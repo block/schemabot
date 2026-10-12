@@ -197,6 +197,44 @@ The PostgreSQL shape differs from MySQL in three ways:
   endpoint fails resolution: a verified CA is required, and the ambient trust
   store is never an implicit fallback.
 
+### Etre targets with more than one match
+
+An `etre` resolver expects its lookup to match one entity. Some inventories
+record both sides of a replicated pair under one target, such as a cluster and
+its standby during a blue/green switchover. A `mysql` resolver handles these
+without any configuration: when its lookup matches more than one entity, it
+connects to each match and reads `read_only`, `innodb_read_only`,
+`server_uuid`, and `SHOW REPLICA STATUS`. The target resolves to the match that
+accepts writes only when both of these hold:
+
+- Exactly one match has `read_only` and `innodb_read_only` off.
+- Every other match replicates from it: its replication status names the
+  writable match's `server_uuid` as a source.
+- The writable match replicates from no server outside the matches. It may
+  replicate back from its own standby, but a writable relay fed from elsewhere
+  is not the authoritative copy, and a change made on it would collide with
+  the same change arriving from its source.
+
+Anything else refuses to resolve the target, and the error names each match
+and what it reported. That covers no writable match, two writable matches, a
+read-only match that replicates from somewhere else or from nothing, and a
+match the probe cannot connect to. A read-only match that does not replicate
+from the writer is refused rather than ignored, because nothing then shows that
+the two matches are copies of one database.
+
+A lookup that matches one entity is not probed. A lookup that matches more than
+four is refused without probing. The matches are probed at the same time, each
+under its own timeout. The probe runs each time the target is
+resolved, so a switchover is picked up on the next request without any change
+to the inventory. It chooses the writer when a request resolves the target; it
+does not watch an apply that is already running.
+
+The probe connects with the same credentials and TLS settings as the schema
+change, and needs the `REPLICATION CLIENT` privilege to read the replication
+status. `SHOW REPLICA STATUS` needs MySQL 8.0.22 or later; on an older server
+the probe refuses the target and its error says so. Resolvers for the other
+database types refuse a lookup that matches more than one entity.
+
 ### PostgreSQL Etre targets
 
 An `etre` resolver with `database_type: postgres` discovers PostgreSQL targets
@@ -463,7 +501,7 @@ Rules:
 - The map MUST contain at least one entry, each entry MUST set a non-empty `target`, and each map key MUST resolve through `tern_deployments` with an endpoint configured for this environment.
 - Keys under `deployments:` must be lowercase; the server refuses to start otherwise.
 - A single-entry map is accepted and behaves identically to the scalar `target` / `deployment` shape. Single-deployment environments should continue to use the scalar shape.
-- `cutover_policy` and `on_failure` are only valid alongside a `deployments` map or a `targets` list. `cutover_policy` accepts `rolling` (the default), `barrier`, or `parallel`; `on_failure` accepts `halt` (the default), `continue`, or `pause`. Both values are captured on every operation row when the apply is created, so the policy in force at that moment travels with the rollout.
+- `cutover_policy` and `on_failure` are only valid alongside a `deployments` map or a `targets` list. `cutover_policy` accepts `rolling`, `barrier`, or `parallel`, and defaults to `parallel` when every member of the environment comes from a `targets` list and to `rolling` otherwise, including for a `deployments` map that mixes `targets` entries with single `target` entries; `on_failure` accepts `halt` (the default), `continue`, or `pause`. Both values are captured on every operation row when the apply is created, so the policy in force at that moment travels with the rollout.
 
 ### Planning and the Primary Deployment
 
@@ -542,7 +580,7 @@ Rules:
 - An environment-level `targets` list is mutually exclusive with an environment-level `deployments` map, the same way an environment-level `target` is. A `targets` list inside a `deployments` entry is how the two combine.
 - The list MUST contain at least one entry, and no entry may be empty.
 - A rollout across the listed targets runs table by table: each table lands on every target before any target starts the next. Tables run in the order the reviewed plan lists them, then any table only another target's plan changes, sorted by name. A target whose plan does not change a table has nothing to run for it, and two statements on one table run together. The exception is a rollout where a target's plan changes a VSchema, which applies with that target's tables, so each target then runs its whole change in one go.
-- `cutover_policy` and `on_failure` order the listed targets within each table the same way they order the deployments of a `deployments` map: each target is a rollout member, taken in list order. The default, `rolling`, runs one target at a time, and under the default `on_failure: halt` a failed target stops every later one from starting. A large fleet can set `cutover_policy: parallel`, which starts up to the server's `max_drivers_per_apply` targets' copies at once, queues the rest, and still cuts over one target at a time in list order. Whatever `on_failure` says, a table that failed on any target ends the rollout at that table: `continue` or a released `pause` still runs it on the remaining targets, but no target starts the next table.
+- `cutover_policy` and `on_failure` order the listed targets within each table the same way they order the deployments of a `deployments` map: each target is a rollout member, taken in list order. The default here is `parallel`: it starts up to the server's `max_drivers_per_apply` targets' copies at once, queues the rest, and still cuts over one target at a time in list order. Under the default `on_failure: halt` a failed target stops every queued target from starting, and holds the cutover of every later target already copying: each of those finishes its copy and waits at the cutover barrier until an operator stops or cancels it. `max_drivers_per_apply` is therefore what bounds how many targets copy at once, and how many a failure can leave holding a finished copy, so raising it widens both; size it for the targets that share a host's disk and network as well as for throughput. An environment that relies on an unset `cutover_policy` running one target at a time needs `cutover_policy: rolling` to keep doing so: a failed target then stops every later one before it starts copying. Whatever `on_failure` says, a table that failed on any target ends the rollout at that table: `continue` or a released `pause` still runs it on the remaining targets, but no target starts the next table.
 - No entry may contain `/`. A deployment addressing several targets names each one in its members' operation keys, and `/` separates a key's components.
 - One deployment may not list the same target twice. A rollout member is identified by its deployment and target together, so the same target under two different deployments is two distinct members and is allowed.
 - Members resolve deployments outermost: every target of the first deployment, then every target of the next.

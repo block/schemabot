@@ -43,27 +43,6 @@ func TestFormatApplyStatusComment_ShardedAttributionFromCaller(t *testing.T) {
 	assert.NotContains(t, out, "github:", "the raw structured caller is not rendered")
 }
 
-func TestParseShardOperationKey(t *testing.T) {
-	ns, shard, table, ok := parseShardOperationKey("cdb_resolute_sharded/-40/mutes")
-	require.True(t, ok)
-	assert.Equal(t, "cdb_resolute_sharded", ns)
-	assert.Equal(t, "-40", shard)
-	assert.Equal(t, "mutes", table)
-
-	for _, key := range []string{"", "cdb_resolute_sharded/group_finalizer", "deployment-only", "ns//table"} {
-		_, _, _, ok := parseShardOperationKey(key)
-		assert.False(t, ok, "key %q must not parse as a shard work key", key)
-	}
-
-	finalizerNS, ok := parseFinalizerOperationKey("cdb_resolute_sharded/group_finalizer")
-	require.True(t, ok)
-	assert.Equal(t, "cdb_resolute_sharded", finalizerNS)
-	for _, key := range []string{"cdb_resolute_sharded/-40/mutes", "group_finalizer", ""} {
-		_, ok := parseFinalizerOperationKey(key)
-		assert.False(t, ok, "key %q must not parse as a finalizer key", key)
-	}
-}
-
 func TestIsShardedApply(t *testing.T) {
 	shardOp := func(shard string) *storage.ApplyOperation {
 		return &storage.ApplyOperation{Deployment: "cake", OperationKey: "ks/" + shard + "/mutes"}
@@ -268,32 +247,6 @@ func TestBuildShardedApplyData_FinalizeOnlyKeyspaceIsNotAVSchemaChange(t *testin
 	summary := templates.RenderShardedApplySummaryComment(buildShardedApplyData(apply, ops, false, nil, view, ""))
 	assert.Contains(t, summary, "### Finalize\n\n**`commerce`**: Finalized\n")
 	assert.Contains(t, summary, "### VSchema\n\n**`payments`**: Applied\n")
-}
-
-// A finalizer whose rollout ended without running it must not read as
-// pending, whichever record says so: a cancelled/reverted operation row
-// (written by the cancel path or mirrored by the stranded-operation reaper)
-// reads as cancelled, and so does a row still pending under a parent whose
-// verdict is final — a halted rollout terminalizes the apply immediately,
-// while the reaper only settles the stranded row minutes after the summary
-// posted. Stopped — on the operation or the parent — reads as stopped: a
-// stopped apply is resumable, so its finalizer may yet run.
-func TestVSchemaStatusForOperationState_TerminalInertStates(t *testing.T) {
-	running := state.Apply.Running
-	assert.Equal(t, "cancelled", vschemaStatusForOperationState(running, state.ApplyOperation.Cancelled))
-	assert.Equal(t, "cancelled", vschemaStatusForOperationState(running, state.ApplyOperation.Reverted))
-	assert.Equal(t, "stopped", vschemaStatusForOperationState(running, state.ApplyOperation.Stopped))
-	assert.Equal(t, "", vschemaStatusForOperationState(running, state.ApplyOperation.Pending),
-		"a pending finalizer under a live apply still reads as pending")
-
-	pending := state.ApplyOperation.Pending
-	assert.Equal(t, "cancelled", vschemaStatusForOperationState(state.Apply.Failed, pending),
-		"a halted rollout's terminal summary must not promise VSchema work no claim arm will run")
-	assert.Equal(t, "cancelled", vschemaStatusForOperationState(state.Apply.Cancelled, pending))
-	assert.Equal(t, "stopped", vschemaStatusForOperationState(state.Apply.Stopped, pending),
-		"a stopped apply's pending finalizer may yet run on resume")
-	assert.Equal(t, "failed", vschemaStatusForOperationState(state.Apply.Failed, state.ApplyOperation.Failed),
-		"the operation's own failure outranks the parent verdict")
 }
 
 // stubPlanStorage serves one stored plan (or a load error) for resolver tests.

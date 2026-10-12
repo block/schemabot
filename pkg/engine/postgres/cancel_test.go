@@ -379,6 +379,60 @@ func TestCancelIsNotRequestedWhenTheCallerGivesUpWithNothingSignalled(t *testing
 	}
 }
 
+// An operator's cancel waits behind a progress poll for the build's session,
+// and the caller gives up before the tracker sends the signal. The tracker
+// says so with its not-dispatched outcome, so no cancel is recorded, and a
+// later cancellation from outside SchemaBot is a failure the next drive
+// retries rather than the operator's cancel. The caller still hears that it
+// gave up. A bare context error from the same call says nothing about whether
+// the signal went out, so it keeps the cancel recorded.
+func TestCancelIsNotRequestedWhenTheCallerGivesUpBeforeTheTrackerSignals(t *testing.T) {
+	tests := []struct {
+		name string
+		// returned is what CancelBuild returns once the caller has given up.
+		returned      func(ctx context.Context) error
+		wantRequested bool
+		wantState     engine.State
+	}{
+		{
+			name: "tracker reports the signal was not dispatched",
+			returned: func(ctx context.Context) error {
+				return fmt.Errorf("cancel concurrent index build backend %d: %w: %w", 4242, progress.ErrCancelNotDispatched, ctx.Err())
+			},
+			wantRequested: false,
+			wantState:     engine.StateFailed,
+		},
+		{
+			name:          "tracker returns a bare context error",
+			returned:      func(ctx context.Context) error { return ctx.Err() },
+			wantRequested: true,
+			wantState:     engine.StateCancelled,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, giveUp := context.WithCancel(t.Context())
+			defer giveUp()
+			tracker := &fakeBuildTracker{}
+			tracker.cancelBuild = func(ctx context.Context) error {
+				giveUp()
+				return tc.returned(ctx)
+			}
+			eng, drive := runningDrive(t, tracker, true)
+
+			result, err := eng.Cancel(ctx, cancelRequest())
+
+			assert.Nil(t, result)
+			require.ErrorIs(t, err, context.Canceled)
+			assert.False(t, tracker.cancelled.Load())
+			assert.False(t, drive.wasCancelled(), "a caller that gave up does not fall back to the drive's context")
+			assert.Equal(t, tc.wantRequested, requestedCancel(t, eng))
+			drive.settleCancelledBuild()
+			assert.Equal(t, tc.wantState, drive.publishedState())
+		})
+	}
+}
+
 // Two cancels for the same build overlap. The first signals the build
 // backend; a retry whose caller gives up finds nothing it could signal. The
 // build comes back cancelled by the first signal — whether or not the first

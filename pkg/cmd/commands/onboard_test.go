@@ -723,6 +723,20 @@ func TestDescribeOnboardPlanChangesNamesOnlyTheTableOfAFinalizedKeyspace(t *test
 	assert.Equal(t, []string{"payments/refund_notes (create): CREATE TABLE `refund_notes` (`id` bigint NOT NULL, PRIMARY KEY (`id`))"}, lines)
 }
 
+// A keyspace on its only shard carries its DDL on that shard. It is named by
+// that DDL alone, with no finalize line, the same way the plan shows it.
+func TestDescribeOnboardPlanChangesNamesAShardCarriedTableOfAFinalizedKeyspace(t *testing.T) {
+	lines := describeOnboardPlanChanges(&apitypes.PlanResponse{
+		Changes: []*apitypes.SchemaChangeResponse{
+			{Namespace: "payments", Metadata: map[string]string{apitypes.NeedsFinalizerMetadataKey: "true"}},
+		},
+		Shards: []*apitypes.ShardPlanResponse{{Namespace: "payments", Shard: "-", Changes: []*apitypes.TableChangeResponse{
+			{TableName: "refunds", ChangeType: "alter", DDL: "ALTER TABLE `refunds` ADD COLUMN `note` text"},
+		}}},
+	})
+	assert.Equal(t, []string{"payments/refunds (alter): ALTER TABLE `refunds` ADD COLUMN `note` text"}, lines)
+}
+
 // A leftover schema file for a table that no longer exists in the target is
 // the classic cause of a failed onboarding verification: the pull rewrites
 // every table in the namespace but never deletes strays, so the stale file

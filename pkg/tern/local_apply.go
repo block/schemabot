@@ -1026,8 +1026,8 @@ func (c *LocalClient) runWithRecovery(ctx context.Context, apply *storage.Apply,
 		c.logger.Error(errMsg, apply.LogAttrs()...)
 		if failErr := c.failApplyWithTasks(ctx, apply, tasks, errMsg); failErr != nil {
 			// The panic is what the operator acts on (AV-5); its containment
-			// marks the apply failed from the reloaded row.
-			c.logger.Error("failed to record the panicked drive's apply failed; the operator's panic containment records it instead",
+			// marks the tasks and the apply failed from the reloaded rows.
+			c.logger.Error("failed to record the panicked drive's failure; the operator's panic containment records it instead",
 				append(apply.LogAttrs(), "error", failErr)...)
 		}
 		return recovered

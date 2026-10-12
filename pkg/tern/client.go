@@ -112,6 +112,30 @@ var ErrApplyTasksNotLoaded = errors.New("apply owns task rows the drive loader d
 // an operator intervenes.
 var ErrApplyTaskRowMissing = errors.New("apply task row not found on re-read")
 
+// ErrTaskRequeueRefused is returned by a resume whose write putting a
+// failed_retryable task back to pending for a retry, or a stopped task back to
+// pending for a start, did not land. The drive exits with the task row still at
+// rest and the next claim repeats the requeue. A local drive and a gRPC drive
+// dispatching a retry exit before any engine work starts, since running the
+// task's DDL while storage records it at rest would leave work no stored state
+// accounts for. A gRPC drive requeues its stopped tasks only after the data
+// plane accepted the start, so there the remote work is already running; the
+// start request stays pending, and the next claim adopts the data plane's
+// state and retries the requeue before completing it. A retry's claim spends
+// one of the apply's recovery attempts, so that loop ends with the recovery
+// budget; a start's claim spends none, so the request stays pending until the
+// write lands. The operator counts every exit under its own resume failure
+// reason, so a requeue that keeps being refused is visible rather than one
+// warning per claim.
+var ErrTaskRequeueRefused = errors.New("task requeue refused")
+
+// ErrPostTerminalReconcile is matched by a drive's failure in the work an apply
+// owes after its terminal outcome is stored, such as answering the start that
+// admitted the claim. The drive has already settled the schema change and
+// nothing re-claims a settled apply, so a caller runs its post-drive settlement
+// rather than treating the drive as unfinished.
+var ErrPostTerminalReconcile = errors.New("reconcile after the stored terminal outcome failed")
+
 var (
 	// ErrPullSchemaUnsupportedType marks a pull request for a database type that
 	// the data plane does not yet support.

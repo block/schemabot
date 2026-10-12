@@ -34,6 +34,18 @@ type ProgressData struct {
 	// deployment that failed under on_failure=pause no longer holds later
 	// deployments. Apply-level: it applies to every operation of the apply.
 	Released bool
+	// Sharded is true when the apply is one change fanned out across its
+	// keyspaces' shards, its tables already rolled up across them, so it
+	// renders as one change, the way its PR comments do, however many shard
+	// and finalizer rows it has.
+	Sharded bool
+}
+
+// RendersOperationSections reports whether progress renders a section per
+// operation: an apply with more than one operation does, unless it is a
+// sharded apply, which reads as one change.
+func RendersOperationSections(ops []ProgressOperation, sharded bool) bool {
+	return len(ops) > 1 && !sharded
 }
 
 // ProgressOperation represents progress for one deployment operation.
@@ -77,6 +89,9 @@ type TableProgress struct {
 	// EstimatedBytes is the table's on-disk size when it was planned, shown
 	// beside the row counts. Nil when the plan had no estimate.
 	EstimatedBytes *int64
+	// PlannedShards is how many shards a sharded table's change spans per its
+	// plan, the shards EstimatedBytes covers. Zero when the plan recorded none.
+	PlannedShards int
 	// Checksum phase progress: rows verified so far and total to verify.
 	// Non-zero only while the table is checksumming (verifying copied data).
 	ChecksumRowsChecked int64
@@ -140,6 +155,7 @@ func ParseProgressResponse(result *apitypes.ProgressResponse) ProgressData {
 		Options:        result.Options,
 		Metadata:       result.Metadata,
 		Released:       result.Released,
+		Sharded:        result.Sharded,
 	}
 	if step, err := apitypes.ParseProgressStep(result.Metadata); err != nil {
 		slog.Warn("progress output omits the statement position because the progress metadata is malformed", "apply_id", result.ApplyID, "error", err)
@@ -173,6 +189,13 @@ func ParseProgressResponse(result *apitypes.ProgressResponse) ProgressData {
 		})
 	}
 
+	if data.Sharded && data.ErrorMessage == "" {
+		// A sharded apply shows no operation sections, so a failure only one
+		// of its operations recorded (a failed shard or finalize) is the
+		// apply's.
+		data.ErrorMessage = firstOperationError(data.Operations)
+	}
+
 	for _, tbl := range ddl.FilterInternalTablesTyped(result.Tables) {
 		tp := TableProgress{
 			TableName:           tbl.TableName,
@@ -186,6 +209,7 @@ func ParseProgressResponse(result *apitypes.ProgressResponse) ProgressData {
 			RowsCopied:          tbl.RowsCopied,
 			RowsTotal:           tbl.RowsTotal,
 			EstimatedBytes:      tbl.EstimatedBytes,
+			PlannedShards:       int(tbl.PlannedShards),
 			PercentComplete:     int(tbl.PercentComplete),
 			ETASeconds:          tbl.ETASeconds,
 			ChecksumRowsChecked: tbl.ChecksumRowsChecked,
@@ -222,4 +246,21 @@ func ParseProgressResponse(result *apitypes.ProgressResponse) ProgressData {
 	}
 
 	return data
+}
+
+// firstOperationError returns the error of the first operation, in resolved
+// order, that failed with one, or "" when none did. A shard's error names the
+// shard, as the PR comment's first-failure line does, since the apply shows
+// no section per shard to say where it failed.
+func firstOperationError(ops []ProgressOperation) string {
+	for _, op := range ops {
+		if !state.IsState(op.State, state.ApplyOperation.Failed, state.ApplyOperation.FailedRetryable) || op.ErrorMessage == "" {
+			continue
+		}
+		if _, shard, _, ok := state.ShardWorkKey(op.OperationKey); ok {
+			return "shard " + shard + ": " + op.ErrorMessage
+		}
+		return op.ErrorMessage
+	}
+	return ""
 }

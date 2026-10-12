@@ -457,7 +457,7 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 			"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
 			"plan_id", planResp.PlanID, "targets", refused.Targets, "deployments", refused.Deployments, "defer_cutover", result.DeferCutover)
 		h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy,
-			rolloutShapeRefusalMessage(refused, action.Apply, environment))
+			rolloutShapeRefusalMessage(refused, action.Apply, environment, h.deploymentTenant()))
 		return false, nil
 	}
 

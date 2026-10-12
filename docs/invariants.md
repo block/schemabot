@@ -223,7 +223,8 @@ Supervision reattaches to the still-running change once storage returns.
 
 Uncertainty is never converted into a verdict. A terminal outcome that cannot be persisted leaves
 the row non-terminal and claimable, to be re-derived on the next claim rather than fabricated.
-*Enforced:* per-failure-class handling in the drive loop (`pkg/api/operator.go`), modelled in
+*Enforced:* per-failure-class handling in the drive loop (`pkg/api/operator.go`) and in the apply
+failure helpers (`pkg/tern/local_apply_failure.go`), modelled in
 [storage-outage-behavior.md](storage-outage-behavior.md).
 
 ### AV-3: Liveness is process-only
@@ -243,7 +244,10 @@ another. Repeated errors observing remote progress mark the apply
 control plane cannot see, not that the change is unhealthy. *Enforced:* failure-class handling in
 the drive loop (`pkg/api/operator.go`), the pre-start task re-read and the outcome-write gate on
 terminal side effects in the sequential drive (`pkg/tern/local_apply_sequential.go`), the same gate
-in the grouped drive (`pkg/tern/local_apply_grouped.go`) and the remote progress error limit
+in the grouped drive (`pkg/tern/local_apply_grouped.go`), the resume's refusal to record a failure
+over an outcome it already stored (the no-remaining-work branches of `resumeApplyWithTasks` and
+`launchAtomicResume` return a `postTerminalReconcileError` that `handleGroupedResumeFailure` passes
+through, `pkg/tern/local_control_resume.go`) and the remote progress error limit
 (`pkg/tern/grpc_client.go`).
 
 ### AV-5: Panics are contained and permanent
@@ -771,8 +775,9 @@ elected reaper, so every write either goes through this resolution or is a reape
 no driver is touching. *Enforced:* the forward-only state resolution
 the drive loop reconciles through (`taskStateWithNoBackwardProgress`,
 `pkg/tern/local_client.go`), and the resume's reading of a settled failed task as the apply's
-outcome rather than as work to re-plan (`failedTaskDecidingOutcome`,
-`pkg/tern/local_control_resume.go`).
+outcome rather than as work to re-plan (`failedTaskDecidingOutcome` and `replanAndFilterTasks`,
+`pkg/tern/local_control_resume.go`; `checkTaskReady`, `pkg/tern/local_apply_sequential.go`, where
+the sequential drive reads the kept failed row as the verdict).
 
 ### ST-5: Unknown engine states are visible and blocking
 
@@ -1147,8 +1152,10 @@ stop and cancel paths (`failPendingRequestForSettledOutcome`, `pkg/tern/local_co
 terminal resolution of a typed unsupported-operation
 decline (`failPendingRequestForUnsupportedOperation`, `pkg/tern/local_control.go`), reached from
 the stop and cancel paths in that file and from the revert and skip-revert paths in
-`pkg/tern/local_apply_grouped.go`, and the refusal paths of the pending control-request processors
-on both clients (`pkg/tern/local_control.go`, `pkg/tern/grpc_client.go`).
+`pkg/tern/local_apply_grouped.go`, the refusal paths of the pending control-request processors
+on both clients (`pkg/tern/local_control.go`, `pkg/tern/grpc_client.go`), and the reaper's sweep
+of requests left pending on an apply that has settled and that no drive still holds
+(`pkg/api/reaper.go`, `ListStrandedPending` in `pkg/storage/internal/sqlstore/control_requests.go`).
 
 ### CO-3: Engine terminal truth outranks a queued command
 
@@ -1162,7 +1169,8 @@ refuses a stop or cancel that would replace an outcome the change already settle
 drive resolves the request and records that outcome. And only settled outcomes are adopted, never
 a remote state still in motion. *Enforced:* terminal-truth preflights on the control paths
 (`pkg/tern/local_control.go`, `pkg/tern/grpc_control_resend.go`); the in-process engine's settled
-outcome checks on stop and cancel (`pkg/engine/spirit/control.go`).
+outcome checks on stop and cancel (`pkg/engine/spirit/control.go`), including a completion its run
+records after the cancel (`pkg/engine/spirit/execution.go`).
 
 ### CO-4: Stop wins
 

@@ -68,6 +68,22 @@ func TestRollbackPlanListsOnlyTheDDLOfAFinalizedKeyspace(t *testing.T) {
 	assert.NotContains(t, preview, "VSchema update")
 }
 
+// A keyspace on its only shard carries its DDL on that shard. The rollback
+// lists that DDL alone: the finalize is part of that work.
+func TestRollbackPlanListsOnlyTheShardCarriedDDLOfAFinalizedKeyspace(t *testing.T) {
+	plan := &apitypes.PlanResponse{Database: "shop", DatabaseType: "vitess", Environment: "staging",
+		Changes: []*apitypes.SchemaChangeResponse{{Namespace: "payments", Metadata: map[string]string{apitypes.NeedsFinalizerMetadataKey: "true"}}},
+		Shards: []*apitypes.ShardPlanResponse{{Namespace: "payments", Shard: "-", Changes: []*apitypes.TableChangeResponse{
+			{TableName: "refunds", ChangeType: "alter", DDL: "ALTER TABLE `refunds` ADD COLUMN `note` text"},
+		}}},
+	}
+
+	preview := ansi.Strip(captureStdout(t, func() { WriteRollbackPlan(plan, "apply-example-85") }))
+
+	assert.Contains(t, preview, "  refunds (alter):\n")
+	assert.NotContains(t, preview, "finalized by the engine")
+}
+
 // A keyspace whose shards diverged lists what each shard will run: the drop
 // only one shard needs is shown beside the ALTER its sibling runs, instead of
 // the one entry per table the namespace-level changes keep. A statement

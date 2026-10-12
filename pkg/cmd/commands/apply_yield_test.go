@@ -84,7 +84,7 @@ func runYieldApply(t *testing.T, server *httptest.Server, watch bool) string {
 		Output:      OutputFormatLog,
 	}
 	var runErr error
-	out := stripAnsi(captureStdout(func() { runErr = cmd.Run(&Globals{Endpoint: server.URL}) }))
+	out := stripAnsi(captureStdout(func() { runErr = cmd.Run(t.Context(), &Globals{Endpoint: server.URL}) }))
 	require.NoError(t, runErr, out)
 	return out
 }
@@ -112,7 +112,7 @@ func TestApplyYield_StoppedApplyKeepsLock(t *testing.T) {
 	server, releases := yieldTestServer(t, state.Apply.Stopped)
 	cmd := ApplyCmd{SchemaDir: writeTestSchemaDir(t), Environment: "staging", AutoApprove: true, Yield: true, Watch: true, Output: OutputFormatLog}
 	var runErr error
-	out := stripAnsi(captureStdout(func() { runErr = cmd.Run(&Globals{Endpoint: server.URL}) }))
+	out := stripAnsi(captureStdout(func() { runErr = cmd.Run(t.Context(), &Globals{Endpoint: server.URL}) }))
 
 	require.ErrorContains(t, runErr, "apply apply-yield was stopped, so the schema change is not on the target")
 	assert.ErrorContains(t, runErr, "start -e")
@@ -141,7 +141,7 @@ func TestApplyYield_UnreadableStateKeepsLock(t *testing.T) {
 	server, releases := yieldTestServer(t, "")
 	cmd := ApplyCmd{SchemaDir: writeTestSchemaDir(t), Environment: "staging", AutoApprove: true, Yield: true, Output: OutputFormatLog}
 	var runErr error
-	out := stripAnsi(captureStdout(func() { runErr = cmd.Run(&Globals{Endpoint: server.URL}) }))
+	out := stripAnsi(captureStdout(func() { runErr = cmd.Run(t.Context(), &Globals{Endpoint: server.URL}) }))
 
 	require.Error(t, runErr)
 	assert.Zero(t, releases.Load(), "an unknown apply state must keep the lock:\n%s", out)
@@ -153,7 +153,7 @@ func TestApplyYield_FailedWatchKeepsLockWithoutQuiescenceProof(t *testing.T) {
 	server, releases := yieldTestServer(t, state.Apply.Failed)
 	cmd := ApplyCmd{SchemaDir: writeTestSchemaDir(t), Environment: "staging", AutoApprove: true, Yield: true, Watch: true, Output: OutputFormatLog}
 	var runErr error
-	out := stripAnsi(captureStdout(func() { runErr = cmd.Run(&Globals{Endpoint: server.URL}) }))
+	out := stripAnsi(captureStdout(func() { runErr = cmd.Run(t.Context(), &Globals{Endpoint: server.URL}) }))
 
 	require.ErrorIs(t, runErr, ErrSilent)
 	assert.Zero(t, releases.Load(), "a failed parent without child operation states must keep its lock:\n%s", out)

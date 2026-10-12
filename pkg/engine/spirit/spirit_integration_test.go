@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"log/slog"
 	"os"
@@ -1137,11 +1138,11 @@ func TestEngine_FetchCurrentSchema(t *testing.T) {
 	require.NoError(t, err, "create internal table")
 
 	eng := New(Config{})
-	schemas, _, err := eng.fetchCurrentSchema(t.Context(), dsn, "testdb", engine.IgnoredTables{})
+	current, err := eng.fetchCurrentSchema(t.Context(), dsn, "testdb", engine.IgnoredTables{})
 	require.NoError(t, err, "fetchCurrentSchema()")
 
-	assert.Len(t, schemas, 2)
-	assert.ElementsMatch(t, []string{"t1", "t2"}, tableSchemaNames(schemas))
+	assert.Len(t, current.tables, 2)
+	assert.ElementsMatch(t, []string{"t1", "t2"}, tableSchemaNames(current.tables))
 }
 
 // A cancel that reaches a still-running schema change must clear the
@@ -1397,10 +1398,10 @@ func TestEngine_FetchCurrentSchema_EmptyDatabase(t *testing.T) {
 	cleanupTables(t, db) // Start with clean database
 
 	eng := New(Config{})
-	schemas, _, err := eng.fetchCurrentSchema(t.Context(), dsn, "testdb", engine.IgnoredTables{})
+	current, err := eng.fetchCurrentSchema(t.Context(), dsn, "testdb", engine.IgnoredTables{})
 	require.NoError(t, err, "fetchCurrentSchema()")
 
-	assert.Empty(t, schemas, "expected 0 tables for empty database")
+	assert.Empty(t, current.tables, "expected 0 tables for empty database")
 }
 
 // TestEngine_ExecuteMigration_AddColumn tests running an actual Spirit schema change
@@ -2146,7 +2147,7 @@ func TestEngine_FetchCurrentSchema_ConnectionError(t *testing.T) {
 	eng := New(Config{})
 
 	// Use invalid DSN
-	_, _, err := eng.fetchCurrentSchema(t.Context(), "invalid:invalid@tcp(localhost:9999)/nonexistent", "testdb", engine.IgnoredTables{})
+	_, err := eng.fetchCurrentSchema(t.Context(), "invalid:invalid@tcp(localhost:9999)/nonexistent", "testdb", engine.IgnoredTables{})
 	assert.Error(t, err, "expected error for invalid DSN")
 }
 
@@ -2208,6 +2209,219 @@ func TestEngine_ExecuteMigration_CancelledContextKeepsStoppedState(t *testing.T)
 		"CREATE TABLE must not run after the context is cancelled")
 	assert.True(t, testutil.TableExists(t, db, "testdb", "stop_pending_drop"),
 		"DROP TABLE must not run after the context is cancelled")
+}
+
+// Stopping an ALTER mid-copy, with nothing queued after it, leaves the change
+// Stopped and the stop accepted. A run counts as completed even after a cancel
+// only when its runner finished the change, so a runner returning because of
+// the stop must never be read as the change landing.
+func TestEngine_Stop_DuringAlterWithNothingAfterIt(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping long-running integration test in short mode")
+	}
+
+	dsn, db := setupTestMySQL(t)
+	cleanupTables(t, db)
+
+	_, err := db.ExecContext(t.Context(), `CREATE TABLE stop_only_alter (
+		id INT PRIMARY KEY AUTO_INCREMENT,
+		name VARCHAR(50) NOT NULL
+	)`)
+	require.NoError(t, err, "create alter target table")
+	seedTableRows(t, db, "stop_only_alter")
+
+	eng := New(Config{
+		Logger:  slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo})),
+		Threads: 1,
+	})
+	ctx := t.Context()
+
+	applyResult, err := eng.Apply(ctx, &engine.ApplyRequest{
+		Database: "testdb",
+		Changes: []engine.SchemaChange{{
+			Namespace: "testdb",
+			TableChanges: []engine.TableChange{
+				{Table: "stop_only_alter", DDL: "ALTER TABLE `stop_only_alter` MODIFY COLUMN `name` varchar(100) NOT NULL"},
+			},
+		}},
+		Credentials: &engine.Credentials{DSN: dsn},
+	})
+	require.NoError(t, err, "Apply()")
+	defer eng.Drain()
+	require.True(t, applyResult.Accepted, "Apply not accepted: %s", applyResult.Message)
+
+	waitForCopyProgress(t, eng, 1)
+
+	stopResult, err := eng.Stop(ctx, &engine.ControlRequest{Database: "testdb"})
+	require.NoError(t, err, "Stop()")
+	require.True(t, stopResult.Accepted, "Stop not accepted: %s", stopResult.Message)
+
+	progress, err := eng.Progress(ctx, &engine.ProgressRequest{})
+	require.NoError(t, err, "Progress() after stop")
+	assert.Equal(t, engine.StateStopped, progress.State,
+		"stopping mid-ALTER must report Stopped, not %s", progress.State)
+}
+
+// A stop that lands during the resumed ALTER, with nothing queued after it,
+// leaves the change Stopped and the stop accepted. The resumed run's ALTER is
+// the last phase, so a runner returning because of the stop is the only thing
+// standing between the stop and a change recorded completed.
+func TestEngine_Stop_DuringResumedAlterWithNothingAfterIt(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping long-running integration test in short mode")
+	}
+
+	dsn, db := setupTestMySQL(t)
+	cleanupTables(t, db)
+
+	_, err := db.ExecContext(t.Context(), `CREATE TABLE stop_resumed_alter (
+		id INT PRIMARY KEY AUTO_INCREMENT,
+		name VARCHAR(50) NOT NULL
+	)`)
+	require.NoError(t, err, "create alter target table")
+	seedTableRows(t, db, "stop_resumed_alter")
+
+	eng := New(Config{
+		Logger:  slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo})),
+		Threads: 1,
+	})
+	ctx := t.Context()
+
+	applyResult, err := eng.Apply(ctx, &engine.ApplyRequest{
+		Database: "testdb",
+		Changes: []engine.SchemaChange{{
+			Namespace: "testdb",
+			TableChanges: []engine.TableChange{
+				{Table: "stop_resumed_alter", DDL: "ALTER TABLE `stop_resumed_alter` MODIFY COLUMN `name` varchar(100) NOT NULL"},
+			},
+		}},
+		Credentials: &engine.Credentials{DSN: dsn},
+	})
+	require.NoError(t, err, "Apply()")
+	defer eng.Drain()
+	require.True(t, applyResult.Accepted, "Apply not accepted: %s", applyResult.Message)
+	waitForCopyProgress(t, eng, 1)
+
+	_, err = eng.Stop(ctx, &engine.ControlRequest{Database: "testdb"})
+	require.NoError(t, err, "first Stop()")
+
+	startResult, err := eng.Start(ctx, &engine.ControlRequest{Database: "testdb", Credentials: &engine.Credentials{DSN: dsn}})
+	require.NoError(t, err, "Start()")
+	require.True(t, startResult.Accepted, "Start not accepted: %s", startResult.Message)
+	waitForCopyProgress(t, eng, 1)
+
+	stopResult, err := eng.Stop(ctx, &engine.ControlRequest{Database: "testdb"})
+	require.NoError(t, err, "second Stop()")
+	require.True(t, stopResult.Accepted, "second Stop not accepted: %s", stopResult.Message)
+
+	progress, err := eng.Progress(ctx, &engine.ProgressRequest{})
+	require.NoError(t, err, "Progress() after the second stop")
+	assert.Equal(t, engine.StateStopped, progress.State,
+		"stopping the resumed ALTER must report Stopped, not %s", progress.State)
+}
+
+// The operator's stop lands the moment Spirit reports the last statement
+// applied: the runner returns having finished the change on a cancelled
+// context. The run must record the change completed, whichever path ran the
+// statement.
+func TestEngine_ExecuteSchemaChange_CompletionAfterCancelIsRecorded(t *testing.T) {
+	cases := map[string]struct {
+		setup string
+		ddl   string
+	}{
+		"create": {
+			ddl: "CREATE TABLE `cancel_late_create` (`id` INT PRIMARY KEY AUTO_INCREMENT) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+		},
+		"alter": {
+			setup: "CREATE TABLE cancel_late_alter (id INT PRIMARY KEY AUTO_INCREMENT)",
+			ddl:   "ALTER TABLE `cancel_late_alter` ADD COLUMN `note` varchar(20) NULL",
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			dsn, db := setupTestMySQL(t)
+			cleanupTables(t, db)
+			if tc.setup != "" {
+				_, err := db.ExecContext(t.Context(), tc.setup)
+				require.NoError(t, err, "create alter target table")
+			}
+
+			eng := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+			host, username, password, database, err := parseDSN(dsn)
+			require.NoError(t, err, "parseDSN")
+			eng.mu.Lock()
+			eng.runningSchemaChange = &runningSchemaChange{database: database, state: engine.StateRunning, started: time.Now()}
+			eng.mu.Unlock()
+
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			var once sync.Once
+			eng.SetLogCallback(func(_ slog.Level, _ string, msg string) {
+				if strings.Contains(msg, "apply complete") {
+					once.Do(cancel)
+				}
+			})
+
+			eng.executeSchemaChange(ctx, host, username, password, database, []string{tc.ddl}, false, directPolicy{})
+
+			require.Error(t, ctx.Err(), "the cancel must have landed while the statement ran")
+			eng.mu.Lock()
+			final := eng.runningSchemaChange.state
+			eng.mu.Unlock()
+			assert.Equal(t, engine.StateCompleted, final, "a change whose every statement landed is completed, cancelled context or not")
+		})
+	}
+}
+
+// A cancel that lands between the cutover commit and Spirit's drop of the
+// swapped-out original leaves the change completed with the original still on
+// the target, because Spirit drops it on the run's own context and only logs
+// the refusal. The run finishes that drop itself, so the completed change
+// leaves the target as an uninterrupted run would have: the new table in
+// place, no _old copy holding its space.
+func TestEngine_ExecuteSchemaChange_CancelAfterCutoverDropsSwappedOutOriginal(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	cleanupTables(t, db)
+	_, err := db.ExecContext(t.Context(), `CREATE TABLE cancel_after_cutover (
+		id INT PRIMARY KEY AUTO_INCREMENT,
+		name VARCHAR(50) NOT NULL
+	)`)
+	require.NoError(t, err, "create alter target table")
+	_, err = db.ExecContext(t.Context(), "INSERT INTO `cancel_after_cutover` (name) VALUES ('a'), ('b'), ('c')")
+	require.NoError(t, err, "seed rows")
+
+	eng := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	host, username, password, database, err := parseDSN(dsn)
+	require.NoError(t, err, "parseDSN")
+	eng.mu.Lock()
+	eng.runningSchemaChange = &runningSchemaChange{database: database, state: engine.StateRunning, started: time.Now()}
+	eng.mu.Unlock()
+
+	// Spirit reports the cutover committed before it drops the original, so a
+	// cancel issued from that log line lands in exactly that window.
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	var once sync.Once
+	eng.SetLogCallback(func(_ slog.Level, _ string, msg string) {
+		if strings.Contains(msg, "final cut over operation complete") {
+			once.Do(cancel)
+		}
+	})
+
+	eng.executeSchemaChange(ctx, host, username, password, database,
+		[]string{"ALTER TABLE `cancel_after_cutover` MODIFY COLUMN `name` varchar(100) NOT NULL"}, false, directPolicy{})
+
+	require.Error(t, ctx.Err(), "the cancel must have landed after the cutover committed")
+	eng.mu.Lock()
+	final := eng.runningSchemaChange.state
+	eng.mu.Unlock()
+	assert.Equal(t, engine.StateCompleted, final)
+	assert.True(t, testutil.TableExists(t, db, database, "cancel_after_cutover"), "the changed table stays in place")
+	assert.False(t, testutil.TableExists(t, db, database, utils.OldTableName("cancel_after_cutover")),
+		"the swapped-out original is dropped as it would be by an uninterrupted run")
+	var rows int
+	require.NoError(t, db.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM `cancel_after_cutover`").Scan(&rows))
+	assert.Equal(t, 3, rows, "the changed table holds every row")
 }
 
 // Stopping a running ALTER that has a DROP TABLE queued after it must leave the

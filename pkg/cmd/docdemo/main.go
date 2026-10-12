@@ -466,7 +466,7 @@ func main() {
 			panic("rollback fixture requires a loopback HTTP endpoint")
 		}
 		cmd := commands.RollbackCmd{ApplyID: "apply-example-85", Environment: "staging", Watch: true}
-		if err := cmd.Run(&commands.Globals{Endpoint: endpoint.String()}); err != nil {
+		if err := cmd.Run(context.Background(), &commands.Globals{Endpoint: endpoint.String()}); err != nil {
 			panic(err)
 		}
 		return
@@ -662,7 +662,7 @@ func rollbackDemo() Demo {
 		}()
 		return capture(func() {
 			cmd := commands.RollbackCmd{ApplyID: "apply-example-85", Environment: "staging", Watch: true}
-			if err := cmd.Run(&commands.Globals{Endpoint: server.URL}); err != nil {
+			if err := cmd.Run(context.Background(), &commands.Globals{Endpoint: server.URL}); err != nil {
 				panic(err)
 			}
 		})

@@ -1930,8 +1930,8 @@ func (c *LocalClient) writeShardProgress(ctx context.Context, logger *slog.Logge
 	}
 	for _, sh := range tp.Shards {
 		c.unrecognizedStatuses.observeShardStatus(ctx, logger, table, sh.Shard, sh.State)
+		// The store assigns the shard row's identifier from its key.
 		shardTask := &storage.Task{
-			TaskIdentifier:   engine.NewTaskID(),
 			ApplyID:          table.ApplyID,
 			ApplyOperationID: table.ApplyOperationID,
 			PlanID:           table.PlanID,

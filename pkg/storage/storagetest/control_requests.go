@@ -689,4 +689,16 @@ func TestControlRequests(t *testing.T, h Harness) {
 		_, err := store.ControlRequests().ClearRemoteFailure(t.Context(), 1, storage.ControlOperationStart)
 		require.Error(t, err)
 	})
+
+	t.Run("ListStrandedPending_DBError", func(t *testing.T) {
+		store := h.NewUnreachableStorage(t)
+		_, err := store.ControlRequests().ListStrandedPending(t.Context(), 1)
+		require.Error(t, err)
+	})
+
+	t.Run("ListStrandedPending_RejectsNonPositiveLimit", func(t *testing.T) {
+		store := h.NewStorage(t)
+		_, err := store.ControlRequests().ListStrandedPending(t.Context(), 0)
+		require.ErrorContains(t, err, "limit must be positive")
+	})
 }

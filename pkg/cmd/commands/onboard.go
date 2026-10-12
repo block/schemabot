@@ -639,7 +639,7 @@ func describeOnboardPlanChanges(result *apitypes.PlanResponse) []string {
 		if rollout != nil && len(rollout.Groups) > 1 {
 			prefix = onboardGroupLabel(rollout.Groups[i].Members) + ": "
 		}
-		for _, line := range describeOnboardChanges(plan.Changes) {
+		for _, line := range describeOnboardChanges(plan) {
 			lines = append(lines, prefix+line)
 		}
 	}
@@ -655,22 +655,25 @@ func onboardGroupLabel(members []string) string {
 	return fmt.Sprintf("%s and %d more", members[0], len(members)-1)
 }
 
-func describeOnboardChanges(changes []*apitypes.SchemaChangeResponse) []string {
+// describeOnboardChanges is one line per change a plan makes, per namespace:
+// each table's DDL, whether the namespace carries it itself or on its shards,
+// then its VSchema change, or the finalize when that is its only work.
+func describeOnboardChanges(plan *apitypes.PlanResponse) []string {
 	var lines []string
-	for _, change := range changes {
+	for _, change := range plan.Changes {
 		if change == nil {
 			continue
 		}
-		for _, tableChange := range change.TableChanges {
-			if tableChange == nil {
-				continue
-			}
+		// The namespace's rendered tables, read from its shards when they
+		// carry its DDL, as the plan shows them.
+		namespacePlan := &apitypes.PlanResponse{Changes: []*apitypes.SchemaChangeResponse{change}, Shards: plan.Shards}
+		for _, tableChange := range namespacePlan.RenderedTables() {
 			lines = append(lines, fmt.Sprintf("%s/%s (%s): %s", change.Namespace, tableChange.TableName, strings.ToLower(tableChange.ChangeType), onboardDDLPreview(tableChange.DDL)))
 		}
 		switch {
 		case change.ShowsVSchemaChange():
 			lines = append(lines, fmt.Sprintf("%s: vschema change", change.Namespace))
-		case change.NeedsFinalizer() && len(change.TableChanges) == 0:
+		case plan.FinalizesOnly(change):
 			lines = append(lines, fmt.Sprintf("%s: engine finalize requested", change.Namespace))
 		}
 	}

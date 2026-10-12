@@ -1035,7 +1035,9 @@ type TaskStore interface {
 	// discovered via SHOW VITESS_MIGRATIONS). It requires the operation lease on
 	// the context: the single lease-holding operator is the only writer of an
 	// operation's per-shard rows, so the lookup-then-write is serialized by that
-	// lease and needs no unique constraint. A displaced operator (lost lease)
+	// lease. The store also assigns a new row's TaskIdentifier from its key, so
+	// storage itself refuses a second row for the same shard; the caller's
+	// TaskIdentifier is not used for a shard row. A displaced operator (lost lease)
 	// fails closed with ErrApplyLeaseLost. On conflict the row is rewritten
 	// through Update: identity is preserved, and the statement text follows
 	// the caller's task like every other mutable column.
@@ -1667,4 +1669,39 @@ type ControlRequestStore interface {
 	// keep warning about a command the operator has since re-issued
 	// successfully. It reports whether the stored row changed.
 	ClearRemoteFailure(ctx context.Context, applyID int64, operation ControlOperation) (bool, error)
+
+	// ListStrandedPending returns pending control requests whose apply has
+	// settled with no drive left to answer them, at most limit rows, oldest
+	// first, each with the apply it belongs to. A drive answers the requests of
+	// an apply it settles, but when that answer does not land nothing re-claims
+	// a settled apply to try again, so the request would stay pending forever.
+	// This is the read the operator's reaper sweeps on to answer them instead.
+	//
+	// Only settled applies (completed, failed, cancelled, reverted) quiescent
+	// past the stranded-operation window qualify: a stopped or failed_retryable
+	// apply is resumable, and its pending start is the request that resumes it.
+	// An apply with a fresh operation lease is excluded whatever its state,
+	// because under a fan-out rollout a sibling drive can still be working under
+	// a settled parent, and that drive's own post-drive settlement answers the
+	// request. The rows are read, not written: settlement is left to the caller
+	// so the outcome it discloses matches what a drive would have disclosed.
+	//
+	// One instance lists per pass, guarded by an advisory lock;
+	// ErrStrandedControlRequestReaperBusy reports that another instance holds
+	// it. As with ReapStranded, the lock is an efficiency gate, not a safety one:
+	// every settlement the caller makes is conditional on the row still pending.
+	ListStrandedPending(ctx context.Context, limit int) ([]*StrandedControlRequest, error)
+}
+
+// ErrStrandedControlRequestReaperBusy reports that another instance holds the
+// stranded control-request reaper lock, so this pass did no work. It is an
+// expected outcome on every instance but one, not a failure.
+var ErrStrandedControlRequestReaperBusy = errors.New("another instance is reaping stranded control requests")
+
+// StrandedControlRequest is one pending control request left behind on a
+// settled apply, carrying the apply so callers can settle the request against
+// the recorded outcome and log it with the canonical triage attributes.
+type StrandedControlRequest struct {
+	Request *ApplyControlRequest
+	Apply   *Apply
 }

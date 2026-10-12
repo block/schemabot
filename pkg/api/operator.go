@@ -1169,15 +1169,19 @@ func (s *Service) recoverSingleApplyOperation(ctx context.Context, driverID int,
 			return claimSpent
 		}
 		var drivePanic *panicsafe.Error
-		if !errors.As(resumeErr, &drivePanic) {
-			// Transient drive failures leave the operation claimable so a later
-			// poll retries it; resumeClaimedApply already logged the cause.
+		if !errors.As(resumeErr, &drivePanic) && !postTerminalReconcileSettlesHere(runCtx, resumeErr) {
+			// Transient drive failures, and a drive this driver may no longer
+			// write for, leave the operation claimable so a later poll retries
+			// it; resumeClaimedApply already logged the cause.
 			return claimSpent
 		}
 		// A contained drive panic already failed this operation's tasks and the
-		// parent apply. Fall through so the operation row is persisted from its
-		// now-failed tasks immediately instead of waiting to be re-leased once
-		// its heartbeat goes stale.
+		// parent apply. A drive that stored the apply's terminal outcome and then
+		// could not answer a request after it has settled the schema change, and
+		// nothing re-claims a settled apply to finish that work. Either way, fall
+		// through so the operation row is persisted from its now-terminal tasks
+		// immediately and the post-drive settlement answers the requests the
+		// outcome resolves.
 	}
 
 	// Persist the operation row from its OWN drive outcome — the aggregate of
@@ -1244,17 +1248,18 @@ func (s *Service) recoverSingleApplyOperation(ctx context.Context, driverID int,
 		return claimSpent
 	}
 
-	// If the derived state above settled the apply terminally and a stop or
-	// cancel is still pending, complete it now so the request does not linger
-	// after the rollout has resolved.
-	if err := s.completePendingControlRequestsIfApplyResolved(applyLeaseCtx, driverID, finalApply.ID); err != nil {
+	// If the derived state above settled the apply terminally and a command is
+	// still pending, settle it now so the request does not linger after the
+	// rollout has resolved. A settlement this drive cannot land is picked up by
+	// the reaper's stranded control-request sweep once the apply is quiescent.
+	if err := s.completePendingControlRequestsIfApplyResolved(applyLeaseCtx, s.driverLogger(driverID), finalApply.ID); err != nil {
 		s.logger.Error("operator: failed to complete pending control requests for resolved apply",
 			append(finalApply.LogAttrs(),
 				"driver", driverID, "apply_operation_id", op.ID, "operation_deployment", op.Deployment, "error", err)...)
 		return claimSpent
 	}
 	if !resumed {
-		s.logger.Debug("operator: a drive that ended in a contained panic does not run the claim ladder again; the driver waits for its next wake or tick",
+		s.logger.Debug("operator: a drive that ended in error, then settled from its terminal tasks, does not run the claim ladder again; the driver waits for its next wake or tick",
 			append(finalApply.LogAttrs(),
 				"driver", driverID, "apply_operation_id", op.ID, "operation_deployment", op.Deployment)...)
 		return claimSpent
@@ -1432,9 +1437,10 @@ func (s *Service) driveClaimedMultiOperation(ctx context.Context, driverID int, 
 	// the apply outran is disclosed by the summary, which is published once and
 	// never re-rendered, so a request still pending here yields a summary that
 	// says nothing about it. A settle failure is logged and the summary published
-	// anyway — an unsettled request is recoverable by a later drive, a summary
-	// this projection alone owed is not.
-	settleErr := s.completePendingControlRequestsIfApplyResolved(operationLeaseCtx, driverID, finalApply.ID)
+	// anyway — an unsettled request is recoverable by a later drive or, once the
+	// apply is quiescent and undriven, by the reaper's stranded control-request
+	// sweep; a summary this projection alone owed is not.
+	settleErr := s.completePendingControlRequestsIfApplyResolved(operationLeaseCtx, s.driverLogger(driverID), finalApply.ID)
 	if settleErr != nil {
 		s.logger.Error("operator: failed to complete pending control requests for resolved apply; terminal summary will omit the command",
 			append(finalApply.LogAttrs(),
@@ -1656,7 +1662,7 @@ func (s *Service) recoverApplyPendingStop(ctx context.Context, driverID int, own
 
 	// Settle first so the summary below can disclose a command this apply outran;
 	// see recoverApplyOperation for why a settle failure does not hold it back.
-	settleErr := s.completePendingControlRequestsIfApplyResolved(applyLeaseCtx, driverID, finalApply.ID)
+	settleErr := s.completePendingControlRequestsIfApplyResolved(applyLeaseCtx, s.driverLogger(driverID), finalApply.ID)
 	if settleErr != nil {
 		s.logger.Error("operator: failed to complete pending control requests after stop reconciliation; terminal summary will omit the command",
 			append(finalApply.LogAttrs(),
@@ -1774,7 +1780,7 @@ func (s *Service) recoverApplyOperationProjection(ctx context.Context, driverID 
 
 	// Settle first so the summary below can disclose a command this apply outran;
 	// see recoverApplyOperation for why a settle failure does not hold it back.
-	settleErr := s.completePendingControlRequestsIfApplyResolved(applyLeaseCtx, driverID, apply.ID)
+	settleErr := s.completePendingControlRequestsIfApplyResolved(applyLeaseCtx, s.driverLogger(driverID), apply.ID)
 	if settleErr != nil {
 		s.logger.Error("operator: failed to complete pending control requests after deriving apply state from its settled operations; terminal summary will omit the command",
 			append(apply.LogAttrs(),
@@ -1824,17 +1830,25 @@ func (s *Service) markPendingOperationsStopped(ctx context.Context, driverID int
 	return nil
 }
 
-// completePendingControlRequestsIfApplyResolved completes pending stop and
-// cancel control requests once the apply has settled to a terminal state, so
-// the requests do not stay pending forever after the rollout resolves. The
+// driverLogger scopes the service logger to one driver, so settlement lines
+// shared with the reaper name which driver answered.
+func (s *Service) driverLogger(driverID int) *slog.Logger {
+	return s.logger.With("driver", driverID)
+}
+
+// completePendingControlRequestsIfApplyResolved settles pending stop, start,
+// and cancel control requests once the apply has settled to a terminal state,
+// so the requests do not stay pending forever after the rollout resolves. The
 // apply is reloaded because the derived-state write operates on a copy and
-// does not mutate the caller's row. A pending stop completes at any terminal
-// state. A pending cancel is handed to the shared settlement, which decides
-// whether the cancel took effect or the schema change outran it, so this path
-// discloses the same outcome as every other drive shape. A still-non-terminal
-// apply resolves only its stop, and only once that stop has reached every
-// operation. No-op when nothing is pending.
-func (s *Service) completePendingControlRequestsIfApplyResolved(ctx context.Context, driverID int, applyID int64) error {
+// does not mutate the caller's row. The logger carries the caller's identity —
+// a driver's id, or the reaper — so the settlement lines name who answered. A
+// pending stop completes at any terminal state. A pending start and a pending
+// cancel are handed to the shared settlements, which decide from the stored
+// outcome whether the command took effect, so this path discloses the same
+// outcome as every other drive shape. A still-non-terminal apply resolves only
+// its stop, and only once that stop has reached every operation. No-op when
+// nothing is pending.
+func (s *Service) completePendingControlRequestsIfApplyResolved(ctx context.Context, logger *slog.Logger, applyID int64) error {
 	apply, err := s.storage.Applies().Get(ctx, applyID)
 	if err != nil {
 		return fmt.Errorf("reload apply %d before completing pending control requests: %w", applyID, err)
@@ -1843,13 +1857,16 @@ func (s *Service) completePendingControlRequestsIfApplyResolved(ctx context.Cont
 		return fmt.Errorf("reload apply %d before completing pending control requests: %w", applyID, storage.ErrApplyNotFound)
 	}
 	if !state.IsTerminalApplyState(apply.State) {
-		return s.completeLandedStopForHeldOpenApply(ctx, driverID, apply)
+		return s.completeLandedStopForHeldOpenApply(ctx, logger, apply)
 	}
 
-	if err := s.completePendingRequestForResolvedApply(ctx, driverID, apply, storage.ControlOperationStop); err != nil {
+	if err := s.completePendingRequestForResolvedApply(ctx, logger, apply, storage.ControlOperationStop); err != nil {
 		return err
 	}
-	return tern.SettlePendingCancelForResolvedApply(ctx, s.storage, s.logger.With("driver", driverID), apply)
+	if err := tern.SettlePendingStartForResolvedApply(ctx, s.storage, logger, apply); err != nil {
+		return err
+	}
+	return tern.SettlePendingCancelForResolvedApply(ctx, s.storage, logger, apply)
 }
 
 // completeLandedStopForHeldOpenApply completes a pending stop request on an
@@ -1866,7 +1883,7 @@ func (s *Service) completePendingControlRequestsIfApplyResolved(ctx context.Cont
 // Fails closed on an incomplete generation. While the manifest still declares
 // operations that have not attached, a later dispatch can bring work this stop
 // must halt, so the request stays pending for it.
-func (s *Service) completeLandedStopForHeldOpenApply(ctx context.Context, driverID int, apply *storage.Apply) error {
+func (s *Service) completeLandedStopForHeldOpenApply(ctx context.Context, logger *slog.Logger, apply *storage.Apply) error {
 	controlReq, err := s.storage.ControlRequests().GetPending(ctx, apply.ID, storage.ControlOperationStop)
 	if err != nil {
 		return fmt.Errorf("load pending stop request for held-open apply %s (%d): %w", apply.ApplyIdentifier, apply.ID, err)
@@ -1880,32 +1897,31 @@ func (s *Service) completeLandedStopForHeldOpenApply(ctx context.Context, driver
 		return fmt.Errorf("list apply_operations for held-open apply %s (%d): %w", apply.ApplyIdentifier, apply.ID, err)
 	}
 	if len(ops) == 0 {
-		s.logger.Debug("operator: leaving pending stop request for held-open apply with no operation rows",
-			append(apply.LogAttrs(), "driver", driverID)...)
+		logger.Debug("operator: leaving pending stop request for held-open apply with no operation rows",
+			apply.LogAttrs()...)
 		return nil
 	}
 	if missing := apply.MissingExpectedOperationKeys(ops); len(missing) > 0 {
-		s.logger.Debug("operator: leaving pending stop request deliverable for operations the generation manifest still expects",
-			append(apply.LogAttrs(),
-				"driver", driverID, "missing_operation_keys", missing)...)
+		logger.Debug("operator: leaving pending stop request deliverable for operations the generation manifest still expects",
+			append(apply.LogAttrs(), "missing_operation_keys", missing)...)
 		return nil
 	}
 	for _, op := range ops {
 		if !state.IsApplyOperationTerminal(op.State) {
-			s.logger.Debug("operator: leaving pending stop request for held-open apply with an operation the stop has not reached",
+			logger.Debug("operator: leaving pending stop request for held-open apply with an operation the stop has not reached",
 				append(apply.LogAttrs(),
-					"driver", driverID, "operation_deployment", op.Deployment,
+					"operation_deployment", op.Deployment,
 					"operation_state", op.State)...)
 			return nil
 		}
 	}
-	return s.completePendingRequestForResolvedApply(ctx, driverID, apply, storage.ControlOperationStop)
+	return s.completePendingRequestForResolvedApply(ctx, logger, apply, storage.ControlOperationStop)
 }
 
 // completePendingRequestForResolvedApply completes one pending control request
 // for an apply the caller has already established as resolved for that
 // operation. No-op when no request of that operation is pending.
-func (s *Service) completePendingRequestForResolvedApply(ctx context.Context, driverID int, apply *storage.Apply, op storage.ControlOperation) error {
+func (s *Service) completePendingRequestForResolvedApply(ctx context.Context, logger *slog.Logger, apply *storage.Apply, op storage.ControlOperation) error {
 	requests := s.storage.ControlRequests()
 	if requests == nil {
 		return fmt.Errorf("complete pending %s request for resolved apply %s (%d): control request store is not available", op, apply.ApplyIdentifier, apply.ID)
@@ -1921,9 +1937,8 @@ func (s *Service) completePendingRequestForResolvedApply(ctx context.Context, dr
 	if err := requests.CompletePending(ctx, apply.ID, op); err != nil {
 		return fmt.Errorf("complete pending %s request for resolved apply %s (%d): %w", op, apply.ApplyIdentifier, apply.ID, err)
 	}
-	s.logger.Info("operator: completed pending control request for resolved apply",
-		append(apply.LogAttrs(),
-			"driver", driverID, "operation", op)...)
+	logger.Info("operator: completed pending control request for resolved apply",
+		append(apply.LogAttrs(), "operation", op)...)
 	return nil
 }
 
@@ -2222,7 +2237,7 @@ func (s *Service) failOperationWithoutTasks(opCtx, applyCtx context.Context, dri
 	// this path resolves the apply, so it owes any pending stop or cancel the
 	// same settlement every other resolving path gives, before the summary that
 	// discloses it is published.
-	if err := s.completePendingControlRequestsIfApplyResolved(applyCtx, driverID, apply.ID); err != nil {
+	if err := s.completePendingControlRequestsIfApplyResolved(applyCtx, s.driverLogger(driverID), apply.ID); err != nil {
 		s.logger.Error("operator: failed to complete pending control requests after failing task-less operation; terminal summary will omit the command",
 			append(apply.LogAttrs(),
 				"driver", driverID, "apply_operation_id", op.ID,
@@ -2233,6 +2248,30 @@ func (s *Service) failOperationWithoutTasks(opCtx, applyCtx context.Context, dri
 	// publishes the summary here; the gate on OperationCount keeps the single-op
 	// caller (which still publishes via its per-driver observer) unchanged.
 	s.publishTerminalSummaryIfWon(applyCtx, driverID, apply, result)
+}
+
+// postTerminalReconcileSettlesHere reports whether a failed drive is one whose
+// caller settles the apply in place: the drive stored the apply's terminal
+// outcome and only an answer owed after it did not land, so the caller persists
+// the operation row from its terminal tasks and runs the post-drive settlement.
+//
+// A reconcile refused because the apply lease was lost, or cut short by the
+// drive's context, is not one, even though it carries the same sentinel:
+// resumeClaimedApplyWithOptions classifies those first, and a driver that lost
+// its lease or is stopping must write nothing more for the apply. The stored
+// outcome stands either way, and the reaper's sweep of control requests
+// stranded on settled applies answers the request instead.
+func postTerminalReconcileSettlesHere(ctx context.Context, err error) bool {
+	if !errors.Is(err, tern.ErrPostTerminalReconcile) {
+		return false
+	}
+	if errors.Is(err, tern.ErrApplyLeasePresumedLost) || errors.Is(err, storage.ErrApplyLeaseLost) {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil {
+		return false
+	}
+	return true
 }
 
 // resumeClaimedApply drives claimed work through the engine. When
@@ -2424,9 +2463,37 @@ func (s *Service) resumeClaimedApplyWithOptions(ctx context.Context, driverID in
 			}
 			return false, err
 		}
+		if errors.Is(err, tern.ErrTaskRequeueRefused) && ctx.Err() == nil {
+			// The drive could not put a task back to pending, so the task row
+			// stays at rest and the next claim repeats the requeue. Whether the
+			// engine had already accepted the work depends on the path, and the
+			// error says which. This reason makes a requeue that storage keeps
+			// refusing visible as a rate rather than one warning per claim.
+			logger.Error("operator: could not requeue the apply's tasks for the resume; the task rows stay at rest and the next claim retries the requeue",
+				"error", err)
+			metrics.RecordOperatorResumeFailure(ctx, apply.Database, deployment, apply.Environment, "task_requeue_refused")
+			if retryableClaim {
+				metrics.AdjustActiveApplies(ctx, -1, apply.Database, deployment, apply.Environment)
+			}
+			return false, err
+		}
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil {
 			logger.Debug("operator: stopped while running claimed apply",
 				"error", err)
+			if retryableClaim {
+				metrics.AdjustActiveApplies(ctx, -1, apply.Database, deployment, apply.Environment)
+			}
+			return false, err
+		}
+		if errors.Is(err, tern.ErrPostTerminalReconcile) {
+			// The drive stored the apply's terminal outcome; only an answer owed
+			// after it did not land. The stored outcome stands, and the request
+			// it resolves is answered by whichever runs first: the caller's
+			// post-drive settlement, where the caller performs one, or the
+			// reaper's sweep of control requests stranded on settled applies.
+			logger.Warn("operator: drive stored the apply's terminal outcome but could not reconcile after it; the outcome stands and the unanswered requests are settled by the post-drive settlement or the stranded control request sweep",
+				"error", err)
+			metrics.RecordOperatorResumeFailure(ctx, apply.Database, deployment, apply.Environment, "post_terminal_reconcile")
 			if retryableClaim {
 				metrics.AdjustActiveApplies(ctx, -1, apply.Database, deployment, apply.Environment)
 			}

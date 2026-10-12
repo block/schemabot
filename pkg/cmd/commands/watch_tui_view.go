@@ -42,7 +42,7 @@ func (m WatchModel) View() string {
 	if state.IsState(m.state, state.NoActiveChange) {
 		return "No active schema change for this database.\n"
 	}
-	if len(m.operations) > 1 {
+	if templates.RendersOperationSections(m.operations, m.sharded) {
 		return m.fitToWindow(m.multiDeploymentProgressSections())
 	}
 
@@ -130,6 +130,12 @@ func (m WatchModel) progressSections() (string, string) {
 		b.WriteString(m.spinner.View() + msg + m.elapsed() + "\n")
 	case state.IsState(m.state, state.Apply.Pending) && !m.pastPending:
 		b.WriteString(m.spinner.View() + "Starting...\n")
+	}
+
+	if m.sharded {
+		if counts := templates.ShardCounts(m.operations, m.released); counts != "" {
+			fmt.Fprintf(&b, "  Shards:  %s\n", counts)
+		}
 	}
 
 	// Keep the PlanetScale deploy request link visible throughout the apply,
