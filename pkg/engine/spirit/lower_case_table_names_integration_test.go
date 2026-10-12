@@ -37,6 +37,7 @@ func TestEngine_Plan_MatchesTableNamesTheWayTheTargetDoes(t *testing.T) {
 	db, err := sql.Open("block-mysql", dsn)
 	require.NoError(t, err)
 	t.Cleanup(func() { utils.CloseAndLog(db) })
+	require.NoError(t, testutil.PingMySQL(t.Context(), db), "connect to mysql with lower_case_table_names=1")
 	var lctn int
 	require.NoError(t, db.QueryRowContext(t.Context(), "SELECT @@lower_case_table_names").Scan(&lctn))
 	require.Equal(t, 1, lctn)
