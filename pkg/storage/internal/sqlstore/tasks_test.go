@@ -4,6 +4,7 @@ package sqlstore
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"strings"
@@ -1068,6 +1069,63 @@ func testUpsertShardProgressKeepsOneRowPerShard(t *testing.T, newStore func(*tes
 		assert.Equal(t, "orders", stored.TableName)
 		assert.Equal(t, 5, stored.ProgressPercent, "the other key's row keeps its own progress")
 	})
+
+	t.Run("the same table and shard under another operation or namespace keeps its own row", func(t *testing.T) {
+		store.tasks.identity = realInserter
+		otherOpID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+			ApplyID: apply.ID, Deployment: "region-b", Target: "payments",
+		})
+		require.NoError(t, err)
+		_, err = store.db.ExecContext(ctx, `UPDATE apply_operations SET lease_owner = ?, lease_token = ?, lease_acquired_at = NOW() WHERE id = ?`,
+			"driver", "other-op-token", otherOpID)
+		require.NoError(t, err)
+		otherOpCtx := storage.WithOperationLease(ctx, storage.OperationLease{ApplyID: apply.ID, OperationID: otherOpID, Owner: "driver", Token: "other-op-token"})
+		otherOperation := shardTask("accounts", 20)
+		otherOperation.ApplyOperationID = &otherOpID
+		otherNamespace := shardTask("accounts", 30)
+		otherNamespace.Namespace = "ledger"
+
+		require.NoError(t, store.Tasks().UpsertShardProgress(opCtx, shardTask("accounts", 10)))
+		require.NoError(t, store.Tasks().UpsertShardProgress(otherOpCtx, otherOperation))
+		require.NoError(t, store.Tasks().UpsertShardProgress(opCtx, otherNamespace))
+
+		progressByNamespace := map[string]int{}
+		rows, err := store.Tasks().GetShardProgressByApplyOperationID(ctx, opID)
+		require.NoError(t, err)
+		for _, row := range rows {
+			if row.TableName == "accounts" {
+				progressByNamespace[row.Namespace] = row.ProgressPercent
+			}
+		}
+		assert.Equal(t, map[string]int{"payments": 10, "ledger": 30}, progressByNamespace,
+			"the operation keeps one row per namespace for the same table and shard")
+		other, err := store.Tasks().GetShardProgressByApplyOperationID(ctx, otherOpID)
+		require.NoError(t, err)
+		require.Len(t, other, 1, "the other operation keeps its own row for the same table and shard")
+		assert.Equal(t, 20, other[0].ProgressPercent)
+	})
+
+	t.Run("an insert refused for a reason other than a duplicate is returned without a re-read", func(t *testing.T) {
+		insertErr := errors.New("connection reset by peer")
+		store.tasks.identity = failingInsert{err: insertErr}
+
+		err := store.Tasks().UpsertShardProgress(opCtx, shardTask("receipts", 10))
+
+		require.ErrorIs(t, err, insertErr)
+		assert.NotContains(t, err.Error(), "refused as a duplicate", "only a duplicate-key refusal is re-read")
+	})
+}
+
+// failingInsert fails every guarded insert with a fixed error without running
+// it, standing in for a write that storage refused for a reason other than a
+// duplicate key.
+type failingInsert struct {
+	identityInserter
+	err error
+}
+
+func (f failingInsert) InsertGuardedID(context.Context, queryExecer, string, ...any) (int64, bool, error) {
+	return 0, false, f.err
 }
 
 // A guarded shard insert that writes nothing while the lease is still current

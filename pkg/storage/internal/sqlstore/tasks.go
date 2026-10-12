@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"math"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -319,11 +320,11 @@ func (s *taskStore) Update(ctx context.Context, task *storage.Task) error {
 // operation lease when present (it is the narrower claim). The lookup-then-write
 // is serialized by that lease, and a new row's identifier is derived from its
 // key (shardTaskIdentifier), so the unique index on task_identifier also
-// refuses a second row for the same shard. The insert is gated on the matching lease token so a displaced operator fails
-// closed (ErrApplyLeaseLost) instead of writing stale rows. The update path
-// reuses the lease-guarded Update, which applies the same lease precedence. On
-// conflict identity is preserved and the statement text follows the caller's
-// task like every other mutable column.
+// refuses a second row for the same shard. The insert is gated on the matching
+// lease token so a displaced operator fails closed (ErrApplyLeaseLost) instead
+// of writing stale rows. The update path reuses the lease-guarded Update, which
+// applies the same lease precedence. On conflict identity is preserved and the
+// statement text follows the caller's task like every other mutable column.
 func (s *taskStore) UpsertShardProgress(ctx context.Context, task *storage.Task) error {
 	canonicalizeTaskIdentity(task)
 
@@ -423,9 +424,16 @@ func shardKeyPredicate(d Dialect) string {
 // one is what makes the existing unique index on task_identifier refuse a
 // second row for the same shard. The key's parts are hashed rather than
 // concatenated so the identifier fits the column for any table and shard
-// name, and so no choice of separator can make two keys collide.
+// name, and each part is written with its length so two keys cannot share a
+// hash input whatever bytes their names hold.
 func shardTaskIdentifier(operationID int64, namespace, table, shard string) string {
-	sum := sha256.Sum256([]byte(namespace + "\x00" + table + "\x00" + shard))
+	var key strings.Builder
+	for _, part := range []string{namespace, table, shard} {
+		key.WriteString(strconv.Itoa(len(part)))
+		key.WriteByte(':')
+		key.WriteString(part)
+	}
+	sum := sha256.Sum256([]byte(key.String()))
 	return fmt.Sprintf("shard-%d-%s", operationID, hex.EncodeToString(sum[:]))
 }
 

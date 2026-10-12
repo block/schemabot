@@ -1,6 +1,7 @@
 package sqlstore
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -94,4 +95,24 @@ func TestTaskUpdateStatement(t *testing.T) {
 // An unknown guard must not fall back to an unguarded write.
 func TestTaskUpdateStatementRejectsUnknownGuard(t *testing.T) {
 	assert.Panics(t, func() { taskUpdateStatement(MySQLDialect{}, taskLeaseGuard(99)) })
+}
+
+// A shard row's identifier is a function of its key alone: the same key
+// always yields the same identifier, and a change to any one part — the
+// operation, the namespace, the table, or the shard — yields another. The
+// parts are framed by length, so names whose bytes straddle a boundary are
+// still two keys rather than one hash input.
+func TestShardTaskIdentifier(t *testing.T) {
+	base := shardTaskIdentifier(12, "payments", "users", "-80")
+
+	assert.Equal(t, base, shardTaskIdentifier(12, "payments", "users", "-80"))
+	assert.True(t, strings.HasPrefix(base, "shard-12-"), "identifier carries the operation: %s", base)
+	assert.NotEqual(t, base, shardTaskIdentifier(13, "payments", "users", "-80"), "another operation")
+	assert.NotEqual(t, base, shardTaskIdentifier(12, "ledger", "users", "-80"), "another namespace")
+	assert.NotEqual(t, base, shardTaskIdentifier(12, "payments", "Users", "-80"), "another table spelling")
+	assert.NotEqual(t, base, shardTaskIdentifier(12, "payments", "users", "80-"), "another shard")
+	assert.NotEqual(t,
+		shardTaskIdentifier(12, "a\x00b", "c", "-80"),
+		shardTaskIdentifier(12, "a", "b\x00c", "-80"),
+		"parts that share bytes across their boundary are still two keys")
 }
