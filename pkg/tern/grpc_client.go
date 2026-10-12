@@ -3684,11 +3684,13 @@ func (c *GRPCClient) requeueStoppedTasksForRemoteStart(ctx context.Context, appl
 		if !state.IsState(task.State, state.Task.Stopped) {
 			continue
 		}
+		previous := *task
 		oldState := task.State
 		task.State = state.Task.Pending
 		task.CompletedAt = nil
 		if err := c.storage.Tasks().Update(ctx, task); err != nil {
-			return fmt.Errorf("requeue stopped task %s for gRPC apply %s start: %w", task.TaskIdentifier, apply.ApplyIdentifier, err)
+			*task = previous
+			return fmt.Errorf("%w: stopped task %s for gRPC apply %s after the data plane accepted the start: %w", ErrTaskRequeueRefused, task.TaskIdentifier, apply.ApplyIdentifier, err)
 		}
 		c.logTaskStateTransition(ctx, apply.ID, task,
 			fmt.Sprintf("Task %s requeued for start", task.TableName), oldState)
@@ -3701,12 +3703,14 @@ func (c *GRPCClient) prepareDispatchTasks(ctx context.Context, apply *storage.Ap
 		if !state.IsState(task.State, state.Task.FailedRetryable) {
 			continue
 		}
+		previous := *task
 		task.State = state.Task.Pending
 		task.ErrorMessage = ""
 		task.CompletedAt = nil
 		task.Attempt++
 		if err := c.storage.Tasks().Update(ctx, task); err != nil {
-			return fmt.Errorf("reset retryable task %s for queued gRPC apply %s: %w", task.TaskIdentifier, apply.ApplyIdentifier, err)
+			*task = previous
+			return fmt.Errorf("%w: retryable task %s for queued gRPC apply %s before dispatch: %w", ErrTaskRequeueRefused, task.TaskIdentifier, apply.ApplyIdentifier, err)
 		}
 	}
 	return nil

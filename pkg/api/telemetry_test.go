@@ -1029,9 +1029,10 @@ func TestResumeClaimedApplyCountsARefusedTaskRequeue(t *testing.T) {
 	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
 	prevMP := otel.GetMeterProvider()
 	otel.SetMeterProvider(mp)
+	cleanupCtx := context.WithoutCancel(t.Context())
 	t.Cleanup(func() {
 		otel.SetMeterProvider(prevMP)
-		require.NoError(t, mp.Shutdown(t.Context()))
+		require.NoError(t, mp.Shutdown(cleanupCtx))
 	})
 	refused := fmt.Errorf("%w: stopped task task_email for start of apply apply-42: storage unavailable", tern.ErrTaskRequeueRefused)
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))

@@ -114,9 +114,14 @@ var ErrApplyTaskRowMissing = errors.New("apply task row not found on re-read")
 
 // ErrTaskRequeueRefused is returned by a resume whose write putting a
 // failed_retryable task back to pending for a retry, or a stopped task back to
-// pending for a start, did not land. Driving on would run the task's DDL while
-// storage records it at rest, so the drive exits without starting anything and
-// the next claim repeats the requeue. A retry's claim spends one of the
+// pending for a start, did not land. The drive exits with the task row still at
+// rest and the next claim repeats the requeue. A local drive and a gRPC drive
+// dispatching a retry exit before any engine work starts, since running the
+// task's DDL while storage records it at rest would leave work no stored state
+// accounts for. A gRPC drive requeues its stopped tasks only after the data
+// plane accepted the start, so there the remote work is already running; the
+// start request stays pending and the next claim's start is repeated against
+// it before the requeue is retried. A retry's claim spends one of the
 // apply's recovery attempts, so that loop ends with the recovery budget; a
 // start's claim spends none, so the request stays pending until the write
 // lands. The operator counts every exit under its own resume failure reason,
