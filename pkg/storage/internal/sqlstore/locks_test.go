@@ -148,7 +148,8 @@ func TestLockStore_Acquire_RefreshSameOwnerValueAlreadyMatches(t *testing.T) {
 // observed, so a zero-row result has one more cause to tell apart: the same
 // owner replaced the pin in between. Under changed-rows semantics the refresh
 // still succeeds when the concurrent write set the very plan this caller
-// wanted, and reports ErrLockIntentChanged when it set any other plan.
+// wanted, and reports ErrLockIntentChanged when it set any other plan or
+// released the lock.
 func TestLockStore_AcquireIfPendingPlanID_RefreshObservedPinReplaced(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
@@ -204,6 +205,15 @@ func TestLockStore_AcquireIfPendingPlanID_RefreshObservedPinReplaced(t *testing.
 	require.NoError(t, err)
 	require.NotNil(t, lock)
 	assert.Equal(t, "plan-3", lock.PendingPlanID)
+
+	// The lock is released instead: the intent this caller observed is gone
+	// just the same, so the refresh reports the intent change, not a missing
+	// lock, and re-creates nothing.
+	require.NoError(t, store.ForceRelease(ctx, "testdb", "vitess"))
+	require.ErrorIs(t, store.refreshPendingConfirmation(ctx, wanted, asObserved, &observed), storage.ErrLockIntentChanged)
+	lock, err = store.Get(ctx, "testdb", "vitess")
+	require.NoError(t, err)
+	assert.Nil(t, lock, "the refused refresh must not re-create the released lock")
 }
 
 // When the lock changes hands between reading it and refreshing its confirmation

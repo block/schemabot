@@ -222,6 +222,12 @@ func (s *lockStore) refreshPendingConfirmation(ctx context.Context, lock, existi
 			lock.DatabaseName, lock.DatabaseType, lock.Owner, getErr)
 	}
 	if current == nil {
+		if observedPendingPlanID != nil && *observedPendingPlanID != "" {
+			// The caller observed a pin it still expected to hold, and the lock
+			// was released since: the same intent change acquireOnce reports
+			// when it finds the lock already gone.
+			return storage.ErrLockIntentChanged
+		}
 		return storage.ErrLockNotFound
 	}
 	if current.Owner != lock.Owner {
