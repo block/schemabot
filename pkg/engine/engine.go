@@ -379,6 +379,88 @@ func ReleaseCancelledArtifacts(ctx context.Context, eng Engine, req *ReleaseArti
 	return true, result, err
 }
 
+// CancelledResumeStateReclaimer is an optional capability for engines whose
+// drive sets up work in the service it drives before anything in that service
+// owns the work's teardown, and records the work in the apply's stored resume
+// state so a later drive can continue from it. A PlanetScale branch before its
+// deploy request is one: the deploy request tears the branch down once it
+// exists, and until then the branch is kept only so a resume can finish
+// preparing it.
+//
+// A cancel that reaches a running drive ends that drive, and the drive
+// reclaims the work on its way out. A cancel that lands between drives has no
+// drive to end: the previous drive exited with the work recorded in stored
+// state, and the drive that consumes the cancel stands down before it ever
+// resumes from that state. The stored state is then the only record of the
+// work, and this capability is how the cancel reclaims it.
+//
+// The reclaim is stateless by design, like ReleaseCancelledArtifacts: it may
+// run on an instance that never drove the apply, so it takes the stored state
+// and the apply's options from the caller rather than from memory. Work the
+// service already owns the teardown of (a branch with a deploy request) is
+// left to the service; work SchemaBot did not create (an operator-supplied
+// branch) is left to its owner. Both are logged, not reclaimed.
+type CancelledResumeStateReclaimer interface {
+	// ReclaimCancelledResumeState removes the work the stored resume state
+	// names when nothing else owns its teardown and SchemaBot created it, and
+	// reports what it removed and what it left in place. Callers must hold
+	// the claim on the cancelled apply, so no drive is resuming from the same
+	// state while the reclaim runs. Work already gone from the service is not
+	// an error: a drive may have reclaimed it before the cancel reached the
+	// stored state.
+	//
+	// A reclaim that fails returns the work it had to leave behind in the
+	// result alongside the error, so the caller can tell an operator what to
+	// remove by hand without reading the error text.
+	ReclaimCancelledResumeState(ctx context.Context, req *ReclaimResumeStateRequest) (*ReclaimResumeStateResult, error)
+}
+
+// ReclaimResumeStateResult reports what a reclaim removed and what it left in
+// place, in words an operator recognises from the service the engine drives.
+// Both are empty when the stored state named nothing that needed reclaiming,
+// which is the ordinary outcome for a cancel of an apply whose work the
+// service already owns.
+type ReclaimResumeStateResult struct {
+	// Reclaimed names each piece of work the reclaim removed.
+	Reclaimed []string
+	// Kept names each piece of work the reclaim left in place, and KeptReason
+	// says why in terms an operator can act on. Empty when Kept is empty.
+	Kept       []string
+	KeptReason string
+}
+
+// ReclaimResumeStateRequest carries what a reclaim needs to find the work and
+// decide whether it is SchemaBot's to remove.
+type ReclaimResumeStateRequest struct {
+	Database    string
+	Credentials *Credentials
+	// Options are the apply's stored options as a whole, as the drive received
+	// them; an engine reads them to tell work it created from work the operator
+	// supplied. A subset built for another purpose can hand an operator's work
+	// to the reclaim.
+	Options map[string]string
+	// ResumeState is the apply's stored engine state. Nil means nothing was
+	// ever persisted, so there is nothing to reclaim.
+	ResumeState *ResumeState
+	// Logger is an optional logger scoped to the schema change, as on
+	// ApplyRequest. Nil falls back to the engine's configured logger.
+	Logger *slog.Logger
+}
+
+// ReclaimCancelledResumeState reclaims the work eng's stored resume state
+// names when eng owns such work at all, and reports whether the engine
+// implements the capability. An engine that does not keeps no work between
+// drives that a cancel must reclaim, so there is nothing to do and nothing to
+// report.
+func ReclaimCancelledResumeState(ctx context.Context, eng Engine, req *ReclaimResumeStateRequest) (supported bool, result *ReclaimResumeStateResult, err error) {
+	reclaimer, ok := eng.(CancelledResumeStateReclaimer)
+	if !ok {
+		return false, nil, nil
+	}
+	result, err = reclaimer.ReclaimCancelledResumeState(ctx, req)
+	return true, result, err
+}
+
 // Credentials contains the resolved credentials for accessing a database.
 // These are populated by the service layer from discovery before calling the engine.
 type Credentials struct {

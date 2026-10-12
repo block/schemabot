@@ -590,3 +590,82 @@ func TestResumeApply_FailureAfterTheDeployRequestLeavesTheBranchToIt(t *testing.
 	require.ErrorContains(t, err, "deploy request #42 failed on resume")
 	assert.Empty(t, client.deleteAttempts())
 }
+
+// A cancel that lands between drives finds the branch only in the apply's
+// stored resume state: the drive that created it has exited, and the drive
+// consuming the cancel stands down before it resumes. The reclaim deletes a
+// branch SchemaBot created and no deploy request owns, and leaves alone a
+// branch the deploy request tears down, a branch the operator supplied, and a
+// branch a drive already removed, reporting each so the apply log can say what
+// is still in PlanetScale and why.
+func TestReclaimCancelledResumeState(t *testing.T) {
+	const ownedBranch = "schemabot-commerce-1a2b"
+	tests := []struct {
+		name          string
+		meta          *psMetadata
+		options       map[string]string
+		deleteErr     error
+		wantAttempts  []string
+		wantReclaimed []string
+		wantKept      []string
+		wantErr       string
+	}{
+		{
+			name: "a branch with no deploy request is deleted", meta: &psMetadata{BranchName: ownedBranch},
+			wantAttempts: []string{ownedBranch}, wantReclaimed: []string{"branch " + ownedBranch},
+		},
+		{
+			name: "a branch its deploy request owns is left to the deploy request", meta: &psMetadata{BranchName: ownedBranch, DeployRequestID: 42},
+		},
+		{
+			name: "an operator-supplied branch is kept for the operator", meta: &psMetadata{BranchName: "my-dev-branch"}, options: map[string]string{"branch": "my-dev-branch"},
+			wantKept: []string{"branch my-dev-branch"},
+		},
+		{
+			name: "a branch a drive already removed is not a failure", meta: &psMetadata{BranchName: ownedBranch}, deleteErr: &ps.Error{Code: ps.ErrNotFound},
+			wantAttempts: []string{ownedBranch},
+		},
+		{
+			name: "a delete that fails reports the branch as left in place", meta: &psMetadata{BranchName: ownedBranch}, deleteErr: errors.New("planetscale unavailable"),
+			wantAttempts: []string{ownedBranch}, wantKept: []string{"branch " + ownedBranch},
+			wantErr: "delete branch " + ownedBranch + " of the cancelled apply on commerce: planetscale unavailable",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client := &resumeReclaimClient{deleteErr: tt.deleteErr}
+			encoded, err := encodePSMetadata(tt.meta)
+			require.NoError(t, err)
+
+			result, err := conformanceEngine(client).ReclaimCancelledResumeState(t.Context(), &engine.ReclaimResumeStateRequest{
+				Database:    "commerce",
+				Credentials: conformanceCredentials(),
+				Options:     tt.options,
+				ResumeState: &engine.ResumeState{Metadata: encoded},
+			})
+
+			if tt.wantErr != "" {
+				require.EqualError(t, err, tt.wantErr)
+			} else {
+				require.NoError(t, err)
+			}
+			require.NotNil(t, result)
+			assert.Equal(t, tt.wantAttempts, client.deleteAttempts(), "a kept branch is never sent a delete")
+			assert.Equal(t, tt.wantReclaimed, result.Reclaimed)
+			assert.Equal(t, tt.wantKept, result.Kept)
+			assert.Equal(t, len(tt.wantKept) > 0, result.KeptReason != "", "a kept branch carries its reason")
+		})
+	}
+
+	t.Run("an apply that persisted no state holds no branch", func(t *testing.T) {
+		client := &resumeReclaimClient{}
+		result, err := conformanceEngine(client).ReclaimCancelledResumeState(t.Context(), &engine.ReclaimResumeStateRequest{
+			Database:    "commerce",
+			Credentials: conformanceCredentials(),
+		})
+		require.NoError(t, err)
+		assert.Empty(t, result.Reclaimed)
+		assert.Empty(t, result.Kept)
+		assert.Empty(t, client.deleteAttempts())
+	})
+}

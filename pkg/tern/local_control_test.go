@@ -927,6 +927,68 @@ func TestLocalClient_CancelEndsTheDriveWithTheOperatorCause(t *testing.T) {
 	assert.Equal(t, state.Apply.Cancelled, apply.State)
 }
 
+// resumeStateReclaimEngine mimics an engine that keeps work between drives in
+// the service it drives, recorded in stored resume state, and reports what a
+// cancel's reclaim removed.
+type resumeStateReclaimEngine struct {
+	controlCaptureEngine
+	reclaimReq *engine.ReclaimResumeStateRequest
+}
+
+func (e *resumeStateReclaimEngine) ReclaimCancelledResumeState(_ context.Context, req *engine.ReclaimResumeStateRequest) (*engine.ReclaimResumeStateResult, error) {
+	e.reclaimReq = req
+	return &engine.ReclaimResumeStateResult{Reclaimed: []string{"branch schemabot-testdb-1a2b"}}, nil
+}
+
+// A PlanetScale drive persisted its branch and exited before creating the
+// deploy request, leaving the apply's tasks pending. An operator's cancel is
+// then consumed by the drive that claims the apply next, before that drive
+// resumes: no drive is running to end, so no drive's own cleanup ever sees the
+// branch. The cancel hands the stored resume state to the engine with the
+// apply's own options, so the branch is reclaimed rather than stranded, and
+// the apply log says what was removed.
+func TestLocalClient_PendingCancelReclaimsTheBranchFromStoredResumeState(t *testing.T) {
+	operationID := int64(99)
+	apply := &storage.Apply{
+		ID:              42,
+		ApplyIdentifier: "apply-vitess-pending-cancel-branch",
+		State:           state.Apply.PreparingBranch,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeVitess,
+	}
+	apply.SetOptions(storage.ApplyOptions{DeferCutover: true})
+	task := &storage.Task{
+		ID:               7,
+		ApplyID:          apply.ID,
+		ApplyOperationID: &operationID,
+		TaskIdentifier:   "task-vitess-pending-cancel-branch",
+		State:            state.Task.Pending,
+	}
+	resumeState := engineResumeStateFromPlanetScaleData(t, operationID, planetscale.ResumeData{BranchName: "schemabot-testdb-1a2b"})
+	controlRequests := pendingControlRequestStore(apply.ID, storage.ControlOperationCancel)
+	eng := &resumeStateReclaimEngine{}
+	client := newVitessControlTestClientWithRequests(apply, []*storage.Task{task}, resumeState, eng, controlRequests)
+	logs := &mockApplyLogStore{}
+	client.storage.(*controlTestStorage).applyLogs = logs
+
+	standDown, err := client.processPendingCancelControlRequest(t.Context(), apply)
+
+	require.NoError(t, err)
+	assert.True(t, standDown)
+	assert.Nil(t, eng.cancelReq, "a pending task has no live engine work to cancel")
+	require.NotNil(t, eng.reclaimReq, "the cancel must hand the stored resume state to the engine")
+	assert.Equal(t, resumeState.Metadata, eng.reclaimReq.ResumeState.Metadata)
+	assert.Equal(t, apply.GetOptions().Map(), eng.reclaimReq.Options, "the engine decides from the apply's own stored options")
+	assert.Equal(t, "testdb", eng.reclaimReq.Database)
+	assert.Equal(t, state.Task.Cancelled, task.State)
+	assert.Equal(t, state.Apply.Cancelled, apply.State)
+	var messages []string
+	for _, log := range logs.logs {
+		messages = append(messages, log.Message)
+	}
+	assert.Contains(t, messages, "Removed what the cancelled schema change had set up: branch schemabot-testdb-1a2b")
+}
+
 // A PlanetScale failed_retryable task paused after a transient failure (e.g.
 // repeated progress-poll errors) still has its created, startable deploy request
 // and persisted resume state. Cancel must cancel that deploy request via the
