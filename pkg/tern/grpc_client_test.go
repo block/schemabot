@@ -7902,6 +7902,114 @@ func TestGRPCClient_ResumeApplyPublishesResumingUntilDataPlaneLeavesStopped(t *t
 	assert.Nil(t, startReq, "the start control request must be completed once the resume is driven")
 }
 
+// The gRPC drive's two requeue writes report a refusal the same way the local
+// drive does: as ErrTaskRequeueRefused wrapping the storage error, with the
+// task left as storage holds it, so the operator counts the exit under its own
+// reason. The retry requeue runs before dispatch; the start requeue runs after
+// the data plane accepted the start, and its error says so.
+func TestGRPCClient_RefusedTaskRequeueIsTyped(t *testing.T) {
+	storageErr := errors.New("storage unavailable")
+	apply := &storage.Apply{ID: 1, ApplyIdentifier: "apply-grpc-requeue-refused", Database: "testdb", Environment: "staging"}
+	cases := []struct {
+		name     string
+		task     *storage.Task
+		requeue  func(c *GRPCClient, ctx context.Context, tasks []*storage.Task) error
+		wantText string
+	}{
+		{
+			name: "retryable task before dispatch",
+			task: &storage.Task{TaskIdentifier: "t-retry", ApplyID: 1, TableName: "users", State: state.Task.FailedRetryable, ErrorMessage: "connection reset", Attempt: 2},
+			requeue: func(c *GRPCClient, ctx context.Context, tasks []*storage.Task) error {
+				return c.prepareDispatchTasks(ctx, apply, tasks)
+			},
+			wantText: "retryable task t-retry for queued gRPC apply apply-grpc-requeue-refused before dispatch",
+		},
+		{
+			name: "stopped task after the data plane accepted the start",
+			task: &storage.Task{TaskIdentifier: "t-stopped", ApplyID: 1, TableName: "users", State: state.Task.Stopped},
+			requeue: func(c *GRPCClient, ctx context.Context, _ []*storage.Task) error {
+				return c.requeueStoppedTasksForRemoteStart(ctx, apply, wholeApplyTaskScope())
+			},
+			wantText: "stopped task t-stopped for gRPC apply apply-grpc-requeue-refused after the data plane accepted the start",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			client, cleanup := testCapturingGRPCClient(t, &capturingTernServer{})
+			defer cleanup()
+			arrived := *tc.task
+			taskStore := &mockTaskStore{tasks: []*storage.Task{tc.task}, updateErr: storageErr}
+			client.storage = &mockStorage{applies: &mockApplyStore{apply: apply}, tasks: taskStore, logs: &mockApplyLogStore{}}
+
+			err := tc.requeue(client, t.Context(), []*storage.Task{tc.task})
+
+			require.ErrorIs(t, err, ErrTaskRequeueRefused)
+			require.ErrorIs(t, err, storageErr)
+			assert.ErrorContains(t, err, tc.wantText)
+			assert.Equal(t, arrived, *tc.task, "a refused requeue leaves the task as storage holds it")
+		})
+	}
+}
+
+func TestGRPCClient_RefusedStartRequeueIsRetriedByTheNextClaim(t *testing.T) {
+	// The data plane accepts an operator's start, then storage refuses the
+	// write that requeues the stopped task. The drive exits with the task row
+	// still stopped and the start request still pending. By the next claim the
+	// data plane has left stopped, so that claim adopts the running state; it
+	// must still requeue the stopped task before completing the start request,
+	// or the row would stay pinned at stopped while the data plane copies.
+	server := &capturingTernServer{
+		progressStates: []ternv1.State{ternv1.State_STATE_STOPPED},
+	}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+
+	storedApply := &storage.Apply{
+		ID: 1, ApplyIdentifier: "apply-start-requeue-retry", Database: "testdb", Environment: "staging",
+		ExternalID: "remote-start-requeue-retry", State: state.Apply.Stopped,
+	}
+	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{{
+		ApplyID: storedApply.ID, Operation: storage.ControlOperationStart, Status: storage.ControlRequestPending,
+	}}}
+	task := &storage.Task{TaskIdentifier: "t-stopped", ApplyID: 1, TableName: "users", State: state.Task.Stopped}
+	taskStore := &mockTaskStore{tasks: []*storage.Task{task}, updateErr: errors.New("storage unavailable")}
+	client.storage = &mockStorage{
+		applies:         &mockApplyStore{apply: storedApply},
+		tasks:           taskStore,
+		logs:            &mockApplyLogStore{},
+		controlRequests: controlRequests,
+	}
+
+	firstClaim := *storedApply
+	err := client.ResumeApply(t.Context(), &firstClaim)
+	require.ErrorIs(t, err, ErrTaskRequeueRefused)
+	assert.True(t, server.startWasCalled(), "the data plane accepted the start before the requeue was refused")
+	assert.Equal(t, state.Task.Stopped, task.State, "a refused requeue leaves the task row stopped")
+	pending, err := controlRequests.GetPending(t.Context(), storedApply.ID, storage.ControlOperationStart)
+	require.NoError(t, err)
+	require.NotNil(t, pending, "the start request stays pending while its requeue is refused")
+
+	taskStore.updateErr = nil
+	server.mu.Lock()
+	server.startCalled = false
+	server.progressStates = []ternv1.State{ternv1.State_STATE_RUNNING, ternv1.State_STATE_RUNNING}
+	server.mu.Unlock()
+
+	secondClaim := *storedApply
+	require.NoError(t, client.ResumeApply(t.Context(), &secondClaim))
+	assert.False(t, server.startWasCalled(), "a data plane that already left stopped is not started again")
+	var requeued bool
+	for _, written := range taskStore.updated {
+		if written.TaskIdentifier == task.TaskIdentifier && state.IsState(written.State, state.Task.Pending) {
+			requeued = true
+		}
+	}
+	assert.True(t, requeued, "the next claim requeues the stopped task to pending")
+	pending, err = controlRequests.GetPending(t.Context(), storedApply.ID, storage.ControlOperationStart)
+	require.NoError(t, err)
+	assert.Nil(t, pending, "the start request completes once the requeue lands")
+}
+
 func TestGRPCClient_RequeueStoppedTasksForRemoteStart(t *testing.T) {
 	// When the data plane accepts a start, the gRPC drive must requeue the apply's
 	// stopped task rows to pending. Otherwise taskStateWithNoBackwardProgress pins
