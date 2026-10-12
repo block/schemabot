@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -18,6 +19,7 @@ import (
 
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
+	"github.com/block/schemabot/pkg/mysqlconn"
 	"github.com/block/schemabot/pkg/mysqlerr"
 )
 
@@ -130,19 +132,9 @@ func (e *Engine) executeSchemaChange(ctx context.Context, host, username, passwo
 		return
 	}
 
-	// A cancelled context means the operator stopped the change; engine state
-	// must remain Stopped, so do not overwrite it with StateCompleted.
-	if ctx.Err() != nil {
-		logger.Info("schema change stopped before completion",
-			"database", database,
-			"reason", ctx.Err(),
-		)
-		return
-	}
-
-	// Completion is signalled only after every phase has run, so a poller never
-	// observes StateCompleted while a later DROP phase is still pending.
-	e.setSchemaChangeCompleted()
+	// Every phase ran every statement, so the change completed, even if a stop
+	// or cancel arrived after the last one landed (see completeSchemaChange).
+	e.completeSchemaChange(ctx, logger, database)
 }
 
 // resumeSchemaChange continues a stopped schema change to completion.
@@ -163,17 +155,7 @@ func (e *Engine) resumeSchemaChange(ctx context.Context, host, username, passwor
 	}
 
 	if err := e.executeSpiritMigration(ctx, host, username, password, database, combinedStatement, deferCutover); err != nil {
-		return // Error already logged and state set; on stop the state stays Stopped.
-	}
-
-	// A stop during the resumed ALTER cancels the context; leave the state
-	// Stopped and do not run the pending DROP phase.
-	if ctx.Err() != nil {
-		logger.Info("schema change stopped during resumed ALTER",
-			"database", database,
-			"reason", ctx.Err(),
-		)
-		return
+		return // Failure already logged and recorded; a stop leaves the state Stopped.
 	}
 
 	phases, err := classifyDDLPhases(originalDDLs)
@@ -187,14 +169,28 @@ func (e *Engine) resumeSchemaChange(ctx context.Context, host, username, passwor
 		return
 	}
 
+	e.completeSchemaChange(ctx, logger, database)
+}
+
+// completeSchemaChange records a change whose every phase ran every statement
+// as completed. Completion is signalled only after the last phase, so a poller
+// never observes StateCompleted while a later DROP phase is still pending.
+//
+// It is recorded even when a stop or cancel cancelled the context after the
+// last statement landed, typically a Spirit cutover that committed just before
+// the cancel reached it. The target then holds the whole change, so recording
+// the stop the caller asked for would describe a resumable pause of a change
+// that already landed. Stop and Cancel read the state again once the runner has
+// returned, and answer that the change completed (see settleAfterRunnerExit).
+// A stop that lands before the last statement keeps the change stopped, since
+// that statement or a later phase returns early on the cancelled context.
+func (e *Engine) completeSchemaChange(ctx context.Context, logger *slog.Logger, database string) {
 	if ctx.Err() != nil {
-		logger.Info("schema change stopped before completion",
+		logger.Info("schema change completed after its context was cancelled by a stop, cancel, or shutdown; recording it completed, since the target holds the whole change",
 			"database", database,
 			"reason", ctx.Err(),
 		)
-		return
 	}
-
 	e.setSchemaChangeCompleted()
 }
 
@@ -267,11 +263,10 @@ func (e *Engine) executeCreateStatements(ctx context.Context, host, username, pa
 // execution, runs the direct statements first (each is synchronous and fast
 // relative to an online copy, and a routing or direct failure should surface
 // before hours of copying), then combines the Spirit-accepted statements into
-// one runner. It returns true when the phase ran and the caller may proceed
-// to the DROP phase, and false on a genuine failure (the failing step has
-// already set StateFailed). A stop cancels the context but may return true;
-// the caller's later ctx.Err() checks then keep the state Stopped without
-// running further phases.
+// one runner. It returns true when every statement ran and the caller may
+// proceed to the DROP phase. It returns false when the phase did not finish:
+// after a genuine failure (the failing step has already set StateFailed), or
+// after a stop, which leaves the state Stopped.
 func (e *Engine) executeAlterPhase(ctx context.Context, host, username, password, database string, alters []string, deferCutover bool, policy directPolicy) bool {
 	target := &lazyTargetDB{dsn: targetDSN(host, username, password, database)}
 	defer target.close()
@@ -286,7 +281,7 @@ func (e *Engine) executeAlterPhase(ctx context.Context, host, username, password
 
 	if len(routing.direct) > 0 {
 		if !e.executeDirectStatements(ctx, target, database, routing.direct, policy) {
-			return ctx.Err() != nil
+			return false
 		}
 	}
 
@@ -384,7 +379,14 @@ func (e *Engine) executeSingleStatement(ctx context.Context, host, username, pas
 	return nil
 }
 
-// executeSpiritMigration runs Spirit for ALTER statements.
+// errSchemaChangeStopped is returned by executeSpiritMigration when the runner
+// returned because a stop or cancel cancelled its context. The state is left
+// as the stop or cancel set it.
+var errSchemaChangeStopped = errors.New("schema change stopped before the ALTER finished")
+
+// executeSpiritMigration runs Spirit for ALTER statements. A nil return means
+// the runner finished the ALTER, cutover included, even when the context was
+// cancelled while it ran.
 func (e *Engine) executeSpiritMigration(ctx context.Context, host, username, password, database, combinedStatement string, deferCutover bool) error {
 	logger := e.changeLogger()
 	// Parse statements to extract table names
@@ -466,7 +468,7 @@ func (e *Engine) executeSpiritMigration(ctx context.Context, host, username, pas
 			)
 			// Don't change state - Stop() already set it to StateStopped
 			utils.CloseAndLog(runner)
-			return nil
+			return errSchemaChangeStopped
 		}
 		logger.Error("schema change failed",
 			"error", err,
@@ -478,8 +480,74 @@ func (e *Engine) executeSpiritMigration(ctx context.Context, host, username, pas
 	}
 
 	utils.CloseAndLog(runner)
+	if ctx.Err() != nil {
+		// The runner finished the ALTER on a context a stop, cancel, or halt
+		// had cancelled, so Spirit's own drop of the swapped-out originals,
+		// which runs on that context, may have been refused. Finish it here
+		// so the completed change leaves the target as an uninterrupted run
+		// would have.
+		e.dropCutoverOriginalsLeftByCancel(context.WithoutCancel(ctx), targetDSN(host, username, password, database), database, tables)
+	}
 	logger.Info("ALTER phase completed", "database", database, "tables", tables)
 	return nil
+}
+
+// cutoverOriginalDropTimeout bounds the drop of the swapped-out originals a
+// cancelled run left behind. It runs on a detached context, since the one the
+// run had is already cancelled, so it needs a bound of its own: a drop can wait
+// on the table's metadata lock, and the stop or cancel that is waiting for the
+// runner should not wait on a server that stopped responding.
+const cutoverOriginalDropTimeout = 2 * time.Minute
+
+// dropCutoverOriginalsLeftByCancel drops the _old tables a completed cutover
+// left on the target because the run's context was cancelled before Spirit
+// dropped them. Spirit drops each swapped-out original on the run's own context
+// after the cutover commits, and only logs a refusal, so a cancel that lands
+// between the commit and that drop leaves the whole original table on the
+// target while the runner still returns having finished the change. Dropping it
+// here mirrors what the uninterrupted run does: the change completed, so the
+// original is disposed of the way every completed cutover disposes of it. A
+// failure is logged with the tables left behind, never returned: the change has
+// completed whatever became of its leftovers.
+func (e *Engine) dropCutoverOriginalsLeftByCancel(ctx context.Context, dsn, database string, tables []string) {
+	ctx, cancel := context.WithTimeout(ctx, cutoverOriginalDropTimeout)
+	defer cancel()
+	logger := e.changeLogger()
+
+	originals := make([]string, 0, len(tables))
+	for _, table := range tables {
+		originals = append(originals, utils.OldTableName(table))
+	}
+	leftover, err := func() ([]string, error) {
+		db, err := mysqlconn.Open(dsn)
+		if err != nil {
+			return originals, fmt.Errorf("open database %s: %w", database, err)
+		}
+		defer utils.CloseAndLog(db)
+		if err := db.PingContext(ctx); err != nil {
+			return originals, fmt.Errorf("connect to database %s: %w", database, err)
+		}
+		present, err := existingTables(ctx, db, database, originals)
+		if err != nil {
+			return originals, err
+		}
+		if len(present) == 0 {
+			return nil, nil
+		}
+		logger.Info("dropping the swapped-out originals Spirit left behind because the run's context was cancelled after the cutover committed",
+			"database", database,
+			"tables", present,
+		)
+		discarded, err := discardArtifacts(ctx, db, database, present)
+		return present[len(discarded):], err
+	}()
+	if err != nil {
+		logger.Warn("the schema change completed but its swapped-out originals could not be dropped; drop them by hand to reclaim their space",
+			"database", database,
+			"tables", leftover,
+			"error", err,
+		)
+	}
 }
 
 func (e *Engine) setSchemaChangeCompleted() {
