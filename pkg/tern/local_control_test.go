@@ -895,6 +895,38 @@ func TestLocalClient_CancelWaitingForDeployCancelsDeployRequest(t *testing.T) {
 	assert.Equal(t, state.Apply.Cancelled, apply.State)
 }
 
+// An operator cancels a PlanetScale apply whose drive is still preparing its
+// branch, before any deploy request exists. Nothing on the engine is live to
+// cancel, so the drive is cancelled directly, and it is cancelled with the
+// operator's cause: the engine tells that apart from a lost lease or a
+// shutdown, and deletes the branch no driver will resume.
+func TestLocalClient_CancelEndsTheDriveWithTheOperatorCause(t *testing.T) {
+	apply := &storage.Apply{
+		ID:              42,
+		ApplyIdentifier: "apply-vitess-preparing-branch",
+		State:           state.Apply.PreparingBranch,
+	}
+	task := &storage.Task{
+		ID:             7,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task-vitess-preparing-branch",
+		State:          state.Task.Pending,
+	}
+	eng := &controlCaptureEngine{}
+	client := newVitessControlTestClient(apply, []*storage.Task{task}, nil, eng)
+	driveCtx, cancelDrive := context.WithCancelCause(t.Context())
+	defer cancelDrive(nil)
+	defer client.clearApplyCancel(client.setApplyCancel(cancelDrive))
+
+	resp, err := client.cancelOwnedApply(t.Context(), &ternv1.CancelRequest{ApplyId: apply.ApplyIdentifier}, "")
+
+	require.NoError(t, err)
+	assert.True(t, resp.Accepted)
+	require.Error(t, driveCtx.Err(), "the cancel ends the drive")
+	assert.True(t, engine.CancelledByOperator(driveCtx), "the drive ends with the operator's cause, got %v", context.Cause(driveCtx))
+	assert.Equal(t, state.Apply.Cancelled, apply.State)
+}
+
 // A PlanetScale failed_retryable task paused after a transient failure (e.g.
 // repeated progress-poll errors) still has its created, startable deploy request
 // and persisted resume state. Cancel must cancel that deploy request via the

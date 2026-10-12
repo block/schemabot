@@ -140,11 +140,12 @@ func TestApplyDeletesItsOwnBranchWhenItFailsBeforeTheDeployRequest(t *testing.T)
 // whose instance is shutting down.
 type handbackClient struct {
 	branchLifecycleClient
-	cancel context.CancelFunc
+	cancel context.CancelCauseFunc
+	cause  error
 }
 
 func (c *handbackClient) CreateBranchPassword(ctx context.Context, _ *ps.DatabaseBranchPasswordRequest) (*ps.DatabaseBranchPassword, error) {
-	c.cancel()
+	c.cancel(c.cause)
 	return nil, ctx.Err()
 }
 
@@ -153,26 +154,29 @@ func (c *handbackClient) CreateBranchPassword(ctx context.Context, _ *ps.Databas
 // Deleting that branch would discard the resume's starting point, and after a
 // lost lease would pull it from under a peer already preparing it. A branch
 // the stored state never named, because no state was recorded or because
-// storage refused the save, cannot be resumed, so it is still deleted. Either
-// way the decision is logged on the apply's logger, so an operator filtering
-// on the apply id sees what became of its branch.
+// storage refused the save, cannot be resumed, so it is still deleted, and so
+// is the branch of a drive an operator cancelled, since no driver resumes a
+// cancelled apply. Either way the decision is logged on the apply's logger, so
+// an operator filtering on the apply id sees what became of its branch.
 func TestApplyKeepsItsBranchForTheDriverThatResumesIt(t *testing.T) {
 	shortenEngineWaits(t)
 	tests := []struct {
 		name        string
 		recorded    bool
 		saveErr     error
+		cause       error
 		wantDeleted bool
 	}{
 		{name: "a branch the stored resume state names is kept", recorded: true, wantDeleted: false},
 		{name: "a branch the stored resume state never named is deleted", recorded: false, wantDeleted: true},
 		{name: "a branch whose resume state storage refused is deleted", recorded: true, saveErr: errors.New("apply apply-0123456789abcdef: storage unavailable"), wantDeleted: true},
+		{name: "the stored branch of an apply an operator cancelled is deleted", recorded: true, cause: engine.ErrCancelledByOperator, wantDeleted: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			ctx, cancel := context.WithCancel(t.Context())
-			defer cancel()
-			client := &handbackClient{cancel: cancel}
+			ctx, cancel := context.WithCancelCause(t.Context())
+			defer cancel(nil)
+			client := &handbackClient{cancel: cancel, cause: tt.cause}
 			var stored []*engine.ResumeState
 			req := &engine.ApplyRequest{
 				PlanID:      "plan-0123456789abcdef",
@@ -317,20 +321,23 @@ func (c *resumeReclaimClient) DeleteBranch(ctx context.Context, req *ps.DeleteDa
 // only when the branch is not SchemaBot's to delete or another drive may still
 // need it: an operator-supplied branch belongs to the operator, and a drive
 // whose context ended is handing the apply to the driver that resumes it from
-// that branch. A kept branch is never sent a delete, and each outcome is
+// that branch, unless an operator cancelled the apply, which no driver
+// resumes. A kept branch is never sent a delete, and each outcome is
 // logged on the apply's logger with the reason.
 func TestReclaimBranchAfterFailedResume(t *testing.T) {
 	const ownedBranch = "schemabot-commerce-1a2b"
 	permanent := engine.NewPermanentError("branch differs from the declared schema on tables the plan does not change (commerce.legacy_audit)")
 	unclassified := errors.New("fetch branch schemabot-commerce-1a2b schema via MySQL on resume: connection refused")
 	tests := []struct {
-		name        string
-		branch      string
-		options     map[string]string
-		cause       error
-		driveEnded  bool
-		wantDeleted []string
-		wantLog     string
+		name       string
+		branch     string
+		options    map[string]string
+		cause      error
+		driveEnded bool
+		// operatorCancelled ends the drive with the operator's cancel cause.
+		operatorCancelled bool
+		wantDeleted       []string
+		wantLog           string
 	}{
 		{
 			name: "a permanent failure deletes the branch SchemaBot created", branch: ownedBranch, cause: permanent,
@@ -350,13 +357,25 @@ func TestReclaimBranchAfterFailedResume(t *testing.T) {
 			name: "a drive that ended keeps the branch for the driver that resumes it", branch: ownedBranch, cause: permanent, driveEnded: true,
 			wantLog: "resumed drive ended before its deploy request; keeping the branch for the driver that resumes the apply",
 		},
+		{
+			name: "a drive an operator cancelled deletes the branch no driver will resume", branch: ownedBranch, cause: permanent, operatorCancelled: true,
+			wantDeleted: []string{ownedBranch},
+			wantLog:     "deleted the branch created for an apply that failed before its deploy request",
+		},
+		{
+			name: "an operator cancel still keeps an operator-supplied branch", branch: "my-dev-branch", options: map[string]string{"branch": "my-dev-branch"}, cause: permanent, operatorCancelled: true,
+			wantLog: "resumed apply failed before its deploy request; keeping the operator-supplied branch",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			ctx, cancel := context.WithCancel(t.Context())
-			defer cancel()
+			ctx, cancel := context.WithCancelCause(t.Context())
+			defer cancel(nil)
 			if tt.driveEnded {
-				cancel()
+				cancel(nil)
+			}
+			if tt.operatorCancelled {
+				cancel(engine.ErrCancelledByOperator)
 			}
 			client := &resumeReclaimClient{}
 			req := resumeRequest(t, &psMetadata{BranchName: tt.branch}, "apply-1a2b3c4d5e6f7890")

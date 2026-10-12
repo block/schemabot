@@ -687,7 +687,7 @@ type stopCancellingEngine struct {
 }
 
 func (e *stopCancellingEngine) Progress(ctx context.Context, req *engine.ProgressRequest) (*engine.ProgressResult, error) {
-	e.client.cancelApplyHandle(e.client.currentApplyCancel())
+	e.client.cancelApplyHandle(e.client.currentApplyCancel(), nil)
 	return e.fakeControlEngine.Progress(ctx, req)
 }
 
@@ -774,8 +774,8 @@ func TestLaunchAtomicResume_StopCancellingTheDriveIsNotAnEngineFailure(t *testin
 	observer := &terminalRecordingObserver{}
 	client.SetObserver(apply.ID, observer)
 
-	driveCtx, cancelDrive := context.WithCancel(t.Context())
-	defer cancelDrive()
+	driveCtx, cancelDrive := context.WithCancelCause(t.Context())
+	defer cancelDrive(nil)
 	generation := client.setApplyCancel(cancelDrive)
 	defer client.clearApplyCancel(generation)
 

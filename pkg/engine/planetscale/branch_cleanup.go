@@ -68,7 +68,8 @@ func (e *Engine) deleteOwnedBranch(ctx context.Context, logger *slog.Logger, cli
 // when another drive may still need it, or when it is not SchemaBot's to
 // delete: an operator-supplied branch belongs to the operator, and a drive
 // whose context ended is handing the apply to the driver that resumes it from
-// this branch. Each kept branch is logged with the reason, so a branch left
+// this branch, unless an operator cancelled it, since no driver resumes a
+// cancelled apply. Each kept branch is logged with the reason, so a branch left
 // behind is explained rather than silent.
 //
 // The stored state names the resumed branch, so the delete stays under the
@@ -84,6 +85,10 @@ func (e *Engine) reclaimBranchAfterFailedResume(ctx context.Context, client pscl
 	case !deployRequestDeletesBranch(req.Options):
 		logger.Info("resumed apply failed before its deploy request; keeping the operator-supplied branch",
 			"organization", org, "planetscale_database", req.Database, "branch", branch, "apply_error", cause)
+	case engine.CancelledByOperator(ctx):
+		// No driver resumes a cancelled apply, so the branch has no one left
+		// to need it, and the delete must outlive the cancelled context.
+		e.deleteOwnedBranch(context.WithoutCancel(ctx), logger, client, org, req.Database, branch, cause)
 	case ctx.Err() != nil:
 		logger.Info("resumed drive ended before its deploy request; keeping the branch for the driver that resumes the apply",
 			"organization", org, "planetscale_database", req.Database, "branch", branch, "apply_error", cause)

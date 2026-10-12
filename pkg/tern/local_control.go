@@ -652,7 +652,7 @@ func (c *LocalClient) stopOwnedApply(ctx context.Context, req *ternv1.StopReques
 	// Cancel the apply goroutine's context so it stops iterating over tasks.
 	// Without this, executeApplySequential would continue to the next table
 	// after Spirit's runner exits, racing with the resume goroutine.
-	c.cancelApplyHandle(applyCancel)
+	c.cancelApplyHandle(applyCancel, nil)
 
 	// For Vitess/PlanetScale, stopping means cancelling the deploy request —
 	// this is permanent (not resumable). Use "cancelled" instead of "stopped".
@@ -789,7 +789,7 @@ func (c *LocalClient) cancelOwnedApply(ctx context.Context, req *ternv1.CancelRe
 		}
 		return nil, fmt.Errorf("engine cancel failed: %w", err)
 	}
-	c.cancelApplyHandle(applyCancel)
+	c.cancelApplyHandle(applyCancel, engine.ErrCancelledByOperator)
 
 	if targetApply != nil {
 		if err := c.releaseCancelledArtifacts(ctx, eng, targetApply, tasks); err != nil {
