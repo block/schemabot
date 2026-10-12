@@ -54,6 +54,23 @@ func (e *Engine) Stop(ctx context.Context, req *engine.ControlRequest) (*engine.
 	e.mu.Unlock()
 
 	logger := e.schemaChangeLogger(rm)
+	if state == engine.StateStopped {
+		// Stopped is provisional while the runner it stopped is still
+		// returning: an earlier stop set it before waiting the runner out, and
+		// the runner can still finish the change on its way out (see
+		// settleAfterRunnerExit). A stop that overlaps that wait answers from
+		// the runner's outcome, not from the provisional state, so a change
+		// that lands is never reported stopped twice over. With no runner
+		// alive the wait returns at once; a runner that will not come down
+		// bounds this stop at its caller's context, and the caller retries.
+		if err := waitForRunExit(ctx, rm); err != nil {
+			return nil, fmt.Errorf("stop on database %s tables %v: the stopped runner has not returned after %w", database, tables, err)
+		}
+		if err := settleAfterRunnerExit(e, rm, logger, "stop", database, tables); err != nil {
+			return nil, err
+		}
+		return settledStopOutcome(logger, engine.StateStopped, database, tables)
+	}
 	if state.IsTerminal() {
 		return settledStopOutcome(logger, state, database, tables)
 	}

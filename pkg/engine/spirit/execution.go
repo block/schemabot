@@ -19,6 +19,7 @@ import (
 
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
+	"github.com/block/schemabot/pkg/mysqlconn"
 	"github.com/block/schemabot/pkg/mysqlerr"
 )
 
@@ -479,8 +480,74 @@ func (e *Engine) executeSpiritMigration(ctx context.Context, host, username, pas
 	}
 
 	utils.CloseAndLog(runner)
+	if ctx.Err() != nil {
+		// The runner finished the ALTER on a context a stop, cancel, or halt
+		// had cancelled, so Spirit's own drop of the swapped-out originals,
+		// which runs on that context, may have been refused. Finish it here
+		// so the completed change leaves the target as an uninterrupted run
+		// would have.
+		e.dropCutoverOriginalsLeftByCancel(context.WithoutCancel(ctx), targetDSN(host, username, password, database), database, tables)
+	}
 	logger.Info("ALTER phase completed", "database", database, "tables", tables)
 	return nil
+}
+
+// cutoverOriginalDropTimeout bounds the drop of the swapped-out originals a
+// cancelled run left behind. It runs on a detached context, since the one the
+// run had is already cancelled, so it needs a bound of its own: a drop can wait
+// on the table's metadata lock, and the stop or cancel that is waiting for the
+// runner should not wait on a server that stopped responding.
+const cutoverOriginalDropTimeout = 2 * time.Minute
+
+// dropCutoverOriginalsLeftByCancel drops the _old tables a completed cutover
+// left on the target because the run's context was cancelled before Spirit
+// dropped them. Spirit drops each swapped-out original on the run's own context
+// after the cutover commits, and only logs a refusal, so a cancel that lands
+// between the commit and that drop leaves the whole original table on the
+// target while the runner still returns having finished the change. Dropping it
+// here mirrors what the uninterrupted run does: the change completed, so the
+// original is disposed of the way every completed cutover disposes of it. A
+// failure is logged with the tables left behind, never returned: the change has
+// completed whatever became of its leftovers.
+func (e *Engine) dropCutoverOriginalsLeftByCancel(ctx context.Context, dsn, database string, tables []string) {
+	ctx, cancel := context.WithTimeout(ctx, cutoverOriginalDropTimeout)
+	defer cancel()
+	logger := e.changeLogger()
+
+	originals := make([]string, 0, len(tables))
+	for _, table := range tables {
+		originals = append(originals, utils.OldTableName(table))
+	}
+	leftover, err := func() ([]string, error) {
+		db, err := mysqlconn.Open(dsn)
+		if err != nil {
+			return originals, fmt.Errorf("open database %s: %w", database, err)
+		}
+		defer utils.CloseAndLog(db)
+		if err := db.PingContext(ctx); err != nil {
+			return originals, fmt.Errorf("connect to database %s: %w", database, err)
+		}
+		present, err := existingTables(ctx, db, database, originals)
+		if err != nil {
+			return originals, err
+		}
+		if len(present) == 0 {
+			return nil, nil
+		}
+		logger.Info("dropping the swapped-out originals Spirit left behind because the run's context was cancelled after the cutover committed",
+			"database", database,
+			"tables", present,
+		)
+		discarded, err := discardArtifacts(ctx, db, database, present)
+		return present[len(discarded):], err
+	}()
+	if err != nil {
+		logger.Warn("the schema change completed but its swapped-out originals could not be dropped; drop them by hand to reclaim their space",
+			"database", database,
+			"tables", leftover,
+			"error", err,
+		)
+	}
 }
 
 func (e *Engine) setSchemaChangeCompleted() {

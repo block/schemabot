@@ -3,6 +3,7 @@ package spirit
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -217,6 +218,68 @@ func TestControlKeepsACompletionThatLandsAfterTheCancel(t *testing.T) {
 			assert.Equal(t, control.wantState, rm.state)
 		})
 	}
+}
+
+// A stop that arrives while an earlier stop is still waiting for the runner
+// finds the change marked stopped, but that mark is provisional until the
+// runner returns: the runner can still finish the change on its way out. The
+// second stop waits the runner out and answers from its outcome, so a change
+// that lands is rejected as completed by both stops rather than reported
+// stopped by the second.
+func TestSecondStopDuringFirstStopWaitDoesNotReportAlreadyStopped(t *testing.T) {
+	eng := New(Config{})
+	rm := registerRunningSchemaChange(eng)
+	runCtx, cancelRun := context.WithCancel(t.Context())
+	rm.cancelFunc = cancelRun
+	release := make(chan struct{})
+	rm.wg.Go(func() {
+		<-runCtx.Done()
+		<-release
+		eng.completeSchemaChange(runCtx, eng.changeLogger(), rm.database)
+	})
+
+	first := make(chan error, 1)
+	go func() {
+		_, err := eng.Stop(t.Context(), &engine.ControlRequest{})
+		first <- err
+	}()
+	require.Eventually(t, func() bool {
+		eng.mu.Lock()
+		defer eng.mu.Unlock()
+		return rm.state == engine.StateStopped
+	}, 5*time.Second, 5*time.Millisecond, "the first stop marks the change stopped before waiting for the runner")
+
+	second := make(chan error, 1)
+	go func() {
+		_, err := eng.Stop(t.Context(), &engine.ControlRequest{})
+		second <- err
+	}()
+	// The second stop must not answer from the provisional mark: it is still
+	// waiting when the runner has not returned.
+	select {
+	case err := <-second:
+		t.Fatalf("the second stop answered %v before the runner returned", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(release)
+
+	assert.True(t, engine.IsAlreadyCompleted(<-first), "the first stop reconciles to the completed outcome")
+	assert.True(t, engine.IsAlreadyCompleted(<-second), "the second stop reconciles to the completed outcome too")
+	assert.Equal(t, engine.StateCompleted, rm.state)
+}
+
+// A stop that finds the change stopped with no runner alive answers at once:
+// there is nothing to wait out, and the change really is paused.
+func TestStopOfAStoppedChangeWithNoRunnerAnswersAlreadyStopped(t *testing.T) {
+	eng := New(Config{})
+	rm := registerRunningSchemaChange(eng)
+	rm.state = engine.StateStopped
+
+	result, err := eng.Stop(t.Context(), &engine.ControlRequest{})
+	require.NoError(t, err)
+	assert.True(t, result.Accepted)
+	assert.Equal(t, "Already stopped", result.Message)
+	assert.Equal(t, engine.StateStopped, rm.state)
 }
 
 // Stateless control operations (cutover, deferred cutover sentinel lookup)
