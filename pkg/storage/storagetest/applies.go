@@ -543,6 +543,35 @@ func TestApplies(t *testing.T, h Harness) {
 		assert.Equal(t, state.Apply.Completed, persisted.State)
 	})
 
+	// A drive's failure write records the outcome under the lease it holds and
+	// leaves that lease on the row: the lease is released by the claim cycle,
+	// not by the write. A driver that gets no reply to its write re-reads the
+	// row and recognizes its own failure by the message and the lease token it
+	// wrote under, so a terminal write that cleared or rotated the token would
+	// make every such write look like someone else's.
+	t.Run("Update_FailedWriteKeepsTheLeaseItWasMadeUnder", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "apply_failed_write_lease_db", storage.DatabaseTypeMySQL)
+		claimed := CreateClaimedApply(t, store, lock, "apply_failed_write_lease", 907, "driver-a")
+		require.NotEmpty(t, claimed.LeaseToken)
+
+		failed := *claimed
+		failed.State = state.Apply.Failed
+		failed.ErrorMessage = "engine lost its connection to the target"
+		now := time.Now()
+		failed.CompletedAt = &now
+		require.NoError(t, store.Applies().Update(storage.WithApplyLease(ctx, claimed.Lease()), &failed))
+
+		persisted, err := store.Applies().Get(ctx, claimed.ID)
+		require.NoError(t, err)
+		require.NotNil(t, persisted)
+		assert.Equal(t, state.Apply.Failed, persisted.State)
+		assert.Equal(t, "engine lost its connection to the target", persisted.ErrorMessage)
+		assert.Equal(t, claimed.LeaseToken, persisted.LeaseToken, "the failed row still carries the token the write was made under")
+		assert.Equal(t, "driver-a", persisted.LeaseOwner)
+	})
+
 	// A stopped apply whose unfinished work another apply took over must never be
 	// started again: its statements would replay against a target where that work
 	// already happened. The takeover is recorded on the apply that handed off, and
