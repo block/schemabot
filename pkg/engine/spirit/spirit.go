@@ -639,10 +639,11 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 	if err != nil {
 		return nil, fmt.Errorf("plan database %s: %w", database, err)
 	}
-	currentSchema, withheld, lowerCaseTableNames, err := e.fetchCurrentSchema(ctx, req.Credentials.DSN, database, ignored)
+	current, err := e.fetchCurrentSchema(ctx, req.Credentials.DSN, database, ignored)
 	if err != nil {
 		return nil, fmt.Errorf("fetch current schema: %w", err)
 	}
+	currentSchema, withheld, lowerCaseTableNames := current.tables, current.withheld, current.lowerCaseTableNames
 	e.logger.Debug("fetched current schema", "database", database, "tables", len(currentSchema))
 	for i, ts := range currentSchema {
 		e.logger.Debug("current schema table", "index", i, "stmt", ts.Schema[:min(200, len(ts.Schema))])
@@ -1279,37 +1280,47 @@ func liveTableNameResolver(current []table.TableSchema, lowerCaseTableNames int)
 	}
 }
 
+// liveSchema is what a plan reads from the target before diffing.
+type liveSchema struct {
+	// tables is the live schema the diff sees, with internal and archive
+	// tables and the withheld tables filtered out.
+	tables []table.TableSchema
+	// withheld is what ignore_tables actually withheld, sorted, for the plan
+	// to disclose: the diff never sees these tables, so without the
+	// disclosure a withheld table would be indistinguishable from an
+	// unchanged one.
+	withheld []string
+	// lowerCaseTableNames is the target's @@lower_case_table_names, which
+	// decides whether the diff compares table names case-insensitively.
+	lowerCaseTableNames int
+}
+
 // fetchCurrentSchema retrieves table schemas from the database, filtering out
 // internal tables (Spirit shadow/checkpoint tables and other _-prefixed tables)
 // and archive tables that are maintained outside declarative schema files.
 //
-// ignored withholds the tables the repository's ignore_tables config names. The
-// second return value is what it actually withheld, sorted, for the plan to
-// disclose: the diff never sees these tables, so without the disclosure a
-// withheld table would be indistinguishable from an unchanged one. The third
-// is the target's @@lower_case_table_names, which decides whether the diff
-// compares table names case-insensitively.
-func (e *Engine) fetchCurrentSchema(ctx context.Context, dsn, database string, ignored engine.IgnoredTables) ([]table.TableSchema, []string, int, error) {
+// ignored withholds the tables the repository's ignore_tables config names.
+func (e *Engine) fetchCurrentSchema(ctx context.Context, dsn, database string, ignored engine.IgnoredTables) (*liveSchema, error) {
 	db, err := mysqlconn.Open(dsn)
 	if err != nil {
-		return nil, nil, 0, fmt.Errorf("open target database: %w", err)
+		return nil, fmt.Errorf("open target database: %w", err)
 	}
 	defer utils.CloseAndLog(db)
 
 	// Open only parsed the DSN; this ping is the first dial, so it is where the
 	// target can refuse the session and the only error worth classifying.
 	if err := db.PingContext(ctx); err != nil {
-		return nil, nil, 0, fmt.Errorf("ping target database: %w", targetauth.Wrap(err))
+		return nil, fmt.Errorf("ping target database: %w", targetauth.Wrap(err))
 	}
 
 	var lowerCaseTableNames int
 	if err := db.QueryRowContext(ctx, "SELECT @@lower_case_table_names").Scan(&lowerCaseTableNames); err != nil {
-		return nil, nil, 0, fmt.Errorf("read lower_case_table_names: %w", err)
+		return nil, fmt.Errorf("read lower_case_table_names: %w", err)
 	}
 
 	tables, err := table.LoadSchemaFromDB(ctx, db, liveSchemaFilterOptions(ignored)...)
 	if err != nil {
-		return nil, nil, 0, fmt.Errorf("load schema: %w", err)
+		return nil, fmt.Errorf("load schema: %w", err)
 	}
 
 	// The archive-naming exclusion is applied here when the loader was not
@@ -1339,7 +1350,7 @@ func (e *Engine) fetchCurrentSchema(ctx context.Context, dsn, database string, i
 		e.logger.Info("live tables withheld from the plan by ignore_tables",
 			"database", database, "tables", withheld)
 	}
-	return kept, withheld, lowerCaseTableNames, nil
+	return &liveSchema{tables: kept, withheld: withheld, lowerCaseTableNames: lowerCaseTableNames}, nil
 }
 
 // tableSizeEstimate is one table's approximate plan-time size read from
