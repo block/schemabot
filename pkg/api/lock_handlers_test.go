@@ -546,26 +546,17 @@ func TestScopedLockReacquireIsPerOperatorGroup(t *testing.T) {
 		assertUnchanged(t, locks, otherTeam)
 	})
 
-	t.Run("an unverified operator creating a free lock holds it", func(t *testing.T) {
+	t.Run("an unverified operator is refused before taking any lock", func(t *testing.T) {
+		// Without a verified identity the lock could record no acquirer, so
+		// the operator taking it could neither release it nor take it again.
 		locks := &memoryLockStore{}
 		rec := acquireUnverified(t, locks, bob)
 
-		assert.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
-		require.NotNil(t, locks.lock)
-		assert.Nil(t, locks.lock.Acquirer, "an unverified caller is recorded as no acquirer")
-	})
-
-	t.Run("an unverified operator is refused a lock with no recorded acquirer taken while this acquire ran", func(t *testing.T) {
-		unrecorded := paymentsLock(8, owner, nil)
-		locks := &memoryLockStore{beforeAcquire: func(s *memoryLockStore) {
-			taken := *unrecorded
-			s.lock = &taken
-		}}
-		rec := acquireUnverified(t, locks, bob)
-
 		assert.Equal(t, http.StatusForbidden, rec.Code, rec.Body.String())
-		assert.Contains(t, rec.Body.String(), "records no verified acquirer")
-		assertUnchanged(t, locks, unrecorded)
+		assert.Contains(t, rec.Body.String(), `lock_acquire on database \"payments\": your identity is not verified`)
+		assert.Contains(t, rec.Body.String(), "nothing is held")
+		assert.Contains(t, rec.Body.String(), "schema-admins", "the refusal names the write groups that can take the lock")
+		assert.Nil(t, locks.lock, "a refused acquire takes no lock")
 	})
 
 	t.Run("a lock released before the acquire could be read back is not reported held", func(t *testing.T) {

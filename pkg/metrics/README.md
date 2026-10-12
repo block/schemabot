@@ -118,7 +118,7 @@ available, such as `repository`, `github_app`, and `installation_id`.
 
 **operation** (locks): `acquire`, `release`
 
-**status** (locks): `success`, `conflict`, `not_found`, `not_owned`, `error`
+**status** (locks): `success`, `conflict`, `not_found`, `not_owned`, `no_acquirer` (a scoped acquire refused because the caller's identity is unverified, so the lock could record no acquirer), `error`
 
 **event_type** (webhooks): `create`, `issues`, `issue_comment`, `pull_request`, `pull_request_review`, `pull_request_review_comment`, `check_run`, `check_suite`, `ping`, `push`
 
