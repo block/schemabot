@@ -1295,6 +1295,58 @@ func TestFailApplyAndNotify_AFailureThisDriveCannotProveIsNotLanded(t *testing.T
 	}
 }
 
+// The re-read after a failure write returned an error proves the write landed
+// only when storage holds the apply failed, with this drive's message, under
+// the lease this drive holds for this apply. A stored row that is still active
+// is not landed even when it already carries this drive's token and an equal
+// message; a lease held for a different apply proves nothing about this one;
+// and a re-read that fails proves nothing at all.
+func TestFailureWriteLanded_ProvesTheWriteOnlyFromAFailedRowUnderThisLease(t *testing.T) {
+	const failure = "engine lost its connection to the target"
+	writeErr := errors.New("connection reset by peer")
+	cases := []struct {
+		name                 string
+		storedState          string
+		reReadErr            error
+		leaseForAnotherApply bool
+		landed               bool
+	}{
+		{name: "failed row under this lease", storedState: state.Apply.Failed, landed: true},
+		{name: "active row with a matching message and token", storedState: state.Apply.Running},
+		{name: "cancelled row with a matching message and token", storedState: state.Apply.Cancelled},
+		{name: "lease held for another apply", storedState: state.Apply.Failed, leaseForAnotherApply: true},
+		{name: "re-read fails", storedState: state.Apply.Failed, reReadErr: errors.New("replica unavailable")},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			stored := failureLogTestApply(tc.storedState, 0)
+			stored.ErrorMessage = failure
+			stored.LeaseToken = "tok-a"
+			client := &LocalClient{
+				config:  LocalConfig{Database: "orders", Type: storage.DatabaseTypeMySQL},
+				storage: &exactProgressStorage{applies: &snapshotApplyStore{stored: *stored, err: tc.reReadErr}},
+				logger:  slog.Default(),
+			}
+			lease := storage.ApplyLease{ApplyID: stored.ID, Owner: "driver-a", Token: "tok-a"}
+			if tc.leaseForAnotherApply {
+				lease.ApplyID = stored.ID + 1
+			}
+			ctx := storage.WithApplyLease(t.Context(), lease)
+
+			landed, got := client.failureWriteLanded(ctx, stored, failure, writeErr)
+
+			assert.Equal(t, tc.landed, landed)
+			if tc.landed {
+				require.NotNil(t, got)
+				assert.Equal(t, state.Apply.Failed, got.State)
+				assert.Equal(t, failure, got.ErrorMessage)
+			} else {
+				assert.Nil(t, got)
+			}
+		})
+	}
+}
+
 // storedThenRefusingApplyStore reads the apply as running until its first
 // write, which it refuses with err, and as stored from then on, modelling a
 // concurrent writer that settled the apply while this drive's write failed.

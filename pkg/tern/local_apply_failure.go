@@ -140,12 +140,12 @@ func (c *LocalClient) refusedTaskVerdict(ctx context.Context, apply *storage.App
 // terminal state for it. A failed write that returns an error is re-read
 // (failureWriteLanded): when storage holds the failure anyway, the write
 // landed and the helper carries on as if it had returned nil. When the failed
-// write does not land, the in-memory
-// apply is put back to its pre-failure state, the active-apply gauge is left
-// alone, and the write error is returned: the stored apply is still active, so
-// nothing that answers for its outcome may run, and the claim that picks it up
-// next settles it. A drive cancelled before or while recording the failure
-// hands the apply back with nil and the apply untouched.
+// write does not land, the in-memory apply is put back to its pre-failure
+// state, the active-apply gauge is left alone, and the write error is
+// returned: the stored apply is still active, so nothing that answers for its
+// outcome may run, and the claim that picks it up next settles it. A drive
+// cancelled before or while recording the failure hands the apply back with
+// nil and the apply untouched.
 //
 // It records the failure only. The side effects a terminal apply owes —
 // settling the control requests it moots and posting the terminal summary —
@@ -239,7 +239,24 @@ func (c *LocalClient) failureWriteLanded(ctx context.Context, apply *storage.App
 			append(apply.LogAttrs(), "error", err)...)
 		return false, nil
 	}
-	if stored == nil || !failureStoredUnderLease(stored, errMsg, lease) {
+	if stored == nil {
+		c.logger.Warn("the apply was not found when re-read after the write recording it failed returned an error; treating the failure as not recorded",
+			apply.LogAttrs()...)
+		return false, nil
+	}
+	if !state.IsState(stored.State, state.Apply.Failed) {
+		c.logger.Debug("storage does not hold the apply failed after the write recording it returned an error; the write did not land",
+			stored.LogAttrs()...)
+		return false, nil
+	}
+	if !failureStoredUnderLease(stored, errMsg, lease) {
+		// Storage holds a failure, but not provably this drive's: another
+		// drive recorded its own, or a successor recorded the same one under
+		// its own lease. The token value itself is never logged.
+		c.logger.Warn("storage holds the apply failed, but not provably by this drive's write; treating the failure as not recorded and leaving the stored outcome to the drive that owns it",
+			append(stored.LogAttrs(),
+				"message_matched", stored.ErrorMessage == errMsg,
+				"lease_token_matched", stored.LeaseToken == lease.Token)...)
 		return false, nil
 	}
 	return true, stored
@@ -324,8 +341,17 @@ func (c *LocalClient) failPendingStartForFailedApply(ctx context.Context, logger
 // Like failApplyWithTasks, a refused task verdict write stops the helper
 // before the apply is touched, and the pause's side effects — the retry log, the
 // active-apply gauge, and the observer's progress update — run only once the
-// pause is stored. When the write does not land, the in-memory apply is put
-// back to its pre-pause state and the write error is returned.
+// pause is stored. When the write returns an error, the in-memory apply is
+// put back to its pre-pause state and the write error is returned.
+//
+// Unlike failApplyWithTasks, a pause write that returns an error is not
+// re-read to find out whether it landed anyway. A pause is not an outcome: it
+// answers no control request and owes no terminal summary, and a stored pause
+// leaves the apply claimable, so the next claim re-drives it and logs and
+// posts whatever it arrives at. What a pause that committed with its reply
+// lost leaves undone is bounded to the retry log entry, the observer's
+// progress update for this attempt, and this drive's active-apply gauge
+// release.
 func (c *LocalClient) markApplyRetryableWithTasks(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, errMsg string) error {
 	if c.driveCancelled(ctx, apply, "before pausing the apply for retry") {
 		return nil
