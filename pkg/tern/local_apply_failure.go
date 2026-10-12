@@ -98,14 +98,28 @@ func taskVerdictMessage(task *storage.Task, errMsg string) string {
 // verdict storage never took: the apply stays active, and the claim that picks
 // it up next reads every task as stored and settles it. A write refused because
 // the drive was cancelled hands the apply back with nil, like the apply write.
-func (c *LocalClient) refusedTaskVerdict(ctx context.Context, apply *storage.Apply, verdict, errMsg string, err error) error {
+//
+// Verdicts already stored for earlier tasks stay stored. A whole-apply drive's
+// next claim reads one of them as the apply's outcome and settles the refused
+// table from it. An operation drive gets no next claim: the operator derives
+// the operation row from the task rows as they stand, so the row settles over a
+// table that still reads running until the stranded-task reaper closes it.
+func (c *LocalClient) refusedTaskVerdict(ctx context.Context, apply *storage.Apply, task *storage.Task, verdict, errMsg string, err error) error {
 	if c.driveCancelled(ctx, apply, "while recording a task verdict") {
 		return nil
 	}
-	attrs := append(apply.LogAttrs(), "verdict", verdict, "failure", errMsg, "error", err)
-	if errors.Is(err, storage.ErrApplyLeaseLost) {
+	attrs := append(task.LogAttrs(), "apply_id", apply.ApplyIdentifier, "verdict", verdict, "failure", errMsg, "error", err)
+	if lease, ok := storage.OperationLeaseFromContext(ctx); ok {
+		attrs = append(attrs, "apply_operation_id", lease.OperationID)
+	}
+	switch {
+	case errors.Is(err, storage.ErrApplyLeaseLost):
 		c.logger.Warn("task verdict was refused because the drive's lease was lost; this driver exits and leaves the apply to the lease holder", attrs...)
-	} else {
+	case errors.Is(err, storage.ErrValueRejected):
+		// The same write is refused every time, so the apply stays active
+		// through every claim that retries it rather than settling.
+		c.logger.Error("task verdict was refused outright because storage cannot hold a value it carries; this driver exits with the apply still active, and every later claim is refused the same write until the stored value changes", attrs...)
+	default:
 		c.logger.Error("failed to record a task verdict; current driver will exit with the apply still active and no terminal side effects run, for the next claim to settle", attrs...)
 	}
 	return fmt.Errorf("record %s task verdicts for apply %s (database %s): %w",
@@ -143,7 +157,7 @@ func (c *LocalClient) failApplyWithTasks(ctx context.Context, apply *storage.App
 			continue
 		}
 		if err := c.markTaskFailed(ctx, task, taskVerdictMessage(task, errMsg)); err != nil {
-			return c.refusedTaskVerdict(ctx, apply, "failed", errMsg, err)
+			return c.refusedTaskVerdict(ctx, apply, task, "failed", errMsg, err)
 		}
 	}
 
@@ -270,7 +284,7 @@ func (c *LocalClient) markApplyRetryableWithTasks(ctx context.Context, apply *st
 			continue
 		}
 		if err := c.markTaskRetryable(ctx, task, taskVerdictMessage(task, errMsg)); err != nil {
-			return c.refusedTaskVerdict(ctx, apply, "failed_retryable", errMsg, err)
+			return c.refusedTaskVerdict(ctx, apply, task, "failed_retryable", errMsg, err)
 		}
 	}
 
