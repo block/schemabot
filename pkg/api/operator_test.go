@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"sync"
@@ -1254,6 +1255,33 @@ func TestStopPendingOperationsForPendingStop(t *testing.T) {
 // so a stopped rollout can carry a running-family verdict; the stop request is
 // what start consults, and leaving it pending there would refuse the very start
 // that resumes the stopped operation.
+// The single-operation drive settles a post-terminal reconcile failure in
+// place only when this driver may still write for the apply. The same sentinel
+// wrapping a lost lease, or raised while the drive is stopping, is classified as
+// that cause and left to the stranded control request sweep instead.
+func TestPostTerminalReconcileSettlesHere(t *testing.T) {
+	sentinel := fmt.Errorf("%w: complete start of apply apply-42: storage unavailable", tern.ErrPostTerminalReconcile)
+	cancelled, cancel := context.WithCancel(t.Context())
+	cancel()
+	cases := map[string]struct {
+		ctx  context.Context
+		err  error
+		want bool
+	}{
+		"the sentinel alone settles here":                    {ctx: t.Context(), err: sentinel, want: true},
+		"an unrelated drive failure does not":                {ctx: t.Context(), err: errors.New("storage unavailable"), want: false},
+		"a sentinel wrapping a lost apply lease does not":    {ctx: t.Context(), err: fmt.Errorf("%w: %w", tern.ErrPostTerminalReconcile, storage.ErrApplyLeaseLost), want: false},
+		"a sentinel wrapping a presumed-lost lease does not": {ctx: t.Context(), err: fmt.Errorf("%w: %w", tern.ErrPostTerminalReconcile, tern.ErrApplyLeasePresumedLost), want: false},
+		"a sentinel wrapping a cancelled context does not":   {ctx: t.Context(), err: fmt.Errorf("%w: %w", tern.ErrPostTerminalReconcile, context.Canceled), want: false},
+		"a sentinel on a drive that is stopping does not":    {ctx: cancelled, err: sentinel, want: false},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			assert.Equal(t, tc.want, postTerminalReconcileSettlesHere(tc.ctx, tc.err))
+		})
+	}
+}
+
 func TestCompletePendingControlRequestsIfApplyResolved(t *testing.T) {
 	pendingRequest := func(op storage.ControlOperation) *storage.ApplyControlRequest {
 		return &storage.ApplyControlRequest{ApplyID: 9, Operation: op, Status: storage.ControlRequestPending}

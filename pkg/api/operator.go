@@ -1114,9 +1114,10 @@ func (s *Service) recoverSingleApplyOperation(ctx context.Context, driverID int,
 			return
 		}
 		var drivePanic *panicsafe.Error
-		if !errors.As(resumeErr, &drivePanic) && !errors.Is(resumeErr, tern.ErrPostTerminalReconcile) {
-			// Transient drive failures leave the operation claimable so a later
-			// poll retries it; resumeClaimedApply already logged the cause.
+		if !errors.As(resumeErr, &drivePanic) && !postTerminalReconcileSettlesHere(runCtx, resumeErr) {
+			// Transient drive failures, and a drive this driver may no longer
+			// write for, leave the operation claimable so a later poll retries
+			// it; resumeClaimedApply already logged the cause.
 			return
 		}
 		// A contained drive panic already failed this operation's tasks and the
@@ -1728,11 +1729,12 @@ func (s *Service) driverLogger(driverID int) *slog.Logger {
 // apply is reloaded because the derived-state write operates on a copy and
 // does not mutate the caller's row. The logger carries the caller's identity —
 // a driver's id, or the reaper — so the settlement lines name who answered. A
-// pending stop completes at any terminal state. A pending start and a pending cancel are handed to the shared
-// settlements, which decide from the stored outcome whether the command took
-// effect, so this path discloses the same outcome as every other drive shape. A still-non-terminal
-// apply resolves only its stop, and only once that stop has reached every
-// operation. No-op when nothing is pending.
+// pending stop completes at any terminal state. A pending start and a pending
+// cancel are handed to the shared settlements, which decide from the stored
+// outcome whether the command took effect, so this path discloses the same
+// outcome as every other drive shape. A still-non-terminal apply resolves only
+// its stop, and only once that stop has reached every operation. No-op when
+// nothing is pending.
 func (s *Service) completePendingControlRequestsIfApplyResolved(ctx context.Context, logger *slog.Logger, applyID int64) error {
 	apply, err := s.storage.Applies().Get(ctx, applyID)
 	if err != nil {
@@ -2135,6 +2137,30 @@ func (s *Service) failOperationWithoutTasks(opCtx, applyCtx context.Context, dri
 	s.publishTerminalSummaryIfWon(applyCtx, driverID, apply, result)
 }
 
+// postTerminalReconcileSettlesHere reports whether a failed drive is one whose
+// caller settles the apply in place: the drive stored the apply's terminal
+// outcome and only an answer owed after it did not land, so the caller persists
+// the operation row from its terminal tasks and runs the post-drive settlement.
+//
+// A reconcile refused because the apply lease was lost, or cut short by the
+// drive's context, is not one, even though it carries the same sentinel:
+// resumeClaimedApplyWithOptions classifies those first, and a driver that lost
+// its lease or is stopping must write nothing more for the apply. The stored
+// outcome stands either way, and the reaper's sweep of control requests
+// stranded on settled applies answers the request instead.
+func postTerminalReconcileSettlesHere(ctx context.Context, err error) bool {
+	if !errors.Is(err, tern.ErrPostTerminalReconcile) {
+		return false
+	}
+	if errors.Is(err, tern.ErrApplyLeasePresumedLost) || errors.Is(err, storage.ErrApplyLeaseLost) {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil {
+		return false
+	}
+	return true
+}
+
 // resumeClaimedApply drives claimed work through the engine. When
 // applyOperationID is set (the operation-claim path) it drives only that
 // deployment's tasks via ResumeApplyOperation with both the operation lease (for
@@ -2348,9 +2374,11 @@ func (s *Service) resumeClaimedApplyWithOptions(ctx context.Context, driverID in
 		}
 		if errors.Is(err, tern.ErrPostTerminalReconcile) {
 			// The drive stored the apply's terminal outcome; only an answer owed
-			// after it did not land. The caller's post-drive settlement retries
-			// that answer against the stored outcome.
-			logger.Warn("operator: drive stored the apply's terminal outcome but could not reconcile after it; the post-drive settlement retries the unanswered requests",
+			// after it did not land. The stored outcome stands, and the request
+			// it resolves is answered by whichever runs first: the caller's
+			// post-drive settlement, where the caller performs one, or the
+			// reaper's sweep of control requests stranded on settled applies.
+			logger.Warn("operator: drive stored the apply's terminal outcome but could not reconcile after it; the outcome stands and the unanswered requests are settled by the post-drive settlement or the stranded control request sweep",
 				"error", err)
 			metrics.RecordOperatorResumeFailure(ctx, apply.Database, deployment, apply.Environment, "post_terminal_reconcile")
 			if retryableClaim {

@@ -228,3 +228,99 @@ func TestOperator_StartUnansweredByEveryDriveSettlementIsSettledByTheReaper(t *t
 	assert.Equal(t, storage.ControlRequestCompleted, start.Status,
 		"the reaper answers the start every drive settlement lost, against the stored completed outcome")
 }
+
+// An operator started a two-deployment rolling rollout. While a sibling is
+// still dispatching the start stays pending on purpose — the rollout is not
+// resolved and the request still describes what the operator asked for. Once
+// the last operation settles the parent, the multi-operation drive's own
+// post-drive settlement answers the start from the stored outcome: completed
+// when the rollout completed, failed with the apply's reason when it settled
+// any other way, even though the start took effect for the operations that ran.
+func TestOperator_StartOnAMultiOperationRolloutSettlesWithTheParent(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	ctx := t.Context()
+	db := openMatrixStorage(t)
+	stor := mysqlstore.New(db)
+
+	cases := []struct {
+		name          string
+		identifier    string
+		lastOutcome   matrixOutcome
+		wantApply     string
+		wantStart     storage.ControlRequestStatus
+		wantStartText string
+	}{
+		{
+			name:        "a rollout that completes answers the start as completed",
+			identifier:  "start-on-rollout-completes",
+			lastOutcome: matrixOutcome{taskState: state.Task.Completed},
+			wantApply:   state.Apply.Completed,
+			wantStart:   storage.ControlRequestCompleted,
+		},
+		{
+			name:          "a rollout whose last deployment fails answers the start with the failure",
+			identifier:    "start-on-rollout-fails",
+			lastOutcome:   matrixOutcome{taskState: state.Task.Failed, errMsg: "region-b boom"},
+			wantApply:     state.Apply.Failed,
+			wantStart:     storage.ControlRequestFailed,
+			wantStartText: "region-b",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			resetMatrixTables(t, ctx, db)
+			seed := seedGroupedApply(t, ctx, stor, multiOpSeed{
+				applyIdentifier: tc.identifier,
+				parentState:     state.Apply.Running,
+				cutoverPolicy:   storage.CutoverPolicyRolling,
+				onFailure:       storage.OnFailureHalt,
+				deployments:     []string{"region-a", "region-b"},
+				opState:         state.ApplyOperation.Pending,
+				taskState:       state.Task.Pending,
+			})
+			_, _, err := stor.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+				ApplyID:     seed.applyID,
+				Operation:   storage.ControlOperationStart,
+				Status:      storage.ControlRequestPending,
+				RequestedBy: "matrix-test",
+			})
+			require.NoError(t, err, "request pending start")
+
+			rec := &driveRecorder{}
+			svc := newMatrixService(t, stor, matrixClients(stor, rec, map[string]matrixOutcome{
+				"region-a": {taskState: state.Task.Completed},
+				"region-b": tc.lastOutcome,
+			}))
+
+			driveNextOperation(t, ctx, svc, 1)
+
+			require.Equal(t, []string{"region-a"}, rec.resumeOrder())
+			require.False(t, state.IsTerminalApplyState(getApply(t, ctx, stor, seed.applyID).State),
+				"one settled deployment of two leaves the rollout open")
+			start, err := stor.ControlRequests().GetByOperation(ctx, seed.applyID, storage.ControlOperationStart)
+			require.NoError(t, err)
+			require.NotNil(t, start)
+			assert.Equal(t, storage.ControlRequestPending, start.Status,
+				"the start stays pending while a sibling is still to dispatch")
+
+			driveNextOperation(t, ctx, svc, 2)
+
+			require.Equal(t, []string{"region-a", "region-b"}, rec.resumeOrder())
+			apply := getApply(t, ctx, stor, seed.applyID)
+			require.Equal(t, tc.wantApply, apply.State)
+			start, err = stor.ControlRequests().GetByOperation(ctx, seed.applyID, storage.ControlOperationStart)
+			require.NoError(t, err)
+			require.NotNil(t, start)
+			assert.Equal(t, tc.wantStart, start.Status,
+				"the drive that settles the parent answers the start from the stored outcome")
+			if tc.wantStartText != "" {
+				assert.Contains(t, start.ErrorMessage, tc.wantStartText,
+					"a failed start carries the apply's own reason")
+			}
+			assert.Equal(t, 1, svc.matrixSummary.count(), "the terminal summary publishes once, after the start is settled")
+		})
+	}
+}
