@@ -1038,6 +1038,20 @@ func testUpsertShardProgressKeepsOneRowPerShard(t *testing.T, newStore func(*tes
 		assert.Equal(t, shardTaskIdentifier(opID, "payments", "users", "-80"), got[0].TaskIdentifier)
 	})
 
+	t.Run("table names differing only in case are separate shards on every dialect", func(t *testing.T) {
+		store.tasks.identity = realInserter
+		require.NoError(t, store.Tasks().UpsertShardProgress(opCtx, shardTask("ledger", 10)))
+		require.NoError(t, store.Tasks().UpsertShardProgress(opCtx, shardTask("Ledger", 20)))
+		require.NoError(t, store.Tasks().UpsertShardProgress(opCtx, shardTask("ledger", 50)))
+
+		lower := loadTask(t, store, shardTaskIdentifier(opID, "payments", "ledger", "-80"))
+		upper := loadTask(t, store, shardTaskIdentifier(opID, "payments", "Ledger", "-80"))
+		assert.Equal(t, "ledger", lower.TableName)
+		assert.Equal(t, 50, lower.ProgressPercent, "the re-upsert updates its own table's row")
+		assert.Equal(t, "Ledger", upper.TableName)
+		assert.Equal(t, 20, upper.ProgressPercent, "the other spelling's row is untouched")
+	})
+
 	t.Run("a row holding the identifier under another key is not written over", func(t *testing.T) {
 		store.tasks.identity = realInserter
 		orders := shardTask("orders", 5)

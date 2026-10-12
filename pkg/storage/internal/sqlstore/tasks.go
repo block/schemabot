@@ -361,14 +361,13 @@ func (s *taskStore) UpsertShardProgress(ctx context.Context, task *storage.Task)
 		return fmt.Errorf("upsert shard progress for operation %d table %q requires a non-empty shard", *task.ApplyOperationID, task.TableName)
 	}
 
-	// Find the existing per-shard row under this operation. The lookup-then-write
-	// is safe without a unique constraint because the held lease makes the caller
-	// the single writer of this operation's rows.
+	// Find the existing per-shard row under this operation. The held lease makes
+	// the caller the single writer of this operation's rows, and the derived
+	// identifier below backs that with the unique index.
 	var id int64
-	err = s.db.QueryRowContext(ctx, `
-		SELECT id FROM tasks
-		WHERE apply_operation_id = ? AND namespace = ? AND table_name = ? AND shard = ?
-	`, *task.ApplyOperationID, task.Namespace, nullString(task.TableName), task.Shard).Scan(&id)
+	err = s.db.QueryRowContext(ctx,
+		`SELECT id FROM tasks WHERE `+shardKeyPredicate(s.dialect),
+		*task.ApplyOperationID, task.Namespace, nullString(task.TableName), task.Shard).Scan(&id)
 	switch {
 	case err == nil:
 		// Existing shard row: update its progress fields under the lease guard.
@@ -407,6 +406,18 @@ func (s *taskStore) UpsertShardProgress(ctx context.Context, task *storage.Task)
 	}
 }
 
+// shardKeyPredicate matches a per-shard task row by its key: operation,
+// namespace, table and shard, binding them in that order. The names compare
+// exactly on every dialect (BinaryEquals): MySQL's table default collation is
+// case- and accent-insensitive, and shardTaskIdentifier hashes the exact
+// bytes, so a looser lookup would treat `users` and `Users` as one shard while
+// their identifiers differ. Exact is also what the engine reports: on a
+// target that keeps `users` and `Users` apart they are two tables.
+func shardKeyPredicate(d Dialect) string {
+	return "apply_operation_id = ? AND " + d.BinaryEquals("namespace") +
+		" AND " + d.BinaryEquals("table_name") + " AND " + d.BinaryEquals("shard")
+}
+
 // shardTaskIdentifier derives a per-shard task row's identifier from the key
 // UpsertShardProgress looks it up by. Deriving it rather than drawing a random
 // one is what makes the existing unique index on task_identifier refuse a
@@ -427,17 +438,15 @@ func shardTaskIdentifier(operationID int64, namespace, table, shard string) stri
 // row that cannot be found.
 func (s *taskStore) updateShardTaskAfterDuplicateInsert(ctx context.Context, task *storage.Task, insertErr error) error {
 	var id int64
-	err := s.db.QueryRowContext(ctx, `
-		SELECT id FROM tasks
-		WHERE task_identifier = ? AND apply_operation_id = ? AND namespace = ? AND table_name = ? AND shard = ?
-	`, task.TaskIdentifier, *task.ApplyOperationID, task.Namespace, nullString(task.TableName), task.Shard).Scan(&id)
+	err := s.db.QueryRowContext(ctx,
+		`SELECT id FROM tasks WHERE task_identifier = ? AND `+shardKeyPredicate(s.dialect),
+		task.TaskIdentifier, *task.ApplyOperationID, task.Namespace, nullString(task.TableName), task.Shard).Scan(&id)
 	if err != nil {
 		return fmt.Errorf("re-read shard task %s for operation %d %s.%s shard %q after its insert was refused as a duplicate (%w): %w",
 			task.TaskIdentifier, *task.ApplyOperationID, task.Namespace, task.TableName, task.Shard, insertErr, err)
 	}
-	slog.Warn("shard progress insert found the shard's row already written; updating that row instead of adding a second",
-		"task_id", task.TaskIdentifier, "apply_operation_id", *task.ApplyOperationID,
-		"namespace", task.Namespace, "table", task.TableName, "shard", task.Shard)
+	slog.WarnContext(ctx, "shard progress insert found the shard's row already written; updating that row instead of adding a second",
+		append(task.LogAttrs(), "apply_operation_id", *task.ApplyOperationID, "namespace", task.Namespace, "shard", task.Shard)...)
 	task.ID = id
 	return s.Update(ctx, task)
 }
