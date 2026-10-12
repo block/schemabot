@@ -1167,7 +1167,8 @@ refuses a stop or cancel that would replace an outcome the change already settle
 drive resolves the request and records that outcome. And only settled outcomes are adopted, never
 a remote state still in motion. *Enforced:* terminal-truth preflights on the control paths
 (`pkg/tern/local_control.go`, `pkg/tern/grpc_control_resend.go`); the in-process engine's settled
-outcome checks on stop and cancel (`pkg/engine/spirit/control.go`).
+outcome checks on stop and cancel (`pkg/engine/spirit/control.go`), including a completion its run
+records after the cancel (`pkg/engine/spirit/execution.go`).
 
 ### CO-4: Stop wins
 

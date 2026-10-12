@@ -2210,6 +2210,57 @@ func TestEngine_ExecuteMigration_CancelledContextKeepsStoppedState(t *testing.T)
 		"DROP TABLE must not run after the context is cancelled")
 }
 
+// Stopping an ALTER mid-copy, with nothing queued after it, leaves the change
+// Stopped and the stop accepted. A run counts as completed even after a cancel
+// only when its runner finished the change, so a runner returning because of
+// the stop must never be read as the change landing.
+func TestEngine_Stop_DuringAlterWithNothingAfterIt(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping long-running integration test in short mode")
+	}
+
+	dsn, db := setupTestMySQL(t)
+	cleanupTables(t, db)
+
+	_, err := db.ExecContext(t.Context(), `CREATE TABLE stop_only_alter (
+		id INT PRIMARY KEY AUTO_INCREMENT,
+		name VARCHAR(50) NOT NULL
+	)`)
+	require.NoError(t, err, "create alter target table")
+	seedTableRows(t, db, "stop_only_alter")
+
+	eng := New(Config{
+		Logger:  slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo})),
+		Threads: 1,
+	})
+	ctx := t.Context()
+
+	applyResult, err := eng.Apply(ctx, &engine.ApplyRequest{
+		Database: "testdb",
+		Changes: []engine.SchemaChange{{
+			Namespace: "testdb",
+			TableChanges: []engine.TableChange{
+				{Table: "stop_only_alter", DDL: "ALTER TABLE `stop_only_alter` MODIFY COLUMN `name` varchar(100) NOT NULL"},
+			},
+		}},
+		Credentials: &engine.Credentials{DSN: dsn},
+	})
+	require.NoError(t, err, "Apply()")
+	defer eng.Drain()
+	require.True(t, applyResult.Accepted, "Apply not accepted: %s", applyResult.Message)
+
+	waitForCopyProgress(t, eng, 1)
+
+	stopResult, err := eng.Stop(ctx, &engine.ControlRequest{Database: "testdb"})
+	require.NoError(t, err, "Stop()")
+	require.True(t, stopResult.Accepted, "Stop not accepted: %s", stopResult.Message)
+
+	progress, err := eng.Progress(ctx, &engine.ProgressRequest{})
+	require.NoError(t, err, "Progress() after stop")
+	assert.Equal(t, engine.StateStopped, progress.State,
+		"stopping mid-ALTER must report Stopped, not %s", progress.State)
+}
+
 // Stopping a running ALTER that has a DROP TABLE queued after it must leave the
 // change in Stopped, never Failed/Completed: the post-ALTER DROP phase sees the
 // cancelled context and must not overwrite the operator-set Stopped state. The

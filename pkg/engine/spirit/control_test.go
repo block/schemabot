@@ -1,6 +1,7 @@
 package spirit
 
 import (
+	"context"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -154,6 +155,66 @@ func TestStopKeepsOutcomeThatLandsDuringCheckpoint(t *testing.T) {
 			tc.checkErr(t, err)
 			assert.False(t, cancelCalled, "a change that already settled has nothing left to cancel")
 			assert.Equal(t, tc.wantState, rm.state)
+		})
+	}
+}
+
+// An operator stops or cancels a schema change whose Spirit cutover commits
+// just before the cancel reaches the runner. The runner then returns having
+// finished the change, and the run records it completed. Once the runner has
+// returned, the stop or cancel reads that outcome and answers that the change
+// completed, so the caller reconciles to the completed outcome rather than
+// recording a stop or cancel of a change the target already holds. A runner
+// that returns without finishing leaves the stop or cancel in effect.
+func TestControlKeepsACompletionThatLandsAfterTheCancel(t *testing.T) {
+	controls := map[string]struct {
+		run       func(eng *Engine, ctx context.Context) (*engine.ControlResult, error)
+		wantState engine.State
+	}{
+		"stop": {run: func(eng *Engine, ctx context.Context) (*engine.ControlResult, error) {
+			return eng.Stop(ctx, &engine.ControlRequest{})
+		}, wantState: engine.StateStopped},
+		"cancel": {run: func(eng *Engine, ctx context.Context) (*engine.ControlResult, error) {
+			return eng.Cancel(ctx, &engine.ControlRequest{})
+		}, wantState: engine.StateCancelled},
+	}
+	for name, control := range controls {
+		t.Run(name+"/the change completes after the cancel", func(t *testing.T) {
+			eng := New(Config{})
+			rm := registerRunningSchemaChange(eng)
+			runCtx, cancelRun := context.WithCancel(t.Context())
+			rm.cancelFunc = cancelRun
+			rm.wg.Go(func() {
+				<-runCtx.Done()
+				eng.completeSchemaChange(runCtx, eng.changeLogger(), rm.database)
+			})
+
+			result, err := control.run(eng, t.Context())
+
+			require.Error(t, err)
+			assert.Nil(t, result)
+			assert.True(t, engine.IsAlreadyCompleted(err), "the caller reconciles to the completed outcome, got %v", err)
+			assert.Contains(t, err.Error(), "completed before the "+name+" took effect")
+			assert.Equal(t, engine.StateCompleted, rm.state)
+		})
+
+		t.Run(name+"/the runner returns without finishing", func(t *testing.T) {
+			eng := New(Config{})
+			rm := registerRunningSchemaChange(eng)
+			runCtx, cancelRun := context.WithCancel(t.Context())
+			rm.cancelFunc = cancelRun
+			rm.wg.Go(func() { <-runCtx.Done() })
+
+			_, err := control.run(eng, t.Context())
+
+			if name == "cancel" {
+				// The cancel goes on to release artifacts against a target this
+				// fixture does not run, so only the state it settled matters here.
+				assert.False(t, engine.IsAlreadyCompleted(err))
+			} else {
+				require.NoError(t, err)
+			}
+			assert.Equal(t, control.wantState, rm.state)
 		})
 	}
 }

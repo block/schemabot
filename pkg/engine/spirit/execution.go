@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -130,19 +131,9 @@ func (e *Engine) executeSchemaChange(ctx context.Context, host, username, passwo
 		return
 	}
 
-	// A cancelled context means the operator stopped the change; engine state
-	// must remain Stopped, so do not overwrite it with StateCompleted.
-	if ctx.Err() != nil {
-		logger.Info("schema change stopped before completion",
-			"database", database,
-			"reason", ctx.Err(),
-		)
-		return
-	}
-
-	// Completion is signalled only after every phase has run, so a poller never
-	// observes StateCompleted while a later DROP phase is still pending.
-	e.setSchemaChangeCompleted()
+	// Every phase ran every statement, so the change completed, even if a stop
+	// or cancel arrived after the last one landed (see completeSchemaChange).
+	e.completeSchemaChange(ctx, logger, database)
 }
 
 // resumeSchemaChange continues a stopped schema change to completion.
@@ -163,17 +154,7 @@ func (e *Engine) resumeSchemaChange(ctx context.Context, host, username, passwor
 	}
 
 	if err := e.executeSpiritMigration(ctx, host, username, password, database, combinedStatement, deferCutover); err != nil {
-		return // Error already logged and state set; on stop the state stays Stopped.
-	}
-
-	// A stop during the resumed ALTER cancels the context; leave the state
-	// Stopped and do not run the pending DROP phase.
-	if ctx.Err() != nil {
-		logger.Info("schema change stopped during resumed ALTER",
-			"database", database,
-			"reason", ctx.Err(),
-		)
-		return
+		return // Failure already logged and recorded; a stop leaves the state Stopped.
 	}
 
 	phases, err := classifyDDLPhases(originalDDLs)
@@ -187,14 +168,28 @@ func (e *Engine) resumeSchemaChange(ctx context.Context, host, username, passwor
 		return
 	}
 
+	e.completeSchemaChange(ctx, logger, database)
+}
+
+// completeSchemaChange records a change whose every phase ran every statement
+// as completed. Completion is signalled only after the last phase, so a poller
+// never observes StateCompleted while a later DROP phase is still pending.
+//
+// It is recorded even when a stop or cancel cancelled the context after the
+// last statement landed, typically a Spirit cutover that committed just before
+// the cancel reached it. The target then holds the whole change, so recording
+// the stop the caller asked for would describe a resumable pause of a change
+// that already landed. Stop and Cancel read the state again once the runner has
+// returned, and answer that the change completed (see settleAfterRunnerExit).
+// A stop that lands before the last statement keeps the change stopped, since
+// that statement or a later phase returns early on the cancelled context.
+func (e *Engine) completeSchemaChange(ctx context.Context, logger *slog.Logger, database string) {
 	if ctx.Err() != nil {
-		logger.Info("schema change stopped before completion",
+		logger.Info("schema change completed as it was being stopped; recording it completed, since the target holds the whole change",
 			"database", database,
 			"reason", ctx.Err(),
 		)
-		return
 	}
-
 	e.setSchemaChangeCompleted()
 }
 
@@ -267,11 +262,10 @@ func (e *Engine) executeCreateStatements(ctx context.Context, host, username, pa
 // execution, runs the direct statements first (each is synchronous and fast
 // relative to an online copy, and a routing or direct failure should surface
 // before hours of copying), then combines the Spirit-accepted statements into
-// one runner. It returns true when the phase ran and the caller may proceed
-// to the DROP phase, and false on a genuine failure (the failing step has
-// already set StateFailed). A stop cancels the context but may return true;
-// the caller's later ctx.Err() checks then keep the state Stopped without
-// running further phases.
+// one runner. It returns true when every statement ran and the caller may
+// proceed to the DROP phase. It returns false when the phase did not finish:
+// after a genuine failure (the failing step has already set StateFailed), or
+// after a stop, which leaves the state Stopped.
 func (e *Engine) executeAlterPhase(ctx context.Context, host, username, password, database string, alters []string, deferCutover bool, policy directPolicy) bool {
 	target := &lazyTargetDB{dsn: targetDSN(host, username, password, database)}
 	defer target.close()
@@ -286,7 +280,7 @@ func (e *Engine) executeAlterPhase(ctx context.Context, host, username, password
 
 	if len(routing.direct) > 0 {
 		if !e.executeDirectStatements(ctx, target, database, routing.direct, policy) {
-			return ctx.Err() != nil
+			return false
 		}
 	}
 
@@ -384,7 +378,14 @@ func (e *Engine) executeSingleStatement(ctx context.Context, host, username, pas
 	return nil
 }
 
-// executeSpiritMigration runs Spirit for ALTER statements.
+// errSchemaChangeStopped is returned by executeSpiritMigration when the runner
+// returned because a stop or cancel cancelled its context. The state is left
+// as the stop or cancel set it.
+var errSchemaChangeStopped = errors.New("schema change stopped before the ALTER finished")
+
+// executeSpiritMigration runs Spirit for ALTER statements. A nil return means
+// the runner finished the ALTER, cutover included, even when the context was
+// cancelled while it ran.
 func (e *Engine) executeSpiritMigration(ctx context.Context, host, username, password, database, combinedStatement string, deferCutover bool) error {
 	logger := e.changeLogger()
 	// Parse statements to extract table names
@@ -466,7 +467,7 @@ func (e *Engine) executeSpiritMigration(ctx context.Context, host, username, pas
 			)
 			// Don't change state - Stop() already set it to StateStopped
 			utils.CloseAndLog(runner)
-			return nil
+			return errSchemaChangeStopped
 		}
 		logger.Error("schema change failed",
 			"error", err,

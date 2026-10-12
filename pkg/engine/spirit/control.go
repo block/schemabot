@@ -102,6 +102,9 @@ func (e *Engine) Stop(ctx context.Context, req *engine.ControlRequest) (*engine.
 
 	// Wait for the goroutine to complete
 	rm.wg.Wait()
+	if err := settleAfterRunnerExit(e, rm, logger, "stop", database, tables); err != nil {
+		return nil, err
+	}
 
 	logger.Info("schema change stopped",
 		"database", database,
@@ -112,6 +115,28 @@ func (e *Engine) Stop(ctx context.Context, req *engine.ControlRequest) (*engine.
 		Accepted: true,
 		Message:  "Stopped - checkpoint saved for resume",
 	}, nil
+}
+
+// settleAfterRunnerExit reads the change's state once its runner has returned
+// from a stop or cancel. The runner can finish the change after the context
+// was cancelled, as when a Spirit cutover commits just before the cancel
+// reaches it, and the run then records the change completed
+// (completeSchemaChange). That outcome stands: the stop or cancel is answered
+// with the typed already-completed rejection, so the caller reconciles to the
+// completed outcome, and a cancel drops no artifacts of a change that landed.
+// Any other state is the stop or cancel taking effect, and nil is returned.
+func settleAfterRunnerExit(e *Engine, rm *runningSchemaChange, logger *slog.Logger, operation, database string, tables []string) error {
+	e.mu.Lock()
+	state := rm.state
+	e.mu.Unlock()
+	if state != engine.StateCompleted {
+		return nil
+	}
+	logger.Info(operation+" rejected: the schema change completed before the "+operation+" took effect",
+		"database", database,
+		"tables", tables,
+	)
+	return engine.NewAlreadyCompletedError("%s rejected: the schema change on database %s completed before the %s took effect", operation, database, operation)
 }
 
 // settledOutcomeOutranksStop reports whether the schema change settled on an
@@ -224,6 +249,9 @@ func (e *Engine) Cancel(ctx context.Context, req *engine.ControlRequest) (*engin
 		"tables", tables,
 	)
 	rm.wg.Wait()
+	if err := settleAfterRunnerExit(e, rm, logger, "cancel", database, tables); err != nil {
+		return nil, err
+	}
 
 	logger.Info("schema change cancelled",
 		"database", database,
