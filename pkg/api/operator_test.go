@@ -1266,7 +1266,7 @@ func TestCompletePendingControlRequestsIfApplyResolved(t *testing.T) {
 		}}
 		svc := newStopReconcileTestService(applies, &markPendingStoppedRecordingStore{}, control)
 
-		require.NoError(t, svc.completePendingControlRequestsIfApplyResolved(t.Context(), 1, 9))
+		require.NoError(t, svc.completePendingControlRequestsIfApplyResolved(t.Context(), svc.driverLogger(1), 9))
 		require.Len(t, control.completed, 1, "a terminal apply with a pending stop completes the request")
 		assert.Equal(t, storage.ControlOperationStop, control.completed[0])
 	})
@@ -1278,7 +1278,7 @@ func TestCompletePendingControlRequestsIfApplyResolved(t *testing.T) {
 		}}
 		svc := newStopReconcileTestService(applies, &markPendingStoppedRecordingStore{}, control)
 
-		require.NoError(t, svc.completePendingControlRequestsIfApplyResolved(t.Context(), 1, 9))
+		require.NoError(t, svc.completePendingControlRequestsIfApplyResolved(t.Context(), svc.driverLogger(1), 9))
 		require.Len(t, control.completed, 1, "a terminal apply with a pending cancel completes the request")
 		assert.Equal(t, storage.ControlOperationCancel, control.completed[0])
 	})
@@ -1290,7 +1290,7 @@ func TestCompletePendingControlRequestsIfApplyResolved(t *testing.T) {
 		}}
 		svc := newStopReconcileTestService(applies, &markPendingStoppedRecordingStore{}, control)
 
-		require.NoError(t, svc.completePendingControlRequestsIfApplyResolved(t.Context(), 1, 9))
+		require.NoError(t, svc.completePendingControlRequestsIfApplyResolved(t.Context(), svc.driverLogger(1), 9))
 		assert.Empty(t, control.completed, "a cancel the schema change outran did not take effect, so it must not read as completed")
 		require.Len(t, control.failed, 1, "the outrun cancel is settled terminally, not left pending")
 		assert.Equal(t, storage.ControlOperationCancel, control.failed[0])
@@ -1305,7 +1305,7 @@ func TestCompletePendingControlRequestsIfApplyResolved(t *testing.T) {
 		}}
 		svc := newStopReconcileTestService(applies, &markPendingStoppedRecordingStore{}, control)
 
-		require.NoError(t, svc.completePendingControlRequestsIfApplyResolved(t.Context(), 1, 9))
+		require.NoError(t, svc.completePendingControlRequestsIfApplyResolved(t.Context(), svc.driverLogger(1), 9))
 		assert.Equal(t, []storage.ControlOperation{storage.ControlOperationStart}, control.completed,
 			"the completed apply is the start having taken effect")
 		assert.Empty(t, control.failed)
@@ -1318,7 +1318,7 @@ func TestCompletePendingControlRequestsIfApplyResolved(t *testing.T) {
 		}}
 		svc := newStopReconcileTestService(applies, &markPendingStoppedRecordingStore{}, control)
 
-		require.NoError(t, svc.completePendingControlRequestsIfApplyResolved(t.Context(), 1, 9))
+		require.NoError(t, svc.completePendingControlRequestsIfApplyResolved(t.Context(), svc.driverLogger(1), 9))
 		assert.Empty(t, control.completed, "a start whose apply failed did not reach the outcome the operator asked for")
 		require.Equal(t, []storage.ControlOperation{storage.ControlOperationStart}, control.failed)
 		assert.Contains(t, control.failureReasons[0], "duplicate entry for key email")
@@ -1331,7 +1331,7 @@ func TestCompletePendingControlRequestsIfApplyResolved(t *testing.T) {
 		}}
 		svc := newStopReconcileTestService(applies, &markPendingStoppedRecordingStore{}, control)
 
-		require.NoError(t, svc.completePendingControlRequestsIfApplyResolved(t.Context(), 1, 9))
+		require.NoError(t, svc.completePendingControlRequestsIfApplyResolved(t.Context(), svc.driverLogger(1), 9))
 		require.Equal(t, []storage.ControlOperation{storage.ControlOperationStart}, control.failed)
 		assert.Contains(t, control.failureReasons[0], "the schema change reached Cancelled before the start could take effect")
 	})
@@ -1345,7 +1345,7 @@ func TestCompletePendingControlRequestsIfApplyResolved(t *testing.T) {
 		}}
 		svc := newStopReconcileTestService(applies, &markPendingStoppedRecordingStore{}, control)
 
-		require.NoError(t, svc.completePendingControlRequestsIfApplyResolved(t.Context(), 1, 9))
+		require.NoError(t, svc.completePendingControlRequestsIfApplyResolved(t.Context(), svc.driverLogger(1), 9))
 		assert.Equal(t, []storage.ControlOperation{storage.ControlOperationStop}, control.completed,
 			"a stopped apply completes the stop but must keep the start that resumes it and the cancel deliverable")
 		assert.Empty(t, control.failed)
@@ -1362,7 +1362,7 @@ func TestCompletePendingControlRequestsIfApplyResolved(t *testing.T) {
 		}}
 		svc := newStopReconcileTestService(applies, ops, control)
 
-		require.NoError(t, svc.completePendingControlRequestsIfApplyResolved(t.Context(), 1, 9))
+		require.NoError(t, svc.completePendingControlRequestsIfApplyResolved(t.Context(), svc.driverLogger(1), 9))
 		assert.Empty(t, control.completed, "an apply with live work must not complete any control request")
 	})
 
@@ -1378,7 +1378,7 @@ func TestCompletePendingControlRequestsIfApplyResolved(t *testing.T) {
 		}}
 		svc := newStopReconcileTestService(applies, ops, control)
 
-		require.NoError(t, svc.completePendingControlRequestsIfApplyResolved(t.Context(), 1, 9))
+		require.NoError(t, svc.completePendingControlRequestsIfApplyResolved(t.Context(), svc.driverLogger(1), 9))
 		require.Len(t, control.completed, 1, "the stop landed on every operation, so its request completes; the cancel is still deliverable")
 		assert.Equal(t, storage.ControlOperationStop, control.completed[0])
 	})
@@ -1388,7 +1388,7 @@ func TestCompletePendingControlRequestsIfApplyResolved(t *testing.T) {
 		control := &fakeControlRequestStore{}
 		svc := newStopReconcileTestService(applies, &markPendingStoppedRecordingStore{}, control)
 
-		require.NoError(t, svc.completePendingControlRequestsIfApplyResolved(t.Context(), 1, 9))
+		require.NoError(t, svc.completePendingControlRequestsIfApplyResolved(t.Context(), svc.driverLogger(1), 9))
 		assert.Empty(t, control.completed, "no pending requests means nothing to complete")
 	})
 }

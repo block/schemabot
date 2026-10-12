@@ -4,7 +4,9 @@ package api
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -107,4 +109,122 @@ func TestOperator_StartUnansweredAfterTheStoredOutcomeIsSettledByTheOperator(t *
 	require.NoError(t, err)
 	require.NotNil(t, apply)
 	assert.Equal(t, state.Apply.Completed, apply.State, "the stored outcome stands")
+}
+
+// refusingSettlementStorage refuses the write that settles a pending control
+// request for as long as the switch is on, the way a storage blip that outlives
+// a drive would, and delegates everything else to real storage.
+type refusingSettlementStorage struct {
+	storage.Storage
+	refuse *atomic.Bool
+}
+
+func (s refusingSettlementStorage) ControlRequests() storage.ControlRequestStore {
+	return refusingSettlementControlStore{ControlRequestStore: s.Storage.ControlRequests(), refuse: s.refuse}
+}
+
+// Wraps a real store rather than standing in for one, so it embeds the
+// interface directly and only the settlement writes are overridden.
+type refusingSettlementControlStore struct {
+	storage.ControlRequestStore
+	refuse *atomic.Bool
+}
+
+func (s refusingSettlementControlStore) CompletePending(ctx context.Context, applyID int64, operation storage.ControlOperation) error {
+	if s.refuse.Load() {
+		return errors.New("control request store unavailable")
+	}
+	return s.ControlRequestStore.CompletePending(ctx, applyID, operation)
+}
+
+func (s refusingSettlementControlStore) FailPending(ctx context.Context, applyID int64, operation storage.ControlOperation, reason string) error {
+	if s.refuse.Load() {
+		return errors.New("control request store unavailable")
+	}
+	return s.ControlRequestStore.FailPending(ctx, applyID, operation, reason)
+}
+
+// An operator started an apply whose drive stored the apply completed and then
+// lost the write answering the start — and the operator's own post-drive
+// settlement lost it too. Nothing re-claims a completed apply, so no later
+// drive will visit the request. The reaper's stranded control-request sweep is
+// what answers it: once the apply has been quiescent for the settlement window
+// and no driver holds an operation of it, the sweep runs the same settlement
+// the drive would have, and the start reads as completed against the stored
+// outcome. Until the apply is quiescent the sweep leaves the request to the
+// drive that may still be settling it.
+func TestOperator_StartUnansweredByEveryDriveSettlementIsSettledByTheReaper(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	ctx := t.Context()
+	db := openMatrixStorage(t)
+	stor := mysqlstore.New(db)
+	var refuse atomic.Bool
+	refuse.Store(true)
+	refusing := refusingSettlementStorage{Storage: stor, refuse: &refuse}
+
+	seed := seedGroupedApply(t, ctx, stor, multiOpSeed{
+		applyIdentifier: "start-unanswered-by-every-drive-settlement",
+		parentState:     state.Apply.Running,
+		cutoverPolicy:   storage.CutoverPolicyRolling,
+		onFailure:       storage.OnFailureHalt,
+		deployments:     []string{"region-a"},
+		opState:         state.ApplyOperation.FailedRetryable,
+		taskState:       state.Task.FailedRetryable,
+	})
+	_, err := db.ExecContext(ctx,
+		"UPDATE applies SET updated_at = NOW() - INTERVAL 2 MINUTE WHERE id = ?", seed.applyID)
+	require.NoError(t, err, "backdate the parent apply heartbeat")
+	stalenessBackdate(t, ctx, db, seed.applyID)
+	_, _, err = stor.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+		ApplyID:     seed.applyID,
+		Operation:   storage.ControlOperationStart,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "matrix-test",
+	})
+	require.NoError(t, err, "request pending start")
+
+	svc := newMatrixService(t, refusing, map[string]tern.Client{
+		"region-a/staging": &unansweredStartClient{matrixTernClient: &matrixTernClient{
+			mockTernClient: &mockTernClient{},
+			stor:           stor,
+			deployment:     "region-a",
+			rec:            &driveRecorder{},
+			outcome:        matrixOutcome{taskState: state.Task.Completed},
+		}},
+	})
+	driveNextOperation(t, ctx, svc, 1)
+
+	start, err := stor.ControlRequests().GetByOperation(ctx, seed.applyID, storage.ControlOperationStart)
+	require.NoError(t, err)
+	require.NotNil(t, start)
+	require.Equal(t, storage.ControlRequestPending, start.Status,
+		"the drive and the operator both lost the settlement write, so the start is still pending")
+	apply, err := stor.Applies().Get(ctx, seed.applyID)
+	require.NoError(t, err)
+	require.NotNil(t, apply)
+	require.Equal(t, state.Apply.Completed, apply.State, "the stored outcome stands")
+
+	// Storage recovers, but the apply settled moments ago: a drive could still
+	// be running its own post-drive settlement, so the sweep leaves it alone.
+	refuse.Store(false)
+	svc.runStrandedReaperPass(ctx)
+	start, err = stor.ControlRequests().GetByOperation(ctx, seed.applyID, storage.ControlOperationStart)
+	require.NoError(t, err)
+	require.NotNil(t, start)
+	assert.Equal(t, storage.ControlRequestPending, start.Status,
+		"a freshly settled apply is still its drive's to answer")
+
+	_, err = db.ExecContext(ctx,
+		"UPDATE applies SET updated_at = NOW() - INTERVAL 11 MINUTE WHERE id = ?", seed.applyID)
+	require.NoError(t, err, "age the settled apply past the quiescence window")
+	svc.runStrandedReaperPass(ctx)
+
+	start, err = stor.ControlRequests().GetByOperation(ctx, seed.applyID, storage.ControlOperationStart)
+	require.NoError(t, err)
+	require.NotNil(t, start)
+	assert.Equal(t, storage.ControlRequestCompleted, start.Status,
+		"the reaper answers the start every drive settlement lost, against the stored completed outcome")
 }
