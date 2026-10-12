@@ -147,9 +147,12 @@ type runningSchemaChange struct {
 	// quarantinedDrops records every table this attempt of the schema change
 	// set out to move into pending drops, keyed by source table, so a DROP
 	// phase replayed through Start skips the tables it already moved and still
-	// fails on a table that vanished some other way. It lives in this process
-	// only; a resume that goes through Apply starts with an empty record.
-	quarantinedDrops map[dropTarget]pendingdrops.QuarantinedTable
+	// fails on a table that vanished some other way. A table keeps every
+	// destination recorded for it, oldest first, since a RENAME a stop
+	// abandoned can still land after a replay recorded a newer one. It lives
+	// in this process only; a resume that goes through Apply starts with an
+	// empty record.
+	quarantinedDrops map[dropTarget][]pendingdrops.QuarantinedTable
 
 	// owner is the drive the run belongs to (engine.WithWorkOwner), set when
 	// Apply starts the run and again when Start resumes it, under Engine.mu.

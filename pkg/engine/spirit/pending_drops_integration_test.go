@@ -562,6 +562,75 @@ func TestEngine_ResumeDropPhase_StopDuringBlockedRename(t *testing.T) {
 	assert.Len(t, listQuarantinedTables(t, db), 1, "the replay must not quarantine the table a second time")
 }
 
+// A stop abandons a quarantine RENAME that is waiting on a metadata lock, and
+// the engine replays the DROP while that RENAME is still queued on the server.
+// The replay still sees the table, so it records a fresh destination and
+// queues behind the abandoned RENAME. Once the lock is released the abandoned
+// RENAME lands at the first destination and the replay's own RENAME finds no
+// table. The next replay must find the data at the first destination and skip
+// the table, rather than report the drop final because the newer destination
+// was never written.
+func TestEngine_ResumeDropPhase_ReplayRacingAnAbandonedRename(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	cleanupTables(t, db)
+	cleanupPendingDropsDB(t, db)
+
+	_, err := db.ExecContext(t.Context(), "CREATE TABLE `replay_races_rename` (id INT PRIMARY KEY AUTO_INCREMENT)")
+	require.NoError(t, err, "create replay_races_rename")
+
+	host, username, password, database, err := parseDSN(dsn)
+	require.NoError(t, err, "parse DSN")
+
+	eng := New(Config{Logger: slog.Default()})
+	eng.installRunningSchemaChange(&runningSchemaChange{
+		database: database,
+		state:    engine.StateRunning,
+		host:     host,
+		username: username,
+		password: password,
+	})
+
+	locker, err := db.Conn(t.Context())
+	require.NoError(t, err, "open locking connection")
+	t.Cleanup(func() {
+		cleanupCtx := context.WithoutCancel(t.Context())
+		_, _ = locker.ExecContext(cleanupCtx, "UNLOCK TABLES")
+		_ = locker.Close()
+	})
+	_, err = locker.ExecContext(t.Context(), "LOCK TABLES `replay_races_rename` READ")
+	require.NoError(t, err, "lock replay_races_rename")
+
+	const drop = "DROP TABLE `replay_races_rename`"
+	waitingStatements := func() int {
+		var waiting int
+		require.NoError(t, db.QueryRowContext(t.Context(), `
+			SELECT COUNT(*) FROM information_schema.processlist
+			WHERE info LIKE 'RENAME TABLE%replay_races_rename%' OR info LIKE 'CREATE DATABASE IF NOT EXISTS%'`).Scan(&waiting))
+		return waiting
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	firstAttempt := make(chan error, 1)
+	go func() { firstAttempt <- eng.quarantineDroppedTables(ctx, host, username, password, database, drop) }()
+	waitFor(t, "the first RENAME to block on the metadata lock", func() bool { return waitingStatements() >= 1 })
+	cancel()
+	require.Error(t, <-firstAttempt, "the stopped attempt must report that its RENAME did not complete")
+
+	replay := make(chan error, 1)
+	go func() { replay <- eng.quarantineDroppedTables(t.Context(), host, username, password, database, drop) }()
+	waitFor(t, "the replay to queue behind the abandoned RENAME", func() bool { return waitingStatements() >= 2 })
+
+	_, err = locker.ExecContext(t.Context(), "UNLOCK TABLES")
+	require.NoError(t, err, "release the metadata lock")
+	require.Error(t, <-replay, "the replay's own RENAME finds the table already moved")
+	require.Len(t, listQuarantinedTables(t, db), 1, "the abandoned RENAME quarantined the table")
+
+	err = eng.quarantineDroppedTables(t.Context(), host, username, password, database, drop)
+	require.NoError(t, err, "the next replay must find the copy the abandoned RENAME wrote")
+	assert.Len(t, listQuarantinedTables(t, db), 1, "the table is quarantined exactly once")
+}
+
 // waitFor polls condition until it holds or the deadline passes.
 func waitFor(t *testing.T, what string, condition func() bool) {
 	t.Helper()
@@ -637,13 +706,13 @@ func TestEngine_ResumeDropPhase_FailsWhenRecordedCopyWasRemoved(t *testing.T) {
 	eng := New(Config{Logger: slog.Default()})
 	eng.installRunningSchemaChange(&runningSchemaChange{
 		database: database,
-		quarantinedDrops: map[dropTarget]pendingdrops.QuarantinedTable{
-			{schema: database, table: "removed_copy"}: {
+		quarantinedDrops: map[dropTarget][]pendingdrops.QuarantinedTable{
+			{schema: database, table: "removed_copy"}: {{
 				SchemaName:       database,
 				TableName:        "removed_copy",
 				QuarantineSchema: pendingdrops.Database,
 				QuarantineTable:  "20260101000000_removed_copy",
-			},
+			}},
 		},
 	})
 
