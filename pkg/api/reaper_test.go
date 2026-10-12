@@ -85,8 +85,130 @@ func strandedReaperServiceWithTasks(reaped []*storage.ReapedOperation, reapErr e
 	svc.storage = &mockStorageWithApplyStores{
 		operations: &staticApplyOperationStore{reaped: reaped, reapErr: reapErr},
 		tasks:      &reapingTaskStore{reaped: reapedTasks, reapErr: taskReapErr},
+		controls:   &reapingControlRequestStore{fakeControlRequestStore: &fakeControlRequestStore{}},
 	}
 	return svc
+}
+
+// reapingControlRequestStore serves the reaper pass a canned stranded listing
+// and records the settlements the pass makes against it.
+type reapingControlRequestStore struct {
+	*fakeControlRequestStore
+	stranded []*storage.StrandedControlRequest
+	listErr  error
+}
+
+func (s *reapingControlRequestStore) ListStrandedPending(context.Context, int) ([]*storage.StrandedControlRequest, error) {
+	return s.stranded, s.listErr
+}
+
+// strandedControlRequestReaperService wires a pass whose control-request sweep
+// finds the given stranded requests and whose apply store serves the apply
+// they belong to, with the other sweeps finding nothing.
+func strandedControlRequestReaperService(apply *storage.Apply, stranded []*storage.StrandedControlRequest, pending ...storage.ControlOperation) (*Service, *reapingControlRequestStore) {
+	pendingByOp := make(map[storage.ControlOperation]*storage.ApplyControlRequest, len(pending))
+	for _, op := range pending {
+		pendingByOp[op] = &storage.ApplyControlRequest{ApplyID: apply.ID, Operation: op, Status: storage.ControlRequestPending}
+	}
+	controls := &reapingControlRequestStore{
+		fakeControlRequestStore: &fakeControlRequestStore{pending: pendingByOp},
+		stranded:                stranded,
+	}
+	svc := newTestService()
+	svc.storage = &mockStorageWithApplyStores{
+		applies:    &getApplyStore{apply: apply},
+		operations: &staticApplyOperationStore{},
+		tasks:      &reapingTaskStore{},
+		controls:   controls,
+	}
+	return svc, controls
+}
+
+func strandedRequest(apply *storage.Apply, op storage.ControlOperation) *storage.StrandedControlRequest {
+	return &storage.StrandedControlRequest{
+		Request: &storage.ApplyControlRequest{ApplyID: apply.ID, Operation: op, Status: storage.ControlRequestPending, RequestedBy: "operator"},
+		Apply:   apply,
+	}
+}
+
+// A start left pending on a completed apply is answered by the reaper with the
+// same outcome the drive would have disclosed: the apply completed, so the
+// start took effect and completes. A failed apply fails the start with the
+// apply's own reason, so the operator reads that the command did not reach the
+// outcome they asked for.
+func TestRunStrandedReaperPassAnswersAStartStrandedOnASettledApply(t *testing.T) {
+	t.Run("completed apply completes the start", func(t *testing.T) {
+		apply := &storage.Apply{ID: 9, ApplyIdentifier: "apply-done", State: state.Apply.Completed}
+		svc, controls := strandedControlRequestReaperService(apply,
+			[]*storage.StrandedControlRequest{strandedRequest(apply, storage.ControlOperationStart)},
+			storage.ControlOperationStart)
+
+		svc.runStrandedReaperPass(t.Context())
+
+		assert.Equal(t, []storage.ControlOperation{storage.ControlOperationStart}, controls.completed)
+		assert.Empty(t, controls.failed)
+	})
+
+	t.Run("failed apply fails the start with the apply's reason", func(t *testing.T) {
+		apply := &storage.Apply{ID: 9, ApplyIdentifier: "apply-failed", State: state.Apply.Failed, ErrorMessage: "target rejected the schema change"}
+		svc, controls := strandedControlRequestReaperService(apply,
+			[]*storage.StrandedControlRequest{strandedRequest(apply, storage.ControlOperationStart)},
+			storage.ControlOperationStart)
+
+		svc.runStrandedReaperPass(t.Context())
+
+		assert.Empty(t, controls.completed)
+		assert.Equal(t, []storage.ControlOperation{storage.ControlOperationStart}, controls.failed)
+		assert.Equal(t, []string{"target rejected the schema change"}, controls.failureReasons)
+	})
+}
+
+// The listing is per request but the settlement is per apply: it reloads the
+// apply and answers every pending request on it in one visit, so an apply that
+// stranded both a stop and a cancel is settled once, not once per row.
+func TestRunStrandedReaperPassSettlesEachStrandedApplyOnce(t *testing.T) {
+	apply := &storage.Apply{ID: 9, ApplyIdentifier: "apply-done", State: state.Apply.Cancelled}
+	svc, controls := strandedControlRequestReaperService(apply,
+		[]*storage.StrandedControlRequest{
+			strandedRequest(apply, storage.ControlOperationStop),
+			strandedRequest(apply, storage.ControlOperationCancel),
+		},
+		storage.ControlOperationStop, storage.ControlOperationCancel)
+
+	svc.runStrandedReaperPass(t.Context())
+
+	assert.Equal(t, []storage.ControlOperation{storage.ControlOperationStop, storage.ControlOperationCancel}, controls.completed,
+		"one visit answers both requests; a second visit would complete them again")
+}
+
+// A storage failure listing stranded control requests is recorded under the
+// sweep's own reason, and losing its election is not a failure.
+func TestRunStrandedReaperPassRecordsControlRequestSweepOutcomes(t *testing.T) {
+	t.Run("listing failure", func(t *testing.T) {
+		reader := reaperMetricReader(t)
+		svc := strandedReaperService(nil, nil)
+		svc.storage.(*mockStorageWithApplyStores).controls = &reapingControlRequestStore{
+			fakeControlRequestStore: &fakeControlRequestStore{},
+			listErr:                 errors.New("control requests table unavailable"),
+		}
+
+		svc.runStrandedReaperPass(t.Context())
+
+		assert.Equal(t, []string{"stranded_control_request_reaper_error"}, claimFailureReasons(t, reader))
+	})
+
+	t.Run("busy is not a failure", func(t *testing.T) {
+		reader := reaperMetricReader(t)
+		svc := strandedReaperService(nil, nil)
+		svc.storage.(*mockStorageWithApplyStores).controls = &reapingControlRequestStore{
+			fakeControlRequestStore: &fakeControlRequestStore{},
+			listErr:                 storage.ErrStrandedControlRequestReaperBusy,
+		}
+
+		svc.runStrandedReaperPass(t.Context())
+
+		assert.Empty(t, claimFailureReasons(t, reader), "an unelected control-request sweep is not a failure")
+	})
 }
 
 func settledOperation(deployment string) *storage.ReapedOperation {
@@ -243,6 +365,7 @@ func TestRunStrandedReaperPassDoesNotHoldOneSweepBehindTheOther(t *testing.T) {
 	svc.storage = &mockStorageWithApplyStores{
 		operations: &gatedApplyOperationStore{gate: operationSweepGate},
 		tasks:      &startedTaskStore{started: taskSweepStarted},
+		controls:   &reapingControlRequestStore{fakeControlRequestStore: &fakeControlRequestStore{}},
 	}
 
 	ctx, cancel := context.WithTimeout(t.Context(), reaperPassDeadline)

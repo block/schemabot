@@ -1250,6 +1250,60 @@ func TestPostgresReapStrandedRetryableDefersToTheOperationLease(t *testing.T) {
 	assert.Equal(t, state.Task.Failed, taskState(t))
 }
 
+// The stranded control-request listing renders the same parent and lease
+// gates, keyed on the request's apply rather than on a task's operation, so
+// PostgreSQL has to execute that rendering too. A pending start on a
+// long-settled apply is the reaper's only once no driver holds an operation of
+// that apply.
+func TestPostgresListStrandedPendingDefersToAFreshOperationLease(t *testing.T) {
+	dsn, fixtureDB := testutil.StartPostgres(t, "sqlstore_stranded_control")
+	db, err := postgresconn.Open(dsn)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	require.NoError(t, db.PingContext(t.Context()))
+	applyPostgresTestSchema(t, fixtureDB)
+
+	h := postgresHarness{db: db, dsn: dsn}
+	store := h.NewStorage(t)
+
+	var applyID int64
+	require.NoError(t, db.QueryRowContext(t.Context(), `
+		INSERT INTO applies (apply_identifier, lock_id, plan_id, database_name, database_type,
+			repository, pull_request, environment, engine, state, options, error_message, updated_at)
+		VALUES ('apply-stranded-control', 1, 1, 'testdb', 'mysql', 'org/repo', 7, 'staging', 'spirit', $1, '{}',
+			'', NOW() - make_interval(secs => $2))
+		RETURNING id`, state.Apply.Completed,
+		int64((strandedParentQuiescence+time.Minute).Seconds())).Scan(&applyID))
+
+	// The operation a sibling driver is holding, heartbeated as of now.
+	var opID int64
+	require.NoError(t, db.QueryRowContext(t.Context(), `
+		INSERT INTO apply_operations (apply_id, deployment, operation_key, state, lease_owner, lease_token)
+		VALUES ($1, 'region-a', 'op-1', $2, 'driver', 'op-token')
+		RETURNING id`, applyID, state.ApplyOperation.Running).Scan(&opID))
+
+	_, alreadyPending, err := store.ControlRequests().RequestPending(t.Context(), &storage.ApplyControlRequest{
+		ApplyID: applyID, Operation: storage.ControlOperationStart, RequestedBy: "operator",
+	})
+	require.NoError(t, err)
+	require.False(t, alreadyPending)
+
+	listed, err := store.ControlRequests().ListStrandedPending(t.Context(), 10)
+	require.NoError(t, err)
+	assert.Empty(t, listed, "a driver holds an operation of the apply, so the request is that drive's to answer")
+
+	_, err = db.ExecContext(t.Context(),
+		`UPDATE apply_operations SET updated_at = NOW() - make_interval(secs => $1) WHERE id = $2`,
+		int64((storage.ApplyLeaseStaleAfter + time.Minute).Seconds()), opID)
+	require.NoError(t, err)
+
+	listed, err = store.ControlRequests().ListStrandedPending(t.Context(), 10)
+	require.NoError(t, err)
+	require.Len(t, listed, 1, "a lease a peer could reclaim no longer speaks for the apply")
+	assert.Equal(t, storage.ControlOperationStart, listed[0].Request.Operation)
+	assert.Equal(t, "apply-stranded-control", listed[0].Apply.ApplyIdentifier)
+}
+
 // Recovering a crashed retry admits one driver per staleness window on
 // PostgreSQL as it does on MySQL. The gate is a rendered interval comparison,
 // not Go, so each dialect has to execute it. Leasing the operation and claiming
