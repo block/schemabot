@@ -141,12 +141,15 @@ func (c *LocalClient) refusedTaskVerdict(ctx context.Context, apply *storage.App
 // with the apply untouched (see refusedTaskVerdict).
 //
 // The in-memory apply reads terminal on return only when storage holds a
-// terminal state for it. When the failed write does not land, the in-memory
-// apply is put back to its pre-failure state, the active-apply gauge is left
-// alone, and the write error is returned: the stored apply is still active, so
-// nothing that answers for its outcome may run, and the claim that picks it up
-// next settles it. A drive cancelled before or while recording the failure
-// hands the apply back with nil and the apply untouched.
+// terminal state for it. A failed write that returns an error is re-read
+// (failureWriteLanded): when storage holds the failure anyway, the write
+// landed and the helper carries on as if it had returned nil. When the failed
+// write does not land, the in-memory apply is put back to its pre-failure
+// state, the active-apply gauge is left alone, and the write error is
+// returned: the stored apply is still active, so nothing that answers for its
+// outcome may run, and the claim that picks it up next settles it. A drive
+// cancelled before or while recording the failure hands the apply back with
+// nil and the apply untouched.
 //
 // It records the failure only. The side effects a terminal apply owes —
 // settling the control requests it moots and posting the terminal summary —
@@ -196,14 +199,79 @@ func (c *LocalClient) failApplyWithTasks(ctx context.Context, apply *storage.App
 		if c.driveCancelled(ctx, apply, "while recording that the apply failed") {
 			return nil
 		}
-		logger.Error("failed to record the apply failed; current apply owner will exit for operator retry with the apply still active, its pending control requests pending, and no terminal summary posted",
-			append(apply.MutableLogAttrs(), "failure", errMsg, "error", err)...)
-		return fmt.Errorf("record apply %s (database %s) failed from stored state %s: %w",
-			apply.ApplyIdentifier, apply.Database, previous.State, err)
+		landed, stored := c.failureWriteLanded(ctx, apply, errMsg, err)
+		if !landed {
+			logger.Error("failed to record the apply failed; current apply owner will exit for operator retry with the apply still active, its pending control requests pending, and no terminal summary posted",
+				append(apply.MutableLogAttrs(), "failure", errMsg, "error", err)...)
+			return fmt.Errorf("record apply %s (database %s) failed from stored state %s: %w",
+				apply.ApplyIdentifier, apply.Database, previous.State, err)
+		}
+		logger.Warn("the write recording the apply failed returned an error, but storage holds the failure; continuing with the stored outcome",
+			append(stored.MutableLogAttrs(), "error", err)...)
+		*apply = *stored
 	}
 	c.logApplyFailure(ctx, apply, previous.State, errMsg)
 	metrics.AdjustActiveApplies(ctx, -1, apply.Database, apply.Deployment, apply.Environment)
 	return nil
+}
+
+// failureWriteLanded re-reads the apply after the write recording it failed
+// returned an error, and reports whether storage holds that failure anyway: the
+// write committed and only its reply was lost, as when the connection drops
+// before the server's acknowledgement arrives. The write is this drive's only
+// when storage holds the apply failed with this drive's message and still
+// under this drive's apply lease: a successor that reclaimed the apply can
+// record the same failure with the same message, and a displaced driver must
+// exit rather than take that outcome, or its side effects, as its own (OW-2).
+// So a write refused for a lost lease is never recovered, and neither is one
+// made by a drive holding no apply lease, since nothing then proves whose write
+// storage holds. Anything else, including a re-read that fails, is a write that
+// did not land, and the drive goes on to treat it that way.
+func (c *LocalClient) failureWriteLanded(ctx context.Context, apply *storage.Apply, errMsg string, writeErr error) (bool, *storage.Apply) {
+	if errors.Is(writeErr, storage.ErrApplyLeaseLost) {
+		return false, nil
+	}
+	lease, held := storage.ApplyLeaseFromContext(ctx)
+	if !held || lease.ApplyID != apply.ID {
+		c.logger.Debug("the drive holds no apply lease to prove the failure write was its own; treating the failure as not recorded",
+			apply.LogAttrs()...)
+		return false, nil
+	}
+	stored, err := c.storage.Applies().Get(ctx, apply.ID)
+	if err != nil {
+		c.logger.Warn("could not re-read the apply after the write recording it failed returned an error; treating the failure as not recorded",
+			append(apply.LogAttrs(), "error", err)...)
+		return false, nil
+	}
+	if stored == nil {
+		c.logger.Warn("the apply was not found when re-read after the write recording it failed returned an error; treating the failure as not recorded",
+			apply.LogAttrs()...)
+		return false, nil
+	}
+	if !state.IsState(stored.State, state.Apply.Failed) {
+		c.logger.Debug("storage does not hold the apply failed after the write recording it returned an error; the write did not land",
+			stored.LogAttrs()...)
+		return false, nil
+	}
+	if !failureStoredUnderLease(stored, errMsg, lease) {
+		// Storage holds a failure, but not provably this drive's: another
+		// drive recorded its own, or a successor recorded the same one under
+		// its own lease. The token value itself is never logged.
+		c.logger.Warn("storage holds the apply failed, but not provably by this drive's write; treating the failure as not recorded and leaving the stored outcome to the drive that owns it",
+			append(stored.LogAttrs(),
+				"message_matched", stored.ErrorMessage == errMsg,
+				"lease_token_matched", stored.LeaseToken == lease.Token)...)
+		return false, nil
+	}
+	return true, stored
+}
+
+// failureStoredUnderLease reports whether the stored apply is failed with
+// errMsg and still carries the lease token the drive wrote under.
+func failureStoredUnderLease(stored *storage.Apply, errMsg string, lease storage.ApplyLease) bool {
+	return state.IsState(stored.State, state.Apply.Failed) &&
+		stored.ErrorMessage == errMsg &&
+		stored.LeaseToken == lease.Token
 }
 
 // failApplyAndNotify fails the apply and, once storage holds a terminal state
@@ -277,8 +345,17 @@ func (c *LocalClient) failPendingStartForFailedApply(ctx context.Context, logger
 // Like failApplyWithTasks, a refused task verdict write stops the helper
 // before the apply is touched, and the pause's side effects — the retry log, the
 // active-apply gauge, and the observer's progress update — run only once the
-// pause is stored. When the write does not land, the in-memory apply is put
-// back to its pre-pause state and the write error is returned.
+// pause is stored. When the write returns an error, the in-memory apply is
+// put back to its pre-pause state and the write error is returned.
+//
+// Unlike failApplyWithTasks, a pause write that returns an error is not
+// re-read to find out whether it landed anyway. A pause is not an outcome: it
+// answers no control request and owes no terminal summary, and a stored pause
+// leaves the apply claimable, so the next claim re-drives it and logs and
+// posts whatever it arrives at. What a pause that committed with its reply
+// lost leaves undone is bounded to the retry log entry, the observer's
+// progress update for this attempt, and this drive's active-apply gauge
+// release.
 func (c *LocalClient) markApplyRetryableWithTasks(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, errMsg string) error {
 	if c.driveCancelled(ctx, apply, "before pausing the apply for retry") {
 		return nil
