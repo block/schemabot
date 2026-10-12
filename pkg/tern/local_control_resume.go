@@ -818,6 +818,21 @@ func (c *LocalClient) replanAndFilterTasks(ctx context.Context, apply *storage.A
 			c.logger.Debug("leaving reverted task terminal during resume re-plan", task.LogAttrs()...)
 			continue
 		}
+		if state.IsState(task.State, state.Task.Failed) {
+			// A task a previous drive failed permanently already holds the
+			// apply's outcome, and the drive reads that verdict from the stored row
+			// (checkTaskReady). A schema match does not overturn it: the live
+			// table can match the reviewed target after a failure (a statement
+			// that landed before the engine reported failing, or a change
+			// applied outside SchemaBot), and settling the task completed here
+			// would let the apply finish as a success, running its remaining
+			// tasks after a permanent failure. The task stays active as stored,
+			// with its reviewed DDL, for the drive to weigh.
+			c.logger.Info("keeping failed task as stored through resume re-plan; the drive reads its verdict from the stored row",
+				task.LogAttrs()...)
+			activeTasks = append(activeTasks, task)
+			continue
+		}
 		if taskInRevertPhase(task) {
 			// Post-cutover, the live schema matches the reviewed target by
 			// definition: the change is applied and the engine is holding the
