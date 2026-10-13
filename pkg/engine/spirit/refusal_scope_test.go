@@ -3,7 +3,7 @@ package spirit
 import (
 	"testing"
 
-	"github.com/block/spirit/pkg/migration/check"
+	"github.com/block/spirit/pkg/check"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -39,6 +39,6 @@ func TestPublishableRefusalChecks(t *testing.T) {
 		"primarykeyfloat",
 		"setReorder",
 		"tableidentifier",
-	}, check.ChecksInScope(check.ScopeStatement),
+	}, check.Checks(check.Migration, check.PhaseStatement),
 		"the statement scope changed: read the check and decide whether its reason is safe to show an operator before updating this list")
 }

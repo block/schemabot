@@ -4,7 +4,7 @@ import (
 	"log/slog"
 	"testing"
 
-	"github.com/block/spirit/pkg/migration/check"
+	"github.com/block/spirit/pkg/check"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
