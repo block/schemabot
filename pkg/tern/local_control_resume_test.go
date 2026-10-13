@@ -783,25 +783,37 @@ func TestResumeApplyPlanLoadStorageErrorStaysRecoverable(t *testing.T) {
 	assert.Empty(t, observer.terminal, "a transient plan-load failure must not notify the terminal observer")
 }
 
-func TestResumeStoppedGroupedApplyHandlesPendingStartBeforeFailedTasks(t *testing.T) {
-	storageErr := errors.New("storage unavailable")
-	client, apply, tasks, applyStore := recoveryPlanLoadFixture(&scriptedPlanStore{err: storageErr})
+// An operator stops an apply whose table had already failed, then starts it.
+// The failure decided the schema change before the stop, so the start must not
+// re-plan the failed table and run its statement again. The start is refused
+// with the failure, the apply records it in place of the stopped state, and the
+// operator is told to plan the change again. No plan is loaded and no engine
+// work starts.
+func TestResumeStoppedApplyRefusesAStartOverAFailedTask(t *testing.T) {
+	planErr := errors.New("the start must be refused before the plan is loaded")
+	client, apply, tasks, applyStore := recoveryPlanLoadFixture(&scriptedPlanStore{err: planErr})
 	apply.State = state.Apply.Stopped
 	applyStore.apply = &storage.Apply{}
 	*applyStore.apply = *apply
 	applyStore.apply.State = state.Apply.Resuming
 	tasks[0].State = state.Task.Failed
+	tasks[0].TableName = "orders"
+	tasks[0].ErrorMessage = "Duplicate entry 'a@b.c' for key 'users.email'"
 	requests := pendingControlRequestStore(apply.ID, storage.ControlOperationStart)
 	client.storage.(*exactProgressStorage).controlRequests = requests
+	observer := &terminalRecordingObserver{}
+	client.SetObserver(apply.ID, observer)
 
 	err := client.resumeApplyWithTasks(t.Context(), apply, nil, tasks, nil, false, false)
 
-	require.ErrorIs(t, err, storageErr)
-	assert.Equal(t, state.Apply.Resuming, applyStore.apply.State,
-		"the stopped snapshot must not overwrite the stored start transition")
+	require.NoError(t, err)
+	want := "start refused: table orders failed before the apply was stopped (Duplicate entry 'a@b.c' for key 'users.email'); plan the schema change again and apply the new plan"
+	assert.Equal(t, state.Apply.Failed, applyStore.apply.State)
+	assert.Equal(t, want, applyStore.apply.ErrorMessage)
 	require.Len(t, requests.requests, 1)
-	assert.Equal(t, storage.ControlRequestPending, requests.requests[0].Status,
-		"the start remains deliverable after a recoverable plan read failure")
+	assert.Equal(t, storage.ControlRequestFailed, requests.requests[0].Status, "the start is answered, not left pending")
+	assert.Contains(t, requests.requests[0].ErrorMessage, want)
+	require.Len(t, observer.terminal, 1, "the failed outcome posts its summary")
 }
 
 // A resume claim that finds a pending cancel against a schema change already

@@ -752,7 +752,8 @@ already-landed work, whereas a revival path would re-run stored DDL against a da
 have drifted since. A rollout whose `failed` verdict is corrected back to `running_degraded` (ST-1)
 is not revived: its failed operation stays failed and is never run again. *Enforced:* absence. No
 write re-runs a failed operation, and the rollout projection is the only write that moves a failed
-apply to an active state (ST-1).
+apply to an active state (ST-1). A start on a stopped apply whose task had already failed is refused
+with that failure rather than resumed (`failedTaskRefusingStart`, `pkg/tern/local_control_resume.go`).
 
 ### ST-3: Apply state flows upward, never downward
 
