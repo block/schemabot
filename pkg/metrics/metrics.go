@@ -1080,7 +1080,7 @@ func RecordUnrecognizedEngineTaskStatus(ctx context.Context, database, databaseT
 
 // RecordLockOperation increments the lock operations counter.
 // Operation should be "acquire" or "release".
-// Status should be "success", "conflict", "not_found", "not_owned", or "error".
+// Status should be "success", "conflict", "not_found", "not_owned", "no_acquirer", or "error".
 func RecordLockOperation(ctx context.Context, operation, database, status string) {
 	addCounter(ctx, "schemabot.lock_operations_total",
 		"Total number of lock acquire/release operations", "{operation}",
