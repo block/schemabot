@@ -6,7 +6,6 @@ import (
 	"log/slog"
 	"slices"
 	"sort"
-	"strings"
 	"time"
 
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
@@ -24,7 +23,7 @@ import (
 // embedder calling this directly gets the same guarantees the server enforces
 // rather than a silent backend preference.
 func (c TargetResolverConfig) BuildResolver(ctx context.Context, logger *slog.Logger) (inventory.Resolver, error) {
-	if err := c.validateOverrides(); err != nil {
+	if err := c.validateTargetConfig(); err != nil {
 		return nil, err
 	}
 	resolver, err := c.buildBackend(ctx, logger)
@@ -34,7 +33,12 @@ func (c TargetResolverConfig) BuildResolver(ctx context.Context, logger *slog.Lo
 	return inventory.NewOverrideResolver(resolver, c.Overrides, logger)
 }
 
-func (c TargetResolverConfig) validateOverrides() error {
+func (c TargetResolverConfig) validateTargetConfig() error {
+	for name, target := range c.Targets {
+		if err := target.ValidateTypeSpelling(); err != nil {
+			return fmt.Errorf("target_resolver target %q: %w", name, err)
+		}
+	}
 	if len(c.Overrides) > 0 && !c.Enabled() {
 		return fmt.Errorf("target_resolver.overrides requires an etre or static backend")
 	}
@@ -46,7 +50,7 @@ func (c TargetResolverConfig) validateOverrides() error {
 			if len(target.SchemaOverrides) != 0 {
 				return fmt.Errorf("target_resolver override target %q already has static schema_overrides", entry.Target)
 			}
-			if strings.ToLower(strings.TrimSpace(target.DatabaseType)) != entry.DatabaseType {
+			if target.DatabaseType != entry.DatabaseType {
 				return fmt.Errorf("target_resolver override target %q type does not match static target", entry.Target)
 			}
 		}

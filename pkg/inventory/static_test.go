@@ -139,7 +139,7 @@ func TestStaticResolverResolveTarget(t *testing.T) {
 	t.Setenv("TARGET_DSN", "user:pass@tcp(db.example:3306)/")
 	resolver, err := NewStaticResolver(StaticConfig{Targets: map[string]StaticTarget{
 		"dsid-orders-prod": {
-			DatabaseType: "MySQL",
+			DatabaseType: "mysql",
 			DSN:          "env:TARGET_DSN",
 			Metadata:     map[string]string{"pending_drops": "false"},
 		},
@@ -839,4 +839,16 @@ func TestStaticResolverDSNFromPostgresRequiresCAForNonRDSHost(t *testing.T) {
 	got, err := newResolver(t, "file:/etc/ssl/private-ca.pem").ResolveTarget(t.Context(), Request{Target: "orders-qa"})
 	require.NoError(t, err)
 	assert.Equal(t, "file:/etc/ssl/private-ca.pem", got.Metadata[MetadataPostgresCARef])
+}
+
+func TestStaticResolverRejectsNoncanonicalConfiguredType(t *testing.T) {
+	for _, databaseType := range []string{"MySQL", "MYSQL", " mysql", "mysql ", "\tmysql\n", "Postgres", "Vitess", "STRATA"} {
+		t.Run(databaseType, func(t *testing.T) {
+			resolver, err := NewStaticResolver(StaticConfig{Targets: map[string]StaticTarget{
+				"cluster": {DatabaseType: databaseType, DSN: "env:MISSING_TYPE_TEST_SECRET"},
+			}})
+			require.ErrorContains(t, err, "must be lowercase with no surrounding whitespace")
+			assert.Nil(t, resolver)
+		})
+	}
 }

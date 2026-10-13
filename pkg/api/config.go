@@ -2282,7 +2282,7 @@ func (c *ServerConfig) Validate() error {
 	if err := c.ValidateExperimentalStrata(); err != nil {
 		return err
 	}
-	if err := c.TargetResolver.validateOverrides(); err != nil {
+	if err := c.TargetResolver.validateTargetConfig(); err != nil {
 		return err
 	}
 	if err := c.validateTargetTableOwners(); err != nil {

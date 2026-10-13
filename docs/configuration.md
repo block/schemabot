@@ -135,6 +135,10 @@ environment entry.
 
 ### Per-target schema overrides
 
+Static `target_resolver.targets` entries require exact lowercase engine types
+without surrounding whitespace, such as `mysql` and `postgres`. Values such as
+`MySQL` or ` mysql ` are rejected at startup, with or without overrides.
+
 A data plane can attach a canonical-to-physical schema mapping after resolving
 an exact `(environment, target)` through Etre or static inventory:
 
