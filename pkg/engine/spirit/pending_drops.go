@@ -238,7 +238,7 @@ func describeMissingCopies(recorded []pendingdrops.QuarantinedTable) string {
 	if len(names) == 1 {
 		return "the pending drops copy this attempt recorded for it, " + names[0] + ", is not present"
 	}
-	return "none of the pending drops copies this attempt recorded for it, " + strings.Join(names, ", ") + ", is present"
+	return "none of the pending drops copies this attempt recorded for it (" + strings.Join(names, ", ") + ") is present"
 }
 
 // tableExistsInSchema checks if a table exists in the given schema.

@@ -802,9 +802,51 @@ func TestEngine_ResumeDropPhase_FailsWhenEveryRecordedCopyWasRemoved(t *testing.
 	message, ok := engine.OperatorMessageOf(err)
 	require.True(t, ok, "error must carry an operator message")
 	assert.Contains(t, message,
-		"DROP TABLE target `removed_copies` does not exist and none of the pending drops copies this attempt recorded for it, `"+
+		"DROP TABLE target `removed_copies` does not exist and none of the pending drops copies this attempt recorded for it (`"+
 			pendingdrops.Database+"`.`20260101000000000_removed_copies`, `"+
-			pendingdrops.Database+"`.`20260101000000001_removed_copies`, is present")
+			pendingdrops.Database+"`.`20260101000000001_removed_copies`) is present")
 	assert.Contains(t, message, "retention period has removed it")
 	assert.Empty(t, listQuarantinedTables(t, db), "a failed replay must not quarantine anything")
+}
+
+// A table that a stopped attempt and its replay both set out to quarantine
+// carries two recorded destinations. When the stopped attempt's RENAME never
+// landed and the replay's did, the table sits at the replay's destination; a
+// further replay finds it there and skips the table instead of reporting the
+// drop as final.
+func TestEngine_ResumeDropPhase_SkipsTableQuarantinedAtTheReplaysDestination(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	cleanupTables(t, db)
+	cleanupPendingDropsDB(t, db)
+
+	host, username, password, database, err := parseDSN(dsn)
+	require.NoError(t, err, "parse DSN")
+
+	first := pendingdrops.QuarantinedTable{
+		SchemaName:       database,
+		TableName:        "landed_at_replay",
+		QuarantineSchema: pendingdrops.Database,
+		QuarantineTable:  "20260101000000000_landed_at_replay",
+	}
+	second := first
+	second.QuarantineTable = "20260101000000001_landed_at_replay"
+
+	_, err = db.ExecContext(t.Context(), fmt.Sprintf("CREATE DATABASE IF NOT EXISTS `%s`", pendingdrops.Database))
+	require.NoError(t, err, "create pending drops database")
+	_, err = db.ExecContext(t.Context(),
+		fmt.Sprintf("CREATE TABLE `%s`.`%s` (id INT PRIMARY KEY)", pendingdrops.Database, second.QuarantineTable))
+	require.NoError(t, err, "create the copy at the replay's destination")
+
+	eng := New(Config{Logger: slog.Default()})
+	eng.installRunningSchemaChange(&runningSchemaChange{
+		database: database,
+		quarantinedDrops: map[dropTarget][]pendingdrops.QuarantinedTable{
+			{schema: database, table: "landed_at_replay"}: {first, second},
+		},
+	})
+
+	err = eng.quarantineDroppedTables(t.Context(), host, username, password, database,
+		"DROP TABLE `landed_at_replay`")
+	require.NoError(t, err, "the copy at the replay's destination holds the table, so the drop is not final")
+	assert.Equal(t, []string{second.QuarantineTable}, listQuarantinedTables(t, db))
 }
