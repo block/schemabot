@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"testing"
+	"time"
 
 	ps "github.com/planetscale/planetscale-go/planetscale"
 
@@ -229,6 +230,68 @@ func TestDiffKeyspace_VSchemaFetchErrors(t *testing.T) {
 		assert.Empty(t, diff.tableChanges)
 		assert.False(t, diff.vschemaChanged)
 		assert.Equal(t, desiredVSchema, diff.currentVSchemaRaw)
+	})
+}
+
+// laggingVSchemaClient answers the first notFoundReads VSchema reads with
+// not-found and every later one with vschema, the way the API answers while it
+// converges after a recent VSchema write. reads counts every read.
+type laggingVSchemaClient struct {
+	psclient.PSClient
+	notFoundReads int
+	vschema       *ps.VSchema
+	reads         int
+}
+
+func (c *laggingVSchemaClient) GetKeyspaceVSchema(context.Context, *ps.GetKeyspaceVSchemaRequest) (*ps.VSchema, error) {
+	c.reads++
+	if c.reads <= c.notFoundReads {
+		return nil, &ps.Error{Code: ps.ErrNotFound}
+	}
+	return c.vschema, nil
+}
+
+// A keyspace's VSchema has a lookup vindex, and the API briefly reports it
+// missing after a recent write. Taken at its word, the desired document would
+// be the keyspace's first and the vindex removal it makes would go unflagged.
+// For a keyspace that already holds tables the read is repeated a bounded
+// number of times, so the plan compares against the VSchema that exists. Once
+// the re-reads run out the absence is accepted, and a keyspace with no tables
+// yet is accepted as absent on the first read.
+func TestDiffKeyspace_VSchemaReportedMissingIsReadAgain(t *testing.T) {
+	origInterval := vschemaAbsenceRereadInterval
+	vschemaAbsenceRereadInterval = time.Millisecond
+	t.Cleanup(func() { vschemaAbsenceRereadInterval = origInterval })
+
+	e := &Engine{linter: lint.New(), logger: slog.New(slog.DiscardHandler)}
+	live := `{"sharded": true, "vindexes": {"hash": {"type": "hash"}, "users_email": {"type": "consistent_lookup_unique"}}, "tables": {"users": {"column_vindexes": [{"column": "id", "name": "hash"}]}}}`
+	desired := &schema.Namespace{Files: map[string]string{
+		"vschema.json": `{"sharded": true, "vindexes": {"hash": {"type": "hash"}}, "tables": {"users": {"column_vindexes": [{"column": "id", "name": "hash"}]}}}`,
+	}}
+	withTables := map[string][]table.TableSchema{"commerce": {{Name: "users", Schema: "CREATE TABLE `users` (`id` bigint NOT NULL, PRIMARY KEY (`id`))"}}}
+
+	t.Run("a lagging read of a keyspace with tables finds the VSchema", func(t *testing.T) {
+		client := &laggingVSchemaClient{notFoundReads: 2, vschema: &ps.VSchema{Raw: live}}
+		diff, err := e.diffKeyspace(t.Context(), client, "org", "mydb", "main", "commerce", desired, withTables)
+		require.NoError(t, err)
+		assert.Equal(t, 3, client.reads)
+		assert.Equal(t, live, diff.currentVSchemaRaw, "the plan compares against the VSchema that exists")
+	})
+
+	t.Run("a keyspace with tables whose VSchema stays missing is accepted as absent after the re-reads", func(t *testing.T) {
+		client := &laggingVSchemaClient{notFoundReads: 100}
+		diff, err := e.diffKeyspace(t.Context(), client, "org", "mydb", "main", "commerce", desired, withTables)
+		require.NoError(t, err)
+		assert.Equal(t, 1+vschemaAbsenceRereads, client.reads)
+		assert.Empty(t, diff.currentVSchemaRaw)
+	})
+
+	t.Run("a keyspace with no tables is accepted as absent on the first read", func(t *testing.T) {
+		client := &laggingVSchemaClient{notFoundReads: 100}
+		diff, err := e.diffKeyspace(t.Context(), client, "org", "mydb", "main", "commerce", desired, map[string][]table.TableSchema{"commerce": nil})
+		require.NoError(t, err)
+		assert.Equal(t, 1, client.reads, "a new keyspace pays no wait")
+		assert.Empty(t, diff.currentVSchemaRaw)
 	})
 }
 

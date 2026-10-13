@@ -321,24 +321,9 @@ func (e *Engine) diffKeyspace(ctx context.Context, client psclient.PSClient, org
 	vschemaChanged := false
 	currentVSchemaRaw := ""
 	if content, ok := ns.Files["vschema.json"]; ok && content != "" {
-		currentVSchema, fetchErr := client.GetKeyspaceVSchema(ctx, &ps.GetKeyspaceVSchemaRequest{
-			Organization: org,
-			Database:     database,
-			Branch:       branch,
-			Keyspace:     ks,
-		})
-		if fetchErr != nil {
-			var psErr *ps.Error
-			if !errors.As(fetchErr, &psErr) || psErr.Code != ps.ErrNotFound {
-				return keyspaceDiff{}, fmt.Errorf("fetch VSchema for keyspace %s: %w", ks, fetchErr)
-			}
-			// Keyspace has no VSchema on this branch yet — either it has
-			// never had one, or the API has not converged after a recent
-			// write. Treat as empty so the desired VSchema appears as a
-			// change; validation callers absorb convergence lag through
-			// the VSchema staleness retry.
-			e.logger.Warn("VSchema not found for keyspace, treating as empty",
-				"keyspace", ks, "branch", branch)
+		currentVSchema, err := e.fetchKeyspaceVSchema(ctx, client, org, database, branch, ks, len(currentSchema[ks]) > 0)
+		if err != nil {
+			return keyspaceDiff{}, err
 		}
 		if currentVSchema != nil {
 			currentVSchemaRaw = currentVSchema.Raw
@@ -409,6 +394,59 @@ func (e *Engine) verifyBranchMatchesMain(ctx context.Context, client psclient.PS
 
 	e.logger.Info("branch schema matches main", "branch", branchName, "keyspaces", len(keyspaces))
 	return nil
+}
+
+// vschemaAbsenceRereads and vschemaAbsenceRereadInterval bound how long a
+// VSchema reported missing for a keyspace that already holds tables is read
+// again before the absence is believed.
+var (
+	vschemaAbsenceRereads        = 3
+	vschemaAbsenceRereadInterval = 2 * time.Second
+)
+
+// fetchKeyspaceVSchema reads the keyspace's VSchema on branch, returning nil
+// when the keyspace has none.
+//
+// A not-found answer means either that the keyspace has never had a VSchema or
+// that the API has not converged after a recent write, and the two call for
+// opposite plans: absence makes the desired document the keyspace's first, which
+// switches off the checks that compare it against what it replaces (removals and
+// vindex or routing mutations). So when the keyspace already holds tables, where
+// a VSchema can exist to be lagging, the read is repeated a bounded number of
+// times before the absence is accepted. A keyspace with no tables yet is new,
+// has no VSchema to lose, and is accepted as absent at once, so planning a new
+// keyspace pays no wait.
+func (e *Engine) fetchKeyspaceVSchema(ctx context.Context, client psclient.PSClient, org, database, branch, ks string, keyspaceHasTables bool) (*ps.VSchema, error) {
+	req := &ps.GetKeyspaceVSchemaRequest{Organization: org, Database: database, Branch: branch, Keyspace: ks}
+	rereads := 0
+	if keyspaceHasTables {
+		rereads = vschemaAbsenceRereads
+	}
+	for attempt := 0; ; attempt++ {
+		current, err := client.GetKeyspaceVSchema(ctx, req)
+		if err == nil {
+			if attempt > 0 {
+				e.logger.Info("VSchema found after an earlier read reported it missing",
+					"keyspace", ks, "branch", branch, "reads", attempt+1)
+			}
+			return current, nil
+		}
+		if !isNotFound(err) {
+			return nil, fmt.Errorf("fetch VSchema for keyspace %s: %w", ks, err)
+		}
+		if attempt >= rereads {
+			e.logger.Warn("VSchema not found for keyspace; treating it as the keyspace's first VSchema",
+				"keyspace", ks, "branch", branch, "keyspace_has_tables", keyspaceHasTables, "reads", attempt+1)
+			return nil, nil
+		}
+		e.logger.Info("VSchema reported missing for a keyspace that holds tables; reading it again in case the API has not converged",
+			"keyspace", ks, "branch", branch, "read", attempt+1, "delay", vschemaAbsenceRereadInterval)
+		select {
+		case <-ctx.Done():
+			return nil, fmt.Errorf("re-read VSchema for keyspace %s: %w", ks, ctx.Err())
+		case <-time.After(vschemaAbsenceRereadInterval):
+		}
+	}
 }
 
 func (e *Engine) fetchDatabaseSchema(ctx context.Context, client psclient.PSClient, org, database, branch string, keyspaces []string) (map[string][]table.TableSchema, error) {
