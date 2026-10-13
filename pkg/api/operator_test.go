@@ -1634,6 +1634,59 @@ func TestRecoverMultiApplyOperation_MissingTaskRowLeavesOperationUnprojected(t *
 		"the parent apply must stay running; a vanished task row settles nothing")
 }
 
+// A multi-operation drive's first table failed permanently and storage refused
+// the write cancelling the table queued behind it, so the drive exited with a
+// task set that is only partly settled: one task failed, one still pending.
+// Deriving the operation from that set would terminalize it failed over the
+// pending task, and a terminal operation gets no next claim to cancel it. The
+// recover flow must leave the operation row as found — running and claimable —
+// and must not touch the parent projection, so the next claim reads every task
+// as stored and settles the operation.
+func TestRecoverMultiApplyOperation_RefusedTaskVerdictLeavesOperationUnprojected(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+
+	applyStore := &casApplyStore{
+		template: storage.Apply{
+			ID:              7,
+			ApplyIdentifier: "apply-multi-op-refused-verdict",
+			Database:        "testdb",
+			DatabaseType:    storage.DatabaseTypeMySQL,
+			Environment:     "staging",
+		},
+		state: state.Apply.Running,
+	}
+	opStore := &recoverOperationStore{op: &storage.ApplyOperation{
+		ID:         42,
+		ApplyID:    7,
+		Deployment: "west",
+		State:      state.ApplyOperation.Running,
+	}}
+	partlySettledTasks := &stubTaskStore{tasks: []*storage.Task{
+		{ID: 1, ApplyID: 7, TaskIdentifier: "task-1", State: state.Task.Failed, ErrorMessage: "engine refused the statement"},
+		{ID: 2, ApplyID: 7, TaskIdentifier: "task-2", State: state.Task.Pending},
+	}}
+	deploymentClient := &mockTernClient{resumeErr: fmt.Errorf("%w: record cancelled task verdicts for apply apply-multi-op-refused-verdict (database testdb): storage unavailable", tern.ErrTaskVerdictRefused)}
+
+	svc := New(
+		&recoverTestStorage{applies: applyStore, ops: opStore, control: &fakeControlRequestStore{}, tasks: partlySettledTasks},
+		testServerConfig(),
+		map[string]tern.Client{"west/staging": deploymentClient},
+		logger,
+	)
+
+	svc.recoverMultiApplyOperation(t.Context(), 1, &storage.ApplyOperation{
+		ID:         42,
+		ApplyID:    7,
+		Deployment: "west",
+		State:      state.ApplyOperation.Running,
+	}, storage.OperationLease{})
+
+	assert.Equal(t, state.ApplyOperation.Running, opStore.op.State,
+		"the operation row must stay running and claimable; its stored failure must not be projected over the task whose cancellation never landed")
+	assert.Equal(t, state.Apply.Running, applyStore.currentState(),
+		"the parent apply must stay running; a partly settled task set settles nothing")
+}
+
 // cutoverOpStore backs the cutover claim path: FindNextApplyOperationCutover
 // hands back the barrier-parked operation whose turn it is, ListByApply reports a
 // genuine multi-operation set (so the operation-lease-only drive is valid), and

@@ -1020,6 +1020,90 @@ func TestExecuteApplyTrace(t *testing.T) {
 	assert.Equal(t, "staging", attrs["environment"])
 }
 
+// A drive that could not record a task's terminal outcome wrote nothing on top
+// of it, and the next claim settles the apply from the stored task rows. The
+// operator counts that exit under its own resume failure reason, so a verdict
+// write storage keeps refusing shows as a rate of task_verdict_refused rather
+// than blending into resume_error. The same refusal caused by a lost lease is
+// the lost lease, and one during shutdown is not counted.
+func TestResumeClaimedApplyCountsARefusedTaskVerdict(t *testing.T) {
+	refused := fmt.Errorf("%w: record cancelled task verdicts for apply apply-42 (database appdb): storage unavailable", tern.ErrTaskVerdictRefused)
+	cases := []struct {
+		name        string
+		resumeErr   error
+		cancelCtx   bool
+		wantReasons []string
+	}{
+		{
+			name:        "a refused task verdict",
+			resumeErr:   refused,
+			wantReasons: []string{"task_verdict_refused"},
+		},
+		{
+			name:        "a refusal caused by a lost lease is counted as the lost lease",
+			resumeErr:   fmt.Errorf("%w: record failed task verdicts for apply apply-42 (database appdb): %w", tern.ErrTaskVerdictRefused, storage.ErrApplyLeaseLost),
+			wantReasons: []string{"lease_lost"},
+		},
+		{
+			name:      "a refusal during shutdown is not counted",
+			resumeErr: refused,
+			cancelCtx: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			reader := sdkmetric.NewManualReader()
+			mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+			prevMP := otel.GetMeterProvider()
+			otel.SetMeterProvider(mp)
+			cleanupCtx := context.WithoutCancel(t.Context())
+			t.Cleanup(func() {
+				otel.SetMeterProvider(prevMP)
+				require.NoError(t, mp.Shutdown(cleanupCtx))
+			})
+			logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+			svc := New(&mockStorageWithApplyStores{
+				plans:   &staticPlanStore{},
+				applies: &staticApplyStore{},
+			}, &ServerConfig{}, map[string]tern.Client{
+				"east/staging": &mockTernClient{resumeErr: tc.resumeErr},
+			}, logger)
+			apply := &storage.Apply{
+				ID: 42, ApplyIdentifier: "apply-42", Database: "appdb",
+				Deployment: "east", Environment: "staging", State: state.Apply.Running,
+			}
+			ctx := t.Context()
+			if tc.cancelCtx {
+				cancelled, cancel := context.WithCancel(ctx)
+				cancel()
+				ctx = cancelled
+			}
+
+			resumed, err := svc.resumeClaimedApply(ctx, 1, apply, 0, "")
+
+			require.ErrorIs(t, err, tern.ErrTaskVerdictRefused)
+			assert.False(t, resumed)
+			var rm metricdata.ResourceMetrics
+			require.NoError(t, reader.Collect(t.Context(), &rm))
+			var reasons []string
+			for _, sm := range rm.ScopeMetrics {
+				for _, m := range sm.Metrics {
+					if m.Name != "schemabot.operator.resume_failures_total" {
+						continue
+					}
+					sum, ok := m.Data.(metricdata.Sum[int64])
+					require.True(t, ok)
+					for _, dp := range sum.DataPoints {
+						reason, _ := dp.Attributes.Value(attribute.Key("reason"))
+						reasons = append(reasons, reason.AsString())
+					}
+				}
+			}
+			assert.Equal(t, tc.wantReasons, reasons)
+		})
+	}
+}
+
 // A drive that stored the apply's terminal outcome and then could not answer a
 // request owed after it is counted under its own resume failure reason, so a
 // settlement storage keeps refusing shows as a rate of post_terminal_reconcile
