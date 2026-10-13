@@ -1196,6 +1196,12 @@ func TestParseCommand_MalformedCommand(t *testing.T) {
 		{name: "environment flag without a value", body: "schemabot plan -e", expected: rejected},
 		{name: "environment flag followed by another flag", body: "schemabot plan -e -d billing", expected: rejected},
 		{name: "environment given twice", body: "schemabot apply -e staging -e production", expected: rejected},
+		{name: "unsafe flag split from its dashes", body: "schemabot apply -e staging -- allow-unsafe", expected: rejected},
+		{name: "unsafe flag without its dashes", body: "schemabot apply -e staging allow-unsafe", expected: rejected},
+		{name: "skip-revert flag split from its dashes", body: "schemabot apply -e staging -- skip-revert", expected: rejected},
+		{name: "defer-cutover flag split from its dashes", body: "schemabot apply -e staging -- defer-cutover", expected: rejected},
+		{name: "auto-confirm flag without its dashes", body: "schemabot apply -e staging yes", expected: rejected},
+		{name: "target flag without its dashes takes its value", body: "schemabot apply -e staging target us-west", expected: rejected},
 		{
 			name:     "tenant given twice has no single routing target",
 			body:     "schemabot plan -e staging -t tenant-a --tenant tenant-b",
@@ -1220,6 +1226,21 @@ func TestParseCommand_MalformedCommand(t *testing.T) {
 			name:     "a plain word makes the line a sentence, not a rejected command",
 			body:     "SchemaBot apply --allow-unsafe. went fine",
 			expected: CommandResult{ProseMention: true},
+		},
+		{
+			name:     "a flag name in a sentence does not reject it",
+			body:     "SchemaBot apply -e staging force pushed past the lint",
+			expected: CommandResult{ProseMention: true},
+		},
+		{
+			name:     "a sentence reporting an apply stays a sentence",
+			body:     "SchemaBot apply -e staging succeeded",
+			expected: CommandResult{ProseMention: true},
+		},
+		{
+			name:     "unsafe flag typed exactly",
+			body:     "schemabot apply -e staging --allow-unsafe",
+			expected: CommandResult{Action: "apply", Environment: "staging", AllowUnsafe: true, Found: true, IsMention: true},
 		},
 		{
 			name:     "environment with a full stop gets the environment usage answer",

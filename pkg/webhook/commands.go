@@ -270,6 +270,29 @@ var valueFlags = map[string]string{
 	"--target": "--target",
 }
 
+// dashlessFlags maps every accepted flag spelling with its leading dashes
+// removed, such as `allow-unsafe` from `--allow-unsafe`, to whether the flag
+// takes a value. A command attempt spells one this way when the dashes are
+// dropped or split off (`-- allow-unsafe`): the word is a mistyped flag, not
+// a plain word that makes the line a sentence.
+var dashlessFlags = func() map[string]bool {
+	m := map[string]bool{}
+	for spelling := range booleanFlags {
+		m[strings.TrimLeft(spelling, "-")] = false
+	}
+	for spelling := range valueFlags {
+		m[strings.TrimLeft(spelling, "-")] = true
+	}
+	return m
+}()
+
+// isDashlessFlag reports whether word, lowercased, spells an accepted flag
+// without its leading dashes.
+func isDashlessFlag(word string) bool {
+	_, ok := dashlessFlags[word]
+	return ok
+}
+
 // firstDirective returns the first line that opens with `schemabot` and is
 // not a sentence. prose reports whether a sentence was skipped on the way, so
 // a caller can say why a comment naming SchemaBot was not answered.
@@ -300,11 +323,13 @@ func (p *CommandParser) firstDirective(body string) (d directive, ok, prose bool
 // with sentence punctuation after it that is not a command. Otherwise the line
 // is malformed when a token is close to one SchemaBot accepts but is not
 // exactly it (a punctuated command word, an unknown, punctuated, or
-// autocorrected flag, a punctuated apply ID, optional-argument brackets copied
-// from usage text, an invalid database or target, a missing environment,
-// database, or target), or when it is ambiguous (a value flag given twice, two
-// apply IDs). A present -e or -t value is checked later, where an invalid one gets its own
-// usage answer.
+// autocorrected flag, a flag spelled without its dashes, a punctuated apply
+// ID, optional-argument brackets copied from usage text, an invalid database
+// or target, a missing environment, database, or target), or when it is
+// ambiguous (a value flag given twice, two apply IDs). A value flag spelled
+// without its dashes still takes the word after it, so the value is not read
+// as a plain word that turns the line into a sentence. A present -e or -t
+// value is checked later, where an invalid one gets its own usage answer.
 func (p *CommandParser) parseDirective(words []string) directive {
 	d := directive{kind: lineCommand, flags: map[string]bool{}, values: map[string]string{}, repeated: map[string]bool{}}
 	if len(words) == 0 {
@@ -356,6 +381,11 @@ func (p *CommandParser) parseDirective(words []string) directive {
 		case isUsagePlaceholder(word):
 		case isUsageNotation(word):
 			malformed = true
+		case isDashlessFlag(lower):
+			malformed = true
+			if dashlessFlags[lower] && i+1 < len(words) && !looksLikeFlag(words[i+1]) {
+				i++
+			}
 		default:
 			d.kind = lineProse
 			return d
