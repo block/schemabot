@@ -251,10 +251,12 @@ func TestResumeApplyWithTasks_NoRemainingWorkSettlesMootedRequests(t *testing.T)
 	taskStore.tasks = tasks
 	observer := &terminalRecordingObserver{}
 	c.SetObserver(apply.ID, observer)
+	reader := newTernMetricsReader(t)
 
 	require.NoError(t, c.resumeApplyWithTasks(t.Context(), apply, nil, tasks, nil, false, false))
 
 	assert.Equal(t, state.Apply.Completed, applies.stored.State)
+	assert.Equal(t, int64(-1), activeAppliesDelta(t, reader), "completing the apply releases it from the active-apply gauge")
 	require.Len(t, controlRequests.requests, 1)
 	assert.Equal(t, storage.ControlRequestCompleted, controlRequests.requests[0].Status,
 		"the completed outcome moots the pending revert")
@@ -806,7 +808,7 @@ type stopCancellingEngine struct {
 }
 
 func (e *stopCancellingEngine) Progress(ctx context.Context, req *engine.ProgressRequest) (*engine.ProgressResult, error) {
-	e.client.cancelApplyHandle(e.client.currentApplyCancel())
+	e.client.cancelApplyHandle(e.client.currentApplyCancel(), nil)
 	return e.fakeControlEngine.Progress(ctx, req)
 }
 
@@ -893,8 +895,8 @@ func TestLaunchAtomicResume_StopCancellingTheDriveIsNotAnEngineFailure(t *testin
 	observer := &terminalRecordingObserver{}
 	client.SetObserver(apply.ID, observer)
 
-	driveCtx, cancelDrive := context.WithCancel(t.Context())
-	defer cancelDrive()
+	driveCtx, cancelDrive := context.WithCancelCause(t.Context())
+	defer cancelDrive(nil)
 	generation := client.setApplyCancel(cancelDrive)
 	defer client.clearApplyCancel(generation)
 

@@ -1121,9 +1121,13 @@ above while any write is deciding ownership by inference.
 
 *Enforced:* the claim every drive runs under (OW-1); the apply-target lock held across a destructive
 target write, which excludes SchemaBot's applies and says so (`WithExclusiveTarget`,
-`pkg/storage/internal/sqlstore/applies.go`); and the engine-side guard that retains rather than
-reclaims what a schema change SchemaBot did not start could own
-(`pkg/engine/spirit/cancelled_artifacts.go`).
+`pkg/storage/internal/sqlstore/applies.go`); the engine-side guards that retain rather than
+reclaim what a schema change SchemaBot did not start could own
+(`pkg/engine/spirit/cancelled_artifacts.go`, and for an operator-supplied branch
+`pkg/engine/planetscale/branch_cleanup.go`); and the cancel's reclaim of a
+cancelled apply's stored engine state, which runs only on the driver consuming
+the cancel and under a deadline inside the claim's staleness window
+(`pkg/tern/local_cancelled_resume_state.go`).
 
 ## Control operations (CO)
 
@@ -1766,8 +1770,9 @@ Forwarded identity headers are trusted only from explicitly listed proxies, a ga
 service caller never reaches the write tier by self-asserting user headers, and every write and
 control action is attributed to the verified caller rather than to any client-supplied caller
 string. A client-supplied string never proves ownership either: a scoped operator releases a lock
-only when its recorded verified acquirer shared one of the operator's groups for that database, and
-a lock with no recorded acquirer is released only under a deployment-wide grant. *Enforced:* the
+only when its recorded verified acquirer shared one of the operator's groups for that database, a
+scoped operator never takes a lock without one, and a lock with no recorded acquirer is released
+only under a deployment-wide grant. *Enforced:* the
 trust-anchor config, which refuses to start without one, and identity-precedence rules in the auth
 layer (`pkg/auth`); the scoped lock release and re-acquire in `pkg/api/lock_handlers.go`, the release
 pinned to the lock row it checked and the re-acquire told which row its acquire created (`ReleaseByID`

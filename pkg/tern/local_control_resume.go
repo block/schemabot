@@ -12,7 +12,6 @@ import (
 
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
-	"github.com/block/schemabot/pkg/metrics"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/routing"
 	"github.com/block/schemabot/pkg/state"
@@ -1400,9 +1399,7 @@ func (c *LocalClient) launchAtomicResume(ctx context.Context, apply *storage.App
 				reconcileErr = &postTerminalReconcileError{storedState: terminalState, err: err}
 			}
 		}
-		if !state.IsTerminalApplyState(oldApplyState) {
-			metrics.AdjustActiveApplies(ctx, -1, apply.Database, apply.Deployment, apply.Environment)
-		}
+		releaseActiveApplyForDriveOutcome(ctx, apply, oldApplyState)
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStateTransition, storage.LogSourceSchemaBot,
 			"All tasks already terminal on resume (final schema check shows no remaining changes)", oldApplyState, terminalState)
 		// A previous drive can have settled every task and exited before it
@@ -2678,6 +2675,7 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 			// recovery retries, and notify the observer only after a durable write.
 			return fmt.Errorf("complete task-less apply %s during recovery: %w", apply.ApplyIdentifier, err)
 		}
+		releaseActiveApplyForDriveOutcome(ctx, apply, previousState)
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStateTransition, storage.LogSourceSchemaBot,
 			"Apply owns no task work; completed without engine work", previousState, state.Apply.Completed)
 		c.notifyTerminalObserver(apply, tasks)
@@ -2721,10 +2719,10 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 				if err := c.markApplyRecovering(ctx, apply, tasks); err != nil {
 					return err
 				}
-				resumeCtx, cancelResume := context.WithCancel(ctx)
+				resumeCtx, cancelResume := context.WithCancelCause(ctx)
 				cancelGeneration := c.setApplyCancel(cancelResume)
 				defer c.clearApplyCancel(cancelGeneration)
-				defer cancelResume()
+				defer cancelResume(nil)
 				if err := c.launchAtomicResume(resumeCtx, apply, tasks, plan, options, "Recovering from checkpoint", true, false, releaseAtCutoverBarrier); err != nil {
 					if errors.Is(err, errGroupedResumeStateUnavailable) {
 						logger.Warn("deferred cutover recovery could not load persisted engine resume state; current apply owner will exit for operator retry",
@@ -2770,6 +2768,7 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 	if len(activeTasks) == 0 {
 		logger.Info("all tasks already completed, marking apply as completed")
 		now := time.Now()
+		claimedState := apply.State
 		apply.State = state.Apply.Completed
 		apply.CompletedAt = &now
 		apply.UpdatedAt = now
@@ -2784,6 +2783,7 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 		if err := c.storage.Applies().Update(ctx, apply); err != nil {
 			return fmt.Errorf("mark resumed apply %s completed after re-plan found no remaining work: %w", apply.ApplyIdentifier, err)
 		}
+		releaseActiveApplyForDriveOutcome(ctx, apply, claimedState)
 		// The outcome is stored from here, so a start that cannot be answered
 		// is reconciliation left undone, not a failure of the schema change:
 		// the stored outcome still owes its settlement and summary, and the
@@ -2856,10 +2856,10 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 	}
 
 	if grouped {
-		resumeCtx, cancelResume := context.WithCancel(ctx)
+		resumeCtx, cancelResume := context.WithCancelCause(ctx)
 		cancelGeneration := c.setApplyCancel(cancelResume)
 		defer c.clearApplyCancel(cancelGeneration)
-		defer cancelResume()
+		defer cancelResume(nil)
 		if err := c.launchAtomicResume(resumeCtx, apply, activeTasks, plan, options, fmt.Sprintf("Apply resumed from checkpoint (%s)", groupedApplyModeDescription(apply, options)), true, startRequested, releaseAtCutoverBarrier); err != nil {
 			if errors.Is(err, errGroupedResumeStateUnavailable) {
 				logger.Warn("grouped resume could not load persisted engine resume state; current apply owner will exit for operator retry",
@@ -2904,10 +2904,10 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 				"Apply resumed from checkpoint (sequential)", "", state.Apply.Running)
 		}
 
-		resumeCtx, cancelResume := context.WithCancel(ctx)
+		resumeCtx, cancelResume := context.WithCancelCause(ctx)
 		cancelGeneration := c.setApplyCancel(cancelResume)
 		defer c.clearApplyCancel(cancelGeneration)
-		defer cancelResume()
+		defer cancelResume(nil)
 		if err := c.resumeApplySequential(resumeCtx, apply, activeTasks, plan, options); err != nil {
 			return err
 		}
@@ -2966,10 +2966,10 @@ func (c *LocalClient) handleGroupedResumeFailure(ctx context.Context, apply *sto
 }
 
 func (c *LocalClient) dispatchQueuedApply(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, plan *storage.Plan, options map[string]string, releaseAtCutoverBarrier bool) error {
-	applyCtx, cancelApply := context.WithCancel(ctx)
+	applyCtx, cancelApply := context.WithCancelCause(ctx)
 	cancelGeneration := c.setApplyCancel(cancelApply)
 	defer c.clearApplyCancel(cancelGeneration)
-	defer cancelApply()
+	defer cancelApply(nil)
 
 	c.logger.Info("dispatching queued apply",
 		"apply_id", apply.ApplyIdentifier,

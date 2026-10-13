@@ -1069,7 +1069,7 @@ func (c *LocalClient) usesGroupedApply(apply *storage.Apply, options map[string]
 	return storage.GroupsEngineExecution(apply.DatabaseType, storage.ApplyOptionsFromMap(options).DeferCutover)
 }
 
-func (c *LocalClient) setApplyCancel(cancel context.CancelFunc) uint64 {
+func (c *LocalClient) setApplyCancel(cancel context.CancelCauseFunc) uint64 {
 	c.cancelMu.Lock()
 	c.cancelApplyGeneration++
 	generation := c.cancelApplyGeneration
@@ -1092,9 +1092,12 @@ func (c *LocalClient) currentApplyCancel() applyCancelHandle {
 	return applyCancelHandle{generation: c.cancelApplyGeneration, cancel: c.cancelApply}
 }
 
-func (c *LocalClient) cancelApplyHandle(handle applyCancelHandle) {
+// cancelApplyHandle cancels the drive the handle was taken from, with cause as
+// the drive context's cause: engine.ErrCancelledByOperator when the command
+// ends the schema change for good, nil when another drive may resume it.
+func (c *LocalClient) cancelApplyHandle(handle applyCancelHandle, cause error) {
 	if handle.cancel != nil {
-		handle.cancel()
+		handle.cancel(cause)
 	}
 	c.cancelMu.Lock()
 	if c.cancelApplyGeneration == handle.generation {

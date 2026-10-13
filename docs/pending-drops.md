@@ -77,7 +77,7 @@ SchemaBot plans again against the live schema. A table an earlier attempt moved
 into `_pending_drops` is no longer part of the diff, so its completed DROP is
 not sent to the engine again. If the engine replays a stopped DROP phase in the
 same process, through its own start path, it skips a missing source table only
-when this attempt recorded moving that table and the recorded copy still
+when this attempt recorded moving that table and any recorded copy still
 exists. The record is written before the rename is issued, so a rename the
 server completes after a stop has abandoned it is still recognized on the
 replay. The record does not outlive the process; a resume on another server
