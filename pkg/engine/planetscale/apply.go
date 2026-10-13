@@ -166,28 +166,33 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (result *e
 	// request is open, the refusal surfaces on the cleanup's error path with
 	// the identifiers for manual reclamation.
 	//
-	// A drive whose context ends is handing the apply back, not failing it: the
-	// operator cancels a drive when its lease is lost, when it looks stalled,
-	// or when the instance shuts down, and in each case another driver resumes
-	// the apply from its stored state. When that state names this branch, the
-	// branch is the resume's starting point, and after a lost lease a peer may
-	// already be preparing it, so it is kept. A branch the stored state does
-	// not name can never be resumed, so it is deleted like any other failure's.
+	// A drive whose context ends is usually handing the apply back, not
+	// failing it: the operator cancels a drive when its lease is lost, when it
+	// looks stalled, or when the instance shuts down, and in each case another
+	// driver resumes the apply from its stored state. When that state names
+	// this branch, the branch is the resume's starting point, and after a lost
+	// lease a peer may already be preparing it, so it is kept. A branch the
+	// stored state does not name can never be resumed, so it is deleted like
+	// any other failure's. So is the branch of a drive an operator cancelled
+	// (engine.CancelledByOperator): no driver resumes a cancelled apply, and
+	// no deploy request exists yet to tear the branch down.
 	ownedBranch := ""
 	defer func() {
 		if retErr == nil || ownedBranch == "" {
 			return
 		}
-		if ctx.Err() != nil && recordedBranch == ownedBranch {
+		cancelledByOperator := engine.CancelledByOperator(ctx)
+		if ctx.Err() != nil && recordedBranch == ownedBranch && !cancelledByOperator {
 			e.applyLogger(req).Info("drive ended before the deploy request was created; keeping the branch for the driver that resumes the apply",
 				"organization", org, "planetscale_database", req.Database, "branch", ownedBranch, "apply_error", retErr)
 			return
 		}
 		// A branch the stored state names stays resumable until the delete
 		// lands, so its delete follows the drive's context; one it does not
-		// name is deleted even after the drive's context ends.
+		// name, or one whose apply an operator cancelled, is deleted even
+		// after the drive's context ends.
 		deleteCtx := ctx
-		if recordedBranch != ownedBranch {
+		if recordedBranch != ownedBranch || cancelledByOperator {
 			deleteCtx = context.WithoutCancel(ctx)
 		}
 		e.deleteOwnedBranch(deleteCtx, e.applyLogger(req), client, org, req.Database, ownedBranch, retErr)

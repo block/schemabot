@@ -859,15 +859,15 @@ func TestLoadStoredProgressMetadataReturnsEmptyMapForNull(t *testing.T) {
 
 func TestApplyCancelHandleDoesNotCancelNewerOwner(t *testing.T) {
 	client := &LocalClient{}
-	oldCtx, oldCancel := context.WithCancel(t.Context())
+	oldCtx, oldCancel := context.WithCancelCause(t.Context())
 	oldGeneration := client.setApplyCancel(oldCancel)
 	oldHandle := client.currentApplyCancel()
 
-	newCtx, newCancel := context.WithCancel(t.Context())
-	defer newCancel()
+	newCtx, newCancel := context.WithCancelCause(t.Context())
+	defer newCancel(nil)
 	newGeneration := client.setApplyCancel(newCancel)
 
-	client.cancelApplyHandle(oldHandle)
+	client.cancelApplyHandle(oldHandle, nil)
 	assert.Equal(t, oldGeneration, oldHandle.generation)
 	require.Eventually(t, func() bool {
 		return oldCtx.Err() != nil

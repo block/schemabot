@@ -21,7 +21,7 @@ available, such as `repository`, `github_app`, and `installation_id`.
 | `schemabot.source_policy.blocks_total` | Counter | operation, database, environment, reason | Trusted-source plan/apply requests blocked by source policy |
 | `schemabot.pr_command_actor_authorization.total` | Counter | command, database, environment, repository, status, reason | GitHub PR command actor authorization decisions |
 | `schemabot.schema_request.errors_total` | Counter | repository, command, database, environment, reason | Schema request errors by reason |
-| `schemabot.active_applies` | UpDownCounter | database, environment | In-progress applies |
+| `schemabot.active_applies` | UpDownCounter | database, deployment, environment | Applies holding their database: counted from acceptance until the apply settles. A stopped apply stays counted, so a value that stays non-zero can be applies parked on an operator's start or cancel rather than work in flight; a retryable pause is not counted |
 | `schemabot.check_ownership_misses_total` | Counter | operation, repository, database, database_type, environment | Guarded check updates skipped because ownership changed |
 | `schemabot.promotion.config_error_blocks_total` | Counter | repository, database, environment | Applies blocked because the target environment is absent from the configured promotion order |
 | `schemabot.status_check_operations_total` | Counter | operation, status, repository, database, database_type, environment | Status-check storage and GitHub operations |
@@ -118,7 +118,7 @@ available, such as `repository`, `github_app`, and `installation_id`.
 
 **operation** (locks): `acquire`, `release`
 
-**status** (locks): `success`, `conflict`, `not_found`, `not_owned`, `error`
+**status** (locks): `success`, `conflict`, `not_found`, `not_owned`, `no_acquirer` (a scoped acquire refused because there is no verified acquirer to record; the log line carries the reason), `error`
 
 **event_type** (webhooks): `create`, `issues`, `issue_comment`, `pull_request`, `pull_request_review`, `pull_request_review_comment`, `check_run`, `check_suite`, `ping`, `push`
 

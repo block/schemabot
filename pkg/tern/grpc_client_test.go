@@ -2676,10 +2676,12 @@ func TestGRPCClient_ResumeApplyCancelsUndispatchedApply(t *testing.T) {
 		controlRequests: controlRequests,
 	}
 
+	reader := newTernMetricsReader(t)
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()
 	require.NoError(t, client.ResumeApply(ctx, apply))
 
+	assert.Equal(t, int64(-1), activeAppliesDelta(t, reader), "the cancel releases the apply from the active-apply gauge")
 	assert.Empty(t, server.getCancelApplyID(), "no remote cancel should be sent for an undispatched apply")
 	assert.Empty(t, server.getApplyRequest(), "an apply cancelled before dispatch must never be dispatched")
 	assert.Equal(t, state.Apply.Cancelled, apply.State)
