@@ -147,6 +147,9 @@ type LockStore interface {
 	// pending plan. Any other same-owner state returns ErrLockIntentChanged and
 	// leaves the stored pending plan alone, so a command that planned against
 	// one intent can never overwrite an intent another command pinned since.
+	// A lock released since a non-empty observedPendingPlanID was observed
+	// also returns ErrLockIntentChanged and re-creates nothing: the pin the
+	// caller planned against is gone.
 	AcquireIfPendingPlanID(ctx context.Context, lock *Lock, observedPendingPlanID string) error
 
 	// Release releases a lock. Only succeeds if caller is the owner.
