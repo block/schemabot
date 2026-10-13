@@ -1590,6 +1590,43 @@ func recoveryResumesFromCheckpoint(databaseType string) bool {
 // If the apply is already in a terminal state (e.g., cancelled by Stop()), the
 // apply state is not overwritten.
 
+// cancelTasksQueuedBehindFailure cancels the tasks still pending behind a
+// permanently failed task, before the apply's outcome is derived from them. A
+// retryable failure leaves them queued for operator recovery.
+//
+// Each cancellation must land before the outcome does. A pending task row under
+// a settled apply is work storage still offers to a drive: a resume would start
+// the statement queued behind the failure, and an operation row settled over
+// it gets no next claim to cancel it. So a refused write stops here with the
+// error and the apply untouched (see refusedTaskVerdict): a whole-apply drive
+// leaves the apply active for the next claim to finalize again, and an
+// operation drive's error carries ErrTaskVerdictRefused so the operator leaves
+// the operation row as found and claimable instead of deriving it from the
+// partly settled task set.
+//
+// handedBack reports that the drive was cancelled while cancelling a task and
+// the apply was handed back untouched: the caller stops without an outcome,
+// since the task it could not cancel is still pending.
+func (c *LocalClient) cancelTasksQueuedBehindFailure(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, failedTask *storage.Task) (handedBack bool, err error) {
+	if failedTask == nil || failedTask.State == state.Task.FailedRetryable {
+		return false, nil
+	}
+	for _, task := range tasks {
+		if task.State != state.Task.Pending {
+			continue
+		}
+		if err := c.persistTaskStateTransition(ctx, task, 0, state.Task.Cancelled, ""); err != nil {
+			if verdictErr := c.refusedTaskVerdict(ctx, apply, task, state.Task.Cancelled, failedTask.ErrorMessage, err); verdictErr != nil {
+				return false, verdictErr
+			}
+			// refusedTaskVerdict answers nil only for a cancelled drive, which it
+			// has already logged as a hand-back.
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 // finalizeSequentialApply updates the apply state based on sequential task outcomes.
 // Permanent failures cancel remaining pending tasks; retryable failures leave
 // pending tasks queued for operator recovery.
@@ -1617,12 +1654,8 @@ func (c *LocalClient) finalizeSequentialApply(ctx context.Context, apply *storag
 	// in-memory outcome is still adopted so the drive's own logs report what the
 	// operation settled to rather than the projection's stale running state.
 	if suppressParentApplyWrites(ctx) {
-		if failedTask != nil && failedTask.State != state.Task.FailedRetryable {
-			for _, task := range tasks {
-				if task.State == state.Task.Pending {
-					c.transitionTaskState(ctx, task, 0, state.Task.Cancelled, "")
-				}
-			}
+		if handedBack, err := c.cancelTasksQueuedBehindFailure(ctx, apply, tasks, failedTask); handedBack || err != nil {
+			return err
 		}
 		adoptSequentialOutcome(apply, failedTask, stoppedByUser, now)
 		logger.Info("sequential operation drive settled; operator derives the operation row and projects the parent",
@@ -1645,12 +1678,8 @@ func (c *LocalClient) finalizeSequentialApply(ctx context.Context, apply *storag
 		return nil
 	}
 	previousState := apply.State
-	if failedTask != nil && failedTask.State != state.Task.FailedRetryable {
-		for _, task := range tasks {
-			if task.State == state.Task.Pending {
-				c.transitionTaskState(ctx, task, 0, state.Task.Cancelled, "")
-			}
-		}
+	if handedBack, err := c.cancelTasksQueuedBehindFailure(ctx, apply, tasks, failedTask); handedBack || err != nil {
+		return err
 	}
 	adoptSequentialOutcome(apply, failedTask, stoppedByUser, now)
 	if err := c.storage.Applies().Update(ctx, apply); err != nil {

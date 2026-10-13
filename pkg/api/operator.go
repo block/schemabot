@@ -1313,6 +1313,15 @@ func (s *Service) driveClaimedMultiOperation(ctx context.Context, driverID int, 
 		// logged and counted the cause.
 		return
 	}
+	if !resumed && errors.Is(resumeErr, tern.ErrTaskVerdictRefused) {
+		// The drive stored some of its tasks' verdicts and storage refused
+		// another, so the task set is only partly settled. Deriving the
+		// operation from it would let a stored failure terminalize the row over
+		// the task whose verdict never landed, and a terminal operation gets no
+		// next claim to finish the job. Leave the operation row as found and
+		// claimable; the next claim reads every task as stored and settles it.
+		return
+	}
 
 	// Persist the operation row from its OWN tasks — even when the drive returned
 	// an error. Unlike the single-op path, a multi-op drive has no
@@ -2364,6 +2373,20 @@ func (s *Service) resumeClaimedApplyWithOptions(ctx context.Context, driverID in
 			logger.Error("operator: could not requeue the apply's tasks for the resume; the task rows stay at rest and the next claim retries the requeue",
 				"error", err)
 			metrics.RecordOperatorResumeFailure(ctx, apply.Database, deployment, apply.Environment, "task_requeue_refused")
+			if retryableClaim {
+				metrics.AdjustActiveApplies(ctx, -1, apply.Database, deployment, apply.Environment)
+			}
+			return false, err
+		}
+		if errors.Is(err, tern.ErrTaskVerdictRefused) && ctx.Err() == nil {
+			// The drive could not record a task's terminal outcome, so it wrote
+			// nothing on top of it: the apply stays active and the next claim
+			// reads every task as stored and settles it. This reason makes a
+			// verdict write that storage keeps refusing visible as a rate rather
+			// than one error line per claim.
+			logger.Error("operator: could not record a task verdict for the apply; the apply stays active and the next claim settles it from the stored task rows",
+				"error", err)
+			metrics.RecordOperatorResumeFailure(ctx, apply.Database, deployment, apply.Environment, "task_verdict_refused")
 			if retryableClaim {
 				metrics.AdjustActiveApplies(ctx, -1, apply.Database, deployment, apply.Environment)
 			}
