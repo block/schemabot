@@ -501,3 +501,19 @@ func TestEtreOverridesPreserveCapabilities(t *testing.T) {
 	_, single := resolver.(inventory.TypeReporter)
 	assert.False(t, single)
 }
+
+func TestTargetResolverOverrideNormalizesStaticType(t *testing.T) {
+	for _, engine := range []string{"mysql", "MySQL", " MySQL "} {
+		t.Run(engine, func(t *testing.T) {
+			cfg := TargetResolverConfig{}
+			cfg.Targets = map[string]inventory.StaticTarget{"cluster-002": {DatabaseType: engine, DSN: "root@tcp(localhost:3306)/"}}
+			cfg.Overrides = []inventory.TargetOverride{{Environment: "production", Target: "cluster-002", DatabaseType: "mysql", SchemaOverrides: map[string]string{"orders": "orders_sandbox"}}}
+			resolver, err := cfg.BuildResolver(t.Context(), slog.Default())
+			require.NoError(t, err)
+			target, err := resolver.ResolveTarget(t.Context(), inventory.Request{Target: "cluster-002", Environment: "production", DatabaseType: "mysql"})
+			require.NoError(t, err)
+			assert.Equal(t, "mysql", target.DatabaseType)
+			assert.Equal(t, cfg.Overrides[0].SchemaOverrides, target.SchemaOverrides)
+		})
+	}
+}

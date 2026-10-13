@@ -75,7 +75,7 @@ func NewOverrideResolver(underlying Resolver, entries []TargetOverride, logger *
 	for _, entry := range entries {
 		// Static entries are known without resolving credentials. Refuse two
 		// mapping owners before startup, even when their mappings agree.
-		if static, ok := underlying.(*StaticResolver); ok {
+		if static, ok := underlying.(*StaticResolver); ok && static != nil {
 			if target, exists := static.targets[entry.Target]; exists {
 				if len(target.schemaOverrides) != 0 {
 					return nil, fmt.Errorf("override target %q already has static schema_overrides", entry.Target)
@@ -120,7 +120,7 @@ func NewOverrideResolver(underlying Resolver, entries []TargetOverride, logger *
 func (r *overrideResolver) ResolveTarget(ctx context.Context, req Request) (*Target, error) {
 	target, err := r.underlying.ResolveTarget(ctx, req)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("resolve override target %q in environment %q: %w", req.Target, req.Environment, err)
 	}
 	entry, ok := r.entries[overrideKey{req.Environment, req.Target}]
 	if !ok {

@@ -28,7 +28,7 @@ func TestOverrideMultiTargetPartialRollout(t *testing.T) {
 	live, err := mysql.Run(ctx, "mysql:8.0", mysql.WithDatabase("testdb"), mysql.WithUsername("root"), mysql.WithPassword("test"), testutil.MySQLTmpfsDatadir())
 	require.NoError(t, err)
 	t.Cleanup(func() {
-		cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second) //nolint:usetesting // Cleanup runs after the test context is cancelled.
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), 30*time.Second)
 		defer cancel()
 		require.NoError(t, live.Terminate(cleanupCtx))
 	})
@@ -65,7 +65,7 @@ func TestOverrideMultiTargetPartialRollout(t *testing.T) {
 				require.NoError(t, err)
 			}
 			t.Cleanup(func() {
-				cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second) //nolint:usetesting // Cleanup runs after the test context is cancelled.
+				cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), 30*time.Second)
 				defer cancel()
 				cleanupDB, err := sql.Open("block-mysql", member.dsn)
 				require.NoError(t, err)

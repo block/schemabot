@@ -1747,6 +1747,13 @@ its stored route is not re-resolved as a convenience: the apply is refused and a
 plan, because re-resolving is exactly the step that could produce a different answer than the one
 the operator reviewed.
 
+The stored route binds the logical target and deployment, not a MySQL schema
+override within that target. Adding, changing, or removing an override requires
+holding affected operations, draining or retiring resumable applies, deploying
+consistent configuration to every replica, and discarding old plans before
+re-planning. This procedure is an operational prerequisite; durable schema-mapping
+binding across driver restarts is not enforced. See [schema override rollout](configuration.md#per-target-schema-overrides).
+
 The schema source is held to the same standard, and checked twice. A repository and a path inside
 it count as a source for a database only because server config says so, verified when the plan is
 made and verified again before the apply runs. Config that cannot answer the question is a

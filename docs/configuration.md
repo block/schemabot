@@ -177,14 +177,18 @@ namespace. Configuration validation cannot prove that a target exists. In a
 multi-target rollout, plan every target against its own live schema; sharing
 desired SQL does not imply identical plans after partial completion.
 
-**Changing mappings requires draining work.** Complete or explicitly retire all
+**Adding, changing, or removing mappings requires draining work.** This includes
+the first override: an older plan may refer to the canonical schema directly.
+Hold new operations for the affected target. Complete or explicitly retire all
 active, deferred-cutover, stopped, or otherwise resumable applies first. Hold
 affected target operations until every serving replica has the same config,
 and re-plan after every mapping change. A new mapping changes the client cache
-identity, but does not durably bind an old MySQL plan across worker restarts.
+identity, but does not durably bind an old MySQL plan across driver restarts.
 Never execute a pre-change plan with a new mapping. To roll back, withdraw the
 affected route and drain its work before removing the mapping: removal restores
 identity mapping and can address a different schema. There is no hot reload.
+Durable mapping identity on plans is not enforced; this release depends on the
+drain-and-replan procedure, including discarding unused pre-change plans.
 
 ### PostgreSQL `dsn_from` targets
 

@@ -102,7 +102,8 @@ func TestOverrideExactMatchAndErrors(t *testing.T) {
 		resolver, err = NewOverrideResolver(overrideBackend(func(context.Context, Request) (*Target, error) { return nil, failure }), []TargetOverride{sampleOverride()}, nil)
 		require.NoError(t, err)
 		_, err = resolver.ResolveTarget(t.Context(), Request{Target: "cluster-002", Environment: "production"})
-		assert.Same(t, failure, err)
+		assert.ErrorIs(t, err, failure)
+		assert.ErrorContains(t, err, `resolve override target "cluster-002" in environment "production"`)
 	}
 }
 
@@ -195,4 +196,12 @@ func TestOverrideLogsExcludeConnectionSecrets(t *testing.T) {
 	assert.Contains(t, output.String(), "orders_sandbox")
 	assert.NotContains(t, output.String(), "dsn-secret")
 	assert.NotContains(t, output.String(), "metadata-secret")
+}
+
+func TestOverrideTypedNilStaticBackend(t *testing.T) {
+	var backend *StaticResolver
+	resolver, err := NewOverrideResolver(backend, []TargetOverride{sampleOverride()}, nil)
+	require.NoError(t, err)
+	_, err = resolver.ResolveTarget(t.Context(), Request{Target: "cluster-002", Environment: "production"})
+	require.Error(t, err)
 }

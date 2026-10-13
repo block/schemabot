@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"slices"
 	"sort"
+	"strings"
 	"time"
 
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
@@ -45,7 +46,7 @@ func (c TargetResolverConfig) validateOverrides() error {
 			if len(target.SchemaOverrides) != 0 {
 				return fmt.Errorf("target_resolver override target %q already has static schema_overrides", entry.Target)
 			}
-			if target.DatabaseType != entry.DatabaseType {
+			if strings.ToLower(strings.TrimSpace(target.DatabaseType)) != entry.DatabaseType {
 				return fmt.Errorf("target_resolver override target %q type does not match static target", entry.Target)
 			}
 		}
