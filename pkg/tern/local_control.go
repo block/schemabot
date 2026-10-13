@@ -2036,6 +2036,7 @@ func (c *LocalClient) handleStopAllTasksTerminal(ctx context.Context, applyID in
 		if err := c.storage.Applies().Update(ctx, apply); err != nil {
 			return nil, fmt.Errorf("update apply %s to derived state %s: %w", apply.ApplyIdentifier, derivedState, err)
 		}
+		adjustActiveAppliesForTransition(ctx, apply, oldState)
 
 		c.logger.Info("stop found all tasks terminal; apply state derived from tasks",
 			"apply_id", apply.ApplyIdentifier,
@@ -2114,6 +2115,7 @@ func (c *LocalClient) settleCancelAllTasksTerminal(ctx context.Context, applyID 
 		}
 		return c.acceptCancelOverSettledApply(ctx, apply, skippedCount, caller, err)
 	}
+	adjustActiveAppliesForTransition(ctx, apply, oldState)
 
 	c.logger.Info("cancel found all tasks terminal; apply state derived from tasks",
 		append(apply.LogAttrs(), "old_state", oldState, "skipped_count", skippedCount, "requested_by", caller)...)
@@ -2162,12 +2164,14 @@ func (c *LocalClient) markApplyStopped(ctx context.Context, applyID int64) error
 		return nil
 	}
 
+	previousState := apply.State
 	apply.State = state.Apply.Stopped
 	apply.CompletedAt = nil
 	apply.UpdatedAt = time.Now()
 	if err := c.storage.Applies().Update(ctx, apply); err != nil {
 		return fmt.Errorf("mark apply %s stopped: %w", apply.ApplyIdentifier, err)
 	}
+	adjustActiveAppliesForTransition(ctx, apply, previousState)
 	return nil
 }
 
@@ -2193,12 +2197,14 @@ func (c *LocalClient) markApplyCancelled(ctx context.Context, applyID int64) err
 		return fmt.Errorf("mark apply %s cancelled: %s", apply.ApplyIdentifier, revertPhaseControlRejectionMessage(apply.ApplyIdentifier, apply.State))
 	}
 	now := time.Now()
+	previousState := apply.State
 	apply.State = state.Apply.Cancelled
 	apply.CompletedAt = &now
 	apply.UpdatedAt = now
 	if err := c.storage.Applies().Update(ctx, apply); err != nil {
 		return fmt.Errorf("mark apply %s cancelled: %w", apply.ApplyIdentifier, err)
 	}
+	adjustActiveAppliesForTransition(ctx, apply, previousState)
 	return nil
 }
 
@@ -2285,6 +2291,7 @@ func (c *LocalClient) settleControlForCompletedEngineChange(ctx context.Context,
 	if err := c.storage.Applies().Update(ctx, apply); err != nil {
 		return 0, fmt.Errorf("mark apply %s completed after %s found the schema change already completed on the engine: %w", apply.ApplyIdentifier, operation, err)
 	}
+	adjustActiveAppliesForTransition(ctx, apply, previousState)
 	c.logger.Warn("engine rejected "+operation+" because the schema change already completed; apply settled as completed",
 		append(apply.LogAttrs(), "requested_by", caller, "previous_state", previousState, "error", rejection)...)
 	eventMsg := fmt.Sprintf("%s arrived after the schema change completed on the engine; apply recorded as completed (%d tasks completed, %d already terminal)",

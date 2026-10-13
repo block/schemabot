@@ -635,6 +635,7 @@ func TestLocalClient_StopAllTasksTerminalDerivesApplyState(t *testing.T) {
 				tasks = append(tasks, task)
 			}
 			client := newMySQLControlTestClient(apply, tasks, &controlCaptureEngine{})
+			reader := newTernMetricsReader(t)
 
 			resp, err := client.stopOwnedApply(t.Context(), &ternv1.StopRequest{ApplyId: apply.ApplyIdentifier}, "")
 
@@ -646,6 +647,7 @@ func TestLocalClient_StopAllTasksTerminalDerivesApplyState(t *testing.T) {
 			assert.Equal(t, tc.wantApplyState, apply.State)
 			assert.Equal(t, tc.wantErrorMessage, apply.ErrorMessage)
 			require.NotNil(t, apply.CompletedAt)
+			assert.Equal(t, int64(-1), activeAppliesDelta(t, reader), "settling the apply releases it from the active-apply gauge")
 		})
 	}
 }
@@ -2133,6 +2135,7 @@ func TestLocalClient_ACancelTheEngineOutranIsSettledBeforeTheTerminalSummary(t *
 	task.State = state.Task.Running
 	observer := &cancelRequestAtTerminalObserver{ctx: t.Context(), requests: controlRequests, applyID: apply.ID}
 	client.SetObserver(apply.ID, observer)
+	reader := newTernMetricsReader(t)
 
 	rejection := engine.NewAlreadyCompletedError("schema change already completed on the engine")
 	_, err := client.settleControlForCompletedEngineChange(t.Context(), "cancel", nil, apply.ID, apply, "operator", rejection)
@@ -2145,6 +2148,7 @@ func TestLocalClient_ACancelTheEngineOutranIsSettledBeforeTheTerminalSummary(t *
 		"a cancel the schema change outran did not take effect, so the summary must not render it as applied")
 	assert.Contains(t, observer.seen.ErrorMessage, "the schema change completed before the cancel could take effect",
 		"the notice the summary renders comes from this message")
+	assert.Equal(t, int64(-1), activeAppliesDelta(t, reader), "settling the apply releases it from the active-apply gauge")
 }
 
 // A durable cancel can land on a schema change that has already cut over and is
