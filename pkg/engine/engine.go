@@ -387,12 +387,14 @@ func ReleaseCancelledArtifacts(ctx context.Context, eng Engine, req *ReleaseArti
 // exists, and until then the branch is kept only so a resume can finish
 // preparing it.
 //
-// A cancel that reaches a running drive ends that drive, and the drive
-// reclaims the work on its way out. A cancel that lands between drives has no
-// drive to end: the previous drive exited with the work recorded in stored
-// state, and the drive that consumes the cancel stands down before it ever
-// resumes from that state. The stored state is then the only record of the
-// work, and this capability is how the cancel reclaims it.
+// A driver consumes a cancel at its checkpoints, which run between engine
+// calls, so the drive that consumes it stands down without any engine call
+// holding the work: the drive that recorded the work has exited, or the drive
+// consuming the cancel has not yet resumed from it. The stored state is then
+// the only record of the work, and this capability is how the cancel reclaims
+// it. An engine also reclaims such work itself when a drive's context ends
+// with ErrCancelledByOperator while the engine holds it; the two finding each
+// other's reclaim already landed is harmless.
 //
 // The reclaim is stateless by design, like ReleaseCancelledArtifacts: it may
 // run on an instance that never drove the apply, so it takes the stored state
@@ -406,8 +408,7 @@ type CancelledResumeStateReclaimer interface {
 	// reports what it removed and what it left in place. Callers must hold
 	// the claim on the cancelled apply, so no drive is resuming from the same
 	// state while the reclaim runs. Work already gone from the service is not
-	// an error: a drive may have reclaimed it before the cancel reached the
-	// stored state.
+	// an error, whatever removed it.
 	//
 	// A reclaim that fails returns the work it had to leave behind in the
 	// result alongside the error, so the caller can tell an operator what to

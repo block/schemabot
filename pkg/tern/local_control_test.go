@@ -895,11 +895,12 @@ func TestLocalClient_CancelWaitingForDeployCancelsDeployRequest(t *testing.T) {
 	assert.Equal(t, state.Apply.Cancelled, apply.State)
 }
 
-// An operator cancels a PlanetScale apply whose drive is still preparing its
-// branch, before any deploy request exists. Nothing on the engine is live to
-// cancel, so the drive is cancelled directly, and it is cancelled with the
-// operator's cause: the engine tells that apart from a lost lease or a
-// shutdown, and deletes the branch no driver will resume.
+// An operator cancels a PlanetScale apply before any deploy request exists,
+// while a drive handle is installed. Nothing on the engine is live to cancel,
+// so the drive is cancelled directly, and it is cancelled with the operator's
+// cause rather than a bare cancellation: the engine tells that apart from a
+// lost lease or a shutdown, and deletes rather than keeps a branch it holds
+// when the drive ends, since no driver resumes a cancelled apply.
 func TestLocalClient_CancelEndsTheDriveWithTheOperatorCause(t *testing.T) {
 	apply := &storage.Apply{
 		ID:              42,
@@ -987,6 +988,74 @@ func TestLocalClient_PendingCancelReclaimsTheBranchFromStoredResumeState(t *test
 		messages = append(messages, log.Message)
 	}
 	assert.Contains(t, messages, "Removed what the cancelled schema change had set up: branch schemabot-testdb-1a2b")
+}
+
+// failingReclaimEngine mimics an engine whose reclaim of a cancelled apply's
+// stored state fails, reporting the work it had to leave in place, and records
+// how often it was asked and under what deadline.
+type failingReclaimEngine struct {
+	controlCaptureEngine
+	calls       int
+	deadline    time.Time
+	hasDeadline bool
+}
+
+func (e *failingReclaimEngine) ReclaimCancelledResumeState(ctx context.Context, _ *engine.ReclaimResumeStateRequest) (*engine.ReclaimResumeStateResult, error) {
+	e.calls++
+	e.deadline, e.hasDeadline = ctx.Deadline()
+	return &engine.ReclaimResumeStateResult{
+			Kept:       []string{"branch schemabot-testdb-1a2b"},
+			KeptReason: "the delete failed; delete it by hand to reclaim branch quota",
+		},
+		errors.New("delete branch schemabot-testdb-1a2b of the cancelled apply on testdb: planetscale unavailable")
+}
+
+// A PlanetScale apply with two tasks in one apply operation is cancelled before
+// its deploy request exists, and the engine cannot delete the branch the stored
+// state names. The cancel still resolves and the apply ends cancelled, the
+// apply log names the branch left in place and what to do about it, the engine
+// is asked once for the operation however many tasks it has, and the ask runs
+// under a deadline inside the claim's staleness window even though the drive's
+// own context carries none.
+func TestLocalClient_FailedReclaimDoesNotHoldBackTheCancel(t *testing.T) {
+	operationID := int64(99)
+	apply := &storage.Apply{
+		ID:              42,
+		ApplyIdentifier: "apply-vitess-failed-reclaim",
+		State:           state.Apply.PreparingBranch,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeVitess,
+	}
+	tasks := []*storage.Task{
+		{ID: 7, ApplyID: apply.ID, ApplyOperationID: &operationID, TaskIdentifier: "task-vitess-failed-reclaim-a", State: state.Task.Pending},
+		{ID: 8, ApplyID: apply.ID, ApplyOperationID: &operationID, TaskIdentifier: "task-vitess-failed-reclaim-b", State: state.Task.Pending},
+	}
+	resumeState := engineResumeStateFromPlanetScaleData(t, operationID, planetscale.ResumeData{BranchName: "schemabot-testdb-1a2b"})
+	controlRequests := pendingControlRequestStore(apply.ID, storage.ControlOperationCancel)
+	eng := &failingReclaimEngine{}
+	client := newVitessControlTestClientWithRequests(apply, tasks, resumeState, eng, controlRequests)
+	logs := &mockApplyLogStore{}
+	client.storage.(*controlTestStorage).applyLogs = logs
+
+	before := time.Now()
+	standDown, err := client.processPendingCancelControlRequest(t.Context(), apply)
+	after := time.Now()
+
+	require.NoError(t, err, "a failed reclaim never fails the cancel")
+	assert.True(t, standDown)
+	assert.Equal(t, 1, eng.calls, "one reclaim per apply operation")
+	require.True(t, eng.hasDeadline, "the reclaim runs under its own deadline")
+	assert.False(t, eng.deadline.Before(before.Add(cancelReclaimTimeout)), "deadline %v is earlier than the reclaim budget", eng.deadline)
+	assert.False(t, eng.deadline.After(after.Add(cancelReclaimTimeout)), "deadline %v is later than the reclaim budget", eng.deadline)
+	assert.Less(t, cancelReclaimTimeout, storage.ApplyLeaseStaleAfter, "the reclaim must finish inside the claim's staleness window")
+	assert.Equal(t, state.Task.Cancelled, tasks[0].State)
+	assert.Equal(t, state.Task.Cancelled, tasks[1].State)
+	assert.Equal(t, state.Apply.Cancelled, apply.State)
+	var messages []string
+	for _, log := range logs.logs {
+		messages = append(messages, log.Message)
+	}
+	assert.Contains(t, messages, "Left in place because the delete failed; delete it by hand to reclaim branch quota: branch schemabot-testdb-1a2b")
 }
 
 // A PlanetScale failed_retryable task paused after a transient failure (e.g.

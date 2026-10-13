@@ -2,9 +2,10 @@
 // engine resume state names, so a cancel that lands between drives does not
 // strand work the engine set up in the service it drives.
 //
-// A running drive ends on the operator's cancel cause and reclaims its own work
-// on the way out. A cancel consumed by the drive that claims the apply next
-// stands that drive down before it resumes, so no drive sees the work: the
+// A driver consumes a cancel at its checkpoints, which run between engine
+// calls, so the drive that consumes it stands down without any engine call
+// holding the work: the drive that recorded the work has exited, or this drive
+// has not yet resumed from it. No drive's own cleanup sees the work, so the
 // stored resume state is its only record, and this file hands that record to
 // the engine. It never decides the cancel: the destructive direction is leaving
 // the work running, so a reclaim that fails is logged and the cancel proceeds.
@@ -14,10 +15,19 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/storage"
 )
+
+// cancelReclaimTimeout bounds the whole reclaim of a cancelled apply's stored
+// engine state, across every apply operation it visits. The reclaim is a
+// destructive write to the service the engine drives and is correct only while
+// the caller's claim on the apply holds (OW-10). The cancel may already have
+// ended the drive whose heartbeat keeps that claim fresh, so the bound stays
+// well inside storage.ApplyLeaseStaleAfter and the claim outlasts the write.
+const cancelReclaimTimeout = 20 * time.Second
 
 // reclaimCancelledResumeState hands each stored engine resume state of the
 // cancelled apply to the engine for reclaiming, and records what the engine
@@ -30,6 +40,10 @@ import (
 // visited, so one unreachable service does not leave every state's work
 // behind. The error returned joins what failed; the caller logs it and goes
 // on with the cancel.
+//
+// Loading and reclaiming run under cancelReclaimTimeout; what was removed and
+// left in place is recorded on ctx, so the apply log still says so when the
+// budget ran out partway.
 func (c *LocalClient) reclaimCancelledResumeState(ctx context.Context, eng engine.Engine, apply *storage.Apply, tasks []*storage.Task) error {
 	if eng == nil {
 		return fmt.Errorf("no engine configured for type: %s", c.config.Type)
@@ -43,9 +57,11 @@ func (c *LocalClient) reclaimCancelledResumeState(ctx context.Context, eng engin
 		return nil
 	}
 
+	reclaimCtx, cancelReclaim := context.WithTimeout(ctx, cancelReclaimTimeout)
+	defer cancelReclaim()
 	var failures []string
 	for _, task := range c.operationTasks(apply, tasks) {
-		stored, err := c.loadStoredEngineResumeState(ctx, task, "cancel reclaim")
+		stored, err := c.loadStoredEngineResumeState(reclaimCtx, task, "cancel reclaim")
 		if err != nil {
 			failures = append(failures, err.Error())
 			continue
@@ -58,7 +74,7 @@ func (c *LocalClient) reclaimCancelledResumeState(ctx context.Context, eng engin
 			failures = append(failures, fmt.Sprintf("resolve credentials to reclaim stored engine state of task %s: %v", task.TaskIdentifier, err))
 			continue
 		}
-		_, result, err := engine.ReclaimCancelledResumeState(ctx, eng, &engine.ReclaimResumeStateRequest{
+		_, result, err := engine.ReclaimCancelledResumeState(reclaimCtx, eng, &engine.ReclaimResumeStateRequest{
 			Database:    apply.Database,
 			Credentials: creds,
 			Options:     apply.GetOptions().Map(),

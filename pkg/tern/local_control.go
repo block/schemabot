@@ -795,13 +795,14 @@ func (c *LocalClient) cancelOwnedApply(ctx context.Context, req *ternv1.CancelRe
 		if err := c.releaseCancelledArtifacts(ctx, eng, targetApply, tasks); err != nil {
 			c.logSkippedArtifactRelease(ctx, targetApply, err)
 		}
-		// The handle above ends a drive that is running, and that drive reclaims
-		// its own work on the way out. Work recorded in stored state by a drive
-		// that has already exited has no drive to reclaim it, so the stored
-		// state is handed to the engine here, whether or not a drive was running:
-		// a running drive and this reclaim finding each other's delete already
-		// landed is harmless, a branch neither reclaims is not. A failed reclaim
-		// never holds the cancel back; what was left behind is on the apply log.
+		// The cancel is consumed at a drive checkpoint, where no engine call
+		// holds work the drive set up, so no drive's own cleanup reclaims work
+		// recorded in stored state. The stored state is handed to the engine
+		// here, whether or not a drive handle was installed: a drive ended with
+		// the operator's cause whose engine already reclaimed the same work
+		// leaves this reclaim finding it gone, which is harmless; work neither
+		// reclaims is not. A failed reclaim never holds the cancel back; what was
+		// left behind is on the apply log.
 		if err := c.reclaimCancelledResumeState(ctx, eng, targetApply, tasks); err != nil {
 			c.logger.Warn("cancelled schema change's stored engine state could not be fully reclaimed; the apply log names what was left in place",
 				append(targetApply.LogAttrs(), "error", err)...)

@@ -56,9 +56,10 @@ func (e *Engine) deleteOwnedBranch(ctx context.Context, logger *slog.Logger, cli
 
 // deleteBranch sends one branch delete under its own deadline and reports a
 // branch PlanetScale no longer has as already gone rather than as a failure.
-// The reclaim paths that call it can run twice for one branch, once from the
-// drive that was ending and once from the cancel that reclaims stored state,
-// and the second delete finding nothing is the first having landed.
+// A branch can be gone for reasons the engine cannot tell apart: an earlier
+// delete of the same branch landed, the branch was never created because the
+// apply ended between persisting its name and creating it, or an operator
+// removed it by hand. In each case there is nothing left to delete.
 func deleteBranch(ctx context.Context, client psclient.PSClient, org, database, branch string) (alreadyGone bool, err error) {
 	deleteCtx, cancel := context.WithTimeout(ctx, branchDeleteTimeout)
 	defer cancel()
@@ -87,8 +88,8 @@ var _ engine.CancelledResumeStateReclaimer = (*Engine)(nil)
 // addressed the deploy request itself. An operator-supplied branch is left to
 // the operator. Each kept branch is logged with the reason on the schema
 // change's logger, so a branch left behind is explained rather than silent. A
-// branch PlanetScale no longer has was reclaimed by the drive before the
-// cancel reached its stored state, and is reported as such, not as a failure.
+// branch PlanetScale no longer has is reported as already gone, not as a
+// failure, without naming a cause the engine cannot know (see deleteBranch).
 func (e *Engine) ReclaimCancelledResumeState(ctx context.Context, req *engine.ReclaimResumeStateRequest) (*engine.ReclaimResumeStateResult, error) {
 	logger := e.logger
 	if req.Logger != nil {
@@ -136,7 +137,7 @@ func (e *Engine) ReclaimCancelledResumeState(ctx context.Context, req *engine.Re
 		return result, fmt.Errorf("delete branch %s of the cancelled apply on %s: %w", meta.BranchName, req.Database, err)
 	}
 	if alreadyGone {
-		logger.Info("cancelled apply's branch was already gone; the drive that created it reclaimed it",
+		logger.Info("cancelled apply's branch was already gone; nothing to reclaim",
 			"organization", org, "planetscale_database", req.Database, "branch", meta.BranchName)
 		return result, nil
 	}
