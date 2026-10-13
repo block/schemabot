@@ -2420,6 +2420,14 @@ func undrivenApplyGate(d Dialect) string {
 	return undrivenApplyGateBoundedTo(d, "")
 }
 
+// undrivenApplyGateCorrelatedOn is undrivenApplyGate for a query whose FROM
+// clause is a child table rather than applies, correlated on the child's
+// apply_id column. It admits the same applies undrivenApplyGate does; only the
+// column the lease lookup is keyed on differs.
+func undrivenApplyGateCorrelatedOn(d Dialect, correlation string) string {
+	return undrivenGate(d, correlation, "")
+}
+
 // undrivenApplyGateBoundedTo is undrivenApplyGate restricted to a known set of
 // candidate applies, given as the placeholder list of a caller's IN clause. An
 // empty list leaves the lease lookup correlated only.
@@ -2433,6 +2441,13 @@ func undrivenApplyGate(d Dialect) string {
 // operation waits on. Repeating the bound inside keeps the lease lookup an index
 // probe over the candidates.
 func undrivenApplyGateBoundedTo(d Dialect, applyIDList string) string {
+	return undrivenGate(d, "applies.id", applyIDList)
+}
+
+// undrivenGate renders the fresh-lease NOT EXISTS behind the undriven-apply
+// gates, keyed on the given apply id expression and optionally bounded to a
+// placeholder list of candidate applies.
+func undrivenGate(d Dialect, correlation string, applyIDList string) string {
 	freshLeaseAfter := d.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime,
 		LiteralIntervalAmount(uint64(storage.ApplyLeaseStaleAfter.Microseconds())), IntervalMicrosecond)
 	bound := ""
@@ -2442,10 +2457,10 @@ func undrivenApplyGateBoundedTo(d Dialect, applyIDList string) string {
 	return fmt.Sprintf(`NOT EXISTS (
 			SELECT 1
 			FROM apply_operations lease_holder
-			WHERE lease_holder.apply_id = applies.id%s
+			WHERE lease_holder.apply_id = %s%s
 				AND lease_holder.lease_owner <> ''
 				AND lease_holder.updated_at >= %s
-		)`, bound, freshLeaseAfter)
+		)`, correlation, bound, freshLeaseAfter)
 }
 
 // ReapStranded elects one reaper per pass and reaps under the lock. See

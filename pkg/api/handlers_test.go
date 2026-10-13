@@ -451,6 +451,10 @@ func (s *memoryControlRequestStore) GetByOperation(_ context.Context, applyID in
 	return nil, nil
 }
 
+func (s *memoryControlRequestStore) ListStrandedPending(context.Context, int) ([]*storage.StrandedControlRequest, error) {
+	return nil, nil
+}
+
 func (s *memoryControlRequestStore) CompletePending(_ context.Context, applyID int64, operation storage.ControlOperation) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()

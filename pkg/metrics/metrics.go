@@ -1280,6 +1280,8 @@ var knownOperatorClaimFailureReasons = map[string]bool{
 	"expire_retryable_error":                   true,
 	"stranded_reaper_error":                    true,
 	"stranded_task_reaper_error":               true,
+	"stranded_active_task_reaper_error":        true,
+	"stranded_control_request_reaper_error":    true,
 	"missing_lease_token":                      true,
 	"operation_storage_error":                  true,
 	"missing_operation_lease_token":            true,

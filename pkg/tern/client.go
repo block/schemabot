@@ -143,6 +143,13 @@ var ErrTaskRequeueRefused = errors.New("task requeue refused")
 // active, and a terminal operation gets no next claim.
 var ErrTaskVerdictRefused = errors.New("task verdict refused")
 
+// ErrPostTerminalReconcile is matched by a drive's failure in the work an apply
+// owes after its terminal outcome is stored, such as answering the start that
+// admitted the claim. The drive has already settled the schema change and
+// nothing re-claims a settled apply, so a caller runs its post-drive settlement
+// rather than treating the drive as unfinished.
+var ErrPostTerminalReconcile = errors.New("reconcile after the stored terminal outcome failed")
+
 var (
 	// ErrPullSchemaUnsupportedType marks a pull request for a database type that
 	// the data plane does not yet support.
