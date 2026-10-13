@@ -1944,14 +1944,15 @@ func TestEngineCancelConcurrentIndexBuildWithoutABackendSignal(t *testing.T) {
 	// builder is found through the lock it waits on — the writer's virtual
 	// transaction — rather than through what it is running.
 	var builderPID int
+	var indexOID uint32
 	var builderState sql.NullString
 	require.Eventually(t, func() bool {
 		err := db.QueryRowContext(t.Context(), `
-			SELECT a.pid, a.state
+			SELECT a.pid, a.state, i.indexrelid
 			FROM pg_locks l
 			JOIN pg_stat_activity a ON a.pid = l.pid
 			JOIN pg_index i ON i.indexrelid = to_regclass('public.orders_ref_idx')
-			WHERE a.datname = current_database() AND l.locktype = 'virtualxid' AND NOT l.granted AND NOT i.indisvalid`).Scan(&builderPID, &builderState)
+			WHERE a.datname = current_database() AND l.locktype = 'virtualxid' AND NOT l.granted AND NOT i.indisvalid`).Scan(&builderPID, &builderState, &indexOID)
 		return err == nil
 	}, postgresApplyDeadline, 10*time.Millisecond, "the build never parked behind the writer after creating its invalid catalog entry")
 	require.Equal(t, "disabled", builderState.String, "the server must hide the builder's state, or the tracker signals it and the context path is not what settles the cancel")
@@ -1964,11 +1965,31 @@ func TestEngineCancelConcurrentIndexBuildWithoutABackendSignal(t *testing.T) {
 	got := awaitPostgresProgress(t, eng, "orders")
 	assert.Equal(t, engine.StateCancelled, got.State, "progress: %+v", got)
 	assert.Equal(t, "cancelled", got.Metadata["phase"])
-	assert.Equal(t, `index "public"."orders_ref_idx" may be invalid but its catalog state could not be verified; inspect pg_index.indisvalid on the target before any recovery, then retry`, got.ErrorMessage)
 	assertBackendGone(t, db, builderPID)
 
+	// The detached verdict races the backend's disconnect. If it still
+	// sees the disabled backend, it cannot prove the build stopped and
+	// leaves the original name alone. If the backend is already gone, the
+	// cleanup can prove abandonment and quarantine the index, but its drop
+	// cannot finish while this writer stays open. In either case the same
+	// invalid index must survive, and the detail must match its identity.
+	var indexName string
+	var valid bool
+	err = db.QueryRowContext(t.Context(), `
+		SELECT c.relname, i.indisvalid
+		FROM pg_class c JOIN pg_index i ON i.indexrelid = c.oid
+		WHERE c.oid = $1 AND i.indrelid = 'public.orders'::regclass`, indexOID).Scan(&indexName, &valid)
+	require.NoError(t, err, "the cancelled build's original index must remain on orders")
+	assert.False(t, valid, "the cancelled build must not leave a valid index")
+	expectedDetails := map[string]string{
+		"orders_ref_idx": `index "public"."orders_ref_idx" may be invalid but its catalog state could not be verified; inspect pg_index.indisvalid on the target before any recovery, then retry`,
+		fmt.Sprintf("pgsprite_abandoned_%d", indexOID): `Concurrent index build cancelled; the invalid index remains under "public"."orders_ref_idx" or an identity-derived pgsprite_abandoned_<oid> name; query pg_index joined to pg_class for invalid indexes on the table, then follow the PostgreSQL invalid-index recovery guidance`,
+	}
+	require.Contains(t, expectedDetails, indexName, "only the original or its OID-derived quarantine name is allowed")
+	assert.Equal(t, expectedDetails[indexName], got.ErrorMessage)
+	t.Logf("cancelled index %d remains as %s", indexOID, indexName)
+
 	writer.release(t)
-	assertIndexInvalid(t, db, "orders_ref_idx")
 }
 
 // TestEngineApplyConcurrentIndexBoundEndsTheBuild proves the configured
