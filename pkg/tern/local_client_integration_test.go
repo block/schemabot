@@ -14,6 +14,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/block/schemabot/pkg/inventory"
+
 	drivermysql "github.com/block/mysql"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/utils"
@@ -923,7 +925,7 @@ func TestLocalClient_PullSchemaOverridesReadPhysicalSchema(t *testing.T) {
 		Database:        "logicaldb",
 		Type:            storage.DatabaseTypeMySQL,
 		TargetDSN:       dsnWithoutDatabase(t, dsn),
-		SchemaOverrides: map[string]string{canonical: physical},
+		SchemaOverrides: resolveIntegrationOverride(t, dsnWithoutDatabase(t, dsn), canonical, physical),
 	}, nil, logger)
 	require.NoError(t, err, "create client")
 	defer utils.CloseAndLog(client)
@@ -1038,7 +1040,7 @@ func TestLocalClient_ApplySchemaOverridesTargetPhysicalSchema(t *testing.T) {
 		Database:        "logicaldb",
 		Type:            storage.DatabaseTypeMySQL,
 		TargetDSN:       dsnWithoutDatabase(t, dsn),
-		SchemaOverrides: map[string]string{canonical: physical},
+		SchemaOverrides: resolveIntegrationOverride(t, dsnWithoutDatabase(t, dsn), canonical, physical),
 	}, stor, logger)
 	require.NoError(t, err, "create client")
 	defer utils.CloseAndLog(client)
@@ -4757,4 +4759,17 @@ func TestLocalClient_ApplyPersistsBranchOptionForQueuedDrive(t *testing.T) {
 		"the queued drive's engine request must carry the dispatched branch option")
 	assert.Equal(t, "true", engineOptions["defer_cutover"],
 		"the queued drive's engine request must carry the dispatched defer_cutover option")
+}
+
+// resolveIntegrationOverride exercises discovery followed by the configured
+// decorator before the real MySQL pull/plan/apply and isolation assertions.
+func resolveIntegrationOverride(t *testing.T, dsn, canonical, physical string) map[string]string {
+	t.Helper()
+	backend, err := inventory.NewStaticResolver(inventory.StaticConfig{Targets: map[string]inventory.StaticTarget{"cluster": {DatabaseType: "mysql", DSN: dsn}}})
+	require.NoError(t, err)
+	resolver, err := inventory.NewOverrideResolver(backend, []inventory.TargetOverride{{Environment: localClientTestEnvironment, Target: "cluster", DatabaseType: "mysql", SchemaOverrides: map[string]string{canonical: physical}}}, slog.Default())
+	require.NoError(t, err)
+	target, err := resolver.ResolveTarget(t.Context(), inventory.Request{Environment: localClientTestEnvironment, Target: "cluster", DatabaseType: "mysql"})
+	require.NoError(t, err)
+	return target.SchemaOverrides
 }

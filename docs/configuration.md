@@ -133,6 +133,59 @@ With the `config_paths` example above, SchemaBot reads:
 `dsn` and `dsn_from` are mutually exclusive for each storage or database
 environment entry.
 
+### Per-target schema overrides
+
+A data plane can attach a canonical-to-physical schema mapping after resolving
+an exact `(environment, target)` through Etre or static inventory:
+
+```yaml
+target_resolver:
+  targets:
+    cluster-002:
+      type: mysql
+      dsn: "env:CLUSTER_DSN" # namespace-free
+  overrides:
+    - environment: production
+      target: cluster-002
+      type: mysql
+      schema_overrides:
+        orders_production: orders_sandbox
+```
+
+`overrides` is not a discovery backend. Configure exactly one of `targets` or
+`etre`. Each override requires an explicit lowercase environment, exact target,
+and engine type, plus exactly one mapping. MySQL and PostgreSQL mappings use the
+same identifier validation as static `schema_overrides`; other engines, unknown
+fields, duplicate environment/target pairs, and empty mappings are rejected.
+An override cannot also own a mapping in static inventory or a custom resolver.
+
+Discovery and credentials are resolved using the original request. There is no
+fallback environment or target. Only after successful discovery does the
+resolver check the resolved identity and type and attach a copied mapping.
+An absent entry preserves the backend result, including any static mapping.
+Enumeration and single-engine reporting retain the underlying resolver's
+capabilities. Startup logs name configured mappings; debug logs record use.
+Neither log includes connection strings or credentials.
+
+The engine operates on the physical schema and returns canonical namespace
+keys. The mapping is a strict allowlist: another namespace is refused. MySQL
+connections must remain namespace-free. A PostgreSQL mapping selects a schema
+within the database already named by the DSN.
+
+Before enabling a mapping, resolve the target and pull/plan using its canonical
+namespace. Configuration validation cannot prove that a target exists. In a
+multi-target rollout, plan every target against its own live schema; sharing
+desired SQL does not imply identical plans after partial completion.
+
+**Changing mappings requires draining work.** Complete or explicitly retire all
+active, deferred-cutover, stopped, or otherwise resumable applies first. Hold
+affected target operations until every serving replica has the same config,
+and re-plan after every mapping change. A new mapping changes the client cache
+identity, but does not durably bind an old MySQL plan across worker restarts.
+Never execute a pre-change plan with a new mapping. To roll back, withdraw the
+affected route and drain its work before removing the mapping: removal restores
+identity mapping and can address a different schema. There is no hot reload.
+
 ### PostgreSQL `dsn_from` targets
 
 `target_resolver` is the data-plane connection resolver: a server exposing the
