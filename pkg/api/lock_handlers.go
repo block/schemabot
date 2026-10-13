@@ -102,7 +102,7 @@ func (s *Service) handleLockAcquire(w http.ResponseWriter, r *http.Request) {
 		// never release or take again; only a deployment write group could.
 		// Refuse it rather than create a lock its own taker is locked out of.
 		metrics.RecordLockOperation(ctx, "acquire", req.Database, "no_acquirer")
-		s.logger.Warn("scoped lock acquire refused: the caller's identity is not verified, so the lock would record no acquirer and the caller could neither release nor re-acquire it; nothing is held",
+		s.logger.Warn("scoped lock acquire refused: the caller's identity is not verified, so the lock would record no acquirer and the caller could neither release nor re-acquire it; this request took no lock",
 			"repository", req.Repository, "database", req.Database, "database_type", req.DatabaseType,
 			"owner", req.Owner, "reason", noAcquirerReason)
 		s.writeError(w, http.StatusForbidden, s.scopedLockAcquirerUnverifiedMessage(req.Database))
@@ -515,7 +515,7 @@ func (s *Service) scopedLockDenialMessage(operation, action string, lock *storag
 // instead.
 func (s *Service) scopedLockAcquirerUnverifiedMessage(database string) string {
 	writeGroups := strings.Join(s.config.Auth.ForwardAuth.WriteGroups, ", ")
-	return fmt.Sprintf("lock_acquire on database %q: your identity is not verified, so the lock could not record who took it, and only a deployment write group (%s) could release it; nothing is held. Retry through the authenticated gateway, or ask a member of a deployment write group to take the lock",
+	return fmt.Sprintf("lock_acquire on database %q: your identity is not verified, so the lock could not record who took it, and only a deployment write group (%s) could release it; this request took no lock. Retry through the authenticated gateway, or ask a member of a deployment write group to take the lock",
 		database, writeGroups)
 }
 

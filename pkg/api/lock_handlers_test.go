@@ -554,7 +554,7 @@ func TestScopedLockReacquireIsPerOperatorGroup(t *testing.T) {
 
 		assert.Equal(t, http.StatusForbidden, rec.Code, rec.Body.String())
 		assert.Contains(t, rec.Body.String(), `lock_acquire on database \"payments\": your identity is not verified`)
-		assert.Contains(t, rec.Body.String(), "nothing is held")
+		assert.Contains(t, rec.Body.String(), "this request took no lock")
 		assert.Contains(t, rec.Body.String(), "schema-admins", "the refusal names the write groups that can take the lock")
 		assert.Nil(t, locks.lock, "a refused acquire takes no lock")
 	})
