@@ -120,7 +120,7 @@ func NewOverrideResolver(underlying Resolver, entries []TargetOverride, logger *
 func (r *overrideResolver) ResolveTarget(ctx context.Context, req Request) (*Target, error) {
 	target, err := r.underlying.ResolveTarget(ctx, req)
 	if err != nil {
-		return nil, fmt.Errorf("resolve override target %q in environment %q: %w", req.Target, req.Environment, err)
+		return nil, fmt.Errorf("resolve target %q in environment %q: %w", req.Target, req.Environment, err)
 	}
 	entry, ok := r.entries[overrideKey{req.Environment, req.Target}]
 	if !ok {

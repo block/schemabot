@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"testing"
 
@@ -101,9 +102,15 @@ func TestOverrideExactMatchAndErrors(t *testing.T) {
 	for _, failure := range []error{context.Canceled, errors.New("not found"), errors.New("ambiguous"), errors.New("credentials")} {
 		resolver, err = NewOverrideResolver(overrideBackend(func(context.Context, Request) (*Target, error) { return nil, failure }), []TargetOverride{sampleOverride()}, nil)
 		require.NoError(t, err)
-		_, err = resolver.ResolveTarget(t.Context(), Request{Target: "cluster-002", Environment: "production"})
-		assert.ErrorIs(t, err, failure)
-		assert.ErrorContains(t, err, `resolve override target "cluster-002" in environment "production"`)
+		for _, req := range []Request{
+			{Target: "cluster-002", Environment: "production"},
+			{Target: "cluster-009", Environment: "production"},
+			{Target: "cluster-002", Environment: "staging"},
+		} {
+			_, err = resolver.ResolveTarget(t.Context(), req)
+			assert.ErrorIs(t, err, failure)
+			assert.EqualError(t, err, fmt.Sprintf("resolve target %q in environment %q: %s", req.Target, req.Environment, failure))
+		}
 	}
 }
 
