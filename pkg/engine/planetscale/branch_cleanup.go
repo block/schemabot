@@ -2,6 +2,7 @@ package planetscale
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"time"
 
@@ -31,14 +32,7 @@ const branchDeleteTimeout = 30 * time.Second
 // remove it by hand — an undeletable branch must be visible, not silently
 // retried.
 func (e *Engine) deleteOwnedBranch(ctx context.Context, logger *slog.Logger, client psclient.PSClient, org, database, branch string, cause error) {
-	deleteCtx, cancel := context.WithTimeout(ctx, branchDeleteTimeout)
-	defer cancel()
-
-	err := client.DeleteBranch(deleteCtx, &ps.DeleteDatabaseBranchRequest{
-		Organization: org,
-		Database:     database,
-		Branch:       branch,
-	})
+	alreadyGone, err := deleteBranch(ctx, client, org, database, branch)
 	if err != nil && ctx.Err() != nil {
 		logger.Warn("drive ended while deleting the branch; abandoned the delete request, which may already have landed; a resuming driver starts fresh if the branch is gone",
 			"organization", org, "planetscale_database", database, "branch", branch,
@@ -51,8 +45,106 @@ func (e *Engine) deleteOwnedBranch(ctx context.Context, logger *slog.Logger, cli
 			"apply_error", cause, "error", err)
 		return
 	}
+	if alreadyGone {
+		logger.Info("the branch created for an apply that failed before its deploy request was already gone",
+			"organization", org, "planetscale_database", database, "branch", branch, "apply_error", cause)
+		return
+	}
 	logger.Info("deleted the branch created for an apply that failed before its deploy request",
 		"organization", org, "planetscale_database", database, "branch", branch, "apply_error", cause)
+}
+
+// deleteBranch sends one branch delete under its own deadline and reports a
+// branch PlanetScale no longer has as already gone rather than as a failure.
+// A branch can be gone for reasons the engine cannot tell apart: an earlier
+// delete of the same branch landed, the branch was never created because the
+// apply ended between persisting its name and creating it, or an operator
+// removed it by hand. In each case there is nothing left to delete.
+func deleteBranch(ctx context.Context, client psclient.PSClient, org, database, branch string) (alreadyGone bool, err error) {
+	deleteCtx, cancel := context.WithTimeout(ctx, branchDeleteTimeout)
+	defer cancel()
+
+	err = client.DeleteBranch(deleteCtx, &ps.DeleteDatabaseBranchRequest{
+		Organization: org,
+		Database:     database,
+		Branch:       branch,
+	})
+	if err != nil && isNotFound(err) {
+		return true, nil
+	}
+	return false, err
+}
+
+var _ engine.CancelledResumeStateReclaimer = (*Engine)(nil)
+
+// ReclaimCancelledResumeState deletes the branch the stored resume state names
+// when no deploy request exists to own its teardown and SchemaBot created it.
+// It serves the cancel that lands between drives: the drive that persisted the
+// branch has exited, and the drive consuming the cancel stands down before it
+// resumes, so no drive's own cleanup ever sees the branch.
+//
+// A state naming a deploy request is left alone: the deploy request tears the
+// branch down (auto_delete_branch), and the engine's Cancel has already
+// addressed the deploy request itself. An operator-supplied branch is left to
+// the operator. Each kept branch is logged with the reason on the schema
+// change's logger, so a branch left behind is explained rather than silent. A
+// branch PlanetScale no longer has is reported as already gone, not as a
+// failure, without naming a cause the engine cannot know (see deleteBranch).
+func (e *Engine) ReclaimCancelledResumeState(ctx context.Context, req *engine.ReclaimResumeStateRequest) (*engine.ReclaimResumeStateResult, error) {
+	logger := e.logger
+	if req.Logger != nil {
+		logger = req.Logger
+	}
+	result := &engine.ReclaimResumeStateResult{}
+	if req.ResumeState == nil || req.ResumeState.Metadata == "" {
+		logger.Debug("cancelled apply persisted no engine state, so it holds no branch to reclaim",
+			"planetscale_database", req.Database)
+		return result, nil
+	}
+	meta, err := decodePSMetadata(req.ResumeState.Metadata)
+	if err != nil {
+		return nil, fmt.Errorf("decode stored resume state of the cancelled apply on %s: %w", req.Database, err)
+	}
+	org := credOrg(req.Credentials)
+	branch := "branch " + meta.BranchName
+	switch {
+	case meta.BranchName == "":
+		logger.Debug("cancelled apply's stored state names no branch, so there is nothing to reclaim",
+			"organization", org, "planetscale_database", req.Database)
+		return result, nil
+	case meta.DeployRequestID != 0:
+		logger.Info("cancelled apply's branch is owned by its deploy request, which tears the branch down",
+			"organization", org, "planetscale_database", req.Database, "branch", meta.BranchName, "deploy_request", meta.DeployRequestID)
+		return result, nil
+	case !deployRequestDeletesBranch(req.Options):
+		logger.Info("cancelled apply ran on an operator-supplied branch; keeping it for the operator",
+			"organization", org, "planetscale_database", req.Database, "branch", meta.BranchName)
+		result.Kept = []string{branch}
+		result.KeptReason = "the operator supplied it and it is theirs to keep"
+		return result, nil
+	}
+
+	client, err := e.getClient(req.Credentials)
+	if err != nil {
+		result.Kept = []string{branch}
+		result.KeptReason = "the PlanetScale API could not be reached; delete it by hand to reclaim branch quota"
+		return result, fmt.Errorf("reclaim branch %s of the cancelled apply on %s: %w", meta.BranchName, req.Database, err)
+	}
+	alreadyGone, err := deleteBranch(ctx, client, org, req.Database, meta.BranchName)
+	if err != nil {
+		result.Kept = []string{branch}
+		result.KeptReason = "the delete failed; delete it by hand to reclaim branch quota"
+		return result, fmt.Errorf("delete branch %s of the cancelled apply on %s: %w", meta.BranchName, req.Database, err)
+	}
+	if alreadyGone {
+		logger.Info("cancelled apply's branch was already gone; nothing to reclaim",
+			"organization", org, "planetscale_database", req.Database, "branch", meta.BranchName)
+		return result, nil
+	}
+	logger.Info("deleted the branch of a cancelled apply that never reached its deploy request",
+		"organization", org, "planetscale_database", req.Database, "branch", meta.BranchName)
+	result.Reclaimed = []string{branch}
+	return result, nil
 }
 
 // reclaimBranchAfterFailedResume deletes the branch a resumed drive was
@@ -68,7 +160,8 @@ func (e *Engine) deleteOwnedBranch(ctx context.Context, logger *slog.Logger, cli
 // when another drive may still need it, or when it is not SchemaBot's to
 // delete: an operator-supplied branch belongs to the operator, and a drive
 // whose context ended is handing the apply to the driver that resumes it from
-// this branch. Each kept branch is logged with the reason, so a branch left
+// this branch, unless an operator cancelled it, since no driver resumes a
+// cancelled apply. Each kept branch is logged with the reason, so a branch left
 // behind is explained rather than silent.
 //
 // The stored state names the resumed branch, so the delete stays under the
@@ -84,6 +177,10 @@ func (e *Engine) reclaimBranchAfterFailedResume(ctx context.Context, client pscl
 	case !deployRequestDeletesBranch(req.Options):
 		logger.Info("resumed apply failed before its deploy request; keeping the operator-supplied branch",
 			"organization", org, "planetscale_database", req.Database, "branch", branch, "apply_error", cause)
+	case engine.CancelledByOperator(ctx):
+		// No driver resumes a cancelled apply, so the branch has no one left
+		// to need it, and the delete must outlive the cancelled context.
+		e.deleteOwnedBranch(context.WithoutCancel(ctx), logger, client, org, req.Database, branch, cause)
 	case ctx.Err() != nil:
 		logger.Info("resumed drive ended before its deploy request; keeping the branch for the driver that resumes the apply",
 			"organization", org, "planetscale_database", req.Database, "branch", branch, "apply_error", cause)

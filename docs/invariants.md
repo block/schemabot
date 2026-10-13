@@ -1121,9 +1121,13 @@ above while any write is deciding ownership by inference.
 
 *Enforced:* the claim every drive runs under (OW-1); the apply-target lock held across a destructive
 target write, which excludes SchemaBot's applies and says so (`WithExclusiveTarget`,
-`pkg/storage/internal/sqlstore/applies.go`); and the engine-side guard that retains rather than
-reclaims what a schema change SchemaBot did not start could own
-(`pkg/engine/spirit/cancelled_artifacts.go`).
+`pkg/storage/internal/sqlstore/applies.go`); the engine-side guards that retain rather than
+reclaim what a schema change SchemaBot did not start could own
+(`pkg/engine/spirit/cancelled_artifacts.go`, and for an operator-supplied branch
+`pkg/engine/planetscale/branch_cleanup.go`); and the cancel's reclaim of a
+cancelled apply's stored engine state, which runs only on the driver consuming
+the cancel and under a deadline inside the claim's staleness window
+(`pkg/tern/local_cancelled_resume_state.go`).
 
 ## Control operations (CO)
 

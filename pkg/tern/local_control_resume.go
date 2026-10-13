@@ -2721,10 +2721,10 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 				if err := c.markApplyRecovering(ctx, apply, tasks); err != nil {
 					return err
 				}
-				resumeCtx, cancelResume := context.WithCancel(ctx)
+				resumeCtx, cancelResume := context.WithCancelCause(ctx)
 				cancelGeneration := c.setApplyCancel(cancelResume)
 				defer c.clearApplyCancel(cancelGeneration)
-				defer cancelResume()
+				defer cancelResume(nil)
 				if err := c.launchAtomicResume(resumeCtx, apply, tasks, plan, options, "Recovering from checkpoint", true, false, releaseAtCutoverBarrier); err != nil {
 					if errors.Is(err, errGroupedResumeStateUnavailable) {
 						logger.Warn("deferred cutover recovery could not load persisted engine resume state; current apply owner will exit for operator retry",
@@ -2856,10 +2856,10 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 	}
 
 	if grouped {
-		resumeCtx, cancelResume := context.WithCancel(ctx)
+		resumeCtx, cancelResume := context.WithCancelCause(ctx)
 		cancelGeneration := c.setApplyCancel(cancelResume)
 		defer c.clearApplyCancel(cancelGeneration)
-		defer cancelResume()
+		defer cancelResume(nil)
 		if err := c.launchAtomicResume(resumeCtx, apply, activeTasks, plan, options, fmt.Sprintf("Apply resumed from checkpoint (%s)", groupedApplyModeDescription(apply, options)), true, startRequested, releaseAtCutoverBarrier); err != nil {
 			if errors.Is(err, errGroupedResumeStateUnavailable) {
 				logger.Warn("grouped resume could not load persisted engine resume state; current apply owner will exit for operator retry",
@@ -2904,10 +2904,10 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 				"Apply resumed from checkpoint (sequential)", "", state.Apply.Running)
 		}
 
-		resumeCtx, cancelResume := context.WithCancel(ctx)
+		resumeCtx, cancelResume := context.WithCancelCause(ctx)
 		cancelGeneration := c.setApplyCancel(cancelResume)
 		defer c.clearApplyCancel(cancelGeneration)
-		defer cancelResume()
+		defer cancelResume(nil)
 		if err := c.resumeApplySequential(resumeCtx, apply, activeTasks, plan, options); err != nil {
 			return err
 		}
@@ -2966,10 +2966,10 @@ func (c *LocalClient) handleGroupedResumeFailure(ctx context.Context, apply *sto
 }
 
 func (c *LocalClient) dispatchQueuedApply(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, plan *storage.Plan, options map[string]string, releaseAtCutoverBarrier bool) error {
-	applyCtx, cancelApply := context.WithCancel(ctx)
+	applyCtx, cancelApply := context.WithCancelCause(ctx)
 	cancelGeneration := c.setApplyCancel(cancelApply)
 	defer c.clearApplyCancel(cancelGeneration)
-	defer cancelApply()
+	defer cancelApply(nil)
 
 	c.logger.Info("dispatching queued apply",
 		"apply_id", apply.ApplyIdentifier,

@@ -652,7 +652,7 @@ func (c *LocalClient) stopOwnedApply(ctx context.Context, req *ternv1.StopReques
 	// Cancel the apply goroutine's context so it stops iterating over tasks.
 	// Without this, executeApplySequential would continue to the next table
 	// after Spirit's runner exits, racing with the resume goroutine.
-	c.cancelApplyHandle(applyCancel)
+	c.cancelApplyHandle(applyCancel, nil)
 
 	// For Vitess/PlanetScale, stopping means cancelling the deploy request —
 	// this is permanent (not resumable). Use "cancelled" instead of "stopped".
@@ -789,11 +789,23 @@ func (c *LocalClient) cancelOwnedApply(ctx context.Context, req *ternv1.CancelRe
 		}
 		return nil, fmt.Errorf("engine cancel failed: %w", err)
 	}
-	c.cancelApplyHandle(applyCancel)
+	c.cancelApplyHandle(applyCancel, engine.ErrCancelledByOperator)
 
 	if targetApply != nil {
 		if err := c.releaseCancelledArtifacts(ctx, eng, targetApply, tasks); err != nil {
 			c.logSkippedArtifactRelease(ctx, targetApply, err)
+		}
+		// The cancel is consumed at a drive checkpoint, where no engine call
+		// holds work the drive set up, so no drive's own cleanup reclaims work
+		// recorded in stored state. The stored state is handed to the engine
+		// here, whether or not a drive handle was installed: a drive ended with
+		// the operator's cause whose engine already reclaimed the same work
+		// leaves this reclaim finding it gone, which is harmless; work neither
+		// reclaims is not. A failed reclaim never holds the cancel back; what was
+		// left behind is on the apply log.
+		if err := c.reclaimCancelledResumeState(ctx, eng, targetApply, tasks); err != nil {
+			c.logger.Warn("cancelled schema change's stored engine state could not be fully reclaimed; the apply log names what was left in place",
+				append(targetApply.LogAttrs(), "error", err)...)
 		}
 	} else {
 		c.logger.Warn("cancel resolved no apply, so any artifacts its schema change left stay on the target",

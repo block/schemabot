@@ -249,7 +249,7 @@ type LocalClient struct {
 	// or executeGroupedApply. Set when an apply starts, called by Stop().
 	// Protected by cancelMu since Apply and Stop run on different goroutines.
 	cancelMu              sync.Mutex
-	cancelApply           context.CancelFunc
+	cancelApply           context.CancelCauseFunc
 	cancelApplyGeneration uint64
 
 	// observers holds per-apply progress observers. The progress poller notifies
@@ -268,7 +268,7 @@ type LocalClient struct {
 
 type applyCancelHandle struct {
 	generation uint64
-	cancel     context.CancelFunc
+	cancel     context.CancelCauseFunc
 }
 
 // Compile-time check that LocalClient implements Client.
