@@ -1,7 +1,9 @@
 package api
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"log/slog"
 	"net/http"
@@ -556,7 +558,23 @@ func TestScopedLockReacquireIsPerOperatorGroup(t *testing.T) {
 		assert.Contains(t, rec.Body.String(), `lock_acquire on database \"payments\": your identity is not verified`)
 		assert.Contains(t, rec.Body.String(), "this request took no lock")
 		assert.Contains(t, rec.Body.String(), "schema-admins", "the refusal names the write groups that can take the lock")
+		assert.Contains(t, rec.Body.String(), "ask a member of a deployment write group to run the command for you")
 		assert.Nil(t, locks.lock, "a refused acquire takes no lock")
+	})
+
+	t.Run("an unverified operator re-sending their own group's lock owner is refused with the lock unchanged", func(t *testing.T) {
+		// The groups of an unverified caller are only claimed, so they do not
+		// decide whether the caller holds the lock; the refusal says only
+		// that this request took none, which stays true while the lock is
+		// held.
+		held := paymentsLock(7, owner, teamAcquirer)
+		locks := &memoryLockStore{lock: paymentsLock(7, owner, teamAcquirer)}
+		rec := acquireUnverified(t, locks, bob)
+
+		assert.Equal(t, http.StatusForbidden, rec.Code, rec.Body.String())
+		assert.Contains(t, rec.Body.String(), `lock_acquire on database \"payments\": your identity is not verified`)
+		assert.Contains(t, rec.Body.String(), "this request took no lock")
+		assertUnchanged(t, locks, held)
 	})
 
 	t.Run("a lock released before the acquire could be read back is not reported held", func(t *testing.T) {
@@ -628,4 +646,39 @@ func TestHoldsLockByOwnerAloneIsAnAllowlist(t *testing.T) {
 	assert.False(t, holdsLockByOwnerAlone(DirectWriteReasonScopedAllow))
 	assert.False(t, holdsLockByOwnerAlone("service_allow"), "an unknown allow reason is held to the recorded acquirer")
 	assert.False(t, holdsLockByOwnerAlone(""))
+}
+
+// A scoped operator's acquire refused because no verified acquirer can be
+// recorded is counted under its own status on the lock operation counter, and
+// logged with the subject the caller claimed and why no acquirer could be
+// recorded, so a break-glass refusal can be found and attributed from
+// telemetry alone.
+func TestUnverifiedScopedLockAcquireRefusalIsCountedAndLogged(t *testing.T) {
+	reader := installManualMetricReader(t)
+	var logs bytes.Buffer
+	svc := New(&mockStorageWithApplyStores{locks: &memoryLockStore{}}, scopedWriteConfig(), nil,
+		slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	ctx := auth.WithUser(t.Context(), &auth.User{Subject: "bob", Groups: []string{"payments-team"}})
+	body := `{"database":"payments","database_type":"mysql","owner":"cli:bob@laptop","repository":"org/payments-service"}`
+	rec := httptest.NewRecorder()
+	svc.handleLockAcquire(rec, httptest.NewRequestWithContext(ctx, http.MethodPost, "/api/locks/acquire", strings.NewReader(body)))
+	require.Equal(t, http.StatusForbidden, rec.Code, rec.Body.String())
+
+	points := collectCounterPoints(t, reader, "schemabot.lock_operations_total")
+	require.Len(t, points, 1)
+	assert.Equal(t, int64(1), points[0].Value)
+	assert.Equal(t, "acquire", attributeValue(t, points[0], "operation"))
+	assert.Equal(t, "payments", attributeValue(t, points[0], "database"))
+	assert.Equal(t, "no_acquirer", attributeValue(t, points[0], "status"))
+
+	var entry map[string]any
+	require.NoError(t, json.Unmarshal(logs.Bytes(), &entry), logs.String())
+	assert.Equal(t, "WARN", entry["level"])
+	assert.Equal(t, "scoped lock acquire refused: there is no verified acquirer to record, so the caller could neither release nor re-acquire the lock; this request took no lock", entry["msg"])
+	assert.Equal(t, "bob", entry["claimed_subject"])
+	assert.Equal(t, DirectWriteReasonUnverifiedIdentity, entry["reason"])
+	assert.Equal(t, "payments", entry["database"])
+	assert.Equal(t, "mysql", entry["database_type"])
+	assert.Equal(t, "cli:bob@laptop", entry["owner"])
+	assert.Equal(t, "org/payments-service", entry["repository"])
 }
