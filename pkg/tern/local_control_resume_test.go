@@ -798,7 +798,7 @@ func TestResumeStoppedApplyRefusesAStartOverAFailedTask(t *testing.T) {
 	applyStore.apply.State = state.Apply.Resuming
 	tasks[0].State = state.Task.Failed
 	tasks[0].TableName = "orders"
-	tasks[0].ErrorMessage = "Duplicate entry 'a@b.c' for key 'users.email'"
+	tasks[0].ErrorMessage = "Existing rows hold duplicate values for a unique key. Resolve the duplicates before applying a change that adds or narrows that key."
 	requests := pendingControlRequestStore(apply.ID, storage.ControlOperationStart)
 	client.storage.(*exactProgressStorage).controlRequests = requests
 	observer := &terminalRecordingObserver{}
@@ -807,13 +807,52 @@ func TestResumeStoppedApplyRefusesAStartOverAFailedTask(t *testing.T) {
 	err := client.resumeApplyWithTasks(t.Context(), apply, nil, tasks, nil, false, false)
 
 	require.NoError(t, err)
-	want := "start refused: table orders failed before the apply was stopped (Duplicate entry 'a@b.c' for key 'users.email'); plan the schema change again and apply the new plan"
+	want := "start refused: table orders failed before the apply was stopped (Existing rows hold duplicate values for a unique key. Resolve the duplicates before applying a change that adds or narrows that key.); plan the schema change again and apply the new plan"
 	assert.Equal(t, state.Apply.Failed, applyStore.apply.State)
 	assert.Equal(t, want, applyStore.apply.ErrorMessage)
 	require.Len(t, requests.requests, 1)
 	assert.Equal(t, storage.ControlRequestFailed, requests.requests[0].Status, "the start is answered, not left pending")
 	assert.Contains(t, requests.requests[0].ErrorMessage, want)
 	require.Len(t, observer.terminal, 1, "the failed outcome posts its summary")
+}
+
+// An operator stops a rollout in which one deployment's table had already
+// failed and another deployment's table was still running, then starts it.
+// The failed table belongs to a sibling operation, whose failure the rollout
+// projection weighs under the apply's failure policy (ST-1); it is not the
+// resumed operation's verdict, so the start is not refused and the resume
+// goes on to load its plan. The resume is proven to have continued by the
+// plan-load failure it runs into, which a refused start would never reach.
+func TestResumeStoppedRolloutStartIsNotRefusedBySiblingOperationFailure(t *testing.T) {
+	planErr := errors.New("the resume must reach the plan load")
+	client, apply, tasks, applyStore := recoveryPlanLoadFixture(&scriptedPlanStore{err: planErr})
+	apply.State = state.Apply.Stopped
+	applyStore.apply = &storage.Apply{}
+	*applyStore.apply = *apply
+	applyStore.apply.State = state.Apply.Resuming
+	siblingOperationID := int64(4)
+	sibling := *tasks[0]
+	sibling.ID = 3
+	sibling.ApplyOperationID = &siblingOperationID
+	sibling.TaskIdentifier = "task-recover-plan-sibling"
+	sibling.TableName = "orders"
+	sibling.State = state.Task.Failed
+	sibling.ErrorMessage = "Existing rows hold duplicate values for a unique key. Resolve the duplicates before applying a change that adds or narrows that key."
+	tasks = append(tasks, &sibling)
+	client.storage.(*exactProgressStorage).tasks = &exactProgressTaskStore{tasks: tasks}
+	requests := pendingControlRequestStore(apply.ID, storage.ControlOperationStart)
+	client.storage.(*exactProgressStorage).controlRequests = requests
+	observer := &terminalRecordingObserver{}
+	client.SetObserver(apply.ID, observer)
+
+	err := client.resumeApplyWithTasks(t.Context(), apply, nil, tasks, nil, false, false)
+
+	require.ErrorIs(t, err, planErr, "the start must not be refused; the resume continues to the plan load")
+	assert.Equal(t, state.Apply.Resuming, applyStore.apply.State, "the apply is not failed from the sibling's task")
+	assert.Empty(t, applyStore.apply.ErrorMessage)
+	require.Len(t, requests.requests, 1)
+	assert.Equal(t, storage.ControlRequestPending, requests.requests[0].Status, "the start stays pending for the resume it admitted")
+	assert.Empty(t, observer.terminal, "no terminal outcome is posted")
 }
 
 // A resume claim that finds a pending cancel against a schema change already

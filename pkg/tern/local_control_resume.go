@@ -2494,7 +2494,10 @@ func failedTaskRefusingStart(tasks []*storage.Task) *storage.Task {
 
 // startRefusedForFailedTaskMessage is the reason a start refused over a failed
 // task records on the apply and on the start request, naming the table that
-// failed, why, and what the operator does next.
+// failed, why, and what the operator does next. The why is the task's stored
+// failure message, the operator sentence the engine authored when the task
+// failed and the same one a failure recorded while the apply was running puts
+// on the apply.
 func startRefusedForFailedTaskMessage(task *storage.Task) string {
 	return fmt.Sprintf("start refused: table %s failed before the apply was stopped (%s); plan the schema change again and apply the new plan",
 		task.TableName, settledTaskFailureMessage(task))
