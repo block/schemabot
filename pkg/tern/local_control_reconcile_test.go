@@ -169,10 +169,12 @@ func TestReconcileEngineTerminalTruth_AdoptsCompletedAndMootsCancel(t *testing.T
 		},
 		pendingReconcileRequest(321, storage.ControlOperationCancel),
 	)
+	reader := newTernMetricsReader(t)
 
 	handled, err := fx.client.reconcileEngineTerminalTruthBeforeCommands(t.Context(), fx.apply, []*storage.Task{fx.task})
 	require.NoError(t, err)
 	assert.True(t, handled)
+	assert.Equal(t, int64(-1), activeAppliesDelta(t, reader), "adopting the engine's outcome releases the apply from the active-apply gauge")
 	assert.NotNil(t, fx.engine.progressReq, "the drive must read the engine's authoritative state")
 	assert.Equal(t, 0, fx.engine.cancelCount, "the doomed cancel must never reach the engine")
 	assert.Equal(t, 0, fx.engine.stopCount)

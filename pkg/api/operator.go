@@ -1262,7 +1262,8 @@ func (s *Service) driveClaimedMultiOperation(ctx context.Context, driverID int, 
 	// in-flight rollout; the driver no longer writes the parent running for
 	// multi-op, so without this the parent would linger pending during a long
 	// drive. The op lease authorizes the derived-state CAS.
-	if _, err := s.updateApplyStateFromOperations(operationLeaseCtx, driverID, apply, allowLeaseScopedFailedReopen); err != nil {
+	preDrive, err := s.updateApplyStateFromOperations(operationLeaseCtx, driverID, apply, allowLeaseScopedFailedReopen)
+	if err != nil {
 		s.logger.Error("operator: failed to project parent running before operation drive; operation will not be driven",
 			append(apply.LogAttrs(),
 				"driver", driverID, "apply_operation_id", op.ID,
@@ -1281,7 +1282,7 @@ func (s *Service) driveClaimedMultiOperation(ctx context.Context, driverID int, 
 	// Suppress the per-driver terminal observer: the aggregate terminal summary
 	// is published once by the projection CAS winner, not per deployment.
 	resumed, resumeErr := s.resumeClaimedApplyWithOptions(runCtx, driverID, apply, op.ID, op.Deployment,
-		resumeClaimedApplyOptions{suppressRecoveredObserver: true, cutover: cutover})
+		resumeClaimedApplyOptions{suppressRecoveredObserver: true, cutover: cutover, projectionOwnsGauge: preDrive.OwnsActiveAppliesGauge})
 	stopHeartbeat()
 	if !resumed && errors.Is(resumeErr, tern.ErrNoTasksForApplyOperation) {
 		// The drive failed closed: the operation has no tasks, so it can never
@@ -2189,6 +2190,10 @@ type resumeClaimedApplyOptions struct {
 	// barrier through its high-risk swap (the deployment-ordered cutover claim)
 	// rather than running its copy phase.
 	cutover bool
+	// projectionOwnsGauge leaves the active-apply gauge to the rollout
+	// projection: the claim of a paused rollout's operation does not count it
+	// again, since the projection does when the parent leaves its pause.
+	projectionOwnsGauge bool
 }
 
 func (s *Service) resumeClaimedApplyWithOptions(ctx context.Context, driverID int, apply *storage.Apply, applyOperationID int64, operationDeployment string, opts resumeClaimedApplyOptions) (bool, error) {
@@ -2247,7 +2252,7 @@ func (s *Service) resumeClaimedApplyWithOptions(ctx context.Context, driverID in
 		s.OnApplyRecovered(apply)
 	}
 
-	retryableClaim := previousState == state.Apply.FailedRetryable
+	retryableClaim := previousState == state.Apply.FailedRetryable && !opts.projectionOwnsGauge
 	if retryableClaim {
 		metrics.AdjustActiveApplies(ctx, 1, apply.Database, deployment, apply.Environment)
 	}
@@ -2925,6 +2930,10 @@ type applyProjectionResult struct {
 	// started again. The apply is waiting on the operator who stopped it, not
 	// stranded behind a projection that never ran.
 	HeldByResumableChild bool
+	// OwnsActiveAppliesGauge is true when the projection, not the operation
+	// drives, moves this apply's active-apply gauge
+	// (projectionOwnsActiveAppliesGauge).
+	OwnsActiveAppliesGauge bool
 }
 
 // anyPauseOnFailure reports whether any operation uses the on_failure=pause
@@ -2993,6 +3002,7 @@ func (s *Service) updateApplyStateFromOperations(ctx context.Context, driverID i
 	if len(ops) == 0 {
 		return applyProjectionResult{}, fmt.Errorf("derive apply state for apply %s (%d): no apply_operations rows", apply.ApplyIdentifier, apply.ID)
 	}
+	ownsGauge := projectionOwnsActiveAppliesGauge(apply, ops)
 
 	// Load the release latch only when some operation uses on_failure=pause: it
 	// is the only policy whose projection depends on whether an operator has
@@ -3101,7 +3111,7 @@ func (s *Service) updateApplyStateFromOperations(ctx context.Context, driverID i
 		s.logger.Debug("operator: derived apply state matches current; no update",
 			append(apply.LogAttrs(),
 				"driver", driverID, "operation_count", len(ops))...)
-		return applyProjectionResult{PreviousState: apply.State, DerivedState: derived, OperationCount: len(ops), ManifestHeld: manifestHeld, HeldByResumableChild: heldByResumableChild}, nil
+		return applyProjectionResult{PreviousState: apply.State, DerivedState: derived, OperationCount: len(ops), ManifestHeld: manifestHeld, HeldByResumableChild: heldByResumableChild, OwnsActiveAppliesGauge: ownsGauge}, nil
 	}
 
 	var completedAt *time.Time
@@ -3142,7 +3152,7 @@ func (s *Service) updateApplyStateFromOperations(ctx context.Context, driverID i
 		s.logger.Info("operator: derived apply state write lost a race; skipping",
 			append(apply.LogAttrs(),
 				"driver", driverID, "derived_state", derived, "operation_count", len(ops))...)
-		return applyProjectionResult{PreviousState: apply.State, DerivedState: derived, OperationCount: len(ops), ManifestHeld: manifestHeld, HeldByResumableChild: heldByResumableChild}, nil
+		return applyProjectionResult{PreviousState: apply.State, DerivedState: derived, OperationCount: len(ops), ManifestHeld: manifestHeld, HeldByResumableChild: heldByResumableChild, OwnsActiveAppliesGauge: ownsGauge}, nil
 	}
 	s.logger.Info("operator: updated derived apply state from apply_operations",
 		append(apply.LogAttrs(),
@@ -3175,32 +3185,34 @@ func (s *Service) updateApplyStateFromOperations(ctx context.Context, driverID i
 	// Own the active-apply gauge when the apply's drives suppressed it. The
 	// enqueue-time increment is keyed to the parent's primary deployment, and
 	// operation-lease-only drives suppress the parent-level metric, so the
-	// projection that wins the parent transition is the single point that must
-	// release it: -1 when the rollout first settles, and +1 if a held rollout
-	// reopens a settled parent to keep it running, so the gauge tracks whether
-	// the apply is still in flight. A stopped rollout is not settled and stays
+	// projection that wins the parent transition is the single point that moves
+	// it, on every transition into or out of the counted states
+	// (state.CountsAsActiveApply): -1 when the rollout settles or pauses for a
+	// retry, and +1 when a held rollout reopens a settled parent or a retry
+	// takes a paused one out of its pause. The operation drives' claims of a
+	// paused rollout leave the gauge to this projection (see
+	// resumeClaimedApplyOptions.projectionOwnsGauge). A stopped rollout stays
 	// counted until it is resumed to an outcome or cancelled. A legacy
 	// single-operation apply keeps decrementing in its direct parent-lease
 	// drive and is left untouched here.
-	if projectionOwnsActiveAppliesGauge(apply, ops) {
-		wasSettled := state.IsState(apply.State, state.SettledApplyStates...)
-		isSettled := state.IsState(derived, state.SettledApplyStates...)
-		switch {
-		case !wasSettled && isSettled:
+	if ownsGauge {
+		switch was, is := state.CountsAsActiveApply(apply.State), state.CountsAsActiveApply(derived); {
+		case was && !is:
 			metrics.AdjustActiveApplies(ctx, -1, apply.Database, apply.Deployment, apply.Environment)
-		case wasSettled && !isSettled:
+		case !was && is:
 			metrics.AdjustActiveApplies(ctx, 1, apply.Database, apply.Deployment, apply.Environment)
 		}
 	}
 
 	return applyProjectionResult{
-		Swapped:              true,
-		PreviousState:        apply.State,
-		DerivedState:         derived,
-		BecameTerminal:       !state.IsTerminalApplyState(apply.State) && state.IsTerminalApplyState(derived),
-		OperationCount:       len(ops),
-		ManifestHeld:         manifestHeld,
-		HeldByResumableChild: heldByResumableChild,
+		Swapped:                true,
+		PreviousState:          apply.State,
+		DerivedState:           derived,
+		BecameTerminal:         !state.IsTerminalApplyState(apply.State) && state.IsTerminalApplyState(derived),
+		OperationCount:         len(ops),
+		ManifestHeld:           manifestHeld,
+		HeldByResumableChild:   heldByResumableChild,
+		OwnsActiveAppliesGauge: ownsGauge,
 	}, nil
 }
 

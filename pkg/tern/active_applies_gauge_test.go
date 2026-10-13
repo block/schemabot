@@ -28,9 +28,15 @@ func activeAppliesDelta(t *testing.T, reader *metric.ManualReader) int64 {
 // An apply is counted on the active-apply gauge from acceptance until it
 // settles, and a stopped apply is still in progress: it waits on an operator's
 // start or cancel. So stopping a running apply leaves the count alone, and the
-// cancel that settles a stopped apply is what releases it. A retryable pause
-// was already released when it paused, so cancelling one releases nothing, and
-// stopping one counts it again until it settles.
+// cancel that settles a stopped apply is what releases it.
+//
+// Each transition is judged from the state storage holds when the command
+// lands, which is what keeps a retryable pause balanced. A drive delivers the
+// command after claiming the apply, and that claim moves a paused apply to
+// running while the operator counts it again, so the command finds it running
+// (the first two cases). The pause cases pin the transition on its own: a pause
+// was already released, so cancelling it releases nothing more and stopping it
+// counts it again.
 func TestControlTransitionsMoveTheActiveAppliesGauge(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -188,5 +194,26 @@ func TestGroupedResumeWithNoRemainingWorkReleasesTheStoppedApply(t *testing.T) {
 	require.NoError(t, r.resume(t))
 
 	require.Equal(t, state.Apply.Completed, r.applies.stored.State)
+	assert.Equal(t, int64(-1), activeAppliesDelta(t, reader))
+}
+
+// A cancel that arrives after every task already settled derives the apply's
+// state from its tasks, and that settled state releases the apply.
+func TestCancelOverSettledTasksReleasesTheGauge(t *testing.T) {
+	reader := newTernMetricsReader(t)
+	apply := &storage.Apply{
+		ID: 42, ApplyIdentifier: "apply-cancel-all-terminal", State: state.Apply.Running,
+		Database: "testdb", DatabaseType: storage.DatabaseTypeVitess, Environment: "staging",
+	}
+	task := &storage.Task{
+		ID: 7, ApplyID: apply.ID, TaskIdentifier: "task-done", Database: "testdb",
+		Namespace: "testdb", TableName: "users", State: state.Task.Completed,
+	}
+	client := newVitessControlTestClient(apply, []*storage.Task{task}, nil, &controlCaptureEngine{})
+
+	_, err := client.settleCancelAllTasksTerminal(t.Context(), apply.ID, 1, "operator")
+
+	require.NoError(t, err)
+	require.Equal(t, state.Apply.Completed, apply.State)
 	assert.Equal(t, int64(-1), activeAppliesDelta(t, reader))
 }

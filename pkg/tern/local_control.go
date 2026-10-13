@@ -2024,6 +2024,7 @@ func (c *LocalClient) handleStopAllTasksTerminal(ctx context.Context, applyID in
 		if err := c.storage.Applies().Update(ctx, apply); err != nil {
 			return nil, fmt.Errorf("update apply %s to derived state %s: %w", apply.ApplyIdentifier, derivedState, err)
 		}
+		adjustActiveAppliesForTransition(ctx, apply, oldState)
 
 		c.logger.Info("stop found all tasks terminal; apply state derived from tasks",
 			"apply_id", apply.ApplyIdentifier,
@@ -2102,6 +2103,7 @@ func (c *LocalClient) settleCancelAllTasksTerminal(ctx context.Context, applyID 
 		}
 		return c.acceptCancelOverSettledApply(ctx, apply, skippedCount, caller, err)
 	}
+	adjustActiveAppliesForTransition(ctx, apply, oldState)
 
 	c.logger.Info("cancel found all tasks terminal; apply state derived from tasks",
 		append(apply.LogAttrs(), "old_state", oldState, "skipped_count", skippedCount, "requested_by", caller)...)
@@ -2194,29 +2196,6 @@ func (c *LocalClient) markApplyCancelled(ctx context.Context, applyID int64) err
 	return nil
 }
 
-// countedAsActiveApply reports whether an apply in applyState is counted on the
-// active-apply gauge. An apply is counted from acceptance until it settles,
-// stopped included: a stopped apply is still an apply in progress, waiting on
-// an operator's start or cancel. A retryable pause is the exception, released
-// when the apply pauses and counted again when a driver reclaims it.
-func countedAsActiveApply(applyState string) bool {
-	return !state.IsState(applyState, state.SettledApplyStates...) &&
-		!state.IsState(applyState, state.Apply.FailedRetryable)
-}
-
-// adjustActiveAppliesForTransition moves the active-apply gauge for a stored
-// transition from previousState to apply.State, read from storage rather than
-// from a drive's snapshot: it releases the apply when the transition leaves the
-// counted states and counts it again when the transition re-enters them.
-func adjustActiveAppliesForTransition(ctx context.Context, apply *storage.Apply, previousState string) {
-	switch was, is := countedAsActiveApply(previousState), countedAsActiveApply(apply.State); {
-	case was && !is:
-		metrics.AdjustActiveApplies(ctx, -1, apply.Database, apply.Deployment, apply.Environment)
-	case !was && is:
-		metrics.AdjustActiveApplies(ctx, 1, apply.Database, apply.Deployment, apply.Environment)
-	}
-}
-
 // settleControlForCompletedEngineChange terminalizes a stop or cancel that the
 // engine rejected because the schema change had already completed on its
 // backend before the operation arrived. The backend's terminal outcome is
@@ -2300,6 +2279,7 @@ func (c *LocalClient) settleControlForCompletedEngineChange(ctx context.Context,
 	if err := c.storage.Applies().Update(ctx, apply); err != nil {
 		return 0, fmt.Errorf("mark apply %s completed after %s found the schema change already completed on the engine: %w", apply.ApplyIdentifier, operation, err)
 	}
+	adjustActiveAppliesForTransition(ctx, apply, previousState)
 	c.logger.Warn("engine rejected "+operation+" because the schema change already completed; apply settled as completed",
 		append(apply.LogAttrs(), "requested_by", caller, "previous_state", previousState, "error", rejection)...)
 	eventMsg := fmt.Sprintf("%s arrived after the schema change completed on the engine; apply recorded as completed (%d tasks completed, %d already terminal)",

@@ -1,6 +1,7 @@
 package api
 
 import (
+	"log/slog"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
+	"github.com/block/schemabot/pkg/tern"
 )
 
 // installManualMeterReader points the global meter provider at an in-memory
@@ -208,6 +210,36 @@ func TestUpdateApplyStateFromOperations_ActiveAppliesAccounting(t *testing.T) {
 		assert.Equal(t, int64(-1), value)
 	})
 
+	t.Run("a multi-operation rollout's retry pause is released and its retry counts it again", func(t *testing.T) {
+		// The operation drives leave the gauge to the projection, so the
+		// projection is the one owner of both halves of a retry: the pause
+		// releases the rollout, and the projection that takes it out of the
+		// pause counts it again.
+		reader := installManualMeterReader(t)
+		pauseStore := &recordingApplyStore{swapped: true}
+		_, err := newOperatorStateTestService(&listingApplyOperationStore{ops: []*storage.ApplyOperation{
+			{ID: 1, State: state.ApplyOperation.FailedRetryable},
+			{ID: 2, State: state.ApplyOperation.Completed},
+		}}, pauseStore).updateApplyStateFromOperations(t.Context(), 1, newApply(state.Apply.Running), allowLeaseScopedFailedReopen)
+		require.NoError(t, err)
+		require.NotNil(t, pauseStore.updated)
+		require.Equal(t, state.Apply.FailedRetryable, pauseStore.updated.State)
+		value, ok := activeAppliesValue(t, reader, database, deployment, environment)
+		require.True(t, ok, "pausing a rollout for a retry must release it")
+		assert.Equal(t, int64(-1), value)
+
+		retryStore := &recordingApplyStore{swapped: true}
+		_, err = newOperatorStateTestService(&listingApplyOperationStore{ops: []*storage.ApplyOperation{
+			{ID: 1, State: state.ApplyOperation.Running},
+			{ID: 2, State: state.ApplyOperation.Completed},
+		}}, retryStore).updateApplyStateFromOperations(t.Context(), 1, newApply(state.Apply.FailedRetryable), allowLeaseScopedFailedReopen)
+		require.NoError(t, err)
+		require.NotNil(t, retryStore.updated)
+		require.Equal(t, state.Apply.Running, retryStore.updated.State)
+		value, _ = activeAppliesValue(t, reader, database, deployment, environment)
+		assert.Equal(t, int64(0), value, "the retry that takes the rollout out of its pause must count it again")
+	})
+
 	t.Run("continuable reopen re-increments the gauge", func(t *testing.T) {
 		reader := installManualMeterReader(t)
 		applyStore := &recordingApplyStore{swapped: true}
@@ -225,4 +257,42 @@ func TestUpdateApplyStateFromOperations_ActiveAppliesAccounting(t *testing.T) {
 		require.True(t, ok, "reopening a failed rollout must re-acquire the active-apply gauge")
 		assert.Equal(t, int64(1), value)
 	})
+}
+
+// A drive that claims a retryable pause counts the apply again, except when the
+// rollout projection owns the gauge: the operation drives of a paused rollout
+// would otherwise each count it again, on top of the projection doing so when
+// the parent leaves its pause.
+func TestResumeClaimedApplyCountsARetryClaimOnlyWhenItOwnsTheGauge(t *testing.T) {
+	for _, tc := range []struct {
+		name                string
+		projectionOwnsGauge bool
+		wantSeries          bool
+	}{
+		{name: "a direct drive counts its retry claim", wantSeries: true},
+		{name: "a drive under a projection-owned gauge leaves it alone", projectionOwnsGauge: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			reader := installManualMeterReader(t)
+			svc := New(&mockStorageWithApplyStores{plans: &staticPlanStore{}, applies: &staticApplyStore{}}, &ServerConfig{},
+				map[string]tern.Client{"eu/production": &mockTernClient{}}, slog.New(slog.DiscardHandler))
+			apply := &storage.Apply{
+				ID: 42, ApplyIdentifier: "apply-retry-claim", Database: "testdb",
+				Deployment: "eu", Environment: "production", State: state.Apply.FailedRetryable,
+			}
+
+			resumed, err := svc.resumeClaimedApplyWithOptions(t.Context(), 1, apply, 0, "",
+				resumeClaimedApplyOptions{suppressRecoveredObserver: true, projectionOwnsGauge: tc.projectionOwnsGauge})
+
+			require.NoError(t, err)
+			require.True(t, resumed)
+			value, ok := activeAppliesValue(t, reader, "testdb", "eu", "production")
+			if !tc.wantSeries {
+				assert.False(t, ok, "the claim must leave the gauge to the projection")
+				return
+			}
+			require.True(t, ok)
+			assert.Equal(t, int64(1), value)
+		})
+	}
 }

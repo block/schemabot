@@ -246,6 +246,7 @@ func (c *LocalClient) adoptEngineTerminalTruth(ctx context.Context, apply *stora
 	if err := c.storage.Applies().Update(ctx, apply); err != nil {
 		return fmt.Errorf("adopt engine terminal state %s for apply %s (database %s): %w", applyState, apply.ApplyIdentifier, apply.Database, err)
 	}
+	releaseActiveApplyForDriveOutcome(ctx, apply, previousState)
 	c.logger.Warn("engine reached a terminal state before a pending stop/cancel was consumed; apply settled to the engine's outcome",
 		append(apply.LogAttrs(),
 			"engine_state", string(progress.State),

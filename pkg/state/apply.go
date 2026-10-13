@@ -550,6 +550,15 @@ var SettledApplyStates = []string{
 	Apply.Reverted,
 }
 
+// CountsAsActiveApply reports whether an apply in applyState is counted on the
+// active-apply gauge. An apply is counted from acceptance until it settles,
+// stopped included: a stopped apply is still in progress, waiting on an
+// operator's start or cancel. A retryable pause is the exception, released when
+// the apply pauses and counted again when a driver reclaims it.
+func CountsAsActiveApply(applyState string) bool {
+	return !IsState(applyState, SettledApplyStates...) && !IsState(applyState, Apply.FailedRetryable)
+}
+
 // IsManifestGatedVerdict reports whether a derived apply state asserts a
 // whole-generation outcome: completed claims every declared operation applied,
 // and reverted claims every declared operation was unwound. Neither claim is

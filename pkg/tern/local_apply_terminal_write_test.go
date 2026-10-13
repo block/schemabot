@@ -132,10 +132,12 @@ func TestResumeApplyWithTasks_NoRemainingWorkSettlesMootedRequests(t *testing.T)
 	taskStore.tasks = tasks
 	observer := &terminalRecordingObserver{}
 	c.SetObserver(apply.ID, observer)
+	reader := newTernMetricsReader(t)
 
 	require.NoError(t, c.resumeApplyWithTasks(t.Context(), apply, nil, tasks, nil, false, false))
 
 	assert.Equal(t, state.Apply.Completed, applies.stored.State)
+	assert.Equal(t, int64(-1), activeAppliesDelta(t, reader), "completing the apply releases it from the active-apply gauge")
 	require.Len(t, controlRequests.requests, 1)
 	assert.Equal(t, storage.ControlRequestCompleted, controlRequests.requests[0].Status,
 		"the completed outcome moots the pending revert")

@@ -12,7 +12,6 @@ import (
 
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
-	"github.com/block/schemabot/pkg/metrics"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/routing"
 	"github.com/block/schemabot/pkg/state"
@@ -1400,12 +1399,7 @@ func (c *LocalClient) launchAtomicResume(ctx context.Context, apply *storage.App
 				reconcileErr = &postTerminalReconcileError{storedState: terminalState, err: err}
 			}
 		}
-		// The drive's snapshot of a stopped apply it was started on is still
-		// counted (countedAsActiveApply), so only a settled snapshot was released
-		// already, and a stopped outcome stays counted.
-		if !state.IsState(oldApplyState, state.SettledApplyStates...) && !state.IsState(terminalState, state.Apply.Stopped) {
-			metrics.AdjustActiveApplies(ctx, -1, apply.Database, apply.Deployment, apply.Environment)
-		}
+		releaseActiveApplyForDriveOutcome(ctx, apply, oldApplyState)
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStateTransition, storage.LogSourceSchemaBot,
 			"All tasks already terminal on resume (final schema check shows no remaining changes)", oldApplyState, terminalState)
 		// A previous drive can have settled every task and exited before it
@@ -2681,6 +2675,7 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 			// recovery retries, and notify the observer only after a durable write.
 			return fmt.Errorf("complete task-less apply %s during recovery: %w", apply.ApplyIdentifier, err)
 		}
+		releaseActiveApplyForDriveOutcome(ctx, apply, previousState)
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStateTransition, storage.LogSourceSchemaBot,
 			"Apply owns no task work; completed without engine work", previousState, state.Apply.Completed)
 		c.notifyTerminalObserver(apply, tasks)
@@ -2773,6 +2768,7 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 	if len(activeTasks) == 0 {
 		logger.Info("all tasks already completed, marking apply as completed")
 		now := time.Now()
+		claimedState := apply.State
 		apply.State = state.Apply.Completed
 		apply.CompletedAt = &now
 		apply.UpdatedAt = now
@@ -2787,6 +2783,7 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 		if err := c.storage.Applies().Update(ctx, apply); err != nil {
 			return fmt.Errorf("mark resumed apply %s completed after re-plan found no remaining work: %w", apply.ApplyIdentifier, err)
 		}
+		releaseActiveApplyForDriveOutcome(ctx, apply, claimedState)
 		// The outcome is stored from here, so a start that cannot be answered
 		// is reconciliation left undone, not a failure of the schema change:
 		// the stored outcome still owes its settlement and summary, and the
