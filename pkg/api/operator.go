@@ -1679,6 +1679,15 @@ func (s *Service) recoverApplyOperationProjection(ctx context.Context, driverID 
 	}
 	metrics.RecordOperatorOperationProjectionRepair(ctx, apply.Database, apply.Deployment, apply.Environment, result.DerivedState)
 
+	// The drive that settled these operations never stored the parent's
+	// outcome, so it never released the apply either: a drive releases only
+	// after its own parent write lands. A projection that owns the gauge already
+	// moved it; for a single-operation apply this repair is the one stored
+	// transition of the parent, so it moves the gauge here.
+	if !result.OwnsActiveAppliesGauge {
+		adjustActiveAppliesForProjectedTransition(ctx, apply, result.PreviousState, result.DerivedState)
+	}
+
 	// Settle first so the summary below can disclose a command this apply outran;
 	// see recoverApplyOperation for why a settle failure does not hold it back.
 	if err := s.completePendingControlRequestsIfApplyResolved(applyLeaseCtx, s.driverLogger(driverID), apply.ID); err != nil {
@@ -2975,7 +2984,9 @@ func anyPauseOnFailure(ops []*storage.ApplyOperation) bool {
 // suppress the parent-level gauge in their own drive, so the projection that
 // wins the parent transition is the single point that must adjust it. A legacy
 // single-operation apply drives under the parent lease and releases the gauge
-// in its direct drive, so its projection leaves the gauge alone.
+// in its direct drive, so its projection leaves the gauge alone; only the
+// repair of a parent its drive left behind moves it for such an apply (see
+// recoverApplyOperationProjection).
 func projectionOwnsActiveAppliesGauge(apply *storage.Apply, ops []*storage.ApplyOperation) bool {
 	return len(ops) > 1 || len(apply.MissingExpectedOperationKeys(ops)) > 0
 }
@@ -3217,14 +3228,10 @@ func (s *Service) updateApplyStateFromOperations(ctx context.Context, driverID i
 	// resumeClaimedApplyOptions.projectionOwnsGauge). A stopped rollout stays
 	// counted until it is resumed to an outcome or cancelled. A legacy
 	// single-operation apply keeps decrementing in its direct parent-lease
-	// drive and is left untouched here.
+	// drive and is left untouched here, unless no drive is left to do it (see
+	// recoverApplyOperationProjection).
 	if ownsGauge {
-		switch was, is := state.CountsAsActiveApply(apply.State), state.CountsAsActiveApply(derived); {
-		case was && !is:
-			metrics.AdjustActiveApplies(ctx, -1, apply.Database, apply.Deployment, apply.Environment)
-		case !was && is:
-			metrics.AdjustActiveApplies(ctx, 1, apply.Database, apply.Deployment, apply.Environment)
-		}
+		adjustActiveAppliesForProjectedTransition(ctx, apply, apply.State, derived)
 	}
 
 	return applyProjectionResult{
@@ -3237,6 +3244,20 @@ func (s *Service) updateApplyStateFromOperations(ctx context.Context, driverID i
 		HeldByResumableChild:   heldByResumableChild,
 		OwnsActiveAppliesGauge: ownsGauge,
 	}, nil
+}
+
+// adjustActiveAppliesForProjectedTransition moves the active-apply gauge for a
+// parent transition a projection stored from previousState to derived: it
+// releases the apply when the transition leaves the counted states
+// (state.CountsAsActiveApply) and counts it again when the transition
+// re-enters them.
+func adjustActiveAppliesForProjectedTransition(ctx context.Context, apply *storage.Apply, previousState, derived string) {
+	switch was, is := state.CountsAsActiveApply(previousState), state.CountsAsActiveApply(derived); {
+	case was && !is:
+		metrics.AdjustActiveApplies(ctx, -1, apply.Database, apply.Deployment, apply.Environment)
+	case !was && is:
+		metrics.AdjustActiveApplies(ctx, 1, apply.Database, apply.Deployment, apply.Environment)
+	}
 }
 
 // publishTerminalSummaryIfWon publishes the apply-level terminal summary when

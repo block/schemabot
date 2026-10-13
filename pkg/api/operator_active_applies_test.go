@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"log/slog"
 	"testing"
 
@@ -293,6 +294,122 @@ func TestResumeClaimedApplyCountsARetryClaimOnlyWhenItOwnsTheGauge(t *testing.T)
 			}
 			require.True(t, ok)
 			assert.Equal(t, int64(1), value)
+		})
+	}
+}
+
+// twoOperationStore serves the claimed operation through recoverOperationStore
+// and lists a sibling beside it, so the apply reads as a multi-operation
+// rollout.
+type twoOperationStore struct {
+	recoverOperationStore
+	sibling storage.ApplyOperation
+}
+
+func (s *twoOperationStore) ListByApply(ctx context.Context, applyID int64) ([]*storage.ApplyOperation, error) {
+	ops, err := s.recoverOperationStore.ListByApply(ctx, applyID)
+	if err != nil {
+		return nil, err
+	}
+	sibling := s.sibling
+	return append(ops, &sibling), nil
+}
+
+// An operation drive that claims a multi-operation rollout paused for a retry
+// counts the rollout once: the projection that takes the parent out of its
+// pause counts it, and the drive's own retry claim leaves the gauge to that
+// projection.
+func TestRecoverMultiApplyOperation_PausedRolloutClaimCountsTheApplyOnce(t *testing.T) {
+	reader := installManualMeterReader(t)
+	applyStore := &casApplyStore{
+		template: storage.Apply{
+			ID: 7, ApplyIdentifier: "apply-paused-rollout", Database: "testdb",
+			DatabaseType: storage.DatabaseTypeMySQL, Environment: "staging", Deployment: "west",
+		},
+		state: state.Apply.FailedRetryable,
+	}
+	claimed := storage.ApplyOperation{ID: 42, ApplyID: 7, Deployment: "west", State: state.ApplyOperation.Running}
+	opStore := &twoOperationStore{
+		recoverOperationStore: recoverOperationStore{op: &claimed},
+		sibling:               storage.ApplyOperation{ID: 43, ApplyID: 7, Deployment: "east", State: state.ApplyOperation.Pending},
+	}
+	svc := New(
+		&recoverTestStorage{
+			applies: applyStore, ops: opStore, control: &fakeControlRequestStore{},
+			tasks: &stubTaskStore{tasks: []*storage.Task{{ID: 1, ApplyID: 7, TaskIdentifier: "task-1", State: state.Task.Running}}},
+		},
+		testServerConfig(),
+		map[string]tern.Client{"west/staging": &mockTernClient{}},
+		slog.New(slog.DiscardHandler),
+	)
+
+	op := claimed
+	svc.recoverMultiApplyOperation(t.Context(), 1, &op, storage.OperationLease{})
+
+	assert.Equal(t, state.Apply.Running, applyStore.currentState())
+	value, ok := activeAppliesValue(t, reader, "testdb", "west", "staging")
+	require.True(t, ok, "taking the rollout out of its pause must count it again")
+	assert.Equal(t, int64(1), value, "the paused rollout is counted once when its retry claims it")
+}
+
+// projectionRepairApplyStore hands the operation-projection repair one stranded
+// parent, with the lease the claim stamps on it.
+type projectionRepairApplyStore struct {
+	casApplyStore
+}
+
+func (s *projectionRepairApplyStore) FindNextApplyForOperationProjection(ctx context.Context, owner string) (*storage.Apply, error) {
+	apply, err := s.Get(ctx, s.template.ID)
+	if err != nil {
+		return nil, err
+	}
+	apply.LeaseOwner = owner
+	apply.LeaseToken = "repair-lease-token"
+	return apply, nil
+}
+
+// A single-operation apply whose drive settled its operation but lost the
+// apply lease before storing the parent outcome (a task-less cancel deferred to
+// the projection, for one) is settled by the operation-projection repair. No
+// drive released that apply, so the repair releases it when it settles the
+// parent, and keeps a stopped parent counted.
+func TestRecoverApplyOperationProjection_ReleasesASingleOperationApplyItSettles(t *testing.T) {
+	tests := []struct {
+		name        string
+		opState     string
+		wantState   string
+		wantRelease bool
+	}{
+		{name: "a cancelled operation settles and releases the apply", opState: state.ApplyOperation.Cancelled, wantState: state.Apply.Cancelled, wantRelease: true},
+		{name: "a completed operation settles and releases the apply", opState: state.ApplyOperation.Completed, wantState: state.Apply.Completed, wantRelease: true},
+		{name: "a stopped operation keeps the apply counted", opState: state.ApplyOperation.Stopped, wantState: state.Apply.Stopped},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			reader := installManualMeterReader(t)
+			applyStore := &projectionRepairApplyStore{casApplyStore: casApplyStore{
+				template: storage.Apply{
+					ID: 7, ApplyIdentifier: "apply-stranded", Database: "testdb",
+					DatabaseType: storage.DatabaseTypeMySQL, Environment: "staging", Deployment: "west",
+				},
+				state: state.Apply.Running,
+			}}
+			opStore := &recoverOperationStore{op: &storage.ApplyOperation{ID: 42, ApplyID: 7, Deployment: "west", State: tt.opState}}
+			svc := New(
+				&recoverTestStorage{applies: applyStore, ops: opStore, control: &fakeControlRequestStore{}, tasks: &stubTaskStore{}},
+				testServerConfig(), nil, slog.New(slog.DiscardHandler),
+			)
+
+			require.True(t, svc.recoverApplyOperationProjection(t.Context(), 1, "driver-1"))
+
+			assert.Equal(t, tt.wantState, applyStore.currentState())
+			value, ok := activeAppliesValue(t, reader, "testdb", "west", "staging")
+			if !tt.wantRelease {
+				assert.False(t, ok, "a stopped apply stays counted")
+				return
+			}
+			require.True(t, ok, "settling a stranded apply must release it")
+			assert.Equal(t, int64(-1), value)
 		})
 	}
 }

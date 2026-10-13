@@ -217,3 +217,31 @@ func TestCancelOverSettledTasksReleasesTheGauge(t *testing.T) {
 	require.Equal(t, state.Apply.Completed, apply.State)
 	assert.Equal(t, int64(-1), activeAppliesDelta(t, reader))
 }
+
+// A drive releases the active-apply gauge only for an outcome that leaves the
+// counted states, and only when the apply it claimed had not settled already:
+// a settled claim was released when it settled, and a stopped outcome stays
+// counted until the apply settles.
+func TestReleaseActiveApplyForDriveOutcomeSkipsCountedOutcomesAndSettledClaims(t *testing.T) {
+	tests := []struct {
+		name         string
+		claimedState string
+		outcome      string
+		wantDelta    int64
+	}{
+		{name: "a settled outcome of a running claim releases", claimedState: state.Apply.Running, outcome: state.Apply.Completed, wantDelta: -1},
+		{name: "a settled outcome of a stopped claim releases", claimedState: state.Apply.Stopped, outcome: state.Apply.Cancelled, wantDelta: -1},
+		{name: "an outcome that is still counted releases nothing", claimedState: state.Apply.Running, outcome: state.Apply.Stopped, wantDelta: 0},
+		{name: "a claim that had already settled releases nothing", claimedState: state.Apply.Completed, outcome: state.Apply.Cancelled, wantDelta: 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			reader := newTernMetricsReader(t)
+			apply := failureLogTestApply(tt.outcome, 0)
+
+			releaseActiveApplyForDriveOutcome(t.Context(), apply, tt.claimedState)
+
+			assert.Equal(t, tt.wantDelta, activeAppliesDelta(t, reader))
+		})
+	}
+}
