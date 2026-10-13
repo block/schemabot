@@ -11,7 +11,7 @@ import (
 	"github.com/block/schemabot/pkg/engine"
 )
 
-// A statement-scope refusal quotes the identifier the schema author wrote, so
+// A statement-phase refusal quotes the identifier the schema author wrote, so
 // one whose column name carries the reserved cause separator must still reach
 // the operator as the one cause the engine issued. The disabled policy returns
 // the refusal before the size gate, so no target connection is needed.
