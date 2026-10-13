@@ -242,6 +242,40 @@ func TestReconcileEngineTerminalTruth_RefusedTaskWriteLeavesTheApplyUnsettled(t 
 	assert.Contains(t, err.Error(), "task-reconcile", "the error names the task whose outcome did not land")
 	assert.False(t, handled)
 	assert.Equal(t, state.Task.WaitingForDeploy, fx.task.State, "the task keeps the state storage holds")
+	assert.Nil(t, fx.task.CompletedAt, "the task keeps the completion storage holds")
+	assert.Equal(t, 0, fx.task.ProgressPercent, "the task keeps the progress storage holds")
+	assert.Equal(t, state.Apply.ValidatingDeployRequest, fx.apply.State, "the apply is not recorded completed over the waiting task")
+	controlReq, err := fx.controlRequests.GetPending(t.Context(), fx.apply.ID, storage.ControlOperationCancel)
+	require.NoError(t, err)
+	assert.NotNil(t, controlReq, "the cancel stays pending for the claim that reconciles next")
+}
+
+// The engine's backend already completed the change, but the drive is
+// cancelled as it adopts that outcome onto the task and the write fails under
+// the cancelled context. The failure describes the cancellation, not a refused
+// verdict, so the reconcile returns the cancellation rather than
+// ErrTaskVerdictRefused, with the task, the apply, and the pending cancel as
+// storage holds them: the commands the outcome would moot stay pending for the
+// claim that reconciles next.
+func TestReconcileEngineTerminalTruth_CancelledDriveLeavesTheApplyUnsettled(t *testing.T) {
+	fx := newReconcileFixture(
+		&fakeControlEngine{
+			externallyAuthoritative: true,
+			progressResult:          &engine.ProgressResult{State: engine.StateCompleted},
+		},
+		pendingReconcileRequest(321, storage.ControlOperationCancel),
+	)
+	fx.storage.tasks.(*exactProgressTaskStore).updateErr = func(ctx context.Context, _ *storage.Task) error { return ctx.Err() }
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	handled, err := fx.client.reconcileEngineTerminalTruthBeforeCommands(ctx, fx.apply, []*storage.Task{fx.task})
+
+	require.ErrorIs(t, err, context.Canceled)
+	require.NotErrorIs(t, err, ErrTaskVerdictRefused, "a cancelled drive's write failure is not a refused verdict")
+	assert.False(t, handled)
+	assert.Equal(t, state.Task.WaitingForDeploy, fx.task.State, "the task keeps the state storage holds")
+	assert.Nil(t, fx.task.CompletedAt, "the task keeps the completion storage holds")
 	assert.Equal(t, state.Apply.ValidatingDeployRequest, fx.apply.State, "the apply is not recorded completed over the waiting task")
 	controlReq, err := fx.controlRequests.GetPending(t.Context(), fx.apply.ID, storage.ControlOperationCancel)
 	require.NoError(t, err)
@@ -290,6 +324,8 @@ func TestReconcileEngineTerminalTruth_PartlyAdoptedTaskSetLeavesTheApplyUnsettle
 	assert.False(t, handled)
 	assert.Equal(t, state.Task.Failed, fx.task.State, "the verdict that landed stays stored")
 	assert.Equal(t, state.Task.WaitingForDeploy, second.State, "the refused task keeps the state storage holds")
+	assert.Empty(t, second.ErrorMessage, "the refused task keeps the error message storage holds")
+	assert.Nil(t, second.CompletedAt, "the refused task keeps the completion storage holds")
 	assert.Equal(t, state.Apply.ValidatingDeployRequest, fx.apply.State, "the apply is not recorded failed over the waiting task")
 	controlReq, err := fx.controlRequests.GetPending(t.Context(), fx.apply.ID, storage.ControlOperationStop)
 	require.NoError(t, err)

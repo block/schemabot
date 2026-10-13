@@ -211,6 +211,7 @@ func (c *LocalClient) adoptEngineTerminalTruth(ctx context.Context, apply *stora
 			skippedCount++
 			continue
 		}
+		asStored := *task
 		if state.IsState(taskState, state.Task.Completed) {
 			task.ProgressPercent = 100
 		}
@@ -220,14 +221,22 @@ func (c *LocalClient) adoptEngineTerminalTruth(ctx context.Context, apply *stora
 		task.CompletedAt = &now
 		// The apply's outcome is recorded only over task rows that carry it: a
 		// task left active under a settled apply is work storage still offers to
-		// a drive. A refused write returns with the apply untouched, for the next
-		// claim to reconcile again. Tasks adopted before it stay adopted; the
-		// error wraps ErrTaskVerdictRefused so an operation drive's row is not
-		// derived from that partly settled set.
+		// a drive. A refused write puts the in-memory task back to what storage
+		// holds and returns with the apply untouched, for the next claim to
+		// reconcile again. Tasks adopted before it stay adopted. refusedTaskVerdict
+		// classifies the refusal as the failure helpers do and wraps
+		// ErrTaskVerdictRefused so an operation drive's row is not derived from
+		// the partly settled set; a cancelled drive, which it hands back with nil,
+		// returns the cancellation here instead, since the reconcile that called
+		// this must not go on to settle the commands the outcome would moot.
 		if err := c.persistTaskStateTransition(ctx, task, task.ApplyID, taskState,
 			fmt.Sprintf("Task %s adopted the engine's %s outcome (the engine reached it before the pending command was consumed)", task.TaskIdentifier, taskState)); err != nil {
-			return fmt.Errorf("%w: adopt engine terminal state %s for task %s of apply %s (database %s): %w",
-				ErrTaskVerdictRefused, taskState, task.TaskIdentifier, apply.ApplyIdentifier, apply.Database, err)
+			*task = asStored
+			if verdictErr := c.refusedTaskVerdict(ctx, apply, task, taskState, progress.ErrorMessage, err); verdictErr != nil {
+				return fmt.Errorf("adopt engine terminal state %s for task %s: %w", taskState, task.TaskIdentifier, verdictErr)
+			}
+			return fmt.Errorf("adopt engine terminal state %s for task %s of apply %s (database %s) on a cancelled drive: %w",
+				taskState, task.TaskIdentifier, apply.ApplyIdentifier, apply.Database, context.Cause(ctx))
 		}
 		settledCount++
 	}

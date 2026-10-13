@@ -1170,8 +1170,10 @@ engine that holds the record in-process answers from it when the command arrives
 refuses a stop or cancel that would replace an outcome the change already settled on, and the
 drive resolves the request and records that outcome. And only settled outcomes are adopted, never
 a remote state still in motion. *Enforced:* terminal-truth preflights on the control paths
-(`pkg/tern/local_control.go`, `pkg/tern/grpc_control_resend.go`); the in-process engine's settled
-outcome checks on stop and cancel (`pkg/engine/spirit/control.go`).
+(`pkg/tern/local_control.go`, `pkg/tern/grpc_control_resend.go`); the drive's adoption of the
+engine's settled outcome onto the task rows before a pending command is consumed
+(`pkg/tern/local_control_reconcile.go`); the in-process engine's settled outcome checks on stop
+and cancel (`pkg/engine/spirit/control.go`).
 
 ### CO-4: Stop wins
 
