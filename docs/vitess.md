@@ -26,7 +26,7 @@ these database access permissions on every database SchemaBot manages:
 |---|---|
 | `read_branch` | Wait for a branch to be ready, read its schema, list its keyspaces, and read each keyspace's VSchema. Also read the production branch: its schema during plan, its schema, keyspaces, and VSchema during pull, and its keyspaces during progress polling |
 | `create_branch` | Create the branch each apply prepares its schema change on |
-| `delete_branch` | Delete that branch when the apply fails before its deploy request exists (see [Branch cleanup](#branch-cleanup)) |
+| `delete_branch` | Delete that branch when the apply fails or is cancelled before its deploy request exists (see [Branch cleanup](#branch-cleanup)) |
 | `connect_branch` | Create the branch password used to run DDL on the branch |
 | `write_branch_vschema` | Apply VSchema changes to the branch |
 | `create_deploy_request` | Create the deploy request and drive it: deploy, cutover, cancel, close, revert, and skip revert |
@@ -59,20 +59,24 @@ deploy request, and progress shows its state with no per-shard row counts.
 ## Branch cleanup
 
 `delete_branch` is the permission most likely to be missing, because only a
-failure path uses it. An apply prepares its schema change on a branch it
-creates, and the deploy request deletes that branch once it exists. When the
-apply fails after the branch exists and before the deploy request is
+failure or a cancel uses it. An apply prepares its schema change on a branch
+it creates, and the deploy request deletes that branch once it exists. When
+the apply fails after the branch exists and before the deploy request is
 created, SchemaBot deletes the branch itself so it does not hold branch
 quota. That covers any failure in that window, on an apply's first drive and
-on a drive that resumed it. Two cases keep the branch. A branch an operator
-supplied is never deleted. A drive that ends before it finishes, because its
-lease was lost, it stalled, or its instance shut down, keeps a branch the
-apply's stored state names, for the driver that resumes the apply from it; a
-branch the stored state does not name cannot be resumed, so it is still
-deleted.
+on a drive that resumed it. An operator cancel in that window deletes the
+branch the same way, and the apply log names the branch it removed. Two
+cases keep the branch. A branch an operator supplied is never deleted; a
+cancel says so on the apply log. A drive that ends before it finishes,
+because its lease was lost, it stalled, or its instance shut down, keeps a
+branch the apply's stored state names, for the driver that resumes the apply
+from it; a branch the stored state does not name cannot be resumed, so it is
+still deleted.
 
 Without `delete_branch` the delete is refused. The apply still fails with its
 own error, and SchemaBot logs the refused delete at error level with the
-organization, database, and branch to delete by hand. Grant only
-`delete_branch`, not `delete_production_branch`: SchemaBot deletes only the
-development branches it creates.
+organization, database, and branch to delete by hand. A cancel still
+resolves, and its apply log names the branch left in place and says to
+delete it by hand. Grant only `delete_branch`, not
+`delete_production_branch`: SchemaBot deletes only the development branches
+it creates.

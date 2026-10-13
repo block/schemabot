@@ -26,8 +26,9 @@ var (
 	// ErrLockIntentChanged is returned when the lock's pending plan is no longer
 	// the one a caller observed: an apply's captured lock owner or pending plan
 	// no longer matches at durable apply creation time, a conditional acquire
-	// finds the same owner's lock pinned to another intent, or a row-pinned
-	// release finds the row re-acquired for another plan.
+	// finds the same owner's lock pinned to another intent or released since a
+	// pin was observed, or a row-pinned release finds the row re-acquired for
+	// another plan.
 	ErrLockIntentChanged = errors.New("lock intent changed")
 
 	// ErrCheckNotFound is returned when a check does not exist.

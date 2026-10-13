@@ -793,7 +793,10 @@ func RecordPromotionConfigErrorBlock(ctx context.Context, repository, database, 
 }
 
 // AdjustActiveApplies increments or decrements the active applies gauge.
-// Use delta=1 when an apply is accepted and delta=-1 when it reaches a terminal state.
+// Use delta=1 when an apply is accepted and delta=-1 when it settles
+// (completed, failed, cancelled, or reverted). A stopped apply stays counted
+// until it settles; a retryable pause is released when it pauses and counted
+// again when a driver reclaims it.
 func AdjustActiveApplies(ctx context.Context, delta int64, database, deployment, environment string) {
 	addUpDownCounter(ctx, "schemabot.active_applies", delta,
 		"Number of currently in-progress applies", "{apply}",

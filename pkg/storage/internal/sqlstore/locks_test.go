@@ -3,8 +3,10 @@
 package sqlstore
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 
@@ -148,7 +150,8 @@ func TestLockStore_Acquire_RefreshSameOwnerValueAlreadyMatches(t *testing.T) {
 // observed, so a zero-row result has one more cause to tell apart: the same
 // owner replaced the pin in between. Under changed-rows semantics the refresh
 // still succeeds when the concurrent write set the very plan this caller
-// wanted, and reports ErrLockIntentChanged when it set any other plan.
+// wanted, and reports ErrLockIntentChanged when it set any other plan or
+// released the lock.
 func TestLockStore_AcquireIfPendingPlanID_RefreshObservedPinReplaced(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
@@ -204,6 +207,15 @@ func TestLockStore_AcquireIfPendingPlanID_RefreshObservedPinReplaced(t *testing.
 	require.NoError(t, err)
 	require.NotNil(t, lock)
 	assert.Equal(t, "plan-3", lock.PendingPlanID)
+
+	// The lock is released instead: the intent this caller observed is gone
+	// just the same, so the refresh reports the intent change, not a missing
+	// lock, and re-creates nothing.
+	require.NoError(t, store.ForceRelease(ctx, "testdb", "vitess"))
+	require.ErrorIs(t, store.refreshPendingConfirmation(ctx, wanted, asObserved, &observed), storage.ErrLockIntentChanged)
+	lock, err = store.Get(ctx, "testdb", "vitess")
+	require.NoError(t, err)
+	assert.Nil(t, lock, "the refused refresh must not re-create the released lock")
 }
 
 // When the lock changes hands between reading it and refreshing its confirmation
@@ -271,6 +283,97 @@ func TestLockStore_Acquire_RefreshOwnerNoLongerMatches(t *testing.T) {
 			PendingPlanID: "plan-1",
 		}, nil)
 	require.ErrorIs(t, err, storage.ErrLockNotFound)
+}
+
+// A caller that observed an unpinned lock (empty observed pin) has no pin to
+// have lost, so a lock released before its write is not an intent change: the
+// refresh reports the lock gone, as it does for an unconditional acquire.
+func TestLockStore_RefreshObservedUnpinnedLockReleased(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := &lockStore{db: newRebindDB(testDB, MySQLDialect{}), dialect: MySQLDialect{}, identity: MySQLDialect{}, classifier: NewMySQLErrorClassifier()}
+
+	require.NoError(t, store.Acquire(ctx, &storage.Lock{
+		DatabaseName: "testdb", DatabaseType: "vitess", Repository: "org/repo", PullRequest: 123, Owner: "org/repo#123",
+	}))
+	observed := ""
+	wanted := &storage.Lock{DatabaseName: "testdb", DatabaseType: "vitess", Owner: "org/repo#123", PendingPlanID: "plan-1"}
+	asObserved := &storage.Lock{DatabaseName: "testdb", DatabaseType: "vitess", Owner: "org/repo#123"}
+
+	require.NoError(t, store.ForceRelease(ctx, "testdb", "vitess"))
+	err := store.refreshPendingConfirmation(ctx, wanted, asObserved, &observed)
+	require.ErrorIs(t, err, storage.ErrLockNotFound)
+	require.NotErrorIs(t, err, storage.ErrLockIntentChanged)
+}
+
+// releaseOnRefreshBinder releases the lock the moment the acquire's refresh
+// UPDATE is bound, so the release lands between the acquire's read of the
+// owner's lock and its write: the window in which the lock the caller read
+// is gone by the time it writes.
+type releaseOnRefreshBinder struct {
+	t        *testing.T
+	store    *lockStore
+	released int
+}
+
+func (b *releaseOnRefreshBinder) Rebind(query string) string {
+	if strings.Contains(query, "SET pending_plan_id") && b.released == 0 {
+		b.released++
+		require.NoError(b.t, b.store.ForceRelease(b.t.Context(), "testdb", "vitess"))
+	}
+	return MySQLDialect{}.Rebind(query)
+}
+
+// An acquire that observed no pin, or none at all, reads the owner's own
+// unpinned lock and finds it released by the time it writes. A free key is the
+// state the caller asked for, so the acquire claims it instead of failing: the
+// lock exists again under the caller's owner and pin, created by this acquire.
+func TestLockStore_Acquire_LockReleasedBetweenReadAndWriteIsClaimed(t *testing.T) {
+	cases := []struct {
+		name    string
+		acquire func(ctx context.Context, store *lockStore, lock *storage.Lock) error
+	}{
+		{
+			name: "unconditional acquire",
+			acquire: func(ctx context.Context, store *lockStore, lock *storage.Lock) error {
+				return store.Acquire(ctx, lock)
+			},
+		},
+		{
+			name: "acquire that observed no pin",
+			acquire: func(ctx context.Context, store *lockStore, lock *storage.Lock) error {
+				return store.AcquireIfPendingPlanID(ctx, lock, "")
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			clearTables(t)
+			ctx := t.Context()
+			releaser := &lockStore{db: newRebindDB(testDB, MySQLDialect{}), dialect: MySQLDialect{}, identity: MySQLDialect{}, classifier: NewMySQLErrorClassifier()}
+			binder := &releaseOnRefreshBinder{t: t, store: releaser}
+			store := &lockStore{db: newRebindDB(testDB, binder), dialect: MySQLDialect{}, identity: MySQLDialect{}, classifier: NewMySQLErrorClassifier()}
+
+			require.NoError(t, releaser.Acquire(ctx, &storage.Lock{
+				DatabaseName: "testdb", DatabaseType: "vitess", Repository: "org/repo", PullRequest: 123, Owner: "org/repo#123",
+			}))
+			lock := &storage.Lock{
+				DatabaseName: "testdb", DatabaseType: "vitess", Repository: "org/repo", PullRequest: 123, Owner: "org/repo#123",
+				PendingPlanID: "plan-1",
+			}
+
+			require.NoError(t, tc.acquire(ctx, store, lock))
+
+			assert.Equal(t, 1, binder.released, "the release landed between the acquire's read and its write")
+			assert.NotZero(t, lock.ID, "the acquire created the lock row")
+			current, err := store.Get(ctx, "testdb", "vitess")
+			require.NoError(t, err)
+			require.NotNil(t, current)
+			assert.Equal(t, lock.ID, current.ID)
+			assert.Equal(t, "org/repo#123", current.Owner)
+			assert.Equal(t, "plan-1", current.PendingPlanID)
+		})
+	}
 }
 
 func TestLockStore_Update(t *testing.T) {

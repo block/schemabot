@@ -1414,6 +1414,7 @@ var optionalCapabilityVerdicts = map[reflect.Type]bool{
 	reflect.TypeFor[engine.DeferredCutoverSignalChecker]():    false,
 	reflect.TypeFor[engine.ExternallyAuthoritativeProgress](): false,
 	reflect.TypeFor[engine.CancelledArtifactReleaser]():       false,
+	reflect.TypeFor[engine.CancelledResumeStateReclaimer]():   false,
 	reflect.TypeFor[engine.ControlResumeValidator]():          false,
 	reflect.TypeFor[engine.ShardKeyedPlanning]():              false,
 }

@@ -1627,6 +1627,7 @@ func (c *GRPCClient) terminalizeUndispatchedApply(ctx context.Context, apply *st
 	if err := c.storage.Applies().Update(ctx, apply); err != nil {
 		return fmt.Errorf("update undispatched %s gRPC apply %s: %w", terminalization.controlOperation, apply.ApplyIdentifier, err)
 	}
+	releaseActiveApplyForDriveOutcome(ctx, apply, oldState)
 	c.logApplyStateTransition(ctx, apply, storage.LogLevelInfo, fmt.Sprintf("Remote apply %s before dispatch: %s%s", terminalization.verb, apply.State, callerApplyLogSuffix(caller)), oldState)
 	return nil
 }
@@ -4176,7 +4177,12 @@ func (c *GRPCClient) persistTerminalStateFromRemote(ctx context.Context, storedA
 	}
 	c.logApplyStateTransition(ctx, storedApply, remoteTerminalApplyLogLevel(storedApply), remoteTerminalApplyLogMessage(storedApply), oldState)
 	*remoteApply = *storedApply
-	metrics.AdjustActiveApplies(ctx, -1, storedApply.Database, storedApply.Deployment, storedApply.Environment)
+	// A stopped apply stays counted until it settles (state.CountsAsActiveApply), so
+	// the start that resumes it owes no re-count and its outcome releases it
+	// once.
+	if !state.IsState(storedApply.State, state.Apply.Stopped) {
+		metrics.AdjustActiveApplies(ctx, -1, storedApply.Database, storedApply.Deployment, storedApply.Environment)
+	}
 	return nil
 }
 

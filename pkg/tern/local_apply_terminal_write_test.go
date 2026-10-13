@@ -109,6 +109,125 @@ func TestFinalizeSequentialApply_OutcomeSideEffectsWaitForTheStoredOutcome(t *te
 	}
 }
 
+// A sequential apply's first table failed permanently with a second table still
+// queued behind it. The queued table must be cancelled before the apply is
+// recorded failed: a pending row under a settled apply is work storage still
+// offers to a drive. When storage refuses that cancellation, the drive returns
+// the error with the apply still running and no terminal summary posted, for
+// the next claim to finalize again; an operation drive returns the same error
+// without adopting the outcome in memory, so the operator leaves its row as
+// found rather than deriving it over the pending task. A drive cancelled during
+// the cancellation hands the apply back with no error and no outcome. Once the
+// write lands, the queued table reads cancelled and the apply failed. A
+// retryable failure cancels nothing: the queued table stays pending for the
+// operator's recovery and the apply records failed_retryable.
+func TestFinalizeSequentialApply_QueuedTaskCancellationMustLandBeforeTheOutcome(t *testing.T) {
+	cases := []struct {
+		name              string
+		driveContext      func(t *testing.T, apply *storage.Apply) context.Context
+		failedState       string
+		taskUpdateErr     error
+		wantRefused       bool
+		wantDriveState    string
+		wantStoredState   string
+		wantQueuedState   string
+		wantTerminalCalls int
+	}{
+		{
+			name:            "cancellation refused",
+			failedState:     state.Task.Failed,
+			taskUpdateErr:   errors.New("storage unavailable"),
+			wantRefused:     true,
+			wantDriveState:  state.Apply.Running,
+			wantStoredState: state.Apply.Running,
+			wantQueuedState: state.Task.Pending,
+		},
+		{
+			name: "cancellation refused on an operation drive",
+			driveContext: func(t *testing.T, apply *storage.Apply) context.Context {
+				return storage.WithOperationLease(t.Context(), storage.OperationLease{ApplyID: apply.ID, OperationID: 5, Owner: "driver-a", Token: "token-a"})
+			},
+			failedState:     state.Task.Failed,
+			taskUpdateErr:   errors.New("storage unavailable"),
+			wantRefused:     true,
+			wantDriveState:  state.Apply.Running,
+			wantStoredState: state.Apply.Running,
+			wantQueuedState: state.Task.Pending,
+		},
+		{
+			name: "cancellation refused on a cancelled drive",
+			driveContext: func(t *testing.T, _ *storage.Apply) context.Context {
+				ctx, cancel := context.WithCancel(t.Context())
+				cancel()
+				return ctx
+			},
+			failedState:     state.Task.Failed,
+			taskUpdateErr:   context.Canceled,
+			wantDriveState:  state.Apply.Running,
+			wantStoredState: state.Apply.Running,
+			wantQueuedState: state.Task.Pending,
+		},
+		{
+			name:              "cancellation lands",
+			failedState:       state.Task.Failed,
+			wantDriveState:    state.Apply.Failed,
+			wantStoredState:   state.Apply.Failed,
+			wantQueuedState:   state.Task.Cancelled,
+			wantTerminalCalls: 1,
+		},
+		{
+			name:            "retryable failure leaves the queued table pending",
+			failedState:     state.Task.FailedRetryable,
+			taskUpdateErr:   errors.New("storage unavailable"),
+			wantDriveState:  state.Apply.FailedRetryable,
+			wantStoredState: state.Apply.FailedRetryable,
+			wantQueuedState: state.Task.Pending,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			stored := failureLogTestApply(state.Apply.Running, 0)
+			failed := &storage.Task{
+				ID: 1, TaskIdentifier: "task-1", ApplyID: stored.ID, TableName: "orders",
+				State: tc.failedState, ErrorMessage: "engine refused the statement",
+			}
+			queued := &storage.Task{ID: 2, TaskIdentifier: "task-2", ApplyID: stored.ID, TableName: "users", State: state.Task.Pending}
+			applies := &mockApplyStore{apply: stored}
+			client := &LocalClient{
+				config: LocalConfig{Database: "orders", Type: storage.DatabaseTypeMySQL},
+				storage: &mockStorage{
+					applies:         applies,
+					tasks:           &mockTaskStore{tasks: []*storage.Task{failed, queued}, updateErr: tc.taskUpdateErr},
+					logs:            &mockApplyLogStore{},
+					controlRequests: &testControlRequestStore{},
+				},
+				logger: slog.Default(),
+			}
+			observer := &terminalRecordingObserver{}
+			client.SetObserver(stored.ID, observer)
+			ctx := t.Context()
+			if tc.driveContext != nil {
+				ctx = tc.driveContext(t, stored)
+			}
+
+			drive := *stored
+			err := client.finalizeSequentialApply(ctx, &drive, []*storage.Task{failed, queued}, failed, false)
+
+			if tc.wantRefused {
+				require.ErrorIs(t, err, tc.taskUpdateErr)
+				require.ErrorIs(t, err, ErrTaskVerdictRefused, "the operator reads this to leave an operation drive's row claimable")
+				assert.Contains(t, err.Error(), "apply-7", "the error names the apply the drive could not finalize")
+			} else {
+				require.NoError(t, err)
+			}
+			assert.Equal(t, tc.wantDriveState, drive.State, "the in-memory outcome is adopted only once every queued cancellation landed")
+			assert.Equal(t, tc.wantStoredState, applies.apply.State)
+			assert.Equal(t, tc.wantQueuedState, queued.State)
+			assert.Len(t, observer.terminal, tc.wantTerminalCalls)
+		})
+	}
+}
+
 // A previous drive settled every task of an apply but exited before it could
 // record the apply's outcome, so the apply was re-claimed still running with an
 // operator's revert pending. The re-claim finds no remaining work and records
@@ -132,10 +251,12 @@ func TestResumeApplyWithTasks_NoRemainingWorkSettlesMootedRequests(t *testing.T)
 	taskStore.tasks = tasks
 	observer := &terminalRecordingObserver{}
 	c.SetObserver(apply.ID, observer)
+	reader := newTernMetricsReader(t)
 
 	require.NoError(t, c.resumeApplyWithTasks(t.Context(), apply, nil, tasks, nil, false, false))
 
 	assert.Equal(t, state.Apply.Completed, applies.stored.State)
+	assert.Equal(t, int64(-1), activeAppliesDelta(t, reader), "completing the apply releases it from the active-apply gauge")
 	require.Len(t, controlRequests.requests, 1)
 	assert.Equal(t, storage.ControlRequestCompleted, controlRequests.requests[0].Status,
 		"the completed outcome moots the pending revert")
@@ -687,7 +808,7 @@ type stopCancellingEngine struct {
 }
 
 func (e *stopCancellingEngine) Progress(ctx context.Context, req *engine.ProgressRequest) (*engine.ProgressResult, error) {
-	e.client.cancelApplyHandle(e.client.currentApplyCancel())
+	e.client.cancelApplyHandle(e.client.currentApplyCancel(), nil)
 	return e.fakeControlEngine.Progress(ctx, req)
 }
 
@@ -774,8 +895,8 @@ func TestLaunchAtomicResume_StopCancellingTheDriveIsNotAnEngineFailure(t *testin
 	observer := &terminalRecordingObserver{}
 	client.SetObserver(apply.ID, observer)
 
-	driveCtx, cancelDrive := context.WithCancel(t.Context())
-	defer cancelDrive()
+	driveCtx, cancelDrive := context.WithCancelCause(t.Context())
+	defer cancelDrive(nil)
 	generation := client.setApplyCancel(cancelDrive)
 	defer client.clearApplyCancel(generation)
 
