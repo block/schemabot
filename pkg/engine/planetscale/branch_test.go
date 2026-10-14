@@ -14,6 +14,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/lint"
@@ -306,6 +307,49 @@ func TestDiffKeyspace_VSchemaReportedMissingIsReadAgain(t *testing.T) {
 		assert.Empty(t, diff.currentVSchemaRaw)
 		assert.True(t, diff.vschemaChanged, "the absence surfaces as the difference the caller retries on")
 	})
+}
+
+// A plan's answer is acted on as read: the removal gate compares the desired
+// VSchema against the current one, and a lagging not-found would leave it
+// nothing to compare against. The plan reads again, so a vindex the desired
+// document drops is recorded as a deletion for the reviewer to consent to.
+func TestPlanKeyspace_LaggingVSchemaKeepsRemovalGate(t *testing.T) {
+	shortenVSchemaRereadInterval(t)
+
+	e := &Engine{linter: lint.New(), logger: slog.New(slog.DiscardHandler)}
+	live := `{"sharded": true, "vindexes": {"hash": {"type": "hash"}, "users_email": {"type": "consistent_lookup_unique"}}, "tables": {"users": {"column_vindexes": [{"column": "id", "name": "hash"}]}}}`
+	desired := &schema.Namespace{Files: map[string]string{
+		"vschema.json": `{"sharded": true, "vindexes": {"hash": {"type": "hash"}}, "tables": {"users": {"column_vindexes": [{"column": "id", "name": "hash"}]}}}`,
+	}}
+	client := &laggingVSchemaClient{notFoundReads: 2, vschema: &ps.VSchema{Raw: live}}
+
+	res, err := e.planKeyspace(t.Context(), client, "org", "mydb", "main", "commerce", desired, map[string][]table.TableSchema{"commerce": nil})
+	require.NoError(t, err)
+	assert.Equal(t, 3, client.reads)
+	deletions, err := apitypes.ParseVSchemaDeletions(res.change.Metadata)
+	require.NoError(t, err)
+	require.Len(t, deletions, 1, "the vindex removal must be recorded for consent")
+	assert.Equal(t, "vindex", deletions[0].Kind)
+	assert.Equal(t, "users_email", deletions[0].Name)
+	assert.Equal(t, live, res.change.OriginalFiles["vschema.json"], "the pre-image is the VSchema that exists")
+}
+
+// A cancelled context ends the wait between VSchema re-reads with the
+// cancellation, rather than reading again or believing the absence.
+func TestFetchKeyspaceVSchema_CancelledWhileWaitingToReread(t *testing.T) {
+	origInterval := vschemaAbsenceRereadInterval
+	vschemaAbsenceRereadInterval = time.Hour
+	t.Cleanup(func() { vschemaAbsenceRereadInterval = origInterval })
+
+	e := &Engine{logger: slog.New(slog.DiscardHandler)}
+	client := &laggingVSchemaClient{notFoundReads: 100}
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	vs, err := e.fetchKeyspaceVSchema(ctx, client, "org", "mydb", "main", "commerce", rereadMissingVSchema)
+	require.ErrorIs(t, err, context.Canceled)
+	assert.Nil(t, vs)
+	assert.Equal(t, 1, client.reads, "cancellation does not read again")
 }
 
 // deployRequestRecorderClient captures the deploy-request creation payload so

@@ -407,6 +407,11 @@ func (e *Engine) verifyBranchMatchesMain(ctx context.Context, client psclient.PS
 			mainNS.Files[t.Name+".sql"] = t.Schema + ";"
 		}
 
+		// mainNS carries only table files, so this diff never reads a
+		// VSchema and the policy is not reached today. It is the re-read
+		// policy because this gate acts on its answer (a difference means
+		// the branch is stale), which is what a VSchema comparison added
+		// here would need.
 		diff, diffErr := e.diffKeyspace(ctx, client, org, database, branchName, ks, mainNS, branchSchema, rereadMissingVSchema)
 		if diffErr != nil {
 			return fmt.Errorf("diff branch vs main for %s: %w", ks, diffErr)
