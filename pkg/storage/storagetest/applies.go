@@ -1225,7 +1225,7 @@ func TestApplies(t *testing.T, h Harness) {
 			return err
 		},
 		"FindMissingSummaryComment_DBError": func(t *testing.T, store storage.ApplyStore) error {
-			_, err := store.FindMissingSummaryComment(t.Context())
+			_, err := store.FindMissingSummaryComment(t.Context(), 0, 10)
 			return err
 		},
 		"FindTerminalWithInProgressCheck_DBError": func(t *testing.T, store storage.ApplyStore) error {

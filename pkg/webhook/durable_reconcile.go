@@ -54,6 +54,7 @@ import (
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/metrics"
+	"github.com/block/schemabot/pkg/panicsafe"
 	"github.com/block/schemabot/pkg/storage"
 )
 
@@ -353,8 +354,25 @@ func (h *Handler) startWebhookReconciler(ctx context.Context, stop <-chan struct
 // is enabled, recovers each miss by enqueueing a synthesized inbox row.
 func (h *Handler) reconcileWebhookInbox(ctx context.Context) {
 	// Terminal outcomes are repaired from apply and check state, not from the
-	// inbox or the repo registry, so they run before either gate below.
-	h.ReconcileTerminalApplyOutcomes(ctx)
+	// inbox or the repo registry, so they run before either gate below. The
+	// repair renders GitHub output from stored rows, so a panic on one poisoned
+	// row is contained here: it costs this repair, not the inbox stages below
+	// or the process that serves webhooks and drives applies.
+	recovered, err := panicsafe.Catch(func() error {
+		h.ReconcileTerminalApplyOutcomes(ctx)
+		return nil
+	})
+	if err != nil {
+		// The repair returns nothing, so only a contained panic reaches the
+		// branch below today; keep the signal if that changes.
+		h.logger.Error("terminal outcome reconciliation failed", "error", err)
+	}
+	if recovered != nil {
+		h.logger.Error("terminal outcome reconciliation panicked; missing summaries and stranded checks wait for the next reconcile pass",
+			"panic", fmt.Sprint(recovered.Value),
+			"stack", string(recovered.Stack))
+		metrics.RecordRecoveredPanic(ctx, "summary_reconciliation")
+	}
 
 	store := h.webhookEventStore()
 	if store == nil {

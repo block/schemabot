@@ -941,9 +941,13 @@ type ApplyStore interface {
 	// the current terminal state's summary was never posted), or only a claim
 	// sentinel stale for longer than SummaryClaimStaleAfter remains from a
 	// publisher that crashed before posting. "Recently" is MissingSummaryLookback.
+	// An apply qualifies only once it has been terminal for at least settledFor,
+	// so a reconciler never races the live publisher that is still delivering
+	// the summary moments after the terminal write; zero disables the floor.
+	// Returns at most limit applies, most recently updated first.
 	// Used by summary reconciliation, at startup and on every reconcile pass, to
 	// post summary comments a failed or interrupted publisher left missing.
-	FindMissingSummaryComment(ctx context.Context) ([]*Apply, error)
+	FindMissingSummaryComment(ctx context.Context, settledFor time.Duration, limit int) ([]*Apply, error)
 
 	// FindTerminalWithInProgressCheck returns GitHub-backed applies in a
 	// terminal state (stopped excluded: a stop deliberately leaves its check in

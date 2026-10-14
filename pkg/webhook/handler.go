@@ -688,12 +688,23 @@ func (h *Handler) clientForRepo(repo string, installationID int64) (*github.Inst
 // reconciliation pass refreshes; the rest wait for the next pass.
 const terminalCheckReconcileBatch = 100
 
+// summaryReconcileBatch bounds how many missing summaries one reconciliation
+// pass posts. Each repair is a GitHub post that can wait out a request timeout,
+// and the pass runs ahead of the inbox sweeps, so a backlog drains over several
+// passes instead of holding the rest of the pass behind it.
+const summaryReconcileBatch = 25
+
 // ReconcileTerminalApplyOutcomes repairs what a terminal apply owes its PR when
 // the publisher that should have delivered it failed or never ran: the summary
-// comment, then the Check Run. It runs at startup and on every webhook
-// reconcile pass, so a publish that failed on a transient GitHub or storage
-// error is retried until it lands. The two repairs are independent, because
-// either half of a terminal publish can fail without the other.
+// comment, then the check. It runs at startup and on every webhook reconcile
+// pass. The two repairs are independent, because either half of a terminal
+// publish can fail without the other.
+//
+// Each repair is driven by stored state, so it retries exactly what storage
+// still records as undelivered: a summary with no recorded comment, and stored
+// check state still in progress. A GitHub Check Run write that fails after
+// stored check state completed is not visible to this scan; its retry is the
+// aggregate fold's bounded re-fold.
 func (h *Handler) ReconcileTerminalApplyOutcomes(ctx context.Context) {
 	h.ReconcileMissingSummaryComments(ctx)
 	h.ReconcileTerminalApplyChecks(ctx)
@@ -729,7 +740,10 @@ func (h *Handler) ReconcileTerminalApplyChecks(ctx context.Context) {
 // ReconcileMissingSummaryComments repairs the apply_comments outbox. It finds
 // recently terminal applies (including stopped) with a progress comment but no
 // summary comment, then posts the missing summary so the PR shows the final
-// result after a restart or a failed publish. Each repair goes through the atomic
+// result after a restart or a failed publish. An apply qualifies only once it
+// has been terminal for the stale-claim window, so the repair never races the
+// live publisher still delivering it, including the cutover path, which edits
+// the cutover comment into the summary rather than posting under the claim. Each repair goes through the atomic
 // summary-marker claim, so a publisher racing this reconciler — or another
 // pod's reconciler — still yields exactly one summary; a claim sentinel left
 // by a publisher that crashed before posting is taken over once stale.
@@ -739,7 +753,7 @@ func (h *Handler) ReconcileMissingSummaryComments(ctx context.Context) {
 		return
 	}
 
-	applies, err := h.service.Storage().Applies().FindMissingSummaryComment(ctx)
+	applies, err := h.service.Storage().Applies().FindMissingSummaryComment(ctx, storage.SummaryClaimStaleAfter, summaryReconcileBatch)
 	if err != nil {
 		h.logger.Error("summary comment reconciliation skipped this pass; terminal applies (including stopped) missing a summary comment stay unrepaired until the next pass",
 			"error", err)

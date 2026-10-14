@@ -3320,7 +3320,7 @@ func (s *applyStore) GetByDatabase(ctx context.Context, database, dbType, enviro
 
 // FindMissingSummaryComment returns GitHub-backed applies that reached a
 // terminal state recently but whose progress comment was never followed by a
-// summary comment. Used to post missing summaries after restart.
+// summary comment. Used by summary reconciliation to post missing summaries.
 //
 // Three forms of "missing" qualify: no summary marker at all (the publisher
 // never ran); a superseded marker (a stop's summary consumed by a resume
@@ -3329,10 +3329,25 @@ func (s *applyStore) GetByDatabase(ctx context.Context, database, dbType, enviro
 // storage.SummaryClaimStaleAfter (the publisher claimed, then crashed before
 // posting). A fresh sentinel is an in-flight publish and is left alone.
 //
-// Recency (storage.MissingSummaryLookback) is judged per state family: most
-// terminal states stamp completed_at, but a stopped apply is resumable and keeps
-// completed_at NULL, so it qualifies by updated_at instead.
-func (s *applyStore) FindMissingSummaryComment(ctx context.Context) ([]*storage.Apply, error) {
+// Recency (storage.MissingSummaryLookback) and the settledFor floor are judged
+// per state family: most terminal states stamp completed_at, but a stopped
+// apply is resumable and keeps completed_at NULL, so it qualifies by updated_at
+// instead.
+func (s *applyStore) FindMissingSummaryComment(ctx context.Context, settledFor time.Duration, limit int) ([]*storage.Apply, error) {
+	// The settle floor compares the same timestamp recency does: completed_at
+	// for most terminal states, updated_at for a resumable stop.
+	settled := "TRUE"
+	var settledArgs []any
+	if settledFor > 0 {
+		settledBefore := s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime, ParameterIntervalAmount(), IntervalSecond)
+		settled = "((a.state = ? AND a.updated_at <= " + settledBefore + ") OR (a.state != ? AND a.completed_at <= " + settledBefore + "))"
+		seconds := int64(settledFor / time.Second)
+		settledArgs = []any{state.Apply.Stopped, seconds, state.Apply.Stopped, seconds}
+	}
+	args := []any{state.Apply.Completed, state.Apply.Failed, state.Apply.Reverted, state.Apply.Cancelled,
+		state.Apply.Stopped, int64(storage.SummaryClaimStaleAfter.Seconds())}
+	args = append(args, settledArgs...)
+	args = append(args, limit)
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT `+applyColumnsForApplyAlias+`
 		FROM applies a
@@ -3350,11 +3365,12 @@ func (s *applyStore) FindMissingSummaryComment(ctx context.Context) ([]*storage.
 			OR acs.superseded_at IS NOT NULL
 			OR (acs.github_comment_id = 0 AND acs.updated_at < `+s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime, ParameterIntervalAmount(), IntervalSecond)+`)
 		  )
+		  AND `+settled+`
 		ORDER BY a.updated_at DESC
-	`, state.Apply.Completed, state.Apply.Failed, state.Apply.Reverted, state.Apply.Cancelled,
-		state.Apply.Stopped, int64(storage.SummaryClaimStaleAfter.Seconds()))
+		LIMIT ?
+	`, args...)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("find terminal applies missing a summary comment: %w", err)
 	}
 	defer utils.CloseAndLog(rows)
 
@@ -3362,11 +3378,14 @@ func (s *applyStore) FindMissingSummaryComment(ctx context.Context) ([]*storage.
 	for rows.Next() {
 		apply, err := scanApplyInto(rows)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("scan terminal apply missing a summary comment: %w", err)
 		}
 		applies = append(applies, apply)
 	}
-	return applies, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate terminal applies missing a summary comment: %w", err)
+	}
+	return applies, nil
 }
 
 // missingSummaryLookbackHours is storage.MissingSummaryLookback in the whole

@@ -178,10 +178,17 @@ func testPostgresNonUTCWriterTimesStoreTheirInstant(t *testing.T, h postgresHarn
 	assert.Equal(t, startedAt.UTC(), *stored.StartedAt, "started_at reads back as the instant the driver wrote, in UTC")
 	assert.Equal(t, completedAt.UTC(), *stored.CompletedAt, "completed_at reads back as the instant the driver wrote, in UTC")
 
-	missing, err := store.Applies().FindMissingSummaryComment(ctx)
+	missing, err := store.Applies().FindMissingSummaryComment(ctx, 0, 100)
 	require.NoError(t, err)
 	require.Len(t, missing, 1, "an apply that finished moments ago with no summary is inside the reconciliation window")
 	assert.Equal(t, apply.ApplyIdentifier, missing[0].ApplyIdentifier)
+
+	// A completed_at stored at the driver's local wall clock would read hours
+	// old and clear the settle floor; stored at its instant, the apply finished
+	// moments ago and is still its live publisher's.
+	unsettled, err := store.Applies().FindMissingSummaryComment(ctx, storage.SummaryClaimStaleAfter, 100)
+	require.NoError(t, err)
+	assert.Empty(t, unsettled, "an apply that finished moments ago has not settled")
 }
 
 // reopenRaceDeadline bounds each wait in the snapshot race: the update reaching

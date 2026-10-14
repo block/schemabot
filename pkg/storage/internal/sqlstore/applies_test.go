@@ -3801,7 +3801,7 @@ func TestApplyStore_FindMissingSummaryComment_ExcludesAppliesWithoutGitHubDestin
 		GitHubCommentID: 1002,
 	}))
 
-	applies, err := store.Applies().FindMissingSummaryComment(ctx)
+	applies, err := store.Applies().FindMissingSummaryComment(ctx, 0, 100)
 	require.NoError(t, err)
 	require.Len(t, applies, 1)
 	assert.Equal(t, githubApply.ApplyIdentifier, applies[0].ApplyIdentifier)
@@ -3862,11 +3862,45 @@ func TestApplyStore_FindMissingSummaryComment_IncludesRecentlyStoppedApplies(t *
 		int(storage.MissingSummaryLookback/time.Hour)+1, stale.ID)
 	require.NoError(t, err)
 
-	applies, err := store.Applies().FindMissingSummaryComment(ctx)
+	applies, err := store.Applies().FindMissingSummaryComment(ctx, 0, 100)
 	require.NoError(t, err)
 	require.Len(t, applies, 1)
 	assert.Equal(t, recent.ApplyIdentifier, applies[0].ApplyIdentifier)
 	assert.Equal(t, state.Apply.Stopped, applies[0].State)
+}
+
+// An apply missing its summary is left to its live publisher until it has
+// been terminal for settledFor: a completed apply judged by completed_at and a
+// stopped one by updated_at, each repaired once it has settled. The limit
+// bounds one pass, most recently updated first.
+func TestApplyStore_FindMissingSummaryComment_SettleFloorAndLimit(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+	const settledFor = 2 * time.Minute
+
+	seedApplyMissingSummary(t, store, "apply_completed_fresh", state.Apply.Completed, 720)
+	seedApplyMissingSummary(t, store, "apply_stopped_fresh", state.Apply.Stopped, 721)
+	completedSettled := seedApplyMissingSummary(t, store, "apply_completed_settled", state.Apply.Completed, 722)
+	_, err := testDB.ExecContext(ctx, `UPDATE applies SET completed_at = NOW() - INTERVAL 10 MINUTE, updated_at = NOW() - INTERVAL 10 MINUTE WHERE id = ?`, completedSettled.ID)
+	require.NoError(t, err)
+	stoppedSettled := seedApplyMissingSummary(t, store, "apply_stopped_settled", state.Apply.Stopped, 723)
+	_, err = testDB.ExecContext(ctx, `UPDATE applies SET updated_at = NOW() - INTERVAL 5 MINUTE WHERE id = ?`, stoppedSettled.ID)
+	require.NoError(t, err)
+
+	applies, err := store.Applies().FindMissingSummaryComment(ctx, settledFor, 100)
+	require.NoError(t, err)
+	var got []string
+	for _, apply := range applies {
+		got = append(got, apply.ApplyIdentifier)
+	}
+	assert.Equal(t, []string{stoppedSettled.ApplyIdentifier, completedSettled.ApplyIdentifier}, got,
+		"only settled applies qualify, most recently updated first")
+
+	limited, err := store.Applies().FindMissingSummaryComment(ctx, settledFor, 1)
+	require.NoError(t, err)
+	require.Len(t, limited, 1)
+	assert.Equal(t, stoppedSettled.ApplyIdentifier, limited[0].ApplyIdentifier)
 }
 
 // seedCheckForApply stores check state for apply's target, owned by apply,
@@ -3955,7 +3989,7 @@ func TestApplyStore_FindMissingSummaryComment_SummaryClaimSentinels(t *testing.T
 		GitHubCommentID: 2002,
 	}))
 
-	applies, err := store.Applies().FindMissingSummaryComment(ctx)
+	applies, err := store.Applies().FindMissingSummaryComment(ctx, 0, 100)
 	require.NoError(t, err)
 	require.Len(t, applies, 1)
 	assert.Equal(t, staleClaim.ApplyIdentifier, applies[0].ApplyIdentifier)
@@ -3986,7 +4020,7 @@ func TestApplyStore_FindMissingSummaryComment_SupersededSummaryMarker(t *testing
 		GitHubCommentID: 2004,
 	}))
 
-	applies, err := store.Applies().FindMissingSummaryComment(ctx)
+	applies, err := store.Applies().FindMissingSummaryComment(ctx, 0, 100)
 	require.NoError(t, err)
 	require.Len(t, applies, 1)
 	assert.Equal(t, superseded.ApplyIdentifier, applies[0].ApplyIdentifier)

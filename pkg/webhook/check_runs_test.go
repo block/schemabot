@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -84,7 +85,7 @@ func (s *emptyApplyStore) GetByApplyIdentifier(ctx context.Context, applyIdentif
 	return nil, nil
 }
 
-func (s *emptyApplyStore) FindMissingSummaryComment(context.Context) ([]*storage.Apply, error) {
+func (s *emptyApplyStore) FindMissingSummaryComment(context.Context, time.Duration, int) ([]*storage.Apply, error) {
 	return nil, nil
 }
 
