@@ -215,9 +215,9 @@ type ServerConfig struct {
 	// Spirit overrides the Spirit engine's default run settings for every
 	// MySQL database this server drives directly. Unset fields keep the
 	// engine defaults (see pkg/engine/spirit), so the block is only needed
-	// to deviate — for example to disable write-thread autoscaling as an
-	// incident kill switch. A database's own metadata entry for the same
-	// key wins over this server-level value.
+	// to deviate — for example to change how old a checkpoint may be and still
+	// be resumed. A database's own metadata entry for the same key wins over
+	// this server-level value.
 	Spirit SpiritConfig `yaml:"spirit,omitempty"`
 
 	// DirectExecution is the server-wide direct execution policy. It applies
@@ -227,8 +227,13 @@ type ServerConfig struct {
 	// direct_execution block replaces this policy whole rather than merging
 	// field by field, so an override can never enable direct execution while
 	// inheriting a size bound stated somewhere else, and an override that
-	// disables it is a complete opt out. Unset (the default) leaves refused
-	// statements blocked everywhere.
+	// disables it is a complete opt out. Unset, the default policy applies
+	// (see defaultDirectExecution): enabled, bounded by the table's data and
+	// index footprint. Set enabled: false to leave refused statements blocked
+	// on the databases this server plans. A control plane forwards its policy
+	// with every plan, and the server that runs the statement uses it in place
+	// of its own, so an opt-out stated only on a server that executes plans
+	// sent by a control plane is overridden.
 	DirectExecution *DirectExecutionConfig `yaml:"direct_execution,omitempty"`
 
 	// PlanetScale configures process-wide behavior for the Vitess engine's
@@ -528,33 +533,11 @@ func validateRateLimits(cfg RateLimitsConfig) error {
 // here are merged into every locally driven MySQL database's metadata unless
 // the database sets the same key itself.
 type SpiritConfig struct {
-	// EnableExperimentalAutoscaling controls whether Spirit scales its thread
-	// pools dynamically from throttler feedback. It engages on Aurora targets
-	// only; other MySQL targets run at fixed thread counts. Defaults to true
-	// when not configured (nil = enabled); set false as the operator kill
-	// switch when autoscaling misbehaves on a target fleet.
-	EnableExperimentalAutoscaling *bool `yaml:"enable_experimental_autoscaling"`
-
-	// EnableExperimentalLocklessChecksum verifies the copy with optimistic
-	// reads and retries instead of a checksum setup lock held over long-lived
-	// snapshots, leaving cutover locking unchanged. Defaults to false: a row
-	// updated continuously throughout the checksum is not yet supported, so
-	// the lockless checker can fail to converge where the snapshot one
-	// completes. Absent and false are the same thing here, so this needs no
-	// tri-state.
-	EnableExperimentalLocklessChecksum bool `yaml:"enable_experimental_lockless_checksum,omitempty"`
-
 	// CheckpointMaxAge bounds how old a Spirit checkpoint may be and still be
 	// resumed, as a Go duration string (e.g. "72h"). Defaults to 3 days:
 	// a copy stalled that long restarts cleanly instead of replaying days of
 	// old binlogs.
 	CheckpointMaxAge string `yaml:"checkpoint_max_age,omitempty"`
-
-	// ChecksumYieldTimeout bounds each checksum read transaction before it
-	// yields its REPEATABLE READ snapshot, as a Go duration string (e.g.
-	// "12h"). Defaults to 12 hours so a long checksum cannot pin InnoDB purge
-	// on the target.
-	ChecksumYieldTimeout string `yaml:"checksum_yield_timeout,omitempty"`
 }
 
 // SpiritMetadata validates the configured Spirit overrides and returns them as
@@ -563,19 +546,7 @@ type SpiritConfig struct {
 // construction instead of silently running applies with the defaults.
 func (c *ServerConfig) SpiritMetadata() (map[string]string, error) {
 	metadata := map[string]string{}
-	if c.Spirit.EnableExperimentalAutoscaling != nil {
-		metadata[spirit.MetadataEnableExperimentalAutoscaling] = strconv.FormatBool(*c.Spirit.EnableExperimentalAutoscaling)
-	}
-	// Only the enabling value is recorded. A server-level false would be
-	// indistinguishable from the default it restates, and it could not
-	// override a database that set the key itself — the database's entry wins.
-	if c.Spirit.EnableExperimentalLocklessChecksum {
-		metadata[spirit.MetadataEnableExperimentalLocklessChecksum] = strconv.FormatBool(true)
-	}
 	if err := setSpiritDuration(metadata, spirit.MetadataCheckpointMaxAge, c.Spirit.CheckpointMaxAge); err != nil {
-		return nil, err
-	}
-	if err := setSpiritDuration(metadata, spirit.MetadataChecksumYieldTimeout, c.Spirit.ChecksumYieldTimeout); err != nil {
 		return nil, err
 	}
 	return metadata, nil
@@ -1035,6 +1006,8 @@ type TargetResolverConfig struct {
 	// each entry's database_type) so one data plane can serve several engines at
 	// once and the request's database type selects among them.
 	Etre []EtreConfig `yaml:"etre,omitempty"`
+	// Overrides decorates discovery; it is not itself a backend.
+	Overrides []inventory.TargetOverride `yaml:"overrides,omitempty"`
 }
 
 // Configured reports whether the data plane has any static target inventory.
@@ -1063,7 +1036,8 @@ type EtreConfig struct {
 	Addr string `yaml:"addr"`
 	// DatabaseType selects the engine the resolver assembles connections for and
 	// is required (no implicit default): "mysql" and "strata" read the MySQL
-	// block; "vitess" reads the Vitess block.
+	// block; "vitess" reads the Vitess block; "postgres" reads the Postgres
+	// block.
 	DatabaseType string `yaml:"database_type"`
 	// EntityType is the Etre entity type recording the target clusters.
 	EntityType string `yaml:"entity_type"`
@@ -1084,6 +1058,9 @@ type EtreConfig struct {
 	MySQL EtreMySQLConfig `yaml:"mysql,omitempty"`
 	// Vitess holds the Vitess engine knobs, read when DatabaseType is "vitess".
 	Vitess EtreVitessConfig `yaml:"vitess,omitempty"`
+	// Postgres holds the PostgreSQL engine knobs, read when DatabaseType is
+	// "postgres".
+	Postgres EtrePostgresConfig `yaml:"postgres,omitempty"`
 	// Credentials configures the credentials for the connection.
 	Credentials EtreCredentialsConfig `yaml:"credentials"`
 }
@@ -1133,6 +1110,25 @@ type EtreVitessConfig struct {
 	DefaultPort string `yaml:"default_port,omitempty"`
 }
 
+// EtrePostgresConfig holds the PostgreSQL knobs for an Etre resolver: how to
+// find the host, how to verify the server, and which role owns the tables the
+// engine creates. The database a connection is made to comes from the
+// credential secret, read as JSON {username, password, dbname} (the format AWS
+// uses for RDS database secrets).
+type EtrePostgresConfig struct {
+	// HostField is the entity field holding the connection host.
+	HostField string `yaml:"host_field"`
+	// DefaultPort is appended to the host when it has no port.
+	DefaultPort string `yaml:"default_port,omitempty"`
+	// CARef selects the CA bundle the server certificate is verified against:
+	// "embedded:rds-global" or "file:<absolute-path>". Optional for RDS
+	// endpoints, which default to the embedded RDS bundle; required otherwise.
+	CARef string `yaml:"ca_ref,omitempty"`
+	// TableOwner is the role new tables are created as. Optional: empty creates
+	// them as the connected role.
+	TableOwner string `yaml:"table_owner,omitempty"`
+}
+
 // EtreCredentialsConfig configures credentials for an Etre-resolved target.
 // Credentials never come from Etre. Type selects the backend; each backend is
 // one pluggable implementation behind the same resolver interface, so the data
@@ -1144,9 +1140,10 @@ type EtreCredentialsConfig struct {
 	// Username is the database user. For secret_ref it is a literal username. For
 	// awssm it is optional: when set, it is a template (over {target} and
 	// {attribute} placeholders, e.g. "{app}_ddl") and the fetched secret is treated
-	// as the plain-text password instead of a JSON payload. For awssm it is mutually
-	// exclusive with token-decoding engines (e.g. vitess), which interpret the
-	// secret themselves.
+	// as the plain-text password instead of a JSON payload. On both backends it
+	// must be unset for engines that decode the secret themselves (vitess,
+	// postgres), because the secret names the user; setting it fails resolver
+	// construction rather than being ignored.
 	// PasswordRef (secret_ref) is a password secret reference (env:, file:,
 	// secretsmanager:, or a literal), optionally carrying a {target} placeholder.
 	Username    string `yaml:"username,omitempty"`
@@ -1163,11 +1160,24 @@ type EtreCredentialsConfig struct {
 	// AWS account id (defaults to aws_account_id); when empty, secrets are read from
 	// the caller's own account. ExternalID is an optional STS external id used only
 	// with RoleARN.
-	Region           string `yaml:"region,omitempty"`
-	RoleARN          string `yaml:"role_arn,omitempty"`
-	ExternalID       string `yaml:"external_id,omitempty"`
-	SecretName       string `yaml:"secret_name,omitempty"`
-	AccountAttribute string `yaml:"account_attribute,omitempty"`
+	//
+	// Region is the data plane's home region, and is required: roles are assumed
+	// through STS there, and a target's secret is read there unless its cluster
+	// is in one of ReachableRegions. RegionAttribute names the entity attribute
+	// holding the region of each target's cluster (e.g. "aws_region"); with
+	// ReachableRegions set, a target whose entity has no value for it, or one
+	// that is not a region name, fails resolution. ReachableRegions lists the other regions whose Secrets Manager
+	// this data plane can call, all in Region's AWS partition, and requires
+	// RegionAttribute: a target whose cluster is in one of them has its secret
+	// read there, and every other target's secret is read in Region, so it must
+	// be replicated there.
+	Region           string   `yaml:"region,omitempty"`
+	RegionAttribute  string   `yaml:"region_attribute,omitempty"`
+	ReachableRegions []string `yaml:"reachable_regions,omitempty"`
+	RoleARN          string   `yaml:"role_arn,omitempty"`
+	ExternalID       string   `yaml:"external_id,omitempty"`
+	SecretName       string   `yaml:"secret_name,omitempty"`
+	AccountAttribute string   `yaml:"account_attribute,omitempty"`
 }
 
 // DatabaseConfig holds configuration for a registered database.
@@ -1339,14 +1349,17 @@ type EnvironmentConfig struct {
 
 	// CutoverPolicy controls how a multi-member rollout sequences the copy and
 	// cutover phases of its members: the deployments of a Deployments map, or
-	// the targets of a Targets list, in resolved order. "rolling" (the default,
-	// also used when unset) keeps the rollout fully serial: a later member does
-	// not start until every earlier member has completed. "barrier" lets later
-	// members run their copy phase once earlier members reach the cutover
-	// barrier, while cutover itself stays ordered. "parallel" starts every
-	// member's copy without waiting on earlier members, up to the server's
-	// max_drivers_per_apply at once, and still cuts over one member at a time in
-	// order. Only meaningful alongside a Deployments map or a Targets list.
+	// the targets of a Targets list, in resolved order. "rolling" keeps the
+	// rollout fully serial: a later member does not start until every earlier
+	// member has completed. "barrier" lets later members run their copy phase
+	// once earlier members reach the cutover barrier, while cutover itself
+	// stays ordered. "parallel" starts every member's copy without waiting on
+	// earlier members, up to the server's max_drivers_per_apply at once, and
+	// still cuts over one member at a time in order. Left unset, an environment
+	// whose every member comes from a Targets list uses "parallel", and any
+	// other, including a Deployments map that mixes Targets lists with single
+	// targets, uses "rolling". Only meaningful alongside a Deployments map or a
+	// Targets list.
 	CutoverPolicy string `yaml:"cutover_policy,omitempty"`
 
 	// OnFailure controls multi-member rollout continuation when a member
@@ -1487,11 +1500,12 @@ func (c *DirectExecutionConfig) EngineMetadata() (map[string]string, error) {
 // the system carries it in: forwarded to the server that will run the
 // statement, and recorded on the apply that statement belongs to.
 //
-// Nil means the configuration states nothing, and a request that states
-// nothing leaves refused statements blocked wherever it lands. A configured
-// block that is disabled is not nothing: it is an opt-out, and it resolves to
-// a disabled policy so that it travels and overrides a grant the server that
-// runs the statement holds of its own.
+// Nil means this block states nothing and resolves to no policy: a request
+// carrying none leaves the executing server's own policy in force, which
+// ServerConfig.ResolveDirectExecution fills with the default when that server
+// states none. A configured block that is disabled is not nothing: it is an
+// opt-out, and it resolves to a disabled policy so that it travels and
+// overrides a grant the server that runs the statement holds of its own.
 func (c *DirectExecutionConfig) Policy() (*storage.DirectExecutionPolicy, error) {
 	if c == nil {
 		return nil, nil
@@ -2008,6 +2022,28 @@ func (c EnvironmentConfig) UsesTargetsList() bool {
 	return false
 }
 
+// routesOnlyThroughTargetsLists reports whether every member of an
+// environment comes from a targets list: an environment-level targets list,
+// or a deployments map whose every entry spells one. It is narrower than
+// UsesTargetsList, which one such entry satisfies. A deployments map that
+// mixes the two spellings also has single-target members, which are expected
+// to hold the same schema as each other, so serializing them is what lets an
+// operator watch one before the next starts.
+func (c EnvironmentConfig) routesOnlyThroughTargetsLists() bool {
+	if c.Targets != nil {
+		return true
+	}
+	if len(c.Deployments) == 0 {
+		return false
+	}
+	for _, dt := range c.Deployments {
+		if dt.Targets == nil {
+			return false
+		}
+	}
+	return true
+}
+
 // validateMultiTargetSupport rejects a targets list on a database whose engine
 // cannot drive several targets from one database entry. Multi-target work is
 // planned and applied per target, which not every engine supports yet, and a
@@ -2136,6 +2172,9 @@ func ParseServerConfig(data []byte) (*ServerConfig, error) {
 	dec := yaml.NewDecoder(bytes.NewReader(data))
 	dec.KnownFields(true)
 	if err := dec.Decode(&config); err != nil {
+		if key, ok := removedSpiritKey(data); ok {
+			return nil, fmt.Errorf("invalid config: spirit.%s was removed: Spirit now chooses this itself; delete the key from the spirit block: %w", key, err)
+		}
 		return nil, fmt.Errorf("parse config file: %w", err)
 	}
 
@@ -2152,6 +2191,27 @@ func ParseServerConfig(data []byte) (*ServerConfig, error) {
 	}
 
 	return &config, nil
+}
+
+// removedSpiritKey reports the first run setting a config's spirit block still
+// sets that Spirit now chooses itself. The strict decode rejects such a key
+// only as an unknown field; naming it as removed tells the operator that
+// deleting it is the whole remedy. It runs only once the strict decode has
+// failed, so YAML that does not parse here is already reported by that
+// decode's error.
+func removedSpiritKey(data []byte) (string, bool) {
+	var doc struct {
+		Spirit map[string]any `yaml:"spirit"`
+	}
+	if yaml.Unmarshal(data, &doc) != nil {
+		return "", false
+	}
+	for _, key := range spirit.RemovedSettingKeys() {
+		if _, ok := doc.Spirit[key]; ok {
+			return key, true
+		}
+	}
+	return "", false
 }
 
 func (c *ServerConfig) canonicalizeRepositories() error {
@@ -2229,6 +2289,9 @@ func (c *ServerConfig) validateTargetTableOwners() error {
 // Validate checks the configuration for required fields and consistency.
 func (c *ServerConfig) Validate() error {
 	if err := c.ValidateExperimentalStrata(); err != nil {
+		return err
+	}
+	if err := c.TargetResolver.validateTargetConfig(); err != nil {
 		return err
 	}
 	if err := c.validateTargetTableOwners(); err != nil {
@@ -3087,15 +3150,24 @@ func (c *ServerConfig) DatabaseEnvironment(database, environment string) *Enviro
 }
 
 // CutoverPolicyFor returns the resolved cutover policy for a database+environment.
-// It defaults to CutoverPolicyRolling (today's serial behaviour) when the
-// environment is unconfigured or leaves cutover_policy unset, preserving the
-// conservative rolling rollout as the safe default.
+// An explicit cutover_policy always wins. Left unset, an environment whose
+// every member comes from a targets list (routesOnlyThroughTargetsLists)
+// defaults to CutoverPolicyParallel: those targets each hold their own schema,
+// so their copies run side by side while cutover stays one target at a time
+// in list order. Every other environment, and an unconfigured one, defaults to
+// CutoverPolicyRolling, the fully serial rollout.
 func (c *ServerConfig) CutoverPolicyFor(database, environment string) string {
 	env := c.DatabaseEnvironment(database, environment)
-	if env == nil || env.CutoverPolicy == "" {
+	if env == nil {
 		return storage.CutoverPolicyRolling
 	}
-	return env.CutoverPolicy
+	if env.CutoverPolicy != "" {
+		return env.CutoverPolicy
+	}
+	if env.routesOnlyThroughTargetsLists() {
+		return storage.CutoverPolicyParallel
+	}
+	return storage.CutoverPolicyRolling
 }
 
 // OnFailure returns the resolved rollout-continuation policy for a
@@ -3951,11 +4023,24 @@ func (c *ServerConfig) validateServerDirectExecutionReachesAnEngine() error {
 	return fmt.Errorf("server config sets direct_execution, which no registered database can honor: it is only supported for %s databases", storage.DatabaseTypeMySQL)
 }
 
+// defaultDirectExecutionMaxTableBytes is the size bound of the server-wide
+// direct execution policy a server config that states none runs under.
+const defaultDirectExecutionMaxTableBytes = "100MiB"
+
+// defaultDirectExecution returns the server-wide direct execution policy a
+// server config that states none runs under: enabled, bounded by the table's
+// data and index footprint. A fresh value each call, so no caller can change
+// the default another resolves.
+func defaultDirectExecution() *DirectExecutionConfig {
+	return &DirectExecutionConfig{Enabled: true, MaxTableBytes: defaultDirectExecutionMaxTableBytes}
+}
+
 // ResolveDirectExecution returns the direct execution policy in force for one
 // database environment: the environment's own block when it states one,
-// otherwise the server-wide policy. The override replaces the server policy
-// whole, so an environment that states the policy disabled opts out of a
-// global grant instead of inheriting its bound.
+// otherwise the server-wide policy, which is the default policy when the
+// server config states none. The override replaces the server policy whole,
+// so an environment that states the policy disabled opts out of a global grant
+// instead of inheriting its bound.
 //
 // The server-wide policy reaches only the engines that can honor it. An
 // explicit per-database block is rejected at startup on every other database
@@ -3972,6 +4057,9 @@ func (c *ServerConfig) ResolveDirectExecution(envConfig *EnvironmentConfig, data
 	}
 	if !directExecutionSupported(databaseType) {
 		return nil
+	}
+	if c.DirectExecution == nil {
+		return defaultDirectExecution()
 	}
 	return c.DirectExecution
 }

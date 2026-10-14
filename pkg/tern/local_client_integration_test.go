@@ -14,6 +14,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/block/schemabot/pkg/inventory"
+
 	drivermysql "github.com/block/mysql"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/utils"
@@ -207,6 +209,7 @@ func buildSchemaWithAllTables(t *testing.T, dsn string, testTableSchemas map[str
 	db, err := sql.Open("block-mysql", dsn)
 	require.NoError(t, err, "failed to open database for schema building")
 	defer utils.CloseAndLog(db)
+	require.NoError(t, db.PingContext(t.Context()), "failed to reach database for schema building")
 
 	tables, err := table.LoadSchemaFromDB(t.Context(), db)
 	require.NoError(t, err, "failed to load schema from database")
@@ -479,8 +482,9 @@ func (e *stagedGroupedResumeEngine) Progress(_ context.Context, req *engine.Prog
 	return &engine.ProgressResult{State: engine.StateCompleted}, nil
 }
 
-func (e *stagedGroupedResumeEngine) Drain() {
+func (e *stagedGroupedResumeEngine) DrainContext(context.Context) error {
 	e.drainCount++
+	return nil
 }
 
 func (e *stagedGroupedResumeEngine) DeferredCutoverSignalExists(ctx context.Context, req *engine.DeferredCutoverSignalRequest) (bool, error) {
@@ -921,7 +925,7 @@ func TestLocalClient_PullSchemaOverridesReadPhysicalSchema(t *testing.T) {
 		Database:        "logicaldb",
 		Type:            storage.DatabaseTypeMySQL,
 		TargetDSN:       dsnWithoutDatabase(t, dsn),
-		SchemaOverrides: map[string]string{canonical: physical},
+		SchemaOverrides: resolveIntegrationOverride(t, dsnWithoutDatabase(t, dsn), canonical, physical),
 	}, nil, logger)
 	require.NoError(t, err, "create client")
 	defer utils.CloseAndLog(client)
@@ -1036,7 +1040,7 @@ func TestLocalClient_ApplySchemaOverridesTargetPhysicalSchema(t *testing.T) {
 		Database:        "logicaldb",
 		Type:            storage.DatabaseTypeMySQL,
 		TargetDSN:       dsnWithoutDatabase(t, dsn),
-		SchemaOverrides: map[string]string{canonical: physical},
+		SchemaOverrides: resolveIntegrationOverride(t, dsnWithoutDatabase(t, dsn), canonical, physical),
 	}, stor, logger)
 	require.NoError(t, err, "create client")
 	defer utils.CloseAndLog(client)
@@ -3070,6 +3074,117 @@ func TestLocalClient_ResumeApplyStartRequestFailsWhenTaskRowIsBlocked(t *testing
 	assert.Equal(t, 1, observer.terminalCount(), "the drive that fails the apply posts its terminal summary")
 }
 
+// This scenario covers an operator who stops an apply after one of its tables
+// failed permanently and then starts it. The failure decided the schema change
+// before the stop, so the start must not re-plan the failed table and run its
+// statement again: the claim is admitted, the resumed drive refuses the start
+// before any plan load or engine hand-off, the stopped table settles failed
+// with the refusal, and the drive settles everything the claim left open — the
+// apply records the refusal naming the failed table, the durable start request
+// fails with the same reason, and the terminal observer fires once.
+func TestLocalClient_ResumeApplyStartRefusedOverAFailedTask(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	_, dsn := setupMySQLContainer(t)
+	setupStorageSchema(t, dsn)
+	cleanupTasks(t, dsn)
+	cleanupTestTables(t, dsn)
+
+	ctx := t.Context()
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	stor := createStorage(t, dsn)
+	defer utils.CloseAndLog(stor)
+
+	client, err := NewLocalClient(LocalConfig{
+		Database:  "testdb",
+		Type:      storage.DatabaseTypeMySQL,
+		TargetDSN: dsn,
+	}, stor, logger)
+	require.NoError(t, err)
+	defer utils.CloseAndLog(client)
+
+	failure := "Existing rows hold duplicate values for a unique key. Resolve the duplicates before applying a change that adds or narrows that key."
+	plan, apply, stoppedTask := seedSingleTaskApply(t, stor, "start-refused-failed-task", state.Apply.Stopped, state.Task.Stopped, "", "")
+	applyID := apply.ID
+	now := time.Now()
+	failedTask := &storage.Task{
+		TaskIdentifier: fmt.Sprintf("task-start-refused-failed-task-orders-%d", now.UnixNano()),
+		ApplyID:        applyID,
+		PlanID:         plan.ID,
+		Database:       "testdb",
+		DatabaseType:   storage.DatabaseTypeMySQL,
+		Engine:         storage.EngineSpirit,
+		State:          state.Task.Failed,
+		ErrorMessage:   failure,
+		TableName:      "orders",
+		Namespace:      "testdb",
+		DDL:            "ALTER TABLE `orders` ADD UNIQUE KEY `uk_ref` (`ref`)",
+		DDLAction:      "alter",
+		Environment:    localClientTestEnvironment,
+		CreatedAt:      now,
+		UpdatedAt:      now,
+		CompletedAt:    &now,
+	}
+	failedTask.ID, err = stor.Tasks().Create(ctx, failedTask)
+	require.NoError(t, err)
+
+	_, alreadyPending, err := stor.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+		ApplyID:     applyID,
+		Operation:   storage.ControlOperationStart,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "integration-test",
+	})
+	require.NoError(t, err)
+	assert.False(t, alreadyPending)
+
+	resumeEngine := &stagedGroupedResumeEngine{}
+	client.spiritEngine = resumeEngine
+	observer := &recordingTerminalObserver{}
+	client.SetObserver(applyID, observer)
+
+	claimed, err := stor.Applies().ClaimApplyByID(ctx, applyID, "test-owner")
+	require.NoError(t, err)
+	require.NotNil(t, claimed)
+	require.Equal(t, state.Apply.Stopped, claimed.State)
+
+	require.NoError(t, client.ResumeApply(ctx, claimed))
+	assert.Equal(t, 0, resumeEngine.applyCount, "the refusal must come before any engine hand-off")
+	assert.Equal(t, 0, resumeEngine.planCalls, "the refusal must come before the re-plan")
+
+	want := "start refused: table orders failed before the apply was stopped (" + failure + "); plan the schema change again and apply the new plan"
+	storedApply, err := stor.Applies().Get(ctx, applyID)
+	require.NoError(t, err)
+	require.NotNil(t, storedApply)
+	assert.Equal(t, state.Apply.Failed, storedApply.State)
+	assert.Equal(t, want, storedApply.ErrorMessage)
+	assert.NotNil(t, storedApply.CompletedAt)
+
+	storedStopped, err := stor.Tasks().Get(ctx, stoppedTask.TaskIdentifier)
+	require.NoError(t, err)
+	require.NotNil(t, storedStopped)
+	assert.Equal(t, state.Task.Failed, storedStopped.State, "the stopped table settles with the apply rather than staying resumable")
+	assert.Equal(t, want, storedStopped.ErrorMessage)
+
+	storedFailed, err := stor.Tasks().Get(ctx, failedTask.TaskIdentifier)
+	require.NoError(t, err)
+	require.NotNil(t, storedFailed)
+	assert.Equal(t, state.Task.Failed, storedFailed.State)
+	assert.Equal(t, failure, storedFailed.ErrorMessage, "the failed table keeps its own reason")
+
+	pendingStart, err := stor.ControlRequests().GetPending(ctx, applyID, storage.ControlOperationStart)
+	require.NoError(t, err)
+	assert.Nil(t, pendingStart, "the start that admitted this claim must not stay pending against a terminal apply")
+	startReq, err := stor.ControlRequests().GetByOperation(ctx, applyID, storage.ControlOperationStart)
+	require.NoError(t, err)
+	require.NotNil(t, startReq)
+	assert.Equal(t, storage.ControlRequestFailed, startReq.Status)
+	assert.Equal(t, want, startReq.ErrorMessage)
+
+	assert.Equal(t, 1, observer.terminalCount(), "the drive that refuses the start posts its terminal summary")
+}
+
 // seedSingleTaskApply persists a plan, an apply in applyState, and one task
 // for `users` in taskState carrying the given execution verdict, and returns
 // the three with their row IDs set.
@@ -4644,4 +4759,17 @@ func TestLocalClient_ApplyPersistsBranchOptionForQueuedDrive(t *testing.T) {
 		"the queued drive's engine request must carry the dispatched branch option")
 	assert.Equal(t, "true", engineOptions["defer_cutover"],
 		"the queued drive's engine request must carry the dispatched defer_cutover option")
+}
+
+// resolveIntegrationOverride exercises discovery followed by the configured
+// decorator before the real MySQL pull/plan/apply and isolation assertions.
+func resolveIntegrationOverride(t *testing.T, dsn, canonical, physical string) map[string]string {
+	t.Helper()
+	backend, err := inventory.NewStaticResolver(inventory.StaticConfig{Targets: map[string]inventory.StaticTarget{"cluster": {DatabaseType: "mysql", DSN: dsn}}})
+	require.NoError(t, err)
+	resolver, err := inventory.NewOverrideResolver(backend, []inventory.TargetOverride{{Environment: localClientTestEnvironment, Target: "cluster", DatabaseType: "mysql", SchemaOverrides: map[string]string{canonical: physical}}}, slog.Default())
+	require.NoError(t, err)
+	target, err := resolver.ResolveTarget(t.Context(), inventory.Request{Environment: localClientTestEnvironment, Target: "cluster", DatabaseType: "mysql"})
+	require.NoError(t, err)
+	return target.SchemaOverrides
 }

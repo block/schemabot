@@ -297,3 +297,16 @@ func TestCoversHeadAgreesWithDiagnoseOnAnUnknownHead(t *testing.T) {
 	require.False(t, CoversHead(row, headSHA))
 	assert.Equal(t, ReasonAwaitingPlan, Diagnose(row, headSHA, nil).Reason)
 }
+
+// The blocks only a rollup may clear and the blocks that say work may have
+// reached the target are disjoint, durable reasons: a writer that preserves
+// both sets keeps every block it did not evaluate.
+func TestPreservedBlockingReasonSetsAreDisjointAndDurable(t *testing.T) {
+	assert.Equal(t, []string{BlockNamespacePlacementRefused, BlockReviewTimeDeploymentDrift}, RollupBlockingReasons())
+	reconciliation := ReconciliationBlockingReasons()
+	assert.Equal(t, []string{BlockApplyCancelledAfterTaskCompleted, BlockRollbackCompleted, BlockSchemaRemovedAfterApplyStarted}, reconciliation)
+	for _, reason := range RollupBlockingReasons() {
+		assert.Equal(t, blockGuard, blockClasses[reason], reason)
+		assert.NotContains(t, reconciliation, reason)
+	}
+}

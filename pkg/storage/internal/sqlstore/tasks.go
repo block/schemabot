@@ -4,13 +4,18 @@ package sqlstore
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/block/schemabot/pkg/namedlock"
 	"github.com/block/schemabot/pkg/state"
@@ -45,10 +50,11 @@ var terminalTaskStatesSQL = func() string {
 
 // taskStore implements storage.TaskStore using MySQL.
 type taskStore struct {
-	db       *rebindDB
-	dialect  Dialect
-	identity identityInserter
-	locker   namedlock.Locker
+	db         *rebindDB
+	dialect    Dialect
+	identity   identityInserter
+	locker     namedlock.Locker
+	classifier ErrorClassifier
 }
 
 func canonicalizeTaskIdentity(task *storage.Task) {
@@ -65,6 +71,7 @@ func (s *taskStore) Create(ctx context.Context, task *storage.Task) (int64, erro
 
 func insertTask(ctx context.Context, exec queryExecer, identity identityInserter, task *storage.Task) (int64, error) {
 	canonicalizeTaskIdentity(task)
+	boundEngineReportedFields(task)
 
 	// Ensure options has valid JSON (empty object if nil)
 	options := task.Options
@@ -106,6 +113,44 @@ func (s *taskStore) Get(ctx context.Context, taskIdentifier string) (*storage.Ta
 	`, taskIdentifier)
 
 	return scanTask(row)
+}
+
+// maxStoredETASeconds is the largest value the tasks.eta_seconds column holds,
+// a signed 32-bit integer in every dialect.
+const maxStoredETASeconds = math.MaxInt32
+
+// maxStoredThrottleReasonChars is the width of the tasks.throttle_reason
+// column, in characters in every dialect.
+const maxStoredThrottleReasonChars = 255
+
+// boundEngineReportedFields fits the task's engine-reported display fields to
+// the columns that hold them, on the caller's task, so the task a drive keeps
+// in memory and the row it reads back agree. These values come from an engine
+// and have no bound of their own; written unbounded, one would refuse every
+// progress write for the task and freeze the row over a display value.
+func boundEngineReportedFields(task *storage.Task) {
+	task.ETASeconds = storedETASeconds(task.ETASeconds)
+	task.ThrottleReason = storedThrottleReason(task.ThrottleReason)
+}
+
+// storedETASeconds bounds an engine-reported ETA to what the column holds. The
+// ETA is an engine's estimate and has no upper bound of its own: one paced on
+// key distance rather than rows reports decades for a table whose keys have a
+// wide gap, so a larger value is stored as the column's maximum, which still
+// reads as far beyond any useful estimate. A negative estimate means nothing,
+// and is stored as no estimate.
+func storedETASeconds(eta int) int {
+	return max(0, min(eta, maxStoredETASeconds))
+}
+
+// storedThrottleReason cuts an engine's throttle reason to the column's width
+// on a character boundary, marking the cut with an ellipsis.
+func storedThrottleReason(reason string) string {
+	if utf8.RuneCountInString(reason) <= maxStoredThrottleReasonChars {
+		return reason
+	}
+	runes := []rune(reason)
+	return string(runes[:maxStoredThrottleReasonChars-1]) + "…"
 }
 
 // taskUpdateAssignments is the SET list Update writes from the caller's task.
@@ -210,6 +255,7 @@ func taskUpdateStatement(d Dialect, guard taskLeaseGuard) string {
 // renders instead waits out the steal and fails, or wins the row lock and holds
 // the steal off until the task write commits.
 func (s *taskStore) Update(ctx context.Context, task *storage.Task) error {
+	boundEngineReportedFields(task)
 	args := []any{
 		task.State, nullString(task.ErrorMessage), nullJSON(task.Options), task.Attempt,
 		task.RowsCopied, task.RowsTotal, task.ProgressPercent, task.ETASeconds, task.ChecksumRowsChecked, task.ChecksumRowsTotal, task.Throttled, task.ThrottleReason, task.ExecutionMode, nullString(task.ModeReason), task.CutoverAttempts,
@@ -244,6 +290,9 @@ func (s *taskStore) Update(ctx context.Context, task *storage.Task) error {
 
 	result, err := s.db.ExecContext(ctx, taskUpdateStatement(s.dialect, guard), args...)
 	if err != nil {
+		if s.classifier != nil && s.classifier.IsValueRejected(err) {
+			return fmt.Errorf("update task %d (%s): %w: %w", task.ID, task.TaskIdentifier, storage.ErrValueRejected, err)
+		}
 		return fmt.Errorf("update task %d (%s): %w", task.ID, task.TaskIdentifier, err)
 	}
 	if verifyLeaseStillOwned == nil {
@@ -269,12 +318,13 @@ func (s *taskStore) Update(ctx context.Context, task *storage.Task) error {
 // drive holds only the apply lease. Either is a sufficient single-writer
 // guarantee for this operation's per-shard rows, so accept both, preferring the
 // operation lease when present (it is the narrower claim). The lookup-then-write
-// is serialized by that lease without a database-level unique constraint, and
-// the insert is gated on the matching lease token so a displaced operator fails
-// closed (ErrApplyLeaseLost) instead of writing stale rows. The update path
-// reuses the lease-guarded Update, which applies the same lease precedence. On
-// conflict identity is preserved and the statement text follows the caller's
-// task like every other mutable column.
+// is serialized by that lease, and a new row's identifier is derived from its
+// key (shardTaskIdentifier), so the unique index on task_identifier also
+// refuses a second row for the same shard. The insert is gated on the matching
+// lease token so a displaced operator fails closed (ErrApplyLeaseLost) instead
+// of writing stale rows. The update path reuses the lease-guarded Update, which
+// applies the same lease precedence. On conflict identity is preserved and the
+// statement text follows the caller's task like every other mutable column.
 func (s *taskStore) UpsertShardProgress(ctx context.Context, task *storage.Task) error {
 	canonicalizeTaskIdentity(task)
 
@@ -312,14 +362,13 @@ func (s *taskStore) UpsertShardProgress(ctx context.Context, task *storage.Task)
 		return fmt.Errorf("upsert shard progress for operation %d table %q requires a non-empty shard", *task.ApplyOperationID, task.TableName)
 	}
 
-	// Find the existing per-shard row under this operation. The lookup-then-write
-	// is safe without a unique constraint because the held lease makes the caller
-	// the single writer of this operation's rows.
+	// Find the existing per-shard row under this operation. The held lease makes
+	// the caller the single writer of this operation's rows, and the derived
+	// identifier below backs that with the unique index.
 	var id int64
-	err = s.db.QueryRowContext(ctx, `
-		SELECT id FROM tasks
-		WHERE apply_operation_id = ? AND namespace = ? AND table_name = ? AND shard = ?
-	`, *task.ApplyOperationID, task.Namespace, nullString(task.TableName), task.Shard).Scan(&id)
+	err = s.db.QueryRowContext(ctx,
+		`SELECT id FROM tasks WHERE `+shardKeyPredicate(s.dialect),
+		*task.ApplyOperationID, task.Namespace, nullString(task.TableName), task.Shard).Scan(&id)
 	switch {
 	case err == nil:
 		// Existing shard row: update its progress fields under the lease guard.
@@ -335,15 +384,79 @@ func (s *taskStore) UpsertShardProgress(ctx context.Context, task *storage.Task)
 		if err := s.verifyOperationBelongsToApply(ctx, *task.ApplyOperationID, task.ApplyID); err != nil {
 			return err
 		}
+		// The row's identifier is derived from its key, so the unique index on
+		// task_identifier admits one row per (operation, namespace, table,
+		// shard) whatever the writers do. A second insert for the same key
+		// means a row appeared since the lookup above; it is not written
+		// twice, and its existing row is updated instead.
+		task.TaskIdentifier = shardTaskIdentifier(*task.ApplyOperationID, task.Namespace, task.TableName, task.Shard)
 		// Insert gated on the held lease so a displaced operator fails closed.
+		var insertErr error
 		if hasOpLease {
-			return s.insertShardTaskGuarded(ctx, task, opLease)
+			insertErr = s.insertShardTaskGuarded(ctx, task, opLease)
+		} else {
+			insertErr = s.insertShardTaskGuardedByApply(ctx, task, applyLease)
 		}
-		return s.insertShardTaskGuardedByApply(ctx, task, applyLease)
+		if insertErr == nil || !s.classifier.IsDuplicateKey(insertErr) {
+			return insertErr
+		}
+		return s.updateShardTaskAfterDuplicateInsert(ctx, task, insertErr)
 	default:
 		return fmt.Errorf("look up shard task for operation %d %s.%s shard %q: %w",
 			*task.ApplyOperationID, task.Namespace, task.TableName, task.Shard, err)
 	}
+}
+
+// shardKeyPredicate matches a per-shard task row by its key: operation,
+// namespace, table and shard, binding them in that order. The names compare
+// exactly on every dialect (BinaryEquals): MySQL's table default collation is
+// case- and accent-insensitive, and shardTaskIdentifier hashes the exact
+// bytes, so a looser lookup would treat `users` and `Users` as one shard while
+// their identifiers differ. Exact is also what the engine reports: on a
+// target that keeps `users` and `Users` apart they are two tables.
+func shardKeyPredicate(d Dialect) string {
+	return "apply_operation_id = ? AND " + d.BinaryEquals("namespace") +
+		" AND " + d.BinaryEquals("table_name") + " AND " + d.BinaryEquals("shard")
+}
+
+// shardTaskIdentifier derives a per-shard task row's identifier from the key
+// UpsertShardProgress looks it up by. Deriving it rather than drawing a random
+// one is what makes the existing unique index on task_identifier refuse a
+// second row for the same shard. The key's parts are hashed rather than
+// concatenated so the identifier fits the column for any table and shard
+// name, and each part is written with its length so two keys cannot share a
+// hash input whatever bytes their names hold.
+func shardTaskIdentifier(operationID int64, namespace, table, shard string) string {
+	var key strings.Builder
+	for _, part := range []string{namespace, table, shard} {
+		key.WriteString(strconv.Itoa(len(part)))
+		key.WriteByte(':')
+		key.WriteString(part)
+	}
+	sum := sha256.Sum256([]byte(key.String()))
+	return fmt.Sprintf("shard-%d-%s", operationID, hex.EncodeToString(sum[:]))
+}
+
+// updateShardTaskAfterDuplicateInsert handles a shard insert the unique index
+// refused: the row for this key was written after UpsertShardProgress looked
+// it up. It reads that row back by its identifier and its full key, and
+// writes the caller's progress through the lease-guarded Update, so the shard
+// keeps one row. A row holding the identifier under a different key is never
+// written over: it is returned as an error with the insert's refusal, as is a
+// row that cannot be found.
+func (s *taskStore) updateShardTaskAfterDuplicateInsert(ctx context.Context, task *storage.Task, insertErr error) error {
+	var id int64
+	err := s.db.QueryRowContext(ctx,
+		`SELECT id FROM tasks WHERE task_identifier = ? AND `+shardKeyPredicate(s.dialect),
+		task.TaskIdentifier, *task.ApplyOperationID, task.Namespace, nullString(task.TableName), task.Shard).Scan(&id)
+	if err != nil {
+		return fmt.Errorf("re-read shard task %s for operation %d %s.%s shard %q after its insert was refused as a duplicate (%w): %w",
+			task.TaskIdentifier, *task.ApplyOperationID, task.Namespace, task.TableName, task.Shard, insertErr, err)
+	}
+	slog.WarnContext(ctx, "shard progress insert found the shard's row already written; updating that row instead of adding a second",
+		append(task.LogAttrs(), "apply_operation_id", *task.ApplyOperationID, "namespace", task.Namespace, "shard", task.Shard)...)
+	task.ID = id
+	return s.Update(ctx, task)
 }
 
 // verifyOperationBelongsToApply fails closed when apply_operation operationID
@@ -381,6 +494,7 @@ const shardTaskInsertColumns = `
 // shardTaskInsertStatement renders the lease guard; the caller appends the
 // guard's args.
 func shardTaskInsertValues(task *storage.Task) (string, []any) {
+	boundEngineReportedFields(task)
 	options := task.Options
 	if len(options) == 0 {
 		options = []byte("{}")

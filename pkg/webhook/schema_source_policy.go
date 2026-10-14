@@ -75,16 +75,24 @@ func (h *Handler) silentUnownedSchemaOnAggregateFanOut(repo, environment string,
 	return true
 }
 
-// deploymentLabel names this deployment in a claim about its own registry: the
-// one environment it serves. A deployment serving several environments, or
-// every one, has no single name, so the label is empty and the comment falls
-// back to the environments it covers.
-func (h *Handler) deploymentLabel() string {
+// deploymentIdentity names this deployment in a claim about its own registry.
+// A deployment serving one environment is named by it. One serving several
+// but not every environment has no single name, so it is identified by the
+// environments it serves, in promotion order. One serving every environment
+// returns neither and speaks as "this" deployment.
+func (h *Handler) deploymentIdentity() (label string, environments []string) {
 	config, ok := h.serverConfig()
-	if !ok || len(config.AllowedEnvironments) != 1 {
-		return ""
+	if !ok {
+		return "", nil
 	}
-	return config.AllowedEnvironments[0]
+	switch len(config.AllowedEnvironments) {
+	case 0:
+		return "", nil
+	case 1:
+		return config.AllowedEnvironments[0], nil
+	default:
+		return "", config.OrderedEnvironments(config.AllowedEnvironments)
+	}
 }
 
 // answersForUnregisteredDatabase reports whether this leader is the one to

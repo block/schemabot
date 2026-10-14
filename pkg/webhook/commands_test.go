@@ -65,7 +65,7 @@ func TestCommandSpecs_FlagsRespected(t *testing.T) {
 		{name: action.SkipRevert, requiresEnv: true, hasApplyID: true},
 		{name: action.Cutover, requiresEnv: true, hasApplyID: true},
 		{name: action.Rollback, requiresEnv: true, hasApplyID: true},
-		{name: action.RollbackConfirm, requiresEnv: true, supportsDefer: true},
+		{name: action.RollbackConfirm, requiresEnv: true, supportsDefer: true, supportsAllowUnsafe: true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -777,6 +777,17 @@ func TestParseCommand(t *testing.T) {
 			},
 		},
 		{
+			name: "rollback-confirm with allow-unsafe",
+			body: "schemabot rollback-confirm -e production --allow-unsafe",
+			expected: CommandResult{
+				Action:      "rollback-confirm",
+				Environment: "production",
+				AllowUnsafe: true,
+				Found:       true,
+				IsMention:   true,
+			},
+		},
+		{
 			name: "rollback-confirm leaves unsupported database flag out of result",
 			body: "schemabot rollback-confirm -e production -d users_db",
 			expected: CommandResult{
@@ -1036,6 +1047,101 @@ func TestParseCommand_SentenceThenCommand(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			assert.Equal(t, tt.expected, parser.ParseCommand(tt.body))
+		})
+	}
+}
+
+// agentExplanationBody is an agent's explanation of how to land a schema
+// change: an imperative-style command appears only inline in a sentence, and
+// the closing line opens with the product name as the subject of a sentence.
+func agentExplanationBody(lastLine string) string {
+	return "🤖 Heads up: this service's schema is now managed by SchemaBot (#123, merged today). " +
+		"`db/migrate/` is kept as history only, so the new `20260921190000_add_column.rb` in this PR won't be picked up by SchemaBot.\n" +
+		"\n" +
+		"To land this change, move it into the declarative schema instead:\n" +
+		"\n" +
+		"1. Drop `db/migrate/20260921190000_add_column.rb`.\n" +
+		"2. Edit `db/mysql/schema/app_{env}/widgets.sql` so its `CREATE TABLE` reflects the end state you want.\n" +
+		"\n" +
+		lastLine
+}
+
+// An explanation whose closing line opens with the product name, in any case,
+// is a sentence about SchemaBot. It runs nothing and gets no answer, while the
+// same comment with a command alone on a line still runs that command. The
+// letter-case variants are the point: the mention match ignores case, so each
+// spelling must reach the prose rule. The wording of the rest of the closing
+// line is illustrative; every variant is prose for the same reason, a plain
+// word after the product name.
+func TestParseCommand_ExplanationOpeningWithTheProductName(t *testing.T) {
+	parser := NewCommandParser()
+	const withApplySteps = "will then comment the exact DDL it plans for staging and production, " +
+		"and you apply it with `schemabot apply -e staging`, then `schemabot apply -e production`."
+	const onThisPR = "will then comment the exact DDL it plans for staging and production on this PR."
+	const readmeCovers = "will then comment the exact DDL it plans for staging and production, " +
+		"and the README covers how to apply it."
+
+	tests := []struct {
+		name     string
+		body     string
+		expected CommandResult
+	}{
+		{
+			name:     "closing line with inline apply commands",
+			body:     agentExplanationBody("SchemaBot " + withApplySteps),
+			expected: CommandResult{ProseMention: true},
+		},
+		{
+			name:     "closing line about the comment on this PR",
+			body:     agentExplanationBody("SchemaBot " + onThisPR),
+			expected: CommandResult{ProseMention: true},
+		},
+		{
+			name:     "closing line pointing at the README",
+			body:     agentExplanationBody("SchemaBot " + readmeCovers),
+			expected: CommandResult{ProseMention: true},
+		},
+		{
+			name:     "title-case product name",
+			body:     agentExplanationBody("Schemabot " + onThisPR),
+			expected: CommandResult{ProseMention: true},
+		},
+		{
+			name:     "upper-case product name",
+			body:     agentExplanationBody("SCHEMABOT " + withApplySteps),
+			expected: CommandResult{ProseMention: true},
+		},
+		{
+			name:     "lower-case product name",
+			body:     agentExplanationBody("schemabot " + onThisPR),
+			expected: CommandResult{ProseMention: true},
+		},
+		{
+			name:     "explanation sentence alone",
+			body:     "SchemaBot " + onThisPR,
+			expected: CommandResult{ProseMention: true},
+		},
+		{
+			name:     "command alone on a line after the explanation runs",
+			body:     agentExplanationBody("SchemaBot "+onThisPR) + "\n\nschemabot apply -e staging",
+			expected: CommandResult{Action: "apply", Environment: "staging", Found: true, IsMention: true},
+		},
+		{
+			name:     "command alone on a line",
+			body:     "schemabot apply -e staging",
+			expected: CommandResult{Action: "apply", Environment: "staging", Found: true, IsMention: true},
+		},
+		{
+			name:     "capitalized command alone on a line",
+			body:     "SchemaBot apply -e staging",
+			expected: CommandResult{Action: "apply", Environment: "staging", Found: true, IsMention: true},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := parser.ParseCommand(tt.body)
+			assert.Equal(t, tt.expected, got)
 		})
 	}
 }
@@ -1395,4 +1501,104 @@ func TestParseCommand_QuoteReply(t *testing.T) {
 			assert.False(t, parser.HasDeferCutoverFlag(shown.prefix+"schemabot rollback apply-abc123 -e staging --defer-cutover"+closer+"\n\nschemabot rollback apply-abc123 -e staging"))
 		})
 	}
+}
+
+// `--target` narrows plan and apply to one rollout member. Its value is the
+// target's name or deployment/target, and target names are opaque, so it is
+// forwarded exactly as typed, never trimmed: the server matches it against the
+// rollout and names the valid targets when it matches none. A missing value
+// rejects the line as malformed, and the value is never read as a plain word
+// that turns the line into prose.
+func TestParseCommandTargetFlag(t *testing.T) {
+	parser := NewCommandParser()
+
+	tests := []struct {
+		name     string
+		body     string
+		expected CommandResult
+	}{
+		{
+			name: "apply narrowed to a target",
+			body: "schemabot apply -e staging --target payments-002",
+			expected: CommandResult{
+				Action: "apply", Environment: "staging", Target: "payments-002",
+				Found: true, IsMention: true,
+			},
+		},
+		{
+			name: "plan narrowed to deployment/target, case kept",
+			body: "schemabot plan -e production -d payments --target prod-west/Payments_002",
+			expected: CommandResult{
+				Action: "plan", Environment: "production", Database: "payments", Target: "prod-west/Payments_002",
+				Found: true, IsMention: true,
+			},
+		},
+		{
+			name: "plan narrowed without an environment",
+			body: "schemabot plan --target payments-002",
+			expected: CommandResult{
+				Action: "plan", Target: "payments-002", MissingEnv: true, IsMention: true,
+			},
+		},
+		{
+			name:     "missing value",
+			body:     "schemabot apply -e staging --target",
+			expected: CommandResult{IsMention: true},
+		},
+		{
+			name:     "value swallowed by the next flag",
+			body:     "schemabot apply -e staging --target --allow-unsafe",
+			expected: CommandResult{IsMention: true},
+		},
+		{
+			name: "opaque target name forwarded as typed",
+			body: "schemabot apply -e staging --target .payments@002",
+			expected: CommandResult{
+				Action: "apply", Environment: "staging", Target: ".payments@002",
+				Found: true, IsMention: true,
+			},
+		},
+		{
+			name: "trailing punctuation kept, never trimmed",
+			body: "schemabot apply -e staging --target payments-002.",
+			expected: CommandResult{
+				Action: "apply", Environment: "staging", Target: "payments-002.",
+				Found: true, IsMention: true,
+			},
+		},
+		{
+			name:     "given twice",
+			body:     "schemabot apply -e staging --target payments-001 --target payments-002",
+			expected: CommandResult{IsMention: true},
+		},
+		{
+			name: "command that takes no target parses without one",
+			body: "schemabot apply-confirm -e staging --target payments-002",
+			expected: CommandResult{
+				Action: "apply-confirm", Environment: "staging", Found: true, IsMention: true,
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.expected, parser.ParseCommand(tc.body))
+		})
+	}
+}
+
+func TestHasTargetFlag(t *testing.T) {
+	p := NewCommandParser()
+	assert.True(t, p.HasTargetFlag("schemabot apply-confirm -e staging --target payments-002"))
+	assert.False(t, p.HasTargetFlag("schemabot apply-confirm -e staging"))
+	assert.False(t, p.HasTargetFlag("schemabot apply-confirm -e staging\n\nlast time I passed --target payments-002"))
+	assert.False(t, p.HasTargetFlag("schemabot apply-confirm -e staging\n\n```\nschemabot apply -e staging --target payments-002\n```\n"))
+}
+
+func TestCommandSupportsTargetFlag(t *testing.T) {
+	assert.True(t, commandSupportsTargetFlag(action.Plan))
+	assert.True(t, commandSupportsTargetFlag(action.Apply))
+	assert.False(t, commandSupportsTargetFlag(action.ApplyConfirm))
+	assert.False(t, commandSupportsTargetFlag(action.Rollback))
+	assert.False(t, commandSupportsTargetFlag(action.Unlock))
+	assert.False(t, commandSupportsTargetFlag("unknown"))
 }

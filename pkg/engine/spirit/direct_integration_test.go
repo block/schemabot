@@ -90,7 +90,7 @@ func dropTablesOnCleanup(t *testing.T, db *sql.DB, tables ...string) {
 	cleanupCtx := context.WithoutCancel(t.Context())
 	t.Cleanup(func() {
 		for _, table := range tables {
-			_, err := db.ExecContext(cleanupCtx, "DROP TABLE IF EXISTS `"+table+"`")
+			_, err := db.ExecContext(cleanupCtx, "DROP TABLE IF EXISTS "+sqlescape.EscapeIdentifier(table))
 			assert.NoError(t, err, "drop table %s", table)
 		}
 	})
@@ -568,6 +568,40 @@ func TestExactRowCountWithin(t *testing.T) {
 	require.Error(t, err, "a missing table is an error, never a zero count")
 }
 
+// The exact bounded count counts the table a name containing a backtick
+// names: a legal name is not a syntax error, and a name shaped like SQL
+// cannot turn the count into a query over something else.
+func TestExactRowCountWithinEscapesIdentifiers(t *testing.T) {
+	_, db := setupTestMySQL(t)
+	const plain = "ord`ers"
+	const crafted = "big` WHERE 0) x #"
+	dropTablesOnCleanup(t, db, plain, crafted)
+
+	for _, name := range []string{plain, crafted} {
+		_, err := db.ExecContext(t.Context(), "CREATE TABLE "+sqlescape.EscapeIdentifier(name)+" (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, v INT NOT NULL)")
+		require.NoError(t, err, "create %s", name)
+		var inserts strings.Builder
+		inserts.WriteString("INSERT INTO " + sqlescape.EscapeIdentifier(name) + " (v) VALUES (1)")
+		for range 19 {
+			inserts.WriteString(",(1)")
+		}
+		_, err = db.ExecContext(t.Context(), inserts.String())
+		require.NoError(t, err, "seed %s", name)
+	}
+
+	count, err := exactRowCountWithin(t.Context(), db, "testdb", plain, 100)
+	require.NoError(t, err, "a name containing a backtick is counted, not a syntax error")
+	assert.Equal(t, int64(20), count)
+
+	count, err = exactRowCountWithin(t.Context(), db, "testdb", crafted, 10)
+	require.NoError(t, err)
+	assert.Equal(t, int64(11), count, "a table above the bound reports limit+1 whatever its name")
+
+	_, err = exactRowCountWithin(t.Context(), db, "testdb", "ord`ers_absent", 10)
+	require.Error(t, err, "a missing table is an error, never a zero count")
+	assert.Contains(t, err.Error(), "count rows of `testdb`.`ord``ers_absent` (bounded at 11)")
+}
+
 // With the policy enabled, an apply routes a statement the engine refuses —
 // a primary-key reshape — to direct execution and drives it to completion:
 // the PK actually changes on the target, the schema change ends completed,
@@ -633,6 +667,110 @@ func TestEngine_ExecuteAlterPhase_DirectApply(t *testing.T) {
 	assert.Equal(t, "direct_apply", directEntry.Table)
 	assert.Equal(t, "completed", directEntry.State)
 	assert.NotNil(t, directEntry.CompletedAt)
+}
+
+// Stopping a change while its direct-routed statement is still queued for the
+// table's metadata lock leaves the change Stopped and the stop accepted. The
+// direct phase is the last phase here, so a phase that reported the cancelled
+// statement as having run would let the run record the change completed and
+// turn the stop into an already-completed rejection.
+func TestEngine_Stop_DuringDirectStatementKeepsStoppedState(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	dropTablesOnCleanup(t, db, "direct_stop")
+
+	_, err := db.ExecContext(t.Context(), `CREATE TABLE direct_stop (
+		id INT NOT NULL AUTO_INCREMENT,
+		tenant_id INT NOT NULL,
+		PRIMARY KEY (id)
+	)`)
+	require.NoError(t, err, "create direct_stop table")
+	_, err = db.ExecContext(t.Context(), `INSERT INTO direct_stop (tenant_id) VALUES (1), (2), (3)`)
+	require.NoError(t, err, "seed rows")
+
+	// An open transaction that has read the table holds a shared metadata lock
+	// until it ends, so the ALTER's exclusive lock request queues behind it.
+	// The lock bound below is long enough that neither the lock wait nor the
+	// force-kill (which runs at 90% of the bound) ends the wait before the
+	// stop does.
+	// The transaction outlives the test context so cleanup can still roll it
+	// back and free the table for the drop.
+	blockerCtx := context.WithoutCancel(t.Context())
+	blocker, err := db.Conn(blockerCtx)
+	require.NoError(t, err, "open blocker connection")
+	blockerTx, err := blocker.BeginTx(blockerCtx, nil)
+	require.NoError(t, err, "begin blocker transaction")
+	var blockerID int
+	require.NoError(t, blockerTx.QueryRowContext(blockerCtx, `SELECT id FROM direct_stop LIMIT 1`).Scan(&blockerID),
+		"the blocker's read takes the shared metadata lock")
+	t.Cleanup(func() {
+		assert.NoError(t, blockerTx.Rollback(), "release the blocker's metadata lock")
+		utils.CloseAndLog(blocker)
+	})
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	eng := New(Config{Logger: logger})
+
+	applyResult, err := eng.Apply(t.Context(), &engine.ApplyRequest{
+		Database: testDatabase,
+		Changes: []engine.SchemaChange{{
+			Namespace: testDatabase,
+			TableChanges: []engine.TableChange{{
+				Table: "direct_stop",
+				DDL:   "ALTER TABLE `direct_stop` DROP PRIMARY KEY, ADD PRIMARY KEY (`id`, `tenant_id`)",
+			}},
+		}},
+		Credentials: &engine.Credentials{
+			DSN: dsn,
+			Metadata: map[string]string{
+				"direct_execution":                                  "true",
+				"direct_execution_max_table_rows":                   "100000",
+				"direct_execution_lock_acquisition_timeout_seconds": "60",
+			},
+		},
+	})
+	require.NoError(t, err, "Apply()")
+	defer eng.Drain()
+	require.True(t, applyResult.Accepted, "Apply not accepted: %s", applyResult.Message)
+
+	waitForStatementWaitingOnMetadataLock(t, db, "direct_stop")
+
+	stopResult, err := eng.Stop(t.Context(), &engine.ControlRequest{Database: testDatabase})
+	require.NoError(t, err, "Stop() must take effect, not report the change already completed")
+	require.True(t, stopResult.Accepted, "Stop not accepted: %s", stopResult.Message)
+
+	progress, err := eng.Progress(t.Context(), &engine.ProgressRequest{})
+	require.NoError(t, err, "Progress() after stop")
+	assert.Equal(t, engine.StateStopped, progress.State,
+		"stopping during a direct statement must report Stopped, not %s", progress.State)
+	var directEntry *engine.TableProgress
+	for i, tp := range progress.Tables {
+		if tp.ProgressDetail == "direct execution (native MySQL DDL)" {
+			directEntry = &progress.Tables[i]
+		}
+	}
+	require.NotNil(t, directEntry, "progress reports the direct statement")
+	assert.Equal(t, directStateStopped, directEntry.State)
+	assert.Nil(t, directEntry.CompletedAt, "a stopped statement's server-side outcome is indeterminate")
+}
+
+// waitForStatementWaitingOnMetadataLock polls the process list until an ALTER
+// of the named table is queued for its metadata lock, so a test stops the
+// change while the statement is in flight rather than before it was sent.
+func waitForStatementWaitingOnMetadataLock(t *testing.T, db *sql.DB, table string) {
+	t.Helper()
+	deadline := time.Now().Add(copyProgressPollDeadline)
+	for time.Now().Before(deadline) {
+		var waiting int
+		require.NoError(t, db.QueryRowContext(t.Context(), `
+			SELECT COUNT(*) FROM information_schema.PROCESSLIST
+			WHERE STATE = 'Waiting for table metadata lock' AND INFO LIKE ?`,
+			"ALTER TABLE `"+table+"`%").Scan(&waiting))
+		if waiting > 0 {
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Fatalf("no ALTER of %s was waiting for its metadata lock within %s", table, copyProgressPollDeadline)
 }
 
 // A single apply carrying both a refused reshape and an ordinary
@@ -944,8 +1082,8 @@ func TestEngine_ExecuteAlterPhase_ExplicitTableLockFailsBusy(t *testing.T) {
 }
 
 // A direct statement finds the sessions blocking it through
-// performance_schema and innodb_trx, and kills them with CONNECTION_ADMIN. A
-// target user missing any of those grants would reach apply time unable to
+// performance_schema and innodb_trx, and kills them with CONNECTION_ADMIN or,
+// on RDS, through mysql.rds_kill. A target user missing any of those grants would reach apply time unable to
 // kill anything, and the statement would queue on the lock while table traffic
 // stalls behind it. So the verdict fails closed to blocked instead, and the
 // reason names the grants without the database's own error text.
@@ -960,10 +1098,12 @@ func TestResolveRefusedMode_ForceKillUnavailableBlocks(t *testing.T) {
 	// The test context is cancelled before cleanup runs, so each drop gets its
 	// own bounded context that outlives it.
 	cleanupCtx := context.WithoutCancel(t.Context())
-	for _, tc := range []struct {
+	for i, tc := range []struct {
 		name string
 		// grants are given on top of the user's own database.
-		grants      []string
+		grants []string
+		// rdsKill creates mysql.rds_kill, as RDS provides it, for the case.
+		rdsKill     bool
 		wantMode    string
 		wantOutcome string
 	}{
@@ -991,9 +1131,20 @@ func TestResolveRefusedMode_ForceKillUnavailableBlocks(t *testing.T) {
 			grants:   []string{"SELECT ON performance_schema.*", "PROCESS ON *.*", "CONNECTION_ADMIN ON *.*"},
 			wantMode: engine.ExecutionModeDirect,
 		},
+		{
+			// RDS withholds CONNECTION_ADMIN and ends other users' sessions
+			// through its own procedure instead.
+			name:     "EXECUTE on mysql.rds_kill instead of CONNECTION_ADMIN",
+			grants:   []string{"SELECT ON performance_schema.*", "PROCESS ON *.*", "EXECUTE ON PROCEDURE mysql.rds_kill"},
+			rdsKill:  true,
+			wantMode: engine.ExecutionModeDirect,
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			user := fmt.Sprintf("direct_nokill_%d", len(tc.grants))
+			if tc.rdsKill {
+				createRDSKill(t, db)
+			}
+			user := fmt.Sprintf("direct_nokill_%d", i)
 			const password = "direct_nokill_pw"
 			_, err := db.ExecContext(t.Context(), fmt.Sprintf("CREATE USER '%s'@'%%' IDENTIFIED BY '%s'", user, password))
 			require.NoError(t, err, "create user %s", user)
@@ -1321,4 +1472,23 @@ func TestEngine_ExecuteAlterPhase_SparesTrafficDuringRebuild(t *testing.T) {
 	require.True(t, stillRebuilding, "the rebuild must outlast the bystander, without waiting on it, for this scenario")
 	require.Equal(t, engine.StateCompleted, r.state, "the apply completes: %s", r.errorMessage)
 	assert.NoError(t, commitErr, "a transaction that never blocked the statement is not killed")
+}
+
+// createRDSKill creates mysql.rds_kill, the procedure RDS provides for ending
+// another user's session without CONNECTION_ADMIN, and drops it when the test
+// ends. Only its existence and the EXECUTE grant on it are checked before a
+// statement runs directly, so the body does nothing.
+func createRDSKill(t *testing.T, db *sql.DB) {
+	t.Helper()
+	_, err := db.ExecContext(t.Context(), "CREATE PROCEDURE `mysql`.`rds_kill`(IN thread BIGINT) SELECT thread")
+	require.NoError(t, err, "create mysql.rds_kill")
+	// The test context is cancelled before cleanup runs, so the drop gets its
+	// own bounded context that outlives it.
+	cleanupCtx := context.WithoutCancel(t.Context())
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(cleanupCtx, 10*time.Second)
+		defer cancel()
+		_, err := db.ExecContext(ctx, "DROP PROCEDURE IF EXISTS `mysql`.`rds_kill`")
+		assert.NoError(t, err, "drop mysql.rds_kill")
+	})
 }

@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -80,24 +81,24 @@ func SetAuthToken(token string) {
 type bearerTransport struct {
 	base  http.RoundTripper
 	token string
-	// origin, when set, is the one origin (as requestOrigin renders it) the
+	// origin, when set, is the one origin (as RequestOrigin renders it) the
 	// private local-runtime credential may be sent to; every other request
 	// is refused outright.
 	origin string
 }
 
 func (t *bearerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	if t.origin != "" && requestOrigin(req.URL) != t.origin {
+	if t.origin != "" && RequestOrigin(req.URL) != t.origin {
 		return nil, fmt.Errorf("refusing to forward local runtime credentials to another endpoint")
 	}
 	chain, complete := redirectChain(req)
 	if !complete {
-		warnUnauthenticatedRedirect("its origin cannot be established", "", requestOrigin(req.URL))
+		WarnUnauthenticatedRedirect("its origin cannot be established", "", RequestOrigin(req.URL))
 		return t.base.RoundTrip(withoutAuthorization(req))
 	}
 	first := chain[0]
-	if !stayedOnFirstOrigin(chain) {
-		warnUnauthenticatedRedirect("it is on another origin", requestOrigin(first.URL), requestOrigin(req.URL))
+	if !StayedOnFirstOrigin(chain) {
+		WarnUnauthenticatedRedirect("it is on another origin", RequestOrigin(first.URL), RequestOrigin(req.URL))
 		return t.base.RoundTrip(withoutAuthorization(req))
 	}
 	if t.token != "" && req.Header.Get("Authorization") == "" {
@@ -111,23 +112,29 @@ func (t *bearerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	return t.base.RoundTrip(req)
 }
 
-// warnWriter receives the CLI's warning lines. It is the process's stderr, the
-// same stream the commands use for their own warnings, so an operator sees why
-// a later 401 happened next to the command output rather than in a log format
-// they filter out.
-var warnWriter io.Writer = os.Stderr
+// warnWriter receives the CLI's warning lines. Nil means the process's stderr
+// as it is when the warning is written, the same stream the commands use for
+// their own warnings, so an operator sees why a later 401 happened next to the
+// command output rather than in a log format they filter out. It is resolved at
+// write time rather than bound at package init, so a caller that redirects
+// os.Stderr sees the warning too.
+var warnWriter io.Writer
 
-// warnUnauthenticatedRedirect tells the operator that a redirect is being
+// WarnUnauthenticatedRedirect tells the operator that a redirect is being
 // followed without the token and why, naming the origin the token belongs to
 // (when known) and the origin the redirect points at.
-func warnUnauthenticatedRedirect(reason, tokenOrigin, redirectOrigin string) {
+func WarnUnauthenticatedRedirect(reason, tokenOrigin, redirectOrigin string) {
 	subject := "the auth token"
 	if tokenOrigin != "" {
 		subject += " for " + tokenOrigin
 	}
 	// The warning is advisory. A stderr that refuses writes leaves nowhere to
 	// report that, and the request itself is unaffected.
-	_, _ = fmt.Fprintf(warnWriter, "Warning: not sending %s to redirect target %s because %s; the request continues unauthenticated\n",
+	out := warnWriter
+	if out == nil {
+		out = os.Stderr
+	}
+	_, _ = fmt.Fprintf(out, "Warning: not sending %s to redirect target %s because %s; the request continues unauthenticated\n",
 		subject, redirectOrigin, reason)
 }
 
@@ -163,22 +170,29 @@ func redirectChain(req *http.Request) (chain []*http.Request, complete bool) {
 	return chain, true
 }
 
-// stayedOnFirstOrigin reports whether every hop in a redirect chain targets the
-// origin of the request the command sent.
-func stayedOnFirstOrigin(chain []*http.Request) bool {
-	origin := requestOrigin(chain[0].URL)
+// StayedOnFirstOrigin reports whether every hop in a redirect chain targets the
+// origin of the request the command sent. The chain is oldest first, so an
+// http.Client CheckRedirect policy passes its via requests with the pending
+// request appended. Any CLI client that sends a credential across redirects
+// holds it to this rule, so the token stays with the origin it was sent to.
+// An empty chain has sent nothing, so it has left no origin.
+func StayedOnFirstOrigin(chain []*http.Request) bool {
+	if len(chain) == 0 {
+		return true
+	}
+	origin := RequestOrigin(chain[0].URL)
 	for _, hop := range chain[1:] {
-		if requestOrigin(hop.URL) != origin {
+		if RequestOrigin(hop.URL) != origin {
 			return false
 		}
 	}
 	return true
 }
 
-// requestOrigin renders a URL's origin as scheme://host:port, with the scheme
+// RequestOrigin renders a URL's origin as scheme://host:port, with the scheme
 // and host lowercased and the scheme's default port made explicit, so the same
 // server compares equal however a redirect spells it.
-func requestOrigin(u *url.URL) string {
+func RequestOrigin(u *url.URL) string {
 	scheme := strings.ToLower(u.Scheme)
 	port := u.Port()
 	if port == "" {
@@ -231,6 +245,13 @@ type APIError struct {
 	// only on responses that advertise one. Read it through RetryAfter rather
 	// than on its own, so a retry is never scheduled without it.
 	RetryAfterSeconds int
+
+	// RetryAfterHeader is the delay the response's Retry-After header asked
+	// for, zero when it sent none or one that could not be read. Unlike
+	// RetryAfter it does not say whether to retry: a proxy in front of the
+	// server can send it with no error code, so the caller decides from the
+	// status whether the request is worth repeating.
+	RetryAfterHeader time.Duration
 }
 
 func (e *APIError) Error() string {
@@ -239,9 +260,15 @@ func (e *APIError) Error() string {
 
 // RetryAfter reports whether this request should be retried and how long to
 // wait first, so a caller automating against the API gets both facts from one
-// call instead of retrying on the code and ignoring the delay.
+// call instead of retrying on the code and ignoring the delay. Whether to retry
+// comes from the error code alone; the delay is the longer of the body's and
+// the Retry-After header's, so no caller retries sooner than either asked.
 func (e *APIError) RetryAfter() (retry bool, after time.Duration) {
-	return apitypes.ErrorResponse{ErrorCode: e.ErrorCode, RetryAfterSeconds: e.RetryAfterSeconds}.RetryAfter()
+	retry, after = apitypes.ErrorResponse{ErrorCode: e.ErrorCode, RetryAfterSeconds: e.RetryAfterSeconds}.RetryAfter()
+	if !retry {
+		return false, 0
+	}
+	return true, max(after, e.RetryAfterHeader)
 }
 
 // IsNotFound reports whether the error is a 404 from the API.
@@ -291,7 +318,7 @@ func doGetIntoWithClient(ctx context.Context, client *http.Client, endpoint, pat
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return parseAPIError(resp.StatusCode, respBody)
+		return parseAPIError(resp, respBody)
 	}
 
 	if err := json.Unmarshal(respBody, result); err != nil {
@@ -324,7 +351,7 @@ func doSendBody(endpoint, method, path string, body any) error {
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return parseAPIError(resp.StatusCode, respBody)
+		return parseAPIError(resp, respBody)
 	}
 	return nil
 }
@@ -373,7 +400,7 @@ func doPostIntoWithClient(ctx context.Context, client *http.Client, endpoint, pa
 	// recorded and the apply owner completes it asynchronously; the body
 	// carries the same JSON shape as a 200 and is equally a success.
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted {
-		return parseAPIError(resp.StatusCode, respBody)
+		return parseAPIError(resp, respBody)
 	}
 
 	if err := json.Unmarshal(respBody, result); err != nil {
@@ -433,20 +460,63 @@ func stripHTMLTags(s string) string {
 }
 
 // parseAPIError builds an APIError from a non-200 HTTP response, extracting
-// the error_code and any advertised retry delay from the JSON body. The delay
-// is read from the body rather than the Retry-After header because this client
-// keeps error bodies and discards responses.
-func parseAPIError(statusCode int, body []byte) *APIError {
+// the error_code and any advertised retry delay from the JSON body, and the
+// Retry-After header, which a proxy or rate limiter in front of SchemaBot may
+// send with a body that carries neither.
+func parseAPIError(resp *http.Response, body []byte) *APIError {
 	apiErr := &APIError{
-		Status:  statusCode,
-		Message: FormatAPIError(statusCode, body),
+		Status:           resp.StatusCode,
+		Message:          FormatAPIError(resp.StatusCode, body),
+		RetryAfterHeader: parseRetryAfterHeader(resp.Header.Get("Retry-After"), time.Now()),
 	}
-	var resp apitypes.ErrorResponse
-	if json.Unmarshal(body, &resp) == nil {
-		apiErr.ErrorCode = resp.ErrorCode
-		apiErr.RetryAfterSeconds = resp.RetryAfterSeconds
+	var errResp apitypes.ErrorResponse
+	if json.Unmarshal(body, &errResp) == nil {
+		apiErr.ErrorCode = errResp.ErrorCode
+		apiErr.RetryAfterSeconds = errResp.RetryAfterSeconds
 	}
 	return apiErr
+}
+
+// maxRetryAfterHeader bounds the delay a Retry-After header can ask for. The
+// header can come from any proxy or maintenance page in front of the server,
+// which commonly asks for an hour, and a watch that honoured that would sit far
+// past the few minutes of failed polls after which it is documented to give
+// up. The server's own delay arrives in the response body and is not bounded
+// here.
+const maxRetryAfterHeader = 5 * time.Minute
+
+// parseRetryAfterHeader reads a Retry-After header value in either form RFC
+// 9110 allows: a count of seconds, or an HTTP date measured from now, bounded
+// by maxRetryAfterHeader. An absent, malformed, or negative value, or a date
+// already past, yields zero, so a header nobody can act on never delays a
+// retry. A count of seconds too large to read is still a request to wait long,
+// so it yields the bound.
+func parseRetryAfterHeader(value string, now time.Time) time.Duration {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0
+	}
+	if isDigits(value) {
+		seconds, err := strconv.ParseInt(value, 10, 64)
+		if err != nil || seconds > int64(maxRetryAfterHeader/time.Second) {
+			return maxRetryAfterHeader
+		}
+		return time.Duration(seconds) * time.Second
+	}
+	at, err := http.ParseTime(value)
+	if err != nil {
+		return 0
+	}
+	return min(max(at.Sub(now), 0), maxRetryAfterHeader)
+}
+
+func isDigits(s string) bool {
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // ConnectionError represents a client-side failure to reach the server
@@ -523,6 +593,6 @@ func SetLocalAuth(token, endpoint string) {
 	SetAuthToken(token)
 	authTransport.origin = endpoint
 	if u, err := url.Parse(endpoint); err == nil {
-		authTransport.origin = requestOrigin(u)
+		authTransport.origin = RequestOrigin(u)
 	}
 }

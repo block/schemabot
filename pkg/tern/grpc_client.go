@@ -1639,6 +1639,7 @@ func (c *GRPCClient) terminalizeUndispatchedApply(ctx context.Context, apply *st
 	if err := c.storage.Applies().Update(ctx, apply); err != nil {
 		return fmt.Errorf("update undispatched %s gRPC apply %s: %w", terminalization.controlOperation, apply.ApplyIdentifier, err)
 	}
+	releaseActiveApplyForDriveOutcome(ctx, apply, oldState)
 	c.logApplyStateTransition(ctx, apply, storage.LogLevelInfo, fmt.Sprintf("Remote apply %s before dispatch: %s%s", terminalization.verb, apply.State, callerApplyLogSuffix(caller)), oldState)
 	return nil
 }
@@ -1762,11 +1763,12 @@ type applyTaskScope struct {
 	// so nothing derives its terminal state but this drive.
 	tasklessOperation bool
 
-	// deploymentOperationKeys is the full operation-key set of the claimed
-	// operation's deployment, captured from the parent's operation rows at claim
-	// load. Deployment-keyed dispatches send it as the generation manifest so
-	// the data plane knows the whole generation from the first dispatch. Empty
-	// for whole-apply scopes.
+	// deploymentOperationKeys is the operation-key set the claimed operation's
+	// deployment dispatches, excluding members already converged at creation.
+	// Captured from the parent's operation rows at claim load, it includes
+	// dispatched siblings that have since completed. Deployment-keyed dispatches
+	// send it as the generation manifest so the data plane knows the whole
+	// generation from the first dispatch. Empty for whole-apply scopes.
 	deploymentOperationKeys []string
 
 	// memberTarget is the claimed operation's target when its deployment
@@ -1883,9 +1885,17 @@ func (s applyTaskScope) generationOperationKeys() []string {
 
 // stampMemberTarget names the dispatch's rollout member target on the request,
 // so the data plane derives the same target-qualified operation key the
-// planner stored. A scope with no member target leaves the request untouched,
-// keeping every single-target dispatch byte-for-byte what it was.
-func (s applyTaskScope) stampMemberTarget(req *ternv1.ApplyRequest) {
+// planner stored, and the table step the operation runs when the rollout runs
+// table by table, so the data plane runs only that step's tables. A scope with
+// no member target leaves the request untouched, keeping every single-target
+// dispatch byte-for-byte what it was.
+//
+// A table step also carries every change of plan, the plan its target was
+// planned with. A member's plan is stored where it was planned, and a member
+// other than the primary is planned without the data plane storing anything,
+// so the step's own table is not enough for the data plane to rebuild the
+// plan the rest of the target's steps run from.
+func (s applyTaskScope) stampMemberTarget(req *ternv1.ApplyRequest, plan *storage.Plan) {
 	if s.memberTarget == "" {
 		return
 	}
@@ -1893,6 +1903,10 @@ func (s applyTaskScope) stampMemberTarget(req *ternv1.ApplyRequest) {
 		req.Options = make(map[string]string)
 	}
 	req.Options[dispatchMemberTargetOption] = s.memberTarget
+	if s.operation != nil && s.operation.RolloutStep > 0 {
+		req.Options[dispatchRolloutStepOption] = strconv.Itoa(s.operation.RolloutStep)
+		req.PlanDdlChanges = planToProtoTableChanges(plan)
+	}
 }
 
 // remoteOperationScope returns the remote operation id this drive's Progress
@@ -1985,7 +1999,15 @@ func (c *GRPCClient) loadOperationApplyTaskScope(ctx context.Context, apply *sto
 		if op.ID == applyOperationID {
 			found = true
 		}
-		if op.Deployment == operation.Deployment {
+		if op.Deployment != operation.Deployment {
+			continue
+		}
+		// The manifest promises the data plane which keys will arrive. A
+		// converged placeholder never dispatches, so its key is left out;
+		// dispatched siblings keep StartedAt or a remote id and stay in. The
+		// claimed operation is the one key this dispatch is about to send, so
+		// it is always declared, whatever shape its row is in.
+		if op.ID == applyOperationID || !op.IsConvergedPlaceholder() {
 			deploymentOperationKeys = append(deploymentOperationKeys, op.OperationKey)
 		}
 	}
@@ -2691,7 +2713,7 @@ func (c *GRPCClient) dispatchRemoteVSchemaOnly(ctx context.Context, apply *stora
 			IgnoreTables:            plan.IgnoreTables(),
 			DirectExecution:         DirectExecutionPolicyProto(driveOptions.DirectExecution),
 		}
-		scope.stampMemberTarget(req)
+		scope.stampMemberTarget(req, plan)
 		resp, err := c.client.Apply(ctx, req)
 		if err != nil {
 			if isAmbiguousRemoteCallError(err) {
@@ -3203,6 +3225,14 @@ func (c *GRPCClient) resumeApply(ctx context.Context, apply *storage.Apply, scop
 				apply.StartedAt = &now
 			}
 			remoteStartRequested = true
+		}
+
+		// The requeue runs on every claim that is about to complete a start
+		// request, not only on the one whose Start the data plane accepted. A
+		// refused requeue exits before the start request is completed, so the
+		// next claim finds the data plane already left stopped and still has
+		// stopped task rows to requeue.
+		if startRequested {
 			if err := c.requeueStoppedTasksForRemoteStart(ctx, apply, scope); err != nil {
 				return err
 			}
@@ -3528,7 +3558,7 @@ func (c *GRPCClient) dispatchPendingApply(ctx context.Context, apply *storage.Ap
 		// reached the control plane from anywhere else cannot grant one.
 		DirectExecution: DirectExecutionPolicyProto(driveOptions.DirectExecution),
 	}
-	scope.stampMemberTarget(req)
+	scope.stampMemberTarget(req, plan)
 	resp, err := c.client.Apply(ctx, req)
 	if err != nil {
 		if isAmbiguousRemoteCallError(err) {
@@ -3665,13 +3695,15 @@ func isTerminalRemoteProgressError(err error) bool {
 	}
 }
 
-// requeueStoppedTasksForRemoteStart requeues an apply's stopped task rows once the
-// data plane accepts a start. The gRPC drive delegates the engine to remote Tern,
-// so it must mirror LocalClient.prepareStoppedTasksForResume: a task left at
-// "stopped" is pinned there by taskStateWithNoBackwardProgress on every later
-// progress poll (a stopped task blocks active engine progress), so the resumed row
-// copy would never surface in stored task state and the PR progress comment would
-// keep rendering "Stopped" while the data plane is actively copying. Requeuing to
+// requeueStoppedTasksForRemoteStart requeues an apply's stopped task rows while
+// a start request is being completed, whether the data plane accepted the start
+// on this claim or on an earlier one whose requeue was refused. The gRPC drive
+// delegates the engine to remote Tern, so it must mirror
+// LocalClient.prepareStoppedTasksForResume: a task left at "stopped" is pinned
+// there by taskStateWithNoBackwardProgress on every later progress poll (a
+// stopped task blocks active engine progress), so the resumed row copy would
+// never surface in stored task state and the PR progress comment would keep
+// rendering "Stopped" while the data plane is actively copying. Requeuing to
 // pending lets the next progress sync advance the task to running.
 func (c *GRPCClient) requeueStoppedTasksForRemoteStart(ctx context.Context, apply *storage.Apply, scope applyTaskScope) error {
 	tasks, err := c.loadApplyTasks(ctx, apply, scope)
@@ -3682,11 +3714,13 @@ func (c *GRPCClient) requeueStoppedTasksForRemoteStart(ctx context.Context, appl
 		if !state.IsState(task.State, state.Task.Stopped) {
 			continue
 		}
+		previous := *task
 		oldState := task.State
 		task.State = state.Task.Pending
 		task.CompletedAt = nil
 		if err := c.storage.Tasks().Update(ctx, task); err != nil {
-			return fmt.Errorf("requeue stopped task %s for gRPC apply %s start: %w", task.TaskIdentifier, apply.ApplyIdentifier, err)
+			*task = previous
+			return fmt.Errorf("%w: stopped task %s for gRPC apply %s after the data plane accepted the start: %w", ErrTaskRequeueRefused, task.TaskIdentifier, apply.ApplyIdentifier, err)
 		}
 		c.logTaskStateTransition(ctx, apply.ID, task,
 			fmt.Sprintf("Task %s requeued for start", task.TableName), oldState)
@@ -3699,15 +3733,34 @@ func (c *GRPCClient) prepareDispatchTasks(ctx context.Context, apply *storage.Ap
 		if !state.IsState(task.State, state.Task.FailedRetryable) {
 			continue
 		}
+		previous := *task
 		task.State = state.Task.Pending
 		task.ErrorMessage = ""
 		task.CompletedAt = nil
 		task.Attempt++
 		if err := c.storage.Tasks().Update(ctx, task); err != nil {
-			return fmt.Errorf("reset retryable task %s for queued gRPC apply %s: %w", task.TaskIdentifier, apply.ApplyIdentifier, err)
+			*task = previous
+			return fmt.Errorf("%w: retryable task %s for queued gRPC apply %s before dispatch: %w", ErrTaskRequeueRefused, task.TaskIdentifier, apply.ApplyIdentifier, err)
 		}
 	}
 	return nil
+}
+
+// planToProtoTableChanges converts every change of a plan to the form a
+// dispatch carries it in, the same shape tasksToProtoTableChanges gives the
+// tasks built from it.
+func planToProtoTableChanges(plan *storage.Plan) []*ternv1.TableChange {
+	flat := plan.FlatDDLChanges()
+	changes := make([]*ternv1.TableChange, 0, len(flat))
+	for _, change := range flat {
+		changes = append(changes, &ternv1.TableChange{
+			TableName:  change.Table,
+			Ddl:        change.DDL,
+			ChangeType: ternconv.OpToChangeType(change.Operation),
+			Namespace:  change.Namespace,
+		})
+	}
+	return changes
 }
 
 func tasksToProtoTableChanges(tasks []*storage.Task) []*ternv1.TableChange {
@@ -4160,7 +4213,12 @@ func (c *GRPCClient) persistTerminalStateFromRemote(ctx context.Context, storedA
 	}
 	c.logApplyStateTransition(ctx, storedApply, remoteTerminalApplyLogLevel(storedApply), remoteTerminalApplyLogMessage(storedApply), oldState)
 	*remoteApply = *storedApply
-	metrics.AdjustActiveApplies(ctx, -1, storedApply.Database, storedApply.Deployment, storedApply.Environment)
+	// A stopped apply stays counted until it settles (state.CountsAsActiveApply), so
+	// the start that resumes it owes no re-count and its outcome releases it
+	// once.
+	if !state.IsState(storedApply.State, state.Apply.Stopped) {
+		metrics.AdjustActiveApplies(ctx, -1, storedApply.Database, storedApply.Deployment, storedApply.Environment)
+	}
 	return nil
 }
 
@@ -4521,8 +4579,8 @@ func (c *GRPCClient) syncShardProgressFromRemote(ctx context.Context, storedAppl
 		if state.IsState(shardState, state.Task.Completed) {
 			pct = 100
 		}
+		// The store assigns the shard row's identifier from its key.
 		shardTask := &storage.Task{
-			TaskIdentifier:   engine.NewTaskID(),
 			ApplyID:          storedTask.ApplyID,
 			ApplyOperationID: storedTask.ApplyOperationID,
 			PlanID:           storedTask.PlanID,

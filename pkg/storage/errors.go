@@ -26,8 +26,9 @@ var (
 	// ErrLockIntentChanged is returned when the lock's pending plan is no longer
 	// the one a caller observed: an apply's captured lock owner or pending plan
 	// no longer matches at durable apply creation time, a conditional acquire
-	// finds the same owner's lock pinned to another intent, or a row-pinned
-	// release finds the row re-acquired for another plan.
+	// finds the same owner's lock pinned to another intent or released since a
+	// pin was observed, or a row-pinned release finds the row re-acquired for
+	// another plan.
 	ErrLockIntentChanged = errors.New("lock intent changed")
 
 	// ErrCheckNotFound is returned when a check does not exist.
@@ -45,6 +46,11 @@ var (
 	// ErrActiveApplyExists is returned when another active apply already exists
 	// for the same database, type, and environment.
 	ErrActiveApplyExists = errors.New("active apply already exists")
+
+	// ErrApplyTakenOver is returned when an operation would attach to an
+	// apply whose work a newer apply took over (Apply.SupersededBy). The older
+	// apply can only settle over what it already attached.
+	ErrApplyTakenOver = errors.New("a newer apply took over the work of this apply")
 
 	// ErrApplyNotActive is returned when a write requires the apply to still be
 	// active (non-terminal) and it is not — e.g. attaching a new operation to
@@ -64,6 +70,11 @@ var (
 	// a later writer, such as a cancel that arrives after the apply completed,
 	// learns the outcome already landed instead of overwriting it.
 	ErrApplyOutcomeSettled = errors.New("apply outcome already settled")
+
+	// ErrValueRejected is returned when storage refuses a write because a value
+	// does not fit its column. The same write is refused on every attempt, so
+	// it is not a transient failure to retry.
+	ErrValueRejected = errors.New("storage rejected a value its column cannot hold")
 
 	// ErrApplyLeaseLost is returned when an operator-owned write no longer
 	// matches the apply lease token stored by the latest operator claimant.

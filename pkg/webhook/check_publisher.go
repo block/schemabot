@@ -616,12 +616,10 @@ func rewindsConcludedCheckRun(run *ghclient.CheckRunResult, status string) bool 
 // touch schema files, or because the databases don't have environments this instance
 // manages. Without this, branch protection would block indefinitely waiting for a
 // check that would never come. It does not publish success over existing
-// per-database state that still needs operator attention.
-func (h *Handler) postPassingAggregates(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA string) {
-	const (
-		title   = "No schema files changed"
-		summary = "SchemaBot found no changes to managed schema files in this PR."
-	)
+// per-database state that still needs operator attention. unmanaged lists the
+// schema configs the PR changes that this deployment does not manage; when it
+// is non-empty the check says so instead of claiming no schema files changed.
+func (h *Handler) postPassingAggregates(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA string, unmanaged []templates.UnmanagedSchemaConfigNoticeData) {
 	if !h.shouldPublishChecks(ctx, repo, "aggregate_check_sync") {
 		return
 	}
@@ -660,6 +658,7 @@ func (h *Handler) postPassingAggregates(ctx context.Context, client *ghclient.In
 			continue
 		}
 
+		title, summary := passingAggregateOutput(ec.environment, unmanaged)
 		opts := ghclient.CheckRunOptions{
 			Name:       checkName,
 			Status:     checkStatusCompleted,
@@ -1046,4 +1045,18 @@ func (h *Handler) clearAggregateBlocksForVerifiedPR(ctx context.Context, client 
 			"head_sha", headSHA, "blocked_head_sha", existing.HeadSHA,
 			"blocking_reason", existing.BlockingReason)
 	}
+}
+
+// passingAggregateOutput is the title and summary of a passing aggregate for
+// one environment's check: "No schema files changed" when the PR changes no
+// schema at all, or a summary of the unmanaged schema it does change. The
+// aggregate sentinel environment is a deployment serving every environment.
+func passingAggregateOutput(environment string, unmanaged []templates.UnmanagedSchemaConfigNoticeData) (title, summary string) {
+	if len(unmanaged) == 0 {
+		return "No schema files changed", "SchemaBot found no changes to managed schema files in this PR."
+	}
+	if environment == aggregateSentinel {
+		environment = ""
+	}
+	return templates.RenderUnmanagedSchemaPassingCheck(environment, unmanaged)
 }

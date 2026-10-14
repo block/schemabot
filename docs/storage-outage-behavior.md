@@ -97,10 +97,10 @@ checksumming) lives inside the engine and keeps operating while unsupervised.
 
 Storage failures during a drive fall into three deliberate categories:
 
-1. **Progress and state mirror writes: log and keep driving.** A failed task
-   or display-metadata write is logged and skipped; the next poll tick writes
-   current progress. Mirroring is idempotent — a missed write costs staleness,
-   nothing else.
+1. **Progress and state mirror writes: log and keep driving.** A failed
+   progress or display-metadata write is logged and skipped; the next poll tick
+   writes current progress. Mirroring is idempotent — a missed write costs
+   staleness, nothing else.
 
 2. **Safety-gating reads: exit the drive attempt.** If the driver cannot read
    pending control requests, it must not keep driving blind to a possible stop
@@ -109,9 +109,10 @@ Storage failures during a drive fall into three deliberate categories:
    unaffected by the supervisor exiting.
 
 3. **Terminal-state writes: error out, never fabricate.** A failure to persist
-   a terminal state leaves the row non-terminal and claimable; the state is
-   re-derived from tasks on the next claim. Storage uncertainty is never
-   converted into a completed apply or a passing check.
+   a terminal state — a task's failure verdict as much as the apply's own
+   outcome — leaves the row non-terminal and claimable; the state is re-derived
+   from tasks on the next claim. Storage uncertainty is never converted into a
+   completed apply or a passing check.
 
 ## The unsupervised window
 

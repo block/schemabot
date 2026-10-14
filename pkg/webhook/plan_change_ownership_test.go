@@ -50,9 +50,10 @@ func TestPlannedDestructiveTables_CollectsUnsafeAlters(t *testing.T) {
 		"an additive alter stays out; a destructive one is attributed by its table")
 }
 
-// The --allow-unsafe gate and the attribution read the same set: a drop
-// confined to one divergent shard is a table the gate solicits consent for,
-// so no attributed destruction reaches an automatic apply unconsented.
+// Every attributed table is one the --allow-unsafe gate solicits consent for,
+// a drop confined to one divergent shard included, so no attributed
+// destruction reaches an automatic apply unconsented. The gate also covers a
+// created table's lint error, which destroys nothing and is not attributed.
 func TestUnsafeGateCoversEveryAttributedTable(t *testing.T) {
 	planResp := &apitypes.PlanResponse{
 		Changes: []*apitypes.SchemaChangeResponse{{
@@ -60,6 +61,7 @@ func TestUnsafeGateCoversEveryAttributedTable(t *testing.T) {
 			TableChanges: []*apitypes.TableChangeResponse{
 				{TableName: "orders", ChangeType: "drop"},
 				{TableName: "users", ChangeType: "alter"},
+				{TableName: "stations", ChangeType: "create", IsUnsafe: true, UnsafeReason: "column `opened_at` is TIMESTAMP, which overflows in 2038"},
 			},
 		}},
 		Shards: []*apitypes.ShardPlanResponse{{
@@ -77,8 +79,36 @@ func TestUnsafeGateCoversEveryAttributedTable(t *testing.T) {
 		gated = append(gated, unsafe.Table)
 	}
 
-	assert.ElementsMatch(t, plannedDestructiveTables(planResp), gated,
+	assert.Subset(t, gated, plannedDestructiveTables(planResp), "every attributed table is gated")
+	assert.ElementsMatch(t, []string{"audit_log", "orders", "stations"}, gated,
 		"a shard-only drop solicits consent, an additive alter is not gated at all")
+	assert.Equal(t, []string{"audit_log", "orders"}, plannedDestructiveTables(planResp),
+		"the created table's lint error is gated but not attributed")
+}
+
+// A table the plan creates is not on the target yet, so an unsafe finding on
+// it, such as a lint error on one of its columns, destroys nothing and is not
+// attributed, even when another open pull request last changed a table by
+// that name. An unsafe ALTER beside it still is.
+func TestPlannedDestructiveTables_LeavesOutCreatedTables(t *testing.T) {
+	planResp := &apitypes.PlanResponse{
+		Changes: []*apitypes.SchemaChangeResponse{{
+			Namespace: "keyspace",
+			TableChanges: []*apitypes.TableChangeResponse{
+				{TableName: "stations", ChangeType: "create", IsUnsafe: true, UnsafeReason: "column `opened_at` is TIMESTAMP, which overflows in 2038"},
+				{TableName: "docks", ChangeType: "alter", IsUnsafe: true, UnsafeReason: "DROP COLUMN discards the column's data"},
+			},
+		}},
+		Shards: []*apitypes.ShardPlanResponse{{
+			Namespace: "keyspace",
+			Shard:     "-80",
+			Changes: []*apitypes.TableChangeResponse{
+				{TableName: "bikes", ChangeType: "create", IsUnsafe: true, UnsafeReason: "column `serviced_at` is TIMESTAMP, which overflows in 2038"},
+			},
+		}},
+	}
+
+	assert.Equal(t, []string{"docks"}, plannedDestructiveTables(planResp))
 }
 
 func TestPlannedDestructiveTables_NoDestructiveChanges(t *testing.T) {
@@ -199,7 +229,6 @@ func TestRenderPlanComment_ManualConfirmationKeepsAttributedChanges(t *testing.T
 		PendingManualConfirmation: true,
 		PausedApplyCause: &templates.PausedApplyCauseData{
 			Heading: "The plan this apply would be checked against could not be read",
-			Remedy:  "Nothing has run. Review the statements above, then confirm to apply them.",
 		},
 	}
 
@@ -288,7 +317,8 @@ func TestRenderMultiEnvPlanComment_AttributedChangeAnnotatesItsOwnEnvironmentOnl
 // A target that runs its own plan can drop something on a table the primary
 // plan leaves alone, so the ownership lookup covers the tables of every
 // unsafe change the rendered target plans carry beyond the primary plan's,
-// each once, and leaves out VSchema changes, which are no table's. A rollout
+// each once, and leaves out VSchema changes, which are no table's, and
+// changes that create their table, which destroy nothing. A rollout
 // the comment does not render target plans for adds nothing.
 func TestTargetPlanDestructiveTables(t *testing.T) {
 	drift := &templates.DeploymentDriftData{
@@ -302,6 +332,7 @@ func TestTargetPlanDestructiveTables(t *testing.T) {
 					{Table: "users", Reason: "DROP INDEX removes an index", ChangeType: "alter", Targets: []string{"primary/ap"}, TotalTargets: 2},
 					{Table: "reconcile_state", Reason: "DROP TABLE removes all data", ChangeType: "drop", Targets: []string{"primary/us"}, TotalTargets: 2},
 					{Table: "testapp/vschema.json", Reason: "removes vindex", ChangeType: apitypes.VSchemaChangeType},
+					{Table: "stations", Reason: "column `opened_at` is TIMESTAMP, which overflows in 2038", ChangeType: "create"},
 				}},
 		},
 	}

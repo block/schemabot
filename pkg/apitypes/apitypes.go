@@ -89,6 +89,8 @@ const (
 	ErrCodeSourcePolicyDenied   = "source_policy_denied"   // Source repo/path is not authorized for the database
 	ErrCodeLockNotOwned         = "lock_not_owned"         // Lock release denied because the caller is not the owner
 	ErrCodeRateLimited          = "rate_limited"           // Caller or target exceeded its request budget; retry after the advertised delay
+	ErrCodeUnsafeOptInRequired  = "unsafe_opt_in_required" // Plan carries an unsafe change; retry with allow_unsafe=true to consent to it
+	ErrCodePlanBlocked          = "plan_blocked"           // Plan carries a change the engine refuses; no retry or option can apply it
 )
 
 var retryableErrorCodes = map[string]bool{
@@ -118,8 +120,8 @@ type ErrorResponse struct {
 
 	// RetryAfterSeconds is how long the client should wait before retrying,
 	// set only on responses that carry a Retry-After header. It repeats the
-	// header in the body because the CLI's HTTP client reads error bodies and
-	// not response headers.
+	// header in the body so a client that reads only the error body, such as
+	// an older CLI, still sees the wait.
 	RetryAfterSeconds int `json:"retry_after_seconds,omitempty"`
 }
 
@@ -848,6 +850,13 @@ type PlanRolloutResponse struct {
 	// schema, so members are expected to differ. False means every member is
 	// expected to run the primary's plan.
 	Independent bool `json:"independent,omitempty"`
+	// MultiTarget is true when some deployment of the rollout addresses more
+	// than one target. An apply of such a rollout refuses --defer-cutover.
+	MultiTarget bool `json:"multi_target,omitempty"`
+	// ShapeRefusal is why apply creation refuses an apply of the whole rollout
+	// whatever options it carries, naming the apply to run instead. It is
+	// empty when the rollout's shape admits one.
+	ShapeRefusal string `json:"shape_refusal,omitempty"`
 	// Groups holds one entry per distinct plan, naming the members that run
 	// it, with the primary's group first.
 	Groups []*PlanMemberGroupResponse `json:"groups,omitempty"`
@@ -1266,12 +1275,20 @@ func (r *PlanResponse) eachUnsafeChange(fn func(namespace string, c UnsafeChange
 // blocked change guarantees the apply fails, so gates use this to reject the
 // apply before it starts.
 func (r *PlanResponse) HasBlockedChanges() bool {
+	return r.FirstBlockedChange() != nil
+}
+
+// FirstBlockedChange returns the first planned change carrying the blocked
+// execution-mode verdict, namespace-level changes before per-shard ones, or
+// nil when there is none. A refusal names this change and its engine's reason,
+// which says what has to change before an apply can run it.
+func (r *PlanResponse) FirstBlockedChange() *TableChangeResponse {
 	if r == nil {
-		return false
+		return nil
 	}
 	for _, t := range r.FlatTables() {
 		if t.EngineBlocked() {
-			return true
+			return t
 		}
 	}
 	for _, sp := range r.Shards {
@@ -1280,11 +1297,11 @@ func (r *PlanResponse) HasBlockedChanges() bool {
 		}
 		for _, t := range sp.Changes {
 			if t.EngineBlocked() {
-				return true
+				return t
 			}
 		}
 	}
-	return false
+	return nil
 }
 
 // DiscardedCopies returns the unfinished copies on the target that applying
@@ -1339,10 +1356,19 @@ func (r *PlanResponse) DirectChanges() []*TableChangeResponse {
 // AllChangesDirect reports whether every planned change is a direct-execution
 // change (and at least one exists). Options that only affect engine-driven
 // statements — like a deferred cutover — have nothing to act on in such a
-// plan, so their commands are rejected rather than silently ignored.
+// plan, so their commands are rejected rather than silently ignored. A
+// namespace whose shards carry changes of their own runs as those shard
+// changes, so its namespace-level table changes, a collapsed view of them, are
+// not consulted.
 func (r *PlanResponse) AllChangesDirect() bool {
 	if r == nil {
 		return false
+	}
+	carriedByShards := map[string]bool{}
+	for _, sp := range r.Shards {
+		if sp != nil && len(sp.Changes) > 0 {
+			carriedByShards[sp.Namespace] = true
+		}
 	}
 	total := 0
 	for _, sc := range r.Changes {
@@ -1351,6 +1377,9 @@ func (r *PlanResponse) AllChangesDirect() bool {
 		}
 		if sc.HasVSchemaChange() || sc.NeedsFinalizer() {
 			return false
+		}
+		if carriedByShards[sc.Namespace] {
+			continue
 		}
 		total += len(sc.TableChanges)
 		for _, t := range sc.TableChanges {
@@ -1482,6 +1511,20 @@ func (r *PlanResponse) RenderedTables() []*TableChangeResponse {
 		}
 	}
 	return tables
+}
+
+// FinalizesOnly reports whether a namespace's only work in the plan is the
+// finalize its engine asked for: no VSchema change to show and no DDL, whether
+// the namespace carries its DDL itself or on its shards. A namespace with DDL
+// finalizes as part of that work, so surfaces name the finalize on its own line
+// only when this holds.
+func (r *PlanResponse) FinalizesOnly(sc *SchemaChangeResponse) bool {
+	if sc == nil || !sc.NeedsFinalizer() || sc.ShowsVSchemaChange() || len(sc.TableChanges) > 0 {
+		return false
+	}
+	return !slices.ContainsFunc(r.Shards, func(sp *ShardPlanResponse) bool {
+		return sp != nil && sp.Namespace == sc.Namespace && len(sp.Changes) > 0
+	})
 }
 
 // HasChanges reports whether the plan carries any work an apply would execute:
@@ -1725,6 +1768,13 @@ type ProgressResponse struct {
 	// on_failure=pause no longer holds later deployments — the rollout proceeds
 	// like continue. Apply-level: it applies to every operation of the apply.
 	Released bool `json:"released,omitempty"`
+	// Sharded is true when the apply is one change fanned out across its
+	// keyspaces' shards. Tables then carries one row per keyspace table with
+	// its shards listed under it (a table on its keyspace's only shard keeps
+	// its own row and names no shard), and Metadata carries each finalizer's
+	// VSchema change. Operations still lists every shard and finalizer row,
+	// but a client renders the apply as one change, the way its PR comments do.
+	Sharded bool `json:"sharded,omitempty"`
 }
 
 // ProgressOperationResponse represents progress for one deployment operation.
@@ -1748,8 +1798,16 @@ type ProgressOperationResponse struct {
 	OnFailure    string `json:"on_failure,omitempty"`
 	ErrorCode    string `json:"error_code,omitempty"`
 	ErrorMessage string `json:"error_message,omitempty"`
-	StartedAt    string `json:"started_at,omitempty"`
-	CompletedAt  string `json:"completed_at,omitempty"`
+	// AlreadyConverged is true for an operation recorded completed when the
+	// apply was created, because its target already held the change and
+	// nothing ran there.
+	AlreadyConverged bool `json:"already_converged,omitempty"`
+	// RolloutStep is the table step this operation runs, numbered from 1, when
+	// the rollout runs table by table: one operation per target and table.
+	// Omitted for an operation that runs its member's whole change.
+	RolloutStep int    `json:"rollout_step,omitempty"`
+	StartedAt   string `json:"started_at,omitempty"`
+	CompletedAt string `json:"completed_at,omitempty"`
 }
 
 // TableProgressResponse represents progress for a single table.
@@ -1775,8 +1833,13 @@ type TableProgressResponse struct {
 	// (data plus indexes), for display beside the row counts. It is the
 	// table's size when planned, not a measure of copy progress. Absent when
 	// the plan had no estimate and for a task scoped to one shard, since the
-	// estimate covers the whole table.
+	// estimate covers the whole table. A sharded table rolled up across its
+	// shards carries it, covering every shard.
 	EstimatedBytes *int64 `json:"estimated_bytes,omitempty"`
+	// PlannedShards is how many shards a sharded table's change spans per its
+	// plan, the shards EstimatedBytes covers. Zero when the plan recorded no
+	// count and for a table not rolled up across shards.
+	PlannedShards int32 `json:"planned_shards,omitempty"`
 	// Checksum phase progress: rows verified so far and total to verify.
 	// Non-zero only while the table is checksumming (verifying copied data).
 	ChecksumRowsChecked int64 `json:"checksum_rows_checked,omitempty"`

@@ -1,10 +1,34 @@
 package engine
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"strings"
 )
+
+// ErrTargetHeld reports that an engine could not start a schema change because
+// another run already holds the target, such as a run an earlier driver of the
+// same apply started and has not yet brought down. The refusal is not a failure
+// of the schema change: the work can start once the holder releases the target,
+// and retrying sooner is only refused again.
+var ErrTargetHeld = errors.New("target is held by another run of a schema change")
+
+// ErrCancelledByOperator is the cause a driver cancels a drive's context with
+// when an operator command ends the schema change for good, as a cancel does.
+// No driver resumes the change afterwards, so work the engine set up for it
+// and kept only so a resume could continue from it is the engine's to remove.
+// A drive cancelled for any other reason, such as a lost lease or a shutdown,
+// carries no such cause: another driver resumes the change from its stored
+// state, and that work must be kept.
+var ErrCancelledByOperator = errors.New("schema change cancelled by an operator")
+
+// CancelledByOperator reports whether ctx ended because an operator cancelled
+// the schema change (ErrCancelledByOperator), as opposed to the drive being
+// handed to another driver.
+func CancelledByOperator(ctx context.Context) bool {
+	return errors.Is(context.Cause(ctx), ErrCancelledByOperator)
+}
 
 // PermanentError wraps an error to indicate it should not be retried.
 // Engines return this when the error is permanent.

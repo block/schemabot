@@ -198,9 +198,8 @@ func (s *Service) pullRateLimitEnforced() bool {
 
 // writeRateLimited writes a 429 carrying how long the caller must wait, both as
 // the standard Retry-After header and in the response body. The body repeats it
-// because the CLI's HTTP client reads error bodies and not response headers, so
-// a header-only hint would be invisible to the client most likely to be
-// limited. Both come from the same rounded value the response body carries, so
+// so a client that reads only the error body, such as an older CLI, still sees
+// the wait. Both come from the same rounded value the response body carries, so
 // the header and the message can never disagree.
 func (s *Service) writeRateLimited(w http.ResponseWriter, retryAfter time.Duration, reason string) {
 	body := apitypes.NewRateLimitedResponse(reason, retryAfter)

@@ -89,6 +89,7 @@ func declaredCheckBlockReasonVars(t *testing.T) map[string]string {
 		"BlockParticipantUnresolved":            checkstate.BlockParticipantUnresolved,
 		"BlockReviewTimeDeploymentDrift":        checkstate.BlockReviewTimeDeploymentDrift,
 		"BlockNamespacePlacementRefused":        checkstate.BlockNamespacePlacementRefused,
+		"BlockNarrowedApply":                    checkstate.BlockNarrowedApply,
 	}
 
 	found := map[string]string{}

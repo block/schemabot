@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/stretchr/testify/assert"
@@ -115,6 +116,40 @@ func TestWatchModel_GivesUpAfterConsecutiveRetryableFailures(t *testing.T) {
 	assert.Equal(t, progressGiveUpMessage(scriptedApplyID, maxConsecutiveProgressFailures)+": "+failure.errorMsg, model.errorMsg)
 	assert.Contains(t, model.errorMsg, "fetch progress for apply "+scriptedApplyID+": 10 consecutive attempts failed; this watch does not affect the apply")
 	assert.Equal(t, state.Apply.Running, model.state, "the last known state is kept on screen")
+}
+
+// The interactive watch follows the same rule as the log and JSON watches: a
+// refused poll whose response names a delay is retried no sooner than that
+// delay, a refusal without one uses the fetch-error backoff, and a successful
+// poll returns to the base interval.
+func TestWatchModel_HonorsRetryAfterHeader(t *testing.T) {
+	retryAfter := ""
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if retryAfter != "" {
+			w.Header().Set("Retry-After", retryAfter)
+		}
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(proxyRateLimitPage))
+	}))
+	t.Cleanup(srv.Close)
+
+	m := NewWatchModel(srv.URL, "", "staging", false)
+	m.applyID = scriptedApplyID
+	require.Equal(t, pollInterval, m.nextPollDelay())
+
+	retryAfter = "45"
+	updated, _ := m.Update(m.fetchProgress()())
+	model := updated.(WatchModel)
+	assert.Equal(t, 45*time.Second, model.nextPollDelay())
+
+	updated, _ = model.Update(progressMsg{state: state.Apply.Running})
+	model = updated.(WatchModel)
+	assert.Equal(t, pollInterval, model.nextPollDelay())
+
+	retryAfter = ""
+	updated, _ = model.Update(model.fetchProgress()())
+	model = updated.(WatchModel)
+	assert.Equal(t, fetchErrorBackoff(1), model.nextPollDelay())
 }
 
 func TestWatchModel_CompletedViewShowsCompactSummary(t *testing.T) {
@@ -469,6 +504,43 @@ func TestWatchModel_SingleDeploymentOutputDoesNotUseMultiView(t *testing.T) {
 	assert.NotContains(t, withSingleOperation, "us-east — running table copy")
 }
 
+// A sharded apply watches as one change, as its PR comments render it: the
+// shards counted by status, each table once under its keyspace with its
+// shards listed beneath it, and no section for a shard or the finalizer.
+func TestWatchModel_ShardedApplyDoesNotUseMultiView(t *testing.T) {
+	progress := apitypes.ProgressResponse{
+		State:       state.Apply.Running,
+		ApplyID:     "apply-sharded",
+		Database:    "shop",
+		Environment: "staging",
+		Sharded:     true,
+		Operations: []*apitypes.ProgressOperationResponse{
+			{Deployment: "data-plane", OperationKey: "shop_001/-80/orders", OperationKind: storage.ApplyOperationKindWork, State: state.ApplyOperation.Running},
+			{Deployment: "data-plane", OperationKey: "shop_001/80-/orders", OperationKind: storage.ApplyOperationKindWork, State: state.ApplyOperation.Running},
+			{Deployment: "data-plane", OperationKey: "shop_001/group_finalizer", OperationKind: storage.ApplyOperationKindGroupFinalizer, State: state.ApplyOperation.Pending},
+		},
+		Tables: []*apitypes.TableProgressResponse{{
+			Deployment: "data-plane", Keyspace: "shop_001", TableName: "orders", ChangeType: "alter",
+			DDL: "ALTER TABLE `orders` ADD COLUMN `note` text", Status: state.Task.Running, RowsCopied: 840, RowsTotal: 2000, PercentComplete: 42,
+			Shards: []*apitypes.ShardProgressResponse{
+				{Shard: "-80", Status: state.Task.Running, RowsCopied: 420, RowsTotal: 1000, PercentComplete: 42},
+				{Shard: "80-", Status: state.Task.Running, RowsCopied: 420, RowsTotal: 1000, PercentComplete: 42},
+			},
+		}},
+	}
+	m := NewWatchModel("http://localhost:8080", "shop", "staging", false)
+	m.initialized = true
+	updated, _ := m.Update(parseProgressResult(&progress))
+
+	view := updated.(WatchModel).View()
+
+	assert.Equal(t, 1, strings.Count(view, "orders:"), "the table renders once:\n%s", view)
+	assert.Contains(t, view, "Shards:  2 running table copy")
+	assert.Contains(t, view, "Shards: 2 (2 copying)")
+	assert.NotContains(t, view, "group_finalizer")
+	assert.NotContains(t, view, "Deployments:")
+}
+
 func multiDeploymentTUITestProgress() apitypes.ProgressResponse {
 	return apitypes.ProgressResponse{
 		State:       state.Apply.Failed,
@@ -820,7 +892,7 @@ func TestGetProgress_ServerReturns500_CLIReturnsError(t *testing.T) {
 
 // Two targets of one deployment each copy their own tables against their own
 // schema. The watch view rolls the deployment up the way the progress output
-// does, listing each table once under the targets that copied it, so a
+// does, listing each table once and naming the targets that copied it, so a
 // deployment addressing several targets does not show every copy twice.
 func TestWatchModel_MultiTargetRollupScopesTablesToTheirMember(t *testing.T) {
 	m := NewWatchModel("http://localhost:8080", "testapp", "production", false)
@@ -832,8 +904,8 @@ func TestWatchModel_MultiTargetRollupScopesTablesToTheirMember(t *testing.T) {
 		{Deployment: "primary", Target: "testapp-002", State: state.ApplyOperation.Running, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt},
 	}
 	m.tables = []templates.TableProgress{
-		{Deployment: "primary", Target: "testapp-001", TableName: "users_001", ChangeType: "alter", Status: state.Task.Completed},
-		{Deployment: "primary", Target: "testapp-002", TableName: "users_002", ChangeType: "alter", Status: state.Task.Running},
+		{Deployment: "primary", Target: "testapp-001", TableName: "users_001", ChangeType: "alter", DDL: "ALTER TABLE `users_001` ADD COLUMN `region` varchar(20)", Status: state.Task.Completed},
+		{Deployment: "primary", Target: "testapp-002", TableName: "users_002", ChangeType: "alter", DDL: "ALTER TABLE `users_002` ADD COLUMN `region` varchar(20)", Status: state.Task.Running},
 	}
 
 	view := m.View()
@@ -841,14 +913,28 @@ func TestWatchModel_MultiTargetRollupScopesTablesToTheirMember(t *testing.T) {
 	assertContainsInOrder(t, view,
 		"Targets: 1 completed · 1 running",
 		"primary — 1 completed · 1 running (2 targets)",
-		"target testapp-001",
-		"users_001",
-		"target testapp-002",
 		"users_002",
+		"target testapp-002",
+		"users_001",
+		"target testapp-001",
 		"To stop this schema change:",
 		"schemabot stop apply-multi-target -e production",
 		"ESC to detach",
 	)
-	assert.Equal(t, 1, strings.Count(view, "users_001"))
-	assert.Equal(t, 1, strings.Count(view, "users_002"))
+	assert.Equal(t, 1, strings.Count(view, "users_001:"))
+	assert.Equal(t, 1, strings.Count(view, "users_002:"))
+}
+
+// An apply SchemaBot has accepted but not yet started reads as queued in the
+// watch view, matching the PR comment, so a wait for capacity never looks like
+// an apply that hung on startup.
+func TestWatchModel_PendingApplyReadsAsQueued(t *testing.T) {
+	m := NewWatchModel("http://localhost:8080", "testdb", "staging", true)
+	m.initialized = true
+	m.state = state.Apply.Pending
+
+	view := m.View()
+
+	assert.Contains(t, view, "Queued, starts automatically")
+	assert.NotContains(t, view, "Starting")
 }

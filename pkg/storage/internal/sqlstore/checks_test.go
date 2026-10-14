@@ -84,7 +84,7 @@ func TestCheckStore_PlanWriteOnDeletedRowReportsCheckNotFound(t *testing.T) {
 		Status: "completed", Conclusion: "success",
 	}
 
-	landed, err := store.checks.writePlanResultUnlessApplyOwned(ctx, check, storage.PlanDriftNotEvaluated, nil)
+	landed, err := store.checks.writePlanResultUnlessApplyOwned(ctx, check, nil, nil)
 	require.ErrorIs(t, err, storage.ErrCheckNotFound)
 	assert.False(t, landed)
 }

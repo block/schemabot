@@ -550,6 +550,36 @@ var SettledApplyStates = []string{
 	Apply.Reverted,
 }
 
+// CountsAsActiveApply reports whether an apply in applyState is counted on the
+// active-apply gauge. An apply is counted from acceptance until it settles,
+// stopped included, because a stopped apply still holds its database until an
+// operator starts or cancels it, however long that takes. The gauge therefore
+// counts applies parked on an operator as well as applies a driver is running.
+//
+// A retryable pause also holds its database but is not counted: it is released
+// when the apply pauses and counted again by the drive that retries it. That
+// keeps it balanced on the paths that leave a pause without a drive, since a
+// cancel and the retry budget running out both settle it without moving the
+// gauge.
+func CountsAsActiveApply(applyState string) bool {
+	return !IsState(applyState, SettledApplyStates...) && !IsState(applyState, Apply.FailedRetryable)
+}
+
+// IsManifestGatedVerdict reports whether a derived apply state asserts a
+// whole-generation outcome: completed claims every declared operation applied,
+// and reverted claims every declared operation was unwound. Neither claim is
+// honest while operations a generation manifest declares have not attached, so
+// the manifest hold gates both. Failure verdicts are not gated: a failed
+// generation must not wait for siblings that may never dispatch.
+//
+// The operator's projection holds a deployment-keyed apply open on it, and
+// storage admits a new generation past a held one only when the verdict over
+// what attached is one this gates, so the two agree on which applies are held.
+func IsManifestGatedVerdict(derived string) bool {
+	return IsState(derived, Apply.Completed) ||
+		IsState(derived, Apply.Reverted)
+}
+
 // IsRunningApplyState reports whether an apply is in a running-family state:
 // running, running_degraded (a rollout still in flight past a failed sibling,
 // whether it is continuing or halted), or one of the post-copy phases (catching_up,

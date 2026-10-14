@@ -513,17 +513,18 @@ message PlanRequest {
   optional bool grouped_execution = 12;
   // Live tables the repository's ignore_tables config withholds from the
   // planner, so a table no schema file declares is not proposed for
-  // DROP TABLE. Matched exactly and case-sensitively against the target's own
-  // catalog, in every namespace the plan covers. The engine discloses what it
-  // actually withheld through exempt_tables on the response, and refuses a
-  // table the config withholds that a schema file also declares.
+  // DROP TABLE. Matched against the target's own catalog, in every namespace
+  // the plan covers: a plain entry exactly and case-sensitively, and an entry
+  // wrapped in slashes as a regular expression over the whole name. The
+  // engine discloses what it actually withheld through exempt_tables on the
+  // response, and refuses a table the config withholds that a schema file
+  // also declares.
   repeated string ignore_tables = 13;
   // The caller's resolved direct execution policy for this database and
   // environment. A control plane forwards it so the target that runs the
   // statement judges it under the policy the control plane's config states.
   // Absent means the caller states no policy and the executing server's own
-  // configuration decides, which with none configured leaves every statement
-  // the engine refuses blocked.
+  // configuration decides, which with none configured is the default policy.
   DirectExecutionPolicy direct_execution = 14;
   // Declared namespaces the caller left out of schema_files because the
   // target's entry in its database's targets list selects only other
@@ -807,6 +808,14 @@ message ApplyRequest {
   // the apply up later — on another pod, or after a restart — routes under
   // the policy the dispatch was admitted under rather than re-deriving one.
   DirectExecutionPolicy direct_execution = 14;
+  // Every change of the plan a table step's dispatch runs part of. A step's
+  // ddl_changes name only its own table, so a deployment that has not stored
+  // the plan builds it from these instead: it verifies the whole plan against
+  // its live schema, stores it once, and runs the step's table from it, so
+  // every later step of the same target finds the plan its own target was
+  // planned with. Empty on a dispatch that is not a table step, whose
+  // ddl_changes already carry its whole plan.
+  repeated TableChange plan_ddl_changes = 15;
 }
 
 // ApplyConflict names the active work that refused an apply, in the terms a

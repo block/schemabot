@@ -21,7 +21,7 @@ available, such as `repository`, `github_app`, and `installation_id`.
 | `schemabot.source_policy.blocks_total` | Counter | operation, database, environment, reason | Trusted-source plan/apply requests blocked by source policy |
 | `schemabot.pr_command_actor_authorization.total` | Counter | command, database, environment, repository, status, reason | GitHub PR command actor authorization decisions |
 | `schemabot.schema_request.errors_total` | Counter | repository, command, database, environment, reason | Schema request errors by reason |
-| `schemabot.active_applies` | UpDownCounter | database, environment | In-progress applies |
+| `schemabot.active_applies` | UpDownCounter | database, deployment, environment | Applies holding their database: counted from acceptance until the apply settles. A stopped apply stays counted, so a value that stays non-zero can be applies parked on an operator's start or cancel rather than work in flight; a retryable pause is not counted |
 | `schemabot.check_ownership_misses_total` | Counter | operation, repository, database, database_type, environment | Guarded check updates skipped because ownership changed |
 | `schemabot.promotion.config_error_blocks_total` | Counter | repository, database, environment | Applies blocked because the target environment is absent from the configured promotion order |
 | `schemabot.status_check_operations_total` | Counter | operation, status, repository, database, database_type, environment | Status-check storage and GitHub operations |
@@ -118,7 +118,7 @@ available, such as `repository`, `github_app`, and `installation_id`.
 
 **operation** (locks): `acquire`, `release`
 
-**status** (locks): `success`, `conflict`, `not_found`, `not_owned`, `error`
+**status** (locks): `success`, `conflict`, `not_found`, `not_owned`, `no_acquirer` (a scoped acquire refused because there is no verified acquirer to record; the log line carries the reason), `error`
 
 **event_type** (webhooks): `create`, `issues`, `issue_comment`, `pull_request`, `pull_request_review`, `pull_request_review_comment`, `check_run`, `check_suite`, `ping`, `push`
 
@@ -138,9 +138,9 @@ available, such as `repository`, `github_app`, and `installation_id`.
 
 **status** (GitHub API): `success`, `error`, `not_found` (a 404 answer to a read operation — an expected "no" from probes like schemabot.yaml lookups; 404s on auth and write operations stay `error`), `transport_error` (no HTTP response: dial/TLS failure or deadline — the signature of GitHub being unreachable), `cancelled` (SchemaBot cancelled the request itself, e.g. during shutdown), `unknown`
 
-**reason** (operator claim failures): `expire_retryable_error`, `missing_lease_token`, `operation_storage_error`, `missing_operation_lease_token`, `operation_set_list_error`, `operation_set_missing`, `operation_task_inspect_error`, `operation_cutover_storage_error`, `missing_operation_cutover_lease_token`, `operation_cutover_set_list_error`, `operation_cutover_set_invalid`, `operation_parent_load_error`, `operation_parent_missing`, `operation_parent_claim_error`, `operation_parent_not_claimable`, `operation_parent_release_error`, `operation_lease_release_error`, `operation_lease_recheck_error`, `operation_lease_recheck_missing`, `operation_lease_rotated`, `operation_lease_released_by_peer`, `missing_operation_deployment`, `stop_reconciliation_claim_error`, `stop_reconciliation_missing_lease_token`, `operation_projection_claim_error`, `operation_projection_missing_lease_token`, `stranded_reaper_error`, `stranded_task_reaper_error`, `unknown`
+**reason** (operator claim failures): `expire_retryable_error`, `missing_lease_token`, `operation_storage_error`, `missing_operation_lease_token`, `operation_set_list_error`, `operation_set_missing`, `operation_task_inspect_error`, `operation_cutover_storage_error`, `missing_operation_cutover_lease_token`, `operation_cutover_set_list_error`, `operation_cutover_set_invalid`, `operation_parent_load_error`, `operation_parent_missing`, `operation_parent_claim_error`, `operation_parent_not_claimable`, `operation_parent_release_error`, `operation_lease_release_error`, `operation_lease_recheck_error`, `operation_lease_recheck_missing`, `operation_lease_rotated`, `operation_lease_released_by_peer`, `missing_operation_deployment`, `stop_reconciliation_claim_error`, `stop_reconciliation_missing_lease_token`, `operation_projection_claim_error`, `operation_projection_missing_lease_token`, `stranded_reaper_error`, `stranded_task_reaper_error`, `stranded_active_task_reaper_error`, `stranded_control_request_reaper_error`, `unknown`
 
-**reason** (operator resume failures): `missing_deployment`, `no_client`, `resume_error`, `lease_lost`, `retry_budget_exhausted`, `recovery_window_expired`
+**reason** (operator resume failures): `missing_deployment`, `no_client`, `resume_error`, `lease_lost`, `lease_presumed_lost`, `retry_budget_exhausted`, `recovery_window_expired`, `drive_panic`, `drive_stalled`, `operation_no_tasks`, `apply_tasks_not_loaded`, `apply_task_row_missing`, `task_requeue_refused` (storage refused the write putting a task back to `pending` for a retry or a start; the task row stays at rest and the next claim retries the requeue), `task_verdict_refused` (storage refused the write recording a task's terminal outcome; the apply stays active, an operation drive's row is left claimable, and the next claim settles the apply from the stored task rows), `post_terminal_reconcile` (the drive stored the apply's terminal outcome but an answer owed after it, such as completing the pending start, did not land; the operator's post-drive settlement retries it, and the reaper's stranded control-request sweep answers what that settlement could not once the apply is quiescent)
 
 **operation** (storage schema refusals): `alter`, `drop` — the statement types the plan's linters can flag as unsafe
 
@@ -487,13 +487,18 @@ The `otelhttp` middleware automatically produces standard HTTP metrics for every
 
 | Metric | Type | Attributes | Description |
 |---|---|---|---|
-| `http.server.request.duration` | Histogram | environment, http.request.method, http.response.status_code | Request latency by method and status code |
+| `http.server.request.duration` | Histogram | environment, http.request.method, http.response.status_code, http.route | Request latency by method, status code, and route |
 | `http.server.request.body.size` | Histogram | environment | Request body sizes |
 | `http.server.response.body.size` | Histogram | environment | Response body sizes |
 
 SchemaBot attaches `environment="unknown"` to these process-wide HTTP metrics
 because routing-level request metrics do not belong to one schema change
 environment. Environment-specific operation metrics use the real environment.
+
+`http.route` is the route pattern the request matched, such as
+`/api/history/{database}`, never the request path, so its values are bounded by
+the route table. It is set for requests the auth middleware rejects as well as
+ones it lets through. A request that matches no route omits it.
 
 ## Adding New Metrics
 

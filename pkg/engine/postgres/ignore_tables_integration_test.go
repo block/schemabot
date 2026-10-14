@@ -109,3 +109,57 @@ func TestEnginePlanIgnoreTablesRefusesDeclaredTable(t *testing.T) {
 	assert.True(t, testutil.PostgresTableExists(t, db, "public", "flyway_schema_history"),
 		"a refused plan must never touch the target")
 }
+
+// A pattern entry withholds a family of runtime-created tables on PostgreSQL
+// the same way it does on the MySQL-family engines: each member is withheld and
+// disclosed, an undeclared table the pattern does not match in full is still
+// reported as a drop, and a pattern that reaches a declared table is refused.
+func TestEnginePlanIgnoreTablesPatternWithholdsRuntimeTableFamily(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "plan_ignore_pattern_test")
+	_, err := db.ExecContext(t.Context(), `
+		CREATE TABLE public.users (id bigint PRIMARY KEY);
+		CREATE TABLE public.relay_1_feed (id bigint PRIMARY KEY, payload jsonb);
+		CREATE TABLE public.relay_22_feed (id bigint PRIMARY KEY, payload jsonb);
+		CREATE TABLE public.relay_feed_settings (id bigint PRIMARY KEY)`)
+	require.NoError(t, err)
+
+	result, err := New().Plan(t.Context(), &engine.PlanRequest{
+		Database: "plan_ignore_pattern_test",
+		SchemaFiles: schema.SchemaFiles{
+			"public": {Files: map[string]string{
+				"users.sql": "CREATE TABLE users (id bigint PRIMARY KEY)",
+			}},
+		},
+		Credentials:  &engine.Credentials{DSN: dsn},
+		IgnoreTables: []string{`/^relay_\d+_feed$/`},
+	})
+	require.NoError(t, err)
+
+	require.Len(t, result.ExemptTables, 1)
+	assert.Equal(t, "public", result.ExemptTables[0].Namespace)
+	assert.Equal(t, []string{"relay_1_feed", "relay_22_feed"}, result.ExemptTables[0].Tables)
+	assert.Equal(t, engine.ExemptReasonIgnoreTables, result.ExemptTables[0].Reason)
+
+	require.Len(t, result.Changes, 1)
+	require.Len(t, result.Changes[0].TableChanges, 1)
+	assert.Equal(t, "relay_feed_settings", result.Changes[0].TableChanges[0].Table,
+		"the undeclared table the pattern does not match is still reported")
+
+	_, err = New().Plan(t.Context(), &engine.PlanRequest{
+		Database: "plan_ignore_pattern_test",
+		SchemaFiles: schema.SchemaFiles{
+			"public": {Files: map[string]string{
+				"users.sql":        "CREATE TABLE users (id bigint PRIMARY KEY)",
+				"relay_1_feed.sql": "CREATE TABLE relay_1_feed (id bigint PRIMARY KEY, payload jsonb)",
+			}},
+		},
+		Credentials:  &engine.Credentials{DSN: dsn},
+		IgnoreTables: []string{`/^relay_\d+_feed$/`},
+	})
+	require.Error(t, err, "Plan() must refuse a pattern that matches a declared table")
+	assert.Contains(t, err.Error(), `ignore_tables entry "/^relay_\d+_feed$/" matches "relay_1_feed", which a schema file in namespace "public" declares`)
+
+	for _, table := range []string{"users", "relay_1_feed", "relay_22_feed", "relay_feed_settings"} {
+		assert.True(t, testutil.PostgresTableExists(t, db, "public", table), "planning must never touch the target")
+	}
+}

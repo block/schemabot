@@ -1,6 +1,7 @@
 package api
 
 import (
+	"fmt"
 	"log/slog"
 	"path/filepath"
 	"testing"
@@ -123,8 +124,23 @@ func TestBuildCredentialResolverAWSSMRequiresFields(t *testing.T) {
 	_, err = buildCredentialResolver(t.Context(), ownAccount, nil)
 	require.NoError(t, err)
 
+	// A region attribute and reachable regions add to the home region.
+	crossRegion := base
+	crossRegion.RegionAttribute = "aws_region"
+	crossRegion.ReachableRegions = []string{"us-west-2"}
+	_, err = buildCredentialResolver(t.Context(), crossRegion, nil)
+	require.NoError(t, err)
+
 	cases := map[string]func(*EtreCredentialsConfig){
-		"region":      func(c *EtreCredentialsConfig) { c.Region = "" },
+		"region is required for the awssm backend": func(c *EtreCredentialsConfig) { c.Region = "" },
+		"reachable_regions requires region_attribute": func(c *EtreCredentialsConfig) {
+			c.ReachableRegions = []string{"us-west-2"}
+		},
+		`target_resolver.etre.credentials: region "us-west" is not an AWS region name`: func(c *EtreCredentialsConfig) { c.Region = "us-west" },
+		`target_resolver.etre.credentials: reachable region "us-west" at index 0 is not an AWS region name`: func(c *EtreCredentialsConfig) {
+			c.RegionAttribute = "aws_region"
+			c.ReachableRegions = []string{"us-west"}
+		},
 		"secret_name": func(c *EtreCredentialsConfig) { c.SecretName = "" },
 	}
 	for field, mutate := range cases {
@@ -142,6 +158,32 @@ func TestBuildCredentialResolverAWSSMRequiresFields(t *testing.T) {
 	_, err = buildCredentialResolver(t.Context(), withUsername, inventory.DecodePlanetScaleSecret)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "username")
+}
+
+// A mistyped region is reported before AWS config is loaded, so it is not
+// hidden behind, or delayed by, a credential chain that cannot load.
+func TestBuildCredentialResolverAWSSMValidatesRegionsBeforeLoadingAWSConfig(t *testing.T) {
+	t.Setenv("AWS_PROFILE", "profile-that-does-not-exist")
+	t.Setenv("AWS_CONFIG_FILE", filepath.Join(t.TempDir(), "aws-config"))
+	t.Setenv("AWS_SHARED_CREDENTIALS_FILE", filepath.Join(t.TempDir(), "aws-credentials"))
+
+	cfg := EtreCredentialsConfig{
+		Type:             "awssm",
+		Region:           "us-east-1",
+		RegionAttribute:  "aws_region",
+		RoleARN:          "arn:aws:iam::{account}:role/tern-assumed",
+		SecretName:       "{target}_ddl_password",
+		ReachableRegions: []string{"us-west-2"},
+	}
+	_, err := buildCredentialResolver(t.Context(), cfg, nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "load AWS config", "a valid config reaches the AWS config load, which fails on the missing profile")
+
+	cfg.ReachableRegions = []string{"us-west-2", "eu-west"}
+	_, err = buildCredentialResolver(t.Context(), cfg, nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `target_resolver.etre.credentials: reachable region "eu-west" at index 1 is not an AWS region name`)
+	assert.NotContains(t, err.Error(), "load AWS config")
 }
 
 // The assume-role backend's account attribute is surfaced to the resolver even
@@ -175,6 +217,20 @@ func TestCredentialAttributeFields(t *testing.T) {
 	}
 	assert.Equal(t, []string{"cluster"}, resolverAttributeFields(templated))
 
+	// The cluster region attribute is surfaced alongside the account attribute.
+	regionAttr := EtreConfig{
+		AttributeFields: []string{"name"},
+		Credentials:     EtreCredentialsConfig{Type: "awssm", RoleARN: "arn:aws:iam::{account}:role/ddl", Region: "us-west-2", RegionAttribute: "aws_region", SecretName: "secret"},
+	}
+	assert.Equal(t, []string{"name", "aws_account_id", "aws_region"}, resolverAttributeFields(regionAttr))
+
+	// Own-account mode needs the region attribute too, with no account attribute.
+	ownAccountRegionAttr := EtreConfig{
+		AttributeFields: []string{"name"},
+		Credentials:     EtreCredentialsConfig{Type: "awssm", Region: "us-west-2", RegionAttribute: "aws_region", SecretName: "secret"},
+	}
+	assert.Equal(t, []string{"name", "aws_region"}, resolverAttributeFields(ownAccountRegionAttr))
+
 	secretRef := EtreConfig{
 		AttributeFields: []string{"region"},
 		Credentials:     EtreCredentialsConfig{Type: "secret_ref"},
@@ -207,6 +263,13 @@ func TestBuildEtreResolverVitess(t *testing.T) {
 	_, err = buildEtreResolver(t.Context(), noToken, logger)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "password_ref")
+
+	// The token secret names the credential, so a username would be ignored.
+	withUsername := cfg
+	withUsername.Credentials.Username = "spirit"
+	_, err = buildEtreResolver(t.Context(), withUsername, logger)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "credentials.username")
 }
 
 // Strata is Aurora-backed and reached over the MySQL protocol, so it assembles
@@ -241,22 +304,82 @@ func TestBuildEtreResolverStrata(t *testing.T) {
 }
 
 // An unsupported database_type fails closed at startup rather than silently
-// resolving as MySQL, so adding an engine (postgres) is a deliberate change at
-// the assembler-selection site.
+// resolving as MySQL, so adding an engine is a deliberate change at the
+// assembler-selection site.
 func TestBuildEtreResolverRejectsUnsupportedEngine(t *testing.T) {
 	logger := slog.New(slog.DiscardHandler)
 	cfg := EtreConfig{
 		Addr:         "https://etre.example",
-		DatabaseType: "postgres",
-		EntityType:   "pg_cluster",
+		DatabaseType: "cassandra",
+		EntityType:   "cassandra_cluster",
 		TargetLabel:  "dsid",
 		Credentials:  EtreCredentialsConfig{Type: "secret_ref", Username: "ddl", PasswordRef: "env:PW"},
 	}
 
 	_, err := buildEtreResolver(t.Context(), cfg, logger)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "postgres")
+	assert.Contains(t, err.Error(), "cassandra")
 	assert.Contains(t, err.Error(), "not supported")
+}
+
+// A PostgreSQL connection is made to one database, so the resolver must learn
+// the database name. It comes from the credential secret, which is decoded as
+// JSON {username, password, dbname}, so a plain-password username is rejected.
+// Misconfigured host, CA, or table owner fails at startup rather than on the
+// first request.
+func TestBuildEtreResolverPostgres(t *testing.T) {
+	logger := slog.New(slog.DiscardHandler)
+	base := EtreConfig{
+		Addr: "https://etre.example", DatabaseType: storage.DatabaseTypePostgres,
+		EntityType: "cluster", TargetLabel: "dsid", EnvLabel: "env",
+		Postgres:    EtrePostgresConfig{HostField: "writer_endpoint", TableOwner: "app_owner"},
+		Credentials: EtreCredentialsConfig{PasswordRef: `{"username":"engine","password":"pw","dbname":"orders"}`},
+	}
+
+	resolver, err := buildEtreResolver(t.Context(), base, logger)
+	require.NoError(t, err)
+	require.NotNil(t, resolver)
+
+	assembler, decode, err := etreAssembler(base)
+	require.NoError(t, err)
+	assert.Equal(t, storage.DatabaseTypePostgres, assembler.DatabaseType())
+	require.NotNil(t, decode, "the database name comes from the secret, so it must be decoded as JSON")
+	assert.Equal(t, "app_owner", etreTableOwner(base))
+
+	// The secret names the user, so a configured username would be ignored
+	// and the engine would connect as a role nobody configured.
+	for name, creds := range map[string]EtreCredentialsConfig{
+		"secret_ref": {PasswordRef: `{"username":"engine","password":"pw","dbname":"orders"}`, Username: "other"},
+		"awssm":      {Type: credentialTypeAWSSM, Region: "us-east-1", SecretName: "db/{target}", Username: "other"},
+	} {
+		withUsername := base
+		withUsername.Credentials = creds
+		_, err = buildEtreResolver(t.Context(), withUsername, logger)
+		require.Error(t, err, name)
+		assert.Contains(t, err.Error(), "credentials.username", name)
+		assert.Contains(t, err.Error(), "postgres", name)
+	}
+
+	cases := map[string]func(*EtreConfig){
+		"postgres.host_field":  func(c *EtreConfig) { c.Postgres.HostField = "" },
+		"postgres.ca_ref":      func(c *EtreConfig) { c.Postgres.CARef = "relative/ca.pem" },
+		"postgres.table_owner": func(c *EtreConfig) { c.Postgres.TableOwner = `app"owner` },
+	}
+	for field, mutate := range cases {
+		cfg := base
+		mutate(&cfg)
+		_, err := buildEtreResolver(t.Context(), cfg, logger)
+		require.Error(t, err, field)
+		assert.Contains(t, err.Error(), field)
+	}
+}
+
+// Only the PostgreSQL engine owns created tables through a configured role; a
+// table_owner left in the postgres block of another engine's resolver is
+// ignored rather than applied to MySQL targets.
+func TestEtreTableOwnerIsPostgresOnly(t *testing.T) {
+	cfg := EtreConfig{DatabaseType: storage.DatabaseTypeMySQL, Postgres: EtrePostgresConfig{TableOwner: "app_owner"}}
+	assert.Empty(t, etreTableOwner(cfg))
 }
 
 // The Vitess organization and database-name attributes are surfaced to the
@@ -333,4 +456,81 @@ func TestBuildResolverRejectsNeitherConfigured(t *testing.T) {
 	_, err := TargetResolverConfig{}.BuildResolver(t.Context(), slog.New(slog.DiscardHandler))
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "neither etre nor static")
+}
+
+// A MySQL resolver always carries the writer probe, so a lookup matching both
+// sides of a replicated pair resolves to the writer. Every other engine has no
+// probe and keeps refusing a lookup that matches more than one entity.
+func TestEtreWriterProbe(t *testing.T) {
+	assert.Equal(t, inventory.MySQLWriterProbe{ConnectTimeout: writerProbeConnectTimeout}, etreWriterProbe(EtreConfig{DatabaseType: storage.DatabaseTypeMySQL}))
+	for _, dbType := range []string{storage.DatabaseTypeStrata, storage.DatabaseTypeVitess, storage.DatabaseTypePostgres} {
+		assert.Nil(t, etreWriterProbe(EtreConfig{DatabaseType: dbType}), dbType)
+	}
+}
+
+func TestTargetResolverOverrides(t *testing.T) {
+	entry := inventory.TargetOverride{Environment: "production", Target: "cluster-002", DatabaseType: "mysql", SchemaOverrides: map[string]string{"orders": "orders_sandbox"}}
+	cfg := TargetResolverConfig{Overrides: []inventory.TargetOverride{entry}}
+	assert.False(t, cfg.Enabled(), "overlays are not a discovery backend")
+	_, err := cfg.BuildResolver(t.Context(), slog.Default())
+	require.ErrorContains(t, err, "requires an etre or static backend")
+	cfg.Targets = map[string]inventory.StaticTarget{"cluster-002": {DatabaseType: "mysql", DSN: "root@tcp(localhost:3306)/"}}
+	resolver, err := cfg.BuildResolver(t.Context(), slog.Default())
+	require.NoError(t, err)
+	resolved, err := resolver.ResolveTarget(t.Context(), inventory.Request{Target: "cluster-002", Environment: "production", DatabaseType: "mysql"})
+	require.NoError(t, err)
+	assert.Equal(t, entry.SchemaOverrides, resolved.SchemaOverrides)
+	cfg.Targets["cluster-002"] = inventory.StaticTarget{DatabaseType: "mysql", DSN: "env:MISSING_OVERRIDE_TEST_SECRET", SchemaOverrides: entry.SchemaOverrides}
+	_, err = cfg.BuildResolver(t.Context(), slog.Default())
+	require.ErrorContains(t, err, "already has static", "conflict validation precedes credential resolution")
+}
+
+func TestEtreOverridesPreserveCapabilities(t *testing.T) {
+	entry := EtreConfig{Addr: "https://etre.example", DatabaseType: "mysql", EntityType: "cluster", TargetLabel: "dsid", MySQL: EtreMySQLConfig{HostField: "writer_endpoint"}, Credentials: EtreCredentialsConfig{Username: "engine", PasswordRef: "env:DDL_PASSWORD"}}
+	cfg := TargetResolverConfig{Etre: []EtreConfig{entry}, Overrides: []inventory.TargetOverride{{Environment: "production", Target: "cluster-002", DatabaseType: "mysql", SchemaOverrides: map[string]string{"orders": "orders_sandbox"}}}}
+	resolver, err := cfg.BuildResolver(t.Context(), slog.Default())
+	require.NoError(t, err)
+	_, enumerable := resolver.(inventory.Enumerator)
+	assert.False(t, enumerable, "single Etre resolver cannot enumerate")
+	require.Implements(t, (*inventory.TypeReporter)(nil), resolver)
+	assert.Equal(t, "mysql", resolver.(inventory.TypeReporter).DatabaseType())
+	entry.DatabaseType = "strata"
+	cfg.Etre = append(cfg.Etre, entry)
+	resolver, err = cfg.BuildResolver(t.Context(), slog.Default())
+	require.NoError(t, err)
+	require.Implements(t, (*inventory.Enumerator)(nil), resolver)
+	_, single := resolver.(inventory.TypeReporter)
+	assert.False(t, single)
+}
+
+func TestTargetResolverRequiresCanonicalStaticType(t *testing.T) {
+	for _, engine := range []string{"mysql", "MySQL", "MYSQL", " mysql", "mysql ", "\tmysql\n"} {
+		for _, withOverride := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/override=%t", engine, withOverride), func(t *testing.T) {
+				cfg := TargetResolverConfig{Targets: map[string]inventory.StaticTarget{
+					"cluster-002": {DatabaseType: engine, DSN: "root@tcp(localhost:3306)/"},
+				}}
+				if withOverride {
+					cfg.Overrides = []inventory.TargetOverride{{Environment: "production", Target: "cluster-002", DatabaseType: "mysql", SchemaOverrides: map[string]string{"orders": "orders_sandbox"}}}
+				}
+				resolver, err := cfg.BuildResolver(t.Context(), slog.Default())
+				if engine != "mysql" {
+					require.ErrorContains(t, err, "must be lowercase with no surrounding whitespace")
+					assert.Nil(t, resolver)
+					serverConfig := ServerConfig{TargetResolver: cfg}
+					require.ErrorContains(t, serverConfig.Validate(), "must be lowercase with no surrounding whitespace")
+					return
+				}
+				require.NoError(t, err)
+				target, err := resolver.ResolveTarget(t.Context(), inventory.Request{Target: "cluster-002", Environment: "production", DatabaseType: "mysql"})
+				require.NoError(t, err)
+				assert.Equal(t, "mysql", target.DatabaseType)
+				if withOverride {
+					assert.Equal(t, cfg.Overrides[0].SchemaOverrides, target.SchemaOverrides)
+				} else {
+					assert.Empty(t, target.SchemaOverrides)
+				}
+			})
+		}
+	}
 }

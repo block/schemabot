@@ -1,6 +1,7 @@
 package commands
 
 import (
+	"context"
 	"errors"
 	"fmt"
 
@@ -21,7 +22,7 @@ type RollbackCmd struct {
 }
 
 // Run executes the rollback command.
-func (cmd *RollbackCmd) Run(g *Globals) error {
+func (cmd *RollbackCmd) Run(ctx context.Context, g *Globals) error {
 	ep, err := resolveControlFlags(g.Endpoint, g.Profile, cmd.ApplyID, cmd.Environment)
 	if err != nil {
 		return err
@@ -80,6 +81,14 @@ func (cmd *RollbackCmd) Run(g *Globals) error {
 	}
 	templates.WriteRollbackPlan(planResult, cmd.ApplyID)
 
+	// A rollback plan gets the same execution verdicts as an apply plan, and
+	// the server refuses to submit a blocked one, so it is refused here,
+	// below the plan that shows the refused statement, before any prompt or
+	// lock.
+	if err := blockedPlanError("rollback", planResult); err != nil {
+		return err
+	}
+
 	// Unsafe changes need --allow-unsafe, exactly as for apply. Neither the
 	// confirmation prompt nor -y stands in for it: a rollback that drops a table
 	// is as destructive as an apply that does.
@@ -110,6 +119,13 @@ func (cmd *RollbackCmd) Run(g *Globals) error {
 	}
 
 	// Step 4: Acquire lock and apply the rollback
+
+	// A Ctrl-C during planning or the prompt ends the command here, before
+	// any lock is taken on the operator's behalf.
+	if ctx.Err() != nil {
+		return stoppedBeforeSubmit(ctx, "rollback")
+	}
+
 	owner := client.GenerateCLIOwner()
 
 	var existingLock *client.LockInfo
@@ -157,6 +173,6 @@ func (cmd *RollbackCmd) Run(g *Globals) error {
 	// a rollout-wide rollback where members are planned on their own, since
 	// none of them has a rollback plan. So showing this plan shows what runs
 	// on every member, though not which members those are.
-	_, err = applyAndWatch(ep, planResult, true, database, environment, owner, "rollback", cmd.DeferCutover, false, false, cmd.AllowUnsafe, "", cmd.Watch, OutputFormatInteractive, 0)
+	_, err = applyAndWatch(ctx, ep, planResult, true, database, environment, owner, "rollback", cmd.DeferCutover, false, false, cmd.AllowUnsafe, "", cmd.Watch, OutputFormatInteractive, 0)
 	return err
 }

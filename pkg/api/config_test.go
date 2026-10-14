@@ -1626,15 +1626,55 @@ func TestServerConfig_ResolveDirectExecutionOverrideReplacesServerPolicy(t *test
 	})
 }
 
-// With no policy configured anywhere, refused statements stay blocked: the
-// engine metadata carries no direct execution keys at all.
-func TestServerConfig_ResolveDirectExecutionDefaultsToBlocked(t *testing.T) {
-	cfg := ServerConfig{}
+// A server config that states no policy runs MySQL databases under the default
+// one: direct execution enabled, bounded at 100MiB of data and indexes. A
+// server-wide block that disables it opts every database out, and engines that
+// cannot honor it never receive the default.
+func TestServerConfig_ResolveDirectExecutionDefaultsToEnabledAt100MiB(t *testing.T) {
+	t.Run("no policy configured", func(t *testing.T) {
+		cfg := ServerConfig{}
+		assert.Equal(t, &DirectExecutionConfig{Enabled: true, MaxTableBytes: "100MiB"},
+			cfg.ResolveDirectExecution(&EnvironmentConfig{}, storage.DatabaseTypeMySQL))
+		policy, err := cfg.DirectExecutionPolicyFor("anything", "production", storage.DatabaseTypeMySQL)
+		require.NoError(t, err)
+		assert.Equal(t, &storage.DirectExecutionPolicy{Enabled: true, MaxTableBytes: 100 << 20}, policy)
+	})
 
-	metadata, err := cfg.DirectExecutionMetadata(&EnvironmentConfig{}, storage.DatabaseTypeMySQL)
+	// The default is built in code rather than read from a config file, so
+	// it never passes startup validation on its own. Holding it to the same
+	// validation a stated block gets keeps a malformed default from failing
+	// every MySQL plan at resolve time instead of failing here.
+	t.Run("default passes the validation a stated block gets", func(t *testing.T) {
+		require.NoError(t, defaultDirectExecution().Validate("default direct_execution policy"))
+	})
 
-	require.NoError(t, err)
-	assert.Empty(t, metadata)
+	t.Run("server-wide opt out", func(t *testing.T) {
+		cfg := ServerConfig{DirectExecution: &DirectExecutionConfig{Enabled: false}}
+		policy, err := cfg.DirectExecutionPolicyFor("anything", "production", storage.DatabaseTypeMySQL)
+		require.NoError(t, err)
+		assert.Equal(t, &storage.DirectExecutionPolicy{Enabled: false}, policy,
+			"an explicit opt out travels as one rather than falling back to the default")
+	})
+
+	t.Run("environment opt out", func(t *testing.T) {
+		cfg := ServerConfig{}
+		envConfig := &EnvironmentConfig{DirectExecution: &DirectExecutionConfig{Enabled: false}}
+		assert.Equal(t, &DirectExecutionConfig{Enabled: false}, cfg.ResolveDirectExecution(envConfig, storage.DatabaseTypeMySQL))
+	})
+
+	t.Run("engine that cannot honor it", func(t *testing.T) {
+		cfg := ServerConfig{}
+		for _, dbType := range []string{storage.DatabaseTypeVitess, storage.DatabaseTypePostgres} {
+			assert.Nil(t, cfg.ResolveDirectExecution(&EnvironmentConfig{}, dbType), "the default must not reach %s", dbType)
+		}
+	})
+
+	t.Run("each resolution is its own value", func(t *testing.T) {
+		cfg := ServerConfig{}
+		first := cfg.ResolveDirectExecution(nil, storage.DatabaseTypeMySQL)
+		first.MaxTableBytes = "1GiB"
+		assert.Equal(t, "100MiB", cfg.ResolveDirectExecution(nil, storage.DatabaseTypeMySQL).MaxTableBytes)
+	})
 }
 
 // A well-formed revert_window_duration parses to the configured window.
@@ -2376,28 +2416,53 @@ func TestValidateDeploymentOrder_EmptyMapKey(t *testing.T) {
 	assert.NotContains(t, err.Error(), `missing deployment ""`)
 }
 
-// TestServerConfig_CutoverPolicyFor verifies the cutover-policy resolver:
-// it defaults to rolling (today's serial rollout) when unset or unconfigured,
-// and honours an explicit barrier policy.
+// TestServerConfig_CutoverPolicyFor verifies the cutover-policy resolver: an
+// explicit policy always wins; left unset, an environment whose every member
+// comes from a targets list (at the environment level, or in every entry of a
+// deployments map) resolves to parallel, and every other environment,
+// configured or not, resolves to rolling. A deployments map that mixes a
+// targets list with a single target resolves to rolling, since its
+// single-target members are the ones a serial rollout lets an operator watch
+// one region at a time.
 func TestServerConfig_CutoverPolicyFor(t *testing.T) {
+	oneTargetMap := map[string]DeploymentTarget{"payments-a": {Target: "payments"}}
+	targetsList := []TargetEntry{{Target: "payments-001"}, {Target: "payments-002"}}
 	cfg := &ServerConfig{
 		Databases: map[string]DatabaseConfig{
 			"payments": {
 				Type: "mysql",
 				Environments: map[string]EnvironmentConfig{
-					"policy-unset":    {Target: "payments", Deployment: "payments-a"},
-					"policy-rolling":  {Deployments: map[string]DeploymentTarget{"payments-a": {Target: "payments"}}, CutoverPolicy: storage.CutoverPolicyRolling},
-					"policy-barrier":  {Deployments: map[string]DeploymentTarget{"payments-a": {Target: "payments"}}, CutoverPolicy: storage.CutoverPolicyBarrier},
-					"policy-parallel": {Deployments: map[string]DeploymentTarget{"payments-a": {Target: "payments"}}, CutoverPolicy: storage.CutoverPolicyParallel},
+					"policy-unset":               {Target: "payments", Deployment: "payments-a"},
+					"policy-rolling":             {Deployments: oneTargetMap, CutoverPolicy: storage.CutoverPolicyRolling},
+					"policy-barrier":             {Deployments: oneTargetMap, CutoverPolicy: storage.CutoverPolicyBarrier},
+					"policy-parallel":            {Deployments: oneTargetMap, CutoverPolicy: storage.CutoverPolicyParallel},
+					"deployments-unset":          {Deployments: map[string]DeploymentTarget{"payments-a": {Target: "payments"}, "payments-b": {Target: "payments"}}},
+					"targets-unset":              {Targets: targetsList, Deployment: "payments-a"},
+					"targets-rolling":            {Targets: targetsList, Deployment: "payments-a", CutoverPolicy: storage.CutoverPolicyRolling},
+					"targets-barrier":            {Targets: targetsList, Deployment: "payments-a", CutoverPolicy: storage.CutoverPolicyBarrier},
+					"deployment-targets-unset":   {Deployments: map[string]DeploymentTarget{"payments-a": {Targets: targetsList}}},
+					"deployment-targets-rolling": {Deployments: map[string]DeploymentTarget{"payments-a": {Targets: targetsList}}, CutoverPolicy: storage.CutoverPolicyRolling},
+					"every-deployment-targets":   {Deployments: map[string]DeploymentTarget{"us": {Targets: []TargetEntry{{Target: "shop-001"}}}, "eu": {Targets: []TargetEntry{{Target: "shop-002"}}}}},
+					"mixed-deployments-unset":    {Deployments: map[string]DeploymentTarget{"us": {Targets: []TargetEntry{{Target: "shop-001"}}}, "eu": {Target: "shop-eu"}}},
+					"mixed-deployments-parallel": {Deployments: map[string]DeploymentTarget{"us": {Targets: []TargetEntry{{Target: "shop-001"}}}, "eu": {Target: "shop-eu"}}, CutoverPolicy: storage.CutoverPolicyParallel},
 				},
 			},
 		},
 	}
 
-	assert.Equal(t, storage.CutoverPolicyRolling, cfg.CutoverPolicyFor("payments", "policy-unset"), "unset defaults to rolling")
+	assert.Equal(t, storage.CutoverPolicyRolling, cfg.CutoverPolicyFor("payments", "policy-unset"), "a single target defaults to rolling")
 	assert.Equal(t, storage.CutoverPolicyRolling, cfg.CutoverPolicyFor("payments", "policy-rolling"), "explicit rolling is rolling")
 	assert.Equal(t, storage.CutoverPolicyBarrier, cfg.CutoverPolicyFor("payments", "policy-barrier"), "explicit barrier is barrier")
 	assert.Equal(t, storage.CutoverPolicyParallel, cfg.CutoverPolicyFor("payments", "policy-parallel"), "explicit parallel is parallel")
+	assert.Equal(t, storage.CutoverPolicyRolling, cfg.CutoverPolicyFor("payments", "deployments-unset"), "a deployments map of single targets defaults to rolling")
+	assert.Equal(t, storage.CutoverPolicyParallel, cfg.CutoverPolicyFor("payments", "targets-unset"), "a targets list defaults to parallel")
+	assert.Equal(t, storage.CutoverPolicyRolling, cfg.CutoverPolicyFor("payments", "targets-rolling"), "explicit rolling on a targets list is rolling")
+	assert.Equal(t, storage.CutoverPolicyBarrier, cfg.CutoverPolicyFor("payments", "targets-barrier"), "explicit barrier on a targets list is barrier")
+	assert.Equal(t, storage.CutoverPolicyParallel, cfg.CutoverPolicyFor("payments", "deployment-targets-unset"), "a targets list inside a deployments entry defaults to parallel")
+	assert.Equal(t, storage.CutoverPolicyRolling, cfg.CutoverPolicyFor("payments", "deployment-targets-rolling"), "explicit rolling on a deployment's targets list is rolling")
+	assert.Equal(t, storage.CutoverPolicyParallel, cfg.CutoverPolicyFor("payments", "every-deployment-targets"), "a deployments map whose every entry is a targets list defaults to parallel")
+	assert.Equal(t, storage.CutoverPolicyRolling, cfg.CutoverPolicyFor("payments", "mixed-deployments-unset"), "a deployments map mixing a targets list with a single target defaults to rolling")
+	assert.Equal(t, storage.CutoverPolicyParallel, cfg.CutoverPolicyFor("payments", "mixed-deployments-parallel"), "explicit parallel on a mixed deployments map is parallel")
 	assert.Equal(t, storage.CutoverPolicyRolling, cfg.CutoverPolicyFor("payments", "missing-env"), "unconfigured env defaults to rolling")
 	assert.Equal(t, storage.CutoverPolicyRolling, cfg.CutoverPolicyFor("missing-db", "policy-barrier"), "unconfigured database defaults to rolling")
 }
@@ -5187,34 +5252,36 @@ func TestServerConfig_SpiritMetadata(t *testing.T) {
 		var cfg ServerConfig
 		require.NoError(t, yaml.Unmarshal([]byte(`
 spirit:
-  enable_experimental_autoscaling: false
-  enable_experimental_lockless_checksum: true
   checkpoint_max_age: 24h
-  checksum_yield_timeout: 6h
 `), &cfg))
 		metadata, err := cfg.SpiritMetadata()
 		require.NoError(t, err)
 		assert.Equal(t, map[string]string{
-			spirit.MetadataEnableExperimentalAutoscaling:      "false",
-			spirit.MetadataEnableExperimentalLocklessChecksum: "true",
-			spirit.MetadataCheckpointMaxAge:                   "24h",
-			spirit.MetadataChecksumYieldTimeout:               "6h",
+			spirit.MetadataCheckpointMaxAge: "24h",
 		}, metadata)
 	})
 
-	// The lockless checksum is off by default, so a block that spells that out
-	// carries no override: the key would restate the default, and a database
-	// that enabled the checker in its own metadata outranks the server value
-	// regardless.
-	t.Run("lockless checksum false carries no override", func(t *testing.T) {
-		var cfg ServerConfig
-		require.NoError(t, yaml.Unmarshal([]byte(`
-spirit:
-  enable_experimental_lockless_checksum: false
-`), &cfg))
-		metadata, err := cfg.SpiritMetadata()
-		require.NoError(t, err)
-		assert.Empty(t, metadata)
+	// Autoscaling and the checksum algorithm are Spirit's own defaults and no
+	// longer configurable. A config that still sets one of the removed keys
+	// fails to load instead of silently running with a setting the operator
+	// believes they changed, and the error says the key was removed so the
+	// operator knows deleting it is the whole remedy.
+	t.Run("removed keys are rejected", func(t *testing.T) {
+		for key, value := range map[string]string{
+			"enable_experimental_autoscaling":       "false",
+			"enable_experimental_lockless_checksum": "true",
+			"checksum_yield_timeout":                "6h",
+		} {
+			_, err := ParseServerConfig([]byte("spirit:\n  " + key + ": " + value + "\n"))
+			require.ErrorContains(t, err, "spirit."+key+" was removed")
+		}
+	})
+
+	// The server config decodes strictly, so an unknown spirit key that was
+	// never a setting still fails to load.
+	t.Run("unknown keys are rejected", func(t *testing.T) {
+		_, err := ParseServerConfig([]byte("spirit:\n  copy_threads: 8\n"))
+		require.ErrorContains(t, err, "copy_threads")
 	})
 
 	t.Run("invalid duration errors", func(t *testing.T) {
@@ -5224,7 +5291,7 @@ spirit:
 	})
 
 	t.Run("non-positive duration errors", func(t *testing.T) {
-		cfg := ServerConfig{Spirit: SpiritConfig{ChecksumYieldTimeout: "-1h"}}
+		cfg := ServerConfig{Spirit: SpiritConfig{CheckpointMaxAge: "-1h"}}
 		_, err := cfg.SpiritMetadata()
 		require.ErrorContains(t, err, "must be positive")
 	})
@@ -5923,11 +5990,6 @@ func TestServerConfig_DirectExecutionPolicyForResolvesByName(t *testing.T) {
 		assert.Nil(t, policy)
 	})
 
-	t.Run("no server-wide policy leaves refused statements blocked", func(t *testing.T) {
-		policy, err := (&ServerConfig{}).DirectExecutionPolicyFor("anything", "production", storage.DatabaseTypeMySQL)
-		require.NoError(t, err)
-		assert.Nil(t, policy)
-	})
 }
 
 // targetNames builds a targets list of bare target names, the spelling that

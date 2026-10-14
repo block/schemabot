@@ -279,7 +279,7 @@ func TestRenderPRCommentSupportChannelFooter(t *testing.T) {
 		}
 		h := &Handler{service: api.New(nil, cfg, nil, testLogger())}
 
-		body := h.renderPRComment("octo/repo", 7, "", templates.RenderUnmanagedSchemaConfigsNotice([]templates.UnmanagedSchemaConfigNoticeData{
+		body := h.renderPRComment("octo/repo", 7, "", templates.RenderUnmanagedSchemaConfigsNotice(nil, []templates.UnmanagedSchemaConfigNoticeData{
 			{SchemaPath: "services/orders/schema", Database: "orders"},
 		}))
 
@@ -389,29 +389,56 @@ func TestCommentObserverRendersOversizedNoticeWithTheConfiguredCLIName(t *testin
 	}
 }
 
+// A command answered with Configuration Not Authorized names the deployment
+// making the claim, since a deployment serving another environment may manage
+// the directory: by its environment when it serves one, and by the
+// environments it serves, in promotion order, when it serves several but not
+// every one. A deployment serving every environment speaks for itself without
+// a name.
 func TestHandleSchemaRequestErrorRendersConfigNotAuthorized(t *testing.T) {
-	client, mux := setupGitHubServer(t)
-	comments := make(chan string, 1)
-	mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", commentRecorder(t, comments))
-
-	installClient := ghclient.NewInstallationClient(client, testLogger())
-	h := &Handler{
-		ghClients: ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: installClient}),
-		logger:    testLogger(),
+	cases := []struct {
+		name    string
+		config  *api.ServerConfig
+		subject string
+	}{
+		{name: "deployment serving every environment", config: &api.ServerConfig{}, subject: "this SchemaBot deployment is not configured to manage its schema directory"},
+		{name: "staging-scoped deployment", config: &api.ServerConfig{AllowedEnvironments: []string{"staging"}}, subject: "the staging SchemaBot deployment is not configured to manage its schema directory"},
+		{
+			name: "deployment serving two of three environments",
+			config: &api.ServerConfig{
+				EnvironmentOrder:    []string{"sandbox", "staging", "production"},
+				AllowedEnvironments: []string{"production", "staging"},
+			},
+			subject: "the SchemaBot deployment serving `staging` and `production` is not configured to manage its schema directory",
+		},
 	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			client, mux := setupGitHubServer(t)
+			comments := make(chan string, 1)
+			mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", commentRecorder(t, comments))
 
-	h.handleSchemaRequestError("octocat/hello-world", 1, 12345, "production", "", "hubot", "apply", &schemaConfigOutsideAllowedDirsError{
-		Database:     "orders",
-		DatabaseType: "mysql",
-		SchemaPath:   "services/orders/schema",
-	}, false)
+			installClient := ghclient.NewInstallationClient(client, testLogger())
+			h := &Handler{
+				service:   api.New(nil, tc.config, nil, testLogger()),
+				ghClients: ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: installClient}),
+				logger:    testLogger(),
+			}
 
-	body := requireComment(t, comments, "config-not-authorized comment")
-	assert.Contains(t, body, "SchemaBot Configuration Not Authorized")
-	assert.Contains(t, body, "SchemaBot found a `schemabot.yaml` configuration")
-	assert.Contains(t, body, "`services/orders/schema`")
-	assert.Contains(t, body, "`databases.orders.allowed_dirs`")
-	assert.NotContains(t, body, "No `schemabot.yaml` configuration file was found")
+			h.handleSchemaRequestError("octocat/hello-world", 1, 12345, "staging", "", "hubot", "apply", &schemaConfigOutsideAllowedDirsError{
+				Database:     "orders",
+				DatabaseType: "mysql",
+				SchemaPath:   "services/orders/schema",
+			}, false)
+
+			body := requireComment(t, comments, "config-not-authorized comment")
+			assert.Contains(t, body, "SchemaBot Configuration Not Authorized")
+			assert.Contains(t, body, "SchemaBot found a `schemabot.yaml` configuration, but "+tc.subject+".")
+			assert.Contains(t, body, "`services/orders/schema`")
+			assert.Contains(t, body, "`databases.orders.allowed_dirs`")
+			assert.NotContains(t, body, "No `schemabot.yaml` configuration file was found")
+		})
+	}
 }
 
 func TestCheckRunRerequestIgnoresNonSchemaBotCheck(t *testing.T) {
@@ -1028,6 +1055,52 @@ func TestWebhookProseMentionIsNotAnswered(t *testing.T) {
 	}
 }
 
+// An agent's explanation of how to land a schema change closes with a line
+// that opens with the product name, in any case, and mentions apply commands
+// only inline. SchemaBot leaves it unanswered rather than replying with the
+// invalid-command help.
+func TestWebhookExplanationOpeningWithTheProductNameIsNotAnswered(t *testing.T) {
+	const onThisPR = " will then comment the exact DDL it plans for staging and production on this PR."
+	tests := []struct {
+		name     string
+		lastLine string
+	}{
+		{
+			name: "inline apply commands",
+			lastLine: "SchemaBot will then comment the exact DDL it plans for staging and production, " +
+				"and you apply it with `schemabot apply -e staging`, then `schemabot apply -e production`.",
+		},
+		{name: "mixed case", lastLine: "SchemaBot" + onThisPR},
+		{name: "title case", lastLine: "Schemabot" + onThisPR},
+		{name: "upper case", lastLine: "SCHEMABOT" + onThisPR},
+		{name: "lower case", lastLine: "schemabot" + onThisPR},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h, comments, _ := newTestHandler(t)
+
+			req := buildWebhookRequest(t, webhookPayloadOpts{
+				comment: agentExplanationBody(tt.lastLine),
+				isPR:    true,
+			}, nil)
+
+			rr := httptest.NewRecorder()
+			h.ServeHTTP(rr, req)
+
+			require.Equal(t, http.StatusOK, rr.Code)
+			assert.Contains(t, rr.Body.String(), "no SchemaBot command")
+
+			// The no-command path returns before launching any goroutines, so the channel is guaranteed empty.
+			select {
+			case body := <-comments:
+				require.Failf(t, "unexpected comment posted", "%s", body)
+			default:
+			}
+		})
+	}
+}
+
 func TestWebhookIgnoresSchemaBotProse(t *testing.T) {
 	h, comments, _ := newTestHandler(t)
 
@@ -1543,5 +1616,56 @@ func TestSchemaErrorGuidanceUsesServerStrataSetting(t *testing.T) {
 				assert.Equal(t, enabled, strings.Contains(body, "`strata` (experimental)"))
 			}
 		})
+	}
+}
+
+// Only plan and apply can be narrowed to one target. apply-confirm confirms
+// the target its apply already named, so a --target on it is answered with a
+// usage comment instead of being ignored or applied to the whole rollout.
+func TestWebhookTargetFlagRejectedOnApplyConfirm(t *testing.T) {
+	h, comments, _ := newTestHandler(t)
+
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot apply-confirm -e staging --target payments-002",
+		isPR:    true,
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.Contains(t, rr.Body.String(), "unsupported flag")
+
+	select {
+	case body := <-comments:
+		assert.Equal(t, "The `--target` flag is not supported for `apply-confirm`. Only `plan` and `apply` take it.", body)
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for error comment")
+	}
+}
+
+// A target is a member of one environment's rollout, so a narrowed plan
+// without -e is a usage error that keeps the target the caller typed. It
+// never falls back to planning every environment.
+func TestWebhookNarrowedPlanWithoutEnvironmentAsksForIt(t *testing.T) {
+	h, comments, _ := newTestHandler(t)
+
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot plan --target payments-002",
+		isPR:    true,
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.Contains(t, rr.Body.String(), "missing environment flag")
+
+	select {
+	case body := <-comments:
+		assert.Contains(t, body, "needs `-e` too")
+		assert.Contains(t, body, "`schemabot plan -e <environment> --target payments-002`")
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for error comment")
 	}
 }

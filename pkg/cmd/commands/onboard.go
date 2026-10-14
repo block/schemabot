@@ -251,7 +251,10 @@ func buildOnboardWritePlan(schemaRoot string, resp *apitypes.PullSchemaResponse,
 	// refuse — a table both withheld from the planner and declared to it — and
 	// re-onboarding an already-configured repository is where that happens,
 	// because the entries it preserves name tables the pull just returned.
-	ignored := engine.NewIgnoredTables(exclusions.Tables)
+	ignored, err := engine.NewIgnoredTables(exclusions.Tables)
+	if err != nil {
+		return nil, fmt.Errorf("read the existing schemabot.yaml's ignore_tables: %w", err)
+	}
 	var withheldGroups []*apitypes.ExemptTablesResponse
 	var formatErrors []error
 
@@ -276,9 +279,9 @@ func buildOnboardWritePlan(schemaRoot string, resp *apitypes.PullSchemaResponse,
 		if err := rejectCaseCollisions("table in "+namespace, tableNames); err != nil {
 			return nil, err
 		}
-		// The filter above is exact, because an entry must never withhold a
-		// table it does not name, while the engines refuse a declared-and-
-		// ignored table with case folded. A live DATABASECHANGELOG under an
+		// The filter above matches as written, because an entry must never
+		// withhold a table it does not name, while the engines refuse a
+		// declared-and-ignored table with case folded. A live DATABASECHANGELOG under an
 		// entry spelling it databasechangelog therefore survives the filter
 		// and lands in a file that every later plan refuses. Refusing here,
 		// against the tables about to be declared and with the engines' own
@@ -636,7 +639,7 @@ func describeOnboardPlanChanges(result *apitypes.PlanResponse) []string {
 		if rollout != nil && len(rollout.Groups) > 1 {
 			prefix = onboardGroupLabel(rollout.Groups[i].Members) + ": "
 		}
-		for _, line := range describeOnboardChanges(plan.Changes) {
+		for _, line := range describeOnboardChanges(plan) {
 			lines = append(lines, prefix+line)
 		}
 	}
@@ -652,22 +655,25 @@ func onboardGroupLabel(members []string) string {
 	return fmt.Sprintf("%s and %d more", members[0], len(members)-1)
 }
 
-func describeOnboardChanges(changes []*apitypes.SchemaChangeResponse) []string {
+// describeOnboardChanges is one line per change a plan makes, per namespace:
+// each table's DDL, whether the namespace carries it itself or on its shards,
+// then its VSchema change, or the finalize when that is its only work.
+func describeOnboardChanges(plan *apitypes.PlanResponse) []string {
 	var lines []string
-	for _, change := range changes {
+	for _, change := range plan.Changes {
 		if change == nil {
 			continue
 		}
-		for _, tableChange := range change.TableChanges {
-			if tableChange == nil {
-				continue
-			}
+		// The namespace's rendered tables, read from its shards when they
+		// carry its DDL, as the plan shows them.
+		namespacePlan := &apitypes.PlanResponse{Changes: []*apitypes.SchemaChangeResponse{change}, Shards: plan.Shards}
+		for _, tableChange := range namespacePlan.RenderedTables() {
 			lines = append(lines, fmt.Sprintf("%s/%s (%s): %s", change.Namespace, tableChange.TableName, strings.ToLower(tableChange.ChangeType), onboardDDLPreview(tableChange.DDL)))
 		}
 		switch {
 		case change.ShowsVSchemaChange():
 			lines = append(lines, fmt.Sprintf("%s: vschema change", change.Namespace))
-		case change.NeedsFinalizer() && len(change.TableChanges) == 0:
+		case plan.FinalizesOnly(change):
 			lines = append(lines, fmt.Sprintf("%s: engine finalize requested", change.Namespace))
 		}
 	}

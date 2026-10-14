@@ -147,6 +147,76 @@ func TestE2EPlanFlagsDroppedColumnOnTableAnOpenPullRequestOwns(t *testing.T) {
 	}
 }
 
+// Another pull request created `stations` and applied it, then stayed open,
+// and the table was later dropped from the target outside SchemaBot. This pull
+// request declares `stations` with a TIMESTAMP column, so its plan creates the
+// table again, and the linter flags the column as needing --allow-unsafe.
+// Creating a table destroys nothing on the target, so the plan carries no
+// attribution: it does not name the other pull request or call anything a
+// change to undo. The finding itself, and the consent it needs, still render.
+func TestE2EPlanDoesNotAttributeATableItCreates(t *testing.T) {
+	dbName := "webhook_create_ownership"
+	svc := setupE2EService(t, dbName)
+	resetOwnershipHistory(t, dbName)
+
+	applyDeclaredSchemaForPullRequest(t, svc, dbName, 2, map[string]string{
+		"users.sql":    ownershipUsersSchema,
+		"stations.sql": ownershipStationsSchema("datetime"),
+	})
+	target, err := sql.Open("block-mysql", driftDSN(t, dbName))
+	require.NoError(t, err)
+	defer func() { _ = target.Close() }()
+	_, err = target.ExecContext(t.Context(), "DROP TABLE `stations`")
+	require.NoError(t, err, "drop the table outside SchemaBot")
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
+	result := setupFakeGitHubForPlan(t, mux, map[string]string{
+		"users.sql":    ownershipUsersSchema,
+		"stations.sql": ownershipStationsSchema("timestamp"),
+	}, schemabotConfig, dbName)
+	registerOpenPullRequest(mux, 2)
+
+	h := newE2EHandler(t, svc, client)
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot plan -e staging",
+		isPR:    true,
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	select {
+	case body := <-result.comments:
+		assert.Contains(t, body, "CREATE TABLE `stations`")
+		assert.Contains(t, body, "TIMESTAMP", "the lint finding on the new column still renders")
+		assert.Contains(t, body, "add `--allow-unsafe` to confirm", "the finding still needs consent")
+		assert.NotContains(t, body, "changed by open PR", "a created table is attributed to no pull request")
+		assert.NotContains(t, body, "#2")
+		assert.NotContains(t, body, "shows up here as one to undo")
+		assert.NotContains(t, body, "Check before applying")
+	case <-time.After(webhookIntegrationPollDeadline):
+		t.Fatal("timed out waiting for the plan comment")
+	}
+}
+
+// ownershipStationsSchema declares `stations` with its opened_at column of
+// the given type.
+func ownershipStationsSchema(openedAtType string) string {
+	return "CREATE TABLE `stations` (\n" +
+		"  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n" +
+		"  `opened_at` " + openedAtType + " NULL DEFAULT NULL,\n" +
+		"  PRIMARY KEY (`id`)\n" +
+		") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;"
+}
+
 // Once the pull request that applied the table is closed, the table is nobody's
 // open claim: the plan renders the drop with no attribution notice, so a
 // legitimate cleanup carries no warning it does not need.

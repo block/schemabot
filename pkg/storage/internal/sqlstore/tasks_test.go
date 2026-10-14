@@ -4,7 +4,10 @@ package sqlstore
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"math"
+	"strings"
 	"testing"
 	"time"
 
@@ -14,6 +17,7 @@ import (
 	"github.com/block/schemabot/pkg/namedlock"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
+	"github.com/block/schemabot/pkg/testutil"
 )
 
 // An operation lease scopes a task update to the task's own operation and is
@@ -428,6 +432,69 @@ func TestTaskStore_ThrottleRoundTrip(t *testing.T) {
 	assert.Equal(t, "requires privileges unavailable to the engine", cleared.ModeReason)
 }
 
+// An engine's ETA and throttle reason are display values it may report past
+// what their columns hold, as a copy over a sparse primary key can. The
+// progress write fits them to the columns instead of being refused, so the row
+// keeps updating, and the caller's task carries the values the row holds.
+// A value storage refuses outright comes back as storage.ErrValueRejected, so
+// the drive can tell it apart from a write a retry would land.
+func TestTaskStore_UpdateBoundsEngineReportedValuesAndReportsRejectedValues(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	lock := createTestLock(t, store, "testapp", "mysql")
+	apply := createTestApply(t, store, lock, "apply_eta", 1)
+	now := time.Now()
+	_, err := store.Tasks().Create(ctx, &storage.Task{
+		TaskIdentifier: "task_eta",
+		ApplyID:        apply.ID,
+		PlanID:         apply.PlanID,
+		Database:       apply.Database,
+		DatabaseType:   apply.DatabaseType,
+		Engine:         storage.EngineSpirit,
+		Environment:    apply.Environment,
+		State:          state.Task.Running,
+		Namespace:      "testapp",
+		TableName:      "users",
+		DDL:            "ALTER TABLE `users` ADD INDEX `idx_email` (`email`)",
+		DDLAction:      "ALTER",
+		ETASeconds:     -1,
+		ThrottleReason: strings.Repeat("x", 300),
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	})
+	require.NoError(t, err)
+
+	task, err := store.Tasks().Get(ctx, "task_eta")
+	require.NoError(t, err)
+	require.NotNil(t, task)
+	assert.Zero(t, task.ETASeconds, "a negative estimate is stored as no estimate")
+	assert.Equal(t, strings.Repeat("x", 254)+"…", task.ThrottleReason, "the insert fits the reason to its column")
+	task.ETASeconds = math.MaxInt32 + 1_000_000
+	task.ThrottleReason = strings.Repeat("é", 300)
+	task.RowsCopied = 42
+	require.NoError(t, store.Tasks().Update(ctx, task), "engine values past their columns do not refuse the progress write")
+
+	stored, err := store.Tasks().Get(ctx, "task_eta")
+	require.NoError(t, err)
+	assert.Equal(t, math.MaxInt32, stored.ETASeconds)
+	assert.Equal(t, strings.Repeat("é", 254)+"…", stored.ThrottleReason, "the reason is cut on a character boundary")
+	assert.Equal(t, int64(42), stored.RowsCopied, "the rest of the progress lands with it")
+	assert.Equal(t, stored.ETASeconds, task.ETASeconds, "the caller's task holds what the row holds")
+	assert.Equal(t, stored.ThrottleReason, task.ThrottleReason)
+
+	stored.ETASeconds = -5
+	require.NoError(t, store.Tasks().Update(ctx, stored))
+	reread, err := store.Tasks().Get(ctx, "task_eta")
+	require.NoError(t, err)
+	assert.Zero(t, reread.ETASeconds, "a negative estimate is stored as no estimate")
+
+	reread.ExecutionMode = strings.Repeat("x", 60)
+	err = store.Tasks().Update(ctx, reread)
+	require.ErrorIs(t, err, storage.ErrValueRejected, "a value the column cannot hold is reported as rejected")
+}
+
 // A sharded work operation's operation key identifies which shard task is real
 // drive input. Other shard rows remain progress detail and must not be replayed
 // as extra table changes if the operation is resumed.
@@ -741,11 +808,22 @@ func TestTaskStore_UpsertShardProgress(t *testing.T) {
 	assert.Equal(t, state.Task.Completed, got[0].State, "a lost lease must not overwrite the shard row")
 	assert.Equal(t, 100, got[0].ProgressPercent)
 
-	// A different shard under the same operation is a separate row.
-	require.NoError(t, store.Tasks().UpsertShardProgress(opCtx("op-token"), shardTask("80-")))
+	// A different shard under the same operation is a separate row. The insert
+	// fits the engine's display values to their columns rather than being
+	// refused over them.
+	second := shardTask("80-")
+	second.ETASeconds = math.MaxInt32 + 1_000_000
+	second.ThrottleReason = strings.Repeat("x", 300)
+	require.NoError(t, store.Tasks().UpsertShardProgress(opCtx("op-token"), second))
 	got, err = store.Tasks().GetShardProgressByApplyOperationID(ctx, opID)
 	require.NoError(t, err)
-	assert.Len(t, got, 2, "a different shard is its own per-shard task row")
+	require.Len(t, got, 2, "a different shard is its own per-shard task row")
+	for _, row := range got {
+		if row.Shard == "80-" {
+			assert.Equal(t, math.MaxInt32, row.ETASeconds)
+			assert.Equal(t, strings.Repeat("x", 254)+"…", row.ThrottleReason)
+		}
+	}
 
 	// A row targeting a different operation than the held lease is refused, so
 	// the lease cannot gate a write that points at another operation.
@@ -878,6 +956,176 @@ type missingInsert struct{ identityInserter }
 
 func (missingInsert) InsertGuardedID(context.Context, queryExecer, string, ...any) (int64, bool, error) {
 	return 0, false, nil
+}
+
+// racingShardInsert writes the shard's row through the real inserter just
+// before the store's own insert runs, modelling a row that appears after
+// UpsertShardProgress looked the shard up and found nothing.
+type racingShardInsert struct {
+	identityInserter
+	race func()
+}
+
+func (r racingShardInsert) InsertGuardedID(ctx context.Context, exec queryExecer, query string, args ...any) (int64, bool, error) {
+	if r.race != nil {
+		r.race()
+	}
+	return r.identityInserter.InsertGuardedID(ctx, exec, query, args...)
+}
+
+// Storage keeps one row per shard of an operation's table even when the
+// store's lookup misses a row that is written before its insert. A new shard
+// row takes an identifier derived from its key, so the unique index on
+// task_identifier refuses the second insert, and the store writes the
+// progress onto the row that won. A row holding that identifier under another
+// key is never written over.
+func TestMySQLUpsertShardProgressKeepsOneRowPerShard(t *testing.T) {
+	testUpsertShardProgressKeepsOneRowPerShard(t, func(t *testing.T) *Storage {
+		clearTables(t)
+		return NewMySQL(testDB)
+	})
+}
+
+func TestPostgresUpsertShardProgressKeepsOneRowPerShard(t *testing.T) {
+	_, db := testutil.StartPostgres(t, "shard_row_unique")
+	applyPostgresTestSchema(t, db)
+	testUpsertShardProgressKeepsOneRowPerShard(t, func(t *testing.T) *Storage {
+		clearPostgresTables(t, db)
+		return NewPostgres(db)
+	})
+}
+
+func testUpsertShardProgressKeepsOneRowPerShard(t *testing.T, newStore func(*testing.T) *Storage) {
+	ctx := t.Context()
+	store := newStore(t)
+	lock := createTestLock(t, store, "shard_unique_db", "vitess")
+	apply := createTestApply(t, store, lock, "apply_shard_unique", 941)
+	opID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a", Target: "payments",
+	})
+	require.NoError(t, err)
+	_, err = store.db.ExecContext(ctx, `UPDATE apply_operations SET lease_owner = ?, lease_token = ?, lease_acquired_at = NOW() WHERE id = ?`,
+		"driver", "op-token", opID)
+	require.NoError(t, err)
+	opCtx := storage.WithOperationLease(ctx, storage.OperationLease{ApplyID: apply.ID, OperationID: opID, Owner: "driver", Token: "op-token"})
+	shardTask := func(table string, progress int) *storage.Task {
+		now := time.Now()
+		return &storage.Task{
+			TaskIdentifier: fmt.Sprintf("caller-chosen-%s-%d", table, progress), ApplyID: apply.ID, ApplyOperationID: &opID,
+			PlanID: apply.PlanID, Database: apply.Database, DatabaseType: apply.DatabaseType,
+			Engine: storage.EnginePlanetScale, Environment: apply.Environment,
+			State: state.Task.Running, Namespace: "payments", TableName: table, Shard: "-80",
+			DDL: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)", DDLAction: "ALTER",
+			ProgressPercent: progress, CreatedAt: now, UpdatedAt: now,
+		}
+	}
+	realInserter := store.tasks.identity
+	t.Cleanup(func() { store.tasks.identity = realInserter })
+
+	t.Run("a row written after the lookup takes the progress", func(t *testing.T) {
+		store.tasks.identity = racingShardInsert{identityInserter: realInserter, race: func() {
+			store.tasks.identity = realInserter
+			require.NoError(t, store.Tasks().UpsertShardProgress(opCtx, shardTask("users", 10)))
+		}}
+
+		task := shardTask("users", 40)
+		require.NoError(t, store.Tasks().UpsertShardProgress(opCtx, task))
+
+		got, err := store.Tasks().GetShardProgressByApplyOperationID(ctx, opID)
+		require.NoError(t, err)
+		require.Len(t, got, 1, "the shard keeps one row")
+		assert.Equal(t, 40, got[0].ProgressPercent, "the later write's progress lands on the row that won")
+		assert.Equal(t, got[0].ID, task.ID)
+		assert.Equal(t, shardTaskIdentifier(opID, "payments", "users", "-80"), got[0].TaskIdentifier)
+	})
+
+	t.Run("table names differing only in case are separate shards on every dialect", func(t *testing.T) {
+		store.tasks.identity = realInserter
+		require.NoError(t, store.Tasks().UpsertShardProgress(opCtx, shardTask("ledger", 10)))
+		require.NoError(t, store.Tasks().UpsertShardProgress(opCtx, shardTask("Ledger", 20)))
+		require.NoError(t, store.Tasks().UpsertShardProgress(opCtx, shardTask("ledger", 50)))
+
+		lower := loadTask(t, store, shardTaskIdentifier(opID, "payments", "ledger", "-80"))
+		upper := loadTask(t, store, shardTaskIdentifier(opID, "payments", "Ledger", "-80"))
+		assert.Equal(t, "ledger", lower.TableName)
+		assert.Equal(t, 50, lower.ProgressPercent, "the re-upsert updates its own table's row")
+		assert.Equal(t, "Ledger", upper.TableName)
+		assert.Equal(t, 20, upper.ProgressPercent, "the other spelling's row is untouched")
+	})
+
+	t.Run("a row holding the identifier under another key is not written over", func(t *testing.T) {
+		store.tasks.identity = realInserter
+		orders := shardTask("orders", 5)
+		require.NoError(t, store.Tasks().UpsertShardProgress(opCtx, orders))
+		_, err := store.db.ExecContext(ctx, `UPDATE tasks SET task_identifier = ? WHERE id = ?`,
+			shardTaskIdentifier(opID, "payments", "invoices", "-80"), orders.ID)
+		require.NoError(t, err)
+
+		err = store.Tasks().UpsertShardProgress(opCtx, shardTask("invoices", 70))
+
+		require.Error(t, err)
+		assert.ErrorContains(t, err, "refused as a duplicate")
+		stored := loadTask(t, store, shardTaskIdentifier(opID, "payments", "invoices", "-80"))
+		assert.Equal(t, "orders", stored.TableName)
+		assert.Equal(t, 5, stored.ProgressPercent, "the other key's row keeps its own progress")
+	})
+
+	t.Run("the same table and shard under another operation or namespace keeps its own row", func(t *testing.T) {
+		store.tasks.identity = realInserter
+		otherOpID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+			ApplyID: apply.ID, Deployment: "region-b", Target: "payments",
+		})
+		require.NoError(t, err)
+		_, err = store.db.ExecContext(ctx, `UPDATE apply_operations SET lease_owner = ?, lease_token = ?, lease_acquired_at = NOW() WHERE id = ?`,
+			"driver", "other-op-token", otherOpID)
+		require.NoError(t, err)
+		otherOpCtx := storage.WithOperationLease(ctx, storage.OperationLease{ApplyID: apply.ID, OperationID: otherOpID, Owner: "driver", Token: "other-op-token"})
+		otherOperation := shardTask("accounts", 20)
+		otherOperation.ApplyOperationID = &otherOpID
+		otherNamespace := shardTask("accounts", 30)
+		otherNamespace.Namespace = "ledger"
+
+		require.NoError(t, store.Tasks().UpsertShardProgress(opCtx, shardTask("accounts", 10)))
+		require.NoError(t, store.Tasks().UpsertShardProgress(otherOpCtx, otherOperation))
+		require.NoError(t, store.Tasks().UpsertShardProgress(opCtx, otherNamespace))
+
+		progressByNamespace := map[string]int{}
+		rows, err := store.Tasks().GetShardProgressByApplyOperationID(ctx, opID)
+		require.NoError(t, err)
+		for _, row := range rows {
+			if row.TableName == "accounts" {
+				progressByNamespace[row.Namespace] = row.ProgressPercent
+			}
+		}
+		assert.Equal(t, map[string]int{"payments": 10, "ledger": 30}, progressByNamespace,
+			"the operation keeps one row per namespace for the same table and shard")
+		other, err := store.Tasks().GetShardProgressByApplyOperationID(ctx, otherOpID)
+		require.NoError(t, err)
+		require.Len(t, other, 1, "the other operation keeps its own row for the same table and shard")
+		assert.Equal(t, 20, other[0].ProgressPercent)
+	})
+
+	t.Run("an insert refused for a reason other than a duplicate is returned without a re-read", func(t *testing.T) {
+		insertErr := errors.New("connection reset by peer")
+		store.tasks.identity = failingInsert{err: insertErr}
+
+		err := store.Tasks().UpsertShardProgress(opCtx, shardTask("receipts", 10))
+
+		require.ErrorIs(t, err, insertErr)
+		assert.NotContains(t, err.Error(), "refused as a duplicate", "only a duplicate-key refusal is re-read")
+	})
+}
+
+// failingInsert fails every guarded insert with a fixed error without running
+// it, standing in for a write that storage refused for a reason other than a
+// duplicate key.
+type failingInsert struct {
+	identityInserter
+	err error
+}
+
+func (f failingInsert) InsertGuardedID(context.Context, queryExecer, string, ...any) (int64, bool, error) {
+	return 0, false, f.err
 }
 
 // A guarded shard insert that writes nothing while the lease is still current

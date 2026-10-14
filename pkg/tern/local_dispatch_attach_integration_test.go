@@ -582,3 +582,83 @@ func TestLocalClient_Apply_MemberTargetKeyingCannotMixWithinADeployment(t *testi
 		assert.Equal(t, []string{""}, operationKeys(t, stor, created.ApplyId))
 	})
 }
+
+// A generation declares payments-001 and payments-002, but only payments-002
+// is ever dispatched, and it completes. Its apply stays open waiting for
+// payments-001. The operator re-runs the apply: the new generation is
+// admitted rather than refused as a conflict, because everything the held
+// apply attached has settled, and it records that it took over the held
+// apply's work. A payments-001 dispatch arriving late for the held apply is
+// then refused, so the held apply can never start work on a target the new
+// generation now owns.
+func TestLocalClient_Apply_RerunAdmittedPastSettledManifestHold(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	stor, client, basePlanID := setupAttachDispatchClient(t)
+	ctx := t.Context()
+	firstPlanID := storeMemberTargetPlan(t, stor, basePlanID, "payments-001")
+	secondPlanID := storeMemberTargetPlan(t, stor, basePlanID, "payments-002")
+
+	const heldKey = "schemabot:v1:held-generation"
+	held, err := client.Apply(ctx, memberTargetDispatchRequest(secondPlanID, heldKey, "payments-002"))
+	require.NoError(t, err)
+	require.True(t, held.Accepted, "the held generation's dispatch must be accepted: %s", held.ErrorMessage)
+
+	heldApply := settleDispatchedApply(t, stor, held.ApplyId, state.Apply.Running)
+
+	rerun := memberTargetDispatchRequest(firstPlanID, "schemabot:v1:rerun-generation", "payments-001")
+	rerun.GenerationOperationKeys = []string{"payments-001"}
+	admitted, err := client.Apply(ctx, rerun)
+	require.NoError(t, err)
+	require.True(t, admitted.Accepted, "the re-run must be admitted past the settled hold: %s", admitted.ErrorMessage)
+	assert.NotEqual(t, held.ApplyId, admitted.ApplyId, "the re-run runs under its own apply")
+	storedHeld, err := stor.Applies().GetByApplyIdentifier(ctx, held.ApplyId)
+	require.NoError(t, err)
+	require.NotNil(t, storedHeld)
+	assert.Equal(t, admitted.ApplyId, storedHeld.SupersededBy, "the re-run records that it took over the held apply's work")
+
+	late, err := client.Apply(ctx, memberTargetDispatchRequest(firstPlanID, heldKey, "payments-001"))
+	require.NoError(t, err)
+	assert.False(t, late.Accepted, "a late operation for the held apply must be refused while the re-run is in flight")
+	assert.Contains(t, late.ErrorMessage, "a newer apply took over the work of apply "+held.ApplyId,
+		"the refusal names the takeover, not the re-run's table conflict")
+
+	settleDispatchedApply(t, stor, admitted.ApplyId, state.Apply.Completed)
+	late, err = client.Apply(ctx, memberTargetDispatchRequest(firstPlanID, heldKey, "payments-001"))
+	require.NoError(t, err)
+	assert.False(t, late.Accepted, "a late operation for the held apply must be refused after the re-run finishes")
+	assert.Contains(t, late.ErrorMessage, "a newer apply took over the work of apply "+held.ApplyId)
+
+	ops, err := stor.ApplyOperations().ListByApply(ctx, heldApply.ID)
+	require.NoError(t, err)
+	assert.Len(t, ops, 1, "the refused dispatches must not attach an operation")
+}
+
+// settleDispatchedApply records every task and operation of a dispatched apply
+// as completed, as its drive would once the work finished, records the apply
+// itself in applyState, and returns the apply.
+func settleDispatchedApply(t *testing.T, stor storage.Storage, applyIdentifier, applyState string) *storage.Apply {
+	t.Helper()
+	ctx := t.Context()
+	apply, err := stor.Applies().GetByApplyIdentifier(ctx, applyIdentifier)
+	require.NoError(t, err)
+	require.NotNil(t, apply)
+	tasks, err := stor.Tasks().GetByApplyID(ctx, apply.ID)
+	require.NoError(t, err)
+	require.NotEmpty(t, tasks)
+	for _, task := range tasks {
+		task.State = state.Task.Completed
+		require.NoError(t, stor.Tasks().Update(ctx, task))
+	}
+	ops, err := stor.ApplyOperations().ListByApply(ctx, apply.ID)
+	require.NoError(t, err)
+	require.NotEmpty(t, ops)
+	for _, op := range ops {
+		require.NoError(t, stor.ApplyOperations().UpdateState(ctx, op.ID, state.ApplyOperation.Completed))
+	}
+	apply.State = applyState
+	require.NoError(t, stor.Applies().Update(ctx, apply))
+	return apply
+}

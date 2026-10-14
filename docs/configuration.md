@@ -20,6 +20,7 @@
 - [Spirit Run Settings](#spirit-run-settings)
 - [Postgres](#postgres)
 - [Target TLS Posture](#target-tls-posture)
+- [PlanetScale Service Token](#planetscale-service-token)
 - [PlanetScale mTLS](#planetscale-mtls)
 - [Storage Schema Changes](#storage-schema-changes)
 - [Support Channel](#support-channel)
@@ -132,6 +133,67 @@ With the `config_paths` example above, SchemaBot reads:
 `dsn` and `dsn_from` are mutually exclusive for each storage or database
 environment entry.
 
+### Per-target schema overrides
+
+Static `target_resolver.targets` entries require exact lowercase engine types
+without surrounding whitespace, such as `mysql` and `postgres`. Values such as
+`MySQL` or ` mysql ` are rejected at startup, with or without overrides.
+
+A data plane can attach a canonical-to-physical schema mapping after resolving
+an exact `(environment, target)` through Etre or static inventory:
+
+```yaml
+target_resolver:
+  targets:
+    cluster-002:
+      type: mysql
+      dsn: "env:CLUSTER_DSN" # namespace-free
+  overrides:
+    - environment: production
+      target: cluster-002
+      type: mysql
+      schema_overrides:
+        orders_production: orders_sandbox
+```
+
+`overrides` is not a discovery backend. Configure exactly one of `targets` or
+`etre`. Each override requires an explicit lowercase environment, exact target,
+and engine type, plus exactly one mapping. MySQL and PostgreSQL mappings use the
+same identifier validation as static `schema_overrides`; other engines, unknown
+fields, duplicate environment/target pairs, and empty mappings are rejected.
+An override cannot also own a mapping in static inventory or a custom resolver.
+
+Discovery and credentials are resolved using the original request. There is no
+fallback environment or target. Only after successful discovery does the
+resolver check the resolved identity and type and attach a copied mapping.
+An absent entry preserves the backend result, including any static mapping.
+Enumeration and single-engine reporting retain the underlying resolver's
+capabilities. Startup logs name configured mappings; debug logs record use.
+Neither log includes connection strings or credentials.
+
+The engine operates on the physical schema and returns canonical namespace
+keys. The mapping is a strict allowlist: another namespace is refused. MySQL
+connections must remain namespace-free. A PostgreSQL mapping selects a schema
+within the database already named by the DSN.
+
+Before enabling a mapping, resolve the target and pull/plan using its canonical
+namespace. Configuration validation cannot prove that a target exists. In a
+multi-target rollout, plan every target against its own live schema; sharing
+desired SQL does not imply identical plans after partial completion.
+
+**Adding, changing, or removing mappings requires draining work.** This includes
+the first override: an older plan may refer to the canonical schema directly.
+Hold new operations for the affected target. Complete or explicitly retire all
+active, deferred-cutover, stopped, or otherwise resumable applies first. Hold
+affected target operations until every serving replica has the same config,
+and re-plan after every mapping change. A new mapping changes the client cache
+identity, but does not durably bind an old MySQL plan across driver restarts.
+Never execute a pre-change plan with a new mapping. To roll back, withdraw the
+affected route and drain its work before removing the mapping: removal restores
+identity mapping and can address a different schema. There is no hot reload.
+Durable mapping identity on plans is not enforced; this release depends on the
+drain-and-replan procedure, including discarding unused pre-change plans.
+
 ### PostgreSQL `dsn_from` targets
 
 `target_resolver` is the data-plane connection resolver: a server exposing the
@@ -195,6 +257,234 @@ The PostgreSQL shape differs from MySQL in three ways:
   When omitted, an RDS endpoint defaults to the embedded bundle and a non-RDS
   endpoint fails resolution: a verified CA is required, and the ambient trust
   store is never an implicit fallback.
+
+### Etre targets with more than one match
+
+An `etre` resolver expects its lookup to match one entity. Some inventories
+record both sides of a replicated pair under one target, such as a cluster and
+its standby during a blue/green switchover. A `mysql` resolver handles these
+without any configuration: when its lookup matches more than one entity, it
+connects to each match and reads `read_only`, `innodb_read_only`,
+`server_uuid`, and `SHOW REPLICA STATUS`. The target resolves to the match that
+accepts writes only when both of these hold:
+
+- Exactly one match has `read_only` and `innodb_read_only` off.
+- Every other match replicates from it: its replication status names the
+  writable match's `server_uuid` as a source.
+- The writable match replicates from no server outside the matches. It may
+  replicate back from its own standby, but a writable relay fed from elsewhere
+  is not the authoritative copy, and a change made on it would collide with
+  the same change arriving from its source.
+
+Anything else refuses to resolve the target, and the error names each match
+and what it reported. That covers no writable match, two writable matches, a
+read-only match that replicates from somewhere else or from nothing, and a
+match the probe cannot connect to. A read-only match that does not replicate
+from the writer is refused rather than ignored, because nothing then shows that
+the two matches are copies of one database.
+
+A lookup that matches one entity is not probed. A lookup that matches more than
+four is refused without probing. The matches are probed at the same time, each
+under its own timeout. The probe runs each time the target is
+resolved, so a switchover is picked up on the next request without any change
+to the inventory. It chooses the writer when a request resolves the target; it
+does not watch an apply that is already running.
+
+The probe connects with the same credentials and TLS settings as the schema
+change, and needs the `REPLICATION CLIENT` privilege to read the replication
+status. `SHOW REPLICA STATUS` needs MySQL 8.0.22 or later; on an older server
+the probe refuses the target and its error says so. Resolvers for the other
+database types refuse a lookup that matches more than one entity.
+
+### PostgreSQL Etre targets
+
+An `etre` resolver with `database_type: postgres` discovers PostgreSQL targets
+the same way it discovers MySQL ones: it looks the opaque target up by a label,
+reads the host from an entity field, and fetches credentials from the
+configured backend. It reads its own `postgres` block.
+
+```yaml
+target_resolver:
+  etre:
+    - addr: "https://etre.example.com"
+      database_type: postgres
+      entity_type: db_cluster
+      target_label: target_id
+      env_label: env
+      attribute_fields: [cluster_name]
+      postgres:
+        host_field: writer_endpoint
+        table_owner: "app_owner"           # optional; see table_owner above
+        ca_ref: "embedded:rds-global"      # optional for RDS endpoints
+      credentials:
+        type: awssm
+        region: us-east-1
+        secret_name: "db/{cluster_name}/schemabot"
+```
+
+A PostgreSQL connection is made to one database, so the resolver needs its
+name. It comes from the credential secret, which is read as JSON in the format
+AWS uses for RDS database secrets; any `engine`, `host`, or `port` fields are
+ignored, because the entity decides where to connect:
+
+```json
+{"username": "schemabot", "password": "...", "dbname": "orders"}
+```
+
+Because the secret names the user, leave `credentials.username` unset. A
+resolver whose engine decodes its secret (`postgres` or `vitess`) refuses to
+start when a username is configured, on both the `secret_ref` and `awssm`
+backends, rather than ignoring it.
+
+The `awssm` backend reads the secret in the region its `region` settings
+choose; see [Etre credentials from AWS Secrets
+Manager](#etre-credentials-from-aws-secrets-manager).
+
+`table_owner` and `ca_ref` mean the same as on a `dsn_from` target. They apply
+to every target the resolver serves, so a resolver serves clusters that share
+one owner role.
+
+### Etre credentials from AWS Secrets Manager
+
+An `etre` resolver with `credentials.type: awssm` reads each target's database
+credentials from AWS Secrets Manager. Three groups of settings decide which
+secret it reads:
+
+| Settings | Decide | Default |
+|---|---|---|
+| `secret_name` | the secret, templated over `{target}` and any `{attribute}` | required |
+| `role_arn`, `account_attribute`, `external_id` | the AWS account, by assuming `role_arn` in the account `account_attribute` names | the data plane's own account |
+| `region`, `region_attribute`, `reachable_regions` | the region the secret is read in | required: `region` |
+
+#### Which region a secret is read in
+
+`region` is the data plane's home region. Roles are assumed through STS there,
+and secrets are read there unless the two optional settings place a target
+elsewhere:
+
+- `region_attribute` names the entity attribute that holds the region of each
+  target's cluster, for example `aws_region`.
+- `reachable_regions` lists the regions, besides `region`, whose Secrets
+  Manager the data plane can call. It requires `region_attribute`, and every
+  listed region must be in the same AWS partition as `region`.
+
+For each target:
+
+```
+region of the target's cluster, from region_attribute
+├─ region, or listed in reachable_regions → read the secret in the cluster's region
+└─ any other region                       → read the secret in region, as a replica
+```
+
+Without `region_attribute`, every secret is read in `region`.
+
+Each deployment shape below needs a different combination:
+
+**All clusters are in the data plane's region.** Set `region` alone.
+
+```yaml
+credentials:
+  type: awssm
+  region: us-east-1
+  role_arn: "arn:aws:iam::{account}:role/schemabot-reader"
+  secret_name: "{target}/schemabot"
+```
+
+**Clusters run in several regions, and the data plane can call Secrets Manager
+only in its own.** Replicate every secret into the home region and add
+`region_attribute`. Reads stay in `region`, and when a secret is missing the
+error names the cluster's region and the replica it expected.
+
+```yaml
+credentials:
+  type: awssm
+  region: us-west-2
+  region_attribute: aws_region
+  role_arn: "arn:aws:iam::{account}:role/schemabot-reader"
+  secret_name: "{target}/schemabot"
+```
+
+**The data plane can call Secrets Manager in every region its clusters run
+in.** List those regions in `reachable_regions`, and each secret is read beside
+its cluster with no replica needed. Roles are still assumed through STS in
+`region`, because credentials from a regional STS endpoint are valid in every
+region of the same AWS partition, so only Secrets Manager has to be reachable
+in the listed regions. For the same reason, every listed region must be in the
+partition of `region`: credentials from the commercial partition cannot read a
+secret in GovCloud, China, or an isolated partition, so the resolver refuses
+to start with such a region listed.
+
+```yaml
+credentials:
+  type: awssm
+  region: us-west-2
+  region_attribute: aws_region
+  reachable_regions: [us-east-1]
+  role_arn: "arn:aws:iam::{account}:role/schemabot-reader"
+  secret_name: "{target}/schemabot"
+```
+
+Shapes can mix: a cluster in a region that is not listed still has its secret
+read in `region`, so it needs a replica there while the clusters in listed
+regions do not.
+
+#### What each target account provides
+
+In the account and region a target's secret is read in, the read needs:
+
+- The secret, named as `secret_name` renders for the target. In the home region
+  that is usually a replica of a secret whose primary is in the cluster's
+  region.
+- With `role_arn`: the role, trusting the data plane's identity and allowed to
+  call `secretsmanager:GetSecretValue` on the secret in that region.
+- Permission for the reading identity to decrypt with the KMS key that encrypts
+  the secret in that region. A replica is encrypted by a key in the replica's
+  own region, so a policy that grants decrypt by key alias needs the alias to
+  exist in that region as well.
+
+#### Errors
+
+With `reachable_regions` set, the attribute chooses where a secret is read, so
+a target whose entity has no value for `region_attribute`, or a value that is
+not an AWS region name, fails before any read rather than having its secret read
+in a region chosen for it:
+
+```
+target "orders" has no "aws_region" attribute naming the region of its cluster
+target "orders" has "aws_region" attribute "us-east", which is not an AWS region name
+```
+
+Without `reachable_regions`, every secret is read in `region` whatever the
+attribute says, so such a target is still read there. It only loses the
+cluster's region from the error below if its secret is missing, and the
+resolver logs a warning for a value that is not a region name.
+
+A secret missing from the home region, for a cluster in a region that is not
+reachable, names the fix:
+
+```
+fetch secret "orders/schemabot" for target "orders" in account 111111111111, region us-west-2:
+get secret value "orders/schemabot": ... ResourceNotFoundException: Secrets Manager can't find
+the specified secret.; the target's cluster is in us-east-1, which is not a reachable region, so
+its secret is read in us-west-2: replicate the secret to us-west-2, or list us-east-1 as a
+reachable region if this data plane can call Secrets Manager there
+```
+
+For a cluster in another AWS partition, where neither fix can work, the error
+says instead that the target has to be served by a data plane in that
+partition.
+
+#### Changing the region settings
+
+A change to these settings moves the reads of every target the resolver serves
+at once, and a target it breaks fails only when something next resolves it.
+Before listing `reachable_regions`, query the inventory for the entities the
+resolver matches and confirm each one carries a region name in
+`region_attribute`, since from then on a target without one fails. Before
+listing a region there, also confirm that the data plane can
+call Secrets Manager there and that every target in that region has its secret
+there: a listed region the data plane cannot reach turns each of those reads
+into a connection failure.
 
 ## gRPC Mode
 
@@ -272,7 +562,7 @@ Rules:
 - The map MUST contain at least one entry, each entry MUST set a non-empty `target`, and each map key MUST resolve through `tern_deployments` with an endpoint configured for this environment.
 - Keys under `deployments:` must be lowercase; the server refuses to start otherwise.
 - A single-entry map is accepted and behaves identically to the scalar `target` / `deployment` shape. Single-deployment environments should continue to use the scalar shape.
-- `cutover_policy` and `on_failure` are only valid alongside a `deployments` map or a `targets` list. `cutover_policy` accepts `rolling` (the default), `barrier`, or `parallel`; `on_failure` accepts `halt` (the default), `continue`, or `pause`. Both values are captured on every operation row when the apply is created, so the policy in force at that moment travels with the rollout.
+- `cutover_policy` and `on_failure` are only valid alongside a `deployments` map or a `targets` list. `cutover_policy` accepts `rolling`, `barrier`, or `parallel`, and defaults to `parallel` when every member of the environment comes from a `targets` list and to `rolling` otherwise, including for a `deployments` map that mixes `targets` entries with single `target` entries; `on_failure` accepts `halt` (the default), `continue`, or `pause`. Both values are captured on every operation row when the apply is created, so the policy in force at that moment travels with the rollout.
 
 ### Planning and the Primary Deployment
 
@@ -289,7 +579,7 @@ Being primary decides which plan is stored, not which deployment is reviewed. A 
 Every deployment name in `deployment_order` must be lowercase; the server
 refuses to start otherwise.
 
-Under `cutover_policy: barrier` or `parallel`, cutovers run one rollout member at a time in this order, and a later member waits until every earlier one has completed. A member is one deployment of a `deployments` map, or one target of a `targets` list. An earlier member that failed stops holding the rollout under `on_failure: continue`, or under `pause` once the rollout is released; under `halt`, and under `pause` until a release, it holds every later cutover. An apply started with `--defer-cutover` follows the same order. Each `schemabot cutover` cuts over the member whose turn it is, and only that member: a second member waits for a second command. A cutover requested while every ready member is still waiting on an earlier one is refused, and the refusal names the member holding the turn. Within a member, copies never wait on each other to start, and how the cutovers are ordered depends on what triggers them. The automatic cutover takes one operation at a time, so two shards of one member cut over one after the other, in the order the rollout created them. A `schemabot cutover` addresses the member's data-plane apply as a whole, so SchemaBot does not order that member's shards and tables among themselves.
+Under `cutover_policy: barrier` or `parallel`, cutovers run one rollout member at a time in this order, and a later member waits until every earlier one has completed. A member is one deployment of a `deployments` map, or one target of a `targets` list. An earlier member that failed stops holding the rollout under `on_failure: continue`, or under `pause` once the rollout is released; under `halt`, and under `pause` until a release, it holds every later cutover. An apply started with `--defer-cutover` follows the same order. A deployment with a `targets` list is the exception: each of its targets cuts over as its table finishes, so an apply to it refuses `--defer-cutover`; apply one target at a time with `--target` to hold a target's cutover. Each `schemabot cutover` cuts over the member whose turn it is, and only that member: a second member waits for a second command. A cutover requested while every ready member is still waiting on an earlier one is refused, and the refusal names the member holding the turn. Within a member, copies never wait on each other to start, and how the cutovers are ordered depends on what triggers them. The automatic cutover takes one operation at a time, so two shards of one member cut over one after the other, in the order the rollout created them. A `schemabot cutover` addresses the member's data-plane apply as a whole, so SchemaBot does not order that member's shards and tables among themselves.
 
 ## Multi-Target Environment (preview)
 
@@ -324,6 +614,8 @@ A `targets` list can also sit inside a `deployments` map entry, for a database w
             target: payments-003
 ```
 
+An apply that spans several deployments, one of them with a `targets` list, is not supported yet and is refused before it takes the lock. Apply one target at a time instead, in rollout order: `schemabot apply -e production --target payments-001`, then the next target. The refusal names the first one. A rollout already up to date applies nothing, so an apply that confirms it converged still succeeds.
+
 ### Selecting namespaces per target
 
 When a database's namespaces are spread across its targets, an entry can be a mapping that names which namespaces live on that target. A bare string and a mapping without `namespaces` both mean the target holds every namespace the schema files declare.
@@ -348,7 +640,8 @@ Rules:
 - `targets` is mutually exclusive with `target` at the same level, and with a local `dsn` / `dsn_from`.
 - An environment-level `targets` list is mutually exclusive with an environment-level `deployments` map, the same way an environment-level `target` is. A `targets` list inside a `deployments` entry is how the two combine.
 - The list MUST contain at least one entry, and no entry may be empty.
-- `cutover_policy` and `on_failure` order the listed targets the same way they order the deployments of a `deployments` map: each target is a rollout member, taken in list order. The default, `rolling`, runs one target at a time, and under the default `on_failure: halt` a failed target stops every later one from starting. A large fleet can set `cutover_policy: parallel`, which starts up to the server's `max_drivers_per_apply` targets' copies at once, queues the rest, and still cuts over one target at a time in list order.
+- A rollout across the listed targets runs table by table: each table lands on every target before any target starts the next. Tables run in the order the reviewed plan lists them, then any table only another target's plan changes, sorted by name. A target whose plan does not change a table has nothing to run for it, and two statements on one table run together. The exception is a rollout where a target's plan changes a VSchema, which applies with that target's tables, so each target then runs its whole change in one go.
+- `cutover_policy` and `on_failure` order the listed targets within each table the same way they order the deployments of a `deployments` map: each target is a rollout member, taken in list order. The default here is `parallel`: it starts up to the server's `max_drivers_per_apply` targets' copies at once, queues the rest, and still cuts over one target at a time in list order. Under the default `on_failure: halt` a failed target stops every queued target from starting, and holds the cutover of every later target already copying: each of those finishes its copy and waits at the cutover barrier until an operator stops or cancels it. `max_drivers_per_apply` is therefore what bounds how many targets copy at once, and how many a failure can leave holding a finished copy, so raising it widens both; size it for the targets that share a host's disk and network as well as for throughput. An environment that relies on an unset `cutover_policy` running one target at a time needs `cutover_policy: rolling` to keep doing so: a failed target then stops every later one before it starts copying. Whatever `on_failure` says, a table that failed on any target ends the rollout at that table: `continue` or a released `pause` still runs it on the remaining targets, but no target starts the next table.
 - No entry may contain `/`. A deployment addressing several targets names each one in its members' operation keys, and `/` separates a key's components.
 - One deployment may not list the same target twice. A rollout member is identified by its deployment and target together, so the same target under two different deployments is two distinct members and is allowed.
 - Members resolve deployments outermost: every target of the first deployment, then every target of the next.
@@ -739,22 +1032,51 @@ local-mode MySQL and `cleanup_enabled: true`.
 
 For MySQL databases executed by the Spirit engine, some ALTER statements are
 deterministically refused by the engine — for example dropping a primary key or
-adding a foreign key, which its online copy cannot preserve. By default those
-statements block the apply. The `direct_execution` policy lets a refused
-statement instead run verbatim as native MySQL DDL when the target table is
-small enough. See [Direct Execution](direct-execution.md) for how routing
-works and what other engines need to adopt it.
+adding a foreign key, which its online copy cannot preserve. The
+`direct_execution` policy lets a refused statement instead run verbatim as
+native MySQL DDL when the target table is small enough. With no policy
+configured, the default applies: enabled, bounded at 100MiB of data and
+indexes, which is an estimate (see `max_table_bytes` below). Set
+`enabled: false` to leave refused statements blocked, or `max_table_rows` for a
+bound the engine corroborates with an exact count. See
+[Direct Execution](direct-execution.md) for how routing works and what other
+engines need to adopt it.
 
 Set it at the top level of the server config to state one policy for every
 MySQL database the server drives:
 
 ```yaml
 direct_execution:
-  enabled: true           # default: false
+  enabled: true           # required to enable; omitted in a stated block means false
   max_table_rows: 100000  # the size bound: set exactly one of max_table_rows
                           # or max_table_bytes (e.g. max_table_bytes: 100MiB)
   lock_acquisition_timeout: 10s  # optional; whole seconds; default 10s
 ```
+
+Only omitting the block entirely selects the default policy. A stated block is
+taken as written: it does not inherit the default's size bound, so one that
+enables direct execution must name its own.
+
+State the policy, including an opt-out, on the control plane. A control plane
+forwards the policy it resolves with every plan, and the server that runs the
+statement uses it in place of its own. A control plane with no
+`direct_execution` block forwards the default, so `enabled: false` set only on
+a data plane is overridden.
+
+Upgrade order: upgrade every server that executes statements to a build that
+reads `max_table_bytes` before upgrading the control plane to a build with this
+default. An older server rejects the forwarded default as missing its row
+bound, so every MySQL plan and apply it serves fails until it is upgraded.
+Stating a `max_table_rows` policy on the control plane first avoids this.
+
+Between the two upgrades, plans and applies disagree. The older control plane
+forwards no policy, so an upgraded server plans a refused statement as direct
+under its own default. The control plane records that plan as judged under no
+policy, and the apply carries that record, so the server blocks at apply the
+statement the plan showed as direct. To keep the two in agreement, set
+`enabled: false` on the upgraded servers until the control plane is upgraded.
+Once it is, the control plane's policy is the one forwarded, so the setting no
+longer has any effect.
 
 This is the form to reach for on a fleet: a per-database block for every
 database is the same policy written many times, and each copy is one more
@@ -874,9 +1196,10 @@ be a whole number of seconds (at least `1s`).
 
 The kill reads `performance_schema` and `information_schema.innodb_trx` to
 find the blocking sessions and ends other users' sessions, so the SchemaBot
-user needs `SELECT` on `performance_schema.*`, `PROCESS`, and
-`CONNECTION_ADMIN` (or `SUPER`) for a statement to run directly; without any
-of them the statement is blocked at plan time.
+user needs `SELECT` on `performance_schema.*`, `PROCESS`, and either
+`CONNECTION_ADMIN` (or `SUPER`) or, on RDS, `EXECUTE` on `mysql.rds_kill` for a
+statement to run directly; without any of them the statement is blocked at
+plan time.
 
 Config validation fails at startup when a per-database `direct_execution`
 block — even a disabled one — is set on a non-MySQL database, when a policy is
@@ -1056,54 +1379,31 @@ defaults below.
 
 ```yaml
 spirit:
-  enable_experimental_autoscaling: true        # default: true
-  enable_experimental_lockless_checksum: true  # default: false
-  checkpoint_max_age: 72h                      # default: 72h (3 days)
-  checksum_yield_timeout: 12h                  # default: 12h
+  checkpoint_max_age: 72h  # default: 72h (3 days)
 ```
 
 The defaults, and why they were chosen:
 
-- **Thread pools are autoscaled on Aurora** (not configurable as a fixed
-  count). With `enable_experimental_autoscaling` on, Spirit sizes the copy,
-  apply, and checksum thread pools from the Aurora instance and scales them
-  dynamically from throttler feedback. A fixed thread count is the classic
-  failure mode on large targets — throughput that made sense on one instance
-  class silently starves or overloads another, and autoscaling is why there is
-  no operator knob for copy aggressiveness. Autoscaling needs Aurora's load
-  signal: on other MySQL targets Spirit leaves it disengaged and runs at fixed
-  default thread counts. Set `enable_experimental_autoscaling: false` only as
-  an incident kill switch when autoscaling misbehaves on a target fleet.
-- **The copy is verified under the snapshot checksum** unless
-  `enable_experimental_lockless_checksum: true` is set. The lockless checker
-  verifies with optimistic reads, retries, and hot-range splitting instead of a
-  checksum setup lock held over long-lived `REPEATABLE READ` snapshots, which
-  keeps a long checksum from pinning InnoDB purge on the target. Cutover locking
-  is the same either way. It is experimental and off by default, and these are
-  the terms an operator accepts by turning it on:
-  - **A continuously updated row can keep the verify phase running.** Such a
-    row is not yet supported: its chunk is deferred at the end of every pass, no
-    pass ever comes back clean, and passes repeat until an operator stops the
-    apply. The apply holds the database's active-apply slot until they do.
-  - **The verify phase reports 0% for its whole duration.** The lockless checker
-    has verified nothing conclusively until its first clean pass, so progress
-    goes from 0% straight to complete rather than climbing. Expect
-    `Checksumming to verify data (0%)` on the PR comment throughout, and a
-    stalled-task warning in the server logs every five minutes, for an apply
-    that is healthy.
-  - **`checksum_yield_timeout` does not apply.** It bounds the snapshot
-    checker's read transactions; the lockless checker holds no snapshot to
-    yield.
-
-  Setting it to `false` at the server level restates the default and overrides
-  nothing, so a database that opts itself in stays opted in.
+- **Thread pools are autoscaled on Aurora** (not configurable). Spirit sizes
+  the copy, apply, and checksum thread pools from the Aurora instance and
+  scales them dynamically from throttler feedback. A fixed thread count is the
+  classic failure mode on large targets — throughput that made sense on one
+  instance class silently starves or overloads another, and autoscaling is why
+  there is no operator knob for copy aggressiveness. Autoscaling needs Aurora's
+  load signal: on other MySQL targets Spirit leaves it disengaged and runs at
+  fixed default thread counts. An Aurora instance with fewer than 4 vCPUs is
+  too small to scale, so Spirit runs it in small-instance mode instead: every
+  pool runs one worker with small chunks and does not scale, which makes a
+  large copy on such an instance markedly slower.
+- **The copy is verified with Spirit's lockless checksum** (not configurable).
+  It verifies with optimistic reads, retries, and hot-range splitting instead
+  of a checksum setup lock held over long-lived `REPEATABLE READ` snapshots, so
+  a long checksum does not pin InnoDB purge on the target. Rows that are
+  updated continuously are settled against the change stream. Cutover still
+  requires a complete clean pass, and cutover locking is unchanged.
 - **`checkpoint_max_age: 72h`** — a checkpoint older than this is not resumed;
   the copy restarts cleanly instead of replaying days of old binlogs, which on
   a busy target is slower and riskier than starting over.
-- **`checksum_yield_timeout: 12h`** — each checksum read transaction yields its
-  `REPEATABLE READ` snapshot within this bound so a long checksum cannot pin
-  InnoDB purge and degrade the whole target instance. It bounds the snapshot
-  checker only, and has no effect where the lockless one is enabled.
 - **GTID change source is auto-detected** (no knob). Targets running with
   `gtid_mode=ON` and `enforce_gtid_consistency=ON` get Spirit's GTID-based
   change source, which tracks replication position across binlog rotation and
@@ -1111,9 +1411,15 @@ The defaults, and why they were chosen:
   the universally supported file+position source.
 
 A database can override the server-level value by setting the same key
-(`enable_experimental_autoscaling`, `enable_experimental_lockless_checksum`,
-`checkpoint_max_age`, `checksum_yield_timeout`) in its own metadata; the
-database's entry wins.
+(`checkpoint_max_age`) in its own metadata; the database's entry wins.
+
+The keys `enable_experimental_autoscaling`,
+`enable_experimental_lockless_checksum`, and `checksum_yield_timeout` were
+removed: Spirit now chooses thread autoscaling and the checksum itself. A
+config that still sets one is rejected rather than ignored, because the
+operator set it to change how runs behave. In the `spirit:` block it fails
+startup; in a database's metadata it fails building that database's engine
+client. Both errors name the key. Deleting the key is the whole remedy.
 
 These settings only apply where this server constructs the Spirit engine
 itself — local-mode MySQL databases. Databases routed to a remote deployment
@@ -1265,6 +1571,12 @@ it: a pinned CA bundle under a non-verifying `sslmode` is refused at CA
 resolution, as described under
 [PostgreSQL `dsn_from` targets](#postgresql-dsn_from-targets), rather than
 silently never consulted.
+
+## PlanetScale Service Token
+
+The Vitess engine calls the PlanetScale API with a service token. The
+permissions it needs, and the ones it does not, are listed in
+[Vitess on PlanetScale](vitess.md#service-token-permissions).
 
 ## PlanetScale mTLS
 
@@ -1588,7 +1900,11 @@ The base branch is used, not the PR's head branch, to prevent a PR from relaxing
 
 Approval is checked at the time of `schemabot apply` and `schemabot apply-confirm`. Once an apply is executing, there is no ongoing approval check. Team membership and CODEOWNERS are evaluated fresh at each gate check.
 
-An approval counts only for the schema it reviewed, whatever the repository's branch protection does with stale approvals. Each reviewer's latest decisive review is used, and an approval satisfies the gate when it was given on the PR's current head commit, or on an earlier commit when GitHub shows the head descends from it and no schema input changed in between: no `.sql`, `vschema.json`, or `schemabot.yaml` file anywhere in the repository, and no file under the database's schema directory. If that cannot be shown (GitHub cannot find the approved commit, a force-push rewrote it out of the branch's history, or GitHub truncates the list of changed files), the approval does not count and the reviewer must approve the current head; the Review Required comment names the reviewers whose approvals no longer count. If GitHub is unavailable while the gate compares the commits, the command fails with a retryable error instead of reporting that a review is required. `apply-confirm` re-checks the gate, so a schema change pushed between `apply` and `apply-confirm` also needs a fresh approval.
+An approval counts only for the schema change it reviewed, whatever the repository's branch protection does with stale approvals. Each reviewer's latest decisive review is used, and an approval satisfies the gate when it was given on the PR's current head commit, or on an earlier commit at which the PR's change to the database's schema inputs is the same as at the head. A database's schema inputs are its schema directory, the environment symlink that directory was resolved through (if any), its `schemabot.yaml`, and the target of every symlink inside them. Changes elsewhere in the repository, including another database's schema, do not affect the approval.
+
+The PR's change is measured against the default branch it was built on: SchemaBot finds the merge base of each commit with the base branch's current tip and compares content at all four commits. A schema input counts as unchanged when the PR turns the same base content into the same result at both commits, or when the PR leaves it as the base branch has it at both commits and the head was built on newer default branch content than the approved commit. So rebasing onto, or merging in, a newer default branch keeps the approval even when that default branch added tables beside the PR's, changed the database's `schemabot.yaml`, or removed a namespace: those changes are not the PR's, and they reached the default branch through their own PR and review. The same holds for a stacked PR: when the PR below it merges, even with revisions, and this PR is rebased onto it, the schema files that came from the lower PR are now the default branch's, and the approval keeps counting as long as this PR's own change is the same. The approval stops counting when the PR edits, adds, or removes a schema input after it, or stops changing a schema input the default branch has not changed since, including when a rebase combines the PR's edit with a default branch edit to the same file, keeps the PR's version over the default branch's, or restores content the default branch changed. Rebuilding the PR on an older default branch commit than the one it was approved on also stops the approval from counting when any schema input differs between the two, since the head would carry a version of that input nobody approved for this PR. These rules trust default branch content, so they apply only to a PR that targets the repository's default branch; a PR targeting any other branch keeps an approval only for a schema input whose base content and PR change are both the same at the two commits, so on such a PR, a rebase or merge that brings in any change to its schema inputs needs a new approval, and the Review Required comment names the target branch to say so. Keeping an approval across default branch changes relies on the default branch requiring review for every change that reaches it: a change pushed to it directly, without its own review, is carried past an earlier approval like any other default branch change. Protect the default branch with required reviews when the review gate is enabled.
+
+If the PR's change differs, the Review Required comment names the reviewers whose approvals no longer count, and the reviewer must approve the current head. If the comparison cannot be completed (GitHub cannot find the approved commit, a directory is too large to list, a symlink points outside the repository, or there are more distinct symlinks than a comparison reads) and no other approval covers the head, that approval does not count and the apply is blocked with a Review Gate Error comment. The comment names the approval that did not count, lists who can approve, and asks for an approval of the latest commit, which needs no comparison. The reason goes to the server logs. Asking GitHub again would return the same answer, so the command is not retried. If GitHub is unavailable while the gate compares the commits, the command fails with a retryable error instead of reporting that a review is required. `apply-confirm` re-checks the gate, so a schema change pushed between `apply` and `apply-confirm` also needs a fresh approval.
 
 ## Authentication
 
@@ -1702,7 +2018,7 @@ The decision has two halves. The middleware admits any caller in `write_groups` 
 
 Two consequences of the environment-less lock grant are worth stating outright. First, a scoped operator's lock holds applies off **every** environment of their database, including environments outside `operator_environments` — an operator scoped to staging can still freeze production applies of their own database. That direction is fail-safe (a lock only ever prevents changes), so the grant deliberately allows it. Second, the reverse direction is not: force release (`force: true`) bypasses the lock ownership check, so it could undo another holder's safety brake — for example an admin's incident lock. Force release therefore stays admin-only (`write_groups`).
 
-A scoped operator's normal release is held to who took the lock, not to the owner string it carries: that string is visible to anyone who can list locks, so sending it proves nothing. A lock acquired through `POST /api/locks/acquire` records its verified acquirer and which of the database's `operator_groups` that acquirer belonged to, and a scoped operator may release it only when they share at least one of those groups — a teammate can release a lock another member of their group took, and nobody outside the group can. A lock that records no acquirer (a PR apply's lock, a lock taken on a deployment with no `operator_groups`, a lock taken by a server version that did not record acquirers, or one taken through the loopback break-glass lane, whose identity headers are not proxy-verified) or whose acquirer held none of the database's operator groups belongs to no group, so a scoped operator cannot release it; a `write_groups` member can, by owner or with `force`. A refused release is a `403` naming the groups that may release the lock, and the lock stays held. The release is decided against the lock row it read and deletes only that row, so a lock released and acquired again while the release runs is reported as a `409` and the new lock stays held. The same rule decides whether a scoped operator who acquires a lock already held under the owner they sent is told they hold it: re-acquiring a lock their own group took succeeds without changing it, and sending the owner of another group's lock, or of a lock that belongs to no group, is a `403` naming the groups that may release it, with the lock unchanged. `write_groups` members, and every caller on a deployment without `operator_groups`, re-acquire and release by owner alone. A lock records its acquirer's groups when it is taken, while the caller's groups are read from the current configuration, so editing `operator_groups` strands locks: after a group is renamed, no scoped operator can release or re-acquire a lock taken under its old name, and an operator moved out of every group a lock recorded can no longer release or re-acquire the lock they took, until a `write_groups` member (or, for a moved operator, a remaining member of one of those groups) releases it.
+A scoped operator's normal release is held to who took the lock, not to the owner string it carries: that string is visible to anyone who can list locks, so sending it proves nothing. A lock acquired through `POST /api/locks/acquire` records its verified acquirer and which of the database's `operator_groups` that acquirer belonged to, and a scoped operator may release it only when they share at least one of those groups — a teammate can release a lock another member of their group took, and nobody outside the group can. A lock that records no acquirer (a PR apply's lock, a lock taken on a deployment with no `operator_groups`, a lock taken by a server version that did not record acquirers, or one taken through the loopback break-glass lane, whose identity headers are not proxy-verified) or whose acquirer held none of the database's operator groups belongs to no group, so a scoped operator cannot release it; a `write_groups` member can, by owner or with `force`. A scoped operator cannot create such a lock: an acquire from a scoped operator whose identity is not verified, as on the loopback break-glass lane, is refused with a `403` before anything is taken, since the lock would record no acquirer and they could never release or re-acquire it. The refusal is decided before the lock is read, so it also answers an unverified operator re-sending the owner of a lock their own group already holds: the lock stays held and unchanged, but the request is not told it holds it, because the groups of an unverified caller are only claimed. `schemabot apply` (unless `--no-lock` is set) and `schemabot rollback` take this lock before they start, so on the loopback break-glass lane they stop at the same refusal before changing anything; a deployment write group member can run them instead. A refused release is a `403` naming the groups that may release the lock, and the lock stays held. The release is decided against the lock row it read and deletes only that row, so a lock released and acquired again while the release runs is reported as a `409` and the new lock stays held. The same rule decides whether a scoped operator who acquires a lock already held under the owner they sent is told they hold it: re-acquiring a lock their own group took succeeds without changing it when their identity is verified, and sending the owner of another group's lock, or of a lock that belongs to no group, is a `403` naming the groups that may release it, with the lock unchanged. `write_groups` members, and every caller on a deployment without `operator_groups`, re-acquire and release by owner alone. A lock records its acquirer's groups when it is taken, while the caller's groups are read from the current configuration, so editing `operator_groups` strands locks: after a group is renamed, no scoped operator can release or re-acquire a lock taken under its old name, and an operator moved out of every group a lock recorded can no longer release or re-acquire the lock they took, until a `write_groups` member (or, for a moved operator, a remaining member of one of those groups) releases it.
 
 The grant fails closed everywhere: an unconfigured database or an environment outside `operator_environments` denies scoped callers with a `403` naming the groups that would grant access, and a target that cannot be resolved at decision time — a stored plan or apply lookup failure — surfaces as the operation's own `500`, never as an authorization. Misconfiguration is a startup error, not a silent no-op: any `operator_groups` grant requires a non-empty `operator_environments` (and the reverse), requires `auth.type: forward_auth`, and every granted database must have at least one of its environments in `operator_environments` — a grant that could never authorize anything is rejected at startup.
 
@@ -1981,10 +2297,22 @@ for the same set of environments. A same-commit comment covering different
 environments is kept expanded — it may be the only visible plan for those
 environments.
 
-A plan outcome can also supersede without posting: when an auto-plan resolves
-to no changes, no new comment appears (the check run alone reports the green
-state), but plan comments from prior commits are still retired — the pending
-DDL and apply prompt they show no longer match the branch.
+Once a PR shows a plan comment, it keeps showing a current one. When an
+auto-plan resolves to no changes and a plan comment from a prior commit is
+still visible, the auto-plan posts its no-changes plan comment, which
+supersedes the prior one like any other plan comment. A PR that has never shown
+a plan comment gets no comment for a no-changes auto-plan; the check run alone
+reports the green state. A push that changes no schema input files leaves the
+newest visible plan comment for the same environments in place while it
+still matches the plan: a comment that shows changes stays while there are
+still changes, and one that shows none stays while there are still none. When the live database moved
+without the schema files changing and the plan flipped between those two
+outcomes, for example after the PR's change was applied outside the PR, the
+auto-plan posts a new plan comment that supersedes the outdated one. The
+comparison is changes against no changes, not the DDL itself: a comment whose
+DDL was partly applied elsewhere stays until the next plan comment replaces
+it. A plan for a commit the PR has already moved past never posts a
+replacement; the current commit's own plan answers instead.
 
 By default, a superseded plan comment no apply ever acted on is deleted from
 the PR timeline outright — its DDL never ran and is reproducible from the

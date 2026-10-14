@@ -1,6 +1,7 @@
 package ddl
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -10,10 +11,10 @@ import (
 // A diff set records each desired table once. Distinct tables are accepted,
 // a second file declaring an already declared table is refused with both file
 // names, a file declaring the same table twice is refused naming that file,
-// and table names compare exactly, the same way the differ keys them: a pair
-// differing only in case is two desired tables to the differ, so it is two
-// declarations here, whatever the target's lower_case_table_names would make
-// of them.
+// and table names compare the way the target and the differ compare them: a
+// pair differing only in case is two tables when lower_case_table_names is 0
+// and one table, refused with both spellings and files named, when it is 1 or
+// 2.
 func TestTableDeclarations_Declare(t *testing.T) {
 	t.Run("distinct tables are accepted", func(t *testing.T) {
 		var declared TableDeclarations
@@ -36,9 +37,19 @@ func TestTableDeclarations_Declare(t *testing.T) {
 		require.EqualError(t, err, `table "orders" is declared more than once in schema file "app/orders.sql". Declare each table exactly once`)
 	})
 
-	t.Run("names differing only in case are distinct tables", func(t *testing.T) {
+	t.Run("names differing only in case are distinct tables on a case-sensitive target", func(t *testing.T) {
 		var declared TableDeclarations
 		require.NoError(t, declared.Declare("app/orders.sql", "orders"))
 		assert.NoError(t, declared.Declare("app/Orders.sql", "Orders"))
 	})
+
+	for _, lctn := range []int{1, 2} {
+		t.Run(fmt.Sprintf("names differing only in case are one table when lower_case_table_names=%d", lctn), func(t *testing.T) {
+			declared := TableDeclarations{LowerCaseTableNames: lctn}
+			require.NoError(t, declared.Declare("app/orders.sql", "orders"))
+			err := declared.Declare("app/Orders.sql", "Orders")
+			require.EqualError(t, err, fmt.Sprintf(`tables "orders" (schema file "app/orders.sql") and "Orders" (schema file "app/Orders.sql") are the same table on this target, which compares table names case-insensitively (lower_case_table_names=%d). Declare each table exactly once`, lctn))
+			require.NoError(t, declared.Declare("app/users.sql", "users"), "other tables are unaffected")
+		})
+	}
 }

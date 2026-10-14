@@ -33,6 +33,9 @@ type WatchModel struct {
 	tables     []templates.TableProgress
 	operations []templates.ProgressOperation
 	released   bool // apply-level release latch: a released pause runs degraded, not paused
+	// sharded is whether the apply is one change fanned out across its
+	// keyspaces' shards, so it renders without operation sections.
+	sharded bool
 	// deferCutover is whether the apply waits for an operator at each cutover.
 	deferCutover bool
 	errorMsg     string
@@ -43,6 +46,9 @@ type WatchModel struct {
 	metadata         map[string]string // Full metadata from progress response
 
 	// UI state
+	// windowHeight is the terminal's height in rows, zero until the first
+	// window size message arrives.
+	windowHeight       int
 	pastPending        bool
 	detached           bool
 	quitting           bool
@@ -51,6 +57,9 @@ type WatchModel struct {
 	startedAt          time.Time
 	initialized        bool
 	consecutiveErrors  int // Consecutive fetch failures (drives backoff)
+	// requestedRetryDelay is the delay the last failed fetch asked for, which
+	// stretches the backoff before the next poll.
+	requestedRetryDelay time.Duration
 }
 
 var activityLabelFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
@@ -63,10 +72,12 @@ type progressMsg struct {
 	tables       []templates.TableProgress
 	operations   []templates.ProgressOperation
 	released     bool              // apply-level release latch: a released pause runs degraded, not paused
+	sharded      bool              // one change fanned out across its keyspaces' shards
 	deferCutover bool              // the apply waits for an operator at each cutover
 	errorMsg     string            // Human-readable error message
 	failed       bool              // true when the API call didn't return usable progress data
 	retryable    bool              // when failed, whether the TUI should keep polling
+	retryAfter   time.Duration     // when failed, the delay the response asked for before the next poll
 	applyID      string            // Populated from progress responses
 	database     string            // Populated from apply-id progress responses
 	environment  string            // Populated from apply-id progress responses
@@ -118,6 +129,10 @@ func (m WatchModel) Init() tea.Cmd {
 // Update implements tea.Model.
 func (m WatchModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
+	case tea.WindowSizeMsg:
+		m.windowHeight = msg.Height
+		return m, nil
+
 	case tea.KeyMsg:
 		// During cutover, ignore all keyboard input except q to force quit
 		isCuttingOver := state.IsState(m.state, state.Apply.CuttingOver) || m.cutoverTriggered
@@ -159,6 +174,7 @@ func (m WatchModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// until the same bound the non-interactive watches give up at.
 			m.consecutiveErrors++
 			m.errorMsg = msg.errorMsg
+			m.requestedRetryDelay = msg.retryAfter
 			if m.consecutiveErrors >= maxConsecutiveProgressFailures {
 				m.errorMsg = progressGiveUpMessage(m.applyID, m.consecutiveErrors) + ": " + msg.errorMsg
 				m.initialized = true
@@ -175,6 +191,7 @@ func (m WatchModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		m.consecutiveErrors = 0
 		m.errorMsg = ""
+		m.requestedRetryDelay = 0
 		m.state = msg.state
 		if !state.IsState(m.state, state.Apply.Pending) {
 			m.pastPending = true
@@ -183,6 +200,7 @@ func (m WatchModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.tables = msg.tables
 		m.operations = msg.operations
 		m.released = msg.released
+		m.sharded = msg.sharded
 		m.deferCutover = msg.deferCutover
 		m.errorMsg = msg.errorMsg
 
@@ -224,16 +242,7 @@ func (m WatchModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
-		// Check for terminal states
-		if state.IsState(m.state, state.Apply.Completed, state.Apply.Failed) {
-			return m, tea.Quit
-		}
-		// Also quit on stopped/cancelled state
-		if state.IsState(m.state, state.Apply.Stopped, state.Apply.Cancelled) {
-			return m, tea.Quit
-		}
-		// Quit if no active schema change
-		if state.IsState(m.state, state.NoActiveChange) {
+		if m.watchHasEnded() {
 			return m, tea.Quit
 		}
 

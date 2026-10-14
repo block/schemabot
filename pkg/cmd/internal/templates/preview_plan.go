@@ -17,6 +17,21 @@ func previewPlanOutput() {
 	WriteOptions(true, false) // Show defer cutover option
 }
 
+// previewPartitionedPlanOutput shows a plan for partitioned tables, each
+// partition definition on its own line.
+func previewPartitionedPlanOutput() {
+	WritePlanHeader(PlanHeaderData{
+		Database:    "testapp",
+		SchemaName:  "testapp",
+		Environment: "staging",
+		IsMySQL:     true,
+	})
+
+	changes := samplePartitionedPlanChanges()
+	WriteSQLChanges(changes, schema.DialectMySQL)
+	WritePlanSummary(changes)
+}
+
 func previewVitessPlanOutput() {
 	WritePlanHeader(PlanHeaderData{
 		Database:    "commerce",

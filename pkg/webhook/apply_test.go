@@ -77,7 +77,8 @@ func TestFormatProgressComment_NoTasks(t *testing.T) {
 	body := formatProgressComment(apply, nil, nil, "")
 
 	assert.Contains(t, body, "testdb")
-	assert.Contains(t, body, "Starting")
+	assert.Contains(t, body, "**Status**: Queued")
+	assert.Contains(t, body, "This schema change starts automatically")
 }
 
 func TestFormatProgressComment_WithError(t *testing.T) {

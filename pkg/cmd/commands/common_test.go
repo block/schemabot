@@ -184,3 +184,27 @@ func TestLoadCLIConfig_RejectsIgnoreTablePaths(t *testing.T) {
 	assert.Nil(t, cfg)
 	assert.Contains(t, err.Error(), "not a path")
 }
+
+// A pattern entry is read as written and travels to the plan request
+// unresolved: only the target's catalog says which tables it matches.
+func TestLoadCLIConfig_ParsesIgnoreTablePatterns(t *testing.T) {
+	dir := t.TempDir()
+	content := "database: mydb\ntype: mysql\nignore_tables:\n  - legacy_audit_log\n  - '/^relay_\\d+_feed$/'\n  - /^relay_[0-9]+_cursor$/\n"
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "schemabot.yaml"), []byte(content), 0644))
+
+	cfg, err := LoadCLIConfig(dir)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"legacy_audit_log", `/^relay_\d+_feed$/`, `/^relay_[0-9]+_cursor$/`}, cfg.PlanExclusions().Tables,
+		"quoted or not, as the docs show it")
+}
+
+func TestLoadCLIConfig_RejectsInvalidIgnoreTablePattern(t *testing.T) {
+	dir := t.TempDir()
+	content := "database: mydb\ntype: mysql\nignore_tables:\n  - '/^relay_(\\d+_feed$/'\n"
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "schemabot.yaml"), []byte(content), 0644))
+
+	cfg, err := LoadCLIConfig(dir)
+	require.Error(t, err)
+	assert.Nil(t, cfg)
+	assert.Contains(t, err.Error(), `schemabot.yaml: ignore_tables entry "/^relay_(\d+_feed$/" is not a valid regular expression`)
+}

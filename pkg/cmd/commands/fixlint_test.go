@@ -10,12 +10,17 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/cmd/client"
+	"github.com/block/schemabot/pkg/cmd/cliname"
 	"github.com/block/schemabot/pkg/schema"
 )
 
 // fixableTable has an INT AUTO_INCREMENT primary key, which fix-lint rewrites
 // to BIGINT and leaves no issue that needs a manual fix.
 const fixableTable = "CREATE TABLE `users` (\n  `id` int NOT NULL AUTO_INCREMENT,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;\n"
+
+// cleanTable is a lint-clean table in SHOW CREATE TABLE form, the form
+// onboard writes, so fix-lint has nothing to fix in it.
+const cleanTable = "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `email` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;\n"
 
 func writeSchemaFile(t *testing.T, path, content string) {
 	t.Helper()
@@ -204,4 +209,49 @@ func TestFixLint_IgnoredNamespaceLeftUntouched(t *testing.T) {
 
 	assert.NotEqual(t, fixableTable, readFile(t, ordersPath))
 	assert.Equal(t, fixableTable, readFile(t, ignoredPath))
+}
+
+// A lint-clean file in SHOW CREATE TABLE form has nothing to fix, so fix-lint
+// leaves it byte-for-byte as written and reports nothing to fix.
+func TestFixLint_CleanNamespacedFileLeftUntouched(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "app")
+	usersPath := filepath.Join(dir, "testapp", "users.sql")
+	writeSchemaFile(t, usersPath, cleanTable)
+
+	var runErr error
+	out := captureStdout(func() {
+		runErr = (&FixLintCmd{SchemaDir: dir}).Run(&Globals{})
+	})
+	require.NoError(t, runErr)
+
+	assert.Equal(t, cleanTable, readFile(t, usersPath))
+	assert.Equal(t, "✓ No lint issues found.\n", out)
+}
+
+// In a directory where one file needs a fix, fix-lint rewrites that file with
+// the fix, lists only that file, and leaves every clean file byte-for-byte as
+// written.
+func TestFixLint_OnlyFileNeedingFixRewritten(t *testing.T) {
+	const orders = "CREATE TABLE `orders` (\n  `id` int NOT NULL AUTO_INCREMENT,\n  `user_id` bigint unsigned NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;\n"
+	dir := filepath.Join(t.TempDir(), "app")
+	usersPath := filepath.Join(dir, "testapp", "users.sql")
+	ordersPath := filepath.Join(dir, "testapp", "orders.sql")
+	billingPath := filepath.Join(dir, "billing", "users.sql")
+	writeSchemaFile(t, usersPath, cleanTable)
+	writeSchemaFile(t, ordersPath, orders)
+	writeSchemaFile(t, billingPath, cleanTable)
+
+	var runErr error
+	out := captureStdout(func() {
+		runErr = (&FixLintCmd{SchemaDir: dir}).Run(&Globals{})
+	})
+	require.NoError(t, runErr)
+
+	assert.Equal(t, "CREATE TABLE `orders` (`id` BIGINT NOT NULL AUTO_INCREMENT,`user_id` BIGINT UNSIGNED NOT NULL,PRIMARY KEY(`id`)) ENGINE = InnoDB DEFAULT CHARACTER SET = UTF8MB4 DEFAULT COLLATE = UTF8MB4_0900_AI_CI", readFile(t, ordersPath))
+	assert.Equal(t, cleanTable, readFile(t, usersPath))
+	assert.Equal(t, cleanTable, readFile(t, billingPath))
+	assert.Equal(t, "✅ Fixed 1 issue(s):\n"+
+		"  - [testapp/orders.sql] INT → BIGINT for primary key\n"+
+		"\n"+
+		"Run '"+cliname.Name()+" plan' to see full validation results.\n", out)
 }

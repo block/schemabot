@@ -162,9 +162,7 @@ type LocalConfig struct {
 	// direct_execution_lock_acquisition_timeout_seconds (positive bound on
 	// each direct statement's lock acquisition; engine default when absent);
 	// plus the run-settings overrides parsed by spirit.SettingsFromMetadata
-	// (enable_experimental_autoscaling,
-	// enable_experimental_lockless_checksum, checkpoint_max_age,
-	// checksum_yield_timeout).
+	// (checkpoint_max_age).
 	Metadata map[string]string
 
 	// SchemaOverrides maps a requested canonical namespace to the
@@ -199,6 +197,9 @@ type LocalConfig struct {
 // supply an engine without the core depending on its package.
 type EngineFactory func(cfg LocalConfig, logger *slog.Logger) (engine.Engine, error)
 
+// defaultHeartbeatInterval is how often a drive renews its claim.
+const defaultHeartbeatInterval = 10 * time.Second
+
 // LocalClient implements Client by calling an embedded engine directly — the
 // built-in Spirit (mysql) or PlanetScale (vitess) engine, or an engine supplied
 // by an embedder for another database type. It uses SchemaBot's storage for
@@ -217,13 +218,19 @@ type LocalClient struct {
 	// at the drive's ingest points. Zero value is ready.
 	unrecognizedStatuses unrecognizedStatusReporter
 
+	// targetHeld measures how long each apply's drives have been refused the
+	// target by another run, so a hold that persists is escalated. Zero value
+	// is ready.
+	targetHeld targetHeldWaits
+
 	// heartbeatInterval controls how often the apply heartbeat updates updated_at.
-	// Defaults to 10s. Tests may lower this to verify heartbeat behavior.
+	// Defaults to defaultHeartbeatInterval. Tests may lower this to verify
+	// heartbeat behavior.
 	heartbeatInterval time.Duration
 
 	// taskPollIntervalOverride, when positive, replaces defaultTaskPollInterval
-	// as the sequential drive's progress poll cadence. Tests may lower it to
-	// drive many polls quickly.
+	// as the sequential drive's progress poll cadence, and targetHeldRetryInterval
+	// as its wait on a held target. Tests may lower it to drive many polls quickly.
 	taskPollIntervalOverride time.Duration
 
 	// taskStallWarnIntervalOverride, when positive, replaces
@@ -242,7 +249,7 @@ type LocalClient struct {
 	// or executeGroupedApply. Set when an apply starts, called by Stop().
 	// Protected by cancelMu since Apply and Stop run on different goroutines.
 	cancelMu              sync.Mutex
-	cancelApply           context.CancelFunc
+	cancelApply           context.CancelCauseFunc
 	cancelApplyGeneration uint64
 
 	// observers holds per-apply progress observers. The progress poller notifies
@@ -261,7 +268,7 @@ type LocalClient struct {
 
 type applyCancelHandle struct {
 	generation uint64
-	cancel     context.CancelFunc
+	cancel     context.CancelCauseFunc
 }
 
 // Compile-time check that LocalClient implements Client.
@@ -300,13 +307,8 @@ func NewLocalClient(cfg LocalConfig, stor storage.Storage, logger *slog.Logger) 
 	if cfg.Type == storage.DatabaseTypeVitess {
 		// api_url is optional in a database's configuration and names a private or
 		// emulated endpoint when it is set. Absent, the database is a real
-		// PlanetScale one, so fall back to the public endpoint the way the
-		// inventory-resolved path does — the client needs a base URL to address
-		// the API directly, and leaving it empty would refuse every apply.
+		// PlanetScale one, and the client addresses the public endpoint.
 		apiURL := cfg.Metadata["api_url"]
-		if apiURL == "" {
-			apiURL = inventory.DefaultPlanetScaleAPIURL
-		}
 		psClientFunc = func(tokenName, tokenValue string) (psclient.PSClient, error) {
 			return psclient.NewPSClientWithBaseURL(tokenName, tokenValue, apiURL)
 		}
@@ -356,7 +358,7 @@ func NewLocalClient(cfg LocalConfig, stor storage.Storage, logger *slog.Logger) 
 		customEngine:      customEngine,
 		psClientFunc:      psClientFunc,
 		logger:            logger,
-		heartbeatInterval: 10 * time.Second,
+		heartbeatInterval: defaultHeartbeatInterval,
 	}, nil
 }
 
@@ -605,6 +607,7 @@ func (c *LocalClient) remapsPostgresNamespaces() bool {
 }
 
 func (c *LocalClient) applyWithEngine(ctx context.Context, eng engine.Engine, req *engine.ApplyRequest) (*engine.ApplyResult, error) {
+	ctx = withDriveWorkOwner(ctx)
 	req = applyRequestWithStatedDirectExecution(req)
 	if !c.remapsPostgresNamespaces() {
 		return eng.Apply(ctx, req)
@@ -2171,6 +2174,34 @@ func (c *LocalClient) planForApplyRequest(ctx context.Context, req *ternv1.Apply
 	if !applyRequestCarriesPlanPayload(req) {
 		return nil, nil
 	}
+	// A table step's ddl_changes name one table of its target's plan, so a plan
+	// built from them would hold that table alone and the target's later steps
+	// would have nothing to run against. A member other than the primary is
+	// planned without this deployment storing its plan, so its first step to
+	// arrive builds the plan from the whole plan the dispatch carries beside
+	// the step: verified against this target's live schema like any other
+	// materialized plan, and stored under the member's plan ID, where every
+	// later step finds it. The step's table is then run from that stored plan.
+	if step, ok := req.GetOptions()[dispatchRolloutStepOption]; ok {
+		if len(req.GetPlanDdlChanges()) == 0 {
+			// Every control plane that dispatches table steps stamps the whole
+			// plan on each attempt, so only one older than that sends a step
+			// without it. The refusal stays retryable: once the control plane
+			// is upgraded, its next attempt carries the plan and the step runs,
+			// whichever plane was upgraded first.
+			return nil, fmt.Errorf("dispatch for rollout step %s has no plan %s stored on this deployment and carries no plan to build it from; refusing to build the plan from one step's table", step, req.PlanId)
+		}
+		c.logger.Info("Apply: building a rollout member's plan from its table step's dispatch",
+			"plan_id", req.PlanId,
+			"database", c.config.Database,
+			"target", req.Target,
+			"rollout_step", step,
+			"plan_change_count", len(req.GetPlanDdlChanges()),
+		)
+		whole := proto.Clone(req).(*ternv1.ApplyRequest)
+		whole.DdlChanges = req.GetPlanDdlChanges()
+		return c.materializeApplyRequestPlan(ctx, whole)
+	}
 	return c.materializeApplyRequestPlan(ctx, req)
 }
 
@@ -2572,16 +2603,28 @@ func (c *LocalClient) existingIdempotentApply(ctx context.Context, req *ternv1.A
 // absent for every other dispatch.
 const dispatchMemberTargetOption = "member_target"
 
+// dispatchRolloutStepOption is the dispatch option naming the table step a
+// member dispatch runs, in a rollout run table by table. Each of a target's
+// steps is its own operation, so the data plane runs only the step's tables and
+// keys the operation by its step behind the target, the key the planner stored.
+// It is set only alongside dispatchMemberTargetOption.
+//
+// A data plane that does not read it derives the whole-target key instead,
+// which the dispatch's generation manifest does not name, so the dispatch is
+// refused before anything runs rather than run every table of the target.
+const dispatchRolloutStepOption = "rollout_step"
+
 // dispatchScope is the execution shape derived from a dispatch request: the
 // DDL changes this dispatch drives, the single target shard of a shard-scoped
-// dispatch, whether the dispatch is a task-less VSchema finalizer, and the
-// rollout member target its operation key is qualified with.
+// dispatch, whether the dispatch is a task-less VSchema finalizer, the rollout
+// member target its operation key is qualified with, and the table step it runs.
 type dispatchScope struct {
 	ddlChanges         []storage.TableChange
 	shard              string
 	finalizer          bool
 	finalizerNamespace string
 	memberTarget       string
+	rolloutStep        int
 }
 
 // deriveDispatchScope determines a dispatch request's scope. A sharded
@@ -2623,6 +2666,19 @@ func deriveDispatchScope(plan *storage.Plan, req *ternv1.ApplyRequest) (dispatch
 		return dispatchScope{}, fmt.Errorf("dispatch for rollout member target %q runs plan %s, which was produced for target %q; refusing to run one target's plan on another target's database", memberTarget, plan.PlanIdentifier, plan.Target)
 	}
 	scope := dispatchScope{ddlChanges: plan.FlatDDLChanges(), memberTarget: memberTarget}
+	rolloutStep, err := dispatchRolloutStep(req, memberTarget)
+	if err != nil {
+		return dispatchScope{}, err
+	}
+	if rolloutStep > 0 {
+		changes, err := rolloutStepDDLChanges(plan, req.DdlChanges)
+		if err != nil {
+			return dispatchScope{}, fmt.Errorf("dispatch for step %d of rollout member target %q: %w", rolloutStep, memberTarget, err)
+		}
+		scope.rolloutStep = rolloutStep
+		scope.ddlChanges = changes
+		return scope, nil
+	}
 	if len(req.TargetShards) > 0 {
 		shard, err := dispatchTargetShard(req.TargetShards)
 		if err != nil {
@@ -2659,6 +2715,88 @@ func dispatchMemberTarget(req *ternv1.ApplyRequest) (string, error) {
 	return target, nil
 }
 
+// dispatchRolloutStep reads the table step a dispatch names, or 0 when it names
+// none. A step belongs to one target's rows, so a dispatch naming a step without
+// a member target, or a step that is not a positive number, is refused rather
+// than run as some other shape. A step runs on a whole target, while a sharded
+// target's work is dispatched one shard at a time, so a dispatch naming both a
+// step and target shards is malformed and refused.
+func dispatchRolloutStep(req *ternv1.ApplyRequest, memberTarget string) (int, error) {
+	raw, ok := req.GetOptions()[dispatchRolloutStepOption]
+	if !ok {
+		return 0, nil
+	}
+	step, err := strconv.Atoi(raw)
+	if err != nil || step < 1 {
+		return 0, fmt.Errorf("dispatch rollout step %q is not a positive number; refusing a dispatch whose table step cannot be read", raw)
+	}
+	if memberTarget == "" {
+		return 0, fmt.Errorf("dispatch names rollout step %d but no member target; a table step is one target's work, so refusing to run it as the whole deployment's", step)
+	}
+	if len(req.TargetShards) > 0 {
+		return 0, fmt.Errorf("dispatch names rollout step %d and target shards %v; a table step runs on a whole target, so refusing a dispatch that names both", step, req.TargetShards)
+	}
+	return step, nil
+}
+
+// rolloutStepDDLChanges narrows the plan's changes to the tables a table step's
+// dispatch names. The plan is this target's own, so its statements are the ones
+// this target runs; the dispatch says only which of its tables the step covers.
+// A dispatched table the plan does not change is refused: the step would
+// otherwise run less than the control plane recorded, and report the missing
+// table as done. A step that names no table is refused too, since it would
+// leave an operation with nothing to drive. A step is one table, so a dispatch
+// naming two tables is refused: it would run both under one step's key, and the
+// other table's own step would run it again. The step's table may sit in more
+// than one of the target's namespaces, and each runs as a task of the step.
+//
+// The dispatch is checked against the target's plan, not against the step: the
+// data plane holds no map from step to table, so which table runs under which
+// step is the control plane's to get right and is not verified here.
+func rolloutStepDDLChanges(plan *storage.Plan, dispatched []*ternv1.TableChange) ([]storage.TableChange, error) {
+	type tableKey struct{ namespace, table string }
+	step := make(map[tableKey]bool, len(dispatched))
+	stepTable := ""
+	for i, ch := range dispatched {
+		if ch == nil {
+			return nil, fmt.Errorf("ddl_change %d is nil", i)
+		}
+		table := strings.TrimSpace(ch.TableName)
+		if table == "" {
+			return nil, fmt.Errorf("ddl_change %d has no table", i)
+		}
+		if stepTable != "" && table != stepTable {
+			return nil, fmt.Errorf("the dispatch names tables %q and %q; a table step runs one table, so refusing to run two under one step", stepTable, table)
+		}
+		stepTable = table
+		step[tableKey{strings.TrimSpace(ch.Namespace), table}] = true
+	}
+	if len(step) == 0 {
+		return nil, fmt.Errorf("the dispatch names no table")
+	}
+	var changes []storage.TableChange
+	covered := make(map[tableKey]bool, len(step))
+	for _, change := range plan.FlatDDLChanges() {
+		key := tableKey{change.Namespace, change.Table}
+		if !step[key] {
+			continue
+		}
+		covered[key] = true
+		changes = append(changes, change)
+	}
+	var uncovered []string
+	for key := range step {
+		if !covered[key] {
+			uncovered = append(uncovered, key.namespace)
+		}
+	}
+	if len(uncovered) > 0 {
+		slices.Sort(uncovered)
+		return nil, fmt.Errorf("plan %s has no change to table %q in namespace %q, which the step names", plan.PlanIdentifier, stepTable, uncovered[0])
+	}
+	return changes, nil
+}
+
 // operationIdentityForDispatch returns the operation key and kind the dispatch
 // scope stores on its apply_operations row.
 //
@@ -2692,6 +2830,9 @@ func operationIdentityForDispatch(scope dispatchScope) (operationKey, operationK
 		}
 		if scope.finalizer {
 			return storage.TargetOperationKey(scope.memberTarget, finalizerKeyForScope(scope)), storage.ApplyOperationKindGroupFinalizer, nil
+		}
+		if scope.rolloutStep > 0 {
+			return storage.TargetOperationKey(scope.memberTarget, storage.RolloutStepOperationKey(scope.rolloutStep)), "", nil
 		}
 		return storage.TargetOperationKey(scope.memberTarget, ""), "", nil
 	}
@@ -2867,6 +3008,23 @@ func (c *LocalClient) refuseAttachToTerminalApply(ctx context.Context, req *tern
 	}
 }
 
+// refuseAttachToTakenOverApply refuses an operation arriving for an apply whose
+// work a newer apply took over. The newer generation was admitted because this
+// one had settled everything that attached and was waiting only for operations
+// like this one, so running it now would run work the newer apply owns on the
+// same deployment.
+func (c *LocalClient) refuseAttachToTakenOverApply(req *ternv1.ApplyRequest, apply *storage.Apply, operationKey string, err error) *ternv1.ApplyResponse {
+	c.logger.Warn("Apply: refusing to attach operation to an apply whose work a newer apply took over; dispatch is rejected",
+		append(apply.LogAttrs(),
+			"operation_key", operationKey,
+			"idempotency_key", req.IdempotencyKey,
+			"error", err)...)
+	return &ternv1.ApplyResponse{
+		Accepted:     false,
+		ErrorMessage: fmt.Sprintf("a newer apply took over the work of apply %s; operation %s cannot attach", apply.ApplyIdentifier, operationKey),
+	}
+}
+
 // attachDispatchOperation adds a sibling dispatch's operation and its tasks to
 // the deployment's existing keyed apply. The attach runs the same conflict and
 // unsafe-DDL gates a fresh apply runs, so attaching never admits work a create
@@ -2881,6 +3039,15 @@ func (c *LocalClient) attachDispatchOperation(ctx context.Context, req *ternv1.A
 	if keysLeadWithTarget := apply.GetOptions().OperationKeysLeadWithTarget; keysLeadWithTarget != (scope.memberTarget != "") {
 		return c.refuseAttachKeyingMismatch(req, apply, plan, scope, operationKey,
 			fmt.Errorf("apply %s records operation keys leading with their target = %t, but this dispatch names member target %q", apply.ApplyIdentifier, keysLeadWithTarget, scope.memberTarget)), nil
+	}
+
+	// A newer generation admitted past this apply took over its work, so this
+	// operation is refused as late before the table conflict with that newer
+	// apply's tasks can refuse it without saying so. The attach re-checks the
+	// marker under the target lock, which is what makes the refusal hold.
+	if apply.SupersededBy != "" {
+		return c.refuseAttachToTakenOverApply(req, apply, operationKey,
+			fmt.Errorf("apply %s took over the work of apply %s: %w", apply.SupersededBy, apply.ApplyIdentifier, storage.ErrApplyTakenOver)), nil
 	}
 
 	// An attach already belongs to a keyed apply, so a conflict here is another
@@ -2930,6 +3097,7 @@ func (c *LocalClient) attachDispatchOperation(ctx context.Context, req *ternv1.A
 		OperationKind: operationKind,
 		Target:        plan.Target,
 		State:         state.ApplyOperation.Pending,
+		RolloutStep:   scope.rolloutStep,
 		CreatedAt:     now,
 		UpdatedAt:     now,
 	}
@@ -2956,6 +3124,8 @@ func (c *LocalClient) attachDispatchOperation(ctx context.Context, req *ternv1.A
 		return c.refuseAttachToTerminalApply(ctx, req, apply, operationKey), nil
 	case errors.Is(err, storage.ErrApplyOperationKeyingMismatch):
 		return c.refuseAttachKeyingMismatch(req, apply, plan, scope, operationKey, err), nil
+	case errors.Is(err, storage.ErrApplyTakenOver):
+		return c.refuseAttachToTakenOverApply(req, apply, operationKey, err), nil
 	case err != nil:
 		return nil, fmt.Errorf("attach operation %s to apply %s: %w", operationKey, apply.ApplyIdentifier, err)
 	}
@@ -3243,6 +3413,7 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 		OperationKind: operationKind,
 		Target:        plan.Target,
 		State:         state.ApplyOperation.Pending,
+		RolloutStep:   scope.rolloutStep,
 		CreatedAt:     now,
 		UpdatedAt:     now,
 	}}

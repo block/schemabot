@@ -711,6 +711,68 @@ func TestDeploymentPlanGroups_DiscloseEachTargetsUnsafeChanges(t *testing.T) {
 		"the gate's list names the targets, since it renders beside the primary plan's changes")
 }
 
+// A table's findings can reach the comment joined into one unsafe reason in
+// different orders on different targets: a plan stored before its engine
+// normalized reasons, or an engine that does not normalize, keeps the order
+// its linters reported. Targets whose findings are the same set share one
+// unsafe change, so
+// the comment lists each finding once rather than once per order. A target
+// with a different set of findings keeps a change of its own.
+func TestDeploymentPlanGroups_TargetsWithTheSameFindingsInAnotherOrderShareOneUnsafeChange(t *testing.T) {
+	create := "CREATE TABLE `bikes` (`id` bigint NOT NULL, `created_at` timestamp NULL, `updated_at` timestamp NULL, PRIMARY KEY (`id`))"
+	const createdAt = "Column `created_at` uses `TIMESTAMP`"
+	const updatedAt = "Column `updated_at` uses `TIMESTAMP`"
+	unsafeCreate := func(target, reason string) api.DeploymentRollupEntry {
+		e := plannedMember("ski", target, create)
+		tc := e.ChangeSet.Changes[0].TableChanges[0]
+		tc.TableName = "bikes"
+		tc.ChangeType = ternv1.ChangeType_CHANGE_TYPE_CREATE
+		tc.IsUnsafe = true
+		tc.UnsafeReason = reason
+		return e
+	}
+	rollup := api.PlanRollup{
+		Clean:    true,
+		Planning: api.PlanIndependent,
+		Entries: []api.DeploymentRollupEntry{
+			plannedMember("ski", "bikeshare-001"),
+			unsafeCreate("bikeshare-002", createdAt+"; "+updatedAt),
+			unsafeCreate("bikeshare-003", updatedAt+"; "+createdAt),
+			unsafeCreate("bikeshare-004", createdAt),
+		},
+	}
+
+	groups := deploymentPlanGroups(rollup)
+	require.Len(t, groups, 2)
+	require.Len(t, groups[1].UnsafeChanges, 2, "one change for the targets that share a set of findings, one for the target with a different set")
+	assert.Equal(t, createdAt+"; "+updatedAt, groups[1].UnsafeChanges[0].Reason)
+	assert.Equal(t, []string{"ski/bikeshare-002", "ski/bikeshare-003"}, groups[1].UnsafeChanges[0].Targets)
+	assert.Equal(t, createdAt, groups[1].UnsafeChanges[1].Reason)
+	assert.Equal(t, []string{"ski/bikeshare-004"}, groups[1].UnsafeChanges[1].Targets)
+}
+
+// Shards of one target can report a table's findings in different orders too,
+// and the shards whose findings are the same set share one unsafe change.
+func TestMemberUnsafeChanges_ShardsWithTheSameFindingsInAnotherOrderShareOneChange(t *testing.T) {
+	const dropCol = "ALTER TABLE `users` DROP COLUMN `nickname`, DROP INDEX `idx_nickname`"
+	shard := func(name, reason string) *ternv1.ShardPlan {
+		return &ternv1.ShardPlan{Shard: name, Changes: []*ternv1.TableChange{{
+			TableName: "users", Ddl: dropCol, ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER, IsUnsafe: true, UnsafeReason: reason,
+		}}}
+	}
+	const column = "DROP COLUMN `nickname` discards the column's data"
+	const index = "DROP INDEX `idx_nickname` is visible"
+	cs := tern.ChangeSet{Shards: []*ternv1.ShardPlan{
+		shard("-80", column+"; "+index),
+		shard("80-", index+"; "+column),
+	}}
+
+	assert.Equal(t, []templates.UnsafeChangeData{{
+		Table: "users", Reason: column + "; " + index, DDL: dropCol, ChangeType: "alter",
+		Shards: []string{"-80", "80-"}, TotalShards: 2,
+	}}, memberUnsafeChanges(cs))
+}
+
 // Targets that run the same DDL share a group, but each target's unsafe
 // verdict is read from its own schema: dropping an index is unsafe only where
 // the index is visible. A sibling that finds the primary target's statement

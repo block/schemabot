@@ -1,6 +1,7 @@
 package commands
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,6 +15,7 @@ import (
 	"github.com/block/schemabot/pkg/cmd/cliname"
 	"github.com/block/schemabot/pkg/cmd/internal/templates"
 	"github.com/block/schemabot/pkg/ddl"
+	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
@@ -42,7 +44,7 @@ type ApplyCmd struct {
 }
 
 // Run executes the apply command.
-func (cmd *ApplyCmd) Run(g *Globals) error {
+func (cmd *ApplyCmd) Run(ctx context.Context, g *Globals) error {
 	if cmd.NoLock && cmd.Force {
 		return fmt.Errorf("--force requires locking to break an existing lock; remove --no-lock to use it")
 	}
@@ -147,6 +149,22 @@ func (cmd *ApplyCmd) Run(g *Globals) error {
 		return nil
 	}
 
+	// An apply that spans several deployments, one of them with several
+	// targets, is refused by apply creation whatever its flags; refusing it
+	// here, before the prompt and the lock, leaves nothing held. A rollout
+	// already up to date has nothing to apply, so it says so above instead,
+	// and an apply that confirms convergence stays a no-op.
+	if rollout := planResult.WholeRollout(); rollout != nil && rollout.ShapeRefusal != "" {
+		return errors.New(rollout.ShapeRefusal)
+	}
+
+	// Each target of a multi-target rollout cuts over as its table finishes,
+	// so the server refuses --defer-cutover there; refusing it before the
+	// prompt saves confirming an apply that will not start.
+	if rollout := planResult.WholeRollout(); cmd.DeferCutover && rollout != nil && rollout.MultiTarget {
+		return fmt.Errorf("--defer-cutover is not supported on an apply to more than one target; apply again without --defer-cutover, or apply one target with --target")
+	}
+
 	// A targeted apply's preflight: the plan has resolved its member, and has
 	// work that would conflict with a schema change on that deployment.
 	if cmd.Target != "" {
@@ -155,6 +173,21 @@ func (cmd *ApplyCmd) Run(g *Globals) error {
 		}); err != nil {
 			return err
 		}
+	}
+
+	// The primary is not listed among rollout member refusals. Its engine's
+	// blocked verdict also refuses single-target and narrowed applies, and no
+	// unsafe opt-in makes it executable. It is checked before the member
+	// refusals, whose remedy is a rerun of the rollout that this verdict would
+	// refuse after those members had already changed.
+	if err := blockedPlanError("apply", planResult); err != nil {
+		if cmd.Output != OutputFormatJSON {
+			// The refused statement is shown before the refusal, since the
+			// remedy, whichever the reason names, starts with reading it.
+			OutputPlanResult(planResult, cfg.Database, cmd.Environment, cfg.SchemaDir, true)
+			writeNarrowedTo(planResult)
+		}
+		return err
 	}
 
 	// The server lists the members whose own plans apply creation refuses in
@@ -230,6 +263,12 @@ func (cmd *ApplyCmd) Run(g *Globals) error {
 
 	// Step 4: Acquire lock and apply the plan
 
+	// A Ctrl-C during planning or the prompt ends the command here, before
+	// any lock is taken or released on the operator's behalf.
+	if ctx.Err() != nil {
+		return stoppedBeforeSubmit(ctx, "apply")
+	}
+
 	if !cmd.NoLock {
 		// If --force, break any existing lock first
 		if cmd.Force {
@@ -294,7 +333,7 @@ func (cmd *ApplyCmd) Run(g *Globals) error {
 	// what each runs. Members the server listed as refused were turned away
 	// before the prompt; a member whose own plan apply creation refuses
 	// without having listed it is refused by POST /api/apply instead.
-	applyID, err := applyAndWatch(ep, planResult, true, cfg.Database, cmd.Environment, owner, "apply", cmd.DeferCutover, cmd.DeferDeploy, cmd.SkipRevert, cmd.AllowUnsafe, cmd.Branch, cmd.Watch, cmd.Output, cmd.LogHeartbeat)
+	applyID, err := applyAndWatch(ctx, ep, planResult, true, cfg.Database, cmd.Environment, owner, "apply", cmd.DeferCutover, cmd.DeferDeploy, cmd.SkipRevert, cmd.AllowUnsafe, cmd.Branch, cmd.Watch, cmd.Output, cmd.LogHeartbeat)
 	if err != nil {
 		if cmd.Yield && !cmd.NoLock && applyID != "" {
 			return errors.Join(err, yieldLock(ep, cfg.Database, cfg.Type, owner, cmd.Environment, applyID))
@@ -429,16 +468,16 @@ const (
 // WatchApplyProgressWithFormat polls the progress API by apply ID with the
 // specified output format. logHeartbeat controls the interval between progress
 // heartbeats in log mode (0 = default 10s).
-func WatchApplyProgressWithFormat(endpoint, applyID, environment string, allowControlActions bool, format OutputFormat, logHeartbeat time.Duration) error {
+func WatchApplyProgressWithFormat(ctx context.Context, endpoint, applyID, environment string, allowControlActions bool, format OutputFormat, logHeartbeat time.Duration) error {
 	// Use log format for CI/server environments
 	if format == OutputFormatLog {
 		if logHeartbeat <= 0 {
 			logHeartbeat = logHeartbeatDefault
 		}
-		return watchApplyProgressLog(newProgressPoller(endpoint, applyID), logHeartbeat)
+		return watchApplyProgressLog(newProgressPoller(ctx, endpoint, applyID), logHeartbeat)
 	}
 	if format == OutputFormatJSON {
-		return watchApplyProgressJSON(newProgressPoller(endpoint, applyID))
+		return watchApplyProgressJSON(newProgressPoller(ctx, endpoint, applyID))
 	}
 
 	// Interactive format: use Bubbletea TUI
@@ -447,8 +486,8 @@ func WatchApplyProgressWithFormat(endpoint, applyID, environment string, allowCo
 
 // WatchApplyProgressAfterCutover polls the progress API after cutover has been triggered.
 // It waits for completion without showing the "waiting for cutover" instructions.
-func WatchApplyProgressAfterCutover(endpoint, applyID string) error {
-	return watchAfterCutover(newProgressPoller(endpoint, applyID))
+func WatchApplyProgressAfterCutover(ctx context.Context, endpoint, applyID string) error {
+	return watchAfterCutover(newProgressPoller(ctx, endpoint, applyID))
 }
 
 func watchAfterCutover(poller *progressPoller) error {
@@ -484,7 +523,9 @@ func watchAfterCutover(poller *progressPoller) error {
 		}
 
 		// Still processing - just wait (don't show waiting instructions since cutover was already triggered)
-		poller.sleep(pollInterval)
+		if err := poller.pause(pollInterval); err != nil {
+			return err
+		}
 	}
 }
 
@@ -591,6 +632,27 @@ func blockUnsafeApply(planResult *apitypes.PlanResponse, database, environment, 
 	return ErrSilent
 }
 
+// blockedPlanError returns the refusal for a plan carrying a blocked
+// execution verdict, or nil when it carries none. It names the plan, the
+// first blocked table, and the engine's reason, which says what has to change:
+// the statement, the target's provisioning, or the server's policy. A reason
+// with several independent causes lists each on its own line, so an operator
+// fixing the first is not surprised by the second on the next attempt.
+func blockedPlanError(command string, plan *apitypes.PlanResponse) error {
+	change := plan.FirstBlockedChange()
+	if change == nil {
+		return nil
+	}
+	reason := change.ModeReason
+	if strings.TrimSpace(reason) == "" {
+		reason = "the engine refuses this statement"
+	}
+	if causes := engine.BlockedCauses(reason); len(causes) > 1 {
+		return fmt.Errorf("%s blocked: plan %s contains a blocked change for table %q:\n- %s", command, plan.PlanID, change.TableName, strings.Join(causes, "\n- "))
+	}
+	return fmt.Errorf("%s blocked: plan %s contains a blocked change for table %q: %s", command, plan.PlanID, change.TableName, reason)
+}
+
 // rolloutAttentionSummary names each rollout member that needs attention with
 // the server's sanitized description of what it needs, on one line.
 func rolloutAttentionSummary(attention []*apitypes.PlanMemberAttentionResponse) string {
@@ -653,7 +715,7 @@ const (
 	logHeartbeatDefault = 10 * time.Second
 )
 
-// tableLogState tracks the last-emitted state for a single table to detect changes.
+// tableLogState tracks the last-emitted state for a single task to detect changes.
 type tableLogState struct {
 	status         string    // last emitted status (normalized)
 	lastEmit       time.Time // last time a line was emitted for this table
@@ -900,10 +962,11 @@ func watchApplyProgressLog(poller *progressPoller, heartbeatInterval time.Durati
 
 		// Emit per-table events
 		for _, tbl := range tables {
-			ts, ok := tableStates[tbl.TableName]
+			key := tableLogKey(tbl)
+			ts, ok := tableStates[key]
 			if !ok {
 				ts = &tableLogState{startedAt: time.Now()}
-				tableStates[tbl.TableName] = ts
+				tableStates[key] = ts
 			}
 
 			tblStatus := state.NormalizeState(tbl.Status)
@@ -1010,7 +1073,9 @@ func watchApplyProgressLog(poller *progressPoller, heartbeatInterval time.Durati
 			return terminalWatchExit(result)
 		}
 
-		poller.sleep(pollInterval)
+		if err := poller.pause(pollInterval); err != nil {
+			return err
+		}
 		// Ramp up to 5s over the first few polls to avoid hammering the API on long schema changes
 		if pollInterval < 5*time.Second {
 			pollInterval *= 2
@@ -1021,7 +1086,17 @@ func watchApplyProgressLog(poller *progressPoller, heartbeatInterval time.Durati
 	}
 }
 
-// tableKVs returns the common key-value pairs for a table log line (table name + task_id if known).
+// tableLogKey uses the durable task identity, which distinguishes repeated
+// statements on the same member and table. Legacy responses without task IDs
+// are scoped by namespace and rollout member; quoting keeps the tuple unambiguous.
+func tableLogKey(tbl *apitypes.TableProgressResponse) string {
+	if tbl.TaskID != "" {
+		return "task:" + tbl.TaskID
+	}
+	return fmt.Sprintf("legacy:%q/%q/%q/%q", tbl.Keyspace, tbl.Deployment, tbl.Target, tbl.TableName)
+}
+
+// tableKVs returns the common identity and provenance fields for a table log line.
 func tableKVs(msg string, tbl *apitypes.TableProgressResponse, ts *tableLogState) []string {
 	kvs := []string{"msg", msg, "table", tbl.TableName}
 	taskID := ts.taskID
@@ -1033,6 +1108,12 @@ func tableKVs(msg string, tbl *apitypes.TableProgressResponse, ts *tableLogState
 	}
 	if tbl.Keyspace != "" {
 		kvs = append(kvs, "keyspace", tbl.Keyspace)
+	}
+	if tbl.Deployment != "" {
+		kvs = append(kvs, "deployment", tbl.Deployment)
+	}
+	if tbl.Target != "" {
+		kvs = append(kvs, "target", tbl.Target)
 	}
 	return kvs
 }
@@ -1232,7 +1313,9 @@ func watchApplyProgressJSON(poller *progressPoller) error {
 			return noActiveChangeError(poller.applyID)
 		}
 
-		poller.sleep(pollInterval)
+		if err := poller.pause(pollInterval); err != nil {
+			return err
+		}
 	}
 }
 

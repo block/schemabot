@@ -619,8 +619,35 @@ operations with their deployment, target, state, and cutover policy. A rollout's
 table entries carry `deployment` and `target`, naming the member whose copy the
 row reports. Attribute a table by the pair, never by `deployment` alone: one
 deployment can address several targets, each running its own copy of the change,
-so several rows for the same table share a deployment and differ only in their
-target. Both fields are absent on an apply that runs against a single target.
+so several rows for the same table share a deployment and differ in their
+target. The pair is read from the stored task's operation row, so a
+single-target apply reports its one member the same way, and a row the server
+cannot match to a stored task carries neither field.
+A sharded apply lists one operation per shard and table it changes, plus each
+keyspace's finalizer, and the response sets `sharded: true`. Its `tables` are
+then rolled up across the shards: one entry per keyspace table, with `status`
+the shard state that needs attention first, `rows_copied` and `rows_total`
+summed over the shards that have reported a total, and `shards` listing each
+shard's own state and rows. `estimated_bytes` is the table's planned size
+across all its shards, and `planned_shards` the number of shards the plan
+recorded it spanning. A shard whose wave has not started reports its
+operation's state and no rows. A table on its keyspace's only shard keeps its
+task's entry, with its `task_id`, and lists no shards. Each finalizer that
+changes its keyspace's VSchema appears in `metadata.vschema_changes` with its
+status and the diff from the stored plan. A sharded apply's operations can
+attach one dispatch at a time, so it reads as every operation its generation
+manifest declares: one still to attach is listed in `operations` as `pending`
+and under its table's `shards` as `pending` with no rows, and a table none of
+whose shards has attached carries the `ddl` and `change_type` the stored plan
+reviewed for it. The CLI and the PR
+comments render the apply as one change, its tables under their keyspace.
+`operations` still lists every attached row.
+`task_id`, when present, identifies the individual task, including repeated
+statements against the same member and table. It names the control plane's
+task and stays the same on every poll, whether the server answers from its
+storage or relays the data plane's own progress. Log-mode watching tracks that
+identity; legacy rows without it are scoped by keyspace, deployment, target,
+and table name.
 The top-level `metadata` object carries engine-specific display fields when the
 engine reports them: PostgreSQL applies report their position through `phase`,
 `step`, `steps_total`, and `statement`; PlanetScale applies report deploy
@@ -631,8 +658,9 @@ where the response comes from. While the data plane reports the apply's
 progress, it is the engine's display name: `Spirit`, `PlanetScale`, `Strata`, or
 `PostgreSQL`. A response served from SchemaBot's storage carries the stored
 engine name instead: `spirit`, `planetscale`, `strata`, or `postgres`. Storage
-serves a settled, retryable-failed, resuming, or multi-deployment apply, and a
-remote apply the data plane has not yet been handed. `Unknown` means the data
+serves a settled, retryable-failed, resuming, or multi-deployment apply, an
+apply whose manifest declares more than one operation, and a remote apply the
+data plane has not yet been handed. `Unknown` means the data
 plane reported an engine this server does not recognize.
 
 <details>
@@ -687,8 +715,9 @@ Response excerpt (illustrative values):
   "engine": "spirit",
   "state": "running",
   "operations": [
-    {"deployment": "commerce-a", "target": "shop-001", "state": "completed", "cutover_policy": "rolling"},
-    {"deployment": "commerce-a", "target": "shop-002", "state": "running", "cutover_policy": "rolling"}
+    {"deployment": "commerce-a", "target": "shop-001", "state": "completed", "cutover_policy": "parallel"},
+    {"deployment": "commerce-a", "target": "shop-002", "state": "running", "cutover_policy": "parallel"},
+    {"deployment": "commerce-a", "target": "shop-003", "state": "completed", "cutover_policy": "parallel", "already_converged": true}
   ],
   "tables": [
     {
@@ -715,9 +744,151 @@ Response excerpt (illustrative values):
 }
 ```
 
-Both rows report the same table under the same deployment, and only `target`
-tells them apart. Each row's `estimated_bytes` is that target's own copy of the
-table.
+Both rows report the same table under the same deployment; `target` names
+which member owns each copy. Each row's `estimated_bytes` is that target's own
+copy of the table.
+
+`already_converged` marks an operation the apply recorded completed when it was
+created, because its target already had the change: nothing ran there, so it
+has no table rows and no `started_at`. A missing `started_at` alone does not
+mean that: an operation can also be settled to its apply's outcome without ever
+starting, and its target may not have the change.
+
+`rollout_step` is set when the rollout runs table by table: the apply then has
+one operation per target and table, and `rollout_step` is the table's place in
+the rollout, numbered from 1. Every target finishes one step before any target
+starts the next. Operations that each run their member's whole change omit it.
+Response excerpt for `orders` then `refunds` on two targets, with `orders` done
+on both:
+
+```json
+{
+  "operations": [
+    {"deployment": "commerce-a", "target": "shop-001", "state": "completed", "cutover_policy": "parallel", "rollout_step": 1},
+    {"deployment": "commerce-a", "target": "shop-002", "state": "completed", "cutover_policy": "parallel", "rollout_step": 1},
+    {"deployment": "commerce-a", "target": "shop-001", "state": "running", "cutover_policy": "parallel", "rollout_step": 2},
+    {"deployment": "commerce-a", "target": "shop-002", "state": "running", "cutover_policy": "parallel", "rollout_step": 2}
+  ]
+}
+```
+
+The CLI's deployment line and the PR comment's headline count such a rollout
+in tables, `1 of 2 tables done on 2 targets`, rather than in target states, and
+read `2 tables done on 2 targets` once every table is done on every target. A
+target that already had the change ran no table and is not counted. Targets in
+an outcome an operator acts on are counted beside it, failures first, so a
+failed `refunds` on `shop-002` reads `1 of 2 tables done on 2 targets · 1 target
+failed`. A table lists its targets while it is in flight on any of them or any of
+them stopped, even when another target's failure makes the table read as
+failed; any other table counts them on its own line.
+
+</details>
+
+For event-based output while applying a rollout, use log mode:
+
+```sh
+schemabot apply -s ./schema -e production -y -o log
+```
+
+Progress log excerpt for two completed `orders` tasks (illustrative timestamps
+and durations):
+
+```text
+03:02:00 Apply started apply_id=apply-example-75
+03:02:00 Table started table=orders deployment=commerce-a target=shop-001 ddl="ALTER TABLE `orders` ADD INDEX `idx_status` (`status`)"
+03:02:00 Table complete table=orders deployment=commerce-a target=shop-001 duration="< 1s"
+03:02:00 Table started table=orders deployment=commerce-a target=shop-002 ddl="ALTER TABLE `orders` ADD INDEX `idx_status` (`status`)"
+03:02:00 Table complete table=orders deployment=commerce-a target=shop-002 duration="< 1s"
+03:02:00 Apply completed duration=2m tables="2/2 succeeded"
+```
+
+Each task gets its own start and completion, even when the table names match.
+Table log lines include `deployment` and `target` when the response supplies
+them, which it does for every row the server can attribute to its stored task,
+on a single-target apply as well as a rollout. Task IDs are used for tracking
+but are not printed.
+
+<details>
+<summary>Sharded apply response example</summary>
+
+```http
+GET /api/progress/apply/apply-example-76
+```
+
+Response excerpt (illustrative values) for `orders` copying across a
+keyspace's four shards, of which only `-40` has started:
+
+```json
+{
+  "apply_id": "apply-example-76",
+  "database": "shop",
+  "database_type": "mysql",
+  "environment": "production",
+  "engine": "strata",
+  "state": "running",
+  "sharded": true,
+  "operations": [
+    {"deployment": "data-plane", "operation_key": "shop_001/-40/orders", "operation_kind": "work", "state": "running"},
+    {"deployment": "data-plane", "operation_key": "shop_001/40-80/orders", "operation_kind": "work", "state": "pending"},
+    {"deployment": "data-plane", "operation_key": "shop_001/80-c0/orders", "operation_kind": "work", "state": "pending"},
+    {"deployment": "data-plane", "operation_key": "shop_001/c0-/orders", "operation_kind": "work", "state": "pending"},
+    {"deployment": "data-plane", "operation_key": "shop_001/group_finalizer", "operation_kind": "group_finalizer", "state": "pending"}
+  ],
+  "tables": [
+    {
+      "table_name": "orders",
+      "keyspace": "shop_001",
+      "deployment": "data-plane",
+      "change_type": "alter",
+      "ddl": "ALTER TABLE `orders` ADD INDEX `idx_created_at`(`created_at`)",
+      "status": "running",
+      "rows_copied": 620,
+      "rows_total": 1000,
+      "percent_complete": 62,
+      "eta_seconds": 195,
+      "estimated_bytes": 23400000000,
+      "planned_shards": 4,
+      "shards": [
+        {"shard": "-40", "status": "running", "rows_copied": 620, "rows_total": 1000, "eta_seconds": 195, "percent_complete": 62},
+        {"shard": "40-80", "status": "pending", "rows_copied": 0, "rows_total": 0, "percent_complete": 0},
+        {"shard": "80-c0", "status": "pending", "rows_copied": 0, "rows_total": 0, "percent_complete": 0},
+        {"shard": "c0-", "status": "pending", "rows_copied": 0, "rows_total": 0, "percent_complete": 0}
+      ]
+    }
+  ],
+  "metadata": {
+    "vschema_changes": "[{\"namespace\":\"shop_001\",\"status\":\"\",\"diff\":\"+  \\\"orders\\\": {}\"}]"
+  }
+}
+```
+
+`schemabot progress apply-example-76` renders it as one change. The header
+counts the shards by status, the rows cover only the started shard, so the ETA
+is a floor, and the VSchema change shows its diff:
+
+```text
+┌─────────────────────────────────────────────────────────┐
+│  Apply ID:     apply-example-76                         │
+│  Database:     shop                                     │
+│  Environment:  production                               │
+│  State:        Running                                  │
+│  Shards:       1 running table copy, 3 waiting for -40  │
+└─────────────────────────────────────────────────────────┘
+
+
+  ── shop_001 ──
+
+     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜ 62.00% (1 of 4 shards)
+       ALTER TABLE `orders` ADD INDEX `idx_created_at`(`created_at`);
+       • Rows: 620 / 1,000 across 1 of 4 shards · ~23.4 GB across all 4 shards · ETA: ≥ 3m 15s
+       • Shards: 4 (1 copying, 3 queued)
+           ◉ -40: 62.00% · 620 / 1,000 rows · ETA: 3m 15s
+           ○ 40-80: queued
+           ○ 80-c0: queued
+           ○ c0-: queued
+    ~ VSchema (shop_001): Pending
+       +  "orders": {}
+```
 
 </details>
 
@@ -1022,6 +1193,41 @@ schemabot list-plans -e production plan-example-42
 Error: plan plan-example-42 was made for environment "staging", not "production"; rerun with -e staging
 ```
 
+A blocked execution verdict is a refusal, not a request for unsafe consent.
+For example, when the fresh plan contains a blocked key alteration on `users`,
+`apply` shows the plan and stops before prompting or locking, even with
+`--allow-unsafe --yield`. The refusal names the plan, the table, and the
+engine's reason, which says what has to change; here it is a grant on the
+target, not the schema files:
+
+```sh
+schemabot apply -s ./schema -e staging --allow-unsafe --yield
+```
+
+```text
+╭─────────────────────────────────────────────╮
+│  MySQL Schema Change Apply                  │
+│                                             │
+│  Database: testdb                           │
+│  Schema name: schema                        │
+╰─────────────────────────────────────────────╯
+
+Staging
+     ~ users
+       ALTER TABLE `users` DROP PRIMARY KEY;
+
+📋 Plan: 1 table to alter
+
+Error: apply blocked: plan plan-example-43 contains a blocked change for table "users": dropping primary key is not supported; direct execution is enabled but SchemaBot lacks a grant it needs to end sessions blocking the statement: grant its database user SELECT on performance_schema, PROCESS, and CONNECTION_ADMIN (or SUPER), then plan again
+```
+
+A reason with several independent causes lists each on its own line. With
+`-o json` the plan is not rendered and the error alone carries the refusal.
+This also applies to a whole rollout, where it is reported before any member
+the rollout refuses, to an apply narrowed with `--target`, and to `rollback`,
+whose refusal starts `rollback blocked:`. No apply is submitted and no lock is
+acquired or released.
+
 History records executions. Plans describe what was proposed.
 `GET /api/plans` lists stored plans, filterable by `database`, `environment`,
 `repository`, and `pull_request` (with `repository`), plus a `last` window.
@@ -1118,7 +1324,10 @@ finalizer to run once its DDL lands (for Strata, registering tables and
 seeding sequences), independently of any VSchema change. The finalizer runs
 as its own `group_finalizer` operation of the apply, so a namespace can carry
 the marker with no table changes at all, and such a plan still has work to
-apply. `vschema_generated_only: "true"`, beside `vschema_changed`, means the
+apply. `vschema`, beside `vschema_changed`, is the VSchema diff the plan was
+reviewed with, so a stored plan shows the same VSchema change the plan did; a
+plan recorded without a diff carries `vschema_changed` alone.
+`vschema_generated_only: "true"`, beside `vschema_changed`, means the
 engine generates the namespace's whole VSchema change from the plan's DDL, so
 there is no VSchema diff to review; plans show such a namespace by its DDL
 alone.
@@ -1265,11 +1474,12 @@ exempted omits the field.
 
 Two things populate it. Tables withheld by the repository's `ignore_tables`
 config (see [Ignoring Tables](namespaces.md#ignoring-tables)) are reported by
-every engine, with `reason` naming the config key; the table names are also
-persisted with the plan so a rollback or resume re-plan withholds the same
-tables the reviewed plan did. Archive-named tables are reported by PostgreSQL
-targets only — the MySQL-family engines exempt them from their live-schema view
-without reporting which ones.
+every engine, with `reason` naming the config key. The configured entries,
+patterns included, are persisted with the plan as written, so a rollback or
+resume re-plan withholds by the same rules the reviewed plan did.
+Archive-named tables are reported by PostgreSQL targets only — the
+MySQL-family engines exempt them from their live-schema view without reporting
+which ones.
 
 Response excerpt from the plan request (illustrative values):
 

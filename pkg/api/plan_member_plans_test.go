@@ -292,19 +292,38 @@ func TestRollupReviewTimeDrift_MemberPlanRecordsTheDirectExecutionPolicy(t *test
 	}, plans.created[0].DirectExecution)
 }
 
-// A member planned on a server holding no grant records the opt-out, so its
-// row says what it was judged under rather than leaving the apply to resolve
-// one from a configuration that may have changed since.
-func TestRollupReviewTimeDrift_MemberPlanRecordsAnOptOutWhenNoGrantIsInForce(t *testing.T) {
-	reviewed := reviewedUsersPlan("ALTER TABLE `users` ADD COLUMN `email` varchar(255)")
-	plans := &recordingPlanStore{}
-	svc := multiTargetService(t, &mockTernClient{
-		planDiffResp: alterUsersDiff("ALTER TABLE `users` ADD COLUMN `phone` varchar(32)"),
-	}, plans)
+// A member plan records the policy it was judged under, whether the server
+// opts out or falls back to the default, so the apply never resolves one from
+// a configuration that may have changed since.
+func TestRollupReviewTimeDrift_MemberPlanRecordsThePolicyInForce(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		policy *DirectExecutionConfig
+		want   *storage.DirectExecutionPolicy
+	}{
+		{
+			name:   "server opts out",
+			policy: &DirectExecutionConfig{Enabled: false},
+			want:   &storage.DirectExecutionPolicy{Enabled: false},
+		},
+		{
+			name: "server states no policy",
+			want: &storage.DirectExecutionPolicy{Enabled: true, MaxTableBytes: 100 << 20},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			reviewed := reviewedUsersPlan("ALTER TABLE `users` ADD COLUMN `email` varchar(255)")
+			plans := &recordingPlanStore{}
+			svc := multiTargetService(t, &mockTernClient{
+				planDiffResp: alterUsersDiff("ALTER TABLE `users` ADD COLUMN `phone` varchar(32)"),
+			}, plans)
+			svc.config.DirectExecution = tc.policy
 
-	_, err := svc.RollupReviewTimeDrift(t.Context(), planDiffReq(t), reviewed, multiTargetMember("testapp-001"))
-	require.NoError(t, err)
+			_, err := svc.RollupReviewTimeDrift(t.Context(), planDiffReq(t), reviewed, multiTargetMember("testapp-001"))
+			require.NoError(t, err)
 
-	require.Len(t, plans.created, 1)
-	assert.Equal(t, &storage.DirectExecutionPolicy{Enabled: false}, plans.created[0].DirectExecution)
+			require.Len(t, plans.created, 1)
+			assert.Equal(t, tc.want, plans.created[0].DirectExecution)
+		})
+	}
 }

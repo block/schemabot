@@ -55,7 +55,9 @@ func (s *lockStore) Acquire(ctx context.Context, lock *storage.Lock) error {
 // empty, or held by the same owner with observedPendingPlanID as its pending
 // plan. Any other same-owner state is a newer intent that a concurrent command
 // pinned since the caller looked, so the acquire returns ErrLockIntentChanged
-// and leaves that pin alone rather than overwriting it.
+// and leaves that pin alone rather than overwriting it. A lock released since
+// a non-empty pin was observed is an intent change too: the pin the caller
+// planned against is gone, and the acquire re-creates nothing.
 func (s *lockStore) AcquireIfPendingPlanID(ctx context.Context, lock *storage.Lock, observedPendingPlanID string) error {
 	return s.acquire(ctx, lock, &observedPendingPlanID)
 }
@@ -89,7 +91,14 @@ func (s *lockStore) acquireOnce(ctx context.Context, lock *storage.Lock, acquire
 		if existing.Owner != lock.Owner {
 			return storage.ErrLockHeld
 		}
-		return s.refreshPendingConfirmation(ctx, lock, existing, observedPendingPlanID)
+		err := s.refreshPendingConfirmation(ctx, lock, existing, observedPendingPlanID)
+		if !errors.Is(err, storage.ErrLockNotFound) {
+			return err
+		}
+		// The owner's lock was released between the read and the refresh. The
+		// caller observed no pin, so a free key is the state it asked for:
+		// claim it below. (A caller that observed a pin learns of the release
+		// as an intent change from the refresh and never reaches here.)
 	}
 
 	// The caller observed a pin it still expects to hold; the lock is gone
@@ -222,6 +231,14 @@ func (s *lockStore) refreshPendingConfirmation(ctx context.Context, lock, existi
 			lock.DatabaseName, lock.DatabaseType, lock.Owner, getErr)
 	}
 	if current == nil {
+		if observedPendingPlanID != nil && *observedPendingPlanID != "" {
+			// The caller observed a pin it still expected to hold, and the lock
+			// was released since: the same intent change acquireOnce reports
+			// when it finds the lock already gone.
+			return storage.ErrLockIntentChanged
+		}
+		// The lock was released since the read and the caller observed no pin;
+		// acquireOnce reads this as a free key to claim.
 		return storage.ErrLockNotFound
 	}
 	if current.Owner != lock.Owner {
@@ -330,6 +347,33 @@ func (s *lockStore) ReleaseIfPendingPlanID(ctx context.Context, database, dbType
 	rowsAffected, err := result.RowsAffected()
 	if err != nil {
 		return false, err
+	}
+	return rowsAffected > 0, nil
+}
+
+// ClearPendingPlanID withdraws the pending plan the caller observed while
+// keeping the owner's hold. Like ReleaseIfPendingPlanID it is conditional on
+// both owner and pending plan in one statement, so a same-owner command that
+// pinned a newer intent in between is left alone. The WHERE clause requires a
+// non-empty pending plan that differs from the cleared value, so a matched row
+// always changes and RowsAffected is unambiguous.
+func (s *lockStore) ClearPendingPlanID(ctx context.Context, database, dbType, owner, pendingPlanID string) (bool, error) {
+	if pendingPlanID == "" {
+		return false, nil
+	}
+	database = storage.CanonicalKey(database)
+	dbType = storage.CanonicalKey(dbType)
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE locks
+		SET pending_plan_id = '', disclosed_copy_discard = ?, updated_at = NOW()
+		WHERE database_name = ? AND database_type = ? AND `+s.dialect.BinaryEquals("owner")+` AND pending_plan_id = ?
+	`, false, database, dbType, owner, pendingPlanID)
+	if err != nil {
+		return false, fmt.Errorf("clear pending plan %s on lock %s/%s owner=%s: %w", pendingPlanID, database, dbType, owner, err)
+	}
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("read rows affected clearing pending plan %s on lock %s/%s owner=%s: %w", pendingPlanID, database, dbType, owner, err)
 	}
 	return rowsAffected > 0, nil
 }

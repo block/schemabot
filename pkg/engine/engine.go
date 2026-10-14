@@ -73,17 +73,19 @@ type Engine interface {
 // schema change's goroutine has fully exited (releasing DB connections) before
 // checking whether the next table still needs changes.
 type Drainer interface {
-	// Drain waits for any in-flight background work to complete and clears it.
-	Drain()
+	// DrainContext waits for any in-flight background work to complete and
+	// clears it. When ctx ends first it returns an error and leaves the work
+	// tracked.
+	DrainContext(ctx context.Context) error
 }
 
 // ShutdownHalter is an optional capability for engines whose schema change work
 // runs inside this process. Such an engine holds resources on the target — for
 // Spirit, an advisory lock on the table it is copying — for exactly as long as
 // its in-process work lives, and that work outlives the drive that started it.
-// Without a way to bring it down, a shutting-down process stops renewing the
-// apply's lease while still holding the target, and peer drivers reclaim work
-// they cannot execute.
+// Without a way to bring it down, a process that stops renewing the apply's
+// lease, because it is shutting down or because its drive was displaced, keeps
+// holding the target, and peer drivers reclaim work they cannot execute.
 //
 // An engine whose work runs elsewhere (a remote online-DDL service) must not
 // implement this: its schema change is unaffected by this process going away,
@@ -94,8 +96,25 @@ type ShutdownHalter interface {
 	// no longer holds the target's resources. It is not an operator stop: it
 	// records no operator intent and leaves the apply active for reclaim.
 	// It returns an error if the work has not come down by the time ctx expires,
-	// so a caller can report that the target may still be held.
+	// so a caller can report that the target may still be held. Work that has
+	// already ended leaves nothing to halt.
 	HaltForShutdown(ctx context.Context) error
+}
+
+// OwnedWorkHalter is an optional capability, alongside ShutdownHalter, for an
+// engine that can halt one drive's in-process work without touching another's.
+// A drive that hands its apply back halts through it, so its run does not keep
+// holding the target under nobody's claim.
+//
+// It is separate from ShutdownHalter so an engine that only halts for shutdown
+// keeps that halt. Such an engine's drives hand the apply back without halting
+// anything, as they did before this capability existed.
+type OwnedWorkHalter interface {
+	// HaltWorkOwnedBy halts like HaltForShutdown, but only the work started
+	// under owner (see WithWorkOwner). One engine serves every drive of a
+	// target in this process, so the drive that hands an apply back must not
+	// bring down the run a later drive has already started in its place.
+	HaltWorkOwnedBy(ctx context.Context, owner string) error
 }
 
 // HaltEngineForShutdown brings eng's in-process schema change work down when it
@@ -108,6 +127,33 @@ func HaltEngineForShutdown(ctx context.Context, eng Engine) (supported bool, err
 		return false, nil
 	}
 	return true, halter.HaltForShutdown(ctx)
+}
+
+// HaltEngineWorkOwnedBy halts the work eng started under owner when eng
+// implements OwnedWorkHalter, and reports whether it does.
+func HaltEngineWorkOwnedBy(ctx context.Context, eng Engine, owner string) (supported bool, err error) {
+	halter, ok := eng.(OwnedWorkHalter)
+	if !ok {
+		return false, nil
+	}
+	return true, halter.HaltWorkOwnedBy(ctx, owner)
+}
+
+type workOwnerContextKey struct{}
+
+// WithWorkOwner names the owner of the engine work started under ctx. An
+// engine that runs its work in this process records the owner on the work
+// when it accepts an Apply or a Start, and HaltWorkOwnedBy halts by it. Work
+// started with no owner belongs to the empty owner.
+func WithWorkOwner(ctx context.Context, owner string) context.Context {
+	return context.WithValue(ctx, workOwnerContextKey{}, owner)
+}
+
+// WorkOwnerFromContext returns the owner WithWorkOwner attached to ctx, or
+// the empty owner.
+func WorkOwnerFromContext(ctx context.Context) string {
+	owner, _ := ctx.Value(workOwnerContextKey{}).(string)
+	return owner
 }
 
 // DeferredCutoverSignalChecker is an optional capability for engines that can
@@ -186,6 +232,38 @@ type SynchronousWorkRegistration interface {
 func RegistersWorkSynchronously(eng Engine) bool {
 	reg, ok := eng.(SynchronousWorkRegistration)
 	return ok && reg.RegistersWorkSynchronously()
+}
+
+// ShardKeyedPlanning is an optional interface for engines whose Plan describes
+// each shard of a sharded namespace on its own, and lists every shard that
+// still needs a change.
+//
+// This decides how a driver reads a re-plan that does not mention a task that
+// ran on one shard. An engine that fans a change out to its shards behind one
+// endpoint reports a namespace as a unit, so a shard missing from its plan says
+// nothing about that shard. An engine that plans each shard itself leaves a
+// shard out exactly when that shard already has the reviewed schema. That
+// includes the namespace whose every shard has it, which such a plan does not
+// mention at all, so the driver cannot tell the two kinds of plan apart from
+// the plan alone. Only the engine knows which kind it produces.
+//
+// Engines that do not implement this interface are treated as reporting
+// namespaces as a unit. A shard-tagged task the plan does not mention is then
+// never settled as completed on that evidence; the driver runs its reviewed
+// statement again instead.
+type ShardKeyedPlanning interface {
+	// PlansEachShard reports whether Plan lists every shard that still needs a
+	// change, so a shard it leaves out already has the reviewed schema.
+	PlansEachShard() bool
+}
+
+// PlansEachShard reports whether eng declares that its Plan lists every shard
+// that still needs a change. Engines that do not implement ShardKeyedPlanning
+// are treated as reporting namespaces as a unit, so their silence about a
+// shard is never read as the shard having the reviewed schema.
+func PlansEachShard(eng Engine) bool {
+	planner, ok := eng.(ShardKeyedPlanning)
+	return ok && planner.PlansEachShard()
 }
 
 // DeferredCutoverSignalRequest identifies the target database whose deferred
@@ -301,6 +379,89 @@ func ReleaseCancelledArtifacts(ctx context.Context, eng Engine, req *ReleaseArti
 	return true, result, err
 }
 
+// CancelledResumeStateReclaimer is an optional capability for engines whose
+// drive sets up work in the service it drives before anything in that service
+// owns the work's teardown, and records the work in the apply's stored resume
+// state so a later drive can continue from it. A PlanetScale branch before its
+// deploy request is one: the deploy request tears the branch down once it
+// exists, and until then the branch is kept only so a resume can finish
+// preparing it.
+//
+// A driver consumes a cancel at its checkpoints, which run between engine
+// calls, so the drive that consumes it stands down without any engine call
+// holding the work: the drive that recorded the work has exited, or the drive
+// consuming the cancel has not yet resumed from it. The stored state is then
+// the only record of the work, and this capability is how the cancel reclaims
+// it. An engine also reclaims such work itself when a drive's context ends
+// with ErrCancelledByOperator while the engine holds it; the two finding each
+// other's reclaim already landed is harmless.
+//
+// The reclaim is stateless by design, like ReleaseCancelledArtifacts: it may
+// run on an instance that never drove the apply, so it takes the stored state
+// and the apply's options from the caller rather than from memory. Work the
+// service already owns the teardown of (a branch with a deploy request) is
+// left to the service; work SchemaBot did not create (an operator-supplied
+// branch) is left to its owner. Both are logged, not reclaimed.
+type CancelledResumeStateReclaimer interface {
+	// ReclaimCancelledResumeState removes the work the stored resume state
+	// names when nothing else owns its teardown and SchemaBot created it, and
+	// reports what it removed and what it left in place. Callers must hold
+	// the claim on the cancelled apply, so no drive is resuming from the same
+	// state while the reclaim runs. Work already gone from the service is not
+	// an error, whatever removed it.
+	//
+	// A reclaim that fails returns the work it had to leave behind in the
+	// result alongside the error, so the caller can tell an operator what to
+	// remove by hand without reading the error text.
+	ReclaimCancelledResumeState(ctx context.Context, req *ReclaimResumeStateRequest) (*ReclaimResumeStateResult, error)
+}
+
+// ReclaimResumeStateResult reports what a reclaim removed and what it left in
+// place, in words an operator recognises from the service the engine drives.
+// Both are empty when the stored state named nothing that needed reclaiming,
+// which is the ordinary outcome for a cancel of an apply whose work the
+// service already owns.
+type ReclaimResumeStateResult struct {
+	// Reclaimed names each piece of work the reclaim removed.
+	Reclaimed []string
+	// Kept names each piece of work the reclaim left in place, and KeptReason
+	// says why in terms an operator can act on. Empty when Kept is empty.
+	Kept       []string
+	KeptReason string
+}
+
+// ReclaimResumeStateRequest carries what a reclaim needs to find the work and
+// decide whether it is SchemaBot's to remove.
+type ReclaimResumeStateRequest struct {
+	Database    string
+	Credentials *Credentials
+	// Options are the apply's stored options as a whole, as the drive received
+	// them; an engine reads them to tell work it created from work the operator
+	// supplied. A subset built for another purpose can hand an operator's work
+	// to the reclaim.
+	Options map[string]string
+	// ResumeState is the apply's stored engine state. Nil means nothing was
+	// ever persisted, so there is nothing to reclaim.
+	ResumeState *ResumeState
+	// Logger is an optional logger scoped to the schema change, as on
+	// ApplyRequest. Nil falls back to the engine's configured logger.
+	Logger *slog.Logger
+}
+
+// ReclaimCancelledResumeState reclaims the work eng's stored resume state
+// names when eng owns such work at all, and reports whether the engine
+// implements the capability. An engine that does not keeps no work between
+// drives that a cancel must reclaim, so there is nothing to do and nothing to
+// report.
+func ReclaimCancelledResumeState(ctx context.Context, eng Engine, req *ReclaimResumeStateRequest) (supported bool, result *ReclaimResumeStateResult, err error) {
+	reclaimer, ok := eng.(CancelledResumeStateReclaimer)
+	if !ok {
+		return false, nil, nil
+	}
+	result, err = reclaimer.ReclaimCancelledResumeState(ctx, req)
+	return true, result, err
+}
+
 // Credentials contains the resolved credentials for accessing a database.
 // These are populated by the service layer from discovery before calling the engine.
 type Credentials struct {
@@ -341,8 +502,10 @@ type PlanRequest struct {
 
 	// IgnoreTables lists the live tables the repository's ignore_tables config
 	// withholds from the planner, so a table no schema file declares is not
-	// proposed for DROP TABLE. Entries are matched exactly and case-sensitively
-	// against the target's own catalog, in every namespace the plan covers.
+	// proposed for DROP TABLE. Entries are matched against the target's own
+	// catalog, in every namespace the plan covers: a plain entry exactly and
+	// case-sensitively, an entry wrapped in slashes as a regular expression over
+	// the whole name. An entry that does not compile fails the plan.
 	// Every engine honors the list, discloses what it actually withheld through
 	// ExemptTables, and refuses a table the config withholds that a schema file
 	// also declares (see IgnoredTables).
@@ -874,6 +1037,12 @@ type ApplyRequest struct {
 	ResumeState  *ResumeState       // Fresh context or full resume state after restart
 	Credentials  *Credentials       // Resolved credentials (from discovery)
 
+	// IgnoreTables lists the live tables the plan was reviewed under the
+	// ignore_tables config withholding (see PlanRequest.IgnoreTables). An engine
+	// that compares a target's live schema against SchemaFiles during apply
+	// leaves these tables out of the comparison, as the plan did.
+	IgnoreTables []string
+
 	// Logger is an optional logger scoped to this schema change, already bound with
 	// the caller's triage identity (apply id, repo, PR, environment). Engines
 	// use it for every log line about this schema change so engine lines stay
@@ -886,7 +1055,9 @@ type ApplyRequest struct {
 	// This enables crash recovery: if the driver dies mid-Apply, the tern layer can
 	// resume from the last persisted state instead of starting over.
 	// Nil means no persistence (state is only returned at the end of Apply).
-	OnStateChange func(state *ResumeState)
+	// The returned error reports whether the state was durably saved, so an
+	// engine never relies on a record that did not land.
+	OnStateChange func(state *ResumeState) error
 
 	// OnEvent is called by the engine to emit structured lifecycle events during Apply.
 	// These events are recorded in apply_logs so operators can see intermediate progress
@@ -955,6 +1126,12 @@ type ProgressResult struct {
 	// scratch, so preserved progress can be told apart from a fresh restart.
 	// False for engines without checkpoint resume.
 	ResumedFromCheckpoint bool
+
+	// TargetHeld reports that a failed result is the engine being refused the
+	// target because another run holds it (ErrTargetHeld), not the schema
+	// change failing. The drive waits for the holder instead of recording a
+	// failure.
+	TargetHeld bool
 
 	// Metadata carries engine-specific display fields for the progress response
 	// (e.g. PlanetScale branch_name, deploy_request_url, is_instant). It lets the

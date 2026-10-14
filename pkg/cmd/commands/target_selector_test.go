@@ -42,8 +42,8 @@ func TestPlanCmd_TargetRequiresEnvironment(t *testing.T) {
 }
 
 // narrowedPlanServer serves plan from /api/plan, the given active applies from
-// /api/status, and accepts every apply, and records the requests the CLI sent
-// and the paths it called. Its status answer follows the server's: an apply's
+// /api/status, grants locks and accepts every apply, and records the requests
+// the CLI sent and the paths it called. Its status answer follows the server's: an apply's
 // deployment is reported only when the request names one, and then only that
 // deployment's applies are listed.
 type narrowedPlanServer struct {
@@ -96,6 +96,8 @@ func newNarrowedPlanServer(t *testing.T, plan *apitypes.PlanResponse, active ...
 		case "/api/status":
 			recorded.statusDeployments = append(recorded.statusDeployments, r.URL.Query().Get("deployment"))
 			assert.NoError(t, json.NewEncoder(w).Encode(apitypes.StatusResponse{Applies: statusAppliesFor(r.URL.Query().Get("deployment"), active)}))
+		case "/api/locks/acquire":
+			writeTestJSON(t, w, []byte(`{"lock":{"database":"testdb","database_type":"mysql"}}`))
 		case "/api/apply":
 			assert.NoError(t, json.NewDecoder(r.Body).Decode(&recorded.applyReq))
 			_, writeErr := w.Write([]byte(`{"accepted":true,"apply_id":"apply-narrowed"}`))
@@ -139,7 +141,7 @@ func TestApplyCmd_TargetNarrowsPlanAndApply(t *testing.T) {
 
 	cmd := targetedApplyCmd(t)
 	out := stripAnsi(captureStdout(func() {
-		require.NoError(t, cmd.Run(&Globals{Endpoint: endpoint}))
+		require.NoError(t, cmd.Run(t.Context(), &Globals{Endpoint: endpoint}))
 	}))
 
 	recorded.mu.Lock()
@@ -162,7 +164,7 @@ func TestApplyCmd_TargetDisclosedWhenMemberIsUpToDate(t *testing.T) {
 
 	cmd := targetedApplyCmd(t)
 	out := stripAnsi(captureStdout(func() {
-		require.NoError(t, cmd.Run(&Globals{Endpoint: endpoint}))
+		require.NoError(t, cmd.Run(t.Context(), &Globals{Endpoint: endpoint}))
 	}))
 
 	assert.Contains(t, out, "No changes. Your schema is up-to-date.\nTarget: prod/payments-002 (this plan covers only this rollout member)")
@@ -183,7 +185,7 @@ func TestApplyCmd_UnsafeRetryKeepsTarget(t *testing.T) {
 	cmd.Output = OutputFormatInteractive
 	var runErr error
 	out := stripAnsi(captureStdout(func() {
-		runErr = cmd.Run(&Globals{Endpoint: endpoint})
+		runErr = cmd.Run(t.Context(), &Globals{Endpoint: endpoint})
 	}))
 
 	require.ErrorIs(t, runErr, ErrSilent)
@@ -219,7 +221,7 @@ func TestApplyCmd_TargetRefusedWhileItsDeploymentHasAnActiveSchemaChange(t *test
 			cmd.Output = OutputFormatInteractive
 			var runErr error
 			out := stripAnsi(captureStdout(func() {
-				runErr = cmd.Run(&Globals{Endpoint: endpoint})
+				runErr = cmd.Run(t.Context(), &Globals{Endpoint: endpoint})
 			}))
 
 			require.Error(t, runErr)
@@ -251,7 +253,7 @@ func TestApplyCmd_TargetRefusedWhileRolloutRunsElsewhereAfterFinishingHere(t *te
 	cmd.Output = OutputFormatInteractive
 	var runErr error
 	out := stripAnsi(captureStdout(func() {
-		runErr = cmd.Run(&Globals{Endpoint: endpoint})
+		runErr = cmd.Run(t.Context(), &Globals{Endpoint: endpoint})
 	}))
 
 	require.Error(t, runErr)

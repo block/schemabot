@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/apitypes"
@@ -51,6 +52,10 @@ type reviewDriftOutcome struct {
 	// apply it refuses names the right fix. Unset is review-time deployment
 	// drift, which is what the rollup reports.
 	block checkBlockReason
+	// preserve lists stored blocking reasons a blocked outcome must not
+	// replace: a row already carrying one keeps it, because it is the stronger
+	// block. Empty for outcomes the rollup reports, which rewrite any block.
+	preserve []string
 }
 
 // blockingReason is the stored reason for a blocked outcome.
@@ -69,10 +74,14 @@ type memberWork struct {
 	// names are the members with work, the way an operator addresses them, in
 	// rollout order.
 	names []string
+	// primary is the name of the target the apply's own plan was planned
+	// against, the first in rollout order, whether or not it has work. Empty
+	// when no rollup was run.
+	primary string
 	// copyAtStake names a member other than the primary whose apply would
 	// discard an unfinished copy, or could not say whether it would, and why.
-	// Empty when no member with work puts a copy at stake.
-	copyAtStake string
+	// Zero when no member with work puts a copy at stake.
+	copyAtStake memberRefusal
 	// others counts the members with work other than the primary target,
 	// whose work runs from plans of their own rather than the primary plan.
 	others int
@@ -92,6 +101,9 @@ func memberWorkOf(rollup *api.PlanRollup) memberWork {
 	// where the rest of the comment qualifies it.
 	names := rollupMemberNames(*rollup)
 	work := memberWork{members: len(rollup.Entries)}
+	if len(names) > 0 {
+		work.primary = names[0]
+	}
 	for i, entry := range rollup.Entries {
 		if withWork[routing.ExecutionTarget{Deployment: entry.Deployment, Target: entry.Target}.MemberID()] {
 			work.names = append(work.names, names[i])
@@ -102,15 +114,30 @@ func memberWorkOf(rollup *api.PlanRollup) memberWork {
 	}
 	work.pending = len(work.names)
 	if at, reason := rollup.MemberCopyAtStake(); at >= 0 {
-		work.copyAtStake = fmt.Sprintf("target %s: %s", names[at], reason)
+		work.copyAtStake = memberRefusal{target: names[at], reason: reason}
 	}
 	return work
 }
 
 // summary says how many targets still need the change, for a check whose
-// primary plan has nothing of its own to summarize.
+// primary plan has nothing of its own to summarize. Targets already at the
+// schema are left out of the count, as every PR surface leaves them out.
 func (w memberWork) summary() string {
-	return fmt.Sprintf("%d of %d targets need this change", w.pending, w.members)
+	if w.pending == 1 {
+		return "1 target needs this change"
+	}
+	return fmt.Sprintf("%d targets need this change", w.pending)
+}
+
+// pendingTargets names the targets that still need the change, for a refusal
+// that tells the operator which targets it held back. Targets already at the
+// schema are left out, as the plan comment leaves them out.
+func (w memberWork) pendingTargets() string {
+	names := "`" + strings.Join(w.names, "`, `") + "`"
+	if len(w.names) == 1 {
+		return "target " + names + " needs this change"
+	}
+	return "targets " + names + " need this change"
 }
 
 // unstoredSummary is the failing aggregate's summary when the check record for
@@ -368,7 +395,12 @@ func (h *Handler) upsertPlanCheckRecord(ctx context.Context, client *ghclient.In
 		BlockingReason: blockingReason,
 		ChangeSummary:  changeSummary,
 	}
-	stored, err := h.service.Storage().Checks().UpsertPlanResult(ctx, check, drift.planDriftState())
+	var stored bool
+	if driftBlocked && len(drift.preserve) > 0 {
+		stored, err = h.service.Storage().Checks().UpsertGuardBlock(ctx, check, drift.preserve)
+	} else {
+		stored, err = h.service.Storage().Checks().UpsertPlanResult(ctx, check, drift.planDriftState())
+	}
 	if errors.Is(err, storage.ErrCheckNotFound) {
 		// The PR closed and its check state was cleaned up while this plan ran.
 		// There is no gate left for the result to land on, so the plan itself is
@@ -649,6 +681,21 @@ func isCompletedRollback(a *storage.Apply) bool {
 	return a.IsRollback() && state.IsState(a.State, state.Apply.Completed)
 }
 
+// completedNarrowedApply reports whether a forward apply narrowed to one
+// rollout member completed. It changed one target, so its success cannot pass
+// the environment's check (MG-12). A check already blocked because the PR
+// removed the schema change keeps that reason, which names the reconciliation
+// the operator owes.
+func completedNarrowedApply(a *storage.Apply, check *storage.Check) bool {
+	if !state.IsState(a.State, state.Apply.Completed) || a.IsRollback() {
+		return false
+	}
+	if storage.ParseApplyOptions(a.Options).NarrowedTo == "" {
+		return false
+	}
+	return !checkBlockedByRemovedSchemaAfterApply(check)
+}
+
 // completedForwardTaskBeforeCancellation returns durable evidence that the
 // cancelled apply or an earlier forward apply changed the same target. Apply
 // rows cannot provide this proof because an apply may be cancelled or failed
@@ -805,6 +852,25 @@ func (h *Handler) updateCheckRecordForApplyResult(ctx context.Context, repo stri
 					append(apply.LogAttrs(), "check_status", check.Status, "check_conclusion", check.Conclusion)...)
 			}
 		}
+	case completedNarrowedApply(apply, check):
+		check.Status = checkStatusCompleted
+		check.Conclusion = checkConclusionActionRequired
+		check.HasChanges = true
+		// A block the narrowed apply kept when it started stays with its own
+		// reason and summary; only a rollup of the whole environment lifts it.
+		if !narrowedApplyKeepsBlock(check.BlockingReason) {
+			check.BlockingReason = narrowedApplyBlock.blockingReason
+			check.ErrorMessage = narrowedApplyBlock.message
+			check.ChangeSummary = narrowedApplyCheckSummary
+		}
+		// MarkActionRequiredForApply releases check ownership, so the plan of
+		// the whole environment that lifts this block can write its result.
+		updated, err = h.service.Storage().Checks().MarkActionRequiredForApply(ctx, check, apply)
+		if err != nil {
+			recordOutcome("error")
+			return false, fmt.Errorf("mark stored check state action_required after apply narrowed to one target repo %s pr %d environment %s database_type %s database %s: %w",
+				repo, pr, apply.Environment, apply.DatabaseType, apply.Database, err)
+		}
 	default:
 		var conclusion string
 		switch {
@@ -839,10 +905,13 @@ func (h *Handler) updateCheckRecordForApplyResult(ctx context.Context, repo stri
 		// The action-required writes yield only to a newer apply, while ordinary
 		// completion requires the row to still be owned by this apply.
 		msg := "skipping check state update because stored state no longer belongs to apply"
-		if isCompletedRollback(apply) {
+		switch {
+		case isCompletedRollback(apply):
 			msg = "skipping rollback action_required update because a newer apply supersedes the rollback"
-		} else if cancelledForwardApply {
+		case cancelledForwardApply:
 			msg = "skipping cancelled apply action_required update because a newer apply supersedes the cancellation"
+		case completedNarrowedApply(apply, check):
+			msg = "skipping narrowed apply action_required update because a newer apply supersedes it"
 		}
 		h.logger.Warn(msg,
 			"repo", repo, "pr", pr, "database", apply.Database,

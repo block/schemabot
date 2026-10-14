@@ -94,6 +94,12 @@ const driftRecoveryHint = "to recover, re-plan against the current live schema t
 // deployment whose schema has drifted; recomputing the local diff and requiring
 // an exact match keeps non-primary drift from being applied unreviewed.
 //
+// A mismatch is permanent. A redispatch carries the same reviewed DDL against
+// the same drifted schema, so no retry can clear it; only a re-plan that
+// refreshes the reviewed plan can, so the apply fails at once with that hint
+// instead of spending its retry budget. A failure to compute the re-plan
+// itself stays retryable, since it says nothing about the schema.
+//
 // On a match it returns this deployment's re-planned changes, keyed the same
 // way the comparison was: the statement this target's engine emitted for each
 // reviewed change and its execution-mode verdict. The dispatch is built from
@@ -155,7 +161,7 @@ func (c *LocalClient) verifyMaterializedPlanMatchesLiveSchema(ctx context.Contex
 		return replannedChanges{}, fmt.Errorf("dispatched plan: %w", err)
 	}
 	if err := compareDriftMultisets(recomputed, dispatched); err != nil {
-		return replannedChanges{}, fmt.Errorf("local schema has drifted from the reviewed plan (database %q, target %q): %w; %s", c.config.Database, req.Target, err, driftRecoveryHint)
+		return replannedChanges{}, engine.NewPermanentError("local schema has drifted from the reviewed plan (database %q, target %q): %w; %s", c.config.Database, req.Target, err, driftRecoveryHint)
 	}
 
 	// VSchema changes are namespace-level, not shard-scoped, and travel on the
@@ -174,10 +180,10 @@ func (c *LocalClient) verifyMaterializedPlanMatchesLiveSchema(ctx context.Contex
 	// fails closed instead of finalizing a keyspace nobody reviewed.
 	if !shardScoped {
 		if err := compareVSchemaParity(vschemaNamespacesFromPlanResult(c, result), vschemaNamespacesFromApplyRequest(c, req.DdlChanges)); err != nil {
-			return replannedChanges{}, fmt.Errorf("local vschema has drifted from the reviewed plan (database %q, target %q): %w; %s", c.config.Database, req.Target, err, driftRecoveryHint)
+			return replannedChanges{}, engine.NewPermanentError("local vschema has drifted from the reviewed plan (database %q, target %q): %w; %s", c.config.Database, req.Target, err, driftRecoveryHint)
 		}
 		if err := compareFinalizeParity(finalizeNamespacesFromPlanResult(c, result), finalizeNamespacesFromApplyRequest(c, req.DdlChanges)); err != nil {
-			return replannedChanges{}, fmt.Errorf("local keyspace finalization has drifted from the reviewed plan (database %q, target %q): %w; %s", c.config.Database, req.Target, err, driftRecoveryHint)
+			return replannedChanges{}, engine.NewPermanentError("local keyspace finalization has drifted from the reviewed plan (database %q, target %q): %w; %s", c.config.Database, req.Target, err, driftRecoveryHint)
 		}
 	}
 	return replanned, nil

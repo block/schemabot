@@ -15,18 +15,33 @@ const (
 	mysqlErrLockWaitTimeout = 1205
 	mysqlErrDuplicateKey    = 1062
 
+	// MySQL refuses a value its column cannot hold with one of these, the same
+	// way on every attempt.
+	mysqlErrWarnDataOutOfRange  = 1264
+	mysqlErrDataTooLong         = 1406
+	mysqlErrTruncatedWrongValue = 1292
+	mysqlErrIncorrectValue      = 1366
+
 	// PostgreSQL rolls back the failed transaction for deadlocks and
 	// serialization failures. Lock-not-available reports an unacquired lock.
 	postgresErrDeadlock             = "40P01"
 	postgresErrSerializationFailure = "40001"
 	postgresErrLockNotAvailable     = "55P03"
 	postgresErrUniqueViolation      = "23505"
+
+	// postgresDataExceptionClass is the SQLSTATE class for a value its column
+	// cannot hold, refused the same way on every attempt.
+	postgresDataExceptionClass = "22"
 )
 
 // ErrorClassifier identifies database errors that affect shared storage flow.
 type ErrorClassifier interface {
 	IsRetryableConflict(error) bool
 	IsDuplicateKey(error) bool
+	// IsValueRejected reports a write refused because a value does not fit
+	// its column. Unlike a transport or lock failure, retrying the same write
+	// is refused again.
+	IsValueRejected(error) bool
 }
 
 type mysqlErrorClassifier struct{}
@@ -55,6 +70,10 @@ func (mysqlErrorClassifier) IsDuplicateKey(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "Duplicate entry")
 }
 
+func (mysqlErrorClassifier) IsValueRejected(err error) bool {
+	return mysqlerr.Is(err, mysqlErrWarnDataOutOfRange, mysqlErrDataTooLong, mysqlErrTruncatedWrongValue, mysqlErrIncorrectValue)
+}
+
 type postgresErrorClassifier struct{}
 
 // NewPostgresErrorClassifier returns error classification for PostgreSQL storage.
@@ -79,4 +98,9 @@ func (postgresErrorClassifier) IsDuplicateKey(err error) bool {
 	}
 	// Defend against driver errors flattened to strings with %v in a call path.
 	return err != nil && strings.Contains(err.Error(), "duplicate key value violates unique constraint")
+}
+
+func (postgresErrorClassifier) IsValueRejected(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && strings.HasPrefix(pgErr.Code, postgresDataExceptionClass)
 }

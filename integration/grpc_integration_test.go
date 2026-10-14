@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/block/mysql"
+	"github.com/block/spirit/pkg/checksum"
 	"github.com/block/spirit/pkg/utils"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -505,6 +506,15 @@ func TestGRPC_FailedTableErrorSurfacesInTaskRecord(t *testing.T) {
 			t.Logf("cleanup: drop database %s: %v", appDBName, err)
 		}
 	})
+
+	// The unique index fails only once Spirit's lockless checksum has run its
+	// full pass budget (checksum.DefaultLocklessMaxPasses). At the production
+	// pacing that exceeds the 30-second wait below, so pace the passes 100ms
+	// apart. Tern runs in this process and this package runs no parallel
+	// tests, so overriding the global is safe.
+	prevRetryDelay := checksum.DefaultLocklessRetryDelay
+	checksum.DefaultLocklessRetryDelay = 100 * time.Millisecond
+	t.Cleanup(func() { checksum.DefaultLocklessRetryDelay = prevRetryDelay })
 
 	// Seed a table with duplicate values so adding a unique index must fail in
 	// the engine with this table's own error.

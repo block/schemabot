@@ -20,6 +20,9 @@ type planCommentSlot struct {
 	DatabaseType string
 	Environments []string
 	HeadSHA      string
+	// UpToDate records that the comment shows nothing to act on, so a later
+	// plan can tell whether the comment still matches its outcome.
+	UpToDate bool
 }
 
 // environmentScope canonicalizes the slot's environments (sorted,
@@ -86,6 +89,7 @@ func (h *Handler) postTrackedPlanComment(repo string, pr int, installationID int
 		HeadSHA:          slot.HeadSHA,
 		GitHubCommentID:  commentID,
 		GitHubNodeID:     nodeID,
+		UpToDate:         slot.UpToDate,
 	}
 	if err := h.service.Storage().PlanComments().Insert(ctx, posted); err != nil {
 		// The comment is live on GitHub either way, but without a row it can
@@ -114,33 +118,131 @@ func (h *Handler) retireSupersededPlanComments(ctx context.Context, client *ghcl
 		"database", posted.DatabaseName, "database_type", posted.DatabaseType) {
 		return
 	}
-	h.retirePlanCommentsForSlot(ctx, client,
-		posted.Repository, posted.PullRequest, posted.DatabaseName, posted.DatabaseType, posted.HeadSHA, posted)
+	priors, err := h.service.Storage().PlanComments().ListUnretiredForSlot(ctx,
+		posted.Repository, posted.PullRequest, posted.DatabaseName, posted.DatabaseType)
+	if err != nil {
+		h.logger.Error("failed to list prior plan comments; superseded plan comments stay visible until the next supersede sweep",
+			append(planCommentAttrs(posted), "error", err)...)
+		return
+	}
+	h.retireSupersededPlanCommentRows(ctx, client, priors, posted.HeadSHA, posted)
 }
 
-// retireStalePlanComments retires the slot's still-visible plan comments
-// rendered at a head other than the current one, for plan outcomes that
-// supersede prior comments without posting a new comment — an auto-plan
-// resolving to no changes still moves the head past every older comment,
-// whose pending DDL and apply prompt no longer match the branch. Same-head
-// comments stay expanded: one may be the only visible plan for its
-// environment scope.
-func (h *Handler) retireStalePlanComments(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, database, databaseType, headSHA string) {
-	if database == "" || headSHA == "" {
-		// Without a database and head there is no slot identity to sweep;
-		// treating the empty identity as a slot could retire untracked
-		// error-only comments across databases.
-		h.logger.Info("skipping stale plan comment retirement because no database or head resolved to key the slot",
-			"repo", repo, "pr", pr, "database", database, "database_type", databaseType, "head_sha", headSHA)
-		return
+// priorHeadPlanCommentNeedsReplacing reports whether this head's plan comment
+// must post to replace the plan answer the slot shows, for an auto-plan that
+// would otherwise post nothing.
+//
+// The answer for this plan is the newest visible comment covering the same
+// environments, the comment the auto-plan dispatch gate also reads. A
+// comment covering other environments says nothing about the ones this plan
+// covers, so it neither stands in for the answer nor hides an outdated one.
+// Every post supersedes the comments before it, so an older comment in the
+// scope that is still visible is history — a comment an apply owns stays
+// expanded under the minimize-based policy — and is never the answer to
+// replace. With no comment in the scope, the plan posts when another scope's
+// comment renders a prior head, so a reply to a narrower command is
+// superseded rather than left showing an outdated plan; the post then becomes
+// the scope's answer.
+//
+// When keepMatchingOutcome is set, the caller vouches that the answer still
+// fits this head: the push left the schema inputs unchanged, or the plan
+// re-runs after a terminal apply. The live target can still move without the
+// inputs — a change applied outside this PR turns a plan with DDL into no
+// changes — so the answer is kept only while its recorded outcome matches
+// slot.UpToDate. Otherwise an answer from a prior head is replaced, so an
+// auto-plan that resolves to no changes supersedes it rather than leaving it
+// in place. An answer already rendered at this head is kept while its outcome
+// matches, either way.
+//
+// A plan with no resolved head, or whose head the PR has moved past, posts
+// nothing: its comment would be stale on arrival, and the current head's own
+// plan answers instead. A failed head read posts nothing for the same reason;
+// since nothing is retired without a post, the visible answer stays. A failed
+// comment read counts as needing a replacement: an extra visible comment is
+// the safe failure, while a wrong false could leave a stale plan as the PR's
+// only answer.
+func (h *Handler) priorHeadPlanCommentNeedsReplacing(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, slot planCommentSlot, keepMatchingOutcome bool) bool {
+	slotAttrs := []any{
+		"repo", repo, "pr", pr,
+		"database", slot.Database, "database_type", slot.DatabaseType,
+		"head_sha", slot.HeadSHA, "up_to_date", slot.UpToDate,
+		"keep_matching_outcome", keepMatchingOutcome,
 	}
-
-	if !h.planSweepHeadIsCurrent(ctx, client, repo, pr, headSHA,
-		"database", database, "database_type", databaseType) {
-		return
+	if slot.HeadSHA == "" {
+		h.logger.Info("not posting a plan comment to replace the visible one because no head resolved to compare it against", slotAttrs...)
+		return false
 	}
+	if !h.planCommentAnswerNeedsReplacing(ctx, repo, pr, slot, keepMatchingOutcome, slotAttrs) {
+		return false
+	}
+	if !h.planSweepHeadIsCurrent(ctx, client, repo, pr, slot.HeadSHA,
+		"database", slot.Database, "database_type", slot.DatabaseType) {
+		h.logger.Info("not posting a plan comment to replace the visible one because this plan's head is not verified as the PR's current head", slotAttrs...)
+		return false
+	}
+	return true
+}
 
-	h.retirePlanCommentsForSlot(ctx, client, repo, pr, database, databaseType, headSHA, nil)
+// planCommentAnswerNeedsReplacing applies priorHeadPlanCommentNeedsReplacing's
+// outcome rules to the newest visible comment in the slot's environment scope.
+func (h *Handler) planCommentAnswerNeedsReplacing(ctx context.Context, repo string, pr int, slot planCommentSlot, keepMatchingOutcome bool, slotAttrs []any) bool {
+	comments, err := h.service.Storage().PlanComments().ListUnretiredForSlot(ctx, repo, pr, slot.Database, slot.DatabaseType)
+	if err != nil {
+		h.logger.Error("failed to list the slot's plan comments; posting the plan comment so the PR still shows a current answer",
+			append(slotAttrs, "error", err)...)
+		return true
+	}
+	scope := slot.environmentScope()
+	answer := newestPlanCommentInScope(comments, scope)
+	if answer == nil {
+		if other := planCommentFromAnotherHead(comments, slot.HeadSHA); other != nil {
+			h.logger.Info("no visible plan comment covers this plan's environments, and another scope's comment renders a prior head; this head's plan comment replaces it",
+				append(planCommentAttrs(other), "current_head_sha", slot.HeadSHA, "plan_environment_scope", scope)...)
+			return true
+		}
+		h.logger.Debug("no visible plan comment to replace", append(slotAttrs, "environment_scope", scope)...)
+		return false
+	}
+	answerAttrs := append(planCommentAttrs(answer), "current_head_sha", slot.HeadSHA,
+		"comment_up_to_date", answer.UpToDate, "plan_up_to_date", slot.UpToDate)
+	if answer.UpToDate != slot.UpToDate {
+		h.logger.Info("the visible plan comment shows a different outcome than this head's plan; this head's plan comment replaces it", answerAttrs...)
+		return true
+	}
+	if answer.HeadSHA != slot.HeadSHA && !keepMatchingOutcome {
+		h.logger.Info("the visible plan comment renders a prior head; this head's plan comment replaces it", answerAttrs...)
+		return true
+	}
+	h.logger.Debug("the visible plan comment still answers for this head's plan", answerAttrs...)
+	return false
+}
+
+// newestPlanCommentInScope returns the most recently recorded comment
+// covering exactly the given environment scope, or nil when there is none.
+// Rows are inserted right after their comment posts, so the highest ID is the
+// newest comment on the PR timeline.
+func newestPlanCommentInScope(comments []*storage.PlanComment, scope string) *storage.PlanComment {
+	var newest *storage.PlanComment
+	for _, c := range comments {
+		if c.EnvironmentScope != scope {
+			continue
+		}
+		if newest == nil || c.ID > newest.ID {
+			newest = c
+		}
+	}
+	return newest
+}
+
+// planCommentFromAnotherHead returns a comment rendering a head other than
+// headSHA, or nil when every comment renders headSHA.
+func planCommentFromAnotherHead(comments []*storage.PlanComment, headSHA string) *storage.PlanComment {
+	for _, c := range comments {
+		if c.HeadSHA != headSHA {
+			return c
+		}
+	}
+	return nil
 }
 
 // retireStalePlanCommentsForPR retires every plan comment still visible on
@@ -193,31 +295,6 @@ func (h *Handler) planSweepHeadIsCurrent(ctx context.Context, client *ghclient.I
 		return false
 	}
 	return true
-}
-
-// retirePlanCommentsForSlot sweeps the slot's still-visible plan comments and
-// retires the superseded ones. posted is the newly posted comment when the
-// sweep follows a post: its own row is skipped and supersession follows
-// planCommentSupersedes. When posted is nil the sweep follows an outcome with
-// no new comment, and only comments from heads other than headSHA are
-// superseded. Every failure keeps the comment on the PR and its row
-// unretired, so the next sweep retries it.
-func (h *Handler) retirePlanCommentsForSlot(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, database, databaseType, headSHA string, posted *storage.PlanComment) {
-	slotAttrs := []any{
-		"repo", repo, "pr", pr,
-		"database", database, "database_type", databaseType,
-		"head_sha", headSHA,
-	}
-
-	priors, err := h.service.Storage().PlanComments().ListUnretiredForSlot(ctx,
-		repo, pr, database, databaseType)
-	if err != nil {
-		h.logger.Error("failed to list prior plan comments; superseded plan comments stay visible until the next supersede sweep",
-			append(slotAttrs, "error", err)...)
-		return
-	}
-
-	h.retireSupersededPlanCommentRows(ctx, client, priors, headSHA, posted)
 }
 
 // retireSupersededPlanCommentRows retires the superseded comments among

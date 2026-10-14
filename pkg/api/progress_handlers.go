@@ -222,6 +222,8 @@ func progressOperationResponseFromStorage(op *storage.ApplyOperation) *apitypes.
 		OnFailure:           op.OnFailure,
 		ErrorCode:           deriveErrorCode(op.State, op.ErrorMessage),
 		ErrorMessage:        op.ErrorMessage,
+		AlreadyConverged:    op.AlreadyConverged,
+		RolloutStep:         op.RolloutStep,
 	}
 	if op.StartedAt != nil {
 		resp.StartedAt = op.StartedAt.Format(time.RFC3339)
@@ -276,25 +278,53 @@ func progressOperationsFromRows(ops []*storage.ApplyOperation) ([]*apitypes.Prog
 	return responses, memberByOperationID
 }
 
+// storedProgressOperations is every projection the storage-served progress
+// response needs from an apply's operation rows.
+type storedProgressOperations struct {
+	// responses are the API operation entries.
+	responses []*apitypes.ProgressOperationResponse
+	// memberByOperationID maps each operation row to the member it runs on.
+	memberByOperationID map[int64]routing.ExecutionTarget
+	// rows are the raw operation rows, for the stored engine metadata overlay.
+	rows []*storage.ApplyOperation
+	// released is the rollout's release latch.
+	released bool
+	// listed is false when the rows could not be read, so the fields above say
+	// nothing about which operations the apply has.
+	listed bool
+}
+
 // bestEffortProgressOperations loads the apply's operation rows once and
 // returns every projection the storage-served progress response needs from
-// them: the API operation entries, the operation-id→member map, the raw rows
-// (for the stored engine metadata overlay), and the release latch.
-func (s *Service) bestEffortProgressOperations(ctx context.Context, apply *storage.Apply) ([]*apitypes.ProgressOperationResponse, map[int64]routing.ExecutionTarget, []*storage.ApplyOperation, bool) {
+// them, or none, with listed false, when they cannot be read.
+func (s *Service) bestEffortProgressOperations(ctx context.Context, apply *storage.Apply) storedProgressOperations {
 	if apply == nil {
 		s.logger.Warn("progress response will omit per-deployment operations: apply is nil")
-		return nil, nil, nil, false
+		return storedProgressOperations{}
 	}
 	operations, memberByOperationID, ops, err := s.progressOperationsForApply(ctx, apply)
 	if err != nil {
 		// Operation rows are observability enrichment, not an apply safety gate.
 		// Serve progress without the enrichment and log the storage uncertainty.
-		s.logger.Warn("progress response will omit per-deployment operations",
+		s.logger.Warn("progress response will omit per-deployment operations and serve each task row as stored",
 			append(apply.LogAttrs(),
 				"error", err)...)
-		return nil, nil, nil, false
+		return storedProgressOperations{}
 	}
-	return operations, memberByOperationID, ops, s.resolveReleaseLatch(ctx, apply, ops)
+	return storedProgressOperations{
+		responses:           operations,
+		memberByOperationID: memberByOperationID,
+		rows:                ops,
+		released:            s.resolveReleaseLatch(ctx, apply, ops),
+		listed:              true,
+	}
+}
+
+// isMultiOperationApply reports whether an apply is made of more than one
+// operation: more than one is attached, or its generation manifest declares
+// more than one, of which some are still to attach one dispatch at a time.
+func isMultiOperationApply(apply *storage.Apply, ops []*storage.ApplyOperation) bool {
+	return len(ops) > 1 || len(apply.ExpectedOperationKeys) > 1
 }
 
 // handleProgressByApplyID handles GET /api/progress/apply/{apply_id} requests.
@@ -338,7 +368,11 @@ func (s *Service) handleProgressByApplyID(w http.ResponseWriter, r *http.Request
 	// path below, so a polled progress read hits apply_operations a single time.
 	ops, opsErr := s.storage.ApplyOperations().ListByApply(r.Context(), apply.ID)
 	if opsErr != nil {
-		s.logger.Warn("could not determine apply operation count; serving progress via the single-deployment path",
+		path := "the single-deployment path"
+		if isMultiOperationApply(apply, nil) {
+			path = "storage, as its generation manifest declares several operations"
+		}
+		s.logger.Warn("failed to list apply operations; serving progress from "+path,
 			append(apply.LogAttrs(),
 				"error", opsErr)...)
 	}
@@ -348,10 +382,11 @@ func (s *Service) handleProgressByApplyID(w http.ResponseWriter, r *http.Request
 	// operator from the operation rows. Serve it from storage so operators see
 	// the real aggregate state and the per-deployment breakdown, not a
 	// single-deployment remote view keyed on a parent id that does not exist
-	// (which would also rewrite a running aggregate to pending). On a storage
-	// error, fall back to the single-deployment path: every apply created today
-	// has one operation, so this only degrades the dormant multi-op case.
-	if opsErr == nil && len(ops) > 1 {
+	// (which would also rewrite a running aggregate to pending). When the
+	// operation rows cannot be listed, the generation manifest alone still says
+	// whether the apply declares several operations; only an apply without one
+	// falls back to the single-deployment path, which describes one operation.
+	if isMultiOperationApply(apply, ops) {
 		httpResp, err := s.progressFromLocalStorage(r.Context(), apply)
 		if err != nil {
 			s.logger.Warn("failed to read multi-operation apply progress from storage; falling back to the single-deployment path",
@@ -414,8 +449,9 @@ func (s *Service) handleProgressByApplyID(w http.ResponseWriter, r *http.Request
 	// Reuse the operation rows already listed above for multi-op detection.
 	// Operation rows are observability enrichment, not an apply safety gate, so
 	// a storage error (already logged) just omits the per-deployment breakdown.
+	var memberByOperationID map[int64]routing.ExecutionTarget
 	if opsErr == nil {
-		httpResp.Operations, _ = progressOperationsFromRows(ops)
+		httpResp.Operations, memberByOperationID = progressOperationsFromRows(ops)
 		httpResp.Released = s.resolveReleaseLatch(r.Context(), apply, ops)
 	}
 	httpResp.ApplyID = apply.ApplyIdentifier
@@ -450,7 +486,12 @@ func (s *Service) handleProgressByApplyID(w http.ResponseWriter, r *http.Request
 
 	setRevertSkippedMetadata(httpResp, apply)
 
-	// Overlay per-table timestamps from task records. The proto response
+	// Overlay each table row with its stored task. The data plane mints its
+	// own task identifiers and knows nothing of the control plane's operation
+	// rows, so a proxied row carries the control-plane task identity and
+	// rollout member only once its stored task is matched; polls answered from
+	// storage already carry both, and a watcher keying on task_id must see the
+	// same identity whichever source answered. The proto response also
 	// doesn't carry task timestamps, but storage has them from engine
 	// progress polling (e.g., SHOW VITESS_MIGRATIONS started_timestamp).
 	if tasks, err := s.storage.Tasks().GetByApplyID(r.Context(), apply.ID); err == nil {
@@ -468,13 +509,20 @@ func (s *Service) handleProgressByApplyID(w http.ResponseWriter, r *http.Request
 		}
 		for _, tpr := range httpResp.Tables {
 			task, ok := taskIndex.Lookup(tpr.Keyspace, tpr.TableName, tpr.DDL)
-			if ok {
-				if task.StartedAt != nil && tpr.StartedAt == "" {
-					tpr.StartedAt = task.StartedAt.Format(time.RFC3339)
-				}
-				if task.CompletedAt != nil && tpr.CompletedAt == "" {
-					tpr.CompletedAt = task.CompletedAt.Format(time.RFC3339)
-				}
+			if !ok {
+				s.logger.Debug("progress row keeps the data plane's task identifier: no stored task matches its statement",
+					append(apply.LogAttrs(),
+						"namespace", tpr.Keyspace,
+						"table", tpr.TableName,
+						"ddl", tpr.DDL)...)
+				continue
+			}
+			attributeStoredTask(tpr, task, memberByOperationID)
+			if task.StartedAt != nil && tpr.StartedAt == "" {
+				tpr.StartedAt = task.StartedAt.Format(time.RFC3339)
+			}
+			if task.CompletedAt != nil && tpr.CompletedAt == "" {
+				tpr.CompletedAt = task.CompletedAt.Format(time.RFC3339)
 			}
 		}
 	}
@@ -1165,11 +1213,12 @@ func (s *Service) progressFromLocalStorage(ctx context.Context, apply *storage.A
 	}
 	overlayApplyOptions(httpResp, apply)
 	setRevertSkippedMetadata(httpResp, apply)
-	operations, memberByOperationID, ops, released := s.bestEffortProgressOperations(ctx, apply)
-	httpResp.Operations = operations
-	httpResp.Released = released
-	overlayStoredDisplayMetadata(httpResp, apply, ops)
+	stored := s.bestEffortProgressOperations(ctx, apply)
+	httpResp.Operations = stored.responses
+	httpResp.Released = stored.released
+	overlayStoredDisplayMetadata(httpResp, apply, stored.rows)
 
+	rows := make([]*apitypes.TableProgressResponse, 0, len(tasks))
 	for _, task := range tasks {
 		tpr := &apitypes.TableProgressResponse{
 			TableName:           task.TableName,
@@ -1186,24 +1235,42 @@ func (s *Service) progressFromLocalStorage(ctx context.Context, apply *storage.A
 			Throttled:           task.Throttled,
 			ThrottleReason:      task.ThrottleReason,
 			IsInstant:           task.IsInstant,
-			TaskID:              task.TaskIdentifier,
 		}
-		if task.ApplyOperationID != nil {
-			if member, ok := memberByOperationID[*task.ApplyOperationID]; ok {
-				tpr.Deployment = member.Deployment
-				tpr.Target = member.Target
-			}
-		}
+		attributeStoredTask(tpr, task, stored.memberByOperationID)
 		if task.StartedAt != nil {
 			tpr.StartedAt = task.StartedAt.Format(time.RFC3339)
 		}
 		if task.CompletedAt != nil {
 			tpr.CompletedAt = task.CompletedAt.Format(time.RFC3339)
 		}
-		httpResp.Tables = append(httpResp.Tables, tpr)
+		rows = append(rows, tpr)
 	}
+	if !stored.listed {
+		// Without the operation rows nothing says which shards the apply has
+		// attached, so a declared shard cannot be told from a running one; the
+		// task rows are served as they are.
+		httpResp.Tables = rows
+		return httpResp, nil
+	}
+	s.rollUpShardedProgress(ctx, httpResp, apply, stored.rows, tasks, rows)
 
 	return httpResp, nil
+}
+
+// attributeStoredTask stamps a table row with the control-plane identity of
+// its stored task: the task identifier, and the rollout member that runs it
+// when the task belongs to an operation row the caller has loaded. Every
+// progress source hands its rows through here so one task reads under one
+// task_id, deployment, and target on every poll.
+func attributeStoredTask(tpr *apitypes.TableProgressResponse, task *storage.Task, memberByOperationID map[int64]routing.ExecutionTarget) {
+	tpr.TaskID = task.TaskIdentifier
+	if task.ApplyOperationID == nil {
+		return
+	}
+	if member, ok := memberByOperationID[*task.ApplyOperationID]; ok {
+		tpr.Deployment = member.Deployment
+		tpr.Target = member.Target
+	}
 }
 
 // overlayApplyOptions populates the options map on the response from the apply record.

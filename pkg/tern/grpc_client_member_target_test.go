@@ -130,6 +130,34 @@ func TestGRPCClient_SiblingTargetsOfOneDeploymentShareItsRemoteApply(t *testing.
 	assert.Empty(t, fx.apply.ExternalID, "a multi-operation dispatch must not write the parent apply external_id")
 }
 
+// An already-converged target remains part of the rollout but never dispatches.
+// The working target still names itself for key qualification and declares only
+// the operation the shared remote apply will actually receive.
+func TestGRPCClient_ConvergedMemberIsNotDispatchedInGenerationManifest(t *testing.T) {
+	server := &capturingTernServer{remoteApplyID: "remote-payments", remoteOperationID: "remote-op-002"}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+	fx := newMemberTargetFixture(t, client)
+	now := time.Now()
+	first := fx.operations.ops[fx.first]
+	first.State, first.CompletedAt = state.ApplyOperation.Completed, &now
+	stor := client.storage.(*mockStorage)
+	stor.tasks.tasks = stor.tasks.tasks[1:]
+
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	require.NoError(t, client.ResumeApplyOperation(ctx, fx.apply, fx.second))
+	req := server.getApplyRequest()
+	require.NotNil(t, req)
+	assert.Equal(t, []string{"payments-002"}, req.GenerationOperationKeys)
+	assert.Equal(t, "payments-002", req.Options[dispatchMemberTargetOption])
+	key, err := dispatchOperationKey(fx.plans.byID[fx.operations.ops[fx.second].PlanID], req)
+	require.NoError(t, err)
+	assert.Equal(t, "payments-002", key)
+	assert.Empty(t, first.RemoteApplyID(), "nothing was dispatched for the converged member")
+	assert.Nil(t, first.StartedAt)
+}
+
 // dispatchOperationKey derives a dispatch's operation key the way both planes
 // do: from the dispatch's plan and request shape.
 func dispatchOperationKey(plan *storage.Plan, req *ternv1.ApplyRequest) (string, error) {

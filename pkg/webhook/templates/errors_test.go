@@ -157,24 +157,55 @@ func TestRenderMultipleConfigsUsageExample(t *testing.T) {
 }
 
 func TestRenderUnmanagedSchemaConfigsNotice(t *testing.T) {
-	t.Run("lists each dropped config with its database", func(t *testing.T) {
-		body := RenderUnmanagedSchemaConfigsNotice([]UnmanagedSchemaConfigNoticeData{
+	t.Run("lists each dropped config with its database across every environment", func(t *testing.T) {
+		body := RenderUnmanagedSchemaConfigsNotice([]string{"staging", "production"}, []UnmanagedSchemaConfigNoticeData{
 			{Database: "inventory", SchemaPath: "services/inventory/schema"},
 			{Database: "billing", SchemaPath: "services/billing/schema"},
 		})
-		assert.Contains(t, body, "## ⚠️ Schema Changes Not Managed by SchemaBot")
+		assert.Contains(t, body, "## ⚠️ Schema Changes Not Managed by SchemaBot\n\n**Environments**: `staging`, `production`\n\nThis PR changes schema")
+		assert.Contains(t, body, "which SchemaBot is not configured to manage in any environment")
 		assert.Contains(t, body, "- `services/inventory/schema` — declares database `inventory`")
 		assert.Contains(t, body, "- `services/billing/schema` — declares database `billing`")
-		assert.Contains(t, body, "will **not** be planned or applied")
+		assert.Contains(t, body, "These schema changes will **not** be planned or applied in any environment, and the SchemaBot checks on this PR do not cover them.")
 		assert.Contains(t, body, "`allowed_dirs`")
 	})
 
+	t.Run("omits the environments header when none are known", func(t *testing.T) {
+		body := RenderUnmanagedSchemaConfigsNotice(nil, []UnmanagedSchemaConfigNoticeData{
+			{Database: "inventory", SchemaPath: "services/inventory/schema"},
+		})
+		assert.Contains(t, body, "## ⚠️ Schema Changes Not Managed by SchemaBot\n\nThis PR changes schema")
+		assert.NotContains(t, body, "**Environments**")
+	})
+
 	t.Run("normalizes values that would break markdown code spans", func(t *testing.T) {
-		body := RenderUnmanagedSchemaConfigsNotice([]UnmanagedSchemaConfigNoticeData{
+		body := RenderUnmanagedSchemaConfigsNotice(nil, []UnmanagedSchemaConfigNoticeData{
 			{Database: "inven`tory", SchemaPath: "services/inventory\nschema"},
 		})
 		assert.Contains(t, body, "- `services/inventory schema` — declares database `` inven`tory ``")
 		assert.NotContains(t, body, "inventory\nschema")
+	})
+}
+
+func TestRenderUnmanagedSchemaPassingCheck(t *testing.T) {
+	configs := []UnmanagedSchemaConfigNoticeData{
+		{Database: "merchants", SchemaPath: "services/merchants/schema"},
+		{Database: "ledger_sandbox", SchemaPath: "services/ledger/schema_sandbox"},
+	}
+
+	t.Run("names the environment the check covers", func(t *testing.T) {
+		title, summary := RenderUnmanagedSchemaPassingCheck("production", configs)
+		assert.Equal(t, "No schema changes managed in production", title)
+		assert.Equal(t, "This PR changes schema only under paths SchemaBot does not manage in `production`, so there is nothing to plan or apply in `production`:\n\n"+
+			"- `services/merchants/schema` declares database `merchants`\n"+
+			"- `services/ledger/schema_sandbox` declares database `ledger_sandbox`\n", summary)
+	})
+
+	t.Run("covers every environment for a deployment serving all of them", func(t *testing.T) {
+		title, summary := RenderUnmanagedSchemaPassingCheck("", configs[:1])
+		assert.Equal(t, "No schema changes managed by SchemaBot", title)
+		assert.Equal(t, "This PR changes schema only under paths SchemaBot does not manage in any environment, so there is nothing to plan or apply in any environment:\n\n"+
+			"- `services/merchants/schema` declares database `merchants`\n", summary)
 	})
 }
 
@@ -485,4 +516,22 @@ func TestRenderRepositoryTreeTruncated(t *testing.T) {
 		})
 		assert.Contains(t, body, "## ⚠️ Repository Too Large to Search\n\n*Requested by @hubot at 2026-07-16 18:56:00 UTC*")
 	})
+}
+
+// The plan refusal details name the plan and what SchemaBot stored with it as
+// code spans, then end in the caller's command to create a new plan. A
+// backtick or newline in a stored name cannot break the span or the line.
+func TestPlanRefusalDetails(t *testing.T) {
+	const replan = "Run `schemabot apply -e staging` to create a new plan."
+
+	assert.Equal(t, "Plan `plan-1` no longer exists, so nothing was applied. "+replan,
+		PlanNotFoundDetail("plan-1", replan))
+	assert.Equal(t, "Plan `plan-1` was created for `production`, not `staging`, so nothing was applied. "+replan,
+		PlanEnvironmentMismatchDetail("plan-1", "production", "staging", replan))
+	assert.Equal(t, "Plan `plan-1` was stored without its `deployment`, so SchemaBot cannot route it and nothing was applied. "+replan,
+		PlanRoutingMetadataDetail("plan-1", "deployment", replan))
+
+	hostile := PlanNotFoundDetail("plan`1\n## injected", replan)
+	assert.NotContains(t, hostile, "\n")
+	assert.Contains(t, hostile, "`` plan`1 ## injected ``")
 }

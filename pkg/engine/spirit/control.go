@@ -11,10 +11,10 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"strings"
 
 	"github.com/block/mysql"
 
+	"github.com/block/spirit/pkg/dbconn/sqlescape"
 	"github.com/block/spirit/pkg/utils"
 
 	"github.com/block/schemabot/pkg/engine"
@@ -54,6 +54,23 @@ func (e *Engine) Stop(ctx context.Context, req *engine.ControlRequest) (*engine.
 	e.mu.Unlock()
 
 	logger := e.schemaChangeLogger(rm)
+	if state == engine.StateStopped {
+		// Stopped is provisional while the runner it stopped is still
+		// returning: an earlier stop set it before waiting the runner out, and
+		// the runner can still finish the change on its way out (see
+		// settleAfterRunnerExit). A stop that overlaps that wait answers from
+		// the runner's outcome, not from the provisional state, so a change
+		// that lands is never reported stopped twice over. With no runner
+		// alive the wait returns at once; a runner that will not come down
+		// bounds this stop at its caller's context, and the caller retries.
+		if err := waitForRunExit(ctx, rm); err != nil {
+			return nil, fmt.Errorf("stop on database %s tables %v: the stopped runner has not returned after %w", database, tables, err)
+		}
+		if err := settleAfterRunnerExit(e, rm, logger, "stop", database, tables); err != nil {
+			return nil, err
+		}
+		return settledStopOutcome(logger, engine.StateStopped, database, tables)
+	}
 	if state.IsTerminal() {
 		return settledStopOutcome(logger, state, database, tables)
 	}
@@ -102,6 +119,9 @@ func (e *Engine) Stop(ctx context.Context, req *engine.ControlRequest) (*engine.
 
 	// Wait for the goroutine to complete
 	rm.wg.Wait()
+	if err := settleAfterRunnerExit(e, rm, logger, "stop", database, tables); err != nil {
+		return nil, err
+	}
 
 	logger.Info("schema change stopped",
 		"database", database,
@@ -112,6 +132,28 @@ func (e *Engine) Stop(ctx context.Context, req *engine.ControlRequest) (*engine.
 		Accepted: true,
 		Message:  "Stopped - checkpoint saved for resume",
 	}, nil
+}
+
+// settleAfterRunnerExit reads the change's state once its runner has returned
+// from a stop or cancel. The runner can finish the change after the context
+// was cancelled, as when a Spirit cutover commits just before the cancel
+// reaches it, and the run then records the change completed
+// (completeSchemaChange). That outcome stands: the stop or cancel is answered
+// with the typed already-completed rejection, so the caller reconciles to the
+// completed outcome, and a cancel drops no artifacts of a change that landed.
+// Any other state is the stop or cancel taking effect, and nil is returned.
+func settleAfterRunnerExit(e *Engine, rm *runningSchemaChange, logger *slog.Logger, operation, database string, tables []string) error {
+	e.mu.Lock()
+	state := rm.state
+	e.mu.Unlock()
+	if state != engine.StateCompleted {
+		return nil
+	}
+	logger.Info(operation+" rejected: the schema change completed before the "+operation+" took effect",
+		"database", database,
+		"tables", tables,
+	)
+	return engine.NewAlreadyCompletedError("%s rejected: the schema change on database %s completed before the %s took effect", operation, database, operation)
 }
 
 // settledOutcomeOutranksStop reports whether the schema change settled on an
@@ -224,6 +266,9 @@ func (e *Engine) Cancel(ctx context.Context, req *engine.ControlRequest) (*engin
 		"tables", tables,
 	)
 	rm.wg.Wait()
+	if err := settleAfterRunnerExit(e, rm, logger, "cancel", database, tables); err != nil {
+		return nil, err
+	}
 
 	logger.Info("schema change cancelled",
 		"database", database,
@@ -330,18 +375,17 @@ func (e *Engine) Start(ctx context.Context, req *engine.ControlRequest) (*engine
 		"tables", tables,
 	)
 
+	// The resumed run's cancel is published with its running state, before
+	// the run starts, so a halt that finds the run active always reaches it.
+	bgCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
 	e.mu.Lock()
 	rm.state = engine.StateRunning
+	rm.cancelFunc = cancel
+	rm.owner = engine.WorkOwnerFromContext(ctx)
 	e.mu.Unlock()
 
-	rm.wg.Go(func() {
-		bgCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	rm.goRun(func() {
 		defer cancel()
-		e.mu.Lock()
-		if e.runningSchemaChange != nil {
-			e.runningSchemaChange.cancelFunc = cancel
-		}
-		e.mu.Unlock()
 		e.resumeSchemaChange(bgCtx, host, username, password, database, originalDDLs, combinedStatement, deferCutover, directExecPolicy)
 	})
 
@@ -421,7 +465,7 @@ func (e *Engine) Cutover(ctx context.Context, req *engine.ControlRequest) (*engi
 	// Drop the sentinel table - Spirit will detect this and proceed with cutover.
 	// Cutover is asynchronous — Spirit performs the table swap in its goroutine.
 	// The caller should poll Progress() for state transitions.
-	_, err = db.ExecContext(ctx, fmt.Sprintf("DROP TABLE IF EXISTS %s.%s", quoteIdentifier(database), quoteIdentifier(deferredCutoverSentinelTable)))
+	_, err = db.ExecContext(ctx, fmt.Sprintf("DROP TABLE IF EXISTS %s.%s", sqlescape.EscapeIdentifier(database), sqlescape.EscapeIdentifier(deferredCutoverSentinelTable)))
 	if err != nil {
 		return nil, fmt.Errorf("drop sentinel table: %w", err)
 	}
@@ -472,10 +516,6 @@ func (e *Engine) DeferredCutoverSignalExists(ctx context.Context, req *engine.De
 		return false, fmt.Errorf("query deferred cutover signal for database %s: %w", database, err)
 	}
 	return count > 0, nil
-}
-
-func quoteIdentifier(name string) string {
-	return "`" + strings.ReplaceAll(name, "`", "``") + "`"
 }
 
 // Revert rolls back a completed schema change. Spirit has no revert window: the

@@ -1,6 +1,7 @@
 package templates
 
 import (
+	"slices"
 	"strings"
 	"testing"
 
@@ -10,9 +11,9 @@ import (
 	"github.com/block/schemabot/pkg/engine"
 )
 
-// primaryDropsLegacyPlan is a rollout whose primary target orders_a drops
-// orders.legacy over an unfinished copy of orders, while orders_b already has
-// the schema. Targets with work lead, so orders_b's group renders last.
+// primaryDropsLegacyPlan is a rollout in which orders_a, the target planned
+// first, drops orders.legacy over an unfinished copy of orders, while orders_b
+// already has the schema.
 func primaryDropsLegacyPlan(environment string) PlanCommentData {
 	changes := []KeyspaceChangeData{{Keyspace: "orders", Statements: []string{"DROP TABLE `legacy`"}}}
 	return PlanCommentData{
@@ -27,12 +28,12 @@ func primaryDropsLegacyPlan(environment string) PlanCommentData {
 		DeploymentDrift: &DeploymentDriftData{
 			Computed: true, Clean: true, Independent: true,
 			Deployments: []DeploymentDriftEntry{
-				{Deployment: "primary", Target: "orders_b", Class: "match"},
-				{Deployment: "primary", Target: "orders_a", Primary: true, Class: "planned"},
+				{Deployment: "shop", Target: "orders_b", Class: "match"},
+				{Deployment: "shop", Target: "orders_a", Primary: true, Class: "planned"},
 			},
 			Plans: []DeploymentPlanGroup{
-				{Members: []string{"primary/orders_b"}},
-				{Members: []string{"primary/orders_a"}, Primary: true, Changes: changes},
+				{Members: []string{"shop/orders_b"}},
+				{Members: []string{"shop/orders_a"}, Primary: true, Changes: changes},
 			},
 		},
 	}
@@ -55,46 +56,83 @@ func sectionOf(t *testing.T, body, heading string) string {
 	return rest
 }
 
-// The unsafe changes and the existing copies a plan comment discloses are read
-// from the primary target alone, so when every target's plan renders they sit
-// under the primary target's heading. Disclosed after the last group instead,
-// they would read as the converged orders_b's, which drops nothing and holds no
-// copy.
-func TestRenderPlanComment_PrimaryTargetDisclosuresSitUnderItsHeading(t *testing.T) {
+// withDistinctPlan adds orders_c, which runs a plan of its own, so each plan
+// renders under a heading naming the targets that run it.
+func withDistinctPlan(data PlanCommentData) PlanCommentData {
+	drift := *data.DeploymentDrift
+	drift.Deployments = append(slices.Clone(drift.Deployments), DeploymentDriftEntry{Deployment: "shop", Target: "orders_c", Class: "planned"})
+	drift.Plans = append(slices.Clone(drift.Plans), DeploymentPlanGroup{
+		Members: []string{"shop/orders_c"},
+		Changes: []KeyspaceChangeData{{Keyspace: "orders", Statements: []string{"ALTER TABLE `orders` ADD COLUMN `note` varchar(64)"}}},
+	})
+	data.DeploymentDrift = &drift
+	return data
+}
+
+// When every target with work runs the same plan, it renders once with no
+// target heading. The unsafe changes it discloses are every such target's,
+// so they name none. The existing copies are read from one target alone, so
+// they name it: a reader would otherwise take them for every target's. The
+// converged orders_b is not named anywhere.
+func TestRenderPlanComment_RolloutDisclosuresNameOnlyTheTargetCopiesWereReadFrom(t *testing.T) {
 	body := RenderPlanComment(primaryDropsLegacyPlan("production"))
 
-	primary := sectionOf(t, body, "### Target `primary/orders_a`")
-	assert.Contains(t, primary, "unsafe change detected")
-	assert.Contains(t, primary, "**Applying destroys work in progress**: 1 unfinished copy on the target")
-	assert.NotContains(t, primary, "On the primary target", "a lone target's heading already names it")
-
-	converged := sectionOf(t, body, "### Target `primary/orders_b`")
-	assert.Contains(t, converged, groupNoChanges)
-	assert.NotContains(t, converged, "unsafe change")
-	assert.NotContains(t, converged, "work in progress")
-	assert.Equal(t, 1, strings.Count(body, "unsafe change detected"), "the warning is not repeated plan-wide")
-	assert.Equal(t, 1, strings.Count(body, "destroys work in progress"), "the copy is not repeated plan-wide")
+	assert.NotContains(t, body, "### ", "one plan renders with no target heading")
+	assert.Contains(t, body, "On target `shop/orders_a`:\n\n⚠️ **Applying destroys work in progress**: 1 unfinished copy on the target")
+	assert.Equal(t, 1, strings.Count(body, "unsafe change detected"), "the warning is said once")
+	assert.Equal(t, 1, strings.Count(body, "destroys work in progress"), "the copy is said once")
+	assert.NotContains(t, body, groupNoChanges, "the converged target has no section")
+	assert.Contains(t, body, " · rolling out to target `shop/orders_a`\n")
+	assert.NotContains(t, body, "orders_b", "the target already there is not named")
 }
 
-// A primary target that shares its group with other targets is named on its
-// copies, since they were read from it and not from the group's other
-// targets.
-func TestRenderPlanComment_PrimaryTargetCopiesNameItInASharedGroup(t *testing.T) {
+// When targets run different plans, each plan's heading names the targets
+// that run it and the summary counts them; the target already at the schema
+// is not named.
+func TestRenderPlanComment_HeadedRolloutCountsOnlyTargetsWithWork(t *testing.T) {
+	body := RenderPlanComment(withDistinctPlan(primaryDropsLegacyPlan("production")))
+
+	assert.Contains(t, body, "### Target `shop/orders_c`")
+	assert.Contains(t, body, " · rolling out to 2 targets\n")
+	assert.NotContains(t, body, "orders_b", "the target already there is not named")
+}
+
+// A target that shares its plan with other targets is still named on its
+// copies, since they were read from it and not from the other targets.
+func TestRenderPlanComment_RolloutCopiesNameTheirTargetInASharedPlan(t *testing.T) {
 	data := primaryDropsLegacyPlan("production")
 	data.DeploymentDrift.Deployments = append(data.DeploymentDrift.Deployments,
-		DeploymentDriftEntry{Deployment: "primary", Target: "orders_c", Class: "planned"})
-	data.DeploymentDrift.Plans[1].Members = []string{"primary/orders_a", "primary/orders_c"}
+		DeploymentDriftEntry{Deployment: "shop", Target: "orders_c", Class: "planned"})
+	data.DeploymentDrift.Plans[1].Members = []string{"shop/orders_a", "shop/orders_c"}
 	body := RenderPlanComment(data)
 
-	group := sectionOf(t, body, "### 2 of 3 targets")
-	assert.Contains(t, group, "On the primary target `primary/orders_a`:\n\n⚠️ **Applying destroys work in progress**")
-	assert.Contains(t, group, "unsafe change detected")
-	assert.NotContains(t, sectionOf(t, body, "### Target `primary/orders_b`"), "work in progress")
+	assert.NotContains(t, body, "### ", "one plan renders with no target heading")
+	assert.Contains(t, body, "On target `shop/orders_a`:\n\n⚠️ **Applying destroys work in progress**")
+	assert.Contains(t, body, " · rolling out to targets `shop/orders_a`, `shop/orders_c`\n")
 }
 
-// An environment's section in a multi-environment comment discloses its
-// primary target's unsafe changes and copies under that target's heading too.
-func TestMultiEnvPlanComment_PrimaryTargetDisclosuresSitUnderItsHeading(t *testing.T) {
+// When targets run different plans, the disclosures read from the target
+// planned first sit under its heading, which names it, so the copies do not
+// name it again. Disclosed after the last plan instead, they would read as
+// orders_c's.
+func TestRenderPlanComment_RolloutDisclosuresSitUnderTheirTargetsHeading(t *testing.T) {
+	body := RenderPlanComment(withDistinctPlan(primaryDropsLegacyPlan("production")))
+
+	first := sectionOf(t, body, "### Target `shop/orders_a`")
+	assert.Contains(t, first, "unsafe change detected")
+	assert.Contains(t, first, "**Applying destroys work in progress**: 1 unfinished copy on the target")
+	assert.NotContains(t, first, "On target", "a lone target's heading already names it")
+
+	other := sectionOf(t, body, "### Target `shop/orders_c`")
+	assert.NotContains(t, other, "unsafe change")
+	assert.NotContains(t, other, "work in progress")
+	assert.NotContains(t, body, "Target `shop/orders_b`", "the converged target has no section")
+	assert.Equal(t, 1, strings.Count(body, "unsafe change detected"), "the warning is not repeated plan-wide")
+}
+
+// An environment's section in a multi-environment comment renders its one
+// plan the same way: no target heading, with the copies naming their target.
+func TestMultiEnvPlanComment_RolloutDisclosuresNameTheirTarget(t *testing.T) {
 	staging, production := primaryDropsLegacyPlan("staging"), primaryDropsLegacyPlan("production")
 	production.DiscardedCopies = nil
 	body := RenderMultiEnvPlanComment(MultiEnvPlanCommentData{
@@ -105,35 +143,63 @@ func TestMultiEnvPlanComment_PrimaryTargetDisclosuresSitUnderItsHeading(t *testi
 
 	_, stagingSection, found := strings.Cut(body, "### Staging")
 	require.True(t, found, body)
-	stagingSection, _, _ = strings.Cut(stagingSection, "### Production")
-	primary := sectionOf(t, stagingSection, "#### Target `primary/orders_a`")
-	assert.Contains(t, primary, "unsafe change detected")
-	assert.Contains(t, primary, "destroys work in progress")
-	assert.NotContains(t, sectionOf(t, stagingSection, "#### Target `primary/orders_b`"), "unsafe change")
+	stagingSection, productionSection, _ := strings.Cut(stagingSection, "### Production")
+	assert.NotContains(t, stagingSection, "#### Target", "one plan renders with no target heading")
+	assert.Contains(t, stagingSection, "unsafe change detected")
+	assert.Contains(t, stagingSection, "On target `shop/orders_a`:")
+	assert.NotContains(t, productionSection, "work in progress")
 }
 
-// The unsafe refusal lists the primary's unsafe changes with every other
-// target's, so the primary's group does not repeat them, and it discloses no
-// existing copies, as a single target's refusal does not.
-func TestRenderUnsafeChangesBlocked_PrimaryTargetGroupRepeatsNothing(t *testing.T) {
+// The unsafe refusal lists every unsafe change itself, so the plan above it
+// does not repeat them, and it discloses no existing copies, as a single
+// target's refusal does not.
+func TestRenderUnsafeChangesBlocked_RolloutPlanRepeatsNothing(t *testing.T) {
 	body := RenderUnsafeChangesBlocked(primaryDropsLegacyPlan("production"))
 
 	assert.Contains(t, body, "Apply rejected**: 1 unsafe change detected\n1. `legacy`")
 	assert.Equal(t, 1, strings.Count(body, "drops the table and all of its rows"), "the refusal lists the drop once")
-	assert.NotContains(t, sectionOf(t, body, "### Target `primary/orders_a`"), "unsafe change")
+	assert.NotContains(t, body, "### ", "one plan renders with no target heading")
 	assert.NotContains(t, body, "work in progress")
 }
 
-// When every target's plan renders, an unsafe finding on a table another pull
-// request changed still names that pull request under the primary target's
-// heading, and the attribution does not also get a section of its own.
-func TestRenderPlanComment_PrimaryTargetUnsafeFindingCarriesAttribution(t *testing.T) {
+// An unsafe finding on a table another pull request changed still names that
+// pull request on the finding, and the attribution does not also get a
+// section of its own.
+func TestRenderPlanComment_RolloutUnsafeFindingCarriesAttribution(t *testing.T) {
 	data := primaryDropsLegacyPlan("production")
 	data.Repository = "acme/orders"
 	data.AttributedChanges = []AttributedChangeData{{Table: "legacy", Repository: "acme/orders", PullRequest: 4790}}
 	body := RenderPlanComment(data)
 
-	primary := sectionOf(t, body, "### Target `primary/orders_a`")
-	assert.Contains(t, primary, "`legacy`: drops the table and all of its rows (changed by open PR [#4790](https://github.com/acme/orders/pull/4790))")
+	assert.Equal(t, 1, strings.Count(body, "`legacy`: drops the table and all of its rows (changed by open PR [#4790](https://github.com/acme/orders/pull/4790))"))
 	assert.NotContains(t, body, "Check before applying")
+}
+
+// When the primary target creates a table that another target already has and
+// changes unsafely, the attribution is about the other target's change, not
+// the creation. A creation destroys nothing, so its finding carries no note,
+// and the attribution keeps a section of its own rather than folding onto it.
+func TestRenderPlanComment_PrimaryTargetCreationNeverCarriesAnotherTargetsAttribution(t *testing.T) {
+	data := primaryDropsLegacyPlan("production")
+	data.Repository = "acme/orders"
+	create := []KeyspaceChangeData{{Keyspace: "orders", Statements: []string{"CREATE TABLE `stations` (`id` bigint NOT NULL, `seen_at` timestamp NULL, PRIMARY KEY (`id`))"}}}
+	data.Changes = create
+	data.DiscardedCopies = nil
+	data.UnsafeChanges = []UnsafeChangeData{{Table: "stations", Reason: "has_timestamp: column seen_at uses TIMESTAMP", ChangeType: "create"}}
+	data.DeploymentDrift.Deployments[0].Class = "planned"
+	data.DeploymentDrift.Plans = []DeploymentPlanGroup{
+		{Members: []string{"primary/orders_a"}, Primary: true, Changes: create},
+		{
+			Members:       []string{"primary/orders_b"},
+			Changes:       []KeyspaceChangeData{{Keyspace: "orders", Statements: []string{"ALTER TABLE `stations` DROP COLUMN `legacy_ref`"}}},
+			UnsafeChanges: []UnsafeChangeData{{Table: "stations", Reason: "DROP COLUMN discards the column's data", ChangeType: "alter"}},
+		},
+	}
+	data.AttributedChanges = []AttributedChangeData{{Table: "stations", Repository: "acme/orders", PullRequest: 4790}}
+	body := RenderPlanComment(data)
+
+	primary := sectionOf(t, body, "### Target `primary/orders_a`")
+	assert.Contains(t, primary, "`stations`: has_timestamp: column seen_at uses TIMESTAMP\n")
+	assert.NotContains(t, body, "(changed by open PR", "no finding carries the attribution")
+	assert.Contains(t, body, "**Check before applying**: 1 destructive change SchemaBot cannot attribute to this PR")
 }

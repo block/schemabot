@@ -15,19 +15,25 @@
 Some ALTER statements are deterministically refused by the MySQL schema change
 engine — dropping a primary key or adding a foreign key can never survive its
 online copy, and explicit `ALGORITHM=` / `LOCK=` clauses conflict with the
-assertions it prepends. By default those statements block the apply, and the
-plan comment says so up front.
+assertions it prepends. By default such a statement runs directly when its
+table holds at most 100MiB of data and indexes; on a larger table, or with
+direct execution turned off, it blocks the apply, and the plan comment says so
+up front. The byte figure is an InnoDB statistics estimate that can undercount
+a table that just grew, and nothing corroborates it; a policy bounded by
+`max_table_rows` is checked against an exact count instead (see
+[Configuration](configuration.md#direct-execution)).
 
 Some refused changes are still genuinely necessary — the canonical case is a
 primary-key reshape on a small table. Without direct execution, the only path
 is running the DDL by hand against the target, outside SchemaBot, with no PR
 trail, no plan, and no audit record. Direct execution brings that category of
-change inside the system: under an explicit per-environment policy, a refused
-statement can run verbatim as native MySQL DDL.
+change inside the system: under a size-bounded policy, the default or one stated
+for the server or an environment, a refused statement can run verbatim as native
+MySQL DDL.
 
 A direct statement behaves nothing like a normal SchemaBot apply. It is
-synchronous, it blocks writes to the table for its full duration, and there is
-no throttling or checkpointing. The policy exists to
+synchronous, it can block writes while MySQL executes the statement, there is no
+throttling or checkpointing, and it has no Spirit revert window. The policy exists to
 bound those consequences, and every uncertain input fails closed.
 
 Lock acquisition is bounded too. Native DDL queues on the table's metadata
@@ -60,11 +66,14 @@ when it is not set.
 
 The kill needs `SELECT` on `performance_schema` and `PROCESS` to find the
 blockers (`PROCESS` covers `information_schema.innodb_trx`, which it reads to
-spare large transactions), and `CONNECTION_ADMIN` (or `SUPER`) to kill
-sessions of other users. A target whose SchemaBot user lacks any of them
-blocks the statement at plan time rather than running it without the kill.
-`CONNECTION_ADMIN` is read from `SHOW GRANTS`; on RDS, holding
-`rds_superuser_role` counts when `activate_all_roles_on_login` is on.
+spare large transactions), and a way to kill sessions of other users:
+`CONNECTION_ADMIN` (or `SUPER`) for `KILL`, or on RDS, `EXECUTE` on
+`mysql.rds_kill`, which the kill calls when `KILL` is denied. A target whose
+SchemaBot user lacks any of them blocks the statement at plan time rather than
+running it without the kill. Both are read from `SHOW GRANTS`, which lists the
+privileges of the user's active roles, so a role such as RDS's
+`rds_superuser_role` counts only for the privileges it actually grants, and
+`EXECUTE` counts only on a server where `mysql.rds_kill` exists.
 
 ## Routing
 
@@ -76,7 +85,8 @@ force, and the plan records a per-table execution-mode verdict:
 ```diagram
 engine refuses statement (e.g. primary-key reshape)
         │ direct_execution policy in force for this database/environment?
-        ├─ absent or disabled ───────────────────► blocked
+        │ (none stated: the default, enabled at max_table_bytes 100MiB)
+        ├─ disabled (enabled: false) ────────────► blocked
         ├─ table size unavailable ───────────────► blocked
         ├─ above the policy's one size bound ────► blocked
         └─ within it ────────────────────────────► direct: statement runs verbatim
@@ -130,8 +140,8 @@ operator-supplied: a caller able to name its own policy there would be
 granting itself the thing the configuration exists to bound.
 
 A request that states no policy leaves the executing server's own
-configuration in force, which with none configured leaves every statement the
-engine refuses blocked.
+configuration in force, which with none configured is the default policy:
+enabled, bounded at 100MiB.
 
 ### The plan carries the policy its verdicts were judged under
 
@@ -252,7 +262,7 @@ reshaping any shared surface:
 - **The PR workflow** keys purely off the execution mode recorded on table
   changes and aggregates across shards, so any engine that emits a `direct`
   verdict inherits the same disclosure with no webhook changes.
-- **Config validation is the opt-in gate.** A per-database `direct_execution`
+- **Config validation is the gate.** A per-database `direct_execution`
   block is only accepted on databases whose engine implements routing; on any
   other engine it fails at startup rather than being silently ignored. The
   server-wide policy names no database type, so it is accepted alongside every
@@ -312,7 +322,9 @@ confirmation step:
   `apply` or at `apply-confirm`, that routes a statement to direct execution
   that the comment the operator was shown ran through Spirit pauses for
   `apply-confirm` against a comment that discloses it, the same way a
-  re-plan whose DDL changed does. An `apply-confirm` given on a comment that
+  re-plan whose DDL changed does. On a `schemabot apply` that runs several
+  targets' plans, that holds for every target's statements, whichever target
+  runs them. An `apply-confirm` given on a comment that
   rendered several targets' plans does not pause again: a statement on the
   primary target that now runs differently, as direct execution or blocked,
   refuses the apply and releases the lock, because how each statement runs
@@ -321,7 +333,9 @@ confirmation step:
 - Other gates still apply: a direct statement that is also an unsafe change,
   such as dropping a primary key, still needs `--allow-unsafe`.
 - `--defer-cutover` is rejected on an all-direct plan — a direct statement has
-  no cutover to defer. On a mixed plan it applies to the engine-driven
+  no cutover to defer. For an environment with several targets, the plan is
+  all-direct when every target with work runs only direct statements, whichever
+  target that is. On a mixed plan it applies to the engine-driven
   statements only. The disclosure on the apply's comment says so, and so
   does the disclosure on a paused comment, since the flag can still be
   passed to `apply-confirm`.
@@ -352,5 +366,5 @@ the statement and MySQL error), a spike in `blocked_size_unknown` means table
 size statistics are unavailable (check target connectivity and
 `information_schema` access), `blocked_force_kill_unavailable` means the
 SchemaBot user lacks a grant the kill needs on the target (grant `SELECT`
-on `performance_schema.*`, `PROCESS`, and `CONNECTION_ADMIN` or `SUPER`), and `blocked_force_kill_unknown`
+on `performance_schema.*`, `PROCESS`, and `CONNECTION_ADMIN` or `SUPER`, or on RDS `EXECUTE` on `mysql.rds_kill`), and `blocked_force_kill_unknown`
 means checking those grants failed (check target connectivity).

@@ -24,8 +24,9 @@ func barrier(dep, st string) Operation {
 }
 
 // parallel builds a parallel, halt-on-failure operation. Under parallel the copy
-// phase has no earlier-sibling gate, so a pending parallel operation is never
-// shown waiting for or halted by an earlier sibling.
+// phase has no earlier-sibling ordering, so a pending parallel operation is
+// never shown waiting for an earlier sibling; a terminal-failed earlier sibling
+// still holds it under halt.
 func parallel(dep, st string) Operation {
 	return Operation{Deployment: dep, State: st, Parallel: true}
 }
@@ -158,10 +159,10 @@ func TestDerivePending_Ordering(t *testing.T) {
 			label: "queued — next in order",
 		},
 		{
-			name:  "parallel: earlier failed does not halt copy start",
+			name:  "parallel: earlier failed halts copy start",
 			ops:   []Operation{parallel("eu", so.Failed), parallel("us", so.Pending)},
-			want:  StateQueuedNext,
-			label: "queued — next in order",
+			want:  StateHalted,
+			label: "halted — eu failed",
 		},
 		{
 			name:  "parallel: earlier cancelled does not halt copy start",
@@ -508,6 +509,56 @@ func TestDerive_PauseFailureWithPendingSiblingHoldsPaused(t *testing.T) {
 	assert.Equal(t, "eu", got.FirstFailure.Deployment)
 }
 
+// TestDerivePending_ParallelHeldByFailedEarlierMember: under parallel a pending
+// operation is still held by a terminal-failed earlier sibling, even while
+// another sibling is mid-copy, because the copy-start gate's failure arm applies
+// to every cutover policy. The hold renders halted by default, paused for a
+// human under on_failure=pause, and is lifted under on_failure=continue, so the
+// label agrees with what the driver will claim next.
+func TestDerivePending_ParallelHeldByFailedEarlierMember(t *testing.T) {
+	cases := []struct {
+		name  string
+		build func(dep, st string) Operation
+		want  PresentationState
+		label string
+	}{
+		{
+			name:  "halt",
+			build: parallel,
+			want:  StateHalted,
+			label: "halted — eu failed",
+		},
+		{
+			name: "pause",
+			build: func(dep, st string) Operation {
+				return Operation{Deployment: dep, State: st, Parallel: true, PauseOnFailure: true}
+			},
+			want:  StatePaused,
+			label: "paused — eu failed; release or stop",
+		},
+		{
+			name: "continue",
+			build: func(dep, st string) Operation {
+				return Operation{Deployment: dep, State: st, Parallel: true, ContinueOnFailure: true}
+			},
+			want:  StateQueuedNext,
+			label: "queued — next in order",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := Derive([]Operation{
+				tc.build("eu", so.Failed),
+				tc.build("ap", so.Running),
+				tc.build("us", so.Pending),
+			})
+			require.Len(t, got.Deployments, 3)
+			assert.Equal(t, tc.want, got.Deployments[2].Presentation)
+			assert.Equal(t, tc.label, got.Deployments[2].Label)
+		})
+	}
+}
+
 // TestDerive_ReleasedPauseRunsDegradedLikeContinue: once an apply is released a
 // pause failure behaves like continue — the held siblings proceed and the
 // aggregate runs degraded rather than paused.
@@ -629,6 +680,63 @@ func TestGroups_RollsUpEachDeploymentsTargets(t *testing.T) {
 	assert.Equal(t, "eu", eu.Lead.Name)
 	assert.Equal(t, []StateCount{{"completed", 1}}, eu.Counts)
 	assert.False(t, eu.Open)
+}
+
+// A group's progress counts the targets that ran the change apart from the
+// ones that already had it, and the rest by status, so the parts always add up
+// to every target the group addresses.
+func TestTargetProgress_CountsRanAndAlreadyHadApart(t *testing.T) {
+	target := func(tgt, st string) Operation {
+		return Operation{Deployment: "primary", Target: tgt, State: st, Parallel: true, ContinueOnFailure: true}
+	}
+	converged := target("t_004", so.Completed)
+	converged.NeverStarted = true
+	converged.AlreadyConverged = true
+	apply := Derive([]Operation{
+		target("t_000", so.Completed),
+		target("t_001", so.Running),
+		target("t_002", so.Pending),
+		target("t_003", so.Failed),
+		converged,
+	})
+
+	groups := apply.Groups()
+	require.Len(t, groups, 1)
+	assert.Equal(t, TargetProgress{
+		Total:      5,
+		Done:       1,
+		AlreadyHad: 1,
+		Others:     []StateCount{{"running", 1}, {"queued", 1}, {"failed", 1}},
+		Unsettled:  2,
+	}, apply.TargetProgress(groups[0]), "the running and queued targets can still run; the failed one cannot")
+}
+
+// Every status is in exactly one histogram category, so a group's status line
+// accounts for each of its targets: with one target in every status, the counts
+// still add up to every target the group addresses.
+func TestTargetProgress_EveryStatusIsCounted(t *testing.T) {
+	var apply Apply
+	var group Group
+	for ps := range presentationStateCount {
+		categories := 0
+		for _, cat := range summaryCategoryOrder {
+			if slices.Contains(cat.states, ps) {
+				categories++
+			}
+		}
+		assert.Equal(t, 1, categories, "status %d must be in exactly one histogram category", ps)
+
+		group.Members = append(group.Members, len(apply.Deployments))
+		apply.Deployments = append(apply.Deployments, Deployment{Presentation: ps})
+	}
+
+	p := apply.TargetProgress(group)
+	counted := p.Done + p.AlreadyHad
+	for _, c := range p.Others {
+		counted += c.Count
+	}
+	assert.Equal(t, p.Total, counted, "every target is counted once: %+v", p)
+	assert.Equal(t, int(presentationStateCount), p.Total)
 }
 
 // Members that are not distinct targets, such as keyed operations with no

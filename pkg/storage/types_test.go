@@ -87,6 +87,57 @@ func TestPlanBlockedChanges(t *testing.T) {
 	assert.Equal(t, "testdb", changes[1].Namespace)
 }
 
+// TestPlanAllChangesDirect verifies that a plan is all-direct only when every
+// table and per-shard change runs as direct execution and at least one exists,
+// so --defer-cutover is refused only where it has nothing to defer.
+func TestPlanAllChangesDirect(t *testing.T) {
+	direct := TableChange{Table: "users", Operation: "alter", ExecutionMode: "direct"}
+	engine := TableChange{Table: "orders", Operation: "alter"}
+	tests := []struct {
+		name string
+		plan *Plan
+		want bool
+	}{
+		{name: "nil plan", plan: nil, want: false},
+		{name: "no changes", plan: &Plan{Namespaces: map[string]*NamespacePlanData{"testdb": {}}}, want: false},
+		{name: "every table change direct", plan: &Plan{Namespaces: map[string]*NamespacePlanData{
+			"testdb": {Tables: []TableChange{direct, direct}},
+		}}, want: true},
+		{name: "one table change through the engine", plan: &Plan{Namespaces: map[string]*NamespacePlanData{
+			"testdb": {Tables: []TableChange{direct, engine}},
+		}}, want: false},
+		{name: "a shard change through the engine", plan: &Plan{
+			Namespaces: map[string]*NamespacePlanData{"testdb": {Tables: []TableChange{direct}}},
+			Shards:     []ShardPlan{{Namespace: "testdb", Shard: "-80", Changes: []TableChange{engine}}},
+		}, want: false},
+		{name: "direct shard changes under an engine-driven collapsed row", plan: &Plan{
+			Namespaces: map[string]*NamespacePlanData{"testdb": {Tables: []TableChange{engine}}},
+			Shards: []ShardPlan{
+				{Namespace: "testdb", Shard: "-80", Changes: []TableChange{direct}},
+				{Namespace: "testdb", Shard: "80-", Changes: []TableChange{direct}},
+			},
+		}, want: true},
+		{name: "an engine-driven namespace no shard carries", plan: &Plan{
+			Namespaces: map[string]*NamespacePlanData{
+				"testdb":  {Tables: []TableChange{direct}},
+				"lookups": {Tables: []TableChange{engine}},
+			},
+			Shards: []ShardPlan{{Namespace: "testdb", Shard: "-80", Changes: []TableChange{direct}}},
+		}, want: false},
+		{name: "direct shard changes only", plan: &Plan{
+			Shards: []ShardPlan{{Namespace: "testdb", Shard: "-80", Changes: []TableChange{direct}}},
+		}, want: true},
+		{name: "a namespace to finalize", plan: &Plan{Namespaces: map[string]*NamespacePlanData{
+			"testdb": {Tables: []TableChange{direct}, Finalize: true},
+		}}, want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, tt.plan.AllChangesDirect())
+		})
+	}
+}
+
 // TestPlanBlockedApplyError verifies the refusal every admission path returns
 // for a plan with a blocked step: it names the first blocked table and its
 // reason, falls back to a fixed reason when the engine recorded none, and is

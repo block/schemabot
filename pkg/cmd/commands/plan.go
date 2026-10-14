@@ -314,6 +314,7 @@ func writeRolloutPlanBody(result *apitypes.PlanResponse, isApply bool) {
 	if lint := result.LintNonErrors(); len(lint) > 0 {
 		templates.WriteLintViolations(lint)
 	}
+	writePlanGuidance(result, isApply)
 	// The summary counts what the rollout runs the way the PR comment does,
 	// each table once however many groups change it. The group headings
 	// already say which members run what.
@@ -513,6 +514,7 @@ func writeChangesBody(result *apitypes.PlanResponse, isApply bool) {
 	if len(lintViolations) > 0 {
 		templates.WriteLintViolations(lintViolations)
 	}
+	writePlanGuidance(result, isApply)
 
 	// The summary counts what the DDL block above shows.
 	finalizes := w.finalizes()
@@ -523,6 +525,18 @@ func writeChangesBody(result *apitypes.PlanResponse, isApply bool) {
 		templates.WritePlanSummary(w.allChanges)
 	}
 	templates.WriteExemptTables(result.ExemptTables)
+}
+
+// writePlanGuidance links the guides for the lint findings the output shows.
+// Apply prints unsafe findings separately; link only findings shown here.
+func writePlanGuidance(result *apitypes.PlanResponse, isApply bool) {
+	var guidanceRules []string
+	for _, finding := range result.LintResults {
+		if finding != nil && (!isApply || finding.Severity != "error") {
+			guidanceRules = append(guidanceRules, finding.Linter)
+		}
+	}
+	templates.WriteRelatedGuidance(guidanceRules, result.DatabaseType == "mysql")
 }
 
 // writeChangeDetail writes one plan's DDL and VSchema changes grouped by

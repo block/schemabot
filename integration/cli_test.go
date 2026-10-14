@@ -1397,27 +1397,22 @@ CREATE TABLE users (
 		assertContains(t, out, "No lint issues found")
 	})
 
-	t.Run("canonicalization", func(t *testing.T) {
+	t.Run("clean_file_left_as_written", func(t *testing.T) {
 		schemaDir := t.TempDir()
 
-		// Write a schema with style issues only (lowercase, no backticks)
-		writeFile(t, filepath.Join(schemaDir, "style.sql"), `
+		// A lint-clean file spelled in lowercase with no backticks has nothing
+		// to fix, so it keeps its exact bytes.
+		style := `
 create table users (id bigint not null auto_increment primary key) charset=utf8mb4;
-`)
+`
+		writeFile(t, filepath.Join(schemaDir, "style.sql"), style)
 
 		out := runCLI(t, binPath, "fix-lint", "-s", schemaDir)
 
-		// Should report canonicalization
-		assertContains(t, out, "canonical")
+		assertContains(t, out, "No lint issues found")
 
-		// File should be canonicalized
 		content, err := os.ReadFile(filepath.Join(schemaDir, "style.sql"))
 		require.NoError(t, err, "read schema file")
-		contentStr := string(content)
-
-		// Should have uppercase keywords
-		assert.Contains(t, contentStr, "CREATE TABLE", "expected uppercase CREATE TABLE")
-		// Should have backtick identifiers
-		assert.Contains(t, contentStr, "`users`", "expected backtick identifiers")
+		assert.Equal(t, style, string(content))
 	})
 }

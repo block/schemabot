@@ -946,6 +946,20 @@ func TestWritePlanHeaderPostgres(t *testing.T) {
 	}
 }
 
+// Plans expose guidance for shown findings; apply output must not link an error
+// finding whose unsafe section is rendered separately.
+func TestOutputPlanResultRelatedGuidance(t *testing.T) {
+	result := planWithTables(&apitypes.TableChangeResponse{TableName: "customers", DDL: "ALTER TABLE `customers` ADD COLUMN `name` varchar(64)", ChangeType: "alter"})
+	result.DatabaseType = "mysql"
+	result.LintResults = []*apitypes.LintViolationResponse{{Table: "customers", Linter: "primary_key", Severity: "warning", Message: "Primary key uses varchar"}}
+	output := captureStdout(func() { OutputPlanResult(result, "shop", "staging", ".", false) })
+	assert.Contains(t, output, "Primary key uses varchar")
+	assert.Contains(t, output, "#choosing-a-primary-key")
+	result.LintResults[0].Severity = "error"
+	output = captureStdout(func() { OutputPlanResult(result, "shop", "staging", ".", true) })
+	assert.NotContains(t, output, "#choosing-a-primary-key")
+}
+
 // Two environments plan the same table create in keyspace payments. In one the
 // engine generated the VSchema change from the DDL, and the plan shows only the
 // DDL; in the other the VSchema change has no diff and no marker, and the plan

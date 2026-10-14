@@ -1,6 +1,7 @@
 package tern
 
 import (
+	"context"
 	"errors"
 	"log/slog"
 	"testing"
@@ -169,10 +170,12 @@ func TestReconcileEngineTerminalTruth_AdoptsCompletedAndMootsCancel(t *testing.T
 		},
 		pendingReconcileRequest(321, storage.ControlOperationCancel),
 	)
+	reader := newTernMetricsReader(t)
 
 	handled, err := fx.client.reconcileEngineTerminalTruthBeforeCommands(t.Context(), fx.apply, []*storage.Task{fx.task})
 	require.NoError(t, err)
 	assert.True(t, handled)
+	assert.Equal(t, int64(-1), activeAppliesDelta(t, reader), "adopting the engine's outcome releases the apply from the active-apply gauge")
 	assert.NotNil(t, fx.engine.progressReq, "the drive must read the engine's authoritative state")
 	assert.Equal(t, 0, fx.engine.cancelCount, "the doomed cancel must never reach the engine")
 	assert.Equal(t, 0, fx.engine.stopCount)
@@ -216,6 +219,119 @@ func TestReconcileEngineTerminalTruth_AdoptsFailedAndMootsStop(t *testing.T) {
 	controlReq, err := fx.controlRequests.GetPending(t.Context(), fx.apply.ID, storage.ControlOperationStop)
 	require.NoError(t, err)
 	assert.Nil(t, controlReq)
+}
+
+// The engine's backend already completed the change, but storage refuses the
+// write adopting that outcome onto the task. The apply's outcome is recorded
+// only over task rows that carry it, so the drive returns the error with the
+// apply and the pending cancel as they were, for the next claim to reconcile
+// again, rather than recording the apply completed over a task still waiting.
+func TestReconcileEngineTerminalTruth_RefusedTaskWriteLeavesTheApplyUnsettled(t *testing.T) {
+	fx := newReconcileFixture(
+		&fakeControlEngine{
+			externallyAuthoritative: true,
+			progressResult:          &engine.ProgressResult{State: engine.StateCompleted},
+		},
+		pendingReconcileRequest(321, storage.ControlOperationCancel),
+	)
+	refused := errors.New("storage unavailable")
+	fx.storage.tasks.(*exactProgressTaskStore).updateErr = func(context.Context, *storage.Task) error { return refused }
+
+	handled, err := fx.client.reconcileEngineTerminalTruthBeforeCommands(t.Context(), fx.apply, []*storage.Task{fx.task})
+
+	require.ErrorIs(t, err, refused)
+	require.ErrorIs(t, err, ErrTaskVerdictRefused, "the operator reads this to leave an operation drive's row claimable")
+	assert.Contains(t, err.Error(), "task-reconcile", "the error names the task whose outcome did not land")
+	assert.False(t, handled)
+	assert.Equal(t, state.Task.WaitingForDeploy, fx.task.State, "the task keeps the state storage holds")
+	assert.Nil(t, fx.task.CompletedAt, "the task keeps the completion storage holds")
+	assert.Equal(t, 0, fx.task.ProgressPercent, "the task keeps the progress storage holds")
+	assert.Equal(t, state.Apply.ValidatingDeployRequest, fx.apply.State, "the apply is not recorded completed over the waiting task")
+	controlReq, err := fx.controlRequests.GetPending(t.Context(), fx.apply.ID, storage.ControlOperationCancel)
+	require.NoError(t, err)
+	assert.NotNil(t, controlReq, "the cancel stays pending for the claim that reconciles next")
+}
+
+// The engine's backend already completed the change, but the drive is
+// cancelled as it adopts that outcome onto the task and the write fails under
+// the cancelled context. The failure describes the cancellation, not a refused
+// verdict, so the reconcile returns the cancellation rather than
+// ErrTaskVerdictRefused, with the task, the apply, and the pending cancel as
+// storage holds them: the commands the outcome would moot stay pending for the
+// claim that reconciles next.
+func TestReconcileEngineTerminalTruth_CancelledDriveLeavesTheApplyUnsettled(t *testing.T) {
+	fx := newReconcileFixture(
+		&fakeControlEngine{
+			externallyAuthoritative: true,
+			progressResult:          &engine.ProgressResult{State: engine.StateCompleted},
+		},
+		pendingReconcileRequest(321, storage.ControlOperationCancel),
+	)
+	fx.storage.tasks.(*exactProgressTaskStore).updateErr = func(ctx context.Context, _ *storage.Task) error { return ctx.Err() }
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	handled, err := fx.client.reconcileEngineTerminalTruthBeforeCommands(ctx, fx.apply, []*storage.Task{fx.task})
+
+	require.ErrorIs(t, err, context.Canceled)
+	require.NotErrorIs(t, err, ErrTaskVerdictRefused, "a cancelled drive's write failure is not a refused verdict")
+	assert.False(t, handled)
+	assert.Equal(t, state.Task.WaitingForDeploy, fx.task.State, "the task keeps the state storage holds")
+	assert.Nil(t, fx.task.CompletedAt, "the task keeps the completion storage holds")
+	assert.Equal(t, state.Apply.ValidatingDeployRequest, fx.apply.State, "the apply is not recorded completed over the waiting task")
+	controlReq, err := fx.controlRequests.GetPending(t.Context(), fx.apply.ID, storage.ControlOperationCancel)
+	require.NoError(t, err)
+	assert.NotNil(t, controlReq, "the cancel stays pending for the claim that reconciles next")
+}
+
+// The engine's backend already failed a change with two tasks still waiting.
+// The first task's adopted failure lands and storage refuses the second. The
+// stored failure stays stored, but the drive returns the error before the
+// apply write, with the apply and the pending stop as they were: an operation
+// drive's row derived from this set would read failed over the task whose
+// write never landed, which is why the error carries ErrTaskVerdictRefused.
+func TestReconcileEngineTerminalTruth_PartlyAdoptedTaskSetLeavesTheApplyUnsettled(t *testing.T) {
+	fx := newReconcileFixture(
+		&fakeControlEngine{
+			externallyAuthoritative: true,
+			progressResult:          &engine.ProgressResult{State: engine.StateFailed, ErrorMessage: "engine refused the statement"},
+		},
+		pendingReconcileRequest(321, storage.ControlOperationStop),
+	)
+	second := &storage.Task{
+		ID:             655,
+		ApplyID:        fx.apply.ID,
+		TaskIdentifier: "task-reconcile-2",
+		Database:       "testdb",
+		Namespace:      "testdb",
+		DatabaseType:   storage.DatabaseTypeMySQL,
+		TableName:      "orders",
+		State:          state.Task.WaitingForDeploy,
+	}
+	tasks := fx.storage.tasks.(*exactProgressTaskStore)
+	tasks.tasks = append(tasks.tasks, second)
+	refused := errors.New("storage unavailable")
+	tasks.updateErr = func(_ context.Context, task *storage.Task) error {
+		if task.ID == second.ID {
+			return refused
+		}
+		return nil
+	}
+
+	handled, err := fx.client.reconcileEngineTerminalTruthBeforeCommands(t.Context(), fx.apply, []*storage.Task{fx.task, second})
+
+	require.ErrorIs(t, err, refused)
+	require.ErrorIs(t, err, ErrTaskVerdictRefused)
+	assert.Contains(t, err.Error(), "task-reconcile-2", "the error names the task whose outcome did not land")
+	assert.False(t, handled)
+	assert.Equal(t, state.Task.Failed, fx.task.State, "the verdict that landed stays stored")
+	assert.Equal(t, state.Task.WaitingForDeploy, second.State, "the refused task keeps the state storage holds")
+	assert.Empty(t, second.ErrorMessage, "the refused task keeps the error message storage holds")
+	assert.Nil(t, second.CompletedAt, "the refused task keeps the completion storage holds")
+	assert.Equal(t, state.Apply.ValidatingDeployRequest, fx.apply.State, "the apply is not recorded failed over the waiting task")
+	controlReq, err := fx.controlRequests.GetPending(t.Context(), fx.apply.ID, storage.ControlOperationStop)
+	require.NoError(t, err)
+	assert.NotNil(t, controlReq, "the stop stays pending for the claim that reconciles next")
 }
 
 // When the engine reports the change still live, the reconcile must step aside

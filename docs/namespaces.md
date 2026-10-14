@@ -336,15 +336,36 @@ ignore_tables:
 
 An ignored table is withheld from the planner's view of the live schema. The plan neither proposes creating it nor proposes dropping it, and an apply never touches it.
 
+### Patterns
+
+Some applications create tables at runtime, such as one queue table per configured trigger. A list of names cannot cover the next one created, so the next plan proposes dropping it. Wrap a regular expression in slashes to withhold the whole family:
+
+```yaml
+# schemabot.yaml
+database: commerce
+type: mysql
+ignore_tables:
+  - flyway_schema_history
+  - /^relay_[0-9]+_feed$/
+```
+
+- A pattern matches the **whole** table name, whether or not you write `^` and `$`. `/relay_[0-9]+_feed/` withholds `relay_7_feed`, but not `old_relay_7_feed` or `relay_7_feed_backup`. To also match a prefix or suffix, say so with `.*`.
+- Matching is case-sensitive, the same as a plain entry. Start the expression with `(?i)` to ignore case.
+- The syntax is [RE2](https://github.com/google/re2/wiki/Syntax), the regular expression syntax of Go. It has no backtracking, a pattern is at most 256 bytes, slashes included, and all of a config's patterns together are at most 1024 bytes, so no config can stall a plan. Lookarounds and backreferences are not supported.
+- A pattern that does not compile is an error naming the entry. The plan or apply fails rather than skipping the entry, because a skipped entry withholds nothing.
+- An entry is a pattern only when it starts **and** ends with `/`. Any other entry is an exact table name, so existing entries keep their meaning. Wrap a pattern in quotes if your YAML tooling needs it; the quotes are not part of the entry. A pattern cannot require a slash, so an entry such as `/var/lib/app/` is refused as a path rather than read as a pattern that matches nothing.
+- A plan records the entries as written, and an apply, resume or rollback of that plan withholds by the same patterns. A table the application creates between the plan and the apply is withheld when it matches, never dropped.
+
+Upgrade SchemaBot servers and data planes before adding a pattern. An older build refuses the pattern as a path when it reads `schemabot.yaml`. If a plan comes from an older data plane that reads the pattern as a literal table name, the server refuses that plan instead of storing a drop of the tables the pattern matches.
+
 ### Rules
 
-- Entries are bare table names. Patterns are not supported, so a set of time-partitioned tables needs one entry per table.
 - Entries are not namespace-qualified, so an entry applies to every namespace the plan covers. A name that occurs in two namespaces is withheld in both.
 - Environment substitution does **not** apply. Namespace entries substitute `{env}` or `$ENV` because namespace *directories* are environment-suffixed; table names are not.
-- Matching is exact and case-sensitive. An entry that matches no live table withholds nothing and the plan proceeds, without comment: a table that is not always on the target is the ordinary case, not a mistake. The server logs unmatched entries.
-- On the MySQL-family engines, naming one archive-shaped table (`<name>_archive_YYYY`, with an optional month and day) makes the planner read every archive table's definition on that target, whether or not the entry matches anything. That shape is what daily or monthly partition rotation produces, so on a rotating target the extra reads can be substantial. Prefer naming the table you mean.
+- A plain entry matches exactly and case-sensitively. An entry that matches no live table withholds nothing and the plan proceeds, without comment: a table that is not always on the target is the ordinary case, not a mistake. The server logs unmatched entries, patterns included.
+- On the MySQL-family engines, naming one archive-shaped table (`<name>_archive_YYYY`, with an optional month and day) makes the planner read every archive table's definition on that target, whether or not the entry matches anything. Any pattern entry does the same, since SchemaBot cannot tell before reading the catalog whether a pattern matches an archive table. That shape is what daily or monthly partition rotation produces, so on a rotating target the extra reads can be substantial. Prefer naming the table you mean.
 
-Declaring a table in a schema file *and* ignoring it is a contradiction SchemaBot refuses, at onboard time before anything is written and at plan time thereafter. The error names the entries to remove.
+Declaring a table in a schema file *and* ignoring it is a contradiction SchemaBot refuses, at onboard time before anything is written and at plan time thereafter. That includes a pattern that matches a declared table. The refusal ignores case, since some databases fold table names to lower case. Two spellings count as the same table when one lower-cases or Unicode-folds to the other, for plain entries and patterns alike, so a few non-ASCII spellings that were distinct before patterns, such as the long s `ſ` and `s`, now collide. The error names the entries to remove, and for a pattern, the declared tables it matches, so you can narrow it.
 
 ### Exclusions are disclosed
 

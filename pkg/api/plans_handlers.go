@@ -208,19 +208,21 @@ func storedPlanResponseFromStorage(plan *storage.Plan) *apitypes.StoredPlanRespo
 		PlanSummaryResponse: *planSummaryFromStorage(plan),
 		SchemaPath:          plan.SchemaPath,
 		Target:              plan.Target,
-		Plan:                planContentFromStorage(plan),
+		Plan:                PlanContentFromStorage(plan),
 	}
 }
 
-// planContentFromStorage reconstructs the POST /api/plan response shape from a
-// stored plan so both render through the same code paths. Lint results and
-// errors are not persisted with a plan, so they are always empty here.
+// PlanContentFromStorage reconstructs the POST /api/plan response shape from a
+// stored plan so both render through the same code paths. It is exported so a
+// PR command that acts on a stored plan, such as rollback confirmation, can
+// render that plan without re-planning. Lint results and errors are not
+// persisted with a plan, so they are always empty here.
 //
 // The member the plan was created against is carried as both halves of its
 // identity. Reporting the deployment alone would read as the member addressing
 // the unnamed target, which is a different member than the one the row records
 // whenever that deployment addresses a named one.
-func planContentFromStorage(plan *storage.Plan) *apitypes.PlanResponse {
+func PlanContentFromStorage(plan *storage.Plan) *apitypes.PlanResponse {
 	resp := &apitypes.PlanResponse{
 		PlanID:       plan.PlanIdentifier,
 		Database:     plan.Database,
@@ -241,10 +243,14 @@ func planContentFromStorage(plan *storage.Plan) *apitypes.PlanResponse {
 		}
 		change := &apitypes.SchemaChangeResponse{Namespace: namespace}
 		if nsData.ChangesVSchema() {
-			// The stored artifact is the desired VSchema document, not a
-			// rendered diff, so the namespace is flagged as carrying VSchema
-			// work without one.
 			change.Metadata = map[string]string{apitypes.VSchemaChangedMetadataKey: "true"}
+			// The diff recorded at plan time is the one the plan was reviewed
+			// with, so a stored plan shows it rather than only flagging the
+			// namespace. A plan recorded without one still reads as carrying
+			// VSchema work.
+			if diff := nsData.Metadata[storage.PlanMetadataVSchemaDiff]; diff != "" {
+				change.Metadata[apitypes.VSchemaDiffMetadataKey] = diff
+			}
 			if !nsData.ShowsVSchemaChange() {
 				// Carried so the stored plan renders the namespace the way
 				// the live plan did: by its DDL and finalize, with no VSchema

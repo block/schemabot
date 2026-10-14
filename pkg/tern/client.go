@@ -27,6 +27,59 @@ var ErrNoTasksForApplyOperation = errors.New("no tasks found for apply operation
 // as an engine failure.
 var ErrApplyLeasePresumedLost = errors.New("apply lease presumed lost after heartbeat failures spanning the staleness window")
 
+// ErrOperatorShutdown is the cause the operator cancels its drives with when the
+// process shuts down. A drive handing its apply back for any other reason halts
+// the engine work it started in this process before it returns; one ended by
+// shutdown leaves that to the shutdown, which halts every in-process engine
+// itself once the drives have returned.
+var ErrOperatorShutdown = errors.New("operator is shutting down")
+
+type operatorShutdownKey struct{}
+
+// NewOperatorContext returns the context an operator runs its drives under and
+// the function that shuts them down, which cancels the drives with
+// ErrOperatorShutdown. A drive's context can end for other reasons first — a
+// lost lease, a stall, a hand-back, or the operator's parent context being
+// cancelled — and then its cause never says shutdown. So the signal that
+// shutdown has begun lives on a context of its own that only shutDown ends,
+// and a drive tearing down after any earlier cancellation still sees a
+// shutdown begin and leaves the teardown to it.
+func NewOperatorContext(parent context.Context) (ctx context.Context, shutDown func()) {
+	drives, cancelDrives := context.WithCancelCause(parent)
+	shutdown, signalShutdown := context.WithCancelCause(context.WithoutCancel(parent))
+	ctx = context.WithValue(drives, operatorShutdownKey{}, shutdown)
+	return ctx, func() {
+		signalShutdown(ErrOperatorShutdown)
+		cancelDrives(ErrOperatorShutdown)
+	}
+}
+
+// operatorShuttingDown reports whether the operator running this drive has
+// begun shutting down, read from the drive's own cancellation cause and from
+// the shutdown signal NewOperatorContext attached.
+func operatorShuttingDown(ctx context.Context) bool {
+	if errors.Is(context.Cause(ctx), ErrOperatorShutdown) {
+		return true
+	}
+	shutdown, ok := ctx.Value(operatorShutdownKey{}).(context.Context)
+	return ok && errors.Is(context.Cause(shutdown), ErrOperatorShutdown)
+}
+
+// afterOperatorShutdown arranges for f to run once the operator running this
+// drive begins shutting down, and returns a function that stops the
+// arrangement. A drive with no operator shutdown signal never runs f.
+func afterOperatorShutdown(ctx context.Context, f func()) (stop func() bool) {
+	shutdown, ok := ctx.Value(operatorShutdownKey{}).(context.Context)
+	if !ok {
+		return func() bool { return true }
+	}
+	return context.AfterFunc(shutdown, func() {
+		if errors.Is(context.Cause(shutdown), ErrOperatorShutdown) {
+			f()
+		}
+	})
+}
+
 // ErrApplyOperationRowMissing is returned by ResumeApplyOperation when tasks
 // scope to the operation but the apply_operation row itself is absent. It is a
 // distinct, more accurate cause than the no-tasks case, but wraps
@@ -58,6 +111,44 @@ var ErrApplyTasksNotLoaded = errors.New("apply owns task rows the drive loader d
 // stays claimable, so the work stays visibly stuck until the row is restored or
 // an operator intervenes.
 var ErrApplyTaskRowMissing = errors.New("apply task row not found on re-read")
+
+// ErrTaskRequeueRefused is returned by a resume whose write putting a
+// failed_retryable task back to pending for a retry, or a stopped task back to
+// pending for a start, did not land. The drive exits with the task row still at
+// rest and the next claim repeats the requeue. A local drive and a gRPC drive
+// dispatching a retry exit before any engine work starts, since running the
+// task's DDL while storage records it at rest would leave work no stored state
+// accounts for. A gRPC drive requeues its stopped tasks only after the data
+// plane accepted the start, so there the remote work is already running; the
+// start request stays pending, and the next claim adopts the data plane's
+// state and retries the requeue before completing it. A retry's claim spends
+// one of the apply's recovery attempts, so that loop ends with the recovery
+// budget; a start's claim spends none, so the request stays pending until the
+// write lands. The operator counts every exit under its own resume failure
+// reason, so a requeue that keeps being refused is visible rather than one
+// warning per claim.
+var ErrTaskRequeueRefused = errors.New("task requeue refused")
+
+// ErrTaskVerdictRefused is returned by a drive whose write recording a task's
+// terminal outcome — failed, failed_retryable, cancelled behind a permanent
+// failure, or an outcome adopted from the engine — did not land. The apply's
+// outcome, and in a multi-operation drive the operation row the operator
+// derives, is read from the task rows, so the drive records nothing on top of
+// a verdict storage never took: the apply stays active and the next claim reads
+// every task as stored and settles it. Verdicts already stored for earlier
+// tasks stay stored. The operator leaves an operation whose drive returned this
+// as found, running and claimable, rather than deriving its row from a task
+// set that is only partly settled: a stored failure ahead of a refused write
+// would otherwise terminalize the operation over a task that still reads
+// active, and a terminal operation gets no next claim.
+var ErrTaskVerdictRefused = errors.New("task verdict refused")
+
+// ErrPostTerminalReconcile is matched by a drive's failure in the work an apply
+// owes after its terminal outcome is stored, such as answering the start that
+// admitted the claim. The drive has already settled the schema change and
+// nothing re-claims a settled apply, so a caller runs its post-drive settlement
+// rather than treating the drive as unfinished.
+var ErrPostTerminalReconcile = errors.New("reconcile after the stored terminal outcome failed")
 
 var (
 	// ErrPullSchemaUnsupportedType marks a pull request for a database type that

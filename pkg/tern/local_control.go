@@ -652,7 +652,7 @@ func (c *LocalClient) stopOwnedApply(ctx context.Context, req *ternv1.StopReques
 	// Cancel the apply goroutine's context so it stops iterating over tasks.
 	// Without this, executeApplySequential would continue to the next table
 	// after Spirit's runner exits, racing with the resume goroutine.
-	c.cancelApplyHandle(applyCancel)
+	c.cancelApplyHandle(applyCancel, nil)
 
 	// For Vitess/PlanetScale, stopping means cancelling the deploy request —
 	// this is permanent (not resumable). Use "cancelled" instead of "stopped".
@@ -789,11 +789,23 @@ func (c *LocalClient) cancelOwnedApply(ctx context.Context, req *ternv1.CancelRe
 		}
 		return nil, fmt.Errorf("engine cancel failed: %w", err)
 	}
-	c.cancelApplyHandle(applyCancel)
+	c.cancelApplyHandle(applyCancel, engine.ErrCancelledByOperator)
 
 	if targetApply != nil {
 		if err := c.releaseCancelledArtifacts(ctx, eng, targetApply, tasks); err != nil {
 			c.logSkippedArtifactRelease(ctx, targetApply, err)
+		}
+		// The cancel is consumed at a drive checkpoint, where no engine call
+		// holds work the drive set up, so no drive's own cleanup reclaims work
+		// recorded in stored state. The stored state is handed to the engine
+		// here, whether or not a drive handle was installed: a drive ended with
+		// the operator's cause whose engine already reclaimed the same work
+		// leaves this reclaim finding it gone, which is harmless; work neither
+		// reclaims is not. A failed reclaim never holds the cancel back; what was
+		// left behind is on the apply log.
+		if err := c.reclaimCancelledResumeState(ctx, eng, targetApply, tasks); err != nil {
+			c.logger.Warn("cancelled schema change's stored engine state could not be fully reclaimed; the apply log names what was left in place",
+				append(targetApply.LogAttrs(), "error", err)...)
 		}
 	} else {
 		c.logger.Warn("cancel resolved no apply, so any artifacts its schema change left stay on the target",
@@ -1581,8 +1593,8 @@ func (c *LocalClient) applyRevertPhaseBlock(ctx context.Context, apply *storage.
 //   - WaitingForCutover: Spirit runner alive, holding connections until cutover.
 //   - Recovering: Spirit's runner is restarted with a detached context during
 //     recovery; only eng.Stop kills it, so without this the runner keeps copying
-//     rows while storage reports stopped and a later resume blocks in Drain()
-//     behind the abandoned runner.
+//     rows while storage reports stopped and every later resume waits in
+//     DrainContext behind the abandoned runner until its drive gives up.
 //   - WaitingForDeploy: the PlanetScale deferred deploy request exists and stays
 //     startable from the PlanetScale UI until eng.Stop cancels it.
 //   - FailedRetryable: a transient failure (e.g. repeated progress-poll errors)
@@ -2024,6 +2036,7 @@ func (c *LocalClient) handleStopAllTasksTerminal(ctx context.Context, applyID in
 		if err := c.storage.Applies().Update(ctx, apply); err != nil {
 			return nil, fmt.Errorf("update apply %s to derived state %s: %w", apply.ApplyIdentifier, derivedState, err)
 		}
+		adjustActiveAppliesForTransition(ctx, apply, oldState)
 
 		c.logger.Info("stop found all tasks terminal; apply state derived from tasks",
 			"apply_id", apply.ApplyIdentifier,
@@ -2102,6 +2115,7 @@ func (c *LocalClient) settleCancelAllTasksTerminal(ctx context.Context, applyID 
 		}
 		return c.acceptCancelOverSettledApply(ctx, apply, skippedCount, caller, err)
 	}
+	adjustActiveAppliesForTransition(ctx, apply, oldState)
 
 	c.logger.Info("cancel found all tasks terminal; apply state derived from tasks",
 		append(apply.LogAttrs(), "old_state", oldState, "skipped_count", skippedCount, "requested_by", caller)...)
@@ -2150,12 +2164,14 @@ func (c *LocalClient) markApplyStopped(ctx context.Context, applyID int64) error
 		return nil
 	}
 
+	previousState := apply.State
 	apply.State = state.Apply.Stopped
 	apply.CompletedAt = nil
 	apply.UpdatedAt = time.Now()
 	if err := c.storage.Applies().Update(ctx, apply); err != nil {
 		return fmt.Errorf("mark apply %s stopped: %w", apply.ApplyIdentifier, err)
 	}
+	adjustActiveAppliesForTransition(ctx, apply, previousState)
 	return nil
 }
 
@@ -2181,12 +2197,14 @@ func (c *LocalClient) markApplyCancelled(ctx context.Context, applyID int64) err
 		return fmt.Errorf("mark apply %s cancelled: %s", apply.ApplyIdentifier, revertPhaseControlRejectionMessage(apply.ApplyIdentifier, apply.State))
 	}
 	now := time.Now()
+	previousState := apply.State
 	apply.State = state.Apply.Cancelled
 	apply.CompletedAt = &now
 	apply.UpdatedAt = now
 	if err := c.storage.Applies().Update(ctx, apply); err != nil {
 		return fmt.Errorf("mark apply %s cancelled: %w", apply.ApplyIdentifier, err)
 	}
+	adjustActiveAppliesForTransition(ctx, apply, previousState)
 	return nil
 }
 
@@ -2273,6 +2291,7 @@ func (c *LocalClient) settleControlForCompletedEngineChange(ctx context.Context,
 	if err := c.storage.Applies().Update(ctx, apply); err != nil {
 		return 0, fmt.Errorf("mark apply %s completed after %s found the schema change already completed on the engine: %w", apply.ApplyIdentifier, operation, err)
 	}
+	adjustActiveAppliesForTransition(ctx, apply, previousState)
 	c.logger.Warn("engine rejected "+operation+" because the schema change already completed; apply settled as completed",
 		append(apply.LogAttrs(), "requested_by", caller, "previous_state", previousState, "error", rejection)...)
 	eventMsg := fmt.Sprintf("%s arrived after the schema change completed on the engine; apply recorded as completed (%d tasks completed, %d already terminal)",
