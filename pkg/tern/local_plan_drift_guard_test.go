@@ -153,6 +153,7 @@ func TestDriftGuard_NoWithheldRecordStillSeesTheWholeSchema(t *testing.T) {
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "local schema has drifted from the reviewed plan")
+	assert.False(t, engine.IsRetryable(err), "a redispatch carries the same reviewed DDL against the same drifted schema")
 	assert.Contains(t, err.Error(), bookkeepingTable)
 	assert.Empty(t, shown, "nothing was withheld, so the re-plan is shown no exclusions")
 }
@@ -196,6 +197,7 @@ func TestDriftGuard_MissingReviewedChangeFailsClosed(t *testing.T) {
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "drifted")
+	assert.False(t, engine.IsRetryable(err), "a redispatch carries the same reviewed DDL against the same drifted schema")
 	assert.Contains(t, err.Error(), "re-plan against the current live schema", "the error must tell a blocked operator how to recover")
 	assert.Nil(t, store.created, "must not materialize a drifted plan")
 }
@@ -215,6 +217,7 @@ func TestDriftGuard_UnexpectedLocalChangeFailsClosed(t *testing.T) {
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "drifted")
+	assert.False(t, engine.IsRetryable(err), "a redispatch carries the same reviewed DDL against the same drifted schema")
 }
 
 // Different DDL for the same table/operation is drift even though the
@@ -232,6 +235,7 @@ func TestDriftGuard_DifferentDDLSameTableFailsClosed(t *testing.T) {
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "drifted")
+	assert.False(t, engine.IsRetryable(err), "a redispatch carries the same reviewed DDL against the same drifted schema")
 }
 
 // A shard-scoped apply is drift-checked against this deployment's re-plan
@@ -271,6 +275,7 @@ func TestDriftGuard_ShardScopedWrongShardFailsClosed(t *testing.T) {
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "drifted")
+	assert.False(t, engine.IsRetryable(err), "a redispatch carries the same reviewed DDL against the same drifted schema")
 	assert.Nil(t, store.created, "must not materialize a drifted shard plan")
 }
 
