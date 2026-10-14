@@ -91,6 +91,7 @@ func retryRepeatsChecksumVerdict(err error) bool {
 // classifyRunnerError already treats as permanent.
 var rowDataErrorCodes = []uint16{
 	1048, // ER_BAD_NULL_ERROR: a NULL in a column the change makes NOT NULL.
+	1264, // ER_WARN_DATA_OUT_OF_RANGE: a value outside the range of a narrowed numeric type.
 	1265, // WARN_DATA_TRUNCATED: a value the new type or length can only store truncated.
 	1366, // ER_TRUNCATED_WRONG_VALUE_FOR_FIELD: a value the new type or character set cannot represent.
 	1406, // ER_DATA_TOO_LONG: a value longer than the new column allows.

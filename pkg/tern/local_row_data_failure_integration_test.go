@@ -16,22 +16,48 @@ import (
 	"github.com/block/schemabot/pkg/state"
 )
 
-// An apply that makes a column NOT NULL while an existing row holds NULL in it
-// can never succeed as planned: every copy attempt writes the same NULL row into
-// the same definition. The first attempt must fail the apply permanently, with
-// the operator-facing reason naming the NULL, rather than pausing it as
-// failed_retryable for a recovery budget that would restart the copy from zero
-// on each attempt and fail identically. A single drive settles the apply, so a
-// retryable pause would be observable here as failed_retryable.
+// An apply whose copy cannot store an existing row under the new definition can
+// never succeed as planned: every copy attempt writes the same row into the
+// same definition. Making a column NOT NULL while a row holds NULL, or
+// narrowing a column below a value a row holds, are two such changes. The first
+// attempt must fail the apply permanently, with the operator-facing reason
+// naming the row's problem, rather than pausing it as failed_retryable for a
+// recovery budget that would restart the copy from zero on each attempt and
+// fail identically. A single drive settles the apply, so a retryable pause
+// would be observable here as failed_retryable.
 func TestLocalClient_Apply_RowDataFailureIsPermanent(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping integration test in short mode")
 	}
 
+	cases := []struct {
+		name      string
+		seed      string // the rows, one of which the new definition cannot store
+		target    string // the declared CREATE TABLE the plan converges to
+		badRows   string // counts the rows the new definition cannot store
+		reason    string // the operator-facing reason the failed task carries
+		errorCode string
+	}{
+		{
+			name:      "NULL into a column made NOT NULL",
+			seed:      "INSERT INTO `row_data_failure` (`id`, `amount`) VALUES (1, 10), (2, NULL), (3, 30)",
+			target:    "CREATE TABLE `row_data_failure` (`id` INT NOT NULL, `amount` BIGINT NOT NULL, PRIMARY KEY (`id`))",
+			badRows:   "SELECT COUNT(*) FROM `row_data_failure` WHERE `amount` IS NULL",
+			reason:    "A row held NULL in a column that cannot be null",
+			errorCode: "(error 1048)",
+		},
+		{
+			name:      "value out of range for a narrowed column",
+			seed:      "INSERT INTO `row_data_failure` (`id`, `amount`) VALUES (1, 10), (2, 1000), (3, 30)",
+			target:    "CREATE TABLE `row_data_failure` (`id` INT NOT NULL, `amount` TINYINT NULL, PRIMARY KEY (`id`))",
+			badRows:   "SELECT COUNT(*) FROM `row_data_failure` WHERE `amount` = 1000",
+			reason:    "An existing value is out of range for the column's target type",
+			errorCode: "(error 1264)",
+		},
+	}
+
 	_, dsn := setupMySQLContainer(t)
 	setupStorageSchema(t, dsn)
-	cleanupTasks(t, dsn)
-	cleanupTestTables(t, dsn)
 
 	ctx := t.Context()
 	db, err := sql.Open("block-mysql", dsn)
@@ -39,64 +65,68 @@ func TestLocalClient_Apply_RowDataFailureIsPermanent(t *testing.T) {
 	defer utils.CloseAndLog(db)
 	require.NoError(t, db.PingContext(ctx), "ping target database")
 
-	dropRowDataFailureTables(t, db)
-	_, err = db.ExecContext(ctx, "CREATE TABLE `row_data_failure` (`id` INT NOT NULL, `amount` BIGINT NULL, PRIMARY KEY (`id`))")
-	require.NoError(t, err, "create row_data_failure")
-	_, err = db.ExecContext(ctx, "INSERT INTO `row_data_failure` (`id`, `amount`) VALUES (1, 10), (2, NULL), (3, 30)")
-	require.NoError(t, err, "seed row_data_failure with a NULL amount")
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cleanupTasks(t, dsn)
+			cleanupTestTables(t, dsn)
+			dropRowDataFailureTables(t, db)
+			defer dropRowDataFailureTables(t, db)
 
-	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
-	stor := createStorage(t, dsn)
-	client, err := NewLocalClient(LocalConfig{
-		Database:  "testdb",
-		Type:      "mysql",
-		TargetDSN: dsn,
-	}, stor, logger)
-	require.NoError(t, err, "create local client")
-	defer utils.CloseAndLog(client)
+			_, err := db.ExecContext(ctx, "CREATE TABLE `row_data_failure` (`id` INT NOT NULL, `amount` BIGINT NULL, PRIMARY KEY (`id`))")
+			require.NoError(t, err, "create row_data_failure")
+			_, err = db.ExecContext(ctx, tc.seed)
+			require.NoError(t, err, "seed row_data_failure")
 
-	planResp, err := client.Plan(ctx, &ternv1.PlanRequest{
-		Type:     "mysql",
-		Database: "testdb",
-		SchemaFiles: map[string]*ternv1.SchemaFiles{
-			"testdb": {Files: buildSchemaWithAllTables(t, dsn, map[string]string{
-				"row_data_failure": "CREATE TABLE `row_data_failure` (`id` INT NOT NULL, `amount` BIGINT NOT NULL, PRIMARY KEY (`id`))",
-			})},
-		},
-	})
-	require.NoError(t, err, "plan NOT NULL change")
-	require.NotEmpty(t, planResp.PlanId, "plan id")
+			logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+			stor := createStorage(t, dsn)
+			client, err := NewLocalClient(LocalConfig{
+				Database:  "testdb",
+				Type:      "mysql",
+				TargetDSN: dsn,
+			}, stor, logger)
+			require.NoError(t, err, "create local client")
+			defer utils.CloseAndLog(client)
 
-	applyResp, err := client.Apply(ctx, &ternv1.ApplyRequest{
-		PlanId:      planResp.PlanId,
-		Environment: localClientTestEnvironment,
-	})
-	require.NoError(t, err, "apply NOT NULL change")
-	require.True(t, applyResp.Accepted, "apply should be accepted: %s", applyResp.ErrorMessage)
+			planResp, err := client.Plan(ctx, &ternv1.PlanRequest{
+				Type:     "mysql",
+				Database: "testdb",
+				SchemaFiles: map[string]*ternv1.SchemaFiles{
+					"testdb": {Files: buildSchemaWithAllTables(t, dsn, map[string]string{"row_data_failure": tc.target})},
+				},
+			})
+			require.NoError(t, err, "plan the change")
+			require.NotEmpty(t, planResp.PlanId, "plan id")
 
-	driveQueuedApply(t, stor, client, applyResp.ApplyId)
+			applyResp, err := client.Apply(ctx, &ternv1.ApplyRequest{
+				PlanId:      planResp.PlanId,
+				Environment: localClientTestEnvironment,
+			})
+			require.NoError(t, err, "apply the change")
+			require.True(t, applyResp.Accepted, "apply should be accepted: %s", applyResp.ErrorMessage)
 
-	apply, err := stor.Applies().GetByApplyIdentifier(ctx, applyResp.ApplyId)
-	require.NoError(t, err, "load apply")
-	require.NotNil(t, apply, "apply %s", applyResp.ApplyId)
-	assert.Equal(t, state.Apply.Failed, apply.State)
-	assert.Zero(t, apply.Attempt, "a permanent failure spends no recovery attempt")
-	assert.Contains(t, apply.ErrorMessage, "(error 1048)")
+			driveQueuedApply(t, stor, client, applyResp.ApplyId)
 
-	tasks, err := stor.Tasks().GetByApplyID(ctx, apply.ID)
-	require.NoError(t, err, "load tasks")
-	require.Len(t, tasks, 1)
-	assert.Equal(t, "row_data_failure", tasks[0].TableName)
-	assert.Equal(t, state.Task.Failed, tasks[0].State)
-	assert.Zero(t, tasks[0].Attempt, "a permanent failure spends no recovery attempt")
-	assert.Contains(t, tasks[0].ErrorMessage, "A row held NULL in a column that cannot be null")
-	assert.Contains(t, tasks[0].ErrorMessage, "(error 1048)")
+			apply, err := stor.Applies().GetByApplyIdentifier(ctx, applyResp.ApplyId)
+			require.NoError(t, err, "load apply")
+			require.NotNil(t, apply, "apply %s", applyResp.ApplyId)
+			assert.Equal(t, state.Apply.Failed, apply.State)
+			assert.Zero(t, apply.Attempt, "a permanent failure spends no recovery attempt")
+			assert.Contains(t, apply.ErrorMessage, tc.errorCode)
 
-	var nullRows int
-	require.NoError(t, db.QueryRowContext(ctx, "SELECT COUNT(*) FROM `row_data_failure` WHERE `amount` IS NULL").Scan(&nullRows), "count NULL amounts")
-	assert.Equal(t, 1, nullRows, "the failed change leaves the table's data untouched")
+			tasks, err := stor.Tasks().GetByApplyID(ctx, apply.ID)
+			require.NoError(t, err, "load tasks")
+			require.Len(t, tasks, 1)
+			assert.Equal(t, "row_data_failure", tasks[0].TableName)
+			assert.Equal(t, state.Task.Failed, tasks[0].State)
+			assert.Zero(t, tasks[0].Attempt, "a permanent failure spends no recovery attempt")
+			assert.Contains(t, tasks[0].ErrorMessage, tc.reason)
+			assert.Contains(t, tasks[0].ErrorMessage, tc.errorCode)
 
-	dropRowDataFailureTables(t, db)
+			var badRows int
+			require.NoError(t, db.QueryRowContext(ctx, tc.badRows).Scan(&badRows), "count the rows the new definition cannot store")
+			assert.Equal(t, 1, badRows, "the failed change leaves the table's data untouched")
+		})
+	}
 }
 
 // dropRowDataFailureTables removes the test table and the shadow and checkpoint

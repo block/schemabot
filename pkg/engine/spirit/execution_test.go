@@ -124,6 +124,7 @@ func TestClassifyRunnerErrorRowData(t *testing.T) {
 		err  error
 	}{
 		{"NULL into a NOT NULL column", copyWarningError(1048, "Column 'c' cannot be null")},
+		{"value out of range for the new type", copyWarningError(1264, "Out of range value for column 'amount' at row 1")},
 		{"value truncated by the new type", copyWarningError(1265, "Data truncated for column 'status' at row 1")},
 		{"value the new type cannot represent", copyWarningError(1366, "Incorrect integer value: 'abc' for column 'n' at row 1")},
 		{"value longer than the new column", copyWarningError(1406, "Data too long for column 'name' at row 1")},
