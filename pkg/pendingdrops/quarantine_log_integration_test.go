@@ -3,6 +3,7 @@
 package pendingdrops
 
 import (
+	"bytes"
 	"database/sql"
 	"testing"
 	"time"
@@ -53,11 +54,77 @@ func TestQuarantineLogAnswersForTheApplyThatAsks(t *testing.T) {
 	assert.Empty(t, recordedNames(t, db, "apply-a", "Orders"), "source names compare exactly")
 }
 
+// An apply that could not tell whether its records landed writes them again
+// and ends with one record per copy. A copy already recorded for another apply,
+// or for another source table, is refused rather than overwritten, and the
+// record it already has is kept.
+func TestQuarantineLogAcceptsARepeatAndRefusesAnotherOwner(t *testing.T) {
+	db := setupCleanerTest(t)
+	now := time.Now()
+	moved, err := Destinations([]TableMove{
+		{SchemaName: "testdb", TableName: "orders"},
+		{SchemaName: "testdb", TableName: "customers"},
+	}, now)
+	require.NoError(t, err)
+
+	require.NoError(t, RecordQuarantines(t.Context(), db, "apply-a", moved, now))
+	require.NoError(t, RecordQuarantines(t.Context(), db, "apply-a", moved, now))
+	assert.Equal(t, []string{moved[0].QuarantineTable}, recordedNames(t, db, "apply-a", "orders"))
+	assert.Equal(t, []string{moved[1].QuarantineTable}, recordedNames(t, db, "apply-a", "customers"))
+
+	err = RecordQuarantines(t.Context(), db, "apply-b", moved, now)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), moved[0].QuarantineTable)
+	assert.Contains(t, err.Error(), "apply-a")
+	assert.Empty(t, recordedNames(t, db, "apply-b", "orders"))
+
+	otherSource := []QuarantinedTable{{SchemaName: "testdb", TableName: "invoices", QuarantineSchema: Database, QuarantineTable: moved[0].QuarantineTable}}
+	err = RecordQuarantines(t.Context(), db, "apply-a", otherSource, now)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "testdb.orders")
+	assert.Empty(t, recordedNames(t, db, "apply-a", "invoices"))
+	assert.Equal(t, []string{moved[0].QuarantineTable}, recordedNames(t, db, "apply-a", "orders"), "the existing record is untouched")
+}
+
+// A quarantine log the cleaner cannot read fails the pass under its own
+// reason, after the expired copies have still been dropped. When a drop fails
+// in the same pass, the error names both failures, so neither is hidden
+// behind the other.
+func TestCleaner_ReportsAQuarantineLogItCannotRead(t *testing.T) {
+	old := time.Now().Add(-8 * 24 * time.Hour)
+
+	t.Run("the log alone", func(t *testing.T) {
+		db := setupCleanerTest(t)
+		expired := createQuarantinedTable(t, db, "old_orders", old)
+		breakQuarantineLog(t, db)
+		reader := newManualMetricReader(t)
+
+		err := testCleaner(t, DefaultRetention, false).Run(t.Context())
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), LogTable)
+		assert.Equal(t, map[string]string{"testdb": "log_error"}, cleanupErrorReasonsByDatabase(t, reader))
+		assert.NotContains(t, quarantinedTables(t, db), expired, "the copies are still dropped")
+	})
+
+	t.Run("with a copy that cannot be dropped", func(t *testing.T) {
+		db := setupCleanerTest(t)
+		expired := createUndroppableQuarantinedTable(t, db, "parent_table", old)
+		breakQuarantineLog(t, db)
+
+		err := testCleaner(t, DefaultRetention, false).Run(t.Context())
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "drop expired pending drops tables")
+		assert.Contains(t, err.Error(), "prune "+Database+"."+LogTable)
+		assert.Contains(t, quarantinedTables(t, db), expired)
+	})
+}
+
 // The quarantine log lives in the pending drops database beside the copies it
 // describes. The cleaner never drops it or reports it unparseable, deletes the
 // record of a copy once that copy is gone and past retention, whether the
 // cleaner dropped it or its RENAME never landed, and keeps every record whose
-// copy still exists or is still within retention. A dry run deletes nothing.
+// copy still exists or is still within retention. A dry run deletes nothing
+// and reports the records a live pass would delete.
 func TestCleaner_KeepsTheQuarantineLogInStepWithTheCopies(t *testing.T) {
 	now := time.Now()
 	old := now.Add(-8 * 24 * time.Hour)
@@ -103,8 +170,12 @@ func TestCleaner_KeepsTheQuarantineLogInStepWithTheCopies(t *testing.T) {
 
 	t.Run("a dry run", func(t *testing.T) {
 		db, names := seed(t)
-		require.NoError(t, testCleaner(t, DefaultRetention, true).Run(t.Context()))
+		var logs bytes.Buffer
+		require.NoError(t, testCleanerLoggingTo(t, &logs, DefaultRetention, true).Run(t.Context()))
 
 		assert.ElementsMatch(t, []string{names["expired copy"], names["fresh copy"], names["expired, no copy"], names["fresh, no copy yet"]}, logged(t, db))
+		assert.Contains(t, logs.String(), "would_prune_log_records=1")
+		assert.Contains(t, logs.String(), "quarantine_table="+names["expired, no copy"], "the record a live pass would delete is named")
+		assert.NotContains(t, logs.String(), "quarantine_table="+names["expired copy"], "a copy a dry run leaves in place keeps its record")
 	})
 }

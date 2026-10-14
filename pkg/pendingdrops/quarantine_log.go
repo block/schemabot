@@ -37,6 +37,12 @@ const createLogTableSQL = "CREATE TABLE IF NOT EXISTS `" + Database + "`.`" + Lo
 // success would leave that copy unexplained. A record whose RENAME never landed
 // names a copy that does not exist, which every reader checks for, and the
 // cleaner removes it once the copy's retention has passed.
+//
+// Recording the same destinations again is accepted when each existing record
+// names the same apply and source, so a caller that retries after an ambiguous
+// failure converges on one record per copy. A destination already recorded for
+// another apply or another source is refused: two moves must not claim one
+// copy.
 func RecordQuarantines(ctx context.Context, db *sql.DB, applyIdentifier string, moved []QuarantinedTable, now time.Time) error {
 	if applyIdentifier == "" {
 		return errors.New("record quarantines: apply identifier is required")
@@ -53,12 +59,41 @@ func RecordQuarantines(ctx context.Context, db *sql.DB, applyIdentifier string, 
 	insert := "INSERT INTO `" + Database + "`.`" + LogTable + "` " +
 		"(quarantine_table, source_schema, source_table, apply_identifier, quarantined_at) VALUES (?, ?, ?, ?, ?)"
 	for _, table := range moved {
+		recorded, err := recordMatchesMove(ctx, db, table, applyIdentifier)
+		if err != nil {
+			return err
+		}
+		if recorded {
+			continue
+		}
 		if _, err := db.ExecContext(ctx, insert, table.QuarantineTable, table.SchemaName, table.TableName, applyIdentifier, now.UTC()); err != nil {
 			return fmt.Errorf("record quarantine of %s.%s as %s for apply %s: %w",
 				table.SchemaName, table.TableName, table.QuarantineTable, applyIdentifier, err)
 		}
 	}
 	return nil
+}
+
+// recordMatchesMove reports whether the log already records table's
+// destination for the same apply and source. It returns an error when the
+// destination is recorded for a different apply or source.
+func recordMatchesMove(ctx context.Context, db *sql.DB, table QuarantinedTable, applyIdentifier string) (bool, error) {
+	var recordedSchema, recordedTable, recordedApply string
+	err := db.QueryRowContext(ctx,
+		"SELECT source_schema, source_table, apply_identifier FROM `"+Database+"`.`"+LogTable+"` WHERE quarantine_table = ?",
+		table.QuarantineTable).Scan(&recordedSchema, &recordedTable, &recordedApply)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("read quarantine log record of %s: %w", table.QuarantineTable, err)
+	}
+	if recordedSchema != table.SchemaName || recordedTable != table.TableName || recordedApply != applyIdentifier {
+		return false, fmt.Errorf("record quarantine of %s.%s as %s for apply %s: %s is already recorded as the quarantine of %s.%s by apply %s",
+			table.SchemaName, table.TableName, table.QuarantineTable, applyIdentifier,
+			table.QuarantineTable, recordedSchema, recordedTable, recordedApply)
+	}
+	return true, nil
 }
 
 // RecordedQuarantines returns every quarantine the apply named applyIdentifier

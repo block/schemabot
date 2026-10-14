@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -253,36 +254,49 @@ func (c *Cleaner) cleanTarget(ctx context.Context, target Target) error {
 		"dry_run", c.dryRun,
 		"kept", kept,
 		"skipped_unparseable", skipped,
-		"pruned_log_records", prunedRecords,
 	}
 	if c.dryRun {
-		attrs = append(attrs, "would_drop", wouldDrop)
+		attrs = append(attrs, "would_drop", wouldDrop, "would_prune_log_records", prunedRecords)
 	} else {
-		attrs = append(attrs, "dropped", dropped)
+		attrs = append(attrs, "dropped", dropped, "pruned_log_records", prunedRecords)
 	}
 	c.logger.Info("pending drops cleanup pass complete", attrs...)
+
+	// Both causes are kept: a pass that could neither drop a copy nor read
+	// the log has two things for an operator to look at.
+	var errs []error
 	if dropErr != nil {
-		return fmt.Errorf("drop expired pending drops tables on %s/%s: %w", target.Database, target.Environment, dropErr)
+		errs = append(errs, fmt.Errorf("drop expired pending drops tables on %s/%s: %w", target.Database, target.Environment, dropErr))
 	}
 	if logErr != nil {
-		return fmt.Errorf("prune %s.%s on %s/%s: %w", Database, LogTable, target.Database, target.Environment, logErr)
+		errs = append(errs, fmt.Errorf("prune %s.%s on %s/%s: %w", Database, LogTable, target.Database, target.Environment, logErr))
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 // pruneQuarantineLog deletes the quarantine log records of copies past
 // retention that no longer exist: copies this or an earlier pass dropped, and
 // copies whose RENAME never landed. remaining lists the pending drops tables
-// still present after this pass. A dry run deletes nothing, and a target with
-// no log has nothing to prune.
+// still present after this pass. A dry run reports how many records it would
+// delete and deletes none, and a target with no log has nothing to prune.
 func (c *Cleaner) pruneQuarantineLog(ctx context.Context, conn *sql.Conn, target Target, hasLog bool, remaining []string, cutoff time.Time) (int, error) {
-	if !hasLog || c.dryRun {
+	if !hasLog {
 		return 0, nil
 	}
 	expired, err := expiredLogRecords(ctx, conn, remaining, cutoff)
 	if err != nil {
 		metrics.RecordPendingDropsCleanupError(ctx, target.Database, target.Environment, "log_error")
 		return 0, err
+	}
+	if c.dryRun {
+		for _, name := range expired {
+			c.logger.Info("pending drops cleanup dry run: quarantine log record of a copy that is gone would be deleted",
+				"database", target.Database,
+				"environment", target.Environment,
+				"quarantine_table", name,
+			)
+		}
+		return len(expired), nil
 	}
 	deleteSQL := "DELETE FROM `" + Database + "`.`" + LogTable + "` WHERE quarantine_table = ?"
 	pruned := 0
