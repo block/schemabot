@@ -66,7 +66,7 @@ func TestRecoverApplyPendingStopReleasesBusySlotOnInvalidLease(t *testing.T) {
 
 	consumed := svc.recoverApplyPendingStop(t.Context(), 1, driverLeaseOwner(1))
 
-	assert.True(t, consumed, "a claimed apply consumes the tick even when its lease is invalid")
+	assert.Equal(t, claimSpent, consumed, "a claimed apply consumes the tick even when its lease is invalid")
 	assert.Equal(t, int64(0), gaugeValue(t, reader, "schemabot.operator.drivers_busy"),
 		"the busy slot must be released when the claim exits without driving")
 }
