@@ -2952,6 +2952,32 @@ var retryableExpirySweep = strandedSweep{
 	subject:  "expired retryable applies",
 }
 
+// branchReconcileLockName elects the one instance that reconciles engine
+// branches each pass. The pass lists every PlanetScale database this process
+// executes against, so there is nothing to scope it to.
+const branchReconcileLockName = "schemabot_branch_reconcile"
+
+// branchReconcileSweep identifies the branch reconcile pass to the shared
+// election.
+var branchReconcileSweep = strandedSweep{
+	lockName: branchReconcileLockName,
+	busy:     storage.ErrBranchReconcileBusy,
+	subject:  "engine branches",
+}
+
+// WithBranchReconcileElection runs fn on the elected instance, holding the
+// lock until fn returns. See storage.ApplyStore for the contract.
+func (s *applyStore) WithBranchReconcileElection(ctx context.Context, fn func(context.Context) error) error {
+	if fn == nil {
+		return fmt.Errorf("work function is required to reconcile engine branches under election")
+	}
+	_, err := reapUnderElection(ctx, s.db, s.locker, branchReconcileSweep,
+		func(ctx context.Context) ([]struct{}, error) {
+			return nil, fn(ctx)
+		})
+	return err
+}
+
 // ExpireRetryable elects one instance per pass and expires under the lock. See
 // storage.ApplyStore for the contract.
 func (s *applyStore) ExpireRetryable(ctx context.Context, limit int) ([]*storage.RetryableApplyExpiration, error) {

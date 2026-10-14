@@ -1129,7 +1129,11 @@ reclaim what a schema change SchemaBot did not start could own
 `pkg/engine/planetscale/branch_cleanup.go`); and the cancel's reclaim of a
 cancelled apply's stored engine state, which runs only on the driver consuming
 the cancel and under a deadline inside the claim's staleness window
-(`pkg/tern/local_cancelled_resume_state.go`).
+(`pkg/tern/local_cancelled_resume_state.go`); and the branch reconcile pass,
+which runs only on the instance elected for it and deletes only a SchemaBot
+branch that no in-progress apply names
+(`WithBranchReconcileElection`, `pkg/api/branch_reconcile.go`,
+`pkg/tern/branch_reconcile.go`).
 
 ## Control operations (CO)
 
