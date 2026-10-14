@@ -6,6 +6,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"io"
 	"log"
 	"log/slog"
 	"os"
@@ -105,9 +106,48 @@ func quarantinedTables(t *testing.T, db *sql.DB) []string {
 
 func testCleaner(t *testing.T, retention time.Duration, dryRun bool) *Cleaner {
 	t.Helper()
-	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	return testCleanerLoggingTo(t, os.Stdout, retention, dryRun)
+}
+
+// testCleanerLoggingTo builds a cleaner over the shared target whose logs go
+// to logs, for tests that assert on what a pass reports.
+func testCleanerLoggingTo(t *testing.T, logs io.Writer, retention time.Duration, dryRun bool) *Cleaner {
+	t.Helper()
+	logger := slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	targets := []Target{{Database: "testdb", Environment: "staging", DSN: sharedDSN, Locker: namedlock.MySQL{}}}
 	return NewCleaner(targets, retention, dryRun, logger)
+}
+
+// breakQuarantineLog replaces the quarantine log with a view over a base table
+// that no longer exists, so the log is listed but cannot be read.
+func breakQuarantineLog(t *testing.T, db *sql.DB) {
+	t.Helper()
+	for _, stmt := range []string{
+		fmt.Sprintf("CREATE DATABASE IF NOT EXISTS `%s`", Database),
+		fmt.Sprintf("DROP TABLE IF EXISTS `%s`.`%s`", Database, LogTable),
+		fmt.Sprintf("CREATE TABLE `%s`.`log_base` (quarantine_table varchar(64) NOT NULL)", Database),
+		fmt.Sprintf("CREATE VIEW `%s`.`%s` AS SELECT quarantine_table FROM `%s`.`log_base`", Database, LogTable, Database),
+		fmt.Sprintf("DROP TABLE `%s`.`log_base`", Database),
+	} {
+		_, err := db.ExecContext(t.Context(), stmt)
+		require.NoError(t, err, stmt)
+	}
+}
+
+// createUndroppableQuarantinedTable creates an expired copy that a child table
+// references, so the cleaner's DROP of it fails.
+func createUndroppableQuarantinedTable(t *testing.T, db *sql.DB, table string, quarantinedAt time.Time) string {
+	t.Helper()
+	expired := createQuarantinedTable(t, db, table, quarantinedAt)
+	_, err := db.ExecContext(t.Context(), fmt.Sprintf("ALTER TABLE `%s`.`%s` ADD PRIMARY KEY (id)", Database, expired))
+	require.NoError(t, err, "add parent primary key")
+	_, err = db.ExecContext(t.Context(), fmt.Sprintf("CREATE TABLE `%s`.`child_table` (id INT PRIMARY KEY, parent_id INT, CONSTRAINT fk_pending_parent FOREIGN KEY (parent_id) REFERENCES `%s`.`%s` (id))", Database, Database, expired))
+	require.NoError(t, err, "create referencing child table")
+	t.Cleanup(func() {
+		_, cleanupErr := db.ExecContext(context.WithoutCancel(t.Context()), fmt.Sprintf("DROP TABLE IF EXISTS `%s`.`child_table`", Database))
+		require.NoError(t, cleanupErr, "drop child table")
+	})
+	return expired
 }
 
 // The cleaner drops quarantined tables older than the retention period and
@@ -195,18 +235,10 @@ func TestCleaner_DropFailureReturnsError(t *testing.T) {
 	db := setupCleanerTest(t)
 
 	quarantinedAt := time.Now().Add(-8 * 24 * time.Hour)
-	expired := createQuarantinedTable(t, db, "parent_table", quarantinedAt)
+	expired := createUndroppableQuarantinedTable(t, db, "parent_table", quarantinedAt)
 	require.NoError(t, RecordQuarantines(t.Context(), db, "apply-a", []QuarantinedTable{
 		{SchemaName: "testdb", TableName: "parent_table", QuarantineSchema: Database, QuarantineTable: expired},
 	}, quarantinedAt))
-	_, err := db.ExecContext(t.Context(), fmt.Sprintf("ALTER TABLE `%s`.`%s` ADD PRIMARY KEY (id)", Database, expired))
-	require.NoError(t, err, "add parent primary key")
-	_, err = db.ExecContext(t.Context(), fmt.Sprintf("CREATE TABLE `%s`.`child_table` (id INT PRIMARY KEY, parent_id INT, CONSTRAINT fk_pending_parent FOREIGN KEY (parent_id) REFERENCES `%s`.`%s` (id))", Database, Database, expired))
-	require.NoError(t, err, "create referencing child table")
-	t.Cleanup(func() {
-		_, cleanupErr := db.ExecContext(context.WithoutCancel(t.Context()), fmt.Sprintf("DROP TABLE IF EXISTS `%s`.`child_table`", Database))
-		require.NoError(t, cleanupErr, "drop child table")
-	})
 
 	cleaner := testCleaner(t, DefaultRetention, false)
 	require.Error(t, cleaner.Run(t.Context()))

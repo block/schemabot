@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/block/spirit/pkg/utils"
@@ -25,7 +26,7 @@ const createLogTableSQL = "CREATE TABLE IF NOT EXISTS `" + Database + "`.`" + Lo
 	"`quarantined_at` datetime(3) NOT NULL, " +
 	"PRIMARY KEY (`quarantine_table`), " +
 	"KEY `idx_apply_source` (`apply_identifier`, `source_schema`, `source_table`)" +
-	") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
+	") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
 
 // RecordQuarantines records in the target's quarantine log that the apply named
 // applyIdentifier is moving each table in moved into pending drops. It creates
@@ -36,6 +37,12 @@ const createLogTableSQL = "CREATE TABLE IF NOT EXISTS `" + Database + "`.`" + Lo
 // success would leave that copy unexplained. A record whose RENAME never landed
 // names a copy that does not exist, which every reader checks for, and the
 // cleaner removes it once the copy's retention has passed.
+//
+// Recording the same destinations again is accepted when each existing record
+// names the same apply and source, so a caller that retries after an ambiguous
+// failure converges on one record per copy. A destination already recorded for
+// another apply or another source is refused: two moves must not claim one
+// copy.
 func RecordQuarantines(ctx context.Context, db *sql.DB, applyIdentifier string, moved []QuarantinedTable, now time.Time) error {
 	if applyIdentifier == "" {
 		return errors.New("record quarantines: apply identifier is required")
@@ -52,12 +59,41 @@ func RecordQuarantines(ctx context.Context, db *sql.DB, applyIdentifier string, 
 	insert := "INSERT INTO `" + Database + "`.`" + LogTable + "` " +
 		"(quarantine_table, source_schema, source_table, apply_identifier, quarantined_at) VALUES (?, ?, ?, ?, ?)"
 	for _, table := range moved {
+		recorded, err := recordMatchesMove(ctx, db, table, applyIdentifier)
+		if err != nil {
+			return err
+		}
+		if recorded {
+			continue
+		}
 		if _, err := db.ExecContext(ctx, insert, table.QuarantineTable, table.SchemaName, table.TableName, applyIdentifier, now.UTC()); err != nil {
 			return fmt.Errorf("record quarantine of %s.%s as %s for apply %s: %w",
 				table.SchemaName, table.TableName, table.QuarantineTable, applyIdentifier, err)
 		}
 	}
 	return nil
+}
+
+// recordMatchesMove reports whether the log already records table's
+// destination for the same apply and source. It returns an error when the
+// destination is recorded for a different apply or source.
+func recordMatchesMove(ctx context.Context, db *sql.DB, table QuarantinedTable, applyIdentifier string) (bool, error) {
+	var recordedSchema, recordedTable, recordedApply string
+	err := db.QueryRowContext(ctx,
+		"SELECT source_schema, source_table, apply_identifier FROM `"+Database+"`.`"+LogTable+"` WHERE quarantine_table = ?",
+		table.QuarantineTable).Scan(&recordedSchema, &recordedTable, &recordedApply)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("read quarantine log record of %s: %w", table.QuarantineTable, err)
+	}
+	if recordedSchema != table.SchemaName || recordedTable != table.TableName || recordedApply != applyIdentifier {
+		return false, fmt.Errorf("record quarantine of %s.%s as %s for apply %s: %s is already recorded as the quarantine of %s.%s by apply %s",
+			table.SchemaName, table.TableName, table.QuarantineTable, applyIdentifier,
+			table.QuarantineTable, recordedSchema, recordedTable, recordedApply)
+	}
+	return true, nil
 }
 
 // RecordedQuarantines returns every quarantine the apply named applyIdentifier
@@ -106,37 +142,52 @@ func logTableExists(ctx context.Context, db *sql.DB) (bool, error) {
 	return count > 0, nil
 }
 
-// expiredLogRecords returns the log records the cleaner may delete: records of
-// copies past retention that no longer exist, either because a pass dropped
-// them or because their RENAME never landed. A record of a copy that still
-// exists stays until the copy is dropped.
+// expiredLogRecords returns the log records the cleaner may delete, given the
+// pending drops tables still present after the pass (see prunableLogRecords).
 func expiredLogRecords(ctx context.Context, conn *sql.Conn, tables []string, cutoff time.Time) ([]string, error) {
-	existing := make(map[string]struct{}, len(tables))
-	for _, name := range tables {
-		existing[name] = struct{}{}
-	}
 	rows, err := conn.QueryContext(ctx, "SELECT quarantine_table FROM `"+Database+"`.`"+LogTable+"`")
 	if err != nil {
 		return nil, fmt.Errorf("read %s.%s: %w", Database, LogTable, err)
 	}
 	defer utils.CloseAndLog(rows)
-	var expired []string
+	var recorded []string
 	for rows.Next() {
 		var name string
 		if err := rows.Scan(&name); err != nil {
 			return nil, fmt.Errorf("scan %s.%s record: %w", Database, LogTable, err)
 		}
-		if _, ok := existing[name]; ok {
+		recorded = append(recorded, name)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate %s.%s: %w", Database, LogTable, err)
+	}
+	return prunableLogRecords(recorded, tables, cutoff), nil
+}
+
+// prunableLogRecords returns the recorded copies whose log records may be
+// deleted: copies past retention that are no longer among remaining, either
+// because a pass dropped them or because their RENAME never landed. A record
+// of a copy that still exists stays until the copy is dropped.
+//
+// Names are matched case-insensitively, as Destinations chooses them: a server
+// with lower_case_table_names set lists a copy under a folded name while its
+// record keeps the casing the quarantine chose, and an exact match would read
+// that live copy as gone and delete the only record of which apply moved it.
+func prunableLogRecords(recorded, remaining []string, cutoff time.Time) []string {
+	existing := make(map[string]struct{}, len(remaining))
+	for _, name := range remaining {
+		existing[strings.ToLower(name)] = struct{}{}
+	}
+	var prunable []string
+	for _, name := range recorded {
+		if _, ok := existing[strings.ToLower(name)]; ok {
 			continue
 		}
 		quarantinedAt, ok := ParseTimestamp(name)
 		if !ok || !quarantinedAt.Before(cutoff) {
 			continue
 		}
-		expired = append(expired, name)
+		prunable = append(prunable, name)
 	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate %s.%s: %w", Database, LogTable, err)
-	}
-	return expired, nil
+	return prunable
 }
