@@ -280,9 +280,9 @@ func (s *Service) recordSweepOutcome(ctx context.Context, sweep reapSweep, reape
 
 // runRetryableExpiryPass settles failed_retryable applies that have exhausted
 // their retry budget or freshness window, along with the task and operation rows
-// underneath them. It is best-effort maintenance on the same terms as the
-// stranded sweeps: a storage error is logged and recorded, and the next pass
-// retries.
+// underneath them, and publishes each one's terminal summary to its PR. It is
+// best-effort maintenance on the same terms as the stranded sweeps: a storage
+// error is logged and recorded, and the next pass retries.
 //
 // It is a pass of its own rather than a fourth sweep in runStrandedReaperPass
 // because it wants a much shorter interval than the stranded sweeps do; see
@@ -303,6 +303,11 @@ func (s *Service) runRetryableExpiryPass(ctx context.Context) {
 				"reason", expiration.Reason)...)
 		metrics.RecordOperatorResumeFailure(ctx, apply.Database, apply.Deployment, apply.Environment, string(expiration.Reason))
 		s.logApplyExpiration(ctx, apply, expiration.Reason)
+		// Expiry is the transition that makes the apply terminal and no driver
+		// holds it, so this pass is the one that publishes the outcome to the
+		// PR and completes its Check Run. The log entry is appended first so
+		// the summary's failure details include why recovery stopped.
+		s.publishTerminalSummary(ctx, apply, "publisher", "retryable_expiry", "expiry_reason", string(expiration.Reason))
 	}
 
 	s.recordSweepOutcome(ctx, retryableExpirySweep, len(expired), err)

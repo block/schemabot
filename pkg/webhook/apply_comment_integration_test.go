@@ -2477,6 +2477,7 @@ func TestE2EReconcileMissingSummaryCommentsPostsSummary(t *testing.T) {
 		CommentState:    state.Comment.Progress,
 		GitHubCommentID: 9001,
 	}))
+	settleReconcileScenario(t, schemabotDB, apply)
 
 	installClient, capture := setupFakeGitHubForComments(t)
 	factory := &fakeClientFactory{client: installClient}
@@ -2595,7 +2596,22 @@ func seedReconcileScenario(t *testing.T, st storage.Storage, schemabotDB *sql.DB
 		CommentState:    state.Comment.Progress,
 		GitHubCommentID: 9001,
 	}))
+	settleReconcileScenario(t, schemabotDB, apply)
 	return apply
+}
+
+// settleReconcileScenario ages apply past the settle floor summary
+// reconciliation leaves to a live publisher, so the scenario reads as an apply
+// whose publisher has had its chance and failed.
+func settleReconcileScenario(t *testing.T, schemabotDB *sql.DB, apply *storage.Apply) {
+	t.Helper()
+	_, err := schemabotDB.ExecContext(t.Context(),
+		"UPDATE applies SET completed_at = completed_at - INTERVAL 10 MINUTE, updated_at = NOW() - INTERVAL 10 MINUTE WHERE id = ?", apply.ID)
+	require.NoError(t, err)
+	if apply.CompletedAt != nil {
+		settled := apply.CompletedAt.Add(-10 * time.Minute)
+		apply.CompletedAt = &settled
+	}
 }
 
 // TestE2EReconcileMissingSummaryCommentsRepairsStoppedApply verifies startup

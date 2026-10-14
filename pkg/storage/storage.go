@@ -940,9 +940,23 @@ type ApplyStore interface {
 	// marker is superseded (a stop's summary consumed by a resume rotation, so
 	// the current terminal state's summary was never posted), or only a claim
 	// sentinel stale for longer than SummaryClaimStaleAfter remains from a
-	// publisher that crashed before posting. Used by startup reconciliation to
-	// post missing summary comments after restarts.
-	FindMissingSummaryComment(ctx context.Context) ([]*Apply, error)
+	// publisher that crashed before posting. "Recently" is MissingSummaryLookback.
+	// An apply qualifies only once it has been terminal for at least settledFor,
+	// so a reconciler never races the live publisher that is still delivering
+	// the summary moments after the terminal write; zero disables the floor.
+	// Returns at most limit applies, most recently updated first.
+	// Used by summary reconciliation, at startup and on every reconcile pass, to
+	// post summary comments a failed or interrupted publisher left missing.
+	FindMissingSummaryComment(ctx context.Context, settledFor time.Duration, limit int) ([]*Apply, error)
+
+	// FindTerminalWithInProgressCheck returns GitHub-backed applies in a
+	// terminal state (stopped excluded: a stop deliberately leaves its check in
+	// progress) that stored check state still names as its in-progress apply,
+	// with no newer apply for the same target. Every terminal check write moves
+	// the stored state out of in_progress, so each result is an apply whose
+	// terminal check refresh never landed. Returns at most limit applies, most
+	// recently updated first.
+	FindTerminalWithInProgressCheck(ctx context.Context, limit int) ([]*Apply, error)
 
 	// GetByPR returns all applies for a PR.
 	GetByPR(ctx context.Context, repo string, pr int) ([]*Apply, error)
@@ -1307,6 +1321,12 @@ const ProgressCommentAuthorityStaleAfter = ApplyLeaseStaleAfter
 // reclaimable. Claims are normally held only for the duration of one GitHub
 // post, so anything older than this window is a crash, not a slow post.
 const SummaryClaimStaleAfter = 2 * time.Minute
+
+// MissingSummaryLookback is how long after reaching a terminal state an apply
+// stays eligible for summary reconciliation. Reconciliation runs on every
+// reconcile pass, so the window is what lets a summary whose publish failed
+// during a long GitHub outage still be posted once GitHub recovers.
+const MissingSummaryLookback = 24 * time.Hour
 
 // PlanCommentStore tracks plan comments posted on PRs so a newer plan comment
 // for the same database can retire the ones it supersedes — minimizing a

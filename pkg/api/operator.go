@@ -3387,68 +3387,63 @@ func (s *Service) publishTerminalSummaryIfWon(ctx context.Context, driverID int,
 	if !result.BecameTerminal {
 		return
 	}
+	s.publishTerminalSummary(ctx, apply,
+		"driver", driverID,
+		"derived_state", result.DerivedState, "operation_count", result.OperationCount)
+}
+
+// publishTerminalSummary publishes the apply-level terminal PR summary for an
+// apply this caller just moved to a terminal state, and refreshes the GitHub
+// Check Run with it. It reloads the apply and every operation's tasks so the
+// summary renders the terminal state, error message, and completion time just
+// stored, across the whole apply. The apply is already durably terminal, so
+// every failure is logged with the caller's attrs, counted, and left for
+// summary reconciliation to repair.
+func (s *Service) publishTerminalSummary(ctx context.Context, apply *storage.Apply, attrs ...any) {
 	if s.OnApplyTerminalSummary == nil {
 		s.logger.Debug("operator: aggregate terminal summary publisher not configured; skipping",
-			append(apply.LogAttrs(),
-				"driver", driverID,
-				"derived_state", result.DerivedState, "operation_count", result.OperationCount)...)
+			append(apply.LogAttrs(), attrs...)...)
 		return
 	}
 
-	// Reload the parent at its terminal state: the input apply still carries the
-	// pre-CAS state, while the summary must render the terminal state, error
-	// message, and completion time the projection just stamped.
 	terminalApply, err := s.storage.Applies().Get(ctx, apply.ID)
 	if err != nil {
 		s.logger.Error("operator: failed to reload terminal apply for aggregate summary; summary not published",
-			append(apply.LogAttrs(),
-				"driver", driverID,
-				"derived_state", result.DerivedState, "operation_count", result.OperationCount, "error", err)...)
+			append(append(apply.LogAttrs(), attrs...), "error", err)...)
 		metrics.RecordOperatorTerminalSummaryFailure(ctx, "reload_apply_error")
 		return
 	}
 	if terminalApply == nil {
 		s.logger.Error("operator: terminal apply not found while publishing aggregate summary; summary not published",
-			append(apply.LogAttrs(),
-				"driver", driverID,
-				"derived_state", result.DerivedState, "operation_count", result.OperationCount)...)
+			append(apply.LogAttrs(), attrs...)...)
 		metrics.RecordOperatorTerminalSummaryFailure(ctx, "apply_missing")
 		return
 	}
 	if !state.IsTerminalApplyState(terminalApply.State) {
 		s.logger.Error("operator: reloaded apply is no longer terminal while publishing aggregate summary; summary not published",
-			append(terminalApply.LogAttrs(),
-				"driver", driverID,
-				"reloaded_state", terminalApply.State, "derived_state", result.DerivedState,
-				"operation_count", result.OperationCount)...)
+			append(append(terminalApply.LogAttrs(), attrs...), "reloaded_state", terminalApply.State)...)
 		metrics.RecordOperatorTerminalSummaryFailure(ctx, "apply_not_terminal_after_cas")
 		return
 	}
 
 	// Reload every operation's tasks so the summary reflects the whole apply, not
-	// just the operation this drive owned.
+	// just the operation this caller touched.
 	tasks, err := s.storage.Tasks().GetByApplyID(ctx, terminalApply.ID)
 	if err != nil {
 		s.logger.Error("operator: failed to reload tasks for aggregate terminal summary; summary not published",
-			append(terminalApply.LogAttrs(),
-				"driver", driverID,
-				"derived_state", result.DerivedState, "operation_count", result.OperationCount, "error", err)...)
+			append(append(terminalApply.LogAttrs(), attrs...), "error", err)...)
 		metrics.RecordOperatorTerminalSummaryFailure(ctx, "reload_tasks_error")
 		return
 	}
 
 	if err := s.OnApplyTerminalSummary(ctx, terminalApply, tasks); err != nil {
 		s.logger.Error("operator: aggregate terminal summary publish failed; parent state stays terminal, summary left for reconciliation",
-			append(terminalApply.LogAttrs(),
-				"driver", driverID,
-				"derived_state", result.DerivedState, "operation_count", result.OperationCount, "error", err)...)
+			append(append(terminalApply.LogAttrs(), attrs...), "error", err)...)
 		metrics.RecordOperatorTerminalSummaryFailure(ctx, "callback_error")
 		return
 	}
 	s.logger.Info("operator: published aggregate terminal summary",
-		append(terminalApply.LogAttrs(),
-			"driver", driverID,
-			"derived_state", result.DerivedState, "operation_count", result.OperationCount)...)
+		append(terminalApply.LogAttrs(), attrs...)...)
 }
 
 func driverLeaseOwner(driverID int) string {
