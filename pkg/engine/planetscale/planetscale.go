@@ -826,16 +826,12 @@ var retryDelay = func(attempt int, lastErr error) time.Duration {
 }
 
 func generateBranchName(database, planID string) string {
-	sanitized := strings.ReplaceAll(database, "_", "-")
-	if len(sanitized) > 20 {
-		sanitized = sanitized[:20]
-	}
 	// Use last 8 chars of plan ID for uniqueness
 	shortID := planID
-	if len(shortID) > 8 {
-		shortID = shortID[len(shortID)-8:]
+	if len(shortID) > generatedBranchIDLen {
+		shortID = shortID[len(shortID)-generatedBranchIDLen:]
 	}
-	return fmt.Sprintf("schemabot-%s-%s", sanitized, shortID)
+	return branchNamePrefix + sanitizedBranchDatabase(database) + "-" + shortID
 }
 
 func deployStateToEngineState(drState string) engine.State {

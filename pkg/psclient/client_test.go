@@ -559,7 +559,7 @@ func TestListingBoundEndedFollowsTheFirstDeadline(t *testing.T) {
 	t.Run("listing bound fired before the caller's deadline", func(t *testing.T) {
 		caller, cancelCaller := context.WithTimeout(t.Context(), 50*time.Millisecond)
 		defer cancelCaller()
-		listCtx, cancel := context.WithTimeoutCause(caller, time.Millisecond, errKeyspaceListingBound)
+		listCtx, cancel := context.WithTimeoutCause(caller, time.Millisecond, errListingBound)
 		defer cancel()
 		<-listCtx.Done()
 		<-caller.Done()
@@ -571,7 +571,7 @@ func TestListingBoundEndedFollowsTheFirstDeadline(t *testing.T) {
 	t.Run("caller's deadline fired before the listing bound", func(t *testing.T) {
 		caller, cancelCaller := context.WithTimeout(t.Context(), time.Millisecond)
 		defer cancelCaller()
-		listCtx, cancel := context.WithTimeoutCause(caller, 50*time.Millisecond, errKeyspaceListingBound)
+		listCtx, cancel := context.WithTimeoutCause(caller, 50*time.Millisecond, errListingBound)
 		defer cancel()
 		<-caller.Done()
 		<-listCtx.Done()
@@ -784,4 +784,59 @@ func TestRawRequestReturnsWhenTheServerHangs(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "read auto_cutover for block/orders deploy request #132")
 	assert.Less(t, time.Since(start), 10*time.Second, "the call must return at the client timeout")
+}
+
+// A database with more branches than fit on one page is listed in full from
+// the database's branches path, so a branch on a later page is not mistaken
+// for one that does not exist.
+func TestListBranchesReadsEveryPage(t *testing.T) {
+	var requested []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "/v1/organizations/block/databases/orders/branches", r.URL.Path)
+		page := r.URL.Query().Get("page")
+		requested = append(requested, page)
+		switch page {
+		case "1":
+			_, _ = w.Write([]byte(`{"type":"list","next_page":2,"data":[{"name":"main","production":true},{"name":"schemabot-orders-1a2b3c4d"}]}`))
+		case "2":
+			_, _ = w.Write([]byte(`{"type":"list","next_page":null,"data":[{"name":"schemabot-orders-5e6f7a8b","created_at":"2026-10-01T10:00:00Z"}]}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	client, err := NewPSClientWithBaseURL("token-name", "token-value", srv.URL)
+	require.NoError(t, err)
+
+	branches, err := client.ListBranches(t.Context(), &ps.ListDatabaseBranchesRequest{Organization: "block", Database: "orders"})
+
+	require.NoError(t, err)
+	require.Len(t, branches, 3)
+	assert.Equal(t, []string{"main", "schemabot-orders-1a2b3c4d", "schemabot-orders-5e6f7a8b"},
+		[]string{branches[0].Name, branches[1].Name, branches[2].Name})
+	assert.True(t, branches[0].Production)
+	assert.Equal(t, time.Date(2026, 10, 1, 10, 0, 0, 0, time.UTC), branches[2].CreatedAt.UTC())
+	assert.Equal(t, []string{"1", "2"}, requested)
+}
+
+// A page that fails ends the listing with an error naming the database and the
+// page, rather than returning the branches read so far as the whole set.
+func TestListBranchesFailsOnALaterPage(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("page") == "1" {
+			_, _ = w.Write([]byte(`{"type":"list","next_page":2,"data":[{"name":"main"}]}`))
+			return
+		}
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`{"message":"branch listing unavailable"}`))
+	}))
+	t.Cleanup(srv.Close)
+	client, err := NewPSClientWithBaseURL("token-name", "token-value", srv.URL)
+	require.NoError(t, err)
+
+	branches, err := client.ListBranches(t.Context(), &ps.ListDatabaseBranchesRequest{Organization: "block", Database: "orders"})
+
+	require.Error(t, err)
+	assert.Nil(t, branches)
+	assert.Contains(t, err.Error(), "list branches for block/orders page 2")
 }
