@@ -126,6 +126,23 @@ and that line is the authoritative source-to-copy pairing. Look the table up
 there first; the query above only identifies a copy by its own (possibly
 shortened) name.
 
+The target keeps the same pairing in `_pending_drops`.`schemabot_quarantine_log`,
+one row per copy, naming the apply that quarantined it. The row is written just
+before the rename, so a row whose copy does not exist means the rename never
+landed or retention already removed the copy:
+
+```sql
+SELECT quarantine_table, source_schema, source_table, apply_identifier, quarantined_at
+FROM `_pending_drops`.`schemabot_quarantine_log`
+WHERE source_schema = 'app' AND source_table = 'users'
+ORDER BY quarantined_at DESC;
+```
+
+A resumed DROP phase reads this log, so an attempt of the same apply on another
+server, or after a restart, recognizes a table it already quarantined instead of
+reporting the drop as lost. The cleaner never drops the log table, and deletes a
+row once its copy is gone and past retention.
+
 Also restore the table's `.sql` file in the schema repository, otherwise the
 next plan will produce another `DROP TABLE` for it.
 

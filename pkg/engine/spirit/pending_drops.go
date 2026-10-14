@@ -89,6 +89,15 @@ func (e *Engine) quarantineDroppedTables(ctx context.Context, host, username, pa
 	for _, table := range moved {
 		e.recordQuarantinedDrop(table)
 	}
+	// The durable record follows the same rule as the one in memory: it is
+	// written before the RENAME. A drop that cannot record which apply moved
+	// the table does not run, so no copy lands in pending drops that a later
+	// attempt cannot recognize as its own.
+	if applyIdentifier := e.runningApplyIdentifier(); applyIdentifier != "" {
+		if err := pendingdrops.RecordQuarantines(ctx, db, applyIdentifier, moved, time.Now()); err != nil {
+			return fmt.Errorf("record which apply quarantines the DROP TABLE targets before moving them: %w", err)
+		}
+	}
 	if err := pendingdrops.MoveTablesTo(ctx, db, moved); err != nil {
 		return fmt.Errorf("quarantine DROP TABLE targets: %w", err)
 	}
@@ -123,14 +132,18 @@ func (e *Engine) quarantineDroppedTables(ctx context.Context, host, username, pa
 // statement: SchemaBot holds no copy of it, and reporting the drop done would
 // tell an operator the data is recoverable when it is not.
 //
-// The record lives on the running schema change, in this process. A resume
-// that goes through Apply, on this server or another, starts with an empty
-// record; the driver plans that resume again against the live schema first,
-// so a table an earlier attempt quarantined is no longer in its diff and this
-// path never sees it.
+// The record is the running schema change's own, in this process, together
+// with the target's quarantine log for the apply it belongs to. The log is what
+// a resume in another process, or after a restart, finds: its in-memory record
+// starts empty, and the log still names the copies earlier attempts of the
+// same apply moved the table to.
 func (e *Engine) resolveMissingDropTarget(ctx context.Context, db *sql.DB, target dropTarget, ifExists bool) error {
 	logger := e.changeLogger()
-	if recorded := e.quarantinedDrops(target); len(recorded) > 0 {
+	recorded, err := e.recordedQuarantines(ctx, db, target)
+	if err != nil {
+		return err
+	}
+	if len(recorded) > 0 {
 		prior, found, err := findRecordedCopy(ctx, db, recorded)
 		if err != nil {
 			return err
@@ -199,6 +212,38 @@ func (e *Engine) recordQuarantinedDrop(table pendingdrops.QuarantinedTable) {
 	}
 	key := dropTarget{schema: table.SchemaName, table: table.TableName}
 	rm.quarantinedDrops[key] = append(rm.quarantinedDrops[key], table)
+}
+
+// recordedQuarantines returns every destination recorded for target by the
+// running schema change: the target's quarantine log for its apply first, then
+// the in-memory record, without repeating a destination both hold. A log that
+// cannot be read fails the statement rather than reading as no record.
+func (e *Engine) recordedQuarantines(ctx context.Context, db *sql.DB, target dropTarget) ([]pendingdrops.QuarantinedTable, error) {
+	var recorded []pendingdrops.QuarantinedTable
+	if applyIdentifier := e.runningApplyIdentifier(); applyIdentifier != "" {
+		durable, err := pendingdrops.RecordedQuarantines(ctx, db, applyIdentifier, target.schema, target.table)
+		if err != nil {
+			return nil, fmt.Errorf("read which copies apply %s recorded for DROP TABLE target `%s`.`%s`: %w", applyIdentifier, target.schema, target.table, err)
+		}
+		recorded = durable
+	}
+	for _, table := range e.quarantinedDrops(target) {
+		if !slices.ContainsFunc(recorded, func(r pendingdrops.QuarantinedTable) bool { return r.QuarantineTable == table.QuarantineTable }) {
+			recorded = append(recorded, table)
+		}
+	}
+	return recorded, nil
+}
+
+// runningApplyIdentifier returns the apply the running schema change belongs
+// to, or "" when there is none or it names no apply.
+func (e *Engine) runningApplyIdentifier() string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.runningSchemaChange == nil {
+		return ""
+	}
+	return e.runningSchemaChange.applyIdentifier
 }
 
 // quarantinedDrops returns every destination the running schema change

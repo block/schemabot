@@ -1442,16 +1442,17 @@ func (c *LocalClient) launchAtomicResume(ctx context.Context, apply *storage.App
 	// engine keys per-table progress on the same namespace/table pairs the
 	// tasks carry.
 	result, err := c.applyWithEngine(ctx, eng, &engine.ApplyRequest{
-		Database:     apply.Database,
-		PlanID:       plan.PlanIdentifier,
-		Changes:      groupedResumeChanges(tasks, plan),
-		TargetShards: taskTargetShards(tasks),
-		SchemaFiles:  plan.SchemaFiles,
-		IgnoreTables: plan.IgnoreTables(),
-		Options:      options,
-		ResumeState:  resumeState,
-		Credentials:  creds,
-		Logger:       c.logger.With(apply.IdentityLogAttrs()...),
+		ApplyIdentifier: apply.ApplyIdentifier,
+		Database:        apply.Database,
+		PlanID:          plan.PlanIdentifier,
+		Changes:         groupedResumeChanges(tasks, plan),
+		TargetShards:    taskTargetShards(tasks),
+		SchemaFiles:     plan.SchemaFiles,
+		IgnoreTables:    plan.IgnoreTables(),
+		Options:         options,
+		ResumeState:     resumeState,
+		Credentials:     creds,
+		Logger:          c.logger.With(apply.IdentityLogAttrs()...),
 		OnStateChange: func(rs *engine.ResumeState) error {
 			if rs == nil {
 				c.logger.Debug("OnStateChange: nil resume state", "apply_id", apply.ApplyIdentifier)
@@ -2129,16 +2130,17 @@ func (c *LocalClient) driveGroupFinalizer(ctx context.Context, apply *storage.Ap
 		"database", apply.Database,
 	)
 	result, err := c.applyWithEngine(ctx, eng, &engine.ApplyRequest{
-		Database:      apply.Database,
-		PlanID:        plan.PlanIdentifier,
-		Changes:       changes,
-		SchemaFiles:   plan.SchemaFiles,
-		IgnoreTables:  plan.IgnoreTables(),
-		Options:       apply.GetOptions().Map(),
-		ResumeState:   resumeState,
-		Credentials:   creds,
-		Logger:        c.logger.With(apply.IdentityLogAttrs()...),
-		OnStateChange: saveResume,
+		ApplyIdentifier: apply.ApplyIdentifier,
+		Database:        apply.Database,
+		PlanID:          plan.PlanIdentifier,
+		Changes:         changes,
+		SchemaFiles:     plan.SchemaFiles,
+		IgnoreTables:    plan.IgnoreTables(),
+		Options:         apply.GetOptions().Map(),
+		ResumeState:     resumeState,
+		Credentials:     creds,
+		Logger:          c.logger.With(apply.IdentityLogAttrs()...),
+		OnStateChange:   saveResume,
 	})
 	if err != nil {
 		return failClosed(fmt.Errorf("group_finalizer %s (apply %s): %w", work, apply.ApplyIdentifier, err))

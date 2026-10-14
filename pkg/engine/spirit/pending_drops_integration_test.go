@@ -665,6 +665,82 @@ func receiveWithin(t *testing.T, results <-chan error, what string) error {
 	}
 }
 
+// A schema change quarantines `durable_orders` and its server restarts, so the
+// next attempt runs on an engine with no memory of the first. The target's
+// quarantine log still names the copy the apply moved the table to, so the
+// replayed DROP recognizes the copy as its own and skips the table. An attempt
+// for a different apply finds no such record and fails rather than report the
+// drop recoverable.
+func TestEngine_ResumeDropPhase_RecognizesItsCopyAfterARestart(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	cleanupTables(t, db)
+	cleanupPendingDropsDB(t, db)
+
+	_, err := db.ExecContext(t.Context(), "CREATE TABLE `durable_orders` (id INT PRIMARY KEY AUTO_INCREMENT)")
+	require.NoError(t, err, "create durable_orders")
+	host, username, password, database, err := parseDSN(dsn)
+	require.NoError(t, err, "parse DSN")
+
+	attempt := func(applyIdentifier string) error {
+		eng := New(Config{Logger: slog.Default()})
+		eng.installRunningSchemaChange(&runningSchemaChange{
+			database: database, state: engine.StateRunning,
+			host: host, username: username, password: password,
+			applyIdentifier: applyIdentifier,
+		})
+		return eng.quarantineDroppedTables(t.Context(), host, username, password, database, "DROP TABLE `durable_orders`")
+	}
+
+	require.NoError(t, attempt("apply-orders"), "the first attempt quarantines the table")
+	copies := listQuarantinedTables(t, db)
+	require.Len(t, copies, 2, "the copy and the quarantine log: %v", copies)
+	recorded, err := pendingdrops.RecordedQuarantines(t.Context(), db, "apply-orders", database, "durable_orders")
+	require.NoError(t, err)
+	require.Len(t, recorded, 1, "the log names the copy before anything else reads it")
+	assert.Contains(t, copies, recorded[0].QuarantineTable)
+
+	require.NoError(t, attempt("apply-orders"), "a fresh engine for the same apply skips the table it already quarantined")
+	assert.Len(t, listQuarantinedTables(t, db), 2, "the table is quarantined exactly once")
+
+	err = attempt("apply-other")
+	require.Error(t, err)
+	message, ok := engine.OperatorMessageOf(err)
+	require.True(t, ok, "error must carry an operator message")
+	assert.Contains(t, message, "`durable_orders` does not exist and was not quarantined by this attempt of the schema change")
+}
+
+// An apply that drops a table through Apply records, on the target, that its
+// apply identifier moved the table into pending drops, so any later attempt of
+// the same apply can find the copy.
+func TestEngine_Apply_RecordsWhichApplyQuarantinedTheTable(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	cleanupTables(t, db)
+	cleanupPendingDropsDB(t, db)
+
+	_, err := db.ExecContext(t.Context(), "CREATE TABLE `apply_drops_me` (id INT PRIMARY KEY AUTO_INCREMENT)")
+	require.NoError(t, err, "create apply_drops_me")
+
+	eng := New(Config{Logger: slog.Default()})
+	defer eng.Drain()
+	result, err := eng.Apply(t.Context(), &engine.ApplyRequest{
+		ApplyIdentifier: "apply-drops-me",
+		Database:        "testdb",
+		Changes: []engine.SchemaChange{{
+			Namespace:    "testdb",
+			TableChanges: []engine.TableChange{{Table: "apply_drops_me", DDL: "DROP TABLE `apply_drops_me`"}},
+		}},
+		Credentials: &engine.Credentials{DSN: dsn},
+	})
+	require.NoError(t, err, "Apply()")
+	require.True(t, result.Accepted, "apply not accepted: %s", result.Message)
+	waitForTerminalOutcome(t, eng, engine.StateCompleted)
+
+	recorded, err := pendingdrops.RecordedQuarantines(t.Context(), db, "apply-drops-me", "testdb", "apply_drops_me")
+	require.NoError(t, err)
+	require.Len(t, recorded, 1)
+	assert.Contains(t, listQuarantinedTables(t, db), recorded[0].QuarantineTable, "the record names the copy that holds the table")
+}
+
 // waitFor polls condition until it holds or the deadline passes.
 func waitFor(t *testing.T, what string, condition func() bool) {
 	t.Helper()
