@@ -1927,9 +1927,12 @@ type ActiveApplyResponse struct {
 
 // StatusResponse is the HTTP response for GET /api/status.
 type StatusResponse struct {
-	ActiveCount  int  `json:"active_count"`
-	Limit        int  `json:"limit,omitempty"`
-	MaxLimit     int  `json:"max_limit,omitempty"`
+	ActiveCount int `json:"active_count"`
+	Limit       int `json:"limit,omitempty"`
+	MaxLimit    int `json:"max_limit,omitempty"`
+	// HasMore reports that more applies match than this page holds. Request
+	// the next page with the same filters and starting_after set to the last
+	// apply's ID.
 	HasMore      bool `json:"has_more,omitempty"`
 	FailuresOnly bool `json:"failures_only,omitempty"`
 	// Last echoes the window bounding the list to applies updated within it;
@@ -1938,6 +1941,10 @@ type StatusResponse struct {
 	// State echoes the canonical form of the state filter restricting the
 	// list; empty means no state filter.
 	State string `json:"state,omitempty"`
+	// StartingAfter echoes the starting_after apply the page continues from,
+	// so a client can tell this page apart from a first page served by a
+	// server that ignores the parameter.
+	StartingAfter string `json:"starting_after,omitempty"`
 	// StateCounts tallies every apply matching the request's filters by state,
 	// unbounded by limit — the applies list may be a truncated page, but these
 	// counts never are.

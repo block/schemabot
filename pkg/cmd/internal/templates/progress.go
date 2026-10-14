@@ -1101,7 +1101,9 @@ type StatusListData struct {
 	StateCounts    map[string]int
 	ShowExternalID bool
 	Deployment     string
-	Applies        []ActiveApplyData
+	// Continued marks a page reached with --after, past the first page.
+	Continued bool
+	Applies   []ActiveApplyData
 }
 
 // statusWindowSuffix renders the active list filters (--state, --last) as a
@@ -1192,15 +1194,26 @@ func WriteStatusList(data StatusListData) {
 	writeStatusListFooter(data)
 }
 
-// writeStatusListTruncation says how much of the history a truncated page holds,
-// and how to see more of it — or that the server will not serve more, when the
-// page is already at the cap.
+// writeStatusListTruncation says how much of the history a truncated page holds
+// and how to see more of it. Below the server's cap a larger --limit shows
+// more; once the page is at the cap, or the operator is already paging, the
+// next page starts --after the last apply this one shows.
 func writeStatusListTruncation(data StatusListData, item string) {
-	if data.MaxLimit > 0 && data.Limit >= data.MaxLimit {
-		fmt.Printf("%sShowing the %d most recent %s. This server caps status history at %d.%s\n", ANSIDim, data.Limit, item, data.MaxLimit, ANSIReset)
-		return
+	atCap := data.MaxLimit > 0 && data.Limit >= data.MaxLimit
+	last := ""
+	if len(data.Applies) > 0 {
+		last = data.Applies[len(data.Applies)-1].ApplyID
 	}
-	fmt.Printf("%sShowing the %d most recent %s. Use --limit N to show more.%s\n", ANSIDim, data.Limit, item, ANSIReset)
+	switch {
+	case data.Continued && last != "":
+		fmt.Printf("%sShowing %d more %s. Add --after %s for the next %d.%s\n", ANSIDim, len(data.Applies), item, last, data.Limit, ANSIReset)
+	case atCap && last != "":
+		fmt.Printf("%sShowing the %d most recent %s. Add --after %s for the next %d.%s\n", ANSIDim, data.Limit, item, last, data.Limit, ANSIReset)
+	case atCap:
+		fmt.Printf("%sShowing the %d most recent %s. This server caps status history at %d.%s\n", ANSIDim, data.Limit, item, data.MaxLimit, ANSIReset)
+	default:
+		fmt.Printf("%sShowing the %d most recent %s. Use --limit N to show more.%s\n", ANSIDim, data.Limit, item, ANSIReset)
+	}
 }
 
 func writeStatusListFooter(data StatusListData) {

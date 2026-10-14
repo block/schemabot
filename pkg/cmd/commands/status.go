@@ -20,15 +20,31 @@ type StatusCmd struct {
 	State       string `help:"Only show applies in this state, for example running, completed, or failed_retryable; cannot be combined with --failed"`
 	Limit       int    `short:"n" help:"Maximum recent applies to show (default 20, max 1000)"`
 	Failed      bool   `help:"Show only failed recent applies" name:"failed"`
+	After       string `help:"Show the page that follows this apply ID, the last one a previous page showed; repeat that page's filters"`
+	All         bool   `help:"List every matching apply, page by page; with --json the pages merge into one applies array"`
 	ExternalID  bool   `help:"Show external engine apply IDs" name:"external-id"`
 	JSON        bool   `help:"Output as JSON"`
 }
+
+// allPagesStatusLimit is the page size --all asks for when --limit is not set.
+// The server clamps it to its own cap, so a server with a lower cap still pages
+// correctly, only in more requests.
+const allPagesStatusLimit = 1000
 
 // Run executes the status command.
 func (cmd *StatusCmd) Run(g *Globals) error {
 	ep, err := resolveEndpoint(g.Endpoint, g.Profile)
 	if err != nil {
 		return err
+	}
+
+	if cmd.After != "" || cmd.All {
+		if cmd.ApplyIDArg != "" {
+			return fmt.Errorf("--after and --all page the recent applies list; drop them to show one apply")
+		}
+		if cmd.Database != "" {
+			return fmt.Errorf("--after and --all page the recent applies list; -d already shows every apply for the database")
+		}
 	}
 
 	// Mode 1: Show details for specific apply by ID
@@ -53,21 +69,30 @@ func (cmd *StatusCmd) Run(g *Globals) error {
 		}
 		last = window
 	}
+	opts := client.StatusOptions{
+		Limit:       cmd.Limit,
+		Environment: cmd.Environment,
+		Deployment:  cmd.Deployment,
+		State:       cmd.State,
+		Failed:      cmd.Failed,
+		Last:        last,
+		After:       cmd.After,
+	}
 	var result *apitypes.StatusResponse
 	err = withLoading("Loading schema change status...", !cmd.JSON, func() error {
 		var loadErr error
-		result, loadErr = client.GetStatus(ep, client.StatusOptions{
-			Limit:       cmd.Limit,
-			Environment: cmd.Environment,
-			Deployment:  cmd.Deployment,
-			State:       cmd.State,
-			Failed:      cmd.Failed,
-			Last:        last,
-		})
+		if cmd.All {
+			result, loadErr = getAllStatusPages(ep, opts)
+		} else {
+			result, loadErr = client.GetStatus(ep, opts)
+		}
 		return loadErr
 	})
 	if err != nil {
 		return err
+	}
+	if result.StartingAfter != cmd.After {
+		return fmt.Errorf("the server did not continue after apply %s; it predates paging, so it cannot show the next page", cmd.After)
 	}
 
 	if cmd.JSON {
@@ -80,7 +105,7 @@ func (cmd *StatusCmd) Run(g *Globals) error {
 		applies = append(applies, activeApplyDataFromResponse(a))
 	}
 
-	templates.WriteStatusList(templates.StatusListData{
+	data := templates.StatusListData{
 		ActiveCount:    result.ActiveCount,
 		Limit:          result.Limit,
 		MaxLimit:       result.MaxLimit,
@@ -91,10 +116,56 @@ func (cmd *StatusCmd) Run(g *Globals) error {
 		StateCounts:    result.StateCounts,
 		ShowExternalID: cmd.ExternalID,
 		Deployment:     cmd.Deployment,
+		Continued:      cmd.After != "",
 		Applies:        applies,
-	})
+	}
+	templates.WriteStatusList(data)
 
 	return nil
+}
+
+// getAllStatusPages fetches the first page for opts and requests each next
+// page after the last apply of the one before, until the server reports no
+// more, merging every page into one response. A page lists only applies after
+// its anchor, but an apply that finished during the walk can tie with the
+// anchor's sort key and appear again, so the merge drops repeats and the
+// result lists each apply once. State counts are the first page's: every page counts
+// the same filter, and the first count is the one taken before the walk.
+func getAllStatusPages(endpoint string, opts client.StatusOptions) (*apitypes.StatusResponse, error) {
+	if opts.Limit == 0 {
+		opts.Limit = allPagesStatusLimit
+	}
+	merged, err := client.GetStatus(endpoint, opts)
+	if err != nil {
+		return nil, err
+	}
+	seen := make(map[string]bool, len(merged.Applies))
+	for _, apply := range merged.Applies {
+		seen[apply.ApplyID] = true
+	}
+	page := merged
+	for page.HasMore && len(page.Applies) > 0 {
+		opts.After = page.Applies[len(page.Applies)-1].ApplyID
+		page, err = client.GetStatus(endpoint, opts)
+		if err != nil {
+			return nil, fmt.Errorf("fetch the status page after apply %s: %w", opts.After, err)
+		}
+		if page.StartingAfter != opts.After {
+			return nil, fmt.Errorf("the server did not continue after apply %s; it predates paging, so --all cannot list every apply", opts.After)
+		}
+		for _, apply := range page.Applies {
+			if seen[apply.ApplyID] {
+				continue
+			}
+			seen[apply.ApplyID] = true
+			merged.Applies = append(merged.Applies, apply)
+			if !state.IsTerminalApplyState(apply.State) && !merged.FailuresOnly {
+				merged.ActiveCount++
+			}
+		}
+	}
+	merged.HasMore = false
+	return merged, nil
 }
 
 func activeApplyDataFromResponse(a *apitypes.ActiveApplyResponse) templates.ActiveApplyData {

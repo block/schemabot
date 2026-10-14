@@ -72,29 +72,32 @@ func TestWriteStatusListHasMoreFooter(t *testing.T) {
 	assert.Contains(t, output, "Use 'schemabot status <apply_id>' to view details")
 }
 
+// At the server's cap a larger --limit cannot show more, so the footer names
+// the --after apply that starts the next page. A page reached with --after
+// says it shows more rather than the most recent, and keeps naming the next
+// --after apply.
 func TestWriteStatusListHasMoreFooterAtMaxLimit(t *testing.T) {
-	output := captureStdout(t, func() {
-		WriteStatusList(StatusListData{
-			ActiveCount: 0,
-			Limit:       1000,
-			MaxLimit:    1000,
-			HasMore:     true,
-			Applies: []ActiveApplyData{
-				{
-					ApplyID:     "apply-example",
-					Database:    "orders",
-					Environment: "staging",
-					State:       state.Apply.Completed,
-					StartedAt:   "2026-05-28T12:00:00Z",
-					CompletedAt: "2026-05-28T12:00:02Z",
-					Caller:      "cli",
-				},
-			},
-		})
-	})
+	page := StatusListData{
+		Limit:    1000,
+		MaxLimit: 1000,
+		HasMore:  true,
+		Applies: []ActiveApplyData{{
+			ApplyID: "apply-example", Database: "orders", Environment: "staging", State: state.Apply.Completed,
+			StartedAt: "2026-05-28T12:00:00Z", CompletedAt: "2026-05-28T12:00:02Z", Caller: "cli",
+		}},
+	}
+	first := captureStdout(t, func() { WriteStatusList(page) })
+	assert.Contains(t, first, "Showing the 1000 most recent schema changes. Add --after apply-example for the next 1000.")
+	assert.NotContains(t, first, "Use --limit N to show more.")
 
-	assert.Contains(t, output, "Showing the 1000 most recent schema changes. This server caps status history at 1000.")
-	assert.NotContains(t, output, "Use --limit N to show more.")
+	page.Continued = true
+	continued := captureStdout(t, func() { WriteStatusList(page) })
+	assert.Contains(t, continued, "Showing 1 more schema changes. Add --after apply-example for the next 1000.")
+
+	page.FailuresOnly = true
+	page.Applies[0].State = state.Apply.Failed
+	failed := captureStdout(t, func() { WriteStatusList(page) })
+	assert.Contains(t, failed, "Showing 1 more failed schema changes. Add --after apply-example for the next 1000.")
 }
 
 func TestWriteStatusListStateSummary(t *testing.T) {

@@ -159,10 +159,11 @@ func TestCLI_Status_ExternalIDShowsRemoteApplyIDs(t *testing.T) {
 	assert.Contains(t, stripped, "apply-status-external-local")
 }
 
-// TestCLI_Status_MaxLimitFooterDoesNotSuggestHigherLimit verifies that a
-// clamped request tells operators they are at the server maximum instead of
-// suggesting an impossible larger --limit value.
-func TestCLI_Status_MaxLimitFooterDoesNotSuggestHigherLimit(t *testing.T) {
+// TestCLI_Status_AfterReachesPastTheCap verifies that a request clamped to the
+// server's maximum page still reaches the rest of the history: the footer names
+// the --after apply instead of an impossible larger --limit, and the page after
+// it lists the apply the first page could not hold.
+func TestCLI_Status_AfterReachesPastTheCap(t *testing.T) {
 	binPath := buildBinary(t, "schemabot", "./pkg/cmd")
 	endpoint, store := startStatusOnlySchemaBot(t)
 
@@ -179,8 +180,15 @@ func TestCLI_Status_MaxLimitFooterDoesNotSuggestHigherLimit(t *testing.T) {
 
 	assert.Equal(t, 1000, statusApplyRowCount(out))
 	assert.Contains(t, stripped, "apply-status-cap-1001")
-	assert.Contains(t, stripped, "Showing the 1000 most recent schema changes. This server caps status history at 1000.")
+	assert.NotContains(t, stripped, "apply-status-cap-0001")
 	assert.NotContains(t, stripped, "Use --limit N to show more.")
+	assert.Contains(t, stripped, "Showing the 1000 most recent schema changes. Add --after apply-status-cap-0002 for the next 1000.")
+
+	nextOut := runCLI(t, binPath, "status", "--endpoint", endpoint, "--limit", "2000", "--after", "apply-status-cap-0002")
+	nextStripped := stripANSI(nextOut)
+	assert.Equal(t, 1, statusApplyRowCount(nextOut))
+	assert.Contains(t, nextStripped, "apply-status-cap-0001")
+	assert.NotContains(t, nextStripped, "--after")
 }
 
 type statusApplySeed struct {

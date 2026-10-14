@@ -1034,6 +1034,7 @@ type RecentAppliesFilter struct {
 	Limit       int
 	Environment string
 	Deployment  string
+	Database    string
 	States      []string
 	// ActiveOnly restricts results to applies that have not reached a terminal
 	// state — the ones that still own their target. It is expressed as "not
@@ -1048,6 +1049,14 @@ type RecentAppliesFilter struct {
 	// terminal state within it, and those started earlier but still running,
 	// including a fanned-out apply whose heartbeats land only on its operations.
 	UpdatedSince time.Time
+	// AfterID, when set, is the row id of an apply from an earlier page: the
+	// list starts with the applies that sort after it in the list's order,
+	// rather than at the top, so a caller walks the list page by page from the
+	// last apply each page showed. The anchor's place is taken from its current
+	// sort key, so an apply that starts, finishes, or is retried during the walk
+	// moves to the top of the order instead of being listed again later on.
+	// CountRecentByState ignores it: counts always cover every matching apply.
+	AfterID int64
 }
 
 // RetryableExpirationReason identifies why operator retry recovery stopped.

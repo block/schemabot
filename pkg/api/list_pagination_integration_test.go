@@ -1,0 +1,211 @@
+//go:build integration
+
+package api
+
+import (
+	"database/sql"
+	"encoding/json"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"os"
+	"testing"
+
+	"github.com/block/spirit/pkg/utils"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/state"
+	"github.com/block/schemabot/pkg/storage"
+	"github.com/block/schemabot/pkg/storage/mysqlstore"
+	"github.com/block/schemabot/pkg/storage/storagetest"
+)
+
+// pagingServer is a SchemaBot API server over real MySQL storage, for tests
+// that walk a paged listing over HTTP.
+type pagingServer struct {
+	db    *sql.DB
+	store storage.Storage
+	mux   *http.ServeMux
+}
+
+func newPagingServer(t *testing.T) *pagingServer {
+	t.Helper()
+	dsn := newStorageDatabaseWithSchema(t).DSN
+	db, err := sql.Open("block-mysql", dsn)
+	require.NoError(t, err)
+	// The service owns the handle and closes it; this close only covers an
+	// early failure before the service exists, so its error is discarded.
+	t.Cleanup(func() { _ = db.Close() })
+	require.NoError(t, db.PingContext(t.Context()))
+	store := mysqlstore.New(db)
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	svc := New(store, testServerConfig(), nil, logger)
+	t.Cleanup(func() { utils.CloseAndLog(svc) })
+	mux := http.NewServeMux()
+	svc.ConfigureRoutes(mux)
+	return &pagingServer{db: db, store: store, mux: mux}
+}
+
+func (s *pagingServer) get(t *testing.T, path string, query url.Values, into any) {
+	t.Helper()
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, path+"?"+query.Encode(), nil)
+	w := httptest.NewRecorder()
+	s.mux.ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), into))
+}
+
+// walkStatus requests the first page of query, then each next page after the
+// last apply of the one before, until the listing ends. It calls between after
+// each page that has a successor and returns how many times each apply was
+// listed.
+func (s *pagingServer) walkStatus(t *testing.T, query url.Values, between func(page int)) (map[string]int, []apitypes.StatusResponse) {
+	t.Helper()
+	seen := map[string]int{}
+	var pages []apitypes.StatusResponse
+	for page := 0; ; page++ {
+		require.Less(t, page, 100, "the walk must end")
+		var resp apitypes.StatusResponse
+		s.get(t, "/api/status", query, &resp)
+		pages = append(pages, resp)
+		for _, apply := range resp.Applies {
+			seen[apply.ApplyID]++
+		}
+		if !resp.HasMore {
+			return seen, pages
+		}
+		require.NotEmpty(t, resp.Applies, "a truncated page lists applies")
+		if between != nil {
+			between(page)
+		}
+		query.Set("starting_after", resp.Applies[len(resp.Applies)-1].ApplyID)
+	}
+}
+
+// seedStatusFleet stores one in-flight apply followed by settled ones in
+// staging, spread across a few databases, plus production applies the walks
+// filter out. The in-flight apply is the oldest row, so the first page lists
+// it ahead of newer settled work. The settled applies are moved a day into the
+// past, so they read as history rather than as activity from the instant the
+// walk runs. It returns the staging apply identifiers and the in-flight apply.
+func (s *pagingServer) seedStatusFleet(t *testing.T, settled int) (map[string]bool, *storage.Apply) {
+	t.Helper()
+	store := s.store
+	inFlight := storagetest.CreateApplyWithStateAndEnv(t, store, storagetest.CreateLock(t, store, "fleet_inflight", storage.DatabaseTypeMySQL),
+		"apply-fleet-inflight", 1, state.Apply.Running, "staging")
+	want := map[string]bool{inFlight.ApplyIdentifier: true}
+	locks := []*storage.Lock{
+		storagetest.CreateLock(t, store, "fleet_orders", storage.DatabaseTypeMySQL),
+		storagetest.CreateLock(t, store, "fleet_billing", storage.DatabaseTypeMySQL),
+		storagetest.CreateLock(t, store, "fleet_catalog", storage.DatabaseTypeMySQL),
+	}
+	for i := range settled {
+		applyState := state.Apply.Completed
+		if i%50 == 0 {
+			applyState = state.Apply.Failed
+		}
+		apply := storagetest.CreateApplyWithStateAndEnv(t, store, locks[i%len(locks)], fmt.Sprintf("apply-fleet-%04d", i), int64(100+i), applyState, "staging")
+		want[apply.ApplyIdentifier] = true
+	}
+	for i := range 5 {
+		storagetest.CreateApplyWithStateAndEnv(t, store, locks[0], fmt.Sprintf("apply-fleet-production-%d", i), int64(10_000+i), state.Apply.Completed, "production")
+	}
+	_, err := s.db.ExecContext(t.Context(),
+		"UPDATE `applies` SET updated_at = updated_at - INTERVAL 1 DAY WHERE apply_identifier <> ?", inFlight.ApplyIdentifier)
+	require.NoError(t, err)
+	return want, inFlight
+}
+
+func assertListedOnce(t *testing.T, want map[string]bool, seen map[string]int) {
+	t.Helper()
+	for identifier := range want {
+		if !assert.Equal(t, 1, seen[identifier], "%s must be listed exactly once", identifier) {
+			return
+		}
+	}
+	assert.Len(t, seen, len(want), "only applies matching the filters are listed")
+}
+
+// More applies match an environment than the server serves in one page. An
+// operator walks every page at the page cap and gets each apply exactly once,
+// with the state counts on every page covering the whole listing.
+func TestStatusPageWalkListsEveryApplyAcrossTheCap(t *testing.T) {
+	server := newPagingServer(t)
+	want, _ := server.seedStatusFleet(t, maxStatusLimit+150)
+
+	seen, pages := server.walkStatus(t, url.Values{"environment": {"staging"}, "limit": {fmt.Sprint(maxStatusLimit)}}, nil)
+	require.Len(t, pages, 2)
+	assert.Len(t, pages[0].Applies, maxStatusLimit)
+	assert.Len(t, pages[1].Applies, len(want)-maxStatusLimit)
+	assertListedOnce(t, want, seen)
+	for i, page := range pages {
+		total := 0
+		for _, n := range page.StateCounts {
+			total += n
+		}
+		assert.Equal(t, len(want), total, "page %d counts every matching apply", i)
+	}
+}
+
+// An operator walks the listing in small pages while the fleet keeps moving:
+// the in-flight apply the first page led with finishes, and new applies are
+// created, between pages. Both move to the top of the order, above every page
+// still to come, so every apply that existed when the walk began is listed
+// exactly once, and each new one at most once.
+func TestStatusPageWalkSurvivesChangesMidWalk(t *testing.T) {
+	server := newPagingServer(t)
+	want, inFlight := server.seedStatusFleet(t, 240)
+	newLock := storagetest.CreateLock(t, server.store, "fleet_new", storage.DatabaseTypeMySQL)
+
+	var created []string
+	seen, pages := server.walkStatus(t, url.Values{"environment": {"staging"}, "limit": {"25"}}, func(page int) {
+		if page == 0 {
+			finished, err := server.store.Applies().Get(t.Context(), inFlight.ID)
+			require.NoError(t, err)
+			finished.State = state.Apply.Completed
+			require.NoError(t, server.store.Applies().Update(t.Context(), finished))
+		}
+		if page < 3 {
+			identifier := fmt.Sprintf("apply-fleet-new-%d", page)
+			storagetest.CreateApplyWithStateAndEnv(t, server.store, newLock, identifier, int64(20_000+page), state.Apply.Completed, "staging")
+			created = append(created, identifier)
+		}
+	})
+	require.NotEmpty(t, pages)
+	require.NotEmpty(t, pages[0].Applies)
+	assert.Equal(t, inFlight.ApplyIdentifier, pages[0].Applies[0].ApplyID, "the first page leads with in-flight work")
+	assert.Greater(t, len(pages), 5, "the walk spans many pages")
+
+	for _, identifier := range created {
+		assert.LessOrEqual(t, seen[identifier], 1, "%s, created during the walk, is listed at most once", identifier)
+		delete(seen, identifier)
+	}
+	assertListedOnce(t, want, seen)
+}
+
+// The page walk keeps every filter the first page was listed under: here a
+// database and a state filter together, against a fleet where most applies
+// match neither.
+func TestStatusPageWalkKeepsFilters(t *testing.T) {
+	server := newPagingServer(t)
+	server.seedStatusFleet(t, 300)
+
+	var everything apitypes.StatusResponse
+	server.get(t, "/api/status", url.Values{"environment": {"staging"}, "database": {"fleet_orders"}, "state": {"completed"}, "limit": {fmt.Sprint(maxStatusLimit)}}, &everything)
+	require.False(t, everything.HasMore)
+	want := map[string]bool{}
+	for _, apply := range everything.Applies {
+		require.Equal(t, "fleet_orders", apply.Database)
+		require.Equal(t, state.Apply.Completed, apply.State)
+		want[apply.ApplyID] = true
+	}
+	require.Greater(t, len(want), 30)
+
+	seen, pages := server.walkStatus(t, url.Values{"environment": {"staging"}, "database": {"fleet_orders"}, "state": {"completed"}, "limit": {"30"}}, nil)
+	assert.Greater(t, len(pages), 1)
+	assertListedOnce(t, want, seen)
+}

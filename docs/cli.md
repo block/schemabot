@@ -260,6 +260,11 @@ $ schemabot status -e staging
 Use 'schemabot status <apply_id>' to view details
 ```
 
+Raise `--limit` to see more changes. Past the server's cap of 1,000, `status`
+names the apply to pass to `--after` for the next page; `--all` follows every
+page for you. The [schema intelligence guide](schema-intelligence.md#whats-running-across-the-fleet)
+shows a paged walk.
+
 Inspect one apply with `status <apply_id>` for a single snapshot, or use
 `progress <apply_id>` to keep watching. The [progress example](#follow-and-control-a-change) shows the live view.
 Stored plans have their own inventory:

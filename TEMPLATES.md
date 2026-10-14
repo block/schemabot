@@ -8598,6 +8598,28 @@ No active applies:
 
 No recent schema changes
 
+More applies than the server's cap:
+
+Recent schema changes
+
+  APPLY ID      DATABASE    ENV      STATE      STARTED      SOURCE
+  apply_jkl012  orders-db   staging  Completed  3 hours ago  https://github.com/acme/shop/pull/415
+  apply_mno345  billing-db  staging  Completed  5 hours ago  cli:jdoe
+
+Showing the 2 most recent schema changes. Add --after apply_mno345 for the next 2.
+Use 'schemabot status <apply_id>' to view details
+
+The next page, reached with --after apply_mno345:
+
+Recent schema changes
+
+  APPLY ID      DATABASE    ENV      STATE      STARTED      SOURCE
+  apply_pqr678  orders-db   staging  Completed  7 hours ago  https://github.com/acme/shop/pull/409
+  apply_stu901  billing-db  staging  Failed     9 hours ago  cli:jdoe
+
+Showing 2 more schema changes. Add --after apply_stu901 for the next 2.
+Use 'schemabot status <apply_id>' to view details
+
 ```
 </details>
 

@@ -77,6 +77,60 @@ func previewStatusListOutput() {
 		ActiveCount: 0,
 		Applies:     nil,
 	})
+
+	fmt.Println()
+	fmt.Println("More applies than the server's cap:")
+	fmt.Println()
+	pageApplies := []ActiveApplyData{
+		{
+			ApplyID:     "apply_jkl012",
+			Database:    "orders-db",
+			Environment: "staging",
+			State:       state.Apply.Completed,
+			Engine:      "Spirit",
+			Caller:      "github:octocat@acme/shop#415",
+			StartedAt:   previewTime.Add(-3 * time.Hour).Format(time.RFC3339),
+			UpdatedAt:   previewTime.Add(-150 * time.Minute).Format(time.RFC3339),
+		},
+		{
+			ApplyID:     "apply_mno345",
+			Database:    "billing-db",
+			Environment: "staging",
+			State:       state.Apply.Completed,
+			Engine:      "Spirit",
+			Caller:      "cli:jdoe@macbook.local",
+			StartedAt:   previewTime.Add(-5 * time.Hour).Format(time.RFC3339),
+			UpdatedAt:   previewTime.Add(-270 * time.Minute).Format(time.RFC3339),
+		},
+	}
+	WriteStatusList(StatusListData{Limit: 2, MaxLimit: 2, HasMore: true, Applies: pageApplies})
+
+	fmt.Println()
+	fmt.Println("The next page, reached with --after apply_mno345:")
+	fmt.Println()
+	nextApplies := []ActiveApplyData{
+		{
+			ApplyID:     "apply_pqr678",
+			Database:    "orders-db",
+			Environment: "staging",
+			State:       state.Apply.Completed,
+			Engine:      "Spirit",
+			Caller:      "github:octocat@acme/shop#409",
+			StartedAt:   previewTime.Add(-7 * time.Hour).Format(time.RFC3339),
+			UpdatedAt:   previewTime.Add(-400 * time.Minute).Format(time.RFC3339),
+		},
+		{
+			ApplyID:     "apply_stu901",
+			Database:    "billing-db",
+			Environment: "staging",
+			State:       state.Apply.Failed,
+			Engine:      "Spirit",
+			Caller:      "cli:jdoe@macbook.local",
+			StartedAt:   previewTime.Add(-9 * time.Hour).Format(time.RFC3339),
+			UpdatedAt:   previewTime.Add(-530 * time.Minute).Format(time.RFC3339),
+		},
+	}
+	WriteStatusList(StatusListData{Limit: 2, MaxLimit: 2, HasMore: true, Continued: true, Applies: nextApplies})
 }
 
 func previewStatusDeploymentOutput() {

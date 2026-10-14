@@ -374,6 +374,18 @@ func (s *recentApplyStore) GetRecent(_ context.Context, filter storage.RecentApp
 	return applies, nil
 }
 
+func (s *recentApplyStore) GetByApplyIdentifier(_ context.Context, applyIdentifier string) (*storage.Apply, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
+	for _, apply := range s.applies {
+		if apply.ApplyIdentifier == applyIdentifier {
+			return apply, nil
+		}
+	}
+	return nil, nil
+}
+
 func (s *recentApplyStore) CountRecentByState(_ context.Context, filter storage.RecentAppliesFilter) (map[string]int, error) {
 	if s.err != nil {
 		return nil, s.err

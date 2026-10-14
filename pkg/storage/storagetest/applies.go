@@ -3,6 +3,7 @@ package storagetest
 import (
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
 	"sync"
 	"testing"
@@ -68,6 +69,123 @@ func TestApplies(t *testing.T, h Harness) {
 		deleted, err := store.Applies().Get(ctx, id)
 		require.NoError(t, err)
 		assert.Nil(t, deleted)
+	})
+
+	// An operator walks the recent-applies list page by page, each page starting
+	// below the last apply the previous one showed, while a new apply is created
+	// between pages. Every apply that existed when the walk began is listed
+	// exactly once, the new one at most once, and an apply outside the filters
+	// never.
+	t.Run("GetRecent_BeforeListsEveryApplyOnce", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+
+		// The in-flight apply is the oldest row, so the first page lists it
+		// ahead of newer settled work and the walk must not list it again.
+		inFlight := CreateApplyWithStateAndEnv(t, store, CreateLock(t, store, "walk_inflight", storage.DatabaseTypeMySQL),
+			"apply_walk_inflight", 1, state.Apply.Running, "staging")
+		settledLock := CreateLock(t, store, "walk_settled", storage.DatabaseTypeMySQL)
+		want := map[string]bool{inFlight.ApplyIdentifier: true}
+		for i := range 7 {
+			apply := CreateApplyWithStateAndEnv(t, store, settledLock, fmt.Sprintf("apply_walk_settled_%d", i), int64(10+i), state.Apply.Completed, "staging")
+			want[apply.ApplyIdentifier] = true
+		}
+		CreateApplyWithStateAndEnv(t, store, settledLock, "apply_walk_other_env", 30, state.Apply.Completed, "production")
+
+		filter := storage.RecentAppliesFilter{Environment: "staging"}
+		seen := map[string]int{}
+		const pageSize = 3
+		for page := 0; ; page++ {
+			require.Less(t, page, 10, "the walk must end")
+			filter.Limit = pageSize + 1
+			applies, err := store.Applies().GetRecent(ctx, filter)
+			require.NoError(t, err)
+			hasMore := len(applies) > pageSize
+			if hasMore {
+				applies = applies[:pageSize]
+			}
+			if page == 0 {
+				require.NotEmpty(t, applies)
+				assert.Equal(t, inFlight.ApplyIdentifier, applies[0].ApplyIdentifier, "the first page leads with in-flight work")
+			}
+			for _, apply := range applies {
+				seen[apply.ApplyIdentifier]++
+			}
+			if !hasMore {
+				break
+			}
+			filter.AfterID = applies[len(applies)-1].ID
+			if page == 0 {
+				CreateApplyWithStateAndEnv(t, store, settledLock, "apply_walk_created_mid_walk", 40, state.Apply.Completed, "staging")
+			}
+		}
+
+		assert.LessOrEqual(t, seen["apply_walk_created_mid_walk"], 1, "an apply created during the walk is listed at most once")
+		delete(seen, "apply_walk_created_mid_walk")
+		for identifier := range want {
+			assert.Equal(t, 1, seen[identifier], "%s must be listed exactly once", identifier)
+		}
+		assert.Len(t, seen, len(want), "only applies matching the filter are listed: %v", seen)
+	})
+
+	t.Run("GetRecent_FiltersByDatabase", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		orders := CreateApplyWithStateAndEnv(t, store, CreateLock(t, store, "orders", storage.DatabaseTypeMySQL),
+			"apply_orders", 1, state.Apply.Completed, "staging")
+		CreateApplyWithStateAndEnv(t, store, CreateLock(t, store, "billing", storage.DatabaseTypeMySQL),
+			"apply_billing", 2, state.Apply.Failed, "staging")
+
+		filter := storage.RecentAppliesFilter{Limit: 10, Database: "ORDERS"}
+		recent, err := store.Applies().GetRecent(ctx, filter)
+		require.NoError(t, err)
+		require.Len(t, recent, 1)
+		assert.Equal(t, orders.ApplyIdentifier, recent[0].ApplyIdentifier)
+
+		filter.AfterID = orders.ID
+		after, err := store.Applies().GetRecent(ctx, filter)
+		require.NoError(t, err)
+		assert.Empty(t, after, "a later page keeps the database filter")
+
+		counts, err := store.Applies().CountRecentByState(ctx, filter)
+		require.NoError(t, err)
+		assert.Equal(t, map[string]int{state.Apply.Completed: 1}, counts, "counts ignore the page position and keep the filter")
+	})
+
+	// More applies are in flight than one page shows. The live group sorts by
+	// start time, so the page after a live apply continues with the live
+	// applies that started later, then the settled ones, without repeating any.
+	t.Run("GetRecent_BeforeALiveApply", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		settled := CreateApplyWithStateAndEnv(t, store, CreateLock(t, store, "walk_settled", storage.DatabaseTypeMySQL),
+			"apply_live_walk_settled", 1, state.Apply.Completed, "staging")
+		started := time.Now().Add(-time.Hour)
+		var live []*storage.Apply
+		for i := range 3 {
+			lock := CreateLock(t, store, fmt.Sprintf("walk_live_%d", i), storage.DatabaseTypeMySQL)
+			apply := CreateApplyWithStateAndEnv(t, store, lock, fmt.Sprintf("apply_live_walk_%d", i), int64(10+i), state.Apply.Running, "staging")
+			// The newest row started first, so start order and row order disagree.
+			startedAt := started.Add(-time.Duration(i) * time.Minute)
+			apply.StartedAt = &startedAt
+			require.NoError(t, store.Applies().Update(ctx, apply))
+			live = append(live, apply)
+		}
+
+		filter := storage.RecentAppliesFilter{Limit: 1, Environment: "staging"}
+		var order []string
+		for range 10 {
+			applies, err := store.Applies().GetRecent(ctx, filter)
+			require.NoError(t, err)
+			if len(applies) == 0 {
+				break
+			}
+			order = append(order, applies[0].ApplyIdentifier)
+			filter.AfterID = applies[0].ID
+		}
+		assert.Equal(t, []string{
+			live[2].ApplyIdentifier, live[1].ApplyIdentifier, live[0].ApplyIdentifier, settled.ApplyIdentifier,
+		}, order, "live applies oldest start first, then settled work")
 	})
 
 	t.Run("Create_Get_Update", func(t *testing.T) {

@@ -833,6 +833,9 @@ type StatusOptions struct {
 	// state, so a caller asking whether a target is busy does not page through
 	// settled history.
 	Active bool
+	// After fetches the page that follows this apply ID, the last one an
+	// earlier page listed. The other options must repeat that page's filters.
+	After string
 }
 
 // GetStatus fetches recent schema changes.
@@ -861,6 +864,9 @@ func GetStatus(endpoint string, opts ...StatusOptions) (*apitypes.StatusResponse
 		}
 		if opts[0].Active {
 			values.Set("active", "true")
+		}
+		if opts[0].After != "" {
+			values.Set("starting_after", opts[0].After)
 		}
 		if encoded := values.Encode(); encoded != "" {
 			requestPath += "?" + encoded

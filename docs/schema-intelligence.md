@@ -1026,19 +1026,118 @@ within the last day.
 | Filter | Meaning |
 |---|---|
 | `environment`, `deployment` | Scope to one environment or one data plane |
+| `database` | Scope to one database |
 | `active=true` | Only applies still in flight |
 | `state=<state>` or `failed=true` | Only applies in a state, or only failures |
 | `last=<duration>` | Only applies updated within a window, such as `24h` |
-| `limit` | Result limit: default 20, maximum 1,000 |
-
-Check `has_more` before treating the list as complete. There is no pagination
-cursor; increase the limit or narrow the filters. Even at the maximum, a
-busy scope can exceed the returned list. `state_counts` still covers all
-matching applies.
+| `limit` | Page size: default 20, maximum 1,000 |
+| `starting_after` | The ID of the last apply the previous page listed |
 
 Applies being driven right now are listed first, oldest start first — the
 longer a schema change has held a table, the higher it sits — and the rest
 follow, most recently active first.
+
+When more applies match than one page holds, the response sets `has_more`.
+Request the next page with the same filters and `starting_after` set to the
+last apply's ID; repeat until `has_more` is false. The page starts after that
+apply's current place in the order, so an apply that settled before the walk
+is listed exactly once. An apply that starts, finishes, or is retried during
+the walk moves to the top of the order, where the first page shows it, rather
+than reappearing on a later page. A `last` window is measured from each
+request. `starting_after` must name an apply in the same environment,
+database, and deployment as the filters; anything else returns `400` naming
+the mismatch. The response echoes `starting_after`, so a client can tell a
+continued page from the first page of a server that predates paging. `limit`
+may change between pages, and `state_counts` covers every matching apply on
+every page.
+
+Below the server's cap, a truncated CLI list says to raise `--limit`. Once a
+page is at the cap, the footer names the apply to pass to `--after` for the
+next page:
+
+```sh
+schemabot status -e staging -n 1000
+```
+
+Output excerpt (illustrative values):
+
+```text
+1 active schema change
+1171 total: 1150 Completed · 20 Failed · 1 Running
+
+  APPLY ID            DATABASE  ENV      STATE      STARTED         SOURCE
+  apply-example-1171  shop      staging  Running    20 minutes ago  example/store#42
+  ...
+  apply-example-172   billing   staging  Completed  9 days ago      example/billing#75
+
+Showing the 1000 most recent schema changes. Add --after apply-example-172 for the next 1000.
+Use 'schemabot status <apply_id>' to view details
+```
+
+```sh
+schemabot status -e staging -n 1000 --after apply-example-172
+```
+
+Output excerpt (illustrative values):
+
+```text
+Recent schema changes
+1171 total: 1150 Completed · 20 Failed · 1 Running
+
+  APPLY ID           DATABASE  ENV      STATE      STARTED       SOURCE
+  apply-example-171  accounts  staging  Completed  9 days ago    example/accounts#19
+  ...
+  apply-example-1    shop      staging  Failed     3 months ago  example/store#2
+
+Use 'schemabot status <apply_id>' to view details
+```
+
+`--all` requests every page itself, 1,000 applies per request unless `-n`
+sets the page size, and prints every matching apply as one list. With
+`--json` it returns a single response whose `applies` array holds every page:
+
+```sh
+schemabot status -e staging --all --json
+```
+
+Output excerpt (illustrative values):
+
+```json
+{
+  "active_count": 1,
+  "limit": 1000,
+  "max_limit": 1000,
+  "state_counts": {
+    "completed": 4,
+    "running": 1
+  },
+  "applies": [
+    {
+      "apply_id": "apply-example-73",
+      "database": "shop",
+      "environment": "staging",
+      "engine": "spirit",
+      "state": "running",
+      "caller": "example/store#42",
+      "started_at": "2026-09-01T02:41:00Z",
+      "updated_at": "2026-09-01T03:01:00Z"
+    },
+    {
+      "apply_id": "apply-example-76",
+      "database": "billing",
+      "environment": "staging",
+      "engine": "spirit",
+      "state": "completed",
+      "caller": "example/billing#75",
+      "started_at": "2026-09-01T02:00:00Z",
+      "completed_at": "2026-09-01T02:20:00Z",
+      "updated_at": "2026-09-01T02:20:00Z"
+    }
+  ]
+}
+```
+
+The excerpt shows the first two of the five applies.
 
 Each row carries the apply ID, database, environment, state, engine, caller,
 error message, and started, completed, and updated timestamps. A row carries
@@ -1140,6 +1239,71 @@ Response excerpt (illustrative values):
       "updated_at": "2026-09-01T03:01:00Z"
     }
   ]
+}
+```
+
+</details>
+
+<details>
+<summary>Paged request and response example</summary>
+
+```http
+GET /api/status?environment=staging&limit=2
+```
+
+Response excerpt (illustrative values):
+
+```json
+{
+  "active_count": 1,
+  "limit": 2,
+  "max_limit": 1000,
+  "has_more": true,
+  "state_counts": {
+    "completed": 4,
+    "running": 1
+  },
+  "applies": [
+    {
+      "apply_id": "apply-example-73",
+      "database": "shop",
+      "environment": "staging",
+      "engine": "spirit",
+      "state": "running",
+      "caller": "example/store#42",
+      "started_at": "2026-09-01T02:41:00Z",
+      "updated_at": "2026-09-01T03:01:00Z"
+    },
+    {
+      "apply_id": "apply-example-76",
+      "database": "billing",
+      "environment": "staging",
+      "engine": "spirit",
+      "state": "completed",
+      "caller": "example/billing#75",
+      "started_at": "2026-09-01T02:00:00Z",
+      "completed_at": "2026-09-01T02:20:00Z",
+      "updated_at": "2026-09-01T02:20:00Z"
+    }
+  ]
+}
+```
+
+The next page repeats the filters and starts after the last apply listed:
+
+```http
+GET /api/status?environment=staging&limit=2&starting_after=apply-example-76
+```
+
+An apply from a different listing is refused:
+
+```http
+GET /api/status?environment=production&limit=2&starting_after=apply-example-76
+```
+
+```json
+{
+  "error": "starting_after apply apply-example-76 is in environment staging, not production; repeat the previous page's filters"
 }
 ```
 
