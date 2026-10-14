@@ -737,6 +737,13 @@ type ApplyStore interface {
 	// Note: For recovery, use ClaimApplyByID which handles locking.
 	GetInProgress(ctx context.Context) ([]*Apply, error)
 
+	// GetUnsettled returns every apply a driver may still claim: the
+	// non-terminal applies GetInProgress returns, and the stopped ones, which
+	// are terminal for claiming but resumable (state.SettledApplyStates). A
+	// reader deciding whether an apply's engine resources are still in use
+	// reads this set, since a stopped apply resumes from them.
+	GetUnsettled(ctx context.Context) ([]*Apply, error)
+
 	// FindStuckPendingApplies returns pending applies that a driver should
 	// already have claimed — pending with child rows (the child-rows arm of
 	// ClaimApplyByID's pending predicate) — but whose created_at is older than
@@ -913,6 +920,19 @@ type ApplyStore interface {
 	// The lock is held for as long as fn runs, so fn must be bounded: every
 	// apply competing for this target waits behind it.
 	WithExclusiveTarget(ctx context.Context, apply *Apply, fn func(context.Context) error) error
+
+	// WithTargetHeld runs fn while holding the advisory lock of the apply
+	// target named by database, dbType, and environment. It is the hold
+	// WithExclusiveTarget gives without its refusal: fn runs alongside the
+	// applies that already own the target, and what the lock gives it is that
+	// no apply is created for, or claimed on, the target until fn returns.
+	//
+	// It is for work that reclaims what no apply owns any more, decided from
+	// the applies in storage: fn reads them under the lock, so the set it reads
+	// is still the set when its last statement runs. Like WithExclusiveTarget it
+	// binds SchemaBot's own applies and nothing else, and fn must be bounded,
+	// because every apply competing for the target waits behind it.
+	WithTargetHeld(ctx context.Context, database, dbType, environment string, fn func(context.Context) error) error
 
 	// ExpireRetryable transitions failed_retryable applies that exhausted their
 	// retry budget or recovery freshness window to permanent failed, settling

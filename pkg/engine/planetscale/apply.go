@@ -245,7 +245,7 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (result *e
 
 	} else {
 		// Create a new branch
-		branchName = generateBranchName(req.Database, req.PlanID)
+		branchName = GenerateBranchName(req.Database, req.PlanID)
 		persistState(&psMetadata{BranchName: branchName})
 		emitEvent(engine.ApplyEvent{
 			Message:  fmt.Sprintf("Creating branch %s", branchName),

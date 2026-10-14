@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -85,6 +86,10 @@ type PSClient interface {
 	ApplyDeployRequest(ctx context.Context, req *ps.ApplyDeployRequestRequest) (*ps.DeployRequest, error)
 	RevertDeployRequest(ctx context.Context, req *ps.RevertDeployRequestRequest) (*ps.DeployRequest, error)
 	SkipRevertDeployRequest(ctx context.Context, req *ps.SkipRevertDeployRequestRequest) (*ps.DeployRequest, error)
+
+	// ListBranches lists every branch of a database, reading each page the API
+	// reports.
+	ListBranches(ctx context.Context, req *ps.ListDatabaseBranchesRequest) ([]*ps.DatabaseBranch, error)
 
 	// ListDeployRequests lists all deploy requests for a database.
 	ListDeployRequests(ctx context.Context, req *ps.ListDeployRequestsRequest) ([]*ps.DeployRequest, error)
@@ -300,65 +305,111 @@ const defaultKeyspaceListingTimeout = 2 * planetScaleHTTPTimeout
 // whole timed out and how many pages it had read, which tells it apart from a
 // single page timing out and from ctx itself ending.
 func (w *psClientWrapper) ListKeyspaces(ctx context.Context, req *ps.ListKeyspacesRequest) ([]*ps.Keyspace, error) {
-	listingTimeout := w.listingTimeout()
-	listCtx, cancel := context.WithTimeoutCause(ctx, listingTimeout, errKeyspaceListingBound)
-	defer cancel()
-
 	// Each name is its own path segment, so a character that URL syntax gives
 	// meaning to cannot retarget the request or swallow the page query.
 	basePath := fmt.Sprintf("/v1/organizations/%s/databases/%s/branches/%s/keyspaces",
 		url.PathEscape(req.Organization), url.PathEscape(req.Database), url.PathEscape(req.Branch))
-	var keyspaces []*ps.Keyspace
+	return listAllPages(ctx, w, pagedListing[*ps.Keyspace]{
+		basePath:      basePath,
+		noun:          "keyspaces",
+		scope:         fmt.Sprintf("%s/%s branch %s", req.Organization, req.Database, req.Branch),
+		key:           func(k *ps.Keyspace) string { return k.Name },
+		repeatMessage: "keyspace listed on two pages; the branch's keyspaces changed while they were being listed, so a keyspace may have been skipped",
+		repeatAttrs:   []any{"organization", req.Organization, "database", req.Database, "branch", req.Branch},
+		repeatKey:     "keyspace",
+	})
+}
+
+// ListBranches returns every branch of the database, reading each page the API
+// reports, on the same terms as ListKeyspaces: the SDK's list call reads only
+// the first page, so the listing uses raw HTTP and is bounded as a whole.
+func (w *psClientWrapper) ListBranches(ctx context.Context, req *ps.ListDatabaseBranchesRequest) ([]*ps.DatabaseBranch, error) {
+	basePath := fmt.Sprintf("/v1/organizations/%s/databases/%s/branches",
+		url.PathEscape(req.Organization), url.PathEscape(req.Database))
+	return listAllPages(ctx, w, pagedListing[*ps.DatabaseBranch]{
+		basePath:      basePath,
+		noun:          "branches",
+		scope:         fmt.Sprintf("%s/%s", req.Organization, req.Database),
+		key:           func(b *ps.DatabaseBranch) string { return b.Name },
+		repeatMessage: "branch listed on two pages; the database's branches changed while they were being listed, so a branch may have been skipped",
+		repeatAttrs:   []any{"organization", req.Organization, "database", req.Database},
+		repeatKey:     "branch",
+	})
+}
+
+// pagedListing describes one raw paged listing for listAllPages: where it is
+// read from, how its errors name it, and how a repeated entry is recognized
+// and logged.
+type pagedListing[T any] struct {
+	basePath      string
+	noun          string
+	scope         string
+	key           func(T) string
+	repeatMessage string
+	repeatAttrs   []any
+	repeatKey     string
+}
+
+// listAllPages reads every page of a raw paged listing, following the API's
+// next_page. It reads at most maxKeyspacePages pages and ends by the wrapper's
+// listing timeout whatever ctx carries, and fails rather than return a partial
+// view. An entry repeated on a later page is kept once and logged (see
+// ListKeyspaces for why).
+func listAllPages[T any](ctx context.Context, w *psClientWrapper, l pagedListing[T]) ([]T, error) {
+	listingTimeout := w.listingTimeout()
+	listCtx, cancel := context.WithTimeoutCause(ctx, listingTimeout, errListingBound)
+	defer cancel()
+
+	var items []T
 	seen := make(map[string]int)
 	page := 1
 	for fetched := 1; ; fetched++ {
 		if fetched > maxKeyspacePages {
-			return nil, fmt.Errorf("list keyspaces for %s/%s branch %s: API still reports page %d after %d pages and %d keyspaces", req.Organization, req.Database, req.Branch, page, maxKeyspacePages, len(keyspaces))
+			return nil, fmt.Errorf("list %s for %s: API still reports page %d after %d pages and %d %s", l.noun, l.scope, page, maxKeyspacePages, len(items), l.noun)
 		}
 		query := url.Values{}
 		query.Set("page", strconv.Itoa(page))
 		query.Set("per_page", strconv.Itoa(keyspacesPerPage))
-		respBody, err := w.doRawJSON(listCtx, http.MethodGet, basePath+"?"+query.Encode(), nil)
+		respBody, err := w.doRawJSON(listCtx, http.MethodGet, l.basePath+"?"+query.Encode(), nil)
 		if err != nil {
 			if listingBoundEnded(listCtx, err) {
-				return nil, fmt.Errorf("list keyspaces for %s/%s branch %s: listing as a whole timed out after %s (pages read: %d, waiting on page %d): %w",
-					req.Organization, req.Database, req.Branch, listingTimeout, fetched-1, page, err)
+				return nil, fmt.Errorf("list %s for %s: listing as a whole timed out after %s (pages read: %d, waiting on page %d): %w",
+					l.noun, l.scope, listingTimeout, fetched-1, page, err)
 			}
-			return nil, fmt.Errorf("list keyspaces for %s/%s branch %s page %d: %w", req.Organization, req.Database, req.Branch, page, err)
+			return nil, fmt.Errorf("list %s for %s page %d: %w", l.noun, l.scope, page, err)
 		}
 		var payload struct {
-			Data     []*ps.Keyspace `json:"data"`
-			NextPage *int           `json:"next_page"`
+			Data     []T  `json:"data"`
+			NextPage *int `json:"next_page"`
 		}
 		if err := json.Unmarshal(respBody, &payload); err != nil {
-			return nil, fmt.Errorf("decode keyspaces for %s/%s branch %s page %d: %w", req.Organization, req.Database, req.Branch, page, err)
+			return nil, fmt.Errorf("decode %s for %s page %d: %w", l.noun, l.scope, page, err)
 		}
-		for _, keyspace := range payload.Data {
-			if firstPage, ok := seen[keyspace.Name]; ok {
-				slog.Warn("keyspace listed on two pages; the branch's keyspaces changed while they were being listed, so a keyspace may have been skipped",
-					"organization", req.Organization, "database", req.Database, "branch", req.Branch,
-					"keyspace", keyspace.Name, "first_page", firstPage, "page", page)
+		for _, item := range payload.Data {
+			name := l.key(item)
+			if firstPage, ok := seen[name]; ok {
+				slog.Warn(l.repeatMessage, append(slices.Clone(l.repeatAttrs), l.repeatKey, name, "first_page", firstPage, "page", page)...)
 				continue
 			}
-			seen[keyspace.Name] = page
-			keyspaces = append(keyspaces, keyspace)
+			seen[name] = page
+			items = append(items, item)
 		}
 		if payload.NextPage == nil || *payload.NextPage == 0 {
-			return keyspaces, nil
+			return items, nil
 		}
 		if *payload.NextPage <= page {
-			return nil, fmt.Errorf("list keyspaces for %s/%s branch %s: page %d reports next page %d, which does not advance", req.Organization, req.Database, req.Branch, page, *payload.NextPage)
+			return nil, fmt.Errorf("list %s for %s: page %d reports next page %d, which does not advance", l.noun, l.scope, page, *payload.NextPage)
 		}
 		page = *payload.NextPage
 	}
 }
 
-// errKeyspaceListingBound is the cancellation cause recorded on a listing's
+// errListingBound is the cancellation cause recorded on a listing's
 // context when its own overall bound, rather than the caller's deadline or
 // cancellation, ends it. It wraps context.DeadlineExceeded because the HTTP
 // client reports a request ended by its context with the context's cause, and
 // callers match a listing that ran out of time as a deadline.
-var errKeyspaceListingBound = fmt.Errorf("keyspace listing bound reached: %w", context.DeadlineExceeded)
+var errListingBound = fmt.Errorf("listing bound reached: %w", context.DeadlineExceeded)
 
 // listingBoundEnded reports whether a page request failed because the
 // listing's own overall bound ended listCtx. The context's cause records which
@@ -368,7 +419,7 @@ var errKeyspaceListingBound = fmt.Errorf("keyspace listing bound reached: %w", c
 // the listing's. The request error must itself be a deadline, so a page that
 // failed for another reason as the bound fired keeps its own error.
 func listingBoundEnded(listCtx context.Context, err error) bool {
-	return errors.Is(context.Cause(listCtx), errKeyspaceListingBound) && errors.Is(err, context.DeadlineExceeded)
+	return errors.Is(context.Cause(listCtx), errListingBound) && errors.Is(err, context.DeadlineExceeded)
 }
 
 func (w *psClientWrapper) GetKeyspaceVSchema(ctx context.Context, req *ps.GetKeyspaceVSchemaRequest) (*ps.VSchema, error) {

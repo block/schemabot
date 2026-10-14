@@ -119,7 +119,7 @@ func TestGenerateBranchName(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := generateBranchName(tt.database, tt.planID)
+			got := GenerateBranchName(tt.database, tt.planID)
 			assert.Equal(t, tt.expected, got)
 		})
 	}
