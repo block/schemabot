@@ -3130,7 +3130,7 @@ type TableProgress struct {
 	// ProgressResponse. Empty when the table has not failed.
 	ErrorMessage string `protobuf:"bytes,16,opt,name=error_message,json=errorMessage,proto3" json:"error_message,omitempty"`
 	// The engine's throttler is pausing this table's active phase (row copy or
-	// checksum verify), so stalled row counts read as a deliberate pause rather
+	// checksum verification), so stalled row counts read as a deliberate pause rather
 	// than a hang. Cleared when the pause lifts.
 	Throttled bool `protobuf:"varint,17,opt,name=throttled,proto3" json:"throttled,omitempty"`
 	// Names the signal pausing the work, for display (e.g. "replica-lag 5s >=

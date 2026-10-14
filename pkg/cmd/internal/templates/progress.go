@@ -528,7 +528,7 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 	case state.Task.Checksumming:
 		// Row copy is done; the engine is verifying the copied data against the
 		// source. On a large table this can run for hours, so show how far the
-		// verify has progressed once Spirit has reported a total.
+		// verification has progressed once Spirit has reported a total.
 		if t.ChecksumRowsTotal > 0 {
 			checksumPct := int(math.Round(float64(t.ChecksumRowsChecked) * 100 / float64(t.ChecksumRowsTotal)))
 			pct := ui.RowCopyDisplayPercent(checksumPct, t.ChecksumRowsChecked)
@@ -550,7 +550,7 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 		b.WriteString(formatTableParts(t))
 		return b.String()
 	case state.Task.PostChecksum:
-		// The verify passed and the engine is applying the changes that
+		// The verification passed and the engine is applying the changes that
 		// accumulated while it ran. Named separately from the pre-checksum
 		// catch-up so the display doesn't rewind to an earlier phase.
 		writeTableLine(&b, t, "%s ⏩ Data verified, applying final changes...", ui.ProgressBarRowCopy(100))

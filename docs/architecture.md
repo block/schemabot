@@ -725,11 +725,11 @@ Key details:
 - **`IsComplete`** comes from the chunker's in-memory `finalChunkSent` flag, NOT from the checkpoint table. This means `IsComplete` is lost on crash — it only exists while the runner is alive.
 - **`RowsCopied` can exceed `RowsTotal`** when the initial MySQL estimate is low. Downstream renderers treat this as an active estimate-exceeded state rather than a percentage above 100%.
 - **`Checksum` progress (`prog.Checksum.RowsChecked` / `RowsTotal`) is populated only while
-  `CurrentState == Checksum`** — it reads zero before the verify starts and again after it
+  `CurrentState == Checksum`** — it reads zero before the verification starts and again after it
   finishes (including during `PostChecksum`). A renderer that shows checksum counters for any
   other phase shows zeros.
 - **`Throttle` is populated only for the paced phases** — the row copy and the checksum
-  verify report the throttler's live status; every other phase reports the zero
+  verification report the throttler's live status; every other phase reports the zero
   `ThrottleStatus{}`, so a finished schema change can never look paused on an aged-out
   signal. A composite throttler joins the reasons of every currently-throttling child with
   `"; "`, and `Throttled` can be true with an empty `Reason` (a throttler that implements
@@ -787,11 +787,11 @@ Two properties matter for display:
      cutting over) — only outside those phases does it report `"completed"`,
      meaning "done copying while other tables copy".
    - Stamps the runner-wide checksum estimate (`ChecksumRowsChecked`/`Total`) on
-     every table unconditionally — Spirit populates it only during the verify
+     every table unconditionally — Spirit populates it only during the verification
      phase, and every copy is complete by then.
    - Stamps the runner-wide throttle status (`Throttled`/`ThrottleReason`) on the
      tables participating in paced work — a table still copying, or every table
-     during the verify (`tableInPacedPhase`) — so a completed table is never
+     during the verification (`tableInPacedPhase`) — so a completed table is never
      rendered as paused by another table's copy. The reason passes through
      `engine.SanitizeThrottleReason` so it can never break an operator surface.
 4. Sets `ProgressResult.ResumedFromCheckpoint` from `Progress.Resume`, which the

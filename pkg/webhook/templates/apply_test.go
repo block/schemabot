@@ -362,7 +362,7 @@ func TestRenderApplyStatusComment_DrainPhasesFromRawSpiritState(t *testing.T) {
 }
 
 // After the checksum passes, the engine drains the changes that accumulated
-// during the verify. It is a table-level state: the apply header stays
+// during the verification. It is a table-level state: the apply header stays
 // "In Progress" while the per-table line names the post-checksum drain — and
 // never rewinds to an indeterminate checksum that already finished.
 func TestRenderApplyStatusComment_PostChecksum(t *testing.T) {
@@ -391,7 +391,7 @@ func TestRenderApplyStatusComment_PostChecksum(t *testing.T) {
 // A table that has finished copying enters the checksum phase, where the engine
 // verifies the copied data before cutover. It is a table-level state: the apply
 // header stays "In Progress" while the per-table line and summary report
-// checksumming, since on a large table the verify can run for hours.
+// checksumming, since on a large table the verification can run for hours.
 func TestRenderApplyStatusComment_Checksumming(t *testing.T) {
 	data := ApplyStatusCommentData{
 		Database:    "testapp",
@@ -470,8 +470,8 @@ func TestRenderApplyStatusComment_Throttled(t *testing.T) {
 		"markdown delimiters in an unrecognized reason are escaped and render with no tip")
 }
 
-// A throttled checksum verify carries the same header annotation and tooltip
-// alongside the verify progress, since the checksum is the other phase the
+// A throttled checksum verification carries the same header annotation and tooltip
+// alongside the verification progress, since the checksum is the other phase the
 // engine's throttler paces.
 func TestRenderApplyStatusComment_ThrottledChecksumming(t *testing.T) {
 	data := ApplyStatusCommentData{

@@ -1103,7 +1103,7 @@ type TableProgress struct {
 	ChecksumRowsChecked int64
 	ChecksumRowsTotal   int64
 	// Throttled reports that the engine's throttler is currently pausing the
-	// phase this table's work is in (the row copy or the checksum verify), so
+	// phase this table's work is in (the row copy or the checksum verification), so
 	// stalled row counts read as a deliberate pause rather than a hang. False
 	// in phases nothing paces, and cleared when the pause lifts.
 	Throttled bool

@@ -4174,19 +4174,19 @@ func activeTaskProgressRank(taskState string) (int, bool) {
 	case state.Task.CatchingUp:
 		// Row copy is done; the engine is applying the changeset accumulated
 		// from the binlog during the copy. Ranks after Running and before
-		// Checksumming — the verify that follows this first drain — so a
+		// Checksumming — the verification that follows this first drain — so a
 		// later poll never regresses the table to a plain copy.
 		return 3, true
 	case state.Task.Checksumming:
 		// Row copy is done; the engine is verifying the copied data. Ranks after
 		// CatchingUp and before PostChecksum — the second drain that follows
-		// the verify — so a later poll never regresses a checksumming table
+		// the verification — so a later poll never regresses a checksumming table
 		// to an earlier phase.
 		return 4, true
 	case state.Task.PostChecksum:
-		// The verify passed and the engine is applying the changes that
+		// The verification passed and the engine is applying the changes that
 		// accumulated while it ran. Ranks after Checksumming so a stale
-		// checksum poll never rewinds the table into a verify that already
+		// checksum poll never rewinds the table into a verification that already
 		// finished, and before WaitingForCutover — the phase the table moves
 		// through next.
 		return 5, true

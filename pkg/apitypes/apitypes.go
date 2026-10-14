@@ -1819,7 +1819,7 @@ type TableProgressResponse struct {
 	ChecksumRowsChecked int64 `json:"checksum_rows_checked,omitempty"`
 	ChecksumRowsTotal   int64 `json:"checksum_rows_total,omitempty"`
 	// The engine's throttler is pausing this table's active phase (row copy or
-	// checksum verify). ThrottleReason names the signal for display and is
+	// checksum verification). ThrottleReason names the signal for display and is
 	// empty when Throttled is false.
 	Throttled      bool                     `json:"throttled,omitempty"`
 	ThrottleReason string                   `json:"throttle_reason,omitempty"`

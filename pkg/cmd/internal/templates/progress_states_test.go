@@ -634,7 +634,7 @@ func TestFormatTableProgress_CatchingUp(t *testing.T) {
 	assert.Contains(t, output, "Rows copied: 1,466,232")
 }
 
-// A table draining the changes that accumulated during the verify names the
+// A table draining the changes that accumulated during the verification names the
 // post-checksum phase — never an indeterminate checksum that already finished.
 func TestFormatTableProgress_PostChecksum(t *testing.T) {
 	output := FormatTableProgress(TableProgress{
@@ -651,14 +651,14 @@ func TestFormatTableProgress_PostChecksum(t *testing.T) {
 // percent — its copy is done and the engine is now verifying the data, which
 // can run for hours on a large table.
 func TestFormatTableProgress_Checksumming(t *testing.T) {
-	// Before Spirit reports a total, the verify shows an indeterminate label.
+	// Before Spirit reports a total, the verification shows an indeterminate label.
 	measuring := FormatTableProgress(TableProgress{
 		TableName: "orders", ChangeType: "alter", Status: state.Task.Checksumming,
 	})
 	assert.Contains(t, measuring, "orders: ")
 	assert.Contains(t, measuring, "🔍 Checksumming to verify data...")
 
-	// Once a total is known, it shows how far the verify has progressed.
+	// Once a total is known, it shows how far the verification has progressed.
 	withProgress := FormatTableProgress(TableProgress{
 		TableName: "orders", ChangeType: "alter", Status: state.Task.Checksumming,
 		ChecksumRowsChecked: 321450, ChecksumRowsTotal: 1466232,
@@ -666,7 +666,7 @@ func TestFormatTableProgress_Checksumming(t *testing.T) {
 	assert.Contains(t, withProgress, "🔍 Checksumming to verify data (21.92%)")
 	assert.Contains(t, withProgress, "Rows verified: 321,450 / 1,466,232")
 
-	// A verify that has only just begun still renders as visibly started: the
+	// A verification that has only just begun still renders as visibly started: the
 	// bar shows a first segment, and the percent shows the true sub-1% fraction
 	// (floored away from 0.00%) instead of an empty "not started" display while
 	// verification is actively running.
