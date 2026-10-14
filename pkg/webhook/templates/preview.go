@@ -1348,6 +1348,7 @@ func PreviewCommentApplyStarted() string {
 		Environment: "staging",
 		RequestedBy: previewRequestedBy,
 		ApplyID:     "apply-a1b2c3d4e5f6",
+		State:       state.Apply.Pending,
 	})
 }
 

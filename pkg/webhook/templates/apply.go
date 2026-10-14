@@ -430,10 +430,21 @@ func writeApplyStatusDetail(sb *strings.Builder, data ApplyStatusCommentData) {
 		}
 	}
 	fmt.Fprintf(sb, "\n**Status**: %s\n", detail)
+	if state.IsState(data.State, state.Apply.Pending) {
+		sb.WriteString("\n" + queuedApplyExplanation + "\n")
+	}
 	if state.IsState(data.State, state.Apply.Failed) {
 		writeSupportChannelOffer(sb)
 	}
 }
+
+// queuedApplyExplanation follows the status line of an apply SchemaBot has
+// accepted but not yet started. A queued apply can wait while other schema
+// changes hold SchemaBot's capacity, and without this line a comment that stays
+// queued reads the same as one that hung. It says only what is true however
+// long the wait: the change starts without anyone acting, and the comment
+// follows it once it does.
+const queuedApplyExplanation = "This schema change starts automatically, and this comment updates once it does."
 
 func applyStatusDetail(applyState string) string {
 	applyState = state.NormalizeState(applyState)
@@ -453,7 +464,7 @@ func applyStatusDetail(applyState string) string {
 	case state.Apply.Reverting:
 		return "Reverting"
 	case state.Apply.Pending:
-		return "Starting"
+		return "Queued"
 	case state.Apply.Running, state.Apply.RunningDegraded:
 		return "In Progress"
 	case state.Apply.CatchingUp:

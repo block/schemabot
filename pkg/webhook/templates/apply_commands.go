@@ -8,6 +8,7 @@ import (
 
 	"github.com/block/schemabot/pkg/caller"
 	"github.com/block/schemabot/pkg/glyph"
+	"github.com/block/schemabot/pkg/state"
 )
 
 // ApplyLockConflictData contains data for apply lock conflict comments.
@@ -320,12 +321,18 @@ func renderBlockedChangesApplyRejected(data PlanCommentData, budget *ddlBlockBud
 // RenderApplyStarted renders the initial body of the live progress comment when
 // an apply begins. It uses the same stable status title as the in-place status
 // comment the observer later edits this into, so the headline does not jump from
-// one title to another on the first progress update.
+// one title to another on the first progress update. An apply that has not
+// started yet reads as queued, since that is what it is until SchemaBot picks it
+// up and the first progress update replaces this body.
 func RenderApplyStarted(data ApplyStatusCommentData) string {
 	var sb strings.Builder
 
 	writeApplyStatusHeader(&sb, data)
 	writeApplyMetadata(&sb, data, currentTimestamp())
+	if state.IsState(data.State, state.Apply.Pending) {
+		writeApplyStatusDetail(&sb, data)
+		return sb.String()
+	}
 	sb.WriteString("\nSchema changes are being applied. This comment will be updated with progress.\n")
 
 	return sb.String()

@@ -3031,7 +3031,7 @@ func TestE2EEditTrackedCommentNotFound(t *testing.T) {
 // posted — a metadata-only DDL finishes faster than the handler's post, so the
 // driver's observer has already found nothing to edit at terminal. The handler
 // re-checks the apply after posting and finalizes the comment in place, so the
-// PR never shows a progress comment frozen at "Starting" after the success
+// PR never shows a progress comment frozen at "Queued" after the success
 // summary. An apply that is still active is left to the observer to edit.
 func TestE2EInitialProgressCommentFinalizedForFastApply(t *testing.T) {
 	ctx := t.Context()
@@ -3085,7 +3085,7 @@ func TestE2EInitialProgressCommentFinalizedForFastApply(t *testing.T) {
 		var created commentCreate
 		select {
 		case created = <-capture.creates:
-			assert.Contains(t, created.Body, "**Status**: Starting")
+			assert.Contains(t, created.Body, "**Status**: Queued")
 		case <-time.After(webhookIntegrationCheckRunDeadline):
 			t.Fatal("timed out waiting for the initial progress comment")
 		}
@@ -3094,7 +3094,7 @@ func TestE2EInitialProgressCommentFinalizedForFastApply(t *testing.T) {
 		case edited := <-capture.edits:
 			assert.Equal(t, created.ID, edited.CommentID, "the finalize edits the just-posted comment")
 			assert.Contains(t, edited.Body, "**Status**: Applied")
-			assert.NotContains(t, edited.Body, "**Status**: Starting")
+			assert.NotContains(t, edited.Body, "**Status**: Queued")
 		case <-time.After(webhookIntegrationCheckRunDeadline):
 			t.Fatal("timed out waiting for the terminal finalize edit")
 		}

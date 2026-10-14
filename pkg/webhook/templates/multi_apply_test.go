@@ -486,7 +486,7 @@ func TestRenderMultiDeploymentApplyComment_PreflightFailureHasNoProgressBar(t *t
 // A deployment held by an earlier sibling's failure is "halted" — a derived
 // presentation; its persisted operation state is still pending. The <details>
 // body's Status line must carry the derived status so it agrees with its own
-// <summary> line, never the raw-state "Starting" gloss.
+// <summary> line, never the raw-state "Queued" gloss.
 func TestRenderMultiDeploymentApplyComment_HaltedDetailUsesDerivedStatus(t *testing.T) {
 	model := presentation.Derive([]presentation.Operation{
 		rollingOp("apse2", so.Failed),
@@ -503,14 +503,14 @@ func TestRenderMultiDeploymentApplyComment_HaltedDetailUsesDerivedStatus(t *test
 	})
 
 	assert.Contains(t, out, "**Status**: ⏸️ Halted — apse2 failed")
-	assert.NotContains(t, out, "**Status**: Starting")
+	assert.NotContains(t, out, "**Status**: Queued")
 	// The failed deployment keeps its raw-state gloss.
 	assert.Contains(t, out, "**Status**: Failed")
 }
 
 // Pending deployments that are genuinely still coming — next in order, or
 // waiting on an earlier copy — also carry their derived status in the body, so
-// the body never shows the raw-state "Starting" gloss for a deployment that
+// the body never shows the raw-state "Queued" gloss for a deployment that
 // has not been claimed.
 func TestRenderMultiDeploymentApplyComment_PendingDetailUsesDerivedStatus(t *testing.T) {
 	model := presentation.Derive([]presentation.Operation{
@@ -528,7 +528,7 @@ func TestRenderMultiDeploymentApplyComment_PendingDetailUsesDerivedStatus(t *tes
 	})
 
 	assert.Contains(t, out, "**Status**: ⏳ Waiting for eu")
-	assert.NotContains(t, out, "**Status**: Starting")
+	assert.NotContains(t, out, "**Status**: Queued")
 	// The running deployment keeps its raw-state gloss and suffix behavior.
 	assert.Contains(t, out, "**Status**: In Progress")
 }
