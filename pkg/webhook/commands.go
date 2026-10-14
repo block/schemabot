@@ -7,6 +7,7 @@ import (
 
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/webhook/action"
+	"github.com/block/schemabot/pkg/webhook/templates"
 )
 
 // CommandSpec declares the parse and dispatch shape of a SchemaBot command.
@@ -161,6 +162,10 @@ type CommandResult struct {
 	Found        bool
 	IsHelp       bool
 	IsMention    bool
+	// Rejection says which token got the command line rejected and why, for
+	// the invalid-command reply to name. It is set only on an IsMention
+	// result that is not a command SchemaBot accepts.
+	Rejection templates.CommandRejection
 	// ProseMention is true when the comment has a line opening with
 	// `schemabot` that reads as a sentence about SchemaBot, and no line
 	// addressed to it. Such a comment is not answered.
@@ -185,9 +190,9 @@ type CommandResult struct {
 //     answer, and it does not hide a command on a later line.
 //   - A malformed command has no plain word but has a token SchemaBot does not
 //     accept exactly, such as `--allow-unsafe.` or `-d billing,`. It is the
-//     directive and gets the "invalid command" answer: the parser never trims
-//     a token into one it accepts, so a typo can never run a command, least of
-//     all an unsafe one.
+//     directive and gets the "invalid command" answer, which names the token
+//     and what is wrong with it. The parser never trims a token into one it
+//     accepts, so a typo can never run a command, least of all an unsafe one.
 //   - A command has every token accepted exactly. The first one is the
 //     directive:
 //     1. Help (`schemabot help`) short-circuits with IsHelp=true so the
@@ -205,7 +210,7 @@ func (p *CommandParser) ParseCommand(body string) CommandResult {
 	tenant, tenantErr := p.tenantOf(d)
 
 	if d.kind == lineMalformed {
-		return CommandResult{Tenant: tenant, TenantError: tenantErr, IsMention: true}
+		return CommandResult{Tenant: tenant, TenantError: tenantErr, IsMention: true, Rejection: d.rejection}
 	}
 	if d.name == action.Help {
 		return CommandResult{Action: action.Help, Tenant: tenant, TenantError: tenantErr, IsHelp: true, IsMention: true}
@@ -213,7 +218,11 @@ func (p *CommandParser) ParseCommand(body string) CommandResult {
 
 	spec, ok := specByName[d.name]
 	if !ok {
-		return CommandResult{Tenant: tenant, TenantError: tenantErr, IsMention: true}
+		result := CommandResult{Tenant: tenant, TenantError: tenantErr, IsMention: true}
+		if d.command != "" {
+			result.Rejection = templates.CommandRejection{Problem: templates.CommandProblemUnknownCommand, Token: d.command}
+		}
+		return result
 	}
 	return p.applySpec(spec, d, tenant, tenantErr)
 }
@@ -238,6 +247,11 @@ type directive struct {
 	kind lineKind
 	// name is the command word, lowercased; empty for a bare `schemabot`.
 	name string
+	// command is the command word as typed.
+	command string
+	// rejection is the first token on a malformed line and what is wrong
+	// with it.
+	rejection templates.CommandRejection
 	// flags holds the boolean flags present, by canonical spelling.
 	flags map[string]bool
 	// values holds the value flags present, by canonical spelling. A flag
@@ -270,28 +284,28 @@ var valueFlags = map[string]string{
 	"--target": "--target",
 }
 
+// dashlessFlag is an accepted flag spelling with its leading dashes removed.
+type dashlessFlag struct {
+	// spelling is the accepted spelling, dashes included.
+	spelling   string
+	takesValue bool
+}
+
 // dashlessFlags maps every accepted flag spelling with its leading dashes
-// removed, such as `allow-unsafe` from `--allow-unsafe`, to whether the flag
-// takes a value. A command attempt spells one this way when the dashes are
-// dropped or split off (`-- allow-unsafe`): the word is a mistyped flag, not
-// a plain word that makes the line a sentence.
-var dashlessFlags = func() map[string]bool {
-	m := map[string]bool{}
+// removed, such as `allow-unsafe` from `--allow-unsafe`, to that spelling. A
+// command attempt spells one this way when the dashes are dropped or split
+// off (`-- allow-unsafe`): the word is a mistyped flag, not a plain word that
+// makes the line a sentence.
+var dashlessFlags = func() map[string]dashlessFlag {
+	m := map[string]dashlessFlag{}
 	for spelling := range booleanFlags {
-		m[strings.TrimLeft(spelling, "-")] = false
+		m[strings.TrimLeft(spelling, "-")] = dashlessFlag{spelling: spelling}
 	}
 	for spelling := range valueFlags {
-		m[strings.TrimLeft(spelling, "-")] = true
+		m[strings.TrimLeft(spelling, "-")] = dashlessFlag{spelling: spelling, takesValue: true}
 	}
 	return m
 }()
-
-// isDashlessFlag reports whether word, lowercased, spells an accepted flag
-// without its leading dashes.
-func isDashlessFlag(word string) bool {
-	_, ok := dashlessFlags[word]
-	return ok
-}
 
 // firstDirective returns the first line that opens with `schemabot` and is
 // not a sentence. prose reports whether a sentence was skipped on the way, so
@@ -328,33 +342,46 @@ func (p *CommandParser) firstDirective(body string) (d directive, ok, prose bool
 // or target, a missing environment, database, or target), or when it is
 // ambiguous (a value flag given twice, two apply IDs). A value flag spelled
 // without its dashes still takes the word after it, so the value is not read
-// as a plain word that turns the line into a sentence. A present -e or -t
-// value is checked later, where an invalid one gets its own usage answer.
+// as a plain word that turns the line into a sentence. The first token to
+// blame is kept as the rejection the invalid-command reply names. A present
+// -e or -t value is checked later, where an invalid one gets its own usage
+// answer.
 func (p *CommandParser) parseDirective(words []string) directive {
 	d := directive{kind: lineCommand, flags: map[string]bool{}, values: map[string]string{}, repeated: map[string]bool{}}
 	if len(words) == 0 {
 		return d
 	}
+	d.command = words[0]
 	d.name = strings.ToLower(words[0])
 	malformed := false
+	// reject marks the line malformed and keeps the first token to blame,
+	// which the invalid-command reply names.
+	reject := func(problem templates.CommandProblem, token, accepted string) {
+		malformed = true
+		if d.rejection.Problem == templates.CommandProblemNone {
+			d.rejection = templates.CommandRejection{Problem: problem, Token: token, Accepted: accepted}
+		}
+	}
 	if word := strings.TrimRight(d.name, sentencePunctuation); word != d.name {
 		if _, ok := specByName[word]; !ok {
 			d.kind = lineProse
 			return d
 		}
-		malformed = true
+		reject(templates.CommandProblemPunctuatedCommand, words[0], word)
 	}
 	for i := 1; i < len(words); i++ {
 		word := words[i]
 		lower := strings.ToLower(word)
-		if flag, ok := autocorrectedValueFlag(lower); ok {
-			lower = flag
-			malformed = true
+		if flag, ok := autocorrectedFlag(lower); ok {
+			if _, isValue := valueFlags[flag]; isValue {
+				reject(templates.CommandProblemAutocorrectedDash, word, flag)
+				lower = flag
+			}
 		}
 		if flag, ok := valueFlags[lower]; ok {
 			if _, given := d.values[flag]; given {
 				d.repeated[flag] = true
-				malformed = true
+				reject(templates.CommandProblemRepeatedFlag, word, flag)
 			}
 			value := ""
 			if i+1 < len(words) && !looksLikeFlag(words[i+1]) {
@@ -362,6 +389,13 @@ func (p *CommandParser) parseDirective(words []string) directive {
 				value = words[i]
 			}
 			d.values[flag] = value
+			if problem, token := p.valueProblem(word, flag, value); problem != templates.CommandProblemNone {
+				accepted := ""
+				if problem == templates.CommandProblemMissingValue {
+					accepted = flag
+				}
+				reject(problem, token, accepted)
+			}
 			continue
 		}
 		if flag, ok := booleanFlags[lower]; ok {
@@ -370,20 +404,29 @@ func (p *CommandParser) parseDirective(words []string) directive {
 		}
 		switch {
 		case looksLikeFlag(word):
-			malformed = true
+			if isBareDashes(word) && i+1 < len(words) && isDashlessFlag(words[i+1]) {
+				// The flag name after the dashes is rejected next and names
+				// the problem: `-- allow-unsafe` is `allow-unsafe` missing
+				// its dashes.
+				malformed = true
+				continue
+			}
+			problem, accepted := misspelledFlag(lower)
+			reject(problem, word, accepted)
 		case p.applyIDRegex.MatchString(word):
 			if d.applyID != "" {
-				malformed = true
+				reject(templates.CommandProblemSecondApplyID, word, "")
 			}
 			d.applyID = word
 		case p.applyIDPrefixRegex.MatchString(word):
-			malformed = true
+			reject(templates.CommandProblemInvalidApplyID, word, "")
 		case isUsagePlaceholder(word):
 		case isUsageNotation(word):
-			malformed = true
-		case isDashlessFlag(lower):
-			malformed = true
-			if dashlessFlags[lower] && i+1 < len(words) && !looksLikeFlag(words[i+1]) {
+			reject(templates.CommandProblemUsageNotation, word, "")
+		case isDashlessFlag(word):
+			flag := dashlessFlags[lower]
+			reject(templates.CommandProblemMissingDashes, word, flag.spelling)
+			if flag.takesValue && i+1 < len(words) && !looksLikeFlag(words[i+1]) {
 				i++
 			}
 		default:
@@ -391,23 +434,74 @@ func (p *CommandParser) parseDirective(words []string) directive {
 			return d
 		}
 	}
-	if env, given := d.values["-e"]; given && env == "" {
-		malformed = true
-	}
-	if database, given := d.values["-d"]; given && !p.databaseNameRegex.MatchString(database) {
-		malformed = true
-	}
-	// Target names are opaque to the parser: the server matches the selector
-	// exactly against the rollout and names the valid ones when it matches
-	// none, so the word is forwarded as typed and only a missing one is
-	// rejected here.
-	if target, given := d.values["--target"]; given && target == "" {
-		malformed = true
-	}
 	if malformed {
 		d.kind = lineMalformed
 	}
 	return d
+}
+
+// valueProblem reports what is wrong with the value a value flag took, and
+// the token to blame: a missing environment, database, or target, or an
+// invalid database name. A present -e or -t value is checked later, where an
+// invalid one gets its own usage answer.
+func (p *CommandParser) valueProblem(word, flag, value string) (templates.CommandProblem, string) {
+	switch flag {
+	case "-e":
+		if value == "" {
+			return templates.CommandProblemMissingValue, word
+		}
+	case "-d":
+		if value == "" {
+			return templates.CommandProblemMissingValue, word
+		}
+		if !p.databaseNameRegex.MatchString(value) {
+			return templates.CommandProblemInvalidDatabase, value
+		}
+	case "--target":
+		// Target names are opaque to the parser: the server matches the
+		// selector exactly against the rollout and names the valid ones when
+		// it matches none, so the word is forwarded as typed and only a
+		// missing one is rejected here.
+		if value == "" {
+			return templates.CommandProblemMissingValue, word
+		}
+	}
+	return templates.CommandProblemNone, ""
+}
+
+// isDashlessFlag reports whether word spells an accepted flag without its
+// leading dashes, in any case.
+func isDashlessFlag(word string) bool {
+	_, ok := dashlessFlags[strings.ToLower(word)]
+	return ok
+}
+
+// isBareDashes reports whether word is nothing but dashes, such as a `--`
+// split off the flag name after it.
+func isBareDashes(word string) bool {
+	return strings.TrimLeft(word, flagDashes) == ""
+}
+
+// misspelledFlag reports what is wrong with a dash-led word, lowercased, that
+// is not an accepted flag, and the accepted flag it is closest to: the flag
+// with sentence punctuation typed after it, or with its leading dash
+// autocorrected. Anything else is an unknown flag with no flag to name.
+func misspelledFlag(word string) (templates.CommandProblem, string) {
+	if trimmed := strings.TrimRight(word, sentencePunctuation); trimmed != word && isAcceptedFlag(trimmed) {
+		return templates.CommandProblemPunctuatedFlag, trimmed
+	}
+	if flag, ok := autocorrectedFlag(word); ok {
+		return templates.CommandProblemAutocorrectedDash, flag
+	}
+	return templates.CommandProblemUnknownFlag, ""
+}
+
+// isAcceptedFlag reports whether word, lowercased, is an accepted spelling of
+// a flag.
+func isAcceptedFlag(word string) bool {
+	_, isValue := valueFlags[word]
+	_, isBoolean := booleanFlags[word]
+	return isValue || isBoolean
 }
 
 // sentencePunctuation ends a word in a sentence. A first word carrying it is
@@ -419,20 +513,24 @@ const sentencePunctuation = ".,;:!?"
 // em dashes and the minus sign that autocorrect puts in place of `-`.
 func looksLikeFlag(word string) bool {
 	r, _ := utf8.DecodeRuneInString(word)
-	return strings.ContainsRune("-\u2010\u2011\u2012\u2013\u2014\u2015\u2212", r)
+	return strings.ContainsRune(flagDashes, r)
 }
 
-// autocorrectedValueFlag returns the value flag that word spells with its
-// leading `-` or `--` autocorrected to another dash, such as `–e`. The
-// line is still rejected, but the flag takes its value as usual, so the value
-// is not read as a plain word that turns the line into a sentence.
-func autocorrectedValueFlag(word string) (string, bool) {
+// flagDashes holds `-` and the en and em dashes and minus sign that
+// autocorrect puts in its place.
+const flagDashes = "-\u2010\u2011\u2012\u2013\u2014\u2015\u2212"
+
+// autocorrectedFlag returns the flag that word, lowercased, spells with its
+// leading `-` or `--` autocorrected to another dash, such as `–e`. The line is
+// still rejected, but a value flag takes its value as usual, so the value is
+// not read as a plain word that turns the line into a sentence.
+func autocorrectedFlag(word string) (string, bool) {
 	r, size := utf8.DecodeRuneInString(word)
 	if r == '-' || !looksLikeFlag(word) {
 		return "", false
 	}
 	for _, flag := range []string{"-" + word[size:], "--" + word[size:]} {
-		if _, ok := valueFlags[flag]; ok {
+		if isAcceptedFlag(flag) {
 			return flag, true
 		}
 	}

@@ -171,7 +171,7 @@ func TestRenderPRCommentSupportChannelFooter(t *testing.T) {
 		}
 		h := &Handler{service: api.New(nil, cfg, nil, testLogger())}
 
-		body := h.renderPRComment("octo/repo", 7, "", templates.RenderInvalidCommand())
+		body := h.renderPRComment("octo/repo", 7, "", templates.RenderInvalidCommand(templates.CommandRejection{}))
 
 		assert.Contains(t, body, "> 💬 Support: [#schema-help](https://example.com/schema-help).")
 	})
@@ -1007,15 +1007,24 @@ func TestWebhookQuoteReplyToCommandIsNotRun(t *testing.T) {
 // A command line with a token SchemaBot does not accept exactly, such as an
 // unsafe flag with a full stop typed after it or split from its dashes, is a
 // botched command rather than a sentence. SchemaBot runs nothing and answers
-// with the invalid-command help, so the commenter learns the apply did not
-// start.
+// with the invalid-command help, opening with the token it rejected and why,
+// so the commenter learns the apply did not start and what to fix.
 func TestWebhookMalformedCommandIsRejected(t *testing.T) {
 	tests := []struct {
 		name    string
 		comment string
+		reason  string
 	}{
-		{name: "unsafe flag with a full stop", comment: "schemabot apply -e staging --allow-unsafe."},
-		{name: "unsafe flag split from its dashes", comment: "schemabot apply -e staging -- allow-unsafe"},
+		{
+			name:    "unsafe flag with a full stop",
+			comment: "schemabot apply -e staging --allow-unsafe.",
+			reason:  "`--allow-unsafe.` has punctuation after it; the flag is `--allow-unsafe`.",
+		},
+		{
+			name:    "unsafe flag split from its dashes",
+			comment: "schemabot apply -e staging -- allow-unsafe",
+			reason:  "`allow-unsafe` is missing its dashes; the flag is `--allow-unsafe`.",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -1034,7 +1043,7 @@ func TestWebhookMalformedCommandIsRejected(t *testing.T) {
 
 			select {
 			case body := <-comments:
-				assert.Contains(t, body, "Invalid Command")
+				assert.Contains(t, body, "## ❌ Invalid Command\n\n"+tt.reason+"\n\nAvailable commands:")
 			case <-time.After(2 * time.Second):
 				require.FailNow(t, "timed out waiting for comment")
 			}

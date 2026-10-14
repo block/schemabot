@@ -1165,7 +1165,7 @@ func PreviewCommentAgentHint() string {
 // PreviewCommentSupportChannel renders a sample error comment with a support-channel footer.
 func PreviewCommentSupportChannel() string {
 	return "### Invalid command\n\n" +
-		RenderSupportChannelFooter(RenderInvalidCommand(), previewSupportChannel()) +
+		RenderSupportChannelFooter(RenderInvalidCommand(CommandRejection{}), previewSupportChannel()) +
 		"\n\n### Apply failure\n\n" +
 		RenderSupportChannelFooter(PreviewCommentApplyFailed(), previewSupportChannel())
 }
@@ -1332,9 +1332,14 @@ func PreviewCommentMissingEnv() string {
 	return RenderMissingEnv(action.Plan)
 }
 
-// PreviewCommentInvalidCmd renders the "invalid command" error comment.
+// PreviewCommentInvalidCmd renders the "invalid command" error comment for a
+// flag typed without its dashes, as in `schemabot apply -e staging -- allow-unsafe`.
 func PreviewCommentInvalidCmd() string {
-	return RenderInvalidCommand()
+	return RenderInvalidCommand(CommandRejection{
+		Problem:  CommandProblemMissingDashes,
+		Token:    "allow-unsafe",
+		Accepted: "--allow-unsafe",
+	})
 }
 
 // =============================================================================

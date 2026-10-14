@@ -3045,7 +3045,9 @@ schemabot plan -e staging
 
 ## ❌ Invalid Command
 
-That command wasn't recognized. Available commands:
+`allow-unsafe` is missing its dashes; the flag is `--allow-unsafe`.
+
+Available commands:
 
 | Command | Description |
 |---------|-------------|
