@@ -12,6 +12,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/schemabot/pkg/engine"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/storage"
 )
@@ -172,7 +173,7 @@ func TestLocalClient_Apply_MemberStepsBuildTheMembersPlanFromTheDispatch(t *test
 	}
 	require.Len(t, memberPlan, 2, "payments-002's own plan alters both tables")
 
-	const planID = "plan-member-payments-002"
+	planID := engine.NewPlanID()
 	stored, err := stor.Plans().Get(ctx, planID)
 	require.NoError(t, err)
 	require.Nil(t, stored, "the data plane holds no plan for a member planned with the diff")
