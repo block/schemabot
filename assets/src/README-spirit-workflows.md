@@ -21,7 +21,8 @@ illustrative, not performance measurements.
 - `spirit-throttling.html` shows an application and Spirit's copy writing to one Aurora writer.
   As application traffic pushes average commit latency up, Spirit's write-thread controller adds a
   thread below 40ms, sheds one above 70ms, and halves the pool at 100ms, where each thread also
-  waits before its next chunk. The copy is write-limited, so only the write pool moves; traffic,
+  waits before its next chunk. Only that pause shows in progress, as `(throttled)`; the status line
+  marks the silent steps. The copy is write-limited, so only the write pool moves; traffic,
   latency, and timing are illustrative. The renderer plays it at 1.3x its 24-second timeline.
 - `spirit-aurora-upsize.html` retells a staging schema change on a 107M-row table that moved from
   `db.r6g.large` to `db.r6g.2xlarge`, as a timeline of events under the table copy's progress bar.
@@ -58,6 +59,6 @@ missing logs or an unusable checkpoint can require a fresh copy.
 For the DDL examples, also check [MySQL 8.4 online DDL operations](https://dev.mysql.com/doc/refman/8.4/en/innodb-online-ddl-operations.html).
 The examples assume an eligible table; they do not claim every column addition can run instantly.
 
-For the throttling, scaling, and upsize illustrations, check the explanation against Spirit's
+For the throttling and upsize illustrations, check the explanation against Spirit's
 [throttler reference](https://github.com/block/spirit/blob/main/pkg/throttler/README.md) and the
 thresholds in `pkg/autoscale`; update the animation when either changes.

@@ -60,8 +60,10 @@ function renderFrame(t){
  s+=arrow(800,728,265,throttled?C.line:C.purple)+(throttled?'':flow(796,738,265,Math.max(1,Math.round(threads/2)),.9,t,C.purple));
  // Commit latency over time against Spirit's three lines.
  s+=rect(36,360,1028,196,'#fff',C.line,12)+txt(56,392,'Average commit latency',15,C.ink,650);
- const status=throttled?'(throttled) commit-latency '+lat.toFixed(1)+'ms >= '+THRESHOLD+'ms':action==='add'?'adding a write thread':action==='shed'?'shedding a write thread':action==='halve'?'halving the threads':'holding';
- s+=txt(1044,392,status,13,throttled?C.amber:C.purple,650,'mono','end');
+ // Progress reports only the limit; adding and shedding threads below it are silent.
+ const step=action==='add'?'adding a write thread':action==='shed'?'shedding a write thread':action==='halve'?'halving the threads':'holding';
+ s+=throttled?txt(1044,392,'progress: (throttled) commit-latency '+lat.toFixed(1)+'ms >= '+THRESHOLD+'ms',13,C.amber,650,'mono','end')
+  :`<text x="1044" y="392" font-size="13" text-anchor="end"><tspan fill="${C.purple}" font-weight="650">${esc(step)}</tspan><tspan fill="${C.muted}" font-weight="500">${step==='holding'?'':' · progress shows no annotation'}</tspan></text>`;
  for(let a=0;a<t;a+=TICK){const b=Math.min(t,a+TICK);if(throttledAt(a))s+=rect(px(a),PY1-8,px(b)-px(a),PY0-PY1+8,C.amberBg,'none',0);}
  s+=line(PX0,PY0,PX1,PY0,C.line);
  for(const [ms,color,label] of [[LOW,C.green,'add below 40ms'],[HIGH,C.amber,'shed above 70ms'],[THRESHOLD,C.red,'pause at 100ms']])s+=line(PX0,py(ms),PX1,py(ms),color,1.2,'6 4')+txt(PX1,py(ms)-5,label,11,color,650,'','end');
@@ -69,7 +71,7 @@ function renderFrame(t){
  s+=`<polyline points="${pts.join(' ')}" fill="none" stroke="${zoneColor===C.ink?C.blue:zoneColor}" stroke-width="3" stroke-linejoin="round"/>`+`<circle cx="${px(t)}" cy="${py(latency(t))}" r="5" fill="${zoneColor===C.ink?C.blue:zoneColor}"/>`;
  s+=rect(36,576,1028,57,C.soft)+txt(55,612,captions[phase],17,C.ink,500);
  s+=txt(36,659,'Illustrative timing and a write-limited copy · Spirit samples every five seconds and moves one step per cooldown.',12,C.muted);
- s+=txt(36,678,'A waiting thread rechecks every second and copies one chunk after a minute, so the copy always makes progress.',12,C.muted);
+ s+=txt(36,678,'A waiting thread rechecks every second and copies one chunk after a minute · only the 100ms pause shows in progress.',12,C.muted);
  document.getElementById('art').innerHTML=s;return {phase,lat,throttled,threads,action,rate:Math.round(rate)};
 }
 window.renderFrame=renderFrame;renderFrame(0);

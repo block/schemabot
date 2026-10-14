@@ -366,6 +366,11 @@ which is what the `(throttled)` annotation reports. A waiting thread rechecks ev
 copies one chunk after a minute, so the copy keeps making progress. The pool limits scale with
 the instance's vCPUs, so a larger instance gives the copy more room alongside the application.
 
+Only the limit shows in progress. Shedding threads between 70% and 100% slows the copy without a
+`(throttled)` annotation, so a copy that runs slower than expected with no annotation may already
+be scaled back. Spirit does not report that state yet;
+[block/spirit#1252](https://github.com/block/spirit/issues/1252) tracks reporting it as a hint.
+
 Allow headroom for both application traffic and the schema change. If progress stays slow,
 check the reported reason alongside database CPU, I/O, and application latency. A quieter
 window or more database capacity may help, depending on the bottleneck. The throttle thresholds
