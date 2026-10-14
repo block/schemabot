@@ -12,9 +12,12 @@ import (
 	"github.com/block/schemabot/pkg/storage"
 )
 
-// branchReconcileDeleteTimeout bounds each branch delete, so one slow request
-// cannot hold the rest of a pass.
-const branchReconcileDeleteTimeout = 30 * time.Second
+// branchReconcileHoldTimeout bounds how long one delete holds the apply
+// target: the re-read of the applies, the delete request, and the wait for the
+// lock itself. It is half of what a driver waits for the target, so a driver
+// that queued behind the hold still gets the lock inside its own wait, and one
+// slow delete cannot hold the rest of a pass.
+const branchReconcileHoldTimeout = storage.ApplyTargetLockWait / 2
 
 // BranchReconcileOptions tunes one ReconcileOrphanedBranches pass.
 type BranchReconcileOptions struct {
@@ -26,6 +29,10 @@ type BranchReconcileOptions struct {
 	Delete bool
 	// Now is the time the pass measures branch age against.
 	Now time.Time
+	// Environment is the environment this database is registered under. With
+	// the database it names the apply target the pass holds while it deletes
+	// a branch, so it is required when Delete is set.
+	Environment string
 }
 
 // BranchReconcileResult counts what one pass found.
@@ -52,18 +59,30 @@ type BranchReconcileResult struct {
 // or one the API refused, leaves a branch that no apply will resume. A branch
 // is reclaimed only when all of these hold, and is kept otherwise:
 //
-//   - it has the shape SchemaBot generates for the database, so an operator's
-//     branch, the main branch, and production branches are never touched;
+//   - it has the shape SchemaBot generates for the database, so the main
+//     branch, production branches, and a branch an operator named are never
+//     touched;
 //   - it is older than opts.Grace;
-//   - no in-progress apply's stored resume state or branch option names it,
-//     read once before judging and again immediately before the delete, since
-//     an apply re-run for the same plan reuses the branch of that name;
+//   - no unsettled apply uses it. An apply uses the branch its stored resume
+//     state names, the branch an operator supplied with the branch option, and
+//     the branch its plan names, since a generated name is a function of the
+//     database and the plan identifier (planetscale.GenerateBranchName). That
+//     last one covers an apply that exists but has not recorded a branch yet,
+//     and the stopped applies are read with the running ones because a driver
+//     may still resume them;
 //   - no open deploy request uses it.
 //
-// The apply records its branch name before creating the branch, so a branch
-// SchemaBot is using is always named by an in-progress apply in this storage.
-// The pass therefore only judges branches of databases this storage alone
-// applies to.
+// The delete holds the apply target this database is registered under
+// (storage.ApplyStore.WithTargetHeld, keyed by the database, its type, and
+// opts.Environment) across a final read of the applies and the delete itself.
+// No apply is created for, claimed on, or advanced on the target while it is
+// held, so the applies the read saw are the applies when the branch goes: an
+// apply re-run for the same plan either already exists, and keeps its branch,
+// or is created after the delete and makes a new one. Every drive on the
+// target waits behind the hold, which is why it is bounded by
+// branchReconcileHoldTimeout and a hold that runs out keeps the branch. The
+// hold covers this registration's target alone, so the pass only judges
+// branches of databases this storage alone applies to.
 //
 // Anything it cannot read fails toward keeping branches: a storage error ends
 // the pass before anything is deleted, and a deploy request lookup that fails
@@ -73,11 +92,14 @@ func (c *LocalClient) ReconcileOrphanedBranches(ctx context.Context, opts Branch
 	if c.config.Type != storage.DatabaseTypeVitess {
 		return BranchReconcileResult{}, fmt.Errorf("reconcile branches for database %s: not a PlanetScale database (type %s)", c.config.Database, c.config.Type)
 	}
+	if opts.Delete && opts.Environment == "" {
+		return BranchReconcileResult{}, fmt.Errorf("reconcile branches for database %s: an environment is required to hold the apply target while deleting", c.config.Database)
+	}
 	target, err := c.planetScalePullClient()
 	if err != nil {
 		return BranchReconcileResult{}, fmt.Errorf("reconcile branches: %w", err)
 	}
-	logger := c.logger.With("database", c.config.Database, "organization", target.org, "planetscale_database", target.database)
+	logger := c.logger.With("database", c.config.Database, "environment", opts.Environment, "organization", target.org, "planetscale_database", target.database)
 	result := BranchReconcileResult{Database: target.database}
 
 	branches, err := target.client.ListBranches(ctx, &ps.ListDatabaseBranchesRequest{Organization: target.org, Database: target.database})
@@ -99,7 +121,7 @@ func (c *LocalClient) ReconcileOrphanedBranches(ctx context.Context, opts Branch
 
 	// Read the branches in use after listing, so an apply that recorded a
 	// branch while the listing ran is seen as using it.
-	inUse, err := c.branchesInUse(ctx)
+	inUse, err := c.branchesInUse(ctx, target.database)
 	if err != nil {
 		return result, fmt.Errorf("reconcile branches of %s/%s: %w", target.org, target.database, err)
 	}
@@ -125,27 +147,26 @@ func (c *LocalClient) ReconcileOrphanedBranches(ctx context.Context, opts Branch
 			logger.Info("branch reconciliation dry run: SchemaBot branch is orphaned and would be deleted", attrs...)
 			continue
 		}
-		claimed, err := c.branchClaimedSince(ctx, branch.Name)
+		outcome, err := c.reclaimBranch(ctx, target, branch.Name, opts.Environment)
 		if err != nil {
-			result.Kept++
-			logger.Warn("keeping SchemaBot branch: in-progress applies could not be re-read before the delete", append(attrs, "error", err)...)
 			errs = append(errs, err)
-			continue
 		}
-		if claimed {
+		switch outcome {
+		case branchKeptInUse:
 			result.Kept++
-			logger.Info("keeping SchemaBot branch: an apply that started during the pass names it", attrs...)
-			continue
-		}
-		result.Orphaned++
-		if err := c.deleteOrphanedBranch(ctx, target, branch.Name); err != nil {
+			logger.Info("keeping SchemaBot branch: an apply that started during the pass uses it", attrs...)
+		case branchKeptUnjudged:
+			result.Kept++
+			logger.Warn("keeping SchemaBot branch: the apply target could not be held and re-read before the delete", append(attrs, "error", err)...)
+		case branchDeleteFailed:
+			result.Orphaned++
 			logger.Error("failed to delete orphaned SchemaBot branch; it is retried on the next pass, or delete it manually to reclaim branch quota",
 				append(attrs, "error", err)...)
-			errs = append(errs, err)
-			continue
+		case branchDeleted:
+			result.Orphaned++
+			result.Deleted++
+			logger.Info("deleted orphaned SchemaBot branch: no unsettled apply uses it and no open deploy request uses it", attrs...)
 		}
-		result.Deleted++
-		logger.Info("deleted orphaned SchemaBot branch: no in-progress apply names it and no open deploy request uses it", attrs...)
 	}
 	logger.Info("branch reconciliation pass complete",
 		"delete", opts.Delete, "candidates", result.Candidates, "kept", result.Kept,
@@ -157,13 +178,13 @@ func (c *LocalClient) ReconcileOrphanedBranches(ctx context.Context, opts Branch
 // returned error is a lookup that failed, and the branch is then kept.
 func (c *LocalClient) keepBranch(ctx context.Context, target *planetScalePullTarget, branch *ps.DatabaseBranch, inUse map[string]bool, opts BranchReconcileOptions) (bool, string, error) {
 	if inUse[branch.Name] {
-		return true, "an in-progress apply names it", nil
+		return true, "an unsettled apply uses it", nil
 	}
 	if branch.CreatedAt.IsZero() {
 		return true, "its creation time is unknown, so its age cannot be judged", nil
 	}
-	if age := opts.Now.Sub(branch.CreatedAt); age < opts.Grace {
-		return true, fmt.Sprintf("younger than the grace period (%s)", opts.Grace), nil
+	if age := opts.Now.Sub(branch.CreatedAt); age <= opts.Grace {
+		return true, fmt.Sprintf("not older than the grace period (%s)", opts.Grace), nil
 	}
 	open, err := target.client.ListDeployRequests(ctx, &ps.ListDeployRequestsRequest{
 		Organization: target.org, Database: target.database, Branch: branch.Name, State: "open",
@@ -177,15 +198,32 @@ func (c *LocalClient) keepBranch(ctx context.Context, target *planetScalePullTar
 	return false, "", nil
 }
 
-// branchesInUse returns every branch an in-progress PlanetScale apply's stored
-// resume state names, together with any branch an operator supplied for one.
-// It reads across all databases, so a branch is never judged unused because
-// the apply naming it was registered under another database identifier.
-func (c *LocalClient) branchesInUse(ctx context.Context) (map[string]bool, error) {
-	applies, err := c.storage.Applies().GetInProgress(ctx)
+// branchesInUse returns every branch an unsettled PlanetScale apply uses: the
+// branch its stored resume state names, the branch an operator supplied with
+// the branch option, and the branch generated for its plan on database. It
+// reads across all registered databases, so a branch is never judged unused
+// because the apply using it was registered under another identifier.
+func (c *LocalClient) branchesInUse(ctx context.Context, database string) (map[string]bool, error) {
+	applies, err := c.storage.Applies().GetUnsettled(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("read in-progress applies: %w", err)
+		return nil, fmt.Errorf("read unsettled applies: %w", err)
 	}
+	planIdentifiers := make(map[int64]string)
+	planIdentifier := func(planID int64) (string, error) {
+		if identifier, ok := planIdentifiers[planID]; ok {
+			return identifier, nil
+		}
+		plan, err := c.storage.Plans().GetByID(ctx, planID)
+		if err != nil {
+			return "", fmt.Errorf("read plan %d: %w", planID, err)
+		}
+		if plan == nil {
+			return "", fmt.Errorf("plan %d does not exist", planID)
+		}
+		planIdentifiers[planID] = plan.PlanIdentifier
+		return plan.PlanIdentifier, nil
+	}
+
 	inUse := make(map[string]bool)
 	for _, apply := range applies {
 		if apply.DatabaseType != storage.DatabaseTypeVitess {
@@ -194,17 +232,36 @@ func (c *LocalClient) branchesInUse(ctx context.Context) (map[string]bool, error
 		if branch := apply.GetOptions().Branch; branch != "" {
 			inUse[branch] = true
 		}
+		if apply.PlanID != 0 {
+			identifier, err := planIdentifier(apply.PlanID)
+			if err != nil {
+				return nil, fmt.Errorf("name the branch of apply %s: %w", apply.ApplyIdentifier, err)
+			}
+			inUse[planetscale.GenerateBranchName(database, identifier)] = true
+		}
 		ops, err := c.storage.ApplyOperations().ListByApply(ctx, apply.ID)
 		if err != nil {
 			return nil, fmt.Errorf("read operations of apply %s: %w", apply.ApplyIdentifier, err)
 		}
 		for _, op := range ops {
+			planID, err := storage.PlanIDForOperation(apply, op)
+			if err != nil {
+				return nil, fmt.Errorf("name the branch of apply %s operation %d: %w", apply.ApplyIdentifier, op.ID, err)
+			}
+			identifier, err := planIdentifier(planID)
+			if err != nil {
+				return nil, fmt.Errorf("name the branch of apply %s operation %d: %w", apply.ApplyIdentifier, op.ID, err)
+			}
+			inUse[planetscale.GenerateBranchName(database, identifier)] = true
+
 			resumeState, err := c.storage.ApplyOperations().GetEngineResumeState(ctx, op.ID)
+			if errors.Is(err, storage.ErrEngineResumeStateNotFound) {
+				c.logger.Debug("apply operation has recorded no branch yet; its plan names the branch it will use",
+					append(apply.LogAttrs(), "operation_id", op.ID)...)
+				continue
+			}
 			if err != nil {
 				return nil, fmt.Errorf("read resume state of apply %s operation %d: %w", apply.ApplyIdentifier, op.ID, err)
-			}
-			if resumeState == nil {
-				continue
 			}
 			branch, err := planetscale.BranchNameFromResumeMetadata(resumeState.Metadata)
 			if err != nil {
@@ -218,24 +275,53 @@ func (c *LocalClient) branchesInUse(ctx context.Context) (map[string]bool, error
 	return inUse, nil
 }
 
-// branchClaimedSince re-reads the in-progress applies and reports whether one
-// now names branch, so an apply that started after the pass first read them
-// keeps the branch it is about to reuse.
-func (c *LocalClient) branchClaimedSince(ctx context.Context, branch string) (bool, error) {
-	inUse, err := c.branchesInUse(ctx)
-	if err != nil {
-		return false, fmt.Errorf("re-read branches in use before deleting branch %s: %w", branch, err)
-	}
-	return inUse[branch], nil
-}
+// branchReclaimOutcome is what became of one orphaned branch the pass set out
+// to delete.
+type branchReclaimOutcome int
 
-func (c *LocalClient) deleteOrphanedBranch(ctx context.Context, target *planetScalePullTarget, branch string) error {
-	deleteCtx, cancel := context.WithTimeout(ctx, branchReconcileDeleteTimeout)
+const (
+	// branchKeptUnjudged: the apply target could not be held, or the applies
+	// could not be re-read under it, so the branch was not judged again and
+	// is kept.
+	branchKeptUnjudged branchReclaimOutcome = iota
+	// branchKeptInUse: an apply that started after the first read uses the
+	// branch, so it is kept.
+	branchKeptInUse
+	// branchDeleteFailed: the branch is orphaned but the delete failed.
+	branchDeleteFailed
+	// branchDeleted: the branch was deleted.
+	branchDeleted
+)
+
+// reclaimBranch deletes an orphaned branch while holding the apply target the
+// database is registered under in environment, after a final read of the
+// applies under that hold. Only the outcome says what happened to the branch:
+// an error is the failure behind it, when there is one.
+func (c *LocalClient) reclaimBranch(ctx context.Context, target *planetScalePullTarget, branch, environment string) (branchReclaimOutcome, error) {
+	holdCtx, cancel := context.WithTimeout(ctx, branchReconcileHoldTimeout)
 	defer cancel()
-	if err := target.client.DeleteBranch(deleteCtx, &ps.DeleteDatabaseBranchRequest{
-		Organization: target.org, Database: target.database, Branch: branch,
-	}); err != nil {
-		return fmt.Errorf("delete branch %s of %s/%s: %w", branch, target.org, target.database, err)
+
+	outcome := branchKeptUnjudged
+	err := c.storage.Applies().WithTargetHeld(holdCtx, c.config.Database, storage.DatabaseTypeVitess, environment, func(ctx context.Context) error {
+		inUse, err := c.branchesInUse(ctx, target.database)
+		if err != nil {
+			return fmt.Errorf("re-read the applies under the held target: %w", err)
+		}
+		if inUse[branch] {
+			outcome = branchKeptInUse
+			return nil
+		}
+		if err := target.client.DeleteBranch(ctx, &ps.DeleteDatabaseBranchRequest{
+			Organization: target.org, Database: target.database, Branch: branch,
+		}); err != nil {
+			outcome = branchDeleteFailed
+			return fmt.Errorf("delete branch %s of %s/%s: %w", branch, target.org, target.database, err)
+		}
+		outcome = branchDeleted
+		return nil
+	})
+	if err != nil && outcome == branchKeptUnjudged {
+		return outcome, fmt.Errorf("hold apply target %s/%s/%s to delete branch %s: %w", c.config.Database, storage.DatabaseTypeVitess, environment, branch, err)
 	}
-	return nil
+	return outcome, err
 }

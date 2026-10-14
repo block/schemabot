@@ -825,15 +825,6 @@ var retryDelay = func(attempt int, lastErr error) time.Duration {
 	return base + time.Duration(rand.IntN(2000))*time.Millisecond
 }
 
-func generateBranchName(database, planID string) string {
-	// Use last 8 chars of plan ID for uniqueness
-	shortID := planID
-	if len(shortID) > generatedBranchIDLen {
-		shortID = shortID[len(shortID)-generatedBranchIDLen:]
-	}
-	return branchNamePrefix + sanitizedBranchDatabase(database) + "-" + shortID
-}
-
 func deployStateToEngineState(drState string) engine.State {
 	switch drState {
 	case deployState.Pending, deployState.Ready:

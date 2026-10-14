@@ -1793,6 +1793,24 @@ func (s *applyStore) GetInProgress(ctx context.Context) ([]*storage.Apply, error
 	return scanApplies(rows)
 }
 
+// GetUnsettled returns all applies in unsettled states: the non-terminal ones
+// and the stopped ones a driver may still claim.
+func (s *applyStore) GetUnsettled(ctx context.Context) ([]*storage.Apply, error) {
+	statePredicate, args := unsettledApplyStatePredicate("state")
+	rows, err := s.db.QueryContext(ctx, fmt.Sprintf(`
+		SELECT `+applyColumns+`
+		FROM applies
+		WHERE %s
+		ORDER BY created_at DESC
+	`, statePredicate), args...)
+	if err != nil {
+		return nil, fmt.Errorf("query unsettled applies: %w", err)
+	}
+	defer utils.CloseAndLog(rows)
+
+	return scanApplies(rows)
+}
+
 // FindStuckPendingApplies returns pending applies older than olderThan that
 // carry child rows — the child-rows arm of the claim predicate (see
 // ClaimApplyByID), so every row returned is one a driver should already have
@@ -2916,6 +2934,31 @@ func (s *applyStore) WithExclusiveTarget(ctx context.Context, apply *storage.App
 	if err := s.checkTargetUnclaimed(ctx, conn, apply, database, dbType, environment, deployment); err != nil {
 		return err
 	}
+
+	return fn(ctx)
+}
+
+// WithTargetHeld runs fn under the named apply target's advisory lock. See
+// storage.ApplyStore for the contract: unlike WithExclusiveTarget it refuses
+// nothing, so fn runs alongside the applies that already own the target, and
+// the lock only keeps the next apply write on the target waiting until fn
+// returns.
+func (s *applyStore) WithTargetHeld(ctx context.Context, database, dbType, environment string, fn func(context.Context) error) error {
+	if fn == nil {
+		return fmt.Errorf("work function is required to hold apply target %s/%s/%s", database, dbType, environment)
+	}
+	database = storage.CanonicalKey(database)
+	dbType = storage.CanonicalKey(dbType)
+	environment = storage.CanonicalKey(environment)
+	if !hasApplyTarget(database, dbType, environment) {
+		return fmt.Errorf("apply target %s/%s/%s is incomplete: database, type, and environment are all required to hold it", database, dbType, environment)
+	}
+
+	conn, lockName, err := acquireApplyTargetLockConn(ctx, s.db, s.locker, database, dbType, environment)
+	if err != nil {
+		return err
+	}
+	defer releaseApplyTargetLockConn(ctx, s.locker, conn, lockName, "hold apply target")
 
 	return fn(ctx)
 }
