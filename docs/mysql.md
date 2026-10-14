@@ -303,21 +303,31 @@ For progress bar colors, phase labels, and keyboard controls, see the
 
 ## Throttling
 
+Spirit tries to finish a schema change as fast as it can without putting your application at risk.
+The copy shares the database with your application's traffic, so Spirit keeps checking how the
+database is coping and adjusts as it goes:
+
+- **The database has room.** Spirit adds threads and copies faster.
+- **The database gets busier.** Spirit drops threads and copies more slowly.
+- **The database reaches a safety limit.** Spirit pauses the copy, or the checksum verification
+  that follows it, until the database recovers.
+  This pause is a throttle, and the progress bar marks it `(throttled)`.
+
+A throttle is Spirit giving your application priority, not a hang. The copy resumes on its own,
+and most throttles are brief and need nothing from you. A copy that slows down without pausing
+shows no annotation, so a long ETA with no `(throttled)` mark can mean the same thing: the database
+has little room to spare. When a throttle lasts or the ETA is longer than you can wait, the
+database is usually short on capacity. Find what is using it, or see
+[upsizing Aurora](#upsizing-aurora-to-speed-up-a-change) for how a larger writer can turn a
+month-long copy into hours.
+
 ![An application and Spirit's copy write to one Aurora writer; while commit latency is low Spirit adds write threads, above 70ms it sheds them, at 100ms it halves them and each thread waits before its next chunk, and as latency recovers Spirit adds threads back](../assets/spirit-throttling.gif)
 
-When a schema change's progress bar carries a `(throttled)` annotation, Spirit's
-throttler is deliberately pausing the copy or the checksum verify to protect
-the database. Throttling is backpressure, not a hang: the work resumes
-on its own as soon as the pressure signal clears. A brief throttle needs no
-attention; only a sustained one is worth the per-signal checks below.
-
-The annotation's tooltip shows the raw reason reported by the engine and a
-short tip; the PR comment version also links this section. Reasons follow
-the grammar `<signal> <observed> <op> <threshold>`. When several signals
-throttle at the same time, the reasons are joined with `; `.
-
-The sections below explain each signal: what it measures, why the engine pauses on it,
-and what to look at when the throttle lasts longer than expected.
+The rest of this section covers the details: which signals Spirit watches, how it scales its
+threads, and what each throttle reason means. The `(throttled)` annotation's tooltip shows the raw
+reason reported by the engine and a short tip, and the PR comment version also links to this
+section. Reasons take the form `<signal> <observed> <op> <threshold>`; when several signals
+throttle at the same time, their reasons are joined with `; `.
 
 ### How Spirit chooses its signals
 
@@ -326,7 +336,7 @@ Before the copy starts, Spirit checks whether the target is Aurora by reading th
 On Aurora it reads the instance's vCPU count from `innodb_buffer_pool_instances`, which Aurora
 sets to the vCPU count, and enables two signals:
 
-- A thread count compared with a budget of the vCPUs plus a small headroom. With read access to
+- A thread count compared with a budget of the vCPU count plus a little headroom. With read access to
   `performance_schema.threads` and `performance_schema.events_waits_current`, Spirit uses the
   [redo-aware](#redo-aware) count; without it, Spirit falls back to [threads-running](#threads-running).
 - [Commit latency](#commit-latency), averaged over each five-second sample.
@@ -356,17 +366,17 @@ fraction of its limit, and that fraction picks a zone:
 
 The zone decides whether the copy grows or shrinks; the queue between the read and write pools
 decides which pool moves. A queue that stays near empty means the readers cannot keep up, so the
-read pool grows or sheds. A queue that stays near full means the writers are the bottleneck, so
-the write pool does. A balanced queue holds even below 40%. Every step except the halve waits out
-a shared cooldown, so the pools move one thread at a time. The animation at the top of this
-section follows a write-limited copy, so only its write pool moves.
+read pool grows or shrinks. A queue that stays near full means the writers are the bottleneck, so
+the write pool does. When the queue is balanced, neither pool moves, even below 40%. Every step
+except halving waits out a shared cooldown, so the pools move one thread at a time. The animation
+at the top of this section follows a write-limited copy, so only its write pool moves.
 
 Separately, while a signal is at or over its limit, each copy thread waits before its next chunk,
 which is what the `(throttled)` annotation reports. A waiting thread rechecks every second and
 copies one chunk after a minute, so the copy keeps making progress. The pool limits scale with
 the instance's vCPUs, so a larger instance gives the copy more room alongside the application.
 
-Only the limit shows in progress. Shedding threads between 70% and 100% slows the copy without a
+Progress shows a throttle only at the limit. Shedding threads between 70% and 100% slows the copy without a
 `(throttled)` annotation, so a copy that runs slower than expected with no annotation may already
 be scaled back. Spirit does not report that state yet;
 [block/spirit#1252](https://github.com/block/spirit/issues/1252) tracks reporting it as a hint.
@@ -383,7 +393,7 @@ deserves investigation even when application traffic is low.
 redo-aware 4 > 3
 ```
 
-Read this as: active threads greater than the instance's threshold. The
+Read this as: active threads are greater than the instance's threshold. The
 engine selects this algorithm when it detects an Aurora source. It counts
 threads actively executing queries (from `performance_schema`) and subtracts
 threads parked on Aurora's redo-log flush wait, which consume no CPU. When
@@ -433,7 +443,7 @@ instance's write IOPS and commit latency metrics. Do not expect a
 co-occurring redo-aware reason as confirmation: redo-aware subtracts exactly
 the threads parked on redo-log waits, so a saturated redo log makes its
 count fall rather than rise, and commit-latency is the signal designed to
-notice. A sustained commit-latency throttle calls for investigating the write
+notice it. A sustained commit-latency throttle calls for investigating the write
 path; it does not by itself prove that a larger instance will resolve it.
 
 ### Throttled with no reason

@@ -16,15 +16,15 @@ const DURATION=18,ROWS=107,RESIZE_AT=5,BACK_AT=6.8,GROW_AT=8.3;
 const hoursPerSecond=t=>t<RESIZE_AT?.5/RESIZE_AT:t<BACK_AT?.25/(BACK_AT-RESIZE_AT):.32;
 // Write threads, and the copy rate in millions of rows per hour they sustain.
 const writeAt=t=>t<BACK_AT?1:t<GROW_AT?6:Math.round(6+4*ease((t-GROW_AT)/2.5));
-const rateAt=t=>t<RESIZE_AT?ROWS/840:t<BACK_AT?0:5.6*writeAt(t);
+const rateAt=t=>t<RESIZE_AT?ROWS/840:t<BACK_AT?0:7.5*writeAt(t);
 const model=[];{let h=0,rows=0;for(let i=0;i<=DURATION*20;i++){const t=i/20;model.push({h,rows});if(rows<ROWS){h+=hoursPerSecond(t)/20;rows=Math.min(ROWS,rows+rateAt(t)*hoursPerSecond(t)/20);}}}
 const at=t=>model[Math.min(model.length-1,Math.round(t*20))];
 const DONE_AT=model.findIndex(m=>m.rows>=ROWS)/20;
-const EVENTS=[[0,'Copy starts on db.r6g.large: one write thread, throttled, ETA about a month'],
- [RESIZE_AT,'Operator sees the ETA and changes the instance class to db.r6g.2xlarge'],
- [BACK_AT,'Writer back with 8 vCPUs; Spirit resumes from its checkpoint on 6 write threads'],
- [GROW_AT,'Autoscaling grows the write threads toward 10; ETA 2 hours'],
- [DONE_AT,'Copy done: 107M rows, about 2 hours after the upsize']];
+const EVENTS=[[0,'The copy starts on db.r6g.large with one write thread, throttled; ETA about a month'],
+ [RESIZE_AT,'The operator sees the ETA and changes the instance class to db.r6g.2xlarge'],
+ [BACK_AT,'The writer is back with 8 vCPUs; Spirit resumes from its checkpoint with 6 write threads'],
+ [GROW_AT,'Autoscaling grows the write pool toward 10 threads'],
+ [DONE_AT,'The copy finishes: 107M rows, about 2 hours after the upsize']];
 const frac=x=>x-Math.floor(x);
 // A small table: header stripe and row lines.
 function table(x,y,label,fill){let r=rect(x,y,70,50,'#fff',C.line,6)+rect(x,y,70,12,fill,'none',6)+rect(x,y+6,70,6,fill,'none',0);
@@ -41,13 +41,13 @@ const stream=[];{let pos=0,speed=.12,lanes=1,alpha=1;
   stream.push({pos,lanes,alpha});}}
 function renderFrame(t){
  t=Math.max(0,Math.min(t,DURATION-.05));
- const phase=t<RESIZE_AT?0:t<11.5?1:2,{h:elapsed,rows}=at(t),done=rows>=ROWS,write=writeAt(t);
+ const phase=t<RESIZE_AT?0:t<DONE_AT?1:2,{h:elapsed,rows}=at(t),done=rows>=ROWS,write=writeAt(t);
  const restarting=t>=RESIZE_AT&&t<BACK_AT,upsized=t>=RESIZE_AT,rate=rateAt(t),hours=rate>0?(ROWS-rows)/rate:840;
- const labels=['Throttled on db.r6g.large','Upsize the writer','Done in 2 hours'];
- const captions=['On a 2-vCPU writer the copy runs one write thread and stays throttled, so its ETA is about a month.',
+ const labels=['Throttled on db.r6g.large','Upsize the writer','Copy done'];
+ const captions=['On a 2-vCPU writer, the copy runs one write thread and stays throttled, so its ETA is about a month.',
   'Changing the instance class gives the writer 8 vCPUs, and Spirit scales its write threads up.',
-  'The copy finished about 2 hours after the upsize instead of a month.'];
- let s=rect(0,0,1100,690,'#fff','none',0)+txt(36,37,'SCHEMABOT / SPIRIT',13,C.muted,650)+txt(36,105,'Upsizing Aurora turns a month-long copy into 2 hours.',32,C.ink,650);
+  'The copy finished about 2 hours after the upsize instead of taking a month.'];
+ let s=rect(0,0,1100,690,'#fff','none',0)+txt(36,37,'SCHEMABOT / SPIRIT',13,C.muted,650)+txt(36,105,'Upsizing Aurora speeds up a throttled copy.',32,C.ink,650);
  for(let i=0;i<3;i++){const x=36+i*349;s+=rect(x,130,330,3,i<phase?C.green:i===phase?C.blue:C.line)+txt(x,158,labels[i],16,i===phase?C.blue:C.muted,i===phase?650:500);}
  // The Aurora writer grows while it restarts on the larger instance class.
  const g=ease((t-RESIZE_AT)/(BACK_AT-RESIZE_AT)),w=400+300*g,hgt=112+38*g,ry=13+3*g,cx=402,bottom=348,top=bottom-hgt,x0=cx-w/2,x1=cx+w/2;

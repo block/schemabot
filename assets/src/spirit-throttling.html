@@ -44,9 +44,9 @@ function renderFrame(t){
  const rate=rates[Math.round(t*20)],zoneColor=lat>=THRESHOLD?C.red:lat>=HIGH?C.amber:C.ink;
  const labels=['Add threads','Shed threads','Wait at 100ms','Grow back'];
  const captions=['Commit latency is low, so Spirit adds write threads and the copy speeds up.',
-  'Application writes push latency up: Spirit sheds a thread above 70ms and halves them at 100ms.',
-  'Above 100ms each thread also waits before its next chunk, so only a trickle copies.',
-  'Latency recovers, so Spirit adds threads back one at a time and the copy speeds up again.'];
+  'Application writes push latency up: Spirit sheds a thread above 70ms and halves its threads at 100ms.',
+  'Above 100ms, each thread also waits before its next chunk, so the copy slows to a trickle.',
+  'As latency recovers, Spirit adds threads back one at a time and the copy speeds up again.'];
  let s=rect(0,0,1100,690,'#fff','none',0)+txt(36,37,'SCHEMABOT / SPIRIT',13,C.muted,650)+txt(36,105,'Spirit slows the copy as commit latency rises.',32,C.ink,650);
  for(let i=0;i<4;i++){const x=36+i*263;s+=rect(x,130,247,3,i<phase?C.green:i===phase?C.blue:C.line)+txt(x,158,labels[i],16,i===phase?C.blue:C.muted,i===phase?650:500);}
  // The application and Spirit both write to one Aurora writer.
@@ -70,8 +70,8 @@ function renderFrame(t){
  let pts=[];for(let a=0;a<=t;a+=.1)pts.push(px(a).toFixed(1)+','+py(latency(a)).toFixed(1));pts.push(px(t).toFixed(1)+','+py(latency(t)).toFixed(1));
  s+=`<polyline points="${pts.join(' ')}" fill="none" stroke="${zoneColor===C.ink?C.blue:zoneColor}" stroke-width="3" stroke-linejoin="round"/>`+`<circle cx="${px(t)}" cy="${py(latency(t))}" r="5" fill="${zoneColor===C.ink?C.blue:zoneColor}"/>`;
  s+=rect(36,576,1028,57,C.soft)+txt(55,612,captions[phase],17,C.ink,500);
- s+=txt(36,659,'Illustrative timing and a write-limited copy · Spirit samples every five seconds and moves one step per cooldown.',12,C.muted);
- s+=txt(36,678,'A waiting thread rechecks every second and copies one chunk after a minute · only the 100ms pause shows in progress.',12,C.muted);
+ s+=txt(36,659,'Timing is illustrative and the copy is write-limited · Spirit samples every five seconds and moves one step per cooldown.',12,C.muted);
+ s+=txt(36,678,'A waiting thread rechecks every second and copies one chunk after a minute · Progress shows only the 100ms pause.',12,C.muted);
  document.getElementById('art').innerHTML=s;return {phase,lat,throttled,threads,action,rate:Math.round(rate)};
 }
 window.renderFrame=renderFrame;renderFrame(0);
