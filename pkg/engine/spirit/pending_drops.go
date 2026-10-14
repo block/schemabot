@@ -97,6 +97,11 @@ func (e *Engine) quarantineDroppedTables(ctx context.Context, host, username, pa
 		if err := pendingdrops.RecordQuarantines(ctx, db, applyIdentifier, moved, time.Now()); err != nil {
 			return fmt.Errorf("record which apply quarantines the DROP TABLE targets before moving them: %w", err)
 		}
+	} else {
+		e.changeLogger().Debug("schema change names no apply; the quarantine is recorded in this process only and a replay in another process will not recognize the copies",
+			"database", database,
+			"tables", quarantinedSourceTables(moved),
+		)
 	}
 	if err := pendingdrops.MoveTablesTo(ctx, db, moved); err != nil {
 		return fmt.Errorf("quarantine DROP TABLE targets: %w", err)
@@ -226,6 +231,11 @@ func (e *Engine) recordedQuarantines(ctx context.Context, db *sql.DB, target dro
 			return nil, fmt.Errorf("read which copies apply %s recorded for DROP TABLE target `%s`.`%s`: %w", applyIdentifier, target.schema, target.table, err)
 		}
 		recorded = durable
+	} else {
+		e.changeLogger().Debug("schema change names no apply; only this process's record says whether the DROP TABLE target was already quarantined",
+			"database", target.schema,
+			"table", target.table,
+		)
 	}
 	for _, table := range e.quarantinedDrops(target) {
 		if !slices.ContainsFunc(recorded, func(r pendingdrops.QuarantinedTable) bool { return r.QuarantineTable == table.QuarantineTable }) {
@@ -271,6 +281,16 @@ func findRecordedCopy(ctx context.Context, db *sql.DB, recorded []pendingdrops.Q
 		}
 	}
 	return pendingdrops.QuarantinedTable{}, false, nil
+}
+
+// quarantinedSourceTables names the source tables of moved as `schema`.`table`
+// for a log line.
+func quarantinedSourceTables(moved []pendingdrops.QuarantinedTable) []string {
+	names := make([]string, 0, len(moved))
+	for _, table := range moved {
+		names = append(names, fmt.Sprintf("`%s`.`%s`", table.SchemaName, table.TableName))
+	}
+	return names
 }
 
 // describeMissingCopies names the recorded destinations a missing DROP target

@@ -682,12 +682,7 @@ func TestEngine_ResumeDropPhase_RecognizesItsCopyAfterARestart(t *testing.T) {
 	require.NoError(t, err, "parse DSN")
 
 	attempt := func(applyIdentifier string) error {
-		eng := New(Config{Logger: slog.Default()})
-		eng.installRunningSchemaChange(&runningSchemaChange{
-			database: database, state: engine.StateRunning,
-			host: host, username: username, password: password,
-			applyIdentifier: applyIdentifier,
-		})
+		eng := engineForApply(t, dsn, applyIdentifier)
 		return eng.quarantineDroppedTables(t.Context(), host, username, password, database, "DROP TABLE `durable_orders`")
 	}
 
@@ -707,6 +702,79 @@ func TestEngine_ResumeDropPhase_RecognizesItsCopyAfterARestart(t *testing.T) {
 	message, ok := engine.OperatorMessageOf(err)
 	require.True(t, ok, "error must carry an operator message")
 	assert.Contains(t, message, "`durable_orders` does not exist and was not quarantined by this attempt of the schema change")
+}
+
+// breakQuarantineLog leaves a table under the quarantine log's name whose
+// columns the log's reads and writes do not match, so every statement against
+// the log fails the way a damaged or foreign table at that name would.
+func breakQuarantineLog(t *testing.T, db *sql.DB) {
+	t.Helper()
+	_, err := db.ExecContext(t.Context(), fmt.Sprintf("CREATE DATABASE IF NOT EXISTS `%s`", pendingdrops.Database))
+	require.NoError(t, err, "create pending drops database")
+	_, err = db.ExecContext(t.Context(), fmt.Sprintf("CREATE TABLE `%s`.`%s` (unrelated INT)", pendingdrops.Database, pendingdrops.LogTable))
+	require.NoError(t, err, "create a quarantine log with the wrong shape")
+}
+
+// engineForApply returns an engine tracking a running schema change that
+// belongs to the named apply, the way Apply leaves it before the DROP phase.
+func engineForApply(t *testing.T, dsn, applyIdentifier string) *Engine {
+	t.Helper()
+	host, username, password, database, err := parseDSN(dsn)
+	require.NoError(t, err, "parse DSN")
+	eng := New(Config{Logger: slog.Default()})
+	eng.installRunningSchemaChange(&runningSchemaChange{
+		database: database, state: engine.StateRunning,
+		host: host, username: username, password: password,
+		applyIdentifier: applyIdentifier,
+	})
+	return eng
+}
+
+// A schema change that names its apply does not quarantine a table it cannot
+// record in the target's quarantine log. With the record refused, the table
+// stays in place and the statement fails: moving it anyway would leave a copy
+// in pending drops that no later attempt of the apply could recognize as its
+// own, so the replay would report the drop final.
+func TestEngine_DropPhase_RefusesToQuarantineWhenTheLogCannotBeWritten(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	cleanupTables(t, db)
+	cleanupPendingDropsDB(t, db)
+	breakQuarantineLog(t, db)
+
+	_, err := db.ExecContext(t.Context(), "CREATE TABLE `probe_keep` (id INT PRIMARY KEY AUTO_INCREMENT)")
+	require.NoError(t, err, "create probe_keep")
+	host, username, password, database, err := parseDSN(dsn)
+	require.NoError(t, err, "parse DSN")
+
+	eng := engineForApply(t, dsn, "apply-a")
+	err = eng.quarantineDroppedTables(t.Context(), host, username, password, database, "DROP TABLE `probe_keep`")
+	require.Error(t, err, "the drop must fail when the quarantine log cannot be written")
+	assert.Contains(t, err.Error(), "record which apply quarantines the DROP TABLE targets before moving them")
+
+	exists, err := tableExistsInSchema(t.Context(), db, database, "probe_keep")
+	require.NoError(t, err)
+	assert.True(t, exists, "the table stays in place when its quarantine cannot be recorded")
+	assert.Equal(t, []string{pendingdrops.LogTable}, listQuarantinedTables(t, db), "no copy lands in pending drops")
+}
+
+// A DROP TABLE target that is missing is resolved against the target's
+// quarantine log. When the log cannot be read, the statement fails rather than
+// read as "never quarantined": IF EXISTS would otherwise report the drop done
+// over a copy this apply may well hold, and a plain DROP would report a
+// recoverable table unrecoverable.
+func TestEngine_DropPhase_FailsAMissingTargetWhenTheLogCannotBeRead(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	cleanupTables(t, db)
+	cleanupPendingDropsDB(t, db)
+	breakQuarantineLog(t, db)
+
+	host, username, password, database, err := parseDSN(dsn)
+	require.NoError(t, err, "parse DSN")
+
+	eng := engineForApply(t, dsn, "apply-a")
+	err = eng.quarantineDroppedTables(t.Context(), host, username, password, database, "DROP TABLE IF EXISTS `probe_missing`")
+	require.Error(t, err, "a missing target must not be skipped when the quarantine log cannot be read")
+	assert.Contains(t, err.Error(), "read which copies apply apply-a recorded for DROP TABLE target")
 }
 
 // An apply that drops a table through Apply records, on the target, that its
