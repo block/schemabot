@@ -104,7 +104,12 @@ func (e *Engine) verifyBranchMatchesDesired(ctx context.Context, client psclient
 			continue
 		}
 
-		diff, err := e.diffKeyspace(ctx, client, org, database, branch, ks, ns, branchSchema)
+		// A VSchema the API reports missing is taken as absent here: the
+		// desired document is never empty when one is checked, so the absence
+		// surfaces as a VSchema difference and the caller's retry reads it
+		// again on its own schedule. Reading it again here as well would
+		// stack the two waits.
+		diff, err := e.diffKeyspace(ctx, client, org, database, branch, ks, ns, branchSchema, acceptMissingVSchema)
 		if err != nil {
 			return fmt.Errorf("validate keyspace %s: %w", ks, err)
 		}
@@ -233,10 +238,30 @@ type keyspaceDiff struct {
 	currentVSchemaRaw string
 }
 
+// missingVSchemaPolicy says what a diff does with a VSchema the API reports
+// missing. A not-found answer means either that the keyspace has never had a
+// VSchema or that the API has not converged after a recent write, and the two
+// call for opposite plans: absence makes the desired document the keyspace's
+// first, which switches off the checks that compare it against what it
+// replaces (removals and vindex or routing mutations).
+type missingVSchemaPolicy int
+
+const (
+	// rereadMissingVSchema reads the VSchema again, a bounded number of times,
+	// before the absence is believed. This is the policy for a diff whose
+	// answer is acted on as read.
+	rereadMissingVSchema missingVSchemaPolicy = iota
+	// acceptMissingVSchema believes the first not-found. This is the policy for
+	// a caller whose own retry loop reads the keyspace again on a VSchema
+	// difference, so a lagging answer costs one of its attempts rather than a
+	// second wait nested inside the first.
+	acceptMissingVSchema
+)
+
 // diffKeyspace diffs a single keyspace's schema between a branch and the
 // desired schema files, linting the planned statements in the same pass.
 // Shared by Plan() and verifyBranchMatchesDesired().
-func (e *Engine) diffKeyspace(ctx context.Context, client psclient.PSClient, org, database, branch, ks string, ns *schema.Namespace, currentSchema map[string][]table.TableSchema) (keyspaceDiff, error) {
+func (e *Engine) diffKeyspace(ctx context.Context, client psclient.PSClient, org, database, branch, ks string, ns *schema.Namespace, currentSchema map[string][]table.TableSchema, missing missingVSchemaPolicy) (keyspaceDiff, error) {
 	var currentTableSchemas []table.TableSchema
 	if tables, ok := currentSchema[ks]; ok {
 		currentTableSchemas = append(currentTableSchemas, tables...)
@@ -321,24 +346,9 @@ func (e *Engine) diffKeyspace(ctx context.Context, client psclient.PSClient, org
 	vschemaChanged := false
 	currentVSchemaRaw := ""
 	if content, ok := ns.Files["vschema.json"]; ok && content != "" {
-		currentVSchema, fetchErr := client.GetKeyspaceVSchema(ctx, &ps.GetKeyspaceVSchemaRequest{
-			Organization: org,
-			Database:     database,
-			Branch:       branch,
-			Keyspace:     ks,
-		})
-		if fetchErr != nil {
-			var psErr *ps.Error
-			if !errors.As(fetchErr, &psErr) || psErr.Code != ps.ErrNotFound {
-				return keyspaceDiff{}, fmt.Errorf("fetch VSchema for keyspace %s: %w", ks, fetchErr)
-			}
-			// Keyspace has no VSchema on this branch yet — either it has
-			// never had one, or the API has not converged after a recent
-			// write. Treat as empty so the desired VSchema appears as a
-			// change; validation callers absorb convergence lag through
-			// the VSchema staleness retry.
-			e.logger.Warn("VSchema not found for keyspace, treating as empty",
-				"keyspace", ks, "branch", branch)
+		currentVSchema, err := e.fetchKeyspaceVSchema(ctx, client, org, database, branch, ks, missing)
+		if err != nil {
+			return keyspaceDiff{}, err
 		}
 		if currentVSchema != nil {
 			currentVSchemaRaw = currentVSchema.Raw
@@ -397,7 +407,12 @@ func (e *Engine) verifyBranchMatchesMain(ctx context.Context, client psclient.PS
 			mainNS.Files[t.Name+".sql"] = t.Schema + ";"
 		}
 
-		diff, diffErr := e.diffKeyspace(ctx, client, org, database, branchName, ks, mainNS, branchSchema)
+		// mainNS carries only table files, so this diff never reads a
+		// VSchema and the policy is not reached today. It is the re-read
+		// policy because this gate acts on its answer (a difference means
+		// the branch is stale), which is what a VSchema comparison added
+		// here would need.
+		diff, diffErr := e.diffKeyspace(ctx, client, org, database, branchName, ks, mainNS, branchSchema, rereadMissingVSchema)
 		if diffErr != nil {
 			return fmt.Errorf("diff branch vs main for %s: %w", ks, diffErr)
 		}
@@ -409,6 +424,57 @@ func (e *Engine) verifyBranchMatchesMain(ctx context.Context, client psclient.PS
 
 	e.logger.Info("branch schema matches main", "branch", branchName, "keyspaces", len(keyspaces))
 	return nil
+}
+
+// vschemaAbsenceRereads and vschemaAbsenceRereadInterval bound how long a
+// VSchema the API reports missing is read again before the absence is believed
+// under rereadMissingVSchema.
+var (
+	vschemaAbsenceRereads        = 3
+	vschemaAbsenceRereadInterval = 2 * time.Second
+)
+
+// fetchKeyspaceVSchema reads the keyspace's VSchema on branch, returning nil
+// when the keyspace has none.
+//
+// Nothing the diff holds tells a keyspace that has never had a VSchema from one
+// whose VSchema the API has not yet converged on: a keyspace with no physical
+// tables can still carry a VSchema, and the table list the diff sees has
+// already had ignore_tables withheld from it. So under rereadMissingVSchema
+// every not-found is read again, a bounded number of times, before it is
+// believed; a keyspace whose VSchema is genuinely absent pays the full wait
+// once, when its first VSchema is planned.
+func (e *Engine) fetchKeyspaceVSchema(ctx context.Context, client psclient.PSClient, org, database, branch, ks string, missing missingVSchemaPolicy) (*ps.VSchema, error) {
+	req := &ps.GetKeyspaceVSchemaRequest{Organization: org, Database: database, Branch: branch, Keyspace: ks}
+	rereads := 0
+	if missing == rereadMissingVSchema {
+		rereads = vschemaAbsenceRereads
+	}
+	for attempt := 0; ; attempt++ {
+		current, err := client.GetKeyspaceVSchema(ctx, req)
+		if err == nil {
+			if attempt > 0 {
+				e.logger.Info("VSchema found after an earlier read reported it missing",
+					"keyspace", ks, "branch", branch, "reads", attempt+1)
+			}
+			return current, nil
+		}
+		if !isNotFound(err) {
+			return nil, fmt.Errorf("fetch VSchema for keyspace %s: %w", ks, err)
+		}
+		if attempt >= rereads {
+			e.logger.Warn("VSchema not found for keyspace; treating it as the keyspace's first VSchema",
+				"keyspace", ks, "branch", branch, "reads", attempt+1)
+			return nil, nil
+		}
+		e.logger.Info("VSchema reported missing; reading it again in case the API has not converged",
+			"keyspace", ks, "branch", branch, "read", attempt+1, "delay", vschemaAbsenceRereadInterval)
+		select {
+		case <-ctx.Done():
+			return nil, fmt.Errorf("re-read VSchema for keyspace %s: %w", ks, ctx.Err())
+		case <-time.After(vschemaAbsenceRereadInterval):
+		}
+	}
 }
 
 func (e *Engine) fetchDatabaseSchema(ctx context.Context, client psclient.PSClient, org, database, branch string, keyspaces []string) (map[string][]table.TableSchema, error) {
