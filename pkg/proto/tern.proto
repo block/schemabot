@@ -776,6 +776,14 @@ message ApplyRequest {
   // the apply up later — on another pod, or after a restart — routes under
   // the policy the dispatch was admitted under rather than re-deriving one.
   DirectExecutionPolicy direct_execution = 14;
+  // Every change of the plan a table step's dispatch runs part of. A step's
+  // ddl_changes name only its own table, so a deployment that has not stored
+  // the plan builds it from these instead: it verifies the whole plan against
+  // its live schema, stores it once, and runs the step's table from it, so
+  // every later step of the same target finds the plan its own target was
+  // planned with. Empty on a dispatch that is not a table step, whose
+  // ddl_changes already carry its whole plan.
+  repeated TableChange plan_ddl_changes = 15;
 }
 
 // ApplyConflict names the active work that refused an apply, in the terms a

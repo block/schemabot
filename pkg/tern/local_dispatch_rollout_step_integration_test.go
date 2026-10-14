@@ -122,3 +122,116 @@ func TestLocalClient_Apply_RolloutStepsAttachOneOperationPerStep(t *testing.T) {
 		assert.Equal(t, []string{want.table}, tablesByOperation[op.ID], "%s runs only its own table", key)
 	}
 }
+
+// payments-002 is a rollout member other than the primary, so the control
+// plane planned it with the non-persisting diff and stored its plan only in
+// its own storage: the data plane holds no plan for it. Its rollout runs
+// table by table, and each step's dispatch carries payments-002's whole plan
+// beside the step's one table. The first step builds payments-002's plan on
+// the data plane from that whole plan, verified against payments-002's live
+// schema, and the second step runs from the plan the first stored. Each step
+// attaches its own operation carrying only its own table, and the stored plan
+// holds both tables, so neither step is refused for want of a plan.
+func TestLocalClient_Apply_MemberStepsBuildTheMembersPlanFromTheDispatch(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	_, dsn := setupMySQLContainer(t)
+	setupStorageSchema(t, dsn)
+	cleanupTestTables(t, dsn)
+	cleanupTasks(t, dsn)
+	ctx := t.Context()
+
+	db, err := sql.Open("block-mysql", dsn)
+	require.NoError(t, err)
+	defer utils.CloseAndLog(db)
+	require.NoError(t, db.PingContext(ctx))
+	for _, ddl := range []string{"CREATE TABLE users (id INT PRIMARY KEY)", "CREATE TABLE accounts (id INT PRIMARY KEY)"} {
+		_, err = db.ExecContext(ctx, ddl)
+		require.NoError(t, err)
+	}
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	stor := createStorage(t, dsn)
+	client, err := NewLocalClient(LocalConfig{Database: "testdb", Type: "mysql", TargetDSN: dsn}, stor, logger)
+	require.NoError(t, err)
+	t.Cleanup(func() { utils.CloseAndLog(client) })
+
+	schemaFiles := map[string]*ternv1.SchemaFiles{"testdb": {Files: buildSchemaWithAllTables(t, dsn, map[string]string{
+		"users":    "CREATE TABLE users (id INT PRIMARY KEY, email VARCHAR(255))",
+		"accounts": "CREATE TABLE accounts (id INT PRIMARY KEY, name VARCHAR(255))",
+	})}}
+	diff, err := client.PlanDiff(ctx, &ternv1.PlanRequest{Type: "mysql", Database: "testdb", Target: "payments-002", SchemaFiles: schemaFiles})
+	require.NoError(t, err)
+	var memberPlan []*ternv1.TableChange
+	for _, change := range diff.Changes {
+		for _, table := range change.TableChanges {
+			memberPlan = append(memberPlan, &ternv1.TableChange{Namespace: change.Namespace, TableName: table.TableName, Ddl: table.Ddl, ChangeType: table.ChangeType})
+		}
+	}
+	require.Len(t, memberPlan, 2, "payments-002's own plan alters both tables")
+
+	const planID = "plan-member-payments-002"
+	stored, err := stor.Plans().Get(ctx, planID)
+	require.NoError(t, err)
+	require.Nil(t, stored, "the data plane holds no plan for a member planned with the diff")
+
+	const key = "schemabot:v1:member-step-test"
+	stepDispatch := func(step, table string) *ternv1.ApplyRequest {
+		req := memberTargetDispatchRequest(planID, key, "payments-002")
+		req.GenerationOperationKeys = []string{"payments-002/step-1", "payments-002/step-2"}
+		req.Options[dispatchRolloutStepOption] = step
+		req.SchemaFiles = schemaFiles
+		req.DdlChanges = nil
+		for _, change := range memberPlan {
+			if change.TableName == table {
+				req.DdlChanges = append(req.DdlChanges, change)
+			}
+		}
+		require.Len(t, req.DdlChanges, 1, "step %s names its one table", step)
+		req.PlanDdlChanges = memberPlan
+		return req
+	}
+
+	first, err := client.Apply(ctx, stepDispatch("1", "users"))
+	require.NoError(t, err)
+	require.True(t, first.Accepted, "the member's first step must be accepted: %s", first.ErrorMessage)
+	assert.Equal(t, "payments-002/step-1", first.OperationKey)
+
+	second, err := client.Apply(ctx, stepDispatch("2", "accounts"))
+	require.NoError(t, err)
+	require.True(t, second.Accepted, "the member's second step must run from the plan its first stored: %s", second.ErrorMessage)
+	assert.Equal(t, first.ApplyId, second.ApplyId)
+	assert.Equal(t, "payments-002/step-2", second.OperationKey)
+
+	stored, err = stor.Plans().Get(ctx, planID)
+	require.NoError(t, err)
+	require.NotNil(t, stored, "the first step stores payments-002's plan on the data plane")
+	assert.Equal(t, "payments-002", stored.Target)
+	var storedTables []string
+	for _, change := range stored.FlatDDLChanges() {
+		storedTables = append(storedTables, change.Table)
+	}
+	assert.ElementsMatch(t, []string{"users", "accounts"}, storedTables, "the stored plan is payments-002's whole plan, not its first step's table")
+
+	apply, err := stor.Applies().GetByApplyIdentifier(ctx, first.ApplyId)
+	require.NoError(t, err)
+	require.NotNil(t, apply)
+	ops, err := stor.ApplyOperations().ListByApply(ctx, apply.ID)
+	require.NoError(t, err)
+	require.Len(t, ops, 2)
+	tasks, err := stor.Tasks().GetByApplyID(ctx, apply.ID)
+	require.NoError(t, err)
+	tablesByOperation := map[int64][]string{}
+	for _, task := range tasks {
+		require.NotNil(t, task.ApplyOperationID)
+		tablesByOperation[*task.ApplyOperationID] = append(tablesByOperation[*task.ApplyOperationID], task.TableName)
+	}
+	for _, op := range ops {
+		want := map[string]string{"payments-002/step-1": "users", "payments-002/step-2": "accounts"}[op.OperationKey]
+		require.NotEmpty(t, want, "unexpected operation %s", op.OperationKey)
+		assert.Equal(t, "payments-002", op.Target)
+		assert.Equal(t, []string{want}, tablesByOperation[op.ID], "%s runs only its own table", op.OperationKey)
+	}
+}

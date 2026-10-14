@@ -6,6 +6,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/schemabot/pkg/ddl"
+	"github.com/block/schemabot/pkg/engine"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/storage"
 )
@@ -107,35 +109,120 @@ func TestDeriveDispatchScope_RolloutStepRunsItsTableInEveryNamespace(t *testing.
 	}
 }
 
-// A table step's dispatch carries one table of its target's plan, so a step
-// that reaches a deployment with no stored plan is refused rather than
-// materialized into a plan of that one table, and no plan row is written.
-func TestPlanForApplyRequest_RefusesToMaterializeAPlanFromOneStep(t *testing.T) {
+// memberStepDispatch is the dispatch of one table step of testapp-002, a
+// rollout member other than the primary: its ddl_changes name the step's
+// table, and beside them it carries every change of testapp-002's plan, which
+// alters `users` (step 1) and creates `orders` (step 2).
+func memberStepDispatch(step, table string) *ternv1.ApplyRequest {
+	return &ternv1.ApplyRequest{
+		PlanId:      "plan-testapp-002",
+		Environment: "production",
+		Target:      "testapp-002",
+		Options:     map[string]string{dispatchMemberTargetOption: "testapp-002", dispatchRolloutStepOption: step},
+		DdlChanges:  []*ternv1.TableChange{{Namespace: "testapp", TableName: table, Ddl: "dispatched text", ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER}},
+		PlanDdlChanges: []*ternv1.TableChange{
+			{Namespace: "testapp", TableName: "users", Ddl: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)", ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER},
+			{Namespace: "testapp", TableName: "orders", Ddl: "CREATE TABLE `orders` (`id` bigint NOT NULL, PRIMARY KEY (`id`))", ChangeType: ternv1.ChangeType_CHANGE_TYPE_CREATE},
+		},
+		SchemaFiles: map[string]*ternv1.SchemaFiles{"testapp": {Files: map[string]string{"users.sql": "CREATE TABLE `users` ...", "orders.sql": "CREATE TABLE `orders` ..."}}},
+	}
+}
+
+// testapp002LivePlan is what testapp-002's own live schema re-plans to before
+// any of its steps has run: both of its plan's changes.
+func testapp002LivePlan() *engine.PlanResult {
+	return &engine.PlanResult{Changes: []engine.SchemaChange{{
+		Namespace: "testapp",
+		TableChanges: []engine.TableChange{
+			{Table: "users", Operation: ddl.StatementAlterTable, DDL: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)"},
+			{Table: "orders", Operation: ddl.StatementCreateTable, DDL: "CREATE TABLE `orders` (`id` bigint NOT NULL, PRIMARY KEY (`id`))"},
+		},
+	}}}
+}
+
+// A rollout member other than the primary is planned without the data plane
+// storing its plan, so the first of its table steps to reach the data plane
+// builds the plan there from the whole plan the dispatch carries: both of
+// testapp-002's changes are verified against its live schema and stored under
+// its plan ID, and the step itself runs only its own table from that plan.
+func TestPlanForApplyRequest_MemberStepBuildsItsTargetsWholePlan(t *testing.T) {
+	store := &fakePlanStore{getFn: func(string) (*storage.Plan, error) { return nil, nil }, createID: 42}
+	c := newPlanMaterializeClientWithPlan(store, testapp002LivePlan())
+	req := memberStepDispatch("2", "orders")
+
+	got, err := c.planForApplyRequest(t.Context(), req)
+	require.NoError(t, err)
+	require.NotNil(t, got)
+
+	assert.Equal(t, "plan-testapp-002", got.PlanIdentifier)
+	assert.Equal(t, "testapp-002", got.Target)
+	require.NotNil(t, store.created)
+	tables := map[string]string{}
+	for _, change := range store.created.FlatDDLChanges() {
+		tables[change.Table] = change.Operation
+	}
+	assert.Equal(t, map[string]string{"users": "alter", "orders": "create"}, tables, "the stored plan is the target's whole plan, not the step's table")
+
+	scope, err := deriveDispatchScope(got, req)
+	require.NoError(t, err)
+	assert.Equal(t, 2, scope.rolloutStep)
+	require.Len(t, scope.ddlChanges, 1)
+	assert.Equal(t, "orders", scope.ddlChanges[0].Table)
+	assert.Equal(t, "CREATE TABLE `orders` (`id` bigint NOT NULL, PRIMARY KEY (`id`))", scope.ddlChanges[0].DDL)
+}
+
+// The whole plan a step carries is held to the same drift check as any plan a
+// deployment builds from a dispatch: testapp-002's live schema already holds
+// `email`, so it re-plans to `orders` alone, the carried plan no longer
+// describes it, and the step is refused before anything is stored.
+func TestPlanForApplyRequest_MemberStepRefusesAPlanItsLiveSchemaDisagreesWith(t *testing.T) {
+	store := &fakePlanStore{getFn: func(string) (*storage.Plan, error) { return nil, nil }, createID: 42}
+	live := testapp002LivePlan()
+	live.Changes[0].TableChanges = live.Changes[0].TableChanges[1:]
+	c := newPlanMaterializeClientWithPlan(store, live)
+
+	got, err := c.planForApplyRequest(t.Context(), memberStepDispatch("2", "orders"))
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "local schema has drifted from the reviewed plan")
+	assert.Nil(t, got)
+	assert.Nil(t, store.created)
+}
+
+// A step dispatch with no stored plan and no whole plan beside it has nothing
+// its target's plan can be built from. It is refused, and permanently, since
+// redispatching the same request would carry no plan either.
+func TestPlanForApplyRequest_RefusesAStepWithNoPlanToBuildFrom(t *testing.T) {
 	store := &fakePlanStore{getFn: func(string) (*storage.Plan, error) { return nil, nil }}
 	c := newPlanMaterializeClient(store)
-	req := stepDispatch("1", "orders")
-	req.PlanId = "plan-payments-001"
-	req.SchemaFiles = map[string]*ternv1.SchemaFiles{"payments": {Files: map[string]string{"orders.sql": "CREATE TABLE `orders` ..."}}}
+	req := memberStepDispatch("1", "users")
+	req.PlanDdlChanges = nil
 
 	got, err := c.planForApplyRequest(t.Context(), req)
 
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "dispatch for rollout step 1 has no plan plan-payments-001 stored on this deployment")
+	assert.Contains(t, err.Error(), "dispatch for rollout step 1 has no plan plan-testapp-002 stored on this deployment and carries no plan to build it from")
+	assert.False(t, engine.IsRetryable(err), "a redispatch carries no plan either")
 	assert.Nil(t, got)
-	assert.Nil(t, store.created, "nothing is materialized from one step's table")
+	assert.Nil(t, store.created, "nothing is built from one step's table")
 }
 
 // The control plane names a stepped operation's table step on its dispatch,
-// alongside its member target, and leaves it off an operation that runs its
-// member's whole change.
+// alongside its member target and its target's whole plan, and leaves both off
+// an operation that runs its member's whole change.
 func TestStampMemberTarget_NamesTheOperationsRolloutStep(t *testing.T) {
 	stepped := applyTaskScope{memberTarget: "payments-001", operation: &storage.ApplyOperation{Target: "payments-001", OperationKey: "payments-001/step-2", RolloutStep: 2}}
 	req := &ternv1.ApplyRequest{}
-	stepped.stampMemberTarget(req)
+	stepped.stampMemberTarget(req, rolloutStepPlan())
 	assert.Equal(t, map[string]string{dispatchMemberTargetOption: "payments-001", dispatchRolloutStepOption: "2"}, req.Options)
+	assert.Equal(t, []*ternv1.TableChange{
+		{Namespace: "payments", TableName: "orders", Ddl: "ALTER TABLE `orders` ADD COLUMN `note` varchar(255)", ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER},
+		{Namespace: "payments", TableName: "refunds", Ddl: "CREATE TABLE `refunds` (`id` bigint NOT NULL, PRIMARY KEY (`id`))", ChangeType: ternv1.ChangeType_CHANGE_TYPE_CREATE},
+	}, req.PlanDdlChanges, "a step carries its target's whole plan")
 
 	whole := applyTaskScope{memberTarget: "payments-001", operation: &storage.ApplyOperation{Target: "payments-001", OperationKey: "payments-001"}}
 	req = &ternv1.ApplyRequest{}
-	whole.stampMemberTarget(req)
+	whole.stampMemberTarget(req, rolloutStepPlan())
 	assert.Equal(t, map[string]string{dispatchMemberTargetOption: "payments-001"}, req.Options)
+	assert.Empty(t, req.PlanDdlChanges, "a whole-target dispatch already carries its plan in ddl_changes")
 }

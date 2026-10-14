@@ -2174,14 +2174,30 @@ func (c *LocalClient) planForApplyRequest(ctx context.Context, req *ternv1.Apply
 	if !applyRequestCarriesPlanPayload(req) {
 		return nil, nil
 	}
-	// A table step's dispatch carries one table of its target's plan, so a plan
-	// built from it would hold that table alone and the next step's table
-	// would have nothing to run against. Apply creation refuses a multi-target
-	// rollout across deployments, so a step's target was planned on this
-	// deployment and its plan is stored here; a step that arrives without one
-	// is refused rather than materialized short.
+	// A table step's ddl_changes name one table of its target's plan, so a plan
+	// built from them would hold that table alone and the target's later steps
+	// would have nothing to run against. A member other than the primary is
+	// planned without this deployment storing its plan, so its first step to
+	// arrive builds the plan from the whole plan the dispatch carries beside
+	// the step: verified against this target's live schema like any other
+	// materialized plan, and stored under the member's plan ID, where every
+	// later step finds it. The step's table is then run from that stored plan.
 	if step, ok := req.GetOptions()[dispatchRolloutStepOption]; ok {
-		return nil, fmt.Errorf("dispatch for rollout step %s has no plan %s stored on this deployment; a step carries one table of its target's plan, so refusing to build the plan from it", step, req.PlanId)
+		if len(req.GetPlanDdlChanges()) == 0 {
+			// No later attempt of the same dispatch carries a plan either, so
+			// the refusal is permanent rather than spent against the retry budget.
+			return nil, engine.NewPermanentError("dispatch for rollout step %s has no plan %s stored on this deployment and carries no plan to build it from; refusing to build the plan from one step's table", step, req.PlanId)
+		}
+		c.logger.Info("Apply: building a rollout member's plan from its table step's dispatch",
+			"plan_id", req.PlanId,
+			"database", c.config.Database,
+			"target", req.Target,
+			"rollout_step", step,
+			"plan_change_count", len(req.GetPlanDdlChanges()),
+		)
+		whole := proto.Clone(req).(*ternv1.ApplyRequest)
+		whole.DdlChanges = req.GetPlanDdlChanges()
+		return c.materializeApplyRequestPlan(ctx, whole)
 	}
 	return c.materializeApplyRequestPlan(ctx, req)
 }
