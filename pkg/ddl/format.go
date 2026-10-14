@@ -324,9 +324,11 @@ func isQuote(c byte) bool {
 // s[openPos]. The scanners only ever see a parser's canonical output, and
 // both canonical grammars write an embedded quote as two consecutive quote
 // characters — never as a backslash escape — so the doubled quote is the one
-// escape honoured here. A backslash is ordinary content: MySQL's canonical
-// form writes a literal ending in a backslash as 'a\', which a backslash
-// aware scanner would misread as unterminated. ok is false when the quote is
+// escape honoured here. A backslash is ordinary content: PostgreSQL's
+// canonical form writes a literal ending in a backslash as 'a\', which a
+// backslash aware scanner would misread as unterminated. MySQL's canonical
+// form escapes the backslash itself ('a\\'), which scans the same way because
+// it never puts a backslash in front of a quote. ok is false when the quote is
 // never closed, in which case the caller cannot lay the statement out safely
 // and should leave it as is.
 func quotedEnd(s string, openPos int) (end int, ok bool) {
