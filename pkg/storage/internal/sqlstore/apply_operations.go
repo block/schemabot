@@ -12,7 +12,9 @@ import (
 	"log/slog"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 
@@ -40,6 +42,19 @@ type applyOperationStore struct {
 	// substitutes storage.DefaultMaxDriversPerApply for an unset value, so the
 	// claim path has no uncapped mode.
 	maxDriversPerApply int
+
+	// processDriverShare caps how many operation leases one apply may hold on
+	// one process; see storage.ProcessDriverShare. Always positive.
+	processDriverShare int
+
+	// claimMu serializes this store's operation claims, so the process share is
+	// exact rather than soft. The plane-wide cap stays soft (see
+	// storage.DefaultMaxDriversPerApply) because bounding it would serialize
+	// claims across pods. Within one process the claims are cheap and a pool's
+	// worth of drivers at most, so serializing them costs little and keeps
+	// concurrent drivers from each reading the pre-claim count and overshooting
+	// the share together.
+	claimMu sync.Mutex
 }
 
 // Insert stores a new apply_operations row and returns its ID.
@@ -1165,8 +1180,42 @@ func driverOccupyingOperationStates() []string {
 	return append(claimableApplyStates(), state.ApplyOperation.FailedRetryable)
 }
 
+// processFreshLeaseCountSQL is freshLeaseCountSQL narrowed to the leases one
+// process holds. A lease owner is "<process>/<claimer>", so the claimer's
+// process prefix selects them, compared byte-exact.
+//
+// It takes three format arguments in order: the occupying-state placeholder
+// list, the dialect's staleness cutoff expression, and the lease owner prefix
+// comparison. Its positional arguments are one per occupying state, then the
+// prefix.
+const processFreshLeaseCountSQL = `(
+			SELECT COUNT(*)
+			FROM apply_operations AS busy
+			WHERE busy.apply_id = apply_operations.apply_id
+				AND busy.lease_owner <> ''
+				AND busy.state IN (%s)
+				AND busy.updated_at >= %s
+				AND %s
+		)`
+
+// leaseOwnerProcessPrefix returns the part of a lease owner that names its
+// process, including the trailing delimiter: "<host>/<pid>/" for
+// "<host>/<pid>/driver-1". An owner with no delimiter is a claimer that is its
+// own process, and is returned whole.
+func leaseOwnerProcessPrefix(owner string) string {
+	i := strings.LastIndex(owner, "/")
+	if i < 0 {
+		return owner
+	}
+	return owner[:i+1]
+}
+
 // driverCapClause renders the fan-out cap predicate and returns it with its
 // positional arguments, so an arm can be gated by appending both together.
+//
+// The predicate is two bounds that must both hold: the apply holds fewer than
+// maxDriversPerApply fresh leases across the plane, and fewer than
+// processDriverShare on the claimer's own process.
 //
 // The clause is rendered here rather than spliced into the claim query as `%s`
 // verbs on purpose. The claim is a long hand-ordered query with many positional
@@ -1174,10 +1223,18 @@ func driverOccupyingOperationStates() []string {
 // would put them in the middle of it, where one misplaced entry shifts every
 // later binding and silently corrupts eligibility for unrelated arms. Rendering
 // the count up front keeps each site's arguments to one named unit.
-func (s *applyOperationStore) driverCapClause(staleClaimCutoff string) (string, []any) {
+func (s *applyOperationStore) driverCapClause(staleClaimCutoff, owner string) (string, []any) {
 	occupyingStates := driverOccupyingOperationStates()
-	clause := fmt.Sprintf(freshLeaseCountSQL, placeholders(len(occupyingStates)), staleClaimCutoff) + " < ?"
-	return clause, append(stringArgs(occupyingStates), s.maxDriversPerApply)
+	statePlaceholders := placeholders(len(occupyingStates))
+	prefix := leaseOwnerProcessPrefix(owner)
+	prefixMatch := s.dialect.BinaryCollation(`LEFT(busy.lease_owner, `+strconv.Itoa(utf8.RuneCountInString(prefix))+`)`) + ` = ?`
+	clause := `(` +
+		fmt.Sprintf(freshLeaseCountSQL, statePlaceholders, staleClaimCutoff) + ` < ?
+				AND ` + fmt.Sprintf(processFreshLeaseCountSQL, statePlaceholders, staleClaimCutoff, prefixMatch) + ` < ?
+			)`
+	args := append(stringArgs(occupyingStates), s.maxDriversPerApply)
+	args = append(args, stringArgs(occupyingStates)...)
+	return clause, append(args, prefix, s.processDriverShare)
 }
 
 // releasedFailureExemptionArgs returns the positional arguments for
@@ -1311,11 +1368,14 @@ func releasedFailureExemptionArgs() []any {
 // Oldest-first is fair only between applies of comparable width. On its own it
 // lets one wide fan-out hold every driver on the plane for as long as its
 // slowest operation runs, so the pending arm is additionally capped at
-// maxDriversPerApply fresh leases per apply (see freshLeaseCountSQL).
+// maxDriversPerApply fresh leases per apply (see freshLeaseCountSQL), and at
+// processDriverShare of them on any one process (see processFreshLeaseCountSQL).
 func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner string) (*storage.ApplyOperation, error) {
 	if owner == "" {
 		return nil, fmt.Errorf("operator owner is required to claim apply_operation: %w", storage.ErrApplyLeaseLost)
 	}
+	s.claimMu.Lock()
+	defer s.claimMu.Unlock()
 	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
 		return nil, fmt.Errorf("begin claim apply_operation transaction: %w", err)
@@ -1326,7 +1386,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 	activeStatePlaceholders := placeholders(len(activeStates))
 	parentClaimable := claimableParentSQL(placeholders(len(terminalApplyStates())))
 	staleClaimCutoff := s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime, LiteralIntervalAmount(uint64(storage.ApplyLeaseStaleAfter.Microseconds())), IntervalMicrosecond)
-	driverCap, driverCapArgs := s.driverCapClause(staleClaimCutoff)
+	driverCap, driverCapArgs := s.driverCapClause(staleClaimCutoff, owner)
 
 	queryArgs := []any{state.ApplyOperation.Pending}
 	// Member-order gate for the pending claim (operationStartGateSQL): a work
@@ -1377,7 +1437,8 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 	// parent's state.
 	queryArgs = append(queryArgs, claimableParentArgs()...)
 	// Fan-out cap: a pending row is claimable only while its apply holds fewer
-	// than maxDriversPerApply fresh operation leases.
+	// than maxDriversPerApply fresh operation leases across the plane, and
+	// fewer than processDriverShare on the claiming process.
 	//
 	// The cap gates every arm that *starts* work — this pending arm, the
 	// stopped+start resume arm, and the deferred-deploy arm — because all three

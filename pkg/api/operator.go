@@ -33,7 +33,7 @@ const (
 
 	// DefaultDrivers is the number of concurrent operator drivers
 	// when not configured via drivers in the server config.
-	DefaultDrivers = 4
+	DefaultDrivers = storage.DefaultDriversPerProcess
 
 	// ApplyClaimLogTimeout bounds the best-effort apply-log append recording an
 	// operator claim, so a slow or hung storage layer cannot delay the resume
@@ -121,6 +121,7 @@ func (s *Service) StartOperator(ctx context.Context) {
 	s.logger.Info("operator started",
 		"drivers", driverCount,
 		"max_drivers_per_apply", storage.BuildOptions(storage.WithMaxDriversPerApply(s.config.MaxDriversPerApply)).MaxDriversPerApply,
+		"max_drivers_per_apply_on_this_process", storage.ProcessDriverShare(driverCount),
 		"interval", s.operatorPollInterval,
 		"stranded_reaper_interval", reaperEvery,
 		"retryable_expiry_interval", expiryEvery)

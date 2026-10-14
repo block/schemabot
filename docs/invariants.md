@@ -1134,6 +1134,17 @@ which deletes a SchemaBot branch only while holding the apply target it belongs
 to, across a final read showing no unsettled apply uses it
 (`WithTargetHeld`, `pkg/tern/branch_reconcile.go`).
 
+### OW-11: No apply holds more than half of any process's drivers
+
+While starting work, one apply holds at most half of a process's driver pool, rounded down and never
+less than one driver. On every process with two or more drivers, then, an apply whose drives all hang
+still leaves drivers free to claim other databases' work, and a wide apply spreads across processes
+instead of filling whichever polled first. Recovering a crashed operation and consuming a stop or
+cancel are exempt, so the bound never wedges the apply it limits. *Enforced:* the start arms of the
+operation claim, serialized per process so concurrent drivers cannot overshoot the share
+(`driverCapClause`, `pkg/storage/internal/sqlstore/apply_operations.go`); the pool size reaches
+storage from the server config (`pkg/serve/serve.go`).
+
 ## Control operations (CO)
 
 Full doctrine: [grpc-control-edge-cases.md](grpc-control-edge-cases.md) and the Control
