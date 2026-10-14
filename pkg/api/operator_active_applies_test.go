@@ -400,7 +400,7 @@ func TestRecoverApplyOperationProjection_ReleasesASingleOperationApplyItSettles(
 				testServerConfig(), nil, slog.New(slog.DiscardHandler),
 			)
 
-			require.True(t, svc.recoverApplyOperationProjection(t.Context(), 1, "driver-1"))
+			require.Equal(t, claimSettled, svc.recoverApplyOperationProjection(t.Context(), 1, "driver-1"))
 
 			assert.Equal(t, tt.wantState, applyStore.currentState())
 			value, ok := activeAppliesValue(t, reader, "testdb", "west", "staging")
