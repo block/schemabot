@@ -303,7 +303,7 @@ For progress bar colors, phase labels, and keyboard controls, see the
 
 ## Throttling
 
-Spirit tries to finish a schema change as fast as it can without putting your application at risk.
+Spirit tries to finish a schema change as fast as it can without putting your database at risk.
 The copy shares the database with your application's traffic, so Spirit keeps checking how the
 database is coping and adjusts as it goes:
 
@@ -313,8 +313,8 @@ database is coping and adjusts as it goes:
   that follows it, until the database recovers.
   This pause is a throttle, and the progress bar marks it `(throttled)`.
 
-A throttle is Spirit giving your application priority, not a hang. The copy resumes on its own,
-and most throttles are brief and need nothing from you. A copy that slows down without pausing
+A throttle is not a hang: Spirit is protecting the database and giving your application's
+traffic priority. The copy resumes on its own, and most throttles are brief and need nothing from you. A copy that slows down without pausing
 shows no annotation, so a long ETA with no `(throttled)` mark can mean the same thing: the database
 has little room to spare. When a throttle lasts or the ETA is longer than you can wait, the
 database is usually short on capacity. Find what is using it, or see
