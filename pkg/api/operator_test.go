@@ -1674,13 +1674,15 @@ func TestRecoverMultiApplyOperation_RefusedTaskVerdictLeavesOperationUnprojected
 		logger,
 	)
 
-	svc.recoverMultiApplyOperation(t.Context(), 1, &storage.ApplyOperation{
+	outcome := svc.recoverMultiApplyOperation(t.Context(), 1, &storage.ApplyOperation{
 		ID:         42,
 		ApplyID:    7,
 		Deployment: "west",
 		State:      state.ApplyOperation.Running,
 	}, storage.OperationLease{})
 
+	assert.Equal(t, claimSpent, outcome,
+		"a refused verdict settles nothing, so the driver waits for its next wake rather than re-running the ladder against the same refusal")
 	assert.Equal(t, state.ApplyOperation.Running, opStore.op.State,
 		"the operation row must stay running and claimable; its stored failure must not be projected over the task whose cancellation never landed")
 	assert.Equal(t, state.Apply.Running, applyStore.currentState(),
