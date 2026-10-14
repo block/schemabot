@@ -359,7 +359,8 @@ func NewHandlerWithDispatch(service *api.Service, ghClients github.ClientSet, we
 		}
 
 		// Register the aggregate terminal-summary callback, invoked by the
-		// operator that won the aggregate projection CAS. A multi-operation apply
+		// operator that won the aggregate projection CAS and by the
+		// retryable-expiry pass for each apply it settles. A multi-operation apply
 		// suppresses the per-driver observer, so this is its only summary
 		// publisher; a single-operation apply reaches it from paths with no live
 		// observer (stop reconciliation), where the summary-marker claim keeps
