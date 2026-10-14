@@ -129,7 +129,7 @@ func (m WatchModel) progressSections() (string, string) {
 		}
 		b.WriteString(m.spinner.View() + msg + m.elapsed() + "\n")
 	case state.IsState(m.state, state.Apply.Pending) && !m.pastPending:
-		b.WriteString(m.spinner.View() + "Starting...\n")
+		b.WriteString(m.spinner.View() + "Queued, starts automatically" + m.elapsed() + "\n")
 	}
 
 	if m.sharded {

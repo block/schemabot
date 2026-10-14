@@ -3921,7 +3921,9 @@ ALTER TABLE `customers` ADD INDEX `idx_loyalty_tier`(`loyalty_tier`);
 
 *Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
 
-Schema changes are being applied. This comment will be updated with progress.
+**Status**: Queued
+
+This schema change starts automatically, and this comment updates once it does.
 
 </details>
 

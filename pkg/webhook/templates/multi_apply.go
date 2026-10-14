@@ -591,7 +591,7 @@ func memberDetail(details []*ApplyStatusCommentData, i int) *ApplyStatusCommentD
 // siblingDerivedStatus returns the <details> body status for a deployment whose
 // presentation is derived from its earlier siblings: queued, waiting, halted,
 // or paused. The raw operation state for all four is pending, which the
-// single-deployment renderer glosses as "Starting" — contradicting the
+// single-deployment renderer glosses as "Queued" — contradicting the
 // <summary> line for a deployment that is in fact held by an earlier failure.
 // Every other presentation returns "" and keeps the raw-state gloss.
 func siblingDerivedStatus(d presentation.Deployment) string {

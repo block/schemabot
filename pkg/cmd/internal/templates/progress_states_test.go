@@ -25,6 +25,12 @@ func TestLabel_PlanetScalePhases(t *testing.T) {
 	assert.Equal(t, "Retrying", state.Label(state.Apply.FailedRetryable))
 }
 
+// A pending apply reads as queued, the same word the PR comment and the shared
+// rollup use for an apply that has not started yet.
+func TestFormatProgressState_PendingReadsAsQueued(t *testing.T) {
+	assert.Equal(t, "⏳ Queued", FormatProgressState(state.Apply.Pending))
+}
+
 func TestFormatProgressState_PlanetScalePhases(t *testing.T) {
 	assert.Contains(t, FormatProgressState(state.Apply.PreparingBranch), "Preparing branch")
 	assert.Contains(t, FormatProgressState(state.Apply.ApplyingBranchChanges), "Applying changes to branch")

@@ -924,3 +924,17 @@ func TestWatchModel_MultiTargetRollupScopesTablesToTheirMember(t *testing.T) {
 	assert.Equal(t, 1, strings.Count(view, "users_001:"))
 	assert.Equal(t, 1, strings.Count(view, "users_002:"))
 }
+
+// An apply SchemaBot has accepted but not yet started reads as queued in the
+// watch view, matching the PR comment, so a wait for capacity never looks like
+// an apply that hung on startup.
+func TestWatchModel_PendingApplyReadsAsQueued(t *testing.T) {
+	m := NewWatchModel("http://localhost:8080", "testdb", "staging", true)
+	m.initialized = true
+	m.state = state.Apply.Pending
+
+	view := m.View()
+
+	assert.Contains(t, view, "Queued, starts automatically")
+	assert.NotContains(t, view, "Starting")
+}
