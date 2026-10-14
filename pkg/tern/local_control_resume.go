@@ -2464,13 +2464,43 @@ func failedTaskDecidingOutcome(tasks []*storage.Task, grouped bool) *storage.Tas
 // failedTaskDecidingResume returns the failed task that decides the outcome of
 // the apply this drive is resuming, or nil when the drive must go on to its
 // pending requests and re-plan. A stopped apply is claimed only to deliver a
-// pending control request, so its failed tasks never decide: the stop already
-// settled them, and the pending start or cancel is answered first.
+// pending control request, so its failed tasks do not decide here: the pending
+// cancel is answered first, and a pending start is refused over them
+// (failedTaskRefusingStart).
 func (c *LocalClient) failedTaskDecidingResume(apply *storage.Apply, tasks []*storage.Task, options map[string]string) *storage.Task {
 	if state.IsState(apply.State, state.Apply.Stopped) {
 		return nil
 	}
 	return failedTaskDecidingOutcome(tasks, c.usesGroupedApply(apply, options))
+}
+
+// failedTaskRefusingStart returns the failed task that refuses a start on a
+// stopped apply, or nil when none does. Any failed task of the operation the
+// drive holds refuses it, whatever state its siblings were stopped in. Tasks
+// spanning more than one operation never do: a sibling deployment's failure is
+// the rollout projection's to weigh under the apply's failure policy (see
+// failedTaskDecidingOutcome).
+func failedTaskRefusingStart(tasks []*storage.Task) *storage.Task {
+	if !tasksShareOneOperation(tasks) {
+		return nil
+	}
+	for _, task := range tasks {
+		if state.IsState(task.State, state.Task.Failed) {
+			return task
+		}
+	}
+	return nil
+}
+
+// startRefusedForFailedTaskMessage is the reason a start refused over a failed
+// task records on the apply and on the start request, naming the table that
+// failed, why, and what the operator does next. The why is the task's stored
+// failure message, the operator sentence the engine authored when the task
+// failed and the same one a failure recorded while the apply was running puts
+// on the apply.
+func startRefusedForFailedTaskMessage(task *storage.Task) string {
+	return fmt.Sprintf("start refused: table %s failed before the apply was stopped (%s); plan the schema change again and apply the new plan",
+		task.TableName, settledTaskFailureMessage(task))
 }
 
 // storedFailureAheadOfWork returns the task a previous drive failed permanently
@@ -2605,6 +2635,16 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 			logger.Info("stopped apply has no pending start request; drive exits without resuming",
 				apply.MutableLogAttrs()...)
 			return nil
+		}
+		// A task that failed before the stop already decided the schema
+		// change: the stop only hid the failure behind a resumable state.
+		// Resuming would re-plan the failed task and run its statement again
+		// on the operator's start, so the start is answered with the failure
+		// instead, and the apply records it.
+		if failed := failedTaskRefusingStart(tasks); failed != nil {
+			logger.Warn("refusing the start of a stopped apply whose task failed before the stop; recording the apply failed from that task, so the change is planned again before it runs",
+				append(apply.MutableLogAttrs(), "failed_task_id", failed.TaskIdentifier, "requested_by", controlRequestCaller(startReq))...)
+			return c.failApplyAndNotify(ctx, apply, tasks, startRefusedForFailedTaskMessage(failed))
 		}
 	}
 

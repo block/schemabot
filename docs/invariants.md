@@ -750,9 +750,11 @@ with the lease-scoped drive paths opting in and the unscoped reconciler opting o
 There is no revival path from `failed`. Plans are diffs, so a fresh plan and apply never re-runs
 already-landed work, whereas a revival path would re-run stored DDL against a database that may
 have drifted since. A rollout whose `failed` verdict is corrected back to `running_degraded` (ST-1)
-is not revived: its failed operation stays failed and is never run again. *Enforced:* absence. No
-write re-runs a failed operation, and the rollout projection is the only write that moves a failed
-apply to an active state (ST-1).
+is not revived: its failed operation stays failed and is never run again. *Enforced:* by absence
+and by one refusal. No write re-runs a failed operation, and the rollout projection is the only
+write that moves a failed apply to an active state (ST-1); a start on a stopped apply whose
+operation holds a failed task is refused with that failure (`failedTaskRefusingStart`,
+`pkg/tern/local_control_resume.go`).
 
 ### ST-3: Apply state flows upward, never downward
 
