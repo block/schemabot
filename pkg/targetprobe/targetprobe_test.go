@@ -497,3 +497,20 @@ func TestOpenDatabaseRejectsNonDSNTypes(t *testing.T) {
 	assert.Nil(t, db)
 	assert.NotContains(t, err.Error(), "secretpw")
 }
+
+// Wrapping the type router must not turn its unenumerable discovery engines
+// into a claim of full startup probe coverage.
+func TestRunOverrideDecoratorPreservesProbeCoverage(t *testing.T) {
+	backend, err := inventory.NewTypeRoutingResolver(map[string]inventory.Resolver{
+		"mysql":    typedResolverOnly{databaseType: "mysql"},
+		"postgres": typedResolverOnly{databaseType: "postgres"},
+	})
+	require.NoError(t, err)
+	resolver, err := inventory.NewOverrideResolver(backend, []inventory.TargetOverride{{Environment: "production", Target: "cluster", DatabaseType: "mysql", SchemaOverrides: map[string]string{"orders": "orders_sandbox"}}}, slog.Default())
+	require.NoError(t, err)
+	prober, logs := newTestProber(resolver, time.Second)
+	prober.Run(t.Context())
+	assert.Contains(t, logs.String(), "discovery-resolved targets are outside probe coverage")
+	assert.Contains(t, logs.String(), "database_types=\"[mysql postgres]\"")
+	assert.NotContains(t, logs.String(), "resolver enumerates every target")
+}

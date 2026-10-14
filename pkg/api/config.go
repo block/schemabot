@@ -1001,6 +1001,8 @@ type TargetResolverConfig struct {
 	// each entry's database_type) so one data plane can serve several engines at
 	// once and the request's database type selects among them.
 	Etre []EtreConfig `yaml:"etre,omitempty"`
+	// Overrides decorates discovery; it is not itself a backend.
+	Overrides []inventory.TargetOverride `yaml:"overrides,omitempty"`
 }
 
 // Configured reports whether the data plane has any static target inventory.
@@ -2278,6 +2280,9 @@ func (c *ServerConfig) validateTargetTableOwners() error {
 // Validate checks the configuration for required fields and consistency.
 func (c *ServerConfig) Validate() error {
 	if err := c.ValidateExperimentalStrata(); err != nil {
+		return err
+	}
+	if err := c.TargetResolver.validateTargetConfig(); err != nil {
 		return err
 	}
 	if err := c.validateTargetTableOwners(); err != nil {

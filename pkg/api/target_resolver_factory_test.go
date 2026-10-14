@@ -1,6 +1,7 @@
 package api
 
 import (
+	"fmt"
 	"log/slog"
 	"path/filepath"
 	"testing"
@@ -464,5 +465,72 @@ func TestEtreWriterProbe(t *testing.T) {
 	assert.Equal(t, inventory.MySQLWriterProbe{ConnectTimeout: writerProbeConnectTimeout}, etreWriterProbe(EtreConfig{DatabaseType: storage.DatabaseTypeMySQL}))
 	for _, dbType := range []string{storage.DatabaseTypeStrata, storage.DatabaseTypeVitess, storage.DatabaseTypePostgres} {
 		assert.Nil(t, etreWriterProbe(EtreConfig{DatabaseType: dbType}), dbType)
+	}
+}
+
+func TestTargetResolverOverrides(t *testing.T) {
+	entry := inventory.TargetOverride{Environment: "production", Target: "cluster-002", DatabaseType: "mysql", SchemaOverrides: map[string]string{"orders": "orders_sandbox"}}
+	cfg := TargetResolverConfig{Overrides: []inventory.TargetOverride{entry}}
+	assert.False(t, cfg.Enabled(), "overlays are not a discovery backend")
+	_, err := cfg.BuildResolver(t.Context(), slog.Default())
+	require.ErrorContains(t, err, "requires an etre or static backend")
+	cfg.Targets = map[string]inventory.StaticTarget{"cluster-002": {DatabaseType: "mysql", DSN: "root@tcp(localhost:3306)/"}}
+	resolver, err := cfg.BuildResolver(t.Context(), slog.Default())
+	require.NoError(t, err)
+	resolved, err := resolver.ResolveTarget(t.Context(), inventory.Request{Target: "cluster-002", Environment: "production", DatabaseType: "mysql"})
+	require.NoError(t, err)
+	assert.Equal(t, entry.SchemaOverrides, resolved.SchemaOverrides)
+	cfg.Targets["cluster-002"] = inventory.StaticTarget{DatabaseType: "mysql", DSN: "env:MISSING_OVERRIDE_TEST_SECRET", SchemaOverrides: entry.SchemaOverrides}
+	_, err = cfg.BuildResolver(t.Context(), slog.Default())
+	require.ErrorContains(t, err, "already has static", "conflict validation precedes credential resolution")
+}
+
+func TestEtreOverridesPreserveCapabilities(t *testing.T) {
+	entry := EtreConfig{Addr: "https://etre.example", DatabaseType: "mysql", EntityType: "cluster", TargetLabel: "dsid", MySQL: EtreMySQLConfig{HostField: "writer_endpoint"}, Credentials: EtreCredentialsConfig{Username: "engine", PasswordRef: "env:DDL_PASSWORD"}}
+	cfg := TargetResolverConfig{Etre: []EtreConfig{entry}, Overrides: []inventory.TargetOverride{{Environment: "production", Target: "cluster-002", DatabaseType: "mysql", SchemaOverrides: map[string]string{"orders": "orders_sandbox"}}}}
+	resolver, err := cfg.BuildResolver(t.Context(), slog.Default())
+	require.NoError(t, err)
+	_, enumerable := resolver.(inventory.Enumerator)
+	assert.False(t, enumerable, "single Etre resolver cannot enumerate")
+	require.Implements(t, (*inventory.TypeReporter)(nil), resolver)
+	assert.Equal(t, "mysql", resolver.(inventory.TypeReporter).DatabaseType())
+	entry.DatabaseType = "strata"
+	cfg.Etre = append(cfg.Etre, entry)
+	resolver, err = cfg.BuildResolver(t.Context(), slog.Default())
+	require.NoError(t, err)
+	require.Implements(t, (*inventory.Enumerator)(nil), resolver)
+	_, single := resolver.(inventory.TypeReporter)
+	assert.False(t, single)
+}
+
+func TestTargetResolverRequiresCanonicalStaticType(t *testing.T) {
+	for _, engine := range []string{"mysql", "MySQL", "MYSQL", " mysql", "mysql ", "\tmysql\n"} {
+		for _, withOverride := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/override=%t", engine, withOverride), func(t *testing.T) {
+				cfg := TargetResolverConfig{Targets: map[string]inventory.StaticTarget{
+					"cluster-002": {DatabaseType: engine, DSN: "root@tcp(localhost:3306)/"},
+				}}
+				if withOverride {
+					cfg.Overrides = []inventory.TargetOverride{{Environment: "production", Target: "cluster-002", DatabaseType: "mysql", SchemaOverrides: map[string]string{"orders": "orders_sandbox"}}}
+				}
+				resolver, err := cfg.BuildResolver(t.Context(), slog.Default())
+				if engine != "mysql" {
+					require.ErrorContains(t, err, "must be lowercase with no surrounding whitespace")
+					assert.Nil(t, resolver)
+					serverConfig := ServerConfig{TargetResolver: cfg}
+					require.ErrorContains(t, serverConfig.Validate(), "must be lowercase with no surrounding whitespace")
+					return
+				}
+				require.NoError(t, err)
+				target, err := resolver.ResolveTarget(t.Context(), inventory.Request{Target: "cluster-002", Environment: "production", DatabaseType: "mysql"})
+				require.NoError(t, err)
+				assert.Equal(t, "mysql", target.DatabaseType)
+				if withOverride {
+					assert.Equal(t, cfg.Overrides[0].SchemaOverrides, target.SchemaOverrides)
+				} else {
+					assert.Empty(t, target.SchemaOverrides)
+				}
+			})
+		}
 	}
 }

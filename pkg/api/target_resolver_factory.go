@@ -23,11 +23,47 @@ import (
 // embedder calling this directly gets the same guarantees the server enforces
 // rather than a silent backend preference.
 func (c TargetResolverConfig) BuildResolver(ctx context.Context, logger *slog.Logger) (inventory.Resolver, error) {
+	if err := c.validateTargetConfig(); err != nil {
+		return nil, err
+	}
+	resolver, err := c.buildBackend(ctx, logger)
+	if err != nil {
+		return nil, err
+	}
+	return inventory.NewOverrideResolver(resolver, c.Overrides, logger)
+}
+
+func (c TargetResolverConfig) validateTargetConfig() error {
+	for name, target := range c.Targets {
+		if err := target.ValidateTypeSpelling(); err != nil {
+			return fmt.Errorf("target_resolver target %q: %w", name, err)
+		}
+	}
+	if len(c.Overrides) > 0 && !c.Enabled() {
+		return fmt.Errorf("target_resolver.overrides requires an etre or static backend")
+	}
+	if err := inventory.ValidateTargetOverrides(c.Overrides); err != nil {
+		return fmt.Errorf("target_resolver: %w", err)
+	}
+	for _, entry := range c.Overrides {
+		if target, ok := c.Targets[entry.Target]; ok {
+			if len(target.SchemaOverrides) != 0 {
+				return fmt.Errorf("target_resolver override target %q already has static schema_overrides", entry.Target)
+			}
+			if target.DatabaseType != entry.DatabaseType {
+				return fmt.Errorf("target_resolver override target %q type does not match static target", entry.Target)
+			}
+		}
+	}
+	return nil
+}
+
+func (c TargetResolverConfig) buildBackend(ctx context.Context, logger *slog.Logger) (inventory.Resolver, error) {
 	etreConfigured := len(c.Etre) > 0
 	staticConfigured := c.Configured()
 	switch {
 	case etreConfigured && staticConfigured:
-		return nil, fmt.Errorf("target_resolver configures both etre and static targets; per-target overrides are not yet supported — use one")
+		return nil, fmt.Errorf("target_resolver configures both etre and static targets; use one discovery backend")
 	case etreConfigured:
 		return buildEtreResolvers(ctx, c.Etre, logger)
 	case staticConfigured:

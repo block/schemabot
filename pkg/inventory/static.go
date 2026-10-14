@@ -67,6 +67,14 @@ type StaticTarget struct {
 	TableOwner string `yaml:"table_owner,omitempty"`
 }
 
+// ValidateTypeSpelling rejects noncanonical spellings of a configured engine.
+func (t StaticTarget) ValidateTypeSpelling() error {
+	if t.DatabaseType != canonicalDatabaseType(t.DatabaseType) {
+		return fmt.Errorf("type %q must be lowercase with no surrounding whitespace", t.DatabaseType)
+	}
+	return nil
+}
+
 // StaticDSNFromConfig assembles a DSN for a static target from secret
 // references, resolved fresh on every request. For MySQL it deliberately never
 // reads a database name: the per-operation request supplies the schema, so the
@@ -226,7 +234,10 @@ func (r *StaticResolver) UnenumerableDatabaseTypes() []string {
 // for a dsn entry resolves and caches the DSN now, while a dsn_from entry only
 // validates its shape (its DSN is assembled per request).
 func newStaticTargetEntry(target string, entry StaticTarget) (*staticTargetEntry, error) {
-	databaseType := canonicalDatabaseType(entry.DatabaseType)
+	if err := entry.ValidateTypeSpelling(); err != nil {
+		return nil, fmt.Errorf("target %q %w", target, err)
+	}
+	databaseType := entry.DatabaseType
 	if databaseType == "" {
 		return nil, fmt.Errorf("target %q missing type", target)
 	}

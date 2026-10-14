@@ -75,7 +75,7 @@ func (p *Prober) Run(ctx context.Context) {
 		p.logger.Info("target probe: discovery-resolved targets are outside probe coverage", attrs...)
 		return
 	}
-	p.logUnenumerableTypes()
+	p.logUnenumerableTypes(enumerator)
 	// Enumeration may reach a remote inventory, so it runs under the same
 	// bound as each target's probe: a listing that outlasts it fails the run
 	// rather than holding the probe goroutine — and with it Close — open for
@@ -113,16 +113,13 @@ func (p *Prober) Run(ctx context.Context) {
 	p.logger.Info("target probe: completed enumerated targets", "outcomes", outcomes)
 }
 
-func (p *Prober) logUnenumerableTypes() {
-	router, ok := p.resolver.(*inventory.TypeRoutingResolver)
-	if !ok {
+func (p *Prober) logUnenumerableTypes(enumerator inventory.Enumerator) {
+	types := enumerator.UnenumerableDatabaseTypes()
+	if len(types) == 0 {
 		p.logger.Debug("target probe: resolver enumerates every target it serves; no database type is outside probe coverage")
 		return
 	}
-	types := router.UnenumerableDatabaseTypes()
-	if len(types) > 0 {
-		p.logger.Info("target probe: discovery-resolved targets are outside probe coverage", "database_types", types)
-	}
+	p.logger.Info("target probe: discovery-resolved targets are outside probe coverage", "database_types", types)
 }
 
 // probeContained is the panic containment boundary for one target (AV-5).
