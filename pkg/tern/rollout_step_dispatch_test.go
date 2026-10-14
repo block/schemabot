@@ -190,8 +190,9 @@ func TestPlanForApplyRequest_MemberStepRefusesAPlanItsLiveSchemaDisagreesWith(t 
 }
 
 // A step dispatch with no stored plan and no whole plan beside it has nothing
-// its target's plan can be built from. It is refused, and permanently, since
-// redispatching the same request would carry no plan either.
+// its target's plan can be built from, so it is refused. Only a control plane
+// older than the whole-plan payload sends one, and the refusal stays
+// retryable so the step runs once an upgraded control plane redispatches it.
 func TestPlanForApplyRequest_RefusesAStepWithNoPlanToBuildFrom(t *testing.T) {
 	store := &fakePlanStore{getFn: func(string) (*storage.Plan, error) { return nil, nil }}
 	c := newPlanMaterializeClient(store)
@@ -202,7 +203,7 @@ func TestPlanForApplyRequest_RefusesAStepWithNoPlanToBuildFrom(t *testing.T) {
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "dispatch for rollout step 1 has no plan plan-testapp-002 stored on this deployment and carries no plan to build it from")
-	assert.False(t, engine.IsRetryable(err), "a redispatch carries no plan either")
+	assert.True(t, engine.IsRetryable(err), "a redispatch from an upgraded control plane carries the plan")
 	assert.Nil(t, got)
 	assert.Nil(t, store.created, "nothing is built from one step's table")
 }

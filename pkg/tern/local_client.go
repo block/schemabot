@@ -2184,9 +2184,12 @@ func (c *LocalClient) planForApplyRequest(ctx context.Context, req *ternv1.Apply
 	// later step finds it. The step's table is then run from that stored plan.
 	if step, ok := req.GetOptions()[dispatchRolloutStepOption]; ok {
 		if len(req.GetPlanDdlChanges()) == 0 {
-			// No later attempt of the same dispatch carries a plan either, so
-			// the refusal is permanent rather than spent against the retry budget.
-			return nil, engine.NewPermanentError("dispatch for rollout step %s has no plan %s stored on this deployment and carries no plan to build it from; refusing to build the plan from one step's table", step, req.PlanId)
+			// Every control plane that dispatches table steps stamps the whole
+			// plan on each attempt, so only one older than that sends a step
+			// without it. The refusal stays retryable: once the control plane
+			// is upgraded, its next attempt carries the plan and the step runs,
+			// whichever plane was upgraded first.
+			return nil, fmt.Errorf("dispatch for rollout step %s has no plan %s stored on this deployment and carries no plan to build it from; refusing to build the plan from one step's table", step, req.PlanId)
 		}
 		c.logger.Info("Apply: building a rollout member's plan from its table step's dispatch",
 			"plan_id", req.PlanId,
