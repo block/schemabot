@@ -783,37 +783,117 @@ func TestResumeApplyPlanLoadStorageErrorStaysRecoverable(t *testing.T) {
 	assert.Empty(t, observer.terminal, "a transient plan-load failure must not notify the terminal observer")
 }
 
-// An operator stops an apply whose table had already failed, then starts it.
-// The failure decided the schema change before the stop, so the start must not
-// re-plan the failed table and run its statement again. The start is refused
-// with the failure, the apply records it in place of the stopped state, and the
-// operator is told to plan the change again. No plan is loaded and no engine
-// work starts.
-func TestResumeStoppedApplyRefusesAStartOverAFailedTask(t *testing.T) {
-	planErr := errors.New("the start must be refused before the plan is loaded")
+// stoppedApplyWithPendingStartFixture builds a stopped apply claimed for a
+// pending start — the stored row already moved to resuming, the drive still
+// holding the claim-time snapshot — whose `users` task rests stopped beside a
+// sibling task for `orders` in the given state. The sibling belongs to the same
+// operation. The plan store is scripted to fail, so a resume that goes on to
+// load its plan is told apart from one refused before it.
+func stoppedApplyWithPendingStartFixture(siblingState, siblingMessage string) (*LocalClient, *storage.Apply, []*storage.Task, *exactProgressApplyStore, *testControlRequestStore, error) {
+	planErr := errors.New("the resume must reach the plan load")
 	client, apply, tasks, applyStore := recoveryPlanLoadFixture(&scriptedPlanStore{err: planErr})
 	apply.State = state.Apply.Stopped
 	applyStore.apply = &storage.Apply{}
 	*applyStore.apply = *apply
 	applyStore.apply.State = state.Apply.Resuming
-	tasks[0].State = state.Task.Failed
-	tasks[0].TableName = "orders"
-	tasks[0].ErrorMessage = "Existing rows hold duplicate values for a unique key. Resolve the duplicates before applying a change that adds or narrows that key."
+	tasks[0].State = state.Task.Stopped
+	sibling := *tasks[0]
+	sibling.ID = 3
+	sibling.TaskIdentifier = "task-recover-plan-orders"
+	sibling.TableName = "orders"
+	sibling.State = siblingState
+	sibling.ErrorMessage = siblingMessage
+	tasks = append(tasks, &sibling)
+	client.storage.(*exactProgressStorage).tasks = &exactProgressTaskStore{tasks: tasks}
 	requests := pendingControlRequestStore(apply.ID, storage.ControlOperationStart)
 	client.storage.(*exactProgressStorage).controlRequests = requests
+	return client, apply, tasks, applyStore, requests, planErr
+}
+
+const duplicateKeyFailureMessage = "Existing rows hold duplicate values for a unique key. Resolve the duplicates before applying a change that adds or narrows that key."
+
+// An operator stops an apply whose `orders` table had already failed while
+// `users` was still to run, then starts it. The failure decided the schema
+// change before the stop, so the start must not re-plan the failed table and
+// run its statement again. The start is refused with the failure, the apply
+// records it in place of the stopped state, the stopped sibling settles failed
+// with the same reason, and the operator is told to plan the change again. No
+// plan is loaded and no engine work starts.
+func TestResumeStoppedApplyRefusesAStartOverAFailedTask(t *testing.T) {
+	client, apply, tasks, applyStore, requests, _ := stoppedApplyWithPendingStartFixture(state.Task.Failed, duplicateKeyFailureMessage)
 	observer := &terminalRecordingObserver{}
 	client.SetObserver(apply.ID, observer)
 
 	err := client.resumeApplyWithTasks(t.Context(), apply, nil, tasks, nil, false, false)
 
 	require.NoError(t, err)
-	want := "start refused: table orders failed before the apply was stopped (Existing rows hold duplicate values for a unique key. Resolve the duplicates before applying a change that adds or narrows that key.); plan the schema change again and apply the new plan"
+	want := "start refused: table orders failed before the apply was stopped (" + duplicateKeyFailureMessage + "); plan the schema change again and apply the new plan"
 	assert.Equal(t, state.Apply.Failed, applyStore.apply.State)
 	assert.Equal(t, want, applyStore.apply.ErrorMessage)
+	assert.Equal(t, state.Task.Failed, tasks[0].State, "the stopped sibling settles with the apply rather than staying resumable")
+	assert.Equal(t, want, tasks[0].ErrorMessage)
+	assert.Equal(t, duplicateKeyFailureMessage, tasks[1].ErrorMessage, "the failed task keeps its own reason")
 	require.Len(t, requests.requests, 1)
 	assert.Equal(t, storage.ControlRequestFailed, requests.requests[0].Status, "the start is answered, not left pending")
 	assert.Contains(t, requests.requests[0].ErrorMessage, want)
 	require.Len(t, observer.terminal, 1, "the failed outcome posts its summary")
+}
+
+// A stopped apply whose other table already completed is the usual shape a
+// start finds, and a completed sibling is no reason to refuse it: the resume
+// continues to the plan load with the start still pending for it.
+func TestResumeStoppedApplyStartIsNotRefusedByCompletedSibling(t *testing.T) {
+	client, apply, tasks, applyStore, requests, planErr := stoppedApplyWithPendingStartFixture(state.Task.Completed, "")
+
+	err := client.resumeApplyWithTasks(t.Context(), apply, nil, tasks, nil, false, false)
+
+	require.ErrorIs(t, err, planErr, "the start must not be refused; the resume continues to the plan load")
+	assert.Equal(t, state.Apply.Resuming, applyStore.apply.State)
+	assert.Empty(t, applyStore.apply.ErrorMessage)
+	assert.Equal(t, state.Task.Stopped, tasks[0].State)
+	assert.Equal(t, storage.ControlRequestPending, requests.requests[0].Status)
+}
+
+// A retryable failure is resumable by design — the next claim requeues the
+// task — so a retryable sibling beside a stopped table does not refuse the
+// start either; only a permanent failure does.
+func TestResumeStoppedApplyStartIsNotRefusedByRetryableSibling(t *testing.T) {
+	client, apply, tasks, applyStore, requests, planErr := stoppedApplyWithPendingStartFixture(state.Task.FailedRetryable, "engine busy")
+
+	err := client.resumeApplyWithTasks(t.Context(), apply, nil, tasks, nil, false, false)
+
+	require.ErrorIs(t, err, planErr, "the start must not be refused; the resume continues to the plan load")
+	assert.Equal(t, state.Apply.Resuming, applyStore.apply.State)
+	assert.Empty(t, applyStore.apply.ErrorMessage)
+	assert.Equal(t, state.Task.Stopped, tasks[0].State)
+	assert.Equal(t, storage.ControlRequestPending, requests.requests[0].Status)
+}
+
+// A rollout's start is claimed one operation at a time, so the drive that
+// refuses it holds an operation lease only and owns its operation's tasks, not
+// the parent row. The refusal fails the operation's tasks — the stopped
+// sibling with the refusal, the failed task keeping its own reason — and
+// returns without writing the parent or answering the start: the operator
+// derives the operation row from the tasks, projects the parent under the
+// rollout's failure policy (ST-1), and settles the start from the projected
+// outcome (SettlePendingStartForResolvedApply). No plan is loaded.
+func TestResumeStoppedOperationRefusesAStartOverAFailedTaskWithoutWritingTheParent(t *testing.T) {
+	client, apply, tasks, applyStore, requests, _ := stoppedApplyWithPendingStartFixture(state.Task.Failed, duplicateKeyFailureMessage)
+	observer := &terminalRecordingObserver{}
+	client.SetObserver(apply.ID, observer)
+	ctx := storage.WithOperationLease(t.Context(), storage.OperationLease{ApplyID: apply.ID, OperationID: *tasks[0].ApplyOperationID, Owner: "driver", Token: "token"})
+
+	err := client.resumeApplyWithTasks(ctx, apply, nil, tasks, nil, false, false)
+
+	require.NoError(t, err)
+	want := "start refused: table orders failed before the apply was stopped (" + duplicateKeyFailureMessage + "); plan the schema change again and apply the new plan"
+	assert.Equal(t, state.Task.Failed, tasks[0].State, "the operation's stopped task settles failed for the operator to derive the operation row from")
+	assert.Equal(t, want, tasks[0].ErrorMessage)
+	assert.Equal(t, duplicateKeyFailureMessage, tasks[1].ErrorMessage)
+	assert.Equal(t, state.Apply.Resuming, applyStore.apply.State, "the parent row is the projection's to write")
+	assert.Empty(t, applyStore.apply.ErrorMessage)
+	assert.Equal(t, storage.ControlRequestPending, requests.requests[0].Status, "the start is the projection's to settle from the parent's outcome")
+	assert.Empty(t, observer.terminal, "the summary posts from the projection, not from the operation drive")
 }
 
 // An operator stops a rollout in which one deployment's table had already
@@ -823,6 +903,14 @@ func TestResumeStoppedApplyRefusesAStartOverAFailedTask(t *testing.T) {
 // resumed operation's verdict, so the start is not refused and the resume
 // goes on to load its plan. The resume is proven to have continued by the
 // plan-load failure it runs into, which a refused start would never reach.
+//
+// No production drive loads two operations' tasks under a pending start: a
+// rollout's start is claimed per operation (ResumeApplyOperation), where the
+// failed deployment's own drive refuses it, and the whole-apply drive
+// (ResumeApply) is reached only by stop reconciliation, which consumes a
+// pending stop and stands down. This pins the one-operation check that keeps
+// the refusal to the drive's own operation should a whole-apply start drive
+// ever be added.
 func TestResumeStoppedRolloutStartIsNotRefusedBySiblingOperationFailure(t *testing.T) {
 	planErr := errors.New("the resume must reach the plan load")
 	client, apply, tasks, applyStore := recoveryPlanLoadFixture(&scriptedPlanStore{err: planErr})
