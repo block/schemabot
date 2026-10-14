@@ -189,11 +189,16 @@ func TestCleaner_CustomRetention(t *testing.T) {
 }
 
 // A table-level cleanup failure is surfaced to the caller while the table
-// remains quarantined for the next cleanup pass.
+// remains quarantined for the next cleanup pass, its quarantine log record
+// with it.
 func TestCleaner_DropFailureReturnsError(t *testing.T) {
 	db := setupCleanerTest(t)
 
-	expired := createQuarantinedTable(t, db, "parent_table", time.Now().Add(-8*24*time.Hour))
+	quarantinedAt := time.Now().Add(-8 * 24 * time.Hour)
+	expired := createQuarantinedTable(t, db, "parent_table", quarantinedAt)
+	require.NoError(t, RecordQuarantines(t.Context(), db, "apply-a", []QuarantinedTable{
+		{SchemaName: "testdb", TableName: "parent_table", QuarantineSchema: Database, QuarantineTable: expired},
+	}, quarantinedAt))
 	_, err := db.ExecContext(t.Context(), fmt.Sprintf("ALTER TABLE `%s`.`%s` ADD PRIMARY KEY (id)", Database, expired))
 	require.NoError(t, err, "add parent primary key")
 	_, err = db.ExecContext(t.Context(), fmt.Sprintf("CREATE TABLE `%s`.`child_table` (id INT PRIMARY KEY, parent_id INT, CONSTRAINT fk_pending_parent FOREIGN KEY (parent_id) REFERENCES `%s`.`%s` (id))", Database, Database, expired))
@@ -208,6 +213,10 @@ func TestCleaner_DropFailureReturnsError(t *testing.T) {
 
 	remaining := quarantinedTables(t, db)
 	assert.Contains(t, remaining, expired, "failed drop should remain quarantined")
+	recorded, err := RecordedQuarantines(t.Context(), db, "apply-a", "testdb", "parent_table")
+	require.NoError(t, err)
+	require.Len(t, recorded, 1, "the record of a copy that is still there is kept")
+	assert.Equal(t, expired, recorded[0].QuarantineTable)
 }
 
 // An unreachable target fails the pass with an error but does not panic; the
