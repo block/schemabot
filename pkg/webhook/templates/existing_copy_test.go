@@ -538,18 +538,16 @@ func TestRenderPlanComment_PausedCommentsCloseTheSameWayAndWarnOnce(t *testing.T
 		"the cause is surfaced once, by the section that explains it in full")
 
 	// Nothing above explains the pause, so the cause is its own disclosure —
-	// same region, same marker, same closing sentence.
+	// same region, same marker, same footer.
 	alone := base
 	alone.PendingManualConfirmation = true
 	alone.PausedApplyCause = &PausedApplyCauseData{
 		Heading: "The plan this apply would be checked against could not be read",
 		Entries: []string{"`orders` (alter) is in this plan"},
-		Remedy:  "Nothing has run. Review the statements above, then confirm to apply them.",
 	}
 	out = RenderPlanComment(alone)
 	assert.Contains(t, out, "⚠️ **The plan this apply would be checked against could not be read**\n"+
 		"- `orders` (alter) is in this plan\n")
-	assert.Contains(t, out, "Nothing has run. Review the statements above, then confirm to apply them.")
 	assert.Contains(t, out, footer)
 	assert.Equal(t, 1, strings.Count(out, "⚠️"))
 	assert.NotContains(t, out, "**Applying automatically**")

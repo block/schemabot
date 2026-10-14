@@ -420,6 +420,89 @@ func TestCallPlanAPI_SendsGroupedExecution(t *testing.T) {
 	assert.False(t, gotReq.GroupedExecution, "a caller that has not chosen leaves the plan on the ungrouped default")
 }
 
+// The server refuses a rollout-wide plan or apply of an environment with more
+// than one member unless the caller says it reads every member's plan. Each
+// helper says so only when its caller decides it: the helpers that take the
+// statement send exactly what they are given, and every other helper says it
+// does not, so a caller that never reads the rollout is refused rather than
+// shown the primary's plan as the whole rollout's.
+func TestPlanAndApplyHelpers_SendRendersRolloutOnlyWhenTheCallerSaysSo(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(dir, "payments"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "payments", "users.sql"), []byte("CREATE TABLE users (id INT)"), 0o644))
+	files := map[string]*apitypes.SchemaFiles{"payments": {Files: map[string]string{"users.sql": "CREATE TABLE users (id INT)"}}}
+
+	var sent struct {
+		path           string
+		rendersRollout bool
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			RendersRollout bool `json:"renders_rollout"`
+		}
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
+		sent.path, sent.rendersRollout = r.URL.Path, body.RendersRollout
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/api/apply" {
+			require.NoError(t, json.NewEncoder(w).Encode(apitypes.ApplyResponse{Accepted: true}))
+			return
+		}
+		require.NoError(t, json.NewEncoder(w).Encode(apitypes.PlanResponse{}))
+	}))
+	t.Cleanup(server.Close)
+
+	for _, tc := range []struct {
+		name     string
+		call     func() error
+		wantPath string
+		want     bool
+	}{
+		{"CallPlanAPI", func() error {
+			_, _, err := CallPlanAPI(server.URL, "orders", "mysql", "development", dir, "", 0, PlanExclusions{}, false)
+			return err
+		}, "/api/plan", false},
+		{"CallPlanAPIWithFiles", func() error {
+			_, err := CallPlanAPIWithFiles(server.URL, "orders", "mysql", "development", files, "", 0)
+			return err
+		}, "/api/plan", false},
+		{"CallPlanAPIForTarget for a caller that renders the rollout", func() error {
+			_, _, err := CallPlanAPIForTarget(server.URL, "orders", "mysql", "development", dir, "", 0, PlanExclusions{}, false, "", true)
+			return err
+		}, "/api/plan", true},
+		{"CallPlanAPIForTarget for a caller that does not", func() error {
+			_, _, err := CallPlanAPIForTarget(server.URL, "orders", "mysql", "development", dir, "", 0, PlanExclusions{}, false, "", false)
+			return err
+		}, "/api/plan", false},
+		{"CallPlanAPIWithContext for a caller that renders the rollout", func() error {
+			_, _, err := CallPlanAPIWithContext(t.Context(), server.URL, "orders", "mysql", "development", dir, "", 0, PlanExclusions{}, false, true)
+			return err
+		}, "/api/plan", true},
+		{"CallPlanAPIWithContext for a caller that does not", func() error {
+			_, _, err := CallPlanAPIWithContext(t.Context(), server.URL, "orders", "mysql", "development", dir, "", 0, PlanExclusions{}, false, false)
+			return err
+		}, "/api/plan", false},
+		{"CallApplyAPI", func() error {
+			_, err := CallApplyAPI(server.URL, "plan-1", "development", "", nil)
+			return err
+		}, "/api/apply", false},
+		{"CallApplyAPIForTarget for a caller that renders the rollout", func() error {
+			_, err := CallApplyAPIForTarget(server.URL, "plan-1", "development", "", "", true, nil)
+			return err
+		}, "/api/apply", true},
+		{"CallApplyAPIForTarget for a caller that does not", func() error {
+			_, err := CallApplyAPIForTarget(server.URL, "plan-1", "development", "", "", false, nil)
+			return err
+		}, "/api/apply", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sent.path, sent.rendersRollout = "", !tc.want
+			require.NoError(t, tc.call())
+			assert.Equal(t, tc.wantPath, sent.path)
+			assert.Equal(t, tc.want, sent.rendersRollout)
+		})
+	}
+}
+
 // A CLI owner is the ownership token the lock API matches byte-exactly against
 // the folded spelling it stored at acquire. An operator on a host whose name
 // carries uppercase characters must still recognize their own lock, so the

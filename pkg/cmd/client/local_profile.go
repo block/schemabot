@@ -11,6 +11,7 @@ import (
 
 // RegisterLocalProfile adds a local connection without replacing a remote
 // profile, credentials, or the user's default. Repeating the same input is safe.
+// The first connection becomes the default when no profiles are configured.
 // It does not provision or start the runtime.
 func RegisterLocalProfile(name, runtimeID string) (bool, error) {
 	if strings.TrimSpace(name) == "" {
@@ -28,6 +29,9 @@ func RegisterLocalProfile(name, runtimeID string) (bool, error) {
 				return nil
 			}
 			return fmt.Errorf("profile %q already has a different connection; choose another profile name", name)
+		}
+		if len(cfg.Profiles) == 0 && cfg.DefaultProfile == "" {
+			cfg.DefaultProfile = name
 		}
 		cfg.Profiles[name] = wanted
 		changed = true

@@ -534,7 +534,7 @@ func TestTargetRouterAuthEvictedApplyOwnerRemainsVisibleToShutdown(t *testing.T)
 	require.NoError(t, err)
 	assert.False(t, first.closed)
 	router.mu.Lock()
-	_, retiring := router.retiring[router.applyOwners[apply.ApplyIdentifier]]
+	_, retiring := router.retiring[router.applyOwners[apply.ApplyIdentifier]["dsid-orders-prod"]]
 	router.mu.Unlock()
 	assert.True(t, retiring)
 	require.NoError(t, router.HaltForShutdown(t.Context()))

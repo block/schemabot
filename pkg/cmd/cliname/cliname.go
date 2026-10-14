@@ -8,6 +8,10 @@
 // flag; a wrapper that embeds the command packages calls Set directly before
 // parsing. Every hint renders through Name so pasted commands work as
 // printed.
+//
+// The server renders the CLI command hints in its PR comments with the same
+// name, configured as cli_name in the server config; a wrapper operator sets
+// the same value in both places.
 package cliname
 
 import (
@@ -15,8 +19,9 @@ import (
 	"sync/atomic"
 )
 
-// defaultName is the bare binary name, rendered when no --cli-name is passed.
-const defaultName = "schemabot"
+// DefaultName is the bare binary name, rendered when no --cli-name is passed
+// and, on the server, when no cli_name is configured.
+const DefaultName = "schemabot"
 
 // flagName is the global flag a wrapper uses to pass its invocation.
 const flagName = "--cli-name"
@@ -38,7 +43,7 @@ func Name() string {
 	if p := name.Load(); p != nil {
 		return *p
 	}
-	return defaultName
+	return DefaultName
 }
 
 // FromArgs extracts the --cli-name flag value from raw command-line args,

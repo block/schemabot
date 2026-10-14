@@ -45,21 +45,24 @@ func TestHostileIdentifierNeverEscapesItsCodeSpan(t *testing.T) {
 	writeShardStatusTable(&shardTable, []ShardStatus{{Shard: hostileIdentifier, State: state.Apply.Running}})
 
 	surfaces := map[string]string{
-		"plan comment":                               RenderPlanComment(plan),
-		"unsafe changes rejection":                   RenderUnsafeChangesBlocked(plan),
-		"blocked changes rejection":                  RenderBlockedChangesApplyRejected(plan),
-		"apply retry row":                            RenderApplyStatusComment(apply),
-		"sharded apply shard table":                  shardTable.String(),
-		"config not authorized comment":              RenderConfigNotAuthorized(configNotAuthorized),
-		"config not authorized error line":           RenderConfigNotAuthorizedLine(hostileIdentifier, hostileIdentifier),
-		"unmanaged schema config notice":             RenderUnmanagedSchemaConfigsNotice([]UnmanagedSchemaConfigNoticeData{{Database: hostileIdentifier, SchemaPath: hostileIdentifier}}),
-		"invalid environment available list":         RenderInvalidEnv("apply", []string{hostileIdentifier}),
-		"database not found for a hostile -d":        RenderDatabaseNotFound(SchemaErrorData{DatabaseName: hostileIdentifier}),
-		"scoped database not found for a hostile -d": RenderDatabaseNotFound(SchemaErrorData{DatabaseName: hostileIdentifier, SearchedDirs: []string{"schema"}}),
-		"database not configured for a hostile -d":   RenderDatabaseNotConfigured(SchemaErrorData{DatabaseName: hostileIdentifier}),
-		"repository truncated for a hostile -d":      RenderRepositoryTreeTruncated(SchemaErrorData{DatabaseName: hostileIdentifier}),
-		"database rejects the repo for a hostile -d": RenderDatabaseRepoNotAllowed(SchemaErrorData{DatabaseName: hostileIdentifier}),
-		"no config for a hostile -d":                 RenderNoConfig(SchemaErrorData{DatabaseName: hostileIdentifier}),
+		"plan comment":                                 RenderPlanComment(plan),
+		"unsafe changes rejection":                     RenderUnsafeChangesBlocked(plan),
+		"blocked changes rejection":                    RenderBlockedChangesApplyRejected(plan),
+		"apply retry row":                              RenderApplyStatusComment(apply),
+		"sharded apply shard table":                    shardTable.String(),
+		"config not authorized comment":                RenderConfigNotAuthorized(configNotAuthorized),
+		"config not authorized error line":             RenderConfigNotAuthorizedLine(hostileIdentifier, hostileIdentifier),
+		"unmanaged schema config notice":               RenderUnmanagedSchemaConfigsNotice([]string{hostileIdentifier}, []UnmanagedSchemaConfigNoticeData{{Database: hostileIdentifier, SchemaPath: hostileIdentifier}}),
+		"unmanaged schema passing check summary":       unmanagedSchemaPassingCheckSummary(hostileIdentifier),
+		"invalid environment available list":           RenderInvalidEnv("apply", []string{hostileIdentifier}),
+		"database not found for a hostile -d":          RenderDatabaseNotFound(SchemaErrorData{DatabaseName: hostileIdentifier}),
+		"scoped database not found for a hostile -d":   RenderDatabaseNotFound(SchemaErrorData{DatabaseName: hostileIdentifier, SearchedDirs: []string{"schema"}}),
+		"database not configured for a hostile -d":     RenderDatabaseNotConfigured(SchemaErrorData{DatabaseName: hostileIdentifier}),
+		"database not registered for a hostile config": RenderDatabaseNotRegistered(SchemaErrorData{UnregisteredConfigs: []UnregisteredSchemaConfigData{{Database: hostileIdentifier, SchemaPath: hostileIdentifier}}}),
+		"databases not registered for hostile configs": RenderDatabaseNotRegistered(SchemaErrorData{UnregisteredConfigs: []UnregisteredSchemaConfigData{{Database: hostileIdentifier, SchemaPath: hostileIdentifier}, {Database: "orders", SchemaPath: hostileIdentifier}}}),
+		"repository truncated for a hostile -d":        RenderRepositoryTreeTruncated(SchemaErrorData{DatabaseName: hostileIdentifier}),
+		"database rejects the repo for a hostile -d":   RenderDatabaseRepoNotAllowed(SchemaErrorData{DatabaseName: hostileIdentifier}),
+		"no config for a hostile -d":                   RenderNoConfig(SchemaErrorData{DatabaseName: hostileIdentifier}),
 	}
 
 	for name, rendered := range surfaces {
@@ -76,4 +79,9 @@ func TestHostileIdentifierNeverEscapesItsCodeSpan(t *testing.T) {
 			}
 		})
 	}
+}
+
+func unmanagedSchemaPassingCheckSummary(identifier string) string {
+	_, summary := RenderUnmanagedSchemaPassingCheck(identifier, []UnmanagedSchemaConfigNoticeData{{Database: identifier, SchemaPath: identifier}})
+	return summary
 }

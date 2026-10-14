@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en"><meta charset="utf-8"><title>How Spirit selects the execution path</title>
+<style>html,body{margin:0;background:#fff}svg{display:block;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif}text{font-variant-numeric:tabular-nums}.mono{font-family:SFMono-Regular,Menlo,Consolas,monospace}</style>
+<svg id="art" width="1100" height="690" viewBox="0 0 1100 690" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Three independent ALTER TABLE examples show Spirit selecting instant DDL, a supported native in-place operation, or an online table copy"></svg>
+<script>
+const C={ink:'#1f2328',muted:'#59636e',line:'#d1d9e0',soft:'#f6f8fa',blue:'#0969da',blueBg:'#ddf4ff',green:'#1a7f37',greenBg:'#dafbe1',amber:'#9a6700',amberBg:'#fff8c5'};
+const clamp=x=>Math.max(0,Math.min(1,x));
+const esc=s=>String(s).replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;');
+const rect=(x,y,w,h,fill=C.soft,stroke='none',r=8)=>`<rect x="${x}" y="${y}" width="${Math.max(0,w)}" height="${h}" rx="${r}" fill="${fill}" stroke="${stroke}"/>`;
+const txt=(x,y,s,size=16,color=C.ink,weight=400,cls='')=>`<text x="${x}" y="${y}" font-size="${size}" fill="${color}" font-weight="${weight}" class="${cls}">${esc(s)}</text>`;
+const path=(d,color=C.line,w=2)=>`<path d="${d}" fill="none" stroke="${color}" stroke-width="${w}" stroke-linejoin="round"/>`;
+const examples=[
+ {label:'Add a column',sql:['ALTER TABLE `customers`','  ADD COLUMN `nickname` varchar(64) DEFAULT NULL;'],caption:'MySQL accepts INSTANT on this eligible table; Spirit finishes without copying rows.'},
+ {label:'Rename an index',sql:['ALTER TABLE `customers`','  RENAME INDEX `idx_created_at` TO `idx_signup_time`;'],caption:'Not instant, but a supported metadata-only INPLACE change; no table copy is needed.'},
+ {label:'Add an index',sql:['ALTER TABLE `customers`','  ADD INDEX `idx_created_at` (`created_at`);'],caption:'Spirit excludes ADD INDEX from its native subset and uses the controlled copy workflow.'}
+];
+function renderFrame(t){
+ t=Math.max(0,Math.min(t,29.99));const scene=Math.floor(t/10),local=t%10,e=examples[scene];
+ const decided=local>=4,advanced=scene>0&&local>=3;
+ let s=rect(0,0,1100,690,'#fff','none',0)+txt(36,37,'SCHEMABOT / SPIRIT',13,C.muted,650)+txt(36,105,'Not every change needs a copy.',34,C.ink,650);
+ for(let i=0;i<3;i++){let x=36+i*351;s+=rect(x,130,326,3,i===scene?C.blue:C.line)+txt(x,160,examples[i].label,16,i===scene?C.blue:C.muted,i===scene?650:500);}
+ s+=rect(36,184,1028,116,C.soft,C.line,10)+txt(57,210,'Example DDL from a reviewed plan',13,C.muted,550)+txt(57,245,e.sql[0],20,C.blue,500,'mono')+txt(57,275,e.sql[1],19,C.ink,400,'mono');
+ const instant=decided&&scene===0,inplace=decided&&scene===1,copy=decided&&scene===2;
+ const boxes=[{x:36,title:'Try INSTANT',sub:'Ask MySQL to use metadata only',active:local<3||instant,color:instant?C.green:C.blue,result:local<3?'Checking the target table':scene===0?'Accepted':'Not supported for this DDL'},
+ {x:387,title:'Check native INPLACE',sub:'Only Spirit’s supported subset',active:advanced,color:inplace?C.green:C.blue,result:!advanced?'If instant is unavailable':scene===1?'Supported · execute natively':'ADD INDEX is excluded'},
+ {x:738,title:'Run the online copy',sub:'Paced, checkpointed, verified',active:copy,color:C.blue,result:copy?'Continue with the copy workflow':'When a supported change needs it'}];
+ for(let i=0;i<3;i++){const b=boxes[i],stroke=b.active?b.color:C.line,bg=b.active?(b.color===C.green?C.greenBg:C.blueBg):C.soft;
+  s+=rect(b.x,365,326,157,'#fff',stroke,10)+txt(b.x+18,399,b.title,20,C.ink,650)+txt(b.x+18,428,b.sub,14,C.muted)+rect(b.x+12,453,302,48,bg)+txt(b.x+22,482,b.result,13,b.active?b.color:C.muted,550);
+ }
+ s+=path('M362 443 H387',advanced?C.blue:C.line)+path('M381 438 L387 443 L381 448',advanced?C.blue:C.line);
+ s+=path('M713 443 H738',copy?C.blue:C.line)+path('M732 438 L738 443 L732 448',copy?C.blue:C.line);
+ // One moving indicator while the decision is made; the result then holds for reading.
+ if(local<4){const x=scene===0?36+Math.min(local/3,1)*300:36+clamp(local/4)*(scene===1?650:1000);s+=rect(x,342,10,6,C.blue,'none',3);}
+ s+=rect(36,576,1028,57,C.soft)+txt(55,612,decided?e.caption:'Spirit checks the operation against the capabilities of the actual target.',17,C.ink,500);
+ s+=txt(36,659,'Independent MySQL 8.4 / InnoDB examples · Required columns and indexes exist · Instant eligibility depends on the table',12,C.muted);
+ s+=txt(36,678,'Illustrative timing · Execution paths shown after plan review and safety checks',12,C.muted);
+ document.getElementById('art').innerHTML=s;return {scene,decided};
+}
+window.renderFrame=renderFrame;renderFrame(0);
+</script></html>

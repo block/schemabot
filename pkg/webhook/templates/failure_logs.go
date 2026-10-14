@@ -76,49 +76,6 @@ type LogGroupData struct {
 	HasOlder bool
 }
 
-// MaxGroupLabelChars bounds what one group heading costs the budget. A label
-// longer than this is clamped rather than allowed to eat the lines it exists
-// to introduce. A caller composing a label keeps it inside this by clamping
-// each of its parts with ElideMiddle, so the clamp here is a backstop.
-const MaxGroupLabelChars = 64
-
-// MaxGroupLabelPartChars bounds one name inside a composed group label — a
-// deployment or a target. A caller composing a label from several names clamps
-// each of them with ElideMiddle before joining, so the label arrives within
-// MaxGroupLabelChars and the heading's own clamp never has to cut it.
-const MaxGroupLabelPartChars = 20
-
-// ElideMiddle shortens text to at most maxBytes by replacing its middle with
-// an ellipsis, keeping both ends. Names that identify a deployment or a target
-// share long prefixes and differ at the tail, so cutting the tail off makes
-// two distinct names render identically — which is the one thing a heading
-// that exists to tell them apart must not do.
-func ElideMiddle(text string, maxBytes int) string {
-	const ellipsis = "…"
-	if len(text) <= maxBytes {
-		return text
-	}
-	if maxBytes <= len(ellipsis) {
-		return truncateToBytes(text, maxBytes)
-	}
-	keep := maxBytes - len(ellipsis)
-	head := keep / 2
-	tail := keep - head
-	return truncateToBytes(text, head) + ellipsis + tailBytes(text, tail)
-}
-
-// tailBytes returns the last maxBytes of text without splitting a UTF-8 rune.
-func tailBytes(text string, maxBytes int) string {
-	if len(text) <= maxBytes {
-		return text
-	}
-	cut := len(text) - maxBytes
-	for cut < len(text) && !utf8.RuneStart(text[cut]) {
-		cut++
-	}
-	return text[cut:]
-}
-
 // RenderFailureLogs renders the collapsed logs section appended to a failed
 // apply's summary comment, formatted like the CLI logs output (timestamp,
 // level tag, message, state transition). Every account of the apply shares the
@@ -135,14 +92,7 @@ func tailBytes(text string, maxBytes int) string {
 // of pushing the comment over the limit. Returns "" when no group carried a
 // line or there is no meaningful room, so the summary renders unchanged.
 func RenderFailureLogs(groups []LogGroupData, available int) string {
-	groups = groupsWithEntries(groups)
-	if len(groups) == 0 {
-		return ""
-	}
-	if available < MinFailureLogsSectionChars {
-		return ""
-	}
-	groups, headings, budget, droppedGroups := groupsWithinBudget(groups, available)
+	groups, headings, budget, droppedGroups := planFold(groups, available)
 	if len(groups) == 0 {
 		return ""
 	}
@@ -184,6 +134,28 @@ func RenderFailureLogs(groups []LogGroupData, available int) string {
 	}
 	section += "```text\n" + strings.Join(blocks, groupSeparator) + "\n```\n\n</details>\n"
 	return section
+}
+
+// FoldGroups returns the groups a fold given available characters carries, in
+// order. RenderFailureLogs renders exactly these, so a caller that has to know
+// what the fold will hold before it is rendered — the summary sentence that
+// sends the reader to the logs below — asks here rather than re-deriving the
+// budget, and the two cannot disagree.
+func FoldGroups(groups []LogGroupData, available int) []LogGroupData {
+	kept, _, _, _ := planFold(groups, available)
+	return kept
+}
+
+// planFold decides what a fold given available characters renders: the groups
+// that carried a line, as many of them as the room gives a renderable share,
+// with their headings, the budget left for lines, and how many groups fell
+// out. Too little room for any fold at all plans nothing.
+func planFold(groups []LogGroupData, available int) (kept []LogGroupData, headings []string, budget int, dropped int) {
+	groups = groupsWithEntries(groups)
+	if len(groups) == 0 || available < MinFailureLogsSectionChars {
+		return nil, nil, 0, 0
+	}
+	return groupsWithinBudget(groups, available)
 }
 
 // groupsWithinBudget decides how many groups the fold can carry and what the
@@ -242,8 +214,11 @@ func groupHeadings(groups []LogGroupData) (headings []string, costUpTo []int) {
 // label is sanitized like any other text in the fence: it is assembled from
 // server configuration rather than from a log line, but it shares the fence
 // with text the engine wrote and nothing in it should be able to close it.
+// It renders whole: the names in it are identifiers an operator has to
+// recognize, and what it costs is charged to the fold's budget like any
+// other line.
 func groupHeading(label string) string {
-	return "== " + truncateToBytes(sanitizeLogText(label), MaxGroupLabelChars) + " =="
+	return "== " + sanitizeLogText(label) + " =="
 }
 
 // groupsWithEntries drops the groups that carried no line, so an account that

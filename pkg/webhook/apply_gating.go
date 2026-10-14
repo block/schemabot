@@ -84,7 +84,7 @@ func filterNonPassingNonSchemaBotChecks(statuses []ghclient.PRCheckStatus, confi
 		if filterRequiredChecks && !config.IsCheckRequired(s.Name) {
 			continue
 		}
-		if s.Status != "completed" {
+		if !checkHasFinished(s.Status) {
 			continue
 		}
 		if checkstate.ConclusionClearsGate(s.Conclusion) {
@@ -239,7 +239,15 @@ func (h *Handler) flagUntrustedAggregateNamedChecks(ctx context.Context, statuse
 	}
 }
 
-// filterInProgressNonSchemaBotChecks returns checks that are still running,
+// checkHasFinished reports whether a check has reached its final state. Only
+// "completed" counts: every other status ("in_progress", "queued", "pending",
+// "waiting", "requested", or one GitHub adds later) means the check has not
+// concluded, so an unrecognized status blocks apply instead of passing it.
+func checkHasFinished(status string) bool {
+	return status == "completed"
+}
+
+// filterInProgressNonSchemaBotChecks returns checks that have not finished,
 // excluding checks created by trusted SchemaBot GitHub Apps.
 func filterInProgressNonSchemaBotChecks(statuses []ghclient.PRCheckStatus, config *api.ServerConfig) []templates.BlockingCheck {
 	var inProgress []templates.BlockingCheck
@@ -251,13 +259,13 @@ func filterInProgressNonSchemaBotChecks(statuses []ghclient.PRCheckStatus, confi
 		if filterRequiredChecks && !config.IsCheckRequired(s.Name) {
 			continue
 		}
-		switch s.Status {
-		case "in_progress", "queued", "pending":
-			inProgress = append(inProgress, templates.BlockingCheck{
-				Name:  s.Name,
-				State: s.Status,
-			})
+		if checkHasFinished(s.Status) {
+			continue
 		}
+		inProgress = append(inProgress, templates.BlockingCheck{
+			Name:  s.Name,
+			State: s.Status,
+		})
 	}
 	return inProgress
 }

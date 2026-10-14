@@ -87,6 +87,9 @@ func TestPlans(t *testing.T, h Harness) {
 			// A member planned against its own live schema is bound to the
 			// reviewed plan of its round; every store must carry that link.
 			PrimaryPlanIdentifier: "plan_reviewed",
+			// A plan narrowed to one rollout member is held to it at apply
+			// creation; every store must carry the narrowing.
+			NarrowedTo: "primary/commerce-target",
 			SchemaFiles: schema.SchemaFiles{
 				"commerce": {Files: map[string]string{"users.sql": "CREATE TABLE `users` (`id` bigint unsigned NOT NULL)"}},
 			},
@@ -110,6 +113,7 @@ func TestPlans(t *testing.T, h Harness) {
 			assert.Equal(t, "staging", got.Environment)
 			assert.Equal(t, "sha_head", got.HeadSHA)
 			assert.Equal(t, "plan_reviewed", got.PrimaryPlanIdentifier)
+			assert.Equal(t, "primary/commerce-target", got.NarrowedTo)
 			require.Contains(t, got.SchemaFiles, "commerce")
 			assert.Equal(t, "CREATE TABLE `users` (`id` bigint unsigned NOT NULL)",
 				got.SchemaFiles["commerce"].Files["users.sql"])
@@ -145,6 +149,62 @@ func TestPlans(t *testing.T, h Harness) {
 		second := plan
 		_, err = store.Plans().Create(ctx, &second)
 		require.ErrorIs(t, err, storage.ErrPlanIDExists)
+	})
+
+	// A planner sharing the service's storage stores a plan's row first, with
+	// the route it knows and no narrowing; the service restamps it with the
+	// member it planned. The restamp records a narrowing on a row without one,
+	// but never widens a narrowed row or moves it to another member.
+	t.Run("UpdateRoute_RecordsNarrowingButNeverReplacesOne", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+
+		_, err := store.Plans().Create(ctx, &storage.Plan{
+			PlanIdentifier: "plan_restamp",
+			Database:       "commerce",
+			DatabaseType:   storage.DatabaseTypeMySQL,
+			Deployment:     "commerce",
+			Target:         "commerce-001",
+			Repository:     "org/repo",
+			PullRequest:    123,
+			Environment:    "staging",
+			HeadSHA:        "sha_head",
+			CreatedAt:      time.Now().UTC().Truncate(time.Second),
+		})
+		require.NoError(t, err)
+
+		requireRoute := func(deployment, target, narrowedTo string) {
+			t.Helper()
+			got, err := store.Plans().Get(ctx, "plan_restamp")
+			require.NoError(t, err)
+			require.NotNil(t, got)
+			assert.Equal(t, deployment, got.Deployment)
+			assert.Equal(t, target, got.Target)
+			assert.Equal(t, narrowedTo, got.NarrowedTo)
+			assert.Equal(t, "commerce", got.Database)
+			assert.Equal(t, "sha_head", got.HeadSHA)
+		}
+
+		require.NoError(t, store.Plans().UpdateRoute(ctx, "plan_restamp", "eu", "commerce-002", "eu/commerce-002"))
+		requireRoute("eu", "commerce-002", "eu/commerce-002")
+
+		// Restamping with the narrowing the row records is the same plan.
+		require.NoError(t, store.Plans().UpdateRoute(ctx, "plan_restamp", "eu", "commerce-002", "eu/commerce-002"))
+		requireRoute("eu", "commerce-002", "eu/commerce-002")
+
+		err = store.Plans().UpdateRoute(ctx, "plan_restamp", "us", "commerce-003", "us/commerce-003")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), `records narrowing "eu/commerce-002", not "us/commerce-003"`)
+		requireRoute("eu", "commerce-002", "eu/commerce-002")
+
+		err = store.Plans().UpdateRoute(ctx, "plan_restamp", "us", "commerce-003", "")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), `records narrowing "eu/commerce-002", not ""`)
+		requireRoute("eu", "commerce-002", "eu/commerce-002")
+
+		err = store.Plans().UpdateRoute(ctx, "plan_missing", "eu", "commerce-002", "eu/commerce-002")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "no plan carries the identifier")
 	})
 
 	t.Run("RoundTripsShardPlans", func(t *testing.T) {
@@ -324,6 +384,7 @@ func TestPlans(t *testing.T, h Harness) {
 			DirectExecution: &storage.DirectExecutionPolicy{
 				Enabled:                       true,
 				MaxTableRows:                  10000,
+				MaxTableBytes:                 100 << 20,
 				LockAcquisitionTimeoutSeconds: 5,
 			},
 			CreatedAt: time.Now().UTC().Truncate(time.Second),

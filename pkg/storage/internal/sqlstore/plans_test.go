@@ -39,3 +39,41 @@ func TestPlanStore_RoundTripsNilPlanDataAsNull(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "null", planData)
 }
+
+// UpdateRoute restamps a stored plan with the rollout member it was planned for
+// and leaves the rest of the row, the plan's content included, as it was stored.
+func TestPlanStore_UpdateRouteRestampsOnlyTheRoute(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	_, err := store.Plans().Create(ctx, &storage.Plan{
+		PlanIdentifier: "plan_route",
+		Database:       "commerce",
+		DatabaseType:   storage.DatabaseTypeMySQL,
+		Deployment:     "commerce",
+		Target:         "commerce-001",
+		Repository:     "org/repo",
+		PullRequest:    123,
+		Environment:    "staging",
+		HeadSHA:        "abc123",
+		Namespaces: map[string]*storage.NamespacePlanData{
+			"commerce": {Tables: []storage.TableChange{{Table: "orders", Operation: "alter", DDL: "ALTER TABLE `orders` ADD COLUMN `region` varchar(16)"}}},
+		},
+		CreatedAt: time.Now(),
+	})
+	require.NoError(t, err)
+
+	require.NoError(t, store.Plans().UpdateRoute(ctx, "plan_route", "eu", "commerce-002", ""))
+
+	plan, err := store.Plans().Get(ctx, "plan_route")
+	require.NoError(t, err)
+	require.NotNil(t, plan)
+	assert.Equal(t, "eu", plan.Deployment)
+	assert.Equal(t, "commerce-002", plan.Target)
+	assert.Equal(t, "commerce", plan.Database)
+	assert.Equal(t, "abc123", plan.HeadSHA)
+	changes := plan.FlatDDLChanges()
+	require.Len(t, changes, 1)
+	assert.Equal(t, "ALTER TABLE `orders` ADD COLUMN `region` varchar(16)", changes[0].DDL)
+}

@@ -30,12 +30,12 @@ type Deletion struct {
 }
 
 // Deletions returns the structural removals needed to go from the current
-// VSchema to the desired one. An empty or blank current VSchema (a new
-// keyspace) has nothing to remove. Both documents must parse as VSchema
-// keyspace JSON; a document that cannot be parsed returns an error so callers
-// can fail closed rather than miss a removal.
+// VSchema to the desired one. A keyspace with no VSchema yet has nothing to
+// remove. Both documents must parse as VSchema keyspace JSON; a document that
+// cannot be parsed returns an error so callers can fail closed rather than
+// miss a removal.
 func Deletions(current, desired string) ([]Deletion, error) {
-	if strings.TrimSpace(current) == "" || strings.TrimSpace(current) == "{}" {
+	if hasNoVSchema(current) {
 		return nil, nil
 	}
 
@@ -112,6 +112,22 @@ func vindexRemovalReason(name string, v *vschemapb.Vindex) string {
 		return fmt.Sprintf("lookup vindex %q is removed: Vitess immediately stops maintaining its lookup rows and queries routed through it can fail or scatter", name)
 	}
 	return fmt.Sprintf("vindex %q is removed: Vitess immediately stops using it for routing and lookups, and queries that depend on it can fail or scatter", name)
+}
+
+// hasNoVSchema reports whether the current document says the keyspace has no
+// VSchema yet. A data plane reports that as either nothing or the empty
+// object, which is how an empty keyspace proto serialises; a lookup can also
+// come back empty while the data plane's API converges after a recent write,
+// and the two are indistinguishable from the document alone. Such a document
+// declares no table, vindex, or association, so there is nothing for the
+// first VSchema to remove. It is not inert for routing, though: an unsharded
+// keyspace routes every live table without a VSchema, so Mutations compares
+// the first document as an empty keyspace against the target's live tables
+// and exempts only the sharded flag, which a sharded keyspace's first
+// document sets because its shards already exist in the topology.
+func hasNoVSchema(current string) bool {
+	current = strings.TrimSpace(current)
+	return current == "" || current == "{}"
 }
 
 // parseKeyspace decodes a VSchema keyspace JSON document. Unlike Normalize,

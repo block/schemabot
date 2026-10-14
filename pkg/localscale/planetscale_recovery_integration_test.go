@@ -29,7 +29,8 @@ import (
 // This drives the real recovery path against LocalScale: a single deploy with
 // deferred cutover parks an in-flight context, then Progress is called with the
 // stored context blanked but the persisted baseline present, and must rediscover
-// the in-flight context.
+// the in-flight context and then report per-shard progress for the changed table
+// from the context-filtered, keyspace-qualified read.
 func TestPlanetScaleProgressRecoversMigrationContextFromBaseline(t *testing.T) {
 	cleanupActiveDeployRequests(t, t.Context())
 	deferCleanupActiveDeployRequests(t)
@@ -70,6 +71,7 @@ func TestPlanetScaleProgressRecoversMigrationContextFromBaseline(t *testing.T) {
 	require.NoError(t, err, "build resume state")
 
 	var recovered string
+	var tables []engine.TableProgress
 	require.Eventually(t, func() bool {
 		result, perr := eng.Progress(ctx, &engine.ProgressRequest{
 			Database:    testDB,
@@ -80,16 +82,21 @@ func TestPlanetScaleProgressRecoversMigrationContextFromBaseline(t *testing.T) {
 			t.Logf("progress poll error (will retry): %v", perr)
 			return false
 		}
-		if result.ResumeState != nil && result.ResumeState.MigrationContext != "" {
+		if result.ResumeState != nil && result.ResumeState.MigrationContext != "" && len(result.Tables) > 0 {
 			recovered = result.ResumeState.MigrationContext
+			tables = result.Tables
 			return true
 		}
 		return false
-	}, 30*time.Second, 500*time.Millisecond, "Progress should recover the in-flight migration context from the baseline")
+	}, 30*time.Second, 500*time.Millisecond, "Progress should recover the in-flight migration context from the baseline and report its shards")
 
 	assert.Contains(t, recovered, ":", "recovered value must be a real Vitess context, not a tern apply identifier")
 	_, inBaseline := baselineContexts[recovered]
 	assert.False(t, inBaseline, "recovered context must be the new in-flight change, not a baseline context")
+
+	require.Len(t, tables, 1, "only the altered table belongs to the recovered context")
+	assert.Equal(t, keyspace, tables[0].Namespace, "per-shard progress must come from the keyspace the change targets")
+	assert.Equal(t, "users", tables[0].Table, "per-shard progress must name the altered table")
 }
 
 // captureMigrationContexts snapshots the migration_context values currently in
@@ -131,7 +138,7 @@ func newRecoveryCredentials(t *testing.T, ctx context.Context) *engine.Credentia
 	cfg.User = pw.Username
 	cfg.Passwd = pw.PlainText
 	cfg.Net = "tcp"
-	cfg.Addr = pw.Hostname // namespace-free; the engine runs USE per keyspace
+	cfg.Addr = pw.Hostname // namespace-free; the engine names the keyspace in each query
 	return &engine.Credentials{
 		DSN: cfg.FormatDSN(),
 		Metadata: map[string]string{

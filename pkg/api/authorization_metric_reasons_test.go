@@ -98,17 +98,20 @@ func TestUnresolvedDirectWriteTargetIsCountedAsSkipped(t *testing.T) {
 	logger := slog.New(slog.DiscardHandler)
 	operator := &auth.User{Subject: "bob", Groups: []string{"payments-team"}}
 
-	cases := map[string]*mockPlanLookupStore{
-		"plan lookup fails":   {err: assert.AnError},
-		"plan does not exist": {},
+	cases := map[string]struct {
+		plans      *mockPlanLookupStore
+		wantStatus int
+	}{
+		"plan lookup fails":   {plans: &mockPlanLookupStore{err: assert.AnError}, wantStatus: http.StatusInternalServerError},
+		"plan does not exist": {plans: &mockPlanLookupStore{}, wantStatus: http.StatusNotFound},
 	}
-	for name, plans := range cases {
+	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
 			reader := installManualMetricReader(t)
-			svc := New(&mockStorageWithPlanLookup{plans: plans}, scopedWriteConfig(), nil, logger)
+			svc := New(&mockStorageWithPlanLookup{plans: tc.plans}, scopedWriteConfig(), nil, logger)
 			rec := scopedDenialRequest(t, svc.handleApply, operator, http.MethodPost, "/api/apply",
 				`{"plan_id":"plan-1","environment":"staging"}`)
-			require.Equal(t, http.StatusInternalServerError, rec.Code)
+			require.Equal(t, tc.wantStatus, rec.Code)
 
 			points := collectCounterPoints(t, reader, "schemabot.direct_write_authorization.total")
 			require.Len(t, points, 1, "exactly one direct-write decision is recorded")

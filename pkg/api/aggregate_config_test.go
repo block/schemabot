@@ -80,6 +80,27 @@ func TestExpectedTenantsForPR(t *testing.T) {
 	})
 }
 
+// The leader decides whether a schema directory is some participant's to
+// manage from the expected-tenant path prefixes alone: a directory under one
+// of them belongs to that participant, a directory under none of them (the
+// repository root included) belongs to no participant, and a deployment that
+// is not the leader has no expected set to decide from.
+func TestExpectedTenantManagesSchemaPath(t *testing.T) {
+	c := leaderConfig()
+
+	assert.True(t, c.ExpectedTenantManagesSchemaPath("octocat/shared-repo", "services/b/schema"))
+	assert.True(t, c.ExpectedTenantManagesSchemaPath("octocat/shared-repo", "services/a"), "the prefix itself is managed")
+	assert.False(t, c.ExpectedTenantManagesSchemaPath("octocat/shared-repo", "services/d/schema"))
+	assert.False(t, c.ExpectedTenantManagesSchemaPath("octocat/shared-repo", "."), "a root config is under no participant prefix")
+	assert.False(t, c.ExpectedTenantManagesSchemaPath("octocat/shared-repo", "services/bb/schema"), "prefix matching is per directory, not per character")
+
+	participant := &ServerConfig{Repos: map[string]RepoConfig{
+		"octocat/shared-repo": {Aggregate: &AggregateConfig{Role: AggregateRoleParticipant}},
+	}}
+	assert.False(t, participant.ExpectedTenantManagesSchemaPath("octocat/shared-repo", "services/b/schema"), "only the leader holds the expected set")
+	assert.False(t, c.ExpectedTenantManagesSchemaPath("octocat/unknown", "services/b/schema"))
+}
+
 // The leader resolves each expected participant's Check Run name from the
 // expected-tenant entry, so ExpectedParticipantChecksForPR must carry the
 // check-name base through alongside the tenant and its paths.

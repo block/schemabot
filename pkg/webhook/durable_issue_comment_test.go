@@ -99,6 +99,8 @@ func TestIssueCommentGateBlockParity(t *testing.T) {
 		{name: "unsupported auto-confirm on apply", comment: "schemabot apply -e production --yes -t alpha", want: issueCommentGateAutoConfirm},
 		{name: "rollback misplaced defer-cutover", comment: "schemabot rollback apply_123 -e production --defer-cutover -t alpha", want: issueCommentGateDeferCutover},
 		{name: "unsupported database", comment: "schemabot stop -e production -d accounts -t alpha", want: issueCommentGateDatabase},
+		{name: "unsupported target", comment: "schemabot apply-confirm -e production --target payments-002 -t alpha", want: issueCommentGateTarget},
+		{name: "narrowed plan missing environment", comment: "schemabot plan --target payments-002 -t alpha", want: issueCommentGateMissingEnvironment},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -629,7 +631,7 @@ func (s *cancelOnLookupLockStore) GetByPR(_ context.Context, _ string, _ int) ([
 	return s.locks, nil
 }
 
-func (s *cancelOnLookupLockStore) Release(ctx context.Context, _, _, _ string) error {
+func (s *cancelOnLookupLockStore) ReleaseByID(ctx context.Context, _ int64, _, _, _, _ string) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}

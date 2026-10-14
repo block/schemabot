@@ -109,3 +109,26 @@ func TestLocalGRPCMultiDeploymentFixtureComposeConsistency(t *testing.T) {
 			"compose must define a service for deployment endpoint host %q", host)
 	}
 }
+
+// TestLocalGRPCMultiDeploymentFixtureTargetsEnvironment pins the fixture's
+// multi-target environment: the same two deployments, each spelling its
+// routing as a targets list, so the environment plans every member against
+// its own live schema rather than mirroring the primary.
+func TestLocalGRPCMultiDeploymentFixtureTargetsEnvironment(t *testing.T) {
+	cfg := loadMultiDeployFixtureConfig(t)
+	require.NoError(t, cfg.Validate())
+
+	env, ok := cfg.Databases["testapp"].Environments["production-targets"]
+	require.True(t, ok, "fixture must configure the production-targets environment")
+	assert.True(t, env.UsesTargetsList(), "production-targets must be multi-target")
+
+	assert.Equal(t, "tern-eu:9090", cfg.TernDeployments["eu"]["production-targets"])
+	assert.Equal(t, "tern-us:9090", cfg.TernDeployments["us"]["production-targets"])
+
+	targets, err := cfg.ResolveDatabaseTargets("testapp", "production-targets")
+	require.NoError(t, err)
+	assert.Equal(t, []routing.ExecutionTarget{
+		{DatabaseType: storage.DatabaseTypeMySQL, Deployment: "eu", Target: "testapp"},
+		{DatabaseType: storage.DatabaseTypeMySQL, Deployment: "us", Target: "testapp"},
+	}, targets)
+}

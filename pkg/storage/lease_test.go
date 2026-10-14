@@ -120,3 +120,21 @@ func TestApplyHasFreshLease(t *testing.T) {
 	var nilApply *Apply
 	assert.False(t, nilApply.HasFreshLease(now))
 }
+
+// An operation's lease is read the same way as an apply's: an owner and a
+// heartbeat within the staleness bound mean a live drive holds the operation.
+func TestApplyOperationHasFreshLease(t *testing.T) {
+	now := time.Now()
+
+	fresh := &ApplyOperation{LeaseOwner: "host/1/driver-0", LeaseToken: "token", UpdatedAt: now.Add(-ApplyLeaseStaleAfter / 2)}
+	assert.True(t, fresh.HasFreshLease(now))
+
+	stale := &ApplyOperation{LeaseOwner: "host/1/driver-0", LeaseToken: "token", UpdatedAt: now.Add(-2 * ApplyLeaseStaleAfter)}
+	assert.False(t, stale.HasFreshLease(now))
+
+	unleased := &ApplyOperation{UpdatedAt: now}
+	assert.False(t, unleased.HasFreshLease(now), "a recent write without an owner is not a lease heartbeat")
+
+	var nilOperation *ApplyOperation
+	assert.False(t, nilOperation.HasFreshLease(now))
+}

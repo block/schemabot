@@ -19,6 +19,8 @@ import (
 	"testing"
 	"time"
 
+	mysql "github.com/block/mysql"
+	"github.com/block/spirit/pkg/utils"
 	gh "github.com/google/go-github/v86/github"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -525,6 +527,186 @@ func TestE2EPlanConfigNotFound(t *testing.T) {
 		assert.Contains(t, body, "No SchemaBot Configuration Found")
 	case <-time.After(10 * time.Second):
 		t.Fatal("timed out waiting for error comment")
+	}
+}
+
+// A plan that adds an index to an existing table renders the table's
+// approximate on-disk size in the plan comment — read from the target's
+// statistics at plan time — so an operator sees the scale of the index build
+// before applying. Only statements whose cost scales with the table carry a
+// size line: metadata-only alters and tables being created are not listed.
+func TestE2EPlanCommentShowsTableSizes(t *testing.T) {
+	dbName := "webhook_plan_table_sizes"
+	svc := setupE2EService(t, dbName)
+	dbConfig := svc.Config().Databases[dbName]
+	dbConfig.AllowedRepos = []string{"octocat/hello-world"}
+	dbConfig.AllowedDirs = []string{"schema"}
+	svc.Config().Databases[dbName] = dbConfig
+
+	// Seed an existing table with enough rows that statistics report a
+	// meaningful estimate, and refresh statistics so the estimate is current.
+	dsnConfig, err := mysql.ParseDSN(e2eTargetDSN)
+	require.NoError(t, err)
+	dsnConfig.DBName = dbName
+	appDB, err := sql.Open("block-mysql", dsnConfig.FormatDSN())
+	require.NoError(t, err)
+	defer utils.CloseAndLog(appDB)
+	require.NoError(t, appDB.PingContext(t.Context()), "ping target database")
+	_, err = appDB.ExecContext(t.Context(), "CREATE TABLE `items` (\n"+
+		"  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n"+
+		"  `name` varchar(255) NOT NULL,\n"+
+		"  PRIMARY KEY (`id`)\n"+
+		") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci")
+	require.NoError(t, err)
+	_, err = appDB.ExecContext(t.Context(), "CREATE TABLE `notes` (\n"+
+		"  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n"+
+		"  `body` varchar(255) NOT NULL,\n"+
+		"  PRIMARY KEY (`id`)\n"+
+		") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci")
+	require.NoError(t, err)
+	var values strings.Builder
+	for i := range 1200 {
+		if i > 0 {
+			values.WriteString(",")
+		}
+		fmt.Fprintf(&values, "('name-%d')", i)
+	}
+	_, err = appDB.ExecContext(t.Context(), "INSERT INTO `items` (`name`) VALUES "+values.String())
+	require.NoError(t, err)
+	_, err = appDB.ExecContext(t.Context(), "ANALYZE TABLE `items`")
+	require.NoError(t, err)
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
+	schemaFiles := map[string]string{
+		// One existing table gains an index (a size line), another gains only a
+		// column (no size line), and a new table is created (no size line).
+		"items.sql":   "CREATE TABLE `items` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`),\n  KEY `idx_name` (`name`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+		"notes.sql":   "CREATE TABLE `notes` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `body` varchar(255) NOT NULL,\n  `priority` int DEFAULT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+		"widgets.sql": "CREATE TABLE `widgets` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+	}
+
+	result := setupFakeGitHubForPlan(t, mux, schemaFiles, schemabotConfig, dbName)
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	installClient := ghclient.NewInstallationClient(client, logger)
+	factory := &fakeClientFactory{client: installClient}
+
+	h := NewHandler(svc, factory, nil, logger)
+
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot plan -e staging",
+		isPR:    true,
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.Contains(t, rr.Body.String(), "plan generated successfully")
+
+	select {
+	case body := <-result.comments:
+		assert.Contains(t, body, "## Schema Change Plan")
+		assert.Contains(t, body, "📊 **Table sizes**:")
+		assert.Regexp(t, "\n- `items`: ~[0-9.]+ (B|KB|MB)\n", body, "the size line carries the table's byte estimate")
+		assert.NotContains(t, body, "- `notes`:", "a column-only alter carries no size line")
+		assert.NotContains(t, body, "- `widgets`:", "a table being created is not listed in the size section")
+		sizesAt := strings.Index(body, "📊 **Table sizes**")
+		summaryAt := strings.Index(body, "📋 **Plan**:")
+		assert.Less(t, sizesAt, summaryAt, "sizes render above the plan summary")
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for plan comment")
+	}
+}
+
+// A plan that moves a table onto a new default collation and makes a unique
+// column case-sensitive says, under the DDL, what each move does to how the
+// columns compare. The column the ALTER redeclares without a collation picks
+// up the new table default, starts treating trailing spaces as significant,
+// says that values differing by accents or other characters can start
+// comparing equal, and names its unique index for that reason. The column moved onto the binary collation starts treating letter
+// case as significant and names no index: no two values can start colliding.
+func TestE2EPlanCommentShowsCollationChanges(t *testing.T) {
+	dbName := "webhook_plan_collation_changes"
+	svc := setupE2EService(t, dbName)
+	dbConfig := svc.Config().Databases[dbName]
+	dbConfig.AllowedRepos = []string{"octocat/hello-world"}
+	dbConfig.AllowedDirs = []string{"schema"}
+	svc.Config().Databases[dbName] = dbConfig
+
+	dsnConfig, err := mysql.ParseDSN(e2eTargetDSN)
+	require.NoError(t, err)
+	dsnConfig.DBName = dbName
+	appDB, err := sql.Open("block-mysql", dsnConfig.FormatDSN())
+	require.NoError(t, err)
+	defer utils.CloseAndLog(appDB)
+	require.NoError(t, appDB.PingContext(t.Context()), "ping target database")
+	_, err = appDB.ExecContext(t.Context(), "CREATE TABLE `handles` (\n"+
+		"  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n"+
+		"  `handle` varchar(64) NOT NULL,\n"+
+		"  `note` varchar(255) DEFAULT NULL,\n"+
+		"  PRIMARY KEY (`id`),\n"+
+		"  UNIQUE KEY `uk_handle` (`handle`),\n"+
+		"  UNIQUE KEY `uk_note` (`note`)\n"+
+		") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci")
+	require.NoError(t, err)
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
+	schemaFiles := map[string]string{
+		"handles.sql": "CREATE TABLE `handles` (\n" +
+			"  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n" +
+			"  `handle` varchar(64) COLLATE utf8mb4_bin NOT NULL,\n" +
+			"  `note` varchar(255) DEFAULT NULL,\n" +
+			"  PRIMARY KEY (`id`),\n" +
+			"  UNIQUE KEY `uk_handle` (`handle`),\n" +
+			"  UNIQUE KEY `uk_note` (`note`)\n" +
+			") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+	}
+
+	result := setupFakeGitHubForPlan(t, mux, schemaFiles, schemabotConfig, dbName)
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	installClient := ghclient.NewInstallationClient(client, logger)
+	factory := &fakeClientFactory{client: installClient}
+
+	h := NewHandler(svc, factory, nil, logger)
+
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot plan -e staging",
+		isPR:    true,
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.Contains(t, rr.Body.String(), "plan generated successfully")
+
+	select {
+	case body := <-result.comments:
+		assert.Contains(t, body, "🔤 **Collation changes**: these columns sort and compare under a new collation after the apply.\n"+
+			"- `handle` on `handles`: `utf8mb4_general_ci` → `utf8mb4_bin`\n"+
+			"  - Comparisons become case-sensitive: `'abc'` and `'ABC'` stop comparing equal.\n"+
+			"- `note` on `handles`: `utf8mb4_general_ci` → `utf8mb4_0900_ai_ci`\n"+
+			"  - Trailing spaces become significant (NO PAD): `'abc'` and `'abc '` stop comparing equal.\n"+
+			"  - Values that differ only by accents or other characters can start comparing equal.\n"+
+			"  - `note` is in unique index `uk_note`: the apply fails if two existing rows collide in that index under the new collation.\n", body)
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for plan comment")
 	}
 }
 

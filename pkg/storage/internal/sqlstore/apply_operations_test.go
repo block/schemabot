@@ -68,29 +68,6 @@ func TestApplyOperationStore_InsertAndGet(t *testing.T) {
 	assert.NotZero(t, got.UpdatedAt)
 }
 
-func TestApplyOperationStore_SaveExternalOperationID(t *testing.T) {
-	clearTables(t)
-	ctx := t.Context()
-	store := NewMySQL(testDB)
-
-	lock := createTestLock(t, store, "testdb", "mysql")
-	apply := createTestApply(t, store, lock, "apply_save_external_operation", 1)
-
-	operationID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
-		ApplyID:    apply.ID,
-		Deployment: "region-a",
-		Target:     "payments",
-	})
-	require.NoError(t, err)
-
-	require.NoError(t, store.ApplyOperations().SaveExternalOperationID(ctx, operationID, "remote-operation-1"))
-
-	got, err := store.ApplyOperations().Get(ctx, operationID)
-	require.NoError(t, err)
-	require.NotNil(t, got)
-	assert.Equal(t, "remote-operation-1", got.ExternalOperationID)
-}
-
 func TestApplyOperationStore_SaveExternalID(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
@@ -106,7 +83,7 @@ func TestApplyOperationStore_SaveExternalID(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	require.NoError(t, store.ApplyOperations().SaveExternalID(ctx, apply.ID, operationID, "remote-apply-1"))
+	require.NoError(t, store.ApplyOperations().SaveExternalID(ctx, apply.ID, operationID, "remote-apply-1", ""))
 
 	got, err := store.ApplyOperations().Get(ctx, operationID)
 	require.NoError(t, err)
@@ -140,7 +117,7 @@ func TestApplyOperationStore_SaveExternalIDSharesDeploymentRemoteApply(t *testin
 	})
 	require.NoError(t, err)
 
-	require.NoError(t, store.ApplyOperations().SaveExternalID(ctx, apply.ID, operationID, "remote-apply-a"))
+	require.NoError(t, store.ApplyOperations().SaveExternalID(ctx, apply.ID, operationID, "remote-apply-a", ""))
 
 	got, err := store.ApplyOperations().Get(ctx, operationID)
 	require.NoError(t, err)
@@ -180,7 +157,7 @@ func TestApplyOperationStore_SaveExternalIDRefusesDeploymentConflict(t *testing.
 			})
 			require.NoError(t, err)
 
-			err = store.ApplyOperations().SaveExternalID(ctx, apply.ID, operationID, "remote-apply-other")
+			err = store.ApplyOperations().SaveExternalID(ctx, apply.ID, operationID, "remote-apply-other", "")
 			require.ErrorIs(t, err, storage.ErrRemoteApplyDeploymentIDConflict)
 			assert.Contains(t, err.Error(), `"remote-apply-a"`)
 			assert.Contains(t, err.Error(), `"remote-apply-other"`)
@@ -214,7 +191,7 @@ func TestApplyOperationStore_SaveExternalIDRefusesReplayWhenSiblingsDiverged(t *
 	})
 	require.NoError(t, err)
 
-	err = store.ApplyOperations().SaveExternalID(ctx, apply.ID, operationID, "remote-apply-other")
+	err = store.ApplyOperations().SaveExternalID(ctx, apply.ID, operationID, "remote-apply-other", "")
 	require.ErrorIs(t, err, storage.ErrRemoteApplyDeploymentIDConflict)
 
 	got, err := store.ApplyOperations().Get(ctx, operationID)
@@ -240,7 +217,7 @@ func TestApplyOperationStore_SaveExternalIDRefusesForeignOperation(t *testing.T)
 	})
 	require.NoError(t, err)
 
-	err = store.ApplyOperations().SaveExternalID(ctx, apply.ID, operationID, "remote-apply-a")
+	err = store.ApplyOperations().SaveExternalID(ctx, apply.ID, operationID, "remote-apply-a", "")
 	require.ErrorIs(t, err, storage.ErrApplyOperationNotFound)
 
 	got, err := store.ApplyOperations().Get(ctx, operationID)
@@ -289,11 +266,11 @@ func TestApplyOperationStore_WritesStampUpdatedAt(t *testing.T) {
 		{"state transition", func(t *testing.T) {
 			require.NoError(t, store.ApplyOperations().UpdateState(ctx, operationID, state.ApplyOperation.Running))
 		}},
-		{"save external operation id", func(t *testing.T) {
-			require.NoError(t, store.ApplyOperations().SaveExternalOperationID(ctx, operationID, "remote-operation-1"))
-		}},
 		{"save external id", func(t *testing.T) {
-			require.NoError(t, store.ApplyOperations().SaveExternalID(ctx, apply.ID, operationID, "remote-apply-1"))
+			require.NoError(t, store.ApplyOperations().SaveExternalID(ctx, apply.ID, operationID, "remote-apply-1", ""))
+		}},
+		{"save external id with its remote operation", func(t *testing.T) {
+			require.NoError(t, store.ApplyOperations().SaveExternalID(ctx, apply.ID, operationID, "remote-apply-1", "remote-operation-1"))
 		}},
 		{"save engine resume state", func(t *testing.T) {
 			require.NoError(t, store.ApplyOperations().SaveEngineResumeState(ctx, operationID, &storage.EngineResumeState{
@@ -303,7 +280,7 @@ func TestApplyOperationStore_WritesStampUpdatedAt(t *testing.T) {
 			}))
 		}},
 		{"identical-value replay", func(t *testing.T) {
-			require.NoError(t, store.ApplyOperations().SaveExternalID(ctx, apply.ID, operationID, "remote-apply-1"))
+			require.NoError(t, store.ApplyOperations().SaveExternalID(ctx, apply.ID, operationID, "remote-apply-1", ""))
 		}},
 	}
 	for _, w := range writes {
@@ -1262,9 +1239,9 @@ func TestApplyOperationStore_FindNextApplyOperation_TerminalParentDoesNotBlockNe
 
 // TestApplyOperationStore_FindNextApplyOperation_StoppedParentResumesThroughStoppedRow
 // verifies the resume path for a stopped rollout with a not-yet-started sibling
-// under a parallel cutover policy (which has no earlier-sibling gate, so the
-// parent's state is the only thing standing between the pending row and a
-// claim). A pending start request makes the stopped apply claimable again, and
+// under a parallel cutover policy (which leaves copy starts unordered when no
+// earlier member has failed, so only the parent's state holds the pending row).
+// A pending start request makes the stopped apply claimable again, and
 // the whole rollout resumes with it: the stopped operation — the row that was
 // already under way — is claimed first, and the not-yet-started sibling is
 // claimable behind it.
@@ -3651,42 +3628,119 @@ func TestApplyOperationStore_FindNextApplyOperation_ParallelClaimsPastRunningSib
 	assert.Equal(t, "region-b", claimed.Deployment)
 }
 
-// TestApplyOperationStore_FindNextApplyOperation_ParallelClaimsPastFailedSibling
-// verifies that parallel drops copy-phase ordering entirely: a terminal-failed
-// earlier sibling does not block a later deployment's copy start, because the
-// copy gate has no earlier-sibling arm for parallel at all. Cutover ordering
-// (where halt-on-failure still applies) is enforced separately on the cutover
-// claim path.
-func TestApplyOperationStore_FindNextApplyOperation_ParallelClaimsPastFailedSibling(t *testing.T) {
-	clearTables(t)
-	ctx := t.Context()
-	store := NewMySQL(testDB)
+// TestApplyOperationStore_FindNextApplyOperation_DispatchedApplyLeavesMemberOrderToTheDispatcher
+// verifies that the copy-start gate between rollout members applies only
+// where the members were ordered: on an apply a dispatcher created (it carries
+// the dispatch's idempotency key), each member target arrives as its own
+// dispatch once the dispatcher has decided it may start, under the default
+// rolling policy the data plane's operations carry. Gating it again here
+// would serialize a parallel rollout and could strand a member behind a
+// sibling the dispatcher has already let fail. A keyless apply keeps the gate.
+func TestApplyOperationStore_FindNextApplyOperation_DispatchedApplyLeavesMemberOrderToTheDispatcher(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		idempotencyKey string
+		wantClaimed    bool
+	}{
+		{name: "apply ordered here", wantClaimed: false},
+		{name: "dispatched apply", idempotencyKey: "schemabot:v1:dispatched", wantClaimed: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			clearTables(t)
+			ctx := t.Context()
+			store := NewMySQL(testDB)
 
-	lock := createTestLock(t, store, "testdb", "mysql")
-	apply := createTestApply(t, store, lock, "apply_op_parallel_failed", 1)
+			lock := createTestLock(t, store, "testdb", "mysql")
+			apply := createTestApply(t, store, lock, "apply_op_member_order", 1)
+			if tc.idempotencyKey != "" {
+				_, err := testDB.ExecContext(ctx, `UPDATE applies SET idempotency_key = ? WHERE id = ?`, tc.idempotencyKey, apply.ID)
+				require.NoError(t, err)
+			}
 
-	failedID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
-		ApplyID: apply.ID, Deployment: "region-a",
-		State: state.ApplyOperation.Failed, CutoverPolicy: storage.CutoverPolicyParallel,
-	})
-	require.NoError(t, err)
-	regionBID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
-		ApplyID: apply.ID, Deployment: "region-b", CutoverPolicy: storage.CutoverPolicyParallel,
-	})
-	require.NoError(t, err)
+			// payments-001 is still copying (running, fresh so not
+			// stale-reclaimable); payments-002 is pending behind it. Both
+			// leave CutoverPolicy unset, so it resolves to rolling.
+			_, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+				ApplyID: apply.ID, Deployment: "default", Target: "payments-001", OperationKey: "payments-001",
+				State: state.ApplyOperation.Running,
+			})
+			require.NoError(t, err)
+			secondID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+				ApplyID: apply.ID, Deployment: "default", Target: "payments-002", OperationKey: "payments-002",
+			})
+			require.NoError(t, err)
 
-	// Backdate the failed row so staleness can't be confused with the reason the
-	// later row is claimable; parallel claims past it on copy regardless.
-	_, err = testDB.ExecContext(ctx, `
-		UPDATE apply_operations SET updated_at = NOW() - INTERVAL 1 HOUR WHERE id = ?
-	`, failedID)
-	require.NoError(t, err)
+			claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
+			require.NoError(t, err)
+			if !tc.wantClaimed {
+				assert.Nil(t, claimed, "a rolling member of an apply ordered here waits for the earlier member to complete")
+				return
+			}
+			require.NotNil(t, claimed, "a dispatched member starts when it arrives; the dispatcher already ordered it")
+			assert.Equal(t, secondID, claimed.ID)
+			assert.Equal(t, "payments-002", claimed.Target)
+		})
+	}
+}
 
-	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
-	require.NoError(t, err)
-	require.NotNil(t, claimed, "parallel must let a later deployment copy past a failed earlier sibling")
-	assert.Equal(t, regionBID, claimed.ID)
-	assert.Equal(t, "region-b", claimed.Deployment)
+// TestApplyOperationStore_FindNextApplyOperation_DispatchedMemberFinalizerLeavesMemberOrderToTheDispatcher
+// verifies the finalizer start gate's half of the same rule. payments-002's
+// work has completed and its group_finalizer is pending while payments-001 is
+// still copying. On an apply a dispatcher created, payments-002's finalizer
+// starts, since the dispatcher already ordered the members; on an apply
+// ordered here it waits for payments-001. Either way it still waits for its
+// own target's work, which member order never relaxes.
+func TestApplyOperationStore_FindNextApplyOperation_DispatchedMemberFinalizerLeavesMemberOrderToTheDispatcher(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		idempotencyKey string
+		ownWorkState   string
+		wantClaimed    bool
+	}{
+		{name: "apply ordered here", ownWorkState: state.ApplyOperation.Completed, wantClaimed: false},
+		{name: "dispatched apply", idempotencyKey: "schemabot:v1:dispatched", ownWorkState: state.ApplyOperation.Completed, wantClaimed: true},
+		{name: "dispatched apply with its own work still copying", idempotencyKey: "schemabot:v1:dispatched", ownWorkState: state.ApplyOperation.Running, wantClaimed: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			clearTables(t)
+			ctx := t.Context()
+			store := NewMySQL(testDB)
+
+			lock := createTestLock(t, store, "testdb", "mysql")
+			apply := createTestApply(t, store, lock, "apply_op_member_finalizer_order", 1)
+			if tc.idempotencyKey != "" {
+				_, err := testDB.ExecContext(ctx, `UPDATE applies SET idempotency_key = ? WHERE id = ?`, tc.idempotencyKey, apply.ID)
+				require.NoError(t, err)
+			}
+
+			_, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+				ApplyID: apply.ID, Deployment: "default", Target: "payments-001", OperationKey: "payments-001",
+				State: state.ApplyOperation.Running,
+			})
+			require.NoError(t, err)
+			_, err = store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+				ApplyID: apply.ID, Deployment: "default", Target: "payments-002", OperationKey: "payments-002",
+				State: tc.ownWorkState,
+			})
+			require.NoError(t, err)
+			finalizerID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+				ApplyID: apply.ID, Deployment: "default", Target: "payments-002",
+				OperationKey:  storage.TargetOperationKey("payments-002", "group_finalizer"),
+				OperationKind: storage.ApplyOperationKindGroupFinalizer,
+			})
+			require.NoError(t, err)
+
+			claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
+			require.NoError(t, err)
+			if !tc.wantClaimed {
+				assert.Nil(t, claimed, "payments-002's finalizer must wait")
+				return
+			}
+			require.NotNil(t, claimed, "a dispatched member's finalizer starts once its own work has completed")
+			assert.Equal(t, finalizerID, claimed.ID)
+			assert.Equal(t, storage.ApplyOperationKindGroupFinalizer, claimed.OperationKind)
+		})
+	}
 }
 
 // TestApplyOperationStore_FindNextApplyOperation_BarrierHaltsOnFailedSibling

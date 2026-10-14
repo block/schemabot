@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"slices"
 	"sort"
 	"strings"
@@ -62,6 +63,8 @@ func (s *Service) pullTargetSchema(
 		span.SetStatus(otelcodes.Error, "resolve tern client failed")
 		return nil, fmt.Errorf("database %q (%s): %w", req.Database, req.Environment, err)
 	}
+
+	namespaces = s.memberPullNamespaces(req, target, namespaces)
 
 	isRemoteTarget := client.IsRemote()
 	s.logger.Info("ExecutePullSchema: calling PullSchema",
@@ -135,6 +138,93 @@ func (s *Service) pullTargetSchema(
 	return merged, nil
 }
 
+// memberPullNamespaces narrows the namespaces a pull asks one target for to the
+// namespaces its targets entry selects. A target that selects none is pulled
+// exactly as requested.
+//
+// A pull of every namespace becomes one call per selected namespace, so the
+// data plane is asked for names rather than left to discover them: the
+// selection outranks a live scan, and a target DSN bound to a different
+// database refuses a named namespace instead of answering with its own. An
+// explicitly requested namespace the target does not select is left out, since
+// the configuration does not place it there.
+func (s *Service) memberPullNamespaces(req apitypes.PullSchemaRequest, target routing.ExecutionTarget, namespaces []string) []string {
+	if len(target.Namespaces) == 0 {
+		return namespaces
+	}
+	if len(namespaces) == 1 && namespaces[0] == "" {
+		return slices.Clone(target.Namespaces)
+	}
+	selected := make([]string, 0, len(namespaces))
+	for _, namespace := range namespaces {
+		if !slices.Contains(target.Namespaces, namespace) {
+			s.logger.Info("pull skips a requested namespace the target's entry does not select",
+				"database", req.Database,
+				"environment", req.Environment,
+				"deployment", target.Deployment,
+				"target", target.Target,
+				"namespace", namespace,
+				"selected_namespaces", target.Namespaces)
+			continue
+		}
+		selected = append(selected, namespace)
+	}
+	return selected
+}
+
+// requireSelectablePullNamespaces refuses an explicitly requested namespace that
+// no targets entry of the environment selects. When every entry selects
+// namespaces, their union is every namespace the environment places, so a name
+// outside it is one no target would be asked for: answering with an empty
+// schema would read as a namespace that exists and holds no tables. An entry
+// selecting nothing holds every namespace, so an environment with one places
+// any name, and a pull of every namespace names none to check.
+func requireSelectablePullNamespaces(req apitypes.PullSchemaRequest, targets []routing.ExecutionTarget, namespaces []string) error {
+	if len(namespaces) == 1 && namespaces[0] == "" {
+		return nil
+	}
+	selectable := map[string]bool{}
+	for _, target := range targets {
+		if len(target.Namespaces) == 0 {
+			return nil
+		}
+		for _, namespace := range target.Namespaces {
+			selectable[namespace] = true
+		}
+	}
+	var unselected []string
+	for _, namespace := range namespaces {
+		if !selectable[namespace] {
+			unselected = append(unselected, namespace)
+		}
+	}
+	if len(unselected) == 0 {
+		return nil
+	}
+	return &UnselectedPullNamespaceError{
+		Database:    req.Database,
+		Environment: req.Environment,
+		Namespaces:  unselected,
+		Selectable:  slices.Sorted(maps.Keys(selectable)),
+	}
+}
+
+// UnselectedPullNamespaceError reports requested pull namespaces that no targets
+// entry of the environment selects.
+type UnselectedPullNamespaceError struct {
+	Database    string
+	Environment string
+	// Namespaces are the requested namespaces no entry selects, in request order.
+	Namespaces []string
+	// Selectable are the namespaces the environment's entries select, sorted.
+	Selectable []string
+}
+
+func (e *UnselectedPullNamespaceError) Error() string {
+	return fmt.Sprintf("database %q environment %q has no targets entry selecting namespaces [%s]; the selectable namespaces are [%s]",
+		e.Database, e.Environment, strings.Join(e.Namespaces, ", "), strings.Join(e.Selectable, ", "))
+}
+
 // pullMemberDivergence reports every rollout member of an environment whose
 // members hold their own schemas: the primary, marked as such and carrying no
 // comparison of its own, and each other member with how its live schema differs
@@ -188,6 +278,13 @@ func (s *Service) pullMemberDivergence(
 	if !containsMember(targets, primary) {
 		return nil, fmt.Errorf("pull for %s/%s resolves rollout members %s, which do not include the primary %s the schema was pulled from; the environment's routing changed during the pull, so re-run it",
 			req.Database, req.Environment, memberIDs(targets), primary.MemberID())
+	}
+	// The primary was pulled for the namespaces its entry selected in the
+	// caller's read. A reload that re-placed them would compare that schema with
+	// members pulled under the new placement, so it fails the same way.
+	if current := memberNamespaces(targets, primary); !slices.Equal(current, primary.Namespaces) {
+		return nil, fmt.Errorf("pull for %s/%s pulled the primary %s for namespaces [%s], but it now selects [%s]; the environment's placement changed during the pull, so re-run it",
+			req.Database, req.Environment, primary.MemberID(), strings.Join(primary.Namespaces, ", "), strings.Join(current, ", "))
 	}
 
 	dialect := schema.DialectForDatabaseType(primary.DatabaseType)
@@ -254,6 +351,17 @@ func containsMember(targets []routing.ExecutionTarget, want routing.ExecutionTar
 	return slices.ContainsFunc(targets, func(target routing.ExecutionTarget) bool {
 		return target.MemberID() == want.MemberID()
 	})
+}
+
+// memberNamespaces returns the namespace selection one member has in a member
+// set. The caller has already checked that the member is present.
+func memberNamespaces(targets []routing.ExecutionTarget, want routing.ExecutionTarget) []string {
+	for _, target := range targets {
+		if target.MemberID() == want.MemberID() {
+			return target.Namespaces
+		}
+	}
+	return nil
 }
 
 // memberIDs names a member set for an error message.

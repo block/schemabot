@@ -18,11 +18,13 @@ import (
 func TestReconfiguredProfile(t *testing.T) {
 	oidc := &client.OIDCLogin{Issuer: "https://issuer.example.com", ClientID: "schemabot-cli", RedirectPort: 8765}
 	loggedIn := client.Profile{
-		Endpoint:     "https://schemabot.example.com",
-		Token:        "id-token",
-		RefreshToken: "refresh-token",
-		TokenExpiry:  1_900_000_000,
-		OIDC:         oidc,
+		Endpoint:      "https://schemabot.example.com",
+		Token:         "id-token",
+		RefreshToken:  "refresh-token",
+		TokenExpiry:   1_900_000_000,
+		TokenIssuer:   "https://flag-issuer.example.com",
+		TokenClientID: "flag-client",
+		OIDC:          oidc,
 	}
 
 	t.Run("same endpoint keeps the cached login and oidc settings", func(t *testing.T) {
@@ -40,6 +42,8 @@ func TestReconfiguredProfile(t *testing.T) {
 		assert.Empty(t, profile.Token)
 		assert.Empty(t, profile.RefreshToken)
 		assert.Zero(t, profile.TokenExpiry)
+		assert.Empty(t, profile.TokenIssuer)
+		assert.Empty(t, profile.TokenClientID)
 		assert.Equal(t, oidc, profile.OIDC)
 	})
 

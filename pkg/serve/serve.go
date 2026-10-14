@@ -1005,7 +1005,7 @@ func (s *Server) Handler() http.Handler {
 	s.svc.ConfigureRoutes(mux)
 	mux.Handle("POST /webhook", s.webhook.handler)
 
-	authedHandler := s.authz.Middleware(mux)
+	authedHandler := withMatchedRoute(mux, s.authz.Middleware(mux))
 
 	// Wrap with OTel HTTP instrumentation for automatic request duration,
 	// request body size, and response body size metrics.
@@ -1015,6 +1015,23 @@ func (s *Server) Handler() http.Handler {
 		authedHandler.ServeHTTP(w, r)
 	})
 	return otelhttp.NewHandler(metricHandler, "schemabot")
+}
+
+// withMatchedRoute records the mux pattern a request matches before the auth
+// middleware sees it, so the OTel HTTP metrics carry the route of every
+// endpoint. The middleware hands the mux a copy of the request carrying the
+// verified caller, and the mux records the pattern on that copy, which the
+// instrumentation never sees. A request the middleware rejects is labeled with
+// its route too, so a burst of 401s names the endpoint it hit. A request that
+// matches no route carries no route, even when an embedder's outer mux already
+// recorded the pattern this handler is mounted under. The request written here
+// is the copy the OTel handler made, so an embedder's own request keeps its
+// pattern.
+func withMatchedRoute(mux *http.ServeMux, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, r.Pattern = mux.Handler(r)
+		next.ServeHTTP(w, r)
+	})
 }
 
 // MetricsHandler returns the Prometheus /metrics handler. Run serves it on the
@@ -1300,10 +1317,10 @@ func serverEngineMetadata(config *api.ServerConfig, resolved map[string]string, 
 			metadata[key] = value
 		}
 	}
-	// The direct execution keys are one policy, not three independent
+	// The direct execution keys are one policy, not independent
 	// defaults: a resolved target that states any of them states the whole
 	// policy, and the server-wide one does not apply. Merging key by key
-	// would let a target enable direct execution while taking its row bound
+	// would let a target enable direct execution while taking its size bound
 	// from somewhere else, which is the pairing the bound exists to prevent.
 	if !hasDirectExecutionPolicy(metadata) {
 		maps.Copy(metadata, directMetadata)
@@ -1314,11 +1331,7 @@ func serverEngineMetadata(config *api.ServerConfig, resolved map[string]string, 
 // hasDirectExecutionPolicy reports whether resolved target metadata already
 // states a direct execution policy of its own.
 func hasDirectExecutionPolicy(metadata map[string]string) bool {
-	for _, key := range []string{
-		engine.MetadataDirectExecution,
-		engine.MetadataDirectExecutionMaxTableRows,
-		engine.MetadataDirectExecutionLockAcquisitionTimeoutSeconds,
-	} {
+	for _, key := range engine.DirectExecutionKeys() {
 		if _, ok := metadata[key]; ok {
 			return true
 		}
@@ -1334,23 +1347,24 @@ func buildWebhookRuntime(serverConfig *api.ServerConfig, svc *api.Service, logge
 }
 
 func buildSingleAppWebhookRuntime(serverConfig *api.ServerConfig, svc *api.Service, logger *slog.Logger) (webhookRuntime, error) {
-	if !serverConfig.GitHub.Configured() {
-		if serverConfig.GitHub.PrivateKey != "" {
-			logger.Warn("GitHub App config found but credentials not available yet — webhook endpoint disabled")
-		}
-		return webhookRuntime{handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusServiceUnavailable)
-			if _, err := w.Write([]byte(`{"error":"GitHub App credentials not available — webhook endpoint is disabled"}`)); err != nil {
-				logger.Error("failed to write disabled webhook response", "method", r.Method, "path", r.URL.Path, "error", err)
-			}
-		})}, nil
+	// The credentials are resolved once and the outcome decides the runtime.
+	// An App that is not configured, or whose credentials are declared but not
+	// available yet, serves a disabled endpoint. A malformed app ID is a
+	// configuration error, not credentials still on their way, so it fails
+	// startup rather than serving with GitHub disabled.
+	creds, err := serverConfig.GitHub.ResolveCredentials()
+	switch {
+	case err == nil:
+	case errors.Is(err, api.ErrGitHubAppNotConfigured):
+		logger.Info("GitHub App not configured — webhook endpoint disabled")
+		return disabledWebhookRuntime(logger), nil
+	case errors.Is(err, api.ErrGitHubAppCredentialsUnavailable):
+		logger.Warn("GitHub App config found but credentials not available yet — webhook endpoint disabled", "error", err)
+		return disabledWebhookRuntime(logger), nil
+	default:
+		return webhookRuntime{}, fmt.Errorf("github: %w", err)
 	}
 
-	ghPrivateKey, err := serverConfig.GitHub.ResolvePrivateKey()
-	if err != nil {
-		return webhookRuntime{}, fmt.Errorf("resolve GitHub private key: %w", err)
-	}
 	ghWebhookSecret, err := serverConfig.GitHub.ResolveWebhookSecret()
 	if err != nil {
 		return webhookRuntime{}, fmt.Errorf("resolve GitHub webhook secret: %w", err)
@@ -1364,8 +1378,7 @@ func buildSingleAppWebhookRuntime(serverConfig *api.ServerConfig, svc *api.Servi
 		return webhookRuntime{}, fmt.Errorf("resolve GitHub repo-webhook secret: %w", err)
 	}
 
-	appID := serverConfig.GitHub.ResolveAppID()
-	ghClient := ghclient.NewClient(appID, []byte(ghPrivateKey), logger,
+	ghClient := ghclient.NewClient(creds.AppID, []byte(creds.PrivateKey), logger,
 		ghclient.WithTrustedCheckAppSlugs(serverConfig.GitHub.TrustedCheckAppSlugs),
 		ghclient.WithConfigDirHints(serverConfig))
 	handlerOpts := append([]webhook.HandlerOption{
@@ -1378,7 +1391,7 @@ func buildSingleAppWebhookRuntime(serverConfig *api.ServerConfig, svc *api.Servi
 	handler := webhook.NewHandler(svc, ghClient, []byte(ghWebhookSecret), logger, handlerOpts...)
 	svc.SetCheckRunBackfiller(handler)
 	logger.Info("GitHub webhook endpoint registered",
-		"app_id", appID, "trusted_check_app_slugs", serverConfig.GitHub.TrustedCheckAppSlugs,
+		"app_id", creds.AppID, "trusted_check_app_slugs", serverConfig.GitHub.TrustedCheckAppSlugs,
 		"repo_webhook_dispatch", repoWebhookSecret != "")
 	return webhookRuntime{
 		startDurableWebhookDispatch:     handler.StartDurableWebhookDispatch,
@@ -1387,6 +1400,18 @@ func buildSingleAppWebhookRuntime(serverConfig *api.ServerConfig, svc *api.Servi
 		handler:                         handler,
 		reconcileMissingSummaryComments: handler.ReconcileMissingSummaryComments,
 	}, nil
+}
+
+// disabledWebhookRuntime serves the webhook path while GitHub is off: every
+// request is answered 503 so a delivery is refused rather than dropped.
+func disabledWebhookRuntime(logger *slog.Logger) webhookRuntime {
+	return webhookRuntime{handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		if _, err := w.Write([]byte(`{"error":"GitHub App credentials not available — webhook endpoint is disabled"}`)); err != nil {
+			logger.Error("failed to write disabled webhook response", "method", r.Method, "path", r.URL.Path, "error", err)
+		}
+	})}
 }
 
 // buildMultiAppWebhookRuntime constructs a webhook handler that dispatches

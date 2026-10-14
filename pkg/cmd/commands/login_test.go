@@ -129,6 +129,54 @@ func TestLoginCmdRunCachesToken(t *testing.T) {
 	assert.Equal(t, "https://other.example", reloaded.Profiles["other"].Endpoint)
 }
 
+// Logging in with --issuer and --client-id records that issuer and client ID
+// next to the cached tokens, so later commands renew the refresh token where it
+// was issued. A second login against another issuer replaces the pair along with
+// the tokens. The profile's own oidc settings are left as the operator wrote them.
+func TestLoginCmdRunRecordsTokenIssuer(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("SCHEMABOT_PROFILE", "")
+
+	configured := &client.OIDCLogin{Issuer: "https://issuer.example", ClientID: "cli-client", RedirectPort: 9999}
+	require.NoError(t, client.SaveConfig(&client.Config{
+		DefaultProfile: "default",
+		Profiles: map[string]client.Profile{
+			"default": {Endpoint: "https://schemabot.example", OIDC: configured},
+		},
+	}))
+
+	login := func(issuer, clientID, refreshToken string) {
+		t.Helper()
+		cmd := &LoginCmd{
+			Issuer:   issuer,
+			ClientID: clientID,
+			loginFn: func(context.Context, client.LoginConfig, client.BrowserOpener) (*client.LoginResult, error) {
+				return &client.LoginResult{IDToken: fakeIDToken(t, map[string]any{"sub": "dev"}), RefreshToken: refreshToken}, nil
+			},
+			openBrowser: func(string) error { return nil },
+		}
+		require.NoError(t, cmd.Run(&Globals{}))
+	}
+
+	login("https://flag-issuer.example", "flag-client", "flag-refresh-token")
+	reloaded, err := client.LoadConfig()
+	require.NoError(t, err)
+	saved := reloaded.Profiles["default"]
+	assert.Equal(t, "flag-refresh-token", saved.RefreshToken)
+	assert.Equal(t, "https://flag-issuer.example", saved.TokenIssuer)
+	assert.Equal(t, "flag-client", saved.TokenClientID)
+	assert.Equal(t, configured, saved.OIDC)
+
+	login("", "", "configured-refresh-token")
+	reloaded, err = client.LoadConfig()
+	require.NoError(t, err)
+	saved = reloaded.Profiles["default"]
+	assert.Equal(t, "configured-refresh-token", saved.RefreshToken)
+	assert.Equal(t, "https://issuer.example", saved.TokenIssuer)
+	assert.Equal(t, "cli-client", saved.TokenClientID)
+	assert.Equal(t, configured, saved.OIDC)
+}
+
 // Without OIDC settings on the profile and no flags, login fails with a clear
 // configuration error rather than opening a browser.
 func TestLoginCmdRunMissingOIDCErrors(t *testing.T) {

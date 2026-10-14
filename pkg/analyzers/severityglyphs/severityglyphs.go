@@ -8,6 +8,10 @@
 // beside them (🛑), naming the member each one collapses into, so a sixth
 // level cannot enter through a glyph the vocabulary never defined.
 //
+// The vocabulary's one non-severity member, the documentation pointer 📖, is
+// flagged the same way: it shares the package so every surface renders the
+// same glyph, and a literal spelled at a rendering site would let it drift.
+//
 // The analyzer inspects decoded string values, so escape-spelled glyphs
 // (e.g. "❌") are caught the same as literal ones. It matches on the
 // base codepoints (⚠ U+26A0, ℹ U+2139), so variation-selector forms are
@@ -56,13 +60,23 @@ var severityGlyphs = []struct {
 	{"🛑", "glyph.Attention"},
 }
 
+// vocabularyGlyphs are the package's members that are not severities. They
+// are reported under their own name so the diagnostic does not call a glyph a
+// severity when the vocabulary says it is not.
+var vocabularyGlyphs = []struct {
+	glyph    string
+	constant string
+}{
+	{"📖", "glyph.Docs"},
+}
+
 // Analyzer flags string literals containing a severity glyph in non-test
 // source files. Test files are skipped because assertions on rendered output
 // deliberately pin the literal glyphs — they must break when the vocabulary
 // drifts.
 var Analyzer = &analysis.Analyzer{
 	Name:     "severityglyphs",
-	Doc:      "flags severity glyph literals (🚨 ⛔ ❌ ⚠️ ℹ️), and glyphs that read as severity without being vocabulary members (🛑), in non-test files; use the named pkg/glyph constants (callers exclude pkg/glyph itself from the package set)",
+	Doc:      "flags severity glyph literals (🚨 ⛔ ❌ ⚠️ ℹ️), glyphs that read as severity without being vocabulary members (🛑), and the documentation glyph (📖), in non-test files; use the named pkg/glyph constants (callers exclude pkg/glyph itself from the package set)",
 	Requires: []*analysis.Analyzer{inspect.Analyzer},
 	Run:      run,
 }
@@ -87,6 +101,11 @@ func run(pass *analysis.Pass) (any, error) {
 		for _, sg := range severityGlyphs {
 			if strings.Contains(val, sg.glyph) {
 				pass.Reportf(lit.Pos(), "severity glyph %s in string literal — use %s from pkg/glyph", sg.glyph, sg.constant)
+			}
+		}
+		for _, vg := range vocabularyGlyphs {
+			if strings.Contains(val, vg.glyph) {
+				pass.Reportf(lit.Pos(), "documentation glyph %s in string literal — use %s from pkg/glyph", vg.glyph, vg.constant)
 			}
 		}
 	})

@@ -3,6 +3,7 @@ package api
 import (
 	"encoding/json"
 	"log/slog"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -72,6 +73,34 @@ func TestProgressResponseFromProtoCarriesTableETA(t *testing.T) {
 	assert.Equal(t, int64(500000), decoded.Tables[0].RowsTotal)
 	assert.Equal(t, int32(50), decoded.Tables[0].PercentComplete)
 	assert.Equal(t, int64(540), decoded.Tables[0].ETASeconds)
+}
+
+// A table's planned size travels from the progress proto through the HTTP
+// response as estimated_bytes, and a table without one omits the field rather
+// than reporting a zero-byte table.
+func TestProgressResponseFromProtoCarriesTableSize(t *testing.T) {
+	bytes := int64(23_400_000_000)
+	resp := progressResponseFromProto(&ternv1.ProgressResponse{
+		State:  ternv1.State_STATE_RUNNING,
+		Engine: ternv1.Engine_ENGINE_SPIRIT,
+		Tables: []*ternv1.TableProgress{
+			{TableName: "orders", Namespace: "testdb", Status: "running", RowsTotal: 48_200_000, EstimatedBytes: &bytes},
+			{TableName: "users", Namespace: "testdb", Status: "running", RowsTotal: 1000},
+		},
+	})
+
+	require.Len(t, resp.Tables, 2)
+	require.NotNil(t, resp.Tables[0].EstimatedBytes)
+	assert.Equal(t, bytes, *resp.Tables[0].EstimatedBytes)
+	assert.Nil(t, resp.Tables[1].EstimatedBytes)
+
+	encoded, err := json.Marshal(resp.Tables)
+	require.NoError(t, err)
+	var decoded []map[string]any
+	require.NoError(t, json.Unmarshal(encoded, &decoded))
+	require.Len(t, decoded, 2)
+	assert.InDelta(t, float64(bytes), decoded[0]["estimated_bytes"], 0)
+	assert.NotContains(t, decoded[1], "estimated_bytes")
 }
 
 func statusFoldService() *Service {
@@ -188,6 +217,47 @@ func TestProgressOperationsCarryOperationKey(t *testing.T) {
 	assert.Equal(t, "commerce/80-/users", decoded.Operations[1].OperationKey)
 }
 
+// A target the apply recorded as already holding the change keeps that mark in
+// the progress response and its JSON encoding, so a client tells it apart from
+// a completed operation that never started for another reason, such as one a
+// reaper settled to its apply's outcome.
+func TestProgressOperationsCarryAlreadyConverged(t *testing.T) {
+	ops := []*storage.ApplyOperation{
+		{ID: 1, Deployment: "primary", Target: "testapp-001", State: state.ApplyOperation.Completed, AlreadyConverged: true},
+		{ID: 2, Deployment: "primary", Target: "testapp-002", State: state.ApplyOperation.Completed},
+	}
+
+	responses, _ := progressOperationsFromRows(ops)
+	require.Len(t, responses, 2)
+	assert.True(t, responses[0].AlreadyConverged)
+	assert.False(t, responses[1].AlreadyConverged)
+
+	encoded, err := json.Marshal(responses)
+	require.NoError(t, err)
+	assert.Equal(t, 1, strings.Count(string(encoded), `"already_converged":true`), string(encoded))
+}
+
+// A row of a rollout run table by table keeps its table step in the progress
+// response and its JSON encoding, which is what folds a target's rows into one
+// member and counts the rollout in tables. A row of a member's whole change
+// omits the field.
+func TestProgressOperationsCarryRolloutStep(t *testing.T) {
+	ops := []*storage.ApplyOperation{
+		{ID: 1, Deployment: "primary", Target: "testapp-001", State: state.ApplyOperation.Running, RolloutStep: 2},
+		{ID: 2, Deployment: "primary", Target: "testapp-002", State: state.ApplyOperation.Pending},
+	}
+
+	responses, _ := progressOperationsFromRows(ops)
+	require.Len(t, responses, 2)
+	assert.Equal(t, 2, responses[0].RolloutStep)
+	assert.Equal(t, 0, responses[1].RolloutStep)
+
+	encoded, err := json.Marshal(responses)
+	require.NoError(t, err)
+	assert.Equal(t, 1, strings.Count(string(encoded), `"rollout_step":2`), string(encoded))
+	assert.Equal(t, 1, strings.Count(string(encoded), `"rollout_step"`), "a row of a member's whole change omits the step: %s", encoded)
+}
+
 // The operation-id map that attributes tasks to rollout members carries the
 // whole routing pair. One deployment can address several targets, each copying
 // the same tables against its own schema, so a task attributed to the deployment
@@ -222,4 +292,20 @@ func TestTableProgressResponseEncodesTarget(t *testing.T) {
 	require.NoError(t, json.Unmarshal(encoded, &decoded))
 	require.Len(t, decoded.Tables, 1)
 	assert.Equal(t, "testapp-002", decoded.Tables[0].Target)
+}
+
+// Every engine the data plane can report has a display name, so a plan or
+// progress response never names its engine "Unknown".
+func TestEngineNameNamesEveryEngine(t *testing.T) {
+	want := map[ternv1.Engine]string{
+		ternv1.Engine_ENGINE_SPIRIT:      "Spirit",
+		ternv1.Engine_ENGINE_PLANETSCALE: "PlanetScale",
+		ternv1.Engine_ENGINE_STRATA:      "Strata",
+		ternv1.Engine_ENGINE_POSTGRES:    "PostgreSQL",
+	}
+	require.Len(t, want, len(ternv1.Engine_name), "every proto engine needs an expected display name here")
+	for value := range ternv1.Engine_name {
+		engine := ternv1.Engine(value)
+		assert.Equal(t, want[engine], engineName(engine), "engine %s", engine)
+	}
 }

@@ -6,7 +6,7 @@
 
 - [Schema Directory Structure](#schema-directory-structure)
 - [Where to Put the Schema Directory](#where-to-put-the-schema-directory)
-- [`$ENV` Substitution in Namespace Names](#env-substitution-in-namespace-names)
+- [Environment Substitution in Namespace Names](#environment-substitution-in-namespace-names)
 - [Ignoring Namespaces](#ignoring-namespaces)
 - [Ignoring Tables](#ignoring-tables)
 - [Per-Target Schema Overrides](#per-target-schema-overrides)
@@ -129,7 +129,10 @@ SchemaBot plans all keyspaces together — a single plan can contain changes acr
 A plan can have DDL-only changes, VSchema-only changes, or both.
 
 A VSchema change that removes a vindex, a table routing entry, or a table's
-column-vindex association is an unsafe change and requires the same
+column-vindex association, or that changes a vindex definition, the
+keyspace's `sharded` flag, or a table's type, primary vindex, or
+`auto_increment`, is an
+unsafe change and requires the same
 `--allow-unsafe` acknowledgment as destructive DDL — see
 [lint-and-safety-levels.md](./lint-and-safety-levels.md#what-unsafe-means).
 
@@ -224,9 +227,9 @@ an established home. Relocating is worth it only if the points above start to
 bite — packaging dead weight, confusion next to imperative change scripts, or
 allowlist/CODEOWNERS churn — and can be done later as a follow-up.
 
-## `$ENV` Substitution in Namespace Names
+## Environment Substitution in Namespace Names
 
-Some infrastructure names schemas with an environment suffix: `bikeshare_staging` in staging, `bikeshare_production` in production. Rather than maintaining separate directories for each environment, you can use `$ENV` in the directory name. When an environment is specified (via `-e`), `$ENV` is replaced with the environment value.
+Some infrastructure names schemas with an environment suffix: `bikeshare_staging` in staging, `bikeshare_production` in production. Rather than maintaining separate directories for each environment, use `{env}` in the directory name. When an environment is specified (via `-e`), `{env}` is replaced with the environment value. Existing `$ENV` directories remain supported.
 
 ### Example
 
@@ -235,7 +238,7 @@ Directory structure:
 ```
 myapp/schema/
 ├── schemabot.yaml
-└── bikeshare_$ENV/
+└── bikeshare_{env}/
     ├── bikes.sql
     └── stations.sql
 ```
@@ -252,11 +255,12 @@ schemabot plan -s myapp/schema -e production
 
 ### Rules
 
-- `$ENV` is replaced with the environment value from `-e` (e.g., `staging`, `production`).
-- If no environment is specified, `$ENV` is left as-is (no substitution).
+- `{env}` and legacy `$ENV` are replaced with the environment value from `-e` (e.g., `staging`, `production`). New `schemabot onboard --template-env-suffix` output uses `{env}`.
+- If no environment is specified, the tokens are left as-is (no substitution).
 - Works in both flat layout (directory name = namespace) and subdirectory layout (subdirectory names = namespaces).
-- You can mix `$ENV` directories with regular directories in the subdirectory layout.
-- When creating the directory from a shell, quote the name to prevent shell expansion: `mkdir 'bikeshare_$ENV'`
+- You can mix templated directories with regular directories in the subdirectory layout. Do not include both `bikeshare_{env}/` and `bikeshare_$ENV/` in one schema root: they resolve to the same namespace and are rejected.
+- Quote literal paths in shell commands, especially legacy `$ENV` names, to prevent shell variable expansion.
+- Pass concrete schema names to `pull --namespace` and `onboard --namespace`, such as `bikeshare_production`; placeholders are for repository directories and `ignore_namespaces` entries.
 
 ## Ignoring Namespaces
 
@@ -287,7 +291,7 @@ ignore_namespaces:
 
 - Entries are bare namespace names, not paths. An entry containing `/` or `\` (e.g., `schema/commerce_test`) is rejected when the config is loaded.
 - Ignored namespaces are excluded from plans, applies, and merge-gate checks. This applies to both the GitHub PR flow and the CLI (`schemabot plan` / `schemabot apply` read the same `schemabot.yaml`).
-- `$ENV` substitution applies to entries the same way it applies to directory names: `fixtures_$ENV` ignores the `fixtures_staging` namespace when planning for staging.
+- `{env}` and legacy `$ENV` substitution apply to entries the same way they apply to directory names: `fixtures_{env}` ignores the `fixtures_staging` namespace when planning for staging.
 - Matching is exact and case-sensitive. An entry that matches no namespace directory excludes nothing; the plan proceeds and the unmatched entry is reported (a CLI warning, a server-side log) so a typo or stale entry is visible.
 - Ignoring every namespace in the schema root is an error: the plan fails rather than reconciling an empty desired state.
 - Ignoring a namespace does not exempt the directory from layout validation; a schema root mixing flat files and subdirectories is still rejected.
@@ -332,15 +336,36 @@ ignore_tables:
 
 An ignored table is withheld from the planner's view of the live schema. The plan neither proposes creating it nor proposes dropping it, and an apply never touches it.
 
+### Patterns
+
+Some applications create tables at runtime, such as one queue table per configured trigger. A list of names cannot cover the next one created, so the next plan proposes dropping it. Wrap a regular expression in slashes to withhold the whole family:
+
+```yaml
+# schemabot.yaml
+database: commerce
+type: mysql
+ignore_tables:
+  - flyway_schema_history
+  - /^relay_[0-9]+_feed$/
+```
+
+- A pattern matches the **whole** table name, whether or not you write `^` and `$`. `/relay_[0-9]+_feed/` withholds `relay_7_feed`, but not `old_relay_7_feed` or `relay_7_feed_backup`. To also match a prefix or suffix, say so with `.*`.
+- Matching is case-sensitive, the same as a plain entry. Start the expression with `(?i)` to ignore case.
+- The syntax is [RE2](https://github.com/google/re2/wiki/Syntax), the regular expression syntax of Go. It has no backtracking, a pattern is at most 256 bytes, slashes included, and all of a config's patterns together are at most 1024 bytes, so no config can stall a plan. Lookarounds and backreferences are not supported.
+- A pattern that does not compile is an error naming the entry. The plan or apply fails rather than skipping the entry, because a skipped entry withholds nothing.
+- An entry is a pattern only when it starts **and** ends with `/`. Any other entry is an exact table name, so existing entries keep their meaning. Wrap a pattern in quotes if your YAML tooling needs it; the quotes are not part of the entry. A pattern cannot require a slash, so an entry such as `/var/lib/app/` is refused as a path rather than read as a pattern that matches nothing.
+- A plan records the entries as written, and an apply, resume or rollback of that plan withholds by the same patterns. A table the application creates between the plan and the apply is withheld when it matches, never dropped.
+
+Upgrade SchemaBot servers and data planes before adding a pattern. An older build refuses the pattern as a path when it reads `schemabot.yaml`. If a plan comes from an older data plane that reads the pattern as a literal table name, the server refuses that plan instead of storing a drop of the tables the pattern matches.
+
 ### Rules
 
-- Entries are bare table names. Patterns are not supported, so a set of time-partitioned tables needs one entry per table.
 - Entries are not namespace-qualified, so an entry applies to every namespace the plan covers. A name that occurs in two namespaces is withheld in both.
-- `$ENV` substitution does **not** apply. Namespace entries substitute `$ENV` because namespace *directories* are environment-suffixed; table names are not.
-- Matching is exact and case-sensitive. An entry that matches no live table withholds nothing and the plan proceeds, without comment: a table that is not always on the target is the ordinary case, not a mistake. The server logs unmatched entries.
-- On the MySQL-family engines, naming one archive-shaped table (`<name>_archive_YYYY`, with an optional month and day) makes the planner read every archive table's definition on that target, whether or not the entry matches anything. That shape is what daily or monthly partition rotation produces, so on a rotating target the extra reads can be substantial. Prefer naming the table you mean.
+- Environment substitution does **not** apply. Namespace entries substitute `{env}` or `$ENV` because namespace *directories* are environment-suffixed; table names are not.
+- A plain entry matches exactly and case-sensitively. An entry that matches no live table withholds nothing and the plan proceeds, without comment: a table that is not always on the target is the ordinary case, not a mistake. The server logs unmatched entries, patterns included.
+- On the MySQL-family engines, naming one archive-shaped table (`<name>_archive_YYYY`, with an optional month and day) makes the planner read every archive table's definition on that target, whether or not the entry matches anything. Any pattern entry does the same, since SchemaBot cannot tell before reading the catalog whether a pattern matches an archive table. That shape is what daily or monthly partition rotation produces, so on a rotating target the extra reads can be substantial. Prefer naming the table you mean.
 
-Declaring a table in a schema file *and* ignoring it is a contradiction SchemaBot refuses, at onboard time before anything is written and at plan time thereafter. The error names the entries to remove.
+Declaring a table in a schema file *and* ignoring it is a contradiction SchemaBot refuses, at onboard time before anything is written and at plan time thereafter. That includes a pattern that matches a declared table. The refusal ignores case, since some databases fold table names to lower case. Two spellings count as the same table when one lower-cases or Unicode-folds to the other, for plain entries and patterns alike, so a few non-ASCII spellings that were distinct before patterns, such as the long s `ſ` and `s`, now collide. The error names the entries to remove, and for a pattern, the declared tables it matches, so you can narrow it.
 
 ### Exclusions are disclosed
 
@@ -359,7 +384,7 @@ from this PR onward.
 
 ## Per-Target Schema Overrides
 
-`$ENV` substitution handles physical schema names that vary by *environment*. When names vary by *deployment within one environment* — several regional clusters in the same environment naming the schema `bikeshare_qa`, `bikeshare_eu_qa`, and `bikeshare_us_qa` — one schema directory cannot express the variance, and copying the directory per region would triple the source of truth.
+`{env}` and `$ENV` substitution handle physical schema names that vary by *environment*. When names vary by *deployment within one environment* — several regional clusters in the same environment naming the schema `bikeshare_qa`, `bikeshare_eu_qa`, and `bikeshare_us_qa` — one schema directory cannot express the variance, and copying the directory per region would triple the source of truth.
 
 Instead, keep one canonical directory (`bikeshare/`) and map the canonical namespace to each deployment's physical schema on the data-plane target. (`target_resolver` is the gRPC data plane's target-to-connection inventory — see [Configuration](configuration.md) for how targets are defined.)
 
@@ -393,7 +418,7 @@ The canonical namespace stays the name everywhere SchemaBot labels a namespace �
 | MySQL, multiple schema names | 1 | many | `app_primary/`, `app_analytics/` |
 | MySQL, different databases | 1 per database | 1 each | separate directories |
 | Vitess, multiple keyspaces | 1 | many | `commerce/`, `commerce_sharded/` |
-| Environment-specific namespace | 1 | 1 per env | `bikeshare_$ENV/` |
+| Environment-specific namespace | 1 | 1 per env | `bikeshare_{env}/` (legacy `bikeshare_$ENV/`) |
 | Repo-only namespace (never deployed) | 1 | all except ignored | `ignore_namespaces: [commerce_test]` |
 | Deployment-specific physical schema | 1 | 1 canonical | `bikeshare/` + per-target `schema_overrides` |
 

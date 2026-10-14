@@ -122,6 +122,18 @@ func TestSchemaPathAllowed(t *testing.T) {
 			want:        false,
 		},
 		{
+			name:        "an invalid entry does not hide a later valid one",
+			allowedDirs: []string{"/services/payments/schema", "", "services/orders/schema"},
+			schemaPath:  "services/orders/schema",
+			want:        true,
+		},
+		{
+			name:        "an invalid entry matches nothing",
+			allowedDirs: []string{"/services/payments/schema"},
+			schemaPath:  "services/payments/schema",
+			want:        false,
+		},
+		{
 			name:        "empty allowed dirs block",
 			allowedDirs: nil,
 			schemaPath:  "schema/payments",

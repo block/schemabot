@@ -57,6 +57,90 @@ func (s *Server) handleCancelDeployRequest(w http.ResponseWriter, r *http.Reques
 	return nil
 }
 
+// Deploy request states. A deploy request is open until it is closed; the
+// deployment state tracks the deploy separately and is left as it was.
+const (
+	deployRequestOpen   = "open"
+	deployRequestClosed = "closed"
+)
+
+// deployRequestStateFor reports the deploy request state for a stored
+// closed_at value.
+func deployRequestStateFor(closedAt sql.NullString) string {
+	if closedAt.Valid && closedAt.String != "" {
+		return deployRequestClosed
+	}
+	return deployRequestOpen
+}
+
+// handleUpdateDeployRequest serves PATCH /deploy-requests/{number}. Closing is
+// the only update PlanetScale accepts there, and it retires a deploy request
+// that has not been deployed — the counterpart of cancel, which only reaches a
+// deploy that is queued or running. A deploy request whose deploy has started
+// cannot be closed, and a closed one can no longer be deployed.
+func (s *Server) handleUpdateDeployRequest(w http.ResponseWriter, r *http.Request) error {
+	_, ref, err := s.resolveDeployAction(r)
+	if err != nil {
+		return err
+	}
+
+	var body struct {
+		State string `json:"state"`
+	}
+	if err := s.decodeJSON(r, &body); err != nil {
+		return err
+	}
+	if body.State != deployRequestClosed {
+		return newHTTPError(http.StatusUnprocessableEntity, "unsupported deploy request state %q: only %q is accepted", body.State, deployRequestClosed)
+	}
+
+	info, err := s.getDeployRequestInfo(r.Context(), ref)
+	if err != nil {
+		return err
+	}
+
+	// The deployed and closed_at guards make close and deploy mutually
+	// exclusive: whichever UPDATE lands first wins, and the other matches no
+	// row.
+	closedAt := time.Now().UTC()
+	result, err := s.metadataDB.ExecContext(r.Context(),
+		`UPDATE localscale_deploy_requests
+		 SET closed_at = ?
+		 WHERE org = ? AND database_name = ? AND number = ? AND deployed = FALSE AND closed_at IS NULL`,
+		closedAt.Format(storedTimestampLayout), ref.org, ref.database, ref.number,
+	)
+	if err != nil {
+		return newHTTPError(http.StatusInternalServerError, "close deploy request: %v", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return newHTTPError(http.StatusInternalServerError, "close deploy request: %v", err)
+	}
+	if affected == 0 {
+		var deployed bool
+		var storedClosedAt sql.NullString
+		if err := s.metadataDB.QueryRowContext(r.Context(),
+			`SELECT deployed, closed_at FROM localscale_deploy_requests
+			 WHERE org = ? AND database_name = ? AND number = ?`,
+			ref.org, ref.database, ref.number,
+		).Scan(&deployed, &storedClosedAt); err != nil {
+			return newHTTPError(http.StatusInternalServerError, "read deploy request %d after a refused close: %v", ref.number, err)
+		}
+		if deployRequestStateFor(storedClosedAt) == deployRequestClosed {
+			return newHTTPError(http.StatusConflict, "cannot close: deploy request %d is already closed", ref.number)
+		}
+		return newHTTPError(http.StatusConflict, "cannot close: deploy request %d has been deployed", ref.number)
+	}
+	s.logger.Info("deploy request closed", "number", ref.number, "org", ref.org,
+		"database", ref.database, "deployment_state", info.deploymentState)
+
+	resp := deployResponse(ref.number, info.branch, info.deploymentState, info.createdAt)
+	resp["state"] = deployRequestClosed
+	resp["closed_at"] = closedAt.Format(time.RFC3339)
+	s.writeJSON(w, resp)
+	return nil
+}
+
 func (s *Server) handleApplyDeployRequest(w http.ResponseWriter, r *http.Request) error {
 	backend, ref, err := s.resolveDeployAction(r)
 	if err != nil {

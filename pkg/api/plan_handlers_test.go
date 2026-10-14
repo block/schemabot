@@ -22,6 +22,21 @@ func TestBuildApplyTaskCopiesExecutionVerdict(t *testing.T) {
 	assert.Equal(t, "requires privileges unavailable to the engine", task.ModeReason)
 }
 
+// Apply tasks carry the table's planned size so progress can show it beside
+// the row counts. A task created for one shard of a table carries none.
+func TestBuildApplyTaskCarriesPlannedSize(t *testing.T) {
+	bytes := int64(23_400_000_000)
+	change := storage.TableChange{Namespace: "testdb", Table: "orders", Operation: "alter", EstimatedBytes: &bytes}
+	plan := &storage.Plan{ID: 7, DatabaseType: storage.DatabaseTypeMySQL}
+
+	task := buildApplyTask(plan, change, "production", storage.ApplyOptions{}, "", time.Now())
+	require.NotNil(t, task.EstimatedBytes)
+	assert.Equal(t, bytes, *task.EstimatedBytes)
+
+	shardTask := buildApplyTask(plan, change, "production", storage.ApplyOptions{}, "-80", time.Now())
+	assert.Nil(t, shardTask.EstimatedBytes)
+}
+
 // TestPullNamespaces exercises the API-boundary pull gate: requested
 // namespaces must be well-formed, concrete, unique, and not reserved for the
 // target's dialect. A system or platform-managed schema must be rejected on
@@ -53,6 +68,7 @@ func TestPullNamespaces(t *testing.T) {
 		{name: "path traversal rejected", dialect: schema.DialectMySQL, namespaces: []string{"a..b"}, wantErr: "single path component"},
 		{name: "path separator rejected", dialect: schema.DialectMySQL, namespaces: []string{`a/b`}, wantErr: "single path component"},
 		{name: "unresolved env placeholder rejected", dialect: schema.DialectMySQL, namespaces: []string{"orders_$ENV"}, wantErr: "$ENV"},
+		{name: "unresolved brace env placeholder rejected", dialect: schema.DialectMySQL, namespaces: []string{"orders_{env}"}, wantErr: "{env}"},
 		{name: "duplicate namespace rejected", dialect: schema.DialectMySQL, namespaces: []string{"orders", "orders"}, wantErr: "duplicate"},
 	}
 

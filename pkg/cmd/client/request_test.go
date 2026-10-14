@@ -1,8 +1,12 @@
 package client
 
 import (
+	"bytes"
+	"crypto/tls"
+	"crypto/x509"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"testing"
 	"time"
 
@@ -125,6 +129,83 @@ func TestDoPostIntoCarriesTheServersRetryDelay(t *testing.T) {
 	assert.Equal(t, 4*time.Second, after)
 }
 
+// A proxy in front of the server can refuse a request with a Retry-After
+// header and a body that is not SchemaBot's JSON. The header's delay still
+// reaches the caller, alongside a status it can classify.
+func TestDoGetIntoCarriesTheRetryAfterHeader(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		w.Header().Set("Retry-After", "30")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`<html><body><h1>429 Too Many Requests</h1></body></html>`))
+	}))
+	t.Cleanup(srv.Close)
+
+	var result struct{}
+	err := doGetInto(srv.URL, "/api/progress/apply/apply-abc", &result)
+
+	var apiErr *APIError
+	require.ErrorAs(t, err, &apiErr)
+	assert.Equal(t, http.StatusTooManyRequests, apiErr.Status)
+	assert.Empty(t, apiErr.ErrorCode)
+	assert.Equal(t, 30*time.Second, apiErr.RetryAfterHeader)
+}
+
+// RetryAfter decides whether to retry from the error code alone, and when it
+// says retry, waits the longer of the body's and the header's delay.
+func TestAPIErrorRetryAfterTakesTheLongerDelay(t *testing.T) {
+	retryable := apitypes.ErrCodeRateLimited
+	for _, tc := range []struct {
+		name      string
+		code      string
+		body      int
+		header    time.Duration
+		wantRetry bool
+		want      time.Duration
+	}{
+		{name: "header longer than body", code: retryable, body: 10, header: 45 * time.Second, wantRetry: true, want: 45 * time.Second},
+		{name: "body longer than header", code: retryable, body: 45, header: 10 * time.Second, wantRetry: true, want: 45 * time.Second},
+		{name: "header only", code: retryable, header: 20 * time.Second, wantRetry: true, want: 20 * time.Second},
+		{name: "code not retryable", code: apitypes.ErrCodeInvalidRequest, header: 45 * time.Second, wantRetry: false, want: 0},
+		{name: "no code", header: 45 * time.Second, wantRetry: false, want: 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			retry, after := (&APIError{ErrorCode: tc.code, RetryAfterSeconds: tc.body, RetryAfterHeader: tc.header}).RetryAfter()
+			assert.Equal(t, tc.wantRetry, retry)
+			assert.Equal(t, tc.want, after)
+		})
+	}
+}
+
+func TestParseRetryAfterHeader(t *testing.T) {
+	now := time.Date(2026, time.March, 4, 12, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name  string
+		value string
+		want  time.Duration
+	}{
+		{name: "absent", value: "", want: 0},
+		{name: "delta seconds", value: "45", want: 45 * time.Second},
+		{name: "delta seconds with surrounding space", value: " 45 ", want: 45 * time.Second},
+		{name: "zero seconds", value: "0", want: 0},
+		{name: "HTTP date in the future", value: now.Add(90 * time.Second).Format(http.TimeFormat), want: 90 * time.Second},
+		{name: "HTTP date in the past", value: now.Add(-time.Minute).Format(http.TimeFormat), want: 0},
+		{name: "negative seconds", value: "-5", want: 0},
+		{name: "signed seconds", value: "+5", want: 0},
+		{name: "fractional seconds", value: "1.5", want: 0},
+		{name: "seconds at the bound", value: "300", want: 5 * time.Minute},
+		{name: "seconds past the bound", value: "86400", want: maxRetryAfterHeader},
+		{name: "seconds too large to represent", value: "99999999999999999999", want: maxRetryAfterHeader},
+		{name: "HTTP date past the bound", value: "Fri, 31 Dec 9999 23:59:59 GMT", want: maxRetryAfterHeader},
+		{name: "malformed", value: "soon", want: 0},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, parseRetryAfterHeader(tc.value, now))
+		})
+	}
+}
+
 // A permanent refusal reports no retry, so a client reading only RetryAfter
 // never schedules one against an error that will never succeed.
 func TestDoPostIntoReportsNoRetryForPermanentErrors(t *testing.T) {
@@ -204,6 +285,279 @@ func TestAuthTokenRefusedOverInsecureRemote(t *testing.T) {
 	err := doGetIntoCtx(t.Context(), "http://schemabot.example.com", "/api/status", &out)
 	require.Error(t, err)
 	assert.ErrorIs(t, err, ErrInsecureTokenTransport)
+}
+
+// redirectServer returns a test server that answers every request with a 307
+// to target+path, so a redirected request keeps its method and body.
+func redirectServer(t *testing.T, newServer func(http.Handler) *httptest.Server, target func() string) *httptest.Server {
+	t.Helper()
+	srv := newServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target()+r.URL.Path, http.StatusTemporaryRedirect)
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// tokenClient returns a client whose bearer transport carries token over base,
+// so a test can exercise the transport against TLS servers without touching
+// the package-level client.
+func tokenClient(base http.RoundTripper, token string) *http.Client {
+	return &http.Client{Transport: &bearerTransport{base: base, token: token}}
+}
+
+// getThrough sends a GET to rawURL with client and closes any response body.
+func getThrough(t *testing.T, client *http.Client, rawURL string) error {
+	t.Helper()
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, rawURL, nil)
+	require.NoError(t, err)
+	resp, err := client.Do(req)
+	if resp != nil {
+		require.NoError(t, resp.Body.Close())
+	}
+	return err
+}
+
+// A SchemaBot server that redirects /api/status to /api/v2/status on itself is
+// still the server the token was issued for, so the redirected request arrives
+// authenticated.
+func TestAuthTokenFollowsSameOriginRedirect(t *testing.T) {
+	var gotAuth, gotPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/status" {
+			http.Redirect(w, r, "/api/v2/status", http.StatusTemporaryRedirect)
+			return
+		}
+		gotPath = r.URL.Path
+		gotAuth = r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	t.Cleanup(srv.Close)
+	setTokenForTest(t, "tok-abc123")
+
+	var out map[string]any
+	require.NoError(t, doGetIntoCtx(t.Context(), srv.URL, "/api/status", &out))
+	assert.Equal(t, "/api/v2/status", gotPath)
+	assert.Equal(t, "Bearer tok-abc123", gotAuth)
+}
+
+// A SchemaBot server on https that redirects to a different https server — here
+// the same address on another port, which net/http alone would still treat as
+// the same host — hands the request to a server the token was not issued for.
+// The redirect is followed, but the second server never sees the token.
+func TestAuthTokenWithheldFromCrossOriginRedirect(t *testing.T) {
+	var gotAuth string
+	var reached bool
+	other := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reached = true
+		gotAuth = r.Header.Get("Authorization")
+	}))
+	t.Cleanup(other.Close)
+	source := redirectServer(t, httptest.NewTLSServer, func() string { return other.URL })
+	roots := x509.NewCertPool()
+	roots.AddCert(source.Certificate())
+	roots.AddCert(other.Certificate())
+	base := http.DefaultTransport.(*http.Transport).Clone()
+	base.TLSClientConfig = &tls.Config{RootCAs: roots, MinVersion: tls.VersionTLS12}
+
+	err := getThrough(t, tokenClient(base, "tok-abc123"), source.URL+"/api/status")
+	require.NoError(t, err)
+	assert.True(t, reached, "the cross-origin redirect is followed")
+	assert.Empty(t, gotAuth)
+}
+
+// A chain that leaves the token's origin and bounces back to it stays
+// unauthenticated: the path it returns to was chosen by a server the token was
+// never meant for.
+func TestAuthTokenWithheldAfterChainLeavesOrigin(t *testing.T) {
+	var gotAuth, gotPath string
+	var home *httptest.Server
+	elsewhere := redirectServer(t, httptest.NewServer, func() string { return home.URL + "/api/landing" })
+	home = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/status" {
+			http.Redirect(w, r, elsewhere.URL+"/bounce", http.StatusTemporaryRedirect)
+			return
+		}
+		gotPath = r.URL.Path
+		gotAuth = r.Header.Get("Authorization")
+	}))
+	t.Cleanup(home.Close)
+
+	err := getThrough(t, tokenClient(http.DefaultTransport, "tok-abc123"), home.URL+"/api/status")
+	require.NoError(t, err)
+	assert.Equal(t, "/api/landing/bounce", gotPath)
+	assert.Empty(t, gotAuth)
+}
+
+// dropsResponseRequest is a RoundTripper that, unlike http.Transport, does not
+// record which request produced each response, so a redirected request cannot
+// be traced back to the request the command sent.
+type dropsResponseRequest struct{ base http.RoundTripper }
+
+func (d dropsResponseRequest) RoundTrip(req *http.Request) (*http.Response, error) {
+	resp, err := d.base.RoundTrip(req)
+	if resp != nil {
+		resp.Request = nil
+	}
+	return resp, err
+}
+
+// When the base transport leaves the redirect chain untraceable, the transport
+// cannot tell a same-origin redirect from a cross-origin one, so it withholds
+// the token from both rather than let the redirect target pass for the origin
+// the token was issued for.
+func TestAuthTokenWithheldWhenRedirectProvenanceIsUnknown(t *testing.T) {
+	var otherAuth string
+	other := captureAuthServer(t, &otherAuth)
+	crossOrigin := redirectServer(t, httptest.NewServer, func() string { return other.URL })
+
+	var homeAuth string
+	home := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/status" {
+			http.Redirect(w, r, "/api/v2/status", http.StatusTemporaryRedirect)
+			return
+		}
+		homeAuth = r.Header.Get("Authorization")
+	}))
+	t.Cleanup(home.Close)
+
+	client := tokenClient(dropsResponseRequest{http.DefaultTransport}, "tok-abc123")
+	require.NoError(t, getThrough(t, client, crossOrigin.URL+"/api/status"))
+	assert.Empty(t, otherAuth, "the token never reaches a server the chain cannot be traced to")
+
+	require.NoError(t, getThrough(t, client, home.URL+"/api/status"))
+	assert.Empty(t, homeAuth, "an untraceable same-origin redirect is treated as having left the origin")
+}
+
+// captureWarnings redirects the transport's warning stream into a buffer for
+// the test and restores the process stream afterwards.
+func captureWarnings(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	prev := warnWriter
+	t.Cleanup(func() { warnWriter = prev })
+	var buf bytes.Buffer
+	warnWriter = &buf
+	return &buf
+}
+
+// An https SchemaBot server that redirects to plaintext http has sent the
+// request to another origin: the redirect is followed, as any cross-origin
+// redirect is, and the plaintext server never sees the token. The operator is
+// told on stderr why the request went on unauthenticated.
+func TestAuthTokenWithheldFromHTTPSDowngradeRedirect(t *testing.T) {
+	var gotAuth string
+	var reached bool
+	plaintext := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reached = true
+		gotAuth = r.Header.Get("Authorization")
+	}))
+	t.Cleanup(plaintext.Close)
+	source := redirectServer(t, httptest.NewTLSServer, func() string { return plaintext.URL })
+	warnings := captureWarnings(t)
+
+	err := getThrough(t, tokenClient(source.Client().Transport, "tok-abc123"), source.URL+"/api/status")
+	require.NoError(t, err)
+	assert.True(t, reached, "the downgrade redirect is followed")
+	assert.Empty(t, gotAuth)
+	sourceURL, err := url.Parse(source.URL)
+	require.NoError(t, err)
+	plaintextURL, err := url.Parse(plaintext.URL)
+	require.NoError(t, err)
+	assert.Equal(t, "Warning: not sending the auth token for "+RequestOrigin(sourceURL)+
+		" to redirect target "+RequestOrigin(plaintextURL)+
+		" because it is on another origin; the request continues unauthenticated\n", warnings.String())
+}
+
+// An Authorization header the caller set itself is withheld across the same
+// downgrade redirect, so a credential the transport did not attach is not sent
+// somewhere the transport's own token would not go.
+func TestCallerAuthorizationWithheldFromHTTPSDowngradeRedirect(t *testing.T) {
+	var gotAuth string
+	plaintext := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+	}))
+	t.Cleanup(plaintext.Close)
+	source := redirectServer(t, httptest.NewTLSServer, func() string { return plaintext.URL })
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, source.URL+"/api/status", nil)
+	require.NoError(t, err)
+	req.Header.Set("Authorization", "Bearer caller-token")
+	resp, err := tokenClient(source.Client().Transport, "").Do(req)
+	require.NoError(t, err)
+	require.NoError(t, resp.Body.Close())
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Empty(t, gotAuth)
+}
+
+// Two loopback servers on different ports are two origins. The token may be
+// sent to either over plaintext, since both are local, but it belongs to the one
+// the command addressed and does not follow a redirect to the other.
+func TestAuthTokenWithheldBetweenLoopbackPorts(t *testing.T) {
+	var gotAuth string
+	var reached bool
+	other := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reached = true
+		gotAuth = r.Header.Get("Authorization")
+	}))
+	t.Cleanup(other.Close)
+	source := redirectServer(t, httptest.NewServer, func() string { return other.URL })
+
+	err := getThrough(t, tokenClient(http.DefaultTransport, "tok-abc123"), source.URL+"/api/status")
+	require.NoError(t, err)
+	assert.True(t, reached, "the redirect to the other loopback port is followed")
+	assert.Empty(t, gotAuth)
+}
+
+// The local-runtime credential is bound to the endpoint's origin, so a request
+// that spells the same server differently still carries it, and a request to
+// any other server is refused before it is sent.
+func TestLocalAuthBoundToNormalizedOrigin(t *testing.T) {
+	var gotAuth string
+	srv := captureAuthServer(t, &gotAuth)
+	prevToken, prevOrigin := authTransport.token, authTransport.origin
+	t.Cleanup(func() { authTransport.token, authTransport.origin = prevToken, prevOrigin })
+	srvURL, err := url.Parse(srv.URL)
+	require.NoError(t, err)
+	SetLocalAuth("local-tok", "HTTP://"+srvURL.Host+"/")
+
+	resp, err := sendThroughTransport(t, srv.URL+"/api/status", "")
+	require.NoError(t, err)
+	require.NoError(t, resp.Body.Close())
+	assert.Equal(t, "Bearer local-tok", gotAuth)
+
+	resp, err = sendThroughTransport(t, "http://127.0.0.1:1/api/status", "")
+	if resp != nil {
+		require.NoError(t, resp.Body.Close())
+	}
+	require.ErrorContains(t, err, "refusing to forward local runtime credentials to another endpoint")
+}
+
+func TestRequestOriginNormalizesDefaultPortAndCase(t *testing.T) {
+	for _, tc := range []struct {
+		raw  string
+		want string
+	}{
+		{raw: "https://SchemaBot.example.com/api", want: "https://schemabot.example.com:443"},
+		{raw: "https://schemabot.example.com:443/api", want: "https://schemabot.example.com:443"},
+		{raw: "http://127.0.0.1:8080/api", want: "http://127.0.0.1:8080"},
+		{raw: "http://[::1]/api", want: "http://[::1]:80"},
+	} {
+		u, err := url.Parse(tc.raw)
+		require.NoError(t, err)
+		assert.Equal(t, tc.want, RequestOrigin(u), tc.raw)
+	}
+}
+
+// An empty redirect chain has sent nothing, so it has left no origin; a chain
+// that changes port has.
+func TestStayedOnFirstOrigin(t *testing.T) {
+	assert.True(t, StayedOnFirstOrigin(nil))
+	request := func(raw string) *http.Request {
+		r, err := http.NewRequestWithContext(t.Context(), http.MethodGet, raw, nil)
+		require.NoError(t, err)
+		return r
+	}
+	assert.True(t, StayedOnFirstOrigin([]*http.Request{request("https://a.example/x"), request("https://A.example:443/y")}))
+	assert.False(t, StayedOnFirstOrigin([]*http.Request{request("https://a.example/x"), request("https://a.example:8443/y")}))
 }
 
 func TestNoTokenAllowedOverInsecureRemote(t *testing.T) {

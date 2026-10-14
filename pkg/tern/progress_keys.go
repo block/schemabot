@@ -67,7 +67,9 @@ type StatementCanonicalizer func(ddl string) string
 // database type's dialect: the drift comparison's canonical form, which
 // strips the physical schema qualifier and normalizes spelling, so a
 // deployment's rendering of a reviewed statement keys the same as the
-// reviewed text. An unregistered database type is an error.
+// reviewed text. Atomic RLS operations retain the physical schema qualifier;
+// drift refuses cross-schema RLS dispatch before progress matching.
+// An unregistered database type is an error.
 //
 // Text the dialect's parser rejects keys by its trimmed form instead, and the
 // rejection is logged with the statement. On the stored side such text can

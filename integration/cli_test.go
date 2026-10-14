@@ -1269,6 +1269,24 @@ CREATE TABLE items (
 		waitForState(t, endpoint, applyID, "completed", 30*time.Second)
 	})
 
+	// Rolling back an ADD COLUMN drops the column, so the rollback plan is
+	// unsafe and needs the same --allow-unsafe consent as an apply would.
+	t.Run("rollback_blocked_without_allow_unsafe", func(t *testing.T) {
+		require.NotEmpty(t, applyID, "apply ID must be set by previous subtest")
+		out, err := runCLIWithErrorInDir(t, binPath, schemaDir, "rollback",
+			applyID,
+			"-e", "staging",
+			"--endpoint", endpoint,
+			"-y",
+			"--watch=false",
+		)
+		require.Error(t, err, "expected rollback to fail without --allow-unsafe")
+		assertContains(t, out, "Apply blocked")
+		assertContains(t, out, "unsafe change(s) detected")
+		assertContains(t, out, "--allow-unsafe")
+		assert.NotContains(t, out, "Rollback started")
+	})
+
 	t.Run("rollback_to_original", func(t *testing.T) {
 		require.NotEmpty(t, applyID, "apply ID must be set by previous subtest")
 		out := runCLIInDir(t, binPath, schemaDir, "rollback",
@@ -1277,8 +1295,11 @@ CREATE TABLE items (
 			"--endpoint", endpoint,
 			"-y",
 			"--watch=false",
+			"--allow-unsafe",
 		)
-		// Should show rollback plan with DROP COLUMN
+		// Should show rollback plan with DROP COLUMN, accepted under --allow-unsafe
+		assertContains(t, out, "Unsafe Changes")
+		assertContains(t, out, "--allow-unsafe enabled")
 		assertContains(t, out, "Rollback started")
 		rollbackID := parseApplyID(t, out)
 		require.NotEqual(t, applyID, rollbackID, "rollback starts a new apply")
@@ -1376,27 +1397,22 @@ CREATE TABLE users (
 		assertContains(t, out, "No lint issues found")
 	})
 
-	t.Run("canonicalization", func(t *testing.T) {
+	t.Run("clean_file_left_as_written", func(t *testing.T) {
 		schemaDir := t.TempDir()
 
-		// Write a schema with style issues only (lowercase, no backticks)
-		writeFile(t, filepath.Join(schemaDir, "style.sql"), `
+		// A lint-clean file spelled in lowercase with no backticks has nothing
+		// to fix, so it keeps its exact bytes.
+		style := `
 create table users (id bigint not null auto_increment primary key) charset=utf8mb4;
-`)
+`
+		writeFile(t, filepath.Join(schemaDir, "style.sql"), style)
 
 		out := runCLI(t, binPath, "fix-lint", "-s", schemaDir)
 
-		// Should report canonicalization
-		assertContains(t, out, "canonical")
+		assertContains(t, out, "No lint issues found")
 
-		// File should be canonicalized
 		content, err := os.ReadFile(filepath.Join(schemaDir, "style.sql"))
 		require.NoError(t, err, "read schema file")
-		contentStr := string(content)
-
-		// Should have uppercase keywords
-		assert.Contains(t, contentStr, "CREATE TABLE", "expected uppercase CREATE TABLE")
-		// Should have backtick identifiers
-		assert.Contains(t, contentStr, "`users`", "expected backtick identifiers")
+		assert.Equal(t, style, string(content))
 	})
 }

@@ -231,9 +231,11 @@ func captureWarnings(t *testing.T) *bytes.Buffer {
 	originalLogger := slog.Default()
 	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
 	warnedNonVerifyingRDS.Clear()
+	warnedDiscardedTimezone.Clear()
 	t.Cleanup(func() {
 		slog.SetDefault(originalLogger)
 		warnedNonVerifyingRDS.Clear()
+		warnedDiscardedTimezone.Clear()
 	})
 	return &logs
 }
@@ -473,12 +475,11 @@ func TestWithConnectTimeout(t *testing.T) {
 
 // Sessions are pinned to timezone=UTC so server-side now() is UTC on any
 // server default, keeping storage's timestamp comparisons consistent across
-// pods. An explicit timezone in the DSN wins, in either DSN form and in any
-// GUC-name case, and the pin never duplicates an existing setting under a
-// different spelling.
+// pods. Explicit settings are overridden in either DSN form and any GUC-name
+// case so client-bound values and server-side time expressions share a zone.
 func TestConnectionConfigPinsUTCTimezone(t *testing.T) {
-	// PGTZ is a libpq env fallback that pgx maps into RuntimeParams and
-	// therefore counts as an explicit setting; clear it so the assertions
+	// PGTZ is a libpq env fallback that pgx maps into RuntimeParams, where the
+	// pin replaces it like any other setting; clear it so the assertions
 	// below reflect the DSN alone.
 	t.Setenv("PGTZ", "")
 
@@ -492,35 +493,127 @@ func TestConnectionConfigPinsUTCTimezone(t *testing.T) {
 
 	cfg, err = connectionConfig("postgres://schemabot:secret@localhost:5432/app?timezone=America/New_York")
 	require.NoError(t, err)
-	assert.Equal(t, "America/New_York", cfg.RuntimeParams["timezone"])
+	assert.Equal(t, "UTC", cfg.RuntimeParams["timezone"])
 
 	cfg, err = connectionConfig("host=localhost user=schemabot timezone=America/New_York")
 	require.NoError(t, err)
-	assert.Equal(t, "America/New_York", cfg.RuntimeParams["timezone"])
+	assert.Equal(t, "UTC", cfg.RuntimeParams["timezone"])
 
 	// PostgreSQL matches GUC names case-insensitively, and pgx preserves the
-	// DSN's key case: the documented TimeZone spelling must win without the
-	// pin adding a second, conflicting timezone entry.
+	// DSN's key case, so the pin must remove conflicting spellings.
 	cfg, err = connectionConfig("postgres://schemabot:secret@localhost:5432/app?TimeZone=America/New_York")
 	require.NoError(t, err)
-	assert.Equal(t, "America/New_York", cfg.RuntimeParams["TimeZone"])
-	assert.NotContains(t, cfg.RuntimeParams, "timezone")
+	assert.NotContains(t, cfg.RuntimeParams, "TimeZone")
+	assert.Equal(t, "UTC", cfg.RuntimeParams["timezone"])
 
 	cfg, err = connectionConfig("host=localhost user=schemabot TimeZone=America/New_York")
 	require.NoError(t, err)
-	assert.Equal(t, "America/New_York", cfg.RuntimeParams["TimeZone"])
-	assert.NotContains(t, cfg.RuntimeParams, "timezone")
+	assert.NotContains(t, cfg.RuntimeParams, "TimeZone")
+	assert.Equal(t, "UTC", cfg.RuntimeParams["timezone"])
 }
 
-// PGTZ follows libpq fallback semantics: it reaches RuntimeParams before the
-// pin runs, so it is honored as an explicit operator setting rather than
-// overridden to UTC.
-func TestConnectionConfigHonorsPGTZ(t *testing.T) {
+// PGTZ follows libpq fallback semantics and reaches RuntimeParams before the
+// storage session pin overrides it.
+func TestConnectionConfigOverridesPGTZ(t *testing.T) {
 	t.Setenv("PGTZ", "America/Los_Angeles")
 
 	cfg, err := connectionConfig("postgres://schemabot:secret@localhost:5432/app")
 	require.NoError(t, err)
-	assert.Equal(t, "America/Los_Angeles", cfg.RuntimeParams["timezone"])
+	assert.Equal(t, "UTC", cfg.RuntimeParams["timezone"])
+}
+
+const discardedTimezoneWarning = "PostgreSQL session timezone is pinned to UTC; the zone set in the DSN or PGTZ is ignored"
+
+// An operator who set a non-UTC session zone in the DSN or PGTZ is told, on
+// the dial path, that the pin replaced it: the warning names the endpoint,
+// the setting as spelled, and the zone. A DSN that names no zone, or names
+// UTC in any spelling, dials silently because the session it asked for is
+// the one it gets.
+func TestOpenWarnsWhenAConfiguredSessionTimezoneIsReplaced(t *testing.T) {
+	t.Setenv("PGTZ", "")
+	tests := []struct {
+		name     string
+		dsn      string
+		wantWarn bool
+		wantAttr []string
+	}{
+		{
+			name:     "URL DSN naming a zone",
+			dsn:      "postgres://schemabot:secret@url.internal.example:5432/app?timezone=America/New_York",
+			wantWarn: true,
+			wantAttr: []string{`host=url.internal.example:5432`, `setting=timezone`, `timezone=America/New_York`},
+		},
+		{
+			name:     "keyword DSN naming a zone under another spelling",
+			dsn:      "host=keyword.internal.example port=5433 user=schemabot password=secret dbname=app TimeZone=Europe/Berlin",
+			wantWarn: true,
+			wantAttr: []string{`host=keyword.internal.example:5433`, `setting=TimeZone`, `timezone=Europe/Berlin`},
+		},
+		{
+			name: "no zone in the DSN",
+			dsn:  "postgres://schemabot:secret@silent.internal.example:5432/app",
+		},
+		{
+			name: "UTC in the DSN",
+			dsn:  "postgres://schemabot:secret@utc.internal.example:5432/app?timezone=utc",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			logs := captureWarnings(t)
+			openWithoutDialing(t, tt.dsn)
+			if !tt.wantWarn {
+				assert.NotContains(t, logs.String(), discardedTimezoneWarning)
+				return
+			}
+			assert.Contains(t, logs.String(), discardedTimezoneWarning)
+			for _, attr := range tt.wantAttr {
+				assert.Contains(t, logs.String(), attr)
+			}
+		})
+	}
+}
+
+// A zone set through PGTZ reaches every DSN the process resolves, so the
+// warning is keyed on the endpoint and the zone rather than on the DSN: a
+// credential reload of the storage pool and a second database on the same
+// endpoint are silent, while another endpoint announces the replacement on
+// its own. Judging a DSN without dialing it does not warn.
+func TestDiscardedTimezoneWarningDedupesPerEndpointAndZone(t *testing.T) {
+	t.Setenv("PGTZ", "America/Los_Angeles")
+	logs := captureWarnings(t)
+	const host = "storage.internal.example:5432"
+
+	for _, dsn := range []string{
+		"postgres://schemabot:secret@" + host + "/app",
+		"postgres://schemabot:rotated@" + host + "/app",
+		"postgres://schemabot:secret@" + host + "/other",
+	} {
+		openWithoutDialing(t, dsn)
+	}
+	assert.Equal(t, 1, bytes.Count(logs.Bytes(), []byte(discardedTimezoneWarning)), "one endpoint and zone warns once across DSNs")
+	assert.Contains(t, logs.String(), "timezone=America/Los_Angeles")
+
+	openWithoutDialing(t, "postgres://schemabot:secret@"+host+"/app?timezone=America/New_York")
+	assert.Equal(t, 2, bytes.Count(logs.Bytes(), []byte(discardedTimezoneWarning)), "a different zone on the same endpoint warns again")
+
+	original := getConnector
+	t.Cleanup(func() { getConnector = original })
+	getConnector = func(pgx.ConnConfig) driver.Connector { return nil }
+	_, err := resolveConnector("postgres://schemabot:secret@" + host + "/app")
+	require.NoError(t, err)
+	assert.Equal(t, 2, bytes.Count(logs.Bytes(), []byte(discardedTimezoneWarning)), "a credential reload of a warned endpoint is silent")
+
+	const other = "other.internal.example:5432"
+	_, err = resolveConnector("postgres://schemabot:secret@" + other + "/app")
+	require.NoError(t, err)
+	assert.Equal(t, 3, bytes.Count(logs.Bytes(), []byte(discardedTimezoneWarning)), "a second endpoint warns on its own")
+	assert.Contains(t, logs.String(), "host="+other)
+
+	verifies, err := VerifiesServerCertificate("postgres://schemabot:secret@judged.internal.example:5432/app")
+	require.NoError(t, err)
+	assert.False(t, verifies)
+	assert.Equal(t, 3, bytes.Count(logs.Bytes(), []byte(discardedTimezoneWarning)), "judging a DSN without dialing it is silent")
 }
 
 // The scheduling of credential reloads is pkg/connreload's and is tested

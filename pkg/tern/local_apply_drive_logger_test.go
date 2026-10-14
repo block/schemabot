@@ -45,7 +45,7 @@ func TestFinalizeSequentialApply_LogsCarryApplyIdentity(t *testing.T) {
 	}
 
 	running := driveLoggerTestApply(state.Apply.Running)
-	client.finalizeSequentialApply(t.Context(), running, nil, nil, false)
+	require.NoError(t, client.finalizeSequentialApply(t.Context(), running, nil, nil, false))
 
 	line := requireCapturedLog(t, records, "apply already terminal in storage, not overwriting during sequential finalization")
 	assertLogCarriesApplyIdentity(t, line)
@@ -90,7 +90,7 @@ func TestFailApplyWithTasks_TerminalLogCarriesApplyIdentity(t *testing.T) {
 	}
 
 	running := driveLoggerTestApply(state.Apply.Running)
-	client.failApplyWithTasks(t.Context(), running, nil, "engine failure")
+	require.NoError(t, client.failApplyWithTasks(t.Context(), running, nil, "engine failure"))
 
 	line := requireCapturedLog(t, records, "apply already in terminal state, not overwriting")
 	assertLogCarriesApplyIdentity(t, line)

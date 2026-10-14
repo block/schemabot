@@ -23,6 +23,8 @@ CREATE TABLE `apply_operations` (
   `completed_at` datetime DEFAULT NULL,
   `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
   `updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  `already_converged` tinyint(1) NOT NULL DEFAULT '0',
+  `rollout_step` int NOT NULL DEFAULT '0',
   PRIMARY KEY (`id`),
   UNIQUE KEY `idx_apply_operation` (`apply_id`,`deployment`,`operation_key`),
   KEY `idx_deployment_state` (`deployment`,`state`),

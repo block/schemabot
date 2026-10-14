@@ -44,36 +44,97 @@ func MoveTable(ctx context.Context, db *sql.DB, schemaName, tableName string, no
 // statement. Either all source tables move to the pending drops database or
 // none of them do.
 func MoveTables(ctx context.Context, db *sql.DB, tables []TableMove, now time.Time) ([]QuarantinedTable, error) {
-	if len(tables) == 0 {
-		return nil, nil
-	}
-
-	if _, err := db.ExecContext(ctx, fmt.Sprintf("CREATE DATABASE IF NOT EXISTS %s", quoteIdentifier(Database))); err != nil {
-		return nil, fmt.Errorf("create %s database: %w", Database, err)
-	}
-
-	moved := quarantineDestinations(tables, now)
-	renameSQL, err := renameStatement(moved)
+	moved, err := Destinations(tables, now)
 	if err != nil {
 		return nil, err
 	}
-	if _, err := db.ExecContext(ctx, renameSQL); err != nil {
-		return nil, fmt.Errorf("rename tables to pending drops (query = %s): %w", renameSQL, err)
+	if err := MoveTablesTo(ctx, db, moved); err != nil {
+		return nil, err
 	}
 	return moved, nil
 }
 
-func quarantineDestinations(tables []TableMove, now time.Time) []QuarantinedTable {
+// MoveTablesTo renames each source table to the quarantine destination chosen
+// for it by Destinations, in a single atomic RENAME TABLE statement. A caller
+// that must know the destinations before the rename is issued, because the
+// rename may complete on the server after the client has given up on it,
+// computes them with Destinations, records them, and then calls this.
+func MoveTablesTo(ctx context.Context, db *sql.DB, moved []QuarantinedTable) error {
+	if len(moved) == 0 {
+		return nil
+	}
+
+	if _, err := db.ExecContext(ctx, fmt.Sprintf("CREATE DATABASE IF NOT EXISTS %s", quoteIdentifier(Database))); err != nil {
+		return fmt.Errorf("create %s database: %w", Database, err)
+	}
+
+	renameSQL, err := renameStatement(moved)
+	if err != nil {
+		return err
+	}
+	if _, err := db.ExecContext(ctx, renameSQL); err != nil {
+		return fmt.Errorf("rename tables to pending drops (query = %s): %w", renameSQL, err)
+	}
+	return nil
+}
+
+// Destinations returns the quarantine destination for each source table,
+// stamped with now. It touches no database, so the same tables and now always
+// produce the same destinations.
+//
+// Every table in one call shares the same timestamp prefix, so two sources
+// with the same table name in different schemas would otherwise be given the
+// same destination and fail the single RENAME. A destination already taken
+// earlier in the call is disambiguated with a hash of its source schema and
+// table name instead. Names are compared case-insensitively because MySQL may
+// store and compare table names that way, depending on lower_case_table_names.
+//
+// It returns an error, rather than looping, if no candidate is free within
+// the attempts a move of this size can need. That can only happen if candidate
+// generation repeats itself, which the caller should hear about instead of
+// hanging on.
+func Destinations(tables []TableMove, now time.Time) ([]QuarantinedTable, error) {
+	prefix := timestampPrefix(now)
+	return destinations(tables, now, func(table TableMove, attempt int) string {
+		return disambiguatedTableName(prefix, table.SchemaName, table.TableName, attempt)
+	})
+}
+
+// destinationAttemptSlack is added to the number of tables in a move to bound
+// the candidates tried for one destination. Distinct candidates collide at
+// most once per name already taken, so a move of n tables needs fewer than n
+// attempts for any one of them; the slack keeps the bound away from that edge
+// without letting a repeating generator spin for long.
+const destinationAttemptSlack = 32
+
+// destinations is Destinations with the disambiguating candidate generator
+// supplied, so a test can drive the loop with candidates the real generator
+// never repeats.
+func destinations(tables []TableMove, now time.Time, candidate func(table TableMove, attempt int) string) ([]QuarantinedTable, error) {
 	moved := make([]QuarantinedTable, 0, len(tables))
+	taken := make(map[string]struct{}, len(tables))
+	maxAttempts := len(tables) + destinationAttemptSlack
 	for _, table := range tables {
+		name := TableName(table.SchemaName, table.TableName, now)
+		for attempt := 0; ; attempt++ {
+			if _, ok := taken[strings.ToLower(name)]; !ok {
+				break
+			}
+			if attempt >= maxAttempts {
+				return nil, fmt.Errorf("no unique quarantine name for %s.%s after %d candidates; last candidate %q",
+					table.SchemaName, table.TableName, attempt, name)
+			}
+			name = candidate(table, attempt)
+		}
+		taken[strings.ToLower(name)] = struct{}{}
 		moved = append(moved, QuarantinedTable{
 			SchemaName:       table.SchemaName,
 			TableName:        table.TableName,
 			QuarantineSchema: Database,
-			QuarantineTable:  TableName(table.SchemaName, table.TableName, now),
+			QuarantineTable:  name,
 		})
 	}
-	return moved
+	return moved, nil
 }
 
 func renameStatement(moved []QuarantinedTable) (string, error) {

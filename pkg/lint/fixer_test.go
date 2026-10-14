@@ -511,7 +511,7 @@ func TestTier3_UnfixableIssues(t *testing.T) {
 	result, err := fixer.FixFiles(files)
 	require.NoError(t, err)
 
-	// File may be canonicalized, but PK issue should be in unfixable
+	// Nothing here is auto-fixable, so the PK issue should be in unfixable
 	for _, fr := range result.Files {
 		if fr.Filename == "sessions.sql" {
 			t.Logf("sessions.sql changed=%v, fixes=%v", fr.Changed, fr.Fixes)
@@ -588,29 +588,31 @@ func TestFixFiles_NoChangesNeeded(t *testing.T) {
 }
 
 // =============================================================================
-// Tier 1 Style Tests - Canonicalization
+// Spelling - Files are rewritten only to apply a fix
 // =============================================================================
 
-func TestTier1_Canonicalization(t *testing.T) {
+// A file with nothing to fix is left as written however it is spelled, so a
+// fix-lint run never turns a clean file into a diff.
+func TestFixFiles_CleanFileLeftAsWritten(t *testing.T) {
 	tests := []struct {
-		name     string
-		input    string
-		contains []string
+		name  string
+		input string
 	}{
 		{
-			name:     "lowercase keywords become uppercase",
-			input:    "create table t (id int)",
-			contains: []string{"CREATE TABLE", "INT"},
+			name:  "SHOW CREATE TABLE form",
+			input: "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `email` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;\n",
 		},
 		{
-			name:     "identifiers get backticks",
-			input:    "CREATE TABLE users (id INT)",
-			contains: []string{"`users`", "`id`"},
+			name:  "lowercase keywords",
+			input: "create table t (id int)",
 		},
 		{
-			name:     "spacing is normalized",
-			input:    "CREATE   TABLE   t(id   INT)",
-			contains: []string{"CREATE TABLE `t`"},
+			name:  "unquoted identifiers",
+			input: "CREATE TABLE users (id INT)",
+		},
+		{
+			name:  "irregular spacing",
+			input: "CREATE   TABLE   t(id   INT)",
 		},
 	}
 
@@ -619,26 +621,34 @@ func TestTier1_Canonicalization(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			result, err := fixer.FixFiles(map[string]string{"test.sql": tt.input})
 			require.NoError(t, err)
+			require.Len(t, result.Files, 1)
 			fr := result.Files[0]
 
-			output := fr.FixedSQL
-			require.NotEmpty(t, output, "expected canonicalization but got no change")
-
-			for _, expected := range tt.contains {
-				assert.Contains(t, output, expected)
-			}
-
-			// Should report canonicalization fix
-			hasCanonFix := false
-			for _, fix := range fr.Fixes {
-				if strings.Contains(fix, "canonical") || strings.Contains(fix, "Normalized") {
-					hasCanonFix = true
-					break
-				}
-			}
-			assert.True(t, hasCanonFix, "expected canonicalization fix in: %v", fr.Fixes)
+			assert.Zero(t, result.TotalFixed)
+			assert.False(t, fr.Changed)
+			assert.Empty(t, fr.Fixes)
+			assert.Empty(t, fr.FixedSQL)
+			assert.Equal(t, tt.input, fr.OriginalSQL)
 		})
 	}
+}
+
+// A file that needs a fix is written back as the restored DDL with the fix
+// applied, and the fix is the only one reported for it.
+func TestFixFiles_FixedFileRestoredWithFix(t *testing.T) {
+	// The comment, the trailing semicolon, and the final newline are not
+	// kept: the fixed file is the parser's rendering of the table alone.
+	input := "-- orders placed through checkout\nCREATE TABLE `orders` (\n  `id` int NOT NULL AUTO_INCREMENT,\n  `user_id` bigint unsigned NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;\n"
+
+	result, err := NewFixer().FixFiles(map[string]string{"orders.sql": input})
+	require.NoError(t, err)
+	require.Len(t, result.Files, 1)
+	fr := result.Files[0]
+
+	assert.Equal(t, 1, result.TotalFixed)
+	assert.True(t, fr.Changed)
+	assert.Equal(t, []string{"INT → BIGINT for primary key"}, fr.Fixes)
+	assert.Equal(t, "CREATE TABLE `orders` (`id` BIGINT NOT NULL AUTO_INCREMENT,`user_id` BIGINT UNSIGNED NOT NULL,PRIMARY KEY(`id`)) ENGINE = InnoDB DEFAULT CHARACTER SET = UTF8MB4 DEFAULT COLLATE = UTF8MB4_0900_AI_CI", fr.FixedSQL)
 }
 
 func TestFixFiles_InvalidSQL(t *testing.T) {

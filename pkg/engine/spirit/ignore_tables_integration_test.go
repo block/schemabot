@@ -235,6 +235,133 @@ func TestEngine_Plan_IgnoreTablesOutranksArchiveNaming(t *testing.T) {
 	assertWithheld(t, result, "testdb", archiveTable)
 }
 
+// An application that creates one table per configured trigger leaves an
+// unbounded family of undeclared tables on the target, and no list of names
+// can cover the member created after the config was written. A pattern entry
+// withholds the whole family, including a member created between two plans,
+// and discloses each one it withheld; an undeclared table the pattern does not
+// match in full is still proposed for DROP TABLE.
+func TestEngine_Plan_IgnoreTablesPatternWithholdsRuntimeTableFamily(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	cleanupTables(t, db)
+
+	for _, stmt := range []string{
+		`CREATE TABLE executions (id INT PRIMARY KEY, name VARCHAR(100))`,
+		`CREATE TABLE relay_1_feed (id BIGINT PRIMARY KEY, payload JSON)`,
+		`CREATE TABLE relay_2_feed (id BIGINT PRIMARY KEY, payload JSON)`,
+		`CREATE TABLE relay_feed_settings (id INT PRIMARY KEY)`,
+	} {
+		_, err := db.ExecContext(t.Context(), stmt)
+		require.NoError(t, err, stmt)
+	}
+	req := &engine.PlanRequest{
+		Database: "testdb",
+		SchemaFiles: testSchemaFiles(map[string]string{
+			"executions.sql": `CREATE TABLE executions (id INT PRIMARY KEY, name VARCHAR(100))`,
+		}),
+		Credentials:  &engine.Credentials{DSN: dsn},
+		IgnoreTables: []string{`/^relay_\d+_feed$/`},
+	}
+
+	result, err := New(Config{}).Plan(t.Context(), req)
+	require.NoError(t, err, "Plan()")
+	assert.Equal(t, []string{"relay_feed_settings"}, droppedTables(result),
+		"only the undeclared table the pattern does not match is proposed for DROP TABLE")
+	assertWithheld(t, result, "testdb", "relay_1_feed", "relay_2_feed")
+
+	// The application creates the next member of the family at runtime. The
+	// same config withholds it on the next plan without anyone editing it.
+	_, err = db.ExecContext(t.Context(), `CREATE TABLE relay_30_feed (id BIGINT PRIMARY KEY, payload JSON)`)
+	require.NoError(t, err)
+
+	result, err = New(Config{}).Plan(t.Context(), req)
+	require.NoError(t, err, "Plan()")
+	assert.Equal(t, []string{"relay_feed_settings"}, droppedTables(result))
+	assertWithheld(t, result, "testdb", "relay_1_feed", "relay_2_feed", "relay_30_feed")
+}
+
+// A pattern written for undeclared tables that also matches a table a schema
+// file declares is the same contradiction as a plain entry naming it, refused
+// ignoring case, and the target is left as it was.
+func TestEngine_Plan_IgnoreTablesPatternRefusesDeclaredTable(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	cleanupTables(t, db)
+
+	_, err := db.ExecContext(t.Context(), `CREATE TABLE relay_1_feed (id BIGINT PRIMARY KEY)`)
+	require.NoError(t, err)
+
+	_, err = New(Config{}).Plan(t.Context(), &engine.PlanRequest{
+		Database: "testdb",
+		SchemaFiles: testSchemaFiles(map[string]string{
+			"relay_1_feed.sql": `CREATE TABLE Relay_1_Feed (id BIGINT PRIMARY KEY)`,
+		}),
+		Credentials:  &engine.Credentials{DSN: dsn},
+		IgnoreTables: []string{`/^relay_\d+_feed$/`},
+	})
+	require.Error(t, err, "Plan() must refuse a pattern that matches a declared table")
+	assert.Contains(t, err.Error(), `ignore_tables entry "/^relay_\d+_feed$/" matches "Relay_1_Feed"`)
+	assert.Contains(t, err.Error(), "Narrow the pattern")
+
+	var count int
+	require.NoError(t, db.QueryRowContext(t.Context(),
+		"SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'testdb' AND table_name = 'relay_1_feed'").Scan(&count))
+	assert.Equal(t, 1, count, "a refused plan leaves the target as it found it")
+}
+
+// A pattern that does not compile fails the plan with an error naming the
+// entry. Skipping it would withhold nothing, and the plan would propose
+// dropping the tables it was written to protect.
+func TestEngine_Plan_IgnoreTablesInvalidPatternFailsThePlan(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	cleanupTables(t, db)
+
+	_, err := db.ExecContext(t.Context(), `CREATE TABLE relay_1_feed (id BIGINT PRIMARY KEY)`)
+	require.NoError(t, err)
+
+	result, err := New(Config{}).Plan(t.Context(), &engine.PlanRequest{
+		Database: "testdb",
+		SchemaFiles: testSchemaFiles(map[string]string{
+			"executions.sql": `CREATE TABLE executions (id INT PRIMARY KEY)`,
+		}),
+		Credentials:  &engine.Credentials{DSN: dsn},
+		IgnoreTables: []string{`/^relay_(\d+_feed$/`},
+	})
+	require.Error(t, err)
+	assert.Nil(t, result, "no plan is produced to review")
+	assert.Contains(t, err.Error(), `ignore_tables entry "/^relay_(\d+_feed$/" is not a valid regular expression`)
+}
+
+// The archive naming exclusion runs inside the loader unless the config could
+// withhold an archive table, and a pattern could, so a pattern takes the
+// exclusion off the loader. An archive table the pattern matches is then
+// disclosed as the config's exclusion, and one it does not match is still
+// excluded by its name alone, undisclosed and not dropped.
+func TestEngine_Plan_IgnoreTablesPatternOutranksArchiveNaming(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	cleanupTables(t, db)
+
+	for _, stmt := range []string{
+		`CREATE TABLE executions (id INT PRIMARY KEY)`,
+		"CREATE TABLE `executions_archive_2024` (id INT PRIMARY KEY)",
+		"CREATE TABLE `audit_log_archive_2019` (id INT PRIMARY KEY)",
+	} {
+		_, err := db.ExecContext(t.Context(), stmt)
+		require.NoError(t, err, stmt)
+	}
+
+	result, err := New(Config{}).Plan(t.Context(), &engine.PlanRequest{
+		Database: "testdb",
+		SchemaFiles: testSchemaFiles(map[string]string{
+			"executions.sql": `CREATE TABLE executions (id INT PRIMARY KEY)`,
+		}),
+		Credentials:  &engine.Credentials{DSN: dsn},
+		IgnoreTables: []string{`/^executions_archive_\d{4}$/`},
+	})
+	require.NoError(t, err, "Plan()")
+	assert.Empty(t, droppedTables(result), "neither archive table is proposed for DROP TABLE")
+	assertWithheld(t, result, "testdb", "executions_archive_2024")
+}
+
 func droppedTables(result *engine.PlanResult) []string {
 	var dropped []string
 	for _, change := range result.FlatTableChanges() {

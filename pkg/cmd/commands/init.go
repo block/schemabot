@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"time"
 
 	"github.com/block/schemabot/pkg/apitypes"
@@ -18,6 +19,7 @@ import (
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/cmd/client"
 	"github.com/block/schemabot/pkg/cmd/cliname"
+	"github.com/block/schemabot/pkg/localdemo"
 	"github.com/block/schemabot/pkg/localruntime"
 	"github.com/block/schemabot/pkg/localsetup"
 )
@@ -25,6 +27,7 @@ import (
 // InitCmd accepts explicit inputs or collects missing decisions in a terminal.
 // Both routes use the same initialization workflow.
 type InitCmd struct {
+	Sample         bool         `help:"Start a disposable local MySQL or PostgreSQL database with sample tables (requires Docker)"`
 	NonInteractive bool         `name:"non-interactive" help:"Never prompt; report missing inputs instead"`
 	interactive    bool         `kong:"-"`
 	progress       func(string) `kong:"-"`
@@ -52,6 +55,12 @@ type initResult struct {
 }
 
 func (cmd *InitCmd) Run(ctx context.Context, g *Globals) error {
+	if err := cmd.prepareSample(ctx, g); err != nil {
+		if cmd.JSON && !errors.Is(err, ErrSilent) {
+			return client.ExitWithJSON("initialization_error", err.Error())
+		}
+		return err
+	}
 	if err := cmd.collectInputs(ctx, g); err != nil {
 		if cmd.JSON && !errors.Is(err, ErrSilent) {
 			return client.ExitWithJSON("initialization_error", err.Error())
@@ -111,7 +120,7 @@ func (cmd *InitCmd) initialize(ctx context.Context, g *Globals) (*initResult, er
 	if err != nil {
 		return nil, err
 	}
-	profile := client.ResolveProfileName(cfg, g.Profile)
+	profile := initProfileName(cfg, g.Profile, cmd.Runtime)
 	if existing, ok := cfg.Profiles[profile]; ok && !reflect.DeepEqual(existing, client.Profile{LocalRuntime: cmd.Runtime}) {
 		return nil, fmt.Errorf("profile %q already has a different connection; choose another --profile", profile)
 	}
@@ -223,12 +232,22 @@ func (cmd *InitCmd) importBaseline(ctx context.Context, manager localruntime.Man
 		}
 	}
 	cmd.reportProgress("Checking that your schema files match...")
-	baseline, _, err := client.CallPlanAPIWithContext(ctx, connection.Endpoint, cmd.Database, cmd.Type, cmd.Environment, stage, "", 0, exclusions, false)
+	// The baseline is verified on every rollout member's plan, the way
+	// onboarding verifies it (validateOnboardPlanResult).
+	baseline, _, err := client.CallPlanAPIWithContext(ctx, connection.Endpoint, cmd.Database, cmd.Type, cmd.Environment, stage, "", 0, exclusions, false, true)
 	if err != nil {
 		return nil, fmt.Errorf("verify baseline: %w", err)
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
+	}
+	if cmd.ReuseSchema && baseline != nil && len(baseline.Errors) == 0 && hasResultChanges(baseline) {
+		// The connection is usable even though the desired schema is not a clean baseline.
+		// Preserve the files and save the connection so the suggested plan can run.
+		if _, err := client.RegisterLocalProfile(profile, cmd.Runtime); err != nil {
+			return nil, fmt.Errorf("save connection for reviewing existing schema differences: %w", err)
+		}
+		return nil, &initSchemaDriftError{message: fmt.Sprintf("your existing schema files differ from the live database; your edits were preserved. Review them with %s plan -s %s -e %s --profile %s instead of rerunning setup:\n  %s", cliname.Name(), initShellArg(cmd.SchemaDir), initShellArg(cmd.Environment), initShellArg(profile), strings.Join(describeOnboardPlanChanges(baseline), "\n  "))}
 	}
 	cmd.reportProgress("Saving your schema files and connection...")
 	if err := publishVerifiedInitSchema(stage, root, baseline, cmd.Database, cmd.Environment); err != nil {
@@ -357,9 +376,28 @@ func (cmd *InitCmd) reportProgress(message string) {
 	}
 }
 
+type initSchemaDriftError struct{ message string }
+
+func (err *initSchemaDriftError) Error() string { return err.message }
+
 func retainedInitError(err error) error {
+	var drift *initSchemaDriftError
+	if errors.As(err, &drift) {
+		return err
+	}
 	if errors.Is(err, context.Canceled) {
 		return fmt.Errorf("setup cancelled; runtime registration is retained for retry: %w", err)
 	}
 	return fmt.Errorf("initialization incomplete; runtime registration is retained for retry: %w", err)
+}
+
+// A configured sample default is useful for plan/apply, but must not capture
+// onboarding for a different runtime. Explicit profile selections still win.
+func initProfileName(cfg *client.Config, flag, runtime string) string {
+	selection := client.ResolveProfile(cfg, flag)
+	existing := cfg.Profiles[selection.Name]
+	if !selection.Explicit() && strings.HasPrefix(existing.LocalRuntime, localdemo.NamePrefix) && existing.LocalRuntime != runtime {
+		return runtime
+	}
+	return selection.Name
 }

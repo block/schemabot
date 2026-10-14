@@ -619,3 +619,57 @@ func TestConnectionMetadataKeysCoverEveryAssembledKey(t *testing.T) {
 		})
 	}
 }
+
+// An inventory that records no database name still resolves when the
+// credential secret names the database, as AWS RDS database secrets do.
+func TestPostgresConnectionAssemblerDatabaseNameSources(t *testing.T) {
+	host := "orders.cluster-abc.us-east-1.rds.amazonaws.com"
+	fromSecret := &Credentials{Username: "ddl", Password: "secret", Metadata: map[string]string{MetadataPostgresDBName: "orders"}}
+
+	dsn, _, err := PostgresConnectionAssembler{}.Assemble(host, nil, fromSecret)
+	require.NoError(t, err)
+	assert.Equal(t, "postgresql://ddl:secret@"+host+"/orders?sslmode=verify-full", dsn) // sadscan:disable np.postgres.1
+
+	// The same name from both sources is not a conflict.
+	_, _, err = PostgresConnectionAssembler{}.Assemble(host, map[string]string{PostgresDBNameAttribute: "orders"}, fromSecret)
+	require.NoError(t, err)
+}
+
+// A target whose inventory and credential secret name different databases is
+// ambiguous: connecting to either could run a schema change against the wrong
+// database, so assembly fails and names both values.
+func TestPostgresConnectionAssemblerRejectsConflictingDatabaseNames(t *testing.T) {
+	creds := &Credentials{Username: "ddl", Password: "secret", Metadata: map[string]string{MetadataPostgresDBName: "orders"}}
+	_, _, err := PostgresConnectionAssembler{}.Assemble(
+		"orders.cluster-abc.us-east-1.rds.amazonaws.com",
+		map[string]string{PostgresDBNameAttribute: "billing"},
+		creds,
+	)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "ambiguous")
+	assert.Contains(t, err.Error(), `"billing"`)
+	assert.Contains(t, err.Error(), `"orders"`)
+}
+
+func TestDecodePostgresSecret(t *testing.T) {
+	creds, err := DecodePostgresSecret(`{"username":"ddl","password":"secret","engine":"postgres","host":"elsewhere.example","port":5432,"dbname":"orders"}`)
+	require.NoError(t, err)
+	// host and port are ignored: the inventory endpoint decides where to connect.
+	assert.Equal(t, &Credentials{Username: "ddl", Password: "secret", Metadata: map[string]string{MetadataPostgresDBName: "orders"}}, creds)
+
+	creds, err = DecodePostgresSecret(`{"username":"ddl","password":"secret"}`)
+	require.NoError(t, err)
+	assert.Equal(t, &Credentials{Username: "ddl", Password: "secret"}, creds)
+
+	for name, raw := range map[string]string{
+		"plain password":   "hunter2",
+		"missing username": `{"password":"hunter2","dbname":"orders"}`,
+		"missing password": `{"username":"ddl","dbname":"orders"}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := DecodePostgresSecret(raw)
+			require.Error(t, err)
+			assert.NotContains(t, err.Error(), "hunter2", "the decode error must not echo the password")
+		})
+	}
+}

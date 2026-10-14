@@ -111,6 +111,7 @@ func TestPlanDisclosesNoCopyOnACleanTarget(t *testing.T) {
 
 	result, _ := target.plan(t)
 	assert.Empty(t, result.ExistingCopies, "a clean target has no copy at stake")
+	assert.True(t, result.ExistingCopiesChecked, "the target was read, so its lack of a copy is a fact rather than an unknown")
 }
 
 // A plan whose ALTER matches a copy already on the target discloses that
@@ -196,7 +197,9 @@ func TestPlanDisclosesADiscardedCopyCoveringPartOfTheBatch(t *testing.T) {
 
 // A target that cannot be read leaves the plan exactly as it would be without
 // the disclosure. A plan describes a target and decides nothing, so failing to
-// read one must never fail the plan an operator is waiting on.
+// read one must never fail the plan an operator is waiting on. It must not
+// claim the target was checked either, since a caller acting on "no copy at
+// stake" would otherwise discard a copy nobody could see.
 func TestPlanDisclosesNothingWhenTheTargetCannotBeRead(t *testing.T) {
 	eng := newPlanEngine(Settings{})
 
@@ -205,10 +208,11 @@ func TestPlanDisclosesNothingWhenTheTargetCannotBeRead(t *testing.T) {
 	target := &lazyTargetDB{dsn: "root:nopass@tcp(127.0.0.1:1)/absent"}
 	defer target.close()
 
-	disclosed := eng.plannedExistingCopies(ctx, target, "absent", []engine.TableChange{
+	disclosed, checked := eng.plannedExistingCopies(ctx, target, "absent", []engine.TableChange{
 		engineRun("xfers", "ALTER TABLE `xfers` ADD INDEX r_token (r_token)"),
 	}, false)
 	assert.Nil(t, disclosed, "an unreadable target is logged, not disclosed and not returned as an error")
+	assert.False(t, checked, "an unreadable target leaves its copies unknown, never reported as clean")
 }
 
 // An apply that drives one table at a time meets each table's copy on its own

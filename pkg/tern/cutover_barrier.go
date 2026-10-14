@@ -1,6 +1,9 @@
 package tern
 
 import (
+	"context"
+	"fmt"
+
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 )
@@ -52,4 +55,113 @@ func effectiveCopyDriveOptions(apply *storage.Apply, multiOperation bool, op *st
 		opts.DeferCutover = true
 	}
 	return opts
+}
+
+// cutoverRequestTurn is an operation-scoped drive's answer to whether it may
+// take the apply's pending cutover request now. The request is apply-level, so
+// under an ordered cutover policy it belongs to the member whose turn it is.
+// When the drive must leave it pending, reason says why and blocker, when set,
+// is the operation that holds it: an earlier sibling holding this member's
+// cutover, or the operation the request is bound to. settle is set instead when
+// the operation the request is bound to has ended, so the drive settles the
+// request rather than taking it.
+type cutoverRequestTurn struct {
+	ready   bool
+	reason  string
+	blocker *storage.ApplyOperation
+	settle  cutoverRequestSettlement
+}
+
+// cutoverRequestSettlement is how a drive settles a cutover request bound to
+// an operation that has ended.
+type cutoverRequestSettlement int
+
+const (
+	// cutoverRequestUnsettled leaves the request to the turn decision.
+	cutoverRequestUnsettled cutoverRequestSettlement = iota
+	// cutoverRequestLanded completes the request: the operation it was bound
+	// to completed, which it can only do by cutting over.
+	cutoverRequestLanded
+	// cutoverRequestEnded fails the request: the operation it was bound to
+	// ended without completing, so the command had no effect.
+	cutoverRequestEnded
+)
+
+// takesCutoverRequestInOrder reports whether this drive may take a pending
+// cutover request only at its own operation's turn. It holds exactly where the
+// automatic cutover claim orders the swaps — an operation of a multi-operation
+// apply under an ordered cutover policy — so rolling rollouts and
+// single-operation applies keep taking the request as before.
+func (s applyTaskScope) takesCutoverRequestInOrder() bool {
+	return s.isOperationScoped() && s.multiOperation && s.operation != nil &&
+		storage.IsOrderedCutoverPolicy(s.operation.CutoverPolicy)
+}
+
+// operationCutoverRequestTurn decides whether this drive's own operation may
+// take the apply's cutover request. A request bound to another operation (see
+// storage.CutoverRequestMetadata) is that operation's alone: it is left for
+// that operation while it can still cut over, and settled once it has ended,
+// so one command never cuts over a second member. Otherwise this operation's
+// own tasks must be parked at the cutover (a sibling being parked does not make
+// this member ready), and no earlier sibling may still hold its turn (storage
+// CutoverBlocker, the same rule the automatic cutover claim follows).
+func operationCutoverRequestTurn(ctx context.Context, store storage.Storage, apply *storage.Apply, scope applyTaskScope, controlReq *storage.ApplyControlRequest) (cutoverRequestTurn, error) {
+	if store == nil {
+		return cutoverRequestTurn{}, fmt.Errorf("storage is not available")
+	}
+	opStore := store.ApplyOperations()
+	if opStore == nil {
+		return cutoverRequestTurn{}, fmt.Errorf("apply operation store is not available")
+	}
+	boundID, err := controlReq.CutoverOperationID()
+	if err != nil {
+		return cutoverRequestTurn{}, fmt.Errorf("read the operation the cutover request of apply %s is bound to: %w", apply.ApplyIdentifier, err)
+	}
+	if boundID != 0 && boundID != scope.applyOperationID {
+		bound, err := opStore.Get(ctx, boundID)
+		if err != nil {
+			return cutoverRequestTurn{}, fmt.Errorf("load apply_operation %d the cutover request of apply %s is bound to: %w", boundID, apply.ApplyIdentifier, err)
+		}
+		if bound == nil {
+			return cutoverRequestTurn{}, fmt.Errorf("cutover request of apply %s is bound to apply_operation %d, which does not exist", apply.ApplyIdentifier, boundID)
+		}
+		switch {
+		case state.IsState(bound.State, state.ApplyOperation.Completed):
+			return cutoverRequestTurn{reason: "the member the request was bound to has cut over", blocker: bound, settle: cutoverRequestLanded}, nil
+		case state.IsApplyOperationTerminal(bound.State):
+			return cutoverRequestTurn{reason: "the member the request was bound to ended without cutting over", blocker: bound, settle: cutoverRequestEnded}, nil
+		default:
+			return cutoverRequestTurn{reason: "the request is bound to another member", blocker: bound}, nil
+		}
+	}
+	taskStore := store.Tasks()
+	if taskStore == nil {
+		return cutoverRequestTurn{}, fmt.Errorf("task store is not available")
+	}
+	tasks, err := taskStore.GetByApplyOperationID(ctx, scope.applyOperationID)
+	if err != nil {
+		return cutoverRequestTurn{}, fmt.Errorf("load tasks for apply_operation %d of apply %s before cutover request: %w", scope.applyOperationID, apply.ApplyIdentifier, err)
+	}
+	if !tasksParkedAtCutover(tasks) {
+		return cutoverRequestTurn{reason: "this member has not reached cutover"}, nil
+	}
+	blocker, err := opStore.CutoverBlocker(ctx, scope.applyOperationID)
+	if err != nil {
+		return cutoverRequestTurn{}, fmt.Errorf("check cutover order for apply_operation %d of apply %s: %w", scope.applyOperationID, apply.ApplyIdentifier, err)
+	}
+	if blocker != nil {
+		return cutoverRequestTurn{reason: "an earlier member has not completed its cutover", blocker: blocker}, nil
+	}
+	return cutoverRequestTurn{ready: true}, nil
+}
+
+// tasksParkedAtCutover reports whether any of an operation's tasks is parked
+// at, or already in, its cutover.
+func tasksParkedAtCutover(tasks []*storage.Task) bool {
+	for _, task := range tasks {
+		if state.IsState(task.State, state.Task.WaitingForCutover, state.Task.CuttingOver) {
+			return true
+		}
+	}
+	return false
 }

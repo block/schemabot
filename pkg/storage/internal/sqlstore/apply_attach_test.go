@@ -160,6 +160,90 @@ func TestApplyStore_AttachOperationWithTasksRejectsDuplicateKey(t *testing.T) {
 	assert.Len(t, storedTasks, 1, "the duplicate attach must not insert its tasks")
 }
 
+// An operation keyed by its target alone cannot attach beside the fixture's
+// shard-keyed operation for the same deployment: both would carry the
+// payments target's work under different keys, so the attach fails closed
+// with ErrApplyOperationKeyingMismatch and leaves no rows behind.
+func TestApplyStore_AttachOperationWithTasksRefusesMixedTargetKeying(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+	apply := createAttachFixtureApply(t, store)
+
+	operation, tasks := attachSiblingOperation(storage.TargetOperationKey("payments", ""), "")
+	require.True(t, operation.KeyedByTarget())
+	err := store.Applies().AttachOperationWithTasks(ctx, apply, operation, tasks)
+	require.ErrorIs(t, err, storage.ErrApplyOperationKeyingMismatch)
+
+	ops, listErr := store.ApplyOperations().ListByApply(ctx, apply.ID)
+	require.NoError(t, listErr)
+	assert.Len(t, ops, 1, "the refused attach must not insert its operation")
+	storedTasks, tasksErr := store.Tasks().GetByApplyID(ctx, apply.ID)
+	require.NoError(t, tasksErr)
+	assert.Len(t, storedTasks, 1, "the refused attach must not insert its tasks")
+}
+
+// Target payments-001's whole-target work is keyed by its target, and its
+// group_finalizer "payments-001/ns_0/group_finalizer" leads with the same
+// target. The finalizer attaches beside that work, since a finalizer's key shape
+// is held by the apply's recorded keying rather than compared with work keys,
+// while a sibling target's work keyed the other way is still refused.
+func TestApplyStore_AttachTargetKeyedFinalizerBesideTargetKeyedWork(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+	now := time.Now()
+	apply := &storage.Apply{
+		ApplyIdentifier: "apply_attach_target_keyed",
+		LockID:          createTestLock(t, store, "payments", storage.DatabaseTypeMySQL).ID,
+		PlanID:          1,
+		Database:        "payments",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Repository:      "org/repo",
+		PullRequest:     123,
+		Environment:     "production",
+		Deployment:      "payments-b",
+		Engine:          storage.EngineSpirit,
+		State:           state.Apply.Pending,
+		Options:         []byte(`{"operation_keys_lead_with_target":true}`),
+		IdempotencyKey:  "schemabot:v1:attach-target-keyed",
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	}
+	work, workTasks := attachSiblingOperation(storage.TargetOperationKey("payments-001", ""), "")
+	work.Deployment = "payments-b"
+	work.Target = "payments-001"
+	workTasks[0].TaskIdentifier = "task_attach_target_keyed_work"
+	applyID, err := store.Applies().CreateWithTasksAndOperations(ctx, apply, workTasks, []*storage.ApplyOperation{work})
+	require.NoError(t, err)
+	apply.ID = applyID
+
+	finalizer := &storage.ApplyOperation{
+		Deployment:    "payments-b",
+		OperationKey:  storage.TargetOperationKey("payments-001", "ns_0/group_finalizer"),
+		OperationKind: storage.ApplyOperationKindGroupFinalizer,
+		Target:        "payments-001",
+		State:         state.ApplyOperation.Pending,
+		CreatedAt:     now,
+		UpdatedAt:     now,
+	}
+	require.NoError(t, store.Applies().AttachOperationWithTasks(ctx, apply, finalizer, nil))
+
+	shardWork, shardTasks := attachSiblingOperation("payments/80-/users", "80-")
+	shardWork.Deployment = "payments-b"
+	shardWork.Target = "payments-002"
+	err = store.Applies().AttachOperationWithTasks(ctx, apply, shardWork, shardTasks)
+	require.ErrorIs(t, err, storage.ErrApplyOperationKeyingMismatch)
+
+	ops, err := store.ApplyOperations().ListByApply(ctx, apply.ID)
+	require.NoError(t, err)
+	keys := make([]string, 0, len(ops))
+	for _, op := range ops {
+		keys = append(keys, op.OperationKey)
+	}
+	assert.ElementsMatch(t, []string{"payments-001", "payments-001/ns_0/group_finalizer"}, keys)
+}
+
 // Attaching to a terminal apply fails closed with ErrApplyNotActive: the
 // apply's target reservation is released and no drive will claim new work
 // under it, so accepting the operation would strand it as permanently pending.

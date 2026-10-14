@@ -435,7 +435,7 @@ func (cmd *InitCmd) promptInputs(ctx context.Context, input io.Reader, output io
 	if err != nil {
 		return err
 	}
-	m := newInitWizard(cmd, client.ResolveProfileName(cfg, g.Profile), output)
+	m := newInitWizard(cmd, initProfileName(cfg, g.Profile, cmd.Runtime), output)
 	m.ctx = ctx
 	_, err = tea.NewProgram(m, tea.WithInput(input), tea.WithOutput(output), tea.WithContext(ctx)).Run()
 	if ctx.Err() != nil {

@@ -1,6 +1,7 @@
 package tern
 
 import (
+	"log/slog"
 	"strings"
 	"testing"
 	"time"
@@ -29,6 +30,28 @@ func TestBuildDispatchTasksCopiesAsymmetricVerdicts(t *testing.T) {
 	assert.Equal(t, localBlockedReason, tasks[0].ModeReason)
 	assert.Equal(t, "direct", tasks[1].ExecutionMode)
 	assert.Empty(t, tasks[1].ModeReason)
+}
+
+// Dispatched tasks carry the table's planned size so progress can show it
+// beside the row counts. A dispatch scoped to one shard creates tasks without
+// one, since the plan's figure covers every shard of the table.
+func TestBuildDispatchTasksCarryPlannedSize(t *testing.T) {
+	plan := &storage.Plan{ID: 7, Database: "testdb", DatabaseType: storage.DatabaseTypeMySQL}
+	bytes := int64(23_400_000_000)
+	changes := []storage.TableChange{
+		{Namespace: "testdb", Table: "orders", DDL: "ALTER TABLE orders ADD INDEX idx_created_at (created_at)", Operation: "alter", EstimatedBytes: &bytes},
+		{Namespace: "testdb", Table: "users", DDL: "ALTER TABLE users ADD INDEX idx_email (email)", Operation: "alter"},
+	}
+
+	tasks := buildDispatchTasks(plan, dispatchScope{ddlChanges: changes}, "production", storage.EngineSpirit, []byte("{}"), time.Now())
+	require.Len(t, tasks, 2)
+	require.NotNil(t, tasks[0].EstimatedBytes)
+	assert.Equal(t, bytes, *tasks[0].EstimatedBytes)
+	assert.Nil(t, tasks[1].EstimatedBytes)
+
+	shardTasks := buildDispatchTasks(plan, dispatchScope{ddlChanges: changes, shard: "-80"}, "production", storage.EngineSpirit, []byte("{}"), time.Now())
+	require.Len(t, shardTasks, 2)
+	assert.Nil(t, shardTasks[0].EstimatedBytes)
 }
 
 // A shard-scoped dispatch is built from task rows, so its changes arrive with
@@ -191,7 +214,7 @@ func TestReplannedChangesRecordBlockedWins(t *testing.T) {
 // shard is deduped out of the namespace-level tables but survives on the shard
 // plan, which is what the admission gate reads.
 func TestBlockedVerdictSurvivesShardedDedupe(t *testing.T) {
-	client := &LocalClient{}
+	client := &LocalClient{logger: slog.New(slog.DiscardHandler)}
 	changes := []engine.SchemaChange{
 		{Namespace: "ks", Shard: engine.Shard{Name: "-80"}, TableChanges: []engine.TableChange{
 			{Table: "users", DDL: "ALTER TABLE users ADD COLUMN email text", Operation: ddl.StatementAlterTable},

@@ -56,6 +56,33 @@ func TestPlanDiff_SurfacesPerShardMembership(t *testing.T) {
 	assert.Equal(t, "ALTER TABLE `users` ADD INDEX (`updated_at`)", byShard["80-"].Changes[0].Ddl)
 }
 
+// A member's diff reports its copies only when the engine read the target for
+// every one. An engine whose copy lookup failed, or that never looked, leaves
+// the member's copies unknown, and the flag is what lets the caller refuse to
+// discard a copy nobody disclosed instead of reading the silence as a clean
+// target.
+func TestPlanDiff_ReportsExistingCopiesOnlyWhenTheEngineCheckedThem(t *testing.T) {
+	for name, tc := range map[string]struct {
+		checked bool
+		want    bool
+	}{
+		"engine checked every copy":       {checked: true, want: true},
+		"engine lookup failed or skipped": {checked: false, want: false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			result := alterUsersEmailPlan()
+			result.ExistingCopiesChecked = tc.checked
+			store := &fakePlanStore{getFn: func(string) (*storage.Plan, error) { return nil, nil }}
+			c := newPlanMaterializeClientWithPlan(store, result)
+
+			resp, err := c.PlanDiff(t.Context(), &ternv1.PlanRequest{Database: "testapp"})
+			require.NoError(t, err)
+			assert.Empty(t, resp.ExistingCopies, "the engine disclosed no copy in either case")
+			assert.Equal(t, tc.want, resp.ExistingCopiesReported)
+		})
+	}
+}
+
 // The rollup's primary member comes from Plan and its non-primary members from
 // PlanDiff, so both must convert an identical engine result into identical
 // change sets — otherwise a deployment that matches the reviewed plan could read

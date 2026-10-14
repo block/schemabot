@@ -13,6 +13,30 @@ func samplePlanChanges() []DDLChange {
 	}
 }
 
+// samplePartitionedPlanChanges returns plan changes for partitioned tables: a
+// new table partitioned by month, a REORGANIZE PARTITION that splits the
+// catch-all partition, and an ALTER that adds a column and repartitions.
+func samplePartitionedPlanChanges() []DDLChange {
+	return []DDLChange{
+		{ChangeType: "CREATE", TableName: "ledger_entries", DDL: "CREATE TABLE `ledger_entries` (`id` bigint NOT NULL AUTO_INCREMENT, `settlement_date` date NOT NULL, `amount_cents` bigint NOT NULL, " +
+			"PRIMARY KEY (`id`,`settlement_date`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci " +
+			"PARTITION BY RANGE COLUMNS(`settlement_date`) (" +
+			"PARTITION `p202601` VALUES LESS THAN ('2026-02-01') ENGINE = InnoDB," +
+			"PARTITION `p202602` VALUES LESS THAN ('2026-03-01') ENGINE = InnoDB," +
+			"PARTITION `p202603` VALUES LESS THAN ('2026-04-01') ENGINE = InnoDB," +
+			"PARTITION `future` VALUES LESS THAN (MAXVALUE) ENGINE = InnoDB)"},
+		{ChangeType: "ALTER", TableName: "events", DDL: "ALTER TABLE `events` REORGANIZE PARTITION `future` INTO (" +
+			"PARTITION `p202611` VALUES LESS THAN ('2026-12-01'), " +
+			"PARTITION `p202612` VALUES LESS THAN ('2027-01-01'), " +
+			"PARTITION `future` VALUES LESS THAN (MAXVALUE))"},
+		{ChangeType: "ALTER", TableName: "payouts", DDL: "ALTER TABLE `payouts` ADD COLUMN `note` varchar(64) NULL DEFAULT NULL " +
+			"PARTITION BY RANGE COLUMNS (`settlement_date`) (" +
+			"PARTITION `p2025` VALUES LESS THAN ('2026-01-01')," +
+			"PARTITION `p2026` VALUES LESS THAN ('2027-01-01')," +
+			"PARTITION `future` VALUES LESS THAN (MAXVALUE))"},
+	}
+}
+
 // samplePlanLintViolations returns reusable lint violations for plan preview functions.
 func samplePlanLintViolations() []apitypes.LintViolationResponse {
 	return []apitypes.LintViolationResponse{

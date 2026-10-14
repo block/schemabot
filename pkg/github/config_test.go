@@ -606,6 +606,7 @@ func TestCreateSchemaRequestFromPRUsesEnvironmentSymlinkSchemaRoot(t *testing.T)
 	assert.Equal(t, "orders", result.Database)
 	assert.Equal(t, "mysql", result.Type)
 	assert.Equal(t, "services/orders/schema/base", result.SchemaPath)
+	assert.Equal(t, "services/orders/schema/schemabot.yaml", result.ConfigPath, "the config sits outside the environment schema root and is still carried")
 	require.Contains(t, result.SchemaFiles, "orders_001")
 	assert.Equal(t, "CREATE TABLE orders (id bigint primary key);\n", result.SchemaFiles["orders_001"].Files["orders.sql"])
 }
@@ -636,6 +637,7 @@ func TestCreateSchemaRequestFromPRUsesRepoRootEnvironmentSymlinkSchemaRoot(t *te
 	require.NoError(t, err)
 	assert.Equal(t, "orders", result.Database)
 	assert.Equal(t, "base", result.SchemaPath)
+	assert.Equal(t, "schemabot.yaml", result.ConfigPath, "a repository-root config is carried as a repo-relative path")
 	require.Contains(t, result.SchemaFiles, "orders_001")
 	assert.Equal(t, "CREATE TABLE orders (id bigint primary key);\n", result.SchemaFiles["orders_001"].Files["orders.sql"])
 }
@@ -801,6 +803,7 @@ func TestCreateSchemaRequestFromPRFallsBackWhenEnvironmentSchemaRootMissing(t *t
 
 	require.NoError(t, err)
 	assert.Equal(t, "apps/widgets/schema", result.SchemaPath)
+	assert.Equal(t, "apps/widgets/schema/schemabot.yaml", result.ConfigPath)
 	require.Contains(t, result.SchemaFiles, "main")
 	assert.Equal(t, "CREATE TABLE widgets (id bigint primary key);\n", result.SchemaFiles["main"].Files["widgets.sql"])
 }
@@ -1370,12 +1373,14 @@ type: mysql
 ignore_tables:
   - flyway_schema_history
   - legacy_audit_log
+  - /^relay_\d+_feed$/
 `
 	var config SchemabotConfig
 	decoder := yaml.NewDecoder(strings.NewReader(yamlData))
 	decoder.KnownFields(true)
 	require.NoError(t, decoder.Decode(&config))
-	assert.Equal(t, []string{"flyway_schema_history", "legacy_audit_log"}, config.IgnoreTables)
+	assert.Equal(t, []string{"flyway_schema_history", "legacy_audit_log", `/^relay_\d+_feed$/`}, config.IgnoreTables,
+		"a pattern entry is read as written, backslashes included")
 }
 
 // The exclusion keys are validated where the config is read, not where it is
@@ -1393,6 +1398,10 @@ func TestFetchConfigRejectsUnusableExclusionEntries(t *testing.T) {
 		"padded ignore_tables entry": {
 			yaml: "database: payments\ntype: mysql\nignore_tables:\n  - \" flyway_schema_history\"\n",
 			want: "ignore_tables",
+		},
+		"ignore_tables pattern that does not compile": {
+			yaml: "database: payments\ntype: mysql\nignore_tables:\n  - /^relay_(\\d+_feed$/\n",
+			want: `ignore_tables entry "/^relay_(\d+_feed$/" is not a valid regular expression`,
 		},
 		"padded ignore_namespaces entry": {
 			yaml: "database: payments\ntype: mysql\nignore_namespaces:\n  - \" local_fixtures\"\n",

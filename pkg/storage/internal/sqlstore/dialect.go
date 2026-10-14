@@ -59,6 +59,13 @@ type Dialect interface {
 	// whose default column collation folds case or accents must force a binary
 	// comparison rather than inherit the column's collation.
 	BinaryEquals(column string) string
+	// BinaryCollation returns expression under a collation that compares
+	// byte-for-byte, so an equality between two such expressions holds only
+	// for identical bytes. Case-significant values such as operation keys,
+	// whose namespace and table components may differ only by case or accent,
+	// are compared through it where both sides are expressions rather than a
+	// bound placeholder (see BinaryEquals).
+	BinaryCollation(expression string) string
 	// JoinedUpdate returns an UPDATE that changes target rows selected through a
 	// join. Aliases qualify join and predicate expressions, while assignments to
 	// target columns must be unqualified so the statement is valid across
@@ -86,10 +93,19 @@ type Dialect interface {
 	// concurrent lease steal: a steal that commits while the guarded statement
 	// runs must fail the fence rather than let a stale token check pass, and a
 	// fence that wins the race must block the steal until the guarded write
-	// commits. Dialects whose joined DML record-locks the scanned joined rows
-	// achieve this with plain token equality; dialects whose joined DML reads
-	// the joined table without locks must lock the row explicitly.
+	// commits. Dialects whose joined UPDATE and DELETE lock the rows they read
+	// from the joined table achieve this with plain token equality; dialects
+	// that read those rows without locks must lock the row explicitly. The
+	// joined table may be the table the statement modifies.
 	LeaseTokenFence(joinTable, joinAlias, idColumn, tokenColumn string) string
+	// LeaseSourceFence is LeaseTokenFence for the WHERE clause of an
+	// INSERT … SELECT whose source is the lease row, or of a subquery that reads
+	// the lease row inside a statement that writes another table, reached
+	// through sourceAlias over sourceTable. It carries the same serialization
+	// contract, and it must hold at every isolation level the session may run
+	// at: a dialect that reads those source rows without locks under some
+	// isolation level must lock the row explicitly.
+	LeaseSourceFence(sourceTable, sourceAlias, idColumn, tokenColumn string) string
 }
 
 // InsertIfAbsentSyntax contains the dialect-specific fragments surrounding an
@@ -265,6 +281,13 @@ func (MySQLDialect) BinaryEquals(column string) string {
 	return column + " COLLATE utf8mb4_0900_bin = ?"
 }
 
+// BinaryCollation applies the binary collation, for the same reason as
+// BinaryEquals: under the table default utf8mb4_0900_ai_ci, values that differ
+// only by case or accent compare equal.
+func (MySQLDialect) BinaryCollation(expression string) string {
+	return "(" + expression + ") COLLATE utf8mb4_0900_bin"
+}
+
 // JoinedUpdate builds a MySQL multi-table UPDATE statement.
 func (MySQLDialect) JoinedUpdate(targetTable, targetAlias, joinTable, joinAlias, joinCondition string, assignments []JoinedUpdateAssignment, predicate string) string {
 	if len(assignments) == 0 {
@@ -298,11 +321,37 @@ func (MySQLDialect) JoinedDelete(targetTable, targetAlias, joinTable, joinAlias,
 		" WHERE " + predicate
 }
 
-// LeaseTokenFence renders a plain token-equality check: MySQL's multi-table
-// UPDATE and DELETE record-lock the scanned rows of the joined table, so the
-// equality alone serializes against a concurrent lease steal.
+// LeaseTokenFence renders a plain token-equality check. InnoDB share-locks
+// the rows a multi-table UPDATE or DELETE reads from the joined table at every
+// isolation level, so the equality alone serializes against a concurrent lease
+// steal. A locking subquery is not an option here: the joined table may be the
+// table being updated (an operation lease authorizing writes to sibling
+// operation rows), and MySQL rejects a subquery that reads the table a
+// statement modifies.
 func (MySQLDialect) LeaseTokenFence(_, joinAlias, _, tokenColumn string) string {
 	return joinAlias + "." + tokenColumn + " = ?"
+}
+
+// LeaseSourceFence locks the source row while checking its token. The SELECT
+// half of an INSERT … SELECT share-locks its source rows only under REPEATABLE
+// READ; a session at READ COMMITTED reads them as a consistent read, so a plain
+// token equality there would pass against a token a concurrent steal was
+// replacing. The correlated FOR SHARE subquery is a locking read at any
+// isolation level: it waits out an uncommitted steal and then sees the rotated
+// token, or holds the steal off until the insert commits.
+func (MySQLDialect) LeaseSourceFence(sourceTable, sourceAlias, idColumn, tokenColumn string) string {
+	return correlatedLeaseFence(sourceTable, sourceAlias, idColumn, tokenColumn, "FOR SHARE")
+}
+
+// correlatedLeaseFence renders the locking form of a lease fence: the aliased
+// row's id must equal the id of the same row re-read under lockClause with the
+// token bound to the fragment's single placeholder.
+func correlatedLeaseFence(table, alias, idColumn, tokenColumn, lockClause string) string {
+	return alias + "." + idColumn +
+		" = (SELECT fence." + idColumn +
+		" FROM " + table + " fence" +
+		" WHERE fence." + idColumn + " = " + alias + "." + idColumn +
+		" AND fence." + tokenColumn + " = ? " + lockClause + ")"
 }
 
 func mysqlIntervalUnit(unit IntervalUnit) string {
@@ -464,6 +513,12 @@ func (PostgresDialect) BinaryEquals(column string) string {
 	return column + " = ?"
 }
 
+// BinaryCollation returns expression unchanged: PostgreSQL's deterministic
+// collations already compare equality byte-for-byte.
+func (PostgresDialect) BinaryCollation(expression string) string {
+	return expression
+}
+
 // JoinedUpdate builds a PostgreSQL UPDATE … FROM statement. The join condition
 // moves into the WHERE clause alongside the residual predicate; SET
 // placeholders still precede predicate placeholders, so the placeholder-free
@@ -515,20 +570,29 @@ func (PostgresDialect) JoinedDelete(targetTable, targetAlias, joinTable, joinAli
 }
 
 // LeaseTokenFence locks the joined row while checking its token. UPDATE … FROM
-// and DELETE … USING read the joined table from the MVCC snapshot without
-// locks, so a plain token equality could pass with a stale value after a
-// concurrent steal commits. The correlated FOR UPDATE subquery record-locks
-// the joined row instead: under READ COMMITTED a lock wait re-evaluates the
-// subquery's predicate against the latest committed row version, so a steal
-// that commits first fails the fence, and a fence that locks first blocks the
-// steal until the guarded write commits — the serialization MySQL's
-// multi-table row locking provides.
+// and DELETE … USING read other tables from the MVCC snapshot without locks, so
+// a plain token equality could pass with a stale value after a concurrent
+// steal commits. The correlated FOR SHARE subquery row-locks the joined row
+// instead: under READ COMMITTED a lock wait re-evaluates the subquery's
+// predicate against the latest committed row version, so a steal that commits
+// first fails the fence, and a fence that locks first blocks the steal until
+// the guarded write commits — the serialization MySQL's row locking provides.
+//
+// A share lock is enough because the fence only reads the lease row: the
+// steal it must serialize against is an UPDATE of that row, which share locks
+// block. Two leased writers for the same apply then hold the fence together,
+// so the apply log, comment and task writes of one drive do not queue behind
+// each other; only a steal or the lease heartbeat's own UPDATE waits on them.
 func (PostgresDialect) LeaseTokenFence(joinTable, joinAlias, idColumn, tokenColumn string) string {
-	return joinAlias + "." + idColumn +
-		" = (SELECT fence." + idColumn +
-		" FROM " + joinTable + " fence" +
-		" WHERE fence." + idColumn + " = " + joinAlias + "." + idColumn +
-		" AND fence." + tokenColumn + " = ? FOR UPDATE)"
+	return correlatedLeaseFence(joinTable, joinAlias, idColumn, tokenColumn, "FOR SHARE")
+}
+
+// LeaseSourceFence renders the same locking fence as LeaseTokenFence: the
+// SELECT of an INSERT … SELECT reads its source rows from the MVCC snapshot
+// without locks at every isolation level, so the source row needs the same
+// explicit lock as a joined row.
+func (PostgresDialect) LeaseSourceFence(sourceTable, sourceAlias, idColumn, tokenColumn string) string {
+	return correlatedLeaseFence(sourceTable, sourceAlias, idColumn, tokenColumn, "FOR SHARE")
 }
 
 // ExcludedValue returns the PostgreSQL reference to the proposed row value.

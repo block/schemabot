@@ -217,3 +217,9 @@ func TestInitCancellationPreservesCauseAndRecovery(t *testing.T) {
 	require.ErrorContains(t, err, "schema files changed")
 	require.NotContains(t, err.Error(), "cancelled")
 }
+
+func TestSchemaDriftDoesNotSuggestRetry(t *testing.T) {
+	drift := &initSchemaDriftError{message: "review your edits with plan"}
+	require.Same(t, drift, retainedInitError(drift))
+	require.ErrorContains(t, retainedInitError(errors.New("connection failed")), "retained for retry")
+}

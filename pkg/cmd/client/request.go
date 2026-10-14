@@ -10,6 +10,9 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
+	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -64,15 +67,39 @@ func SetAuthToken(token string) {
 
 // bearerTransport sets "Authorization: Bearer <token>" on each request when a
 // token is configured and the header is not already set.
+//
+// The token belongs to the server the command addressed, so across a redirect
+// it travels only while every hop stays on the origin (scheme, host, and port)
+// of the request the command sent. That is stricter than net/http, which keeps
+// sensitive headers across a redirect to a subdomain, another port, or another
+// scheme of the same host. A redirect to another origin is still followed, as
+// net/http follows it, but without the token; once a chain has left the origin
+// it stays unauthenticated, as net/http's own stripping of sensitive headers
+// does. A redirect whose chain the base transport did not record in full is
+// treated as having left the origin, since the token's origin cannot be
+// established from what remains.
 type bearerTransport struct {
-	base   http.RoundTripper
-	token  string
+	base  http.RoundTripper
+	token string
+	// origin, when set, is the one origin (as RequestOrigin renders it) the
+	// private local-runtime credential may be sent to; every other request
+	// is refused outright.
 	origin string
 }
 
 func (t *bearerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	if t.origin != "" && req.URL.Scheme+"://"+req.URL.Host != t.origin {
+	if t.origin != "" && RequestOrigin(req.URL) != t.origin {
 		return nil, fmt.Errorf("refusing to forward local runtime credentials to another endpoint")
+	}
+	chain, complete := redirectChain(req)
+	if !complete {
+		WarnUnauthenticatedRedirect("its origin cannot be established", "", RequestOrigin(req.URL))
+		return t.base.RoundTrip(withoutAuthorization(req))
+	}
+	first := chain[0]
+	if !StayedOnFirstOrigin(chain) {
+		WarnUnauthenticatedRedirect("it is on another origin", RequestOrigin(first.URL), RequestOrigin(req.URL))
+		return t.base.RoundTrip(withoutAuthorization(req))
 	}
 	if t.token != "" && req.Header.Get("Authorization") == "" {
 		if err := GuardInsecureToken(req.URL); err != nil {
@@ -83,6 +110,100 @@ func (t *bearerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		req.Header.Set("Authorization", "Bearer "+t.token)
 	}
 	return t.base.RoundTrip(req)
+}
+
+// warnWriter receives the CLI's warning lines. Nil means the process's stderr
+// as it is when the warning is written, the same stream the commands use for
+// their own warnings, so an operator sees why a later 401 happened next to the
+// command output rather than in a log format they filter out. It is resolved at
+// write time rather than bound at package init, so a caller that redirects
+// os.Stderr sees the warning too.
+var warnWriter io.Writer
+
+// WarnUnauthenticatedRedirect tells the operator that a redirect is being
+// followed without the token and why, naming the origin the token belongs to
+// (when known) and the origin the redirect points at.
+func WarnUnauthenticatedRedirect(reason, tokenOrigin, redirectOrigin string) {
+	subject := "the auth token"
+	if tokenOrigin != "" {
+		subject += " for " + tokenOrigin
+	}
+	// The warning is advisory. A stderr that refuses writes leaves nowhere to
+	// report that, and the request itself is unaffected.
+	out := warnWriter
+	if out == nil {
+		out = os.Stderr
+	}
+	_, _ = fmt.Fprintf(out, "Warning: not sending %s to redirect target %s because %s; the request continues unauthenticated\n",
+		subject, redirectOrigin, reason)
+}
+
+// withoutAuthorization returns a copy of req with no Authorization header.
+// RoundTrip must not mutate the caller's request, so the header is removed
+// from a clone. The clone is the contract, not a sign the header is expected:
+// by the time a cross-host redirect reaches this transport net/http has usually
+// stripped it already, and the copy is then of a request with nothing to remove.
+func withoutAuthorization(req *http.Request) *http.Request {
+	stripped := req.Clone(req.Context())
+	stripped.Header.Del("Authorization")
+	return stripped
+}
+
+// redirectChain returns the requests net/http sent to arrive at req, oldest
+// first and ending with req itself, and whether that chain is complete. A
+// request that is not a redirect is a complete chain of one.
+//
+// net/http links each redirected request to the response that caused it, and
+// the response to the request that produced it. A base RoundTripper that omits
+// that second link leaves the earlier hops unknowable, so the chain is reported
+// incomplete rather than presenting the hop it stopped at as the first request.
+func redirectChain(req *http.Request) (chain []*http.Request, complete bool) {
+	chain = []*http.Request{req}
+	for hop := req; hop.Response != nil; hop = hop.Response.Request {
+		if hop.Response.Request == nil {
+			slices.Reverse(chain)
+			return chain, false
+		}
+		chain = append(chain, hop.Response.Request)
+	}
+	slices.Reverse(chain)
+	return chain, true
+}
+
+// StayedOnFirstOrigin reports whether every hop in a redirect chain targets the
+// origin of the request the command sent. The chain is oldest first, so an
+// http.Client CheckRedirect policy passes its via requests with the pending
+// request appended. Any CLI client that sends a credential across redirects
+// holds it to this rule, so the token stays with the origin it was sent to.
+// An empty chain has sent nothing, so it has left no origin.
+func StayedOnFirstOrigin(chain []*http.Request) bool {
+	if len(chain) == 0 {
+		return true
+	}
+	origin := RequestOrigin(chain[0].URL)
+	for _, hop := range chain[1:] {
+		if RequestOrigin(hop.URL) != origin {
+			return false
+		}
+	}
+	return true
+}
+
+// RequestOrigin renders a URL's origin as scheme://host:port, with the scheme
+// and host lowercased and the scheme's default port made explicit, so the same
+// server compares equal however a redirect spells it.
+func RequestOrigin(u *url.URL) string {
+	scheme := strings.ToLower(u.Scheme)
+	port := u.Port()
+	if port == "" {
+		switch scheme {
+		case "https":
+			port = "443"
+		case "http":
+			port = "80"
+		}
+	}
+	return scheme + "://" + net.JoinHostPort(strings.ToLower(u.Hostname()), port)
 }
 
 // ErrInsecureTokenTransport is returned when a Bearer token would be sent over
@@ -124,6 +245,13 @@ type APIError struct {
 	// only on responses that advertise one. Read it through RetryAfter rather
 	// than on its own, so a retry is never scheduled without it.
 	RetryAfterSeconds int
+
+	// RetryAfterHeader is the delay the response's Retry-After header asked
+	// for, zero when it sent none or one that could not be read. Unlike
+	// RetryAfter it does not say whether to retry: a proxy in front of the
+	// server can send it with no error code, so the caller decides from the
+	// status whether the request is worth repeating.
+	RetryAfterHeader time.Duration
 }
 
 func (e *APIError) Error() string {
@@ -132,9 +260,15 @@ func (e *APIError) Error() string {
 
 // RetryAfter reports whether this request should be retried and how long to
 // wait first, so a caller automating against the API gets both facts from one
-// call instead of retrying on the code and ignoring the delay.
+// call instead of retrying on the code and ignoring the delay. Whether to retry
+// comes from the error code alone; the delay is the longer of the body's and
+// the Retry-After header's, so no caller retries sooner than either asked.
 func (e *APIError) RetryAfter() (retry bool, after time.Duration) {
-	return apitypes.ErrorResponse{ErrorCode: e.ErrorCode, RetryAfterSeconds: e.RetryAfterSeconds}.RetryAfter()
+	retry, after = apitypes.ErrorResponse{ErrorCode: e.ErrorCode, RetryAfterSeconds: e.RetryAfterSeconds}.RetryAfter()
+	if !retry {
+		return false, 0
+	}
+	return true, max(after, e.RetryAfterHeader)
 }
 
 // IsNotFound reports whether the error is a 404 from the API.
@@ -184,7 +318,7 @@ func doGetIntoWithClient(ctx context.Context, client *http.Client, endpoint, pat
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return parseAPIError(resp.StatusCode, respBody)
+		return parseAPIError(resp, respBody)
 	}
 
 	if err := json.Unmarshal(respBody, result); err != nil {
@@ -217,7 +351,7 @@ func doSendBody(endpoint, method, path string, body any) error {
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return parseAPIError(resp.StatusCode, respBody)
+		return parseAPIError(resp, respBody)
 	}
 	return nil
 }
@@ -266,7 +400,7 @@ func doPostIntoWithClient(ctx context.Context, client *http.Client, endpoint, pa
 	// recorded and the apply owner completes it asynchronously; the body
 	// carries the same JSON shape as a 200 and is equally a success.
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted {
-		return parseAPIError(resp.StatusCode, respBody)
+		return parseAPIError(resp, respBody)
 	}
 
 	if err := json.Unmarshal(respBody, result); err != nil {
@@ -326,20 +460,63 @@ func stripHTMLTags(s string) string {
 }
 
 // parseAPIError builds an APIError from a non-200 HTTP response, extracting
-// the error_code and any advertised retry delay from the JSON body. The delay
-// is read from the body rather than the Retry-After header because this client
-// keeps error bodies and discards responses.
-func parseAPIError(statusCode int, body []byte) *APIError {
+// the error_code and any advertised retry delay from the JSON body, and the
+// Retry-After header, which a proxy or rate limiter in front of SchemaBot may
+// send with a body that carries neither.
+func parseAPIError(resp *http.Response, body []byte) *APIError {
 	apiErr := &APIError{
-		Status:  statusCode,
-		Message: FormatAPIError(statusCode, body),
+		Status:           resp.StatusCode,
+		Message:          FormatAPIError(resp.StatusCode, body),
+		RetryAfterHeader: parseRetryAfterHeader(resp.Header.Get("Retry-After"), time.Now()),
 	}
-	var resp apitypes.ErrorResponse
-	if json.Unmarshal(body, &resp) == nil {
-		apiErr.ErrorCode = resp.ErrorCode
-		apiErr.RetryAfterSeconds = resp.RetryAfterSeconds
+	var errResp apitypes.ErrorResponse
+	if json.Unmarshal(body, &errResp) == nil {
+		apiErr.ErrorCode = errResp.ErrorCode
+		apiErr.RetryAfterSeconds = errResp.RetryAfterSeconds
 	}
 	return apiErr
+}
+
+// maxRetryAfterHeader bounds the delay a Retry-After header can ask for. The
+// header can come from any proxy or maintenance page in front of the server,
+// which commonly asks for an hour, and a watch that honoured that would sit far
+// past the few minutes of failed polls after which it is documented to give
+// up. The server's own delay arrives in the response body and is not bounded
+// here.
+const maxRetryAfterHeader = 5 * time.Minute
+
+// parseRetryAfterHeader reads a Retry-After header value in either form RFC
+// 9110 allows: a count of seconds, or an HTTP date measured from now, bounded
+// by maxRetryAfterHeader. An absent, malformed, or negative value, or a date
+// already past, yields zero, so a header nobody can act on never delays a
+// retry. A count of seconds too large to read is still a request to wait long,
+// so it yields the bound.
+func parseRetryAfterHeader(value string, now time.Time) time.Duration {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0
+	}
+	if isDigits(value) {
+		seconds, err := strconv.ParseInt(value, 10, 64)
+		if err != nil || seconds > int64(maxRetryAfterHeader/time.Second) {
+			return maxRetryAfterHeader
+		}
+		return time.Duration(seconds) * time.Second
+	}
+	at, err := http.ParseTime(value)
+	if err != nil {
+		return 0
+	}
+	return min(max(at.Sub(now), 0), maxRetryAfterHeader)
+}
+
+func isDigits(s string) bool {
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // ConnectionError represents a client-side failure to reach the server
@@ -408,4 +585,14 @@ func FormatAPIError(statusCode int, body []byte) string {
 }
 
 // SetLocalAuth binds the private runtime credential to its verified endpoint.
-func SetLocalAuth(token, endpoint string) { SetAuthToken(token); authTransport.origin = endpoint }
+// The endpoint is stored as the origin RoundTrip compares requests against, so
+// the credential goes to the same server however a request spells it. An
+// endpoint that does not parse as a URL is kept as given; nothing renders to
+// it, so every request is refused rather than one slipping through.
+func SetLocalAuth(token, endpoint string) {
+	SetAuthToken(token)
+	authTransport.origin = endpoint
+	if u, err := url.Parse(endpoint); err == nil {
+		authTransport.origin = RequestOrigin(u)
+	}
+}

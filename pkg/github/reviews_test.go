@@ -193,6 +193,25 @@ func TestGetApprovedReviewers(t *testing.T) {
 	}
 }
 
+// Each approval carries the commit it was given on, taken from the reviewer's
+// latest decisive review rather than an earlier approval.
+func TestGetApprovedReviewsCarriesCommit(t *testing.T) {
+	now := time.Now()
+	reviews := []*ReviewInfo{
+		{User: "alice", State: ReviewApproved, SubmittedAt: now.Add(-2 * time.Hour), CommitID: "aaa111"},
+		{User: "alice", State: ReviewApproved, SubmittedAt: now.Add(-time.Hour), CommitID: "bbb222"},
+		{User: "alice", State: ReviewCommented, SubmittedAt: now, CommitID: "ccc333"},
+		{User: "bob", State: ReviewApproved, SubmittedAt: now.Add(-time.Hour), CommitID: "aaa111"},
+		{User: "bob", State: ReviewDismissed, SubmittedAt: now, CommitID: "bbb222"},
+	}
+
+	approvals := GetApprovedReviews(reviews)
+
+	require.Len(t, approvals, 1)
+	assert.Equal(t, "alice", approvals[0].User)
+	assert.Equal(t, "bbb222", approvals[0].CommitID)
+}
+
 func TestIsTeamMember(t *testing.T) {
 	setGitHubUnavailableReadRetryDelay(t, time.Millisecond)
 	tests := []struct {

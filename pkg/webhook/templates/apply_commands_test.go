@@ -4,7 +4,10 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/block/schemabot/pkg/state"
 )
 
 // The rejection lists the teams and users allowed to run the command, so a
@@ -86,4 +89,24 @@ func TestRenderBaseSchemaFreshnessRejection(t *testing.T) {
 		require.Contains(t, out, "apply was rejected")
 		require.NotContains(t, out, "schema/orders")
 	})
+}
+
+// An apply SchemaBot has accepted but not yet started reads as queued from the
+// first comment, so a wait for capacity never looks like a hung apply. Once the
+// apply is running, the same comment says the schema changes are being applied.
+func TestRenderApplyStartedReflectsWhetherTheApplyHasStarted(t *testing.T) {
+	data := ApplyStatusCommentData{
+		Database: "orders", Environment: "staging", RequestedBy: "dave", ApplyID: "apply-1",
+	}
+
+	data.State = state.Apply.Pending
+	queued := RenderApplyStarted(data)
+	assert.Contains(t, queued, "**Status**: Queued")
+	assert.Contains(t, queued, "This schema change starts automatically, and this comment updates once it does.")
+	assert.NotContains(t, queued, "being applied")
+
+	data.State = state.Apply.Running
+	running := RenderApplyStarted(data)
+	assert.Contains(t, running, "Schema changes are being applied. This comment will be updated with progress.")
+	assert.NotContains(t, running, "Queued")
 }

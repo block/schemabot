@@ -21,6 +21,12 @@ type ExecutionTarget struct {
 	DatabaseType string
 	Deployment   string
 	Target       string
+
+	// Namespaces is the subset of the declared namespaces this target holds,
+	// in configured order. Empty means the target holds every namespace the
+	// schema files declare. It narrows what the member plans and pulls and is
+	// not part of its identity: MemberID stays the deployment and target.
+	Namespaces []string
 }
 
 // MemberID is the rollout-member identity of this execution target: the
@@ -28,6 +34,11 @@ type ExecutionTarget struct {
 // deployment name alone does not identify a member, because one deployment can
 // address several targets; callers that compare, order, or report members must
 // use this pair rather than the deployment.
+//
+// The pair is joined with a slash, so two members compare equal only when both
+// fields do: deployment names are validated at config load to letters, digits,
+// underscores, and hyphens, so the first slash always ends the deployment,
+// whatever the target contains.
 func (t ExecutionTarget) MemberID() string {
 	return t.Deployment + "/" + t.Target
 }

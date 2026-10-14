@@ -33,11 +33,12 @@ func TestRenderPlanComment_LintShownOnPlanNotOnApply(t *testing.T) {
 	assert.NotContains(t, apply, "Column added without DEFAULT value")
 }
 
-// Unsafe-change warnings belong on the plan comment, where the operator reviews
-// them before applying. Unsafe changes only reach an apply after the operator
-// acknowledged them with --allow-unsafe (apply-confirm re-checks and blocks
-// otherwise), so the locked apply comment omits the warning block as noise.
-func TestRenderPlanComment_UnsafeShownOnPlanNotOnApply(t *testing.T) {
+// Unsafe-change warnings appear on the plan comment, where the operator reviews
+// them before applying, and on the locked apply comment, as the record of what
+// the running apply destroys: the plan can have changed since the operator
+// opted in with --allow-unsafe. The guidance on making a drop safe stays on
+// the plan comment, since it is out of reach once the apply runs.
+func TestRenderPlanComment_UnsafeShownOnPlanAndApply(t *testing.T) {
 	data := PlanCommentData{
 		Database: "testapp", Environment: "staging", IsMySQL: true,
 		Changes: []KeyspaceChangeData{{
@@ -57,9 +58,8 @@ func TestRenderPlanComment_UnsafeShownOnPlanNotOnApply(t *testing.T) {
 
 	data.IsLocked = true
 	apply := RenderPlanComment(data)
-	assert.NotContains(t, apply, "**Issues**: 1 unsafe change detected", "the locked apply comment omits the unsafe warning as noise")
-	assert.NotContains(t, apply, "DROP COLUMN is destructive")
-	assert.NotContains(t, apply, "Destructive drop guidance", "the drop guidance rides inside the unsafe block and is omitted with it")
+	assert.Contains(t, apply, "**Issues**: 1 unsafe change detected\n1. `users`: DROP COLUMN is destructive\n", "the locked apply comment records the unsafe change it runs")
+	assert.NotContains(t, apply, "Destructive drop guidance", "the drop guidance is out of reach once the apply runs")
 	assert.Contains(t, apply, "DROP COLUMN `email`", "the DDL itself stays visible on the apply comment")
 }
 
@@ -106,7 +106,8 @@ func TestRenderPlanComment_ShardedPartiallyApplied(t *testing.T) {
 	})
 
 	assert.Contains(t, out, "Shards diverge — what applies where:", "a partially-applied keyspace is divergent")
-	assert.Contains(t, out, "Already applied — no change.", "satisfied shards are surfaced, not hidden")
+	assert.Contains(t, out, "**shard `-40`**\n\nNo schema changes detected\n\n", "satisfied shards are surfaced, not hidden")
+	assert.NotContains(t, out, "✅", "a keyspace with shards left to change is not all clear")
 	assert.Contains(t, out, "**shard `-40`**", "the satisfied shard is named")
 	assert.Contains(t, out, "**shards `40-80`, `80-c0`, `c0-`**", "the changing shards share one group")
 	assert.Equal(t, 1, strings.Count(out, "```sql"), "the satisfied group shows no empty code block")

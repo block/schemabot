@@ -163,12 +163,12 @@ func TestFinalizerDispatchScope(t *testing.T) {
 		},
 	}
 	t.Run("single namespace is namespace-scoped", func(t *testing.T) {
-		ns, err := finalizerDispatchScope(plan, []string{"ks_a"}, nil)
+		ns, err := finalizerDispatchScope(plan, []string{"ks_a"}, nil, "")
 		require.NoError(t, err)
 		assert.Equal(t, "ks_a", ns)
 	})
 	t.Run("single namespace with a namespace-keyed manifest stays namespace-scoped", func(t *testing.T) {
-		ns, err := finalizerDispatchScope(plan, []string{"ks_a"}, []string{"ks_a/-80/users", "ks_a/group_finalizer"})
+		ns, err := finalizerDispatchScope(plan, []string{"ks_a"}, []string{"ks_a/-80/users", "ks_a/group_finalizer"}, "")
 		require.NoError(t, err)
 		assert.Equal(t, "ks_a", ns)
 	})
@@ -180,7 +180,7 @@ func TestFinalizerDispatchScope(t *testing.T) {
 				"ks_a": {Artifacts: map[string]string{storage.VSchemaArtifactName: `{"sharded": true}`}},
 			},
 		}
-		ns, err := finalizerDispatchScope(soloPlan, []string{"ks_a"}, []string{"group_finalizer"})
+		ns, err := finalizerDispatchScope(soloPlan, []string{"ks_a"}, []string{"group_finalizer"}, "")
 		require.NoError(t, err)
 		assert.Empty(t, ns)
 	})
@@ -193,7 +193,7 @@ func TestFinalizerDispatchScope(t *testing.T) {
 				"ks_b": {Artifacts: map[string]string{storage.VSchemaArtifactName: `{"tables": {}}`}},
 			},
 		}
-		_, err := finalizerDispatchScope(twoPlan, []string{"ks_a"}, []string{"group_finalizer"})
+		_, err := finalizerDispatchScope(twoPlan, []string{"ks_a"}, []string{"group_finalizer"}, "")
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "must cover the plan's full finalizer set")
 	})
@@ -206,7 +206,7 @@ func TestFinalizerDispatchScope(t *testing.T) {
 				"ks_b": {Artifacts: map[string]string{storage.VSchemaArtifactName: `{"tables": {}}`}},
 			},
 		}
-		ns, err := finalizerDispatchScope(multiPlan, []string{"ks_b", "ks_a"}, nil)
+		ns, err := finalizerDispatchScope(multiPlan, []string{"ks_b", "ks_a"}, nil, "")
 		require.NoError(t, err)
 		assert.Empty(t, ns)
 	})
@@ -220,17 +220,17 @@ func TestFinalizerDispatchScope(t *testing.T) {
 				"ks_c": {Artifacts: map[string]string{storage.VSchemaArtifactName: `{"tables": {}}`}},
 			},
 		}
-		_, err := finalizerDispatchScope(multiPlan, []string{"ks_a", "ks_b"}, nil)
+		_, err := finalizerDispatchScope(multiPlan, []string{"ks_a", "ks_b"}, nil, "")
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "must cover the plan's full finalizer set")
 	})
 	t.Run("no namespaces fails closed", func(t *testing.T) {
-		_, err := finalizerDispatchScope(plan, nil, nil)
+		_, err := finalizerDispatchScope(plan, nil, nil, "")
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "names no namespaces")
 	})
 	t.Run("namespace without a VSchema artifact fails closed", func(t *testing.T) {
-		_, err := finalizerDispatchScope(plan, []string{"ks_b"}, nil)
+		_, err := finalizerDispatchScope(plan, []string{"ks_b"}, nil, "")
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "neither a VSchema artifact nor a finalize request")
 	})

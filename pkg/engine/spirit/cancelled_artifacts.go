@@ -21,6 +21,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/block/spirit/pkg/dbconn/sqlescape"
 	"github.com/block/spirit/pkg/utils"
 
 	"github.com/block/schemabot/pkg/engine"
@@ -275,7 +276,7 @@ func discardArtifacts(ctx context.Context, db *sql.DB, database string, names []
 	discarded := make([]string, 0, len(names))
 	for _, name := range names {
 		if _, err := db.ExecContext(ctx, fmt.Sprintf("DROP TABLE IF EXISTS %s.%s",
-			quoteIdentifier(database), quoteIdentifier(name))); err != nil {
+			sqlescape.EscapeIdentifier(database), sqlescape.EscapeIdentifier(name))); err != nil {
 			return discarded, fmt.Errorf("discard cancelled schema change artifact %s.%s: %w", database, name, err)
 		}
 		discarded = append(discarded, database+"."+name)

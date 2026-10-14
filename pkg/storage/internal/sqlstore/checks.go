@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
@@ -93,6 +94,29 @@ func (s *checkStore) Upsert(ctx context.Context, check *storage.Check) error {
 // only a write that re-ran the rollup and found the deployments clean may clear
 // it. See storage.PlanDriftState.
 func (s *checkStore) UpsertPlanResult(ctx context.Context, check *storage.Check, drift storage.PlanDriftState) (bool, error) {
+	// A not-evaluated write preserves an existing review-time block, a
+	// deployment drift block or a namespace placement refusal: only a write
+	// that re-ran the rollup (clean or blocked) may rewrite it.
+	var preserve []string
+	if drift == storage.PlanDriftNotEvaluated {
+		preserve = []string{storage.ReviewTimeDeploymentDriftBlockingReason, storage.NamespacePlacementRefusedBlockingReason}
+	}
+	return s.upsertPlanResultPreserving(ctx, check, preserve)
+}
+
+// UpsertGuardBlock records a guard block over plan-derived check state,
+// refusing while an in-progress apply owns the row like UpsertPlanResult, and
+// leaving a row whose stored blocking reason is in preserve blocked by that
+// reason. The row-level lock makes the read of the stored reason and the write
+// one decision, so a block a concurrent writer records is never replaced.
+func (s *checkStore) UpsertGuardBlock(ctx context.Context, check *storage.Check, preserve []string) (bool, error) {
+	return s.upsertPlanResultPreserving(ctx, check, preserve)
+}
+
+// upsertPlanResultPreserving writes plan-derived check state, keeping the
+// gating columns of an existing row whose stored blocking reason is in
+// preserve.
+func (s *checkStore) upsertPlanResultPreserving(ctx context.Context, check *storage.Check, preserve []string) (bool, error) {
 	canonicalizeCheck(check)
 	var checkRunID any
 	if check.CheckRunID != 0 {
@@ -128,7 +152,7 @@ func (s *checkStore) UpsertPlanResult(ctx context.Context, check *storage.Check,
 			return err
 		}
 
-		stored, err = s.writePlanResultUnlessApplyOwned(ctx, check, drift, checkRunID)
+		stored, err = s.writePlanResultUnlessApplyOwned(ctx, check, preserve, checkRunID)
 		return err
 	})
 	return stored, err
@@ -154,7 +178,7 @@ func (s *checkStore) UpsertPlanResult(ctx context.Context, check *storage.Check,
 // Returns storage.ErrCheckNotFound when the row is gone, which ownership cannot
 // account for: apply-owned rows are retained, so a target a refusal protects
 // still exists.
-func (s *checkStore) writePlanResultUnlessApplyOwned(ctx context.Context, check *storage.Check, drift storage.PlanDriftState, checkRunID any) (bool, error) {
+func (s *checkStore) writePlanResultUnlessApplyOwned(ctx context.Context, check *storage.Check, preserve []string, checkRunID any) (bool, error) {
 	target := fmt.Sprintf("%s#%d %s/%s/%s",
 		check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName)
 
@@ -197,41 +221,46 @@ func (s *checkStore) writePlanResultUnlessApplyOwned(ctx context.Context, check 
 		return false, nil
 	}
 
-	// A not-evaluated write preserves the full gating state of an existing
-	// review-time drift block: it may refresh the head SHA and check run id so the
-	// current-head aggregate stays aligned, but it must not clear the block's
-	// conclusion, blocking reason, or summary. Only a write that re-ran the rollup
-	// (clean or blocked) rewrites those columns.
+	// A row whose stored blocking reason is in preserve keeps its full gating
+	// state: the write may refresh the head SHA and check run id so the
+	// current-head aggregate stays aligned, but it must not clear or replace the
+	// block's conclusion, blocking reason, or summary.
 	// Every CASE predicate reads the stored blocking_reason: preservation
 	// keys on the existing block, never on the incoming write. MySQL
 	// evaluates SET assignments left to right and later expressions see
 	// already-assigned values, while PostgreSQL evaluates every right-hand
 	// side against the old row — so blocking_reason is assigned after every
 	// CASE that reads it, keeping both dialects reading the stored value.
-	if drift == storage.PlanDriftNotEvaluated {
+	if len(preserve) > 0 {
+		kept := "COALESCE(blocking_reason, '') IN (" + strings.TrimSuffix(strings.Repeat("?, ", len(preserve)), ", ") + ")"
+		reasons := make([]any, len(preserve))
+		for i, reason := range preserve {
+			reasons[i] = reason
+		}
+		// Arguments follow the SET list: each CASE takes the preserved
+		// reasons, then the value the write records when the row is not kept.
+		args := []any{check.HeadSHA, checkRunID}
+		args = append(args, reasons...)
+		for _, value := range []any{check.HasChanges, check.Status, check.Conclusion, check.ErrorMessage, nullString(check.ChangeSummary), check.BlockingReason} {
+			args = append(args, reasons...)
+			args = append(args, value)
+		}
+		args = append(args, check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName)
 		_, err = tx.ExecContext(ctx, `
 			UPDATE checks
 			SET head_sha = ?,
 			    check_run_id = ?,
-			    apply_id     = CASE WHEN COALESCE(blocking_reason, '') = ? THEN apply_id     ELSE NULL END,
-			    has_changes  = CASE WHEN COALESCE(blocking_reason, '') = ? THEN has_changes  ELSE ?    END,
-			    status       = CASE WHEN COALESCE(blocking_reason, '') = ? THEN status       ELSE ?    END,
-			    conclusion   = CASE WHEN COALESCE(blocking_reason, '') = ? THEN conclusion   ELSE ?    END,
-			    error_message   = CASE WHEN COALESCE(blocking_reason, '') = ? THEN error_message   ELSE ? END,
-			    change_summary  = CASE WHEN COALESCE(blocking_reason, '') = ? THEN change_summary  ELSE ? END,
-			    blocking_reason = CASE WHEN COALESCE(blocking_reason, '') = ? THEN blocking_reason ELSE ? END,
+			    apply_id        = CASE WHEN `+kept+` THEN apply_id        ELSE NULL END,
+			    has_changes     = CASE WHEN `+kept+` THEN has_changes     ELSE ? END,
+			    status          = CASE WHEN `+kept+` THEN status          ELSE ? END,
+			    conclusion      = CASE WHEN `+kept+` THEN conclusion      ELSE ? END,
+			    error_message   = CASE WHEN `+kept+` THEN error_message   ELSE ? END,
+			    change_summary  = CASE WHEN `+kept+` THEN change_summary  ELSE ? END,
+			    blocking_reason = CASE WHEN `+kept+` THEN blocking_reason ELSE ? END,
 			    updated_at = `+s.dialect.CurrentTimestamp(TimestampPrecisionDefault)+`
 			WHERE repository = ? AND pull_request = ?
 			  AND environment = ? AND database_type = ? AND database_name = ?
-		`, check.HeadSHA, checkRunID,
-			storage.ReviewTimeDeploymentDriftBlockingReason,
-			storage.ReviewTimeDeploymentDriftBlockingReason, check.HasChanges,
-			storage.ReviewTimeDeploymentDriftBlockingReason, check.Status,
-			storage.ReviewTimeDeploymentDriftBlockingReason, check.Conclusion,
-			storage.ReviewTimeDeploymentDriftBlockingReason, check.ErrorMessage,
-			storage.ReviewTimeDeploymentDriftBlockingReason, nullString(check.ChangeSummary),
-			storage.ReviewTimeDeploymentDriftBlockingReason, check.BlockingReason,
-			check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName)
+		`, args...)
 	} else {
 		_, err = tx.ExecContext(ctx, `
 			UPDATE checks
@@ -415,6 +444,18 @@ func isPlanOnlySuccessful(check *storage.Check) bool {
 		!check.HasChanges
 }
 
+// checkApplyLeasePredicate renders the lease guard a terminal check write
+// carries when the apply's driver holds its lease. It binds the apply ID, then
+// the lease token. The applies row is read through a subquery of an UPDATE on
+// checks, so the token check goes through LeaseSourceFence: it serializes
+// against a concurrent steal instead of passing against a token the
+// statement's snapshot still holds, at whatever isolation level the storage
+// session runs.
+func checkApplyLeasePredicate(d Dialect) string {
+	return " AND EXISTS (SELECT 1 FROM applies lease_apply WHERE lease_apply.id = ? AND " +
+		d.LeaseSourceFence("applies", "lease_apply", "id", "lease_token") + ")"
+}
+
 // CompleteForApply updates stored check state to a terminal state only if it
 // still belongs to the apply being completed.
 func (s *checkStore) CompleteForApply(ctx context.Context, check *storage.Check, apply *storage.Apply) (bool, error) {
@@ -429,12 +470,7 @@ func (s *checkStore) CompleteForApply(ctx context.Context, check *storage.Check,
 		checkStatusInProgress, apply.ID, apply.ID}
 	lease := apply.Lease()
 	if lease.Valid() {
-		leasePredicate = `
-		  AND EXISTS (
-		    SELECT 1
-		    FROM applies lease_apply
-		    WHERE lease_apply.id = ? AND lease_apply.lease_token = ?
-		  )`
+		leasePredicate = checkApplyLeasePredicate(s.dialect)
 		args = append(args, lease.ApplyID, lease.Token)
 	}
 
@@ -507,12 +543,7 @@ func (s *checkStore) MarkActionRequiredForApply(ctx context.Context, check *stor
 	}
 	lease := apply.Lease()
 	if lease.Valid() {
-		leasePredicate = `
-		  AND EXISTS (
-		    SELECT 1
-		    FROM applies lease_apply
-		    WHERE lease_apply.id = ? AND lease_apply.lease_token = ?
-		  )`
+		leasePredicate = checkApplyLeasePredicate(s.dialect)
 		args = append(args, lease.ApplyID, lease.Token)
 	}
 
@@ -579,12 +610,7 @@ func (s *checkStore) MarkCancelledApplyFailed(ctx context.Context, check *storag
 		apply.ID, apply.ID, apply.ID, state.Task.Completed}
 	lease := apply.Lease()
 	if lease.Valid() {
-		leasePredicate = `
-		  AND EXISTS (
-		    SELECT 1
-		    FROM applies lease_apply
-		    WHERE lease_apply.id = ? AND lease_apply.lease_token = ?
-		  )`
+		leasePredicate = checkApplyLeasePredicate(s.dialect)
 		args = append(args, lease.ApplyID, lease.Token)
 	}
 

@@ -2,6 +2,7 @@ package tern
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -539,6 +540,293 @@ func TestPollTaskToCompletion_LostEngineWorkNeverCompletesARevertPhaseTask(t *te
 	assert.Equal(t, 0, eng.planCalls, "the target schema is never consulted for a revert-phase task")
 }
 
+// settlementRefusingTaskStore accepts the drive's in-flight progress writes and
+// refuses the first refusals writes that would bring a task to rest (every one
+// when refusals is negative), the way a lease-fenced store refuses a displaced
+// driver once a peer has rotated the token.
+type settlementRefusingTaskStore struct {
+	*stateRecordingTaskStore
+	err      error
+	refusals int
+	refused  int
+}
+
+func (s *settlementRefusingTaskStore) Update(ctx context.Context, t *storage.Task) error {
+	if !state.IsInFlightTaskState(t.State) && s.refusals != 0 {
+		s.refusals--
+		s.refused++
+		return s.err
+	}
+	return s.stateRecordingTaskStore.Update(ctx, t)
+}
+
+// progressRefusingTaskStore is the counterpart: it refuses the first refusals
+// writes that keep a task in flight (every one when refusals is negative) and
+// accepts the rest, so a test can refuse the per-poll progress write alone.
+type progressRefusingTaskStore struct {
+	*stateRecordingTaskStore
+	err      error
+	refusals int
+	refused  int
+}
+
+func (s *progressRefusingTaskStore) Update(ctx context.Context, t *storage.Task) error {
+	if state.IsInFlightTaskState(t.State) && s.refusals != 0 {
+		s.refusals--
+		s.refused++
+		return s.err
+	}
+	return s.stateRecordingTaskStore.Update(ctx, t)
+}
+
+// A peer takes the lease while this drive is settling work its engine lost.
+// The target answered; only the settlement write was refused, because the
+// lease is gone. The drive exits at that write. It must not count the refusal
+// against the verification budget, re-verify the target until the budget runs
+// out, and then rest the task and finalize an apply another driver now owns.
+func TestPollTaskToCompletion_LostWorkSettlementRefusedByLeaseLossExits(t *testing.T) {
+	for name, taskState := range map[string]string{
+		"verified settlement":     state.Task.Running,
+		"revert-phase settlement": state.Task.Reverting,
+	} {
+		t.Run(name, func(t *testing.T) {
+			eng := &lostWorkEngine{
+				phaseSequenceEngine: phaseSequenceEngine{results: []*engine.ProgressResult{{State: engine.StatePending}}},
+				planResult:          &engine.PlanResult{NoChanges: true},
+			}
+			client, apply, task, recording := lostWorkPollFixtureInState(eng, lostWorkTrustBudgetReached, taskState)
+			refusing := &settlementRefusingTaskStore{
+				stateRecordingTaskStore: recording,
+				err:                     fmt.Errorf("task %s update: %w", task.TaskIdentifier, storage.ErrApplyLeaseLost),
+				refusals:                -1,
+			}
+			client.storage.(*exactProgressStorage).tasks = refusing
+
+			action := client.pollTaskToCompletion(t.Context(), apply, task, nil, nil)
+
+			assert.Equal(t, taskAbort, action, "a displaced driver exits without a verdict")
+			assert.Equal(t, 1, refusing.refused, "the drive stops at the first refused settlement instead of retrying it as a verification failure")
+			assert.Equal(t, taskState, task.State, "the in-memory task is left as stored")
+			for _, written := range recording.states {
+				assert.Equal(t, taskState, written, "only in-flight progress writes land; the task is never rested or failed by a displaced driver")
+			}
+		})
+	}
+}
+
+// A storage blip refuses the write that settles lost engine work. Nothing
+// about the lease is known, so the drive keeps the task in flight and settles
+// it at the next poll; the settlement it reports is the one storage accepted.
+func TestPollTaskToCompletion_LostWorkSettlementRetriedAfterStorageBlip(t *testing.T) {
+	for name, tc := range map[string]struct {
+		taskState string
+		action    taskAction
+		settled   string
+	}{
+		"verified settlement":     {taskState: state.Task.Running, action: taskContinue, settled: state.Task.Completed},
+		"revert-phase settlement": {taskState: state.Task.Reverting, action: taskFailed, settled: state.Task.FailedRetryable},
+	} {
+		t.Run(name, func(t *testing.T) {
+			eng := &lostWorkEngine{
+				phaseSequenceEngine: phaseSequenceEngine{results: []*engine.ProgressResult{{State: engine.StatePending}}},
+				planResult:          &engine.PlanResult{NoChanges: true},
+			}
+			client, apply, task, recording := lostWorkPollFixtureInState(eng, lostWorkTrustBudgetReached, tc.taskState)
+			// A whole-namespace task, so a converged re-plan can settle it.
+			task.Shard = ""
+			refusing := &settlementRefusingTaskStore{
+				stateRecordingTaskStore: recording,
+				err:                     errors.New("storage down"),
+				refusals:                1,
+			}
+			client.storage.(*exactProgressStorage).tasks = refusing
+
+			action := client.pollTaskToCompletion(t.Context(), apply, task, nil, nil)
+
+			assert.Equal(t, tc.action, action)
+			assert.Equal(t, tc.settled, task.State, "the reported settlement is the one storage accepted")
+			assert.Equal(t, 1, refusing.refused)
+			require.NotEmpty(t, recording.states)
+			assert.Equal(t, tc.settled, recording.states[len(recording.states)-1])
+		})
+	}
+}
+
+// Every poll of a running copy persists the task row. When a peer has taken
+// the lease, that write is refused and the drive exits at once; when storage
+// blips, the refused write is retried at the next poll and the copy runs on to
+// completion, since a blip says nothing about who owns the work.
+func TestPollTaskToCompletion_RefusedProgressWrite(t *testing.T) {
+	t.Run("lease lost exits", func(t *testing.T) {
+		eng := &phaseSequenceEngine{results: []*engine.ProgressResult{{State: engine.StateRunning}, {State: engine.StateCompleted}}}
+		client, apply, task, recording := lostWorkPollFixture(eng, lostWorkTrustBudgetAmple)
+		refusing := &progressRefusingTaskStore{
+			stateRecordingTaskStore: recording,
+			err:                     fmt.Errorf("task %s update: %w", task.TaskIdentifier, storage.ErrApplyLeaseLost),
+			refusals:                -1,
+		}
+		client.storage.(*exactProgressStorage).tasks = refusing
+
+		action := client.pollTaskToCompletion(t.Context(), apply, task, nil, nil)
+
+		assert.Equal(t, taskAbort, action)
+		assert.Equal(t, 1, refusing.refused, "the drive exits at the first refused progress write")
+		assert.Equal(t, 1, eng.calls, "no further poll after the refusal")
+		assert.Empty(t, recording.states, "no terminal write follows a lost lease")
+	})
+	t.Run("storage blip retries", func(t *testing.T) {
+		eng := &phaseSequenceEngine{results: []*engine.ProgressResult{{State: engine.StateRunning}, {State: engine.StateRunning}, {State: engine.StateCompleted}}}
+		client, apply, task, recording := lostWorkPollFixture(eng, lostWorkTrustBudgetAmple)
+		refusing := &progressRefusingTaskStore{
+			stateRecordingTaskStore: recording,
+			err:                     errors.New("storage down"),
+			refusals:                1,
+		}
+		client.storage.(*exactProgressStorage).tasks = refusing
+
+		action := client.pollTaskToCompletion(t.Context(), apply, task, nil, nil)
+
+		assert.Equal(t, taskContinue, action)
+		assert.Equal(t, state.Task.Completed, task.State)
+		assert.Equal(t, 1, refusing.refused)
+		assert.Equal(t, []string{state.Task.Running, state.Task.Completed}, recording.states, "the retried progress write lands, then the terminal one")
+	})
+	t.Run("rejected value exits", func(t *testing.T) {
+		eng := &phaseSequenceEngine{results: []*engine.ProgressResult{{State: engine.StateRunning}, {State: engine.StateCompleted}}}
+		client, apply, task, recording := lostWorkPollFixture(eng, lostWorkTrustBudgetAmple)
+		refusing := &progressRefusingTaskStore{
+			stateRecordingTaskStore: recording,
+			err:                     fmt.Errorf("update task %s: %w: out of range value for column 'eta_seconds'", task.TaskIdentifier, storage.ErrValueRejected),
+			refusals:                -1,
+		}
+		client.storage.(*exactProgressStorage).tasks = refusing
+
+		action := client.pollTaskToCompletion(t.Context(), apply, task, nil, nil)
+
+		assert.Equal(t, taskAbort, action, "a write storage refuses outright ends the drive instead of freezing the task row")
+		assert.Equal(t, 1, refusing.refused, "the refused value is not written again")
+		assert.Equal(t, 1, eng.calls, "no further poll after the refusal")
+		assert.Empty(t, recording.states)
+		assertApplyLogContains(t, client, "Progress for table orders could not be recorded")
+	})
+	t.Run("persistent failure exits", func(t *testing.T) {
+		eng := &phaseSequenceEngine{results: []*engine.ProgressResult{{State: engine.StateRunning}}}
+		client, apply, task, recording := lostWorkPollFixture(eng, lostWorkTrustBudgetAmple)
+		refusing := &progressRefusingTaskStore{
+			stateRecordingTaskStore: recording,
+			err:                     errors.New("storage down"),
+			refusals:                -1,
+		}
+		client.storage.(*exactProgressStorage).tasks = refusing
+
+		action := client.pollTaskToCompletion(t.Context(), apply, task, nil, nil)
+
+		assert.Equal(t, taskAbort, action, "a write that keeps failing ends the drive as its own failure, not as a stalled row")
+		assert.Equal(t, maxConsecutiveProgressPollErrors, refusing.refused, "the drive spends the poll's error budget before giving up")
+		assert.Equal(t, maxConsecutiveProgressPollErrors, eng.calls)
+		assert.Empty(t, recording.states)
+		assertApplyLogContains(t, client, "Progress for table orders could not be recorded")
+	})
+}
+
+// assertApplyLogContains asserts the drive recorded a durable apply log whose
+// message contains want.
+func assertApplyLogContains(t *testing.T, client *LocalClient, want string) {
+	t.Helper()
+	logs := client.storage.(*exactProgressStorage).logs.(*mockApplyLogStore)
+	for _, entry := range logs.logs {
+		if strings.Contains(entry.Message, want) {
+			return
+		}
+	}
+	assert.Failf(t, "apply log not recorded", "no apply log contains %q", want)
+}
+
+// The terminal-write budget counts consecutive refusals, not refusals over the
+// task's life. An engine reports the task finished, storage refuses the
+// terminal write nine times, the engine then reports the task back in flight
+// and that progress write lands; when the engine reports it finished again, the
+// second run of nine refusals must not abort the drive, since a landed write
+// in between showed storage is taking this task's rows again.
+func TestPollTaskToCompletion_TerminalWriteBudgetRestartsAfterALandedProgressWrite(t *testing.T) {
+	refusalsPerRun := maxConsecutiveTerminalWriteFailures - 1
+	results := make([]*engine.ProgressResult, 0, refusalsPerRun+2)
+	for range refusalsPerRun {
+		results = append(results, &engine.ProgressResult{State: engine.StateCompleted})
+	}
+	results = append(results, &engine.ProgressResult{State: engine.StateRunning}, &engine.ProgressResult{State: engine.StateCompleted})
+	eng := &phaseSequenceEngine{results: results}
+	client, apply, task, recording := lostWorkPollFixture(eng, lostWorkTrustBudgetAmple)
+	refusing := &settlementRefusingTaskStore{
+		stateRecordingTaskStore: recording,
+		err:                     errors.New("storage down"),
+		refusals:                2 * refusalsPerRun,
+	}
+	client.storage.(*exactProgressStorage).tasks = refusing
+
+	action := client.pollTaskToCompletion(t.Context(), apply, task, nil, nil)
+
+	assert.Equal(t, taskContinue, action, "two runs of refusals, each inside the budget, do not abort the drive")
+	assert.Equal(t, 2*refusalsPerRun, refusing.refused, "every refusal in both runs was attempted")
+	assert.Equal(t, state.Task.Completed, task.State)
+	assert.Equal(t, []string{state.Task.Running, state.Task.Completed}, recording.states, "the progress write between the runs lands, then the terminal one")
+	assert.Equal(t, 2*refusalsPerRun+2, eng.calls, "the drive polls once per refusal, once for the in-flight report, and once for the landed terminal write")
+}
+
+// A re-plan verdict the settlement does not know settles nothing: writing a
+// task row with an empty state would leave a row no predicate or sweep can
+// find, so the settlement refuses before it reaches storage.
+func TestSettleLostVerifiedTask_UnknownVerdictWritesNothing(t *testing.T) {
+	client, apply, task, recording := lostWorkPollFixture(&phaseSequenceEngine{}, lostWorkTrustBudgetAmple)
+	before := *task
+
+	err := client.settleLostVerifiedTask(t.Context(), apply, task, replanVerdict(99), engine.StatePending)
+
+	require.ErrorContains(t, err, "unknown re-plan verdict 99")
+	assert.Empty(t, recording.states, "nothing is written for a verdict with no state")
+	assert.Equal(t, before, *task, "the task is left as found")
+}
+
+// Every verdict replanVerdictForTask can return settles the task to a real
+// state, and only a landed change completes it; none reaches the
+// unknown-verdict refusal. A verdict added without a settlement fails here.
+func TestSettleLostVerifiedTask_EveryVerdictSettles(t *testing.T) {
+	want := map[replanVerdict]string{
+		replanNeedsChange:     state.Task.FailedRetryable,
+		replanChangeLanded:    state.Task.Completed,
+		replanCannotAttribute: state.Task.FailedRetryable,
+	}
+	require.Len(t, want, int(replanVerdictCount), "every verdict has an expected settlement")
+	for verdict := range replanVerdictCount {
+		require.Contains(t, want, verdict, "verdict %d has an expected settlement", verdict)
+		client, apply, task, recording := lostWorkPollFixture(&phaseSequenceEngine{}, lostWorkTrustBudgetAmple)
+
+		require.NoError(t, client.settleLostVerifiedTask(t.Context(), apply, task, verdict, engine.StatePending), "verdict %d", verdict)
+
+		assert.Equal(t, []string{want[verdict]}, recording.states, "verdict %d", verdict)
+		assert.Equal(t, want[verdict], task.State, "verdict %d", verdict)
+	}
+}
+
+// An engine refused the table because another run of a schema change still
+// holds it has not failed the schema change. The poll reports the refusal to
+// its caller, which waits for the holder, and records no failure verdict.
+func TestPollTaskToCompletion_TargetHeldIsNotAFailure(t *testing.T) {
+	eng := &phaseSequenceEngine{results: []*engine.ProgressResult{{
+		State: engine.StateFailed, TargetHeld: true,
+		ErrorMessage: "could not acquire advisory lock: lock is held by another connection",
+	}}}
+	client, apply, task, recording := lostWorkPollFixture(eng, lostWorkTrustBudgetAmple)
+
+	action := client.pollTaskToCompletion(t.Context(), apply, task, nil, nil)
+
+	assert.Equal(t, taskTargetHeld, action)
+	assert.Equal(t, 1, eng.calls)
+	assert.Equal(t, state.Task.Running, task.State, "the task is not rested failed or failed_retryable")
+	assert.Empty(t, task.ErrorMessage)
+	assert.Empty(t, recording.states, "no failure verdict is written")
+}
+
 // A task parked at an operator gate — a held cutover, a deferred deploy, an
 // open revert window — is motionless by design for as long as the operator
 // takes to act. The stall watchdog must stay quiet for those states, so the
@@ -844,4 +1132,109 @@ func TestLostEngineWorkPendingBudgetFollowsTheEngine(t *testing.T) {
 	overridden := &LocalClient{lostEngineWorkPendingBudgetOverride: lostWorkTrustBudgetReached}
 	assert.Equal(t, lostWorkTrustBudgetReached, overridden.lostEngineWorkPendingBudget(provisioning))
 	assert.Equal(t, lostWorkTrustBudgetReached, overridden.lostEngineWorkPendingBudget(synchronous))
+}
+
+// An engine that flaps between finished and in flight, against storage that
+// refuses every terminal write while it takes the progress writes, must still
+// end the drive: each landed progress write restarts the consecutive budget,
+// so only a ceiling over the whole poll keeps the drive from holding the
+// database's active-apply slot forever.
+func TestPollTaskToCompletion_TerminalWriteRefusalsStayBoundedUnderAFlappingEngine(t *testing.T) {
+	const flaps = 50
+	results := make([]*engine.ProgressResult, 0, 2*flaps+1)
+	for range flaps {
+		results = append(results, &engine.ProgressResult{State: engine.StateCompleted}, &engine.ProgressResult{State: engine.StateRunning})
+	}
+	results = append(results, &engine.ProgressResult{State: engine.StateCompleted})
+	eng := &phaseSequenceEngine{results: results}
+	client, apply, task, recording := lostWorkPollFixture(eng, lostWorkTrustBudgetAmple)
+	refusing := &settlementRefusingTaskStore{
+		stateRecordingTaskStore: recording,
+		err:                     errors.New("storage down"),
+		refusals:                -1,
+	}
+	client.storage.(*exactProgressStorage).tasks = refusing
+
+	action := client.pollTaskToCompletion(t.Context(), apply, task, nil, nil)
+
+	assert.Equal(t, taskAbort, action)
+	assert.Equal(t, maxTotalTerminalWriteFailures, refusing.refused, "terminal refusals across the task's poll stop at the ceiling")
+	assert.Less(t, eng.calls, len(results), "the drive ends before the scripted engine runs out of flaps")
+}
+
+// allRefusingTaskStore refuses every task write, in flight or at rest.
+type allRefusingTaskStore struct {
+	*stateRecordingTaskStore
+	refused int
+}
+
+func (s *allRefusingTaskStore) Update(context.Context, *storage.Task) error {
+	s.refused++
+	return errors.New("storage down")
+}
+
+// A progress write that storage refuses shows nothing about whether storage is
+// taking this task's rows, so it must not restart the terminal-write budget:
+// nine refused terminal writes, a refused progress write, and one more refused
+// terminal write end the drive.
+func TestPollTaskToCompletion_RefusedProgressWriteDoesNotRestartTerminalBudget(t *testing.T) {
+	refusalsPerRun := maxConsecutiveTerminalWriteFailures - 1
+	results := make([]*engine.ProgressResult, 0, refusalsPerRun+2)
+	for range refusalsPerRun {
+		results = append(results, &engine.ProgressResult{State: engine.StateCompleted})
+	}
+	results = append(results, &engine.ProgressResult{State: engine.StateRunning}, &engine.ProgressResult{State: engine.StateCompleted})
+	eng := &phaseSequenceEngine{results: results}
+	client, apply, task, recording := lostWorkPollFixture(eng, lostWorkTrustBudgetAmple)
+	refusing := &allRefusingTaskStore{stateRecordingTaskStore: recording}
+	client.storage.(*exactProgressStorage).tasks = refusing
+
+	action := client.pollTaskToCompletion(t.Context(), apply, task, nil, nil)
+
+	assert.Equal(t, taskAbort, action)
+	assert.Equal(t, refusalsPerRun+2, eng.calls, "the tenth refused terminal write aborts; the refused progress write in between restarts nothing")
+	assert.Equal(t, refusalsPerRun+2, refusing.refused, "every write the drive attempted was refused")
+	assert.Empty(t, recording.states, "nothing landed")
+}
+
+// The durable record of a task finishing names the state the task left and the
+// one it reached, so an operator reading the apply log sees running ->
+// completed rather than a transition from a state to itself.
+func TestPollTaskToCompletion_FinishedTransitionNamesTheStateLeft(t *testing.T) {
+	eng := &phaseSequenceEngine{results: []*engine.ProgressResult{{State: engine.StateCompleted}}}
+	client, apply, task, _ := lostWorkPollFixture(eng, lostWorkTrustBudgetAmple)
+
+	require.Equal(t, taskContinue, client.pollTaskToCompletion(t.Context(), apply, task, nil, nil))
+
+	logs := client.storage.(*exactProgressStorage).logs.(*mockApplyLogStore)
+	var finished *storage.ApplyLog
+	for _, entry := range logs.logs {
+		if strings.Contains(entry.Message, "finished") {
+			finished = entry
+		}
+	}
+	require.NotNil(t, finished, "the drive records the task finishing")
+	assert.Equal(t, state.Task.Running, finished.OldState)
+	assert.Equal(t, state.Task.Completed, finished.NewState)
+}
+
+// A drive waiting for another run to release the table keeps the task row
+// fresh so the wait reads as alive. A write storage refuses outright is
+// refused the same way every time, so the drive exits rather than waiting on
+// with a frozen row.
+func TestWaitForTargetRelease_RejectedWriteExits(t *testing.T) {
+	client, _, task, recording := lostWorkPollFixture(&phaseSequenceEngine{}, lostWorkTrustBudgetAmple)
+	refusing := &progressRefusingTaskStore{
+		stateRecordingTaskStore: recording,
+		err:                     fmt.Errorf("update task %s: %w", task.TaskIdentifier, storage.ErrValueRejected),
+		refusals:                -1,
+	}
+	client.storage.(*exactProgressStorage).tasks = refusing
+
+	assert.Equal(t, taskAbort, client.waitForTargetRelease(t.Context(), slog.Default(), task))
+	assert.Equal(t, 1, refusing.refused)
+
+	refusing.err = errors.New("storage down")
+	assert.Equal(t, taskContinue, client.waitForTargetRelease(t.Context(), slog.Default(), task),
+		"a transient failure starts the task again and retries the write")
 }

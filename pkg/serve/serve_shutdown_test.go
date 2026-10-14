@@ -319,7 +319,7 @@ func TestServeStopsClaimingNewWorkOnShutdownSignal(t *testing.T) {
 			handler:                     http.NotFoundHandler(),
 			startDurableWebhookDispatch: func(context.Context) { started <- struct{}{} },
 			stopDurableWebhookDispatch: func() {
-				before := claimAttempts()
+				before := settledClaimAttempts(claimAttempts, pollInterval)
 				time.Sleep(20 * pollInterval)
 				claimsAcrossDrain <- [2]int{before, claimAttempts()}
 			},
@@ -357,6 +357,27 @@ func TestServeStopsClaimingNewWorkOnShutdownSignal(t *testing.T) {
 	default:
 		t.Fatal("Close did not stop the durable webhook dispatch")
 	}
+}
+
+// settledClaimAttempts returns the claim count once it has held still for two
+// poll intervals, or after ten if it never does. The shutdown signal closes the
+// claim gate, but a driver already inside a tick finishes it, and each rung of
+// its claim ladder logs its failure whenever that dial returns; a baseline read
+// before those lines land would count a tick that began before the signal as
+// a claim made after it. A driver that really keeps claiming moves the count
+// throughout, so the cap hands that back as the baseline and the window that
+// follows still catches it.
+func settledClaimAttempts(claimAttempts func() int, pollInterval time.Duration) int {
+	deadline := time.Now().Add(10 * pollInterval)
+	count := claimAttempts()
+	stableSince := time.Now()
+	for time.Since(stableSince) < 2*pollInterval && time.Now().Before(deadline) {
+		time.Sleep(pollInterval / 4)
+		if next := claimAttempts(); next != count {
+			count, stableSince = next, time.Now()
+		}
+	}
+	return count
 }
 
 // freeTCPPort returns a loopback port that was free a moment ago, for a listener

@@ -403,9 +403,23 @@ func canonicalDDLForDrift(p ddl.StatementParser, raw string) (string, error) {
 	if raw == "" {
 		return "", fmt.Errorf("empty DDL")
 	}
+	// An atomic operation is compared as one ordered sequence. Its engine owns
+	// grammar admission; ordinary statement and create-set parsing remain strict.
+	// RLS retains its physical target: a dispatch does not prove the source
+	// deployment’s namespace mapping, so it cannot authorize schema erasure.
+	if rls, ok := p.(interface{ CanonicalRowSecurity(string) (string, error) }); ok {
+		if canonical, err := rls.CanonicalRowSecurity(raw); err == nil {
+			return canonical, nil
+		}
+	}
 	if stmtType, _, err := p.Classify(raw); err == nil {
 		return canonicalDriftStatement(p, raw, stmtType)
 	}
+	// Classify accepts one statement only, so a multi-statement script reaches
+	// ParseCreateSet, and its admitted shapes are what keep drift closed: a
+	// CREATE TABLE followed only by CREATE INDEX statements on that table. Any
+	// other sequence is refused at the first statement outside that shape, so
+	// a trailing statement cannot hide behind the classification of the first.
 	createSet, err := ddl.ParseCreateSet(p, raw)
 	if err != nil {
 		return "", fmt.Errorf("DDL rejected by the statement parser: %w", err)

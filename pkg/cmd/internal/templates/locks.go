@@ -30,6 +30,16 @@ func WriteLockReleased(database, dbType string) {
 	fmt.Printf("🔓 Lock released for %s (%s)\n", database, dbType)
 }
 
+// WriteLockKept writes the message when --yield keeps the database lock:
+// the apply has not settled, a row under a settled apply can still write, or
+// the server did not release it. reason says which; the second line names the
+// command that releases the lock by hand once nothing under the apply is
+// left to run.
+func WriteLockKept(database, dbType, reason string) {
+	fmt.Printf("🔒 Lock kept for %s (%s) despite --yield: %s.\n", database, dbType, reason)
+	fmt.Printf("   Release it once nothing is left to run: %s unlock -d %s -t %s\n", cliname.Name(), database, dbType)
+}
+
 // WriteLockForceReleased writes the force release message.
 func WriteLockForceReleased(database, dbType, previousOwner string) {
 	fmt.Printf(glyph.Attention+"  Force released lock for %s (%s)\n", database, dbType)

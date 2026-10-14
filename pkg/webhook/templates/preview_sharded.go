@@ -34,7 +34,7 @@ const (
 )
 
 func previewMutesCell(shard string) ShardCell {
-	return ShardCell{Shard: shard, Table: "mutes", DDL: previewMutesIndex}
+	return ShardCell{Shard: shard, Table: "mutes", Statements: []string{previewMutesIndex}}
 }
 
 // PreviewCommentShardedApplyInProgress renders a sharded apply mid-rollout: the
@@ -49,6 +49,8 @@ func PreviewCommentShardedApplyInProgress() string {
 				Table: "mutes", Status: state.Task.Running,
 				RowsCopied: previewMutesRowsCopied, RowsTotal: previewMutesRowsTotal, ETASeconds: 195,
 				ShardsReporting: 1,
+				EstimatedBytes:  new(int64(23_400_000_000)),
+				PlannedShards:   4,
 				Shards: []ShardProgressData{
 					{Shard: "-40", Status: state.Task.Running, PercentComplete: previewMutesCopyPercent},
 					{Shard: "40-80", Status: state.Task.Pending},
@@ -265,7 +267,7 @@ func PreviewCommentShardedApplyDivergent() string {
 			}),
 			Cells: []ShardCell{
 				previewMutesCell("-40"),
-				{Shard: "40-80", Table: "mutes", DDL: previewMutesIndexDrift},
+				{Shard: "40-80", Table: "mutes", Statements: []string{previewMutesIndexDrift}},
 				previewMutesCell("80-c0"),
 			},
 		}},
@@ -302,7 +304,7 @@ func PreviewCommentShardedApplyMultiKeyspace() string {
 					Shards: []ShardProgressData{{Shard: "-", Status: state.Task.Completed}},
 				}},
 				Shards: []ShardStatus{unshard(shards[0], "-")},
-				Cells:  []ShardCell{{Shard: "-", Table: "outcomes", DDL: "ALTER TABLE `outcomes` ADD COLUMN `verdict` varchar(32);"}},
+				Cells:  []ShardCell{{Shard: "-", Table: "outcomes", Statements: []string{"ALTER TABLE `outcomes` ADD COLUMN `verdict` varchar(32);"}}},
 			},
 			{
 				Keyspace: "cdb_resolute_lookup",
@@ -310,10 +312,12 @@ func PreviewCommentShardedApplyMultiKeyspace() string {
 					Table: "outcomes_lookup", Status: state.Task.Running,
 					RowsCopied: 540211, RowsTotal: 2000780, ETASeconds: 480,
 					ShardsReporting: 1,
+					EstimatedBytes:  new(int64(612_000_000)),
+					PlannedShards:   1,
 					Shards:          []ShardProgressData{{Shard: "-", Status: state.Task.Running, PercentComplete: 27}},
 				}},
 				Shards: []ShardStatus{unshard(shards[1], "-")},
-				Cells:  []ShardCell{{Shard: "-", Table: "outcomes_lookup", DDL: "ALTER TABLE `outcomes_lookup` ADD COLUMN `verdict` varchar(32);"}},
+				Cells:  []ShardCell{{Shard: "-", Table: "outcomes_lookup", Statements: []string{"ALTER TABLE `outcomes_lookup` ADD COLUMN `verdict` varchar(32);"}}},
 			},
 			{
 				Keyspace: "cdb_resolute_sharded",
@@ -350,6 +354,9 @@ func PreviewCommentShardedPlanDivergent() string {
 		Changes: []KeyspaceChangeData{{
 			Keyspace:   "cdb_resolute_sharded",
 			Statements: []string{idx},
+			TableSizes: []TableSizeData{
+				{Table: "mutes", EstimatedBytes: previewBytes(22_800_000_000), ShardCount: 4},
+			},
 			Shards: []KeyspaceShardChange{
 				{Shard: "-40", Statements: []string{idx}},
 				{Shard: "80-c0", Statements: []string{idx}},
@@ -402,16 +409,25 @@ func previewShardRange(i, n int) string {
 // so the partially-applied keyspace shows its divergent state.
 func PreviewCommentShardedPlanPartiallyApplied() string {
 	idx := "ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`)"
+	outcomesIdx := "ALTER TABLE `outcomes` ADD INDEX `status`(`status`)"
 	return RenderPlanComment(PlanCommentData{
 		Database: "cdb_resolute", Environment: "production", DatabaseType: "strata",
 		HeadSHA: previewHeadSHA, Repository: previewRepository, RequestedBy: previewRequestedBy,
 		Changes: []KeyspaceChangeData{{
 			Keyspace: "cdb_resolute_sharded",
+			// A table without a byte estimate beside one that has it renders
+			// as explicitly unavailable, so a failed size probe never reads as
+			// a small table. The satisfied shard needs no change, so the
+			// change spans three shards.
+			TableSizes: []TableSizeData{
+				{Table: "mutes", ShardCount: 3},
+				{Table: "outcomes", EstimatedBytes: previewBytes(4_210_000_000), ShardCount: 3},
+			},
 			Shards: []KeyspaceShardChange{
 				{Shard: "-40", Satisfied: true},
-				{Shard: "40-80", Statements: []string{idx}},
-				{Shard: "80-c0", Statements: []string{idx}},
-				{Shard: "c0-", Statements: []string{idx}},
+				{Shard: "40-80", Statements: []string{idx, outcomesIdx}},
+				{Shard: "80-c0", Statements: []string{idx, outcomesIdx}},
+				{Shard: "c0-", Statements: []string{idx, outcomesIdx}},
 			},
 		}},
 	})

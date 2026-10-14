@@ -82,3 +82,17 @@ func TestConcurrentLocalProfileRegistration(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, cfg.Profiles, 8)
 }
+
+func TestFirstLocalProfileBecomesDefault(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	_, err := RegisterLocalProfile("sample", "sample")
+	require.NoError(t, err)
+	cfg, err := LoadConfig()
+	require.NoError(t, err)
+	require.Equal(t, "sample", ResolveProfileName(cfg, ""))
+	_, err = RegisterLocalProfile("second", "second")
+	require.NoError(t, err)
+	cfg, err = LoadConfig()
+	require.NoError(t, err)
+	require.Equal(t, "sample", ResolveProfileName(cfg, ""))
+}

@@ -194,7 +194,7 @@ func TestExecuteApplySequential_UnansweredRereadLeavesApplyActive(t *testing.T) 
 				logger: slog.Default(),
 			}
 
-			client.executeApplySequential(t.Context(), apply, tasks, &storage.Plan{}, nil)
+			require.NoError(t, client.executeApplySequential(t.Context(), apply, tasks, &storage.Plan{}, nil))
 
 			assert.Equal(t, 1, eng.applyCalls, "only the first table reaches the engine")
 			assert.True(t, state.IsState(first.State, state.Task.Completed), "the first table completes, got %s", first.State)

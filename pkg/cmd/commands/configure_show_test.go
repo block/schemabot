@@ -33,3 +33,28 @@ func TestConfigureShowProfileSelection(t *testing.T) {
 		})
 	}
 }
+
+// A profile whose login recorded an issuer and client ID refreshes there
+// regardless of its oidc settings, so configure show prints the pair under that
+// profile; a profile without the pair prints only its endpoint.
+func TestConfigureShowRecordedTokenSource(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("SCHEMABOT_PROFILE", "")
+	t.Setenv("SCHEMABOT_ENDPOINT", "")
+	require.NoError(t, client.SaveConfig(&client.Config{Profiles: map[string]client.Profile{
+		"default": {
+			Endpoint:      "https://default.example.test",
+			TokenIssuer:   "https://sso.example.test",
+			TokenClientID: "schemabot-cli-sso",
+			OIDC:          &client.OIDCLogin{Issuer: "https://issuer.example.test", ClientID: "schemabot-cli"},
+		},
+		"team": {Endpoint: "https://team.example.test"},
+	}}))
+
+	var runErr error
+	output := captureOutput(t, func() { runErr = (&ConfigureShowCmd{}).Run(&Globals{}) })
+	require.NoError(t, runErr)
+	require.Contains(t, output, "    * default: https://default.example.test\n"+
+		"        refreshes at https://sso.example.test as client schemabot-cli-sso (recorded at login)\n"+
+		"      team: https://team.example.test\n")
+}

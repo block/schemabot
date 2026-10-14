@@ -128,6 +128,15 @@ func TestSeamClassifyRejectsMultiStatement(t *testing.T) {
 	assert.Contains(t, err.Error(), "split with SplitStatements before classifying")
 }
 
+func TestTiDBSplitReturnsEachStatementText(t *testing.T) {
+	statements, err := SplitStatements("CREATE TABLE `a` (`id` INT); DROP TABLE `b`;")
+	require.NoError(t, err)
+	assert.Equal(t, []string{
+		"CREATE TABLE `a` (`id` INT);",
+		"DROP TABLE `b`;",
+	}, statements)
+}
+
 // The TiDB implementation must translate every Spirit statement type it can
 // return into the pkg/ddl-owned vocabulary, preserving the classification a
 // caller branches on.

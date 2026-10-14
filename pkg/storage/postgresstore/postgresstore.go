@@ -16,7 +16,10 @@ type Storage = sqlstore.Storage
 
 var _ storage.Storage = (*Storage)(nil)
 
-// New creates a new PostgreSQL storage instance.
+// New creates a new PostgreSQL storage instance. db must come from
+// postgresconn (Open or OpenReloadable): its datetime columns are plain
+// timestamps compared against a UTC now(), and those pools are what write a
+// time.Time parameter as its UTC reading whatever location it carries.
 func New(db *sql.DB, opts ...storage.Option) *Storage {
 	return sqlstore.NewPostgres(db, opts...)
 }

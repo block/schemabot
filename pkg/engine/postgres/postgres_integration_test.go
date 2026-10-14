@@ -312,6 +312,119 @@ func TestEnginePlanCapturesOriginalFiles(t *testing.T) {
 	}
 }
 
+// Capture keeps the forward plan's table membership: ignored bookkeeping
+// tables do not become rollback declarations or block capture when their shape
+// cannot be rendered, while an explicitly declared archive keeps its original.
+// Replanning and applying those originals reverses the nullable-column addition
+// without changing ignored tables, and still marks the column drop unsafe.
+func TestEnginePlanRollbackBaselineMembershipRoundTrip(t *testing.T) {
+	tests := []struct {
+		name       string
+		database   string
+		table      string
+		ignoredDDL string
+	}{
+		{
+			name:       "ignored renderable table",
+			database:   "baseline_ignore_renderable_test",
+			table:      "users",
+			ignoredDDL: "CREATE TABLE public.flyway_schema_history (installed_rank integer PRIMARY KEY, version text)",
+		},
+		{
+			name:       "ignored unrenderable table",
+			database:   "baseline_ignore_unrenderable_test",
+			table:      "users",
+			ignoredDDL: "CREATE UNLOGGED TABLE public.flyway_schema_history (installed_rank integer PRIMARY KEY, version text)",
+		},
+		{
+			name:     "declared archive table",
+			database: "baseline_declared_archive_test",
+			table:    "audit_log_archive_2019",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dsn, db := testutil.StartPostgres(t, tt.database)
+			ctx, cancel := context.WithTimeout(t.Context(), postgresApplyDeadline)
+			defer cancel()
+			_, err := db.ExecContext(ctx, fmt.Sprintf("CREATE TABLE public.%s (id bigint PRIMARY KEY)", tt.table))
+			require.NoError(t, err)
+			_, err = db.ExecContext(ctx, fmt.Sprintf("INSERT INTO public.%s (id) VALUES (1)", tt.table))
+			require.NoError(t, err)
+			var ignored []string
+			if tt.ignoredDDL != "" {
+				_, err = db.ExecContext(ctx, tt.ignoredDDL)
+				require.NoError(t, err)
+				_, err = db.ExecContext(ctx, "INSERT INTO public.flyway_schema_history VALUES (1, 'v1')")
+				require.NoError(t, err)
+				ignored = []string{"flyway_schema_history"}
+			}
+
+			eng := New()
+			forward, err := eng.Plan(ctx, &engine.PlanRequest{
+				Database: tt.database,
+				SchemaFiles: schema.SchemaFiles{"public": {Files: map[string]string{
+					tt.table + ".sql": fmt.Sprintf("CREATE TABLE %s (id bigint PRIMARY KEY, email text)", tt.table),
+				}}},
+				Credentials:  &engine.Credentials{DSN: dsn},
+				IgnoreTables: ignored,
+			})
+			require.NoError(t, err)
+			require.Len(t, forward.Changes, 1)
+			originals := forward.Changes[0].OriginalFiles
+			require.True(t, forward.Changes[0].OriginalFilesCaptured)
+			assert.Equal(t, map[string]string{tt.table + ".sql": fmt.Sprintf(
+				"CREATE TABLE \"%s\" (\n    \"id\" bigint NOT NULL,\n    CONSTRAINT \"%s_pkey\" PRIMARY KEY (id)\n);\n", tt.table, tt.table)}, originals)
+			require.Len(t, forward.Changes[0].TableChanges, 1)
+			addition := forward.Changes[0].TableChanges[0]
+			assert.Equal(t, tt.table, addition.Table)
+			assert.False(t, addition.IsUnsafe)
+			require.Empty(t, addition.ExecutionMode)
+			applied, err := eng.Apply(ctx, applyRequest(dsn, addition.Table, addition.DDL))
+			require.NoError(t, err)
+			require.True(t, applied.Accepted)
+			require.Equal(t, engine.StateCompleted, awaitPostgresProgress(t, eng, tt.table).State)
+
+			rollbackRequest := &engine.PlanRequest{
+				Database:     tt.database,
+				SchemaFiles:  schema.SchemaFiles{"public": {Files: originals}},
+				Credentials:  &engine.Credentials{DSN: dsn},
+				IgnoreTables: ignored,
+			}
+			rollback, err := eng.Plan(ctx, rollbackRequest)
+			require.NoError(t, err, "originals and the source plan's ignores must be consistent")
+			require.False(t, rollback.NoChanges)
+			require.Len(t, rollback.Changes, 1)
+			require.Len(t, rollback.Changes[0].TableChanges, 1)
+			drop := rollback.Changes[0].TableChanges[0]
+			assert.Equal(t, tt.table, drop.Table)
+			assert.Equal(t, ddl.StatementAlterTable, drop.Operation)
+			assert.Equal(t, fmt.Sprintf("ALTER TABLE public.%s DROP email", tt.table), drop.DDL)
+			assert.True(t, drop.IsUnsafe, "rollback keeps destructive-change disclosure")
+			assert.NotEmpty(t, drop.UnsafeReason)
+			require.Empty(t, drop.ExecutionMode)
+			rolledBack, err := eng.Apply(ctx, applyRequest(dsn, drop.Table, drop.DDL))
+			require.NoError(t, err)
+			require.True(t, rolledBack.Accepted)
+			require.Equal(t, engine.StateCompleted, awaitPostgresProgress(t, eng, tt.table).State)
+			converged, err := eng.Plan(ctx, rollbackRequest)
+			require.NoError(t, err)
+			assert.True(t, converged.NoChanges)
+
+			var id int64
+			err = db.QueryRowContext(ctx, fmt.Sprintf("SELECT id FROM public.%s", tt.table)).Scan(&id)
+			require.NoError(t, err)
+			assert.Equal(t, int64(1), id)
+			if tt.ignoredDDL != "" {
+				var version string
+				err = db.QueryRowContext(ctx, "SELECT version FROM public.flyway_schema_history WHERE installed_rank = 1").Scan(&version)
+				require.NoError(t, err)
+				assert.Equal(t, "v1", version)
+			}
+		})
+	}
+}
+
 // A pull refuses a namespace whose tables carry objects the declarative
 // format cannot represent, because those files become the owner's declared
 // schema. A rollback baseline is declared by nobody, and the differ cannot
@@ -343,7 +456,7 @@ func TestEnginePlanCapturesNamespaceWithUnmodeledObjects(t *testing.T) {
 	assert.Equal(t, map[string]string{"accounts.sql": originalAccounts}, result.Changes[0].OriginalFiles)
 }
 
-// An archive table is left in place rather than dropped, so it sits
+// An undeclared archive table is left in place rather than dropped, so it sits
 // outside management on the forward plan and on any rollback re-plan. Its
 // shape is therefore not the rollback baseline's concern: an archive table
 // the renderer refuses neither appears in the baseline nor costs the
@@ -374,26 +487,104 @@ func TestEnginePlanCaptureLeavesExemptArchiveTablesOutOfBaseline(t *testing.T) {
 		"the baseline declares exactly the tables a rollback re-plan would manage")
 }
 
-// A cancellation that arrives after listing an all-archive namespace still
-// ends the baseline capture, even though no managed table needs introspection.
-func TestRenderPostgresTablesLeavesExemptArchiveTablesOutOfBaselineAfterCancellation(t *testing.T) {
-	dsn, db := testutil.StartPostgres(t, "render_archive_cancel_test")
-	_, err := db.ExecContext(t.Context(), `CREATE TABLE public.audit_log_archive_2019 (id bigint PRIMARY KEY)`)
-	require.NoError(t, err)
+// A declared archive the forward plan creates has no live original, so the
+// baseline holds only the tables that existed, and the plan stays
+// rollback-capable. The rollback re-plan reverses the managed table's change
+// and finds the new archive live with no file: it is left in place and
+// disclosed as exempt, as any archive-named table without a file is.
+func TestEnginePlanRollbackLeavesCreatedDeclaredArchiveInPlace(t *testing.T) {
+	const originalUsers = "CREATE TABLE \"users\" (\n    \"id\" bigint NOT NULL,\n    CONSTRAINT \"users_pkey\" PRIMARY KEY (id)\n);\n"
+	const archive = "audit_log_archive_2019"
 
-	ctx, cancel := context.WithCancel(t.Context())
+	dsn, db := testutil.StartPostgres(t, "plan_created_archive_rollback_test")
+	ctx, cancel := context.WithTimeout(t.Context(), postgresApplyDeadline)
 	defer cancel()
-	poolCfg, err := pgxpool.ParseConfig(dsn)
+	_, err := db.ExecContext(ctx, "CREATE TABLE public.users (id bigint PRIMARY KEY)")
 	require.NoError(t, err)
-	poolCfg.ConnConfig.Tracer = &cancelAfterFirstQuery{cancel: cancel}
-	pool, err := pgxpool.NewWithConfig(t.Context(), poolCfg)
-	require.NoError(t, err)
-	defer pool.Close()
 
-	rendered, renderErrors, err := renderPostgresTables(ctx, pool, "public", rollbackBaseline)
-	require.ErrorIs(t, err, context.Canceled)
-	assert.Nil(t, rendered)
-	assert.Nil(t, renderErrors)
+	eng := New()
+	forward, err := eng.Plan(ctx, &engine.PlanRequest{
+		Database: "plan_created_archive_rollback_test",
+		SchemaFiles: schema.SchemaFiles{"public": {Files: map[string]string{
+			"users.sql":      "CREATE TABLE users (id bigint PRIMARY KEY, email text)",
+			archive + ".sql": fmt.Sprintf("CREATE TABLE %s (id bigint PRIMARY KEY)", archive),
+		}}},
+		Credentials: &engine.Credentials{DSN: dsn},
+	})
+	require.NoError(t, err)
+	require.Len(t, forward.Changes, 1)
+	assert.Empty(t, forward.ExemptTables, "a declared archive is managed, not exempt")
+	require.True(t, forward.Changes[0].OriginalFilesCaptured)
+	assert.Equal(t, map[string]string{"users.sql": originalUsers}, forward.Changes[0].OriginalFiles,
+		"a table that does not exist yet has no original to capture")
+	require.Len(t, forward.Changes[0].TableChanges, 2)
+	for _, change := range forward.Changes[0].TableChanges {
+		require.Empty(t, change.ExecutionMode, "%s", change.DDL)
+		applied, err := eng.Apply(ctx, applyRequest(dsn, change.Table, change.DDL))
+		require.NoError(t, err)
+		require.True(t, applied.Accepted)
+		require.Equal(t, engine.StateCompleted, awaitPostgresProgress(t, eng, change.Table).State)
+	}
+
+	rollback, err := eng.Plan(ctx, &engine.PlanRequest{
+		Database:    "plan_created_archive_rollback_test",
+		SchemaFiles: schema.SchemaFiles{"public": {Files: forward.Changes[0].OriginalFiles}},
+		Credentials: &engine.Credentials{DSN: dsn},
+	})
+	require.NoError(t, err)
+	require.Len(t, rollback.Changes, 1)
+	require.Len(t, rollback.Changes[0].TableChanges, 1)
+	assert.Equal(t, "ALTER TABLE public.users DROP email", rollback.Changes[0].TableChanges[0].DDL)
+	require.Len(t, rollback.ExemptTables, 1)
+	assert.Equal(t, "public", rollback.ExemptTables[0].Namespace)
+	assert.Equal(t, []string{archive}, rollback.ExemptTables[0].Tables)
+	assert.Equal(t, "archive naming", rollback.ExemptTables[0].Reason)
+}
+
+// A cancellation that arrives after listing a namespace of excluded tables
+// still ends capture, even though no managed table needs introspection.
+func TestRenderPostgresTablesReturnsCancellationAfterFiltering(t *testing.T) {
+	tests := []struct {
+		name     string
+		database string
+		setup    string
+		ignored  []string
+	}{
+		{
+			name:     "undeclared archive",
+			database: "render_archive_cancel_test",
+			setup:    "CREATE TABLE public.audit_log_archive_2019 (id bigint PRIMARY KEY)",
+		},
+		{
+			name:     "ignored table",
+			database: "render_ignored_cancel_test",
+			setup:    "CREATE UNLOGGED TABLE public.flyway_schema_history (installed_rank integer PRIMARY KEY)",
+			ignored:  []string{"flyway_schema_history"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dsn, db := testutil.StartPostgres(t, tt.database)
+			deadline, end := context.WithTimeout(t.Context(), postgresApplyDeadline)
+			defer end()
+			_, err := db.ExecContext(deadline, tt.setup)
+			require.NoError(t, err)
+
+			ctx, cancel := context.WithCancel(deadline)
+			defer cancel()
+			poolCfg, err := pgxpool.ParseConfig(dsn)
+			require.NoError(t, err)
+			poolCfg.ConnConfig.Tracer = &cancelAfterFirstQuery{cancel: cancel}
+			pool, err := pgxpool.NewWithConfig(deadline, poolCfg)
+			require.NoError(t, err)
+			defer pool.Close()
+
+			files, captured, err := captureOriginalFiles(ctx, pool, tt.database, "public", nil, mustIgnoredTables(t, tt.ignored))
+			require.ErrorIs(t, err, context.Canceled)
+			assert.False(t, captured)
+			assert.Nil(t, files)
+		})
+	}
 }
 
 // cancelAfterFirstQuery cancels the capture's context as soon as its table
@@ -435,7 +626,7 @@ func TestCaptureOriginalFilesReturnsCancellationInsteadOfIncompleteBaseline(t *t
 	require.NoError(t, err)
 	defer pool.Close()
 
-	files, captured, err := captureOriginalFiles(ctx, pool, "capture_cancel_test", "public")
+	files, captured, err := captureOriginalFiles(ctx, pool, "capture_cancel_test", "public", nil, engine.IgnoredTables{})
 	require.ErrorIs(t, err, context.Canceled)
 	assert.False(t, captured)
 	assert.Nil(t, files)
@@ -539,7 +730,7 @@ func TestRenderPostgresTablesHoldsTheConcurrencyCap(t *testing.T) {
 	require.NoError(t, err)
 	defer pool.Close()
 
-	rendered, renderErrors, err := renderPostgresTables(t.Context(), pool, "app", rollbackBaseline)
+	rendered, renderErrors, err := renderPostgresTables(t.Context(), pool, "appdb", "app", rollbackBaseline(nil, engine.IgnoredTables{}))
 	require.NoError(t, err)
 	assert.Empty(t, renderErrors)
 	assert.Len(t, rendered, baselineIntrospectionConcurrency*2)
@@ -649,7 +840,7 @@ func TestRenderPostgresTablesEndsOnIntrospectionFailureAndCancelsTheRest(t *test
 	require.NoError(t, err)
 	defer pool.Close()
 
-	rendered, renderErrors, err := renderPostgresTables(deadline, pool, "app", rollbackBaseline)
+	rendered, renderErrors, err := renderPostgresTables(deadline, pool, "appdb", "app", rollbackBaseline(nil, engine.IgnoredTables{}))
 	assert.False(t, dropped.timedOut.Load(),
 		"the sibling introspections must be cancelled by the failure; a render that lets them run holds them to the deadline")
 	require.ErrorIs(t, err, schemadiff.ErrTableNotFound)
@@ -694,7 +885,7 @@ func TestRenderPostgresTablesIntrospectsConcurrentlyInListingOrder(t *testing.T)
 	require.NoError(t, err)
 	defer pool.Close()
 
-	rendered, renderErrors, err := renderPostgresTables(deadline, pool, "app", pulledBaseline)
+	rendered, renderErrors, err := renderPostgresTables(deadline, pool, "appdb", "app", pulledBaseline)
 	assert.False(t, rendezvous.timedOut.Load(),
 		"two introspections must be in flight at once; a render that takes tables one at a time never reaches the second BEGIN")
 	require.NoError(t, err)
@@ -716,7 +907,7 @@ func TestRenderPostgresTablesIntrospectsConcurrentlyInListingOrder(t *testing.T)
 	require.NoError(t, err)
 	defer freePool.Close()
 	for range 3 {
-		again, againErrors, err := renderPostgresTables(t.Context(), freePool, "app", pulledBaseline)
+		again, againErrors, err := renderPostgresTables(t.Context(), freePool, "appdb", "app", pulledBaseline)
 		require.NoError(t, err)
 		assert.Equal(t, rendered, again)
 		require.Len(t, againErrors, len(renderErrors))
@@ -1753,14 +1944,15 @@ func TestEngineCancelConcurrentIndexBuildWithoutABackendSignal(t *testing.T) {
 	// builder is found through the lock it waits on — the writer's virtual
 	// transaction — rather than through what it is running.
 	var builderPID int
+	var indexOID uint32
 	var builderState sql.NullString
 	require.Eventually(t, func() bool {
 		err := db.QueryRowContext(t.Context(), `
-			SELECT a.pid, a.state
+			SELECT a.pid, a.state, i.indexrelid
 			FROM pg_locks l
 			JOIN pg_stat_activity a ON a.pid = l.pid
 			JOIN pg_index i ON i.indexrelid = to_regclass('public.orders_ref_idx')
-			WHERE a.datname = current_database() AND l.locktype = 'virtualxid' AND NOT l.granted AND NOT i.indisvalid`).Scan(&builderPID, &builderState)
+			WHERE a.datname = current_database() AND l.locktype = 'virtualxid' AND NOT l.granted AND NOT i.indisvalid`).Scan(&builderPID, &builderState, &indexOID)
 		return err == nil
 	}, postgresApplyDeadline, 10*time.Millisecond, "the build never parked behind the writer after creating its invalid catalog entry")
 	require.Equal(t, "disabled", builderState.String, "the server must hide the builder's state, or the tracker signals it and the context path is not what settles the cancel")
@@ -1773,11 +1965,31 @@ func TestEngineCancelConcurrentIndexBuildWithoutABackendSignal(t *testing.T) {
 	got := awaitPostgresProgress(t, eng, "orders")
 	assert.Equal(t, engine.StateCancelled, got.State, "progress: %+v", got)
 	assert.Equal(t, "cancelled", got.Metadata["phase"])
-	assert.Equal(t, `index "public"."orders_ref_idx" may be invalid but its catalog state could not be verified; inspect pg_index.indisvalid on the target before any recovery, then retry`, got.ErrorMessage)
 	assertBackendGone(t, db, builderPID)
 
+	// The detached verdict races the backend's disconnect. If it still
+	// sees the disabled backend, it cannot prove the build stopped and
+	// leaves the original name alone. If the backend is already gone, the
+	// cleanup can prove abandonment and quarantine the index, but its drop
+	// cannot finish while this writer stays open. In either case the same
+	// invalid index must survive, and the detail must match its identity.
+	var indexName string
+	var valid bool
+	err = db.QueryRowContext(t.Context(), `
+		SELECT c.relname, i.indisvalid
+		FROM pg_class c JOIN pg_index i ON i.indexrelid = c.oid
+		WHERE c.oid = $1 AND i.indrelid = 'public.orders'::regclass`, indexOID).Scan(&indexName, &valid)
+	require.NoError(t, err, "the cancelled build's original index must remain on orders")
+	assert.False(t, valid, "the cancelled build must not leave a valid index")
+	expectedDetails := map[string]string{
+		"orders_ref_idx": `index "public"."orders_ref_idx" may be invalid but its catalog state could not be verified; inspect pg_index.indisvalid on the target before any recovery, then retry`,
+		fmt.Sprintf("pgsprite_abandoned_%d", indexOID): `Concurrent index build cancelled; the invalid index remains under "public"."orders_ref_idx" or an identity-derived pgsprite_abandoned_<oid> name; query pg_index joined to pg_class for invalid indexes on the table, then follow the PostgreSQL invalid-index recovery guidance`,
+	}
+	require.Contains(t, expectedDetails, indexName, "only the original or its OID-derived quarantine name is allowed")
+	assert.Equal(t, expectedDetails[indexName], got.ErrorMessage)
+	t.Logf("cancelled index %d remains as %s", indexOID, indexName)
+
 	writer.release(t)
-	assertIndexInvalid(t, db, "orders_ref_idx")
 }
 
 // TestEngineApplyConcurrentIndexBoundEndsTheBuild proves the configured
@@ -2355,7 +2567,7 @@ func TestCaptureOriginalFilesWithRowSecurity(t *testing.T) {
 	pool, err := pgxpool.New(ctx, dsn)
 	require.NoError(t, err)
 	defer pool.Close()
-	files, captured, err := captureOriginalFiles(ctx, pool, "capture_rls", "public")
+	files, captured, err := captureOriginalFiles(ctx, pool, "capture_rls", "public", nil, engine.IgnoredTables{})
 	require.NoError(t, err)
 	assert.False(t, captured)
 	assert.Nil(t, files)

@@ -1,6 +1,8 @@
 package planetscale
 
 import (
+	"io"
+	"log/slog"
 	"testing"
 
 	"github.com/block/spirit/pkg/table"
@@ -8,8 +10,17 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/engine"
+	"github.com/block/schemabot/pkg/psclient"
 	"github.com/block/schemabot/pkg/schema"
 )
+
+// mustIgnoredTables indexes ignore_tables entries the test knows are valid.
+func mustIgnoredTables(t *testing.T, entries []string) engine.IgnoredTables {
+	t.Helper()
+	ignored, err := engine.NewIgnoredTables(entries)
+	require.NoError(t, err)
+	return ignored
+}
 
 func ignoreTablesRequest(files map[string]map[string]string, ignore ...string) *engine.PlanRequest {
 	schemaFiles := make(schema.SchemaFiles, len(files))
@@ -43,7 +54,7 @@ func TestWithholdIgnoredTablesFiltersEachKeyspace(t *testing.T) {
 	}
 
 	exempt, err := New(nil).withholdIgnoredTables(
-		engine.NewIgnoredTables(req.IgnoreTables), req,
+		mustIgnoredTables(t, req.IgnoreTables), req,
 		[]string{"commerce", "commerce_sharded"}, currentSchema)
 	require.NoError(t, err)
 
@@ -71,7 +82,7 @@ func TestWithholdIgnoredTablesWithoutEntriesIsANoOp(t *testing.T) {
 	}
 
 	exempt, err := New(nil).withholdIgnoredTables(
-		engine.NewIgnoredTables(nil), req, []string{"commerce"}, currentSchema)
+		mustIgnoredTables(t, nil), req, []string{"commerce"}, currentSchema)
 	require.NoError(t, err)
 
 	assert.Empty(t, exempt)
@@ -96,7 +107,7 @@ func TestWithholdIgnoredTablesMatchingNothingDisclosesNothing(t *testing.T) {
 	}
 
 	exempt, err := New(nil).withholdIgnoredTables(
-		engine.NewIgnoredTables(req.IgnoreTables), req, []string{"commerce"}, currentSchema)
+		mustIgnoredTables(t, req.IgnoreTables), req, []string{"commerce"}, currentSchema)
 	require.NoError(t, err)
 
 	assert.Empty(t, exempt, "matching is exact and case-sensitive")
@@ -116,7 +127,7 @@ func TestWithholdIgnoredTablesRefusesDeclaredTable(t *testing.T) {
 	}
 
 	_, err := New(nil).withholdIgnoredTables(
-		engine.NewIgnoredTables(req.IgnoreTables), req, []string{"commerce"}, currentSchema)
+		mustIgnoredTables(t, req.IgnoreTables), req, []string{"commerce"}, currentSchema)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "flyway_schema_history")
 	assert.Contains(t, err.Error(), `namespace "commerce"`)
@@ -140,7 +151,7 @@ func TestWithholdIgnoredTablesRefusesDeclaredTableWhateverTheCase(t *testing.T) 
 	}
 
 	_, err := New(nil).withholdIgnoredTables(
-		engine.NewIgnoredTables(req.IgnoreTables), req, []string{"commerce"}, currentSchema)
+		mustIgnoredTables(t, req.IgnoreTables), req, []string{"commerce"}, currentSchema)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), `"flyway_schema_history" (the file spells it "Flyway_Schema_History")`)
 
@@ -160,10 +171,100 @@ func TestWithholdIgnoredTablesRefusesKeyspaceWithoutFiles(t *testing.T) {
 	}
 
 	_, err := New(nil).withholdIgnoredTables(
-		engine.NewIgnoredTables(req.IgnoreTables), req,
+		mustIgnoredTables(t, req.IgnoreTables), req,
 		[]string{"commerce", "commerce_sharded"}, currentSchema)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), `plan keyspace "commerce_sharded": schema files are required`)
+}
+
+// An application that creates one table per configured trigger leaves a
+// family of undeclared tables in a keyspace, and a pattern entry withholds the
+// whole family there and discloses each member, while a declared table the
+// pattern does not match stays in the diff.
+func TestWithholdIgnoredTablesWithholdsPatternFamily(t *testing.T) {
+	req := ignoreTablesRequest(map[string]map[string]string{
+		"commerce":         {"orders.sql": "CREATE TABLE orders (id bigint NOT NULL PRIMARY KEY)"},
+		"commerce_sharded": {"products.sql": "CREATE TABLE products (id bigint NOT NULL PRIMARY KEY)"},
+	}, `/^relay_\d+_feed$/`)
+	feed := func(name string) table.TableSchema {
+		return table.TableSchema{Name: name, Schema: "CREATE TABLE " + name + " (id bigint NOT NULL PRIMARY KEY)"}
+	}
+	currentSchema := map[string][]table.TableSchema{
+		"commerce":         {feed("orders"), feed("relay_2_feed"), feed("relay_10_feed"), feed("relay_feed_settings")},
+		"commerce_sharded": {feed("products"), feed("relay_7_feed")},
+	}
+
+	exempt, err := New(nil).withholdIgnoredTables(
+		mustIgnoredTables(t, req.IgnoreTables), req,
+		[]string{"commerce", "commerce_sharded"}, currentSchema)
+	require.NoError(t, err)
+
+	require.Len(t, exempt, 2)
+	assert.Equal(t, "commerce", exempt[0].Namespace)
+	assert.Equal(t, []string{"relay_10_feed", "relay_2_feed"}, exempt[0].Tables)
+	assert.Equal(t, engine.ExemptReasonIgnoreTables, exempt[0].Reason)
+	assert.Equal(t, "commerce_sharded", exempt[1].Namespace)
+	assert.Equal(t, []string{"relay_7_feed"}, exempt[1].Tables)
+
+	assert.Equal(t, []string{"orders", "relay_feed_settings"}, tableSchemaNames(currentSchema["commerce"]),
+		"a table the pattern does not match in full stays in the diff")
+	assert.Equal(t, []string{"products"}, tableSchemaNames(currentSchema["commerce_sharded"]))
+}
+
+// A pattern that also reaches a table a keyspace's files declare is refused,
+// the same as a plain entry naming it.
+func TestWithholdIgnoredTablesRefusesPatternMatchingDeclaredTable(t *testing.T) {
+	req := ignoreTablesRequest(map[string]map[string]string{
+		"commerce": {"relay_1_feed.sql": "CREATE TABLE relay_1_feed (id bigint NOT NULL PRIMARY KEY)"},
+	}, `/^relay_\d+_feed$/`)
+	currentSchema := map[string][]table.TableSchema{
+		"commerce": {{Name: "relay_1_feed", Schema: "CREATE TABLE relay_1_feed (id bigint NOT NULL PRIMARY KEY)"}},
+	}
+
+	_, err := New(nil).withholdIgnoredTables(
+		mustIgnoredTables(t, req.IgnoreTables), req, []string{"commerce"}, currentSchema)
+	require.Error(t, err)
+	assert.Equal(t,
+		`ignore_tables entry "/^relay_\d+_feed$/" matches "relay_1_feed", which a schema file in namespace "commerce" declares. Narrow the pattern so it no longer matches it, or remove the schema file`,
+		err.Error())
+}
+
+// The apply-side comparison of a branch against the declared schema leaves out
+// the same pattern-matched tables the plan withheld, so a family member on the
+// branch is not read as drift.
+func TestWithoutIgnoredTablesHonorsPatterns(t *testing.T) {
+	live := map[string][]table.TableSchema{
+		"commerce": {{Name: "orders"}, {Name: "relay_3_feed"}, {Name: "relay_3_feed_old"}},
+	}
+	kept := withoutIgnoredTables(live, mustIgnoredTables(t, []string{`/^relay_\d+_feed$/`}))
+	assert.Equal(t, []string{"orders", "relay_3_feed_old"}, tableSchemaNames(kept["commerce"]))
+}
+
+// A pattern that does not compile fails the plan and the apply that carry it,
+// and the apply fails before it creates a branch it would have to clean up.
+func TestInvalidIgnoreTablesPatternFailsPlanAndApply(t *testing.T) {
+	e := NewWithClient(slog.New(slog.NewTextHandler(io.Discard, nil)),
+		func(_, _ string) (psclient.PSClient, error) { return &emptyMainBranchClient{}, nil })
+	_, err := e.Plan(t.Context(), &engine.PlanRequest{
+		Database:     "commerce",
+		SchemaFiles:  schema.SchemaFiles{"commerce": &schema.Namespace{Files: map[string]string{"orders.sql": "CREATE TABLE orders (id bigint NOT NULL PRIMARY KEY)"}}},
+		Credentials:  &engine.Credentials{Metadata: map[string]string{"organization": "org", "token_name": "tn", "token_value": "tv"}},
+		IgnoreTables: []string{`/relay_(\d+_feed/`},
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `ignore_tables entry "/relay_(\d+_feed/" is not a valid regular expression`)
+
+	client := &branchLifecycleClient{}
+	_, err = conformanceEngine(client).Apply(t.Context(), &engine.ApplyRequest{
+		PlanID:       "plan-0123456789abcdef",
+		Database:     "commerce",
+		Credentials:  conformanceCredentials(),
+		IgnoreTables: []string{`/relay_(\d+_feed/`},
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `ignore_tables entry "/relay_(\d+_feed/" is not a valid regular expression`)
+	created, _ := client.snapshot()
+	assert.Empty(t, created, "no branch is created for an apply that cannot read its exclusions")
 }
 
 func tableSchemaNames(schemas []table.TableSchema) []string {

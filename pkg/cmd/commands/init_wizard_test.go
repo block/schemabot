@@ -455,7 +455,7 @@ func (r initBrokenTerminal) Read([]byte) (int, error) {
 
 func TestInitTerminalFailureJoinsCleanup(t *testing.T) {
 	started, cleaned := make(chan struct{}), make(chan struct{})
-	_, err := runInitProgress(t.Context(), func(ctx context.Context, report func(string)) (*initResult, error) {
+	_, err := runInitProgress(t.Context(), "connect and verify", func(ctx context.Context, report func(string)) (*initResult, error) {
 		defer close(cleaned)
 		close(started)
 		<-ctx.Done()
@@ -491,7 +491,7 @@ func TestInitCancelledBeforeWorkReturnsError(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 	called := false
-	result, err := runInitProgress(ctx, func(context.Context, func(string)) (*initResult, error) {
+	result, err := runInitProgress(ctx, "connect and verify", func(context.Context, func(string)) (*initResult, error) {
 		called = true
 		return &initResult{}, nil
 	}, tea.WithInput(nil), tea.WithOutput(io.Discard), tea.WithoutRenderer())
@@ -587,4 +587,13 @@ func TestInitWizardDetectsExistingProjectBeforeReview(t *testing.T) {
 	explicit := newInitWizard(&InitCmd{SchemaDir: root, Type: "postgres", Database: "other"}, "default", io.Discard)
 	require.Equal(t, "postgres", explicit.fields[0].value)
 	require.Equal(t, "other", explicit.fields[1].value)
+}
+
+func TestInitProgressHeading(t *testing.T) {
+	for _, heading := range []string{"sample database", "connect and verify"} {
+		t.Run(heading, func(t *testing.T) {
+			m := &initProgress{heading: heading, width: 72, stages: []string{"A stage whose wording can change"}}
+			require.Contains(t, m.View(), "SchemaBot  /  "+heading)
+		})
+	}
 }

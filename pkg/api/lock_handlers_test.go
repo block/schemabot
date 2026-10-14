@@ -1,7 +1,10 @@
 package api
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -186,13 +189,50 @@ type memoryLockStore struct {
 	storage.LockStore
 	lock              *storage.Lock
 	beforeReleaseByID func(*memoryLockStore)
+	// beforeAcquire runs at the start of an acquire, to stage a lock taken
+	// under the same owner before this acquire's insert.
+	beforeAcquire func(*memoryLockStore)
+	// afterAcquire runs once an acquire has succeeded, to stage a release, a
+	// replacement, or a failing read between the acquire and the handler's
+	// read of the lock.
+	afterAcquire func(*memoryLockStore)
+	// getError, when set, fails every read of the lock.
+	getError error
+	lastID   int64
 }
 
 func (s *memoryLockStore) holds(database, dbType string) bool {
 	return s.lock != nil && s.lock.DatabaseName == database && s.lock.DatabaseType == dbType
 }
 
+// Acquire has the storage layer's acquire semantics for a request carrying no
+// pending plan: it creates the row when none is held, reporting the new row's
+// ID on lock, succeeds without writing anything when the same owner already
+// holds it, and refuses any other owner.
+func (s *memoryLockStore) Acquire(_ context.Context, lock *storage.Lock) error {
+	if s.beforeAcquire != nil {
+		s.beforeAcquire(s)
+	}
+	if s.holds(lock.DatabaseName, lock.DatabaseType) {
+		if s.lock.Owner != lock.Owner {
+			return storage.ErrLockHeld
+		}
+	} else {
+		s.lastID++
+		lock.ID = s.lastID
+		created := *lock
+		s.lock = &created
+	}
+	if s.afterAcquire != nil {
+		s.afterAcquire(s)
+	}
+	return nil
+}
+
 func (s *memoryLockStore) Get(_ context.Context, database, dbType string) (*storage.Lock, error) {
+	if s.getError != nil {
+		return nil, s.getError
+	}
 	if !s.holds(database, dbType) {
 		return nil, nil
 	}
@@ -211,7 +251,7 @@ func (s *memoryLockStore) Release(_ context.Context, database, dbType, owner str
 	return nil
 }
 
-func (s *memoryLockStore) ReleaseByID(_ context.Context, id int64, database, dbType, owner string) error {
+func (s *memoryLockStore) ReleaseByID(_ context.Context, id int64, database, dbType, owner, pendingPlanID string) error {
 	if s.beforeReleaseByID != nil {
 		s.beforeReleaseByID(s)
 	}
@@ -223,6 +263,9 @@ func (s *memoryLockStore) ReleaseByID(_ context.Context, id int64, database, dbT
 	}
 	if s.lock.Owner != owner {
 		return storage.ErrLockNotOwned
+	}
+	if s.lock.PendingPlanID != pendingPlanID {
+		return storage.ErrLockIntentChanged
 	}
 	s.lock = nil
 	return nil
@@ -298,7 +341,7 @@ func TestScopedLockReleaseIsPerOperatorGroup(t *testing.T) {
 		rec := release(t, locks, &auth.User{Subject: "bob", Groups: []string{"payments-team"}})
 
 		assert.Equal(t, http.StatusForbidden, rec.Code)
-		assert.Contains(t, rec.Body.String(), "records no verified acquirer")
+		assert.Contains(t, rec.Body.String(), `the lock is held under owner \"`+owner+`\", the owner you sent, but records no verified acquirer`)
 		assert.Contains(t, rec.Body.String(), "schema-admins")
 		assert.NotNil(t, locks.lock, "a refused release leaves the lock held")
 	})
@@ -338,6 +381,36 @@ func TestScopedLockReleaseIsPerOperatorGroup(t *testing.T) {
 		assert.Equal(t, int64(8), locks.lock.ID)
 	})
 
+	t.Run("a lock pinned to a pending plan is released", func(t *testing.T) {
+		held := paymentsLock(7, owner, teamAcquirer)
+		held.PendingPlanID = "plan-1"
+		locks := &memoryLockStore{lock: held}
+		rec := release(t, locks, &auth.User{Subject: "carol", Groups: []string{"payments-team"}})
+
+		assert.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+		assert.Nil(t, locks.lock, "the checked row and its pending plan are released")
+	})
+
+	t.Run("a lock re-pinned to a new plan after the check is left held", func(t *testing.T) {
+		held := paymentsLock(7, owner, teamAcquirer)
+		held.PendingPlanID = "plan-1"
+		locks := &memoryLockStore{
+			lock: held,
+			beforeReleaseByID: func(s *memoryLockStore) {
+				refreshed := *s.lock
+				refreshed.PendingPlanID = "plan-2"
+				s.lock = &refreshed
+			},
+		}
+		rec := release(t, locks, &auth.User{Subject: "carol", Groups: []string{"payments-team"}})
+
+		assert.Equal(t, http.StatusConflict, rec.Code, rec.Body.String())
+		assert.Contains(t, rec.Body.String(), "released and acquired again")
+		require.NotNil(t, locks.lock, "the lock re-pinned to a new plan stays held")
+		assert.Equal(t, int64(7), locks.lock.ID)
+		assert.Equal(t, "plan-2", locks.lock.PendingPlanID)
+	})
+
 	t.Run("a lock released after the check reports it missing", func(t *testing.T) {
 		locks := &memoryLockStore{
 			lock:              paymentsLock(7, owner, teamAcquirer),
@@ -368,15 +441,244 @@ func TestScopedLockReleaseIsPerOperatorGroup(t *testing.T) {
 	})
 }
 
-// Release by owner string alone is the exception, not the default: only the
-// deployment write groups and a deployment with no scoped grants get it. An
-// allow reason the release path has not been taught about is held to the
-// recorded acquirer, so a new grant cannot release by owner until someone
-// decides it should.
-func TestReleasesLockByOwnerAloneIsAnAllowlist(t *testing.T) {
-	assert.True(t, releasesLockByOwnerAlone(DirectWriteReasonAdminAllow))
-	assert.True(t, releasesLockByOwnerAlone(DirectWriteReasonScopedLaneDisabled))
-	assert.False(t, releasesLockByOwnerAlone(DirectWriteReasonScopedAllow))
-	assert.False(t, releasesLockByOwnerAlone("service_allow"), "an unknown allow reason is held to the recorded acquirer")
-	assert.False(t, releasesLockByOwnerAlone(""))
+// A scoped operator who sends the owner string of a lock that is already held
+// is told they hold it only when the lock's recorded acquirer shared one of the
+// database's operator groups with them, the same rule that decides who may
+// release it. The owner string is readable by anyone who can list locks, so a
+// caller from another group, or any scoped caller facing a lock with no
+// recorded acquirer, gets a 403 naming who holds it, and the lock is left
+// exactly as it was. Re-acquiring your own group's lock stays idempotent, and
+// deployment write-group members re-acquire by owner as before.
+func TestScopedLockReacquireIsPerOperatorGroup(t *testing.T) {
+	logger := slog.New(slog.DiscardHandler)
+	cfg := scopedWriteConfig()
+	payments := cfg.Databases["payments"]
+	payments.OperatorGroups = []string{"payments-team", "payments-oncall"}
+	cfg.Databases["payments"] = payments
+
+	const owner = "cli:bob@laptop"
+	body := `{"database":"payments","database_type":"mysql","owner":"` + owner + `","repository":"org/payments-service"}`
+	teamAcquirer := &storage.LockAcquirer{Subject: "bob", OperatorGroups: []string{"payments-team"}}
+	bob := &auth.User{Subject: "bob", Groups: []string{"payments-team"}}
+
+	acquire := func(t *testing.T, locks *memoryLockStore, user *auth.User) *httptest.ResponseRecorder {
+		t.Helper()
+		svc := New(&mockStorageWithApplyStores{locks: locks}, cfg, nil, logger)
+		return scopedDenialRequest(t, svc.handleLockAcquire, user, http.MethodPost, "/api/locks/acquire", body)
+	}
+	// acquireUnverified sends the acquire as user without a verified identity,
+	// so the request records no acquirer.
+	acquireUnverified := func(t *testing.T, locks *memoryLockStore, user *auth.User) *httptest.ResponseRecorder {
+		t.Helper()
+		svc := New(&mockStorageWithApplyStores{locks: locks}, cfg, nil, logger)
+		ctx := auth.WithUser(t.Context(), user)
+		req := httptest.NewRequestWithContext(ctx, http.MethodPost, "/api/locks/acquire", strings.NewReader(body))
+		rec := httptest.NewRecorder()
+		svc.handleLockAcquire(rec, req)
+		return rec
+	}
+	assertUnchanged := func(t *testing.T, locks *memoryLockStore, want *storage.Lock) {
+		t.Helper()
+		require.NotNil(t, locks.lock, "a refused re-acquire leaves the lock held")
+		assert.Equal(t, want, locks.lock, "a refused re-acquire changes nothing on the lock")
+	}
+
+	t.Run("an operator in another of the database's groups is refused", func(t *testing.T) {
+		held := paymentsLock(7, owner, teamAcquirer)
+		locks := &memoryLockStore{lock: paymentsLock(7, owner, teamAcquirer)}
+		rec := acquire(t, locks, &auth.User{Subject: "mallory", Groups: []string{"payments-oncall"}})
+
+		assert.Equal(t, http.StatusForbidden, rec.Code, rec.Body.String())
+		assert.Contains(t, rec.Body.String(), "lock_acquire on database")
+		assert.Contains(t, rec.Body.String(), "acquired under operator groups (payments-team)")
+		assert.Contains(t, rec.Body.String(), "schema-admins", "the denial names the write groups that may release it")
+		assertUnchanged(t, locks, held)
+	})
+
+	t.Run("a lock with no recorded acquirer is refused and named as held under the caller's own owner", func(t *testing.T) {
+		held := paymentsLock(7, owner, nil)
+		locks := &memoryLockStore{lock: paymentsLock(7, owner, nil)}
+		rec := acquire(t, locks, bob)
+
+		assert.Equal(t, http.StatusForbidden, rec.Code, rec.Body.String())
+		assert.Contains(t, rec.Body.String(), `the lock is held under owner \"`+owner+`\", the owner you sent, but records no verified acquirer`)
+		assert.Contains(t, rec.Body.String(), "schema-admins", "the denial names the write groups that may release it")
+		assertUnchanged(t, locks, held)
+	})
+
+	t.Run("a lock acquired by a caller in no operator group is refused", func(t *testing.T) {
+		admin := &storage.LockAcquirer{Subject: "alice", OperatorGroups: []string{}}
+		held := paymentsLock(7, owner, admin)
+		locks := &memoryLockStore{lock: paymentsLock(7, owner, admin)}
+		rec := acquire(t, locks, bob)
+
+		assert.Equal(t, http.StatusForbidden, rec.Code, rec.Body.String())
+		assert.Contains(t, rec.Body.String(), "none of the database's operator groups")
+		assertUnchanged(t, locks, held)
+	})
+
+	t.Run("the acquirer re-acquiring their own lock succeeds without changing it", func(t *testing.T) {
+		held := paymentsLock(7, owner, teamAcquirer)
+		locks := &memoryLockStore{lock: paymentsLock(7, owner, teamAcquirer)}
+		rec := acquire(t, locks, bob)
+
+		assert.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+		assert.Contains(t, rec.Body.String(), owner)
+		assert.Equal(t, held, locks.lock)
+	})
+
+	t.Run("a teammate in the acquirer's operator group re-acquires it", func(t *testing.T) {
+		locks := &memoryLockStore{lock: paymentsLock(7, owner, teamAcquirer)}
+		rec := acquire(t, locks, &auth.User{Subject: "carol", Groups: []string{"payments-team"}})
+
+		assert.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+		assert.Equal(t, int64(7), locks.lock.ID)
+	})
+
+	t.Run("a lock taken by another group while this acquire ran is refused", func(t *testing.T) {
+		otherTeam := paymentsLock(8, owner, &storage.LockAcquirer{Subject: "erin", OperatorGroups: []string{"payments-oncall"}})
+		locks := &memoryLockStore{beforeAcquire: func(s *memoryLockStore) {
+			taken := *otherTeam
+			s.lock = &taken
+		}}
+		rec := acquire(t, locks, bob)
+
+		assert.Equal(t, http.StatusForbidden, rec.Code, rec.Body.String())
+		assert.Contains(t, rec.Body.String(), "acquired under operator groups (payments-oncall)")
+		assertUnchanged(t, locks, otherTeam)
+	})
+
+	t.Run("an unverified operator is refused before taking any lock", func(t *testing.T) {
+		// Without a verified identity the lock could record no acquirer, so
+		// the operator taking it could neither release it nor take it again.
+		locks := &memoryLockStore{}
+		rec := acquireUnverified(t, locks, bob)
+
+		assert.Equal(t, http.StatusForbidden, rec.Code, rec.Body.String())
+		assert.Contains(t, rec.Body.String(), `lock_acquire on database \"payments\": your identity is not verified`)
+		assert.Contains(t, rec.Body.String(), "this request took no lock")
+		assert.Contains(t, rec.Body.String(), "schema-admins", "the refusal names the write groups that can take the lock")
+		assert.Contains(t, rec.Body.String(), "ask a member of a deployment write group to run the command for you")
+		assert.Nil(t, locks.lock, "a refused acquire takes no lock")
+	})
+
+	t.Run("an unverified operator re-sending their own group's lock owner is refused with the lock unchanged", func(t *testing.T) {
+		// The groups of an unverified caller are only claimed, so they do not
+		// decide whether the caller holds the lock; the refusal says only
+		// that this request took none, which stays true while the lock is
+		// held.
+		held := paymentsLock(7, owner, teamAcquirer)
+		locks := &memoryLockStore{lock: paymentsLock(7, owner, teamAcquirer)}
+		rec := acquireUnverified(t, locks, bob)
+
+		assert.Equal(t, http.StatusForbidden, rec.Code, rec.Body.String())
+		assert.Contains(t, rec.Body.String(), `lock_acquire on database \"payments\": your identity is not verified`)
+		assert.Contains(t, rec.Body.String(), "this request took no lock")
+		assertUnchanged(t, locks, held)
+	})
+
+	t.Run("a lock released before the acquire could be read back is not reported held", func(t *testing.T) {
+		locks := &memoryLockStore{afterAcquire: func(s *memoryLockStore) { s.lock = nil }}
+		rec := acquire(t, locks, bob)
+
+		assert.Equal(t, http.StatusInternalServerError, rec.Code, rec.Body.String())
+		assert.Contains(t, rec.Body.String(), "released before this acquire could be confirmed")
+		assert.Nil(t, locks.lock)
+	})
+
+	t.Run("a lock this acquire created and then lost to another group before it was read back is refused", func(t *testing.T) {
+		otherTeam := paymentsLock(99, owner, &storage.LockAcquirer{Subject: "erin", OperatorGroups: []string{"payments-oncall"}})
+		locks := &memoryLockStore{afterAcquire: func(s *memoryLockStore) {
+			taken := *otherTeam
+			s.lock = &taken
+		}}
+		rec := acquire(t, locks, bob)
+
+		assert.Equal(t, http.StatusForbidden, rec.Code, rec.Body.String())
+		assert.Contains(t, rec.Body.String(), "acquired under operator groups (payments-oncall)")
+		assertUnchanged(t, locks, otherTeam)
+	})
+
+	t.Run("a lock this acquire created that cannot be read back is not reported held and is named to the caller", func(t *testing.T) {
+		locks := &memoryLockStore{afterAcquire: func(s *memoryLockStore) { s.getError = errors.New("storage unavailable") }}
+		rec := acquire(t, locks, bob)
+
+		assert.Equal(t, http.StatusInternalServerError, rec.Code, rec.Body.String())
+		assert.Contains(t, rec.Body.String(), "was acquired but could not be read back, so it is not reported held")
+		assert.Contains(t, rec.Body.String(), `the lock may be held under owner \"`+owner+`\"`)
+		assert.Contains(t, rec.Body.String(), "release it under that owner")
+		assert.NotContains(t, rec.Body.String(), `"lock":`, "a lock that could not be read back is not reported held")
+		require.NotNil(t, locks.lock, "the created lock is left held")
+		assert.Equal(t, owner, locks.lock.Owner)
+	})
+
+	t.Run("a lock already held under this owner that cannot be read back is not reported held", func(t *testing.T) {
+		held := paymentsLock(7, owner, teamAcquirer)
+		locks := &memoryLockStore{
+			lock:         paymentsLock(7, owner, teamAcquirer),
+			afterAcquire: func(s *memoryLockStore) { s.getError = errors.New("storage unavailable") },
+		}
+		rec := acquire(t, locks, bob)
+
+		assert.Equal(t, http.StatusInternalServerError, rec.Code, rec.Body.String())
+		assert.Contains(t, rec.Body.String(), "internal error")
+		assert.NotContains(t, rec.Body.String(), owner, "a lock that could not be read back is not described to the caller")
+		assertUnchanged(t, locks, held)
+	})
+
+	t.Run("a deployment write-group member re-acquires any group's lock by owner", func(t *testing.T) {
+		locks := &memoryLockStore{lock: paymentsLock(7, owner, nil)}
+		rec := acquire(t, locks, &auth.User{Subject: "alice", Groups: []string{"schema-admins"}})
+
+		assert.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+		assert.Equal(t, int64(7), locks.lock.ID)
+	})
+}
+
+// Holding a lock by owner string alone, to re-acquire or release it, is the
+// exception, not the default: only the deployment write groups and a
+// deployment with no scoped grants get it. An allow reason the lock paths have
+// not been taught about is held to the recorded acquirer, so a new grant cannot
+// hold a lock by owner until someone decides it should.
+func TestHoldsLockByOwnerAloneIsAnAllowlist(t *testing.T) {
+	assert.True(t, holdsLockByOwnerAlone(DirectWriteReasonAdminAllow))
+	assert.True(t, holdsLockByOwnerAlone(DirectWriteReasonScopedLaneDisabled))
+	assert.False(t, holdsLockByOwnerAlone(DirectWriteReasonScopedAllow))
+	assert.False(t, holdsLockByOwnerAlone("service_allow"), "an unknown allow reason is held to the recorded acquirer")
+	assert.False(t, holdsLockByOwnerAlone(""))
+}
+
+// A scoped operator's acquire refused because no verified acquirer can be
+// recorded is counted under its own status on the lock operation counter, and
+// logged with the subject the caller claimed and why no acquirer could be
+// recorded, so a break-glass refusal can be found and attributed from
+// telemetry alone.
+func TestUnverifiedScopedLockAcquireRefusalIsCountedAndLogged(t *testing.T) {
+	reader := installManualMetricReader(t)
+	var logs bytes.Buffer
+	svc := New(&mockStorageWithApplyStores{locks: &memoryLockStore{}}, scopedWriteConfig(), nil,
+		slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	ctx := auth.WithUser(t.Context(), &auth.User{Subject: "bob", Groups: []string{"payments-team"}})
+	body := `{"database":"payments","database_type":"mysql","owner":"cli:bob@laptop","repository":"org/payments-service"}`
+	rec := httptest.NewRecorder()
+	svc.handleLockAcquire(rec, httptest.NewRequestWithContext(ctx, http.MethodPost, "/api/locks/acquire", strings.NewReader(body)))
+	require.Equal(t, http.StatusForbidden, rec.Code, rec.Body.String())
+
+	points := collectCounterPoints(t, reader, "schemabot.lock_operations_total")
+	require.Len(t, points, 1)
+	assert.Equal(t, int64(1), points[0].Value)
+	assert.Equal(t, "acquire", attributeValue(t, points[0], "operation"))
+	assert.Equal(t, "payments", attributeValue(t, points[0], "database"))
+	assert.Equal(t, "no_acquirer", attributeValue(t, points[0], "status"))
+
+	var entry map[string]any
+	require.NoError(t, json.Unmarshal(logs.Bytes(), &entry), logs.String())
+	assert.Equal(t, "WARN", entry["level"])
+	assert.Equal(t, "scoped lock acquire refused: there is no verified acquirer to record, so the caller could neither release nor re-acquire the lock; this request took no lock", entry["msg"])
+	assert.Equal(t, "bob", entry["claimed_subject"])
+	assert.Equal(t, DirectWriteReasonUnverifiedIdentity, entry["reason"])
+	assert.Equal(t, "payments", entry["database"])
+	assert.Equal(t, "mysql", entry["database_type"])
+	assert.Equal(t, "cli:bob@laptop", entry["owner"])
+	assert.Equal(t, "org/payments-service", entry["repository"])
 }

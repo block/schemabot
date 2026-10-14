@@ -311,6 +311,77 @@ a drop. See [namespace scope](namespaces.md) for shared databases.
 The command's PR hint is for GitHub automation. You can also use the generated
 files directly with the CLI, as shown below.
 
+#### Recovering from onboarding formatting errors
+
+Onboarding reports every table-formatting failure together and writes no files
+if any table fails. Existing files stay untouched. `--force` only permits
+overwrites; it does not bypass formatting checks. Editing a local file and
+rerunning `onboard` does not fix the refusal, because the command pulls the live
+schema again.
+
+To build the schema root manually, retrieve the original definitions with
+`pull -o json`, using the same database, environment, profile or endpoint,
+type override, and concrete namespace selection as the failed onboarding.
+Omit `--table`: recovery needs the complete managed schema, including namespace
+artifacts. For example, a one-table MySQL database returns:
+
+```console
+$ schemabot pull -d shop -e staging -o json
+{
+  "database": "shop",
+  "type": "mysql",
+  "environment": "staging",
+  "namespaces": {
+    "shop": {
+      "tables": {
+        "orders": "CREATE TABLE orders (id bigint NOT NULL) /*!50100 PARTITION BY HASH (id) PARTITIONS 4 */"
+      }
+    }
+  },
+  "table_count": 1
+}
+```
+
+Create `schema/schemabot.yaml` with the returned `database` and `type`:
+
+```yaml
+database: shop
+type: mysql
+```
+
+Preserve any existing `ignore_namespaces` and `ignore_tables` settings. For
+each managed table, copy its decoded SQL string to
+`schema/<namespace>/<table>.sql`, adding line breaks outside quoted content
+without changing options, comments, or statements. The example becomes
+`schema/shop/orders.sql`:
+
+```sql
+CREATE TABLE orders (
+    id bigint NOT NULL
+) /*!50100 PARTITION BY HASH (id) PARTITIONS 4 */;
+```
+
+Copy namespace artifacts such as `vschema.json` into the same namespace
+directory. Include every managed table, not just the tables named in the
+error; omit tables explicitly withheld by the preserved exclusions. If you
+used `--template-env-suffix`, apply the same namespace-directory mapping
+described in [namespace scope](namespaces.md).
+
+For a managed namespace with no tables or artifacts, keep its scope explicit
+with a `schema.sql` file containing exactly:
+
+```sql
+-- This namespace is empty. Add CREATE TABLE declarations here.
+```
+
+Run `schemabot plan -s ./schema -e staging` with the same connection settings.
+Before committing, require `✓ No schema changes detected.` as shown in the
+[plan walkthrough](#plan-and-apply-a-change). Resolve every error or proposed
+change against the original pull; do not apply changes to make the live
+database match an incorrectly copied baseline. If the original SQL itself
+cannot pass the dialect parser, report that parser limitation instead of
+removing the unsupported schema definition.
+
 ### Review an index change
 
 Plan output uses the target database dialect, including PostgreSQL identifier
@@ -394,11 +465,108 @@ This confirms that the live schema matches your files. Commit the files so
 your repository records the schema you now run. If your team uses GitHub
 merge gates, follow the [PR workflow](pre-merge-workflow.md) instead.
 
+### Apply to one target of a rollout
+
+An environment can fan out to several targets, from a `targets:` list or a
+`deployments:` map. `plan` and `apply` cover the whole rollout by default.
+Pass `--target` to plan and apply one member only, for example to land a
+change on one target before the rest:
+
+```console
+$ schemabot apply -s ./schema -e production --target payments-002
+...
+Target: prod/payments-002 (this plan covers only this rollout member)
+
+Do you want to apply these changes? Only 'yes' will be accepted: yes
+```
+
+`--target` takes the target's name, or `deployment/target` when two
+deployments address a target of the same name; an ambiguous bare name is
+refused. An unknown name is refused with the list of valid targets. `plan`
+takes the same flag and needs `-e` with it.
+
+A narrowed plan speaks for its one target. It shows only that target's
+changes, never the whole rollout's split of what applies where, and it is
+never gated on another target that needs attention. It never records a GitHub
+check result, so a narrowed plan or apply cannot pass a PR merge gate while
+other targets still need the change. On a pull request, `schemabot plan -e
+<env> --target <target>` and `schemabot apply -e <env> --target <target>`
+narrow the same way. A narrowed plan comment leaves the schema check as it
+was; a narrowed apply blocks it with `narrowed_apply` from the moment it is
+dispatched, and an apply or plan of the whole environment lifts that block
+once every target has the change. `apply-confirm` takes no `--target`: it confirms the
+target its apply named. The server records the narrowing on the
+stored plan and refuses to apply it anywhere but the target it was made for,
+and a narrowed apply cannot be rolled back with `rollback`: restore that
+target by planning and applying the previous schema with the same `--target`.
+In an environment with a single target, `--target` names the whole rollout,
+so the plan and apply are not narrowed.
+
+A plan of the whole rollout plans every target beside the first one and shows
+what applies where. It reports no changes only when every target is at the
+desired schema, so a re-run of an `apply` that already landed, or the
+verification step of `onboard`, reads as up to date. When the first target is
+already at the desired schema, for example after an apply narrowed to it,
+another target can still need the change, and the plan says so rather than
+reading as up to date from the first target alone. A target planned against
+its own schema shows that work under its own heading. A deployment expected to
+mirror the first target is listed as needing attention instead, with the
+`--target` that applies it on its own, since its plan differs from the one it
+mirrors. A target that cannot be planned is listed as needing attention too.
+`apply` of the whole rollout refuses while any target needs attention, and
+`onboard` fails its verification.
+
+A plan or apply of a whole rollout of more than one target needs a CLI that
+renders every target's plan. The server refuses one from an older CLI, which
+would show only the first target's plan, with `upgrade the schemabot CLI to
+plan or apply a multi-target environment`; `--target` still works from it.
+Upgrade the server before the CLI, as [releases](release.md) describes: an
+older server refuses a request from a newer CLI as an unknown field.
+
+A targeted apply checks for a schema change already in progress on its
+target's deployment, which every target of a `targets:` list shares, and
+refuses to start while one is queued or running there.
+
+A rollback of a rollout-wide apply is made against the first target the apply
+ran from. If the rollout order changed since, the rollback is refused rather
+than reverting that one target alone: restore the order the apply ran under,
+then retry it. A rollout of a `targets:` list plans each target against its own
+schema, and a rollback is one plan, so its rollback is refused before anything
+is planned: restore each target by planning and applying the previous schema
+with `--target`. The refusal follows how the apply ran, as recorded with its
+plan, not how the environment is configured now, so respelling the targets as
+mirrored deployments, or removing all but the first, does not let the rollback
+through. An apply that ran one plan on every target is refused only if its
+targets are now each planned against their own schema.
+
 ### Understand a refusal
 
 Changes classified as unsafe require an explicit `--allow-unsafe` opt-in.
 Review the exact DDL and its consequences before providing it. Some changes
 are unsupported or blocked by the engine; the flag does not make them valid.
+`apply` and `rollback` refuse a blocked plan before they check or take a lock
+or ask for confirmation, for a single target, the whole rollout, or `--target`
+alike. The refusal follows the plan and names the plan, the first blocked
+table, and the engine's reason, one line per cause. Fix what the reason names:
+the statement, a grant on the target, or the server's policy. `--yield` has no
+lock to release on this refusal.
+
+An apply of the whole rollout runs each target's own plan, but holds every
+target to what the first target's plan discloses, since that is the plan you
+review and consent against. So the server refuses, whatever the flags,
+`--allow-unsafe` included, a target whose own plan carries an unsafe change
+the first target's plan does not, a change the engine runs as direct-execution
+DDL there, or work the apply, laid out from the first target's plan, has no
+operation to run. It returns those targets with the plan, and `apply` refuses
+before it takes a lock or prompts. For each target it prints the
+`apply --target <target>` that applies that target's own plan, with
+`--allow-unsafe` when that plan is unsafe; once those have landed, apply the
+rollout again for the rest. A target whose plan no apply runs, because its
+engine refuses a change or its own plan's work has no operation to run from,
+gets no such command: change the schema files instead. These refused targets
+are listed only once no target needs attention, since a target needing
+attention refuses the apply first. So after you fix a target that needed
+attention and plan again, the plan can still list a target the apply refuses.
 
 A database lock can also block a new apply. Inspect the owner and ongoing
 work before releasing it. Locks span the database's environments; forcing
@@ -428,7 +596,7 @@ $ schemabot progress apply-example-73
        • Rows: 6,000,000 / 10,000,000 · ETA: 8m 0s
        • ℹ️ Throttled: commit-latency 120ms >= 100ms · backing off while database writes commit slowly
 
-  Docs: https://github.com/block/schemabot/blob/main/docs/throttle.md
+  📖 Docs: https://github.com/block/schemabot/blob/main/docs/throttle.md
 
 
 
@@ -441,14 +609,17 @@ Press **Esc** to detach while copying; the apply keeps running. **s** requests
 a stop for this MySQL example. At deferred cutover, **Enter** requests the
 swap. During cutover, the watcher asks you to wait and disables Esc/stop.
 
+For progress bar colors, phase labels, and keyboard controls, see the
+[progress display reference](#progress-display-reference).
+
 ### Understand throttling
 
 When copying is throttled, the live view explains why. This MySQL example
 pauses when commits are slow, then continues as conditions improve. Recognized
 signals include a short explanation beside each affected table. One shared
 link to the [throttle reference](throttle.md) appears below the tables.
-The link uses a readable label in supported terminals and the full URL in plain output,
-matching `list-plans` and `status`.
+The link shows the page's path, `docs/throttle.md`, in supported terminals and
+the full URL in plain output, matching how `list-plans` and `status` link a PR.
 
 ![MySQL progress shows a commit-latency throttle signal, its docs link, and completion](../assets/cli-throttle.gif)
 
@@ -514,11 +685,11 @@ $ schemabot progress apply-example-84
      ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜ 72.50%
        ALTER TABLE `orders` ADD INDEX `idx_status`(`status`);
        • Rows: 2,900,000 / 4,000,000 · ETA: 2m 45s
-       • Shards: 4 (1 complete, 3 copying)
+       • Shards: 4 (3 copying, 1 complete)
+           ◉ c0-: 45.00% · 450,000 / 1,000,000 rows · ETA: 2m 45s
+           ◉ 80-c0: 65.00% · 650,000 / 1,000,000 rows · ETA: 1m 45s
+           ◉ 40-80: 80.00% · 800,000 / 1,000,000 rows · ETA: 1m 0s
            ✓ -40: 1,000,000 rows
-           ◉ 40-80: 80.00% (800,000/1,000,000 rows) ETA 1m 0s
-           ◉ 80-c0: 65.00% (650,000/1,000,000 rows) ETA 1m 45s
-           ◉ c0-: 45.00% (450,000/1,000,000 rows) ETA 2m 45s
 
 
 ESC detach • c cancel
@@ -575,8 +746,10 @@ The preview and live progress format SQL using the target database dialect,
 preserving quoted names and values. If the server omits the database type or
 returns an unrecognized type, both views preserve the original SQL.
 
-Here is a rollback of the index added earlier. This example declines the
-confirmation, so nothing changes:
+Here is a rollback of the index added earlier. Dropping the index is an unsafe
+change, and rollback needs `--allow-unsafe` for unsafe changes exactly as
+`apply` does. Without the flag it stops before the confirmation prompt, with
+or without `-y`, and nothing changes:
 
 ```console
 $ schemabot rollback -e staging apply-example-73
@@ -591,7 +764,34 @@ The following changes will be applied to rollback:
 
   orders (alter):
     ALTER TABLE `orders` DROP INDEX `idx_status`;
-⚠️ Unsafe Changes Detected:
+⛔ Apply blocked: 1 unsafe change(s) detected
+  1. orders: Index "idx_status" should be made invisible before dropping to ensure it's not needed
+
+🚨 To proceed with these destructive changes, re-run with --allow-unsafe:
+
+  schemabot rollback apply-example-73 -e staging --allow-unsafe
+```
+
+With `--allow-unsafe`, the unsafe changes are listed again and the confirmation
+still follows. This example declines it, so nothing changes:
+
+```console
+$ schemabot rollback apply-example-73 -e staging --allow-unsafe
+Rollback Plan
+┌───────────────────────────────────┐
+│  Database:      shop              │
+│  Environment:   staging           │
+│  Source apply:  apply-example-73  │
+└───────────────────────────────────┘
+
+The following changes will be applied to rollback:
+
+  orders (alter):
+    ALTER TABLE `orders` DROP INDEX `idx_status`;
+
+🚨 Unsafe Changes (--allow-unsafe enabled)
+
+The following unsafe changes will be applied:
   1. orders: Index "idx_status" should be made invisible before dropping to ensure it's not needed
 
 Do you want to apply this rollback? Only 'yes' will be accepted: no
@@ -763,7 +963,10 @@ environments were not read."), because a clean answer for one environment is
 not a clean answer for the pull request. `--json` gives each row a stable
 `reason` code to branch on. The inspection only reads, so any token that can
 already see a pull request's status can run it; recreating a Check Run with
-`checks backfill` is the admin operation.
+`checks backfill` is the admin operation. Every inspection reads GitHub
+through the App installation, so each caller has a
+[request budget](configuration.md#check-inspection); a loop that exceeds it is
+refused with a retry delay rather than spending the quota the merge gate needs.
 
 ### Recover missing GitHub checks
 
@@ -820,6 +1023,141 @@ a fleet sweep would otherwise pay a storage read per pull request for runs
 that started minutes ago and never get printed. `--stuck-after` sets that
 threshold, and a run whose start time cannot be read is always explained.
 
+### Progress display reference
+
+<details>
+<summary>MySQL progress bars, phase labels, and keyboard controls</summary>
+
+The TUI and CLI use emoji progress bars to convey state at a glance. Each color maps to a
+specific state. The bar is 20 squares wide; filled squares represent percent complete.
+
+#### Progress bar colors
+
+| Color | Emoji | Meaning | Used when |
+|-------|-------|---------|-----------|
+| Blue  | `🟦`  | In progress | Engine actively working: copying rows, cutting over, recovering state |
+| Yellow | `🟨` | Not final | Waiting for cutover, revert window open, reverting, skipping revert, or retrying after a recoverable failure |
+| Green | `🟩`  | Complete | Table finished successfully |
+| Orange | `🟧` | Stopped | Stopped mid-progress (partially complete) |
+| Red   | `🟥`  | Failed | Table failed |
+| White | `⬜`  | Empty | Remaining (unfilled portion of any bar) |
+
+#### Per-table display by state
+
+**Copying rows** — blue bar with percent, row counts, and ETA while the estimate still holds:
+```
+  orders: 🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 32% (71,436/221,193 rows) ETA 5m 30s
+          ALTER TABLE `orders` ADD COLUMN `discount` int NOT NULL DEFAULT 0
+```
+
+**Copying rows after estimate exceeded** — full-width activity indicator with no percentage:
+```
+  orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 Finalizing copy
+          ALTER TABLE `orders` ADD COLUMN `discount` int NOT NULL DEFAULT 0
+       • Rows copied: 145,000 so far
+       • ℹ️ More rows than initially estimated, copying is still active and will continue
+```
+
+**Catching up** — blue bar at 100% with the first-drain label:
+```
+  orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 ⏩ Catching up on accumulated changes...
+          ALTER TABLE `orders` ADD COLUMN `discount` int NOT NULL DEFAULT 0
+       • Rows copied: 1,466,232
+```
+
+**Checksumming** — blue bar tracking verify progress once Spirit reports a total
+(indeterminate "Checksumming to verify data..." before that):
+```
+  orders: 🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 🔍 Checksumming to verify data (21%)
+          ALTER TABLE `orders` ADD COLUMN `discount` int NOT NULL DEFAULT 0
+       • Rows verified: 321,450 / 1,466,232
+```
+
+**Post-checksum** — blue bar at 100% with the second-drain label:
+```
+  orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 ⏩ Data verified, applying final changes...
+          ALTER TABLE `orders` ADD COLUMN `discount` int NOT NULL DEFAULT 0
+       • Rows copied: 1,466,232
+```
+
+**Queued** (pending, not yet started) — empty bar:
+```
+  products: ⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ queued
+            ALTER TABLE `products` ADD COLUMN `weight` decimal(10,2)
+```
+
+**Starting** (running but no row data yet):
+```
+  users: ⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ starting...
+         ALTER TABLE `users` ADD COLUMN `phone` varchar(20)
+```
+
+**Waiting for cutover** — yellow bar at 100%:
+```
+  orders: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 ⏸️ Waiting for cutover
+          ALTER TABLE `orders` ADD COLUMN `discount` int NOT NULL DEFAULT 0
+```
+
+**Cutting over** — blue bar at 100% with spinner (the engine is working again, so the
+bar returns to blue):
+```
+  orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 🔄 Cutting over...
+          ALTER TABLE `orders` ADD COLUMN `discount` int NOT NULL DEFAULT 0
+```
+
+**Complete** — green bar at 100%:
+```
+  orders: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+          ALTER TABLE `orders` ADD COLUMN `discount` int NOT NULL DEFAULT 0
+```
+
+**Stopped** — orange bar at the progress when stop occurred:
+```
+  orders: 🟧🟧🟧🟧🟧🟧⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ⏹️ Stopped at 32%
+          ALTER TABLE `orders` ADD COLUMN `discount` int NOT NULL DEFAULT 0
+```
+
+**Failed** — red bar at the progress when failure occurred:
+```
+  orders: 🟥🟥🟥🟥🟥⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ❌ Failed
+          ALTER TABLE `orders` ADD COLUMN `discount` int NOT NULL DEFAULT 0
+```
+
+**Cancelled** (sequential mode — earlier table failed, this one never ran):
+```
+  products: ⊘ Cancelled (not started)
+            ALTER TABLE `products` ADD COLUMN `weight` decimal(10,2)
+```
+
+#### Status line (above tables)
+
+The TUI shows a single status line above the table list. It varies by overall state:
+
+| State | Status line |
+|-------|-------------|
+| Starting | `⠋ Loading...` |
+| Pending | `⠋ Queued, starts automatically` |
+| Running | `⠋ 🔄 Copying rows... ETA 5m 30s` |
+| Stopping | `⠋ Stopping...` |
+| Waiting for cutover | *(cutover prompt shown in footer instead)* |
+| Cutting over | `⠋ Cutting over...` |
+| Completed | *(no status line — completion message shown after tables)* |
+| Stopped | *(no status line — stopped message shown after tables)* |
+
+The `⠋` is a Braille spinner (animated in the TUI, static here).
+
+#### Footer
+
+| State | Footer |
+|-------|--------|
+| Running | `ESC detach • s stop` |
+| Waiting for cutover (with `--cutover`) | `Press Enter to proceed with cutover (or ESC to detach)` |
+| Waiting for cutover (no `--cutover`) | `To proceed: schemabot cutover -e <env> <id>` |
+| Cutting over | `Cutover in progress - please wait...` |
+| Stopped | `Use 'schemabot start -e <env> <id>' to resume.` |
+
+</details>
+
 ## Use the CLI from scripts and agents
 
 Prefer structured output when another program consumes the result:
@@ -856,6 +1194,28 @@ return after submission without opening an interactive watcher. Retain the new
 apply ID and check its status; submission alone does not confirm completion.
 Interactive operators should keep the default automatic watcher.
 
+A watching `apply -o log` or `apply -o json` returns as soon as the apply
+reaches a final state. It exits 0 only when the apply completed, and non-zero
+when it was stopped, failed, was cancelled, or was reverted, because in each of
+those the schema change is not on the target. For a stopped apply the error
+names the `start` command that resumes it. A watcher that cannot reach the
+server retries with backoff, and exits non-zero once polls have kept failing
+for a few minutes in a row; the interactive watcher gives up on the same
+schedule. Giving up does not affect the apply. The error tells the operator to
+run `progress` with the apply ID to watch it again. When a refused poll
+carries a `Retry-After` header, as a proxy or rate limiter in front of
+SchemaBot may send, a watcher waits at least that long before polling again,
+up to 5 minutes per poll, so a watcher held off this way takes longer to give
+up.
+
+A single Ctrl-C or SIGTERM ends only the watch. The command prints a notice to
+stderr saying the apply continues and how to watch it again with `progress`,
+and exits 130, the status a shell reports for an interrupted process, so a
+script can tell an interrupted watch from an apply that failed. The apply
+itself runs on unaffected. A Ctrl-C that lands before the apply or rollback
+has been submitted ends the command before anything is started, with a notice
+saying so, and the same exit status.
+
 Do not scrape colored tables or progress bars. Check the exit status and the
 returned payload, and retain plan/apply IDs for follow-up reads. An accepted
 apply may still be running. Use [schema intelligence](schema-intelligence.md)
@@ -869,7 +1229,9 @@ launching SchemaBot. Keep those organization-specific steps in the wrapper;
 use the upstream CLI for plans and operations.
 
 An exec-style wrapper passes `--cli-name "acme schemabot"` so generated hints
-lead back through the wrapper. It can supply the endpoint with `--endpoint`
+lead back through the wrapper. Set the server's
+[`cli_name`](configuration.md#cli-name) to the same value so the CLI hints in
+PR comments lead back through it too. It can supply the endpoint with `--endpoint`
 and a bearer token through `SCHEMABOT_TOKEN`. Avoid placing credentials in
 shell history or printing them in diagnostics.
 

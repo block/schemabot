@@ -19,7 +19,20 @@ const applyLogColumns = `id, apply_id, task_id, level, event_type, source, messa
 // applyLogStore implements storage.ApplyLogStore using MySQL.
 type applyLogStore struct {
 	db       *rebindDB
+	dialect  Dialect
 	identity identityInserter
+}
+
+// applyLogLeasedAppendStatement renders Append's statement for a caller holding
+// the apply lease. It binds the nine inserted columns, then the apply ID, then
+// the lease token. The row is selected from the leased applies row, so a
+// displaced driver's statement selects nothing and inserts nothing; the token
+// check goes through LeaseSourceFence so it serializes against a concurrent
+// steal instead of passing against a token the statement's snapshot still
+// holds, at whatever isolation level the storage session runs.
+func applyLogLeasedAppendStatement(d Dialect) string {
+	return "INSERT INTO apply_logs (apply_id, task_id, level, event_type, source, message, old_state, new_state, metadata) " +
+		"SELECT ?, ?, ?, ?, ?, ?, ?, ?, ? FROM applies a WHERE a.id = ? AND " + d.LeaseSourceFence("applies", "a", "id", "lease_token")
 }
 
 // Append adds a new log entry.
@@ -35,15 +48,7 @@ func (s *applyLogStore) Append(ctx context.Context, log *storage.ApplyLog) error
 	}
 
 	if hasLease {
-		id, inserted, err := s.identity.InsertGuardedID(ctx, s.db, `
-			INSERT INTO apply_logs (
-				apply_id, task_id, level, event_type, source, message,
-				old_state, new_state, metadata
-			)
-			SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?
-			FROM applies
-			WHERE id = ? AND lease_token = ?
-		`,
+		id, inserted, err := s.identity.InsertGuardedID(ctx, s.db, applyLogLeasedAppendStatement(s.dialect),
 			log.ApplyID, nullInt64Ptr(log.TaskID), log.Level, log.EventType, source, log.Message,
 			nullString(log.OldState), nullString(log.NewState), nullJSON(log.Metadata),
 			lease.ApplyID, lease.Token,

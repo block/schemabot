@@ -39,6 +39,7 @@ func TestPlanRequestClientFieldsDecodeOnTheServer(t *testing.T) {
 	assert.True(t, got.GroupedExecution,
 		"the statement-grouping decision must survive the client/server boundary")
 	assert.Equal(t, "x", got.Database)
+	assert.Equal(t, "x", got.Target, "the rollout member selector must survive the client/server boundary")
 }
 
 // populatedJSONValue builds a non-zero value of typ so that omitempty cannot

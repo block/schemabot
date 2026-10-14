@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -11,6 +12,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/auth"
 	"github.com/block/schemabot/pkg/storage"
 )
@@ -323,7 +325,11 @@ func TestHandlersEnforceScopedWriteDenials(t *testing.T) {
 			`{"plan_id":"plan-1","environment":"staging"}`)
 
 		assert.Equal(t, http.StatusInternalServerError, rec.Code)
-		assert.Contains(t, rec.Body.String(), "get plan plan-1")
+		var resp apitypes.ErrorResponse
+		require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
+		assert.Equal(t, apitypes.ErrCodeStorageError, resp.ErrorCode)
+		assert.Contains(t, resp.Error, "failed to get plan plan-1")
+		assert.NotContains(t, resp.Error, assert.AnError.Error(), "the storage error stays in the server log")
 	})
 
 	t.Run("apply rejects a plan that does not exist at decision time", func(t *testing.T) {
@@ -332,8 +338,11 @@ func TestHandlersEnforceScopedWriteDenials(t *testing.T) {
 		rec := scopedDenialRequest(t, svc.handleApply, operator, http.MethodPost, "/api/apply",
 			`{"plan_id":"plan-missing","environment":"staging"}`)
 
-		assert.Equal(t, http.StatusInternalServerError, rec.Code)
-		assert.Contains(t, rec.Body.String(), "plan not found: plan-missing",
+		assert.Equal(t, http.StatusNotFound, rec.Code)
+		var resp apitypes.ErrorResponse
+		require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
+		assert.Equal(t, apitypes.ErrCodeNotFound, resp.ErrorCode)
+		assert.Contains(t, resp.Error, "plan not found: plan-missing",
 			"the authorization decision is bound to a plan that exists when it is made")
 	})
 

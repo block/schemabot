@@ -21,6 +21,13 @@ func TestNeedsFinalizerKeyIsSharedByEngineAndAPITypes(t *testing.T) {
 	assert.Equal(t, engine.MetadataNeedsFinalizer, apitypes.NeedsFinalizerMetadataKey)
 }
 
+// The engine and the plan comment read the generated-only VSchema marker under
+// one key; the two constants exist only because apitypes stays dependency-free.
+func TestVSchemaGeneratedOnlyKeyIsSharedByEngineAndAPITypes(t *testing.T) {
+	assert.Equal(t, engine.MetadataVSchemaGeneratedOnly, apitypes.VSchemaGeneratedOnlyMetadataKey)
+	assert.Equal(t, engine.MetadataVSchemaGeneratedOnly, storage.PlanMetadataVSchemaGeneratedOnly)
+}
+
 // A sharded keyspace adds a table and its engine asks to finalize the keyspace
 // once the table exists, with no VSchema document in the plan. The stored plan
 // records the request on the namespace — from whichever shard's change carries
@@ -214,11 +221,11 @@ func TestFinalizerDispatchScopeCoversFinalizeOnlyNamespaces(t *testing.T) {
 		},
 	}
 
-	ns, err := finalizerDispatchScope(plan, []string{"ks_b", "ks_a"}, nil)
+	ns, err := finalizerDispatchScope(plan, []string{"ks_b", "ks_a"}, nil, "")
 	require.NoError(t, err)
 	assert.Empty(t, ns, "a dispatch naming the full finalizer set is deployment-scoped")
 
-	_, err = finalizerDispatchScope(plan, []string{"ks_a"}, []string{"group_finalizer"})
+	_, err = finalizerDispatchScope(plan, []string{"ks_a"}, []string{"group_finalizer"}, "")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "plan plan-scope-finalize finalizes [ks_a ks_b]")
 }

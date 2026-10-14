@@ -167,20 +167,37 @@ func TestServerEngineMetadataAppliesServerDirectExecutionPolicy(t *testing.T) {
 
 // A resolved target that states any part of a direct execution policy states
 // all of it: the server-wide policy is not merged in alongside, so the target
-// can never enable direct execution under a row bound configured elsewhere.
+// can never enable direct execution under a size bound configured elsewhere.
 func TestServerEngineMetadataLeavesATargetsOwnDirectExecutionPolicyWhole(t *testing.T) {
-	config := &api.ServerConfig{
-		DirectExecution: &api.DirectExecutionConfig{Enabled: true, MaxTableRows: 10000, LockAcquisitionTimeout: "10s"},
+	for name, serverPolicy := range map[string]*api.DirectExecutionConfig{
+		"row-bound server policy":  {Enabled: true, MaxTableRows: 10000, LockAcquisitionTimeout: "10s"},
+		"byte-bound server policy": {Enabled: true, MaxTableBytes: "100MiB", LockAcquisitionTimeout: "10s"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			require.NoError(t, serverPolicy.Validate("server config"), "the fixture is a policy the server would load")
+			config := &api.ServerConfig{DirectExecution: serverPolicy}
+
+			resolved := map[string]string{engine.MetadataDirectExecution: "true"}
+			metadata, err := serverEngineMetadata(config, resolved, storage.DatabaseTypeMySQL)
+			require.NoError(t, err)
+			assert.Equal(t, "true", metadata[engine.MetadataDirectExecution])
+			assert.NotContains(t, metadata, engine.MetadataDirectExecutionMaxTableRows,
+				"a target stating its own policy must not inherit the server-wide size bound; the engine blocks a bound-less grant")
+			assert.NotContains(t, metadata, engine.MetadataDirectExecutionMaxTableBytes,
+				"a target stating its own policy must not inherit the server-wide size bound; the engine blocks a bound-less grant")
+			assert.NotContains(t, metadata, engine.MetadataDirectExecutionLockAcquisitionTimeoutSeconds)
+
+			// A target stating only a byte bound has stated its policy too, so
+			// the server-wide grant is not merged in to enable it.
+			bytesOnly := map[string]string{engine.MetadataDirectExecutionMaxTableBytes: "1048576"}
+			metadata, err = serverEngineMetadata(config, bytesOnly, storage.DatabaseTypeMySQL)
+			require.NoError(t, err)
+			assert.Equal(t, "1048576", metadata[engine.MetadataDirectExecutionMaxTableBytes])
+			assert.NotContains(t, metadata, engine.MetadataDirectExecution, "the server-wide grant does not enable a target that stated its own policy")
+			assert.NotContains(t, metadata, engine.MetadataDirectExecutionMaxTableRows)
+			assert.NotContains(t, metadata, engine.MetadataDirectExecutionLockAcquisitionTimeoutSeconds)
+		})
 	}
-	resolved := map[string]string{engine.MetadataDirectExecution: "true"}
-
-	metadata, err := serverEngineMetadata(config, resolved, storage.DatabaseTypeMySQL)
-
-	require.NoError(t, err)
-	assert.Equal(t, "true", metadata[engine.MetadataDirectExecution])
-	assert.NotContains(t, metadata, engine.MetadataDirectExecutionMaxTableRows,
-		"a target stating its own policy must not inherit the server-wide row bound; the engine blocks a bound-less grant")
-	assert.NotContains(t, metadata, engine.MetadataDirectExecutionLockAcquisitionTimeoutSeconds)
 }
 
 // An environment that opts out of a server-wide grant keeps its opt-out. The
@@ -206,14 +223,27 @@ func TestServerEngineMetadataKeepsAnEnvironmentsOptOutOverTheServerPolicy(t *tes
 	assert.NotContains(t, metadata, engine.MetadataDirectExecutionMaxTableRows)
 }
 
-// With no policy configured, no direct execution key reaches the engine and
-// refused statements stay blocked.
-func TestServerEngineMetadataOmitsDirectExecutionByDefault(t *testing.T) {
+// With no policy configured, the engine receives the default: enabled,
+// bounded by table size.
+func TestServerEngineMetadataCarriesTheDefaultDirectExecutionPolicy(t *testing.T) {
 	metadata, err := serverEngineMetadata(&api.ServerConfig{}, nil, storage.DatabaseTypeMySQL)
 
 	require.NoError(t, err)
-	assert.NotContains(t, metadata, engine.MetadataDirectExecution)
+	assert.Equal(t, "true", metadata[engine.MetadataDirectExecution])
+	assert.Equal(t, "104857600", metadata[engine.MetadataDirectExecutionMaxTableBytes])
 	assert.NotContains(t, metadata, engine.MetadataDirectExecutionMaxTableRows)
+}
+
+// A server that opts out tells the engine so, and refused statements stay
+// blocked.
+func TestServerEngineMetadataCarriesAServerOptOut(t *testing.T) {
+	config := &api.ServerConfig{DirectExecution: &api.DirectExecutionConfig{Enabled: false}}
+
+	metadata, err := serverEngineMetadata(config, nil, storage.DatabaseTypeMySQL)
+
+	require.NoError(t, err)
+	assert.Equal(t, "false", metadata[engine.MetadataDirectExecution])
+	assert.NotContains(t, metadata, engine.MetadataDirectExecutionMaxTableBytes)
 }
 
 // The server-wide policy reaches only the engines that consume it, so a

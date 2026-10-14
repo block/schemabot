@@ -550,12 +550,33 @@ type capturingTernServer struct {
 	stopRefusal       string // when set, Stop answers Accepted=false with this reason
 	cancelRefusal     string // when set, Cancel answers Accepted=false with this reason
 	omitOperationKey  bool   // emulate a data plane that does not echo the operation key
+	echoOperationKey  string // when set, echoed in place of the derived key, emulating a response for another operation
+	// omitProgressScope emulates a data plane that ignores a progress
+	// request's apply_operation_id and answers for the whole apply.
+	omitProgressScope bool
+	cutoverReq        *ternv1.CutoverRequest
 }
 
 // dispatchOperationKeyEcho mirrors the data plane's operation key derivation
 // for the dispatch shapes these tests exercise, minus the stored-plan
 // validation a real data plane performs before answering.
 func dispatchOperationKeyEcho(req *ternv1.ApplyRequest) string {
+	target, err := dispatchMemberTarget(req)
+	if err != nil {
+		return ""
+	}
+	if target == "" {
+		return unqualifiedDispatchOperationKeyEcho(req)
+	}
+	if namespaces := vschemaOnlyDispatchNamespaces(req.DdlChanges); len(namespaces) > 0 {
+		return storage.TargetOperationKey(target, unqualifiedDispatchOperationKeyEcho(req))
+	}
+	return target
+}
+
+// unqualifiedDispatchOperationKeyEcho is a dispatch's operation key within its
+// target: the shard key, the finalizer key, or empty for whole-target work.
+func unqualifiedDispatchOperationKeyEcho(req *ternv1.ApplyRequest) string {
 	if len(req.TargetShards) == 1 {
 		changes, err := scopedDispatchDDLChanges(req.DdlChanges)
 		if err != nil {
@@ -585,13 +606,17 @@ func (s *capturingTernServer) Apply(_ context.Context, req *ternv1.ApplyRequest)
 	}
 	operationID := s.remoteOperationID
 	omitOperationKey := s.omitOperationKey
+	echoOperationKey := s.echoOperationKey
 	err := s.applyErr
 	s.mu.Unlock()
 	if err != nil {
 		return nil, err
 	}
 	operationKey := ""
-	if !omitOperationKey {
+	switch {
+	case echoOperationKey != "":
+		operationKey = echoOperationKey
+	case !omitOperationKey:
 		operationKey = dispatchOperationKeyEcho(req)
 	}
 	return &ternv1.ApplyResponse{Accepted: true, ApplyId: applyID, ApplyOperationId: operationID, OperationKey: operationKey}, nil
@@ -650,6 +675,7 @@ func (s *capturingTernServer) Cutover(_ context.Context, req *ternv1.CutoverRequ
 	s.mu.Lock()
 	s.cutoverApplyID = req.ApplyId
 	s.cutoverCaller = req.Caller
+	s.cutoverReq = &ternv1.CutoverRequest{ApplyId: req.ApplyId, Environment: req.Environment, Caller: req.Caller, ApplyOperationId: req.ApplyOperationId}
 	err := s.cutoverErr
 	accepted := s.cutoverAccepted
 	message := s.cutoverMessage
@@ -677,10 +703,15 @@ func (s *capturingTernServer) Revert(_ context.Context, req *ternv1.RevertReques
 func (s *capturingTernServer) Progress(_ context.Context, req *ternv1.ProgressRequest) (*ternv1.ProgressResponse, error) {
 	s.mu.Lock()
 	s.progressReq = &ternv1.ProgressRequest{
-		ApplyId:     req.ApplyId,
-		Environment: req.Environment,
+		ApplyId:          req.ApplyId,
+		Environment:      req.Environment,
+		ApplyOperationId: req.ApplyOperationId,
 	}
 	s.progressApplyID = req.ApplyId
+	scopedTo := req.ApplyOperationId
+	if s.omitProgressScope {
+		scopedTo = ""
+	}
 	ps := s.progressState
 	psSet := s.progressStateSet
 	if len(s.progressStates) > 0 {
@@ -708,6 +739,7 @@ func (s *capturingTernServer) Progress(_ context.Context, req *ternv1.ProgressRe
 		Tables:                 tables,
 		ErrorMessage:           errorMessage,
 		SettledControlRequests: settled,
+		ApplyOperationId:       scopedTo,
 	}, nil
 }
 func (s *capturingTernServer) Logs(context.Context, *ternv1.LogsRequest) (*ternv1.LogsResponse, error) {
@@ -799,9 +831,16 @@ func (s *capturingTernServer) getProgressRequest() *ternv1.ProgressRequest {
 		return nil
 	}
 	return &ternv1.ProgressRequest{
-		ApplyId:     s.progressReq.ApplyId,
-		Environment: s.progressReq.Environment,
+		ApplyId:          s.progressReq.ApplyId,
+		Environment:      s.progressReq.Environment,
+		ApplyOperationId: s.progressReq.ApplyOperationId,
 	}
+}
+
+func (s *capturingTernServer) getCutoverRequest() *ternv1.CutoverRequest {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.cutoverReq
 }
 
 func (s *capturingTernServer) getApplyRequest() *ternv1.ApplyRequest {
@@ -950,9 +989,15 @@ func (m *mockApplyLogStore) GetRecentByApply(_ context.Context, _ int64, limit i
 type mockPlanStore struct {
 	storage.PlanStore
 	plan *storage.Plan
+	// byID, when set, answers GetByID per plan id instead of returning plan
+	// for every id, for applies whose operations run plans of their own.
+	byID map[int64]*storage.Plan
 }
 
-func (m *mockPlanStore) GetByID(context.Context, int64) (*storage.Plan, error) {
+func (m *mockPlanStore) GetByID(_ context.Context, id int64) (*storage.Plan, error) {
+	if m.byID != nil {
+		return m.byID[id], nil
+	}
 	return m.plan, nil
 }
 
@@ -975,6 +1020,10 @@ type mockApplyOperationStore struct {
 	ops          map[int64]*storage.ApplyOperation
 	saveErr      error
 	savedResumes []*storage.EngineResumeState
+	// operationIDWriteErr fails any SaveExternalID that carries a remote
+	// operation id, standing in for a pod that dies before that id reaches
+	// storage.
+	operationIDWriteErr error
 }
 
 func (m *mockApplyOperationStore) Get(_ context.Context, id int64) (*storage.ApplyOperation, error) {
@@ -1052,21 +1101,12 @@ func (m *mockApplyOperationStore) MarkFailed(_ context.Context, id int64, errMsg
 	return nil
 }
 
-func (m *mockApplyOperationStore) SaveExternalOperationID(_ context.Context, operationID int64, externalOperationID string) error {
+func (m *mockApplyOperationStore) SaveExternalID(_ context.Context, applyID, operationID int64, externalID, externalOperationID string) error {
 	if m.saveErr != nil {
 		return m.saveErr
 	}
-	op, ok := m.ops[operationID]
-	if !ok {
-		return storage.ErrApplyOperationNotFound
-	}
-	op.ExternalOperationID = externalOperationID
-	return nil
-}
-
-func (m *mockApplyOperationStore) SaveExternalID(_ context.Context, applyID, operationID int64, externalID string) error {
-	if m.saveErr != nil {
-		return m.saveErr
+	if externalOperationID != "" && m.operationIDWriteErr != nil {
+		return m.operationIDWriteErr
 	}
 	op, ok := m.ops[operationID]
 	if !ok {
@@ -1076,6 +1116,9 @@ func (m *mockApplyOperationStore) SaveExternalID(_ context.Context, applyID, ope
 		return fmt.Errorf("apply_operation %d does not belong to apply %d: %w", operationID, applyID, storage.ErrApplyOperationNotFound)
 	}
 	op.ExternalID = externalID
+	if externalOperationID != "" {
+		op.ExternalOperationID = externalOperationID
+	}
 	return nil
 }
 
@@ -2633,10 +2676,12 @@ func TestGRPCClient_ResumeApplyCancelsUndispatchedApply(t *testing.T) {
 		controlRequests: controlRequests,
 	}
 
+	reader := newTernMetricsReader(t)
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()
 	require.NoError(t, client.ResumeApply(ctx, apply))
 
+	assert.Equal(t, int64(-1), activeAppliesDelta(t, reader), "the cancel releases the apply from the active-apply gauge")
 	assert.Empty(t, server.getCancelApplyID(), "no remote cancel should be sent for an undispatched apply")
 	assert.Empty(t, server.getApplyRequest(), "an apply cancelled before dispatch must never be dispatched")
 	assert.Equal(t, state.Apply.Cancelled, apply.State)
@@ -7859,6 +7904,114 @@ func TestGRPCClient_ResumeApplyPublishesResumingUntilDataPlaneLeavesStopped(t *t
 	assert.Nil(t, startReq, "the start control request must be completed once the resume is driven")
 }
 
+// The gRPC drive's two requeue writes report a refusal the same way the local
+// drive does: as ErrTaskRequeueRefused wrapping the storage error, with the
+// task left as storage holds it, so the operator counts the exit under its own
+// reason. The retry requeue runs before dispatch; the start requeue runs after
+// the data plane accepted the start, and its error says so.
+func TestGRPCClient_RefusedTaskRequeueIsTyped(t *testing.T) {
+	storageErr := errors.New("storage unavailable")
+	apply := &storage.Apply{ID: 1, ApplyIdentifier: "apply-grpc-requeue-refused", Database: "testdb", Environment: "staging"}
+	cases := []struct {
+		name     string
+		task     *storage.Task
+		requeue  func(c *GRPCClient, ctx context.Context, tasks []*storage.Task) error
+		wantText string
+	}{
+		{
+			name: "retryable task before dispatch",
+			task: &storage.Task{TaskIdentifier: "t-retry", ApplyID: 1, TableName: "users", State: state.Task.FailedRetryable, ErrorMessage: "connection reset", Attempt: 2},
+			requeue: func(c *GRPCClient, ctx context.Context, tasks []*storage.Task) error {
+				return c.prepareDispatchTasks(ctx, apply, tasks)
+			},
+			wantText: "retryable task t-retry for queued gRPC apply apply-grpc-requeue-refused before dispatch",
+		},
+		{
+			name: "stopped task after the data plane accepted the start",
+			task: &storage.Task{TaskIdentifier: "t-stopped", ApplyID: 1, TableName: "users", State: state.Task.Stopped},
+			requeue: func(c *GRPCClient, ctx context.Context, _ []*storage.Task) error {
+				return c.requeueStoppedTasksForRemoteStart(ctx, apply, wholeApplyTaskScope())
+			},
+			wantText: "stopped task t-stopped for gRPC apply apply-grpc-requeue-refused after the data plane accepted the start",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			client, cleanup := testCapturingGRPCClient(t, &capturingTernServer{})
+			defer cleanup()
+			arrived := *tc.task
+			taskStore := &mockTaskStore{tasks: []*storage.Task{tc.task}, updateErr: storageErr}
+			client.storage = &mockStorage{applies: &mockApplyStore{apply: apply}, tasks: taskStore, logs: &mockApplyLogStore{}}
+
+			err := tc.requeue(client, t.Context(), []*storage.Task{tc.task})
+
+			require.ErrorIs(t, err, ErrTaskRequeueRefused)
+			require.ErrorIs(t, err, storageErr)
+			assert.ErrorContains(t, err, tc.wantText)
+			assert.Equal(t, arrived, *tc.task, "a refused requeue leaves the task as storage holds it")
+		})
+	}
+}
+
+func TestGRPCClient_RefusedStartRequeueIsRetriedByTheNextClaim(t *testing.T) {
+	// The data plane accepts an operator's start, then storage refuses the
+	// write that requeues the stopped task. The drive exits with the task row
+	// still stopped and the start request still pending. By the next claim the
+	// data plane has left stopped, so that claim adopts the running state; it
+	// must still requeue the stopped task before completing the start request,
+	// or the row would stay pinned at stopped while the data plane copies.
+	server := &capturingTernServer{
+		progressStates: []ternv1.State{ternv1.State_STATE_STOPPED},
+	}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+
+	storedApply := &storage.Apply{
+		ID: 1, ApplyIdentifier: "apply-start-requeue-retry", Database: "testdb", Environment: "staging",
+		ExternalID: "remote-start-requeue-retry", State: state.Apply.Stopped,
+	}
+	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{{
+		ApplyID: storedApply.ID, Operation: storage.ControlOperationStart, Status: storage.ControlRequestPending,
+	}}}
+	task := &storage.Task{TaskIdentifier: "t-stopped", ApplyID: 1, TableName: "users", State: state.Task.Stopped}
+	taskStore := &mockTaskStore{tasks: []*storage.Task{task}, updateErr: errors.New("storage unavailable")}
+	client.storage = &mockStorage{
+		applies:         &mockApplyStore{apply: storedApply},
+		tasks:           taskStore,
+		logs:            &mockApplyLogStore{},
+		controlRequests: controlRequests,
+	}
+
+	firstClaim := *storedApply
+	err := client.ResumeApply(t.Context(), &firstClaim)
+	require.ErrorIs(t, err, ErrTaskRequeueRefused)
+	assert.True(t, server.startWasCalled(), "the data plane accepted the start before the requeue was refused")
+	assert.Equal(t, state.Task.Stopped, task.State, "a refused requeue leaves the task row stopped")
+	pending, err := controlRequests.GetPending(t.Context(), storedApply.ID, storage.ControlOperationStart)
+	require.NoError(t, err)
+	require.NotNil(t, pending, "the start request stays pending while its requeue is refused")
+
+	taskStore.updateErr = nil
+	server.mu.Lock()
+	server.startCalled = false
+	server.progressStates = []ternv1.State{ternv1.State_STATE_RUNNING, ternv1.State_STATE_RUNNING}
+	server.mu.Unlock()
+
+	secondClaim := *storedApply
+	require.NoError(t, client.ResumeApply(t.Context(), &secondClaim))
+	assert.False(t, server.startWasCalled(), "a data plane that already left stopped is not started again")
+	var requeued bool
+	for _, written := range taskStore.updated {
+		if written.TaskIdentifier == task.TaskIdentifier && state.IsState(written.State, state.Task.Pending) {
+			requeued = true
+		}
+	}
+	assert.True(t, requeued, "the next claim requeues the stopped task to pending")
+	pending, err = controlRequests.GetPending(t.Context(), storedApply.ID, storage.ControlOperationStart)
+	require.NoError(t, err)
+	assert.Nil(t, pending, "the start request completes once the requeue lands")
+}
+
 func TestGRPCClient_RequeueStoppedTasksForRemoteStart(t *testing.T) {
 	// When the data plane accepts a start, the gRPC drive must requeue the apply's
 	// stopped task rows to pending. Otherwise taskStateWithNoBackwardProgress pins
@@ -9458,6 +9611,83 @@ func TestGenerationOperationKeys(t *testing.T) {
 	scope.operation.Attempt = 1
 	assert.Equal(t, []string{"commerce/80-/users"}, scope.generationOperationKeys(),
 		"a retry's manifest is its own operation key alone")
+}
+
+// A member settled at creation never dispatches, regardless of whether the
+// rollout uses work or finalizer operations. Pending task-less operations and
+// siblings that already dispatched still belong to the generation, and target
+// qualification depends on the full rollout, including its converged member.
+func TestGenerationOperationKeys_ConvergedMembers(t *testing.T) {
+	now := time.Now()
+	for _, tc := range []struct {
+		name    string
+		sibling storage.ApplyOperation
+		include bool
+	}{
+		{name: "converged work", sibling: storage.ApplyOperation{State: state.ApplyOperation.Completed, OperationKind: storage.ApplyOperationKindWork}},
+		{name: "converged finalizer", sibling: storage.ApplyOperation{State: state.ApplyOperation.Completed, OperationKind: storage.ApplyOperationKindGroupFinalizer}},
+		{name: "pending taskless work", sibling: storage.ApplyOperation{State: state.ApplyOperation.Pending, OperationKind: storage.ApplyOperationKindWork}, include: true},
+		{name: "pending finalizer", sibling: storage.ApplyOperation{State: state.ApplyOperation.Pending, OperationKind: storage.ApplyOperationKindGroupFinalizer}, include: true},
+		{name: "completed started work", sibling: storage.ApplyOperation{State: state.ApplyOperation.Completed, StartedAt: &now}, include: true},
+		{name: "completed started finalizer", sibling: storage.ApplyOperation{State: state.ApplyOperation.Completed, OperationKind: storage.ApplyOperationKindGroupFinalizer, StartedAt: &now}, include: true},
+		{name: "completed remote apply", sibling: storage.ApplyOperation{State: state.ApplyOperation.Completed, ExternalID: "remote-apply"}, include: true},
+		{name: "completed legacy remote apply", sibling: storage.ApplyOperation{State: state.ApplyOperation.Completed, EngineResumeContext: "remote-apply"}, include: true},
+		{name: "completed remote operation", sibling: storage.ApplyOperation{State: state.ApplyOperation.Completed, ExternalOperationID: "remote-operation"}, include: true},
+		{name: "failed never started", sibling: storage.ApplyOperation{State: state.ApplyOperation.Failed}, include: true},
+		{name: "stopped never started", sibling: storage.ApplyOperation{State: state.ApplyOperation.Stopped}, include: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sibling := tc.sibling
+			sibling.ID, sibling.ApplyID = 2, 100
+			sibling.Deployment, sibling.Target, sibling.OperationKey = "default", "payments-001", "payments-001"
+			if sibling.OperationKind == storage.ApplyOperationKindGroupFinalizer {
+				sibling.OperationKey += "/group_finalizer"
+			}
+			ops := &mockApplyOperationStore{ops: map[int64]*storage.ApplyOperation{
+				1: {ID: 1, ApplyID: 100, Deployment: "default", Target: "payments-002", OperationKey: "payments-002/commerce/80-/users", State: state.ApplyOperation.Pending},
+				2: &sibling,
+				3: {ID: 3, ApplyID: 100, Deployment: "other", Target: "payments-003", OperationKey: "payments-003"},
+			}}
+			client := &GRPCClient{storage: &mockStorage{operations: ops}}
+			apply := &storage.Apply{ID: 100, ApplyIdentifier: "apply-converged-member"}
+			scope, err := client.loadOperationApplyTaskScope(t.Context(), apply, 1)
+			require.NoError(t, err)
+			want := []string{"payments-002/commerce/80-/users"}
+			if tc.include {
+				want = append([]string{sibling.OperationKey}, want...)
+			}
+			assert.Equal(t, want, scope.generationOperationKeys())
+			assert.Equal(t, "payments-002", scope.memberTarget, "the converged target still qualifies the working member's dispatch")
+
+			ops.ops[1].State, ops.ops[1].StartedAt = state.ApplyOperation.Completed, &now
+			completed, err := client.loadOperationApplyTaskScope(t.Context(), apply, 1)
+			require.NoError(t, err)
+			assert.Equal(t, want, completed.generationOperationKeys(), "completion after dispatch must not narrow the generation")
+			completed.operation.Attempt = 1
+			assert.Equal(t, []string{ops.ops[1].OperationKey}, completed.generationOperationKeys(), "deliberate retries still declare only their own key")
+		})
+	}
+}
+
+// A dispatch always declares its own key. The manifest is built from the rows
+// of the claimed operation's deployment, and the claimed row is the one key
+// this dispatch is about to send, so it stays in the manifest even when its
+// row has the shape of a converged placeholder: a data plane must never
+// receive an operation its generation does not list.
+func TestGenerationOperationKeys_ClaimedOperationAlwaysDeclaresItself(t *testing.T) {
+	ops := &mockApplyOperationStore{ops: map[int64]*storage.ApplyOperation{
+		1: {ID: 1, ApplyID: 100, Deployment: "default", Target: "payments-001", OperationKey: "payments-001/commerce/80-/users", State: state.ApplyOperation.Completed},
+		2: {ID: 2, ApplyID: 100, Deployment: "default", Target: "payments-002", OperationKey: "payments-002/commerce/80-/users", State: state.ApplyOperation.Completed},
+		3: {ID: 3, ApplyID: 100, Deployment: "default", Target: "payments-003", OperationKey: "payments-003/commerce/80-/users", State: state.ApplyOperation.Pending},
+	}}
+	require.True(t, ops.ops[1].IsConvergedPlaceholder(), "the claimed row has the placeholder shape")
+	client := &GRPCClient{storage: &mockStorage{operations: ops}}
+	apply := &storage.Apply{ID: 100, ApplyIdentifier: "apply-claimed-placeholder"}
+
+	scope, err := client.loadOperationApplyTaskScope(t.Context(), apply, 1)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"payments-001/commerce/80-/users", "payments-003/commerce/80-/users"}, scope.generationOperationKeys(),
+		"the claimed operation declares itself; the converged sibling is left out")
 }
 
 // The idempotency key and the generation manifest are derived independently

@@ -58,6 +58,11 @@ plan: DROP TABLE `users`   RENAME TABLE `app`.`users`
 2. **Apply** — the Spirit engine intercepts the `DROP TABLE` and renames the
    table into `_pending_drops` with a UTC timestamp prefix
    (`YYYYMMDDHHmmSSmmm_<table>`, capped at MySQL's 64-character name limit).
+   A table name too long to fit is shortened by characters and ends in
+   `_<hash>`, derived from its schema and full name. A name that would otherwise
+   match another table quarantined in the same rename (the same table name in
+   two schemas, say) uses progressively more hash characters until it is
+   unique, so every table gets its own copy.
    The rename is atomic and metadata-only, so it completes immediately
    regardless of table size. The apply log records the quarantine table name.
 3. **Retention** — the table sits in `_pending_drops` with its data intact.
@@ -66,6 +71,20 @@ plan: DROP TABLE `users`   RENAME TABLE `app`.`users`
    drops quarantined tables whose timestamp prefix is older than the retention
    period. Tables whose names do not carry a valid timestamp prefix are never
    auto-dropped, because their age is unknown.
+
+**A resumed schema change does not quarantine a table twice.** Before resuming,
+SchemaBot plans again against the live schema. A table an earlier attempt moved
+into `_pending_drops` is no longer part of the diff, so its completed DROP is
+not sent to the engine again. If the engine replays a stopped DROP phase in the
+same process, through its own start path, it skips a missing source table only
+when this attempt recorded moving that table and any recorded copy still
+exists. The record is written before the rename is issued, so a rename the
+server completes after a stop has abandoned it is still recognized on the
+replay. The record does not outlive the process; a resume on another server
+relies on the re-plan above. Any other missing table still fails unless the
+statement says `IF EXISTS`, and a recorded copy that retention has since
+removed fails too: the drop is final, and the message says so and asks for the
+schema change to be planned again against the live schema.
 
 **Cancelling a schema change quarantines its copy too.** A cancelled change
 leaves a shadow table holding every row copied so far, and — if it had already
@@ -89,13 +108,39 @@ to reclaim space from a quarantined `DROP TABLE`.
 Within the retention period, restore a quarantined table by renaming it back:
 
 ```sql
--- Find the quarantined table (newest timestamp prefix wins).
+-- Find the quarantined table (newest timestamp prefix wins). The filter leaves
+-- out the quarantine log, which is the one table in `_pending_drops` whose
+-- name carries no timestamp prefix.
 SELECT table_name FROM information_schema.tables
-WHERE table_schema = '_pending_drops' ORDER BY table_name DESC;
+WHERE table_schema = '_pending_drops' AND table_name REGEXP '^[0-9]{17}_'
+ORDER BY table_name DESC;
 
 -- Restore it.
 RENAME TABLE `_pending_drops`.`20260610143022123_users` TO `app`.`users`;
 ```
+
+A quarantined name does not record which schema the table came from, and a
+name that was shortened to fit the 64-character limit (one ending in `_<hash>`)
+does not carry the full table name either, so neither can be mapped back to
+its source from `information_schema` alone. Two records pair each copy with its
+source. The apply log writes a line of the form
+``table `app`.`users` quarantined as `_pending_drops`.`20260610143022123_users`; recoverable until the pending drops retention period expires``
+for every table it quarantines. The quarantine log,
+`_pending_drops`.`schemabot_quarantine_log`, records the same pairing on the
+target itself, one row per copy with the apply that moved it:
+
+```sql
+SELECT quarantine_table, source_schema, source_table, apply_identifier, quarantined_at
+FROM `_pending_drops`.`schemabot_quarantine_log`
+WHERE source_schema = 'app' AND source_table = 'users'
+ORDER BY quarantined_at DESC;
+```
+
+The quarantine log is written before the `RENAME`, so a row can name a copy
+that does not exist when the rename never landed; check that the copy is there
+before restoring it. Leave the log in place: it is SchemaBot's durable record
+of which apply made each copy, the cleaner never drops it, and the cleaner
+deletes a row on its own once that row's copy is gone and past retention.
 
 Also restore the table's `.sql` file in the schema repository, otherwise the
 next plan will produce another `DROP TABLE` for it.
@@ -153,7 +198,7 @@ See [Configuration](configuration.md#pending-drops) for field semantics.
 | `schemabot.pending_drops.cleanup_dropped_total` | Expired quarantined tables permanently dropped by the cleaner. |
 | `schemabot.pending_drops.cleanup_skipped_total` | Quarantined tables skipped because their names carry no valid timestamp prefix. A sustained nonzero rate means tables are accumulating that an operator must inspect and remove manually. |
 | `schemabot.pending_drops.cleanup_lock_skipped_total` | Cleanup target passes skipped because another instance held the per-target advisory lock. |
-| `schemabot.pending_drops.cleanup_errors_total` | Cleanup failures by reason (`dsn_resolution_error`, `locker_missing`, `target_error`, or `drop_error`). Failed work retries on the next pass, but `locker_missing` is a producer wiring bug that fails every pass until fixed. |
+| `schemabot.pending_drops.cleanup_errors_total` | Cleanup failures by reason (`dsn_resolution_error`, `locker_missing`, `target_error`, `drop_error`, or `log_error`, a quarantine log read or prune that failed). Failed work retries on the next pass, but `locker_missing` is a producer wiring bug that fails every pass until fixed. |
 
 The apply log for a schema change that drops a table records the quarantine
 database and table name, so operators can locate the table for recovery without

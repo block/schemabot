@@ -161,9 +161,10 @@ func RecordPlan(ctx context.Context, repo, database, deployment, environment, st
 // RecordPlanCommentRetirement counts the outcome of retiring one superseded
 // plan comment. Outcomes: "minimized" (hidden on GitHub but still expandable
 // as the record of what was planned), "deleted" (no apply ever acted on the
-// plan and the repository opted into deletion, so the comment is removed from
-// the timeline), "apply_owned" (kept fully expanded because an apply owns the
-// plan's head and the repository uses the minimize-based policy),
+// plan and the deployment uses the default delete-based policy, so the comment
+// is removed from the timeline), "apply_owned" (kept fully expanded because an
+// apply owns the plan's head and the deployment opted out to the
+// minimize-based policy),
 // "guard_error" (apply-ownership lookup failed, comment left untouched fail
 // closed — investigate storage), "minimize_error" / "delete_error" (the
 // GitHub call failed; retried on the next supersede — investigate GitHub API
@@ -414,7 +415,7 @@ func KnownReviewDriftClassification(classification string) bool {
 //
 // classification="planned" is the healthy outcome for a member that holds its
 // own schema: it was planned against that schema and never compared to the
-// reviewed plan, so it is the independent counterpart of "match" and not a
+// primary plan, so it is the independent counterpart of "match" and not a
 // signal to alert on. It has to be listed here rather than left to the unknown
 // bucket, which is reserved for a classification the code emits and this
 // contract does not know about — a coding gap, which normal independent
@@ -427,7 +428,7 @@ func RecordReviewDrift(ctx context.Context, database, environment, deployment, c
 		classification = "unknown"
 	}
 	addCounter(ctx, "schemabot.review_drift.total",
-		"review-time per-member classifications: against the reviewed primary plan where members mirror it, against the member's own schema where they do not", "{deployment}",
+		"review-time per-member classifications: against the primary target's plan where members mirror it, against the member's own schema where they do not", "{deployment}",
 		attribute.String("database", database),
 		EnvironmentAttribute(environment),
 		attribute.String("deployment", deployment),
@@ -792,7 +793,10 @@ func RecordPromotionConfigErrorBlock(ctx context.Context, repository, database, 
 }
 
 // AdjustActiveApplies increments or decrements the active applies gauge.
-// Use delta=1 when an apply is accepted and delta=-1 when it reaches a terminal state.
+// Use delta=1 when an apply is accepted and delta=-1 when it settles
+// (completed, failed, cancelled, or reverted). A stopped apply stays counted
+// until it settles; a retryable pause is released when it pauses and counted
+// again when a driver reclaims it.
 func AdjustActiveApplies(ctx context.Context, delta int64, database, deployment, environment string) {
 	addUpDownCounter(ctx, "schemabot.active_applies", delta,
 		"Number of currently in-progress applies", "{apply}",
@@ -987,6 +991,14 @@ func RecordEngineTerminalTruthReconcile(ctx context.Context, database, deploymen
 //     sustained rate means new applies are repeatedly dispatched against a
 //     target that already has actively driven work — check who is submitting
 //     the duplicates.
+//   - "fresh_operation_lease": a live drive holds the lease of the operation
+//     that owns the task, even though the apply's own lease reads stale, so
+//     the local engine probe was skipped and the live drive stays
+//     authoritative. Read it the same way as "fresh_lease".
+//   - "operation_lease_unreadable": the lease of the operation that owns the
+//     task could not be read, so a live drive could not be ruled out and the
+//     task kept blocking. Any sustained rate is a storage problem, not a
+//     workload one.
 //   - "foreign_terminal_report": the lease is stale and this process's engine
 //     memory reports terminal, but the lease was last held by another process,
 //     so the report was refused. Driver stale-claim recovery settles the task;
@@ -1068,7 +1080,7 @@ func RecordUnrecognizedEngineTaskStatus(ctx context.Context, database, databaseT
 
 // RecordLockOperation increments the lock operations counter.
 // Operation should be "acquire" or "release".
-// Status should be "success", "conflict", "not_found", "not_owned", or "error".
+// Status should be "success", "conflict", "not_found", "not_owned", "no_acquirer", or "error".
 func RecordLockOperation(ctx context.Context, operation, database, status string) {
 	addCounter(ctx, "schemabot.lock_operations_total",
 		"Total number of lock acquire/release operations", "{operation}",
@@ -1271,6 +1283,8 @@ var knownOperatorClaimFailureReasons = map[string]bool{
 	"expire_retryable_error":                   true,
 	"stranded_reaper_error":                    true,
 	"stranded_task_reaper_error":               true,
+	"stranded_active_task_reaper_error":        true,
+	"stranded_control_request_reaper_error":    true,
 	"missing_lease_token":                      true,
 	"operation_storage_error":                  true,
 	"missing_operation_lease_token":            true,
@@ -2336,12 +2350,14 @@ func RecordDropTableAlreadyAbsent(ctx context.Context, database string) {
 // completed, failed, or stopped; refused statements the policy does not route
 // directly are blocked with the reason encoded in the outcome.
 var knownDirectExecutionOutcomes = map[string]bool{
-	"completed":               true,
-	"failed":                  true,
-	"stopped":                 true,
-	"blocked_policy_disabled": true,
-	"blocked_size_limit":      true,
-	"blocked_size_unknown":    true,
+	"completed":                      true,
+	"failed":                         true,
+	"stopped":                        true,
+	"blocked_policy_disabled":        true,
+	"blocked_size_limit":             true,
+	"blocked_size_unknown":           true,
+	"blocked_force_kill_unavailable": true,
+	"blocked_force_kill_unknown":     true,
 }
 
 // RecordDirectExecution increments the counter for a statement the
@@ -2351,7 +2367,11 @@ var knownDirectExecutionOutcomes = map[string]bool{
 // in failed means native DDL is erroring on the target (check the apply logs
 // for the statement and MySQL error), and a spike in blocked_size_unknown
 // means row estimates are unavailable (check target connectivity and
-// information_schema access).
+// information_schema access). blocked_force_kill_unavailable means the target
+// user lacks a grant the kill needs (grant SELECT on performance_schema.*,
+// PROCESS, and CONNECTION_ADMIN or SUPER, or on RDS EXECUTE on mysql.rds_kill);
+// blocked_force_kill_unknown means checking those grants failed (check target
+// connectivity).
 func RecordDirectExecution(ctx context.Context, database, outcome string) {
 	if !knownDirectExecutionOutcomes[outcome] {
 		outcome = "unknown"

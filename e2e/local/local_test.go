@@ -140,7 +140,7 @@ func TestLocal_SchemaBot_SchemaApplied(t *testing.T) {
 }
 
 func TestLocal_Demo_TestAppTablesCreated(t *testing.T) {
-	// Skip this test if demo tables don't exist (requires 'make demo' first)
+	// Skip this test if demo tables don't exist (requires 'make demo-full' first)
 	stagingDSN := testappStagingDSN(t)
 	db, err := sql.Open("block-mysql", stagingDSN)
 	if err != nil {
@@ -151,7 +151,7 @@ func TestLocal_Demo_TestAppTablesCreated(t *testing.T) {
 	var count int
 	_ = db.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'testapp' AND table_name = 'users'").Scan(&count)
 	if count == 0 {
-		t.Skip("Demo tables not present (run 'make demo' first)")
+		t.Skip("Demo tables not present (run 'make demo-full' first)")
 	}
 
 	productionDSN := testappProductionDSN(t)
@@ -1274,6 +1274,6 @@ func TestLocal_Demo_FullValidation(t *testing.T) {
 		}
 		t.Log("Demo validation passed: SchemaBot healthy, all tables present")
 	} else {
-		t.Log("Demo validation passed: SchemaBot healthy (demo tables not present - run 'make demo' for full validation)")
+		t.Log("Demo validation passed: SchemaBot healthy (demo tables not present - run 'make demo-full' for full validation)")
 	}
 }

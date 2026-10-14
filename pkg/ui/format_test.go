@@ -40,20 +40,34 @@ func TestFormatApproxBytes(t *testing.T) {
 	}{
 		{0, "~0 B"},
 		{812, "~812 B"},
-		{1_000, "~1 KB"},
-		{112_640, "~112.6 KB"},
-		{999_949_999, "~999.9 MB"},
-		{999_950_000, "~1 GB"},
+		{1_000, "~1.0 KB"},
+		{112_640, "~113 KB"},
+		{99_949, "~99.9 KB"},
+		{99_950, "~100 KB"},
+		{999_499_999, "~999 MB"},
+		{999_500_000, "~1.0 GB"},
 		{1_130_000_000, "~1.1 GB"},
 		{23_400_000_000, "~23.4 GB"},
-		{999_950_000_000, "~1 TB"},
-		{48_000_000_000_000, "~48 TB"},
-		{999_950_000_000_000, "~1 PB"},
+		{186_000_000_000, "~186 GB"},
+		{186_400_000_000, "~186 GB"},
+		{999_500_000_000, "~1.0 TB"},
+		{48_000_000_000_000, "~48.0 TB"},
+		{999_500_000_000_000, "~1.0 PB"},
 		{-5, "~0 B"},
 	}
 	for _, tt := range tests {
 		assert.Equal(t, tt.want, FormatApproxBytes(tt.b), "b=%d", tt.b)
 	}
+}
+
+// A copy line carries the table's planned size after its row counts, and
+// nothing when the plan had no estimate.
+func TestFormatTableSizeClause(t *testing.T) {
+	bytes := int64(23_400_000_000)
+	assert.Equal(t, " · ~23.4 GB", FormatTableSizeClause(&bytes))
+	zero := int64(0)
+	assert.Equal(t, " · ~0 B", FormatTableSizeClause(&zero))
+	assert.Empty(t, FormatTableSizeClause(nil))
 }
 
 func TestTableStatePriority(t *testing.T) {

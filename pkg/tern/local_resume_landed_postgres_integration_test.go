@@ -243,9 +243,9 @@ func TestLocalClient_ResumeApplyPostgresSettlesLandedStatementWithoutReexecution
 	assert.True(t, hasLogMessageContaining(logs,
 		fmt.Sprintf("Task %s already completed (its statement landed before its outcome was recorded)", emailTask.TaskIdentifier)),
 		"the landed task's settlement must be visible in the apply log")
-	assert.False(t, hasLogMessageContaining(logs, fmt.Sprintf("Task %s resumed", emailTask.TaskIdentifier)),
+	assert.False(t, hasLogMessageContaining(logs, fmt.Sprintf("Resuming task %s ", emailTask.TaskIdentifier)),
 		"the landed task must never be handed to the engine")
-	assert.True(t, hasLogMessageContaining(logs, fmt.Sprintf("Task %s resumed", nameTask.TaskIdentifier)),
+	assert.True(t, hasLogMessageContaining(logs, fmt.Sprintf("Resuming task %s ", nameTask.TaskIdentifier)),
 		"the remaining task must be handed to the engine")
 	assert.False(t, hasLogMessageContaining(logs,
 		fmt.Sprintf("Task %s already completed", nameTask.TaskIdentifier)),

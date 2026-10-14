@@ -344,7 +344,7 @@ func TestUnlockCommandCoreTerminalDispositions(t *testing.T) {
 
 		require.NoError(t, err)
 		assert.False(t, retry, "another PR's lock ownership is a deterministic rejection the same input always reproduces")
-		assert.Zero(t, lockStore.forceReleaseCalls, "another PR's lock must not be force-released")
+		assert.Zero(t, lockStore.releaseCalls, "another PR's lock must not be force-released")
 		body := requireComment(t, comments, "ownership rejection comment")
 		assert.Contains(t, body, "held by octocat/other-repo#7")
 	})
@@ -490,10 +490,57 @@ func TestUnlockCommandCoreTerminalDispositions(t *testing.T) {
 		require.NoError(t, err)
 		assert.False(t, retry, "a stale command is terminal; the recovery path is a fresh comment")
 		assert.Zero(t, lockStore.releaseCalls, "a stale command must not release any lock")
-		assert.Zero(t, lockStore.forceReleaseCalls, "a stale command must not force-release any lock")
 		body := requireComment(t, comments, "stale-command answer")
 		assert.Contains(t, body, "acquired after the command was received")
 		assert.Contains(t, body, "Comment `schemabot unlock` again")
+	})
+
+	t.Run("a lock timestamp in the receipt second is left in place", func(t *testing.T) {
+		client, mux := setupGitHubServer(t)
+		comments := recordComments(t, mux)
+		issuedAt := time.Now().Truncate(time.Second).Add(500 * time.Millisecond)
+		lock := prOwnedOrdersLock()
+		lock.CreatedAt = issuedAt.Add(-time.Hour)
+		lock.UpdatedAt = issuedAt.Truncate(time.Second)
+		lockStore := &unlockTestLockStore{locks: []*storage.Lock{lock}}
+		st := &unlockTestStorage{locks: lockStore, applies: &noActiveAppliesStore{}}
+		h := unlockTestHandler(t, st, ghclient.NewInstallationClient(client, testLogger()))
+
+		retry, err := h.unlockCommandCore(t.Context(), issuedAt, "octocat/hello-world", 1, 12345, "testuser", CommandResult{Action: action.Unlock})
+
+		require.NoError(t, err)
+		assert.False(t, retry)
+		assert.Zero(t, lockStore.releaseCalls, "a lock refreshed in the receipt second must stay held")
+		body := requireComment(t, comments, "stale-command answer")
+		assert.Contains(t, body, "At least one current lock")
+		assert.Contains(t, body, "this command released nothing")
+	})
+
+	t.Run("mixed reacquired and already gone locks report the held lock", func(t *testing.T) {
+		client, mux := setupGitHubServer(t)
+		comments := recordComments(t, mux)
+		ordersLock := prOwnedOrdersLock()
+		billingLock := prOwnedOrdersLock()
+		billingLock.DatabaseName = "billing"
+		lockStore := &unlockTestLockStore{
+			locks: []*storage.Lock{ordersLock, billingLock},
+			releaseErrs: map[string]error{
+				"orders":  storage.ErrLockIntentChanged,
+				"billing": storage.ErrLockNotFound,
+			},
+		}
+		st := &unlockTestStorage{locks: lockStore, applies: &noActiveAppliesStore{}}
+		h := unlockTestHandler(t, st, ghclient.NewInstallationClient(client, testLogger()))
+
+		retry, err := h.unlockCommandCore(t.Context(), time.Now(), "octocat/hello-world", 1, 12345, "testuser", CommandResult{Action: action.Unlock})
+
+		require.NoError(t, err)
+		assert.False(t, retry)
+		assert.Empty(t, lockStore.released, "this command released nothing")
+		body := requireComment(t, comments, "mixed stale-command answer")
+		assert.Contains(t, body, "At least one current lock")
+		assert.Contains(t, body, "this command released nothing")
+		assert.NotContains(t, body, "Every lock matched")
 	})
 }
 

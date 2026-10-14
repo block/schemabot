@@ -147,9 +147,19 @@ func TestInitEngines(t *testing.T) {
 			require.NoError(t, err)
 			edited := []byte(string(schema) + "\n-- keep my edit\n")
 			require.NoError(t, os.WriteFile(schemaPath, edited, 0600))
+			// Simulate a checkout with existing desired files but no saved CLI profile.
+			require.NoError(t, os.Remove(filepath.Join(home, ".schemabot", "config.yaml")))
 			output, err = run(args...)
 			require.Error(t, err, string(output))
-			require.Contains(t, string(output), "still produce schema changes")
+			require.Contains(t, string(output), "your existing schema files differ from the live database")
+			require.NotContains(t, string(output), "retained for retry")
+			require.Contains(t, string(output), "--profile project")
+			output, err = run("plan", "--profile", "project", "-e", "development", "-s", root, "--json")
+			require.NoError(t, err, string(output))
+			var driftPlans map[string]apitypes.PlanResponse
+			require.NoError(t, json.Unmarshal(output, &driftPlans))
+			driftPlan := driftPlans["development"]
+			require.True(t, driftPlan.HasChanges())
 			after, err := os.ReadFile(schemaPath)
 			require.NoError(t, err)
 			require.Equal(t, edited, after)
@@ -157,7 +167,7 @@ func TestInitEngines(t *testing.T) {
 			// Reuse must reject a real difference without changing the user's files.
 			output, err = run(append(slices.Clone(args), "--reuse-schema")...)
 			require.Error(t, err, string(output))
-			require.Contains(t, string(output), "still produce schema changes")
+			require.Contains(t, string(output), "your existing schema files differ from the live database")
 			require.FileExists(t, filepath.Join(root, namespace, "notes.sql"))
 			// Explicit reuse accepts harmless formatting/comments without replacing files.
 			require.NoError(t, os.Remove(filepath.Join(root, namespace, "notes.sql")))

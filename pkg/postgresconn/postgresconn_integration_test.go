@@ -69,6 +69,46 @@ func TestOpenPinsSessionTimezoneToUTC(t *testing.T) {
 	assert.Equal(t, "UTC", tz)
 }
 
+// A time.Time bound to a plain timestamp column is stored as the UTC reading of
+// its instant on every pool this package opens, including the reloadable
+// storage pool, and reads back as that instant in UTC. A process whose local
+// zone is west of UTC would otherwise store its local wall clock, hours behind
+// the session's now().
+func TestPoolsStoreTimestampParametersAsUTC(t *testing.T) {
+	dsn, adminDB := testutil.StartPostgres(t, "postgresconn_timestamps")
+	_, err := adminDB.ExecContext(t.Context(), `CREATE TABLE stamps (pool text PRIMARY KEY, recorded_at timestamp NOT NULL)`)
+	require.NoError(t, err)
+
+	driverZone := time.FixedZone("UTC-5", -5*60*60)
+	instant := time.Date(2026, time.September, 28, 6, 30, 0, 123456000, driverZone)
+
+	pools := map[string]func(t *testing.T) (*sql.DB, error){
+		"Open": func(*testing.T) (*sql.DB, error) { return Open(dsn) },
+		"OpenReloadable": func(*testing.T) (*sql.DB, error) {
+			return OpenReloadable(dsn, func() (string, error) { return dsn, nil })
+		},
+	}
+	for name, open := range pools {
+		t.Run(name, func(t *testing.T) {
+			db, err := open(t)
+			require.NoError(t, err)
+			t.Cleanup(func() { utils.CloseAndLog(db) })
+			require.NoError(t, db.PingContext(t.Context()))
+
+			_, err = db.ExecContext(t.Context(), `INSERT INTO stamps (pool, recorded_at) VALUES ($1, $2)`, name, instant)
+			require.NoError(t, err)
+
+			var wallClock string
+			var got time.Time
+			require.NoError(t, db.QueryRowContext(t.Context(),
+				`SELECT recorded_at::text, recorded_at FROM stamps WHERE pool = $1`, name,
+			).Scan(&wallClock, &got))
+			assert.Equal(t, "2026-09-28 11:30:00.123456", wallClock, "the stored wall clock is the UTC reading")
+			assert.Equal(t, instant.UTC(), got, "the column reads back as the written instant, in UTC")
+		})
+	}
+}
+
 // Rotating the storage password out from under a running pool must be
 // transparent: the next fresh physical connection is rejected with an
 // authentication error, the pool re-resolves the DSN through reload, retries,

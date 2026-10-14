@@ -26,7 +26,11 @@ type SchemaRequestResult struct {
 	// resolved through a symlink. Base-freshness checks compare both the link
 	// object and its target so retargeting the environment cannot go unnoticed.
 	SchemaLinkPath string
-	HeadSHA        string // Commit SHA used to fetch schema files
+	// ConfigPath is the repo-relative path of the schemabot.yaml the database
+	// was discovered from. It lies outside SchemaPath when the schema root is
+	// an environment subdirectory or a symlink target.
+	ConfigPath string
+	HeadSHA    string // Commit SHA used to fetch schema files
 	// IgnoredNamespaces lists the namespaces that were actually removed from
 	// SchemaFiles by the config's ignore_namespaces, resolved for the
 	// environment and sorted. Surfaces the exclusion on the PR (plan comment)
@@ -156,6 +160,7 @@ func (ic *InstallationClient) CreateSchemaRequestForConfig(ctx context.Context, 
 		PullRequest:       pr,
 		SchemaPath:        schemaRoot,
 		SchemaLinkPath:    schemaLinkPath,
+		ConfigPath:        path.Join(configDir, ConfigFileName),
 		HeadSHA:           prInfo.HeadSHA,
 		IgnoredNamespaces: ignoredNamespaces,
 		IgnoreTables:      config.IgnoreTables,

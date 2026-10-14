@@ -75,22 +75,40 @@ ordinary table and index definitions; no extra flag is needed. A disabled table
 with policies still exports those policies and an explicit `DISABLE` setting.
 
 A pulled RLS definition can be checked back into its namespace directory and
-planned. An unchanged definition produces no changes. Changes to settings,
-policies, or the table shape in an RLS declaration currently refuse planning;
-SchemaBot does not turn the review into executable SQL. Direct RLS apply requests
-are also refused. Creating a new table with an RLS declaration is not supported
-yet. Atomic RLS apply is a separate follow-up.
+planned. An unchanged definition produces no changes. Changes to policies,
+policy comments, or RLS settings become one reviewed operation per table.
+The existing unsafe-change consent gate applies because these changes affect
+who can access rows. No additional RLS flag is needed.
+
+At execution, pg-sprite locks the table, regenerates the ordered SQL, and checks it against the reviewed operation before executing any of it.
+The entire policy replacement commits in one transaction, including settings
+and comments. A mismatch refuses execution and requires a new plan. This binds
+the SQL to execute, not every prior policy predicate: if concurrent edits still
+produce exactly the reviewed SQL, that SQL remains authorized.
+
+RLS drift comparison retains the physical schema qualifier. Dispatching a reviewed
+RLS operation to a differently named physical schema requires a fresh plan and
+review on that target; ordinary table namespace mapping does not authorize this
+RLS remapping. The executor still verifies the exact ordered SQL under its lock.
+
+Unchanged RLS definitions use a catalog comparison without an exclusive target lock
+or an ownership requirement. Planning a change and executing it take a bounded
+exclusive table lock. Keep policy
+updates small and expect a busy table to refuse rather than wait indefinitely.
+Creating a new table with an RLS declaration and combining structural changes
+with managed RLS remain unsupported. Direct RLS apply requests without the
+stored desired schema files are refused.
 
 Existing table-only files remain supported on tables with live RLS. They manage
 columns and indexes without changing policies or RLS settings; older rollback
 baselines keep this behavior too. Omitting RLS clauses does **not** disable RLS
-or drop policies. Explicit RLS declarations use the stricter comparison above,
-which currently refuses mixed structural and RLS changes. A no-change result
+or drop policies. Explicit RLS declarations use the atomic path above,
+which refuses mixed structural and RLS changes. A no-change result
 for a table-only file says nothing about whether its access policies match.
 
-New plans for a namespace containing RLS tables remain rollback-incapable until
-complete RLS definitions can be applied during recovery. Pull still exports the
-full definition; rollback capture never strips access policies to claim support.
+New plans for a namespace containing managed RLS tables remain rollback-incapable
+until complete RLS definitions can be applied during recovery. Pull still exports
+the full definition; rollback capture never strips access policies to claim support.
 
 For example, an existing table can pull as:
 
@@ -110,8 +128,9 @@ CREATE POLICY "readers" ON "documents"
 ```
 
 Planning this file against that same live definition returns `NoChanges: true`.
-Editing the policy to `USING (true)` instead returns a row security comparison
-refusal, with no executable plan or live changes.
+Editing the policy to `USING (true)` produces an unsafe policy replacement
+for review. Applying it broadens access to every row allowed by the remaining
+policies and grants; review that access change before consenting.
 
 RLS comparison and rendering use pg-sprite's validated model. Policy roles and
 qualified helper functions must already exist. Unsupported policy dependencies
@@ -122,8 +141,9 @@ does not judge whether a policy grants the right access.
 ## Supported changes
 
 The apply path normally executes a plan one statement at a time. Each statement
-runs as its own task and its own PostgreSQL transaction. The exception is a
-greenfield create set: its table and indexes run as one task through a
+runs as its own task and its own PostgreSQL transaction. An RLS replacement
+runs as one task and one atomic transaction, as described above. A second
+exception is a greenfield create set: its table and indexes run as one task through a
 pg-sprite sequence, with each sequence step in its own bounded transaction. A
 failed set leaves its committed prefix on the target, and the next plan
 reconciles that live catalog. Every statement must satisfy all of these
@@ -447,11 +467,14 @@ incompletely; and a drop has to take the referencing constraints with it. The
 plan names those constraints too, so both sides of one relationship explain
 themselves.
 
-Archive tables named `<table>_archive_YYYY[_MM[_DD]]` are exempt from the
-verdict, as they are in the MySQL engine's view of a live schema: an archive
-is a retired copy kept outside declarative schema files. That naming
-convention is the only per-table exemption — a leading underscore means
-nothing on PostgreSQL — and `ignore_namespaces` is the per-namespace one. The
+Archive tables named `<table>_archive_YYYY[_MM[_DD]]` with no schema file are
+exempt from the verdict, as they are in the MySQL engine's view of a live schema:
+an archive is a retired copy kept outside declarative schema files. An archive
+that a file explicitly declares is managed like any other declared table.
+That naming convention is the only naming-based per-table exemption — a leading
+underscore means nothing on PostgreSQL. `ignore_tables` entries, exact names
+and patterns, also withhold live tables; a file declaring an ignored table is refused as a
+contradiction. `ignore_namespaces` is the per-namespace exemption. The
 plan discloses the tables it exempted, by namespace, in the PR comment and in
 `schemabot plan` and `schemabot apply` output, so a reviewer can tell an
 archive the verdict skipped from a table it found declared.
@@ -632,13 +655,16 @@ solely from a state this engine never reports.
 | `engine.Engine.Cutover` | Typed decline at drive time | DDL changes the target directly; there is no deferred table swap to trigger. | [`pkg/engine/postgres/postgres.go`](../pkg/engine/postgres/postgres.go), [`pkg/tern/local_control.go`](../pkg/tern/local_control.go) |
 | `engine.Engine.Revert` | Refused at intake; typed decline never reached | Each successful statement commits directly and creates no revert window, so the API refuses the request before any engine is consulted and the driver never enters the state from which it would call the engine. | [`pkg/api/control_handlers.go`](../pkg/api/control_handlers.go), [`pkg/engine/postgres/postgres.go`](../pkg/engine/postgres/postgres.go) |
 | `engine.Engine.SkipRevert` | Refused at intake; typed decline never reached | With no revert window, every committed statement is already permanent; refused at the same intake gate as revert. | [`pkg/api/control_handlers.go`](../pkg/api/control_handlers.go), [`pkg/engine/postgres/postgres.go`](../pkg/engine/postgres/postgres.go) |
-| `engine.Drainer.Drain` | Implemented | Recovery must wait for in-process apply goroutines before re-planning, then discard their instance-local progress. | [`pkg/engine/postgres/postgres.go`](../pkg/engine/postgres/postgres.go) |
+| `engine.Drainer.DrainContext` | Implemented | Recovery must wait for in-process apply goroutines before re-planning, then discard their instance-local progress. The wait ends with the drive's context, leaving the work tracked, so a drive whose claim is gone does not sit behind it. | [`pkg/engine/postgres/postgres.go`](../pkg/engine/postgres/postgres.go) |
 | `engine.ShutdownHalter.HaltForShutdown` | Implemented | Shutdown cancels in-process concurrent index builds so they do not keep target resources after this instance stops renewing its lease; bounded plain DDL is allowed to finish. | [`pkg/engine/postgres/postgres.go`](../pkg/engine/postgres/postgres.go) |
+| `engine.OwnedWorkHalter.HaltWorkOwnedBy` | Implemented | A drive handing its apply back cancels the concurrent index builds it started, and only those, and waits for its plain DDL to finish; another drive's applies on the same engine are left running. | [`pkg/engine/postgres/postgres.go`](../pkg/engine/postgres/postgres.go) |
 | `engine.DeferredCutoverSignalChecker.DeferredCutoverSignalExists` | Not applicable; not implemented | Direct DDL has no deferred cutover gate or durable table-swap signal. | [`pkg/engine/engine.go`](../pkg/engine/engine.go), [`pkg/engine/postgres/postgres.go`](../pkg/engine/postgres/postgres.go) |
 | `engine.ExternallyAuthoritativeProgress.ProgressIsExternallyAuthoritative` | Not applicable; not implemented | Progress is held in the engine instance's in-memory apply map, not in an external service that every instance can query authoritatively. | [`pkg/engine/postgres/apply.go`](../pkg/engine/postgres/apply.go) |
 | `engine.SynchronousWorkRegistration.RegistersWorkSynchronously` | Implemented; returns `true` | `Apply` claims the tracked progress entry before returning and has no remote provisioning phase. | [`pkg/engine/postgres/postgres.go`](../pkg/engine/postgres/postgres.go) |
 | `engine.CancelledArtifactReleaser.ReleaseCancelledArtifacts` | Not applicable; not implemented | PostgreSQL does not create copy tables owned by this engine; cancellation attempts to remove any invalid concurrent index before settling, and a removal that fails is named in the terminal summary for operator follow-up rather than deferred to a generic artifact release. | [`pkg/engine/postgres/cancel.go`](../pkg/engine/postgres/cancel.go), [`pkg/engine/postgres/apply.go`](../pkg/engine/postgres/apply.go) |
+| `engine.CancelledResumeStateReclaimer.ReclaimCancelledResumeState` | Not applicable; not implemented | Each statement runs in this process against the target directly; nothing is set up in a remote service ahead of the work that owns its teardown, so a cancel that lands between drives finds no stored resume state naming work to reclaim. | [`pkg/engine/engine.go`](../pkg/engine/engine.go), [`pkg/engine/postgres/apply.go`](../pkg/engine/postgres/apply.go) |
 | `engine.ControlResumeValidator.ValidateControlResumeState` | Not applicable; not implemented | Control requests use `ResumeState.MigrationContext` only as the in-memory apply key and have no opaque, operation-specific remote state to validate. | [`pkg/engine/postgres/apply.go`](../pkg/engine/postgres/apply.go), [`pkg/engine/postgres/cancel.go`](../pkg/engine/postgres/cancel.go) |
+| `engine.ShardKeyedPlanning.PlansEachShard` | Not applicable; not implemented | A PostgreSQL target is not sharded, so its tasks carry no shard and the plan never needs to speak for one. | [`pkg/engine/engine.go`](../pkg/engine/engine.go) |
 
 ## Failure and recovery
 
@@ -654,10 +680,25 @@ it commits or fails, and recovery re-plans against the live target before
 further work. A privilege refusal is a permanent failed task, includes the
 required provisioning advice, and leaves the target unchanged.
 
-Rollback baseline capture refuses namespaces containing RLS tables until
-recovery can restore their complete access rules alongside sibling tables.
-It never strips policies to mark a plan rollback-capable. [RV-7](invariants.md#rv-7-rollback-needs-the-originals)
-requires complete originals before rollback can proceed.
+Rollback captures the same live table set the forward plan manages. Tables
+`ignore_tables` withholds, by exact case-sensitive name or by pattern, are
+excluded before introspection, as are
+archive-named tables with no schema file. An explicitly declared archive remains
+managed and keeps its original definition, so rollback can reverse its changes.
+A declared archive the forward plan creates has no original to keep: the
+rollback re-plan finds it live with no file and, like any archive-named table
+without one, leaves it in place and discloses it as exempt rather than dropping
+it. Pull still exports archive-named tables; these capture exclusions do not
+change pull behavior or permit a table to be both ignored and declared.
+
+Capture is complete for that managed set or the plan is rollback-incapable;
+an unrenderable ignored table or undeclared archive does not prevent capture.
+Managed RLS tables still prevent capture until recovery can restore their
+complete access rules alongside sibling tables. Capture never strips policies to
+mark a plan rollback-capable, and a catalog read failure or cancellation still
+ends planning. [RV-7](invariants.md#rv-7-rollback-needs-the-originals)
+requires complete originals before rollback can proceed; missing originals in
+older plans are never reconstructed from the current target.
 
 ## Configuration and credentials
 
@@ -734,8 +775,8 @@ A passing refusal case proves rejection, not support for applying that change.
 
 This is a small adapter suite, not a claim of hosted Supabase support. It does
 not exercise Supavisor, the Data API, Auth service, Realtime, or hosted TLS.
-SchemaBot can pull and compare RLS declarations, but does not yet execute changes
-to them. The RLS test also calls the native apply path directly and checks visibility with the image's `authenticated` role and
+The Supabase fixture test covers pull and comparison; the separate atomic RLS
+integration tests cover policy replacement. The fixture RLS test also calls the native apply path directly and checks visibility with the image's `authenticated` role and
 bootstrap `auth.uid()` function. It does not test the full plan-to-apply workflow
 for an RLS table or HTTP authentication.
 

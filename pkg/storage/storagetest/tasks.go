@@ -62,6 +62,50 @@ func TestTasks(t *testing.T, h Harness) {
 		assert.Equal(t, 813, owners[0].PullRequest)
 	})
 
+	// A task's planned table size is written once when the task is created
+	// and read back with it. Progress updates rewrite the task's live figures
+	// but never its size, so a drive that does not carry the size cannot
+	// clear it.
+	t.Run("EstimatedBytes_WrittenAtCreate_SurvivesUpdate", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "task_bytes_db", storage.DatabaseTypeMySQL)
+		apply := CreateApply(t, store, lock, "apply_task_bytes", 902)
+		now := time.Now().UTC().Truncate(time.Second)
+
+		sized := newTask(apply, "task_bytes_sized", "orders", now)
+		bytes := int64(23_400_000_000)
+		sized.EstimatedBytes = &bytes
+		_, err := store.Tasks().Create(ctx, sized)
+		require.NoError(t, err)
+		unsized := newTask(apply, "task_bytes_unsized", "users", now)
+		_, err = store.Tasks().Create(ctx, unsized)
+		require.NoError(t, err)
+
+		got, err := store.Tasks().Get(ctx, sized.TaskIdentifier)
+		require.NoError(t, err)
+		require.NotNil(t, got)
+		require.NotNil(t, got.EstimatedBytes)
+		assert.Equal(t, bytes, *got.EstimatedBytes)
+
+		got.EstimatedBytes = nil
+		got.State = state.Task.Running
+		got.RowsCopied = 500
+		got.RowsTotal = 1000
+		require.NoError(t, store.Tasks().Update(ctx, got))
+		updated, err := store.Tasks().Get(ctx, sized.TaskIdentifier)
+		require.NoError(t, err)
+		require.NotNil(t, updated)
+		assert.Equal(t, int64(500), updated.RowsCopied)
+		require.NotNil(t, updated.EstimatedBytes, "a progress update never clears the planned size")
+		assert.Equal(t, bytes, *updated.EstimatedBytes)
+
+		gotUnsized, err := store.Tasks().Get(ctx, unsized.TaskIdentifier)
+		require.NoError(t, err)
+		require.NotNil(t, gotUnsized)
+		assert.Nil(t, gotUnsized.EstimatedBytes, "a task created without an estimate reads back without one")
+	})
+
 	t.Run("Create_Get_Update", func(t *testing.T) {
 		ctx := t.Context()
 		store := h.NewStorage(t)

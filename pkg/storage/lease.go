@@ -37,6 +37,27 @@ func ApplyLeaseFromContext(ctx context.Context) (ApplyLease, bool) {
 
 type operationLeaseContextKey struct{}
 
+type operationLeaseAbsenceContextKey struct{}
+
+// OperationLeaseAbsence identifies an operation that must remain unleased for
+// a task write to land. Storage compares freshness with its own clock in the
+// same statement as the task update, so a concurrent claim rejects the write.
+type OperationLeaseAbsence struct {
+	ApplyID     int64
+	OperationID int64
+}
+
+// WithOperationLeaseAbsent guards a task write against a live operation drive.
+func WithOperationLeaseAbsent(ctx context.Context, guard OperationLeaseAbsence) context.Context {
+	return context.WithValue(ctx, operationLeaseAbsenceContextKey{}, guard)
+}
+
+// OperationLeaseAbsenceFromContext returns the absence guard attached to ctx.
+func OperationLeaseAbsenceFromContext(ctx context.Context) (OperationLeaseAbsence, bool) {
+	guard, ok := ctx.Value(operationLeaseAbsenceContextKey{}).(OperationLeaseAbsence)
+	return guard, ok
+}
+
 // OperationLease is the ownership capability for one claimed apply_operation.
 // It is distinct from ApplyLease: it identifies the operation row and carries
 // the operation's own token, so storage writes can guard on the operation's

@@ -91,3 +91,69 @@ func TestValueFromGetSecretOutput(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "has no value")
 }
+
+func TestSecretJSONKey(t *testing.T) {
+	const secret = `{"app-id": "123456", "app_id": 1234567, "big": 12345678901234567890, "enabled": true, "pk": "-----BEGIN", "nested": {"a": 1}, "absent": null}`
+
+	t.Run("string value is returned as is", func(t *testing.T) {
+		got, err := secretJSONKey(secret, "github-app", "app-id")
+		require.NoError(t, err)
+		assert.Equal(t, "123456", got)
+	})
+
+	t.Run("number value keeps every digit", func(t *testing.T) {
+		got, err := secretJSONKey(secret, "github-app", "app_id")
+		require.NoError(t, err)
+		assert.Equal(t, "1234567", got)
+
+		got, err = secretJSONKey(secret, "github-app", "big")
+		require.NoError(t, err)
+		assert.Equal(t, "12345678901234567890", got)
+	})
+
+	t.Run("other values are their JSON literal", func(t *testing.T) {
+		got, err := secretJSONKey(secret, "github-app", "enabled")
+		require.NoError(t, err)
+		assert.Equal(t, "true", got)
+
+		got, err = secretJSONKey(secret, "github-app", "nested")
+		require.NoError(t, err)
+		assert.Equal(t, `{"a":1}`, got)
+	})
+
+	t.Run("null value is an error rather than a stand-in string", func(t *testing.T) {
+		_, err := secretJSONKey(secret, "github-app", "absent")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), `key "absent" in secret "github-app" is null`)
+	})
+
+	t.Run("data after the object is rejected", func(t *testing.T) {
+		for _, corrupt := range []string{
+			`{"app-id": "1"} {"app-id": "2"}`,
+			`{"app-id": "1"} junk`,
+			`{"app-id": "1"}}`,
+		} {
+			_, err := secretJSONKey(corrupt, "github-app", "app-id")
+			require.Error(t, err, corrupt)
+			assert.Contains(t, err.Error(), `parse secret "github-app" as JSON: unexpected data after the JSON object`, corrupt)
+		}
+	})
+
+	t.Run("trailing whitespace is not data", func(t *testing.T) {
+		got, err := secretJSONKey(`{"app-id": "1"}`+"\n  \n", "github-app", "app-id")
+		require.NoError(t, err)
+		assert.Equal(t, "1", got)
+	})
+
+	t.Run("missing key names the key and the secret", func(t *testing.T) {
+		_, err := secretJSONKey(secret, "github-app", "webhook-secret")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), `key "webhook-secret" not found in secret "github-app"`)
+	})
+
+	t.Run("non-JSON secret names the secret", func(t *testing.T) {
+		_, err := secretJSONKey("not json", "github-app", "app-id")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), `parse secret "github-app" as JSON`)
+	})
+}

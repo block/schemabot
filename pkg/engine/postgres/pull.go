@@ -14,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"golang.org/x/sync/errgroup"
 
+	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/postgresconn"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/schema"
@@ -114,7 +115,7 @@ func (e *Engine) PullSchema(ctx context.Context, req *ternv1.PullSchemaRequest) 
 		// accountable for, so a pulled baseline declares exactly what a later
 		// plan would otherwise report as undeclared. Partitions and
 		// extension-owned tables have no file of their own and are left out.
-		tables, tableErrors, err := renderPostgresTables(ctx, pool, namespace, pulledBaseline)
+		tables, tableErrors, err := renderPostgresTables(ctx, pool, e.pullDatabase, namespace, pulledBaseline)
 		if err != nil {
 			return nil, fmt.Errorf("pull PostgreSQL database %q: %w", e.pullDatabase, err)
 		}
@@ -142,9 +143,11 @@ type baselinePolicy struct {
 	// — even though the renderer would happily render its columns and
 	// indexes without them.
 	refuseUnmodeledObjects bool
-	// skipArchiveTables leaves archive-named tables out of the baseline, the
-	// same tables the plan leaves in place instead of dropping.
-	skipArchiveTables bool
+	// skipUndeclaredArchiveTables leaves archive-named tables out only when
+	// no forward schema file declares them. Declared archives are managed.
+	skipUndeclaredArchiveTables bool
+	declaredTables              map[string]bool
+	ignoredTables               engine.IgnoredTables
 }
 
 // pulledBaseline becomes the owner's declared schema, so a table the format
@@ -156,9 +159,28 @@ var pulledBaseline = baselinePolicy{refuseUnmodeledObjects: true, includeRowSecu
 // rollbackBaseline is read only by a rollback re-plan, which manages the
 // same table set the forward plan did. Objects the differ cannot see are
 // left in place by any apply and by any rollback, so they cost the
-// namespace nothing; an archive table sits outside management on both
-// plans, so its shape — renderable or not — is not the baseline's concern.
-var rollbackBaseline = baselinePolicy{skipArchiveTables: true}
+// namespace nothing. Ignored tables and undeclared archives sit outside
+// management, so their shapes are not the baseline's concern.
+func rollbackBaseline(declared map[string]bool, ignored engine.IgnoredTables) baselinePolicy {
+	return baselinePolicy{
+		skipUndeclaredArchiveTables: true,
+		declaredTables:              declared,
+		ignoredTables:               ignored,
+	}
+}
+
+// exclusionReason names the rule that leaves a table out of the baseline,
+// using the same reason strings a plan reports for its exempt tables, or
+// returns "" when the baseline carries the table.
+func (p baselinePolicy) exclusionReason(table string) string {
+	if p.ignoredTables.Withholds(table) {
+		return engine.ExemptReasonIgnoreTables
+	}
+	if p.skipUndeclaredArchiveTables && !p.declaredTables[table] && spirittable.IsArchiveTable(table) {
+		return exemptReasonArchiveNaming
+	}
+	return ""
+}
 
 // baselineIntrospectionConcurrency caps how many tables a baseline render
 // introspects at once. Each introspection is one read-only transaction of
@@ -200,17 +222,19 @@ type renderedTable struct {
 // the whole render with an error, and cancels the introspections still in
 // flight, instead of being recorded as a per-table refusal and carried on
 // past.
-func renderPostgresTables(ctx context.Context, pool *pgxpool.Pool, namespace string, policy baselinePolicy) (map[string]string, []error, error) {
+func renderPostgresTables(ctx context.Context, pool *pgxpool.Pool, database, namespace string, policy baselinePolicy) (map[string]string, []error, error) {
 	tables, err := schemadiff.ListManagedTables(ctx, pool, namespace)
 	if err != nil {
 		return nil, nil, fmt.Errorf("list PostgreSQL tables in schema %q: %w", namespace, err)
 	}
 	managedTables := make([]string, 0, len(tables))
 	for _, table := range tables {
-		if policy.skipArchiveTables && spirittable.IsArchiveTable(table) {
-			slog.Debug("PostgreSQL archive table is outside management and left out of the rendered baseline",
+		if reason := policy.exclusionReason(table); reason != "" {
+			slog.Debug("PostgreSQL table is outside management and left out of the rendered baseline",
+				"database", database,
 				"namespace", namespace,
-				"table", table)
+				"table", table,
+				"reason", reason)
 			continue
 		}
 		managedTables = append(managedTables, table)

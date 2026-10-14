@@ -117,7 +117,7 @@ func TestDDLBlockBudgetIsSharedAcrossBlocks(t *testing.T) {
 
 		assert.Equal(t, 0, budget.remaining)
 		rendered := strings.ReplaceAll(out.String(), ddlTruncatedMarker, "")
-		assert.LessOrEqual(t, len(rendered), total+len("```sql\n```\n"), "an exhausted budget renders an empty block, never more content")
+		assert.Equal(t, total, len(rendered), "an exhausted budget renders no block, never more content")
 	})
 }
 
@@ -170,6 +170,18 @@ func TestWriteSQLFencedBlocksShareOneSectionBudget(t *testing.T) {
 
 			assert.Equal(t, whole(first)+ddlTruncatedMarker, out.String(), "share %d: the marker follows the whole block directly", share)
 			assert.Equal(t, extra, budget.remaining, "share %d: only the block written is charged", share)
+		}
+	})
+
+	t.Run("a share with no room for one byte of the first block writes the marker alone", func(t *testing.T) {
+		oneByteBlock := len("```sql\nA\n```\n")
+		for share := range oneByteBlock {
+			budget := &ddlBlockBudget{remaining: share, blocksLeft: 1}
+			var out strings.Builder
+			writeSQLFencedBlocks(&out, []string{first, second}, budget)
+
+			assert.Equal(t, ddlTruncatedMarker, out.String(), "share %d: no fence renders past the share", share)
+			assert.Equal(t, share, budget.remaining, "share %d: nothing is charged", share)
 		}
 	})
 

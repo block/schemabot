@@ -27,6 +27,26 @@ func pendingControlRequest(ctx context.Context, store storage.Storage, apply *st
 	return controlReq, nil
 }
 
+// controlRequestAccepted reports whether the engine has accepted a control
+// request of the given operation for an apply: its durable request row is
+// completed. The row is completed by whichever process carried the request
+// out, whether the API's immediate attempt or a drive, so this is the answer a
+// drive that never saw the acceptance itself must read.
+func controlRequestAccepted(ctx context.Context, store storage.Storage, apply *storage.Apply, operation storage.ControlOperation) (bool, error) {
+	if store == nil {
+		return false, fmt.Errorf("storage is not available")
+	}
+	controlStore := store.ControlRequests()
+	if controlStore == nil {
+		return false, fmt.Errorf("control request store is not available")
+	}
+	controlReq, err := controlStore.GetByOperation(ctx, apply.ID, operation)
+	if err != nil {
+		return false, fmt.Errorf("load %s control request for apply %s: %w", operation, apply.ApplyIdentifier, err)
+	}
+	return controlReq != nil && controlReq.Status == storage.ControlRequestCompleted, nil
+}
+
 // completePendingControlRequests marks the pending control request of the given
 // operation completed, after verifying the apply lease still holds.
 func completePendingControlRequests(ctx context.Context, store storage.Storage, apply *storage.Apply, operation storage.ControlOperation) error {
@@ -75,6 +95,20 @@ func settlePendingRequestsForTerminalApply(ctx context.Context, store storage.St
 	return SettlePendingCancelForResolvedApply(ctx, store, logger, apply)
 }
 
+// settleRequestsForStoredOutcome settles the pending control requests that an
+// apply's durably stored terminal outcome moots. A settlement failure is
+// logged rather than returned: the outcome is stored, so the summary is owed
+// (RC-5 withholds a summary only for an outcome storage never held) and the
+// caller proceeds to release the gauge and notify the observer. The unsettled
+// requests stay pending for the operator's post-drive settlement, and an
+// operator can re-issue one; a summary that never posts has no such recovery.
+func (c *LocalClient) settleRequestsForStoredOutcome(ctx context.Context, logger *slog.Logger, apply *storage.Apply) {
+	if err := settlePendingRequestsForTerminalApply(ctx, c.storage, c.logger, apply); err != nil {
+		logger.Warn("failed to settle pending control requests for the stored terminal outcome; they stay pending for the operator's post-drive settlement and the terminal summary still posts",
+			"state", apply.State, "error", err)
+	}
+}
+
 // SettlePendingCancelForResolvedApply settles the pending cancel of an apply
 // that has reached a terminal state, whichever path drove it there. An apply
 // resolves under more than one drive shape, and every one of them owes the
@@ -90,6 +124,47 @@ func SettlePendingCancelForResolvedApply(ctx context.Context, store storage.Stor
 		return nil
 	}
 	return settlePendingCancelForTerminalApply(ctx, store, logger, apply)
+}
+
+// SettlePendingStartForResolvedApply answers the pending start of an apply that
+// has reached a terminal state. A drive that stores the outcome answers the
+// start itself, but when that answer does not land the outcome still stands, and
+// nothing re-claims a settled apply to try again — so the operator's post-drive
+// settlement answers it here instead of leaving it pending forever.
+//
+// A completed apply is the start having taken effect. Any other settled state
+// fails the start, with the apply's own failure reason when it has one, so the
+// operator reads that the command did not reach the outcome they asked for. A
+// stopped apply keeps its start: that is the request that resumes it.
+//
+// The caller must have established that the apply is terminal.
+func SettlePendingStartForResolvedApply(ctx context.Context, store storage.Storage, logger *slog.Logger, apply *storage.Apply) error {
+	if state.IsState(apply.State, state.Apply.Stopped) {
+		logger.DebugContext(ctx, "leaving the pending start request deliverable for a stopped apply", apply.LogAttrs()...)
+		return nil
+	}
+	controlReq, err := pendingControlRequest(ctx, store, apply, storage.ControlOperationStart)
+	if err != nil {
+		return err
+	}
+	if controlReq == nil {
+		return nil
+	}
+	if state.IsState(apply.State, state.Apply.Completed) {
+		logger.InfoContext(ctx, "completing pending start request for completed apply",
+			append(apply.LogAttrs(), "requested_by", controlRequestCaller(controlReq))...)
+		return completePendingControlRequests(ctx, store, apply, storage.ControlOperationStart)
+	}
+	reason := apply.ErrorMessage
+	if reason == "" {
+		reason = "the schema change settled before the start could take effect"
+		if info, known := state.LookupApply(state.NormalizeState(apply.State)); known {
+			reason = fmt.Sprintf("the schema change reached %s before the start could take effect", info.Label)
+		}
+	}
+	logger.WarnContext(ctx, "failing pending start request for settled apply",
+		append(apply.LogAttrs(), "requested_by", controlRequestCaller(controlReq), "reason", reason)...)
+	return failPendingControlRequests(ctx, store, apply, storage.ControlOperationStart, reason)
 }
 
 // settlePendingCancelForTerminalApply settles an apply's pending cancel once the

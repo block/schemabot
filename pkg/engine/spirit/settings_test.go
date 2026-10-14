@@ -9,8 +9,6 @@ import (
 )
 
 func TestSettingsFromMetadata(t *testing.T) {
-	boolPtr := func(v bool) *bool { return &v }
-
 	tests := []struct {
 		name     string
 		metadata map[string]string
@@ -31,47 +29,11 @@ func TestSettingsFromMetadata(t *testing.T) {
 			want: Settings{},
 		},
 		{
-			name: "all overrides parse",
+			name: "checkpoint max age parses",
 			metadata: map[string]string{
-				MetadataEnableExperimentalAutoscaling:      "false",
-				MetadataEnableExperimentalLocklessChecksum: "true",
-				MetadataCheckpointMaxAge:                   "24h",
-				MetadataChecksumYieldTimeout:               "6h",
+				MetadataCheckpointMaxAge: "24h",
 			},
-			want: Settings{
-				EnableExperimentalAutoscaling:      boolPtr(false),
-				EnableExperimentalLocklessChecksum: true,
-				CheckpointMaxAge:                   24 * time.Hour,
-				ChecksumYieldTimeout:               6 * time.Hour,
-			},
-		},
-		{
-			name: "lockless checksum false parses to the default",
-			metadata: map[string]string{
-				MetadataEnableExperimentalLocklessChecksum: "false",
-			},
-			want: Settings{},
-		},
-		{
-			name: "invalid lockless checksum value errors",
-			metadata: map[string]string{
-				MetadataEnableExperimentalLocklessChecksum: "sure",
-			},
-			wantErr: MetadataEnableExperimentalLocklessChecksum,
-		},
-		{
-			name: "autoscaling true is preserved as an explicit value",
-			metadata: map[string]string{
-				MetadataEnableExperimentalAutoscaling: "true",
-			},
-			want: Settings{EnableExperimentalAutoscaling: boolPtr(true)},
-		},
-		{
-			name: "invalid autoscaling value errors",
-			metadata: map[string]string{
-				MetadataEnableExperimentalAutoscaling: "yep",
-			},
-			wantErr: MetadataEnableExperimentalAutoscaling,
+			want: Settings{CheckpointMaxAge: 24 * time.Hour},
 		},
 		{
 			name: "invalid checkpoint duration errors",
@@ -81,9 +43,9 @@ func TestSettingsFromMetadata(t *testing.T) {
 			wantErr: MetadataCheckpointMaxAge,
 		},
 		{
-			name: "non-positive checksum yield errors",
+			name: "non-positive checkpoint duration errors",
 			metadata: map[string]string{
-				MetadataChecksumYieldTimeout: "0s",
+				MetadataCheckpointMaxAge: "0s",
 			},
 			wantErr: "must be positive",
 		},
@@ -101,6 +63,21 @@ func TestSettingsFromMetadata(t *testing.T) {
 	}
 }
 
+// A database whose metadata still sets a run setting this engine no longer
+// exposes must not silently run with Spirit's default instead: the operator
+// set that key to change how the run behaves, so the settings fail to build
+// and the error names the key to delete.
+func TestSettingsFromMetadataRejectsRemovedKeys(t *testing.T) {
+	for _, key := range []string{
+		"enable_experimental_autoscaling",
+		"enable_experimental_lockless_checksum",
+		"checksum_yield_timeout",
+	} {
+		_, err := SettingsFromMetadata(map[string]string{key: "false"})
+		require.ErrorContains(t, err, "metadata key "+key+" is no longer supported")
+	}
+}
+
 // TestNewResolvesSettings verifies that New resolves zero-value Settings
 // fields to the fleet defaults and preserves explicit overrides, so every
 // embedder that constructs the engine without configuration runs with the
@@ -109,22 +86,10 @@ func TestNewResolvesSettings(t *testing.T) {
 	t.Run("defaults", func(t *testing.T) {
 		eng := New(Config{})
 		assert.Equal(t, DefaultCheckpointMaxAge, eng.checkpointMaxAge)
-		assert.Equal(t, DefaultChecksumYieldTimeout, eng.checksumYieldTimeout)
-		assert.True(t, eng.autoscaling)
-		assert.False(t, eng.locklessChecksum)
 	})
 
 	t.Run("overrides", func(t *testing.T) {
-		disabled := false
-		eng := New(Config{Settings: Settings{
-			EnableExperimentalAutoscaling:      &disabled,
-			EnableExperimentalLocklessChecksum: true,
-			CheckpointMaxAge:                   24 * time.Hour,
-			ChecksumYieldTimeout:               6 * time.Hour,
-		}})
+		eng := New(Config{Settings: Settings{CheckpointMaxAge: 24 * time.Hour}})
 		assert.Equal(t, 24*time.Hour, eng.checkpointMaxAge)
-		assert.Equal(t, 6*time.Hour, eng.checksumYieldTimeout)
-		assert.False(t, eng.autoscaling)
-		assert.True(t, eng.locklessChecksum)
 	})
 }

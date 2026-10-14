@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"maps"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -35,6 +36,14 @@ func TestVSchemaPlanMetadata(t *testing.T) {
 			PlanMetadataVSchemaMutations: `[{"kind":"vindex_type","name":"user_idx","reason":"changing vindex user_idx type re-computes keyspace ids"}]`,
 			PlanMetadataVSchemaDiff:      "--- current\n+++ new\n+ vindex hash",
 		}, got)
+	})
+
+	t.Run("generated-only marker persists beside the flag", func(t *testing.T) {
+		got := VSchemaPlanMetadata(map[string]string{
+			PlanMetadataVSchemaChanged:       "true",
+			PlanMetadataVSchemaGeneratedOnly: "true",
+		})
+		assert.Equal(t, map[string]string{PlanMetadataVSchemaChanged: "true", PlanMetadataVSchemaGeneratedOnly: "true"}, got)
 	})
 }
 
@@ -208,4 +217,34 @@ func TestPlanUnsafeVSchemaChanges(t *testing.T) {
 		require.Len(t, changes, 1)
 		assert.Equal(t, "payments", changes[0].Namespace)
 	})
+}
+
+// A stored namespace's VSchema change is shown as one unless the engine
+// generated it entirely from the DDL, with no diff and no deletion or mutation
+// record, and the namespace is finalized; then its finalize is what shows.
+func TestNamespacePlanDataShowsVSchemaChange(t *testing.T) {
+	artifact := map[string]string{VSchemaArtifactName: `{"tables": {"refund_notes": {}}}`}
+	generated := func(extra map[string]string) map[string]string {
+		meta := map[string]string{PlanMetadataVSchemaChanged: "true", PlanMetadataVSchemaGeneratedOnly: "true"}
+		maps.Copy(meta, extra)
+		return meta
+	}
+	cases := []struct {
+		name string
+		ns   *NamespacePlanData
+		want bool
+	}{
+		{"no VSchema change", &NamespacePlanData{Finalize: true}, false},
+		{"VSchema change", &NamespacePlanData{Artifacts: artifact, Metadata: map[string]string{PlanMetadataVSchemaChanged: "true"}, Finalize: true}, true},
+		{"generated and finalized", &NamespacePlanData{Artifacts: artifact, Metadata: generated(nil), Finalize: true}, false},
+		{"generated without a finalize", &NamespacePlanData{Artifacts: artifact, Metadata: generated(nil)}, true},
+		{"generated with a diff", &NamespacePlanData{Artifacts: artifact, Metadata: generated(map[string]string{PlanMetadataVSchemaDiff: "+ refund_notes"}), Finalize: true}, true},
+		{"generated with a deletion", &NamespacePlanData{Artifacts: artifact, Metadata: generated(map[string]string{PlanMetadataVSchemaDeletions: `[{"kind":"table","name":"refund_notes","reason":"r"}]`}), Finalize: true}, true},
+		{"generated with a mutation", &NamespacePlanData{Artifacts: artifact, Metadata: generated(map[string]string{PlanMetadataVSchemaMutations: `[{"kind":"vindex_type","name":"hash","reason":"r"}]`}), Finalize: true}, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, tc.ns.ShowsVSchemaChange())
+		})
+	}
 }

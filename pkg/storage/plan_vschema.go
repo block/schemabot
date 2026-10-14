@@ -29,18 +29,27 @@ const (
 	// destructive DDL.
 	PlanMetadataVSchemaDeletions = "vschema_deletions"
 
-	// PlanMetadataVSchemaMutations holds the in-place vindex definition
-	// changes in the namespace's VSchema change as a JSON-encoded list of
-	// {kind, name, reason} records. A mutation keeps the vindex's name but
-	// changes how Vitess routes through it, so it requires the same opt-in
+	// PlanMetadataVSchemaMutations holds the in-place routing changes in the
+	// namespace's VSchema change as a JSON-encoded list of {kind, name,
+	// reason} records. A mutation removes nothing but changes how Vitess
+	// routes rows or issues ids — through a vindex, a table's routing
+	// fields, or the keyspace's own flags — so it requires the same opt-in
 	// as a removal.
 	PlanMetadataVSchemaMutations = "vschema_mutations"
+
+	// PlanMetadataVSchemaGeneratedOnly is "true" when the engine generated the
+	// namespace's whole VSchema change from the plan's DDL, leaving no diff to
+	// review (engine.MetadataVSchemaGeneratedOnly). Persisting it lets
+	// stored-plan and apply-time surfaces show the namespace the way the plan
+	// did. Display-only: no safety gate reads it.
+	PlanMetadataVSchemaGeneratedOnly = "vschema_generated_only"
 )
 
 // VSchemaPlanMetadata extracts the subset of an engine's plan change-metadata
 // that must survive plan persistence: the keys apply-time safety gates read
-// (the VSchema-changed flag and the recorded structural deletions and vindex
-// mutations) plus the rendered diff apply-time display reads. Every plan
+// (the VSchema-changed flag and the recorded structural deletions and
+// in-place routing changes) plus the rendered diff and generated-only marker apply-time
+// display reads. Every plan
 // persistence site uses this helper so stored plans carry the same metadata
 // regardless of which plane persisted them. Returns nil for a change without
 // VSchema work, so such namespaces store no metadata.
@@ -49,7 +58,7 @@ func VSchemaPlanMetadata(metadata map[string]string) map[string]string {
 		return nil
 	}
 	persisted := map[string]string{PlanMetadataVSchemaChanged: "true"}
-	for _, key := range []string{PlanMetadataVSchemaDeletions, PlanMetadataVSchemaMutations, PlanMetadataVSchemaDiff} {
+	for _, key := range []string{PlanMetadataVSchemaDeletions, PlanMetadataVSchemaMutations, PlanMetadataVSchemaDiff, PlanMetadataVSchemaGeneratedOnly} {
 		if raw := metadata[key]; raw != "" {
 			persisted[key] = raw
 		}
@@ -59,8 +68,8 @@ func VSchemaPlanMetadata(metadata map[string]string) map[string]string {
 
 // VSchemaUnsafeChange is one namespace's VSchema change that requires explicit
 // unsafe opt-in before queueing operator work: a recorded structural removal
-// or vindex mutation, or a VSchema change whose record is missing or
-// unreadable.
+// or in-place routing change, or a VSchema change whose record is missing
+// or unreadable.
 type VSchemaUnsafeChange struct {
 	Namespace string
 	Reason    string
