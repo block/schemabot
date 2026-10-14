@@ -185,6 +185,7 @@ func TestPlanForApplyRequest_MemberStepRefusesAPlanItsLiveSchemaDisagreesWith(t 
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "local schema has drifted from the reviewed plan")
+	assert.False(t, engine.IsRetryable(err), "a redispatch carries the same reviewed DDL against the same drifted schema")
 	assert.Nil(t, got)
 	assert.Nil(t, store.created)
 }
