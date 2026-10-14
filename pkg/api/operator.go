@@ -1382,7 +1382,7 @@ func (s *Service) driveClaimedMultiOperation(ctx context.Context, driverID int, 
 		// the task whose verdict never landed, and a terminal operation gets no
 		// next claim to finish the job. Leave the operation row as found and
 		// claimable; the next claim reads every task as stored and settles it.
-		return
+		return claimSpent
 	}
 
 	// Persist the operation row from its OWN tasks — even when the drive returned
