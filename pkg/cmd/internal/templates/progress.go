@@ -394,7 +394,7 @@ func FormatProgressState(s string) string {
 	case state.NoActiveChange:
 		return "No active schema change"
 	case state.Apply.Pending:
-		return "⏳ Starting..."
+		return "⏳ Queued"
 	case state.Apply.PreparingBranch:
 		return ANSICyan + "🔄 Preparing branch..." + ANSIReset
 	case state.Apply.ApplyingBranchChanges:
