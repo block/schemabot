@@ -445,7 +445,7 @@ backpressure semantics are the same; only the explanation is missing.
 
 ## Upsizing Aurora to speed up a change
 
-![A copy throttled on a 2-vCPU db.r6g.large writer has an ETA of about a month; after the instance class changes to the 8-vCPU db.r6g.2xlarge, Spirit's autoscaling engages and the copy finishes in about 2 hours](../assets/spirit-aurora-upsize.gif)
+![Rows stream slowly from orders to _orders_new on a throttled 2-vCPU db.r6g.large writer with an ETA of about a month; the writer grows into an 8-vCPU db.r6g.2xlarge, the stream speeds up as Spirit adds write threads, and the copy finishes about 2 hours later](../assets/spirit-aurora-upsize.gif)
 
 **A throttled copy on a small writer can finish in hours instead of weeks after an upsize.** A
 schema change runs long for two reasons: a large table with many writes is more work, and a busy

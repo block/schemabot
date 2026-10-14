@@ -25,7 +25,9 @@ illustrative, not performance measurements.
   marks the silent steps. The copy is write-limited, so only the write pool moves; traffic,
   latency, and timing are illustrative. The renderer plays it at 1.3x its 24-second timeline.
 - `spirit-aurora-upsize.html` retells a staging schema change on a 107M-row table that moved from
-  `db.r6g.large` to `db.r6g.2xlarge`, as a timeline of events under the table copy's progress bar.
+  `db.r6g.large` to `db.r6g.2xlarge`. Rows stream as dots from `orders` to `_orders_new` inside the
+  writer, which grows while it restarts; the stream speeds up and gains lanes as the write pool
+  grows. A timeline of events sits under the table copy's progress bar.
   The ETAs and instance classes are the observed values; the time before the upsize is
   illustrative, and the write threads follow Spirit's sizing for each instance class
   (small-instance mode below 4 vCPUs, write threads from vCPUs minus two upward).
