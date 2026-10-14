@@ -39,8 +39,10 @@ type PlansListData struct {
 	MaxLimit int
 	HasMore  bool
 	// Last is the operator's creation-window filter, verbatim, for display.
-	Last  string
-	Plans []PlanSummaryData
+	Last string
+	// Continued marks a page reached with --after, past the first page.
+	Continued bool
+	Plans     []PlanSummaryData
 }
 
 // WritePlansList renders stored plans newest-first as a column table, in the
@@ -98,8 +100,29 @@ func WritePlansList(data PlansListData) {
 		fmt.Printf("\n  %s%s%s\n", ANSIDim, legend, ANSIReset)
 	}
 	if data.HasMore {
-		fmt.Printf("\n  %sShowing %d plans; more available — raise --limit (max %d) or narrow with filters%s\n",
-			ANSIDim, len(data.Plans), data.MaxLimit, ANSIReset)
+		writePlansListTruncation(data)
+	}
+}
+
+// writePlansListTruncation says how to see more of a truncated plan list.
+// Below the server's cap a larger --limit shows more; once the page is at the
+// cap, or the operator is already paging, the next page starts --after the
+// last plan this one shows.
+func writePlansListTruncation(data PlansListData) {
+	atCap := data.MaxLimit > 0 && data.Limit >= data.MaxLimit
+	last := ""
+	if len(data.Plans) > 0 {
+		last = data.Plans[len(data.Plans)-1].PlanID
+	}
+	switch {
+	case data.Continued && last != "":
+		fmt.Printf("\n  %sShowing %d more plans. Add --after %s for the next %d.%s\n", ANSIDim, len(data.Plans), last, data.Limit, ANSIReset)
+	case atCap && last != "":
+		fmt.Printf("\n  %sShowing the %d most recent plans. Add --after %s for the next %d.%s\n", ANSIDim, data.Limit, last, data.Limit, ANSIReset)
+	case atCap:
+		fmt.Printf("\n  %sShowing the %d most recent plans. This server caps the plan list at %d.%s\n", ANSIDim, data.Limit, data.MaxLimit, ANSIReset)
+	default:
+		fmt.Printf("\n  %sShowing the %d most recent plans. Use --limit N to show more.%s\n", ANSIDim, data.Limit, ANSIReset)
 	}
 }
 

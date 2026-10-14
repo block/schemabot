@@ -166,3 +166,31 @@ func TestWritePlansListAlignsChangeSummaries(t *testing.T) {
 			"CREATED column misaligned:\n%q", strings.Join(rows, "\n"))
 	}
 }
+
+// Below the server's cap a truncated plan list points at --limit. At the cap,
+// and on a page reached with --after, it names the --after plan that starts
+// the next page instead.
+func TestWritePlansListTruncatedFooter(t *testing.T) {
+	data := PlansListData{
+		Limit:    20,
+		MaxLimit: 200,
+		HasMore:  true,
+		Plans: []PlanSummaryData{{
+			PlanID: "plan-1700000000000000001", Database: "orders-db", Environment: "staging",
+			Source: "ad-hoc", CreatedAt: time.Now().Add(-time.Hour), Changes: "1 alter",
+		}},
+	}
+	underCap := captureStdout(t, func() { WritePlansList(data) })
+	assert.Contains(t, underCap, "Showing the 20 most recent plans. Use --limit N to show more.")
+	assert.NotContains(t, underCap, "--after")
+
+	data.Limit = 200
+	atCap := captureStdout(t, func() { WritePlansList(data) })
+	assert.Contains(t, atCap, "Showing the 200 most recent plans. Add --after plan-1700000000000000001 for the next 200.")
+	assert.NotContains(t, atCap, "Use --limit")
+
+	data.Limit = 20
+	data.Continued = true
+	continued := captureStdout(t, func() { WritePlansList(data) })
+	assert.Contains(t, continued, "Showing 1 more plans. Add --after plan-1700000000000000001 for the next 20.")
+}

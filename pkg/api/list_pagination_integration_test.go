@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/block/spirit/pkg/utils"
 	"github.com/stretchr/testify/assert"
@@ -231,4 +232,95 @@ func TestStatusPageWalkKeepsFilters(t *testing.T) {
 	seen, pages := server.walkStatus(t, url.Values{"environment": {"staging"}, "database": {"fleet_orders"}, "state": {"completed"}, "limit": {"30"}}, nil)
 	assert.Greater(t, len(pages), 1)
 	assertListedOnce(t, want, seen)
+}
+
+// createPagingPlan stores a plan for the plans page walk, created at the given
+// instant.
+func (s *pagingServer) createPagingPlan(t *testing.T, identifier, database string, createdAt time.Time) {
+	t.Helper()
+	_, err := s.store.Plans().Create(t.Context(), &storage.Plan{
+		PlanIdentifier: identifier,
+		Database:       database,
+		DatabaseType:   storage.DatabaseTypeMySQL,
+		Environment:    "staging",
+		Repository:     "org/repo",
+		PullRequest:    7,
+		CreatedAt:      createdAt,
+	})
+	require.NoError(t, err)
+}
+
+// The plan listing caps a page far below the status list. Walking it page by
+// page from each page's last plan lists every plan exactly once, including
+// plans that share a creation second across a page boundary, and a plan stored
+// while the walk runs is newer than every page after the first, so the walk
+// does not list it.
+func TestPlansPageWalkListsEveryPlanOnce(t *testing.T) {
+	server := newPagingServer(t)
+	base := time.Now().UTC().Truncate(time.Second).Add(-time.Hour)
+	want := map[string]bool{}
+	for i := range maxPlansLimit + 30 {
+		identifier := fmt.Sprintf("plan-walk-%04d", i)
+		// Several plans per second, so pages break inside a second.
+		server.createPagingPlan(t, identifier, "orders", base.Add(time.Duration(i/4)*time.Second))
+		want[identifier] = true
+	}
+
+	seen := map[string]int{}
+	query := url.Values{"environment": {"staging"}, "repository": {"org/repo"}, "pull_request": {"7"}, "limit": {"40"}}
+	var pages int
+	for {
+		require.Less(t, pages, 100, "the walk must end")
+		var resp apitypes.PlansResponse
+		server.get(t, "/api/plans", query, &resp)
+		pages++
+		assert.Equal(t, query.Get("starting_after"), resp.StartingAfter, "page %d names the plan it continues from", pages)
+		for _, plan := range resp.Plans {
+			seen[plan.PlanID]++
+		}
+		if !resp.HasMore {
+			break
+		}
+		if pages == 1 {
+			server.createPagingPlan(t, "plan-walk-created-mid-walk", "orders", time.Now().UTC())
+		}
+		query.Set("starting_after", resp.Plans[len(resp.Plans)-1].PlanID)
+	}
+	assert.Greater(t, pages, 5)
+	assert.Zero(t, seen["plan-walk-created-mid-walk"])
+	assertListedOnce(t, want, seen)
+}
+
+// A plans page continues only the listing its starting_after plan came from:
+// a plan that does not exist, or whose database, environment, repository, or
+// pull request differs from the request's filters, is refused with a 400 that
+// names the mismatch.
+func TestPlansPageRefusesAPlanFromAnotherListing(t *testing.T) {
+	server := newPagingServer(t)
+	server.createPagingPlan(t, "plan-orders", "orders", time.Now().UTC().Add(-time.Minute))
+
+	for _, tc := range []struct {
+		name  string
+		query url.Values
+		want  string
+	}{
+		{"unknown plan", url.Values{"starting_after": {"plan-missing"}}, "starting_after plan plan-missing does not exist; pass the last plan ID from the previous page"},
+		{"database", url.Values{"database": {"billing"}, "starting_after": {"plan-orders"}}, "starting_after plan plan-orders is for database orders, not billing; repeat the previous page's filters"},
+		{"environment", url.Values{"environment": {"production"}, "starting_after": {"plan-orders"}}, "starting_after plan plan-orders is in environment staging, not production; repeat the previous page's filters"},
+		{"repository", url.Values{"repository": {"org/other"}, "starting_after": {"plan-orders"}}, "starting_after plan plan-orders is from repository org/repo, not org/other; repeat the previous page's filters"},
+		{"pull request", url.Values{"repository": {"org/repo"}, "pull_request": {"8"}, "starting_after": {"plan-orders"}}, "starting_after plan plan-orders is from pull request 7, not 8; repeat the previous page's filters"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/plans?"+tc.query.Encode(), nil)
+			w := httptest.NewRecorder()
+			server.mux.ServeHTTP(w, req)
+			require.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
+			assert.Contains(t, w.Body.String(), tc.want)
+		})
+	}
+
+	var resp apitypes.PlansResponse
+	server.get(t, "/api/plans", url.Values{"database": {"orders"}, "environment": {"staging"}, "repository": {"org/repo"}, "pull_request": {"7"}, "starting_after": {"plan-orders"}}, &resp)
+	assert.Empty(t, resp.Plans, "nothing is older than the only plan")
+	assert.False(t, resp.HasMore)
 }

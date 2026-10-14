@@ -1158,12 +1158,19 @@ type PlanSummaryResponse struct {
 
 // PlansResponse is the HTTP response for GET /api/plans.
 type PlansResponse struct {
-	Limit    int  `json:"limit"`
-	MaxLimit int  `json:"max_limit"`
-	HasMore  bool `json:"has_more"`
+	Limit    int `json:"limit"`
+	MaxLimit int `json:"max_limit"`
+	// HasMore reports that more plans match than this page holds. Request the
+	// next page with the same filters and starting_after set to the last
+	// plan's ID.
+	HasMore bool `json:"has_more"`
 	// Last echoes the requested creation window, when one was given.
-	Last  string                 `json:"last,omitempty"`
-	Plans []*PlanSummaryResponse `json:"plans"`
+	Last string `json:"last,omitempty"`
+	// StartingAfter echoes the starting_after plan the page continues from,
+	// so a client can tell this page apart from a first page served by a
+	// server that ignores the parameter.
+	StartingAfter string                 `json:"starting_after,omitempty"`
+	Plans         []*PlanSummaryResponse `json:"plans"`
 }
 
 // StoredPlanResponse is the HTTP response for GET /api/plans/{plan_identifier}:

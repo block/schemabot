@@ -265,8 +265,9 @@ Use 'schemabot status <apply_id>' to view details
 ```
 
 Every active schema change is listed first, however long ago it started. The
-finished ones follow, newest first. Raise `--limit` to see more of them. Past the server's cap of 1,000, `status` names the apply to
-pass to `--after` for the next page; `--all` follows every page for you. The [schema intelligence guide](schema-intelligence.md#whats-running-across-the-fleet)
+finished ones follow, newest first. Raise `--limit` to see more of them. Past
+the server's cap (1,000 applies, 200 plans), `status` and `list-plans` name the
+ID to pass to `--after` for the next page; `--all` follows every page for you. The [schema intelligence guide](schema-intelligence.md#whats-running-across-the-fleet)
 shows a paged walk.
 
 Inspect one apply with `status <apply_id>` for a single snapshot, or use

@@ -1703,9 +1703,38 @@ Response excerpt from the plan request (illustrative values):
 }
 ```
 
-The list defaults to 20 plans and caps at 200. Check `has_more`; there is no
-pagination cursor. Filters narrow the recent results but do not provide an
-exhaustive search across all historical DDL.
+The list defaults to 20 plans per page and caps a page at 200, newest first.
+When more plans match, the response sets `has_more`. Request the next page
+with the same filters and `starting_after` set to the last plan's ID; repeat
+until `has_more` is false. Plans never change once stored, so a walk lists
+every matching plan exactly once, and a plan stored during the walk is newer
+than the pages after the first. A `last` window is measured from each request.
+`starting_after` must name a plan matching the `database`, `environment`,
+`repository`, and `pull_request` filters; anything else returns `400` naming
+the mismatch. The response echoes `starting_after`, as the status list does.
+Below the cap, a truncated `schemabot list-plans` says to raise `--limit`;
+once a page is at the cap, it names the plan to pass to `--after` for the next
+page. `schemabot list-plans --all` requests every page itself, 200 plans per
+request unless `-n` sets the page size:
+
+```sh
+schemabot list-plans -e staging -n 200
+```
+
+Output excerpt (illustrative values):
+
+```text
+Recent plans
+
+  PLAN ID           DATABASE  ENV      CHANGES                 CREATED      SOURCE
+  plan-example-412  shop      staging  1 alter, 2 drop · ⚠️ 2  2 hours ago  example/store#42
+  ...
+  plan-example-213  shop      staging  1 alter                 9 days ago   example/store#17
+
+  ⚠️ unsafe change
+
+  Showing the 200 most recent plans. Add --after plan-example-213 for the next 200.
+```
 
 <details>
 <summary>List stored plans</summary>

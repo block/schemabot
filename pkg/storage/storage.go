@@ -552,6 +552,24 @@ type WebhookEventStore interface {
 	TerminateStuckProcessing(ctx context.Context, reason string) (int64, error)
 }
 
+// PlanListPosition is a plan's place in the newest-first plan listing: its
+// creation time, with its row id breaking ties between plans created in the
+// same instant.
+type PlanListPosition struct {
+	CreatedAt time.Time
+	ID        int64
+}
+
+// PlanListAnchor is a plan named to continue a listing after: its place in
+// the listing and the fields that decide which listings it belongs to.
+type PlanListAnchor struct {
+	Position    PlanListPosition
+	Database    string
+	Environment string
+	Repository  string
+	PullRequest int
+}
+
 // ListPlansOptions filters and bounds a plan listing. Zero-value fields are
 // not applied, so an empty options value with a Limit lists the newest plans
 // across every database and environment.
@@ -574,6 +592,10 @@ type ListPlansOptions struct {
 	// Since, when set, restricts results to plans created at or after this
 	// instant.
 	Since time.Time
+	// StartAfter, when set, lists the plans that follow this one in the
+	// newest-first order, so a caller can walk the listing page by page.
+	// Plans never change once created, so the position is stable.
+	StartAfter *PlanListPosition
 	// Limit bounds the number of plans returned. It must be positive unless
 	// PrimaryPlanIdentifier names one review round, which bounds the listing to
 	// that round's member plans on its own; every other listing is open-ended
@@ -594,6 +616,12 @@ type PlanStore interface {
 
 	// GetByID returns a plan by ID, or nil if not found.
 	GetByID(ctx context.Context, id int64) (*Plan, error)
+
+	// GetListAnchor returns a plan's place in the plan listing and the fields
+	// a listing filters on, or nil if not found. It reads none of the stored
+	// schema or plan data, so a listing can continue after a plan without
+	// loading it.
+	GetListAnchor(ctx context.Context, planIdentifier string) (*PlanListAnchor, error)
 
 	// GetByLock is not implemented: plans carry no direct lock association,
 	// and every implementation returns ErrNotImplemented so a caller can
