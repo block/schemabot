@@ -75,6 +75,55 @@ func TestPostgresStorageParity(t *testing.T) {
 		}, postgresLockWaiter(h.db))
 	})
 	t.Run("NonUTCWriterTimesStoreTheirInstant", func(t *testing.T) { testPostgresNonUTCWriterTimesStoreTheirInstant(t, h) })
+	t.Run("FindTerminalWithInProgressCheck", func(t *testing.T) { testPostgresFindTerminalWithInProgressCheck(t, h) })
+}
+
+// testPostgresFindTerminalWithInProgressCheck verifies the stranded-check query
+// runs on Postgres: a failed apply whose stored check state is still in
+// progress is returned, and one whose check completed is not.
+func testPostgresFindTerminalWithInProgressCheck(t *testing.T, h postgresHarness) {
+	store := h.NewStorage(t)
+	ctx := t.Context()
+
+	seed := func(name, checkStatus string, planID int64) *storage.Apply {
+		lock := storagetest.CreateLock(t, store, name+"_db", storage.DatabaseTypeMySQL)
+		apply := &storage.Apply{
+			ApplyIdentifier: name,
+			LockID:          lock.ID,
+			PlanID:          planID,
+			Database:        lock.DatabaseName,
+			DatabaseType:    lock.DatabaseType,
+			Repository:      lock.Repository,
+			PullRequest:     lock.PullRequest,
+			Environment:     "staging",
+			Caller:          "org/repo#123",
+			InstallationID:  12345,
+			Engine:          storage.EngineSpirit,
+			State:           state.Apply.Failed,
+		}
+		applyID, err := store.Applies().Create(ctx, apply)
+		require.NoError(t, err)
+		apply.ID = applyID
+		require.NoError(t, store.Checks().Upsert(ctx, &storage.Check{
+			Repository:   apply.Repository,
+			PullRequest:  apply.PullRequest,
+			HeadSHA:      "abc123",
+			Environment:  apply.Environment,
+			DatabaseType: apply.DatabaseType,
+			DatabaseName: apply.Database,
+			ApplyID:      apply.ID,
+			HasChanges:   true,
+			Status:       checkStatus,
+		}))
+		return apply
+	}
+	stranded := seed("apply_pg_check_stranded", checkStatusInProgress, 740)
+	seed("apply_pg_check_completed", "completed", 741)
+
+	applies, err := store.Applies().FindTerminalWithInProgressCheck(ctx, 10)
+	require.NoError(t, err)
+	require.Len(t, applies, 1)
+	assert.Equal(t, stranded.ApplyIdentifier, applies[0].ApplyIdentifier)
 }
 
 // testPostgresNonUTCWriterTimesStoreTheirInstant verifies that a driver running
@@ -82,15 +131,14 @@ func TestPostgresStorageParity(t *testing.T) {
 // started_at and completed_at from its own clock, so the values carry its
 // location; every datetime column is a plain timestamp, which keeps only a
 // wall-clock reading. The stored reading must be the UTC one: the apply reads
-// back at the instant it finished, and a GitHub-backed apply that finished
-// moments ago with no summary comment is still inside the now()-relative
-// reconciliation window, so its terminal summary is posted after a restart.
+// back at the instant it finished, which is what every now()-relative window
+// over it, such as summary reconciliation's, is measured against.
 func testPostgresNonUTCWriterTimesStoreTheirInstant(t *testing.T, h postgresHarness) {
 	store := h.NewStorage(t)
 	ctx := t.Context()
 
 	// West of UTC, so a local wall-clock reading taken for UTC lands hours in
-	// the past, outside the reconciliation window.
+	// the past.
 	driverZone := time.FixedZone("UTC-5", -5*60*60)
 	completedAt := time.Now().In(driverZone).Truncate(time.Microsecond)
 	startedAt := completedAt.Add(-time.Minute)

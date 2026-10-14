@@ -3858,7 +3858,8 @@ func TestApplyStore_FindMissingSummaryComment_IncludesRecentlyStoppedApplies(t *
 
 	recent := seedApplyMissingSummary(t, store, "apply_stopped_recent", state.Apply.Stopped, 700)
 	stale := seedApplyMissingSummary(t, store, "apply_stopped_stale", state.Apply.Stopped, 701)
-	_, err := testDB.ExecContext(ctx, `UPDATE applies SET updated_at = NOW() - INTERVAL 2 HOUR WHERE id = ?`, stale.ID)
+	_, err := testDB.ExecContext(ctx, `UPDATE applies SET updated_at = NOW() - INTERVAL ? HOUR WHERE id = ?`,
+		int(storage.MissingSummaryLookback/time.Hour)+1, stale.ID)
 	require.NoError(t, err)
 
 	applies, err := store.Applies().FindMissingSummaryComment(ctx)
@@ -3866,6 +3867,63 @@ func TestApplyStore_FindMissingSummaryComment_IncludesRecentlyStoppedApplies(t *
 	require.Len(t, applies, 1)
 	assert.Equal(t, recent.ApplyIdentifier, applies[0].ApplyIdentifier)
 	assert.Equal(t, state.Apply.Stopped, applies[0].State)
+}
+
+// seedCheckForApply stores check state for apply's target, owned by apply,
+// with the given status.
+func seedCheckForApply(t *testing.T, store *Storage, apply *storage.Apply, status string) {
+	t.Helper()
+	require.NoError(t, store.Checks().Upsert(t.Context(), &storage.Check{
+		Repository:   apply.Repository,
+		PullRequest:  apply.PullRequest,
+		HeadSHA:      "abc123",
+		Environment:  apply.Environment,
+		DatabaseType: apply.DatabaseType,
+		DatabaseName: apply.Database,
+		ApplyID:      apply.ID,
+		HasChanges:   true,
+		Status:       status,
+	}))
+}
+
+// A terminal apply whose stored check state is still in progress is one whose
+// terminal check refresh never landed, and FindTerminalWithInProgressCheck is
+// how reconciliation finds it. A stopped apply keeps its check in progress on
+// purpose, a completed check has nothing left to repair, and an apply a newer
+// one has superseded can no longer complete the row, so none of those return.
+func TestApplyStore_FindTerminalWithInProgressCheck(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	stranded := seedApplyMissingSummary(t, store, "apply_check_stranded", state.Apply.Failed, 800)
+	seedCheckForApply(t, store, stranded, checkStatusInProgress)
+
+	completed := seedApplyMissingSummary(t, store, "apply_check_completed", state.Apply.Failed, 801)
+	seedCheckForApply(t, store, completed, "completed")
+
+	stopped := seedApplyMissingSummary(t, store, "apply_check_stopped", state.Apply.Stopped, 802)
+	seedCheckForApply(t, store, stopped, checkStatusInProgress)
+
+	superseded := seedApplyMissingSummary(t, store, "apply_check_superseded", state.Apply.Failed, 803)
+	seedCheckForApply(t, store, superseded, checkStatusInProgress)
+	newer := *superseded
+	newer.ID = 0
+	newer.ApplyIdentifier = "apply_check_superseded_newer"
+	newer.State = state.Apply.Running
+	newer.CompletedAt = nil
+	_, err := store.Applies().Create(ctx, &newer)
+	require.NoError(t, err)
+
+	applies, err := store.Applies().FindTerminalWithInProgressCheck(ctx, 10)
+	require.NoError(t, err)
+	require.Len(t, applies, 1)
+	assert.Equal(t, stranded.ApplyIdentifier, applies[0].ApplyIdentifier)
+	assert.Equal(t, state.Apply.Failed, applies[0].State)
+
+	limited, err := store.Applies().FindTerminalWithInProgressCheck(ctx, 0)
+	require.NoError(t, err)
+	assert.Empty(t, limited, "the limit bounds the batch")
 }
 
 // TestApplyStore_FindMissingSummaryComment_SummaryClaimSentinels verifies the

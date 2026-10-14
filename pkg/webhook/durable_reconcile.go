@@ -1,7 +1,10 @@
 // durable_reconcile.go implements the webhook reconciliation loop: the
 // correctness backstop for deliveries the durable inbox cannot recover on its
-// own. Each pass does two things:
+// own. Each pass does three things:
 //
+//   - Repairs terminal apply outcomes a failed publisher left undelivered: a
+//     missing summary comment, and stored check state (with its Check Run)
+//     still in progress for an apply that already finished.
 //   - Actively terminates inbox rows wedged in processing (driver hard-killed on
 //     its final attempt, lease expired, attempts at the cap) that FindNext never
 //     reclaims, emitting each as a durable failure so it surfaces in
@@ -341,12 +344,18 @@ func (h *Handler) startWebhookReconciler(ctx context.Context, stop <-chan struct
 	})
 }
 
-// reconcileWebhookInbox runs one reconciliation pass in two stages: an active
-// stuck-processing sweep that terminalizes inbox rows wedged past the attempt
-// cap, followed by a missing-delivery scan over registered repositories. The
+// reconcileWebhookInbox runs one reconciliation pass in three stages: a repair
+// of terminal apply outcomes (summary comments and Check Runs) a failed
+// publisher left undelivered, an active stuck-processing sweep that
+// terminalizes inbox rows wedged past the attempt cap, then a missing-delivery
+// scan over registered repositories. The
 // scan reports every open PR head with no inbox delivery and, when synthesis
 // is enabled, recovers each miss by enqueueing a synthesized inbox row.
 func (h *Handler) reconcileWebhookInbox(ctx context.Context) {
+	// Terminal outcomes are repaired from apply and check state, not from the
+	// inbox or the repo registry, so they run before either gate below.
+	h.ReconcileTerminalApplyOutcomes(ctx)
+
 	store := h.webhookEventStore()
 	if store == nil {
 		h.logger.Warn("webhook reconciler skipped because webhook event storage is unavailable")

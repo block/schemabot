@@ -84,6 +84,14 @@ func (s *emptyApplyStore) GetByApplyIdentifier(ctx context.Context, applyIdentif
 	return nil, nil
 }
 
+func (s *emptyApplyStore) FindMissingSummaryComment(context.Context) ([]*storage.Apply, error) {
+	return nil, nil
+}
+
+func (s *emptyApplyStore) FindTerminalWithInProgressCheck(context.Context, int) ([]*storage.Apply, error) {
+	return nil, nil
+}
+
 type failingStorage struct {
 	emptyStorage
 }

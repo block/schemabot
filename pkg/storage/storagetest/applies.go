@@ -1228,6 +1228,10 @@ func TestApplies(t *testing.T, h Harness) {
 			_, err := store.FindMissingSummaryComment(t.Context())
 			return err
 		},
+		"FindTerminalWithInProgressCheck_DBError": func(t *testing.T, store storage.ApplyStore) error {
+			_, err := store.FindTerminalWithInProgressCheck(t.Context(), 10)
+			return err
+		},
 		"GetByPR_DBError": func(t *testing.T, store storage.ApplyStore) error {
 			_, err := store.GetByPR(t.Context(), "org/repo", 1)
 			return err

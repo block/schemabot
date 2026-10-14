@@ -3329,9 +3329,9 @@ func (s *applyStore) GetByDatabase(ctx context.Context, database, dbType, enviro
 // storage.SummaryClaimStaleAfter (the publisher claimed, then crashed before
 // posting). A fresh sentinel is an in-flight publish and is left alone.
 //
-// Recency is judged per state family: most terminal states stamp completed_at,
-// but a stopped apply is resumable and keeps completed_at NULL, so it qualifies
-// by updated_at instead.
+// Recency (storage.MissingSummaryLookback) is judged per state family: most
+// terminal states stamp completed_at, but a stopped apply is resumable and keeps
+// completed_at NULL, so it qualifies by updated_at instead.
 func (s *applyStore) FindMissingSummaryComment(ctx context.Context) ([]*storage.Apply, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT `+applyColumnsForApplyAlias+`
@@ -3342,8 +3342,8 @@ func (s *applyStore) FindMissingSummaryComment(ctx context.Context) ([]*storage.
 		  AND a.pull_request > 0
 		  AND a.installation_id > 0
 		  AND (
-			(a.state IN (?, ?, ?, ?) AND a.completed_at > `+s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime, LiteralIntervalAmount(1), IntervalHour)+`)
-			OR (a.state = ? AND a.updated_at > `+s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime, LiteralIntervalAmount(1), IntervalHour)+`)
+			(a.state IN (?, ?, ?, ?) AND a.completed_at > `+s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime, LiteralIntervalAmount(missingSummaryLookbackHours), IntervalHour)+`)
+			OR (a.state = ? AND a.updated_at > `+s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime, LiteralIntervalAmount(missingSummaryLookbackHours), IntervalHour)+`)
 		  )
 		  AND (
 			acs.id IS NULL
@@ -3367,6 +3367,56 @@ func (s *applyStore) FindMissingSummaryComment(ctx context.Context) ([]*storage.
 		applies = append(applies, apply)
 	}
 	return applies, rows.Err()
+}
+
+// missingSummaryLookbackHours is storage.MissingSummaryLookback in the whole
+// hours the interval literal takes.
+const missingSummaryLookbackHours = uint64(storage.MissingSummaryLookback / time.Hour)
+
+// FindTerminalWithInProgressCheck returns terminal applies whose stored check
+// state still names them as the in-progress apply. The newer-apply guard
+// mirrors CompleteForApply's, so an apply the refresh could not complete is
+// never returned.
+func (s *applyStore) FindTerminalWithInProgressCheck(ctx context.Context, limit int) ([]*storage.Apply, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT `+applyColumnsForApplyAlias+`
+		FROM checks c
+		JOIN applies a ON a.id = c.apply_id
+		WHERE c.status = ?
+		  AND a.repository != ''
+		  AND a.pull_request > 0
+		  AND a.installation_id > 0
+		  AND a.state IN (?, ?, ?, ?)
+		  AND NOT EXISTS (
+		    SELECT 1
+		    FROM applies newer
+		    WHERE newer.repository = c.repository
+		      AND newer.pull_request = c.pull_request
+		      AND newer.environment = c.environment
+		      AND newer.database_type = c.database_type
+		      AND newer.database_name = c.database_name
+		      AND newer.id > a.id
+		  )
+		ORDER BY a.updated_at DESC
+		LIMIT ?
+	`, checkStatusInProgress, state.Apply.Completed, state.Apply.Failed, state.Apply.Reverted, state.Apply.Cancelled, limit)
+	if err != nil {
+		return nil, fmt.Errorf("find terminal applies with in-progress stored check state: %w", err)
+	}
+	defer utils.CloseAndLog(rows)
+
+	var applies []*storage.Apply
+	for rows.Next() {
+		apply, err := scanApplyInto(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan terminal apply with in-progress stored check state: %w", err)
+		}
+		applies = append(applies, apply)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate terminal applies with in-progress stored check state: %w", err)
+	}
+	return applies, nil
 }
 
 // GetByPR returns all applies for a PR.

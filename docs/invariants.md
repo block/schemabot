@@ -1536,9 +1536,12 @@ ordinary claim path will only reclaim a marker that records an already-posted co
 in-flight sentinel would hand two writers the same claim, which is the unbounded duplication this
 invariant does rule out. *Enforced:* the atomic summary claim and its stale-claim recovery
 (`pkg/storage/internal/sqlstore/apply_comments.go`), the observer claims in the drive and
-recovery paths (`pkg/webhook/comment_observer.go`, `pkg/webhook/handler.go`), and the retryable
+recovery paths (`pkg/webhook/comment_observer.go`, `pkg/webhook/handler.go`), the retryable
 expiry pass, which publishes for each apply it moves to failed (`runRetryableExpiryPass` in
-`pkg/api/reaper.go`).
+`pkg/api/reaper.go`), and terminal outcome reconciliation, which at startup and on every webhook
+reconcile pass posts missing summaries and completes stored check state a terminal apply left in
+progress (`ReconcileTerminalApplyOutcomes` in `pkg/webhook/handler.go`, run from
+`pkg/webhook/durable_reconcile.go`).
 
 ## Review integrity and data safety (RV)
 
