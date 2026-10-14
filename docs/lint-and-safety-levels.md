@@ -231,9 +231,11 @@ comment is the *gate firing*. Same data, two moments in time:
 
 So ⚠️ always means "review this before you apply", and ⛔ always means "your
 command was refused". Once an apply *is* acknowledged with `--allow-unsafe`,
-the locked apply comment omits the Issues section — the acknowledgment already
-happened — and carries `--allow-unsafe` forward on the confirm command it
-renders.
+the comment of an apply already running omits the Issues section: the
+acknowledgment already happened, and the DDL on that comment shows what the
+apply runs. A paused apply's comment still lists them, since its
+`apply-confirm` carries `--allow-unsafe` forward and the plan can have changed
+since the operator opted in.
 
 ## Blocked changes (⛔ Cannot apply)
 
