@@ -1131,7 +1131,7 @@ func claimableParentArgs() []any {
 // at the cutover barrier clears its lease and backdates its heartbeat, so it is
 // parked, not occupying anything.
 //
-// The cap is a filter on the pending arm only, never a sort key. Sorting by the
+// The cap is a filter on the arms that start work, never a sort key. Sorting by the
 // count would replace the indexed (created_at, id) walk with a full sort that
 // evaluates a correlated subquery per row, which is the claim cost the ordering
 // index exists to avoid. Filtering keeps the index walk: a driver steps past a
@@ -1156,11 +1156,13 @@ const freshLeaseCountSQL = `(
 // be claimed in" and "states in which a driver occupies an operation" are
 // different questions that only mostly overlap.
 //
-// failed_retryable is where they part. A redispatched operation keeps that
-// state for its whole drive — the claim rotates the lease and leaves the state
-// alone, and the row is not rewritten until the drive settles it — so a driver
-// really is occupying it the entire time. Counting it is what keeps a retry
-// sweep from running the apply at twice its cap.
+// failed_retryable is where they part. A row redispatched under a parent-lease
+// drive keeps that state for its whole drive — the claim rotates the lease and
+// leaves the state alone, and the row is not rewritten until the drive settles
+// it — so a driver really is occupying it the entire time. Counting it is what
+// keeps a retry sweep from running the apply at twice its cap. An
+// operation-lease redispatch moves its row to running instead, which the cap
+// already counts.
 func driverOccupyingOperationStates() []string {
 	return append(claimableApplyStates(), state.ApplyOperation.FailedRetryable)
 }
@@ -1380,12 +1382,15 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 	// than maxDriversPerApply fresh operation leases.
 	//
 	// The cap gates every arm that *starts* work — this pending arm, the
-	// stopped+start resume arm, and the deferred-deploy arm — because all three
-	// admit an apply's siblings onto drivers, and an uncapped one is a way around
-	// the bound rather than an exception to it. A stop/start cycle is the shape
+	// stopped+start resume arm, the deferred-deploy arm, and the deliberate
+	// redispatch half of the failed_retryable arm — because all four admit an
+	// apply's siblings onto drivers, and an uncapped one is a way around the
+	// bound rather than an exception to it. A stop/start cycle is the shape
 	// that matters: stop bulk-moves every pending row to stopped, so an uncapped
 	// resume arm would make all of them claimable at once and hand one apply the
-	// whole pool durably, which is the starvation this exists to prevent.
+	// whole pool durably, which is the starvation this exists to prevent. A
+	// retry sweep is the same shape: an outage that leaves every deployment
+	// failed_retryable would otherwise redispatch all of them at once.
 	//
 	// The recovery and control-request arms stay uncapped: a capped-out apply
 	// still has to be able to re-lease a crashed operation and to consume a
@@ -1393,9 +1398,10 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 	// cap itself the thing that wedges the apply it is bounding.
 	//
 	// Capping a start arm cannot wedge either, because the states it admits work
-	// into (resuming, running) are themselves counted: each resumed operation
-	// drops out of the count as it settles, so the rest drain behind it exactly
-	// as the pending arm's do.
+	// into (resuming, running, and a single-operation redispatch's leased
+	// failed_retryable) are themselves counted: each operation drops out of the
+	// count as it settles, so the rest drain behind it exactly as the pending
+	// arm's do.
 	queryArgs = append(queryArgs, driverCapArgs...)
 	queryArgs = append(queryArgs, stringArgs(activeStates)...)
 	// Stale-active barrier-park exemption (see the staleness clause below): a
@@ -1442,6 +1448,19 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 	queryArgs = append(queryArgs,
 		state.ApplyOperation.Stopped,
 		storage.ControlOperationCancel, storage.ControlRequestPending)
+	// A barrier-parked operation is driven by nothing: its copy drive exits at
+	// the barrier, the stale-active arm leaves it to the cutover claim, and the
+	// cutover claim will not start it behind a failed earlier sibling under
+	// halt, nor while the rollout is being stopped. A pending cancel or stop
+	// must still reach it, so the drive that delivers the request claims it
+	// here: without it the parked row never settles, the parent never derives
+	// stopped or cancelled, and the request is never completed. The claim
+	// leaves the row parked, so it carries the rematch guard; the drive moves
+	// it out of waiting_for_cutover once the request lands.
+	queryArgs = append(queryArgs,
+		state.ApplyOperation.WaitingForCutover,
+		storage.CutoverPolicyBarrier, storage.CutoverPolicyParallel,
+		storage.ControlOperationCancel, storage.ControlOperationStop, storage.ControlRequestPending)
 	// Deferred-deploy start gate keys on the PARENT apply state, not the
 	// operation state: the operation row stays active (running) while the apply
 	// parks at waiting_for_deploy, because the copy phase finished and only the
@@ -1456,6 +1475,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 	queryArgs = append(queryArgs, driverCapArgs...)
 	queryArgs = append(queryArgs, state.ApplyOperation.FailedRetryable)
 	queryArgs = append(queryArgs, state.Apply.FailedRetryable, maxRecoveryAttempts, retryableRecoveryFreshnessDays)
+	queryArgs = append(queryArgs, driverCapArgs...)
 	queryArgs = append(queryArgs, stringArgs(activeStates)...)
 
 	// The stopped-row and failed_retryable clauses mirror ApplyStore.ClaimApplyByID.
@@ -1471,6 +1491,14 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 	//     pending cancel request is reclaimable so the drive can terminalize it.
 	//     The cancel arm carries the rematch guard because its claim can leave
 	//     the row stopped; see requestRematchGuardSQL.
+	//
+	//   - An operation parked at the cutover barrier of a multi-operation
+	//     apply whose parent has a pending cancel or stop request is
+	//     reclaimable so the drive can deliver it to the engine holding the
+	//     parked copy.
+	//     Nothing else drives a parked row before its cutover turn, and under
+	//     halt that turn never comes. The arm carries the rematch guard because
+	//     the claim leaves the row parked.
 	//
 	//   - An active operation whose PARENT apply is waiting_for_deploy and has a
 	//     pending start request is reclaimable so the operator can trigger the
@@ -1531,14 +1559,15 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 	// a gated one would be redundant with the pending clause below. Start
 	// requests resume eligible work; they do not reorder the rollout.
 	retryFreshnessCutoff := s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime, ParameterIntervalAmount(), IntervalDay)
-	// The two guarded arms differ in the equal-timestamp case for the same reason
+	// The guarded arms differ in the equal-timestamp case for the same reason
 	// they do in ApplyStore.ClaimApplyByID: the stopped+cancel claim moves the row
 	// out of stopped atomically with its lease rotation, so no peer can match it
 	// in the same second and it can admit an equal timestamp; the
-	// waiting_for_deploy claim leaves the row where it is and must refuse one.
-	// See leaseRematchComparison.
+	// waiting_for_deploy and parked claims leave the row where it is and
+	// must refuse one. See leaseRematchComparison.
 	deferredDeployGuard := requestRematchGuardSQL("apply_operations", rematchOnlyAfterLease, staleClaimCutoff)
 	stoppedCancelGuard := requestRematchGuardSQL("apply_operations", rematchAtOrAfterLease, staleClaimCutoff)
+	parkedControlGuard := requestRematchGuardSQL("apply_operations", rematchOnlyAfterLease, staleClaimCutoff)
 	row := tx.QueryRowContext(ctx, fmt.Sprintf(`
 		SELECT %s
 		FROM apply_operations
@@ -1603,6 +1632,24 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 				)
 			)
 			OR (
+				state = ?
+				AND cutover_policy IN (?, ?)
+				AND EXISTS (
+					SELECT 1
+					FROM apply_operations AS sibling
+					WHERE sibling.apply_id = apply_operations.apply_id
+						AND sibling.id <> apply_operations.id
+				)
+				AND EXISTS (
+					SELECT 1
+					FROM apply_control_requests cr
+					WHERE cr.apply_id = apply_operations.apply_id
+						AND cr.operation IN (?, ?)
+						AND cr.status = ?
+						AND `+parkedControlGuard+`
+				)
+			)
+			OR (
 				state IN (%s)
 				AND EXISTS (
 					SELECT 1
@@ -1631,6 +1678,10 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 								a.state = ?
 								AND a.attempt < ?
 								AND a.updated_at >= %s
+								-- Names no column of a, but belongs to this arm
+								-- alone: a deliberate redispatch starts work, so
+								-- it is capped; crash recovery below is not.
+								AND `+driverCap+`
 							)
 							OR (
 								a.state IN (%s)
@@ -1745,32 +1796,33 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 		}
 
 		// Re-claiming a failed_retryable operation is a redispatch, so consume one
-		// unit of the parent apply's retry budget. Only multi-operation applies are
-		// charged here: a single-operation apply's parent attempt is incremented by
-		// the ClaimApplyByID its drive performs, so bumping here too would
-		// double-count. Without this, an operation-only multi-deployment retry never
-		// advances applies.attempt, so ExpireRetryable's budget path never fires and
-		// a permanently failing deployment retries forever — stranding a healthy
-		// sibling parked at the cutover barrier under on_failure "continue". The
-		// EXISTS-sibling guard selects multi-op, and the failed_retryable parent
-		// guard keeps this to genuine redispatches (a terminal-failed parent never
-		// re-leases its operations). The attempt < budget guard makes the
-		// increment idempotent once the budget is spent: two operators can claim
-		// different failed_retryable operations of the same apply concurrently, and
-		// the row lock this UPDATE takes serializes them, so the second sees the
-		// already-incremented attempt and does not overshoot maxRecoveryAttempts.
+		// unit of the parent apply's retry budget. Only operations the operator
+		// drives under the operation lease are charged here (see
+		// redispatchDrivesUnderOperationLease): a parent-lease drive increments the
+		// parent attempt in the ClaimApplyByID it performs, so bumping here too
+		// would double-count. Without this, an operation-lease retry never
+		// advances applies.attempt, so ExpireRetryable's budget path never fires
+		// and a permanently failing deployment retries forever — stranding a
+		// healthy sibling parked at the cutover barrier under on_failure
+		// "continue". The failed_retryable parent guard keeps this to genuine
+		// redispatches (a terminal-failed parent never re-leases its operations).
+		// The attempt < budget guard makes the increment idempotent once the
+		// budget is spent: two operators can claim different failed_retryable
+		// operations of the same apply concurrently, and the row lock this UPDATE
+		// takes serializes them, so the second sees the already-incremented
+		// attempt and does not overshoot maxRecoveryAttempts.
 		if ad.State == state.ApplyOperation.FailedRetryable {
 			// Advance the operation's own attempt only on a genuine deliberate
 			// redispatch — the parent apply is still failed_retryable. A
 			// failed_retryable child is also re-claimed for crash recovery when
 			// the parent apply is already active (running) with a stale heartbeat
 			// (its retry was admitted, then the driver crashed); that re-lease
-			// must leave attempt untouched so the orphaned dispatch's idempotency
-			// key stays stable and is reused, not duplicated. The parent-state
+			// must leave attempt untouched so the count records only deliberate
+			// retries. The dispatch idempotency key does not read it. The parent-state
 			// gate mirrors the budget bump below; the join lets one statement both
 			// test the parent state and write the child row. Unlike the budget
-			// bump this is not gated on multi-operation: attempt is
-			// operation-local and a sibling's retry must never rotate it.
+			// bump this is not gated on the drive mode: attempt is
+			// operation-local and a sibling's retry must never advance it.
 			attemptBump := s.dialect.JoinedUpdate(
 				"apply_operations", "o", "applies", "a", "a.id = o.apply_id",
 				[]JoinedUpdateAssignment{
@@ -1791,18 +1843,43 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 				ad.Attempt++
 			}
 
-			if _, err := tx.ExecContext(ctx, `
-				UPDATE applies
-				SET attempt = attempt + 1, updated_at = NOW()
-				WHERE id = ?
-					AND state = ?
-					AND attempt < ?
-					AND EXISTS (
-						SELECT 1 FROM apply_operations o
-						WHERE o.apply_id = applies.id AND o.id <> ?
-					)
-			`, ad.ApplyID, state.Apply.FailedRetryable, maxRecoveryAttempts, ad.ID); err != nil {
-				return nil, fmt.Errorf("consume retry budget for apply_operation %d redispatch: %w", ad.ID, err)
+			underOperationLease, err := redispatchDrivesUnderOperationLease(ctx, tx, ad)
+			if err != nil {
+				return nil, err
+			}
+			if underOperationLease {
+				if _, err := tx.ExecContext(ctx, `
+					UPDATE applies
+					SET attempt = attempt + 1, updated_at = NOW()
+					WHERE id = ?
+						AND state = ?
+						AND attempt < ?
+				`, ad.ApplyID, state.Apply.FailedRetryable, maxRecoveryAttempts); err != nil {
+					return nil, fmt.Errorf("consume retry budget for apply_operation %d redispatch: %w", ad.ID, err)
+				}
+
+				// An operation-lease redispatch must move the row out of
+				// failed_retryable atomically with the lease rotation, for the
+				// same reason the stopped claim moves its row to resuming: the
+				// redispatch arm is budget-gated, not heartbeat-gated, and nothing
+				// else closes it. A parent-lease retry is closed by its parent
+				// claim's failed_retryable -> running transition, but an
+				// operation-lease parent is owned by the rollout projection and
+				// stays failed_retryable while any operation is, so a row left
+				// failed_retryable would be re-leased on every poll, rotating the
+				// live driver's lease out from under it and starving every
+				// failed_retryable sibling behind it. As running, the row is
+				// re-leasable only by the heartbeat-guarded stale-active arm,
+				// which recovers a crashed drive.
+				moved, err := moveRedispatchToRunning(ctx, tx, ad)
+				if err != nil {
+					return nil, err
+				}
+				if moved {
+					ad.State = state.ApplyOperation.Running
+					ad.ErrorMessage = ""
+					ad.CompletedAt = nil
+				}
 			}
 		}
 	}
@@ -1816,6 +1893,74 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 	ad.LeaseAcquiredAt = &leaseAcquiredAt
 
 	return ad, nil
+}
+
+// redispatchDrivesUnderOperationLease reports whether the operator will drive
+// a redispatched operation under its operation lease, with the rollout
+// projection owning the parent, rather than under a parent-lease drive that
+// claims the parent itself. It mirrors the operator's drive-mode decision
+// (recoverApplyOperation in pkg/api): the operation lease applies when the
+// apply has other attached operations, when its generation manifest still
+// expects an operation that has not attached, or when the operation has no
+// tasks to drive a parent claim from. Each check is its own read because
+// MySQL refuses an UPDATE whose subquery reads the table being updated.
+func redispatchDrivesUnderOperationLease(ctx context.Context, tx *rebindTx, ad *storage.ApplyOperation) (bool, error) {
+	var siblings int
+	if err := tx.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM apply_operations WHERE apply_id = ? AND id <> ?
+	`, ad.ApplyID, ad.ID).Scan(&siblings); err != nil {
+		return false, fmt.Errorf("count siblings of redispatched apply_operation %d: %w", ad.ID, err)
+	}
+	if siblings > 0 {
+		return true, nil
+	}
+
+	var manifestJSON []byte
+	if err := tx.QueryRowContext(ctx, `SELECT expected_operation_keys FROM applies WHERE id = ?`, ad.ApplyID).Scan(&manifestJSON); err != nil {
+		return false, fmt.Errorf("load generation manifest for redispatched apply_operation %d: %w", ad.ID, err)
+	}
+	if len(manifestJSON) > 0 {
+		parent := &storage.Apply{}
+		if err := json.Unmarshal(manifestJSON, &parent.ExpectedOperationKeys); err != nil {
+			return false, fmt.Errorf("unmarshal expected_operation_keys for redispatched apply_operation %d: %w", ad.ID, err)
+		}
+		if len(parent.MissingExpectedOperationKeys([]*storage.ApplyOperation{ad})) > 0 {
+			return true, nil
+		}
+	}
+
+	var tasks int
+	if err := tx.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM tasks WHERE apply_operation_id = ?
+	`, ad.ID).Scan(&tasks); err != nil {
+		return false, fmt.Errorf("count tasks of redispatched apply_operation %d: %w", ad.ID, err)
+	}
+	return tasks == 0, nil
+}
+
+// moveRedispatchToRunning moves a failed_retryable operation to running when
+// its parent is still failed_retryable, which is what makes the claim a
+// deliberate redispatch rather than crash recovery. It reports whether the row
+// moved.
+func moveRedispatchToRunning(ctx context.Context, tx *rebindTx, ad *storage.ApplyOperation) (bool, error) {
+	res, err := tx.ExecContext(ctx, `
+		UPDATE apply_operations
+		SET state = ?, error_message = '', completed_at = NULL, updated_at = NOW()
+		WHERE id = ?
+			AND state = ?
+			AND EXISTS (
+				SELECT 1 FROM applies a
+				WHERE a.id = apply_operations.apply_id AND a.state = ?
+			)
+	`, state.ApplyOperation.Running, ad.ID, state.ApplyOperation.FailedRetryable, state.Apply.FailedRetryable)
+	if err != nil {
+		return false, fmt.Errorf("move redispatched apply_operation %d to running: %w", ad.ID, err)
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("read redispatch rows affected for apply_operation %d: %w", ad.ID, err)
+	}
+	return rows > 0, nil
 }
 
 // FindNextApplyOperationCutover atomically claims the next operation parked at
@@ -2208,36 +2353,87 @@ func (s *applyOperationStore) DeleteByApply(ctx context.Context, applyID int64) 
 // Writes are apply-lease guarded when a lease is present in ctx, mirroring
 // DeleteByApply.
 func (s *applyOperationStore) MarkPendingStoppedByApply(ctx context.Context, applyID int64) (int64, error) {
+	return s.markPendingByApply(ctx, applyID, state.ApplyOperation.Stopped, "stop", pendingRows)
+}
+
+// MarkPendingCancelledByApply transitions every operation of an apply that
+// never started to cancelled, returning the number of rows changed: the
+// pending ones, and the ones a stop moved from pending to stopped before any
+// driver claimed them. Neither changed anything on its target, so nothing has
+// to be stopped there. The claim gate would only ever refuse a pending one once
+// the rollout settles, and the rollout settles cancelled without waiting on a
+// never-started stopped one, so either left alone would outlive the cancelled
+// apply. Cancelled is final, so completed_at is stamped. A stopped operation
+// that had started is left to the drive that delivers the cancel to it, and
+// writes are lease guarded exactly as MarkPendingStoppedByApply's.
+func (s *applyOperationStore) MarkPendingCancelledByApply(ctx context.Context, applyID int64) (int64, error) {
+	return s.markPendingByApply(ctx, applyID, state.ApplyOperation.Cancelled, "cancel", neverStartedRows)
+}
+
+// sweptRows selects the operation rows a bulk sweep of an apply settles. The
+// predicate names its columns through the given prefix, "" or a table alias
+// with its trailing dot.
+type sweptRows struct {
+	predicate func(prefix string) string
+	args      []any
+}
+
+// pendingRows are the operations no driver has claimed yet.
+var pendingRows = sweptRows{
+	predicate: func(prefix string) string { return prefix + "state = ?" },
+	args:      []any{state.ApplyOperation.Pending},
+}
+
+// neverStartedRows are the pending operations plus the stopped ones that never
+// started, which a stop reached while they were still pending.
+var neverStartedRows = sweptRows{
+	predicate: func(prefix string) string {
+		return "(" + prefix + "state = ? OR (" + prefix + "state = ? AND " + prefix + "started_at IS NULL))"
+	},
+	args: []any{state.ApplyOperation.Pending, state.ApplyOperation.Stopped},
+}
+
+// markPendingByApply moves the swept operations of an apply to newState,
+// stamping completed_at when newState is terminal and not resumable.
+func (s *applyOperationStore) markPendingByApply(ctx context.Context, applyID int64, newState, verb string, swept sweptRows) (int64, error) {
+	assignments := []JoinedUpdateAssignment{
+		{Column: "state", Expr: "?"},
+		{Column: "updated_at", Expr: "NOW()"},
+	}
+	plainSet := "state = ?, updated_at = NOW()"
+	if newState != state.ApplyOperation.Stopped {
+		assignments = append(assignments, JoinedUpdateAssignment{Column: "completed_at", Expr: "NOW()"})
+		plainSet += ", completed_at = NOW()"
+	}
 	// An operation-lease-only drive (fan-out multi-operation mode) holds no
 	// parent apply lease, but it is still an authorized driver of the apply's
 	// rollout and may terminalize the apply's still-pending sibling operations
-	// under a pending stop. Authorize the bulk stop by joining the owning
-	// operation row and requiring it still carries the lease token, so a
-	// displaced driver that lost its lease fails closed instead of stopping
+	// under a pending stop or cancel. Authorize the bulk write by joining the
+	// owning operation row and requiring it still carries the lease token, so a
+	// displaced driver that lost its lease fails closed instead of moving
 	// siblings it no longer owns. Operation lease takes precedence over the
 	// parent apply lease, matching operationWriteGuardFromContext.
 	if opLease, ok := storage.OperationLeaseFromContext(ctx); ok {
 		if !opLease.Valid() {
-			return 0, fmt.Errorf("invalid operation lease for stopping pending apply_operations of apply %d: %w", applyID, storage.ErrApplyLeaseLost)
+			return 0, fmt.Errorf("invalid operation lease for %s of pending apply_operations of apply %d: %w", verb, applyID, storage.ErrApplyLeaseLost)
 		}
 		if opLease.ApplyID != applyID {
-			return 0, fmt.Errorf("operation lease for apply %d does not authorize stopping pending operations of apply %d: %w", opLease.ApplyID, applyID, storage.ErrApplyLeaseLost)
+			return 0, fmt.Errorf("operation lease for apply %d does not authorize %s of pending operations of apply %d: %w", opLease.ApplyID, verb, applyID, storage.ErrApplyLeaseLost)
 		}
 		query := s.dialect.JoinedUpdate(
 			"apply_operations", "ao", "apply_operations", "owner_op", "owner_op.apply_id = ao.apply_id",
-			[]JoinedUpdateAssignment{
-				{Column: "state", Expr: "?"},
-				{Column: "updated_at", Expr: "NOW()"},
-			},
-			"ao.apply_id = ? AND ao.state = ? AND owner_op.id = ? AND "+s.dialect.LeaseTokenFence("apply_operations", "owner_op", "id", "lease_token"),
+			assignments,
+			"ao.apply_id = ? AND "+swept.predicate("ao.")+" AND owner_op.id = ? AND "+s.dialect.LeaseTokenFence("apply_operations", "owner_op", "id", "lease_token"),
 		)
-		result, err := s.db.ExecContext(ctx, query, state.ApplyOperation.Stopped, applyID, state.ApplyOperation.Pending, opLease.OperationID, opLease.Token)
+		args := append([]any{newState, applyID}, swept.args...)
+		args = append(args, opLease.OperationID, opLease.Token)
+		result, err := s.db.ExecContext(ctx, query, args...)
 		if err != nil {
-			return 0, fmt.Errorf("stop pending apply_operations for apply %d under operation lease: %w", applyID, err)
+			return 0, fmt.Errorf("%s pending apply_operations for apply %d under operation lease: %w", verb, applyID, err)
 		}
 		rows, err := result.RowsAffected()
 		if err != nil {
-			return 0, fmt.Errorf("read stopped pending apply_operations rows affected for apply %d: %w", applyID, err)
+			return 0, fmt.Errorf("read %s pending apply_operations rows affected for apply %d: %w", verb, applyID, err)
 		}
 		if rows == 0 {
 			// No pending rows changed: either there were none (lease still
@@ -2255,36 +2451,36 @@ func (s *applyOperationStore) MarkPendingStoppedByApply(ctx context.Context, app
 	if err != nil {
 		return 0, err
 	}
-	if !hasLease {
-		result, err := s.db.ExecContext(ctx, `
-			UPDATE apply_operations
-			SET state = ?, updated_at = NOW()
-			WHERE apply_id = ? AND state = ?
-		`, state.ApplyOperation.Stopped, applyID, state.ApplyOperation.Pending)
+	if hasLease {
+		query := s.dialect.JoinedUpdate(
+			"apply_operations", "ao", "applies", "a", "a.id = ao.apply_id",
+			assignments,
+			"ao.apply_id = ? AND "+swept.predicate("ao.")+" AND "+s.dialect.LeaseTokenFence("applies", "a", "id", "lease_token"),
+		)
+		args := append([]any{newState, applyID}, swept.args...)
+		args = append(args, lease.Token)
+		result, err := s.db.ExecContext(ctx, query, args...)
 		if err != nil {
-			return 0, fmt.Errorf("stop pending apply_operations for apply %d: %w", applyID, err)
+			return 0, fmt.Errorf("%s pending apply_operations for apply %d: %w", verb, applyID, err)
 		}
-		rows, err := result.RowsAffected()
+		rows, err := confirmLeaseOnZeroRows(ctx, s.db, result, lease, verb+" pending apply_operations", fmt.Sprintf("apply %d", applyID))
 		if err != nil {
-			return 0, fmt.Errorf("read stopped pending apply_operations rows affected for apply %d: %w", applyID, err)
+			return 0, err
 		}
 		return rows, nil
 	}
-	query := s.dialect.JoinedUpdate(
-		"apply_operations", "ao", "applies", "a", "a.id = ao.apply_id",
-		[]JoinedUpdateAssignment{
-			{Column: "state", Expr: "?"},
-			{Column: "updated_at", Expr: "NOW()"},
-		},
-		"ao.apply_id = ? AND ao.state = ? AND "+s.dialect.LeaseTokenFence("applies", "a", "id", "lease_token"),
-	)
-	result, err := s.db.ExecContext(ctx, query, state.ApplyOperation.Stopped, applyID, state.ApplyOperation.Pending, lease.Token)
+	args := append([]any{newState, applyID}, swept.args...)
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE apply_operations
+		SET `+plainSet+`
+		WHERE apply_id = ? AND `+swept.predicate("")+`
+	`, args...)
 	if err != nil {
-		return 0, fmt.Errorf("stop pending apply_operations for apply %d: %w", applyID, err)
+		return 0, fmt.Errorf("%s pending apply_operations for apply %d: %w", verb, applyID, err)
 	}
-	rows, err := confirmLeaseOnZeroRows(ctx, s.db, result, lease, "stopped pending apply_operations", fmt.Sprintf("apply %d", applyID))
+	rows, err := result.RowsAffected()
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("read %s pending apply_operations rows affected for apply %d: %w", verb, applyID, err)
 	}
 	return rows, nil
 }
@@ -2396,11 +2592,11 @@ func unleasedOperationGate(d Dialect) string {
 // where the parent is selected.
 //
 // It reads the lease and nothing else, because state does not tell the two
-// meanings of a lease apart. A redispatched operation keeps its failed_retryable
-// state for the whole drive — the claim rotates the lease and leaves the state
-// alone — so any state filter that admits failed_retryable admits an apply a
-// driver is part-way through retrying, which is the one case a whole-apply write
-// must not land under. Filtering it out instead would exclude the retry but not
+// meanings of a lease apart. A redispatched single-operation row keeps its
+// failed_retryable state for the whole drive — the claim rotates the lease and
+// leaves the state alone — so any state filter that admits failed_retryable
+// admits an apply a driver is part-way through retrying, which is the one case a
+// whole-apply write must not land under. Filtering it out instead would exclude the retry but not
 // the drive.
 //
 // Reading the lease alone only terminalizes because a drive clears its lease as

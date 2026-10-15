@@ -219,6 +219,8 @@ type staticPlanStore struct {
 	// listed by the round the apply was created from.
 	memberPlans []*storage.Plan
 	err         error
+	// errByID fails GetByID for the listed plan IDs only.
+	errByID map[int64]error
 }
 
 func (s *staticPlanStore) List(_ context.Context, opts storage.ListPlansOptions) ([]*storage.Plan, error) {
@@ -244,6 +246,9 @@ func (s *staticPlanStore) Get(context.Context, string) (*storage.Plan, error) {
 func (s *staticPlanStore) GetByID(_ context.Context, id int64) (*storage.Plan, error) {
 	if s.err != nil {
 		return nil, s.err
+	}
+	if err := s.errByID[id]; err != nil {
+		return nil, err
 	}
 	if s.plansByID != nil {
 		return s.plansByID[id], nil
@@ -425,6 +430,13 @@ func (s *memoryControlRequestStore) RequestPending(_ context.Context, req *stora
 	stored.ID = s.nextID
 	s.requests = append(s.requests, stored)
 	return cloneControlRequest(stored), false, nil
+}
+
+func (s *memoryControlRequestStore) RequestPendingSuperseding(ctx context.Context, req *storage.ApplyControlRequest, superseded storage.ControlOperation) (*storage.ApplyControlRequest, bool, error) {
+	if err := s.CompletePending(ctx, req.ApplyID, superseded); err != nil {
+		return nil, false, err
+	}
+	return s.RequestPending(ctx, req)
 }
 
 func (s *memoryControlRequestStore) GetPending(_ context.Context, applyID int64, operation storage.ControlOperation) (*storage.ApplyControlRequest, error) {
@@ -5169,6 +5181,69 @@ func TestValidateRollbackSourceApplyRejectsPlannerSourceMismatchForOlderApply(t 
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "current rollback planner would select")
+}
+
+// A rollout whose targets are each planned against their own schema runs every
+// target but the primary from a member plan bound to the primary, so the latest
+// task can point at a member plan of the apply's own review round. That task is
+// still this apply's work and passes the source check. A task on a plan bound
+// to some other review round, or on a plan that is no longer stored, is
+// rejected for good. A plan that fails to load is a storage failure the caller
+// can retry, never a verdict on the task.
+func TestValidateRollbackSourceApplyAcceptsMemberPlanOfTheApplysRound(t *testing.T) {
+	now := time.Now().UTC()
+	for _, tc := range []struct {
+		name          string
+		memberPrimary string
+		memberMissing bool
+		memberLoadErr error
+		wantErr       string
+		wantTerminal  bool
+	}{
+		{name: "member plan of the apply's round", memberPrimary: "plan-primary"},
+		{name: "member plan of another round", memberPrimary: "plan-other", wantErr: "latest schema change task for database orders points to plan 11", wantTerminal: true},
+		{name: "member plan no longer stored", memberMissing: true, wantErr: "latest schema change task for database orders points to plan 11", wantTerminal: true},
+		{name: "member plan fails to load", memberPrimary: "plan-primary", memberLoadErr: errors.New("connection refused"), wantErr: "load plan 11 of rollback source task"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			apply := rollbackGuardrailApply("apply_rollout", 1, 10, now)
+			primary := rollbackGuardrailPlan(10, true)
+			primary.PlanIdentifier = "plan-primary"
+			plans := map[int64]*storage.Plan{10: primary}
+			if !tc.memberMissing {
+				member := rollbackGuardrailPlan(11, true)
+				member.PlanIdentifier = "plan-member"
+				member.PrimaryPlanIdentifier = tc.memberPrimary
+				plans[11] = member
+			}
+			svc := newRollbackGuardrailServiceWithApplies([]*storage.Apply{apply}, plans,
+				[]*storage.Task{rollbackGuardrailTask(1, 11, now)})
+			if tc.memberLoadErr != nil {
+				svc.storage.Plans().(*staticPlanStore).errByID = map[int64]error{11: tc.memberLoadErr}
+			}
+
+			_, gotPlan, err := svc.ValidateRollbackSourceApply(t.Context(), RollbackSourceRequest{
+				ApplyIdentifier: "apply_rollout",
+				Environment:     "staging",
+				Repository:      "org/repo",
+				PullRequest:     1,
+			})
+
+			if tc.wantErr != "" {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tc.wantErr)
+				var terminal *terminalControlError
+				assert.Equal(t, tc.wantTerminal, errors.As(err, &terminal), "whether retrying the same request can succeed")
+				if tc.memberLoadErr != nil {
+					assert.ErrorIs(t, err, tc.memberLoadErr, "the storage failure stays in the chain for the caller")
+				}
+				return
+			}
+			require.NoError(t, err)
+			require.NotNil(t, gotPlan)
+			assert.Equal(t, int64(10), gotPlan.ID, "the source plan stays the apply's primary plan")
+		})
+	}
 }
 
 func TestValidateRollbackSourceApplyScopesLatestCompletedTaskByEnvironment(t *testing.T) {
