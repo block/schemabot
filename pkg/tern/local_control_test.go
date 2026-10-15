@@ -2981,6 +2981,90 @@ func TestLocalClient_StartJoinsThePendingStartOfAResumingApply(t *testing.T) {
 	assert.Equal(t, storage.ControlRequestPending, requests[0].Status)
 }
 
+// A start joins a resuming apply only once it has read the pending start it
+// joins. When that read cannot be made or its record cannot be decoded, the
+// start is refused with the cause and records nothing, rather than reporting a
+// start as accepted on pending state it never verified.
+func TestLocalClient_StartRefusesToJoinAPendingStartItCannotRead(t *testing.T) {
+	tests := []struct {
+		name     string
+		requests func(apply *storage.Apply) *testControlRequestStore
+		storage  func(base *controlTestStorage, requests *testControlRequestStore) storage.Storage
+		wantErr  string
+	}{
+		{
+			name: "control request store unavailable",
+			storage: func(base *controlTestStorage, _ *testControlRequestStore) storage.Storage {
+				return &noControlRequestsStorage{controlTestStorage: base}
+			},
+			wantErr: "control request store is not available",
+		},
+		{
+			name: "pending start lookup fails",
+			storage: func(base *controlTestStorage, requests *testControlRequestStore) storage.Storage {
+				base.controlRequests = &failingGetPendingControlRequestStore{testControlRequestStore: requests, err: errors.New("storage unavailable")}
+				return base
+			},
+			wantErr: "load pending start for resuming apply apply-resume-target: storage unavailable",
+		},
+		{
+			name: "pending start metadata is malformed",
+			requests: func(apply *storage.Apply) *testControlRequestStore {
+				return &testControlRequestStore{requests: []*storage.ApplyControlRequest{{
+					ID: 1, ApplyID: apply.ID, Operation: storage.ControlOperationStart,
+					Status: storage.ControlRequestPending, Metadata: []byte("{not json"),
+				}}}
+			},
+			wantErr: "decode pending start metadata for apply apply-resume-target",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			apply, task := restingStartApply(state.Task.Running, time.Minute)
+			apply.State = state.Apply.Resuming
+			client := newMySQLControlTestClient(apply, []*storage.Task{task}, &controlCaptureEngine{})
+			base := client.storage.(*controlTestStorage)
+			requests := &testControlRequestStore{}
+			if tt.requests != nil {
+				requests = tt.requests(apply)
+			}
+			base.controlRequests = requests
+			if tt.storage != nil {
+				client.storage = tt.storage(base, requests)
+			}
+			before := len(requests.requests)
+
+			resp, err := client.Start(t.Context(), &ternv1.StartRequest{ApplyId: apply.ApplyIdentifier})
+
+			require.Error(t, err)
+			assert.Nil(t, resp, "a refused start is not reported as accepted")
+			assert.Contains(t, err.Error(), tt.wantErr)
+			assert.Len(t, requests.requests, before, "a refused start records no request")
+		})
+	}
+}
+
+// noControlRequestsStorage stands in for storage that has no control request
+// store at all.
+type noControlRequestsStorage struct {
+	*controlTestStorage
+}
+
+func (s *noControlRequestsStorage) ControlRequests() storage.ControlRequestStore {
+	return nil
+}
+
+// failingGetPendingControlRequestStore fails the pending-request read and
+// serves every other call from the wrapped store.
+type failingGetPendingControlRequestStore struct {
+	*testControlRequestStore
+	err error
+}
+
+func (s *failingGetPendingControlRequestStore) GetPending(context.Context, int64, storage.ControlOperation) (*storage.ApplyControlRequest, error) {
+	return nil, s.err
+}
+
 // A resuming apply whose start was already consumed is past the point a start
 // can act on, so a start there is refused rather than queued behind work that
 // is already moving.
