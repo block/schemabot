@@ -413,10 +413,15 @@ func (s *checkStore) MarkStalePlanSuccessful(ctx context.Context, check *storage
 // stale cleanup read it earlier: an apply completing in between leaves a
 // completed row, which this write turns into action_required rather than back
 // into in_progress. apply_id is left as stored, so the owner stays the owner.
-func (s *checkStore) BlockStaleStartedApply(ctx context.Context, check *storage.Check) (bool, error) {
+//
+// The same locked read pins the row cleanup read: a row a different apply
+// claimed since, or one a newer write moved to a head that is neither the head
+// cleanup read nor headSHA, belongs to that newer write and is left alone.
+func (s *checkStore) BlockStaleStartedApply(ctx context.Context, check *storage.Check, headSHA string) (bool, error) {
 	canonicalizeCheck(check)
 	target := fmt.Sprintf("%s#%d %s/%s/%s",
 		check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName)
+	readHeadSHA := check.HeadSHA
 
 	blocked := false
 	err := withLockRetry(ctx, s.classifier, "block stale started apply check for "+target, func() error {
@@ -427,15 +432,15 @@ func (s *checkStore) BlockStaleStartedApply(ctx context.Context, check *storage.
 		}
 		defer rollbackTx(ctx, tx, "block stale started apply check")
 
-		var status string
+		var status, storedHeadSHA string
 		var applyID sql.NullInt64
 		err = tx.QueryRowContext(ctx, `
-			SELECT status, apply_id
+			SELECT status, apply_id, head_sha
 			FROM checks
 			WHERE repository = ? AND pull_request = ?
 			  AND environment = ? AND database_type = ? AND database_name = ?
 			FOR UPDATE
-		`, check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName).Scan(&status, &applyID)
+		`, check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName).Scan(&status, &applyID, &storedHeadSHA)
 		if errors.Is(err, sql.ErrNoRows) {
 			return fmt.Errorf("check state for %s was deleted before stale cleanup could block it: %w", target, storage.ErrCheckNotFound)
 		}
@@ -447,6 +452,14 @@ func (s *checkStore) BlockStaleStartedApply(ctx context.Context, check *storage.
 			// terminal write is the authoritative outcome and stays in place.
 			if err := tx.Commit(); err != nil {
 				return fmt.Errorf("commit released stale started apply check read for %s: %w", target, err)
+			}
+			return nil
+		}
+		if newerWriteOwnsStaleCheck(applyID, storedHeadSHA, check.ApplyID, readHeadSHA, headSHA) {
+			// Another apply claimed the row, or a newer commit's cleanup
+			// moved it on, after this cleanup read it. That write stays.
+			if err := tx.Commit(); err != nil {
+				return fmt.Errorf("commit superseded stale started apply check read for %s: %w", target, err)
 			}
 			return nil
 		}
@@ -468,13 +481,14 @@ func (s *checkStore) BlockStaleStartedApply(ctx context.Context, check *storage.
 			    updated_at = `+s.dialect.CurrentTimestamp(TimestampPrecisionDefault)+`
 			WHERE repository = ? AND pull_request = ?
 			  AND environment = ? AND database_type = ? AND database_name = ?
-		`, check.HeadSHA, true, status, conclusion, check.BlockingReason, check.ErrorMessage,
+		`, headSHA, true, status, conclusion, check.BlockingReason, check.ErrorMessage,
 			check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName); err != nil {
 			return fmt.Errorf("write stale started apply check block for %s: %w", target, err)
 		}
 		if err := tx.Commit(); err != nil {
 			return fmt.Errorf("commit stale started apply check block for %s: %w", target, err)
 		}
+		check.HeadSHA = headSHA
 		check.HasChanges = true
 		check.Status = status
 		check.Conclusion = conclusion
@@ -482,6 +496,17 @@ func (s *checkStore) BlockStaleStartedApply(ctx context.Context, check *storage.
 		return nil
 	})
 	return blocked, err
+}
+
+// newerWriteOwnsStaleCheck reports whether a stale cleanup block must yield to
+// a write that landed after cleanup read the row: a different apply now owns
+// it, or its head moved to one that is neither the head cleanup read nor the
+// head cleanup is writing.
+func newerWriteOwnsStaleCheck(storedApplyID sql.NullInt64, storedHeadSHA string, readApplyID int64, readHeadSHA, headSHA string) bool {
+	if storedApplyID.Int64 != readApplyID {
+		return true
+	}
+	return storedHeadSHA != readHeadSHA && storedHeadSHA != headSHA
 }
 
 // ClearAggregateBlock clears the blocking reason on stored aggregate check
@@ -576,7 +601,15 @@ func (s *checkStore) CompleteForApply(ctx context.Context, check *storage.Check,
 		args = append(args, lease.ApplyID, lease.Token)
 	}
 
-	result, err := s.db.ExecContext(ctx, `
+	target := fmt.Sprintf("%s#%d %s/%s/%s for apply %s",
+		check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName, apply.ApplyIdentifier)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, fmt.Errorf("begin check completion %s: %w", target, err)
+	}
+	defer rollbackTx(ctx, tx, "complete check for apply")
+
+	result, err := tx.ExecContext(ctx, `
 		UPDATE checks
 		SET head_sha        = CASE WHEN COALESCE(blocking_reason, '') = ? THEN head_sha ELSE ? END,
 		    check_run_id = ?,
@@ -604,19 +637,49 @@ func (s *checkStore) CompleteForApply(ctx context.Context, check *storage.Check,
 		  )`+leasePredicate+`
 	`, args...)
 	if err != nil {
-		return false, err
+		return false, fmt.Errorf("write check completion %s: %w", target, err)
 	}
 
 	rows, err := result.RowsAffected()
 	if err != nil {
-		return false, err
+		return false, fmt.Errorf("read rows affected by check completion %s: %w", target, err)
 	}
-	if rows == 0 && lease.Valid() {
-		if err := ensureApplyLeaseStillOwned(ctx, s.db, lease); err != nil {
-			return false, err
+	if rows == 0 {
+		if err := tx.Commit(); err != nil {
+			return false, fmt.Errorf("commit check completion %s that changed no row: %w", target, err)
 		}
+		if lease.Valid() {
+			if err := ensureApplyLeaseStillOwned(ctx, s.db, lease); err != nil {
+				return false, err
+			}
+		}
+		return false, nil
 	}
-	return rows > 0, nil
+
+	// Read the landed row back in the same transaction, which still holds the
+	// row lock the UPDATE took, so the caller sees what was stored: a kept
+	// schema-removed block rather than the completion it asked for.
+	var headSHA string
+	var hasChanges bool
+	var conclusion, blockingReason, errorMessage sql.NullString
+	if err := tx.QueryRowContext(ctx, `
+		SELECT head_sha, has_changes, conclusion, blocking_reason, error_message
+		FROM checks
+		WHERE repository = ? AND pull_request = ?
+		  AND environment = ? AND database_type = ? AND database_name = ?
+	`, check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName).Scan(
+		&headSHA, &hasChanges, &conclusion, &blockingReason, &errorMessage); err != nil {
+		return false, fmt.Errorf("read back check completion %s: %w", target, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("commit check completion %s: %w", target, err)
+	}
+	check.HeadSHA = headSHA
+	check.HasChanges = hasChanges
+	check.Conclusion = conclusion.String
+	check.BlockingReason = blockingReason.String
+	check.ErrorMessage = errorMessage.String
+	return true, nil
 }
 
 // MarkActionRequiredForApply marks stored check state action_required for a

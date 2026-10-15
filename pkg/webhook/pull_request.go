@@ -1303,10 +1303,10 @@ func (h *Handler) settleStaleCheckState(ctx context.Context, repo string, pr int
 // after this cleanup read the row is never shown as running again.
 func (h *Handler) blockStaleStartedApplyCheckState(ctx context.Context, repo string, pr int, headSHA string, check *storage.Check) bool {
 	readStatus := check.Status
-	check.HeadSHA = headSHA
+	readHeadSHA := check.HeadSHA
 	check.BlockingReason = schemaRemovedAfterApplyBlock.blockingReason
 	check.ErrorMessage = schemaRemovedAfterApplyBlock.message
-	blocked, err := h.service.Storage().Checks().BlockStaleStartedApply(ctx, check)
+	blocked, err := h.service.Storage().Checks().BlockStaleStartedApply(ctx, check, headSHA)
 	if err != nil {
 		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
 			Operation:    "stale_check_cleanup",
@@ -1320,12 +1320,13 @@ func (h *Handler) blockStaleStartedApplyCheckState(ctx context.Context, repo str
 			"repo", repo, "pr", pr, "head_sha", headSHA,
 			"database", check.DatabaseName, "database_type", check.DatabaseType,
 			"environment", check.Environment, "check_id", check.ID,
-			"apply_id", check.ApplyID, "error", err)
+			"read_head_sha", readHeadSHA, "error", err)
 		return false
 	}
 	if !blocked {
-		// The apply released the row between the cleanup read and this write,
-		// so its own terminal outcome is the stored state and stays in place.
+		// Between the cleanup read and this write, the apply released the row,
+		// another apply claimed it, or a newer commit's cleanup moved it on.
+		// That later write is the stored state and stays in place.
 		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
 			Operation:    "stale_check_cleanup",
 			Repository:   repo,
@@ -1334,11 +1335,11 @@ func (h *Handler) blockStaleStartedApplyCheckState(ctx context.Context, repo str
 			Environment:  check.Environment,
 			Status:       "noop",
 		})
-		h.logger.Info("stale check left to the terminal outcome its apply recorded after cleanup read it",
+		h.logger.Info("stale check left to the write that released, claimed, or moved it after cleanup read it",
 			"repo", repo, "pr", pr, "head_sha", headSHA,
 			"database", check.DatabaseName, "database_type", check.DatabaseType,
 			"environment", check.Environment, "check_id", check.ID,
-			"apply_id", check.ApplyID, "read_status", readStatus)
+			"read_head_sha", readHeadSHA, "read_status", readStatus)
 		return false
 	}
 	metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
@@ -1354,7 +1355,7 @@ func (h *Handler) blockStaleStartedApplyCheckState(ctx context.Context, repo str
 			"repo", repo, "pr", pr, "head_sha", headSHA,
 			"database", check.DatabaseName, "database_type", check.DatabaseType,
 			"environment", check.Environment, "check_id", check.ID,
-			"apply_id", check.ApplyID, "read_status", readStatus,
+			"read_status", readStatus,
 			"stored_status", check.Status, "stored_conclusion", check.Conclusion)
 	}
 	return true
