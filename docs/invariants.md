@@ -1200,7 +1200,9 @@ before it hands a VSchema to the engine (`finalizerStandsDownForPendingControl`,
 `pkg/tern/local_control_resume.go`); cancel-before-stop consumption on both clients
 (`processPendingCancelOrStopControlRequest`, `pkg/tern/local_control.go`,
 `pkg/tern/grpc_client.go`); conflict rejection at request intake
-(`pkg/api/control_handlers.go`).
+(`pkg/api/control_handlers.go`); and failing the cutover a stop superseded wherever the stop's
+request completes (`SettlePendingCutoverAfterStop`, `pkg/tern/control_requests.go`, reached from
+both clients and from `pkg/api/control_handlers.go` and `pkg/api/operator.go`).
 
 ### CO-5: The revert phase owns the outcome
 

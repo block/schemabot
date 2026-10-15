@@ -53,6 +53,50 @@ func TestSettlePendingRequestsForTerminalApply(t *testing.T) {
 	}
 }
 
+// A cutover still pending when the apply settles is answered by the outcome the
+// apply reached: an apply that cut over completes it, and every other terminal
+// state fails it with a reason, so it never lingers pending for the reaper to
+// re-list on every pass.
+func TestSettlePendingRequestsForTerminalApplySettlesCutoverByOutcome(t *testing.T) {
+	cases := []struct {
+		applyState string
+		wantStatus storage.ControlRequestStatus
+		wantError  string
+	}{
+		{applyState: state.Apply.Completed, wantStatus: storage.ControlRequestCompleted},
+		{applyState: state.Apply.Reverted, wantStatus: storage.ControlRequestCompleted},
+		{applyState: state.Apply.Cancelled, wantStatus: storage.ControlRequestFailed,
+			wantError: "cutover request was not applied because apply is cancelled"},
+		{applyState: state.Apply.Failed, wantStatus: storage.ControlRequestFailed,
+			wantError: "cutover request was not applied because apply is failed"},
+		{applyState: state.Apply.Stopped, wantStatus: storage.ControlRequestFailed,
+			wantError: cutoverSupersededByStopMessage},
+	}
+	for _, tc := range cases {
+		t.Run(tc.applyState, func(t *testing.T) {
+			apply := &storage.Apply{
+				ID:              7,
+				ApplyIdentifier: "apply-terminal-cutover",
+				Database:        "testdb",
+				Environment:     "staging",
+				State:           tc.applyState,
+			}
+			controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{
+				{ApplyID: apply.ID, Operation: storage.ControlOperationCutover, Status: storage.ControlRequestPending, RequestedBy: "cli:alice"},
+			}}
+			store := &mockStorage{controlRequests: controlRequests, logs: &mockApplyLogStore{}}
+
+			require.NoError(t, settlePendingRequestsForTerminalApply(t.Context(), store, discardLogger(), apply))
+
+			settled, err := controlRequests.GetByOperation(t.Context(), apply.ID, storage.ControlOperationCutover)
+			require.NoError(t, err)
+			require.NotNil(t, settled)
+			assert.Equal(t, tc.wantStatus, settled.Status)
+			assert.Equal(t, tc.wantError, settled.ErrorMessage)
+		})
+	}
+}
+
 // A cancel that an apply outran never took effect, so the sweep resolves it as a
 // rejection rather than reporting it applied: the failed request is what lights
 // up the PR comment's "Command not applied" notice and what a re-issued cancel

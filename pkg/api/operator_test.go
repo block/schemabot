@@ -1411,6 +1411,50 @@ func TestCompletePendingControlRequestsIfApplyResolved(t *testing.T) {
 		assert.Equal(t, storage.ControlOperationStop, control.completed[0])
 	})
 
+	t.Run("fails a pending cutover when a cancel settled the apply", func(t *testing.T) {
+		applies := &getApplyStore{apply: &storage.Apply{ID: 9, ApplyIdentifier: "apply-cancelled", State: state.Apply.Cancelled}}
+		control := &fakeControlRequestStore{pending: map[storage.ControlOperation]*storage.ApplyControlRequest{
+			storage.ControlOperationCutover: pendingRequest(storage.ControlOperationCutover),
+		}}
+		svc := newStopReconcileTestService(applies, &markPendingStoppedRecordingStore{}, control)
+
+		require.NoError(t, svc.completePendingControlRequestsIfApplyResolved(t.Context(), svc.driverLogger(1), 9))
+		assert.Empty(t, control.completed, "a cancelled apply never cut over, so the cutover must not read as completed")
+		require.Equal(t, []storage.ControlOperation{storage.ControlOperationCutover}, control.failed)
+		assert.Equal(t, "cutover request was not applied because apply is cancelled", control.failureReasons[0])
+	})
+
+	t.Run("completes a pending cutover when the apply cut over", func(t *testing.T) {
+		applies := &getApplyStore{apply: &storage.Apply{ID: 9, ApplyIdentifier: "apply-done", State: state.Apply.Completed}}
+		control := &fakeControlRequestStore{pending: map[storage.ControlOperation]*storage.ApplyControlRequest{
+			storage.ControlOperationCutover: pendingRequest(storage.ControlOperationCutover),
+		}}
+		svc := newStopReconcileTestService(applies, &markPendingStoppedRecordingStore{}, control)
+
+		require.NoError(t, svc.completePendingControlRequestsIfApplyResolved(t.Context(), svc.driverLogger(1), 9))
+		assert.Equal(t, []storage.ControlOperation{storage.ControlOperationCutover}, control.completed)
+		assert.Empty(t, control.failed)
+	})
+
+	t.Run("fails the cutover a held-open apply's stop superseded", func(t *testing.T) {
+		applies := &getApplyStore{apply: &storage.Apply{ID: 9, ApplyIdentifier: "apply-degraded", State: state.Apply.RunningDegraded}}
+		control := &fakeControlRequestStore{pending: map[storage.ControlOperation]*storage.ApplyControlRequest{
+			storage.ControlOperationStop:    pendingRequest(storage.ControlOperationStop),
+			storage.ControlOperationCutover: pendingRequest(storage.ControlOperationCutover),
+		}}
+		ops := &markPendingStoppedRecordingStore{ops: []*storage.ApplyOperation{
+			{ID: 1, Deployment: "region-a", State: state.ApplyOperation.Stopped},
+			{ID: 2, Deployment: "region-b", State: state.ApplyOperation.Stopped},
+		}}
+		svc := newStopReconcileTestService(applies, ops, control)
+
+		require.NoError(t, svc.completePendingControlRequestsIfApplyResolved(t.Context(), svc.driverLogger(1), 9))
+		assert.Equal(t, []storage.ControlOperation{storage.ControlOperationStop}, control.completed)
+		require.Equal(t, []storage.ControlOperation{storage.ControlOperationCutover}, control.failed,
+			"a cutover queued before the stop must not fire when a later start resumes the copy")
+		assert.Contains(t, control.failureReasons[0], "superseded by stop")
+	})
+
 	t.Run("no-op when nothing is pending", func(t *testing.T) {
 		applies := &getApplyStore{apply: &storage.Apply{ID: 9, ApplyIdentifier: "apply-done", State: state.Apply.Failed}}
 		control := &fakeControlRequestStore{}

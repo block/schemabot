@@ -707,7 +707,7 @@ func (c *GRPCClient) processPendingCutoverControlRequest(ctx context.Context, ap
 		return completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCutover)
 	}
 	if cutoverRequestFailedByApplyState(apply.State) {
-		message := fmt.Sprintf("cutover request was not applied because apply is %s", apply.State)
+		message := cutoverNotAppliedMessage(apply.State)
 		if err := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCutover, message); err != nil {
 			return err
 		}

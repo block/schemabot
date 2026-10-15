@@ -6181,6 +6181,51 @@ func TestGRPCClient_ProcessPendingStopSyncDoesNotTerminalizeDuringRetryablePause
 	assert.NotNil(t, stopReq, "the durable stop request must stay pending for the remote to consume")
 }
 
+// TestGRPCClient_StopSupersedesPendingCutover covers a remote deferred-cutover
+// apply whose stop landed on the data plane while a cutover queued before it
+// was still pending. Completing the stop fails that cutover with a reason the
+// operator can act on, so a later start cannot carry it into a table swap.
+func TestGRPCClient_StopSupersedesPendingCutover(t *testing.T) {
+	client, cleanup := testCapturingGRPCClient(t, &capturingTernServer{})
+	defer cleanup()
+
+	apply := &storage.Apply{
+		ID:              7,
+		ApplyIdentifier: "apply-grpc-stop-supersedes-cutover",
+		ExternalID:      "remote-grpc-stop-supersedes-cutover",
+		PlanID:          99,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+		State:           state.Apply.WaitingForCutover,
+	}
+	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{
+		{ID: 1, ApplyID: apply.ID, Operation: storage.ControlOperationCutover, Status: storage.ControlRequestPending, RequestedBy: "cli:alice"},
+		{ID: 2, ApplyID: apply.ID, Operation: storage.ControlOperationStop, Status: storage.ControlRequestPending, RequestedBy: "cli:bob"},
+	}}
+	storedApply := *apply
+	storedApply.State = state.Apply.Stopped
+	client.storage = &mockStorage{
+		applies:         &mockApplyStore{apply: &storedApply},
+		tasks:           &mockTaskStore{},
+		logs:            &mockApplyLogStore{},
+		controlRequests: controlRequests,
+	}
+
+	_, err := client.processPendingStopControlRequest(t.Context(), apply, wholeApplyTaskScope())
+	require.NoError(t, err)
+
+	stopReq, err := controlRequests.GetByOperation(t.Context(), apply.ID, storage.ControlOperationStop)
+	require.NoError(t, err)
+	require.NotNil(t, stopReq)
+	assert.Equal(t, storage.ControlRequestCompleted, stopReq.Status)
+	cutoverReq, err := controlRequests.GetByOperation(t.Context(), apply.ID, storage.ControlOperationCutover)
+	require.NoError(t, err)
+	require.NotNil(t, cutoverReq)
+	assert.Equal(t, storage.ControlRequestFailed, cutoverReq.Status)
+	assert.Equal(t, cutoverSupersededByStopMessage, cutoverReq.ErrorMessage)
+}
+
 func TestGRPCClient_ProcessPendingCancelSyncDoesNotTerminalizeDuringRetryablePause(t *testing.T) {
 	// A cancel accepted by the data plane while the remote apply is paused for
 	// a data-plane retry syncs against a STATE_FAILED snapshot whose tables
