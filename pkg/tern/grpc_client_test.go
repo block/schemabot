@@ -2287,6 +2287,75 @@ func TestGRPCClient_ResumeApplyOperationDispatchParksBarrierCutoverRemotely(t *t
 		"the automatic barrier decision must not be persisted onto the shared apply options")
 }
 
+// After a data-plane outage, a rollout's parent reads failed_retryable while a
+// sibling target waits for its own retry. This target was already copying when
+// the outage hit, and its redispatch claim moved it back to running. When the
+// data plane reports it parked at the cutover barrier, the drive parks and
+// returns, freeing the target for the cutover claim. It does not keep polling
+// a parked target because the rollout parent reads failed_retryable.
+func TestGRPCClient_ResumeApplyOperationParksRedispatchedOperationUnderRetryableParent(t *testing.T) {
+	server := &capturingTernServer{
+		progressState:    ternv1.State_STATE_WAITING_FOR_CUTOVER,
+		progressStateSet: true,
+		progressTables: []*ternv1.TableProgress{{
+			Namespace:       "default",
+			TableName:       "users",
+			Status:          state.Task.WaitingForCutover,
+			PercentComplete: 100,
+		}},
+	}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+
+	apply := &storage.Apply{
+		ID:              7,
+		ApplyIdentifier: "apply-retryable-parent",
+		PlanID:          99,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+		State:           state.Apply.FailedRetryable,
+	}
+	apply.SetOptions(storage.ApplyOptions{Target: "testdb-target"})
+	operationID := int64(42)
+	siblingID := int64(43)
+	task := &storage.Task{
+		ID:               11,
+		TaskIdentifier:   "task-users",
+		ApplyID:          apply.ID,
+		ApplyOperationID: &operationID,
+		TableName:        "users",
+		DDL:              "ALTER TABLE users ADD COLUMN email varchar(255)",
+		DDLAction:        "alter",
+		Namespace:        "default",
+		State:            state.Task.Running,
+	}
+	applyStore := &mockApplyStore{apply: apply}
+	client.storage = &mockStorage{
+		applies: applyStore,
+		tasks: &mockTaskStore{
+			tasks:           []*storage.Task{task},
+			getByApplyIDErr: errors.New("whole-apply task load must not be used for operation-scoped resume"),
+		},
+		plans: &mockPlanStore{plan: &storage.Plan{ID: apply.PlanID, PlanIdentifier: "plan-retryable-parent"}},
+		operations: &mockApplyOperationStore{ops: map[int64]*storage.ApplyOperation{
+			operationID: {ID: operationID, ApplyID: apply.ID, Deployment: "west", State: state.ApplyOperation.Running,
+				CutoverPolicy: storage.CutoverPolicyBarrier, EngineResumeContext: "remote-op-west-1"},
+			siblingID: {ID: siblingID, ApplyID: apply.ID, Deployment: "east", State: state.ApplyOperation.FailedRetryable,
+				CutoverPolicy: storage.CutoverPolicyBarrier},
+		}},
+		logs: &mockApplyLogStore{},
+	}
+
+	// A generous deadline: the drive must return promptly at the barrier, not
+	// run until the deadline.
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	require.NoError(t, client.ResumeApplyOperation(ctx, apply, operationID))
+	assert.Equal(t, state.Task.WaitingForCutover, task.State, "the target's task records the barrier")
+	assert.Empty(t, applyStore.updates, "the rollout parent is owned by the projection, so the drive never writes it")
+}
+
 func TestGRPCClient_ResumeApplyOperationDispatchDoesNotDeferRollingCutover(t *testing.T) {
 	// A multi-deployment apply under the default rolling policy serializes copy
 	// and cutover per deployment, so its copy drive must NOT defer cutover — the
@@ -7704,16 +7773,23 @@ func TestGRPCClient_QueuedRemoteDispatchPredicate(t *testing.T) {
 // pending→running in a separate transaction before the drive runs, so a freshly
 // claimed operation reaches dispatch in running with no per-operation remote id
 // yet. That first dispatch must proceed — a running operation with an empty
-// remote id is not the ambiguous crash case the whole-apply path rejects.
+// remote id is not the ambiguous crash case the whole-apply path rejects. A
+// stop that catches an operation before it starts leaves it with no started_at,
+// so the start that resumes it is its first dispatch too; a resuming operation
+// that had started may already exist remotely and is not redispatched.
 func TestGRPCClient_QueuedRemoteDispatchPredicate_OperationScope(t *testing.T) {
 	tests := []struct {
 		name     string
 		opState  string
 		remoteID string
+		started  bool
 		multiOp  bool
 		want     bool
 	}{
 		{name: "multi-op running without remote id dispatches", opState: state.ApplyOperation.Running, multiOp: true, want: true},
+		{name: "multi-op resuming that never started dispatches", opState: state.ApplyOperation.Resuming, multiOp: true, want: true},
+		{name: "multi-op resuming that started without remote id does not dispatch", opState: state.ApplyOperation.Resuming, started: true, multiOp: true, want: false},
+		{name: "multi-op resuming with remote id does not dispatch", opState: state.ApplyOperation.Resuming, remoteID: "remote-apply-123", multiOp: true, want: false},
 		{name: "multi-op pending without remote id dispatches", opState: state.ApplyOperation.Pending, multiOp: true, want: true},
 		{name: "multi-op running with remote id does not dispatch", opState: state.ApplyOperation.Running, remoteID: "remote-apply-123", multiOp: true, want: false},
 		{name: "multi-op terminal without remote id does not dispatch", opState: state.ApplyOperation.Completed, multiOp: true, want: false},
@@ -7725,13 +7801,18 @@ func TestGRPCClient_QueuedRemoteDispatchPredicate_OperationScope(t *testing.T) {
 			// The parent apply is running because a sibling deployment is active;
 			// the per-operation remote id (not apply.ExternalID) governs dispatch.
 			apply := &storage.Apply{State: state.Apply.Running}
+			operation := &storage.ApplyOperation{
+				State:               tt.opState,
+				EngineResumeContext: tt.remoteID,
+			}
+			if tt.started {
+				startedAt := time.Now()
+				operation.StartedAt = &startedAt
+			}
 			scope := applyTaskScope{
 				applyOperationID: 1,
-				operation: &storage.ApplyOperation{
-					State:               tt.opState,
-					EngineResumeContext: tt.remoteID,
-				},
-				multiOperation: tt.multiOp,
+				operation:        operation,
+				multiOperation:   tt.multiOp,
 			}
 			assert.Equal(t, tt.want, shouldDispatchQueuedRemoteApply(apply, scope))
 		})
@@ -9504,55 +9585,37 @@ func TestRemoteApplyIdempotencyKey(t *testing.T) {
 		"distinct deployments must produce distinct keys")
 }
 
-// TestRemoteApplyIdempotencyKey_GenerationRotation verifies that a
-// deployment-scoped key rotates only on the operation's own dispatch
-// generation. The shared apply.Attempt advances when any sibling operation of
-// any deployment is redispatched, so a key derived from it would rotate under
-// an unrelated deployment's orphaned dispatch and duplicate its remote apply;
-// the deployment key must ignore it. The operation's own attempt advances only
-// on that operation's deliberate retry, which is exactly when the retried work
-// must dispatch fresh.
-func TestRemoteApplyIdempotencyKey_GenerationRotation(t *testing.T) {
-	opScope := func(parentAttempt, opAttempt int) (*storage.Apply, applyTaskScope) {
+// TestRemoteApplyIdempotencyKey_StableAcrossAttempts verifies that a
+// deployment-scoped key moves with neither attempt counter. The shared
+// apply.Attempt advances when any sibling operation of any deployment is
+// redispatched, and the operation's own attempt advances when its dispatch
+// failed before it attached. A deployment has exactly one data-plane apply, so
+// either rotation would reach the data plane as a new generation that takes the
+// deployment over from the apply its siblings are still running on.
+func TestRemoteApplyIdempotencyKey_StableAcrossAttempts(t *testing.T) {
+	opScope := func(parentAttempt, opAttempt int, operationKey string) (*storage.Apply, applyTaskScope) {
 		return &storage.Apply{ApplyIdentifier: "apply-abc123", Attempt: parentAttempt},
 			applyTaskScope{
 				applyOperationID: 1,
-				operation:        &storage.ApplyOperation{Deployment: "region-a", OperationKey: "commerce/users", Attempt: opAttempt},
+				operation:        &storage.ApplyOperation{Deployment: "region-a", OperationKey: operationKey, Attempt: opAttempt},
 				multiOperation:   true,
 			}
 	}
 
-	apply0, scope0 := opScope(0, 0)
+	apply0, scope0 := opScope(0, 0, "commerce/-80/users")
 	base := remoteApplyIdempotencyKey(apply0, scope0)
 
-	// A sibling deployment's retry advances the shared parent attempt while
-	// this deployment's dispatch is still orphaned mid-flight. Its key must not
-	// move, so the re-drive reuses the original dispatch instead of starting a
-	// duplicate remote apply.
-	applySiblingRetried, scopeOrphaned := opScope(3, 0)
+	applySiblingRetried, scopeOrphaned := opScope(3, 0, "commerce/-80/users")
 	assert.Equal(t, base, remoteApplyIdempotencyKey(applySiblingRetried, scopeOrphaned),
 		"the shared apply attempt must not rotate an orphaned deployment's key")
 
-	// The operation's own deliberate retry rotates the key so the retried work
-	// dispatches a fresh remote apply.
-	applyRetried, scopeRetried := opScope(1, 1)
-	assert.NotEqual(t, base, remoteApplyIdempotencyKey(applyRetried, scopeRetried),
-		"an operation's own advanced attempt must rotate the deployment key")
+	applyRetried, scopeRetried := opScope(1, 2, "commerce/-80/users")
+	assert.Equal(t, base, remoteApplyIdempotencyKey(applyRetried, scopeRetried),
+		"an operation's own retry must land on its deployment's one remote apply")
 
-	// A retry key is stable across a re-dispatch of the same attempt, so an
-	// orphaned retry dispatch is reused rather than duplicated.
-	assert.Equal(t, remoteApplyIdempotencyKey(applyRetried, scopeRetried),
-		remoteApplyIdempotencyKey(applyRetried, scopeRetried),
-		"the retry key must be stable within one attempt")
-
-	// A retry redispatches only its own operation — siblings that succeeded
-	// never dispatch again — so sibling retries must not share a remote apply:
-	// each retried operation gets its own operation-scoped key.
-	_, scopeSiblingRetried := opScope(1, 1)
-	scopeSiblingRetried.operation.OperationKey = "commerce/80-/users"
-	assert.NotEqual(t, remoteApplyIdempotencyKey(applyRetried, scopeRetried),
-		remoteApplyIdempotencyKey(applyRetried, scopeSiblingRetried),
-		"retried siblings must dispatch to distinct operation-scoped remote applies")
+	_, scopeSiblingRetried := opScope(1, 1, "commerce/80-/users")
+	assert.Equal(t, base, remoteApplyIdempotencyKey(applyRetried, scopeSiblingRetried),
+		"a retried sibling shares the deployment's key like every other sibling")
 }
 
 // A deployment-keyed dispatch carries the generation manifest — the full
@@ -9605,12 +9668,12 @@ func TestGenerationOperationKeys(t *testing.T) {
 	assert.Equal(t, []string{"commerce/-80/users"}, scopeOther.generationOperationKeys(),
 		"a deployment's manifest never includes another deployment's operations")
 
-	// A deliberate retry dispatches under an operation-scoped key, so its
-	// manifest declares only its own operation: the retry's remote apply never
-	// receives siblings, and declaring them would hold it open forever.
+	// A retry dispatches under its deployment's key onto the same remote
+	// apply, so it declares the same generation its first dispatch did.
+	firstDispatch := scope.generationOperationKeys()
 	scope.operation.Attempt = 1
-	assert.Equal(t, []string{"commerce/80-/users"}, scope.generationOperationKeys(),
-		"a retry's manifest is its own operation key alone")
+	assert.Equal(t, firstDispatch, scope.generationOperationKeys(),
+		"a retry declares the generation its deployment's remote apply already holds")
 }
 
 // A member settled at creation never dispatches, regardless of whether the
@@ -9664,7 +9727,7 @@ func TestGenerationOperationKeys_ConvergedMembers(t *testing.T) {
 			require.NoError(t, err)
 			assert.Equal(t, want, completed.generationOperationKeys(), "completion after dispatch must not narrow the generation")
 			completed.operation.Attempt = 1
-			assert.Equal(t, []string{ops.ops[1].OperationKey}, completed.generationOperationKeys(), "deliberate retries still declare only their own key")
+			assert.Equal(t, want, completed.generationOperationKeys(), "a retry lands on the same remote apply and declares the same generation")
 		})
 	}
 }
@@ -9691,13 +9754,13 @@ func TestGenerationOperationKeys_ClaimedOperationAlwaysDeclaresItself(t *testing
 }
 
 // The idempotency key and the generation manifest are derived independently
-// from the same scope, so they must rotate together on a deliberate retry: a
-// rotated key paired with a still-full manifest (or an unrotated key paired
-// with a narrowed one) creates a remote apply whose declared operation set can
-// never attach, holding it Running under the completion gate forever. This
-// exercises both derivations on one scope object across the attempt boundary
-// so the pairing cannot drift apart unnoticed.
-func TestRetryRotatesKeyAndManifestTogether(t *testing.T) {
+// from the same scope, so they must hold together across a retry: a key that
+// moved to a new generation paired with the deployment's manifest (or the
+// deployment's key paired with a narrowed manifest) creates a remote apply
+// whose declared operation set can never attach, holding it Running under the
+// completion gate forever. This exercises both derivations on one scope object
+// across the attempt boundary so the pairing cannot drift apart unnoticed.
+func TestRetryKeepsKeyAndManifestTogether(t *testing.T) {
 	apply := &storage.Apply{ApplyIdentifier: "apply-abc123"}
 	scope := applyTaskScope{
 		applyOperationID: 1,
@@ -9709,20 +9772,15 @@ func TestRetryRotatesKeyAndManifestTogether(t *testing.T) {
 		deploymentOperationKeys: []string{"commerce/-80/users", "commerce/80-/users", "commerce/group_finalizer"},
 	}
 
-	// First dispatch: a deployment-scoped key paired with the full deployment
-	// manifest, so the shared remote apply knows every sibling it must await.
 	firstKey := remoteApplyIdempotencyKey(apply, scope)
 	assert.Equal(t, scope.deploymentOperationKeys, scope.generationOperationKeys(),
 		"a first dispatch pairs its deployment key with the full deployment manifest")
 
-	// The operation's deliberate retry: the same scope must rotate the key to
-	// operation scope AND narrow the manifest to the retried operation alone —
-	// the retry's remote apply receives exactly this one operation.
 	scope.operation.Attempt = 1
-	assert.NotEqual(t, firstKey, remoteApplyIdempotencyKey(apply, scope),
-		"a deliberate retry rotates to an operation-scoped key")
-	assert.Equal(t, []string{"commerce/80-/users"}, scope.generationOperationKeys(),
-		"the retry narrows the manifest to its own operation in the same step as the key rotation")
+	assert.Equal(t, firstKey, remoteApplyIdempotencyKey(apply, scope),
+		"a retry keeps its deployment's key")
+	assert.Equal(t, scope.deploymentOperationKeys, scope.generationOperationKeys(),
+		"a retry keeps the deployment manifest its key's remote apply holds")
 }
 
 // A deployment-keyed dispatch shares one remote apply across sibling

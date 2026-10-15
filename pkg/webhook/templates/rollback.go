@@ -42,7 +42,7 @@ func renderRollbackPlanComment(data PlanCommentData, budget *ddlBlockBudget) str
 	// The rollback's unsafe changes are named here, because confirming them
 	// takes --allow-unsafe and the operator should see what that destroys.
 	if data.HasUnsafeChanges && len(data.UnsafeChanges) > 0 {
-		writeUnsafeWarning(&sb, data.UnsafeChanges, nil, data.DatabaseType, data.IsMySQL, true)
+		writeUnsafeWarning(&sb, data.UnsafeChanges, nil, data.DatabaseType, data.IsMySQL)
 	}
 
 	// Lint violations. Only the lint fold names a finding's rule here: the

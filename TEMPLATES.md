@@ -4490,11 +4490,11 @@ schemabot apply -e staging
 @mona is not authorized to run `schemabot apply` for this database.
 
 **Operators of `orders`** — members of these teams, or these users, can run it:
-- `acme/orders-operators`
+- @acme/orders-operators
 
 **Other authorized teams and users**:
-- `acme/db-admins`
-- `jdoe`
+- @acme/db-admins
+- @jdoe
 
 Ask one of them to run it, or request membership in one of the teams above.
 <!-- schemabot:offer-support-channel -->
@@ -4938,6 +4938,55 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 **Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
 
 *Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+**Status**: Checksumming
+
+📊 1/3 complete · 1 checksumming · 1 queued
+
+**Schema `testapp`**
+
+**`users`**: 🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 🔍 Checksumming to verify data (21.92%)
+
+```sql
+ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
+```
+- Rows verified: 321,450 / 1,466,232
+
+**`products`**: ⏳ Queued
+
+```sql
+ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
+```
+
+**`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete
+
+```sql
+ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
+```
+
+
+---
+
+To stop this schema change:
+```
+schemabot stop apply-a1b2c3d4e5f6 -e staging
+```
+
+_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+
+</details>
+
+<details>
+<summary><a name="second-table-checksumming-cutover-deferred"></a><strong>Second Table Checksumming: Cutover Deferred</strong></summary>
+
+
+## Schema Change Status — Staging
+
+**Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
+
+*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+**Options**: ⏸️ Defer Cutover
 
 **Status**: Checksumming
 
@@ -6139,6 +6188,46 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 </details>
 
 <details>
+<summary><a name="cutover-started-superseded-progress-comment"></a><strong>Cutover Started: Superseded Progress Comment</strong></summary>
+
+
+Cutover started — progress continues in [a new progress comment](https://github.com/acme/testapp/pull/42#issuecomment-2222222222).
+
+<details>
+<summary>Progress before the cutover</summary>
+
+## Schema Change Status — Staging
+
+**Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
+
+*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+**Status**: Waiting for Cutover
+
+**1/1** table(s) ready for cutover
+
+**`users`**: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 Waiting for cutover
+
+```sql
+ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
+```
+
+
+---
+
+To proceed with cutover:
+```
+schemabot cutover apply-a1b2c3d4e5f6 -e staging
+```
+
+_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+
+
+</details>
+
+</details>
+
+<details>
 <summary><a name="cutover-complete-superseded-cutover-prompt"></a><strong>Cutover Complete: Superseded Cutover Prompt</strong></summary>
 
 
@@ -6166,7 +6255,10 @@ ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
 
 ---
 
-SchemaBot triggers cutover automatically — no action needed.
+To proceed with cutover:
+```
+schemabot cutover apply-a1b2c3d4e5f6 -e staging
+```
 
 _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
 
