@@ -1331,7 +1331,10 @@ func TestRefuseTableDeclaredTwice(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			err := refuseTableDeclaredTwice("public", tc.files)
+			parsed, err := parseDesiredFiles("public", tc.files)
+			if err == nil {
+				err = refuseTableDeclaredTwice("public", parsed)
+			}
 			if tc.wantErr == "" {
 				require.NoError(t, err)
 				return
