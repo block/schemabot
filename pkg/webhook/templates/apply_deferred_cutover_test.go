@@ -128,4 +128,13 @@ func TestRenderMultiDeploymentApplyComment_DeferredCutoverLineOnce(t *testing.T)
 	ready := render([]presentation.Operation{barrierOp("us", so.WaitingForCutover), barrierOp("eu", so.Running)}, true)
 	assert.NotContains(t, ready, "Defer Cutover", ready)
 	assert.Contains(t, ready, "schemabot cutover apply-123 -e production")
+
+	// A degraded rollout may have a deployment already past cutover, so it
+	// carries no promise of a pause still ahead.
+	for _, past := range []string{so.CuttingOver, so.RevertWindow} {
+		ops := []presentation.Operation{barrierOp("us", so.Failed), barrierOp("eu", past)}
+		require.Equal(t, state.Apply.RunningDegraded, presentation.Derive(ops).State, "a failed deployment beside one in %s derives a degraded rollout", past)
+		degraded := render(ops, true)
+		assert.NotContains(t, degraded, "Defer Cutover", degraded)
+	}
 }

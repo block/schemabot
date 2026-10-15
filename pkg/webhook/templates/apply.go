@@ -467,11 +467,17 @@ func writeDeferredCutoverNote(sb *strings.Builder, deferCutover bool, applyState
 // cutover and will go through it: queued, copying rows or in a post-copy phase,
 // resuming that work, or preparing a PlanetScale branch and deploy request.
 // States that may or may not still be before cutover (recovering, retrying,
-// stopped) are left out, so the line never claims a pause that has passed.
+// stopped, or a degraded rollout whose other deployments may already be
+// cutting over) are left out, so the line never claims a pause that has
+// passed.
 func precedesCutover(applyState string) bool {
-	return state.IsRunningApplyState(applyState) || state.IsState(applyState,
+	return state.IsState(applyState,
 		state.Apply.Pending,
 		state.Apply.Resuming,
+		state.Apply.Running,
+		state.Apply.CatchingUp,
+		state.Apply.Checksumming,
+		state.Apply.PostChecksum,
 		state.Apply.PreparingBranch,
 		state.Apply.ApplyingBranchChanges,
 		state.Apply.ValidatingBranch,
