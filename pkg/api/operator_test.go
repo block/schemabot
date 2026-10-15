@@ -1040,6 +1040,32 @@ func TestUpdateApplyStateFromOperations_FirstFailedDeploymentWins(t *testing.T) 
 		"the reason must come from the first failed deployment in order, not a later failed sibling")
 }
 
+// TestUpdateApplyStateFromOperations_FailureNamesTheTarget verifies that when
+// one deployment addresses several targets, the surfaced reason names the
+// target that failed, since the deployment alone does not say which one did.
+func TestUpdateApplyStateFromOperations_FailureNamesTheTarget(t *testing.T) {
+	ops := []*storage.ApplyOperation{
+		{ID: 1, Deployment: "region-a", Target: "orders-001", State: state.ApplyOperation.Completed},
+		{ID: 2, Deployment: "region-a", Target: "orders-002", State: state.ApplyOperation.Failed, ErrorMessage: "spirit: duplicate entry"},
+		{ID: 3, Deployment: "region-a", Target: "orders-003", State: state.ApplyOperation.Cancelled},
+	}
+	applyStore := &recordingApplyStore{swapped: true}
+	svc := newOperatorStateTestService(&listingApplyOperationStore{ops: ops}, applyStore)
+
+	apply := &storage.Apply{
+		ID:              3,
+		ApplyIdentifier: "apply-projection",
+		State:           state.Apply.Running,
+		Environment:     "staging",
+	}
+
+	_, err := svc.updateApplyStateFromOperations(t.Context(), 1, apply, allowLeaseScopedFailedReopen)
+	require.NoError(t, err)
+	require.NotNil(t, applyStore.updated)
+	assert.Equal(t, state.Apply.Failed, applyStore.updated.State)
+	assert.Equal(t, "target orders-002 on deployment region-a failed: spirit: duplicate entry", applyStore.updated.ErrorMessage)
+}
+
 // TestUpdateApplyStateFromOperations_KeepsExistingMessageWhenNoOperationCarriesOne
 // verifies that a derived failed verdict preserves the apply's existing message
 // when no failed operation row carries one, rather than blanking the reason.

@@ -179,10 +179,34 @@ func (s *Service) ValidateRollbackSourceApply(ctx context.Context, req RollbackS
 		return apply, plan, controlConflictf("apply %s is not the schema change that the current rollback planner would select for database %s environment %s", apply.ApplyIdentifier, apply.Database, apply.Environment)
 	}
 	if latestTask.PlanID != apply.PlanID {
-		return apply, plan, terminalControlf("latest schema change task for database %s points to plan %d, but apply %s points to plan %d", apply.Database, latestTask.PlanID, apply.ApplyIdentifier, apply.PlanID)
+		memberOfRound, err := taskPlanIsMemberOfRound(ctx, planStore, latestTask, plan)
+		if err != nil {
+			return apply, plan, err
+		}
+		if !memberOfRound {
+			return apply, plan, terminalControlf("latest schema change task for database %s points to plan %d, but apply %s points to plan %d", apply.Database, latestTask.PlanID, apply.ApplyIdentifier, apply.PlanID)
+		}
+		s.logger.Debug("rollback source task ran a member plan of the apply's review round",
+			append(apply.LogAttrs(), "task_id", latestTask.TaskIdentifier, "task_plan_id", latestTask.PlanID)...)
 	}
 
 	return apply, plan, nil
+}
+
+// taskPlanIsMemberOfRound reports whether task ran a member plan stored for
+// the review round of primary. A rollout whose targets are each planned
+// against their own schema runs every target but the primary from a plan of
+// its own, bound to the primary plan, so its tasks legitimately point at a plan
+// other than the apply's.
+func taskPlanIsMemberOfRound(ctx context.Context, planStore storage.PlanStore, task *storage.Task, primary *storage.Plan) (bool, error) {
+	taskPlan, err := planStore.GetByID(ctx, task.PlanID)
+	if err != nil {
+		return false, fmt.Errorf("load plan %d of rollback source task %s: %w", task.PlanID, task.TaskIdentifier, err)
+	}
+	if taskPlan == nil {
+		return false, nil
+	}
+	return primary.PlanIdentifier != "" && taskPlan.PrimaryPlanIdentifier == primary.PlanIdentifier, nil
 }
 
 func validateRollbackSourceScope(req RollbackSourceRequest, apply *storage.Apply) error {

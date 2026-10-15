@@ -3026,7 +3026,9 @@ func firstFailedTaskError(tasks []*storage.Task) string {
 }
 
 // firstFailedOperationMessage returns a deployment-qualified failure reason from
-// the first failed operation row that carries one. It surfaces the parent
+// the first failed operation row that carries one, naming the operation's
+// target as well when it has one, since a deployment addressing several
+// targets says nothing about which of them failed. It surfaces the parent
 // apply's ErrorMessage from the aggregate when the rollout settles to failed,
 // rather than leaving whatever message the last-driven (possibly successful)
 // operation wrote. The rollout's failure verdict is the first failure, so the
@@ -3034,9 +3036,13 @@ func firstFailedTaskError(tasks []*storage.Task) string {
 // carries a message, so the caller keeps the existing apply message as fallback.
 func firstFailedOperationMessage(ops []*storage.ApplyOperation) string {
 	for _, op := range ops {
-		if state.IsState(op.State, state.ApplyOperation.Failed) && op.ErrorMessage != "" {
-			return fmt.Sprintf("deployment %s failed: %s", op.Deployment, op.ErrorMessage)
+		if !state.IsState(op.State, state.ApplyOperation.Failed) || op.ErrorMessage == "" {
+			continue
 		}
+		if op.Target != "" {
+			return fmt.Sprintf("target %s on deployment %s failed: %s", op.Target, op.Deployment, op.ErrorMessage)
+		}
+		return fmt.Sprintf("deployment %s failed: %s", op.Deployment, op.ErrorMessage)
 	}
 	return ""
 }

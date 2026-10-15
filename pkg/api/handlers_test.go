@@ -5178,6 +5178,50 @@ func TestValidateRollbackSourceApplyRejectsPlannerSourceMismatchForOlderApply(t 
 	assert.Contains(t, err.Error(), "current rollback planner would select")
 }
 
+// A rollout whose targets are each planned against their own schema runs every
+// target but the primary from a member plan bound to the primary, so the latest
+// task can point at a member plan of the apply's own review round. That task is
+// still this apply's work and passes the source check; a task on a plan bound
+// to some other review round does not.
+func TestValidateRollbackSourceApplyAcceptsMemberPlanOfTheApplysRound(t *testing.T) {
+	now := time.Now().UTC()
+	for _, tc := range []struct {
+		name          string
+		memberPrimary string
+		wantErr       string
+	}{
+		{name: "member plan of the apply's round", memberPrimary: "plan-primary"},
+		{name: "member plan of another round", memberPrimary: "plan-other", wantErr: "latest schema change task for database orders points to plan 11"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			apply := rollbackGuardrailApply("apply_rollout", 1, 10, now)
+			primary := rollbackGuardrailPlan(10, true)
+			primary.PlanIdentifier = "plan-primary"
+			member := rollbackGuardrailPlan(11, true)
+			member.PlanIdentifier = "plan-member"
+			member.PrimaryPlanIdentifier = tc.memberPrimary
+			svc := newRollbackGuardrailServiceWithApplies([]*storage.Apply{apply}, map[int64]*storage.Plan{10: primary, 11: member},
+				[]*storage.Task{rollbackGuardrailTask(1, 11, now)})
+
+			_, gotPlan, err := svc.ValidateRollbackSourceApply(t.Context(), RollbackSourceRequest{
+				ApplyIdentifier: "apply_rollout",
+				Environment:     "staging",
+				Repository:      "org/repo",
+				PullRequest:     1,
+			})
+
+			if tc.wantErr != "" {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tc.wantErr)
+				return
+			}
+			require.NoError(t, err)
+			require.NotNil(t, gotPlan)
+			assert.Equal(t, int64(10), gotPlan.ID, "the source plan stays the apply's primary plan")
+		})
+	}
+}
+
 func TestValidateRollbackSourceApplyScopesLatestCompletedTaskByEnvironment(t *testing.T) {
 	now := time.Now().UTC()
 	apply := rollbackGuardrailApply("apply_staging", 1, 10, now.Add(-time.Minute))
