@@ -19,6 +19,10 @@ grpc:
 config:
   storage:
     dsn: "env:MYSQL_DSN"
+  # The data plane drives every operation of the shared apply, so it needs
+  # one driver per target as well; with fewer, a target queues behind the
+  # others and the scenarios that need every target moving at once race.
+  max_drivers_per_apply: 3
   target_resolver:
     etre:
       - addr: "http://etre:8080"
