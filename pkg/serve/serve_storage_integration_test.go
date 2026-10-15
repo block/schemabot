@@ -3,6 +3,7 @@
 package serve
 
 import (
+	"bytes"
 	"fmt"
 	"log/slog"
 	"testing"
@@ -179,6 +180,11 @@ func TestBuildCarriesLocalHostingToTheStorageSchemaAdapter(t *testing.T) {
 // time has passed is claimable, and one still in the future is not. Storage
 // writes UTC timestamps from Go and compares them against the session's NOW(),
 // so the storage pool must run its sessions in UTC.
+//
+// The server's own zone still matters to an operator rolling the fleet: a pod
+// from a build that does not pin the session stamps lease heartbeats in that
+// zone, and a pinned pod would reclaim its live applies. So connecting to such
+// a server logs the rollout rule, with the measured offset.
 func TestConnectStorageMySQLSessionsRunInUTC(t *testing.T) {
 	ctx := t.Context()
 	req := testutil.MySQLContainerRequest("mysql:8.0", "schemabot")
@@ -191,8 +197,9 @@ func TestConnectStorageMySQLSessionsRunInUTC(t *testing.T) {
 	dsn, err := testutil.MySQLDSN(ctx, container, "schemabot")
 	require.NoError(t, err)
 
+	var logs bytes.Buffer
 	cfg := &api.ServerConfig{Storage: api.StorageConfig{DSN: dsn}}
-	db, _, err := connectStorage(ctx, cfg, schema.DialectMySQL, slog.New(slog.DiscardHandler))
+	db, _, err := connectStorage(ctx, cfg, schema.DialectMySQL, slog.New(slog.NewTextHandler(&logs, nil)))
 	require.NoError(t, err)
 	t.Cleanup(func() { utils.CloseAndLog(db) })
 	store, err := newStore(schema.DialectMySQL, db)
@@ -202,6 +209,12 @@ func TestConnectStorageMySQLSessionsRunInUTC(t *testing.T) {
 	require.NoError(t, db.QueryRowContext(ctx, "SELECT @@GLOBAL.time_zone, @@SESSION.time_zone").Scan(&globalZone, &sessionZone))
 	require.Equal(t, "-07:00", globalZone, "the server must default to a non-UTC zone for this test to mean anything")
 	assert.Equal(t, "+00:00", sessionZone)
+
+	assert.Contains(t, logs.String(), "level=WARN")
+	assert.Contains(t, logs.String(), "storage server's default time zone is not UTC")
+	assert.Contains(t, logs.String(), "Stop the old pods before starting the new ones")
+	assert.Contains(t, logs.String(), "default_time_zone=-07:00")
+	assert.Contains(t, logs.String(), "offset_from_utc=-7h0m0s")
 
 	require.NoError(t, store.Locks().Acquire(ctx, &storage.Lock{
 		DatabaseName: "appdb",
@@ -250,10 +263,14 @@ func TestConnectStorageMySQLReadsPlanTimestamps(t *testing.T) {
 	require.NoError(t, err)
 	for i, option := range []string{"", "?parseTime=false", "?parseTime=true"} {
 		t.Run(fmt.Sprintf("option_%d", i), func(t *testing.T) {
+			var logs bytes.Buffer
 			cfg := &api.ServerConfig{Storage: api.StorageConfig{DSN: dsn + option}}
-			db, _, err := connectStorage(t.Context(), cfg, schema.DialectMySQL, slog.New(slog.DiscardHandler))
+			db, _, err := connectStorage(t.Context(), cfg, schema.DialectMySQL, slog.New(slog.NewTextHandler(&logs, nil)))
 			require.NoError(t, err)
 			t.Cleanup(func() { utils.CloseAndLog(db) })
+			// The container's default zone is UTC, so pinned and unpinned
+			// sessions already agree and there is no rollout rule to log.
+			assert.NotContains(t, logs.String(), "Stop the old pods before starting the new ones")
 			store, err := newStore(schema.DialectMySQL, db)
 			require.NoError(t, err)
 			plan := &storage.Plan{PlanIdentifier: fmt.Sprintf("timestamp-plan-%d", i), Database: "app", DatabaseType: "mysql", Environment: "development", CreatedAt: time.Now().UTC().Truncate(time.Second)}

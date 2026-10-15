@@ -854,7 +854,58 @@ func connectStorage(ctx context.Context, cfg *api.ServerConfig, dialect schema.D
 		utils.CloseAndLog(db)
 		return nil, "", fmt.Errorf("ping storage database: %w", err)
 	}
+	if dialect == schema.DialectMySQL {
+		if err := warnWhenMySQLStorageDefaultsToNonUTC(pingCtx, db, logger); err != nil {
+			utils.CloseAndLog(db)
+			return nil, "", fmt.Errorf("read storage server time zone: %w", err)
+		}
+	}
 	return db, dsn, nil
+}
+
+// warnWhenMySQLStorageDefaultsToNonUTC reports, once at connect, a MySQL
+// storage server whose default session zone is not UTC. Every session this
+// pool opens runs in UTC regardless, so the server's zone does not affect this
+// process. It affects a rollout: a pod from a build that does not pin the
+// session stamps lease heartbeats in the server's zone, while a pod from this
+// build judges them against a UTC cutoff. On such a server, during a rolling
+// deploy, a live apply's heartbeat reads as stale by the zone offset and the
+// new pod reclaims the apply from its driver. The warning names that condition
+// so the operator rolling the fleet knows to stop the old pods before starting
+// the new ones.
+//
+// The zone is measured rather than parsed: the server converts the current
+// instant from UTC into its default zone, and the difference is the offset,
+// whatever spelling (an offset, a named zone, or SYSTEM) the variable carries.
+func warnWhenMySQLStorageDefaultsToNonUTC(ctx context.Context, db *sql.DB, logger *slog.Logger) error {
+	const query = `SELECT @@GLOBAL.time_zone, @@GLOBAL.system_time_zone,
+		TIMESTAMPDIFF(SECOND, UTC_TIMESTAMP(), CONVERT_TZ(UTC_TIMESTAMP(), '+00:00', @@GLOBAL.time_zone))`
+	var defaultZone, systemZone string
+	var offsetSeconds sql.NullInt64
+	if err := db.QueryRowContext(ctx, query).Scan(&defaultZone, &systemZone, &offsetSeconds); err != nil {
+		return fmt.Errorf("measure the storage server's default time zone against UTC: %w", err)
+	}
+	attrs := []any{
+		"default_time_zone", defaultZone,
+		"system_time_zone", systemZone,
+	}
+	if !offsetSeconds.Valid {
+		logger.Warn("storage server's default time zone cannot be converted to UTC, so treat it as not UTC: "+
+			"this build runs every storage session in UTC, and pods from a build that does not will have their "+
+			"lease heartbeats read as stale by the zone offset and their live applies reclaimed. "+
+			"Stop the old pods before starting the new ones.", attrs...)
+		return nil
+	}
+	if offsetSeconds.Int64 == 0 {
+		logger.Debug("storage server's default time zone is UTC; pinned and unpinned sessions read the same clock", attrs...)
+		return nil
+	}
+	logger.Warn("storage server's default time zone is not UTC: this build runs every storage session in UTC, "+
+		"so pods from a build that does not must not share this storage while an apply is in flight; their "+
+		"lease heartbeats read as stale by the zone offset and a pod from this build will reclaim a live apply. "+
+		"Stop the old pods before starting the new ones.",
+		append(attrs, "offset_from_utc", (time.Duration(offsetSeconds.Int64)*time.Second).String())...)
+	return nil
 }
 
 // pinnedStorageDSN is the reload callback the storage pool re-resolves through
