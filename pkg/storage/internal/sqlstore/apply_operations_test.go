@@ -2989,10 +2989,10 @@ func TestApplyOperationStore_FindNextApplyOperation_CapsDeferredDeploy(t *testin
 }
 
 // TestApplyOperationStore_FindNextApplyOperation_CountsRetryingSiblings verifies
-// that operations being retried count against the cap. A redispatched operation
-// keeps its failed_retryable state for the whole drive, so a driver is occupying
-// it the entire time — leaving it out of the count would let a retry sweep run
-// an apply at twice its configured cap.
+// that failed_retryable operations a driver holds count against the cap. A
+// crash-recovery re-lease leaves the row failed_retryable for its whole drive,
+// so a driver is occupying it the entire time — leaving it out of the count
+// would let a retry sweep run an apply at twice its configured cap.
 func TestApplyOperationStore_FindNextApplyOperation_CountsRetryingSiblings(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()

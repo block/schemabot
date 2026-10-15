@@ -1156,11 +1156,12 @@ const freshLeaseCountSQL = `(
 // be claimed in" and "states in which a driver occupies an operation" are
 // different questions that only mostly overlap.
 //
-// failed_retryable is where they part. A redispatched operation keeps that
-// state for its whole drive — the claim rotates the lease and leaves the state
-// alone, and the row is not rewritten until the drive settles it — so a driver
-// really is occupying it the entire time. Counting it is what keeps a retry
-// sweep from running the apply at twice its cap.
+// failed_retryable is where they part. A redispatched single-operation row
+// keeps that state for its whole drive — the claim rotates the lease and leaves
+// the state alone, and the row is not rewritten until the drive settles it — so
+// a driver really is occupying it the entire time. Counting it is what keeps a
+// retry sweep from running the apply at twice its cap. A multi-operation
+// redispatch moves its row to running instead, which the cap already counts.
 func driverOccupyingOperationStates() []string {
 	return append(claimableApplyStates(), state.ApplyOperation.FailedRetryable)
 }
@@ -1804,6 +1805,30 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 			`, ad.ApplyID, state.Apply.FailedRetryable, maxRecoveryAttempts, ad.ID); err != nil {
 				return nil, fmt.Errorf("consume retry budget for apply_operation %d redispatch: %w", ad.ID, err)
 			}
+
+			// A multi-operation redispatch must move the row out of
+			// failed_retryable atomically with the lease rotation, for the same
+			// reason the stopped claim moves its row to resuming: the
+			// redispatch arm is budget-gated, not heartbeat-gated, and nothing
+			// else closes it. A single-operation retry is closed by its parent
+			// claim's failed_retryable -> running transition, but a
+			// multi-operation parent is owned by the rollout projection and
+			// stays failed_retryable while any sibling is, so a row left
+			// failed_retryable would be re-leased on every poll, rotating the
+			// live driver's lease out from under it and starving every
+			// failed_retryable sibling behind it. As running, the row is
+			// re-leasable only by the heartbeat-guarded stale-active arm,
+			// which recovers a crashed drive. The guards match the budget
+			// bump: a genuine redispatch of a multi-operation apply.
+			moved, err := moveMultiOperationRedispatchToRunning(ctx, tx, ad)
+			if err != nil {
+				return nil, err
+			}
+			if moved {
+				ad.State = state.ApplyOperation.Running
+				ad.ErrorMessage = ""
+				ad.CompletedAt = nil
+			}
 		}
 	}
 
@@ -1816,6 +1841,42 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 	ad.LeaseAcquiredAt = &leaseAcquiredAt
 
 	return ad, nil
+}
+
+// moveMultiOperationRedispatchToRunning moves a failed_retryable operation of
+// a multi-operation apply to running when its parent is still failed_retryable,
+// which is what makes the claim a deliberate redispatch rather than crash
+// recovery. It reports whether the row moved. The sibling check is its own
+// read because MySQL refuses an UPDATE whose subquery reads the table being
+// updated.
+func moveMultiOperationRedispatchToRunning(ctx context.Context, tx *rebindTx, ad *storage.ApplyOperation) (bool, error) {
+	var siblings int
+	if err := tx.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM apply_operations WHERE apply_id = ? AND id <> ?
+	`, ad.ApplyID, ad.ID).Scan(&siblings); err != nil {
+		return false, fmt.Errorf("count siblings of redispatched apply_operation %d: %w", ad.ID, err)
+	}
+	if siblings == 0 {
+		return false, nil
+	}
+	res, err := tx.ExecContext(ctx, `
+		UPDATE apply_operations
+		SET state = ?, error_message = '', completed_at = NULL, updated_at = NOW()
+		WHERE id = ?
+			AND state = ?
+			AND EXISTS (
+				SELECT 1 FROM applies a
+				WHERE a.id = apply_operations.apply_id AND a.state = ?
+			)
+	`, state.ApplyOperation.Running, ad.ID, state.ApplyOperation.FailedRetryable, state.Apply.FailedRetryable)
+	if err != nil {
+		return false, fmt.Errorf("move redispatched apply_operation %d to running: %w", ad.ID, err)
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("read redispatch rows affected for apply_operation %d: %w", ad.ID, err)
+	}
+	return rows > 0, nil
 }
 
 // FindNextApplyOperationCutover atomically claims the next operation parked at
@@ -2396,11 +2457,11 @@ func unleasedOperationGate(d Dialect) string {
 // where the parent is selected.
 //
 // It reads the lease and nothing else, because state does not tell the two
-// meanings of a lease apart. A redispatched operation keeps its failed_retryable
-// state for the whole drive — the claim rotates the lease and leaves the state
-// alone — so any state filter that admits failed_retryable admits an apply a
-// driver is part-way through retrying, which is the one case a whole-apply write
-// must not land under. Filtering it out instead would exclude the retry but not
+// meanings of a lease apart. A redispatched single-operation row keeps its
+// failed_retryable state for the whole drive — the claim rotates the lease and
+// leaves the state alone — so any state filter that admits failed_retryable
+// admits an apply a driver is part-way through retrying, which is the one case a
+// whole-apply write must not land under. Filtering it out instead would exclude the retry but not
 // the drive.
 //
 // Reading the lease alone only terminalizes because a drive clears its lease as

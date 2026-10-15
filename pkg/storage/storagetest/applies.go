@@ -789,6 +789,57 @@ func TestApplies(t *testing.T, h Harness) {
 		require.NoError(t, createApplyOnDeployment(t, store, lock, "apply_region_a_after_retry", 9322, "region-a"), "a retry no driver holds reserves nothing")
 	})
 
+	// A data-plane outage leaves two targets of a rollout failed_retryable: one
+	// was copying and one never dispatched. The parent reads failed_retryable
+	// while either does. Redispatching the first moves its row to running in the
+	// claim, so the next claim takes the second target instead of re-leasing the
+	// first out from under the driver that is resuming it.
+	t.Run("FindNextApplyOperation_MultiOperationRedispatchMovesTheRowToRunning", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "apply_rollout_redispatch_db", storage.DatabaseTypeMySQL)
+		rollout := CreateApplyWithStateEnvDeployment(t, store, lock, "apply_rollout_redispatch", 9330, state.Apply.Pending, "production", "region-a")
+		copyingID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+			ApplyID: rollout.ID, Deployment: "region-a", Target: "orders-001", OperationKey: "orders-001/schema",
+			State: state.ApplyOperation.FailedRetryable, ErrorMessage: "progress poll failed",
+		})
+		require.NoError(t, err)
+		undispatchedID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+			ApplyID: rollout.ID, Deployment: "region-a", Target: "orders-002", OperationKey: "orders-002/schema",
+			State: state.ApplyOperation.FailedRetryable, ErrorMessage: "dispatch failed",
+		})
+		require.NoError(t, err)
+		rollout.State = state.Apply.FailedRetryable
+		require.NoError(t, store.Applies().Update(ctx, rollout))
+
+		first, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-a")
+		require.NoError(t, err)
+		require.NotNil(t, first, "a failed_retryable operation under a retryable parent must be claimable")
+		assert.Equal(t, state.ApplyOperation.Running, first.State, "the redispatch claim returns the row it moved")
+		redispatched, err := store.ApplyOperations().Get(ctx, first.ID)
+		require.NoError(t, err)
+		require.NotNil(t, redispatched)
+		assert.Equal(t, state.ApplyOperation.Running, redispatched.State)
+		assert.Empty(t, redispatched.ErrorMessage, "the redispatch clears the failure it is retrying")
+		assert.Equal(t, "driver-a", redispatched.LeaseOwner)
+		assert.Equal(t, first.LeaseToken, redispatched.LeaseToken)
+
+		second, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-b")
+		require.NoError(t, err)
+		require.NotNil(t, second, "the other failed_retryable target is claimable next")
+		assert.NotEqual(t, first.ID, second.ID, "the claim never re-leases the target driver-a is resuming")
+		assert.ElementsMatch(t, []int64{copyingID, undispatchedID}, []int64{first.ID, second.ID})
+
+		held, err := store.ApplyOperations().Get(ctx, first.ID)
+		require.NoError(t, err)
+		require.NotNil(t, held)
+		assert.Equal(t, first.LeaseToken, held.LeaseToken, "driver-a still holds the lease it claimed")
+
+		none, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-c")
+		require.NoError(t, err)
+		assert.Nil(t, none, "both targets are being resumed, so there is nothing left to claim")
+	})
+
 	// Moving an existing apply back into an active state runs the same check as
 	// creating one, so neither the general update nor the resume claim of a
 	// stopped apply can activate an apply on a target of a rollout whose parent
