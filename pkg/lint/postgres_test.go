@@ -261,8 +261,7 @@ CREATE INDEX k_ab ON t (a, b);`,
 	}
 }
 
-// Tables in the ignore list are parsed but produce no findings, matching the
-// MySQL audit's treatment of SchemaBot's own bookkeeping table.
+// Tables in the ignore list are parsed but produce no findings.
 func TestLintPostgresSchema_IgnoredTable(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.IgnoreTables = []string{"schema_version"}

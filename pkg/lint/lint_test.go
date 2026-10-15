@@ -80,6 +80,35 @@ func TestLintStatements_DropIndex(t *testing.T) {
 	assert.True(t, found, "expected invisible_index_before_drop error for DROP INDEX, got: %+v", results)
 }
 
+// The default linter classifies a destructive change by what it does, never
+// by the table's name: dropping a column and a unique index requires
+// --allow-unsafe on a table called schema_version exactly as on users.
+func TestPlanChangesDefaultConfigFlagsDropsOnEveryTableName(t *testing.T) {
+	for _, name := range []string{"users", "schema_version"} {
+		t.Run(name, func(t *testing.T) {
+			current := []table.TableSchema{{Name: name, Schema: "CREATE TABLE `" + name + "` (" +
+				"`id` bigint NOT NULL, `checksum` int, `script` varchar(100), " +
+				"PRIMARY KEY (`id`), UNIQUE KEY `u_script` (`script`)" +
+				") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"}}
+			desired := []table.TableSchema{{Name: name, Schema: "CREATE TABLE `" + name + "` (" +
+				"`id` bigint NOT NULL, `script` varchar(100), PRIMARY KEY (`id`)" +
+				") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"}}
+
+			plan, err := PlanChanges(current, desired, nil, New().SpiritConfig())
+			require.NoError(t, err)
+			require.Len(t, plan.Changes, 1)
+
+			change := plan.Changes[0]
+			assert.Equal(t, name, change.TableName)
+			assert.Contains(t, change.Statement, "DROP COLUMN `checksum`")
+			assert.Contains(t, change.Statement, "DROP INDEX `u_script`")
+			reason, unsafe := PlannedChangeUnsafeReason(change)
+			assert.True(t, unsafe, "dropping a column and an index on %s must require --allow-unsafe", name)
+			assert.NotEmpty(t, reason)
+		})
+	}
+}
+
 func TestLintStatements_SafeAlter(t *testing.T) {
 	linter := New()
 
