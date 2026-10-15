@@ -145,6 +145,68 @@ func testProcessDriverShare(t *testing.T, newStore newShareStore) {
 		assert.Equal(t, parkedID, cutover.ID)
 	})
 
+	// A two-driver pod has one share slot for the apply, and both a pending
+	// shard's copy and a parked shard's cutover could take it. The pod's copy
+	// and cutover claims race for that slot together, round after round, and
+	// exactly one of them wins it each time: the two claim paths share one
+	// per-process lock, so neither reads the free slot while the other is
+	// taking it.
+	t.Run("CopyAndCutoverClaimsShareOneSlot", func(t *testing.T) {
+		const rounds = 20
+		const claimersPerPath = 4
+		for round := range rounds {
+			store := newStore(t, storage.WithMaxDriversPerApply(32), storage.WithDriversPerProcess(2))
+			lock := storagetest.CreateLock(t, store, fmt.Sprintf("share_mixed_db_%d", round), storage.DatabaseTypeMySQL)
+			apply := storagetest.CreateApply(t, store, lock, fmt.Sprintf("apply_share_mixed_%d", round), 1)
+			_, err := store.ApplyOperations().Insert(t.Context(), &storage.ApplyOperation{
+				ApplyID: apply.ID, Deployment: "region-a", OperationKey: "commerce/shard-0/users",
+				OperationKind: storage.ApplyOperationKindWork,
+				State:         state.ApplyOperation.WaitingForCutover, CutoverPolicy: storage.CutoverPolicyBarrier,
+			})
+			require.NoError(t, err)
+			_, err = store.ApplyOperations().Insert(t.Context(), &storage.ApplyOperation{
+				ApplyID: apply.ID, Deployment: "region-a", OperationKey: "commerce/shard-1/users",
+				OperationKind: storage.ApplyOperationKindWork, CutoverPolicy: storage.CutoverPolicyBarrier,
+			})
+			require.NoError(t, err)
+
+			start := make(chan struct{})
+			var wg sync.WaitGroup
+			var mu sync.Mutex
+			var claimed []*storage.ApplyOperation
+			var claimErrors []error
+			record := func(got *storage.ApplyOperation, err error) {
+				mu.Lock()
+				defer mu.Unlock()
+				if err != nil {
+					claimErrors = append(claimErrors, err)
+					return
+				}
+				if got != nil {
+					claimed = append(claimed, got)
+				}
+			}
+			for i := range claimersPerPath {
+				copyOwner := fmt.Sprintf("pod-a/1/driver-copy-%d", i)
+				cutoverOwner := fmt.Sprintf("pod-a/1/driver-cutover-%d", i)
+				wg.Go(func() {
+					<-start
+					record(store.ApplyOperations().FindNextApplyOperation(t.Context(), copyOwner))
+				})
+				wg.Go(func() {
+					<-start
+					record(store.ApplyOperations().FindNextApplyOperationCutover(t.Context(), cutoverOwner))
+				})
+			}
+			close(start)
+			wg.Wait()
+
+			require.Empty(t, claimErrors, "round %d", round)
+			require.Len(t, claimed, 1, "round %d: the pod's one share slot goes to exactly one claim", round)
+			assert.Equal(t, apply.ID, claimed[0].ApplyID)
+		}
+	})
+
 	// A shard parked at the cutover barrier keeps the lease of the drive that
 	// parked it until that lease goes stale, but the drive has returned and the
 	// driver is free. On a two-driver pod the shard's cutover still starts there
