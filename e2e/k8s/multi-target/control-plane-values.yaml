@@ -1,0 +1,55 @@
+# Control plane Helm values for the multi-target k8s e2e.
+#
+# Every environment here addresses several targets behind one data plane
+# deployment, the shape that rolls out table by table. shardapp lists its
+# targets bare, so each shard holds every namespace the schema files declare;
+# nsapp gives each target its own namespace. The targets are DSIDs the data
+# plane resolves through Etre.
+
+image:
+  repository: schemabot
+  tag: test
+  pullPolicy: Never
+
+config:
+  storage:
+    dsn: "env:MYSQL_DSN"
+  databases:
+    shardapp:
+      type: mysql
+      environments:
+        staging:
+          deployment: data-plane-mt
+          targets:
+            - dsid-shard-001
+            - dsid-shard-002
+            - dsid-shard-003
+    nsapp:
+      type: mysql
+      environments:
+        staging:
+          deployment: data-plane-mt
+          targets:
+            - target: dsid-shard-001
+              namespaces: [nsapp_a]
+            - target: dsid-shard-002
+              namespaces: [nsapp_b]
+            - target: dsid-shard-003
+              namespaces: [nsapp_c]
+  tern_deployments:
+    data-plane-mt:
+      staging: "data-plane-mt-schemabot:13370"
+
+env:
+  - name: MYSQL_DSN
+    value: "root:testpassword@tcp(mysql-control-plane:3306)/schemabot?parseTime=true&multiStatements=true"
+  - name: LOG_LEVEL
+    value: "debug"
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: "1"
+    memory: 512Mi

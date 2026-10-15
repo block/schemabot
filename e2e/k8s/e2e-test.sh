@@ -234,12 +234,13 @@ done
 
 echo "Running k8s e2e tests..."
 TEST_EXIT_CODE=0
-# The etre- and vitess-resolver tests need their own in-cluster stacks and run in
-# dedicated jobs, so skip them here rather than against the base stack.
+# The etre-resolver, vitess-resolver, and multi-target tests need their own
+# in-cluster stacks and run in dedicated jobs, so skip them here rather than
+# against the base stack.
 E2E_SCHEMABOT_URL="http://localhost:${CONTROL_PLANE_PORT}" \
 E2E_SCHEMABOT_MYSQL_DSN="root:testpassword@tcp(localhost:${MYSQL_CONTROL_PLANE_PORT})/schemabot?parseTime=true&multiStatements=true" \
 E2E_TERN_STAGING_MYSQL_DSN="root:testpassword@tcp(localhost:${MYSQL_DATA_PLANE_PORT})/testapp?parseTime=true&multiStatements=true" \
-    go test -count=1 -v -tags=e2e -timeout="${E2E_TEST_TIMEOUT:-10m}" -skip 'TestK8sEtre|TestK8sVitess' ./e2e/k8s/... || TEST_EXIT_CODE=$?
+    go test -count=1 -v -tags=e2e -timeout="${E2E_TEST_TIMEOUT:-10m}" -skip 'TestK8sEtre|TestK8sVitess|TestK8sMultiTarget' ./e2e/k8s/... || TEST_EXIT_CODE=$?
 
 # Teardown runs in the EXIT trap.
 exit "$TEST_EXIT_CODE"
