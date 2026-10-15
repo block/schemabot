@@ -175,11 +175,13 @@ type ApplyStatusCommentData struct {
 	Rollback bool
 
 	// DeferCutover reports whether cutover waits on an explicit operator
-	// trigger (the apply's durable defer-cutover option). It selects the
-	// waiting-for-cutover footer: deferred applies get the pasteable
-	// `schemabot cutover` command, while non-deferred applies get a note that
-	// the drive triggers cutover automatically — surfacing the command there
-	// would tell the operator to act when no action is needed.
+	// trigger (the apply's durable defer-cutover option). Before cutover it
+	// adds the deferred-cutover line under the status, so a reader of a long
+	// copy or checksum knows the apply will pause and wait for them. It also
+	// selects the waiting-for-cutover footer: deferred applies get the
+	// pasteable `schemabot cutover` command, while non-deferred applies get a
+	// note that the drive triggers cutover automatically — surfacing the
+	// command there would tell the operator to act when no action is needed.
 	DeferCutover bool
 
 	// PlanID names the plan this member is running, alongside the database and
@@ -239,6 +241,9 @@ func renderApplyStatusCommentBody(data ApplyStatusCommentData, includeLastUpdate
 	// inline (e.g. "Revert Window | Closes in 28m 30s") so the operator sees the
 	// state and its deadline in one place rather than on a separate line.
 	writeApplyStatusDetail(&sb, data)
+	if !data.InRolloutSection {
+		writeDeferredCutoverNote(&sb, data.DeferCutover, data.State)
+	}
 	writeApplyStep(&sb, data)
 
 	// Deploy-request link (PlanetScale) — the operator's entry point into the
@@ -436,6 +441,39 @@ func writeApplyStatusDetail(sb *strings.Builder, data ApplyStatusCommentData) {
 	if state.IsState(data.State, state.Apply.Failed) {
 		writeSupportChannelOffer(sb)
 	}
+}
+
+// deferredCutoverNote tells the reader of a deferred apply that has not yet
+// reached cutover what happens next and what they will do then. It reuses the
+// plan and apply comments' option label, so the option reads the same from the
+// plan through the apply.
+const deferredCutoverNote = "**Options**: ⏸️ Defer Cutover — pauses before cutover and waits for `schemabot cutover`"
+
+// writeDeferredCutoverNote writes the deferred-cutover line while a deferred
+// apply is still working toward its cutover pause. Once the apply waits for
+// cutover the footer gives the command itself, and after that the deferral has
+// nothing left to tell the reader.
+func writeDeferredCutoverNote(sb *strings.Builder, deferCutover bool, applyState string) {
+	if !deferCutover || !precedesCutover(applyState) {
+		return
+	}
+	fmt.Fprintf(sb, "\n%s\n", deferredCutoverNote)
+}
+
+// precedesCutover reports whether an apply in this state has not yet reached
+// cutover and will go through it: queued, copying rows or in a post-copy phase,
+// resuming that work, or preparing a PlanetScale branch and deploy request.
+// States that may or may not still be before cutover (recovering, retrying,
+// stopped) are left out, so the line never claims a pause that has passed.
+func precedesCutover(applyState string) bool {
+	return state.IsRunningApplyState(applyState) || state.IsState(applyState,
+		state.Apply.Pending,
+		state.Apply.Resuming,
+		state.Apply.PreparingBranch,
+		state.Apply.ApplyingBranchChanges,
+		state.Apply.ValidatingBranch,
+		state.Apply.CreatingDeployRequest,
+		state.Apply.ValidatingDeployRequest)
 }
 
 // queuedApplyExplanation follows the status line of an apply SchemaBot has
@@ -1883,6 +1921,7 @@ func ApplyStatusFromProgress(resp *apitypes.ProgressResponse, requestedBy string
 		ErrorMessage: resp.ErrorMessage,
 		StartedAt:    resp.StartedAt,
 		CompletedAt:  resp.CompletedAt,
+		DeferCutover: resp.Options["defer_cutover"] == "true",
 	}
 	data.RevertExpiresAt = resp.Metadata["revert_expires_at"]
 	if step, err := apitypes.ParseProgressStep(resp.Metadata); err != nil {

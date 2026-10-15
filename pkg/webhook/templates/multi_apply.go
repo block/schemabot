@@ -118,6 +118,12 @@ func renderMultiDeploymentApplyComment(data MultiDeploymentApplyData, renderedAt
 		return sb.String()
 	}
 	writeDeploymentCounts(&sb, data.Model.Counts, groups)
+	// The deferral is the apply's, so it is stated once here rather than in
+	// each deployment's section. A deployment already waiting for cutover
+	// puts the command in the footer, which says it instead.
+	if data.Model.NextAction.Kind != presentation.NextActionCutover {
+		writeDeferredCutoverNote(&sb, rolloutDefersCutover(data.Details), data.Model.State)
+	}
 	writeAggregateFirstFailure(&sb, data.Model.FirstFailure)
 
 	// Flat per-deployment summary (always visible — survives any later size
