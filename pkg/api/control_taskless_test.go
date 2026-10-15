@@ -77,16 +77,26 @@ func TestQueueStopForTasklessApplyRecordsDurableRequest(t *testing.T) {
 	assert.Equal(t, "operator", req.RequestedBy)
 }
 
-// An operator started a stopped rollout and is stopping it again. The rollout
-// kept its start pending while it ran, since the start is what its stopped
-// operations are claimed for, so the new stop completes that start before it
-// is recorded: a start left pending under it would resume the rollout the
-// moment the stop landed. A single-operation apply's drive consumes its own
-// start, so the stop leaves that start alone.
-func TestQueueStopSupersedesThePendingStartOfARollout(t *testing.T) {
+// An operator stopped an apply, started it again, and is stopping it again.
+// An apply driven under the operation lease kept its start pending while it
+// ran, since the start is what its stopped operations are claimed for, so the
+// new stop completes that start before it is recorded: a start left pending
+// under it would resume the apply the moment the stop landed. That covers a
+// rollout, and also a lone operation that drives under the operation lease
+// because its manifest still expects siblings or because it has no tasks. An
+// apply driven under the parent lease consumes its own start, so the stop
+// leaves that start alone.
+func TestQueueStopSupersedesThePendingStartOfAnOperationLeaseDrive(t *testing.T) {
+	operationID := int64(1)
+	taskOfTheLoneOperation := []*storage.Task{{ID: 5, ApplyID: 13, ApplyOperationID: &operationID, State: state.Task.Running}}
+	loneOperation := []*storage.ApplyOperation{
+		{ID: operationID, ApplyID: 13, Deployment: "region-a", OperationKey: "orders-001", State: state.ApplyOperation.Resuming},
+	}
 	for _, tc := range []struct {
 		name          string
 		operations    []*storage.ApplyOperation
+		tasks         []*storage.Task
+		expectedKeys  []string
 		wantStartLeft bool
 	}{
 		{
@@ -97,21 +107,44 @@ func TestQueueStopSupersedesThePendingStartOfARollout(t *testing.T) {
 			},
 		},
 		{
-			name: "single operation",
-			operations: []*storage.ApplyOperation{
-				{ID: 1, ApplyID: 13, Deployment: "region-a", State: state.ApplyOperation.Resuming},
-			},
+			name:         "lone operation whose manifest still expects a sibling",
+			operations:   loneOperation,
+			tasks:        taskOfTheLoneOperation,
+			expectedKeys: []string{"orders-001", "orders-002"},
+		},
+		{
+			name:       "lone task-less operation",
+			operations: loneOperation,
+		},
+		{
+			name:          "lone operation with tasks",
+			operations:    loneOperation,
+			tasks:         taskOfTheLoneOperation,
+			wantStartLeft: true,
+		},
+		{
+			name:          "lone operation with tasks whose manifest is fully attached",
+			operations:    loneOperation,
+			tasks:         taskOfTheLoneOperation,
+			expectedKeys:  []string{"orders-001"},
+			wantStartLeft: true,
+		},
+		{
+			name:          "no operation attached yet",
 			wantStartLeft: true,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			controls := &memoryControlRequestStore{}
 			svc := New(&mockStorageWithApplyStores{
-				tasks:      &capturingTaskStore{},
+				tasks:      &capturingTaskStore{tasks: tc.tasks},
 				controls:   controls,
 				operations: &staticApplyOperationStore{operations: tc.operations},
 			}, testServerConfig(), nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
-			apply := &storage.Apply{ID: 13, ApplyIdentifier: "apply-restopped", Database: "orders", State: state.Apply.Running, Environment: "staging"}
+			apply := &storage.Apply{
+				ID: 13, ApplyIdentifier: "apply-restopped", Database: "orders", State: state.Apply.Running, Environment: "staging",
+				ExpectedOperationKeys: tc.expectedKeys,
+			}
 			_, _, err := controls.RequestPending(t.Context(), &storage.ApplyControlRequest{
 				ApplyID: apply.ID, Operation: storage.ControlOperationStart, Status: storage.ControlRequestPending, RequestedBy: "first-operator",
 			})
@@ -124,9 +157,9 @@ func TestQueueStopSupersedesThePendingStartOfARollout(t *testing.T) {
 			start, err := controls.GetPending(t.Context(), apply.ID, storage.ControlOperationStart)
 			require.NoError(t, err)
 			if tc.wantStartLeft {
-				assert.NotNil(t, start, "the single-operation drive consumes its own start")
+				assert.NotNil(t, start, "a parent-lease drive consumes its own start")
 			} else {
-				assert.Nil(t, start, "the stop supersedes the rollout's pending start, so nothing reopens the rollout once it lands")
+				assert.Nil(t, start, "the stop supersedes the operation-lease drive's pending start, so nothing reopens the apply once it lands")
 			}
 			stop, err := controls.GetPending(t.Context(), apply.ID, storage.ControlOperationStop)
 			require.NoError(t, err)

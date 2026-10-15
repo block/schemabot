@@ -1304,14 +1304,14 @@ func (s *Service) queueStopForApplyOwner(ctx context.Context, apply *storage.App
 
 // stopSupersedesPendingStart reports whether a stop recorded on this apply
 // supersedes a pending start, which the stop's own write then completes in the
-// same transaction. A rollout keeps its start pending until it settles,
-// because the operations the start resumes are claimed one at a time on its
-// behalf, and a pending start on a stopped rollout is what reopens it. Left
-// pending under the new stop, that start would resume the rollout as soon as
-// the stop landed on every operation. A stop is only accepted for a
-// non-terminal apply, so the start it supersedes has already taken effect. A
-// single-operation apply's drive consumes its start when it resumes, so its
-// start is left to that drive.
+// same transaction. An apply driven under the operation lease keeps its start
+// pending until it settles, because the operations the start resumes are
+// claimed one at a time on its behalf, and a pending start on a stopped apply
+// is what reopens it. Left pending under the new stop, that start would resume
+// the apply as soon as the stop landed on every operation. A stop is only
+// accepted for a non-terminal apply, so the start it supersedes has already
+// taken effect. An apply driven under the parent lease consumes its start when
+// its drive resumes, so its start is left to that drive.
 func (s *Service) stopSupersedesPendingStart(ctx context.Context, apply *storage.Apply, caller string) (bool, error) {
 	controlStore := s.storage.ControlRequests()
 	if controlStore == nil {
@@ -1328,14 +1328,41 @@ func (s *Service) stopSupersedesPendingStart(ctx context.Context, apply *storage
 	if err != nil {
 		return false, fmt.Errorf("list apply_operations for apply %s before recording a stop: %w", apply.ApplyIdentifier, err)
 	}
-	if len(ops) < 2 {
-		s.logger.Info("stop requested while a start is pending on a single-operation apply; leaving the start to the drive that resumes it",
-			append(apply.LogAttrs(), "requested_by", caller, "start_requested_by", start.RequestedBy)...)
+	operationLease, err := s.applyDrivesUnderOperationLease(ctx, apply, ops)
+	if err != nil {
+		return false, fmt.Errorf("decide drive mode of apply %s before recording a stop: %w", apply.ApplyIdentifier, err)
+	}
+	if !operationLease {
+		s.logger.Info("stop requested while a start is pending on an apply driven under the parent lease; leaving the start to the drive that resumes it",
+			append(apply.LogAttrs(), "requested_by", caller, "start_requested_by", start.RequestedBy, "operation_count", len(ops))...)
 		return false, nil
 	}
-	s.logger.Info("stop requested while a start is pending on a rollout; the stop write completes the start it supersedes",
-		append(apply.LogAttrs(), "requested_by", caller, "start_requested_by", start.RequestedBy)...)
+	s.logger.Info("stop requested while a start is pending on an apply driven under the operation lease; the stop write completes the start it supersedes",
+		append(apply.LogAttrs(), "requested_by", caller, "start_requested_by", start.RequestedBy, "operation_count", len(ops))...)
 	return true, nil
+}
+
+// applyDrivesUnderOperationLease reports whether the apply's operations are
+// driven under the operation lease, with the parent projected from them, rather
+// than under the parent lease. It mirrors the drive-mode decision in
+// recoverApplyOperation: a rollout of several operations, a lone operation
+// whose generation manifest still expects siblings, and a lone task-less
+// operation all drive under the operation lease. An apply with no operation
+// attached has not been driven yet, so no drive mode applies.
+func (s *Service) applyDrivesUnderOperationLease(ctx context.Context, apply *storage.Apply, ops []*storage.ApplyOperation) (bool, error) {
+	switch {
+	case len(ops) == 0:
+		return false, nil
+	case len(ops) > 1:
+		return true, nil
+	case len(apply.MissingExpectedOperationKeys(ops)) > 0:
+		return true, nil
+	}
+	hasTasks, err := s.claimedOperationHasTasks(ctx, ops[0])
+	if err != nil {
+		return false, err
+	}
+	return !hasTasks, nil
 }
 
 func stopRequestCounts(tasks []*storage.Task) (int64, int64) {
