@@ -2452,6 +2452,21 @@ func PreviewCommentApplyChecksumming() string {
 	return RenderApplyStatusComment(sampleApplyData(state.Apply.Checksumming, tables))
 }
 
+// PreviewCommentApplyChecksummingDeferredCutover renders the checksumming
+// comment for an apply started with --defer-cutover, which carries the
+// deferred-cutover option.
+func PreviewCommentApplyChecksummingDeferredCutover() string {
+	tables := sampleApplyTables()
+	tables[0].Status = state.Task.Completed
+	tables[1].Status = state.Task.Checksumming
+	tables[1].ChecksumRowsChecked = 321450
+	tables[1].ChecksumRowsTotal = 1466232
+	tables[2].Status = state.Task.Pending
+	data := sampleApplyData(state.Apply.Checksumming, tables)
+	data.DeferCutover = true
+	return RenderApplyStatusComment(data)
+}
+
 // PreviewCommentApplyPostChecksum renders an apply comment where a table has
 // passed the checksum and is draining the changes that accumulated during it.
 func PreviewCommentApplyPostChecksum() string {

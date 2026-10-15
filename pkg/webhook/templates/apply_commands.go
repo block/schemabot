@@ -329,6 +329,7 @@ func RenderApplyStarted(data ApplyStatusCommentData) string {
 
 	writeApplyStatusHeader(&sb, data)
 	writeApplyMetadata(&sb, data, currentTimestamp())
+	writeApplyOptions(&sb, data.DeferCutover, data.SkipRevert, data.State)
 	if state.IsState(data.State, state.Apply.Pending) {
 		writeApplyStatusDetail(&sb, data)
 		return sb.String()
