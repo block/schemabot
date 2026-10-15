@@ -4829,6 +4829,55 @@ func TestPendingDropsConfig(t *testing.T) {
 	})
 }
 
+func TestBranchReconcileConfig(t *testing.T) {
+	t.Run("parsed from YAML", func(t *testing.T) {
+		var cfg ServerConfig
+		require.NoError(t, yaml.Unmarshal([]byte("branch_reconcile:\n  enabled: true\n  delete: true\n  grace: 36h\n"), &cfg))
+		assert.Equal(t, BranchReconcileConfig{Enabled: true, Delete: true, Grace: "36h"}, cfg.BranchReconcile)
+		grace, err := cfg.BranchReconcileGrace()
+		require.NoError(t, err)
+		assert.Equal(t, 36*time.Hour, grace)
+	})
+
+	t.Run("default grace", func(t *testing.T) {
+		cfg := ServerConfig{}
+		grace, err := cfg.BranchReconcileGrace()
+		require.NoError(t, err)
+		assert.Equal(t, 24*time.Hour, grace)
+	})
+
+	t.Run("invalid grace rejected", func(t *testing.T) {
+		cfg := ServerConfig{BranchReconcile: BranchReconcileConfig{Grace: "soon"}}
+		_, err := cfg.BranchReconcileGrace()
+		assert.ErrorContains(t, err, "branch_reconcile.grace")
+	})
+
+	t.Run("non-positive grace rejected", func(t *testing.T) {
+		cfg := ServerConfig{BranchReconcile: BranchReconcileConfig{Grace: "0s"}}
+		_, err := cfg.BranchReconcileGrace()
+		assert.ErrorContains(t, err, "must be positive")
+	})
+
+	databases := map[string]DatabaseConfig{
+		"orders": {
+			Type: "vitess",
+			Environments: map[string]EnvironmentConfig{
+				"staging": {DSN: "root:pass@tcp(localhost:3306)/orders"},
+			},
+		},
+	}
+
+	t.Run("validate rejects invalid grace when enabled", func(t *testing.T) {
+		cfg := ServerConfig{Databases: databases, BranchReconcile: BranchReconcileConfig{Enabled: true, Grace: "soon"}}
+		assert.ErrorContains(t, cfg.Validate(), "branch_reconcile.grace")
+	})
+
+	t.Run("validate ignores invalid grace when disabled", func(t *testing.T) {
+		cfg := ServerConfig{Databases: databases, BranchReconcile: BranchReconcileConfig{Grace: "soon"}}
+		assert.NoError(t, cfg.Validate())
+	})
+}
+
 func TestSupportChannelConfig(t *testing.T) {
 	validConfig := func() ServerConfig {
 		return ServerConfig{

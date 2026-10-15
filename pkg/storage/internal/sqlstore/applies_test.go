@@ -5094,3 +5094,43 @@ func TestApplyExpiryOrderingIsIndexed(t *testing.T) {
 	assert.Equal(t, []string{"state", "updated_at"}, indexColumns,
 		"the expiry ordering needs an index on exactly its filter and ordering columns, in that order")
 }
+
+// Only one instance reconciles engine branches per pass, and it holds the
+// election for as long as the reconcile runs: a second instance that asks while
+// the first is inside its pass steps aside without running its own, and once
+// the first finishes the lock is free for the next pass.
+func TestApplyStore_WithBranchReconcileElection_ElectsOneInstancePerPass(t *testing.T) {
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+	other := NewMySQL(testDB)
+
+	ranOther := false
+	err := store.Applies().WithBranchReconcileElection(ctx, func(ctx context.Context) error {
+		otherErr := other.Applies().WithBranchReconcileElection(ctx, func(context.Context) error {
+			ranOther = true
+			return nil
+		})
+		require.ErrorIs(t, otherErr, storage.ErrBranchReconcileBusy, "a second instance steps aside while the first is reconciling")
+		return nil
+	})
+	require.NoError(t, err)
+	assert.False(t, ranOther)
+
+	ranNext := false
+	require.NoError(t, other.Applies().WithBranchReconcileElection(ctx, func(context.Context) error {
+		ranNext = true
+		return nil
+	}))
+	assert.True(t, ranNext, "the lock is released when the elected pass returns")
+}
+
+// The reconcile's own error is what the election returns, so the pass can
+// report it.
+func TestApplyStore_WithBranchReconcileElection_ReturnsTheReconcileError(t *testing.T) {
+	store := NewMySQL(testDB)
+	reconcileErr := fmt.Errorf("list branches: PlanetScale API unavailable")
+
+	err := store.Applies().WithBranchReconcileElection(t.Context(), func(context.Context) error { return reconcileErr })
+
+	require.ErrorIs(t, err, reconcileErr)
+}
