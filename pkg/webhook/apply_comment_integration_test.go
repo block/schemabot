@@ -1674,6 +1674,187 @@ func TestE2EDeferredCutoverCommandRotatesProgressComment(t *testing.T) {
 	}
 }
 
+// A deferred apply submitted with skip-revert chosen upfront passes from the
+// cutover straight into skipping revert, so the first tick past the gate can
+// find it there with only the operator's cutover request on record. That tick
+// still owes the cutover command's rotation: a fresh progress comment at the
+// bottom of the PR, with the comment that waited for cutover folded under the
+// cutover's headline. Later ticks and a fresh observer edit the fresh comment.
+func TestE2EDeferredCutoverFirstObservedSkippingRevertRotates(t *testing.T) {
+	ctx := t.Context()
+	const repo = "org/repo-cutover-skip-revert"
+	f := setupApplyCommentFixture(t, applyCommentFixtureParams{
+		repo:         repo,
+		pr:           158,
+		database:     "e2e_cutover_skip_revert_db",
+		applyState:   state.Apply.WaitingForCutover,
+		deferCutover: true,
+	})
+	st, apply, task, capture, h := f.st, f.apply, f.task, f.capture, f.handler
+
+	h.postAndTrackComment(ctx, repo, 158, 12345, apply, state.Comment.Progress, "Waiting for Cutover — run `schemabot cutover` to proceed")
+	gateProgressID := requireCommentCreate(t, capture)
+
+	_, _, err := st.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationCutover,
+		RequestedBy: "operator",
+	})
+	require.NoError(t, err)
+
+	fake := clock.NewFake(task.CreatedAt)
+	obs := f.newObserver(st, fake)
+
+	apply.State = state.Apply.SkippingRevert
+	task.State = state.Task.RevertWindow
+	obs.OnProgress(apply, []*storage.Task{task})
+
+	freshID := requireCommentCreate(t, capture)
+	select {
+	case edited := <-capture.edits:
+		assert.Equal(t, gateProgressID, edited.CommentID, "the fold lands on the comment that waited for cutover")
+		assert.True(t, strings.HasPrefix(edited.Body, fmt.Sprintf(
+			"Cutover started — progress continues in [a new progress comment](https://github.com/%s/pull/158#issuecomment-%d).", repo, freshID)), edited.Body)
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected the comment that waited for cutover to be folded")
+	}
+
+	prog, err := st.ApplyComments().Get(ctx, apply.ID, state.Comment.Progress)
+	require.NoError(t, err)
+	require.NotNil(t, prog)
+	assert.Equal(t, freshID, prog.GitHubCommentID)
+	require.NotNil(t, prog.PostedPhase)
+	assert.Equal(t, phaseSkippingRevert, *prog.PostedPhase)
+
+	for _, o := range []*CommentObserver{obs, f.newObserver(st, fake)} {
+		fake.Advance(activeInterval + time.Second)
+		o.OnProgress(apply, []*storage.Task{task})
+		select {
+		case created := <-capture.creates:
+			t.Fatalf("the cutover rotates once; got another comment %d: %s", created.ID, created.Body)
+		case edited := <-capture.edits:
+			assert.Equal(t, freshID, edited.CommentID, "later edits land on the fresh comment")
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+}
+
+// In an ordered deferred rollout across several deployments, each member waits
+// at the gate for its own cutover command, and the one apply-level cutover
+// request is re-bound to each member in turn. Every member's cutover is an
+// operator command taking effect, so each one rotates a fresh progress comment
+// in and folds the comment that tracked the previous member's cutover — the
+// second member's cutover does not edit the first member's comment because
+// both recorded the same phase. This holds for the observer that rotated the
+// first member and for a fresh observer after a restart.
+func TestE2EOrderedDeferredCutoverRotatesForEachMember(t *testing.T) {
+	const firstMember, secondMember = int64(9101), int64(9102)
+	for name, freshObserverForSecond := range map[string]bool{
+		"same observer":  false,
+		"fresh observer": true,
+	} {
+		t.Run(name, func(t *testing.T) {
+			ctx := t.Context()
+			repo := "org/repo-ordered-cutover-" + strings.ReplaceAll(name, " ", "-")
+			f := setupApplyCommentFixture(t, applyCommentFixtureParams{
+				repo:         repo,
+				pr:           159,
+				database:     "e2e_ordered_cutover_" + strings.Fields(name)[0],
+				applyState:   state.Apply.WaitingForCutover,
+				deferCutover: true,
+			})
+			st, apply, task, capture, h := f.st, f.apply, f.task, f.capture, f.handler
+
+			h.postAndTrackComment(ctx, repo, 159, 12345, apply, state.Comment.Progress, "Waiting for Cutover — run `schemabot cutover` to proceed")
+			gateProgressID := requireCommentCreate(t, capture)
+
+			fake := clock.NewFake(task.CreatedAt)
+			obs := f.newObserver(st, fake)
+
+			// cutOverMember records the operator's cutover bound to the member,
+			// moves the apply through the cutover, and returns the fresh
+			// progress comment the rotation posted after checking it folded
+			// the comment tracking the previous cutover.
+			cutOverMember := func(o *CommentObserver, member, supersededID int64) int64 {
+				t.Helper()
+				_, _, err := st.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+					ApplyID:     apply.ID,
+					Operation:   storage.ControlOperationCutover,
+					RequestedBy: "operator",
+					Metadata:    storage.CutoverRequestMetadata(member),
+				})
+				require.NoError(t, err)
+
+				apply.State = state.Apply.CuttingOver
+				task.State = state.Task.CuttingOver
+				fake.Advance(activeInterval + time.Second)
+				o.OnProgress(apply, []*storage.Task{task})
+
+				freshID := requireCommentCreate(t, capture)
+				select {
+				case edited := <-capture.edits:
+					assert.Equal(t, supersededID, edited.CommentID, "the fold lands on the comment tracking the previous cutover")
+					assert.True(t, strings.HasPrefix(edited.Body, fmt.Sprintf(
+						"Cutover started — progress continues in [a new progress comment](https://github.com/%s/pull/159#issuecomment-%d).", repo, freshID)), edited.Body)
+				case <-time.After(5 * time.Second):
+					t.Fatal("expected the comment tracking the previous cutover to be folded")
+				}
+
+				prog, err := st.ApplyComments().Get(ctx, apply.ID, state.Comment.Progress)
+				require.NoError(t, err)
+				require.NotNil(t, prog)
+				assert.Equal(t, freshID, prog.GitHubCommentID)
+				require.NotNil(t, prog.PostedPhase)
+				assert.Equal(t, phaseCuttingOver, *prog.PostedPhase)
+				require.NotNil(t, prog.PostedCutoverOperationID)
+				assert.Equal(t, member, *prog.PostedCutoverOperationID)
+				return freshID
+			}
+
+			firstID := cutOverMember(obs, firstMember, gateProgressID)
+
+			// The first member finished; the driver consumed its request and
+			// the second member is parked at the gate. The tick edits the
+			// first member's comment in place.
+			require.NoError(t, st.ControlRequests().CompletePending(ctx, apply.ID, storage.ControlOperationCutover))
+			apply.State = state.Apply.WaitingForCutover
+			task.State = state.Task.WaitingForCutover
+			fake.Advance(activeInterval + time.Second)
+			obs.OnProgress(apply, []*storage.Task{task})
+			select {
+			case created := <-capture.creates:
+				t.Fatalf("parking the next member at the gate must not rotate; got %d: %s", created.ID, created.Body)
+			case edited := <-capture.edits:
+				assert.Equal(t, firstID, edited.CommentID, "the gate edits the first member's comment in place")
+			case <-time.After(5 * time.Second):
+				t.Fatal("expected the gate to edit the first member's comment")
+			}
+
+			second := obs
+			if freshObserverForSecond {
+				second = f.newObserver(st, fake)
+			}
+			secondID := cutOverMember(second, secondMember, firstID)
+
+			// The second member's cutover moves into its revert window: later
+			// ticks and a fresh observer edit its comment.
+			apply.State = state.Apply.RevertWindow
+			task.State = state.Task.RevertWindow
+			for _, o := range []*CommentObserver{second, f.newObserver(st, fake)} {
+				fake.Advance(activeInterval + time.Second)
+				o.OnProgress(apply, []*storage.Task{task})
+				select {
+				case created := <-capture.creates:
+					t.Fatalf("a member's cutover rotates once; got another comment %d: %s", created.ID, created.Body)
+				case edited := <-capture.edits:
+					assert.Equal(t, secondID, edited.CommentID, "later edits land on the second member's comment")
+				case <-time.After(100 * time.Millisecond):
+				}
+			}
+		})
+	}
+}
+
 // A cutover that is not the effect of an operator's command transitions the
 // progress comment in place: an apply that never deferred its cutover cuts
 // over on its own, and a deferred apply with no recorded cutover request has

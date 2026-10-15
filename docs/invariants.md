@@ -1305,9 +1305,10 @@ did, rather than at an older comment somewhere up the page that may or may not h
 since.
 
 The signal that a rotation is due is durable rather than in-memory. Every tracked progress comment
-records the phase the apply was in when it was posted, so a comment recording an earlier phase is
-known to predate the current one, and a fresh observer on a later drive claim reaches the same
-conclusion the previous one did. Each recorded phase rotates at most once.
+records the phase the apply was in when it was posted, and which rollout member's cutover it
+tracks, so a comment recording an earlier phase or an earlier member's cutover is known to predate
+the current one, and a fresh observer on a later drive claim reaches the same conclusion the
+previous one did. Each recorded signal rotates at most once.
 
 Because rotation exists to surface a command, it is gated on a command having been issued.
 Reverting has no other way in, so entering it always rotates. Skipping-revert does have another

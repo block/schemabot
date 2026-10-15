@@ -97,11 +97,11 @@ type CommentObserver struct {
 	// lands.
 	resumeSupersedePending bool
 
-	// rotatedPhases records the control phases this observer already rotated
-	// for (or confirmed the tracked comment postdates), keyed by phase name,
-	// so later ticks skip the storage re-read. Guarded by mu like the other
-	// per-drive rotation flags.
-	rotatedPhases map[string]bool
+	// settledControlRotations records the control-phase rotations this
+	// observer already rotated for (or confirmed the tracked comment
+	// covers), so later ticks skip the storage re-read. Guarded by mu like
+	// the other per-drive rotation flags.
+	settledControlRotations map[controlRotationKey]bool
 
 	// cutoverRotated marks that this observer already rotated in a fresh
 	// progress comment after a deferred cutover completed (or confirmed the
@@ -138,6 +138,10 @@ type pendingProgressRotation struct {
 	// recorded on the tracked row at adoption so the durable rotation signal
 	// survives the retried write.
 	phase string
+	// cutoverOperationID is the rollout member whose cutover the comment
+	// tracks (0 when none), recorded on the tracked row at adoption alongside
+	// the phase.
+	cutoverOperationID int64
 	// reason selects the frozen rendering the superseded comment is owed.
 	reason supersededProgressReason
 	// supersededCommentID is the prior tracked comment, still owed its freeze.
@@ -1136,8 +1140,16 @@ func (o *CommentObserver) rotateProgressCommentForResume(apply *storage.Apply, t
 		pendingFreeze = &tracked.GitHubCommentID
 	}
 
+	cutoverOperationID, err := o.cutoverOperationForPost(ctx, apply)
+	if err != nil {
+		// The fresh comment must record whose cutover it tracks, or a later
+		// tick would rotate again for a cutover it already shows. The summary
+		// marker stays in place, so the next tick retries.
+		o.logError(apply, "observer: failed to load the cutover request before resume rotation", "error", err)
+		return false
+	}
 	body := o.formatStatusComment(apply, tasks)
-	newCommentID, posted, trackedNew := o.postAndTrackComment(apply, state.Comment.Progress, body, pendingFreeze)
+	newCommentID, posted, trackedNew := o.postAndTrackComment(apply, state.Comment.Progress, body, pendingFreeze, cutoverOperationID)
 	if !posted {
 		// postAndTrackComment logged the failure. The summary marker is left in
 		// place — it is the durable signal that a resume rotation is owed — so
@@ -1216,9 +1228,9 @@ func controlPhase(applyState string) string {
 // progress comment. Reverting always is — it has no non-operator entry path.
 // Skipping-revert and the cutover phases only sometimes are, so they
 // additionally require the durable operator-origin signal (see
-// phaseIsOperatorIssued). The cutover phases are cutting over and the revert
-// window the cutover opens: cutting over can pass between two ticks, so the
-// first tick past the gate rotates from whichever it finds.
+// operatorControlRotations). The cutover phases are cutting over and the
+// revert window the cutover opens: cutting over can pass between two ticks, so
+// the first tick past the gate rotates from whichever it finds.
 func phaseRotatesProgressComment(phase string) bool {
 	return phase == phaseReverting || phase == phaseSkippingRevert || cutoverEffectPhase(phase)
 }
@@ -1229,29 +1241,85 @@ func cutoverEffectPhase(phase string) bool {
 	return phase == phaseCuttingOver || phase == phaseRevertWindow
 }
 
-// phaseIsOperatorIssued reports whether the apply entered the phase as the
-// effect of an operator control command — the situation comment rotation
-// exists for: an operator watching the bottom of the PR timeline for the
-// effect of the command they just issued. Reverting is always
-// operator-issued. Skipping-revert is operator-issued only when a durable
-// skip-revert control request exists for the apply: the phase is also entered
-// when the revert window expires on its own or when the apply was submitted
-// with skip-revert chosen upfront, and neither involves a command whose
-// effect an operator is waiting to see — the progress comment transitions in
-// place. A cutover phase is operator-issued only on an apply that deferred its
-// cutover and carries a durable cutover control request: any other apply cuts
-// over on its own, and its comment transitions in place.
-func (o *CommentObserver) phaseIsOperatorIssued(ctx context.Context, apply *storage.Apply, phase string) (bool, error) {
-	switch {
-	case phase == phaseSkippingRevert:
-		return o.controlRequestExists(ctx, storage.ControlOperationSkipRevert)
-	case cutoverEffectPhase(phase):
-		if !o.shouldDeferCutover(apply) {
-			return false, nil
-		}
-		return o.controlRequestExists(ctx, storage.ControlOperationCutover)
+// controlRotationKey identifies a control-phase rotation an observer settled:
+// the phase, and the rollout member whose cutover the tracked comment covers
+// (0 when none). The member is part of the key because one apply-level cutover
+// request is re-bound to each member of an ordered rollout in turn, so the
+// same phase recurs once per member's cutover.
+type controlRotationKey struct {
+	phase              string
+	cutoverOperationID int64
+}
+
+// controlPhaseRotations is what an apply's control phase can owe the progress
+// comment: the operator commands the phase may be the effect of, in the order
+// they are checked, and the key a comment posted for them records.
+type controlPhaseRotations struct {
+	key     controlRotationKey
+	reasons []supersededProgressReason
+}
+
+// operatorControlRotations reports which operator commands the apply's
+// control phase may be the effect of — the situation comment rotation exists
+// for: an operator watching the bottom of the PR timeline for the effect of
+// the command they just issued. No reasons means the apply entered the phase
+// on its own and the progress comment transitions in place.
+//
+// Reverting is always operator-issued. Every phase at or past a deferred
+// cutover owes the cutover command's rotation first, when the apply deferred
+// its cutover and carries a durable cutover control request: any other apply
+// cuts over on its own. That includes skipping-revert, because an apply
+// submitted with skip-revert chosen upfront passes from the cutover straight
+// into skipping revert, and a tick can first find it there. Skipping-revert
+// then owes its own rotation only when a durable skip-revert control request
+// exists: the phase is also entered when the revert window expires on its own
+// or when skip-revert was chosen upfront, and neither involves a command whose
+// effect an operator is waiting to see.
+func (o *CommentObserver) operatorControlRotations(ctx context.Context, apply *storage.Apply, phase string) (controlPhaseRotations, error) {
+	rotations := controlPhaseRotations{key: controlRotationKey{phase: phase}}
+	if phase == phaseReverting {
+		rotations.reasons = []supersededProgressReason{supersededByRevert}
+		return rotations, nil
 	}
-	return true, nil
+	cutoverOperationID, cutoverRequested, err := o.deferredCutoverRequest(ctx, apply)
+	if err != nil {
+		return controlPhaseRotations{}, err
+	}
+	if cutoverRequested {
+		rotations.key.cutoverOperationID = cutoverOperationID
+		rotations.reasons = append(rotations.reasons, supersededByCutoverCommand)
+	}
+	if phase == phaseSkippingRevert {
+		skipRevertRequested, err := o.controlRequestExists(ctx, storage.ControlOperationSkipRevert)
+		if err != nil {
+			return controlPhaseRotations{}, err
+		}
+		if skipRevertRequested {
+			rotations.reasons = append(rotations.reasons, supersededBySkipRevert)
+		}
+	}
+	return rotations, nil
+}
+
+// deferredCutoverRequest reports whether the apply deferred its cutover and
+// carries a durable cutover control request, whatever its status, and the
+// rollout member that request is bound to (0 when it names none).
+func (o *CommentObserver) deferredCutoverRequest(ctx context.Context, apply *storage.Apply) (cutoverOperationID int64, requested bool, err error) {
+	if !o.shouldDeferCutover(apply) {
+		return 0, false, nil
+	}
+	req, err := o.stor.ControlRequests().GetByOperation(ctx, o.applyID, storage.ControlOperationCutover)
+	if err != nil {
+		return 0, false, fmt.Errorf("load %s control request: %w", storage.ControlOperationCutover, err)
+	}
+	if req == nil {
+		return 0, false, nil
+	}
+	cutoverOperationID, err = req.CutoverOperationID()
+	if err != nil {
+		return 0, false, fmt.Errorf("read the rollout member the cutover request is bound to: %w", err)
+	}
+	return cutoverOperationID, true, nil
 }
 
 // controlRequestExists reports whether the apply carries a durable control
@@ -1264,17 +1332,49 @@ func (o *CommentObserver) controlRequestExists(ctx context.Context, operation st
 	return req != nil, nil
 }
 
-// trackedCommentCoversPhase reports whether the tracked progress comment was
-// posted at or after the phase's rotation, so no rotation is owed. A cutover
-// rotation is owed once, whichever cutover phase the tick finds the apply in:
-// a comment posted at or past the cutover already tracks its effect. Any other
-// phase rotates once, into a comment recording that phase.
-func trackedCommentCoversPhase(tracked *storage.ApplyComment, phase string) bool {
-	posted := trackedPhase(tracked)
-	if cutoverEffectPhase(phase) {
-		return posted == phaseCuttingOver || postCutoverPhase(posted)
+// cutoverMayRecurInPhase reports whether a later cutover can still owe a
+// rotation while the apply stays in this phase: on an apply that deferred its
+// cutover, each rollout member's cutover re-binds the one cutover request, so
+// the phases at and past a cutover recur once per member. The observer then
+// re-reads the cutover request every tick instead of answering from memory by
+// phase alone.
+func (o *CommentObserver) cutoverMayRecurInPhase(apply *storage.Apply, phase string) bool {
+	return o.shouldDeferCutover(apply) && (cutoverEffectPhase(phase) || phase == phaseSkippingRevert)
+}
+
+// cutoverOperationForPost returns the rollout member whose cutover a progress
+// comment posted now tracks: the member the apply's cutover request is bound
+// to, while the apply is at or past a deferred cutover, and 0 otherwise.
+func (o *CommentObserver) cutoverOperationForPost(ctx context.Context, apply *storage.Apply) (int64, error) {
+	if !o.cutoverMayRecurInPhase(apply, controlPhase(apply.State)) {
+		return 0, nil
 	}
-	return posted == phase
+	cutoverOperationID, _, err := o.deferredCutoverRequest(ctx, apply)
+	return cutoverOperationID, err
+}
+
+// postedCutoverOperationID converts a rollout member to the value recorded on
+// a tracked progress comment: nil when the comment tracks no member's cutover.
+func postedCutoverOperationID(cutoverOperationID int64) *int64 {
+	if cutoverOperationID == 0 {
+		return nil
+	}
+	return &cutoverOperationID
+}
+
+// trackedCommentCoversRotation reports whether the tracked progress comment
+// already tracks the effect of the command, so no rotation is owed for it. A
+// cutover rotation is owed once per rollout member, whichever phase at or past
+// the cutover the tick finds the apply in: a comment posted at or past the
+// cutover of the member the request is bound to already tracks its effect.
+// Any other command rotates once, into a comment recording the phase.
+func trackedCommentCoversRotation(tracked *storage.ApplyComment, key controlRotationKey, reason supersededProgressReason) bool {
+	posted := trackedPhase(tracked)
+	if reason == supersededByCutoverCommand {
+		atOrPastCutover := posted == phaseCuttingOver || postCutoverPhase(posted)
+		return atOrPastCutover && trackedCutoverOperationID(tracked) == key.cutoverOperationID
+	}
+	return posted == key.phase
 }
 
 // postCutoverPhase reports whether a recorded phase means the comment was
@@ -1294,14 +1394,24 @@ func trackedPhase(tracked *storage.ApplyComment) string {
 	return *tracked.PostedPhase
 }
 
+// trackedCutoverOperationID returns the rollout member whose cutover a tracked
+// comment row records, treating nil as none.
+func trackedCutoverOperationID(tracked *storage.ApplyComment) int64 {
+	if tracked.PostedCutoverOperationID == nil {
+		return 0
+	}
+	return *tracked.PostedCutoverOperationID
+}
+
 // rotateProgressCommentForControlPhase posts a fresh progress comment when a
 // control operation's phase (cutover, revert, skip-revert) has taken effect, so
 // the operation is tracked in a new comment at the bottom of the PR timeline
 // instead of re-editing the comment last rendered for the prior phase. The
 // signal is durable and cross-pod safe: every tracked progress comment records
-// the phase the apply was in when it was posted, so an apply in a control
-// phase whose tracked comment records a different phase still predates it. The
-// fresh comment records the phase, so later ticks — and fresh observers on
+// the phase the apply was in when it was posted, and the rollout member whose
+// cutover it tracks, so an apply in a control phase whose tracked comment
+// records a different phase — or another member's cutover — still predates it.
+// The fresh comment records both, so later ticks — and fresh observers on
 // later drive claims — see the rotation already happened. Returns true when it
 // rotated.
 func (o *CommentObserver) rotateProgressCommentForControlPhase(apply *storage.Apply, tasks []*storage.Task) bool {
@@ -1310,29 +1420,34 @@ func (o *CommentObserver) rotateProgressCommentForControlPhase(apply *storage.Ap
 		// Not in a phase that rotates — the common path on every progress tick.
 		return false
 	}
-	if o.rotatedPhases[phase] {
-		// This observer already rotated for the phase (or confirmed the tracked
-		// comment postdates it) — answered from memory instead of re-reading
-		// storage on every later tick. A fresh observer on a later drive claim
-		// starts with this unset and re-checks the durable record.
+	if !o.cutoverMayRecurInPhase(apply, phase) && o.settledControlRotations[controlRotationKey{phase: phase}] {
+		// This observer already settled the phase — answered from memory
+		// instead of re-reading storage on every later tick. A fresh observer
+		// on a later drive claim starts with this unset and re-checks the
+		// durable record.
 		return false
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	operatorIssued, err := o.phaseIsOperatorIssued(ctx, apply, phase)
+	rotations, err := o.operatorControlRotations(ctx, apply, phase)
 	if err != nil {
 		o.logError(apply, "observer: failed to determine whether the control phase was operator-issued; rotation will be re-checked on the next tick",
 			"error", err, "phase", phase)
 		return false
 	}
-	if !operatorIssued {
+	if len(rotations.reasons) == 0 {
 		// The apply entered the phase on its own — no operator command whose
 		// effect needs surfacing at the bottom of the PR. The progress comment
 		// transitions in place; remembered so later ticks skip the re-check.
-		o.markPhaseRotated(phase)
+		o.markControlRotationSettled(rotations.key)
 		o.logInfo(apply, "observer: control phase was not operator-issued; progress comment transitions in place", "phase", phase)
+		return false
+	}
+	if o.settledControlRotations[rotations.key] {
+		// This observer already settled this phase for the cutover the
+		// request is bound to now; only a later member's cutover re-opens it.
 		return false
 	}
 
@@ -1352,22 +1467,23 @@ func (o *CommentObserver) rotateProgressCommentForControlPhase(apply *storage.Ap
 	if tracked.PendingFreezeCommentID != nil {
 		// A superseded comment from an earlier rotation is still owed its
 		// frozen rendering — the freeze edit failed or the pod died before it
-		// landed. Retry it now (even when the tracked comment already records
+		// landed. Retry it now (even when the tracked comment already covers
 		// this phase and no new rotation follows); on success the marker is
 		// cleared.
 		o.freezeSupersededProgressComment(apply, *tracked.PendingFreezeCommentID, tracked.GitHubCommentID,
 			supersededByPriorRotation)
 	}
-	if trackedCommentCoversPhase(tracked, phase) {
-		// The tracked comment was posted while the apply was already in this
-		// phase (for a cutover, in any phase at or past it) — it already
-		// tracks the operation, across restarts and drive re-claims.
-		o.markPhaseRotated(phase)
+	reason, owed := firstOwedControlRotation(tracked, rotations)
+	if !owed {
+		// The tracked comment was posted after every command the phase may be
+		// the effect of took effect — it already tracks them, across restarts
+		// and drive re-claims.
+		o.markControlRotationSettled(rotations.key)
 		return false
 	}
 
 	body := o.formatStatusComment(apply, tasks)
-	newCommentID, posted, trackedNew := o.postAndTrackComment(apply, state.Comment.Progress, body, &tracked.GitHubCommentID)
+	newCommentID, posted, trackedNew := o.postAndTrackComment(apply, state.Comment.Progress, body, &tracked.GitHubCommentID, rotations.key.cutoverOperationID)
 	if !posted {
 		// postAndTrackComment logged the failure. The tracked comment still
 		// predates the phase, so the next tick retries the rotation.
@@ -1377,47 +1493,49 @@ func (o *CommentObserver) rotateProgressCommentForControlPhase(apply *storage.Ap
 		// The fresh comment is on the PR, but the tracked row still points at
 		// the prior comment, which therefore must not be folded. Remember the
 		// fresh comment so later ticks retry only the tracking write —
-		// adoption — instead of posting a duplicate; the phase is marked
-		// rotated once the row tracks it.
+		// adoption — instead of posting a duplicate; the rotation is settled
+		// once the row tracks it.
 		o.pendingRotation = &pendingProgressRotation{
 			commentID:           newCommentID,
 			phase:               phase,
-			reason:              supersededReasonForPhase(phase),
+			cutoverOperationID:  rotations.key.cutoverOperationID,
+			reason:              reason,
 			supersededCommentID: tracked.GitHubCommentID,
 		}
 		o.logError(apply, "observer: fresh progress comment posted for control phase but not tracked; progress edits continue on the prior comment until the next tick adopts it",
-			"phase", phase, "github_comment_id", newCommentID)
+			"phase", phase, "cutover_operation_id", rotations.key.cutoverOperationID, "github_comment_id", newCommentID)
 		return true
 	}
-	o.markPhaseRotated(phase)
+	o.markControlRotationSettled(rotations.key)
 
-	o.freezeSupersededProgressComment(apply, tracked.GitHubCommentID, newCommentID, supersededReasonForPhase(phase))
+	o.freezeSupersededProgressComment(apply, tracked.GitHubCommentID, newCommentID, reason)
 
 	o.logger.Info("observer: posted fresh progress comment for control phase",
-		"apply_id", o.applyID, "repo", o.repo, "pr", o.pr, "state", apply.State, "phase", phase)
+		"apply_id", o.applyID, "repo", o.repo, "pr", o.pr, "state", apply.State, "phase", phase,
+		"cutover_operation_id", rotations.key.cutoverOperationID)
 	return true
 }
 
-// markPhaseRotated records in-memory that this observer rotated (or confirmed
-// the tracked comment already covers) the given control phase, so later ticks
-// skip the storage re-read.
-func (o *CommentObserver) markPhaseRotated(phase string) {
-	if o.rotatedPhases == nil {
-		o.rotatedPhases = make(map[string]bool)
+// firstOwedControlRotation returns the first command, in check order, whose
+// effect the tracked comment does not track yet. Its reason selects the
+// frozen rendering of the comment the rotation supersedes.
+func firstOwedControlRotation(tracked *storage.ApplyComment, rotations controlPhaseRotations) (supersededProgressReason, bool) {
+	for _, reason := range rotations.reasons {
+		if !trackedCommentCoversRotation(tracked, rotations.key, reason) {
+			return reason, true
+		}
 	}
-	o.rotatedPhases[phase] = true
+	return 0, false
 }
 
-// supersededReasonForPhase selects the frozen rendering for the comment a
-// control-phase rotation supersedes.
-func supersededReasonForPhase(phase string) supersededProgressReason {
-	switch {
-	case phase == phaseSkippingRevert:
-		return supersededBySkipRevert
-	case cutoverEffectPhase(phase):
-		return supersededByCutoverCommand
+// markControlRotationSettled records in-memory that this observer rotated (or
+// confirmed the tracked comment already covers) the control-phase rotation, so
+// later ticks skip the storage re-read.
+func (o *CommentObserver) markControlRotationSettled(key controlRotationKey) {
+	if o.settledControlRotations == nil {
+		o.settledControlRotations = make(map[controlRotationKey]bool)
 	}
-	return supersededByRevert
+	o.settledControlRotations[key] = true
 }
 
 // rotateProgressCommentAfterCutover posts a fresh progress comment when a
@@ -1488,8 +1606,16 @@ func (o *CommentObserver) rotateProgressCommentAfterCutover(apply *storage.Apply
 			supersededByPriorRotation)
 	}
 
+	cutoverOperationID, err := o.cutoverOperationForPost(ctx, apply)
+	if err != nil {
+		// The fresh comment must record whose cutover it tracks, or the
+		// control-phase rotation would rotate again for the cutover it already
+		// shows. The live cutover row stays in place, so the next tick retries.
+		o.logError(apply, "observer: failed to load the cutover request before post-cutover rotation", "error", err)
+		return false
+	}
 	body := o.formatStatusComment(apply, tasks)
-	newCommentID, posted, trackedNew := o.postAndTrackComment(apply, state.Comment.Progress, body, &cutover.GitHubCommentID)
+	newCommentID, posted, trackedNew := o.postAndTrackComment(apply, state.Comment.Progress, body, &cutover.GitHubCommentID, cutoverOperationID)
 	if !posted {
 		// postAndTrackComment logged the failure. The live cutover row is left
 		// in place — it is the durable signal that this rotation is owed — so
@@ -1510,6 +1636,7 @@ func (o *CommentObserver) rotateProgressCommentAfterCutover(apply *storage.Apply
 		o.pendingRotation = &pendingProgressRotation{
 			commentID:           newCommentID,
 			phase:               controlPhase(apply.State),
+			cutoverOperationID:  cutoverOperationID,
 			reason:              supersededByCutover,
 			supersededCommentID: cutover.GitHubCommentID,
 		}
@@ -1597,20 +1724,21 @@ func (o *CommentObserver) adoptPendingRotationComment(apply *storage.Apply) bool
 	defer cancel()
 
 	comment := &storage.ApplyComment{
-		ApplyID:                o.applyID,
-		CommentState:           state.Comment.Progress,
-		GitHubCommentID:        p.commentID,
-		PostedPhase:            &p.phase,
-		PendingFreezeCommentID: &p.supersededCommentID,
+		ApplyID:                  o.applyID,
+		CommentState:             state.Comment.Progress,
+		GitHubCommentID:          p.commentID,
+		PostedPhase:              &p.phase,
+		PostedCutoverOperationID: postedCutoverOperationID(p.cutoverOperationID),
+		PendingFreezeCommentID:   &p.supersededCommentID,
 	}
 	if err := o.stor.ApplyComments().Upsert(o.contextWithApplyLease(ctx, apply), comment); err != nil {
 		o.logError(apply, "observer: failed to adopt posted-but-untracked progress comment; progress edits continue on the prior comment until a retry lands",
-			"github_comment_id", p.commentID, "phase", p.phase, "error", err)
+			"github_comment_id", p.commentID, "phase", p.phase, "cutover_operation_id", p.cutoverOperationID, "error", err)
 		return false
 	}
 	o.pendingRotation = nil
 	if p.phase != phaseNone {
-		o.markPhaseRotated(p.phase)
+		o.markControlRotationSettled(controlRotationKey{phase: p.phase, cutoverOperationID: p.cutoverOperationID})
 	}
 	o.logInfo(apply, "observer: adopted posted-but-untracked progress comment; progress edits now land on it",
 		"github_comment_id", p.commentID, "phase", p.phase)
@@ -1665,15 +1793,16 @@ func (o *CommentObserver) freezeSupersededProgressComment(apply *storage.Apply, 
 	}
 }
 
-// postAndTrackComment creates a comment and stores its ID, recording the
-// apply's control phase on progress comments so a later control operation is
-// detectable. pendingFreezeCommentID, when non-nil, records in the same tracking
-// write that the named predecessor comment is still owed its frozen rendering;
-// pass nil for posts that supersede nothing. Returns the GitHub comment ID,
-// whether the post landed on the PR, and whether the tracking row
-// was updated to point at it — a posted but untracked comment exists on the PR
-// while later edits still target the prior comment.
-func (o *CommentObserver) postAndTrackComment(apply *storage.Apply, commentState string, body string, pendingFreezeCommentID *int64) (commentID int64, posted, tracked bool) {
+// postAndTrackComment creates a comment and stores its ID, recording on
+// progress comments the apply's control phase and cutoverOperationID — the
+// rollout member whose cutover the comment tracks, 0 for none — so a later
+// control operation is detectable. pendingFreezeCommentID, when non-nil,
+// records in the same tracking write that the named predecessor comment is
+// still owed its frozen rendering; pass nil for posts that supersede nothing.
+// Returns the GitHub comment ID, whether the post landed on the PR, and whether
+// the tracking row was updated to point at it — a posted but untracked comment
+// exists on the PR while later edits still target the prior comment.
+func (o *CommentObserver) postAndTrackComment(apply *storage.Apply, commentState string, body string, pendingFreezeCommentID *int64, cutoverOperationID int64) (commentID int64, posted, tracked bool) {
 	if !o.leaseStillOwnsObserver(apply, "create GitHub client before post") {
 		return 0, false, false
 	}
@@ -1710,6 +1839,7 @@ func (o *CommentObserver) postAndTrackComment(apply *storage.Apply, commentState
 	if commentState == state.Comment.Progress {
 		phase := controlPhase(apply.State)
 		comment.PostedPhase = &phase
+		comment.PostedCutoverOperationID = postedCutoverOperationID(cutoverOperationID)
 	}
 	if err := o.stor.ApplyComments().Upsert(o.contextWithApplyLease(ctx, apply), comment); err != nil {
 		o.logError(apply, "observer: failed to store comment ID", "error", err, "comment_state", commentState)
