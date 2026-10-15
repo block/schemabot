@@ -1443,6 +1443,17 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 	queryArgs = append(queryArgs,
 		state.ApplyOperation.Stopped,
 		storage.ControlOperationCancel, storage.ControlRequestPending)
+	// A barrier-parked operation is driven by nothing: its copy drive exits at
+	// the barrier, the stale-active arm leaves it to the cutover claim, and the
+	// cutover claim will not start it behind a failed earlier sibling under
+	// halt. A pending cancel is the one request that must still reach it, so
+	// the drive that delivers the cancel claims it here. The claim leaves the
+	// row parked, so it carries the rematch guard; the drive moves it out of
+	// waiting_for_cutover once the cancel lands.
+	queryArgs = append(queryArgs,
+		state.ApplyOperation.WaitingForCutover,
+		storage.CutoverPolicyBarrier, storage.CutoverPolicyParallel,
+		storage.ControlOperationCancel, storage.ControlRequestPending)
 	// Deferred-deploy start gate keys on the PARENT apply state, not the
 	// operation state: the operation row stays active (running) while the apply
 	// parks at waiting_for_deploy, because the copy phase finished and only the
@@ -1472,6 +1483,13 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 	//     pending cancel request is reclaimable so the drive can terminalize it.
 	//     The cancel arm carries the rematch guard because its claim can leave
 	//     the row stopped; see requestRematchGuardSQL.
+	//
+	//   - An operation parked at the cutover barrier of a multi-operation
+	//     apply whose parent has a pending cancel request is reclaimable so the
+	//     drive can deliver the cancel to the engine holding the parked copy.
+	//     Nothing else drives a parked row before its cutover turn, and under
+	//     halt that turn never comes. The arm carries the rematch guard because
+	//     the claim leaves the row parked.
 	//
 	//   - An active operation whose PARENT apply is waiting_for_deploy and has a
 	//     pending start request is reclaimable so the operator can trigger the
@@ -1532,14 +1550,15 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 	// a gated one would be redundant with the pending clause below. Start
 	// requests resume eligible work; they do not reorder the rollout.
 	retryFreshnessCutoff := s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime, ParameterIntervalAmount(), IntervalDay)
-	// The two guarded arms differ in the equal-timestamp case for the same reason
+	// The guarded arms differ in the equal-timestamp case for the same reason
 	// they do in ApplyStore.ClaimApplyByID: the stopped+cancel claim moves the row
 	// out of stopped atomically with its lease rotation, so no peer can match it
 	// in the same second and it can admit an equal timestamp; the
-	// waiting_for_deploy claim leaves the row where it is and must refuse one.
-	// See leaseRematchComparison.
+	// waiting_for_deploy and parked+cancel claims leave the row where it is and
+	// must refuse one. See leaseRematchComparison.
 	deferredDeployGuard := requestRematchGuardSQL("apply_operations", rematchOnlyAfterLease, staleClaimCutoff)
 	stoppedCancelGuard := requestRematchGuardSQL("apply_operations", rematchAtOrAfterLease, staleClaimCutoff)
+	parkedCancelGuard := requestRematchGuardSQL("apply_operations", rematchOnlyAfterLease, staleClaimCutoff)
 	row := tx.QueryRowContext(ctx, fmt.Sprintf(`
 		SELECT %s
 		FROM apply_operations
@@ -1601,6 +1620,24 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 						AND cr.operation = ?
 						AND cr.status = ?
 						AND `+stoppedCancelGuard+`
+				)
+			)
+			OR (
+				state = ?
+				AND cutover_policy IN (?, ?)
+				AND EXISTS (
+					SELECT 1
+					FROM apply_operations AS sibling
+					WHERE sibling.apply_id = apply_operations.apply_id
+						AND sibling.id <> apply_operations.id
+				)
+				AND EXISTS (
+					SELECT 1
+					FROM apply_control_requests cr
+					WHERE cr.apply_id = apply_operations.apply_id
+						AND cr.operation = ?
+						AND cr.status = ?
+						AND `+parkedCancelGuard+`
 				)
 			)
 			OR (
@@ -2269,36 +2306,60 @@ func (s *applyOperationStore) DeleteByApply(ctx context.Context, applyID int64) 
 // Writes are apply-lease guarded when a lease is present in ctx, mirroring
 // DeleteByApply.
 func (s *applyOperationStore) MarkPendingStoppedByApply(ctx context.Context, applyID int64) (int64, error) {
+	return s.markPendingByApply(ctx, applyID, state.ApplyOperation.Stopped, "stop")
+}
+
+// MarkPendingCancelledByApply transitions every still-pending operation of an
+// apply to cancelled, returning the number of rows changed. A pending operation
+// of a rollout under a pending cancel never started, so nothing on its target
+// changed and nothing has to be stopped there; the claim gate would only ever
+// refuse it once the rollout settles, leaving it pending under a cancelled
+// apply. Cancelled is final, so completed_at is stamped. Only pending rows are
+// touched, and writes are lease guarded exactly as MarkPendingStoppedByApply's.
+func (s *applyOperationStore) MarkPendingCancelledByApply(ctx context.Context, applyID int64) (int64, error) {
+	return s.markPendingByApply(ctx, applyID, state.ApplyOperation.Cancelled, "cancel")
+}
+
+// markPendingByApply moves every still-pending operation of an apply to
+// newState, stamping completed_at when newState is terminal and not
+// resumable.
+func (s *applyOperationStore) markPendingByApply(ctx context.Context, applyID int64, newState, verb string) (int64, error) {
+	assignments := []JoinedUpdateAssignment{
+		{Column: "state", Expr: "?"},
+		{Column: "updated_at", Expr: "NOW()"},
+	}
+	plainSet := "state = ?, updated_at = NOW()"
+	if newState != state.ApplyOperation.Stopped {
+		assignments = append(assignments, JoinedUpdateAssignment{Column: "completed_at", Expr: "NOW()"})
+		plainSet += ", completed_at = NOW()"
+	}
 	// An operation-lease-only drive (fan-out multi-operation mode) holds no
 	// parent apply lease, but it is still an authorized driver of the apply's
 	// rollout and may terminalize the apply's still-pending sibling operations
-	// under a pending stop. Authorize the bulk stop by joining the owning
-	// operation row and requiring it still carries the lease token, so a
-	// displaced driver that lost its lease fails closed instead of stopping
+	// under a pending stop or cancel. Authorize the bulk write by joining the
+	// owning operation row and requiring it still carries the lease token, so a
+	// displaced driver that lost its lease fails closed instead of moving
 	// siblings it no longer owns. Operation lease takes precedence over the
 	// parent apply lease, matching operationWriteGuardFromContext.
 	if opLease, ok := storage.OperationLeaseFromContext(ctx); ok {
 		if !opLease.Valid() {
-			return 0, fmt.Errorf("invalid operation lease for stopping pending apply_operations of apply %d: %w", applyID, storage.ErrApplyLeaseLost)
+			return 0, fmt.Errorf("invalid operation lease for %s of pending apply_operations of apply %d: %w", verb, applyID, storage.ErrApplyLeaseLost)
 		}
 		if opLease.ApplyID != applyID {
-			return 0, fmt.Errorf("operation lease for apply %d does not authorize stopping pending operations of apply %d: %w", opLease.ApplyID, applyID, storage.ErrApplyLeaseLost)
+			return 0, fmt.Errorf("operation lease for apply %d does not authorize %s of pending operations of apply %d: %w", opLease.ApplyID, verb, applyID, storage.ErrApplyLeaseLost)
 		}
 		query := s.dialect.JoinedUpdate(
 			"apply_operations", "ao", "apply_operations", "owner_op", "owner_op.apply_id = ao.apply_id",
-			[]JoinedUpdateAssignment{
-				{Column: "state", Expr: "?"},
-				{Column: "updated_at", Expr: "NOW()"},
-			},
+			assignments,
 			"ao.apply_id = ? AND ao.state = ? AND owner_op.id = ? AND "+s.dialect.LeaseTokenFence("apply_operations", "owner_op", "id", "lease_token"),
 		)
-		result, err := s.db.ExecContext(ctx, query, state.ApplyOperation.Stopped, applyID, state.ApplyOperation.Pending, opLease.OperationID, opLease.Token)
+		result, err := s.db.ExecContext(ctx, query, newState, applyID, state.ApplyOperation.Pending, opLease.OperationID, opLease.Token)
 		if err != nil {
-			return 0, fmt.Errorf("stop pending apply_operations for apply %d under operation lease: %w", applyID, err)
+			return 0, fmt.Errorf("%s pending apply_operations for apply %d under operation lease: %w", verb, applyID, err)
 		}
 		rows, err := result.RowsAffected()
 		if err != nil {
-			return 0, fmt.Errorf("read stopped pending apply_operations rows affected for apply %d: %w", applyID, err)
+			return 0, fmt.Errorf("read %s pending apply_operations rows affected for apply %d: %w", verb, applyID, err)
 		}
 		if rows == 0 {
 			// No pending rows changed: either there were none (lease still
@@ -2316,36 +2377,33 @@ func (s *applyOperationStore) MarkPendingStoppedByApply(ctx context.Context, app
 	if err != nil {
 		return 0, err
 	}
-	if !hasLease {
-		result, err := s.db.ExecContext(ctx, `
-			UPDATE apply_operations
-			SET state = ?, updated_at = NOW()
-			WHERE apply_id = ? AND state = ?
-		`, state.ApplyOperation.Stopped, applyID, state.ApplyOperation.Pending)
+	if hasLease {
+		query := s.dialect.JoinedUpdate(
+			"apply_operations", "ao", "applies", "a", "a.id = ao.apply_id",
+			assignments,
+			"ao.apply_id = ? AND ao.state = ? AND "+s.dialect.LeaseTokenFence("applies", "a", "id", "lease_token"),
+		)
+		result, err := s.db.ExecContext(ctx, query, newState, applyID, state.ApplyOperation.Pending, lease.Token)
 		if err != nil {
-			return 0, fmt.Errorf("stop pending apply_operations for apply %d: %w", applyID, err)
+			return 0, fmt.Errorf("%s pending apply_operations for apply %d: %w", verb, applyID, err)
 		}
-		rows, err := result.RowsAffected()
+		rows, err := confirmLeaseOnZeroRows(ctx, s.db, result, lease, verb+" pending apply_operations", fmt.Sprintf("apply %d", applyID))
 		if err != nil {
-			return 0, fmt.Errorf("read stopped pending apply_operations rows affected for apply %d: %w", applyID, err)
+			return 0, err
 		}
 		return rows, nil
 	}
-	query := s.dialect.JoinedUpdate(
-		"apply_operations", "ao", "applies", "a", "a.id = ao.apply_id",
-		[]JoinedUpdateAssignment{
-			{Column: "state", Expr: "?"},
-			{Column: "updated_at", Expr: "NOW()"},
-		},
-		"ao.apply_id = ? AND ao.state = ? AND "+s.dialect.LeaseTokenFence("applies", "a", "id", "lease_token"),
-	)
-	result, err := s.db.ExecContext(ctx, query, state.ApplyOperation.Stopped, applyID, state.ApplyOperation.Pending, lease.Token)
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE apply_operations
+		SET `+plainSet+`
+		WHERE apply_id = ? AND state = ?
+	`, newState, applyID, state.ApplyOperation.Pending)
 	if err != nil {
-		return 0, fmt.Errorf("stop pending apply_operations for apply %d: %w", applyID, err)
+		return 0, fmt.Errorf("%s pending apply_operations for apply %d: %w", verb, applyID, err)
 	}
-	rows, err := confirmLeaseOnZeroRows(ctx, s.db, result, lease, "stopped pending apply_operations", fmt.Sprintf("apply %d", applyID))
+	rows, err := result.RowsAffected()
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("read %s pending apply_operations rows affected for apply %d: %w", verb, applyID, err)
 	}
 	return rows, nil
 }

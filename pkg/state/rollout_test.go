@@ -330,3 +330,56 @@ func TestDeriveRolloutApplyState_FailedStepEndsTheRollout(t *testing.T) {
 	assert.Equal(t, Apply.Cancelled, DeriveRolloutApplyState(RolloutChildren(ops(ApplyOperation.Cancelled, ApplyOperation.Completed))))
 	assert.Equal(t, Apply.Reverted, DeriveRolloutApplyState(RolloutChildren(ops(ApplyOperation.Reverted, ApplyOperation.Completed))))
 }
+
+// TestDeriveRolloutApplyState_CancelWaitsForWorkUnderWay verifies that a cancel
+// settles a rollout only once it has reached every target already copying.
+// payments-002 had not started `stations` when the cancel arrived, so it
+// settled at once; payments-001 is still copying it. The rollout keeps
+// reporting the copy until payments-001 is cancelled too, and a target that
+// never started holds nothing.
+func TestDeriveRolloutApplyState_CancelWaitsForWorkUnderWay(t *testing.T) {
+	ops := func(first, second, third string) []RolloutOperation {
+		return []RolloutOperation{
+			rolloutStep("payments-001", 1, first),
+			rolloutStep("payments-002", 1, second),
+			rolloutStep("payments-003", 1, third),
+			rolloutStep("payments-001", 2, ApplyOperation.Pending),
+			rolloutStep("payments-002", 2, ApplyOperation.Pending),
+			rolloutStep("payments-003", 2, ApplyOperation.Pending),
+		}
+	}
+
+	assert.Equal(t, Apply.Running, DeriveRolloutApplyState(RolloutChildren(ops(ApplyOperation.Running, ApplyOperation.Cancelled, ApplyOperation.Pending))))
+	assert.Equal(t, Apply.WaitingForCutover, DeriveRolloutApplyState(RolloutChildren(ops(ApplyOperation.WaitingForCutover, ApplyOperation.Cancelled, ApplyOperation.Pending))))
+	assert.Equal(t, Apply.Cancelled, DeriveRolloutApplyState(RolloutChildren(ops(ApplyOperation.Cancelled, ApplyOperation.Cancelled, ApplyOperation.Pending))))
+	assert.Equal(t, Apply.Cancelled, DeriveRolloutApplyState(RolloutChildren(ops(ApplyOperation.Cancelled, ApplyOperation.Completed, ApplyOperation.Cancelled))))
+}
+
+// TestDeriveRolloutApplyState_StopWaitsForWorkUnderWay verifies that a rollout
+// reads stopped only once no target is still working. The stop caught
+// payments-002 and payments-003 before they started, so they stopped at once,
+// while payments-001 is still copying `stations` until its own engine stops.
+// The same shape runs the other way on start: payments-001 resumes first and
+// the stopped targets wait their turn, and the rollout reports the resumed
+// copy rather than stopped.
+func TestDeriveRolloutApplyState_StopWaitsForWorkUnderWay(t *testing.T) {
+	ops := func(first, second, third string) []RolloutOperation {
+		return []RolloutOperation{
+			rolloutStep("payments-001", 1, first),
+			rolloutStep("payments-002", 1, second),
+			rolloutStep("payments-003", 1, third),
+			rolloutStep("payments-001", 2, ApplyOperation.Stopped),
+			rolloutStep("payments-002", 2, ApplyOperation.Stopped),
+			rolloutStep("payments-003", 2, ApplyOperation.Stopped),
+		}
+	}
+
+	assert.Equal(t, Apply.Running, DeriveRolloutApplyState(RolloutChildren(ops(ApplyOperation.Running, ApplyOperation.Stopped, ApplyOperation.Stopped))),
+		"a stop that has not landed on the copying target must not read stopped")
+	assert.Equal(t, Apply.WaitingForCutover, DeriveRolloutApplyState(RolloutChildren(ops(ApplyOperation.WaitingForCutover, ApplyOperation.Stopped, ApplyOperation.Stopped))))
+	assert.Equal(t, Apply.Resuming, DeriveRolloutApplyState(RolloutChildren(ops(ApplyOperation.Resuming, ApplyOperation.Stopped, ApplyOperation.Stopped))),
+		"a start reads resuming while its first target resumes")
+	assert.Equal(t, Apply.Stopped, DeriveRolloutApplyState(RolloutChildren(ops(ApplyOperation.Stopped, ApplyOperation.Stopped, ApplyOperation.Stopped))))
+	assert.Equal(t, Apply.Stopped, DeriveRolloutApplyState(RolloutChildren(ops(ApplyOperation.Completed, ApplyOperation.Completed, ApplyOperation.Stopped))),
+		"completed targets hold nothing, so only the stopped work remains")
+}

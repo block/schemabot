@@ -1411,6 +1411,38 @@ func TestCompletePendingControlRequestsIfApplyResolved(t *testing.T) {
 		assert.Equal(t, storage.ControlOperationStop, control.completed[0])
 	})
 
+	t.Run("keeps the start pending while a resumed rollout still has a stopped operation", func(t *testing.T) {
+		applies := &getApplyStore{apply: &storage.Apply{ID: 9, ApplyIdentifier: "apply-resuming", State: state.Apply.Running}}
+		control := &fakeControlRequestStore{pending: map[storage.ControlOperation]*storage.ApplyControlRequest{
+			storage.ControlOperationStart: pendingRequest(storage.ControlOperationStart),
+		}}
+		ops := &markPendingStoppedRecordingStore{ops: []*storage.ApplyOperation{
+			{ID: 1, Deployment: "region-a", OperationKey: "orders-001/step-1", State: state.ApplyOperation.Running},
+			{ID: 2, Deployment: "region-a", OperationKey: "orders-001/step-2", State: state.ApplyOperation.Stopped},
+		}}
+		svc := newStopReconcileTestService(applies, ops, control)
+
+		require.NoError(t, svc.completePendingControlRequestsIfApplyResolved(t.Context(), svc.driverLogger(1), 9))
+		assert.Empty(t, control.completed, "the stopped step-2 operation is claimed only for the pending start, so the start must stay pending")
+		assert.Empty(t, control.failed)
+	})
+
+	t.Run("completes the start once the resumed rollout has no stopped operation", func(t *testing.T) {
+		applies := &getApplyStore{apply: &storage.Apply{ID: 9, ApplyIdentifier: "apply-resumed", State: state.Apply.Running}}
+		control := &fakeControlRequestStore{pending: map[storage.ControlOperation]*storage.ApplyControlRequest{
+			storage.ControlOperationStart: pendingRequest(storage.ControlOperationStart),
+		}}
+		ops := &markPendingStoppedRecordingStore{ops: []*storage.ApplyOperation{
+			{ID: 1, Deployment: "region-a", OperationKey: "orders-001/step-1", State: state.ApplyOperation.Completed},
+			{ID: 2, Deployment: "region-a", OperationKey: "orders-001/step-2", State: state.ApplyOperation.Resuming},
+		}}
+		svc := newStopReconcileTestService(applies, ops, control)
+
+		require.NoError(t, svc.completePendingControlRequestsIfApplyResolved(t.Context(), svc.driverLogger(1), 9))
+		assert.Equal(t, []storage.ControlOperation{storage.ControlOperationStart}, control.completed,
+			"every operation the start was for has resumed, so the start has taken effect")
+	})
+
 	t.Run("no-op when nothing is pending", func(t *testing.T) {
 		applies := &getApplyStore{apply: &storage.Apply{ID: 9, ApplyIdentifier: "apply-done", State: state.Apply.Failed}}
 		control := &fakeControlRequestStore{}
@@ -1418,6 +1450,47 @@ func TestCompletePendingControlRequestsIfApplyResolved(t *testing.T) {
 
 		require.NoError(t, svc.completePendingControlRequestsIfApplyResolved(t.Context(), svc.driverLogger(1), 9))
 		assert.Empty(t, control.completed, "no pending requests means nothing to complete")
+	})
+}
+
+// TestUpdateApplyStateFromOperations_StartReopensStoppedRollout covers an
+// operator starting a stopped multi-operation rollout: the start claim moves one
+// stopped operation to resuming, so the operation rows derive an active rollout
+// again over a parent that still reads stopped. The pending start is what makes
+// that reopen legitimate. Without one, a stopped parent never drifts back to an
+// active state.
+func TestUpdateApplyStateFromOperations_StartReopensStoppedRollout(t *testing.T) {
+	startedAt := time.Now().Add(-time.Minute)
+	ops := []*storage.ApplyOperation{
+		{ID: 1, OperationKey: "orders-001/step-1", State: state.ApplyOperation.Resuming, StartedAt: &startedAt},
+		{ID: 2, OperationKey: "orders-002/step-1", State: state.ApplyOperation.Stopped},
+	}
+	stoppedApply := func() *storage.Apply {
+		return &storage.Apply{ID: 3, ApplyIdentifier: "apply-stopped-rollout", State: state.Apply.Stopped, StartedAt: &startedAt, Environment: "staging"}
+	}
+
+	t.Run("a pending start reopens the stopped parent", func(t *testing.T) {
+		applyStore := &recordingApplyStore{swapped: true}
+		control := &fakeControlRequestStore{pending: map[storage.ControlOperation]*storage.ApplyControlRequest{
+			storage.ControlOperationStart: {ApplyID: 3, Operation: storage.ControlOperationStart, Status: storage.ControlRequestPending},
+		}}
+		svc := newStopReconcileTestService(applyStore, &listingApplyOperationStore{ops: ops}, control)
+
+		_, err := svc.updateApplyStateFromOperations(t.Context(), 1, stoppedApply(), allowLeaseScopedFailedReopen)
+		require.NoError(t, err)
+		require.NotNil(t, applyStore.updated, "the resumed rollout must move the parent out of stopped")
+		assert.Equal(t, state.Apply.Stopped, applyStore.expectedState, "the reopen compare-and-swaps on the stopped state read before deriving")
+		assert.False(t, state.IsTerminalApplyState(applyStore.updated.State), "the parent reads active while its operations resume, got %q", applyStore.updated.State)
+	})
+
+	t.Run("without a pending start the stopped parent is not reopened", func(t *testing.T) {
+		applyStore := &recordingApplyStore{swapped: true}
+		svc := newStopReconcileTestService(applyStore, &listingApplyOperationStore{ops: ops}, &fakeControlRequestStore{})
+
+		_, err := svc.updateApplyStateFromOperations(t.Context(), 1, stoppedApply(), allowLeaseScopedFailedReopen)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "child operations derive non-terminal state")
+		assert.Nil(t, applyStore.updated, "a stopped parent with no start must keep its stored state")
 	})
 }
 

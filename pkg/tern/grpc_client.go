@@ -3452,7 +3452,18 @@ func shouldDispatchQueuedRemoteApply(apply *storage.Apply, scope applyTaskScope)
 	// ambiguous "running with no remote id" case the whole-apply path guards
 	// against, where a shared external_id could have been lost after a real
 	// dispatch.
-	return scope.usesOperationRemoteResume() && state.IsState(dispatchState, state.Apply.Running)
+	if !scope.usesOperationRemoteResume() {
+		return false
+	}
+	if state.IsState(dispatchState, state.Apply.Running) {
+		return true
+	}
+	// A stop catches still-pending operations before they start and moves them
+	// to stopped without a started_at; the start claim then moves the row to
+	// resuming. Such a row never ran, so it was never dispatched either, and
+	// resuming it is its first dispatch. A resuming row that had started is
+	// not: it may have reached remote Tern before its id was stored.
+	return state.IsState(dispatchState, state.Apply.Resuming) && scope.operation.StartedAt == nil
 }
 
 // undispatchedControlRequestSettlesLocally reports whether a pending stop or

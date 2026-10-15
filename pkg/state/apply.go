@@ -172,6 +172,9 @@ func DeriveApplyState(taskStates []string) string {
 	if counts[Apply.Running] > 0 {
 		return Apply.Running
 	}
+	if counts[Apply.Resuming] > 0 {
+		return Apply.Resuming
+	}
 	if postCopyPhaseWithQueuedWork(counts) {
 		return Apply.Running
 	}
@@ -267,8 +270,9 @@ type RolloutChild struct {
 // child operations, accounting for the on_failure rollout-continuation policy.
 //
 // It builds on DeriveApplyState: the base projection is computed the same way,
-// and any non-failed base is returned unchanged. The policy only modulates the
-// failed case. continue governs rollout *continuation*, never the apply's
+// and any base other than failed or cancelled is returned unchanged. A
+// cancelled base waits for the cancel to reach every sibling already under way
+// (see deriveCancelledRollout). The policy only modulates the failed case. continue governs rollout *continuation*, never the apply's
 // pass/fail verdict — so an apply that suffered a continuable failure still
 // settles to failed once every sibling is terminal; the policy only delays that
 // verdict so the remaining siblings get their turn instead of the first failure
@@ -305,6 +309,12 @@ func DeriveRolloutApplyState(children []RolloutChild) string {
 		childStates[i] = c.State
 	}
 	base := DeriveApplyState(childStates)
+	if IsState(base, Apply.Cancelled) {
+		return deriveCancelledRollout(children)
+	}
+	if IsState(base, Apply.Stopped) {
+		return deriveStoppedRollout(children)
+	}
 	if !IsState(base, Apply.Failed) {
 		return base
 	}
@@ -367,6 +377,47 @@ func DeriveRolloutApplyState(children []RolloutChild) string {
 		return Apply.Failed
 	}
 	return Apply.RunningDegraded
+}
+
+// deriveCancelledRollout projects a rollout in which at least one child was
+// cancelled. A cancel reaches a rollout one child at a time: a child no driver
+// has started settles on the spot, while one already copying settles only when
+// its own engine has stopped writing to its target. The rollout is cancelled
+// once every child that started has settled. Until then it reports the state of
+// the work still under way, so the pending cancel stays deliverable to that work
+// and the parent never reads cancelled over a target that is still changing.
+func deriveCancelledRollout(children []RolloutChild) string {
+	var underWay []string
+	for _, c := range children {
+		if childHoldsItsTarget(c) && !childNotYetStarted(c) {
+			underWay = append(underWay, c.State)
+		}
+	}
+	if len(underWay) == 0 {
+		return Apply.Cancelled
+	}
+	return DeriveApplyState(underWay)
+}
+
+// deriveStoppedRollout projects a rollout in which at least one child is
+// stopped. Stop and start both reach a rollout one child at a time: a stop lands
+// on each started child only when its own engine has stopped writing, and a
+// start resumes the stopped children one claim at a time, the ones a stop caught
+// before they began only once the members ahead of them finish. The rollout is
+// stopped once no child is still working. Until then it reports the state of the
+// work under way, so it never reads stopped over a target that is still
+// changing, and a stop that has not landed everywhere stays deliverable.
+func deriveStoppedRollout(children []RolloutChild) string {
+	var underWay []string
+	for _, c := range children {
+		if childHoldsItsTarget(c) && !childNotYetStarted(c) && !IsState(c.State, Apply.Stopped) {
+			underWay = append(underWay, c.State)
+		}
+	}
+	if len(underWay) == 0 {
+		return Apply.Stopped
+	}
+	return DeriveApplyState(underWay)
 }
 
 // childHoldsItsTarget reports whether a child still holds the deployment it was
@@ -493,6 +544,8 @@ func normalizeApplyState(raw string) string {
 		return Apply.FailedRetryable
 	case "STOPPED":
 		return Apply.Stopped
+	case "RESUMING":
+		return Apply.Resuming
 	case "CANCELLED":
 		return Apply.Cancelled
 	case "REVERTED":

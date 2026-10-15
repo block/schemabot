@@ -1344,13 +1344,13 @@ func TestRenderMultiDeploymentApplyComment_PausedRolloutWithPendingCutoverShares
 
 // A terminal apply refuses stop, and refuses cancel in every terminal state
 // but stopped, so the rollout footer offers neither once the aggregate is
-// terminal, even while a member is still writing to its target: a cancelled
-// sibling ranks the aggregate cancelled over a sibling still copying. A stopped
+// terminal, even while a member is still writing to its target: a reverted
+// sibling ranks the aggregate reverted over a sibling still copying. A stopped
 // PlanetScale aggregate offers no cancel either, since PlanetScale refuses stop
 // and so never reaches that state.
 func TestRenderMultiDeploymentApplyComment_TerminalAggregateNeverOffersStop(t *testing.T) {
-	ops := []presentation.Operation{rollingOp("us", so.Cancelled), rollingOp("eu", so.Running)}
-	require.Equal(t, state.Apply.Cancelled, presentation.Derive(ops).State)
+	ops := []presentation.Operation{rollingOp("us", so.Reverted), rollingOp("eu", so.Running)}
+	require.Equal(t, state.Apply.Reverted, presentation.Derive(ops).State)
 
 	terminal := 0
 	for _, field := range reflect.ValueOf(state.Apply).Fields() {
@@ -1368,7 +1368,7 @@ func TestRenderMultiDeploymentApplyComment_TerminalAggregateNeverOffersStop(t *t
 					ApplyID:     "apply-123",
 					Environment: "production",
 					Details: []*ApplyStatusCommentData{
-						{Database: "orders_us", State: state.Apply.Cancelled, ApplyID: "apply-123", Environment: "production", Engine: engine},
+						{Database: "orders_us", State: state.Apply.Reverted, ApplyID: "apply-123", Environment: "production", Engine: engine},
 						{Database: "orders_eu", State: state.Apply.Running, ApplyID: "apply-123", Environment: "production", Engine: engine},
 					},
 				})
@@ -1723,17 +1723,15 @@ func TestRenderMultiDeploymentApplyComment_SoleMultiTargetStatusFollowsTheApply(
 	assert.NotContains(t, out, "Rolled out to")
 }
 
-// An apply settles as cancelled or reverted while one of its targets is still
-// running. The status line follows the target that is still going, in the
-// present tense, rather than calling the rollout finished beside a running
-// count.
+// An apply settles as reverted while one of its targets is still running. The
+// status line follows the target that is still going, in the present tense,
+// rather than calling the rollout finished beside a running count.
 func TestRenderMultiDeploymentApplyComment_SoleMultiTargetStatusWaitsForARunningTarget(t *testing.T) {
 	for _, tc := range []struct {
 		ended    string
 		rollback bool
 		want     string
 	}{
-		{so.Cancelled, false, "Rolling out: 0 of 2 targets done, 1 running, 1 cancelled"},
 		{so.Reverted, true, "Rolling back: 0 of 2 targets done, 1 running, 1 reverted"},
 	} {
 		data := MultiDeploymentApplyData{
