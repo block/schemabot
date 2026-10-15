@@ -402,6 +402,22 @@ func stoppedAppliesTitle(n int) string {
 	return fmt.Sprintf("%d applies stopped", n)
 }
 
+// isStoppedAppliesAggregate reports whether an aggregate Check Run concluded
+// because stopped applies are all that hold it, the case the fold titles with
+// stoppedAppliesTitle. It is read off the title because that is the only place
+// a deployment that cannot see the applies learns why the run concluded; the
+// conclusion alone is the same as for changes no apply has run yet.
+func isStoppedAppliesAggregate(run *ghclient.CheckRunResult) bool {
+	if run.Status != checkStatusCompleted || run.Conclusion != checkConclusionActionRequired {
+		return false
+	}
+	var n int
+	if _, err := fmt.Sscanf(run.Title, "%d", &n); err != nil {
+		return false
+	}
+	return n > 0 && run.Title == stoppedAppliesTitle(n)
+}
+
 // stoppedApplyIDs is the set of applies resting in the stopped state, so the
 // fold can tell a check held open by a paused apply from one held open by work
 // still running. The distinction is the operator's next move: a stopped apply

@@ -1081,7 +1081,10 @@ When the apply reaches a terminal state:
 - `stopped` leaves the internal record `in_progress` and owned by the apply,
   since the apply has not settled. The aggregate Check Run concludes
   `action_required` titled "1 apply stopped", so merge stays blocked without a
-  run left spinning, and returns to in progress when the apply is started again.
+  run left spinning. When a driver claims the apply to start it again, SchemaBot
+  republishes the aggregate and the Check Run returns to in progress. If that
+  publish fails, the run keeps saying the apply is stopped until the next
+  aggregate publish for the PR; merge stays blocked either way.
 
 Completion is conditional on ownership: the watcher can only update the row if
 the row still represents that `apply_id` and no newer apply exists for the same
@@ -1227,6 +1230,7 @@ another SchemaBot deployment.
 | --- | --- | --- |
 | `success` on the PR head commit | Yes | Prior environment is clean for the commit being applied. |
 | `action_required` on the PR head commit | No | Apply the prior environment first. |
+| `action_required` held by a stopped apply | No | Start the stopped apply in the prior environment again. |
 | `in_progress` | No | Wait for the prior environment to finish. |
 | `failure` on the PR head commit | No | Fix and re-apply the prior environment. |
 | Completed on another commit | No | The result says nothing about the commit being applied. Re-check the prior environment on the PR head with `schemabot plan -e <prior-environment>`. |
@@ -1248,7 +1252,10 @@ environment:
   environment.
 - If another deployment owns the prior environment, SchemaBot reads the
   environment aggregate check run from GitHub, such as `SchemaBot (staging)` or
-  the deployment's configured check name.
+  the deployment's configured check name. The run's conclusion decides whether
+  the apply is blocked; when it is `action_required` with a stopped-apply title
+  such as "1 apply stopped", the blocked comment asks for the stopped apply to
+  be started again instead of for a fresh apply.
 
 The GitHub lookup verifies which App created the check run: only this
 deployment's own GitHub App and the sibling deployment Apps listed in

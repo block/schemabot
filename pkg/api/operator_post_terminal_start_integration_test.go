@@ -324,3 +324,65 @@ func TestOperator_StartOnAMultiOperationRolloutSettlesWithTheParent(t *testing.T
 		})
 	}
 }
+
+// An operator stops a two-deployment rollout and then starts it again. The
+// first operation claim under the start takes the rollout out of its stop: the
+// driver reports that claim once, after the parent has left stopped in storage,
+// so the PR Check Run republished from storage no longer says the rollout is
+// stopped. The claim of the second operation drives a rollout that is already
+// running and reports nothing.
+func TestOperator_StartOnAStoppedRolloutReportsTheClaimOnce(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	ctx := t.Context()
+	db := openMatrixStorage(t)
+	stor := mysqlstore.New(db)
+	resetMatrixTables(t, ctx, db)
+
+	seed := seedGroupedApply(t, ctx, stor, multiOpSeed{
+		applyIdentifier: "start-on-stopped-rollout",
+		parentState:     state.Apply.Stopped,
+		cutoverPolicy:   storage.CutoverPolicyRolling,
+		onFailure:       storage.OnFailureHalt,
+		deployments:     []string{"region-a", "region-b"},
+		opState:         state.ApplyOperation.Stopped,
+		taskState:       state.Task.Stopped,
+	})
+	// The rollout was copying when it stopped: both operations had started, so
+	// the start resumes them as recovered work rather than gating them as new
+	// members.
+	_, err := db.ExecContext(ctx, "UPDATE apply_operations SET started_at = NOW() WHERE apply_id = ?", seed.applyID)
+	require.NoError(t, err)
+	_, _, err = stor.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+		ApplyID:     seed.applyID,
+		Operation:   storage.ControlOperationStart,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "matrix-test",
+	})
+	require.NoError(t, err, "request pending start")
+
+	rec := &driveRecorder{}
+	svc := newMatrixService(t, stor, matrixClients(stor, rec, map[string]matrixOutcome{
+		"region-a": {taskState: state.Task.Completed},
+		"region-b": {taskState: state.Task.Completed},
+	}))
+	var claimedStates []string
+	svc.OnStoppedApplyClaimed = func(apply *storage.Apply) {
+		assert.Equal(t, seed.applyID, apply.ID)
+		claimedStates = append(claimedStates, getApply(t, ctx, stor, apply.ID).State)
+	}
+
+	driveNextOperation(t, ctx, svc, 1)
+
+	require.Equal(t, []string{"region-a"}, rec.resumeOrder())
+	require.Len(t, claimedStates, 1, "the claim that takes the rollout out of its stop is reported")
+	assert.False(t, state.IsState(claimedStates[0], state.Apply.Stopped),
+		"the parent has left stopped in storage by the time the claim is reported, got %s", claimedStates[0])
+
+	driveNextOperation(t, ctx, svc, 2)
+
+	require.Equal(t, []string{"region-a", "region-b"}, rec.resumeOrder())
+	assert.Len(t, claimedStates, 1, "a claim on a rollout already running again is not reported")
+}

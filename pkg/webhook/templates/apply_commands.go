@@ -913,6 +913,23 @@ func RenderApplyBlockedByPriorEnvInProgress(database, environment, priorEnv stri
 	return offerSupportChannel(sb.String())
 }
 
+// RenderApplyBlockedByStoppedPriorEnvApply renders a comment when an apply is
+// blocked because a prior environment's apply is stopped: it holds the prior
+// environment until it is started again, so it is the operator's move, not
+// something to wait for.
+func RenderApplyBlockedByStoppedPriorEnvApply(database, environment, priorEnv string) string {
+	var sb strings.Builder
+
+	writeEnvironmentTitle(&sb, glyph.Refused+" Apply Blocked", environment)
+	writeDBLine(&sb, database)
+	sb.WriteString("\n")
+	fmt.Fprintf(&sb, "%s has a stopped apply. Start it again with the command on its progress comment.\n\n", capitalizeFirst(priorEnv))
+	fmt.Fprintf(&sb, "Once %s completes, retry:\n", priorEnv)
+	fmt.Fprintf(&sb, "```\nschemabot apply -e %s\n```\n", environment)
+
+	return offerSupportChannel(sb.String())
+}
+
 // RenderApplyBlockedByUnlistedEnvironment renders a comment when an apply is
 // blocked because this scoped SchemaBot instance cannot enforce staging-first
 // promotion ordering: the target environment is not part of the configured

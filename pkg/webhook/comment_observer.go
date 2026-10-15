@@ -56,11 +56,6 @@ type CommentObserver struct {
 	// Optional — nil means no hook.
 	OnTerminalHook func(apply *storage.Apply)
 
-	// OnResumeHook is called after the observer posts the fresh progress
-	// comment for an apply resumed from a stop. Used by the webhook handler to
-	// move the Check Run off "stopped". Optional — nil means no hook.
-	OnResumeHook func(apply *storage.Apply)
-
 	// clock is the time source used for adaptive rate-limit math. Defaults
 	// to clock.Real{} in NewCommentObserver; tests may inject a *clock.Fake
 	// via clock.NewFake(start).
@@ -199,10 +194,6 @@ type CommentObserverConfig struct {
 	// Used to update check runs on terminal state.
 	OnTerminalHook func(apply *storage.Apply)
 
-	// OnResumeHook is called after the fresh progress comment for an apply
-	// resumed from a stop is posted. Used to update check runs on resume.
-	OnResumeHook func(apply *storage.Apply)
-
 	// Clock is the time source for adaptive rate-limit math. Optional —
 	// nil or typed-nil defaults to clock.Real{} (via clock.Default). Tests
 	// inject a *clock.Fake via clock.NewFake(start) to make the
@@ -273,7 +264,6 @@ func NewCommentObserver(cfg CommentObserverConfig) *CommentObserver {
 		shardedPlans:   shardedPlans,
 		logger:         cfg.Logger,
 		OnTerminalHook: cfg.OnTerminalHook,
-		OnResumeHook:   cfg.OnResumeHook,
 		clock:          clk,
 		authorityOwner: storage.LeaseOwnerProcess() + "/comment-observer",
 	}
@@ -1184,9 +1174,6 @@ func (o *CommentObserver) rotateProgressCommentForResume(apply *storage.Apply, t
 	o.supersedeResumeSummaryMarker(apply)
 	o.logger.Info("observer: posted fresh progress comment for resumed apply",
 		"apply_id", o.applyID, "repo", o.repo, "pr", o.pr, "state", apply.State)
-	if o.OnResumeHook != nil {
-		o.OnResumeHook(apply)
-	}
 	return true
 }
 

@@ -1798,6 +1798,8 @@ type CheckRunResult struct {
 	Name       string
 	Status     string // "queued", "in_progress", "completed"
 	Conclusion string // "success", "failure", "neutral", "action_required"
+	// Title is the run's output title; empty when the run has none.
+	Title string
 	// StartedAt is when the Check Run was started; zero when GitHub did not
 	// report a start time. Lets callers judge how long a run that never
 	// completed has been sitting.
@@ -1868,6 +1870,7 @@ func (ic *InstallationClient) FindCheckRunByName(ctx context.Context, repo, head
 						Name:       run.GetName(),
 						Status:     run.GetStatus(),
 						Conclusion: run.GetConclusion(),
+						Title:      run.GetOutput().GetTitle(),
 						StartedAt:  run.GetStartedAt().Time,
 					}
 				}

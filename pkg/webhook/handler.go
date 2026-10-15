@@ -358,6 +358,25 @@ func NewHandlerWithDispatch(service *api.Service, ghClients github.ClientSet, we
 			service.SetApplyObserver(apply.Database, apply.Deployment, apply.Environment, apply.ID, NewCommentObserver(cfg))
 		}
 
+		// A stopped apply's Check Run says it is stopped. When a driver claims
+		// it again, republish the aggregate so the run follows the apply back
+		// to in progress. The publish runs off the drive's goroutine on a copy
+		// of the apply: the drive mutates its own copy as it runs, and it must
+		// not wait on GitHub before the copy starts again.
+		service.OnStoppedApplyClaimed = func(apply *storage.Apply) {
+			if apply.Repository == "" || apply.PullRequest == 0 || apply.InstallationID == 0 {
+				logger.Debug("stopped apply claimed; no Check Run to refresh: apply has no GitHub destination",
+					"apply_id", apply.ApplyIdentifier,
+					"database", apply.Database,
+					"environment", apply.Environment)
+				return
+			}
+			claimed := *apply
+			h.goSafe(claimed.Repository, claimed.PullRequest, claimed.InstallationID, "", func() {
+				h.republishAggregateForHeldCheck(context.Background(), &claimed, "stopped apply claimed")
+			})
+		}
+
 		// Register the aggregate terminal-summary callback, invoked by the
 		// operator that won the aggregate projection CAS and by the
 		// retryable-expiry pass for each apply it settles. A multi-operation apply
@@ -711,9 +730,6 @@ func (h *Handler) commentObserverConfig(factory github.GitHubClientFactory, repo
 		EngineLogs:     h.engineLogReader(),
 		shardedPlans:   h.shardedPlans,
 		Logger:         h.logger,
-		OnResumeHook: func(a *storage.Apply) {
-			h.republishAggregateForHeldCheck(context.Background(), a, "resumed apply")
-		},
 	}
 }
 

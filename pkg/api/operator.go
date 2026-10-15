@@ -2387,6 +2387,13 @@ func (s *Service) resumeClaimedApplyWithOptions(ctx context.Context, driverID in
 	if s.OnApplyRecovered != nil && !opts.suppressRecoveredObserver {
 		s.OnApplyRecovered(apply)
 	}
+	// The claim leaves the caller's copy in the state it was claimed from, so
+	// stopped here means this drive is the one taking the apply out of its
+	// stop. It fires whether or not the per-driver observer is suppressed: a
+	// multi-operation rollout leaves stopped the same way a single apply does.
+	if state.IsState(previousState, state.Apply.Stopped) && s.OnStoppedApplyClaimed != nil {
+		s.OnStoppedApplyClaimed(apply)
+	}
 
 	retryableClaim := previousState == state.Apply.FailedRetryable && !opts.projectionOwnsGauge
 	if retryableClaim {
