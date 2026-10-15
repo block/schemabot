@@ -91,7 +91,7 @@ func (h *Handler) rollbackCommandCore(parent context.Context, repo string, pr in
 				"requested_by", requestedBy)
 			return false, nil
 		}
-		h.postComment(repo, pr, installationID, templates.RenderRollbackMissingApplyID(h.cliName(), result.Environment, h.deploymentTenant()))
+		h.postComment(repo, pr, installationID, templates.RenderRollbackMissingApplyID(h.missingApplyIDData(ctx, repo, pr, result, "rollback", rollbackActsOn)))
 		return false, nil
 	}
 

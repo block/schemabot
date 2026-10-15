@@ -827,8 +827,7 @@ func TestWebhookControlCommandMissingApplyID(t *testing.T) {
 
 			select {
 			case body := <-comments:
-				assert.Contains(t, body, "Missing Apply ID")
-				assert.Contains(t, body, "schemabot "+tt.action+" <apply-id> -e <environment>")
+				assert.Contains(t, body, "## Missing Apply ID\n\nThis PR has no apply in `staging` that `"+tt.action+"` can act on.")
 			case <-time.After(2 * time.Second):
 				t.Fatal("timed out waiting for missing apply ID comment")
 			}

@@ -44,7 +44,7 @@ func (h *Handler) loadApplyForPRControl(ctx context.Context, repo string, pr int
 				"requested_by", requestedBy)
 			return nil, false
 		}
-		h.postComment(repo, pr, installationID, templates.RenderControlMissingApplyID(h.cliName(), command, result.Environment))
+		h.postComment(repo, pr, installationID, templates.RenderControlMissingApplyID(h.missingApplyIDData(ctx, repo, pr, result, command, controlCommandActsOn)))
 		return nil, false
 	}
 	if h.service == nil {

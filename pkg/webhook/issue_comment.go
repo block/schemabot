@@ -392,7 +392,10 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 			return
 		}
 		h.acknowledgeCommand(repo, pr, installationID, deliveryID, result.CommentID)
-		h.postComment(repo, pr, installationID, templates.RenderRollbackMissingApplyID(h.cliName(), result.Environment, h.deploymentTenant()))
+		lookupCtx, cancel := h.commandContext(ctx, commandTimeout)
+		data := h.missingApplyIDData(lookupCtx, repo, pr, result, "rollback", rollbackActsOn)
+		cancel()
+		h.postComment(repo, pr, installationID, templates.RenderRollbackMissingApplyID(data))
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "missing apply ID"})
 		return
 	}

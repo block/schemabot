@@ -788,6 +788,69 @@ func apiServiceForStopCommandTest(t *testing.T, store storage.Storage, database 
 	}, nil, testLogger())
 }
 
+// An operator comments `schemabot stop -e staging` without the apply ID while
+// a staging apply is running on the PR. The reply looks the apply up and names
+// the exact command to comment, ID included, so the operator never has to find
+// the ID on another comment or run a CLI command from the PR.
+func TestE2EControlCommandWithoutApplyIDNamesTheApply(t *testing.T) {
+	ctx := t.Context()
+	schemabotDB, err := sql.Open("block-mysql", e2eSchemabotDSN)
+	require.NoError(t, err)
+	require.NoError(t, schemabotDB.PingContext(ctx))
+
+	store := mysqlstore.New(schemabotDB)
+	applyIdentifier := "apply_7a8b9c0d"
+	database := "missing_apply_id_pr_comments_db"
+	cleanupStopCommandTestRows(t, schemabotDB, applyIdentifier, database)
+	t.Cleanup(func() {
+		cleanupStopCommandTestRows(t, schemabotDB, applyIdentifier, database)
+		utils.CloseAndLog(schemabotDB)
+	})
+	createStopCommandApply(t, store, applyIdentifier, database)
+
+	client, mux := setupGitHubServer(t)
+	comments := make(chan string, 10)
+	mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Body string `json:"body"`
+		}
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
+		comments <- body.Body
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": 99})
+	})
+	mux.HandleFunc("POST /repos/octocat/hello-world/issues/comments/42/reactions", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": 1})
+	})
+
+	h := &Handler{
+		service:   apiServiceForStopCommandTest(t, store, database),
+		ghClients: ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: ghclient.NewInstallationClient(client, testLogger())}),
+		logger:    testLogger(),
+	}
+
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment:   "schemabot stop -e staging",
+		userLogin: "alice",
+		isPR:      true,
+	}, nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	comment := readComment(t, comments)
+	assert.Contains(t, comment, "## Missing Apply ID")
+	assert.Contains(t, comment, "```\nschemabot stop "+applyIdentifier+" -e staging\n```",
+		"the reply names the running staging apply's exact stop command")
+	assert.NotContains(t, comment, "status -e", "the reply never sends the operator to a CLI command")
+
+	stored, err := store.Applies().GetByApplyIdentifier(ctx, applyIdentifier)
+	require.NoError(t, err)
+	require.NotNil(t, stored)
+	assert.Equal(t, state.Apply.Running, stored.State, "a command without an apply ID stops nothing")
+}
+
 func createStopCommandApply(t *testing.T, store storage.Storage, applyIdentifier, database string) int64 {
 	t.Helper()
 	return createStopCommandApplyWithEngine(t, store, applyIdentifier, database, storage.EngineSpirit)

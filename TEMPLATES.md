@@ -4209,6 +4209,57 @@ schemabot apply -e production
 </details>
 
 <details>
+<summary><a name="control-command-missing-apply-id"></a><strong>Control Command Missing Apply ID</strong></summary>
+
+
+## Missing Apply ID
+
+Comment this to `cutover` the `testapp` apply in `production`:
+```
+schemabot cutover apply-a1b2c3d4e5f6 -e production
+```
+<!-- schemabot:offer-support-channel -->
+
+</details>
+
+<details>
+<summary><a name="control-command-missing-apply-id-several-applies"></a><strong>Control Command Missing Apply ID (Several Applies)</strong></summary>
+
+
+## Missing Apply ID
+
+Comment the command for the apply you mean:
+
+`testapp` in `staging`:
+```
+schemabot stop apply-a1b2c3d4e5f6 -e staging
+```
+
+`billing` in `staging`:
+```
+schemabot stop apply-0f9e8d7c6b5a -e staging
+```
+<!-- schemabot:offer-support-channel -->
+
+</details>
+
+<details>
+<summary><a name="rollback-missing-apply-id"></a><strong>Rollback Missing Apply ID</strong></summary>
+
+
+## Missing Apply ID
+
+Comment this to `rollback` the `testapp` apply in `staging`:
+```
+schemabot rollback apply-a1b2c3d4e5f6 -e staging
+```
+
+To confirm a generated rollback, comment `schemabot rollback-confirm -e staging`.
+<!-- schemabot:offer-support-channel -->
+
+</details>
+
+<details>
 <summary><a name="apply-blocked-prior-env-check-missing"></a><strong>Apply Blocked: Prior Env Check Missing</strong></summary>
 
 
