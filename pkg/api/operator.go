@@ -1952,17 +1952,18 @@ func (s *Service) driverLogger(driverID int) *slog.Logger {
 }
 
 // completePendingControlRequestsIfApplyResolved settles pending stop, start,
-// and cancel control requests once the apply has settled to a terminal state,
-// so the requests do not stay pending forever after the rollout resolves. The
-// apply is reloaded because the derived-state write operates on a copy and
-// does not mutate the caller's row. The logger carries the caller's identity —
-// a driver's id, or the reaper — so the settlement lines name who answered. A
-// pending stop completes at any terminal state. A pending start and a pending
-// cancel are handed to the shared settlements, which decide from the stored
-// outcome whether the command took effect, so this path discloses the same
-// outcome as every other drive shape. A still-non-terminal apply resolves only
-// its stop, and only once that stop has reached every operation. No-op when
-// nothing is pending.
+// cutover, and cancel control requests once the apply has settled to a
+// terminal state, so the requests do not stay pending forever after the
+// rollout resolves. The apply is reloaded because the derived-state write
+// operates on a copy and does not mutate the caller's row. The logger carries
+// the caller's identity — a driver's id, or the reaper — so the settlement
+// lines name who answered. A pending stop completes at any terminal state. A
+// pending start, cutover, and cancel are handed to the shared settlements,
+// which decide from the stored outcome whether the command took effect, so
+// this path discloses the same outcome as every other drive shape. A
+// still-non-terminal apply resolves only its stop, and only once that stop has
+// reached every operation, along with the cutover that stop superseded. No-op
+// when nothing is pending.
 func (s *Service) completePendingControlRequestsIfApplyResolved(ctx context.Context, logger *slog.Logger, applyID int64) error {
 	apply, err := s.storage.Applies().Get(ctx, applyID)
 	if err != nil {
@@ -1975,6 +1976,12 @@ func (s *Service) completePendingControlRequestsIfApplyResolved(ctx context.Cont
 		return s.completeLandedStopForHeldOpenApply(ctx, logger, apply)
 	}
 
+	// The cutover is settled before the stop completes, so a failed settlement
+	// on a stopped apply leaves the stop pending to gate the cutover off until
+	// the next pass settles it (CO-4).
+	if err := tern.SettlePendingCutoverForResolvedApply(ctx, s.storage, logger, apply); err != nil {
+		return err
+	}
 	if err := s.completePendingRequestForResolvedApply(ctx, logger, apply, storage.ControlOperationStop); err != nil {
 		return err
 	}
@@ -2029,6 +2036,12 @@ func (s *Service) completeLandedStopForHeldOpenApply(ctx context.Context, logger
 					"operation_state", op.State)...)
 			return nil
 		}
+	}
+	// The cutover the stop superseded is settled while the stop is still
+	// pending, so a failed settlement leaves the stop gate up for the next
+	// pass (CO-4).
+	if err := tern.SettlePendingCutoverAfterStop(ctx, s.storage, logger, apply); err != nil {
+		return fmt.Errorf("settle pending cutover superseded by stop for held-open apply %s: %w", apply.ApplyIdentifier, err)
 	}
 	return s.completePendingRequestForResolvedApply(ctx, logger, apply, storage.ControlOperationStop)
 }

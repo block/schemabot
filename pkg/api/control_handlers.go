@@ -1053,10 +1053,25 @@ func (s *Service) completeImmediateStopRequestIfStopped(ctx context.Context, app
 	if controlStore == nil {
 		return false, fmt.Errorf("control request store is not available")
 	}
+	if err := s.settleCutoverSupersededByStop(ctx, storedApply); err != nil {
+		return false, err
+	}
 	if err := controlStore.CompletePending(ctx, apply.ID, storage.ControlOperationStop); err != nil {
 		return false, fmt.Errorf("complete pending stop control request for apply %s after immediate stop: %w", apply.ApplyIdentifier, err)
 	}
 	return true, nil
+}
+
+// settleCutoverSupersededByStop answers the cutover still pending when the
+// apply's stop took effect, so it cannot fire on the copy a later start
+// resumes. Callers settle it before completing the stop request (CO-4): the
+// pending stop keeps a drive from taking the cutover, so a failed settlement
+// leaves the stop pending for the retry that settles it.
+func (s *Service) settleCutoverSupersededByStop(ctx context.Context, apply *storage.Apply) error {
+	if err := tern.SettlePendingCutoverAfterStop(ctx, s.storage, s.logger, apply); err != nil {
+		return fmt.Errorf("settle pending cutover superseded by stop for apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	return nil
 }
 
 func stopRequestCompletedByApplyState(applyState string) bool {
@@ -1682,6 +1697,9 @@ func (s *Service) completeResolvedStopBeforeStart(ctx context.Context, client te
 	}
 
 	if stopRequestCompletedByApplyState(apply.State) {
+		if err := s.settleCutoverSupersededByStop(ctx, apply); err != nil {
+			return err
+		}
 		if err := controlStore.CompletePending(ctx, apply.ID, storage.ControlOperationStop); err != nil {
 			return fmt.Errorf("complete pending stop control request for apply %s before start: %w", apply.ApplyIdentifier, err)
 		}
@@ -1732,6 +1750,9 @@ func (s *Service) completeResolvedStopBeforeStart(ctx context.Context, client te
 		return s.reloadApplyAfterRefusedStopSync(ctx, apply, oldState, stopCaller, caller)
 	}
 	*apply = synced
+	if err := s.settleCutoverSupersededByStop(ctx, apply); err != nil {
+		return err
+	}
 	if err := controlStore.CompletePending(ctx, apply.ID, storage.ControlOperationStop); err != nil {
 		return fmt.Errorf("complete pending remote stop control request for apply %s before start: %w", apply.ApplyIdentifier, err)
 	}
