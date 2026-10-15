@@ -296,13 +296,12 @@ func (o *CommentObserver) OnProgress(apply *storage.Apply, tasks []*storage.Task
 	now := o.clock.Now()
 	currentState := apply.State
 
-	// Check if a cutover comment was posted by an external handler. A
-	// superseded row is an already-rotated-away prompt from an earlier drive,
-	// not a live cutover comment — treating it as live would re-mute the
-	// observer. This must happen before the deferred-cutover-gate branch below
-	// — it is the restart-time dedup: an apply can park at the gate for days,
-	// and without the durable-row check every fresh observer on a restart or
-	// re-claimed drive would post a duplicate prompt.
+	// Check for a live cutover prompt comment, which an apply parked at the
+	// gate behind a separate prompt still carries. A superseded row is an
+	// already-rotated-away prompt from an earlier drive, not a live cutover
+	// comment — treating it as live would re-mute the observer. The durable
+	// row is what keeps every fresh observer on a restart or re-claimed drive
+	// muted behind the prompt rather than editing the frozen progress comment.
 	if !o.hasCutoverComment {
 		checkCtx, checkCancel := context.WithTimeout(context.Background(), 2*time.Second)
 		cutover, err := o.stor.ApplyComments().Get(checkCtx, o.applyID, state.Comment.Cutover)
@@ -333,25 +332,19 @@ func (o *CommentObserver) OnProgress(apply *storage.Apply, tasks []*storage.Task
 	// the tracked one.
 	adopted := o.pendingRotation == nil || o.adoptPendingRotationComment(apply)
 
-	// Post the cutover prompt when the apply is at the deferred-cutover gate,
-	// but only if one hasn't been posted already. A failed post leaves
-	// hasCutoverComment unset so the next tick retries, instead of muting the
-	// observer for the rest of the drive over one transient GitHub error.
-	if atDeferredCutoverGate(currentState) && o.shouldDeferCutover(apply) && !o.hasCutoverComment {
-		body := o.formatStatusComment(apply, tasks)
-		if _, posted, _ := o.postAndTrackComment(apply, state.Comment.Cutover, body, nil); posted {
-			o.hasCutoverComment = true
-		}
-		o.lastRendered.state = currentState
-		return
-	}
-
-	// While the cutover prompt is live, stop editing — the prompt is the
-	// active comment and the progress comment stays frozen. Rotate a fresh
-	// progress comment in only when the apply has provably moved past the
-	// cutover gate into a post-cutover phase (revert window, reverting,
-	// skipping revert): the prompt's call to action is spent, and the operator
-	// looks at the bottom of the PR for the effect of the cutover command.
+	// A deferred apply parked at the cutover gate is not a command taking
+	// effect, so the progress comment moves to waiting for cutover in place,
+	// with the cutover command in its footer; the operator's cutover is what
+	// rotates a fresh comment in (rotateProgressCommentForControlPhase).
+	//
+	// A live cutover prompt row is an apply that parked behind a separate
+	// prompt comment, which nothing posts anymore. While it is live, stop
+	// editing — the prompt is the active comment and the progress comment
+	// stays frozen. Rotate a fresh progress comment in only when the apply has
+	// provably moved past the cutover gate into a post-cutover phase (revert
+	// window, reverting, skipping revert): the prompt's call to action is
+	// spent, and the operator looks at the bottom of the PR for the effect of
+	// the cutover command.
 	// Terminal states are left to OnTerminal, which completes the cutover
 	// comment itself. Every other state keeps the observer muted — a restart
 	// recovery re-copying a parked apply, a retryable failure at the gate, a
@@ -382,10 +375,10 @@ func (o *CommentObserver) OnProgress(apply *storage.Apply, tasks []*storage.Task
 			return
 		}
 
-		// A control operation taking effect (revert, skip-revert) likewise gets a
-		// fresh progress comment: the user just issued the command, so its effect
-		// belongs at the bottom of the PR timeline, with the old comment frozen at
-		// its pre-operation state as the record.
+		// A control operation taking effect (cutover, revert, skip-revert)
+		// likewise gets a fresh progress comment: the user just issued the
+		// command, so its effect belongs at the bottom of the PR timeline, with
+		// the old comment frozen at its pre-operation state as the record.
 		if o.rotateProgressCommentForControlPhase(apply, tasks) {
 			o.lastRendered.state = currentState
 			o.lastProgressPost = now
@@ -798,15 +791,6 @@ func (o *CommentObserver) summaryCommentFromOps(ctx context.Context, apply *stor
 
 func (o *CommentObserver) shouldDeferCutover(apply *storage.Apply) bool {
 	return o.deferCutover || apply.GetOptions().DeferCutover
-}
-
-// atDeferredCutoverGate reports whether the apply is at the deferred-cutover
-// gate, where the cutover prompt comment belongs. waiting_for_cutover is the
-// parked state the apply holds until the operator's cutover command;
-// cutting_over is the transient window while the cutover executes. A tick can
-// first observe the apply in either state, so the prompt posts from both.
-func atDeferredCutoverGate(applyState string) bool {
-	return state.IsState(applyState, state.Apply.WaitingForCutover, state.Apply.CuttingOver)
 }
 
 func (o *CommentObserver) leaseStillOwnsObserver(apply *storage.Apply, operation string) bool {
@@ -1230,14 +1214,19 @@ func controlPhase(applyState string) string {
 // phaseRotatesProgressComment reports whether an apply entering the phase can
 // be the effect of an operator control command that warrants rotating the
 // progress comment. Reverting always is — it has no non-operator entry path.
-// Skipping-revert only sometimes is, so it additionally requires the durable
-// operator-origin signal (see phaseIsOperatorIssued). The cutover-driven
-// phases are not listed here: entering the revert window after an
-// auto-cutover involves no operator command (the comment transitions in
-// place), and the operator-triggered deferred cutover rotates through
-// rotateProgressCommentAfterCutover, keyed on the cutover prompt comment.
+// Skipping-revert and the cutover phases only sometimes are, so they
+// additionally require the durable operator-origin signal (see
+// phaseIsOperatorIssued). The cutover phases are cutting over and the revert
+// window the cutover opens: cutting over can pass between two ticks, so the
+// first tick past the gate rotates from whichever it finds.
 func phaseRotatesProgressComment(phase string) bool {
-	return phase == phaseReverting || phase == phaseSkippingRevert
+	return phase == phaseReverting || phase == phaseSkippingRevert || cutoverEffectPhase(phase)
+}
+
+// cutoverEffectPhase reports whether the phase follows a cutover: the cutover
+// running, or the revert window it opened.
+func cutoverEffectPhase(phase string) bool {
+	return phase == phaseCuttingOver || phase == phaseRevertWindow
 }
 
 // phaseIsOperatorIssued reports whether the apply entered the phase as the
@@ -1249,16 +1238,43 @@ func phaseRotatesProgressComment(phase string) bool {
 // when the revert window expires on its own or when the apply was submitted
 // with skip-revert chosen upfront, and neither involves a command whose
 // effect an operator is waiting to see — the progress comment transitions in
-// place.
-func (o *CommentObserver) phaseIsOperatorIssued(ctx context.Context, phase string) (bool, error) {
-	if phase != phaseSkippingRevert {
-		return true, nil
+// place. A cutover phase is operator-issued only on an apply that deferred its
+// cutover and carries a durable cutover control request: any other apply cuts
+// over on its own, and its comment transitions in place.
+func (o *CommentObserver) phaseIsOperatorIssued(ctx context.Context, apply *storage.Apply, phase string) (bool, error) {
+	switch {
+	case phase == phaseSkippingRevert:
+		return o.controlRequestExists(ctx, storage.ControlOperationSkipRevert)
+	case cutoverEffectPhase(phase):
+		if !o.shouldDeferCutover(apply) {
+			return false, nil
+		}
+		return o.controlRequestExists(ctx, storage.ControlOperationCutover)
 	}
-	req, err := o.stor.ControlRequests().GetByOperation(ctx, o.applyID, storage.ControlOperationSkipRevert)
+	return true, nil
+}
+
+// controlRequestExists reports whether the apply carries a durable control
+// request for the operation, whatever its status.
+func (o *CommentObserver) controlRequestExists(ctx context.Context, operation storage.ControlOperation) (bool, error) {
+	req, err := o.stor.ControlRequests().GetByOperation(ctx, o.applyID, operation)
 	if err != nil {
-		return false, fmt.Errorf("load skip-revert control request: %w", err)
+		return false, fmt.Errorf("load %s control request: %w", operation, err)
 	}
 	return req != nil, nil
+}
+
+// trackedCommentCoversPhase reports whether the tracked progress comment was
+// posted at or after the phase's rotation, so no rotation is owed. A cutover
+// rotation is owed once, whichever cutover phase the tick finds the apply in:
+// a comment posted at or past the cutover already tracks its effect. Any other
+// phase rotates once, into a comment recording that phase.
+func trackedCommentCoversPhase(tracked *storage.ApplyComment, phase string) bool {
+	posted := trackedPhase(tracked)
+	if cutoverEffectPhase(phase) {
+		return posted == phaseCuttingOver || postCutoverPhase(posted)
+	}
+	return posted == phase
 }
 
 // postCutoverPhase reports whether a recorded phase means the comment was
@@ -1279,8 +1295,8 @@ func trackedPhase(tracked *storage.ApplyComment) string {
 }
 
 // rotateProgressCommentForControlPhase posts a fresh progress comment when a
-// control operation's phase (revert, skip-revert) has taken effect, so the
-// operation is tracked in a new comment at the bottom of the PR timeline
+// control operation's phase (cutover, revert, skip-revert) has taken effect, so
+// the operation is tracked in a new comment at the bottom of the PR timeline
 // instead of re-editing the comment last rendered for the prior phase. The
 // signal is durable and cross-pod safe: every tracked progress comment records
 // the phase the apply was in when it was posted, so an apply in a control
@@ -1305,7 +1321,7 @@ func (o *CommentObserver) rotateProgressCommentForControlPhase(apply *storage.Ap
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	operatorIssued, err := o.phaseIsOperatorIssued(ctx, phase)
+	operatorIssued, err := o.phaseIsOperatorIssued(ctx, apply, phase)
 	if err != nil {
 		o.logError(apply, "observer: failed to determine whether the control phase was operator-issued; rotation will be re-checked on the next tick",
 			"error", err, "phase", phase)
@@ -1342,10 +1358,10 @@ func (o *CommentObserver) rotateProgressCommentForControlPhase(apply *storage.Ap
 		o.freezeSupersededProgressComment(apply, *tracked.PendingFreezeCommentID, tracked.GitHubCommentID,
 			supersededByPriorRotation)
 	}
-	if trackedPhase(tracked) == phase {
+	if trackedCommentCoversPhase(tracked, phase) {
 		// The tracked comment was posted while the apply was already in this
-		// phase — it already tracks the operation, across restarts and drive
-		// re-claims.
+		// phase (for a cutover, in any phase at or past it) — it already
+		// tracks the operation, across restarts and drive re-claims.
 		o.markPhaseRotated(phase)
 		return false
 	}
@@ -1395,8 +1411,11 @@ func (o *CommentObserver) markPhaseRotated(phase string) {
 // supersededReasonForPhase selects the frozen rendering for the comment a
 // control-phase rotation supersedes.
 func supersededReasonForPhase(phase string) supersededProgressReason {
-	if phase == phaseSkippingRevert {
+	switch {
+	case phase == phaseSkippingRevert:
 		return supersededBySkipRevert
+	case cutoverEffectPhase(phase):
+		return supersededByCutoverCommand
 	}
 	return supersededByRevert
 }
@@ -1536,6 +1555,10 @@ const (
 	// cutover completed into a still-active apply, pointing at the fresh
 	// progress comment that tracks the post-cutover phase.
 	supersededByCutover
+	// supersededByCutoverCommand freezes the progress comment a deferred
+	// apply waited for cutover in, once the operator's cutover takes effect,
+	// pointing at the fresh progress comment that tracks the cutover.
+	supersededByCutoverCommand
 )
 
 // frozenSupersededProgressBody renders the folded body written over a
@@ -1557,6 +1580,8 @@ func (o *CommentObserver) frozenSupersededProgressBody(reason supersededProgress
 		return templates.RenderSkipRevertSupersededProgressComment(data)
 	case supersededByCutover:
 		return templates.RenderCutoverSupersededComment(data)
+	case supersededByCutoverCommand:
+		return templates.RenderCutoverCommandSupersededProgressComment(data)
 	}
 	return templates.RenderSupersededProgressComment(data)
 }

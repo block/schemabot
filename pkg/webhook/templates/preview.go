@@ -3301,6 +3301,26 @@ func PreviewCommentSkipRevertSupersededProgress() string {
 	})
 }
 
+// PreviewCommentCutoverCommandSupersededProgress renders the progress comment
+// that waited at the deferred-cutover gate after the operator's cutover took
+// effect: the waiting-for-cutover rendering collapses into a details block
+// under a pointer to the fresh comment now tracking the cutover.
+func PreviewCommentCutoverCommandSupersededProgress() string {
+	table := sampleSingleTable()
+	table.Status = state.Task.WaitingForCutover
+	table.RowsCopied = 7200000
+	table.RowsTotal = 7200000
+	table.PercentComplete = 100
+	data := sampleSingleApplyData(state.Apply.WaitingForCutover, table)
+	data.DeferCutover = true
+	return RenderCutoverCommandSupersededProgressComment(SupersededProgressData{
+		Repo:         "acme/testapp",
+		PR:           42,
+		NewCommentID: 2222222222,
+		PreviousBody: RenderApplyStatusComment(data),
+	})
+}
+
 // PreviewCommentCutoverSuperseded renders a spent cutover prompt after a
 // deferred cutover completed into a still-active apply: the prompt collapses
 // into a details block under a pointer to the fresh comment now tracking the
@@ -3312,6 +3332,7 @@ func PreviewCommentCutoverSuperseded() string {
 	table.RowsTotal = 7200000
 	table.PercentComplete = 100
 	data := sampleSingleApplyData(state.Apply.WaitingForCutover, table)
+	data.DeferCutover = true
 	return RenderCutoverSupersededComment(SupersededProgressData{
 		Repo:         "acme/testapp",
 		PR:           42,

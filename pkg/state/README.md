@@ -332,26 +332,28 @@ For Vitess tables, per-shard progress is rendered below the table progress bar. 
 
 ## Comment states
 
-PR comment tracking for applies. Each apply can have up to 3 comments, one per comment state:
+PR comment tracking for applies. Each apply tracks at most one comment per comment state:
 
 | State | Value | Description |
 |-------|-------|-------------|
-| Progress | `progress` | Main progress comment, created on `pending`, edited throughout execution |
-| Cutover | `cutover` | Cutover confirmation comment, created only with `--defer-cutover` when entering `cutting_over` |
+| Progress | `progress` | Progress comment, created on `pending` and edited throughout execution. Rotated to a fresh comment when an operator's control command takes effect on a still-active apply |
+| Cutover | `cutover` | Separate cutover prompt for an apply parked at the deferred-cutover gate. Current builds no longer post one; the row is honored for applies that parked behind a prompt posted by an earlier build |
 | Summary | `summary` | Final summary comment, created when the apply reaches a terminal state |
 
-Stored in the `apply_comments` table with `UNIQUE(apply_id, comment_state)`. Upsert semantics allow Start/resume to replace old comment IDs with fresh ones.
+Stored in the `apply_comments` table with `UNIQUE(apply_id, comment_state)`. Upsert semantics let a rotation or a resume replace the tracked comment ID with a fresh one.
 
 ### How it works
 
-At any point during an apply, exactly one comment is the **active comment** — the one that gets edited on each state change or progress tick. Initially the progress comment is active. If `--defer-cutover` is used, a second cutover comment is created when the apply enters `cutting_over`, and that comment becomes the active one (the progress comment is frozen). When the apply reaches a terminal state, the active comment is edited one last time with the final state, and a separate summary comment is posted.
+At any point during an apply, exactly one comment is the **active comment** — the one that gets edited on each state change or progress tick. The progress comment is active throughout, including through the deferred-cutover gate: when a `--defer-cutover` apply finishes its checksum, the progress comment moves to "Waiting for Cutover" in place and carries the cutover command in its footer.
 
-The `apply_comments` table maps `(apply_id, comment_state)` to a GitHub comment ID. This lets the webhook handler look up which comment to edit without carrying state between requests. The active comment is resolved by checking if a cutover comment exists — if so, it's active; otherwise, the progress comment is active:
+When an operator's command takes effect on a still-active apply — a deferred cutover reaching `cutting_over` (or `revert_window`, when `cutting_over` passed between ticks), a revert, or a skip-revert — the observer posts a fresh progress comment at the bottom of the PR and folds the superseded one into a collapsed details block pointing at its successor. The rotation is gated on the durable control request, so a cutover the apply runs on its own transitions in place. The phase that rotated is recorded on the tracked row (`posted_phase`), so each command rotates at most once across ticks and pods. When the apply reaches a terminal state, the active comment is edited one last time with the final state, and a summary comment is posted.
+
+The `apply_comments` table maps `(apply_id, comment_state)` to a GitHub comment ID. This lets the webhook handler look up which comment to edit without carrying state between requests. A live cutover prompt row, left by an earlier build, is active while it exists; otherwise the progress comment is active:
 
 ```go
 cutover, _ := store.Get(ctx, applyID, state.Comment.Cutover)
 if cutover != nil {
-    return cutover  // cutover is active
+    return cutover  // a prompt posted by an earlier build is active
 }
 return store.Get(ctx, applyID, state.Comment.Progress)  // progress is active
 ```
@@ -367,17 +369,18 @@ return store.Get(ctx, applyID, state.Comment.Progress)  // progress is active
                     ▼
            ┌──────────────────┐
            │     progress     │   Progress comment being edited
-           │     (active)     │   (edit on: running, waiting_for_cutover,
-           └───────┬──┬───────┘    cutting_over(auto), revert_window(auto))
+           │     (active)     │   (edit on: running, checksumming,
+           └───────┬──┬───────┘    waiting_for_cutover, automatic cutover)
                    │  │
-    on: terminal   │  │ on: cutting_over with defer_cutover
-                   │  │ action: CREATE cutover comment
-                   │  │ (progress frozen, cutover becomes active)
+    on: terminal   │  │ on: operator's cutover, revert, or skip-revert
+                   │  │     takes effect
+                   │  │ action: CREATE fresh progress comment,
+                   │  │         FOLD the superseded one
                    │  ▼
                    │  ┌──────────────────┐
-                   │  │     cutover      │  Cutover comment being edited
-                   │  │     (active)     │  (edit on: revert_window(defer))
-                   │  └────────┬─────────┘
+                   │  │ fresh progress   │  Fresh comment being edited
+                   │  │     (active)     │  (edit on: later phases of the
+                   │  └────────┬─────────┘   same command)
                    │           │ on: terminal
                    │           │
                    ▼           ▼
@@ -396,13 +399,11 @@ return store.Get(ctx, applyID, state.Comment.Progress)  // progress is active
 | Active Comment | Apply Event | Comment Actions |
 |----------------|-------------|-----------------|
 | (none) | pending | CREATE progress |
-| progress | running / waiting_for_cutover | EDIT progress |
-| progress | cutting_over (auto) | EDIT progress |
-| progress | cutting_over (defer_cutover) | CREATE cutover (becomes active) |
-| progress | revert_window (auto) | EDIT progress |
+| progress | running / checksumming / waiting_for_cutover | EDIT progress |
+| progress | cutting_over or revert_window (automatic cutover) | EDIT progress |
+| progress | cutting_over or revert_window (operator's deferred cutover) | CREATE fresh progress, FOLD the superseded one |
+| progress | later phase of the same cutover | EDIT progress |
 | progress | terminal | EDIT progress to final, CREATE summary |
-| cutover | revert_window (defer) | EDIT cutover |
-| cutover | terminal | EDIT cutover to final, CREATE summary |
 | (done) | Start (resume from stopped) | UPSERT progress and summary with new IDs |
 
 ### Example: apply with `--defer-cutover`
@@ -410,17 +411,17 @@ return store.Get(ctx, applyID, state.Comment.Progress)  // progress is active
 1. User runs `schemabot apply-confirm -e staging` → apply created in `pending`
    - **CREATE** progress comment: "Schema change pending..."
 2. Apply starts → `running`, progress ticks at 10%, 20%, ...
-   - **EDIT** progress comment: "Running... 20% complete"
-3. Row copy finishes → `waiting_for_cutover`
-   - **EDIT** progress comment: "Waiting for cutover"
+   - **EDIT** progress comment: "Copying rows... 20% complete"
+3. Row copy and checksum finish → `waiting_for_cutover`
+   - **EDIT** progress comment: "Waiting for Cutover", with the cutover command in the footer
 4. User runs `schemabot cutover -e staging` → `cutting_over`
-   - **CREATE** cutover comment: "Cutover in progress..." ← cutover is now active
-   - Progress comment is frozen (still shows "Waiting for cutover")
+   - **CREATE** fresh progress comment: "Cutting over..." ← the fresh comment is now active
+   - **EDIT** the earlier progress comment into a fold: "Cutover started — progress continues in a new progress comment", with its waiting-for-cutover rendering collapsed
 5. Cutover completes → `completed`
-   - **EDIT** cutover comment: "Cutover complete"
+   - **EDIT** fresh progress comment: "Applied"
    - **CREATE** summary comment: "Schema change completed successfully"
 
-Result: 3 comments on the PR (progress, cutover, summary). Without `--defer-cutover`, there would be 2 (progress, summary) — the progress comment covers the entire lifecycle including cutover.
+Result: the folded pre-cutover progress comment, the fresh progress comment, and the summary. Without `--defer-cutover` the single progress comment covers the entire lifecycle including cutover, followed by the summary.
 
 ## Engine trust model
 

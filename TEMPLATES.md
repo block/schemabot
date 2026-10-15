@@ -6139,6 +6139,46 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 </details>
 
 <details>
+<summary><a name="cutover-started-superseded-progress-comment"></a><strong>Cutover Started: Superseded Progress Comment</strong></summary>
+
+
+Cutover started — progress continues in [a new progress comment](https://github.com/acme/testapp/pull/42#issuecomment-2222222222).
+
+<details>
+<summary>Progress before the cutover</summary>
+
+## Schema Change Status — Staging
+
+**Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
+
+*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+**Status**: Waiting for Cutover
+
+**1/1** table(s) ready for cutover
+
+**`users`**: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 Waiting for cutover
+
+```sql
+ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
+```
+
+
+---
+
+To proceed with cutover:
+```
+schemabot cutover apply-a1b2c3d4e5f6 -e staging
+```
+
+_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+
+
+</details>
+
+</details>
+
+<details>
 <summary><a name="cutover-complete-superseded-cutover-prompt"></a><strong>Cutover Complete: Superseded Cutover Prompt</strong></summary>
 
 
@@ -6166,7 +6206,10 @@ ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
 
 ---
 
-SchemaBot triggers cutover automatically — no action needed.
+To proceed with cutover:
+```
+schemabot cutover apply-a1b2c3d4e5f6 -e staging
+```
 
 _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
 
