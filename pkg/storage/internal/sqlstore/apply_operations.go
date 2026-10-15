@@ -200,16 +200,25 @@ func (s *applyOperationStore) ListRecentTargets(ctx context.Context, databaseTyp
 	}
 	cutoff := s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime,
 		LiteralIntervalAmount(uint64(lookback.Microseconds())), IntervalMicrosecond)
-	// The cutoff is a trusted internal fragment; it is concatenated rather
-	// than formatted so a stray % can never corrupt the SQL.
+	// Targets are resolver keys that differ byte for byte, so the tuple is
+	// made distinct under the binary collation: under a column collation that
+	// folds case, two targets differing only by case would collapse into one
+	// and a target the data plane applied to would go unreported. The cutoff
+	// and the collated expressions are trusted internal fragments; they are
+	// concatenated rather than formatted so a stray % can never corrupt the
+	// SQL.
+	bin := s.dialect.BinaryCollation
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT DISTINCT a.database_name, a.environment, ao.target
+		SELECT DISTINCT
+			`+bin("a.database_name")+` AS database_name,
+			`+bin("a.environment")+` AS environment,
+			`+bin("ao.target")+` AS target
 		FROM apply_operations ao
 		JOIN applies a ON a.id = ao.apply_id
 		WHERE a.database_type = ?
 			AND ao.target <> ''
 			AND a.created_at >= `+cutoff+`
-		ORDER BY a.database_name, a.environment, ao.target`, databaseType)
+		ORDER BY database_name, environment, target`, databaseType)
 	if err != nil {
 		return nil, fmt.Errorf("query recent %s apply targets within %s: %w", databaseType, lookback, err)
 	}

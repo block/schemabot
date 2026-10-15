@@ -2094,6 +2094,32 @@ func TestApplyOperations(t *testing.T, h Harness) {
 		require.ErrorContains(t, err, "lookback must be positive")
 	})
 
+	// ListRecentTargets_TargetsDifferingOnlyByCaseAreDistinct verifies that
+	// two targets of one database and environment whose names differ only by
+	// case are both listed: a target name is a resolver key compared byte for
+	// byte, so a storage collation that folds case must not merge them. The
+	// order the two sort in depends on the storage collation, so only
+	// membership is asserted.
+	t.Run("ListRecentTargets_TargetsDifferingOnlyByCaseAreDistinct", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		orders := CreateLock(t, store, "orders", storage.DatabaseTypeVitess)
+		apply := CreateApplyWithStateAndEnv(t, store, orders, "apply_orders_case", 985, state.Apply.Completed, "staging")
+		for deployment, target := range map[string]string{"region-a": "orders-A", "region-b": "orders-a"} {
+			_, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+				ApplyID: apply.ID, Deployment: deployment, Target: target,
+			})
+			require.NoError(t, err)
+		}
+
+		targets, err := store.ApplyOperations().ListRecentTargets(ctx, storage.DatabaseTypeVitess, 24*time.Hour)
+		require.NoError(t, err)
+		assert.ElementsMatch(t, []storage.AppliedTarget{
+			{Database: "orders", Environment: "staging", Target: "orders-A"},
+			{Database: "orders", Environment: "staging", Target: "orders-a"},
+		}, targets)
+	})
+
 	t.Run("ListRecentTargets_DBError", func(t *testing.T) {
 		store := h.NewUnreachableStorage(t)
 		_, err := store.ApplyOperations().ListRecentTargets(t.Context(), storage.DatabaseTypeVitess, time.Hour)

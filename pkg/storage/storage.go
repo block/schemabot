@@ -1428,9 +1428,11 @@ type ApplyOperationStore interface {
 	// ListRecentTargets returns each distinct (database, environment, target)
 	// that an apply of databaseType ran an operation against, among applies
 	// created within lookback of the storage database's clock, ordered by
-	// database, environment, then target. Operations without a target are
-	// skipped. It tells a data plane, which resolves targets on demand rather
-	// than listing them in config, which targets it has applied to.
+	// database, environment, then target. Tuples are distinct byte for byte,
+	// so targets that differ only by case are listed separately, as the
+	// resolver keys they are. Operations without a target are skipped. It
+	// tells a data plane, which resolves targets on demand rather than
+	// listing them in config, which targets it has applied to.
 	ListRecentTargets(ctx context.Context, databaseType string, lookback time.Duration) ([]AppliedTarget, error)
 
 	// UpdateState transitions a child row to a new state. Updates the state
