@@ -176,13 +176,18 @@ type ApplyStatusCommentData struct {
 
 	// DeferCutover reports whether cutover waits on an explicit operator
 	// trigger (the apply's durable defer-cutover option). Before cutover it
-	// adds the deferred-cutover line under the status, so a reader of a long
+	// is listed on the options line above the status, so a reader of a long
 	// copy or checksum knows the apply will pause and wait for them. It also
 	// selects the waiting-for-cutover footer: deferred applies get the
 	// pasteable `schemabot cutover` command, while non-deferred applies get a
 	// note that the drive triggers cutover automatically — surfacing the
 	// command there would tell the operator to act when no action is needed.
 	DeferCutover bool
+
+	// SkipRevert reports whether the apply was started with --skip-revert (the
+	// apply's durable skip-revert option). Before cutover it is listed on the
+	// options line beside DeferCutover, as the plan listed it.
+	SkipRevert bool
 
 	// PlanID names the plan this member is running, alongside the database and
 	// the apply identifier. It is set only when the members of one apply do not
@@ -240,7 +245,7 @@ func renderApplyStatusCommentBody(data ApplyStatusCommentData, includeLastUpdate
 	// The apply's options sit above the status: they hold for the whole apply
 	// while the status changes on every update.
 	if !data.InRolloutSection {
-		writeDeferredCutoverNote(&sb, data.DeferCutover, data.State)
+		writeApplyOptions(&sb, data.DeferCutover, data.SkipRevert, data.State)
 	}
 
 	// Status line. For the revert window it carries the countdown to permanence
@@ -446,21 +451,17 @@ func writeApplyStatusDetail(sb *strings.Builder, data ApplyStatusCommentData) {
 	}
 }
 
-// deferredCutoverNote tells the reader of a deferred apply that has not yet
-// reached cutover that the apply will wait for them at the cutover gate. It
-// reuses the plan and apply comments' option label, so the option reads the
-// same from the plan through the apply.
-const deferredCutoverNote = "**Options**: ⏸️ Defer Cutover"
-
-// writeDeferredCutoverNote writes the deferred-cutover line while a deferred
-// apply is still working toward its cutover pause. Once the apply waits for
-// cutover the footer gives the command itself, and after that the deferral has
-// nothing left to tell the reader.
-func writeDeferredCutoverNote(sb *strings.Builder, deferCutover bool, applyState string) {
-	if !deferCutover || !precedesCutover(applyState) {
+// writeApplyOptions writes the apply's options line while the apply is still
+// working toward its cutover, listing every option it was started with the way
+// the plan did. For a deferred apply it tells the reader of a long copy that
+// the apply will wait for them at the cutover gate. Once a deferred apply waits
+// for cutover the footer gives the command itself, and after cutover the
+// options have nothing left to tell the reader.
+func writeApplyOptions(sb *strings.Builder, deferCutover, skipRevert bool, applyState string) {
+	if !precedesCutover(applyState) {
 		return
 	}
-	fmt.Fprintf(sb, "\n%s\n", deferredCutoverNote)
+	writeOptionsLine(sb, deferCutover, skipRevert)
 }
 
 // precedesCutover reports whether an apply in this state has not yet reached
@@ -1931,6 +1932,7 @@ func ApplyStatusFromProgress(resp *apitypes.ProgressResponse, requestedBy string
 		StartedAt:    resp.StartedAt,
 		CompletedAt:  resp.CompletedAt,
 		DeferCutover: resp.Options["defer_cutover"] == "true",
+		SkipRevert:   resp.Options["skip_revert"] == "true",
 	}
 	data.RevertExpiresAt = resp.Metadata["revert_expires_at"]
 	if step, err := apitypes.ParseProgressStep(resp.Metadata); err != nil {

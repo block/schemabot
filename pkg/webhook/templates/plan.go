@@ -966,11 +966,19 @@ func shortSHA(sha string) string {
 
 // writeOptions writes the options line if any options are enabled.
 func writeOptions(sb *strings.Builder, data PlanCommentData) {
+	writeOptionsLine(sb, data.DeferCutover, data.SkipRevert)
+}
+
+// writeOptionsLine writes the options an operator chose for an apply, if any.
+// The plan, apply, and progress comments all write it through here, so an
+// option reads the same from the plan through the apply and none is dropped
+// along the way.
+func writeOptionsLine(sb *strings.Builder, deferCutover, skipRevert bool) {
 	var opts []string
-	if data.DeferCutover {
+	if deferCutover {
 		opts = append(opts, "⏸️ Defer Cutover")
 	}
-	if data.SkipRevert {
+	if skipRevert {
 		opts = append(opts, "⏩ Skip Revert")
 	}
 	if len(opts) > 0 {

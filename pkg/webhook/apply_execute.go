@@ -601,6 +601,7 @@ func (h *Handler) executeApply(
 		State:        apply.State,
 		Engine:       schemaResult.Type,
 		DeferCutover: apply.GetOptions().DeferCutover,
+		SkipRevert:   apply.GetOptions().SkipRevert,
 	})
 	h.postInitialProgressComment(ctx, repo, pr, installationID, apply, progressBody)
 
