@@ -20,8 +20,10 @@ const checkColumns = `id, repository, pull_request, head_sha,
 	blocking_reason, error_message, change_summary, created_at, updated_at`
 
 const (
-	checkStatusInProgress  = "in_progress"
-	checkConclusionSuccess = "success"
+	checkStatusInProgress         = "in_progress"
+	checkStatusCompleted          = "completed"
+	checkConclusionSuccess        = "success"
+	checkConclusionActionRequired = "action_required"
 )
 
 // checkStore implements storage.CheckStore using MySQL.
@@ -404,6 +406,84 @@ func (s *checkStore) MarkStalePlanSuccessful(ctx context.Context, check *storage
 	return isPlanOnlySuccessful(current), nil
 }
 
+// BlockStaleStartedApply records that the schema change a started apply owns
+// left the PR. The row's status is read and written in one transaction with the
+// row held under FOR UPDATE, so the decision between keeping it in_progress and
+// settling it as action_required is made against the row as it is now, not as
+// stale cleanup read it earlier: an apply completing in between leaves a
+// completed row, which this write turns into action_required rather than back
+// into in_progress. apply_id is left as stored, so the owner stays the owner.
+func (s *checkStore) BlockStaleStartedApply(ctx context.Context, check *storage.Check) (bool, error) {
+	canonicalizeCheck(check)
+	target := fmt.Sprintf("%s#%d %s/%s/%s",
+		check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName)
+
+	blocked := false
+	err := withLockRetry(ctx, s.classifier, "block stale started apply check for "+target, func() error {
+		blocked = false
+		tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+		if err != nil {
+			return fmt.Errorf("begin stale started apply check block for %s: %w", target, err)
+		}
+		defer rollbackTx(ctx, tx, "block stale started apply check")
+
+		var status string
+		var applyID sql.NullInt64
+		err = tx.QueryRowContext(ctx, `
+			SELECT status, apply_id
+			FROM checks
+			WHERE repository = ? AND pull_request = ?
+			  AND environment = ? AND database_type = ? AND database_name = ?
+			FOR UPDATE
+		`, check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName).Scan(&status, &applyID)
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("check state for %s was deleted before stale cleanup could block it: %w", target, storage.ErrCheckNotFound)
+		}
+		if err != nil {
+			return fmt.Errorf("read check ownership for stale started apply block on %s: %w", target, err)
+		}
+		if status != checkStatusInProgress && !applyID.Valid {
+			// The owner released the row after stale cleanup read it. Its
+			// terminal write is the authoritative outcome and stays in place.
+			if err := tx.Commit(); err != nil {
+				return fmt.Errorf("commit released stale started apply check read for %s: %w", target, err)
+			}
+			return nil
+		}
+
+		conclusion := checkConclusionActionRequired
+		if status == checkStatusInProgress {
+			conclusion = ""
+		} else {
+			status = checkStatusCompleted
+		}
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE checks
+			SET head_sha = ?,
+			    has_changes = ?,
+			    status = ?,
+			    conclusion = ?,
+			    blocking_reason = ?,
+			    error_message = ?,
+			    updated_at = `+s.dialect.CurrentTimestamp(TimestampPrecisionDefault)+`
+			WHERE repository = ? AND pull_request = ?
+			  AND environment = ? AND database_type = ? AND database_name = ?
+		`, check.HeadSHA, true, status, conclusion, check.BlockingReason, check.ErrorMessage,
+			check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName); err != nil {
+			return fmt.Errorf("write stale started apply check block for %s: %w", target, err)
+		}
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("commit stale started apply check block for %s: %w", target, err)
+		}
+		check.HasChanges = true
+		check.Status = status
+		check.Conclusion = conclusion
+		blocked = true
+		return nil
+	})
+	return blocked, err
+}
+
 // ClearAggregateBlock clears the blocking reason on stored aggregate check
 // state. The WHERE clause pins the head SHA and blocking reason the caller
 // read, making the clear an optimistic-concurrency write: a block recorded
@@ -458,16 +538,38 @@ func checkApplyLeasePredicate(d Dialect) string {
 
 // CompleteForApply updates stored check state to a terminal state only if it
 // still belongs to the apply being completed.
+//
+// The completion is computed from a row the caller read earlier, so it can
+// miss a schema-removed block stale cleanup recorded since. A row whose stored
+// blocking reason is that block keeps its head SHA, reason, and message and
+// stays blocking: a successful completion lands as action_required, and any
+// other terminal conclusion lands as the caller wrote it. Every CASE reads the
+// stored blocking_reason, which is assigned last so MySQL's left-to-right SET
+// evaluation and PostgreSQL's old-row evaluation agree.
 func (s *checkStore) CompleteForApply(ctx context.Context, check *storage.Check, apply *storage.Apply) (bool, error) {
 	canonicalizeCheck(check)
 	var checkRunID any
 	if check.CheckRunID != 0 {
 		checkRunID = check.CheckRunID
 	}
+	removed := storage.SchemaRemovedAfterApplyStartedBlockingReason
+	removedConclusion := check.Conclusion
+	if removedConclusion == checkConclusionSuccess {
+		removedConclusion = checkConclusionActionRequired
+	}
 	leasePredicate := ""
-	args := []any{check.HeadSHA, checkRunID, apply.ID, check.HasChanges, check.Status, check.Conclusion, check.BlockingReason, check.ErrorMessage, check.ChangeSummary,
+	args := []any{
+		removed, check.HeadSHA,
+		checkRunID, apply.ID,
+		removed, check.HasChanges,
+		check.Status,
+		removed, removedConclusion, check.Conclusion,
+		removed, check.ErrorMessage,
+		check.ChangeSummary,
+		removed, check.BlockingReason,
 		check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName,
-		checkStatusInProgress, apply.ID, apply.ID}
+		checkStatusInProgress, apply.ID, apply.ID,
+	}
 	lease := apply.Lease()
 	if lease.Valid() {
 		leasePredicate = checkApplyLeasePredicate(s.dialect)
@@ -476,15 +578,15 @@ func (s *checkStore) CompleteForApply(ctx context.Context, check *storage.Check,
 
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE checks
-		SET head_sha = ?,
+		SET head_sha        = CASE WHEN COALESCE(blocking_reason, '') = ? THEN head_sha ELSE ? END,
 		    check_run_id = ?,
 		    apply_id = ?,
-		    has_changes = ?,
+		    has_changes     = CASE WHEN COALESCE(blocking_reason, '') = ? THEN TRUE ELSE ? END,
 		    status = ?,
-		    conclusion = ?,
-		    blocking_reason = ?,
-		    error_message = ?,
+		    conclusion      = CASE WHEN COALESCE(blocking_reason, '') = ? THEN ? ELSE ? END,
+		    error_message   = CASE WHEN COALESCE(blocking_reason, '') = ? THEN error_message ELSE ? END,
 		    change_summary = COALESCE(NULLIF(?, ''), change_summary),
+		    blocking_reason = CASE WHEN COALESCE(blocking_reason, '') = ? THEN blocking_reason ELSE ? END,
 		    updated_at = `+s.dialect.CurrentTimestamp(TimestampPrecisionDefault)+`
 		WHERE repository = ? AND pull_request = ?
 		  AND environment = ? AND database_type = ? AND database_name = ?

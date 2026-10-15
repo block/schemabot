@@ -1297,18 +1297,17 @@ func (h *Handler) settleStaleCheckState(ctx context.Context, repo string, pr int
 	return h.markStalePlanOnlyCheckStateSuccessful(ctx, repo, pr, headSHA, check)
 }
 
+// blockStaleStartedApplyCheckState blocks a row a started apply owns on headSHA.
+// Whether the row stays in_progress or settles as action_required is decided by
+// the store from the row as it is at write time, so an apply that completes
+// after this cleanup read the row is never shown as running again.
 func (h *Handler) blockStaleStartedApplyCheckState(ctx context.Context, repo string, pr int, headSHA string, check *storage.Check) bool {
+	readStatus := check.Status
 	check.HeadSHA = headSHA
-	check.HasChanges = true
 	check.BlockingReason = schemaRemovedAfterApplyBlock.blockingReason
 	check.ErrorMessage = schemaRemovedAfterApplyBlock.message
-	if check.Status == checkStatusInProgress {
-		check.Conclusion = ""
-	} else {
-		check.Status = checkStatusCompleted
-		check.Conclusion = checkConclusionActionRequired
-	}
-	if err := h.service.Storage().Checks().Upsert(ctx, check); err != nil {
+	blocked, err := h.service.Storage().Checks().BlockStaleStartedApply(ctx, check)
+	if err != nil {
 		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
 			Operation:    "stale_check_cleanup",
 			Repository:   repo,
@@ -1324,6 +1323,24 @@ func (h *Handler) blockStaleStartedApplyCheckState(ctx context.Context, repo str
 			"apply_id", check.ApplyID, "error", err)
 		return false
 	}
+	if !blocked {
+		// The apply released the row between the cleanup read and this write,
+		// so its own terminal outcome is the stored state and stays in place.
+		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+			Operation:    "stale_check_cleanup",
+			Repository:   repo,
+			Database:     check.DatabaseName,
+			DatabaseType: check.DatabaseType,
+			Environment:  check.Environment,
+			Status:       "noop",
+		})
+		h.logger.Info("stale check left to the terminal outcome its apply recorded after cleanup read it",
+			"repo", repo, "pr", pr, "head_sha", headSHA,
+			"database", check.DatabaseName, "database_type", check.DatabaseType,
+			"environment", check.Environment, "check_id", check.ID,
+			"apply_id", check.ApplyID, "read_status", readStatus)
+		return false
+	}
 	metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
 		Operation:    "stale_check_cleanup",
 		Repository:   repo,
@@ -1332,6 +1349,14 @@ func (h *Handler) blockStaleStartedApplyCheckState(ctx context.Context, repo str
 		Environment:  check.Environment,
 		Status:       "blocked",
 	})
+	if check.Status != readStatus {
+		h.logger.Info("stale check blocked against the status its apply recorded after cleanup read it",
+			"repo", repo, "pr", pr, "head_sha", headSHA,
+			"database", check.DatabaseName, "database_type", check.DatabaseType,
+			"environment", check.Environment, "check_id", check.ID,
+			"apply_id", check.ApplyID, "read_status", readStatus,
+			"stored_status", check.Status, "stored_conclusion", check.Conclusion)
+	}
 	return true
 }
 

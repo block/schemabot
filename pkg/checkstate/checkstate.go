@@ -69,7 +69,7 @@ func IsAggregate(check *storage.Check) bool {
 // block has to survive later writes that did not re-evaluate the condition, so
 // a non-empty value is always a deliberate decision to keep the gate closed.
 const (
-	BlockSchemaRemovedAfterApplyStarted   = "schema_removed_after_apply_started"
+	BlockSchemaRemovedAfterApplyStarted   = storage.SchemaRemovedAfterApplyStartedBlockingReason
 	BlockRollbackCompleted                = "rollback_completed"
 	BlockApplyCancelled                   = "apply_cancelled"
 	BlockApplyCancelledAfterTaskCompleted = "apply_cancelled_after_task_completed"

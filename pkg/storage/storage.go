@@ -250,6 +250,17 @@ type CheckStore interface {
 	// Returns true when the row was marked successful.
 	MarkStalePlanSuccessful(ctx context.Context, check *Check) (bool, error)
 
+	// BlockStaleStartedApply records that the schema change a started apply
+	// owns is gone from the PR: it moves the row onto check.HeadSHA with
+	// check's blocking reason and message, keeping an in-progress row
+	// in_progress and turning a settled one into action_required. The
+	// status is decided from the row as stored at write time, under the same
+	// row lock as the write, so a completion that lands after the caller read
+	// the row is never rewound to in_progress. It writes nothing and returns
+	// false when no started apply owns the row any more. On a landed write,
+	// check.Status and check.Conclusion hold the values stored.
+	BlockStaleStartedApply(ctx context.Context, check *Check) (bool, error)
+
 	// ClearAggregateBlock clears the blocking reason on stored aggregate check
 	// state after the PR-level guards re-verified that the blocking condition
 	// no longer applies. The update is conditional on the head SHA and blocking
@@ -261,7 +272,9 @@ type CheckStore interface {
 	// CompleteForApply updates stored check state to a terminal state only if
 	// it still belongs to the given apply and no newer apply exists for the
 	// same PR/environment/database. Returns false when another driver changed
-	// the stored state first.
+	// the stored state first. A row stale cleanup already blocked with
+	// SchemaRemovedAfterApplyStartedBlockingReason keeps its head SHA, reason,
+	// and message, and a successful completion of it lands as action_required.
 	CompleteForApply(ctx context.Context, check *Check, apply *Apply) (bool, error)
 
 	// MarkActionRequiredForApply marks stored check state action_required for a

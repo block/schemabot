@@ -764,6 +764,137 @@ func TestChecks(t *testing.T, h Harness) {
 		assert.Equal(t, apply.ID, stored.ApplyID)
 	})
 
+	// Stale cleanup reads an in-progress apply-owned row, the apply completes,
+	// and only then does cleanup record that the schema change left the PR. The
+	// block must settle the completed row as action_required on the new commit,
+	// never rewind it to in_progress as if the apply were still running.
+	t.Run("BlockStaleStartedApplyAfterApplyCompleted", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "removed_after_complete_db", storage.DatabaseTypeMySQL)
+		apply := CreateApplyWithStateAndEnv(t, store, lock, "removed-after-complete", 713, state.Apply.Running, "staging")
+		require.NoError(t, store.Checks().Upsert(ctx, &storage.Check{
+			Repository: lock.Repository, PullRequest: lock.PullRequest, HeadSHA: "sha-a",
+			Environment: "staging", DatabaseType: lock.DatabaseType, DatabaseName: lock.DatabaseName,
+			ApplyID: apply.ID, HasChanges: true, Status: "in_progress",
+		}))
+
+		cleanupRead := getCheck(t, store, lock.DatabaseName)
+		require.Equal(t, "in_progress", cleanupRead.Status)
+
+		completion := *getCheck(t, store, lock.DatabaseName)
+		completion.Status = "completed"
+		completion.Conclusion = "success"
+		completion.HasChanges = false
+		updated, err := store.Checks().CompleteForApply(ctx, &completion, apply)
+		require.NoError(t, err)
+		require.True(t, updated)
+
+		cleanupRead.HeadSHA = "sha-b"
+		cleanupRead.BlockingReason = storage.SchemaRemovedAfterApplyStartedBlockingReason
+		cleanupRead.ErrorMessage = "schema change removed after apply started"
+		blocked, err := store.Checks().BlockStaleStartedApply(ctx, cleanupRead)
+		require.NoError(t, err)
+		require.True(t, blocked)
+		assert.Equal(t, "completed", cleanupRead.Status)
+		assert.Equal(t, "action_required", cleanupRead.Conclusion)
+
+		stored := getCheck(t, store, lock.DatabaseName)
+		assert.Equal(t, "completed", stored.Status, "a completed apply must not be shown as running again")
+		assert.Equal(t, "action_required", stored.Conclusion)
+		assert.Equal(t, "sha-b", stored.HeadSHA)
+		assert.Equal(t, storage.SchemaRemovedAfterApplyStartedBlockingReason, stored.BlockingReason)
+		assert.Equal(t, "schema change removed after apply started", stored.ErrorMessage)
+		assert.True(t, stored.HasChanges)
+		assert.Equal(t, apply.ID, stored.ApplyID)
+	})
+
+	// The driver reads the row, stale cleanup blocks it on a newer commit, and
+	// the driver then completes from its earlier read. The completion must not
+	// write the block away: the row lands action_required on the newer commit
+	// with the schema-removed reason the operator reconciles from.
+	t.Run("CompleteForApplyKeepsStaleCleanupBlock", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "removed_before_complete_db", storage.DatabaseTypeMySQL)
+		apply := CreateApplyWithStateAndEnv(t, store, lock, "removed-before-complete", 714, state.Apply.Running, "staging")
+		require.NoError(t, store.Checks().Upsert(ctx, &storage.Check{
+			Repository: lock.Repository, PullRequest: lock.PullRequest, HeadSHA: "sha-a",
+			Environment: "staging", DatabaseType: lock.DatabaseType, DatabaseName: lock.DatabaseName,
+			ApplyID: apply.ID, HasChanges: true, Status: "in_progress",
+		}))
+
+		driverRead := getCheck(t, store, lock.DatabaseName)
+
+		cleanup := *getCheck(t, store, lock.DatabaseName)
+		cleanup.HeadSHA = "sha-b"
+		cleanup.BlockingReason = storage.SchemaRemovedAfterApplyStartedBlockingReason
+		cleanup.ErrorMessage = "schema change removed after apply started"
+		blocked, err := store.Checks().BlockStaleStartedApply(ctx, &cleanup)
+		require.NoError(t, err)
+		require.True(t, blocked)
+		assert.Equal(t, "in_progress", cleanup.Status, "a running apply stays in_progress while it owns the row")
+
+		driverRead.Status = "completed"
+		driverRead.Conclusion = "success"
+		driverRead.HasChanges = false
+		driverRead.BlockingReason = ""
+		driverRead.ErrorMessage = ""
+		updated, err := store.Checks().CompleteForApply(ctx, driverRead, apply)
+		require.NoError(t, err)
+		require.True(t, updated)
+
+		stored := getCheck(t, store, lock.DatabaseName)
+		assert.Equal(t, "completed", stored.Status)
+		assert.Equal(t, "action_required", stored.Conclusion, "a completion must not turn a schema-removed block green")
+		assert.Equal(t, "sha-b", stored.HeadSHA)
+		assert.Equal(t, storage.SchemaRemovedAfterApplyStartedBlockingReason, stored.BlockingReason)
+		assert.Equal(t, "schema change removed after apply started", stored.ErrorMessage)
+		assert.True(t, stored.HasChanges)
+		assert.Equal(t, apply.ID, stored.ApplyID)
+	})
+
+	// An apply that released the row after stale cleanup read it — here a
+	// completed rollback — owns the outcome: the cleanup block writes nothing.
+	t.Run("BlockStaleStartedApplyLeavesReleasedRow", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "removed_after_release_db", storage.DatabaseTypeMySQL)
+		rollback := CreateApplyWithStateAndEnv(t, store, lock, "removed-after-release", 715, state.Apply.Completed, "staging")
+		require.NoError(t, store.Checks().Upsert(ctx, &storage.Check{
+			Repository: lock.Repository, PullRequest: lock.PullRequest, HeadSHA: "sha-a",
+			Environment: "staging", DatabaseType: lock.DatabaseType, DatabaseName: lock.DatabaseName,
+			ApplyID: rollback.ID, HasChanges: true, Status: "in_progress",
+		}))
+		cleanupRead := getCheck(t, store, lock.DatabaseName)
+
+		release := *getCheck(t, store, lock.DatabaseName)
+		release.Status = "completed"
+		release.Conclusion = "action_required"
+		release.BlockingReason = "rollback_completed"
+		updated, err := store.Checks().MarkActionRequiredForApply(ctx, &release, rollback)
+		require.NoError(t, err)
+		require.True(t, updated)
+
+		cleanupRead.HeadSHA = "sha-b"
+		cleanupRead.BlockingReason = storage.SchemaRemovedAfterApplyStartedBlockingReason
+		blocked, err := store.Checks().BlockStaleStartedApply(ctx, cleanupRead)
+		require.NoError(t, err)
+		assert.False(t, blocked)
+
+		stored := getCheck(t, store, lock.DatabaseName)
+		assert.Equal(t, "sha-a", stored.HeadSHA)
+		assert.Equal(t, "action_required", stored.Conclusion)
+		assert.Equal(t, "rollback_completed", stored.BlockingReason)
+		assert.Zero(t, stored.ApplyID)
+
+		_, err = store.Checks().BlockStaleStartedApply(ctx, &storage.Check{
+			Repository: lock.Repository, PullRequest: lock.PullRequest, HeadSHA: "sha-b",
+			Environment: "staging", DatabaseType: lock.DatabaseType, DatabaseName: "missing_db",
+		})
+		require.ErrorIs(t, err, storage.ErrCheckNotFound)
+	})
+
 	t.Run("ClearAggregateBlock", func(t *testing.T) {
 		ctx := t.Context()
 		store := h.NewStorage(t)
@@ -897,6 +1028,10 @@ func TestChecks(t *testing.T, h Harness) {
 		_, err := h.NewUnreachableStorage(t).Checks().MarkStalePlanSuccessful(t.Context(), check)
 		require.Error(t, err)
 	})
+	t.Run("BlockStaleStartedApply_DBError", func(t *testing.T) {
+		_, err := h.NewUnreachableStorage(t).Checks().BlockStaleStartedApply(t.Context(), check)
+		require.Error(t, err)
+	})
 	t.Run("ClearAggregateBlock_DBError", func(t *testing.T) {
 		_, err := h.NewUnreachableStorage(t).Checks().ClearAggregateBlock(t.Context(), check)
 		require.Error(t, err)
@@ -929,6 +1064,16 @@ func TestChecks(t *testing.T, h Harness) {
 	t.Run("DeleteByPRRetainingBlockingApplyOwned_DBError", func(t *testing.T) {
 		require.Error(t, h.NewUnreachableStorage(t).Checks().DeleteByPRRetainingBlockingApplyOwned(t.Context(), "org/repo", 123, false))
 	})
+}
+
+// getCheck reads the staging per-database row for databaseName on org/repo#123
+// and requires that it exists.
+func getCheck(t *testing.T, store storage.Storage, databaseName string) *storage.Check {
+	t.Helper()
+	check, err := store.Checks().Get(t.Context(), "org/repo", 123, "staging", storage.DatabaseTypeMySQL, databaseName)
+	require.NoError(t, err)
+	require.NotNil(t, check, "stored check state for %s", databaseName)
+	return check
 }
 
 // requirePlanResultStored writes a plan result and asserts it landed, for the
