@@ -1991,6 +1991,7 @@ func TestResumeClaimedApply_DrivePanicFailsApply(t *testing.T) {
 	var drivePanic *panicsafe.Error
 	require.ErrorAs(t, err, &drivePanic, "a contained drive panic must surface as a panicsafe error")
 	assert.Equal(t, "corrupt engine metadata", drivePanic.Value)
+	assert.NotErrorIs(t, err, tern.ErrTaskVerdictRefused, "every task verdict landed, so containment is complete")
 	assert.False(t, resumed)
 
 	require.True(t, applyStore.updateCalled, "the apply row must be written to its failed state")
@@ -2064,6 +2065,137 @@ func TestResumeClaimedApply_DrivePanicUnderOperationLeaseLeavesParentToProjectio
 	require.Len(t, taskStore.updated, 1, "the operation's task must be failed so the operation row can settle")
 	assert.True(t, state.IsState(taskStore.updated[0].State, state.Task.Failed))
 	assert.Contains(t, taskStore.updated[0].ErrorMessage, "corrupt operation metadata")
+}
+
+// refusingTaskStore is a recordingTaskStore whose Update refuses the tasks
+// named in refuse with the mapped error, so a test can make storage turn down
+// one task's verdict while the others land.
+type refusingTaskStore struct {
+	recordingTaskStore
+	refuse map[int64]error
+}
+
+func (s *refusingTaskStore) Update(ctx context.Context, task *storage.Task) error {
+	if err, ok := s.refuse[task.ID]; ok {
+		return err
+	}
+	return s.recordingTaskStore.Update(ctx, task)
+}
+
+// An apply's drive panics while it holds tasks for `orders` and `users`, and
+// storage takes the failed verdict for `orders` but refuses the one for
+// `users`, whether the drive's lease was lost or storage failed outright.
+// Failing the apply now would settle it over a `users` row that still reads
+// running, and a settled apply gets no claim to finish that row. The apply row
+// is therefore not written: it stays running under the lease this drive stops
+// heartbeating, and the error carries ErrTaskVerdictRefused so the claim paths
+// leave the operation row as found too. The `orders` verdict stays stored.
+func TestResumeClaimedApply_DrivePanicWithRefusedTaskVerdictLeavesApplyActive(t *testing.T) {
+	for name, refusal := range map[string]error{
+		"lease lost":    fmt.Errorf("update task: %w", storage.ErrApplyLeaseLost),
+		"storage error": errors.New("update task: connection reset by peer"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			client := &panickingResumeClient{panicValue: "corrupt engine metadata"}
+			apply := &storage.Apply{
+				ID:              42,
+				ApplyIdentifier: "apply-42",
+				Database:        "appdb",
+				Deployment:      "east",
+				Environment:     "staging",
+				State:           state.Apply.Running,
+				LeaseOwner:      "driver-0",
+				LeaseToken:      "lease-token",
+			}
+			applyStore := &panicContainmentApplyStore{apply: apply}
+			taskStore := &refusingTaskStore{
+				recordingTaskStore: recordingTaskStore{tasks: []*storage.Task{
+					{ID: 9, TaskIdentifier: "task-orders", ApplyID: 42, TableName: "orders", State: state.Task.Running},
+					{ID: 10, TaskIdentifier: "task-users", ApplyID: 42, TableName: "users", State: state.Task.Running},
+				}},
+				refuse: map[int64]error{10: refusal},
+			}
+			logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+			svc := New(&mockStorageWithApplyStores{
+				plans:   &staticPlanStore{},
+				applies: applyStore,
+				tasks:   taskStore,
+			}, &ServerConfig{}, map[string]tern.Client{
+				"east/staging": client,
+			}, logger)
+
+			ctx := storage.WithApplyLease(t.Context(), apply.Lease())
+			claimed := *apply
+			var resumed bool
+			var err error
+			require.NotPanics(t, func() {
+				resumed, err = svc.resumeClaimedApply(ctx, 0, &claimed, 0, "")
+			})
+
+			assert.False(t, resumed)
+			var drivePanic *panicsafe.Error
+			require.ErrorAs(t, err, &drivePanic, "the contained panic stays visible to the caller")
+			require.ErrorIs(t, err, tern.ErrTaskVerdictRefused, "the claim paths read this to leave the operation row as found")
+			require.ErrorIs(t, err, refusal)
+			assert.Contains(t, err.Error(), "task-users")
+
+			assert.False(t, applyStore.updateCalled, "the apply must not be failed over a task whose verdict did not land")
+			assert.Equal(t, state.Apply.Running, applyStore.apply.State)
+			assert.Nil(t, applyStore.apply.CompletedAt)
+
+			require.Len(t, taskStore.updated, 1, "only the orders verdict lands")
+			assert.Equal(t, "task-orders", taskStore.updated[0].TaskIdentifier)
+			assert.Equal(t, state.Task.Failed, taskStore.updated[0].State)
+			assert.Contains(t, taskStore.updated[0].ErrorMessage, "corrupt engine metadata")
+		})
+	}
+}
+
+// A drive panic whose tasks cannot be loaded leaves the apply running for the
+// same reason a refused verdict does: none of its task rows recorded a
+// verdict, so failing the apply would settle it over rows that still read
+// active.
+func TestResumeClaimedApply_DrivePanicWithUnloadableTasksLeavesApplyActive(t *testing.T) {
+	client := &panickingResumeClient{panicValue: "corrupt engine metadata"}
+	apply := &storage.Apply{
+		ID:              42,
+		ApplyIdentifier: "apply-42",
+		Database:        "appdb",
+		Deployment:      "east",
+		Environment:     "staging",
+		State:           state.Apply.Running,
+		LeaseOwner:      "driver-0",
+		LeaseToken:      "lease-token",
+	}
+	applyStore := &panicContainmentApplyStore{apply: apply}
+	loadErr := errors.New("load tasks: connection reset by peer")
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	svc := New(&mockStorageWithApplyStores{
+		plans:   &staticPlanStore{},
+		applies: applyStore,
+		tasks:   &failingTaskLoadStore{err: loadErr},
+	}, &ServerConfig{}, map[string]tern.Client{
+		"east/staging": client,
+	}, logger)
+
+	ctx := storage.WithApplyLease(t.Context(), apply.Lease())
+	claimed := *apply
+	_, err := svc.resumeClaimedApply(ctx, 0, &claimed, 0, "")
+
+	require.ErrorIs(t, err, tern.ErrTaskVerdictRefused)
+	require.ErrorIs(t, err, loadErr)
+	assert.False(t, applyStore.updateCalled, "the apply must not be failed over task rows that recorded no verdict")
+	assert.Equal(t, state.Apply.Running, applyStore.apply.State)
+}
+
+// failingTaskLoadStore fails every task load with err.
+type failingTaskLoadStore struct {
+	storage.TaskStore
+	err error
+}
+
+func (s *failingTaskLoadStore) GetByApplyID(context.Context, int64) ([]*storage.Task, error) {
+	return nil, s.err
 }
 
 // unclaimableParentApplyStore backs the unclaimable-parent reconcile with a
@@ -2342,6 +2474,64 @@ func TestDriveTick_ContainsDrivePanicUnderOperationClaimAndKeepsClaiming(t *test
 	require.NotPanics(t, func() { svc.driveTick(t.Context(), 0, openClaimGate()) })
 	assert.Equal(t, 2, ops.claims,
 		"the driver must keep claiming after containing the panic, and the failed operation must not be claimable")
+}
+
+// The same containment through a claimed operation: the drive for apply
+// `apply-42` panics holding tasks for `orders` and `users`, and storage refuses
+// the `users` verdict. A stored `orders` failure would derive the operation,
+// then the parent apply, failed over the `users` row that still reads running,
+// so the tick leaves both rows running. The driver keeps the operation lease
+// rather than handing it back, so the row is not offered again until its
+// heartbeat goes stale and the panicking drive is not re-run on the next tick.
+func TestDriveTick_DrivePanicWithRefusedTaskVerdictLeavesOperationActive(t *testing.T) {
+	client := &panickingResumeClient{panicValue: "corrupt engine metadata"}
+	operationID := int64(7)
+	apply := &storage.Apply{
+		ID:              42,
+		ApplyIdentifier: "apply-42",
+		Database:        "appdb",
+		Deployment:      "east",
+		Environment:     "staging",
+		State:           state.Apply.Running,
+	}
+	op := &storage.ApplyOperation{
+		ID:         operationID,
+		ApplyID:    42,
+		Deployment: "east",
+		State:      state.ApplyOperation.Running,
+	}
+	applies := &operationClaimApplyStore{apply: apply}
+	ops := &claimLadderOperationStore{recoverOperationStore: &recoverOperationStore{op: op}}
+	taskStore := &refusingTaskStore{
+		recordingTaskStore: recordingTaskStore{tasks: []*storage.Task{
+			{ID: 9, TaskIdentifier: "task-orders", ApplyID: 42, ApplyOperationID: &operationID, TableName: "orders", State: state.Task.Running},
+			{ID: 10, TaskIdentifier: "task-users", ApplyID: 42, ApplyOperationID: &operationID, TableName: "users", State: state.Task.Running},
+		}},
+		refuse: map[int64]error{10: errors.New("update task: connection reset by peer")},
+	}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	svc := New(&mockStorageWithApplyStores{
+		plans:      &staticPlanStore{},
+		applies:    applies,
+		tasks:      taskStore,
+		controls:   &fakeControlRequestStore{},
+		operations: ops,
+	}, testServerConfig(), map[string]tern.Client{
+		"east/staging": client,
+	}, logger)
+
+	require.NotPanics(t, func() { svc.driveTick(t.Context(), 0, openClaimGate()) })
+	assert.Equal(t, 1, ops.claims)
+	assert.Equal(t, state.ApplyOperation.Running, op.State,
+		"the operation must not be derived failed over the task whose verdict did not land")
+	assert.Empty(t, op.ErrorMessage)
+	assert.False(t, applies.updateCalled, "the parent apply must not be failed by the containment")
+	assert.Equal(t, state.Apply.Running, applies.apply.State,
+		"the parent apply must not be projected failed from the operation")
+
+	require.Len(t, taskStore.updated, 1, "only the orders verdict lands")
+	assert.Equal(t, "task-orders", taskStore.updated[0].TaskIdentifier)
+	assert.Equal(t, state.Task.Failed, taskStore.updated[0].State)
 }
 
 // tasklessOperationStores holds the four stores markOperationFromOwnResult
