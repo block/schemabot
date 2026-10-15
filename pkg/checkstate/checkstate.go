@@ -394,7 +394,7 @@ func runningDisposition(check *storage.Check, apply *storage.Apply, coversHead b
 	if applyIsStopped(apply) {
 		return Disposition{
 			Reason:   ReasonApplyStopped,
-			Summary:  "The apply holding this check is stopped, so the check stays in progress and the gate stays closed.",
+			Summary:  "The apply holding this check is stopped, so the gate stays closed.",
 			Remedy:   "Start the apply or cancel it. It does not settle on its own, and no plan replaces a stopped apply's result.",
 			Blocking: true,
 		}

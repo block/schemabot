@@ -1595,6 +1595,12 @@ func PreviewCommentApplyBlockedByCheckStatusError() string {
 		})
 }
 
+// PreviewCommentApplyBlockedByStoppedPriorEnvApply renders a sample "production
+// blocked by a stopped staging apply" comment.
+func PreviewCommentApplyBlockedByStoppedPriorEnvApply() string {
+	return RenderApplyBlockedByStoppedPriorEnvApply("testapp", "production", "staging")
+}
+
 // PreviewCommentApplyBlockedByPriorEnvCheckError renders a sample fail-closed
 // block for a prior-environment check that could not be read.
 func PreviewCommentApplyBlockedByPriorEnvCheckError() string {

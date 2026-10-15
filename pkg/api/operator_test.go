@@ -170,6 +170,59 @@ func TestResumeClaimedApplyWithOptions_SuppressesRecoveredObserverForMultiOp(t *
 	assert.Nil(t, deploymentClient.observer)
 }
 
+// A driver that claims a stopped apply tells the webhook handler, so the PR
+// Check Run can leave "stopped" as the apply starts again. It does so on both
+// drive shapes: a multi-operation rollout suppresses the per-driver observer,
+// but leaves its stop the same way a single apply does. An apply claimed from
+// any other state is not leaving a stop and does not fire it.
+func TestResumeClaimedApplyWithOptions_ReportsAStoppedApplyClaim(t *testing.T) {
+	cases := []struct {
+		name         string
+		claimedFrom  string
+		suppressHook bool
+		wantClaimed  bool
+	}{
+		{name: "single-operation drive of a stopped apply", claimedFrom: state.Apply.Stopped, wantClaimed: true},
+		{name: "multi-operation drive of a stopped rollout", claimedFrom: state.Apply.Stopped, suppressHook: true, wantClaimed: true},
+		{name: "drive of a pending apply", claimedFrom: state.Apply.Pending},
+		{name: "drive of a running apply recovered after a crash", claimedFrom: state.Apply.Running},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			deploymentClient := &mockTernClient{}
+			logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+			svc := New(&mockStorageWithApplyStores{
+				plans:   &staticPlanStore{},
+				applies: &staticApplyStore{},
+			}, &ServerConfig{}, map[string]tern.Client{
+				"east/staging": deploymentClient,
+			}, logger)
+			var claimed []*storage.Apply
+			svc.OnStoppedApplyClaimed = func(apply *storage.Apply) { claimed = append(claimed, apply) }
+			apply := &storage.Apply{
+				ID:              42,
+				ApplyIdentifier: "apply-42",
+				Database:        "appdb",
+				Deployment:      "east",
+				Environment:     "staging",
+				State:           tc.claimedFrom,
+			}
+
+			resumed, err := svc.resumeClaimedApplyWithOptions(t.Context(), 1, apply, 0, "east",
+				resumeClaimedApplyOptions{suppressRecoveredObserver: tc.suppressHook})
+
+			require.NoError(t, err)
+			assert.True(t, resumed)
+			if !tc.wantClaimed {
+				assert.Empty(t, claimed, "an apply claimed from %s is not leaving a stop", tc.claimedFrom)
+				return
+			}
+			require.Len(t, claimed, 1, "the claim of a stopped apply is reported once")
+			assert.Same(t, apply, claimed[0])
+		})
+	}
+}
+
 // An operator drive binds a drive-scoped logger once at the claim boundary, so
 // every log line of the drive carries the apply's identity (apply_id, repo, pr,
 // database, environment) and the effective deployment without each call site
