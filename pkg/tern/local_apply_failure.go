@@ -228,6 +228,13 @@ func (c *LocalClient) failApplyWithTasks(ctx context.Context, apply *storage.App
 // proves whose write storage holds. Anything else, including a re-read that
 // fails, is a write that did not land, and the drive goes on to treat it that
 // way.
+//
+// Failing closed on a failed re-read leaves one known drift: a first pause for
+// retry that committed but whose re-read also fails is returned as an error,
+// so neither the drive nor the operator releases the active-applies gauge for
+// it. The gauge then reads one too high while the apply is paused, and stays
+// so after it settles, since the count the retry claim adds is the one that
+// settlement releases.
 func (c *LocalClient) outcomeWriteLanded(ctx context.Context, apply *storage.Apply, wantState, errMsg string, writeErr error) (bool, *storage.Apply) {
 	if errors.Is(writeErr, storage.ErrApplyLeaseLost) {
 		return false, nil

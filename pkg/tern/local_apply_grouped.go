@@ -277,7 +277,17 @@ func (c *LocalClient) completeTasklessGroupedApply(ctx context.Context, apply *s
 	apply.CompletedAt = &now
 	apply.UpdatedAt = now
 	if err := c.storage.Applies().Update(ctx, apply); err != nil {
-		return fmt.Errorf("complete task-less grouped apply %s: %w", apply.ApplyIdentifier, err)
+		// The write may have committed with only its reply lost. When storage
+		// holds the apply completed under this drive's lease, the write landed
+		// and the drive goes on to answer for it below; otherwise the stored
+		// apply is still active and nothing that answers for its outcome may run.
+		landed, stored := c.outcomeWriteLanded(ctx, apply, apply.State, apply.ErrorMessage, err)
+		if !landed {
+			return fmt.Errorf("complete task-less grouped apply %s: %w", apply.ApplyIdentifier, err)
+		}
+		c.logger.Warn("the write recording the task-less apply completed returned an error, but storage holds it; continuing with the stored outcome",
+			append(stored.LogAttrs(), "error", err)...)
+		*apply = *stored
 	}
 	if message == "" {
 		message = "Apply completed with state: completed"
