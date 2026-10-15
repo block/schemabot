@@ -25,6 +25,7 @@ import (
 	"github.com/block/pg-sprite/pkg/router"
 	"github.com/block/pg-sprite/pkg/schemadiff"
 	pgstatement "github.com/block/pg-sprite/pkg/statement"
+	"github.com/block/pg-sprite/pkg/verdict"
 	spirittable "github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/utils"
 	"github.com/jackc/pgx/v5"
@@ -1313,14 +1314,17 @@ func executionVerdict(formatVersion int, statement pgplan.Statement, table strin
 		if reason, ok := createShapeRefusalReason(statement.Cause, table); ok {
 			return blocked(reason)
 		}
-		verdict := blocked(fmt.Sprintf("statement for table %q is refused: it cannot be executed safely as written", table))
+		if statement.Cause == "" && statement.Reason == verdict.ReasonDeclarativeForeignKey {
+			return blocked(foreignKeyChangeRefusalReason(statement.Kind, table))
+		}
+		refused := blocked(fmt.Sprintf("statement for table %q is refused: it cannot be executed safely as written", table))
 		// An absent cause is a refusal from outside the create path and the
 		// generic sentence is the right one; only a cause the mapping has no
 		// sentence for is vocabulary that moved.
 		if statement.Cause != "" {
-			verdict.unrecognized = &unrecognizedPlannerVocabulary{kind: "create_shape_cause", value: string(statement.Cause)}
+			refused.unrecognized = &unrecognizedPlannerVocabulary{kind: "create_shape_cause", value: string(statement.Cause)}
 		}
-		return verdict
+		return refused
 	case router.DispositionExecute:
 		// Execute on anything but the native route with native steps is a
 		// route or backend this build does not run, or a plan with nothing
@@ -1366,12 +1370,29 @@ func createShapeRefusalReason(cause executor.CreateShapeCause, table string) (st
 		reason = "declares the same relation name more than once; give every table, index, constraint, and sequence a unique name"
 	case executor.CreateShapeMultipleOperations:
 		reason = "contains multiple create operations in one statement; split them into separate CREATE TABLE or CREATE INDEX statements"
+	case executor.CreateShapeForeignKey:
+		reason = "declares a foreign key, which SchemaBot plans but does not apply on PostgreSQL yet; create the table without the foreign key, then add it outside SchemaBot"
 	case executor.CreateShapeUnsupportedKind:
 		reason = "uses a statement kind SchemaBot's PostgreSQL create path does not support; use CREATE TABLE or CREATE INDEX, or create the object outside SchemaBot"
 	default:
 		return "", false
 	}
 	return fmt.Sprintf("statement for table %q %s", table, reason), true
+}
+
+// foreignKeyChangeRefusalReason renders the planner's refusal of a
+// foreign-key change on a live table. The plan shows the change so it can be
+// reviewed, but the engine does not run it, so the operator runs it
+// themselves.
+func foreignKeyChangeRefusalReason(kind schemadiff.ChangeKind, table string) string {
+	action := "changes"
+	switch kind {
+	case schemadiff.ChangeAddForeignKey:
+		action = "adds"
+	case schemadiff.ChangeDropForeignKey:
+		action = "drops"
+	}
+	return fmt.Sprintf("statement for table %q %s a foreign key, which SchemaBot plans but does not apply on PostgreSQL yet; run this statement outside SchemaBot", table, action)
 }
 
 func destructiveReason(destructive bool, table string) string {

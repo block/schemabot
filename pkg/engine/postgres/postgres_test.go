@@ -18,6 +18,8 @@ import (
 	"github.com/block/pg-sprite/pkg/planner"
 	"github.com/block/pg-sprite/pkg/preflight"
 	"github.com/block/pg-sprite/pkg/router"
+	"github.com/block/pg-sprite/pkg/schemadiff"
+	"github.com/block/pg-sprite/pkg/verdict"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -157,6 +159,7 @@ var createShapeRefusalSentences = map[executor.CreateShapeCause]string{
 	executor.CreateShapeConcurrently:       `statement for table "users" declares CONCURRENTLY for an index on a new table, which SchemaBot's PostgreSQL create path does not support; remove CONCURRENTLY so the index can be built before the table receives traffic`,
 	executor.CreateShapeDuplicateName:      `statement for table "users" declares the same relation name more than once; give every table, index, constraint, and sequence a unique name`,
 	executor.CreateShapeMultipleOperations: `statement for table "users" contains multiple create operations in one statement; split them into separate CREATE TABLE or CREATE INDEX statements`,
+	executor.CreateShapeForeignKey:         `statement for table "users" declares a foreign key, which SchemaBot plans but does not apply on PostgreSQL yet; create the table without the foreign key, then add it outside SchemaBot`,
 	executor.CreateShapeUnsupportedKind:    `statement for table "users" uses a statement kind SchemaBot's PostgreSQL create path does not support; use CREATE TABLE or CREATE INDEX, or create the object outside SchemaBot`,
 }
 
@@ -206,6 +209,29 @@ func TestExecutionVerdictEmptyCreateShapeCause(t *testing.T) {
 	}, executionVerdict(pgplan.FormatVersion, pgplan.Statement{
 		Disposition: router.DispositionRefuse,
 	}, "users"))
+}
+
+// A foreign-key change on a live table is planned so it can be reviewed, but
+// the engine does not run it: the step is blocked with a sentence naming
+// whether the statement adds or drops the foreign key, and nothing is
+// reported as unrecognized vocabulary.
+func TestExecutionVerdictForeignKeyChange(t *testing.T) {
+	for _, tt := range []struct {
+		kind schemadiff.ChangeKind
+		want string
+	}{
+		{schemadiff.ChangeAddForeignKey, `statement for table "users" adds a foreign key, which SchemaBot plans but does not apply on PostgreSQL yet; run this statement outside SchemaBot`},
+		{schemadiff.ChangeDropForeignKey, `statement for table "users" drops a foreign key, which SchemaBot plans but does not apply on PostgreSQL yet; run this statement outside SchemaBot`},
+	} {
+		t.Run(string(tt.kind), func(t *testing.T) {
+			assert.Equal(t, stepVerdict{mode: engine.ExecutionModeBlocked, reason: tt.want},
+				executionVerdict(pgplan.FormatVersion, pgplan.Statement{
+					Kind:        tt.kind,
+					Disposition: router.DispositionRefuse,
+					Reason:      verdict.ReasonDeclarativeForeignKey,
+				}, "users"))
+		})
+	}
 }
 
 func TestTableChangesMapsDestructiveSafety(t *testing.T) {

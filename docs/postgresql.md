@@ -454,12 +454,17 @@ a reviewed drop before the rest can be pulled. `CREATE UNLOGGED TABLE`,
 `PARTITION BY` and a child of `INHERITS` flattened to its own columns are all
 accepted in a hand-written file.
 
-Foreign keys change which remedy is available, and the plan says which. The
-declarative format does not support foreign keys, so a table that owns them
-cannot be declared: a file for it fails to parse, and a file that omits them
-plans their removal as a destructive `DROP CONSTRAINT`. The plan names the
-constraints; the table must be dropped, or have its foreign keys removed
-before it is declared, through a separately reviewed process. A table that
+Foreign keys are planned but not applied. A file may declare a foreign key
+whose referenced table is unqualified and exists in the same namespace. A
+declared foreign key that matches the live one plans no change. One the file
+adds plans as an `ADD CONSTRAINT` that names the referenced table with its
+namespace, and a live one the file omits plans as a destructive
+`DROP CONSTRAINT`; both are shown for review and blocked, because SchemaBot
+does not apply foreign-key changes on PostgreSQL yet. Run that statement
+outside SchemaBot, then re-plan. A new table that declares a foreign key is
+blocked as a whole: create it without the foreign key, then add the foreign
+key outside SchemaBot. Planning copies each referenced table's shape, so the
+planning role needs `SELECT` on it; it never blocks writes to it. A table that
 other tables reference can be declared — the constraints live on the
 referencing tables, not in its own definition — but only by a hand-written
 file, because the pull refuses to render a table it would describe
