@@ -1367,7 +1367,12 @@ func postedCutoverOperationID(cutoverOperationID int64) *int64 {
 // cutover rotation is owed once per rollout member, whichever phase at or past
 // the cutover the tick finds the apply in: a comment posted at or past the
 // cutover of the member the request is bound to already tracks its effect.
-// Any other command rotates once, into a comment recording the phase.
+// A row recording no member covers only a cutover bound to none: the handler's
+// own posts and older builds record no member, so a row without one cannot
+// say which member's cutover it tracks, and treating it as covering would let
+// the next member's cutover edit in place. The cost is at most one extra fold
+// for a member such a row did track. Any other command rotates once, into a
+// comment recording the phase.
 func trackedCommentCoversRotation(tracked *storage.ApplyComment, key controlRotationKey, reason supersededProgressReason) bool {
 	posted := trackedPhase(tracked)
 	if reason == supersededByCutoverCommand {

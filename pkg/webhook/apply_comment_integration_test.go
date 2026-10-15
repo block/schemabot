@@ -1855,6 +1855,66 @@ func TestE2EOrderedDeferredCutoverRotatesForEachMember(t *testing.T) {
 	}
 }
 
+// A progress comment that records no rollout member — the handler's own
+// post, such as the fresh comment of a resume, or one an older build posted —
+// cannot say whose cutover it tracks. When the next member of an ordered
+// rollout is cut over after such a comment was posted past the gate, the
+// operator's command still lands in a fresh comment at the bottom of the PR
+// rather than editing that comment in place.
+func TestE2EOrderedDeferredCutoverRotatesPastCommentWithoutMember(t *testing.T) {
+	ctx := t.Context()
+	const repo = "org/repo-ordered-cutover-no-member"
+	const nextMember = int64(9202)
+	f := setupApplyCommentFixture(t, applyCommentFixtureParams{
+		repo:         repo,
+		pr:           160,
+		database:     "e2e_ordered_cutover_no_member",
+		applyState:   state.Apply.RevertWindow,
+		deferCutover: true,
+	})
+	st, apply, task, capture, h := f.st, f.apply, f.task, f.capture, f.handler
+
+	// The tracked comment was posted in the previous member's revert window
+	// and records no member.
+	h.postAndTrackComment(ctx, repo, 160, 12345, apply, state.Comment.Progress, "Revert window — previous member")
+	pastID := requireCommentCreate(t, capture)
+	prog, err := st.ApplyComments().Get(ctx, apply.ID, state.Comment.Progress)
+	require.NoError(t, err)
+	require.NotNil(t, prog)
+	require.NotNil(t, prog.PostedPhase)
+	require.Equal(t, phaseRevertWindow, *prog.PostedPhase)
+	require.Nil(t, prog.PostedCutoverOperationID, "the handler's post records no member")
+
+	_, _, err = st.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationCutover,
+		RequestedBy: "operator",
+		Metadata:    storage.CutoverRequestMetadata(nextMember),
+	})
+	require.NoError(t, err)
+
+	obs := f.newObserver(st, clock.NewFake(task.CreatedAt))
+	apply.State = state.Apply.CuttingOver
+	task.State = state.Task.CuttingOver
+	obs.OnProgress(apply, []*storage.Task{task})
+
+	freshID := requireCommentCreate(t, capture)
+	select {
+	case edited := <-capture.edits:
+		assert.Equal(t, pastID, edited.CommentID, "the fold lands on the comment that recorded no member")
+		assert.True(t, strings.HasPrefix(edited.Body, fmt.Sprintf(
+			"Cutover started — progress continues in [a new progress comment](https://github.com/%s/pull/160#issuecomment-%d).", repo, freshID)), edited.Body)
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected the comment that recorded no member to be folded")
+	}
+	prog, err = st.ApplyComments().Get(ctx, apply.ID, state.Comment.Progress)
+	require.NoError(t, err)
+	require.NotNil(t, prog)
+	assert.Equal(t, freshID, prog.GitHubCommentID)
+	require.NotNil(t, prog.PostedCutoverOperationID)
+	assert.Equal(t, nextMember, *prog.PostedCutoverOperationID)
+}
+
 // A cutover that is not the effect of an operator's command transitions the
 // progress comment in place: an apply that never deferred its cutover cuts
 // over on its own, and a deferred apply with no recorded cutover request has
