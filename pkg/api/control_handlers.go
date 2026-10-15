@@ -1280,6 +1280,9 @@ func (s *Service) queueStopForApplyOwner(ctx context.Context, apply *storage.App
 		s.logger.Info("stop requested for a task-less apply; recording the durable request for the task-less settle path",
 			append(apply.LogAttrs(), "requested_by", caller)...)
 	}
+	if err := s.supersedePendingStartForStop(ctx, apply, caller); err != nil {
+		return nil, "", err
+	}
 	controlReq, alreadyPending, err := s.createStopControlRequest(ctx, apply, caller, stoppedCount, skippedCount)
 	if err != nil {
 		return nil, "", err
@@ -1296,6 +1299,44 @@ func (s *Service) queueStopForApplyOwner(ctx context.Context, apply *storage.App
 		StoppedCount: stoppedCount,
 		SkippedCount: skippedCount,
 	}, "", nil
+}
+
+// supersedePendingStartForStop completes a pending start on a multi-operation
+// apply before a stop is recorded on it. A rollout keeps its start pending
+// until it settles, because the operations the start resumes are claimed one
+// at a time on its behalf, and a pending start on a stopped rollout is what
+// reopens it. Left pending under the new stop, that start would resume the
+// rollout as soon as the stop landed on every operation. A stop is only
+// accepted for a non-terminal apply, so the start it supersedes has already
+// taken effect. A single-operation apply's drive consumes its start when it
+// resumes, so its start is left to that drive.
+func (s *Service) supersedePendingStartForStop(ctx context.Context, apply *storage.Apply, caller string) error {
+	controlStore := s.storage.ControlRequests()
+	if controlStore == nil {
+		return fmt.Errorf("control request store is not available")
+	}
+	start, err := controlStore.GetPending(ctx, apply.ID, storage.ControlOperationStart)
+	if err != nil {
+		return fmt.Errorf("load pending start request for apply %s before recording a stop: %w", apply.ApplyIdentifier, err)
+	}
+	if start == nil {
+		return nil
+	}
+	ops, err := s.storage.ApplyOperations().ListByApply(ctx, apply.ID)
+	if err != nil {
+		return fmt.Errorf("list apply_operations for apply %s before recording a stop: %w", apply.ApplyIdentifier, err)
+	}
+	if len(ops) < 2 {
+		s.logger.Info("stop requested while a start is pending on a single-operation apply; leaving the start to the drive that resumes it",
+			append(apply.LogAttrs(), "requested_by", caller, "start_requested_by", start.RequestedBy)...)
+		return nil
+	}
+	if err := controlStore.CompletePending(ctx, apply.ID, storage.ControlOperationStart); err != nil {
+		return fmt.Errorf("complete pending start request for apply %s superseded by a stop: %w", apply.ApplyIdentifier, err)
+	}
+	s.logger.Info("completed the pending start of a rollout superseded by a stop",
+		append(apply.LogAttrs(), "requested_by", caller, "start_requested_by", start.RequestedBy)...)
+	return nil
 }
 
 func stopRequestCounts(tasks []*storage.Task) (int64, int64) {

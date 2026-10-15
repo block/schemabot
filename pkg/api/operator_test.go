@@ -1411,38 +1411,6 @@ func TestCompletePendingControlRequestsIfApplyResolved(t *testing.T) {
 		assert.Equal(t, storage.ControlOperationStop, control.completed[0])
 	})
 
-	t.Run("keeps the start pending while a resumed rollout still has a stopped operation", func(t *testing.T) {
-		applies := &getApplyStore{apply: &storage.Apply{ID: 9, ApplyIdentifier: "apply-resuming", State: state.Apply.Running}}
-		control := &fakeControlRequestStore{pending: map[storage.ControlOperation]*storage.ApplyControlRequest{
-			storage.ControlOperationStart: pendingRequest(storage.ControlOperationStart),
-		}}
-		ops := &markPendingStoppedRecordingStore{ops: []*storage.ApplyOperation{
-			{ID: 1, Deployment: "region-a", OperationKey: "orders-001/step-1", State: state.ApplyOperation.Running},
-			{ID: 2, Deployment: "region-a", OperationKey: "orders-001/step-2", State: state.ApplyOperation.Stopped},
-		}}
-		svc := newStopReconcileTestService(applies, ops, control)
-
-		require.NoError(t, svc.completePendingControlRequestsIfApplyResolved(t.Context(), svc.driverLogger(1), 9))
-		assert.Empty(t, control.completed, "the stopped step-2 operation is claimed only for the pending start, so the start must stay pending")
-		assert.Empty(t, control.failed)
-	})
-
-	t.Run("completes the start once the resumed rollout has no stopped operation", func(t *testing.T) {
-		applies := &getApplyStore{apply: &storage.Apply{ID: 9, ApplyIdentifier: "apply-resumed", State: state.Apply.Running}}
-		control := &fakeControlRequestStore{pending: map[storage.ControlOperation]*storage.ApplyControlRequest{
-			storage.ControlOperationStart: pendingRequest(storage.ControlOperationStart),
-		}}
-		ops := &markPendingStoppedRecordingStore{ops: []*storage.ApplyOperation{
-			{ID: 1, Deployment: "region-a", OperationKey: "orders-001/step-1", State: state.ApplyOperation.Completed},
-			{ID: 2, Deployment: "region-a", OperationKey: "orders-001/step-2", State: state.ApplyOperation.Resuming},
-		}}
-		svc := newStopReconcileTestService(applies, ops, control)
-
-		require.NoError(t, svc.completePendingControlRequestsIfApplyResolved(t.Context(), svc.driverLogger(1), 9))
-		assert.Equal(t, []storage.ControlOperation{storage.ControlOperationStart}, control.completed,
-			"every operation the start was for has resumed, so the start has taken effect")
-	})
-
 	t.Run("no-op when nothing is pending", func(t *testing.T) {
 		applies := &getApplyStore{apply: &storage.Apply{ID: 9, ApplyIdentifier: "apply-done", State: state.Apply.Failed}}
 		control := &fakeControlRequestStore{}

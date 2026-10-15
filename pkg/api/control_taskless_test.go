@@ -76,3 +76,62 @@ func TestQueueStopForTasklessApplyRecordsDurableRequest(t *testing.T) {
 	require.NotNil(t, req, "the durable stop request must be recorded for the task-less settle path")
 	assert.Equal(t, "operator", req.RequestedBy)
 }
+
+// An operator started a stopped rollout and is stopping it again. The rollout
+// kept its start pending while it ran, since the start is what its stopped
+// operations are claimed for, so the new stop completes that start before it
+// is recorded: a start left pending under it would resume the rollout the
+// moment the stop landed. A single-operation apply's drive consumes its own
+// start, so the stop leaves that start alone.
+func TestQueueStopSupersedesThePendingStartOfARollout(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		operations    []*storage.ApplyOperation
+		wantStartLeft bool
+	}{
+		{
+			name: "rollout",
+			operations: []*storage.ApplyOperation{
+				{ID: 1, ApplyID: 13, Deployment: "region-a", Target: "orders-001", State: state.ApplyOperation.Running},
+				{ID: 2, ApplyID: 13, Deployment: "region-a", Target: "orders-002", State: state.ApplyOperation.Stopped},
+			},
+		},
+		{
+			name: "single operation",
+			operations: []*storage.ApplyOperation{
+				{ID: 1, ApplyID: 13, Deployment: "region-a", State: state.ApplyOperation.Resuming},
+			},
+			wantStartLeft: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			controls := &memoryControlRequestStore{}
+			svc := New(&mockStorageWithApplyStores{
+				tasks:      &capturingTaskStore{},
+				controls:   controls,
+				operations: &staticApplyOperationStore{operations: tc.operations},
+			}, testServerConfig(), nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+			apply := &storage.Apply{ID: 13, ApplyIdentifier: "apply-restopped", Database: "orders", State: state.Apply.Running, Environment: "staging"}
+			_, _, err := controls.RequestPending(t.Context(), &storage.ApplyControlRequest{
+				ApplyID: apply.ID, Operation: storage.ControlOperationStart, Status: storage.ControlRequestPending, RequestedBy: "first-operator",
+			})
+			require.NoError(t, err)
+
+			resp, _, err := svc.queueStopForApplyOwner(t.Context(), apply, "second-operator")
+			require.NoError(t, err)
+			require.True(t, resp.Accepted)
+
+			start, err := controls.GetPending(t.Context(), apply.ID, storage.ControlOperationStart)
+			require.NoError(t, err)
+			if tc.wantStartLeft {
+				assert.NotNil(t, start, "the single-operation drive consumes its own start")
+			} else {
+				assert.Nil(t, start, "the stop supersedes the rollout's pending start, so nothing reopens the rollout once it lands")
+			}
+			stop, err := controls.GetPending(t.Context(), apply.ID, storage.ControlOperationStop)
+			require.NoError(t, err)
+			require.NotNil(t, stop, "the stop is recorded")
+			assert.Equal(t, "second-operator", stop.RequestedBy)
+		})
+	}
+}

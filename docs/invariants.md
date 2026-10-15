@@ -871,7 +871,7 @@ or `paused` where a pause is holding it — until that sibling is started and fi
 cancelled. A rollout reads `stopped` only once no sibling that started is still under way: until a stop
 has landed on every started sibling, the rollout takes the state of the work still running, so
 the stop request stays pending and `stop` stays on offer for the sibling it has not reached. A
-`start` resolves the same way in reverse, once no operation is still stopped. A rollout held open this way still resolves the stop that produced it, once that stop
+`start` on a rollout stays pending until the rollout settles or a later `stop` supersedes it, since a pending `start` is what reopens a stopped rollout. A rollout held open this way still resolves the stop that produced it, once that stop
 has reached every operation: the pending request is what `start` consults, so holding it open
 without completing the request would refuse the start the hold exists to preserve (CO-2).
 *Enforced:* the ordered-claim gates in `FindNextApplyOperation`, whose work and finalizer arms
@@ -893,8 +893,9 @@ check `CutoverBlocker` (`pkg/storage/internal/sqlstore/apply_operations.go`, sha
 `stepOrphanedByEarlierStep` marks work held behind a table that settled without completing, read through `StepRowCanNeverPass`), through which every
 projection builds its children, with `RolloutHeldByResumableChild` (`pkg/state/apply.go`), which
 `updateApplyStateFromOperations` consults to keep a held-open rollout's recovery claim quiet, and
-`completeLandedStopForHeldOpenApply` keeping its stop resolved and `completeLandedStartForResumedRollout`
-resolving its start (`pkg/api/operator.go`).
+`completeLandedStopForHeldOpenApply` keeping its stop resolved (`pkg/api/operator.go`), and
+`supersedePendingStartForStop` completing a rollout's pending start when a stop is recorded
+(`pkg/api/control_handlers.go`).
 
 ## Ownership and leases (OW)
 

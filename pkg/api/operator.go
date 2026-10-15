@@ -1962,10 +1962,7 @@ func (s *Service) completePendingControlRequestsIfApplyResolved(ctx context.Cont
 		return fmt.Errorf("reload apply %d before completing pending control requests: %w", applyID, storage.ErrApplyNotFound)
 	}
 	if !state.IsTerminalApplyState(apply.State) {
-		if err := s.completeLandedStopForHeldOpenApply(ctx, logger, apply); err != nil {
-			return err
-		}
-		return s.completeLandedStartForResumedRollout(ctx, logger, apply)
+		return s.completeLandedStopForHeldOpenApply(ctx, logger, apply)
 	}
 
 	if err := s.completePendingRequestForResolvedApply(ctx, logger, apply, storage.ControlOperationStop); err != nil {
@@ -2024,49 +2021,6 @@ func (s *Service) completeLandedStopForHeldOpenApply(ctx context.Context, logger
 		}
 	}
 	return s.completePendingRequestForResolvedApply(ctx, logger, apply, storage.ControlOperationStop)
-}
-
-// completeLandedStartForResumedRollout completes a pending start request once
-// the rollout it resumed has no stopped operation left.
-//
-// The start is what every stopped operation is claimed for, and the start
-// gate holds back a stopped operation that never began until the members
-// before it complete, so the request has to stay pending until the last
-// stopped operation has been resumed. Completing it earlier would leave that
-// operation with nothing to claim it for. Fails closed on an incomplete
-// generation, for the same reason completeLandedStopForHeldOpenApply does.
-func (s *Service) completeLandedStartForResumedRollout(ctx context.Context, logger *slog.Logger, apply *storage.Apply) error {
-	controlReq, err := s.storage.ControlRequests().GetPending(ctx, apply.ID, storage.ControlOperationStart)
-	if err != nil {
-		return fmt.Errorf("load pending start request for resumed apply %s (%d): %w", apply.ApplyIdentifier, apply.ID, err)
-	}
-	if controlReq == nil {
-		return nil
-	}
-	ops, err := s.storage.ApplyOperations().ListByApply(ctx, apply.ID)
-	if err != nil {
-		return fmt.Errorf("list apply_operations for resumed apply %s (%d): %w", apply.ApplyIdentifier, apply.ID, err)
-	}
-	if len(ops) < 2 {
-		logger.Debug("operator: leaving pending start request for the drive that resumes a single-operation apply",
-			apply.LogAttrs()...)
-		return nil
-	}
-	if missing := apply.MissingExpectedOperationKeys(ops); len(missing) > 0 {
-		logger.Debug("operator: leaving pending start request deliverable for operations the generation manifest still expects",
-			append(apply.LogAttrs(), "missing_operation_keys", missing)...)
-		return nil
-	}
-	for _, op := range ops {
-		if state.IsState(op.State, state.ApplyOperation.Stopped) {
-			logger.Debug("operator: leaving pending start request for resumed apply with an operation the start has not reached",
-				append(apply.LogAttrs(),
-					"operation_deployment", op.Deployment,
-					"operation_key", op.OperationKey)...)
-			return nil
-		}
-	}
-	return s.completePendingRequestForResolvedApply(ctx, logger, apply, storage.ControlOperationStart)
 }
 
 // completePendingRequestForResolvedApply completes one pending control request
