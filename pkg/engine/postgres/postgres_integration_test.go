@@ -1367,6 +1367,8 @@ func TestLiveTablesUnderShadowingSearchPath(t *testing.T) {
 		CREATE TABLE public.ext_owned_config (key text PRIMARY KEY);
 		ALTER EXTENSION hstore ADD TABLE public.ext_owned_config;
 		CREATE SCHEMA hostile;
+		CREATE TABLE hostile.accounts (id bigint PRIMARY KEY);
+		CREATE TABLE public.invoices (id bigint PRIMARY KEY, account_id bigint REFERENCES hostile.accounts (id));
 		CREATE TABLE hostile.pg_class (oid oid, relname name, relnamespace oid, relkind "char", relispartition boolean,
 			relrowsecurity boolean, relforcerowsecurity boolean, reloptions text[]);
 		CREATE TABLE hostile.pg_namespace (oid oid, nspname name);
@@ -1404,14 +1406,15 @@ func TestLiveTablesUnderShadowingSearchPath(t *testing.T) {
 	tables, err := liveTables(t.Context(), pool, "public")
 	require.NoError(t, err)
 	assert.Equal(t, []liveTable{
-		{name: "events", foreignKeys: []string{}, referencedBy: []string{}},
-		{name: "orders", foreignKeys: []string{"orders_user_id_fkey"}, referencedBy: []string{}},
-		{name: "users", foreignKeys: []string{}, referencedBy: []string{"orders_user_id_fkey"}},
+		{name: "events", foreignKeys: []string{}, crossNamespaceForeignKeys: []string{}, referencedBy: []string{}},
+		{name: "invoices", foreignKeys: []string{"invoices_account_id_fkey"}, crossNamespaceForeignKeys: []string{"invoices_account_id_fkey"}, referencedBy: []string{}},
+		{name: "orders", foreignKeys: []string{"orders_user_id_fkey"}, crossNamespaceForeignKeys: []string{}, referencedBy: []string{}},
+		{name: "users", foreignKeys: []string{}, crossNamespaceForeignKeys: []string{}, referencedBy: []string{"orders_user_id_fkey"}},
 	}, tables, "every live table and its foreign keys must be enumerated, and only the partition and the extension-owned table left out, despite the shadowing search_path")
 
 	pulled, err := schemadiff.ListManagedTables(t.Context(), pool, "public")
 	require.NoError(t, err)
-	assert.Equal(t, []string{"events", "orders", "users"}, pulled, "the pull must render the same set the plan holds files accountable for")
+	assert.Equal(t, []string{"events", "invoices", "orders", "users"}, pulled, "the pull must render the same set the plan holds files accountable for")
 
 	namespaces, err := pullNamespaces(t.Context(), pool, "")
 	require.NoError(t, err)
