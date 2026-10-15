@@ -104,30 +104,23 @@ func markPendingControlRequestCompleted(ctx context.Context, store storage.Stora
 
 // settlePendingRequestsForTerminalApply settles the pending control requests
 // that a terminal apply moots: a pending stop is settled (the apply can no
-// longer be stopped), and a pending revert or skip-revert can no longer act
-// because the revert window is gone. Sweeping the mooted requests keeps a
-// request issued moments before the apply settled — or one that lost to a
-// contradictory command — from lingering pending forever.
+// longer be stopped). Sweeping the mooted requests keeps a request issued
+// moments before the apply settled — or one that lost to a contradictory
+// command — from lingering pending forever.
 //
-// A pending cutover and a pending cancel are settled rather than completed
-// outright: the terminal state decides whether the operator's command took
-// effect. A pending cancel is mooted by every terminal state except stopped,
-// since a stopped apply remains cancellable and its pending cancel stays
-// deliverable for the next drive.
+// A pending cutover, cancel, revert, and skip-revert are settled rather than
+// completed outright: the terminal state decides whether the operator's command
+// took effect (CO-2). A pending cancel is mooted by every terminal state except
+// stopped, since a stopped apply remains cancellable and its pending cancel
+// stays deliverable for the next drive.
 func settlePendingRequestsForTerminalApply(ctx context.Context, store storage.Storage, logger *slog.Logger, apply *storage.Apply) error {
 	if err := completePendingStopControlRequest(ctx, store, logger, apply); err != nil {
 		return err
 	}
-	// The other requests the terminal state moots whatever the outcome.
-	completed := []storage.ControlOperation{
-		storage.ControlOperationRevert,
-		storage.ControlOperationSkipRevert,
-	}
 	// A pending request for a retired operation can only be a row written by a
 	// previous release; no driver services it anymore, so this sweep is its
 	// only settlement path.
-	completed = append(completed, storage.RetiredControlOperations()...)
-	for _, op := range completed {
+	for _, op := range storage.RetiredControlOperations() {
 		if err := completePendingControlRequests(ctx, store, apply, op); err != nil {
 			return err
 		}
@@ -136,7 +129,70 @@ func settlePendingRequestsForTerminalApply(ctx context.Context, store storage.St
 	if err := SettlePendingCutoverForResolvedApply(ctx, store, logger, apply); err != nil {
 		return err
 	}
+	for _, op := range []storage.ControlOperation{storage.ControlOperationRevert, storage.ControlOperationSkipRevert} {
+		if err := settlePendingRevertPhaseRequestForTerminalApply(ctx, store, logger, apply, op); err != nil {
+			return err
+		}
+	}
 	return SettlePendingCancelForResolvedApply(ctx, store, logger, apply)
+}
+
+// settlePendingRevertPhaseRequestForTerminalApply answers a revert or
+// skip-revert still pending once the apply is terminal. The revert window is
+// gone, so the request can no longer act; whether it took effect is read from
+// the outcome. A revert took effect only when the apply settled reverted, and a
+// skip-revert only when it settled completed — the window closed and the change
+// stayed. Any other outcome outran the command, so it fails with a reason that
+// says so rather than being reported as carried out.
+//
+// The caller must have established that the apply is terminal.
+func settlePendingRevertPhaseRequestForTerminalApply(ctx context.Context, store storage.Storage, logger *slog.Logger, apply *storage.Apply, op storage.ControlOperation) error {
+	controlReq, err := pendingControlRequest(ctx, store, apply, op)
+	if err != nil {
+		return err
+	}
+	if controlReq == nil {
+		return nil
+	}
+	if revertPhaseRequestTookEffect(op, apply.State) {
+		logger.InfoContext(ctx, "completing pending control request: the apply settled on its outcome",
+			append(apply.LogAttrs(), "operation", op, "requested_by", controlRequestCaller(controlReq))...)
+		return completePendingControlRequests(ctx, store, apply, op)
+	}
+	reason := revertPhaseOutrunReason(op, apply.State)
+	logger.InfoContext(ctx, "failing pending control request: the apply settled before it could take effect",
+		append(apply.LogAttrs(), "operation", op, "requested_by", controlRequestCaller(controlReq), "reason", reason)...)
+	return failPendingControlRequests(ctx, store, apply, op, reason)
+}
+
+// revertPhaseRequestTookEffect reports whether a terminal apply state is the
+// outcome a revert or skip-revert asked for.
+func revertPhaseRequestTookEffect(op storage.ControlOperation, applyState string) bool {
+	switch op {
+	case storage.ControlOperationRevert:
+		return state.IsState(applyState, state.Apply.Reverted)
+	case storage.ControlOperationSkipRevert:
+		return state.IsState(applyState, state.Apply.Completed)
+	default:
+		return false
+	}
+}
+
+// revertPhaseOutrunReason names what overtook a revert or skip-revert on an
+// apply that reached applyState, in the operator's vocabulary for the state.
+func revertPhaseOutrunReason(op storage.ControlOperation, applyState string) string {
+	command := "revert"
+	if op == storage.ControlOperationSkipRevert {
+		command = "skip-revert"
+	}
+	if state.IsState(applyState, state.Apply.Completed) {
+		return fmt.Sprintf("the schema change completed before the %s could take effect; the change is live on the target", command)
+	}
+	info, known := state.LookupApply(state.NormalizeState(applyState))
+	if !known {
+		return fmt.Sprintf("the schema change settled before the %s could take effect", command)
+	}
+	return fmt.Sprintf("the schema change reached %s before the %s could take effect", info.Label, command)
 }
 
 // cutoverSupersededByStopMessage answers a cutover that was still pending when

@@ -258,8 +258,8 @@ func TestResumeApplyWithTasks_NoRemainingWorkSettlesMootedRequests(t *testing.T)
 	assert.Equal(t, state.Apply.Completed, applies.stored.State)
 	assert.Equal(t, int64(-1), activeAppliesDelta(t, reader), "completing the apply releases it from the active-apply gauge")
 	require.Len(t, controlRequests.requests, 1)
-	assert.Equal(t, storage.ControlRequestCompleted, controlRequests.requests[0].Status,
-		"the completed outcome moots the pending revert")
+	assert.Equal(t, storage.ControlRequestFailed, controlRequests.requests[0].Status,
+		"the completed outcome outran the pending revert")
 	require.Len(t, observer.terminal, 1)
 	assert.Equal(t, state.Apply.Completed, observer.terminal[0].State)
 	assert.Empty(t, eng.applied, "an apply with no remaining work hands nothing to the engine")
@@ -299,8 +299,8 @@ func TestResumeApplyWithTasks_SettledFailedTaskFailsTheApply(t *testing.T) {
 	assert.Equal(t, "deploy request 5 not found", applies.stored.ErrorMessage)
 	assert.Equal(t, state.Task.Failed, failed.State, "a failed task stays failed")
 	require.Len(t, controlRequests.requests, 1)
-	assert.Equal(t, storage.ControlRequestCompleted, controlRequests.requests[0].Status,
-		"the failed outcome moots the pending revert")
+	assert.Equal(t, storage.ControlRequestFailed, controlRequests.requests[0].Status,
+		"the failed outcome outran the pending revert")
 	require.Len(t, observer.terminal, 1)
 	assert.Equal(t, state.Apply.Failed, observer.terminal[0].State)
 	assert.Empty(t, eng.applied, "an apply whose tasks are all settled hands nothing to the engine")
@@ -585,7 +585,7 @@ func TestResumeApplyWithTasks_BlockedTaskFailureOwesEveryTerminalSideEffect(t *t
 		{
 			name:             "request writes land",
 			wantStartStatus:  storage.ControlRequestFailed,
-			wantRevertStatus: storage.ControlRequestCompleted,
+			wantRevertStatus: storage.ControlRequestFailed,
 		},
 		{
 			name:             "request writes are refused",
@@ -717,8 +717,8 @@ func TestExecuteGroupedApply_FailureReturnsOweTerminalSideEffects(t *testing.T) 
 			assert.Contains(t, applyStore.apply.ErrorMessage, tc.wantErrorText)
 			assert.Equal(t, state.Task.Failed, tasks[0].State)
 			require.Len(t, requests.requests, 1)
-			assert.Equal(t, storage.ControlRequestCompleted, requests.requests[0].Status,
-				"the failed outcome moots the pending revert")
+			assert.Equal(t, storage.ControlRequestFailed, requests.requests[0].Status,
+				"the failed outcome outran the pending revert")
 			require.Len(t, observer.terminal, 1, "the stored failure owes its terminal summary")
 			assert.Equal(t, state.Apply.Failed, observer.terminal[0].State)
 		})
@@ -750,7 +750,7 @@ func TestPollForCompletionAtomic_OutcomeSideEffectsWaitForTheStoredOutcome(t *te
 		{
 			name:              "outcome write lands",
 			wantStoredState:   state.Apply.Completed,
-			wantRevertStatus:  storage.ControlRequestCompleted,
+			wantRevertStatus:  storage.ControlRequestFailed,
 			wantTerminalCalls: 1,
 		},
 	}
@@ -1231,7 +1231,7 @@ func TestPollForCompletionAtomic_PermanentFailureSideEffectsWaitForTheStoredFail
 			name:              "failure write lands",
 			wantStoredState:   state.Apply.Failed,
 			wantDriveState:    state.Apply.Failed,
-			wantRevertStatus:  storage.ControlRequestCompleted,
+			wantRevertStatus:  storage.ControlRequestFailed,
 			wantTerminalCalls: 1,
 		},
 	}
@@ -1343,7 +1343,7 @@ func TestFailApplyAndNotify_LandedWriteWithALostReplyOwesItsSideEffects(t *testi
 	assert.Equal(t, state.Apply.Failed, drive.State, "the drive adopts the outcome storage holds")
 	require.Len(t, controlRequests.requests, 2)
 	assert.Equal(t, storage.ControlRequestFailed, controlRequests.requests[0].Status, "the admitting start is answered with the failure")
-	assert.Equal(t, storage.ControlRequestCompleted, controlRequests.requests[1].Status, "the failure moots the pending revert")
+	assert.Equal(t, storage.ControlRequestFailed, controlRequests.requests[1].Status, "the failure outran the pending revert")
 	assert.True(t, hasLogMessageContaining(logs.logs, "Apply failed: engine lost its connection to the target"))
 	require.Len(t, observer.terminal, 1)
 	assert.Equal(t, state.Apply.Failed, observer.terminal[0].State)

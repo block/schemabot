@@ -10,11 +10,8 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// A terminal apply moots every pending window/stop control request: a stop is
-// settled, and a revert or skip-revert can no longer act once the revert window
-// is gone — including a request that lost to a contradictory command (e.g. a
-// revert still pending after skip-revert finalized the apply). The sweep
-// completes all of them so no request lingers pending forever.
+// A terminal apply moots a pending stop whatever the outcome, so the sweep
+// completes it and no request lingers pending forever.
 func TestSettlePendingRequestsForTerminalApply(t *testing.T) {
 	apply := &storage.Apply{
 		ID:              7,
@@ -25,8 +22,6 @@ func TestSettlePendingRequestsForTerminalApply(t *testing.T) {
 	}
 	sweptOps := []storage.ControlOperation{
 		storage.ControlOperationStop,
-		storage.ControlOperationRevert,
-		storage.ControlOperationSkipRevert,
 		// A pending row for a retired operation, written by a previous release;
 		// no driver services it, so the sweep is its only settlement path.
 		storage.ControlOperation("volume"),
@@ -253,6 +248,63 @@ func TestCompletePendingControlRequestsRefusesStop(t *testing.T) {
 	pending, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationStop)
 	require.NoError(t, err)
 	assert.NotNil(t, pending)
+}
+
+// A revert or skip-revert still pending when the apply settles can no longer
+// act, and the outcome the apply reached says whether it took effect. A revert
+// sent in the revert window whose immediate engine call failed stays pending;
+// if the window then expires and the apply completes, the change is permanent,
+// so the revert is answered as not applied rather than reported carried out.
+// Likewise a skip-revert outrun by a revert. Only the outcome each command asked
+// for completes it.
+func TestSettlePendingRequestsForTerminalApplySettlesRevertPhaseByOutcome(t *testing.T) {
+	cases := []struct {
+		name       string
+		operation  storage.ControlOperation
+		applyState string
+		wantStatus storage.ControlRequestStatus
+		wantError  string
+	}{
+		{name: "revert that reverted", operation: storage.ControlOperationRevert, applyState: state.Apply.Reverted,
+			wantStatus: storage.ControlRequestCompleted},
+		{name: "revert outrun by completion", operation: storage.ControlOperationRevert, applyState: state.Apply.Completed,
+			wantStatus: storage.ControlRequestFailed,
+			wantError:  "the schema change completed before the revert could take effect; the change is live on the target"},
+		{name: "revert outrun by failure", operation: storage.ControlOperationRevert, applyState: state.Apply.Failed,
+			wantStatus: storage.ControlRequestFailed,
+			wantError:  "the schema change reached Failed before the revert could take effect"},
+		{name: "skip-revert that completed", operation: storage.ControlOperationSkipRevert, applyState: state.Apply.Completed,
+			wantStatus: storage.ControlRequestCompleted},
+		{name: "skip-revert outrun by a revert", operation: storage.ControlOperationSkipRevert, applyState: state.Apply.Reverted,
+			wantStatus: storage.ControlRequestFailed,
+			wantError:  "the schema change reached Reverted before the skip-revert could take effect"},
+		{name: "skip-revert outrun by failure", operation: storage.ControlOperationSkipRevert, applyState: state.Apply.Failed,
+			wantStatus: storage.ControlRequestFailed,
+			wantError:  "the schema change reached Failed before the skip-revert could take effect"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			apply := &storage.Apply{
+				ID:              7,
+				ApplyIdentifier: "apply-terminal-revert-phase",
+				Database:        "testdb",
+				Environment:     "staging",
+				State:           tc.applyState,
+			}
+			controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{
+				{ApplyID: apply.ID, Operation: tc.operation, Status: storage.ControlRequestPending, RequestedBy: "cli:alice"},
+			}}
+			store := &mockStorage{controlRequests: controlRequests}
+
+			require.NoError(t, settlePendingRequestsForTerminalApply(t.Context(), store, discardLogger(), apply))
+
+			settled, err := controlRequests.GetByOperation(t.Context(), apply.ID, tc.operation)
+			require.NoError(t, err)
+			require.NotNil(t, settled)
+			assert.Equal(t, tc.wantStatus, settled.Status)
+			assert.Equal(t, tc.wantError, settled.ErrorMessage)
+		})
+	}
 }
 
 // A cancel that an apply outran never took effect, so the sweep resolves it as a
