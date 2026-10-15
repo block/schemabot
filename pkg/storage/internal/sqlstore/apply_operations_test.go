@@ -1976,6 +1976,10 @@ func TestApplyOperationStore_FindNextApplyOperation_ClaimsFailedRetryableWithinB
 		ApplyID: apply.ID, Deployment: "region-a", State: state.ApplyOperation.FailedRetryable,
 	})
 	require.NoError(t, err)
+	// A lone operation with tasks is driven under the parent lease, whose
+	// ClaimApplyByID moves the parent and the row out of failed_retryable.
+	task := createRetryableReapTask(t, store, apply, "task_op_retryable_ok", "users", state.Task.FailedRetryable, "copy failed")
+	attachTaskToOperation(t, task.TaskIdentifier, id)
 
 	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
 	require.NoError(t, err)
@@ -2031,10 +2035,10 @@ func TestApplyOperationStore_FindNextApplyOperation_MultiOpRedispatchConsumesPar
 }
 
 // TestApplyOperationStore_FindNextApplyOperation_SingleOpRedispatchDoesNotConsumeParentBudget
-// verifies OC-5 Part B2's guard: a single-operation apply's parent attempt is
-// incremented by the ClaimApplyByID its drive performs, so the operation claim
-// must NOT also bump it — doing so would double-count the budget. The
-// EXISTS-sibling guard keeps the redispatch charge to multi-op applies only.
+// verifies OC-5 Part B2's guard: a single-operation apply with tasks is driven
+// under the parent lease, whose ClaimApplyByID increments the parent attempt,
+// so the operation claim must NOT also bump it — doing so would double-count
+// the budget.
 func TestApplyOperationStore_FindNextApplyOperation_SingleOpRedispatchDoesNotConsumeParentBudget(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
@@ -2051,16 +2055,129 @@ func TestApplyOperationStore_FindNextApplyOperation_SingleOpRedispatchDoesNotCon
 		ApplyID: apply.ID, Deployment: "region-a", State: state.ApplyOperation.FailedRetryable,
 	})
 	require.NoError(t, err)
+	task := createRetryableReapTask(t, store, apply, "task_op_singleop_budget", "users", state.Task.FailedRetryable, "copy failed")
+	attachTaskToOperation(t, task.TaskIdentifier, id)
 
 	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
 	require.NoError(t, err)
 	require.NotNil(t, claimed)
 	assert.Equal(t, id, claimed.ID)
+	assert.Equal(t, state.ApplyOperation.FailedRetryable, claimed.State, "the parent claim, not the operation claim, moves a parent-lease retry")
 
 	persistedApply, err := store.Applies().Get(ctx, apply.ID)
 	require.NoError(t, err)
 	require.NotNil(t, persistedApply)
 	assert.Equal(t, maxRecoveryAttempts-1, persistedApply.Attempt, "a single-op apply's retry budget is charged by ClaimApplyByID, not by the operation claim")
+}
+
+// A lone attached operation is still driven under the operation lease when its
+// generation manifest expects another operation that has not attached, or when
+// it has no tasks to drive a parent claim from. The parent stays owned by the
+// rollout projection in both cases, so its redispatch claim charges the parent
+// budget and moves the row to running exactly as a multi-operation one does.
+// Left failed_retryable, the row would be re-leased on every poll and the
+// budget would never advance, so the retry would never expire.
+func TestApplyOperationStore_FindNextApplyOperation_OperationLeaseRedispatchOfALoneOperation(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		manifest []string
+		withTask bool
+	}{
+		{name: "manifest expects an unattached operation", manifest: []string{"target-001", "target-002"}, withTask: true},
+		{name: "operation has no tasks"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			clearTables(t)
+			ctx := t.Context()
+			store := NewMySQL(testDB)
+
+			lock := createTestLock(t, store, "testdb", "mysql")
+			apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_op_lone_lease", 1, state.Apply.FailedRetryable, "staging")
+			var manifest any
+			if tc.manifest != nil {
+				encoded, err := json.Marshal(tc.manifest)
+				require.NoError(t, err)
+				manifest = string(encoded)
+			}
+			_, err := testDB.ExecContext(ctx, `
+				UPDATE applies SET attempt = ?, expected_operation_keys = ?, updated_at = NOW() WHERE id = ?
+			`, maxRecoveryAttempts-1, manifest, apply.ID)
+			require.NoError(t, err)
+
+			id, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+				ApplyID: apply.ID, Deployment: "region-a", OperationKey: "target-002", Target: "target-002",
+				State: state.ApplyOperation.FailedRetryable, ErrorMessage: "dispatch failed",
+			})
+			require.NoError(t, err)
+			if tc.withTask {
+				task := createRetryableReapTask(t, store, apply, "task_op_lone_lease", "users", state.Task.FailedRetryable, "copy failed")
+				attachTaskToOperation(t, task.TaskIdentifier, id)
+			}
+
+			claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-a")
+			require.NoError(t, err)
+			require.NotNil(t, claimed)
+			assert.Equal(t, id, claimed.ID)
+			assert.Equal(t, state.ApplyOperation.Running, claimed.State)
+
+			persisted, err := store.ApplyOperations().Get(ctx, id)
+			require.NoError(t, err)
+			require.NotNil(t, persisted)
+			assert.Equal(t, state.ApplyOperation.Running, persisted.State)
+			assert.Empty(t, persisted.ErrorMessage)
+
+			persistedApply, err := store.Applies().Get(ctx, apply.ID)
+			require.NoError(t, err)
+			require.NotNil(t, persistedApply)
+			assert.Equal(t, maxRecoveryAttempts, persistedApply.Attempt, "an operation-lease redispatch consumes one unit of the parent retry budget")
+
+			again, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-b")
+			require.NoError(t, err)
+			assert.Nil(t, again, "the claim never re-leases the row driver-a is resuming")
+		})
+	}
+}
+
+// An outage leaves more of a rollout's targets failed_retryable than the
+// apply's driver cap. The retry sweep redispatches only the cap's worth at
+// once; the rest wait for a slot instead of each taking a driver.
+func TestApplyOperationStore_FindNextApplyOperation_RedispatchHonorsTheDriverCap(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql")
+	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_op_redispatch_cap", 1, state.Apply.FailedRetryable, "staging")
+	targets := storage.DefaultMaxDriversPerApply + 1
+	for i := range targets {
+		key := fmt.Sprintf("orders-%03d/schema", i+1)
+		_, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+			ApplyID: apply.ID, Deployment: "region-a", OperationKey: key, Target: key,
+			State: state.ApplyOperation.FailedRetryable, ErrorMessage: "progress poll failed",
+		})
+		require.NoError(t, err)
+	}
+
+	claimed := 0
+	for i := range targets {
+		op, err := store.ApplyOperations().FindNextApplyOperation(ctx, fmt.Sprintf("driver-%d", i))
+		require.NoError(t, err)
+		if op == nil {
+			break
+		}
+		claimed++
+	}
+	assert.Equal(t, storage.DefaultMaxDriversPerApply, claimed, "a retry sweep occupies exactly the cap's worth of drivers")
+
+	ops, err := store.ApplyOperations().ListByApply(ctx, apply.ID)
+	require.NoError(t, err)
+	waiting := 0
+	for _, op := range ops {
+		if op.State == state.ApplyOperation.FailedRetryable {
+			waiting++
+		}
+	}
+	assert.Equal(t, targets-storage.DefaultMaxDriversPerApply, waiting, "the rest stay failed_retryable for a later slot")
 }
 
 // TestApplyOperationStore_FindNextApplyOperation_RedispatchAdvancesOperationAttempt
@@ -2989,10 +3106,10 @@ func TestApplyOperationStore_FindNextApplyOperation_CapsDeferredDeploy(t *testin
 }
 
 // TestApplyOperationStore_FindNextApplyOperation_CountsRetryingSiblings verifies
-// that operations being retried count against the cap. A redispatched operation
-// keeps its failed_retryable state for the whole drive, so a driver is occupying
-// it the entire time — leaving it out of the count would let a retry sweep run
-// an apply at twice its configured cap.
+// that failed_retryable operations a driver holds count against the cap. A
+// crash-recovery re-lease leaves the row failed_retryable for its whole drive,
+// so a driver is occupying it the entire time — leaving it out of the count
+// would let a retry sweep run an apply at twice its configured cap.
 func TestApplyOperationStore_FindNextApplyOperation_CountsRetryingSiblings(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()

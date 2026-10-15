@@ -2561,7 +2561,44 @@ func (c *GRPCClient) ResumeApplyOperation(ctx context.Context, apply *storage.Ap
 		scope.tasklessOperation = true
 		return c.dispatchRemoteVSchemaOnly(ctx, apply, scope, plan, plan.VSchemaNamespaces(), tasklessWorkDispatchKind)
 	}
+	c.seedOperationDriveStateFromOperation(ctx, apply, scope)
 	return c.resumeApply(ctx, apply, scope)
+}
+
+// seedOperationDriveStateFromOperation replaces a failed_retryable parent
+// snapshot with the claimed operation's own active state before an
+// operation-scoped drive reasons with it. The parent of a multi-operation apply
+// is the rollout projection, so it reads failed_retryable while any sibling, or
+// this operation before its redispatch claim, is paused for a retry. The drive
+// never writes that parent, but it does compare remote progress against the
+// in-memory state, and the no-backward rule holds a stored failed_retryable
+// against any active report: left in place, the drive would never see its own
+// operation reach the cutover barrier, never park, and hold the lease forever.
+func (c *GRPCClient) seedOperationDriveStateFromOperation(ctx context.Context, apply *storage.Apply, scope applyTaskScope) {
+	if !scope.usesOperationRemoteResume() {
+		return
+	}
+	if !state.IsState(apply.State, state.Apply.FailedRetryable) {
+		return
+	}
+	if !operationIsUnderActiveDrive(scope.operation.State) {
+		c.applyLogger(apply).DebugContext(ctx, "operation drive keeps the failed_retryable parent snapshot because its operation is not in an active state",
+			append(apply.MutableLogAttrs(), "apply_operation_id", scope.operation.ID, "operation_state", scope.operation.State)...)
+		return
+	}
+	c.applyLogger(apply).InfoContext(ctx, "operation drive reasons from its operation's state, not the failed_retryable rollout parent",
+		append(apply.MutableLogAttrs(), "apply_operation_id", scope.operation.ID, "operation_state", scope.operation.State)...)
+	apply.State = scope.operation.State
+}
+
+// operationIsUnderActiveDrive reports whether an operation's state is one a
+// live drive moves forward: started, not resting for a retry or a stop, and
+// not settled.
+func operationIsUnderActiveDrive(operationState string) bool {
+	if state.IsTerminalApplyState(operationState) {
+		return false
+	}
+	return !state.IsState(operationState, state.Apply.Pending, state.Apply.FailedRetryable, state.Apply.Stopped)
 }
 
 // The two task-less operation shapes a remote drive dispatches as a VSchema-only

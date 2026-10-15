@@ -2287,6 +2287,75 @@ func TestGRPCClient_ResumeApplyOperationDispatchParksBarrierCutoverRemotely(t *t
 		"the automatic barrier decision must not be persisted onto the shared apply options")
 }
 
+// After a data-plane outage, a rollout's parent reads failed_retryable while a
+// sibling target waits for its own retry. This target was already copying when
+// the outage hit, and its redispatch claim moved it back to running. When the
+// data plane reports it parked at the cutover barrier, the drive parks and
+// returns, freeing the target for the cutover claim. It does not keep polling
+// a parked target because the rollout parent reads failed_retryable.
+func TestGRPCClient_ResumeApplyOperationParksRedispatchedOperationUnderRetryableParent(t *testing.T) {
+	server := &capturingTernServer{
+		progressState:    ternv1.State_STATE_WAITING_FOR_CUTOVER,
+		progressStateSet: true,
+		progressTables: []*ternv1.TableProgress{{
+			Namespace:       "default",
+			TableName:       "users",
+			Status:          state.Task.WaitingForCutover,
+			PercentComplete: 100,
+		}},
+	}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+
+	apply := &storage.Apply{
+		ID:              7,
+		ApplyIdentifier: "apply-retryable-parent",
+		PlanID:          99,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+		State:           state.Apply.FailedRetryable,
+	}
+	apply.SetOptions(storage.ApplyOptions{Target: "testdb-target"})
+	operationID := int64(42)
+	siblingID := int64(43)
+	task := &storage.Task{
+		ID:               11,
+		TaskIdentifier:   "task-users",
+		ApplyID:          apply.ID,
+		ApplyOperationID: &operationID,
+		TableName:        "users",
+		DDL:              "ALTER TABLE users ADD COLUMN email varchar(255)",
+		DDLAction:        "alter",
+		Namespace:        "default",
+		State:            state.Task.Running,
+	}
+	applyStore := &mockApplyStore{apply: apply}
+	client.storage = &mockStorage{
+		applies: applyStore,
+		tasks: &mockTaskStore{
+			tasks:           []*storage.Task{task},
+			getByApplyIDErr: errors.New("whole-apply task load must not be used for operation-scoped resume"),
+		},
+		plans: &mockPlanStore{plan: &storage.Plan{ID: apply.PlanID, PlanIdentifier: "plan-retryable-parent"}},
+		operations: &mockApplyOperationStore{ops: map[int64]*storage.ApplyOperation{
+			operationID: {ID: operationID, ApplyID: apply.ID, Deployment: "west", State: state.ApplyOperation.Running,
+				CutoverPolicy: storage.CutoverPolicyBarrier, EngineResumeContext: "remote-op-west-1"},
+			siblingID: {ID: siblingID, ApplyID: apply.ID, Deployment: "east", State: state.ApplyOperation.FailedRetryable,
+				CutoverPolicy: storage.CutoverPolicyBarrier},
+		}},
+		logs: &mockApplyLogStore{},
+	}
+
+	// A generous deadline: the drive must return promptly at the barrier, not
+	// run until the deadline.
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	require.NoError(t, client.ResumeApplyOperation(ctx, apply, operationID))
+	assert.Equal(t, state.Task.WaitingForCutover, task.State, "the target's task records the barrier")
+	assert.Empty(t, applyStore.updates, "the rollout parent is owned by the projection, so the drive never writes it")
+}
+
 func TestGRPCClient_ResumeApplyOperationDispatchDoesNotDeferRollingCutover(t *testing.T) {
 	// A multi-deployment apply under the default rolling policy serializes copy
 	// and cutover per deployment, so its copy drive must NOT defer cutover — the
