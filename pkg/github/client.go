@@ -1382,7 +1382,8 @@ func (c *schemaChangeComparer) compare(ctx context.Context, paths []string) (str
 // approved commit and the head still generates the same schema change
 // statements (see PRSchemaChangeUnchangedSince). Anything short of proof
 // returns false, so any doubt counts as a change; an error means GitHub could
-// not serve the file's content.
+// not serve the file's content, or the evaluation was cancelled while the
+// dialect compared the file.
 func (c *schemaChangeComparer) sameStatements(ctx context.Context, item schemaChangeItem) (bool, error) {
 	logAttrs := []any{"repo", c.repo, "path", item.path,
 		"approved_sha", c.commits[sideApproved], "head_sha", c.commits[sideHead]}
@@ -1418,6 +1419,13 @@ func (c *schemaChangeComparer) sameStatements(ctx context.Context, item schemaCh
 	}
 	same, reason, err := c.compareStatements(ctx, contents[sideApprovedBase], contents[sideApproved], contents[sideHeadBase], contents[sideHead])
 	if err != nil {
+		// A comparison cut short by the evaluation's own cancellation proves
+		// nothing about the file, so the evaluation fails instead of
+		// recording the file as changed.
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return false, fmt.Errorf("compare statements of schema file %s in repo %s: evaluation cancelled: %w",
+				item.path, c.repo, errors.Join(ctxErr, err))
+		}
 		c.ic.logger.Info("review gate comparison: cannot compare a schema file's statements, so it counts as changed",
 			append(logAttrs, "error", err)...)
 		return false, nil

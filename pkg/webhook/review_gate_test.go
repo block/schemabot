@@ -321,6 +321,9 @@ func TestCheckReviewGate_ApprovalCoverage(t *testing.T) {
 		// postgresTarget answers the PostgreSQL schema file comparison on the
 		// environment's target; nil leaves the environment with no target.
 		postgresTarget *schemaFileCompareTernClient
+		// cancelDuringCompare cancels the evaluation while the target
+		// compares the file.
+		cancelDuringCompare bool
 		// approvedUnknown leaves the approved commit unknown to GitHub.
 		approvedUnknown bool
 		// headFileStatus makes GitHub answer the read of the head's orders
@@ -582,6 +585,16 @@ func TestCheckReviewGate_ApprovalCoverage(t *testing.T) {
 			headChange:     setPostgresOrders("id bigint NOT NULL PRIMARY KEY, total bigint, note text"),
 			postgresTarget: &schemaFileCompareTernClient{err: errors.New("connection refused")},
 			want:           wantChanged,
+		},
+		{
+			name:                "a PostgreSQL comparison cut short by the evaluation's cancellation is a retryable evaluation failure",
+			databaseType:        "postgres",
+			prChange:            setPostgresOrders("id bigint NOT NULL PRIMARY KEY, note text"),
+			baseChange:          setPostgresOrders("id bigint NOT NULL PRIMARY KEY, total bigint"),
+			headChange:          setPostgresOrders("id bigint NOT NULL PRIMARY KEY, total bigint, note text"),
+			postgresTarget:      &schemaFileCompareTernClient{resp: &ternv1.CompareSchemaFileChangeResponse{Same: true}},
+			cancelDuringCompare: true,
+			wantErr:             context.Canceled,
 		},
 		{
 			name:           "a rebase that combined the PR's column with the default branch's in a PostgreSQL schema file does not count when the target cannot run the comparison",
@@ -847,7 +860,12 @@ func TestCheckReviewGate_ApprovalCoverage(t *testing.T) {
 			schema.SchemaLinkPath = tt.schemaLinkPath
 			schema.Type = cmp.Or(tt.databaseType, schema.Type)
 			schema.ConfigPath = cmp.Or(tt.configPath, "schema/testdb/schemabot.yaml")
-			result, err := h.checkReviewGate(t.Context(), client, "octocat/hello-world", 1, "staging", schema)
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			if tt.cancelDuringCompare {
+				tt.postgresTarget.onCompare = cancel
+			}
+			result, err := h.checkReviewGate(ctx, client, "octocat/hello-world", 1, "staging", schema)
 			if tt.wantErr != nil {
 				require.ErrorIs(t, err, tt.wantErr)
 				assert.Nil(t, result)
@@ -904,14 +922,29 @@ type schemaFileCompareTernClient struct {
 	tern.Client
 	resp *ternv1.CompareSchemaFileChangeResponse
 	err  error
+	// onCompare, when set, runs before the answer, standing in for whatever
+	// happens while the target works (the evaluation being cancelled).
+	onCompare func()
+	// hang makes the target answer only when the comparison's context ends.
+	hang bool
 	mu   sync.Mutex
 	reqs []*ternv1.CompareSchemaFileChangeRequest
 }
 
-func (c *schemaFileCompareTernClient) CompareSchemaFileChange(_ context.Context, req *ternv1.CompareSchemaFileChangeRequest) (*ternv1.CompareSchemaFileChangeResponse, error) {
+func (c *schemaFileCompareTernClient) CompareSchemaFileChange(ctx context.Context, req *ternv1.CompareSchemaFileChangeRequest) (*ternv1.CompareSchemaFileChangeResponse, error) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	c.reqs = append(c.reqs, req)
+	c.mu.Unlock()
+	if c.onCompare != nil {
+		c.onCompare()
+	}
+	if c.hang {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if c.err != nil {
 		return nil, c.err
 	}
@@ -2056,5 +2089,62 @@ func TestEnforceReviewGate(t *testing.T) {
 		require.NoError(t, err)
 		assert.False(t, blocked)
 		assert.Empty(t, comments, "an approved review must not draw a gate comment")
+	})
+}
+
+// One review gate evaluation spends a bounded time comparing PostgreSQL
+// schema files on the target, however many files and approvals it checks:
+// once a slow target uses up the budget, the remaining files count as
+// changed without asking it again. A file that two approvals share is
+// compared on the target once.
+func TestTargetStatementComparer(t *testing.T) {
+	newComparer := func(t *testing.T, target *schemaFileCompareTernClient, budget time.Duration) *targetStatementComparer {
+		t.Helper()
+		cfg := reviewGateTestConfig(func(cfg *api.ServerConfig) {
+			db := cfg.Databases["orders"]
+			db.Type = storage.DatabaseTypePostgres
+			cfg.Databases["orders"] = db
+		})
+		h, _ := setupReviewGateHandler(t, cfg)
+		h.service = api.New(&emptyStorage{}, cfg, map[string]tern.Client{"orders/staging": target}, h.logger)
+		c := h.newTargetStatementComparer("octocat/hello-world", 1, "orders", "staging")
+		c.budget = budget
+		return c
+	}
+
+	t.Run("a slow target spends the budget and the rest count as changed", func(t *testing.T) {
+		target := &schemaFileCompareTernClient{hang: true}
+		c := newComparer(t, target, 50*time.Millisecond)
+
+		same, _, err := c.compare(t.Context(), "orders base", "orders", "orders head base", "orders head")
+		require.ErrorIs(t, err, context.DeadlineExceeded)
+		assert.False(t, same)
+
+		same, _, err = c.compare(t.Context(), "items base", "items", "items head base", "items head")
+		require.ErrorIs(t, err, errTargetComparisonBudgetSpent)
+		assert.False(t, same)
+		assert.Len(t, target.requests(), 1, "a file past the budget is never sent to the target")
+	})
+
+	t.Run("a file two approvals share is compared once", func(t *testing.T) {
+		target := &schemaFileCompareTernClient{resp: &ternv1.CompareSchemaFileChangeResponse{Reason: "the head declares column note differently from the approved commit"}}
+		c := newComparer(t, target, time.Minute)
+		for range 2 {
+			same, reason, err := c.compare(t.Context(), "orders base", "orders", "orders head base", "orders head")
+			require.NoError(t, err)
+			assert.False(t, same)
+			assert.Equal(t, "the head declares column note differently from the approved commit", reason)
+		}
+		assert.Len(t, target.requests(), 1)
+	})
+
+	t.Run("a failed comparison is asked again", func(t *testing.T) {
+		target := &schemaFileCompareTernClient{err: errors.New("connection refused")}
+		c := newComparer(t, target, time.Minute)
+		for range 2 {
+			_, _, err := c.compare(t.Context(), "orders base", "orders", "orders head base", "orders head")
+			require.ErrorContains(t, err, "connection refused")
+		}
+		assert.Len(t, target.requests(), 2, "only an answer is remembered")
 	})
 }

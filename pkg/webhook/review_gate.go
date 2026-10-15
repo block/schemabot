@@ -299,8 +299,8 @@ type approvalCoverage struct {
 // MySQL-family files hold one CREATE TABLE each, which ddl.SameTableChange
 // compares from the files alone. PostgreSQL has no offline model of a schema
 // file, so the environment's primary target runs each version on a scratch
-// schema and compares what it built; a target that cannot answer leaves the
-// file changed.
+// schema and compares what it built (see targetStatementComparer); a target
+// that cannot answer within the evaluation's budget leaves the file changed.
 func (h *Handler) statementComparerFor(repo string, pr int, database, environment, databaseType string) ghclient.SchemaFileChangeComparer {
 	switch schemadialect.DialectForDatabaseType(databaseType) {
 	case schemadialect.DialectMySQL:
@@ -313,9 +313,7 @@ func (h *Handler) statementComparerFor(repo string, pr int, database, environmen
 				"repo", repo, "pr", pr, "database", database, "environment", environment)
 			return nil
 		}
-		return func(ctx context.Context, approvedBase, approved, headBase, head string) (bool, string, error) {
-			return h.service.CompareSchemaFileChange(ctx, database, environment, approvedBase, approved, headBase, head)
-		}
+		return h.newTargetStatementComparer(repo, pr, database, environment).compare
 	default:
 		return nil
 	}
