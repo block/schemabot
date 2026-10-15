@@ -7,18 +7,14 @@ import (
 	"log/slog"
 	"strings"
 
-	"github.com/block/pg-sprite/pkg/dbconn"
 	"github.com/block/pg-sprite/pkg/schemadiff"
 	spirittable "github.com/block/spirit/pkg/table"
-	"github.com/block/spirit/pkg/utils"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"golang.org/x/sync/errgroup"
 
 	"github.com/block/schemabot/pkg/engine"
-	"github.com/block/schemabot/pkg/postgresconn"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/schema"
-	"github.com/block/schemabot/pkg/targetauth"
 )
 
 // The pull's catalog reads carry the same pg_catalog qualification as
@@ -68,35 +64,11 @@ func (e *Engine) PullSchema(ctx context.Context, req *ternv1.PullSchemaRequest) 
 	if e.pullCredentials == nil || e.pullCredentials.DSN == "" {
 		return nil, fmt.Errorf("pull PostgreSQL database %q: DSN credentials are required", e.pullDatabase)
 	}
-	caPath, err := caCertPath(e.pullCredentials)
+	pool, closePool, err := openTargetPool(ctx, e.pullDatabase, e.pullCredentials, "schema pull")
 	if err != nil {
 		return nil, fmt.Errorf("pull PostgreSQL database %q: %w", e.pullDatabase, err)
 	}
-	validationOpts, err := validationRootCAs(caPath)
-	if err != nil {
-		return nil, fmt.Errorf("pull PostgreSQL database %q: %w", e.pullDatabase, err)
-	}
-	// Validate the SchemaBot-managed connection path, including its transport
-	// policy, before adapting the same normalized DSN to pg-sprite's pool API.
-	db, err := postgresconn.Open(e.pullCredentials.DSN, validationOpts...)
-	if err != nil {
-		return nil, fmt.Errorf("open PostgreSQL database %q for schema pull: %w", e.pullDatabase, err)
-	}
-	defer utils.CloseAndLog(db)
-	// Open only parsed the DSN; this ping is the first dial, so it is where the
-	// target can refuse the session and the only error worth classifying.
-	if err := db.PingContext(ctx); err != nil {
-		return nil, fmt.Errorf("ping PostgreSQL database %q for schema pull: %w", e.pullDatabase, targetauth.Wrap(err))
-	}
-	poolCfg, err := spritePoolConfig(e.pullCredentials.DSN, caPath)
-	if err != nil {
-		return nil, fmt.Errorf("pull PostgreSQL database %q: %w", e.pullDatabase, err)
-	}
-	pool, err := dbconn.NewPool(ctx, poolCfg)
-	if err != nil {
-		return nil, fmt.Errorf("open pg-sprite pool for PostgreSQL database %q schema pull: %w", e.pullDatabase, err)
-	}
-	defer pool.Close()
+	defer closePool()
 
 	namespaces, err := pullNamespaces(ctx, pool, req.GetNamespace())
 	if err != nil {
