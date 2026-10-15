@@ -767,6 +767,13 @@ func TestApplies(t *testing.T, h Harness) {
 		rollout := CreateApplyWithStateEnvDeployment(t, store, lock, "apply_rollout_retrying", 9320, state.Apply.Pending, "production", "region-a")
 		operationID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{ApplyID: rollout.ID, Deployment: "region-a", OperationKey: "schema", State: state.ApplyOperation.FailedRetryable})
 		require.NoError(t, err)
+		// A lone operation with tasks is driven under the parent lease, the
+		// shape whose retry leaves the row failed_retryable.
+		task := newTask(rollout, "task_rollout_retrying", "users", time.Now())
+		task.State = state.Task.FailedRetryable
+		task.ApplyOperationID = &operationID
+		_, err = store.Tasks().Create(ctx, task)
+		require.NoError(t, err)
 		rollout.State = state.Apply.FailedRetryable
 		require.NoError(t, store.Applies().Update(ctx, rollout))
 
@@ -838,6 +845,36 @@ func TestApplies(t *testing.T, h Harness) {
 		none, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-c")
 		require.NoError(t, err)
 		assert.Nil(t, none, "both targets are being resumed, so there is nothing left to claim")
+	})
+
+	// A deployment-keyed generation declared two targets and only target-002
+	// attached before the data plane failed. The operator drives that lone row
+	// under its operation lease because the manifest still expects target-001,
+	// so the redispatch claim charges the parent's retry budget and moves the
+	// row to running, the same as when a sibling has attached.
+	t.Run("FindNextApplyOperation_ManifestExpectedRedispatchMovesTheRowToRunning", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "apply_manifest_redispatch_db", storage.DatabaseTypeMySQL)
+		rollout := createManifestGeneration(t, store, lock, "apply_manifest_redispatch", 9333,
+			[]string{"target-001", "target-002"}, state.ApplyOperation.FailedRetryable, state.Task.FailedRetryable)
+		rollout.State = state.Apply.FailedRetryable
+		require.NoError(t, store.Applies().Update(ctx, rollout))
+
+		claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-a")
+		require.NoError(t, err)
+		require.NotNil(t, claimed, "a failed_retryable operation under a retryable parent must be claimable")
+		assert.Equal(t, "target-002", claimed.OperationKey)
+		assert.Equal(t, state.ApplyOperation.Running, claimed.State, "the redispatch claim returns the row it moved")
+
+		parent, err := store.Applies().Get(ctx, rollout.ID)
+		require.NoError(t, err)
+		require.NotNil(t, parent)
+		assert.Equal(t, 1, parent.Attempt, "the redispatch consumes one unit of the parent retry budget")
+
+		again, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-b")
+		require.NoError(t, err)
+		assert.Nil(t, again, "the claim never re-leases the row driver-a is resuming")
 	})
 
 	// Moving an existing apply back into an active state runs the same check as
