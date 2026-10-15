@@ -1405,14 +1405,18 @@ func createShapeRefusalReason(cause executor.CreateShapeCause, table string) (st
 // reviewed, but the engine does not run it, so the operator runs it
 // themselves. A blocked step blocks the whole plan, so an added foreign key
 // whose column the same plan adds cannot be run on its own: the remedy has
-// the rest of the plan applied first, without the foreign key.
+// the rest of the plan applied first, without the foreign key. A dropped
+// foreign key is usually one the file left out rather than one the operator
+// means to remove, so its remedy offers declaring it first, which plans no
+// change and keeps the constraint; one into another namespace cannot be
+// declared, so for that one removal is the only way forward.
 func foreignKeyChangeRefusalReason(kind schemadiff.ChangeKind, table string) string {
 	const unsupported = "which SchemaBot plans but does not apply on PostgreSQL yet"
 	switch kind {
 	case schemadiff.ChangeAddForeignKey:
 		return fmt.Sprintf("statement for table %q adds a foreign key, %s; leave the foreign key out of the schema file to apply the rest of the plan, then run this statement outside SchemaBot and add the foreign key back to the file", table, unsupported)
 	case schemadiff.ChangeDropForeignKey:
-		return fmt.Sprintf("statement for table %q drops a foreign key, %s; run this statement outside SchemaBot, then re-plan", table, unsupported)
+		return fmt.Sprintf("statement for table %q drops a foreign key, %s; to keep the foreign key, declare it in the schema file and re-plan; to remove it, run this statement outside SchemaBot, then re-plan; a foreign key that references another namespace cannot be declared, so the plan stays blocked until it is removed through a separately reviewed process", table, unsupported)
 	}
 	return fmt.Sprintf("statement for table %q changes a foreign key, %s; leave the change out of the schema file to apply the rest of the plan, then run this statement outside SchemaBot and put the change back in the file", table, unsupported)
 }

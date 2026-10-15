@@ -5,6 +5,7 @@ package postgres
 import (
 	"testing"
 
+	"github.com/block/pg-sprite/pkg/schemadiff"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -73,10 +74,38 @@ func TestEnginePlanForeignKeys(t *testing.T) {
 	dropFK, ok := byDDL["ALTER TABLE public.payments DROP CONSTRAINT payments_order_id_fkey"]
 	require.True(t, ok, "the undeclared live foreign key is planned as a drop")
 	assert.Equal(t, engine.ExecutionModeBlocked, dropFK.ExecutionMode)
-	assert.Contains(t, dropFK.ModeReason, `statement for table "payments" drops a foreign key, which SchemaBot plans but does not apply on PostgreSQL yet`)
+	assert.Contains(t, dropFK.ModeReason, `statement for table "payments" drops a foreign key, which SchemaBot plans but does not apply on PostgreSQL yet; to keep the foreign key, declare it in the schema file and re-plan`)
 
 	create, ok := byDDL["CREATE TABLE public.shipments (id bigint PRIMARY KEY, order_id bigint NOT NULL REFERENCES orders (id))"]
 	require.True(t, ok, "the new table is planned")
 	assert.Equal(t, engine.ExecutionModeBlocked, create.ExecutionMode)
 	assert.Contains(t, create.ModeReason, `statement for table "shipments" declares a foreign key, which SchemaBot plans but does not apply on PostgreSQL yet`)
+}
+
+// A schema file whose foreign key references a table that does not exist on
+// the target fails the plan, even when another file in the same plan creates
+// that table, because the planner binds each foreign key to the live
+// referenced table's shape. The error names the fix: apply the referenced
+// table first, then add the foreign key.
+func TestEnginePlanForeignKeyToMissingTable(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "plan_foreign_key_missing_test")
+	_, err := db.ExecContext(t.Context(), `CREATE TABLE public.orders (id bigint PRIMARY KEY, customer_id bigint NOT NULL)`)
+	require.NoError(t, err)
+	req := &engine.PlanRequest{
+		Database: "plan_foreign_key_missing_test",
+		SchemaFiles: schema.SchemaFiles{
+			"public": {Files: map[string]string{
+				"customers.sql": "CREATE TABLE customers (id bigint PRIMARY KEY)",
+				"orders.sql":    "CREATE TABLE orders (id bigint PRIMARY KEY, customer_id bigint NOT NULL REFERENCES customers (id))",
+			}},
+		},
+		Credentials: &engine.Credentials{DSN: dsn},
+	}
+
+	_, err = New().Plan(t.Context(), req)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, schemadiff.ErrReferencedTableNotFound)
+	assert.Contains(t, err.Error(), `plan PostgreSQL schema in "public"/"orders.sql"`)
+	assert.Contains(t, err.Error(), "public.customers")
+	assert.Contains(t, err.Error(), "a foreign key can reference only a table that already exists on the target, so apply the referenced table first, then add the foreign key")
 }

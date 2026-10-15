@@ -216,13 +216,15 @@ func TestExecutionVerdictEmptyCreateShapeCause(t *testing.T) {
 // whether the statement adds or drops the foreign key, and nothing is
 // reported as unrecognized vocabulary. An added foreign key's remedy applies
 // the rest of the plan first, since its column may be one the same plan adds.
+// A dropped foreign key's remedy offers declaring it before removing it, so
+// an operator whose file left it out keeps the constraint.
 func TestExecutionVerdictForeignKeyChange(t *testing.T) {
 	for _, tt := range []struct {
 		kind schemadiff.ChangeKind
 		want string
 	}{
 		{schemadiff.ChangeAddForeignKey, `statement for table "users" adds a foreign key, which SchemaBot plans but does not apply on PostgreSQL yet; leave the foreign key out of the schema file to apply the rest of the plan, then run this statement outside SchemaBot and add the foreign key back to the file`},
-		{schemadiff.ChangeDropForeignKey, `statement for table "users" drops a foreign key, which SchemaBot plans but does not apply on PostgreSQL yet; run this statement outside SchemaBot, then re-plan`},
+		{schemadiff.ChangeDropForeignKey, `statement for table "users" drops a foreign key, which SchemaBot plans but does not apply on PostgreSQL yet; to keep the foreign key, declare it in the schema file and re-plan; to remove it, run this statement outside SchemaBot, then re-plan; a foreign key that references another namespace cannot be declared, so the plan stays blocked until it is removed through a separately reviewed process`},
 	} {
 		t.Run(string(tt.kind), func(t *testing.T) {
 			assert.Equal(t, stepVerdict{mode: engine.ExecutionModeBlocked, reason: tt.want},
@@ -231,6 +233,28 @@ func TestExecutionVerdictForeignKeyChange(t *testing.T) {
 					Disposition: router.DispositionRefuse,
 					Reason:      verdict.ReasonDeclarativeForeignKey,
 				}, "users"))
+		})
+	}
+}
+
+// A foreign key the planner cannot bind fails the plan with the fix appended:
+// the referenced table must already exist on the target, and the planning
+// role must be able to read it. The remedy matches through wrapping, and any
+// other failure gets none.
+func TestReferencedTableRemedy(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		err  error
+		want string
+	}{
+		{"not found", fmt.Errorf("plan: %w: public.customers", schemadiff.ErrReferencedTableNotFound),
+			"; a foreign key can reference only a table that already exists on the target, so apply the referenced table first, then add the foreign key"},
+		{"not readable", fmt.Errorf("plan: %w: public.customers", schemadiff.ErrReferencedTableNotReadable),
+			"; grant the planning role SELECT on the referenced table, then re-plan"},
+		{"other failure", errors.New("connection reset"), ""},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, referencedTableRemedy(tt.err))
 		})
 	}
 }

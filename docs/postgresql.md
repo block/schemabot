@@ -455,14 +455,19 @@ a reviewed drop before the rest can be pulled. `CREATE UNLOGGED TABLE`,
 accepted in a hand-written file.
 
 Foreign keys are planned but not applied. A file may declare a foreign key
-whose referenced table is unqualified and exists in the same namespace. A
+whose referenced table is unqualified and already exists on the target in the
+same namespace; a file that creates the referenced table in the same plan does
+not count, so apply the referenced table first, then add the foreign key. A
 declared foreign key that matches the live one plans no change. One the file
 adds plans as an `ADD CONSTRAINT` that names the referenced table with its
 namespace, and a live one the file omits plans as a destructive
 `DROP CONSTRAINT`; both are shown for review and blocked, because SchemaBot
 does not apply foreign-key changes on PostgreSQL yet. A blocked step blocks the
-whole plan, so a dropped foreign key is run outside SchemaBot and then
-re-planned. An added one may sit on a column the same plan adds, so leave it out
+whole plan. A dropped foreign key is usually one the file left out: declare
+it in the file to keep it, which plans no change, or run the `DROP CONSTRAINT`
+outside SchemaBot and re-plan to remove it. A foreign key into another
+namespace cannot be declared, so a table that carries one stays blocked until
+that foreign key is removed. An added one may sit on a column the same plan adds, so leave it out
 of the file to apply the rest of the plan first, then run the `ADD CONSTRAINT`
 outside SchemaBot and add the foreign key back to the file. A new table that
 declares a foreign key is blocked as a whole: leave the foreign key out of the
@@ -761,7 +766,9 @@ schema inside a transaction it then rolls back, so the planning role also
 needs `CREATE` on the target database, and the connection must be read-write
 rather than a hot standby. Nothing persists — the transaction is rolled back —
 but a role provisioned with only the apply-time privileges fails at plan time
-with a permission error on the database.
+with a permission error on the database. A schema file that declares a foreign
+key also needs `SELECT` on each referenced table, because planning copies that
+table's shape.
 
 ## Supabase compatibility tests
 
