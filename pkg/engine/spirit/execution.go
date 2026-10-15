@@ -15,6 +15,7 @@ import (
 	spiritflags "github.com/block/spirit/pkg/flags"
 	spiritmigration "github.com/block/spirit/pkg/migration"
 	"github.com/block/spirit/pkg/statement"
+	"github.com/block/spirit/pkg/status"
 	"github.com/block/spirit/pkg/utils"
 
 	"github.com/block/schemabot/pkg/ddl"
@@ -423,9 +424,43 @@ func (e *Engine) executeSingleStatement(ctx context.Context, host, username, pas
 // as the stop or cancel set it.
 var errSchemaChangeStopped = errors.New("schema change stopped before the ALTER finished")
 
+// cancelledRunnerError is what a Spirit runner error returned on a cancelled
+// context says about the target, read from the evidence the runner retained
+// for the run (see classifyCancelledRunnerError).
+type cancelledRunnerError int
+
+const (
+	// cancelledBeforeCutover: the cutover never committed, so the cancel
+	// stopped the change and the target holds none of it.
+	cancelledBeforeCutover cancelledRunnerError = iota
+	// cancelledAfterCutover: the cutover committed, so the target holds the
+	// change and the error came from Spirit's cleanup after it.
+	cancelledAfterCutover
+	// cancelledCutoverUnverified: Spirit could not tell whether the cutover
+	// committed, so neither outcome is proven.
+	cancelledCutoverUnverified
+)
+
+// classifyCancelledRunnerError reads whether a runner that returned an error on
+// a cancelled context had committed its cutover. Spirit marks the run's result
+// with a durable mutation the moment the cutover commits, and every error it
+// returns after that comes from cleanup of a change the target already holds.
+// An ownership-ambiguous result outranks it: Spirit could not tell which table
+// is live, so nothing is proven landed.
+func classifyCancelledRunnerError(result status.WorkflowResult) cancelledRunnerError {
+	if result.OwnershipAmbiguous() {
+		return cancelledCutoverUnverified
+	}
+	if result.DurableMutation {
+		return cancelledAfterCutover
+	}
+	return cancelledBeforeCutover
+}
+
 // executeSpiritMigration runs Spirit for ALTER statements. A nil return means
 // the runner finished the ALTER, cutover included, even when the context was
-// cancelled while it ran.
+// cancelled while it ran, and even when Spirit's cleanup after a committed
+// cutover then failed on that cancelled context.
 func (e *Engine) executeSpiritMigration(ctx context.Context, host, username, password, database, combinedStatement string, deferCutover bool) error {
 	logger := e.changeLogger()
 	// Parse statements to extract table names
@@ -500,22 +535,61 @@ func (e *Engine) executeSpiritMigration(ctx context.Context, host, username, pas
 	// still in flight, and a progress poll must observe the recorded outcome,
 	// never infer one from a runner mid-teardown.
 	if err := runner.Run(ctx); err != nil {
-		// Check if this was a cancellation (stop) vs a real failure
-		if ctx.Err() != nil {
+		if ctx.Err() == nil {
+			logger.Error("schema change failed",
+				"error", err,
+			)
+			classifiedErr := classifyRunnerError(err)
+			e.setSchemaChangeFailed(fmt.Errorf("schema change failed: %w", classifiedErr))
+			utils.CloseAndLog(runner)
+			return classifiedErr
+		}
+		// A stop, cancel, or shutdown cancelled the context. Whether that
+		// stopped the change is Spirit's to say: an error after the cutover
+		// committed comes from cleanup of a change the target already holds.
+		switch classifyCancelledRunnerError(runner.Result()) {
+		case cancelledAfterCutover:
+			// The change landed, so it settles exactly as a runner that
+			// returned nil on the cancelled context does, below. The error is
+			// cleanup Spirit could not finish; it is logged, never recorded as
+			// the change's outcome.
+			logger.Warn("the schema change's cutover committed before its context was cancelled by a stop, cancel, or shutdown, but Spirit's cleanup after the cutover failed; settling the ALTER as finished, since the target holds it",
+				"database", database,
+				"tables", tables,
+				"reason", ctx.Err(),
+				"error", err,
+			)
+		case cancelledCutoverUnverified:
+			// Neither outcome is proven, so the change is not recorded
+			// completed. Stopped claims nothing about the target: a resume
+			// re-plans against the live schema first and settles a change that
+			// already landed instead of running it again.
+			logger.Warn("schema change stopped, but Spirit could not verify whether its cutover committed; leaving it stopped, since a resume re-plans against the live schema before running anything",
+				"database", database,
+				"tables", tables,
+				"reason", ctx.Err(),
+				"error", err,
+			)
+			utils.CloseAndLog(runner)
+			return errSchemaChangeStopped
+		case cancelledBeforeCutover:
 			logger.Info("schema change stopped",
 				"reason", ctx.Err(),
 			)
 			// Don't change state - Stop() already set it to StateStopped
 			utils.CloseAndLog(runner)
 			return errSchemaChangeStopped
+		default:
+			// Only a proven cutover settles the change as landed.
+			logger.Error("schema change stopped with an unrecognized classification of the cancelled run; leaving it stopped",
+				"database", database,
+				"tables", tables,
+				"reason", ctx.Err(),
+				"error", err,
+			)
+			utils.CloseAndLog(runner)
+			return errSchemaChangeStopped
 		}
-		logger.Error("schema change failed",
-			"error", err,
-		)
-		classifiedErr := classifyRunnerError(err)
-		e.setSchemaChangeFailed(fmt.Errorf("schema change failed: %w", classifiedErr))
-		utils.CloseAndLog(runner)
-		return classifiedErr
 	}
 
 	utils.CloseAndLog(runner)

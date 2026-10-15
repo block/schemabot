@@ -9,6 +9,7 @@ import (
 	"github.com/block/mysql"
 	"github.com/block/spirit/pkg/checksum"
 	"github.com/block/spirit/pkg/dbconn"
+	"github.com/block/spirit/pkg/status"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -112,6 +113,49 @@ func TestClassifyRunnerError(t *testing.T) {
 func copyWarningError(code uint16, message string) error {
 	return fmt.Errorf("failed to execute chunklet insert: %w",
 		&dbconn.UnsafeWarningError{Warning: &mysql.MySQLError{Number: code, Message: message}})
+}
+
+// A runner error on a context a stop, cancel, or shutdown cancelled is read
+// against the evidence Spirit retained for the run. Once the cutover commits,
+// the target holds the change, so an error from the cleanup after it settles
+// the ALTER as finished rather than stopped. Before the cutover the change is
+// stopped, and when Spirit cannot tell whether the cutover committed nothing
+// is proven landed, so the change stays stopped too.
+func TestClassifyCancelledRunnerError(t *testing.T) {
+	tests := []struct {
+		name   string
+		result status.WorkflowResult
+		want   cancelledRunnerError
+	}{
+		{
+			name:   "cancelled before the cutover committed stops the change",
+			result: status.WorkflowResult{},
+			want:   cancelledBeforeCutover,
+		},
+		{
+			name:   "cleanup failing after the cutover committed keeps the change landed",
+			result: status.WorkflowResult{DurableMutation: true},
+			want:   cancelledAfterCutover,
+		},
+		{
+			name:   "an unverified cutover is not proven landed",
+			result: status.WorkflowResult{TerminalOwnership: status.WorkflowTerminalOwnershipAmbiguous},
+			want:   cancelledCutoverUnverified,
+		},
+		{
+			name: "ambiguous ownership outranks a durable mutation",
+			result: status.WorkflowResult{
+				DurableMutation:   true,
+				TerminalOwnership: status.WorkflowTerminalOwnershipAmbiguous,
+			},
+			want: cancelledCutoverUnverified,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, classifyCancelledRunnerError(tt.result))
+		})
+	}
 }
 
 // A row the copy cannot write into the new table definition fails every
