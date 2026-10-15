@@ -257,6 +257,44 @@ func TestRawRequestFailureRendersOnlyTheAPIsOwnRefusal(t *testing.T) {
 	}
 }
 
+// A plan decides that a branch has no keyspace by a given name only on the
+// API's not-found answer to a read of that one keyspace. The read addresses
+// the keyspace by name, and a 404 comes back as the typed not-found error the
+// plan recognizes, while a keyspace that exists comes back by name.
+func TestGetKeyspaceReadsOneKeyspaceByName(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, http.MethodGet, r.Method)
+		switch r.URL.Path {
+		case "/v1/organizations/block/databases/orders/branches/main/keyspaces/commerce":
+			_, _ = w.Write([]byte(`{"name":"commerce","sharded":true}`))
+		case "/v1/organizations/block/databases/orders/branches/main/keyspaces/billing":
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"code":"not_found","message":"Not Found"}`))
+		default:
+			t.Errorf("unexpected request path %s", r.URL.Path)
+			w.WriteHeader(http.StatusTeapot)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	client, err := NewPSClientWithBaseURL("token-name", "token-value", srv.URL)
+	require.NoError(t, err)
+
+	t.Run("a keyspace the branch has", func(t *testing.T) {
+		keyspace, err := client.GetKeyspace(t.Context(), &ps.GetKeyspaceRequest{Organization: "block", Database: "orders", Branch: "main", Keyspace: "commerce"})
+		require.NoError(t, err)
+		assert.Equal(t, "commerce", keyspace.Name)
+	})
+
+	t.Run("a keyspace the branch does not have", func(t *testing.T) {
+		keyspace, err := client.GetKeyspace(t.Context(), &ps.GetKeyspaceRequest{Organization: "block", Database: "orders", Branch: "main", Keyspace: "billing"})
+		var psErr *ps.Error
+		require.ErrorAs(t, err, &psErr)
+		assert.Equal(t, ps.ErrNotFound, psErr.Code)
+		assert.Nil(t, keyspace)
+	})
+}
+
 // keyspacesServer serves the keyspace list endpoint for branch main of
 // block/orders, answering each requested page with the body pages maps it to.
 // A page with no entry is answered 404, so a request the test did not expect

@@ -204,8 +204,9 @@ keyspace id to that shard, so the flag alone re-routes nothing. Removals and
 mutations are detected structurally by comparing the current and desired
 VSchema documents; a VSchema that cannot be parsed fails the plan rather than
 skipping detection. A plan treats a keyspace as getting its first VSchema only
-when PlanetScale reports that the branch has no keyspace by that name. A
-keyspace the branch has whose VSchema PlanetScale keeps reporting missing fails the plan, because an
+when PlanetScale reports, on two reads, that the branch has no keyspace by
+that name. A keyspace the branch has whose VSchema PlanetScale keeps reporting
+missing fails the plan, including the plan a rollback makes, because an
 absence nothing confirms would skip this detection and record an empty
 VSchema as the rollback baseline.
 
