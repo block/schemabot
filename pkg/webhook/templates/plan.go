@@ -447,6 +447,17 @@ func (d PlanCommentData) applyingWithoutConfirmation() bool {
 	return d.IsLocked && !d.PendingManualConfirmation
 }
 
+// disclosesUnsafeChanges reports whether this comment lists the plan's unsafe
+// changes: wherever the reader still decides whether they run. The plan
+// comment lists them for review, and a paused comment lists what its
+// apply-confirm consents to, since that command carries --allow-unsafe forward
+// and a plan can turn unsafe after the opt-in. The comment of an apply already
+// running leaves them out: the operator consented to them on the plan comment,
+// and the DDL on this comment is the record of what the apply runs.
+func (d PlanCommentData) disclosesUnsafeChanges() bool {
+	return !d.applyingWithoutConfirmation()
+}
+
 // directNotesDeferCutover reports whether the direct disclosure says
 // --defer-cutover leaves the direct statements alone: on an apply that passed
 // the flag, and on a paused comment, where the operator can still pass it to
@@ -624,7 +635,7 @@ func renderPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 	// When the unsafe warning below lists every attributed table, the
 	// attribution rides on those findings instead of a section of its own, so
 	// each change is explained once.
-	unsafeShown := data.HasUnsafeChanges && len(data.UnsafeChanges) > 0
+	unsafeShown := data.HasUnsafeChanges && len(data.UnsafeChanges) > 0 && data.disclosesUnsafeChanges()
 	attributionNotes, attributionFolded := unsafeAttributionNotes(data, unsafeShown && attributionStillActionable(data))
 	if len(data.AttributedChanges) > 0 && attributionStillActionable(data) && !attributionFolded {
 		writeAttributedChanges(&sb, data.AttributedChanges)
@@ -656,16 +667,11 @@ func renderPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 		writePausedApplyCause(&sb, data.PausedApplyCause)
 	}
 
-	// Unsafe changes warning — shown on every comment, because the plan may
-	// have changed since the operator opted in with --allow-unsafe: the plan
-	// comment lists them for review, a paused comment lists what its
-	// apply-confirm consents to, and the comment of an apply already running is
-	// the record of what it destroys. The running comment drops the guidance on
-	// how to make a drop safe, which is out of reach once the apply runs.
-	// Target plans disclose them under the primary target's group, whose plan
-	// they are from.
+	// Unsafe changes warning — shown where the reader still decides whether
+	// they run (see disclosesUnsafeChanges). Target plans disclose them under
+	// the primary target's group, whose plan they are from.
 	if unsafeShown && !targetPlans {
-		writeUnsafeWarning(&sb, data.UnsafeChanges, attributionNotes, data.DatabaseType, data.IsMySQL, !data.applyingWithoutConfirmation())
+		writeUnsafeWarning(&sb, data.UnsafeChanges, attributionNotes, data.DatabaseType, data.IsMySQL)
 	}
 
 	// Lint violations — shown on the plan comment for review, omitted on the
@@ -2339,14 +2345,12 @@ func writeTargetPlans(sb *strings.Builder, data PlanCommentData, budget *ddlBloc
 			writeDirectChanges(sb, g.DirectChanges, data.DatabaseType, data.IsMySQL, data.directNotesDeferCutover())
 		}
 		// So is an unsafe change, which `--allow-unsafe` consents to on every
-		// target. The primary's group discloses its own with the primary
-		// plan's. The comment of an apply already running lists them too: a
-		// target's plan can turn unsafe after the operator opted in, and that
-		// comment is the only record of what the apply destroys there.
+		// target, wherever the reader still decides whether it runs. The
+		// primary's group discloses its own with the primary plan's.
 		if g.Primary {
 			writePrimaryTargetDisclosures(sb, data, g)
-		} else if unsafe := g.unsafeBeyondPrimaryPlan(); len(unsafe) > 0 {
-			writeUnsafeWarning(sb, unsafe, nil, data.DatabaseType, data.IsMySQL, !data.applyingWithoutConfirmation())
+		} else if unsafe := g.unsafeBeyondPrimaryPlan(); len(unsafe) > 0 && data.disclosesUnsafeChanges() {
+			writeUnsafeWarning(sb, unsafe, nil, data.DatabaseType, data.IsMySQL)
 		}
 	}
 }
@@ -2364,6 +2368,9 @@ func writePrimaryTargetDisclosures(sb *strings.Builder, data PlanCommentData, g 
 		fmt.Fprintf(sb, "On target %s:\n\n", inlineCode(g.Members[0]))
 	}
 	writeExistingCopies(sb, data)
+	if !data.disclosesUnsafeChanges() {
+		return
+	}
 	var unsafe []UnsafeChangeData
 	if data.HasUnsafeChanges {
 		unsafe = append(unsafe, data.UnsafeChanges...)
@@ -2371,7 +2378,7 @@ func writePrimaryTargetDisclosures(sb *strings.Builder, data PlanCommentData, g 
 	unsafe = append(unsafe, g.unsafeBeyondPrimaryPlan()...)
 	if len(unsafe) > 0 {
 		notes, _ := unsafeAttributionNotes(data, data.HasUnsafeChanges && len(data.UnsafeChanges) > 0 && attributionStillActionable(data))
-		writeUnsafeWarning(sb, unsafe, notes, data.DatabaseType, data.IsMySQL, !data.applyingWithoutConfirmation())
+		writeUnsafeWarning(sb, unsafe, notes, data.DatabaseType, data.IsMySQL)
 	}
 }
 
@@ -2665,10 +2672,9 @@ func writeEngineReasonItem(sb *strings.Builder, table, reason string) {
 
 // writeUnsafeWarning lists the unsafe findings. attributionNotes, keyed by
 // table, carries the attribution for tables another pull request changed, so
-// the reader learns where a change came from on the finding itself.
-// dropGuidance adds how to make a destructive drop safe, which only a comment
-// whose reader still decides the apply can act on.
-func writeUnsafeWarning(sb *strings.Builder, changes []UnsafeChangeData, attributionNotes map[string]string, databaseType string, isMySQL, dropGuidance bool) {
+// the reader learns where a change came from on the finding itself, and how
+// to make a destructive drop safe.
+func writeUnsafeWarning(sb *strings.Builder, changes []UnsafeChangeData, attributionNotes map[string]string, databaseType string, isMySQL bool) {
 	n := countUnsafeFindings(changes)
 	fmt.Fprintf(sb, glyph.Attention+" **Issues**: %d unsafe %s detected\n", n, pluralize("change", n))
 	item := 0
@@ -2683,9 +2689,7 @@ func writeUnsafeWarning(sb *strings.Builder, changes []UnsafeChangeData, attribu
 		sb.WriteString("\nA plan diffs this PR's schema files against the live database, so a change another PR applied before merging shows up here as one to undo.\n")
 	}
 	sb.WriteString("\n")
-	if dropGuidance {
-		writeUnsafeDropGuidance(sb, changes, databaseType, isMySQL)
-	}
+	writeUnsafeDropGuidance(sb, changes, databaseType, isMySQL)
 }
 
 // unsafeChangeLabel names an unsafe change's table, with the shards and the
@@ -3477,7 +3481,7 @@ func writeEnvironmentPlanSection(sb *strings.Builder, plan *PlanCommentData, bud
 
 	// Unsafe changes warning
 	if unsafeShown && !targetPlans {
-		writeUnsafeWarning(sb, plan.UnsafeChanges, attributionNotes, plan.DatabaseType, plan.IsMySQL, true)
+		writeUnsafeWarning(sb, plan.UnsafeChanges, attributionNotes, plan.DatabaseType, plan.IsMySQL)
 	}
 
 	// Lint violations.
