@@ -2952,6 +2952,51 @@ func TestLocalClient_StartOutsideTheDiscoveryWindowNamesTheWayForward(t *testing
 		"the refusal points at the command that resumes the change anyway")
 }
 
+// A rollout's control plane operations share one data plane apply, and each
+// operation's drive sends its own start. The second can arrive after the first
+// moved the apply to resuming and its driver already requeued the table, so
+// nothing is resting any more. It asks for nothing the pending start is not
+// already doing, so it joins that start and reports the same counts. Refusing
+// it fails the control plane's start for that operation's target, which then
+// stays stopped while its siblings finish.
+func TestLocalClient_StartJoinsThePendingStartOfAResumingApply(t *testing.T) {
+	apply, task := restingStartApply(state.Task.Stopped, time.Minute)
+	client := newMySQLControlTestClient(apply, []*storage.Task{task}, &controlCaptureEngine{})
+
+	first, err := client.Start(t.Context(), &ternv1.StartRequest{ApplyId: apply.ApplyIdentifier})
+	require.NoError(t, err)
+	require.True(t, first.Accepted)
+
+	apply.State = state.Apply.Resuming
+	task.State = state.Task.Running
+
+	second, err := client.Start(t.Context(), &ternv1.StartRequest{ApplyId: apply.ApplyIdentifier})
+	require.NoError(t, err, "a start that reaches a resuming apply joins the pending start")
+	assert.True(t, second.Accepted)
+	assert.Equal(t, first.StartedCount, second.StartedCount, "the joined start reports what the pending one recorded")
+	assert.Equal(t, first.SkippedCount, second.SkippedCount)
+
+	requests := client.storage.ControlRequests().(*testControlRequestStore).requests
+	require.Len(t, requests, 1, "the joining start records no second request")
+	assert.Equal(t, storage.ControlRequestPending, requests[0].Status)
+}
+
+// A resuming apply whose start was already consumed is past the point a start
+// can act on, so a start there is refused rather than queued behind work that
+// is already moving.
+func TestLocalClient_StartRefusesAResumingApplyWithNoPendingStart(t *testing.T) {
+	apply, task := restingStartApply(state.Task.Running, time.Minute)
+	apply.State = state.Apply.Resuming
+	client := newMySQLControlTestClient(apply, []*storage.Task{task}, &controlCaptureEngine{})
+
+	_, err := client.Start(t.Context(), &ternv1.StartRequest{ApplyId: apply.ApplyIdentifier})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "schema change is not stopped (current state: resuming)")
+	assert.Empty(t, client.storage.ControlRequests().(*testControlRequestStore).requests,
+		"a refused start records no request")
+}
+
 // Task states arrive in proto form for terminal states too, so a finished
 // table must be counted as skipped rather than reported as a state start
 // cannot act on — the latter tells the operator something is wedged when the
