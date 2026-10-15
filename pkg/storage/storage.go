@@ -1628,6 +1628,16 @@ type ApplyOperationStore interface {
 	// is present in ctx.
 	MarkPendingStoppedByApply(ctx context.Context, applyID int64) (int64, error)
 
+	// MarkPendingCancelledByApply transitions every operation of an apply that
+	// never started to cancelled, returning the number of rows changed: the
+	// pending ones, and the stopped ones a stop reached while still pending.
+	// Used once a cancel is pending: an operation that never started changed
+	// nothing on its target, so it settles on the spot rather than outliving a
+	// cancelled rollout. A stopped operation that had started is left to the
+	// drive that delivers the cancel to it. completed_at is stamped, and writes
+	// are lease guarded the same way as MarkPendingStoppedByApply.
+	MarkPendingCancelledByApply(ctx context.Context, applyID int64) (int64, error)
+
 	// ReapStranded mirrors the parent's outcome onto pending, unleased operation
 	// rows whose parent apply settled long enough ago to be quiescent, returning
 	// what it reaped (at most limit rows, oldest first). A pending row under a
@@ -1701,6 +1711,12 @@ type ControlRequestStore interface {
 	// same operation is already pending for the apply, the existing request is
 	// returned with alreadyPending=true.
 	RequestPending(ctx context.Context, req *ApplyControlRequest) (*ApplyControlRequest, bool, error)
+
+	// RequestPendingSuperseding records req as RequestPending does and, in the
+	// same transaction, completes the apply's pending request for superseded,
+	// whose effect req replaces. Either both writes land or neither does, so a
+	// failed request leaves the superseded one still deliverable.
+	RequestPendingSuperseding(ctx context.Context, req *ApplyControlRequest, superseded ControlOperation) (*ApplyControlRequest, bool, error)
 
 	// GetPending returns the pending request for an apply operation.
 	GetPending(ctx context.Context, applyID int64, operation ControlOperation) (*ApplyControlRequest, error)

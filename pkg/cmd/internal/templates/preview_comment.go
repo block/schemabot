@@ -141,6 +141,7 @@ func previewCommentAllOutput() {
 		{"RESUMED: SUPERSEDED PROGRESS COMMENT", func() { fmt.Print(webhooktemplates.PreviewCommentResumeSupersededProgress()) }},
 		{"REVERT: SUPERSEDED PROGRESS COMMENT", func() { fmt.Print(webhooktemplates.PreviewCommentRevertSupersededProgress()) }},
 		{"SKIP REVERT: SUPERSEDED PROGRESS COMMENT", func() { fmt.Print(webhooktemplates.PreviewCommentSkipRevertSupersededProgress()) }},
+		{"CUTOVER STARTED: SUPERSEDED PROGRESS COMMENT", func() { fmt.Print(webhooktemplates.PreviewCommentCutoverCommandSupersededProgress()) }},
 		{"CUTOVER COMPLETE: SUPERSEDED CUTOVER PROMPT", func() { fmt.Print(webhooktemplates.PreviewCommentCutoverSuperseded()) }},
 		{"RETRY: SUPERSEDED PROGRESS COMMENT (GENERIC)", func() { fmt.Print(webhooktemplates.PreviewCommentSupersededProgress()) }},
 		{"SUMMARY: COMPLETED", func() { fmt.Print(webhooktemplates.PreviewCommentSummaryCompleted()) }},
@@ -348,6 +349,7 @@ func previewCommentApplyFlowAllOutput() {
 		{"SECOND TABLE THROTTLED", func() { fmt.Print(webhooktemplates.PreviewCommentApplyThrottled()) }},
 		{"SECOND TABLE CATCHING UP", func() { fmt.Print(webhooktemplates.PreviewCommentApplyCatchingUp()) }},
 		{"SECOND TABLE CHECKSUMMING", func() { fmt.Print(webhooktemplates.PreviewCommentApplyChecksumming()) }},
+		{"SECOND TABLE CHECKSUMMING: CUTOVER DEFERRED", func() { fmt.Print(webhooktemplates.PreviewCommentApplyChecksummingDeferredCutover()) }},
 		{"SECOND TABLE POST-CHECKSUM", func() { fmt.Print(webhooktemplates.PreviewCommentApplyPostChecksum()) }},
 		{"THIRD TABLE RUNNING", func() { fmt.Print(webhooktemplates.PreviewCommentApplyThirdRunning()) }},
 		// PostgreSQL: several statements on one table, each its own row
@@ -382,6 +384,7 @@ func previewCommentApplyFlowAllOutput() {
 		{"RESUMED: SUPERSEDED PROGRESS COMMENT", func() { fmt.Print(webhooktemplates.PreviewCommentResumeSupersededProgress()) }},
 		{"REVERT: SUPERSEDED PROGRESS COMMENT", func() { fmt.Print(webhooktemplates.PreviewCommentRevertSupersededProgress()) }},
 		{"SKIP REVERT: SUPERSEDED PROGRESS COMMENT", func() { fmt.Print(webhooktemplates.PreviewCommentSkipRevertSupersededProgress()) }},
+		{"CUTOVER STARTED: SUPERSEDED PROGRESS COMMENT", func() { fmt.Print(webhooktemplates.PreviewCommentCutoverCommandSupersededProgress()) }},
 		{"CUTOVER COMPLETE: SUPERSEDED CUTOVER PROMPT", func() { fmt.Print(webhooktemplates.PreviewCommentCutoverSuperseded()) }},
 		{"RETRY: SUPERSEDED PROGRESS COMMENT (GENERIC)", func() { fmt.Print(webhooktemplates.PreviewCommentSupersededProgress()) }},
 		// Summaries

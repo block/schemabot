@@ -1856,17 +1856,12 @@ func (s applyTaskScope) remoteApplyID(apply *storage.Apply) string {
 // complete. Whole-apply dispatches carry none — the dispatch is the whole
 // generation.
 //
-// A deliberate retry (the operation's own attempt above zero) declares only
-// its own key, mirroring its operation-scoped idempotency key: the retry's
-// remote apply receives exactly this one operation, and declaring the whole
-// deployment set would hold that apply open forever for siblings that are
-// never redispatched.
+// A redispatched operation declares the same set: it lands on the same remote
+// apply as its first dispatch (see remoteApplyIdempotencyKey), whose
+// generation is still the whole deployment.
 func (s applyTaskScope) generationOperationKeys() []string {
 	if !s.usesOperationRemoteResume() {
 		return nil
-	}
-	if s.operation.Attempt > 0 {
-		return []string{s.operation.OperationKey}
 	}
 	return s.deploymentOperationKeys
 }
@@ -2051,29 +2046,23 @@ func operationLeaseOnly(ctx context.Context) bool {
 
 // remoteApplyIdempotencyKey derives the deduplication key the control plane
 // stamps on every remote Apply dispatch. The key is stable across a re-dispatch
-// of the same generation — so an ambiguous dispatch whose response was lost is
-// reused rather than duplicated — and rotates when the dispatched work is
-// deliberately retried.
+// of the same work, so a dispatch whose response was lost is replayed rather
+// than duplicated.
 //
-// Operation-scoped drives key generation zero on the deployment, not the
-// individual operation: every sibling operation a deployment dispatches in its
-// first generation carries the same key, so the data plane lands them on one
-// remote apply — the first dispatch creates it, each sibling attaches its own
-// operation, and the data plane tells the dispatches apart by the operation
-// key it derives from each request's shape. The generation is the operation's
-// own attempt, never the shared apply.Attempt: the parent counter advances
-// when any sibling operation of any deployment is redispatched (it feeds the
-// apply's retry budget), so keying on it would let one deployment's genuine
-// retry rotate the key under another deployment's orphaned dispatch and
-// duplicate its remote apply.
+// Operation-scoped drives key on the deployment, not the individual operation:
+// every sibling operation a deployment dispatches carries the same key, so the
+// data plane lands them on one remote apply — the first dispatch creates it,
+// each sibling attaches its own operation, and the data plane tells the
+// dispatches apart by the operation key it derives from each request's shape.
 //
-// A deliberate retry (the operation's own attempt above zero) keys on the
-// operation as well: a retry redispatches only its own operation — siblings
-// that succeeded stay on the generation-zero apply and are never sent again —
-// so a deployment-shared retry key would land the retry on a remote apply
-// whose declared generation includes work that can never arrive, and its
-// completion gate would hold it open forever. An operation-scoped key gives
-// each retried operation its own remote apply that completes on its own work.
+// The key never rotates for an operation-scoped drive, not even when the
+// operation's own attempt advances on a retry. A deployment has exactly one
+// data-plane apply, and an operation is redispatched only while it has no
+// remote id, so the retry's work belongs on that one apply: either its first
+// dispatch reached the data plane and the retry replays it, or it never did
+// and the retry attaches it as the generation's missing operation. A rotated
+// key would reach the data plane as a new generation, which takes the
+// deployment over from the apply its siblings are still running on.
 //
 // The targets of a deployment that addresses several are siblings in exactly
 // this sense: they share the deployment's key and so its one remote apply, and
@@ -2089,10 +2078,14 @@ func remoteApplyIdempotencyKey(apply *storage.Apply, scope applyTaskScope) strin
 		apply.ApplyIdentifier,
 	}
 	if scope.usesOperationRemoteResume() {
-		parts = append(parts, "deployment", scope.operation.Deployment, strconv.Itoa(scope.operation.Attempt))
-		if scope.operation.Attempt > 0 {
-			parts = append(parts, "operation", scope.operation.OperationKey)
-		}
+		// The generation stays "0" so every dispatch of the deployment, retries
+		// included, hashes to the key its first dispatch carried, including a
+		// first dispatch an earlier build sent that is still in flight. An
+		// earlier build's retries hashed the operation's attempt and key, which
+		// this key never reproduces, so a retry such a build sent but never
+		// recorded is not recovered here: upgrade from those builds while no
+		// rollout operation is failed_retryable.
+		parts = append(parts, "deployment", scope.operation.Deployment, "0")
 	} else {
 		parts = append(parts, "whole", strconv.Itoa(apply.Attempt))
 	}
@@ -2568,7 +2561,44 @@ func (c *GRPCClient) ResumeApplyOperation(ctx context.Context, apply *storage.Ap
 		scope.tasklessOperation = true
 		return c.dispatchRemoteVSchemaOnly(ctx, apply, scope, plan, plan.VSchemaNamespaces(), tasklessWorkDispatchKind)
 	}
+	c.seedOperationDriveStateFromOperation(ctx, apply, scope)
 	return c.resumeApply(ctx, apply, scope)
+}
+
+// seedOperationDriveStateFromOperation replaces a failed_retryable parent
+// snapshot with the claimed operation's own active state before an
+// operation-scoped drive reasons with it. The parent of a multi-operation apply
+// is the rollout projection, so it reads failed_retryable while any sibling, or
+// this operation before its redispatch claim, is paused for a retry. The drive
+// never writes that parent, but it does compare remote progress against the
+// in-memory state, and the no-backward rule holds a stored failed_retryable
+// against any active report: left in place, the drive would never see its own
+// operation reach the cutover barrier, never park, and hold the lease forever.
+func (c *GRPCClient) seedOperationDriveStateFromOperation(ctx context.Context, apply *storage.Apply, scope applyTaskScope) {
+	if !scope.usesOperationRemoteResume() {
+		return
+	}
+	if !state.IsState(apply.State, state.Apply.FailedRetryable) {
+		return
+	}
+	if !operationIsUnderActiveDrive(scope.operation.State) {
+		c.applyLogger(apply).DebugContext(ctx, "operation drive keeps the failed_retryable parent snapshot because its operation is not in an active state",
+			append(apply.MutableLogAttrs(), "apply_operation_id", scope.operation.ID, "operation_state", scope.operation.State)...)
+		return
+	}
+	c.applyLogger(apply).InfoContext(ctx, "operation drive reasons from its operation's state, not the failed_retryable rollout parent",
+		append(apply.MutableLogAttrs(), "apply_operation_id", scope.operation.ID, "operation_state", scope.operation.State)...)
+	apply.State = scope.operation.State
+}
+
+// operationIsUnderActiveDrive reports whether an operation's state is one a
+// live drive moves forward: started, not resting for a retry or a stop, and
+// not settled.
+func operationIsUnderActiveDrive(operationState string) bool {
+	if state.IsTerminalApplyState(operationState) {
+		return false
+	}
+	return !state.IsState(operationState, state.Apply.Pending, state.Apply.FailedRetryable, state.Apply.Stopped)
 }
 
 // The two task-less operation shapes a remote drive dispatches as a VSchema-only
@@ -3426,7 +3456,18 @@ func shouldDispatchQueuedRemoteApply(apply *storage.Apply, scope applyTaskScope)
 	// ambiguous "running with no remote id" case the whole-apply path guards
 	// against, where a shared external_id could have been lost after a real
 	// dispatch.
-	return scope.usesOperationRemoteResume() && state.IsState(dispatchState, state.Apply.Running)
+	if !scope.usesOperationRemoteResume() {
+		return false
+	}
+	if state.IsState(dispatchState, state.Apply.Running) {
+		return true
+	}
+	// A stop catches still-pending operations before they start and moves them
+	// to stopped without a started_at; the start claim then moves the row to
+	// resuming. Such a row never ran, so it was never dispatched either, and
+	// resuming it is its first dispatch. A resuming row that had started is
+	// not: it may have reached remote Tern before its id was stored.
+	return state.IsState(dispatchState, state.Apply.Resuming) && scope.operation.StartedAt == nil
 }
 
 // undispatchedControlRequestSettlesLocally reports whether a pending stop or

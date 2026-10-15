@@ -87,35 +87,28 @@ func RenderPRCommandNotAuthorized(data ActorAuthorizationCommentData) string {
 	// The database's own operators lead in their own section so the blocked
 	// user knows who to ask first, mirroring the review-required comment; the
 	// broader principals follow as an explicit fallback. Principals render as
-	// inline code, never @-mentions: the list is guidance for the blocked
-	// user, and mentions would notify every admin team and operator on every
-	// rejected command.
+	// @-mentions, the same as the review-required comment's reviewer list, so
+	// the blocked user can click straight through to each team or user.
 	hasOperators := len(data.OperatorPrincipals) > 0
 	hasOthers := len(data.OtherPrincipals) > 0
 	switch {
 	case hasOperators:
 		fmt.Fprintf(&sb, "**Operators of `%s`** — members of these teams, or these users, can run it:\n", data.Database)
-		writePrincipalList(&sb, data.OperatorPrincipals)
+		writeMentionList(&sb, data.OperatorPrincipals)
 		if hasOthers {
 			sb.WriteString("\n**Other authorized teams and users**:\n")
-			writePrincipalList(&sb, data.OtherPrincipals)
+			writeMentionList(&sb, data.OtherPrincipals)
 		}
 		writeAskPrincipalsGuidance(&sb, data.OperatorPrincipals, data.OtherPrincipals)
 	case hasOthers:
 		sb.WriteString("**Who can run this command** — members of these teams, or these users:\n")
-		writePrincipalList(&sb, data.OtherPrincipals)
+		writeMentionList(&sb, data.OtherPrincipals)
 		writeAskPrincipalsGuidance(&sb, data.OtherPrincipals)
 	default:
 		sb.WriteString("A configured SchemaBot admin/database operator must run this command.\n")
 	}
 
 	return offerSupportChannel(sb.String())
-}
-
-func writePrincipalList(sb *strings.Builder, principals []string) {
-	for _, principal := range principals {
-		fmt.Fprintf(sb, "- `%s`\n", principal)
-	}
 }
 
 // writeAskPrincipalsGuidance closes the principal lists with what the blocked
@@ -329,6 +322,7 @@ func RenderApplyStarted(data ApplyStatusCommentData) string {
 
 	writeApplyStatusHeader(&sb, data)
 	writeApplyMetadata(&sb, data, currentTimestamp())
+	writeApplyOptions(&sb, data.DeferCutover, data.SkipRevert, data.State)
 	if state.IsState(data.State, state.Apply.Pending) {
 		writeApplyStatusDetail(&sb, data)
 		return sb.String()
