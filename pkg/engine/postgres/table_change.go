@@ -94,7 +94,7 @@ func (e *Engine) CompareSchemaFileChange(ctx context.Context, req *ternv1.Compar
 		return &ternv1.CompareSchemaFileChangeResponse{Reason: fmt.Sprintf("table %s: %s", table, why)}, nil
 	}
 
-	pool, closePool, err := openTargetPool(ctx, e.pullDatabase, e.pullCredentials, "schema file comparison")
+	pool, closePool, err := openTargetPool(ctx, e.pullCredentials)
 	if err != nil {
 		return nil, fmt.Errorf("compare PostgreSQL schema file for database %q: %w", e.pullDatabase, err)
 	}

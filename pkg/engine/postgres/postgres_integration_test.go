@@ -218,7 +218,7 @@ func TestEnginePullSchemaReturnsCancelledContext(t *testing.T) {
 
 	require.ErrorIs(t, err, context.Canceled)
 	assert.Nil(t, response)
-	assert.Contains(t, err.Error(), `PostgreSQL database "pull_cancel_test" for schema pull`)
+	assert.Contains(t, err.Error(), `pull PostgreSQL database "pull_cancel_test": ping PostgreSQL target`)
 	assert.NotContains(t, err.Error(), "refused incomplete baseline")
 }
 

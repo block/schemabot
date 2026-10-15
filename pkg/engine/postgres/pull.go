@@ -64,7 +64,7 @@ func (e *Engine) PullSchema(ctx context.Context, req *ternv1.PullSchemaRequest) 
 	if e.pullCredentials == nil || e.pullCredentials.DSN == "" {
 		return nil, fmt.Errorf("pull PostgreSQL database %q: DSN credentials are required", e.pullDatabase)
 	}
-	pool, closePool, err := openTargetPool(ctx, e.pullDatabase, e.pullCredentials, "schema pull")
+	pool, closePool, err := openTargetPool(ctx, e.pullCredentials)
 	if err != nil {
 		return nil, fmt.Errorf("pull PostgreSQL database %q: %w", e.pullDatabase, err)
 	}
