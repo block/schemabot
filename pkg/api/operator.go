@@ -1952,15 +1952,16 @@ func (s *Service) driverLogger(driverID int) *slog.Logger {
 }
 
 // completePendingControlRequestsIfApplyResolved settles pending stop, start,
-// cutover, and cancel control requests once the apply has settled to a
-// terminal state, so the requests do not stay pending forever after the
-// rollout resolves. The apply is reloaded because the derived-state write
-// operates on a copy and does not mutate the caller's row. The logger carries
-// the caller's identity — a driver's id, or the reaper — so the settlement
-// lines name who answered. A pending stop completes at any terminal state. A
-// pending start, cutover, and cancel are handed to the shared settlements,
-// which decide from the stored outcome whether the command took effect, so
-// this path discloses the same outcome as every other drive shape. A
+// cutover, revert, skip-revert, and cancel control requests once the apply has
+// settled to a terminal state, so the requests do not stay pending forever
+// after the rollout resolves. The apply is reloaded because the derived-state
+// write operates on a copy and does not mutate the caller's row. The logger
+// carries the caller's identity — a driver's id, or the reaper — so the
+// settlement lines name who answered. A pending stop completes at any terminal
+// state. A pending start, cutover, revert, skip-revert, and cancel are handed
+// to the shared settlements, which decide from the stored outcome whether the
+// command took effect, so this path discloses the same outcome as every other
+// drive shape. A
 // still-non-terminal apply resolves only its stop, and only once that stop has
 // reached every operation, along with the cutover that stop superseded. No-op
 // when nothing is pending.
@@ -1986,6 +1987,9 @@ func (s *Service) completePendingControlRequestsIfApplyResolved(ctx context.Cont
 		return err
 	}
 	if err := tern.SettlePendingStartForResolvedApply(ctx, s.storage, logger, apply); err != nil {
+		return err
+	}
+	if err := tern.SettlePendingRevertPhaseForResolvedApply(ctx, s.storage, logger, apply); err != nil {
 		return err
 	}
 	return tern.SettlePendingCancelForResolvedApply(ctx, s.storage, logger, apply)

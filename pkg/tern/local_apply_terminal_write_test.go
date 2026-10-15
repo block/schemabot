@@ -260,9 +260,45 @@ func TestResumeApplyWithTasks_NoRemainingWorkSettlesMootedRequests(t *testing.T)
 	require.Len(t, controlRequests.requests, 1)
 	assert.Equal(t, storage.ControlRequestFailed, controlRequests.requests[0].Status,
 		"the completed outcome outran the pending revert")
+	assert.True(t, hasLogMessageContaining(logs.logs, "Revert did not take effect: the schema change completed before the revert could take effect"),
+		"the apply history records that the revert never landed")
 	require.Len(t, observer.terminal, 1)
 	assert.Equal(t, state.Apply.Completed, observer.terminal[0].State)
 	assert.Empty(t, eng.applied, "an apply with no remaining work hands nothing to the engine")
+}
+
+// The same re-claimed apply with an operator's skip-revert pending instead.
+// The completed outcome is the revert window closing with the change kept,
+// which is what the skip-revert asked for, so the drive that stores it answers
+// the skip-revert as carried out rather than leaving it pending.
+func TestResumeApplyWithTasks_NoRemainingWorkCompletesPendingSkipRevert(t *testing.T) {
+	logs := &mockApplyLogStore{}
+	taskStore := &exactProgressTaskStore{}
+	c, _, apply, applies, tasks := newLandedSiblingResume(t, taskStore, logs)
+	plan := &storage.Plan{ID: 5}
+	apply.PlanID = plan.ID
+	applies.stored = *apply
+	store := c.storage.(*exactProgressStorage)
+	store.plans = &fakePlanStore{getByIDFn: func(int64) (*storage.Plan, error) { return plan, nil }}
+	controlRequests := pendingControlRequestStore(apply.ID, storage.ControlOperationSkipRevert)
+	store.controlRequests = controlRequests
+	for _, task := range tasks {
+		task.State = state.Task.Completed
+	}
+	taskStore.tasks = tasks
+	observer := &terminalRecordingObserver{}
+	c.SetObserver(apply.ID, observer)
+
+	require.NoError(t, c.resumeApplyWithTasks(t.Context(), apply, nil, tasks, nil, false, false))
+
+	assert.Equal(t, state.Apply.Completed, applies.stored.State)
+	require.Len(t, controlRequests.requests, 1)
+	assert.Equal(t, storage.ControlRequestCompleted, controlRequests.requests[0].Status,
+		"the completed outcome is the skip-revert having taken effect")
+	assert.False(t, hasLogMessageContaining(logs.logs, "did not take effect"),
+		"a skip-revert that took effect is not disclosed as not applied")
+	require.Len(t, observer.terminal, 1)
+	assert.Equal(t, state.Apply.Completed, observer.terminal[0].State)
 }
 
 // A grouped drive failed every task of an apply, then the write recording the

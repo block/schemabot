@@ -129,12 +129,44 @@ func settlePendingRequestsForTerminalApply(ctx context.Context, store storage.St
 	if err := SettlePendingCutoverForResolvedApply(ctx, store, logger, apply); err != nil {
 		return err
 	}
+	if err := SettlePendingRevertPhaseForResolvedApply(ctx, store, logger, apply); err != nil {
+		return err
+	}
+	return SettlePendingCancelForResolvedApply(ctx, store, logger, apply)
+}
+
+// SettlePendingRevertPhaseForResolvedApply answers the pending revert and
+// skip-revert of an apply that has reached a terminal state, whichever path
+// drove it there: the drive that stored the outcome, the operator's post-drive
+// settlement, or the reaper's stranded control-request sweep. Each one owes the
+// operator the same answer about the command they issued, so they share this
+// entry point (see settlePendingRevertPhaseRequestForTerminalApply).
+//
+// The caller must have established that the apply is terminal.
+func SettlePendingRevertPhaseForResolvedApply(ctx context.Context, store storage.Storage, logger *slog.Logger, apply *storage.Apply) error {
 	for _, op := range []storage.ControlOperation{storage.ControlOperationRevert, storage.ControlOperationSkipRevert} {
 		if err := settlePendingRevertPhaseRequestForTerminalApply(ctx, store, logger, apply, op); err != nil {
 			return err
 		}
 	}
-	return SettlePendingCancelForResolvedApply(ctx, store, logger, apply)
+	return nil
+}
+
+// settlePendingRevertPhaseRequestOutsideWindow answers a revert or skip-revert a
+// drive finds pending once the apply has left its revert window, without
+// another engine call: the window is where the engine acts on either command.
+// A terminal apply settles the request by its outcome. An apply still on its
+// way out of the window — reverting, or skipping the revert — leaves it
+// pending: the command may be the one carrying the apply there, so failing it
+// now could contradict the outcome it is about to reach, and the terminal
+// settlement answers it once that outcome is stored.
+func settlePendingRevertPhaseRequestOutsideWindow(ctx context.Context, store storage.Storage, logger *slog.Logger, apply *storage.Apply, op storage.ControlOperation) error {
+	if state.IsTerminalApplyState(apply.State) {
+		return settlePendingRevertPhaseRequestForTerminalApply(ctx, store, logger, apply, op)
+	}
+	logger.DebugContext(ctx, "leaving the pending control request for the terminal settlement: the apply left the revert window and has not settled",
+		append(apply.LogAttrs(), "operation", op)...)
+	return nil
 }
 
 // settlePendingRevertPhaseRequestForTerminalApply answers a revert or
@@ -143,7 +175,8 @@ func settlePendingRequestsForTerminalApply(ctx context.Context, store storage.St
 // the outcome. A revert took effect only when the apply settled reverted, and a
 // skip-revert only when it settled completed — the window closed and the change
 // stayed. Any other outcome outran the command, so it fails with a reason that
-// says so rather than being reported as carried out.
+// says so rather than being reported as carried out, and the apply history
+// records that it did not take effect.
 //
 // The caller must have established that the apply is terminal.
 func settlePendingRevertPhaseRequestForTerminalApply(ctx context.Context, store storage.Storage, logger *slog.Logger, apply *storage.Apply, op storage.ControlOperation) error {
@@ -160,9 +193,24 @@ func settlePendingRevertPhaseRequestForTerminalApply(ctx context.Context, store 
 		return completePendingControlRequests(ctx, store, apply, op)
 	}
 	reason := revertPhaseOutrunReason(op, apply.State)
-	logger.InfoContext(ctx, "failing pending control request: the apply settled before it could take effect",
-		append(apply.LogAttrs(), "operation", op, "requested_by", controlRequestCaller(controlReq), "reason", reason)...)
-	return failPendingControlRequests(ctx, store, apply, op, reason)
+	caller := controlRequestCaller(controlReq)
+	logger.WarnContext(ctx, "failing pending control request: the apply settled before it could take effect",
+		append(apply.LogAttrs(), "operation", op, "requested_by", caller, "reason", reason)...)
+	if err := failPendingControlRequests(ctx, store, apply, op, reason); err != nil {
+		return err
+	}
+	appendSettledRequestEvent(ctx, store, logger, apply, storage.LogLevelWarn, revertPhaseEventType(op),
+		fmt.Sprintf("%s did not take effect: %s%s", remoteControlOperationLabel(op), reason, callerApplyLogSuffix(caller)))
+	return nil
+}
+
+// revertPhaseEventType is the apply event type that records a revert or
+// skip-revert in the apply history.
+func revertPhaseEventType(op storage.ControlOperation) string {
+	if op == storage.ControlOperationSkipRevert {
+		return storage.LogEventSkipRevertTriggered
+	}
+	return storage.LogEventRevertTriggered
 }
 
 // revertPhaseRequestTookEffect reports whether a terminal apply state is the
@@ -181,10 +229,7 @@ func revertPhaseRequestTookEffect(op storage.ControlOperation, applyState string
 // revertPhaseOutrunReason names what overtook a revert or skip-revert on an
 // apply that reached applyState, in the operator's vocabulary for the state.
 func revertPhaseOutrunReason(op storage.ControlOperation, applyState string) string {
-	command := "revert"
-	if op == storage.ControlOperationSkipRevert {
-		command = "skip-revert"
-	}
+	command := op.Command()
 	if state.IsState(applyState, state.Apply.Completed) {
 		return fmt.Sprintf("the schema change completed before the %s could take effect; the change is live on the target", command)
 	}
@@ -499,23 +544,33 @@ func discloseSettledTerminalCancel(ctx context.Context, store storage.Storage, l
 		logger.WarnContext(ctx, "failing pending cancel request: the schema change settled before the cancel could take effect",
 			append(apply.LogAttrs(), "requested_by", caller, "reason", reason)...)
 	}
+	appendSettledRequestEvent(ctx, store, logger, apply, level, storage.LogEventCancelRequested, message)
+}
+
+// appendSettledRequestEvent records in the apply history how a settled control
+// request resolved.
+//
+// Best-effort: the request is already settled, so a failure to append the apply
+// event is logged rather than returned. Retrying the settlement would find no
+// pending request and would never write the event.
+func appendSettledRequestEvent(ctx context.Context, store storage.Storage, logger *slog.Logger, apply *storage.Apply, level, eventType, message string) {
 	logStore := store.ApplyLogs()
 	if logStore == nil {
-		logger.ErrorContext(ctx, "apply log store is not available; the settled cancel will not appear in the apply history",
-			append(apply.LogAttrs(), "event_message", message)...)
+		logger.ErrorContext(ctx, "apply log store is not available; the settled control request will not appear in the apply history",
+			append(apply.LogAttrs(), "event_type", eventType, "event_message", message)...)
 		return
 	}
 	entry := &storage.ApplyLog{
 		ApplyID:   apply.ID,
 		Level:     level,
-		EventType: storage.LogEventCancelRequested,
+		EventType: eventType,
 		Source:    storage.LogSourceSchemaBot,
 		Message:   message,
 		CreatedAt: time.Now(),
 	}
 	if err := logStore.Append(ctx, entry); err != nil {
-		logger.WarnContext(ctx, "failed to append the settled-cancel apply event; the rejection remains in the control request and the server log",
-			append(apply.LogAttrs(), "error", err, "event_message", message)...)
+		logger.WarnContext(ctx, "failed to append the settled control request apply event; the outcome remains in the control request and the server log",
+			append(apply.LogAttrs(), "error", err, "event_type", eventType, "event_message", message)...)
 	}
 }
 

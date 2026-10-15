@@ -256,7 +256,9 @@ func TestCompletePendingControlRequestsRefusesStop(t *testing.T) {
 // if the window then expires and the apply completes, the change is permanent,
 // so the revert is answered as not applied rather than reported carried out.
 // Likewise a skip-revert outrun by a revert. Only the outcome each command asked
-// for completes it.
+// for completes it. A request that did not take effect also leaves a warning in
+// the apply history, so an operator triaging from the history alone sees that
+// the command was accepted and never landed.
 func TestSettlePendingRequestsForTerminalApplySettlesRevertPhaseByOutcome(t *testing.T) {
 	cases := []struct {
 		name       string
@@ -264,23 +266,50 @@ func TestSettlePendingRequestsForTerminalApplySettlesRevertPhaseByOutcome(t *tes
 		applyState string
 		wantStatus storage.ControlRequestStatus
 		wantError  string
+		wantEvent  string
 	}{
 		{name: "revert that reverted", operation: storage.ControlOperationRevert, applyState: state.Apply.Reverted,
 			wantStatus: storage.ControlRequestCompleted},
 		{name: "revert outrun by completion", operation: storage.ControlOperationRevert, applyState: state.Apply.Completed,
 			wantStatus: storage.ControlRequestFailed,
-			wantError:  "the schema change completed before the revert could take effect; the change is live on the target"},
+			wantError:  "the schema change completed before the revert could take effect; the change is live on the target",
+			wantEvent:  "Revert did not take effect: the schema change completed before the revert could take effect; the change is live on the target (caller: cli:alice)"},
+		{name: "revert outrun by a proto-form completed state", operation: storage.ControlOperationRevert, applyState: "STATE_COMPLETED",
+			wantStatus: storage.ControlRequestFailed,
+			wantError:  "the schema change completed before the revert could take effect; the change is live on the target",
+			wantEvent:  "Revert did not take effect: the schema change completed before the revert could take effect; the change is live on the target (caller: cli:alice)"},
 		{name: "revert outrun by failure", operation: storage.ControlOperationRevert, applyState: state.Apply.Failed,
 			wantStatus: storage.ControlRequestFailed,
-			wantError:  "the schema change reached Failed before the revert could take effect"},
+			wantError:  "the schema change reached Failed before the revert could take effect",
+			wantEvent:  "Revert did not take effect: the schema change reached Failed before the revert could take effect (caller: cli:alice)"},
+		{name: "revert on a stopped apply", operation: storage.ControlOperationRevert, applyState: state.Apply.Stopped,
+			wantStatus: storage.ControlRequestFailed,
+			wantError:  "the schema change reached Stopped before the revert could take effect",
+			wantEvent:  "Revert did not take effect: the schema change reached Stopped before the revert could take effect (caller: cli:alice)"},
+		{name: "revert outrun by a cancel", operation: storage.ControlOperationRevert, applyState: state.Apply.Cancelled,
+			wantStatus: storage.ControlRequestFailed,
+			wantError:  "the schema change reached Cancelled before the revert could take effect",
+			wantEvent:  "Revert did not take effect: the schema change reached Cancelled before the revert could take effect (caller: cli:alice)"},
 		{name: "skip-revert that completed", operation: storage.ControlOperationSkipRevert, applyState: state.Apply.Completed,
+			wantStatus: storage.ControlRequestCompleted},
+		{name: "skip-revert that completed in proto form", operation: storage.ControlOperationSkipRevert, applyState: "STATE_COMPLETED",
 			wantStatus: storage.ControlRequestCompleted},
 		{name: "skip-revert outrun by a revert", operation: storage.ControlOperationSkipRevert, applyState: state.Apply.Reverted,
 			wantStatus: storage.ControlRequestFailed,
-			wantError:  "the schema change reached Reverted before the skip-revert could take effect"},
+			wantError:  "the schema change reached Reverted before the skip-revert could take effect",
+			wantEvent:  "Skip-revert did not take effect: the schema change reached Reverted before the skip-revert could take effect (caller: cli:alice)"},
 		{name: "skip-revert outrun by failure", operation: storage.ControlOperationSkipRevert, applyState: state.Apply.Failed,
 			wantStatus: storage.ControlRequestFailed,
-			wantError:  "the schema change reached Failed before the skip-revert could take effect"},
+			wantError:  "the schema change reached Failed before the skip-revert could take effect",
+			wantEvent:  "Skip-revert did not take effect: the schema change reached Failed before the skip-revert could take effect (caller: cli:alice)"},
+		{name: "skip-revert on a stopped apply", operation: storage.ControlOperationSkipRevert, applyState: state.Apply.Stopped,
+			wantStatus: storage.ControlRequestFailed,
+			wantError:  "the schema change reached Stopped before the skip-revert could take effect",
+			wantEvent:  "Skip-revert did not take effect: the schema change reached Stopped before the skip-revert could take effect (caller: cli:alice)"},
+		{name: "skip-revert outrun by a cancel", operation: storage.ControlOperationSkipRevert, applyState: state.Apply.Cancelled,
+			wantStatus: storage.ControlRequestFailed,
+			wantError:  "the schema change reached Cancelled before the skip-revert could take effect",
+			wantEvent:  "Skip-revert did not take effect: the schema change reached Cancelled before the skip-revert could take effect (caller: cli:alice)"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -294,7 +323,8 @@ func TestSettlePendingRequestsForTerminalApplySettlesRevertPhaseByOutcome(t *tes
 			controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{
 				{ApplyID: apply.ID, Operation: tc.operation, Status: storage.ControlRequestPending, RequestedBy: "cli:alice"},
 			}}
-			store := &mockStorage{controlRequests: controlRequests}
+			logs := &mockApplyLogStore{}
+			store := &mockStorage{controlRequests: controlRequests, logs: logs}
 
 			require.NoError(t, settlePendingRequestsForTerminalApply(t.Context(), store, discardLogger(), apply))
 
@@ -303,6 +333,71 @@ func TestSettlePendingRequestsForTerminalApplySettlesRevertPhaseByOutcome(t *tes
 			require.NotNil(t, settled)
 			assert.Equal(t, tc.wantStatus, settled.Status)
 			assert.Equal(t, tc.wantError, settled.ErrorMessage)
+			if tc.wantEvent == "" {
+				assert.Empty(t, logs.logs, "a command that took effect adds no did-not-take-effect event")
+				return
+			}
+			require.Len(t, logs.logs, 1)
+			assert.Equal(t, storage.LogLevelWarn, logs.logs[0].Level)
+			wantEventType := map[storage.ControlOperation]string{
+				storage.ControlOperationRevert:     storage.LogEventRevertTriggered,
+				storage.ControlOperationSkipRevert: storage.LogEventSkipRevertTriggered,
+			}[tc.operation]
+			assert.Equal(t, wantEventType, logs.logs[0].EventType)
+			assert.Equal(t, tc.wantEvent, logs.logs[0].Message)
+		})
+	}
+}
+
+// A state the registry does not carry has no operator-facing name, so the
+// reason names no state rather than echoing the stored token.
+func TestRevertPhaseOutrunReasonUnknownState(t *testing.T) {
+	assert.Equal(t, "the schema change settled before the revert could take effect",
+		revertPhaseOutrunReason(storage.ControlOperationRevert, "not_a_state"))
+	assert.Equal(t, "the schema change settled before the skip-revert could take effect",
+		revertPhaseOutrunReason(storage.ControlOperationSkipRevert, "not_a_state"))
+}
+
+// The remote drive acts on a revert or skip-revert only in the revert window.
+// Once the apply has settled it answers the request by the outcome, without an
+// engine call, so the remote and local drives give the operator the same
+// answer. While the apply is still on its way out of the window the request
+// stays pending: it may be the command carrying the apply there, and the
+// terminal settlement answers it once the outcome is stored.
+func TestSettlePendingRevertPhaseRequestOutsideWindow(t *testing.T) {
+	cases := []struct {
+		name       string
+		operation  storage.ControlOperation
+		applyState string
+		wantStatus storage.ControlRequestStatus
+	}{
+		{name: "revert while reverting", operation: storage.ControlOperationRevert, applyState: state.Apply.Reverting,
+			wantStatus: storage.ControlRequestPending},
+		{name: "revert while skipping the revert", operation: storage.ControlOperationRevert, applyState: state.Apply.SkippingRevert,
+			wantStatus: storage.ControlRequestPending},
+		{name: "skip-revert while skipping the revert", operation: storage.ControlOperationSkipRevert, applyState: state.Apply.SkippingRevert,
+			wantStatus: storage.ControlRequestPending},
+		{name: "revert on a reverted apply", operation: storage.ControlOperationRevert, applyState: state.Apply.Reverted,
+			wantStatus: storage.ControlRequestCompleted},
+		{name: "revert on a completed apply", operation: storage.ControlOperationRevert, applyState: state.Apply.Completed,
+			wantStatus: storage.ControlRequestFailed},
+		{name: "skip-revert on a completed apply", operation: storage.ControlOperationSkipRevert, applyState: state.Apply.Completed,
+			wantStatus: storage.ControlRequestCompleted},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			apply := &storage.Apply{ID: 7, ApplyIdentifier: "apply-left-window", Database: "testdb", Environment: "staging", State: tc.applyState}
+			controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{
+				{ApplyID: apply.ID, Operation: tc.operation, Status: storage.ControlRequestPending, RequestedBy: "cli:alice"},
+			}}
+			store := &mockStorage{controlRequests: controlRequests}
+
+			require.NoError(t, settlePendingRevertPhaseRequestOutsideWindow(t.Context(), store, discardLogger(), apply, tc.operation))
+
+			got, err := controlRequests.GetByOperation(t.Context(), apply.ID, tc.operation)
+			require.NoError(t, err)
+			require.NotNil(t, got)
+			assert.Equal(t, tc.wantStatus, got.Status)
 		})
 	}
 }

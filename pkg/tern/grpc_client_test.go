@@ -8547,7 +8547,7 @@ func TestGRPCClient_ProcessPendingCutoverWaitsWhenNotReady(t *testing.T) {
 // A pending skip-revert request on a revert-window apply is the operator's retry
 // path: the drive proxies SkipRevert to the data plane, records revert_skipped,
 // and completes the request. Once the apply has left the revert window, the
-// request is moot and is completed without another engine call.
+// outcome it reaches answers the request without another engine call.
 func TestGRPCClient_ProcessPendingSkipRevert(t *testing.T) {
 	newApply := func(s string) *storage.Apply {
 		return &storage.Apply{
@@ -8584,21 +8584,36 @@ func TestGRPCClient_ProcessPendingSkipRevert(t *testing.T) {
 		assert.Nil(t, pending, "request completed after a successful skip")
 	})
 
-	t.Run("apply already left the revert window: completes without an engine call", func(t *testing.T) {
-		server := &capturingTernServer{}
-		client, cleanup := testCapturingGRPCClient(t, server)
-		defer cleanup()
-		apply := newApply(state.Apply.Completed)
-		store, controlRequests, _ := newStore(apply)
-		client.storage = store
+	// Outside the window the drive makes no engine call. A settled apply answers
+	// the request by its outcome, the same answer the local drive gives: only a
+	// completed apply is the skip-revert having taken effect. An apply still
+	// skipping the revert keeps the request pending for the terminal settlement.
+	for _, tc := range []struct {
+		applyState string
+		wantStatus storage.ControlRequestStatus
+	}{
+		{applyState: state.Apply.Completed, wantStatus: storage.ControlRequestCompleted},
+		{applyState: state.Apply.Reverted, wantStatus: storage.ControlRequestFailed},
+		{applyState: state.Apply.Failed, wantStatus: storage.ControlRequestFailed},
+		{applyState: state.Apply.SkippingRevert, wantStatus: storage.ControlRequestPending},
+	} {
+		t.Run("apply left the revert window as "+tc.applyState+": no engine call", func(t *testing.T) {
+			server := &capturingTernServer{}
+			client, cleanup := testCapturingGRPCClient(t, server)
+			defer cleanup()
+			apply := newApply(tc.applyState)
+			store, controlRequests, _ := newStore(apply)
+			client.storage = store
 
-		err := client.processPendingSkipRevertControlRequest(t.Context(), apply, apply.ExternalID)
-		require.NoError(t, err)
-		assert.Empty(t, server.getSkipRevertApplyID(), "no engine call once the revert window is gone")
-		pending, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationSkipRevert)
-		require.NoError(t, err)
-		assert.Nil(t, pending, "moot request completed")
-	})
+			err := client.processPendingSkipRevertControlRequest(t.Context(), apply, apply.ExternalID)
+			require.NoError(t, err)
+			assert.Empty(t, server.getSkipRevertApplyID(), "no engine call once the revert window is gone")
+			got, err := controlRequests.GetByOperation(t.Context(), apply.ID, storage.ControlOperationSkipRevert)
+			require.NoError(t, err)
+			require.NotNil(t, got)
+			assert.Equal(t, tc.wantStatus, got.Status)
+		})
+	}
 }
 
 func TestGRPCClient_ProcessPendingRevert(t *testing.T) {
@@ -8636,21 +8651,43 @@ func TestGRPCClient_ProcessPendingRevert(t *testing.T) {
 		assert.Nil(t, pending, "request completed after a successful revert")
 	})
 
-	t.Run("apply already left the revert window: completes without an engine call", func(t *testing.T) {
-		server := &capturingTernServer{}
-		client, cleanup := testCapturingGRPCClient(t, server)
-		defer cleanup()
-		apply := newApply(state.Apply.Completed)
-		store, controlRequests := newStore(apply)
-		client.storage = store
+	// Outside the window the drive makes no engine call. A settled apply answers
+	// the request by its outcome, the same answer the local drive gives: only a
+	// reverted apply is the revert having taken effect. A revert window that
+	// expired into a completed apply left the change live, so the revert is
+	// answered as not applied. An apply still reverting or skipping the revert
+	// keeps the request pending for the terminal settlement.
+	for _, tc := range []struct {
+		applyState string
+		wantStatus storage.ControlRequestStatus
+		wantError  string
+	}{
+		{applyState: state.Apply.Reverted, wantStatus: storage.ControlRequestCompleted},
+		{applyState: state.Apply.Completed, wantStatus: storage.ControlRequestFailed,
+			wantError: "the schema change completed before the revert could take effect; the change is live on the target"},
+		{applyState: state.Apply.Failed, wantStatus: storage.ControlRequestFailed,
+			wantError: "the schema change reached Failed before the revert could take effect"},
+		{applyState: state.Apply.Reverting, wantStatus: storage.ControlRequestPending},
+		{applyState: state.Apply.SkippingRevert, wantStatus: storage.ControlRequestPending},
+	} {
+		t.Run("apply left the revert window as "+tc.applyState+": no engine call", func(t *testing.T) {
+			server := &capturingTernServer{}
+			client, cleanup := testCapturingGRPCClient(t, server)
+			defer cleanup()
+			apply := newApply(tc.applyState)
+			store, controlRequests := newStore(apply)
+			client.storage = store
 
-		err := client.processPendingRevertControlRequest(t.Context(), apply, apply.ExternalID)
-		require.NoError(t, err)
-		assert.Empty(t, server.getRevertApplyID(), "no engine call once the revert window is gone")
-		pending, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationRevert)
-		require.NoError(t, err)
-		assert.Nil(t, pending, "moot request completed")
-	})
+			err := client.processPendingRevertControlRequest(t.Context(), apply, apply.ExternalID)
+			require.NoError(t, err)
+			assert.Empty(t, server.getRevertApplyID(), "no engine call once the revert window is gone")
+			got, err := controlRequests.GetByOperation(t.Context(), apply.ID, storage.ControlOperationRevert)
+			require.NoError(t, err)
+			require.NotNil(t, got)
+			assert.Equal(t, tc.wantStatus, got.Status)
+			assert.Equal(t, tc.wantError, got.ErrorMessage)
+		})
+	}
 }
 
 func TestGRPCClient_ProcessPendingCutoverWaitsWhileRecovering(t *testing.T) {

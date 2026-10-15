@@ -881,10 +881,9 @@ func (c *GRPCClient) processPendingSkipRevertControlRequest(ctx context.Context,
 		return nil
 	}
 	// Skip-revert is only meaningful in the revert window. Once the apply has
-	// left it (finalized, reverted, …) the request is moot — complete it so it
-	// does not linger.
+	// left it, the outcome it reaches answers the request.
 	if !state.IsState(apply.State, state.Apply.RevertWindow) {
-		return completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationSkipRevert)
+		return settlePendingRevertPhaseRequestOutsideWindow(ctx, c.storage, c.baseLogger(), apply, storage.ControlOperationSkipRevert)
 	}
 	resp, err := c.client.SkipRevert(ctx, &ternv1.SkipRevertRequest{
 		ApplyId:     remoteID,
@@ -927,11 +926,10 @@ func (c *GRPCClient) processPendingRevertControlRequest(ctx context.Context, app
 	if controlReq == nil {
 		return nil
 	}
-	// Revert is only meaningful in the revert window. Once the apply has left it
-	// (finalized, reverted, …) the request is moot — complete it so it does not
-	// linger.
+	// Revert is only meaningful in the revert window. Once the apply has left
+	// it, the outcome it reaches answers the request.
 	if !state.IsState(apply.State, state.Apply.RevertWindow) {
-		return completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationRevert)
+		return settlePendingRevertPhaseRequestOutsideWindow(ctx, c.storage, c.baseLogger(), apply, storage.ControlOperationRevert)
 	}
 	resp, err := c.client.Revert(ctx, &ternv1.RevertRequest{
 		ApplyId:     remoteID,
@@ -2445,7 +2443,8 @@ func remoteControlOperationLabel(operation storage.ControlOperation) string {
 	if operation == "" {
 		return "Control command"
 	}
-	return strings.ToUpper(string(operation)[:1]) + strings.ReplaceAll(string(operation)[1:], "_", "-")
+	command := operation.Command()
+	return strings.ToUpper(command[:1]) + command[1:]
 }
 
 // operationForDisplayMirror loads the apply_operation whose
