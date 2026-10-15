@@ -20,14 +20,19 @@ import (
 // does not apply foreign keys on PostgreSQL yet. A foreign key on a column the
 // same plan adds is planned as the column add and a blocked constraint, and
 // its remedy has the rest of the plan applied first, because the constraint
-// cannot run before its column exists.
+// cannot run before its column exists. A dropped foreign key's remedy names
+// the table's foreign keys into another namespace only when it has some, since
+// a schema file cannot declare those.
 func TestEnginePlanForeignKeys(t *testing.T) {
 	dsn, db := testutil.StartPostgres(t, "plan_foreign_keys_test")
 	_, err := db.ExecContext(t.Context(), `
 		CREATE TABLE public.users (id bigint PRIMARY KEY);
 		CREATE TABLE public.orders (id bigint PRIMARY KEY, user_id bigint NOT NULL);
 		CREATE TABLE public.payments (id bigint PRIMARY KEY, order_id bigint NOT NULL REFERENCES public.orders (id));
-		CREATE TABLE public.refunds (id bigint PRIMARY KEY)`)
+		CREATE TABLE public.refunds (id bigint PRIMARY KEY);
+		CREATE SCHEMA billing;
+		CREATE TABLE billing.accounts (id bigint PRIMARY KEY);
+		CREATE TABLE public.invoices (id bigint PRIMARY KEY, account_id bigint NOT NULL REFERENCES billing.accounts (id))`)
 	require.NoError(t, err)
 	req := &engine.PlanRequest{
 		Database: "plan_foreign_keys_test",
@@ -37,6 +42,7 @@ func TestEnginePlanForeignKeys(t *testing.T) {
 				"orders.sql":    "CREATE TABLE orders (id bigint PRIMARY KEY, user_id bigint NOT NULL REFERENCES users (id), note text)",
 				"payments.sql":  "CREATE TABLE payments (id bigint PRIMARY KEY, order_id bigint NOT NULL)",
 				"refunds.sql":   "CREATE TABLE refunds (id bigint PRIMARY KEY, order_id bigint REFERENCES orders (id))",
+				"invoices.sql":  "CREATE TABLE invoices (id bigint PRIMARY KEY, account_id bigint NOT NULL)",
 				"shipments.sql": "CREATE TABLE shipments (id bigint PRIMARY KEY, order_id bigint NOT NULL REFERENCES orders (id))",
 			}},
 		},
@@ -74,7 +80,12 @@ func TestEnginePlanForeignKeys(t *testing.T) {
 	dropFK, ok := byDDL["ALTER TABLE public.payments DROP CONSTRAINT payments_order_id_fkey"]
 	require.True(t, ok, "the undeclared live foreign key is planned as a drop")
 	assert.Equal(t, engine.ExecutionModeBlocked, dropFK.ExecutionMode)
-	assert.Contains(t, dropFK.ModeReason, `statement for table "payments" drops a foreign key, which SchemaBot plans but does not apply on PostgreSQL yet; to keep the foreign key, declare it in the schema file and re-plan`)
+	assert.Equal(t, `statement for table "payments" drops a foreign key, which SchemaBot plans but does not apply on PostgreSQL yet; to keep the foreign key, declare it in the schema file and re-plan; to remove it, run this statement outside SchemaBot, then re-plan`, dropFK.ModeReason)
+
+	dropCrossNamespaceFK, ok := byDDL["ALTER TABLE public.invoices DROP CONSTRAINT invoices_account_id_fkey"]
+	require.True(t, ok, "the undeclared foreign key into another namespace is planned as a drop")
+	assert.Equal(t, engine.ExecutionModeBlocked, dropCrossNamespaceFK.ExecutionMode)
+	assert.Equal(t, `statement for table "invoices" drops a foreign key, which SchemaBot plans but does not apply on PostgreSQL yet; to keep the foreign key, declare it in the schema file and re-plan; to remove it, run this statement outside SchemaBot, then re-plan; foreign key constraint(s) "invoices_account_id_fkey" reference another namespace and cannot be declared, so the plan stays blocked until they are removed through a separately reviewed process`, dropCrossNamespaceFK.ModeReason)
 
 	create, ok := byDDL["CREATE TABLE public.shipments (id bigint PRIMARY KEY, order_id bigint NOT NULL REFERENCES orders (id))"]
 	require.True(t, ok, "the new table is planned")
@@ -85,8 +96,9 @@ func TestEnginePlanForeignKeys(t *testing.T) {
 // A schema file whose foreign key references a table that does not exist on
 // the target fails the plan, even when another file in the same plan creates
 // that table, because the planner binds each foreign key to the live
-// referenced table's shape. The error names the fix: apply the referenced
-// table first, then add the foreign key.
+// referenced table's shape. The error names the fix: leave the foreign key
+// out of the file, apply the referenced table first, then add the foreign key
+// outside SchemaBot.
 func TestEnginePlanForeignKeyToMissingTable(t *testing.T) {
 	dsn, db := testutil.StartPostgres(t, "plan_foreign_key_missing_test")
 	_, err := db.ExecContext(t.Context(), `CREATE TABLE public.orders (id bigint PRIMARY KEY, customer_id bigint NOT NULL)`)
@@ -107,5 +119,5 @@ func TestEnginePlanForeignKeyToMissingTable(t *testing.T) {
 	assert.ErrorIs(t, err, schemadiff.ErrReferencedTableNotFound)
 	assert.Contains(t, err.Error(), `plan PostgreSQL schema in "public"/"orders.sql"`)
 	assert.Contains(t, err.Error(), "public.customers")
-	assert.Contains(t, err.Error(), "a foreign key can reference only a table that already exists on the target, so apply the referenced table first, then add the foreign key")
+	assert.Contains(t, err.Error(), "a foreign key can reference only a table that already exists on the target, so leave the foreign key out of the schema file, apply the referenced table first, then run the ADD CONSTRAINT outside SchemaBot and add the foreign key back to the file")
 }

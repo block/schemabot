@@ -306,7 +306,11 @@ func planSchemas(ctx context.Context, pool *pgxpool.Pool, req *engine.PlanReques
 				return nil, fmt.Errorf("plan PostgreSQL schema in %q/%q: %w", namespace, filename, err)
 			}
 			desiredTables[table] = true
-			changes, tiers, unrecognized, err := tableChanges(report, parser)
+			crossNamespace, err := crossNamespaceForeignKeysForDrops(ctx, pool, namespace, report)
+			if err != nil {
+				return nil, err
+			}
+			changes, tiers, unrecognized, err := tableChanges(report, crossNamespace, parser)
 			if err != nil {
 				return nil, fmt.Errorf("render PostgreSQL plan for table %q in namespace %q: %w", table, namespace, err)
 			}
@@ -449,14 +453,37 @@ const tierUnderived preflight.Tier = -1
 // shape has no tier carries tierUnderived. unrecognized carries one entry per
 // statement whose verdict is a placeholder for planner vocabulary this build
 // does not map, for the caller to log with the plan's identifiers.
-func tableChanges(report pgplan.Report, parser ddl.StatementParser) ([]engine.TableChange, []preflight.Tier, []unrecognizedPlannerVocabulary, error) {
+// crossNamespaceForeignKeysForDrops reads the live table's foreign keys into
+// another namespace when the plan drops a foreign key, so the drop's remedy
+// can name them; a plan with no dropped foreign key never reads the catalog.
+// The live table must exist, since only a live constraint can be dropped, so
+// a missing row is an error rather than a table without foreign keys.
+func crossNamespaceForeignKeysForDrops(ctx context.Context, pool *pgxpool.Pool, namespace string, report pgplan.Report) ([]string, error) {
+	if !slices.ContainsFunc(report.Statements, func(s pgplan.Statement) bool { return s.Kind == schemadiff.ChangeDropForeignKey }) {
+		return nil, nil
+	}
+	keys, err := foreignKeysFor(ctx, pool, namespace, []string{report.Table})
+	if err != nil {
+		return nil, err
+	}
+	if len(keys) != 1 {
+		return nil, fmt.Errorf("table %q in namespace %q left the catalog while the plan was reading its foreign keys; retry the plan", report.Table, namespace)
+	}
+	return keys[0].crossNamespaceForeignKeys, nil
+}
+
+// tableChanges maps a table's planned statements to the changes the operator
+// reviews. crossNamespaceForeignKeys names the live table's foreign keys into
+// another namespace, which a schema file cannot declare, so a dropped foreign
+// key's remedy names them only when the table has any.
+func tableChanges(report pgplan.Report, crossNamespaceForeignKeys []string, parser ddl.StatementParser) ([]engine.TableChange, []preflight.Tier, []unrecognizedPlannerVocabulary, error) {
 	// Each statement's verdict is derived once and reused for both the
 	// greenfield decision and the rendering, so a placeholder verdict is
 	// reported once per statement.
 	verdicts := make([]stepVerdict, len(report.Statements))
 	var unrecognized []unrecognizedPlannerVocabulary
 	for i, statement := range report.Statements {
-		verdicts[i] = executionVerdict(report.FormatVersion, statement, report.Table)
+		verdicts[i] = executionVerdict(report.FormatVersion, statement, report.Table, crossNamespaceForeignKeys)
 		if verdicts[i].unrecognized != nil {
 			unrecognized = append(unrecognized, *verdicts[i].unrecognized)
 		}
@@ -1302,7 +1329,7 @@ func singleLine(s string) string {
 // mapping was written — still renders a blocked placeholder, and is reported
 // on the verdict so the caller can log it with the identifiers this function
 // does not have.
-func executionVerdict(formatVersion int, statement pgplan.Statement, table string) stepVerdict {
+func executionVerdict(formatVersion int, statement pgplan.Statement, table string, crossNamespaceForeignKeys []string) stepVerdict {
 	if formatVersion != pgplan.FormatVersion {
 		return stepVerdict{
 			mode:         engine.ExecutionModeBlocked,
@@ -1335,7 +1362,7 @@ func executionVerdict(formatVersion int, statement pgplan.Statement, table strin
 			return blocked(reason)
 		}
 		if statement.Cause == "" && statement.Reason == verdict.ReasonDeclarativeForeignKey {
-			return blocked(foreignKeyChangeRefusalReason(statement.Kind, table))
+			return blocked(foreignKeyChangeRefusalReason(statement.Kind, table, crossNamespaceForeignKeys))
 		}
 		refused := blocked(fmt.Sprintf("statement for table %q is refused: it cannot be executed safely as written", table))
 		// An absent cause is a refusal from outside the create path and the
@@ -1408,15 +1435,21 @@ func createShapeRefusalReason(cause executor.CreateShapeCause, table string) (st
 // the rest of the plan applied first, without the foreign key. A dropped
 // foreign key is usually one the file left out rather than one the operator
 // means to remove, so its remedy offers declaring it first, which plans no
-// change and keeps the constraint; one into another namespace cannot be
-// declared, so for that one removal is the only way forward.
-func foreignKeyChangeRefusalReason(kind schemadiff.ChangeKind, table string) string {
+// change and keeps the constraint. A foreign key into another namespace
+// cannot be declared, so when the table carries any, the remedy names them
+// and says removal is the only way forward for those.
+func foreignKeyChangeRefusalReason(kind schemadiff.ChangeKind, table string, crossNamespaceForeignKeys []string) string {
 	const unsupported = "which SchemaBot plans but does not apply on PostgreSQL yet"
 	switch kind {
 	case schemadiff.ChangeAddForeignKey:
 		return fmt.Sprintf("statement for table %q adds a foreign key, %s; leave the foreign key out of the schema file to apply the rest of the plan, then run this statement outside SchemaBot and add the foreign key back to the file", table, unsupported)
 	case schemadiff.ChangeDropForeignKey:
-		return fmt.Sprintf("statement for table %q drops a foreign key, %s; to keep the foreign key, declare it in the schema file and re-plan; to remove it, run this statement outside SchemaBot, then re-plan; a foreign key that references another namespace cannot be declared, so the plan stays blocked until it is removed through a separately reviewed process", table, unsupported)
+		reason := fmt.Sprintf("statement for table %q drops a foreign key, %s; to keep the foreign key, declare it in the schema file and re-plan; to remove it, run this statement outside SchemaBot, then re-plan", table, unsupported)
+		if len(crossNamespaceForeignKeys) > 0 {
+			reason += fmt.Sprintf("; foreign key constraint(s) %s reference another namespace and cannot be declared, so the plan stays blocked until they are removed through a separately reviewed process",
+				strings.Join(quoteAll(crossNamespaceForeignKeys), ", "))
+		}
+		return reason
 	}
 	return fmt.Sprintf("statement for table %q changes a foreign key, %s; leave the change out of the schema file to apply the rest of the plan, then run this statement outside SchemaBot and put the change back in the file", table, unsupported)
 }

@@ -457,8 +457,9 @@ accepted in a hand-written file.
 Foreign keys are planned but not applied. A file may declare a foreign key
 whose referenced table is unqualified and already exists on the target in the
 same namespace; a file that creates the referenced table in the same plan does
-not count, so apply the referenced table first, then add the foreign key. A
-declared foreign key that matches the live one plans no change. One the file
+not count, so leave the foreign key out of the file, apply the referenced
+table first, then run the `ADD CONSTRAINT` outside SchemaBot and add the
+foreign key back to the file. A declared foreign key that matches the live one plans no change. One the file
 adds plans as an `ADD CONSTRAINT` that names the referenced table with its
 namespace, and a live one the file omits plans as a destructive
 `DROP CONSTRAINT`; both are shown for review and blocked, because SchemaBot
@@ -466,9 +467,9 @@ does not apply foreign-key changes on PostgreSQL yet. A blocked step blocks the
 whole plan. A dropped foreign key is usually one the file left out: declare
 it in the file to keep it, which plans no change, or run the `DROP CONSTRAINT`
 outside SchemaBot and re-plan to remove it. A foreign key into another
-namespace cannot be declared, so a table that carries one stays blocked until
-that foreign key is removed. An added one may sit on a column the same plan adds, so leave it out
-of the file to apply the rest of the plan first, then run the `ADD CONSTRAINT`
+namespace cannot be declared, so when the table carries one, the blocked step
+names it and the plan stays blocked until it is removed. An added one may sit
+on a column the same plan adds, so leave it out of the file to apply the rest of the plan first, then run the `ADD CONSTRAINT`
 outside SchemaBot and add the foreign key back to the file. A new table that
 declares a foreign key is blocked as a whole: leave the foreign key out of the
 file to create the table, then add it the same way. Planning copies each
