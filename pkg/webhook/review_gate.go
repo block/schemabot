@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"path"
 	"slices"
 	"strings"
 
@@ -495,7 +496,7 @@ func (h *Handler) loadReviewGatePolicy(ctx context.Context, client *ghclient.Ins
 	appendOtherReviewers(reviewPolicy.AdminTeams, reviewPolicy.AdminUsers, repoAdminTeams, repoAdminUsers)
 
 	if reviewPolicy.IncludeCodeowners {
-		owners, err := matchReviewGateCodeowners(ctx, client, repo, baseRef, schemaPath)
+		owners, err := h.matchReviewGateCodeowners(ctx, client, repo, baseRef, database, schemaPath)
 		if err != nil {
 			return reviewGatePolicy{}, err
 		}
@@ -519,25 +520,38 @@ func (h *Handler) loadReviewGatePolicy(ctx context.Context, client *ghclient.Ins
 	return policy, nil
 }
 
-func matchReviewGateCodeowners(ctx context.Context, client *ghclient.InstallationClient, repo, baseRef, schemaPath string) ([]codeowners.Owner, error) {
+// matchReviewGateCodeowners returns the CODEOWNERS owners of the database's
+// schema directory: the owners of the last rule matching it, as GitHub
+// resolves them. A directory no rule matches, or one matched by a rule that
+// names no owners, has no code owners, so CODEOWNERS contributes no reviewers
+// for it; the gate then relies on the configured admins and operators alone.
+// An unknown schema directory cannot be matched, so it is treated the same
+// way rather than borrowing owners from unrelated paths.
+func (h *Handler) matchReviewGateCodeowners(ctx context.Context, client *ghclient.InstallationClient, repo, baseRef, database, schemaPath string) ([]codeowners.Owner, error) {
+	if schemaPath == "" {
+		h.logger.Warn("review gate: CODEOWNERS contributes no reviewers because the database's schema directory is unknown",
+			"repo", repo, "database", database, "base_ref", baseRef)
+		return nil, nil
+	}
 	ruleset, err := client.FetchCodeownersRuleset(ctx, repo, baseRef)
 	if err != nil {
 		return nil, fmt.Errorf("fetch CODEOWNERS: %w", err)
 	}
 	if ruleset == nil {
+		h.logger.Info("review gate: CODEOWNERS contributes no reviewers because the base branch has no CODEOWNERS file",
+			"repo", repo, "database", database, "base_ref", baseRef)
 		return nil, nil
 	}
 
-	var owners []codeowners.Owner
-	if schemaPath != "" {
-		matchPath := strings.TrimSuffix(schemaPath, "/") + "/.schema"
-		owners, err = ghclient.MatchCodeownersPath(ruleset, matchPath)
-		if err != nil {
-			return nil, fmt.Errorf("match CODEOWNERS for %s: %w", schemaPath, err)
-		}
+	matchPath := path.Join(schemaPath, ".schema")
+	owners, err := ghclient.MatchCodeownersPath(ruleset, matchPath)
+	if err != nil {
+		return nil, fmt.Errorf("match CODEOWNERS for %s: %w", schemaPath, err)
 	}
-	if owners == nil {
-		owners = ghclient.OwnersFromRuleset(ruleset)
+	if len(owners) == 0 {
+		h.logger.Info("review gate: CODEOWNERS contributes no reviewers because no CODEOWNERS rule assigns owners to the schema directory",
+			"repo", repo, "database", database, "base_ref", baseRef, "schema_path", schemaPath)
+		return nil, nil
 	}
 	return owners, nil
 }

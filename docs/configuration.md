@@ -1941,6 +1941,8 @@ CODEOWNERS support is opt-in because CODEOWNERS is repo-controlled while review 
 
 The base branch is used, not the PR's head branch, to prevent a PR from relaxing its own approval requirements by modifying CODEOWNERS.
 
+Only the owners of the database's schema directory count, resolved the way GitHub resolves them: the last rule matching that directory wins. A schema directory that no rule matches, or that a rule leaves explicitly unowned, has no code owners, so CODEOWNERS adds no reviewers for it and only the other configured principals can approve. Owners of other paths in the repository never satisfy the gate. If CODEOWNERS is the only source of reviewers and no rule owns the schema directory, the review gate fails with an error until a rule covers it or another principal is configured.
+
 Approval is checked at the time of `schemabot apply` and `schemabot apply-confirm`. Once an apply is executing, there is no ongoing approval check. Team membership and CODEOWNERS are evaluated fresh at each gate check.
 
 An approval counts only for the schema change it reviewed, whatever the repository's branch protection does with stale approvals. Each reviewer's latest decisive review is used, and an approval satisfies the gate when it was given on the PR's current head commit, or on an earlier commit at which the PR's change to the database's schema inputs is the same as at the head. A database's schema inputs are its schema directory, the environment symlink that directory was resolved through (if any), its `schemabot.yaml`, and the target of every symlink inside them. Changes elsewhere in the repository, including another database's schema, do not affect the approval.

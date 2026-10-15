@@ -1583,6 +1583,130 @@ func TestCheckReviewGate_CodeownersOptIn(t *testing.T) {
 	assert.Contains(t, result.OtherReviewers, "carol")
 }
 
+// TestCheckReviewGate_CodeownersScopedToSchemaDirectory pins that CODEOWNERS
+// grants approval authority only through the rule that owns the database's
+// schema directory. A directory no rule matches, one a rule leaves explicitly
+// unowned, or an unknown directory has no code owners, so the owner of an
+// unrelated path cannot approve the schema change; configured admins still can.
+func TestCheckReviewGate_CodeownersScopedToSchemaDirectory(t *testing.T) {
+	tests := []struct {
+		name           string
+		codeowners     string
+		schemaPath     string
+		approver       string
+		wantApproved   bool
+		wantOtherNames []string
+	}{
+		{
+			name:           "unmatched directory ignores owners of unrelated paths",
+			codeowners:     "/web/ @frank\n/infra/ @erin\n",
+			schemaPath:     "schema/payments",
+			approver:       "frank",
+			wantApproved:   false,
+			wantOtherNames: []string{"zoe"},
+		},
+		{
+			name:           "matched directory accepts its owner",
+			codeowners:     "/web/ @frank\n/schema/payments/ @erin\n",
+			schemaPath:     "schema/payments",
+			approver:       "erin",
+			wantApproved:   true,
+			wantOtherNames: []string{"zoe", "erin"},
+		},
+		{
+			name:           "explicitly unowned directory has no code owners",
+			codeowners:     "* @frank\n/schema/payments/\n",
+			schemaPath:     "schema/payments",
+			approver:       "frank",
+			wantApproved:   false,
+			wantOtherNames: []string{"zoe"},
+		},
+		{
+			name:           "unknown schema directory has no code owners",
+			codeowners:     "* @frank\n",
+			schemaPath:     "",
+			approver:       "frank",
+			wantApproved:   false,
+			wantOtherNames: []string{"zoe"},
+		},
+		{
+			name:           "repository root schema directory matches root rules",
+			codeowners:     "* @frank\n",
+			schemaPath:     ".",
+			approver:       "frank",
+			wantApproved:   true,
+			wantOtherNames: []string{"zoe", "frank"},
+		},
+		{
+			name:           "configured admin still approves an unmatched directory",
+			codeowners:     "/web/ @frank\n",
+			schemaPath:     "schema/payments",
+			approver:       "zoe",
+			wantApproved:   true,
+			wantOtherNames: []string{"zoe"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h, mux := setupReviewGateHandler(t, reviewGateTestConfig(func(cfg *api.ServerConfig) {
+				cfg.ReviewPolicy.IncludeCodeowners = true
+				cfg.ReviewPolicy.IncludeDatabaseOperators = new(false)
+				cfg.ReviewPolicy.AdminUsers = []string{"zoe"}
+			}))
+
+			registerPREndpoint(mux, "alice")
+			registerCodeownersEndpoint(mux, tt.codeowners, true)
+			registerReviewsEndpoint(mux, []*gh.PullRequestReview{
+				{
+					User:        &gh.User{Login: new(tt.approver)},
+					State:       new(ghclient.ReviewApproved),
+					CommitID:    new(reviewGateTestHeadSHA),
+					SubmittedAt: &gh.Timestamp{Time: time.Now()},
+				},
+			})
+
+			client, err := h.clientForRepo("octocat/hello-world", 12345)
+			require.NoError(t, err)
+
+			result, err := h.checkReviewGate(t.Context(), client, "octocat/hello-world", 1, reviewGateSchema(tt.schemaPath, reviewGateTestHeadSHA))
+			require.NoError(t, err)
+			require.NotNil(t, result)
+			assert.Equal(t, tt.wantApproved, result.Approved)
+			assert.Equal(t, tt.wantOtherNames, result.OtherReviewers)
+		})
+	}
+}
+
+// TestCheckReviewGate_UnmatchedCodeownersWithoutOtherReviewersErrors pins that
+// a policy whose only source of reviewers is CODEOWNERS fails closed when no
+// rule owns the schema directory, rather than approving through the owners of
+// unrelated paths.
+func TestCheckReviewGate_UnmatchedCodeownersWithoutOtherReviewersErrors(t *testing.T) {
+	h, mux := setupReviewGateHandler(t, reviewGateTestConfig(func(cfg *api.ServerConfig) {
+		cfg.ReviewPolicy.IncludeCodeowners = true
+		cfg.ReviewPolicy.IncludeDatabaseOperators = new(false)
+	}))
+
+	registerPREndpoint(mux, "alice")
+	registerCodeownersEndpoint(mux, "/web/ @frank\n", true)
+	registerReviewsEndpoint(mux, []*gh.PullRequestReview{
+		{
+			User:        &gh.User{Login: new("frank")},
+			State:       new(ghclient.ReviewApproved),
+			CommitID:    new(reviewGateTestHeadSHA),
+			SubmittedAt: &gh.Timestamp{Time: time.Now()},
+		},
+	})
+
+	client, err := h.clientForRepo("octocat/hello-world", 12345)
+	require.NoError(t, err)
+
+	result, err := h.checkReviewGate(t.Context(), client, "octocat/hello-world", 1, reviewGateSchema("schema/payments", reviewGateTestHeadSHA))
+	require.Error(t, err)
+	assert.Nil(t, result)
+	assert.Contains(t, err.Error(), "no configured reviewers")
+}
+
 func TestCheckReviewGate_NoConfiguredReviewersErrors(t *testing.T) {
 	h, mux := setupReviewGateHandler(t, reviewGateTestConfig(func(cfg *api.ServerConfig) {
 		cfg.ReviewPolicy.IncludeDatabaseOperators = new(false)
