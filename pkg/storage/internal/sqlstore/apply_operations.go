@@ -1446,14 +1446,16 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 	// A barrier-parked operation is driven by nothing: its copy drive exits at
 	// the barrier, the stale-active arm leaves it to the cutover claim, and the
 	// cutover claim will not start it behind a failed earlier sibling under
-	// halt. A pending cancel is the one request that must still reach it, so
-	// the drive that delivers the cancel claims it here. The claim leaves the
-	// row parked, so it carries the rematch guard; the drive moves it out of
-	// waiting_for_cutover once the cancel lands.
+	// halt, nor while the rollout is being stopped. A pending cancel or stop
+	// must still reach it, so the drive that delivers the request claims it
+	// here: without it the parked row never settles, the parent never derives
+	// stopped or cancelled, and the request is never completed. The claim
+	// leaves the row parked, so it carries the rematch guard; the drive moves
+	// it out of waiting_for_cutover once the request lands.
 	queryArgs = append(queryArgs,
 		state.ApplyOperation.WaitingForCutover,
 		storage.CutoverPolicyBarrier, storage.CutoverPolicyParallel,
-		storage.ControlOperationCancel, storage.ControlRequestPending)
+		storage.ControlOperationCancel, storage.ControlOperationStop, storage.ControlRequestPending)
 	// Deferred-deploy start gate keys on the PARENT apply state, not the
 	// operation state: the operation row stays active (running) while the apply
 	// parks at waiting_for_deploy, because the copy phase finished and only the
@@ -1485,8 +1487,9 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 	//     the row stopped; see requestRematchGuardSQL.
 	//
 	//   - An operation parked at the cutover barrier of a multi-operation
-	//     apply whose parent has a pending cancel request is reclaimable so the
-	//     drive can deliver the cancel to the engine holding the parked copy.
+	//     apply whose parent has a pending cancel or stop request is
+	//     reclaimable so the drive can deliver it to the engine holding the
+	//     parked copy.
 	//     Nothing else drives a parked row before its cutover turn, and under
 	//     halt that turn never comes. The arm carries the rematch guard because
 	//     the claim leaves the row parked.
@@ -1554,11 +1557,11 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 	// they do in ApplyStore.ClaimApplyByID: the stopped+cancel claim moves the row
 	// out of stopped atomically with its lease rotation, so no peer can match it
 	// in the same second and it can admit an equal timestamp; the
-	// waiting_for_deploy and parked+cancel claims leave the row where it is and
+	// waiting_for_deploy and parked claims leave the row where it is and
 	// must refuse one. See leaseRematchComparison.
 	deferredDeployGuard := requestRematchGuardSQL("apply_operations", rematchOnlyAfterLease, staleClaimCutoff)
 	stoppedCancelGuard := requestRematchGuardSQL("apply_operations", rematchAtOrAfterLease, staleClaimCutoff)
-	parkedCancelGuard := requestRematchGuardSQL("apply_operations", rematchOnlyAfterLease, staleClaimCutoff)
+	parkedControlGuard := requestRematchGuardSQL("apply_operations", rematchOnlyAfterLease, staleClaimCutoff)
 	row := tx.QueryRowContext(ctx, fmt.Sprintf(`
 		SELECT %s
 		FROM apply_operations
@@ -1635,9 +1638,9 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 					SELECT 1
 					FROM apply_control_requests cr
 					WHERE cr.apply_id = apply_operations.apply_id
-						AND cr.operation = ?
+						AND cr.operation IN (?, ?)
 						AND cr.status = ?
-						AND `+parkedCancelGuard+`
+						AND `+parkedControlGuard+`
 				)
 			)
 			OR (

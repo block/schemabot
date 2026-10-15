@@ -900,6 +900,65 @@ func TestApplies(t *testing.T, h Harness) {
 		assert.Nil(t, cutover, "the parked operation still does not cut over behind the failure")
 	})
 
+	// A stop reaches a barrier rollout while shard 1 is still copying and
+	// shard 2 has parked at the barrier. Shard 1's drive stops its own copy,
+	// but shard 2's copy drive already exited at the barrier, and a pending
+	// stop keeps the cutover claim away from it. The stop makes it claimable
+	// once, for the drive that settles it stopped; without that the parent
+	// never derives stopped and the stop is never completed. The claim leaves
+	// it parked and is not repeated while that drive holds the lease.
+	t.Run("FindNextApplyOperation_PendingStopClaimsOperationParkedAtBarrier", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "apply_rollout_parked_stop_db", storage.DatabaseTypeMySQL)
+		rollout := CreateApplyWithStateEnvDeployment(t, store, lock, "apply_rollout_parked_stop", 9335, state.Apply.Pending, "production", "region-a")
+		insert := func(target, key, operationState string) int64 {
+			id, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+				ApplyID: rollout.ID, Deployment: "region-a", Target: target, OperationKey: storage.TargetOperationKey(target, key),
+				OperationKind: storage.ApplyOperationKindWork, CutoverPolicy: storage.CutoverPolicyBarrier, OnFailure: storage.OnFailureHalt,
+				State: operationState,
+			})
+			require.NoError(t, err)
+			return id
+		}
+		insert("orders-001", "step-1", state.ApplyOperation.Stopped)
+		parkedID := insert("orders-002", "step-1", state.ApplyOperation.WaitingForCutover)
+		insert("orders-003", "step-1", state.ApplyOperation.Stopped)
+		rollout.State = state.Apply.WaitingForCutover
+		require.NoError(t, store.Applies().Update(ctx, rollout))
+
+		idle, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-a")
+		require.NoError(t, err)
+		assert.Nil(t, idle, "without a control request nothing claims the parked or stopped operations")
+
+		_, alreadyPending, err := store.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+			ApplyID:   rollout.ID,
+			Operation: storage.ControlOperationStop,
+			Status:    storage.ControlRequestPending,
+			Metadata:  []byte(`{}`),
+		})
+		require.NoError(t, err)
+		require.False(t, alreadyPending)
+
+		cutover, err := store.ApplyOperations().FindNextApplyOperationCutover(ctx, "driver-b")
+		require.NoError(t, err)
+		assert.Nil(t, cutover, "a pending stop keeps the parked operation from cutting over")
+
+		claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-a")
+		require.NoError(t, err)
+		require.NotNil(t, claimed, "a pending stop makes the parked operation claimable")
+		assert.Equal(t, parkedID, claimed.ID)
+		held, err := store.ApplyOperations().Get(ctx, parkedID)
+		require.NoError(t, err)
+		require.NotNil(t, held)
+		assert.Equal(t, state.ApplyOperation.WaitingForCutover, held.State, "the claim leaves the operation parked")
+		assert.Equal(t, claimed.LeaseToken, held.LeaseToken)
+
+		again, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-b")
+		require.NoError(t, err)
+		assert.Nil(t, again, "the stop is delivered by the drive that holds the lease, not re-claimed")
+	})
+
 	// Moving an existing apply back into an active state runs the same check as
 	// creating one, so neither the general update nor the resume claim of a
 	// stopped apply can activate an apply on a target of a rollout whose parent
