@@ -264,7 +264,8 @@ caller gets a fixed internal error, never the panic text or a stack. *Enforced:*
 boundary in `pkg/panicsafe/panicsafe.go`, applied around webhook work units
 (`pkg/webhook/handler.go`, `pkg/webhook/durable_dispatch.go`), local drives
 (`pkg/tern/local_apply.go`), and the startup target probe (`pkg/serve/serve.go`
-around enumeration, `pkg/targetprobe/targetprobe.go` around each target).
+around enumeration, `pkg/targetprobe/targetprobe.go` around each target); the contained drive
+panic becomes a permanent `failed` in `failClaimedApplyAfterDrivePanic` (`pkg/api/operator.go`).
 
 ### AV-6: Mixed versions are survivable by contract, not by guesswork
 

@@ -7,7 +7,9 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"os"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -2176,6 +2178,182 @@ func TestResumeClaimedApply_DrivePanicFailsApply(t *testing.T) {
 	require.Len(t, taskStore.updated, 1, "the in-flight task must be settled")
 	assert.True(t, state.IsState(taskStore.updated[0].State, state.Task.Failed))
 	assert.Contains(t, taskStore.updated[0].ErrorMessage, "corrupt engine metadata")
+}
+
+// snapshotTaskStore stores task rows the way storage does: a read returns a
+// copy, and a row changes only when its write succeeds. refuse names the tasks
+// whose writes fail with refuseErr.
+type snapshotTaskStore struct {
+	storage.TaskStore
+	rows      map[int64]storage.Task
+	refuse    map[int64]bool
+	refuseErr error
+}
+
+func (s *snapshotTaskStore) GetByApplyID(_ context.Context, applyID int64) ([]*storage.Task, error) {
+	var tasks []*storage.Task
+	for _, id := range slices.Sorted(maps.Keys(s.rows)) {
+		if row := s.rows[id]; row.ApplyID == applyID {
+			tasks = append(tasks, &row)
+		}
+	}
+	return tasks, nil
+}
+
+func (s *snapshotTaskStore) Update(_ context.Context, task *storage.Task) error {
+	if s.refuse[task.ID] {
+		return s.refuseErr
+	}
+	s.rows[task.ID] = *task
+	return nil
+}
+
+// A drive panic is contained while storage refuses one task's failed verdict.
+// The apply is still failed: an apply left active would be claimed again and
+// resumed through the engine, feeding the input that panicked straight back.
+// The refused task keeps its stored running state until the stranded
+// active-task reaper settles it under the failed apply.
+func TestResumeClaimedApply_DrivePanicWithRefusedTaskVerdictStillFailsApply(t *testing.T) {
+	client := &panickingResumeClient{panicValue: "corrupt engine metadata"}
+	apply := &storage.Apply{
+		ID:              42,
+		ApplyIdentifier: "apply-42",
+		Database:        "appdb",
+		Deployment:      "east",
+		Environment:     "staging",
+		State:           state.Apply.Running,
+		LeaseOwner:      "driver-0",
+		LeaseToken:      "lease-token",
+	}
+	applyStore := &panicContainmentApplyStore{apply: apply}
+	taskStore := &snapshotTaskStore{
+		rows: map[int64]storage.Task{
+			9:  {ID: 9, ApplyID: 42, TaskIdentifier: "task-orders", State: state.Task.Running},
+			10: {ID: 10, ApplyID: 42, TaskIdentifier: "task-users", State: state.Task.Running},
+		},
+		refuse:    map[int64]bool{9: true},
+		refuseErr: errors.New("storage unavailable"),
+	}
+	svc := New(&mockStorageWithApplyStores{
+		plans:   &staticPlanStore{},
+		applies: applyStore,
+		tasks:   taskStore,
+	}, &ServerConfig{}, map[string]tern.Client{
+		"east/staging": client,
+	}, slog.New(slog.DiscardHandler))
+
+	ctx := storage.WithApplyLease(t.Context(), apply.Lease())
+	claimed := *apply
+	var err error
+	require.NotPanics(t, func() {
+		_, err = svc.resumeClaimedApply(ctx, 0, &claimed, 0, "")
+	})
+
+	var drivePanic *panicsafe.Error
+	require.ErrorAs(t, err, &drivePanic)
+	require.True(t, applyStore.updateCalled, "the apply is failed even though a task verdict did not land")
+	assert.True(t, state.IsState(applyStore.apply.State, state.Apply.Failed),
+		"failed (permanent), so no claim resumes the apply through the engine again")
+	assert.True(t, state.IsState(taskStore.rows[9].State, state.Task.Running),
+		"the refused verdict leaves the stored row as it was, for the stranded active-task reaper")
+	assert.True(t, state.IsState(taskStore.rows[10].State, state.Task.Failed),
+		"a refused verdict does not stop the later tasks recording theirs")
+}
+
+// refusedVerdictLogLine is the subset of a JSON log line the refused task
+// verdict test reads.
+type refusedVerdictLogLine struct {
+	Level               string `json:"level"`
+	Msg                 string `json:"msg"`
+	ApplyID             string `json:"apply_id"`
+	State               string `json:"state"`
+	TaskID              string `json:"task_id"`
+	Table               string `json:"table"`
+	StoredState         string `json:"stored_state"`
+	AttemptedState      string `json:"attempted_state"`
+	ApplyOperationID    *int64 `json:"apply_operation_id"`
+	OperationDeployment string `json:"operation_deployment"`
+}
+
+// A drive panic is contained while storage refuses a task's failed verdict,
+// and the refusal is logged by cause so an operator can triage it: a lost
+// lease and a cancelled drive are warnings, a rejected value and a storage
+// error are errors. Each line reports the state the rows actually hold — the
+// apply's state and the task's stored state — with the refused verdict under
+// its own key, and carries the operation routing attributes.
+func TestFailClaimedApplyAfterDrivePanic_RefusedVerdictLogsByCause(t *testing.T) {
+	cases := []struct {
+		name      string
+		refuseErr error
+		cancel    bool
+		wantLevel string
+		wantMsg   string
+	}{
+		{"lease lost", fmt.Errorf("update task: %w", storage.ErrApplyLeaseLost), false, "WARN", "because the drive's lease was lost"},
+		{"cancelled", errors.New("context canceled"), true, "WARN", "because the drive was cancelled"},
+		{"value rejected", fmt.Errorf("update task: %w", storage.ErrValueRejected), false, "ERROR", "storage cannot hold a value it carries; the apply's failed verdict is attempted next"},
+		{"storage error", errors.New("storage unavailable"), false, "ERROR", "storage error recording task failed verdict while containing drive panic; the apply's failed verdict is attempted next"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			logger := slog.New(slog.NewJSONHandler(&buf, nil))
+			apply := &storage.Apply{
+				ID:              42,
+				ApplyIdentifier: "apply-42",
+				Database:        "appdb",
+				Environment:     "staging",
+				State:           state.Apply.Running,
+				LeaseOwner:      "driver-0",
+				LeaseToken:      "lease-token",
+			}
+			applyStore := &panicContainmentApplyStore{apply: apply}
+			taskStore := &snapshotTaskStore{
+				rows: map[int64]storage.Task{
+					9: {ID: 9, ApplyID: 42, TaskIdentifier: "task-orders", TableName: "orders", State: state.Task.WaitingForCutover},
+				},
+				refuse:    map[int64]bool{9: true},
+				refuseErr: tc.refuseErr,
+			}
+			svc := New(&mockStorageWithApplyStores{
+				plans:   &staticPlanStore{},
+				applies: applyStore,
+				tasks:   taskStore,
+			}, &ServerConfig{}, map[string]tern.Client{}, logger)
+
+			ctx := storage.WithApplyLease(t.Context(), apply.Lease())
+			if tc.cancel {
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithCancel(ctx)
+				cancel()
+			}
+			claimed := *apply
+			failed := svc.failClaimedApplyAfterDrivePanic(ctx, 0, &claimed, 0, "east", &panicsafe.Error{Value: "boom"})
+			assert.True(t, failed, "the apply's failed verdict is still written after a refused task verdict")
+
+			var refusal *refusedVerdictLogLine
+			for raw := range bytes.SplitSeq(bytes.TrimSpace(buf.Bytes()), []byte("\n")) {
+				var line refusedVerdictLogLine
+				require.NoError(t, json.Unmarshal(raw, &line))
+				if bytes.Contains([]byte(line.Msg), []byte(tc.wantMsg)) {
+					refusal = &line
+				}
+			}
+			require.NotNil(t, refusal, "no log line carried %q:\n%s", tc.wantMsg, buf.String())
+			assert.Equal(t, tc.wantLevel, refusal.Level)
+			assert.Equal(t, "apply-42", refusal.ApplyID)
+			assert.Equal(t, state.Apply.Running, refusal.State,
+				"state is the apply's, which containment has not written yet, not the refused task verdict")
+			assert.Equal(t, "task-orders", refusal.TaskID)
+			assert.Equal(t, "orders", refusal.Table)
+			assert.Equal(t, state.Task.WaitingForCutover, refusal.StoredState,
+				"stored_state is the state the task row still holds")
+			assert.Equal(t, state.Task.Failed, refusal.AttemptedState)
+			require.NotNil(t, refusal.ApplyOperationID, "the operation routing attributes are logged")
+			assert.Equal(t, int64(0), *refusal.ApplyOperationID)
+			assert.Equal(t, "east", refusal.OperationDeployment)
+		})
+	}
 }
 
 // A drive panic contained while holding only an operation lease fails the
