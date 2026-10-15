@@ -4986,9 +4986,9 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 *Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
 
-**Status**: Checksumming
+**Options**: ⏸️ Defer Cutover
 
-**Options**: ⏸️ Defer Cutover — pauses before cutover and waits for `schemabot cutover`
+**Status**: Checksumming
 
 📊 1/3 complete · 1 checksumming · 1 queued
 

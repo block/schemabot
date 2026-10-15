@@ -13,7 +13,7 @@ import (
 	"github.com/block/schemabot/pkg/storage"
 )
 
-const wantDeferredCutoverLine = "\n**Options**: ⏸️ Defer Cutover — pauses before cutover and waits for `schemabot cutover`\n"
+const wantDeferredCutoverLine = "\n**Options**: ⏸️ Defer Cutover\n"
 
 func deferredCutoverApplyData(applyState, taskState string, deferCutover bool) ApplyStatusCommentData {
 	return ApplyStatusCommentData{
@@ -31,9 +31,9 @@ func deferredCutoverApplyData(applyState, taskState string, deferCutover bool) A
 }
 
 // An apply started with --defer-cutover that is still copying rows or
-// checksumming tells the PR reader, right under its status, that it will pause
-// before cutover and wait for `schemabot cutover`, so a long copy is not read
-// as a change that will finish on its own.
+// checksumming tells the PR reader, right above the status that changes on
+// every update, that it was started with cutover deferred, so a long copy is
+// not read as a change that will finish on its own.
 func TestRenderApplyStatusComment_DeferredCutoverLineBeforeCutover(t *testing.T) {
 	for name, tc := range map[string]struct {
 		applyState, taskState, status string
@@ -44,7 +44,7 @@ func TestRenderApplyStatusComment_DeferredCutoverLineBeforeCutover(t *testing.T)
 		t.Run(name, func(t *testing.T) {
 			out := RenderApplyStatusComment(deferredCutoverApplyData(tc.applyState, tc.taskState, true))
 
-			assert.Contains(t, out, "\n**Status**: "+tc.status+"\n"+wantDeferredCutoverLine, out)
+			assert.Contains(t, out, wantDeferredCutoverLine+"\n**Status**: "+tc.status+"\n", out)
 			assert.Equal(t, 1, strings.Count(out, "Defer Cutover"), out)
 			assert.Contains(t, out, "To stop this schema change:\n```\nschemabot stop apply-abc123 -e production\n```\n", "the footer still offers stop")
 		})

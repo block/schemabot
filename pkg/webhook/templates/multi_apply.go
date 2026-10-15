@@ -108,6 +108,13 @@ func renderMultiDeploymentApplyComment(data MultiDeploymentApplyData, renderedAt
 	// single-deployment comment so the headline vocabulary stays shared.
 	writeApplyStatusHeader(&sb, ApplyStatusCommentData{State: data.Model.State, Environment: data.Environment, Rollback: data.Rollback})
 	writeAggregateMetadata(&sb, data, renderedAt)
+	// The deferral is the apply's, so it is stated once here, above the
+	// changing status, rather than in each deployment's section. A rollout
+	// already waiting for cutover puts the command in the footer, which says
+	// it instead.
+	if data.Model.NextAction.Kind != presentation.NextActionCutover {
+		writeDeferredCutoverNote(&sb, rolloutDefersCutover(data.Details), data.Model.State)
+	}
 	groups := groupsWithChanges(data.Model, data.Model.Groups())
 	if g, ok := soleTargetRollout(groups); ok {
 		writeTargetRolloutBody(&sb, data, g, budget)
@@ -118,12 +125,6 @@ func renderMultiDeploymentApplyComment(data MultiDeploymentApplyData, renderedAt
 		return sb.String()
 	}
 	writeDeploymentCounts(&sb, data.Model.Counts, groups)
-	// The deferral is the apply's, so it is stated once here rather than in
-	// each deployment's section. A deployment already waiting for cutover
-	// puts the command in the footer, which says it instead.
-	if data.Model.NextAction.Kind != presentation.NextActionCutover {
-		writeDeferredCutoverNote(&sb, rolloutDefersCutover(data.Details), data.Model.State)
-	}
 	writeAggregateFirstFailure(&sb, data.Model.FirstFailure)
 
 	// Flat per-deployment summary (always visible — survives any later size

@@ -237,13 +237,16 @@ func renderApplyStatusCommentBody(data ApplyStatusCommentData, includeLastUpdate
 	// Metadata line
 	writeApplyMetadata(&sb, data, renderedAt)
 
+	// The apply's options sit above the status: they hold for the whole apply
+	// while the status changes on every update.
+	if !data.InRolloutSection {
+		writeDeferredCutoverNote(&sb, data.DeferCutover, data.State)
+	}
+
 	// Status line. For the revert window it carries the countdown to permanence
 	// inline (e.g. "Revert Window | Closes in 28m 30s") so the operator sees the
 	// state and its deadline in one place rather than on a separate line.
 	writeApplyStatusDetail(&sb, data)
-	if !data.InRolloutSection {
-		writeDeferredCutoverNote(&sb, data.DeferCutover, data.State)
-	}
 	writeApplyStep(&sb, data)
 
 	// Deploy-request link (PlanetScale) — the operator's entry point into the
@@ -444,10 +447,10 @@ func writeApplyStatusDetail(sb *strings.Builder, data ApplyStatusCommentData) {
 }
 
 // deferredCutoverNote tells the reader of a deferred apply that has not yet
-// reached cutover what happens next and what they will do then. It reuses the
-// plan and apply comments' option label, so the option reads the same from the
-// plan through the apply.
-const deferredCutoverNote = "**Options**: ⏸️ Defer Cutover — pauses before cutover and waits for `schemabot cutover`"
+// reached cutover that the apply will wait for them at the cutover gate. It
+// reuses the plan and apply comments' option label, so the option reads the
+// same from the plan through the apply.
+const deferredCutoverNote = "**Options**: ⏸️ Defer Cutover"
 
 // writeDeferredCutoverNote writes the deferred-cutover line while a deferred
 // apply is still working toward its cutover pause. Once the apply waits for

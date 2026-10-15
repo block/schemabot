@@ -329,13 +329,12 @@ func RenderApplyStarted(data ApplyStatusCommentData) string {
 
 	writeApplyStatusHeader(&sb, data)
 	writeApplyMetadata(&sb, data, currentTimestamp())
+	writeDeferredCutoverNote(&sb, data.DeferCutover, data.State)
 	if state.IsState(data.State, state.Apply.Pending) {
 		writeApplyStatusDetail(&sb, data)
-		writeDeferredCutoverNote(&sb, data.DeferCutover, data.State)
 		return sb.String()
 	}
 	sb.WriteString("\nSchema changes are being applied. This comment will be updated with progress.\n")
-	writeDeferredCutoverNote(&sb, data.DeferCutover, data.State)
 
 	return sb.String()
 }

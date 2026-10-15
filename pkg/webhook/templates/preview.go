@@ -2453,8 +2453,8 @@ func PreviewCommentApplyChecksumming() string {
 }
 
 // PreviewCommentApplyChecksummingDeferredCutover renders the checksumming
-// comment for an apply started with --defer-cutover, which tells the reader the
-// apply pauses before cutover and waits for them.
+// comment for an apply started with --defer-cutover, which carries the
+// deferred-cutover option.
 func PreviewCommentApplyChecksummingDeferredCutover() string {
 	tables := sampleApplyTables()
 	tables[0].Status = state.Task.Completed
