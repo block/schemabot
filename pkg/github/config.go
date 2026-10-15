@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"path"
+	"slices"
 	"sort"
 	"strings"
 
@@ -574,12 +575,7 @@ func (ic *InstallationClient) FindConfigsForPRFiles(ctx context.Context, repo, r
 		probes[configDir] = config
 	}
 
-	var filenames []string
-	for _, f := range files {
-		filenames = append(filenames, f.Filename)
-	}
-	schemaFiles := filterSchemaFiles(filenames)
-	for _, schemaFile := range schemaFiles {
+	for _, schemaFile := range discoverySchemaPaths(files) {
 		config, configDir, err := ic.findNearestConfig(ctx, repo, ref, schemaFile, probes)
 		if err != nil {
 			return nil, err
@@ -659,16 +655,34 @@ func isDiscoveryInputFile(filename string) bool {
 	return IsSchemaFile(filename) || isConfigFile(filename)
 }
 
+// renamedAwaySchemaPath reports the schema file path a rename vacated when it is
+// not also the file's current path. A rename that moves a schema file to a
+// non-schema name, or out of every config directory, stops the default branch
+// declaring its tables, so discovery must still resolve the config that managed
+// the old path — as it does for a plain deletion.
+func renamedAwaySchemaPath(file PRFile) (string, bool) {
+	vacated, ok := vacatedSchemaPath(file)
+	if !ok || vacated == file.Filename {
+		return "", false
+	}
+	return vacated, true
+}
+
+// isDiscoveryInputPRFile reports whether a changed file can make a pull request
+// resolve a database, by its current path or by the schema path it vacated.
+func isDiscoveryInputPRFile(file PRFile) bool {
+	if isDiscoveryInputFile(file.Filename) {
+		return true
+	}
+	_, vacated := renamedAwaySchemaPath(file)
+	return vacated
+}
+
 // HasDiscoveryInputFiles reports whether any changed file could resolve a
 // database. Callers use it to skip work entirely on the pull requests — most of
 // them, in a repository of any size — that touch no schema at all.
 func HasDiscoveryInputFiles(files []PRFile) bool {
-	for _, file := range files {
-		if isDiscoveryInputFile(file.Filename) {
-			return true
-		}
-	}
-	return false
+	return slices.ContainsFunc(files, isDiscoveryInputPRFile)
 }
 
 func isRemovedPRFile(status string) bool {
@@ -679,11 +693,17 @@ func isRenamedPRFile(status string) bool {
 	return strings.EqualFold(status, "renamed")
 }
 
-func filterSchemaFiles(files []string) []string {
+// discoverySchemaPaths returns the schema file paths discovery walks up from:
+// each changed file's current path when it is a schema file, and the schema
+// path a rename vacated.
+func discoverySchemaPaths(files []PRFile) []string {
 	var result []string
 	for _, file := range files {
-		if IsSchemaFile(file) {
-			result = append(result, file)
+		if IsSchemaFile(file.Filename) {
+			result = append(result, file.Filename)
+		}
+		if vacated, ok := renamedAwaySchemaPath(file); ok {
+			result = append(result, vacated)
 		}
 	}
 	return result

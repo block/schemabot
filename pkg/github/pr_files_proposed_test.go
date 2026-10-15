@@ -173,6 +173,34 @@ func TestPRFilesProposedAgainstDefaultBranchKeepsDeletionsAndConfigs(t *testing.
 	assert.Equal(t, []string{"schema/orders/dropped.sql", "schema/orders/schemabot.yaml"}, filenames(proposed))
 }
 
+// TestPRFilesProposedAgainstDefaultBranchKeepsRenamesThatVacateSchema covers a
+// rename that moves a schema file to a name discovery does not read. The
+// rename the pull request proposes — the head lacks the old path and the
+// default branch still declares it — is kept so discovery resolves the config
+// that managed it. A rename the default branch already holds is inherited
+// history and is dropped.
+func TestPRFilesProposedAgainstDefaultBranchKeepsRenamesThatVacateSchema(t *testing.T) {
+	repo := proposedFilesRepo{
+		head: map[string]string{
+			"schema/orders/users.sql.disabled": "users-blob",
+			"schema/billing/invoices.md":       "invoices-blob",
+		},
+		defaultTip: map[string]string{
+			"schema/orders/users.sql":    "users-blob",
+			"schema/billing/invoices.md": "invoices-blob",
+		},
+	}
+	ic, _ := newProposedFilesClient(t, repo)
+
+	proposed, _, err := ic.PRFilesProposedAgainstDefaultBranch(t.Context(), "octocat/hello-world", "head-sha", []PRFile{
+		{Filename: "schema/orders/users.sql.disabled", PreviousFilename: "schema/orders/users.sql", Status: "renamed"},
+		{Filename: "schema/billing/invoices.md", PreviousFilename: "schema/billing/invoices.sql", Status: "renamed"},
+	})
+
+	require.NoError(t, err)
+	assert.Equal(t, []string{"schema/orders/users.sql.disabled"}, filenames(proposed))
+}
+
 // TestPRFilesProposedAgainstDefaultBranchSkipsPullRequestsWithoutSchema
 // verifies that the narrowing costs nothing on the pull requests that never
 // resolve a database — most of them, in a repository of any size. With no file
