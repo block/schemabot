@@ -2045,6 +2045,60 @@ func TestApplyOperations(t *testing.T, h Harness) {
 		_, err := store.ApplyOperations().FindNextApplyOperation(t.Context(), "driver")
 		require.Error(t, err)
 	})
+
+	// ListRecentTargets_DistinctTargetsOfOneType verifies that a data plane
+	// learns every target it applied to for one database type: each
+	// (database, environment, target) appears once however many operations
+	// ran against it, settled applies count, and operations of another
+	// database type or with no target are left out.
+	t.Run("ListRecentTargets_DistinctTargetsOfOneType", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		insertTargeted := func(t *testing.T, applyID int64, deployment, target string) {
+			t.Helper()
+			_, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+				ApplyID: applyID, Deployment: deployment, Target: target,
+			})
+			require.NoError(t, err)
+		}
+
+		orders := CreateLock(t, store, "orders", storage.DatabaseTypeVitess)
+		ordersStaging := CreateApplyWithStateAndEnv(t, store, orders, "apply_orders_staging", 981, state.Apply.Completed, "staging")
+		insertTargeted(t, ordersStaging.ID, "region-a", "orders-staging-a")
+		insertTargeted(t, ordersStaging.ID, "region-b", "orders-staging-b")
+		ordersRetry := CreateApplyWithStateAndEnv(t, store, orders, "apply_orders_staging_retry", 982, state.Apply.Failed, "staging")
+		insertTargeted(t, ordersRetry.ID, "region-a", "orders-staging-a")
+		ordersProduction := CreateApplyWithStateAndEnv(t, store, orders, "apply_orders_production", 983, state.Apply.Running, "production")
+		insertTargeted(t, ordersProduction.ID, "region-a", "orders-production-a")
+		insertTargeted(t, ordersProduction.ID, "region-c", "")
+
+		billing := CreateLock(t, store, "billing", storage.DatabaseTypeMySQL)
+		billingStaging := CreateApplyWithStateAndEnv(t, store, billing, "apply_billing_staging", 984, state.Apply.Completed, "staging")
+		insertTargeted(t, billingStaging.ID, "region-a", "billing-staging-a")
+
+		targets, err := store.ApplyOperations().ListRecentTargets(ctx, storage.DatabaseTypeVitess, 24*time.Hour)
+		require.NoError(t, err)
+		assert.Equal(t, []storage.AppliedTarget{
+			{Database: "orders", Environment: "production", Target: "orders-production-a"},
+			{Database: "orders", Environment: "staging", Target: "orders-staging-a"},
+			{Database: "orders", Environment: "staging", Target: "orders-staging-b"},
+		}, targets)
+
+		mysqlTargets, err := store.ApplyOperations().ListRecentTargets(ctx, storage.DatabaseTypeMySQL, 24*time.Hour)
+		require.NoError(t, err)
+		assert.Equal(t, []storage.AppliedTarget{
+			{Database: "billing", Environment: "staging", Target: "billing-staging-a"},
+		}, mysqlTargets)
+
+		_, err = store.ApplyOperations().ListRecentTargets(ctx, storage.DatabaseTypeVitess, 0)
+		require.ErrorContains(t, err, "lookback must be positive")
+	})
+
+	t.Run("ListRecentTargets_DBError", func(t *testing.T) {
+		store := h.NewUnreachableStorage(t)
+		_, err := store.ApplyOperations().ListRecentTargets(t.Context(), storage.DatabaseTypeVitess, time.Hour)
+		require.Error(t, err)
+	})
 }
 
 // testOneTargetsShardsCutOverOneAtATime seeds one target with two shards of

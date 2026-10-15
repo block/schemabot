@@ -189,6 +189,46 @@ func (s *applyOperationStore) ListByApplies(ctx context.Context, applyIDs []int6
 	return scanApplyOperations(rows)
 }
 
+// ListRecentTargets returns each distinct (database, environment, target) an
+// apply of databaseType ran an operation against, among applies created within
+// lookback of the storage database's clock. The cutoff is computed by the
+// database so it is compared against created_at in the same clock and time
+// zone the row was stamped with.
+func (s *applyOperationStore) ListRecentTargets(ctx context.Context, databaseType string, lookback time.Duration) ([]storage.AppliedTarget, error) {
+	if lookback <= 0 {
+		return nil, fmt.Errorf("list recent %s apply targets: lookback must be positive, got %s", databaseType, lookback)
+	}
+	cutoff := s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime,
+		LiteralIntervalAmount(uint64(lookback.Microseconds())), IntervalMicrosecond)
+	// The cutoff is a trusted internal fragment; it is concatenated rather
+	// than formatted so a stray % can never corrupt the SQL.
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT DISTINCT a.database_name, a.environment, ao.target
+		FROM apply_operations ao
+		JOIN applies a ON a.id = ao.apply_id
+		WHERE a.database_type = ?
+			AND ao.target <> ''
+			AND a.created_at >= `+cutoff+`
+		ORDER BY a.database_name, a.environment, ao.target`, databaseType)
+	if err != nil {
+		return nil, fmt.Errorf("query recent %s apply targets within %s: %w", databaseType, lookback, err)
+	}
+	defer utils.CloseAndLog(rows)
+
+	var targets []storage.AppliedTarget
+	for rows.Next() {
+		var target storage.AppliedTarget
+		if err := rows.Scan(&target.Database, &target.Environment, &target.Target); err != nil {
+			return nil, fmt.Errorf("scan recent %s apply target: %w", databaseType, err)
+		}
+		targets = append(targets, target)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("read recent %s apply targets: %w", databaseType, err)
+	}
+	return targets, nil
+}
+
 // execStateUpdate runs a guarded UPDATE against a single apply_operations row,
 // applying the given SET assignments with their placeholder args and the write
 // guard's statement rendering. It centralizes the guard load, argument

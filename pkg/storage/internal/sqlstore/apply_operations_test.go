@@ -5489,3 +5489,36 @@ func TestApplyOperationClaimOrderingIsIndexed(t *testing.T) {
 	assert.Equal(t, []string{"created_at", "id"}, indexColumns,
 		"the claim ordering needs an index on exactly its ordering pair, in that order")
 }
+
+// ListRecentTargets bounds a data plane's view of the targets it applied to by
+// the age of the apply: a target whose only applies are older than the lookback
+// drops out, while one with any apply inside the window stays, however old its
+// other applies are.
+func TestApplyOperationStore_ListRecentTargetsWindow(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	lock := createTestLock(t, store, "orders", storage.DatabaseTypeVitess)
+	seed := func(t *testing.T, applyID string, planID int64, target string, age time.Duration) {
+		t.Helper()
+		apply := createTestApplyWithStateAndEnv(t, store, lock, applyID, planID, state.Apply.Completed, "staging")
+		_, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+			ApplyID: apply.ID, Deployment: "region-a", Target: target,
+		})
+		require.NoError(t, err)
+		_, err = testDB.ExecContext(ctx,
+			fmt.Sprintf(`UPDATE applies SET created_at = NOW() - INTERVAL %d SECOND WHERE id = ?`, int(age.Seconds())),
+			apply.ID)
+		require.NoError(t, err)
+	}
+	seed(t, "apply_stale_only", 9101, "orders-stale", 40*24*time.Hour)
+	seed(t, "apply_recent_old", 9102, "orders-recent", 40*24*time.Hour)
+	seed(t, "apply_recent_new", 9103, "orders-recent", 2*24*time.Hour)
+
+	targets, err := store.ApplyOperations().ListRecentTargets(ctx, storage.DatabaseTypeVitess, 30*24*time.Hour)
+	require.NoError(t, err)
+	assert.Equal(t, []storage.AppliedTarget{
+		{Database: "orders", Environment: "staging", Target: "orders-recent"},
+	}, targets)
+}

@@ -1300,6 +1300,15 @@ func (a *Apply) IsRollback() bool {
 	return ParseApplyOptions(a.Options).Rollback
 }
 
+// AppliedTarget is one target an apply ran an operation against: the
+// database identifier the apply was registered under, its environment, and
+// the opaque target the data plane resolved.
+type AppliedTarget struct {
+	Database    string
+	Environment string
+	Target      string
+}
+
 // ApplyOperation represents one child row in the apply_operations table:
 // the per-(deployment, operation_key) slice of a multi-operation apply, and the
 // unit of work the driver claim loop reconciles.

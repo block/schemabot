@@ -1425,6 +1425,14 @@ type ApplyOperationStore interface {
 	// (apply_id, created_at, id) order.
 	ListByApplies(ctx context.Context, applyIDs []int64) ([]*ApplyOperation, error)
 
+	// ListRecentTargets returns each distinct (database, environment, target)
+	// that an apply of databaseType ran an operation against, among applies
+	// created within lookback of the storage database's clock, ordered by
+	// database, environment, then target. Operations without a target are
+	// skipped. It tells a data plane, which resolves targets on demand rather
+	// than listing them in config, which targets it has applied to.
+	ListRecentTargets(ctx context.Context, databaseType string, lookback time.Duration) ([]AppliedTarget, error)
+
 	// UpdateState transitions a child row to a new state. Updates the state
 	// column only; for transitions that should also stamp started_at or
 	// completed_at, use MarkStarted / MarkCompleted / MarkFailed instead.
