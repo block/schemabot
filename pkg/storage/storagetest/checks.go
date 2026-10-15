@@ -438,6 +438,37 @@ func TestChecks(t *testing.T, h Harness) {
 		assert.Equal(t, "in_progress", stored.Status)
 	})
 
+	// A driver that cancels a forward apply before any task completed releases
+	// the check while still holding the apply lease, so the write carries both
+	// the no-completed-task guard and the lease fence. The check is released.
+	t.Run("MarkActionRequiredReleasesCancelledApplyUnderItsLease", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+
+		lock := CreateLock(t, store, "cancel_release_lease_db", storage.DatabaseTypeMySQL)
+		apply := CreateClaimedApply(t, store, lock, "cancel-release-under-lease", 713, "driver-a")
+		require.True(t, apply.Lease().Valid(), "the cancelled apply's driver still holds its lease")
+		apply.State = state.Apply.Cancelled
+		check := &storage.Check{
+			Repository: lock.Repository, PullRequest: lock.PullRequest, HeadSHA: "abc",
+			Environment: apply.Environment, DatabaseType: lock.DatabaseType, DatabaseName: lock.DatabaseName,
+			ApplyID: apply.ID, HasChanges: true, Status: "in_progress",
+		}
+		require.NoError(t, store.Checks().Upsert(ctx, check))
+
+		check.Status = "completed"
+		check.Conclusion = "action_required"
+		updated, err := store.Checks().MarkActionRequiredForApply(ctx, check, apply)
+		require.NoError(t, err)
+		assert.True(t, updated)
+
+		stored, err := store.Checks().Get(ctx, lock.Repository, lock.PullRequest, apply.Environment, lock.DatabaseType, lock.DatabaseName)
+		require.NoError(t, err)
+		require.NotNil(t, stored)
+		assert.Equal(t, "action_required", stored.Conclusion)
+		assert.Zero(t, stored.ApplyID, "a safely cancelled forward apply releases its ownership of the check")
+	})
+
 	// Retained cancellation state requires completed forward-task evidence and
 	// remains owned by the cancelled apply, including when reconciliation
 	// repairs an older completed failure row.
