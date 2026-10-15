@@ -37,6 +37,14 @@ func TestValidateRowSecurityApply(t *testing.T) {
      document_id bigint REFERENCES documents (id)
  );
  `
+	// Another table's row security declaration is the ordinary case for a
+	// namespace with row security on several tables; only the declaration for
+	// the apply's table counts.
+	const rowSecurityCompanion = `
+ CREATE TABLE orders (id bigint PRIMARY KEY);
+ ALTER TABLE orders ENABLE ROW LEVEL SECURITY;
+ CREATE POLICY readers ON orders FOR SELECT USING (id = 2);
+ `
 	for _, tt := range []struct {
 		name, namespace, table, definition string
 		companion                          string
@@ -52,6 +60,7 @@ func TestValidateRowSecurityApply(t *testing.T) {
 		{name: "admitted ordinary companion", namespace: "public", table: "documents", definition: desired, companion: ordinaryCompanion},
 		{name: "unsupported ordinary companion", namespace: "public", table: "documents", definition: desired, companion: foreignKeyCompanion,
 			wantError: `parse schema file "orders.sql"`, wantErrorIs: pgstatement.ErrForeignKey},
+		{name: "other table's row security companion", namespace: "public", table: "documents", definition: desired, companion: rowSecurityCompanion},
 		{name: "deferred cutover", namespace: "public", table: "documents", definition: desired, deferCutover: true, wantError: "do not support deferred cutover"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
@@ -81,6 +90,7 @@ func TestValidateRowSecurityApply(t *testing.T) {
 			}
 			require.NoError(t, err)
 			require.NotNil(t, change.rowSecurity)
+			require.Equal(t, tt.table, change.rowSecurity.Table())
 			require.Len(t, change.reviewedSecurity, 2)
 		})
 	}

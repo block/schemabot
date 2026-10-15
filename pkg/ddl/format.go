@@ -158,15 +158,7 @@ func postgresSchemaFileStatements(content string) ([]string, error) {
 
 	// Both desired-schema parsers require a table and return it first, even
 	// when an index precedes the table in the source file.
-	var statements []pgstatement.Statement
-	if desired, ok := file.RowSecurity(); ok {
-		statements = desired.Statements()
-	} else if desired, ok := file.Schema(); ok {
-		statements = desired.Statements()
-	} else {
-		return nil, fmt.Errorf("desired PostgreSQL schema file admitted no statements")
-	}
-
+	statements := file.Statements()
 	result := make([]string, len(statements))
 	for i, stmt := range statements {
 		result[i] = stmt.SQL()
