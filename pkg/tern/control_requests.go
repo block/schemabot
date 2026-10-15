@@ -437,6 +437,21 @@ func restoreApplyStateAfterUnacceptedCutover(ctx context.Context, store storage.
 	return nil
 }
 
+// failUnacceptedCutoverRequest resolves a pending cutover request the engine
+// did not take: it restores the apply's pre-cutover state, then fails the
+// request with the engine's reason. The restore comes first so a failed restore
+// write leaves the request pending for the next drive to re-send, rather than
+// failing it over an apply still stored as cutting_over.
+func failUnacceptedCutoverRequest(ctx context.Context, store storage.Storage, apply *storage.Apply, preCutoverState, errorMessage string, logger *slog.Logger, remoteIDs ...string) error {
+	if err := restoreApplyStateAfterUnacceptedCutover(ctx, store, apply, preCutoverState, logger); err != nil {
+		return err
+	}
+	if err := failPendingControlRequests(ctx, store, apply, storage.ControlOperationCutover, errorMessage, remoteIDs...); err != nil {
+		return fmt.Errorf("fail pending cutover request: %w", err)
+	}
+	return nil
+}
+
 func applyReadyForCutoverRequest(ctx context.Context, store storage.Storage, apply *storage.Apply) (bool, error) {
 	if state.IsState(apply.State, state.Apply.WaitingForCutover, state.Apply.CuttingOver) {
 		return true, nil

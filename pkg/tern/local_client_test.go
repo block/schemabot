@@ -564,6 +564,7 @@ type fakeControlEngine struct {
 	cutoverCount            int
 	cutoverResult           *engine.ControlResult
 	cutoverErr              error
+	cutoverNoResult         bool
 	progressReq             *engine.ProgressRequest
 	progressResult          *engine.ProgressResult
 	progressErr             error
@@ -633,6 +634,9 @@ func (e *fakeControlEngine) Start(context.Context, *engine.ControlRequest) (*eng
 
 func (e *fakeControlEngine) Cutover(context.Context, *engine.ControlRequest) (*engine.ControlResult, error) {
 	e.cutoverCount++
+	if e.cutoverNoResult {
+		return nil, nil
+	}
 	if e.cutoverResult != nil || e.cutoverErr != nil {
 		return e.cutoverResult, e.cutoverErr
 	}
@@ -2472,6 +2476,107 @@ func TestLocalClient_ProcessPendingCutoverControlRequestFailsRejectedRequest(t *
 	require.Len(t, controlRequests.requests, 1)
 	assert.Equal(t, storage.ControlRequestFailed, controlRequests.requests[0].Status)
 	assert.Equal(t, "not ready for cutover", controlRequests.requests[0].ErrorMessage)
+}
+
+// An apply parked at waiting_for_cutover gets an operator cutover that the
+// engine does not take: the cutover errors, comes back with no result, or is
+// refused. The request fails with the engine's reason and the stored apply
+// returns to waiting_for_cutover rather than staying at cutting_over with no
+// cutover behind it, so the operator's next cutover is recorded as a new
+// request and the next drive sends it to the engine.
+func TestLocalClient_ProcessPendingCutoverNotAcceptedRestoresApplyState(t *testing.T) {
+	tests := []struct {
+		name           string
+		engine         *fakeControlEngine
+		wantRequestErr string
+	}{
+		{
+			name:           "engine cutover fails",
+			engine:         &fakeControlEngine{cutoverErr: errors.New("drop sentinel table: connection reset")},
+			wantRequestErr: "cutover failed: drop sentinel table: connection reset",
+		},
+		{
+			name:           "engine returns no result",
+			engine:         &fakeControlEngine{cutoverNoResult: true},
+			wantRequestErr: "not accepted",
+		},
+		{
+			name:           "engine refuses the cutover",
+			engine:         &fakeControlEngine{cutoverResult: &engine.ControlResult{Accepted: false, Message: "not ready for cutover"}},
+			wantRequestErr: "not ready for cutover",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			apply := &storage.Apply{
+				ID:              132,
+				ApplyIdentifier: "apply-cutover-not-accepted-local",
+				Database:        "testdb",
+				DatabaseType:    storage.DatabaseTypeMySQL,
+				Environment:     "staging",
+				State:           state.Apply.WaitingForCutover,
+			}
+			task := &storage.Task{
+				ID:             465,
+				ApplyID:        apply.ID,
+				TaskIdentifier: "task-cutover-not-accepted-local",
+				Database:       "testdb",
+				Namespace:      "testdb",
+				DatabaseType:   storage.DatabaseTypeMySQL,
+				TableName:      "users",
+				State:          state.Task.WaitingForCutover,
+			}
+			controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{{
+				ApplyID:     apply.ID,
+				Operation:   storage.ControlOperationCutover,
+				Status:      storage.ControlRequestPending,
+				RequestedBy: "cli:alice",
+			}}}
+			applies := &exactProgressApplyStore{apply: apply}
+			client := &LocalClient{
+				config: LocalConfig{
+					Database: "testdb",
+					Type:     storage.DatabaseTypeMySQL,
+				},
+				storage: &exactProgressStorage{
+					applies:         applies,
+					tasks:           &exactProgressTaskStore{tasks: []*storage.Task{task}},
+					logs:            &mockApplyLogStore{},
+					controlRequests: controlRequests,
+				},
+				spiritEngine: tt.engine,
+				logger:       slog.Default(),
+			}
+
+			err := client.processPendingCutoverControlRequest(t.Context(), apply, []*storage.Task{task})
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tt.wantRequestErr)
+			assert.Equal(t, 1, tt.engine.cutoverCount)
+			assert.Equal(t, state.Apply.WaitingForCutover, apply.State)
+			assert.Equal(t, state.Apply.WaitingForCutover, applies.apply.State)
+			require.Len(t, controlRequests.requests, 1)
+			assert.Equal(t, storage.ControlRequestFailed, controlRequests.requests[0].Status)
+			assert.Equal(t, tt.wantRequestErr, controlRequests.requests[0].ErrorMessage)
+
+			// The operator comments cutover again. The stored apply is waiting
+			// for cutover, so the API records a new durable request rather than
+			// answering that a cutover is already in progress, and the next
+			// drive sends it to the engine.
+			_, alreadyPending, err := controlRequests.RequestPending(t.Context(), &storage.ApplyControlRequest{
+				ApplyID:     apply.ID,
+				Operation:   storage.ControlOperationCutover,
+				Status:      storage.ControlRequestPending,
+				RequestedBy: "cli:alice",
+			})
+			require.NoError(t, err)
+			require.False(t, alreadyPending)
+			*tt.engine = fakeControlEngine{cutoverCount: tt.engine.cutoverCount}
+			require.NoError(t, client.processPendingCutoverControlRequest(t.Context(), apply, []*storage.Task{task}))
+			assert.Equal(t, 2, tt.engine.cutoverCount)
+			assert.Equal(t, storage.ControlRequestCompleted, controlRequests.requests[0].Status)
+			assert.Equal(t, state.Apply.CuttingOver, applies.apply.State)
+		})
+	}
 }
 
 // A cutover request that the engine backend rejects because it has not yet
