@@ -1,6 +1,7 @@
 package github
 
 import (
+	"context"
 	"errors"
 	"log/slog"
 	"testing"
@@ -80,7 +81,7 @@ func TestSameStatements(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			var compared [][4]string
-			compareStatements := SchemaFileChangeComparer(func(approvedBase, approved, headBase, head string) (bool, string, error) {
+			compareStatements := SchemaFileChangeComparer(func(_ context.Context, approvedBase, approved, headBase, head string) (bool, string, error) {
 				compared = append(compared, [4]string{approvedBase, approved, headBase, head})
 				if tt.compareErr != nil {
 					return false, "", tt.compareErr

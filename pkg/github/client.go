@@ -1140,11 +1140,12 @@ const maxSchemaStatementComparisons = 16
 // schema file generates the same schema change statements on two bases:
 // approvedBase to approved at the approved commit, and headBase to head at
 // the head. It is supplied by the database's dialect, since only the dialect
-// can parse the file. same is false, with reason saying why for operator
-// logs, when the statements differ or the head replaces something the base
-// changed in between. An error means the files could not be compared, which
-// proves nothing.
-type SchemaFileChangeComparer func(approvedBase, approved, headBase, head string) (same bool, reason string, err error)
+// can understand the file, and it may run the files on the database's target
+// to do so. same is false, with reason saying why for operator logs, when the
+// statements differ or the head replaces something the base changed in
+// between. An error means the files could not be compared, which proves
+// nothing.
+type SchemaFileChangeComparer func(ctx context.Context, approvedBase, approved, headBase, head string) (same bool, reason string, err error)
 
 // SchemaChangeComparison is the outcome of PRSchemaChangeUnchangedSince.
 type SchemaChangeComparison struct {
@@ -1415,7 +1416,7 @@ func (c *schemaChangeComparer) sameStatements(ctx context.Context, item schemaCh
 		}
 		contents[i] = text
 	}
-	same, reason, err := c.compareStatements(contents[sideApprovedBase], contents[sideApproved], contents[sideHeadBase], contents[sideHead])
+	same, reason, err := c.compareStatements(ctx, contents[sideApprovedBase], contents[sideApproved], contents[sideHeadBase], contents[sideHead])
 	if err != nil {
 		c.ic.logger.Info("review gate comparison: cannot compare a schema file's statements, so it counts as changed",
 			append(logAttrs, "error", err)...)
