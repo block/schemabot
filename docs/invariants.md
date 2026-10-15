@@ -1200,9 +1200,10 @@ before it hands a VSchema to the engine (`finalizerStandsDownForPendingControl`,
 `pkg/tern/local_control_resume.go`); cancel-before-stop consumption on both clients
 (`processPendingCancelOrStopControlRequest`, `pkg/tern/local_control.go`,
 `pkg/tern/grpc_client.go`); conflict rejection at request intake
-(`pkg/api/control_handlers.go`); and failing the cutover a stop superseded wherever the stop's
-request completes (`SettlePendingCutoverAfterStop`, `pkg/tern/control_requests.go`, reached from
-both clients and from `pkg/api/control_handlers.go` and `pkg/api/operator.go`).
+(`pkg/api/control_handlers.go`); and failing the cutover a stop superseded before the stop's
+request completes (`completePendingStopControlRequest` and `SettlePendingCutoverAfterStop`,
+`pkg/tern/control_requests.go`, reached from both clients and from
+`pkg/api/control_handlers.go` and `pkg/api/operator.go`).
 
 ### CO-5: The revert phase owns the outcome
 
@@ -1225,7 +1226,9 @@ onto sibling operations or future applies. *Enforced:* queue-time eligibility ga
 operation-scoped request rows (`pkg/storage/internal/sqlstore/control_requests.go`); a cutover
 request on an ordered rollout is bound at intake to the member whose turn it is
 (`cutoverTurnForRequest`, `pkg/api/control_handlers.go`), and only that member's drive takes it
-(`operationCutoverRequestTurn`, `pkg/tern/cutover_barrier.go`).
+(`operationCutoverRequestTurn`, `pkg/tern/cutover_barrier.go`); once the apply resolves, that
+request is settled from the member's own outcome (`settleBoundPendingCutover`,
+`pkg/tern/control_requests.go`).
 
 ### CO-7: ID namespaces are never conflated
 

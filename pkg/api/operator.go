@@ -1885,13 +1885,16 @@ func (s *Service) completePendingControlRequestsIfApplyResolved(ctx context.Cont
 		return s.completeLandedStopForHeldOpenApply(ctx, logger, apply)
 	}
 
+	// The cutover is settled before the stop completes, so a failed settlement
+	// on a stopped apply leaves the stop pending to gate the cutover off until
+	// the next pass settles it (CO-4).
+	if err := tern.SettlePendingCutoverForResolvedApply(ctx, s.storage, logger, apply); err != nil {
+		return err
+	}
 	if err := s.completePendingRequestForResolvedApply(ctx, logger, apply, storage.ControlOperationStop); err != nil {
 		return err
 	}
 	if err := tern.SettlePendingStartForResolvedApply(ctx, s.storage, logger, apply); err != nil {
-		return err
-	}
-	if err := tern.SettlePendingCutoverForResolvedApply(ctx, s.storage, logger, apply); err != nil {
 		return err
 	}
 	return tern.SettlePendingCancelForResolvedApply(ctx, s.storage, logger, apply)
@@ -1943,10 +1946,13 @@ func (s *Service) completeLandedStopForHeldOpenApply(ctx context.Context, logger
 			return nil
 		}
 	}
-	if err := s.completePendingRequestForResolvedApply(ctx, logger, apply, storage.ControlOperationStop); err != nil {
-		return err
+	// The cutover the stop superseded is settled while the stop is still
+	// pending, so a failed settlement leaves the stop gate up for the next
+	// pass (CO-4).
+	if err := tern.SettlePendingCutoverAfterStop(ctx, s.storage, logger, apply); err != nil {
+		return fmt.Errorf("settle pending cutover superseded by stop for held-open apply %s: %w", apply.ApplyIdentifier, err)
 	}
-	return tern.SettlePendingCutoverAfterStop(ctx, s.storage, logger, apply)
+	return s.completePendingRequestForResolvedApply(ctx, logger, apply, storage.ControlOperationStop)
 }
 
 // completePendingRequestForResolvedApply completes one pending control request
