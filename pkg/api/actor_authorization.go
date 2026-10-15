@@ -37,10 +37,18 @@ func (c *ServerConfig) PRCommandAuthorizationEnabled() bool {
 	return c != nil && c.PRCommandAuthorization.Enabled
 }
 
-// ReviewPolicyEnabled returns true when apply/apply-confirm PR comments must
-// pass the review gate.
-func (c *ServerConfig) ReviewPolicyEnabled() bool {
-	return c != nil && c.ReviewPolicy.Enabled
+// ReviewPolicyEnabled returns true when apply/apply-confirm PR comments for
+// database must pass the review gate: the instance-wide review policy is on,
+// or the database opts in with its own review_policy.
+func (c *ServerConfig) ReviewPolicyEnabled(database string) bool {
+	if c == nil {
+		return false
+	}
+	if c.ReviewPolicy.Enabled {
+		return true
+	}
+	dbConfig := c.Database(database)
+	return dbConfig != nil && dbConfig.ReviewPolicy.Enabled
 }
 
 // ReviewPolicyIncludesDatabaseOperators returns whether database-scoped
@@ -81,6 +89,27 @@ func validateReviewPolicy(config ReviewPolicyConfig) error {
 		return err
 	}
 	return nil
+}
+
+// validateDatabaseReviewPolicy rejects a database that opts into the review
+// gate when no configured principal could ever approve its applies, which
+// would block every one of them.
+func (c *ServerConfig) validateDatabaseReviewPolicy(database string, dbConfig DatabaseConfig) error {
+	if !dbConfig.ReviewPolicy.Enabled {
+		return nil
+	}
+	if c.ReviewPolicyIncludesDatabaseOperators() && (len(dbConfig.OperatorTeams) > 0 || len(dbConfig.OperatorUsers) > 0) {
+		return nil
+	}
+	if len(c.ReviewPolicy.AdminTeams) > 0 || len(c.ReviewPolicy.AdminUsers) > 0 || c.ReviewPolicy.IncludeCodeowners {
+		return nil
+	}
+	for _, repoConfig := range c.Repos {
+		if len(repoConfig.AdminTeams) > 0 || len(repoConfig.AdminUsers) > 0 {
+			return nil
+		}
+	}
+	return fmt.Errorf("databases.%s.review_policy.enabled requires someone who can approve: set the database's operator_teams or operator_users (with review_policy.include_database_operators left on), review_policy.admin_teams or admin_users, a repo's admin_teams or admin_users, or review_policy.include_codeowners", database)
 }
 
 func validateDatabaseActorAuthorization(database string, dbConfig DatabaseConfig) error {

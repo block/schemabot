@@ -4081,17 +4081,17 @@ require_passing_checks: false
 func TestServerConfig_ReviewPolicy(t *testing.T) {
 	t.Run("nil receiver defaults to false", func(t *testing.T) {
 		var cfg *ServerConfig
-		assert.False(t, cfg.ReviewPolicyEnabled())
+		assert.False(t, cfg.ReviewPolicyEnabled("testapp"))
 	})
 
 	t.Run("disabled by default", func(t *testing.T) {
 		cfg := &ServerConfig{}
-		assert.False(t, cfg.ReviewPolicyEnabled())
+		assert.False(t, cfg.ReviewPolicyEnabled("testapp"))
 	})
 
 	t.Run("explicitly enabled", func(t *testing.T) {
 		cfg := &ServerConfig{ReviewPolicy: ReviewPolicyConfig{Enabled: true}}
-		assert.True(t, cfg.ReviewPolicyEnabled())
+		assert.True(t, cfg.ReviewPolicyEnabled("testapp"))
 	})
 
 	t.Run("database operators included by default", func(t *testing.T) {
@@ -4134,12 +4134,109 @@ review_policy:
 		cfg, err := LoadServerConfigFromFile(configPath)
 		require.NoError(t, err)
 
-		assert.True(t, cfg.ReviewPolicyEnabled())
+		assert.True(t, cfg.ReviewPolicyEnabled("testapp"))
 		assert.Equal(t, []string{"octocat/admins"}, cfg.ReviewPolicy.AdminTeams)
 		assert.Equal(t, []string{"mona"}, cfg.ReviewPolicy.AdminUsers)
 		assert.False(t, cfg.ReviewPolicyIncludesDatabaseOperators())
 		assert.True(t, cfg.ReviewPolicy.IncludeCodeowners)
 	})
+}
+
+// An instance with the review gate off can turn it on for one database. The
+// opt-in covers only that database, and a database that opts in must name
+// someone who can approve, or every one of its applies would be blocked.
+func TestServerConfig_DatabaseReviewPolicy(t *testing.T) {
+	loadConfig := func(t *testing.T, content string) (*ServerConfig, error) {
+		t.Helper()
+		configPath := filepath.Join(t.TempDir(), "config.yaml")
+		require.NoError(t, os.WriteFile(configPath, []byte(content), 0644))
+		return LoadServerConfigFromFile(configPath)
+	}
+
+	t.Run("a database that opts in is gated and the others are not", func(t *testing.T) {
+		cfg, err := loadConfig(t, `
+databases:
+  orders:
+    type: mysql
+    operator_teams:
+      - octocat/orders-owners
+    review_policy:
+      enabled: true
+    environments:
+      staging:
+        dsn: "root@tcp(localhost:3306)/orders"
+  payments:
+    type: mysql
+    environments:
+      staging:
+        dsn: "root@tcp(localhost:3306)/payments"
+`)
+		require.NoError(t, err)
+		assert.True(t, cfg.ReviewPolicyEnabled("orders"))
+		assert.False(t, cfg.ReviewPolicyEnabled("payments"))
+		assert.False(t, cfg.ReviewPolicyEnabled("unknown"))
+	})
+
+	t.Run("an instance-wide gate covers every database", func(t *testing.T) {
+		cfg := &ServerConfig{
+			ReviewPolicy: ReviewPolicyConfig{Enabled: true},
+			Databases:    map[string]DatabaseConfig{"payments": {Type: "mysql"}},
+		}
+		assert.True(t, cfg.ReviewPolicyEnabled("payments"))
+	})
+
+	t.Run("a database that opts in with nobody who can approve is rejected", func(t *testing.T) {
+		_, err := loadConfig(t, `
+databases:
+  orders:
+    type: mysql
+    review_policy:
+      enabled: true
+    environments:
+      staging:
+        dsn: "root@tcp(localhost:3306)/orders"
+`)
+		require.ErrorContains(t, err, "databases.orders.review_policy.enabled requires someone who can approve")
+	})
+
+	t.Run("operators excluded from the review policy cannot approve an opted-in database", func(t *testing.T) {
+		_, err := loadConfig(t, `
+review_policy:
+  include_database_operators: false
+databases:
+  orders:
+    type: mysql
+    operator_users:
+      - mona
+    review_policy:
+      enabled: true
+    environments:
+      staging:
+        dsn: "root@tcp(localhost:3306)/orders"
+`)
+		require.ErrorContains(t, err, "databases.orders.review_policy.enabled requires someone who can approve")
+	})
+
+	for name, approvers := range map[string]string{
+		"instance admins": "review_policy:\n  admin_users:\n    - mona\n",
+		"CODEOWNERS":      "review_policy:\n  include_codeowners: true\n",
+		"repo admins":     "repos:\n  octocat/orders:\n    admin_teams:\n      - octocat/maintainers\n",
+	} {
+		t.Run("an opted-in database approved by "+name+" is accepted", func(t *testing.T) {
+			cfg, err := loadConfig(t, approvers+`
+databases:
+  orders:
+    type: mysql
+    review_policy:
+      enabled: true
+    environments:
+      staging:
+        dsn: "root@tcp(localhost:3306)/orders"
+`)
+			require.NoError(t, err)
+			assert.True(t, cfg.ReviewPolicyEnabled("orders"))
+		})
+	}
 }
 
 func TestServerConfig_IsCheckRequired(t *testing.T) {

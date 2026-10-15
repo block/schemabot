@@ -1920,6 +1920,23 @@ databases:
         dsn: "env:STAGING_DSN"
 ```
 
+An instance with the review gate off can still turn it on for one database. For example, a staging instance whose databases apply without review by default can require one for `payments`:
+
+```yaml
+databases:
+  payments:
+    type: mysql
+    operator_teams:
+      - myorg/payments-operators
+    review_policy:
+      enabled: true
+    environments:
+      staging:
+        dsn: "env:STAGING_DSN"
+```
+
+The database's own `review_policy` only adds the gate; it cannot turn off an instance-wide one. Who can approve comes from the instance's settings below, so an opted-in database needs at least one of them configured, and SchemaBot refuses to start otherwise.
+
 When enabled, SchemaBot checks PR approval before proceeding. A satisfying review can come from:
 
 1. `review_policy.admin_teams` or `review_policy.admin_users`, which apply to every configured database.
