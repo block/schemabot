@@ -897,6 +897,10 @@ func hasApplyLogMessageContaining(logs []*storage.ApplyLog, want string) bool {
 
 // mockTernClient implements tern.Client for testing.
 type mockTernClient struct {
+	compareMu    sync.Mutex
+	compareReqs  []*ternv1.CompareSchemaFileChangeRequest
+	compareResp  *ternv1.CompareSchemaFileChangeResponse
+	compareErr   error
 	healthErr    error
 	planResp     *ternv1.PlanResponse
 	planErr      error
@@ -982,6 +986,19 @@ func (m *mockTernClient) Plan(ctx context.Context, req *ternv1.PlanRequest) (*te
 	}
 	return nil, m.planErr
 }
+func (m *mockTernClient) CompareSchemaFileChange(_ context.Context, req *ternv1.CompareSchemaFileChangeRequest) (*ternv1.CompareSchemaFileChangeResponse, error) {
+	m.compareMu.Lock()
+	defer m.compareMu.Unlock()
+	m.compareReqs = append(m.compareReqs, req)
+	if m.compareErr != nil {
+		return nil, m.compareErr
+	}
+	if m.compareResp == nil {
+		return nil, fmt.Errorf("mock tern client has no schema file comparison response")
+	}
+	return m.compareResp, nil
+}
+
 func (m *mockTernClient) PlanDiff(ctx context.Context, req *ternv1.PlanRequest) (*ternv1.PlanDiffResponse, error) {
 	m.planDiffMu.Lock()
 	m.planDiffReq = req
