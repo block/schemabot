@@ -1219,6 +1219,14 @@ func (s *recordingCheckStore) MarkStalePlanSuccessful(ctx context.Context, check
 	return updated, err
 }
 
+func (s *recordingCheckStore) BlockStaleStartedApply(ctx context.Context, check *storage.Check, headSHA string) (bool, error) {
+	blocked, err := s.CheckStore.BlockStaleStartedApply(ctx, check, headSHA)
+	if err == nil && blocked {
+		s.record("block_stale_started_apply", check.DatabaseName, check.Status, check.Conclusion)
+	}
+	return blocked, err
+}
+
 func (s *recordingCheckStore) CompleteForApply(ctx context.Context, check *storage.Check, apply *storage.Apply) (bool, error) {
 	updated, err := s.CheckStore.CompleteForApply(ctx, check, apply)
 	if err == nil && updated {

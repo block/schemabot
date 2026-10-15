@@ -643,10 +643,10 @@ func TestRenderPlanComment_ConvergedPrimaryApplyAsksForConfirmation(t *testing.T
 }
 
 // When another target's plan turns unsafe after the operator opted in with
-// --allow-unsafe, the apply's comment lists that target's unsafe change whether
-// it stops for confirmation or runs: a paused comment's apply-confirm carries
-// the opt-in forward, and a running comment is the only record of what the
-// apply destroys on that target.
+// --allow-unsafe, a paused comment lists that target's unsafe change, because
+// its apply-confirm carries the opt-in forward. The comment of an apply
+// already running leaves the list out and shows the target's DDL, the record
+// of what the apply runs there.
 func TestRenderPlanComment_RolloutApplyListsAnotherTargetsNewUnsafeChange(t *testing.T) {
 	data := convergedPrimaryPlanData()
 	data.IsLocked = true
@@ -662,7 +662,8 @@ func TestRenderPlanComment_RolloutApplyListsAnotherTargetsNewUnsafeChange(t *tes
 
 	data.PendingManualConfirmation = false
 	out = RenderPlanComment(data)
-	assert.Contains(t, out, "⚠️ **Issues**: 1 unsafe change detected\n1. `users`: DROP COLUMN discards the column's data\n")
+	assert.NotContains(t, out, "**Issues**", "the running comment leaves the consented unsafe changes out")
+	assert.Contains(t, out, "DROP COLUMN `legacy_ref`", "the target's DDL stays on the running comment")
 	assert.Contains(t, out, "**Applying automatically**")
 }
 

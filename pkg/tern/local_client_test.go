@@ -1664,6 +1664,156 @@ func TestLocalClient_ProcessPendingStopControlRequest(t *testing.T) {
 	assert.True(t, hasLogMessageContaining(logs.logs, "Stop requested: 1 tasks stopped, 0 skipped (caller: cli:alice)"))
 }
 
+// TestLocalClient_StopSupersedesPendingCutover covers a deferred-cutover apply
+// parked at waiting_for_cutover that receives cutover and then stop before the
+// next drive tick. The stop takes effect first, and the queued cutover is failed
+// with a reason the operator can act on rather than left pending. Once a later
+// start brings the copy back to waiting_for_cutover, the drive finds no cutover
+// to take, so the table is not swapped until the operator issues a fresh one.
+func TestLocalClient_StopSupersedesPendingCutover(t *testing.T) {
+	apply := &storage.Apply{
+		ID:              129,
+		ApplyIdentifier: "apply-stop-supersedes-cutover",
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+		State:           state.Apply.WaitingForCutover,
+	}
+	task := &storage.Task{
+		ID:             462,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task-stop-supersedes-cutover",
+		Database:       "testdb",
+		Namespace:      "testdb",
+		DatabaseType:   storage.DatabaseTypeMySQL,
+		TableName:      "users",
+		State:          state.Task.WaitingForCutover,
+	}
+	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{
+		{
+			ID:          1,
+			ApplyID:     apply.ID,
+			Operation:   storage.ControlOperationCutover,
+			Status:      storage.ControlRequestPending,
+			RequestedBy: "cli:alice",
+		},
+		{
+			ID:          2,
+			ApplyID:     apply.ID,
+			Operation:   storage.ControlOperationStop,
+			Status:      storage.ControlRequestPending,
+			RequestedBy: "cli:bob",
+		},
+	}}
+	fakeEngine := &fakeControlEngine{}
+	client := &LocalClient{
+		config: LocalConfig{
+			Database: "testdb",
+			Type:     storage.DatabaseTypeMySQL,
+		},
+		storage: &exactProgressStorage{
+			applies:         &exactProgressApplyStore{apply: apply},
+			tasks:           &exactProgressTaskStore{tasks: []*storage.Task{task}},
+			logs:            &mockApplyLogStore{},
+			controlRequests: controlRequests,
+		},
+		spiritEngine: fakeEngine,
+		logger:       slog.Default(),
+	}
+
+	standDown, err := client.processPendingStopControlRequest(t.Context(), apply)
+	require.NoError(t, err)
+	assert.True(t, standDown)
+	assert.Equal(t, 1, fakeEngine.stopCount)
+	require.Equal(t, state.Apply.Stopped, apply.State)
+
+	cutoverReq, err := controlRequests.GetByOperation(t.Context(), apply.ID, storage.ControlOperationCutover)
+	require.NoError(t, err)
+	require.NotNil(t, cutoverReq)
+	assert.Equal(t, storage.ControlRequestFailed, cutoverReq.Status)
+	assert.Equal(t, cutoverSupersededByStopMessage, cutoverReq.ErrorMessage)
+	stopReq, err := controlRequests.GetByOperation(t.Context(), apply.ID, storage.ControlOperationStop)
+	require.NoError(t, err)
+	require.NotNil(t, stopReq)
+	assert.Equal(t, storage.ControlRequestCompleted, stopReq.Status)
+
+	// A later start resumes the copy, which parks at waiting_for_cutover again.
+	apply.State = state.Apply.WaitingForCutover
+	task.State = state.Task.WaitingForCutover
+	require.NoError(t, client.processPendingCutoverControlRequest(t.Context(), apply, []*storage.Task{task}))
+	assert.Equal(t, 0, fakeEngine.cutoverCount, "the table must not be swapped without a cutover issued after the stop")
+	assert.Equal(t, state.Apply.WaitingForCutover, apply.State)
+}
+
+// failFirstCutoverSettleStore fails the first FailPending of a cutover request,
+// the way a transient storage error would while a stop settles the cutover it
+// superseded.
+type failFirstCutoverSettleStore struct {
+	*testControlRequestStore
+	failed bool
+}
+
+func (s *failFirstCutoverSettleStore) FailPending(ctx context.Context, applyID int64, op storage.ControlOperation, msg string) error {
+	if op == storage.ControlOperationCutover && !s.failed {
+		s.failed = true
+		return errors.New("transient storage error")
+	}
+	return s.testControlRequestStore.FailPending(ctx, applyID, op, msg)
+}
+
+// TestLocalClient_StopKeepsItsGateUntilTheSupersededCutoverSettles covers a
+// stop whose write settling the queued cutover fails. The stop stays pending,
+// so the owner's retry settles the cutover before the stop completes, and the
+// copy a later start parks at waiting_for_cutover is not swapped by the old
+// command.
+func TestLocalClient_StopKeepsItsGateUntilTheSupersededCutoverSettles(t *testing.T) {
+	apply := &storage.Apply{ID: 129, ApplyIdentifier: "apply-stop-gate", Database: "testdb", DatabaseType: storage.DatabaseTypeMySQL, Environment: "staging", State: state.Apply.WaitingForCutover}
+	task := &storage.Task{ID: 462, ApplyID: apply.ID, TaskIdentifier: "task-stop-gate", Database: "testdb", Namespace: "testdb", DatabaseType: storage.DatabaseTypeMySQL, TableName: "users", State: state.Task.WaitingForCutover}
+	base := &testControlRequestStore{requests: []*storage.ApplyControlRequest{
+		{ID: 1, ApplyID: apply.ID, Operation: storage.ControlOperationCutover, Status: storage.ControlRequestPending, RequestedBy: "cli:alice"},
+		{ID: 2, ApplyID: apply.ID, Operation: storage.ControlOperationStop, Status: storage.ControlRequestPending, RequestedBy: "cli:bob"},
+	}}
+	controlRequests := &failFirstCutoverSettleStore{testControlRequestStore: base}
+	fakeEngine := &fakeControlEngine{}
+	client := &LocalClient{
+		config: LocalConfig{Database: "testdb", Type: storage.DatabaseTypeMySQL},
+		storage: &exactProgressStorage{
+			applies:         &exactProgressApplyStore{apply: apply},
+			tasks:           &exactProgressTaskStore{tasks: []*storage.Task{task}},
+			logs:            &mockApplyLogStore{},
+			controlRequests: controlRequests,
+		},
+		spiritEngine: fakeEngine,
+		logger:       slog.Default(),
+	}
+
+	_, err := client.processPendingStopControlRequest(t.Context(), apply)
+	require.ErrorContains(t, err, "transient storage error")
+	stopReq, err := base.GetByOperation(t.Context(), apply.ID, storage.ControlOperationStop)
+	require.NoError(t, err)
+	require.NotNil(t, stopReq)
+	assert.Equal(t, storage.ControlRequestPending, stopReq.Status, "the stop must stay pending until the cutover it superseded is settled")
+
+	_, err = client.processPendingStopControlRequest(t.Context(), apply)
+	require.NoError(t, err)
+
+	cutoverReq, err := base.GetByOperation(t.Context(), apply.ID, storage.ControlOperationCutover)
+	require.NoError(t, err)
+	require.NotNil(t, cutoverReq)
+	assert.Equal(t, storage.ControlRequestFailed, cutoverReq.Status, "the owner's retry settles the cutover queued before the stop")
+	assert.Equal(t, cutoverSupersededByStopMessage, cutoverReq.ErrorMessage)
+	stopReq, err = base.GetByOperation(t.Context(), apply.ID, storage.ControlOperationStop)
+	require.NoError(t, err)
+	require.NotNil(t, stopReq)
+	assert.Equal(t, storage.ControlRequestCompleted, stopReq.Status)
+
+	// A later start resumes the copy, which parks again.
+	apply.State = state.Apply.WaitingForCutover
+	task.State = state.Task.WaitingForCutover
+	require.NoError(t, client.processPendingCutoverControlRequest(t.Context(), apply, []*storage.Task{task}))
+	assert.Equal(t, 0, fakeEngine.cutoverCount, "the table must not be swapped without a cutover issued after the stop")
+}
+
 func TestLocalClient_ProcessPendingCancelControlRequest(t *testing.T) {
 	apply := &storage.Apply{
 		ID:              123,

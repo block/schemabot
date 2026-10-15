@@ -53,6 +53,208 @@ func TestSettlePendingRequestsForTerminalApply(t *testing.T) {
 	}
 }
 
+// A cutover still pending when the apply settles is answered by the outcome the
+// apply reached: an apply that cut over completes it, and every other terminal
+// state fails it with a reason, so it never lingers pending for the reaper to
+// re-list on every pass.
+func TestSettlePendingRequestsForTerminalApplySettlesCutoverByOutcome(t *testing.T) {
+	cases := []struct {
+		applyState string
+		wantStatus storage.ControlRequestStatus
+		wantError  string
+	}{
+		{applyState: state.Apply.Completed, wantStatus: storage.ControlRequestCompleted},
+		{applyState: state.Apply.Reverted, wantStatus: storage.ControlRequestCompleted},
+		{applyState: state.Apply.Cancelled, wantStatus: storage.ControlRequestFailed,
+			wantError: "cutover request was not applied because apply is cancelled"},
+		{applyState: state.Apply.Failed, wantStatus: storage.ControlRequestFailed,
+			wantError: "cutover request was not applied because apply is failed"},
+		{applyState: state.Apply.Stopped, wantStatus: storage.ControlRequestFailed,
+			wantError: cutoverSupersededByStopMessage},
+	}
+	for _, tc := range cases {
+		t.Run(tc.applyState, func(t *testing.T) {
+			apply := &storage.Apply{
+				ID:              7,
+				ApplyIdentifier: "apply-terminal-cutover",
+				Database:        "testdb",
+				Environment:     "staging",
+				State:           tc.applyState,
+			}
+			controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{
+				{ApplyID: apply.ID, Operation: storage.ControlOperationCutover, Status: storage.ControlRequestPending, RequestedBy: "cli:alice"},
+			}}
+			store := &mockStorage{controlRequests: controlRequests, logs: &mockApplyLogStore{}}
+
+			require.NoError(t, settlePendingRequestsForTerminalApply(t.Context(), store, discardLogger(), apply))
+
+			settled, err := controlRequests.GetByOperation(t.Context(), apply.ID, storage.ControlOperationCutover)
+			require.NoError(t, err)
+			require.NotNil(t, settled)
+			assert.Equal(t, tc.wantStatus, settled.Status)
+			assert.Equal(t, tc.wantError, settled.ErrorMessage)
+		})
+	}
+}
+
+// A cutover bound to one operation is answered from that operation's outcome,
+// not the parent apply's (CO-6): an operation that cut over before a sibling
+// failed the apply completes its request, and one that did not fails it with
+// its own reason.
+func TestSettlePendingRequestsForTerminalApplySettlesBoundCutoverByOperation(t *testing.T) {
+	cases := []struct {
+		name           string
+		operationState string
+		wantStatus     storage.ControlRequestStatus
+		wantError      string
+	}{
+		{name: "operation cut over", operationState: state.ApplyOperation.Completed, wantStatus: storage.ControlRequestCompleted},
+		{name: "operation in revert window", operationState: state.ApplyOperation.RevertWindow, wantStatus: storage.ControlRequestCompleted},
+		{name: "operation stopped", operationState: state.ApplyOperation.Stopped, wantStatus: storage.ControlRequestFailed,
+			wantError: cutoverSupersededByStopMessage},
+		{name: "operation cancelled", operationState: state.ApplyOperation.Cancelled, wantStatus: storage.ControlRequestFailed,
+			wantError: "cutover request was not applied because the operation it was sent for is cancelled"},
+		{name: "operation never ended", operationState: state.ApplyOperation.WaitingForCutover, wantStatus: storage.ControlRequestFailed,
+			wantError: "cutover request was not applied because apply is failed"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			apply := &storage.Apply{ID: 7, ApplyIdentifier: "apply-bound", Database: "testdb", Environment: "staging", State: state.Apply.Failed}
+			controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{
+				{ID: 1, ApplyID: apply.ID, Operation: storage.ControlOperationCutover, Status: storage.ControlRequestPending,
+					RequestedBy: "cli:alice", Metadata: storage.CutoverRequestMetadata(42)},
+			}}
+			ops := &mockApplyOperationStore{ops: map[int64]*storage.ApplyOperation{
+				42: {ID: 42, ApplyID: apply.ID, Deployment: "region-a", State: tc.operationState},
+			}}
+			store := &mockStorage{controlRequests: controlRequests, logs: &mockApplyLogStore{}, operations: ops}
+
+			require.NoError(t, settlePendingRequestsForTerminalApply(t.Context(), store, discardLogger(), apply))
+
+			settled, err := controlRequests.GetByOperation(t.Context(), apply.ID, storage.ControlOperationCutover)
+			require.NoError(t, err)
+			require.NotNil(t, settled)
+			assert.Equal(t, tc.wantStatus, settled.Status)
+			assert.Equal(t, tc.wantError, settled.ErrorMessage)
+		})
+	}
+}
+
+// A stop that takes effect on an apply still held open answers a cutover bound
+// to one operation from that operation: one that already cut over completes
+// it, and one the stop halted fails it as superseded.
+func TestSettlePendingCutoverAfterStopSettlesBoundCutoverByOperation(t *testing.T) {
+	cases := []struct {
+		name           string
+		operationState string
+		wantStatus     storage.ControlRequestStatus
+		wantError      string
+	}{
+		{name: "operation cut over", operationState: state.ApplyOperation.Completed, wantStatus: storage.ControlRequestCompleted},
+		{name: "operation stopped", operationState: state.ApplyOperation.Stopped, wantStatus: storage.ControlRequestFailed,
+			wantError: cutoverSupersededByStopMessage},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			apply := &storage.Apply{ID: 7, ApplyIdentifier: "apply-bound-held-open", Database: "testdb", Environment: "staging", State: state.Apply.RunningDegraded}
+			controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{
+				{ID: 1, ApplyID: apply.ID, Operation: storage.ControlOperationCutover, Status: storage.ControlRequestPending,
+					RequestedBy: "cli:alice", Metadata: storage.CutoverRequestMetadata(42)},
+			}}
+			ops := &mockApplyOperationStore{ops: map[int64]*storage.ApplyOperation{
+				42: {ID: 42, ApplyID: apply.ID, Deployment: "region-a", State: tc.operationState},
+			}}
+			store := &mockStorage{controlRequests: controlRequests, logs: &mockApplyLogStore{}, operations: ops}
+
+			require.NoError(t, SettlePendingCutoverAfterStop(t.Context(), store, discardLogger(), apply))
+
+			settled, err := controlRequests.GetByOperation(t.Context(), apply.ID, storage.ControlOperationCutover)
+			require.NoError(t, err)
+			require.NotNil(t, settled)
+			assert.Equal(t, tc.wantStatus, settled.Status)
+			assert.Equal(t, tc.wantError, settled.ErrorMessage)
+		})
+	}
+}
+
+// A bound cutover whose operation cannot be read stays pending: the lookup
+// error is returned rather than recorded as an outcome the operation may not
+// have reached.
+func TestSettlePendingCutoverForResolvedApplyPropagatesBoundOperationLookupError(t *testing.T) {
+	apply := &storage.Apply{ID: 7, ApplyIdentifier: "apply-bound-lookup", Database: "testdb", Environment: "staging", State: state.Apply.Failed}
+	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{
+		{ID: 1, ApplyID: apply.ID, Operation: storage.ControlOperationCutover, Status: storage.ControlRequestPending,
+			RequestedBy: "cli:alice", Metadata: storage.CutoverRequestMetadata(42)},
+	}}
+	store := &mockStorage{controlRequests: controlRequests, logs: &mockApplyLogStore{}, operations: &mockApplyOperationStore{}}
+
+	err := SettlePendingCutoverForResolvedApply(t.Context(), store, discardLogger(), apply)
+	require.ErrorIs(t, err, storage.ErrApplyOperationNotFound)
+
+	pending, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationCutover)
+	require.NoError(t, err)
+	assert.NotNil(t, pending, "a cutover whose operation could not be read must stay pending")
+}
+
+// A bound cutover whose operation does not exist fails, as it does on the
+// bound operation's drive, rather than staying pending on a resolved apply.
+func TestSettlePendingCutoverForResolvedApplyFailsBoundCutoverOfMissingOperation(t *testing.T) {
+	apply := &storage.Apply{ID: 7, ApplyIdentifier: "apply-bound-missing", Database: "testdb", Environment: "staging", State: state.Apply.Failed}
+	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{
+		{ID: 1, ApplyID: apply.ID, Operation: storage.ControlOperationCutover, Status: storage.ControlRequestPending,
+			RequestedBy: "cli:alice", Metadata: storage.CutoverRequestMetadata(42)},
+	}}
+	ops := &mockApplyOperationStore{ops: map[int64]*storage.ApplyOperation{42: nil}}
+	store := &mockStorage{controlRequests: controlRequests, logs: &mockApplyLogStore{}, operations: ops}
+
+	require.NoError(t, SettlePendingCutoverForResolvedApply(t.Context(), store, discardLogger(), apply))
+
+	settled, err := controlRequests.GetByOperation(t.Context(), apply.ID, storage.ControlOperationCutover)
+	require.NoError(t, err)
+	require.NotNil(t, settled)
+	assert.Equal(t, storage.ControlRequestFailed, settled.Status)
+	assert.Equal(t, "cutover request was not applied because the operation it was sent for (42) does not exist", settled.ErrorMessage)
+}
+
+// A stop that lands on an apply which already cut over does not fail the
+// cutover as superseded: the cutover took effect, so it completes.
+func TestSettlePendingCutoverAfterStopCompletesCutoverOfCutOverApply(t *testing.T) {
+	for _, applyState := range []string{state.Apply.Completed, state.Apply.RevertWindow} {
+		t.Run(applyState, func(t *testing.T) {
+			apply := &storage.Apply{ID: 7, ApplyIdentifier: "apply-cut-over", Database: "testdb", Environment: "staging", State: applyState}
+			controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{
+				{ID: 1, ApplyID: apply.ID, Operation: storage.ControlOperationCutover, Status: storage.ControlRequestPending, RequestedBy: "cli:alice"},
+			}}
+			store := &mockStorage{controlRequests: controlRequests, logs: &mockApplyLogStore{}}
+
+			require.NoError(t, SettlePendingCutoverAfterStop(t.Context(), store, discardLogger(), apply))
+
+			settled, err := controlRequests.GetByOperation(t.Context(), apply.ID, storage.ControlOperationCutover)
+			require.NoError(t, err)
+			require.NotNil(t, settled)
+			assert.Equal(t, storage.ControlRequestCompleted, settled.Status)
+			assert.Empty(t, settled.ErrorMessage)
+		})
+	}
+}
+
+// A stop request completes only through the path that settles the cutover it
+// superseded; the generic completion refuses it and leaves it pending.
+func TestCompletePendingControlRequestsRefusesStop(t *testing.T) {
+	apply := &storage.Apply{ID: 7, ApplyIdentifier: "apply-stop-refused", Database: "testdb", Environment: "staging", State: state.Apply.Stopped}
+	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{
+		{ID: 1, ApplyID: apply.ID, Operation: storage.ControlOperationStop, Status: storage.ControlRequestPending, RequestedBy: "cli:bob"},
+	}}
+	store := &mockStorage{controlRequests: controlRequests, logs: &mockApplyLogStore{}}
+
+	err := completePendingControlRequests(t.Context(), store, apply, storage.ControlOperationStop)
+	require.ErrorContains(t, err, "completePendingStopControlRequest")
+
+	pending, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationStop)
+	require.NoError(t, err)
+	assert.NotNil(t, pending)
+}
+
 // A cancel that an apply outran never took effect, so the sweep resolves it as a
 // rejection rather than reporting it applied: the failed request is what lights
 // up the PR comment's "Command not applied" notice and what a re-issued cancel
