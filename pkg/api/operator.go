@@ -1173,22 +1173,6 @@ func (s *Service) recoverSingleApplyOperation(ctx context.Context, driverID int,
 			s.failOperationWithoutTasks(operationLeaseCtx, applyLeaseCtx, driverID, op, apply)
 			return claimSpent
 		}
-		if errors.Is(resumeErr, tern.ErrTaskVerdictRefused) {
-			// Storage refused a task's verdict, whether the drive's own write
-			// or a contained panic's, so the task set is only partly settled
-			// and a stored failure would derive the operation, then the parent,
-			// failed over the task whose verdict never landed. Leave both rows
-			// as found. The operation lease is kept rather than released, so the
-			// row is claimable again only once its heartbeat goes stale, and
-			// the rows settle once that claim stores every task verdict.
-			s.logger.Warn("operator: a task verdict did not land, so the operation and parent apply are left active until a claim after the operation lease goes stale stores every task verdict",
-				append(apply.LogAttrs(),
-					"driver", driverID,
-					"apply_operation_id", op.ID,
-					"operation_deployment", op.Deployment,
-					"error", resumeErr)...)
-			return claimSpent
-		}
 		var drivePanic *panicsafe.Error
 		if !errors.As(resumeErr, &drivePanic) && !postTerminalReconcileSettlesHere(runCtx, resumeErr) {
 			// Transient drive failures, and a drive this driver may no longer
@@ -1196,15 +1180,13 @@ func (s *Service) recoverSingleApplyOperation(ctx context.Context, driverID int,
 			// it; resumeClaimedApply already logged the cause.
 			return claimSpent
 		}
-		// A contained drive panic reaching here stored every one of this
-		// operation's task verdicts as failed, and failed the parent apply
-		// unless that write was skipped or did not land. A drive that stored
-		// the apply's terminal outcome and then could not answer a request
-		// after it has settled the schema change, and nothing re-claims a
-		// settled apply to finish that work. Either way, fall through so the
-		// operation row is persisted from its now-terminal tasks immediately
-		// and the post-drive settlement answers the requests the outcome
-		// resolves.
+		// A contained drive panic already failed this operation's tasks and the
+		// parent apply. A drive that stored the apply's terminal outcome and then
+		// could not answer a request after it has settled the schema change, and
+		// nothing re-claims a settled apply to finish that work. Either way, fall
+		// through so the operation row is persisted from its now-terminal tasks
+		// immediately and the post-drive settlement answers the requests the
+		// outcome resolves.
 	}
 
 	// Persist the operation row from its OWN drive outcome — the aggregate of
@@ -2433,7 +2415,7 @@ func (s *Service) resumeClaimedApplyWithOptions(ctx context.Context, driverID in
 	if err != nil {
 		var drivePanic *panicsafe.Error
 		if errors.As(err, &drivePanic) {
-			logger.Error("operator: engine drive panicked; failing the drive's tasks, then the apply, so it is not re-claimed and panicked again",
+			logger.Error("operator: engine drive panicked; the apply will be marked failed so it is not re-claimed and panicked again",
 				"state", apply.State,
 				"apply_operation_id", applyOperationID,
 				"panic", fmt.Sprint(drivePanic.Value),
@@ -2443,30 +2425,7 @@ func (s *Service) resumeClaimedApplyWithOptions(ctx context.Context, driverID in
 			// The failed transition below owns the active-apply gauge release, so
 			// the retryable-claim decrement the other failure branches perform is
 			// intentionally omitted here.
-			if containErr := s.failClaimedApplyAfterDrivePanic(ctx, driverID, apply, applyOperationID, deployment, drivePanic); containErr != nil {
-				// A task in the drive's scope did not record its failed verdict,
-				// so the apply was left active rather than failed over it. The
-				// joined error carries ErrTaskVerdictRefused, which the operation
-				// claim paths read to leave the operation row as found instead of
-				// deriving it from a partly settled task set. The apply stays
-				// active, so no failed transition releases the gauge this claim
-				// took for a retryable apply. A refusal caused by a lost lease is
-				// the lost lease, and one during shutdown is not counted, the
-				// same as for a drive's own refused verdict.
-				switch {
-				case ctx.Err() != nil:
-					logger.Debug("operator: containment stopped by a cancelled drive; not counted as a refused verdict",
-						"error", containErr)
-				case errors.Is(containErr, storage.ErrApplyLeaseLost):
-					metrics.RecordOperatorResumeFailure(ctx, apply.Database, deployment, apply.Environment, "lease_lost")
-				default:
-					metrics.RecordOperatorResumeFailure(ctx, apply.Database, deployment, apply.Environment, "task_verdict_refused")
-				}
-				if retryableClaim {
-					metrics.AdjustActiveApplies(ctx, -1, apply.Database, deployment, apply.Environment)
-				}
-				return false, fmt.Errorf("%w; containment left the apply active: %w", err, containErr)
-			}
+			s.failClaimedApplyAfterDrivePanic(ctx, driverID, apply, applyOperationID, deployment, drivePanic)
 			return false, err
 		}
 		if errors.Is(err, tern.ErrApplyLeasePresumedLost) {
@@ -2623,24 +2582,20 @@ func (s *Service) logApplyResumeClaim(ctx context.Context, logger *slog.Logger, 
 // this driver holds the parent apply lease — the apply row is marked failed so
 // neither the stale-heartbeat nor the retry recovery path re-claims the same
 // row and panics again. failed (permanent) is deliberate: failed_retryable
-// would queue the apply straight back into the panicking code path.
+// would queue the apply straight back into the panicking code path. Returns
+// true when this call transitioned the apply row to failed.
 //
-// The apply's outcome is read from its task rows, so the apply is failed only
-// once every in-scope task has stored its failed verdict. When the tasks
-// cannot be loaded, or storage refuses a task's write, the apply row is not
-// written and the returned error wraps tern.ErrTaskVerdictRefused: the apply
-// stays active under a lease this driver stops heartbeating, so no claim takes
-// it again until that lease goes stale, and the claim that does reads the
-// verdicts already stored and retries the one that did not land. Verdicts
-// stored for other tasks stay stored. A nil return means every in-scope task
-// recorded its verdict; it does not mean this call wrote the apply row, which
-// is skipped when the rollout projection owns it, the apply already settled,
-// or the reload or write failed.
+// A task whose failed verdict cannot be stored does not hold the apply open.
+// An apply left active would be claimed again and resumed through the engine,
+// feeding the poisoned input straight back. The apply is failed anyway, and
+// the stranded active-task reaper (storage.TaskStore.ReapStrandedActive)
+// later settles the task that is still active under it to failed, carrying
+// the apply's explanation. Until then the task reads as its last stored state.
 //
 // The apply requires operator intervention afterwards: fix the underlying code
 // or data fault the panic log identifies, then start a new apply for the
 // schema change.
-func (s *Service) failClaimedApplyAfterDrivePanic(ctx context.Context, driverID int, apply *storage.Apply, applyOperationID int64, deployment string, drivePanic *panicsafe.Error) error {
+func (s *Service) failClaimedApplyAfterDrivePanic(ctx context.Context, driverID int, apply *storage.Apply, applyOperationID int64, deployment string, drivePanic *panicsafe.Error) bool {
 	errMsg := fmt.Sprintf("apply drive panicked: %v", drivePanic.Value)
 	now := s.clock.Now()
 
@@ -2656,16 +2611,13 @@ func (s *Service) failClaimedApplyAfterDrivePanic(ctx context.Context, driverID 
 		tasks, tasksErr = s.storage.Tasks().GetByApplyID(ctx, apply.ID)
 	}
 	if tasksErr != nil {
-		s.logger.Error("operator: failed to load tasks while containing drive panic; the apply is left active, not failed, until a claim after its lease goes stale stores every task verdict",
+		s.logger.Error("operator: failed to load tasks while containing drive panic; the apply's failed verdict is written next, and once it is stored the stranded active-task reaper settles its unfinished tasks to failed",
 			append(apply.LogAttrs(),
 				"driver", driverID,
 				"apply_operation_id", applyOperationID,
 				"operation_deployment", deployment,
 				"error", tasksErr)...)
-		return fmt.Errorf("%w: load tasks to record failed verdicts after a drive panic for apply %s (database %s, apply_operation_id %d): %w",
-			tern.ErrTaskVerdictRefused, apply.ApplyIdentifier, apply.Database, applyOperationID, tasksErr)
 	}
-	var refusedErrs []error
 	for _, task := range tasks {
 		if state.IsTerminalTaskState(task.State) {
 			s.logger.Debug("operator: task already terminal while containing drive panic; leaving its state",
@@ -2681,19 +2633,7 @@ func (s *Service) failClaimedApplyAfterDrivePanic(ctx context.Context, driverID 
 		task.UpdatedAt = now
 		if err := s.storage.Tasks().Update(ctx, task); err != nil {
 			s.logRefusedPanicTaskVerdict(ctx, driverID, apply, task, storedState, err)
-			refusedErrs = append(refusedErrs, fmt.Errorf("task %s: %w", task.TaskIdentifier, err))
 		}
-	}
-	if len(refusedErrs) > 0 {
-		s.logger.Error("operator: a task did not record its failed verdict while containing drive panic; the apply is left active, not failed, until a claim after its lease goes stale stores every task verdict",
-			append(apply.LogAttrs(),
-				"driver", driverID,
-				"apply_operation_id", applyOperationID,
-				"operation_deployment", deployment,
-				"refused_task_count", len(refusedErrs),
-				"task_count", len(tasks))...)
-		return fmt.Errorf("%w: record failed task verdicts after a drive panic for apply %s (database %s, apply_operation_id %d): %w",
-			tern.ErrTaskVerdictRefused, apply.ApplyIdentifier, apply.Database, applyOperationID, errors.Join(refusedErrs...))
 	}
 
 	// A multi-operation drive holds only its operation lease; the parent
@@ -2706,7 +2646,7 @@ func (s *Service) failClaimedApplyAfterDrivePanic(ctx context.Context, driverID 
 				"driver", driverID,
 				"apply_operation_id", applyOperationID,
 				"operation_deployment", deployment)...)
-		return nil
+		return false
 	}
 
 	// Reload before writing: a stop or a competing driver may have already
@@ -2716,17 +2656,17 @@ func (s *Service) failClaimedApplyAfterDrivePanic(ctx context.Context, driverID 
 	if err != nil {
 		s.logger.Error("operator: failed to reload apply while containing drive panic; the apply is not marked failed and will be re-claimed on a later poll",
 			append(apply.LogAttrs(), "driver", driverID, "error", err)...)
-		return nil
+		return false
 	}
 	if fresh == nil {
 		s.logger.Error("operator: apply not found while containing drive panic; the apply is not marked failed",
 			append(apply.LogAttrs(), "driver", driverID)...)
-		return nil
+		return false
 	}
 	if state.IsTerminalApplyState(fresh.State) {
 		s.logger.Info("operator: apply already terminal while containing drive panic; leaving its state",
 			append(apply.LogAttrs(), "driver", driverID, "current_state", fresh.State)...)
-		return nil
+		return false
 	}
 
 	// Write the reloaded row, not the claim-time pointer: fields a stop or a
@@ -2739,31 +2679,33 @@ func (s *Service) failClaimedApplyAfterDrivePanic(ctx context.Context, driverID 
 	if err := s.storage.Applies().Update(ctx, fresh); err != nil {
 		s.logger.Error("operator: failed to mark apply failed while containing drive panic; the apply will be re-claimed on a later poll",
 			append(apply.LogAttrs(), "driver", driverID, "error", err)...)
-		return nil
+		return false
 	}
 	// The failed transition releases the active-apply gauge the same way an
 	// engine-driven failure would have.
 	metrics.AdjustActiveApplies(ctx, -1, fresh.Database, deployment, fresh.Environment)
 	s.logApplyDrivePanicFailure(ctx, driverID, fresh, previousState, errMsg)
-	return nil
+	return true
 }
 
 // logRefusedPanicTaskVerdict logs why a task's failed verdict did not land
 // while a drive panic was being contained. The causes need different triage:
 // a lost lease means a peer owns the apply now, a cancelled drive hands it
-// back, a rejected value is refused on every claim until the stored value
-// changes, and anything else is a storage error the next claim may clear.
+// back, a rejected value is refused on every write that carries it, and
+// anything else is a storage error. Containment goes on to fail the apply
+// either way, and once that verdict is stored the stranded active-task reaper
+// settles the task.
 func (s *Service) logRefusedPanicTaskVerdict(ctx context.Context, driverID int, apply *storage.Apply, task *storage.Task, storedState string, err error) {
 	attrs := append(task.LogAttrs(), "apply_id", apply.ApplyIdentifier, "driver", driverID, "stored_state", storedState, "error", err)
 	switch {
 	case errors.Is(err, storage.ErrApplyLeaseLost):
 		s.logger.Warn("operator: task failed verdict was refused while containing drive panic because the drive's lease was lost; the lease holder settles the task", attrs...)
 	case ctx.Err() != nil:
-		s.logger.Warn("operator: task failed verdict was not recorded while containing drive panic because the drive was cancelled; the task is left for the next claim", attrs...)
+		s.logger.Warn("operator: task failed verdict was not recorded while containing drive panic because the drive was cancelled; the task keeps its stored state for the next writer", attrs...)
 	case errors.Is(err, storage.ErrValueRejected):
-		s.logger.Error("operator: task failed verdict was refused outright while containing drive panic because storage cannot hold a value it carries; every later claim is refused the same write until the stored value changes", attrs...)
+		s.logger.Error("operator: task failed verdict was refused while containing drive panic because storage cannot hold a value it carries; the apply's failed verdict is written next, and once it is stored the stranded active-task reaper settles this task to failed", attrs...)
 	default:
-		s.logger.Error("operator: storage error recording task failed verdict while containing drive panic; the task is left for the next claim", attrs...)
+		s.logger.Error("operator: storage error recording task failed verdict while containing drive panic; the apply's failed verdict is written next, and once it is stored the stranded active-task reaper settles this task to failed", attrs...)
 	}
 }
 
