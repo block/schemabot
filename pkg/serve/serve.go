@@ -171,16 +171,16 @@ func versionFromBuildInfo(info *debug.BuildInfo) string {
 }
 
 type webhookRuntime struct {
-	handler                         http.Handler
-	startDurableWebhookDispatch     func(context.Context)
-	stopDurableWebhookDispatch      func()
-	drainInProcessWebhookWork       func(context.Context)
-	reconcileMissingSummaryComments func(context.Context)
+	handler                        http.Handler
+	startDurableWebhookDispatch    func(context.Context)
+	stopDurableWebhookDispatch     func()
+	drainInProcessWebhookWork      func(context.Context)
+	reconcileTerminalApplyOutcomes func(context.Context)
 }
 
-// reconcilePass is a running one-shot missing-summary reconciliation. Start
+// reconcilePass is a running one-shot terminal outcome reconciliation. Start
 // detaches the pass from its context on purpose — it repairs terminal PR
-// comments an interrupted process left half-written, and a request context
+// comments and Check Runs an interrupted process left half-written, and a request context
 // ending must not leave them that way — which makes Close the only place that
 // can put a bound on it. This handle is what gives Close something to bound.
 type reconcilePass struct {
@@ -189,18 +189,19 @@ type reconcilePass struct {
 }
 
 // Reconciliation drain policy. The pass reads stored apply state and writes
-// GitHub comments, so Close waits for it before storage closes underneath it.
+// GitHub comments and Check Runs, so Close waits for it before storage closes
+// underneath it.
 //
 // The timeout covers a pass making progress against a responsive GitHub API and
 // abandons one that is not, because an abandoned pass costs nothing that lasts:
-// the comments it did not reach are still missing, which is exactly the
-// condition that makes the next process to start run the pass again. The grace
+// the outcomes it did not reach are still missing, which is exactly the
+// condition the next reconcile pass repairs. The grace
 // that follows is not a second budget — it is the moment it takes a cancelled
 // pass to unwind, so it ends on its own context rather than on a storage pool
 // that closed under it.
 const (
-	missingSummaryReconcileDrainTimeout = 5 * time.Second
-	missingSummaryReconcileCancelGrace  = 2 * time.Second
+	terminalOutcomeReconcileDrainTimeout = 5 * time.Second
+	terminalOutcomeReconcileCancelGrace  = 2 * time.Second
 )
 
 // stop waits for the pass, then cancels it if it has not finished. It reports
@@ -210,33 +211,33 @@ func (p *reconcilePass) stop(logger *slog.Logger) {
 	if p == nil {
 		return
 	}
-	if drain.Wait(&p.wg, missingSummaryReconcileDrainTimeout) {
+	if drain.Wait(&p.wg, terminalOutcomeReconcileDrainTimeout) {
 		return
 	}
 
-	logger.Warn("missing-summary reconciliation did not finish within the shutdown drain; it is being canceled and the comments it did not reach are reconciled by the next process to start",
-		"drain_timeout", missingSummaryReconcileDrainTimeout)
+	logger.Warn("terminal outcome reconciliation did not finish within the shutdown drain; it is being canceled and the outcomes it did not reach are reconciled by the next reconcile pass",
+		"drain_timeout", terminalOutcomeReconcileDrainTimeout)
 	p.cancel()
-	if !drain.Wait(&p.wg, missingSummaryReconcileCancelGrace) {
-		logger.Warn("missing-summary reconciliation has not returned since it was canceled; its remaining storage calls will fail as the pool closes",
-			"cancel_grace", missingSummaryReconcileCancelGrace)
+	if !drain.Wait(&p.wg, terminalOutcomeReconcileCancelGrace) {
+		logger.Warn("terminal outcome reconciliation has not returned since it was canceled; its remaining storage calls will fail as the pool closes",
+			"cancel_grace", terminalOutcomeReconcileCancelGrace)
 	}
 }
 
-func (r webhookRuntime) StartMissingSummaryReconciliation(ctx context.Context, logger *slog.Logger) *reconcilePass {
-	if r.reconcileMissingSummaryComments == nil {
-		logger.Debug("missing summary reconciliation disabled")
+func (r webhookRuntime) StartTerminalOutcomeReconciliation(ctx context.Context, logger *slog.Logger) *reconcilePass {
+	if r.reconcileTerminalApplyOutcomes == nil {
+		logger.Debug("terminal outcome reconciliation disabled")
 		return nil
 	}
 
 	reconcileCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
 	pass := &reconcilePass{cancel: cancel}
 	pass.wg.Go(func() {
-		// The reconcile pass renders GitHub comments from stored apply state; a
+		// The reconcile pass renders GitHub output from stored apply state; a
 		// panic on one poisoned row must degrade only this startup pass, not
 		// kill the process that serves webhooks and drives applies.
 		err := panicsafe.Call(func() error {
-			r.reconcileMissingSummaryComments(reconcileCtx)
+			r.reconcileTerminalApplyOutcomes(reconcileCtx)
 			return nil
 		})
 		if err == nil {
@@ -246,10 +247,10 @@ func (r webhookRuntime) StartMissingSummaryReconciliation(ctx context.Context, l
 		if !errors.As(err, &reconcilePanic) {
 			// The reconcile callback returns nothing, so only a contained panic
 			// reaches here today; keep the signal if that invariant changes.
-			logger.Error("missing-summary reconciliation failed", "error", err)
+			logger.Error("terminal outcome reconciliation failed", "error", err)
 			return
 		}
-		logger.Error("missing-summary reconciliation panicked; missing summary comments will not be reconciled until the next restart",
+		logger.Error("terminal outcome reconciliation panicked at startup; missing summaries and stranded checks wait for the next reconcile pass",
 			"panic", fmt.Sprint(reconcilePanic.Value),
 			"stack", string(reconcilePanic.Stack))
 		metrics.RecordRecoveredPanic(reconcileCtx, "summary_reconciliation")
@@ -429,7 +430,7 @@ func serveUntilShutdown(runCtx context.Context, srv *Server, signalled <-chan os
 	}
 
 	// Start background loops (operator, health monitor, pending-drops cleaner,
-	// missing-summary reconciliation). Server.Close stops them.
+	// terminal outcome reconciliation). Server.Close stops them.
 	srv.Start(backgroundCtx)
 
 	server := &http.Server{
@@ -538,7 +539,7 @@ type Server struct {
 	// through attributableVersion on the way, because a report is prose and
 	// the sentinel is a log value.
 	version string
-	// reconcile is the missing-summary pass Start kicked off, nil when Start
+	// reconcile is the terminal outcome pass Start kicked off, nil when Start
 	// has not run or the pass is not configured. Close bounds it.
 	reconcile *reconcilePass
 }
@@ -1045,13 +1046,13 @@ func (s *Server) MetricsHandler() http.Handler {
 // (dispatches queued applies and recovers stale ones), the remote-deployment
 // health monitor, the webhook inbox monitor (emits durable-inbox depth/backlog
 // metrics), the startup target probe, and the pending-drops cleaner — all of which run until ctx is
-// canceled or Close is called. It also kicks off a one-shot missing-summary
+// canceled or Close is called. It also kicks off a one-shot terminal outcome
 // reconciliation that, once started, runs independently of ctx (it repairs
-// interrupted terminal comments and must not be cut short by a request context)
+// interrupted terminal comments and checks and must not be cut short by a request context)
 // until Close bounds it; it runs before the operator so recovered applies attach
 // observers first.
 func (s *Server) Start(ctx context.Context) {
-	s.reconcile = s.webhook.StartMissingSummaryReconciliation(ctx, s.logger)
+	s.reconcile = s.webhook.StartTerminalOutcomeReconciliation(ctx, s.logger)
 	if s.targetResolver != nil {
 		s.startTargetProbe(ctx)
 	}
@@ -1394,11 +1395,11 @@ func buildSingleAppWebhookRuntime(serverConfig *api.ServerConfig, svc *api.Servi
 		"app_id", creds.AppID, "trusted_check_app_slugs", serverConfig.GitHub.TrustedCheckAppSlugs,
 		"repo_webhook_dispatch", repoWebhookSecret != "")
 	return webhookRuntime{
-		startDurableWebhookDispatch:     handler.StartDurableWebhookDispatch,
-		stopDurableWebhookDispatch:      handler.StopDurableWebhookDispatch,
-		drainInProcessWebhookWork:       handler.DrainInProcessWebhookWork,
-		handler:                         handler,
-		reconcileMissingSummaryComments: handler.ReconcileMissingSummaryComments,
+		startDurableWebhookDispatch:    handler.StartDurableWebhookDispatch,
+		stopDurableWebhookDispatch:     handler.StopDurableWebhookDispatch,
+		drainInProcessWebhookWork:      handler.DrainInProcessWebhookWork,
+		handler:                        handler,
+		reconcileTerminalApplyOutcomes: handler.ReconcileTerminalApplyOutcomes,
 	}, nil
 }
 
@@ -1489,11 +1490,11 @@ func buildMultiAppWebhookRuntime(serverConfig *api.ServerConfig, svc *api.Servic
 	svc.SetCheckRunBackfiller(handler)
 	logger.Info("GitHub multi-App webhook endpoint registered", "apps", len(serverConfig.Apps))
 	return webhookRuntime{
-		startDurableWebhookDispatch:     handler.StartDurableWebhookDispatch,
-		stopDurableWebhookDispatch:      handler.StopDurableWebhookDispatch,
-		drainInProcessWebhookWork:       handler.DrainInProcessWebhookWork,
-		handler:                         handler,
-		reconcileMissingSummaryComments: handler.ReconcileMissingSummaryComments,
+		startDurableWebhookDispatch:    handler.StartDurableWebhookDispatch,
+		stopDurableWebhookDispatch:     handler.StopDurableWebhookDispatch,
+		drainInProcessWebhookWork:      handler.DrainInProcessWebhookWork,
+		handler:                        handler,
+		reconcileTerminalApplyOutcomes: handler.ReconcileTerminalApplyOutcomes,
 	}, nil
 }
 

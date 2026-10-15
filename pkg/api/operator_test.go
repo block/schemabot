@@ -90,7 +90,7 @@ func TestRecoverApplyPendingStop_ClaimErrorDoesNotConsumeTick(t *testing.T) {
 
 	consumed := svc.recoverApplyPendingStop(t.Context(), 1, driverLeaseOwner(1))
 
-	assert.False(t, consumed, "a failed stop-reconciliation claim must not consume the driver tick")
+	assert.Equal(t, claimFellThrough, consumed, "a failed stop-reconciliation claim must not consume the driver tick")
 }
 
 type noopProgressObserver struct{}
@@ -1674,13 +1674,15 @@ func TestRecoverMultiApplyOperation_RefusedTaskVerdictLeavesOperationUnprojected
 		logger,
 	)
 
-	svc.recoverMultiApplyOperation(t.Context(), 1, &storage.ApplyOperation{
+	outcome := svc.recoverMultiApplyOperation(t.Context(), 1, &storage.ApplyOperation{
 		ID:         42,
 		ApplyID:    7,
 		Deployment: "west",
 		State:      state.ApplyOperation.Running,
 	}, storage.OperationLease{})
 
+	assert.Equal(t, claimSpent, outcome,
+		"a refused verdict settles nothing, so the driver waits for its next wake rather than re-running the ladder against the same refusal")
 	assert.Equal(t, state.ApplyOperation.Running, opStore.op.State,
 		"the operation row must stay running and claimable; its stored failure must not be projected over the task whose cancellation never landed")
 	assert.Equal(t, state.Apply.Running, applyStore.currentState(),
@@ -1793,7 +1795,7 @@ func TestRecoverApplyOperationCutover_RoutesThroughCutoverDrive(t *testing.T) {
 
 	consumed := svc.recoverApplyOperationCutover(t.Context(), 1, "driver-1")
 
-	assert.True(t, consumed, "claiming a parked cutover must consume the tick")
+	assert.Equal(t, claimSpent, consumed, "claiming a parked cutover must consume the tick, and a task-less failure must not re-run the ladder")
 	assert.True(t, opStore.claimed, "the cutover claim predicate must be queried")
 	deploymentClient.resumeMu.Lock()
 	cutoverID := deploymentClient.resumeCutoverOperationID
@@ -1840,7 +1842,7 @@ func TestRecoverApplyOperationCutover_RejectsSingleOperationSet(t *testing.T) {
 
 	consumed := svc.recoverApplyOperationCutover(t.Context(), 1, "driver-1")
 
-	assert.True(t, consumed, "claiming any operation consumes the tick even when it is rejected")
+	assert.Equal(t, claimSpent, consumed, "claiming any operation consumes the tick even when it is rejected")
 	deploymentClient.resumeMu.Lock()
 	cutoverID := deploymentClient.resumeCutoverOperationID
 	copyID := deploymentClient.resumeOperationID

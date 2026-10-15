@@ -750,9 +750,11 @@ with the lease-scoped drive paths opting in and the unscoped reconciler opting o
 There is no revival path from `failed`. Plans are diffs, so a fresh plan and apply never re-runs
 already-landed work, whereas a revival path would re-run stored DDL against a database that may
 have drifted since. A rollout whose `failed` verdict is corrected back to `running_degraded` (ST-1)
-is not revived: its failed operation stays failed and is never run again. *Enforced:* absence. No
-write re-runs a failed operation, and the rollout projection is the only write that moves a failed
-apply to an active state (ST-1).
+is not revived: its failed operation stays failed and is never run again. *Enforced:* by absence
+and by one refusal. No write re-runs a failed operation, and the rollout projection is the only
+write that moves a failed apply to an active state (ST-1); a start on a stopped apply whose
+operation holds a failed task is refused with that failure (`failedTaskRefusingStart`,
+`pkg/tern/local_control_resume.go`).
 
 ### ST-3: Apply state flows upward, never downward
 
@@ -1533,8 +1535,13 @@ sentinel abandoned by a crashed publisher is recovered by its own stale-claim pa
 ordinary claim path will only reclaim a marker that records an already-posted comment. Stealing an
 in-flight sentinel would hand two writers the same claim, which is the unbounded duplication this
 invariant does rule out. *Enforced:* the atomic summary claim and its stale-claim recovery
-(`pkg/storage/internal/sqlstore/apply_comments.go`), and the observer claims in the drive and
-recovery paths (`pkg/webhook/comment_observer.go`, `pkg/webhook/handler.go`).
+(`pkg/storage/internal/sqlstore/apply_comments.go`), the observer claims in the drive and
+recovery paths (`pkg/webhook/comment_observer.go`, `pkg/webhook/handler.go`), the retryable
+expiry pass, which publishes for each apply it moves to failed (`runRetryableExpiryPass` in
+`pkg/api/reaper.go`), and terminal outcome reconciliation, which at startup and on every webhook
+reconcile pass posts missing summaries and completes stored check state a terminal apply left in
+progress (`ReconcileTerminalApplyOutcomes` in `pkg/webhook/handler.go`, run from
+`pkg/webhook/durable_reconcile.go`).
 
 ## Review integrity and data safety (RV)
 
@@ -1745,12 +1752,20 @@ its stored route is not re-resolved as a convenience: the apply is refused and a
 plan, because re-resolving is exactly the step that could produce a different answer than the one
 the operator reviewed.
 
+The stored route binds the logical target and deployment, not a MySQL schema
+override within that target. Adding, changing, or removing an override requires
+holding affected operations, draining or retiring resumable applies, deploying
+consistent configuration to every replica, and discarding old plans before
+re-planning. This procedure is an operational prerequisite; durable schema-mapping
+binding across driver restarts is not enforced. See [schema override rollout](configuration.md#per-target-schema-overrides).
+
 The schema source is held to the same standard, and checked twice. A repository and a path inside
 it count as a source for a database only because server config says so, verified when the plan is
 made and verified again before the apply runs. Config that cannot answer the question is a
 refusal, never a default. *Breaks if violated:* a change reviewed against one database is applied
 to another. *Enforced:* server-side routing (`pkg/tern/target_router.go`), the schema override
-allowlist (`pkg/tern/local_client.go`, validated by `pkg/inventory/static.go`), rollout member
+allowlist (`pkg/tern/local_client.go`, validated by `pkg/inventory/static.go`), configured
+resolver identity assertions (`pkg/inventory/overrides.go`), rollout member
 selection (`pkg/api/rollout_member_selector.go`, `applyTargets` in `pkg/api/plan_handlers.go`), the PostgreSQL
 apply's check that planned DDL names the schema it targets (`pkg/engine/postgres/apply.go`), and
 source policy (`pkg/webhook/schema_source_policy.go`).

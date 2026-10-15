@@ -243,7 +243,7 @@ type Service struct {
 	OnApplyRecovered RecoveryCallback
 
 	// OnApplyTerminalSummary is called after an apply is terminalized by the
-	// aggregate projection CAS. Set by the webhook handler to publish the
+	// aggregate projection CAS or by retryable expiry. Set by the webhook handler to publish the
 	// apply-level terminal PR summary and refresh GitHub check state; the
 	// summary-marker claim inside the publish path keeps it exactly-once
 	// against any still-live per-driver observer.

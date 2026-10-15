@@ -133,6 +133,67 @@ With the `config_paths` example above, SchemaBot reads:
 `dsn` and `dsn_from` are mutually exclusive for each storage or database
 environment entry.
 
+### Per-target schema overrides
+
+Static `target_resolver.targets` entries require exact lowercase engine types
+without surrounding whitespace, such as `mysql` and `postgres`. Values such as
+`MySQL` or ` mysql ` are rejected at startup, with or without overrides.
+
+A data plane can attach a canonical-to-physical schema mapping after resolving
+an exact `(environment, target)` through Etre or static inventory:
+
+```yaml
+target_resolver:
+  targets:
+    cluster-002:
+      type: mysql
+      dsn: "env:CLUSTER_DSN" # namespace-free
+  overrides:
+    - environment: production
+      target: cluster-002
+      type: mysql
+      schema_overrides:
+        orders_production: orders_sandbox
+```
+
+`overrides` is not a discovery backend. Configure exactly one of `targets` or
+`etre`. Each override requires an explicit lowercase environment, exact target,
+and engine type, plus exactly one mapping. MySQL and PostgreSQL mappings use the
+same identifier validation as static `schema_overrides`; other engines, unknown
+fields, duplicate environment/target pairs, and empty mappings are rejected.
+An override cannot also own a mapping in static inventory or a custom resolver.
+
+Discovery and credentials are resolved using the original request. There is no
+fallback environment or target. Only after successful discovery does the
+resolver check the resolved identity and type and attach a copied mapping.
+An absent entry preserves the backend result, including any static mapping.
+Enumeration and single-engine reporting retain the underlying resolver's
+capabilities. Startup logs name configured mappings; debug logs record use.
+Neither log includes connection strings or credentials.
+
+The engine operates on the physical schema and returns canonical namespace
+keys. The mapping is a strict allowlist: another namespace is refused. MySQL
+connections must remain namespace-free. A PostgreSQL mapping selects a schema
+within the database already named by the DSN.
+
+Before enabling a mapping, resolve the target and pull/plan using its canonical
+namespace. Configuration validation cannot prove that a target exists. In a
+multi-target rollout, plan every target against its own live schema; sharing
+desired SQL does not imply identical plans after partial completion.
+
+**Adding, changing, or removing mappings requires draining work.** This includes
+the first override: an older plan may refer to the canonical schema directly.
+Hold new operations for the affected target. Complete or explicitly retire all
+active, deferred-cutover, stopped, or otherwise resumable applies first. Hold
+affected target operations until every serving replica has the same config,
+and re-plan after every mapping change. A new mapping changes the client cache
+identity, but does not durably bind an old MySQL plan across driver restarts.
+Never execute a pre-change plan with a new mapping. To roll back, withdraw the
+affected route and drain its work before removing the mapping: removal restores
+identity mapping and can address a different schema. There is no hot reload.
+Durable mapping identity on plans is not enforced; this release depends on the
+drain-and-replan procedure, including discarding unused pre-change plans.
+
 ### PostgreSQL `dsn_from` targets
 
 `target_resolver` is the data-plane connection resolver: a server exposing the
@@ -971,22 +1032,51 @@ local-mode MySQL and `cleanup_enabled: true`.
 
 For MySQL databases executed by the Spirit engine, some ALTER statements are
 deterministically refused by the engine — for example dropping a primary key or
-adding a foreign key, which its online copy cannot preserve. By default those
-statements block the apply. The `direct_execution` policy lets a refused
-statement instead run verbatim as native MySQL DDL when the target table is
-small enough. See [Direct Execution](direct-execution.md) for how routing
-works and what other engines need to adopt it.
+adding a foreign key, which its online copy cannot preserve. The
+`direct_execution` policy lets a refused statement instead run verbatim as
+native MySQL DDL when the target table is small enough. With no policy
+configured, the default applies: enabled, bounded at 100MiB of data and
+indexes, which is an estimate (see `max_table_bytes` below). Set
+`enabled: false` to leave refused statements blocked, or `max_table_rows` for a
+bound the engine corroborates with an exact count. See
+[Direct Execution](direct-execution.md) for how routing works and what other
+engines need to adopt it.
 
 Set it at the top level of the server config to state one policy for every
 MySQL database the server drives:
 
 ```yaml
 direct_execution:
-  enabled: true           # default: false
+  enabled: true           # required to enable; omitted in a stated block means false
   max_table_rows: 100000  # the size bound: set exactly one of max_table_rows
                           # or max_table_bytes (e.g. max_table_bytes: 100MiB)
   lock_acquisition_timeout: 10s  # optional; whole seconds; default 10s
 ```
+
+Only omitting the block entirely selects the default policy. A stated block is
+taken as written: it does not inherit the default's size bound, so one that
+enables direct execution must name its own.
+
+State the policy, including an opt-out, on the control plane. A control plane
+forwards the policy it resolves with every plan, and the server that runs the
+statement uses it in place of its own. A control plane with no
+`direct_execution` block forwards the default, so `enabled: false` set only on
+a data plane is overridden.
+
+Upgrade order: upgrade every server that executes statements to a build that
+reads `max_table_bytes` before upgrading the control plane to a build with this
+default. An older server rejects the forwarded default as missing its row
+bound, so every MySQL plan and apply it serves fails until it is upgraded.
+Stating a `max_table_rows` policy on the control plane first avoids this.
+
+Between the two upgrades, plans and applies disagree. The older control plane
+forwards no policy, so an upgraded server plans a refused statement as direct
+under its own default. The control plane records that plan as judged under no
+policy, and the apply carries that record, so the server blocks at apply the
+statement the plan showed as direct. To keep the two in agreement, set
+`enabled: false` on the upgraded servers until the control plane is upgraded.
+Once it is, the control plane's policy is the one forwarded, so the setting no
+longer has any effect.
 
 This is the form to reach for on a fleet: a per-database block for every
 database is the same policy written many times, and each copy is one more

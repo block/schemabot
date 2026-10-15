@@ -2477,6 +2477,7 @@ func TestE2EReconcileMissingSummaryCommentsPostsSummary(t *testing.T) {
 		CommentState:    state.Comment.Progress,
 		GitHubCommentID: 9001,
 	}))
+	settleReconcileScenario(t, schemabotDB, apply)
 
 	installClient, capture := setupFakeGitHubForComments(t)
 	factory := &fakeClientFactory{client: installClient}
@@ -2595,7 +2596,22 @@ func seedReconcileScenario(t *testing.T, st storage.Storage, schemabotDB *sql.DB
 		CommentState:    state.Comment.Progress,
 		GitHubCommentID: 9001,
 	}))
+	settleReconcileScenario(t, schemabotDB, apply)
 	return apply
+}
+
+// settleReconcileScenario ages apply past the settle floor summary
+// reconciliation leaves to a live publisher, so the scenario reads as an apply
+// whose publisher has had its chance and failed.
+func settleReconcileScenario(t *testing.T, schemabotDB *sql.DB, apply *storage.Apply) {
+	t.Helper()
+	_, err := schemabotDB.ExecContext(t.Context(),
+		"UPDATE applies SET completed_at = completed_at - INTERVAL 10 MINUTE, updated_at = NOW() - INTERVAL 10 MINUTE WHERE id = ?", apply.ID)
+	require.NoError(t, err)
+	if apply.CompletedAt != nil {
+		settled := apply.CompletedAt.Add(-10 * time.Minute)
+		apply.CompletedAt = &settled
+	}
 }
 
 // TestE2EReconcileMissingSummaryCommentsRepairsStoppedApply verifies startup
@@ -3031,7 +3047,7 @@ func TestE2EEditTrackedCommentNotFound(t *testing.T) {
 // posted — a metadata-only DDL finishes faster than the handler's post, so the
 // driver's observer has already found nothing to edit at terminal. The handler
 // re-checks the apply after posting and finalizes the comment in place, so the
-// PR never shows a progress comment frozen at "Starting" after the success
+// PR never shows a progress comment frozen at "Queued" after the success
 // summary. An apply that is still active is left to the observer to edit.
 func TestE2EInitialProgressCommentFinalizedForFastApply(t *testing.T) {
 	ctx := t.Context()
@@ -3085,7 +3101,7 @@ func TestE2EInitialProgressCommentFinalizedForFastApply(t *testing.T) {
 		var created commentCreate
 		select {
 		case created = <-capture.creates:
-			assert.Contains(t, created.Body, "**Status**: Starting")
+			assert.Contains(t, created.Body, "**Status**: Queued")
 		case <-time.After(webhookIntegrationCheckRunDeadline):
 			t.Fatal("timed out waiting for the initial progress comment")
 		}
@@ -3094,7 +3110,7 @@ func TestE2EInitialProgressCommentFinalizedForFastApply(t *testing.T) {
 		case edited := <-capture.edits:
 			assert.Equal(t, created.ID, edited.CommentID, "the finalize edits the just-posted comment")
 			assert.Contains(t, edited.Body, "**Status**: Applied")
-			assert.NotContains(t, edited.Body, "**Status**: Starting")
+			assert.NotContains(t, edited.Body, "**Status**: Queued")
 		case <-time.After(webhookIntegrationCheckRunDeadline):
 			t.Fatal("timed out waiting for the terminal finalize edit")
 		}

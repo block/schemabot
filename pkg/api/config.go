@@ -227,8 +227,13 @@ type ServerConfig struct {
 	// direct_execution block replaces this policy whole rather than merging
 	// field by field, so an override can never enable direct execution while
 	// inheriting a size bound stated somewhere else, and an override that
-	// disables it is a complete opt out. Unset (the default) leaves refused
-	// statements blocked everywhere.
+	// disables it is a complete opt out. Unset, the default policy applies
+	// (see defaultDirectExecution): enabled, bounded by the table's data and
+	// index footprint. Set enabled: false to leave refused statements blocked
+	// on the databases this server plans. A control plane forwards its policy
+	// with every plan, and the server that runs the statement uses it in place
+	// of its own, so an opt-out stated only on a server that executes plans
+	// sent by a control plane is overridden.
 	DirectExecution *DirectExecutionConfig `yaml:"direct_execution,omitempty"`
 
 	// PlanetScale configures process-wide behavior for the Vitess engine's
@@ -1001,6 +1006,8 @@ type TargetResolverConfig struct {
 	// each entry's database_type) so one data plane can serve several engines at
 	// once and the request's database type selects among them.
 	Etre []EtreConfig `yaml:"etre,omitempty"`
+	// Overrides decorates discovery; it is not itself a backend.
+	Overrides []inventory.TargetOverride `yaml:"overrides,omitempty"`
 }
 
 // Configured reports whether the data plane has any static target inventory.
@@ -1490,11 +1497,12 @@ func (c *DirectExecutionConfig) EngineMetadata() (map[string]string, error) {
 // the system carries it in: forwarded to the server that will run the
 // statement, and recorded on the apply that statement belongs to.
 //
-// Nil means the configuration states nothing, and a request that states
-// nothing leaves refused statements blocked wherever it lands. A configured
-// block that is disabled is not nothing: it is an opt-out, and it resolves to
-// a disabled policy so that it travels and overrides a grant the server that
-// runs the statement holds of its own.
+// Nil means this block states nothing and resolves to no policy: a request
+// carrying none leaves the executing server's own policy in force, which
+// ServerConfig.ResolveDirectExecution fills with the default when that server
+// states none. A configured block that is disabled is not nothing: it is an
+// opt-out, and it resolves to a disabled policy so that it travels and
+// overrides a grant the server that runs the statement holds of its own.
 func (c *DirectExecutionConfig) Policy() (*storage.DirectExecutionPolicy, error) {
 	if c == nil {
 		return nil, nil
@@ -2278,6 +2286,9 @@ func (c *ServerConfig) validateTargetTableOwners() error {
 // Validate checks the configuration for required fields and consistency.
 func (c *ServerConfig) Validate() error {
 	if err := c.ValidateExperimentalStrata(); err != nil {
+		return err
+	}
+	if err := c.TargetResolver.validateTargetConfig(); err != nil {
 		return err
 	}
 	if err := c.validateTargetTableOwners(); err != nil {
@@ -4009,11 +4020,24 @@ func (c *ServerConfig) validateServerDirectExecutionReachesAnEngine() error {
 	return fmt.Errorf("server config sets direct_execution, which no registered database can honor: it is only supported for %s databases", storage.DatabaseTypeMySQL)
 }
 
+// defaultDirectExecutionMaxTableBytes is the size bound of the server-wide
+// direct execution policy a server config that states none runs under.
+const defaultDirectExecutionMaxTableBytes = "100MiB"
+
+// defaultDirectExecution returns the server-wide direct execution policy a
+// server config that states none runs under: enabled, bounded by the table's
+// data and index footprint. A fresh value each call, so no caller can change
+// the default another resolves.
+func defaultDirectExecution() *DirectExecutionConfig {
+	return &DirectExecutionConfig{Enabled: true, MaxTableBytes: defaultDirectExecutionMaxTableBytes}
+}
+
 // ResolveDirectExecution returns the direct execution policy in force for one
 // database environment: the environment's own block when it states one,
-// otherwise the server-wide policy. The override replaces the server policy
-// whole, so an environment that states the policy disabled opts out of a
-// global grant instead of inheriting its bound.
+// otherwise the server-wide policy, which is the default policy when the
+// server config states none. The override replaces the server policy whole,
+// so an environment that states the policy disabled opts out of a global grant
+// instead of inheriting its bound.
 //
 // The server-wide policy reaches only the engines that can honor it. An
 // explicit per-database block is rejected at startup on every other database
@@ -4030,6 +4054,9 @@ func (c *ServerConfig) ResolveDirectExecution(envConfig *EnvironmentConfig, data
 	}
 	if !directExecutionSupported(databaseType) {
 		return nil
+	}
+	if c.DirectExecution == nil {
+		return defaultDirectExecution()
 	}
 	return c.DirectExecution
 }

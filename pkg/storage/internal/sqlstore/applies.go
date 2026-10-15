@@ -1793,6 +1793,24 @@ func (s *applyStore) GetInProgress(ctx context.Context) ([]*storage.Apply, error
 	return scanApplies(rows)
 }
 
+// GetUnsettled returns all applies in unsettled states: the non-terminal ones
+// and the stopped ones a driver may still claim.
+func (s *applyStore) GetUnsettled(ctx context.Context) ([]*storage.Apply, error) {
+	statePredicate, args := unsettledApplyStatePredicate("state")
+	rows, err := s.db.QueryContext(ctx, fmt.Sprintf(`
+		SELECT `+applyColumns+`
+		FROM applies
+		WHERE %s
+		ORDER BY created_at DESC
+	`, statePredicate), args...)
+	if err != nil {
+		return nil, fmt.Errorf("query unsettled applies: %w", err)
+	}
+	defer utils.CloseAndLog(rows)
+
+	return scanApplies(rows)
+}
+
 // FindStuckPendingApplies returns pending applies older than olderThan that
 // carry child rows — the child-rows arm of the claim predicate (see
 // ClaimApplyByID), so every row returned is one a driver should already have
@@ -2920,6 +2938,31 @@ func (s *applyStore) WithExclusiveTarget(ctx context.Context, apply *storage.App
 	return fn(ctx)
 }
 
+// WithTargetHeld runs fn under the named apply target's advisory lock. See
+// storage.ApplyStore for the contract: unlike WithExclusiveTarget it refuses
+// nothing, so fn runs alongside the applies that already own the target, and
+// the lock only keeps the next apply write on the target waiting until fn
+// returns.
+func (s *applyStore) WithTargetHeld(ctx context.Context, database, dbType, environment string, fn func(context.Context) error) error {
+	if fn == nil {
+		return fmt.Errorf("work function is required to hold apply target %s/%s/%s", database, dbType, environment)
+	}
+	database = storage.CanonicalKey(database)
+	dbType = storage.CanonicalKey(dbType)
+	environment = storage.CanonicalKey(environment)
+	if !hasApplyTarget(database, dbType, environment) {
+		return fmt.Errorf("apply target %s/%s/%s is incomplete: database, type, and environment are all required to hold it", database, dbType, environment)
+	}
+
+	conn, lockName, err := acquireApplyTargetLockConn(ctx, s.db, s.locker, database, dbType, environment)
+	if err != nil {
+		return err
+	}
+	defer releaseApplyTargetLockConn(ctx, s.locker, conn, lockName, "hold apply target")
+
+	return fn(ctx)
+}
+
 // checkTargetUnclaimed reports whether any active apply other than this one
 // owns the target, as ErrActiveApplyExists.
 func (s *applyStore) checkTargetUnclaimed(ctx context.Context, conn *rebindConn, apply *storage.Apply, database, dbType, environment, deployment string) error {
@@ -3320,7 +3363,7 @@ func (s *applyStore) GetByDatabase(ctx context.Context, database, dbType, enviro
 
 // FindMissingSummaryComment returns GitHub-backed applies that reached a
 // terminal state recently but whose progress comment was never followed by a
-// summary comment. Used to post missing summaries after restart.
+// summary comment. Used by summary reconciliation to post missing summaries.
 //
 // Three forms of "missing" qualify: no summary marker at all (the publisher
 // never ran); a superseded marker (a stop's summary consumed by a resume
@@ -3329,10 +3372,25 @@ func (s *applyStore) GetByDatabase(ctx context.Context, database, dbType, enviro
 // storage.SummaryClaimStaleAfter (the publisher claimed, then crashed before
 // posting). A fresh sentinel is an in-flight publish and is left alone.
 //
-// Recency is judged per state family: most terminal states stamp completed_at,
-// but a stopped apply is resumable and keeps completed_at NULL, so it qualifies
-// by updated_at instead.
-func (s *applyStore) FindMissingSummaryComment(ctx context.Context) ([]*storage.Apply, error) {
+// Recency (storage.MissingSummaryLookback) and the settledFor floor are judged
+// per state family: most terminal states stamp completed_at, but a stopped
+// apply is resumable and keeps completed_at NULL, so it qualifies by updated_at
+// instead.
+func (s *applyStore) FindMissingSummaryComment(ctx context.Context, settledFor time.Duration, limit int) ([]*storage.Apply, error) {
+	// The settle floor compares the same timestamp recency does: completed_at
+	// for most terminal states, updated_at for a resumable stop.
+	settled := "TRUE"
+	var settledArgs []any
+	if settledFor > 0 {
+		settledBefore := s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime, ParameterIntervalAmount(), IntervalSecond)
+		settled = "((a.state = ? AND a.updated_at <= " + settledBefore + ") OR (a.state != ? AND a.completed_at <= " + settledBefore + "))"
+		seconds := int64(settledFor / time.Second)
+		settledArgs = []any{state.Apply.Stopped, seconds, state.Apply.Stopped, seconds}
+	}
+	args := []any{state.Apply.Completed, state.Apply.Failed, state.Apply.Reverted, state.Apply.Cancelled,
+		state.Apply.Stopped, int64(storage.SummaryClaimStaleAfter.Seconds())}
+	args = append(args, settledArgs...)
+	args = append(args, limit)
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT `+applyColumnsForApplyAlias+`
 		FROM applies a
@@ -3342,19 +3400,20 @@ func (s *applyStore) FindMissingSummaryComment(ctx context.Context) ([]*storage.
 		  AND a.pull_request > 0
 		  AND a.installation_id > 0
 		  AND (
-			(a.state IN (?, ?, ?, ?) AND a.completed_at > `+s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime, LiteralIntervalAmount(1), IntervalHour)+`)
-			OR (a.state = ? AND a.updated_at > `+s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime, LiteralIntervalAmount(1), IntervalHour)+`)
+			(a.state IN (?, ?, ?, ?) AND a.completed_at > `+s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime, LiteralIntervalAmount(missingSummaryLookbackHours), IntervalHour)+`)
+			OR (a.state = ? AND a.updated_at > `+s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime, LiteralIntervalAmount(missingSummaryLookbackHours), IntervalHour)+`)
 		  )
 		  AND (
 			acs.id IS NULL
 			OR acs.superseded_at IS NOT NULL
 			OR (acs.github_comment_id = 0 AND acs.updated_at < `+s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime, ParameterIntervalAmount(), IntervalSecond)+`)
 		  )
+		  AND `+settled+`
 		ORDER BY a.updated_at DESC
-	`, state.Apply.Completed, state.Apply.Failed, state.Apply.Reverted, state.Apply.Cancelled,
-		state.Apply.Stopped, int64(storage.SummaryClaimStaleAfter.Seconds()))
+		LIMIT ?
+	`, args...)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("find terminal applies missing a summary comment: %w", err)
 	}
 	defer utils.CloseAndLog(rows)
 
@@ -3362,11 +3421,64 @@ func (s *applyStore) FindMissingSummaryComment(ctx context.Context) ([]*storage.
 	for rows.Next() {
 		apply, err := scanApplyInto(rows)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("scan terminal apply missing a summary comment: %w", err)
 		}
 		applies = append(applies, apply)
 	}
-	return applies, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate terminal applies missing a summary comment: %w", err)
+	}
+	return applies, nil
+}
+
+// missingSummaryLookbackHours is storage.MissingSummaryLookback in the whole
+// hours the interval literal takes.
+const missingSummaryLookbackHours = uint64(storage.MissingSummaryLookback / time.Hour)
+
+// FindTerminalWithInProgressCheck returns terminal applies whose stored check
+// state still names them as the in-progress apply. The newer-apply guard
+// mirrors CompleteForApply's, so an apply the refresh could not complete is
+// never returned.
+func (s *applyStore) FindTerminalWithInProgressCheck(ctx context.Context, limit int) ([]*storage.Apply, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT `+applyColumnsForApplyAlias+`
+		FROM checks c
+		JOIN applies a ON a.id = c.apply_id
+		WHERE c.status = ?
+		  AND a.repository != ''
+		  AND a.pull_request > 0
+		  AND a.installation_id > 0
+		  AND a.state IN (?, ?, ?, ?)
+		  AND NOT EXISTS (
+		    SELECT 1
+		    FROM applies newer
+		    WHERE newer.repository = c.repository
+		      AND newer.pull_request = c.pull_request
+		      AND newer.environment = c.environment
+		      AND newer.database_type = c.database_type
+		      AND newer.database_name = c.database_name
+		      AND newer.id > a.id
+		  )
+		ORDER BY a.updated_at DESC
+		LIMIT ?
+	`, checkStatusInProgress, state.Apply.Completed, state.Apply.Failed, state.Apply.Reverted, state.Apply.Cancelled, limit)
+	if err != nil {
+		return nil, fmt.Errorf("find terminal applies with in-progress stored check state: %w", err)
+	}
+	defer utils.CloseAndLog(rows)
+
+	var applies []*storage.Apply
+	for rows.Next() {
+		apply, err := scanApplyInto(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan terminal apply with in-progress stored check state: %w", err)
+		}
+		applies = append(applies, apply)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate terminal applies with in-progress stored check state: %w", err)
+	}
+	return applies, nil
 }
 
 // GetByPR returns all applies for a PR.

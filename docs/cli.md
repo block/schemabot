@@ -1136,7 +1136,7 @@ The TUI shows a single status line above the table list. It varies by overall st
 | State | Status line |
 |-------|-------------|
 | Starting | `⠋ Loading...` |
-| Pending | `⠋ Starting...` |
+| Pending | `⠋ Queued, starts automatically` |
 | Running | `⠋ 🔄 Copying rows... ETA 5m 30s` |
 | Stopping | `⠋ Stopping...` |
 | Waiting for cutover | *(cutover prompt shown in footer instead)* |

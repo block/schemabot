@@ -102,8 +102,8 @@ func TestBuildStopsWhenItsContextIsCanceled(t *testing.T) {
 
 // Close waits for the detached reconciliation pass, but only for as long as its
 // drain allows: a pass that will not finish is cancelled and left behind rather
-// than held onto, because the comments it did not reach are reconciled by the
-// next process to start, and a process that cannot close is not that process.
+// than held onto, because the outcomes it did not reach are reconciled by the
+// next reconcile pass, and a process that cannot close never runs one.
 func TestReconcilePassStopIsBounded(t *testing.T) {
 	t.Parallel()
 
@@ -118,14 +118,14 @@ func TestReconcilePassStopIsBounded(t *testing.T) {
 		{
 			name:        "pass returns when canceled",
 			cooperative: true,
-			wantWithin:  missingSummaryReconcileDrainTimeout + missingSummaryReconcileCancelGrace,
+			wantWithin:  terminalOutcomeReconcileDrainTimeout + terminalOutcomeReconcileCancelGrace,
 			wantLogs:    []string{"did not finish within the shutdown drain"},
 			notWantLog:  "has not returned since it was canceled",
 		},
 		{
 			name:        "pass ignores cancellation",
 			cooperative: false,
-			wantWithin:  missingSummaryReconcileDrainTimeout + missingSummaryReconcileCancelGrace + 5*time.Second,
+			wantWithin:  terminalOutcomeReconcileDrainTimeout + terminalOutcomeReconcileCancelGrace + 5*time.Second,
 			wantLogs: []string{
 				"did not finish within the shutdown drain",
 				"has not returned since it was canceled",
@@ -143,7 +143,7 @@ func TestReconcilePassStopIsBounded(t *testing.T) {
 
 			release := make(chan struct{})
 			t.Cleanup(func() { close(release) })
-			runtime := webhookRuntime{reconcileMissingSummaryComments: func(ctx context.Context) {
+			runtime := webhookRuntime{reconcileTerminalApplyOutcomes: func(ctx context.Context) {
 				if tt.cooperative {
 					select {
 					case <-ctx.Done():
@@ -154,14 +154,14 @@ func TestReconcilePassStopIsBounded(t *testing.T) {
 				<-release
 			}}
 
-			pass := runtime.StartMissingSummaryReconciliation(t.Context(), logger)
+			pass := runtime.StartTerminalOutcomeReconciliation(t.Context(), logger)
 			require.NotNil(t, pass)
 
 			start := time.Now()
 			pass.stop(logger)
 			elapsed := time.Since(start)
 
-			assert.GreaterOrEqual(t, elapsed, missingSummaryReconcileDrainTimeout,
+			assert.GreaterOrEqual(t, elapsed, terminalOutcomeReconcileDrainTimeout,
 				"the pass gets its full drain before being canceled")
 			assert.Less(t, elapsed, tt.wantWithin, "stop returns on its own bound, not on the pass")
 

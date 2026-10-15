@@ -1348,6 +1348,7 @@ func PreviewCommentApplyStarted() string {
 		Environment: "staging",
 		RequestedBy: previewRequestedBy,
 		ApplyID:     "apply-a1b2c3d4e5f6",
+		State:       state.Apply.Pending,
 	})
 }
 
@@ -3528,7 +3529,8 @@ func PreviewCommentSummaryFailedEngineLogs() string {
 	tables[1].RowsTotal = 1466232
 	tables[1].PercentComplete = 30
 	// The stored reason is what SchemaBot recorded and what its own log line
-	// repeats; the summary renders the version that points at the fold below.
+	// repeats. A reason chosen by code renders as is; only the generic sentence
+	// is rewritten to point at the fold below.
 	stored := mysqlerr.ReasonFromText("(errno 1265)")
 	data := sampleSummaryData(state.Apply.Failed, tables)
 	data.ErrorMessage = mysqlerr.PointToRenderedLogs(stored)
