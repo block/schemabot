@@ -248,11 +248,12 @@ another. Repeated errors observing remote progress mark the apply
 control plane cannot see, not that the change is unhealthy. *Enforced:* failure-class handling in
 the drive loop (`pkg/api/operator.go`), the pre-start task re-read and the outcome-write gate on
 terminal side effects in the sequential drive (`pkg/tern/local_apply_sequential.go`), the same gate
-in the grouped drive (`pkg/tern/local_apply_grouped.go`), the resume's refusal to record a failure
-over an outcome it already stored (the no-remaining-work branches of `resumeApplyWithTasks` and
-`launchAtomicResume` return a `postTerminalReconcileError` that `handleGroupedResumeFailure` passes
-through, `pkg/tern/local_control_resume.go`) and the remote progress error limit
-(`pkg/tern/grpc_client.go`).
+in the grouped drive (`pkg/tern/local_apply_grouped.go`), with `outcomeWriteLanded`
+(`pkg/tern/local_apply_failure.go`) as the only proof that lets either gate adopt an outcome write
+that returned an error, the resume's refusal to record a failure over an outcome it already stored
+(the no-remaining-work branches of `resumeApplyWithTasks` and `launchAtomicResume` return a
+`postTerminalReconcileError` that `handleGroupedResumeFailure` passes through,
+`pkg/tern/local_control_resume.go`) and the remote progress error limit (`pkg/tern/grpc_client.go`).
 
 ### AV-5: Panics are contained and permanent
 
@@ -264,7 +265,8 @@ caller gets a fixed internal error, never the panic text or a stack. *Enforced:*
 boundary in `pkg/panicsafe/panicsafe.go`, applied around webhook work units
 (`pkg/webhook/handler.go`, `pkg/webhook/durable_dispatch.go`), local drives
 (`pkg/tern/local_apply.go`), and the startup target probe (`pkg/serve/serve.go`
-around enumeration, `pkg/targetprobe/targetprobe.go` around each target).
+around enumeration, `pkg/targetprobe/targetprobe.go` around each target); the contained drive
+panic becomes a permanent `failed` in `failClaimedApplyAfterDrivePanic` (`pkg/api/operator.go`).
 
 ### AV-6: Mixed versions are survivable by contract, not by guesswork
 
@@ -930,7 +932,9 @@ check on every lease-scoped storage write
 (`pkg/storage/internal/sqlstore/applies.go`, `pkg/storage/internal/sqlstore/apply_operations.go`,
 `pkg/storage/internal/sqlstore/tasks.go`, `pkg/storage/internal/sqlstore/apply_comments.go`,
 `pkg/storage/internal/sqlstore/apply_logs.go`, `pkg/storage/internal/sqlstore/checks.go`,
-`pkg/storage/internal/sqlstore/control_requests.go`).
+`pkg/storage/internal/sqlstore/control_requests.go`), and the lease-token match in
+`outcomeWriteLanded` (`pkg/tern/local_apply_failure.go`) before a drive adopts an outcome write
+that returned an error.
 
 ### OW-3: A driver stops before a peer may reclaim
 

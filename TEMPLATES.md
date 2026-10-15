@@ -4191,6 +4191,24 @@ schemabot apply -e production
 </details>
 
 <details>
+<summary><a name="apply-blocked-by-prior-env-stopped"></a><strong>Apply Blocked By Prior Env (Stopped)</strong></summary>
+
+
+## ⛔ Apply Blocked — Production
+
+**Database**: `testapp`
+
+Staging has a stopped apply. Start it again with the command on its progress comment.
+
+Once staging completes, retry:
+```
+schemabot apply -e production
+```
+<!-- schemabot:offer-support-channel -->
+
+</details>
+
+<details>
 <summary><a name="apply-blocked-prior-env-check-missing"></a><strong>Apply Blocked: Prior Env Check Missing</strong></summary>
 
 
