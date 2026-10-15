@@ -2089,6 +2089,102 @@ func TestResumeClaimedApply_DrivePanicWithRefusedTaskVerdictStillFailsApply(t *t
 		"a refused verdict does not stop the later tasks recording theirs")
 }
 
+// refusedVerdictLogLine is the subset of a JSON log line the refused task
+// verdict test reads.
+type refusedVerdictLogLine struct {
+	Level               string `json:"level"`
+	Msg                 string `json:"msg"`
+	ApplyID             string `json:"apply_id"`
+	State               string `json:"state"`
+	TaskID              string `json:"task_id"`
+	Table               string `json:"table"`
+	StoredState         string `json:"stored_state"`
+	AttemptedState      string `json:"attempted_state"`
+	ApplyOperationID    *int64 `json:"apply_operation_id"`
+	OperationDeployment string `json:"operation_deployment"`
+}
+
+// A drive panic is contained while storage refuses a task's failed verdict,
+// and the refusal is logged by cause so an operator can triage it: a lost
+// lease and a cancelled drive are warnings, a rejected value and a storage
+// error are errors. Each line reports the state the rows actually hold — the
+// apply's state and the task's stored state — with the refused verdict under
+// its own key, and carries the operation routing attributes.
+func TestFailClaimedApplyAfterDrivePanic_RefusedVerdictLogsByCause(t *testing.T) {
+	cases := []struct {
+		name      string
+		refuseErr error
+		cancel    bool
+		wantLevel string
+		wantMsg   string
+	}{
+		{"lease lost", fmt.Errorf("update task: %w", storage.ErrApplyLeaseLost), false, "WARN", "because the drive's lease was lost"},
+		{"cancelled", errors.New("context canceled"), true, "WARN", "because the drive was cancelled"},
+		{"value rejected", fmt.Errorf("update task: %w", storage.ErrValueRejected), false, "ERROR", "storage cannot hold a value it carries; the apply's failed verdict is attempted next"},
+		{"storage error", errors.New("storage unavailable"), false, "ERROR", "storage error recording task failed verdict while containing drive panic; the apply's failed verdict is attempted next"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			logger := slog.New(slog.NewJSONHandler(&buf, nil))
+			apply := &storage.Apply{
+				ID:              42,
+				ApplyIdentifier: "apply-42",
+				Database:        "appdb",
+				Environment:     "staging",
+				State:           state.Apply.Running,
+				LeaseOwner:      "driver-0",
+				LeaseToken:      "lease-token",
+			}
+			applyStore := &panicContainmentApplyStore{apply: apply}
+			taskStore := &snapshotTaskStore{
+				rows: map[int64]storage.Task{
+					9: {ID: 9, ApplyID: 42, TaskIdentifier: "task-orders", TableName: "orders", State: state.Task.WaitingForCutover},
+				},
+				refuse:    map[int64]bool{9: true},
+				refuseErr: tc.refuseErr,
+			}
+			svc := New(&mockStorageWithApplyStores{
+				plans:   &staticPlanStore{},
+				applies: applyStore,
+				tasks:   taskStore,
+			}, &ServerConfig{}, map[string]tern.Client{}, logger)
+
+			ctx := storage.WithApplyLease(t.Context(), apply.Lease())
+			if tc.cancel {
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithCancel(ctx)
+				cancel()
+			}
+			claimed := *apply
+			failed := svc.failClaimedApplyAfterDrivePanic(ctx, 0, &claimed, 0, "east", &panicsafe.Error{Value: "boom"})
+			assert.True(t, failed, "the apply's failed verdict is still written after a refused task verdict")
+
+			var refusal *refusedVerdictLogLine
+			for raw := range bytes.SplitSeq(bytes.TrimSpace(buf.Bytes()), []byte("\n")) {
+				var line refusedVerdictLogLine
+				require.NoError(t, json.Unmarshal(raw, &line))
+				if bytes.Contains([]byte(line.Msg), []byte(tc.wantMsg)) {
+					refusal = &line
+				}
+			}
+			require.NotNil(t, refusal, "no log line carried %q:\n%s", tc.wantMsg, buf.String())
+			assert.Equal(t, tc.wantLevel, refusal.Level)
+			assert.Equal(t, "apply-42", refusal.ApplyID)
+			assert.Equal(t, state.Apply.Running, refusal.State,
+				"state is the apply's, which containment has not written yet, not the refused task verdict")
+			assert.Equal(t, "task-orders", refusal.TaskID)
+			assert.Equal(t, "orders", refusal.Table)
+			assert.Equal(t, state.Task.WaitingForCutover, refusal.StoredState,
+				"stored_state is the state the task row still holds")
+			assert.Equal(t, state.Task.Failed, refusal.AttemptedState)
+			require.NotNil(t, refusal.ApplyOperationID, "the operation routing attributes are logged")
+			assert.Equal(t, int64(0), *refusal.ApplyOperationID)
+			assert.Equal(t, "east", refusal.OperationDeployment)
+		})
+	}
+}
+
 // A drive panic contained while holding only an operation lease fails the
 // operation's tasks but leaves the parent applies row untouched: under the
 // multi-operation fan-out the parent state is owned by the rollout projection,
