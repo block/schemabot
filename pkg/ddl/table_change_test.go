@@ -100,7 +100,7 @@ func TestSameTableChange(t *testing.T) {
 			head: "CREATE TABLE `variants` (`id` bigint NOT NULL AUTO_INCREMENT, `token` varchar(255) NOT NULL, `amount` int DEFAULT NULL, " +
 				"`bounty_amount` bigint DEFAULT NULL, `bounty_currency` varchar(3) DEFAULT NULL, " +
 				"`sku` varchar(64) DEFAULT NULL, PRIMARY KEY (`id`), UNIQUE KEY `u_token` (`token`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
-			wantReason: []string{"table variants", "varchar(64)"},
+			wantReason: []string{"table variants: the head declares column sku differently from the approved commit"},
 		},
 		{
 			name:         "a head that drops a column the base added",
@@ -111,7 +111,7 @@ func TestSameTableChange(t *testing.T) {
 			head: "CREATE TABLE `variants` (`id` bigint NOT NULL AUTO_INCREMENT, `token` varchar(255) NOT NULL, `amount` int DEFAULT NULL, " +
 				"`bounty_amount` bigint DEFAULT NULL, `sku` varchar(255) DEFAULT NULL, " +
 				"PRIMARY KEY (`id`), UNIQUE KEY `u_token` (`token`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
-			wantReason: []string{"table variants", "DROP COLUMN `bounty_currency`"},
+			wantReason: []string{"table variants: the base changed column bounty_currency since the approved commit, and the head replaces it"},
 		},
 		{
 			// Both bases are modified by the same statement, but on the newer
@@ -124,7 +124,7 @@ func TestSameTableChange(t *testing.T) {
 				"PRIMARY KEY (`id`), UNIQUE KEY `u_token` (`token`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
 			head: "CREATE TABLE `variants` (`id` bigint NOT NULL AUTO_INCREMENT, `token` varchar(255) NOT NULL, `amount` bigint DEFAULT NULL, " +
 				"PRIMARY KEY (`id`), UNIQUE KEY `u_token` (`token`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
-			wantReason: []string{"table variants", "the base changed column amount", "replaces it"},
+			wantReason: []string{"table variants", "both the approved commit and the base changed column amount"},
 		},
 		{
 			name:         "a head that keeps the PR's version of an index the base changed",
@@ -135,7 +135,64 @@ func TestSameTableChange(t *testing.T) {
 				"PRIMARY KEY (`id`), UNIQUE KEY `u_token` (`token`) COMMENT 'lookup by token') ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
 			head: "CREATE TABLE `variants` (`id` bigint NOT NULL AUTO_INCREMENT, `token` varchar(255) NOT NULL, `amount` int DEFAULT NULL, " +
 				"PRIMARY KEY (`id`), UNIQUE KEY `u_token` (`token`, `amount`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
-			wantReason: []string{"table variants", "the base changed index u_token", "replaces it"},
+			wantReason: []string{"table variants", "both the approved commit and the base changed index u_token"},
+		},
+		{
+			name:         "a head that reverts a column the base changed and the PR did not",
+			approvedBase: base,
+			approved: "CREATE TABLE `variants` (`id` bigint NOT NULL AUTO_INCREMENT, `token` varchar(255) NOT NULL, `amount` int DEFAULT NULL, " +
+				"`sku` varchar(255) DEFAULT NULL, PRIMARY KEY (`id`), UNIQUE KEY `u_token` (`token`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+			headBase: "CREATE TABLE `variants` (`id` bigint NOT NULL AUTO_INCREMENT, `token` varchar(255) NOT NULL, `amount` int NOT NULL, " +
+				"PRIMARY KEY (`id`), UNIQUE KEY `u_token` (`token`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+			head: "CREATE TABLE `variants` (`id` bigint NOT NULL AUTO_INCREMENT, `token` varchar(255) NOT NULL, `amount` int DEFAULT NULL, " +
+				"`sku` varchar(255) DEFAULT NULL, PRIMARY KEY (`id`), UNIQUE KEY `u_token` (`token`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+			wantReason: []string{"table variants", "the base changed column amount since the approved commit, and the head replaces it"},
+		},
+		{
+			name:         "a table option the PR sets beside one the base set",
+			approvedBase: base,
+			approved:     base + " COMMENT='campaign variants'",
+			headBase:     base + " STATS_PERSISTENT=1",
+			head:         base + " STATS_PERSISTENT=1 COMMENT='campaign variants'",
+			wantSame:     true,
+		},
+		{
+			name:         "a head that drops a table option the base set",
+			approvedBase: base,
+			approved:     base + " COMMENT='campaign variants'",
+			headBase:     base + " STATS_PERSISTENT=1",
+			head:         base + " COMMENT='campaign variants'",
+			wantReason:   []string{"table variants", "the base changed table option stats_persistent"},
+		},
+		{
+			// The statements match, since the diff does not compare the
+			// TEMPORARY modifier, but the head declares a different table.
+			name:         "a head that makes the table TEMPORARY",
+			approvedBase: base,
+			approved: "CREATE TABLE `variants` (`id` bigint NOT NULL AUTO_INCREMENT, `token` varchar(255) NOT NULL, `amount` int DEFAULT NULL, " +
+				"`sku` varchar(255) DEFAULT NULL, PRIMARY KEY (`id`), UNIQUE KEY `u_token` (`token`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+			headBase: base,
+			head: "CREATE TEMPORARY TABLE `variants` (`id` bigint NOT NULL AUTO_INCREMENT, `token` varchar(255) NOT NULL, `amount` int DEFAULT NULL, " +
+				"`sku` varchar(255) DEFAULT NULL, PRIMARY KEY (`id`), UNIQUE KEY `u_token` (`token`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+			wantReason: []string{"table variants", "the head declares the TEMPORARY modifier differently from the approved commit"},
+		},
+		{
+			// Both commits generate MODIFY COLUMN `b` ... FIRST, but the
+			// head also puts `b` back before `a`, undoing the base's order.
+			name:         "a head that undoes the base's column order",
+			approvedBase: "CREATE TABLE `t` (`id` int NOT NULL, `b` int, `a` int, PRIMARY KEY (`id`))",
+			approved:     "CREATE TABLE `t` (`b` int, `id` int NOT NULL, `a` int, PRIMARY KEY (`id`))",
+			headBase:     "CREATE TABLE `t` (`id` int NOT NULL, `a` int, `b` int, PRIMARY KEY (`id`))",
+			head:         "CREATE TABLE `t` (`b` int, `id` int NOT NULL, `a` int, PRIMARY KEY (`id`))",
+			wantReason:   []string{"table t: the base reordered columns since the approved commit"},
+		},
+		{
+			name:         "a head that orders the PR's columns differently",
+			approvedBase: "CREATE TABLE `t` (`id` int NOT NULL, PRIMARY KEY (`id`))",
+			approved:     "CREATE TABLE `t` (`id` int NOT NULL, `x` int, `y` int, PRIMARY KEY (`id`))",
+			headBase:     "CREATE TABLE `t` (`id` int NOT NULL, PRIMARY KEY (`id`))",
+			head:         "CREATE TABLE `t` (`id` int NOT NULL, `y` int, `x` int, PRIMARY KEY (`id`))",
+			wantReason:   []string{"table t: the head orders columns differently from the approved commit"},
 		},
 		{
 			name:         "a file that renames its table at the head",
@@ -182,6 +239,24 @@ func TestSameTableChange_CannotCompare(t *testing.T) {
 			same, reason, err := SameTableChange(table, table, table, tt.head)
 			require.Error(t, err)
 			assert.Contains(t, err.Error(), tt.wantErr)
+			assert.False(t, same)
+			assert.Empty(t, reason)
+		})
+	}
+}
+
+// A file that declares a column twice is rejected before anything is
+// diffed, at whichever commit it appears.
+func TestSameTableChange_DuplicateDeclaration(t *testing.T) {
+	table := "CREATE TABLE `t` (`id` bigint NOT NULL, `x` int, PRIMARY KEY (`id`))"
+	duplicated := "CREATE TABLE `t` (`id` bigint NOT NULL, `x` int, `X` int, PRIMARY KEY (`id`))"
+	for i, side := range []string{"approved commit's base", "approved commit", "head's base", "head"} {
+		t.Run(side, func(t *testing.T) {
+			files := [4]string{table, table, table, table}
+			files[i] = duplicated
+			same, reason, err := SameTableChange(files[0], files[1], files[2], files[3])
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "read table t at the "+side+": column x is declared more than once")
 			assert.False(t, same)
 			assert.Empty(t, reason)
 		})

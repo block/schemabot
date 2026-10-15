@@ -15,22 +15,28 @@ import (
 //
 // approvedBase and approved are the file at the approved commit's merge base
 // and at the approved commit; headBase and head are the file at the head's
-// merge base and at the head. The change is the same when two things hold:
+// merge base and at the head. The change is the same when the head is the
+// newer base plus the approved edit and nothing else, which takes three
+// things:
 //
+//   - Every column, index, constraint, table option, and partitioning clause
+//     is the three-way merge of the approved commit and headBase: the head
+//     declares it as the approved commit does where the base left it alone,
+//     and as headBase does where the base changed it and the pull request
+//     did not. One both changed cannot be merged. Comparing elements, not
+//     only statements, matters because statements can hide an override: a
+//     column the base made NOT NULL and the pull request widened is modified
+//     the same way on both bases, yet on the newer one the statement also
+//     drops the NOT NULL.
+//   - The columns keep their relative order: the bases order the columns
+//     they share the same way, and so do the approved commit and the head.
+//     An element's definition carries no position, so a reordering would
+//     otherwise go unseen wherever the statements happen to match.
 //   - Diffing each base against its commit yields the same statements, so the
-//     reviewer approved exactly the statements the head generates.
-//   - The head keeps every column, index, constraint, table option, and
-//     partitioning clause that the base changed between approvedBase and
-//     headBase exactly as headBase has it. Otherwise the head would replace
-//     newer base content with the pull request's older version of it, and
-//     the statements could still match: a column the base made NOT NULL and
-//     the pull request widened is modified the same way on both bases, yet on
-//     the newer one the statement also drops the NOT NULL.
-//
-// Together they mean the head is the newer base plus the approved change and
-// nothing else. The diff ignores nothing (no AUTO_INCREMENT, engine, charset,
-// partitioning, or row format exemptions), so any difference the planner
-// could act on counts.
+//     reviewer approved exactly the statements the head generates, including
+//     where each column goes. The diff ignores nothing (no AUTO_INCREMENT,
+//     engine, charset, partitioning, or row format exemptions), so any
+//     difference the planner could act on counts.
 //
 // When the change is not the same, reason says why, for operator logs. Each
 // file must hold exactly one CREATE TABLE, all four naming the same table,
@@ -47,12 +53,19 @@ func SameTableChange(approvedBase, approved, headBase, head string) (same bool, 
 		{"head", head},
 	}
 	var tables [len(files)]*statement.CreateTable
+	var elements [len(files)]map[string]string
 	for i, f := range files {
 		ct, err := parseSingleCreateTable(f.content)
 		if err != nil {
 			return false, "", fmt.Errorf("parse the schema file at the %s: %w", f.name, err)
 		}
-		tables[i] = ct
+		// Every file is checked for duplicate declarations before any is
+		// diffed: the diff assumes each element is declared once.
+		e, err := tableElements(ct)
+		if err != nil {
+			return false, "", fmt.Errorf("read table %s at the %s: %w", ct.TableName, f.name, err)
+		}
+		tables[i], elements[i] = ct, e
 	}
 	aBase, a, hBase, h := tables[0], tables[1], tables[2], tables[3]
 	for i, ct := range tables {
@@ -60,6 +73,16 @@ func SameTableChange(approvedBase, approved, headBase, head string) (same bool, 
 			return false, fmt.Sprintf("the file declares table %s at the %s but %s at the %s",
 				aBase.TableName, files[0].name, ct.TableName, files[i].name), nil
 		}
+	}
+
+	if why := unmergedElement(elements[0], elements[1], elements[2], elements[3]); why != "" {
+		return false, fmt.Sprintf("table %s: %s", aBase.TableName, why), nil
+	}
+	if !sameColumnOrder(aBase, hBase) {
+		return false, fmt.Sprintf("table %s: the base reordered columns since the approved commit", aBase.TableName), nil
+	}
+	if !sameColumnOrder(a, h) {
+		return false, fmt.Sprintf("table %s: the head orders columns differently from the approved commit", aBase.TableName), nil
 	}
 
 	approvedChange, err := strictTableDiff(aBase, a)
@@ -73,15 +96,6 @@ func SameTableChange(approvedBase, approved, headBase, head string) (same bool, 
 	if !slices.Equal(approvedChange, headChange) {
 		return false, fmt.Sprintf("table %s: the approved commit generates %q but the head generates %q",
 			aBase.TableName, approvedChange, headChange), nil
-	}
-
-	overridden, err := overriddenBaseElement(aBase, hBase, h)
-	if err != nil {
-		return false, "", fmt.Errorf("compare elements of table %s: %w", aBase.TableName, err)
-	}
-	if overridden != "" {
-		return false, fmt.Sprintf("table %s: the base changed %s since the approved commit, and the head replaces it with another version",
-			aBase.TableName, overridden), nil
 	}
 	return true, "", nil
 }
@@ -117,26 +131,16 @@ func strictTableDiff(source, target *statement.CreateTable) ([]string, error) {
 	return stmts, nil
 }
 
-// overriddenBaseElement returns the first element (in name order) that the
-// base changed between approvedBase and headBase but head does not have
-// exactly as headBase has it, or "" when head keeps every such change. An
-// element added or removed by the base counts as changed.
-func overriddenBaseElement(approvedBase, headBase, head *statement.CreateTable) (string, error) {
-	var elements [3]map[string]string
-	for i, ct := range []*statement.CreateTable{approvedBase, headBase, head} {
-		e, err := tableElements(ct)
-		if err != nil {
-			return "", err
-		}
-		elements[i] = e
-	}
-	aBase, hBase, h := elements[0], elements[1], elements[2]
+// unmergedElement checks that head is the element-by-element three-way merge
+// of approved and headBase over approvedBase, and returns why the first
+// element (in name order) that is not breaks it, or "" when every element
+// merges. An element added or removed counts as changed.
+func unmergedElement(approvedBase, approved, headBase, head map[string]string) string {
 	keys := make(map[string]bool)
-	for k := range aBase {
-		keys[k] = true
-	}
-	for k := range hBase {
-		keys[k] = true
+	for _, elements := range []map[string]string{approvedBase, approved, headBase, head} {
+		for k := range elements {
+			keys[k] = true
+		}
 	}
 	sorted := make([]string, 0, len(keys))
 	for k := range keys {
@@ -144,14 +148,18 @@ func overriddenBaseElement(approvedBase, headBase, head *statement.CreateTable) 
 	}
 	sort.Strings(sorted)
 	for _, k := range sorted {
-		if sameElement(aBase, hBase, k) {
-			continue
-		}
-		if !sameElement(hBase, h, k) {
-			return k, nil
+		baseChanged := !sameElement(approvedBase, headBase, k)
+		prChanged := !sameElement(approvedBase, approved, k)
+		switch {
+		case baseChanged && prChanged:
+			return fmt.Sprintf("both the approved commit and the base changed %s", k)
+		case baseChanged && !sameElement(headBase, head, k):
+			return fmt.Sprintf("the base changed %s since the approved commit, and the head replaces it with another version", k)
+		case !baseChanged && !sameElement(approved, head, k):
+			return fmt.Sprintf("the head declares %s differently from the approved commit", k)
 		}
 	}
-	return "", nil
+	return ""
 }
 
 // sameElement reports whether key is absent from both x and y or present in
@@ -162,12 +170,41 @@ func sameElement(x, y map[string]string, key string) bool {
 	return xok == yok && xv == yv
 }
 
+// sameColumnOrder reports whether x and y order the columns they both declare
+// the same way. Columns only one of them declares are ignored.
+func sameColumnOrder(x, y *statement.CreateTable) bool {
+	inY := make(map[string]bool, len(y.Columns))
+	for _, col := range y.Columns {
+		inY[strings.ToLower(col.Name)] = true
+	}
+	var shared []string
+	for _, col := range x.Columns {
+		if name := strings.ToLower(col.Name); inY[name] {
+			shared = append(shared, name)
+		}
+	}
+	i := 0
+	for _, col := range y.Columns {
+		name := strings.ToLower(col.Name)
+		if !slices.Contains(shared, name) {
+			continue
+		}
+		if shared[i] != name {
+			return false
+		}
+		i++
+	}
+	return true
+}
+
 // tableElements keys every column, index, and constraint of ct by kind and
-// lowercased name (MySQL matches them case-insensitively), plus the table
-// options and partitioning, and maps each to its parsed definition. Column
-// position is not part of a column's definition; a reordering shows up in the
-// statements instead. An element declared twice cannot be told apart from the
-// other, so it is an error.
+// lowercased name (MySQL matches them case-insensitively), every table option
+// and CREATE modifier ct sets by name, and its partitioning, and maps each to
+// its parsed definition. Each option is its own element, so the pull request
+// and the base can change different options of the same table. Column
+// position is not part of a column's definition; sameColumnOrder checks it.
+// An element declared twice cannot be told apart from the other, so it is an
+// error.
 func tableElements(ct *statement.CreateTable) (map[string]string, error) {
 	elements := make(map[string]string)
 	add := func(key string, definition any) error {
@@ -196,16 +233,37 @@ func tableElements(ct *statement.CreateTable) (map[string]string, error) {
 			return nil, err
 		}
 	}
-	options := struct {
-		Temporary    bool                    `json:"temporary"`
-		IfNotExists  bool                    `json:"if_not_exists"`
-		TableOptions *statement.TableOptions `json:"table_options"`
-	}{ct.Temporary, ct.IfNotExists, ct.TableOptions}
-	if err := add("table options", options); err != nil {
-		return nil, err
+	if ct.Temporary {
+		if err := add("the TEMPORARY modifier", true); err != nil {
+			return nil, err
+		}
 	}
-	if err := add("partitioning", ct.Partition); err != nil {
-		return nil, err
+	if ct.IfNotExists {
+		if err := add("the IF NOT EXISTS modifier", true); err != nil {
+			return nil, err
+		}
+	}
+	if ct.TableOptions != nil {
+		// TableOptions omits every option the statement does not set, so
+		// its encoded fields are exactly the options declared.
+		encoded, err := json.Marshal(ct.TableOptions)
+		if err != nil {
+			return nil, fmt.Errorf("encode table options: %w", err)
+		}
+		var options map[string]json.RawMessage
+		if err := json.Unmarshal(encoded, &options); err != nil {
+			return nil, fmt.Errorf("decode table options: %w", err)
+		}
+		for name, value := range options {
+			if err := add("table option "+name, value); err != nil {
+				return nil, err
+			}
+		}
+	}
+	if ct.Partition != nil {
+		if err := add("partitioning", ct.Partition); err != nil {
+			return nil, err
+		}
 	}
 	return elements, nil
 }
