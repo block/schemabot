@@ -404,7 +404,10 @@ Apply reaches terminal state
         |
         +-- completed ----------> per-db completed/success
         |
-        +-- failed/stopped/etc -> per-db completed/failure
+        +-- failed/cancelled ---> per-db completed/failure
+        |
+        +-- stopped ------------> per-db stays in_progress,
+                                  aggregate action_required
         |
         v
 Recompute aggregate check
@@ -436,7 +439,10 @@ Rollback reaches terminal state
         |
         +-- completed ----------> per-db completed/action_required
         |
-        +-- failed/stopped/etc -> per-db completed/failure
+        +-- failed/cancelled ---> per-db completed/failure
+        |
+        +-- stopped ------------> per-db stays in_progress,
+                                  aggregate action_required
         |
         v
 Recompute aggregate check
@@ -1070,8 +1076,12 @@ When the apply reaches a terminal state:
 
 - `completed` sets the internal record to `success` and lets the aggregate pass
   if every other record is also successful.
-- `failed`, `stopped`, `cancelled`, or other non-success terminal states set the
-  internal record to `failure` and the aggregate fails.
+- `failed`, `cancelled`, or other non-success terminal states set the internal
+  record to `failure` and the aggregate fails.
+- `stopped` leaves the internal record `in_progress` and owned by the apply,
+  since the apply has not settled. The aggregate Check Run concludes
+  `action_required` titled "1 apply stopped", so merge stays blocked without a
+  run left spinning, and returns to in progress when the apply is started again.
 
 Completion is conditional on ownership: the watcher can only update the row if
 the row still represents that `apply_id` and no newer apply exists for the same

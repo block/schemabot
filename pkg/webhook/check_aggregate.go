@@ -237,20 +237,35 @@ func anyInProgressOnCommit(checks []*storage.Check, headSHA string) bool {
 	return false
 }
 
-// computeAggregate determines the aggregate conclusion and status from per-database checks.
-func computeAggregate(checks []*storage.Check) (conclusion, status string) {
-	// in_progress takes precedence — the aggregate should show running
+// computeAggregate determines the aggregate conclusion and status from
+// per-database checks. stopped names the applies resting in the stopped state;
+// nil reads as "nothing is stopped".
+func computeAggregate(checks []*storage.Check, stopped stoppedApplyIDs) (conclusion, status string) {
+	// in_progress takes precedence — the aggregate should show running. A row
+	// held open by a stopped apply is not running work: it waits on an
+	// operator to start or cancel the apply, so it folds as action_required
+	// below, still blocking merge, rather than as a run that never finishes.
+	heldByStoppedApply := false
 	for _, c := range checks {
-		if c.Status == checkStatusInProgress {
-			return "", checkStatusInProgress
+		if c.Status != checkStatusInProgress {
+			continue
 		}
+		if stopped.holds(c) {
+			heldByStoppedApply = true
+			continue
+		}
+		return "", checkStatusInProgress
 	}
 
-	// All checks are completed — compute conclusion
+	// Every remaining check is completed or held by a stopped apply — compute
+	// the conclusion.
 	for _, c := range checks {
 		if c.Conclusion == checkConclusionFailure {
 			return checkConclusionFailure, checkStatusCompleted
 		}
+	}
+	if heldByStoppedApply {
+		return checkConclusionActionRequired, checkStatusCompleted
 	}
 	for _, c := range checks {
 		if c.Conclusion == checkConclusionActionRequired {
@@ -278,7 +293,12 @@ func aggregateSummary(checks []*storage.Check, conclusion string, stopped stoppe
 		pending := 0
 		unresolved := 0
 		tenantApplies := 0
+		stoppedApplies := 0
 		for _, c := range checks {
+			if c.Status == checkStatusInProgress && stopped.holds(c) {
+				stoppedApplies++
+				continue
+			}
 			if c.Conclusion != checkConclusionActionRequired {
 				continue
 			}
@@ -291,6 +311,10 @@ func aggregateSummary(checks []*storage.Check, conclusion string, stopped stoppe
 			}
 		}
 		switch {
+		case pending == 0 && stoppedApplies > 0:
+			// Every row holding the aggregate is a stopped apply, so the PR
+			// is waiting on an operator to start or cancel, not on work.
+			title = stoppedAppliesTitle(stoppedApplies)
 		case pending > 0 && unresolved == pending:
 			// Every blocking row is a participant whose Check Run could not be
 			// read; no apply is actually pending, the participants are silent.
@@ -330,6 +354,9 @@ func aggregateSummary(checks []*storage.Check, conclusion string, stopped stoppe
 		default:
 			title = fmt.Sprintf("%d applies pending", pending)
 		}
+		if pending > 0 && stoppedApplies > 0 {
+			title = fmt.Sprintf("%s (%d stopped)", title, stoppedApplies)
+		}
 		summary = buildAggregateTable(checks, stopped)
 	default:
 		// in_progress — conclusion is empty
@@ -357,14 +384,6 @@ func aggregateSummary(checks []*storage.Check, conclusion string, stopped stoppe
 			} else {
 				title = fmt.Sprintf("Waiting for %d participant deployments to report", waiting)
 			}
-		case inProgress > 0 && paused == inProgress:
-			// Every row holding the aggregate open is a stopped apply, so the
-			// PR is waiting on an operator to start or cancel, not on work.
-			if paused == 1 {
-				title = "1 apply stopped"
-			} else {
-				title = fmt.Sprintf("%d applies stopped", paused)
-			}
 		case paused > 0:
 			title = fmt.Sprintf("Apply in progress (%d stopped)", paused)
 		default:
@@ -373,6 +392,14 @@ func aggregateSummary(checks []*storage.Check, conclusion string, stopped stoppe
 		summary = buildAggregateTable(checks, stopped)
 	}
 	return title, summary
+}
+
+// stoppedAppliesTitle names the stopped applies holding the aggregate.
+func stoppedAppliesTitle(n int) string {
+	if n == 1 {
+		return "1 apply stopped"
+	}
+	return fmt.Sprintf("%d applies stopped", n)
 }
 
 // stoppedApplyIDs is the set of applies resting in the stopped state, so the

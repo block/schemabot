@@ -424,8 +424,9 @@ func (h *Handler) upsertAggregateCheckRunOnce(
 	}
 
 	contributions, staleCount := normalizeStaleContributions(dbChecks, headSHA)
-	conclusion, status := computeAggregate(contributions)
-	title, summary := aggregateSummary(contributions, conclusion, h.stoppedAppliesForPR(ctx, repo, pr, contributions))
+	stopped := h.stoppedAppliesForPR(ctx, repo, pr, contributions)
+	conclusion, status := computeAggregate(contributions, stopped)
+	title, summary := aggregateSummary(contributions, conclusion, stopped)
 	if staleCount > 0 {
 		h.logger.Info("aggregate fold holds rows recorded for another commit as blocking until results land for the current commit",
 			"repo", repo, "pr", pr, "check_name", checkName,

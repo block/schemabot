@@ -382,6 +382,8 @@ func TestE2EResumeRotatesProgressComment(t *testing.T) {
 
 	fake := clock.NewFake(task.CreatedAt)
 	obs := f.newObserver(st, fake)
+	var resumeHooks atomic.Int64
+	obs.OnResumeHook = func(*storage.Apply) { resumeHooks.Add(1) }
 
 	// First progress tick after resume rotates the progress comment. While the
 	// apply is in the Resuming window the comment keeps the stable in-progress
@@ -402,6 +404,7 @@ func TestE2EResumeRotatesProgressComment(t *testing.T) {
 		t.Fatal("expected a new progress comment to be posted on resume")
 	}
 	assert.NotEqual(t, stoppedProgressID, newProgressID, "resume must post a new comment, not reuse the stopped one")
+	assert.Equal(t, int64(1), resumeHooks.Load(), "the rotation republishes the PR check so it leaves stopped")
 
 	// The prior comment is frozen into a collapsed details block pointing at
 	// its successor, with the pre-stop body preserved inside the fold.
@@ -446,6 +449,7 @@ func TestE2EResumeRotatesProgressComment(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("expected an in-place edit of the new progress comment on the next tick")
 	}
+	assert.Equal(t, int64(1), resumeHooks.Load(), "an in-place edit does not republish the PR check again")
 }
 
 // A resume rotation whose fresh comment lands but whose summary-marker
