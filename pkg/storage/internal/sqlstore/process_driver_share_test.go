@@ -10,6 +10,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/storage/storagetest"
 )
@@ -106,6 +107,98 @@ func testProcessDriverShare(t *testing.T, newStore newShareStore) {
 		for _, op := range claimed {
 			assert.Equal(t, wide.ID, op.ApplyID)
 		}
+	})
+
+	// Starting a parked cutover takes a driver like starting a copy does, so it
+	// counts against the same share. With one of its two drivers already copying
+	// the apply's later shard, pod A leaves the apply's cutover to another pod
+	// rather than giving the apply both of its drivers.
+	t.Run("ParkedCutoverWaitsForTheShare", func(t *testing.T) {
+		ctx := t.Context()
+		store := newStore(t, storage.WithMaxDriversPerApply(32), storage.WithDriversPerProcess(2))
+		lock := storagetest.CreateLock(t, store, "share_cutover_db", storage.DatabaseTypeMySQL)
+		apply := storagetest.CreateApply(t, store, lock, "apply_share_cutover", 1)
+		parkedID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+			ApplyID: apply.ID, Deployment: "region-a", OperationKey: "commerce/shard-0/users",
+			OperationKind: storage.ApplyOperationKindWork,
+			State:         state.ApplyOperation.WaitingForCutover, CutoverPolicy: storage.CutoverPolicyBarrier,
+		})
+		require.NoError(t, err)
+		copyingID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+			ApplyID: apply.ID, Deployment: "region-a", OperationKey: "commerce/shard-1/users",
+			OperationKind: storage.ApplyOperationKindWork, CutoverPolicy: storage.CutoverPolicyBarrier,
+		})
+		require.NoError(t, err)
+
+		copying, err := store.ApplyOperations().FindNextApplyOperation(ctx, "pod-a/1/driver-1")
+		require.NoError(t, err)
+		require.NotNil(t, copying)
+		require.Equal(t, copyingID, copying.ID, "pod A starts the later shard's copy")
+
+		blocked, err := store.ApplyOperations().FindNextApplyOperationCutover(ctx, "pod-a/1/driver-2")
+		require.NoError(t, err)
+		assert.Nil(t, blocked, "pod A already gives the apply its share, so the cutover waits for another pod")
+
+		cutover, err := store.ApplyOperations().FindNextApplyOperationCutover(ctx, "pod-b/2/driver-1")
+		require.NoError(t, err)
+		require.NotNil(t, cutover, "pod B has its share of the apply free")
+		assert.Equal(t, parkedID, cutover.ID)
+	})
+
+	// A shard parked at the cutover barrier keeps the lease of the drive that
+	// parked it until that lease goes stale, but the drive has returned and the
+	// driver is free. On a two-driver pod the shard's cutover still starts there
+	// at once rather than waiting out the stale lease.
+	t.Run("ParkedShardsLeftoverLeaseDoesNotHoldItsCutover", func(t *testing.T) {
+		ctx := t.Context()
+		store := newStore(t, storage.WithMaxDriversPerApply(32), storage.WithDriversPerProcess(2))
+		lock := storagetest.CreateLock(t, store, "share_parked_db", storage.DatabaseTypeMySQL)
+		apply := storagetest.CreateApply(t, store, lock, "apply_share_parked", 1)
+		parkedID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+			ApplyID: apply.ID, Deployment: "region-a", OperationKey: "commerce/shard-0/users",
+			OperationKind: storage.ApplyOperationKindWork, CutoverPolicy: storage.CutoverPolicyBarrier,
+		})
+		require.NoError(t, err)
+		_, err = store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+			ApplyID: apply.ID, Deployment: "region-a", OperationKey: "commerce/shard-1/users",
+			OperationKind: storage.ApplyOperationKindWork, CutoverPolicy: storage.CutoverPolicyBarrier,
+			State: state.ApplyOperation.Completed,
+		})
+		require.NoError(t, err)
+
+		copied, err := store.ApplyOperations().FindNextApplyOperation(ctx, "pod-a/1/driver-1")
+		require.NoError(t, err)
+		require.NotNil(t, copied)
+		require.Equal(t, parkedID, copied.ID)
+		require.NoError(t, store.ApplyOperations().UpdateState(ctx, parkedID, state.ApplyOperation.WaitingForCutover))
+
+		cutover, err := store.ApplyOperations().FindNextApplyOperationCutover(ctx, "pod-a/1/driver-2")
+		require.NoError(t, err)
+		require.NotNil(t, cutover, "the parked shard's own leftover lease occupies no driver")
+		assert.Equal(t, parkedID, cutover.ID)
+	})
+
+	// A claimer whose owner names no process is its own process, so it is
+	// matched whole: driver-10 holding its share does not refuse driver-1,
+	// whose owner is the first part of driver-10's.
+	t.Run("OwnerWithoutProcessIsMatchedWhole", func(t *testing.T) {
+		ctx := t.Context()
+		store := newStore(t, storage.WithMaxDriversPerApply(32), storage.WithDriversPerProcess(2))
+		wide := seedShardedApply(t, store, "share_bare_db", "apply_share_bare", 3)
+
+		first, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-10")
+		require.NoError(t, err)
+		require.NotNil(t, first)
+		assert.Equal(t, wide.ID, first.ApplyID)
+
+		again, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-10")
+		require.NoError(t, err)
+		assert.Nil(t, again, "driver-10 already holds its share of the apply")
+
+		other, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-1")
+		require.NoError(t, err)
+		require.NotNil(t, other, "driver-1 is a different claimer from driver-10")
+		assert.Equal(t, wide.ID, other.ApplyID)
 	})
 
 	// A one-driver pool cannot be split, so the share is the whole driver: the

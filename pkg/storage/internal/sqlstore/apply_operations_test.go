@@ -2698,9 +2698,10 @@ func TestApplyOperationStore_FindNextApplyOperation_ConcurrentDriversClaimDistin
 	})
 	require.NoError(t, err)
 
-	// The per-apply driver cap is raised to the shard count so it cannot mask
-	// what this test is about: that concurrent drivers take distinct shards of
-	// one apply. The cap's own behavior is covered separately.
+	// The per-apply driver cap and each process's share are raised to the shard
+	// count so neither can mask what this test is about: that concurrent drivers
+	// take distinct shards of one apply. Each bound's own behavior is covered
+	// separately.
 	const drivers = 16
 	stores := make([]*Storage, drivers)
 	for i := range drivers {
@@ -2711,7 +2712,7 @@ func TestApplyOperationStore_FindNextApplyOperation_ConcurrentDriversClaimDistin
 		t.Cleanup(func() {
 			require.NoError(t, db.Close())
 		})
-		stores[i] = NewMySQL(db, storage.WithMaxDriversPerApply(shards))
+		stores[i] = NewMySQL(db, storage.WithMaxDriversPerApply(shards), storage.WithDriversPerProcess(2*shards))
 	}
 
 	start := make(chan struct{})
