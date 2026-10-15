@@ -88,6 +88,9 @@ if ! minikube status > /dev/null 2>&1; then
     minikube start --driver=docker --container-runtime=docker --cpus=2 --memory=2048
 fi
 
+# shellcheck source=e2e/k8s/pin-minikube-kubeconfig.sh
+source "$REPO_ROOT/e2e/k8s/pin-minikube-kubeconfig.sh"
+
 # --- Build image ---
 
 # The image tag is per-run for the same reason as the namespace: the chart
@@ -120,11 +123,15 @@ cleanup() {
         echo "Keeping namespace $NAMESPACE and image schemabot:${IMAGE_TAG}"
     else
         echo "Tearing down..."
-        kubectl delete namespace "$NAMESPACE" --ignore-not-found
+        # Teardown still needs the pinned kubeconfig, so it is removed last,
+        # and a failed delete must not skip that removal.
+        kubectl delete namespace "$NAMESPACE" --ignore-not-found ||
+            echo "Warning: could not delete namespace $NAMESPACE; delete it with: kubectl --context $MINIKUBE_CONTEXT delete namespace $NAMESPACE"
         # Best-effort: without this, per-run image tags accumulate in
         # minikube's docker daemon across runs.
         docker rmi "schemabot:${IMAGE_TAG}" > /dev/null 2>&1 || true
     fi
+    rm -f "$PINNED_KUBECONFIG"
 }
 trap cleanup EXIT
 
