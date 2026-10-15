@@ -2183,8 +2183,8 @@ func TestApplyOperationStore_FindNextApplyOperation_RedispatchHonorsTheDriverCap
 // TestApplyOperationStore_FindNextApplyOperation_RedispatchAdvancesOperationAttempt
 // verifies that re-claiming a failed_retryable operation — its deliberate
 // redispatch — advances the operation's own attempt counter, both on the
-// returned row and as persisted. This is the per-operation dispatch generation
-// the operation-scoped idempotency key rotates on.
+// returned row and as persisted. The count records the operation's own
+// retries; the dispatch idempotency key does not read it.
 func TestApplyOperationStore_FindNextApplyOperation_RedispatchAdvancesOperationAttempt(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
