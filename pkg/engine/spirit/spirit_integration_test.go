@@ -2431,15 +2431,38 @@ func TestEngine_ExecuteSchemaChange_CancelAfterCutoverDropsSwappedOutOriginal(t 
 // completed rather than stopped: a stopped change would offer the operator a
 // resume of a change that already landed.
 func TestEngine_ExecuteSchemaChange_CleanupFailureAfterCutoverOnCancelIsCompleted(t *testing.T) {
-	const tableName = "cancel_cleanup_fails"
+	final := runAlterWithCleanupFailureAfterCutover(t, "cancel_cleanup_fails", true)
+	assert.Equal(t, engine.StateCompleted, final, "a change whose cutover committed is completed, whatever its cleanup did")
+}
+
+// The same cleanup failure after a committed cutover, with nothing cancelling
+// the run: Spirit runs that cleanup on a bounded context of its own, so it can
+// fail without any stop, cancel, or shutdown. The target already holds the
+// change, so the run records it completed rather than failed: a failed change
+// would report an error and offer a retry of a change that already landed.
+func TestEngine_ExecuteSchemaChange_CleanupFailureAfterCutoverWithoutCancelIsCompleted(t *testing.T) {
+	final := runAlterWithCleanupFailureAfterCutover(t, "nocancel_cleanup_fails", false)
+	assert.Equal(t, engine.StateCompleted, final, "a change whose cutover committed is completed, whatever its cleanup did")
+}
+
+// runAlterWithCleanupFailureAfterCutover runs an ALTER on a fresh tableName
+// whose cutover commits and whose cleanup after it then fails: from the moment
+// Spirit logs the committed cutover, a session reading Spirit's checkpoint
+// table holds its metadata lock, so Spirit's drop of it times out. With
+// cancelAtCutover, the run's context is cancelled at that same moment, as a
+// stop, cancel, or shutdown landing just after the cutover would cancel it. It
+// checks that the scenario held and that the target holds the change, and
+// returns the state the run settled in.
+func runAlterWithCleanupFailureAfterCutover(t *testing.T, tableName string, cancelAtCutover bool) engine.State {
+	t.Helper()
 	dsn, db := setupTestMySQL(t)
 	cleanupTables(t, db)
-	_, err := db.ExecContext(t.Context(), `CREATE TABLE cancel_cleanup_fails (
-		id INT PRIMARY KEY AUTO_INCREMENT,
-		name VARCHAR(50) NOT NULL
-	)`)
+	_, err := db.ExecContext(t.Context(), fmt.Sprintf("CREATE TABLE `%s` (\n"+
+		"\tid INT PRIMARY KEY AUTO_INCREMENT,\n"+
+		"\tname VARCHAR(50) NOT NULL\n"+
+		")", tableName))
 	require.NoError(t, err, "create alter target table")
-	_, err = db.ExecContext(t.Context(), "INSERT INTO `cancel_cleanup_fails` (name) VALUES ('a'), ('b'), ('c')")
+	_, err = db.ExecContext(t.Context(), fmt.Sprintf("INSERT INTO `%s` (name) VALUES ('a'), ('b'), ('c')", tableName))
 	require.NoError(t, err, "seed rows")
 
 	// A short lock wait bounds how long the checkpoint drop waits before it
@@ -2467,7 +2490,9 @@ func TestEngine_ExecuteSchemaChange_CleanupFailureAfterCutoverOnCancelIsComplete
 			return
 		}
 		once.Do(func() {
-			defer cancel()
+			if cancelAtCutover {
+				defer cancel()
+			}
 			tx, err := db.BeginTx(t.Context(), nil)
 			if err != nil {
 				holdErr = fmt.Errorf("begin transaction holding %s: %w", checkpointTable, err)
@@ -2482,18 +2507,21 @@ func TestEngine_ExecuteSchemaChange_CleanupFailureAfterCutoverOnCancelIsComplete
 	})
 
 	eng.executeSchemaChange(ctx, host, username, password, database,
-		[]string{"ALTER TABLE `cancel_cleanup_fails` MODIFY COLUMN `name` varchar(100) NOT NULL"}, false, directPolicy{})
+		[]string{fmt.Sprintf("ALTER TABLE `%s` MODIFY COLUMN `name` varchar(100) NOT NULL", tableName)}, false, directPolicy{})
 
 	require.NoError(t, holdErr, "hold the checkpoint table's metadata lock")
 	require.NotNil(t, holder, "the cutover must have committed while the change ran")
-	require.Error(t, ctx.Err(), "the cancel must have landed after the cutover committed")
+	if cancelAtCutover {
+		require.Error(t, ctx.Err(), "the cancel must have landed after the cutover committed")
+	} else {
+		require.NoError(t, ctx.Err(), "nothing may cancel the run")
+	}
 	assert.True(t, testutil.TableExists(t, db, database, checkpointTable),
 		"Spirit's cleanup after the cutover must have failed for this scenario to apply")
 	require.NoError(t, holder.Rollback(), "release the checkpoint table's metadata lock")
 	eng.mu.Lock()
 	final := eng.runningSchemaChange.state
 	eng.mu.Unlock()
-	assert.Equal(t, engine.StateCompleted, final, "a change whose cutover committed is completed, whatever its cleanup did")
 	assert.False(t, testutil.TableExists(t, db, database, utils.OldTableName(tableName)),
 		"the swapped-out original is dropped as it would be by an uninterrupted run")
 	var maxLen int
@@ -2501,6 +2529,7 @@ func TestEngine_ExecuteSchemaChange_CleanupFailureAfterCutoverOnCancelIsComplete
 		"SELECT CHARACTER_MAXIMUM_LENGTH FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND COLUMN_NAME = 'name'",
 		database, tableName).Scan(&maxLen))
 	assert.Equal(t, 100, maxLen, "the target holds the changed column")
+	return final
 }
 
 // Stopping a running ALTER that has a DROP TABLE queued after it must leave the
