@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"slices"
 	"testing"
 	"time"
 
@@ -174,27 +175,31 @@ func TestDiffKeyspace_RefusesTableDeclaredTwice(t *testing.T) {
 
 // vschemaFetchStubClient serves a fixed response for keyspace VSchema reads so
 // tests can drive the VSchema half of diffKeyspace without a live API. The
-// branch lists no keyspaces unless listErr is set, in which case listing fails.
+// branch has no keyspaces: reading one by name is not-found, unless lookupErr
+// is set, in which case the read fails with it.
 type vschemaFetchStubClient struct {
 	psclient.PSClient
-	vschema *ps.VSchema
-	err     error
-	listErr error
+	vschema   *ps.VSchema
+	err       error
+	lookupErr error
 }
 
 func (c *vschemaFetchStubClient) GetKeyspaceVSchema(_ context.Context, _ *ps.GetKeyspaceVSchemaRequest) (*ps.VSchema, error) {
 	return c.vschema, c.err
 }
 
-func (c *vschemaFetchStubClient) ListKeyspaces(context.Context, *ps.ListKeyspacesRequest) ([]*ps.Keyspace, error) {
-	return nil, c.listErr
+func (c *vschemaFetchStubClient) GetKeyspace(context.Context, *ps.GetKeyspaceRequest) (*ps.Keyspace, error) {
+	if c.lookupErr != nil {
+		return nil, c.lookupErr
+	}
+	return nil, &ps.Error{Code: ps.ErrNotFound}
 }
 
 // A NotFound on the VSchema read of a keyspace the branch does not list yet
 // means the keyspace has no VSchema: the desired document is its first, so it
-// surfaces as a change instead of failing the plan. A keyspace listing that
-// fails cannot confirm the absence, so it fails the diff, and so does any
-// other VSchema fetch error.
+// surfaces as a change instead of failing the plan. A keyspace read that fails
+// cannot confirm the absence, so it fails the diff, and so does any other
+// VSchema fetch error.
 func TestDiffKeyspace_VSchemaFetchErrors(t *testing.T) {
 	shortenVSchemaRereadInterval(t)
 	e := &Engine{
@@ -209,7 +214,7 @@ func TestDiffKeyspace_VSchemaFetchErrors(t *testing.T) {
 	}
 	currentSchema := map[string][]table.TableSchema{"myapp": {}}
 
-	t.Run("NotFound for a keyspace the branch does not list is an empty current VSchema", func(t *testing.T) {
+	t.Run("NotFound for a keyspace the branch does not have is an empty current VSchema", func(t *testing.T) {
 		client := &vschemaFetchStubClient{err: &ps.Error{Code: ps.ErrNotFound}}
 		diff, err := e.diffKeyspace(t.Context(), client, "org", "mydb", "schemabot-mydb-abc", "myapp", desired, currentSchema, rereadMissingVSchema)
 		require.NoError(t, err)
@@ -218,10 +223,10 @@ func TestDiffKeyspace_VSchemaFetchErrors(t *testing.T) {
 		assert.Empty(t, diff.currentVSchemaRaw)
 	})
 
-	t.Run("NotFound whose keyspace listing fails fails the diff", func(t *testing.T) {
-		client := &vschemaFetchStubClient{err: &ps.Error{Code: ps.ErrNotFound}, listErr: errors.New("list unavailable")}
+	t.Run("NotFound whose keyspace read fails fails the diff", func(t *testing.T) {
+		client := &vschemaFetchStubClient{err: &ps.Error{Code: ps.ErrNotFound}, lookupErr: &ps.Error{Code: ps.ErrInternal}}
 		_, err := e.diffKeyspace(t.Context(), client, "org", "mydb", "schemabot-mydb-abc", "myapp", desired, currentSchema, rereadMissingVSchema)
-		require.ErrorContains(t, err, "list keyspaces on branch schemabot-mydb-abc of database mydb to confirm keyspace myapp has no VSchema: list unavailable")
+		require.ErrorContains(t, err, "read keyspace myapp on branch schemabot-mydb-abc of database mydb to confirm it has no VSchema")
 	})
 
 	t.Run("non-NotFound API error fails the diff", func(t *testing.T) {
@@ -249,18 +254,28 @@ func TestDiffKeyspace_VSchemaFetchErrors(t *testing.T) {
 // laggingVSchemaClient answers the first notFoundReads VSchema reads with
 // not-found and every later one with vschema, the way the API answers while it
 // converges after a recent VSchema write. reads counts every read. The branch
-// lists the keyspaces in listed; listings counts every keyspace listing.
+// has the keyspaces in existing; lookups counts every keyspace read by name.
+// Its keyspace listing returns only listed, so a test can model a listing
+// whose pages shifted and left out a keyspace that exists.
 type laggingVSchemaClient struct {
 	psclient.PSClient
 	notFoundReads int
 	vschema       *ps.VSchema
+	existing      []string
 	listed        []string
 	reads         int
-	listings      int
+	lookups       int
+}
+
+func (c *laggingVSchemaClient) GetKeyspace(_ context.Context, req *ps.GetKeyspaceRequest) (*ps.Keyspace, error) {
+	c.lookups++
+	if slices.Contains(c.existing, req.Keyspace) {
+		return &ps.Keyspace{Name: req.Keyspace}, nil
+	}
+	return nil, &ps.Error{Code: ps.ErrNotFound}
 }
 
 func (c *laggingVSchemaClient) ListKeyspaces(context.Context, *ps.ListKeyspacesRequest) ([]*ps.Keyspace, error) {
-	c.listings++
 	keyspaces := make([]*ps.Keyspace, 0, len(c.listed))
 	for _, name := range c.listed {
 		keyspaces = append(keyspaces, &ps.Keyspace{Name: name})
@@ -289,9 +304,9 @@ func shortenVSchemaRereadInterval(t *testing.T) {
 // missing after a recent write. Taken at its word, the desired document would
 // be the keyspace's first and the vindex removal it makes would go unflagged.
 // A diff that acts on its answer reads again a bounded number of times for a
-// keyspace the branch lists, so it compares against the VSchema that exists,
+// keyspace the branch has, so it compares against the VSchema that exists,
 // and refuses once the re-reads run out rather than planning against an
-// absence nothing confirms. A keyspace the branch does not list has no VSchema
+// absence nothing confirms. A keyspace the branch does not have has no VSchema
 // to lag, so its absence is believed at once. A diff whose caller retries on a
 // VSchema difference believes the first not-found, so the two waits do not
 // stack.
@@ -309,33 +324,33 @@ func TestDiffKeyspace_VSchemaReportedMissingIsReadAgain(t *testing.T) {
 	noTables := map[string][]table.TableSchema{"commerce": nil}
 
 	t.Run("a lagging read finds the VSchema", func(t *testing.T) {
-		client := &laggingVSchemaClient{notFoundReads: 2, vschema: &ps.VSchema{Raw: live}, listed: []string{"billing", "commerce"}}
+		client := &laggingVSchemaClient{notFoundReads: 2, vschema: &ps.VSchema{Raw: live}, existing: []string{"billing", "commerce"}}
 		diff, err := e.diffKeyspace(t.Context(), client, "org", "mydb", "main", "commerce", desired, noTables, rereadMissingVSchema)
 		require.NoError(t, err)
 		assert.Equal(t, 3, client.reads)
 		assert.Equal(t, live, diff.currentVSchemaRaw, "the plan compares against the VSchema that exists")
 	})
 
-	t.Run("a VSchema that stays missing on a listed keyspace refuses the plan after the re-reads", func(t *testing.T) {
-		client := &laggingVSchemaClient{notFoundReads: 100, listed: []string{"commerce"}}
+	t.Run("a VSchema that stays missing on a keyspace the branch has refuses the plan after the re-reads", func(t *testing.T) {
+		client := &laggingVSchemaClient{notFoundReads: 100, existing: []string{"commerce"}}
 		diff, err := e.diffKeyspace(t.Context(), client, "org", "mydb", "main", "commerce", desired, noTables, rereadMissingVSchema)
 		var refusal *unconfirmedVSchemaAbsenceError
 		require.ErrorAs(t, err, &refusal)
 		assert.Equal(t, 1+vschemaAbsenceRereads, client.reads)
-		assert.Equal(t, 1, client.listings)
-		assert.Equal(t, "PlanetScale lists keyspace commerce on branch main of database mydb but reported no VSchema for it on 4 reads, "+
+		assert.Equal(t, 1, client.lookups)
+		assert.Equal(t, "PlanetScale has keyspace commerce on branch main of database mydb but reported no VSchema for it on 4 reads, "+
 			"so the plan cannot tell an absent VSchema from one the API has not caught up on. "+
 			"Re-run plan once PlanetScale shows the keyspace's VSchema. "+
 			"If the keyspace has never had one, set an empty VSchema ({}) on it in PlanetScale, then re-run plan", err.Error())
 		assert.Equal(t, keyspaceDiff{}, diff)
 	})
 
-	t.Run("a keyspace the branch does not list plans its first VSchema without re-reading", func(t *testing.T) {
-		client := &laggingVSchemaClient{notFoundReads: 100, listed: []string{"billing"}}
+	t.Run("a keyspace the branch does not have plans its first VSchema without re-reading", func(t *testing.T) {
+		client := &laggingVSchemaClient{notFoundReads: 100, existing: []string{"billing"}}
 		diff, err := e.diffKeyspace(t.Context(), client, "org", "mydb", "main", "commerce", desired, noTables, rereadMissingVSchema)
 		require.NoError(t, err)
 		assert.Equal(t, 1, client.reads)
-		assert.Equal(t, 1, client.listings)
+		assert.Equal(t, 1, client.lookups)
 		assert.Empty(t, diff.currentVSchemaRaw)
 		assert.True(t, diff.vschemaChanged, "the desired document is the keyspace's first")
 	})
@@ -345,9 +360,20 @@ func TestDiffKeyspace_VSchemaReportedMissingIsReadAgain(t *testing.T) {
 		diff, err := e.diffKeyspace(t.Context(), client, "org", "mydb", "main", "commerce", desired, noTables, acceptMissingVSchema)
 		require.NoError(t, err)
 		assert.Equal(t, 1, client.reads, "the caller's own retry reads again")
-		assert.Equal(t, 0, client.listings, "the caller's retry needs no confirmation of the absence")
+		assert.Equal(t, 0, client.lookups, "the caller's retry needs no confirmation of the absence")
 		assert.Empty(t, diff.currentVSchemaRaw)
 		assert.True(t, diff.vschemaChanged, "the absence surfaces as the difference the caller retries on")
+	})
+
+	t.Run("a keyspace a shifted listing leaves out is still read by name and refuses the plan", func(t *testing.T) {
+		// Another keyspace was deleted between the listing's pages, so the
+		// listing omits commerce although the branch has it.
+		client := &laggingVSchemaClient{notFoundReads: 100, existing: []string{"billing", "commerce"}, listed: []string{"billing"}}
+		_, err := e.diffKeyspace(t.Context(), client, "org", "mydb", "main", "commerce", desired, noTables, rereadMissingVSchema)
+		var refusal *unconfirmedVSchemaAbsenceError
+		require.ErrorAs(t, err, &refusal, "a keyspace that exists is never taken as having no VSchema")
+		assert.Equal(t, 1+vschemaAbsenceRereads, client.reads)
+		assert.Equal(t, 1, client.lookups)
 	})
 }
 
@@ -363,7 +389,7 @@ func TestPlanKeyspace_LaggingVSchemaKeepsRemovalGate(t *testing.T) {
 	desired := &schema.Namespace{Files: map[string]string{
 		"vschema.json": `{"sharded": true, "vindexes": {"hash": {"type": "hash"}}, "tables": {"users": {"column_vindexes": [{"column": "id", "name": "hash"}]}}}`,
 	}}
-	client := &laggingVSchemaClient{notFoundReads: 2, vschema: &ps.VSchema{Raw: live}, listed: []string{"commerce"}}
+	client := &laggingVSchemaClient{notFoundReads: 2, vschema: &ps.VSchema{Raw: live}, existing: []string{"commerce"}}
 
 	res, err := e.planKeyspace(t.Context(), client, "org", "mydb", "main", "commerce", desired, map[string][]table.TableSchema{"commerce": nil})
 	require.NoError(t, err)
@@ -376,7 +402,7 @@ func TestPlanKeyspace_LaggingVSchemaKeepsRemovalGate(t *testing.T) {
 	assert.Equal(t, live, res.change.OriginalFiles["vschema.json"], "the pre-image is the VSchema that exists")
 }
 
-// A keyspace the branch lists whose VSchema the API keeps reporting missing is
+// A keyspace the branch has whose VSchema the API keeps reporting missing is
 // not planned: a plan against the absence would drop the vindex removal from
 // the consent gate and record an empty VSchema as the rollback pre-image, which
 // a rollback would write over the keyspace's real VSchema.
@@ -387,7 +413,7 @@ func TestPlanKeyspace_UnconfirmedVSchemaAbsenceRefusesThePlan(t *testing.T) {
 	desired := &schema.Namespace{Files: map[string]string{
 		"vschema.json": `{"sharded": true, "vindexes": {"hash": {"type": "hash"}}, "tables": {"users": {"column_vindexes": [{"column": "id", "name": "hash"}]}}}`,
 	}}
-	client := &laggingVSchemaClient{notFoundReads: 100, listed: []string{"commerce"}}
+	client := &laggingVSchemaClient{notFoundReads: 100, existing: []string{"commerce"}}
 
 	res, err := e.planKeyspace(t.Context(), client, "org", "mydb", "main", "commerce", desired, map[string][]table.TableSchema{"commerce": nil})
 	var refusal *unconfirmedVSchemaAbsenceError
@@ -412,7 +438,7 @@ func TestVerifyBranchMatchesDesired_ReadsVSchemaOncePerValidation(t *testing.T) 
 			return map[string][]table.TableSchema{"commerce": nil}, nil
 		},
 	}
-	client := &laggingVSchemaClient{notFoundReads: 1, vschema: &ps.VSchema{Raw: desiredVSchema}, listed: []string{"commerce"}}
+	client := &laggingVSchemaClient{notFoundReads: 1, vschema: &ps.VSchema{Raw: desiredVSchema}, existing: []string{"commerce"}}
 	files := schema.SchemaFiles{"commerce": &schema.Namespace{Files: map[string]string{"vschema.json": desiredVSchema}}}
 	validate := func() error {
 		return e.verifyBranchMatchesDesired(t.Context(), client, "org", "mydb", "schemabot-mydb-abc", []string{"commerce"}, files, engine.IgnoredTables{}, &ps.DatabaseBranchPassword{})
@@ -421,7 +447,7 @@ func TestVerifyBranchMatchesDesired_ReadsVSchemaOncePerValidation(t *testing.T) 
 	err := validate()
 	require.ErrorContains(t, err, "keyspace commerce has unexpected VSchema difference after apply")
 	assert.Equal(t, 1, client.reads, "one VSchema read per validation")
-	assert.Equal(t, 0, client.listings)
+	assert.Equal(t, 0, client.lookups)
 
 	require.NoError(t, validate(), "the next validation reads the converged VSchema")
 	assert.Equal(t, 2, client.reads)
@@ -435,7 +461,7 @@ func TestFetchKeyspaceVSchema_CancelledWhileWaitingToReread(t *testing.T) {
 	t.Cleanup(func() { vschemaAbsenceRereadInterval = origInterval })
 
 	e := &Engine{logger: slog.New(slog.DiscardHandler)}
-	client := &laggingVSchemaClient{notFoundReads: 100, listed: []string{"commerce"}}
+	client := &laggingVSchemaClient{notFoundReads: 100, existing: []string{"commerce"}}
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 

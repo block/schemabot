@@ -1707,7 +1707,7 @@ rejected. *Enforced:* truncation and symlink guards on every schema-fetch path
 (`pkg/github/schema.go`, `pkg/github/client.go`); on the target side, the live-schema reads that
 feed a plan end it on any table they cannot read (`fetchCurrentSchema` in
 `pkg/engine/spirit/spirit.go`, `renderPostgresTables` in `pkg/engine/postgres/pull.go`) and on
-a VSchema reported missing for a keyspace the target still lists
+a VSchema reported missing for a keyspace the target still has
 (`fetchKeyspaceVSchema` in `pkg/engine/planetscale/branch.go`), and
 a table declared by two desired schema files fails planning on every engine through one rule
 (`ddl.TableDeclarations` in `pkg/ddl/table_declarations.go`, applied by `pkg/engine/spirit/spirit.go`,

@@ -252,7 +252,7 @@ type missingVSchemaPolicy int
 
 const (
 	// rereadMissingVSchema believes the absence only for a keyspace the branch
-	// does not list; for a listed keyspace it reads the VSchema again, a
+	// does not have; for a keyspace it has, it reads the VSchema again, a
 	// bounded number of times, and refuses if it is still missing. This is
 	// the policy for a diff whose answer is acted on as read.
 	rereadMissingVSchema missingVSchemaPolicy = iota
@@ -440,7 +440,7 @@ var (
 )
 
 // unconfirmedVSchemaAbsenceError refuses a plan for a keyspace the branch
-// lists but whose VSchema the API still reports missing after the bounded
+// has but whose VSchema the API still reports missing after the bounded
 // re-reads. Planning on would make the desired document the keyspace's first:
 // the VSchema removal and routing mutation checks would have nothing to
 // compare against, and the rollback baseline would record an empty VSchema
@@ -453,7 +453,7 @@ type unconfirmedVSchemaAbsenceError struct {
 }
 
 func (e *unconfirmedVSchemaAbsenceError) Error() string {
-	return fmt.Sprintf("PlanetScale lists keyspace %s on branch %s of database %s but reported no VSchema for it on %d reads, "+
+	return fmt.Sprintf("PlanetScale has keyspace %s on branch %s of database %s but reported no VSchema for it on %d reads, "+
 		"so the plan cannot tell an absent VSchema from one the API has not caught up on. "+
 		"Re-run plan once PlanetScale shows the keyspace's VSchema. "+
 		"If the keyspace has never had one, set an empty VSchema ({}) on it in PlanetScale, then re-run plan",
@@ -468,8 +468,10 @@ func (e *unconfirmedVSchemaAbsenceError) Error() string {
 // the two apart: a keyspace with no physical tables can still carry a VSchema,
 // and the table list the diff sees has already had ignore_tables withheld from
 // it. Under rereadMissingVSchema the absence is believed only for a keyspace
-// the branch does not list yet, which has no VSchema to lag. For a listed
-// keyspace the read is repeated a bounded number of times, and a VSchema that
+// the branch does not have yet, which has no VSchema to lag. That is asked of
+// the keyspace by name rather than read from the keyspace listing, whose pages
+// can shift and leave out a keyspace that exists. For a keyspace the branch
+// has, the read is repeated a bounded number of times, and a VSchema that
 // stays missing refuses the plan with unconfirmedVSchemaAbsenceError rather
 // than planning against an absence nothing confirms.
 func (e *Engine) fetchKeyspaceVSchema(ctx context.Context, client psclient.PSClient, org, database, branch, ks string, missing missingVSchemaPolicy) (*ps.VSchema, error) {
@@ -492,18 +494,18 @@ func (e *Engine) fetchKeyspaceVSchema(ctx context.Context, client psclient.PSCli
 			return nil, nil
 		}
 		if attempt == 0 {
-			listed, listErr := keyspaceListed(ctx, client, org, database, branch, ks)
-			if listErr != nil {
-				return nil, listErr
+			exists, existsErr := keyspaceExists(ctx, client, org, database, branch, ks)
+			if existsErr != nil {
+				return nil, existsErr
 			}
-			if !listed {
-				e.logger.Info("VSchema not found for a keyspace the branch does not list yet; planning the keyspace's first VSchema",
+			if !exists {
+				e.logger.Info("VSchema not found for a keyspace the branch does not have yet; planning the keyspace's first VSchema",
 					"keyspace", ks, "branch", branch)
 				return nil, nil
 			}
 		}
 		if attempt >= vschemaAbsenceRereads {
-			e.logger.Warn("VSchema still reported missing for a keyspace the branch lists; refusing the plan",
+			e.logger.Warn("VSchema still reported missing for a keyspace the branch has; refusing the plan",
 				"database", database, "keyspace", ks, "branch", branch, "reads", attempt+1)
 			return nil, &unconfirmedVSchemaAbsenceError{database: database, branch: branch, keyspace: ks, reads: attempt + 1}
 		}
@@ -517,18 +519,18 @@ func (e *Engine) fetchKeyspaceVSchema(ctx context.Context, client psclient.PSCli
 	}
 }
 
-// keyspaceListed reports whether the API lists keyspace ks on branch.
-func keyspaceListed(ctx context.Context, client psclient.PSClient, org, database, branch, ks string) (bool, error) {
-	keyspaces, err := client.ListKeyspaces(ctx, &ps.ListKeyspacesRequest{Organization: org, Database: database, Branch: branch})
-	if err != nil {
-		return false, fmt.Errorf("list keyspaces on branch %s of database %s to confirm keyspace %s has no VSchema: %w", branch, database, ks, err)
+// keyspaceExists reports whether branch has keyspace ks, reading it by name.
+// Only a not-found answer means it does not; any other error is returned, so
+// an absence is never assumed from a read that failed.
+func keyspaceExists(ctx context.Context, client psclient.PSClient, org, database, branch, ks string) (bool, error) {
+	_, err := client.GetKeyspace(ctx, &ps.GetKeyspaceRequest{Organization: org, Database: database, Branch: branch, Keyspace: ks})
+	if err == nil {
+		return true, nil
 	}
-	for _, k := range keyspaces {
-		if k.Name == ks {
-			return true, nil
-		}
+	if isNotFound(err) {
+		return false, nil
 	}
-	return false, nil
+	return false, fmt.Errorf("read keyspace %s on branch %s of database %s to confirm it has no VSchema: %w", ks, branch, database, err)
 }
 
 func (e *Engine) fetchDatabaseSchema(ctx context.Context, client psclient.PSClient, org, database, branch string, keyspaces []string) (map[string][]table.TableSchema, error) {
