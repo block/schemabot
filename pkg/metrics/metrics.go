@@ -2092,14 +2092,14 @@ func RecordWebhookDispatchDuration(ctx context.Context, appName, eventType, repo
 }
 
 // RecordSummaryCommentRepaired counts terminal summary comments posted by
-// startup reconciliation because no publisher had posted one — the driver's
+// summary reconciliation because no publisher had posted one — the driver's
 // observer lost its lease or crashed, or a claimed publish died before
 // posting. A nonzero rate means terminal summaries are being missed at apply
 // time; investigate the terminal-publish paths (observer lease churn, stop
 // reconciliation, aggregate CAS publisher) for the apply state on the label.
 func RecordSummaryCommentRepaired(ctx context.Context, repo string, applyState string) {
 	addCounter(ctx, "schemabot.webhook.summary_comments_repaired_total",
-		"Total number of missing terminal summary comments posted by startup reconciliation", "{comment}",
+		"Total number of missing terminal summary comments posted by summary reconciliation", "{comment}",
 		EnvironmentAttribute(""),
 		attribute.String("repository", repo),
 		attribute.String("apply_state", applyState))

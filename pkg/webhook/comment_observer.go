@@ -62,11 +62,12 @@ type CommentObserver struct {
 	clock clock.Clock
 
 	// aggregateTerminalCASWinner marks a one-shot observer used by the operator
-	// to publish a multi-operation apply's single terminal summary after it won
-	// the aggregate projection compare-and-swap. Such a driver holds the
-	// operation lease, not the parent apply lease, so the per-driver apply-lease
-	// authority does not apply; the won CAS is the authority. It bypasses the
-	// apply-lease checks and lease-scoped storage writes accordingly.
+	// to publish an apply's single terminal summary after it won the transition
+	// that made the apply terminal: the aggregate projection compare-and-swap,
+	// or the retryable-expiry pass that settled the apply. Neither holds the
+	// parent apply lease, so the per-driver apply-lease authority does not
+	// apply; the won transition is the authority. It bypasses the apply-lease
+	// checks and lease-scoped storage writes accordingly.
 	aggregateTerminalCASWinner bool
 
 	// authorityOwner identifies this process to the durable progress-comment

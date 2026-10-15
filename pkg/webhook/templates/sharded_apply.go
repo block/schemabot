@@ -198,6 +198,9 @@ func renderShardedApplyComment(data ShardedApplyData, renderedAt string, formatt
 	writeApplyStatusHeader(&sb, ApplyStatusCommentData{State: data.State, Environment: data.Environment, Rollback: data.Rollback})
 	writeShardedMetadata(&sb, data, renderedAt)
 	writeShardedStatusLine(&sb, data)
+	if state.IsState(data.State, state.Apply.Pending) {
+		sb.WriteString("\n" + queuedApplyExplanation + "\n")
+	}
 
 	writeShardCounts(&sb, allShardStatuses(data.Keyspaces))
 	writeShardedFailure(&sb, data)

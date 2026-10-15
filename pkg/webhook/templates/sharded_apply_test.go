@@ -51,6 +51,28 @@ func TestRenderShardedApplyComment_UniformSingleTable(t *testing.T) {
 	assert.NotContains(t, out, "grouped by change", "a uniform apply is not grouped")
 }
 
+// A sharded apply that has not started yet reads as queued and says it starts on
+// its own, as a single-database apply does. Once it is running the explanation
+// is gone, since the status line and shard counts then carry the progress.
+func TestRenderShardedApplyComment_PendingExplainsItIsQueued(t *testing.T) {
+	data := ShardedApplyData{
+		State: state.Apply.Pending, Environment: "staging", Database: "cdb_resolute",
+		ApplyID: "apply-x", RequestedBy: "morgo",
+		Keyspaces: withTables(oneKeyspace([]ShardStatus{
+			{Shard: "-80", Emoji: "⏳", Label: "queued — next in order", State: state.ApplyOperation.Pending},
+			{Shard: "80-", Emoji: "⏳", Label: "queued — next in order", State: state.ApplyOperation.Pending},
+		}, []ShardCell{mutesCell("-80"), mutesCell("80-")}), "mutes"),
+	}
+
+	queued := RenderShardedApplyComment(data)
+	assert.Contains(t, queued, "**Status**: Queued — 0 of 1 change applied")
+	assert.Contains(t, queued, queuedApplyExplanation)
+
+	data.State = state.Apply.Running
+	running := RenderShardedApplyComment(data)
+	assert.NotContains(t, running, queuedApplyExplanation)
+}
+
 // A sharded apply shows each table's DDL under its rollup line, as a MySQL or
 // Vitess apply does, so the operator sees what is running without going back to
 // the plan. A table running the same statement on every shard shows it once.

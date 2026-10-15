@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -81,6 +82,14 @@ func (s *emptyApplyStore) GetByPR(ctx context.Context, repo string, pr int) ([]*
 }
 
 func (s *emptyApplyStore) GetByApplyIdentifier(ctx context.Context, applyIdentifier string) (*storage.Apply, error) {
+	return nil, nil
+}
+
+func (s *emptyApplyStore) FindMissingSummaryComment(context.Context, time.Duration, int) ([]*storage.Apply, error) {
+	return nil, nil
+}
+
+func (s *emptyApplyStore) FindTerminalWithInProgressCheck(context.Context, int) ([]*storage.Apply, error) {
 	return nil, nil
 }
 

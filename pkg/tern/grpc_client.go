@@ -1877,7 +1877,13 @@ func (s applyTaskScope) generationOperationKeys() []string {
 // table by table, so the data plane runs only that step's tables. A scope with
 // no member target leaves the request untouched, keeping every single-target
 // dispatch byte-for-byte what it was.
-func (s applyTaskScope) stampMemberTarget(req *ternv1.ApplyRequest) {
+//
+// A table step also carries every change of plan, the plan its target was
+// planned with. A member's plan is stored where it was planned, and a member
+// other than the primary is planned without the data plane storing anything,
+// so the step's own table is not enough for the data plane to rebuild the
+// plan the rest of the target's steps run from.
+func (s applyTaskScope) stampMemberTarget(req *ternv1.ApplyRequest, plan *storage.Plan) {
 	if s.memberTarget == "" {
 		return
 	}
@@ -1887,6 +1893,7 @@ func (s applyTaskScope) stampMemberTarget(req *ternv1.ApplyRequest) {
 	req.Options[dispatchMemberTargetOption] = s.memberTarget
 	if s.operation != nil && s.operation.RolloutStep > 0 {
 		req.Options[dispatchRolloutStepOption] = strconv.Itoa(s.operation.RolloutStep)
+		req.PlanDdlChanges = planToProtoTableChanges(plan)
 	}
 }
 
@@ -2694,7 +2701,7 @@ func (c *GRPCClient) dispatchRemoteVSchemaOnly(ctx context.Context, apply *stora
 			IgnoreTables:            plan.IgnoreTables(),
 			DirectExecution:         DirectExecutionPolicyProto(driveOptions.DirectExecution),
 		}
-		scope.stampMemberTarget(req)
+		scope.stampMemberTarget(req, plan)
 		resp, err := c.client.Apply(ctx, req)
 		if err != nil {
 			if isAmbiguousRemoteCallError(err) {
@@ -3539,7 +3546,7 @@ func (c *GRPCClient) dispatchPendingApply(ctx context.Context, apply *storage.Ap
 		// reached the control plane from anywhere else cannot grant one.
 		DirectExecution: DirectExecutionPolicyProto(driveOptions.DirectExecution),
 	}
-	scope.stampMemberTarget(req)
+	scope.stampMemberTarget(req, plan)
 	resp, err := c.client.Apply(ctx, req)
 	if err != nil {
 		if isAmbiguousRemoteCallError(err) {
@@ -3725,6 +3732,23 @@ func (c *GRPCClient) prepareDispatchTasks(ctx context.Context, apply *storage.Ap
 		}
 	}
 	return nil
+}
+
+// planToProtoTableChanges converts every change of a plan to the form a
+// dispatch carries it in, the same shape tasksToProtoTableChanges gives the
+// tasks built from it.
+func planToProtoTableChanges(plan *storage.Plan) []*ternv1.TableChange {
+	flat := plan.FlatDDLChanges()
+	changes := make([]*ternv1.TableChange, 0, len(flat))
+	for _, change := range flat {
+		changes = append(changes, &ternv1.TableChange{
+			TableName:  change.Table,
+			Ddl:        change.DDL,
+			ChangeType: ternconv.OpToChangeType(change.Operation),
+			Namespace:  change.Namespace,
+		})
+	}
+	return changes
 }
 
 func tasksToProtoTableChanges(tasks []*storage.Task) []*ternv1.TableChange {

@@ -1116,6 +1116,82 @@ func TestApplies(t *testing.T, h Harness) {
 		require.Error(t, store.Applies().WithExclusiveTarget(ctx, cancelled, nil))
 	})
 
+	// A stopped apply is terminal for claiming but a driver may still resume
+	// it, so a reader of the applies whose engine resources are still in use
+	// sees it alongside the running ones, and never a settled one.
+	t.Run("GetUnsettled", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "apply_unsettled_db", storage.DatabaseTypeVitess)
+		running := CreateApplyWithStateAndEnv(t, store, lock, "apply_unsettled_running", 941, state.Apply.Running, "staging")
+		stopped := CreateApplyWithStateAndEnv(t, store, lock, "apply_unsettled_stopped", 942, state.Apply.Stopped, "production")
+		CreateApplyWithStateAndEnv(t, store, lock, "apply_unsettled_completed", 943, state.Apply.Completed, "staging")
+		CreateApplyWithStateAndEnv(t, store, lock, "apply_unsettled_cancelled", 944, state.Apply.Cancelled, "production")
+
+		unsettled, err := store.Applies().GetUnsettled(ctx)
+		require.NoError(t, err)
+		var identifiers []string
+		for _, apply := range unsettled {
+			identifiers = append(identifiers, apply.ApplyIdentifier)
+		}
+		assert.ElementsMatch(t, []string{running.ApplyIdentifier, stopped.ApplyIdentifier}, identifiers)
+
+		inProgress, err := store.Applies().GetInProgress(ctx)
+		require.NoError(t, err)
+		require.Len(t, inProgress, 1, "stopped is terminal, so only the running apply is in progress")
+		assert.Equal(t, running.ApplyIdentifier, inProgress[0].ApplyIdentifier)
+	})
+
+	// Work that reclaims what no apply owns runs alongside the applies that
+	// already own the target, and holds the target so that no apply is created
+	// for it until the work returns: the applies the work read are still the
+	// applies when it finishes.
+	t.Run("WithTargetHeld", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "apply_held_target_db", storage.DatabaseTypeVitess)
+		running := CreateApplyWithStateEnvDeployment(t, store, lock,
+			"apply_held_running", 931, state.Apply.Running, "staging", "primary")
+
+		hold := func(ctx context.Context, fn func(context.Context) error) error {
+			return store.Applies().WithTargetHeld(ctx, "Apply_Held_Target_DB", "Vitess", "Staging", fn)
+		}
+
+		ran := 0
+		require.NoError(t, hold(ctx, func(context.Context) error {
+			ran++
+			unsettled, err := store.Applies().GetUnsettled(ctx)
+			require.NoError(t, err)
+			require.Len(t, unsettled, 1, "the hold does not refuse to run while an apply owns the target")
+			assert.Equal(t, running.ApplyIdentifier, unsettled[0].ApplyIdentifier)
+
+			// The target stays held for as long as the work runs: a second
+			// hold on it, given less time than the work takes, gives up.
+			secondCtx, cancel := context.WithTimeout(ctx, 300*time.Millisecond)
+			defer cancel()
+			require.Error(t, hold(secondCtx, func(context.Context) error {
+				return errors.New("a second hold ran while the first was on")
+			}))
+			return nil
+		}))
+		assert.Equal(t, 1, ran)
+
+		require.NoError(t, hold(ctx, func(context.Context) error {
+			ran++
+			return nil
+		}), "the target is free again once the work returns")
+		assert.Equal(t, 2, ran)
+
+		sentinel := errors.New("held work failed")
+		require.ErrorIs(t, store.Applies().WithTargetHeld(ctx, "apply_held_target_db", storage.DatabaseTypeVitess, "staging", func(context.Context) error {
+			return sentinel
+		}), sentinel, "the work's own error reaches the caller unchanged")
+
+		require.Error(t, store.Applies().WithTargetHeld(ctx, "apply_held_target_db", storage.DatabaseTypeVitess, "", func(context.Context) error { return nil }),
+			"a target without an environment cannot be held")
+		require.Error(t, store.Applies().WithTargetHeld(ctx, "apply_held_target_db", storage.DatabaseTypeVitess, "staging", nil))
+	})
+
 	dbErrorTests := map[string]func(t *testing.T, store storage.ApplyStore) error{
 		"WithExclusiveTarget_DBError": func(t *testing.T, store storage.ApplyStore) error {
 			return store.WithExclusiveTarget(t.Context(), &storage.Apply{
@@ -1188,6 +1264,14 @@ func TestApplies(t *testing.T, h Harness) {
 			_, err := store.GetInProgress(t.Context())
 			return err
 		},
+		"GetUnsettled_DBError": func(t *testing.T, store storage.ApplyStore) error {
+			_, err := store.GetUnsettled(t.Context())
+			return err
+		},
+		"WithTargetHeld_DBError": func(t *testing.T, store storage.ApplyStore) error {
+			return store.WithTargetHeld(t.Context(), "apply_held_target_db", storage.DatabaseTypeVitess, "staging",
+				func(context.Context) error { return nil })
+		},
 		"FindStuckPendingApplies_DBError": func(t *testing.T, store storage.ApplyStore) error {
 			_, err := store.FindStuckPendingApplies(t.Context(), time.Minute, 1)
 			return err
@@ -1225,7 +1309,11 @@ func TestApplies(t *testing.T, h Harness) {
 			return err
 		},
 		"FindMissingSummaryComment_DBError": func(t *testing.T, store storage.ApplyStore) error {
-			_, err := store.FindMissingSummaryComment(t.Context())
+			_, err := store.FindMissingSummaryComment(t.Context(), 0, 10)
+			return err
+		},
+		"FindTerminalWithInProgressCheck_DBError": func(t *testing.T, store storage.ApplyStore) error {
+			_, err := store.FindTerminalWithInProgressCheck(t.Context(), 10)
 			return err
 		},
 		"GetByPR_DBError": func(t *testing.T, store storage.ApplyStore) error {
