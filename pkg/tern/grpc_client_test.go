@@ -7773,16 +7773,23 @@ func TestGRPCClient_QueuedRemoteDispatchPredicate(t *testing.T) {
 // pending→running in a separate transaction before the drive runs, so a freshly
 // claimed operation reaches dispatch in running with no per-operation remote id
 // yet. That first dispatch must proceed — a running operation with an empty
-// remote id is not the ambiguous crash case the whole-apply path rejects.
+// remote id is not the ambiguous crash case the whole-apply path rejects. A
+// stop that catches an operation before it starts leaves it with no started_at,
+// so the start that resumes it is its first dispatch too; a resuming operation
+// that had started may already exist remotely and is not redispatched.
 func TestGRPCClient_QueuedRemoteDispatchPredicate_OperationScope(t *testing.T) {
 	tests := []struct {
 		name     string
 		opState  string
 		remoteID string
+		started  bool
 		multiOp  bool
 		want     bool
 	}{
 		{name: "multi-op running without remote id dispatches", opState: state.ApplyOperation.Running, multiOp: true, want: true},
+		{name: "multi-op resuming that never started dispatches", opState: state.ApplyOperation.Resuming, multiOp: true, want: true},
+		{name: "multi-op resuming that started without remote id does not dispatch", opState: state.ApplyOperation.Resuming, started: true, multiOp: true, want: false},
+		{name: "multi-op resuming with remote id does not dispatch", opState: state.ApplyOperation.Resuming, remoteID: "remote-apply-123", multiOp: true, want: false},
 		{name: "multi-op pending without remote id dispatches", opState: state.ApplyOperation.Pending, multiOp: true, want: true},
 		{name: "multi-op running with remote id does not dispatch", opState: state.ApplyOperation.Running, remoteID: "remote-apply-123", multiOp: true, want: false},
 		{name: "multi-op terminal without remote id does not dispatch", opState: state.ApplyOperation.Completed, multiOp: true, want: false},
@@ -7794,13 +7801,18 @@ func TestGRPCClient_QueuedRemoteDispatchPredicate_OperationScope(t *testing.T) {
 			// The parent apply is running because a sibling deployment is active;
 			// the per-operation remote id (not apply.ExternalID) governs dispatch.
 			apply := &storage.Apply{State: state.Apply.Running}
+			operation := &storage.ApplyOperation{
+				State:               tt.opState,
+				EngineResumeContext: tt.remoteID,
+			}
+			if tt.started {
+				startedAt := time.Now()
+				operation.StartedAt = &startedAt
+			}
 			scope := applyTaskScope{
 				applyOperationID: 1,
-				operation: &storage.ApplyOperation{
-					State:               tt.opState,
-					EngineResumeContext: tt.remoteID,
-				},
-				multiOperation: tt.multiOp,
+				operation:        operation,
+				multiOperation:   tt.multiOp,
 			}
 			assert.Equal(t, tt.want, shouldDispatchQueuedRemoteApply(apply, scope))
 		})

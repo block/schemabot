@@ -695,7 +695,7 @@ Canonical model: [apply-lifecycle.md](apply-lifecycle.md) and
 ### ST-1: A finished apply stays finished
 
 No path moves a terminal apply (`completed`, `failed`, `cancelled`, `reverted`, `stopped`) back
-to an active state, other than the two routes named below: claiming a stopped apply to resume it
+to an active state, other than the routes named below: claiming a stopped apply to resume it
 or deliver its cancel, and correcting a rollout verdict that was recorded too early. Not a retry,
 not an API write, not a crashed driver replaying stale progress.
 
@@ -720,6 +720,12 @@ lease for this write, so the lease requirement is the callers' policy. The write
 parent still holds the state it read. It writes the parent row alone, so no failed operation runs
 again, and it does not re-run the target check of OW-5.
 
+A stopped rollout leaves `stopped` through that same projection update rather than through its own
+claim. Its operations are claimed one by one, so delivering a `start` or a `cancel` to them moves
+the operations, and the parent follows by re-deriving from them. That write runs only from
+`stopped` and only while a `start` or `cancel` is pending on the apply, so a stopped rollout no
+operator addressed never drifts back to an active state.
+
 `stopped` is the one terminal state that is still addressable, because a stopped apply is holding
 a database rather than done with it. It can be claimed to resume via `start`, and it can be
 claimed to deliver a pending `cancel`, which settles it to `cancelled`. Both are explicit arms of
@@ -743,7 +749,9 @@ claim query, the terminal-state refusals in the control handlers, and the write-
 marker consulted by the start, resume, and retry paths (`pkg/storage/internal/sqlstore/applies.go`,
 `pkg/api/control_handlers.go`); the reopen policy each caller passes to the rollout projection,
 with the lease-scoped drive paths opting in and the unscoped reconciler opting out
-(`reopensHeldFailedRollout` in `updateApplyStateFromOperations`, `pkg/api/operator.go`).
+(`reopensHeldFailedRollout` in `updateApplyStateFromOperations`, `pkg/api/operator.go`), and the
+pending-request gate on a stopped rollout's reopen and drive (`stoppedRolloutDeliverableRequest`,
+`pkg/api/operator.go`).
 
 ### ST-2: Recovery from permanent failure is a fresh plan and apply
 
@@ -860,7 +868,10 @@ every policy and not only the fail-closed ones. The two differ by one state: a `
 that had started is terminal for claiming but resumable, so an operator can start it again and a driver will write to
 that target. A rollout whose remaining sibling is stopped therefore stays open — `running_degraded`,
 or `paused` where a pause is holding it — until that sibling is started and finishes, or is
-cancelled. A rollout held open this way still resolves the stop that produced it, once that stop
+cancelled. A rollout reads `stopped` only once no sibling that started is still under way: until a stop
+has landed on every started sibling, the rollout takes the state of the work still running, so
+the stop request stays pending and `stop` stays on offer for the sibling it has not reached. A
+`start` on a rollout stays pending until the rollout settles or a later `stop` supersedes it, since a pending `start` is what reopens a stopped rollout. A rollout held open this way still resolves the stop that produced it, once that stop
 has reached every operation: the pending request is what `start` consults, so holding it open
 without completing the request would refuse the start the hold exists to preserve (CO-2).
 *Enforced:* the ordered-claim gates in `FindNextApplyOperation`, whose work and finalizer arms
@@ -877,12 +888,15 @@ check `CutoverBlocker` (`pkg/storage/internal/sqlstore/apply_operations.go`, sha
 `earlierSiblingHoldsCutoverSQL`), applied when a drive takes the request
 (`operationCutoverRequestTurn`, `pkg/tern/cutover_barrier.go`) and at request intake
 (`cutoverTurnForRequest`, `pkg/api/control_handlers.go`); and the rollout state derivation
-(`DeriveRolloutApplyState`, `hasStartedUnsettledWork` and `childHoldsItsTarget`,
+(`DeriveRolloutApplyState`, `deriveCancelledRollout`, `deriveStoppedRollout`, `hasStartedUnsettledWork` and `childHoldsItsTarget`,
 `pkg/state/apply.go`), fed by `RolloutChildren` (`pkg/state/rollout.go`, whose
 `stepOrphanedByEarlierStep` marks work held behind a table that settled without completing, read through `StepRowCanNeverPass`), through which every
 projection builds its children, with `RolloutHeldByResumableChild` (`pkg/state/apply.go`), which
 `updateApplyStateFromOperations` consults to keep a held-open rollout's recovery claim quiet, and
-`completeLandedStopForHeldOpenApply` keeping its stop resolved (`pkg/api/operator.go`).
+`completeLandedStopForHeldOpenApply` keeping its stop resolved (`pkg/api/operator.go`), and
+`stopSupersedesPendingStart` completing the pending start of an apply driven under the operation lease in the same write that records a stop
+(`pkg/api/control_handlers.go`, through `RequestPendingSuperseding` in
+`pkg/storage/internal/sqlstore/control_requests.go`).
 
 ## Ownership and leases (OW)
 
@@ -1168,7 +1182,10 @@ stop and cancel paths (`failPendingRequestForSettledOutcome`, `pkg/tern/local_co
 terminal resolution of a typed unsupported-operation
 decline (`failPendingRequestForUnsupportedOperation`, `pkg/tern/local_control.go`), reached from
 the stop and cancel paths in that file and from the revert and skip-revert paths in
-`pkg/tern/local_apply_grouped.go`, the refusal paths of the pending control-request processors
+`pkg/tern/local_apply_grouped.go`, the claim arms that hand a pending cancel to a rollout's
+stopped and cutover-parked operations and a pending stop to its cutover-parked ones (`FindNextApplyOperation`,
+`pkg/storage/internal/sqlstore/apply_operations.go`) and the settling of its never-started
+operations on the spot (`cancelPendingOperationsForPendingCancel`, `pkg/api/operator.go`), the refusal paths of the pending control-request processors
 on both clients (`pkg/tern/local_control.go`, `pkg/tern/grpc_client.go`), and the reaper's sweep
 of requests left pending on an apply that has settled and that no drive still holds
 (`pkg/api/reaper.go`, `ListStrandedPending` in `pkg/storage/internal/sqlstore/control_requests.go`).

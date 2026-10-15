@@ -427,6 +427,13 @@ func (s *memoryControlRequestStore) RequestPending(_ context.Context, req *stora
 	return cloneControlRequest(stored), false, nil
 }
 
+func (s *memoryControlRequestStore) RequestPendingSuperseding(ctx context.Context, req *storage.ApplyControlRequest, superseded storage.ControlOperation) (*storage.ApplyControlRequest, bool, error) {
+	if err := s.CompletePending(ctx, req.ApplyID, superseded); err != nil {
+		return nil, false, err
+	}
+	return s.RequestPending(ctx, req)
+}
+
 func (s *memoryControlRequestStore) GetPending(_ context.Context, applyID int64, operation storage.ControlOperation) (*storage.ApplyControlRequest, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

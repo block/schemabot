@@ -59,6 +59,66 @@ func TestControlRequests(t *testing.T, h Harness) {
 		assert.JSONEq(t, string(first.Metadata), string(second.Metadata))
 	})
 
+	// RequestPendingSuperseding_CompletesTheSupersededRequest verifies that a
+	// stop recorded over a pending start completes that start in the same write,
+	// so the stop is the only request left pending on the apply.
+	t.Run("RequestPendingSuperseding_CompletesTheSupersededRequest", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+
+		applyID := createControlRequestApply(t, store, "control_supersede_db", "apply_control_supersede")
+		_, _, err := store.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+			ApplyID: applyID, Operation: storage.ControlOperationStart, Status: storage.ControlRequestPending, RequestedBy: "first-operator",
+		})
+		require.NoError(t, err)
+
+		stop, alreadyPending, err := store.ControlRequests().RequestPendingSuperseding(ctx, &storage.ApplyControlRequest{
+			ApplyID: applyID, Operation: storage.ControlOperationStop, Status: storage.ControlRequestPending, RequestedBy: "second-operator",
+			Metadata: []byte(`{"stopped_count":2}`),
+		}, storage.ControlOperationStart)
+		require.NoError(t, err)
+		assert.False(t, alreadyPending)
+		assert.Equal(t, storage.ControlOperationStop, stop.Operation)
+		assert.Equal(t, "second-operator", stop.RequestedBy)
+
+		pendingStart, err := store.ControlRequests().GetPending(ctx, applyID, storage.ControlOperationStart)
+		require.NoError(t, err)
+		assert.Nil(t, pendingStart, "the superseded start is no longer pending")
+		start, err := store.ControlRequests().GetByOperation(ctx, applyID, storage.ControlOperationStart)
+		require.NoError(t, err)
+		require.NotNil(t, start)
+		assert.Equal(t, storage.ControlRequestCompleted, start.Status)
+		assert.NotNil(t, start.CompletedAt)
+	})
+
+	// RequestPendingSuperseding_FailedRequestKeepsTheSupersededPending verifies
+	// that the two writes land together: a stop whose own write fails leaves the
+	// start it would have superseded pending, so no acknowledged command is lost.
+	t.Run("RequestPendingSuperseding_FailedRequestKeepsTheSupersededPending", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+
+		applyID := createControlRequestApply(t, store, "control_supersede_fail_db", "apply_control_supersede_fail")
+		_, _, err := store.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+			ApplyID: applyID, Operation: storage.ControlOperationStart, Status: storage.ControlRequestPending, RequestedBy: "first-operator",
+		})
+		require.NoError(t, err)
+
+		_, _, err = store.ControlRequests().RequestPendingSuperseding(ctx, &storage.ApplyControlRequest{
+			ApplyID: applyID, Operation: storage.ControlOperationStop, Status: storage.ControlRequestPending, RequestedBy: "second-operator",
+			Metadata: []byte(`{not json`),
+		}, storage.ControlOperationStart)
+		require.Error(t, err, "the metadata column rejects invalid JSON, failing the stop's own write")
+
+		start, err := store.ControlRequests().GetPending(ctx, applyID, storage.ControlOperationStart)
+		require.NoError(t, err)
+		require.NotNil(t, start, "the start stays pending when the stop that supersedes it is not recorded")
+		assert.Equal(t, "first-operator", start.RequestedBy)
+		stop, err := store.ControlRequests().GetByOperation(ctx, applyID, storage.ControlOperationStop)
+		require.NoError(t, err)
+		assert.Nil(t, stop)
+	})
+
 	// RequestPending_ConcurrentFirstRequests verifies concurrent operator
 	// requests for the same apply operation converge on one durable pending
 	// row — exactly one caller creates it, every other caller observes the

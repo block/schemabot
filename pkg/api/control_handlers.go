@@ -1280,7 +1280,11 @@ func (s *Service) queueStopForApplyOwner(ctx context.Context, apply *storage.App
 		s.logger.Info("stop requested for a task-less apply; recording the durable request for the task-less settle path",
 			append(apply.LogAttrs(), "requested_by", caller)...)
 	}
-	controlReq, alreadyPending, err := s.createStopControlRequest(ctx, apply, caller, stoppedCount, skippedCount)
+	supersedesStart, err := s.stopSupersedesPendingStart(ctx, apply, caller)
+	if err != nil {
+		return nil, "", err
+	}
+	controlReq, alreadyPending, err := s.createStopControlRequest(ctx, apply, caller, stoppedCount, skippedCount, supersedesStart)
 	if err != nil {
 		return nil, "", err
 	}
@@ -1296,6 +1300,69 @@ func (s *Service) queueStopForApplyOwner(ctx context.Context, apply *storage.App
 		StoppedCount: stoppedCount,
 		SkippedCount: skippedCount,
 	}, "", nil
+}
+
+// stopSupersedesPendingStart reports whether a stop recorded on this apply
+// supersedes a pending start, which the stop's own write then completes in the
+// same transaction. An apply driven under the operation lease keeps its start
+// pending until it settles, because the operations the start resumes are
+// claimed one at a time on its behalf, and a pending start on a stopped apply
+// is what reopens it. Left pending under the new stop, that start would resume
+// the apply as soon as the stop landed on every operation. A stop is only
+// accepted for a non-terminal apply, so the start it supersedes has already
+// taken effect. An apply driven under the parent lease consumes its start when
+// its drive resumes, so its start is left to that drive.
+func (s *Service) stopSupersedesPendingStart(ctx context.Context, apply *storage.Apply, caller string) (bool, error) {
+	controlStore := s.storage.ControlRequests()
+	if controlStore == nil {
+		return false, fmt.Errorf("control request store is not available")
+	}
+	start, err := controlStore.GetPending(ctx, apply.ID, storage.ControlOperationStart)
+	if err != nil {
+		return false, fmt.Errorf("load pending start request for apply %s before recording a stop: %w", apply.ApplyIdentifier, err)
+	}
+	if start == nil {
+		return false, nil
+	}
+	ops, err := s.storage.ApplyOperations().ListByApply(ctx, apply.ID)
+	if err != nil {
+		return false, fmt.Errorf("list apply_operations for apply %s before recording a stop: %w", apply.ApplyIdentifier, err)
+	}
+	operationLease, err := s.applyDrivesUnderOperationLease(ctx, apply, ops)
+	if err != nil {
+		return false, fmt.Errorf("decide drive mode of apply %s before recording a stop: %w", apply.ApplyIdentifier, err)
+	}
+	if !operationLease {
+		s.logger.Info("stop requested while a start is pending on an apply driven under the parent lease; leaving the start to the drive that resumes it",
+			append(apply.LogAttrs(), "requested_by", caller, "start_requested_by", start.RequestedBy, "operation_count", len(ops))...)
+		return false, nil
+	}
+	s.logger.Info("stop requested while a start is pending on an apply driven under the operation lease; the stop write completes the start it supersedes",
+		append(apply.LogAttrs(), "requested_by", caller, "start_requested_by", start.RequestedBy, "operation_count", len(ops))...)
+	return true, nil
+}
+
+// applyDrivesUnderOperationLease reports whether the apply's operations are
+// driven under the operation lease, with the parent projected from them, rather
+// than under the parent lease. It mirrors the drive-mode decision in
+// recoverApplyOperation: a rollout of several operations, a lone operation
+// whose generation manifest still expects siblings, and a lone task-less
+// operation all drive under the operation lease. An apply with no operation
+// attached has not been driven yet, so no drive mode applies.
+func (s *Service) applyDrivesUnderOperationLease(ctx context.Context, apply *storage.Apply, ops []*storage.ApplyOperation) (bool, error) {
+	switch {
+	case len(ops) == 0:
+		return false, nil
+	case len(ops) > 1:
+		return true, nil
+	case len(apply.MissingExpectedOperationKeys(ops)) > 0:
+		return true, nil
+	}
+	hasTasks, err := s.claimedOperationHasTasks(ctx, ops[0])
+	if err != nil {
+		return false, err
+	}
+	return !hasTasks, nil
 }
 
 func stopRequestCounts(tasks []*storage.Task) (int64, int64) {
@@ -1336,11 +1403,36 @@ func (s *Service) createControlRequest(ctx context.Context, apply *storage.Apply
 	return controlReq, alreadyPending, nil
 }
 
-func (s *Service) createStopControlRequest(ctx context.Context, apply *storage.Apply, caller string, stoppedCount, skippedCount int64) (*storage.ApplyControlRequest, bool, error) {
-	return s.createControlRequest(ctx, apply, storage.ControlOperationStop, caller, stopControlRequestMetadata{
+// createStopControlRequest records the stop. When supersedesStart is set, the
+// apply's pending start is completed in the same transaction, so a failed stop
+// write leaves that start deliverable.
+func (s *Service) createStopControlRequest(ctx context.Context, apply *storage.Apply, caller string, stoppedCount, skippedCount int64, supersedesStart bool) (*storage.ApplyControlRequest, bool, error) {
+	metadata := stopControlRequestMetadata{
 		StoppedCount: stoppedCount,
 		SkippedCount: skippedCount,
-	})
+	}
+	if !supersedesStart {
+		return s.createControlRequest(ctx, apply, storage.ControlOperationStop, caller, metadata)
+	}
+	controlStore := s.storage.ControlRequests()
+	if controlStore == nil {
+		return nil, false, fmt.Errorf("control request store is not available")
+	}
+	metadataJSON, err := json.Marshal(metadata)
+	if err != nil {
+		return nil, false, fmt.Errorf("marshal stop control request metadata for apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	controlReq, alreadyPending, err := controlStore.RequestPendingSuperseding(ctx, &storage.ApplyControlRequest{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationStop,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: caller,
+		Metadata:    metadataJSON,
+	}, storage.ControlOperationStart)
+	if err != nil {
+		return nil, false, fmt.Errorf("record stop control request superseding the pending start for apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	return controlReq, alreadyPending, nil
 }
 
 // pendingControlResponseIfPresent loads any pending control request for the

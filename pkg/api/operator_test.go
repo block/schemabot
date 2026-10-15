@@ -1421,6 +1421,107 @@ func TestCompletePendingControlRequestsIfApplyResolved(t *testing.T) {
 	})
 }
 
+// TestUpdateApplyStateFromOperations_StartReopensStoppedRollout covers an
+// operator starting a stopped multi-operation rollout: the start claim moves one
+// stopped operation to resuming, so the operation rows derive an active rollout
+// again over a parent that still reads stopped. The pending start is what makes
+// that reopen legitimate. Without one, a stopped parent never drifts back to an
+// active state.
+func TestUpdateApplyStateFromOperations_StartReopensStoppedRollout(t *testing.T) {
+	startedAt := time.Now().Add(-time.Minute)
+	ops := []*storage.ApplyOperation{
+		{ID: 1, OperationKey: "orders-001/step-1", State: state.ApplyOperation.Resuming, StartedAt: &startedAt},
+		{ID: 2, OperationKey: "orders-002/step-1", State: state.ApplyOperation.Stopped},
+	}
+	stoppedApply := func() *storage.Apply {
+		return &storage.Apply{ID: 3, ApplyIdentifier: "apply-stopped-rollout", State: state.Apply.Stopped, StartedAt: &startedAt, Environment: "staging"}
+	}
+
+	t.Run("a pending start reopens the stopped parent", func(t *testing.T) {
+		applyStore := &recordingApplyStore{swapped: true}
+		control := &fakeControlRequestStore{pending: map[storage.ControlOperation]*storage.ApplyControlRequest{
+			storage.ControlOperationStart: {ApplyID: 3, Operation: storage.ControlOperationStart, Status: storage.ControlRequestPending},
+		}}
+		svc := newStopReconcileTestService(applyStore, &listingApplyOperationStore{ops: ops}, control)
+
+		_, err := svc.updateApplyStateFromOperations(t.Context(), 1, stoppedApply(), allowLeaseScopedFailedReopen)
+		require.NoError(t, err)
+		require.NotNil(t, applyStore.updated, "the resumed rollout must move the parent out of stopped")
+		assert.Equal(t, state.Apply.Stopped, applyStore.expectedState, "the reopen compare-and-swaps on the stopped state read before deriving")
+		assert.False(t, state.IsTerminalApplyState(applyStore.updated.State), "the parent reads active while its operations resume, got %q", applyStore.updated.State)
+	})
+
+	t.Run("without a pending start the stopped parent is not reopened", func(t *testing.T) {
+		applyStore := &recordingApplyStore{swapped: true}
+		svc := newStopReconcileTestService(applyStore, &listingApplyOperationStore{ops: ops}, &fakeControlRequestStore{})
+
+		_, err := svc.updateApplyStateFromOperations(t.Context(), 1, stoppedApply(), allowLeaseScopedFailedReopen)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "child operations derive non-terminal state")
+		assert.Nil(t, applyStore.updated, "a stopped parent with no start must keep its stored state")
+	})
+}
+
+// An operator cancels a stopped two-target rollout. The cancel drive claims
+// each stopped operation in turn, moving it to resuming only so no peer
+// re-leases it, then settles it cancelled. A cancel resumes nothing, so the
+// parent reads stopped through every step and then cancelled, never moving
+// stopped → resuming → stopped, where each return to stopped would read as a
+// new terminal transition and post a Stopped summary in the middle of the
+// cancel. A start pending beside the cancel does not change that: the drive
+// delivers the cancel first.
+func TestUpdateApplyStateFromOperations_CancelHoldsStoppedRolloutStopped(t *testing.T) {
+	startedAt := time.Now().Add(-time.Minute)
+	stoppedApply := func() *storage.Apply {
+		return &storage.Apply{ID: 3, ApplyIdentifier: "apply-stopped-rollout", State: state.Apply.Stopped, StartedAt: &startedAt, Environment: "staging"}
+	}
+	operations := func(first, second string) []*storage.ApplyOperation {
+		return []*storage.ApplyOperation{
+			{ID: 1, OperationKey: "orders-001/step-1", State: first, StartedAt: &startedAt},
+			{ID: 2, OperationKey: "orders-002/step-1", State: second, StartedAt: &startedAt},
+		}
+	}
+	steps := []struct {
+		name       string
+		ops        []*storage.ApplyOperation
+		wantUpdate string
+	}{
+		{name: "first target claimed for the cancel", ops: operations(state.ApplyOperation.Resuming, state.ApplyOperation.Stopped)},
+		{name: "first target cancelled", ops: operations(state.ApplyOperation.Cancelled, state.ApplyOperation.Stopped)},
+		{name: "second target claimed for the cancel", ops: operations(state.ApplyOperation.Cancelled, state.ApplyOperation.Resuming)},
+		{name: "every target cancelled", ops: operations(state.ApplyOperation.Cancelled, state.ApplyOperation.Cancelled), wantUpdate: state.Apply.Cancelled},
+	}
+	for _, pending := range []struct {
+		name     string
+		requests []storage.ControlOperation
+	}{
+		{name: "cancel pending", requests: []storage.ControlOperation{storage.ControlOperationCancel}},
+		{name: "start and cancel pending", requests: []storage.ControlOperation{storage.ControlOperationStart, storage.ControlOperationCancel}},
+	} {
+		t.Run(pending.name, func(t *testing.T) {
+			for _, step := range steps {
+				t.Run(step.name, func(t *testing.T) {
+					requests := map[storage.ControlOperation]*storage.ApplyControlRequest{}
+					for _, operation := range pending.requests {
+						requests[operation] = &storage.ApplyControlRequest{ApplyID: 3, Operation: operation, Status: storage.ControlRequestPending}
+					}
+					applyStore := &recordingApplyStore{swapped: true}
+					svc := newStopReconcileTestService(applyStore, &listingApplyOperationStore{ops: step.ops}, &fakeControlRequestStore{pending: requests})
+
+					_, err := svc.updateApplyStateFromOperations(t.Context(), 1, stoppedApply(), allowLeaseScopedFailedReopen)
+					require.NoError(t, err)
+					if step.wantUpdate == "" {
+						assert.Nil(t, applyStore.updated, "the parent stays stopped while the cancel is delivered")
+						return
+					}
+					require.NotNil(t, applyStore.updated, "the settled cancel moves the parent")
+					assert.Equal(t, step.wantUpdate, applyStore.updated.State)
+				})
+			}
+		})
+	}
+}
+
 // TestUpdateApplyStateFromOperations_StaleWriteSkipped verifies that when the
 // compare-and-swap misses — another drive advanced the apply between the
 // operator's read and write — the operator skips quietly rather than erroring or
