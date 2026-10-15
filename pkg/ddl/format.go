@@ -151,28 +151,14 @@ func schemaFileStatements(dialect schema.Dialect, parser StatementParser, conten
 }
 
 func postgresSchemaFileStatements(content string) ([]string, error) {
-	hasRowSecurity, err := pgstatement.HasRowSecurityDeclaration(content)
+	file, err := pgstatement.ParseDesiredFile(content)
 	if err != nil {
 		return nil, err
 	}
 
 	// Both desired-schema parsers require a table and return it first, even
 	// when an index precedes the table in the source file.
-	var statements []pgstatement.Statement
-	if hasRowSecurity {
-		desired, err := pgstatement.ParseDesiredWithRowSecurity(content)
-		if err != nil {
-			return nil, err
-		}
-		statements = desired.Statements()
-	} else {
-		desired, err := pgstatement.ParseDesired(content)
-		if err != nil {
-			return nil, err
-		}
-		statements = desired.Statements()
-	}
-
+	statements := file.Statements()
 	result := make([]string, len(statements))
 	for i, stmt := range statements {
 		result[i] = stmt.SQL()

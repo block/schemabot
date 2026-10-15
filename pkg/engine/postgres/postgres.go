@@ -275,23 +275,32 @@ func planSchemas(ctx context.Context, pool *pgxpool.Pool, req *engine.PlanReques
 		if ns == nil {
 			return nil, fmt.Errorf("plan PostgreSQL namespace %q: schema files are required", namespace)
 		}
-		if err := refuseTableDeclaredTwice(namespace, ns.Files); err != nil {
+		parsed, err := parseDesiredFiles(namespace, ns.Files)
+		if err != nil {
+			return nil, err
+		}
+		if err := refuseTableDeclaredTwice(namespace, parsed); err != nil {
 			return nil, err
 		}
 		schemaChange := engine.SchemaChange{Namespace: namespace}
 		files := sortedKeys(ns.Files)
 		desiredTables := make(map[string]bool, len(files))
 		for _, filename := range files {
-			table, rlsChanges, handled, err := planRowSecurityOperation(ctx, pool, namespace, ns.Files[filename])
-			if err != nil {
-				return nil, fmt.Errorf("plan PostgreSQL schema in %q/%q: %w", namespace, filename, err)
-			}
-			if handled {
-				desiredTables[table] = true
+			file := parsed[filename]
+			if rowSecurity, ok := file.RowSecurity(); ok {
+				rlsChanges, err := planRowSecurityOperation(ctx, pool, namespace, rowSecurity)
+				if err != nil {
+					return nil, fmt.Errorf("plan PostgreSQL schema in %q/%q: %w", namespace, filename, err)
+				}
+				desiredTables[file.Table()] = true
 				schemaChange.TableChanges = append(schemaChange.TableChanges, rlsChanges...)
 				continue
 			}
-			report, table, err := planPostgresDefinition(ctx, pool, namespace, ns.Files[filename])
+			desired, ok := file.Schema()
+			if !ok {
+				return nil, fmt.Errorf("plan PostgreSQL schema in %q/%q: the parse admitted no planner input", namespace, filename)
+			}
+			report, table, err := planPostgresDefinition(ctx, pool, namespace, desired)
 			if err != nil {
 				return nil, fmt.Errorf("plan PostgreSQL schema in %q/%q: %w", namespace, filename, err)
 			}
@@ -365,17 +374,14 @@ func planSchemas(ctx context.Context, pool *pgxpool.Pool, req *engine.PlanReques
 // on its own, so a table declared twice would get two contradictory diffs,
 // each dropping what only the other file declares; there is no single desired
 // definition to review. The error names the table and both files so the
-// operator knows which one to remove. It runs before any file is planned, and
-// applies the same rule every planner does (ddl.TableDeclarations), so a
-// duplicate declaration reads the same whichever engine refuses it.
-func refuseTableDeclaredTwice(namespace string, files map[string]string) error {
+// operator knows which one to remove. It runs before any file is planned, on
+// the same admitted files the plan uses, and applies the same rule every
+// planner does (ddl.TableDeclarations), so a duplicate declaration reads the
+// same whichever engine refuses it.
+func refuseTableDeclaredTwice(namespace string, files map[string]pgstatement.DesiredFile) error {
 	var declared ddl.TableDeclarations
 	for _, filename := range sortedKeys(files) {
-		table, err := desiredTableName(files[filename])
-		if err != nil {
-			return fmt.Errorf("plan PostgreSQL schema in %q/%q: %w", namespace, filename, err)
-		}
-		if err := declared.Declare(filename, table); err != nil {
+		if err := declared.Declare(filename, files[filename].Table()); err != nil {
 			return fmt.Errorf("plan PostgreSQL namespace %q: %w", namespace, err)
 		}
 	}

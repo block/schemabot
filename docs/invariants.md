@@ -1631,7 +1631,8 @@ belongs to the target that will run the statement: a deployment that applies a p
 plan itself re-plans against its own live schema and judges the apply on that verdict, not the
 planning deployment's. *Enforced:* plan-time execution verdicts (`pkg/engine`; for PostgreSQL the
 privilege and size gates in `pkg/engine/postgres/postgres.go`, plus RLS admission refusals
-in `pkg/engine/postgres/row_security_apply.go` that abort plan creation); the whole-plan
+in `pkg/engine/postgres/row_security.go` that abort plan creation and the apply-time gate in
+`pkg/engine/postgres/row_security_apply.go`); the whole-plan
 blocked verdict (`storage.Plan.BlockedApplyError`, `pkg/storage`) checked at every apply admission
 path (`pkg/api/plan_handlers.go`, `pkg/tern/local_client.go`), and the CLI's `apply` and `rollback`
 refusing the namespace and shard verdicts of the plan they submit (a rollout's primary plan)
