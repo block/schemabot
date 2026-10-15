@@ -16,13 +16,17 @@ import (
 // A schema whose files declare foreign keys plans: the change a foreign key
 // does not touch is planned to run, while each foreign-key change, and a new
 // table that declares one, is shown for review and blocked, since SchemaBot
-// does not apply foreign keys on PostgreSQL yet.
+// does not apply foreign keys on PostgreSQL yet. A foreign key on a column the
+// same plan adds is planned as the column add and a blocked constraint, and
+// its remedy has the rest of the plan applied first, because the constraint
+// cannot run before its column exists.
 func TestEnginePlanForeignKeys(t *testing.T) {
 	dsn, db := testutil.StartPostgres(t, "plan_foreign_keys_test")
 	_, err := db.ExecContext(t.Context(), `
 		CREATE TABLE public.users (id bigint PRIMARY KEY);
 		CREATE TABLE public.orders (id bigint PRIMARY KEY, user_id bigint NOT NULL);
-		CREATE TABLE public.payments (id bigint PRIMARY KEY, order_id bigint NOT NULL REFERENCES public.orders (id))`)
+		CREATE TABLE public.payments (id bigint PRIMARY KEY, order_id bigint NOT NULL REFERENCES public.orders (id));
+		CREATE TABLE public.refunds (id bigint PRIMARY KEY)`)
 	require.NoError(t, err)
 	req := &engine.PlanRequest{
 		Database: "plan_foreign_keys_test",
@@ -31,6 +35,7 @@ func TestEnginePlanForeignKeys(t *testing.T) {
 				"users.sql":     "CREATE TABLE users (id bigint PRIMARY KEY)",
 				"orders.sql":    "CREATE TABLE orders (id bigint PRIMARY KEY, user_id bigint NOT NULL REFERENCES users (id), note text)",
 				"payments.sql":  "CREATE TABLE payments (id bigint PRIMARY KEY, order_id bigint NOT NULL)",
+				"refunds.sql":   "CREATE TABLE refunds (id bigint PRIMARY KEY, order_id bigint REFERENCES orders (id))",
 				"shipments.sql": "CREATE TABLE shipments (id bigint PRIMARY KEY, order_id bigint NOT NULL REFERENCES orders (id))",
 			}},
 		},
@@ -55,7 +60,15 @@ func TestEnginePlanForeignKeys(t *testing.T) {
 	addFK, ok := byDDL["ALTER TABLE public.orders ADD CONSTRAINT orders_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users (id)"]
 	require.True(t, ok, "the foreign-key add is planned")
 	assert.Equal(t, engine.ExecutionModeBlocked, addFK.ExecutionMode)
-	assert.Equal(t, `statement for table "orders" adds a foreign key, which SchemaBot plans but does not apply on PostgreSQL yet; run this statement outside SchemaBot`, addFK.ModeReason)
+	assert.Equal(t, `statement for table "orders" adds a foreign key, which SchemaBot plans but does not apply on PostgreSQL yet; leave the foreign key out of the schema file to apply the rest of the plan, then run this statement outside SchemaBot and add the foreign key back to the file`, addFK.ModeReason)
+
+	addRefundColumn, ok := byDDL["ALTER TABLE public.refunds ADD COLUMN order_id bigint"]
+	require.True(t, ok, "the new column is planned on its own")
+	assert.NotEqual(t, engine.ExecutionModeBlocked, addRefundColumn.ExecutionMode)
+	addRefundFK, ok := byDDL["ALTER TABLE public.refunds ADD CONSTRAINT refunds_order_id_fkey FOREIGN KEY (order_id) REFERENCES public.orders (id)"]
+	require.True(t, ok, "the foreign key on the new column is planned as its own statement")
+	assert.Equal(t, engine.ExecutionModeBlocked, addRefundFK.ExecutionMode)
+	assert.Contains(t, addRefundFK.ModeReason, "leave the foreign key out of the schema file to apply the rest of the plan")
 
 	dropFK, ok := byDDL["ALTER TABLE public.payments DROP CONSTRAINT payments_order_id_fkey"]
 	require.True(t, ok, "the undeclared live foreign key is planned as a drop")

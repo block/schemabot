@@ -1159,10 +1159,10 @@ func TestEnginePlanCreateTableIgnoresSizeCeiling(t *testing.T) {
 // surfaces it as a DROP TABLE that is both destructive and blocked, so the
 // reviewer sees the divergence and the apply path can never run the drop. The
 // verdict prescribes only remedies the operator can follow — a table that owns
-// a foreign key cannot be declared, and a table that another table's foreign
-// key references cannot be declared by a pulled file, so each reason names the
-// constraint and the side it lives on instead of a file that cannot be
-// written. A declared table that already matches its file contributes nothing,
+// a foreign key into another namespace cannot be declared, and any other table
+// with a foreign key on either side cannot be declared by a pulled file, so
+// each reason names the constraint and the side it lives on instead of a file
+// that cannot be written. A declared table that already matches its file contributes nothing,
 // even when foreign keys elsewhere reference it. Tables whose definition lives
 // elsewhere are not reported on their own: a partition belongs to its parent
 // and an extension-owned table to its extension. Archive tables are exempt by
@@ -1177,6 +1177,9 @@ func TestEnginePlanUndeclaredTableIsBlockedDrop(t *testing.T) {
 		CREATE TABLE public.orders (id bigint PRIMARY KEY, user_id bigint REFERENCES public.users (id));
 		CREATE TABLE public.regions (id bigint PRIMARY KEY);
 		CREATE TABLE public.warehouses (id bigint PRIMARY KEY, region_id bigint REFERENCES public.regions (id));
+		CREATE SCHEMA billing;
+		CREATE TABLE billing.accounts (id bigint PRIMARY KEY);
+		CREATE TABLE public.invoices (id bigint PRIMARY KEY, account_id bigint REFERENCES billing.accounts (id));
 		CREATE TABLE public.events (id bigint, day date) PARTITION BY RANGE (day);
 		CREATE TABLE public.events_2026 PARTITION OF public.events
 			FOR VALUES FROM ('2026-01-01') TO ('2027-01-01');
@@ -1211,21 +1214,23 @@ func TestEnginePlanUndeclaredTableIsBlockedDrop(t *testing.T) {
 	assert.Equal(t, []string{"audit_log_archive_2019"}, result.ExemptTables[0].Tables)
 	assert.Equal(t, "archive naming", result.ExemptTables[0].Reason)
 	assert.NotContains(t, result.ExemptTables[0].Tables, "legacy_users")
-	require.Len(t, result.Changes[0].TableChanges, 8,
+	require.Len(t, result.Changes[0].TableChanges, 9,
 		"every undeclared table with a definition of its own is reported; the declared table, its partition, the extension-owned table and the archive table are not")
 
 	const declarable = "declare the table in a schema file to keep it under management, or drop it through a separately reviewed process"
-	const ownsForeignKey = `cannot be declared while it carries foreign key constraint(s) "orders_user_id_fkey", which schema files do not support — drop the table, or remove its foreign keys before declaring it, through a separately reviewed process`
-	const referencedByForeignKey = `foreign key constraint(s) "warehouses_region_id_fkey" on other tables reference it, and schema files do not support foreign keys, so the schema pull cannot write a file for it — declare the table by hand in a schema file to keep it under management, or drop it together with the referencing constraints through a separately reviewed process`
+	const ownsForeignKey = `it carries foreign key constraint(s) "orders_user_id_fkey", so the schema pull cannot write a file for it — declare the table by hand in a schema file, foreign keys included, to keep it under management, or drop it through a separately reviewed process`
+	const ownsCrossNamespaceForeignKey = `the table cannot be declared while it carries foreign key constraint(s) "invoices_account_id_fkey", which reference another namespace and schema files do not support — drop the table, or remove those foreign keys before declaring it, through a separately reviewed process`
+	const referencedByForeignKey = `foreign key constraint(s) "warehouses_region_id_fkey" on other tables reference it, so the schema pull cannot write a file for it — declare the table by hand in a schema file to keep it under management, or drop it together with the referencing constraints through a separately reviewed process`
 	for i, want := range []struct{ table, ddl, remedy string }{
 		{"_settings", "DROP TABLE public._settings", declarable},
 		{"events", "DROP TABLE public.events", declarable},
+		{"invoices", "DROP TABLE public.invoices", ownsCrossNamespaceForeignKey},
 		{"legacy_users", "DROP TABLE public.legacy_users", declarable},
 		{"orders", "DROP TABLE public.orders", ownsForeignKey},
 		{"regions", "DROP TABLE public.regions", referencedByForeignKey},
 		{"scratch", "DROP TABLE public.scratch", declarable},
 		{"users_history", "DROP TABLE public.users_history", declarable},
-		{"warehouses", "DROP TABLE public.warehouses", `cannot be declared while it carries foreign key constraint(s) "warehouses_region_id_fkey"`},
+		{"warehouses", "DROP TABLE public.warehouses", `it carries foreign key constraint(s) "warehouses_region_id_fkey", so the schema pull cannot write a file for it`},
 	} {
 		change := result.Changes[0].TableChanges[i]
 		assert.Equal(t, want.table, change.Table)
@@ -1238,7 +1243,7 @@ func TestEnginePlanUndeclaredTableIsBlockedDrop(t *testing.T) {
 		assert.Contains(t, change.ModeReason, `table "`+want.table+`" exists on the target but no schema file in namespace "public" declares it`)
 		assert.Contains(t, change.ModeReason, want.remedy)
 	}
-	for _, table := range []string{"legacy_users", "orders", "regions", "warehouses", "scratch", "users_history", "_settings", "audit_log_archive_2019", "ext_owned_config"} {
+	for _, table := range []string{"legacy_users", "orders", "regions", "warehouses", "invoices", "scratch", "users_history", "_settings", "audit_log_archive_2019", "ext_owned_config"} {
 		assert.True(t, testutil.PostgresTableExists(t, db, "public", table), "planning must never touch the target")
 	}
 }

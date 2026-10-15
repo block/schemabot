@@ -460,16 +460,25 @@ declared foreign key that matches the live one plans no change. One the file
 adds plans as an `ADD CONSTRAINT` that names the referenced table with its
 namespace, and a live one the file omits plans as a destructive
 `DROP CONSTRAINT`; both are shown for review and blocked, because SchemaBot
-does not apply foreign-key changes on PostgreSQL yet. Run that statement
-outside SchemaBot, then re-plan. A new table that declares a foreign key is
-blocked as a whole: create it without the foreign key, then add the foreign
-key outside SchemaBot. Planning copies each referenced table's shape, so the
-planning role needs `SELECT` on it; it never blocks writes to it. A table that
-other tables reference can be declared — the constraints live on the
-referencing tables, not in its own definition — but only by a hand-written
-file, because the pull refuses to render a table it would describe
-incompletely; and a drop has to take the referencing constraints with it. The
-plan names those constraints too, so both sides of one relationship explain
+does not apply foreign-key changes on PostgreSQL yet. A blocked step blocks the
+whole plan, so a dropped foreign key is run outside SchemaBot and then
+re-planned. An added one may sit on a column the same plan adds, so leave it out
+of the file to apply the rest of the plan first, then run the `ADD CONSTRAINT`
+outside SchemaBot and add the foreign key back to the file. A new table that
+declares a foreign key is blocked as a whole: leave the foreign key out of the
+file to create the table, then add it the same way. Planning copies each
+referenced table's shape, so the planning role needs `SELECT` on it; it never
+blocks writes to it.
+
+The pull refuses to render a table with a foreign key on either side, because
+it would describe the table incompletely, so such a table needs a hand-written
+file. One that owns foreign keys is declared with them; one that other tables
+reference is declared without them, since the constraints live on the
+referencing tables, not in its own definition. A table that owns a foreign key
+into another namespace cannot be declared at all: remove that foreign key or
+drop the table through a separately reviewed process. A drop of a referenced
+table has to take the referencing constraints with it. The plan names the
+constraints on both sides, so both sides of one relationship explain
 themselves.
 
 Archive tables named `<table>_archive_YYYY[_MM[_DD]]` with no schema file are
