@@ -1875,6 +1875,16 @@ func (s *Service) stoppedRolloutDeliverableRequest(ctx context.Context, apply *s
 	return "", nil
 }
 
+// stoppedRolloutCancelPending reports whether a stopped apply has a pending
+// cancel. The caller must have established that the apply is stopped.
+func (s *Service) stoppedRolloutCancelPending(ctx context.Context, apply *storage.Apply) (bool, error) {
+	controlReq, err := s.storage.ControlRequests().GetPending(ctx, apply.ID, storage.ControlOperationCancel)
+	if err != nil {
+		return false, fmt.Errorf("load pending cancel request for stopped apply %s (%d): %w", apply.ApplyIdentifier, apply.ID, err)
+	}
+	return controlReq != nil, nil
+}
+
 // stopPendingOperationsForPendingStop terminalizes still-pending sibling
 // operations to stopped when the apply has a pending stop request, so the
 // rollout can settle instead of stranding running with siblings the claim gate
@@ -3338,6 +3348,21 @@ func (s *Service) updateApplyStateFromOperations(ctx context.Context, driverID i
 		if request == "" {
 			return applyProjectionResult{}, fmt.Errorf("derive apply state for terminal apply %s (%d): child operations derive non-terminal state %q from parent state %q",
 				apply.ApplyIdentifier, apply.ID, derived, apply.State)
+		}
+		// A cancel resumes nothing: its drive claims each stopped operation
+		// only to settle it, so the rollout stays stopped until the cancel
+		// settles it cancelled. Reopening it for that drive would move the
+		// parent stopped → resuming → stopped once per operation, and each
+		// return to stopped reads as a fresh terminal transition.
+		cancelPending, err := s.stoppedRolloutCancelPending(ctx, apply)
+		if err != nil {
+			return applyProjectionResult{}, err
+		}
+		if cancelPending {
+			s.logger.Debug("operator: holding stopped rollout stopped while its pending cancel is delivered",
+				append(apply.LogAttrs(),
+					"driver", driverID, "derived_state", derived, "operation_count", len(ops))...)
+			derived = state.Apply.Stopped
 		}
 	}
 
