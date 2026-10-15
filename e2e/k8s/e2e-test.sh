@@ -88,6 +88,9 @@ if ! minikube status > /dev/null 2>&1; then
     minikube start --driver=docker --container-runtime=docker --cpus=2 --memory=2048
 fi
 
+# shellcheck source=e2e/k8s/pin-minikube-kubeconfig.sh
+source "$REPO_ROOT/e2e/k8s/pin-minikube-kubeconfig.sh"
+
 # --- Build image ---
 
 # The image tag is per-run for the same reason as the namespace: the chart
@@ -112,6 +115,7 @@ rm -f "$REPO_ROOT/deploy/local/schemabot-dev"
 # deployment by hand.
 PIDS=()
 cleanup() {
+    rm -f "$PINNED_KUBECONFIG"
     echo "Cleaning up port-forwards..."
     for pid in ${PIDS[@]+"${PIDS[@]}"}; do
         kill "$pid" 2>/dev/null || true
