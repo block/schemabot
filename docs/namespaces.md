@@ -73,6 +73,12 @@ type: mysql
 
 SchemaBot plans each namespace independently — `app_primary` and `app_analytics` each produce their own `SchemaChange` with separate table changes.
 
+Each namespace is diffed against its own MySQL database, so a table
+whose schema file is deleted is dropped in that namespace's database and shows up
+under that namespace only. This needs a namespace-free target DSN; see
+[MySQL target DSN requirements](#mysql-target-dsn-requirements) for what a DSN that
+names a database cannot do.
+
 ### MySQL — Different databases entirely
 
 When an app talks to separate database servers, each gets its own schema directory with its own `schemabot.yaml`:
@@ -316,6 +322,16 @@ the whole database as one unit: an ignored namespace's live tables would
 have no declaring files and the diff would plan them as `DROP TABLE`, the
 inverse of "ignore". SchemaBot refuses this combination, and the plan fails with
 an error asking for a namespace-free DSN or removal of `ignore_namespaces`.
+
+A DSN that names a database also cannot drop a table when the schema root has
+two or more namespaces. Every namespace is diffed against that one database, so
+a live table that no schema file declares is in every namespace's live schema at
+once, and the deleted file that said which namespace held it is no longer in the
+request. SchemaBot cannot attribute the `DROP TABLE` to a namespace, so the plan
+fails with an error that names the table and the namespaces. To drop it, switch
+to a namespace-free DSN, or keep that database's schema files in one namespace
+directory. With a single namespace, the drop belongs to it and is planned like
+any other drop.
 
 ## Ignoring Tables
 

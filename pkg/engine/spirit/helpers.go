@@ -45,11 +45,14 @@ func parseDSN(dsn string) (host, username, password, database string, err error)
 // namespace they belong to (from SchemaFiles keys) for consistency with
 // multi-namespace engines like PlanetScale. declaredIn maps each desired
 // table to the namespace whose schema file declares it. The result is in
-// namespace order, so the same input yields the same plan.
-func groupChangesByNamespace(changes []engine.TableChange, currentSchema []table.TableSchema, declaredIn map[string]string, sf schema.SchemaFiles) ([]engine.SchemaChange, error) {
+// namespace order, so the same input yields the same plan. A namespace with
+// no table change gets no SchemaChange, so an empty change list yields an
+// empty result. database names the database the request is diffed against,
+// for the error when a dropped table cannot be attributed.
+func groupChangesByNamespace(changes []engine.TableChange, currentSchema []table.TableSchema, declaredIn map[string]string, sf schema.SchemaFiles, database string) ([]engine.SchemaChange, error) {
 	changesByNS := make(map[string][]engine.TableChange)
 	for _, tc := range changes {
-		ns, err := namespaceForTable(tc.Table, declaredIn, sf)
+		ns, err := namespaceForTable(tc.Table, declaredIn, sf, database)
 		if err != nil {
 			return nil, fmt.Errorf("namespace lookup for table %q: %w", tc.Table, err)
 		}
@@ -59,21 +62,16 @@ func groupChangesByNamespace(changes []engine.TableChange, currentSchema []table
 	for ns := range changesByNS {
 		originalFilesByNS[ns] = map[string]string{}
 	}
-	if len(sf) == 1 {
-		for ns := range sf {
-			for _, ts := range currentSchema {
-				originalFilesByNS[ns][ts.Name+".sql"] = ts.Schema
-			}
+	// Originals are captured only for the namespaces that have a SchemaChange;
+	// a live table in a namespace the plan does not change has no SchemaChange
+	// to carry it.
+	for _, ts := range currentSchema {
+		ns, err := namespaceForTable(ts.Name, declaredIn, sf, database)
+		if err != nil {
+			return nil, fmt.Errorf("namespace lookup for original table %q: %w", ts.Name, err)
 		}
-	} else {
-		for _, ts := range currentSchema {
-			ns, err := namespaceForTable(ts.Name, declaredIn, sf)
-			if err != nil {
-				return nil, fmt.Errorf("namespace lookup for original table %q: %w", ts.Name, err)
-			}
-			if _, ok := originalFilesByNS[ns]; ok {
-				originalFilesByNS[ns][ts.Name+".sql"] = ts.Schema
-			}
+		if files, ok := originalFilesByNS[ns]; ok {
+			files[ts.Name+".sql"] = ts.Schema
 		}
 	}
 	schemaChanges := make([]engine.SchemaChange, 0, len(changesByNS))
@@ -95,21 +93,28 @@ func groupChangesByNamespace(changes []engine.TableChange, currentSchema []table
 // declarations alone, never on the order a map is walked or on a file's name.
 //
 // The namespace is the per-table progress-matching key, so it must be
-// deterministic. A table no schema file declares — for example a DROP TABLE
-// plan, where the table no longer has a defining statement — can only be
-// attributed when exactly one namespace exists. With two or more namespaces
-// it cannot be attributed to a single one, so this returns an error rather
-// than an arbitrary map key.
-func namespaceForTable(table string, declaredIn map[string]string, sf schema.SchemaFiles) (string, error) {
+// deterministic. A table no schema file declares is one the plan drops: its
+// declaring file was removed or emptied. With exactly one namespace the
+// request is that namespace's database, so the drop belongs to it. With two
+// or more, every namespace is diffed against the same database, so the live
+// table is in all of their schemas at once, and the request no longer carries
+// the removed file that said which namespace held it. No namespace can be
+// proven to own the drop, so this refuses with the remedy rather than picking
+// one. A namespace-free target DSN plans each namespace against its own
+// database, which attributes every drop exactly.
+func namespaceForTable(table string, declaredIn map[string]string, sf schema.SchemaFiles, database string) (string, error) {
 	if nsName, ok := declaredIn[table]; ok {
 		return nsName, nil
 	}
-	if len(sf) == 1 {
+	switch len(sf) {
+	case 0:
+		return "", fmt.Errorf("table %q in database %q has no schema namespace: the request carries no schema files", table, database)
+	case 1:
 		for nsName := range sf {
 			return nsName, nil
 		}
 	}
-	return "", fmt.Errorf("no namespace defines table %q among %d schema namespaces %v", table, len(sf), namespaceNames(sf))
+	return "", fmt.Errorf("cannot attribute DROP TABLE %q to a schema namespace: namespaces %v are all diffed against database %q and none of them declares the table; use a target DSN that names no database, so each namespace is diffed against its own database, or keep this database's schema files in one namespace directory", table, namespaceNames(sf), database)
 }
 
 // namespaceNames returns the sorted namespace keys for inclusion in error
