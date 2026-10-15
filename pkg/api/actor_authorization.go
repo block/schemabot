@@ -104,12 +104,17 @@ func (c *ServerConfig) validateDatabaseReviewPolicy(database string, dbConfig Da
 	if len(c.ReviewPolicy.AdminTeams) > 0 || len(c.ReviewPolicy.AdminUsers) > 0 || c.ReviewPolicy.IncludeCodeowners {
 		return nil
 	}
-	for _, repoConfig := range c.Repos {
+	// A repo's admins approve only that repo's PRs, so they count only for a
+	// repo the database accepts schema changes from.
+	for repo, repoConfig := range c.Repos {
+		if !databaseAllowsRepo(dbConfig, repo) {
+			continue
+		}
 		if len(repoConfig.AdminTeams) > 0 || len(repoConfig.AdminUsers) > 0 {
 			return nil
 		}
 	}
-	return fmt.Errorf("databases.%s.review_policy.enabled requires someone who can approve: set the database's operator_teams or operator_users (with review_policy.include_database_operators left on), review_policy.admin_teams or admin_users, a repo's admin_teams or admin_users, or review_policy.include_codeowners", database)
+	return fmt.Errorf("databases.%s.review_policy.enabled requires someone who can approve: set the database's operator_teams or operator_users (with review_policy.include_database_operators left on), review_policy.admin_teams or admin_users, admin_teams or admin_users on a repo in its allowed_repos, or review_policy.include_codeowners", database)
 }
 
 func validateDatabaseActorAuthorization(database string, dbConfig DatabaseConfig) error {

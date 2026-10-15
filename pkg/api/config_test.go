@@ -4217,6 +4217,50 @@ databases:
 		require.ErrorContains(t, err, "databases.orders.review_policy.enabled requires someone who can approve")
 	})
 
+	t.Run("admins of a repo the database does not allow cannot approve an opted-in database", func(t *testing.T) {
+		_, err := loadConfig(t, `
+repos:
+  octocat/unrelated:
+    admin_teams:
+      - octocat/maintainers
+databases:
+  orders:
+    type: mysql
+    allowed_repos:
+      - octocat/orders
+    review_policy:
+      enabled: true
+    environments:
+      staging:
+        dsn: "root@tcp(localhost:3306)/orders"
+`)
+		require.ErrorContains(t, err, "databases.orders.review_policy.enabled requires someone who can approve")
+	})
+
+	t.Run("admins of a repo the database allows can approve an opted-in database", func(t *testing.T) {
+		cfg, err := loadConfig(t, `
+repos:
+  octocat/unrelated:
+    admin_teams:
+      - octocat/maintainers
+  octocat/orders:
+    admin_users:
+      - mona
+databases:
+  orders:
+    type: mysql
+    allowed_repos:
+      - octocat/orders
+    review_policy:
+      enabled: true
+    environments:
+      staging:
+        dsn: "root@tcp(localhost:3306)/orders"
+`)
+		require.NoError(t, err)
+		assert.True(t, cfg.ReviewPolicyEnabled("orders"))
+	})
+
 	for name, approvers := range map[string]string{
 		"instance admins": "review_policy:\n  admin_users:\n    - mona\n",
 		"CODEOWNERS":      "review_policy:\n  include_codeowners: true\n",
