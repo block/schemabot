@@ -45,9 +45,15 @@ type branchReconcileTarget struct {
 // false when the pass should not start. Each reason it declines is logged
 // separately, because each asks something different of the operator.
 //
-// The pass is a reaper (OW-10): it deletes branches that belong to applies no
-// driver is coming back for, so it runs with the operator and one elected
-// instance runs it per tick.
+// The pass deletes branches that belong to applies no driver is coming back
+// for, so it runs with the operator. Each pod runs it on its own ticker, and
+// the election keeps two pods from running it at once. What makes each delete
+// safe is not the election but the apply target hold the reconcile takes
+// around it (OW-10).
+//
+// The targets are read on every pass rather than here, because a local server
+// can register databases while it runs; a process with none yet still starts
+// the pass so it picks them up.
 func (s *Service) branchReconcilePass() (func(context.Context), bool) {
 	if !s.config.BranchReconcile.Enabled {
 		s.logger.Debug("branch reconcile pass not started because it is disabled; orphaned PlanetScale branches are left until deleted by hand")
@@ -60,16 +66,12 @@ func (s *Service) branchReconcilePass() (func(context.Context), bool) {
 		s.logger.Error("branch reconcile pass not started because its grace period is invalid; orphaned PlanetScale branches are left until the config is fixed", "error", err)
 		return nil, false
 	}
-	targets := s.branchReconcileTargets()
-	if len(targets) == 0 {
-		s.logger.Info("branch reconcile pass not started because no local PlanetScale database targets are configured; the deployment that executes against each database reconciles its branches")
-		return nil, false
-	}
 	deleteOrphans := s.config.BranchReconcile.Delete
 	s.logger.Info("branch reconcile pass enabled",
-		"delete", deleteOrphans, "grace", grace, "interval", BranchReconcileInterval, "targets", len(targets))
+		"delete", deleteOrphans, "grace", grace, "interval", BranchReconcileInterval,
+		"local_planetscale_targets", len(s.branchReconcileTargets()))
 	return func(ctx context.Context) {
-		s.runBranchReconcilePass(ctx, targets, grace, deleteOrphans)
+		s.runBranchReconcilePass(ctx, grace, deleteOrphans)
 	}, true
 }
 
@@ -95,10 +97,16 @@ func (s *Service) branchReconcileTargets() []branchReconcileTarget {
 	return targets
 }
 
-// runBranchReconcilePass reconciles every target on the elected instance. The
-// targets are independent databases, so one that fails is logged and the pass
-// moves on to the next; the failures are joined into the pass's outcome.
-func (s *Service) runBranchReconcilePass(ctx context.Context, targets []branchReconcileTarget, grace time.Duration, deleteOrphans bool) {
+// runBranchReconcilePass reconciles every current target on the elected
+// instance. The targets are independent databases, so one that fails is logged
+// and the pass moves on to the next; the failures are joined into the pass's
+// outcome.
+func (s *Service) runBranchReconcilePass(ctx context.Context, grace time.Duration, deleteOrphans bool) {
+	targets := s.branchReconcileTargets()
+	if len(targets) == 0 {
+		s.logger.Debug("branch reconcile pass skipped: no local PlanetScale database targets; the deployment that executes against each database reconciles its branches")
+		return
+	}
 	deleted := 0
 	err := s.storage.Applies().WithBranchReconcileElection(ctx, func(ctx context.Context) error {
 		var errs []error
@@ -129,9 +137,10 @@ func (s *Service) reconcileTargetBranches(ctx context.Context, target branchReco
 		return 0, fmt.Errorf("reconcile branches of %s/%s: client %T cannot reconcile branches", target.database, target.environment, client)
 	}
 	result, err := reconciler.ReconcileOrphanedBranches(ctx, tern.BranchReconcileOptions{
-		Grace:  grace,
-		Delete: deleteOrphans,
-		Now:    s.clock.Now(),
+		Grace:       grace,
+		Delete:      deleteOrphans,
+		Now:         s.clock.Now(),
+		Environment: target.environment,
 	})
 	if err != nil {
 		logger.Error("branch reconcile on this database was incomplete; branches it could not judge or delete are kept and retried on the next pass",

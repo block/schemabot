@@ -956,9 +956,10 @@ type ApplyStore interface {
 	// WithBranchReconcileElection runs fn on the one instance elected to
 	// reconcile engine branches this pass, under an advisory lock held for as
 	// long as fn runs. ErrBranchReconcileBusy reports that another instance
-	// holds the lock, and fn does not run. The election makes the pass a
-	// reaper: the branches it deletes belong to applies no driver is coming
-	// back for, so a single elected instance acts for all of them.
+	// holds the lock, and fn does not run. The lock is an efficiency gate,
+	// not a safety one: it keeps two instances from listing every branch at
+	// once, while each delete is made safe by the apply target hold the
+	// reconcile takes around it.
 	WithBranchReconcileElection(ctx context.Context, fn func(context.Context) error) error
 
 	// FindMissingSummaryComment returns GitHub-backed applies that recently

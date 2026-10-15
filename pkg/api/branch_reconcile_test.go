@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"sync"
 	"testing"
 	"time"
 
@@ -90,26 +91,30 @@ func TestBranchReconcileTargetsAreLocalPlanetScaleEnvironments(t *testing.T) {
 	}, svc.branchReconcileTargets())
 }
 
-// An elected pass hands each target the configured grace and delete mode and
-// the service clock's time, and a database that fails does not stop the pass
-// from reconciling the next one.
+// An elected pass hands each target the configured grace and delete mode, the
+// service clock's time, and the environment the target is registered under
+// (the reconcile holds that apply target while it deletes), and a database
+// that fails does not stop the pass from reconciling the next one.
 func TestRunBranchReconcilePassReconcilesEveryTargetOnTheElectedInstance(t *testing.T) {
 	reader := reaperMetricReader(t)
-	applies := &electingApplyStore{}
-	svc := newBranchReconcileService(t, BranchReconcileConfig{Enabled: true, Delete: true}, branchReconcileDatabases(), applies)
+	databases := branchReconcileDatabases()
+	databases["catalog"] = DatabaseConfig{
+		Type:         storage.DatabaseTypeVitess,
+		Environments: map[string]EnvironmentConfig{"sandbox": {DSN: "catalog-sandbox-dsn"}},
+	}
+	svc := newBranchReconcileService(t, BranchReconcileConfig{Enabled: true, Delete: true}, databases, &electingApplyStore{})
 	now := time.Date(2026, 10, 14, 12, 0, 0, 0, time.UTC)
 	require.NoError(t, svc.SetClock(clock.NewFake(now)))
 	failing := &reconcilingTernClient{err: errors.New("PlanetScale API unavailable")}
 	healthy := &reconcilingTernClient{result: tern.BranchReconcileResult{Database: "orders", Candidates: 2, Kept: 1, Orphaned: 1, Deleted: 1}}
-	svc.ternClients["catalog/staging"] = failing
+	svc.ternClients["catalog/sandbox"] = failing
 	svc.ternClients["orders/staging"] = healthy
-	targets := []branchReconcileTarget{{database: "catalog", environment: "staging"}, {database: "orders", environment: "staging"}}
 
-	svc.runBranchReconcilePass(t.Context(), targets, 36*time.Hour, true)
+	svc.runBranchReconcilePass(t.Context(), 36*time.Hour, true)
 
-	want := tern.BranchReconcileOptions{Grace: 36 * time.Hour, Delete: true, Now: now}
-	assert.Equal(t, []tern.BranchReconcileOptions{want}, failing.calls)
-	assert.Equal(t, []tern.BranchReconcileOptions{want}, healthy.calls, "a failed database does not stop the pass")
+	assert.Equal(t, []tern.BranchReconcileOptions{{Grace: 36 * time.Hour, Delete: true, Now: now, Environment: "sandbox"}}, failing.calls)
+	assert.Equal(t, []tern.BranchReconcileOptions{{Grace: 36 * time.Hour, Delete: true, Now: now, Environment: "staging"}}, healthy.calls,
+		"a failed database does not stop the pass")
 	assert.Equal(t, []string{"branch_reconcile_error"}, claimFailureReasons(t, reader))
 }
 
@@ -122,32 +127,28 @@ func TestRunBranchReconcilePassDoesNothingWhenAnotherInstanceIsElected(t *testin
 	client := &reconcilingTernClient{}
 	svc.ternClients["orders/staging"] = client
 
-	svc.runBranchReconcilePass(t.Context(), []branchReconcileTarget{{database: "orders", environment: "staging"}}, time.Hour, true)
+	svc.runBranchReconcilePass(t.Context(), time.Hour, true)
 
 	assert.Equal(t, 1, applies.elections)
 	assert.Empty(t, client.calls)
 	assert.Empty(t, claimFailureReasons(t, reader))
 }
 
-// The pass starts only when it is enabled, its grace period is valid, and this
-// process executes against at least one PlanetScale database; the configured
-// delete mode reaches the reconcile.
-func TestBranchReconcilePassStartsOnlyWhenItHasWorkToDo(t *testing.T) {
-	onlyMySQL := map[string]DatabaseConfig{"payments": branchReconcileDatabases()["payments"]}
+// The pass starts whenever it is enabled with a valid grace period, and the
+// configured delete mode and default grace reach the reconcile.
+func TestBranchReconcilePassStartsOnlyWhenEnabledWithAValidGrace(t *testing.T) {
 	tests := []struct {
-		name      string
-		cfg       BranchReconcileConfig
-		databases map[string]DatabaseConfig
-		starts    bool
+		name   string
+		cfg    BranchReconcileConfig
+		starts bool
 	}{
-		{name: "disabled", cfg: BranchReconcileConfig{}, databases: branchReconcileDatabases()},
-		{name: "invalid grace", cfg: BranchReconcileConfig{Enabled: true, Grace: "soon"}, databases: branchReconcileDatabases()},
-		{name: "no local PlanetScale database", cfg: BranchReconcileConfig{Enabled: true}, databases: onlyMySQL},
-		{name: "enabled with a local PlanetScale database", cfg: BranchReconcileConfig{Enabled: true}, databases: branchReconcileDatabases(), starts: true},
+		{name: "disabled", cfg: BranchReconcileConfig{}},
+		{name: "invalid grace", cfg: BranchReconcileConfig{Enabled: true, Grace: "soon"}},
+		{name: "enabled", cfg: BranchReconcileConfig{Enabled: true}, starts: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			svc := newBranchReconcileService(t, tt.cfg, tt.databases, &electingApplyStore{})
+			svc := newBranchReconcileService(t, tt.cfg, branchReconcileDatabases(), &electingApplyStore{})
 			client := &reconcilingTernClient{}
 			svc.ternClients["orders/staging"] = client
 
@@ -162,5 +163,72 @@ func TestBranchReconcilePassStartsOnlyWhenItHasWorkToDo(t *testing.T) {
 			assert.Equal(t, DefaultBranchReconcileGrace, client.calls[0].Grace)
 			assert.False(t, client.calls[0].Delete, "an enabled pass only reports unless delete is set")
 		})
+	}
+}
+
+// A local server can register a PlanetScale database while it runs. The pass
+// reads its targets on every tick, so a server that started with none skips
+// the election until one is registered and then reconciles it.
+func TestBranchReconcilePassPicksUpADatabaseRegisteredAfterStartup(t *testing.T) {
+	onlyMySQL := map[string]DatabaseConfig{"payments": branchReconcileDatabases()["payments"]}
+	applies := &electingApplyStore{}
+	svc := newBranchReconcileService(t, BranchReconcileConfig{Enabled: true}, onlyMySQL, applies)
+	svc.config.EnableLocalRegistration()
+	client := &reconcilingTernClient{}
+	svc.ternClients["orders/staging"] = client
+
+	pass, ok := svc.branchReconcilePass()
+	require.True(t, ok, "an enabled pass starts before any PlanetScale database is registered")
+	pass(t.Context())
+	assert.Zero(t, applies.elections, "with no targets the pass does not contend for the election")
+
+	next := *svc.config
+	next.Databases = map[string]DatabaseConfig{
+		"payments": onlyMySQL["payments"],
+		"orders": {
+			Type:         storage.DatabaseTypeVitess,
+			Environments: map[string]EnvironmentConfig{"staging": {DSN: "orders-staging-dsn"}},
+		},
+	}
+	_, publish, err := svc.config.PrepareLocalRegistration(&next, map[string]map[string]string{"orders": {"staging": "orders-staging-dsn"}})
+	require.NoError(t, err)
+	publish()
+
+	pass(t.Context())
+	require.Len(t, client.calls, 1)
+	assert.Equal(t, "staging", client.calls[0].Environment)
+}
+
+// electionSignallingApplyStore reports each branch reconcile election on a
+// channel and declines it, so a test can see that the pass ran.
+type electionSignallingApplyStore struct {
+	*capturingApplyStore
+	once sync.Once
+	ran  chan struct{}
+}
+
+func (s *electionSignallingApplyStore) WithBranchReconcileElection(context.Context, func(context.Context) error) error {
+	s.once.Do(func() { close(s.ran) })
+	return storage.ErrBranchReconcileBusy
+}
+
+// Starting the operator starts the branch reconcile pass when it is enabled.
+func TestStartOperatorStartsTheBranchReconcilePass(t *testing.T) {
+	store := &electionSignallingApplyStore{capturingApplyStore: &capturingApplyStore{}, ran: make(chan struct{})}
+	svc, _ := newQueueApplyTestService(trustedQueueApplyTestPlan(), &mockTernClient{}, store)
+	svc.config.BranchReconcile = BranchReconcileConfig{Enabled: true}
+	svc.config.Databases["orders"] = DatabaseConfig{
+		Type:         storage.DatabaseTypeVitess,
+		Environments: map[string]EnvironmentConfig{"staging": {DSN: "orders-staging-dsn"}},
+	}
+	require.NoError(t, svc.SetOperatorPollInterval(time.Hour))
+
+	svc.StartOperator(t.Context())
+	defer svc.StopOperator()
+
+	select {
+	case <-store.ran:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the operator never ran the branch reconcile pass")
 	}
 }

@@ -89,17 +89,22 @@ lost its lease part-way through the delete and no driver resumed the apply, or
 PlanetScale refused the delete. No apply names that branch any more, so nothing
 will delete it, and it holds branch quota until someone does.
 
-The branch reconcile pass finds those branches. It runs with the operator, on
-one instance at a time, once an hour, and checks every PlanetScale database
-this server executes against (each environment with a local `dsn`). It
-reclaims a branch only when all of these hold:
+The branch reconcile pass finds those branches. It runs with the operator:
+each server runs it when it starts and then hourly, and an election keeps two
+servers from running it at the same time, so a fleet of N servers runs it up
+to N times an hour. Each run checks every PlanetScale database this server
+executes against (each environment with a local `dsn`), including databases
+registered after the server started. It reclaims a branch only when all of
+these hold:
 
 - its name has the shape SchemaBot gives the branches it creates for that
   database, so the production branch and operator-created branches are never
   touched;
 - it is older than the grace period;
-- no in-progress apply names it, in its stored state or as an
-  operator-supplied branch; the pass reads this again just before each delete;
+- no unsettled apply uses it, stopped applies included: not the branch its
+  stored state names, not one an operator supplied, and not the one its plan
+  would generate. The pass holds the apply target while it reads this a final
+  time and deletes, so no apply can start on that target in between;
 - no open deploy request uses it.
 
 Anything the pass cannot read keeps the branch, and the next pass tries again.
