@@ -888,14 +888,15 @@ check `CutoverBlocker` (`pkg/storage/internal/sqlstore/apply_operations.go`, sha
 `earlierSiblingHoldsCutoverSQL`), applied when a drive takes the request
 (`operationCutoverRequestTurn`, `pkg/tern/cutover_barrier.go`) and at request intake
 (`cutoverTurnForRequest`, `pkg/api/control_handlers.go`); and the rollout state derivation
-(`DeriveRolloutApplyState`, `deriveStoppedRollout`, `hasStartedUnsettledWork` and `childHoldsItsTarget`,
+(`DeriveRolloutApplyState`, `deriveCancelledRollout`, `deriveStoppedRollout`, `hasStartedUnsettledWork` and `childHoldsItsTarget`,
 `pkg/state/apply.go`), fed by `RolloutChildren` (`pkg/state/rollout.go`, whose
 `stepOrphanedByEarlierStep` marks work held behind a table that settled without completing, read through `StepRowCanNeverPass`), through which every
 projection builds its children, with `RolloutHeldByResumableChild` (`pkg/state/apply.go`), which
 `updateApplyStateFromOperations` consults to keep a held-open rollout's recovery claim quiet, and
 `completeLandedStopForHeldOpenApply` keeping its stop resolved (`pkg/api/operator.go`), and
-`supersedePendingStartForStop` completing a rollout's pending start when a stop is recorded
-(`pkg/api/control_handlers.go`).
+`stopSupersedesPendingStart` completing a rollout's pending start in the same write that records a stop
+(`pkg/api/control_handlers.go`, through `RequestPendingSuperseding` in
+`pkg/storage/internal/sqlstore/control_requests.go`).
 
 ## Ownership and leases (OW)
 

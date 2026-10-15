@@ -386,6 +386,11 @@ func DeriveRolloutApplyState(children []RolloutChild) string {
 // once every child that started has settled. Until then it reports the state of
 // the work still under way, so the pending cancel stays deliverable to that work
 // and the parent never reads cancelled over a target that is still changing.
+//
+// A cancel can follow a stop that has not landed everywhere, leaving a stopped
+// child beside one still copying. That work under way is read the way a
+// stopped rollout reads it, so the parent reports the copy rather than stopped,
+// and the stopped child stays outstanding until the cancel reaches it.
 func deriveCancelledRollout(children []RolloutChild) string {
 	var underWay []string
 	for _, c := range children {
@@ -396,7 +401,11 @@ func deriveCancelledRollout(children []RolloutChild) string {
 	if len(underWay) == 0 {
 		return Apply.Cancelled
 	}
-	return DeriveApplyState(underWay)
+	derived := DeriveApplyState(underWay)
+	if IsState(derived, Apply.Stopped) {
+		return deriveStoppedRollout(children)
+	}
+	return derived
 }
 
 // deriveStoppedRollout projects a rollout in which at least one child is

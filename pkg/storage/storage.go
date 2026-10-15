@@ -1691,6 +1691,12 @@ type ControlRequestStore interface {
 	// returned with alreadyPending=true.
 	RequestPending(ctx context.Context, req *ApplyControlRequest) (*ApplyControlRequest, bool, error)
 
+	// RequestPendingSuperseding records req as RequestPending does and, in the
+	// same transaction, completes the apply's pending request for superseded,
+	// whose effect req replaces. Either both writes land or neither does, so a
+	// failed request leaves the superseded one still deliverable.
+	RequestPendingSuperseding(ctx context.Context, req *ApplyControlRequest, superseded ControlOperation) (*ApplyControlRequest, bool, error)
+
 	// GetPending returns the pending request for an apply operation.
 	GetPending(ctx context.Context, applyID int64, operation ControlOperation) (*ApplyControlRequest, error)
 

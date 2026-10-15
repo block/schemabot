@@ -355,6 +355,36 @@ func TestDeriveRolloutApplyState_CancelWaitsForWorkUnderWay(t *testing.T) {
 	assert.Equal(t, Apply.Cancelled, DeriveRolloutApplyState(RolloutChildren(ops(ApplyOperation.Cancelled, ApplyOperation.Completed, ApplyOperation.Cancelled))))
 }
 
+// TestDeriveRolloutApplyState_CancelAfterAPartialStop verifies a cancel that
+// follows a stop which had not landed everywhere. The stop reached payments-002
+// while payments-001 was still copying `stations`, and the cancel then settled
+// payments-003. The rollout keeps reporting payments-001's copy rather than
+// stopped, and once that copy stops too it reads stopped, so the pending cancel
+// still reopens it to reach both stopped targets.
+func TestDeriveRolloutApplyState_CancelAfterAPartialStop(t *testing.T) {
+	// Every target had started copying before the stop, so a stopped row here
+	// holds partly copied work rather than a stop caught before any claim.
+	started := func(target, opState string) RolloutOperation {
+		op := rolloutStep(target, 1, opState)
+		op.NeverStarted = false
+		return op
+	}
+	ops := func(first, second, third string) []RolloutOperation {
+		return []RolloutOperation{
+			started("payments-001", first),
+			started("payments-002", second),
+			started("payments-003", third),
+		}
+	}
+
+	assert.Equal(t, Apply.Running, DeriveRolloutApplyState(RolloutChildren(ops(ApplyOperation.Running, ApplyOperation.Stopped, ApplyOperation.Cancelled))),
+		"a stopped target must not hide the copy still under way")
+	assert.Equal(t, Apply.WaitingForCutover, DeriveRolloutApplyState(RolloutChildren(ops(ApplyOperation.WaitingForCutover, ApplyOperation.Stopped, ApplyOperation.Cancelled))))
+	assert.Equal(t, Apply.Stopped, DeriveRolloutApplyState(RolloutChildren(ops(ApplyOperation.Stopped, ApplyOperation.Stopped, ApplyOperation.Cancelled))),
+		"stopped targets the cancel has not reached keep the rollout open")
+	assert.Equal(t, Apply.Cancelled, DeriveRolloutApplyState(RolloutChildren(ops(ApplyOperation.Cancelled, ApplyOperation.Cancelled, ApplyOperation.Cancelled))))
+}
+
 // TestDeriveRolloutApplyState_StopWaitsForWorkUnderWay verifies that a rollout
 // reads stopped only once no target is still working. The stop caught
 // payments-002 and payments-003 before they started, so they stopped at once,
