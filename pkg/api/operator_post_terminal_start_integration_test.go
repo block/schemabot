@@ -325,13 +325,14 @@ func TestOperator_StartOnAMultiOperationRolloutSettlesWithTheParent(t *testing.T
 	}
 }
 
-// An operator stops a two-deployment rollout and then starts it again. The
-// first operation claim under the start takes the rollout out of its stop: the
-// driver reports that claim once, after the parent has left stopped in storage,
-// so the PR Check Run republished from storage no longer says the rollout is
-// stopped. The claim of the second operation drives a rollout that is already
-// running and reports nothing.
-func TestOperator_StartOnAStoppedRolloutReportsTheClaimOnce(t *testing.T) {
+// An operator stops a two-deployment rollout and then starts it again. A
+// rolling start drives one deployment at a time, and between the two drives the
+// rollout reads stopped again: one deployment has finished and the other is
+// still stopped. Each claim that takes the rollout out of stopped is reported,
+// after the parent has left stopped in storage, so the PR Check Run republished
+// from storage never keeps saying the rollout is stopped while a deployment
+// runs.
+func TestOperator_StartOnAStoppedRolloutReportsEachClaimOutOfStopped(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping integration test in short mode")
 	}
@@ -380,9 +381,13 @@ func TestOperator_StartOnAStoppedRolloutReportsTheClaimOnce(t *testing.T) {
 	require.Len(t, claimedStates, 1, "the claim that takes the rollout out of its stop is reported")
 	assert.False(t, state.IsState(claimedStates[0], state.Apply.Stopped),
 		"the parent has left stopped in storage by the time the claim is reported, got %s", claimedStates[0])
+	require.Equal(t, state.Apply.Stopped, getApply(t, ctx, stor, seed.applyID).State,
+		"with region-a done and region-b still stopped, the rollout reads stopped between the drives")
 
 	driveNextOperation(t, ctx, svc, 2)
 
 	require.Equal(t, []string{"region-a", "region-b"}, rec.resumeOrder())
-	assert.Len(t, claimedStates, 1, "a claim on a rollout already running again is not reported")
+	require.Len(t, claimedStates, 2, "the claim that takes the rollout out of stopped again is reported too")
+	assert.False(t, state.IsState(claimedStates[1], state.Apply.Stopped),
+		"the parent has left stopped in storage by the time the second claim is reported, got %s", claimedStates[1])
 }
