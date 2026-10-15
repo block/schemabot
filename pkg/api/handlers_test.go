@@ -897,17 +897,20 @@ func hasApplyLogMessageContaining(logs []*storage.ApplyLog, want string) bool {
 
 // mockTernClient implements tern.Client for testing.
 type mockTernClient struct {
-	compareMu    sync.Mutex
-	compareReqs  []*ternv1.CompareSchemaFileChangeRequest
-	compareResp  *ternv1.CompareSchemaFileChangeResponse
-	compareErr   error
-	healthErr    error
-	planResp     *ternv1.PlanResponse
-	planErr      error
-	planReq      *ternv1.PlanRequest
-	planDiffResp *ternv1.PlanDiffResponse
-	planDiffErr  error
-	planDiffReq  *ternv1.PlanRequest
+	compareMu   sync.Mutex
+	compareReqs []*ternv1.CompareSchemaFileChangeRequest
+	// compareDeadlines holds each comparison's context deadline, the zero
+	// time when it had none.
+	compareDeadlines []time.Time
+	compareResp      *ternv1.CompareSchemaFileChangeResponse
+	compareErr       error
+	healthErr        error
+	planResp         *ternv1.PlanResponse
+	planErr          error
+	planReq          *ternv1.PlanRequest
+	planDiffResp     *ternv1.PlanDiffResponse
+	planDiffErr      error
+	planDiffReq      *ternv1.PlanRequest
 	// planDiffMu guards planDiffReq: a rollout plan diffs its members
 	// concurrently, so one client can serve several diffs at once.
 	planDiffMu     sync.Mutex
@@ -986,10 +989,12 @@ func (m *mockTernClient) Plan(ctx context.Context, req *ternv1.PlanRequest) (*te
 	}
 	return nil, m.planErr
 }
-func (m *mockTernClient) CompareSchemaFileChange(_ context.Context, req *ternv1.CompareSchemaFileChangeRequest) (*ternv1.CompareSchemaFileChangeResponse, error) {
+func (m *mockTernClient) CompareSchemaFileChange(ctx context.Context, req *ternv1.CompareSchemaFileChangeRequest) (*ternv1.CompareSchemaFileChangeResponse, error) {
 	m.compareMu.Lock()
 	defer m.compareMu.Unlock()
 	m.compareReqs = append(m.compareReqs, req)
+	deadline, _ := ctx.Deadline()
+	m.compareDeadlines = append(m.compareDeadlines, deadline)
 	if m.compareErr != nil {
 		return nil, m.compareErr
 	}
