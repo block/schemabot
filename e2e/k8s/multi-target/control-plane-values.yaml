@@ -14,6 +14,11 @@ image:
 config:
   storage:
     dsn: "env:MYSQL_DSN"
+  # One driver per target, so every target of a rollout starts together. The
+  # halt scenario needs the target behind the failing one already copying when
+  # that failure lands; with fewer drivers than targets it would queue behind
+  # the failure and never start.
+  max_drivers_per_apply: 3
   databases:
     shardapp:
       type: mysql

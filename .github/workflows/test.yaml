@@ -915,6 +915,10 @@ jobs:
           kubectl logs -n schemabot-e2e-multi-target -l app=etre --tail=100 2>/dev/null || true
           echo "=== ministack ==="
           kubectl logs -n schemabot-e2e-multi-target -l app=ministack --tail=100 2>/dev/null || true
+          echo "=== Seed jobs ==="
+          kubectl logs -n schemabot-e2e-multi-target -l job-name=etre-mongo-init --tail=50 2>/dev/null || true
+          kubectl logs -n schemabot-e2e-multi-target -l job-name=etre-seed --tail=50 2>/dev/null || true
+          kubectl logs -n schemabot-e2e-multi-target -l job-name=ministack-seed --tail=50 2>/dev/null || true
           echo "=== All pods ==="
           kubectl get pods -n schemabot-e2e-multi-target -o wide 2>/dev/null || true
 

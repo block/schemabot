@@ -31,7 +31,7 @@ NAMESPACE="schemabot-e2e-multi-target"
 SHARDS=(001 002 003)
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 
-for cmd in minikube helm docker kubectl go; do
+for cmd in minikube helm docker kubectl go lsof; do
     if ! command -v "$cmd" > /dev/null 2>&1; then
         echo "Error: $cmd is not installed"
         exit 1

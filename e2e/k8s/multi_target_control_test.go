@@ -226,13 +226,18 @@ func TestK8sMultiTarget_DataPlanePodRestartCompletes(t *testing.T) {
 func markAllDataPlaneAppliesStale(t *testing.T) {
 	t.Helper()
 	db := testutil.OpenMySQL(t, storageDSNs(t)[0])
+	settled := strings.TrimSuffix(strings.Repeat("?, ", len(state.SettledApplyStates)), ", ")
+	args := make([]any, len(state.SettledApplyStates))
+	for i, s := range state.SettledApplyStates {
+		args[i] = s
+	}
 	_, err := db.ExecContext(t.Context(),
-		"UPDATE applies SET updated_at = NOW() - INTERVAL 2 MINUTE WHERE state NOT IN ('completed', 'failed', 'cancelled')")
+		"UPDATE applies SET updated_at = NOW() - INTERVAL 2 MINUTE WHERE state NOT IN ("+settled+")", args...)
 	require.NoError(t, err)
 	_, err = db.ExecContext(t.Context(),
 		`UPDATE apply_operations ao JOIN applies a ON ao.apply_id = a.id
 			SET ao.updated_at = NOW() - INTERVAL 2 MINUTE
-			WHERE a.state NOT IN ('completed', 'failed', 'cancelled')`)
+			WHERE a.state NOT IN (`+settled+`)`, args...)
 	require.NoError(t, err)
 }
 
