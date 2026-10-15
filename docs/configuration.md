@@ -1282,6 +1282,41 @@ supports both `mysql` and `postgres`.) See
 [docs/storage-schema.md](storage-schema.md) for how schema
 bootstrapping differs between the two dialects.
 
+### MySQL storage sessions run in UTC
+
+Storage writes UTC timestamps from Go and compares them against the session's
+`NOW()` in lease, lock, and webhook retry predicates, so every session the
+MySQL storage pool opens runs with `time_zone='+00:00'` and the Go MySQL
+driver reads and writes `DATETIME` values as UTC. The storage server's own
+default time zone does not affect SchemaBot, and any `time_zone` the storage
+DSN carries is replaced. Target-database connections are not pinned: their
+timestamps are application data. PostgreSQL storage sessions are pinned the
+same way.
+
+The server's default zone does matter once, on a storage server whose default
+zone is not UTC (`@@GLOBAL.time_zone` other than `+00:00`, or `SYSTEM` on a
+host whose clock is not UTC): a pod from a build that does not pin the session
+stamps lease heartbeats in that zone, while a pod from a build that does
+judges them against a UTC cutoff. Run side by side, the pinned pod reads a
+heartbeat written a moment ago as stale by the zone offset and reclaims the
+apply from its live driver. So when moving between such builds in either
+direction, upgrade or rollback, **stop every old pod before starting a new one**
+rather than rolling them. SchemaBot measures the server's default zone against
+UTC when it connects to storage and logs a warning naming this rule, with the
+offset, whenever the two differ; a server already in UTC (the RDS and Aurora
+default) logs nothing and needs no ordering.
+
+Rows the database stamped before the first pinned pod connected keep the
+reading the old zone gave them: `created_at`, `updated_at`, and
+`completed_at` on existing applies and locks, for example, so history read
+across that point shows a step of the zone offset. Until a row is next
+stamped, anything that measures its age against the clock, from the lease
+staleness window to retention cutoffs, sees it as older by the offset west of
+UTC and younger by the offset east of it. The case that is visible is an
+apply in flight at the restart, whose last heartbeat carries the old reading:
+west of UTC the restarted fleet reclaims it as soon as it starts, east of UTC
+only once the offset has elapsed on top of the staleness window.
+
 ### PostgreSQL storage needs a session-per-connection endpoint
 
 SchemaBot coordinates its instances on PostgreSQL with session-scoped advisory
