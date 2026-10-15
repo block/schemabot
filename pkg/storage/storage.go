@@ -250,6 +250,21 @@ type CheckStore interface {
 	// Returns true when the row was marked successful.
 	MarkStalePlanSuccessful(ctx context.Context, check *Check) (bool, error)
 
+	// BlockStaleStartedApply records that the schema change a started apply
+	// owns is gone from the PR: it moves the row onto headSHA with check's
+	// blocking reason and message, keeping an in-progress row in_progress and
+	// turning a settled one into action_required. check is the row as the
+	// caller read it; its HeadSHA and ApplyID pin that read. The status is
+	// decided from the row as stored at write time, under the same row lock
+	// as the write, so a completion that lands after the caller read the row
+	// is never rewound to in_progress. It writes nothing and returns false
+	// when no started apply owns the row any more, when a different apply
+	// owns it than the caller read, or when the stored head is neither the
+	// head the caller read nor headSHA, because a newer write owns the row.
+	// On a landed write, check.HeadSHA, check.Status, and check.Conclusion
+	// hold the values stored.
+	BlockStaleStartedApply(ctx context.Context, check *Check, headSHA string) (bool, error)
+
 	// ClearAggregateBlock clears the blocking reason on stored aggregate check
 	// state after the PR-level guards re-verified that the blocking condition
 	// no longer applies. The update is conditional on the head SHA and blocking
@@ -261,7 +276,11 @@ type CheckStore interface {
 	// CompleteForApply updates stored check state to a terminal state only if
 	// it still belongs to the given apply and no newer apply exists for the
 	// same PR/environment/database. Returns false when another driver changed
-	// the stored state first.
+	// the stored state first. A row stale cleanup already blocked with
+	// SchemaRemovedAfterApplyStartedBlockingReason keeps its head SHA, reason,
+	// and message, and a successful completion of it lands as action_required.
+	// On a landed write, check holds the head SHA, has_changes, conclusion,
+	// blocking reason, and message stored.
 	CompleteForApply(ctx context.Context, check *Check, apply *Apply) (bool, error)
 
 	// MarkActionRequiredForApply marks stored check state action_required for a

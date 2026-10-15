@@ -255,6 +255,12 @@ const ReviewTimeDeploymentDriftBlockingReason = "review_time_deployment_drift"
 // re-evaluates placement can lift it.
 const NamespacePlacementRefusedBlockingReason = "namespace_placement_refused"
 
+// SchemaRemovedAfterApplyStartedBlockingReason is the stable
+// Check.BlockingReason value for a row whose schema change left the PR after
+// an apply started. CompleteForApply keeps a row carrying this reason blocked,
+// so an apply finishing after stale cleanup recorded it cannot write it away.
+const SchemaRemovedAfterApplyStartedBlockingReason = "schema_removed_after_apply_started"
+
 type Check struct {
 	// ID is the unique identifier (BIGINT AUTO_INCREMENT).
 	ID int64
