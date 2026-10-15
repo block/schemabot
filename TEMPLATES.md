@@ -4490,11 +4490,11 @@ schemabot apply -e staging
 @mona is not authorized to run `schemabot apply` for this database.
 
 **Operators of `orders`** — members of these teams, or these users, can run it:
-- `acme/orders-operators`
+- @acme/orders-operators
 
 **Other authorized teams and users**:
-- `acme/db-admins`
-- `jdoe`
+- @acme/db-admins
+- @jdoe
 
 Ask one of them to run it, or request membership in one of the teams above.
 <!-- schemabot:offer-support-channel -->
