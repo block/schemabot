@@ -135,6 +135,22 @@ func TestEngineCompareSchemaFileChange(t *testing.T) {
 			wantReason:   "the base changed index orders_total_idx since the approved commit, and the head replaces it with another version",
 		},
 		{
+			name:         "unnamed checks the PR and the default branch both add, which PostgreSQL names by position",
+			approvedBase: orders("id bigint PRIMARY KEY, total bigint"),
+			approved:     orders("id bigint PRIMARY KEY, total bigint, CHECK (total > 0)"),
+			headBase:     orders("id bigint PRIMARY KEY, total bigint, CHECK (total < 1000000)"),
+			head:         orders("id bigint PRIMARY KEY, total bigint, CHECK (total < 1000000), CHECK (total > 0)"),
+			wantReason:   "table orders: the approved commit generates",
+		},
+		{
+			name:         "a head that reorders two columns the PR changed",
+			approvedBase: orders("id bigint PRIMARY KEY, x integer, y integer"),
+			approved:     orders("id bigint PRIMARY KEY, x bigint, y bigint"),
+			headBase:     orders("id bigint PRIMARY KEY, x integer, y integer, note text"),
+			head:         orders("id bigint PRIMARY KEY, y bigint, x bigint, note text"),
+			wantReason:   "table orders: the approved commit generates",
+		},
+		{
 			name:         "a file that declares another table at the head",
 			approvedBase: orders("id bigint PRIMARY KEY"),
 			approved:     orders("id bigint PRIMARY KEY, note text"),

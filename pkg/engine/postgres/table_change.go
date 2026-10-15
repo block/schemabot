@@ -41,8 +41,12 @@ const comparisonSchema = "public"
 //     transaction that is always rolled back (schemadiff.IntrospectDesired),
 //     so nothing persists.
 //
-// Column order is not compared: PostgreSQL appends every added column, and
-// pg-sprite does not manage attribute order.
+// Column order gets no check of its own, as it does on MySQL: PostgreSQL
+// appends every added column, and pg-sprite does not manage attribute order.
+// The statements still list changes in the order the file declares them,
+// and that order can matter (it is the order added columns land in), so a
+// head that reorders columns the pull request changed generates a
+// different change and keeps no approval.
 //
 // Each file must declare one table, the same one at all four commits, and no
 // row security. A file that does not, or that the target cannot run, is an
