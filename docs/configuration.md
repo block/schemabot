@@ -21,6 +21,7 @@
 - [Postgres](#postgres)
 - [Target TLS Posture](#target-tls-posture)
 - [PlanetScale Service Token](#planetscale-service-token)
+- [Branch Reconcile](#branch-reconcile)
 - [PlanetScale mTLS](#planetscale-mtls)
 - [Storage Schema Changes](#storage-schema-changes)
 - [Support Channel](#support-channel)
@@ -1568,6 +1569,22 @@ silently never consulted.
 The Vitess engine calls the PlanetScale API with a service token. The
 permissions it needs, and the ones it does not, are listed in
 [Vitess on PlanetScale](vitess.md#service-token-permissions).
+
+## Branch Reconcile
+
+The `branch_reconcile` block turns on a background pass that reclaims
+PlanetScale branches SchemaBot created and no apply will resume or delete. It
+is off by default, and when enabled it only logs what it would delete until
+`delete: true` is set. See
+[Reclaiming orphaned branches](vitess.md#reclaiming-orphaned-branches) for
+what the pass checks before it deletes a branch.
+
+```yaml
+branch_reconcile:
+  enabled: true   # default: false
+  delete: false   # default: false — log the orphaned branches instead of deleting them
+  grace: 24h      # default: 24h
+```
 
 ## PlanetScale mTLS
 

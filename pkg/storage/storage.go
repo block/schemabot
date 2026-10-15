@@ -953,6 +953,15 @@ type ApplyStore interface {
 	// concurrent passes would be correct but would each pay the full scan.
 	ExpireRetryable(ctx context.Context, limit int) ([]*RetryableApplyExpiration, error)
 
+	// WithBranchReconcileElection runs fn on the one instance elected to
+	// reconcile engine branches this pass, under an advisory lock held for as
+	// long as fn runs. ErrBranchReconcileBusy reports that another instance
+	// holds the lock, and fn does not run. The lock is an efficiency gate,
+	// not a safety one: it keeps two instances from listing every branch at
+	// once, while each delete is made safe by the apply target hold the
+	// reconcile takes around it.
+	WithBranchReconcileElection(ctx context.Context, fn func(context.Context) error) error
+
 	// FindMissingSummaryComment returns GitHub-backed applies that recently
 	// reached a terminal state (including stopped, judged by updated_at since a
 	// resumable stop keeps completed_at NULL) but whose progress comment was
@@ -1034,6 +1043,11 @@ const (
 // expiry lock, so this pass did no work. It is an expected outcome on every
 // instance but one, not a failure.
 var ErrRetryableExpiryBusy = errors.New("another instance is expiring retryable applies")
+
+// ErrBranchReconcileBusy reports that another instance holds the branch
+// reconcile lock, so this pass did no work. It is an expected outcome on every
+// instance but one, not a failure.
+var ErrBranchReconcileBusy = errors.New("another instance is reconciling engine branches")
 
 // RetryableApplyExpiration is a failed_retryable apply that was made permanent
 // because operator recovery should no longer retry it automatically.

@@ -212,6 +212,11 @@ type ServerConfig struct {
 	// forever.
 	PendingDrops PendingDropsConfig `yaml:"pending_drops,omitempty"`
 
+	// BranchReconcile configures the reaper pass that finds PlanetScale
+	// branches SchemaBot created and no apply will resume or delete, and
+	// reclaims them. It is off by default.
+	BranchReconcile BranchReconcileConfig `yaml:"branch_reconcile,omitempty"`
+
 	// Spirit overrides the Spirit engine's default run settings for every
 	// MySQL database this server drives directly. Unset fields keep the
 	// engine defaults (see pkg/engine/spirit), so the block is only needed
@@ -348,6 +353,41 @@ type PendingDropsConfig struct {
 	// DryRun makes the cleaner log the tables it would drop without dropping
 	// them. The quarantine itself is unaffected.
 	DryRun bool `yaml:"dry_run,omitempty"`
+}
+
+// BranchReconcileConfig configures the branch reconcile pass for the
+// PlanetScale databases this process executes against.
+type BranchReconcileConfig struct {
+	// Enabled starts the pass with the operator. Defaults to false.
+	Enabled bool `yaml:"enabled,omitempty"`
+
+	// Delete deletes the orphaned branches the pass finds. Defaults to false,
+	// so an enabled pass only logs the branches it would delete.
+	Delete bool `yaml:"delete,omitempty"`
+
+	// Grace is how old a branch must be before the pass judges it, as a Go
+	// duration string (e.g. "24h"). Defaults to 24 hours.
+	Grace string `yaml:"grace,omitempty"`
+}
+
+// DefaultBranchReconcileGrace is the branch age the reconcile pass waits for
+// when branch_reconcile.grace is not set.
+const DefaultBranchReconcileGrace = 24 * time.Hour
+
+// BranchReconcileGrace returns the configured grace period for the branch
+// reconcile pass, or DefaultBranchReconcileGrace when it is not set.
+func (c *ServerConfig) BranchReconcileGrace() (time.Duration, error) {
+	if c.BranchReconcile.Grace == "" {
+		return DefaultBranchReconcileGrace, nil
+	}
+	d, err := time.ParseDuration(c.BranchReconcile.Grace)
+	if err != nil {
+		return 0, fmt.Errorf("parse branch_reconcile.grace %q: %w", c.BranchReconcile.Grace, err)
+	}
+	if d <= 0 {
+		return 0, fmt.Errorf("branch_reconcile.grace must be positive, got %q", c.BranchReconcile.Grace)
+	}
+	return d, nil
 }
 
 // SupportChannelConfig configures an optional support destination shown in
@@ -2346,6 +2386,11 @@ func (c *ServerConfig) Validate() error {
 	}
 	if c.PendingDropsEnabled() {
 		if _, err := c.PendingDropsRetention(); err != nil {
+			return err
+		}
+	}
+	if c.BranchReconcile.Enabled {
+		if _, err := c.BranchReconcileGrace(); err != nil {
 			return err
 		}
 	}
