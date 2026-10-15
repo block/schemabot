@@ -1392,12 +1392,13 @@ type ApplyOperation struct {
 	// and advances only when a driver re-claims the row as a deliberate retry —
 	// the operation is failed_retryable and so is its parent apply. It does not
 	// advance on a crash-recovery re-lease (a still-active parent with a stale
-	// heartbeat, or an in-flight drive whose driver died), so an orphaned
-	// dispatch's idempotency key stays stable and is reused rather than
-	// duplicated. It is the operation-local counterpart to applies.attempt: a
-	// sibling operation's retry advances the shared parent attempt but never this
-	// row's, so an operation-scoped dispatch generation rotates only on its own
-	// retry.
+	// heartbeat, or an in-flight drive whose driver died), so the
+	// count records only retries. It is the operation-local counterpart to
+	// applies.attempt: a sibling operation's retry advances the shared parent
+	// attempt but never this row's. It is a record for triage, not a dispatch
+	// generation: the operation-scoped idempotency key ignores it, so every
+	// dispatch of a deployment, retries included, carries the same key and
+	// lands on the deployment's one remote apply (OW-5).
 	Attempt int
 
 	// AlreadyConverged is true for an operation recorded completed when its

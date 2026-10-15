@@ -2079,8 +2079,12 @@ func remoteApplyIdempotencyKey(apply *storage.Apply, scope applyTaskScope) strin
 	}
 	if scope.usesOperationRemoteResume() {
 		// The generation stays "0" so every dispatch of the deployment, retries
-		// included, hashes to the key its first dispatch carried, including
-		// one sent by an earlier build that is still in flight.
+		// included, hashes to the key its first dispatch carried, including a
+		// first dispatch an earlier build sent that is still in flight. An
+		// earlier build's retries hashed the operation's attempt and key, which
+		// this key never reproduces, so a retry such a build sent but never
+		// recorded is not recovered here: upgrade from those builds while no
+		// rollout operation is failed_retryable.
 		parts = append(parts, "deployment", scope.operation.Deployment, "0")
 	} else {
 		parts = append(parts, "whole", strconv.Itoa(apply.Attempt))
