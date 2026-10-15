@@ -784,6 +784,102 @@ func TestPollForCompletionAtomic_OutcomeSideEffectsWaitForTheStoredOutcome(t *te
 	}
 }
 
+// lostReplyDerivedStateApplyStore commits the rollout projection's state write
+// and then reports err, modelling a grouped drive's settled-state write whose
+// acknowledgement was lost when the connection dropped.
+type lostReplyDerivedStateApplyStore struct {
+	*snapshotApplyStore
+	err error
+}
+
+func (s *lostReplyDerivedStateApplyStore) UpdateDerivedState(ctx context.Context, id int64, expectedState, newState, errorMessage string, startedAt, completedAt *time.Time) (bool, error) {
+	if _, err := s.snapshotApplyStore.UpdateDerivedState(ctx, id, expectedState, newState, errorMessage, startedAt, completedAt); err != nil {
+		return false, err
+	}
+	return false, s.err
+}
+
+// CheckLease accepts the lease the stored apply carries, so the drive's
+// settlement writes run under it once the outcome is stored.
+func (s *lostReplyDerivedStateApplyStore) CheckLease(_ context.Context, lease storage.ApplyLease) error {
+	if s.stored.LeaseToken != lease.Token {
+		return storage.ErrApplyLeaseLost
+	}
+	return nil
+}
+
+// A grouped apply over two shards finishes while an operator's revert is
+// pending, and the write recording it completed commits but its reply is lost,
+// so the drive sees an error. When storage holds the apply completed under this
+// drive's lease, the write landed: the same drive settles the revert the
+// outcome moots, posts the terminal summary, and releases the active-apply
+// gauge, rather than leaving all of it for the next restart's reconciliation.
+// When the completed row carries another lease's token, nothing proves the
+// write was this drive's (OW-2): the drive exits with the write error, the
+// revert stays pending, no summary posts, and the gauge is left alone.
+func TestPollForCompletionAtomic_SettledWriteWithALostReplyIsAdoptedOnlyUnderThisLease(t *testing.T) {
+	writeErr := errors.New("connection reset by peer")
+	cases := []struct {
+		name              string
+		storedToken       string
+		wantRevertStatus  storage.ControlRequestStatus
+		wantTerminalCalls int
+		wantGaugeDelta    int64
+	}{
+		{
+			name:              "completed under this drive's lease",
+			storedToken:       "tok-a",
+			wantRevertStatus:  storage.ControlRequestCompleted,
+			wantTerminalCalls: 1,
+			wantGaugeDelta:    -1,
+		},
+		{
+			name:              "completed under another lease",
+			storedToken:       "tok-b",
+			wantRevertStatus:  storage.ControlRequestPending,
+			wantTerminalCalls: 0,
+			wantGaugeDelta:    0,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			reader := newTernMetricsReader(t)
+			eng := &lostWorkEngine{phaseSequenceEngine: phaseSequenceEngine{results: []*engine.ProgressResult{
+				{State: engine.StateCompleted},
+			}}}
+			client, apply, tasks, _ := lostWorkAtomicPollFixture(eng, lostWorkTrustBudgetAmple)
+			store := client.storage.(*exactProgressStorage)
+			snapshot, ok := store.applies.(*snapshotApplyStore)
+			require.True(t, ok)
+			snapshot.stored.LeaseToken = tc.storedToken
+			apply.LeaseToken = "tok-a"
+			store.applies = &lostReplyDerivedStateApplyStore{snapshotApplyStore: snapshot, err: writeErr}
+			controlRequests := pendingControlRequestStore(apply.ID, storage.ControlOperationRevert)
+			store.controlRequests = controlRequests
+			observer := &terminalRecordingObserver{}
+			client.SetObserver(apply.ID, observer)
+			ctx := storage.WithApplyLease(t.Context(), storage.ApplyLease{ApplyID: apply.ID, Owner: "driver-a", Token: "tok-a"})
+
+			pollErr := client.pollForCompletionAtomic(ctx, apply, tasks, nil, nil, map[string]string{}, false)
+
+			assert.Equal(t, state.Apply.Completed, snapshot.stored.State, "the write committed either way")
+			if tc.wantTerminalCalls > 0 {
+				require.NoError(t, pollErr)
+				assert.Equal(t, state.Apply.Completed, apply.State, "the drive adopts the outcome storage holds")
+			} else {
+				require.ErrorIs(t, pollErr, writeErr)
+			}
+			require.Len(t, controlRequests.requests, 1)
+			assert.Equal(t, tc.wantRevertStatus, controlRequests.requests[0].Status)
+			require.Len(t, observer.terminal, tc.wantTerminalCalls)
+			if tc.wantTerminalCalls > 0 {
+				assert.Equal(t, state.Apply.Completed, observer.terminal[0].State)
+			}
+			assert.Equal(t, tc.wantGaugeDelta, activeAppliesDelta(t, reader))
+		})
+	}
+}
+
 // driveCancellingApplyStore serves reads from the wrapped snapshot store and
 // cancels the drive when the rollout projection's state write is attempted,
 // failing the write the way a storage driver does once its context is gone.
@@ -1422,7 +1518,7 @@ func TestFailApplyAndNotify_AFailureThisDriveCannotProveIsNotLanded(t *testing.T
 // is not landed even when it already carries this drive's token and an equal
 // message; a lease held for a different apply proves nothing about this one;
 // and a re-read that fails proves nothing at all.
-func TestFailureWriteLanded_ProvesTheWriteOnlyFromAFailedRowUnderThisLease(t *testing.T) {
+func TestOutcomeWriteLanded_ProvesTheWriteOnlyFromAFailedRowUnderThisLease(t *testing.T) {
 	const failure = "engine lost its connection to the target"
 	writeErr := errors.New("connection reset by peer")
 	cases := []struct {
@@ -1454,7 +1550,7 @@ func TestFailureWriteLanded_ProvesTheWriteOnlyFromAFailedRowUnderThisLease(t *te
 			}
 			ctx := storage.WithApplyLease(t.Context(), lease)
 
-			landed, got := client.failureWriteLanded(ctx, stored, failure, writeErr)
+			landed, got := client.outcomeWriteLanded(ctx, stored, state.Apply.Failed, failure, writeErr)
 
 			assert.Equal(t, tc.landed, landed)
 			if tc.landed {
