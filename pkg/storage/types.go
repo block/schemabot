@@ -2080,6 +2080,16 @@ type ApplyComment struct {
 	// empty: the comment still predates whatever phase the apply is in now.
 	PostedPhase *string
 
+	// PostedCutoverOperationID records which rollout member's cutover a
+	// progress comment posted at or past a deferred cutover tracks: the
+	// operation the apply's cutover request was bound to at post time. A
+	// cutover request is apply-level and is re-bound to each member in turn,
+	// so the phase alone cannot tell one member's cutover from the next; a
+	// request bound to a different member than the tracked comment records is
+	// a cutover the comment does not track yet. Nil when the comment tracks no
+	// member's cutover, including an apply whose cutover request names none.
+	PostedCutoverOperationID *int64
+
 	// PendingFreezeCommentID records the GitHub comment ID of a progress
 	// comment this row's comment superseded whose frozen rendering has not yet
 	// landed on GitHub. It is written in the same upsert that tracks the

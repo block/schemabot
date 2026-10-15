@@ -1308,19 +1308,22 @@ did, rather than at an older comment somewhere up the page that may or may not h
 since.
 
 The signal that a rotation is due is durable rather than in-memory. Every tracked progress comment
-records the phase the apply was in when it was posted, so a comment recording an earlier phase is
-known to predate the current one, and a fresh observer on a later drive claim reaches the same
-conclusion the previous one did. Each recorded phase rotates at most once.
+records the phase the apply was in when it was posted, and which rollout member's cutover it
+tracks, so a comment recording an earlier phase or an earlier member's cutover is known to predate
+the current one, and a fresh observer on a later drive claim reaches the same conclusion the
+previous one did. Each recorded signal rotates at most once.
 
 Because rotation exists to surface a command, it is gated on a command having been issued.
 Reverting has no other way in, so entering it always rotates. Skipping-revert does have another
 way in: the revert window can expire on its own, and an apply can be submitted with skip-revert
 chosen upfront. Neither is a command whose effect anyone is waiting to see, so that phase rotates
 only when a durable skip-revert control request exists for the apply, and otherwise the comment
-transitions in place. Operations that resolve straight to a terminal state, cancel among them, do
+transitions in place. Cutting over likewise happens on its own unless the apply deferred its
+cutover, so the phases past the cutover gate rotate only for an apply that deferred it and carries a
+durable cutover control request, once for each member that request is bound to in turn. Operations that resolve straight to a terminal state, cancel among them, do
 not rotate at all, because the terminal summary already lands at the bottom. The phase is derived
 from engine-agnostic apply state, so every engine gets the same PR timeline. *Enforced:* the phase
-recorded on the tracked comment row and the rotation predicates
+and rollout member recorded on the tracked comment row and the rotation predicates
 (`pkg/webhook/comment_observer.go`).
 
 ### UX-2: Acknowledgment means a deployment is acting, not that a packet arrived
