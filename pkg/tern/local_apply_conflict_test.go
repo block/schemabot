@@ -609,6 +609,48 @@ func TestConflictCheckStampsOwnProcessTerminalReport(t *testing.T) {
 	assert.NotNil(t, running.CompletedAt)
 }
 
+// An own-process failure report settles a stale task the way the drive would
+// have: a failure the engine marks retryable rests as failed_retryable with the
+// engine's reason and no completion stamp, so the retry budget still owns it and
+// the task keeps holding the database; a non-retryable failure ends as failed
+// with the same reason and admits the new apply.
+func TestConflictCheckSettlesOwnProcessFailureReportLikeTheDrive(t *testing.T) {
+	for name, tc := range map[string]struct {
+		retryable bool
+		wantState string
+		admits    bool
+	}{
+		"retryable failure":     {retryable: true, wantState: state.Task.FailedRetryable, admits: false},
+		"non-retryable failure": {retryable: false, wantState: state.Task.Failed, admits: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			running := &storage.Task{
+				ID: 15, ApplyID: 151, TaskIdentifier: "task-own-lease", Database: "testdb",
+				DatabaseType: storage.DatabaseTypeMySQL, TableName: "users", State: state.Task.Running,
+			}
+			client := newNoActiveChangeClient("testdb", []*storage.Task{running})
+			client.storage.(*exactProgressStorage).applies = &mockApplyStore{apply: staleLeaseApply(151, storage.LeaseOwnerProcess()+"/driver-0")}
+			client.spiritEngine = &fakeControlEngine{progressResult: &engine.ProgressResult{
+				State: engine.StateFailed, Message: "Failed", ErrorMessage: "lost connection to the target during the copy",
+				Retryable: tc.retryable,
+			}}
+
+			plan := &storage.Plan{Database: "testdb", DatabaseType: storage.DatabaseTypeMySQL}
+			_, _, err := client.checkActiveTaskConflict(t.Context(), plan, "", "", 0)
+			if tc.admits {
+				require.NoError(t, err, "a permanent failure ends the task and admits the new apply")
+				assert.NotNil(t, running.CompletedAt, "a permanent failure is stamped complete")
+			} else {
+				require.Error(t, err, "a retryable failure keeps holding the database until its retry settles it")
+				assert.Contains(t, err.Error(), "schema change already in progress")
+				assert.Nil(t, running.CompletedAt, "a retryable failure is not stamped complete")
+			}
+			assert.Equal(t, tc.wantState, running.State)
+			assert.Equal(t, "lost connection to the target during the copy", running.ErrorMessage, "the engine's failure reason must be kept")
+		})
+	}
+}
+
 // A terminal report that names its tables settles a task only when the task's
 // table is among them. This process can have run a later schema change on the
 // same database under its own lease, so an own-process terminal report for a

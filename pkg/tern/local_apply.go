@@ -609,8 +609,10 @@ func (c *LocalClient) pendingDriverRequest(ctx context.Context, apply *storage.A
 
 // tryResolveStaleTask checks the engine to see if a non-terminal task is actually done.
 // If the engine reports a terminal state, or reports no active work for a task that
-// storage believes is in-flight, the task is updated in storage and no longer blocks.
-// Resting tasks (Stopped, FailedRetryable) are left untouched.
+// storage believes is in-flight, the task is updated in storage and no longer blocks;
+// a terminal failure the engine marks retryable is stored as FailedRetryable instead,
+// which keeps blocking like any resting task. Resting tasks (Stopped, FailedRetryable)
+// are left untouched.
 //
 // The engine probe answers from this process's own memory of the work: it
 // reports what this process ran, not the task's actual cross-process state. The
@@ -708,13 +710,30 @@ func (c *LocalClient) tryResolveStaleTask(ctx context.Context, t *storage.Task, 
 		// check retries the settlement cleanly. The write carries the
 		// operation lease absence guard, so a drive that claimed the
 		// operation after the lease was read refuses it the same way.
+		//
+		// The report is settled the way the drive would have settled it: a
+		// failure the engine marks retryable rests as failed_retryable with no
+		// completion stamp, so the retry policy still owns it, and every failure
+		// keeps the engine's reason.
 		previous := *t
-		settledState := engineStateToStorage(result.State)
-		now := time.Now()
-		t.CompletedAt = &now
+		settledState := taskStateFromProgressResult(result)
+		if state.IsTerminalTaskState(settledState) {
+			now := time.Now()
+			t.CompletedAt = &now
+		}
+		if result.State == engine.StateFailed && t.ErrorMessage == "" {
+			t.ErrorMessage = progressFailureMessage(result)
+		}
 		if err := c.persistTaskStateTransition(settlementCtx, t, 0, settledState, ""); err != nil {
 			*t = previous
 			c.logStaleTaskSettlementRefused(t, apply, settledState, err)
+			return false
+		}
+		// A retryable failure rests rather than ends: like any failed_retryable
+		// task, it keeps holding the database until its retry settles it.
+		if !state.IsTerminalTaskState(settledState) {
+			c.logger.Info("conflict check: settled a stale task as a retryable failure; it keeps blocking the database until its retry settles it",
+				append(t.LogAttrs(), "apply_id", apply.ApplyIdentifier, "error_message", t.ErrorMessage)...)
 			return false
 		}
 		return true
