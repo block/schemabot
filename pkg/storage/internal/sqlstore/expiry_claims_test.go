@@ -6,6 +6,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -66,14 +67,15 @@ func testRetryableExpiryLeaseMeanings(t *testing.T, newStore func(*testing.T) *S
 
 		// The redispatch claim rotates a lease onto one operation and spends the
 		// parent's last attempt, so the apply now matches expiry's budget arm
-		// while the drive it just admitted is only starting. The row it holds
-		// still reads failed_retryable: the claim transitions pending and
-		// stopped operations, not this one.
+		// while the drive it just admitted is only starting. The claim moves the
+		// row it holds to running, since its siblings keep the parent
+		// failed_retryable, while every sibling still reads failed_retryable: the
+		// parent's state cannot tell the admitted drive from a settled one.
 		claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "retry-driver")
 		require.NoError(t, err)
 		require.NotNil(t, claimed, "an operation under a parent with budget left must be claimable for redispatch")
-		assert.Equal(t, state.ApplyOperation.FailedRetryable, claimed.State,
-			"a redispatch claim leaves the operation state alone, so state cannot distinguish it from a settled drive")
+		assert.Equal(t, state.ApplyOperation.Running, claimed.State,
+			"a redispatch of one operation of several moves it to running with the lease rotation")
 		assert.Contains(t, opIDs, claimed.ID)
 
 		parent, err := store.Applies().Get(ctx, apply.ID)
@@ -87,7 +89,7 @@ func testRetryableExpiryLeaseMeanings(t *testing.T, newStore func(*testing.T) *S
 		expired, err := store.Applies().ExpireRetryable(ctx, 10)
 		require.NoError(t, err)
 		assert.Empty(t, expired, "the lease of a drive that was just admitted must keep expiry out")
-		assertRetryableTreeIntact(t, ctx, store, apply.ID, opIDs, tasks)
+		assertRetryableTreeIntact(t, ctx, store, apply.ID, opIDs, tasks, claimed.ID)
 	})
 
 	t.Run("a settled drive's leftover lease expires the whole tree", func(t *testing.T) {
@@ -315,8 +317,10 @@ func seedExhaustedRetryableTree(t *testing.T, ctx context.Context, store *Storag
 
 // assertRetryableTreeIntact proves a declined pass wrote nothing at all: a
 // partial settlement is the failure this deferral exists to prevent, and a
-// parent left failed over unsettled children is how it would show.
-func assertRetryableTreeIntact(t *testing.T, ctx context.Context, store *Storage, applyID int64, opIDs []int64, tasks []*storage.Task) {
+// parent left failed over unsettled children is how it would show. Every
+// operation still reads failed_retryable except the ones a redispatch claim
+// moved to running.
+func assertRetryableTreeIntact(t *testing.T, ctx context.Context, store *Storage, applyID int64, opIDs []int64, tasks []*storage.Task, redispatched ...int64) {
 	t.Helper()
 	parent, err := store.Applies().Get(ctx, applyID)
 	require.NoError(t, err)
@@ -327,7 +331,11 @@ func assertRetryableTreeIntact(t *testing.T, ctx context.Context, store *Storage
 		op, err := store.ApplyOperations().Get(ctx, id)
 		require.NoError(t, err)
 		require.NotNil(t, op)
-		assert.Equal(t, state.ApplyOperation.FailedRetryable, op.State)
+		want := state.ApplyOperation.FailedRetryable
+		if slices.Contains(redispatched, id) {
+			want = state.ApplyOperation.Running
+		}
+		assert.Equal(t, want, op.State, "apply_operation %d", id)
 	}
 	assertTaskState(t, store, tasks[0].TaskIdentifier, state.Task.FailedRetryable)
 	assertTaskState(t, store, tasks[1].TaskIdentifier, state.Task.Pending)
