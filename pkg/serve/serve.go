@@ -918,7 +918,11 @@ func openStoragePool(dialect schema.Dialect, dsn string, cfg *api.ServerConfig, 
 			mysqlconn.WithConnectTimeout(connectTimeout),
 			// Stored plans, locks, and applies scan timestamps into time.Time.
 			// This is a storage requirement, including after credential reload.
-			func(cfg *mysql.Config) { cfg.ParseTime = true })
+			func(cfg *mysql.Config) { cfg.ParseTime = true },
+			// Storage compares Go-written UTC timestamps against NOW() in
+			// lease, lock, and webhook retry predicates, so the session's
+			// zone must be UTC whatever the server's system zone is.
+			mysqlconn.WithUTCSession())
 	case schema.DialectPostgres:
 		// The storage pool carries a statement budget of its own so steady-state
 		// storage queries run under a value SchemaBot states rather than

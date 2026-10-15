@@ -173,6 +173,72 @@ func TestBuildCarriesLocalHostingToTheStorageSchemaAdapter(t *testing.T) {
 		"the same request is honored on a normally hosted server")
 }
 
+// A MySQL storage server whose system time zone is west of UTC still agrees
+// with SchemaBot on what time it is: a lock stamped by the database reads back
+// as the current UTC instant, a deferred webhook delivery whose not-before
+// time has passed is claimable, and one still in the future is not. Storage
+// writes UTC timestamps from Go and compares them against the session's NOW(),
+// so the storage pool must run its sessions in UTC.
+func TestConnectStorageMySQLSessionsRunInUTC(t *testing.T) {
+	ctx := t.Context()
+	req := testutil.MySQLContainerRequest("mysql:8.0", "schemabot")
+	req.Cmd = []string{"--default-time-zone=-07:00"}
+	container, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
+		ContainerRequest: req, Started: true,
+	})
+	require.NoError(t, err)
+	testcontainers.CleanupContainer(t, container)
+	dsn, err := testutil.MySQLDSN(ctx, container, "schemabot")
+	require.NoError(t, err)
+
+	cfg := &api.ServerConfig{Storage: api.StorageConfig{DSN: dsn}}
+	db, _, err := connectStorage(ctx, cfg, schema.DialectMySQL, slog.New(slog.DiscardHandler))
+	require.NoError(t, err)
+	t.Cleanup(func() { utils.CloseAndLog(db) })
+	store, err := newStore(schema.DialectMySQL, db)
+	require.NoError(t, err)
+
+	var globalZone, sessionZone string
+	require.NoError(t, db.QueryRowContext(ctx, "SELECT @@GLOBAL.time_zone, @@SESSION.time_zone").Scan(&globalZone, &sessionZone))
+	require.Equal(t, "-07:00", globalZone, "the server must default to a non-UTC zone for this test to mean anything")
+	assert.Equal(t, "+00:00", sessionZone)
+
+	require.NoError(t, store.Locks().Acquire(ctx, &storage.Lock{
+		DatabaseName: "appdb",
+		DatabaseType: storage.DatabaseTypeMySQL,
+		Repository:   "org/repo",
+		PullRequest:  1,
+		Owner:        "org/repo#1",
+	}))
+	lock, err := store.Locks().Get(ctx, "appdb", storage.DatabaseTypeMySQL)
+	require.NoError(t, err)
+	require.NotNil(t, lock)
+	assert.WithinDuration(t, time.Now(), lock.CreatedAt, time.Minute)
+
+	future := time.Now().Add(10 * time.Minute)
+	_, err = store.WebhookEvents().Create(ctx, &storage.WebhookEvent{
+		DeliveryID: "deferred-future", Event: "pull_request", Action: "synchronize",
+		Repository: "org/repo", PullRequest: 1, HeadSHA: "future-head", Payload: []byte(`{}`),
+		RetryAfter: &future,
+	})
+	require.NoError(t, err)
+	claimed, err := store.WebhookEvents().FindNext(ctx, "driver-1", time.Minute)
+	require.NoError(t, err)
+	assert.Nil(t, claimed, "a delivery deferred into the future is not claimable yet")
+
+	past := time.Now().Add(-time.Minute)
+	_, err = store.WebhookEvents().Create(ctx, &storage.WebhookEvent{
+		DeliveryID: "deferred-past", Event: "pull_request", Action: "synchronize",
+		Repository: "org/repo", PullRequest: 2, HeadSHA: "past-head", Payload: []byte(`{}`),
+		RetryAfter: &past,
+	})
+	require.NoError(t, err)
+	claimed, err = store.WebhookEvents().FindNext(ctx, "driver-1", time.Minute)
+	require.NoError(t, err)
+	require.NotNil(t, claimed, "a delivery whose not-before time has passed is claimable")
+	assert.Equal(t, "deferred-past", claimed.DeliveryID)
+}
+
 func TestConnectStorageMySQLReadsPlanTimestamps(t *testing.T) {
 	ctx := t.Context()
 	container, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
