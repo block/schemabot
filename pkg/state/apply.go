@@ -191,7 +191,8 @@ func DeriveApplyState(taskStates []string) string {
 }
 
 // cutoverIsLeastAdvancedActiveWork reports whether a task is cutting over
-// with no sibling in an earlier active phase — queued, copying, or verifying.
+// with no sibling in an earlier active phase — queued, resuming, copying, or
+// verifying.
 // A cutover is the last step of a table's work, so surfacing it at the apply
 // level while earlier work is still active would overstate progress and force
 // the derived state to fall back once that cutover completes; it surfaces
@@ -202,6 +203,7 @@ func cutoverIsLeastAdvancedActiveWork(counts map[string]int) bool {
 	return counts[Apply.CuttingOver] > 0 &&
 		counts[Apply.Pending] == 0 &&
 		counts[Apply.Running] == 0 &&
+		counts[Apply.Resuming] == 0 &&
 		counts[Apply.CatchingUp] == 0 &&
 		counts[Apply.Checksumming] == 0 &&
 		counts[Apply.PostChecksum] == 0
