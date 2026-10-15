@@ -106,6 +106,63 @@ func TestK8sMultiTarget_StopStartMidCopyCompletes(t *testing.T) {
 	}
 }
 
+// Shard 1 is still copying orders while shard 2 has finished its copy and holds
+// at the cutover barrier for it. A stop reaches every target: the copying one,
+// the parked one, and shard 3 wherever it is. The apply reports stopped, and a
+// start resumes every target through the barrier to completion.
+func TestK8sMultiTarget_StopWithTargetsParkedAtBarrierThenStartCompletes(t *testing.T) {
+	ep := testutil.Endpoint(t)
+	dsns := shardDSNs(t, mtShardApp)
+	resetSchema(t, dsns)
+	cleanupRolloutState(t)
+	execOn(t, dsns, mtUsersV1, mtOrdersV1)
+	seedOrders(t, dsns[:1], 3*mtCopyRows)
+	seedOrders(t, dsns[1:], 1_000)
+
+	plan := planRollout(t, ep, mtShardApp, shardFiles(mtShardApp, map[string]string{"users": mtUsersV2, "orders": mtOrdersV2}))
+	applyID := applyRollout(t, ep, plan.PlanID, nil)
+
+	var parked *apitypes.ProgressResponse
+	testutil.Poll(t, 2*time.Minute, testutil.PollInterval,
+		func() bool {
+			p, err := testutil.FetchProgress(ep, applyID)
+			if err != nil {
+				return false
+			}
+			parked = p
+			require.False(t, state.IsTerminalApplyState(p.State), "apply finished before shard 2 was observed parked:\n%s", describeProgress(p))
+			ops := operationsByStep(p)[1]
+			return operationStateOn(ops, mtTargets[0]) == state.ApplyOperation.Running &&
+				operationStateOn(ops, mtTargets[1]) == state.ApplyOperation.WaitingForCutover
+		},
+		func() string { return "shard 2 never parked while shard 1 copied:\n" + describeProgress(parked) },
+	)
+	t.Log("parked:\n" + describeProgress(parked))
+
+	stop, err := client.CallStopAPI(ep, mtEnvironment, applyID)
+	require.NoError(t, err, "stop")
+	require.True(t, stop.Accepted, "stop not accepted: %s", stop.ErrorMessage)
+	p := waitForStates(t, ep, applyID, 2*time.Minute, state.Apply.Stopped)
+	t.Log("after stop:\n" + describeProgress(p))
+	for _, op := range operationsByStep(p)[1] {
+		assert.Equal(t, state.ApplyOperation.Stopped, state.NormalizeState(op.State), "orders on %s is stopped", op.Target)
+	}
+	for i, dsn := range dsns {
+		assert.False(t, indexOn(t, dsn, "orders", "idx_user_id"), "no target cut over while stopped: %s", mtTargets[i])
+	}
+
+	start, err := client.CallStartAPI(ep, mtEnvironment, applyID)
+	require.NoError(t, err, "start")
+	require.True(t, start.Accepted, "start not accepted: %s %s", start.ErrorCode, start.ErrorMessage)
+
+	p = requireCompleted(t, ep, applyID)
+	t.Log("after start:\n" + describeProgress(p))
+	for i, dsn := range dsns {
+		assert.True(t, indexOn(t, dsn, "orders", "idx_user_id"), "orders.idx_user_id on %s", mtTargets[i])
+		assert.True(t, testutil.ColumnExists(t, dsn, "users", "email"), "users.email on %s", mtTargets[i])
+	}
+}
+
 // A cancel lands while orders is copying. The apply ends cancelled, no target
 // starts the next table, and no shard keeps a shadow copy of orders.
 func TestK8sMultiTarget_CancelMidCopyStopsRollout(t *testing.T) {
