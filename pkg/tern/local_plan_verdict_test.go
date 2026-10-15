@@ -282,6 +282,43 @@ func TestDispatchScopeCarriesReplannedUnsafeVerdict(t *testing.T) {
 	}
 }
 
+// A locally planned keyspace whose shards diverge keeps each shard's own
+// changes on its shard row, while the namespace-level tables list each table
+// once with the first shard's text and verdict. A dispatch scoped to the shard
+// that drops a column must be matched to that shard's row, so its task rows
+// carry the unsafe verdict only that row holds and the unsafe-change admission
+// gate refuses the apply without the opt-in, while the sibling shard's dispatch
+// of a safe add stays safe.
+func TestDispatchScopeCarriesDivergentShardUnsafeVerdict(t *testing.T) {
+	c := newPlanMaterializeClient(&fakePlanStore{})
+	namespaces, shards := c.namespacesFromEngineChanges([]engine.SchemaChange{
+		{Namespace: "testapp", Shard: engine.Shard{Name: "-80"}, TableChanges: []engine.TableChange{
+			{Table: "users", Operation: ddl.StatementAlterTable, DDL: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)"},
+		}},
+		{Namespace: "testapp", Shard: engine.Shard{Name: "80-"}, TableChanges: []engine.TableChange{
+			{Table: "users", Operation: ddl.StatementAlterTable, DDL: "ALTER TABLE `users` DROP COLUMN `legacy_id`",
+				IsUnsafe: true, UnsafeReason: dropLegacyIDReason},
+		}},
+	}, nil)
+	require.Len(t, namespaces["testapp"].Tables, 1, "the namespace-level copy is deduped by table name")
+	assert.False(t, namespaces["testapp"].Tables[0].IsUnsafe, "and the surviving copy is the safe add")
+	plan := &storage.Plan{PlanIdentifier: "plan-divergent", Namespaces: namespaces, Shards: shards}
+
+	dropScope, err := c.dispatchScopeForApply(plan, dropUsersLegacyIDDispatch(plan.PlanIdentifier, "80-"))
+	require.NoError(t, err)
+	require.Len(t, dropScope.ddlChanges, 1)
+	assert.True(t, dropScope.ddlChanges[0].IsUnsafe, "the task rows carry the dropping shard's verdict")
+	assert.Equal(t, dropLegacyIDReason, dropScope.ddlChanges[0].UnsafeReason)
+	require.EqualError(t, rejectUnsafeDDLChangesWithoutOptIn(plan.PlanIdentifier, dropScope.ddlChanges, storage.ApplyOptions{}),
+		`stored plan plan-divergent contains unsafe change for table "users": `+dropLegacyIDReason+`; retry with allow_unsafe=true`)
+
+	addScope, err := c.dispatchScopeForApply(plan, alterUsersEmailDispatch(plan.PlanIdentifier, "-80"))
+	require.NoError(t, err)
+	require.Len(t, addScope.ddlChanges, 1)
+	assert.False(t, addScope.ddlChanges[0].IsUnsafe, "the adding shard's dispatch stays safe")
+	require.NoError(t, rejectUnsafeDDLChangesWithoutOptIn(plan.PlanIdentifier, addScope.ddlChanges, storage.ApplyOptions{}))
+}
+
 // The re-plan's unsafe verdict only ever tightens a change: an unsafe re-plan
 // marks a safe change unsafe, and a safe re-plan leaves a change already
 // marked unsafe, and its reason, as they were.

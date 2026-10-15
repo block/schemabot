@@ -326,11 +326,13 @@ func (c *LocalClient) stampReplannedChanges(namespaces map[string]*storage.Names
 // dispatched change is matched to its counterpart in the plan row under the
 // drift key — the same equivalence the drift comparison admitted it on — and
 // takes the counterpart's statement and execution-mode verdict, and its unsafe
-// flag where the counterpart is marked unsafe. A change with
-// no counterpart keeps the dispatched statement: the plan row was materialized
-// by a sibling dispatch of the same plan and holds only that dispatch's
-// changes, or was planned locally and holds its sharded changes per shard, and
-// in both the dispatched text is this deployment's own. The substitution never
+// flag where the counterpart is marked unsafe. The counterparts come from the
+// dispatched shard's own plan row where the plan judged a namespace per shard
+// (see shardDispatchCounterparts), so a shard whose changes diverge from its
+// siblings' is matched to its own text and verdict. A change with no
+// counterpart keeps the dispatched statement: the plan row was materialized by
+// a sibling dispatch of the same plan and holds only that dispatch's changes,
+// and the dispatched text is this deployment's own. The substitution never
 // widens what runs — an unmatched change runs exactly the reviewed text — and
 // the operation key a shard-scoped dispatch is stamped with names the
 // namespace, shard and table only, so the control plane's echo check, which
@@ -348,7 +350,7 @@ func (c *LocalClient) dispatchScopeForApply(plan *storage.Plan, req *ternv1.Appl
 		return dispatchScope{}, err
 	}
 	stored := map[driftChangeKey][]storage.TableChange{}
-	for _, tc := range plan.FlatDDLChanges() {
+	for _, tc := range c.shardDispatchCounterparts(plan, scope.shard) {
 		canon, err := canonicalDDLForDrift(parser, tc.DDL)
 		if err != nil {
 			return dispatchScope{}, fmt.Errorf("plan table %q: %w", tc.Table, err)
@@ -378,6 +380,43 @@ func (c *LocalClient) dispatchScopeForApply(plan *storage.Plan, req *ternv1.Appl
 		replannedChangeOf(matches[0]).stampOnto(ch)
 	}
 	return scope, nil
+}
+
+// shardDispatchCounterparts returns the plan's copies of the changes a dispatch
+// scoped to shard can be matched against. A namespace the plan judged per
+// shard lists each table once at namespace level, with the text and verdict of
+// whichever shard was planned first, while every shard's own changes live on
+// its shard row; so for such a namespace the counterparts are the dispatched
+// shard's row, and a shard whose changes diverge from its siblings' is matched
+// to its own text and verdict rather than to another shard's. Every other
+// namespace, including every namespace of a plan materialized from a dispatch
+// (which carries no shard rows), contributes its namespace-level changes.
+func (c *LocalClient) shardDispatchCounterparts(plan *storage.Plan, shard string) []storage.TableChange {
+	carriedByShards := map[string]bool{}
+	for _, sp := range plan.Shards {
+		if len(sp.Changes) > 0 {
+			carriedByShards[c.planNamespace(sp.Namespace)] = true
+		}
+	}
+	var counterparts []storage.TableChange
+	for _, tc := range plan.FlatDDLChanges() {
+		if carriedByShards[c.planNamespace(tc.Namespace)] {
+			continue
+		}
+		counterparts = append(counterparts, tc)
+	}
+	for _, sp := range plan.Shards {
+		if sp.Shard != shard {
+			continue
+		}
+		for _, tc := range sp.Changes {
+			if tc.Namespace == "" {
+				tc.Namespace = sp.Namespace
+			}
+			counterparts = append(counterparts, tc)
+		}
+	}
+	return counterparts
 }
 
 // driftMultisetFromApplyRequest builds the table DDL multiset the dispatch
