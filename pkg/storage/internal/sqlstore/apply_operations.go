@@ -1131,7 +1131,7 @@ func claimableParentArgs() []any {
 // at the cutover barrier clears its lease and backdates its heartbeat, so it is
 // parked, not occupying anything.
 //
-// The cap is a filter on the pending arm only, never a sort key. Sorting by the
+// The cap is a filter on the arms that start work, never a sort key. Sorting by the
 // count would replace the indexed (created_at, id) walk with a full sort that
 // evaluates a correlated subquery per row, which is the claim cost the ordering
 // index exists to avoid. Filtering keeps the index walk: a driver steps past a
@@ -1156,12 +1156,13 @@ const freshLeaseCountSQL = `(
 // be claimed in" and "states in which a driver occupies an operation" are
 // different questions that only mostly overlap.
 //
-// failed_retryable is where they part. A redispatched single-operation row
-// keeps that state for its whole drive — the claim rotates the lease and leaves
-// the state alone, and the row is not rewritten until the drive settles it — so
-// a driver really is occupying it the entire time. Counting it is what keeps a
-// retry sweep from running the apply at twice its cap. A multi-operation
-// redispatch moves its row to running instead, which the cap already counts.
+// failed_retryable is where they part. A row redispatched under a parent-lease
+// drive keeps that state for its whole drive — the claim rotates the lease and
+// leaves the state alone, and the row is not rewritten until the drive settles
+// it — so a driver really is occupying it the entire time. Counting it is what
+// keeps a retry sweep from running the apply at twice its cap. An
+// operation-lease redispatch moves its row to running instead, which the cap
+// already counts.
 func driverOccupyingOperationStates() []string {
 	return append(claimableApplyStates(), state.ApplyOperation.FailedRetryable)
 }
@@ -1381,12 +1382,15 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 	// than maxDriversPerApply fresh operation leases.
 	//
 	// The cap gates every arm that *starts* work — this pending arm, the
-	// stopped+start resume arm, and the deferred-deploy arm — because all three
-	// admit an apply's siblings onto drivers, and an uncapped one is a way around
-	// the bound rather than an exception to it. A stop/start cycle is the shape
+	// stopped+start resume arm, the deferred-deploy arm, and the deliberate
+	// redispatch half of the failed_retryable arm — because all four admit an
+	// apply's siblings onto drivers, and an uncapped one is a way around the
+	// bound rather than an exception to it. A stop/start cycle is the shape
 	// that matters: stop bulk-moves every pending row to stopped, so an uncapped
 	// resume arm would make all of them claimable at once and hand one apply the
-	// whole pool durably, which is the starvation this exists to prevent.
+	// whole pool durably, which is the starvation this exists to prevent. A
+	// retry sweep is the same shape: an outage that leaves every deployment
+	// failed_retryable would otherwise redispatch all of them at once.
 	//
 	// The recovery and control-request arms stay uncapped: a capped-out apply
 	// still has to be able to re-lease a crashed operation and to consume a
@@ -1394,9 +1398,10 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 	// cap itself the thing that wedges the apply it is bounding.
 	//
 	// Capping a start arm cannot wedge either, because the states it admits work
-	// into (resuming, running) are themselves counted: each resumed operation
-	// drops out of the count as it settles, so the rest drain behind it exactly
-	// as the pending arm's do.
+	// into (resuming, running, and a single-operation redispatch's leased
+	// failed_retryable) are themselves counted: each operation drops out of the
+	// count as it settles, so the rest drain behind it exactly as the pending
+	// arm's do.
 	queryArgs = append(queryArgs, driverCapArgs...)
 	queryArgs = append(queryArgs, stringArgs(activeStates)...)
 	// Stale-active barrier-park exemption (see the staleness clause below): a
@@ -1470,6 +1475,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 	queryArgs = append(queryArgs, driverCapArgs...)
 	queryArgs = append(queryArgs, state.ApplyOperation.FailedRetryable)
 	queryArgs = append(queryArgs, state.Apply.FailedRetryable, maxRecoveryAttempts, retryableRecoveryFreshnessDays)
+	queryArgs = append(queryArgs, driverCapArgs...)
 	queryArgs = append(queryArgs, stringArgs(activeStates)...)
 
 	// The stopped-row and failed_retryable clauses mirror ApplyStore.ClaimApplyByID.
@@ -1672,6 +1678,10 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 								a.state = ?
 								AND a.attempt < ?
 								AND a.updated_at >= %s
+								-- Names no column of a, but belongs to this arm
+								-- alone: a deliberate redispatch starts work, so
+								-- it is capped; crash recovery below is not.
+								AND `+driverCap+`
 							)
 							OR (
 								a.state IN (%s)
@@ -1786,32 +1796,33 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 		}
 
 		// Re-claiming a failed_retryable operation is a redispatch, so consume one
-		// unit of the parent apply's retry budget. Only multi-operation applies are
-		// charged here: a single-operation apply's parent attempt is incremented by
-		// the ClaimApplyByID its drive performs, so bumping here too would
-		// double-count. Without this, an operation-only multi-deployment retry never
-		// advances applies.attempt, so ExpireRetryable's budget path never fires and
-		// a permanently failing deployment retries forever — stranding a healthy
-		// sibling parked at the cutover barrier under on_failure "continue". The
-		// EXISTS-sibling guard selects multi-op, and the failed_retryable parent
-		// guard keeps this to genuine redispatches (a terminal-failed parent never
-		// re-leases its operations). The attempt < budget guard makes the
-		// increment idempotent once the budget is spent: two operators can claim
-		// different failed_retryable operations of the same apply concurrently, and
-		// the row lock this UPDATE takes serializes them, so the second sees the
-		// already-incremented attempt and does not overshoot maxRecoveryAttempts.
+		// unit of the parent apply's retry budget. Only operations the operator
+		// drives under the operation lease are charged here (see
+		// redispatchDrivesUnderOperationLease): a parent-lease drive increments the
+		// parent attempt in the ClaimApplyByID it performs, so bumping here too
+		// would double-count. Without this, an operation-lease retry never
+		// advances applies.attempt, so ExpireRetryable's budget path never fires
+		// and a permanently failing deployment retries forever — stranding a
+		// healthy sibling parked at the cutover barrier under on_failure
+		// "continue". The failed_retryable parent guard keeps this to genuine
+		// redispatches (a terminal-failed parent never re-leases its operations).
+		// The attempt < budget guard makes the increment idempotent once the
+		// budget is spent: two operators can claim different failed_retryable
+		// operations of the same apply concurrently, and the row lock this UPDATE
+		// takes serializes them, so the second sees the already-incremented
+		// attempt and does not overshoot maxRecoveryAttempts.
 		if ad.State == state.ApplyOperation.FailedRetryable {
 			// Advance the operation's own attempt only on a genuine deliberate
 			// redispatch — the parent apply is still failed_retryable. A
 			// failed_retryable child is also re-claimed for crash recovery when
 			// the parent apply is already active (running) with a stale heartbeat
 			// (its retry was admitted, then the driver crashed); that re-lease
-			// must leave attempt untouched so the orphaned dispatch's idempotency
-			// key stays stable and is reused, not duplicated. The parent-state
+			// must leave attempt untouched so the count records only deliberate
+			// retries. The dispatch idempotency key does not read it. The parent-state
 			// gate mirrors the budget bump below; the join lets one statement both
 			// test the parent state and write the child row. Unlike the budget
-			// bump this is not gated on multi-operation: attempt is
-			// operation-local and a sibling's retry must never rotate it.
+			// bump this is not gated on the drive mode: attempt is
+			// operation-local and a sibling's retry must never advance it.
 			attemptBump := s.dialect.JoinedUpdate(
 				"apply_operations", "o", "applies", "a", "a.id = o.apply_id",
 				[]JoinedUpdateAssignment{
@@ -1832,42 +1843,43 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 				ad.Attempt++
 			}
 
-			if _, err := tx.ExecContext(ctx, `
-				UPDATE applies
-				SET attempt = attempt + 1, updated_at = NOW()
-				WHERE id = ?
-					AND state = ?
-					AND attempt < ?
-					AND EXISTS (
-						SELECT 1 FROM apply_operations o
-						WHERE o.apply_id = applies.id AND o.id <> ?
-					)
-			`, ad.ApplyID, state.Apply.FailedRetryable, maxRecoveryAttempts, ad.ID); err != nil {
-				return nil, fmt.Errorf("consume retry budget for apply_operation %d redispatch: %w", ad.ID, err)
-			}
-
-			// A multi-operation redispatch must move the row out of
-			// failed_retryable atomically with the lease rotation, for the same
-			// reason the stopped claim moves its row to resuming: the
-			// redispatch arm is budget-gated, not heartbeat-gated, and nothing
-			// else closes it. A single-operation retry is closed by its parent
-			// claim's failed_retryable -> running transition, but a
-			// multi-operation parent is owned by the rollout projection and
-			// stays failed_retryable while any sibling is, so a row left
-			// failed_retryable would be re-leased on every poll, rotating the
-			// live driver's lease out from under it and starving every
-			// failed_retryable sibling behind it. As running, the row is
-			// re-leasable only by the heartbeat-guarded stale-active arm,
-			// which recovers a crashed drive. The guards match the budget
-			// bump: a genuine redispatch of a multi-operation apply.
-			moved, err := moveMultiOperationRedispatchToRunning(ctx, tx, ad)
+			underOperationLease, err := redispatchDrivesUnderOperationLease(ctx, tx, ad)
 			if err != nil {
 				return nil, err
 			}
-			if moved {
-				ad.State = state.ApplyOperation.Running
-				ad.ErrorMessage = ""
-				ad.CompletedAt = nil
+			if underOperationLease {
+				if _, err := tx.ExecContext(ctx, `
+					UPDATE applies
+					SET attempt = attempt + 1, updated_at = NOW()
+					WHERE id = ?
+						AND state = ?
+						AND attempt < ?
+				`, ad.ApplyID, state.Apply.FailedRetryable, maxRecoveryAttempts); err != nil {
+					return nil, fmt.Errorf("consume retry budget for apply_operation %d redispatch: %w", ad.ID, err)
+				}
+
+				// An operation-lease redispatch must move the row out of
+				// failed_retryable atomically with the lease rotation, for the
+				// same reason the stopped claim moves its row to resuming: the
+				// redispatch arm is budget-gated, not heartbeat-gated, and nothing
+				// else closes it. A parent-lease retry is closed by its parent
+				// claim's failed_retryable -> running transition, but an
+				// operation-lease parent is owned by the rollout projection and
+				// stays failed_retryable while any operation is, so a row left
+				// failed_retryable would be re-leased on every poll, rotating the
+				// live driver's lease out from under it and starving every
+				// failed_retryable sibling behind it. As running, the row is
+				// re-leasable only by the heartbeat-guarded stale-active arm,
+				// which recovers a crashed drive.
+				moved, err := moveRedispatchToRunning(ctx, tx, ad)
+				if err != nil {
+					return nil, err
+				}
+				if moved {
+					ad.State = state.ApplyOperation.Running
+					ad.ErrorMessage = ""
+					ad.CompletedAt = nil
+				}
 			}
 		}
 	}
@@ -1883,22 +1895,54 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 	return ad, nil
 }
 
-// moveMultiOperationRedispatchToRunning moves a failed_retryable operation of
-// a multi-operation apply to running when its parent is still failed_retryable,
-// which is what makes the claim a deliberate redispatch rather than crash
-// recovery. It reports whether the row moved. The sibling check is its own
-// read because MySQL refuses an UPDATE whose subquery reads the table being
-// updated.
-func moveMultiOperationRedispatchToRunning(ctx context.Context, tx *rebindTx, ad *storage.ApplyOperation) (bool, error) {
+// redispatchDrivesUnderOperationLease reports whether the operator will drive
+// a redispatched operation under its operation lease, with the rollout
+// projection owning the parent, rather than under a parent-lease drive that
+// claims the parent itself. It mirrors the operator's drive-mode decision
+// (recoverApplyOperation in pkg/api): the operation lease applies when the
+// apply has other attached operations, when its generation manifest still
+// expects an operation that has not attached, or when the operation has no
+// tasks to drive a parent claim from. Each check is its own read because
+// MySQL refuses an UPDATE whose subquery reads the table being updated.
+func redispatchDrivesUnderOperationLease(ctx context.Context, tx *rebindTx, ad *storage.ApplyOperation) (bool, error) {
 	var siblings int
 	if err := tx.QueryRowContext(ctx, `
 		SELECT COUNT(*) FROM apply_operations WHERE apply_id = ? AND id <> ?
 	`, ad.ApplyID, ad.ID).Scan(&siblings); err != nil {
 		return false, fmt.Errorf("count siblings of redispatched apply_operation %d: %w", ad.ID, err)
 	}
-	if siblings == 0 {
-		return false, nil
+	if siblings > 0 {
+		return true, nil
 	}
+
+	var manifestJSON []byte
+	if err := tx.QueryRowContext(ctx, `SELECT expected_operation_keys FROM applies WHERE id = ?`, ad.ApplyID).Scan(&manifestJSON); err != nil {
+		return false, fmt.Errorf("load generation manifest for redispatched apply_operation %d: %w", ad.ID, err)
+	}
+	if len(manifestJSON) > 0 {
+		parent := &storage.Apply{}
+		if err := json.Unmarshal(manifestJSON, &parent.ExpectedOperationKeys); err != nil {
+			return false, fmt.Errorf("unmarshal expected_operation_keys for redispatched apply_operation %d: %w", ad.ID, err)
+		}
+		if len(parent.MissingExpectedOperationKeys([]*storage.ApplyOperation{ad})) > 0 {
+			return true, nil
+		}
+	}
+
+	var tasks int
+	if err := tx.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM tasks WHERE apply_operation_id = ?
+	`, ad.ID).Scan(&tasks); err != nil {
+		return false, fmt.Errorf("count tasks of redispatched apply_operation %d: %w", ad.ID, err)
+	}
+	return tasks == 0, nil
+}
+
+// moveRedispatchToRunning moves a failed_retryable operation to running when
+// its parent is still failed_retryable, which is what makes the claim a
+// deliberate redispatch rather than crash recovery. It reports whether the row
+// moved.
+func moveRedispatchToRunning(ctx context.Context, tx *rebindTx, ad *storage.ApplyOperation) (bool, error) {
 	res, err := tx.ExecContext(ctx, `
 		UPDATE apply_operations
 		SET state = ?, error_message = '', completed_at = NULL, updated_at = NOW()
