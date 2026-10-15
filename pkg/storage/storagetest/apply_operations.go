@@ -1774,10 +1774,11 @@ func TestApplyOperations(t *testing.T, h Harness) {
 		assert.Equal(t, state.ApplyOperation.Failed, failed.State)
 	})
 
-	// MarkPendingCancelledByApply settles only the pending siblings, as
-	// cancelled with completed_at stamped, leaves running and terminal rows
-	// intact, and fails closed for a driver whose operation lease was rotated
-	// away.
+	// MarkPendingCancelledByApply settles the siblings that never started,
+	// pending ones and ones a stop reached while still pending, as cancelled
+	// with completed_at stamped. It leaves running, terminal, and started
+	// stopped rows intact, and fails closed for a driver whose operation lease
+	// was rotated away.
 	t.Run("MarkPendingCancelledByApply", func(t *testing.T) {
 		ctx := t.Context()
 		store := h.NewStorage(t)
@@ -1787,6 +1788,11 @@ func TestApplyOperations(t *testing.T, h Harness) {
 		pendingID := createOperation(t, store, apply.ID, "region-b", "pending")
 		completedID := createOperation(t, store, apply.ID, "region-c", "completed")
 		require.NoError(t, store.ApplyOperations().MarkCompleted(ctx, completedID))
+		neverStartedStoppedID := createOperation(t, store, apply.ID, "region-d", "never-started-stopped")
+		require.NoError(t, store.ApplyOperations().UpdateState(ctx, neverStartedStoppedID, state.ApplyOperation.Stopped))
+		startedStoppedID := createOperation(t, store, apply.ID, "region-e", "started-stopped")
+		require.NoError(t, store.ApplyOperations().MarkStarted(ctx, startedStoppedID))
+		require.NoError(t, store.ApplyOperations().UpdateState(ctx, startedStoppedID, state.ApplyOperation.Stopped))
 
 		claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "current-driver")
 		require.NoError(t, err)
@@ -1806,7 +1812,7 @@ func TestApplyOperations(t *testing.T, h Harness) {
 		ownedCtx := storage.WithOperationLease(ctx, lease(claimed.LeaseToken))
 		changed, err := store.ApplyOperations().MarkPendingCancelledByApply(ownedCtx, apply.ID)
 		require.NoError(t, err)
-		assert.Equal(t, int64(1), changed)
+		assert.Equal(t, int64(2), changed, "the pending row and the stopped row that never started")
 		again, err := store.ApplyOperations().MarkPendingCancelledByApply(ownedCtx, apply.ID)
 		require.NoError(t, err)
 		assert.Zero(t, again)
@@ -1816,6 +1822,15 @@ func TestApplyOperations(t *testing.T, h Harness) {
 		require.NotNil(t, pending)
 		assert.Equal(t, state.ApplyOperation.Cancelled, pending.State)
 		assert.NotNil(t, pending.CompletedAt, "cancelled is final, so completed_at is stamped")
+		neverStartedStopped, err := store.ApplyOperations().Get(ctx, neverStartedStoppedID)
+		require.NoError(t, err)
+		require.NotNil(t, neverStartedStopped)
+		assert.Equal(t, state.ApplyOperation.Cancelled, neverStartedStopped.State, "a stop that caught the row pending left nothing on its target")
+		assert.NotNil(t, neverStartedStopped.CompletedAt)
+		startedStopped, err := store.ApplyOperations().Get(ctx, startedStoppedID)
+		require.NoError(t, err)
+		require.NotNil(t, startedStopped)
+		assert.Equal(t, state.ApplyOperation.Stopped, startedStopped.State, "a stopped row that started settles through the drive that delivers the cancel")
 		owner, err := store.ApplyOperations().Get(ctx, ownerID)
 		require.NoError(t, err)
 		require.NotNil(t, owner)

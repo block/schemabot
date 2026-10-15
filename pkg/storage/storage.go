@@ -1609,12 +1609,14 @@ type ApplyOperationStore interface {
 	// is present in ctx.
 	MarkPendingStoppedByApply(ctx context.Context, applyID int64) (int64, error)
 
-	// MarkPendingCancelledByApply transitions every still-pending operation of
-	// an apply to cancelled, returning the number of rows changed. Used once a
-	// cancel is pending: a pending operation never started, so it settles on
-	// the spot rather than staying pending under a cancelled rollout. Only
-	// pending rows are touched, completed_at is stamped, and writes are lease
-	// guarded the same way as MarkPendingStoppedByApply.
+	// MarkPendingCancelledByApply transitions every operation of an apply that
+	// never started to cancelled, returning the number of rows changed: the
+	// pending ones, and the stopped ones a stop reached while still pending.
+	// Used once a cancel is pending: an operation that never started changed
+	// nothing on its target, so it settles on the spot rather than outliving a
+	// cancelled rollout. A stopped operation that had started is left to the
+	// drive that delivers the cancel to it. completed_at is stamped, and writes
+	// are lease guarded the same way as MarkPendingStoppedByApply.
 	MarkPendingCancelledByApply(ctx context.Context, applyID int64) (int64, error)
 
 	// ReapStranded mirrors the parent's outcome onto pending, unleased operation

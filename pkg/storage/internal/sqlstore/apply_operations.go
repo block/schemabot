@@ -2353,24 +2353,49 @@ func (s *applyOperationStore) DeleteByApply(ctx context.Context, applyID int64) 
 // Writes are apply-lease guarded when a lease is present in ctx, mirroring
 // DeleteByApply.
 func (s *applyOperationStore) MarkPendingStoppedByApply(ctx context.Context, applyID int64) (int64, error) {
-	return s.markPendingByApply(ctx, applyID, state.ApplyOperation.Stopped, "stop")
+	return s.markPendingByApply(ctx, applyID, state.ApplyOperation.Stopped, "stop", pendingRows)
 }
 
-// MarkPendingCancelledByApply transitions every still-pending operation of an
-// apply to cancelled, returning the number of rows changed. A pending operation
-// of a rollout under a pending cancel never started, so nothing on its target
-// changed and nothing has to be stopped there; the claim gate would only ever
-// refuse it once the rollout settles, leaving it pending under a cancelled
-// apply. Cancelled is final, so completed_at is stamped. Only pending rows are
-// touched, and writes are lease guarded exactly as MarkPendingStoppedByApply's.
+// MarkPendingCancelledByApply transitions every operation of an apply that
+// never started to cancelled, returning the number of rows changed: the
+// pending ones, and the ones a stop moved from pending to stopped before any
+// driver claimed them. Neither changed anything on its target, so nothing has
+// to be stopped there. The claim gate would only ever refuse a pending one once
+// the rollout settles, and the rollout settles cancelled without waiting on a
+// never-started stopped one, so either left alone would outlive the cancelled
+// apply. Cancelled is final, so completed_at is stamped. A stopped operation
+// that had started is left to the drive that delivers the cancel to it, and
+// writes are lease guarded exactly as MarkPendingStoppedByApply's.
 func (s *applyOperationStore) MarkPendingCancelledByApply(ctx context.Context, applyID int64) (int64, error) {
-	return s.markPendingByApply(ctx, applyID, state.ApplyOperation.Cancelled, "cancel")
+	return s.markPendingByApply(ctx, applyID, state.ApplyOperation.Cancelled, "cancel", neverStartedRows)
 }
 
-// markPendingByApply moves every still-pending operation of an apply to
-// newState, stamping completed_at when newState is terminal and not
-// resumable.
-func (s *applyOperationStore) markPendingByApply(ctx context.Context, applyID int64, newState, verb string) (int64, error) {
+// sweptRows selects the operation rows a bulk sweep of an apply settles. The
+// predicate names its columns through the given prefix, "" or a table alias
+// with its trailing dot.
+type sweptRows struct {
+	predicate func(prefix string) string
+	args      []any
+}
+
+// pendingRows are the operations no driver has claimed yet.
+var pendingRows = sweptRows{
+	predicate: func(prefix string) string { return prefix + "state = ?" },
+	args:      []any{state.ApplyOperation.Pending},
+}
+
+// neverStartedRows are the pending operations plus the stopped ones that never
+// started, which a stop reached while they were still pending.
+var neverStartedRows = sweptRows{
+	predicate: func(prefix string) string {
+		return "(" + prefix + "state = ? OR (" + prefix + "state = ? AND " + prefix + "started_at IS NULL))"
+	},
+	args: []any{state.ApplyOperation.Pending, state.ApplyOperation.Stopped},
+}
+
+// markPendingByApply moves the swept operations of an apply to newState,
+// stamping completed_at when newState is terminal and not resumable.
+func (s *applyOperationStore) markPendingByApply(ctx context.Context, applyID int64, newState, verb string, swept sweptRows) (int64, error) {
 	assignments := []JoinedUpdateAssignment{
 		{Column: "state", Expr: "?"},
 		{Column: "updated_at", Expr: "NOW()"},
@@ -2398,9 +2423,11 @@ func (s *applyOperationStore) markPendingByApply(ctx context.Context, applyID in
 		query := s.dialect.JoinedUpdate(
 			"apply_operations", "ao", "apply_operations", "owner_op", "owner_op.apply_id = ao.apply_id",
 			assignments,
-			"ao.apply_id = ? AND ao.state = ? AND owner_op.id = ? AND "+s.dialect.LeaseTokenFence("apply_operations", "owner_op", "id", "lease_token"),
+			"ao.apply_id = ? AND "+swept.predicate("ao.")+" AND owner_op.id = ? AND "+s.dialect.LeaseTokenFence("apply_operations", "owner_op", "id", "lease_token"),
 		)
-		result, err := s.db.ExecContext(ctx, query, newState, applyID, state.ApplyOperation.Pending, opLease.OperationID, opLease.Token)
+		args := append([]any{newState, applyID}, swept.args...)
+		args = append(args, opLease.OperationID, opLease.Token)
+		result, err := s.db.ExecContext(ctx, query, args...)
 		if err != nil {
 			return 0, fmt.Errorf("%s pending apply_operations for apply %d under operation lease: %w", verb, applyID, err)
 		}
@@ -2428,9 +2455,11 @@ func (s *applyOperationStore) markPendingByApply(ctx context.Context, applyID in
 		query := s.dialect.JoinedUpdate(
 			"apply_operations", "ao", "applies", "a", "a.id = ao.apply_id",
 			assignments,
-			"ao.apply_id = ? AND ao.state = ? AND "+s.dialect.LeaseTokenFence("applies", "a", "id", "lease_token"),
+			"ao.apply_id = ? AND "+swept.predicate("ao.")+" AND "+s.dialect.LeaseTokenFence("applies", "a", "id", "lease_token"),
 		)
-		result, err := s.db.ExecContext(ctx, query, newState, applyID, state.ApplyOperation.Pending, lease.Token)
+		args := append([]any{newState, applyID}, swept.args...)
+		args = append(args, lease.Token)
+		result, err := s.db.ExecContext(ctx, query, args...)
 		if err != nil {
 			return 0, fmt.Errorf("%s pending apply_operations for apply %d: %w", verb, applyID, err)
 		}
@@ -2440,11 +2469,12 @@ func (s *applyOperationStore) markPendingByApply(ctx context.Context, applyID in
 		}
 		return rows, nil
 	}
+	args := append([]any{newState, applyID}, swept.args...)
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE apply_operations
 		SET `+plainSet+`
-		WHERE apply_id = ? AND state = ?
-	`, newState, applyID, state.ApplyOperation.Pending)
+		WHERE apply_id = ? AND `+swept.predicate("")+`
+	`, args...)
 	if err != nil {
 		return 0, fmt.Errorf("%s pending apply_operations for apply %d: %w", verb, applyID, err)
 	}
