@@ -1765,12 +1765,12 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 			// failed_retryable child is also re-claimed for crash recovery when
 			// the parent apply is already active (running) with a stale heartbeat
 			// (its retry was admitted, then the driver crashed); that re-lease
-			// must leave attempt untouched so the orphaned dispatch's idempotency
-			// key stays stable and is reused, not duplicated. The parent-state
+			// must leave attempt untouched so the count records only deliberate
+			// retries. The dispatch idempotency key does not read it. The parent-state
 			// gate mirrors the budget bump below; the join lets one statement both
 			// test the parent state and write the child row. Unlike the budget
 			// bump this is not gated on multi-operation: attempt is
-			// operation-local and a sibling's retry must never rotate it.
+			// operation-local and a sibling's retry must never advance it.
 			attemptBump := s.dialect.JoinedUpdate(
 				"apply_operations", "o", "applies", "a", "a.id = o.apply_id",
 				[]JoinedUpdateAssignment{
