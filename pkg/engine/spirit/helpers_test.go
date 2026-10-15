@@ -43,14 +43,14 @@ func TestNamespaceForTable(t *testing.T) {
 	t.Run("multi-namespace with no declaration refuses naming every namespace", func(t *testing.T) {
 		for range 50 {
 			ns, err := namespaceForTable("dropped_table", declaredIn, sf, "shop")
-			require.EqualError(t, err, `cannot attribute DROP TABLE "dropped_table" to a schema namespace: namespaces [billing users] are all diffed against database "shop" and none of them declares the table; use a target DSN that names no database, so each namespace is diffed against its own database, or keep this database's schema files in one namespace directory`)
+			require.EqualError(t, err, `DROP TABLE "dropped_table" cannot be placed: namespaces [billing users] all diff against database "shop". Keep this database's schema files in one namespace directory, or ask a SchemaBot operator to use a target with no database in its DSN`)
 			assert.Empty(t, ns)
 		}
 	})
 
 	t.Run("empty schema files returns an error", func(t *testing.T) {
 		ns, err := namespaceForTable("nonexistent", nil, schema.SchemaFiles{}, "shop")
-		require.EqualError(t, err, `table "nonexistent" in database "shop" has no schema namespace: the request carries no schema files`)
+		require.EqualError(t, err, `DROP TABLE "nonexistent" cannot be placed: the request carries no schema files for database "shop". Restore this database's schema files, or remove the database from the SchemaBot config`)
 		assert.Empty(t, ns)
 	})
 }

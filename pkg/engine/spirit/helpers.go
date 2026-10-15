@@ -54,7 +54,10 @@ func groupChangesByNamespace(changes []engine.TableChange, currentSchema []table
 	for _, tc := range changes {
 		ns, err := namespaceForTable(tc.Table, declaredIn, sf, database)
 		if err != nil {
-			return nil, fmt.Errorf("namespace lookup for table %q: %w", tc.Table, err)
+			// The refusal already names the table, the database and the
+			// namespaces, and the plan comment renders it verbatim, so a
+			// wrap here would only repeat the table name in front of it.
+			return nil, err
 		}
 		changesByNS[ns] = append(changesByNS[ns], tc)
 	}
@@ -68,7 +71,7 @@ func groupChangesByNamespace(changes []engine.TableChange, currentSchema []table
 	for _, ts := range currentSchema {
 		ns, err := namespaceForTable(ts.Name, declaredIn, sf, database)
 		if err != nil {
-			return nil, fmt.Errorf("namespace lookup for original table %q: %w", ts.Name, err)
+			return nil, fmt.Errorf("capture original table definitions: %w", err)
 		}
 		if files, ok := originalFilesByNS[ns]; ok {
 			files[ts.Name+".sql"] = ts.Schema
@@ -108,13 +111,16 @@ func namespaceForTable(table string, declaredIn map[string]string, sf schema.Sch
 	}
 	switch len(sf) {
 	case 0:
-		return "", fmt.Errorf("table %q in database %q has no schema namespace: the request carries no schema files", table, database)
+		// SchemaBot's own callers reject a request with no schema files before
+		// it plans, so only a direct Tern Plan call with an empty map lands
+		// here. Every live table would be a drop, so refuse with the way out.
+		return "", fmt.Errorf("DROP TABLE %q cannot be placed: the request carries no schema files for database %q. Restore this database's schema files, or remove the database from the SchemaBot config", table, database)
 	case 1:
 		for nsName := range sf {
 			return nsName, nil
 		}
 	}
-	return "", fmt.Errorf("cannot attribute DROP TABLE %q to a schema namespace: namespaces %v are all diffed against database %q and none of them declares the table; use a target DSN that names no database, so each namespace is diffed against its own database, or keep this database's schema files in one namespace directory", table, namespaceNames(sf), database)
+	return "", fmt.Errorf("DROP TABLE %q cannot be placed: namespaces %v all diff against database %q. Keep this database's schema files in one namespace directory, or ask a SchemaBot operator to use a target with no database in its DSN", table, namespaceNames(sf), database)
 }
 
 // namespaceNames returns the sorted namespace keys for inclusion in error

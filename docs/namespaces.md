@@ -327,11 +327,11 @@ A DSN that names a database also cannot drop a table when the schema root has
 two or more namespaces. Every namespace is diffed against that one database, so
 a live table that no schema file declares is in every namespace's live schema at
 once, and the deleted file that said which namespace held it is no longer in the
-request. SchemaBot cannot attribute the `DROP TABLE` to a namespace, so the plan
-fails with an error that names the table and the namespaces. To drop it, switch
-to a namespace-free DSN, or keep that database's schema files in one namespace
-directory. With a single namespace, the drop belongs to it and is planned like
-any other drop.
+request. SchemaBot cannot place the `DROP TABLE` in a namespace, so the plan
+fails with an error that names the table, the namespaces and the database. To
+drop it, keep that database's schema files in one namespace directory, or have a
+SchemaBot operator switch the target to a namespace-free DSN. With a single
+namespace, the drop belongs to it and is planned like any other drop.
 
 ## Ignoring Tables
 

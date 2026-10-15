@@ -751,7 +751,7 @@ func TestEngine_Plan_DropByEmptiedFileInMultiNamespaceFails(t *testing.T) {
 		},
 		Credentials: &engine.Credentials{DSN: dsn},
 	})
-	require.EqualError(t, err, `namespace lookup for table "orders": cannot attribute DROP TABLE "orders" to a schema namespace: namespaces [billing testdb] are all diffed against database "testdb" and none of them declares the table; use a target DSN that names no database, so each namespace is diffed against its own database, or keep this database's schema files in one namespace directory`)
+	require.EqualError(t, err, `DROP TABLE "orders" cannot be placed: namespaces [billing testdb] all diff against database "testdb". Keep this database's schema files in one namespace directory, or ask a SchemaBot operator to use a target with no database in its DSN`)
 	assert.Nil(t, result)
 }
 
@@ -781,7 +781,37 @@ func TestEngine_Plan_DropByDeletedFileInSharedDatabaseRefuses(t *testing.T) {
 		},
 		Credentials: &engine.Credentials{DSN: dsn},
 	})
-	require.EqualError(t, err, `namespace lookup for table "invoices_old": cannot attribute DROP TABLE "invoices_old" to a schema namespace: namespaces [app billing] are all diffed against database "testdb" and none of them declares the table; use a target DSN that names no database, so each namespace is diffed against its own database, or keep this database's schema files in one namespace directory`)
+	require.EqualError(t, err, `DROP TABLE "invoices_old" cannot be placed: namespaces [app billing] all diff against database "testdb". Keep this database's schema files in one namespace directory, or ask a SchemaBot operator to use a target with no database in its DSN`)
+	assert.Nil(t, result)
+}
+
+// The request names the logical database "logicaldb" while the target DSN
+// names "testdb", the database the plan actually diffs against. When the
+// deleted billing/invoices_old.sql leaves a drop no namespace can own, the
+// refusal names "testdb", the database the namespaces actually share, not
+// the request's logical name.
+func TestEngine_Plan_UnplaceableDropNamesTheTargetDatabase(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	cleanupTables(t, db)
+	for _, stmt := range []string{
+		"CREATE TABLE invoices (id INT NOT NULL, PRIMARY KEY (id))",
+		"CREATE TABLE invoices_old (id INT NOT NULL, PRIMARY KEY (id))",
+		"CREATE TABLE users (id INT NOT NULL, PRIMARY KEY (id))",
+	} {
+		_, err := db.ExecContext(t.Context(), stmt)
+		require.NoError(t, err)
+	}
+
+	eng := New(Config{Logger: slog.New(slog.NewTextHandler(os.Stdout, nil))})
+	result, err := eng.Plan(t.Context(), &engine.PlanRequest{
+		Database: "logicaldb",
+		SchemaFiles: schema.SchemaFiles{
+			"app":     &schema.Namespace{Files: map[string]string{"users.sql": "CREATE TABLE `users` (\n  `id` int NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"}},
+			"billing": &schema.Namespace{Files: map[string]string{"invoices.sql": "CREATE TABLE `invoices` (\n  `id` int NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"}},
+		},
+		Credentials: &engine.Credentials{DSN: dsn},
+	})
+	require.EqualError(t, err, `DROP TABLE "invoices_old" cannot be placed: namespaces [app billing] all diff against database "testdb". Keep this database's schema files in one namespace directory, or ask a SchemaBot operator to use a target with no database in its DSN`)
 	assert.Nil(t, result)
 }
 
