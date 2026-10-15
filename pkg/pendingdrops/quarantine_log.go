@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/block/spirit/pkg/utils"
+
+	"github.com/block/schemabot/pkg/mysqlerr"
 )
 
 // LogTable is the table in the pending drops database that records which apply
@@ -17,9 +19,13 @@ import (
 const LogTable = "schemabot_quarantine_log"
 
 // createLogTableSQL creates the quarantine log. Source names and the apply
-// identifier compare exactly, the way the quarantine records its source.
+// identifier compare exactly, the way the quarantine records its source. The
+// destination compares the way Destinations tells copies apart: without regard
+// to case, since MySQL may fold table names, but distinguishing every other
+// character, so two sources whose names differ only by an accent keep two
+// records as they keep two copies.
 const createLogTableSQL = "CREATE TABLE IF NOT EXISTS `" + Database + "`.`" + LogTable + "` (" +
-	"`quarantine_table` varchar(64) NOT NULL, " +
+	"`quarantine_table` varchar(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_as_ci NOT NULL, " +
 	"`source_schema` varchar(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL, " +
 	"`source_table` varchar(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL, " +
 	"`apply_identifier` varchar(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL, " +
@@ -100,18 +106,21 @@ func recordMatchesMove(ctx context.Context, db *sql.DB, table QuarantinedTable, 
 // recorded for schemaName.tableName, oldest first, or none when the target has
 // no quarantine log. A record says only that the apply set out to move the
 // table: the caller checks that the copy it names exists.
+//
+// The log is read directly, and only the server saying the log or its database
+// does not exist counts as having no log. Asking information_schema first would
+// read a log the account has lost its privileges on as absent, since MySQL
+// lists only the tables an account holds a privilege on; a log that exists but
+// cannot be read is an error, so the caller does not take a missing record for
+// a table that was never quarantined.
 func RecordedQuarantines(ctx context.Context, db *sql.DB, applyIdentifier, schemaName, tableName string) ([]QuarantinedTable, error) {
-	exists, err := logTableExists(ctx, db)
-	if err != nil {
-		return nil, err
-	}
-	if !exists {
-		return nil, nil
-	}
 	rows, err := db.QueryContext(ctx,
 		"SELECT quarantine_table FROM `"+Database+"`.`"+LogTable+"` "+
 			"WHERE apply_identifier = ? AND source_schema = ? AND source_table = ? ORDER BY quarantined_at, quarantine_table",
 		applyIdentifier, schemaName, tableName)
+	if isMissingLog(err) {
+		return nil, nil
+	}
 	if err != nil {
 		return nil, fmt.Errorf("read recorded quarantines of %s.%s for apply %s: %w", schemaName, tableName, applyIdentifier, err)
 	}
@@ -132,14 +141,19 @@ func RecordedQuarantines(ctx context.Context, db *sql.DB, applyIdentifier, schem
 	return recorded, nil
 }
 
-func logTableExists(ctx context.Context, db *sql.DB) (bool, error) {
-	var count int
-	if err := db.QueryRowContext(ctx,
-		"SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = ? AND table_name = ?",
-		Database, LogTable).Scan(&count); err != nil {
-		return false, fmt.Errorf("check for %s.%s: %w", Database, LogTable, err)
-	}
-	return count > 0, nil
+// The server errors that say the quarantine log has not been created:
+// ER_BAD_DB_ERROR when the pending drops database is missing and
+// ER_NO_SUCH_TABLE when the database exists without the log. A denied read is
+// neither; it is reported, not read as an empty log.
+const (
+	erBadDB       = 1049
+	erNoSuchTable = 1146
+)
+
+// isMissingLog reports whether err is the server saying the quarantine log, or
+// the pending drops database that holds it, does not exist.
+func isMissingLog(err error) bool {
+	return mysqlerr.Is(err, erBadDB, erNoSuchTable)
 }
 
 // expiredLogRecords returns the log records the cleaner may delete, given the
@@ -168,6 +182,12 @@ func expiredLogRecords(ctx context.Context, conn *sql.Conn, tables []string, cut
 // deleted: copies past retention that are no longer among remaining, either
 // because a pass dropped them or because their RENAME never landed. A record
 // of a copy that still exists stays until the copy is dropped.
+//
+// Retention is measured from the timestamp in the copy's name, which the
+// RENAME and its record share, so a record is pruned only once a RENAME still
+// waiting to land would produce a copy that is itself past retention and
+// dropped by the next pass. Such a copy is not recoverable through the record
+// either way, so nothing a record could still explain is pruned ahead of it.
 //
 // Names are matched case-insensitively, as Destinations chooses them: a server
 // with lower_case_table_names set lists a copy under a folded name while its
