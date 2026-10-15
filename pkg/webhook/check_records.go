@@ -207,6 +207,24 @@ func (h *Handler) storeNamespacePlacementCheck(ctx context.Context, client *ghcl
 	return headSHA, err
 }
 
+// planFailedUnstoredSummary is the failing aggregate's summary when the failing
+// check for an environment that could not plan could not be stored either.
+const planFailedUnstoredSummary = "SchemaBot could not plan this environment or record the failure; see the plan comment, then re-run plan"
+
+// storePlanFailedCheck stores a failing check for an environment whose plan
+// could not be produced at all: its schema request, its environment
+// validation, or the plan itself failed. That environment has no plan row, so
+// without this one the aggregate folds only the environments that did plan and
+// can pass while this one was never planned (MG-1, MG-2). The row records a
+// plan error rather than a blocking reason, so the environment's next plan
+// replaces it like any plan result. The raw error stays in the server logs and
+// the plan comment; the stored row carries only the fixed plan-failed text.
+func (h *Handler) storePlanFailedCheck(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, schema *ghclient.SchemaRequestResult, environment string) (string, error) {
+	failed := &apitypes.PlanResponse{Errors: []string{planFailedCheckText}}
+	headSHA, _, err := h.upsertPlanCheckRecord(ctx, client, repo, pr, schema, failed, environment, reviewDriftOutcome{})
+	return headSHA, err
+}
+
 // storeManualPlanCheckRecord stores per-database check state after a manual
 // plan and then reconciles same-head apply-owned stored check state when the manual
 // plan proves the target already matches the PR schema.

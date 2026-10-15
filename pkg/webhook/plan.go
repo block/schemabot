@@ -488,6 +488,10 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 	// Environments whose namespace placement refusal could not be persisted,
 	// kept for the same reason and posted under the placement block's reason.
 	placementBlockUnstored := map[string]string{}
+	// Environments whose plan could not be produced at all, in plan order. Each
+	// gets a failing stored check row once the loop knows the head SHA, so the
+	// aggregate fold cannot pass on the environments that did plan.
+	var planFailedEnvironments []string
 	// Whether any environment's rollout round found a member with work. The
 	// primary's plan alone cannot say, so auto-plan reads this before skipping
 	// its comment.
@@ -511,11 +515,13 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 		if err != nil {
 			h.logger.Error("schema request failed", "repo", repo, "pr", pr, "env", env, "error", err)
 			multiEnvData.Errors[env] = userFacingError(err)
+			planFailedEnvironments = append(planFailedEnvironments, env)
 			continue
 		}
 		if err := h.attachServerEnvironments(schemaResult, env); err != nil {
 			h.logger.Error("schema environment validation failed", "repo", repo, "pr", pr, "env", env, "error", err)
 			multiEnvData.Errors[env] = userFacingError(err)
+			planFailedEnvironments = append(planFailedEnvironments, env)
 			continue
 		}
 
@@ -581,6 +587,7 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 		if err != nil {
 			h.logger.Error("plan execution failed", "repo", repo, "pr", pr, "env", env, "error", err)
 			multiEnvData.Errors[env] = userFacingError(err)
+			planFailedEnvironments = append(planFailedEnvironments, env)
 			continue
 		}
 
@@ -638,7 +645,26 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 	// If all environments errored, no check records were stored and headSHA
 	// is empty. Post a failing aggregate so branch protection isn't stuck
 	// waiting for a check that will never arrive.
+	planFailedUnstored := map[string]string{}
 	if headSHA != "" {
+		// The fold below reads stored rows only, so an environment that failed
+		// to plan while another stored a row must fail through a row of its own.
+		// A successful schema request seeded the database identity and head SHA
+		// every environment of this delivery shares.
+		failedSchema := &ghclient.SchemaRequestResult{
+			Database:   multiEnvData.Database,
+			Type:       multiEnvData.DatabaseType,
+			Repository: multiEnvData.Repository,
+			HeadSHA:    multiEnvData.HeadSHA,
+		}
+		for _, env := range planFailedEnvironments {
+			if _, checkErr := h.storePlanFailedCheck(ctx, client, repo, pr, failedSchema, env); checkErr != nil {
+				h.logger.Error("failed to store failing check record for an environment that could not plan; posting a failing aggregate instead",
+					"repo", repo, "pr", pr, "env", env, "database_type", failedSchema.Type,
+					"database", failedSchema.Database, "head_sha", failedSchema.HeadSHA, "error", checkErr)
+				planFailedUnstored[env] = planFailedUnstoredSummary
+			}
+		}
 		h.settleChecksReplacedByNewTypeBeforeFold(ctx, client, repo, pr, headSHA, multiEnvData.Database, multiEnvData.DatabaseType)
 		h.updateAggregateCheck(ctx, client, repo, pr, headSHA)
 	} else if len(multiEnvData.Errors) > 0 {
@@ -669,6 +695,9 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 			"repo", repo,
 			"pr", pr,
 			"environments", len(placementBlockUnstored))
+	}
+	if len(planFailedUnstored) > 0 {
+		h.postFailingAggregates(ctx, client, repo, pr, multiEnvData.HeadSHA, planFailedUnstored)
 	}
 	if len(pendingWorkUnstored) > 0 && multiEnvData.HeadSHA != "" {
 		h.postFailingAggregates(ctx, client, repo, pr, multiEnvData.HeadSHA, pendingWorkUnstored)

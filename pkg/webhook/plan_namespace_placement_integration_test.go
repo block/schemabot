@@ -71,6 +71,17 @@ func newNamespacePlacementHarness(t *testing.T, productionTargets []api.TargetEn
 // harness's own reads go to the unwrapped store.
 func newNamespacePlacementHarnessWithStorage(t *testing.T, productionTargets []api.TargetEntry, wrap func(storage.Storage) storage.Storage) *namespacePlacementHarness {
 	t.Helper()
+	production := &namespaceSelectingTernClient{}
+	p := newMultiEnvPlanHarness(t, productionTargets, production, wrap)
+	p.production = production
+	return p
+}
+
+// newMultiEnvPlanHarness is the harness with production planned by the given
+// tern client, so a test can choose how production's plan answers. The
+// returned harness leaves production unset.
+func newMultiEnvPlanHarness(t *testing.T, productionTargets []api.TargetEntry, production tern.Client, wrap func(storage.Storage) storage.Storage) *namespacePlacementHarness {
+	t.Helper()
 	dbName := "webhook_ns_placement"
 	ctx := t.Context()
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
@@ -94,7 +105,6 @@ func newNamespacePlacementHarnessWithStorage(t *testing.T, productionTargets []a
 		TernDeployments: api.TernConfig{"eu": {"staging": "tern-eu-staging:9090", "production": "tern-eu:9090"}},
 		Repos:           map[string]api.RepoConfig{"octocat/hello-world": {}},
 	}
-	production := &namespaceSelectingTernClient{}
 	var handlerStore storage.Storage = st
 	if wrap != nil {
 		handlerStore = wrap(st)
@@ -121,11 +131,10 @@ func newNamespacePlacementHarnessWithStorage(t *testing.T, productionTargets []a
 	// aggregate Check Run an earlier fold published, and so update it.
 	installClient := ghclient.NewInstallationClientWithSlug(client, logger, "schemabot")
 	return &namespacePlacementHarness{
-		dbName:     dbName,
-		store:      st,
-		handler:    NewHandler(svc, &fakeClientFactory{client: installClient}, nil, logger),
-		github:     result,
-		production: production,
+		dbName:  dbName,
+		store:   st,
+		handler: NewHandler(svc, &fakeClientFactory{client: installClient}, nil, logger),
+		github:  result,
 	}
 }
 
