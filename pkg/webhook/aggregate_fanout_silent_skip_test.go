@@ -962,8 +962,8 @@ func TestControlMissingApplyIDDefersToLeader(t *testing.T) {
 		h.handleStopCommand("octocat/hello-world", 1, 12345, "hubot", missingID(""))
 
 		body := requireComment(t, comments, "missing-apply-id control comment")
-		assert.Contains(t, body, "## Missing Apply ID\n\nCopy the command from the apply's progress comment. It carries the apply ID.",
-			"the leader stores only its own applies, so it points at the comment that carries the ID")
+		assert.Contains(t, body, "Missing Apply ID")
+		assert.Contains(t, body, "schemabot stop <apply-id> -e <environment>")
 	})
 
 	t.Run("tenant-scoped command gets the usage error from the addressee", func(t *testing.T) {
@@ -999,8 +999,8 @@ func TestRollbackMissingApplyIDDefersToLeader(t *testing.T) {
 		h.handleRollbackCommand("octocat/hello-world", 1, 12345, "hubot", missingID(""))
 
 		body := requireComment(t, comments, "missing-apply-id rollback comment")
-		assert.Contains(t, body, "## Missing Apply ID\n\nCopy the command from the summary comment of the completed apply. It carries the apply ID.",
-			"the leader stores only its own applies, so it points at the comment that carries the ID")
+		assert.Contains(t, body, "Missing Apply ID")
+		assert.Contains(t, body, "schemabot rollback <apply-id> -e <environment>")
 	})
 
 	t.Run("tenant-scoped command gets the usage error from the addressee", func(t *testing.T) {

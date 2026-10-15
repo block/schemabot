@@ -1176,7 +1176,6 @@ func PreviewCommentOversized() string {
 	return RenderSupportChannelFooter(RenderOversizedComment(OversizedCommentData{
 		Title:         "## Schema Change Apply — Staging",
 		RenderedBytes: 84801,
-		Environment:   "staging",
 	}), previewSupportChannel())
 }
 
@@ -1599,42 +1598,6 @@ func PreviewCommentApplyBlockedByCheckStatusError() string {
 // blocked by a stopped staging apply" comment.
 func PreviewCommentApplyBlockedByStoppedPriorEnvApply() string {
 	return RenderApplyBlockedByStoppedPriorEnvApply("testapp", "production", "staging")
-}
-
-// PreviewCommentControlMissingApplyID renders a sample reply to `schemabot
-// cutover -e production` that named no apply ID, naming the one production
-// apply it can act on.
-func PreviewCommentControlMissingApplyID() string {
-	return RenderControlMissingApplyID(MissingApplyIDData{
-		Command:     "cutover",
-		Environment: "production",
-		Candidates:  []ApplyIDCandidate{{ApplyID: "apply-a1b2c3d4e5f6", Database: "testapp", Environment: "production"}},
-		Complete:    true,
-	})
-}
-
-// PreviewCommentControlMissingApplyIDSeveral renders a sample reply to
-// `schemabot stop` that named no apply ID on a PR with two running applies.
-func PreviewCommentControlMissingApplyIDSeveral() string {
-	return RenderControlMissingApplyID(MissingApplyIDData{
-		Command: "stop",
-		Candidates: []ApplyIDCandidate{
-			{ApplyID: "apply-a1b2c3d4e5f6", Database: "testapp", Environment: "staging"},
-			{ApplyID: "apply-0f9e8d7c6b5a", Database: "billing", Environment: "staging"},
-		},
-		Complete: true,
-	})
-}
-
-// PreviewCommentRollbackMissingApplyID renders a sample reply to `schemabot
-// rollback -e staging` that named no apply ID, naming the completed apply.
-func PreviewCommentRollbackMissingApplyID() string {
-	return RenderRollbackMissingApplyID(MissingApplyIDData{
-		Command:     "rollback",
-		Environment: "staging",
-		Candidates:  []ApplyIDCandidate{{ApplyID: "apply-a1b2c3d4e5f6", Database: "testapp", Environment: "staging"}},
-		Complete:    true,
-	})
 }
 
 // PreviewCommentApplyBlockedByPriorEnvCheckError renders a sample fail-closed

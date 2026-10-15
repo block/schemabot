@@ -2688,7 +2688,7 @@ schemabot apply -e staging
 
 ⚠️ **This comment was too large to post.** SchemaBot rendered it at 84,801 bytes and GitHub accepts at most 65,536 in one comment, so this notice took its place. The schema change itself is unaffected; only this view of it is missing.
 
-**What to do next:** the desired schema is in this PR's schema files, and an apply's progress is available from the CLI with `schemabot status -e staging`. The server logs record the rendering with this PR's identifiers.
+**What to do next:** the desired schema is in this PR's schema files. The server logs record the rendering with this PR's identifiers.
 <!-- schemabot:offer-support-channel -->
 
 > 💬 Support: [#schema-help](https://chat.example.com/schema-help).
@@ -4204,57 +4204,6 @@ Once staging completes, retry:
 ```
 schemabot apply -e production
 ```
-<!-- schemabot:offer-support-channel -->
-
-</details>
-
-<details>
-<summary><a name="control-command-missing-apply-id"></a><strong>Control Command Missing Apply ID</strong></summary>
-
-
-## Missing Apply ID
-
-Comment this to `cutover` the `testapp` apply in `production`:
-```
-schemabot cutover apply-a1b2c3d4e5f6 -e production
-```
-<!-- schemabot:offer-support-channel -->
-
-</details>
-
-<details>
-<summary><a name="control-command-missing-apply-id-several-applies"></a><strong>Control Command Missing Apply ID (Several Applies)</strong></summary>
-
-
-## Missing Apply ID
-
-Comment the command for the apply you mean:
-
-`testapp` in `staging`:
-```
-schemabot stop apply-a1b2c3d4e5f6 -e staging
-```
-
-`billing` in `staging`:
-```
-schemabot stop apply-0f9e8d7c6b5a -e staging
-```
-<!-- schemabot:offer-support-channel -->
-
-</details>
-
-<details>
-<summary><a name="rollback-missing-apply-id"></a><strong>Rollback Missing Apply ID</strong></summary>
-
-
-## Missing Apply ID
-
-Comment this to `rollback` the `testapp` apply in `staging`:
-```
-schemabot rollback apply-a1b2c3d4e5f6 -e staging
-```
-
-To confirm a generated rollback, comment `schemabot rollback-confirm -e staging`.
 <!-- schemabot:offer-support-channel -->
 
 </details>

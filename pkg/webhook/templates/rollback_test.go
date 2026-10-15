@@ -258,6 +258,26 @@ func TestRenderRollbackConfirmNoLockTenant(t *testing.T) {
 	assert.Contains(t, withoutDatabase, "`schemabot rollback <apply-id> -e production --tenant acme`")
 }
 
+// The reply names the PR comment usage and where the apply ID is. It never
+// offers a CLI command, which does not work as a PR comment.
+func TestRenderRollbackMissingApplyID(t *testing.T) {
+	rendered := RenderRollbackMissingApplyID("")
+	assert.Contains(t, rendered, "## Missing Apply ID\n\n"+
+		"Usage: `schemabot rollback <apply-id> -e <environment>`\n\n"+
+		"Confirm a generated rollback with `schemabot rollback-confirm -e <environment>`.\n\n"+
+		"The apply ID is on the summary comment of the completed apply.")
+	assert.NotContains(t, rendered, "status")
+	assert.NotContains(t, rendered, "--tenant")
+}
+
+// On a tenant deployment, the usage hints carry the deployment's tenant so
+// pasting them addresses this deployment.
+func TestRenderRollbackMissingApplyIDTenant(t *testing.T) {
+	rendered := RenderRollbackMissingApplyID("acme")
+	assert.Contains(t, rendered, "`schemabot rollback <apply-id> -e <environment> --tenant acme`")
+	assert.Contains(t, rendered, "`schemabot rollback-confirm -e <environment> --tenant acme`")
+}
+
 func TestRenderRollbackApplyNotFound(t *testing.T) {
 	rendered := RenderRollbackApplyNotFound("apply-abc123")
 	assert.Contains(t, rendered, "## Apply Not Found")
@@ -392,7 +412,7 @@ func TestRenderRollbackNotAccepted(t *testing.T) {
 
 func TestRollbackTemplates_NoStrayWhitespace(t *testing.T) {
 	for name, body := range map[string]string{
-		"MissingApplyID":            RenderRollbackMissingApplyID(MissingApplyIDData{Command: "rollback"}),
+		"MissingApplyID":            RenderRollbackMissingApplyID(""),
 		"ApplyNotFound":             RenderRollbackApplyNotFound("a"),
 		"Rejected":                  RenderRollbackRejected(RollbackRejectedData{ApplyID: "a", Database: "d", Environment: "e", Reason: "r"}),
 		"BlockedByLockPR":           RenderRollbackBlockedByLock("d", "e", "o", "r", 1, "", LockedDatabaseApply{}),

@@ -341,13 +341,11 @@ func TestBuildPlanCommentDataCarriesTheAgentHint(t *testing.T) {
 	})
 }
 
-// A deployment's cli_name reaches the CLI hints in the comments the handler
-// posts: the plan data it builds carries it for the stored-plan pointer, and
-// the oversized-comment notice starts its status hint with it. A deployment
-// that configures none renders the CLI's own name.
-func TestHandlerRendersCLIHintsWithTheConfiguredCLIName(t *testing.T) {
+// A deployment's cli_name reaches the plan data the handler builds, which
+// starts the stored-plan pointer with it. A deployment that configures none
+// renders the CLI's own name.
+func TestHandlerBuildsPlanDataWithTheConfiguredCLIName(t *testing.T) {
 	schema := &ghclient.SchemaRequestResult{Database: "orders", Type: "mysql"}
-	oversized := "## Schema Change Plan\n\n" + strings.Repeat("x", 2*templates.GitHubIssueCommentMaxChars)
 	for _, tc := range []struct{ name, configured, want string }{
 		{"no cli_name configured", "", "schemabot"},
 		{"cli_name configured", "acme schemabot", "acme schemabot"},
@@ -357,19 +355,16 @@ func TestHandlerRendersCLIHintsWithTheConfiguredCLIName(t *testing.T) {
 
 			data := buildPlanCommentData(schema, &apitypes.PlanResponse{PlanID: "plan_7c41f9"}, "staging", "", "octocat", h.agentHint(), h.cliName())
 			assert.Equal(t, tc.want, data.CLIName)
-			assert.Contains(t, h.renderPRComment("octo/repo", 7, "staging", oversized), "`"+tc.want+" status -e staging`")
 		})
 	}
 }
 
 // Every comment observer the handler builds starts from
-// commentObserverConfig, so the deployment's cli_name reaches the comments the
-// observer posts for an apply: an apply comment too large for GitHub is
-// replaced by the oversized notice, whose status hint starts with the
-// configured name and is scoped to the apply's environment, runnable as
-// printed. Both observer kinds, the per-driver one and the one-shot aggregate
-// terminal-summary publisher, render the same hint.
-func TestCommentObserverRendersOversizedNoticeWithTheConfiguredCLIName(t *testing.T) {
+// commentObserverConfig, so the deployment's cli_name and the handler's sharded
+// plan cache reach every observer. Both observer kinds, the per-driver one and
+// the one-shot aggregate terminal-summary publisher, replace an apply comment
+// too large for GitHub with the oversized notice.
+func TestCommentObserverConfigCarriesTheHandlersSettings(t *testing.T) {
 	h := &Handler{logger: testLogger(), service: api.New(nil, &api.ServerConfig{CLIName: "acme schemabot"}, nil, testLogger()), shardedPlans: newShardedPlanCache()}
 	cfg := h.commentObserverConfig(nil, "octo/repo", 7, 42)
 	assert.Equal(t, "acme schemabot", cfg.CLIName)
@@ -383,8 +378,8 @@ func TestCommentObserverRendersOversizedNoticeWithTheConfiguredCLIName(t *testin
 	} {
 		t.Run(name, func(t *testing.T) {
 			body := observer.renderPRComment(apply, oversized)
+			assert.True(t, strings.HasPrefix(body, "## Schema Change Apply — Staging\n\n"), "the notice keeps the replaced comment's heading")
 			assert.Contains(t, body, "too large to post")
-			assert.Contains(t, body, "available from the CLI with `acme schemabot status -e staging`.")
 		})
 	}
 }
@@ -827,7 +822,8 @@ func TestWebhookControlCommandMissingApplyID(t *testing.T) {
 
 			select {
 			case body := <-comments:
-				assert.Contains(t, body, "## Missing Apply ID\n\nThis PR has no apply in `staging` that `"+tt.action+"` can act on.")
+				assert.Contains(t, body, "Missing Apply ID")
+				assert.Contains(t, body, "schemabot "+tt.action+" <apply-id> -e <environment>")
 			case <-time.After(2 * time.Second):
 				t.Fatal("timed out waiting for missing apply ID comment")
 			}

@@ -321,12 +321,6 @@ func PreviewCLIOutput(previewType PreviewType) {
 		fmt.Print(webhooktemplates.PreviewCommentApplyBlockedByPriorEnvFailed())
 	case PreviewCommentBlockedByPriorInProg:
 		fmt.Print(webhooktemplates.PreviewCommentApplyBlockedByPriorEnvInProgress())
-	case PreviewCommentControlMissingApplyID:
-		fmt.Print(webhooktemplates.PreviewCommentControlMissingApplyID())
-	case PreviewCommentControlMissingApplyIDSeveral:
-		fmt.Print(webhooktemplates.PreviewCommentControlMissingApplyIDSeveral())
-	case PreviewCommentRollbackMissingApplyID:
-		fmt.Print(webhooktemplates.PreviewCommentRollbackMissingApplyID())
 	case PreviewCommentBlockedByPriorStopped:
 		fmt.Print(webhooktemplates.PreviewCommentApplyBlockedByStoppedPriorEnvApply())
 	case PreviewCommentReviewRequired:

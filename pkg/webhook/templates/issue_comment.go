@@ -108,6 +108,16 @@ type CutoverCommandAcceptedData struct {
 	Status      string
 }
 
+// RenderControlMissingApplyID renders the message posted when an apply-scoped
+// control command is invoked without the required apply ID. It points at the
+// apply's progress comment, which carries the command with the apply ID.
+func RenderControlMissingApplyID(command string) string {
+	usage := fmt.Sprintf("schemabot %s <apply-id> -e <environment>", command)
+	return offerSupportChannel(fmt.Sprintf("## Missing Apply ID\n\n"+
+		"Usage: `%s`\n\n"+
+		"The apply ID is on the apply's progress comment.", usage))
+}
+
 // RenderStopCommandAccepted renders the acknowledgement posted when a PR
 // comment stop command records durable stop intent.
 func RenderStopCommandAccepted(data StopCommandAcceptedData) string {

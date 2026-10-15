@@ -43,6 +43,16 @@ func TestRenderUnsupportedDatabaseFlagRollbackConfirm(t *testing.T) {
 	assert.Equal(t, "The `-d` flag is not supported for `rollback-confirm`.", rendered)
 }
 
+// The reply names the PR comment usage and where the apply ID is. It never
+// offers a CLI command, which does not work as a PR comment.
+func TestRenderControlMissingApplyID(t *testing.T) {
+	rendered := RenderControlMissingApplyID("stop")
+	assert.Contains(t, rendered, "## Missing Apply ID\n\n"+
+		"Usage: `schemabot stop <apply-id> -e <environment>`\n\n"+
+		"The apply ID is on the apply's progress comment.")
+	assert.NotContains(t, rendered, "status")
+}
+
 func TestRenderStopCommandAccepted(t *testing.T) {
 	rendered := RenderStopCommandAccepted(StopCommandAcceptedData{
 		ApplyID:      "apply_abc123",

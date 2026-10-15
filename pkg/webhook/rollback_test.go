@@ -229,7 +229,8 @@ func TestWebhookRollbackMissingApplyID(t *testing.T) {
 
 	select {
 	case body := <-comments:
-		assert.Contains(t, body, "## Missing Apply ID\n\nThis PR has no completed apply in `staging` to roll back.")
+		assert.Contains(t, body, "Missing Apply ID")
+		assert.Contains(t, body, "schemabot rollback <apply-id> -e <environment>")
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for comment")
 	}

@@ -137,6 +137,17 @@ func RenderRollbackConfirmNoLock(database, environment, tenant string) string {
 		database, environment, rollbackCmd)
 }
 
+// RenderRollbackMissingApplyID renders the message posted when `schemabot rollback`
+// is invoked without an apply ID argument. Tenant is the deployment's own
+// tenant; when set, the rollback usage lines carry it so pasting a hint
+// addresses this deployment.
+func RenderRollbackMissingApplyID(tenant string) string {
+	return offerSupportChannel("## Missing Apply ID\n\n" +
+		fmt.Sprintf("Usage: `%s`\n\n", TenantCommand("schemabot rollback <apply-id>", "<environment>", tenant)) +
+		fmt.Sprintf("Confirm a generated rollback with `%s`.\n\n", TenantCommand("schemabot rollback-confirm", "<environment>", tenant)) +
+		"The apply ID is on the summary comment of the completed apply.")
+}
+
 // RenderRollbackApplyNotFound renders the message posted when the supplied apply ID
 // does not match any stored apply.
 func RenderRollbackApplyNotFound(applyID string) string {

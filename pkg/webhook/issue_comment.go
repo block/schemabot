@@ -392,10 +392,7 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 			return
 		}
 		h.acknowledgeCommand(repo, pr, installationID, deliveryID, result.CommentID)
-		lookupCtx, cancel := h.commandContext(ctx, commandTimeout)
-		data := h.missingApplyIDData(lookupCtx, repo, pr, result, "rollback", rollbackActsOn)
-		cancel()
-		h.postComment(repo, pr, installationID, templates.RenderRollbackMissingApplyID(data))
+		h.postComment(repo, pr, installationID, templates.RenderRollbackMissingApplyID(h.deploymentTenant()))
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "missing apply ID"})
 		return
 	}
@@ -887,17 +884,16 @@ func (h *Handler) acknowledgeCommand(repo string, pr int, installationID int64, 
 // renderPRComment finishes a comment body for posting on repo's PR: an
 // oversized body is replaced with the notice that fits, then the support
 // footer is appended. environment is the one environment the comment is about,
-// which scopes the notice's CLI hint; empty when it names none or several.
+// logged when the body is replaced; empty when it names none or several.
 func (h *Handler) renderPRComment(repo string, pr int, environment, body string) string {
-	return appendSupportChannelFooter(fitPRComment(h.logger, repo, pr, environment, body, h.cliName()), h.supportChannel())
+	return appendSupportChannelFooter(fitPRComment(h.logger, repo, pr, environment, body), h.supportChannel())
 }
 
 // fitPRComment returns body when GitHub will accept it and otherwise the
 // oversized-comment notice, logging the rendered size with the identifiers an
-// operator needs to find the comment that was replaced. cliName starts the
-// notice's CLI command hint and environment scopes it.
-func fitPRComment(logger interface{ Error(msg string, args ...any) }, repo string, pr int, environment, body, cliName string) string {
-	fitted, replaced := templates.FitGitHubComment(body, cliName, environment)
+// operator needs to find the comment that was replaced.
+func fitPRComment(logger interface{ Error(msg string, args ...any) }, repo string, pr int, environment, body string) string {
+	fitted, replaced := templates.FitGitHubComment(body)
 	if replaced {
 		logger.Error("comment exceeds GitHub's size cap; posting the oversized-comment notice in its place",
 			"repo", repo, "pr", pr, "environment", environment, "rendered_bytes", len(body), "limit_bytes", templates.GitHubIssueCommentMaxChars)

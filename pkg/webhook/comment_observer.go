@@ -1861,7 +1861,7 @@ func (o *CommentObserver) renderPRComment(apply *storage.Apply, body string) str
 	if apply != nil {
 		environment = apply.Environment
 	}
-	return appendSupportChannelFooter(fitPRComment(o.logger, o.repo, o.pr, environment, body, o.cliName), o.supportChannel)
+	return appendSupportChannelFooter(fitPRComment(o.logger, o.repo, o.pr, environment, body), o.supportChannel)
 }
 
 // publishClaimedSummary posts the separate apply-level terminal summary
