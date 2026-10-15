@@ -115,7 +115,6 @@ rm -f "$REPO_ROOT/deploy/local/schemabot-dev"
 # deployment by hand.
 PIDS=()
 cleanup() {
-    rm -f "$PINNED_KUBECONFIG"
     echo "Cleaning up port-forwards..."
     for pid in ${PIDS[@]+"${PIDS[@]}"}; do
         kill "$pid" 2>/dev/null || true
@@ -124,11 +123,15 @@ cleanup() {
         echo "Keeping namespace $NAMESPACE and image schemabot:${IMAGE_TAG}"
     else
         echo "Tearing down..."
-        kubectl delete namespace "$NAMESPACE" --ignore-not-found
+        # Teardown still needs the pinned kubeconfig, so it is removed last,
+        # and a failed delete must not skip that removal.
+        kubectl delete namespace "$NAMESPACE" --ignore-not-found ||
+            echo "Warning: could not delete namespace $NAMESPACE; delete it with: kubectl --context minikube delete namespace $NAMESPACE"
         # Best-effort: without this, per-run image tags accumulate in
         # minikube's docker daemon across runs.
         docker rmi "schemabot:${IMAGE_TAG}" > /dev/null 2>&1 || true
     fi
+    rm -f "$PINNED_KUBECONFIG"
 }
 trap cleanup EXIT
 
