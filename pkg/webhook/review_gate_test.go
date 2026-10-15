@@ -306,7 +306,10 @@ func TestCheckReviewGate_ApprovalCoverage(t *testing.T) {
 		// databaseType overrides the database's type, mysql by default.
 		databaseType string
 		// approvedUnknown leaves the approved commit unknown to GitHub.
-		approvedUnknown  bool
+		approvedUnknown bool
+		// headFileStatus makes GitHub answer the read of the head's orders
+		// table file with this HTTP status.
+		headFileStatus   int
 		treesUnavailable bool
 		want             string
 		wantErr          error
@@ -508,6 +511,24 @@ func TestCheckReviewGate_ApprovalCoverage(t *testing.T) {
 			baseChange: setOrders("`id` bigint NOT NULL, `total` bigint"),
 			headChange: setOrders("`id` bigint NOT NULL, `total` bigint, `note` text"),
 			want:       wantCovers,
+		},
+		{
+			// The statements cannot be compared without the head's file, so
+			// a GitHub outage leaves the gate undecided and retryable.
+			name:           "a combined file GitHub cannot serve during an outage is a retryable evaluation failure",
+			prChange:       setOrders("`id` bigint NOT NULL, `note` text"),
+			baseChange:     setOrders("`id` bigint NOT NULL, `total` bigint"),
+			headChange:     setOrders("`id` bigint NOT NULL, `total` bigint, `note` text"),
+			headFileStatus: http.StatusServiceUnavailable,
+			wantErr:        ghclient.ErrGitHubUnavailable,
+		},
+		{
+			name:           "a combined file GitHub no longer has cannot be compared",
+			prChange:       setOrders("`id` bigint NOT NULL, `note` text"),
+			baseChange:     setOrders("`id` bigint NOT NULL, `total` bigint"),
+			headChange:     setOrders("`id` bigint NOT NULL, `total` bigint, `note` text"),
+			headFileStatus: http.StatusNotFound,
+			want:           wantUncompared,
 		},
 		{
 			name:         "a rebase that combined the PR's column with the default branch's in a Vitess keyspace's file counts",
@@ -753,6 +774,12 @@ func TestCheckReviewGate_ApprovalCoverage(t *testing.T) {
 				})
 			} else {
 				registerReviewGateGitObjects(t, mux, commits)
+			}
+			if tt.headFileStatus != 0 {
+				sum := sha1.Sum([]byte("blob\x00" + commits[reviewGateTestHeadSHA]["schema/testdb/orders/orders.sql"]))
+				mux.HandleFunc("GET /repos/octocat/hello-world/git/blobs/"+hex.EncodeToString(sum[:]), func(w http.ResponseWriter, _ *http.Request) {
+					http.Error(w, http.StatusText(tt.headFileStatus), tt.headFileStatus)
+				})
 			}
 
 			client, err := h.clientForRepo("octocat/hello-world", 12345)
