@@ -138,9 +138,12 @@ ORDER BY quarantined_at DESC;
 
 The quarantine log is written before the `RENAME`, so a row can name a copy
 that does not exist when the rename never landed; check that the copy is there
-before restoring it. Leave the log in place: it is SchemaBot's durable record
-of which apply made each copy, the cleaner never drops it, and the cleaner
-deletes a row on its own once that row's copy is gone and past retention.
+before restoring it. A resumed DROP phase reads this log, so an attempt of the
+same apply on another server, or after a restart, recognizes a table it already
+quarantined instead of reporting the drop as lost. Leave the log in place: it is
+SchemaBot's durable record of which apply made each copy, the cleaner never
+drops it, and the cleaner deletes a row on its own once that row's copy is gone
+and past retention.
 
 Also restore the table's `.sql` file in the schema repository, otherwise the
 next plan will produce another `DROP TABLE` for it.

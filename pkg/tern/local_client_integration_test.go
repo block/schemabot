@@ -3706,6 +3706,7 @@ func TestLocalClient_ResumeApplyGroupedRebuildsChangesFromTasks(t *testing.T) {
 	require.NotNil(t, applyReq.ResumeState)
 	assert.Equal(t, apply.ApplyIdentifier, applyReq.ResumeState.MigrationContext)
 	assert.Empty(t, applyReq.ResumeState.Metadata)
+	assert.Equal(t, apply.ApplyIdentifier, applyReq.ApplyIdentifier, "the engine learns which apply it is resuming")
 
 	require.Len(t, applyReq.Changes, 1)
 	assert.Equal(t, "testdb", applyReq.Changes[0].Namespace)
@@ -4755,6 +4756,8 @@ func TestLocalClient_ApplyPersistsBranchOptionForQueuedDrive(t *testing.T) {
 
 	require.NotEmpty(t, eng.applyRequests, "the queued drive must reach the engine")
 	engineOptions := eng.applyRequests[len(eng.applyRequests)-1].Options
+	assert.Equal(t, resp.ApplyId, eng.applyRequests[len(eng.applyRequests)-1].ApplyIdentifier,
+		"the queued drive's engine request must name its apply")
 	assert.Equal(t, "reuse-me", engineOptions["branch"],
 		"the queued drive's engine request must carry the dispatched branch option")
 	assert.Equal(t, "true", engineOptions["defer_cutover"],

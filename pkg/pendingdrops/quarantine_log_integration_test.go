@@ -4,10 +4,15 @@ package pendingdrops
 
 import (
 	"bytes"
+	"context"
 	"database/sql"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/block/mysql"
+	"github.com/block/spirit/pkg/utils"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
@@ -84,6 +89,91 @@ func TestQuarantineLogAcceptsARepeatAndRefusesAnotherOwner(t *testing.T) {
 	assert.Contains(t, err.Error(), "testdb.orders")
 	assert.Empty(t, recordedNames(t, db, "apply-a", "invoices"))
 	assert.Equal(t, []string{moved[0].QuarantineTable}, recordedNames(t, db, "apply-a", "orders"), "the existing record is untouched")
+}
+
+// One DROP TABLE names `cafe` and `café`, two tables MySQL keeps apart. The
+// log keeps their records apart as well, so the quarantine moves both, while a
+// destination that differs from a recorded one only by case is still the same
+// copy, as it is on a server that folds table names.
+func TestQuarantineLogTellsDestinationsApartAsMySQLDoes(t *testing.T) {
+	db := setupCleanerTest(t)
+	now := time.Now()
+	moved, err := Destinations([]TableMove{
+		{SchemaName: "testdb", TableName: "cafe"},
+		{SchemaName: "testdb", TableName: "café"},
+	}, now)
+	require.NoError(t, err)
+	require.NotEqual(t, moved[0].QuarantineTable, moved[1].QuarantineTable)
+
+	require.NoError(t, RecordQuarantines(t.Context(), db, "apply-a", moved, now))
+	assert.Equal(t, []string{moved[0].QuarantineTable}, recordedNames(t, db, "apply-a", "cafe"))
+	assert.Equal(t, []string{moved[1].QuarantineTable}, recordedNames(t, db, "apply-a", "café"))
+
+	for _, stmt := range []string{
+		"CREATE TABLE `testdb`.`cafe` (id INT)",
+		"CREATE TABLE `testdb`.`café` (id INT)",
+	} {
+		_, err := db.ExecContext(t.Context(), stmt)
+		require.NoError(t, err, stmt)
+	}
+	t.Cleanup(func() {
+		_, err := db.ExecContext(context.WithoutCancel(t.Context()), "DROP TABLE IF EXISTS `testdb`.`cafe`, `testdb`.`café`")
+		assert.NoError(t, err, "drop accent tables")
+	})
+	require.NoError(t, MoveTablesTo(t.Context(), db, moved))
+	assert.Contains(t, quarantinedTables(t, db), moved[0].QuarantineTable)
+	assert.Contains(t, quarantinedTables(t, db), moved[1].QuarantineTable)
+
+	folded := []QuarantinedTable{{SchemaName: "testdb", TableName: "cafe", QuarantineSchema: Database, QuarantineTable: strings.ToUpper(moved[0].QuarantineTable)}}
+	err = RecordQuarantines(t.Context(), db, "apply-b", folded, now)
+	require.Error(t, err, "a destination differing only by case is the recorded copy")
+	assert.Contains(t, err.Error(), "apply-a")
+}
+
+// A resume reads the quarantine log with whatever credentials it has. A target
+// with no pending drops database, or one without the log, has no records. A
+// log the account cannot read is an error, never an empty log: taking it for
+// empty would let a DROP TABLE IF EXISTS of a table this apply already moved
+// report the drop done without finding its copy.
+func TestRecordedQuarantinesDistinguishesNoLogFromAnUnreadableOne(t *testing.T) {
+	db := setupCleanerTest(t)
+
+	t.Run("no pending drops database", func(t *testing.T) {
+		assert.Empty(t, recordedNames(t, db, "apply-a", "orders"))
+	})
+
+	t.Run("pending drops database without the log", func(t *testing.T) {
+		_, err := db.ExecContext(t.Context(), fmt.Sprintf("CREATE DATABASE `%s`", Database))
+		require.NoError(t, err)
+		assert.Empty(t, recordedNames(t, db, "apply-a", "orders"))
+	})
+
+	t.Run("a log the account cannot read", func(t *testing.T) {
+		recordQuarantine(t, db, "apply-a", "orders", time.Now())
+
+		const user, password = "pending_drops_blind", "no-pending-drops-pw"
+		_, err := db.ExecContext(t.Context(), "CREATE USER IF NOT EXISTS '"+user+"'@'%' IDENTIFIED BY '"+password+"'")
+		require.NoError(t, err, "create user without pending drops access")
+		t.Cleanup(func() {
+			_, err := db.ExecContext(context.WithoutCancel(t.Context()), "DROP USER IF EXISTS '"+user+"'@'%'")
+			assert.NoError(t, err, "drop user without pending drops access")
+		})
+		_, err = db.ExecContext(t.Context(), "GRANT SELECT ON `testdb`.* TO '"+user+"'@'%'")
+		require.NoError(t, err, "grant select on testdb")
+
+		cfg, err := mysql.ParseDSN(sharedDSN)
+		require.NoError(t, err)
+		cfg.User, cfg.Passwd = user, password
+		limited, err := sql.Open("block-mysql", cfg.FormatDSN())
+		require.NoError(t, err)
+		t.Cleanup(func() { utils.CloseAndLog(limited) })
+		require.NoError(t, limited.PingContext(t.Context()))
+
+		recorded, err := RecordedQuarantines(t.Context(), limited, "apply-a", "testdb", "orders")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "read recorded quarantines of testdb.orders for apply apply-a")
+		assert.Empty(t, recorded)
+	})
 }
 
 // A quarantine log the cleaner cannot read fails the pass under its own

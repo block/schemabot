@@ -233,7 +233,7 @@ func (c *LocalClient) checkTaskReady(ctx context.Context, logger *slog.Logger, t
 // drive paths already set TargetShards via taskTargetShards; this is the
 // single-task path's equivalent. The identity-bound drive logger rides along
 // so engine lines for this task inherit the apply's triage identity.
-func sequentialEngineApplyRequest(task *storage.Task, options map[string]string, creds *engine.Credentials, logger *slog.Logger) *engine.ApplyRequest {
+func sequentialEngineApplyRequest(applyIdentifier string, task *storage.Task, options map[string]string, creds *engine.Credentials, logger *slog.Logger) *engine.ApplyRequest {
 	change := engine.SchemaChange{
 		Namespace:    task.Namespace,
 		TableChanges: []engine.TableChange{{Table: task.TableName, DDL: task.DDL}},
@@ -242,12 +242,13 @@ func sequentialEngineApplyRequest(task *storage.Task, options map[string]string,
 		change.Shard = engine.Shard{Name: task.Shard}
 	}
 	req := &engine.ApplyRequest{
-		Database:    task.Database,
-		Changes:     []engine.SchemaChange{change},
-		Options:     options,
-		ResumeState: &engine.ResumeState{MigrationContext: task.TaskIdentifier},
-		Credentials: creds,
-		Logger:      logger,
+		ApplyIdentifier: applyIdentifier,
+		Database:        task.Database,
+		Changes:         []engine.SchemaChange{change},
+		Options:         options,
+		ResumeState:     &engine.ResumeState{MigrationContext: task.TaskIdentifier},
+		Credentials:     creds,
+		Logger:          logger,
 	}
 	if task.Shard != "" {
 		req.TargetShards = []string{task.Shard}
@@ -556,7 +557,7 @@ func (c *LocalClient) runEngineTaskAttempt(ctx context.Context, apply *storage.A
 	// Sequential mode: one DDL per engine call. The task identifier is used as the
 	// engine resume key (ResumeState.MigrationContext) so each table's schema
 	// change is tracked independently.
-	request := sequentialEngineApplyRequest(task, options, taskCreds, logger)
+	request := sequentialEngineApplyRequest(apply.ApplyIdentifier, task, options, taskCreds, logger)
 	needsFiles, err := c.taskNeedsRowSecurityFiles(task)
 	if err != nil {
 		return c.failureVerdictAction(apply.ApplyIdentifier, task, c.markTaskFailed(ctx, task, fmt.Sprintf("resolve row security parser: %v", err)))

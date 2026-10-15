@@ -150,9 +150,15 @@ type runningSchemaChange struct {
 	// fails on a table that vanished some other way. A table keeps every
 	// destination recorded for it, oldest first, since a RENAME a stop
 	// abandoned can still land after a replay recorded a newer one. It lives
-	// in this process only; a resume that goes through Apply starts with an
-	// empty record.
+	// in this process only; the target's quarantine log keeps the same record
+	// durably for a schema change that names its apply (applyIdentifier).
 	quarantinedDrops map[dropTarget][]pendingdrops.QuarantinedTable
+
+	// applyIdentifier names the apply this schema change belongs to
+	// (engine.ApplyRequest.ApplyIdentifier), or is empty when it belongs to
+	// none. It keys the target's quarantine log, so an attempt in another
+	// process recognizes the tables this apply quarantined.
+	applyIdentifier string
 
 	// owner is the drive the run belongs to (engine.WithWorkOwner), set when
 	// Apply starts the run and again when Start resumes it, under Engine.mu.
@@ -957,21 +963,22 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 	// reaches it.
 	bgCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
 	rm := &runningSchemaChange{
-		logger:         logger,
-		spiritLogger:   spiritLogger,
-		database:       database,
-		tableNamespace: tableNamespace,
-		tables:         nil, // Tables will be populated by executeSchemaChange
-		originalDDLs:   req.FlatDDL(),
-		state:          engine.StateRunning,
-		started:        time.Now(),
-		deferCutover:   deferCutover,
-		directPolicy:   directExecPolicy,
-		host:           host,
-		username:       username,
-		password:       password,
-		cancelFunc:     cancel,
-		owner:          engine.WorkOwnerFromContext(ctx),
+		logger:          logger,
+		spiritLogger:    spiritLogger,
+		database:        database,
+		tableNamespace:  tableNamespace,
+		tables:          nil, // Tables will be populated by executeSchemaChange
+		originalDDLs:    req.FlatDDL(),
+		state:           engine.StateRunning,
+		started:         time.Now(),
+		deferCutover:    deferCutover,
+		directPolicy:    directExecPolicy,
+		host:            host,
+		username:        username,
+		password:        password,
+		cancelFunc:      cancel,
+		owner:           engine.WorkOwnerFromContext(ctx),
+		applyIdentifier: req.ApplyIdentifier,
 	}
 	e.installRunningSchemaChange(rm)
 

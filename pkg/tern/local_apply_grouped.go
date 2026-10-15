@@ -87,16 +87,17 @@ func (c *LocalClient) executeGroupedApply(ctx context.Context, apply *storage.Ap
 	// Grouped mode: all DDLs in one engine call. Use the apply identifier so all
 	// table work shares one context for progress tracking.
 	result, err := c.applyWithEngine(ctx, eng, &engine.ApplyRequest{
-		Database:     apply.Database,
-		PlanID:       plan.PlanIdentifier,
-		Changes:      changes,
-		TargetShards: taskTargetShards(tasks),
-		SchemaFiles:  plan.SchemaFiles,
-		IgnoreTables: plan.IgnoreTables(),
-		Options:      options,
-		ResumeState:  &engine.ResumeState{MigrationContext: apply.ApplyIdentifier},
-		Credentials:  creds,
-		Logger:       logger,
+		ApplyIdentifier: apply.ApplyIdentifier,
+		Database:        apply.Database,
+		PlanID:          plan.PlanIdentifier,
+		Changes:         changes,
+		TargetShards:    taskTargetShards(tasks),
+		SchemaFiles:     plan.SchemaFiles,
+		IgnoreTables:    plan.IgnoreTables(),
+		Options:         options,
+		ResumeState:     &engine.ResumeState{MigrationContext: apply.ApplyIdentifier},
+		Credentials:     creds,
+		Logger:          logger,
 		OnEvent: func(event engine.ApplyEvent) {
 			oldState := apply.State
 			newState := deriveApplyPhase(event)
