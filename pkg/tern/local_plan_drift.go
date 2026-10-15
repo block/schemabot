@@ -44,12 +44,41 @@ type driftChangeKey struct {
 type driftChangeMultiset map[driftChangeKey]int
 
 // replannedChange is one change as this deployment's own re-plan produced it:
-// the statement its engine emitted against this target and the execution-mode
-// verdict on how that statement would run here.
+// the statement its engine emitted against this target, the execution-mode
+// verdict on how that statement would run here, and whether its engine judged
+// the statement unsafe.
 type replannedChange struct {
-	ddl    string
-	mode   string
-	reason string
+	ddl          string
+	mode         string
+	reason       string
+	unsafe       bool
+	unsafeReason string
+}
+
+// replannedChangeOf reads the re-planned facts back off a plan row's change,
+// so a change carried from the plan row is stamped exactly as the plan row
+// was.
+func replannedChangeOf(tc storage.TableChange) replannedChange {
+	return replannedChange{ddl: tc.DDL, mode: tc.ExecutionMode, reason: tc.ModeReason, unsafe: tc.IsUnsafe, unsafeReason: tc.UnsafeReason}
+}
+
+// stampOnto writes the re-planned facts onto a change. The statement and
+// execution-mode verdict are this target's and replace what the change
+// carried. The unsafe flag is only ever tightened: a re-plan that judges the
+// statement unsafe marks the change unsafe, so the unsafe-change admission
+// gate requires the opt-in for it, and a re-plan that judges it safe leaves a
+// change already marked unsafe as it is.
+func (r replannedChange) stampOnto(tc *storage.TableChange) {
+	tc.DDL = r.ddl
+	tc.ExecutionMode = r.mode
+	tc.ModeReason = r.reason
+	if !r.unsafe {
+		return
+	}
+	tc.IsUnsafe = true
+	if r.unsafeReason != "" {
+		tc.UnsafeReason = r.unsafeReason
+	}
 }
 
 // replannedChanges records, per change, what this deployment's re-plan
@@ -221,7 +250,7 @@ func (c *LocalClient) driftMultisetFromPlanResult(result *engine.PlanResult, sha
 			}
 			key := driftChangeKey{ns, shard, tc.Table, ddl.StatementTypeToOp(tc.Operation), canon}
 			ms[key]++
-			replanned.record(key, replannedChange{ddl: tc.DDL, mode: tc.ExecutionMode, reason: tc.ModeReason})
+			replanned.record(key, replannedChange{ddl: tc.DDL, mode: tc.ExecutionMode, reason: tc.ModeReason, unsafe: tc.IsUnsafe, unsafeReason: tc.UnsafeReason})
 		}
 	}
 	return ms, replanned, nil
@@ -254,6 +283,11 @@ func (c *LocalClient) driftMultisetFromPlanResult(result *engine.PlanResult, sha
 // reviewed text it will never run. Every materialized change has a re-planned
 // counterpart because the drift comparison already required the two multisets
 // to match key for key.
+//
+// The unsafe flag is tightened the same way. The dispatch does not carry the
+// flag, and an operation the statement classifies as an alter can still drop
+// data (a dropped column), so without the re-plan's judgement the
+// unsafe-change admission gate would admit it without the opt-in.
 func (c *LocalClient) stampReplannedChanges(namespaces map[string]*storage.NamespacePlanData, replanned replannedChanges) error {
 	parser, err := c.statementParser()
 	if err != nil {
@@ -273,9 +307,7 @@ func (c *LocalClient) stampReplannedChanges(namespaces map[string]*storage.Names
 			if !ok {
 				return fmt.Errorf("table %q: no re-planned change for one the drift comparison matched", tc.Table)
 			}
-			tc.DDL = change.ddl
-			tc.ExecutionMode = change.mode
-			tc.ModeReason = change.reason
+			change.stampOnto(tc)
 		}
 	}
 	return nil
@@ -293,7 +325,8 @@ func (c *LocalClient) stampReplannedChanges(namespaces map[string]*storage.Names
 // target's re-planned text. The substitution here closes that gap: each
 // dispatched change is matched to its counterpart in the plan row under the
 // drift key — the same equivalence the drift comparison admitted it on — and
-// takes the counterpart's statement and execution-mode verdict. A change with
+// takes the counterpart's statement and execution-mode verdict, and its unsafe
+// flag where the counterpart is marked unsafe. A change with
 // no counterpart keeps the dispatched statement: the plan row was materialized
 // by a sibling dispatch of the same plan and holds only that dispatch's
 // changes, or was planned locally and holds its sharded changes per shard, and
@@ -342,9 +375,7 @@ func (c *LocalClient) dispatchScopeForApply(plan *storage.Plan, req *ternv1.Appl
 		}
 		// Consume the match so a duplicated change pairs one to one.
 		stored[key] = matches[1:]
-		ch.DDL = matches[0].DDL
-		ch.ExecutionMode = matches[0].ExecutionMode
-		ch.ModeReason = matches[0].ModeReason
+		replannedChangeOf(matches[0]).stampOnto(ch)
 	}
 	return scope, nil
 }
