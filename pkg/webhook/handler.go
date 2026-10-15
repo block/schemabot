@@ -419,7 +419,12 @@ func (h *Handler) refreshChecksForTerminalApply(ctx context.Context, a *storage.
 			append(checkFields(), "error", err)...)
 		return
 	}
-	if !updated {
+	// A stopped apply leaves its stored check in_progress, so the write above
+	// changes nothing, but the Check Run still says the apply is running. The
+	// aggregate is republished so the PR shows the apply as stopped while merge
+	// stays blocked.
+	stopped := state.IsState(a.State, state.Apply.Stopped)
+	if !updated && !stopped {
 		h.logger.Debug("observer: skipping aggregate check update for terminal apply, apply no longer owns check state",
 			checkFields()...)
 		return
@@ -441,6 +446,11 @@ func (h *Handler) refreshChecksForTerminalApply(ctx context.Context, a *storage.
 			checkFields()...)
 		return
 	}
+	if stopped && checkRecord.ApplyID != a.ID {
+		h.logger.Debug("observer: skipping aggregate check update for stopped apply, another apply owns the stored check state",
+			append(checkFields(), "check_apply_id", checkRecord.ApplyID)...)
+		return
+	}
 	// The stored row names the commit the apply started on, and the terminal
 	// write above re-pins it there. Both decisions left — which commit carries
 	// the outcome, and whether a re-plan is owed — turn on where the PR is now,
@@ -459,6 +469,13 @@ func (h *Handler) refreshChecksForTerminalApply(ctx context.Context, a *storage.
 	}
 
 	h.updateAggregateCheck(publishHeadCtx(ctx, a, prInfo), ghInstClient, a.Repository, a.PullRequest, aggregatePublishSHA(checkRecord, prInfo))
+	if stopped {
+		// The stopped apply still holds its check, so a plan for a newer head
+		// would be refused; the re-plan waits for the apply to settle.
+		h.logger.Debug("no re-plan after stopped apply: the apply still holds its check until it is started or cancelled",
+			checkFields()...)
+		return
+	}
 	h.replanAfterTerminalApply(a, checkRecord, prInfo)
 }
 
