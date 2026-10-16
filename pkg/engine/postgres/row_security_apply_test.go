@@ -29,12 +29,20 @@ func TestValidateRowSecurityApply(t *testing.T) {
  );
  CREATE INDEX orders_placed_at_idx ON orders (placed_at);
  `
-	// A foreign key is refused by ordinary admission, so this companion fails
-	// the apply check, and the error names its file.
+	// A foreign key to an unqualified table is admitted by ordinary
+	// admission, so this companion passes the apply check.
 	const foreignKeyCompanion = `
  CREATE TABLE orders (
      id bigint PRIMARY KEY,
      document_id bigint REFERENCES documents (id)
+ );
+ `
+	// A schema-qualified reference is refused by ordinary admission, so this
+	// companion fails the apply check, and the error names its file.
+	const qualifiedReferenceCompanion = `
+ CREATE TABLE orders (
+     id bigint PRIMARY KEY,
+     document_id bigint REFERENCES other.documents (id)
  );
  `
 	// Another table's row security declaration is the ordinary case for a
@@ -58,8 +66,9 @@ func TestValidateRowSecurityApply(t *testing.T) {
 		{name: "table only file", namespace: "public", table: "documents", definition: "CREATE TABLE documents (id bigint PRIMARY KEY)", wantError: "declaration for table"},
 		{name: "duplicate file", namespace: "public", table: "documents", definition: desired, duplicate: true, wantError: "multiple row security declarations"},
 		{name: "admitted ordinary companion", namespace: "public", table: "documents", definition: desired, companion: ordinaryCompanion},
-		{name: "unsupported ordinary companion", namespace: "public", table: "documents", definition: desired, companion: foreignKeyCompanion,
-			wantError: `parse schema file "orders.sql"`, wantErrorIs: pgstatement.ErrForeignKey},
+		{name: "admitted foreign-key companion", namespace: "public", table: "documents", definition: desired, companion: foreignKeyCompanion},
+		{name: "unsupported ordinary companion", namespace: "public", table: "documents", definition: desired, companion: qualifiedReferenceCompanion,
+			wantError: `parse schema file "orders.sql"`, wantErrorIs: pgstatement.ErrQualifiedName},
 		{name: "other table's row security companion", namespace: "public", table: "documents", definition: desired, companion: rowSecurityCompanion},
 		{name: "deferred cutover", namespace: "public", table: "documents", definition: desired, deferCutover: true, wantError: "do not support deferred cutover"},
 	} {

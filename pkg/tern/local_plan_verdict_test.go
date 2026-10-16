@@ -210,6 +210,253 @@ func TestReplannedChangesRecordBlockedWins(t *testing.T) {
 	assert.Equal(t, direct, neitherBlocked.byChange[key], "the first non-blocked change stands")
 }
 
+const dropLegacyIDReason = "DROP COLUMN removes data"
+
+// dropUsersLegacyIDReplan is this deployment's re-plan of a dropped column: an
+// alter by operation, which its engine judges unsafe.
+func dropUsersLegacyIDReplan(shard string) *engine.PlanResult {
+	return &engine.PlanResult{
+		Changes: []engine.SchemaChange{{
+			Namespace: "testapp",
+			Shard:     engine.Shard{Name: shard},
+			TableChanges: []engine.TableChange{{
+				Table:        "users",
+				Operation:    ddl.StatementAlterTable,
+				DDL:          "ALTER TABLE `users` DROP COLUMN `legacy_id`",
+				IsUnsafe:     true,
+				UnsafeReason: dropLegacyIDReason,
+			}},
+		}},
+	}
+}
+
+// dropUsersLegacyIDDispatch is the dispatch for the dropped column as task rows
+// build it: no unsafe flag travels with it.
+func dropUsersLegacyIDDispatch(planID string, targetShards ...string) *ternv1.ApplyRequest {
+	return &ternv1.ApplyRequest{
+		PlanId:       planID,
+		TargetShards: targetShards,
+		DdlChanges: []*ternv1.TableChange{
+			{TableName: "users", Ddl: "ALTER TABLE `users` DROP COLUMN `legacy_id`", ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER, Namespace: "testapp"},
+		},
+	}
+}
+
+// A dispatched column drop carries no unsafe flag, and its operation is an
+// alter, so only this deployment's re-plan knows it destroys data. The
+// materialized plan and the dispatch scope built from it must carry that
+// judgement, so the unsafe-change admission gate refuses the apply unless the
+// operator opted in — whether the dispatch covers the whole deployment or one
+// shard.
+func TestDispatchScopeCarriesReplannedUnsafeVerdict(t *testing.T) {
+	cases := []struct {
+		name         string
+		shard        string
+		targetShards []string
+	}{
+		{name: "whole deployment"},
+		{name: "shard scoped", shard: "-80", targetShards: []string{"-80"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store := &fakePlanStore{getFn: func(string) (*storage.Plan, error) { return nil, nil }, createID: 25}
+			c := newPlanMaterializeClientWithPlan(store, dropUsersLegacyIDReplan(tc.shard))
+			req := dropUsersLegacyIDDispatch("plan_drop_legacy_id", tc.targetShards...)
+
+			plan, err := c.planForApplyRequest(t.Context(), req)
+			require.NoError(t, err)
+			require.NotNil(t, plan)
+			stored := plan.Namespaces["testapp"].Tables[0]
+			assert.True(t, stored.IsUnsafe, "the plan row carries the re-plan's unsafe verdict")
+			assert.Equal(t, dropLegacyIDReason, stored.UnsafeReason)
+
+			scope, err := c.dispatchScopeForApply(plan, req)
+			require.NoError(t, err)
+			require.Len(t, scope.ddlChanges, 1)
+			assert.True(t, scope.ddlChanges[0].IsUnsafe, "the dispatch scope the admission gate reads carries it too")
+
+			require.EqualError(t, rejectUnsafeDDLChangesWithoutOptIn(plan.PlanIdentifier, scope.ddlChanges, storage.ApplyOptions{}),
+				`stored plan plan_drop_legacy_id contains unsafe change for table "users": `+dropLegacyIDReason+`; retry with allow_unsafe=true`)
+			require.NoError(t, rejectUnsafeDDLChangesWithoutOptIn(plan.PlanIdentifier, scope.ddlChanges, storage.ApplyOptions{AllowUnsafe: true}))
+		})
+	}
+}
+
+// A locally planned keyspace whose shards diverge keeps each shard's own
+// changes on its shard row, while the namespace-level tables list each table
+// once with the first shard's text and verdict. A dispatch scoped to the shard
+// that drops a column must be matched to that shard's row, so its task rows
+// carry the unsafe verdict only that row holds and the unsafe-change admission
+// gate refuses the apply without the opt-in, while the sibling shard's dispatch
+// of a safe add stays safe.
+func TestDispatchScopeCarriesDivergentShardUnsafeVerdict(t *testing.T) {
+	c := newPlanMaterializeClient(&fakePlanStore{})
+	namespaces, shards := c.namespacesFromEngineChanges([]engine.SchemaChange{
+		{Namespace: "testapp", Shard: engine.Shard{Name: "-80"}, TableChanges: []engine.TableChange{
+			{Table: "users", Operation: ddl.StatementAlterTable, DDL: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)"},
+		}},
+		{Namespace: "testapp", Shard: engine.Shard{Name: "80-"}, TableChanges: []engine.TableChange{
+			{Table: "users", Operation: ddl.StatementAlterTable, DDL: "ALTER TABLE `users` DROP COLUMN `legacy_id`",
+				IsUnsafe: true, UnsafeReason: dropLegacyIDReason},
+		}},
+	}, nil)
+	require.Len(t, namespaces["testapp"].Tables, 1, "the namespace-level copy is deduped by table name")
+	assert.False(t, namespaces["testapp"].Tables[0].IsUnsafe, "and the surviving copy is the safe add")
+	plan := &storage.Plan{PlanIdentifier: "plan-divergent", Namespaces: namespaces, Shards: shards}
+
+	dropScope, err := c.dispatchScopeForApply(plan, dropUsersLegacyIDDispatch(plan.PlanIdentifier, "80-"))
+	require.NoError(t, err)
+	require.Len(t, dropScope.ddlChanges, 1)
+	assert.True(t, dropScope.ddlChanges[0].IsUnsafe, "the task rows carry the dropping shard's verdict")
+	assert.Equal(t, dropLegacyIDReason, dropScope.ddlChanges[0].UnsafeReason)
+	require.EqualError(t, rejectUnsafeDDLChangesWithoutOptIn(plan.PlanIdentifier, dropScope.ddlChanges, storage.ApplyOptions{}),
+		`stored plan plan-divergent contains unsafe change for table "users": `+dropLegacyIDReason+`; retry with allow_unsafe=true`)
+
+	addScope, err := c.dispatchScopeForApply(plan, alterUsersEmailDispatch(plan.PlanIdentifier, "-80"))
+	require.NoError(t, err)
+	require.Len(t, addScope.ddlChanges, 1)
+	assert.False(t, addScope.ddlChanges[0].IsUnsafe, "the adding shard's dispatch stays safe")
+	require.NoError(t, rejectUnsafeDDLChangesWithoutOptIn(plan.PlanIdentifier, addScope.ddlChanges, storage.ApplyOptions{}))
+}
+
+// A non-primary deployment materializes its plan row from the first shard
+// dispatch to arrive, so the row holds only that shard's changes, and a later
+// sibling dispatch resolves to the stored row without a re-plan. When the
+// sibling drops a column, nothing on this deployment has judged it, so its
+// dispatch scope is marked unsafe with a reason saying the verdict could not
+// be confirmed here, and the unsafe-change admission gate refuses it without
+// the opt-in.
+func TestDispatchScopeCarriesSiblingShardUnsafeVerdict(t *testing.T) {
+	var stored *storage.Plan
+	store := &fakePlanStore{getFn: func(string) (*storage.Plan, error) { return stored, nil }, createID: 37}
+	c := newPlanMaterializeClientWithPlan(store, alterUsersEmailShardPlan("-80"))
+
+	first, err := c.planForApplyRequest(t.Context(), alterUsersEmailDispatch("plan_sibling", "-80"))
+	require.NoError(t, err)
+	require.NotNil(t, first)
+	stored = first
+
+	req := dropUsersLegacyIDDispatch("plan_sibling", "80-")
+	plan, err := c.planForApplyRequest(t.Context(), req)
+	require.NoError(t, err, "the stored row is returned; no re-plan runs for the sibling")
+	require.Same(t, first, plan)
+	scope, err := c.dispatchScopeForApply(plan, req)
+	require.NoError(t, err)
+	require.Len(t, scope.ddlChanges, 1)
+	assert.True(t, scope.ddlChanges[0].IsUnsafe, "the sibling shard's unjudged drop is marked unsafe")
+	assert.Equal(t, unconfirmedUnsafeReason, scope.ddlChanges[0].UnsafeReason)
+	require.EqualError(t, rejectUnsafeDDLChangesWithoutOptIn(plan.PlanIdentifier, scope.ddlChanges, storage.ApplyOptions{}),
+		`stored plan plan_sibling contains unsafe change for table "users": `+unconfirmedUnsafeReason+`; retry with allow_unsafe=true`)
+	require.NoError(t, rejectUnsafeDDLChangesWithoutOptIn(plan.PlanIdentifier, scope.ddlChanges, storage.ApplyOptions{AllowUnsafe: true}))
+
+	// The shard that materialized the row matches its own counterpart and
+	// keeps the re-plan's safe verdict.
+	firstScope, err := c.dispatchScopeForApply(plan, alterUsersEmailDispatch("plan_sibling", "-80"))
+	require.NoError(t, err)
+	require.Len(t, firstScope.ddlChanges, 1)
+	assert.False(t, firstScope.ddlChanges[0].IsUnsafe)
+}
+
+// sameTextShardPlan is a locally planned keyspace whose shards carry the same
+// statement for users, judged unsafe only on 80-, with the shards planned in
+// the given order. The namespace-level copy holds the first shard's verdict.
+func sameTextShardPlan(t *testing.T, c *LocalClient, order ...string) *storage.Plan {
+	t.Helper()
+	const addEmail = "ALTER TABLE `users` ADD COLUMN `email` varchar(255)"
+	var changes []engine.SchemaChange
+	for _, shard := range order {
+		tc := engine.TableChange{Table: "users", Operation: ddl.StatementAlterTable, DDL: addEmail}
+		if shard == "80-" {
+			tc.IsUnsafe, tc.UnsafeReason = true, "ADD COLUMN narrows existing data on this shard"
+		}
+		changes = append(changes, engine.SchemaChange{Namespace: "testapp", Shard: engine.Shard{Name: shard}, TableChanges: []engine.TableChange{tc}})
+	}
+	namespaces, shards := c.namespacesFromEngineChanges(changes, nil)
+	require.Len(t, namespaces["testapp"].Tables, 1, "the namespace-level copy is deduped by table name")
+	return &storage.Plan{PlanIdentifier: "plan-same-text", Namespaces: namespaces, Shards: shards}
+}
+
+// Two shards carry the same statement with different unsafe verdicts, and the
+// namespace-level copy holds the safe shard's. A dispatch for the unsafe shard
+// is matched to its own shard row, not to the namespace-level copy, so it
+// carries its own unsafe verdict.
+func TestSameTextShardVerdictFollowsDispatchedShard(t *testing.T) {
+	c := newPlanMaterializeClient(&fakePlanStore{})
+	plan := sameTextShardPlan(t, c, "-80", "80-")
+	scope, err := c.dispatchScopeForApply(plan, alterUsersEmailDispatch(plan.PlanIdentifier, "80-"))
+	require.NoError(t, err)
+	require.Len(t, scope.ddlChanges, 1)
+	assert.True(t, scope.ddlChanges[0].IsUnsafe, "the unsafe shard's dispatch carries its own verdict")
+	assert.Equal(t, "ADD COLUMN narrows existing data on this shard", scope.ddlChanges[0].UnsafeReason)
+}
+
+// The mirror case: the namespace-level copy holds the unsafe shard's verdict.
+// A dispatch for the safe shard is matched to its own shard row only, so it
+// does not borrow the unsafe sibling's verdict.
+func TestSameTextShardVerdictNotBorrowedFromSibling(t *testing.T) {
+	c := newPlanMaterializeClient(&fakePlanStore{})
+	plan := sameTextShardPlan(t, c, "80-", "-80")
+	scope, err := c.dispatchScopeForApply(plan, alterUsersEmailDispatch(plan.PlanIdentifier, "-80"))
+	require.NoError(t, err)
+	require.Len(t, scope.ddlChanges, 1)
+	assert.False(t, scope.ddlChanges[0].IsUnsafe, "the safe shard stays safe")
+	assert.Empty(t, scope.ddlChanges[0].UnsafeReason)
+}
+
+// When the re-plan holds the same change twice and only one copy is unsafe,
+// the kept copy is unsafe regardless of order, as a blocked copy wins: a
+// verdict that would require the opt-in is never dropped by a duplicate.
+func TestReplannedChangesRecordUnsafeWins(t *testing.T) {
+	key := driftChangeKey{namespace: "testapp", table: "users", operation: "alter", ddl: "x"}
+	safe := replannedChange{ddl: "a", mode: engine.ExecutionModeDirect}
+	unsafe := replannedChange{ddl: "a", mode: engine.ExecutionModeDirect, unsafe: true, unsafeReason: "drops data"}
+
+	unsafeLast := replannedChanges{byChange: map[driftChangeKey]replannedChange{}}
+	unsafeLast.record(key, safe)
+	unsafeLast.record(key, unsafe)
+	assert.Equal(t, unsafe, unsafeLast.byChange[key])
+
+	unsafeFirst := replannedChanges{byChange: map[driftChangeKey]replannedChange{}}
+	unsafeFirst.record(key, unsafe)
+	unsafeFirst.record(key, safe)
+	assert.Equal(t, unsafe, unsafeFirst.byChange[key])
+
+	// A blocked copy is kept for its verdict and still takes the unsafe flag
+	// of the copy it displaced.
+	blocked := replannedChange{ddl: "a", mode: engine.ExecutionModeBlocked, reason: localBlockedReason}
+	blockedLast := replannedChanges{byChange: map[driftChangeKey]replannedChange{}}
+	blockedLast.record(key, unsafe)
+	blockedLast.record(key, blocked)
+	assert.Equal(t, replannedChange{ddl: "a", mode: engine.ExecutionModeBlocked, reason: localBlockedReason, unsafe: true, unsafeReason: "drops data"}, blockedLast.byChange[key])
+}
+
+// The re-plan's unsafe verdict only ever tightens a change: an unsafe re-plan
+// marks a safe change unsafe, and a safe re-plan leaves a change already
+// marked unsafe, and its reason, as they were.
+func TestReplannedChangeStampOntoOnlyTightensUnsafe(t *testing.T) {
+	const statement = "ALTER TABLE `users` DROP COLUMN `legacy_id`"
+
+	tightened := storage.TableChange{Table: "users", Operation: "alter", DDL: statement}
+	replannedChange{ddl: statement, unsafe: true, unsafeReason: dropLegacyIDReason}.stampOnto(&tightened)
+	assert.True(t, tightened.IsUnsafe)
+	assert.Equal(t, dropLegacyIDReason, tightened.UnsafeReason)
+
+	kept := storage.TableChange{Table: "users", Operation: "alter", DDL: statement, IsUnsafe: true, UnsafeReason: "reviewed as unsafe"}
+	replannedChange{ddl: statement}.stampOnto(&kept)
+	assert.True(t, kept.IsUnsafe, "a safe re-plan never clears the unsafe flag")
+	assert.Equal(t, "reviewed as unsafe", kept.UnsafeReason)
+
+	keptReason := storage.TableChange{Table: "users", Operation: "alter", DDL: statement, IsUnsafe: true, UnsafeReason: "reviewed as unsafe"}
+	replannedChange{ddl: statement, unsafe: true}.stampOnto(&keptReason)
+	assert.True(t, keptReason.IsUnsafe)
+	assert.Equal(t, "reviewed as unsafe", keptReason.UnsafeReason, "an unsafe re-plan with no reason keeps the existing one")
+
+	safe := storage.TableChange{Table: "users", Operation: "alter", DDL: statement}
+	replannedChange{ddl: statement}.stampOnto(&safe)
+	assert.False(t, safe.IsUnsafe)
+	assert.Empty(t, safe.UnsafeReason)
+}
+
 // A blocked verdict on one shard's copy of a table already seen on another
 // shard is deduped out of the namespace-level tables but survives on the shard
 // plan, which is what the admission gate reads.
