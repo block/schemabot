@@ -987,10 +987,11 @@ func (s *lostReplyDerivedStateApplyStore) CheckLease(_ context.Context, lease st
 // drive's lease, the write landed: the drive takes the stored row as its own
 // and answers for the outcome the way a write with a reply would, rather than
 // leaving it for the next restart's reconciliation. A completed, failed, or
-// stopped apply settles the revert it moots and posts its terminal summary; a
+// stopped apply answers the revert it outran as not applied (none of them is
+// the reverted outcome the revert asked for) and posts its terminal summary; a
 // stopped apply stays counted on the active-apply gauge and the others release
-// it. A failed_retryable pause settles the revert, releases the gauge, and
-// sends a progress update rather than a terminal summary. When the stored row
+// it. A failed_retryable pause answers the revert the same way, releases the
+// gauge, and sends a progress update rather than a terminal summary. When the stored row
 // carries another lease's token, nothing proves the write was this drive's
 // (OW-2): the drive exits with the write error, the revert stays pending,
 // nothing posts, and the gauge is left alone.
@@ -1013,7 +1014,7 @@ func TestPollForCompletionAtomic_SettledWriteWithALostReplyIsAdoptedOnlyUnderThi
 			result:            engine.ProgressResult{State: engine.StateCompleted},
 			storedToken:       "tok-a",
 			wantState:         state.Apply.Completed,
-			wantRevertStatus:  storage.ControlRequestCompleted,
+			wantRevertStatus:  storage.ControlRequestFailed,
 			wantTerminalCalls: 1,
 			wantGaugeDelta:    -1,
 		},
@@ -1022,7 +1023,7 @@ func TestPollForCompletionAtomic_SettledWriteWithALostReplyIsAdoptedOnlyUnderThi
 			result:            engine.ProgressResult{State: engine.StateFailed, ErrorMessage: engineFailure},
 			storedToken:       "tok-a",
 			wantState:         state.Apply.Failed,
-			wantRevertStatus:  storage.ControlRequestCompleted,
+			wantRevertStatus:  storage.ControlRequestFailed,
 			wantTerminalCalls: 1,
 			wantGaugeDelta:    -1,
 		},
@@ -1031,7 +1032,7 @@ func TestPollForCompletionAtomic_SettledWriteWithALostReplyIsAdoptedOnlyUnderThi
 			result:            engine.ProgressResult{State: engine.StateStopped},
 			storedToken:       "tok-a",
 			wantState:         state.Apply.Stopped,
-			wantRevertStatus:  storage.ControlRequestCompleted,
+			wantRevertStatus:  storage.ControlRequestFailed,
 			wantTerminalCalls: 1,
 			wantGaugeDelta:    0,
 		},
@@ -1040,7 +1041,7 @@ func TestPollForCompletionAtomic_SettledWriteWithALostReplyIsAdoptedOnlyUnderThi
 			result:            engine.ProgressResult{State: engine.StateFailed, Retryable: true, ErrorMessage: engineFailure},
 			storedToken:       "tok-a",
 			wantState:         state.Apply.FailedRetryable,
-			wantRevertStatus:  storage.ControlRequestCompleted,
+			wantRevertStatus:  storage.ControlRequestFailed,
 			wantProgressCalls: 1,
 			wantGaugeDelta:    -1,
 		},
