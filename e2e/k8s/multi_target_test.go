@@ -477,10 +477,12 @@ func TestK8sMultiTarget_ConvergedMemberCompletes(t *testing.T) {
 // After the plan is reviewed, shard 2's orders drifts, so shard 2 refuses the
 // reviewed DDL and fails as soon as it is dispatched, under the default
 // on_failure: halt. Shard 1 cuts over as soon as its own copy is ready. Shard
-// 3 holds a larger table, so its copy is still running when shard 2 fails; it
-// finishes and holds at the cutover barrier rather than cutting over behind
-// the failure, and no shard starts the next table. A cancel releases shard 3
-// without cutting it over, and the apply settles failed, naming shard 2.
+// 3 holds a larger table and is claimed at about the moment shard 2 refuses,
+// so the rollout halts it in one of two places: either shard 3 never starts,
+// or it starts, finishes its copy and holds at the cutover barrier until a
+// cancel releases it without cutting it over. Either way nothing cuts over
+// behind the failure, no shard starts the next table, and the apply settles
+// failed, naming shard 2.
 func TestK8sMultiTarget_FailedTargetHaltsRollout(t *testing.T) {
 	ep := testutil.Endpoint(t)
 	dsns := shardDSNs(t, mtShardApp)
@@ -493,44 +495,47 @@ func TestK8sMultiTarget_FailedTargetHaltsRollout(t *testing.T) {
 	execOn(t, dsns[1:2], "ALTER TABLE orders ADD COLUMN extra int DEFAULT NULL")
 	applyID := applyRollout(t, ep, plan.PlanID, nil)
 
-	var held *apitypes.ProgressResponse
+	var halted *apitypes.ProgressResponse
 	testutil.Poll(t, mtRolloutDeadline, testutil.PollInterval,
 		func() bool {
 			p, err := testutil.FetchProgress(ep, applyID)
 			if err != nil {
 				return false
 			}
-			held = p
-			ops := operationsByStep(p)[1]
-			return state.IsState(p.State, state.Apply.RunningDegraded) &&
-				operationStateOn(ops, mtTargets[1]) == state.ApplyOperation.Failed &&
-				operationStateOn(ops, mtTargets[2]) == state.ApplyOperation.WaitingForCutover
+			halted = p
+			return state.IsState(p.State, state.SettledApplyStates...) || heldAtBarrierBehindFailure(p)
 		},
-		func() string { return "rollout never held shard 3 behind the failure:\n" + describeProgress(held) },
+		func() string { return "rollout never halted behind the failure:\n" + describeProgress(halted) },
 	)
-	t.Log("held:\n" + describeProgress(held))
-	assert.Equal(t, state.ApplyOperation.Completed, operationStateOn(operationsByStep(held)[1], mtTargets[0]), describeProgress(held))
-	for _, op := range operationsByStep(held)[2] {
+	t.Log("halted:\n" + describeProgress(halted))
+	assert.Equal(t, state.ApplyOperation.Failed, operationStateOn(operationsByStep(halted)[1], mtTargets[1]), describeProgress(halted))
+	assert.Equal(t, state.ApplyOperation.Completed, operationStateOn(operationsByStep(halted)[1], mtTargets[0]), describeProgress(halted))
+	for _, op := range operationsByStep(halted)[2] {
 		assert.True(t, state.IsState(op.State, state.ApplyOperation.Pending), "step 2 on %s did not start behind the failure, got %s", op.Target, op.State)
 	}
-	assert.False(t, indexOn(t, dsns[2], "orders", "uq_note"), "shard 3 holds its cutover behind the failure")
+	assert.False(t, indexOn(t, dsns[2], "orders", "uq_note"), "shard 3 does not cut over behind the failure")
 
-	cancelResp, err := client.CallCancelAPI(ep, mtEnvironment, applyID)
-	require.NoError(t, err, "cancel")
-	require.True(t, cancelResp.Accepted, "cancel not accepted: %s", cancelResp.ErrorMessage)
-
-	p := waitForSettled(t, ep, applyID, mtRolloutDeadline, nil)
+	p := halted
+	if heldAtBarrierBehindFailure(halted) {
+		cancelResp, err := client.CallCancelAPI(ep, mtEnvironment, applyID)
+		require.NoError(t, err, "cancel")
+		require.True(t, cancelResp.Accepted, "cancel not accepted: %s", cancelResp.ErrorMessage)
+		p = waitForSettled(t, ep, applyID, mtRolloutDeadline, nil)
+		assert.Equal(t, state.ApplyOperation.Cancelled, operationStateOn(operationsByStep(p)[1], mtTargets[2]), describeProgress(p))
+	} else {
+		assert.Equal(t, state.ApplyOperation.Pending, operationStateOn(operationsByStep(p)[1], mtTargets[2]), "shard 3 never started behind the failure: %s", describeProgress(p))
+	}
 	t.Log("settled:\n" + describeProgress(p))
 	require.Equal(t, state.Apply.Failed, p.State, describeProgress(p))
 	assert.Contains(t, p.ErrorMessage, mtTargets[1], "the failure names the target")
-	assert.Equal(t, state.ApplyOperation.Cancelled, operationStateOn(operationsByStep(p)[1], mtTargets[2]), describeProgress(p))
 	assert.True(t, indexOn(t, dsns[0], "orders", "uq_note"), "shard 1 cut over ahead of the failure")
-	assert.False(t, indexOn(t, dsns[2], "orders", "uq_note"), "the cancel released shard 3 without cutting it over")
+	assert.False(t, indexOn(t, dsns[2], "orders", "uq_note"), "shard 3 never cut over behind the failure")
 	for i, dsn := range dsns {
 		assert.False(t, testutil.ColumnExists(t, dsn, "users", "email"), "users is held after the failed table on %s", mtTargets[i])
 	}
-	// Shard 1 cut over and the cancel released shard 3's copy, asynchronously.
-	// Shard 2 refused the reviewed DDL before it copied anything.
+	// Shard 1 cut over, and a cancel releases a copy shard 3 started,
+	// asynchronously. Shard 2 refused the reviewed DDL before it copied
+	// anything.
 	released := []int{0, 1, 2}
 	testutil.Poll(t, testutil.PollDeadline, time.Second,
 		func() bool {
@@ -550,6 +555,16 @@ func TestK8sMultiTarget_FailedTargetHaltsRollout(t *testing.T) {
 		},
 	)
 	assert.False(t, indexOn(t, dsns[1], "orders", "uq_note"), "shard 2 refused the reviewed DDL")
+}
+
+// heldAtBarrierBehindFailure reports whether p shows the halt rollout of
+// TestK8sMultiTarget_FailedTargetHaltsRollout holding shard 3 at the cutover
+// barrier behind shard 2's failure.
+func heldAtBarrierBehindFailure(p *apitypes.ProgressResponse) bool {
+	ops := operationsByStep(p)[1]
+	return state.IsState(p.State, state.Apply.RunningDegraded) &&
+		operationStateOn(ops, mtTargets[1]) == state.ApplyOperation.Failed &&
+		operationStateOn(ops, mtTargets[2]) == state.ApplyOperation.WaitingForCutover
 }
 
 // operationStateOn returns the state of the operation in ops on target, or ""
