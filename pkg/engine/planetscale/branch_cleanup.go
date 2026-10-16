@@ -75,6 +75,100 @@ func deleteBranch(ctx context.Context, client psclient.PSClient, org, database, 
 	return false, err
 }
 
+// deployRequestCloseTimeout bounds the read and the close that retire the
+// deploy request of a failed apply, so a slow PlanetScale API cannot hold the
+// apply's failure path open.
+const deployRequestCloseTimeout = 30 * time.Second
+
+// deployRequestNeverDeployed reports whether a deploy request is provably one
+// whose deploy never began: it carries no deploy timestamp, and its deployment
+// state precedes a deploy (pending, ready) or records that PlanetScale refused
+// the deploy request before any deploy (error).
+func deployRequestNeverDeployed(dr *ps.DeployRequest) bool {
+	if dr.DeployedAt != nil {
+		return false
+	}
+	switch dr.DeploymentState {
+	case deployState.Pending, deployState.Ready, deployState.Error:
+		return true
+	default:
+		return false
+	}
+}
+
+// retireDeployRequestOfFailedApply closes the deploy request a failed apply
+// created and deletes the branch the apply created for it, when the deploy
+// request provably never deployed. The deploy request's auto_delete_branch
+// only fires when a deploy finishes, so without this a failure between
+// creating the deploy request and starting its deploy leaves the deploy
+// request open, still deployable from the PlanetScale UI after SchemaBot
+// reported the apply failed, and leaves the branch holding quota.
+//
+// Nothing that may have started deploying is touched: the deploy request is
+// re-read first, and only one that reads as never deployed is closed, and the
+// branch is deleted only once the close response also reads as never deployed.
+// ownedBranch is empty for an operator-supplied branch, which is closed out of
+// its deploy request but kept for the operator. Each outcome is logged with the
+// identifiers needed to finish the cleanup by hand; the caller returns cause
+// unchanged whatever happens here.
+func (e *Engine) retireDeployRequestOfFailedApply(ctx context.Context, logger *slog.Logger, client psclient.PSClient, org, database string, number uint64, ownedBranch string, cause error) {
+	attrs := []any{"organization", org, "planetscale_database", database, "deploy_request", number, "branch", ownedBranch, "apply_error", cause}
+	closeCtx, cancel := context.WithTimeout(ctx, deployRequestCloseTimeout)
+	defer cancel()
+
+	dr, err := e.getDeployRequest(closeCtx, client, org, database, number)
+	if err != nil {
+		logger.Error("failed to read the deploy request of a failed apply; close it manually if it never deployed, and delete its branch to reclaim branch quota",
+			append(attrs, "error", err)...)
+		return
+	}
+	if !deployRequestNeverDeployed(dr) {
+		logger.Warn("the deploy request of a failed apply reports a deploy may have begun; leaving it and its branch in place",
+			append(attrs, "deployment_state", dr.DeploymentState, "deployed_at", formatDeployedAt(dr.DeployedAt))...)
+		return
+	}
+	if dr.State == deployRequestClosed {
+		logger.Info("the deploy request of a failed apply was already closed before it deployed", attrs...)
+	} else {
+		closed, closeErr := client.CloseDeployRequest(closeCtx, &ps.CloseDeployRequestRequest{
+			Organization: org,
+			Database:     database,
+			Number:       number,
+		})
+		if closeErr != nil {
+			logger.Error("failed to close the undeployed deploy request of a failed apply; close it manually, and delete its branch to reclaim branch quota",
+				append(attrs, "deployment_state", dr.DeploymentState, "error", closeErr)...)
+			return
+		}
+		if closed == nil {
+			logger.Error("closing the undeployed deploy request of a failed apply returned no deploy request; check it is closed, and delete its branch to reclaim branch quota",
+				attrs...)
+			return
+		}
+		if !deployRequestNeverDeployed(closed) {
+			logger.Error("closing the deploy request of a failed apply reported a deploy; leaving its branch in place",
+				append(attrs, "deployment_state", closed.DeploymentState, "deployed_at", formatDeployedAt(closed.DeployedAt))...)
+			return
+		}
+		logger.Info("closed the undeployed deploy request of a failed apply",
+			append(attrs, "deployment_state", dr.DeploymentState)...)
+	}
+	if ownedBranch == "" {
+		logger.Info("the failed apply ran on an operator-supplied branch; keeping it for the operator", attrs...)
+		return
+	}
+	alreadyGone, err := deleteBranch(ctx, client, org, database, ownedBranch)
+	switch {
+	case err != nil:
+		logger.Error("failed to delete the branch of a failed apply after closing its deploy request; delete it manually to reclaim branch quota",
+			append(attrs, "error", err)...)
+	case alreadyGone:
+		logger.Info("the branch of a failed apply was already gone after closing its deploy request", attrs...)
+	default:
+		logger.Info("deleted the branch of a failed apply after closing its undeployed deploy request", attrs...)
+	}
+}
+
 var _ engine.CancelledResumeStateReclaimer = (*Engine)(nil)
 
 // ReclaimCancelledResumeState deletes the branch the stored resume state names
