@@ -162,7 +162,7 @@ func TestSameTableChange(t *testing.T) {
 			approved:     base + " COMMENT='campaign variants'",
 			headBase:     base + " STATS_PERSISTENT=1",
 			head:         base + " COMMENT='campaign variants'",
-			wantReason:   []string{"table variants", "the base changed table option stats_persistent"},
+			wantReason:   []string{"table variants", "the base changed table option STATS_PERSISTENT"},
 		},
 		{
 			// The statements match, since the diff does not compare the
@@ -174,7 +174,7 @@ func TestSameTableChange(t *testing.T) {
 			headBase: base,
 			head: "CREATE TEMPORARY TABLE `variants` (`id` bigint NOT NULL AUTO_INCREMENT, `token` varchar(255) NOT NULL, `amount` int DEFAULT NULL, " +
 				"`sku` varchar(255) DEFAULT NULL, PRIMARY KEY (`id`), UNIQUE KEY `u_token` (`token`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
-			wantReason: []string{"table variants", "the head declares the TEMPORARY modifier differently from the approved commit"},
+			wantReason: []string{"table variants", "the head declares the CREATE TABLE clauses differently from the approved commit"},
 		},
 		{
 			// Both commits generate MODIFY COLUMN `b` ... FIRST, but the
@@ -323,6 +323,13 @@ func TestSameTableChange_AddedTable(t *testing.T) {
 			wantReason: "table overrides: the head orders columns differently from the approved commit",
 		},
 		{
+			name: "an option Spirit's model does not carry that the head changes",
+			head: "CREATE TABLE `overrides` (`id` bigint NOT NULL AUTO_INCREMENT, `program_token` varchar(255) NOT NULL, " +
+				"`created_at` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY (`id`), KEY `idx_program_token` (`program_token`)) " +
+				"ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci ENCRYPTION='Y'",
+			wantReason: "table overrides: the head declares table option ENCRYPTION differently from the approved commit",
+		},
+		{
 			name:       "a head that names another table",
 			head:       "CREATE TABLE `program_overrides` (`id` bigint NOT NULL AUTO_INCREMENT, PRIMARY KEY (`id`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
 			wantReason: "the file declares table overrides at the approved commit but program_overrides at the head",
@@ -364,6 +371,54 @@ func TestSameTableChange_AddedTableCannotCompare(t *testing.T) {
 			assert.Contains(t, err.Error(), tt.wantErr)
 			assert.False(t, same)
 			assert.Empty(t, reason)
+		})
+	}
+}
+
+// Clauses Spirit's model of a table does not carry still take part, because
+// elements are read from the parse tree: a table option the model drops, and
+// the source of CREATE TABLE ... LIKE or the query of CREATE TABLE ... AS
+// SELECT.
+func TestSameTableChange_ClausesOutsideSpiritsModel(t *testing.T) {
+	const table = "CREATE TABLE `t` (`id` bigint NOT NULL, PRIMARY KEY (`id`)) ENGINE=InnoDB"
+	tests := []struct {
+		name                                   string
+		approvedBase, approved, headBase, head string
+		wantReason                             string
+	}{
+		{
+			name:         "an ENCRYPTION option the head changes on a file both sides edited",
+			approvedBase: table, headBase: table,
+			approved:   "CREATE TABLE `t` (`id` bigint NOT NULL, `x` int, PRIMARY KEY (`id`)) ENGINE=InnoDB ENCRYPTION='Y'",
+			head:       "CREATE TABLE `t` (`id` bigint NOT NULL, `x` int, PRIMARY KEY (`id`)) ENGINE=InnoDB ENCRYPTION='N'",
+			wantReason: "table t: the head declares table option ENCRYPTION differently from the approved commit",
+		},
+		{
+			name:         "a COMPRESSION option the base set and the head drops",
+			approvedBase: table, approved: "CREATE TABLE `t` (`id` bigint NOT NULL, `x` int, PRIMARY KEY (`id`)) ENGINE=InnoDB",
+			headBase:   "CREATE TABLE `t` (`id` bigint NOT NULL, PRIMARY KEY (`id`)) ENGINE=InnoDB COMPRESSION='zlib'",
+			head:       "CREATE TABLE `t` (`id` bigint NOT NULL, `x` int, PRIMARY KEY (`id`)) ENGINE=InnoDB",
+			wantReason: "table t: the base changed table option COMPRESSION since the approved commit, and the head replaces it with another version",
+		},
+		{
+			name:       "a LIKE source the head changes on a file the PR adds",
+			approved:   "CREATE TABLE `t` LIKE `source_a`",
+			head:       "CREATE TABLE `t` LIKE `source_b`",
+			wantReason: "table t: the head declares the CREATE TABLE clauses differently from the approved commit",
+		},
+		{
+			name:       "an AS SELECT query the head changes on a file the PR adds",
+			approved:   "CREATE TABLE `t` (`id` bigint NOT NULL, PRIMARY KEY (`id`)) AS SELECT `id` FROM `source` WHERE `id` > 1",
+			head:       "CREATE TABLE `t` (`id` bigint NOT NULL, PRIMARY KEY (`id`)) AS SELECT `id` FROM `source` WHERE `id` > 2",
+			wantReason: "table t: the head declares the CREATE TABLE clauses differently from the approved commit",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			same, reason, err := SameTableChange(tt.approvedBase, tt.approved, tt.headBase, tt.head)
+			require.NoError(t, err)
+			assert.False(t, same)
+			assert.Equal(t, tt.wantReason, reason)
 		})
 	}
 }
