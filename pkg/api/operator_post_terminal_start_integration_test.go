@@ -331,7 +331,8 @@ func TestOperator_StartOnAMultiOperationRolloutSettlesWithTheParent(t *testing.T
 // still stopped. Each claim that takes the rollout out of stopped is reported,
 // after the parent has left stopped in storage, so the PR Check Run republished
 // from storage never keeps saying the rollout is stopped while a deployment
-// runs.
+// runs, and the PR progress comment observer is attached again, so the comment
+// follows the resumed copy instead of staying frozen at stopped.
 func TestOperator_StartOnAStoppedRolloutReportsEachClaimOutOfStopped(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping integration test in short mode")
@@ -381,6 +382,8 @@ func TestOperator_StartOnAStoppedRolloutReportsEachClaimOutOfStopped(t *testing.
 	require.Len(t, claimedStates, 1, "the claim that takes the rollout out of its stop is reported")
 	assert.False(t, state.IsState(claimedStates[0], state.Apply.Stopped),
 		"the parent has left stopped in storage by the time the claim is reported, got %s", claimedStates[0])
+	assert.Equal(t, 1, svc.matrixSummary.recoveredCount(),
+		"the drive that takes the rollout out of its stop attaches the PR progress observer")
 	require.Equal(t, state.Apply.Stopped, getApply(t, ctx, stor, seed.applyID).State,
 		"with region-a done and region-b still stopped, the rollout reads stopped between the drives")
 
@@ -390,4 +393,6 @@ func TestOperator_StartOnAStoppedRolloutReportsEachClaimOutOfStopped(t *testing.
 	require.Len(t, claimedStates, 2, "the claim that takes the rollout out of stopped again is reported too")
 	assert.False(t, state.IsState(claimedStates[1], state.Apply.Stopped),
 		"the parent has left stopped in storage by the time the second claim is reported, got %s", claimedStates[1])
+	assert.Equal(t, 2, svc.matrixSummary.recoveredCount(),
+		"each drive that takes the rollout out of stopped again attaches the observer again")
 }

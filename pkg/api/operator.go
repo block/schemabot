@@ -1295,6 +1295,39 @@ func (s *Service) recoverMultiApplyOperation(ctx context.Context, driverID int, 
 	return s.driveClaimedMultiOperation(ctx, driverID, op, opLease, false)
 }
 
+// rolloutLeftStop reports whether this projection is the one that took a
+// stopped rollout back into flight. Exactly one drive wins that swap, so it is
+// the single owner of what the resume needs beyond the drive itself. A cancel
+// holds the rollout stopped and a settled rollout derives a terminal state, so
+// neither counts.
+func rolloutLeftStop(projection applyProjectionResult) bool {
+	return projection.Swapped &&
+		state.IsState(projection.PreviousState, state.Apply.Stopped) &&
+		!state.IsTerminalApplyState(projection.DerivedState)
+}
+
+// reattachResumedRolloutObserver gives a resumed rollout a progress comment
+// observer again. The rollout's observer stopped watching when the rollout
+// stopped, and operation drives never attach one of their own, so without this
+// the PR keeps reading stopped for the whole resumed copy. The observer's first
+// tick sees the stop's summary comment and posts a fresh progress comment at the
+// bottom of the PR. Its GitHub writes go through the durable progress-comment
+// authority, so observers on other pods never edit the comment at the same time.
+func (s *Service) reattachResumedRolloutObserver(driverID int, op *storage.ApplyOperation, apply *storage.Apply) {
+	if s.OnApplyRecovered == nil {
+		s.logger.Debug("operator: resumed rollout has no observer hook; PR progress comment will not follow the resume",
+			append(apply.LogAttrs(),
+				"driver", driverID, "apply_operation_id", op.ID,
+				"operation_deployment", op.Deployment)...)
+		return
+	}
+	s.logger.Info("operator: rollout left its stop; attaching progress comment observer",
+		append(apply.LogAttrs(),
+			"driver", driverID, "apply_operation_id", op.ID,
+			"operation_deployment", op.Deployment)...)
+	s.OnApplyRecovered(apply)
+}
+
 // driveClaimedMultiOperation drives one claimed operation of a multi-operation
 // apply under the operation lease only and settles the parent via the projection
 // CAS. cutover selects the drive phase: false runs the operation's copy phase
@@ -1360,6 +1393,9 @@ func (s *Service) driveClaimedMultiOperation(ctx context.Context, driverID int, 
 				"driver", driverID, "apply_operation_id", op.ID,
 				"operation_deployment", op.Deployment, "error", err)...)
 		return claimSpent
+	}
+	if rolloutLeftStop(preDrive) {
+		s.reattachResumedRolloutObserver(driverID, op, apply)
 	}
 
 	// Heartbeat the operation row on the apply heartbeat cadence so a peer driver
