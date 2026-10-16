@@ -2565,8 +2565,9 @@ func rejectUnsafeVSchemaChangesWithoutOptIn(plan *storage.Plan, applyOpts storag
 // existingIdempotentApply returns the apply previously created for
 // req.IdempotencyKey, or nil when the key is empty or unseen. The match is
 // returned regardless of the existing apply's state: the key encodes the
-// dispatch generation (apply id + attempt + operation), so "same key" means
-// "same generation", and a deliberate retry rotates the key via apply.Attempt.
+// dispatch generation, so "same key" means "same generation". A whole-apply
+// retry rotates the key via apply.Attempt; an operation-scoped dispatch keeps
+// its deployment's key across retries, since a deployment has one apply.
 // A stored apply whose environment, database, or type disagrees with the request
 // signals an accidental key reuse or a control-plane bug, which is surfaced as
 // an error rather than silently aliased.

@@ -44,6 +44,20 @@ func TestStatusCommentSurfacesRejectedControlCommands(t *testing.T) {
 		assert.Contains(t, body, "outside its revert window")
 	})
 
+	// The notice names the command the operator typed, so the bullet and the
+	// reason beside it spell skip-revert the same way.
+	t.Run("a failed skip-revert is named as the command the operator typed", func(t *testing.T) {
+		body := observer(&storage.ApplyControlRequest{
+			Operation:    storage.ControlOperationSkipRevert,
+			Status:       storage.ControlRequestFailed,
+			RequestedBy:  "octocat",
+			ErrorMessage: "the schema change reached Reverted before the skip-revert could take effect",
+		}).formatStatusComment(apply, nil)
+
+		assert.Contains(t, body, "`skip-revert` was accepted but did not take effect (requested by `octocat`): the schema change reached Reverted before the skip-revert could take effect")
+		assert.NotContains(t, body, "skip_revert")
+	})
+
 	// A rejection recorded by a previous release for a retired operation names
 	// a command the operator can no longer issue: the notice's "re-issue the
 	// command" remedy is impossible, so nothing could ever clear it.

@@ -1774,6 +1774,73 @@ func TestApplyOperations(t *testing.T, h Harness) {
 		assert.Equal(t, state.ApplyOperation.Failed, failed.State)
 	})
 
+	// MarkPendingCancelledByApply settles the siblings that never started,
+	// pending ones and ones a stop reached while still pending, as cancelled
+	// with completed_at stamped. It leaves running, terminal, and started
+	// stopped rows intact, and fails closed for a driver whose operation lease
+	// was rotated away.
+	t.Run("MarkPendingCancelledByApply", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "operation_cancel_pending_db", storage.DatabaseTypeMySQL)
+		apply := CreateApply(t, store, lock, "apply_operation_cancel_pending", 908)
+		ownerID := createOperation(t, store, apply.ID, "region-a", "owner")
+		pendingID := createOperation(t, store, apply.ID, "region-b", "pending")
+		completedID := createOperation(t, store, apply.ID, "region-c", "completed")
+		require.NoError(t, store.ApplyOperations().MarkCompleted(ctx, completedID))
+		neverStartedStoppedID := createOperation(t, store, apply.ID, "region-d", "never-started-stopped")
+		require.NoError(t, store.ApplyOperations().UpdateState(ctx, neverStartedStoppedID, state.ApplyOperation.Stopped))
+		startedStoppedID := createOperation(t, store, apply.ID, "region-e", "started-stopped")
+		require.NoError(t, store.ApplyOperations().MarkStarted(ctx, startedStoppedID))
+		require.NoError(t, store.ApplyOperations().UpdateState(ctx, startedStoppedID, state.ApplyOperation.Stopped))
+
+		claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "current-driver")
+		require.NoError(t, err)
+		require.NotNil(t, claimed)
+		require.Equal(t, ownerID, claimed.ID)
+		lease := func(token string) storage.OperationLease {
+			return storage.OperationLease{ApplyID: apply.ID, OperationID: ownerID, Owner: claimed.LeaseOwner, Token: token}
+		}
+
+		_, err = store.ApplyOperations().MarkPendingCancelledByApply(storage.WithOperationLease(ctx, lease("stale-token")), apply.ID)
+		require.ErrorIs(t, err, storage.ErrApplyLeaseLost)
+		pending, err := store.ApplyOperations().Get(ctx, pendingID)
+		require.NoError(t, err)
+		require.NotNil(t, pending)
+		assert.Equal(t, state.ApplyOperation.Pending, pending.State, "a displaced driver cancels nothing")
+
+		ownedCtx := storage.WithOperationLease(ctx, lease(claimed.LeaseToken))
+		changed, err := store.ApplyOperations().MarkPendingCancelledByApply(ownedCtx, apply.ID)
+		require.NoError(t, err)
+		assert.Equal(t, int64(2), changed, "the pending row and the stopped row that never started")
+		again, err := store.ApplyOperations().MarkPendingCancelledByApply(ownedCtx, apply.ID)
+		require.NoError(t, err)
+		assert.Zero(t, again)
+
+		pending, err = store.ApplyOperations().Get(ctx, pendingID)
+		require.NoError(t, err)
+		require.NotNil(t, pending)
+		assert.Equal(t, state.ApplyOperation.Cancelled, pending.State)
+		assert.NotNil(t, pending.CompletedAt, "cancelled is final, so completed_at is stamped")
+		neverStartedStopped, err := store.ApplyOperations().Get(ctx, neverStartedStoppedID)
+		require.NoError(t, err)
+		require.NotNil(t, neverStartedStopped)
+		assert.Equal(t, state.ApplyOperation.Cancelled, neverStartedStopped.State, "a stop that caught the row pending left nothing on its target")
+		assert.NotNil(t, neverStartedStopped.CompletedAt)
+		startedStopped, err := store.ApplyOperations().Get(ctx, startedStoppedID)
+		require.NoError(t, err)
+		require.NotNil(t, startedStopped)
+		assert.Equal(t, state.ApplyOperation.Stopped, startedStopped.State, "a stopped row that started settles through the drive that delivers the cancel")
+		owner, err := store.ApplyOperations().Get(ctx, ownerID)
+		require.NoError(t, err)
+		require.NotNil(t, owner)
+		assert.Equal(t, state.ApplyOperation.Running, owner.State, "the operation under way settles through its own drive")
+		completed, err := store.ApplyOperations().Get(ctx, completedID)
+		require.NoError(t, err)
+		require.NotNil(t, completed)
+		assert.Equal(t, state.ApplyOperation.Completed, completed.State)
+	})
+
 	// MarkPendingStoppedByApply_OperationLease verifies a fan-out driver can
 	// stop pending siblings through its live operation lease, while stale or
 	// cross-apply lease claims fail closed.
