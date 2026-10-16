@@ -263,18 +263,18 @@ func (h *Handler) rollbackCommandCore(parent context.Context, repo string, pr in
 	planResp, err := h.service.ExecuteRollbackPlanForApply(ctx, apply)
 	if unsupported, refused := asRolloutRollbackUnsupported(err); refused {
 		comment := templates.RenderRollbackOfRolloutUnsupported(templates.RollbackOfRolloutUnsupportedData{
-			Environment:       environment,
-			ApplyID:           unsupported.ApplyID,
-			Targets:           unsupported.Targets,
-			PlannedOnTheirOwn: unsupported.PlannedOnTheirOwn,
-			RoutingChecked:    unsupported.RoutingChecked,
-			Unrouted:          unsupported.Unrouted,
-			PR:                h.prStateForRemedy(ctx, repo, pr, installationID, environment, applyID),
-			Tenant:            h.deploymentTenant(),
+			Environment:    environment,
+			ApplyID:        unsupported.ApplyID,
+			RanOn:          unsupported.RanOn,
+			Targets:        unsupported.Targets,
+			RoutingChecked: unsupported.RoutingChecked,
+			Unrouted:       unsupported.Unrouted,
+			PR:             h.prStateForRemedy(ctx, repo, pr, installationID, environment, applyID),
+			Tenant:         h.deploymentTenant(),
 		})
 		releaseErr := h.releaseRollbackLockAfterRejectedPlan(ctx, database, dbType, lockOwner, lockAcquiredByCommand)
 		h.logRollbackLockReleaseFailure(repo, pr, database, dbType, lockOwner, releaseErr)
-		h.logger.Warn("rollback refused: the apply's rollout plans each target against its own schema; the PR comment names reverting the PR's schema files and applying again",
+		h.logger.Warn("rollback refused: rollback is not supported for an apply in an environment with multiple targets; the PR comment names reverting the PR's schema files and applying again",
 			"repo", repo, "pr", pr, "apply_id", applyID, "environment", environment, "database", database, "error", err)
 		h.postComment(repo, pr, installationID, comment)
 		return false, nil

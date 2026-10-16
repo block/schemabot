@@ -280,28 +280,6 @@ func TestCreateStoredApply_NarrowingIsNotReadFromCallerOptions(t *testing.T) {
 	assert.Equal(t, DefaultDeployment+"/payments-002", apply.GetOptions().NarrowedTo)
 }
 
-// A rollback plan is applied to the whole rollout, so reverting an apply that
-// changed payments-002 alone would run the reversal on payments-001 and
-// payments-003, which never received the change. It is refused before any
-// planning.
-func TestExecuteRollbackPlan_NarrowedApplyIsRefused(t *testing.T) {
-	svc, _ := narrowingApplyService(t)
-	apply := &storage.Apply{
-		ApplyIdentifier: "apply-narrowed",
-		Database:        "payments",
-		DatabaseType:    storage.DatabaseTypeMySQL,
-		Environment:     "production",
-		Deployment:      DefaultDeployment,
-		State:           state.Apply.Completed,
-		Options:         storage.MarshalApplyOptions(storage.ApplyOptions{NarrowedTo: DefaultDeployment + "/payments-002"}),
-	}
-
-	_, err := svc.ExecuteRollbackPlanForApply(t.Context(), apply)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "ran on rollout member "+DefaultDeployment+"/payments-002 only")
-	assert.Contains(t, err.Error(), "rollback of a narrowed apply is not supported")
-}
-
 // singleTargetServerConfig routes orders/production to one target, so the
 // rollout is that one member.
 func singleTargetServerConfig() *ServerConfig {
@@ -557,169 +535,140 @@ func rollbackSourceApply(deployment string) (*storage.Plan, *storage.Apply) {
 	}
 }
 
-// A rollout-wide apply of two mirrored deployments ran its plan from eu, then
-// deployment_order was changed so us is first. The rollback is planned against
-// eu, and the rollout now runs only from us's plan, so the rollback could reach
-// the rollout only by reverting eu alone. It is refused before planning, with
-// the order the apply ran under as the remedy rather than a deployment to
-// revert by itself. In the order the apply ran under, the rollback is planned
-// against eu as before.
-func TestExecuteRollbackPlan_RefusedAfterTheRolloutPrimaryMoved(t *testing.T) {
-	source, apply := rollbackSourceApply("eu")
-	cases := []struct {
-		name    string
-		order   []string
-		wantErr string
-	}{
-		{
-			name:  "reordered",
-			order: []string{"us", "eu"},
-			wantErr: "apply apply-rollout ran across the rollout from rollout primary eu/payments-001, but the rollout primary is now us/payments-001; " +
-				"a rollback made against eu/payments-001 cannot be applied to the rollout, and applying it to that target alone would leave the others on the applied schema. " +
-				"Restore the rollout order the apply ran under (deployment_order) so eu/payments-001 is first, then retry the rollback",
-		},
-		{name: "in the order the apply ran under", order: []string{"eu", "us"}},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			cfg := narrowingServerConfig()
-			cfg.Databases["payments"].Environments["production"] = EnvironmentConfig{
-				Deployments:     map[string]DeploymentTarget{"eu": {Target: "payments-001"}, "us": {Target: "payments-001"}},
-				DeploymentOrder: tc.order,
-			}
-			mockClient := &mockTernClient{isRemote: true, planResp: &ternv1.PlanResponse{PlanId: "plan-rollback"}}
-			svc := New(&mockStorageWithPlanLookup{plans: &rollbackSourcePlanStore{source: source}}, cfg, map[string]tern.Client{
-				"eu/production": mockClient,
-				"us/production": &mockTernClient{isRemote: true},
-			}, slog.New(slog.NewTextHandler(io.Discard, nil)))
-
-			_, err := svc.ExecuteRollbackPlanForApply(t.Context(), apply)
-			if tc.wantErr == "" {
-				require.NoError(t, err)
-				require.NotNil(t, mockClient.planReq)
-				assert.Equal(t, "payments-001", mockClient.planReq.Target)
-				return
-			}
-			require.Error(t, err)
-			assert.Equal(t, tc.wantErr, err.Error())
-			assert.Equal(t, http.StatusConflict, controlOperationHTTPStatus(err))
-			assert.Nil(t, mockClient.planReq, "nothing is planned for a rollback that cannot reach the rollout")
-		})
-	}
-}
-
-// rollbackRoundPlanStore is rollbackSourcePlanStore with the member plans the
-// source plan's review round stored, served to List by the round they are
-// bound to.
-type rollbackRoundPlanStore struct {
-	rollbackSourcePlanStore
-	round   []*storage.Plan
-	listErr error
-}
-
-func (s *rollbackRoundPlanStore) List(_ context.Context, opts storage.ListPlansOptions) ([]*storage.Plan, error) {
-	if s.listErr != nil {
-		return nil, s.listErr
-	}
-	var matched []*storage.Plan
-	for _, plan := range s.round {
-		if plan.PrimaryPlanIdentifier == opts.PrimaryPlanIdentifier {
-			matched = append(matched, plan)
+// workOperations are the operation rows of an apply that ran on each named
+// member, deployment and target together.
+func workOperations(applyID int64, members ...routing.ExecutionTarget) []*storage.ApplyOperation {
+	ops := make([]*storage.ApplyOperation, len(members))
+	for i, member := range members {
+		ops[i] = &storage.ApplyOperation{
+			ID: int64(i + 1), ApplyID: applyID, Deployment: member.Deployment, Target: member.Target,
+			OperationKey: storage.TargetOperationKey(member.Target, ""), OperationKind: storage.ApplyOperationKindWork,
 		}
 	}
-	return matched, nil
+	return ops
 }
 
-// A rollout-wide apply ran across payments-001, 002 and 003, each planned
-// against its own schema, so its review round stored a plan for 002 and 003. A
-// rollback is one plan made against payments-001, and no member of such a
-// rollout runs another member's plan, so the rollback is refused before
-// anything is planned, naming the narrowed applies that do restore each
-// target. The round decides, whatever the configuration says now: the refusal
-// holds after the environment is respelled as mirrored deployments, or cut to
-// payments-001 alone, either of which would otherwise run payments-001's
-// rollback DDL on a target it was never planned for, or revert payments-001
-// and leave the others on the applied schema. A round that cannot be read
-// refuses the rollback. An apply whose round planned no target on its own ran
-// one plan everywhere, and rolls back unless the environment has since been
-// respelled as targets planned on their own, which apply creation could not
-// pair with one plan either. A single-target environment rolls back as before.
-// A refusal of an apply that ran each target from its own plan names the
-// targets the environment no longer routes to, since the apply that undoes it
-// reaches only the routed ones.
-func TestExecuteRollbackPlan_RefusedForARolloutOfIndependentlyPlannedTargets(t *testing.T) {
+// Rollback is not supported yet for multiple targets: a rollback is one plan
+// made against the target the apply ran its plan from, and an environment of
+// several targets either runs each from a plan of its own or reaches targets
+// that plan was never made against. Every rollback that would touch more than
+// one target is refused before anything is planned, and the refusal is typed
+// so a PR comment can name the apply of schema files without the change that
+// does undo it everywhere. What the apply actually ran on decides as much as
+// the routing now: an apply across two mirrored deployments is refused after
+// the environment is cut to one, since a rollback would revert only the one
+// left. A sharded apply runs several operations on one target and rolls back
+// like any single-target apply. Operations that cannot be read refuse the
+// rollback rather than guess where the apply ran.
+func TestExecuteRollbackPlan_RefusedForAnyMultiTargetRollout(t *testing.T) {
 	source, apply := rollbackSourceApply(DefaultDeployment)
-	roundMember := func(target string) *storage.Plan {
-		plan := memberPlan(target)
-		plan.PrimaryPlanIdentifier = source.PlanIdentifier
-		return plan
+	apply.ID = 7
+	member := func(deployment, target string) routing.ExecutionTarget {
+		return routing.ExecutionTarget{Deployment: deployment, Target: target}
 	}
-	independentRound := []*storage.Plan{roundMember("payments-002"), roundMember("payments-003")}
+	primary := member(DefaultDeployment, "payments-001")
 	targetsEnv := func(targets ...string) EnvironmentConfig {
 		return EnvironmentConfig{Deployment: DefaultDeployment, Targets: targetNames(targets...)}
 	}
-	const plannedOnTheirOwn = "apply apply-rollout ran across the 3 targets of payments/production, which were each planned against their own schema, and a rollback is one plan made against " + DefaultDeployment + "/payments-001; " +
-		"rollback of such a rollout is not supported, so restore each target by planning and applying the previous schema with its target"
+	mirroredEnv := func(order ...string) EnvironmentConfig {
+		deployments := map[string]DeploymentTarget{}
+		for _, deployment := range order {
+			deployments[deployment] = DeploymentTarget{Target: "payments-001"}
+		}
+		return EnvironmentConfig{Deployments: deployments, DeploymentOrder: order}
+	}
+	const notSupported = "; rollback is not supported yet for multiple targets, so undo it by applying schema files without the change"
+	sharded := workOperations(apply.ID, primary, primary)
+	sharded[0].OperationKey, sharded[1].OperationKey = storage.TargetOperationKey("payments-001", "-80"), storage.TargetOperationKey("payments-001", "80-")
+	sharded = append(sharded, &storage.ApplyOperation{ID: 9, ApplyID: apply.ID, Deployment: DefaultDeployment, OperationKind: storage.ApplyOperationKindGroupFinalizer})
+
 	cases := []struct {
-		name     string
-		env      EnvironmentConfig
-		round    []*storage.Plan
-		listErr  error
-		wantErr  string
-		wantCode int
-		// wantTargets is the target count a refused rollback reports to a
-		// caller that names its own remedy; zero when it is not refused.
-		wantTargets int
-		// wantRoutingChecked and wantUnrouted are what a refusal of an apply
-		// that ran each target from its own plan reports about the targets
-		// the environment no longer routes to.
-		wantRoutingChecked bool
-		wantUnrouted       []string
+		name       string
+		deployment string
+		env        EnvironmentConfig
+		narrowedTo string
+		ops        []*storage.ApplyOperation
+		opsErr     error
+		wantErr    string
+		wantCode   int
+		// wantRanOn and wantTargets are what a refusal reports to a caller
+		// that names its own remedy; zero wantRanOn means it is not refused.
+		wantRanOn    int
+		wantTargets  int
+		wantUnrouted []string
 	}{
 		{
-			name: "three targets planned on their own", env: targetsEnv("payments-001", "payments-002", "payments-003"),
-			round: independentRound, wantErr: plannedOnTheirOwn, wantCode: http.StatusConflict, wantTargets: 3,
-			wantRoutingChecked: true,
+			name: "three targets", env: targetsEnv("payments-001", "payments-002", "payments-003"),
+			ops:     workOperations(apply.ID, primary, member(DefaultDeployment, "payments-002"), member(DefaultDeployment, "payments-003")),
+			wantErr: "apply apply-rollout ran on 3 targets of payments/production" + notSupported, wantCode: http.StatusConflict,
+			wantRanOn: 3, wantTargets: 3,
 		},
 		{
-			name: "three targets planned on their own, since respelled as mirrored deployments",
-			env: EnvironmentConfig{
-				Deployments:     map[string]DeploymentTarget{DefaultDeployment: {Target: "payments-001"}, "us": {Target: "payments-002"}},
-				DeploymentOrder: []string{DefaultDeployment, "us"},
-			},
-			round: independentRound, wantErr: plannedOnTheirOwn, wantCode: http.StatusConflict, wantTargets: 3,
-			wantRoutingChecked: true, wantUnrouted: []string{DefaultDeployment + "/payments-002", DefaultDeployment + "/payments-003"},
+			name: "three targets, since cut to the primary", env: targetsEnv("payments-001"),
+			ops:     workOperations(apply.ID, primary, member(DefaultDeployment, "payments-002"), member(DefaultDeployment, "payments-003")),
+			wantErr: "apply apply-rollout ran on 3 targets of payments/production" + notSupported, wantCode: http.StatusConflict,
+			wantRanOn: 3, wantTargets: 1, wantUnrouted: []string{DefaultDeployment + "/payments-002", DefaultDeployment + "/payments-003"},
 		},
 		{
-			name: "three targets planned on their own, since cut to the primary", env: targetsEnv("payments-001"),
-			round: independentRound, wantErr: plannedOnTheirOwn, wantCode: http.StatusConflict, wantTargets: 3,
-			wantRoutingChecked: true, wantUnrouted: []string{DefaultDeployment + "/payments-002", DefaultDeployment + "/payments-003"},
+			name: "two mirrored deployments, since cut to one", env: targetsEnv("payments-001"),
+			ops:     workOperations(apply.ID, primary, member("us", "payments-001")),
+			wantErr: "apply apply-rollout ran on 2 targets of payments/production" + notSupported, wantCode: http.StatusConflict,
+			wantRanOn: 2, wantTargets: 1, wantUnrouted: []string{"us/payments-001"},
 		},
 		{
-			name: "one plan across the rollout, since respelled as targets planned on their own", env: targetsEnv("payments-001", "payments-002"),
-			wantErr: "apply apply-rollout ran one plan across payments/production, whose 2 targets are now each planned against their own schema, and a rollback is one plan made against " + DefaultDeployment + "/payments-001; " +
-				"rollback of such a rollout is not supported, so restore each target by planning and applying the previous schema with its target",
-			wantCode: http.StatusConflict, wantTargets: 2,
+			name: "two mirrored deployments, in the order the apply ran under", deployment: "eu", env: mirroredEnv("eu", "us"),
+			ops:     workOperations(apply.ID, member("eu", "payments-001"), member("us", "payments-001")),
+			wantErr: "apply apply-rollout ran on 2 targets of payments/production" + notSupported, wantCode: http.StatusConflict,
+			wantRanOn: 2, wantTargets: 2,
 		},
 		{
-			name: "review round unreadable", env: targetsEnv("payments-001"), listErr: errors.New("connection refused"),
-			wantErr:  "rollback of apply apply-rollout: read the review round of its plan plan-payments-001: list member plans for payments/production round plan-payments-001: connection refused",
+			name: "two mirrored deployments, since reordered", deployment: "eu", env: mirroredEnv("us", "eu"),
+			ops:     workOperations(apply.ID, member("eu", "payments-001"), member("us", "payments-001")),
+			wantErr: "apply apply-rollout ran on 2 targets of payments/production" + notSupported, wantCode: http.StatusConflict,
+			wantRanOn: 2, wantTargets: 2,
+		},
+		{
+			name: "narrowed to one of three targets", env: targetsEnv("payments-001", "payments-002", "payments-003"),
+			narrowedTo: DefaultDeployment + "/payments-002", ops: workOperations(apply.ID, member(DefaultDeployment, "payments-002")),
+			wantErr: "apply apply-rollout ran on 1 of the 3 targets of payments/production" + notSupported, wantCode: http.StatusConflict,
+			wantRanOn: 1, wantTargets: 3,
+		},
+		{
+			name: "one target, since joined by a second", env: targetsEnv("payments-001", "payments-002"),
+			ops:     workOperations(apply.ID, primary),
+			wantErr: "apply apply-rollout ran on 1 of the 2 targets of payments/production" + notSupported, wantCode: http.StatusConflict,
+			wantRanOn: 1, wantTargets: 2,
+		},
+		{
+			name: "operations unreadable", env: targetsEnv("payments-001"), opsErr: errors.New("connection refused"),
+			wantErr:  "rollback of apply apply-rollout: list apply_operations for apply apply-rollout: connection refused",
 			wantCode: http.StatusInternalServerError,
 		},
-		{name: "one target", env: targetsEnv("payments-001")},
+		{name: "one target", env: targetsEnv("payments-001"), ops: workOperations(apply.ID, primary)},
+		{name: "one sharded target", env: targetsEnv("payments-001"), ops: sharded},
+		{name: "one target with no operation rows", env: targetsEnv("payments-001")},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			deployment := tc.deployment
+			if deployment == "" {
+				deployment = DefaultDeployment
+			}
+			source, apply := *source, *apply
+			source.Deployment, apply.Deployment = deployment, deployment
+			apply.Options = storage.MarshalApplyOptions(storage.ApplyOptions{NarrowedTo: tc.narrowedTo})
 			cfg := narrowingServerConfig()
 			cfg.Databases["payments"].Environments["production"] = tc.env
 			mockClient := &mockTernClient{isRemote: true, planResp: &ternv1.PlanResponse{PlanId: "plan-rollback"}}
-			plans := &rollbackRoundPlanStore{rollbackSourcePlanStore: rollbackSourcePlanStore{source: source}, round: tc.round, listErr: tc.listErr}
-			svc := New(&mockStorageWithPlanLookup{plans: plans}, cfg, map[string]tern.Client{
-				DefaultDeployment + "/production": mockClient,
-				"us/production":                   &mockTernClient{isRemote: true},
+			svc := New(&mockStorageWithPlanLookup{
+				plans:      &rollbackSourcePlanStore{source: &source},
+				operations: &staticApplyOperationStore{operations: tc.ops, err: tc.opsErr},
+			}, cfg, map[string]tern.Client{
+				deployment + "/production": mockClient,
+				"us/production":            &mockTernClient{isRemote: true},
 			}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 
-			_, err := svc.ExecuteRollbackPlanForApply(t.Context(), apply)
+			_, err := svc.ExecuteRollbackPlanForApply(t.Context(), &apply)
 			if tc.wantErr == "" {
 				require.NoError(t, err)
 				require.NotNil(t, mockClient.planReq)
@@ -730,17 +679,17 @@ func TestExecuteRollbackPlan_RefusedForARolloutOfIndependentlyPlannedTargets(t *
 			assert.Equal(t, tc.wantErr, err.Error())
 			assert.Equal(t, tc.wantCode, controlOperationHTTPStatus(err))
 			var unsupported *RolloutRollbackUnsupportedError
-			if tc.wantTargets > 0 {
-				require.ErrorAs(t, err, &unsupported, "a refused rollout rollback must be readable as its own error")
+			if tc.wantRanOn > 0 {
+				require.ErrorAs(t, err, &unsupported, "a refused multi-target rollback must be readable as its own error")
 				assert.Equal(t, "apply-rollout", unsupported.ApplyID)
+				assert.Equal(t, tc.wantRanOn, unsupported.RanOn)
 				assert.Equal(t, tc.wantTargets, unsupported.Targets)
-				assert.Equal(t, tc.round != nil, unsupported.PlannedOnTheirOwn, "only an apply whose round planned each target on its own ran them from their own plans")
-				assert.Equal(t, tc.wantRoutingChecked, unsupported.RoutingChecked)
+				assert.True(t, unsupported.RoutingChecked)
 				assert.Equal(t, tc.wantUnrouted, unsupported.Unrouted)
 			} else {
-				assert.NotErrorAs(t, err, &unsupported, "a failure to read the round is not a refusal")
+				assert.NotErrorAs(t, err, &unsupported, "a failure to read the operations is not a refusal")
 			}
-			assert.Nil(t, mockClient.planReq, "nothing is planned for a rollback no member could run")
+			assert.Nil(t, mockClient.planReq, "nothing is planned for a refused rollback")
 		})
 	}
 }

@@ -3467,12 +3467,12 @@ func PreviewCommentRollbackStatus() string {
 // its own schema.
 func PreviewCommentRollbackOfRolloutUnsupported() string {
 	return RenderRollbackOfRolloutUnsupported(RollbackOfRolloutUnsupportedData{
-		Environment:       "staging",
-		ApplyID:           "apply-a1b2c3d4e5f6",
-		Targets:           4,
-		PlannedOnTheirOwn: true,
-		RoutingChecked:    true,
-		PR:                PRStateOpen,
+		Environment:    "staging",
+		ApplyID:        "apply-a1b2c3d4e5f6",
+		RanOn:          4,
+		Targets:        4,
+		RoutingChecked: true,
+		PR:             PRStateOpen,
 	})
 }
 

@@ -35,12 +35,29 @@ type rollbackTestStorage struct {
 	plans   storage.PlanStore
 	tasks   storage.TaskStore
 	locks   storage.LockStore
+	// operations are the source apply's operation rows.
+	operations []*storage.ApplyOperation
 }
 
 func (s *rollbackTestStorage) Applies() storage.ApplyStore { return s.applies }
 func (s *rollbackTestStorage) Plans() storage.PlanStore    { return s.plans }
 func (s *rollbackTestStorage) Tasks() storage.TaskStore    { return s.tasks }
 func (s *rollbackTestStorage) Locks() storage.LockStore    { return s.locks }
+
+// ApplyOperations serves the source apply's operation rows; with none set, it
+// is an apply that rolls back on the one target its plan was made against.
+func (s *rollbackTestStorage) ApplyOperations() storage.ApplyOperationStore {
+	return rollbackTestOperationStore{operations: s.operations}
+}
+
+type rollbackTestOperationStore struct {
+	storage.ApplyOperationStore
+	operations []*storage.ApplyOperation
+}
+
+func (s rollbackTestOperationStore) ListByApply(context.Context, int64) ([]*storage.ApplyOperation, error) {
+	return s.operations, nil
+}
 
 type rollbackTestApplyStore struct {
 	storage.ApplyStore
@@ -78,17 +95,6 @@ func (s *rollbackTestPlanStore) GetByID(_ context.Context, _ int64) (*storage.Pl
 // ran one plan on its one target, so its round stored no member plans.
 func (s *rollbackTestPlanStore) List(context.Context, storage.ListPlansOptions) ([]*storage.Plan, error) {
 	return nil, nil
-}
-
-// rollbackRoundPlanStore serves the source plan and a review round that
-// stored a plan for each of the rollout's other targets.
-type rollbackRoundPlanStore struct {
-	*rollbackTestPlanStore
-	members []*storage.Plan
-}
-
-func (s *rollbackRoundPlanStore) List(context.Context, storage.ListPlansOptions) ([]*storage.Plan, error) {
-	return s.members, nil
 }
 
 type rollbackTestTaskStore struct {
@@ -823,8 +829,8 @@ func TestRollbackCommandCoreTerminalDispositions(t *testing.T) {
 		assert.Contains(t, body, "rollback DDL rejected by engine")
 	})
 
-	// The apply ran across a rollout whose targets were each planned against
-	// their own schema, and a rollback is one plan. The refusal is the
+	// The apply ran across multiple targets, and rollback is not supported yet
+	// for multiple targets. The refusal is the
 	// command's answer, and in a PR it names the remedy the PR already holds:
 	// revert its schema files and apply again.
 	// The remedy is an apply of schema files without the change, and where
@@ -858,19 +864,17 @@ func TestRollbackCommandCoreTerminalDispositions(t *testing.T) {
 			wantText: "revert it in this PR if the PR is open",
 		},
 	} {
-		t.Run("rollback of a rollout planned per target is refused with the remedy, "+tc.name, func(t *testing.T) {
+		t.Run("rollback of an apply across multiple targets is refused with the remedy, "+tc.name, func(t *testing.T) {
 			client, mux := setupGitHubServer(t)
 			comments := recordComments(t, mux)
 			tc.serve(mux)
 			lockStore := &rollbackTestLockStore{}
 			st := remotePlanRollbackStorage(lockStore)
-			st.plans = &rollbackRoundPlanStore{
-				rollbackTestPlanStore: st.plans.(*rollbackTestPlanStore),
-				members: []*storage.Plan{
-					{PlanIdentifier: "plan-member-b", Deployment: "tenant-a", Target: "orders-staging-b"},
-					{PlanIdentifier: "plan-member-c", Deployment: "tenant-a", Target: "orders-staging-c"},
-					{PlanIdentifier: "plan-member-d", Deployment: "tenant-a", Target: "orders-staging-d"},
-				},
+			for i, target := range []string{"orders-staging", "orders-staging-b", "orders-staging-c", "orders-staging-d"} {
+				st.operations = append(st.operations, &storage.ApplyOperation{
+					ID: int64(i + 1), ApplyID: 7, Deployment: "tenant-a", Target: target,
+					OperationKey: storage.TargetOperationKey(target, ""), OperationKind: storage.ApplyOperationKindWork,
+				})
 			}
 			h := unlockTestHandler(t, st, ghclient.NewInstallationClient(client, testLogger()))
 
@@ -881,11 +885,11 @@ func TestRollbackCommandCoreTerminalDispositions(t *testing.T) {
 			assert.Equal(t, 1, lockStore.releaseCalls, "the command-acquired lock must be released after the refusal")
 			body := requireComment(t, comments, "rollout rollback refusal comment")
 			assert.Contains(t, body, "## Rollback Not Supported — Staging")
-			assert.Contains(t, body, "`apply-123` ran on 4 targets, each planned against its own schema")
+			assert.Contains(t, body, "Rollback isn't supported yet for multiple targets. `apply-123` ran on 4 targets.")
 			assert.Contains(t, body, tc.wantText)
 			assert.Contains(t, body, "```\nschemabot apply -e staging\n```")
 			assert.NotContains(t, body, "Rollback Failed")
-			assert.NotContains(t, body, "rollback of such a rollout is not supported", "the PR comment names the remedy in its own terms, not the API's message")
+			assert.NotContains(t, body, "rollback is not supported yet for multiple targets, so", "the PR comment names the remedy in its own terms, not the API's message")
 		})
 	}
 

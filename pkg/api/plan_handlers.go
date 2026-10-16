@@ -3316,17 +3316,6 @@ func (s *Service) ExecuteRollbackPlanForApply(ctx context.Context, apply *storag
 	if !state.IsState(apply.State, state.Apply.Completed) {
 		return nil, controlConflictf("apply %s is in state %q; only completed applies can be rolled back", apply.ApplyIdentifier, apply.State)
 	}
-	// A rollback plan is applied to the whole rollout, and a narrowed apply
-	// changed one member. Reverting it everywhere would run the reversal on
-	// members that never received the change, so it is refused until rollback
-	// can be narrowed the same way.
-	if member := apply.GetOptions().NarrowedTo; member != "" {
-		s.logger.Warn("rollback refused for an apply narrowed to one rollout member",
-			append(apply.LogAttrs(), "narrowed_to", member)...)
-		return nil, controlConflictf("apply %s ran on rollout member %s only; rollback of a narrowed apply is not supported, so restore that target by planning and applying the previous schema with target %s",
-			apply.ApplyIdentifier, member, member)
-	}
-
 	plan, err := s.storage.Plans().GetByID(ctx, apply.PlanID)
 	if err != nil {
 		return nil, fmt.Errorf("get rollback source plan: %w", err)
@@ -3351,10 +3340,7 @@ func (s *Service) ExecuteRollbackPlanForApply(ctx context.Context, apply *storag
 	if plan.Target == "" {
 		return nil, terminalControlf("plan %s is missing server-side routing metadata field %q; create a new plan and retry rollback", plan.PlanIdentifier, "target")
 	}
-	if err := s.refuseRollbackOfIndependentRollout(ctx, plan, apply, routing.ExecutionTarget{Deployment: deployment, Target: plan.Target}); err != nil {
-		return nil, err
-	}
-	if err := s.refuseRollbackAfterPrimaryMoved(apply, routing.ExecutionTarget{Deployment: deployment, Target: plan.Target}); err != nil {
+	if err := s.refuseMultiTargetRollback(ctx, apply, routing.ExecutionTarget{Deployment: deployment, Target: plan.Target}); err != nil {
 		return nil, err
 	}
 	// Client resolution is a config lookup: a deployment that cannot resolve a
@@ -3438,120 +3424,129 @@ func (s *Service) ExecuteRollbackPlanForApply(ctx context.Context, apply *storag
 	return planResponseFromProto(resp), nil
 }
 
-// refuseRollbackOfIndependentRollout refuses a rollback of an apply across a
-// rollout whose members are each planned against their own schema.
+// refuseMultiTargetRollback refuses a rollback of an apply in an environment
+// with more than one target. Rollback is not supported yet across multiple
+// targets: a rollback is one plan, made against the target the apply ran its
+// plan from (RV-9), and a rollout of several targets either runs each from a
+// plan of its own or reaches targets that plan was never made against. The
+// remedy that does undo the apply on every target is an apply of schema files
+// without the change, which plans each target against its own live schema.
 //
-// A rollback is one plan, made against the rollout primary, and such a
-// rollout runs no member from another member's plan (RV-9): apply creation
-// pairs each member with a plan stored for it, and a rollback stores none. The
-// rollback is refused here, before a plan is made, with the remedy that does
-// restore each member: an apply narrowed to it of the previous schema.
-//
-// The apply's own review round decides, not the configuration as it reads now.
-// A round that planned its members on their own stored a plan for each, bound
-// to the source plan, and the apply ran each member from its own plan however
-// the environment has been respelled since: as mirrored deployments, or with
-// fewer targets. A round that cannot be read refuses the rollback, since it is
-// the only record of how the apply ran. A round that stored no member plan ran
-// one plan on every member, and the configuration is still read for the one
-// case that rollback cannot reach either: an environment respelled since as
-// targets planned on their own, whose apply creation would find no plan for
-// any member but the primary.
-func (s *Service) refuseRollbackOfIndependentRollout(ctx context.Context, plan *storage.Plan, apply *storage.Apply, applyPrimary routing.ExecutionTarget) error {
-	memberPlans, err := s.MemberPlansForReviewRound(ctx, plan, apply.Environment)
+// Three records can each show more than one target, and any of them refuses:
+// the operations the apply ran (the targets it actually reached), a narrowing
+// to one member (which only a rollout of several has), and the environment's
+// routing now (the targets a rollback apply would reach). Operations that
+// cannot be read refuse the rollback, since they are the only record of where
+// the apply ran. Routing that cannot be resolved is left to apply creation
+// when the apply ran on one target, as it is for any other single-target
+// rollback.
+func (s *Service) refuseMultiTargetRollback(ctx context.Context, apply *storage.Apply, applyPrimary routing.ExecutionTarget) error {
+	ranOn, err := s.targetsApplyRanOn(ctx, apply, applyPrimary)
 	if err != nil {
-		s.logger.Error("rollback refused: the source plan's review round could not be read to tell whether its targets were each planned against their own schema",
-			append(apply.LogAttrs(), "plan_id", plan.PlanIdentifier, "error", err)...)
-		return fmt.Errorf("rollback of apply %s: read the review round of its plan %s: %w", apply.ApplyIdentifier, plan.PlanIdentifier, err)
+		s.logger.Error("rollback refused: the apply's operations could not be read to tell which targets it ran on",
+			append(apply.LogAttrs(), "error", err)...)
+		return fmt.Errorf("rollback of apply %s: %w", apply.ApplyIdentifier, err)
 	}
-	if len(memberPlans) > 0 {
-		targets := len(memberPlans) + 1
-		s.logger.Warn("rollback refused: the apply ran each of the rollout's targets from a plan of its own, and a rollback has one plan",
-			append(apply.LogAttrs(), "plan_id", plan.PlanIdentifier, "targets", targets)...)
-		unsupported := &RolloutRollbackUnsupportedError{
-			ApplyID:           apply.ApplyIdentifier,
-			Targets:           targets,
-			PlannedOnTheirOwn: true,
-			reason: fmt.Sprintf("apply %s ran across the %d targets of %s/%s, which were each planned against their own schema, and a rollback is one plan made against %s; rollback of such a rollout is not supported, so restore each target by planning and applying the previous schema with its target",
-				apply.ApplyIdentifier, targets, apply.Database, apply.Environment, applyPrimary.MemberID()),
+	narrowedTo := apply.GetOptions().NarrowedTo
+
+	unsupported := &RolloutRollbackUnsupportedError{ApplyID: apply.ApplyIdentifier, RanOn: len(ranOn)}
+	members, err := s.config.ResolveDatabaseTargets(apply.Database, apply.Environment)
+	if err != nil {
+		if len(ranOn) <= 1 && narrowedTo == "" {
+			s.logger.Debug("rollback target check skipped: the apply ran on one target, and config did not resolve the environment's targets; apply creation holds the plan to its stored target",
+				append(apply.LogAttrs(), "error", err)...)
+			return nil
 		}
-		s.recordUnroutedRolloutMembers(unsupported, apply, applyPrimary, memberPlans)
-		return rolloutRollbackConflict(unsupported)
-	}
-
-	members, err := s.config.ResolveDatabaseTargets(apply.Database, apply.Environment)
-	if err != nil {
-		s.logger.Debug("rollback member planning check skipped: the apply's round planned no target on its own, and config did not resolve the rollout members; apply creation pairs each member with its own plan",
-			append(apply.LogAttrs(), "error", err)...)
-		return nil
-	}
-	if len(members) <= 1 {
-		return nil
-	}
-	planning, err := s.config.MemberPlanningFor(apply.Database, apply.Environment)
-	if err != nil {
-		s.logger.Debug("rollback member planning check skipped: the apply's round planned no target on its own, and config did not resolve member planning; apply creation pairs each member with its own plan",
-			append(apply.LogAttrs(), "error", err)...)
-		return nil
-	}
-	if planning != PlanIndependent {
-		return nil
-	}
-	s.logger.Warn("rollback refused: the rollout's targets are now each planned against their own schema, and a rollback has one plan",
-		append(apply.LogAttrs(), "plan_id", plan.PlanIdentifier, "members", len(members))...)
-	return rolloutRollbackConflict(&RolloutRollbackUnsupportedError{
-		ApplyID: apply.ApplyIdentifier,
-		Targets: len(members),
-		reason: fmt.Sprintf("apply %s ran one plan across %s/%s, whose %d targets are now each planned against their own schema, and a rollback is one plan made against %s; rollback of such a rollout is not supported, so restore each target by planning and applying the previous schema with its target",
-			apply.ApplyIdentifier, apply.Database, apply.Environment, len(members), applyPrimary.MemberID()),
-	})
-}
-
-// recordUnroutedRolloutMembers names, on a refused rollback, the targets the
-// apply ran on that the environment no longer routes to. Undoing the apply
-// means applying the previous schema, and an apply reaches only the targets
-// routed now, so a target dropped from the routing since would keep the
-// applied schema. A configuration that cannot be resolved leaves the error
-// unchecked, and the caller words its remedy without the comparison.
-func (s *Service) recordUnroutedRolloutMembers(unsupported *RolloutRollbackUnsupportedError, apply *storage.Apply, applyPrimary routing.ExecutionTarget, memberPlans map[string]*storage.Plan) {
-	members, err := s.config.ResolveDatabaseTargets(apply.Database, apply.Environment)
-	if err != nil {
 		s.logger.Warn("rollback refusal cannot compare the apply's targets with the current routing: config did not resolve the environment's targets",
 			append(apply.LogAttrs(), "error", err)...)
-		return
-	}
-	routed := make(map[string]bool, len(members))
-	for _, member := range members {
-		routed[member.MemberID()] = true
-	}
-	ran := []string{applyPrimary.MemberID()}
-	for memberID := range memberPlans {
-		ran = append(ran, memberID)
-	}
-	slices.Sort(ran[1:])
-	for _, memberID := range ran {
-		if !routed[memberID] {
-			unsupported.Unrouted = append(unsupported.Unrouted, memberID)
+	} else {
+		unsupported.Targets = len(members)
+		unsupported.RoutingChecked = true
+		routed := make(map[string]bool, len(members))
+		for _, member := range members {
+			routed[member.MemberID()] = true
+		}
+		for _, memberID := range ranOn {
+			if !routed[memberID] {
+				unsupported.Unrouted = append(unsupported.Unrouted, memberID)
+			}
 		}
 	}
-	unsupported.RoutingChecked = true
+
+	if len(ranOn) <= 1 && narrowedTo == "" && unsupported.Targets <= 1 {
+		return nil
+	}
+	s.logger.Warn("rollback refused: rollback is not supported for an apply in an environment with multiple targets",
+		append(apply.LogAttrs(), "ran_on", ranOn, "narrowed_to", narrowedTo, "environment_targets", unsupported.Targets, "unrouted", unsupported.Unrouted)...)
+	unsupported.reason = multiTargetRollbackReason(apply, unsupported)
+	return rolloutRollbackConflict(unsupported)
+}
+
+// targetsApplyRanOn lists the targets an apply's operations ran on, as sorted
+// rollout member IDs. A sharded target runs several operations and counts
+// once, and a group finalizer runs no target's work of its own. An apply with
+// no operation rows ran on the target its plan was made against.
+func (s *Service) targetsApplyRanOn(ctx context.Context, apply *storage.Apply, applyPrimary routing.ExecutionTarget) ([]string, error) {
+	opStore := s.storage.ApplyOperations()
+	if opStore == nil {
+		return nil, fmt.Errorf("apply operations store is not available")
+	}
+	ops, err := opStore.ListByApply(ctx, apply.ID)
+	if err != nil {
+		return nil, fmt.Errorf("list apply_operations for apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	seen := map[string]bool{}
+	var ranOn []string
+	for _, op := range ops {
+		if op.OperationKind == storage.ApplyOperationKindGroupFinalizer {
+			continue
+		}
+		member := routing.ExecutionTarget{Deployment: op.Deployment, Target: op.Target}
+		if member.Target == "" && member.Deployment == applyPrimary.Deployment {
+			member = applyPrimary
+		}
+		if id := member.MemberID(); !seen[id] {
+			seen[id] = true
+			ranOn = append(ranOn, id)
+		}
+	}
+	if len(ranOn) == 0 {
+		s.logger.Debug("rollback target check: the apply recorded no operations, so it ran on the target its plan was made against",
+			apply.LogAttrs()...)
+		return []string{applyPrimary.MemberID()}, nil
+	}
+	slices.Sort(ranOn)
+	return ranOn, nil
+}
+
+// multiTargetRollbackReason is the refusal's message for callers that pass it
+// on as text, such as the CLI.
+func multiTargetRollbackReason(apply *storage.Apply, unsupported *RolloutRollbackUnsupportedError) string {
+	var ran string
+	switch {
+	case unsupported.RanOn > 1:
+		ran = fmt.Sprintf("apply %s ran on %d targets of %s/%s", apply.ApplyIdentifier, unsupported.RanOn, apply.Database, apply.Environment)
+	case unsupported.Targets > 1:
+		ran = fmt.Sprintf("apply %s ran on 1 of the %d targets of %s/%s", apply.ApplyIdentifier, unsupported.Targets, apply.Database, apply.Environment)
+	default:
+		ran = fmt.Sprintf("apply %s ran on target %s only, narrowed from the targets of %s/%s", apply.ApplyIdentifier, apply.GetOptions().NarrowedTo, apply.Database, apply.Environment)
+	}
+	return ran + "; rollback is not supported yet for multiple targets, so undo it by applying schema files without the change"
 }
 
 // RolloutRollbackUnsupportedError is a rollback refused because the apply's
-// rollout plans each of its targets against its own schema, and a rollback is
-// one plan. A caller that can name the remedy in its own terms, such as a PR
-// whose schema files can be reverted and applied again, reads it with
+// environment has more than one target, and rollback is not supported yet for
+// multiple targets. A caller that can name the remedy in its own terms, such
+// as a PR whose schema files can be reverted and applied again, reads it with
 // errors.As instead of passing the message on.
 type RolloutRollbackUnsupportedError struct {
 	// ApplyID is the apply the rollback was asked to reverse.
 	ApplyID string
-	// Targets is how many targets the rollout runs across.
+	// RanOn is how many targets the apply ran on.
+	RanOn int
+	// Targets is how many targets the environment routes to now; zero when
+	// the routing could not be resolved.
 	Targets int
-	// PlannedOnTheirOwn is set when the apply itself ran each target from a
-	// plan of its own. Unset, the apply ran one plan, and it is the
-	// environment's targets as configured now (Targets of them) that are each
-	// planned on their own.
-	PlannedOnTheirOwn bool
 	// RoutingChecked is set when the targets the apply ran on were compared
 	// with the ones the environment routes to now; Unrouted lists those it no
 	// longer routes to, which an apply of the previous schema would not reach.
@@ -3568,35 +3563,6 @@ func (e *RolloutRollbackUnsupportedError) Error() string {
 // carrying the typed error so a caller can read it with errors.As.
 func rolloutRollbackConflict(unsupported *RolloutRollbackUnsupportedError) error {
 	return &controlOperationHTTPError{status: http.StatusConflict, err: unsupported}
-}
-
-// refuseRollbackAfterPrimaryMoved refuses a rollback of a rollout-wide apply
-// whose rollout primary is no longer the environment's first member.
-//
-// A rollback plan is made against the member the forward apply ran its plan
-// from, and a rollout-wide apply runs only from the current primary's plan
-// (RV-9). Once a reorder moves another member to the front, the
-// rollback plan can no longer be applied to the rollout, and applying it to its
-// own member alone would revert that member and leave the others on the
-// forward schema. The rollback is refused here, before a plan is made, with
-// the one remedy that reverts every member: restore the rollout order the
-// apply ran under. A configuration that cannot resolve the environment is left to apply
-// creation, which then runs the plan on its stored member only when the
-// rollout has no other.
-func (s *Service) refuseRollbackAfterPrimaryMoved(apply *storage.Apply, applyPrimary routing.ExecutionTarget) error {
-	members, err := s.config.ResolveDatabaseTargets(apply.Database, apply.Environment)
-	if err != nil {
-		s.logger.Debug("rollback primary check skipped: config did not resolve the rollout members; apply creation holds the plan to its stored member",
-			append(apply.LogAttrs(), "error", err)...)
-		return nil
-	}
-	if len(members) <= 1 || (members[0].Deployment == applyPrimary.Deployment && members[0].Target == applyPrimary.Target) {
-		return nil
-	}
-	s.logger.Warn("rollback refused: the rollout primary changed since the apply ran",
-		append(apply.LogAttrs(), "apply_primary", applyPrimary.MemberID(), "rollout_primary", members[0].MemberID())...)
-	return controlConflictf("apply %s ran across the rollout from rollout primary %s, but the rollout primary is now %s; a rollback made against %s cannot be applied to the rollout, and applying it to that target alone would leave the others on the applied schema. Restore the rollout order the apply ran under (deployment_order) so %s is first, then retry the rollback",
-		apply.ApplyIdentifier, applyPrimary.MemberID(), members[0].MemberID(), applyPrimary.MemberID(), applyPrimary.MemberID())
 }
 
 func rollbackSourcePlanMatchesApply(plan *storage.Plan, apply *storage.Apply) bool {

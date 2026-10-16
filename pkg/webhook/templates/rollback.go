@@ -241,13 +241,11 @@ const (
 type RollbackOfRolloutUnsupportedData struct {
 	Environment string
 	ApplyID     string
-	// Targets is how many targets the refusal counted: the ones the apply ran
-	// on when PlannedOnTheirOwn, otherwise the environment's targets now.
+	// RanOn is how many targets the apply ran on.
+	RanOn int
+	// Targets is how many targets the environment routes to now; zero when
+	// the routing could not be resolved.
 	Targets int
-	// PlannedOnTheirOwn is set when the apply ran each target from a plan of
-	// its own; unset, it ran one plan and the environment has since been
-	// configured to plan each target on its own.
-	PlannedOnTheirOwn bool
 	// RoutingChecked is set when the apply's targets were compared with the
 	// environment's routing now; Unrouted lists the ones no longer routed.
 	RoutingChecked bool
@@ -260,21 +258,25 @@ type RollbackOfRolloutUnsupportedData struct {
 }
 
 // RenderRollbackOfRolloutUnsupported renders the message posted when a
-// rollback is refused because the apply's rollout plans each of its targets
-// against its own schema, and a rollback is one plan. What undoes the change on
-// every target is an apply of schema files without it, and where those files
-// can be applied from depends on the PR: an open PR reverts the change itself,
-// a merged one needs a PR that reverts it, and a closed one needs a PR that
-// plans the default branch, which never had it. A PR whose revert leaves its
-// schema files equal to the default branch changes no schema file, so it is
-// planned only once its schemabot.yaml changes too.
+// rollback is refused because the apply's environment has more than one
+// target, and rollback is not supported yet for multiple targets. What undoes
+// the change on every target is an apply of schema files without it, and where
+// those files can be applied from depends on the PR: an open PR reverts the
+// change itself, a merged one needs a PR that reverts it, and a closed one
+// needs a PR that plans the default branch, which never had it. A PR whose
+// revert leaves its schema files equal to the default branch changes no schema
+// file, so it is planned only once its schemabot.yaml changes too.
 func RenderRollbackOfRolloutUnsupported(data RollbackOfRolloutUnsupportedData) string {
 	var sb strings.Builder
 	writeEnvironmentTitle(&sb, "Rollback Not Supported", data.Environment)
-	if data.PlannedOnTheirOwn {
-		fmt.Fprintf(&sb, "`%s` ran on %d targets, each planned against its own schema, and a rollback runs one plan.\n\n", data.ApplyID, data.Targets)
-	} else {
-		fmt.Fprintf(&sb, "`%s` ran one plan, and this environment's %d targets are now each planned against their own schema. A rollback runs one plan.\n\n", data.ApplyID, data.Targets)
+	sb.WriteString("Rollback isn't supported yet for multiple targets. ")
+	switch {
+	case data.RanOn > 1:
+		fmt.Fprintf(&sb, "`%s` ran on %d targets.\n\n", data.ApplyID, data.RanOn)
+	case data.Targets > 1:
+		fmt.Fprintf(&sb, "`%s` ran on 1 of this environment's %d targets.\n\n", data.ApplyID, data.Targets)
+	default:
+		fmt.Fprintf(&sb, "`%s` was narrowed to one target.\n\n", data.ApplyID)
 	}
 
 	switch {

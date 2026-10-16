@@ -497,8 +497,10 @@ dispatched, and an apply or plan of the whole environment lifts that block
 once every target has the change. `apply-confirm` takes no `--target`: it confirms the
 target its apply named. The server records the narrowing on the
 stored plan and refuses to apply it anywhere but the target it was made for,
-and a narrowed apply cannot be rolled back with `rollback`: restore that
-target by planning and applying the previous schema with the same `--target`.
+and `rollback` is not supported yet for an apply in an environment of more
+than one target, narrowed or not: undo it by applying schema files without the
+change, or restore a narrowed apply's target by planning and applying the
+previous schema with the same `--target`.
 In an environment with a single target, `--target` names the whole rollout,
 so the plan and apply are not narrowed.
 

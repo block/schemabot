@@ -473,25 +473,26 @@ func TestRenderRollbackRejectedRedactsEndpoints(t *testing.T) {
 	assert.Contains(t, rendered, "**Reason**: `dial tcp [endpoint redacted]: connection refused`")
 }
 
-// A rollback of an apply that ran on 4 targets, each planned against its own
-// schema, is refused. The comment names where schema files without the change
-// can be applied from, which depends on the PR: an open PR reverts the change
-// and toggles a nonce so its directory is still planned, a merged one needs a
-// reverting PR, and a closed one needs a PR that plans the default branch,
-// which never had the change. A PR whose state could not be read gets wording
-// true for every state. Targets the environment no longer routes to are named,
-// since the apply that undoes the change would not reach them.
+// A rollback of an apply that ran on 4 targets is refused, since rollback is
+// not supported yet for multiple targets. The comment names where schema files
+// without the change can be applied from, which depends on the PR: an open PR
+// reverts the change and toggles a nonce so its directory is still planned, a
+// merged one needs a reverting PR, and a closed one needs a PR that plans the
+// default branch, which never had the change. A PR whose state could not be
+// read gets wording true for every state. Targets the environment no longer
+// routes to are named, since the apply that undoes the change would not reach
+// them.
 func TestRenderRollbackOfRolloutUnsupported(t *testing.T) {
 	data := RollbackOfRolloutUnsupportedData{
-		Environment:       "staging",
-		ApplyID:           "apply-a1b2c3d4e5f6",
-		Targets:           4,
-		PlannedOnTheirOwn: true,
-		RoutingChecked:    true,
-		PR:                PRStateOpen,
+		Environment:    "staging",
+		ApplyID:        "apply-a1b2c3d4e5f6",
+		RanOn:          4,
+		Targets:        4,
+		RoutingChecked: true,
+		PR:             PRStateOpen,
 	}
 	assert.Equal(t, "## Rollback Not Supported — Staging\n\n"+
-		"`apply-a1b2c3d4e5f6` ran on 4 targets, each planned against its own schema, and a rollback runs one plan.\n\n"+
+		"Rollback isn't supported yet for multiple targets. `apply-a1b2c3d4e5f6` ran on 4 targets.\n\n"+
 		"To undo it, revert the change in this PR's schema files and add or toggle a `# nonce` comment line in the database's `schemabot.yaml` so the directory is still planned. Push, then run:\n"+
 		"```\nschemabot apply -e staging\n```\n", RenderRollbackOfRolloutUnsupported(data))
 
@@ -535,13 +536,16 @@ func TestRenderRollbackOfRolloutUnsupported(t *testing.T) {
 		assert.Contains(t, RenderRollbackOfRolloutUnsupported(unchecked), "An apply reaches only the targets this environment routes to now, so add back any target it ran on that is no longer routed.\n\n")
 	})
 
-	t.Run("one plan, since configured to plan each target on its own", func(t *testing.T) {
-		switched := data
-		switched.PlannedOnTheirOwn = false
-		switched.Targets = 2
-		out := RenderRollbackOfRolloutUnsupported(switched)
-		assert.Contains(t, out, "`apply-a1b2c3d4e5f6` ran one plan, and this environment's 2 targets are now each planned against their own schema. A rollback runs one plan.\n\n")
-		assert.NotContains(t, out, "each planned against its own schema, and")
+	t.Run("one of several targets", func(t *testing.T) {
+		one := data
+		one.RanOn = 1
+		assert.Contains(t, RenderRollbackOfRolloutUnsupported(one), "Rollback isn't supported yet for multiple targets. `apply-a1b2c3d4e5f6` ran on 1 of this environment's 4 targets.\n\n")
+	})
+
+	t.Run("narrowed, routing unresolved", func(t *testing.T) {
+		narrowed := data
+		narrowed.RanOn, narrowed.Targets, narrowed.RoutingChecked = 1, 0, false
+		assert.Contains(t, RenderRollbackOfRolloutUnsupported(narrowed), "Rollback isn't supported yet for multiple targets. `apply-a1b2c3d4e5f6` was narrowed to one target.\n\n")
 	})
 
 	t.Run("tenant", func(t *testing.T) {
