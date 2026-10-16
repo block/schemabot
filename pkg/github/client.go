@@ -1758,9 +1758,10 @@ func pathInsideAny(p string, dirs []string) bool {
 // is the one SchemaBot already privileges — the post-merge reconcile runs for
 // it alone, and a registered repository cannot be pointed at another ref.
 //
-// The result is always a subset of files, with the previous path of a rename
-// the default branch already holds cleared, so this can only ever narrow
-// discovery: it cannot surface a database that was not already discovered.
+// Every kept file is one of files, unchanged except that a rename the default
+// branch already holds has its PreviousFilename cleared, so this can only ever
+// narrow discovery: it cannot surface a database that was not already
+// discovered.
 // Only the files discovery keys on are compared, so a pull request that touches
 // no schema costs no API calls.
 func (ic *InstallationClient) PRFilesProposedAgainstDefaultBranch(ctx context.Context, repo, headSHA string, files []PRFile) (proposed []PRFile, defaultTipSHA string, err error) {

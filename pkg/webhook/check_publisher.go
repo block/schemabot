@@ -368,11 +368,17 @@ func (h *Handler) loadStoppedApplies(ctx context.Context, repo string, pr int) (
 }
 
 // prFilePaths extracts the changed-file paths from a PR file listing for
-// expected-participant matching.
+// expected-participant matching. A rename contributes the path it vacated as
+// well as its new one: moving a participant's schema file to a name or
+// directory outside the participant's paths stops the default branch declaring
+// that participant's tables, so the participant is still expected.
 func prFilePaths(files []ghclient.PRFile) []string {
 	paths := make([]string, 0, len(files))
 	for _, f := range files {
 		paths = append(paths, f.Filename)
+		if f.PreviousFilename != "" && f.PreviousFilename != f.Filename {
+			paths = append(paths, f.PreviousFilename)
+		}
 	}
 	return paths
 }
