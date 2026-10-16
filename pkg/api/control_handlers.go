@@ -2214,14 +2214,16 @@ func (s *Service) executeRevertForApply(ctx context.Context, client tern.Client,
 // with its own remote apply, so an immediate call keyed on one apply id would
 // act on a single operation and leave its siblings behind; the operator fans the
 // durable request out to every operation instead. When the operation count
-// cannot be determined the immediate attempt proceeds, and the durable request
-// still covers a failure.
+// cannot be determined the immediate attempt is skipped too: an accepted
+// immediate call completes the whole durable request, so on a multi-operation
+// apply it would remove the command before the siblings receive it. The request
+// stays pending for the driver to carry out.
 func (s *Service) immediateControlSkippedForMultiOperationApply(ctx context.Context, apply *storage.Apply, operation, caller string) bool {
 	multiOp, err := s.applyHasMultipleOperations(ctx, apply)
 	if err != nil {
-		s.logger.Warn("could not determine apply operation count; attempting single-deployment immediate "+operation,
+		s.logger.Warn("could not determine apply operation count; immediate "+operation+" skipped and the durable request stays pending for the driver",
 			append(apply.LogAttrs(), "requested_by", caller, "error", err)...)
-		return false
+		return true
 	}
 	if multiOp {
 		s.logger.Info("immediate "+operation+" skipped for multi-operation apply; operator will fan out the durable request per operation",
