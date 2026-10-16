@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"net/http"
+	"slices"
 	"time"
 
 	"github.com/block/schemabot/pkg/api"
@@ -645,7 +647,6 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 	// If all environments errored, no check records were stored and headSHA
 	// is empty. Post a failing aggregate so branch protection isn't stuck
 	// waiting for a check that will never arrive.
-	planFailedUnstored := map[string]string{}
 	if headSHA != "" {
 		// The fold below reads stored rows only, so an environment that failed
 		// to plan while another stored a row must fail through a row of its own.
@@ -657,16 +658,33 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 			Repository: multiEnvData.Repository,
 			HeadSHA:    multiEnvData.HeadSHA,
 		}
+		planFailedUnstored := map[string]string{}
 		for _, env := range planFailedEnvironments {
 			if _, checkErr := h.storePlanFailedCheck(ctx, client, repo, pr, failedSchema, env); checkErr != nil {
-				h.logger.Error("failed to store failing check record for an environment that could not plan; posting a failing aggregate instead",
+				h.logger.Error("failed to store failing check record for an environment that could not plan; posting a blocked failing aggregate before the fold instead",
 					"repo", repo, "pr", pr, "env", env, "database_type", failedSchema.Type,
 					"database", failedSchema.Database, "head_sha", failedSchema.HeadSHA, "error", checkErr)
 				planFailedUnstored[env] = planFailedUnstoredSummary
 			}
 		}
+		// A failure stored check state does not hold is invisible to the fold,
+		// which would pass on the environments that did plan. Its failing
+		// aggregate is posted first, carrying a block every fold leaves in
+		// place, so neither this fold nor one from a later plan of another
+		// environment publishes success over it. Should the block itself not be
+		// stored, the fold is skipped rather than allowed to publish.
+		foldSeesEveryFailure := true
+		if len(planFailedUnstored) > 0 {
+			foldSeesEveryFailure = h.postFailingAggregatesWithBlock(ctx, client, repo, pr, headSHA, planFailedUnstored, planFailedUnrecordedBlock)
+		}
 		h.settleChecksReplacedByNewTypeBeforeFold(ctx, client, repo, pr, headSHA, multiEnvData.Database, multiEnvData.DatabaseType)
-		h.updateAggregateCheck(ctx, client, repo, pr, headSHA)
+		if foldSeesEveryFailure {
+			h.updateAggregateCheck(ctx, client, repo, pr, headSHA)
+		} else {
+			h.logger.Error("aggregate not folded: an environment's plan failure is recorded neither on its check row nor as an aggregate block, so a fold could pass without it; the aggregate check keeps its prior state until the check is re-run or a commit is pushed",
+				"repo", repo, "pr", pr, "head_sha", headSHA, "database_type", multiEnvData.DatabaseType,
+				"database", multiEnvData.Database, "environments", slices.Sorted(maps.Keys(planFailedUnstored)))
+		}
 	} else if len(multiEnvData.Errors) > 0 {
 		prInfo, fetchErr := client.FetchPullRequest(ctx, repo, pr)
 		if fetchErr != nil {
@@ -695,9 +713,6 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 			"repo", repo,
 			"pr", pr,
 			"environments", len(placementBlockUnstored))
-	}
-	if len(planFailedUnstored) > 0 {
-		h.postFailingAggregates(ctx, client, repo, pr, multiEnvData.HeadSHA, planFailedUnstored)
 	}
 	if len(pendingWorkUnstored) > 0 && multiEnvData.HeadSHA != "" {
 		h.postFailingAggregates(ctx, client, repo, pr, multiEnvData.HeadSHA, pendingWorkUnstored)

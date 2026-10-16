@@ -208,8 +208,11 @@ func (h *Handler) storeNamespacePlacementCheck(ctx context.Context, client *ghcl
 }
 
 // planFailedUnstoredSummary is the failing aggregate's summary when the failing
-// check for an environment that could not plan could not be stored either.
-const planFailedUnstoredSummary = "SchemaBot could not plan this environment or record the failure; see the plan comment, then re-run plan"
+// check for an environment that could not plan could not be stored either. The
+// aggregate then carries planFailedUnrecordedBlock, which a plan command does
+// not release, so the summary names what does: a re-run of the check or a new
+// commit, either of which re-plans every environment.
+const planFailedUnstoredSummary = "SchemaBot could not plan this environment or record the failure; see the plan comment, then re-run this check or push a commit to re-plan every environment"
 
 // storePlanFailedCheck stores a failing check for an environment whose plan
 // could not be produced at all: its schema request, its environment

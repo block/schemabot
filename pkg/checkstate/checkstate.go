@@ -81,6 +81,7 @@ const (
 	BlockNoAllowedConfiguredEnvironments  = "no_allowed_configured_environments"
 	BlockParticipantUnresolved            = "participant_unresolved"
 	BlockNarrowedApply                    = "narrowed_apply"
+	BlockPlanFailedUnrecorded             = "plan_failed_unrecorded"
 	BlockReviewTimeDeploymentDrift        = storage.ReviewTimeDeploymentDriftBlockingReason
 	BlockNamespacePlacementRefused        = storage.NamespacePlacementRefusedBlockingReason
 )
@@ -132,6 +133,7 @@ var blockClasses = map[string]blockClass{
 	BlockManagedDirMissingConfig:          blockGuard,
 	BlockNoAllowedConfiguredEnvironments:  blockGuard,
 	BlockNarrowedApply:                    blockGuard,
+	BlockPlanFailedUnrecorded:             blockGuard,
 	BlockParticipantUnresolved:            blockAwaitingReport,
 }
 
