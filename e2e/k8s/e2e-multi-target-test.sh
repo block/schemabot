@@ -61,10 +61,12 @@ for port in "${LOCAL_PORTS[@]}"; do
     fi
 done
 
+# PIDS holds every background process the script starts, the port-forwards and
+# the background compiles alike, so an early exit stops them all.
 PIDS=()
 cleanup() {
     rm -f "$PINNED_KUBECONFIG"
-    echo "Cleaning up port-forwards..."
+    echo "Cleaning up background processes..."
     for pid in ${PIDS[@]+"${PIDS[@]}"}; do
         kill "$pid" 2>/dev/null || true
     done
@@ -113,6 +115,7 @@ echo "Building schemabot + etre images for minikube..."
 eval "$(minikube docker-env)"
 CGO_ENABLED=0 GOOS=linux go build -o "$REPO_ROOT/bin/schemabot-linux" ./pkg/cmd &
 SCHEMABOT_BUILD_PID=$!
+PIDS+=("$SCHEMABOT_BUILD_PID")
 docker build -t etre:test "$REPO_ROOT/e2e/k8s/etre/"
 
 # The etre deployment never pulls its image, so the stack is applied only once
@@ -129,8 +132,11 @@ kubectl create configmap etre-fixtures \
 kubectl delete job etre-mongo-init etre-seed ministack-seed -n "$NAMESPACE" --ignore-not-found
 kubectl apply -n "$NAMESPACE" -f "$REPO_ROOT/e2e/k8s/etre-stack.yaml"
 
+# The namespace was created before the build so MySQL could start early, so a
+# failed build tears it down rather than leaving its pods behind.
 if ! wait "$SCHEMABOT_BUILD_PID"; then
     echo "Error: building the schemabot binary failed"
+    teardown_namespace
     exit 1
 fi
 cp "$REPO_ROOT/bin/schemabot-linux" "$REPO_ROOT/deploy/local/schemabot-dev"
@@ -145,6 +151,7 @@ rm -f "$REPO_ROOT/deploy/local/schemabot-dev"
 # own output.
 go test -tags=e2e -c -o /dev/null ./e2e/k8s &
 TEST_COMPILE_PID=$!
+PIDS+=("$TEST_COMPILE_PID")
 
 wait_for_ready_pods "app=mysql-control-plane"
 wait_for_ready_pods "app=mysql-data-plane"

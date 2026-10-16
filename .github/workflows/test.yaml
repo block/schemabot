@@ -14,6 +14,11 @@ on:
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
+env:
+  # The installed minikube and the key of its cached node image and preload
+  # read this one value, so a version bump cannot leave a stale cache entry
+  # that exactly matches the old key.
+  MINIKUBE_VERSION: "1.39.0"
 jobs:
   # Detect whether the change touches any non-markdown file.
   # PRs that touch only docs skip the heavy jobs below; pushes (main/tags)
@@ -99,7 +104,7 @@ jobs:
           path: |
             ~/go/pkg/mod
             ~/.cache/go-build
-          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum', 'e2e/consumermodule/go.sum') }}
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum', 'e2e/consumermodule/go.sum', '.github/go-cache-epoch') }}
           restore-keys: go-${{ runner.os }}-${{ runner.arch }}-
       - name: "Build"
         run: go build -v ./...
@@ -125,7 +130,7 @@ jobs:
           path: |
             ~/go/pkg/mod
             ~/.cache/go-build
-          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum', 'e2e/consumermodule/go.sum') }}
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum', 'e2e/consumermodule/go.sum', '.github/go-cache-epoch') }}
 
   unit:
     name: "Unit Tests"
@@ -146,7 +151,7 @@ jobs:
           path: |
             ~/go/pkg/mod
             ~/.cache/go-build
-          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum', 'e2e/consumermodule/go.sum') }}
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum', 'e2e/consumermodule/go.sum', '.github/go-cache-epoch') }}
           restore-keys: go-${{ runner.os }}-${{ runner.arch }}-
       - name: "Test"
         run: make test-unit
@@ -208,7 +213,7 @@ jobs:
           path: |
             ~/go/pkg/mod
             ~/.cache/go-build
-          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum', 'e2e/consumermodule/go.sum') }}
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum', 'e2e/consumermodule/go.sum', '.github/go-cache-epoch') }}
           restore-keys: go-${{ runner.os }}-${{ runner.arch }}-
       # Pre-pull external images with retries so transient registry outages
       # surface here as a named, retryable, fail-fast step instead of as many
@@ -390,7 +395,7 @@ jobs:
           path: |
             ~/go/pkg/mod
             ~/.cache/go-build
-          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum', 'e2e/consumermodule/go.sum') }}
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum', 'e2e/consumermodule/go.sum', '.github/go-cache-epoch') }}
           restore-keys: go-${{ runner.os }}-${{ runner.arch }}-
       # Pre-pull external images with retries so a transient registry outage
       # fails fast in a named, retryable step instead of failing the image
@@ -439,7 +444,7 @@ jobs:
           path: |
             ~/go/pkg/mod
             ~/.cache/go-build
-          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum', 'e2e/consumermodule/go.sum') }}
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum', 'e2e/consumermodule/go.sum', '.github/go-cache-epoch') }}
           restore-keys: go-${{ runner.os }}-${{ runner.arch }}-
       # Pre-pull external images with retries so a transient registry outage
       # fails fast in a named, retryable step instead of failing the compose
@@ -496,7 +501,7 @@ jobs:
           path: |
             ~/go/pkg/mod
             ~/.cache/go-build
-          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum', 'e2e/consumermodule/go.sum') }}
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum', 'e2e/consumermodule/go.sum', '.github/go-cache-epoch') }}
           restore-keys: go-${{ runner.os }}-${{ runner.arch }}-
       # Pre-pull external images with retries so a transient registry outage
       # fails fast in a named, retryable step instead of failing the compose
@@ -569,7 +574,7 @@ jobs:
           path: |
             ~/go/pkg/mod
             ~/.cache/go-build
-          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum', 'e2e/consumermodule/go.sum') }}
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum', 'e2e/consumermodule/go.sum', '.github/go-cache-epoch') }}
           restore-keys: go-${{ runner.os }}-${{ runner.arch }}-
       # Pre-pull external images with retries so a transient registry outage
       # fails fast in a named, retryable step instead of failing the compose
@@ -697,7 +702,7 @@ jobs:
           path: |
             ~/go/pkg/mod
             ~/.cache/go-build
-          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum', 'e2e/consumermodule/go.sum') }}
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum', 'e2e/consumermodule/go.sum', '.github/go-cache-epoch') }}
           restore-keys: go-${{ runner.os }}-${{ runner.arch }}-
       # Pre-pull external images with retries so a transient registry outage
       # fails fast in a named, retryable step instead of failing the compose
@@ -754,7 +759,7 @@ jobs:
           path: |
             ~/go/pkg/mod
             ~/.cache/go-build
-          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum', 'e2e/consumermodule/go.sum') }}
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum', 'e2e/consumermodule/go.sum', '.github/go-cache-epoch') }}
           restore-keys: go-${{ runner.os }}-${{ runner.arch }}-
       # setup-minikube's own download cache cannot reach the cache service, so
       # every run would download the node image and the Kubernetes preload.
@@ -766,7 +771,7 @@ jobs:
           path: |
             ~/.minikube/cache/kic
             ~/.minikube/cache/preloaded-tarball
-          key: minikube-1.39.0-${{ runner.os }}-${{ runner.arch }}
+          key: minikube-${{ env.MINIKUBE_VERSION }}-${{ runner.os }}-${{ runner.arch }}
       - name: "Start minikube"
         uses: medyagh/setup-minikube@d8c0eb871f6f455542491d86a574477bd3894533 # medyagh/setup-minikube@v0.0.18
         with:
@@ -776,7 +781,7 @@ jobs:
           container-runtime: docker
           cpus: 2
           memory: 2048
-          minikube-version: 1.39.0
+          minikube-version: ${{ env.MINIKUBE_VERSION }}
           cache: false
           # The scripts wait for each of their own pods, so minikube need not
           # also wait for every system pod to turn Ready before they start.
@@ -788,7 +793,7 @@ jobs:
           path: |
             ~/.minikube/cache/kic
             ~/.minikube/cache/preloaded-tarball
-          key: minikube-1.39.0-${{ runner.os }}-${{ runner.arch }}
+          key: minikube-${{ env.MINIKUBE_VERSION }}-${{ runner.os }}-${{ runner.arch }}
       # The script builds the schemabot image into minikube's docker daemon
       # under its own per-run tag, so no separate build step is needed here.
       - name: "Deploy and test"
@@ -846,7 +851,7 @@ jobs:
           path: |
             ~/go/pkg/mod
             ~/.cache/go-build
-          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum', 'e2e/consumermodule/go.sum') }}
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum', 'e2e/consumermodule/go.sum', '.github/go-cache-epoch') }}
           restore-keys: go-${{ runner.os }}-${{ runner.arch }}-
       # setup-minikube's own download cache cannot reach the cache service, so
       # every run would download the node image and the Kubernetes preload.
@@ -858,7 +863,7 @@ jobs:
           path: |
             ~/.minikube/cache/kic
             ~/.minikube/cache/preloaded-tarball
-          key: minikube-1.39.0-${{ runner.os }}-${{ runner.arch }}
+          key: minikube-${{ env.MINIKUBE_VERSION }}-${{ runner.os }}-${{ runner.arch }}
       - name: "Start minikube"
         uses: medyagh/setup-minikube@d8c0eb871f6f455542491d86a574477bd3894533 # medyagh/setup-minikube@v0.0.18
         with:
@@ -868,7 +873,7 @@ jobs:
           container-runtime: docker
           cpus: 2
           memory: 4096
-          minikube-version: 1.39.0
+          minikube-version: ${{ env.MINIKUBE_VERSION }}
           cache: false
           # The scripts wait for each of their own pods, so minikube need not
           # also wait for every system pod to turn Ready before they start.
@@ -880,7 +885,7 @@ jobs:
           path: |
             ~/.minikube/cache/kic
             ~/.minikube/cache/preloaded-tarball
-          key: minikube-1.39.0-${{ runner.os }}-${{ runner.arch }}
+          key: minikube-${{ env.MINIKUBE_VERSION }}-${{ runner.os }}-${{ runner.arch }}
       # The script builds both the schemabot and etre images into minikube's
       # docker daemon, so no separate build step is needed here.
       - name: "Deploy and test"
@@ -984,7 +989,7 @@ jobs:
           path: |
             ~/go/pkg/mod
             ~/.cache/go-build
-          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum', 'e2e/consumermodule/go.sum') }}
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum', 'e2e/consumermodule/go.sum', '.github/go-cache-epoch') }}
           restore-keys: go-${{ runner.os }}-${{ runner.arch }}-
       # setup-minikube's own download cache cannot reach the cache service, so
       # every run would download the node image and the Kubernetes preload.
@@ -996,7 +1001,7 @@ jobs:
           path: |
             ~/.minikube/cache/kic
             ~/.minikube/cache/preloaded-tarball
-          key: minikube-1.39.0-${{ runner.os }}-${{ runner.arch }}
+          key: minikube-${{ env.MINIKUBE_VERSION }}-${{ runner.os }}-${{ runner.arch }}
       - name: "Start minikube"
         uses: medyagh/setup-minikube@d8c0eb871f6f455542491d86a574477bd3894533 # medyagh/setup-minikube@v0.0.18
         with:
@@ -1008,7 +1013,7 @@ jobs:
           # stores, Etre and ministack: sized to the script's own minikube.
           cpus: 4
           memory: 6144
-          minikube-version: 1.39.0
+          minikube-version: ${{ env.MINIKUBE_VERSION }}
           cache: false
           # The scripts wait for each of their own pods, so minikube need not
           # also wait for every system pod to turn Ready before they start.
@@ -1020,7 +1025,7 @@ jobs:
           path: |
             ~/.minikube/cache/kic
             ~/.minikube/cache/preloaded-tarball
-          key: minikube-1.39.0-${{ runner.os }}-${{ runner.arch }}
+          key: minikube-${{ env.MINIKUBE_VERSION }}-${{ runner.os }}-${{ runner.arch }}
       # The script builds the schemabot and etre images into minikube's docker
       # daemon, so no separate build step is needed here.
       - name: "Deploy and test"
@@ -1072,7 +1077,7 @@ jobs:
           path: |
             ~/go/pkg/mod
             ~/.cache/go-build
-          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum', 'e2e/consumermodule/go.sum') }}
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum', 'e2e/consumermodule/go.sum', '.github/go-cache-epoch') }}
           restore-keys: go-${{ runner.os }}-${{ runner.arch }}-
       # The runner ships a preinstalled MySQL whose AppArmor profile confines
       # /usr/sbin/mysqld to its packaged data dirs. LocalScale runs vtcombo's
@@ -1095,7 +1100,7 @@ jobs:
           path: |
             ~/.minikube/cache/kic
             ~/.minikube/cache/preloaded-tarball
-          key: minikube-1.39.0-${{ runner.os }}-${{ runner.arch }}
+          key: minikube-${{ env.MINIKUBE_VERSION }}-${{ runner.os }}-${{ runner.arch }}
       - name: "Start minikube"
         uses: medyagh/setup-minikube@d8c0eb871f6f455542491d86a574477bd3894533 # medyagh/setup-minikube@v0.0.18
         with:
@@ -1105,7 +1110,7 @@ jobs:
           container-runtime: docker
           cpus: 2
           memory: 6144
-          minikube-version: 1.39.0
+          minikube-version: ${{ env.MINIKUBE_VERSION }}
           cache: false
           # The scripts wait for each of their own pods, so minikube need not
           # also wait for every system pod to turn Ready before they start.
@@ -1117,7 +1122,7 @@ jobs:
           path: |
             ~/.minikube/cache/kic
             ~/.minikube/cache/preloaded-tarball
-          key: minikube-1.39.0-${{ runner.os }}-${{ runner.arch }}
+          key: minikube-${{ env.MINIKUBE_VERSION }}-${{ runner.os }}-${{ runner.arch }}
       # The script builds the schemabot, etre, and localscale images into
       # minikube's docker daemon, so no separate build step is needed here.
       - name: "Deploy and test"
