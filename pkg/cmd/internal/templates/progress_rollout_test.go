@@ -1027,6 +1027,24 @@ func TestWriteProgress_SettledRolloutTableReadsNotStarted(t *testing.T) {
 	})
 }
 
+// A rollup's headline counts the deployment's targets, singular for a
+// deployment of one target and plural for several.
+func TestFormatTargetRollup_HeadlineCountsTargets(t *testing.T) {
+	for _, tc := range []struct {
+		targets []rolloutTarget
+		want    string
+	}{
+		{targets: []rolloutTarget{copyingTarget(400)}, want: "🔄 prod — 1 running (1 target)\n"},
+		{targets: []rolloutTarget{completedTarget(), copyingTarget(400)}, want: "🔄 prod — 1 completed · 1 running (2 targets)\n"},
+	} {
+		data := targetRolloutData(tc.targets)
+		model := presentation.Derive(ProgressOperationsForPresentation(data.Operations, data.Released))
+		view := RolloutView{ApplyID: data.ApplyID, Environment: data.Environment, Engine: data.Engine, Model: model, Tables: data.Tables}
+		out := ansiEscape.ReplaceAllString(FormatTargetRollup(view, model.Groups()[0]), "")
+		assert.True(t, strings.HasPrefix(out, tc.want), "want headline %q:\n%s", tc.want, out)
+	}
+}
+
 // A target that has reported no table progress counts toward a rolled-up
 // table at where its operation stands, the way the PR comment counts it: one
 // that failed before reporting is listed as failed and counts as no progress

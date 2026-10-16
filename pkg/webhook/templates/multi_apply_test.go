@@ -824,19 +824,26 @@ func TestRenderMultiDeploymentApplyComment_SoleGroupCutDDLSpeaksOnlyForReporting
 // whose every target failed still fits in one comment; the <summary> counts
 // carry the total.
 func TestRenderMultiDeploymentApplyComment_RolledUpFailedTargetsAreNamed(t *testing.T) {
-	var ops []presentation.Operation
-	var details []*ApplyStatusCommentData
-	for i := range failedTargetRowLimit + 5 {
-		target := fmt.Sprintf("testapp-%03d", i)
-		ops = append(ops, presentation.Operation{Deployment: "primary", Target: target, State: so.Failed, Parallel: true, ContinueOnFailure: true, Error: "Error 1062: Duplicate entry | for key"})
-		details = append(details, targetDetail(target, state.Task.Failed, addNote, 0))
+	render := func(failed int) string {
+		var ops []presentation.Operation
+		var details []*ApplyStatusCommentData
+		for i := range failed {
+			target := fmt.Sprintf("testapp-%03d", i)
+			ops = append(ops, presentation.Operation{Deployment: "primary", Target: target, State: so.Failed, Parallel: true, ContinueOnFailure: true, Error: "Error 1062: Duplicate entry | for key"})
+			details = append(details, targetDetail(target, state.Task.Failed, addNote, 0))
+		}
+		return renderTargets(presentation.Derive(ops), details...)
 	}
-	out := renderTargets(presentation.Derive(ops), details...)
 
+	out := render(failedTargetRowLimit + 5)
 	assert.Contains(t, out, "\n❌ Rolled out to no targets, 25 failed\n")
 	assert.Contains(t, out, "\n| Target | Status |\n| --- | --- |\n| `testapp-000` | ❌ failed — Error 1062: Duplicate entry / for key |\n")
 	assert.Equal(t, failedTargetRowLimit, strings.Count(out, "| ❌ failed"))
 	assert.Contains(t, out, "\n…and 5 more failed targets.\n")
+
+	out = render(failedTargetRowLimit + 1)
+	assert.Equal(t, failedTargetRowLimit, strings.Count(out, "| ❌ failed"))
+	assert.Contains(t, out, "\n…and 1 more failed target.\n", out)
 }
 
 // A table copying on several targets shows its planned size summed across
@@ -2212,6 +2219,27 @@ func TestRenderMultiDeploymentApplyComment_SettledRolloutTableReadsNotStarted(t 
 		assert.NotContains(t, out, "not started")
 		assert.NotContains(t, out, "Not started")
 	})
+}
+
+// A settled rollout of `orders` and `docks` across two targets, where only
+// testapp-001 changes `docks`: each completed table line counts the targets
+// that ran it, singular for the table one target ran and plural for the table
+// both ran.
+func TestRenderMultiDeploymentApplyComment_CompletedTableCountsItsTargets(t *testing.T) {
+	ops := []presentation.Operation{
+		parallelTarget("primary", "testapp-001", so.Completed),
+		parallelTarget("primary", "testapp-002", so.Completed),
+	}
+	out := renderTargets(presentation.Derive(ops),
+		tablesDetail("testapp_001",
+			TableProgressData{TableName: "orders", Status: state.Task.Completed, RowsCopied: 1000},
+			TableProgressData{TableName: "docks", Status: state.Task.Completed, RowsCopied: 1000},
+		),
+		tablesDetail("testapp_002", TableProgressData{TableName: "orders", Status: state.Task.Completed, RowsCopied: 1000}),
+	)
+	assert.Contains(t, out, "**`docks`**: ✅ Complete (1 target)\n", out)
+	assert.Contains(t, out, "**`orders`**: ✅ Complete (2 targets)\n", out)
+	assert.NotContains(t, out, "(1 targets)", out)
 }
 
 // A rollout of `orders` four targets wide where testapp-001 is checksumming,

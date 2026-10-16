@@ -119,6 +119,22 @@ func TestListParts(t *testing.T) {
 		want = append(want, PartListLine{Part: -1, Summary: "1 more target past copying"})
 		assert.Equal(t, want, got)
 	})
+	t.Run("one past each cap reads singular", func(t *testing.T) {
+		var parts []Part
+		for i := range 6 {
+			parts = append(parts, Part{Name: fmt.Sprintf("failed%d", i), Status: task.Failed})
+		}
+		for i := range 4 {
+			parts = append(parts, Part{Name: fmt.Sprintf("copying%d", i), Status: task.Running, RowsCopied: int64(100 * (i + 1)), RowsTotal: 1000})
+		}
+		var summaries []string
+		for _, line := range ListParts(len(parts), func(i int) Part { return parts[i] }, ShardNoun) {
+			if line.Summary != "" {
+				summaries = append(summaries, line.Summary)
+			}
+		}
+		assert.Equal(t, []string{"1 more failed shard", "1 more copying shard"}, summaries)
+	})
 	t.Run("copiers that have not reported follow the ones that have", func(t *testing.T) {
 		var parts []Part
 		for i := range 6 {

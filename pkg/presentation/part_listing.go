@@ -218,14 +218,14 @@ func ListParts(n int, part func(int) Part, noun Noun) []PartListLine {
 		failed++
 	}
 	if more := failed - maxFailedParts; more > 0 {
-		lines = append(lines, PartListLine{Part: -1, Summary: fmt.Sprintf("%d more failed %s", more, nounFor(noun, more))})
+		lines = append(lines, PartListLine{Part: -1, Summary: fmt.Sprintf("%d more failed %s", more, noun.Label(more))})
 	}
 	copying := copyingFurthestBehindFirst(n, part)
 	for _, i := range copying[:min(len(copying), maxCopyingParts)] {
 		lines = append(lines, PartListLine{Part: i})
 	}
 	if more := len(copying) - maxCopyingParts; more > 0 {
-		lines = append(lines, PartListLine{Part: -1, Summary: fmt.Sprintf("%d more copying %s", more, nounFor(noun, more))})
+		lines = append(lines, PartListLine{Part: -1, Summary: fmt.Sprintf("%d more copying %s", more, noun.Label(more))})
 	}
 	// A part working through any later phase is as live as a copying one, so
 	// it is named too, in its own order, rather than hidden in the heading.
@@ -234,17 +234,9 @@ func ListParts(n int, part func(int) Part, noun Noun) []PartListLine {
 		lines = append(lines, PartListLine{Part: i})
 	}
 	if more := len(working) - maxCopyingParts; more > 0 {
-		lines = append(lines, PartListLine{Part: -1, Summary: fmt.Sprintf("%d more %s past copying", more, nounFor(noun, more))})
+		lines = append(lines, PartListLine{Part: -1, Summary: fmt.Sprintf("%d more %s past copying", more, noun.Label(more))})
 	}
 	return lines
-}
-
-// nounFor is noun in the number count calls for.
-func nounFor(noun Noun, count int) string {
-	if count == 1 {
-		return noun.Singular
-	}
-	return noun.Plural
 }
 
 // workingPastCopy is the parts among n an engine is working on past the row

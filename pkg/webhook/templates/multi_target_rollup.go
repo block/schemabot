@@ -357,7 +357,7 @@ func writeTargetTableLine(sb *strings.Builder, table string, cells []TableProgre
 		return
 	}
 	if status == state.Task.Completed {
-		fmt.Fprintf(sb, "**%s**: %s (%d targets)\n", name, shardedTableStatusPhrase(status), len(cells))
+		fmt.Fprintf(sb, "**%s**: %s (%s)\n", name, shardedTableStatusPhrase(status), targetNoun.Count(len(cells)))
 		writeDDL()
 		return
 	}
@@ -505,7 +505,7 @@ func writeFailedTargets(sb *strings.Builder, model presentation.Apply, g present
 		fmt.Fprintf(sb, "| %s | %s |\n", inlineCodeCell(memberTarget(d)), cell)
 	}
 	if more := len(failed) - failedTargetRowLimit; more > 0 {
-		fmt.Fprintf(sb, "\n…and %d more failed targets.\n", more)
+		fmt.Fprintf(sb, "\n…and %d more failed %s.\n", more, targetNoun.Label(more))
 	}
 }
 
