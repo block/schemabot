@@ -12,6 +12,7 @@ import (
 	"github.com/block/schemabot/pkg/cmd/cliname"
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/glyph"
+	"github.com/block/schemabot/pkg/presentation"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/ui"
@@ -486,6 +487,11 @@ func writeTableLine(b *strings.Builder, t TableProgress, format string, args ...
 // provided activity bar and label when row-copy progress has exceeded its
 // estimate.
 func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel string) string {
+	if keepsAcrossTargetsBar(t) {
+		if out, ok := formatAcrossTargetsProgress(t); ok {
+			return out
+		}
+	}
 	if isHaltedAcrossTargets(t) {
 		return formatHaltedAcrossTargets(t)
 	}
@@ -494,6 +500,9 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 	}
 	if isNotStartedAcrossTargets(t) {
 		return formatNotStartedAcrossTargets(t)
+	}
+	if keepsShardedBar(t) {
+		return formatShardedPhaseProgress(t)
 	}
 
 	var b strings.Builder
@@ -506,6 +515,7 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 		if t.DDL != "" {
 			b.WriteString(formatTableDDL(t))
 		}
+		writePlannedRows(&b, t)
 		b.WriteString("\n")
 		b.WriteString(formatTableParts(t))
 		return b.String()
@@ -846,15 +856,38 @@ func recoveringIsCopyingRows(t TableProgress) bool {
 func writeStructuredRowsAndETA(b *strings.Builder, t TableProgress) {
 	coverage, size, partial := rowsCoverageAndSize(t)
 	eta := ui.FormatETA(t.ETASeconds)
-	if partial {
-		// The unreported shards can only add time, so the ETA is a floor.
+	if partial || t.RowsTotalPlanned {
+		// The unreported shards or targets can only add time, so the ETA is
+		// a floor.
 		eta = "≥ " + eta
 	}
+	total := ui.FormatNumber(t.RowsTotal)
+	if t.RowsTotalPlanned {
+		total = ui.FormatApproxRows(t.RowsTotal)
+	}
 	if t.ETASeconds > 0 {
-		fmt.Fprintf(b, indentDetail+"Rows: %s / %s%s%s · ETA: %s\n", ui.FormatNumber(ui.ClampRows(t.RowsCopied, t.RowsTotal)), ui.FormatNumber(t.RowsTotal), coverage, size, eta)
+		fmt.Fprintf(b, indentDetail+"Rows: %s / %s%s%s · ETA: %s\n", ui.FormatNumber(ui.ClampRows(t.RowsCopied, t.RowsTotal)), total, coverage, size, eta)
 		return
 	}
-	fmt.Fprintf(b, indentDetail+"Rows: %s / %s%s%s\n", ui.FormatNumber(ui.ClampRows(t.RowsCopied, t.RowsTotal)), ui.FormatNumber(t.RowsTotal), coverage, size)
+	fmt.Fprintf(b, indentDetail+"Rows: %s / %s%s%s\n", ui.FormatNumber(ui.ClampRows(t.RowsCopied, t.RowsTotal)), total, coverage, size)
+}
+
+// writePlannedRows writes the rows line of a queued table: the plan's row
+// estimate and size, both approximate, so the work ahead is visible before
+// the copy starts. A table rolled up across targets names them, since its
+// estimate is their sum. It writes nothing when the plan had no row estimate,
+// which a table rolled up across targets lacks while some of its targets have
+// reported nothing at all: their estimates are not known, so a sum of the rest
+// would understate the table (tableAcrossTargets).
+func writePlannedRows(b *strings.Builder, t TableProgress) {
+	if t.EstimatedRows == nil {
+		return
+	}
+	span := ""
+	if t.AcrossTargets {
+		span = presentation.PlannedRowsSpan(len(t.Shards))
+	}
+	fmt.Fprintf(b, indentDetail+"Rows: %s%s%s\n", ui.FormatApproxRows(*t.EstimatedRows), span, ui.FormatTableSizeClause(t.EstimatedBytes))
 }
 
 // rowsCoverageAndSize returns the clauses a table's rows line carries after
@@ -941,9 +974,9 @@ func WriteStopSuccess(data StopData) {
 	}
 	fmt.Println()
 	if data.ApplyID != "" {
-		fmt.Printf("%sCheckpoint saved. Use '%s start -e %s %s' to resume.%s\n", ANSIDim, cliname.Name(), data.Environment, data.ApplyID, ANSIReset)
+		fmt.Printf("%sCheckpoint saved. Use '%s' to resume.%s\n", ANSIDim, cliname.Command("start", "-e", data.Environment, data.ApplyID), ANSIReset)
 	} else {
-		fmt.Printf("%sCheckpoint saved. Use '%s start' to resume from where you left off.%s\n", ANSIDim, cliname.Name(), ANSIReset)
+		fmt.Printf("%sCheckpoint saved. Use '%s' to resume from where you left off.%s\n", ANSIDim, cliname.Command("start"), ANSIReset)
 	}
 }
 
@@ -996,14 +1029,25 @@ func WriteStartSuccess(data StartData) {
 	fmt.Printf("%sResuming from checkpoint...%s\n", ANSIDim, ANSIReset)
 }
 
+// ProgressCommand is the command that watches an apply on the server and in
+// the environment this run addressed. A wrapper may route an omitted
+// environment to a default one, so the environment is named whenever this run
+// knew it, along with the routing flags the operator passed.
+func ProgressCommand(applyID, environment string) string {
+	if environment == "" {
+		return cliname.Command("progress", applyID)
+	}
+	return cliname.Command("progress", applyID, "-e", environment)
+}
+
 // WriteStartNoWatch writes the start command output when --watch=false.
 func WriteStartNoWatch(applyID, database, environment string) {
 	fmt.Printf("%s%s▶️  Schema change resumed%s\n", ANSIBold, ANSIGreen, ANSIReset)
 	fmt.Println()
 	if applyID != "" {
-		fmt.Printf("To watch and manage: %s progress %s\n", cliname.Name(), applyID)
+		fmt.Printf("To watch and manage: %s\n", ProgressCommand(applyID, environment))
 	} else {
-		fmt.Printf("To watch and manage: %s status -d %s -e %s\n", cliname.Name(), database, environment)
+		fmt.Printf("To watch and manage: %s\n", cliname.Command("status", "-d", database, "-e", environment))
 	}
 }
 
@@ -1022,7 +1066,7 @@ func WriteReleaseSuccess(data ReleaseData) {
 	fmt.Printf("Environment: %s\n", data.Environment)
 	fmt.Println()
 	if data.ApplyID != "" {
-		fmt.Printf("%sHeld deployments will resume. Use '%s progress %s' to follow them.%s\n", ANSIDim, cliname.Name(), data.ApplyID, ANSIReset)
+		fmt.Printf("%sHeld deployments will resume. Use '%s' to follow them.%s\n", ANSIDim, ProgressCommand(data.ApplyID, data.Environment), ANSIReset)
 	} else {
 		fmt.Printf("%sHeld deployments will resume.%s\n", ANSIDim, ANSIReset)
 	}
@@ -1168,7 +1212,7 @@ func writeStatusListFooter(data StatusListData) {
 		}
 		writeStatusListTruncation(data, item)
 	}
-	fmt.Printf("%sUse '%s status <apply_id>' to view details%s\n", ANSIDim, cliname.Name(), ANSIReset)
+	fmt.Printf("%sUse '%s' to view details%s\n", ANSIDim, cliname.Command("status", "<apply_id>"), ANSIReset)
 }
 
 func writeFailedStatusList(data StatusListData) {
@@ -1187,7 +1231,7 @@ func writeFailedStatusList(data StatusListData) {
 			statusFailureActor(a, data.ShowExternalID),
 			formatFailureTimestamp(a),
 			compactStatusFailureReason(a.ErrorMessage))
-		fmt.Printf("%s status %s\n", cliname.Name(), a.ApplyID)
+		fmt.Println(cliname.Command("status", a.ApplyID))
 	}
 
 	if data.HasMore && data.Limit > 0 {
@@ -1444,7 +1488,7 @@ func WriteDatabaseHistory(data DatabaseHistoryData) {
 	writeStatusTable(databaseHistoryColumns(), data.Applies, func(a ApplyHistoryData) string { return a.State })
 
 	fmt.Println()
-	fmt.Printf("%sUse '%s status <apply_id>' to view details%s\n", ANSIDim, cliname.Name(), ANSIReset)
+	fmt.Printf("%sUse '%s' to view details%s\n", ANSIDim, cliname.Command("status", "<apply_id>"), ANSIReset)
 }
 
 // stateColorFunc returns an ANSI color function for the given state.

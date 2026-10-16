@@ -34,6 +34,10 @@ type TableProgressData struct {
 	// EstimatedBytes is the table's on-disk size when it was planned, shown
 	// beside the row counts. Nil when the plan had no estimate.
 	EstimatedBytes *int64
+	// EstimatedRows is the table's row count when it was planned, shown while
+	// the table is queued and before the engine reports RowsTotal. Nil when
+	// the plan had no estimate.
+	EstimatedRows *int64
 	// Checksum phase progress: rows verified so far and total to verify.
 	// Non-zero only while the table is checksumming (verifying copied data).
 	ChecksumRowsChecked int64
@@ -109,15 +113,32 @@ func countReadyForCutover(tables []TableProgressData) int {
 	return ready
 }
 
-// ShardProgressData is the high-level status of one shard, for the compact
-// per-shard summary in the PR comment. It intentionally carries only state +
-// percent (no row counts/ETA) to keep the comment quiet.
+// ShardProgressData is one shard's or target's progress, for the compact
+// per-part summary in the PR comment: its state, copy figures, and verify
+// figures, with no ETA to keep the comment quiet.
 type ShardProgressData struct {
 	Shard           string
 	Status          string // canonical lowercase shard/task state
 	PercentComplete int
 	RowsCopied      int64
 	RowsTotal       int64
+	// ChecksumRowsChecked and ChecksumRowsTotal are how far a checksumming
+	// member's verify has got, once its engine reports a total.
+	ChecksumRowsChecked int64
+	ChecksumRowsTotal   int64
+	// PlannedRows is the plan's row estimate for a member whose copy is still
+	// ahead with no total reported, so a queued target says how much it will
+	// copy.
+	PlannedRows *int64
+}
+
+// part is the shard or target as the shared part listing reads it.
+func (m ShardProgressData) part() presentation.Part {
+	return presentation.Part{
+		Name: m.Shard, Status: m.Status, PercentComplete: m.PercentComplete, RowsCopied: m.RowsCopied, RowsTotal: m.RowsTotal,
+		ChecksumRowsChecked: m.ChecksumRowsChecked, ChecksumRowsTotal: m.ChecksumRowsTotal,
+		PlannedRows: m.PlannedRows,
+	}
 }
 
 // ApplyStatusCommentData contains all data needed to render an apply status PR comment.
@@ -997,6 +1018,7 @@ func renderTableProgress(sb *strings.Builder, dialect schema.Dialect, table Tabl
 	case state.Task.Pending:
 		fmt.Fprintf(sb, "**%s**: \u23f3 Queued\n", inlineCode(table.TableName))
 		writeDDLLine(sb, dialect, table.DDL, budget)
+		writePlannedRows(sb, table.EstimatedRows, table.EstimatedBytes, "")
 
 	case state.Task.Completed:
 		bar := ui.ProgressBarComplete()
@@ -1157,10 +1179,7 @@ func writeMemberList(sb *strings.Builder, noun presentation.Noun, members []Shar
 	if len(members) <= 1 {
 		return
 	}
-	part := func(i int) presentation.Part {
-		m := members[i]
-		return presentation.Part{Name: m.Shard, Status: m.Status, PercentComplete: m.PercentComplete, RowsCopied: m.RowsCopied, RowsTotal: m.RowsTotal}
-	}
+	part := func(i int) presentation.Part { return members[i].part() }
 	c := presentation.CountParts(len(members), func(i int) string { return members[i].Status })
 	c.PendingLabel = pendingWord
 	fmt.Fprintf(sb, "- %s: %d (%s)\n", ui.CapitalizeFirst(noun.Plural), len(members), strings.Join(c.Phrases(), ", "))
@@ -1362,6 +1381,18 @@ func countTablesWithDDL(tables []TableProgressData) int {
 		}
 	}
 	return count
+}
+
+// writePlannedRows writes the rows line of a table no engine has reported on
+// yet: the plan's row estimate and size, both approximate, so the work ahead
+// is visible before the copy starts. span names the targets the estimate
+// covers when it is summed across several. It writes nothing when the plan
+// had no row estimate.
+func writePlannedRows(sb *strings.Builder, estimatedRows, estimatedBytes *int64, span string) {
+	if estimatedRows == nil {
+		return
+	}
+	fmt.Fprintf(sb, "- Rows: %s%s%s\n", ui.FormatApproxRows(*estimatedRows), span, ui.FormatTableSizeClause(estimatedBytes))
 }
 
 // writeRowsAndETA writes the rows copied / total line with optional ETA.

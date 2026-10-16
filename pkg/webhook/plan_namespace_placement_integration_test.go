@@ -71,6 +71,29 @@ func newNamespacePlacementHarness(t *testing.T, productionTargets []api.TargetEn
 // harness's own reads go to the unwrapped store.
 func newNamespacePlacementHarnessWithStorage(t *testing.T, productionTargets []api.TargetEntry, wrap func(storage.Storage) storage.Storage) *namespacePlacementHarness {
 	t.Helper()
+	production := &namespaceSelectingTernClient{}
+	p := newMultiEnvPlanHarness(t, productionTargets, production, wrap)
+	p.production = production
+	return p
+}
+
+// newMultiEnvPlanHarness is the harness with production planned by the given
+// tern client, so a test can choose how production's plan answers. The
+// returned harness leaves production unset.
+func newMultiEnvPlanHarness(t *testing.T, productionTargets []api.TargetEntry, production tern.Client, wrap func(storage.Storage) storage.Storage) *namespacePlacementHarness {
+	t.Helper()
+	table := "CREATE TABLE `orders` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;"
+	return newMultiEnvPlanHarnessWithRepo(t, productionTargets, production, wrap, map[string]string{
+		"ns_0/orders.sql": table,
+		"ns_1/orders.sql": table,
+	}, "")
+}
+
+// newMultiEnvPlanHarnessWithRepo is newMultiEnvPlanHarness with the pull
+// request carrying the given schema files, and configExtra appended to its
+// schemabot.yaml.
+func newMultiEnvPlanHarnessWithRepo(t *testing.T, productionTargets []api.TargetEntry, production tern.Client, wrap func(storage.Storage) storage.Storage, files map[string]string, configExtra string) *namespacePlacementHarness {
+	t.Helper()
 	dbName := "webhook_ns_placement"
 	ctx := t.Context()
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
@@ -94,7 +117,6 @@ func newNamespacePlacementHarnessWithStorage(t *testing.T, productionTargets []a
 		TernDeployments: api.TernConfig{"eu": {"staging": "tern-eu-staging:9090", "production": "tern-eu:9090"}},
 		Repos:           map[string]api.RepoConfig{"octocat/hello-world": {}},
 	}
-	production := &namespaceSelectingTernClient{}
 	var handlerStore storage.Storage = st
 	if wrap != nil {
 		handlerStore = wrap(st)
@@ -111,21 +133,16 @@ func newNamespacePlacementHarnessWithStorage(t *testing.T, productionTargets []a
 	client := gh.NewClient(nil)
 	client.BaseURL, _ = url.Parse(server.URL + "/")
 
-	table := "CREATE TABLE `orders` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;"
-	result := setupFakeGitHubForPlan(t, mux, map[string]string{
-		"ns_0/orders.sql": table,
-		"ns_1/orders.sql": table,
-	}, "database: "+dbName+"\ntype: mysql\n", dbName)
+	result := setupFakeGitHubForPlan(t, mux, files, "database: "+dbName+"\ntype: mysql\n"+configExtra, dbName)
 
 	// The App slug lets a later fold on the same head verify that it owns the
 	// aggregate Check Run an earlier fold published, and so update it.
 	installClient := ghclient.NewInstallationClientWithSlug(client, logger, "schemabot")
 	return &namespacePlacementHarness{
-		dbName:     dbName,
-		store:      st,
-		handler:    NewHandler(svc, &fakeClientFactory{client: installClient}, nil, logger),
-		github:     result,
-		production: production,
+		dbName:  dbName,
+		store:   st,
+		handler: NewHandler(svc, &fakeClientFactory{client: installClient}, nil, logger),
+		github:  result,
 	}
 }
 

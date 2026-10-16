@@ -84,9 +84,9 @@ func writeRollbackCancel(sb *strings.Builder, tenant string) {
 // RenderRollbackUnsafeChangesBlocked renders the refusal posted when
 // rollback-confirm is given without `--allow-unsafe` and the pinned rollback
 // plan carries unsafe changes. It mirrors the apply refusal: the rollback plan,
-// each unsafe change, and the exact rollback-confirm command that consents to
-// them. Nothing ran and the lock still pins the rollback plan, so the
-// re-issued command confirms the same plan, and unlock cancels it.
+// each unsafe change, and the rollback-confirm command to re-issue with
+// `--allow-unsafe`. Nothing ran and the lock still pins the rollback plan, so
+// the re-issued command confirms the same plan, and unlock cancels it.
 func RenderRollbackUnsafeChangesBlocked(data PlanCommentData) string {
 	return renderWithinCommentLimit(countPlanDDLBlocks(data.Changes), 0, func(budget *ddlBlockBudget) string {
 		return renderRollbackUnsafeChangesBlocked(data, budget)
@@ -109,12 +109,12 @@ func renderRollbackUnsafeChangesBlocked(data PlanCommentData, budget *ddlBlockBu
 
 	// The retry keeps every option the rejected command carried, so following
 	// it changes only the consent, never how the rollback runs.
-	retryCommand := TenantCommand("schemabot rollback-confirm", data.Environment, data.Tenant) + " --allow-unsafe"
+	retryCommand := TenantCommand("schemabot rollback-confirm", data.Environment, data.Tenant)
 	if data.DeferCutover {
 		retryCommand += " --defer-cutover"
 	}
 	writeUnsafeChangesRejection(&sb, data, "Rollback rejected", retryCommand)
-	sb.WriteString("\nThe lock still pins this rollback plan, so the command above confirms it.\n\n")
+	sb.WriteString("\nThe lock still pins this rollback plan, so the command above, with `--allow-unsafe`, confirms it.\n\n")
 	writeRollbackCancel(&sb, data.Tenant)
 
 	return appendAgentHint(offerSupportChannel(sb.String()), data.AgentHint)

@@ -406,6 +406,7 @@ func tableProgressFromTasks(databaseFallback string, tasks []*storage.Task, shar
 			RowsCopied:          t.RowsCopied,
 			RowsTotal:           t.RowsTotal,
 			EstimatedBytes:      t.EstimatedBytes,
+			EstimatedRows:       t.EstimatedRows,
 			PercentComplete:     t.ProgressPercent,
 			ETASeconds:          int64(t.ETASeconds),
 			ChecksumRowsChecked: t.ChecksumRowsChecked,
@@ -439,6 +440,9 @@ func shardProgressForTable(shardsByTable map[string][]*storage.Task, applyOperat
 			PercentComplete: r.ProgressPercent,
 			RowsCopied:      r.RowsCopied,
 			RowsTotal:       r.RowsTotal,
+
+			ChecksumRowsChecked: r.ChecksumRowsChecked,
+			ChecksumRowsTotal:   r.ChecksumRowsTotal,
 		})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Shard < out[j].Shard })

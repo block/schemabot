@@ -88,6 +88,14 @@ type CommentObserver struct {
 	stagnantTicks     int
 	hasCutoverComment bool
 	resumeRotated     bool
+	// terminalPublishedState is the terminal state this observer last
+	// published, cleared when it next sees the apply in flight. A rollout's
+	// operations run on several clients that each hold the observer and each
+	// deliver the settled apply's terminal state, so a delivery of the same
+	// state with no progress in between is a duplicate. A stop followed by a
+	// start reaches the observer as progress first, so the later terminal
+	// state still publishes.
+	terminalPublishedState string
 
 	// resumeSupersedePending marks that this observer's resume rotation posted
 	// its fresh comment but failed to consume the summary marker. The marker is
@@ -245,6 +253,21 @@ func (o *CommentObserver) logInfo(apply *storage.Apply, msg string, args ...any)
 	o.logger.Info(msg, append(fields, args...)...)
 }
 
+func (o *CommentObserver) logDebug(apply *storage.Apply, msg string, args ...any) {
+	fields := []any{
+		"repo", o.repo,
+		"pr", o.pr,
+	}
+	if apply != nil {
+		fields = append(fields,
+			"apply_id", apply.ApplyIdentifier,
+			"database", apply.Database,
+			"environment", apply.Environment,
+		)
+	}
+	o.logger.Debug(msg, append(fields, args...)...)
+}
+
 // NewCommentObserver creates a new CommentObserver for posting PR comments.
 func NewCommentObserver(cfg CommentObserverConfig) *CommentObserver {
 	clk := clock.Default(cfg.Clock)
@@ -292,6 +315,9 @@ func NewAggregateTerminalCommentObserver(cfg CommentObserverConfig) *CommentObse
 func (o *CommentObserver) OnProgress(apply *storage.Apply, tasks []*storage.Task) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
+	if !state.IsTerminalApplyState(apply.State) {
+		o.terminalPublishedState = ""
+	}
 	o.resetProgressCommentAuthorityDecision()
 	if !o.leaseStillOwnsObserver(apply, "progress") {
 		return
@@ -477,6 +503,14 @@ func (o *CommentObserver) progressCommentDue(now time.Time, current progressSnap
 // Edits the active comment to final state, posts summary comment,
 // and updates check runs.
 func (o *CommentObserver) OnTerminal(apply *storage.Apply, tasks []*storage.Task) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.terminalPublishedState != "" && state.IsState(apply.State, o.terminalPublishedState) {
+		o.logDebug(apply, "observer: this terminal state is already published; skipping the duplicate delivery",
+			"state", apply.State)
+		return
+	}
+	o.terminalPublishedState = apply.State
 	o.resetProgressCommentAuthorityDecision()
 	if !o.leaseStillOwnsObserver(apply, "terminal") {
 		return

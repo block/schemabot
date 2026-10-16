@@ -529,8 +529,16 @@ check as not passing, so having nothing to say has to be said rather than left e
 logic applies in reverse. When SchemaBot expects a check, environment, or config and cannot find
 it, that reads as blocking, never as not-applicable. A gate must not be removable by the very
 change it guards. *Enforced:* aggregate creation on head-commit events
-(`pkg/webhook/check_suite.go`, `pkg/webhook/pull_request.go`); required-check and
-environment-ordering gates (`pkg/webhook/apply_gating.go`, `pkg/webhook/check_prior_env.go`).
+(`pkg/webhook/check_suite.go`, `pkg/webhook/pull_request.go`); config discovery, the command
+path's choice of discovery over a passing refresh, and the aggregate leader's expected-participant
+match, which all read the schema paths a PR vacates as well as those it changes
+(`FindConfigsForPRFiles` in `pkg/github/config.go`, `prHasCurrentSchemaBotFiles` in
+`pkg/webhook/schema_reconciliation.go`, `prFilePaths` in `pkg/webhook/check_publisher.go`);
+required-check and environment-ordering gates (`pkg/webhook/apply_gating.go`,
+`pkg/webhook/check_prior_env.go`); an environment that could not plan while another of the same
+multi-environment plan did, stored as a failing check, or, when that row cannot be stored, a
+failing aggregate carrying a block no fold replaces (`storePlanFailedCheck` in
+`pkg/webhook/check_records.go`, called by `handleMultiEnvPlan` in `pkg/webhook/plan.go`).
 
 ### MG-3: The rollup is conservative
 
@@ -1212,7 +1220,9 @@ a remote state still in motion. *Enforced:* terminal-truth preflights on the con
 engine's settled outcome onto the task rows before a pending command is consumed
 (`pkg/tern/local_control_reconcile.go`); the in-process engine's settled outcome checks on stop
 and cancel (`pkg/engine/spirit/control.go`), including a completion its run records after the
-cancel (`pkg/engine/spirit/execution.go`).
+cancel, and its run's deference to a stop or cancel that interrupted it, which no failure the run
+records afterwards replaces (`setSchemaChangeFailed`, `pkg/engine/spirit/execution.go`,
+`pkg/engine/spirit/direct.go`).
 
 ### CO-4: Stop wins
 

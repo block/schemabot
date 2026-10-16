@@ -264,6 +264,17 @@ type LocalClient struct {
 	// observer in the registry.
 	// Protected by observerMu.
 	pendingObserver ProgressObserver
+
+	// observerPollCtx bounds every multi-operation observer poller this client
+	// starts; Close cancels it. Created with the first poller.
+	// Protected by observerMu.
+	observerPollCtx    context.Context
+	observerPollCancel context.CancelFunc
+
+	// observerPollIntervalOverride, when positive, replaces
+	// defaultObserverPollInterval. Tests lower it to observe notifications
+	// without waiting out the production cadence.
+	observerPollIntervalOverride time.Duration
 }
 
 type applyCancelHandle struct {
@@ -448,7 +459,12 @@ func engineNameToProto(name string) (ternv1.Engine, error) {
 
 // Close closes the client and releases resources.
 func (c *LocalClient) Close() error {
-	// LocalClient doesn't own storage, so nothing to close
+	// LocalClient doesn't own storage; it only stops its observer pollers.
+	c.observerMu.Lock()
+	defer c.observerMu.Unlock()
+	if c.observerPollCancel != nil {
+		c.observerPollCancel()
+	}
 	return nil
 }
 
@@ -2909,6 +2925,7 @@ func buildDispatchTasks(plan *storage.Plan, scope dispatchScope, environment, en
 			ExecutionMode:  ddlChange.ExecutionMode,
 			ModeReason:     ddlChange.ModeReason,
 			EstimatedBytes: ddlChange.TaskEstimatedBytes(scope.shard),
+			EstimatedRows:  ddlChange.TaskEstimatedRows(scope.shard),
 			CreatedAt:      now,
 			UpdatedAt:      now,
 		}
@@ -3797,6 +3814,7 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 		tp.RowsCopied = t.RowsCopied
 		tp.RowsTotal = t.RowsTotal
 		tp.EstimatedBytes = t.EstimatedBytes
+		tp.EstimatedRows = t.EstimatedRows
 		tp.ChecksumRowsChecked = t.ChecksumRowsChecked
 		tp.ChecksumRowsTotal = t.ChecksumRowsTotal
 		tp.Throttled = t.Throttled

@@ -686,10 +686,10 @@ $ schemabot progress apply-example-84
        ALTER TABLE `orders` ADD INDEX `idx_status`(`status`);
        • Rows: 2,900,000 / 4,000,000 · ETA: 2m 45s
        • Shards: 4 (3 copying, 1 complete)
-           ◉ c0-: 45.00% · 450,000 / 1,000,000 rows · ETA: 2m 45s
-           ◉ 80-c0: 65.00% · 650,000 / 1,000,000 rows · ETA: 1m 45s
-           ◉ 40-80: 80.00% · 800,000 / 1,000,000 rows · ETA: 1m 0s
            ✓ -40: 1,000,000 rows
+           ◉ 40-80: 80.00% · 800,000 / 1,000,000 rows · ETA: 1m 0s
+           ◉ 80-c0: 65.00% · 650,000 / 1,000,000 rows · ETA: 1m 45s
+           ◉ c0-: 45.00% · 450,000 / 1,000,000 rows · ETA: 2m 45s
 
 
 ESC detach • c cancel
@@ -1202,7 +1202,9 @@ names the `start` command that resumes it. A watcher that cannot reach the
 server retries with backoff, and exits non-zero once polls have kept failing
 for a few minutes in a row; the interactive watcher gives up on the same
 schedule. Giving up does not affect the apply. The error tells the operator to
-run `progress` with the apply ID to watch it again. When a refused poll
+run `progress` with the apply ID to watch it again. That command names the
+environment and any `--profile` or `--endpoint` the watch was started with, so
+pasting it reaches the same server. When a refused poll
 carries a `Retry-After` header, as a proxy or rate limiter in front of
 SchemaBot may send, a watcher waits at least that long before polling again,
 up to 5 minutes per poll, so a watcher held off this way takes longer to give
