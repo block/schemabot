@@ -2090,33 +2090,52 @@ func TestApplyOperations(t *testing.T, h Harness) {
 			{Database: "billing", Environment: "staging", Target: "billing-staging-a"},
 		}, mysqlTargets)
 
-		_, err = store.ApplyOperations().ListRecentTargets(ctx, storage.DatabaseTypeVitess, 0)
-		require.ErrorContains(t, err, "lookback must be positive")
+		// The cutoff is rendered in whole microseconds, so a lookback that
+		// would truncate to an empty window is refused rather than narrowed.
+		for _, lookback := range []time.Duration{0, 500 * time.Nanosecond} {
+			_, err = store.ApplyOperations().ListRecentTargets(ctx, storage.DatabaseTypeVitess, lookback)
+			require.ErrorContains(t, err, "lookback must be at least 1µs, got "+lookback.String())
+		}
 	})
 
-	// ListRecentTargets_TargetsDifferingOnlyByCaseAreDistinct verifies that
-	// two targets of one database and environment whose names differ only by
-	// case are both listed: a target name is a resolver key compared byte for
-	// byte, so a storage collation that folds case must not merge them. The
-	// order the two sort in depends on the storage collation, so only
-	// membership is asserted.
-	t.Run("ListRecentTargets_TargetsDifferingOnlyByCaseAreDistinct", func(t *testing.T) {
+	// ListRecentTargets_TuplesAreDistinctAndBytewiseOrdered verifies that
+	// targets differing only by case are listed separately and that the
+	// tuples come back in the same bytewise order on every dialect: a target
+	// is a resolver key compared byte for byte, so a storage collation that
+	// folds case must not merge two of them, and neither a case-folding nor
+	// a locale collation may reorder them. Database names and environments
+	// are stored folded to lowercase, so their variants differ by
+	// punctuation, which bytewise order sorts '-' before '_' and those
+	// collations sort the other way round.
+	t.Run("ListRecentTargets_TuplesAreDistinctAndBytewiseOrdered", func(t *testing.T) {
 		ctx := t.Context()
 		store := h.NewStorage(t)
-		orders := CreateLock(t, store, "orders", storage.DatabaseTypeVitess)
-		apply := CreateApplyWithStateAndEnv(t, store, orders, "apply_orders_case", 985, state.Apply.Completed, "staging")
-		for deployment, target := range map[string]string{"region-a": "orders-A", "region-b": "orders-a"} {
-			_, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
-				ApplyID: apply.ID, Deployment: deployment, Target: target,
-			})
-			require.NoError(t, err)
+		seed := func(t *testing.T, lock *storage.Lock, applyID string, planID int64, env string, targets ...string) {
+			t.Helper()
+			apply := CreateApplyWithStateAndEnv(t, store, lock, applyID, planID, state.Apply.Completed, env)
+			for i, target := range targets {
+				_, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+					ApplyID: apply.ID, Deployment: fmt.Sprintf("region-%d", i), Target: target,
+				})
+				require.NoError(t, err)
+			}
 		}
+
+		ordersB := CreateLock(t, store, "orders-b", storage.DatabaseTypeVitess)
+		seed(t, ordersB, "apply_orders_b_staging_b", 985, "staging-b", "orders-a", "orders-A", "orders-b", "orders_B")
+		seed(t, ordersB, "apply_orders_b_staging_a", 986, "staging_a", "orders-a")
+		ordersA := CreateLock(t, store, "orders_a", storage.DatabaseTypeVitess)
+		seed(t, ordersA, "apply_orders_a_staging", 987, "staging", "orders-a")
 
 		targets, err := store.ApplyOperations().ListRecentTargets(ctx, storage.DatabaseTypeVitess, 24*time.Hour)
 		require.NoError(t, err)
-		assert.ElementsMatch(t, []storage.AppliedTarget{
-			{Database: "orders", Environment: "staging", Target: "orders-A"},
-			{Database: "orders", Environment: "staging", Target: "orders-a"},
+		assert.Equal(t, []storage.AppliedTarget{
+			{Database: "orders-b", Environment: "staging-b", Target: "orders-A"},
+			{Database: "orders-b", Environment: "staging-b", Target: "orders-a"},
+			{Database: "orders-b", Environment: "staging-b", Target: "orders-b"},
+			{Database: "orders-b", Environment: "staging-b", Target: "orders_B"},
+			{Database: "orders-b", Environment: "staging_a", Target: "orders-a"},
+			{Database: "orders_a", Environment: "staging", Target: "orders-a"},
 		}, targets)
 	})
 
