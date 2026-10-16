@@ -141,7 +141,7 @@ func TestWriteProgress_ThreeTargetRolloutIsOneSection(t *testing.T) {
 	out := renderRollout(t, targetRolloutData([]rolloutTarget{completedTarget(), copyingTarget(400), queuedTarget()}))
 
 	assert.Contains(t, out, "Targets:      1 completed · 1 running · 1 queued")
-	assert.Contains(t, out, "🔄 prod — 1 completed · 1 running · 1 queued (3 targets)")
+	assert.Contains(t, out, "🔄 1 completed · 1 running · 1 queued (3 targets)")
 	assert.Equal(t, 1, strings.Count(out, "ADD COLUMN `region`"), "the shared change's DDL is shown once:\n%s", out)
 	assert.Contains(t, out, "46%", "the bar is the table's progress across all three targets")
 	assert.Contains(t, out, "Rows: 1,400 / 2,000 across 2 of 3 targets · ETA: ≥ 2m 0s")
@@ -205,7 +205,7 @@ func TestWriteProgress_TargetRollupCountsSettledTargetsApart(t *testing.T) {
 	finished := targetRolloutData([]rolloutTarget{ran, ran, converged})
 	finished.State = state.Apply.Completed
 	out := renderRollout(t, finished)
-	assert.Contains(t, out, "✅ prod — 2 completed · 1 already had it (3 targets)")
+	assert.Contains(t, out, "✅ 2 completed · 1 already had it (3 targets)")
 	assert.Contains(t, out, "1 of 3 targets already had this schema; nothing ran there.")
 	assert.NotContains(t, out, "have not reported progress yet", "a finished target is not waiting to report:\n%s", out)
 
@@ -213,7 +213,7 @@ func TestWriteProgress_TargetRollupCountsSettledTargetsApart(t *testing.T) {
 	settled := targetRolloutData([]rolloutTarget{ran, ran, reaped})
 	settled.State = state.Apply.Completed
 	out = renderRollout(t, settled)
-	assert.Contains(t, out, "✅ prod — 3 completed (3 targets)")
+	assert.Contains(t, out, "✅ 3 completed (3 targets)")
 	assert.NotContains(t, out, "already had", "a reaped target is not one that already had the change:\n%s", out)
 
 	failedEarly := rolloutTarget{opState: state.ApplyOperation.Failed, startedAt: "2026-09-30T12:00:00Z", err: "connection refused"}
@@ -290,7 +290,7 @@ func TestWriteProgress_SixtyFourTargetRolloutStaysOneScreen(t *testing.T) {
 	out := renderRollout(t, wideRollout())
 
 	assert.Less(t, strings.Count(out, "\n"), 50, "the rollout is not a section per target:\n%s", out)
-	assert.Contains(t, out, "❌ prod — 40 completed · 19 running · 4 queued · 1 failed (64 targets)")
+	assert.Contains(t, out, "❌ 40 completed · 19 running · 4 queued · 1 failed (64 targets)")
 	assert.Equal(t, 1, strings.Count(out, "ADD COLUMN `region`"))
 	assert.NotContains(t, out, "❌ Failed", "a table still copying on 19 targets does not read as failed")
 	assert.Contains(t, out, "• Targets: 64 (1 failed, 19 copying, 4 queued, 40 complete)\n"+
@@ -865,7 +865,7 @@ func TestWriteProgress_TableByTableRolloutCountsTargets(t *testing.T) {
 
 	out := renderRollout(t, data)
 
-	assert.Equal(t, 1, strings.Count(out, "🔄 prod — 0 of 2 tables done on 2 targets\n"), "one section for the deployment:\n%s", out)
+	assert.Equal(t, 1, strings.Count(out, "🔄 0 of 2 tables done on 2 targets\n"), "one section for the deployment:\n%s", out)
 	assert.NotContains(t, out, "Tables:", "the deployment line carries the table count, not the box:\n%s", out)
 	assert.Equal(t, 1, strings.Count(out, "~ bikes:"))
 	assert.Equal(t, 1, strings.Count(out, "~ docks: ⏳ Queued\n"))
@@ -892,7 +892,7 @@ func TestWriteProgress_TableByTableRolloutCountsTableSteps(t *testing.T) {
 
 	assert.NotContains(t, out, "Targets:      ")
 	assert.NotContains(t, out, "Tables:", "the deployment line carries the table count, not the box:\n%s", out)
-	assert.Equal(t, 1, strings.Count(out, "🔄 prod — 1 of 2 tables done on 2 targets\n"), "one section for the deployment:\n%s", out)
+	assert.Equal(t, 1, strings.Count(out, "🔄 1 of 2 tables done on 2 targets\n"), "one section for the deployment:\n%s", out)
 	assert.Contains(t, out, "~ bikes: "+ui.ProgressBarComplete()+" ✓ Complete\n")
 	assert.Contains(t, out, "• Targets: 2 (1 copying, 1 queued)")
 	assert.Equal(t, 1, strings.Count(out, "• Targets:"), "only the copying table lists its targets:\n%s", out)
@@ -915,7 +915,7 @@ func TestWriteProgress_TableByTableRolloutNamesFailedTargets(t *testing.T) {
 
 	out := renderRollout(t, data)
 
-	assert.Contains(t, out, "prod — 1 of 2 tables done on 3 targets · 2 targets failed\n", "%s", out)
+	assert.Contains(t, out, "❌ 1 of 2 tables done on 3 targets · 2 targets failed\n", "%s", out)
 	assert.NotContains(t, out, "Tables:", "the deployment line carries the table count, not the box:\n%s", out)
 }
 
@@ -936,7 +936,7 @@ func TestWriteProgress_SettledTableByTableRolloutReadsLikeThePRComment(t *testin
 
 	out := renderRollout(t, data)
 
-	assert.Contains(t, out, "❌ prod — 0 of 2 tables done on 3 targets · 1 target failed, 2 halted\n", "%s", out)
+	assert.Contains(t, out, "❌ 0 of 2 tables done on 3 targets · 1 target failed, 2 halted\n", "%s", out)
 	assertLess(t, out, "~ stations: ❌ Failed · 2 complete, 1 failed\n", "~ docks: ⊘ Not started\n")
 	assert.NotContains(t, out, "• Targets:", "a table no target is copying lists no targets:\n%s", out)
 	assert.NotContains(t, out, "Tables:", "the deployment line carries the table count, not the box:\n%s", out)
@@ -957,7 +957,7 @@ func TestWriteProgress_TableByTableRolloutLeavesOutConvergedTargets(t *testing.T
 
 	out := renderRollout(t, data)
 
-	assert.Contains(t, out, "prod — 1 of 2 tables done on 2 targets\n", "%s", out)
+	assert.Contains(t, out, "🔄 1 of 2 tables done on 2 targets\n", "%s", out)
 	assert.Contains(t, out, "1 of 3 targets already had this schema; nothing ran there.")
 }
 
@@ -1028,14 +1028,16 @@ func TestWriteProgress_SettledRolloutTableReadsNotStarted(t *testing.T) {
 }
 
 // A rollup's headline counts the deployment's targets, singular for a
-// deployment of one target and plural for several.
+// deployment of one target and plural for several. An apply whose only
+// deployment rolls out to several targets leads with the counts, with no
+// deployment name to tell it apart (presentation.SoleTargetRollout).
 func TestFormatTargetRollup_HeadlineCountsTargets(t *testing.T) {
 	for _, tc := range []struct {
 		targets []rolloutTarget
 		want    string
 	}{
 		{targets: []rolloutTarget{copyingTarget(400)}, want: "🔄 prod — 1 running (1 target)\n"},
-		{targets: []rolloutTarget{completedTarget(), copyingTarget(400)}, want: "🔄 prod — 1 completed · 1 running (2 targets)\n"},
+		{targets: []rolloutTarget{completedTarget(), copyingTarget(400)}, want: "🔄 1 completed · 1 running (2 targets)\n"},
 	} {
 		data := targetRolloutData(tc.targets)
 		model := presentation.Derive(ProgressOperationsForPresentation(data.Operations, data.Released))

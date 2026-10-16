@@ -319,6 +319,17 @@ type Group struct {
 	Open bool
 }
 
+// SoleTargetRollout returns the apply's one deployment when it addresses
+// several targets. Such an apply has no other deployment to tell it apart
+// from, so every surface states its status once, without naming the
+// deployment or wrapping the table lines in a per-deployment section.
+func SoleTargetRollout(groups []Group) (Group, bool) {
+	if len(groups) == 1 && len(groups[0].Members) > 1 {
+		return groups[0], true
+	}
+	return Group{}, false
+}
+
 // Groups partitions the rollout's members by deployment, in the order each
 // deployment first appears in resolved order. A deployment's members form one
 // group only when each is a distinct named target; members that divide one

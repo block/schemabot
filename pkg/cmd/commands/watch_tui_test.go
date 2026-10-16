@@ -912,7 +912,7 @@ func TestWatchModel_MultiTargetRollupScopesTablesToTheirMember(t *testing.T) {
 
 	assertContainsInOrder(t, view,
 		"Targets: 1 completed · 1 running",
-		"primary — 1 completed · 1 running (2 targets)",
+		"1 completed · 1 running (2 targets)",
 		"users_002",
 		"target testapp-002",
 		"users_001",
@@ -921,6 +921,7 @@ func TestWatchModel_MultiTargetRollupScopesTablesToTheirMember(t *testing.T) {
 		"schemabot stop apply-multi-target -e production",
 		"ESC to detach",
 	)
+	assert.NotContains(t, view, "primary —", "a sole deployment is not named")
 	assert.Equal(t, 1, strings.Count(view, "users_001:"))
 	assert.Equal(t, 1, strings.Count(view, "users_002:"))
 }
