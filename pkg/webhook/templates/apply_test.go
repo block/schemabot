@@ -619,7 +619,7 @@ func TestRenderUnsafeChangesBlockedCarriesLintFindingsAndTheirGuides(t *testing.
 	assert.Contains(t, rendered, "Column rename detected", "the lint fold reaches the decision point")
 	assert.Contains(t, rendered, primaryKeyDocURL, "the blocking finding links its guide")
 	assert.Contains(t, rendered, "#renaming-a-column-or-table")
-	assert.Less(t, strings.Index(rendered, "📖 **Related guidance:**"), strings.Index(rendered, "--allow-unsafe`:**"),
+	assert.Less(t, strings.Index(rendered, "📖 **Related guidance:**"), strings.Index(rendered, "To proceed with these destructive changes**"),
 		"the reading comes before the command it informs")
 }
 

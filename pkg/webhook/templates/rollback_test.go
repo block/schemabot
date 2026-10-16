@@ -73,9 +73,9 @@ func TestRenderRollbackPlanComment_ListsUnsafeChanges(t *testing.T) {
 }
 
 // rollback-confirm without --allow-unsafe on a rollback plan with unsafe
-// changes is refused with the plan, each unsafe change, the exact
-// rollback-confirm command that consents to them, and the unlock that cancels
-// the still-pinned rollback.
+// changes is refused with the plan, each unsafe change, the rollback-confirm
+// command to re-issue with --allow-unsafe, and the unlock that cancels the
+// still-pinned rollback.
 func TestRenderRollbackUnsafeChangesBlocked(t *testing.T) {
 	data := PlanCommentData{
 		Database:     "shop",
@@ -99,7 +99,8 @@ func TestRenderRollbackUnsafeChangesBlocked(t *testing.T) {
 		assert.Contains(t, rendered, "DROP TABLE `audit_log`")
 		assert.Contains(t, rendered, "**⛔ Rollback rejected**: 1 unsafe change detected")
 		assert.Contains(t, rendered, "1. `audit_log`: DROP TABLE removes all data")
-		assert.Contains(t, rendered, "```\nschemabot rollback-confirm -e staging --allow-unsafe\n```")
+		assert.Contains(t, rendered, "add `--allow-unsafe` to confirm 1 unsafe change on `audit_log`:\n```\nschemabot rollback-confirm -e staging\n```")
+		assert.NotContains(t, rendered, "--allow-unsafe\n```", "consenting to destroy data takes typing the flag, so the pasteable command leaves it out")
 		assert.Contains(t, rendered, "The lock still pins this rollback plan")
 		assert.Contains(t, rendered, "```\nschemabot unlock\n```")
 		assert.NotContains(t, rendered, "schemabot apply")
@@ -109,7 +110,7 @@ func TestRenderRollbackUnsafeChangesBlocked(t *testing.T) {
 		tenantData := data
 		tenantData.Tenant = "acme"
 		rendered := RenderRollbackUnsafeChangesBlocked(tenantData)
-		assert.Contains(t, rendered, "```\nschemabot rollback-confirm -e staging --tenant acme --allow-unsafe\n```")
+		assert.Contains(t, rendered, "```\nschemabot rollback-confirm -e staging --tenant acme\n```")
 		assert.Contains(t, rendered, "```\nschemabot unlock --tenant acme\n```")
 	})
 
@@ -117,7 +118,7 @@ func TestRenderRollbackUnsafeChangesBlocked(t *testing.T) {
 		deferredData := data
 		deferredData.DeferCutover = true
 		rendered := RenderRollbackUnsafeChangesBlocked(deferredData)
-		assert.Contains(t, rendered, "```\nschemabot rollback-confirm -e staging --allow-unsafe --defer-cutover\n```")
+		assert.Contains(t, rendered, "```\nschemabot rollback-confirm -e staging --defer-cutover\n```")
 	})
 }
 

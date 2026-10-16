@@ -2489,9 +2489,9 @@ Before allowing a destructive drop, first deploy application code that no longer
 
 </details>
 
-**🚨 To proceed with these destructive changes, re-run with `--allow-unsafe`:**
+**🚨 To proceed with these destructive changes**, add `--allow-unsafe` to confirm 1 unsafe change on `customers`:
 ```
-schemabot apply -e staging --allow-unsafe
+schemabot apply -e staging
 ```
 <!-- schemabot:offer-support-channel -->
 
@@ -2525,9 +2525,9 @@ Before dropping an index in MySQL, first make the dropped index invisible and ve
 
 </details>
 
-**🚨 To proceed with these destructive changes, re-run with `--allow-unsafe`:**
+**🚨 To proceed with these destructive changes**, add `--allow-unsafe` to confirm 1 unsafe change on `customers`:
 ```
-schemabot apply -e staging --allow-unsafe
+schemabot apply -e staging
 ```
 <!-- schemabot:offer-support-channel -->
 
@@ -2568,9 +2568,9 @@ ALTER TABLE `users` RENAME COLUMN `email` TO `email_address`;
 2. `orders`: Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19. Consider using `DATETIME` instead.
 3. `users`: Column rename detected in table `users`: `email` to `email_address`. Renaming a column cannot be done atomically across application pods, and ORMs that generate column names at compile time (e.g. jOOQ) will break until code is recompiled
 
-**🚨 To proceed with these destructive changes, re-run with `--allow-unsafe`:**
+**🚨 To proceed with these destructive changes**, add `--allow-unsafe` to confirm 3 unsafe changes on `orders` and `users`:
 ```
-schemabot apply -e staging --allow-unsafe
+schemabot apply -e staging
 ```
 <!-- schemabot:offer-support-channel -->
 
@@ -6978,12 +6978,12 @@ Before allowing a destructive drop, first deploy application code that no longer
 
 </details>
 
-**🚨 To proceed with these destructive changes, re-run with `--allow-unsafe`:**
+**🚨 To proceed with these destructive changes**, add `--allow-unsafe` to confirm 1 unsafe change on `audit_log`:
 ```
-schemabot rollback-confirm -e staging --allow-unsafe
+schemabot rollback-confirm -e staging
 ```
 
-The lock still pins this rollback plan, so the command above confirms it.
+The lock still pins this rollback plan, so the command above, with `--allow-unsafe`, confirms it.
 
 To cancel, comment:
 ```
