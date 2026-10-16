@@ -86,7 +86,9 @@ func TestOperatorStartsParallelMembersTogetherFromOneWake(t *testing.T) {
 	ctx := t.Context()
 	db := openMatrixStorage(t)
 	members := []string{"region-a", "region-b", "region-c"}
-	stor := mysqlstore.New(db, storage.WithMaxDriversPerApply(len(members)))
+	// The apply's driver cap and this process's share of it are both raised to
+	// the member count, so neither bound is what holds a start back.
+	stor := mysqlstore.New(db, storage.WithMaxDriversPerApply(len(members)), storage.WithDriversPerProcess(2*len(members)))
 	claims := &claimMissCountingStorage{Storage: stor}
 
 	rec := &driveRecorder{}
