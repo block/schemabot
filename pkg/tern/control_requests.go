@@ -104,7 +104,8 @@ func markPendingControlRequestCompleted(ctx context.Context, store storage.Stora
 
 // SettlePendingRequestsForTerminalApply settles the pending control requests
 // that a terminal apply moots: a pending stop is settled (the apply can no
-// longer be stopped). Sweeping the mooted requests keeps a request issued
+// longer be stopped), and so is a pending release (there is no paused rollout
+// left to release). Sweeping the mooted requests keeps a request issued
 // moments before the apply settled — or one that lost to a contradictory
 // command — from lingering pending forever.
 //
@@ -126,19 +127,12 @@ func SettlePendingRequestsForTerminalApply(ctx context.Context, store storage.St
 	}
 	// A pending request for a retired operation can only be a row written by a
 	// previous release; no driver services it anymore, so this sweep is its
-	// only settlement path.
-	for _, op := range storage.RetiredControlOperations() {
-		controlReq, err := pendingControlRequest(ctx, store, apply, op)
-		if err != nil {
-			return err
-		}
-		if controlReq == nil {
-			logger.DebugContext(ctx, "no pending control request of this operation to settle", append(apply.LogAttrs(), "operation", op)...)
-			continue
-		}
-		logger.InfoContext(ctx, "completing pending control request the terminal apply moots",
-			append(apply.LogAttrs(), "operation", op, "requested_by", controlRequestCaller(controlReq))...)
-		if err := completePendingControlRequests(ctx, store, apply, op); err != nil {
+	// only settlement path. A pending release is mooted the same way: it only
+	// ever latched a paused rollout open, and a terminal apply has no rollout
+	// left to release. It completes rather than fails so the latch still reads
+	// as released, exactly as it did while the request was pending.
+	for _, op := range append(storage.RetiredControlOperations(), storage.ControlOperationRelease) {
+		if err := completePendingRequestMootedByTerminalApply(ctx, store, logger, apply, op); err != nil {
 			return err
 		}
 	}
@@ -150,6 +144,23 @@ func SettlePendingRequestsForTerminalApply(ctx context.Context, store storage.St
 		return err
 	}
 	return SettlePendingCancelForResolvedApply(ctx, store, logger, apply)
+}
+
+// completePendingRequestMootedByTerminalApply completes the apply's pending
+// request of one operation that a terminal apply moots outright, whatever
+// outcome the apply reached.
+func completePendingRequestMootedByTerminalApply(ctx context.Context, store storage.Storage, logger *slog.Logger, apply *storage.Apply, op storage.ControlOperation) error {
+	controlReq, err := pendingControlRequest(ctx, store, apply, op)
+	if err != nil {
+		return err
+	}
+	if controlReq == nil {
+		logger.DebugContext(ctx, "no pending control request of this operation to settle", append(apply.LogAttrs(), "operation", op)...)
+		return nil
+	}
+	logger.InfoContext(ctx, "completing pending control request the terminal apply moots",
+		append(apply.LogAttrs(), "operation", op, "requested_by", controlRequestCaller(controlReq))...)
+	return completePendingControlRequests(ctx, store, apply, op)
 }
 
 // SettlePendingRevertPhaseForResolvedApply answers the pending revert and

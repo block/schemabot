@@ -10,8 +10,10 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// A terminal apply moots a pending stop whatever the outcome, so the sweep
-// completes it and no request lingers pending forever.
+// A terminal apply moots a pending stop, a pending release, and a retired
+// operation's leftover row whatever the outcome, so the sweep completes them and
+// no request lingers pending forever. The release completes rather than fails,
+// so it still latches the rollout open as it did while pending.
 func TestSettlePendingRequestsForTerminalApply(t *testing.T) {
 	apply := &storage.Apply{
 		ID:              7,
@@ -22,6 +24,7 @@ func TestSettlePendingRequestsForTerminalApply(t *testing.T) {
 	}
 	sweptOps := []storage.ControlOperation{
 		storage.ControlOperationStop,
+		storage.ControlOperationRelease,
 		// A pending row for a retired operation, written by a previous release;
 		// no driver services it, so the sweep is its only settlement path.
 		storage.ControlOperation("volume"),

@@ -169,7 +169,9 @@ func TestRunStrandedReaperPassAnswersAStartStrandedOnASettledApply(t *testing.T)
 // it completed. A revert the completed schema change outran fails with a reason
 // saying the change is live, rather than staying pending and being re-listed on
 // every pass. A request for a retired operation has no driver left to serve it,
-// so the reaper completes it.
+// so the reaper completes it. A release has no paused rollout left to release on
+// a settled apply, so the reaper completes it too, which keeps the latch reading
+// as released.
 func TestRunStrandedReaperPassAnswersRevertPhaseRequestsStrandedOnASettledApply(t *testing.T) {
 	retired := storage.RetiredControlOperations()
 	require.NotEmpty(t, retired, "the retired-operation case needs a retired operation to strand")
@@ -190,6 +192,10 @@ func TestRunStrandedReaperPassAnswersRevertPhaseRequestsStrandedOnASettledApply(
 			wantCompleted: []storage.ControlOperation{storage.ControlOperationRevert}},
 		{name: "a retired operation's request completes", applyState: state.Apply.Completed, op: retired[0],
 			wantCompleted: []storage.ControlOperation{retired[0]}},
+		{name: "a release on a completed apply completes", applyState: state.Apply.Completed, op: storage.ControlOperationRelease,
+			wantCompleted: []storage.ControlOperation{storage.ControlOperationRelease}},
+		{name: "a release on a failed apply completes", applyState: state.Apply.Failed, op: storage.ControlOperationRelease,
+			wantCompleted: []storage.ControlOperation{storage.ControlOperationRelease}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
