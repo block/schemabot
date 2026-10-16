@@ -27,6 +27,10 @@ type ApplyLockConflictData struct {
 	// Active apply info (for "apply in progress" case)
 	ApplyID    string
 	ApplyState string
+	// ApplyEnvironment is the active apply's own environment, which a PR's
+	// applies in other environments can block. The control commands address
+	// it; empty means the requested environment.
+	ApplyEnvironment string
 	// DeferCutover is the active apply's own option: when set, its
 	// waiting_for_cutover state waits on an operator's cutover command
 	// rather than on SchemaBot.
@@ -458,21 +462,31 @@ func RenderApplyInProgress(data ApplyLockConflictData) string {
 	if applyAgain == "" {
 		applyAgain = appendTenantFlag("schemabot apply -e "+data.Environment, data.Tenant)
 	}
+	applyEnvironment := data.ApplyEnvironment
+	if applyEnvironment == "" {
+		applyEnvironment = data.Environment
+	}
 	control := func(verb string) string {
-		return appendTenantFlag(fmt.Sprintf("schemabot %s %s -e %s", verb, data.ApplyID, data.Environment), data.Tenant)
+		return appendTenantFlag(fmt.Sprintf("schemabot %s %s -e %s", verb, data.ApplyID, applyEnvironment), data.Tenant)
+	}
+	// An apply in another environment is named by it, since the heading
+	// names the requested one.
+	activeApply := "This PR's apply"
+	if applyEnvironment != data.Environment {
+		activeApply = "This PR's " + applyEnvironment + " apply"
 	}
 
 	switch {
 	case activeApplyAwaitsCutover(data):
-		fmt.Fprintf(&sb, "This PR's apply `%s` is waiting for cutover, so a second apply cannot start.\n\n", data.ApplyID)
+		fmt.Fprintf(&sb, "%s `%s` is waiting for cutover, so a second apply cannot start.\n\n", activeApply, data.ApplyID)
 		fmt.Fprintf(&sb, "To cut over:\n```\n%s\n```\n\n", control("cutover"))
 		fmt.Fprintf(&sb, "Once it completes, apply again:\n```\n%s\n```\n", applyAgain)
 	case state.IsState(data.ApplyState, state.Apply.RevertWindow):
-		fmt.Fprintf(&sb, "This PR's apply `%s` is in its revert window, so a second apply cannot start.\n\n", data.ApplyID)
+		fmt.Fprintf(&sb, "%s `%s` is in its revert window, so a second apply cannot start.\n\n", activeApply, data.ApplyID)
 		fmt.Fprintf(&sb, "To keep its changes and close the window:\n```\n%s\n```\n\n", control("skip-revert"))
 		fmt.Fprintf(&sb, "Once it completes, apply again:\n```\n%s\n```\n", applyAgain)
 	default:
-		fmt.Fprintf(&sb, "This PR's apply `%s` is still running (state: `%s`), so a second apply cannot start.\n\n", data.ApplyID, data.ApplyState)
+		fmt.Fprintf(&sb, "%s `%s` is still running (state: `%s`), so a second apply cannot start.\n\n", activeApply, data.ApplyID, data.ApplyState)
 		fmt.Fprintf(&sb, "Once it finishes, apply again:\n```\n%s\n```\n", applyAgain)
 	}
 

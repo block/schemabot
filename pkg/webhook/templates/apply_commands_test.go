@@ -169,6 +169,20 @@ func TestRenderApplyInProgressNamesTheNextStep(t *testing.T) {
 		assert.Contains(t, out, "Once it completes, "+applyAgain)
 	})
 
+	t.Run("an apply in another environment is named by it and addressed there", func(t *testing.T) {
+		data := base
+		data.ApplyEnvironment = "production"
+		data.ApplyState = state.Apply.WaitingForCutover
+		data.DeferCutover = true
+		out := RenderApplyInProgress(data)
+		assert.Contains(t, out, "This PR's production apply `apply-abc123` is waiting for cutover, so a second apply cannot start.")
+		assert.Contains(t, out, "To cut over:\n```\nschemabot cutover apply-abc123 -e production --tenant payments\n```\n")
+		assert.Contains(t, out, "Once it completes, "+applyAgain, "the apply to run again stays in the requested environment")
+
+		data.ApplyState = state.Apply.RevertWindow
+		assert.Contains(t, RenderApplyInProgress(data), "```\nschemabot skip-revert apply-abc123 -e production --tenant payments\n```\n")
+	})
+
 	t.Run("without a rendered apply command the plain apply is offered", func(t *testing.T) {
 		data := base
 		data.ApplyState = state.Apply.Running
