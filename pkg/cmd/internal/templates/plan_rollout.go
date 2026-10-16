@@ -143,7 +143,7 @@ func wrapNames(names []string, more, indent int) []string {
 // member that a narrowed apply runs, without the binary name. Past
 // memberNamesInlineLimit the rest are counted rather than spelled out.
 func WriteRolloutApplyRefused(noun presentation.Noun, refused []*apitypes.PlanMemberRefusalResponse, reruns []string) {
-	fmt.Printf("%s Apply blocked: an apply of the whole rollout cannot run the plan of %d %s\n\n", glyph.Refused, len(refused), nounLabel(noun, len(refused)))
+	fmt.Printf("%s Apply blocked: an apply of the whole rollout cannot run the plan of %d %s\n\n", glyph.Refused, len(refused), noun.Label(len(refused)))
 	shown := min(len(refused), memberNamesInlineLimit)
 	for _, r := range refused[:shown] {
 		fmt.Printf("  • %s — %s\n", r.Member, r.Detail)
@@ -158,7 +158,7 @@ func WriteRolloutApplyRefused(noun presentation.Noun, refused []*apitypes.PlanMe
 		fmt.Println("No apply can run these changes; change the schema files so each target's engine accepts them.")
 		fmt.Println()
 	case blocked > 0:
-		fmt.Printf("No apply can run the changes of the %d %s whose engine refuses them; change the schema files so each target's engine accepts them.\n", blocked, nounLabel(noun, blocked))
+		fmt.Printf("No apply can run the changes of the %d %s whose engine refuses them; change the schema files so each target's engine accepts them.\n", blocked, noun.Label(blocked))
 		fmt.Println()
 	}
 	if len(reruns) == 0 {
@@ -176,7 +176,7 @@ func WriteRolloutApplyRefused(noun presentation.Noun, refused []*apitypes.PlanMe
 		fmt.Printf("  %s %s\n", cliname.Name(), rerun)
 	}
 	if rest := len(reruns) - shownReruns; rest > 0 {
-		fmt.Printf("  and the same for %d more %s\n", rest, nounLabel(noun, rest))
+		fmt.Printf("  and the same for %d more %s\n", rest, noun.Label(rest))
 	}
 	fmt.Println()
 }
@@ -191,12 +191,4 @@ func countBlockedRefusals(refused []*apitypes.PlanMemberRefusalResponse) int {
 		}
 	}
 	return n
-}
-
-// nounLabel is noun's singular for one member and its plural otherwise.
-func nounLabel(noun presentation.Noun, n int) string {
-	if n == 1 {
-		return noun.Singular
-	}
-	return noun.Plural
 }

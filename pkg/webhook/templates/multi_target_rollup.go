@@ -495,7 +495,7 @@ func writeFailedTargets(sb *strings.Builder, model presentation.Apply, g present
 		fmt.Fprintf(sb, "| %s | %s |\n", inlineCodeCell(memberTarget(d)), cell)
 	}
 	if more := len(failed) - failedTargetRowLimit; more > 0 {
-		fmt.Fprintf(sb, "\n…and %d more failed targets.\n", more)
+		fmt.Fprintf(sb, "\n…and %d more failed %s.\n", more, targetNoun.Label(more))
 	}
 }
 

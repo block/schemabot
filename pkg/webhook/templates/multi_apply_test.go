@@ -824,19 +824,26 @@ func TestRenderMultiDeploymentApplyComment_SoleGroupCutDDLSpeaksOnlyForReporting
 // whose every target failed still fits in one comment; the <summary> counts
 // carry the total.
 func TestRenderMultiDeploymentApplyComment_RolledUpFailedTargetsAreNamed(t *testing.T) {
-	var ops []presentation.Operation
-	var details []*ApplyStatusCommentData
-	for i := range failedTargetRowLimit + 5 {
-		target := fmt.Sprintf("testapp-%03d", i)
-		ops = append(ops, presentation.Operation{Deployment: "primary", Target: target, State: so.Failed, Parallel: true, ContinueOnFailure: true, Error: "Error 1062: Duplicate entry | for key"})
-		details = append(details, targetDetail(target, state.Task.Failed, addNote, 0))
+	render := func(failed int) string {
+		var ops []presentation.Operation
+		var details []*ApplyStatusCommentData
+		for i := range failed {
+			target := fmt.Sprintf("testapp-%03d", i)
+			ops = append(ops, presentation.Operation{Deployment: "primary", Target: target, State: so.Failed, Parallel: true, ContinueOnFailure: true, Error: "Error 1062: Duplicate entry | for key"})
+			details = append(details, targetDetail(target, state.Task.Failed, addNote, 0))
+		}
+		return renderTargets(presentation.Derive(ops), details...)
 	}
-	out := renderTargets(presentation.Derive(ops), details...)
 
+	out := render(failedTargetRowLimit + 5)
 	assert.Contains(t, out, "\n❌ Rolled out to no targets, 25 failed\n")
 	assert.Contains(t, out, "\n| Target | Status |\n| --- | --- |\n| `testapp-000` | ❌ failed — Error 1062: Duplicate entry / for key |\n")
 	assert.Equal(t, failedTargetRowLimit, strings.Count(out, "| ❌ failed"))
 	assert.Contains(t, out, "\n…and 5 more failed targets.\n")
+
+	out = render(failedTargetRowLimit + 1)
+	assert.Equal(t, failedTargetRowLimit, strings.Count(out, "| ❌ failed"))
+	assert.Contains(t, out, "\n…and 1 more failed target.\n", out)
 }
 
 // A table copying on several targets shows its planned size summed across

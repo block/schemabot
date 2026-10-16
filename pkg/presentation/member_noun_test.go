@@ -22,3 +22,19 @@ func TestCoveragePhrase(t *testing.T) {
 		assert.Equal(t, tc.want, CoveragePhrase(ShardNoun, tc.count, tc.total))
 	}
 }
+
+// A noun reads singular for one member and plural for any other count, bare
+// as a label or after the count.
+func TestNounLabelAndCount(t *testing.T) {
+	for _, tc := range []struct {
+		count          int
+		label, counted string
+	}{
+		{count: 0, label: "targets", counted: "0 targets"},
+		{count: 1, label: "target", counted: "1 target"},
+		{count: 2, label: "targets", counted: "2 targets"},
+	} {
+		assert.Equal(t, tc.label, TargetNoun.Label(tc.count))
+		assert.Equal(t, tc.counted, TargetNoun.Count(tc.count))
+	}
+}
