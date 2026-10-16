@@ -163,6 +163,9 @@ const (
 	// when the apply was created, so nothing ran there. It is neither a
 	// completed rollout member nor one still to report.
 	StateAlreadyApplied
+	// StateResuming is a stopped member a start has claimed again; its drive
+	// is picking the work back up.
+	StateResuming
 
 	// presentationStateCount is one past the last state, so a test can visit
 	// every state and fail when a new one has no histogram category.
@@ -522,6 +525,10 @@ func deriveDeployment(ops []Operation, names []string, i int) Deployment {
 		d.set(StateRetrying, "retrying", "🔁", true)
 	case state.ApplyOperation.Stopped:
 		d.set(StateStopped, "stopped — resume to continue", "⏹️", true)
+	case state.ApplyOperation.Resuming:
+		// A start claimed this stopped deployment and its drive is picking
+		// the work back up; the row stays resuming until the drive settles.
+		d.set(StateResuming, "resuming", "🔄", true)
 	case state.ApplyOperation.RevertWindow:
 		d.set(StateRevertWindow, "in revert window", "⏳", true)
 	case state.ApplyOperation.Cancelled:
@@ -877,6 +884,7 @@ var summaryCategoryOrder = []struct {
 	{"cutting over", []PresentationState{StateCuttingOver}},
 	{"ready for cutover", []PresentationState{StateReadyForCutoverNext, StateReadyForCutoverWaiting}},
 	{"running", []PresentationState{StateRunningCopy}},
+	{"resuming", []PresentationState{StateResuming}},
 	{"waiting", []PresentationState{StateWaiting}},
 	{"queued", []PresentationState{StateQueuedNext}},
 	{"halted", []PresentationState{StateHalted}},

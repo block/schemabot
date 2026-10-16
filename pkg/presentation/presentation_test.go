@@ -84,6 +84,7 @@ func TestDeriveDeployment_StateLabels(t *testing.T) {
 		{so.Failed, StateFailed, "failed", "❌", true},
 		{so.FailedRetryable, StateRetrying, "retrying", "🔁", true},
 		{so.Stopped, StateStopped, "stopped — resume to continue", "⏹️", true},
+		{so.Resuming, StateResuming, "resuming", "🔄", true},
 		{so.RevertWindow, StateRevertWindow, "in revert window", "⏳", true},
 		{so.Cancelled, StateCancelled, "cancelled", "🚫", false},
 		{so.Reverted, StateReverted, "reverted", "↩️", false},
@@ -860,4 +861,24 @@ func TestDerive_MemberCarriesItsOperationsIdentifiers(t *testing.T) {
 		assert.Equal(t, want.externalOperationID, d.ExternalOperationID, want.target)
 		assert.Equal(t, want.neverStarted, d.NeverStarted, want.target)
 	}
+}
+
+// A start on a stopped rollout claims its members one drive at a time. The
+// members already claimed read resuming, not an unknown state, and count as
+// resuming in the histogram beside the member still stopped.
+func TestDerive_StartOnStoppedRolloutCountsResumingMembers(t *testing.T) {
+	got := Derive([]Operation{
+		rolling("us", so.Resuming),
+		rolling("eu", so.Resuming),
+		rolling("au", so.Stopped),
+	})
+
+	for _, d := range got.Deployments[:2] {
+		assert.Equal(t, StateResuming, d.Presentation, d.Name)
+		assert.Equal(t, "resuming", d.Label, d.Name)
+	}
+	assert.Equal(t, []StateCount{
+		{Label: "resuming", Count: 2},
+		{Label: "stopped", Count: 1},
+	}, got.Counts)
 }
