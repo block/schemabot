@@ -1,9 +1,10 @@
 package cliname
 
 import (
-	"regexp"
+	"log/slog"
 	"strings"
 	"sync/atomic"
+	"unicode"
 )
 
 // The route is the set of global flags that selected the control plane this
@@ -13,22 +14,29 @@ import (
 // default route. The route is recorded from what the operator typed, before
 // any endpoint resolution rewrites it: a wrapper that port-forwards, or a local
 // runtime, replaces the endpoint with one that does not outlive the run.
-var route atomic.Pointer[[]string]
+var route atomic.Pointer[[]Flag]
 
-// SetRoute records the routing flags hints carry, as flag and value pairs in
-// command-line order (for example "--profile", "prod"). The CLI records its own
-// with Globals.RouteFlags after parsing; a wrapper that adds a routing flag of
-// its own appends it and calls SetRoute again. Callers must never pass a
-// credential: everything recorded here is printed. An empty route clears it.
-func SetRoute(flags ...string) {
-	recorded := append([]string(nil), flags...)
+// Flag is one routing flag and the value the operator gave it, such as
+// {Name: "--profile", Value: "prod"}.
+type Flag struct {
+	Name  string
+	Value string
+}
+
+// SetRoute records the routing flags hints carry, in command-line order. The
+// CLI records its own with Globals.RouteFlags after parsing; a wrapper that adds
+// a routing flag of its own appends it and calls SetRoute again. Callers must
+// never pass a credential: everything recorded here is printed. An empty route
+// clears it.
+func SetRoute(flags ...Flag) {
+	recorded := append([]Flag(nil), flags...)
 	route.Store(&recorded)
 }
 
 // Route returns the recorded routing flags, or nil when none were recorded.
-func Route() []string {
+func Route() []Flag {
 	if p := route.Load(); p != nil {
-		return append([]string(nil), (*p)...)
+		return append([]Flag(nil), (*p)...)
 	}
 	return nil
 }
@@ -36,25 +44,62 @@ func Route() []string {
 // Command renders a pasteable command that reaches the server this run used:
 // the tool name, args, and the recorded routing flags. Args are rendered as
 // given, so a caller can pass a placeholder such as <environment>; the routing
-// values came from the operator and are quoted when a shell would split them.
+// values came from the operator and are rendered so a shell passes them through
+// unchanged.
 func Command(args ...string) string {
 	parts := append([]string{Name()}, args...)
 	for _, flag := range Route() {
-		parts = append(parts, quoteArg(flag))
+		rendered, ok := renderFlag(flag)
+		if !ok {
+			slog.Debug("leaving a routing flag with a control character out of command hints", "flag", flag.Name)
+			continue
+		}
+		parts = append(parts, rendered)
 	}
 	return strings.Join(parts, " ")
 }
 
-// shellSafe matches an argument a shell passes through unchanged.
-var shellSafe = regexp.MustCompile(`^[A-Za-z0-9_@%+=:,./-]+$`)
-
-// quoteArg double-quotes an argument a shell would otherwise split or expand.
-// Double quotes, not single, because callers embed the whole command in
-// single quotes.
-func quoteArg(arg string) string {
-	if shellSafe.MatchString(arg) {
-		return arg
+// renderFlag renders a routing flag for a shell. A value that starts with a
+// hyphen, or is empty, is joined with "=", since the CLI's parser reads a
+// separate hyphen-leading word as another flag. A value holding a control
+// character has no portable shell spelling, so it is reported as unrenderable.
+func renderFlag(flag Flag) (string, bool) {
+	if strings.ContainsFunc(flag.Value, unicode.IsControl) {
+		return "", false
 	}
-	escaped := strings.NewReplacer(`\`, `\\`, `"`, `\"`, `$`, `\$`, "`", "\\`").Replace(arg)
-	return `"` + escaped + `"`
+	value := shellEscape(flag.Value)
+	if value == "" || strings.HasPrefix(flag.Value, "-") {
+		return flag.Name + "=" + value, true
+	}
+	return flag.Name + " " + value, true
+}
+
+// shellEscape backslash-escapes every character a shell would otherwise split
+// on, expand, or treat as syntax. Backslashes rather than quotes, because no
+// quoting style is safe on its own: double quotes still expand "$" and, in an
+// interactive bash, "!" history references, and callers embed the whole
+// command in single quotes.
+//
+// A leading "=" is escaped too: zsh expands a word that starts with one into
+// the path of the command it names.
+func shellEscape(value string) string {
+	var b strings.Builder
+	for i, r := range value {
+		if !isShellSafe(r) || (i == 0 && r == '=') {
+			b.WriteByte('\\')
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
+}
+
+// isShellSafe reports whether a shell passes r through unescaped anywhere in
+// a word.
+func isShellSafe(r rune) bool {
+	switch {
+	case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+		return true
+	default:
+		return strings.ContainsRune("_@%+=:,./-", r)
+	}
 }

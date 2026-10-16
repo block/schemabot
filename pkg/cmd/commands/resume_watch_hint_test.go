@@ -1,6 +1,7 @@
 package commands
 
 import (
+	"os/exec"
 	"strings"
 	"testing"
 
@@ -62,34 +63,55 @@ func TestGlobalsRouteFlags_NeverPrintsSecrets(t *testing.T) {
 
 	flags := g.RouteFlags()
 
-	assert.Equal(t, []string{"--profile", "prod", "--endpoint", "https://schemabot.example/api"}, flags)
-	joined := strings.Join(flags, " ")
-	for _, secret := range []string{"hunter2", "ops:", "abc123", "bearer-secret", "frag"} {
-		assert.NotContains(t, joined, secret)
+	assert.Equal(t, []cliname.Flag{
+		{Name: "--profile", Value: "prod"},
+		{Name: "--endpoint", Value: "https://schemabot.example/api"},
+	}, flags)
+	for _, flag := range flags {
+		for _, secret := range []string{"hunter2", "ops:", "abc123", "bearer-secret", "frag"} {
+			assert.NotContains(t, flag.Value, secret)
+		}
 	}
 	assert.Empty(t, (&Globals{Token: "bearer-secret"}).RouteFlags(), "a token alone selects no route")
 }
 
 // The hint is only right if pasting it selects what the original command
-// selected. Parse the rendered command back through kong and compare.
+// selected. Each case records a route, hands the rendered command to a real
+// shell, and parses the words the shell produced back through kong. The
+// values include ones a shell or the flag parser would mangle unescaped: a
+// hyphen-leading profile, which kong would read as another flag, and profiles
+// with a space or a "!".
 func TestResumeWatchHint_ParsesBackToTheSameRoute(t *testing.T) {
-	recordRoute(t, Globals{Profile: "prod", Endpoint: "https://schemabot.example"})
-	hint := pastedResumeCommand("apply-7c2e", "production")
+	for _, g := range []Globals{
+		{Profile: "prod", Endpoint: "https://schemabot.example"},
+		{Profile: "-prod"},
+		{Profile: "prod!cluster"},
+		{Profile: "west cluster"},
+	} {
+		t.Run(g.Profile, func(t *testing.T) {
+			recordRoute(t, g)
+			pasted := pastedResumeCommand("apply-7c2e", "production")
 
-	args := strings.Fields(strings.TrimPrefix(hint, cliname.Name()+" "))
-	var cli struct {
-		Globals
-		Progress ProgressCmd `cmd:""`
+			out, err := exec.CommandContext(t.Context(), "/bin/sh", "-c", `printf '%s\0' `+pasted).Output()
+			require.NoError(t, err)
+			words := strings.Split(strings.TrimSuffix(string(out), "\x00"), "\x00")
+			require.Equal(t, "schemabot", words[0])
+
+			var cli struct {
+				Globals
+				Progress ProgressCmd `cmd:""`
+			}
+			parser, err := kong.New(&cli, kong.Name("schemabot"))
+			require.NoError(t, err)
+			_, err = parser.Parse(words[1:])
+			require.NoError(t, err, "the hint %q must parse", pasted)
+
+			assert.Equal(t, "apply-7c2e", cli.Progress.ApplyID)
+			assert.Equal(t, "production", cli.Progress.Environment)
+			assert.Equal(t, g.Profile, cli.Profile)
+			assert.Equal(t, g.Endpoint, cli.Endpoint)
+		})
 	}
-	parser, err := kong.New(&cli, kong.Name("schemabot"))
-	require.NoError(t, err)
-	_, err = parser.Parse(args)
-	require.NoError(t, err, "the hint %q must parse", hint)
-
-	assert.Equal(t, "apply-7c2e", cli.Progress.ApplyID)
-	assert.Equal(t, "production", cli.Progress.Environment)
-	assert.Equal(t, "prod", cli.Profile)
-	assert.Equal(t, "https://schemabot.example", cli.Endpoint)
 }
 
 // pastedResumeCommand extracts the command from the resume hint,

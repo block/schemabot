@@ -55,13 +55,13 @@ func (g *Globals) Resolve() (string, error) {
 // parsing and before anything rewrites Endpoint with a resolved one. The token
 // is never included, and the endpoint is stripped of any credentials, query,
 // or fragment, because hints are printed to the terminal and to CI logs.
-func (g *Globals) RouteFlags() []string {
-	var flags []string
+func (g *Globals) RouteFlags() []cliname.Flag {
+	var flags []cliname.Flag
 	if g.Profile != "" {
-		flags = append(flags, "--profile", g.Profile)
+		flags = append(flags, cliname.Flag{Name: "--profile", Value: g.Profile})
 	}
 	if endpoint := endpointForHint(g.Endpoint); endpoint != "" {
-		flags = append(flags, "--endpoint", endpoint)
+		flags = append(flags, cliname.Flag{Name: "--endpoint", Value: endpoint})
 	}
 	return flags
 }
