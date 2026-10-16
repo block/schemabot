@@ -908,8 +908,28 @@ func TestDerive_StartOnStoppedRolloutCountsResumingMembers(t *testing.T) {
 		assert.Equal(t, StateResuming, d.Presentation, d.Name)
 		assert.Equal(t, "resuming", d.Label, d.Name)
 	}
+	assert.Equal(t, StateStopped, got.Deployments[2].Presentation, "the start has not claimed au yet")
 	assert.Equal(t, []StateCount{
 		{Label: "resuming", Count: 2},
 		{Label: "stopped", Count: 1},
 	}, got.Counts)
+}
+
+// While a start claims a group's stopped targets one at a time, the group leads
+// with a target already resuming rather than with one still stopped, so the
+// heading shows the start under way instead of inviting a second one.
+func TestGroups_ResumingTargetHeadsGroupOverStoppedOne(t *testing.T) {
+	target := func(tgt, st string) Operation {
+		return Operation{Deployment: "primary", Target: tgt, State: st}
+	}
+	apply := Derive([]Operation{
+		target("t_000", so.Stopped),
+		target("t_001", so.Resuming),
+	})
+
+	groups := apply.Groups()
+	require.Len(t, groups, 1)
+	assert.Equal(t, "primary/t_001", groups[0].Lead.Name, "the resuming target heads the group")
+	assert.Equal(t, StateResuming, groups[0].Lead.Presentation)
+	assert.Equal(t, []StateCount{{"resuming", 1}, {"stopped", 1}}, groups[0].Counts)
 }

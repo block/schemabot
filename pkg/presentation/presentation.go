@@ -382,10 +382,13 @@ func (a Apply) group(deployment string, members []int) Group {
 }
 
 // attentionOrder ranks presentations by how urgently they need an operator,
-// most urgent first and settled members last.
+// most urgent first and settled members last. Resuming outranks stopped: the
+// two coexist only while a start is claiming a group's stopped members one at
+// a time, and the group has to lead with the start already under way rather
+// than with a stopped member that invites a second one.
 var attentionOrder = []PresentationState{
-	StateFailed, StateRetrying, StatePaused, StateHalted, StateStopped,
-	StateReadyForCutoverNext, StateCuttingOver, StateRunningCopy, StateResuming, StateRevertWindow,
+	StateFailed, StateRetrying, StatePaused, StateHalted, StateResuming, StateStopped,
+	StateReadyForCutoverNext, StateCuttingOver, StateRunningCopy, StateRevertWindow,
 	StateReadyForCutoverWaiting, StateWaiting, StateQueuedNext,
 	StateCancelled, StateReverted, StateCompleted, StateAlreadyApplied,
 }
