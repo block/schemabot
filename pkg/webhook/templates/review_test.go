@@ -50,8 +50,26 @@ func TestRenderReviewRequired_ChangedApprovers(t *testing.T) {
 
 	assert.Contains(t, result, "\nApprovals on an earlier commit no longer count because this PR's schema change is different now: @bob, @carol. Ask for an approval of the latest commit.\n")
 	assert.NotContains(t, result, "This PR targets", "a PR whose base branch is unknown is not told it targets another branch")
+	assert.NotContains(t, result, "Changed since the approval", "no file is named when the gate reports none")
 	assert.Less(t, strings.Index(result, "Approvals on an earlier commit"), strings.Index(result, "**Operators of `payments`**"),
 		"the explanation precedes the reviewer lists")
+}
+
+// The comment names the schema files whose change differs since the earlier
+// approvals, so the author sees what needs a fresh review.
+func TestRenderReviewRequired_ChangedPaths(t *testing.T) {
+	result := RenderReviewRequired(ReviewGateData{
+		Database:         "payments",
+		Environment:      "staging",
+		RequestedBy:      "alice",
+		OtherReviewers:   []string{"bob"},
+		PRAuthor:         "alice",
+		ChangedApprovers: []string{"bob"},
+		ChangedPaths:     []string{"schema/payments/overrides.sql", "schema/payments/votes.sql"},
+	})
+
+	assert.Contains(t, result, "\nApprovals on an earlier commit no longer count because this PR's schema change is different now: @bob. "+
+		"Changed since the approval: `schema/payments/overrides.sql`, `schema/payments/votes.sql`. Ask for an approval of the latest commit.\n")
 }
 
 // A PR targeting a branch other than the default has approvals carried only

@@ -4355,7 +4355,7 @@ Schema changes require approval from an authorized reviewer before applying.
 
 Schema changes require approval from an authorized reviewer before applying.
 
-Approvals on an earlier commit no longer count because this PR's schema change is different now: @jdoe. Ask for an approval of the latest commit.
+Approvals on an earlier commit no longer count because this PR's schema change is different now: @jdoe. Changed since the approval: `schema/testapp/orders.sql`. Ask for an approval of the latest commit.
 
 **Operators of `testapp`**:
 - @acme/testapp-operators
@@ -4382,7 +4382,7 @@ Approvals on an earlier commit no longer count because this PR's schema change i
 
 Schema changes require approval from an authorized reviewer before applying.
 
-Approvals on an earlier commit no longer count because this PR's schema change is different now: @jdoe. This PR targets `release-1.2`, not `main`, so changes that reach `release-1.2` count as a change too. Ask for an approval of the latest commit.
+Approvals on an earlier commit no longer count because this PR's schema change is different now: @jdoe. Changed since the approval: `schema/testapp/orders.sql`. This PR targets `release-1.2`, not `main`, so changes that reach `release-1.2` count as a change too. Ask for an approval of the latest commit.
 
 **Operators of `testapp`**:
 - @acme/testapp-operators

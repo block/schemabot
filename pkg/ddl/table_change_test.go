@@ -262,3 +262,108 @@ func TestSameTableChange_DuplicateDeclaration(t *testing.T) {
 		})
 	}
 }
+
+// A table file the pull request adds is absent at both bases, so its change
+// is the CREATE TABLE itself. Reformatting the file or editing its comments
+// keeps the approval; any change to what the table is built from does not.
+func TestSameTableChange_AddedTable(t *testing.T) {
+	const approved = "CREATE TABLE `overrides` (\n" +
+		"  `id` bigint NOT NULL AUTO_INCREMENT,\n" +
+		"  `program_token` varchar(255) NOT NULL,\n" +
+		"  `created_at` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,\n" +
+		"  PRIMARY KEY (`id`),\n" +
+		"  KEY `idx_program_token` (`program_token`)\n" +
+		") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+	tests := []struct {
+		name       string
+		head       string
+		wantSame   bool
+		wantReason string
+	}{
+		{
+			name: "a reformatted file with a comment added",
+			head: "-- Per-program overrides.\nCREATE TABLE `overrides` (`id` bigint NOT NULL AUTO_INCREMENT, `program_token` varchar(255) NOT NULL, " +
+				"`created_at` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY (`id`), KEY `idx_program_token` (`program_token`)) " +
+				"ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;\n",
+			wantSame: true,
+		},
+		{
+			name: "a column whose type changes at the head",
+			head: "CREATE TABLE `overrides` (`id` bigint NOT NULL AUTO_INCREMENT, `program_token` varchar(255) NOT NULL, " +
+				"`created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY (`id`), KEY `idx_program_token` (`program_token`)) " +
+				"ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+			wantReason: "table overrides: the head declares column created_at differently from the approved commit",
+		},
+		{
+			name: "a column the head adds",
+			head: "CREATE TABLE `overrides` (`id` bigint NOT NULL AUTO_INCREMENT, `program_token` varchar(255) NOT NULL, " +
+				"`created_at` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP, `note` text, PRIMARY KEY (`id`), KEY `idx_program_token` (`program_token`)) " +
+				"ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+			wantReason: "table overrides: the head declares column note differently from the approved commit",
+		},
+		{
+			name: "an index the head drops",
+			head: "CREATE TABLE `overrides` (`id` bigint NOT NULL AUTO_INCREMENT, `program_token` varchar(255) NOT NULL, " +
+				"`created_at` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY (`id`)) " +
+				"ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+			wantReason: "table overrides: the head declares index idx_program_token differently from the approved commit",
+		},
+		{
+			name: "a table option the head changes",
+			head: "CREATE TABLE `overrides` (`id` bigint NOT NULL AUTO_INCREMENT, `program_token` varchar(255) NOT NULL, " +
+				"`created_at` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY (`id`), KEY `idx_program_token` (`program_token`)) " +
+				"ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci ROW_FORMAT=COMPRESSED",
+			wantReason: "table overrides: the head declares table option",
+		},
+		{
+			name: "columns the head reorders",
+			head: "CREATE TABLE `overrides` (`id` bigint NOT NULL AUTO_INCREMENT, `created_at` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP, " +
+				"`program_token` varchar(255) NOT NULL, PRIMARY KEY (`id`), KEY `idx_program_token` (`program_token`)) " +
+				"ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+			wantReason: "table overrides: the head orders columns differently from the approved commit",
+		},
+		{
+			name:       "a head that names another table",
+			head:       "CREATE TABLE `program_overrides` (`id` bigint NOT NULL AUTO_INCREMENT, PRIMARY KEY (`id`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+			wantReason: "the file declares table overrides at the approved commit but program_overrides at the head",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			same, reason, err := SameTableChange("", approved, "", tt.head)
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantSame, same)
+			if tt.wantSame {
+				assert.Empty(t, reason)
+				return
+			}
+			assert.Contains(t, reason, tt.wantReason)
+		})
+	}
+}
+
+// A file absent at only one base has no single change to compare, and one
+// that cannot be read as one CREATE TABLE proves nothing; both are errors the
+// caller counts as changed.
+func TestSameTableChange_AddedTableCannotCompare(t *testing.T) {
+	table := "CREATE TABLE `t` (`id` bigint NOT NULL, PRIMARY KEY (`id`))"
+	tests := []struct {
+		name                                   string
+		approvedBase, approved, headBase, head string
+		wantErr                                string
+	}{
+		{name: "absent at the approved commit's base only", approved: table, headBase: table, head: table, wantErr: "absent at one base but not the other"},
+		{name: "absent at the head's base only", approvedBase: table, approved: table, head: table, wantErr: "absent at one base but not the other"},
+		{name: "two statements at the head", approved: table, head: table + ";\nCREATE TABLE `u` (`id` bigint NOT NULL, PRIMARY KEY (`id`));", wantErr: "parse the schema file at the head: the file holds 2 statements"},
+		{name: "a column declared twice at the approved commit", approved: "CREATE TABLE `t` (`id` bigint NOT NULL, `x` int, `X` int, PRIMARY KEY (`id`))", head: table, wantErr: "read table t at the approved commit: column x is declared more than once"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			same, reason, err := SameTableChange(tt.approvedBase, tt.approved, tt.headBase, tt.head)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tt.wantErr)
+			assert.False(t, same)
+			assert.Empty(t, reason)
+		})
+	}
+}

@@ -38,11 +38,22 @@ import (
 //     engine, charset, partitioning, or row format exemptions), so any
 //     difference the planner could act on counts.
 //
+// A file the pull request adds is absent at both bases, passed as "". Its
+// change is the CREATE TABLE itself, so it is the same when the approved
+// commit and the head declare the same elements in the same column order:
+// formatting and comments may differ, nothing the table is built from may.
+//
 // When the change is not the same, reason says why, for operator logs. Each
 // file must hold exactly one CREATE TABLE, all four naming the same table,
 // and an element may be declared only once per file; an error means the files
 // could not be compared and proves nothing.
 func SameTableChange(approvedBase, approved, headBase, head string) (same bool, reason string, err error) {
+	if approvedBase == "" && headBase == "" {
+		return sameAddedTable(approved, head)
+	}
+	if approvedBase == "" || headBase == "" {
+		return false, "", fmt.Errorf("the file is absent at one base but not the other")
+	}
 	files := [...]struct {
 		name    string
 		content string
@@ -96,6 +107,44 @@ func SameTableChange(approvedBase, approved, headBase, head string) (same bool, 
 	if !slices.Equal(approvedChange, headChange) {
 		return false, fmt.Sprintf("table %s: the approved commit generates %q but the head generates %q",
 			aBase.TableName, approvedChange, headChange), nil
+	}
+	return true, "", nil
+}
+
+// sameAddedTable compares a table file the pull request adds at the approved
+// commit and at the head.
+func sameAddedTable(approved, head string) (same bool, reason string, err error) {
+	files := [...]struct {
+		name    string
+		content string
+	}{
+		{"approved commit", approved},
+		{"head", head},
+	}
+	var tables [len(files)]*statement.CreateTable
+	var elements [len(files)]map[string]string
+	for i, f := range files {
+		ct, err := parseSingleCreateTable(f.content)
+		if err != nil {
+			return false, "", fmt.Errorf("parse the schema file at the %s: %w", f.name, err)
+		}
+		e, err := tableElements(ct)
+		if err != nil {
+			return false, "", fmt.Errorf("read table %s at the %s: %w", ct.TableName, f.name, err)
+		}
+		tables[i], elements[i] = ct, e
+	}
+	a, h := tables[0], tables[1]
+	if a.TableName != h.TableName {
+		return false, fmt.Sprintf("the file declares table %s at the approved commit but %s at the head", a.TableName, h.TableName), nil
+	}
+	// With no base, every element is the pull request's own, so the merge
+	// holds exactly when the head declares each one as approved.
+	if why := UnmergedElement(nil, elements[0], nil, elements[1]); why != "" {
+		return false, fmt.Sprintf("table %s: %s", a.TableName, why), nil
+	}
+	if !sameColumnOrder(a, h) {
+		return false, fmt.Sprintf("table %s: the head orders columns differently from the approved commit", a.TableName), nil
 	}
 	return true, "", nil
 }
