@@ -2866,3 +2866,32 @@ func TestRenderApplySummaryComment_Rollback(t *testing.T) {
 	assert.Contains(t, failed, "## ❌ Rollback Failed")
 	assert.NotContains(t, failed, "Schema Change Failed")
 }
+
+// A cancel stops `orders` part-way through its row copy, reaches `users`
+// after its engine began it but before it reported rows, and reaches
+// `products` while it is still queued. Only `products` reads not started; the
+// progress comment and the terminal summary both say how far `orders` got.
+func TestRenderApplyComments_CancelledTableSaysHowFarItGot(t *testing.T) {
+	data := ApplyStatusCommentData{
+		Database:    "testapp",
+		Environment: "staging",
+		RequestedBy: "aparajon",
+		State:       state.Apply.Cancelled,
+		Engine:      "Spirit",
+		Tables: []TableProgressData{
+			{TableName: "orders", DDL: "ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`)", Status: state.Task.Cancelled, Started: true, PercentComplete: 40, RowsCopied: 400, RowsTotal: 1000},
+			{TableName: "users", DDL: "ALTER TABLE `users` ADD INDEX `idx_email` (`email`)", Status: state.Task.Cancelled, Started: true},
+			{TableName: "products", DDL: "ALTER TABLE `products` ADD INDEX `idx_price` (`price_cents`)", Status: state.Task.Cancelled},
+		},
+	}
+
+	progress := RenderApplyStatusComment(data)
+	assert.Contains(t, progress, "**`orders`**: 🚫 Cancelled at 40.00%\n", "%s", progress)
+	assert.Contains(t, progress, "**`users`**: 🚫 Cancelled\n", "%s", progress)
+	assert.Contains(t, progress, "**`products`**: 🚫 Cancelled (not started)\n", "%s", progress)
+
+	summary := RenderApplySummaryComment(data)
+	assert.Contains(t, summary, "**`orders`** — Cancelled at 40.00%\n", "%s", summary)
+	assert.Contains(t, summary, "**`users`** — Cancelled\n", "%s", summary)
+	assert.Contains(t, summary, "**`products`** — Cancelled\n", "%s", summary)
+}

@@ -414,6 +414,7 @@ func tableProgressFromTasks(databaseFallback string, tasks []*storage.Task, shar
 			Throttled:           t.Throttled,
 			ThrottleReason:      t.ThrottleReason,
 			IsInstant:           t.IsInstant,
+			Started:             t.StartedAt != nil,
 			ErrorMessage:        t.ErrorMessage,
 			Shards:              shardProgressForTable(shardsByTable, t.ApplyOperationID, t.Namespace, t.TableName),
 		})

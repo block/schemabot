@@ -2289,6 +2289,80 @@ func TestRenderMultiDeploymentApplyComment_SettledRolloutTableReadsNotStarted(t 
 	})
 }
 
+// A rollout of `trips` was cancelled with some targets part-way through the
+// table. The line counts the targets the cancel stopped and the ones that
+// never began the table, and says the table was not started only when no
+// target began it.
+func TestRenderMultiDeploymentApplyComment_CancelledRolloutCountsTheTargetsItStopped(t *testing.T) {
+	trips := func(database string, table TableProgressData) *ApplyStatusCommentData {
+		table.TableName = "trips"
+		d := tablesDetail(database, table)
+		d.State = state.Apply.Cancelled
+		return d
+	}
+	cancelledTargets := func(n int) presentation.Apply {
+		ops := make([]presentation.Operation, n)
+		for i := range ops {
+			ops[i] = parallelTarget("primary", fmt.Sprintf("testapp-%03d", i+1), so.Cancelled)
+		}
+		model := presentation.Derive(ops)
+		require.Equal(t, state.Apply.Cancelled, model.State)
+		return model
+	}
+	midCopy := TableProgressData{Status: state.Task.Cancelled, Started: true, RowsCopied: 400, RowsTotal: 1000}
+	queued := TableProgressData{Status: state.Task.Pending}
+
+	t.Run("targets stopped mid-copy", func(t *testing.T) {
+		out := renderTargets(cancelledTargets(4),
+			trips("testapp_001", midCopy),
+			trips("testapp_002", midCopy),
+			trips("testapp_003", queued),
+			trips("testapp_004", queued),
+		)
+		assert.Contains(t, out, "**`trips`**: ⊘ Cancelled on 2 of 4 targets · 2 not started\n", "%s", out)
+		assert.NotContains(t, out, "(not started)", "%s", out)
+	})
+	t.Run("a target that began without reporting rows", func(t *testing.T) {
+		out := renderTargets(cancelledTargets(2),
+			trips("testapp_001", TableProgressData{Status: state.Task.Cancelled, Started: true}),
+			trips("testapp_002", TableProgressData{Status: state.Task.Cancelled}),
+		)
+		assert.Contains(t, out, "**`trips`**: ⊘ Cancelled on 1 of 2 targets · 1 not started\n", "%s", out)
+	})
+	t.Run("some targets completed first", func(t *testing.T) {
+		out := renderTargets(cancelledTargets(3),
+			trips("testapp_001", TableProgressData{Status: state.Task.Completed, Started: true, RowsCopied: 1000, RowsTotal: 1000}),
+			trips("testapp_002", midCopy),
+			trips("testapp_003", queued),
+		)
+		assert.Contains(t, out, "**`trips`**: ⊘ Cancelled on 1 of 3 targets · 1 complete, 1 not started\n", "%s", out)
+	})
+	t.Run("no target began it", func(t *testing.T) {
+		out := renderTargets(cancelledTargets(2),
+			trips("testapp_001", TableProgressData{Status: state.Task.Cancelled}),
+			trips("testapp_002", queued),
+		)
+		assert.Contains(t, out, "**`trips`**: ⊘ Cancelled (not started)\n", "%s", out)
+	})
+	// A failure cancels only the tasks queued behind it on its own target, so
+	// while the rollout runs on, a target that was not cancelled is still
+	// queued to run the table.
+	t.Run("a target still to run stays queued until the rollout settles", func(t *testing.T) {
+		model := presentation.Derive([]presentation.Operation{
+			parallelTarget("primary", "testapp-001", so.Completed),
+			parallelTarget("primary", "testapp-002", so.Failed),
+			parallelTarget("primary", "testapp-003", so.Running),
+		})
+		require.False(t, model.RolloutSettled(model.Groups()[0]), "testapp-003 is still running")
+		out := renderTargets(model,
+			trips("testapp_001", TableProgressData{Status: state.Task.Completed, Started: true, RowsCopied: 1000, RowsTotal: 1000}),
+			trips("testapp_002", TableProgressData{Status: state.Task.Cancelled}),
+			trips("testapp_003", queued),
+		)
+		assert.Contains(t, out, "**`trips`**: ⊘ Cancelled · 1 complete, 1 queued, 1 not started\n", "%s", out)
+	})
+}
+
 // A settled rollout of `orders` and `docks` across two targets, where only
 // testapp-001 changes `docks`: each completed table line counts the targets
 // that ran it, singular for the table one target ran and plural for the table

@@ -276,6 +276,9 @@ func rankTargetTableLines(lines []targetTableLine) {
 // queued.
 func writeTargetTableLine(sb *strings.Builder, table string, cells []TableProgressData, strip []ShardProgressData, settled bool, budget *ddlBlockBudget, writeDDL func()) {
 	var done, queued, failed, retrying, reporting, unreported, estimated int
+	// cancelled counts the targets a cancel stopped part-way through the
+	// table, and unbegun the ones it reached before they began it.
+	var cancelled, unbegun int
 	var copied, total, planned, eta int64
 	var running int
 	for _, c := range cells {
@@ -296,7 +299,14 @@ func writeTargetTableLine(sb *strings.Builder, table string, cells []TableProgre
 		case state.Task.FailedRetryable:
 			retrying++
 			continue
-		case state.Task.Stopped, state.Task.Cancelled, state.Task.Reverted:
+		case state.Task.Stopped, state.Task.Reverted:
+			continue
+		case state.Task.Cancelled:
+			if tableBegan(c) {
+				cancelled++
+			} else {
+				unbegun++
+			}
 			continue
 		case state.Task.Running:
 			running++
@@ -386,12 +396,12 @@ func writeTargetTableLine(sb *strings.Builder, table string, cells []TableProgre
 		// No target ran the table, so there is nothing to count.
 		phrase, coverage = "⊘ Not started", ""
 	}
-	if status == state.Task.Cancelled && done > 0 {
-		// The pure-cancelled parenthetical ("not started") would be false:
-		// the change is live on the completed targets.
-		phrase = "⊘ Cancelled"
-	}
 	lists := listsTargets(strip)
+	if status == state.Task.Cancelled {
+		phrase, coverage = cancelledTargetsLine(cancelledTargets{
+			done: done, cancelled: cancelled, unbegun: unbegun, pending: pending, targets: len(cells),
+		}, settled, lists)
+	}
 	if lists {
 		// The list counts the targets, so the headline does not repeat them.
 		coverage = ""
@@ -406,6 +416,48 @@ func writeTargetTableLine(sb *strings.Builder, table string, cells []TableProgre
 	if lists {
 		writeMemberList(sb, presentation.TargetNoun, strip, pendingWord, budget)
 	}
+}
+
+// cancelledTargets counts where a table stands on each of its targets when
+// the cancel reached it: done completed it first, cancelled were stopped
+// part-way through it, unbegun were cancelled before they began it, and
+// pending have not begun it and were not cancelled.
+type cancelledTargets struct {
+	done, cancelled, unbegun, pending, targets int
+}
+
+// cancelledTargetsLine is the phrase and coverage of a table line whose
+// rolled-up status is cancelled. The line says the table was not started only
+// when no target began it and none is still to run it; otherwise it counts the
+// targets the cancel stopped, unless the list under the line names them.
+//
+// A target that was not cancelled can still be queued to run the table: a
+// failure cancels only the tasks queued behind it on its own target, and the
+// other targets carry on. Until the rollout settles those targets are counted
+// as queued, apart from the ones that will never begin the table.
+func cancelledTargetsLine(t cancelledTargets, settled, lists bool) (string, string) {
+	notStarted, queued := t.unbegun, 0
+	if settled {
+		notStarted += t.pending
+	} else {
+		queued = t.pending
+	}
+	if t.done == 0 && t.cancelled == 0 && queued == 0 {
+		return shardedTableStatusPhrase(state.Task.Cancelled), ""
+	}
+	phrase := "⊘ Cancelled"
+	if t.cancelled > 0 && !lists {
+		phrase += fmt.Sprintf(" on %d of %d targets", t.cancelled, t.targets)
+	}
+	coverage := presentation.TargetCoverage(t.done, 0, queued, 0, 0, presentation.PendingQueued)
+	if notStarted > 0 {
+		separator := ", "
+		if coverage == "" {
+			separator = " · "
+		}
+		coverage += fmt.Sprintf("%s%d %s", separator, notStarted, presentation.PendingNotStarted)
+	}
+	return phrase, coverage
 }
 
 // keepsTargetProgressBar reports whether a table line across a rollout's

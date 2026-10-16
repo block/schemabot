@@ -48,6 +48,9 @@ type TableProgressData struct {
 	Throttled      bool
 	ThrottleReason string
 	IsInstant      bool
+	// Started reports that the engine began the table's change: its task
+	// left the queue, whether or not it reported rows before it settled.
+	Started bool
 
 	// ErrorMessage is the task's last error. Rendered for states where the
 	// per-table error explains what the user is seeing (e.g. a retrying or
@@ -1125,7 +1128,7 @@ func renderTableProgress(sb *strings.Builder, dialect schema.Dialect, table Tabl
 		}
 
 	case state.Task.Cancelled:
-		fmt.Fprintf(sb, "**%s**: 🚫 Cancelled (not started)\n", inlineCode(table.TableName))
+		fmt.Fprintf(sb, "**%s**: 🚫 %s\n", inlineCode(table.TableName), cancelledTablePhrase(table))
 		writeDDLLine(sb, dialect, table.DDL, budget)
 
 	case state.Task.RevertWindow:
@@ -1257,6 +1260,31 @@ func writeThrottleTooltip(sb *strings.Builder, table TableProgressData) {
 		return
 	}
 	fmt.Fprintf(sb, "- "+glyph.Info+" _Throttled: %s_\n", escapeInlineMarkdown(table.ThrottleReason))
+}
+
+// tableBegan reports whether the engine began a table's change before it
+// settled. A table with rows copied began even where the data carries no
+// start signal of its own.
+func tableBegan(table TableProgressData) bool {
+	return table.Started || copiedRows(table)
+}
+
+// copiedRows reports whether a table's row copy made any progress.
+func copiedRows(table TableProgressData) bool {
+	return table.PercentComplete > 0 || table.RowsCopied > 0
+}
+
+// cancelledTablePhrase is a cancelled table's state: how far its row copy
+// had come when the cancel stopped it, or that it was never started.
+func cancelledTablePhrase(table TableProgressData) string {
+	switch {
+	case copiedRows(table):
+		return "Cancelled at " + ui.FormatRowCopyPercent(table.PercentComplete, table.RowsCopied, table.RowsTotal)
+	case tableBegan(table):
+		return "Cancelled"
+	default:
+		return "Cancelled (not started)"
+	}
 }
 
 func recoveringIsCopyingRows(table TableProgressData) bool {
@@ -1916,7 +1944,11 @@ func writeSummaryTableEntry(sb *strings.Builder, dialect schema.Dialect, t Table
 	case "reverted":
 		fmt.Fprintf(sb, "**%s** — Reverted\n", inlineCode(t.TableName))
 	case state.Task.Cancelled:
-		fmt.Fprintf(sb, "**%s** — Cancelled\n", inlineCode(t.TableName))
+		label := "Cancelled"
+		if copiedRows(t) {
+			label = fmt.Sprintf("Cancelled at %s", ui.FormatRowCopyPercent(t.PercentComplete, t.RowsCopied, t.RowsTotal))
+		}
+		fmt.Fprintf(sb, "**%s** — %s\n", inlineCode(t.TableName), label)
 	default:
 		// Unknown or in-flight statuses still get a visible label — a bare
 		// table name reads as success, which is wrong for anything but
