@@ -70,7 +70,7 @@ var errApprovalNotComparable = errors.New("an approval on an earlier commit cann
 // evaluation-failure comment on durable attempts, where the driver retries
 // and posts the single terminal answer instead; blocks always comment.
 func (h *Handler) enforceReviewGate(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, installationID int64, schemaResult *ghclient.SchemaRequestResult, environment, requestedBy, commandName string, suppressRetryComments bool) (blocked bool, err error) {
-	gateResult, err := h.checkReviewGate(ctx, client, repo, pr, schemaResult)
+	gateResult, err := h.checkReviewGate(ctx, client, repo, pr, environment, schemaResult)
 	if err != nil {
 		h.logger.Error("review gate check failed", "repo", repo, "pr", pr,
 			"database", schemaResult.Database, "environment", environment,
@@ -119,6 +119,8 @@ func reviewGateErrorDetail(err error) string {
 // Returns nil if review gating is disabled (apply proceeds).
 // Returns a result with Approved=true if gate passes.
 // Returns a result with Approved=false if gate blocks.
+// environment is the one the command targets; a PostgreSQL schema file
+// comparison runs on its primary target.
 // schema identifies the database and where its schema inputs live: the schema
 // directory, the environment symlink it was resolved through (if any), and the
 // config file. schema.HeadSHA is the commit the schema files being applied
@@ -132,7 +134,7 @@ func reviewGateErrorDetail(err error) string {
 // An approval on an earlier commit that cannot be compared with HeadSHA at all
 // does not count; it is recorded in UncomparedApprovers so the comment can say
 // why it was not counted.
-func (h *Handler) checkReviewGate(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, schema *ghclient.SchemaRequestResult) (*ReviewGateResult, error) {
+func (h *Handler) checkReviewGate(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, environment string, schema *ghclient.SchemaRequestResult) (*ReviewGateResult, error) {
 	if !h.isReviewGateEnabled(repo, schema.Database) {
 		return nil, nil
 	}
@@ -201,7 +203,7 @@ func (h *Handler) checkReviewGate(ctx context.Context, client *ghclient.Installa
 		defaultBranch:     prInfo.DefaultBranch,
 		headSHA:           headSHA,
 		inputPaths:        reviewGateInputPaths(schema),
-		compareStatements: statementComparerFor(schema.Type),
+		compareStatements: h.statementComparerFor(repo, pr, database, environment, schema.Type),
 		verdicts:          make(map[string]approvalVerdict),
 	}
 	var changedApprovers, uncomparedApprovers []string
@@ -297,15 +299,31 @@ type approvalCoverage struct {
 }
 
 // statementComparerFor returns the statement comparison for a database
-// type's schema files. MySQL-family files hold one CREATE TABLE each, which
-// ddl.SameTableChange compares. Every other dialect returns nil, so its
-// files are compared by content alone and a file both the PR and the base
-// branch edited always counts as changed.
-func statementComparerFor(databaseType string) ghclient.SchemaFileChangeComparer {
-	if schemadialect.DialectForDatabaseType(databaseType) == schemadialect.DialectMySQL {
-		return ddl.SameTableChange
+// type's schema files, or nil when the dialect has none, so its files are
+// compared by content alone and a file both the PR and the base branch edited
+// always counts as changed.
+//
+// MySQL-family files hold one CREATE TABLE each, which ddl.SameTableChange
+// compares from the files alone. PostgreSQL has no offline model of a schema
+// file, so the environment's primary target runs each version on a scratch
+// schema and compares what it built (see targetStatementComparer); a target
+// that cannot answer within the evaluation's budget leaves the file changed.
+func (h *Handler) statementComparerFor(repo string, pr int, database, environment, databaseType string) ghclient.SchemaFileChangeComparer {
+	switch schemadialect.DialectForDatabaseType(databaseType) {
+	case schemadialect.DialectMySQL:
+		return func(_ context.Context, approvedBase, approved, headBase, head string) (bool, string, error) {
+			return ddl.SameTableChange(approvedBase, approved, headBase, head)
+		}
+	case schemadialect.DialectPostgres:
+		if h.service == nil {
+			h.logger.Warn("review gate: no service is wired, so PostgreSQL schema files both the PR and the base branch edited will count as changed",
+				"repo", repo, "pr", pr, "database", database, "environment", environment)
+			return nil
+		}
+		return h.newTargetStatementComparer(repo, pr, database, environment).compare
+	default:
+		return nil
 	}
-	return nil
 }
 
 // approvalCoversHead decides whether an approval still stands for the PR head.
