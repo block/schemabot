@@ -215,6 +215,13 @@ type Service struct {
 	heldOperationClaimsMu       sync.Mutex
 	heldOperationClaims         map[int64]heldOperationClaim
 	heldOperationClaimsDraining bool
+	// resumeObservers names the resumed rollouts this process has already
+	// given a progress comment observer, keyed by apply id, so later claims of
+	// the same rollout here do not attach another. It narrows the durable
+	// signal, the stop's summary comment that stays unconsumed until an
+	// observer rotates it, to one attach per process.
+	resumeObserversMu sync.Mutex
+	resumeObservers   map[int64]bool
 
 	remoteHealthMu       sync.Mutex
 	remoteHealthCancel   context.CancelFunc
