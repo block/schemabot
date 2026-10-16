@@ -474,15 +474,80 @@ func TestRenderRollbackRejectedRedactsEndpoints(t *testing.T) {
 }
 
 // A rollback of an apply that ran on 4 targets, each planned against its own
-// schema, is refused. The comment names the remedy the PR already holds:
-// revert the change in its schema files and apply again.
+// schema, is refused. The comment names where schema files without the change
+// can be applied from, which depends on the PR: an open PR reverts the change
+// and toggles a nonce so its directory is still planned, a merged one needs a
+// reverting PR, and a closed one needs a PR that plans the default branch,
+// which never had the change. A PR whose state could not be read gets wording
+// true for every state. Targets the environment no longer routes to are named,
+// since the apply that undoes the change would not reach them.
 func TestRenderRollbackOfRolloutUnsupported(t *testing.T) {
-	out := RenderRollbackOfRolloutUnsupported("staging", "apply-a1b2c3d4e5f6", 4, "")
+	data := RollbackOfRolloutUnsupportedData{
+		Environment:       "staging",
+		ApplyID:           "apply-a1b2c3d4e5f6",
+		Targets:           4,
+		PlannedOnTheirOwn: true,
+		RoutingChecked:    true,
+		PR:                PRStateOpen,
+	}
 	assert.Equal(t, "## Rollback Not Supported — Staging\n\n"+
 		"`apply-a1b2c3d4e5f6` ran on 4 targets, each planned against its own schema, and a rollback runs one plan.\n\n"+
-		"To undo it, revert the change in this PR's schema files, then run:\n"+
-		"```\nschemabot apply -e staging\n```\n", out)
+		"To undo it, revert the change in this PR's schema files and add or toggle a `# nonce` comment line in the database's `schemabot.yaml` so the directory is still planned. Push, then run:\n"+
+		"```\nschemabot apply -e staging\n```\n", RenderRollbackOfRolloutUnsupported(data))
 
-	withTenant := RenderRollbackOfRolloutUnsupported("production", "apply-a1b2c3d4e5f6", 4, "payments")
-	assert.Contains(t, withTenant, "```\nschemabot apply -e production --tenant payments\n```\n")
+	t.Run("merged PR", func(t *testing.T) {
+		merged := data
+		merged.PR = PRStateMerged
+		out := RenderRollbackOfRolloutUnsupported(merged)
+		assert.Contains(t, out, "To undo it, open a PR that reverts the change in the schema files, then run there:\n```\nschemabot apply -e staging\n```\n")
+		assert.NotContains(t, out, "this PR's schema files")
+		assert.NotContains(t, out, "nonce")
+	})
+
+	t.Run("closed PR", func(t *testing.T) {
+		closed := data
+		closed.PR = PRStateClosed
+		out := RenderRollbackOfRolloutUnsupported(closed)
+		assert.Contains(t, out, "To undo it, open a PR that only adds or toggles a `# nonce` comment line in the database's `schemabot.yaml`. The default branch never had this change, so that PR's plan reverts it. Then run there:\n")
+		assert.NotContains(t, out, "this PR's schema files")
+	})
+
+	t.Run("PR state unknown", func(t *testing.T) {
+		unknown := data
+		unknown.PR = PRStateUnknown
+		out := RenderRollbackOfRolloutUnsupported(unknown)
+		assert.Contains(t, out, "revert it in this PR if the PR is open, and add or toggle a `# nonce` comment line in the database's `schemabot.yaml` so the directory is still planned, or revert it in a new PR if this one merged. Then run:\n")
+	})
+
+	t.Run("targets no longer routed", func(t *testing.T) {
+		unrouted := data
+		unrouted.Unrouted = []string{"default/payments-002", "default/payments-003"}
+		out := RenderRollbackOfRolloutUnsupported(unrouted)
+		assert.Contains(t, out, "`default/payments-002` and `default/payments-003` are no longer routed in this environment, so an apply would not reach them. Add them back to the server config first.\n\n")
+
+		unrouted.Unrouted = []string{"default/payments-002"}
+		assert.Contains(t, RenderRollbackOfRolloutUnsupported(unrouted), "`default/payments-002` is no longer routed in this environment, so an apply would not reach it. Add it back to the server config first.\n\n")
+	})
+
+	t.Run("routing not compared", func(t *testing.T) {
+		unchecked := data
+		unchecked.RoutingChecked = false
+		assert.Contains(t, RenderRollbackOfRolloutUnsupported(unchecked), "An apply reaches only the targets this environment routes to now, so add back any target it ran on that is no longer routed.\n\n")
+	})
+
+	t.Run("one plan, since configured to plan each target on its own", func(t *testing.T) {
+		switched := data
+		switched.PlannedOnTheirOwn = false
+		switched.Targets = 2
+		out := RenderRollbackOfRolloutUnsupported(switched)
+		assert.Contains(t, out, "`apply-a1b2c3d4e5f6` ran one plan, and this environment's 2 targets are now each planned against their own schema. A rollback runs one plan.\n\n")
+		assert.NotContains(t, out, "each planned against its own schema, and")
+	})
+
+	t.Run("tenant", func(t *testing.T) {
+		withTenant := data
+		withTenant.Environment = "production"
+		withTenant.Tenant = "payments"
+		assert.Contains(t, RenderRollbackOfRolloutUnsupported(withTenant), "```\nschemabot apply -e production --tenant payments\n```\n")
+	})
 }

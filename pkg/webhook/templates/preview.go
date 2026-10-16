@@ -3466,7 +3466,14 @@ func PreviewCommentRollbackStatus() string {
 // rollback whose apply ran across a rollout of targets each planned against
 // its own schema.
 func PreviewCommentRollbackOfRolloutUnsupported() string {
-	return RenderRollbackOfRolloutUnsupported("staging", "apply-a1b2c3d4e5f6", 4, "")
+	return RenderRollbackOfRolloutUnsupported(RollbackOfRolloutUnsupportedData{
+		Environment:       "staging",
+		ApplyID:           "apply-a1b2c3d4e5f6",
+		Targets:           4,
+		PlannedOnTheirOwn: true,
+		RoutingChecked:    true,
+		PR:                PRStateOpen,
+	})
 }
 
 func PreviewCommentRollbackSummaryCompleted() string {

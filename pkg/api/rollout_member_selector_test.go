@@ -644,6 +644,9 @@ func (s *rollbackRoundPlanStore) List(_ context.Context, opts storage.ListPlansO
 // one plan everywhere, and rolls back unless the environment has since been
 // respelled as targets planned on their own, which apply creation could not
 // pair with one plan either. A single-target environment rolls back as before.
+// A refusal of an apply that ran each target from its own plan names the
+// targets the environment no longer routes to, since the apply that undoes it
+// reaches only the routed ones.
 func TestExecuteRollbackPlan_RefusedForARolloutOfIndependentlyPlannedTargets(t *testing.T) {
 	source, apply := rollbackSourceApply(DefaultDeployment)
 	roundMember := func(target string) *storage.Plan {
@@ -667,10 +670,16 @@ func TestExecuteRollbackPlan_RefusedForARolloutOfIndependentlyPlannedTargets(t *
 		// wantTargets is the target count a refused rollback reports to a
 		// caller that names its own remedy; zero when it is not refused.
 		wantTargets int
+		// wantRoutingChecked and wantUnrouted are what a refusal of an apply
+		// that ran each target from its own plan reports about the targets
+		// the environment no longer routes to.
+		wantRoutingChecked bool
+		wantUnrouted       []string
 	}{
 		{
 			name: "three targets planned on their own", env: targetsEnv("payments-001", "payments-002", "payments-003"),
 			round: independentRound, wantErr: plannedOnTheirOwn, wantCode: http.StatusConflict, wantTargets: 3,
+			wantRoutingChecked: true,
 		},
 		{
 			name: "three targets planned on their own, since respelled as mirrored deployments",
@@ -679,10 +688,12 @@ func TestExecuteRollbackPlan_RefusedForARolloutOfIndependentlyPlannedTargets(t *
 				DeploymentOrder: []string{DefaultDeployment, "us"},
 			},
 			round: independentRound, wantErr: plannedOnTheirOwn, wantCode: http.StatusConflict, wantTargets: 3,
+			wantRoutingChecked: true, wantUnrouted: []string{DefaultDeployment + "/payments-002", DefaultDeployment + "/payments-003"},
 		},
 		{
 			name: "three targets planned on their own, since cut to the primary", env: targetsEnv("payments-001"),
 			round: independentRound, wantErr: plannedOnTheirOwn, wantCode: http.StatusConflict, wantTargets: 3,
+			wantRoutingChecked: true, wantUnrouted: []string{DefaultDeployment + "/payments-002", DefaultDeployment + "/payments-003"},
 		},
 		{
 			name: "one plan across the rollout, since respelled as targets planned on their own", env: targetsEnv("payments-001", "payments-002"),
@@ -723,6 +734,9 @@ func TestExecuteRollbackPlan_RefusedForARolloutOfIndependentlyPlannedTargets(t *
 				require.ErrorAs(t, err, &unsupported, "a refused rollout rollback must be readable as its own error")
 				assert.Equal(t, "apply-rollout", unsupported.ApplyID)
 				assert.Equal(t, tc.wantTargets, unsupported.Targets)
+				assert.Equal(t, tc.round != nil, unsupported.PlannedOnTheirOwn, "only an apply whose round planned each target on its own ran them from their own plans")
+				assert.Equal(t, tc.wantRoutingChecked, unsupported.RoutingChecked)
+				assert.Equal(t, tc.wantUnrouted, unsupported.Unrouted)
 			} else {
 				assert.NotErrorAs(t, err, &unsupported, "a failure to read the round is not a refusal")
 			}

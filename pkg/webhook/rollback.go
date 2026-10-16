@@ -261,7 +261,17 @@ func (h *Handler) rollbackCommandCore(parent context.Context, repo string, pr in
 	// schema. The lock is already held and the source apply was revalidated
 	// after lock acquisition, so the plan can be pinned for confirmation.
 	planResp, err := h.service.ExecuteRollbackPlanForApply(ctx, apply)
-	if comment, refused := rolloutRollbackRefusalComment(err, environment, h.deploymentTenant()); refused {
+	if unsupported, refused := asRolloutRollbackUnsupported(err); refused {
+		comment := templates.RenderRollbackOfRolloutUnsupported(templates.RollbackOfRolloutUnsupportedData{
+			Environment:       environment,
+			ApplyID:           unsupported.ApplyID,
+			Targets:           unsupported.Targets,
+			PlannedOnTheirOwn: unsupported.PlannedOnTheirOwn,
+			RoutingChecked:    unsupported.RoutingChecked,
+			Unrouted:          unsupported.Unrouted,
+			PR:                h.prStateForRemedy(ctx, repo, pr, installationID, environment, applyID),
+			Tenant:            h.deploymentTenant(),
+		})
 		releaseErr := h.releaseRollbackLockAfterRejectedPlan(ctx, database, dbType, lockOwner, lockAcquiredByCommand)
 		h.logRollbackLockReleaseFailure(repo, pr, database, dbType, lockOwner, releaseErr)
 		h.logger.Warn("rollback refused: the apply's rollout plans each target against its own schema; the PR comment names reverting the PR's schema files and applying again",
@@ -457,17 +467,44 @@ func (h *Handler) postRollbackTerminalInvariant(logMsg, repo string, pr int, ins
 	h.postCommandError(repo, pr, installationID, action.Rollback, environment, requestedBy, err.Error())
 }
 
-// rolloutRollbackRefusalComment is the comment for a rollback refused because
-// the apply's rollout plans each target against its own schema, and whether
-// err is that refusal. The refusal is the command's answer, not a failure: in
-// a PR the remedy is the PR's own schema files, which the comment names in
-// place of the API's message.
-func rolloutRollbackRefusalComment(err error, environment, tenant string) (string, bool) {
+// asRolloutRollbackUnsupported reports whether err is a rollback refused
+// because the apply's rollout plans each target against its own schema. The
+// refusal is the command's answer, not a failure: in a PR the remedy is an
+// apply of schema files without the change, which the comment names in place
+// of the API's message.
+func asRolloutRollbackUnsupported(err error) (*api.RolloutRollbackUnsupportedError, bool) {
 	var unsupported *api.RolloutRollbackUnsupportedError
 	if !errors.As(err, &unsupported) {
-		return "", false
+		return nil, false
 	}
-	return templates.RenderRollbackOfRolloutUnsupported(environment, unsupported.ApplyID, unsupported.Targets, tenant), true
+	return unsupported, true
+}
+
+// prStateForRemedy reads whether the PR is open, closed or merged, which
+// decides where a remedy's schema files can be applied from. A failed read is
+// logged and returns PRStateUnknown, and the comment words its remedy so it
+// holds for every state.
+func (h *Handler) prStateForRemedy(ctx context.Context, repo string, pr int, installationID int64, environment, applyID string) templates.PRState {
+	client, err := h.clientForRepo(repo, installationID)
+	if err != nil {
+		h.logger.Warn("could not create a GitHub client to read the PR state for the rollback remedy; the comment names the remedy for every PR state",
+			"repo", repo, "pr", pr, "environment", environment, "apply_id", applyID, "error", err)
+		return templates.PRStateUnknown
+	}
+	prInfo, err := client.FetchPullRequestNoCache(ctx, repo, pr)
+	if err != nil {
+		h.logger.Warn("could not read the PR state to name the rollback remedy; the comment names the remedy for every PR state",
+			"repo", repo, "pr", pr, "environment", environment, "apply_id", applyID, "error", err)
+		return templates.PRStateUnknown
+	}
+	switch {
+	case prInfo.Merged:
+		return templates.PRStateMerged
+	case prInfo.IsClosed():
+		return templates.PRStateClosed
+	default:
+		return templates.PRStateOpen
+	}
 }
 
 func (h *Handler) postRollbackRejected(repo string, pr int, installationID int64, apply *storage.Apply, applyID, environment, database, reason string) {

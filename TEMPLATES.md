@@ -7059,7 +7059,7 @@ ALTER TABLE `users` DROP INDEX `idx_email`;
 
 `apply-a1b2c3d4e5f6` ran on 4 targets, each planned against its own schema, and a rollback runs one plan.
 
-To undo it, revert the change in this PR's schema files, then run:
+To undo it, revert the change in this PR's schema files and add or toggle a `# nonce` comment line in the database's `schemabot.yaml` so the directory is still planned. Push, then run:
 ```
 schemabot apply -e staging
 ```

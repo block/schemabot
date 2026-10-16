@@ -225,19 +225,99 @@ func RenderRollbackBlockedByLock(database, environment, lockOwner, lockRepo stri
 		database, environment, caller.Short(lockOwner)))
 }
 
+// PRState is what a lookup found about the pull request a command came from.
+// The zero value is a lookup that did not succeed.
+type PRState int
+
+const (
+	PRStateUnknown PRState = iota
+	PRStateOpen
+	PRStateClosed
+	PRStateMerged
+)
+
+// RollbackOfRolloutUnsupportedData is what the refused-rollout-rollback comment
+// renders from.
+type RollbackOfRolloutUnsupportedData struct {
+	Environment string
+	ApplyID     string
+	// Targets is how many targets the refusal counted: the ones the apply ran
+	// on when PlannedOnTheirOwn, otherwise the environment's targets now.
+	Targets int
+	// PlannedOnTheirOwn is set when the apply ran each target from a plan of
+	// its own; unset, it ran one plan and the environment has since been
+	// configured to plan each target on its own.
+	PlannedOnTheirOwn bool
+	// RoutingChecked is set when the apply's targets were compared with the
+	// environment's routing now; Unrouted lists the ones no longer routed.
+	RoutingChecked bool
+	Unrouted       []string
+	// PR is the state of the PR the rollback was commented on.
+	PR PRState
+	// Tenant is the deployment's own tenant; when set, the apply command
+	// carries it.
+	Tenant string
+}
+
 // RenderRollbackOfRolloutUnsupported renders the message posted when a
-// rollback is refused because the apply's rollout planned each of its targets
-// against its own schema, and a rollback is one plan. The PR's own schema
-// files are what undo the change on every target: reverting the change there
-// and applying again plans each target on its own. Tenant is the deployment's
-// own tenant; when set, the apply command carries it.
-func RenderRollbackOfRolloutUnsupported(environment, applyID string, targets int, tenant string) string {
+// rollback is refused because the apply's rollout plans each of its targets
+// against its own schema, and a rollback is one plan. What undoes the change on
+// every target is an apply of schema files without it, and where those files
+// can be applied from depends on the PR: an open PR reverts the change itself,
+// a merged one needs a PR that reverts it, and a closed one needs a PR that
+// plans the default branch, which never had it. A PR whose revert leaves its
+// schema files equal to the default branch changes no schema file, so it is
+// planned only once its schemabot.yaml changes too.
+func RenderRollbackOfRolloutUnsupported(data RollbackOfRolloutUnsupportedData) string {
 	var sb strings.Builder
-	writeEnvironmentTitle(&sb, "Rollback Not Supported", environment)
-	fmt.Fprintf(&sb, "`%s` ran on %d targets, each planned against its own schema, and a rollback runs one plan.\n\n", applyID, targets)
-	sb.WriteString("To undo it, revert the change in this PR's schema files, then run:\n")
-	fmt.Fprintf(&sb, "```\n%s\n```\n", appendTenantFlag(fmt.Sprintf("schemabot apply -e %s", environment), tenant))
+	writeEnvironmentTitle(&sb, "Rollback Not Supported", data.Environment)
+	if data.PlannedOnTheirOwn {
+		fmt.Fprintf(&sb, "`%s` ran on %d targets, each planned against its own schema, and a rollback runs one plan.\n\n", data.ApplyID, data.Targets)
+	} else {
+		fmt.Fprintf(&sb, "`%s` ran one plan, and this environment's %d targets are now each planned against their own schema. A rollback runs one plan.\n\n", data.ApplyID, data.Targets)
+	}
+
+	switch {
+	case data.RoutingChecked && len(data.Unrouted) > 0:
+		fmt.Fprintf(&sb, "%s no longer routed in this environment, so an apply would not reach %s. Add %s back to the server config first.\n\n",
+			unroutedTargetsPhrase(data.Unrouted), pronoun(len(data.Unrouted), "it", "them"), pronoun(len(data.Unrouted), "it", "them"))
+	case !data.RoutingChecked:
+		sb.WriteString("An apply reaches only the targets this environment routes to now, so add back any target it ran on that is no longer routed.\n\n")
+	}
+
+	const nonce = "add or toggle a `# nonce` comment line in the database's `schemabot.yaml`"
+	switch data.PR {
+	case PRStateOpen:
+		fmt.Fprintf(&sb, "To undo it, revert the change in this PR's schema files and %s so the directory is still planned. Push, then run:\n", nonce)
+	case PRStateMerged:
+		sb.WriteString("To undo it, open a PR that reverts the change in the schema files, then run there:\n")
+	case PRStateClosed:
+		sb.WriteString("To undo it, open a PR that only adds or toggles a `# nonce` comment line in the database's `schemabot.yaml`. The default branch never had this change, so that PR's plan reverts it. Then run there:\n")
+	default:
+		fmt.Fprintf(&sb, "To undo it, apply schema files without the change: revert it in this PR if the PR is open, and %s so the directory is still planned, or revert it in a new PR if this one merged. Then run:\n", nonce)
+	}
+	fmt.Fprintf(&sb, "```\n%s\n```\n", appendTenantFlag(fmt.Sprintf("schemabot apply -e %s", data.Environment), data.Tenant))
 	return sb.String()
+}
+
+// unroutedTargetsPhrase names the targets an environment no longer routes to,
+// as the subject of a sentence.
+func unroutedTargetsPhrase(targets []string) string {
+	quoted := make([]string, len(targets))
+	for i, target := range targets {
+		quoted[i] = "`" + target + "`"
+	}
+	if len(quoted) == 1 {
+		return quoted[0] + " is"
+	}
+	return strings.Join(quoted[:len(quoted)-1], ", ") + " and " + quoted[len(quoted)-1] + " are"
+}
+
+func pronoun(n int, one, many string) string {
+	if n == 1 {
+		return one
+	}
+	return many
 }
 
 // RenderRollbackNothingToDo renders the message posted when a rollback plan

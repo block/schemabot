@@ -2,10 +2,12 @@ package webhook
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"testing"
 
+	gh "github.com/google/go-github/v86/github"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	grpccodes "google.golang.org/grpc/codes"
@@ -825,33 +827,67 @@ func TestRollbackCommandCoreTerminalDispositions(t *testing.T) {
 	// their own schema, and a rollback is one plan. The refusal is the
 	// command's answer, and in a PR it names the remedy the PR already holds:
 	// revert its schema files and apply again.
-	t.Run("rollback of a rollout planned per target is refused with the PR remedy", func(t *testing.T) {
-		client, mux := setupGitHubServer(t)
-		comments := recordComments(t, mux)
-		lockStore := &rollbackTestLockStore{}
-		st := remotePlanRollbackStorage(lockStore)
-		st.plans = &rollbackRoundPlanStore{
-			rollbackTestPlanStore: st.plans.(*rollbackTestPlanStore),
-			members: []*storage.Plan{
-				{PlanIdentifier: "plan-member-b", Deployment: "tenant-a", Target: "orders-staging-b"},
-				{PlanIdentifier: "plan-member-c", Deployment: "tenant-a", Target: "orders-staging-c"},
-				{PlanIdentifier: "plan-member-d", Deployment: "tenant-a", Target: "orders-staging-d"},
-			},
-		}
-		h := unlockTestHandler(t, st, ghclient.NewInstallationClient(client, testLogger()))
+	// The remedy is an apply of schema files without the change, and where
+	// those files can be applied from depends on the PR, so the comment reads
+	// its state: an open PR reverts the change itself, a merged one needs a
+	// reverting PR, a closed one a PR that plans the default branch. A state
+	// that cannot be read gets the wording that holds for all of them.
+	for _, tc := range []struct {
+		name     string
+		serve    func(mux *http.ServeMux)
+		wantText string
+	}{
+		{
+			name:     "open PR",
+			serve:    func(mux *http.ServeMux) { servePullRequestState(mux, "open", false) },
+			wantText: "To undo it, revert the change in this PR's schema files and add or toggle a `# nonce` comment line",
+		},
+		{
+			name:     "merged PR",
+			serve:    func(mux *http.ServeMux) { servePullRequestState(mux, "closed", true) },
+			wantText: "To undo it, open a PR that reverts the change in the schema files, then run there:",
+		},
+		{
+			name:     "closed PR",
+			serve:    func(mux *http.ServeMux) { servePullRequestState(mux, "closed", false) },
+			wantText: "To undo it, open a PR that only adds or toggles a `# nonce` comment line",
+		},
+		{
+			name:     "PR state unreadable",
+			serve:    func(*http.ServeMux) {},
+			wantText: "revert it in this PR if the PR is open",
+		},
+	} {
+		t.Run("rollback of a rollout planned per target is refused with the remedy, "+tc.name, func(t *testing.T) {
+			client, mux := setupGitHubServer(t)
+			comments := recordComments(t, mux)
+			tc.serve(mux)
+			lockStore := &rollbackTestLockStore{}
+			st := remotePlanRollbackStorage(lockStore)
+			st.plans = &rollbackRoundPlanStore{
+				rollbackTestPlanStore: st.plans.(*rollbackTestPlanStore),
+				members: []*storage.Plan{
+					{PlanIdentifier: "plan-member-b", Deployment: "tenant-a", Target: "orders-staging-b"},
+					{PlanIdentifier: "plan-member-c", Deployment: "tenant-a", Target: "orders-staging-c"},
+					{PlanIdentifier: "plan-member-d", Deployment: "tenant-a", Target: "orders-staging-d"},
+				},
+			}
+			h := unlockTestHandler(t, st, ghclient.NewInstallationClient(client, testLogger()))
 
-		retry, err := h.rollbackCommandCore(t.Context(), "octocat/hello-world", 1, 12345, "testuser", rollbackCommand())
+			retry, err := h.rollbackCommandCore(t.Context(), "octocat/hello-world", 1, 12345, "testuser", rollbackCommand())
 
-		require.NoError(t, err)
-		assert.False(t, retry, "the refusal is deterministic for this apply; re-driving would refuse again")
-		assert.Equal(t, 1, lockStore.releaseCalls, "the command-acquired lock must be released after the refusal")
-		body := requireComment(t, comments, "rollout rollback refusal comment")
-		assert.Contains(t, body, "## Rollback Not Supported — Staging")
-		assert.Contains(t, body, "`apply-123` ran on 4 targets, each planned against its own schema")
-		assert.Contains(t, body, "```\nschemabot apply -e staging\n```")
-		assert.NotContains(t, body, "Rollback Failed")
-		assert.NotContains(t, body, "orders-staging", "the PR comment names the remedy, not the API's routing detail")
-	})
+			require.NoError(t, err)
+			assert.False(t, retry, "the refusal is deterministic for this apply; re-driving would refuse again")
+			assert.Equal(t, 1, lockStore.releaseCalls, "the command-acquired lock must be released after the refusal")
+			body := requireComment(t, comments, "rollout rollback refusal comment")
+			assert.Contains(t, body, "## Rollback Not Supported — Staging")
+			assert.Contains(t, body, "`apply-123` ran on 4 targets, each planned against its own schema")
+			assert.Contains(t, body, tc.wantText)
+			assert.Contains(t, body, "```\nschemabot apply -e staging\n```")
+			assert.NotContains(t, body, "Rollback Failed")
+			assert.NotContains(t, body, "rollback of such a rollout is not supported", "the PR comment names the remedy in its own terms, not the API's message")
+		})
+	}
 
 	t.Run("lock held by another PR is terminal", func(t *testing.T) {
 		client, mux := setupGitHubServer(t)
@@ -895,5 +931,14 @@ func TestRollbackCommandCoreTerminalDispositions(t *testing.T) {
 		assert.Zero(t, lockStore.acquireCalls, "a denied rollback must not acquire any lock")
 		body := requireComment(t, comments, "authorization denial comment")
 		assert.Contains(t, body, "SchemaBot Command Not Authorized")
+	})
+}
+
+// servePullRequestState serves PR #1 in the given GitHub state; a merged PR is
+// reported as closed with merged set.
+func servePullRequestState(mux *http.ServeMux, prState string, merged bool) {
+	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(gh.PullRequest{State: &prState, Merged: &merged})
 	})
 }
