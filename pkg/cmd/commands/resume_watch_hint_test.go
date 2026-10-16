@@ -1,6 +1,8 @@
 package commands
 
 import (
+	"bytes"
+	"log/slog"
 	"os/exec"
 	"strings"
 	"testing"
@@ -75,6 +77,24 @@ func TestGlobalsRouteFlags_NeverPrintsSecrets(t *testing.T) {
 		}
 	}
 	assert.Empty(t, (&Globals{Token: "bearer-secret"}).RouteFlags(), "a token alone selects no route")
+}
+
+// An endpoint that does not parse is left out of the hints, and the debug
+// line saying so does not quote it: the credentials it carries never reach a
+// log either.
+func TestGlobalsRouteFlags_UnparseableEndpointNeverLogged(t *testing.T) {
+	var logs bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+
+	g := Globals{Endpoint: "https://demo:example-password@example.invalid/%zz?token=example-token"}
+
+	assert.Empty(t, g.RouteFlags())
+	assert.Contains(t, logs.String(), "leaving an unparseable endpoint out of command hints")
+	for _, secret := range []string{"example-password", "example-token", "demo:", "example.invalid"} {
+		assert.NotContains(t, logs.String(), secret)
+	}
 }
 
 // The hint is only right if pasting it selects what the original command

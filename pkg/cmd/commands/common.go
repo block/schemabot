@@ -69,13 +69,14 @@ func (g *Globals) RouteFlags() []cliname.Flag {
 // endpointForHint is the endpoint as a hint may print it: scheme, host, and
 // path only. An endpoint that does not parse as a URL is left out rather than
 // printed, since there is no way to tell which part of it is a credential.
+// The parse error is not logged for the same reason: it quotes the endpoint.
 func endpointForHint(endpoint string) string {
 	if endpoint == "" {
 		return ""
 	}
 	u, err := url.Parse(endpoint)
 	if err != nil {
-		slog.Debug("leaving an unparseable endpoint out of command hints", "error", err)
+		slog.Debug("leaving an unparseable endpoint out of command hints")
 		return ""
 	}
 	u.User = nil
