@@ -1886,6 +1886,11 @@ func recentAppliesWhere(filter storage.RecentAppliesFilter) ([]string, []any) {
 		where = append(where, fmt.Sprintf("state NOT IN (%s)", placeholders(len(terminal))))
 		args = append(args, stringArgs(terminal)...)
 	}
+	if filter.FinishedOnly {
+		terminal := terminalApplyStates()
+		where = append(where, fmt.Sprintf("state IN (%s)", placeholders(len(terminal))))
+		args = append(args, stringArgs(terminal)...)
+	}
 	if !filter.UpdatedSince.IsZero() {
 		activity, activityArgs := recentAppliesLastActivity(filter)
 		where = append(where, activity+" >= ?")
@@ -1896,25 +1901,23 @@ func recentAppliesWhere(filter storage.RecentAppliesFilter) ([]string, []any) {
 }
 
 // recentAppliesLastActivity is the most recent activity on an apply, across the
-// apply row and its operation rows. The status views both window and sort on it,
-// so a time window and the ordering inside it agree on what recent means.
+// apply row and its operation rows. The status list's time window bounds on it.
 //
 // updated_at is the lease heartbeat a driver refreshes on every tick, so it
 // tracks work in flight rather than when the apply was requested. Creation time
-// does not: a copy that runs for days keeps sinking as newer applies are
-// created against other databases, until the one schema change still touching a
-// production table falls outside the page an operator sees, while the summary
-// counts — which ignore the limit — still report it as running.
+// does not: a window on it would drop a copy that has run for days while it is
+// still the one schema change touching a production table, while the summary
+// counts would still report it as running.
 //
-// The operation rows have to be part of the key because an operation-scoped
+// The operation rows have to be part of the window because an operation-scoped
 // drive is refused a parent heartbeat by design: parent liveness belongs to the
 // parent lease, so a fanned-out apply advances apply_operations.updated_at every
 // tick while applies.updated_at stays frozen at its last parent state change.
-// Keying on the apply row alone would sink exactly the multi-deployment rollout
-// that is still copying rows.
+// Windowing on the apply row alone would drop exactly the multi-deployment
+// rollout that is still copying rows.
 //
 // GREATEST keeps whichever row moved last, so an apply whose own state changed
-// after its operations went quiet still sorts by its own timestamp.
+// after its operations went quiet is still windowed on its own timestamp.
 //
 // Under a deployment filter the operation half is scoped to that deployment, so
 // the view answers for the deployment an operator asked about: a rollout whose
@@ -1937,164 +1940,27 @@ func recentAppliesLastActivity(filter storage.RecentAppliesFilter) (string, []an
 	)`, args
 }
 
-// recentAppliesActivityAlias names the last-activity value once it has been
-// projected by recentAppliesSelect, so the sort keys reference a column instead
-// of repeating the subquery.
-const recentAppliesActivityAlias = "last_activity"
-
-// recentAppliesListAlias is the name the projected rows take in the outer query.
-const recentAppliesListAlias = "recent"
-
-// recentAppliesSelect projects the filtered applies along with their last
-// activity, for the outer query to sort.
+// GetRecent returns applies matching the filter, newest first by when each was
+// created, starting below filter.AfterID when it is set.
 //
-// The list projects last activity here rather than deriving it inside its ORDER
-// BY because most of the sort keys need it: evaluated in place, its subquery over
-// the operation rows runs again for every key on every candidate row, and the
-// query spends most of its time re-deriving a value it already has. Projected
-// once, the sort keys are plain column references.
-//
-// Args are appended in the order their placeholders appear in the statement —
-// the projected expression precedes the predicates that follow FROM.
-func recentAppliesSelect(filter storage.RecentAppliesFilter) (string, []any) {
-	activity, args := recentAppliesLastActivity(filter)
-	query := "SELECT " + applyColumns + ", " + activity + " AS " + recentAppliesActivityAlias +
-		" FROM applies"
-	where, whereArgs := recentAppliesWhere(filter)
+// The order is the row id, which never changes once an apply exists. That is
+// what makes the list safe to page: an apply that starts, finishes, or is
+// retried between two requests keeps its place, so a walk from the last apply
+// of each page lists every matching apply once. A new apply takes a higher id
+// and lands above every page already read. An order on state or activity would
+// move applies across the page boundary mid-walk, skipping or repeating them.
+// Callers that need in-flight work first ask for it separately with ActiveOnly.
+func (s *applyStore) GetRecent(ctx context.Context, filter storage.RecentAppliesFilter) ([]*storage.Apply, error) {
+	query := "SELECT " + applyColumns + " FROM applies"
+	where, args := recentAppliesWhere(filter)
+	if filter.AfterID > 0 {
+		where = append(where, "id < ?")
+		args = append(args, filter.AfterID)
+	}
 	if len(where) > 0 {
 		query += " WHERE " + strings.Join(where, " AND ")
 	}
-	return query, append(args, whereArgs...)
-}
-
-// recentAppliesOrderBy sorts the status list into a live group and a quiet
-// group, and orders each by the key that means something for it.
-//
-// An apply is live when a driver is still on it: recent activity *and* a
-// non-terminal state. Both halves are load-bearing. Activity alone would call a
-// just-finished apply live for as long as its last heartbeat stays fresh, and
-// then sort it by start time among the running work. State alone would float an
-// abandoned apply — pending with no driver, or retryable that nothing is
-// retrying — above the work actually in flight, forever. Together they say what
-// an operator means by "running now": something is driving it, and it has not
-// finished. An apply stopped and never resumed is terminal, so it stays quiet.
-//
-// Activity is bucketed rather than compared because every driver refreshes its
-// heartbeat on the same short interval: live rows all carry a timestamp from
-// within one interval, so ordering on the timestamp itself would put whichever
-// driver ticked most recently first and reshuffle the top of the list between one
-// status call and the next. The bucket bound is the lease staleness window — the
-// same bound the claim queries use to decide whether a driver still holds a row,
-// so "live" means one thing across the system.
-//
-// Inside the live group the key is when the apply started, oldest first: the
-// risk of a schema change grows with how long it has been holding a table, and
-// the order is stable as time passes, so a newly started apply joins the bottom
-// of the group instead of displacing every row above it. Applies still starting
-// up have no started_at yet and fall back to their creation time.
-//
-// The quiet group keeps last activity, which for a finished apply is when it
-// finished, so the most recently settled work reads first.
-func (s *applyStore) recentAppliesOrderBy() (string, []any) {
-	col := func(name string) string { return recentAppliesListAlias + "." + name }
-	isLive, liveArgs := s.recentAppliesLive(col(recentAppliesActivityAlias), col("state"))
-
-	orderBy := fmt.Sprintf(`
-		ORDER BY %s DESC,
-			CASE WHEN %s THEN COALESCE(%s, %s) END ASC,
-			%s DESC,
-			%s DESC
-	`, isLive, isLive, col("started_at"), col("created_at"), col(recentAppliesActivityAlias), col("id"))
-
-	// The predicate is spelled out per key it appears in, so its states bind once
-	// per occurrence. A column alias is not visible to sibling expressions in the
-	// select list that produced it, so hoisting the predicate into that select
-	// would mean repeating the activity subquery rather than referencing it —
-	// paying per row to save a handful of constant binds. Each occurrence is a
-	// state comparison against an already-projected column, so the repetition
-	// costs nothing per row.
-	args := append([]any{}, liveArgs...)
-	args = append(args, liveArgs...)
-	return orderBy, args
-}
-
-// recentAppliesLive is the predicate that puts an apply in the status list's
-// live group, over the given last-activity and state expressions (see
-// recentAppliesOrderBy for why it takes both).
-func (s *applyStore) recentAppliesLive(activity, applyState string) (string, []any) {
-	liveWindow := s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime,
-		LiteralIntervalAmount(uint64(storage.ApplyLeaseStaleAfter.Microseconds())), IntervalMicrosecond)
-	terminal := terminalApplyStates()
-	return fmt.Sprintf("(%s >= %s AND %s NOT IN (%s))", activity, liveWindow, applyState, placeholders(len(terminal))),
-		stringArgs(terminal)
-}
-
-// recentAppliesAnchorAlias names the derived row holding the sort key of the
-// apply a later page starts below.
-const recentAppliesAnchorAlias = "anchor"
-
-// recentAppliesAnchorSelect projects the current sort key of the apply named by
-// filter.AfterID: its state, the start time the live group sorts on, and its
-// last activity. The anchor is not held to the filter's predicates, since its
-// state or activity may have moved out of them since the page that showed it.
-func recentAppliesAnchorSelect(filter storage.RecentAppliesFilter) (string, []any) {
-	activity, args := recentAppliesLastActivity(filter)
-	query := "SELECT id AS anchor_id, state AS anchor_state, COALESCE(started_at, created_at) AS anchor_start, " +
-		activity + " AS anchor_activity FROM applies WHERE id = ?"
-	return query, append(args, filter.AfterID)
-}
-
-// recentAppliesAfterAnchor keeps the applies that sort after the anchor in the
-// order recentAppliesOrderBy defines, mirroring each of its keys:
-//
-//   - After a live anchor come the live applies that started later (or started
-//     at the same instant and sort later on activity and id), then every quiet
-//     apply.
-//   - After a quiet anchor come the quiet applies with older last activity, or
-//     the same activity and a lower id.
-//
-// A settled apply's last activity is when it settled and does not move, so a
-// walk lists settled history exactly once. An apply that starts, finishes, or
-// is retried during the walk takes fresh activity and moves to the top of the
-// order, above every anchor, so it is never listed twice.
-func (s *applyStore) recentAppliesAfterAnchor() (string, []any) {
-	col := func(name string) string { return recentAppliesListAlias + "." + name }
-	anchor := func(name string) string { return recentAppliesAnchorAlias + "." + name }
-	rowLive, rowLiveArgs := s.recentAppliesLive(col(recentAppliesActivityAlias), col("state"))
-	anchorLive, anchorLiveArgs := s.recentAppliesLive(anchor("anchor_activity"), anchor("anchor_state"))
-	rowStart := fmt.Sprintf("COALESCE(%s, %s)", col("started_at"), col("created_at"))
-	activityBelow := fmt.Sprintf("(%[1]s < %[2]s OR (%[1]s = %[2]s AND %[3]s < %[4]s))",
-		col(recentAppliesActivityAlias), anchor("anchor_activity"), col("id"), anchor("anchor_id"))
-
-	below := fmt.Sprintf(`(
-		(%[1]s AND ((%[2]s AND (%[3]s > %[5]s OR (%[3]s = %[5]s AND %[4]s))) OR NOT %[2]s))
-		OR (NOT %[1]s AND NOT %[2]s AND %[4]s)
-	)`, anchorLive, rowLive, rowStart, activityBelow, anchor("anchor_start"))
-
-	// Placeholders bind in the order the live predicates appear above: anchor,
-	// row, row, anchor, row.
-	var args []any
-	for _, occurrence := range [][]any{anchorLiveArgs, rowLiveArgs, rowLiveArgs, anchorLiveArgs, rowLiveArgs} {
-		args = append(args, occurrence...)
-	}
-	return below, args
-}
-
-// GetRecent returns applies matching the filter in the status list's order,
-// starting after filter.AfterID when it is set.
-func (s *applyStore) GetRecent(ctx context.Context, filter storage.RecentAppliesFilter) ([]*storage.Apply, error) {
-	inner, args := recentAppliesSelect(filter)
-	query := "SELECT " + applyColumns + " FROM (" + inner + ") AS " + recentAppliesListAlias
-	if filter.AfterID > 0 {
-		anchor, anchorArgs := recentAppliesAnchorSelect(filter)
-		after, afterArgs := s.recentAppliesAfterAnchor()
-		query += " CROSS JOIN (" + anchor + ") AS " + recentAppliesAnchorAlias + " WHERE " + after
-		args = append(args, anchorArgs...)
-		args = append(args, afterArgs...)
-	}
-	orderBy, orderArgs := s.recentAppliesOrderBy()
-	query += orderBy + " LIMIT ?"
-	args = append(args, orderArgs...)
+	query += " ORDER BY id DESC LIMIT ?"
 	args = append(args, filter.Limit)
 
 	rows, err := s.db.QueryContext(ctx, query, args...)

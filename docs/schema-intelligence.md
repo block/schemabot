@@ -986,12 +986,16 @@ schemabot status -e production
 
 ```text
 2 active schema changes
-3 total: 1 Completed · 1 Running · 1 Waiting for cutover
 
   APPLY ID          DATABASE  ENV         STATE                STARTED         SOURCE
-  apply-example-72  billing   production  Waiting for cutover  2 hours ago     example/billing#73
   apply-example-73  shop      production  Running              20 minutes ago  example/store#42
-  apply-example-71  accounts  production  Completed            1 hour ago      example/accounts#18
+  apply-example-72  billing   production  Waiting for cutover  2 hours ago     example/billing#73
+
+Recent schema changes
+1 total: 1 Completed
+
+  APPLY ID          DATABASE  ENV         STATE      STARTED     DURATION  SOURCE
+  apply-example-71  accounts  production  Completed  1 hour ago  57m       example/accounts#18
 
 Use 'schemabot status <apply_id>' to view details
 ```
@@ -1027,26 +1031,36 @@ within the last day.
 |---|---|
 | `environment`, `deployment` | Scope to one environment or one data plane |
 | `database` | Scope to one database |
-| `active=true` | Only applies still in flight |
+| `active=true` or `active=false` | Only applies still in flight, or only finished ones |
 | `state=<state>` or `failed=true` | Only applies in a state, or only failures |
 | `last=<duration>` | Only applies updated within a window, such as `24h` |
 | `limit` | Page size: default 20, maximum 1,000 |
 | `starting_after` | The ID of the last apply the previous page listed |
 
-Applies being driven right now are listed first, oldest start first — the
-longer a schema change has held a table, the higher it sits — and the rest
-follow, most recently active first.
+Applies are listed newest first, in the order they were created. `active=true`
+keeps the applies still in flight, stopped ones excluded, and `active=false`
+keeps the rest: completed, failed, stopped, cancelled, and reverted. Together
+the two list every apply exactly once. The response echoes `active` when the
+request set it; a server that predates `active=false` omits the echo.
+
+Without `--state` or `--failed`, `schemabot status` makes one request for each
+half. It lists every active apply first, newest first, then the finished ones a
+page at a time under **Recent schema changes**, with a DURATION column: start to
+finish, or start to the moment it stopped. `--limit` and `--after` page the
+finished applies; a page reached with `--after` lists only finished applies.
 
 When more applies match than one page holds, the response sets `has_more`.
 Request the next page with the same filters and `starting_after` set to the
-last apply's ID; repeat until `has_more` is false. The page starts after that
-apply's current place in the order, so an apply that settled before the walk
-is listed exactly once. An apply that starts, finishes, or is retried during
-the walk moves to the top of the order, where the first page shows it, rather
-than reappearing on a later page. A `last` window is measured from each
-request. `starting_after` must name an apply in the same environment,
-database, and deployment as the filters; anything else returns `400` naming
-the mismatch. The response echoes `starting_after`, so a client can tell a
+last apply's ID; repeat until `has_more` is false. The order never changes, so
+every apply created before the walk began is listed exactly once, and one
+created during the walk is not listed. A filter is applied at each request, so
+an apply that moves in or out of a filter's set during the walk, such as one
+that finishes while `active=true` is paged, is listed on the pages read while
+it matched. A `last` window is measured from each request. `starting_after`
+must name an apply in the same environment, database, and deployment as the
+filters; anything else returns `400` naming the mismatch. The apply's state is
+not checked, so a walk continues after an apply that finished since the
+previous page. The response echoes `starting_after`, so a client can tell a
 continued page from the first page of a server that predates paging. `limit`
 may change between pages, and `state_counts` covers every matching apply on
 every page.
@@ -1063,12 +1077,17 @@ Output excerpt (illustrative values):
 
 ```text
 1 active schema change
-1171 total: 1150 Completed · 20 Failed · 1 Running
 
-  APPLY ID            DATABASE  ENV      STATE      STARTED         SOURCE
-  apply-example-1171  shop      staging  Running    20 minutes ago  example/store#42
+  APPLY ID            DATABASE  ENV      STATE    STARTED         SOURCE
+  apply-example-1171  shop      staging  Running  20 minutes ago  example/store#42
+
+Recent schema changes
+1170 total: 1150 Completed · 20 Failed
+
+  APPLY ID            DATABASE  ENV      STATE      STARTED         DURATION  SOURCE
+  apply-example-1170  accounts  staging  Completed  40 minutes ago  6m        example/accounts#88
   ...
-  apply-example-172   billing   staging  Completed  9 days ago      example/billing#75
+  apply-example-172   billing   staging  Completed  9 days ago      18m       example/billing#75
 
 Showing the 1000 most recent schema changes. Add --after apply-example-172 for the next 1000.
 Use 'schemabot status <apply_id>' to view details
@@ -1082,19 +1101,20 @@ Output excerpt (illustrative values):
 
 ```text
 Recent schema changes
-1171 total: 1150 Completed · 20 Failed · 1 Running
+1170 total: 1150 Completed · 20 Failed
 
-  APPLY ID           DATABASE  ENV      STATE      STARTED       SOURCE
-  apply-example-171  accounts  staging  Completed  9 days ago    example/accounts#19
+  APPLY ID           DATABASE  ENV      STATE      STARTED      DURATION  SOURCE
+  apply-example-171  accounts  staging  Completed  9 days ago   7m        example/accounts#19
   ...
-  apply-example-1    shop      staging  Failed     3 months ago  example/store#2
+  apply-example-1    shop      staging  Failed     90 days ago  2m        example/store#2
 
 Use 'schemabot status <apply_id>' to view details
 ```
 
 `--all` requests every page itself, 1,000 applies per request unless `-n`
-sets the page size, and prints every matching apply as one list. With
-`--json` it returns a single response whose `applies` array holds every page:
+sets the page size, and prints every active apply followed by every finished
+one. With `--json` it pages the unfiltered list instead and returns a single
+response whose `applies` array holds every page, newest first:
 
 ```sh
 schemabot status -e staging --all --json
@@ -1164,6 +1184,7 @@ Response excerpt (illustrative values):
   "active_count": 0,
   "limit": 20,
   "max_limit": 1000,
+  "active": true,
   "state_counts": {
     "running": 1
   },
@@ -1208,16 +1229,6 @@ Response excerpt (illustrative values):
   },
   "applies": [
     {
-      "apply_id": "apply-example-72",
-      "database": "billing",
-      "environment": "production",
-      "engine": "spirit",
-      "state": "waiting_for_cutover",
-      "caller": "example/billing#73",
-      "started_at": "2026-09-01T01:01:00Z",
-      "updated_at": "2026-09-01T03:01:00Z"
-    },
-    {
       "apply_id": "apply-example-73",
       "database": "shop",
       "environment": "production",
@@ -1236,6 +1247,16 @@ Response excerpt (illustrative values):
       "caller": "example/accounts#18",
       "started_at": "2026-09-01T02:01:00Z",
       "completed_at": "2026-09-01T02:58:00Z",
+      "updated_at": "2026-09-01T03:01:00Z"
+    },
+    {
+      "apply_id": "apply-example-72",
+      "database": "billing",
+      "environment": "production",
+      "engine": "spirit",
+      "state": "waiting_for_cutover",
+      "caller": "example/billing#73",
+      "started_at": "2026-09-01T01:01:00Z",
       "updated_at": "2026-09-01T03:01:00Z"
     }
   ]

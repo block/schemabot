@@ -18,7 +18,7 @@ type StatusCmd struct {
 	Deployment  string `help:"Deployment filter"`
 	Last        string `help:"Only show applies active within this window, for example 6h or 2d; counts the latest activity on the apply or any of its deployments, so a long-running change stays listed; by default the list is bounded by --limit alone"`
 	State       string `help:"Only show applies in this state, for example running, completed, or failed_retryable; cannot be combined with --failed"`
-	Limit       int    `short:"n" help:"Maximum recent applies to show (default 20, max 1000)"`
+	Limit       int    `short:"n" help:"Maximum recent applies to show; without --state or --failed these are the finished ones, listed below every active apply (default 20, max 1000)"`
 	Failed      bool   `help:"Show only failed recent applies" name:"failed"`
 	After       string `help:"Show the page that follows this apply ID, the last one a previous page showed; repeat that page's filters"`
 	All         bool   `help:"List every matching apply, page by page; with --json the pages merge into one applies array"`
@@ -78,34 +78,89 @@ func (cmd *StatusCmd) Run(g *Globals) error {
 		Last:        last,
 		After:       cmd.After,
 	}
-	var result *apitypes.StatusResponse
-	err = withLoading("Loading schema change status...", !cmd.JSON, func() error {
-		var loadErr error
-		if cmd.All {
-			result, loadErr = getAllStatusPages(ep, opts)
-		} else {
-			result, loadErr = client.GetStatus(ep, opts)
+	if cmd.JSON {
+		result, err := cmd.getStatus(ep, opts)
+		if err != nil {
+			return err
 		}
-		return loadErr
+		return writeJSON(result)
+	}
+	if cmd.State != "" || cmd.Failed {
+		var result *apitypes.StatusResponse
+		err = withLoading("Loading schema change status...", true, func() error {
+			var loadErr error
+			result, loadErr = cmd.getStatus(ep, opts)
+			return loadErr
+		})
+		if err != nil {
+			return err
+		}
+		templates.WriteStatusList(cmd.statusListData(result))
+		return nil
+	}
+	return cmd.showSectionedStatus(ep, opts)
+}
+
+// getStatus fetches the page opts names, or every page with --all.
+func (cmd *StatusCmd) getStatus(endpoint string, opts client.StatusOptions) (*apitypes.StatusResponse, error) {
+	var result *apitypes.StatusResponse
+	var err error
+	if cmd.All {
+		result, err = getAllStatusPages(endpoint, opts)
+	} else {
+		result, err = client.GetStatus(endpoint, opts)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if result.StartingAfter != opts.After {
+		return nil, fmt.Errorf("the server did not continue after apply %s; it predates paging, so it cannot show the next page", opts.After)
+	}
+	return result, nil
+}
+
+// showSectionedStatus renders the default view: the finished applies a page at
+// a time, below every active apply on the first page. A server that predates
+// the finished-only filter lists everything for it, so that list is rendered
+// on its own instead, in the order the server chose.
+func (cmd *StatusCmd) showSectionedStatus(endpoint string, opts client.StatusOptions) error {
+	finishedOpts := opts
+	finishedOpts.Finished = true
+	var finished, active *apitypes.StatusResponse
+	err := withLoading("Loading schema change status...", true, func() error {
+		var loadErr error
+		finished, loadErr = cmd.getStatus(endpoint, finishedOpts)
+		if loadErr != nil || finished.Active == nil || cmd.After != "" {
+			return loadErr
+		}
+		activeOpts := opts
+		activeOpts.Active = true
+		activeOpts.Limit = allPagesStatusLimit
+		active, loadErr = client.GetStatus(endpoint, activeOpts)
+		if loadErr != nil {
+			return fmt.Errorf("fetch active schema changes: %w", loadErr)
+		}
+		return nil
 	})
 	if err != nil {
 		return err
 	}
-	if result.StartingAfter != cmd.After {
-		return fmt.Errorf("the server did not continue after apply %s; it predates paging, so it cannot show the next page", cmd.After)
+	data := cmd.statusListData(finished)
+	if finished.Active == nil {
+		templates.WriteStatusList(data)
+		return nil
 	}
-
-	if cmd.JSON {
-		return writeJSON(result)
+	data.Sectioned = true
+	if active != nil {
+		data.Active = activeApplyDataFromResponses(active.Applies)
+		data.ActiveHasMore = active.HasMore
 	}
+	templates.WriteStatusList(data)
+	return nil
+}
 
-	// Convert to template format
-	applies := make([]templates.ActiveApplyData, 0, len(result.Applies))
-	for _, a := range result.Applies {
-		applies = append(applies, activeApplyDataFromResponse(a))
-	}
-
-	data := templates.StatusListData{
+func (cmd *StatusCmd) statusListData(result *apitypes.StatusResponse) templates.StatusListData {
+	return templates.StatusListData{
 		ActiveCount:    result.ActiveCount,
 		Limit:          result.Limit,
 		MaxLimit:       result.MaxLimit,
@@ -117,20 +172,29 @@ func (cmd *StatusCmd) Run(g *Globals) error {
 		ShowExternalID: cmd.ExternalID,
 		Deployment:     cmd.Deployment,
 		Continued:      cmd.After != "",
-		Applies:        applies,
+		Applies:        activeApplyDataFromResponses(result.Applies),
 	}
-	templates.WriteStatusList(data)
+}
 
-	return nil
+func activeApplyDataFromResponses(responses []*apitypes.ActiveApplyResponse) []templates.ActiveApplyData {
+	applies := make([]templates.ActiveApplyData, 0, len(responses))
+	for _, a := range responses {
+		applies = append(applies, activeApplyDataFromResponse(a))
+	}
+	return applies
 }
 
 // getAllStatusPages fetches the first page for opts and requests each next
 // page after the last apply of the one before, until the server reports no
-// more, merging every page into one response. A page lists only applies after
-// its anchor, but an apply that finished during the walk can tie with the
-// anchor's sort key and appear again, so the merge drops repeats and the
-// result lists each apply once. State counts are the first page's: every page counts
-// the same filter, and the first count is the one taken before the walk.
+// more, merging every page into one response. The list is ordered by when each
+// apply was created, which never changes, so the walk lists exactly once every
+// apply that matches the filters throughout it. One created during the walk
+// lands above the first page and is not listed, and one whose state moves into
+// or out of a state filter mid-walk is listed only if the move happens before
+// the walk reaches it. State counts are the first page's: every
+// page counts the same filter, and the first count is the one taken before the
+// walk, so they can disagree with the merged list if applies change state
+// during it.
 func getAllStatusPages(endpoint string, opts client.StatusOptions) (*apitypes.StatusResponse, error) {
 	if opts.Limit == 0 {
 		opts.Limit = allPagesStatusLimit
@@ -138,10 +202,6 @@ func getAllStatusPages(endpoint string, opts client.StatusOptions) (*apitypes.St
 	merged, err := client.GetStatus(endpoint, opts)
 	if err != nil {
 		return nil, err
-	}
-	seen := make(map[string]bool, len(merged.Applies))
-	for _, apply := range merged.Applies {
-		seen[apply.ApplyID] = true
 	}
 	page := merged
 	for page.HasMore && len(page.Applies) > 0 {
@@ -153,16 +213,8 @@ func getAllStatusPages(endpoint string, opts client.StatusOptions) (*apitypes.St
 		if page.StartingAfter != opts.After {
 			return nil, fmt.Errorf("the server did not continue after apply %s; it predates paging, so --all cannot list every apply", opts.After)
 		}
-		for _, apply := range page.Applies {
-			if seen[apply.ApplyID] {
-				continue
-			}
-			seen[apply.ApplyID] = true
-			merged.Applies = append(merged.Applies, apply)
-			if !state.IsTerminalApplyState(apply.State) && !merged.FailuresOnly {
-				merged.ActiveCount++
-			}
-		}
+		merged.Applies = append(merged.Applies, page.Applies...)
+		merged.ActiveCount += page.ActiveCount
 	}
 	merged.HasMore = false
 	return merged, nil

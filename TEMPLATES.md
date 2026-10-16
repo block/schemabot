@@ -8585,37 +8585,66 @@ ESC detach • s stop
 
 ```
 
-3 active schema changes
+2 active schema changes
 
   APPLY ID      DATABASE   ENV         STATE                STARTED         SOURCE
   apply_abc123  orders-db  staging     Running              15 minutes ago  https://github.com/acme/shop/pull/412
   apply_def456  users-db   production  Waiting for cutover  45 minutes ago  cli:jdoe
-  apply_ghi789  analytics  staging     Stopped              2 hours ago     https://github.com/acme/analytics/pull/87
+
+Recent schema changes
+44 total: 41 Completed · 2 Failed · 1 Stopped
+
+  APPLY ID      DATABASE    ENV      STATE      STARTED      DURATION  SOURCE
+  apply_ghi789  analytics   staging  Stopped    2 hours ago  12m       https://github.com/acme/analytics/pull/87
+  apply_jkl012  orders-db   staging  Completed  3 hours ago  30m       https://github.com/acme/shop/pull/415
+  apply_mno345  billing-db  staging  Failed     5 hours ago  30m       cli:jdoe
+
+Showing the 3 most recent schema changes. Use --limit N to show more.
+Use 'schemabot status <apply_id>' to view details
+
+Nothing active:
+
+No active schema changes
+
+Recent schema changes
+2 total: 1 Completed · 1 Failed
+
+  APPLY ID      DATABASE    ENV      STATE      STARTED      DURATION  SOURCE
+  apply_jkl012  orders-db   staging  Completed  3 hours ago  30m       https://github.com/acme/shop/pull/415
+  apply_mno345  billing-db  staging  Failed     5 hours ago  30m       cli:jdoe
 
 Use 'schemabot status <apply_id>' to view details
 
-No active applies:
+No applies at all:
 
 No recent schema changes
 
-More applies than the server's cap:
+More finished applies than the server's cap:
+
+2 active schema changes
+
+  APPLY ID      DATABASE   ENV         STATE                STARTED         SOURCE
+  apply_abc123  orders-db  staging     Running              15 minutes ago  https://github.com/acme/shop/pull/412
+  apply_def456  users-db   production  Waiting for cutover  45 minutes ago  cli:jdoe
 
 Recent schema changes
+44 total: 41 Completed · 2 Failed · 1 Stopped
 
-  APPLY ID      DATABASE    ENV      STATE      STARTED      SOURCE
-  apply_jkl012  orders-db   staging  Completed  3 hours ago  https://github.com/acme/shop/pull/415
-  apply_mno345  billing-db  staging  Completed  5 hours ago  cli:jdoe
+  APPLY ID      DATABASE    ENV      STATE      STARTED      DURATION  SOURCE
+  apply_jkl012  orders-db   staging  Completed  3 hours ago  30m       https://github.com/acme/shop/pull/415
+  apply_mno345  billing-db  staging  Failed     5 hours ago  30m       cli:jdoe
 
 Showing the 2 most recent schema changes. Add --after apply_mno345 for the next 2.
 Use 'schemabot status <apply_id>' to view details
 
-The next page, reached with --after apply_mno345:
+The next page, reached with --after apply_mno345, lists only finished applies:
 
 Recent schema changes
+44 total: 41 Completed · 2 Failed · 1 Stopped
 
-  APPLY ID      DATABASE    ENV      STATE      STARTED      SOURCE
-  apply_pqr678  orders-db   staging  Completed  7 hours ago  https://github.com/acme/shop/pull/409
-  apply_stu901  billing-db  staging  Failed     9 hours ago  cli:jdoe
+  APPLY ID      DATABASE    ENV      STATE      STARTED      DURATION  SOURCE
+  apply_pqr678  orders-db   staging  Completed  7 hours ago  20m       https://github.com/acme/shop/pull/409
+  apply_stu901  billing-db  staging  Failed     9 hours ago  10m       cli:jdoe
 
 Showing 2 more schema changes. Add --after apply_stu901 for the next 2.
 Use 'schemabot status <apply_id>' to view details
@@ -8633,6 +8662,8 @@ Use 'schemabot status <apply_id>' to view details
   APPLY ID              EXTERNAL APPLY ID         EXTERNAL OP ID         DATABASE   ENV         STATE                STARTED        SOURCE
   apply-multi-a1b2c3d4  remote-apply-us-east-001  remote-op-us-east-001  orders-db  production  Waiting for cutover  8 minutes ago  https://github.com/acme/shop/pull/412
 
+No recent finished schema changes
+
 Use 'schemabot status <apply_id>' to view details
 
 Multiple matching operations:
@@ -8642,6 +8673,8 @@ Multiple matching operations:
   APPLY ID                EXTERNAL APPLY ID         DATABASE      ENV         STATE    STARTED        SOURCE
   apply-sharded-d5e6f7g8  remote-apply-us-east-002  inventory-db  production  Running  4 minutes ago  https://github.com/acme/shop/pull/412
 
+No recent finished schema changes
+
 Use 'schemabot status <apply_id>' to view details
 
 No data-plane apply id recorded:
@@ -8650,6 +8683,8 @@ No data-plane apply id recorded:
 
   APPLY ID                DATABASE     ENV         STATE    STARTED       SOURCE
   apply-pending-l3m4n5o6  payments-db  production  Pending  1 minute ago  https://github.com/acme/shop/pull/412
+
+No recent finished schema changes
 
 Use 'schemabot status <apply_id>' to view details
 

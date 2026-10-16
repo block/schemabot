@@ -736,15 +736,11 @@ type ApplyStore interface {
 	UpdateDerivedState(ctx context.Context, applyID int64, expectedState, newState, errorMessage string, startedAt, completedAt *time.Time) (swapped bool, err error)
 
 	// GetRecent returns applies across all databases for `schemabot status` (no
-	// args), in-flight work first.
-	//
-	// An apply is in flight when a driver is still on it: its latest lease
-	// heartbeat — on the apply row or any of its operations — falls inside the
-	// lease staleness window, and its state is not terminal. So a schema change
-	// still copying rows stays on the first page however long ago it started,
-	// while an abandoned or finished one sinks. In-flight applies are ordered
-	// oldest-started first; everything else by when it last changed, which for a
-	// finished apply is when it finished.
+	// args), newest first by when each was created. The order never changes for
+	// an apply, so a caller pages through it with AfterID without skipping or
+	// repeating an apply whose state moves between pages. A caller that shows
+	// in-flight work first lists it separately with ActiveOnly, and the rest
+	// with FinishedOnly.
 	GetRecent(ctx context.Context, filter RecentAppliesFilter) ([]*Apply, error)
 
 	// CountRecentByState returns how many applies match the filter, grouped by
@@ -1042,6 +1038,10 @@ type RecentAppliesFilter struct {
 	// does not know counts as active: a caller asking whether a target is busy
 	// must not be told it is free because a state was missed.
 	ActiveOnly bool
+	// FinishedOnly restricts results to applies in a terminal state: the
+	// complement of ActiveOnly, so the two split every apply between them and
+	// a caller listing both sections lists each apply once.
+	FinishedOnly bool
 	// UpdatedSince, when set, restricts results to applies whose last activity
 	// — the latest lease heartbeat on the apply row or any of its operations —
 	// falls at or after this instant. Windowing on activity rather than start
@@ -1050,11 +1050,10 @@ type RecentAppliesFilter struct {
 	// including a fanned-out apply whose heartbeats land only on its operations.
 	UpdatedSince time.Time
 	// AfterID, when set, is the row id of an apply from an earlier page: the
-	// list starts with the applies that sort after it in the list's order,
-	// rather than at the top, so a caller walks the list page by page from the
-	// last apply each page showed. The anchor's place is taken from its current
-	// sort key, so an apply that starts, finishes, or is retried during the walk
-	// moves to the top of the order instead of being listed again later on.
+	// list starts with the applies created before it, rather than at the top,
+	// so a caller walks the list page by page from the last apply each page
+	// showed. The list is ordered by row id alone, which never changes, so the
+	// anchor keeps its place however its state moves during the walk.
 	// CountRecentByState ignores it: counts always cover every matching apply.
 	AfterID int64
 }

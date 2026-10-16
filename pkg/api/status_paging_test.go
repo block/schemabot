@@ -144,3 +144,38 @@ func TestHandleStatusStartingAfterAllowsAnAnchorWhoseStateMoved(t *testing.T) {
 	require.Len(t, applies.filters, 1)
 	assert.Equal(t, int64(20), applies.filters[0].AfterID)
 }
+
+// active=false lists only terminal applies, the complement of active=true, so
+// a caller lists the two halves with one request each. The response echoes the
+// filter, which tells a caller the server applied it, and an absent parameter
+// filters nothing and echoes nothing.
+func TestHandleStatusActiveFilterEcho(t *testing.T) {
+	for _, tc := range []struct {
+		raw          string
+		activeOnly   bool
+		finishedOnly bool
+	}{
+		{raw: "true", activeOnly: true},
+		{raw: "false", finishedOnly: true},
+		{raw: ""},
+	} {
+		applies := &recentApplyStore{applies: pagingTestApplies(time.Now().UTC())}
+		mux := newStatusPagingServer(t, applies, nil)
+		query := url.Values{}
+		if tc.raw != "" {
+			query.Set("active", tc.raw)
+		}
+
+		code, resp, errResp := getStatusPage(t, mux, query)
+		require.Equal(t, http.StatusOK, code, errResp.Error)
+		require.Len(t, applies.filters, 1)
+		assert.Equal(t, tc.activeOnly, applies.filters[0].ActiveOnly, "active=%q", tc.raw)
+		assert.Equal(t, tc.finishedOnly, applies.filters[0].FinishedOnly, "active=%q", tc.raw)
+		if tc.raw == "" {
+			assert.Nil(t, resp.Active, "no filter is echoed when none was asked for")
+			continue
+		}
+		require.NotNil(t, resp.Active, "active=%q is echoed", tc.raw)
+		assert.Equal(t, tc.activeOnly, *resp.Active)
+	}
+}

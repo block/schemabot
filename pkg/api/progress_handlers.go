@@ -894,7 +894,7 @@ func (s *Service) handleStatus(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	activeOnly, err := parseStatusActiveOnly(r)
+	activeFilter, err := parseStatusActive(r)
 	if err != nil {
 		s.writeError(w, http.StatusBadRequest, err.Error())
 		return
@@ -912,8 +912,9 @@ func (s *Service) handleStatus(w http.ResponseWriter, r *http.Request) {
 	if stateFilter != "" {
 		filter.States = []string{stateFilter}
 	}
-	if activeOnly {
-		filter.ActiveOnly = true
+	if activeFilter != nil {
+		filter.ActiveOnly = *activeFilter
+		filter.FinishedOnly = !*activeFilter
 	}
 	if last > 0 {
 		filter.UpdatedSince = time.Now().Add(-last)
@@ -955,6 +956,7 @@ func (s *Service) handleStatus(w http.ResponseWriter, r *http.Request) {
 		HasMore:       hasMore,
 		FailuresOnly:  failuresOnly,
 		StartingAfter: startingAfter,
+		Active:        activeFilter,
 		StateCounts:   stateCounts,
 		Applies:       make([]*apitypes.ActiveApplyResponse, 0, len(applies)),
 	}
@@ -1204,19 +1206,21 @@ func parseStatusLast(r *http.Request) (time.Duration, error) {
 	return last, nil
 }
 
-// parseStatusActiveOnly parses the optional `active` query parameter restricting
-// the status list to applies that have not reached a terminal state. Callers use
-// it to ask whether a target is busy without paging through settled history.
-func parseStatusActiveOnly(r *http.Request) (bool, error) {
+// parseStatusActive parses the optional `active` query parameter. true restricts
+// the status list to applies that have not reached a terminal state, which is
+// how a caller asks whether a target is busy without paging through settled
+// history; false restricts it to the terminal ones, so a caller can list the
+// two halves separately. nil means no filter.
+func parseStatusActive(r *http.Request) (*bool, error) {
 	raw := r.URL.Query().Get("active")
 	if raw == "" {
-		return false, nil
+		return nil, nil
 	}
 	active, err := strconv.ParseBool(raw)
 	if err != nil {
-		return false, fmt.Errorf("active must be a boolean")
+		return nil, fmt.Errorf("active must be a boolean")
 	}
-	return active, nil
+	return &active, nil
 }
 
 func parseStatusFailuresOnly(r *http.Request) (bool, error) {

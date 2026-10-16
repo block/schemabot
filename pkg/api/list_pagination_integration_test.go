@@ -88,10 +88,10 @@ func (s *pagingServer) walkStatus(t *testing.T, query url.Values, between func(p
 
 // seedStatusFleet stores one in-flight apply followed by settled ones in
 // staging, spread across a few databases, plus production applies the walks
-// filter out. The in-flight apply is the oldest row, so the first page lists
-// it ahead of newer settled work. The settled applies are moved a day into the
-// past, so they read as history rather than as activity from the instant the
-// walk runs. It returns the staging apply identifiers and the in-flight apply.
+// filter out. The in-flight apply is the oldest row, so it is the last apply a
+// walk reaches. The settled applies are moved a day into the past, so they
+// read as history rather than as activity from the instant the walk runs. It
+// returns the staging apply identifiers and the in-flight apply.
 func (s *pagingServer) seedStatusFleet(t *testing.T, settled int) (map[string]bool, *storage.Apply) {
 	t.Helper()
 	store := s.store
@@ -151,18 +151,18 @@ func TestStatusPageWalkListsEveryApplyAcrossTheCap(t *testing.T) {
 	}
 }
 
-// An operator walks the listing in small pages while the fleet keeps moving:
-// the in-flight apply the first page led with finishes, and new applies are
-// created, between pages. Both move to the top of the order, above every page
-// still to come, so every apply that existed when the walk began is listed
-// exactly once, and each new one at most once.
+// An operator walks the finished applies in small pages, the way the default
+// status view does, while the fleet keeps moving: the in-flight apply finishes
+// and new applies are created between pages. The order is creation, which
+// never changes, so every settled apply is listed exactly once, the apply that
+// finished before the walk reached it is listed too, and the new applies land
+// above the first page and are not listed.
 func TestStatusPageWalkSurvivesChangesMidWalk(t *testing.T) {
 	server := newPagingServer(t)
 	want, inFlight := server.seedStatusFleet(t, 240)
 	newLock := storagetest.CreateLock(t, server.store, "fleet_new", storage.DatabaseTypeMySQL)
 
-	var created []string
-	seen, pages := server.walkStatus(t, url.Values{"environment": {"staging"}, "limit": {"25"}}, func(page int) {
+	seen, pages := server.walkStatus(t, url.Values{"environment": {"staging"}, "active": {"false"}, "limit": {"25"}}, func(page int) {
 		if page == 0 {
 			finished, err := server.store.Applies().Get(t.Context(), inFlight.ID)
 			require.NoError(t, err)
@@ -170,21 +170,44 @@ func TestStatusPageWalkSurvivesChangesMidWalk(t *testing.T) {
 			require.NoError(t, server.store.Applies().Update(t.Context(), finished))
 		}
 		if page < 3 {
-			identifier := fmt.Sprintf("apply-fleet-new-%d", page)
-			storagetest.CreateApplyWithStateAndEnv(t, server.store, newLock, identifier, int64(20_000+page), state.Apply.Completed, "staging")
-			created = append(created, identifier)
+			storagetest.CreateApplyWithStateAndEnv(t, server.store, newLock, fmt.Sprintf("apply-fleet-new-%d", page), int64(20_000+page), state.Apply.Completed, "staging")
 		}
+	})
+	assert.Greater(t, len(pages), 5, "the walk spans many pages")
+	for i, page := range pages {
+		require.NotNil(t, page.Active, "page %d echoes the active filter", i)
+		assert.False(t, *page.Active, "page %d lists finished applies", i)
+	}
+	assertListedOnce(t, want, seen)
+}
+
+// Three applies are running and an operator pages through the active ones one
+// at a time. The apply the first page ended on finishes before the next
+// request. It keeps its place in the order, so the walk still reaches the
+// running applies after it.
+func TestStatusActiveWalkContinuesAfterAnApplyThatFinished(t *testing.T) {
+	server := newPagingServer(t)
+	var running []*storage.Apply
+	for i := range 3 {
+		lock := storagetest.CreateLock(t, server.store, fmt.Sprintf("fleet_running_%d", i), storage.DatabaseTypeMySQL)
+		running = append(running, storagetest.CreateApplyWithStateAndEnv(t, server.store, lock, fmt.Sprintf("apply-fleet-running-%d", i), int64(10+i), state.Apply.Running, "staging"))
+	}
+
+	seen, pages := server.walkStatus(t, url.Values{"environment": {"staging"}, "active": {"true"}, "limit": {"1"}}, func(page int) {
+		if page != 0 {
+			return
+		}
+		anchor, err := server.store.Applies().Get(t.Context(), running[2].ID)
+		require.NoError(t, err)
+		anchor.State = state.Apply.Completed
+		require.NoError(t, server.store.Applies().Update(t.Context(), anchor))
 	})
 	require.NotEmpty(t, pages)
 	require.NotEmpty(t, pages[0].Applies)
-	assert.Equal(t, inFlight.ApplyIdentifier, pages[0].Applies[0].ApplyID, "the first page leads with in-flight work")
-	assert.Greater(t, len(pages), 5, "the walk spans many pages")
-
-	for _, identifier := range created {
-		assert.LessOrEqual(t, seen[identifier], 1, "%s, created during the walk, is listed at most once", identifier)
-		delete(seen, identifier)
-	}
-	assertListedOnce(t, want, seen)
+	assert.Equal(t, running[2].ApplyIdentifier, pages[0].Applies[0].ApplyID, "newest first")
+	assertListedOnce(t, map[string]bool{
+		running[0].ApplyIdentifier: true, running[1].ApplyIdentifier: true, running[2].ApplyIdentifier: true,
+	}, seen)
 }
 
 // The page walk keeps every filter the first page was listed under: here a

@@ -1945,6 +1945,11 @@ type StatusResponse struct {
 	// so a client can tell this page apart from a first page served by a
 	// server that ignores the parameter.
 	StartingAfter string `json:"starting_after,omitempty"`
+	// Active echoes the active filter: true lists only applies that have not
+	// reached a terminal state, false only the terminal ones, and absent means
+	// no filter. A client that asked for active=false and finds it absent is
+	// talking to a server that lists everything regardless.
+	Active *bool `json:"active,omitempty"`
 	// StateCounts tallies every apply matching the request's filters by state,
 	// unbounded by limit — the applies list may be a truncated page, but these
 	// counts never are.

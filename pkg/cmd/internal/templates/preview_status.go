@@ -33,112 +33,100 @@ func previewStatesOutput() {
 	}
 }
 
+// previewStatusApply builds a status row that started startedAgo before the
+// preview time and, when endedAgo is non-zero, last changed endedAgo before it.
+// A terminal row other than stopped completed at that time too.
+func previewStatusApply(id, database, environment, applyState, caller string, startedAgo, endedAgo time.Duration) ActiveApplyData {
+	a := ActiveApplyData{
+		ApplyID:     id,
+		Database:    database,
+		Environment: environment,
+		State:       applyState,
+		Engine:      "Spirit",
+		Caller:      caller,
+		StartedAt:   previewTime.Add(-startedAgo).Format(time.RFC3339),
+		UpdatedAt:   previewTime.Add(-30 * time.Second).Format(time.RFC3339),
+	}
+	if endedAgo > 0 {
+		a.UpdatedAt = previewTime.Add(-endedAgo).Format(time.RFC3339)
+		if state.IsTerminalApplyState(applyState) && !state.IsState(applyState, state.Apply.Stopped) {
+			a.CompletedAt = a.UpdatedAt
+		}
+	}
+	return a
+}
+
 func previewStatusListOutput() {
+	active := []ActiveApplyData{
+		previewStatusApply("apply_abc123", "orders-db", "staging", state.Apply.Running, "github:octocat@acme/shop#412", 15*time.Minute, 0),
+		previewStatusApply("apply_def456", "users-db", "production", state.Apply.WaitingForCutover, "cli:jdoe@macbook.local", 45*time.Minute, 0),
+	}
+	finished := []ActiveApplyData{
+		previewStatusApply("apply_ghi789", "analytics", "staging", state.Apply.Stopped, "github:hubot@acme/analytics#87", 2*time.Hour, 108*time.Minute),
+		previewStatusApply("apply_jkl012", "orders-db", "staging", state.Apply.Completed, "github:octocat@acme/shop#415", 3*time.Hour, 150*time.Minute),
+		previewStatusApply("apply_mno345", "billing-db", "staging", state.Apply.Failed, "cli:jdoe@macbook.local", 5*time.Hour, 270*time.Minute),
+	}
+	finishedCounts := map[string]int{state.Apply.Stopped: 1, state.Apply.Completed: 41, state.Apply.Failed: 2}
+
 	WriteStatusList(StatusListData{
-		ActiveCount: 3,
+		Sectioned:   true,
+		ActiveCount: len(active),
+		Active:      active,
+		Applies:     finished,
+		StateCounts: finishedCounts,
+		Limit:       3,
+		MaxLimit:    1000,
+		HasMore:     true,
+	})
+
+	fmt.Println()
+	fmt.Println("Nothing active:")
+	fmt.Println()
+	WriteStatusList(StatusListData{Sectioned: true, Applies: finished[1:], StateCounts: map[string]int{state.Apply.Completed: 1, state.Apply.Failed: 1}})
+
+	fmt.Println()
+	fmt.Println("No applies at all:")
+	fmt.Println()
+	WriteStatusList(StatusListData{Sectioned: true})
+
+	fmt.Println()
+	fmt.Println("More finished applies than the server's cap:")
+	fmt.Println()
+	WriteStatusList(StatusListData{
+		Sectioned:   true,
+		ActiveCount: len(active),
+		Active:      active,
+		Applies:     finished[1:],
+		StateCounts: finishedCounts,
+		Limit:       2,
+		MaxLimit:    2,
+		HasMore:     true,
+	})
+
+	fmt.Println()
+	fmt.Println("The next page, reached with --after apply_mno345, lists only finished applies:")
+	fmt.Println()
+	WriteStatusList(StatusListData{
+		Sectioned: true,
 		Applies: []ActiveApplyData{
-			{
-				ApplyID:     "apply_abc123",
-				Database:    "orders-db",
-				Environment: "staging",
-				State:       state.Apply.Running,
-				Engine:      "Spirit",
-				Caller:      "github:octocat@acme/shop#412",
-				StartedAt:   previewTime.Add(-15 * time.Minute).Format(time.RFC3339),
-				UpdatedAt:   previewTime.Add(-30 * time.Second).Format(time.RFC3339),
-			},
-			{
-				ApplyID:     "apply_def456",
-				Database:    "users-db",
-				Environment: "production",
-				State:       state.Apply.WaitingForCutover,
-				Engine:      "Spirit",
-				Caller:      "cli:jdoe@macbook.local",
-				StartedAt:   previewTime.Add(-45 * time.Minute).Format(time.RFC3339),
-				UpdatedAt:   previewTime.Add(-1 * time.Minute).Format(time.RFC3339),
-			},
-			{
-				ApplyID:     "apply_ghi789",
-				Database:    "analytics",
-				Environment: "staging",
-				State:       state.Apply.Stopped,
-				Engine:      "Spirit",
-				Caller:      "github:hubot@acme/analytics#87",
-				StartedAt:   previewTime.Add(-2 * time.Hour).Format(time.RFC3339),
-				UpdatedAt:   previewTime.Add(-30 * time.Minute).Format(time.RFC3339),
-			},
+			previewStatusApply("apply_pqr678", "orders-db", "staging", state.Apply.Completed, "github:octocat@acme/shop#409", 7*time.Hour, 400*time.Minute),
+			previewStatusApply("apply_stu901", "billing-db", "staging", state.Apply.Failed, "cli:jdoe@macbook.local", 9*time.Hour, 530*time.Minute),
 		},
+		StateCounts: finishedCounts,
+		Limit:       2,
+		MaxLimit:    2,
+		HasMore:     true,
+		Continued:   true,
 	})
-
-	fmt.Println()
-	fmt.Println("No active applies:")
-	fmt.Println()
-	WriteStatusList(StatusListData{
-		ActiveCount: 0,
-		Applies:     nil,
-	})
-
-	fmt.Println()
-	fmt.Println("More applies than the server's cap:")
-	fmt.Println()
-	pageApplies := []ActiveApplyData{
-		{
-			ApplyID:     "apply_jkl012",
-			Database:    "orders-db",
-			Environment: "staging",
-			State:       state.Apply.Completed,
-			Engine:      "Spirit",
-			Caller:      "github:octocat@acme/shop#415",
-			StartedAt:   previewTime.Add(-3 * time.Hour).Format(time.RFC3339),
-			UpdatedAt:   previewTime.Add(-150 * time.Minute).Format(time.RFC3339),
-		},
-		{
-			ApplyID:     "apply_mno345",
-			Database:    "billing-db",
-			Environment: "staging",
-			State:       state.Apply.Completed,
-			Engine:      "Spirit",
-			Caller:      "cli:jdoe@macbook.local",
-			StartedAt:   previewTime.Add(-5 * time.Hour).Format(time.RFC3339),
-			UpdatedAt:   previewTime.Add(-270 * time.Minute).Format(time.RFC3339),
-		},
-	}
-	WriteStatusList(StatusListData{Limit: 2, MaxLimit: 2, HasMore: true, Applies: pageApplies})
-
-	fmt.Println()
-	fmt.Println("The next page, reached with --after apply_mno345:")
-	fmt.Println()
-	nextApplies := []ActiveApplyData{
-		{
-			ApplyID:     "apply_pqr678",
-			Database:    "orders-db",
-			Environment: "staging",
-			State:       state.Apply.Completed,
-			Engine:      "Spirit",
-			Caller:      "github:octocat@acme/shop#409",
-			StartedAt:   previewTime.Add(-7 * time.Hour).Format(time.RFC3339),
-			UpdatedAt:   previewTime.Add(-400 * time.Minute).Format(time.RFC3339),
-		},
-		{
-			ApplyID:     "apply_stu901",
-			Database:    "billing-db",
-			Environment: "staging",
-			State:       state.Apply.Failed,
-			Engine:      "Spirit",
-			Caller:      "cli:jdoe@macbook.local",
-			StartedAt:   previewTime.Add(-9 * time.Hour).Format(time.RFC3339),
-			UpdatedAt:   previewTime.Add(-530 * time.Minute).Format(time.RFC3339),
-		},
-	}
-	WriteStatusList(StatusListData{Limit: 2, MaxLimit: 2, HasMore: true, Continued: true, Applies: nextApplies})
 }
 
 func previewStatusDeploymentOutput() {
 	WriteStatusList(StatusListData{
+		Sectioned:      true,
 		ActiveCount:    1,
 		ShowExternalID: true,
 		Deployment:     "us-east",
-		Applies: []ActiveApplyData{
+		Active: []ActiveApplyData{
 			{
 				ApplyID:             "apply-multi-a1b2c3d4",
 				ExternalID:          "remote-apply-us-east-001",
@@ -159,10 +147,11 @@ func previewStatusDeploymentOutput() {
 	fmt.Println("Multiple matching operations:")
 	fmt.Println()
 	WriteStatusList(StatusListData{
+		Sectioned:      true,
 		ActiveCount:    1,
 		ShowExternalID: true,
 		Deployment:     "us-east",
-		Applies: []ActiveApplyData{
+		Active: []ActiveApplyData{
 			{
 				ApplyID:     "apply-sharded-d5e6f7g8",
 				ExternalID:  "remote-apply-us-east-002",
@@ -182,10 +171,11 @@ func previewStatusDeploymentOutput() {
 	fmt.Println("No data-plane apply id recorded:")
 	fmt.Println()
 	WriteStatusList(StatusListData{
+		Sectioned:      true,
 		ActiveCount:    1,
 		ShowExternalID: true,
 		Deployment:     "us-east",
-		Applies: []ActiveApplyData{
+		Active: []ActiveApplyData{
 			{
 				ApplyID:     "apply-pending-l3m4n5o6",
 				Database:    "payments-db",

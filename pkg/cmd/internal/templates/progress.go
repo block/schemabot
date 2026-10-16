@@ -1104,6 +1104,14 @@ type StatusListData struct {
 	// Continued marks a page reached with --after, past the first page.
 	Continued bool
 	Applies   []ActiveApplyData
+	// Sectioned renders the default view: Active above the finished applies
+	// in Applies, which alone are paged by --limit and --after. Active is
+	// listed in full on a first page and omitted from a continued one.
+	Sectioned bool
+	Active    []ActiveApplyData
+	// ActiveHasMore reports more active applies than the server returns in
+	// one request.
+	ActiveHasMore bool
 }
 
 // statusWindowSuffix renders the active list filters (--state, --last) as a
@@ -1159,16 +1167,12 @@ func writeStatusStateSummary(counts map[string]int) {
 
 // WriteStatusList writes the status list output.
 func WriteStatusList(data StatusListData) {
+	if data.Sectioned {
+		writeSectionedStatusList(data)
+		return
+	}
 	if len(data.Applies) == 0 {
-		filters := ""
-		if parts := statusFilterPhrases(data); len(parts) > 0 {
-			filters = " " + strings.Join(parts, ", ")
-		}
-		if data.FailuresOnly {
-			fmt.Printf("%sNo recent failed schema changes%s%s\n", ANSIDim, filters, ANSIReset)
-		} else {
-			fmt.Printf("%sNo recent schema changes%s%s\n", ANSIDim, filters, ANSIReset)
-		}
+		writeEmptyStatusList(data)
 		return
 	}
 	if data.FailuresOnly {
@@ -1178,20 +1182,72 @@ func WriteStatusList(data StatusListData) {
 
 	// Header
 	if data.ActiveCount > 0 {
-		if data.ActiveCount == 1 {
-			fmt.Printf("%s1 active schema change%s%s\n", ANSIBold, ANSIReset, statusWindowSuffix(data))
-		} else {
-			fmt.Printf("%s%d active schema changes%s%s\n", ANSIBold, data.ActiveCount, ANSIReset, statusWindowSuffix(data))
-		}
+		writeActiveStatusHeader(data, data.ActiveCount)
 	} else {
 		fmt.Printf("%sRecent schema changes%s%s\n", ANSIBold, ANSIReset, statusWindowSuffix(data))
 	}
 	writeStatusStateSummary(data.StateCounts)
 	fmt.Println()
 
-	writeStatusTable(statusListColumns(data), data.Applies, func(a ActiveApplyData) string { return a.State })
+	writeStatusTable(statusListColumns(data, data.Applies, false), data.Applies, func(a ActiveApplyData) string { return a.State })
 
 	writeStatusListFooter(data)
+}
+
+// writeSectionedStatusList writes the default status view: every active apply,
+// then the finished ones a page at a time. The two come from separate requests
+// over an order that never changes, so paging the finished applies cannot skip
+// or repeat one whose state moves between pages, and active work is always on
+// screen however many applies finished since it started.
+func writeSectionedStatusList(data StatusListData) {
+	if len(data.Active) == 0 && len(data.Applies) == 0 {
+		writeEmptyStatusList(data)
+		return
+	}
+	if !data.Continued {
+		if len(data.Active) == 0 {
+			fmt.Printf("%sNo active schema changes%s%s\n", ANSIDim, ANSIReset, statusWindowSuffix(data))
+		} else {
+			writeActiveStatusHeader(data, len(data.Active))
+			fmt.Println()
+			writeStatusTable(statusListColumns(data, data.Active, false), data.Active, func(a ActiveApplyData) string { return a.State })
+			if data.ActiveHasMore {
+				fmt.Printf("\n%sShowing the %d most recent active schema changes.%s\n", ANSIDim, len(data.Active), ANSIReset)
+			}
+		}
+		fmt.Println()
+	}
+
+	if len(data.Applies) == 0 {
+		fmt.Printf("%sNo recent finished schema changes%s%s\n", ANSIDim, ANSIReset, statusWindowSuffix(data))
+		writeStatusListFooter(data)
+		return
+	}
+	fmt.Printf("%sRecent schema changes%s%s\n", ANSIBold, ANSIReset, statusWindowSuffix(data))
+	writeStatusStateSummary(data.StateCounts)
+	fmt.Println()
+	writeStatusTable(statusListColumns(data, data.Applies, true), data.Applies, func(a ActiveApplyData) string { return a.State })
+	writeStatusListFooter(data)
+}
+
+func writeActiveStatusHeader(data StatusListData, count int) {
+	if count == 1 {
+		fmt.Printf("%s1 active schema change%s%s\n", ANSIBold, ANSIReset, statusWindowSuffix(data))
+		return
+	}
+	fmt.Printf("%s%d active schema changes%s%s\n", ANSIBold, count, ANSIReset, statusWindowSuffix(data))
+}
+
+func writeEmptyStatusList(data StatusListData) {
+	filters := ""
+	if parts := statusFilterPhrases(data); len(parts) > 0 {
+		filters = " " + strings.Join(parts, ", ")
+	}
+	if data.FailuresOnly {
+		fmt.Printf("%sNo recent failed schema changes%s%s\n", ANSIDim, filters, ANSIReset)
+	} else {
+		fmt.Printf("%sNo recent schema changes%s%s\n", ANSIDim, filters, ANSIReset)
+	}
 }
 
 // writeStatusListTruncation says how much of the history a truncated page holds
@@ -1306,7 +1362,11 @@ func writeStatusTable[Row any](columns []statusColumn[Row], rows []Row, rowState
 // already do — the deployment's shared data-plane apply id and the
 // per-operation remote row id — and omits DEPLOYMENT, which every row repeats
 // back to the operator who named it.
-func statusListColumns(data StatusListData) []statusColumn[ActiveApplyData] {
+//
+// withDuration adds how long each apply ran, for finished applies: their start
+// time alone does not say when they ended. Active applies leave it out, since
+// their start time already says how long they have been running.
+func statusListColumns(data StatusListData, rows []ActiveApplyData, withDuration bool) []statusColumn[ActiveApplyData] {
 	columns := []statusColumn[ActiveApplyData]{
 		{header: "APPLY ID", value: func(a ActiveApplyData) string { return a.ApplyID }},
 	}
@@ -1337,9 +1397,28 @@ func statusListColumns(data StatusListData) []statusColumn[ActiveApplyData] {
 	columns = append(columns,
 		statusColumn[ActiveApplyData]{header: "STATE", colored: true, value: func(a ActiveApplyData) string { return state.Label(a.State) }},
 		statusColumn[ActiveApplyData]{header: "STARTED", value: func(a ActiveApplyData) string { return formatStartedAt(a.StartedAt) }},
+	)
+	if withDuration {
+		columns = append(columns,
+			statusColumn[ActiveApplyData]{header: "DURATION", value: finishedApplyDuration},
+		)
+	}
+	columns = append(columns,
 		statusColumn[ActiveApplyData]{header: "SOURCE", last: true, value: func(a ActiveApplyData) string { return applySource(a.Caller) }},
 	)
-	return retainPopulatedStatusColumns(columns, data.Applies)
+	return retainPopulatedStatusColumns(columns, rows)
+}
+
+// finishedApplyDuration is how long a finished apply ran. A stopped apply
+// records no completion time, because it can still be resumed, so its last
+// change, the stop, ends the span instead; measuring to now would make a
+// stopped apply's duration keep growing.
+func finishedApplyDuration(a ActiveApplyData) string {
+	end := a.CompletedAt
+	if end == "" {
+		end = a.UpdatedAt
+	}
+	return formatApplyDuration(a.StartedAt, end)
 }
 
 // retainPopulatedStatusColumns drops every optional column no row fills in.
