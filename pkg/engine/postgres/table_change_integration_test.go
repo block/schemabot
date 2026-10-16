@@ -210,6 +210,11 @@ func TestEngineCompareSchemaFileChangeRejectsFilesItCannotRun(t *testing.T) {
 			wantErr: "row security",
 		},
 		{
+			name:    "a file with a foreign key",
+			head:    "CREATE TABLE orders (id bigint PRIMARY KEY, note text, customer_id bigint REFERENCES customers (id));",
+			wantErr: "table orders declares foreign keys to customers, which the comparison does not cover",
+		},
+		{
 			name:     "a file the target rejects",
 			approved: "CREATE TABLE orders (id bigint PRIMARY KEY, note no_such_type);",
 			head:     "CREATE TABLE orders (id bigint PRIMARY KEY, note no_such_type);",

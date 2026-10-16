@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"slices"
+	"strings"
 
 	"github.com/block/pg-sprite/pkg/schemadiff"
 	"github.com/block/pg-sprite/pkg/statement"
@@ -49,7 +50,7 @@ const comparisonSchema = "public"
 // different change and keeps no approval.
 //
 // Each file must declare one table, the same one at all four commits, and no
-// row security. A file that does not, or that the target cannot run, is an
+// row security or foreign key. A file that does not, or that the target cannot run, is an
 // error: it proves nothing, and the caller treats the file as changed.
 func (e *Engine) CompareSchemaFileChange(ctx context.Context, req *ternv1.CompareSchemaFileChangeRequest) (*ternv1.CompareSchemaFileChangeResponse, error) {
 	if req == nil {
@@ -102,7 +103,9 @@ func (e *Engine) CompareSchemaFileChange(ctx context.Context, req *ternv1.Compar
 
 	var models [len(files)]schemadiff.Model
 	for i, d := range desired {
-		m, err := schemadiff.IntrospectDesired(ctx, pool, d)
+		// The schema names where a foreign key's referenced tables are read
+		// from; comparableSchema admits no foreign key, so nothing reads it.
+		m, err := schemadiff.IntrospectDesired(ctx, pool, "", d)
 		if err != nil {
 			return nil, fmt.Errorf("compare PostgreSQL schema file for database %q: run table %s at the %s: %w", e.pullDatabase, table, files[i].name, err)
 		}
@@ -119,7 +122,10 @@ func (e *Engine) CompareSchemaFileChange(ctx context.Context, req *ternv1.Compar
 }
 
 // comparableSchema admits a schema file the comparison can run: one table
-// declaration with no row security, which the ordinary planner manages.
+// declaration with no row security, which the ordinary planner manages, and no
+// foreign key. Running a foreign key needs the namespace its referenced tables
+// live in, which the request does not carry, and SchemaBot never applies a
+// PostgreSQL foreign key anyway.
 func comparableSchema(content string) (statement.DesiredSchema, error) {
 	file, err := statement.ParseDesiredFile(content)
 	if err != nil {
@@ -131,6 +137,9 @@ func comparableSchema(content string) (statement.DesiredSchema, error) {
 	schema, ok := file.Schema()
 	if !ok {
 		return statement.DesiredSchema{}, fmt.Errorf("the parse admitted no table declaration")
+	}
+	if referenced := schema.ReferencedTables(); len(referenced) > 0 {
+		return statement.DesiredSchema{}, fmt.Errorf("table %s declares foreign keys to %s, which the comparison does not cover", schema.Table(), strings.Join(referenced, ", "))
 	}
 	return schema, nil
 }
