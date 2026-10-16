@@ -1467,6 +1467,54 @@ func TestLaunchAtomicResumeAllRevertedTasksTerminalizeAsReverted(t *testing.T) {
 	assert.Equal(t, state.Task.Reverted, tasks[0].State, "terminal task state must not be rewritten by the resume")
 }
 
+// A Vitess apply paused for retry is recovered by handing the engine the
+// persisted state of its deploy request, which keeps running on the provider.
+// A transient error while reattaching to it (the provider rate limiting the
+// deploy request lookup) says nothing about the change, so the recovery pauses
+// the apply again for a later claim to reattach, instead of failing an apply
+// whose deploy request is still live. A resume with no persisted engine work
+// starts fresh and keeps the start-of-work policy, and a revert-phase apply is
+// never paused, so both fail on the same error.
+func TestGroupedResumeTransientReattachFailurePausesVitessApply(t *testing.T) {
+	persisted := &storage.EngineResumeState{
+		ApplyOperationID: 7,
+		MigrationContext: "ctx-reattach",
+		Metadata:         `{"branch_name":"branch-1","deploy_request_id":5}`,
+	}
+	cases := []struct {
+		name       string
+		stored     *storage.EngineResumeState
+		applyState string
+		taskState  string
+		wantApply  string
+		wantTask   string
+	}{
+		{"paused apply reattaching to its deploy request pauses again", persisted, state.Apply.FailedRetryable, state.Task.Pending, state.Apply.FailedRetryable, state.Task.FailedRetryable},
+		{"resume with no persisted engine work fails", nil, state.Apply.FailedRetryable, state.Task.Pending, state.Apply.Failed, state.Task.Failed},
+		{"revert-phase apply reattaching to its deploy request fails", persisted, state.Apply.RevertWindow, state.Task.RevertWindow, state.Apply.Failed, state.Task.Failed},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			client, apply, tasks, plan, applyStore := reattachResumeFixture(&exactProgressApplyOperationStore{data: tc.stored}, nil)
+			client.planetscaleEngine.(*fakeControlEngine).applyErr = errors.New("get deploy request #5 on resume: rate limited")
+			apply.State = tc.applyState
+			tasks[0].State = tc.taskState
+
+			err := client.launchAtomicResume(t.Context(), apply, tasks, plan, apply.GetOptions().Map(), "Apply resumed from checkpoint", false, false, false)
+			require.Error(t, err)
+			assert.Equal(t, tc.stored != nil, errors.Is(err, errReattachToAcceptedWorkFailed))
+			handled := client.handleGroupedResumeFailure(t.Context(), apply, tasks, err)
+
+			assert.Equal(t, tc.wantApply, applyStore.apply.State)
+			assert.Equal(t, tc.wantTask, tasks[0].State)
+			assert.Contains(t, applyStore.apply.ErrorMessage, "rate limited")
+			if tc.wantApply == state.Apply.FailedRetryable {
+				assert.NoError(t, handled, "the pause is stored, so the drive exits cleanly")
+			}
+		})
+	}
+}
+
 // After the engine accepts a grouped Vitess apply, a deploy request is live on
 // the provider. A failure to persist the engine resume state is storage
 // uncertainty, not a failed schema change: the apply pauses for operator retry

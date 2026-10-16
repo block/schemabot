@@ -591,3 +591,28 @@ func TestPollForCompletionAtomic_VitessProgressOutagePausesApplyForRetry(t *test
 	}
 	assert.NotContains(t, recording.states, state.Task.Failed, "no task is failed outright")
 }
+
+// Once a Vitess apply has cut over and its revert window is open, the
+// revert-phase task states are what make a recovery claim reattach to the
+// deploy request instead of settling the tasks from a schema comparison that
+// matches the reviewed target until a revert lands. A progress outage in that
+// phase therefore never pauses the apply as failed_retryable, which would
+// rewrite those states and let recovery complete an apply the provider can
+// still revert: no task is ever written failed_retryable, and the apply is
+// failed rather than left for a recovery to settle as completed.
+func TestPollForCompletionAtomic_VitessProgressOutageInRevertWindowDoesNotPause(t *testing.T) {
+	eng := &erroringProgressEngine{}
+	client, apply, tasks, recording := lostWorkAtomicPollFixtureInState(eng, lostWorkTrustBudgetAmple, state.Task.RevertWindow)
+	apply.State = state.Apply.RevertWindow
+	client.storage.(*exactProgressStorage).applies.(*snapshotApplyStore).stored.State = state.Apply.RevertWindow
+
+	require.NoError(t, client.pollForCompletionAtomic(t.Context(), apply, tasks, nil, nil, map[string]string{}, false))
+
+	assert.Equal(t, maxConsecutiveProgressPollErrors, eng.calls, "the poll spends its whole error budget first")
+	assert.Equal(t, state.Apply.Failed, apply.State, "a revert-phase apply is not paused for a recovery to settle from schema")
+	assert.Contains(t, apply.ErrorMessage, fmt.Sprintf("progress polling failed after %d consecutive errors", maxConsecutiveProgressPollErrors))
+	assert.NotContains(t, recording.states, state.Task.FailedRetryable, "no revert-phase task is rewritten failed_retryable")
+	for _, task := range tasks {
+		assert.NotEqual(t, state.Task.Completed, task.State, "task %s", task.TaskIdentifier)
+	}
+}

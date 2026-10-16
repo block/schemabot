@@ -1503,6 +1503,9 @@ func (c *LocalClient) launchAtomicResume(ctx context.Context, apply *storage.App
 		},
 	})
 	if err != nil {
+		if resumeStateHoldsAcceptedWork(resumeState) {
+			return fmt.Errorf("%w: engine apply failed: %w", errReattachToAcceptedWorkFailed, err)
+		}
 		return fmt.Errorf("engine apply failed: %w", err)
 	}
 	if !result.Accepted {
@@ -1637,6 +1640,21 @@ func (c *LocalClient) persistReattachedResumeStates(ctx context.Context, apply *
 // a later attempt can retry against intact storage — failing the apply here
 // would abandon engine work that is still in flight on the provider.
 var errGroupedResumeStateUnavailable = errors.New("grouped resume state unavailable")
+
+// errReattachToAcceptedWorkFailed marks a grouped resume whose engine apply
+// failed while handing the engine the resume state persisted for work it had
+// already accepted. The engine was reattaching to that work, not starting new
+// work, so the failure takes the accepted-work retry policy rather than the
+// one for starting engine work.
+var errReattachToAcceptedWorkFailed = errors.New("reattach to accepted engine work failed")
+
+// resumeStateHoldsAcceptedWork reports whether a grouped resume hands the
+// engine persisted state for work it already accepted, so the engine
+// reattaches to that work rather than starting fresh from the schema change
+// context alone.
+func resumeStateHoldsAcceptedWork(resumeState *engine.ResumeState) bool {
+	return resumeState != nil && resumeState.Metadata != ""
+}
 
 // errRevertPhaseTaskInSequentialResume marks a sequential resume that found a
 // task in an engine-monitored revert phase. Only the grouped drive reattaches
@@ -3027,7 +3045,7 @@ func (c *LocalClient) handleGroupedResumeFailure(ctx context.Context, apply *sto
 	if c.driveCancelled(ctx, apply, "while resuming the apply") {
 		return nil
 	}
-	if c.shouldRetryEngineError(err) {
+	if c.shouldPauseGroupedResumeFailure(apply, tasks, err) {
 		logger.Warn("engine apply failed during recovery, pausing apply for operator retry",
 			"error", err)
 		return c.markApplyRetryableWithTasks(ctx, apply, tasks, err.Error())
@@ -3042,6 +3060,18 @@ func (c *LocalClient) handleGroupedResumeFailure(ctx context.Context, apply *sto
 		return nil
 	}
 	return err
+}
+
+// shouldPauseGroupedResumeFailure decides whether a refused grouped resume
+// pauses the apply for operator retry. A failure reattaching to work the
+// engine already accepted takes the accepted-work policy, since that work
+// keeps running whatever this drive concludes and a later claim reattaches to
+// it again; any other refusal takes the policy for starting engine work.
+func (c *LocalClient) shouldPauseGroupedResumeFailure(apply *storage.Apply, tasks []*storage.Task, err error) bool {
+	if errors.Is(err, errReattachToAcceptedWorkFailed) {
+		return c.shouldPauseAcceptedWork(apply, tasks, err)
+	}
+	return c.shouldRetryEngineError(err)
 }
 
 func (c *LocalClient) dispatchQueuedApply(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, plan *storage.Plan, options map[string]string, releaseAtCutoverBarrier bool) error {

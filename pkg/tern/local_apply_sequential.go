@@ -1571,6 +1571,30 @@ func (c *LocalClient) shouldRetryAcceptedWorkError(err error) bool {
 	return recoveryResumesFromCheckpoint(c.config.Type) || recoveryReattachesToAcceptedWork(c.config.Type)
 }
 
+// shouldPauseAcceptedWork decides whether a retryable error observing,
+// driving, or reattaching to work the engine already accepted pauses the apply
+// as failed_retryable. It applies shouldRetryAcceptedWorkError, except while
+// the apply is in its revert phase: the pause rewrites every non-terminal task
+// as failed_retryable, which erases the revert-phase task states that make a
+// recovery reattach to the engine instead of settling the tasks from a schema
+// comparison that, post-cutover, matches the reviewed target until a revert
+// lands. A revert-phase apply is therefore never paused here, so its outcome
+// is never decided by that comparison.
+func (c *LocalClient) shouldPauseAcceptedWork(apply *storage.Apply, tasks []*storage.Task, err error) bool {
+	if revertPhaseInFlight(apply, tasks) {
+		c.logger.Warn("apply is in its revert phase, so it fails instead of pausing for retry: a pause would erase the revert-phase task states recovery reattaches by",
+			append(apply.LogAttrs(), "error", err)...)
+		return false
+	}
+	return c.shouldRetryAcceptedWorkError(err)
+}
+
+// revertPhaseInFlight reports whether the apply or any of its tasks sits in an
+// engine-monitored revert phase.
+func revertPhaseInFlight(apply *storage.Apply, tasks []*storage.Task) bool {
+	return applyInRevertPhase(apply) || firstRevertPhaseTask(tasks, 0) != nil
+}
+
 // recoveryReattachesToAcceptedWork reports whether the database type's engine
 // keeps accepted work running outside SchemaBot and a re-claimed recovery
 // attempt reattaches to it through the persisted engine resume state. Vitess
