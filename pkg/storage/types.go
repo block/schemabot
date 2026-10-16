@@ -1634,6 +1634,13 @@ func (o ControlOperation) Valid() bool {
 	return false
 }
 
+// Command returns the operation spelled as the command an operator types
+// (skip-revert, not the stored skip_revert), for surfaces that name the command
+// back to them.
+func (o ControlOperation) Command() string {
+	return strings.ReplaceAll(string(o), "_", "-")
+}
+
 // retiredControlOperations are operations a previous release recognized that
 // this release removed. Durable rows and data-plane reports naming them can
 // survive an upgrade; no driver services them anymore, so consumers skip them

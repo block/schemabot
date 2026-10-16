@@ -1536,6 +1536,43 @@ func TestCompletePendingControlRequestsIfApplyResolved(t *testing.T) {
 		assert.Contains(t, control.failureReasons[0], "superseded by stop")
 	})
 
+	// A revert or skip-revert whose in-drive answer did not land is answered
+	// here by the outcome the apply reached, the same answer the drive would
+	// have given, rather than left pending for the reaper to re-list forever.
+	for _, tc := range []struct {
+		op            storage.ControlOperation
+		applyState    string
+		wantCompleted []storage.ControlOperation
+		wantFailed    []storage.ControlOperation
+		wantReason    string
+	}{
+		{op: storage.ControlOperationRevert, applyState: state.Apply.Reverted,
+			wantCompleted: []storage.ControlOperation{storage.ControlOperationRevert}},
+		{op: storage.ControlOperationRevert, applyState: state.Apply.Completed,
+			wantFailed: []storage.ControlOperation{storage.ControlOperationRevert},
+			wantReason: "the schema change completed before the revert could take effect; the change is live on the target"},
+		{op: storage.ControlOperationSkipRevert, applyState: state.Apply.Completed,
+			wantCompleted: []storage.ControlOperation{storage.ControlOperationSkipRevert}},
+		{op: storage.ControlOperationSkipRevert, applyState: state.Apply.Reverted,
+			wantFailed: []storage.ControlOperation{storage.ControlOperationSkipRevert},
+			wantReason: "the schema change reached Reverted before the skip-revert could take effect"},
+	} {
+		t.Run(fmt.Sprintf("settles a pending %s on a %s apply by its outcome", tc.op, tc.applyState), func(t *testing.T) {
+			applies := &getApplyStore{apply: &storage.Apply{ID: 9, ApplyIdentifier: "apply-done", State: tc.applyState}}
+			control := &fakeControlRequestStore{pending: map[storage.ControlOperation]*storage.ApplyControlRequest{
+				tc.op: pendingRequest(tc.op),
+			}}
+			svc := newStopReconcileTestService(applies, &markPendingStoppedRecordingStore{}, control)
+
+			require.NoError(t, svc.completePendingControlRequestsIfApplyResolved(t.Context(), svc.driverLogger(1), 9))
+			assert.Equal(t, tc.wantCompleted, control.completed)
+			assert.Equal(t, tc.wantFailed, control.failed)
+			if tc.wantReason != "" {
+				assert.Equal(t, []string{tc.wantReason}, control.failureReasons)
+			}
+		})
+	}
+
 	t.Run("no-op when nothing is pending", func(t *testing.T) {
 		applies := &getApplyStore{apply: &storage.Apply{ID: 9, ApplyIdentifier: "apply-done", State: state.Apply.Failed}}
 		control := &fakeControlRequestStore{}

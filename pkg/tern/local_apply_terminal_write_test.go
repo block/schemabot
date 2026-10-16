@@ -388,11 +388,47 @@ func TestResumeApplyWithTasks_NoRemainingWorkSettlesMootedRequests(t *testing.T)
 	assert.Equal(t, state.Apply.Completed, applies.stored.State)
 	assert.Equal(t, int64(-1), activeAppliesDelta(t, reader), "completing the apply releases it from the active-apply gauge")
 	require.Len(t, controlRequests.requests, 1)
-	assert.Equal(t, storage.ControlRequestCompleted, controlRequests.requests[0].Status,
-		"the completed outcome moots the pending revert")
+	assert.Equal(t, storage.ControlRequestFailed, controlRequests.requests[0].Status,
+		"the completed outcome outran the pending revert")
+	assert.True(t, hasLogMessageContaining(logs.logs, "Revert did not take effect: the schema change completed before the revert could take effect"),
+		"the apply history records that the revert never landed")
 	require.Len(t, observer.terminal, 1)
 	assert.Equal(t, state.Apply.Completed, observer.terminal[0].State)
 	assert.Empty(t, eng.applied, "an apply with no remaining work hands nothing to the engine")
+}
+
+// The same re-claimed apply with an operator's skip-revert pending instead.
+// The completed outcome is the revert window closing with the change kept,
+// which is what the skip-revert asked for, so the drive that stores it answers
+// the skip-revert as carried out rather than leaving it pending.
+func TestResumeApplyWithTasks_NoRemainingWorkCompletesPendingSkipRevert(t *testing.T) {
+	logs := &mockApplyLogStore{}
+	taskStore := &exactProgressTaskStore{}
+	c, _, apply, applies, tasks := newLandedSiblingResume(t, taskStore, logs)
+	plan := &storage.Plan{ID: 5}
+	apply.PlanID = plan.ID
+	applies.stored = *apply
+	store := c.storage.(*exactProgressStorage)
+	store.plans = &fakePlanStore{getByIDFn: func(int64) (*storage.Plan, error) { return plan, nil }}
+	controlRequests := pendingControlRequestStore(apply.ID, storage.ControlOperationSkipRevert)
+	store.controlRequests = controlRequests
+	for _, task := range tasks {
+		task.State = state.Task.Completed
+	}
+	taskStore.tasks = tasks
+	observer := &terminalRecordingObserver{}
+	c.SetObserver(apply.ID, observer)
+
+	require.NoError(t, c.resumeApplyWithTasks(t.Context(), apply, nil, tasks, nil, false, false))
+
+	assert.Equal(t, state.Apply.Completed, applies.stored.State)
+	require.Len(t, controlRequests.requests, 1)
+	assert.Equal(t, storage.ControlRequestCompleted, controlRequests.requests[0].Status,
+		"the completed outcome is the skip-revert having taken effect")
+	assert.False(t, hasLogMessageContaining(logs.logs, "did not take effect"),
+		"a skip-revert that took effect is not disclosed as not applied")
+	require.Len(t, observer.terminal, 1)
+	assert.Equal(t, state.Apply.Completed, observer.terminal[0].State)
 }
 
 // A grouped drive failed every task of an apply, then the write recording the
@@ -429,8 +465,8 @@ func TestResumeApplyWithTasks_SettledFailedTaskFailsTheApply(t *testing.T) {
 	assert.Equal(t, "deploy request 5 not found", applies.stored.ErrorMessage)
 	assert.Equal(t, state.Task.Failed, failed.State, "a failed task stays failed")
 	require.Len(t, controlRequests.requests, 1)
-	assert.Equal(t, storage.ControlRequestCompleted, controlRequests.requests[0].Status,
-		"the failed outcome moots the pending revert")
+	assert.Equal(t, storage.ControlRequestFailed, controlRequests.requests[0].Status,
+		"the failed outcome outran the pending revert")
 	require.Len(t, observer.terminal, 1)
 	assert.Equal(t, state.Apply.Failed, observer.terminal[0].State)
 	assert.Empty(t, eng.applied, "an apply whose tasks are all settled hands nothing to the engine")
@@ -715,7 +751,7 @@ func TestResumeApplyWithTasks_BlockedTaskFailureOwesEveryTerminalSideEffect(t *t
 		{
 			name:             "request writes land",
 			wantStartStatus:  storage.ControlRequestFailed,
-			wantRevertStatus: storage.ControlRequestCompleted,
+			wantRevertStatus: storage.ControlRequestFailed,
 		},
 		{
 			name:             "request writes are refused",
@@ -847,8 +883,8 @@ func TestExecuteGroupedApply_FailureReturnsOweTerminalSideEffects(t *testing.T) 
 			assert.Contains(t, applyStore.apply.ErrorMessage, tc.wantErrorText)
 			assert.Equal(t, state.Task.Failed, tasks[0].State)
 			require.Len(t, requests.requests, 1)
-			assert.Equal(t, storage.ControlRequestCompleted, requests.requests[0].Status,
-				"the failed outcome moots the pending revert")
+			assert.Equal(t, storage.ControlRequestFailed, requests.requests[0].Status,
+				"the failed outcome outran the pending revert")
 			require.Len(t, observer.terminal, 1, "the stored failure owes its terminal summary")
 			assert.Equal(t, state.Apply.Failed, observer.terminal[0].State)
 		})
@@ -880,7 +916,7 @@ func TestPollForCompletionAtomic_OutcomeSideEffectsWaitForTheStoredOutcome(t *te
 		{
 			name:              "outcome write lands",
 			wantStoredState:   state.Apply.Completed,
-			wantRevertStatus:  storage.ControlRequestCompleted,
+			wantRevertStatus:  storage.ControlRequestFailed,
 			wantTerminalCalls: 1,
 		},
 	}
@@ -951,10 +987,11 @@ func (s *lostReplyDerivedStateApplyStore) CheckLease(_ context.Context, lease st
 // drive's lease, the write landed: the drive takes the stored row as its own
 // and answers for the outcome the way a write with a reply would, rather than
 // leaving it for the next restart's reconciliation. A completed, failed, or
-// stopped apply settles the revert it moots and posts its terminal summary; a
+// stopped apply answers the revert it outran as not applied (none of them is
+// the reverted outcome the revert asked for) and posts its terminal summary; a
 // stopped apply stays counted on the active-apply gauge and the others release
-// it. A failed_retryable pause settles the revert, releases the gauge, and
-// sends a progress update rather than a terminal summary. When the stored row
+// it. A failed_retryable pause answers the revert the same way, releases the
+// gauge, and sends a progress update rather than a terminal summary. When the stored row
 // carries another lease's token, nothing proves the write was this drive's
 // (OW-2): the drive exits with the write error, the revert stays pending,
 // nothing posts, and the gauge is left alone.
@@ -977,7 +1014,7 @@ func TestPollForCompletionAtomic_SettledWriteWithALostReplyIsAdoptedOnlyUnderThi
 			result:            engine.ProgressResult{State: engine.StateCompleted},
 			storedToken:       "tok-a",
 			wantState:         state.Apply.Completed,
-			wantRevertStatus:  storage.ControlRequestCompleted,
+			wantRevertStatus:  storage.ControlRequestFailed,
 			wantTerminalCalls: 1,
 			wantGaugeDelta:    -1,
 		},
@@ -986,7 +1023,7 @@ func TestPollForCompletionAtomic_SettledWriteWithALostReplyIsAdoptedOnlyUnderThi
 			result:            engine.ProgressResult{State: engine.StateFailed, ErrorMessage: engineFailure},
 			storedToken:       "tok-a",
 			wantState:         state.Apply.Failed,
-			wantRevertStatus:  storage.ControlRequestCompleted,
+			wantRevertStatus:  storage.ControlRequestFailed,
 			wantTerminalCalls: 1,
 			wantGaugeDelta:    -1,
 		},
@@ -995,7 +1032,7 @@ func TestPollForCompletionAtomic_SettledWriteWithALostReplyIsAdoptedOnlyUnderThi
 			result:            engine.ProgressResult{State: engine.StateStopped},
 			storedToken:       "tok-a",
 			wantState:         state.Apply.Stopped,
-			wantRevertStatus:  storage.ControlRequestCompleted,
+			wantRevertStatus:  storage.ControlRequestFailed,
 			wantTerminalCalls: 1,
 			wantGaugeDelta:    0,
 		},
@@ -1004,7 +1041,7 @@ func TestPollForCompletionAtomic_SettledWriteWithALostReplyIsAdoptedOnlyUnderThi
 			result:            engine.ProgressResult{State: engine.StateFailed, Retryable: true, ErrorMessage: engineFailure},
 			storedToken:       "tok-a",
 			wantState:         state.Apply.FailedRetryable,
-			wantRevertStatus:  storage.ControlRequestCompleted,
+			wantRevertStatus:  storage.ControlRequestFailed,
 			wantProgressCalls: 1,
 			wantGaugeDelta:    -1,
 		},
@@ -1508,7 +1545,7 @@ func TestPollForCompletionAtomic_PermanentFailureSideEffectsWaitForTheStoredFail
 			name:              "failure write lands",
 			wantStoredState:   state.Apply.Failed,
 			wantDriveState:    state.Apply.Failed,
-			wantRevertStatus:  storage.ControlRequestCompleted,
+			wantRevertStatus:  storage.ControlRequestFailed,
 			wantTerminalCalls: 1,
 		},
 	}
@@ -1627,7 +1664,7 @@ func TestFailApplyAndNotify_LandedWriteWithALostReplyOwesItsSideEffects(t *testi
 	assert.Equal(t, state.Apply.Failed, drive.State, "the drive adopts the outcome storage holds")
 	require.Len(t, controlRequests.requests, 2)
 	assert.Equal(t, storage.ControlRequestFailed, controlRequests.requests[0].Status, "the admitting start is answered with the failure")
-	assert.Equal(t, storage.ControlRequestCompleted, controlRequests.requests[1].Status, "the failure moots the pending revert")
+	assert.Equal(t, storage.ControlRequestFailed, controlRequests.requests[1].Status, "the failure outran the pending revert")
 	assert.True(t, hasLogMessageContaining(logs.logs, "Apply failed: engine lost its connection to the target"))
 	require.Len(t, observer.terminal, 1)
 	assert.Equal(t, state.Apply.Failed, observer.terminal[0].State)
