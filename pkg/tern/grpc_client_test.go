@@ -10607,13 +10607,14 @@ func TestDefaultRPCDeadlineEndsAHungCall(t *testing.T) {
 // bound would cut its legitimate work off.
 func TestGRPCMethodDeadlineCoversEveryTernRPC(t *testing.T) {
 	heavy := map[string]bool{
-		ternv1.Tern_Apply_FullMethodName:             true,
-		ternv1.Tern_Plan_FullMethodName:              true,
-		ternv1.Tern_PlanDiff_FullMethodName:          true,
-		ternv1.Tern_PullSchema_FullMethodName:        true,
-		ternv1.Tern_Revert_FullMethodName:            true,
-		ternv1.Tern_SkipRevert_FullMethodName:        true,
-		ternv1.Tern_StorageSchemaPlan_FullMethodName: true,
+		ternv1.Tern_Apply_FullMethodName:                   true,
+		ternv1.Tern_Plan_FullMethodName:                    true,
+		ternv1.Tern_PlanDiff_FullMethodName:                true,
+		ternv1.Tern_CompareSchemaFileChange_FullMethodName: true,
+		ternv1.Tern_PullSchema_FullMethodName:              true,
+		ternv1.Tern_Revert_FullMethodName:                  true,
+		ternv1.Tern_SkipRevert_FullMethodName:              true,
+		ternv1.Tern_StorageSchemaPlan_FullMethodName:       true,
 	}
 	control := map[string]bool{
 		ternv1.Tern_Progress_FullMethodName: true,
