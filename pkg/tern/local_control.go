@@ -364,7 +364,7 @@ func (c *LocalClient) processPendingCutoverControlRequest(ctx context.Context, a
 		return completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCutover)
 	}
 	if cutoverRequestFailedByApplyState(apply.State) {
-		message := fmt.Sprintf("cutover request was not applied because apply is %s", apply.State)
+		message := cutoverNotAppliedMessage(apply.State)
 		if err := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCutover, message); err != nil {
 			return err
 		}
@@ -392,6 +392,10 @@ func (c *LocalClient) processPendingCutoverControlRequest(ctx context.Context, a
 		message := "schema change has a pending stop request; cutover is blocked until stop is processed"
 		return fmt.Errorf("process pending cutover for apply %s: %s", apply.ApplyIdentifier, message)
 	}
+	preCutoverState, err := preCutoverStateForRestore(ctx, c.storage, apply)
+	if err != nil {
+		return fmt.Errorf("process pending cutover for apply %s: %w", apply.ApplyIdentifier, err)
+	}
 	if err := markApplyCuttingOverForControlRequest(ctx, c.storage, apply, logger); err != nil {
 		return err
 	}
@@ -408,24 +412,28 @@ func (c *LocalClient) processPendingCutoverControlRequest(ctx context.Context, a
 			append(apply.MutableLogAttrs(), "requested_by", controlRequestCaller(controlReq), "error", err)...)
 		return nil
 	}
+	// Each branch where the engine did not take the cutover restores the
+	// pre-cutover state before failing the request, so the apply is not left
+	// stored as cutting_over with no cutover behind it.
 	if err != nil {
-		errorMessage := err.Error()
-		if failErr := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCutover, errorMessage); failErr != nil {
-			return fmt.Errorf("process pending cutover for apply %s: %w; fail pending cutover request: %w", apply.ApplyIdentifier, err, failErr)
+		if failErr := failUnacceptedCutoverRequest(ctx, c.storage, apply, preCutoverState, err.Error(), logger); failErr != nil {
+			return fmt.Errorf("process pending cutover for apply %s: %w; %w", apply.ApplyIdentifier, err, failErr)
 		}
 		return fmt.Errorf("process pending cutover for apply %s: %w", apply.ApplyIdentifier, err)
 	}
+	// cutover answers an engine that yields no result as a refusal, so this
+	// branch guards that contract rather than a path the engine can reach.
 	if resp == nil {
 		errorMessage := "the cutover path returned neither a response nor an error"
-		if err := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCutover, errorMessage); err != nil {
-			return err
+		if err := failUnacceptedCutoverRequest(ctx, c.storage, apply, preCutoverState, errorMessage, logger); err != nil {
+			return fmt.Errorf("process pending cutover for apply %s: %s: %w", apply.ApplyIdentifier, errorMessage, err)
 		}
 		return fmt.Errorf("process pending cutover for apply %s: %s", apply.ApplyIdentifier, errorMessage)
 	}
 	if !resp.Accepted {
 		errorMessage := controlRefusalMessage(storage.ControlOperationCutover, resp.ErrorMessage)
-		if err := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCutover, errorMessage); err != nil {
-			return err
+		if err := failUnacceptedCutoverRequest(ctx, c.storage, apply, preCutoverState, errorMessage, logger); err != nil {
+			return fmt.Errorf("process pending cutover for apply %s: %s: %w", apply.ApplyIdentifier, errorMessage, err)
 		}
 		return fmt.Errorf("process pending cutover for apply %s: %s", apply.ApplyIdentifier, errorMessage)
 	}
@@ -1299,7 +1307,7 @@ func (c *LocalClient) processPendingStopControlRequest(ctx context.Context, appl
 	// Bind the apply's identity once so every consumption log line is
 	// filterable by apply_id/repo/pr without hand-listing the attrs per call.
 	logger := c.logger.With(apply.IdentityLogAttrs()...)
-	if completed, err := completePendingRequestIfStoredApplyResolved(ctx, c.storage, apply, storage.ControlOperationStop); err != nil {
+	if completed, err := completePendingStopIfStoredApplyResolved(ctx, c.storage, logger, apply); err != nil {
 		return false, err
 	} else if completed {
 		logger.Info("completing pending stop request for resolved apply",
@@ -1315,7 +1323,7 @@ func (c *LocalClient) processPendingStopControlRequest(ctx context.Context, appl
 			"state", apply.State)
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStopRequested, storage.LogSourceSchemaBot,
 			fmt.Sprintf("Pending stop request completed for terminal apply%s", callerApplyLogSuffix(controlRequestCaller(controlReq))), "", "")
-		if err := completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationStop); err != nil {
+		if err := completePendingStopControlRequest(ctx, c.storage, logger, apply); err != nil {
 			return false, err
 		}
 		return c.stopStandsDownUnlessStartPending(ctx, logger, apply)
@@ -1377,7 +1385,7 @@ func (c *LocalClient) processPendingStopControlRequest(ctx context.Context, appl
 		// drive keeps going: no stop took effect.
 		return false, c.failRefusedControlRequest(stopCtx, logger, apply, storage.ControlOperationStop, storage.LogEventStopRequested, controlReq, resp.ErrorMessage)
 	}
-	completed, err := completePendingRequestIfStoredApplyResolved(stopCtx, c.storage, apply, storage.ControlOperationStop)
+	completed, err := completePendingStopIfStoredApplyResolved(stopCtx, c.storage, logger, apply)
 	if err != nil {
 		return false, err
 	}
@@ -2498,7 +2506,7 @@ func (c *LocalClient) boundCutoverRequestTurn(ctx context.Context, apply *storag
 		return false, fmt.Errorf("load apply_operation %d the pending cutover of apply %s is for: %w", boundID, apply.ApplyIdentifier, err)
 	}
 	if bound == nil {
-		message := fmt.Sprintf("cutover request was not applied because the operation it was sent for (%d) does not exist", boundID)
+		message := boundCutoverMissingOperationMessage(boundID)
 		logger.Warn("failing pending cutover request bound to an operation that does not exist",
 			"requested_by", controlRequestCaller(controlReq), "bound_operation_id", boundID)
 		return false, failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCutover, message)
@@ -2512,7 +2520,7 @@ func (c *LocalClient) boundCutoverRequestTurn(ctx context.Context, apply *storag
 		logger.Warn("failing pending cutover request whose operation ended without cutting over",
 			append(bound.LogAttrs(), "requested_by", controlRequestCaller(controlReq))...)
 		return false, failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCutover,
-			fmt.Sprintf("cutover request was not applied because the operation it was sent for is %s", bound.State))
+			boundCutoverOperationEndedMessage(bound.State))
 	}
 	logger.Debug("pending cutover request is bound to a sibling operation; leaving it for that operation's drive",
 		"requested_by", controlRequestCaller(controlReq), "bound_operation_id", boundID, "drive_operation_id", driveOperationID)

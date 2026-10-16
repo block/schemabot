@@ -1142,6 +1142,45 @@ func TestPostgresApplyOperationLeaseGuards(t *testing.T) {
 	})
 }
 
+// ListRecentTargets bounds a data plane's view of the targets it applied to by
+// the age of the apply on PostgreSQL too: the cutoff is rendered SQL, so it is
+// exercised on each dialect. A target whose only applies are older than the
+// lookback drops out, while one with any apply inside the window stays.
+func TestPostgresListRecentTargetsWindow(t *testing.T) {
+	dsn, fixtureDB := testutil.StartPostgres(t, "sqlstore_recent_targets_window")
+	db, err := postgresconn.Open(dsn)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	require.NoError(t, db.PingContext(t.Context()))
+	applyPostgresTestSchema(t, fixtureDB)
+	clearPostgresTables(t, db)
+
+	ctx := t.Context()
+	store := NewPostgres(db)
+	lock := storagetest.CreateLock(t, store, "orders", storage.DatabaseTypeVitess)
+	seed := func(t *testing.T, applyID string, planID int64, target string, age time.Duration) {
+		t.Helper()
+		apply := storagetest.CreateApplyWithStateAndEnv(t, store, lock, applyID, planID, state.Apply.Completed, "staging")
+		_, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+			ApplyID: apply.ID, Deployment: "region-a", Target: target,
+		})
+		require.NoError(t, err)
+		_, err = db.ExecContext(ctx,
+			fmt.Sprintf(`UPDATE applies SET created_at = CURRENT_TIMESTAMP - INTERVAL '%d seconds' WHERE id = $1`, int(age.Seconds())),
+			apply.ID)
+		require.NoError(t, err)
+	}
+	seed(t, "apply_stale_only", 9101, "orders-stale", 40*24*time.Hour)
+	seed(t, "apply_recent_old", 9102, "orders-recent", 40*24*time.Hour)
+	seed(t, "apply_recent_new", 9103, "orders-recent", 2*24*time.Hour)
+
+	targets, err := store.ApplyOperations().ListRecentTargets(ctx, storage.DatabaseTypeVitess, 30*24*time.Hour)
+	require.NoError(t, err)
+	assert.Equal(t, []storage.AppliedTarget{
+		{Database: "orders", Environment: "staging", Target: "orders-recent"},
+	}, targets)
+}
+
 func applyPostgresTestSchema(t *testing.T, db *sql.DB) {
 	t.Helper()
 	entries, err := schema.PostgresFS.ReadDir("postgres")
