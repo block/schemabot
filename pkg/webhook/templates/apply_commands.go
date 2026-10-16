@@ -171,7 +171,7 @@ func RenderPRCommandAuthorizationUnavailable(data ActorAuthorizationCommentData)
 
 // RenderUnsafeChangesBlocked renders a comment when unsafe changes are detected
 // and --allow-unsafe was not specified. Shows the plan DDL plus a blocking message
-// instructing the user to re-run with --allow-unsafe.
+// instructing the user to re-run the apply with --allow-unsafe added.
 func RenderUnsafeChangesBlocked(data PlanCommentData) string {
 	// Every target's plan renders when the apply runs other targets' plans, so
 	// the refusal shows what each would run. The refusal lists every unsafe
@@ -234,16 +234,18 @@ func renderUnsafeChangesBlocked(data PlanCommentData, budget *ddlBlockBudget) st
 	if data.Tenant != "" {
 		applyCmd += fmt.Sprintf(" --tenant %s", data.Tenant)
 	}
-	writeUnsafeChangesRejection(&sb, data, "Apply rejected", applyCmd+" --allow-unsafe")
+	writeUnsafeChangesRejection(&sb, data, "Apply rejected", applyCmd)
 
 	return appendAgentHint(offerSupportChannel(sb.String()), data.AgentHint)
 }
 
 // writeUnsafeChangesRejection writes the refusal for a command that would run
 // unsafe changes without `--allow-unsafe`: the heading names what was
-// rejected, each unsafe change is listed, and the comment ends in the exact
-// command that consents to them.
-func writeUnsafeChangesRejection(sb *strings.Builder, data PlanCommentData, rejected, retryCommand string) {
+// rejected, each unsafe change is listed, and the comment ends in the command
+// to re-run. Like the plan's apply instruction, the consent requirement leads
+// into the command and the flag stays out of the pasteable command, so
+// consenting to destroy data takes typing it.
+func writeUnsafeChangesRejection(sb *strings.Builder, data PlanCommentData, rejected, command string) {
 	sb.WriteString("---\n\n")
 	unsafeCount := countUnsafeFindings(data.UnsafeChanges)
 	fmt.Fprintf(sb, "**"+glyph.Refused+" %s**: %d unsafe %s detected\n", rejected, unsafeCount, pluralize("change", unsafeCount))
@@ -261,8 +263,13 @@ func writeUnsafeChangesRejection(sb *strings.Builder, data PlanCommentData, reje
 		writeAttributedChanges(sb, data.AttributedChanges)
 	}
 
-	sb.WriteString("**" + glyph.Escalation + " To proceed with these destructive changes, re-run with `--allow-unsafe`:**\n")
-	fmt.Fprintf(sb, "```\n%s\n```\n", retryCommand)
+	consent := unsafeConsent{
+		findings:    unsafeCount,
+		tables:      unsafeChangeTables(data.UnsafeChanges),
+		primaryOnly: !unsafeCountCoversEveryTarget(data.DeploymentDrift),
+	}
+	fmt.Fprintf(sb, "**%s To proceed with these destructive changes**, %s:\n", glyph.Escalation, consent.instruction())
+	fmt.Fprintf(sb, "```\n%s\n```\n", command)
 }
 
 // RenderBlockedChangesApplyRejected renders the rejection comment for an

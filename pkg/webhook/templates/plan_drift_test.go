@@ -1221,6 +1221,6 @@ func TestRenderUnsafeChangesBlocked_NamesOtherTargetsChanges(t *testing.T) {
 		"the refusal shows the plan the targets would run")
 	assert.Contains(t, out, "📋 **Plan**: **1** table to alter · rolling out to targets `primary/testapp_2`, `primary/testapp_3`\n")
 	assert.NotContains(t, out, "No schema changes detected\n\n---", "the refusal does not read as a no-op when other targets have work")
-	assert.Equal(t, 1, strings.Count(out, "`bikes`"), "each unsafe change is listed once")
-	assert.Contains(t, out, "schemabot apply -e production --allow-unsafe")
+	assert.Equal(t, 1, strings.Count(out, ". `bikes`"), "each unsafe change is listed once")
+	assert.Contains(t, out, "add `--allow-unsafe` to confirm 1 unsafe change on `bikes`:\n```\nschemabot apply -e production\n```")
 }
