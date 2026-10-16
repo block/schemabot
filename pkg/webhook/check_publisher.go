@@ -354,11 +354,16 @@ func (h *Handler) stoppedAppliesForPR(ctx context.Context, repo string, pr int, 
 }
 
 // prFilePaths extracts the changed-file paths from a PR file listing for
-// expected-participant matching.
+// expected-participant matching, including the schema path a rename vacated:
+// moving a participant's schema file out of its managed paths still changes
+// what that participant declares, so the participant must stay expected.
 func prFilePaths(files []ghclient.PRFile) []string {
 	paths := make([]string, 0, len(files))
 	for _, f := range files {
 		paths = append(paths, f.Filename)
+		if vacated, ok := ghclient.VacatedSchemaPath(f); ok && vacated != f.Filename {
+			paths = append(paths, vacated)
+		}
 	}
 	return paths
 }

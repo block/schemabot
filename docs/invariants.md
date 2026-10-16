@@ -529,7 +529,8 @@ it, that reads as blocking, never as not-applicable. A gate must not be removabl
 change it guards. *Enforced:* aggregate creation on head-commit events
 (`pkg/webhook/check_suite.go`, `pkg/webhook/pull_request.go`); config discovery, which resolves
 a config from the schema paths a PR vacates as well as those it changes (`FindConfigsForPRFiles`
-in `pkg/github/config.go`); required-check and
+in `pkg/github/config.go`), and the leader's expected-participant match, which counts a vacated
+schema path too (`prFilePaths` in `pkg/webhook/check_publisher.go`); required-check and
 environment-ordering gates (`pkg/webhook/apply_gating.go`, `pkg/webhook/check_prior_env.go`).
 
 ### MG-3: The rollup is conservative

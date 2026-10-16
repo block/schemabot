@@ -661,7 +661,7 @@ func isDiscoveryInputFile(filename string) bool {
 // declaring its tables, so discovery must still resolve the config that managed
 // the old path — as it does for a plain deletion.
 func renamedAwaySchemaPath(file PRFile) (string, bool) {
-	vacated, ok := vacatedSchemaPath(file)
+	vacated, ok := VacatedSchemaPath(file)
 	if !ok || vacated == file.Filename {
 		return "", false
 	}

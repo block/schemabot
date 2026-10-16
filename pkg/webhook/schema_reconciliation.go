@@ -150,7 +150,10 @@ func (h *Handler) convergeAggregatesForNoManagedSchemaChanges(ctx context.Contex
 
 func prHasCurrentSchemaBotFiles(files []ghclient.PRFile) bool {
 	for _, file := range files {
-		if strings.HasSuffix(file.Filename, ".sql") || strings.HasSuffix(file.Filename, "vschema.json") {
+		if ghclient.IsSchemaFile(file.Filename) {
+			return true
+		}
+		if _, vacated := ghclient.VacatedSchemaPath(file); vacated {
 			return true
 		}
 		if path.Base(file.Filename) == ghclient.ConfigFileName && !strings.EqualFold(file.Status, "removed") {

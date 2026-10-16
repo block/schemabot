@@ -46,6 +46,19 @@ func TestPRHasCurrentSchemaBotFiles(t *testing.T) {
 			want: true,
 		},
 		{
+			name: "schema file renamed to a disabled name still needs normal discovery",
+			files: []ghclient.PRFile{
+				{Filename: "schema/widgets/users.sql.disabled", PreviousFilename: "schema/widgets/users.sql", Status: "renamed"},
+			},
+			want: true,
+		},
+		{
+			name: "non schema file rename is not a managed schema change",
+			files: []ghclient.PRFile{
+				{Filename: "docs/guide.md", PreviousFilename: "docs/users.md", Status: "renamed"},
+			},
+		},
+		{
 			name: "modified config file needs normal discovery",
 			files: []ghclient.PRFile{
 				{Filename: "schema/schemabot.yaml", Status: "modified"},
