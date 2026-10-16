@@ -162,6 +162,11 @@ func writeTargetTables(b *strings.Builder, v RolloutView, g presentation.Group) 
 	settled := v.Model.RolloutSettled(g)
 	for i := range rolled {
 		rolled[i].UnreportedTargets = lineSilent
+		if lineSilent > 0 {
+			// The silent targets' sizes are not known, so a sum of the rest
+			// would understate the table.
+			rolled[i].EstimatedBytes = nil
+		}
 		rolled[i].RolloutSettled = settled
 		if covered := len(rolled[i].Shards) + lineSilent + lineSettled; covered < len(g.Members)-converged {
 			rolled[i].OnTargets = targetSubsetLabel(rolled[i].Shards, len(g.Members)-converged)
@@ -318,9 +323,10 @@ func tableAcrossTargets(v RolloutView, byMember map[rolloutMemberKey][]TableProg
 	statuses := make([]string, 0, len(members))
 	allInstant := true
 	// The plan's row estimates: planned for the targets that have not
-	// reported a copy yet, and every target's while each has one.
-	var planned, plannedAll int64
-	allPlanned := true
+	// reported a copy yet, and every target's while each has one. The plan's
+	// size is summed the same way, since each target copies its own data.
+	var planned, plannedAll, plannedBytes int64
+	allPlanned, allSized := true, true
 	for _, i := range members {
 		d := v.Model.Deployments[i]
 		for _, t := range byMember[rolloutMemberKey{d.Deployment, d.Target}] {
@@ -338,6 +344,11 @@ func tableAcrossTargets(v RolloutView, byMember map[rolloutMemberKey][]TableProg
 				PercentComplete: t.PercentComplete,
 			})
 			allInstant = allInstant && t.IsInstant
+			if t.EstimatedBytes == nil {
+				allSized = false
+			} else {
+				plannedBytes += *t.EstimatedBytes
+			}
 			if t.EstimatedRows == nil {
 				allPlanned = false
 			} else {
@@ -363,6 +374,9 @@ func tableAcrossTargets(v RolloutView, byMember map[rolloutMemberKey][]TableProg
 	rolled.IsInstant = len(statuses) > 0 && allInstant
 	if allPlanned && len(statuses) > 0 {
 		rolled.EstimatedRows = &plannedAll
+	}
+	if allSized && len(statuses) > 0 {
+		rolled.EstimatedBytes = &plannedBytes
 	}
 	if rolled.RowsTotal > 0 && planned > 0 {
 		// Some targets have reported their copy and the rest have not: the

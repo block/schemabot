@@ -761,9 +761,10 @@ func TestTableChangeTaskEstimatedBytes(t *testing.T) {
 
 // A task carries the plan's row estimate under the same whole-table rule as
 // its size: its own copy when it spans the table, none when scoped to a shard.
+// Only an ALTER copies rows, so a DROP of a sized table carries none.
 func TestTableChangeTaskEstimatedRows(t *testing.T) {
 	rows := int64(48_200_000)
-	change := TableChange{Table: "orders", EstimatedRows: &rows}
+	change := TableChange{Table: "orders", Operation: "alter", EstimatedRows: &rows}
 
 	whole := change.TaskEstimatedRows("")
 	require.NotNil(t, whole)
@@ -772,5 +773,8 @@ func TestTableChangeTaskEstimatedRows(t *testing.T) {
 	assert.Equal(t, int64(48_200_000), *change.EstimatedRows, "the task gets its own copy of the estimate")
 
 	assert.Nil(t, change.TaskEstimatedRows("-80"), "a shard-scoped task carries no whole-table estimate")
-	assert.Nil(t, TableChange{Table: "users"}.TaskEstimatedRows(""), "no estimate at plan time means none on the task")
+	assert.Nil(t, TableChange{Table: "users", Operation: "alter"}.TaskEstimatedRows(""), "no estimate at plan time means none on the task")
+
+	drop := TableChange{Table: "orders", Operation: "drop", EstimatedRows: &rows}
+	assert.Nil(t, drop.TaskEstimatedRows(""), "a drop copies no rows, so its task carries no row estimate")
 }

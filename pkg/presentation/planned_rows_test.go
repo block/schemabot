@@ -23,3 +23,10 @@ func TestCopyStillAhead(t *testing.T) {
 		assert.False(t, CopyStillAhead(s), "%s has no copy ahead for an estimate to stand in for", s)
 	}
 }
+
+// A planned row count names how many targets it is summed across without
+// claiming they are all of the rollout's, and reads naturally for one.
+func TestPlannedRowsSpan(t *testing.T) {
+	assert.Equal(t, " across 3 targets", PlannedRowsSpan(3))
+	assert.Equal(t, " on 1 target", PlannedRowsSpan(1))
+}

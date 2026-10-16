@@ -33,9 +33,11 @@ type rolloutTarget struct {
 	rowsTotal  int64
 	// estimatedRows is the plan's row estimate for the target's table.
 	estimatedRows *int64
-	eta           int64
-	err           string
-	externalID    string
+	// estimatedBytes is the plan's size estimate for the target's table.
+	estimatedBytes *int64
+	eta            int64
+	err            string
+	externalID     string
 	// externalOperationID is the target's own data-plane operation.
 	externalOperationID string
 	isInstant           bool
@@ -85,7 +87,7 @@ func targetRolloutData(targets []rolloutTarget) ProgressData {
 			Deployment: "prod", Target: name, Namespace: "orders", TableName: "orders",
 			ChangeType: "alter", DDL: ddl, Status: target.status,
 			RowsCopied: target.rowsCopied, RowsTotal: target.rowsTotal, ETASeconds: target.eta, PercentComplete: percent,
-			IsInstant: target.isInstant, EstimatedRows: target.estimatedRows,
+			IsInstant: target.isInstant, EstimatedRows: target.estimatedRows, EstimatedBytes: target.estimatedBytes,
 		})
 	}
 	return data
@@ -699,7 +701,24 @@ func TestFormatTargetRollup_QueuedTargetsCountByPlannedRows(t *testing.T) {
 	assert.Contains(t, out, "Rows: 500 / ~4k · ETA: ≥ "+ui.FormatETA(120)+"\n", "%s", out)
 
 	out = renderRollout(t, targetRolloutData([]rolloutTarget{queued(1_000), queued(1_200), queued(1_800)}))
-	assert.Contains(t, out, "Rows: ~4k across all 3 targets\n", "%s", out)
+	assert.Contains(t, out, "Rows: ~4k across 3 targets\n", "%s", out)
+
+	// Each target copies its own data, so the planned size is summed across
+	// the targets like the rows, and only while every target carries one.
+	sized := func(rows, bytes int64) rolloutTarget {
+		target := queued(rows)
+		target.estimatedBytes = &bytes
+		return target
+	}
+	totalBytes := int64(6_000_000_000)
+	out = renderRollout(t, targetRolloutData([]rolloutTarget{sized(1_000, 1_000_000_000), sized(1_200, 2_000_000_000), sized(1_800, 3_000_000_000)}))
+	assert.Contains(t, out, "Rows: ~4k across 3 targets"+ui.FormatTableSizeClause(&totalBytes)+"\n", "%s", out)
+	out = renderRollout(t, targetRolloutData([]rolloutTarget{sized(1_000, 1_000_000_000), sized(1_200, 2_000_000_000), queued(1_800)}))
+	assert.Contains(t, out, "Rows: ~4k across 3 targets\n", "a size summed without every target would understate the table:\n%s", out)
+	copying := copyingTarget(500)
+	copying.estimatedBytes = new(int64(1_000_000_000))
+	out = renderRollout(t, targetRolloutData([]rolloutTarget{copying, sized(1_200, 2_000_000_000), queuedTarget()}))
+	assert.NotContains(t, out, ui.FormatTableSizeClause(new(int64(3_000_000_000))), "a target that has reported nothing has no size to add:\n%s", out)
 
 	// A target that has reported nothing has no estimate to add, so a sum of
 	// the others would understate the table and none is shown.

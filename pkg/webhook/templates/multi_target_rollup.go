@@ -391,7 +391,7 @@ func writeTargetTableLine(sb *strings.Builder, table string, cells []TableProgre
 	writeDDL()
 	if status == state.Task.Pending && !settled {
 		if rows := targetsPlannedRows(cells, silent); rows != nil {
-			writePlannedRows(sb, rows, targetsTableBytes(cells, silent), fmt.Sprintf(" across all %d targets", len(cells)))
+			writePlannedRows(sb, rows, targetsTableBytes(cells, silent), presentation.PlannedRowsSpan(len(cells)))
 		}
 	}
 	if lists {

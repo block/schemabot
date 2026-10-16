@@ -580,9 +580,14 @@ func (tc TableChange) TaskEstimatedBytes(shard string) *int64 {
 
 // TaskEstimatedRows returns the row estimate a task created from this change
 // carries, under the same whole-table rule as TaskEstimatedBytes: a task
-// scoped to one shard carries none rather than the whole table's count.
+// scoped to one shard carries none rather than the whole table's count. Only
+// an ALTER copies rows, so a task for any other change carries none either:
+// the plan sizes a table it drops, but that is not work the task will copy.
 func (tc TableChange) TaskEstimatedRows(shard string) *int64 {
 	if shard != "" || tc.EstimatedRows == nil {
+		return nil
+	}
+	if !strings.EqualFold(tc.Operation, "alter") {
 		return nil
 	}
 	rows := *tc.EstimatedRows

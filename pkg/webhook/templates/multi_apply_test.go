@@ -909,7 +909,7 @@ func TestRenderMultiDeploymentApplyComment_QueuedTargetsCountByPlannedRows(t *te
 		queued("testapp_002", 1_200),
 		queued("testapp_003", 1_800),
 	)
-	assert.Contains(t, out, "- Rows: ~4k across all 3 targets\n")
+	assert.Contains(t, out, "- Rows: ~4k across 3 targets\n")
 }
 
 // A target past its copy that reports no rows copied an empty table, so its

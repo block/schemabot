@@ -12,6 +12,7 @@ import (
 	"github.com/block/schemabot/pkg/cmd/cliname"
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/glyph"
+	"github.com/block/schemabot/pkg/presentation"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/ui"
@@ -878,7 +879,7 @@ func writePlannedRows(b *strings.Builder, t TableProgress) {
 	}
 	span := ""
 	if t.AcrossTargets {
-		span = fmt.Sprintf(" across all %d targets", len(t.Shards))
+		span = presentation.PlannedRowsSpan(len(t.Shards))
 	}
 	fmt.Fprintf(b, indentDetail+"Rows: %s%s%s\n", ui.FormatApproxRows(*t.EstimatedRows), span, ui.FormatTableSizeClause(t.EstimatedBytes))
 }

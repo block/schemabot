@@ -1341,7 +1341,6 @@ func countTablesWithDDL(tables []TableProgressData) int {
 	return count
 }
 
-// writeRowsAndETA writes the rows copied / total line with optional ETA.
 // writePlannedRows writes the rows line of a table no engine has reported on
 // yet: the plan's row estimate and size, both approximate, so the work ahead
 // is visible before the copy starts. span names the targets the estimate
@@ -1354,6 +1353,7 @@ func writePlannedRows(sb *strings.Builder, estimatedRows, estimatedBytes *int64,
 	fmt.Fprintf(sb, "- Rows: %s%s%s\n", ui.FormatApproxRows(*estimatedRows), span, ui.FormatTableSizeClause(estimatedBytes))
 }
 
+// writeRowsAndETA writes the rows copied / total line with optional ETA.
 func writeRowsAndETA(sb *strings.Builder, table TableProgressData) {
 	if table.RowsTotal <= 0 {
 		return

@@ -24,7 +24,8 @@ func TestBuildApplyTaskCopiesExecutionVerdict(t *testing.T) {
 
 // Apply tasks carry the table's planned size and row count so progress can
 // show them beside the row counts, and before the copy reports any. A task
-// created for one shard of a table carries neither.
+// created for one shard of a table carries neither, and a drop carries the
+// table's size but no rows, since it copies none.
 func TestBuildApplyTaskCarriesPlanEstimates(t *testing.T) {
 	bytes := int64(23_400_000_000)
 	rows := int64(48_200_000)
@@ -40,6 +41,13 @@ func TestBuildApplyTaskCarriesPlanEstimates(t *testing.T) {
 	shardTask := buildApplyTask(plan, change, "production", storage.ApplyOptions{}, "-80", time.Now())
 	assert.Nil(t, shardTask.EstimatedBytes)
 	assert.Nil(t, shardTask.EstimatedRows)
+
+	drop := change
+	drop.Operation = "drop"
+	dropTask := buildApplyTask(plan, drop, "production", storage.ApplyOptions{}, "", time.Now())
+	require.NotNil(t, dropTask.EstimatedBytes)
+	assert.Equal(t, bytes, *dropTask.EstimatedBytes)
+	assert.Nil(t, dropTask.EstimatedRows, "a drop copies no rows")
 }
 
 // TestPullNamespaces exercises the API-boundary pull gate: requested
