@@ -1984,7 +1984,7 @@ func TestCheckReviewGate_CodeownersScopedToSchemaDirectory(t *testing.T) {
 			client, err := h.clientForRepo("octocat/hello-world", 12345)
 			require.NoError(t, err)
 
-			result, err := h.checkReviewGate(t.Context(), client, "octocat/hello-world", 1, reviewGateSchema(tt.schemaPath, reviewGateTestHeadSHA))
+			result, err := h.checkReviewGate(t.Context(), client, "octocat/hello-world", 1, "staging", reviewGateSchema(tt.schemaPath, reviewGateTestHeadSHA))
 			require.NoError(t, err)
 			require.NotNil(t, result)
 			assert.Equal(t, tt.wantApproved, result.Approved)
@@ -2022,7 +2022,7 @@ func TestCheckReviewGate_UnmatchedCodeownersWithoutOtherReviewersErrors(t *testi
 	client, err := h.clientForRepo("octocat/hello-world", 12345)
 	require.NoError(t, err)
 
-	result, err := h.checkReviewGate(t.Context(), client, "octocat/hello-world", 1, reviewGateSchema("schema/payments", reviewGateTestHeadSHA))
+	result, err := h.checkReviewGate(t.Context(), client, "octocat/hello-world", 1, "staging", reviewGateSchema("schema/payments", reviewGateTestHeadSHA))
 	require.Error(t, err)
 	assert.Nil(t, result)
 	assert.Contains(t, err.Error(), "no configured reviewers")
