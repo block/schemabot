@@ -561,20 +561,21 @@ func TestK8sMultiTarget_FailedTargetHaltsRollout(t *testing.T) {
 	assert.False(t, indexOn(t, dsns[1], "orders", "uq_note"), "shard 2 refused the reviewed DDL")
 }
 
-// mtFailedCopyRows keeps the failing shard's table small, so its copy reaches
-// the row that fails it within seconds.
-const mtFailedCopyRows = 10_000
+// mtFailedCopyRows sizes the failing shard's table so its copy is still
+// running when the drive starts the next shard, and reaches the failing row,
+// inserted last, well before the larger shard's copy is ready.
+const mtFailedCopyRows = mtCopyRows
 
-// Shard 2 has a note too long for the narrowed column, so its copy of orders
-// fails, under the default on_failure: halt. A duplicate would only fail the
-// checksum after the copy, whose retries are paced in seconds and outlast a
-// larger shard's copy. Every shard starts together. Shard 1 has nothing to
-// copy and cuts over ahead of the failure. Shard 2's copy fails within
-// seconds, while shard 3 is still copying a large table. Once shard 3's copy
-// is ready it holds at the cutover barrier behind the failure instead of
-// cutting over. A cancel releases shard 3 without cutting it over, and the
-// apply settles failed, naming shard 2, whose failed copy stays on the target
-// for a new apply to adopt.
+// Shard 2 has a note too long for the narrowed column in its last row, so its
+// copy of orders fails near the end, under the default on_failure: halt. A
+// duplicate would only fail the checksum after the copy, whose retries are
+// paced in seconds and outlast a larger shard's copy. The drive starts the
+// shards in order. Shard 1 has nothing to copy and cuts over ahead of the
+// failure. Shard 2's copy fails while shard 3 is still copying a table three
+// times its size. Once shard 3's copy is ready it holds at the cutover barrier
+// behind the failure instead of cutting over. A cancel releases shard 3
+// without cutting it over, and the apply settles failed, naming shard 2, whose
+// failed copy stays on the target for a new apply to adopt.
 func TestK8sMultiTarget_FailedCopyHoldsLaterTargetAtBarrier(t *testing.T) {
 	ep := testutil.Endpoint(t)
 	dsns := shardDSNs(t, mtShardApp)
