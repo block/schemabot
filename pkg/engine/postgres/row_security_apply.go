@@ -17,51 +17,40 @@ import (
 
 // A policy replacement is one reviewed operation and one transaction. Never
 // split its statements into ordinary independently committed DDL tasks.
-func planRowSecurityOperation(ctx context.Context, pool *pgxpool.Pool, namespace, sql string) (string, []engine.TableChange, bool, error) {
-	has, err := statement.HasRowSecurityDeclaration(sql)
-	if err != nil {
-		return "", nil, false, err
-	}
-	if !has {
-		return "", nil, false, nil
-	}
-	desired, err := statement.ParseDesiredWithRowSecurity(sql)
-	if err != nil {
-		return "", nil, true, err
-	}
+func planRowSecurityOperation(ctx context.Context, pool *pgxpool.Pool, namespace string, desired statement.DesiredWithRowSecurity) ([]engine.TableChange, error) {
 	// Equality is a catalog comparison, not execution authority. Avoid taking
 	// an exclusive target lock or requiring table ownership for unchanged files.
 	live, err := schemadiff.Introspect(ctx, pool, namespace, desired.Table())
 	if errors.Is(err, schemadiff.ErrTableNotFound) {
-		return desired.Table(), nil, true, fmt.Errorf("creating table %q.%q with managed row security is not supported: %w", namespace, desired.Table(), schemadiff.ErrUnsupportedChange)
+		return nil, fmt.Errorf("creating table %q.%q with managed row security is not supported: %w", namespace, desired.Table(), schemadiff.ErrUnsupportedChange)
 	}
 	if err != nil {
-		return desired.Table(), nil, true, err
+		return nil, err
 	}
 	wanted, err := schemadiff.IntrospectDesiredWithRowSecurity(ctx, pool, desired)
 	if err != nil {
-		return desired.Table(), nil, true, err
+		return nil, err
 	}
 	if _, err := schemadiff.DiffWithRowSecurity(namespace, live, wanted); err == nil {
-		return desired.Table(), nil, true, nil
+		return nil, nil
 	} else if !errors.Is(err, schemadiff.ErrUnsupportedChange) {
-		return desired.Table(), nil, true, err
+		return nil, err
 	}
 	// A delta still needs the executor's locked admission and fresh comparison.
 	preview, err := executor.PreviewRowSecurity(ctx, pool, namespace, desired, executor.Budget{
 		LockTimeout: optimisticLockTimeout, StatementTimeout: optimisticStatementLimit,
 	})
 	if err != nil {
-		return desired.Table(), nil, true, err
+		return nil, err
 	}
 	if len(preview.Statements) == 0 {
-		return desired.Table(), nil, true, nil
+		return nil, nil
 	}
-	return desired.Table(), []engine.TableChange{{
+	return []engine.TableChange{{
 		Table: desired.Table(), Operation: ddl.StatementAlterTable,
 		DDL:      strings.Join(preview.Statements, ";\n"),
 		IsUnsafe: true, UnsafeReason: "Row security changes alter who can access rows; review the complete policy and settings replacement",
-	}}, true, nil
+	}}, nil
 }
 
 func validateRowSecurityApply(req *engine.ApplyRequest, operation statement.RowSecurityChange) (nativeApply, error) {
@@ -79,19 +68,12 @@ func validateRowSecurityApply(req *engine.ApplyRequest, operation statement.RowS
 	}
 	var found *statement.DesiredWithRowSecurity
 	for _, name := range sortedKeys(files.Files) {
-		sql := files.Files[name]
-		has, err := statement.HasRowSecurityDeclaration(sql)
+		file, err := statement.ParseDesiredFile(files.Files[name])
 		if err != nil {
 			return nativeApply{}, fmt.Errorf("parse schema file %q: %w", name, err)
 		}
-		if !has {
-			continue
-		}
-		desired, err := statement.ParseDesiredWithRowSecurity(sql)
-		if err != nil {
-			return nativeApply{}, fmt.Errorf("parse row security file %q: %w", name, err)
-		}
-		if desired.Table() != tc.Table {
+		desired, ok := file.RowSecurity()
+		if !ok || desired.Table() != tc.Table {
 			continue
 		}
 		if found != nil {

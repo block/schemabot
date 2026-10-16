@@ -163,6 +163,23 @@ func TestRunStrandedReaperPassAnswersAStartStrandedOnASettledApply(t *testing.T)
 	})
 }
 
+// A revert left pending on an apply whose revert window expired into a
+// completed outcome is answered by the reaper as not applied: the change is
+// live on the target, so reporting the revert carried out would be false, and
+// leaving it pending would have every later pass list it again.
+func TestRunStrandedReaperPassAnswersARevertStrandedOnACompletedApply(t *testing.T) {
+	apply := &storage.Apply{ID: 9, ApplyIdentifier: "apply-window-expired", State: state.Apply.Completed}
+	svc, controls := strandedControlRequestReaperService(apply,
+		[]*storage.StrandedControlRequest{strandedRequest(apply, storage.ControlOperationRevert)},
+		storage.ControlOperationRevert)
+
+	svc.runStrandedReaperPass(t.Context())
+
+	assert.Empty(t, controls.completed)
+	assert.Equal(t, []storage.ControlOperation{storage.ControlOperationRevert}, controls.failed)
+	assert.Equal(t, []string{"the schema change completed before the revert could take effect; the change is live on the target"}, controls.failureReasons)
+}
+
 // The listing is per request but the settlement is per apply: it reloads the
 // apply and answers every pending request on it in one visit, so an apply that
 // stranded both a stop and a cancel is settled once, not once per row.
@@ -444,6 +461,16 @@ func (s *expiringApplyStore) ExpireRetryable(ctx context.Context, limit int) ([]
 	return s.expirations, nil
 }
 
+// Get serves the expired apply the pass reloads to publish its terminal summary.
+func (s *expiringApplyStore) Get(_ context.Context, id int64) (*storage.Apply, error) {
+	for _, expiration := range s.expirations {
+		if expiration.Apply.ID == id {
+			return expiration.Apply, nil
+		}
+	}
+	return nil, nil
+}
+
 // retryableExpiryService wires a service whose expiry pass is served by applies,
 // returning the store its apply-log writes land in.
 func retryableExpiryService(applies storage.ApplyStore) (*Service, *capturingApplyLogStore) {
@@ -495,6 +522,33 @@ func TestRunRetryableExpiryPassRecordsWhyRecoveryStoppedInTheApplyLog(t *testing
 	assert.Contains(t, entry.Message, string(storage.RetryableExpirationAttemptBudget))
 	assert.Equal(t, state.Apply.FailedRetryable, entry.OldState)
 	assert.Equal(t, state.Apply.Failed, entry.NewState)
+}
+
+// Expiry is the transition that makes a retrying apply terminal, and no driver
+// holds the apply to publish that outcome. The pass publishes the apply's
+// terminal summary itself, after recording why recovery stopped, so the PR
+// gets its failure summary and its Check Run leaves "in progress" instead of
+// keeping the last progress comment for an apply that has already failed.
+func TestRunRetryableExpiryPassPublishesTheTerminalSummary(t *testing.T) {
+	tasks := &terminalSummaryTaskStore{tasks: []*storage.Task{{TaskIdentifier: "task-1", ApplyID: 42, State: state.Task.Failed}}}
+	applyLogs := &capturingApplyLogStore{}
+	svc := newTestService()
+	svc.storage = &mockStorageWithApplyStores{applies: &expiringApplyStore{expirations: budgetExpiration()}, tasks: tasks, applyLogs: applyLogs}
+	var published []recordedTerminalSummary
+	svc.OnApplyTerminalSummary = func(_ context.Context, a *storage.Apply, ts []*storage.Task) error {
+		require.Len(t, applyLogs.logs, 1, "why recovery stopped is logged before the summary renders the apply's failure details")
+		published = append(published, recordedTerminalSummary{apply: a, tasks: ts})
+		return nil
+	}
+
+	svc.runRetryableExpiryPass(t.Context())
+
+	require.Len(t, published, 1, "the expired apply's terminal summary is published once")
+	assert.Equal(t, "apply-42", published[0].apply.ApplyIdentifier)
+	assert.Equal(t, state.Apply.Failed, published[0].apply.State)
+	require.Len(t, published[0].tasks, 1)
+	assert.Equal(t, "task-1", published[0].tasks[0].TaskIdentifier)
+	assert.True(t, tasks.called, "the summary reloads every task of the apply")
 }
 
 // A retryable-apply expiry is a control-plane lifecycle transition an operator

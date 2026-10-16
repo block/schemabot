@@ -232,12 +232,16 @@ const (
 // pushes more commits. The approval keeps counting while the PR's own change
 // to the database's schema inputs (schema directory, followed symlinks,
 // config, environment link) is the same at the head, however much the default
-// branch moved underneath it. When the PR's change differs at the head, the PR
-// is blocked until someone approves the head and the comment says why. When
-// the approved commit cannot be compared with the head, the approval does not
-// count and the PR is blocked the same way. When GitHub is unavailable during
-// the comparison, the gate cannot decide and returns a retryable evaluation
-// error, never a verdict.
+// branch moved underneath it. On a MySQL-family database that includes a
+// rebase that combined the PR's edit with a default branch edit to the same
+// table's file, as long as the PR's edit generates the same statements on
+// both bases and does not replace what the default branch changed; on
+// PostgreSQL, such a file is always a change. When the PR's change differs
+// at the head, the PR is blocked until someone approves the head and the
+// comment says why. When the approved commit cannot be compared with the
+// head, the approval does not count and the PR is blocked the same way. When
+// GitHub is unavailable during the comparison, the gate cannot decide and
+// returns a retryable evaluation error, never a verdict.
 func TestCheckReviewGate_ApprovalCoverage(t *testing.T) {
 	ordersTable := "CREATE TABLE `orders` (`id` bigint NOT NULL, PRIMARY KEY (`id`))"
 	baseFiles := map[string]string{
@@ -260,6 +264,14 @@ func TestCheckReviewGate_ApprovalCoverage(t *testing.T) {
 	}
 	addVotes := func(files map[string]string) {
 		files["schema/testdb/orders/votes.sql"] = "CREATE TABLE `votes` (`id` bigint NOT NULL, PRIMARY KEY (`id`))"
+	}
+	// ordersWith is the orders table with the given column definitions;
+	// setOrders replaces the orders table with it.
+	ordersWith := func(columns string) string {
+		return "CREATE TABLE `orders` (" + columns + ", PRIMARY KEY (`id`))"
+	}
+	setOrders := func(columns string) func(map[string]string) {
+		return func(files map[string]string) { files["schema/testdb/orders/orders.sql"] = ordersWith(columns) }
 	}
 	addVotesAnd := func(more func(map[string]string)) func(map[string]string) {
 		return func(files map[string]string) {
@@ -291,8 +303,13 @@ func TestCheckReviewGate_ApprovalCoverage(t *testing.T) {
 		schemaPath           string
 		schemaLinkPath       string
 		configPath           string
+		// databaseType overrides the database's type, mysql by default.
+		databaseType string
 		// approvedUnknown leaves the approved commit unknown to GitHub.
-		approvedUnknown  bool
+		approvedUnknown bool
+		// headFileStatus makes GitHub answer the read of the head's orders
+		// table file with this HTTP status.
+		headFileStatus   int
 		treesUnavailable bool
 		want             string
 		wantErr          error
@@ -485,17 +502,92 @@ func TestCheckReviewGate_ApprovalCoverage(t *testing.T) {
 			want:          wantChanged,
 		},
 		{
-			name: "a rebase that combined the PR's change with the default branch's in one file does not count",
+			// The default branch added a column to the file the PR edits, so
+			// the rebase combined both edits in one file. The file's content
+			// differs, but the PR's change still generates the same
+			// statement.
+			name:       "a rebase that combined the PR's column with the default branch's in one file counts",
+			prChange:   setOrders("`id` bigint NOT NULL, `note` text"),
+			baseChange: setOrders("`id` bigint NOT NULL, `total` bigint"),
+			headChange: setOrders("`id` bigint NOT NULL, `total` bigint, `note` text"),
+			want:       wantCovers,
+		},
+		{
+			// The statements cannot be compared without the head's file, so
+			// a GitHub outage leaves the gate undecided and retryable.
+			name:           "a combined file GitHub cannot serve during an outage is a retryable evaluation failure",
+			prChange:       setOrders("`id` bigint NOT NULL, `note` text"),
+			baseChange:     setOrders("`id` bigint NOT NULL, `total` bigint"),
+			headChange:     setOrders("`id` bigint NOT NULL, `total` bigint, `note` text"),
+			headFileStatus: http.StatusServiceUnavailable,
+			wantErr:        ghclient.ErrGitHubUnavailable,
+		},
+		{
+			name:           "a combined file GitHub no longer has cannot be compared",
+			prChange:       setOrders("`id` bigint NOT NULL, `note` text"),
+			baseChange:     setOrders("`id` bigint NOT NULL, `total` bigint"),
+			headChange:     setOrders("`id` bigint NOT NULL, `total` bigint, `note` text"),
+			headFileStatus: http.StatusNotFound,
+			want:           wantUncompared,
+		},
+		{
+			name:         "a rebase that combined the PR's column with the default branch's in a Vitess keyspace's file counts",
+			databaseType: "vitess",
+			prChange:     setOrders("`id` bigint NOT NULL, `note` text"),
+			baseChange:   setOrders("`id` bigint NOT NULL, `total` bigint"),
+			headChange:   setOrders("`id` bigint NOT NULL, `total` bigint, `note` text"),
+			want:         wantCovers,
+		},
+		{
+			name:         "a rebase that combined the PR's change with the default branch's in a PostgreSQL schema file does not count",
+			databaseType: "postgres",
 			prChange: func(files map[string]string) {
-				files["schema/testdb/orders/orders.sql"] = "CREATE TABLE `orders` (`id` bigint NOT NULL, `note` text, PRIMARY KEY (`id`))"
+				files["schema/testdb/orders/orders.sql"] = "CREATE TABLE orders (id bigint NOT NULL PRIMARY KEY, note text);"
 			},
 			baseChange: func(files map[string]string) {
-				files["schema/testdb/orders/orders.sql"] = "CREATE TABLE `orders` (`id` bigint NOT NULL, `total` bigint, PRIMARY KEY (`id`))"
+				files["schema/testdb/orders/orders.sql"] = "CREATE TABLE orders (id bigint NOT NULL PRIMARY KEY, total bigint);"
 			},
 			headChange: func(files map[string]string) {
-				files["schema/testdb/orders/orders.sql"] = "CREATE TABLE `orders` (`id` bigint NOT NULL, `total` bigint, `note` text, PRIMARY KEY (`id`))"
+				files["schema/testdb/orders/orders.sql"] = "CREATE TABLE orders (id bigint NOT NULL PRIMARY KEY, total bigint, note text);"
 			},
 			want: wantChanged,
+		},
+		{
+			name:       "a rebase that combined the PR's column with the default branch's but placed it differently does not count",
+			prChange:   setOrders("`id` bigint NOT NULL, `note` text"),
+			baseChange: setOrders("`id` bigint NOT NULL, `total` bigint"),
+			headChange: setOrders("`id` bigint NOT NULL, `note` text, `total` bigint"),
+			want:       wantChanged,
+		},
+		{
+			// Both commits modify amount with the same statement, but on the
+			// newer default branch that statement also drops its NOT NULL.
+			name:       "a rebase that kept the PR's version of a column the default branch changed does not count",
+			base:       map[string]string{"schema/testdb/schemabot.yaml": "database: orders\n", "schema/testdb/orders/orders.sql": ordersWith("`id` bigint NOT NULL, `amount` int")},
+			prChange:   setOrders("`id` bigint NOT NULL, `amount` bigint"),
+			baseChange: setOrders("`id` bigint NOT NULL, `amount` int NOT NULL"),
+			headChange: setOrders("`id` bigint NOT NULL, `amount` bigint"),
+			want:       wantChanged,
+		},
+		{
+			name:               "a rebase onto a target branch other than the default that combined the PR's column with the branch's does not count",
+			targetsOtherBranch: true,
+			prChange:           setOrders("`id` bigint NOT NULL, `note` text"),
+			baseChange:         setOrders("`id` bigint NOT NULL, `total` bigint"),
+			headChange:         setOrders("`id` bigint NOT NULL, `total` bigint, `note` text"),
+			want:               wantChanged,
+		},
+		{
+			// The approved commit carried the default branch's newer column;
+			// the head is on content from before it, so its statements rest
+			// on base content nobody approved for this change.
+			name:              "a head rebuilt on an older default branch that drops the default branch's column from a combined file does not count",
+			baseChange:        setOrders("`id` bigint NOT NULL, `total` bigint"),
+			prChange:          setOrders("`id` bigint NOT NULL, `total` bigint, `note` text"),
+			headChange:        setOrders("`id` bigint NOT NULL, `note` text"),
+			approvedOnNewBase: true,
+			headOnOldBase:     true,
+			want:              wantChanged,
 		},
 		{
 			name:     "a head that restores a schema file the default branch changed does not count",
@@ -683,12 +775,19 @@ func TestCheckReviewGate_ApprovalCoverage(t *testing.T) {
 			} else {
 				registerReviewGateGitObjects(t, mux, commits)
 			}
+			if tt.headFileStatus != 0 {
+				sum := sha1.Sum([]byte("blob\x00" + commits[reviewGateTestHeadSHA]["schema/testdb/orders/orders.sql"]))
+				mux.HandleFunc("GET /repos/octocat/hello-world/git/blobs/"+hex.EncodeToString(sum[:]), func(w http.ResponseWriter, _ *http.Request) {
+					http.Error(w, http.StatusText(tt.headFileStatus), tt.headFileStatus)
+				})
+			}
 
 			client, err := h.clientForRepo("octocat/hello-world", 12345)
 			require.NoError(t, err)
 
 			schema := reviewGateSchema(cmp.Or(tt.schemaPath, "schema/testdb"), reviewGateTestHeadSHA)
 			schema.SchemaLinkPath = tt.schemaLinkPath
+			schema.Type = cmp.Or(tt.databaseType, schema.Type)
 			schema.ConfigPath = cmp.Or(tt.configPath, "schema/testdb/schemabot.yaml")
 			result, err := h.checkReviewGate(t.Context(), client, "octocat/hello-world", 1, schema)
 			if tt.wantErr != nil {
@@ -754,9 +853,9 @@ func TestCheckReviewGate_ApprovalWithoutCommit(t *testing.T) {
 }
 
 // reviewGateSchema is the schema request the review gate tests evaluate: the
-// orders database read from schemaPath at headSHA.
+// orders MySQL database read from schemaPath at headSHA.
 func reviewGateSchema(schemaPath, headSHA string) *ghclient.SchemaRequestResult {
-	return &ghclient.SchemaRequestResult{Database: "orders", SchemaPath: schemaPath, HeadSHA: headSHA}
+	return &ghclient.SchemaRequestResult{Database: "orders", Type: "mysql", SchemaPath: schemaPath, HeadSHA: headSHA}
 }
 
 // reviewGateBaseReads counts the base branch reads registerReviewGateBaseBranch
@@ -1429,8 +1528,66 @@ func TestCheckReviewGate_SelfApprovalBlocked(t *testing.T) {
 func TestCheckReviewGate_DisabledByDefault(t *testing.T) {
 	h, _ := setupReviewGateHandler(t, actorAuthTestConfig(false))
 
-	enabled := h.isReviewGateEnabled("octocat/hello-world")
+	enabled := h.isReviewGateEnabled("octocat/hello-world", "orders")
 	assert.False(t, enabled)
+}
+
+// A server instance with the review gate off (a staging instance, say) still
+// gates a database that opts in with its own review_policy: an apply with no
+// approval is blocked and names the database's operators, and an operator's
+// approval lets it through. Another database on the same instance is not
+// gated.
+func TestCheckReviewGate_DatabaseOptIn(t *testing.T) {
+	cfg := actorAuthTestConfig(false, func(cfg *api.ServerConfig) {
+		db := cfg.Databases["orders"]
+		db.OperatorUsers = []string{"bob"}
+		db.ReviewPolicy = api.DatabaseReviewPolicyConfig{Enabled: true}
+		cfg.Databases["orders"] = db
+		cfg.Databases["payments"] = api.DatabaseConfig{Type: "mysql"}
+	})
+	require.False(t, cfg.ReviewPolicy.Enabled, "the instance-wide gate is off")
+
+	for _, tt := range []struct {
+		name    string
+		reviews []*gh.PullRequestReview
+		want    bool
+	}{
+		{name: "no approval blocks"},
+		{
+			name: "an operator's approval of the head lets it through",
+			reviews: []*gh.PullRequestReview{{
+				User: &gh.User{Login: new("bob")}, State: new(ghclient.ReviewApproved),
+				SubmittedAt: &gh.Timestamp{Time: time.Now()}, CommitID: new(reviewGateTestHeadSHA),
+			}},
+			want: true,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			h, mux := setupReviewGateHandler(t, cfg)
+			registerPREndpoint(mux, "alice")
+			registerReviewsEndpoint(mux, tt.reviews)
+			client, err := h.clientForRepo("octocat/hello-world", 12345)
+			require.NoError(t, err)
+
+			result, err := h.checkReviewGate(t.Context(), client, "octocat/hello-world", 1, reviewGateSchema("schema/testdb", reviewGateTestHeadSHA))
+			require.NoError(t, err)
+			require.NotNil(t, result, "the opted-in database is gated")
+			assert.Equal(t, tt.want, result.Approved)
+			assert.Equal(t, []string{"bob"}, result.OperatorReviewers)
+		})
+	}
+
+	t.Run("a database that does not opt in is not gated", func(t *testing.T) {
+		h, _ := setupReviewGateHandler(t, cfg)
+		client, err := h.clientForRepo("octocat/hello-world", 12345)
+		require.NoError(t, err)
+
+		schema := reviewGateSchema("schema/payments", reviewGateTestHeadSHA)
+		schema.Database = "payments"
+		result, err := h.checkReviewGate(t.Context(), client, "octocat/hello-world", 1, schema)
+		require.NoError(t, err)
+		assert.Nil(t, result)
+	})
 }
 
 func TestCheckReviewGate_OperatorTeamApproval(t *testing.T) {

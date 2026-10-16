@@ -1135,6 +1135,89 @@ func TestLocalClient_Plan(t *testing.T) {
 	assert.Equal(t, "testdb", resp.Changes[0].TableChanges[0].Namespace)
 }
 
+// A namespace-free MySQL target holds two namespaces, each its own database,
+// and both hold a table named `invoices_old`. The pull request deletes
+// billing's `invoices_old.sql` and keeps app's. Each namespace is diffed
+// against its own database, so the plan drops `invoices_old` in billing
+// only, as an unsafe change that needs the drop approval, and app's
+// same-named table is left alone.
+func TestLocalClient_PlanAttributesDropToNamespaceThatHoldsTable(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	container, dsn := setupMySQLContainer(t)
+	_ = container              // container is managed by TestMain
+	setupStorageSchema(t, dsn) // need storage tables
+
+	ctx := t.Context()
+	db, err := sql.Open("block-mysql", dsn)
+	require.NoError(t, err, "open database")
+	defer utils.CloseAndLog(db)
+
+	const (
+		appNS     = "nsdrop_app"
+		billingNS = "nsdrop_billing"
+		invoices  = "CREATE TABLE `invoices_old` (`id` bigint unsigned NOT NULL AUTO_INCREMENT, PRIMARY KEY (`id`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+	)
+	for _, stmt := range []string{
+		"CREATE DATABASE IF NOT EXISTS `" + appNS + "`",
+		"CREATE DATABASE IF NOT EXISTS `" + billingNS + "`",
+		"CREATE TABLE IF NOT EXISTS `" + appNS + "`.`invoices_old` (`id` bigint unsigned NOT NULL AUTO_INCREMENT, PRIMARY KEY (`id`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+		"CREATE TABLE IF NOT EXISTS `" + billingNS + "`.`invoices_old` (`id` bigint unsigned NOT NULL AUTO_INCREMENT, PRIMARY KEY (`id`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+		"CREATE TABLE IF NOT EXISTS `" + billingNS + "`.`invoices` (`id` bigint unsigned NOT NULL AUTO_INCREMENT, PRIMARY KEY (`id`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+	} {
+		_, err = db.ExecContext(ctx, stmt)
+		require.NoError(t, err, "prepare namespace databases")
+	}
+	t.Cleanup(func() {
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), 30*time.Second)
+		defer cancel()
+		cleanupDB, cleanupErr := sql.Open("block-mysql", dsn)
+		require.NoError(t, cleanupErr, "open database for namespace cleanup")
+		defer utils.CloseAndLog(cleanupDB)
+		for _, ns := range []string{appNS, billingNS} {
+			_, cleanupErr = cleanupDB.ExecContext(cleanupCtx, "DROP DATABASE IF EXISTS `"+ns+"`")
+			assert.NoError(t, cleanupErr, "drop namespace database %s", ns)
+		}
+	})
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	stor := createStorage(t, dsn)
+	client, err := NewLocalClient(LocalConfig{
+		Database:  "logicaldb",
+		Type:      storage.DatabaseTypeMySQL,
+		TargetDSN: dsnWithoutDatabase(t, dsn),
+	}, stor, logger)
+	require.NoError(t, err, "create client")
+	defer utils.CloseAndLog(client)
+
+	resp, err := client.Plan(ctx, &ternv1.PlanRequest{
+		Type:     storage.DatabaseTypeMySQL,
+		Database: "logicaldb",
+		SchemaFiles: map[string]*ternv1.SchemaFiles{
+			appNS: {Files: map[string]string{"invoices_old.sql": invoices}},
+			billingNS: {Files: map[string]string{
+				"invoices.sql": "CREATE TABLE `invoices` (`id` bigint unsigned NOT NULL AUTO_INCREMENT, PRIMARY KEY (`id`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+			}},
+		},
+	})
+	require.NoError(t, err, "Plan()")
+
+	require.Len(t, resp.Changes, 1, "only billing has a change")
+	sc := resp.Changes[0]
+	assert.Equal(t, billingNS, sc.Namespace)
+	require.Len(t, sc.TableChanges, 1)
+	drop := sc.TableChanges[0]
+	assert.Equal(t, "invoices_old", drop.TableName)
+	assert.Equal(t, billingNS, drop.Namespace)
+	assert.Equal(t, ternv1.ChangeType_CHANGE_TYPE_DROP, drop.ChangeType)
+	assert.Contains(t, drop.Ddl, "DROP TABLE")
+	assert.True(t, drop.IsUnsafe, "a drop needs the explicit drop approval")
+	assert.True(t, sc.OriginalFilesCaptured)
+	assert.Contains(t, sc.OriginalFiles["invoices_old.sql"], "CREATE TABLE `invoices_old`")
+}
+
 func TestLocalClient_Plan_UsesConfigDatabase(t *testing.T) {
 	// In local mode, LocalClient always uses the database from config,
 	// not from the request. This test verifies that behavior.
@@ -3706,6 +3789,7 @@ func TestLocalClient_ResumeApplyGroupedRebuildsChangesFromTasks(t *testing.T) {
 	require.NotNil(t, applyReq.ResumeState)
 	assert.Equal(t, apply.ApplyIdentifier, applyReq.ResumeState.MigrationContext)
 	assert.Empty(t, applyReq.ResumeState.Metadata)
+	assert.Equal(t, apply.ApplyIdentifier, applyReq.ApplyIdentifier, "the engine learns which apply it is resuming")
 
 	require.Len(t, applyReq.Changes, 1)
 	assert.Equal(t, "testdb", applyReq.Changes[0].Namespace)
@@ -4755,6 +4839,8 @@ func TestLocalClient_ApplyPersistsBranchOptionForQueuedDrive(t *testing.T) {
 
 	require.NotEmpty(t, eng.applyRequests, "the queued drive must reach the engine")
 	engineOptions := eng.applyRequests[len(eng.applyRequests)-1].Options
+	assert.Equal(t, resp.ApplyId, eng.applyRequests[len(eng.applyRequests)-1].ApplyIdentifier,
+		"the queued drive's engine request must name its apply")
 	assert.Equal(t, "reuse-me", engineOptions["branch"],
 		"the queued drive's engine request must carry the dispatched branch option")
 	assert.Equal(t, "true", engineOptions["defer_cutover"],

@@ -88,6 +88,9 @@ if ! minikube status > /dev/null 2>&1; then
     minikube start --driver=docker --container-runtime=docker --cpus=2 --memory=2048
 fi
 
+# shellcheck source=e2e/k8s/pin-minikube-kubeconfig.sh
+source "$REPO_ROOT/e2e/k8s/pin-minikube-kubeconfig.sh"
+
 # --- Build image ---
 
 # The image tag is per-run for the same reason as the namespace: the chart
@@ -120,11 +123,15 @@ cleanup() {
         echo "Keeping namespace $NAMESPACE and image schemabot:${IMAGE_TAG}"
     else
         echo "Tearing down..."
-        kubectl delete namespace "$NAMESPACE" --ignore-not-found
+        # Teardown still needs the pinned kubeconfig, so it is removed last,
+        # and a failed delete must not skip that removal.
+        kubectl delete namespace "$NAMESPACE" --ignore-not-found ||
+            echo "Warning: could not delete namespace $NAMESPACE; delete it with: kubectl --context $MINIKUBE_CONTEXT delete namespace $NAMESPACE"
         # Best-effort: without this, per-run image tags accumulate in
         # minikube's docker daemon across runs.
         docker rmi "schemabot:${IMAGE_TAG}" > /dev/null 2>&1 || true
     fi
+    rm -f "$PINNED_KUBECONFIG"
 }
 trap cleanup EXIT
 
@@ -227,12 +234,13 @@ done
 
 echo "Running k8s e2e tests..."
 TEST_EXIT_CODE=0
-# The etre- and vitess-resolver tests need their own in-cluster stacks and run in
-# dedicated jobs, so skip them here rather than against the base stack.
+# The etre-resolver, vitess-resolver, and multi-target tests need their own
+# in-cluster stacks and run in dedicated jobs, so skip them here rather than
+# against the base stack.
 E2E_SCHEMABOT_URL="http://localhost:${CONTROL_PLANE_PORT}" \
 E2E_SCHEMABOT_MYSQL_DSN="root:testpassword@tcp(localhost:${MYSQL_CONTROL_PLANE_PORT})/schemabot?parseTime=true&multiStatements=true" \
 E2E_TERN_STAGING_MYSQL_DSN="root:testpassword@tcp(localhost:${MYSQL_DATA_PLANE_PORT})/testapp?parseTime=true&multiStatements=true" \
-    go test -count=1 -v -tags=e2e -timeout="${E2E_TEST_TIMEOUT:-10m}" -skip 'TestK8sEtre|TestK8sVitess' ./e2e/k8s/... || TEST_EXIT_CODE=$?
+    go test -count=1 -v -tags=e2e -timeout="${E2E_TEST_TIMEOUT:-10m}" -skip 'TestK8sEtre|TestK8sVitess|TestK8sMultiTarget' ./e2e/k8s/... || TEST_EXIT_CODE=$?
 
 # Teardown runs in the EXIT trap.
 exit "$TEST_EXIT_CODE"

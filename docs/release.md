@@ -226,6 +226,16 @@ needs the release.
 Anything else that changes the order for a particular release is called out in its
 release notes.
 
+**No skew window at all across the storage time zone pin.** Builds that run
+their MySQL storage sessions in UTC and builds that do not must not share a
+storage server whose default time zone is not UTC while any apply is in flight:
+the pinned side reads the other side's lease heartbeats as stale by the zone
+offset and reclaims live applies. Crossing that line in either direction, by
+upgrade or by rollback, is a stop-then-start of the plane that owns the storage
+pool, not a roll. The server logs the rule at storage connect when it applies;
+see [MySQL storage sessions run in
+UTC](./configuration.md#mysql-storage-sessions-run-in-utc).
+
 All of which is why mixed versions have to be genuinely tolerable, and the
 additive-only rule is what buys that. A skew window is still a rollout state
 rather than a resting place, so close it rather than letting the planes drift

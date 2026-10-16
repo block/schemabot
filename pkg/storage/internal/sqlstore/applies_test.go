@@ -3801,7 +3801,7 @@ func TestApplyStore_FindMissingSummaryComment_ExcludesAppliesWithoutGitHubDestin
 		GitHubCommentID: 1002,
 	}))
 
-	applies, err := store.Applies().FindMissingSummaryComment(ctx)
+	applies, err := store.Applies().FindMissingSummaryComment(ctx, 0, 100)
 	require.NoError(t, err)
 	require.Len(t, applies, 1)
 	assert.Equal(t, githubApply.ApplyIdentifier, applies[0].ApplyIdentifier)
@@ -3858,14 +3858,106 @@ func TestApplyStore_FindMissingSummaryComment_IncludesRecentlyStoppedApplies(t *
 
 	recent := seedApplyMissingSummary(t, store, "apply_stopped_recent", state.Apply.Stopped, 700)
 	stale := seedApplyMissingSummary(t, store, "apply_stopped_stale", state.Apply.Stopped, 701)
-	_, err := testDB.ExecContext(ctx, `UPDATE applies SET updated_at = NOW() - INTERVAL 2 HOUR WHERE id = ?`, stale.ID)
+	_, err := testDB.ExecContext(ctx, `UPDATE applies SET updated_at = NOW() - INTERVAL ? HOUR WHERE id = ?`,
+		int(storage.MissingSummaryLookback/time.Hour)+1, stale.ID)
 	require.NoError(t, err)
 
-	applies, err := store.Applies().FindMissingSummaryComment(ctx)
+	applies, err := store.Applies().FindMissingSummaryComment(ctx, 0, 100)
 	require.NoError(t, err)
 	require.Len(t, applies, 1)
 	assert.Equal(t, recent.ApplyIdentifier, applies[0].ApplyIdentifier)
 	assert.Equal(t, state.Apply.Stopped, applies[0].State)
+}
+
+// An apply missing its summary is left to its live publisher until it has
+// been terminal for settledFor: a completed apply judged by completed_at and a
+// stopped one by updated_at, each repaired once it has settled. The limit
+// bounds one pass, most recently updated first.
+func TestApplyStore_FindMissingSummaryComment_SettleFloorAndLimit(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+	const settledFor = 2 * time.Minute
+
+	seedApplyMissingSummary(t, store, "apply_completed_fresh", state.Apply.Completed, 720)
+	seedApplyMissingSummary(t, store, "apply_stopped_fresh", state.Apply.Stopped, 721)
+	completedSettled := seedApplyMissingSummary(t, store, "apply_completed_settled", state.Apply.Completed, 722)
+	_, err := testDB.ExecContext(ctx, `UPDATE applies SET completed_at = NOW() - INTERVAL 10 MINUTE, updated_at = NOW() - INTERVAL 10 MINUTE WHERE id = ?`, completedSettled.ID)
+	require.NoError(t, err)
+	stoppedSettled := seedApplyMissingSummary(t, store, "apply_stopped_settled", state.Apply.Stopped, 723)
+	_, err = testDB.ExecContext(ctx, `UPDATE applies SET updated_at = NOW() - INTERVAL 5 MINUTE WHERE id = ?`, stoppedSettled.ID)
+	require.NoError(t, err)
+
+	applies, err := store.Applies().FindMissingSummaryComment(ctx, settledFor, 100)
+	require.NoError(t, err)
+	var got []string
+	for _, apply := range applies {
+		got = append(got, apply.ApplyIdentifier)
+	}
+	assert.Equal(t, []string{stoppedSettled.ApplyIdentifier, completedSettled.ApplyIdentifier}, got,
+		"only settled applies qualify, most recently updated first")
+
+	limited, err := store.Applies().FindMissingSummaryComment(ctx, settledFor, 1)
+	require.NoError(t, err)
+	require.Len(t, limited, 1)
+	assert.Equal(t, stoppedSettled.ApplyIdentifier, limited[0].ApplyIdentifier)
+}
+
+// seedCheckForApply stores check state for apply's target, owned by apply,
+// with the given status.
+func seedCheckForApply(t *testing.T, store *Storage, apply *storage.Apply, status string) {
+	t.Helper()
+	require.NoError(t, store.Checks().Upsert(t.Context(), &storage.Check{
+		Repository:   apply.Repository,
+		PullRequest:  apply.PullRequest,
+		HeadSHA:      "abc123",
+		Environment:  apply.Environment,
+		DatabaseType: apply.DatabaseType,
+		DatabaseName: apply.Database,
+		ApplyID:      apply.ID,
+		HasChanges:   true,
+		Status:       status,
+	}))
+}
+
+// A terminal apply whose stored check state is still in progress is one whose
+// terminal check refresh never landed, and FindTerminalWithInProgressCheck is
+// how reconciliation finds it. A stopped apply keeps its check in progress on
+// purpose, a completed check has nothing left to repair, and an apply a newer
+// one has superseded can no longer complete the row, so none of those return.
+func TestApplyStore_FindTerminalWithInProgressCheck(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	stranded := seedApplyMissingSummary(t, store, "apply_check_stranded", state.Apply.Failed, 800)
+	seedCheckForApply(t, store, stranded, checkStatusInProgress)
+
+	completed := seedApplyMissingSummary(t, store, "apply_check_completed", state.Apply.Failed, 801)
+	seedCheckForApply(t, store, completed, "completed")
+
+	stopped := seedApplyMissingSummary(t, store, "apply_check_stopped", state.Apply.Stopped, 802)
+	seedCheckForApply(t, store, stopped, checkStatusInProgress)
+
+	superseded := seedApplyMissingSummary(t, store, "apply_check_superseded", state.Apply.Failed, 803)
+	seedCheckForApply(t, store, superseded, checkStatusInProgress)
+	newer := *superseded
+	newer.ID = 0
+	newer.ApplyIdentifier = "apply_check_superseded_newer"
+	newer.State = state.Apply.Running
+	newer.CompletedAt = nil
+	_, err := store.Applies().Create(ctx, &newer)
+	require.NoError(t, err)
+
+	applies, err := store.Applies().FindTerminalWithInProgressCheck(ctx, 10)
+	require.NoError(t, err)
+	require.Len(t, applies, 1)
+	assert.Equal(t, stranded.ApplyIdentifier, applies[0].ApplyIdentifier)
+	assert.Equal(t, state.Apply.Failed, applies[0].State)
+
+	limited, err := store.Applies().FindTerminalWithInProgressCheck(ctx, 0)
+	require.NoError(t, err)
+	assert.Empty(t, limited, "the limit bounds the batch")
 }
 
 // TestApplyStore_FindMissingSummaryComment_SummaryClaimSentinels verifies the
@@ -3897,7 +3989,7 @@ func TestApplyStore_FindMissingSummaryComment_SummaryClaimSentinels(t *testing.T
 		GitHubCommentID: 2002,
 	}))
 
-	applies, err := store.Applies().FindMissingSummaryComment(ctx)
+	applies, err := store.Applies().FindMissingSummaryComment(ctx, 0, 100)
 	require.NoError(t, err)
 	require.Len(t, applies, 1)
 	assert.Equal(t, staleClaim.ApplyIdentifier, applies[0].ApplyIdentifier)
@@ -3928,7 +4020,7 @@ func TestApplyStore_FindMissingSummaryComment_SupersededSummaryMarker(t *testing
 		GitHubCommentID: 2004,
 	}))
 
-	applies, err := store.Applies().FindMissingSummaryComment(ctx)
+	applies, err := store.Applies().FindMissingSummaryComment(ctx, 0, 100)
 	require.NoError(t, err)
 	require.Len(t, applies, 1)
 	assert.Equal(t, superseded.ApplyIdentifier, applies[0].ApplyIdentifier)
@@ -5001,4 +5093,44 @@ func TestApplyExpiryOrderingIsIndexed(t *testing.T) {
 
 	assert.Equal(t, []string{"state", "updated_at"}, indexColumns,
 		"the expiry ordering needs an index on exactly its filter and ordering columns, in that order")
+}
+
+// Only one instance reconciles engine branches per pass, and it holds the
+// election for as long as the reconcile runs: a second instance that asks while
+// the first is inside its pass steps aside without running its own, and once
+// the first finishes the lock is free for the next pass.
+func TestApplyStore_WithBranchReconcileElection_ElectsOneInstancePerPass(t *testing.T) {
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+	other := NewMySQL(testDB)
+
+	ranOther := false
+	err := store.Applies().WithBranchReconcileElection(ctx, func(ctx context.Context) error {
+		otherErr := other.Applies().WithBranchReconcileElection(ctx, func(context.Context) error {
+			ranOther = true
+			return nil
+		})
+		require.ErrorIs(t, otherErr, storage.ErrBranchReconcileBusy, "a second instance steps aside while the first is reconciling")
+		return nil
+	})
+	require.NoError(t, err)
+	assert.False(t, ranOther)
+
+	ranNext := false
+	require.NoError(t, other.Applies().WithBranchReconcileElection(ctx, func(context.Context) error {
+		ranNext = true
+		return nil
+	}))
+	assert.True(t, ranNext, "the lock is released when the elected pass returns")
+}
+
+// The reconcile's own error is what the election returns, so the pass can
+// report it.
+func TestApplyStore_WithBranchReconcileElection_ReturnsTheReconcileError(t *testing.T) {
+	store := NewMySQL(testDB)
+	reconcileErr := fmt.Errorf("list branches: PlanetScale API unavailable")
+
+	err := store.Applies().WithBranchReconcileElection(t.Context(), func(context.Context) error { return reconcileErr })
+
+	require.ErrorIs(t, err, reconcileErr)
 }

@@ -233,7 +233,7 @@ func (c *LocalClient) checkTaskReady(ctx context.Context, logger *slog.Logger, t
 // drive paths already set TargetShards via taskTargetShards; this is the
 // single-task path's equivalent. The identity-bound drive logger rides along
 // so engine lines for this task inherit the apply's triage identity.
-func sequentialEngineApplyRequest(task *storage.Task, options map[string]string, creds *engine.Credentials, logger *slog.Logger) *engine.ApplyRequest {
+func sequentialEngineApplyRequest(applyIdentifier string, task *storage.Task, options map[string]string, creds *engine.Credentials, logger *slog.Logger) *engine.ApplyRequest {
 	change := engine.SchemaChange{
 		Namespace:    task.Namespace,
 		TableChanges: []engine.TableChange{{Table: task.TableName, DDL: task.DDL}},
@@ -242,12 +242,13 @@ func sequentialEngineApplyRequest(task *storage.Task, options map[string]string,
 		change.Shard = engine.Shard{Name: task.Shard}
 	}
 	req := &engine.ApplyRequest{
-		Database:    task.Database,
-		Changes:     []engine.SchemaChange{change},
-		Options:     options,
-		ResumeState: &engine.ResumeState{MigrationContext: task.TaskIdentifier},
-		Credentials: creds,
-		Logger:      logger,
+		ApplyIdentifier: applyIdentifier,
+		Database:        task.Database,
+		Changes:         []engine.SchemaChange{change},
+		Options:         options,
+		ResumeState:     &engine.ResumeState{MigrationContext: task.TaskIdentifier},
+		Credentials:     creds,
+		Logger:          logger,
 	}
 	if task.Shard != "" {
 		req.TargetShards = []string{task.Shard}
@@ -556,7 +557,7 @@ func (c *LocalClient) runEngineTaskAttempt(ctx context.Context, apply *storage.A
 	// Sequential mode: one DDL per engine call. The task identifier is used as the
 	// engine resume key (ResumeState.MigrationContext) so each table's schema
 	// change is tracked independently.
-	request := sequentialEngineApplyRequest(task, options, taskCreds, logger)
+	request := sequentialEngineApplyRequest(apply.ApplyIdentifier, task, options, taskCreds, logger)
 	needsFiles, err := c.taskNeedsRowSecurityFiles(task)
 	if err != nil {
 		return c.failureVerdictAction(apply.ApplyIdentifier, task, c.markTaskFailed(ctx, task, fmt.Sprintf("resolve row security parser: %v", err)))
@@ -1636,7 +1637,9 @@ func (c *LocalClient) cancelTasksQueuedBehindFailure(ctx context.Context, apply 
 // posts the terminal summary — run only once the outcome is durably stored.
 // When the apply cannot be reloaded or the outcome write fails, it returns an
 // error with the stored apply still active: the drive exits, and the claim
-// that picks the apply up next finalizes it and settles its requests then.
+// that picks the apply up next finalizes it and settles its requests then. A
+// write that returned an error counts as stored only when outcomeWriteLanded
+// proves storage holds it under this drive's lease.
 // Once the outcome is stored it returns nil whatever happens to the side
 // effects: a failed request settlement is logged and left for the operator's
 // post-drive settlement, and the summary still posts.
@@ -1686,12 +1689,22 @@ func (c *LocalClient) finalizeSequentialApply(ctx context.Context, apply *storag
 		if c.driveCancelled(ctx, apply, "while persisting the sequential outcome") {
 			return nil
 		}
-		// The stored apply is still active, so nothing that answers for its
-		// outcome may run: a pending control request completed here would
-		// resolve an operator's command against an apply storage still reports
-		// running, and the observer would post a terminal summary for it.
-		return fmt.Errorf("persist sequential outcome %s for apply %s (database %s) from stored state %s: %w",
-			apply.State, apply.ApplyIdentifier, apply.Database, previousState, err)
+		// The write may have committed with only its reply lost. When storage
+		// holds this outcome under this drive's lease, the write landed and
+		// the drive goes on to answer for it below.
+		landed, stored := c.outcomeWriteLanded(ctx, apply, apply.State, apply.ErrorMessage, err)
+		if !landed {
+			// The stored apply is still active, so nothing that answers for its
+			// outcome may run: a pending control request completed here would
+			// resolve an operator's command against an apply storage still
+			// reports running, and the observer would post a terminal summary
+			// for it.
+			return fmt.Errorf("persist sequential outcome %s for apply %s (database %s) from stored state %s: %w",
+				apply.State, apply.ApplyIdentifier, apply.Database, previousState, err)
+		}
+		logger.Warn("the write recording the sequential outcome returned an error, but storage holds it; continuing with the stored outcome",
+			append(stored.MutableLogAttrs(), "previous_state", previousState, "error", err)...)
+		*apply = *stored
 	}
 	// A sequential apply's failure reaches the operator through the same
 	// apply log stream as every other path, so a failed table does not read

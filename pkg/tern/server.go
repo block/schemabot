@@ -200,6 +200,18 @@ func pullSchemaErrorCode(err error) codes.Code {
 	return codes.Internal
 }
 
+func (s *Server) CompareSchemaFileChange(ctx context.Context, req *ternv1.CompareSchemaFileChangeRequest) (*ternv1.CompareSchemaFileChangeResponse, error) {
+	resp, err := s.client.CompareSchemaFileChange(ctx, req)
+	if err != nil {
+		code := codes.Internal
+		if errors.Is(err, ErrCompareSchemaFileChangeUnsupported) {
+			code = codes.Unimplemented
+		}
+		return nil, status.Error(code, err.Error())
+	}
+	return resp, nil
+}
+
 func (s *Server) Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv1.PlanResponse, error) {
 	resp, err := s.client.Plan(ctx, req)
 	if err != nil {

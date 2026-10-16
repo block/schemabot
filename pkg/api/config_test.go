@@ -4142,6 +4142,203 @@ review_policy:
 	})
 }
 
+// An instance with the review gate off can turn it on for one database. The
+// opt-in covers only that database, and a database that opts in must name
+// someone who can approve, or every one of its applies would be blocked.
+func TestServerConfig_DatabaseReviewPolicy(t *testing.T) {
+	loadConfig := func(t *testing.T, content string) (*ServerConfig, error) {
+		t.Helper()
+		configPath := filepath.Join(t.TempDir(), "config.yaml")
+		require.NoError(t, os.WriteFile(configPath, []byte(content), 0644))
+		return LoadServerConfigFromFile(configPath)
+	}
+
+	t.Run("a database that opts in is gated and the others are not", func(t *testing.T) {
+		cfg, err := loadConfig(t, `
+databases:
+  orders:
+    type: mysql
+    operator_teams:
+      - octocat/orders-owners
+    review_policy:
+      enabled: true
+    environments:
+      staging:
+        dsn: "root@tcp(localhost:3306)/orders"
+  payments:
+    type: mysql
+    environments:
+      staging:
+        dsn: "root@tcp(localhost:3306)/payments"
+`)
+		require.NoError(t, err)
+		assert.True(t, cfg.ReviewPolicyEnabledForDatabase("orders"))
+		assert.False(t, cfg.ReviewPolicyEnabledForDatabase("payments"))
+		assert.False(t, cfg.ReviewPolicyEnabledForDatabase("unknown"))
+	})
+
+	t.Run("an instance-wide gate covers every database", func(t *testing.T) {
+		cfg := &ServerConfig{
+			ReviewPolicy: ReviewPolicyConfig{Enabled: true},
+			Databases:    map[string]DatabaseConfig{"payments": {Type: "mysql"}},
+		}
+		assert.True(t, cfg.ReviewPolicyEnabledForDatabase("payments"))
+	})
+
+	t.Run("a database that opts in with nobody who can approve is rejected", func(t *testing.T) {
+		_, err := loadConfig(t, `
+databases:
+  orders:
+    type: mysql
+    review_policy:
+      enabled: true
+    environments:
+      staging:
+        dsn: "root@tcp(localhost:3306)/orders"
+`)
+		require.ErrorContains(t, err, "databases.orders.review_policy.enabled requires someone who can approve")
+	})
+
+	t.Run("operators excluded from the review policy cannot approve an opted-in database", func(t *testing.T) {
+		_, err := loadConfig(t, `
+review_policy:
+  include_database_operators: false
+databases:
+  orders:
+    type: mysql
+    operator_users:
+      - mona
+    review_policy:
+      enabled: true
+    environments:
+      staging:
+        dsn: "root@tcp(localhost:3306)/orders"
+`)
+		require.ErrorContains(t, err, "databases.orders.review_policy.enabled requires someone who can approve")
+	})
+
+	t.Run("admins of a repo the database does not allow cannot approve an opted-in database", func(t *testing.T) {
+		_, err := loadConfig(t, `
+repos:
+  octocat/unrelated:
+    admin_teams:
+      - octocat/maintainers
+databases:
+  orders:
+    type: mysql
+    allowed_repos:
+      - octocat/orders
+    review_policy:
+      enabled: true
+    environments:
+      staging:
+        dsn: "root@tcp(localhost:3306)/orders"
+`)
+		require.ErrorContains(t, err, "databases.orders.review_policy.enabled requires someone who can approve")
+	})
+
+	t.Run("admins of a repo the database allows can approve an opted-in database", func(t *testing.T) {
+		cfg, err := loadConfig(t, `
+repos:
+  octocat/unrelated:
+    admin_teams:
+      - octocat/maintainers
+  octocat/orders:
+    admin_users:
+      - mona
+databases:
+  orders:
+    type: mysql
+    allowed_repos:
+      - octocat/orders
+    review_policy:
+      enabled: true
+    environments:
+      staging:
+        dsn: "root@tcp(localhost:3306)/orders"
+`)
+		require.NoError(t, err)
+		assert.True(t, cfg.ReviewPolicyEnabledForDatabase("orders"))
+	})
+
+	t.Run("a repo the database accepts with no admins of its own leaves an opted-in database without an approver", func(t *testing.T) {
+		_, err := loadConfig(t, `
+repos:
+  octocat/a:
+    admin_teams:
+      - octocat/maintainers
+  octocat/b: {}
+databases:
+  orders:
+    type: mysql
+    review_policy:
+      enabled: true
+    environments:
+      staging:
+        dsn: "root@tcp(localhost:3306)/orders"
+`)
+		require.ErrorContains(t, err, "databases.orders.review_policy.enabled requires someone who can approve every PR, but repos.octocat/b, which the database accepts schema changes from, has no admin_teams or admin_users")
+	})
+
+	t.Run("CODEOWNERS alone cannot approve an opted-in database", func(t *testing.T) {
+		_, err := loadConfig(t, `
+review_policy:
+  include_codeowners: true
+repos:
+  octocat/orders: {}
+databases:
+  orders:
+    type: mysql
+    review_policy:
+      enabled: true
+    environments:
+      staging:
+        dsn: "root@tcp(localhost:3306)/orders"
+`)
+		require.ErrorContains(t, err, "repos.octocat/orders, which the database accepts schema changes from, has no admin_teams or admin_users")
+	})
+
+	t.Run("an opted-in database that accepts any repository needs approvers beyond repo admins when no repos are configured", func(t *testing.T) {
+		_, err := loadConfig(t, `
+databases:
+  orders:
+    type: mysql
+    review_policy:
+      enabled: true
+    environments:
+      staging:
+        dsn: "root@tcp(localhost:3306)/orders"
+`)
+		require.ErrorContains(t, err, "databases.orders.review_policy.enabled requires someone who can approve every PR, but the database accepts any repository and no repos are configured")
+	})
+
+	for name, approvers := range map[string]string{
+		"instance admins":              "review_policy:\n  admin_users:\n    - mona\n",
+		"repo admins":                  "repos:\n  octocat/orders:\n    admin_teams:\n      - octocat/maintainers\n",
+		"admins of every repo":         "repos:\n  octocat/a:\n    admin_teams:\n      - octocat/maintainers\n  octocat/b:\n    admin_users:\n      - mona\n",
+		"operators beside a bare repo": "repos:\n  octocat/orders: {}\n",
+	} {
+		t.Run("an opted-in database approved by "+name+" is accepted", func(t *testing.T) {
+			operators := ""
+			if strings.HasPrefix(name, "operators") {
+				operators = "    operator_users:\n      - mona\n"
+			}
+			cfg, err := loadConfig(t, approvers+`
+databases:
+  orders:
+    type: mysql
+`+operators+`    review_policy:
+      enabled: true
+    environments:
+      staging:
+        dsn: "root@tcp(localhost:3306)/orders"
+`)
+			require.NoError(t, err)
+			assert.True(t, cfg.ReviewPolicyEnabledForDatabase("orders"))
+		})
+	}
+}
+
 func TestServerConfig_IsCheckRequired(t *testing.T) {
 	t.Run("nil receiver requires all checks", func(t *testing.T) {
 		var cfg *ServerConfig
@@ -4825,6 +5022,55 @@ func TestPendingDropsConfig(t *testing.T) {
 			},
 			PendingDrops: PendingDropsConfig{Enabled: boolPtr(false), Retention: "not-a-duration"},
 		}
+		assert.NoError(t, cfg.Validate())
+	})
+}
+
+func TestBranchReconcileConfig(t *testing.T) {
+	t.Run("parsed from YAML", func(t *testing.T) {
+		var cfg ServerConfig
+		require.NoError(t, yaml.Unmarshal([]byte("branch_reconcile:\n  enabled: true\n  delete: true\n  grace: 36h\n"), &cfg))
+		assert.Equal(t, BranchReconcileConfig{Enabled: true, Delete: true, Grace: "36h"}, cfg.BranchReconcile)
+		grace, err := cfg.BranchReconcileGrace()
+		require.NoError(t, err)
+		assert.Equal(t, 36*time.Hour, grace)
+	})
+
+	t.Run("default grace", func(t *testing.T) {
+		cfg := ServerConfig{}
+		grace, err := cfg.BranchReconcileGrace()
+		require.NoError(t, err)
+		assert.Equal(t, 24*time.Hour, grace)
+	})
+
+	t.Run("invalid grace rejected", func(t *testing.T) {
+		cfg := ServerConfig{BranchReconcile: BranchReconcileConfig{Grace: "soon"}}
+		_, err := cfg.BranchReconcileGrace()
+		assert.ErrorContains(t, err, "branch_reconcile.grace")
+	})
+
+	t.Run("non-positive grace rejected", func(t *testing.T) {
+		cfg := ServerConfig{BranchReconcile: BranchReconcileConfig{Grace: "0s"}}
+		_, err := cfg.BranchReconcileGrace()
+		assert.ErrorContains(t, err, "must be positive")
+	})
+
+	databases := map[string]DatabaseConfig{
+		"orders": {
+			Type: "vitess",
+			Environments: map[string]EnvironmentConfig{
+				"staging": {DSN: "root:pass@tcp(localhost:3306)/orders"},
+			},
+		},
+	}
+
+	t.Run("validate rejects invalid grace when enabled", func(t *testing.T) {
+		cfg := ServerConfig{Databases: databases, BranchReconcile: BranchReconcileConfig{Enabled: true, Grace: "soon"}}
+		assert.ErrorContains(t, cfg.Validate(), "branch_reconcile.grace")
+	})
+
+	t.Run("validate ignores invalid grace when disabled", func(t *testing.T) {
+		cfg := ServerConfig{Databases: databases, BranchReconcile: BranchReconcileConfig{Grace: "soon"}}
 		assert.NoError(t, cfg.Validate())
 	})
 }

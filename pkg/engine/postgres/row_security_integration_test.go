@@ -205,10 +205,12 @@ func TestRowSecurityComparisonOperationalError(t *testing.T) {
 	defer pool.Close()
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
-	_, _, _, err = planRowSecurityOperation(ctx, pool, "public", `
+	desired, err := statement.ParseDesiredWithRowSecurity(`
   CREATE TABLE documents (id bigint PRIMARY KEY);
   ALTER TABLE documents ENABLE ROW LEVEL SECURITY;
  `)
+	require.NoError(t, err)
+	_, err = planRowSecurityOperation(ctx, pool, "public", desired)
 	require.ErrorIs(t, err, context.Canceled)
 	assert.NotContains(t, err.Error(), "does not yet execute")
 	assert.NotErrorIs(t, err, schemadiff.ErrUnsupportedChange)

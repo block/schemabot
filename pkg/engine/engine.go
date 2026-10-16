@@ -1028,14 +1028,20 @@ func DirectExecutionKeys() []string {
 // On first apply, set the resume context to group related DDL.
 // On resume after restart, pass the full ResumeState from storage.
 type ApplyRequest struct {
-	PlanID       string             // Plan being executed (for tracing and apply→plan linkage)
-	Database     string             // Target database
-	Changes      []SchemaChange     // Per-namespace changes to apply (DDL + files from plan)
-	TargetShards []string           // Optional shard selector for sharded engines
-	SchemaFiles  schema.SchemaFiles // Full declarative schema files (for engines that apply whole files)
-	Options      map[string]string  // Options like "defer_cutover", "skip_revert"
-	ResumeState  *ResumeState       // Fresh context or full resume state after restart
-	Credentials  *Credentials       // Resolved credentials (from discovery)
+	PlanID string // Plan being executed (for tracing and apply→plan linkage)
+	// ApplyIdentifier names the apply this request drives, the same identifier
+	// on every attempt and resume of it. An engine that leaves durable records
+	// on the target about work it did, such as which tables it quarantined,
+	// keys them by it so a later attempt in another process can recognize its
+	// own work. Empty when the caller drives no stored apply.
+	ApplyIdentifier string
+	Database        string             // Target database
+	Changes         []SchemaChange     // Per-namespace changes to apply (DDL + files from plan)
+	TargetShards    []string           // Optional shard selector for sharded engines
+	SchemaFiles     schema.SchemaFiles // Full declarative schema files (for engines that apply whole files)
+	Options         map[string]string  // Options like "defer_cutover", "skip_revert"
+	ResumeState     *ResumeState       // Fresh context or full resume state after restart
+	Credentials     *Credentials       // Resolved credentials (from discovery)
 
 	// IgnoreTables lists the live tables the plan was reviewed under the
 	// ignore_tables config withholding (see PlanRequest.IgnoreTables). An engine

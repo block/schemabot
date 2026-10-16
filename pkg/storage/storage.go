@@ -250,6 +250,21 @@ type CheckStore interface {
 	// Returns true when the row was marked successful.
 	MarkStalePlanSuccessful(ctx context.Context, check *Check) (bool, error)
 
+	// BlockStaleStartedApply records that the schema change a started apply
+	// owns is gone from the PR: it moves the row onto headSHA with check's
+	// blocking reason and message, keeping an in-progress row in_progress and
+	// turning a settled one into action_required. check is the row as the
+	// caller read it; its HeadSHA and ApplyID pin that read. The status is
+	// decided from the row as stored at write time, under the same row lock
+	// as the write, so a completion that lands after the caller read the row
+	// is never rewound to in_progress. It writes nothing and returns false
+	// when no started apply owns the row any more, when a different apply
+	// owns it than the caller read, or when the stored head is neither the
+	// head the caller read nor headSHA, because a newer write owns the row.
+	// On a landed write, check.HeadSHA, check.Status, and check.Conclusion
+	// hold the values stored.
+	BlockStaleStartedApply(ctx context.Context, check *Check, headSHA string) (bool, error)
+
 	// ClearAggregateBlock clears the blocking reason on stored aggregate check
 	// state after the PR-level guards re-verified that the blocking condition
 	// no longer applies. The update is conditional on the head SHA and blocking
@@ -261,7 +276,11 @@ type CheckStore interface {
 	// CompleteForApply updates stored check state to a terminal state only if
 	// it still belongs to the given apply and no newer apply exists for the
 	// same PR/environment/database. Returns false when another driver changed
-	// the stored state first.
+	// the stored state first. A row stale cleanup already blocked with
+	// SchemaRemovedAfterApplyStartedBlockingReason keeps its head SHA, reason,
+	// and message, and a successful completion of it lands as action_required.
+	// On a landed write, check holds the head SHA, has_changes, conclusion,
+	// blocking reason, and message stored.
 	CompleteForApply(ctx context.Context, check *Check, apply *Apply) (bool, error)
 
 	// MarkActionRequiredForApply marks stored check state action_required for a
@@ -737,6 +756,13 @@ type ApplyStore interface {
 	// Note: For recovery, use ClaimApplyByID which handles locking.
 	GetInProgress(ctx context.Context) ([]*Apply, error)
 
+	// GetUnsettled returns every apply a driver may still claim: the
+	// non-terminal applies GetInProgress returns, and the stopped ones, which
+	// are terminal for claiming but resumable (state.SettledApplyStates). A
+	// reader deciding whether an apply's engine resources are still in use
+	// reads this set, since a stopped apply resumes from them.
+	GetUnsettled(ctx context.Context) ([]*Apply, error)
+
 	// FindStuckPendingApplies returns pending applies that a driver should
 	// already have claimed — pending with child rows (the child-rows arm of
 	// ClaimApplyByID's pending predicate) — but whose created_at is older than
@@ -914,6 +940,19 @@ type ApplyStore interface {
 	// apply competing for this target waits behind it.
 	WithExclusiveTarget(ctx context.Context, apply *Apply, fn func(context.Context) error) error
 
+	// WithTargetHeld runs fn while holding the advisory lock of the apply
+	// target named by database, dbType, and environment. It is the hold
+	// WithExclusiveTarget gives without its refusal: fn runs alongside the
+	// applies that already own the target, and what the lock gives it is that
+	// no apply is created for, or claimed on, the target until fn returns.
+	//
+	// It is for work that reclaims what no apply owns any more, decided from
+	// the applies in storage: fn reads them under the lock, so the set it reads
+	// is still the set when its last statement runs. Like WithExclusiveTarget it
+	// binds SchemaBot's own applies and nothing else, and fn must be bounded,
+	// because every apply competing for the target waits behind it.
+	WithTargetHeld(ctx context.Context, database, dbType, environment string, fn func(context.Context) error) error
+
 	// ExpireRetryable transitions failed_retryable applies that exhausted their
 	// retry budget or recovery freshness window to permanent failed, settling
 	// their task and operation rows against that verdict. Returns the applies
@@ -933,6 +972,15 @@ type ApplyStore interface {
 	// concurrent passes would be correct but would each pay the full scan.
 	ExpireRetryable(ctx context.Context, limit int) ([]*RetryableApplyExpiration, error)
 
+	// WithBranchReconcileElection runs fn on the one instance elected to
+	// reconcile engine branches this pass, under an advisory lock held for as
+	// long as fn runs. ErrBranchReconcileBusy reports that another instance
+	// holds the lock, and fn does not run. The lock is an efficiency gate,
+	// not a safety one: it keeps two instances from listing every branch at
+	// once, while each delete is made safe by the apply target hold the
+	// reconcile takes around it.
+	WithBranchReconcileElection(ctx context.Context, fn func(context.Context) error) error
+
 	// FindMissingSummaryComment returns GitHub-backed applies that recently
 	// reached a terminal state (including stopped, judged by updated_at since a
 	// resumable stop keeps completed_at NULL) but whose progress comment was
@@ -940,9 +988,23 @@ type ApplyStore interface {
 	// marker is superseded (a stop's summary consumed by a resume rotation, so
 	// the current terminal state's summary was never posted), or only a claim
 	// sentinel stale for longer than SummaryClaimStaleAfter remains from a
-	// publisher that crashed before posting. Used by startup reconciliation to
-	// post missing summary comments after restarts.
-	FindMissingSummaryComment(ctx context.Context) ([]*Apply, error)
+	// publisher that crashed before posting. "Recently" is MissingSummaryLookback.
+	// An apply qualifies only once it has been terminal for at least settledFor,
+	// so a reconciler never races the live publisher that is still delivering
+	// the summary moments after the terminal write; zero disables the floor.
+	// Returns at most limit applies, most recently updated first.
+	// Used by summary reconciliation, at startup and on every reconcile pass, to
+	// post summary comments a failed or interrupted publisher left missing.
+	FindMissingSummaryComment(ctx context.Context, settledFor time.Duration, limit int) ([]*Apply, error)
+
+	// FindTerminalWithInProgressCheck returns GitHub-backed applies in a
+	// terminal state (stopped excluded: a stop deliberately leaves its check in
+	// progress) that stored check state still names as its in-progress apply,
+	// with no newer apply for the same target. Every terminal check write moves
+	// the stored state out of in_progress, so each result is an apply whose
+	// terminal check refresh never landed. Returns at most limit applies, most
+	// recently updated first.
+	FindTerminalWithInProgressCheck(ctx context.Context, limit int) ([]*Apply, error)
 
 	// GetByPR returns all applies for a PR.
 	GetByPR(ctx context.Context, repo string, pr int) ([]*Apply, error)
@@ -1000,6 +1062,11 @@ const (
 // expiry lock, so this pass did no work. It is an expected outcome on every
 // instance but one, not a failure.
 var ErrRetryableExpiryBusy = errors.New("another instance is expiring retryable applies")
+
+// ErrBranchReconcileBusy reports that another instance holds the branch
+// reconcile lock, so this pass did no work. It is an expected outcome on every
+// instance but one, not a failure.
+var ErrBranchReconcileBusy = errors.New("another instance is reconciling engine branches")
 
 // RetryableApplyExpiration is a failed_retryable apply that was made permanent
 // because operator recovery should no longer retry it automatically.
@@ -1308,6 +1375,12 @@ const ProgressCommentAuthorityStaleAfter = ApplyLeaseStaleAfter
 // post, so anything older than this window is a crash, not a slow post.
 const SummaryClaimStaleAfter = 2 * time.Minute
 
+// MissingSummaryLookback is how long after reaching a terminal state an apply
+// stays eligible for summary reconciliation. Reconciliation runs on every
+// reconcile pass, so the window is what lets a summary whose publish failed
+// during a long GitHub outage still be posted once GitHub recovers.
+const MissingSummaryLookback = 24 * time.Hour
+
 // PlanCommentStore tracks plan comments posted on PRs so a newer plan comment
 // for the same database can retire the ones it supersedes — minimizing a
 // comment whose head an apply owns, deleting one no apply acted on. Rows exist
@@ -1370,6 +1443,18 @@ type ApplyOperationStore interface {
 	// ListByApplies returns all child rows for the requested applies in
 	// (apply_id, created_at, id) order.
 	ListByApplies(ctx context.Context, applyIDs []int64) ([]*ApplyOperation, error)
+
+	// ListRecentTargets returns each distinct (database, environment, target)
+	// that an apply of databaseType ran an operation against, among applies
+	// created within lookback of the storage database's clock, ordered by
+	// database, environment, then target, each compared bytewise, so every
+	// dialect returns the same order. Tuples are distinct byte for byte, so
+	// targets that differ only by case are listed separately, as the
+	// resolver keys they are. Operations without a target are skipped. A
+	// lookback under one microsecond is rejected. It
+	// tells a data plane, which resolves targets on demand rather than
+	// listing them in config, which targets it has applied to.
+	ListRecentTargets(ctx context.Context, databaseType string, lookback time.Duration) ([]AppliedTarget, error)
 
 	// UpdateState transitions a child row to a new state. Updates the state
 	// column only; for transitions that should also stamp started_at or
@@ -1555,6 +1640,16 @@ type ApplyOperationStore interface {
 	// is present in ctx.
 	MarkPendingStoppedByApply(ctx context.Context, applyID int64) (int64, error)
 
+	// MarkPendingCancelledByApply transitions every operation of an apply that
+	// never started to cancelled, returning the number of rows changed: the
+	// pending ones, and the stopped ones a stop reached while still pending.
+	// Used once a cancel is pending: an operation that never started changed
+	// nothing on its target, so it settles on the spot rather than outliving a
+	// cancelled rollout. A stopped operation that had started is left to the
+	// drive that delivers the cancel to it. completed_at is stamped, and writes
+	// are lease guarded the same way as MarkPendingStoppedByApply.
+	MarkPendingCancelledByApply(ctx context.Context, applyID int64) (int64, error)
+
 	// ReapStranded mirrors the parent's outcome onto pending, unleased operation
 	// rows whose parent apply settled long enough ago to be quiescent, returning
 	// what it reaped (at most limit rows, oldest first). A pending row under a
@@ -1628,6 +1723,12 @@ type ControlRequestStore interface {
 	// same operation is already pending for the apply, the existing request is
 	// returned with alreadyPending=true.
 	RequestPending(ctx context.Context, req *ApplyControlRequest) (*ApplyControlRequest, bool, error)
+
+	// RequestPendingSuperseding records req as RequestPending does and, in the
+	// same transaction, completes the apply's pending request for superseded,
+	// whose effect req replaces. Either both writes land or neither does, so a
+	// failed request leaves the superseded one still deliverable.
+	RequestPendingSuperseding(ctx context.Context, req *ApplyControlRequest, superseded ControlOperation) (*ApplyControlRequest, bool, error)
 
 	// GetPending returns the pending request for an apply operation.
 	GetPending(ctx context.Context, applyID int64, operation ControlOperation) (*ApplyControlRequest, error)

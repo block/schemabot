@@ -75,6 +75,55 @@ func TestPostgresStorageParity(t *testing.T) {
 		}, postgresLockWaiter(h.db))
 	})
 	t.Run("NonUTCWriterTimesStoreTheirInstant", func(t *testing.T) { testPostgresNonUTCWriterTimesStoreTheirInstant(t, h) })
+	t.Run("FindTerminalWithInProgressCheck", func(t *testing.T) { testPostgresFindTerminalWithInProgressCheck(t, h) })
+}
+
+// testPostgresFindTerminalWithInProgressCheck verifies the stranded-check query
+// runs on Postgres: a failed apply whose stored check state is still in
+// progress is returned, and one whose check completed is not.
+func testPostgresFindTerminalWithInProgressCheck(t *testing.T, h postgresHarness) {
+	store := h.NewStorage(t)
+	ctx := t.Context()
+
+	seed := func(name, checkStatus string, planID int64) *storage.Apply {
+		lock := storagetest.CreateLock(t, store, name+"_db", storage.DatabaseTypeMySQL)
+		apply := &storage.Apply{
+			ApplyIdentifier: name,
+			LockID:          lock.ID,
+			PlanID:          planID,
+			Database:        lock.DatabaseName,
+			DatabaseType:    lock.DatabaseType,
+			Repository:      lock.Repository,
+			PullRequest:     lock.PullRequest,
+			Environment:     "staging",
+			Caller:          "org/repo#123",
+			InstallationID:  12345,
+			Engine:          storage.EngineSpirit,
+			State:           state.Apply.Failed,
+		}
+		applyID, err := store.Applies().Create(ctx, apply)
+		require.NoError(t, err)
+		apply.ID = applyID
+		require.NoError(t, store.Checks().Upsert(ctx, &storage.Check{
+			Repository:   apply.Repository,
+			PullRequest:  apply.PullRequest,
+			HeadSHA:      "abc123",
+			Environment:  apply.Environment,
+			DatabaseType: apply.DatabaseType,
+			DatabaseName: apply.Database,
+			ApplyID:      apply.ID,
+			HasChanges:   true,
+			Status:       checkStatus,
+		}))
+		return apply
+	}
+	stranded := seed("apply_pg_check_stranded", checkStatusInProgress, 740)
+	seed("apply_pg_check_completed", "completed", 741)
+
+	applies, err := store.Applies().FindTerminalWithInProgressCheck(ctx, 10)
+	require.NoError(t, err)
+	require.Len(t, applies, 1)
+	assert.Equal(t, stranded.ApplyIdentifier, applies[0].ApplyIdentifier)
 }
 
 // testPostgresNonUTCWriterTimesStoreTheirInstant verifies that a driver running
@@ -82,15 +131,14 @@ func TestPostgresStorageParity(t *testing.T) {
 // started_at and completed_at from its own clock, so the values carry its
 // location; every datetime column is a plain timestamp, which keeps only a
 // wall-clock reading. The stored reading must be the UTC one: the apply reads
-// back at the instant it finished, and a GitHub-backed apply that finished
-// moments ago with no summary comment is still inside the now()-relative
-// reconciliation window, so its terminal summary is posted after a restart.
+// back at the instant it finished, which is what every now()-relative window
+// over it, such as summary reconciliation's, is measured against.
 func testPostgresNonUTCWriterTimesStoreTheirInstant(t *testing.T, h postgresHarness) {
 	store := h.NewStorage(t)
 	ctx := t.Context()
 
 	// West of UTC, so a local wall-clock reading taken for UTC lands hours in
-	// the past, outside the reconciliation window.
+	// the past.
 	driverZone := time.FixedZone("UTC-5", -5*60*60)
 	completedAt := time.Now().In(driverZone).Truncate(time.Microsecond)
 	startedAt := completedAt.Add(-time.Minute)
@@ -130,10 +178,17 @@ func testPostgresNonUTCWriterTimesStoreTheirInstant(t *testing.T, h postgresHarn
 	assert.Equal(t, startedAt.UTC(), *stored.StartedAt, "started_at reads back as the instant the driver wrote, in UTC")
 	assert.Equal(t, completedAt.UTC(), *stored.CompletedAt, "completed_at reads back as the instant the driver wrote, in UTC")
 
-	missing, err := store.Applies().FindMissingSummaryComment(ctx)
+	missing, err := store.Applies().FindMissingSummaryComment(ctx, 0, 100)
 	require.NoError(t, err)
 	require.Len(t, missing, 1, "an apply that finished moments ago with no summary is inside the reconciliation window")
 	assert.Equal(t, apply.ApplyIdentifier, missing[0].ApplyIdentifier)
+
+	// A completed_at stored at the driver's local wall clock would read hours
+	// old and clear the settle floor; stored at its instant, the apply finished
+	// moments ago and is still its live publisher's.
+	unsettled, err := store.Applies().FindMissingSummaryComment(ctx, storage.SummaryClaimStaleAfter, 100)
+	require.NoError(t, err)
+	assert.Empty(t, unsettled, "an apply that finished moments ago has not settled")
 }
 
 // reopenRaceDeadline bounds each wait in the snapshot race: the update reaching
@@ -1085,6 +1140,45 @@ func TestPostgresApplyOperationLeaseGuards(t *testing.T) {
 		require.NotNil(t, advanced.StartedAt, "the projection stamps started_at while it is still NULL")
 		assert.WithinDuration(t, startedAt, *advanced.StartedAt, time.Second)
 	})
+}
+
+// ListRecentTargets bounds a data plane's view of the targets it applied to by
+// the age of the apply on PostgreSQL too: the cutoff is rendered SQL, so it is
+// exercised on each dialect. A target whose only applies are older than the
+// lookback drops out, while one with any apply inside the window stays.
+func TestPostgresListRecentTargetsWindow(t *testing.T) {
+	dsn, fixtureDB := testutil.StartPostgres(t, "sqlstore_recent_targets_window")
+	db, err := postgresconn.Open(dsn)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	require.NoError(t, db.PingContext(t.Context()))
+	applyPostgresTestSchema(t, fixtureDB)
+	clearPostgresTables(t, db)
+
+	ctx := t.Context()
+	store := NewPostgres(db)
+	lock := storagetest.CreateLock(t, store, "orders", storage.DatabaseTypeVitess)
+	seed := func(t *testing.T, applyID string, planID int64, target string, age time.Duration) {
+		t.Helper()
+		apply := storagetest.CreateApplyWithStateAndEnv(t, store, lock, applyID, planID, state.Apply.Completed, "staging")
+		_, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+			ApplyID: apply.ID, Deployment: "region-a", Target: target,
+		})
+		require.NoError(t, err)
+		_, err = db.ExecContext(ctx,
+			fmt.Sprintf(`UPDATE applies SET created_at = CURRENT_TIMESTAMP - INTERVAL '%d seconds' WHERE id = $1`, int(age.Seconds())),
+			apply.ID)
+		require.NoError(t, err)
+	}
+	seed(t, "apply_stale_only", 9101, "orders-stale", 40*24*time.Hour)
+	seed(t, "apply_recent_old", 9102, "orders-recent", 40*24*time.Hour)
+	seed(t, "apply_recent_new", 9103, "orders-recent", 2*24*time.Hour)
+
+	targets, err := store.ApplyOperations().ListRecentTargets(ctx, storage.DatabaseTypeVitess, 30*24*time.Hour)
+	require.NoError(t, err)
+	assert.Equal(t, []storage.AppliedTarget{
+		{Database: "orders", Environment: "staging", Target: "orders-recent"},
+	}, targets)
 }
 
 func applyPostgresTestSchema(t *testing.T, db *sql.DB) {

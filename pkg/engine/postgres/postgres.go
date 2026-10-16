@@ -25,6 +25,7 @@ import (
 	"github.com/block/pg-sprite/pkg/router"
 	"github.com/block/pg-sprite/pkg/schemadiff"
 	pgstatement "github.com/block/pg-sprite/pkg/statement"
+	"github.com/block/pg-sprite/pkg/verdict"
 	spirittable "github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/utils"
 	"github.com/jackc/pgx/v5"
@@ -275,28 +276,41 @@ func planSchemas(ctx context.Context, pool *pgxpool.Pool, req *engine.PlanReques
 		if ns == nil {
 			return nil, fmt.Errorf("plan PostgreSQL namespace %q: schema files are required", namespace)
 		}
-		if err := refuseTableDeclaredTwice(namespace, ns.Files); err != nil {
+		parsed, err := parseDesiredFiles(namespace, ns.Files)
+		if err != nil {
+			return nil, err
+		}
+		if err := refuseTableDeclaredTwice(namespace, parsed); err != nil {
 			return nil, err
 		}
 		schemaChange := engine.SchemaChange{Namespace: namespace}
 		files := sortedKeys(ns.Files)
 		desiredTables := make(map[string]bool, len(files))
 		for _, filename := range files {
-			table, rlsChanges, handled, err := planRowSecurityOperation(ctx, pool, namespace, ns.Files[filename])
-			if err != nil {
-				return nil, fmt.Errorf("plan PostgreSQL schema in %q/%q: %w", namespace, filename, err)
-			}
-			if handled {
-				desiredTables[table] = true
+			file := parsed[filename]
+			if rowSecurity, ok := file.RowSecurity(); ok {
+				rlsChanges, err := planRowSecurityOperation(ctx, pool, namespace, rowSecurity)
+				if err != nil {
+					return nil, fmt.Errorf("plan PostgreSQL schema in %q/%q: %w", namespace, filename, err)
+				}
+				desiredTables[file.Table()] = true
 				schemaChange.TableChanges = append(schemaChange.TableChanges, rlsChanges...)
 				continue
 			}
-			report, table, err := planPostgresDefinition(ctx, pool, namespace, ns.Files[filename])
+			desired, ok := file.Schema()
+			if !ok {
+				return nil, fmt.Errorf("plan PostgreSQL schema in %q/%q: the parse admitted no planner input", namespace, filename)
+			}
+			report, table, err := planPostgresDefinition(ctx, pool, namespace, desired)
 			if err != nil {
 				return nil, fmt.Errorf("plan PostgreSQL schema in %q/%q: %w", namespace, filename, err)
 			}
 			desiredTables[table] = true
-			changes, tiers, unrecognized, err := tableChanges(report, parser)
+			crossNamespace, err := crossNamespaceForeignKeysForDrops(ctx, pool, namespace, report)
+			if err != nil {
+				return nil, err
+			}
+			changes, tiers, unrecognized, err := tableChanges(report, crossNamespace, parser)
 			if err != nil {
 				return nil, fmt.Errorf("render PostgreSQL plan for table %q in namespace %q: %w", table, namespace, err)
 			}
@@ -365,17 +379,14 @@ func planSchemas(ctx context.Context, pool *pgxpool.Pool, req *engine.PlanReques
 // on its own, so a table declared twice would get two contradictory diffs,
 // each dropping what only the other file declares; there is no single desired
 // definition to review. The error names the table and both files so the
-// operator knows which one to remove. It runs before any file is planned, and
-// applies the same rule every planner does (ddl.TableDeclarations), so a
-// duplicate declaration reads the same whichever engine refuses it.
-func refuseTableDeclaredTwice(namespace string, files map[string]string) error {
+// operator knows which one to remove. It runs before any file is planned, on
+// the same admitted files the plan uses, and applies the same rule every
+// planner does (ddl.TableDeclarations), so a duplicate declaration reads the
+// same whichever engine refuses it.
+func refuseTableDeclaredTwice(namespace string, files map[string]pgstatement.DesiredFile) error {
 	var declared ddl.TableDeclarations
 	for _, filename := range sortedKeys(files) {
-		table, err := desiredTableName(files[filename])
-		if err != nil {
-			return fmt.Errorf("plan PostgreSQL schema in %q/%q: %w", namespace, filename, err)
-		}
-		if err := declared.Declare(filename, table); err != nil {
+		if err := declared.Declare(filename, files[filename].Table()); err != nil {
 			return fmt.Errorf("plan PostgreSQL namespace %q: %w", namespace, err)
 		}
 	}
@@ -442,14 +453,37 @@ const tierUnderived preflight.Tier = -1
 // shape has no tier carries tierUnderived. unrecognized carries one entry per
 // statement whose verdict is a placeholder for planner vocabulary this build
 // does not map, for the caller to log with the plan's identifiers.
-func tableChanges(report pgplan.Report, parser ddl.StatementParser) ([]engine.TableChange, []preflight.Tier, []unrecognizedPlannerVocabulary, error) {
+// crossNamespaceForeignKeysForDrops reads the live table's foreign keys into
+// another namespace when the plan drops a foreign key, so the drop's remedy
+// can name them; a plan with no dropped foreign key never reads the catalog.
+// The live table must exist, since only a live constraint can be dropped, so
+// a missing row is an error rather than a table without foreign keys.
+func crossNamespaceForeignKeysForDrops(ctx context.Context, pool *pgxpool.Pool, namespace string, report pgplan.Report) ([]string, error) {
+	if !slices.ContainsFunc(report.Statements, func(s pgplan.Statement) bool { return s.Kind == schemadiff.ChangeDropForeignKey }) {
+		return nil, nil
+	}
+	keys, err := foreignKeysFor(ctx, pool, namespace, []string{report.Table})
+	if err != nil {
+		return nil, err
+	}
+	if len(keys) != 1 {
+		return nil, fmt.Errorf("table %q in namespace %q left the catalog while the plan was reading its foreign keys; retry the plan", report.Table, namespace)
+	}
+	return keys[0].crossNamespaceForeignKeys, nil
+}
+
+// tableChanges maps a table's planned statements to the changes the operator
+// reviews. crossNamespaceForeignKeys names the live table's foreign keys into
+// another namespace, which a schema file cannot declare, so a dropped foreign
+// key's remedy names them only when the table has any.
+func tableChanges(report pgplan.Report, crossNamespaceForeignKeys []string, parser ddl.StatementParser) ([]engine.TableChange, []preflight.Tier, []unrecognizedPlannerVocabulary, error) {
 	// Each statement's verdict is derived once and reused for both the
 	// greenfield decision and the rendering, so a placeholder verdict is
 	// reported once per statement.
 	verdicts := make([]stepVerdict, len(report.Statements))
 	var unrecognized []unrecognizedPlannerVocabulary
 	for i, statement := range report.Statements {
-		verdicts[i] = executionVerdict(report.FormatVersion, statement, report.Table)
+		verdicts[i] = executionVerdict(report.FormatVersion, statement, report.Table, crossNamespaceForeignKeys)
 		if verdicts[i].unrecognized != nil {
 			unrecognized = append(unrecognized, *verdicts[i].unrecognized)
 		}
@@ -992,30 +1026,39 @@ func undeclaredTableDrops(ctx context.Context, pool *pgxpool.Pool, database, nam
 
 // undeclaredTableReason explains why the drop is blocked and what the
 // operator can do about it, tailored to the table's foreign key relationships.
-// The declarative format refuses foreign keys on either side: a table that
-// owns them cannot be declared at all, and a table that other tables
-// reference can be declared only by a hand-written file, because the
-// constraints live on the referencing tables and the schema pull refuses to
-// render a table it would describe incompletely. A drop of a referenced
+// A schema file can declare a foreign key only to a table in its own
+// namespace, so a table that owns one into another namespace cannot be
+// declared at all. Any other table with foreign keys on either side can be
+// declared, but only by a hand-written file, because the schema pull refuses
+// to render a table it would describe incompletely. A drop of a referenced
 // table has to take the referencing constraints with it.
 func undeclaredTableReason(namespace string, live liveTable) string {
 	preamble := fmt.Sprintf(
 		"table %q exists on the target but no schema file in namespace %q declares it; converging would drop the table, which SchemaBot's PostgreSQL support never executes",
 		live.name, namespace)
 	owned := strings.Join(quoteAll(live.foreignKeys), ", ")
+	crossNamespace := strings.Join(quoteAll(live.crossNamespaceForeignKeys), ", ")
 	referencing := strings.Join(quoteAll(live.referencedBy), ", ")
 	switch {
+	case len(live.crossNamespaceForeignKeys) > 0 && len(live.referencedBy) > 0:
+		return fmt.Sprintf(
+			"%s; the table cannot be declared while it carries foreign key constraint(s) %s, which reference another namespace and schema files do not support, and foreign key constraint(s) %s on other tables reference it — drop the table together with the referencing constraints, or remove those foreign keys and declare it by hand, through a separately reviewed process",
+			preamble, crossNamespace, referencing)
+	case len(live.crossNamespaceForeignKeys) > 0:
+		return fmt.Sprintf(
+			"%s; the table cannot be declared while it carries foreign key constraint(s) %s, which reference another namespace and schema files do not support — drop the table, or remove those foreign keys before declaring it, through a separately reviewed process",
+			preamble, crossNamespace)
 	case len(live.foreignKeys) > 0 && len(live.referencedBy) > 0:
 		return fmt.Sprintf(
-			"%s; the table cannot be declared while it carries foreign key constraint(s) %s, which schema files do not support, and foreign key constraint(s) %s on other tables reference it — drop the table together with the referencing constraints, or remove its own foreign keys and declare it by hand, through a separately reviewed process",
+			"%s; it carries foreign key constraint(s) %s and foreign key constraint(s) %s on other tables reference it, so the schema pull cannot write a file for it — declare the table by hand in a schema file, foreign keys included, to keep it under management, or drop it together with the referencing constraints through a separately reviewed process",
 			preamble, owned, referencing)
 	case len(live.foreignKeys) > 0:
 		return fmt.Sprintf(
-			"%s; the table cannot be declared while it carries foreign key constraint(s) %s, which schema files do not support — drop the table, or remove its foreign keys before declaring it, through a separately reviewed process",
+			"%s; it carries foreign key constraint(s) %s, so the schema pull cannot write a file for it — declare the table by hand in a schema file, foreign keys included, to keep it under management, or drop it through a separately reviewed process",
 			preamble, owned)
 	case len(live.referencedBy) > 0:
 		return fmt.Sprintf(
-			"%s; foreign key constraint(s) %s on other tables reference it, and schema files do not support foreign keys, so the schema pull cannot write a file for it — declare the table by hand in a schema file to keep it under management, or drop it together with the referencing constraints through a separately reviewed process",
+			"%s; foreign key constraint(s) %s on other tables reference it, so the schema pull cannot write a file for it — declare the table by hand in a schema file to keep it under management, or drop it together with the referencing constraints through a separately reviewed process",
 			preamble, referencing)
 	}
 	return preamble + " — declare the table in a schema file to keep it under management, or drop it through a separately reviewed process"
@@ -1034,11 +1077,14 @@ func quoteAll(names []string) []string {
 // liveTable is a table the namespace holds on the target, with the foreign
 // key constraint names on each side of the table that decide which remedy the
 // verdict can offer: foreignKeys are the constraints the table owns,
-// referencedBy the constraints on other tables that point at it.
+// crossNamespaceForeignKeys the subset of them that reference a table in
+// another namespace, and referencedBy the constraints on other tables that
+// point at it.
 type liveTable struct {
-	name         string
-	foreignKeys  []string
-	referencedBy []string
+	name                      string
+	foreignKeys               []string
+	crossNamespaceForeignKeys []string
+	referencedBy              []string
 }
 
 // liveTables lists the tables pg-sprite's declarative model manages, in name
@@ -1082,9 +1128,10 @@ func liveTables(ctx context.Context, pool *pgxpool.Pool, namespace string) ([]li
 // tableForeignKeys is one table's foreign key constraint names on each side,
 // as the catalog reports them.
 type tableForeignKeys struct {
-	name         string
-	foreignKeys  []string
-	referencedBy []string
+	name                      string
+	foreignKeys               []string
+	crossNamespaceForeignKeys []string
+	referencedBy              []string
 }
 
 // foreignKeysFor reads the foreign key constraint names on each side of every
@@ -1098,6 +1145,12 @@ func foreignKeysFor(ctx context.Context, pool *pgxpool.Pool, namespace string, n
 		                 FROM pg_catalog.pg_constraint con
 		                 WHERE con.conrelid OPERATOR(pg_catalog.=) c.oid
 		                   AND con.contype OPERATOR(pg_catalog.=) 'f'), '{}'),
+		       COALESCE((SELECT pg_catalog.array_agg(con.conname ORDER BY con.conname)
+		                 FROM pg_catalog.pg_constraint con
+		                 JOIN pg_catalog.pg_class ref ON ref.oid OPERATOR(pg_catalog.=) con.confrelid
+		                 WHERE con.conrelid OPERATOR(pg_catalog.=) c.oid
+		                   AND con.contype OPERATOR(pg_catalog.=) 'f'
+		                   AND ref.relnamespace OPERATOR(pg_catalog.<>) c.relnamespace), '{}'),
 		       COALESCE((SELECT pg_catalog.array_agg(con.conname ORDER BY con.conname)
 		                 FROM pg_catalog.pg_constraint con
 		                 WHERE con.confrelid OPERATOR(pg_catalog.=) c.oid
@@ -1114,7 +1167,7 @@ func foreignKeysFor(ctx context.Context, pool *pgxpool.Pool, namespace string, n
 	keys := make([]tableForeignKeys, 0, len(names))
 	for rows.Next() {
 		var key tableForeignKeys
-		if err := rows.Scan(&key.name, &key.foreignKeys, &key.referencedBy); err != nil {
+		if err := rows.Scan(&key.name, &key.foreignKeys, &key.crossNamespaceForeignKeys, &key.referencedBy); err != nil {
 			return nil, fmt.Errorf("scan foreign keys for declarable table in namespace %q: %w", namespace, err)
 		}
 		keys = append(keys, key)
@@ -1151,6 +1204,7 @@ func joinForeignKeys(namespace string, names []string, keys []tableForeignKeys) 
 		}
 		decorated[key.name] = true
 		live.foreignKeys = key.foreignKeys
+		live.crossNamespaceForeignKeys = key.crossNamespaceForeignKeys
 		live.referencedBy = key.referencedBy
 	}
 	for _, name := range names {
@@ -1275,7 +1329,7 @@ func singleLine(s string) string {
 // mapping was written — still renders a blocked placeholder, and is reported
 // on the verdict so the caller can log it with the identifiers this function
 // does not have.
-func executionVerdict(formatVersion int, statement pgplan.Statement, table string) stepVerdict {
+func executionVerdict(formatVersion int, statement pgplan.Statement, table string, crossNamespaceForeignKeys []string) stepVerdict {
 	if formatVersion != pgplan.FormatVersion {
 		return stepVerdict{
 			mode:         engine.ExecutionModeBlocked,
@@ -1307,14 +1361,17 @@ func executionVerdict(formatVersion int, statement pgplan.Statement, table strin
 		if reason, ok := createShapeRefusalReason(statement.Cause, table); ok {
 			return blocked(reason)
 		}
-		verdict := blocked(fmt.Sprintf("statement for table %q is refused: it cannot be executed safely as written", table))
+		if statement.Cause == "" && statement.Reason == verdict.ReasonDeclarativeForeignKey {
+			return blocked(foreignKeyChangeRefusalReason(statement.Kind, table, crossNamespaceForeignKeys))
+		}
+		refused := blocked(fmt.Sprintf("statement for table %q is refused: it cannot be executed safely as written", table))
 		// An absent cause is a refusal from outside the create path and the
 		// generic sentence is the right one; only a cause the mapping has no
 		// sentence for is vocabulary that moved.
 		if statement.Cause != "" {
-			verdict.unrecognized = &unrecognizedPlannerVocabulary{kind: "create_shape_cause", value: string(statement.Cause)}
+			refused.unrecognized = &unrecognizedPlannerVocabulary{kind: "create_shape_cause", value: string(statement.Cause)}
 		}
-		return verdict
+		return refused
 	case router.DispositionExecute:
 		// Execute on anything but the native route with native steps is a
 		// route or backend this build does not run, or a plan with nothing
@@ -1360,12 +1417,41 @@ func createShapeRefusalReason(cause executor.CreateShapeCause, table string) (st
 		reason = "declares the same relation name more than once; give every table, index, constraint, and sequence a unique name"
 	case executor.CreateShapeMultipleOperations:
 		reason = "contains multiple create operations in one statement; split them into separate CREATE TABLE or CREATE INDEX statements"
+	case executor.CreateShapeForeignKey:
+		reason = "declares a foreign key, which SchemaBot plans but does not apply on PostgreSQL yet; leave the foreign key out of the schema file to create the table, then add the foreign key outside SchemaBot and back to the file"
 	case executor.CreateShapeUnsupportedKind:
 		reason = "uses a statement kind SchemaBot's PostgreSQL create path does not support; use CREATE TABLE or CREATE INDEX, or create the object outside SchemaBot"
 	default:
 		return "", false
 	}
 	return fmt.Sprintf("statement for table %q %s", table, reason), true
+}
+
+// foreignKeyChangeRefusalReason renders the planner's refusal of a
+// foreign-key change on a live table. The plan shows the change so it can be
+// reviewed, but the engine does not run it, so the operator runs it
+// themselves. A blocked step blocks the whole plan, so an added foreign key
+// whose column the same plan adds cannot be run on its own: the remedy has
+// the rest of the plan applied first, without the foreign key. A dropped
+// foreign key is usually one the file left out rather than one the operator
+// means to remove, so its remedy offers declaring it first, which plans no
+// change and keeps the constraint. A foreign key into another namespace
+// cannot be declared, so when the table carries any, the remedy names them
+// and says removal is the only way forward for those.
+func foreignKeyChangeRefusalReason(kind schemadiff.ChangeKind, table string, crossNamespaceForeignKeys []string) string {
+	const unsupported = "which SchemaBot plans but does not apply on PostgreSQL yet"
+	switch kind {
+	case schemadiff.ChangeAddForeignKey:
+		return fmt.Sprintf("statement for table %q adds a foreign key, %s; leave the foreign key out of the schema file to apply the rest of the plan, then run this statement outside SchemaBot and add the foreign key back to the file", table, unsupported)
+	case schemadiff.ChangeDropForeignKey:
+		reason := fmt.Sprintf("statement for table %q drops a foreign key, %s; to keep the foreign key, declare it in the schema file and re-plan; to remove it, run this statement outside SchemaBot, then re-plan", table, unsupported)
+		if len(crossNamespaceForeignKeys) > 0 {
+			reason += fmt.Sprintf("; foreign key constraint(s) %s reference another namespace and cannot be declared, so the plan stays blocked until they are removed through a separately reviewed process",
+				strings.Join(quoteAll(crossNamespaceForeignKeys), ", "))
+		}
+		return reason
+	}
+	return fmt.Sprintf("statement for table %q changes a foreign key, %s; leave the change out of the schema file to apply the rest of the plan, then run this statement outside SchemaBot and put the change back in the file", table, unsupported)
 }
 
 func destructiveReason(destructive bool, table string) string {

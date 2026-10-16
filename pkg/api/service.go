@@ -242,8 +242,17 @@ type Service struct {
 	// an observer for PR comments.
 	OnApplyRecovered RecoveryCallback
 
+	// OnStoppedApplyClaimed is called after a driver claims a stopped apply,
+	// before the drive starts, on both single- and multi-operation drives. A
+	// start claim has already committed the apply out of stopped; a claim that
+	// delivers a pending cancel leaves it stopped until the drive settles it.
+	// Set by the webhook handler to move the PR Check Run off "stopped", which
+	// it republishes from the apply's state in storage, so both claims show
+	// what storage records. It must not block: the drive waits on it.
+	OnStoppedApplyClaimed func(apply *storage.Apply)
+
 	// OnApplyTerminalSummary is called after an apply is terminalized by the
-	// aggregate projection CAS. Set by the webhook handler to publish the
+	// aggregate projection CAS or by retryable expiry. Set by the webhook handler to publish the
 	// apply-level terminal PR summary and refresh GitHub check state; the
 	// summary-marker claim inside the publish path keeps it exactly-once
 	// against any still-live per-driver observer.
