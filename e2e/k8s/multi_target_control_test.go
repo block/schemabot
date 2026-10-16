@@ -3,7 +3,6 @@
 package k8s
 
 import (
-	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -293,7 +292,7 @@ func TestK8sMultiTarget_DriftAfterPlanFailsNamingTarget(t *testing.T) {
 	assert.Equal(t, []string{mtTargets[1]}, drifted, describeProgress(p))
 }
 
-// Rollback is not supported yet for multiple targets. A completed rollout
+// Rollback isn't supported for schema changes across multiple targets yet. A completed rollout
 // across the shards is refused before anything is planned, and the refusal
 // names the remedy that restores each shard: an apply of schema files without
 // the change.
@@ -311,8 +310,7 @@ func TestK8sMultiTarget_RollbackOfIndependentRolloutIsRefused(t *testing.T) {
 	_, err := client.CallRollbackPlanAPI(ep, applyID, mtEnvironment)
 	require.Error(t, err, "rollback of an apply across multiple targets")
 	t.Log(err)
-	assert.Contains(t, err.Error(), "apply "+applyID+" ran on "+strconv.Itoa(len(dsns))+" targets")
-	assert.Contains(t, err.Error(), "rollback is not supported yet for multiple targets, so undo it by applying schema files without the change")
+	assert.Contains(t, err.Error(), "rollback isn't supported for schema changes across multiple targets yet; undo apply "+applyID+" by applying schema files without the change")
 	for i, dsn := range dsns {
 		assert.True(t, testutil.ColumnExists(t, dsn, "users", "email"), "nothing was rolled back on %s", mtTargets[i])
 	}

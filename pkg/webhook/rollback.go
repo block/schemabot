@@ -265,8 +265,6 @@ func (h *Handler) rollbackCommandCore(parent context.Context, repo string, pr in
 		comment := templates.RenderRollbackOfRolloutUnsupported(templates.RollbackOfRolloutUnsupportedData{
 			Environment:    environment,
 			ApplyID:        unsupported.ApplyID,
-			RanOn:          unsupported.RanOn,
-			Targets:        unsupported.Targets,
 			RoutingChecked: unsupported.RoutingChecked,
 			Unrouted:       unsupported.Unrouted,
 			PR:             h.prStateForRemedy(ctx, repo, pr, installationID, environment, applyID),

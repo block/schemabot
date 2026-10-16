@@ -473,8 +473,8 @@ func TestRenderRollbackRejectedRedactsEndpoints(t *testing.T) {
 	assert.Contains(t, rendered, "**Reason**: `dial tcp [endpoint redacted]: connection refused`")
 }
 
-// A rollback of an apply that ran on 4 targets is refused, since rollback is
-// not supported yet for multiple targets. The comment names where schema files
+// A rollback of a schema change across multiple targets is refused, and the
+// comment says so in one sentence. It then names where schema files
 // without the change can be applied from, which depends on the PR: an open PR
 // reverts the change and toggles a nonce so its directory is still planned, a
 // merged one needs a reverting PR, and a closed one needs a PR that plans the
@@ -486,21 +486,19 @@ func TestRenderRollbackOfRolloutUnsupported(t *testing.T) {
 	data := RollbackOfRolloutUnsupportedData{
 		Environment:    "staging",
 		ApplyID:        "apply-a1b2c3d4e5f6",
-		RanOn:          4,
-		Targets:        4,
 		RoutingChecked: true,
 		PR:             PRStateOpen,
 	}
 	assert.Equal(t, "## Rollback Not Supported — Staging\n\n"+
-		"Rollback isn't supported yet for multiple targets. `apply-a1b2c3d4e5f6` ran on 4 targets.\n\n"+
-		"To undo it, revert the change in this PR's schema files and add or toggle a `# nonce` comment line in the database's `schemabot.yaml` so the directory is still planned. Push, then run:\n"+
+		"Rollback isn't supported for schema changes across multiple targets yet.\n\n"+
+		"To undo `apply-a1b2c3d4e5f6`, revert the change in this PR's schema files and add or toggle a `# nonce` comment line in the database's `schemabot.yaml` so the directory is still planned. Push, then run:\n"+
 		"```\nschemabot apply -e staging\n```\n", RenderRollbackOfRolloutUnsupported(data))
 
 	t.Run("merged PR", func(t *testing.T) {
 		merged := data
 		merged.PR = PRStateMerged
 		out := RenderRollbackOfRolloutUnsupported(merged)
-		assert.Contains(t, out, "To undo it, open a PR that reverts the change in the schema files, then run there:\n```\nschemabot apply -e staging\n```\n")
+		assert.Contains(t, out, "To undo `apply-a1b2c3d4e5f6`, open a PR that reverts the change in the schema files, then run there:\n```\nschemabot apply -e staging\n```\n")
 		assert.NotContains(t, out, "this PR's schema files")
 		assert.NotContains(t, out, "nonce")
 	})
@@ -509,7 +507,7 @@ func TestRenderRollbackOfRolloutUnsupported(t *testing.T) {
 		closed := data
 		closed.PR = PRStateClosed
 		out := RenderRollbackOfRolloutUnsupported(closed)
-		assert.Contains(t, out, "To undo it, open a PR that only adds or toggles a `# nonce` comment line in the database's `schemabot.yaml`. The default branch never had this change, so that PR's plan reverts it. Then run there:\n")
+		assert.Contains(t, out, "To undo `apply-a1b2c3d4e5f6`, open a PR that only adds or toggles a `# nonce` comment line in the database's `schemabot.yaml`. The default branch never had this change, so that PR's plan reverts it. Then run there:\n")
 		assert.NotContains(t, out, "this PR's schema files")
 	})
 
@@ -534,18 +532,6 @@ func TestRenderRollbackOfRolloutUnsupported(t *testing.T) {
 		unchecked := data
 		unchecked.RoutingChecked = false
 		assert.Contains(t, RenderRollbackOfRolloutUnsupported(unchecked), "An apply reaches only the targets this environment routes to now, so add back any target it ran on that is no longer routed.\n\n")
-	})
-
-	t.Run("one of several targets", func(t *testing.T) {
-		one := data
-		one.RanOn = 1
-		assert.Contains(t, RenderRollbackOfRolloutUnsupported(one), "Rollback isn't supported yet for multiple targets. `apply-a1b2c3d4e5f6` ran on 1 of this environment's 4 targets.\n\n")
-	})
-
-	t.Run("narrowed, routing unresolved", func(t *testing.T) {
-		narrowed := data
-		narrowed.RanOn, narrowed.Targets, narrowed.RoutingChecked = 1, 0, false
-		assert.Contains(t, RenderRollbackOfRolloutUnsupported(narrowed), "Rollback isn't supported yet for multiple targets. `apply-a1b2c3d4e5f6` was narrowed to one target.\n\n")
 	})
 
 	t.Run("tenant", func(t *testing.T) {

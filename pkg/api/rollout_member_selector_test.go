@@ -577,7 +577,7 @@ func TestExecuteRollbackPlan_RefusedForAnyMultiTargetRollout(t *testing.T) {
 		}
 		return EnvironmentConfig{Deployments: deployments, DeploymentOrder: order}
 	}
-	const notSupported = "; rollback is not supported yet for multiple targets, so undo it by applying schema files without the change"
+	const notSupported = "rollback isn't supported for schema changes across multiple targets yet; undo apply apply-rollout by applying schema files without the change"
 	sharded := workOperations(apply.ID, primary, primary)
 	sharded[0].OperationKey, sharded[1].OperationKey = storage.TargetOperationKey("payments-001", "-80"), storage.TargetOperationKey("payments-001", "80-")
 	sharded = append(sharded, &storage.ApplyOperation{ID: 9, ApplyID: apply.ID, Deployment: DefaultDeployment, OperationKind: storage.ApplyOperationKindGroupFinalizer})
@@ -600,43 +600,43 @@ func TestExecuteRollbackPlan_RefusedForAnyMultiTargetRollout(t *testing.T) {
 		{
 			name: "three targets", env: targetsEnv("payments-001", "payments-002", "payments-003"),
 			ops:     workOperations(apply.ID, primary, member(DefaultDeployment, "payments-002"), member(DefaultDeployment, "payments-003")),
-			wantErr: "apply apply-rollout ran on 3 targets of payments/production" + notSupported, wantCode: http.StatusConflict,
+			wantErr: notSupported, wantCode: http.StatusConflict,
 			wantRanOn: 3, wantTargets: 3,
 		},
 		{
 			name: "three targets, since cut to the primary", env: targetsEnv("payments-001"),
 			ops:     workOperations(apply.ID, primary, member(DefaultDeployment, "payments-002"), member(DefaultDeployment, "payments-003")),
-			wantErr: "apply apply-rollout ran on 3 targets of payments/production" + notSupported, wantCode: http.StatusConflict,
+			wantErr: notSupported, wantCode: http.StatusConflict,
 			wantRanOn: 3, wantTargets: 1, wantUnrouted: []string{DefaultDeployment + "/payments-002", DefaultDeployment + "/payments-003"},
 		},
 		{
 			name: "two mirrored deployments, since cut to one", env: targetsEnv("payments-001"),
 			ops:     workOperations(apply.ID, primary, member("us", "payments-001")),
-			wantErr: "apply apply-rollout ran on 2 targets of payments/production" + notSupported, wantCode: http.StatusConflict,
+			wantErr: notSupported, wantCode: http.StatusConflict,
 			wantRanOn: 2, wantTargets: 1, wantUnrouted: []string{"us/payments-001"},
 		},
 		{
 			name: "two mirrored deployments, in the order the apply ran under", deployment: "eu", env: mirroredEnv("eu", "us"),
 			ops:     workOperations(apply.ID, member("eu", "payments-001"), member("us", "payments-001")),
-			wantErr: "apply apply-rollout ran on 2 targets of payments/production" + notSupported, wantCode: http.StatusConflict,
+			wantErr: notSupported, wantCode: http.StatusConflict,
 			wantRanOn: 2, wantTargets: 2,
 		},
 		{
 			name: "two mirrored deployments, since reordered", deployment: "eu", env: mirroredEnv("us", "eu"),
 			ops:     workOperations(apply.ID, member("eu", "payments-001"), member("us", "payments-001")),
-			wantErr: "apply apply-rollout ran on 2 targets of payments/production" + notSupported, wantCode: http.StatusConflict,
+			wantErr: notSupported, wantCode: http.StatusConflict,
 			wantRanOn: 2, wantTargets: 2,
 		},
 		{
 			name: "narrowed to one of three targets", env: targetsEnv("payments-001", "payments-002", "payments-003"),
 			narrowedTo: DefaultDeployment + "/payments-002", ops: workOperations(apply.ID, member(DefaultDeployment, "payments-002")),
-			wantErr: "apply apply-rollout ran on 1 of the 3 targets of payments/production" + notSupported, wantCode: http.StatusConflict,
+			wantErr: notSupported, wantCode: http.StatusConflict,
 			wantRanOn: 1, wantTargets: 3,
 		},
 		{
 			name: "one target, since joined by a second", env: targetsEnv("payments-001", "payments-002"),
 			ops:     workOperations(apply.ID, primary),
-			wantErr: "apply apply-rollout ran on 1 of the 2 targets of payments/production" + notSupported, wantCode: http.StatusConflict,
+			wantErr: notSupported, wantCode: http.StatusConflict,
 			wantRanOn: 1, wantTargets: 2,
 		},
 		{

@@ -3478,7 +3478,7 @@ func (s *Service) refuseMultiTargetRollback(ctx context.Context, apply *storage.
 	}
 	s.logger.Warn("rollback refused: rollback is not supported for an apply in an environment with multiple targets",
 		append(apply.LogAttrs(), "ran_on", ranOn, "narrowed_to", narrowedTo, "environment_targets", unsupported.Targets, "unrouted", unsupported.Unrouted)...)
-	unsupported.reason = multiTargetRollbackReason(apply, unsupported)
+	unsupported.reason = multiTargetRollbackReason(apply)
 	return rolloutRollbackConflict(unsupported)
 }
 
@@ -3521,17 +3521,8 @@ func (s *Service) targetsApplyRanOn(ctx context.Context, apply *storage.Apply, a
 
 // multiTargetRollbackReason is the refusal's message for callers that pass it
 // on as text, such as the CLI.
-func multiTargetRollbackReason(apply *storage.Apply, unsupported *RolloutRollbackUnsupportedError) string {
-	var ran string
-	switch {
-	case unsupported.RanOn > 1:
-		ran = fmt.Sprintf("apply %s ran on %d targets of %s/%s", apply.ApplyIdentifier, unsupported.RanOn, apply.Database, apply.Environment)
-	case unsupported.Targets > 1:
-		ran = fmt.Sprintf("apply %s ran on 1 of the %d targets of %s/%s", apply.ApplyIdentifier, unsupported.Targets, apply.Database, apply.Environment)
-	default:
-		ran = fmt.Sprintf("apply %s ran on target %s only, narrowed from the targets of %s/%s", apply.ApplyIdentifier, apply.GetOptions().NarrowedTo, apply.Database, apply.Environment)
-	}
-	return ran + "; rollback is not supported yet for multiple targets, so undo it by applying schema files without the change"
+func multiTargetRollbackReason(apply *storage.Apply) string {
+	return fmt.Sprintf("rollback isn't supported for schema changes across multiple targets yet; undo apply %s by applying schema files without the change", apply.ApplyIdentifier)
 }
 
 // RolloutRollbackUnsupportedError is a rollback refused because the apply's

@@ -7052,14 +7052,14 @@ ALTER TABLE `users` DROP INDEX `idx_email`;
 </details>
 
 <details>
-<summary><a name="rollback-refused-rollout-of-targets-planned-on-their-own"></a><strong>Rollback Refused: Rollout Of Targets Planned On Their Own</strong></summary>
+<summary><a name="rollback-refused-multiple-targets"></a><strong>Rollback Refused: Multiple Targets</strong></summary>
 
 
 ## Rollback Not Supported — Staging
 
-Rollback isn't supported yet for multiple targets. `apply-a1b2c3d4e5f6` ran on 4 targets.
+Rollback isn't supported for schema changes across multiple targets yet.
 
-To undo it, revert the change in this PR's schema files and add or toggle a `# nonce` comment line in the database's `schemabot.yaml` so the directory is still planned. Push, then run:
+To undo `apply-a1b2c3d4e5f6`, revert the change in this PR's schema files and add or toggle a `# nonce` comment line in the database's `schemabot.yaml` so the directory is still planned. Push, then run:
 ```
 schemabot apply -e staging
 ```

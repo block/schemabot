@@ -846,17 +846,17 @@ func TestRollbackCommandCoreTerminalDispositions(t *testing.T) {
 		{
 			name:     "open PR",
 			serve:    func(mux *http.ServeMux) { servePullRequestState(mux, "open", false) },
-			wantText: "To undo it, revert the change in this PR's schema files and add or toggle a `# nonce` comment line",
+			wantText: "To undo `apply-123`, revert the change in this PR's schema files and add or toggle a `# nonce` comment line",
 		},
 		{
 			name:     "merged PR",
 			serve:    func(mux *http.ServeMux) { servePullRequestState(mux, "closed", true) },
-			wantText: "To undo it, open a PR that reverts the change in the schema files, then run there:",
+			wantText: "To undo `apply-123`, open a PR that reverts the change in the schema files, then run there:",
 		},
 		{
 			name:     "closed PR",
 			serve:    func(mux *http.ServeMux) { servePullRequestState(mux, "closed", false) },
-			wantText: "To undo it, open a PR that only adds or toggles a `# nonce` comment line",
+			wantText: "To undo `apply-123`, open a PR that only adds or toggles a `# nonce` comment line",
 		},
 		{
 			name:     "PR state unreadable",
@@ -885,11 +885,11 @@ func TestRollbackCommandCoreTerminalDispositions(t *testing.T) {
 			assert.Equal(t, 1, lockStore.releaseCalls, "the command-acquired lock must be released after the refusal")
 			body := requireComment(t, comments, "rollout rollback refusal comment")
 			assert.Contains(t, body, "## Rollback Not Supported — Staging")
-			assert.Contains(t, body, "Rollback isn't supported yet for multiple targets. `apply-123` ran on 4 targets.")
+			assert.Contains(t, body, "Rollback isn't supported for schema changes across multiple targets yet.\n\n")
 			assert.Contains(t, body, tc.wantText)
 			assert.Contains(t, body, "```\nschemabot apply -e staging\n```")
 			assert.NotContains(t, body, "Rollback Failed")
-			assert.NotContains(t, body, "rollback is not supported yet for multiple targets, so", "the PR comment names the remedy in its own terms, not the API's message")
+			assert.NotContains(t, body, "by applying schema files without the change", "the PR comment names the remedy in its own terms, not the API's message")
 		})
 	}
 

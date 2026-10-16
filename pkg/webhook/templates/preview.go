@@ -3459,23 +3459,20 @@ func PreviewCommentRollbackStatus() string {
 	return RenderApplyStatusComment(data)
 }
 
-// PreviewCommentRollbackSummaryCompleted renders the terminal summary for a
-// completed rollback apply — announced as a rollback, never as an applied
-// schema change.
 // PreviewCommentRollbackOfRolloutUnsupported previews the refusal of a
-// rollback whose apply ran across a rollout of targets each planned against
-// its own schema.
+// rollback of a schema change across multiple targets.
 func PreviewCommentRollbackOfRolloutUnsupported() string {
 	return RenderRollbackOfRolloutUnsupported(RollbackOfRolloutUnsupportedData{
 		Environment:    "staging",
 		ApplyID:        "apply-a1b2c3d4e5f6",
-		RanOn:          4,
-		Targets:        4,
 		RoutingChecked: true,
 		PR:             PRStateOpen,
 	})
 }
 
+// PreviewCommentRollbackSummaryCompleted renders the terminal summary for a
+// completed rollback apply — announced as a rollback, never as an applied
+// schema change.
 func PreviewCommentRollbackSummaryCompleted() string {
 	data := sampleSummaryData(state.Apply.Completed, sampleRollbackTables(state.Task.Completed))
 	data.Rollback = true
