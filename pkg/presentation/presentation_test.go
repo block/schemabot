@@ -84,6 +84,7 @@ func TestDeriveDeployment_StateLabels(t *testing.T) {
 		{so.Failed, StateFailed, "failed", "❌", true},
 		{so.FailedRetryable, StateRetrying, "retrying", "🔁", true},
 		{so.Stopped, StateStopped, "stopped — resume to continue", "⏹️", true},
+		{so.Resuming, StateResuming, "resuming", "🔄", true},
 		{so.RevertWindow, StateRevertWindow, "in revert window", "⏳", true},
 		{so.Cancelled, StateCancelled, "cancelled", "🚫", false},
 		{so.Reverted, StateReverted, "reverted", "↩️", false},
@@ -682,6 +683,37 @@ func TestGroups_RollsUpEachDeploymentsTargets(t *testing.T) {
 	assert.False(t, eu.Open)
 }
 
+// A group headed by a target picking its work back up after a start leads with
+// that target, not with one that already finished, so the group's glyph says
+// the rollout is moving rather than done.
+func TestGroups_ResumingTargetHeadsGroupOverCompletedOne(t *testing.T) {
+	target := func(tgt, st string) Operation {
+		return Operation{Deployment: "primary", Target: tgt, State: st, Parallel: true, ContinueOnFailure: true}
+	}
+	apply := Derive([]Operation{
+		target("t_000", so.Completed),
+		target("t_001", so.Resuming),
+	})
+
+	groups := apply.Groups()
+	require.Len(t, groups, 1)
+	assert.Equal(t, "primary/t_001", groups[0].Lead.Name, "the resuming target heads the group")
+	assert.Equal(t, StateResuming, groups[0].Lead.Presentation)
+	assert.Equal(t, "🔄", groups[0].Lead.Emoji)
+	assert.Equal(t, []StateCount{{"completed", 1}, {"resuming", 1}}, groups[0].Counts)
+}
+
+// Every status but unknown has a place in the attention order, so a group's
+// lead is chosen by urgency rather than by which status was left unranked.
+func TestAttentionOrder_RanksEveryKnownStatus(t *testing.T) {
+	for ps := range presentationStateCount {
+		if ps == StateUnknown {
+			continue
+		}
+		assert.Contains(t, attentionOrder, ps, "status %d must be ranked in attentionOrder", ps)
+	}
+}
+
 // A group's progress counts the targets that ran the change apart from the
 // ones that already had it, and the rest by status, so the parts always add up
 // to every target the group addresses.
@@ -860,4 +892,44 @@ func TestDerive_MemberCarriesItsOperationsIdentifiers(t *testing.T) {
 		assert.Equal(t, want.externalOperationID, d.ExternalOperationID, want.target)
 		assert.Equal(t, want.neverStarted, d.NeverStarted, want.target)
 	}
+}
+
+// A start on a stopped rollout claims its members one drive at a time. The
+// members already claimed read resuming, not an unknown state, and count as
+// resuming in the histogram beside the member still stopped.
+func TestDerive_StartOnStoppedRolloutCountsResumingMembers(t *testing.T) {
+	got := Derive([]Operation{
+		rolling("us", so.Resuming),
+		rolling("eu", so.Resuming),
+		rolling("au", so.Stopped),
+	})
+
+	for _, d := range got.Deployments[:2] {
+		assert.Equal(t, StateResuming, d.Presentation, d.Name)
+		assert.Equal(t, "resuming", d.Label, d.Name)
+	}
+	assert.Equal(t, StateStopped, got.Deployments[2].Presentation, "the start has not claimed au yet")
+	assert.Equal(t, []StateCount{
+		{Label: "resuming", Count: 2},
+		{Label: "stopped", Count: 1},
+	}, got.Counts)
+}
+
+// While a start claims a group's stopped targets one at a time, the group leads
+// with a target already resuming rather than with one still stopped, so the
+// heading shows the start under way instead of inviting a second one.
+func TestGroups_ResumingTargetHeadsGroupOverStoppedOne(t *testing.T) {
+	target := func(tgt, st string) Operation {
+		return Operation{Deployment: "primary", Target: tgt, State: st}
+	}
+	apply := Derive([]Operation{
+		target("t_000", so.Stopped),
+		target("t_001", so.Resuming),
+	})
+
+	groups := apply.Groups()
+	require.Len(t, groups, 1)
+	assert.Equal(t, "primary/t_001", groups[0].Lead.Name, "the resuming target heads the group")
+	assert.Equal(t, StateResuming, groups[0].Lead.Presentation)
+	assert.Equal(t, []StateCount{{"resuming", 1}, {"stopped", 1}}, groups[0].Counts)
 }
