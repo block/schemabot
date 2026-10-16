@@ -1101,7 +1101,17 @@ type StatusListData struct {
 	StateCounts    map[string]int
 	ShowExternalID bool
 	Deployment     string
-	Applies        []ActiveApplyData
+	// Continued marks a page reached with --after, past the first page.
+	Continued bool
+	Applies   []ActiveApplyData
+	// Sectioned renders the default view: Active above the finished applies
+	// in Applies, which alone are paged by --limit and --after. Active is
+	// listed in full on a first page and omitted from a continued one.
+	Sectioned bool
+	Active    []ActiveApplyData
+	// ActiveHasMore reports more active applies than the server returns in
+	// one request.
+	ActiveHasMore bool
 }
 
 // statusWindowSuffix renders the active list filters (--state, --last) as a
@@ -1157,16 +1167,12 @@ func writeStatusStateSummary(counts map[string]int) {
 
 // WriteStatusList writes the status list output.
 func WriteStatusList(data StatusListData) {
+	if data.Sectioned {
+		writeSectionedStatusList(data)
+		return
+	}
 	if len(data.Applies) == 0 {
-		filters := ""
-		if parts := statusFilterPhrases(data); len(parts) > 0 {
-			filters = " " + strings.Join(parts, ", ")
-		}
-		if data.FailuresOnly {
-			fmt.Printf("%sNo recent failed schema changes%s%s\n", ANSIDim, filters, ANSIReset)
-		} else {
-			fmt.Printf("%sNo recent schema changes%s%s\n", ANSIDim, filters, ANSIReset)
-		}
+		writeEmptyStatusList(data)
 		return
 	}
 	if data.FailuresOnly {
@@ -1176,31 +1182,94 @@ func WriteStatusList(data StatusListData) {
 
 	// Header
 	if data.ActiveCount > 0 {
-		if data.ActiveCount == 1 {
-			fmt.Printf("%s1 active schema change%s%s\n", ANSIBold, ANSIReset, statusWindowSuffix(data))
-		} else {
-			fmt.Printf("%s%d active schema changes%s%s\n", ANSIBold, data.ActiveCount, ANSIReset, statusWindowSuffix(data))
-		}
+		writeActiveStatusHeader(data, data.ActiveCount)
 	} else {
 		fmt.Printf("%sRecent schema changes%s%s\n", ANSIBold, ANSIReset, statusWindowSuffix(data))
 	}
 	writeStatusStateSummary(data.StateCounts)
 	fmt.Println()
 
-	writeStatusTable(statusListColumns(data), data.Applies, func(a ActiveApplyData) string { return a.State })
+	writeStatusTable(statusListColumns(data, data.Applies), data.Applies, func(a ActiveApplyData) string { return a.State })
 
 	writeStatusListFooter(data)
 }
 
-// writeStatusListTruncation says how much of the history a truncated page holds,
-// and how to see more of it — or that the server will not serve more, when the
-// page is already at the cap.
-func writeStatusListTruncation(data StatusListData, item string) {
-	if data.MaxLimit > 0 && data.Limit >= data.MaxLimit {
-		fmt.Printf("%sShowing the %d most recent %s. This server caps status history at %d.%s\n", ANSIDim, data.Limit, item, data.MaxLimit, ANSIReset)
+// writeSectionedStatusList writes the default status view: every active apply,
+// then the finished ones a page at a time. The two come from separate requests
+// over an order that never changes, so paging the finished applies cannot skip
+// or repeat one whose state moves between pages, and active work is always on
+// screen however many applies finished since it started.
+func writeSectionedStatusList(data StatusListData) {
+	if len(data.Active) == 0 && len(data.Applies) == 0 {
+		writeEmptyStatusList(data)
 		return
 	}
-	fmt.Printf("%sShowing the %d most recent %s. Use --limit N to show more.%s\n", ANSIDim, data.Limit, item, ANSIReset)
+	if !data.Continued {
+		if len(data.Active) == 0 {
+			fmt.Printf("%sNo active schema changes%s%s\n", ANSIDim, ANSIReset, statusWindowSuffix(data))
+		} else {
+			writeActiveStatusHeader(data, len(data.Active))
+			fmt.Println()
+			writeStatusTable(statusListColumns(data, data.Active), data.Active, func(a ActiveApplyData) string { return a.State })
+			if data.ActiveHasMore {
+				fmt.Printf("\n%sShowing the %d most recent active schema changes.%s\n", ANSIDim, len(data.Active), ANSIReset)
+			}
+		}
+		fmt.Println()
+	}
+
+	if len(data.Applies) == 0 {
+		fmt.Printf("%sNo recent finished schema changes%s%s\n", ANSIDim, ANSIReset, statusWindowSuffix(data))
+		writeStatusListFooter(data)
+		return
+	}
+	fmt.Printf("%sRecent schema changes%s%s\n", ANSIBold, ANSIReset, statusWindowSuffix(data))
+	writeStatusStateSummary(data.StateCounts)
+	fmt.Println()
+	writeStatusTable(statusListColumns(data, data.Applies), data.Applies, func(a ActiveApplyData) string { return a.State })
+	writeStatusListFooter(data)
+}
+
+func writeActiveStatusHeader(data StatusListData, count int) {
+	if count == 1 {
+		fmt.Printf("%s1 active schema change%s%s\n", ANSIBold, ANSIReset, statusWindowSuffix(data))
+		return
+	}
+	fmt.Printf("%s%d active schema changes%s%s\n", ANSIBold, count, ANSIReset, statusWindowSuffix(data))
+}
+
+func writeEmptyStatusList(data StatusListData) {
+	filters := ""
+	if parts := statusFilterPhrases(data); len(parts) > 0 {
+		filters = " " + strings.Join(parts, ", ")
+	}
+	if data.FailuresOnly {
+		fmt.Printf("%sNo recent failed schema changes%s%s\n", ANSIDim, filters, ANSIReset)
+	} else {
+		fmt.Printf("%sNo recent schema changes%s%s\n", ANSIDim, filters, ANSIReset)
+	}
+}
+
+// writeStatusListTruncation says how much of the history a truncated page holds
+// and how to see more of it. Below the server's cap a larger --limit shows
+// more; once the page is at the cap, or the operator is already paging, the
+// next page starts --after the last apply this one shows.
+func writeStatusListTruncation(data StatusListData, item string) {
+	atCap := data.MaxLimit > 0 && data.Limit >= data.MaxLimit
+	last := ""
+	if len(data.Applies) > 0 {
+		last = data.Applies[len(data.Applies)-1].ApplyID
+	}
+	switch {
+	case data.Continued && last != "":
+		fmt.Printf("%sShowing %d more %s. Add --after %s for the next %d.%s\n", ANSIDim, len(data.Applies), item, last, data.Limit, ANSIReset)
+	case atCap && last != "":
+		fmt.Printf("%sShowing the %d most recent %s. Add --after %s for the next %d.%s\n", ANSIDim, data.Limit, item, last, data.Limit, ANSIReset)
+	case atCap:
+		fmt.Printf("%sShowing the %d most recent %s. This server caps status history at %d.%s\n", ANSIDim, data.Limit, item, data.MaxLimit, ANSIReset)
+	default:
+		fmt.Printf("%sShowing the %d most recent %s. Use --limit N to show more.%s\n", ANSIDim, data.Limit, item, ANSIReset)
+	}
 }
 
 func writeStatusListFooter(data StatusListData) {
@@ -1293,7 +1362,7 @@ func writeStatusTable[Row any](columns []statusColumn[Row], rows []Row, rowState
 // already do — the deployment's shared data-plane apply id and the
 // per-operation remote row id — and omits DEPLOYMENT, which every row repeats
 // back to the operator who named it.
-func statusListColumns(data StatusListData) []statusColumn[ActiveApplyData] {
+func statusListColumns(data StatusListData, rows []ActiveApplyData) []statusColumn[ActiveApplyData] {
 	columns := []statusColumn[ActiveApplyData]{
 		{header: "APPLY ID", value: func(a ActiveApplyData) string { return a.ApplyID }},
 	}
@@ -1324,9 +1393,11 @@ func statusListColumns(data StatusListData) []statusColumn[ActiveApplyData] {
 	columns = append(columns,
 		statusColumn[ActiveApplyData]{header: "STATE", colored: true, value: func(a ActiveApplyData) string { return state.Label(a.State) }},
 		statusColumn[ActiveApplyData]{header: "STARTED", value: func(a ActiveApplyData) string { return formatStartedAt(a.StartedAt) }},
+	)
+	columns = append(columns,
 		statusColumn[ActiveApplyData]{header: "SOURCE", last: true, value: func(a ActiveApplyData) string { return applySource(a.Caller) }},
 	)
-	return retainPopulatedStatusColumns(columns, data.Applies)
+	return retainPopulatedStatusColumns(columns, rows)
 }
 
 // retainPopulatedStatusColumns drops every optional column no row fills in.

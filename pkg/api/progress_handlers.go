@@ -894,7 +894,7 @@ func (s *Service) handleStatus(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	activeOnly, err := parseStatusActiveOnly(r)
+	activeFilter, err := parseStatusActive(r)
 	if err != nil {
 		s.writeError(w, http.StatusBadRequest, err.Error())
 		return
@@ -904,6 +904,7 @@ func (s *Service) handleStatus(w http.ResponseWriter, r *http.Request) {
 		Limit:       limit + 1,
 		Environment: storage.CanonicalKey(r.URL.Query().Get("environment")),
 		Deployment:  storage.CanonicalKey(r.URL.Query().Get("deployment")),
+		Database:    storage.CanonicalKey(r.URL.Query().Get("database")),
 	}
 	if failuresOnly {
 		filter.States = []string{state.Apply.Failed, state.Apply.FailedRetryable}
@@ -911,15 +912,30 @@ func (s *Service) handleStatus(w http.ResponseWriter, r *http.Request) {
 	if stateFilter != "" {
 		filter.States = []string{stateFilter}
 	}
-	if activeOnly {
-		filter.ActiveOnly = true
+	if activeFilter != nil {
+		filter.ActiveOnly = *activeFilter
+		filter.FinishedOnly = !*activeFilter
 	}
 	if last > 0 {
 		filter.UpdatedSince = time.Now().Add(-last)
 	}
+	startingAfter := r.URL.Query().Get("starting_after")
+	if startingAfter != "" {
+		anchorID, status, err := s.statusListAnchor(r.Context(), startingAfter, filter)
+		if err != nil {
+			s.writeError(w, status, err.Error())
+			return
+		}
+		filter.AfterID = anchorID
+	}
 	applies, err := s.storage.Applies().GetRecent(r.Context(), filter)
 	if err != nil {
-		s.logger.Error("get recent applies failed", "error", err)
+		s.logger.Error("get recent applies failed",
+			"environment", filter.Environment,
+			"deployment", filter.Deployment,
+			"database", filter.Database,
+			"starting_after", startingAfter,
+			"error", err)
 		s.writeError(w, http.StatusInternalServerError, "failed to get recent applies")
 		return
 	}
@@ -935,12 +951,14 @@ func (s *Service) handleStatus(w http.ResponseWriter, r *http.Request) {
 	}
 
 	resp := &apitypes.StatusResponse{
-		Limit:        limit,
-		MaxLimit:     maxStatusLimit,
-		HasMore:      hasMore,
-		FailuresOnly: failuresOnly,
-		StateCounts:  stateCounts,
-		Applies:      make([]*apitypes.ActiveApplyResponse, 0, len(applies)),
+		Limit:         limit,
+		MaxLimit:      maxStatusLimit,
+		HasMore:       hasMore,
+		FailuresOnly:  failuresOnly,
+		StartingAfter: startingAfter,
+		Active:        activeFilter,
+		StateCounts:   stateCounts,
+		Applies:       make([]*apitypes.ActiveApplyResponse, 0, len(applies)),
 	}
 	if last > 0 {
 		resp.Last = last.String()
@@ -980,6 +998,69 @@ func (s *Service) handleStatus(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.writeJSON(w, http.StatusOK, resp)
+}
+
+// statusListAnchor resolves the starting_after apply of a status page to its
+// row id. The apply must exist and match the request's environment, database,
+// and deployment, which never change for an apply, so a page continues the
+// list the anchor came from rather than one with different filters. The
+// state, failed, active, and last filters are not checked: the anchor's state
+// and activity may have moved since the page that showed it. It returns the
+// HTTP status to answer with alongside any error.
+func (s *Service) statusListAnchor(ctx context.Context, applyIdentifier string, filter storage.RecentAppliesFilter) (int64, int, error) {
+	anchor, err := s.storage.Applies().GetByApplyIdentifier(ctx, applyIdentifier)
+	if err != nil {
+		s.logger.Error("look up status page anchor failed",
+			"apply_id", applyIdentifier,
+			"environment", filter.Environment,
+			"deployment", filter.Deployment,
+			"database", filter.Database,
+			"error", err)
+		return 0, http.StatusInternalServerError, fmt.Errorf("failed to look up starting_after apply %s", applyIdentifier)
+	}
+	if anchor == nil {
+		return 0, http.StatusBadRequest, fmt.Errorf("starting_after apply %s does not exist; pass the last apply ID from the previous page", applyIdentifier)
+	}
+	if filter.Environment != "" && storage.CanonicalKey(anchor.Environment) != filter.Environment {
+		return 0, http.StatusBadRequest, fmt.Errorf("starting_after apply %s is in environment %s, not %s; repeat the previous page's filters",
+			applyIdentifier, anchor.Environment, filter.Environment)
+	}
+	if filter.Database != "" && storage.CanonicalKey(anchor.Database) != filter.Database {
+		return 0, http.StatusBadRequest, fmt.Errorf("starting_after apply %s is for database %s, not %s; repeat the previous page's filters",
+			applyIdentifier, anchor.Database, filter.Database)
+	}
+	if filter.Deployment != "" {
+		inDeployment, err := s.applyTouchesDeployment(ctx, anchor, filter.Deployment)
+		if err != nil {
+			s.logger.Error("check status page anchor deployment failed",
+				append(anchor.LogAttrs(), "requested_deployment", filter.Deployment, "error", err)...)
+			return 0, http.StatusInternalServerError, fmt.Errorf("failed to check the deployments of starting_after apply %s", applyIdentifier)
+		}
+		if !inDeployment {
+			return 0, http.StatusBadRequest, fmt.Errorf("starting_after apply %s does not touch deployment %s; repeat the previous page's filters",
+				applyIdentifier, filter.Deployment)
+		}
+	}
+	return anchor.ID, http.StatusOK, nil
+}
+
+// applyTouchesDeployment reports whether an apply runs in a deployment, by the
+// same rule the deployment filter of the status list applies: the apply's own
+// deployment, or any of its operations'.
+func (s *Service) applyTouchesDeployment(ctx context.Context, apply *storage.Apply, deployment string) (bool, error) {
+	if storage.CanonicalKey(apply.Deployment) == deployment {
+		return true, nil
+	}
+	ops, err := s.storage.ApplyOperations().ListByApplies(ctx, []int64{apply.ID})
+	if err != nil {
+		return false, fmt.Errorf("list operations of apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	for _, op := range ops {
+		if storage.CanonicalKey(op.Deployment) == deployment {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // statusOperationForDeployment narrows an apply's operations to the requested
@@ -1125,19 +1206,21 @@ func parseStatusLast(r *http.Request) (time.Duration, error) {
 	return last, nil
 }
 
-// parseStatusActiveOnly parses the optional `active` query parameter restricting
-// the status list to applies that have not reached a terminal state. Callers use
-// it to ask whether a target is busy without paging through settled history.
-func parseStatusActiveOnly(r *http.Request) (bool, error) {
+// parseStatusActive parses the optional `active` query parameter. true restricts
+// the status list to applies that have not reached a terminal state, which is
+// how a caller asks whether a target is busy without paging through settled
+// history; false restricts it to the terminal ones, so a caller can list the
+// two halves separately. nil means no filter.
+func parseStatusActive(r *http.Request) (*bool, error) {
 	raw := r.URL.Query().Get("active")
 	if raw == "" {
-		return false, nil
+		return nil, nil
 	}
 	active, err := strconv.ParseBool(raw)
 	if err != nil {
-		return false, fmt.Errorf("active must be a boolean")
+		return nil, fmt.Errorf("active must be a boolean")
 	}
-	return active, nil
+	return &active, nil
 }
 
 func parseStatusFailuresOnly(r *http.Request) (bool, error) {
