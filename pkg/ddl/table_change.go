@@ -75,7 +75,7 @@ func SameTableChange(approvedBase, approved, headBase, head string) (same bool, 
 		}
 	}
 
-	if why := unmergedElement(elements[0], elements[1], elements[2], elements[3]); why != "" {
+	if why := UnmergedElement(elements[0], elements[1], elements[2], elements[3]); why != "" {
 		return false, fmt.Sprintf("table %s: %s", aBase.TableName, why), nil
 	}
 	if !sameColumnOrder(aBase, hBase) {
@@ -131,11 +131,14 @@ func strictTableDiff(source, target *statement.CreateTable) ([]string, error) {
 	return stmts, nil
 }
 
-// unmergedElement checks that head is the element-by-element three-way merge
+// UnmergedElement checks that head is the element-by-element three-way merge
 // of approved and headBase over approvedBase, and returns why the first
 // element (in name order) that is not breaks it, or "" when every element
-// merges. An element added or removed counts as changed.
-func unmergedElement(approvedBase, approved, headBase, head map[string]string) string {
+// merges. Each map holds one table's elements, keyed by a name that says what
+// the element is and mapped to its definition. An element added or removed
+// counts as changed, and one that both approved and headBase changed never
+// merges. Every dialect's statement comparison applies this one rule.
+func UnmergedElement(approvedBase, approved, headBase, head map[string]string) string {
 	keys := make(map[string]bool)
 	for _, elements := range []map[string]string{approvedBase, approved, headBase, head} {
 		for k := range elements {

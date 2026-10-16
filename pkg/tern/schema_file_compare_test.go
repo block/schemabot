@@ -10,9 +10,13 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/engine"
+	"github.com/block/schemabot/pkg/engine/postgres"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/storage"
 )
+
+// The PostgreSQL engine is the one that compares schema files on its target.
+var _ SchemaFileChangeComparer = (*postgres.Engine)(nil)
 
 // comparingEngine is a PostgreSQL engine that can compare schema files,
 // answering with resp or err and recording the request.
