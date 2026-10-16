@@ -856,9 +856,54 @@ jobs:
           echo "=== All pods ==="
           kubectl get pods -n schemabot-e2e-etre -o wide 2>/dev/null || true
 
-  e2e-k8s-multi-target:
-    name: "E2E K8s Multi-Target Tests"
+  e2e-k8s-multi-target-matrix:
+    name: "E2E K8s Multi-Target Matrix"
     needs: changes
+    if: needs.changes.outputs.code == 'true' && (needs.changes.outputs.full == 'true' || github.event_name != 'pull_request')
+    runs-on: ubuntu-latest
+    timeout-minutes: 1
+    outputs:
+      shards: ${{ steps.gen.outputs.shards }}
+    steps:
+      - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # actions/checkout@v6
+      - name: "Generate shard matrix"
+        id: gen
+        run: |
+          set -euo pipefail
+          NUM_SHARDS=2
+          # Deterministic order so a test always lands in the same bucket, and
+          # a new multi-target test joins a bucket without a list to update.
+          # Anchoring on the line start matches declarations, not prose that
+          # mentions a test. grep exits 1 when nothing matches and 2 when the
+          # tree is unusable; the status check below is the fail-closed gate,
+          # so an unreadable test file cannot drop its tests out of every
+          # shard while the job passes.
+          set +e
+          matches=$(grep -r --include='*_test.go' -h -o '^func TestK8sMultiTarget_[A-Za-z0-9_]*' e2e/k8s)
+          grep_status=$?
+          set -e
+          if [ "$grep_status" -gt 1 ]; then
+            echo "::error::e2e/k8s is unusable for test discovery (grep exited $grep_status)"
+            exit 1
+          fi
+          tests=$(printf '%s\n' "$matches" | sed 's/^func //' | sort -u)
+          count=$(printf '%s\n' "$tests" | grep -c . || true)
+          if [ "$count" -lt "$NUM_SHARDS" ]; then
+            echo "::error::discovered $count multi-target tests, fewer than the $NUM_SHARDS shards"
+            exit 1
+          fi
+          # Each filter is anchored so a test name that prefixes another
+          # cannot also run in the other shard.
+          shards=$(printf '%s\n' "$tests" | awk -v n="$NUM_SHARDS" '
+            { bucket[NR % n] = bucket[NR % n] (bucket[NR % n] ? "|" : "") $0 }
+            END { for (i=0; i<n; i++) printf "{\"shard\":\"%d\",\"run_filter\":\"^(%s)$\"}\n", i+1, bucket[i] }
+          ' | jq -cs '.')
+          echo "shards=$shards" >> "$GITHUB_OUTPUT"
+          echo "$count tests across $NUM_SHARDS shards"
+
+  e2e-k8s-multi-target:
+    name: "E2E K8s Multi-Target Tests (${{ matrix.shard }})"
+    needs: [changes, e2e-k8s-multi-target-matrix]
     if: needs.changes.outputs.code == 'true' && (needs.changes.outputs.full == 'true' || github.event_name != 'pull_request')
     runs-on: ubuntu-latest
     # Sized so setup (checkout, Go, cache restore, minikube start, the script's
@@ -867,6 +912,12 @@ jobs:
     # lands inside the job budget with room left for the goroutine dump, the
     # script's exit trap, and the pod-log capture step.
     timeout-minutes: 30
+    # Each shard stands up the whole stack, so the split pays the setup on
+    # every runner to run the tests across them.
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.e2e-k8s-multi-target-matrix.outputs.shards) }}
     steps:
       - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # actions/checkout@v6
       - name: "Configure Go"
@@ -903,6 +954,7 @@ jobs:
           # go test's own timeout inside the script; the job budget above is
           # sized to exceed it plus setup, so change the two together.
           E2E_TEST_TIMEOUT: 18m
+          E2E_TEST_RUN: ${{ matrix.run_filter }}
         run: make test-e2e-k8s-multi-target
       - name: "Pod logs on failure"
         if: failure()
