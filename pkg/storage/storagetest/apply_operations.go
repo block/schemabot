@@ -2112,6 +2112,105 @@ func TestApplyOperations(t *testing.T, h Harness) {
 		_, err := store.ApplyOperations().FindNextApplyOperation(t.Context(), "driver")
 		require.Error(t, err)
 	})
+
+	// ListRecentTargets_DistinctTargetsOfOneType verifies that a data plane
+	// learns every target it applied to for one database type: each
+	// (database, environment, target) appears once however many operations
+	// ran against it, settled applies count, and operations of another
+	// database type or with no target are left out.
+	t.Run("ListRecentTargets_DistinctTargetsOfOneType", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		insertTargeted := func(t *testing.T, applyID int64, deployment, target string) {
+			t.Helper()
+			_, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+				ApplyID: applyID, Deployment: deployment, Target: target,
+			})
+			require.NoError(t, err)
+		}
+
+		orders := CreateLock(t, store, "orders", storage.DatabaseTypeVitess)
+		ordersStaging := CreateApplyWithStateAndEnv(t, store, orders, "apply_orders_staging", 981, state.Apply.Completed, "staging")
+		insertTargeted(t, ordersStaging.ID, "region-a", "orders-staging-a")
+		insertTargeted(t, ordersStaging.ID, "region-b", "orders-staging-b")
+		ordersRetry := CreateApplyWithStateAndEnv(t, store, orders, "apply_orders_staging_retry", 982, state.Apply.Failed, "staging")
+		insertTargeted(t, ordersRetry.ID, "region-a", "orders-staging-a")
+		ordersProduction := CreateApplyWithStateAndEnv(t, store, orders, "apply_orders_production", 983, state.Apply.Running, "production")
+		insertTargeted(t, ordersProduction.ID, "region-a", "orders-production-a")
+		insertTargeted(t, ordersProduction.ID, "region-c", "")
+
+		billing := CreateLock(t, store, "billing", storage.DatabaseTypeMySQL)
+		billingStaging := CreateApplyWithStateAndEnv(t, store, billing, "apply_billing_staging", 984, state.Apply.Completed, "staging")
+		insertTargeted(t, billingStaging.ID, "region-a", "billing-staging-a")
+
+		targets, err := store.ApplyOperations().ListRecentTargets(ctx, storage.DatabaseTypeVitess, 24*time.Hour)
+		require.NoError(t, err)
+		assert.Equal(t, []storage.AppliedTarget{
+			{Database: "orders", Environment: "production", Target: "orders-production-a"},
+			{Database: "orders", Environment: "staging", Target: "orders-staging-a"},
+			{Database: "orders", Environment: "staging", Target: "orders-staging-b"},
+		}, targets)
+
+		mysqlTargets, err := store.ApplyOperations().ListRecentTargets(ctx, storage.DatabaseTypeMySQL, 24*time.Hour)
+		require.NoError(t, err)
+		assert.Equal(t, []storage.AppliedTarget{
+			{Database: "billing", Environment: "staging", Target: "billing-staging-a"},
+		}, mysqlTargets)
+
+		// The cutoff is rendered in whole microseconds, so a lookback that
+		// would truncate to an empty window is refused rather than narrowed.
+		for _, lookback := range []time.Duration{0, 500 * time.Nanosecond} {
+			_, err = store.ApplyOperations().ListRecentTargets(ctx, storage.DatabaseTypeVitess, lookback)
+			require.ErrorContains(t, err, "lookback must be at least 1µs, got "+lookback.String())
+		}
+	})
+
+	// ListRecentTargets_TuplesAreDistinctAndBytewiseOrdered verifies that
+	// targets differing only by case are listed separately and that the
+	// tuples come back in the same bytewise order on every dialect: a target
+	// is a resolver key compared byte for byte, so a storage collation that
+	// folds case must not merge two of them, and neither a case-folding nor
+	// a locale collation may reorder them. Database names and environments
+	// are stored folded to lowercase, so their variants differ by
+	// punctuation, which bytewise order sorts '-' before '_' and those
+	// collations sort the other way round.
+	t.Run("ListRecentTargets_TuplesAreDistinctAndBytewiseOrdered", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		seed := func(t *testing.T, lock *storage.Lock, applyID string, planID int64, env string, targets ...string) {
+			t.Helper()
+			apply := CreateApplyWithStateAndEnv(t, store, lock, applyID, planID, state.Apply.Completed, env)
+			for i, target := range targets {
+				_, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+					ApplyID: apply.ID, Deployment: fmt.Sprintf("region-%d", i), Target: target,
+				})
+				require.NoError(t, err)
+			}
+		}
+
+		ordersB := CreateLock(t, store, "orders-b", storage.DatabaseTypeVitess)
+		seed(t, ordersB, "apply_orders_b_staging_b", 985, "staging-b", "orders-a", "orders-A", "orders-b", "orders_B")
+		seed(t, ordersB, "apply_orders_b_staging_a", 986, "staging_a", "orders-a")
+		ordersA := CreateLock(t, store, "orders_a", storage.DatabaseTypeVitess)
+		seed(t, ordersA, "apply_orders_a_staging", 987, "staging", "orders-a")
+
+		targets, err := store.ApplyOperations().ListRecentTargets(ctx, storage.DatabaseTypeVitess, 24*time.Hour)
+		require.NoError(t, err)
+		assert.Equal(t, []storage.AppliedTarget{
+			{Database: "orders-b", Environment: "staging-b", Target: "orders-A"},
+			{Database: "orders-b", Environment: "staging-b", Target: "orders-a"},
+			{Database: "orders-b", Environment: "staging-b", Target: "orders-b"},
+			{Database: "orders-b", Environment: "staging-b", Target: "orders_B"},
+			{Database: "orders-b", Environment: "staging_a", Target: "orders-a"},
+			{Database: "orders_a", Environment: "staging", Target: "orders-a"},
+		}, targets)
+	})
+
+	t.Run("ListRecentTargets_DBError", func(t *testing.T) {
+		store := h.NewUnreachableStorage(t)
+		_, err := store.ApplyOperations().ListRecentTargets(t.Context(), storage.DatabaseTypeVitess, time.Hour)
+		require.Error(t, err)
+	})
 }
 
 // testOneTargetsShardsCutOverOneAtATime seeds one target with two shards of
