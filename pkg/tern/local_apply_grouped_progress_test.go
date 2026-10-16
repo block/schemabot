@@ -1,6 +1,7 @@
 package tern
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -551,4 +552,42 @@ func TestApplyEngineTableDisplayFields_BoundsTheThrottleReason(t *testing.T) {
 	assert.Equal(t, engine.SanitizeThrottleReason(reason), task.ThrottleReason)
 	assert.LessOrEqual(t, len(task.ThrottleReason), 255, "the reason fits the throttle_reason column")
 	assert.True(t, strings.HasPrefix(task.ThrottleReason, "replica lag / x"))
+}
+
+// erroringProgressEngine is an externally authoritative engine whose every
+// progress poll fails with a transient error, as when the provider's API is
+// rate limiting or unreachable while the deploy request keeps running.
+type erroringProgressEngine struct {
+	engine.Engine
+	calls int
+}
+
+func (e *erroringProgressEngine) Name() string { return "planetscale" }
+
+func (e *erroringProgressEngine) ProgressIsExternallyAuthoritative() bool { return true }
+
+func (e *erroringProgressEngine) Progress(context.Context, *engine.ProgressRequest) (*engine.ProgressResult, error) {
+	e.calls++
+	return nil, errors.New("get deploy request: rate limited")
+}
+
+// A Vitess apply's deploy request keeps running on the provider whatever the
+// drive concludes. When every progress poll fails, the drive cannot see the
+// work, which says nothing about its health, so once the poll's error budget
+// is spent the apply pauses as failed_retryable for a later claim to reattach
+// to the same deploy request. It is never failed outright over live work.
+func TestPollForCompletionAtomic_VitessProgressOutagePausesApplyForRetry(t *testing.T) {
+	eng := &erroringProgressEngine{}
+	client, apply, tasks, recording := lostWorkAtomicPollFixture(eng, lostWorkTrustBudgetAmple)
+
+	require.NoError(t, client.pollForCompletionAtomic(t.Context(), apply, tasks, nil, nil, map[string]string{}, false))
+
+	assert.Equal(t, maxConsecutiveProgressPollErrors, eng.calls, "the poll spends its whole error budget first")
+	assert.Equal(t, state.Apply.FailedRetryable, apply.State)
+	assert.Contains(t, apply.ErrorMessage, fmt.Sprintf("progress polling failed after %d consecutive errors", maxConsecutiveProgressPollErrors))
+	assert.Contains(t, apply.ErrorMessage, "rate limited")
+	for _, task := range tasks {
+		assert.Equal(t, state.Task.FailedRetryable, task.State, "task %s", task.TaskIdentifier)
+	}
+	assert.NotContains(t, recording.states, state.Task.Failed, "no task is failed outright")
 }

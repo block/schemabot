@@ -40,6 +40,37 @@ func TestShouldRetryEngineErrorByDatabaseType(t *testing.T) {
 	}
 }
 
+// An error observing or driving work the engine already accepted pauses for
+// operator recovery wherever a recovery claim continues that same work: from a
+// checkpoint (MySQL, Strata) or by reattaching to the work the engine keeps
+// running outside SchemaBot (Vitess deploy requests). Postgres and unknown
+// types keep the conservative disposition, and a permanent error always fails.
+func TestShouldRetryAcceptedWorkErrorByDatabaseType(t *testing.T) {
+	transient := fmt.Errorf("get deploy request: rate limited")
+	permanent := engine.NewPermanentError("deploy request not found")
+
+	cases := []struct {
+		name         string
+		databaseType string
+		err          error
+		want         bool
+	}{
+		{"mysql transient pauses for retry", storage.DatabaseTypeMySQL, transient, true},
+		{"strata transient pauses for retry", storage.DatabaseTypeStrata, transient, true},
+		{"vitess transient pauses for retry", storage.DatabaseTypeVitess, transient, true},
+		{"postgres transient fails permanently", storage.DatabaseTypePostgres, transient, false},
+		{"embedder-registered type fails permanently", "customengine", transient, false},
+		{"vitess permanent error fails permanently", storage.DatabaseTypeVitess, permanent, false},
+		{"mysql permanent error fails permanently", storage.DatabaseTypeMySQL, permanent, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			client := &LocalClient{config: LocalConfig{Type: tc.databaseType}}
+			assert.Equal(t, tc.want, client.shouldRetryAcceptedWorkError(tc.err))
+		})
+	}
+}
+
 func TestEngineDispositionsByDatabaseType(t *testing.T) {
 	cases := []struct {
 		name                        string

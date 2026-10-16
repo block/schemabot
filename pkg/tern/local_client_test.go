@@ -3043,10 +3043,12 @@ func TestLocalClient_AutoTriggerCutoverEscalatesWhenNotReadyPersists(t *testing.
 // rejecting with a hard error (revoked cutover permission, persistent API
 // rejection) cannot retry forever — that would pin the apply at
 // waiting_for_cutover holding the database's deploy queue and lock until a
-// human cancels. After the consecutive-failure bound the drive settles the
-// apply as failed and this owner exits, so the check gate stays closed and an
-// operator gets a settled apply to act on instead of a silent spin.
-func TestLocalClient_AutoTriggerCutoverFailsApplyAfterRepeatedHardRejections(t *testing.T) {
+// human cancels. After the consecutive-failure bound the drive pauses the
+// apply as failed_retryable and this owner exits, so the check gate stays
+// closed. The deploy request is still live at its cutover, so a later claim
+// reattaches to it and tries again within the recovery retry budget, rather
+// than the apply being failed over work that keeps running on the provider.
+func TestLocalClient_AutoTriggerCutoverPausesApplyAfterRepeatedHardRejections(t *testing.T) {
 	apply := &storage.Apply{
 		ID:              133,
 		ApplyIdentifier: "apply-auto-cutover-hard-fail",
@@ -3087,11 +3089,11 @@ func TestLocalClient_AutoTriggerCutoverFailsApplyAfterRepeatedHardRejections(t *
 	}
 
 	require.True(t, client.autoTriggerCutover(t.Context(), fakeEngine, apply, []*storage.Task{task}, controlReq, pollState, now),
-		"the drive owner must exit once the apply is settled")
+		"the drive owner must exit once the apply is paused")
 	assert.Equal(t, maxConsecutiveCutoverFailures, fakeEngine.cutoverCount)
-	assert.Equal(t, state.Apply.Failed, apply.State, "repeated hard rejections must settle the apply as failed")
-	assert.Equal(t, state.Task.Failed, task.State)
-	assert.Contains(t, apply.ErrorMessage, "cutover failed after 10 consecutive attempts")
+	assert.Equal(t, state.Apply.FailedRetryable, apply.State, "repeated hard rejections pause the apply over its live deploy request")
+	assert.Equal(t, state.Task.FailedRetryable, task.State)
+	assert.Contains(t, apply.ErrorMessage, fmt.Sprintf("cutover failed after %d consecutive attempts", maxConsecutiveCutoverFailures))
 	assert.Contains(t, task.ErrorMessage, "403 cutover not permitted")
 }
 

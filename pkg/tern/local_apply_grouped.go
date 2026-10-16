@@ -784,7 +784,7 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 		logger.Warn("progress check failed",
 			append(apply.MutableLogAttrs(), "error", err, "consecutive_errors", ps.consecutiveErrors)...)
 		if ps.consecutiveErrors >= maxConsecutiveProgressPollErrors {
-			if c.shouldRetryEngineError(err) {
+			if c.shouldRetryAcceptedWorkError(err) {
 				logger.Warn("progress polling failed repeatedly, pausing apply for operator retry",
 					"consecutive_errors", ps.consecutiveErrors)
 				ps.terminalErr = c.markApplyRetryableWithTasks(ctx, apply, tasks, fmt.Sprintf("progress polling failed after %d consecutive errors: %v", ps.consecutiveErrors, err))
@@ -1504,7 +1504,7 @@ func (c *LocalClient) autoTriggerCutover(ctx context.Context, eng engine.Engine,
 		if ps.consecutiveCutoverFailures < maxConsecutiveCutoverFailures {
 			return false
 		}
-		if c.shouldRetryEngineError(err) {
+		if c.shouldRetryAcceptedWorkError(err) {
 			logger.Warn("auto-cutover failed repeatedly, pausing apply for operator retry",
 				append(apply.MutableLogAttrs(), "consecutive_cutover_failures", ps.consecutiveCutoverFailures)...)
 			ps.terminalErr = c.markApplyRetryableWithTasks(ctx, apply, tasks, fmt.Sprintf("cutover failed after %d consecutive attempts: %v", ps.consecutiveCutoverFailures, err))

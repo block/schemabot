@@ -1557,6 +1557,31 @@ func (c *LocalClient) shouldRetryEngineError(err error) bool {
 	return recoveryResumesFromCheckpoint(c.config.Type) && engine.IsRetryable(err)
 }
 
+// shouldRetryAcceptedWorkError decides whether an error observing or driving
+// work the engine already accepted — a progress poll or an automatic cutover
+// attempt on a running grouped apply — pauses the apply as failed_retryable
+// instead of failing it permanently. Unlike shouldRetryEngineError, which
+// governs the start of engine work, this pause cannot dispatch duplicate work
+// on an engine whose recovery reattaches to the work it accepted, so such an
+// engine pauses here even though its start errors fail the apply.
+func (c *LocalClient) shouldRetryAcceptedWorkError(err error) bool {
+	if !engine.IsRetryable(err) {
+		return false
+	}
+	return recoveryResumesFromCheckpoint(c.config.Type) || recoveryReattachesToAcceptedWork(c.config.Type)
+}
+
+// recoveryReattachesToAcceptedWork reports whether the database type's engine
+// keeps accepted work running outside SchemaBot and a re-claimed recovery
+// attempt reattaches to it through the persisted engine resume state. Vitess
+// applies are deploy requests on an external provider that keep running
+// whatever the drive concludes, and a grouped resume hands the stored deploy
+// request back to the engine instead of creating a new one. Failing such an
+// apply permanently would only abandon a deploy request that is still live.
+func recoveryReattachesToAcceptedWork(databaseType string) bool {
+	return databaseType == storage.DatabaseTypeVitess
+}
+
 // recoveryResumesFromCheckpoint reports whether the database type's engine can
 // safely retry a failed attempt: a re-claimed recovery attempt resumes the same
 // in-flight work from the engine's durable checkpoint rather than issuing new
