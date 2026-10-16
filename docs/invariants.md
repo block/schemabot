@@ -1212,7 +1212,9 @@ a remote state still in motion. *Enforced:* terminal-truth preflights on the con
 engine's settled outcome onto the task rows before a pending command is consumed
 (`pkg/tern/local_control_reconcile.go`); the in-process engine's settled outcome checks on stop
 and cancel (`pkg/engine/spirit/control.go`), including a completion its run records after the
-cancel (`pkg/engine/spirit/execution.go`).
+cancel, and its run's deference to a stop or cancel that interrupted it, which no failure the run
+records afterwards replaces (`setSchemaChangeFailed`, `pkg/engine/spirit/execution.go`,
+`pkg/engine/spirit/direct.go`).
 
 ### CO-4: Stop wins
 
