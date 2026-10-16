@@ -557,21 +557,27 @@ func TestK8sMultiTarget_FailedTargetHaltsRollout(t *testing.T) {
 	assert.False(t, indexOn(t, dsns[1], "orders", "uq_note"), "shard 2 refused the reviewed DDL")
 }
 
+// mtFailedCopyRows keeps the failing shard's copy small. The checksum that
+// rejects a duplicate re-walks the whole table on every pass, so a large table
+// would delay the failure past the moment a larger shard's copy is ready.
+const mtFailedCopyRows = 10_000
+
 // Shard 2 has duplicate notes, so its unique index on orders fails after its
 // copy, under the default on_failure: halt. Every shard starts together.
-// Shard 1 has nothing to copy and cuts over ahead of the failure. Shard 3
-// copies three times shard 2's rows, so it is still copying when shard 2
-// fails, and once its copy is ready it holds at the cutover barrier behind
-// the failure instead of cutting over. A cancel releases shard 3 without
-// cutting it over, and the apply settles failed, naming shard 2, whose failed
-// copy stays on the target for a new apply to adopt.
+// Shard 1 has nothing to copy and cuts over ahead of the failure. Shard 2's
+// table is small, so its copy and the checksum that rejects it finish within
+// seconds, while shard 3 is still copying a large table. Once shard 3's copy
+// is ready it holds at the cutover barrier behind the failure instead of
+// cutting over. A cancel releases shard 3 without cutting it over, and the
+// apply settles failed, naming shard 2, whose failed copy stays on the target
+// for a new apply to adopt.
 func TestK8sMultiTarget_FailedCopyHoldsLaterTargetAtBarrier(t *testing.T) {
 	ep := testutil.Endpoint(t)
 	dsns := shardDSNs(t, mtShardApp)
 	resetSchema(t, dsns)
 	cleanupRolloutState(t)
 	execOn(t, dsns, mtOrdersV1, mtUsersV1)
-	seedOrders(t, dsns[1:2], mtCopyRows)
+	seedOrders(t, dsns[1:2], mtFailedCopyRows)
 	execOn(t, dsns[1:2], "INSERT INTO orders (user_id, amount, note) VALUES (1, 1, 'dup'), (2, 2, 'dup')")
 	seedOrders(t, dsns[2:], 3*mtCopyRows)
 
