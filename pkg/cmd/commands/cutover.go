@@ -78,5 +78,5 @@ func (cmd *CutoverCmd) Run(ctx context.Context, g *Globals) error {
 	}
 
 	// Watch progress until completion - cutover already triggered, so skip waiting instructions
-	return WatchApplyProgressAfterCutover(ctx, ep, cmd.ApplyID)
+	return WatchApplyProgressAfterCutover(ctx, ep, cmd.ApplyID, cmd.Environment)
 }

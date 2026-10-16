@@ -2,10 +2,12 @@ package postgres
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/block/pg-sprite/pkg/diffplan"
 	"github.com/block/pg-sprite/pkg/plan"
+	"github.com/block/pg-sprite/pkg/schemadiff"
 	"github.com/block/pg-sprite/pkg/statement"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -19,7 +21,7 @@ func planPostgresDefinition(ctx context.Context, pool *pgxpool.Pool, namespace s
 	// planner leaves live policies and settings unchanged.
 	report, err := diffplan.Plan(ctx, pool, diffplan.Request{Schema: namespace, Desired: desired})
 	if err != nil {
-		return plan.Report{}, desired.Table(), fmt.Errorf("plan PostgreSQL table %q: %w", desired.Table(), err)
+		return plan.Report{}, desired.Table(), fmt.Errorf("plan PostgreSQL table %q: %w%s", desired.Table(), err, referencedTableRemedy(err))
 	}
 	return report, desired.Table(), nil
 }
@@ -40,4 +42,19 @@ func parseDesiredFiles(namespace string, files map[string]string) (map[string]st
 		parsed[filename] = desired
 	}
 	return parsed, nil
+}
+
+// referencedTableRemedy names the fix for a foreign key the planner cannot
+// bind. The planner copies each referenced table's shape from the live
+// database, so the referenced table must already exist on the target: a
+// schema file that creates it in the same plan does not help. It returns an
+// empty string for every other failure.
+func referencedTableRemedy(err error) string {
+	switch {
+	case errors.Is(err, schemadiff.ErrReferencedTableNotFound):
+		return "; a foreign key can reference only a table that already exists on the target, so leave the foreign key out of the schema file, apply the referenced table first, then run the ADD CONSTRAINT outside SchemaBot and add the foreign key back to the file"
+	case errors.Is(err, schemadiff.ErrReferencedTableNotReadable):
+		return "; grant the planning role SELECT on the referenced table, then re-plan"
+	}
+	return ""
 }

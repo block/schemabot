@@ -1,6 +1,7 @@
 package templates
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/block/schemabot/pkg/apitypes"
@@ -193,6 +194,23 @@ func TestRenderResumeSupersededProgressComment(t *testing.T) {
 		"the superseded body is preserved inside the fold")
 }
 
+// TestRenderCutoverCommandSupersededProgressComment verifies the frozen body
+// written over a deferred apply's progress comment once the operator's cutover
+// takes effect: it links the successor comment and folds the
+// waiting-for-cutover rendering, cutover command and all, into a details block
+// so it stays on the PR as a record without reading as a live prompt.
+func TestRenderCutoverCommandSupersededProgressComment(t *testing.T) {
+	rendered := RenderCutoverCommandSupersededProgressComment(SupersededProgressData{
+		Repo:         "acme/testapp",
+		PR:           42,
+		NewCommentID: 2222222222,
+		PreviousBody: "## Schema Change Status — Production\n\n**Status**: Waiting for Cutover",
+	})
+	assert.True(t, strings.HasPrefix(rendered,
+		"Cutover started — progress continues in [a new progress comment](https://github.com/acme/testapp/pull/42#issuecomment-2222222222).\n\n"), rendered)
+	assert.Contains(t, rendered, "<details>\n<summary>Progress before the cutover</summary>\n\n## Schema Change Status — Production\n\n**Status**: Waiting for Cutover\n\n</details>\n")
+}
+
 // TestRenderSupersededProgressComment verifies the frozen body written over a
 // progress comment when the superseding rotation is no longer known: it links
 // the successor comment and folds the final progress into a details block
@@ -224,11 +242,12 @@ func TestIsSupersededProgressComment(t *testing.T) {
 		Repo: "acme/testapp", PR: 42, NewCommentID: 1, PreviousBody: "old",
 	}
 	frozen := map[string]string{
-		"resume":      RenderResumeSupersededProgressComment(shared),
-		"revert":      RenderRevertSupersededProgressComment(shared),
-		"skip-revert": RenderSkipRevertSupersededProgressComment(shared),
-		"cutover":     RenderCutoverSupersededComment(shared),
-		"generic":     RenderSupersededProgressComment(shared),
+		"resume":          RenderResumeSupersededProgressComment(shared),
+		"revert":          RenderRevertSupersededProgressComment(shared),
+		"skip-revert":     RenderSkipRevertSupersededProgressComment(shared),
+		"cutover":         RenderCutoverSupersededComment(shared),
+		"cutover command": RenderCutoverCommandSupersededProgressComment(shared),
+		"generic":         RenderSupersededProgressComment(shared),
 		// A volume-frozen body has no renderer anymore, but bodies written by a
 		// release that had one are still on GitHub and must stay recognizable.
 		"volume": renderSupersededFold(volumeSupersededPrefix+" **8/11** — progress continues in",
@@ -243,6 +262,7 @@ func TestIsSupersededProgressComment(t *testing.T) {
 	live := map[string]string{
 		"progress body":            "## Schema Change Status — Staging",
 		"cutover-complete wording": "Cutover complete — the schema change is finalizing.",
+		"cutover-started wording":  "Cutover started by the operator.",
 		"reverting wording":        "Schema change reverting — see the table below.",
 		"skip-revert wording":      "Revert skipped by the operator.",
 	}

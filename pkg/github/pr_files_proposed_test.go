@@ -201,6 +201,68 @@ func TestPRFilesProposedAgainstDefaultBranchKeepsRenamesThatVacateSchema(t *test
 	assert.Equal(t, []string{"schema/orders/users.sql.disabled"}, filenames(proposed))
 }
 
+// TestPRFilesProposedAgainstDefaultBranchScopesCrossConfigRenames covers a
+// rename that moves a schema file from one config directory to another, run
+// through narrowing and then config discovery. When the pull request proposes
+// the rename — the default branch still declares the old path — merging it
+// stops declaring the table under billing, so both configs are planned. When
+// the default branch already holds the rename and the pull request only edits
+// the destination, the vacated path is inherited history: only orders is
+// planned.
+func TestPRFilesProposedAgainstDefaultBranchScopesCrossConfigRenames(t *testing.T) {
+	renamed := PRFile{Filename: "schema/orders/users.sql", PreviousFilename: "schema/billing/users.sql", Status: "renamed"}
+	tests := []struct {
+		name          string
+		repo          proposedFilesRepo
+		wantPrevious  string
+		wantDatabases []string
+	}{
+		{
+			name: "proposed rename plans both configs",
+			repo: proposedFilesRepo{
+				head:       map[string]string{"schema/orders/users.sql": "users-blob"},
+				defaultTip: map[string]string{"schema/billing/users.sql": "users-blob"},
+			},
+			wantPrevious:  "schema/billing/users.sql",
+			wantDatabases: []string{"billing", "orders"},
+		},
+		{
+			name: "inherited rename with an edited destination plans only orders",
+			repo: proposedFilesRepo{
+				head:       map[string]string{"schema/orders/users.sql": "users-edited-blob"},
+				defaultTip: map[string]string{"schema/orders/users.sql": "users-blob"},
+			},
+			wantPrevious:  "",
+			wantDatabases: []string{"orders"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client, mux := setupRateLimitedTestGitHubServer(t)
+			tt.repo.serve(t, mux)
+			registerFileContent(t, mux, "/repos/octocat/hello-world/contents/schema/orders/schemabot.yaml", "database: orders\ntype: mysql\n")
+			registerFileContent(t, mux, "/repos/octocat/hello-world/contents/schema/billing/schemabot.yaml", "database: billing\ntype: mysql\n")
+			ic := NewInstallationClient(client, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+			proposed, _, err := ic.PRFilesProposedAgainstDefaultBranch(t.Context(), "octocat/hello-world", "head-sha", []PRFile{renamed})
+			require.NoError(t, err)
+			require.Len(t, proposed, 1)
+			assert.Equal(t, "schema/orders/users.sql", proposed[0].Filename)
+			assert.Equal(t, tt.wantPrevious, proposed[0].PreviousFilename)
+
+			configs, err := ic.FindConfigsForPRFiles(t.Context(), "octocat/hello-world", "head-sha", proposed)
+			require.NoError(t, err)
+			databases := make([]string, len(configs))
+			for i, dc := range configs {
+				databases[i] = dc.Config.Database
+			}
+			sort.Strings(databases)
+			assert.Equal(t, tt.wantDatabases, databases)
+		})
+	}
+}
+
 // TestPRFilesProposedAgainstDefaultBranchSkipsPullRequestsWithoutSchema
 // verifies that the narrowing costs nothing on the pull requests that never
 // resolve a database — most of them, in a repository of any size. With no file

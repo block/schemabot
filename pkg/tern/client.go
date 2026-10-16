@@ -156,7 +156,19 @@ var (
 	ErrPullSchemaUnsupportedType = errors.New("pull schema unsupported database type")
 	// ErrPullSchemaInvalidRequest marks a malformed pull request.
 	ErrPullSchemaInvalidRequest = errors.New("pull schema invalid request")
+	// ErrCompareSchemaFileChangeUnsupported marks a schema file comparison
+	// for a database type whose engine cannot compare files.
+	ErrCompareSchemaFileChangeUnsupported = errors.New("schema file comparison unsupported for database type")
 )
+
+// SchemaFileChangeComparer is the optional engine capability behind
+// CompareSchemaFileChange. An engine whose schema files can only be
+// understood by running them on the target implements it; LocalClient fails
+// closed with ErrCompareSchemaFileChangeUnsupported for an engine that does
+// not.
+type SchemaFileChangeComparer interface {
+	CompareSchemaFileChange(ctx context.Context, req *ternv1.CompareSchemaFileChangeRequest) (*ternv1.CompareSchemaFileChangeResponse, error)
+}
 
 // SchemaPuller is the optional engine capability that answers PullSchema for
 // database types without a built-in pull path. An engine supplied through
@@ -182,6 +194,12 @@ type Client interface {
 	// plan. Its result is not applyable (no plan_id); it is the read-only
 	// producer the control plane runs per deployment to detect review-time drift.
 	PlanDiff(ctx context.Context, req *ternv1.PlanRequest) (*ternv1.PlanDiffResponse, error)
+
+	// CompareSchemaFileChange reports whether a pull request's edit to one
+	// schema file generates the same schema change on two bases, by running
+	// each version on the target in a rolled-back transaction. It is
+	// read-only; the review gate asks it for files it cannot compare offline.
+	CompareSchemaFileChange(ctx context.Context, req *ternv1.CompareSchemaFileChangeRequest) (*ternv1.CompareSchemaFileChangeResponse, error)
 
 	// Apply executes a previously generated plan.
 	// Validates that the schema hasn't changed since Plan was called.

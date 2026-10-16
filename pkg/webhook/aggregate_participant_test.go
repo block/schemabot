@@ -40,11 +40,12 @@ func TestIsAggregateParticipant(t *testing.T) {
 		"an unconfigured repo keeps posting")
 }
 
-// A PR that renames a participant's schema file out of the participant's managed
-// paths (to a disabled name, or to a directory no participant manages) still changes
-// what that participant declares, so the leader must keep expecting the
-// participant's check and fold it rather than pass on "no managed schema changes".
-func TestLeaderExpectsParticipantsForPRCountsVacatedSchemaPath(t *testing.T) {
+// An aggregate leader expects a participant's Check Run when a PR renames one of
+// that participant's schema files out of its paths: merging the rename stops
+// the default branch declaring the participant's tables, so the leader's
+// aggregate must fold the participant (fail-closed) rather than pass on "no
+// managed schema changes".
+func TestLeaderExpectsParticipantsForRenameOutOfParticipantPaths(t *testing.T) {
 	cfg := &api.ServerConfig{
 		Repos: map[string]api.RepoConfig{
 			"octocat/shared-repo": {Aggregate: &api.AggregateConfig{
@@ -60,32 +61,19 @@ func TestLeaderExpectsParticipantsForPRCountsVacatedSchemaPath(t *testing.T) {
 	tests := []struct {
 		name string
 		file ghclient.PRFile
-		want bool
 	}{
-		{
-			name: "renamed to a disabled name",
-			file: ghclient.PRFile{Filename: "tenant-b/schema/users.sql.disabled", PreviousFilename: "tenant-b/schema/users.sql", Status: "renamed"},
-			want: true,
-		},
-		{
-			name: "renamed out of every participant path",
-			file: ghclient.PRFile{Filename: "archive/users.sql", PreviousFilename: "tenant-b/schema/users.sql", Status: "renamed"},
-			want: true,
-		},
-		{
-			name: "non schema rename outside participant paths",
-			file: ghclient.PRFile{Filename: "docs/guide.md", PreviousFilename: "docs/users.md", Status: "renamed"},
-		},
-		{
-			name: "schema rename outside participant paths",
-			file: ghclient.PRFile{Filename: "other/users_v2.sql", PreviousFilename: "other/users.sql", Status: "renamed"},
-		},
+		{"moved out of the participant's directory", ghclient.PRFile{Filename: "archive/users.sql", PreviousFilename: "tenant-b/schema/widgets/users.sql", Status: "renamed"}},
+		{"renamed to a non-schema file elsewhere", ghclient.PRFile{Filename: "docs/users.md", PreviousFilename: "tenant-b/schema/widgets/users.sql", Status: "renamed"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			assert.Equal(t, tt.want, h.leaderExpectsParticipantsForPR("octocat/shared-repo", []ghclient.PRFile{tt.file}))
+			assert.True(t, h.leaderExpectsParticipantsForPR("octocat/shared-repo", []ghclient.PRFile{tt.file}))
 		})
 	}
+
+	assert.False(t, h.leaderExpectsParticipantsForPR("octocat/shared-repo", []ghclient.PRFile{
+		{Filename: "docs/b.md", PreviousFilename: "docs/a.md", Status: "renamed"},
+	}), "a rename outside every participant's paths expects no participant")
 }
 
 // The predicate tolerates a handler with no server config (returns false, so the

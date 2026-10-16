@@ -6,6 +6,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -63,17 +64,26 @@ func testRetryableExpiryLeaseMeanings(t *testing.T, newStore func(*testing.T) *S
 		defer cancel()
 		store := newStore(t)
 		apply, opIDs, tasks := seedExhaustedRetryableTree(t, ctx, store, "expiry_running_retry", maxRecoveryAttempts-1)
+		// The drives that settled the tree handed their leases back, as a
+		// finished drive does. A leftover fresh lease would hold its slot under
+		// the driver cap until it went stale, and the redispatch would wait.
+		_, err := store.db.ExecContext(ctx, `
+			UPDATE apply_operations SET lease_owner = '', lease_token = '', lease_acquired_at = NULL
+			WHERE apply_id = ?
+		`, apply.ID)
+		require.NoError(t, err)
 
 		// The redispatch claim rotates a lease onto one operation and spends the
 		// parent's last attempt, so the apply now matches expiry's budget arm
-		// while the drive it just admitted is only starting. The row it holds
-		// still reads failed_retryable: the claim transitions pending and
-		// stopped operations, not this one.
+		// while the drive it just admitted is only starting. The claim moves the
+		// row it holds to running, since its siblings keep the parent
+		// failed_retryable, while every sibling still reads failed_retryable: the
+		// parent's state cannot tell the admitted drive from a settled one.
 		claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "retry-driver")
 		require.NoError(t, err)
 		require.NotNil(t, claimed, "an operation under a parent with budget left must be claimable for redispatch")
-		assert.Equal(t, state.ApplyOperation.FailedRetryable, claimed.State,
-			"a redispatch claim leaves the operation state alone, so state cannot distinguish it from a settled drive")
+		assert.Equal(t, state.ApplyOperation.Running, claimed.State,
+			"a redispatch of one operation of several moves it to running with the lease rotation")
 		assert.Contains(t, opIDs, claimed.ID)
 
 		parent, err := store.Applies().Get(ctx, apply.ID)
@@ -87,7 +97,7 @@ func testRetryableExpiryLeaseMeanings(t *testing.T, newStore func(*testing.T) *S
 		expired, err := store.Applies().ExpireRetryable(ctx, 10)
 		require.NoError(t, err)
 		assert.Empty(t, expired, "the lease of a drive that was just admitted must keep expiry out")
-		assertRetryableTreeIntact(t, ctx, store, apply.ID, opIDs, tasks)
+		assertRetryableTreeIntact(t, ctx, store, apply.ID, opIDs, tasks, claimed.ID)
 	})
 
 	t.Run("a settled drive's leftover lease expires the whole tree", func(t *testing.T) {
@@ -315,8 +325,10 @@ func seedExhaustedRetryableTree(t *testing.T, ctx context.Context, store *Storag
 
 // assertRetryableTreeIntact proves a declined pass wrote nothing at all: a
 // partial settlement is the failure this deferral exists to prevent, and a
-// parent left failed over unsettled children is how it would show.
-func assertRetryableTreeIntact(t *testing.T, ctx context.Context, store *Storage, applyID int64, opIDs []int64, tasks []*storage.Task) {
+// parent left failed over unsettled children is how it would show. Every
+// operation still reads failed_retryable except the ones a redispatch claim
+// moved to running.
+func assertRetryableTreeIntact(t *testing.T, ctx context.Context, store *Storage, applyID int64, opIDs []int64, tasks []*storage.Task, redispatched ...int64) {
 	t.Helper()
 	parent, err := store.Applies().Get(ctx, applyID)
 	require.NoError(t, err)
@@ -327,7 +339,11 @@ func assertRetryableTreeIntact(t *testing.T, ctx context.Context, store *Storage
 		op, err := store.ApplyOperations().Get(ctx, id)
 		require.NoError(t, err)
 		require.NotNil(t, op)
-		assert.Equal(t, state.ApplyOperation.FailedRetryable, op.State)
+		want := state.ApplyOperation.FailedRetryable
+		if slices.Contains(redispatched, id) {
+			want = state.ApplyOperation.Running
+		}
+		assert.Equal(t, want, op.State, "apply_operation %d", id)
 	}
 	assertTaskState(t, store, tasks[0].TaskIdentifier, state.Task.FailedRetryable)
 	assertTaskState(t, store, tasks[1].TaskIdentifier, state.Task.Pending)
@@ -366,7 +382,7 @@ func backdateOperationLease(t *testing.T, ctx context.Context, store *Storage, o
 // Exercise both orderings at the candidate-scan boundary using actual row locks
 // and the public operation claim. Parent claims alone cannot protect fan-out.
 func testRetryableExpiryOperationFence(t *testing.T, newStore func(*testing.T) *Storage) {
-	for _, scenario := range []string{"claim wins", "expiry wins", "busy sibling", "heartbeat wins", "cutover claim wins", "expiry blocks cutover"} {
+	for _, scenario := range []string{"claim wins", "expiry wins", "busy sibling", "heartbeat wins", "cutover claim yields", "expiry blocks cutover"} {
 		t.Run(scenario, func(t *testing.T) {
 			ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 			defer cancel()
@@ -387,7 +403,7 @@ func testRetryableExpiryOperationFence(t *testing.T, newStore func(*testing.T) *
 				require.NoError(t, err)
 				opIDs = append(opIDs, id)
 			}
-			if scenario == "cutover claim wins" || scenario == "expiry blocks cutover" {
+			if scenario == "cutover claim yields" || scenario == "expiry blocks cutover" {
 				_, err = store.db.ExecContext(ctx, "UPDATE apply_operations SET state = ?, cutover_policy = ?, updated_at = "+staleHeartbeat+" WHERE id = ?", state.ApplyOperation.Completed, storage.CutoverPolicyParallel, opIDs[0])
 				require.NoError(t, err)
 				_, err = store.db.ExecContext(ctx, "UPDATE apply_operations SET state = ?, cutover_policy = ?, updated_at = "+staleHeartbeat+" WHERE id = ?", state.ApplyOperation.WaitingForCutover, storage.CutoverPolicyParallel, opIDs[1])
@@ -429,16 +445,21 @@ func testRetryableExpiryOperationFence(t *testing.T, newStore func(*testing.T) *
 			require.NoError(t, tx.QueryRowContext(ctx, "SELECT id FROM applies WHERE id = ? AND state = ? AND attempt >= ? AND "+gate+" FOR UPDATE", args...).Scan(&id))
 
 			switch scenario {
-			case "claim wins", "cutover claim wins":
-				claim := store.ApplyOperations().FindNextApplyOperation
-				if scenario == "cutover claim wins" {
-					claim = store.ApplyOperations().FindNextApplyOperationCutover
-				}
-				claimed, err := claim(ctx, "new-driver")
+			case "claim wins":
+				claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "new-driver")
 				require.NoError(t, err)
 				require.NotNil(t, claimed)
 				assert.False(t, lockUndrivenApply(ctx, t, expiryStore, tx, apply.ID),
 					"lease recheck must reject a claim made after candidate selection")
+			case "cutover claim yields":
+				// The cutover claim admits a swap only under the parent apply's
+				// row lock, which candidate selection already holds, so it
+				// backs off rather than commit inside expiry's window.
+				claimed, err := store.ApplyOperations().FindNextApplyOperationCutover(ctx, "new-driver")
+				require.NoError(t, err)
+				assert.Nil(t, claimed, "cutover claim must back off while expiry holds the parent apply")
+				assert.True(t, lockUndrivenApply(ctx, t, expiryStore, tx, apply.ID),
+					"expiry keeps the tree the cutover claim backed off from")
 			case "heartbeat wins":
 				err := store.ApplyOperations().Heartbeat(storage.WithOperationLease(ctx, storage.OperationLease{ApplyID: apply.ID, OperationID: opIDs[0], Token: "old-token"}), opIDs[0])
 				require.NoError(t, err)

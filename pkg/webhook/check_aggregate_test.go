@@ -78,7 +78,7 @@ func TestComputeAggregate(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			conclusion, status := computeAggregate(tt.checks)
+			conclusion, status := computeAggregate(tt.checks, nil)
 			assert.Equal(t, tt.wantConclusion, conclusion)
 			assert.Equal(t, tt.wantStatus, status)
 		})
@@ -291,10 +291,13 @@ func TestAggregateSummary_TenantApplyTitles(t *testing.T) {
 	})
 }
 
-// A stopped apply keeps its check in progress so merge stays blocked, but the
-// PR is waiting on an operator to start or cancel it — not on work. The title
-// has to say which, or a reader watches for progress that will never arrive.
-func TestAggregateSummary_StoppedApplies(t *testing.T) {
+// A stopped apply keeps its stored check in progress, but the PR is waiting on
+// an operator to start or cancel it — not on work. When only stopped applies
+// hold the aggregate, it concludes action_required, still blocking merge, and
+// the title says the applies are stopped; a reader shown a running check would
+// watch for progress that will never arrive. A stopped apply alongside running
+// work keeps the aggregate in progress.
+func TestAggregateFold_StoppedApplies(t *testing.T) {
 	running := &storage.Check{
 		DatabaseName: "orders", DatabaseType: "mysql", Environment: "production",
 		ApplyID: 11, Status: checkStatusInProgress, HasChanges: true,
@@ -307,37 +310,78 @@ func TestAggregateSummary_StoppedApplies(t *testing.T) {
 		DatabaseName: "ledger", DatabaseType: "mysql", Environment: "production",
 		ApplyID: 33, Status: checkStatusInProgress, HasChanges: true,
 	}
+	pendingUsers := &storage.Check{
+		DatabaseName: "users", DatabaseType: "mysql", Environment: "production",
+		Status: checkStatusCompleted, Conclusion: checkConclusionActionRequired, HasChanges: true,
+	}
+	failedUsers := &storage.Check{
+		DatabaseName: "users", DatabaseType: "mysql", Environment: "production",
+		Status: checkStatusCompleted, Conclusion: checkConclusionFailure, HasChanges: true,
+	}
 	stopped := stoppedApplyIDs{22: true, 33: true}
 
+	fold := func(checks ...*storage.Check) (conclusion, status, title, summary string) {
+		conclusion, status = computeAggregate(checks, stopped)
+		title, summary = aggregateSummary(checks, conclusion, stopped)
+		return conclusion, status, title, summary
+	}
+
 	t.Run("the only in-flight apply is stopped", func(t *testing.T) {
-		title, _ := aggregateSummary([]*storage.Check{stoppedOrders}, "", stopped)
+		conclusion, status, title, _ := fold(stoppedOrders)
+		assert.Equal(t, checkStatusCompleted, status)
+		assert.Equal(t, checkConclusionActionRequired, conclusion)
 		assert.Equal(t, "1 apply stopped", title)
 	})
 
 	t.Run("every in-flight apply is stopped", func(t *testing.T) {
-		title, _ := aggregateSummary([]*storage.Check{stoppedOrders, stoppedLedger}, "", stopped)
+		conclusion, status, title, _ := fold(stoppedOrders, stoppedLedger)
+		assert.Equal(t, checkStatusCompleted, status)
+		assert.Equal(t, checkConclusionActionRequired, conclusion)
 		assert.Equal(t, "2 applies stopped", title)
 	})
 
+	t.Run("a stopped apply alongside a pending one", func(t *testing.T) {
+		conclusion, status, title, _ := fold(stoppedLedger, pendingUsers)
+		assert.Equal(t, checkStatusCompleted, status)
+		assert.Equal(t, checkConclusionActionRequired, conclusion)
+		assert.Equal(t, "1 apply pending (1 stopped)", title)
+	})
+
+	t.Run("a failed apply outranks a stopped one", func(t *testing.T) {
+		conclusion, status, title, _ := fold(stoppedLedger, failedUsers)
+		assert.Equal(t, checkStatusCompleted, status)
+		assert.Equal(t, checkConclusionFailure, conclusion)
+		assert.Equal(t, "Apply failed", title)
+	})
+
 	t.Run("a stopped apply alongside one still running", func(t *testing.T) {
-		title, _ := aggregateSummary([]*storage.Check{running, stoppedLedger}, "", stopped)
+		conclusion, status, title, _ := fold(running, stoppedLedger)
+		assert.Equal(t, checkStatusInProgress, status)
+		assert.Empty(t, conclusion)
 		assert.Equal(t, "Apply in progress (1 stopped)", title)
 	})
 
 	t.Run("the table row agrees with the title", func(t *testing.T) {
-		_, summary := aggregateSummary([]*storage.Check{running, stoppedLedger}, "", stopped)
+		_, _, _, summary := fold(running, stoppedLedger)
 		assert.Contains(t, summary, "| `ledger` | mysql | — | Stopped |")
 		assert.Contains(t, summary, "| `orders` | mysql | — | In progress |")
 	})
 
 	t.Run("nothing stopped keeps the state-agnostic title", func(t *testing.T) {
-		title, _ := aggregateSummary([]*storage.Check{running}, "", stopped)
+		conclusion, status, title, _ := fold(running)
+		assert.Equal(t, checkStatusInProgress, status)
+		assert.Empty(t, conclusion)
 		assert.Equal(t, "Apply in progress", title)
 	})
 
-	// An unresolvable set (a storage read failed) must not change the title.
-	t.Run("unknown apply states keep the state-agnostic title", func(t *testing.T) {
-		title, _ := aggregateSummary([]*storage.Check{stoppedOrders, stoppedLedger}, "", nil)
+	// An unresolvable set (a storage read failed) keeps the aggregate in
+	// progress: it still blocks merge, and nothing claims the apply is stopped.
+	t.Run("unknown apply states keep the aggregate in progress", func(t *testing.T) {
+		checks := []*storage.Check{stoppedOrders, stoppedLedger}
+		conclusion, status := computeAggregate(checks, nil)
+		title, _ := aggregateSummary(checks, conclusion, nil)
+		assert.Equal(t, checkStatusInProgress, status)
+		assert.Empty(t, conclusion)
 		assert.Equal(t, "Apply in progress", title)
 	})
 }
@@ -509,7 +553,7 @@ func TestNormalizeStaleContributions(t *testing.T) {
 			assert.Equal(t, checkStatusInProgress, c.Status)
 			assert.Empty(t, c.Conclusion)
 		}
-		conclusion, status := computeAggregate(contributions)
+		conclusion, status := computeAggregate(contributions, nil)
 		assert.Empty(t, conclusion)
 		assert.Equal(t, checkStatusInProgress, status)
 	})

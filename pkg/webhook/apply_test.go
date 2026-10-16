@@ -2,6 +2,7 @@ package webhook
 
 import (
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 
@@ -252,4 +253,21 @@ func TestBuildApplyCommentData_DefaultNamespace(t *testing.T) {
 	data := buildApplyCommentData(apply, tasks, operationDisplay{}, nil, "")
 
 	assert.Equal(t, "testdb", data.Tables[0].Namespace, "empty namespace should default to database name")
+}
+
+// A task the engine began carries its start into the comment row, so a
+// cancelled table can tell a target the cancel stopped part-way from one it
+// reached while the table was still queued.
+func TestTableProgressFromTasks_CarriesWhetherTheTaskStarted(t *testing.T) {
+	startedAt := time.Now()
+	rows := tableProgressFromTasks("testdb", []*storage.Task{
+		{TableName: "orders", State: state.Task.Cancelled, StartedAt: &startedAt},
+		{TableName: "users", State: state.Task.Cancelled},
+	}, nil)
+
+	assert.Len(t, rows, 2)
+	assert.Equal(t, "orders", rows[0].TableName)
+	assert.True(t, rows[0].Started, "a task with a start time began its table")
+	assert.Equal(t, "users", rows[1].TableName)
+	assert.False(t, rows[1].Started, "a task with no start time never began its table")
 }

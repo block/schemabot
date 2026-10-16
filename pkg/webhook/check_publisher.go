@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"strings"
 
 	"github.com/block/schemabot/pkg/api"
@@ -319,26 +320,39 @@ func anyApplyOwnedInProgress(checks []*storage.Check) bool {
 }
 
 // stoppedAppliesForPR resolves which of a PR's applies are stopped, so the fold
-// can name a paused apply rather than report it as work in progress.
+// can tell a check held open by a stopped apply from one held open by running
+// work.
 //
 // Folds run on every webhook event and re-fold, and the set is consulted only
 // for in-progress apply-owned rows, so a fold with none — the steady state once
 // a PR's contributions have all completed — skips the read entirely rather than
 // paying for a result it would discard.
 //
-// A lookup failure returns no set rather than an error: the aggregate's status
-// and conclusion do not depend on it, so failing the whole fold would trade a
-// less precise title for a check that does not get published at all. The title
-// falls back to the state-agnostic wording and the error is logged.
+// The set decides the aggregate's status and conclusion, not just its title: a
+// row held by a stopped apply folds as completed/action_required rather than
+// in_progress. A lookup failure returns no set rather than an error, so every
+// such row folds as in_progress for that fold. That still blocks merge, which
+// is the fail-closed direction; failing the whole fold instead would leave the
+// Check Run on whatever it last said. The error is logged.
 func (h *Handler) stoppedAppliesForPR(ctx context.Context, repo string, pr int, checks []*storage.Check) stoppedApplyIDs {
 	if !anyApplyOwnedInProgress(checks) {
 		return nil
 	}
-	applies, err := h.service.Storage().Applies().GetByPR(ctx, repo, pr)
+	stopped, err := h.loadStoppedApplies(ctx, repo, pr)
 	if err != nil {
-		h.logger.Warn("aggregate title will not distinguish stopped applies; failed to load the PR's applies",
+		h.logger.Warn("aggregate will fold stopped applies as in progress, still blocking merge; failed to load the PR's applies",
 			"repo", repo, "pr", pr, "error", err)
 		return nil
+	}
+	return stopped
+}
+
+// loadStoppedApplies reads which of a PR's applies are resting in the stopped
+// state.
+func (h *Handler) loadStoppedApplies(ctx context.Context, repo string, pr int) (stoppedApplyIDs, error) {
+	applies, err := h.service.Storage().Applies().GetByPR(ctx, repo, pr)
+	if err != nil {
+		return nil, fmt.Errorf("load applies for %s#%d: %w", repo, pr, err)
 	}
 	var stopped stoppedApplyIDs
 	for _, a := range applies {
@@ -350,19 +364,20 @@ func (h *Handler) stoppedAppliesForPR(ctx context.Context, repo string, pr int, 
 		}
 		stopped[a.ID] = true
 	}
-	return stopped
+	return stopped, nil
 }
 
 // prFilePaths extracts the changed-file paths from a PR file listing for
-// expected-participant matching, including the schema path a rename vacated:
-// moving a participant's schema file out of its managed paths still changes
-// what that participant declares, so the participant must stay expected.
+// expected-participant matching. A rename contributes the path it vacated as
+// well as its new one: moving a participant's schema file to a name or
+// directory outside the participant's paths stops the default branch declaring
+// that participant's tables, so the participant is still expected.
 func prFilePaths(files []ghclient.PRFile) []string {
 	paths := make([]string, 0, len(files))
 	for _, f := range files {
 		paths = append(paths, f.Filename)
-		if vacated, ok := ghclient.VacatedSchemaPath(f); ok && vacated != f.Filename {
-			paths = append(paths, vacated)
+		if f.PreviousFilename != "" && f.PreviousFilename != f.Filename {
+			paths = append(paths, f.PreviousFilename)
 		}
 	}
 	return paths
@@ -370,6 +385,54 @@ func prFilePaths(files []ghclient.PRFile) []string {
 
 // upsertAggregateCheckRunOnce computes the aggregate conclusion from the given
 // checks and creates or updates a GitHub check run with the specified name.
+//
+// The fold reads which applies are stopped once, then spends several GitHub
+// round trips publishing what it read. An apply that stops or starts again in
+// that window leaves the published run describing a state the apply has left,
+// and with nothing serializing folds for a PR, a fold that read the older state
+// can be the last to publish. So once a fold that consulted the stopped set has
+// published, the set is read again, and if it moved the aggregate is folded
+// once more from the current state.
+func (h *Handler) upsertAggregateCheckRunOnce(
+	ctx context.Context, client *ghclient.InstallationClient,
+	repo string, pr int, headSHA string,
+	dbChecks []*storage.Check, checkName string, environment string,
+) error {
+	folded, err := h.foldAggregateCheckRun(ctx, client, repo, pr, headSHA, dbChecks, checkName, environment)
+	if err != nil {
+		return err
+	}
+	if !anyApplyOwnedInProgress(folded.contributions) {
+		return nil
+	}
+	current, err := h.loadStoppedApplies(ctx, repo, pr)
+	if err != nil {
+		h.logger.Warn("aggregate check not re-checked against the PR's stopped applies; the published run stands until the next fold",
+			"repo", repo, "pr", pr, "check_name", checkName,
+			"environment", environment, "head_sha", headSHA, "error", err)
+		return nil
+	}
+	if maps.Equal(current, folded.stopped) {
+		return nil
+	}
+	h.logger.Info("re-folding aggregate check: an apply stopped or started again while the fold published",
+		"repo", repo, "pr", pr, "check_name", checkName,
+		"environment", environment, "head_sha", headSHA,
+		"folded_stopped_applies", len(folded.stopped), "current_stopped_applies", len(current))
+	_, err = h.foldAggregateCheckRun(ctx, client, repo, pr, headSHA, dbChecks, checkName, environment)
+	return err
+}
+
+// aggregateFold is what one fold published from: the contributions after
+// stale-commit normalization, and the stopped applies it read. Both are empty
+// when the fold published nothing.
+type aggregateFold struct {
+	contributions []*storage.Check
+	stopped       stoppedApplyIDs
+}
+
+// foldAggregateCheckRun folds the given checks into one aggregate and publishes
+// it as a GitHub check run with the specified name.
 //
 // The environment parameter controls the storage key: for per-environment aggregates
 // it is the real environment name (e.g., "staging"), for the global aggregate it is
@@ -389,12 +452,14 @@ func prFilePaths(files []ghclient.PRFile) []string {
 // It records the same operation metrics and logs as before and additionally
 // returns the underlying error so a caller with a retry mechanism can react to a
 // failed GitHub or storage write. A stored blocking reason is an intentional
-// fail-closed skip, not an operational failure, so it returns nil.
-func (h *Handler) upsertAggregateCheckRunOnce(
+// fail-closed skip, not an operational failure, so it returns no error. It also
+// returns what it published from, so the caller can check whether the stopped
+// applies moved while it published.
+func (h *Handler) foldAggregateCheckRun(
 	ctx context.Context, client *ghclient.InstallationClient,
 	repo string, pr int, headSHA string,
 	dbChecks []*storage.Check, checkName string, environment string,
-) error {
+) (aggregateFold, error) {
 	// Look up existing aggregate check state using the environment-specific key.
 	existing, err := h.service.Storage().Checks().Get(ctx, repo, pr, environment, aggregateSentinel, aggregateSentinel)
 	if err != nil {
@@ -405,7 +470,7 @@ func (h *Handler) upsertAggregateCheckRunOnce(
 			Status:      "error",
 		})
 		h.logger.Error("failed to look up aggregate check", "repo", repo, "pr", pr, "environment", environment, "error", err)
-		return fmt.Errorf("look up aggregate check for %s#%d (env %s): %w", repo, pr, environment, err)
+		return aggregateFold{}, fmt.Errorf("look up aggregate check for %s#%d (env %s): %w", repo, pr, environment, err)
 	}
 
 	// A stored blocking reason means a PR-level guard failed the aggregate
@@ -425,12 +490,13 @@ func (h *Handler) upsertAggregateCheckRunOnce(
 			"blocked_head_sha", existing.HeadSHA,
 			"blocking_reason", existing.BlockingReason,
 			"check_run_id", existing.CheckRunID)
-		return nil
+		return aggregateFold{}, nil
 	}
 
 	contributions, staleCount := normalizeStaleContributions(dbChecks, headSHA)
-	conclusion, status := computeAggregate(contributions)
-	title, summary := aggregateSummary(contributions, conclusion, h.stoppedAppliesForPR(ctx, repo, pr, contributions))
+	stopped := h.stoppedAppliesForPR(ctx, repo, pr, contributions)
+	conclusion, status := computeAggregate(contributions, stopped)
+	title, summary := aggregateSummary(contributions, conclusion, stopped)
 	if staleCount > 0 {
 		h.logger.Info("aggregate fold holds rows recorded for another commit as blocking until results land for the current commit",
 			"repo", repo, "pr", pr, "check_name", checkName,
@@ -478,7 +544,7 @@ func (h *Handler) upsertAggregateCheckRunOnce(
 				"repo", repo, "pr", pr, "check_name", checkName,
 				"environment", environment, "head_sha", headSHA,
 				"stored_check_run_id", existing.CheckRunID, "error", err)
-			return fmt.Errorf("resolve newest aggregate check run %q for %s#%d@%s (env %s): %w", checkName, repo, pr, headSHA, environment, err)
+			return aggregateFold{}, fmt.Errorf("resolve newest aggregate check run %q for %s#%d@%s (env %s): %w", checkName, repo, pr, headSHA, environment, err)
 		}
 		if run == nil {
 			// Stored state names a run for this commit that no trusted App run
@@ -532,7 +598,7 @@ func (h *Handler) upsertAggregateCheckRunOnce(
 				"environment", environment, "check_run_id", liveRun.ID,
 				"head_sha", headSHA, "check_status", status,
 				"conclusion", conclusion, "error", err)
-			return fmt.Errorf("update aggregate check run %d for %s#%d (env %s): %w", liveRun.ID, repo, pr, environment, err)
+			return aggregateFold{}, fmt.Errorf("update aggregate check run %d for %s#%d (env %s): %w", liveRun.ID, repo, pr, environment, err)
 		}
 		checkRunID = liveRun.ID
 	} else {
@@ -553,7 +619,7 @@ func (h *Handler) upsertAggregateCheckRunOnce(
 				"repo", repo, "pr", pr, "check_name", checkName,
 				"environment", environment, "head_sha", headSHA,
 				"check_status", status, "conclusion", conclusion, "error", err)
-			return fmt.Errorf("create aggregate check run for %s#%d@%s (env %s): %w", repo, pr, headSHA, environment, err)
+			return aggregateFold{}, fmt.Errorf("create aggregate check run for %s#%d@%s (env %s): %w", repo, pr, headSHA, environment, err)
 		}
 		if rewound {
 			metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
@@ -590,7 +656,7 @@ func (h *Handler) upsertAggregateCheckRunOnce(
 			"environment", environment, "check_run_id", checkRunID,
 			"head_sha", headSHA, "check_status", status,
 			"conclusion", conclusion, "error", err)
-		return fmt.Errorf("store aggregate check state for %s#%d (env %s): %w", repo, pr, environment, err)
+		return aggregateFold{}, fmt.Errorf("store aggregate check state for %s#%d (env %s): %w", repo, pr, environment, err)
 	}
 
 	metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
@@ -604,7 +670,7 @@ func (h *Handler) upsertAggregateCheckRunOnce(
 		"environment", environment, "check_run_id", checkRunID,
 		"check_status", status, "conclusion", conclusion,
 		"per_database_checks", len(dbChecks))
-	return nil
+	return aggregateFold{contributions: contributions, stopped: stopped}, nil
 }
 
 // rewindsConcludedCheckRun reports whether publishing the recomputed status to
@@ -782,13 +848,17 @@ func (h *Handler) postFailingAggregates(ctx context.Context, client *ghclient.In
 
 // postFailingAggregatesWithBlock stores a blocking reason only for callers with
 // a stable failure class. Generic plan errors should use postFailingAggregates.
-func (h *Handler) postFailingAggregatesWithBlock(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA string, errors map[string]string, block checkBlockReason) {
+//
+// It reports whether every failing aggregate it set out to post was published
+// and stored. A caller about to fold the aggregate from stored check state
+// reads false as "the fold may not see this failure" and must not fold.
+func (h *Handler) postFailingAggregatesWithBlock(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA string, errors map[string]string, block checkBlockReason) bool {
 	if !h.shouldPublishChecks(ctx, repo, "aggregate_check_sync") {
-		return
+		return false
 	}
 
 	if !h.verifyHeadSHAStillCurrentForPR(ctx, client, repo, pr, headSHA, "aggregate_check_sync") {
-		return
+		return false
 	}
 
 	config := h.service.Config()
@@ -823,9 +893,10 @@ func (h *Handler) postFailingAggregatesWithBlock(ctx context.Context, client *gh
 			Status:     "noop",
 		})
 		h.logger.Debug("no failing aggregate checks to post", "repo", repo, "pr", pr)
-		return
+		return true
 	}
 
+	stored := true
 	for _, ec := range checks {
 		// Build summary from the error for this environment
 		summary := planFailedCheckText
@@ -855,6 +926,7 @@ func (h *Handler) postFailingAggregatesWithBlock(ctx context.Context, client *gh
 				h.logger.Error("failed to look up stored aggregate state before failing aggregate; not publishing so any stored block stays authoritative",
 					"repo", repo, "pr", pr, "check_name", ec.name,
 					"environment", ec.environment, "head_sha", headSHA, "error", err)
+				stored = false
 				continue
 			}
 			if existing != nil && existing.BlockingReason != "" {
@@ -890,6 +962,7 @@ func (h *Handler) postFailingAggregatesWithBlock(ctx context.Context, client *gh
 				Status:      "error",
 			})
 			h.logger.Error("failed to create failing aggregate", "repo", repo, "pr", pr, "error", err)
+			stored = false
 			continue
 		}
 
@@ -915,6 +988,7 @@ func (h *Handler) postFailingAggregatesWithBlock(ctx context.Context, client *gh
 				Status:      "error",
 			})
 			h.logger.Error("failed to store failing aggregate check", "error", err)
+			stored = false
 			continue
 		}
 
@@ -927,6 +1001,7 @@ func (h *Handler) postFailingAggregatesWithBlock(ctx context.Context, client *gh
 		h.logger.Info("posted failing aggregate",
 			"repo", repo, "pr", pr, "check_name", ec.name, "env", ec.environment)
 	}
+	return stored
 }
 
 // planFailedCheckText is the fixed title and fallback summary a failing plan

@@ -575,7 +575,7 @@ func (ic *InstallationClient) FindConfigsForPRFiles(ctx context.Context, repo, r
 		probes[configDir] = config
 	}
 
-	for _, schemaFile := range discoverySchemaPaths(files) {
+	for _, schemaFile := range DiscoverySchemaPaths(files) {
 		config, configDir, err := ic.findNearestConfig(ctx, repo, ref, schemaFile, probes)
 		if err != nil {
 			return nil, err
@@ -661,7 +661,7 @@ func isDiscoveryInputFile(filename string) bool {
 // declaring its tables, so discovery must still resolve the config that managed
 // the old path — as it does for a plain deletion.
 func renamedAwaySchemaPath(file PRFile) (string, bool) {
-	vacated, ok := VacatedSchemaPath(file)
+	vacated, ok := vacatedSchemaPath(file)
 	if !ok || vacated == file.Filename {
 		return "", false
 	}
@@ -693,10 +693,12 @@ func isRenamedPRFile(status string) bool {
 	return strings.EqualFold(status, "renamed")
 }
 
-// discoverySchemaPaths returns the schema file paths discovery walks up from:
+// DiscoverySchemaPaths returns the schema file paths discovery walks up from:
 // each changed file's current path when it is a schema file, and the schema
-// path a rename vacated.
-func discoverySchemaPaths(files []PRFile) []string {
+// path a rename vacated. Callers deciding whether a pull request needs config
+// discovery at all read the same paths, so a rename that vacates a schema
+// path is never read as "no schema files changed".
+func DiscoverySchemaPaths(files []PRFile) []string {
 	var result []string
 	for _, file := range files {
 		if IsSchemaFile(file.Filename) {

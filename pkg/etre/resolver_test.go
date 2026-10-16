@@ -169,7 +169,8 @@ func TestEtreResolverOmitsEnvLabelWhenUnset(t *testing.T) {
 }
 
 // A not-found lookup fails closed and surfaces the sentinel so a multi-type
-// resolver could fall back.
+// resolver could fall back, and reports the target as one the inventory does
+// not have.
 func TestEtreResolverFailsClosedOnNotFound(t *testing.T) {
 	r := newEtreResolverForTest(t, nil, nil, EtreResolverConfig{
 		TargetLabel: "dsid",
@@ -179,6 +180,7 @@ func TestEtreResolverFailsClosedOnNotFound(t *testing.T) {
 	_, err := r.ResolveTarget(t.Context(), inventory.Request{Target: "missing"})
 	require.Error(t, err)
 	assert.ErrorIs(t, err, ErrNotFound)
+	assert.ErrorIs(t, err, inventory.ErrTargetNotFound)
 }
 
 // A request whose type does not match the engine the resolver serves fails

@@ -180,7 +180,7 @@ func vacatedSchemaFiles(prFiles []PRFile, schemaRoot string) []PRFile {
 	prefix := path.Clean(schemaRoot) + "/"
 	var vacated []PRFile
 	for _, file := range prFiles {
-		vacatedPath, ok := VacatedSchemaPath(file)
+		vacatedPath, ok := vacatedSchemaPath(file)
 		if !ok {
 			continue
 		}
@@ -229,9 +229,9 @@ func emptiedPRNamespaces(grouped map[string]*ternv1.SchemaFiles, ignored []strin
 	return result
 }
 
-// VacatedSchemaPath reports the schema file path a pull request file left
+// vacatedSchemaPath reports the schema file path a pull request file left
 // empty: the path of a deleted file, or the previous path of a renamed one.
-func VacatedSchemaPath(file PRFile) (string, bool) {
+func vacatedSchemaPath(file PRFile) (string, bool) {
 	var vacated string
 	switch {
 	case isRemovedPRFile(file.Status):
