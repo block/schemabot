@@ -163,6 +163,13 @@ func settledOutcomeOutranksStop(state engine.State) bool {
 	return state.IsTerminal() && state != engine.StateStopped
 }
 
+// controlOutcomeStands reports whether the schema change carries the outcome
+// of a stop or cancel the operator asked for, which a failure its run records
+// afterwards must not replace.
+func controlOutcomeStands(state engine.State) bool {
+	return state == engine.StateStopped || state == engine.StateCancelled
+}
+
 // settledStopOutcome answers a stop that finds the schema change already
 // settled, leaving the settled state in place. Only a change still in motion
 // can be paused: a stopped change already is, and a completed, failed, or
