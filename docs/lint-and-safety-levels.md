@@ -148,6 +148,10 @@ classified unsafe when any of the following hold:
 - a lint rule raised it at error severity (for example dropping an index that
   was never made invisible).
 
+Narrowing a column's type or removing an `ENUM` or `SET` value is not unsafe
+on any engine; see [Unsafe Changes](./architecture.md#unsafe-changes) for what
+catches a lossy narrowing at apply time instead.
+
 On the MySQL family, a new table is also unsafe when Spirit could not alter it
 later (the `spirit_compatible` rule, error severity). The rule applies to
 Vitess targets too: Vitess online DDL also needs a primary key and refuses

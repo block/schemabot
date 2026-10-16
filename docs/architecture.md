@@ -239,10 +239,17 @@ Unsafe operations that produce error-severity violations:
 - `DROP COLUMN` — deletes a column and its data from every row
 - `DROP INDEX` without first making it invisible — may cause query performance regression
 
-A `MODIFY COLUMN` that narrows a type (for example `varchar(255)` to `varchar(10)`, or
-`bigint` to `tinyint`) and the removal of an `ENUM` or `SET` value are not on this list:
-Spirit's linter reports no error-severity violation for them, so they plan and apply without
-`--allow-unsafe`. Review a narrowing change against the data the column already holds.
+A `MODIFY COLUMN` that narrows a non-key column's type (for example `varchar(255)` to
+`varchar(10)`, or `bigint` to `tinyint`) and the removal of an `ENUM` or `SET` value are not
+on this list, on any engine: Spirit's linter reports no error-severity violation for them,
+Vitess targets take the same verdict, and pg-sprite marks only drops destructive, so they
+plan and apply without `--allow-unsafe`. Narrowing a primary key column is caught only when
+the new type falls outside the allowed key types (the `primary_key` rule), not because it
+narrows. Whether a narrowing loses data is decided at apply time, not plan time: Spirit
+copies the rows and fails the apply before cutover when its checksum finds a copied value
+that no longer matches, and PostgreSQL rejects a value that does not fit the new type.
+SchemaBot adds no check of its own on any engine, so review a narrowing change against the
+data the column already holds before applying it.
 
 For MySQL/Spirit databases, an applied `DROP TABLE` can additionally be
 quarantined instead of executed: the table is renamed into a `_pending_drops`
