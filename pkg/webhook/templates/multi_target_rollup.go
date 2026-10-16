@@ -295,6 +295,12 @@ func writeTargetTableLine(sb *strings.Builder, table string, cells []TableProgre
 			eta = max(eta, c.ETASeconds)
 		}
 		if c.RowsTotal == 0 {
+			if !presentation.CopyStillAhead(status) {
+				// The target is past its copy, so the table it copied had no
+				// rows: its zero is the engine's answer.
+				reporting++
+				continue
+			}
 			if c.EstimatedRows != nil {
 				// The target has not reported its copy yet, so the plan's
 				// estimate stands in for the rows it will copy.

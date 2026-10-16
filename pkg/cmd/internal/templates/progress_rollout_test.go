@@ -700,6 +700,24 @@ func TestFormatTargetRollup_QueuedTargetsCountByPlannedRows(t *testing.T) {
 
 	out = renderRollout(t, targetRolloutData([]rolloutTarget{queued(1_000), queued(1_200), queued(1_800)}))
 	assert.Contains(t, out, "Rows: ~4k across all 3 targets\n", "%s", out)
+
+	// A target that has reported nothing has no estimate to add, so a sum of
+	// the others would understate the table and none is shown.
+	out = renderRollout(t, targetRolloutData([]rolloutTarget{queued(1_000), queued(1_200), queuedTarget()}))
+	assert.NotContains(t, out, "~2k", "%s", out)
+	assert.NotContains(t, out, "Rows: ~", "%s", out)
+}
+
+// A target past its copy that reports no rows copied an empty table, so its
+// zero is the engine's answer: the plan's estimate does not stand in for it,
+// and the table's total is the rows the targets reported.
+func TestFormatTargetRollup_PostCopyZeroIsNotEstimated(t *testing.T) {
+	stale := int64(900)
+	emptyTable := rolloutTarget{opState: state.ApplyOperation.WaitingForCutover, status: state.Task.WaitingForCutover, estimatedRows: &stale}
+
+	out := renderRollout(t, targetRolloutData([]rolloutTarget{copyingTarget(500), emptyTable}))
+	assert.Contains(t, out, "Rows: 500 / 1,000 · ETA: "+ui.FormatETA(120)+"\n", "%s", out)
+	assert.NotContains(t, out, "/ ~", "%s", out)
 }
 
 // A failed target is named with its own data-plane identifiers, read from the

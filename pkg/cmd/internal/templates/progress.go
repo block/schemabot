@@ -866,9 +866,14 @@ func writeStructuredRowsAndETA(b *strings.Builder, t TableProgress) {
 // writePlannedRows writes the rows line of a queued table: the plan's row
 // estimate and size, both approximate, so the work ahead is visible before
 // the copy starts. A table rolled up across targets names them, since its
-// estimate is their sum. It writes nothing when the plan had no row estimate.
+// estimate is their sum. It writes nothing when the plan had no row estimate,
+// or when some targets the line speaks for have reported nothing at all: their
+// estimates are not known, so a sum of the rest would understate the table.
 func writePlannedRows(b *strings.Builder, t TableProgress) {
 	if t.EstimatedRows == nil {
+		return
+	}
+	if t.UnreportedTargets > 0 {
 		return
 	}
 	span := ""

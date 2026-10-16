@@ -342,7 +342,7 @@ func tableAcrossTargets(v RolloutView, byMember map[rolloutMemberKey][]TableProg
 				allPlanned = false
 			} else {
 				plannedAll += *t.EstimatedRows
-				if t.RowsTotal == 0 && rowsStillToCome(status) {
+				if t.RowsTotal == 0 && presentation.CopyStillAhead(status) {
 					planned += *t.EstimatedRows
 				}
 			}
@@ -545,14 +545,6 @@ func anyTargetStarted(targets []ShardProgress) bool {
 func countsTowardRolledRows(status string) bool {
 	return state.IsInFlightTaskState(status) ||
 		state.IsState(status, state.Task.Completed, state.Task.RevertWindow)
-}
-
-// rowsStillToCome reports whether a target that has reported no rows will
-// still copy them: it is queued or working on the change. A finished target
-// that reported none ran it without a copy, and a halted one is named in its
-// own line.
-func rowsStillToCome(status string) bool {
-	return state.IsState(status, state.Task.Pending) || state.IsInFlightTaskState(status)
 }
 
 // inFlightRollupOrder is every in-flight task state, copying first and the

@@ -912,6 +912,27 @@ func TestRenderMultiDeploymentApplyComment_QueuedTargetsCountByPlannedRows(t *te
 	assert.Contains(t, out, "- Rows: ~4k across all 3 targets\n")
 }
 
+// A target past its copy that reports no rows copied an empty table, so its
+// zero is the engine's answer: the plan's estimate does not stand in for it,
+// and the table's total is the rows the targets reported.
+func TestRenderMultiDeploymentApplyComment_PostCopyZeroIsNotEstimated(t *testing.T) {
+	emptyTable := targetDetail("testapp_002", state.Task.WaitingForCutover, addNote, 0)
+	emptyTable.Tables[0].RowsCopied, emptyTable.Tables[0].RowsTotal, emptyTable.Tables[0].ETASeconds = 0, 0, 0
+	stale := int64(900)
+	emptyTable.Tables[0].EstimatedRows = &stale
+	ops := []presentation.Operation{
+		{Deployment: "primary", Target: "testapp-001", State: so.Running},
+		{Deployment: "primary", Target: "testapp-002", State: so.WaitingForCutover},
+	}
+
+	out := renderTargets(presentation.Derive(ops),
+		targetDetail("testapp_001", state.Task.Running, addNote, 500),
+		emptyTable,
+	)
+	assert.Contains(t, out, "- Rows: 500 / 1,000 · ETA: "+ui.FormatETA(500)+"\n")
+	assert.NotContains(t, out, "/ ~")
+}
+
 func TestTargetsTableBytes(t *testing.T) {
 	one, two := int64(1_500_000_000), int64(2_000_000_000)
 	cells := []TableProgressData{{EstimatedBytes: &one}, {EstimatedBytes: &two}}
