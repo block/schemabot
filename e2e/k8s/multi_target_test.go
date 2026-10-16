@@ -474,23 +474,23 @@ func TestK8sMultiTarget_ConvergedMemberCompletes(t *testing.T) {
 	}
 }
 
-// Shard 2 has duplicate notes, so a unique index on orders fails there under
-// the default on_failure: halt. Shard 1 cuts over as soon as its own copy is
-// ready. Shard 3 holds a larger table, so its copy is still running when
-// shard 2 fails; it finishes and holds at the cutover barrier rather than
-// cutting over behind the failure, and no shard starts the next table. A
-// cancel releases shard 3 without cutting it over, and the apply settles
-// failed, naming shard 2, whose failed copy stays for a new apply to adopt.
+// After the plan is reviewed, shard 2's orders drifts, so shard 2 refuses the
+// reviewed DDL and fails as soon as it is dispatched, under the default
+// on_failure: halt. Shard 1 cuts over as soon as its own copy is ready. Shard
+// 3 holds a larger table, so its copy is still running when shard 2 fails; it
+// finishes and holds at the cutover barrier rather than cutting over behind
+// the failure, and no shard starts the next table. A cancel releases shard 3
+// without cutting it over, and the apply settles failed, naming shard 2.
 func TestK8sMultiTarget_FailedTargetHaltsRollout(t *testing.T) {
 	ep := testutil.Endpoint(t)
 	dsns := shardDSNs(t, mtShardApp)
 	resetSchema(t, dsns)
 	cleanupRolloutState(t)
 	execOn(t, dsns, mtOrdersV1, mtUsersV1)
-	execOn(t, dsns[1:2], "INSERT INTO orders (user_id, amount, note) VALUES (1, 1, 'dup'), (2, 2, 'dup')")
 	seedOrders(t, dsns[2:], 3*mtCopyRows)
 
 	plan := planRollout(t, ep, mtShardApp, shardFiles(mtShardApp, map[string]string{"orders": mtOrdersUq, "users": mtUsersV2}))
+	execOn(t, dsns[1:2], "ALTER TABLE orders ADD COLUMN extra int DEFAULT NULL")
 	applyID := applyRollout(t, ep, plan.PlanID, nil)
 
 	var held *apitypes.ProgressResponse
@@ -530,8 +530,8 @@ func TestK8sMultiTarget_FailedTargetHaltsRollout(t *testing.T) {
 		assert.False(t, testutil.ColumnExists(t, dsn, "users", "email"), "users is held after the failed table on %s", mtTargets[i])
 	}
 	// Shard 1 cut over and the cancel released shard 3's copy, asynchronously.
-	// Shard 2's failed copy stays on the target for a new apply to adopt.
-	released := []int{0, 2}
+	// Shard 2 refused the reviewed DDL before it copied anything.
+	released := []int{0, 1, 2}
 	testutil.Poll(t, testutil.PollDeadline, time.Second,
 		func() bool {
 			for _, i := range released {
@@ -546,10 +546,10 @@ func TestK8sMultiTarget_FailedTargetHaltsRollout(t *testing.T) {
 			for _, i := range released {
 				b.WriteString(mtTargets[i] + ": " + strings.Join(shadowTables(t, dsns[i], "orders"), ",") + "\n")
 			}
-			return "shadow tables left on a shard that cut over or was cancelled:\n" + b.String()
+			return "shadow tables left on a shard that cut over, refused, or was cancelled:\n" + b.String()
 		},
 	)
-	assert.NotEmpty(t, shadowTables(t, dsns[1], "orders"), "the failed copy stays on %s for a new apply to adopt", mtTargets[1])
+	assert.False(t, indexOn(t, dsns[1], "orders", "uq_note"), "shard 2 refused the reviewed DDL")
 }
 
 // operationStateOn returns the state of the operation in ops on target, or ""
