@@ -842,13 +842,17 @@ func (h *Handler) postFailingAggregates(ctx context.Context, client *ghclient.In
 
 // postFailingAggregatesWithBlock stores a blocking reason only for callers with
 // a stable failure class. Generic plan errors should use postFailingAggregates.
-func (h *Handler) postFailingAggregatesWithBlock(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA string, errors map[string]string, block checkBlockReason) {
+//
+// It reports whether every failing aggregate it set out to post was published
+// and stored. A caller about to fold the aggregate from stored check state
+// reads false as "the fold may not see this failure" and must not fold.
+func (h *Handler) postFailingAggregatesWithBlock(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA string, errors map[string]string, block checkBlockReason) bool {
 	if !h.shouldPublishChecks(ctx, repo, "aggregate_check_sync") {
-		return
+		return false
 	}
 
 	if !h.verifyHeadSHAStillCurrentForPR(ctx, client, repo, pr, headSHA, "aggregate_check_sync") {
-		return
+		return false
 	}
 
 	config := h.service.Config()
@@ -883,9 +887,10 @@ func (h *Handler) postFailingAggregatesWithBlock(ctx context.Context, client *gh
 			Status:     "noop",
 		})
 		h.logger.Debug("no failing aggregate checks to post", "repo", repo, "pr", pr)
-		return
+		return true
 	}
 
+	stored := true
 	for _, ec := range checks {
 		// Build summary from the error for this environment
 		summary := planFailedCheckText
@@ -915,6 +920,7 @@ func (h *Handler) postFailingAggregatesWithBlock(ctx context.Context, client *gh
 				h.logger.Error("failed to look up stored aggregate state before failing aggregate; not publishing so any stored block stays authoritative",
 					"repo", repo, "pr", pr, "check_name", ec.name,
 					"environment", ec.environment, "head_sha", headSHA, "error", err)
+				stored = false
 				continue
 			}
 			if existing != nil && existing.BlockingReason != "" {
@@ -950,6 +956,7 @@ func (h *Handler) postFailingAggregatesWithBlock(ctx context.Context, client *gh
 				Status:      "error",
 			})
 			h.logger.Error("failed to create failing aggregate", "repo", repo, "pr", pr, "error", err)
+			stored = false
 			continue
 		}
 
@@ -975,6 +982,7 @@ func (h *Handler) postFailingAggregatesWithBlock(ctx context.Context, client *gh
 				Status:      "error",
 			})
 			h.logger.Error("failed to store failing aggregate check", "error", err)
+			stored = false
 			continue
 		}
 
@@ -987,6 +995,7 @@ func (h *Handler) postFailingAggregatesWithBlock(ctx context.Context, client *gh
 		h.logger.Info("posted failing aggregate",
 			"repo", repo, "pr", pr, "check_name", ec.name, "env", ec.environment)
 	}
+	return stored
 }
 
 // planFailedCheckText is the fixed title and fallback summary a failing plan
