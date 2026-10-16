@@ -78,18 +78,22 @@ func deleteBranch(ctx context.Context, client psclient.PSClient, org, database, 
 var _ engine.CancelledResumeStateReclaimer = (*Engine)(nil)
 
 // ReclaimCancelledResumeState deletes the branch the stored resume state names
-// when no deploy request exists to own its teardown and SchemaBot created it.
-// It serves the cancel that lands between drives: the drive that persisted the
-// branch has exited, and the drive consuming the cancel stands down before it
-// resumes, so no drive's own cleanup ever sees the branch.
+// when no deploy request will tear it down and SchemaBot created it. It serves
+// the cancel that lands between drives: the drive that persisted the branch has
+// exited, and the drive consuming the cancel stands down before it resumes, so
+// no drive's own cleanup ever sees the branch.
 //
-// A state naming a deploy request is left alone: the deploy request tears the
-// branch down (auto_delete_branch), and the engine's Cancel has already
-// addressed the deploy request itself. An operator-supplied branch is left to
-// the operator. Each kept branch is logged with the reason on the schema
-// change's logger, so a branch left behind is explained rather than silent. A
-// branch PlanetScale no longer has is reported as already gone, not as a
-// failure, without naming a cause the engine cannot know (see deleteBranch).
+// An operator-supplied branch is left to the operator. A deploy request tears
+// its branch down (auto_delete_branch) only when its deploy finishes, so a
+// state naming a deploy request is left to it unless the deploy request was
+// closed before it deployed — the engine's Cancel closes a deferred deploy
+// request that way — in which case nothing else removes the branch and it is
+// deleted here. A deploy request that cannot be read is left to own the
+// branch, since only a read proves it will never deploy. Each kept branch is
+// logged with the reason on the schema change's logger, so a branch left
+// behind is explained rather than silent. A branch PlanetScale no longer has is
+// reported as already gone, not as a failure, without naming a cause the
+// engine cannot know (see deleteBranch).
 func (e *Engine) ReclaimCancelledResumeState(ctx context.Context, req *engine.ReclaimResumeStateRequest) (*engine.ReclaimResumeStateResult, error) {
 	logger := e.logger
 	if req.Logger != nil {
@@ -112,23 +116,45 @@ func (e *Engine) ReclaimCancelledResumeState(ctx context.Context, req *engine.Re
 		logger.Debug("cancelled apply's stored state names no branch, so there is nothing to reclaim",
 			"organization", org, "planetscale_database", req.Database)
 		return result, nil
-	case meta.DeployRequestID != 0:
-		logger.Info("cancelled apply's branch is owned by its deploy request, which tears the branch down",
-			"organization", org, "planetscale_database", req.Database, "branch", meta.BranchName, "deploy_request", meta.DeployRequestID)
-		return result, nil
 	case !deployRequestDeletesBranch(req.Options):
 		logger.Info("cancelled apply ran on an operator-supplied branch; keeping it for the operator",
-			"organization", org, "planetscale_database", req.Database, "branch", meta.BranchName)
+			"organization", org, "planetscale_database", req.Database, "branch", meta.BranchName, "deploy_request", meta.DeployRequestID)
 		result.Kept = []string{branch}
 		result.KeptReason = "the operator supplied it and it is theirs to keep"
 		return result, nil
 	}
 
 	client, err := e.getClient(req.Credentials)
+	if err != nil && meta.DeployRequestID != 0 {
+		logger.Warn("could not reach PlanetScale to read the cancelled apply's deploy request; leaving the branch to the deploy request",
+			"organization", org, "planetscale_database", req.Database, "branch", meta.BranchName, "deploy_request", meta.DeployRequestID, "error", err)
+		return result, nil
+	}
 	if err != nil {
 		result.Kept = []string{branch}
 		result.KeptReason = "the PlanetScale API could not be reached; delete it by hand to reclaim branch quota"
 		return result, fmt.Errorf("reclaim branch %s of the cancelled apply on %s: %w", meta.BranchName, req.Database, err)
+	}
+	if meta.DeployRequestID != 0 {
+		dr, err := client.GetDeployRequest(ctx, &ps.GetDeployRequestRequest{
+			Organization: org,
+			Database:     req.Database,
+			Number:       meta.DeployRequestID,
+		})
+		if err != nil {
+			logger.Warn("could not read the cancelled apply's deploy request; leaving the branch to the deploy request",
+				"organization", org, "planetscale_database", req.Database, "branch", meta.BranchName, "deploy_request", meta.DeployRequestID, "error", err)
+			return result, nil
+		}
+		if !deployRequestClosedUndeployed(dr) {
+			logger.Info("cancelled apply's branch is owned by its deploy request, which tears the branch down when its deploy finishes",
+				"organization", org, "planetscale_database", req.Database, "branch", meta.BranchName, "deploy_request", meta.DeployRequestID,
+				"deploy_request_state", dr.State, "deployment_state", dr.DeploymentState)
+			return result, nil
+		}
+		logger.Info("cancelled apply's deploy request was closed before it deployed, so it will not tear the branch down; deleting the branch",
+			"organization", org, "planetscale_database", req.Database, "branch", meta.BranchName, "deploy_request", meta.DeployRequestID,
+			"deployment_state", dr.DeploymentState)
 	}
 	alreadyGone, err := deleteBranch(ctx, client, org, req.Database, meta.BranchName)
 	if err != nil {
@@ -141,8 +167,8 @@ func (e *Engine) ReclaimCancelledResumeState(ctx context.Context, req *engine.Re
 			"organization", org, "planetscale_database", req.Database, "branch", meta.BranchName)
 		return result, nil
 	}
-	logger.Info("deleted the branch of a cancelled apply that never reached its deploy request",
-		"organization", org, "planetscale_database", req.Database, "branch", meta.BranchName)
+	logger.Info("deleted the branch of a cancelled apply that no deploy request tears down",
+		"organization", org, "planetscale_database", req.Database, "branch", meta.BranchName, "deploy_request", meta.DeployRequestID)
 	result.Reclaimed = []string{branch}
 	return result, nil
 }

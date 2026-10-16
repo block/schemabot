@@ -591,6 +591,103 @@ func TestResumeApply_FailureAfterTheDeployRequestLeavesTheBranchToIt(t *testing.
 	assert.Empty(t, client.deleteAttempts())
 }
 
+// deployRequestReclaimClient serves the cancelled apply's stored deploy request
+// as dr, or fails the read with getErr, and records each read.
+type deployRequestReclaimClient struct {
+	resumeReclaimClient
+	dr     *ps.DeployRequest
+	getErr error
+	reads  []uint64
+}
+
+func (c *deployRequestReclaimClient) GetDeployRequest(_ context.Context, req *ps.GetDeployRequestRequest) (*ps.DeployRequest, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.reads = append(c.reads, req.Number)
+	if c.getErr != nil {
+		return nil, c.getErr
+	}
+	return c.dr, nil
+}
+
+// A cancel of a deferred deploy closes its deploy request before the deploy
+// starts, and a deploy request tears its branch down only when its deploy
+// finishes, so a branch SchemaBot created for a deploy request closed that way
+// has nothing else to remove it. The reclaim reads the stored deploy request
+// and deletes the branch only when the read proves the deploy request closed
+// without deploying. A deploy request that is still open, or that closed by
+// deploying, owns the branch; a deploy request that cannot be read is left to
+// own it; and an operator-supplied branch is kept for the operator without
+// reading the deploy request at all.
+func TestReclaimCancelledResumeState_DeployRequest(t *testing.T) {
+	const ownedBranch = "schemabot-commerce-1a2b"
+	deployedAt := time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name          string
+		meta          *psMetadata
+		options       map[string]string
+		dr            *ps.DeployRequest
+		getErr        error
+		wantReads     []uint64
+		wantAttempts  []string
+		wantReclaimed []string
+		wantKept      []string
+	}{
+		{
+			name:      "a branch whose deploy request closed before it deployed is deleted",
+			meta:      &psMetadata{BranchName: ownedBranch, DeployRequestID: 42},
+			dr:        &ps.DeployRequest{Number: 42, State: deployRequestClosed, DeploymentState: "ready"},
+			wantReads: []uint64{42}, wantAttempts: []string{ownedBranch}, wantReclaimed: []string{"branch " + ownedBranch},
+		},
+		{
+			name:      "a branch whose deploy request closed by deploying is left to the deploy request",
+			meta:      &psMetadata{BranchName: ownedBranch, DeployRequestID: 42},
+			dr:        &ps.DeployRequest{Number: 42, State: deployRequestClosed, DeploymentState: "complete", DeployedAt: &deployedAt},
+			wantReads: []uint64{42},
+		},
+		{
+			name:      "a branch whose deploy request is still open is left to the deploy request",
+			meta:      &psMetadata{BranchName: ownedBranch, DeployRequestID: 42},
+			dr:        &ps.DeployRequest{Number: 42, State: "open", DeploymentState: "ready"},
+			wantReads: []uint64{42},
+		},
+		{
+			name:      "a branch whose deploy request cannot be read is left to the deploy request",
+			meta:      &psMetadata{BranchName: ownedBranch, DeployRequestID: 42},
+			getErr:    errors.New("planetscale unavailable"),
+			wantReads: []uint64{42},
+		},
+		{
+			name: "an operator-supplied branch with a deploy request is kept for the operator",
+			meta: &psMetadata{BranchName: "my-dev-branch", DeployRequestID: 42}, options: map[string]string{"branch": "my-dev-branch"},
+			dr:       &ps.DeployRequest{Number: 42, State: deployRequestClosed, DeploymentState: "ready"},
+			wantKept: []string{"branch my-dev-branch"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client := &deployRequestReclaimClient{dr: tt.dr, getErr: tt.getErr}
+			encoded, err := encodePSMetadata(tt.meta)
+			require.NoError(t, err)
+
+			result, err := conformanceEngine(client).ReclaimCancelledResumeState(t.Context(), &engine.ReclaimResumeStateRequest{
+				Database:    "commerce",
+				Credentials: conformanceCredentials(),
+				Options:     tt.options,
+				ResumeState: &engine.ResumeState{Metadata: encoded},
+			})
+
+			require.NoError(t, err, "a reclaim that leaves the branch to its deploy request is not a failure")
+			require.NotNil(t, result)
+			assert.Equal(t, tt.wantReads, client.reads)
+			assert.Equal(t, tt.wantAttempts, client.deleteAttempts(), "a kept branch is never sent a delete")
+			assert.Equal(t, tt.wantReclaimed, result.Reclaimed)
+			assert.Equal(t, tt.wantKept, result.Kept)
+			assert.Equal(t, len(tt.wantKept) > 0, result.KeptReason != "", "a kept branch carries its reason")
+		})
+	}
+}
+
 // A cancel that lands between drives finds the branch only in the apply's
 // stored resume state: the drive that created it has exited, and the drive
 // consuming the cancel stands down before it resumes. The reclaim deletes a
@@ -613,9 +710,6 @@ func TestReclaimCancelledResumeState(t *testing.T) {
 		{
 			name: "a branch with no deploy request is deleted", meta: &psMetadata{BranchName: ownedBranch},
 			wantAttempts: []string{ownedBranch}, wantReclaimed: []string{"branch " + ownedBranch},
-		},
-		{
-			name: "a branch its deploy request owns is left to the deploy request", meta: &psMetadata{BranchName: ownedBranch, DeployRequestID: 42},
 		},
 		{
 			name: "an operator-supplied branch is kept for the operator", meta: &psMetadata{BranchName: "my-dev-branch"}, options: map[string]string{"branch": "my-dev-branch"},
