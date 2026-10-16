@@ -255,8 +255,10 @@ that returned an error, the resume's refusal to record a failure over an outcome
 `postTerminalReconcileError` that `handleGroupedResumeFailure` passes through,
 `pkg/tern/local_control_resume.go`), the remote progress error limit (`pkg/tern/grpc_client.go`)
 and the PlanetScale engine's re-read of a deploy request whose deploy call failed, which tracks a
-deploy that started instead of failing it (`adoptDeployAfterError`,
-`pkg/engine/planetscale/branch.go`).
+deploy that started instead of failing it and reports an unknown outcome when the re-read fails
+(`adoptDeployAfterError`, `pkg/engine/planetscale/branch.go`), with the drive pausing an unknown
+outcome for recovery on every engine (`engine.OutcomeUnknownError`, `shouldRetryEngineError` in
+`pkg/tern/local_apply_sequential.go`).
 
 ### AV-5: Panics are contained and permanent
 

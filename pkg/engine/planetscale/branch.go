@@ -1024,8 +1024,10 @@ func (e *Engine) deployDeployRequest(ctx context.Context, client psclient.PSClie
 // running remotely; failing the apply then would leave it running with nothing
 // tracking it. The deploy request is re-read, and when it reports that its
 // deploy began it is returned as accepted so the drive tracks it. Otherwise
-// deployErr is returned. A failed re-read returns deployErr with the re-read
-// error attached, because nothing proves the deploy did not start.
+// deployErr is returned. A re-read that fails or returns nothing leaves the
+// outcome unknown, because nothing proves the deploy did not start: the error
+// carries engine.OutcomeUnknownError so the drive pauses the apply and recovery
+// re-reads this same deploy request instead of failing it or deploying another.
 func (e *Engine) adoptDeployAfterError(ctx context.Context, client psclient.PSClient, org, database string, number uint64, deployErr error) (*ps.DeployRequest, error) {
 	dr, getErr := client.GetDeployRequest(ctx, &ps.GetDeployRequestRequest{
 		Organization: org,
@@ -1033,14 +1035,14 @@ func (e *Engine) adoptDeployAfterError(ctx context.Context, client psclient.PSCl
 		Number:       number,
 	})
 	if getErr != nil {
-		e.logger.Warn("deploy call failed and re-reading the deploy request to check whether the deploy started also failed; failing the deploy",
+		e.logger.Warn("deploy call failed and re-reading the deploy request to check whether the deploy started also failed; reporting the deploy outcome as unknown so recovery re-reads this deploy request",
 			"database", database, "deploy_request", number, "deploy_error", deployErr, "error", getErr)
-		return nil, fmt.Errorf("%w (re-reading deploy request #%d to check whether the deploy started also failed: %w)", deployErr, number, getErr)
+		return nil, engine.NewOutcomeUnknownError("%w (re-reading deploy request #%d to check whether the deploy started also failed: %w)", deployErr, number, getErr)
 	}
 	if dr == nil {
-		e.logger.Warn("deploy call failed and re-reading the deploy request returned nothing; failing the deploy",
+		e.logger.Warn("deploy call failed and re-reading the deploy request returned nothing; reporting the deploy outcome as unknown so recovery re-reads this deploy request",
 			"database", database, "deploy_request", number, "deploy_error", deployErr)
-		return nil, fmt.Errorf("%w (re-reading deploy request #%d to check whether the deploy started returned no deploy request)", deployErr, number)
+		return nil, engine.NewOutcomeUnknownError("%w (re-reading deploy request #%d to check whether the deploy started returned no deploy request)", deployErr, number)
 	}
 	if !deployRequestReportsDeploy(dr) {
 		e.logger.Info("deploy call failed and the deploy request reports no deploy; failing the deploy",

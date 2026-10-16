@@ -14,10 +14,13 @@ import (
 // whose engine resumes a re-claimed attempt from a durable checkpoint — MySQL
 // and Strata both drive Spirit, so recovery continues the same in-flight work.
 // Other types classify engine errors as permanent, and a typed permanent error
-// is never paused for retry regardless of type.
+// is never paused for retry regardless of type. An unknown outcome pauses on
+// every type, because the work may be running and recovery re-observes it.
 func TestShouldRetryEngineErrorByDatabaseType(t *testing.T) {
 	transient := fmt.Errorf("engine lost its connection to the target")
 	permanent := engine.NewPermanentError("plan references a dropped table")
+	unknown := engine.NewOutcomeUnknownError("deploy outcome unknown: %w", transient)
+	unrecordedUnknown := engine.NewPermanentError("deploy not named in resume state: %w", unknown)
 
 	cases := []struct {
 		name         string
@@ -31,6 +34,10 @@ func TestShouldRetryEngineErrorByDatabaseType(t *testing.T) {
 		{"postgres transient fails permanently", storage.DatabaseTypePostgres, transient, false},
 		{"mysql permanent error fails permanently", storage.DatabaseTypeMySQL, permanent, false},
 		{"strata permanent error fails permanently", storage.DatabaseTypeStrata, permanent, false},
+		{"vitess unknown outcome pauses for retry", storage.DatabaseTypeVitess, unknown, true},
+		{"postgres unknown outcome pauses for retry", storage.DatabaseTypePostgres, unknown, true},
+		{"mysql unknown outcome pauses for retry", storage.DatabaseTypeMySQL, unknown, true},
+		{"vitess permanent unknown outcome fails permanently", storage.DatabaseTypeVitess, unrecordedUnknown, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
