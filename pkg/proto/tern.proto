@@ -71,6 +71,24 @@ service Tern {
     };
   }
 
+  // CompareSchemaFileChange reports whether a pull request's edit to one
+  // schema file generates the same schema change on two different bases. The
+  // review gate asks it when a rebase combined the pull request's edit with a
+  // default branch edit to the same file, for a database type whose schema
+  // files can only be understood by running them, so an approval given before
+  // the rebase can keep counting.
+  //
+  // It is read-only: each version of the file is run inside a transaction
+  // that is always rolled back, so nothing persists on the target. An engine
+  // that cannot compare files returns UNIMPLEMENTED, and the caller treats the
+  // file as changed.
+  rpc CompareSchemaFileChange(CompareSchemaFileChangeRequest) returns (CompareSchemaFileChangeResponse) {
+    option (google.api.http) = {
+      post: "/v1/compare-schema-file-change"
+      body: "*"
+    };
+  }
+
   // Apply executes a previously generated plan. Returns immediately with an
   // apply_id; execution happens asynchronously. Use Progress to track status.
   //
@@ -321,6 +339,36 @@ enum ChangeType {
 message SchemaFiles {
   // Filename → content mapping (e.g., "users.sql" → CREATE TABLE, "vschema.json" → VSchema JSON).
   map<string, string> files = 1;
+}
+
+// CompareSchemaFileChangeRequest carries one schema file at the four commits
+// the review gate compares.
+message CompareSchemaFileChangeRequest {
+  // Database name from server-side config.
+  string database = 1;
+  // Database type, e.g. "postgres".
+  string type = 2;
+  // Environment whose target runs the comparison.
+  string environment = 3;
+  // Opaque identifier for endpoint discovery. Defaults to database if empty.
+  string target = 4;
+  // The file at the approved commit's merge base.
+  string approved_base = 5;
+  // The file at the approved commit.
+  string approved = 6;
+  // The file at the head's merge base.
+  string head_base = 7;
+  // The file at the head.
+  string head = 8;
+}
+
+// CompareSchemaFileChangeResponse is the comparison's verdict.
+message CompareSchemaFileChangeResponse {
+  // True when the head generates exactly the schema change the approved
+  // commit did.
+  bool same = 1;
+  // Why the change is not the same, for operator logs. Empty when same.
+  string reason = 2;
 }
 
 // PullSchemaRequest requests a live schema export for a database route.
