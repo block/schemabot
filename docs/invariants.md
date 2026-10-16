@@ -1652,7 +1652,11 @@ is passed (`blockRollbackUnsafeWithoutOptIn` and `rollbackPlanUnsafeChanges` in
 `pkg/webhook/rollback.go`). The rollback pin lasts only as long as the plan comment that names
 those changes: when that comment cannot be posted, `rollback` withdraws its pin before returning
 (`withdrawUndisclosedRollbackPin` in `pkg/webhook/rollback.go`, over the conditional
-`LockStore.ClearPendingPlanID`).
+`LockStore.ClearPendingPlanID`). On the data plane, apply admission requires the opt-in for the
+applying deployment's own re-planned unsafe verdicts, stamped onto the materialized plan and the
+dispatch scope, with a shard dispatch this deployment never re-planned treated as unsafe
+(`pkg/tern/local_plan_drift.go`, gated by `rejectUnsafeDDLChangesWithoutOptIn` in
+`pkg/tern/local_client.go`).
 
 ### RV-4: Engine refusals are known at plan time and gate the apply
 
