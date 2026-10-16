@@ -1356,6 +1356,39 @@ func TestResumeApplyWithTasks_FailedTaskWhoseStatementLandedKeepsItsVerdict(t *t
 	assert.Equal(t, state.Apply.Failed, observer.terminal[0].State)
 }
 
+// A drive lost its connection to the target mid-copy on `users` and exited
+// before it saved the failure, so a later conflict check settled the task
+// failed_retryable from the engine's report while the apply stayed running
+// under a stale lease. When recovery reclaims that running apply, the task is
+// requeued like any retried task: the re-run is counted as an attempt, and the
+// earlier failure's reason does not survive onto the completed row.
+func TestResumeApplyWithTasks_RequeuesARetryableTaskUnderARunningApply(t *testing.T) {
+	taskStore := &exactProgressTaskStore{}
+	c, eng, apply, applies, tasks := newLandedSiblingResume(t, taskStore, &mockApplyLogStore{})
+	plan := &storage.Plan{ID: 5}
+	apply.PlanID = plan.ID
+	applies.stored = *apply
+	c.storage.(*exactProgressStorage).plans = &fakePlanStore{getByIDFn: func(int64) (*storage.Plan, error) { return plan, nil }}
+	landed, retried := tasks[0], tasks[1]
+	now := time.Now()
+	landed.State = state.Task.Completed
+	landed.CompletedAt = &now
+	retried.State = state.Task.FailedRetryable
+	retried.ErrorMessage = "lost connection to the target during the copy"
+	taskStore.tasks = tasks
+
+	require.NoError(t, c.resumeApplyWithTasks(t.Context(), apply, nil, tasks, nil, false, false))
+
+	assert.Equal(t, []string{"ALTER TABLE `users` ADD COLUMN `name` varchar(255)"}, eng.applied, "only the retried task runs")
+	assert.Equal(t, state.Task.Completed, retried.State)
+	assert.Equal(t, 1, retried.Attempt, "the retry is counted as an attempt")
+	assert.Empty(t, retried.ErrorMessage, "a completed task carries no failure reason")
+	assert.Equal(t, 0, landed.Attempt, "a completed task is not requeued")
+	stored, err := applies.Get(t.Context(), apply.ID)
+	require.NoError(t, err)
+	assert.Equal(t, state.Apply.Completed, stored.State)
+}
+
 // The same re-claim, but the failed task's table has left the re-plan diff
 // entirely: live already matches the reviewed target for it, so the re-plan
 // would otherwise read the table as done. The stored failure still decides the

@@ -610,8 +610,9 @@ func (c *LocalClient) pendingDriverRequest(ctx context.Context, apply *storage.A
 // tryResolveStaleTask checks the engine to see if a non-terminal task is actually done.
 // If the engine reports a terminal state, or reports no active work for a task that
 // storage believes is in-flight, the task is updated in storage and no longer blocks;
-// a terminal failure the engine marks retryable is stored as FailedRetryable instead,
-// which keeps blocking like any resting task. Resting tasks (Stopped, FailedRetryable)
+// a terminal report that maps to a resting state (a retryable failure, or a stop) is
+// stored in that state instead, which keeps blocking like any resting task under a
+// claimable apply. Resting tasks (Stopped, FailedRetryable)
 // are left untouched.
 //
 // The engine probe answers from this process's own memory of the work: it
@@ -712,12 +713,15 @@ func (c *LocalClient) tryResolveStaleTask(ctx context.Context, t *storage.Task, 
 		// operation after the lease was read refuses it the same way.
 		//
 		// The report is settled the way the drive would have settled it: a
-		// failure the engine marks retryable rests as failed_retryable with no
-		// completion stamp, so the retry policy still owns it, and every failure
-		// keeps the engine's reason.
+		// failure the engine marks retryable rests as failed_retryable and a
+		// stopped report rests as stopped, neither with a completion stamp, so
+		// a later drive of the apply picks the task up again. A failure keeps
+		// the engine's reason unless the task already carries one, which the
+		// drive that owned the task wrote and outranks this process's memory.
 		previous := *t
 		settledState := taskStateFromProgressResult(result)
-		if state.IsTerminalTaskState(settledState) {
+		rests := staleTaskSettlementRests(settledState)
+		if !rests {
 			now := time.Now()
 			t.CompletedAt = &now
 		}
@@ -729,11 +733,9 @@ func (c *LocalClient) tryResolveStaleTask(ctx context.Context, t *storage.Task, 
 			c.logStaleTaskSettlementRefused(t, apply, settledState, err)
 			return false
 		}
-		// A retryable failure rests rather than ends: like any failed_retryable
-		// task, it keeps holding the database until its retry settles it.
-		if !state.IsTerminalTaskState(settledState) {
-			c.logger.Info("conflict check: settled a stale task as a retryable failure; it keeps blocking the database until its retry settles it",
-				append(t.LogAttrs(), "apply_id", apply.ApplyIdentifier, "error_message", t.ErrorMessage)...)
+		if rests {
+			c.logger.Info("conflict check: settled a stale task into a resting state; it keeps blocking the database while its apply is still claimable",
+				append(t.LogAttrs(), "apply_id", apply.ApplyIdentifier, "settled_state", settledState, "error_message", t.ErrorMessage)...)
 			return false
 		}
 		return true
@@ -775,6 +777,19 @@ func (c *LocalClient) tryResolveStaleTask(ctx context.Context, t *storage.Task, 
 	}
 
 	return false
+}
+
+// staleTaskSettlementRests reports whether a stale task settled from an engine
+// terminal report rests rather than ends. Every engine terminal report maps to
+// a terminal task state except a retryable failure (failed_retryable) and a
+// stopped report (stopped). Both rest under an apply that is still claimable,
+// so a later drive of the apply picks the task up again, and the task keeps the
+// hold every later conflict check gives it: a failed_retryable task always
+// blocks, and a stopped one blocks until its apply is terminal. Any other
+// non-terminal state rests too, so a report that maps to a state this
+// predicate does not name keeps blocking rather than admitting a new apply.
+func staleTaskSettlementRests(settledState string) bool {
+	return !state.IsTerminalTaskState(settledState)
 }
 
 // logStaleTaskSettlementRefused records why tryResolveStaleTask left a task
