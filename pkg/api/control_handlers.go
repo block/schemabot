@@ -2168,6 +2168,12 @@ func (s *Service) executeRevertForApply(ctx context.Context, client tern.Client,
 	}
 	s.logControlOperationForApply(ctx, apply, caller, storage.LogEventRevertTriggered, "Revert triggered by user")
 
+	if s.immediateControlSkippedForMultiOperationApply(ctx, apply, "revert", caller) {
+		metrics.RecordControlOperation(ctx, "revert", apply.Database, apply.Deployment, apply.Environment, "success")
+		s.wakeOperator(apply.ApplyIdentifier, apply.Database, apply.Environment)
+		return &apitypes.ControlResponse{Accepted: true}, http.StatusAccepted, nil
+	}
+
 	// Attempt the revert immediately. If it fails or this process dies, the
 	// durable request remains pending for the apply owner to retry.
 	resp, err := client.Revert(ctx, &ternv1.RevertRequest{
@@ -2200,6 +2206,28 @@ func (s *Service) executeRevertForApply(ctx context.Context, client tern.Client,
 	s.wakeOperator(apply.ApplyIdentifier, apply.Database, apply.Environment)
 
 	return &apitypes.ControlResponse{Accepted: resp.Accepted, ErrorMessage: apply.OperatorFacingMessage(resp.ErrorMessage)}, http.StatusOK, nil
+}
+
+// immediateControlSkippedForMultiOperationApply reports whether the immediate
+// engine attempt of a revert-window control must be skipped because the apply
+// spans several operations. Each operation drives against its own deployment
+// with its own remote apply, so an immediate call keyed on one apply id would
+// act on a single operation and leave its siblings behind; the operator fans the
+// durable request out to every operation instead. When the operation count
+// cannot be determined the immediate attempt proceeds, and the durable request
+// still covers a failure.
+func (s *Service) immediateControlSkippedForMultiOperationApply(ctx context.Context, apply *storage.Apply, operation, caller string) bool {
+	multiOp, err := s.applyHasMultipleOperations(ctx, apply)
+	if err != nil {
+		s.logger.Warn("could not determine apply operation count; attempting single-deployment immediate "+operation,
+			append(apply.LogAttrs(), "requested_by", caller, "error", err)...)
+		return false
+	}
+	if multiOp {
+		s.logger.Info("immediate "+operation+" skipped for multi-operation apply; operator will fan out the durable request per operation",
+			append(apply.LogAttrs(), "requested_by", caller)...)
+	}
+	return multiOp
 }
 
 // SkipRevertRequest is the HTTP request body for POST /api/skip-revert.
@@ -2297,6 +2325,12 @@ func (s *Service) executeSkipRevertForApply(ctx context.Context, client tern.Cli
 		return &apitypes.ControlResponse{Accepted: true, Status: apitypes.ControlStatusAlreadyRequested}, http.StatusAccepted, nil
 	}
 	s.logControlOperationForApply(ctx, apply, caller, storage.LogEventSkipRevertTriggered, "Skip-revert triggered by user")
+
+	if s.immediateControlSkippedForMultiOperationApply(ctx, apply, "skip-revert", caller) {
+		metrics.RecordControlOperation(ctx, "skip_revert", apply.Database, apply.Deployment, apply.Environment, "success")
+		s.wakeOperator(apply.ApplyIdentifier, apply.Database, apply.Environment)
+		return &apitypes.ControlResponse{Accepted: true}, http.StatusAccepted, nil
+	}
 
 	// Attempt the skip immediately. If it fails or this process dies, the durable
 	// request remains pending for the apply owner to retry.

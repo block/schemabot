@@ -2321,15 +2321,14 @@ func capitalizeControlVerb(operation string) string {
 	return strings.ToUpper(operation[:1]) + operation[1:]
 }
 
-// controlSetup resolves the active task, credentials, and engine for a control operation.
-// Returns an error if no active schema change exists or no engine is configured.
-func (c *LocalClient) controlSetup(ctx context.Context) (*storage.Task, *engine.Credentials, engine.Engine, error) {
-	task, err := c.getActiveTaskForDatabase(ctx, c.config.Database)
+// controlSetup resolves the task, credentials, and engine for a revert-window
+// control operation on the apply the request names. Returns an error if the
+// apply does not exist, belongs to another environment, has no active task, or
+// no engine is configured.
+func (c *LocalClient) controlSetup(ctx context.Context, applyID, environment, operation string) (*storage.Task, *engine.Credentials, engine.Engine, error) {
+	task, err := c.activeTaskForControlApply(ctx, applyID, environment, operation)
 	if err != nil {
 		return nil, nil, nil, err
-	}
-	if task == nil {
-		return nil, nil, nil, fmt.Errorf("no active schema change")
 	}
 	eng := c.getEngine()
 	if eng == nil {
@@ -2340,6 +2339,36 @@ func (c *LocalClient) controlSetup(ctx context.Context) (*storage.Task, *engine.
 		return nil, nil, nil, err
 	}
 	return task, creds, eng, nil
+}
+
+// activeTaskForControlApply returns the first non-terminal task of the apply a
+// control request names. The apply is the unit a control acts on: the tasks of
+// one database are shared by every environment's client, so a request must
+// resolve through its apply and confirm the apply belongs to the environment
+// the request was issued for, never through the database's newest active task.
+func (c *LocalClient) activeTaskForControlApply(ctx context.Context, applyID, environment, operation string) (*storage.Task, error) {
+	if applyID == "" {
+		return nil, fmt.Errorf("%s requires an apply id", operation)
+	}
+	apply, err := c.resolveControlApply(ctx, applyID, operation)
+	if err != nil {
+		return nil, err
+	}
+	if apply.Environment != environment {
+		c.logger.Warn(operation+" rejected because the apply belongs to another environment",
+			append(apply.LogAttrs(), "requested_environment", environment)...)
+		return nil, fmt.Errorf("apply %s belongs to environment %q, not %q", apply.ApplyIdentifier, apply.Environment, environment)
+	}
+	tasks, err := c.storage.Tasks().GetByApplyID(ctx, apply.ID)
+	if err != nil {
+		return nil, fmt.Errorf("get tasks of apply %s before %s: %w", apply.ApplyIdentifier, operation, err)
+	}
+	for _, t := range tasks {
+		if !state.IsTerminalTaskState(t.State) {
+			return t, nil
+		}
+	}
+	return nil, fmt.Errorf("no active schema change for apply %s", apply.ApplyIdentifier)
 }
 
 // buildControlRequest creates a ControlRequest with persisted engine resume data.
@@ -2395,7 +2424,7 @@ func (c *LocalClient) loadStoredEngineResumeState(ctx context.Context, task *sto
 
 // Revert reverts a completed schema change during the revert window.
 func (c *LocalClient) Revert(ctx context.Context, req *ternv1.RevertRequest) (*ternv1.RevertResponse, error) {
-	task, creds, eng, err := c.controlSetup(ctx)
+	task, creds, eng, err := c.controlSetup(ctx, req.ApplyId, req.Environment, "revert")
 	if err != nil {
 		return nil, err
 	}
@@ -2418,7 +2447,7 @@ func (c *LocalClient) Revert(ctx context.Context, req *ternv1.RevertRequest) (*t
 
 // SkipRevert skips the revert window and finalizes the schema change.
 func (c *LocalClient) SkipRevert(ctx context.Context, req *ternv1.SkipRevertRequest) (*ternv1.SkipRevertResponse, error) {
-	task, creds, eng, err := c.controlSetup(ctx)
+	task, creds, eng, err := c.controlSetup(ctx, req.ApplyId, req.Environment, "skip-revert")
 	if err != nil {
 		return nil, err
 	}

@@ -3057,7 +3057,7 @@ func TestLocalClientRevertWindowDeclinesAreRefusalsNotErrors(t *testing.T) {
 			decline: engine.NewUnsupportedOperationError("revert is not supported for these schema changes"),
 			reason:  "revert is not supported",
 			call: func(c *LocalClient) (bool, string, error) {
-				resp, err := c.Revert(t.Context(), &ternv1.RevertRequest{Environment: "staging"})
+				resp, err := c.Revert(t.Context(), &ternv1.RevertRequest{ApplyId: "apply-decline", Environment: "staging"})
 				if resp == nil {
 					return false, "", err
 				}
@@ -3069,7 +3069,7 @@ func TestLocalClientRevertWindowDeclinesAreRefusalsNotErrors(t *testing.T) {
 			decline: engine.NewUnsupportedOperationError("skip-revert is not supported for these schema changes"),
 			reason:  "skip-revert is not supported",
 			call: func(c *LocalClient) (bool, string, error) {
-				resp, err := c.SkipRevert(t.Context(), &ternv1.SkipRevertRequest{Environment: "staging"})
+				resp, err := c.SkipRevert(t.Context(), &ternv1.SkipRevertRequest{ApplyId: "apply-decline", Environment: "staging"})
 				if resp == nil {
 					return false, "", err
 				}
@@ -3112,5 +3112,163 @@ func newDecliningControlLocalClient(decline error) *LocalClient {
 		},
 		spiritEngine: &fakeControlEngine{revertErr: decline, skipRevertErr: decline},
 		logger:       slog.Default(),
+	}
+}
+
+type revertScopeApplyStore struct {
+	storage.ApplyStore
+	applies []*storage.Apply
+}
+
+func (s *revertScopeApplyStore) GetByApplyIdentifier(_ context.Context, applyIdentifier string) (*storage.Apply, error) {
+	for _, apply := range s.applies {
+		if apply.ApplyIdentifier == applyIdentifier {
+			return apply, nil
+		}
+	}
+	return nil, nil
+}
+
+type revertScopeTaskStore struct {
+	storage.TaskStore
+	tasks []*storage.Task
+}
+
+func (s *revertScopeTaskStore) GetByApplyID(_ context.Context, applyID int64) ([]*storage.Task, error) {
+	var tasks []*storage.Task
+	for _, task := range s.tasks {
+		if task.ApplyID == applyID {
+			tasks = append(tasks, task)
+		}
+	}
+	return tasks, nil
+}
+
+// GetByDatabase mirrors the SQL store: every environment's tasks, newest first.
+func (s *revertScopeTaskStore) GetByDatabase(_ context.Context, _ string) ([]*storage.Task, error) {
+	return s.tasks, nil
+}
+
+type revertScopeOperationStore struct {
+	storage.ApplyOperationStore
+	resumeMetadata map[int64]string
+}
+
+func (s *revertScopeOperationStore) GetEngineResumeState(_ context.Context, operationID int64) (*storage.EngineResumeState, error) {
+	if metadata, ok := s.resumeMetadata[operationID]; ok {
+		return &storage.EngineResumeState{Metadata: metadata}, nil
+	}
+	return nil, storage.ErrEngineResumeStateNotFound
+}
+
+type revertScopeEngine struct {
+	engine.Engine
+	revertReq     *engine.ControlRequest
+	skipRevertReq *engine.ControlRequest
+}
+
+func (e *revertScopeEngine) Name() string { return "revert-scope" }
+
+func (e *revertScopeEngine) Revert(_ context.Context, req *engine.ControlRequest) (*engine.ControlResult, error) {
+	e.revertReq = req
+	return &engine.ControlResult{Accepted: true}, nil
+}
+
+func (e *revertScopeEngine) SkipRevert(_ context.Context, req *engine.ControlRequest) (*engine.ControlResult, error) {
+	e.skipRevertReq = req
+	return &engine.ControlResult{Accepted: true}, nil
+}
+
+// newRevertScopeLocalClient builds a client over one database whose staging and
+// production applies both sit in their revert window. The production apply is
+// the newer one, so a lookup that ignores the apply and the environment reaches
+// the production task first.
+func newRevertScopeLocalClient() (*LocalClient, *revertScopeEngine) {
+	stagingOp, productionOp := int64(10), int64(20)
+	stagingApply := &storage.Apply{
+		ID: 1, ApplyIdentifier: "apply-staging", Database: "testdb",
+		Environment: "staging", State: state.Apply.RevertWindow,
+	}
+	productionApply := &storage.Apply{
+		ID: 2, ApplyIdentifier: "apply-production", Database: "testdb",
+		Environment: "production", State: state.Apply.RevertWindow,
+	}
+	productionTask := &storage.Task{
+		ID: 2, ApplyID: productionApply.ID, TaskIdentifier: "task-production", ApplyOperationID: &productionOp,
+		Database: "testdb", Environment: "production", State: state.Task.RevertWindow,
+	}
+	stagingTask := &storage.Task{
+		ID: 1, ApplyID: stagingApply.ID, TaskIdentifier: "task-staging", ApplyOperationID: &stagingOp,
+		Database: "testdb", Environment: "staging", State: state.Task.RevertWindow,
+	}
+	eng := &revertScopeEngine{}
+	return &LocalClient{
+		config: LocalConfig{Database: "testdb", Type: storage.DatabaseTypeVitess},
+		storage: &controlTestStorage{
+			applies:   &revertScopeApplyStore{applies: []*storage.Apply{productionApply, stagingApply}},
+			tasks:     &revertScopeTaskStore{tasks: []*storage.Task{productionTask, stagingTask}},
+			applyLogs: &controlTestApplyLogStore{},
+			applyOperations: &revertScopeOperationStore{resumeMetadata: map[int64]string{
+				stagingOp:    "deploy-request-staging",
+				productionOp: "deploy-request-production",
+			}},
+		},
+		planetscaleEngine: eng,
+		logger:            slog.New(slog.DiscardHandler),
+	}, eng
+}
+
+// Staging and production applies of one database sit in their revert window at
+// once. Reverting or skipping the revert of the staging apply must act on the
+// staging apply's own engine resume state, never on the newer production
+// apply's, because that resume state addresses the deploy request the engine
+// then reverts or finalizes.
+func TestLocalClientRevertWindowControlsActOnTheNamedApply(t *testing.T) {
+	client, eng := newRevertScopeLocalClient()
+
+	resp, err := client.Revert(t.Context(), &ternv1.RevertRequest{ApplyId: "apply-staging", Environment: "staging"})
+	require.NoError(t, err)
+	assert.True(t, resp.Accepted)
+	require.NotNil(t, eng.revertReq)
+	require.NotNil(t, eng.revertReq.ResumeState)
+	assert.Equal(t, "deploy-request-staging", eng.revertReq.ResumeState.Metadata, "revert uses the staging apply's resume state")
+
+	resp2, err := client.SkipRevert(t.Context(), &ternv1.SkipRevertRequest{ApplyId: "apply-staging", Environment: "staging"})
+	require.NoError(t, err)
+	assert.True(t, resp2.Accepted)
+	require.NotNil(t, eng.skipRevertReq)
+	require.NotNil(t, eng.skipRevertReq.ResumeState)
+	assert.Equal(t, "deploy-request-staging", eng.skipRevertReq.ResumeState.Metadata, "skip-revert uses the staging apply's resume state")
+}
+
+// A control for an apply that does not exist, belongs to another environment, or
+// names no apply is refused before any engine call, so it can never fall through
+// to another apply's task.
+func TestLocalClientRevertWindowControlsRefuseAnApplyThatIsNotTheirs(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		applyID     string
+		environment string
+		wantError   string
+	}{
+		{name: "unknown apply", applyID: "apply-missing", environment: "staging", wantError: "apply-missing"},
+		{name: "other environment's apply", applyID: "apply-production", environment: "staging", wantError: `belongs to environment "production", not "staging"`},
+		{name: "no environment", applyID: "apply-staging", environment: "", wantError: `belongs to environment "staging", not ""`},
+		{name: "no apply", applyID: "", environment: "staging", wantError: "requires an apply id"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client, eng := newRevertScopeLocalClient()
+
+			_, err := client.Revert(t.Context(), &ternv1.RevertRequest{ApplyId: tc.applyID, Environment: tc.environment})
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tc.wantError)
+
+			_, err = client.SkipRevert(t.Context(), &ternv1.SkipRevertRequest{ApplyId: tc.applyID, Environment: tc.environment})
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tc.wantError)
+
+			assert.Nil(t, eng.revertReq, "a refused revert never reaches the engine")
+			assert.Nil(t, eng.skipRevertReq, "a refused skip-revert never reaches the engine")
+		})
 	}
 }
