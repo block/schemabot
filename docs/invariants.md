@@ -1239,7 +1239,9 @@ skip-revert in flight — stop, cancel, and cutover are refused for the whole ph
 keeps driving the phase to its own outcome rather than settling on the refused command, because
 storage must never settle on a state that contradicts what the engine is still doing to the
 database underneath. *Enforced:* the revert-phase gate on the control path
-(`pkg/tern/local_control.go`), and the drive loops that act on its answer
+(`pkg/tern/local_control.go`), the resolution of a revert or skip-revert through the apply the
+request names and that apply's own live task (`activeTaskForControlApply`,
+`pkg/tern/local_control.go`), and the drive loops that act on its answer
 (`pkg/tern/local_apply_grouped.go`, `pkg/tern/local_apply_sequential.go`,
 `pkg/tern/local_control_resume.go`, `pkg/tern/grpc_client.go`).
 
@@ -1264,7 +1266,9 @@ Data-plane RPCs identify work by the operation's `external_id`, while every user
 to a data plane is a routing bug, and the internal numeric row ID appears on no surface at all.
 *Enforced:* the remote apply ID invariant
 ([grpc-control-edge-cases.md](grpc-control-edge-cases.md)); ID resolution at the API boundary
-(`pkg/api/control_handlers.go`).
+(`pkg/api/control_handlers.go`); and the local client's resolution of a control request's apply
+identifier within its own database and environment scope (`resolveControlApply` and
+`activeTaskForControlApply`, `pkg/tern/local_control.go`).
 
 ### CO-8: A stop that cannot pause is refused, never quietly made permanent
 
