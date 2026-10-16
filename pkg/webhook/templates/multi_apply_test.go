@@ -875,6 +875,43 @@ func TestRenderMultiDeploymentApplyComment_RolledUpTableSizeTotalsTheTargets(t *
 	assert.Contains(t, out, "- Rows: 750 / 2,000 across 2 of 3 targets · ~5.0 GB across all 3 targets · ETA: "+ui.FormatETA(500)+"\n")
 }
 
+// A target that has not reported its copy yet counts toward the table's rows
+// by the plan's estimate, so the total spans every target from the start and
+// the bar does not read the targets already copying as most of the work. The
+// estimate makes the total approximate, and the ETA a floor, since the queued
+// target's copy is still ahead. Before any target starts, the table shows the
+// estimate summed across them.
+func TestRenderMultiDeploymentApplyComment_QueuedTargetsCountByPlannedRows(t *testing.T) {
+	queued := func(database string, rows int64) *ApplyStatusCommentData {
+		detail := targetDetail(database, state.Task.Pending, addNote, 0)
+		detail.State = state.Apply.Pending
+		detail.Tables[0].RowsTotal, detail.Tables[0].ETASeconds = 0, 0
+		detail.Tables[0].EstimatedRows = &rows
+		return detail
+	}
+	ops := []presentation.Operation{
+		{Deployment: "primary", Target: "testapp-001", State: so.Running},
+		{Deployment: "primary", Target: "testapp-002", State: so.Pending},
+		{Deployment: "primary", Target: "testapp-003", State: so.Pending},
+	}
+
+	out := renderTargets(presentation.Derive(ops),
+		targetDetail("testapp_001", state.Task.Running, addNote, 500),
+		queued("testapp_002", 1_200),
+		queued("testapp_003", 1_800),
+	)
+	assert.Contains(t, out, "**`orders`**: "+ui.ProgressBarRowCopy(12)+" 12%\n")
+	assert.Contains(t, out, "- Rows: 500 / ~4k · ETA: ≥ "+ui.FormatETA(500)+"\n")
+
+	ops[0].State = so.Pending
+	out = renderTargets(presentation.Derive(ops),
+		queued("testapp_001", 1_000),
+		queued("testapp_002", 1_200),
+		queued("testapp_003", 1_800),
+	)
+	assert.Contains(t, out, "- Rows: ~4k across all 3 targets\n")
+}
+
 func TestTargetsTableBytes(t *testing.T) {
 	one, two := int64(1_500_000_000), int64(2_000_000_000)
 	cells := []TableProgressData{{EstimatedBytes: &one}, {EstimatedBytes: &two}}

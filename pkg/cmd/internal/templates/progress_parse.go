@@ -89,6 +89,14 @@ type TableProgress struct {
 	// EstimatedBytes is the table's on-disk size when it was planned, shown
 	// beside the row counts. Nil when the plan had no estimate.
 	EstimatedBytes *int64
+	// EstimatedRows is the table's row count when it was planned, shown while
+	// the table is queued and before the engine reports RowsTotal. Nil when
+	// the plan had no estimate.
+	EstimatedRows *int64
+	// RowsTotalPlanned marks a RowsTotal rolled up across targets that
+	// includes the plan's estimate for targets that have not reported their
+	// copy yet, so the total renders as approximate.
+	RowsTotalPlanned bool
 	// PlannedShards is how many shards a sharded table's change spans per its
 	// plan, the shards EstimatedBytes covers. Zero when the plan recorded none.
 	PlannedShards int
@@ -209,6 +217,7 @@ func ParseProgressResponse(result *apitypes.ProgressResponse) ProgressData {
 			RowsCopied:          tbl.RowsCopied,
 			RowsTotal:           tbl.RowsTotal,
 			EstimatedBytes:      tbl.EstimatedBytes,
+			EstimatedRows:       tbl.EstimatedRows,
 			PlannedShards:       int(tbl.PlannedShards),
 			PercentComplete:     int(tbl.PercentComplete),
 			ETASeconds:          tbl.ETASeconds,

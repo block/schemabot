@@ -1836,6 +1836,11 @@ type TableProgressResponse struct {
 	// estimate covers the whole table. A sharded table rolled up across its
 	// shards carries it, covering every shard.
 	EstimatedBytes *int64 `json:"estimated_bytes,omitempty"`
+	// EstimatedRows is the plan's approximate row count for the table, so a
+	// table that has not started copying can show how much it will copy.
+	// rows_total replaces it once the engine reports. Absent under the same
+	// rules as EstimatedBytes.
+	EstimatedRows *int64 `json:"estimated_rows,omitempty"`
 	// PlannedShards is how many shards a sharded table's change spans per its
 	// plan, the shards EstimatedBytes covers. Zero when the plan recorded no
 	// count and for a table not rolled up across shards.

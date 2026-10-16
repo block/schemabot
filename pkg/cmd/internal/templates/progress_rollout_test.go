@@ -31,9 +31,11 @@ type rolloutTarget struct {
 	ddl        string
 	rowsCopied int64
 	rowsTotal  int64
-	eta        int64
-	err        string
-	externalID string
+	// estimatedRows is the plan's row estimate for the target's table.
+	estimatedRows *int64
+	eta           int64
+	err           string
+	externalID    string
 	// externalOperationID is the target's own data-plane operation.
 	externalOperationID string
 	isInstant           bool
@@ -83,7 +85,7 @@ func targetRolloutData(targets []rolloutTarget) ProgressData {
 			Deployment: "prod", Target: name, Namespace: "orders", TableName: "orders",
 			ChangeType: "alter", DDL: ddl, Status: target.status,
 			RowsCopied: target.rowsCopied, RowsTotal: target.rowsTotal, ETASeconds: target.eta, PercentComplete: percent,
-			IsInstant: target.isInstant,
+			IsInstant: target.isInstant, EstimatedRows: target.estimatedRows,
 		})
 	}
 	return data
@@ -680,6 +682,24 @@ func TestFormatTargetRollup_TableCountsItsTargets(t *testing.T) {
 		assert.Contains(t, out, "~ orders: "+ui.ProgressBarComplete()+" ✓ Complete\n", "%s", out)
 		assert.NotContains(t, out, "of 3 targets", "%s", out)
 	})
+}
+
+// A queued target counts toward the table's rows by the plan's estimate, so
+// the total and the bar span every target from the start instead of reading
+// the one copying target's rows as the table's. The estimate makes the total
+// approximate and the ETA a floor. Before any target starts, the table shows
+// the estimate summed across its targets.
+func TestFormatTargetRollup_QueuedTargetsCountByPlannedRows(t *testing.T) {
+	queued := func(rows int64) rolloutTarget {
+		return rolloutTarget{opState: state.ApplyOperation.Pending, status: state.Task.Pending, estimatedRows: &rows}
+	}
+
+	out := renderRollout(t, targetRolloutData([]rolloutTarget{copyingTarget(500), queued(1_200), queued(1_800)}))
+	assert.Contains(t, out, "~ orders: "+ui.ProgressBarRowCopy(12)+" 12.50%\n", "%s", out)
+	assert.Contains(t, out, "Rows: 500 / ~4k · ETA: ≥ "+ui.FormatETA(120)+"\n", "%s", out)
+
+	out = renderRollout(t, targetRolloutData([]rolloutTarget{queued(1_000), queued(1_200), queued(1_800)}))
+	assert.Contains(t, out, "Rows: ~4k across all 3 targets\n", "%s", out)
 }
 
 // A failed target is named with its own data-plane identifiers, read from the

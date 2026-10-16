@@ -317,6 +317,10 @@ func tableAcrossTargets(v RolloutView, byMember map[rolloutMemberKey][]TableProg
 	}
 	statuses := make([]string, 0, len(members))
 	allInstant := true
+	// The plan's row estimates: planned for the targets that have not
+	// reported a copy yet, and every target's while each has one.
+	var planned, plannedAll int64
+	allPlanned := true
 	for _, i := range members {
 		d := v.Model.Deployments[i]
 		for _, t := range byMember[rolloutMemberKey{d.Deployment, d.Target}] {
@@ -334,6 +338,14 @@ func tableAcrossTargets(v RolloutView, byMember map[rolloutMemberKey][]TableProg
 				PercentComplete: t.PercentComplete,
 			})
 			allInstant = allInstant && t.IsInstant
+			if t.EstimatedRows == nil {
+				allPlanned = false
+			} else {
+				plannedAll += *t.EstimatedRows
+				if t.RowsTotal == 0 && rowsStillToCome(status) {
+					planned += *t.EstimatedRows
+				}
+			}
 			if countsTowardRolledRows(status) {
 				rolled.RowsCopied += t.RowsCopied
 				rolled.RowsTotal += t.RowsTotal
@@ -349,6 +361,16 @@ func tableAcrossTargets(v RolloutView, byMember map[rolloutMemberKey][]TableProg
 	}
 	rolled.Status = rollupTaskStatus(statuses)
 	rolled.IsInstant = len(statuses) > 0 && allInstant
+	if allPlanned && len(statuses) > 0 {
+		rolled.EstimatedRows = &plannedAll
+	}
+	if rolled.RowsTotal > 0 && planned > 0 {
+		// Some targets have reported their copy and the rest have not: the
+		// plan's estimate stands in for the rest, so the total and the bar
+		// span every target instead of only the ones that started.
+		rolled.RowsTotal += planned
+		rolled.RowsTotalPlanned = true
+	}
 	if rolled.RowsTotal > 0 {
 		rolled.PercentComplete = int(min(rolled.RowsCopied, rolled.RowsTotal) * 100 / rolled.RowsTotal)
 	}
@@ -523,6 +545,14 @@ func anyTargetStarted(targets []ShardProgress) bool {
 func countsTowardRolledRows(status string) bool {
 	return state.IsInFlightTaskState(status) ||
 		state.IsState(status, state.Task.Completed, state.Task.RevertWindow)
+}
+
+// rowsStillToCome reports whether a target that has reported no rows will
+// still copy them: it is queued or working on the change. A finished target
+// that reported none ran it without a copy, and a halted one is named in its
+// own line.
+func rowsStillToCome(status string) bool {
+	return state.IsState(status, state.Task.Pending) || state.IsInFlightTaskState(status)
 }
 
 // inFlightRollupOrder is every in-flight task state, copying first and the

@@ -610,6 +610,15 @@ as zero time remaining. Throttled tasks can include `throttle_reason`.
 the same figure the plan comment shows. It is fixed for the life of the apply
 and does not grow as rows copy. It is omitted when the plan had no estimate,
 and on a row for one shard of a table, since the plan measures the whole table.
+`estimated_rows` is the table's planned row count, under the same rules. It is
+there from the moment the task is created, so a table that is still queued, or
+whose copy has not yet reported, shows how much it will copy; once the engine
+reports, `rows_total` is the figure to use. The CLI and the PR comment show it
+as an approximate count (`Rows: ~4.2M`) while the table is queued, and a
+rollout's table line counts each target that has not reported by its estimate,
+so the total spans every target and reads as approximate (`Rows: 500 / ~4k`).
+A sharded table rolled up across its shards carries `estimated_bytes` but not
+`estimated_rows`.
 A PostgreSQL concurrent index build reports a whole-build percentage estimated
 from the server's build phase and its counters; it stays below 100 until the
 apply completes and holds its last value between phases (see
@@ -687,6 +696,7 @@ Response excerpt (illustrative values):
       "rows_copied": 6000000,
       "rows_total": 10000000,
       "estimated_bytes": 3200000000,
+      "estimated_rows": 9800000,
       "percent_complete": 60,
       "eta_seconds": 2520,
       "throttled": true,
@@ -727,6 +737,7 @@ Response excerpt (illustrative values):
       "ddl": "ALTER TABLE `orders` ADD INDEX `idx_status` (`status`)",
       "status": "completed",
       "estimated_bytes": 2400000000,
+      "estimated_rows": 7400000,
       "percent_complete": 100
     },
     {
@@ -738,6 +749,7 @@ Response excerpt (illustrative values):
       "rows_copied": 2000000,
       "rows_total": 8000000,
       "estimated_bytes": 2600000000,
+      "estimated_rows": 7900000,
       "percent_complete": 25
     }
   ]
@@ -745,8 +757,8 @@ Response excerpt (illustrative values):
 ```
 
 Both rows report the same table under the same deployment; `target` names
-which member owns each copy. Each row's `estimated_bytes` is that target's own
-copy of the table.
+which member owns each copy. Each row's `estimated_bytes` and `estimated_rows`
+are that target's own copy of the table.
 
 `already_converged` marks an operation the apply recorded completed when it was
 created, because its target already had the change: nothing ran there, so it
