@@ -3129,6 +3129,14 @@ func (c *LocalClient) attachDispatchOperation(ctx context.Context, req *ternv1.A
 		UpdatedAt:     now,
 	}
 
+	// The stopped applies whose resting copies this dispatch meets are stamped
+	// as taken over in the transaction that attaches the operation, so the
+	// handoff is durable exactly when the attach is: a stamp that cannot be
+	// written fails the attach, and the dispatch is retried whole rather than
+	// leaving a stopped apply that a later start would replay.
+	takeovers := c.supersededTakeovers(apply, releasedHolders, scope.ddlChanges)
+	apply.TakesOverApplyIDs = takeoverApplyIDs(takeovers)
+
 	err = c.storage.Applies().AttachOperationWithTasks(ctx, apply, operation, tasks)
 	switch {
 	case errors.Is(err, storage.ErrApplyOperationExists):
@@ -3157,7 +3165,7 @@ func (c *LocalClient) attachDispatchOperation(ctx context.Context, req *ternv1.A
 		return nil, fmt.Errorf("attach operation %s to apply %s: %w", operationKey, apply.ApplyIdentifier, err)
 	}
 
-	c.markSupersededHolders(ctx, apply, releasedHolders, scope.ddlChanges)
+	c.announceSupersededTakeovers(ctx, apply, takeovers)
 
 	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventInfo, storage.LogSourceSchemaBot,
 		fmt.Sprintf("Operation attached: %s", operationKey), "", apply.State)

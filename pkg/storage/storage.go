@@ -678,8 +678,13 @@ type ApplyStore interface {
 	// operations of the apply are not keyed that way, and the reverse, so one
 	// target's work can never attach under two keys. An attach to an apply
 	// whose work a newer generation took over (Apply.SupersededBy) fails with
-	// ErrApplyTakenOver. On success the operation's ID and every
-	// task's ID and ApplyOperationID are populated.
+	// ErrApplyTakenOver. Each apply named in apply.TakesOverApplyIDs is stamped
+	// with apply's identifier as its SupersededBy marker in the same
+	// transaction, with the write-once semantics of MarkSuperseded: a holder an
+	// earlier successor already stamped is left alone. A holder that does not
+	// exist, equals apply itself, or whose stamp does not land fails the attach
+	// and leaves neither the operation nor any marker. On success the operation's
+	// ID and every task's ID and ApplyOperationID are populated.
 	AttachOperationWithTasks(ctx context.Context, apply *Apply, operation *ApplyOperation, tasks []*Task) error
 
 	// Get returns an apply by ID, or nil if not found.
@@ -886,11 +891,12 @@ type ApplyStore interface {
 	// a self-referential handoff would refuse the apply forever while pointing
 	// the operator back at the refused apply itself.
 	//
-	// A dispatch that creates its successor records the takeover through
-	// Apply.TakesOverApplyIDs on the create, in the creating transaction, rather
-	// than with this method: the marker then never names an apply that does not
-	// exist, and no takeover is left without its marker. This method is for a
-	// takeover recorded after the fact. The marker does not carry the window
+	// A dispatch that creates its successor, or attaches an operation to an
+	// existing apply, records the takeover through Apply.TakesOverApplyIDs on that
+	// create or attach, in its transaction, rather than with this method: the
+	// marker then never names an apply that does not exist, and no takeover is
+	// left without its marker. This method is for a takeover recorded after the
+	// fact. The marker does not carry the window
 	// alone: while the successor is active, a claim on the handed-off apply is
 	// refused by the claim-time one-active-apply re-check; the marker is what
 	// keeps refusing once the successor settles and that re-check has nothing
