@@ -79,7 +79,7 @@ func shardDispatchRequest(planID, key, shard string) *ternv1.ApplyRequest {
 		DdlChanges: []*ternv1.TableChange{{
 			Namespace:  "testdb",
 			TableName:  "users",
-			Ddl:        "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
+			Ddl:        "ALTER TABLE `users` ADD COLUMN `email` varchar(255) NULL",
 			ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER,
 		}},
 	}

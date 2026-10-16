@@ -1,6 +1,7 @@
 package github
 
 import (
+	"context"
 	"errors"
 	"log/slog"
 	"testing"
@@ -80,7 +81,7 @@ func TestSameStatements(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			var compared [][4]string
-			compareStatements := SchemaFileChangeComparer(func(approvedBase, approved, headBase, head string) (bool, string, error) {
+			compareStatements := SchemaFileChangeComparer(func(_ context.Context, approvedBase, approved, headBase, head string) (bool, string, error) {
 				compared = append(compared, [4]string{approvedBase, approved, headBase, head})
 				if tt.compareErr != nil {
 					return false, "", tt.compareErr
@@ -132,4 +133,40 @@ func TestSameStatements(t *testing.T) {
 			}
 		})
 	}
+}
+
+// A comparison cut short because the evaluation itself was cancelled proves
+// nothing about the file, so it is an error rather than a changed verdict,
+// and it uses none of the comparison budget.
+func TestSameStatementsCancelledEvaluation(t *testing.T) {
+	file := func(sha string) gitSide {
+		return gitSide{entry: TreeEntry{Mode: "100644", Type: "blob", SHA: sha}, found: true}
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	c := &schemaChangeComparer{
+		ic:                  &InstallationClient{logger: slog.New(slog.DiscardHandler)},
+		repo:                "octocat/hello-world",
+		commits:             [4]string{"approved-sha", "approved-base-sha", "head-sha", "head-base-sha"},
+		baseContentReviewed: true,
+		compareStatements: func(ctx context.Context, _, _, _, _ string) (bool, string, error) {
+			cancel()
+			return false, "", ctx.Err()
+		},
+		blobText: map[string]string{
+			"approved": "approved content", "approved-base": "approved base content",
+			"head": "head content", "head-base": "head base content",
+		},
+	}
+	item := schemaChangeItem{
+		path:     "schema/db/orders.sql",
+		sides:    [4]gitSide{file("approved"), file("approved-base"), file("head"), file("head-base")},
+		resolved: true,
+	}
+
+	same, err := c.sameStatements(ctx, item)
+	require.ErrorIs(t, err, context.Canceled)
+	assert.ErrorContains(t, err, "evaluation cancelled")
+	assert.False(t, same)
+	assert.Empty(t, c.statementComparedPaths)
 }

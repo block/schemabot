@@ -1654,7 +1654,11 @@ is passed (`blockRollbackUnsafeWithoutOptIn` and `rollbackPlanUnsafeChanges` in
 `pkg/webhook/rollback.go`). The rollback pin lasts only as long as the plan comment that names
 those changes: when that comment cannot be posted, `rollback` withdraws its pin before returning
 (`withdrawUndisclosedRollbackPin` in `pkg/webhook/rollback.go`, over the conditional
-`LockStore.ClearPendingPlanID`).
+`LockStore.ClearPendingPlanID`). On the data plane, apply admission requires the opt-in for the
+applying deployment's own re-planned unsafe verdicts, stamped onto the materialized plan and the
+dispatch scope, with a shard dispatch this deployment never re-planned treated as unsafe
+(`pkg/tern/local_plan_drift.go`, gated by `rejectUnsafeDDLChangesWithoutOptIn` in
+`pkg/tern/local_client.go`).
 
 ### RV-4: Engine refusals are known at plan time and gate the apply
 
@@ -1850,9 +1854,11 @@ both the same. This relies on the default branch requiring review for every chan
 it: a change pushed to it without review is carried past an earlier approval as default branch
 content. *Enforced:* the review gate and actor
 authorization (`pkg/webhook/review_gate.go`, `pkg/webhook/actor_authorization.go`), with the
-comparison in `PRSchemaChangeUnchangedSince` (`pkg/github/client.go`), which proves a MySQL-family
-schema file both the change and the default branch edited generates the same statements with
-`SameTableChange` (`pkg/ddl/table_change.go`).
+comparison in `PRSchemaChangeUnchangedSince` (`pkg/github/client.go`), which proves a schema file
+both the change and the default branch edited generates the same statements: with
+`SameTableChange` (`pkg/ddl/table_change.go`) for MySQL-family files, and on the environment's
+primary target with `CompareSchemaFileChange` (`pkg/engine/postgres/table_change.go`) for
+PostgreSQL files.
 
 ### AZ-5: Commands never guess
 

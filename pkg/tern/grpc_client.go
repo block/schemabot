@@ -210,7 +210,8 @@ const DefaultMaxRecvMsgBytes = 16 << 20 // 16 MiB
 //
 // Only RPCs that are safe to re-send are retried, in two budgets:
 //
-// Caller-facing reads (PullSchema, Plan, PlanDiff) get a long budget: a
+// Caller-facing reads (PullSchema, Plan, PlanDiff, CompareSchemaFileChange)
+// get a long budget: a
 // human or review workflow is waiting on the response, and a data-plane pod
 // restart or mesh drain lasts seconds — well past a sub-second budget — so
 // these ride out up to roughly fifteen seconds before surfacing UNAVAILABLE.
@@ -237,7 +238,8 @@ const retryServiceConfig = `{
 		"name": [
 			{"service": "tern.v1.Tern", "method": "PullSchema"},
 			{"service": "tern.v1.Tern", "method": "Plan"},
-			{"service": "tern.v1.Tern", "method": "PlanDiff"}
+			{"service": "tern.v1.Tern", "method": "PlanDiff"},
+			{"service": "tern.v1.Tern", "method": "CompareSchemaFileChange"}
 		],
 		"retryPolicy": {
 			"maxAttempts": 5,
@@ -289,6 +291,7 @@ func grpcMethodDeadline(fullMethod string) time.Duration {
 	case ternv1.Tern_Apply_FullMethodName,
 		ternv1.Tern_Plan_FullMethodName,
 		ternv1.Tern_PlanDiff_FullMethodName,
+		ternv1.Tern_CompareSchemaFileChange_FullMethodName,
 		ternv1.Tern_PullSchema_FullMethodName,
 		ternv1.Tern_Revert_FullMethodName,
 		ternv1.Tern_SkipRevert_FullMethodName,
@@ -419,6 +422,18 @@ func (c *GRPCClient) Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv1
 
 func (c *GRPCClient) PlanDiff(ctx context.Context, req *ternv1.PlanRequest) (*ternv1.PlanDiffResponse, error) {
 	return c.client.PlanDiff(ctx, req)
+}
+
+// CompareSchemaFileChange asks the remote data plane to compare one schema
+// file. A data plane that cannot compare files, including one that predates
+// the RPC, answers UNIMPLEMENTED, which is returned as
+// ErrCompareSchemaFileChangeUnsupported.
+func (c *GRPCClient) CompareSchemaFileChange(ctx context.Context, req *ternv1.CompareSchemaFileChangeRequest) (*ternv1.CompareSchemaFileChangeResponse, error) {
+	resp, err := c.client.CompareSchemaFileChange(ctx, req)
+	if status.Code(err) == codes.Unimplemented {
+		return nil, fmt.Errorf("remote data plane cannot compare schema files for database %s: %w: %w", req.GetDatabase(), ErrCompareSchemaFileChangeUnsupported, err)
+	}
+	return resp, err
 }
 
 func (c *GRPCClient) PullSchema(ctx context.Context, req *ternv1.PullSchemaRequest) (*ternv1.PullSchemaResponse, error) {

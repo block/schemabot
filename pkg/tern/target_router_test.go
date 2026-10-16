@@ -96,6 +96,7 @@ func (s targetRouterApplyStore) GetInProgress(context.Context) ([]*storage.Apply
 }
 
 type targetRouterRecordingClient struct {
+	compareReq         *ternv1.CompareSchemaFileChangeRequest
 	pullReq            *ternv1.PullSchemaRequest
 	planReq            *ternv1.PlanRequest
 	planDiffReq        *ternv1.PlanRequest
@@ -140,6 +141,11 @@ func (c *targetRouterRecordingClient) Plan(_ context.Context, req *ternv1.PlanRe
 		return c.onPlanResult()
 	}
 	return &ternv1.PlanResponse{PlanId: "plan-routed"}, nil
+}
+
+func (c *targetRouterRecordingClient) CompareSchemaFileChange(_ context.Context, req *ternv1.CompareSchemaFileChangeRequest) (*ternv1.CompareSchemaFileChangeResponse, error) {
+	c.compareReq = req
+	return &ternv1.CompareSchemaFileChangeResponse{Same: true}, nil
 }
 
 func (c *targetRouterRecordingClient) PlanDiff(_ context.Context, req *ternv1.PlanRequest) (*ternv1.PlanDiffResponse, error) {
@@ -294,6 +300,35 @@ func TestTargetRouterRoutesPlanDiffThroughStaticTarget(t *testing.T) {
 	assert.Equal(t, "orders-logical", client.planDiffReq.Database)
 	assert.Equal(t, storage.DatabaseTypeMySQL, client.planDiffReq.Type)
 	assert.Equal(t, "dsid-orders-prod", client.planDiffReq.Target)
+	assert.Equal(t, "root@tcp(localhost:3306)/", client.targetDSN)
+}
+
+// A schema file comparison reaches the resolved target's client with the
+// target's identity and its file versions intact.
+func TestTargetRouterRoutesSchemaFileComparisonThroughStaticTarget(t *testing.T) {
+	resolver := newStaticResolver(t)
+	created := make(map[string]*targetRouterRecordingClient)
+	router := newTargetRouterForTest(t, resolver, nil, nil, created)
+
+	resp, err := router.CompareSchemaFileChange(t.Context(), &ternv1.CompareSchemaFileChangeRequest{
+		Database:     "orders-logical",
+		Type:         storage.DatabaseTypeMySQL,
+		Environment:  "production",
+		Target:       "dsid-orders-prod",
+		ApprovedBase: "approved base",
+		Head:         "head",
+	})
+
+	require.NoError(t, err)
+	assert.True(t, resp.GetSame())
+	client := created["orders-logical"]
+	require.NotNil(t, client)
+	require.NotNil(t, client.compareReq)
+	assert.Equal(t, "orders-logical", client.compareReq.Database)
+	assert.Equal(t, storage.DatabaseTypeMySQL, client.compareReq.Type)
+	assert.Equal(t, "dsid-orders-prod", client.compareReq.Target)
+	assert.Equal(t, "approved base", client.compareReq.ApprovedBase)
+	assert.Equal(t, "head", client.compareReq.Head)
 	assert.Equal(t, "root@tcp(localhost:3306)/", client.targetDSN)
 }
 
