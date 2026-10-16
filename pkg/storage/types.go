@@ -1161,6 +1161,14 @@ type Apply struct {
 	// apply carries no manifest and completion derives from attached rows alone.
 	ExpectedOperationKeys []string
 
+	// TakesOverApplyIDs names the stopped applies whose unfinished work this
+	// apply takes over, by row ID. It is read only when the apply is created
+	// through CreateWithTasksAndOperations or CreateWithGroupedOperations, which
+	// stamp each named apply's SupersededBy with this apply's identifier in the
+	// transaction that creates it, so the apply and the handoff become visible
+	// together or not at all. It is never stored on the new apply's own row.
+	TakesOverApplyIDs []int64
+
 	// Engine is the schema change engine: "spirit", "planetscale", etc.
 	Engine string
 

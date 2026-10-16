@@ -894,6 +894,9 @@ func applyTargetForUpdate(ctx context.Context, db queryRower, apply *storage.App
 
 // Create stores a new apply and returns its ID.
 func (s *applyStore) Create(ctx context.Context, apply *storage.Apply) (int64, error) {
+	if len(apply.TakesOverApplyIDs) > 0 {
+		return 0, fmt.Errorf("create apply %s: taking over stopped applies is recorded only by the create paths that write rows in one transaction", apply.ApplyIdentifier)
+	}
 	canonicalizeApplyIdentity(apply)
 	canonicalizeApplyState(apply)
 
@@ -1233,12 +1236,46 @@ func (s *applyStore) createWithRowsOnce(ctx context.Context, apply *storage.Appl
 			return 0, err
 		}
 	}
+	for _, holderID := range apply.TakesOverApplyIDs {
+		if err := markTakenOver(ctx, writeTx.tx, holderID, apply.ApplyIdentifier); err != nil {
+			return 0, err
+		}
+	}
 
 	if err := writeTx.commit(); err != nil {
 		return 0, fmt.Errorf("commit %s: %w", opName, err)
 	}
 
 	return id, nil
+}
+
+// markTakenOver records successor as the apply that took over a stopped apply's
+// unfinished work, in the transaction that creates the successor. It is the same
+// write-once superseded_by marker MarkSuperseded writes, so a failure here rolls
+// the successor's creation back and leaves no apply without its handoff.
+//
+// The first successor to record a handoff owns the marker. A holder already
+// stamped by an earlier successor is left alone and is not an error: the stopped
+// apply is refused either way, and reassigning the marker would resolve an
+// ambiguous takeover by overwriting.
+func markTakenOver(ctx context.Context, tx *rebindTx, holderID int64, successor string) error {
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE applies SET superseded_by = ?, updated_at = updated_at WHERE id = ? AND superseded_by = ''`,
+		successor, holderID); err != nil {
+		return fmt.Errorf("record apply %s taking over stopped apply %d: %w", successor, holderID, err)
+	}
+	var stored string
+	err := tx.QueryRowContext(ctx, `SELECT superseded_by FROM applies WHERE id = ?`, holderID).Scan(&stored)
+	if errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("record apply %s taking over stopped apply %d: %w", successor, holderID, storage.ErrApplyNotFound)
+	}
+	if err != nil {
+		return fmt.Errorf("read superseded_by of stopped apply %d taken over by apply %s: %w", holderID, successor, err)
+	}
+	if stored == "" {
+		return fmt.Errorf("record apply %s taking over stopped apply %d: the marker is still unset after the write", successor, holderID)
+	}
+	return nil
 }
 
 // verifyExpectedLockIntent locks and validates the webhook apply intent in the
