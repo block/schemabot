@@ -719,9 +719,11 @@ func settledManifestHold(ctx context.Context, tx *rebindTx, holder activeApplyHo
 //   - pending: the claim refuses to start an operation whose parent is
 //     terminal, and the stranded reaper later settles the row.
 //   - failed_retryable: the retry claim resumes an operation only while its
-//     parent is retryable or active. A driver re-driving one leaves the state
-//     alone for the whole drive and clears its lease when the drive ends, so
-//     a fresh lease is what tells a retry in progress from an idle row.
+//     parent is retryable or active. An operation-lease redispatch moves the
+//     row to running, so it is in progress by state like any running row. A
+//     parent-lease redispatch leaves the state alone for the whole drive and
+//     clears its lease when the drive ends, so for that one a fresh lease is
+//     what tells a retry in progress from an idle row.
 //
 // A running operation is in progress by state alone, not by lease. When its
 // driver dies, the stale-active claim re-leases it whatever the parent's state

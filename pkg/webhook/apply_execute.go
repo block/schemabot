@@ -594,12 +594,14 @@ func (h *Handler) executeApply(
 	// the apply could complete between the check and the post, leaving a
 	// stale "In Progress" comment that the observer never edits.
 	progressBody := templates.RenderApplyStarted(templates.ApplyStatusCommentData{
-		ApplyID:     applyResp.ApplyID,
-		Database:    database,
-		Environment: environment,
-		RequestedBy: requestedBy,
-		State:       apply.State,
-		Engine:      schemaResult.Type,
+		ApplyID:      applyResp.ApplyID,
+		Database:     database,
+		Environment:  environment,
+		RequestedBy:  requestedBy,
+		State:        apply.State,
+		Engine:       schemaResult.Type,
+		DeferCutover: apply.GetOptions().DeferCutover,
+		SkipRevert:   apply.GetOptions().SkipRevert,
 	})
 	h.postInitialProgressComment(ctx, repo, pr, installationID, apply, progressBody)
 
