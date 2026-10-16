@@ -683,6 +683,37 @@ func TestGroups_RollsUpEachDeploymentsTargets(t *testing.T) {
 	assert.False(t, eu.Open)
 }
 
+// A group headed by a target picking its work back up after a start leads with
+// that target, not with one that already finished, so the group's glyph says
+// the rollout is moving rather than done.
+func TestGroups_ResumingTargetHeadsGroupOverCompletedOne(t *testing.T) {
+	target := func(tgt, st string) Operation {
+		return Operation{Deployment: "primary", Target: tgt, State: st, Parallel: true, ContinueOnFailure: true}
+	}
+	apply := Derive([]Operation{
+		target("t_000", so.Completed),
+		target("t_001", so.Resuming),
+	})
+
+	groups := apply.Groups()
+	require.Len(t, groups, 1)
+	assert.Equal(t, "primary/t_001", groups[0].Lead.Name, "the resuming target heads the group")
+	assert.Equal(t, StateResuming, groups[0].Lead.Presentation)
+	assert.Equal(t, "🔄", groups[0].Lead.Emoji)
+	assert.Equal(t, []StateCount{{"completed", 1}, {"resuming", 1}}, groups[0].Counts)
+}
+
+// Every status but unknown has a place in the attention order, so a group's
+// lead is chosen by urgency rather than by which status was left unranked.
+func TestAttentionOrder_RanksEveryKnownStatus(t *testing.T) {
+	for ps := range presentationStateCount {
+		if ps == StateUnknown {
+			continue
+		}
+		assert.Contains(t, attentionOrder, ps, "status %d must be ranked in attentionOrder", ps)
+	}
+}
+
 // A group's progress counts the targets that ran the change apart from the
 // ones that already had it, and the rest by status, so the parts always add up
 // to every target the group addresses.

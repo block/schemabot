@@ -385,7 +385,7 @@ func (a Apply) group(deployment string, members []int) Group {
 // most urgent first and settled members last.
 var attentionOrder = []PresentationState{
 	StateFailed, StateRetrying, StatePaused, StateHalted, StateStopped,
-	StateReadyForCutoverNext, StateCuttingOver, StateRunningCopy, StateRevertWindow,
+	StateReadyForCutoverNext, StateCuttingOver, StateRunningCopy, StateResuming, StateRevertWindow,
 	StateReadyForCutoverWaiting, StateWaiting, StateQueuedNext,
 	StateCancelled, StateReverted, StateCompleted, StateAlreadyApplied,
 }
