@@ -1028,14 +1028,15 @@ func TestWriteProgress_SettledRolloutTableReadsNotStarted(t *testing.T) {
 }
 
 // A rollup's headline counts the deployment's targets, singular for a
-// deployment of one target and plural for several. The apply's only rollout
-// leads with the counts, with no deployment name to tell it apart.
+// deployment of one target and plural for several. An apply whose only
+// deployment rolls out to several targets leads with the counts, with no
+// deployment name to tell it apart (presentation.SoleTargetRollout).
 func TestFormatTargetRollup_HeadlineCountsTargets(t *testing.T) {
 	for _, tc := range []struct {
 		targets []rolloutTarget
 		want    string
 	}{
-		{targets: []rolloutTarget{copyingTarget(400)}, want: "🔄 1 running (1 target)\n"},
+		{targets: []rolloutTarget{copyingTarget(400)}, want: "🔄 prod — 1 running (1 target)\n"},
 		{targets: []rolloutTarget{completedTarget(), copyingTarget(400)}, want: "🔄 1 completed · 1 running (2 targets)\n"},
 	} {
 		data := targetRolloutData(tc.targets)
