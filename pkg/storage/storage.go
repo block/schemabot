@@ -1462,7 +1462,9 @@ type ApplyOperationStore interface {
 
 	// ListRecentTargets returns each distinct (database, environment, target)
 	// that an apply of databaseType ran an operation against, among applies
-	// created within lookback of the storage database's clock, ordered by
+	// last written (updated_at) within lookback of the storage database's
+	// clock, so an apply that settled recently counts however old it is,
+	// ordered by
 	// database, environment, then target, each compared bytewise, so every
 	// dialect returns the same order. Tuples are distinct byte for byte, so
 	// targets that differ only by case are listed separately, as the

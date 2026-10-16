@@ -1176,7 +1176,10 @@ the cancel and under a deadline inside the claim's staleness window
 (`pkg/tern/local_cancelled_resume_state.go`); and the branch reconcile pass,
 which deletes a SchemaBot branch only while holding the apply target it belongs
 to, across a final read showing no unsettled apply uses it
-(`WithTargetHeld`, `pkg/tern/branch_reconcile.go`).
+(`WithTargetHeld`, `pkg/tern/branch_reconcile.go`); on a data plane that
+resolves targets, the target held is the database and environment the
+target's applies were stored under, reached through the route those applies
+take (`TargetRouter.ReconcileRecentTargetBranches`).
 
 ## Control operations (CO)
 

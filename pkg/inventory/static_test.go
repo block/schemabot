@@ -230,6 +230,7 @@ func TestStaticResolverResolveTargetValidatesRequest(t *testing.T) {
 
 	_, err = resolver.ResolveTarget(t.Context(), Request{Target: "missing"})
 	assert.ErrorContains(t, err, "target \"missing\" is not configured")
+	assert.ErrorIs(t, err, ErrTargetNotFound, "an unconfigured target is one the inventory does not have")
 
 	_, err = resolver.ResolveTarget(t.Context(), Request{Target: "target-1", DatabaseType: "vitess"})
 	assert.ErrorContains(t, err, "target \"target-1\" is configured for database type \"mysql\", not \"vitess\"")
