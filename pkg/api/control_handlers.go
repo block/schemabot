@@ -179,10 +179,34 @@ func (s *Service) ValidateRollbackSourceApply(ctx context.Context, req RollbackS
 		return apply, plan, controlConflictf("apply %s is not the schema change that the current rollback planner would select for database %s environment %s", apply.ApplyIdentifier, apply.Database, apply.Environment)
 	}
 	if latestTask.PlanID != apply.PlanID {
-		return apply, plan, terminalControlf("latest schema change task for database %s points to plan %d, but apply %s points to plan %d", apply.Database, latestTask.PlanID, apply.ApplyIdentifier, apply.PlanID)
+		memberOfRound, err := taskPlanIsMemberOfRound(ctx, planStore, latestTask, plan)
+		if err != nil {
+			return apply, plan, err
+		}
+		if !memberOfRound {
+			return apply, plan, terminalControlf("latest schema change task for database %s points to plan %d, but apply %s points to plan %d", apply.Database, latestTask.PlanID, apply.ApplyIdentifier, apply.PlanID)
+		}
+		s.logger.Debug("rollback source task ran a member plan of the apply's review round",
+			append(apply.LogAttrs(), "task_id", latestTask.TaskIdentifier, "task_plan_id", latestTask.PlanID)...)
 	}
 
 	return apply, plan, nil
+}
+
+// taskPlanIsMemberOfRound reports whether task ran a member plan stored for
+// the review round of primary. A rollout whose targets are each planned
+// against their own schema runs every target but the primary from a plan of
+// its own, bound to the primary plan, so its tasks legitimately point at a plan
+// other than the apply's.
+func taskPlanIsMemberOfRound(ctx context.Context, planStore storage.PlanStore, task *storage.Task, primary *storage.Plan) (bool, error) {
+	taskPlan, err := planStore.GetByID(ctx, task.PlanID)
+	if err != nil {
+		return false, fmt.Errorf("load plan %d of rollback source task %s: %w", task.PlanID, task.TaskIdentifier, err)
+	}
+	if taskPlan == nil {
+		return false, nil
+	}
+	return primary.PlanIdentifier != "" && taskPlan.PrimaryPlanIdentifier == primary.PlanIdentifier, nil
 }
 
 func validateRollbackSourceScope(req RollbackSourceRequest, apply *storage.Apply) error {
@@ -1029,10 +1053,25 @@ func (s *Service) completeImmediateStopRequestIfStopped(ctx context.Context, app
 	if controlStore == nil {
 		return false, fmt.Errorf("control request store is not available")
 	}
+	if err := s.settleCutoverSupersededByStop(ctx, storedApply); err != nil {
+		return false, err
+	}
 	if err := controlStore.CompletePending(ctx, apply.ID, storage.ControlOperationStop); err != nil {
 		return false, fmt.Errorf("complete pending stop control request for apply %s after immediate stop: %w", apply.ApplyIdentifier, err)
 	}
 	return true, nil
+}
+
+// settleCutoverSupersededByStop answers the cutover still pending when the
+// apply's stop took effect, so it cannot fire on the copy a later start
+// resumes. Callers settle it before completing the stop request (CO-4): the
+// pending stop keeps a drive from taking the cutover, so a failed settlement
+// leaves the stop pending for the retry that settles it.
+func (s *Service) settleCutoverSupersededByStop(ctx context.Context, apply *storage.Apply) error {
+	if err := tern.SettlePendingCutoverAfterStop(ctx, s.storage, s.logger, apply); err != nil {
+		return fmt.Errorf("settle pending cutover superseded by stop for apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	return nil
 }
 
 func stopRequestCompletedByApplyState(applyState string) bool {
@@ -1280,7 +1319,11 @@ func (s *Service) queueStopForApplyOwner(ctx context.Context, apply *storage.App
 		s.logger.Info("stop requested for a task-less apply; recording the durable request for the task-less settle path",
 			append(apply.LogAttrs(), "requested_by", caller)...)
 	}
-	controlReq, alreadyPending, err := s.createStopControlRequest(ctx, apply, caller, stoppedCount, skippedCount)
+	supersedesStart, err := s.stopSupersedesPendingStart(ctx, apply, caller)
+	if err != nil {
+		return nil, "", err
+	}
+	controlReq, alreadyPending, err := s.createStopControlRequest(ctx, apply, caller, stoppedCount, skippedCount, supersedesStart)
 	if err != nil {
 		return nil, "", err
 	}
@@ -1296,6 +1339,69 @@ func (s *Service) queueStopForApplyOwner(ctx context.Context, apply *storage.App
 		StoppedCount: stoppedCount,
 		SkippedCount: skippedCount,
 	}, "", nil
+}
+
+// stopSupersedesPendingStart reports whether a stop recorded on this apply
+// supersedes a pending start, which the stop's own write then completes in the
+// same transaction. An apply driven under the operation lease keeps its start
+// pending until it settles, because the operations the start resumes are
+// claimed one at a time on its behalf, and a pending start on a stopped apply
+// is what reopens it. Left pending under the new stop, that start would resume
+// the apply as soon as the stop landed on every operation. A stop is only
+// accepted for a non-terminal apply, so the start it supersedes has already
+// taken effect. An apply driven under the parent lease consumes its start when
+// its drive resumes, so its start is left to that drive.
+func (s *Service) stopSupersedesPendingStart(ctx context.Context, apply *storage.Apply, caller string) (bool, error) {
+	controlStore := s.storage.ControlRequests()
+	if controlStore == nil {
+		return false, fmt.Errorf("control request store is not available")
+	}
+	start, err := controlStore.GetPending(ctx, apply.ID, storage.ControlOperationStart)
+	if err != nil {
+		return false, fmt.Errorf("load pending start request for apply %s before recording a stop: %w", apply.ApplyIdentifier, err)
+	}
+	if start == nil {
+		return false, nil
+	}
+	ops, err := s.storage.ApplyOperations().ListByApply(ctx, apply.ID)
+	if err != nil {
+		return false, fmt.Errorf("list apply_operations for apply %s before recording a stop: %w", apply.ApplyIdentifier, err)
+	}
+	operationLease, err := s.applyDrivesUnderOperationLease(ctx, apply, ops)
+	if err != nil {
+		return false, fmt.Errorf("decide drive mode of apply %s before recording a stop: %w", apply.ApplyIdentifier, err)
+	}
+	if !operationLease {
+		s.logger.Info("stop requested while a start is pending on an apply driven under the parent lease; leaving the start to the drive that resumes it",
+			append(apply.LogAttrs(), "requested_by", caller, "start_requested_by", start.RequestedBy, "operation_count", len(ops))...)
+		return false, nil
+	}
+	s.logger.Info("stop requested while a start is pending on an apply driven under the operation lease; the stop write completes the start it supersedes",
+		append(apply.LogAttrs(), "requested_by", caller, "start_requested_by", start.RequestedBy, "operation_count", len(ops))...)
+	return true, nil
+}
+
+// applyDrivesUnderOperationLease reports whether the apply's operations are
+// driven under the operation lease, with the parent projected from them, rather
+// than under the parent lease. It mirrors the drive-mode decision in
+// recoverApplyOperation: a rollout of several operations, a lone operation
+// whose generation manifest still expects siblings, and a lone task-less
+// operation all drive under the operation lease. An apply with no operation
+// attached has not been driven yet, so no drive mode applies.
+func (s *Service) applyDrivesUnderOperationLease(ctx context.Context, apply *storage.Apply, ops []*storage.ApplyOperation) (bool, error) {
+	switch {
+	case len(ops) == 0:
+		return false, nil
+	case len(ops) > 1:
+		return true, nil
+	case len(apply.MissingExpectedOperationKeys(ops)) > 0:
+		return true, nil
+	}
+	hasTasks, err := s.claimedOperationHasTasks(ctx, ops[0])
+	if err != nil {
+		return false, err
+	}
+	return !hasTasks, nil
 }
 
 func stopRequestCounts(tasks []*storage.Task) (int64, int64) {
@@ -1336,11 +1442,36 @@ func (s *Service) createControlRequest(ctx context.Context, apply *storage.Apply
 	return controlReq, alreadyPending, nil
 }
 
-func (s *Service) createStopControlRequest(ctx context.Context, apply *storage.Apply, caller string, stoppedCount, skippedCount int64) (*storage.ApplyControlRequest, bool, error) {
-	return s.createControlRequest(ctx, apply, storage.ControlOperationStop, caller, stopControlRequestMetadata{
+// createStopControlRequest records the stop. When supersedesStart is set, the
+// apply's pending start is completed in the same transaction, so a failed stop
+// write leaves that start deliverable.
+func (s *Service) createStopControlRequest(ctx context.Context, apply *storage.Apply, caller string, stoppedCount, skippedCount int64, supersedesStart bool) (*storage.ApplyControlRequest, bool, error) {
+	metadata := stopControlRequestMetadata{
 		StoppedCount: stoppedCount,
 		SkippedCount: skippedCount,
-	})
+	}
+	if !supersedesStart {
+		return s.createControlRequest(ctx, apply, storage.ControlOperationStop, caller, metadata)
+	}
+	controlStore := s.storage.ControlRequests()
+	if controlStore == nil {
+		return nil, false, fmt.Errorf("control request store is not available")
+	}
+	metadataJSON, err := json.Marshal(metadata)
+	if err != nil {
+		return nil, false, fmt.Errorf("marshal stop control request metadata for apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	controlReq, alreadyPending, err := controlStore.RequestPendingSuperseding(ctx, &storage.ApplyControlRequest{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationStop,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: caller,
+		Metadata:    metadataJSON,
+	}, storage.ControlOperationStart)
+	if err != nil {
+		return nil, false, fmt.Errorf("record stop control request superseding the pending start for apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	return controlReq, alreadyPending, nil
 }
 
 // pendingControlResponseIfPresent loads any pending control request for the
@@ -1566,6 +1697,9 @@ func (s *Service) completeResolvedStopBeforeStart(ctx context.Context, client te
 	}
 
 	if stopRequestCompletedByApplyState(apply.State) {
+		if err := s.settleCutoverSupersededByStop(ctx, apply); err != nil {
+			return err
+		}
 		if err := controlStore.CompletePending(ctx, apply.ID, storage.ControlOperationStop); err != nil {
 			return fmt.Errorf("complete pending stop control request for apply %s before start: %w", apply.ApplyIdentifier, err)
 		}
@@ -1616,6 +1750,9 @@ func (s *Service) completeResolvedStopBeforeStart(ctx context.Context, client te
 		return s.reloadApplyAfterRefusedStopSync(ctx, apply, oldState, stopCaller, caller)
 	}
 	*apply = synced
+	if err := s.settleCutoverSupersededByStop(ctx, apply); err != nil {
+		return err
+	}
 	if err := controlStore.CompletePending(ctx, apply.ID, storage.ControlOperationStop); err != nil {
 		return fmt.Errorf("complete pending remote stop control request for apply %s before start: %w", apply.ApplyIdentifier, err)
 	}

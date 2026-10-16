@@ -209,6 +209,7 @@ func buildDeploymentDetail(apply *storage.Apply, op *storage.ApplyOperation, tas
 		Tenant:           tenant,
 		Rollback:         apply.IsRollback(),
 		DeferCutover:     apply.GetOptions().DeferCutover,
+		SkipRevert:       apply.GetOptions().SkipRevert,
 		PlanID:           display.PlanIdentifier,
 		CLIName:          cliName,
 	}

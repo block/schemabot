@@ -751,7 +751,67 @@ func TestEngine_Plan_DropByEmptiedFileInMultiNamespaceFails(t *testing.T) {
 		},
 		Credentials: &engine.Credentials{DSN: dsn},
 	})
-	require.EqualError(t, err, `namespace lookup for table "orders": no namespace defines table "orders" among 2 schema namespaces [billing testdb]`)
+	require.EqualError(t, err, `DROP TABLE "orders" cannot be placed: namespaces [billing testdb] all diff against database "testdb". Keep this database's schema files in one namespace directory, or ask a SchemaBot operator to use a target with no database in its DSN`)
+	assert.Nil(t, result)
+}
+
+// The live database has `users`, `invoices` and `invoices_old`, and the
+// request diffs two namespaces, app and billing, against it. billing/invoices_old.sql
+// has been deleted, so the diff drops `invoices_old`. Both namespaces' live
+// schema is this one database, so the table is in both at once and the
+// deleted file is no longer in the request: the plan refuses, naming the
+// table, both namespaces, and the remedy, rather than placing the drop in
+// either one.
+func TestEngine_Plan_DropByDeletedFileInSharedDatabaseRefuses(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	cleanupTables(t, db)
+	_, err := db.ExecContext(t.Context(), "CREATE TABLE invoices (id INT NOT NULL, PRIMARY KEY (id))")
+	require.NoError(t, err)
+	_, err = db.ExecContext(t.Context(), "CREATE TABLE invoices_old (id INT NOT NULL, PRIMARY KEY (id))")
+	require.NoError(t, err)
+	_, err = db.ExecContext(t.Context(), "CREATE TABLE users (id INT NOT NULL, PRIMARY KEY (id))")
+	require.NoError(t, err)
+
+	eng := New(Config{Logger: slog.New(slog.NewTextHandler(os.Stdout, nil))})
+	result, err := eng.Plan(t.Context(), &engine.PlanRequest{
+		Database: "testdb",
+		SchemaFiles: schema.SchemaFiles{
+			"app":     &schema.Namespace{Files: map[string]string{"users.sql": "CREATE TABLE `users` (\n  `id` int NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"}},
+			"billing": &schema.Namespace{Files: map[string]string{"invoices.sql": "CREATE TABLE `invoices` (\n  `id` int NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"}},
+		},
+		Credentials: &engine.Credentials{DSN: dsn},
+	})
+	require.EqualError(t, err, `DROP TABLE "invoices_old" cannot be placed: namespaces [app billing] all diff against database "testdb". Keep this database's schema files in one namespace directory, or ask a SchemaBot operator to use a target with no database in its DSN`)
+	assert.Nil(t, result)
+}
+
+// The request names the logical database "logicaldb" while the target DSN
+// names "testdb", the database the plan actually diffs against. When the
+// deleted billing/invoices_old.sql leaves a drop no namespace can own, the
+// refusal names "testdb", the database the namespaces actually share, not
+// the request's logical name.
+func TestEngine_Plan_UnplaceableDropNamesTheTargetDatabase(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	cleanupTables(t, db)
+	for _, stmt := range []string{
+		"CREATE TABLE invoices (id INT NOT NULL, PRIMARY KEY (id))",
+		"CREATE TABLE invoices_old (id INT NOT NULL, PRIMARY KEY (id))",
+		"CREATE TABLE users (id INT NOT NULL, PRIMARY KEY (id))",
+	} {
+		_, err := db.ExecContext(t.Context(), stmt)
+		require.NoError(t, err)
+	}
+
+	eng := New(Config{Logger: slog.New(slog.NewTextHandler(os.Stdout, nil))})
+	result, err := eng.Plan(t.Context(), &engine.PlanRequest{
+		Database: "logicaldb",
+		SchemaFiles: schema.SchemaFiles{
+			"app":     &schema.Namespace{Files: map[string]string{"users.sql": "CREATE TABLE `users` (\n  `id` int NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"}},
+			"billing": &schema.Namespace{Files: map[string]string{"invoices.sql": "CREATE TABLE `invoices` (\n  `id` int NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"}},
+		},
+		Credentials: &engine.Credentials{DSN: dsn},
+	})
+	require.EqualError(t, err, `DROP TABLE "invoices_old" cannot be placed: namespaces [app billing] all diff against database "testdb". Keep this database's schema files in one namespace directory, or ask a SchemaBot operator to use a target with no database in its DSN`)
 	assert.Nil(t, result)
 }
 
@@ -2422,6 +2482,114 @@ func TestEngine_ExecuteSchemaChange_CancelAfterCutoverDropsSwappedOutOriginal(t 
 	var rows int
 	require.NoError(t, db.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM `cancel_after_cutover`").Scan(&rows))
 	assert.Equal(t, 3, rows, "the changed table holds every row")
+}
+
+// A cancel lands just after the cutover commits, and Spirit's cleanup after the
+// cutover then fails: here its drop of the checkpoint table times out behind a
+// session reading that table. The runner returns that error on the cancelled
+// context, but the target already holds the change, so the run records it
+// completed rather than stopped: a stopped change would offer the operator a
+// resume of a change that already landed.
+func TestEngine_ExecuteSchemaChange_CleanupFailureAfterCutoverOnCancelIsCompleted(t *testing.T) {
+	final := runAlterWithCleanupFailureAfterCutover(t, "cancel_cleanup_fails", true)
+	assert.Equal(t, engine.StateCompleted, final, "a change whose cutover committed is completed, whatever its cleanup did")
+}
+
+// The same cleanup failure after a committed cutover, with nothing cancelling
+// the run: Spirit runs that cleanup on a bounded context of its own, so it can
+// fail without any stop, cancel, or shutdown. The target already holds the
+// change, so the run records it completed rather than failed: a failed change
+// would report an error and offer a retry of a change that already landed.
+func TestEngine_ExecuteSchemaChange_CleanupFailureAfterCutoverWithoutCancelIsCompleted(t *testing.T) {
+	final := runAlterWithCleanupFailureAfterCutover(t, "nocancel_cleanup_fails", false)
+	assert.Equal(t, engine.StateCompleted, final, "a change whose cutover committed is completed, whatever its cleanup did")
+}
+
+// runAlterWithCleanupFailureAfterCutover runs an ALTER on a fresh tableName
+// whose cutover commits and whose cleanup after it then fails: from the moment
+// Spirit logs the committed cutover, a session reading Spirit's checkpoint
+// table holds its metadata lock, so Spirit's drop of it times out. With
+// cancelAtCutover, the run's context is cancelled at that same moment, as a
+// stop, cancel, or shutdown landing just after the cutover would cancel it. It
+// checks that the scenario held and that the target holds the change, and
+// returns the state the run settled in.
+func runAlterWithCleanupFailureAfterCutover(t *testing.T, tableName string, cancelAtCutover bool) engine.State {
+	t.Helper()
+	dsn, db := setupTestMySQL(t)
+	cleanupTables(t, db)
+	_, err := db.ExecContext(t.Context(), fmt.Sprintf("CREATE TABLE `%s` (\n"+
+		"\tid INT PRIMARY KEY AUTO_INCREMENT,\n"+
+		"\tname VARCHAR(50) NOT NULL\n"+
+		")", tableName))
+	require.NoError(t, err, "create alter target table")
+	_, err = db.ExecContext(t.Context(), fmt.Sprintf("INSERT INTO `%s` (name) VALUES ('a'), ('b'), ('c')", tableName))
+	require.NoError(t, err, "seed rows")
+
+	// A short lock wait bounds how long the checkpoint drop waits before it
+	// fails, so the cleanup error arrives promptly.
+	eng := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), LockWaitTimeout: time.Second})
+	host, username, password, database, err := parseDSN(dsn)
+	require.NoError(t, err, "parseDSN")
+	eng.mu.Lock()
+	eng.runningSchemaChange = &runningSchemaChange{database: database, state: engine.StateRunning, started: time.Now()}
+	eng.mu.Unlock()
+
+	// Spirit logs the committed cutover before its cleanup, and the callback
+	// runs on Spirit's goroutine, so the checkpoint table's metadata lock is
+	// held before the cleanup tries to drop it.
+	checkpointTable := utils.CheckpointTableName(tableName)
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	var (
+		once    sync.Once
+		holder  *sql.Tx
+		holdErr error
+	)
+	eng.SetLogCallback(func(_ slog.Level, _ string, msg string) {
+		if !strings.Contains(msg, "final cut over operation complete") {
+			return
+		}
+		once.Do(func() {
+			if cancelAtCutover {
+				defer cancel()
+			}
+			tx, err := db.BeginTx(t.Context(), nil)
+			if err != nil {
+				holdErr = fmt.Errorf("begin transaction holding %s: %w", checkpointTable, err)
+				return
+			}
+			holder = tx
+			var n int
+			if err := tx.QueryRowContext(t.Context(), fmt.Sprintf("SELECT COUNT(*) FROM `%s`", checkpointTable)).Scan(&n); err != nil {
+				holdErr = fmt.Errorf("read %s to hold its metadata lock: %w", checkpointTable, err)
+			}
+		})
+	})
+
+	eng.executeSchemaChange(ctx, host, username, password, database,
+		[]string{fmt.Sprintf("ALTER TABLE `%s` MODIFY COLUMN `name` varchar(100) NOT NULL", tableName)}, false, directPolicy{})
+
+	require.NoError(t, holdErr, "hold the checkpoint table's metadata lock")
+	require.NotNil(t, holder, "the cutover must have committed while the change ran")
+	if cancelAtCutover {
+		require.Error(t, ctx.Err(), "the cancel must have landed after the cutover committed")
+	} else {
+		require.NoError(t, ctx.Err(), "nothing may cancel the run")
+	}
+	assert.True(t, testutil.TableExists(t, db, database, checkpointTable),
+		"Spirit's cleanup after the cutover must have failed for this scenario to apply")
+	require.NoError(t, holder.Rollback(), "release the checkpoint table's metadata lock")
+	eng.mu.Lock()
+	final := eng.runningSchemaChange.state
+	eng.mu.Unlock()
+	assert.False(t, testutil.TableExists(t, db, database, utils.OldTableName(tableName)),
+		"the swapped-out original is dropped as it would be by an uninterrupted run")
+	var maxLen int
+	require.NoError(t, db.QueryRowContext(t.Context(),
+		"SELECT CHARACTER_MAXIMUM_LENGTH FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND COLUMN_NAME = 'name'",
+		database, tableName).Scan(&maxLen))
+	assert.Equal(t, 100, maxLen, "the target holds the changed column")
+	return final
 }
 
 // Stopping a running ALTER that has a DROP TABLE queued after it must leave the

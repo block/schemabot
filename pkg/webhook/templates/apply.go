@@ -175,12 +175,19 @@ type ApplyStatusCommentData struct {
 	Rollback bool
 
 	// DeferCutover reports whether cutover waits on an explicit operator
-	// trigger (the apply's durable defer-cutover option). It selects the
-	// waiting-for-cutover footer: deferred applies get the pasteable
-	// `schemabot cutover` command, while non-deferred applies get a note that
-	// the drive triggers cutover automatically — surfacing the command there
-	// would tell the operator to act when no action is needed.
+	// trigger (the apply's durable defer-cutover option). Before cutover it
+	// is listed on the options line above the status, so a reader of a long
+	// copy or checksum knows the apply will pause and wait for them. It also
+	// selects the waiting-for-cutover footer: deferred applies get the
+	// pasteable `schemabot cutover` command, while non-deferred applies get a
+	// note that the drive triggers cutover automatically — surfacing the
+	// command there would tell the operator to act when no action is needed.
 	DeferCutover bool
+
+	// SkipRevert reports whether the apply was started with --skip-revert (the
+	// apply's durable skip-revert option). Before cutover it is listed on the
+	// options line beside DeferCutover, as the plan listed it.
+	SkipRevert bool
 
 	// PlanID names the plan this member is running, alongside the database and
 	// the apply identifier. It is set only when the members of one apply do not
@@ -234,6 +241,12 @@ func renderApplyStatusCommentBody(data ApplyStatusCommentData, includeLastUpdate
 
 	// Metadata line
 	writeApplyMetadata(&sb, data, renderedAt)
+
+	// The apply's options sit above the status: they hold for the whole apply
+	// while the status changes on every update.
+	if !data.InRolloutSection {
+		writeApplyOptions(&sb, data.DeferCutover, data.SkipRevert, data.State)
+	}
 
 	// Status line. For the revert window it carries the countdown to permanence
 	// inline (e.g. "Revert Window | Closes in 28m 30s") so the operator sees the
@@ -436,6 +449,41 @@ func writeApplyStatusDetail(sb *strings.Builder, data ApplyStatusCommentData) {
 	if state.IsState(data.State, state.Apply.Failed) {
 		writeSupportChannelOffer(sb)
 	}
+}
+
+// writeApplyOptions writes the apply's options line while the apply is still
+// working toward its cutover, listing every option it was started with the way
+// the plan did. For a deferred apply it tells the reader of a long copy that
+// the apply will wait for them at the cutover gate. Once a deferred apply waits
+// for cutover the footer gives the command itself, and after cutover the
+// options have nothing left to tell the reader.
+func writeApplyOptions(sb *strings.Builder, deferCutover, skipRevert bool, applyState string) {
+	if !precedesCutover(applyState) {
+		return
+	}
+	writeOptionsLine(sb, deferCutover, skipRevert)
+}
+
+// precedesCutover reports whether an apply in this state has not yet reached
+// cutover and will go through it: queued, copying rows or in a post-copy phase,
+// resuming that work, or preparing a PlanetScale branch and deploy request.
+// States that may or may not still be before cutover (recovering, retrying,
+// stopped, or a degraded rollout whose other deployments may already be
+// cutting over) are left out, so the line never claims a pause that has
+// passed.
+func precedesCutover(applyState string) bool {
+	return state.IsState(applyState,
+		state.Apply.Pending,
+		state.Apply.Resuming,
+		state.Apply.Running,
+		state.Apply.CatchingUp,
+		state.Apply.Checksumming,
+		state.Apply.PostChecksum,
+		state.Apply.PreparingBranch,
+		state.Apply.ApplyingBranchChanges,
+		state.Apply.ValidatingBranch,
+		state.Apply.CreatingDeployRequest,
+		state.Apply.ValidatingDeployRequest)
 }
 
 // queuedApplyExplanation follows the status line of an apply SchemaBot has
@@ -1883,6 +1931,8 @@ func ApplyStatusFromProgress(resp *apitypes.ProgressResponse, requestedBy string
 		ErrorMessage: resp.ErrorMessage,
 		StartedAt:    resp.StartedAt,
 		CompletedAt:  resp.CompletedAt,
+		DeferCutover: resp.Options["defer_cutover"] == "true",
+		SkipRevert:   resp.Options["skip_revert"] == "true",
 	}
 	data.RevertExpiresAt = resp.Metadata["revert_expires_at"]
 	if step, err := apitypes.ParseProgressStep(resp.Metadata); err != nil {
