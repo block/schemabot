@@ -1637,7 +1637,9 @@ func (c *LocalClient) cancelTasksQueuedBehindFailure(ctx context.Context, apply 
 // posts the terminal summary — run only once the outcome is durably stored.
 // When the apply cannot be reloaded or the outcome write fails, it returns an
 // error with the stored apply still active: the drive exits, and the claim
-// that picks the apply up next finalizes it and settles its requests then.
+// that picks the apply up next finalizes it and settles its requests then. A
+// write that returned an error counts as stored only when outcomeWriteLanded
+// proves storage holds it under this drive's lease.
 // Once the outcome is stored it returns nil whatever happens to the side
 // effects: a failed request settlement is logged and left for the operator's
 // post-drive settlement, and the summary still posts.
@@ -1672,7 +1674,7 @@ func (c *LocalClient) finalizeSequentialApply(ctx context.Context, apply *storag
 		logger.Info("apply already terminal in storage, not overwriting during sequential finalization",
 			"stored_state", freshApply.State)
 		*apply = *freshApply
-		if err := settlePendingRequestsForTerminalApply(ctx, c.storage, c.logger, apply); err != nil {
+		if err := SettlePendingRequestsForTerminalApply(ctx, c.storage, c.logger, apply); err != nil {
 			logger.Warn("failed to settle pending control requests for terminal sequential apply",
 				"error", err)
 		}
@@ -1687,12 +1689,22 @@ func (c *LocalClient) finalizeSequentialApply(ctx context.Context, apply *storag
 		if c.driveCancelled(ctx, apply, "while persisting the sequential outcome") {
 			return nil
 		}
-		// The stored apply is still active, so nothing that answers for its
-		// outcome may run: a pending control request completed here would
-		// resolve an operator's command against an apply storage still reports
-		// running, and the observer would post a terminal summary for it.
-		return fmt.Errorf("persist sequential outcome %s for apply %s (database %s) from stored state %s: %w",
-			apply.State, apply.ApplyIdentifier, apply.Database, previousState, err)
+		// The write may have committed with only its reply lost. When storage
+		// holds this outcome under this drive's lease, the write landed and
+		// the drive goes on to answer for it below.
+		landed, stored := c.outcomeWriteLanded(ctx, apply, apply.State, apply.ErrorMessage, err)
+		if !landed {
+			// The stored apply is still active, so nothing that answers for its
+			// outcome may run: a pending control request completed here would
+			// resolve an operator's command against an apply storage still
+			// reports running, and the observer would post a terminal summary
+			// for it.
+			return fmt.Errorf("persist sequential outcome %s for apply %s (database %s) from stored state %s: %w",
+				apply.State, apply.ApplyIdentifier, apply.Database, previousState, err)
+		}
+		logger.Warn("the write recording the sequential outcome returned an error, but storage holds it; continuing with the stored outcome",
+			append(stored.MutableLogAttrs(), "previous_state", previousState, "error", err)...)
+		*apply = *stored
 	}
 	// A sequential apply's failure reaches the operator through the same
 	// apply log stream as every other path, so a failed table does not read

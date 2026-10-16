@@ -122,12 +122,31 @@ func (s *controlRequestStore) listStrandedPending(ctx context.Context, limit int
 }
 
 func (s *controlRequestStore) RequestPending(ctx context.Context, req *storage.ApplyControlRequest) (*storage.ApplyControlRequest, bool, error) {
+	return s.requestPendingWithRetry(ctx, req, "")
+}
+
+// RequestPendingSuperseding is RequestPending with the superseded operation's
+// pending request completed in the same transaction. See
+// storage.ControlRequestStore.
+func (s *controlRequestStore) RequestPendingSuperseding(ctx context.Context, req *storage.ApplyControlRequest, superseded storage.ControlOperation) (*storage.ApplyControlRequest, bool, error) {
+	if superseded == "" {
+		return nil, false, fmt.Errorf("request control request for apply %d operation %s: superseded operation is required", req.ApplyID, req.Operation)
+	}
+	if superseded == req.Operation {
+		return nil, false, fmt.Errorf("request control request for apply %d operation %s: a request cannot supersede its own operation", req.ApplyID, req.Operation)
+	}
+	return s.requestPendingWithRetry(ctx, req, superseded)
+}
+
+// requestPendingWithRetry records req, completing superseded's pending request
+// in the same transaction when superseded is set.
+func (s *controlRequestStore) requestPendingWithRetry(ctx context.Context, req *storage.ApplyControlRequest, superseded storage.ControlOperation) (*storage.ApplyControlRequest, bool, error) {
 	var controlReq *storage.ApplyControlRequest
 	var alreadyPending bool
 	op := fmt.Sprintf("request control request for apply %d operation %s", req.ApplyID, req.Operation)
 	err := withLockRetry(ctx, s.classifier, op, func() error {
 		var attemptErr error
-		controlReq, alreadyPending, attemptErr = s.requestPending(ctx, req)
+		controlReq, alreadyPending, attemptErr = s.requestPending(ctx, req, superseded)
 		if attemptErr == nil || !s.classifier.IsDuplicateKey(attemptErr) {
 			return attemptErr
 		}
@@ -142,7 +161,7 @@ func (s *controlRequestStore) RequestPending(ctx context.Context, req *storage.A
 		// losing insert returns the winning row as "already requested"; if the
 		// re-read also fails, return that storage error instead of hiding an
 		// unexpected conflict.
-		controlReq, alreadyPending, attemptErr = s.requestPending(ctx, req)
+		controlReq, alreadyPending, attemptErr = s.requestPending(ctx, req, superseded)
 		if attemptErr != nil {
 			return fmt.Errorf("retry control request after duplicate insert for apply %d operation %s: %w", req.ApplyID, req.Operation, attemptErr)
 		}
@@ -154,13 +173,23 @@ func (s *controlRequestStore) RequestPending(ctx context.Context, req *storage.A
 	return controlReq, alreadyPending, nil
 }
 
-func (s *controlRequestStore) requestPending(ctx context.Context, req *storage.ApplyControlRequest) (*storage.ApplyControlRequest, bool, error) {
+func (s *controlRequestStore) requestPending(ctx context.Context, req *storage.ApplyControlRequest, superseded storage.ControlOperation) (*storage.ApplyControlRequest, bool, error) {
 	metadata := nullJSON(req.Metadata)
 	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
 		return nil, false, fmt.Errorf("begin control request transaction for apply %d operation %s: %w", req.ApplyID, req.Operation, err)
 	}
 	defer rollbackTx(ctx, tx, "request pending")
+
+	if superseded != "" {
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE apply_control_requests
+			SET status = ?, completed_at = COALESCE(completed_at, NOW()), updated_at = NOW()
+			WHERE apply_id = ? AND operation = ? AND status = ?
+		`, storage.ControlRequestCompleted, req.ApplyID, superseded, storage.ControlRequestPending); err != nil {
+			return nil, false, fmt.Errorf("complete pending %s control request for apply %d superseded by %s: %w", superseded, req.ApplyID, req.Operation, err)
+		}
+	}
 
 	existing, err := s.getByApplyOperationForUpdate(ctx, tx, req.ApplyID, req.Operation)
 	if err != nil {

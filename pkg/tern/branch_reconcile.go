@@ -9,6 +9,7 @@ import (
 	ps "github.com/planetscale/planetscale-go/planetscale"
 
 	"github.com/block/schemabot/pkg/engine/planetscale"
+	"github.com/block/schemabot/pkg/inventory"
 	"github.com/block/schemabot/pkg/storage"
 )
 
@@ -324,4 +325,99 @@ func (c *LocalClient) reclaimBranch(ctx context.Context, target *planetScalePull
 		return outcome, fmt.Errorf("hold apply target %s/%s/%s to delete branch %s: %w", c.config.Database, storage.DatabaseTypeVitess, environment, branch, err)
 	}
 	return outcome, err
+}
+
+// RecentTargetWindow is how far past the grace period a data plane looks back
+// for the PlanetScale targets it applied to, measured from each apply's last
+// write. A branch is orphaned no later than its apply settles, and settling
+// writes the apply, so the target stays listed for at least this long after
+// the branch first becomes reclaimable: a month of hourly passes to reclaim
+// it.
+const RecentTargetWindow = 30 * 24 * time.Hour
+
+// RecentTargetsReconcileResult counts what one TargetRouter pass did.
+type RecentTargetsReconcileResult struct {
+	// Targets is how many recently applied targets the pass visited.
+	Targets int
+	// Deleted is how many orphaned branches it deleted across them.
+	Deleted int
+	// Unreachable is how many of the visited targets this data plane can no
+	// longer reach (see branchReconcileTargetUnreachable). Their branches are
+	// kept, and they are not counted as failures.
+	Unreachable int
+}
+
+// ReconcileRecentTargetBranches runs LocalClient.ReconcileOrphanedBranches on
+// every PlanetScale target this data plane's applies were written for within
+// the grace period plus RecentTargetWindow.
+//
+// A data plane that resolves targets per request has no static list of
+// databases, so the targets come from its own storage: each distinct
+// (database, environment, target) its apply operations ran against. Each is
+// reached through the same route an apply on it takes, so the reconcile runs
+// with the client, and holds the apply target, that a drive of the apply would
+// use. opts.Environment is ignored: each target is reconciled under the
+// environment its applies were stored with.
+//
+// A target that cannot be resolved or reconciled is logged and the pass moves
+// on; the failures are joined and returned after every target is visited. A
+// target this data plane can no longer reach at all, because the inventory no
+// longer has it or its client has no PlanetScale client, is logged at warn and
+// not returned as a failure: it would otherwise fail every pass until it left
+// the window, and hide a failure on a target that can be reconciled.
+func (r *TargetRouter) ReconcileRecentTargetBranches(ctx context.Context, opts BranchReconcileOptions) (RecentTargetsReconcileResult, error) {
+	lookback := opts.Grace + RecentTargetWindow
+	targets, err := r.storage.ApplyOperations().ListRecentTargets(ctx, storage.DatabaseTypeVitess, lookback)
+	if err != nil {
+		return RecentTargetsReconcileResult{}, fmt.Errorf("reconcile branches: list PlanetScale targets applied to within %s: %w", lookback, err)
+	}
+	result := RecentTargetsReconcileResult{Targets: len(targets)}
+	var errs []error
+	for _, target := range targets {
+		deleted, err := r.reconcileTargetBranches(ctx, target, opts)
+		result.Deleted += deleted
+		switch {
+		case err == nil:
+		case branchReconcileTargetUnreachable(err):
+			result.Unreachable++
+			r.logger.Warn("branch reconcile skipped a recently applied target this data plane can no longer reach; its branches are kept and are not reconciled from here",
+				"database", target.Database, "environment", target.Environment, "target", target.Target, "error", err)
+		default:
+			r.logger.Error("branch reconcile on this target was incomplete; branches it could not judge or delete are kept and retried on the next pass",
+				"database", target.Database, "environment", target.Environment, "target", target.Target, "deleted", deleted, "error", err)
+			errs = append(errs, err)
+		}
+	}
+	return result, errors.Join(errs...)
+}
+
+// branchReconcileTargetUnreachable reports whether err says the target cannot
+// be reached at all, rather than that reaching it failed: the inventory
+// answered and no longer has the target, or the target's client has no
+// PlanetScale client. A resolver that cannot read the inventory, a missing
+// organization, and every PlanetScale API or storage error are not this.
+func branchReconcileTargetUnreachable(err error) bool {
+	return errors.Is(err, inventory.ErrTargetNotFound) || errors.Is(err, errPlanetScaleClientNotConfigured)
+}
+
+// reconcileTargetBranches reconciles one recently applied target on its
+// route's current client and returns how many branches it deleted.
+func (r *TargetRouter) reconcileTargetBranches(ctx context.Context, target storage.AppliedTarget, opts BranchReconcileOptions) (int, error) {
+	gen, err := r.clientOnlyForTarget(ctx, target.Target, storage.DatabaseTypeVitess, target.Environment, target.Database)
+	if err != nil {
+		return 0, fmt.Errorf("reconcile branches of %s/%s on target %q: %w", target.Database, target.Environment, target.Target, err)
+	}
+	defer r.release(gen)
+	reconciler, ok := gen.client.(interface {
+		ReconcileOrphanedBranches(context.Context, BranchReconcileOptions) (BranchReconcileResult, error)
+	})
+	if !ok {
+		return 0, fmt.Errorf("reconcile branches of %s/%s on target %q: client %T cannot reconcile branches", target.Database, target.Environment, target.Target, gen.client)
+	}
+	opts.Environment = target.Environment
+	reconciled, err := reconciler.ReconcileOrphanedBranches(ctx, opts)
+	if err != nil {
+		return reconciled.Deleted, fmt.Errorf("reconcile branches of %s/%s on target %q: %w", target.Database, target.Environment, target.Target, err)
+	}
+	return reconciled.Deleted, nil
 }

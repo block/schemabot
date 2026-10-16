@@ -19,7 +19,7 @@ type ProgressCmd struct {
 // Run executes the progress command.
 func (cmd *ProgressCmd) Run(g *Globals) error {
 	if cmd.ApplyID == "" {
-		return fmt.Errorf("apply_id is required (use '%s status -d <database>' to find active applies)", cliname.Name())
+		return fmt.Errorf("apply_id is required (use '%s' to find active applies)", cliname.Command("status", "-d", "<database>"))
 	}
 
 	ep, err := g.Resolve()

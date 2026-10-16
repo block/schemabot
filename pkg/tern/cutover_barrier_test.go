@@ -172,8 +172,8 @@ func TestTakesCutoverRequestInOrder(t *testing.T) {
 		scope applyTaskScope
 		want  bool
 	}{
-		{"multi-op barrier waits its turn", applyTaskScope{applyOperationID: 7, operation: barrierOp(), multiOperation: true}, true},
-		{"multi-op parallel waits its turn", applyTaskScope{applyOperationID: 7, operation: parallelOp(), multiOperation: true}, true},
+		{"multi-op barrier is held by earlier members", applyTaskScope{applyOperationID: 7, operation: barrierOp(), multiOperation: true}, true},
+		{"multi-op parallel is held by earlier members", applyTaskScope{applyOperationID: 7, operation: parallelOp(), multiOperation: true}, true},
 		{"multi-op rolling is unordered", applyTaskScope{applyOperationID: 7, operation: rollingOp(), multiOperation: true}, false},
 		{"single-op barrier has no siblings", applyTaskScope{applyOperationID: 7, operation: barrierOp()}, false},
 		{"whole-apply drive has no member", wholeApplyTaskScope(), false},

@@ -249,16 +249,26 @@ findings, each with output examples.
 ```console
 $ schemabot status -e staging
 1 active schema change
-4 total: 2 Completed · 1 Failed · 1 Running
 
-  APPLY ID          DATABASE  ENV      STATE      STARTED         SOURCE
-  apply-example-73  shop      staging  Running    10 minutes ago  https://github.com/acme/store/pull/42
-  apply-example-72  billing   staging  Completed  1 hour ago      https://github.com/acme/billing/pull/18
-  apply-example-71  catalog   staging  Failed     2 hours ago     https://github.com/acme/store/pull/40
-  apply-example-70  accounts  staging  Completed  3 hours ago     https://github.com/acme/accounts/pull/12
+  APPLY ID          DATABASE  ENV      STATE    STARTED         SOURCE
+  apply-example-73  shop      staging  Running  10 minutes ago  https://github.com/acme/store/pull/42
+
+Recent schema changes
+3 total: 2 Completed · 1 Failed
+
+  APPLY ID          DATABASE  ENV      STATE      STARTED      SOURCE
+  apply-example-72  billing   staging  Completed  1 hour ago   https://github.com/acme/billing/pull/18
+  apply-example-71  catalog   staging  Failed     2 hours ago  https://github.com/acme/store/pull/40
+  apply-example-70  accounts  staging  Completed  3 hours ago  https://github.com/acme/accounts/pull/12
 
 Use 'schemabot status <apply_id>' to view details
 ```
+
+Every active schema change is listed first, however long ago it started. The
+finished ones follow, newest first. Raise `--limit` to see more of them. Past
+the server's cap (1,000 applies, 200 plans), `status` and `list-plans` name the
+ID to pass to `--after` for the next page; `--all` follows every page for you. The [schema intelligence guide](schema-intelligence.md#whats-running-across-the-fleet)
+shows a paged walk.
 
 Inspect one apply with `status <apply_id>` for a single snapshot, or use
 `progress <apply_id>` to keep watching. The [progress example](#follow-and-control-a-change) shows the live view.
@@ -686,10 +696,10 @@ $ schemabot progress apply-example-84
        ALTER TABLE `orders` ADD INDEX `idx_status`(`status`);
        • Rows: 2,900,000 / 4,000,000 · ETA: 2m 45s
        • Shards: 4 (3 copying, 1 complete)
-           ◉ c0-: 45.00% · 450,000 / 1,000,000 rows · ETA: 2m 45s
-           ◉ 80-c0: 65.00% · 650,000 / 1,000,000 rows · ETA: 1m 45s
-           ◉ 40-80: 80.00% · 800,000 / 1,000,000 rows · ETA: 1m 0s
            ✓ -40: 1,000,000 rows
+           ◉ 40-80: 80.00% · 800,000 / 1,000,000 rows · ETA: 1m 0s
+           ◉ 80-c0: 65.00% · 650,000 / 1,000,000 rows · ETA: 1m 45s
+           ◉ c0-: 45.00% · 450,000 / 1,000,000 rows · ETA: 2m 45s
 
 
 ESC detach • c cancel
@@ -902,7 +912,7 @@ Waiting on an operator:
     apply: apply-example-68 (rolled_back)
     blocking reason: rollback_completed
     do: Reconcile the target environment. No plan and no new commit clears this on its own.
-  staging/shipments: The apply holding this check is stopped, so the check stays in progress and the gate stays closed.
+  staging/shipments: The apply holding this check is stopped, so the gate stays closed.
     apply: apply-example-81 (stopped)
     do: Start the apply or cancel it. It does not settle on its own, and no plan replaces a stopped apply's result.
 ```
@@ -1202,7 +1212,9 @@ names the `start` command that resumes it. A watcher that cannot reach the
 server retries with backoff, and exits non-zero once polls have kept failing
 for a few minutes in a row; the interactive watcher gives up on the same
 schedule. Giving up does not affect the apply. The error tells the operator to
-run `progress` with the apply ID to watch it again. When a refused poll
+run `progress` with the apply ID to watch it again. That command names the
+environment and any `--profile` or `--endpoint` the watch was started with, so
+pasting it reaches the same server. When a refused poll
 carries a `Retry-After` header, as a proxy or rate limiter in front of
 SchemaBot may send, a watcher waits at least that long before polling again,
 up to 5 minutes per poll, so a watcher held off this way takes longer to give

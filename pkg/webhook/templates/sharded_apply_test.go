@@ -603,8 +603,8 @@ func TestRenderShardedApplyComment_TableCopyProgressBar(t *testing.T) {
 
 	assert.Contains(t, out, "**`mutes`**: "+ui.ProgressBarRowCopy(62)+" 62%")
 	assert.Contains(t, out, "- Rows: 914,707 / 1,466,232 · ETA: 3m 15s")
-	assert.Contains(t, out, "- Rows: 914,707 / 1,466,232 · ETA: 3m 15s\n- Shards: 2 (2 copying)\n  - ◉ `80-`: 54%\n  - ◉ `-40`: 71%\n",
-		"the shard list sits below the rows line, the shard furthest behind first")
+	assert.Contains(t, out, "- Rows: 914,707 / 1,466,232 · ETA: 3m 15s\n- Shards: 2 (2 copying)\n  - ◉ `-40`: 71%\n  - ◉ `80-`: 54%\n",
+		"the shard list sits below the rows line, the shards in their own order")
 	assert.NotContains(t, out, "Row copy in progress", "the bar replaces the state phrase")
 	assert.NotContains(t, out, "across", "full coverage needs no disclosure")
 	assert.NotContains(t, out, "62% (", "full coverage carries no headline qualifier")
@@ -1192,4 +1192,63 @@ func TestShardedDDLFormatterFormatsEachStatementSetOnce(t *testing.T) {
 	require.Len(t, other, 1)
 	assert.Contains(t, other[0], "ALTER TABLE `blocks`")
 	assert.Len(t, formatter.blocks, 2)
+}
+
+// A table with one shard waiting for cutover, one checksumming, and one still
+// copying reads as its progress across all three, not as the phase of its most
+// pressing shard: the bar holds short of complete and the shard list says
+// where each shard stands.
+func TestRenderShardedApplyComment_MixedShardPhasesKeepTheBar(t *testing.T) {
+	out := RenderShardedApplyComment(ShardedApplyData{
+		State: state.Apply.Running, Environment: "staging", Database: "cdb_resolute",
+		ApplyID: "apply-x",
+		Keyspaces: []ShardedKeyspace{{
+			Keyspace: "cdb_resolute_sharded",
+			Tables: []ShardedTableStatus{{
+				Table: "mutes", Status: state.Task.Checksumming, RowsCopied: 2500, RowsTotal: 3000, ShardsReporting: 3,
+				Shards: []ShardProgressData{
+					{Shard: "-40", Status: state.Task.WaitingForCutover, PercentComplete: 100, RowsCopied: 1000, RowsTotal: 1000},
+					{Shard: "40-80", Status: state.Task.Checksumming, PercentComplete: 100, RowsCopied: 1000, RowsTotal: 1000, ChecksumRowsChecked: 250, ChecksumRowsTotal: 1000},
+					{Shard: "80-", Status: state.Task.Running, PercentComplete: 50, RowsCopied: 500, RowsTotal: 1000},
+				},
+			}},
+		}},
+	})
+
+	assert.Contains(t, out, "**`mutes`**: "+ui.ProgressBarRowCopy(83)+" 83%\n", "%s", out)
+	assert.NotContains(t, out, shardedTableStatusPhrase(state.Task.Checksumming))
+	assert.Contains(t, out, "  - ● `-40`: waiting for cutover\n  - ◉ `40-80`: checksumming 25.00% · 250 / 1,000 rows verified\n  - ◉ `80-`: 50.00% · 500 / 1,000 rows\n", "%s", out)
+}
+
+// A table's bar spans every shard it runs on, as a rollout's bar spans its
+// targets: rows copied on the shards that reported count by their rows, and a
+// shard that is queued or has not attached yet counts as nothing. One shard
+// cutting over beside one copying halfway reads 75%, and one verified shard
+// of four reads 25%, never the reporting shard's own figure.
+func TestRenderShardedApplyComment_PhaseBarSpansEveryShard(t *testing.T) {
+	render := func(table ShardedTableStatus) string {
+		return RenderShardedApplyComment(ShardedApplyData{
+			State: state.Apply.Running, Environment: "staging", Database: "shop", ApplyID: "apply-x",
+			Keyspaces: []ShardedKeyspace{{Keyspace: "shop_001", Tables: []ShardedTableStatus{table}}},
+		})
+	}
+
+	out := render(ShardedTableStatus{
+		Table: "orders", Status: state.Task.CuttingOver, RowsCopied: 1500, RowsTotal: 2000, ShardsReporting: 2,
+		Shards: []ShardProgressData{
+			{Shard: "-80", Status: state.Task.CuttingOver, PercentComplete: 100, RowsCopied: 1000, RowsTotal: 1000},
+			{Shard: "80-", Status: state.Task.Running, PercentComplete: 50, RowsCopied: 500, RowsTotal: 1000},
+		},
+	})
+	assert.Contains(t, out, "**`orders`**: "+ui.ProgressBarRowCopy(75)+" 75%\n", "%s", out)
+
+	out = render(ShardedTableStatus{
+		Table: "orders", Status: state.Task.Checksumming, RowsCopied: 1000, RowsTotal: 1000, ShardsReporting: 1, PlannedShards: 4,
+		Shards: []ShardProgressData{
+			{Shard: "-40", Status: state.Task.Checksumming, PercentComplete: 100, RowsCopied: 1000, RowsTotal: 1000, ChecksumRowsChecked: 250, ChecksumRowsTotal: 1000},
+			{Shard: "40-80", Status: state.Task.Pending},
+		},
+	})
+	assert.Contains(t, out, "**`orders`**: "+ui.ProgressBarRowCopy(25)+" 25%\n", "%s", out)
+	assert.Contains(t, out, "- Rows: 1,000 / 1,000 across 1 of 4 shards\n", "%s", out)
 }

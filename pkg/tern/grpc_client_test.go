@@ -2287,6 +2287,75 @@ func TestGRPCClient_ResumeApplyOperationDispatchParksBarrierCutoverRemotely(t *t
 		"the automatic barrier decision must not be persisted onto the shared apply options")
 }
 
+// After a data-plane outage, a rollout's parent reads failed_retryable while a
+// sibling target waits for its own retry. This target was already copying when
+// the outage hit, and its redispatch claim moved it back to running. When the
+// data plane reports it parked at the cutover barrier, the drive parks and
+// returns, freeing the target for the cutover claim. It does not keep polling
+// a parked target because the rollout parent reads failed_retryable.
+func TestGRPCClient_ResumeApplyOperationParksRedispatchedOperationUnderRetryableParent(t *testing.T) {
+	server := &capturingTernServer{
+		progressState:    ternv1.State_STATE_WAITING_FOR_CUTOVER,
+		progressStateSet: true,
+		progressTables: []*ternv1.TableProgress{{
+			Namespace:       "default",
+			TableName:       "users",
+			Status:          state.Task.WaitingForCutover,
+			PercentComplete: 100,
+		}},
+	}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+
+	apply := &storage.Apply{
+		ID:              7,
+		ApplyIdentifier: "apply-retryable-parent",
+		PlanID:          99,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+		State:           state.Apply.FailedRetryable,
+	}
+	apply.SetOptions(storage.ApplyOptions{Target: "testdb-target"})
+	operationID := int64(42)
+	siblingID := int64(43)
+	task := &storage.Task{
+		ID:               11,
+		TaskIdentifier:   "task-users",
+		ApplyID:          apply.ID,
+		ApplyOperationID: &operationID,
+		TableName:        "users",
+		DDL:              "ALTER TABLE users ADD COLUMN email varchar(255)",
+		DDLAction:        "alter",
+		Namespace:        "default",
+		State:            state.Task.Running,
+	}
+	applyStore := &mockApplyStore{apply: apply}
+	client.storage = &mockStorage{
+		applies: applyStore,
+		tasks: &mockTaskStore{
+			tasks:           []*storage.Task{task},
+			getByApplyIDErr: errors.New("whole-apply task load must not be used for operation-scoped resume"),
+		},
+		plans: &mockPlanStore{plan: &storage.Plan{ID: apply.PlanID, PlanIdentifier: "plan-retryable-parent"}},
+		operations: &mockApplyOperationStore{ops: map[int64]*storage.ApplyOperation{
+			operationID: {ID: operationID, ApplyID: apply.ID, Deployment: "west", State: state.ApplyOperation.Running,
+				CutoverPolicy: storage.CutoverPolicyBarrier, EngineResumeContext: "remote-op-west-1"},
+			siblingID: {ID: siblingID, ApplyID: apply.ID, Deployment: "east", State: state.ApplyOperation.FailedRetryable,
+				CutoverPolicy: storage.CutoverPolicyBarrier},
+		}},
+		logs: &mockApplyLogStore{},
+	}
+
+	// A generous deadline: the drive must return promptly at the barrier, not
+	// run until the deadline.
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	require.NoError(t, client.ResumeApplyOperation(ctx, apply, operationID))
+	assert.Equal(t, state.Task.WaitingForCutover, task.State, "the target's task records the barrier")
+	assert.Empty(t, applyStore.updates, "the rollout parent is owned by the projection, so the drive never writes it")
+}
+
 func TestGRPCClient_ResumeApplyOperationDispatchDoesNotDeferRollingCutover(t *testing.T) {
 	// A multi-deployment apply under the default rolling policy serializes copy
 	// and cutover per deployment, so its copy drive must NOT defer cutover — the
@@ -2690,6 +2759,58 @@ func TestGRPCClient_ResumeApplyCancelsUndispatchedApply(t *testing.T) {
 	cancelReq, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationCancel)
 	require.NoError(t, err)
 	assert.Nil(t, cancelReq, "the cancel request must be completed, not left pending for the next claim")
+}
+
+func TestGRPCClient_ResumeApplyStopsUndispatchedApply(t *testing.T) {
+	// An apply stopped before it was ever dispatched has no remote apply to
+	// address. The drive settles it in control-plane storage — the apply row
+	// stopped and the durable stop request completed — and sends nothing to
+	// the data plane.
+	server := &capturingTernServer{}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+
+	apply := &storage.Apply{
+		ID:              6,
+		ApplyIdentifier: "apply-undispatched-stop",
+		PlanID:          99,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+		State:           state.Apply.Pending,
+	}
+	task := &storage.Task{
+		ID:             11,
+		TaskIdentifier: "task-users",
+		ApplyID:        apply.ID,
+		TableName:      "users",
+		State:          state.Task.Pending,
+	}
+	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationStop,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "cli:alice",
+	}}}
+	client.storage = &mockStorage{
+		applies:         &mockApplyStore{apply: apply},
+		tasks:           &mockTaskStore{tasks: []*storage.Task{task}},
+		logs:            &mockApplyLogStore{},
+		controlRequests: controlRequests,
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	require.NoError(t, client.ResumeApply(ctx, apply))
+
+	assert.Empty(t, server.getStopApplyID(), "no remote stop should be sent for an undispatched apply")
+	assert.Empty(t, server.getApplyRequest(), "an apply stopped before dispatch must not be dispatched")
+	assert.Equal(t, state.Apply.Stopped, apply.State)
+
+	stopReq, err := controlRequests.GetByOperation(t.Context(), apply.ID, storage.ControlOperationStop)
+	require.NoError(t, err)
+	require.NotNil(t, stopReq)
+	assert.Equal(t, storage.ControlRequestCompleted, stopReq.Status, "the stop request must be completed, not left pending for the next claim")
 }
 
 func TestGRPCClient_ResumeApplyOperationCancelsUndispatchedOperationWithoutCompletingApplyCancel(t *testing.T) {
@@ -6181,6 +6302,51 @@ func TestGRPCClient_ProcessPendingStopSyncDoesNotTerminalizeDuringRetryablePause
 	assert.NotNil(t, stopReq, "the durable stop request must stay pending for the remote to consume")
 }
 
+// TestGRPCClient_StopSupersedesPendingCutover covers a remote deferred-cutover
+// apply whose stop landed on the data plane while a cutover queued before it
+// was still pending. Completing the stop fails that cutover with a reason the
+// operator can act on, so a later start cannot carry it into a table swap.
+func TestGRPCClient_StopSupersedesPendingCutover(t *testing.T) {
+	client, cleanup := testCapturingGRPCClient(t, &capturingTernServer{})
+	defer cleanup()
+
+	apply := &storage.Apply{
+		ID:              7,
+		ApplyIdentifier: "apply-grpc-stop-supersedes-cutover",
+		ExternalID:      "remote-grpc-stop-supersedes-cutover",
+		PlanID:          99,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+		State:           state.Apply.WaitingForCutover,
+	}
+	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{
+		{ID: 1, ApplyID: apply.ID, Operation: storage.ControlOperationCutover, Status: storage.ControlRequestPending, RequestedBy: "cli:alice"},
+		{ID: 2, ApplyID: apply.ID, Operation: storage.ControlOperationStop, Status: storage.ControlRequestPending, RequestedBy: "cli:bob"},
+	}}
+	storedApply := *apply
+	storedApply.State = state.Apply.Stopped
+	client.storage = &mockStorage{
+		applies:         &mockApplyStore{apply: &storedApply},
+		tasks:           &mockTaskStore{},
+		logs:            &mockApplyLogStore{},
+		controlRequests: controlRequests,
+	}
+
+	_, err := client.processPendingStopControlRequest(t.Context(), apply, wholeApplyTaskScope())
+	require.NoError(t, err)
+
+	stopReq, err := controlRequests.GetByOperation(t.Context(), apply.ID, storage.ControlOperationStop)
+	require.NoError(t, err)
+	require.NotNil(t, stopReq)
+	assert.Equal(t, storage.ControlRequestCompleted, stopReq.Status)
+	cutoverReq, err := controlRequests.GetByOperation(t.Context(), apply.ID, storage.ControlOperationCutover)
+	require.NoError(t, err)
+	require.NotNil(t, cutoverReq)
+	assert.Equal(t, storage.ControlRequestFailed, cutoverReq.Status)
+	assert.Equal(t, cutoverSupersededByStopMessage, cutoverReq.ErrorMessage)
+}
+
 func TestGRPCClient_ProcessPendingCancelSyncDoesNotTerminalizeDuringRetryablePause(t *testing.T) {
 	// A cancel accepted by the data plane while the remote apply is paused for
 	// a data-plane retry syncs against a STATE_FAILED snapshot whose tables
@@ -7704,16 +7870,24 @@ func TestGRPCClient_QueuedRemoteDispatchPredicate(t *testing.T) {
 // pending→running in a separate transaction before the drive runs, so a freshly
 // claimed operation reaches dispatch in running with no per-operation remote id
 // yet. That first dispatch must proceed — a running operation with an empty
-// remote id is not the ambiguous crash case the whole-apply path rejects.
+// remote id is not the ambiguous crash case the whole-apply path rejects. A
+// stop settles an operation with no remote id in storage alone, whether or not
+// it had been claimed, so the start that resumes it dispatches it under the
+// deployment's unchanged key: a dispatch that had reached the data plane is
+// replayed there rather than duplicated.
 func TestGRPCClient_QueuedRemoteDispatchPredicate_OperationScope(t *testing.T) {
 	tests := []struct {
 		name     string
 		opState  string
 		remoteID string
+		started  bool
 		multiOp  bool
 		want     bool
 	}{
 		{name: "multi-op running without remote id dispatches", opState: state.ApplyOperation.Running, multiOp: true, want: true},
+		{name: "multi-op resuming that never started dispatches", opState: state.ApplyOperation.Resuming, multiOp: true, want: true},
+		{name: "multi-op resuming that was claimed before its stop dispatches", opState: state.ApplyOperation.Resuming, started: true, multiOp: true, want: true},
+		{name: "multi-op resuming with remote id does not dispatch", opState: state.ApplyOperation.Resuming, remoteID: "remote-apply-123", multiOp: true, want: false},
 		{name: "multi-op pending without remote id dispatches", opState: state.ApplyOperation.Pending, multiOp: true, want: true},
 		{name: "multi-op running with remote id does not dispatch", opState: state.ApplyOperation.Running, remoteID: "remote-apply-123", multiOp: true, want: false},
 		{name: "multi-op terminal without remote id does not dispatch", opState: state.ApplyOperation.Completed, multiOp: true, want: false},
@@ -7725,13 +7899,18 @@ func TestGRPCClient_QueuedRemoteDispatchPredicate_OperationScope(t *testing.T) {
 			// The parent apply is running because a sibling deployment is active;
 			// the per-operation remote id (not apply.ExternalID) governs dispatch.
 			apply := &storage.Apply{State: state.Apply.Running}
+			operation := &storage.ApplyOperation{
+				State:               tt.opState,
+				EngineResumeContext: tt.remoteID,
+			}
+			if tt.started {
+				startedAt := time.Now()
+				operation.StartedAt = &startedAt
+			}
 			scope := applyTaskScope{
 				applyOperationID: 1,
-				operation: &storage.ApplyOperation{
-					State:               tt.opState,
-					EngineResumeContext: tt.remoteID,
-				},
-				multiOperation: tt.multiOp,
+				operation:        operation,
+				multiOperation:   tt.multiOp,
 			}
 			assert.Equal(t, tt.want, shouldDispatchQueuedRemoteApply(apply, scope))
 		})
@@ -8369,7 +8548,7 @@ func TestGRPCClient_ProcessPendingCutoverWaitsWhenNotReady(t *testing.T) {
 // A pending skip-revert request on a revert-window apply is the operator's retry
 // path: the drive proxies SkipRevert to the data plane, records revert_skipped,
 // and completes the request. Once the apply has left the revert window, the
-// request is moot and is completed without another engine call.
+// outcome it reaches answers the request without another engine call.
 func TestGRPCClient_ProcessPendingSkipRevert(t *testing.T) {
 	newApply := func(s string) *storage.Apply {
 		return &storage.Apply{
@@ -8406,21 +8585,36 @@ func TestGRPCClient_ProcessPendingSkipRevert(t *testing.T) {
 		assert.Nil(t, pending, "request completed after a successful skip")
 	})
 
-	t.Run("apply already left the revert window: completes without an engine call", func(t *testing.T) {
-		server := &capturingTernServer{}
-		client, cleanup := testCapturingGRPCClient(t, server)
-		defer cleanup()
-		apply := newApply(state.Apply.Completed)
-		store, controlRequests, _ := newStore(apply)
-		client.storage = store
+	// Outside the window the drive makes no engine call. A settled apply answers
+	// the request by its outcome, the same answer the local drive gives: only a
+	// completed apply is the skip-revert having taken effect. An apply still
+	// skipping the revert keeps the request pending for the terminal settlement.
+	for _, tc := range []struct {
+		applyState string
+		wantStatus storage.ControlRequestStatus
+	}{
+		{applyState: state.Apply.Completed, wantStatus: storage.ControlRequestCompleted},
+		{applyState: state.Apply.Reverted, wantStatus: storage.ControlRequestFailed},
+		{applyState: state.Apply.Failed, wantStatus: storage.ControlRequestFailed},
+		{applyState: state.Apply.SkippingRevert, wantStatus: storage.ControlRequestPending},
+	} {
+		t.Run("apply left the revert window as "+tc.applyState+": no engine call", func(t *testing.T) {
+			server := &capturingTernServer{}
+			client, cleanup := testCapturingGRPCClient(t, server)
+			defer cleanup()
+			apply := newApply(tc.applyState)
+			store, controlRequests, _ := newStore(apply)
+			client.storage = store
 
-		err := client.processPendingSkipRevertControlRequest(t.Context(), apply, apply.ExternalID)
-		require.NoError(t, err)
-		assert.Empty(t, server.getSkipRevertApplyID(), "no engine call once the revert window is gone")
-		pending, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationSkipRevert)
-		require.NoError(t, err)
-		assert.Nil(t, pending, "moot request completed")
-	})
+			err := client.processPendingSkipRevertControlRequest(t.Context(), apply, apply.ExternalID)
+			require.NoError(t, err)
+			assert.Empty(t, server.getSkipRevertApplyID(), "no engine call once the revert window is gone")
+			got, err := controlRequests.GetByOperation(t.Context(), apply.ID, storage.ControlOperationSkipRevert)
+			require.NoError(t, err)
+			require.NotNil(t, got)
+			assert.Equal(t, tc.wantStatus, got.Status)
+		})
+	}
 }
 
 func TestGRPCClient_ProcessPendingRevert(t *testing.T) {
@@ -8458,21 +8652,43 @@ func TestGRPCClient_ProcessPendingRevert(t *testing.T) {
 		assert.Nil(t, pending, "request completed after a successful revert")
 	})
 
-	t.Run("apply already left the revert window: completes without an engine call", func(t *testing.T) {
-		server := &capturingTernServer{}
-		client, cleanup := testCapturingGRPCClient(t, server)
-		defer cleanup()
-		apply := newApply(state.Apply.Completed)
-		store, controlRequests := newStore(apply)
-		client.storage = store
+	// Outside the window the drive makes no engine call. A settled apply answers
+	// the request by its outcome, the same answer the local drive gives: only a
+	// reverted apply is the revert having taken effect. A revert window that
+	// expired into a completed apply left the change live, so the revert is
+	// answered as not applied. An apply still reverting or skipping the revert
+	// keeps the request pending for the terminal settlement.
+	for _, tc := range []struct {
+		applyState string
+		wantStatus storage.ControlRequestStatus
+		wantError  string
+	}{
+		{applyState: state.Apply.Reverted, wantStatus: storage.ControlRequestCompleted},
+		{applyState: state.Apply.Completed, wantStatus: storage.ControlRequestFailed,
+			wantError: "the schema change completed before the revert could take effect; the change is live on the target"},
+		{applyState: state.Apply.Failed, wantStatus: storage.ControlRequestFailed,
+			wantError: "the schema change reached Failed before the revert could take effect"},
+		{applyState: state.Apply.Reverting, wantStatus: storage.ControlRequestPending},
+		{applyState: state.Apply.SkippingRevert, wantStatus: storage.ControlRequestPending},
+	} {
+		t.Run("apply left the revert window as "+tc.applyState+": no engine call", func(t *testing.T) {
+			server := &capturingTernServer{}
+			client, cleanup := testCapturingGRPCClient(t, server)
+			defer cleanup()
+			apply := newApply(tc.applyState)
+			store, controlRequests := newStore(apply)
+			client.storage = store
 
-		err := client.processPendingRevertControlRequest(t.Context(), apply, apply.ExternalID)
-		require.NoError(t, err)
-		assert.Empty(t, server.getRevertApplyID(), "no engine call once the revert window is gone")
-		pending, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationRevert)
-		require.NoError(t, err)
-		assert.Nil(t, pending, "moot request completed")
-	})
+			err := client.processPendingRevertControlRequest(t.Context(), apply, apply.ExternalID)
+			require.NoError(t, err)
+			assert.Empty(t, server.getRevertApplyID(), "no engine call once the revert window is gone")
+			got, err := controlRequests.GetByOperation(t.Context(), apply.ID, storage.ControlOperationRevert)
+			require.NoError(t, err)
+			require.NotNil(t, got)
+			assert.Equal(t, tc.wantStatus, got.Status)
+			assert.Equal(t, tc.wantError, got.ErrorMessage)
+		})
+	}
 }
 
 func TestGRPCClient_ProcessPendingCutoverWaitsWhileRecovering(t *testing.T) {
@@ -9504,55 +9720,37 @@ func TestRemoteApplyIdempotencyKey(t *testing.T) {
 		"distinct deployments must produce distinct keys")
 }
 
-// TestRemoteApplyIdempotencyKey_GenerationRotation verifies that a
-// deployment-scoped key rotates only on the operation's own dispatch
-// generation. The shared apply.Attempt advances when any sibling operation of
-// any deployment is redispatched, so a key derived from it would rotate under
-// an unrelated deployment's orphaned dispatch and duplicate its remote apply;
-// the deployment key must ignore it. The operation's own attempt advances only
-// on that operation's deliberate retry, which is exactly when the retried work
-// must dispatch fresh.
-func TestRemoteApplyIdempotencyKey_GenerationRotation(t *testing.T) {
-	opScope := func(parentAttempt, opAttempt int) (*storage.Apply, applyTaskScope) {
+// TestRemoteApplyIdempotencyKey_StableAcrossAttempts verifies that a
+// deployment-scoped key moves with neither attempt counter. The shared
+// apply.Attempt advances when any sibling operation of any deployment is
+// redispatched, and the operation's own attempt advances when its dispatch
+// failed before it attached. A deployment has exactly one data-plane apply, so
+// either rotation would reach the data plane as a new generation that takes the
+// deployment over from the apply its siblings are still running on.
+func TestRemoteApplyIdempotencyKey_StableAcrossAttempts(t *testing.T) {
+	opScope := func(parentAttempt, opAttempt int, operationKey string) (*storage.Apply, applyTaskScope) {
 		return &storage.Apply{ApplyIdentifier: "apply-abc123", Attempt: parentAttempt},
 			applyTaskScope{
 				applyOperationID: 1,
-				operation:        &storage.ApplyOperation{Deployment: "region-a", OperationKey: "commerce/users", Attempt: opAttempt},
+				operation:        &storage.ApplyOperation{Deployment: "region-a", OperationKey: operationKey, Attempt: opAttempt},
 				multiOperation:   true,
 			}
 	}
 
-	apply0, scope0 := opScope(0, 0)
+	apply0, scope0 := opScope(0, 0, "commerce/-80/users")
 	base := remoteApplyIdempotencyKey(apply0, scope0)
 
-	// A sibling deployment's retry advances the shared parent attempt while
-	// this deployment's dispatch is still orphaned mid-flight. Its key must not
-	// move, so the re-drive reuses the original dispatch instead of starting a
-	// duplicate remote apply.
-	applySiblingRetried, scopeOrphaned := opScope(3, 0)
+	applySiblingRetried, scopeOrphaned := opScope(3, 0, "commerce/-80/users")
 	assert.Equal(t, base, remoteApplyIdempotencyKey(applySiblingRetried, scopeOrphaned),
 		"the shared apply attempt must not rotate an orphaned deployment's key")
 
-	// The operation's own deliberate retry rotates the key so the retried work
-	// dispatches a fresh remote apply.
-	applyRetried, scopeRetried := opScope(1, 1)
-	assert.NotEqual(t, base, remoteApplyIdempotencyKey(applyRetried, scopeRetried),
-		"an operation's own advanced attempt must rotate the deployment key")
+	applyRetried, scopeRetried := opScope(1, 2, "commerce/-80/users")
+	assert.Equal(t, base, remoteApplyIdempotencyKey(applyRetried, scopeRetried),
+		"an operation's own retry must land on its deployment's one remote apply")
 
-	// A retry key is stable across a re-dispatch of the same attempt, so an
-	// orphaned retry dispatch is reused rather than duplicated.
-	assert.Equal(t, remoteApplyIdempotencyKey(applyRetried, scopeRetried),
-		remoteApplyIdempotencyKey(applyRetried, scopeRetried),
-		"the retry key must be stable within one attempt")
-
-	// A retry redispatches only its own operation — siblings that succeeded
-	// never dispatch again — so sibling retries must not share a remote apply:
-	// each retried operation gets its own operation-scoped key.
-	_, scopeSiblingRetried := opScope(1, 1)
-	scopeSiblingRetried.operation.OperationKey = "commerce/80-/users"
-	assert.NotEqual(t, remoteApplyIdempotencyKey(applyRetried, scopeRetried),
-		remoteApplyIdempotencyKey(applyRetried, scopeSiblingRetried),
-		"retried siblings must dispatch to distinct operation-scoped remote applies")
+	_, scopeSiblingRetried := opScope(1, 1, "commerce/80-/users")
+	assert.Equal(t, base, remoteApplyIdempotencyKey(applyRetried, scopeSiblingRetried),
+		"a retried sibling shares the deployment's key like every other sibling")
 }
 
 // A deployment-keyed dispatch carries the generation manifest — the full
@@ -9605,12 +9803,12 @@ func TestGenerationOperationKeys(t *testing.T) {
 	assert.Equal(t, []string{"commerce/-80/users"}, scopeOther.generationOperationKeys(),
 		"a deployment's manifest never includes another deployment's operations")
 
-	// A deliberate retry dispatches under an operation-scoped key, so its
-	// manifest declares only its own operation: the retry's remote apply never
-	// receives siblings, and declaring them would hold it open forever.
+	// A retry dispatches under its deployment's key onto the same remote
+	// apply, so it declares the same generation its first dispatch did.
+	firstDispatch := scope.generationOperationKeys()
 	scope.operation.Attempt = 1
-	assert.Equal(t, []string{"commerce/80-/users"}, scope.generationOperationKeys(),
-		"a retry's manifest is its own operation key alone")
+	assert.Equal(t, firstDispatch, scope.generationOperationKeys(),
+		"a retry declares the generation its deployment's remote apply already holds")
 }
 
 // A member settled at creation never dispatches, regardless of whether the
@@ -9664,7 +9862,7 @@ func TestGenerationOperationKeys_ConvergedMembers(t *testing.T) {
 			require.NoError(t, err)
 			assert.Equal(t, want, completed.generationOperationKeys(), "completion after dispatch must not narrow the generation")
 			completed.operation.Attempt = 1
-			assert.Equal(t, []string{ops.ops[1].OperationKey}, completed.generationOperationKeys(), "deliberate retries still declare only their own key")
+			assert.Equal(t, want, completed.generationOperationKeys(), "a retry lands on the same remote apply and declares the same generation")
 		})
 	}
 }
@@ -9691,13 +9889,13 @@ func TestGenerationOperationKeys_ClaimedOperationAlwaysDeclaresItself(t *testing
 }
 
 // The idempotency key and the generation manifest are derived independently
-// from the same scope, so they must rotate together on a deliberate retry: a
-// rotated key paired with a still-full manifest (or an unrotated key paired
-// with a narrowed one) creates a remote apply whose declared operation set can
-// never attach, holding it Running under the completion gate forever. This
-// exercises both derivations on one scope object across the attempt boundary
-// so the pairing cannot drift apart unnoticed.
-func TestRetryRotatesKeyAndManifestTogether(t *testing.T) {
+// from the same scope, so they must hold together across a retry: a key that
+// moved to a new generation paired with the deployment's manifest (or the
+// deployment's key paired with a narrowed manifest) creates a remote apply
+// whose declared operation set can never attach, holding it Running under the
+// completion gate forever. This exercises both derivations on one scope object
+// across the attempt boundary so the pairing cannot drift apart unnoticed.
+func TestRetryKeepsKeyAndManifestTogether(t *testing.T) {
 	apply := &storage.Apply{ApplyIdentifier: "apply-abc123"}
 	scope := applyTaskScope{
 		applyOperationID: 1,
@@ -9709,20 +9907,15 @@ func TestRetryRotatesKeyAndManifestTogether(t *testing.T) {
 		deploymentOperationKeys: []string{"commerce/-80/users", "commerce/80-/users", "commerce/group_finalizer"},
 	}
 
-	// First dispatch: a deployment-scoped key paired with the full deployment
-	// manifest, so the shared remote apply knows every sibling it must await.
 	firstKey := remoteApplyIdempotencyKey(apply, scope)
 	assert.Equal(t, scope.deploymentOperationKeys, scope.generationOperationKeys(),
 		"a first dispatch pairs its deployment key with the full deployment manifest")
 
-	// The operation's deliberate retry: the same scope must rotate the key to
-	// operation scope AND narrow the manifest to the retried operation alone —
-	// the retry's remote apply receives exactly this one operation.
 	scope.operation.Attempt = 1
-	assert.NotEqual(t, firstKey, remoteApplyIdempotencyKey(apply, scope),
-		"a deliberate retry rotates to an operation-scoped key")
-	assert.Equal(t, []string{"commerce/80-/users"}, scope.generationOperationKeys(),
-		"the retry narrows the manifest to its own operation in the same step as the key rotation")
+	assert.Equal(t, firstKey, remoteApplyIdempotencyKey(apply, scope),
+		"a retry keeps its deployment's key")
+	assert.Equal(t, scope.deploymentOperationKeys, scope.generationOperationKeys(),
+		"a retry keeps the deployment manifest its key's remote apply holds")
 }
 
 // A deployment-keyed dispatch shares one remote apply across sibling
@@ -10415,13 +10608,14 @@ func TestDefaultRPCDeadlineEndsAHungCall(t *testing.T) {
 // bound would cut its legitimate work off.
 func TestGRPCMethodDeadlineCoversEveryTernRPC(t *testing.T) {
 	heavy := map[string]bool{
-		ternv1.Tern_Apply_FullMethodName:             true,
-		ternv1.Tern_Plan_FullMethodName:              true,
-		ternv1.Tern_PlanDiff_FullMethodName:          true,
-		ternv1.Tern_PullSchema_FullMethodName:        true,
-		ternv1.Tern_Revert_FullMethodName:            true,
-		ternv1.Tern_SkipRevert_FullMethodName:        true,
-		ternv1.Tern_StorageSchemaPlan_FullMethodName: true,
+		ternv1.Tern_Apply_FullMethodName:                   true,
+		ternv1.Tern_Plan_FullMethodName:                    true,
+		ternv1.Tern_PlanDiff_FullMethodName:                true,
+		ternv1.Tern_CompareSchemaFileChange_FullMethodName: true,
+		ternv1.Tern_PullSchema_FullMethodName:              true,
+		ternv1.Tern_Revert_FullMethodName:                  true,
+		ternv1.Tern_SkipRevert_FullMethodName:              true,
+		ternv1.Tern_StorageSchemaPlan_FullMethodName:       true,
 	}
 	control := map[string]bool{
 		ternv1.Tern_Progress_FullMethodName: true,
