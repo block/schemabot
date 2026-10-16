@@ -1836,6 +1836,11 @@ type TableProgressResponse struct {
 	// estimate covers the whole table. A sharded table rolled up across its
 	// shards carries it, covering every shard.
 	EstimatedBytes *int64 `json:"estimated_bytes,omitempty"`
+	// EstimatedRows is the plan's approximate row count for the table, so a
+	// table that has not started copying can show how much it will copy.
+	// rows_total replaces it once the engine reports. Absent under the same
+	// rules as EstimatedBytes.
+	EstimatedRows *int64 `json:"estimated_rows,omitempty"`
 	// PlannedShards is how many shards a sharded table's change spans per its
 	// plan, the shards EstimatedBytes covers. Zero when the plan recorded no
 	// count and for a table not rolled up across shards.
@@ -1866,6 +1871,10 @@ type ShardProgressResponse struct {
 	ETASeconds      int64  `json:"eta_seconds,omitempty"`
 	PercentComplete int32  `json:"percent_complete"`
 	CutoverAttempts int32  `json:"cutover_attempts,omitempty"`
+	// Checksum phase progress: rows verified so far and total to verify.
+	// Non-zero only while the shard is checksumming (verifying copied data).
+	ChecksumRowsChecked int64 `json:"checksum_rows_checked,omitempty"`
+	ChecksumRowsTotal   int64 `json:"checksum_rows_total,omitempty"`
 }
 
 // GetTableName implements ddl.TableWithName for filtering Spirit internal tables.

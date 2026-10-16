@@ -1285,6 +1285,20 @@ type DatabaseConfig struct {
 	// must never move into repo-editable configuration, where a database team
 	// could grant themselves direct write with a self-merged PR.
 	OperatorGroups []string `yaml:"operator_groups,omitempty"`
+
+	// ReviewPolicy opts this database into the review gate on this server
+	// instance when the instance-wide review_policy leaves it off. It can
+	// only add the gate, never remove it.
+	ReviewPolicy DatabaseReviewPolicyConfig `yaml:"review_policy,omitempty"`
+}
+
+// DatabaseReviewPolicyConfig configures the review gate for one database.
+type DatabaseReviewPolicyConfig struct {
+	// Enabled turns on the review gate for this database's applies on this
+	// server instance, even when review_policy.enabled is false. Who can
+	// approve still comes from the instance-wide review_policy: its admins,
+	// repo admins, this database's operators, and CODEOWNERS when included.
+	Enabled bool `yaml:"enabled,omitempty"`
 }
 
 // PRCommandAuthorizationConfig configures actor authorization for mutating
@@ -2432,6 +2446,9 @@ func (c *ServerConfig) Validate() error {
 			return err
 		}
 		if err := validateDatabaseActorAuthorization(name, dbConfig); err != nil {
+			return err
+		}
+		if err := c.validateDatabaseReviewPolicy(name, dbConfig); err != nil {
 			return err
 		}
 		if err := validateDatabaseApp(name, dbConfig); err != nil {

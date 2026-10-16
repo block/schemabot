@@ -179,10 +179,34 @@ func (s *Service) ValidateRollbackSourceApply(ctx context.Context, req RollbackS
 		return apply, plan, controlConflictf("apply %s is not the schema change that the current rollback planner would select for database %s environment %s", apply.ApplyIdentifier, apply.Database, apply.Environment)
 	}
 	if latestTask.PlanID != apply.PlanID {
-		return apply, plan, terminalControlf("latest schema change task for database %s points to plan %d, but apply %s points to plan %d", apply.Database, latestTask.PlanID, apply.ApplyIdentifier, apply.PlanID)
+		memberOfRound, err := taskPlanIsMemberOfRound(ctx, planStore, latestTask, plan)
+		if err != nil {
+			return apply, plan, err
+		}
+		if !memberOfRound {
+			return apply, plan, terminalControlf("latest schema change task for database %s points to plan %d, but apply %s points to plan %d", apply.Database, latestTask.PlanID, apply.ApplyIdentifier, apply.PlanID)
+		}
+		s.logger.Debug("rollback source task ran a member plan of the apply's review round",
+			append(apply.LogAttrs(), "task_id", latestTask.TaskIdentifier, "task_plan_id", latestTask.PlanID)...)
 	}
 
 	return apply, plan, nil
+}
+
+// taskPlanIsMemberOfRound reports whether task ran a member plan stored for
+// the review round of primary. A rollout whose targets are each planned
+// against their own schema runs every target but the primary from a plan of
+// its own, bound to the primary plan, so its tasks legitimately point at a plan
+// other than the apply's.
+func taskPlanIsMemberOfRound(ctx context.Context, planStore storage.PlanStore, task *storage.Task, primary *storage.Plan) (bool, error) {
+	taskPlan, err := planStore.GetByID(ctx, task.PlanID)
+	if err != nil {
+		return false, fmt.Errorf("load plan %d of rollback source task %s: %w", task.PlanID, task.TaskIdentifier, err)
+	}
+	if taskPlan == nil {
+		return false, nil
+	}
+	return primary.PlanIdentifier != "" && taskPlan.PrimaryPlanIdentifier == primary.PlanIdentifier, nil
 }
 
 func validateRollbackSourceScope(req RollbackSourceRequest, apply *storage.Apply) error {
@@ -566,6 +590,37 @@ func (s *Service) executeCutoverForApply(ctx context.Context, client tern.Client
 		metrics.RecordControlOperation(ctx, "cutover", apply.Database, apply.Deployment, apply.Environment, "error")
 		return nil, 0, err
 	}
+	// One member's cutover in progress does not make the request redundant
+	// for the rest of a multi-operation apply: under an ordered policy another
+	// member can be parked and free to cut over at the same time. The turn is
+	// decided before the in-progress answer, so the request lands on that
+	// member, and the in-progress answer is left for when nothing is.
+	var turn cutoverTurn
+	if multiOp && (readiness == cutoverRequestReady || readiness == cutoverRequestAlreadyInProgress) {
+		turn, err = s.cutoverTurnForRequest(ctx, apply)
+		if err != nil {
+			err := fmt.Errorf("check cutover order for apply %s: %w", apply.ApplyIdentifier, err)
+			metrics.RecordControlOperation(ctx, "cutover", apply.Database, apply.Deployment, apply.Environment, "error")
+			return nil, 0, err
+		}
+		if hold := turn.hold; hold != nil {
+			s.logger.Info("cutover request rejected because an earlier member holds every parked member",
+				append(apply.LogAttrs(),
+					"requested_by", caller,
+					"parked_member", hold.parked,
+					"blocking_member", hold.blocker,
+					"blocking_state", hold.blockerState)...)
+			err := controlConflictf("%s", hold.message())
+			metrics.RecordControlOperation(ctx, "cutover", apply.Database, apply.Deployment, apply.Environment, "rejected")
+			return nil, 0, err
+		}
+		switch {
+		case turn.taker != nil:
+			readiness = cutoverRequestReady
+		case turn.inProgress:
+			readiness = cutoverRequestAlreadyInProgress
+		}
+	}
 	if readiness == cutoverRequestAlreadyInProgress {
 		metrics.RecordControlOperation(ctx, "cutover", apply.Database, apply.Deployment, apply.Environment, "success")
 		s.logControlOperationForApply(ctx, apply, caller, storage.LogEventCutoverTriggered,
@@ -588,26 +643,6 @@ func (s *Service) executeCutoverForApply(ctx context.Context, client tern.Client
 		metrics.RecordControlOperation(ctx, "cutover", apply.Database, apply.Deployment, apply.Environment, "rejected")
 		return nil, 0, err
 	}
-	var turn cutoverTurn
-	if multiOp {
-		turn, err = s.cutoverTurnForRequest(ctx, apply)
-		if err != nil {
-			err := fmt.Errorf("check cutover order for apply %s: %w", apply.ApplyIdentifier, err)
-			metrics.RecordControlOperation(ctx, "cutover", apply.Database, apply.Deployment, apply.Environment, "error")
-			return nil, 0, err
-		}
-		if hold := turn.hold; hold != nil {
-			s.logger.Info("cutover request rejected because no parked member is at its turn",
-				append(apply.LogAttrs(),
-					"requested_by", caller,
-					"parked_member", hold.parked,
-					"blocking_member", hold.blocker,
-					"blocking_state", hold.blockerState)...)
-			err := controlConflictf("%s", hold.message())
-			metrics.RecordControlOperation(ctx, "cutover", apply.Database, apply.Deployment, apply.Environment, "rejected")
-			return nil, 0, err
-		}
-	}
 	cutoverReq := &storage.ApplyControlRequest{
 		ApplyID:     apply.ID,
 		Operation:   storage.ControlOperationCutover,
@@ -615,7 +650,7 @@ func (s *Service) executeCutoverForApply(ctx context.Context, client tern.Client
 		RequestedBy: caller,
 	}
 	if turn.taker != nil {
-		// Bind the request to the member whose turn it is, so this one command
+		// Bind the request to the member that takes it, so this one command
 		// cuts over that member and cannot pass on to the next one.
 		cutoverReq.Metadata = storage.CutoverRequestMetadata(turn.taker.ID)
 	}
@@ -713,50 +748,65 @@ func (s *Service) cutoverRequestReadiness(ctx context.Context, client tern.Clien
 
 // cutoverTurnHold names the members of an ordered rollout when a cutover
 // request has no member that could take it: the first parked member, and the
-// earlier member whose turn it still is.
+// earlier member whose state holds it.
 type cutoverTurnHold struct {
-	parked       string
-	blocker      string
-	blockerState string
-	// blockerFailed is set when the blocker ended without completing, so the
-	// rollout's on_failure policy (blockerOnFailure) is what holds later
-	// cutovers behind it.
-	blockerFailed    bool
+	parked           string
+	blocker          string
+	blockerState     string
 	blockerOnFailure string
 }
 
-// message is the refusal an operator reads: which member holds the turn, its
-// state, and what lets the rollout go on from there.
+// message is the refusal an operator reads: which member holds the cutover,
+// its state, and what lets the rollout go on from there (storage
+// CutoverBlocker). An earlier target of the same deployment holds only in a
+// state the rollout halts on, so each of those cases names the one action
+// that clears it; an earlier deployment holds until it has completed, so the
+// default case names the member to wait for.
 func (h *cutoverTurnHold) message() string {
-	if h.blockerFailed {
+	switch h.blockerState {
+	case state.ApplyOperation.Failed:
 		next := "stop the schema change, or fix the failure and apply again"
 		if h.blockerOnFailure == storage.OnFailurePause {
 			next = "release the rollout to continue past it, or stop the schema change"
 		}
-		return fmt.Sprintf("cutover follows rollout order: %s is %s ahead of %s, and on_failure %s holds every later cutover; %s",
-			h.blocker, h.blockerState, h.parked, h.blockerOnFailure, next)
+		return fmt.Sprintf("cutover is held: %s failed ahead of %s, and on_failure %s holds every later cutover; %s",
+			h.blocker, h.parked, h.blockerOnFailure, next)
+	case state.ApplyOperation.FailedRetryable:
+		return fmt.Sprintf("cutover is held: %s is retrying a failure ahead of %s; run cutover again once %s recovers",
+			h.blocker, h.parked, h.blocker)
+	case state.ApplyOperation.Stopped:
+		return fmt.Sprintf("cutover is held: %s is stopped ahead of %s; start the schema change to resume it, or cancel it",
+			h.blocker, h.parked)
+	case state.ApplyOperation.Cancelled, state.ApplyOperation.Reverted:
+		return fmt.Sprintf("cutover is held: %s was %s ahead of %s, so later members do not cut over; stop the schema change and apply again",
+			h.blocker, h.blockerState, h.parked)
+	default:
+		return fmt.Sprintf("cutover follows deployment order: %s is in an earlier deployment than %s and is %s; run cutover again once %s has completed",
+			h.blocker, h.parked, h.blockerState, h.blocker)
 	}
-	return fmt.Sprintf("cutover follows rollout order: %s is ahead of %s and is %s; run cutover again once %s has completed",
-		h.blocker, h.parked, h.blockerState, h.blocker)
 }
 
 // cutoverTurn is the intake's answer for a cutover request on a
-// multi-operation apply. taker is the parked operation whose turn it is, which
-// the request is bound to; hold is set instead when no parked member may take
-// the request now. Both are nil when the apply's cutover is unordered, or when
-// no member is parked by task evidence, which leaves the decision to the
+// multi-operation apply. taker is the first parked operation whose cutover has
+// not started and that no earlier member holds, which the request is bound
+// to; hold is set instead when an earlier member holds every such operation.
+// inProgress reports, under an ordered policy with no taker and no hold, that
+// a member's cutover has already started, so the request has nothing left to
+// start. All are unset when the apply's cutover is unordered, or when no
+// member is parked by task evidence, which leaves the decision to the
 // caller's readiness check.
 type cutoverTurn struct {
-	taker *storage.ApplyOperation
-	hold  *cutoverTurnHold
+	taker      *storage.ApplyOperation
+	hold       *cutoverTurnHold
+	inProgress bool
 }
 
 // cutoverTurnForRequest decides which member of a multi-operation apply that
 // has a member parked at cutover may take a cutover request now. The request is
-// apply-level and only a parked member whose turn it is may take it (the
-// drive's own gate, operationCutoverRequestTurn in pkg/tern), so accepting one
-// while every parked member waits on an earlier member would queue it for a
-// consumer that is not there yet. A parked member under an unordered cutover
+// apply-level and only a parked member no earlier member holds may take it
+// (the drive's own gate, operationCutoverRequestTurn in pkg/tern), so
+// accepting one while an earlier member holds every parked member would queue
+// it for a consumer that is not there yet. A parked member under an unordered cutover
 // policy takes the request as it always has. The turn is decided by storage
 // CutoverBlocker, the rule the automatic cutover claim follows.
 func (s *Service) cutoverTurnForRequest(ctx context.Context, apply *storage.Apply) (cutoverTurn, error) {
@@ -773,19 +823,22 @@ func (s *Service) cutoverTurnForRequest(ctx context.Context, apply *storage.Appl
 	if err != nil {
 		return cutoverTurn{}, fmt.Errorf("load tasks for apply %s: %w", apply.ApplyIdentifier, err)
 	}
-	parked := make(map[int64]bool, len(ops))
+	tasksByOp := make(map[int64][]*storage.Task, len(ops))
 	for _, task := range tasks {
 		if task.ApplyOperationID == nil {
 			continue
 		}
-		if state.IsState(task.State, state.Task.WaitingForCutover, state.Task.CuttingOver) {
-			parked[*task.ApplyOperationID] = true
-		}
+		tasksByOp[*task.ApplyOperationID] = append(tasksByOp[*task.ApplyOperationID], task)
 	}
 	names := memberDisplayNames(ops)
 	var turn cutoverTurn
+	cutoverStarted := false
 	for i, op := range ops {
-		if !parked[op.ID] {
+		if cutoverStartedOnTasks(tasksByOp[op.ID]) {
+			cutoverStarted = true
+			continue
+		}
+		if !parkedOnTasks(tasksByOp[op.ID]) {
 			continue
 		}
 		if !storage.IsOrderedCutoverPolicy(op.CutoverPolicy) {
@@ -802,13 +855,39 @@ func (s *Service) cutoverTurnForRequest(ctx context.Context, apply *storage.Appl
 			turn.hold = &cutoverTurnHold{
 				parked:           names[i],
 				blocker:          memberDisplayName(ops, names, blocker),
-				blockerState:     blocker.State,
-				blockerFailed:    state.IsApplyOperationTerminal(blocker.State) && !state.IsState(blocker.State, state.ApplyOperation.Completed),
+				blockerState:     blocker.CutoverHoldState(tasksByOp[blocker.ID]),
 				blockerOnFailure: blocker.OnFailure,
 			}
 		}
 	}
+	if turn.hold == nil {
+		turn.inProgress = cutoverStarted
+	}
 	return turn, nil
+}
+
+// parkedOnTasks reports whether an operation's tasks are parked at the
+// cutover.
+func parkedOnTasks(tasks []*storage.Task) bool {
+	for _, task := range tasks {
+		if state.IsState(task.State, state.Task.WaitingForCutover) {
+			return true
+		}
+	}
+	return false
+}
+
+// cutoverStartedOnTasks reports whether an operation's cutover has started:
+// one of its tasks is cutting over. A request cuts over a member's remote
+// apply as a whole, so a member that has started is not one a later request
+// can take again.
+func cutoverStartedOnTasks(tasks []*storage.Task) bool {
+	for _, task := range tasks {
+		if state.IsState(task.State, state.Task.CuttingOver) {
+			return true
+		}
+	}
+	return false
 }
 
 // memberDisplayNames resolves the operator-facing name of every operation of
@@ -1029,10 +1108,25 @@ func (s *Service) completeImmediateStopRequestIfStopped(ctx context.Context, app
 	if controlStore == nil {
 		return false, fmt.Errorf("control request store is not available")
 	}
+	if err := s.settleCutoverSupersededByStop(ctx, storedApply); err != nil {
+		return false, err
+	}
 	if err := controlStore.CompletePending(ctx, apply.ID, storage.ControlOperationStop); err != nil {
 		return false, fmt.Errorf("complete pending stop control request for apply %s after immediate stop: %w", apply.ApplyIdentifier, err)
 	}
 	return true, nil
+}
+
+// settleCutoverSupersededByStop answers the cutover still pending when the
+// apply's stop took effect, so it cannot fire on the copy a later start
+// resumes. Callers settle it before completing the stop request (CO-4): the
+// pending stop keeps a drive from taking the cutover, so a failed settlement
+// leaves the stop pending for the retry that settles it.
+func (s *Service) settleCutoverSupersededByStop(ctx context.Context, apply *storage.Apply) error {
+	if err := tern.SettlePendingCutoverAfterStop(ctx, s.storage, s.logger, apply); err != nil {
+		return fmt.Errorf("settle pending cutover superseded by stop for apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	return nil
 }
 
 func stopRequestCompletedByApplyState(applyState string) bool {
@@ -1280,7 +1374,11 @@ func (s *Service) queueStopForApplyOwner(ctx context.Context, apply *storage.App
 		s.logger.Info("stop requested for a task-less apply; recording the durable request for the task-less settle path",
 			append(apply.LogAttrs(), "requested_by", caller)...)
 	}
-	controlReq, alreadyPending, err := s.createStopControlRequest(ctx, apply, caller, stoppedCount, skippedCount)
+	supersedesStart, err := s.stopSupersedesPendingStart(ctx, apply, caller)
+	if err != nil {
+		return nil, "", err
+	}
+	controlReq, alreadyPending, err := s.createStopControlRequest(ctx, apply, caller, stoppedCount, skippedCount, supersedesStart)
 	if err != nil {
 		return nil, "", err
 	}
@@ -1296,6 +1394,69 @@ func (s *Service) queueStopForApplyOwner(ctx context.Context, apply *storage.App
 		StoppedCount: stoppedCount,
 		SkippedCount: skippedCount,
 	}, "", nil
+}
+
+// stopSupersedesPendingStart reports whether a stop recorded on this apply
+// supersedes a pending start, which the stop's own write then completes in the
+// same transaction. An apply driven under the operation lease keeps its start
+// pending until it settles, because the operations the start resumes are
+// claimed one at a time on its behalf, and a pending start on a stopped apply
+// is what reopens it. Left pending under the new stop, that start would resume
+// the apply as soon as the stop landed on every operation. A stop is only
+// accepted for a non-terminal apply, so the start it supersedes has already
+// taken effect. An apply driven under the parent lease consumes its start when
+// its drive resumes, so its start is left to that drive.
+func (s *Service) stopSupersedesPendingStart(ctx context.Context, apply *storage.Apply, caller string) (bool, error) {
+	controlStore := s.storage.ControlRequests()
+	if controlStore == nil {
+		return false, fmt.Errorf("control request store is not available")
+	}
+	start, err := controlStore.GetPending(ctx, apply.ID, storage.ControlOperationStart)
+	if err != nil {
+		return false, fmt.Errorf("load pending start request for apply %s before recording a stop: %w", apply.ApplyIdentifier, err)
+	}
+	if start == nil {
+		return false, nil
+	}
+	ops, err := s.storage.ApplyOperations().ListByApply(ctx, apply.ID)
+	if err != nil {
+		return false, fmt.Errorf("list apply_operations for apply %s before recording a stop: %w", apply.ApplyIdentifier, err)
+	}
+	operationLease, err := s.applyDrivesUnderOperationLease(ctx, apply, ops)
+	if err != nil {
+		return false, fmt.Errorf("decide drive mode of apply %s before recording a stop: %w", apply.ApplyIdentifier, err)
+	}
+	if !operationLease {
+		s.logger.Info("stop requested while a start is pending on an apply driven under the parent lease; leaving the start to the drive that resumes it",
+			append(apply.LogAttrs(), "requested_by", caller, "start_requested_by", start.RequestedBy, "operation_count", len(ops))...)
+		return false, nil
+	}
+	s.logger.Info("stop requested while a start is pending on an apply driven under the operation lease; the stop write completes the start it supersedes",
+		append(apply.LogAttrs(), "requested_by", caller, "start_requested_by", start.RequestedBy, "operation_count", len(ops))...)
+	return true, nil
+}
+
+// applyDrivesUnderOperationLease reports whether the apply's operations are
+// driven under the operation lease, with the parent projected from them, rather
+// than under the parent lease. It mirrors the drive-mode decision in
+// recoverApplyOperation: a rollout of several operations, a lone operation
+// whose generation manifest still expects siblings, and a lone task-less
+// operation all drive under the operation lease. An apply with no operation
+// attached has not been driven yet, so no drive mode applies.
+func (s *Service) applyDrivesUnderOperationLease(ctx context.Context, apply *storage.Apply, ops []*storage.ApplyOperation) (bool, error) {
+	switch {
+	case len(ops) == 0:
+		return false, nil
+	case len(ops) > 1:
+		return true, nil
+	case len(apply.MissingExpectedOperationKeys(ops)) > 0:
+		return true, nil
+	}
+	hasTasks, err := s.claimedOperationHasTasks(ctx, ops[0])
+	if err != nil {
+		return false, err
+	}
+	return !hasTasks, nil
 }
 
 func stopRequestCounts(tasks []*storage.Task) (int64, int64) {
@@ -1336,11 +1497,36 @@ func (s *Service) createControlRequest(ctx context.Context, apply *storage.Apply
 	return controlReq, alreadyPending, nil
 }
 
-func (s *Service) createStopControlRequest(ctx context.Context, apply *storage.Apply, caller string, stoppedCount, skippedCount int64) (*storage.ApplyControlRequest, bool, error) {
-	return s.createControlRequest(ctx, apply, storage.ControlOperationStop, caller, stopControlRequestMetadata{
+// createStopControlRequest records the stop. When supersedesStart is set, the
+// apply's pending start is completed in the same transaction, so a failed stop
+// write leaves that start deliverable.
+func (s *Service) createStopControlRequest(ctx context.Context, apply *storage.Apply, caller string, stoppedCount, skippedCount int64, supersedesStart bool) (*storage.ApplyControlRequest, bool, error) {
+	metadata := stopControlRequestMetadata{
 		StoppedCount: stoppedCount,
 		SkippedCount: skippedCount,
-	})
+	}
+	if !supersedesStart {
+		return s.createControlRequest(ctx, apply, storage.ControlOperationStop, caller, metadata)
+	}
+	controlStore := s.storage.ControlRequests()
+	if controlStore == nil {
+		return nil, false, fmt.Errorf("control request store is not available")
+	}
+	metadataJSON, err := json.Marshal(metadata)
+	if err != nil {
+		return nil, false, fmt.Errorf("marshal stop control request metadata for apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	controlReq, alreadyPending, err := controlStore.RequestPendingSuperseding(ctx, &storage.ApplyControlRequest{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationStop,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: caller,
+		Metadata:    metadataJSON,
+	}, storage.ControlOperationStart)
+	if err != nil {
+		return nil, false, fmt.Errorf("record stop control request superseding the pending start for apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	return controlReq, alreadyPending, nil
 }
 
 // pendingControlResponseIfPresent loads any pending control request for the
@@ -1566,6 +1752,9 @@ func (s *Service) completeResolvedStopBeforeStart(ctx context.Context, client te
 	}
 
 	if stopRequestCompletedByApplyState(apply.State) {
+		if err := s.settleCutoverSupersededByStop(ctx, apply); err != nil {
+			return err
+		}
 		if err := controlStore.CompletePending(ctx, apply.ID, storage.ControlOperationStop); err != nil {
 			return fmt.Errorf("complete pending stop control request for apply %s before start: %w", apply.ApplyIdentifier, err)
 		}
@@ -1616,6 +1805,9 @@ func (s *Service) completeResolvedStopBeforeStart(ctx context.Context, client te
 		return s.reloadApplyAfterRefusedStopSync(ctx, apply, oldState, stopCaller, caller)
 	}
 	*apply = synced
+	if err := s.settleCutoverSupersededByStop(ctx, apply); err != nil {
+		return err
+	}
 	if err := controlStore.CompletePending(ctx, apply.ID, storage.ControlOperationStop); err != nil {
 		return fmt.Errorf("complete pending remote stop control request for apply %s before start: %w", apply.ApplyIdentifier, err)
 	}
@@ -2168,6 +2360,12 @@ func (s *Service) executeRevertForApply(ctx context.Context, client tern.Client,
 	}
 	s.logControlOperationForApply(ctx, apply, caller, storage.LogEventRevertTriggered, "Revert triggered by user")
 
+	if s.immediateControlSkippedForMultiOperationApply(ctx, apply, "revert", caller) {
+		metrics.RecordControlOperation(ctx, "revert", apply.Database, apply.Deployment, apply.Environment, "success")
+		s.wakeOperator(apply.ApplyIdentifier, apply.Database, apply.Environment)
+		return &apitypes.ControlResponse{Accepted: true}, http.StatusAccepted, nil
+	}
+
 	// Attempt the revert immediately. If it fails or this process dies, the
 	// durable request remains pending for the apply owner to retry.
 	resp, err := client.Revert(ctx, &ternv1.RevertRequest{
@@ -2200,6 +2398,28 @@ func (s *Service) executeRevertForApply(ctx context.Context, client tern.Client,
 	s.wakeOperator(apply.ApplyIdentifier, apply.Database, apply.Environment)
 
 	return &apitypes.ControlResponse{Accepted: resp.Accepted, ErrorMessage: apply.OperatorFacingMessage(resp.ErrorMessage)}, http.StatusOK, nil
+}
+
+// immediateControlSkippedForMultiOperationApply reports whether the immediate
+// engine attempt of a revert-window control must be skipped because the apply
+// spans several operations. Each operation drives against its own deployment
+// with its own remote apply, so an immediate call keyed on one apply id would
+// act on a single operation and, on acceptance, complete the whole durable
+// request before its siblings receive the command. The request is left pending
+// for the operations' drives instead. When the operation count cannot be
+// determined the immediate attempt is skipped for the same reason.
+func (s *Service) immediateControlSkippedForMultiOperationApply(ctx context.Context, apply *storage.Apply, operation, caller string) bool {
+	multiOp, err := s.applyHasMultipleOperations(ctx, apply)
+	if err != nil {
+		s.logger.Warn("could not determine apply operation count; immediate "+operation+" skipped and the durable request stays pending for the driver",
+			append(apply.LogAttrs(), "requested_by", caller, "error", err)...)
+		return true
+	}
+	if multiOp {
+		s.logger.Info("immediate "+operation+" skipped for multi-operation apply; the durable request stays pending for the operations' drives",
+			append(apply.LogAttrs(), "requested_by", caller)...)
+	}
+	return multiOp
 }
 
 // SkipRevertRequest is the HTTP request body for POST /api/skip-revert.
@@ -2297,6 +2517,12 @@ func (s *Service) executeSkipRevertForApply(ctx context.Context, client tern.Cli
 		return &apitypes.ControlResponse{Accepted: true, Status: apitypes.ControlStatusAlreadyRequested}, http.StatusAccepted, nil
 	}
 	s.logControlOperationForApply(ctx, apply, caller, storage.LogEventSkipRevertTriggered, "Skip-revert triggered by user")
+
+	if s.immediateControlSkippedForMultiOperationApply(ctx, apply, "skip-revert", caller) {
+		metrics.RecordControlOperation(ctx, "skip_revert", apply.Database, apply.Deployment, apply.Environment, "success")
+		s.wakeOperator(apply.ApplyIdentifier, apply.Database, apply.Environment)
+		return &apitypes.ControlResponse{Accepted: true}, http.StatusAccepted, nil
+	}
 
 	// Attempt the skip immediately. If it fails or this process dies, the durable
 	// request remains pending for the apply owner to retry.

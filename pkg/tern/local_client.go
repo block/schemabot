@@ -264,6 +264,17 @@ type LocalClient struct {
 	// observer in the registry.
 	// Protected by observerMu.
 	pendingObserver ProgressObserver
+
+	// observerPollCtx bounds every multi-operation observer poller this client
+	// starts; Close cancels it. Created with the first poller.
+	// Protected by observerMu.
+	observerPollCtx    context.Context
+	observerPollCancel context.CancelFunc
+
+	// observerPollIntervalOverride, when positive, replaces
+	// defaultObserverPollInterval. Tests lower it to observe notifications
+	// without waiting out the production cadence.
+	observerPollIntervalOverride time.Duration
 }
 
 type applyCancelHandle struct {
@@ -448,7 +459,12 @@ func engineNameToProto(name string) (ternv1.Engine, error) {
 
 // Close closes the client and releases resources.
 func (c *LocalClient) Close() error {
-	// LocalClient doesn't own storage, so nothing to close
+	// LocalClient doesn't own storage; it only stops its observer pollers.
+	c.observerMu.Lock()
+	defer c.observerMu.Unlock()
+	if c.observerPollCancel != nil {
+		c.observerPollCancel()
+	}
 	return nil
 }
 
@@ -1647,6 +1663,32 @@ func (c *LocalClient) Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv
 	}, nil
 }
 
+// CompareSchemaFileChange delegates a schema file comparison to the engine's
+// SchemaFileChangeComparer capability, and fails closed with
+// ErrCompareSchemaFileChangeUnsupported when the engine has none.
+func (c *LocalClient) CompareSchemaFileChange(ctx context.Context, req *ternv1.CompareSchemaFileChangeRequest) (*ternv1.CompareSchemaFileChangeResponse, error) {
+	if req == nil {
+		return nil, fmt.Errorf("schema file comparison request is required")
+	}
+	if req.Type != "" && req.Type != c.config.Type {
+		return nil, fmt.Errorf("compare schema file for database %s: request type %q does not match client type %q", c.config.Database, req.Type, c.config.Type)
+	}
+	comparer, ok := c.getEngine().(SchemaFileChangeComparer)
+	if !ok {
+		return nil, fmt.Errorf("compare schema file for database %s type %s: %w", c.config.Database, c.config.Type, ErrCompareSchemaFileChangeUnsupported)
+	}
+	resp, err := comparer.CompareSchemaFileChange(ctx, req)
+	if err != nil {
+		return nil, fmt.Errorf("compare schema file for database %s: %w", c.config.Database, err)
+	}
+	c.logger.Info("LocalClient.CompareSchemaFileChange: compared schema file",
+		"database", c.config.Database,
+		"type", c.config.Type,
+		"same", resp.GetSame(),
+		"reason", resp.GetReason())
+	return resp, nil
+}
+
 // PlanDiff computes this deployment's desired-vs-live diff without persisting a
 // plan. It shares the engine planning and proto conversion with Plan but stops
 // before storage, so its result is not applyable (no plan_id). It is the
@@ -2565,8 +2607,9 @@ func rejectUnsafeVSchemaChangesWithoutOptIn(plan *storage.Plan, applyOpts storag
 // existingIdempotentApply returns the apply previously created for
 // req.IdempotencyKey, or nil when the key is empty or unseen. The match is
 // returned regardless of the existing apply's state: the key encodes the
-// dispatch generation (apply id + attempt + operation), so "same key" means
-// "same generation", and a deliberate retry rotates the key via apply.Attempt.
+// dispatch generation, so "same key" means "same generation". A whole-apply
+// retry rotates the key via apply.Attempt; an operation-scoped dispatch keeps
+// its deployment's key across retries, since a deployment has one apply.
 // A stored apply whose environment, database, or type disagrees with the request
 // signals an accidental key reuse or a control-plane bug, which is surfaced as
 // an error rather than silently aliased.
@@ -2882,6 +2925,7 @@ func buildDispatchTasks(plan *storage.Plan, scope dispatchScope, environment, en
 			ExecutionMode:  ddlChange.ExecutionMode,
 			ModeReason:     ddlChange.ModeReason,
 			EstimatedBytes: ddlChange.TaskEstimatedBytes(scope.shard),
+			EstimatedRows:  ddlChange.TaskEstimatedRows(scope.shard),
 			CreatedAt:      now,
 			UpdatedAt:      now,
 		}
@@ -3770,6 +3814,7 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 		tp.RowsCopied = t.RowsCopied
 		tp.RowsTotal = t.RowsTotal
 		tp.EstimatedBytes = t.EstimatedBytes
+		tp.EstimatedRows = t.EstimatedRows
 		tp.ChecksumRowsChecked = t.ChecksumRowsChecked
 		tp.ChecksumRowsTotal = t.ChecksumRowsTotal
 		tp.Throttled = t.Throttled

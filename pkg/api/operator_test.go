@@ -7,7 +7,9 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"os"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -166,6 +168,59 @@ func TestResumeClaimedApplyWithOptions_SuppressesRecoveredObserverForMultiOp(t *
 	assert.False(t, observerSet, "a multi-op drive must not fire the per-driver observer hook")
 	assert.Zero(t, deploymentClient.observerApplyID, "no observer must be registered for a multi-op drive")
 	assert.Nil(t, deploymentClient.observer)
+}
+
+// A driver that claims a stopped apply tells the webhook handler, so the PR
+// Check Run can leave "stopped" as the apply starts again. It does so on both
+// drive shapes: a multi-operation rollout suppresses the per-driver observer,
+// but leaves its stop the same way a single apply does. An apply claimed from
+// any other state is not leaving a stop and does not fire it.
+func TestResumeClaimedApplyWithOptions_ReportsAStoppedApplyClaim(t *testing.T) {
+	cases := []struct {
+		name         string
+		claimedFrom  string
+		suppressHook bool
+		wantClaimed  bool
+	}{
+		{name: "single-operation drive of a stopped apply", claimedFrom: state.Apply.Stopped, wantClaimed: true},
+		{name: "multi-operation drive of a stopped rollout", claimedFrom: state.Apply.Stopped, suppressHook: true, wantClaimed: true},
+		{name: "drive of a pending apply", claimedFrom: state.Apply.Pending},
+		{name: "drive of a running apply recovered after a crash", claimedFrom: state.Apply.Running},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			deploymentClient := &mockTernClient{}
+			logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+			svc := New(&mockStorageWithApplyStores{
+				plans:   &staticPlanStore{},
+				applies: &staticApplyStore{},
+			}, &ServerConfig{}, map[string]tern.Client{
+				"east/staging": deploymentClient,
+			}, logger)
+			var claimed []*storage.Apply
+			svc.OnStoppedApplyClaimed = func(apply *storage.Apply) { claimed = append(claimed, apply) }
+			apply := &storage.Apply{
+				ID:              42,
+				ApplyIdentifier: "apply-42",
+				Database:        "appdb",
+				Deployment:      "east",
+				Environment:     "staging",
+				State:           tc.claimedFrom,
+			}
+
+			resumed, err := svc.resumeClaimedApplyWithOptions(t.Context(), 1, apply, 0, "east",
+				resumeClaimedApplyOptions{suppressRecoveredObserver: tc.suppressHook})
+
+			require.NoError(t, err)
+			assert.True(t, resumed)
+			if !tc.wantClaimed {
+				assert.Empty(t, claimed, "an apply claimed from %s is not leaving a stop", tc.claimedFrom)
+				return
+			}
+			require.Len(t, claimed, 1, "the claim of a stopped apply is reported once")
+			assert.Same(t, apply, claimed[0])
+		})
+	}
 }
 
 // An operator drive binds a drive-scoped logger once at the claim boundary, so
@@ -1040,6 +1095,32 @@ func TestUpdateApplyStateFromOperations_FirstFailedDeploymentWins(t *testing.T) 
 		"the reason must come from the first failed deployment in order, not a later failed sibling")
 }
 
+// TestUpdateApplyStateFromOperations_FailureNamesTheTarget verifies that when
+// one deployment addresses several targets, the surfaced reason names the
+// target that failed, since the deployment alone does not say which one did.
+func TestUpdateApplyStateFromOperations_FailureNamesTheTarget(t *testing.T) {
+	ops := []*storage.ApplyOperation{
+		{ID: 1, Deployment: "region-a", Target: "orders-001", State: state.ApplyOperation.Completed},
+		{ID: 2, Deployment: "region-a", Target: "orders-002", State: state.ApplyOperation.Failed, ErrorMessage: "spirit: duplicate entry"},
+		{ID: 3, Deployment: "region-a", Target: "orders-003", State: state.ApplyOperation.Cancelled},
+	}
+	applyStore := &recordingApplyStore{swapped: true}
+	svc := newOperatorStateTestService(&listingApplyOperationStore{ops: ops}, applyStore)
+
+	apply := &storage.Apply{
+		ID:              3,
+		ApplyIdentifier: "apply-projection",
+		State:           state.Apply.Running,
+		Environment:     "staging",
+	}
+
+	_, err := svc.updateApplyStateFromOperations(t.Context(), 1, apply, allowLeaseScopedFailedReopen)
+	require.NoError(t, err)
+	require.NotNil(t, applyStore.updated)
+	assert.Equal(t, state.Apply.Failed, applyStore.updated.State)
+	assert.Equal(t, "target orders-002 on deployment region-a failed: spirit: duplicate entry", applyStore.updated.ErrorMessage)
+}
+
 // TestUpdateApplyStateFromOperations_KeepsExistingMessageWhenNoOperationCarriesOne
 // verifies that a derived failed verdict preserves the apply's existing message
 // when no failed operation row carries one, rather than blanking the reason.
@@ -1411,6 +1492,87 @@ func TestCompletePendingControlRequestsIfApplyResolved(t *testing.T) {
 		assert.Equal(t, storage.ControlOperationStop, control.completed[0])
 	})
 
+	t.Run("fails a pending cutover when a cancel settled the apply", func(t *testing.T) {
+		applies := &getApplyStore{apply: &storage.Apply{ID: 9, ApplyIdentifier: "apply-cancelled", State: state.Apply.Cancelled}}
+		control := &fakeControlRequestStore{pending: map[storage.ControlOperation]*storage.ApplyControlRequest{
+			storage.ControlOperationCutover: pendingRequest(storage.ControlOperationCutover),
+		}}
+		svc := newStopReconcileTestService(applies, &markPendingStoppedRecordingStore{}, control)
+
+		require.NoError(t, svc.completePendingControlRequestsIfApplyResolved(t.Context(), svc.driverLogger(1), 9))
+		assert.Empty(t, control.completed, "a cancelled apply never cut over, so the cutover must not read as completed")
+		require.Equal(t, []storage.ControlOperation{storage.ControlOperationCutover}, control.failed)
+		assert.Equal(t, "cutover request was not applied because apply is cancelled", control.failureReasons[0])
+	})
+
+	t.Run("completes a pending cutover when the apply cut over", func(t *testing.T) {
+		applies := &getApplyStore{apply: &storage.Apply{ID: 9, ApplyIdentifier: "apply-done", State: state.Apply.Completed}}
+		control := &fakeControlRequestStore{pending: map[storage.ControlOperation]*storage.ApplyControlRequest{
+			storage.ControlOperationCutover: pendingRequest(storage.ControlOperationCutover),
+		}}
+		svc := newStopReconcileTestService(applies, &markPendingStoppedRecordingStore{}, control)
+
+		require.NoError(t, svc.completePendingControlRequestsIfApplyResolved(t.Context(), svc.driverLogger(1), 9))
+		assert.Equal(t, []storage.ControlOperation{storage.ControlOperationCutover}, control.completed)
+		assert.Empty(t, control.failed)
+	})
+
+	t.Run("fails the cutover a held-open apply's stop superseded", func(t *testing.T) {
+		applies := &getApplyStore{apply: &storage.Apply{ID: 9, ApplyIdentifier: "apply-degraded", State: state.Apply.RunningDegraded}}
+		control := &fakeControlRequestStore{pending: map[storage.ControlOperation]*storage.ApplyControlRequest{
+			storage.ControlOperationStop:    pendingRequest(storage.ControlOperationStop),
+			storage.ControlOperationCutover: pendingRequest(storage.ControlOperationCutover),
+		}}
+		ops := &markPendingStoppedRecordingStore{ops: []*storage.ApplyOperation{
+			{ID: 1, Deployment: "region-a", State: state.ApplyOperation.Stopped},
+			{ID: 2, Deployment: "region-b", State: state.ApplyOperation.Stopped},
+		}}
+		svc := newStopReconcileTestService(applies, ops, control)
+
+		require.NoError(t, svc.completePendingControlRequestsIfApplyResolved(t.Context(), svc.driverLogger(1), 9))
+		assert.Equal(t, []storage.ControlOperation{storage.ControlOperationStop}, control.completed)
+		require.Equal(t, []storage.ControlOperation{storage.ControlOperationCutover}, control.failed,
+			"a cutover queued before the stop must not fire when a later start resumes the copy")
+		assert.Contains(t, control.failureReasons[0], "superseded by stop")
+	})
+
+	// A revert or skip-revert whose in-drive answer did not land is answered
+	// here by the outcome the apply reached, the same answer the drive would
+	// have given, rather than left pending for the reaper to re-list forever.
+	for _, tc := range []struct {
+		op            storage.ControlOperation
+		applyState    string
+		wantCompleted []storage.ControlOperation
+		wantFailed    []storage.ControlOperation
+		wantReason    string
+	}{
+		{op: storage.ControlOperationRevert, applyState: state.Apply.Reverted,
+			wantCompleted: []storage.ControlOperation{storage.ControlOperationRevert}},
+		{op: storage.ControlOperationRevert, applyState: state.Apply.Completed,
+			wantFailed: []storage.ControlOperation{storage.ControlOperationRevert},
+			wantReason: "the schema change completed before the revert could take effect; the change is live on the target"},
+		{op: storage.ControlOperationSkipRevert, applyState: state.Apply.Completed,
+			wantCompleted: []storage.ControlOperation{storage.ControlOperationSkipRevert}},
+		{op: storage.ControlOperationSkipRevert, applyState: state.Apply.Reverted,
+			wantFailed: []storage.ControlOperation{storage.ControlOperationSkipRevert},
+			wantReason: "the schema change reached Reverted before the skip-revert could take effect"},
+	} {
+		t.Run(fmt.Sprintf("settles a pending %s on a %s apply by its outcome", tc.op, tc.applyState), func(t *testing.T) {
+			applies := &getApplyStore{apply: &storage.Apply{ID: 9, ApplyIdentifier: "apply-done", State: tc.applyState}}
+			control := &fakeControlRequestStore{pending: map[storage.ControlOperation]*storage.ApplyControlRequest{
+				tc.op: pendingRequest(tc.op),
+			}}
+			svc := newStopReconcileTestService(applies, &markPendingStoppedRecordingStore{}, control)
+
+			require.NoError(t, svc.completePendingControlRequestsIfApplyResolved(t.Context(), svc.driverLogger(1), 9))
+			assert.Equal(t, tc.wantCompleted, control.completed)
+			assert.Equal(t, tc.wantFailed, control.failed)
+			if tc.wantReason != "" {
+				assert.Equal(t, []string{tc.wantReason}, control.failureReasons)
+			}
+		})
+	}
+
 	t.Run("no-op when nothing is pending", func(t *testing.T) {
 		applies := &getApplyStore{apply: &storage.Apply{ID: 9, ApplyIdentifier: "apply-done", State: state.Apply.Failed}}
 		control := &fakeControlRequestStore{}
@@ -1419,6 +1581,107 @@ func TestCompletePendingControlRequestsIfApplyResolved(t *testing.T) {
 		require.NoError(t, svc.completePendingControlRequestsIfApplyResolved(t.Context(), svc.driverLogger(1), 9))
 		assert.Empty(t, control.completed, "no pending requests means nothing to complete")
 	})
+}
+
+// TestUpdateApplyStateFromOperations_StartReopensStoppedRollout covers an
+// operator starting a stopped multi-operation rollout: the start claim moves one
+// stopped operation to resuming, so the operation rows derive an active rollout
+// again over a parent that still reads stopped. The pending start is what makes
+// that reopen legitimate. Without one, a stopped parent never drifts back to an
+// active state.
+func TestUpdateApplyStateFromOperations_StartReopensStoppedRollout(t *testing.T) {
+	startedAt := time.Now().Add(-time.Minute)
+	ops := []*storage.ApplyOperation{
+		{ID: 1, OperationKey: "orders-001/step-1", State: state.ApplyOperation.Resuming, StartedAt: &startedAt},
+		{ID: 2, OperationKey: "orders-002/step-1", State: state.ApplyOperation.Stopped},
+	}
+	stoppedApply := func() *storage.Apply {
+		return &storage.Apply{ID: 3, ApplyIdentifier: "apply-stopped-rollout", State: state.Apply.Stopped, StartedAt: &startedAt, Environment: "staging"}
+	}
+
+	t.Run("a pending start reopens the stopped parent", func(t *testing.T) {
+		applyStore := &recordingApplyStore{swapped: true}
+		control := &fakeControlRequestStore{pending: map[storage.ControlOperation]*storage.ApplyControlRequest{
+			storage.ControlOperationStart: {ApplyID: 3, Operation: storage.ControlOperationStart, Status: storage.ControlRequestPending},
+		}}
+		svc := newStopReconcileTestService(applyStore, &listingApplyOperationStore{ops: ops}, control)
+
+		_, err := svc.updateApplyStateFromOperations(t.Context(), 1, stoppedApply(), allowLeaseScopedFailedReopen)
+		require.NoError(t, err)
+		require.NotNil(t, applyStore.updated, "the resumed rollout must move the parent out of stopped")
+		assert.Equal(t, state.Apply.Stopped, applyStore.expectedState, "the reopen compare-and-swaps on the stopped state read before deriving")
+		assert.False(t, state.IsTerminalApplyState(applyStore.updated.State), "the parent reads active while its operations resume, got %q", applyStore.updated.State)
+	})
+
+	t.Run("without a pending start the stopped parent is not reopened", func(t *testing.T) {
+		applyStore := &recordingApplyStore{swapped: true}
+		svc := newStopReconcileTestService(applyStore, &listingApplyOperationStore{ops: ops}, &fakeControlRequestStore{})
+
+		_, err := svc.updateApplyStateFromOperations(t.Context(), 1, stoppedApply(), allowLeaseScopedFailedReopen)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "child operations derive non-terminal state")
+		assert.Nil(t, applyStore.updated, "a stopped parent with no start must keep its stored state")
+	})
+}
+
+// An operator cancels a stopped two-target rollout. The cancel drive claims
+// each stopped operation in turn, moving it to resuming only so no peer
+// re-leases it, then settles it cancelled. A cancel resumes nothing, so the
+// parent reads stopped through every step and then cancelled, never moving
+// stopped → resuming → stopped, where each return to stopped would read as a
+// new terminal transition and post a Stopped summary in the middle of the
+// cancel. A start pending beside the cancel does not change that: the drive
+// delivers the cancel first.
+func TestUpdateApplyStateFromOperations_CancelHoldsStoppedRolloutStopped(t *testing.T) {
+	startedAt := time.Now().Add(-time.Minute)
+	stoppedApply := func() *storage.Apply {
+		return &storage.Apply{ID: 3, ApplyIdentifier: "apply-stopped-rollout", State: state.Apply.Stopped, StartedAt: &startedAt, Environment: "staging"}
+	}
+	operations := func(first, second string) []*storage.ApplyOperation {
+		return []*storage.ApplyOperation{
+			{ID: 1, OperationKey: "orders-001/step-1", State: first, StartedAt: &startedAt},
+			{ID: 2, OperationKey: "orders-002/step-1", State: second, StartedAt: &startedAt},
+		}
+	}
+	steps := []struct {
+		name       string
+		ops        []*storage.ApplyOperation
+		wantUpdate string
+	}{
+		{name: "first target claimed for the cancel", ops: operations(state.ApplyOperation.Resuming, state.ApplyOperation.Stopped)},
+		{name: "first target cancelled", ops: operations(state.ApplyOperation.Cancelled, state.ApplyOperation.Stopped)},
+		{name: "second target claimed for the cancel", ops: operations(state.ApplyOperation.Cancelled, state.ApplyOperation.Resuming)},
+		{name: "every target cancelled", ops: operations(state.ApplyOperation.Cancelled, state.ApplyOperation.Cancelled), wantUpdate: state.Apply.Cancelled},
+	}
+	for _, pending := range []struct {
+		name     string
+		requests []storage.ControlOperation
+	}{
+		{name: "cancel pending", requests: []storage.ControlOperation{storage.ControlOperationCancel}},
+		{name: "start and cancel pending", requests: []storage.ControlOperation{storage.ControlOperationStart, storage.ControlOperationCancel}},
+	} {
+		t.Run(pending.name, func(t *testing.T) {
+			for _, step := range steps {
+				t.Run(step.name, func(t *testing.T) {
+					requests := map[storage.ControlOperation]*storage.ApplyControlRequest{}
+					for _, operation := range pending.requests {
+						requests[operation] = &storage.ApplyControlRequest{ApplyID: 3, Operation: operation, Status: storage.ControlRequestPending}
+					}
+					applyStore := &recordingApplyStore{swapped: true}
+					svc := newStopReconcileTestService(applyStore, &listingApplyOperationStore{ops: step.ops}, &fakeControlRequestStore{pending: requests})
+
+					_, err := svc.updateApplyStateFromOperations(t.Context(), 1, stoppedApply(), allowLeaseScopedFailedReopen)
+					require.NoError(t, err)
+					if step.wantUpdate == "" {
+						assert.Nil(t, applyStore.updated, "the parent stays stopped while the cancel is delivered")
+						return
+					}
+					require.NotNil(t, applyStore.updated, "the settled cancel moves the parent")
+					assert.Equal(t, step.wantUpdate, applyStore.updated.State)
+				})
+			}
+		})
+	}
 }
 
 // TestUpdateApplyStateFromOperations_StaleWriteSkipped verifies that when the
@@ -2007,6 +2270,182 @@ func TestResumeClaimedApply_DrivePanicFailsApply(t *testing.T) {
 	assert.Contains(t, taskStore.updated[0].ErrorMessage, "corrupt engine metadata")
 }
 
+// snapshotTaskStore stores task rows the way storage does: a read returns a
+// copy, and a row changes only when its write succeeds. refuse names the tasks
+// whose writes fail with refuseErr.
+type snapshotTaskStore struct {
+	storage.TaskStore
+	rows      map[int64]storage.Task
+	refuse    map[int64]bool
+	refuseErr error
+}
+
+func (s *snapshotTaskStore) GetByApplyID(_ context.Context, applyID int64) ([]*storage.Task, error) {
+	var tasks []*storage.Task
+	for _, id := range slices.Sorted(maps.Keys(s.rows)) {
+		if row := s.rows[id]; row.ApplyID == applyID {
+			tasks = append(tasks, &row)
+		}
+	}
+	return tasks, nil
+}
+
+func (s *snapshotTaskStore) Update(_ context.Context, task *storage.Task) error {
+	if s.refuse[task.ID] {
+		return s.refuseErr
+	}
+	s.rows[task.ID] = *task
+	return nil
+}
+
+// A drive panic is contained while storage refuses one task's failed verdict.
+// The apply is still failed: an apply left active would be claimed again and
+// resumed through the engine, feeding the input that panicked straight back.
+// The refused task keeps its stored running state until the stranded
+// active-task reaper settles it under the failed apply.
+func TestResumeClaimedApply_DrivePanicWithRefusedTaskVerdictStillFailsApply(t *testing.T) {
+	client := &panickingResumeClient{panicValue: "corrupt engine metadata"}
+	apply := &storage.Apply{
+		ID:              42,
+		ApplyIdentifier: "apply-42",
+		Database:        "appdb",
+		Deployment:      "east",
+		Environment:     "staging",
+		State:           state.Apply.Running,
+		LeaseOwner:      "driver-0",
+		LeaseToken:      "lease-token",
+	}
+	applyStore := &panicContainmentApplyStore{apply: apply}
+	taskStore := &snapshotTaskStore{
+		rows: map[int64]storage.Task{
+			9:  {ID: 9, ApplyID: 42, TaskIdentifier: "task-orders", State: state.Task.Running},
+			10: {ID: 10, ApplyID: 42, TaskIdentifier: "task-users", State: state.Task.Running},
+		},
+		refuse:    map[int64]bool{9: true},
+		refuseErr: errors.New("storage unavailable"),
+	}
+	svc := New(&mockStorageWithApplyStores{
+		plans:   &staticPlanStore{},
+		applies: applyStore,
+		tasks:   taskStore,
+	}, &ServerConfig{}, map[string]tern.Client{
+		"east/staging": client,
+	}, slog.New(slog.DiscardHandler))
+
+	ctx := storage.WithApplyLease(t.Context(), apply.Lease())
+	claimed := *apply
+	var err error
+	require.NotPanics(t, func() {
+		_, err = svc.resumeClaimedApply(ctx, 0, &claimed, 0, "")
+	})
+
+	var drivePanic *panicsafe.Error
+	require.ErrorAs(t, err, &drivePanic)
+	require.True(t, applyStore.updateCalled, "the apply is failed even though a task verdict did not land")
+	assert.True(t, state.IsState(applyStore.apply.State, state.Apply.Failed),
+		"failed (permanent), so no claim resumes the apply through the engine again")
+	assert.True(t, state.IsState(taskStore.rows[9].State, state.Task.Running),
+		"the refused verdict leaves the stored row as it was, for the stranded active-task reaper")
+	assert.True(t, state.IsState(taskStore.rows[10].State, state.Task.Failed),
+		"a refused verdict does not stop the later tasks recording theirs")
+}
+
+// refusedVerdictLogLine is the subset of a JSON log line the refused task
+// verdict test reads.
+type refusedVerdictLogLine struct {
+	Level               string `json:"level"`
+	Msg                 string `json:"msg"`
+	ApplyID             string `json:"apply_id"`
+	State               string `json:"state"`
+	TaskID              string `json:"task_id"`
+	Table               string `json:"table"`
+	StoredState         string `json:"stored_state"`
+	AttemptedState      string `json:"attempted_state"`
+	ApplyOperationID    *int64 `json:"apply_operation_id"`
+	OperationDeployment string `json:"operation_deployment"`
+}
+
+// A drive panic is contained while storage refuses a task's failed verdict,
+// and the refusal is logged by cause so an operator can triage it: a lost
+// lease and a cancelled drive are warnings, a rejected value and a storage
+// error are errors. Each line reports the state the rows actually hold — the
+// apply's state and the task's stored state — with the refused verdict under
+// its own key, and carries the operation routing attributes.
+func TestFailClaimedApplyAfterDrivePanic_RefusedVerdictLogsByCause(t *testing.T) {
+	cases := []struct {
+		name      string
+		refuseErr error
+		cancel    bool
+		wantLevel string
+		wantMsg   string
+	}{
+		{"lease lost", fmt.Errorf("update task: %w", storage.ErrApplyLeaseLost), false, "WARN", "because the drive's lease was lost"},
+		{"cancelled", errors.New("context canceled"), true, "WARN", "because the drive was cancelled"},
+		{"value rejected", fmt.Errorf("update task: %w", storage.ErrValueRejected), false, "ERROR", "storage cannot hold a value it carries; the apply's failed verdict is attempted next"},
+		{"storage error", errors.New("storage unavailable"), false, "ERROR", "storage error recording task failed verdict while containing drive panic; the apply's failed verdict is attempted next"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			logger := slog.New(slog.NewJSONHandler(&buf, nil))
+			apply := &storage.Apply{
+				ID:              42,
+				ApplyIdentifier: "apply-42",
+				Database:        "appdb",
+				Environment:     "staging",
+				State:           state.Apply.Running,
+				LeaseOwner:      "driver-0",
+				LeaseToken:      "lease-token",
+			}
+			applyStore := &panicContainmentApplyStore{apply: apply}
+			taskStore := &snapshotTaskStore{
+				rows: map[int64]storage.Task{
+					9: {ID: 9, ApplyID: 42, TaskIdentifier: "task-orders", TableName: "orders", State: state.Task.WaitingForCutover},
+				},
+				refuse:    map[int64]bool{9: true},
+				refuseErr: tc.refuseErr,
+			}
+			svc := New(&mockStorageWithApplyStores{
+				plans:   &staticPlanStore{},
+				applies: applyStore,
+				tasks:   taskStore,
+			}, &ServerConfig{}, map[string]tern.Client{}, logger)
+
+			ctx := storage.WithApplyLease(t.Context(), apply.Lease())
+			if tc.cancel {
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithCancel(ctx)
+				cancel()
+			}
+			claimed := *apply
+			failed := svc.failClaimedApplyAfterDrivePanic(ctx, 0, &claimed, 0, "east", &panicsafe.Error{Value: "boom"})
+			assert.True(t, failed, "the apply's failed verdict is still written after a refused task verdict")
+
+			var refusal *refusedVerdictLogLine
+			for raw := range bytes.SplitSeq(bytes.TrimSpace(buf.Bytes()), []byte("\n")) {
+				var line refusedVerdictLogLine
+				require.NoError(t, json.Unmarshal(raw, &line))
+				if bytes.Contains([]byte(line.Msg), []byte(tc.wantMsg)) {
+					refusal = &line
+				}
+			}
+			require.NotNil(t, refusal, "no log line carried %q:\n%s", tc.wantMsg, buf.String())
+			assert.Equal(t, tc.wantLevel, refusal.Level)
+			assert.Equal(t, "apply-42", refusal.ApplyID)
+			assert.Equal(t, state.Apply.Running, refusal.State,
+				"state is the apply's, which containment has not written yet, not the refused task verdict")
+			assert.Equal(t, "task-orders", refusal.TaskID)
+			assert.Equal(t, "orders", refusal.Table)
+			assert.Equal(t, state.Task.WaitingForCutover, refusal.StoredState,
+				"stored_state is the state the task row still holds")
+			assert.Equal(t, state.Task.Failed, refusal.AttemptedState)
+			require.NotNil(t, refusal.ApplyOperationID, "the operation routing attributes are logged")
+			assert.Equal(t, int64(0), *refusal.ApplyOperationID)
+			assert.Equal(t, "east", refusal.OperationDeployment)
+		})
+	}
+}
+
 // A drive panic contained while holding only an operation lease fails the
 // operation's tasks but leaves the parent applies row untouched: under the
 // multi-operation fan-out the parent state is owned by the rollout projection,
@@ -2495,4 +2934,37 @@ func TestMarkOperationFromOwnResult_TasklessVSchemaOnlyMirrorsParentWhenDriveLef
 	require.NoError(t, err)
 	assert.False(t, marked, "a still-running operation must be left claimable for a later poll")
 	assert.False(t, opStore.written, "no state write should occur while the operation is still in flight")
+}
+
+// Only the projection that takes a stopped rollout back into flight reattaches
+// the PR progress observer. A lost race, a rollout that was never stopped, and a
+// stop settled by a cancel all leave the observer alone.
+func TestRolloutLeftStop(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		projection applyProjectionResult
+		want       bool
+	}{
+		{
+			name:       "start resumes a stopped rollout",
+			projection: applyProjectionResult{Swapped: true, PreviousState: state.Apply.Stopped, DerivedState: state.Apply.Resuming},
+			want:       true,
+		},
+		{
+			name:       "another drive won the swap",
+			projection: applyProjectionResult{Swapped: false, PreviousState: state.Apply.Stopped, DerivedState: state.Apply.Resuming},
+		},
+		{
+			name:       "rollout was already running",
+			projection: applyProjectionResult{Swapped: true, PreviousState: state.Apply.Running, DerivedState: state.Apply.WaitingForCutover},
+		},
+		{
+			name:       "cancel settles the stopped rollout",
+			projection: applyProjectionResult{Swapped: true, PreviousState: state.Apply.Stopped, DerivedState: state.Apply.Cancelled},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, rolloutLeftStop(tc.projection))
+		})
+	}
 }

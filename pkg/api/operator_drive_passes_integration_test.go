@@ -6,6 +6,7 @@ import (
 	"context"
 	"log/slog"
 	"os"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -66,6 +67,66 @@ func TestOperatorCutsOverParallelMembersBackToBackWithoutWaitingForATick(t *test
 	}
 
 	assert.Equal(t, members, rec.resumeOrder(), "swaps must run one at a time in rollout order")
+	for _, dep := range members {
+		assert.Equal(t, state.ApplyOperation.Completed, opState(t, ctx, stor, seed.opID(dep)),
+			"operation %s must be completed", dep)
+	}
+}
+
+// A parallel rollout of three targets is queued while every driver is idle,
+// and the wake that follows reaches one driver. The rollout must still start
+// all three copies at once, within the apply's driver cap, rather than one
+// per poll tick: each driver that starts a copy wakes an idle peer, which
+// claims the next. Every drive blocks until all three are running together,
+// so the rollout only finishes if the starts fan out at claim speed.
+func TestOperatorStartsParallelMembersTogetherFromOneWake(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+	ctx := t.Context()
+	db := openMatrixStorage(t)
+	members := []string{"region-a", "region-b", "region-c"}
+	stor := mysqlstore.New(db, storage.WithMaxDriversPerApply(len(members)))
+	claims := &claimMissCountingStorage{Storage: stor}
+
+	rec := &driveRecorder{}
+	gate := newDriveGate(t, len(members))
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	svc := New(claims, &ServerConfig{Drivers: len(members)}, matrixClients(stor, rec, map[string]matrixOutcome{
+		"region-a": {taskState: state.Task.Completed, gate: gate},
+		"region-b": {taskState: state.Task.Completed, gate: gate},
+		"region-c": {taskState: state.Task.Completed, gate: gate},
+	}), logger)
+	require.NoError(t, svc.SetOperatorPollInterval(time.Hour))
+
+	svc.StartOperator(ctx)
+	t.Cleanup(svc.StopOperator)
+
+	// Every driver runs one pass at startup. Seed only once each has found no
+	// copy to claim, so the rollout is started by the wake alone.
+	deadline := time.Now().Add(drivePassesDeadline)
+	for claims.misses() < len(members) {
+		require.True(t, time.Now().Before(deadline), "every driver must finish its startup pass")
+		time.Sleep(10 * time.Millisecond)
+	}
+	seed := seedGroupedApply(t, ctx, stor, multiOpSeed{
+		applyIdentifier: "drive-passes-parallel-start",
+		parentState:     state.Apply.Pending,
+		cutoverPolicy:   storage.CutoverPolicyParallel,
+		onFailure:       storage.OnFailureHalt,
+		deployments:     members,
+		opState:         state.ApplyOperation.Pending,
+		taskState:       state.Task.Pending,
+	})
+	svc.WakeOperator("drive-passes-parallel-start", "payments", "staging")
+
+	for !state.IsState(getApply(t, ctx, stor, seed.applyID).State, state.Apply.Completed) {
+		require.True(t, time.Now().Before(deadline),
+			"every target must start from one wake; copies driven so far: %v", rec.resumeOrder())
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	assert.ElementsMatch(t, members, rec.resumeOrder(), "every target must be driven exactly once")
 	for _, dep := range members {
 		assert.Equal(t, state.ApplyOperation.Completed, opState(t, ctx, stor, seed.opID(dep)),
 			"operation %s must be completed", dep)
@@ -204,4 +265,32 @@ type gateClosingMatrixClient struct {
 func (c *gateClosingMatrixClient) ResumeApplyOperation(ctx context.Context, apply *storage.Apply, applyOperationID int64) error {
 	c.closeGate()
 	return c.matrixTernClient.ResumeApplyOperation(ctx, apply, applyOperationID)
+}
+
+// claimMissCountingStorage counts the copy claims that found nothing to claim,
+// so a test can tell when every driver has finished a pass.
+type claimMissCountingStorage struct {
+	storage.Storage
+	count atomic.Int64
+}
+
+func (c *claimMissCountingStorage) ApplyOperations() storage.ApplyOperationStore {
+	return claimMissCountingOperations{ApplyOperationStore: c.Storage.ApplyOperations(), parent: c}
+}
+
+func (c *claimMissCountingStorage) misses() int {
+	return int(c.count.Load())
+}
+
+type claimMissCountingOperations struct {
+	storage.ApplyOperationStore
+	parent *claimMissCountingStorage
+}
+
+func (o claimMissCountingOperations) FindNextApplyOperation(ctx context.Context, owner string) (*storage.ApplyOperation, error) {
+	op, err := o.ApplyOperationStore.FindNextApplyOperation(ctx, owner)
+	if err == nil && op == nil {
+		o.parent.count.Add(1)
+	}
+	return op, err
 }

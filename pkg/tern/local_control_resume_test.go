@@ -993,8 +993,8 @@ func TestResumeApplyMissingPlanFailsApply(t *testing.T) {
 		"in-flight task must fail with its apply, got %s", tasks[0].State)
 	assert.Equal(t, "plan not found during recovery", tasks[0].ErrorMessage)
 	require.Len(t, requests.requests, 1)
-	assert.Equal(t, storage.ControlRequestCompleted, requests.requests[0].Status,
-		"the terminal outcome moots the pending revert")
+	assert.Equal(t, storage.ControlRequestFailed, requests.requests[0].Status,
+		"the terminal outcome outran the pending revert")
 	require.Len(t, observer.terminal, 1)
 	assert.True(t, state.IsState(observer.terminal[0].State, state.Apply.Failed))
 }
@@ -1354,6 +1354,39 @@ func TestResumeApplyWithTasks_FailedTaskWhoseStatementLandedKeepsItsVerdict(t *t
 	assert.Empty(t, eng.applied, "nothing reaches the engine after a permanent failure")
 	require.Len(t, observer.terminal, 1)
 	assert.Equal(t, state.Apply.Failed, observer.terminal[0].State)
+}
+
+// A drive lost its connection to the target mid-copy on `users` and exited
+// before it saved the failure, so a later conflict check settled the task
+// failed_retryable from the engine's report while the apply stayed running
+// under a stale lease. When recovery reclaims that running apply, the task is
+// requeued like any retried task: the re-run is counted as an attempt, and the
+// earlier failure's reason does not survive onto the completed row.
+func TestResumeApplyWithTasks_RequeuesARetryableTaskUnderARunningApply(t *testing.T) {
+	taskStore := &exactProgressTaskStore{}
+	c, eng, apply, applies, tasks := newLandedSiblingResume(t, taskStore, &mockApplyLogStore{})
+	plan := &storage.Plan{ID: 5}
+	apply.PlanID = plan.ID
+	applies.stored = *apply
+	c.storage.(*exactProgressStorage).plans = &fakePlanStore{getByIDFn: func(int64) (*storage.Plan, error) { return plan, nil }}
+	landed, retried := tasks[0], tasks[1]
+	now := time.Now()
+	landed.State = state.Task.Completed
+	landed.CompletedAt = &now
+	retried.State = state.Task.FailedRetryable
+	retried.ErrorMessage = "lost connection to the target during the copy"
+	taskStore.tasks = tasks
+
+	require.NoError(t, c.resumeApplyWithTasks(t.Context(), apply, nil, tasks, nil, false, false))
+
+	assert.Equal(t, []string{"ALTER TABLE `users` ADD COLUMN `name` varchar(255)"}, eng.applied, "only the retried task runs")
+	assert.Equal(t, state.Task.Completed, retried.State)
+	assert.Equal(t, 1, retried.Attempt, "the retry is counted as an attempt")
+	assert.Empty(t, retried.ErrorMessage, "a completed task carries no failure reason")
+	assert.Equal(t, 0, landed.Attempt, "a completed task is not requeued")
+	stored, err := applies.Get(t.Context(), apply.ID)
+	require.NoError(t, err)
+	assert.Equal(t, state.Apply.Completed, stored.State)
 }
 
 // The same re-claim, but the failed task's table has left the re-plan diff

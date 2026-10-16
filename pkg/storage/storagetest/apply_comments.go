@@ -53,15 +53,19 @@ func TestApplyComments(t *testing.T, h Harness) {
 		assert.Equal(t, int64(111222333), retrieved.GitHubCommentID)
 		require.NotNil(t, retrieved.PostedPhase)
 		assert.Empty(t, *retrieved.PostedPhase)
+		assert.Nil(t, retrieved.PostedCutoverOperationID)
 		assert.NotZero(t, retrieved.ID)
 		assert.NotZero(t, retrieved.CreatedAt)
 		assert.NotZero(t, retrieved.UpdatedAt)
 
 		// A rotation to a fresh comment upserts the same slot with the new
-		// comment ID and control phase.
+		// comment ID, control phase, and the rollout member whose cutover it
+		// tracks.
 		comment.GitHubCommentID = 444555666
 		reverting := state.Apply.Reverting
 		comment.PostedPhase = &reverting
+		cutoverOperationID := int64(4242)
+		comment.PostedCutoverOperationID = &cutoverOperationID
 		require.NoError(t, store.ApplyComments().Upsert(ctx, comment))
 
 		retrieved, err = store.ApplyComments().Get(ctx, apply.ID, state.Comment.Progress)
@@ -70,6 +74,8 @@ func TestApplyComments(t *testing.T, h Harness) {
 		assert.Equal(t, int64(444555666), retrieved.GitHubCommentID)
 		require.NotNil(t, retrieved.PostedPhase)
 		assert.Equal(t, state.Apply.Reverting, *retrieved.PostedPhase)
+		require.NotNil(t, retrieved.PostedCutoverOperationID)
+		assert.Equal(t, int64(4242), *retrieved.PostedCutoverOperationID)
 
 		// A summary comment carries no control phase; the column stays NULL
 		// and reads back nil.
@@ -82,6 +88,7 @@ func TestApplyComments(t *testing.T, h Harness) {
 		require.NoError(t, err)
 		require.NotNil(t, retrieved)
 		assert.Nil(t, retrieved.PostedPhase)
+		assert.Nil(t, retrieved.PostedCutoverOperationID)
 
 		// A missing slot reads back nil, not an error.
 		missing, err := store.ApplyComments().Get(ctx, apply.ID+1000, state.Comment.Progress)

@@ -432,9 +432,13 @@ func shardedTableStatusesByKeyspace(ops []*storage.ApplyOperation, tasksByOp map
 		sp := shardOperationCopy(op, tasksByOp[op.ID])
 		copiesByTable[key] = append(copiesByTable[key], sp)
 		shardsByTable[key] = append(shardsByTable[key], templates.ShardProgressData{
-			Shard:           shard,
-			Status:          sp.Status,
-			PercentComplete: sp.PercentComplete,
+			Shard:               shard,
+			Status:              sp.Status,
+			PercentComplete:     sp.PercentComplete,
+			RowsCopied:          sp.RowsCopied,
+			RowsTotal:           sp.RowsTotal,
+			ChecksumRowsChecked: sp.ChecksumRowsChecked,
+			ChecksumRowsTotal:   sp.ChecksumRowsTotal,
 		})
 	}
 	out := make(map[string][]templates.ShardedTableStatus, len(order))
@@ -467,6 +471,9 @@ func shardOperationCopy(op *storage.ApplyOperation, tasks []*storage.Task) prese
 			RowsCopied:      t.RowsCopied,
 			RowsTotal:       t.RowsTotal,
 			ETASeconds:      int64(t.ETASeconds),
+
+			ChecksumRowsChecked: t.ChecksumRowsChecked,
+			ChecksumRowsTotal:   t.ChecksumRowsTotal,
 		})
 	}
 	return presentation.ShardOperationCopy(op.State, copies)

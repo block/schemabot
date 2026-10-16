@@ -1214,6 +1214,47 @@ func TestCheckPriorEnvViaGitHub(t *testing.T) {
 		assert.True(t, blocked)
 	})
 
+	// A staging aggregate that concluded action_required because an apply is
+	// stopped blocks production the same way, but the remedy is to start that
+	// apply again: a fresh staging apply would be refused while the stopped one
+	// holds the database. A run held by changes no apply has run yet, or by a
+	// stopped apply alongside them, still asks for the staging apply.
+	for _, tc := range []struct {
+		name    string
+		title   string
+		want    string
+		notWant string
+	}{
+		{name: "one stopped apply asks for it to be started", title: "1 apply stopped",
+			want: "Staging has a stopped apply. Start it again with the command on its progress comment.", notWant: "Apply staging first"},
+		{name: "several stopped applies ask for them to be started", title: "3 applies stopped",
+			want: "Staging has a stopped apply.", notWant: "Apply staging first"},
+		{name: "pending changes ask for the staging apply", title: "1 apply pending",
+			want: "Staging has pending changes. Apply staging first before applying to production.", notWant: "stopped apply"},
+		{name: "pending changes beside a stopped apply ask for the staging apply", title: "1 apply pending (1 stopped)",
+			want: "Apply staging first", notWant: "Staging has a stopped apply."},
+	} {
+		t.Run("staging check action_required: "+tc.name, func(t *testing.T) {
+			h, comments := setupCheckRunServer(t, []map[string]any{
+				{"id": 1, "name": "SchemaBot (staging)", "status": "completed", "conclusion": "action_required",
+					"output": map[string]any{"title": tc.title}, "app": map[string]any{"slug": "schemabot"}},
+			})
+
+			blocked, err := h.checkPriorEnvViaGitHub(t.Context(), repo, pr, "orders", "production", "staging", 12345, false)
+			require.NoError(t, err)
+			assert.True(t, blocked, "an action_required staging aggregate blocks production whatever holds it")
+
+			select {
+			case body := <-comments:
+				assert.Contains(t, body, "Apply Blocked")
+				assert.Contains(t, body, tc.want)
+				assert.NotContains(t, body, tc.notWant)
+			default:
+				t.Fatal("expected a comment explaining the blocked apply")
+			}
+		})
+	}
+
 	t.Run("no staging check blocks apply", func(t *testing.T) {
 		h, comments := setupCheckRunServer(t, []map[string]any{})
 

@@ -272,6 +272,21 @@ type CheckStore interface {
 	// Returns true when the row was marked successful.
 	MarkStalePlanSuccessful(ctx context.Context, check *Check) (bool, error)
 
+	// BlockStaleStartedApply records that the schema change a started apply
+	// owns is gone from the PR: it moves the row onto headSHA with check's
+	// blocking reason and message, keeping an in-progress row in_progress and
+	// turning a settled one into action_required. check is the row as the
+	// caller read it; its HeadSHA and ApplyID pin that read. The status is
+	// decided from the row as stored at write time, under the same row lock
+	// as the write, so a completion that lands after the caller read the row
+	// is never rewound to in_progress. It writes nothing and returns false
+	// when no started apply owns the row any more, when a different apply
+	// owns it than the caller read, or when the stored head is neither the
+	// head the caller read nor headSHA, because a newer write owns the row.
+	// On a landed write, check.HeadSHA, check.Status, and check.Conclusion
+	// hold the values stored.
+	BlockStaleStartedApply(ctx context.Context, check *Check, headSHA string) (bool, error)
+
 	// ClearAggregateBlock clears the blocking reason on stored aggregate check
 	// state after the PR-level guards re-verified that the blocking condition
 	// no longer applies. The update is conditional on the head SHA and blocking
@@ -283,7 +298,11 @@ type CheckStore interface {
 	// CompleteForApply updates stored check state to a terminal state only if
 	// it still belongs to the given apply and no newer apply exists for the
 	// same PR/environment/database. Returns false when another driver changed
-	// the stored state first.
+	// the stored state first. A row stale cleanup already blocked with
+	// SchemaRemovedAfterApplyStartedBlockingReason keeps its head SHA, reason,
+	// and message, and a successful completion of it lands as action_required.
+	// On a landed write, check holds the head SHA, has_changes, conclusion,
+	// blocking reason, and message stored.
 	CompleteForApply(ctx context.Context, check *Check, apply *Apply) (bool, error)
 
 	// MarkActionRequiredForApply marks stored check state action_required for a
@@ -1447,6 +1466,18 @@ type ApplyOperationStore interface {
 	// (apply_id, created_at, id) order.
 	ListByApplies(ctx context.Context, applyIDs []int64) ([]*ApplyOperation, error)
 
+	// ListRecentTargets returns each distinct (database, environment, target)
+	// that an apply of databaseType ran an operation against, among applies
+	// created within lookback of the storage database's clock, ordered by
+	// database, environment, then target, each compared bytewise, so every
+	// dialect returns the same order. Tuples are distinct byte for byte, so
+	// targets that differ only by case are listed separately, as the
+	// resolver keys they are. Operations without a target are skipped. A
+	// lookback under one microsecond is rejected. It
+	// tells a data plane, which resolves targets on demand rather than
+	// listing them in config, which targets it has applied to.
+	ListRecentTargets(ctx context.Context, databaseType string, lookback time.Duration) ([]AppliedTarget, error)
+
 	// UpdateState transitions a child row to a new state. Updates the state
 	// column only; for transitions that should also stamp started_at or
 	// completed_at, use MarkStarted / MarkCompleted / MarkFailed instead.
@@ -1526,29 +1557,39 @@ type ApplyOperationStore interface {
 	// target) pair, so the targets of one deployment are ordered exactly like the
 	// deployments of a map, while the operations of one member (a sharded
 	// target's per-shard work) do not gate each other's start. Under barrier
-	// and parallel they are still ordered at cutover, by
-	// FindNextApplyOperationCutover; under rolling they cut over in their own
-	// drives. A member's finalizer starts only once the work it finalizes has
-	// completed, and it waits on earlier members as rolling does, for them to
-	// complete, under every policy.
+	// and parallel they cut over through FindNextApplyOperationCutover; under
+	// rolling they cut over in their own drives. A member's finalizer starts
+	// only once the work it finalizes has completed. Under rolling it then
+	// waits for every earlier member to complete; under barrier and parallel it
+	// waits for every earlier deployment to complete, and an earlier target of
+	// its own deployment holds it only while that target has failed, is
+	// retrying, or was stopped, cancelled or reverted, as at cutover.
 	//
 	// owner identifies the claiming driver and is required; it is recorded as
 	// the operation's lease owner. Returns the claimed row, or nil if nothing
-	// needs work.
+	// needs work. A row claimed from pending or stopped is returned with the
+	// state it was claimed from, which is how the caller tells a claim that
+	// starts an operation from a retry or a recovery.
 	FindNextApplyOperation(ctx context.Context, owner string) (*ApplyOperation, error)
 
 	// FindNextApplyOperationCutover atomically claims the next operation parked
-	// at the cutover barrier whose turn it is, in deployment order, and rotates a
-	// fresh operation lease onto it in the same transaction. It is the cutover
+	// at the cutover barrier that no earlier sibling holds, and rotates a fresh
+	// operation lease onto it in the same transaction. It is the cutover
 	// counterpart to FindNextApplyOperation: that primitive gates the copy phase
 	// (claims pending rows → running); this one gates the cutover phase.
 	//
-	// A waiting_for_cutover row is claimed and transitioned to cutting_over only
-	// when every earlier operation of the apply has reached completed (the
-	// cutover gate is completed-only, with the on_failure "continue" exemption
-	// for a terminal-failed earlier sibling) and no pending stop control request
-	// exists for the apply. The gate covers every earlier operation, whichever
-	// member it belongs to, so one member's shards also cut over one at a time.
+	// A waiting_for_cutover row is claimed and transitioned to cutting_over
+	// once it is parked, unless an earlier operation of another deployment has
+	// not completed, so deployments cut over strictly in order; an earlier
+	// operation of its own deployment has failed, is retrying (by its own state
+	// or a task retrying under it), or was stopped, cancelled or reverted (with
+	// the on_failure "continue" exemption for a terminal-failed one); a stop
+	// control request is pending
+	// for the apply, or the apply already has as many cutovers in flight as its
+	// per-apply driver cap allows. The cap is admitted under a lock on the
+	// parent apply row, so concurrent drivers cannot overshoot it. An earlier
+	// target of the same deployment that is still copying or cutting over does
+	// not hold it.
 	// Separately, a row already in cutting_over or
 	// revert_window whose heartbeat has been stale for more than one minute is
 	// re-leased without changing its state — recovering an in-flight cutover whose
@@ -1560,16 +1601,17 @@ type ApplyOperationStore interface {
 
 	// CutoverBlocker returns the earliest earlier operation of another rollout
 	// member (deployment, target) that holds the operation's cutover, or nil
-	// when it is that operation's turn. It applies the same rule as
-	// FindNextApplyOperationCutover: an earlier sibling holds until it has
-	// completed, unless the rollout's on_failure policy continues past its
-	// terminal failure. A manually requested cutover uses it so that it lands
-	// on the member whose turn it is, in the order the automatic cutover claim
-	// would follow between members. Operations of the same member, its shards
-	// and tables, never hold each other's requested cutover: the request
+	// when nothing does. It applies the same rule as
+	// FindNextApplyOperationCutover: an earlier operation of another deployment
+	// holds until it has completed, and one of the same deployment holds only
+	// while it has failed, is retrying (by its own state or a task under it),
+	// or was stopped, cancelled or reverted, unless the rollout's on_failure
+	// policy continues past its terminal failure. A
+	// manually requested cutover uses it so that it is held exactly where the
+	// automatic cutover claim would be. Operations of the same member, its
+	// shards and tables, never hold each other's requested cutover: the request
 	// addresses the member's remote apply, which takes whichever of them are
-	// parked. The automatic claim still cuts them over one at a time. It claims
-	// nothing.
+	// parked. It claims nothing.
 	CutoverBlocker(ctx context.Context, operationID int64) (*ApplyOperation, error)
 
 	// ReleaseClaim releases an operation lease the calling driver holds but
@@ -1630,6 +1672,16 @@ type ApplyOperationStore interface {
 	// is resumable, so completed_at is left nil. Apply-lease guarded when a lease
 	// is present in ctx.
 	MarkPendingStoppedByApply(ctx context.Context, applyID int64) (int64, error)
+
+	// MarkPendingCancelledByApply transitions every operation of an apply that
+	// never started to cancelled, returning the number of rows changed: the
+	// pending ones, and the stopped ones a stop reached while still pending.
+	// Used once a cancel is pending: an operation that never started changed
+	// nothing on its target, so it settles on the spot rather than outliving a
+	// cancelled rollout. A stopped operation that had started is left to the
+	// drive that delivers the cancel to it. completed_at is stamped, and writes
+	// are lease guarded the same way as MarkPendingStoppedByApply.
+	MarkPendingCancelledByApply(ctx context.Context, applyID int64) (int64, error)
 
 	// ReapStranded mirrors the parent's outcome onto pending, unleased operation
 	// rows whose parent apply settled long enough ago to be quiescent, returning
@@ -1704,6 +1756,12 @@ type ControlRequestStore interface {
 	// same operation is already pending for the apply, the existing request is
 	// returned with alreadyPending=true.
 	RequestPending(ctx context.Context, req *ApplyControlRequest) (*ApplyControlRequest, bool, error)
+
+	// RequestPendingSuperseding records req as RequestPending does and, in the
+	// same transaction, completes the apply's pending request for superseded,
+	// whose effect req replaces. Either both writes land or neither does, so a
+	// failed request leaves the superseded one still deliverable.
+	RequestPendingSuperseding(ctx context.Context, req *ApplyControlRequest, superseded ControlOperation) (*ApplyControlRequest, bool, error)
 
 	// GetPending returns the pending request for an apply operation.
 	GetPending(ctx context.Context, applyID int64, operation ControlOperation) (*ApplyControlRequest, error)

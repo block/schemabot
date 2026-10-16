@@ -204,6 +204,60 @@ func (s *applyOperationStore) ListByApplies(ctx context.Context, applyIDs []int6
 	return scanApplyOperations(rows)
 }
 
+// ListRecentTargets returns each distinct (database, environment, target) an
+// apply of databaseType ran an operation against, among applies created within
+// lookback of the storage database's clock. The cutoff is computed by the
+// database so it is compared against created_at in the same clock and time
+// zone the row was stamped with.
+func (s *applyOperationStore) ListRecentTargets(ctx context.Context, databaseType string, lookback time.Duration) ([]storage.AppliedTarget, error) {
+	// The cutoff is rendered in whole microseconds, so a shorter lookback
+	// would truncate to an empty window rather than the one asked for.
+	if lookback < time.Microsecond {
+		return nil, fmt.Errorf("list recent %s apply targets: lookback must be at least %s, got %s", databaseType, time.Microsecond, lookback)
+	}
+	cutoff := s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime,
+		LiteralIntervalAmount(uint64(lookback.Microseconds())), IntervalMicrosecond)
+	// Targets are resolver keys that differ byte for byte, so the tuple is
+	// made distinct under a binary collation: under a column collation that
+	// folds case, two targets differing only by case would collapse into one
+	// and a target the data plane applied to would go unreported. The same
+	// collation orders the aliases bytewise, so every dialect returns the
+	// tuples in one order; database names and environments are stored
+	// folded to lowercase, so for them it carries the order alone. The
+	// cutoff and the collated expressions are trusted internal fragments;
+	// they are concatenated rather than formatted so a stray % can never
+	// corrupt the SQL.
+	key := s.dialect.BinarySortKey
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT DISTINCT
+			`+key("a.database_name")+` AS database_name,
+			`+key("a.environment")+` AS environment,
+			`+key("ao.target")+` AS target
+		FROM apply_operations ao
+		JOIN applies a ON a.id = ao.apply_id
+		WHERE a.database_type = ?
+			AND ao.target <> ''
+			AND a.created_at >= `+cutoff+`
+		ORDER BY database_name, environment, target`, databaseType)
+	if err != nil {
+		return nil, fmt.Errorf("query recent %s apply targets within %s: %w", databaseType, lookback, err)
+	}
+	defer utils.CloseAndLog(rows)
+
+	var targets []storage.AppliedTarget
+	for rows.Next() {
+		var target storage.AppliedTarget
+		if err := rows.Scan(&target.Database, &target.Environment, &target.Target); err != nil {
+			return nil, fmt.Errorf("scan recent %s apply target: %w", databaseType, err)
+		}
+		targets = append(targets, target)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("read recent %s apply targets: %w", databaseType, err)
+	}
+	return targets, nil
+}
+
 // execStateUpdate runs a guarded UPDATE against a single apply_operations row,
 // applying the given SET assignments with their placeholder args and the write
 // guard's statement rendering. It centralizes the guard load, argument
@@ -890,27 +944,106 @@ const rolloutMembersOrderedHereSQL = `NOT EXISTS (
 		AND dispatched.idempotency_key IS NOT NULL
 )`
 
-// earlierSiblingHoldsCutoverSQL is the cutover-order rule: an earlier sibling
+// earlierSiblingHoldsCutoverSQL is the cutover hold rule: an earlier sibling
 // (lower created_at, id — deployment_order as materialized at apply-create)
-// holds a later operation's cutover until it has completed, unless
-// releasedFailureExemptionSQL lets a terminal-failed one stop blocking. The
-// swaps are strictly ordered, so a sibling parked at the barrier still holds.
-// It references the apply_operations (the operation whose turn is asked about)
-// and earlier aliases, so the automatic cutover claim
-// (FindNextApplyOperationCutover) and the manual-request turn check
-// (CutoverBlocker) evaluate the same rule. pkg/presentation blocksCutover is
-// the render-side mirror. Placeholders: see earlierSiblingHoldsCutoverArgs.
+// holds a later operation's cutover as earlierHoldsUnderOrderedCutoverSQL
+// says, unless releasedFailureExemptionSQL lets a terminal-failed one stop
+// holding where on_failure continues past it. It references the
+// apply_operations (the operation whose cutover is asked about) and earlier
+// aliases, so the automatic cutover claim (FindNextApplyOperationCutover) and
+// the manual-request check (CutoverBlocker) evaluate the same rule.
+// pkg/presentation holdsCutover is the render-side mirror. Placeholders: see
+// earlierSiblingHoldsCutoverArgs.
 func earlierSiblingHoldsCutoverSQL(d Dialect) string {
 	return `earlier.apply_id = apply_operations.apply_id
 	AND (earlier.created_at, earlier.id) < (apply_operations.created_at, apply_operations.id)
-	AND earlier.state <> ?
+	AND ` + earlierHoldsUnderOrderedCutoverSQL() + `
 	AND ` + releasedFailureExemptionSQL(d)
 }
 
 // earlierSiblingHoldsCutoverArgs returns the positional arguments for
 // earlierSiblingHoldsCutoverSQL, in placeholder order.
 func earlierSiblingHoldsCutoverArgs() []any {
-	return append([]any{state.ApplyOperation.Completed}, releasedFailureExemptionArgs()...)
+	return append(earlierHoldsUnderOrderedCutoverArgs(), releasedFailureExemptionArgs()...)
+}
+
+// earlierHoldsUnderOrderedCutoverSQL is the rule by which an earlier operation
+// holds a later one's cutover, and its finalizer, under an ordered cutover
+// policy (barrier or parallel). It splits on deployment:
+//
+//   - An earlier operation of another deployment holds until it has completed,
+//     its revert window included, so deployments cut over strictly in order
+//     and the first one finishes before the next one starts.
+//   - An earlier operation of the same deployment, such as another of its
+//     targets or shards, holds only while it is in a state the rollout halts
+//     on (earlierMemberHoldsSQL). One still copying, parked, cutting over or
+//     complete holds nothing, so the targets of one deployment each cut over
+//     as soon as their own copy is ready.
+//
+// The fragment references the apply_operations and earlier aliases; its
+// placeholders are listed by earlierHoldsUnderOrderedCutoverArgs.
+func earlierHoldsUnderOrderedCutoverSQL() string {
+	return `(
+	(
+		earlier.deployment <> apply_operations.deployment
+		AND earlier.state <> ?
+	)
+	OR (
+		earlier.deployment = apply_operations.deployment
+		AND ` + earlierMemberHoldsSQL() + `
+	)
+)`
+}
+
+// earlierHoldsUnderOrderedCutoverArgs returns the positional arguments for
+// earlierHoldsUnderOrderedCutoverSQL, in placeholder order.
+func earlierHoldsUnderOrderedCutoverArgs() []any {
+	return append([]any{state.ApplyOperation.Completed}, earlierMemberHoldsArgs()...)
+}
+
+// earlierMemberHoldsSQL matches an earlier operation in a state the rollout
+// halts on (memberHoldStates), or one whose drive is riding out a data-plane
+// retry. A remote data plane parks its apply between recovery attempts while
+// the drive keeps its lease and keeps polling, so the operation row stays in
+// its active state and only the operation's task rows record the retry. The
+// rollout halts on that retry exactly as on a failed_retryable row, so the
+// task rows count as the same evidence. The fragment references the earlier
+// alias; its placeholders are listed by earlierMemberHoldsArgs.
+func earlierMemberHoldsSQL() string {
+	return `(
+	earlier.state IN (` + placeholders(len(memberHoldStates())) + `)
+	OR EXISTS (
+		SELECT 1
+		FROM tasks AS retrying_task
+		WHERE retrying_task.apply_operation_id = earlier.id
+			AND retrying_task.state = ?
+	)
+)`
+}
+
+// earlierMemberHoldsArgs returns the positional arguments for
+// earlierMemberHoldsSQL, in placeholder order.
+func earlierMemberHoldsArgs() []any {
+	return append(stringArgs(memberHoldStates()), state.Task.FailedRetryable)
+}
+
+// memberHoldStates lists the states in which an earlier operation of the same
+// deployment holds a later one's cutover and finalizer under an ordered
+// cutover policy (barrier or parallel): the states a rollout halts on rather
+// than waits through. Failed is final unless on_failure continues past it; retrying and
+// stopped may still go either way, so they hold until they resolve; cancelled
+// and reverted mean the rollout is not going ahead on that member. A retry a
+// live drive rides out holds too, by its task rows (earlierMemberHoldsSQL).
+// The list must match storage.CutoverHoldState and pkg/presentation
+// holdsCutover.
+func memberHoldStates() []string {
+	return []string{
+		state.ApplyOperation.Failed,
+		state.ApplyOperation.FailedRetryable,
+		state.ApplyOperation.Stopped,
+		state.ApplyOperation.Cancelled,
+		state.ApplyOperation.Reverted,
+	}
 }
 
 // earlierFinalizerAtBarrierSQL matches an earlier group_finalizer that the
@@ -946,12 +1079,15 @@ func earlierFinalizerAtBarrierArgs() []any {
 
 // finalizerStartGateSQL is the gate a group_finalizer starts through, on every
 // claim arm that can start one. It waits for the work it finalizes to
-// complete (a namespace whose only change is its VSchema has no such work),
-// and then for every earlier-member sibling to complete, under every
-// cutover_policy, with the on_failure exemption. The fragment references the
-// apply_operations alias; its placeholders, in order, are the work kind,
-// completed, completed, and releasedFailureExemptionArgs (see
-// finalizerStartGateArgs).
+// complete (a namespace whose only change is its VSchema has no such work).
+// Earlier members then hold it the way they hold a cutover: under barrier and
+// parallel as earlierHoldsUnderOrderedCutoverSQL says, so an earlier
+// deployment holds until it has completed and an earlier target of the same
+// deployment only while the rollout halts on it, and under rolling, and any
+// unrecognized policy, which fails closed to the serial gate, until every
+// earlier member has completed. Both carry the on_failure exemption.
+// The fragment references the apply_operations alias; its placeholders are
+// listed by finalizerStartGateArgs.
 func finalizerStartGateSQL(d Dialect) string {
 	return `(
 	NOT EXISTS (
@@ -970,7 +1106,16 @@ func finalizerStartGateSQL(d Dialect) string {
 			AND ` + earlierRolloutMemberSQL + `
 			AND ` + rolloutMembersOrderedHereSQL + `
 			AND (earlier.created_at, earlier.id) < (apply_operations.created_at, apply_operations.id)
-			AND earlier.state <> ?
+			AND (
+				(
+					apply_operations.cutover_policy IN (?, ?)
+					AND ` + earlierHoldsUnderOrderedCutoverSQL() + `
+				)
+				OR (
+					apply_operations.cutover_policy NOT IN (?, ?)
+					AND earlier.state <> ?
+				)
+			)
 			AND ` + releasedFailureExemptionSQL(d) + `
 	)
 )`
@@ -982,8 +1127,13 @@ func finalizerStartGateArgs() []any {
 	args := []any{
 		storage.ApplyOperationKindWork,
 		state.ApplyOperation.Completed,
-		state.ApplyOperation.Completed,
+		storage.CutoverPolicyBarrier, storage.CutoverPolicyParallel,
 	}
+	args = append(args, earlierHoldsUnderOrderedCutoverArgs()...)
+	args = append(args,
+		storage.CutoverPolicyBarrier, storage.CutoverPolicyParallel,
+		state.ApplyOperation.Completed,
+	)
 	return append(args, releasedFailureExemptionArgs()...)
 }
 
@@ -1146,7 +1296,7 @@ func claimableParentArgs() []any {
 // at the cutover barrier clears its lease and backdates its heartbeat, so it is
 // parked, not occupying anything.
 //
-// The cap is a filter on the pending arm only, never a sort key. Sorting by the
+// The cap is a filter on the arms that start work, never a sort key. Sorting by the
 // count would replace the indexed (created_at, id) walk with a full sort that
 // evaluates a correlated subquery per row, which is the claim cost the ordering
 // index exists to avoid. Filtering keeps the index walk: a driver steps past a
@@ -1171,11 +1321,13 @@ const freshLeaseCountSQL = `(
 // be claimed in" and "states in which a driver occupies an operation" are
 // different questions that only mostly overlap.
 //
-// failed_retryable is where they part. A redispatched operation keeps that
-// state for its whole drive — the claim rotates the lease and leaves the state
-// alone, and the row is not rewritten until the drive settles it — so a driver
-// really is occupying it the entire time. Counting it is what keeps a retry
-// sweep from running the apply at twice its cap.
+// failed_retryable is where they part. A row redispatched under a parent-lease
+// drive keeps that state for its whole drive — the claim rotates the lease and
+// leaves the state alone, and the row is not rewritten until the drive settles
+// it — so a driver really is occupying it the entire time. Counting it is what
+// keeps a retry sweep from running the apply at twice its cap. An
+// operation-lease redispatch moves its row to running instead, which the cap
+// already counts.
 func driverOccupyingOperationStates() []string {
 	return append(claimableApplyStates(), state.ApplyOperation.FailedRetryable)
 }
@@ -1275,6 +1427,25 @@ func (s *applyOperationStore) driverCapClause(staleClaimCutoff, owner string) (s
 	return clause, append(args, processShareArgs...)
 }
 
+// cutoverPhaseOperationStates lists the operation states a driver occupies
+// while it cuts an operation over. The cutover claim caps these on their own
+// lane (cutoverCapClause) rather than against every occupying state, so an
+// operation whose copy is ready never waits for a driver behind other members
+// that are still copying.
+func cutoverPhaseOperationStates() []string {
+	return []string{state.ApplyOperation.CuttingOver, state.ApplyOperation.RevertWindow}
+}
+
+// cutoverCapClause renders the cutover claim's fan-out cap: the apply may hold
+// at most maxDriversPerApply fresh leases mid-cutover at once. Copies count
+// against the copy claim's cap (driverCapClause), which counts cutovers too,
+// so the drivers one apply holds stay bounded at twice the cap.
+func (s *applyOperationStore) cutoverCapClause(staleClaimCutoff string) (string, []any) {
+	cutoverStates := cutoverPhaseOperationStates()
+	clause := fmt.Sprintf(freshLeaseCountSQL, placeholders(len(cutoverStates)), staleClaimCutoff) + " < ?"
+	return clause, append(stringArgs(cutoverStates), s.maxDriversPerApply)
+}
+
 // releasedFailureExemptionArgs returns the positional arguments for
 // releasedFailureExemptionSQL, in placeholder order.
 func releasedFailureExemptionArgs() []any {
@@ -1327,20 +1498,20 @@ func releasedFailureExemptionArgs() []any {
 //     block, so a failed earlier deployment still halts the rollout.
 //   - parallel: earlier siblings do not order a work row's copy start, but a
 //     failed earlier member still gates admission under on_failure. The fan-out
-//     cap below bounds concurrent copies; the cutover claim orders the swaps.
+//     cap below bounds concurrent copies.
 //
-// A group_finalizer's gate is not policy-aware. It waits for the work it
-// finalizes to complete (a namespace whose only change is its VSchema has no
-// such work), and then for every earlier-member sibling to complete, under
-// every policy. A finalizer never parks at the cutover
-// barrier: its drive publishes the member's change in one step, so the barrier
-// and parallel relaxations, which are safe for work only because the work then
-// parks and the cutover claim orders its swap, would let a later member's
-// VSchema go out while an earlier member's is still unapplied or has failed.
-// The finalizer therefore takes the cutover claim's completed-only order at
-// its start, and the stopped+start resume arm holds a stopped finalizer to
-// the same gate (finalizerStartGateSQL), so a stop and start cannot publish
-// it out of order.
+// A group_finalizer waits for the work it finalizes to complete (a namespace
+// whose only change is its VSchema has no such work). Earlier members hold it
+// the way they hold a cutover, since a finalizer never parks at the cutover
+// barrier and its drive publishes the member's change in one step: under
+// rolling until every earlier member has completed, and under barrier and
+// parallel until every earlier deployment has completed and while an earlier
+// target of its own deployment has failed, is retrying, or was stopped,
+// cancelled or reverted (earlierHoldsUnderOrderedCutoverSQL), so a later
+// member's VSchema never goes out ahead of an earlier deployment or past a
+// failure the rollout halts on. The stopped+start
+// resume arm holds a stopped finalizer to the same gate (finalizerStartGateSQL),
+// so a stop and start cannot publish it past one either.
 //
 // on_failure (per-apply policy, also captured on each row at create)
 // layers on top of every gate: "halt" (the default) keeps a terminal-failed
@@ -1479,12 +1650,15 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 	// fewer than processDriverShare on the claiming process.
 	//
 	// The cap gates every arm that *starts* work — this pending arm, the
-	// stopped+start resume arm, and the deferred-deploy arm — because all three
-	// admit an apply's siblings onto drivers, and an uncapped one is a way around
-	// the bound rather than an exception to it. A stop/start cycle is the shape
+	// stopped+start resume arm, the deferred-deploy arm, and the deliberate
+	// redispatch half of the failed_retryable arm — because all four admit an
+	// apply's siblings onto drivers, and an uncapped one is a way around the
+	// bound rather than an exception to it. A stop/start cycle is the shape
 	// that matters: stop bulk-moves every pending row to stopped, so an uncapped
 	// resume arm would make all of them claimable at once and hand one apply the
-	// whole pool durably, which is the starvation this exists to prevent.
+	// whole pool durably, which is the starvation this exists to prevent. A
+	// retry sweep is the same shape: an outage that leaves every deployment
+	// failed_retryable would otherwise redispatch all of them at once.
 	//
 	// The recovery and control-request arms stay uncapped: a capped-out apply
 	// still has to be able to re-lease a crashed operation and to consume a
@@ -1492,15 +1666,16 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 	// cap itself the thing that wedges the apply it is bounding.
 	//
 	// Capping a start arm cannot wedge either, because the states it admits work
-	// into (resuming, running) are themselves counted: each resumed operation
-	// drops out of the count as it settles, so the rest drain behind it exactly
-	// as the pending arm's do.
+	// into (resuming, running, and a single-operation redispatch's leased
+	// failed_retryable) are themselves counted: each operation drops out of the
+	// count as it settles, so the rest drain behind it exactly as the pending
+	// arm's do.
 	queryArgs = append(queryArgs, driverCapArgs...)
 	queryArgs = append(queryArgs, stringArgs(activeStates)...)
 	// Stale-active barrier-park exemption (see the staleness clause below): a
 	// multi-deployment operation parked at the cutover barrier under an
 	// ordered-cutover policy (barrier or parallel) is reserved for the
-	// deployment-ordered cutover claim, so the copy claim must not re-lease it as
+	// cutover claim, so the copy claim must not re-lease it as
 	// stale-active work. A single-operation apply has no sibling and is never
 	// exempted, so manual --defer-cutover behaviour is unchanged.
 	queryArgs = append(queryArgs,
@@ -1541,6 +1716,19 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 	queryArgs = append(queryArgs,
 		state.ApplyOperation.Stopped,
 		storage.ControlOperationCancel, storage.ControlRequestPending)
+	// A barrier-parked operation is driven by nothing: its copy drive exits at
+	// the barrier, the stale-active arm leaves it to the cutover claim, and the
+	// cutover claim will not start it behind a failed earlier sibling under
+	// halt, nor while the rollout is being stopped. A pending cancel or stop
+	// must still reach it, so the drive that delivers the request claims it
+	// here: without it the parked row never settles, the parent never derives
+	// stopped or cancelled, and the request is never completed. The claim
+	// leaves the row parked, so it carries the rematch guard; the drive moves
+	// it out of waiting_for_cutover once the request lands.
+	queryArgs = append(queryArgs,
+		state.ApplyOperation.WaitingForCutover,
+		storage.CutoverPolicyBarrier, storage.CutoverPolicyParallel,
+		storage.ControlOperationCancel, storage.ControlOperationStop, storage.ControlRequestPending)
 	// Deferred-deploy start gate keys on the PARENT apply state, not the
 	// operation state: the operation row stays active (running) while the apply
 	// parks at waiting_for_deploy, because the copy phase finished and only the
@@ -1555,6 +1743,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 	queryArgs = append(queryArgs, driverCapArgs...)
 	queryArgs = append(queryArgs, state.ApplyOperation.FailedRetryable)
 	queryArgs = append(queryArgs, state.Apply.FailedRetryable, maxRecoveryAttempts, retryableRecoveryFreshnessDays)
+	queryArgs = append(queryArgs, driverCapArgs...)
 	queryArgs = append(queryArgs, stringArgs(activeStates)...)
 
 	// The stopped-row and failed_retryable clauses mirror ApplyStore.ClaimApplyByID.
@@ -1570,6 +1759,14 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 	//     pending cancel request is reclaimable so the drive can terminalize it.
 	//     The cancel arm carries the rematch guard because its claim can leave
 	//     the row stopped; see requestRematchGuardSQL.
+	//
+	//   - An operation parked at the cutover barrier of a multi-operation
+	//     apply whose parent has a pending cancel or stop request is
+	//     reclaimable so the drive can deliver it to the engine holding the
+	//     parked copy.
+	//     Nothing else drives a parked row before its cutover turn, and under
+	//     halt that turn never comes. The arm carries the rematch guard because
+	//     the claim leaves the row parked.
 	//
 	//   - An active operation whose PARENT apply is waiting_for_deploy and has a
 	//     pending start request is reclaimable so the operator can trigger the
@@ -1630,14 +1827,15 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 	// a gated one would be redundant with the pending clause below. Start
 	// requests resume eligible work; they do not reorder the rollout.
 	retryFreshnessCutoff := s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime, ParameterIntervalAmount(), IntervalDay)
-	// The two guarded arms differ in the equal-timestamp case for the same reason
+	// The guarded arms differ in the equal-timestamp case for the same reason
 	// they do in ApplyStore.ClaimApplyByID: the stopped+cancel claim moves the row
 	// out of stopped atomically with its lease rotation, so no peer can match it
 	// in the same second and it can admit an equal timestamp; the
-	// waiting_for_deploy claim leaves the row where it is and must refuse one.
-	// See leaseRematchComparison.
+	// waiting_for_deploy and parked claims leave the row where it is and
+	// must refuse one. See leaseRematchComparison.
 	deferredDeployGuard := requestRematchGuardSQL("apply_operations", rematchOnlyAfterLease, staleClaimCutoff)
 	stoppedCancelGuard := requestRematchGuardSQL("apply_operations", rematchAtOrAfterLease, staleClaimCutoff)
+	parkedControlGuard := requestRematchGuardSQL("apply_operations", rematchOnlyAfterLease, staleClaimCutoff)
 	row := tx.QueryRowContext(ctx, fmt.Sprintf(`
 		SELECT %s
 		FROM apply_operations
@@ -1702,6 +1900,24 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 				)
 			)
 			OR (
+				state = ?
+				AND cutover_policy IN (?, ?)
+				AND EXISTS (
+					SELECT 1
+					FROM apply_operations AS sibling
+					WHERE sibling.apply_id = apply_operations.apply_id
+						AND sibling.id <> apply_operations.id
+				)
+				AND EXISTS (
+					SELECT 1
+					FROM apply_control_requests cr
+					WHERE cr.apply_id = apply_operations.apply_id
+						AND cr.operation IN (?, ?)
+						AND cr.status = ?
+						AND `+parkedControlGuard+`
+				)
+			)
+			OR (
 				state IN (%s)
 				AND EXISTS (
 					SELECT 1
@@ -1730,6 +1946,10 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 								a.state = ?
 								AND a.attempt < ?
 								AND a.updated_at >= %s
+								-- Names no column of a, but belongs to this arm
+								-- alone: a deliberate redispatch starts work, so
+								-- it is capped; crash recovery below is not.
+								AND `+driverCap+`
 							)
 							OR (
 								a.state IN (%s)
@@ -1844,32 +2064,33 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 		}
 
 		// Re-claiming a failed_retryable operation is a redispatch, so consume one
-		// unit of the parent apply's retry budget. Only multi-operation applies are
-		// charged here: a single-operation apply's parent attempt is incremented by
-		// the ClaimApplyByID its drive performs, so bumping here too would
-		// double-count. Without this, an operation-only multi-deployment retry never
-		// advances applies.attempt, so ExpireRetryable's budget path never fires and
-		// a permanently failing deployment retries forever — stranding a healthy
-		// sibling parked at the cutover barrier under on_failure "continue". The
-		// EXISTS-sibling guard selects multi-op, and the failed_retryable parent
-		// guard keeps this to genuine redispatches (a terminal-failed parent never
-		// re-leases its operations). The attempt < budget guard makes the
-		// increment idempotent once the budget is spent: two operators can claim
-		// different failed_retryable operations of the same apply concurrently, and
-		// the row lock this UPDATE takes serializes them, so the second sees the
-		// already-incremented attempt and does not overshoot maxRecoveryAttempts.
+		// unit of the parent apply's retry budget. Only operations the operator
+		// drives under the operation lease are charged here (see
+		// redispatchDrivesUnderOperationLease): a parent-lease drive increments the
+		// parent attempt in the ClaimApplyByID it performs, so bumping here too
+		// would double-count. Without this, an operation-lease retry never
+		// advances applies.attempt, so ExpireRetryable's budget path never fires
+		// and a permanently failing deployment retries forever — stranding a
+		// healthy sibling parked at the cutover barrier under on_failure
+		// "continue". The failed_retryable parent guard keeps this to genuine
+		// redispatches (a terminal-failed parent never re-leases its operations).
+		// The attempt < budget guard makes the increment idempotent once the
+		// budget is spent: two operators can claim different failed_retryable
+		// operations of the same apply concurrently, and the row lock this UPDATE
+		// takes serializes them, so the second sees the already-incremented
+		// attempt and does not overshoot maxRecoveryAttempts.
 		if ad.State == state.ApplyOperation.FailedRetryable {
 			// Advance the operation's own attempt only on a genuine deliberate
 			// redispatch — the parent apply is still failed_retryable. A
 			// failed_retryable child is also re-claimed for crash recovery when
 			// the parent apply is already active (running) with a stale heartbeat
 			// (its retry was admitted, then the driver crashed); that re-lease
-			// must leave attempt untouched so the orphaned dispatch's idempotency
-			// key stays stable and is reused, not duplicated. The parent-state
+			// must leave attempt untouched so the count records only deliberate
+			// retries. The dispatch idempotency key does not read it. The parent-state
 			// gate mirrors the budget bump below; the join lets one statement both
 			// test the parent state and write the child row. Unlike the budget
-			// bump this is not gated on multi-operation: attempt is
-			// operation-local and a sibling's retry must never rotate it.
+			// bump this is not gated on the drive mode: attempt is
+			// operation-local and a sibling's retry must never advance it.
 			attemptBump := s.dialect.JoinedUpdate(
 				"apply_operations", "o", "applies", "a", "a.id = o.apply_id",
 				[]JoinedUpdateAssignment{
@@ -1890,18 +2111,43 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 				ad.Attempt++
 			}
 
-			if _, err := tx.ExecContext(ctx, `
-				UPDATE applies
-				SET attempt = attempt + 1, updated_at = NOW()
-				WHERE id = ?
-					AND state = ?
-					AND attempt < ?
-					AND EXISTS (
-						SELECT 1 FROM apply_operations o
-						WHERE o.apply_id = applies.id AND o.id <> ?
-					)
-			`, ad.ApplyID, state.Apply.FailedRetryable, maxRecoveryAttempts, ad.ID); err != nil {
-				return nil, fmt.Errorf("consume retry budget for apply_operation %d redispatch: %w", ad.ID, err)
+			underOperationLease, err := redispatchDrivesUnderOperationLease(ctx, tx, ad)
+			if err != nil {
+				return nil, err
+			}
+			if underOperationLease {
+				if _, err := tx.ExecContext(ctx, `
+					UPDATE applies
+					SET attempt = attempt + 1, updated_at = NOW()
+					WHERE id = ?
+						AND state = ?
+						AND attempt < ?
+				`, ad.ApplyID, state.Apply.FailedRetryable, maxRecoveryAttempts); err != nil {
+					return nil, fmt.Errorf("consume retry budget for apply_operation %d redispatch: %w", ad.ID, err)
+				}
+
+				// An operation-lease redispatch must move the row out of
+				// failed_retryable atomically with the lease rotation, for the
+				// same reason the stopped claim moves its row to resuming: the
+				// redispatch arm is budget-gated, not heartbeat-gated, and nothing
+				// else closes it. A parent-lease retry is closed by its parent
+				// claim's failed_retryable -> running transition, but an
+				// operation-lease parent is owned by the rollout projection and
+				// stays failed_retryable while any operation is, so a row left
+				// failed_retryable would be re-leased on every poll, rotating the
+				// live driver's lease out from under it and starving every
+				// failed_retryable sibling behind it. As running, the row is
+				// re-leasable only by the heartbeat-guarded stale-active arm,
+				// which recovers a crashed drive.
+				moved, err := moveRedispatchToRunning(ctx, tx, ad)
+				if err != nil {
+					return nil, err
+				}
+				if moved {
+					ad.State = state.ApplyOperation.Running
+					ad.ErrorMessage = ""
+					ad.CompletedAt = nil
+				}
 			}
 		}
 	}
@@ -1917,8 +2163,76 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 	return ad, nil
 }
 
+// redispatchDrivesUnderOperationLease reports whether the operator will drive
+// a redispatched operation under its operation lease, with the rollout
+// projection owning the parent, rather than under a parent-lease drive that
+// claims the parent itself. It mirrors the operator's drive-mode decision
+// (recoverApplyOperation in pkg/api): the operation lease applies when the
+// apply has other attached operations, when its generation manifest still
+// expects an operation that has not attached, or when the operation has no
+// tasks to drive a parent claim from. Each check is its own read because
+// MySQL refuses an UPDATE whose subquery reads the table being updated.
+func redispatchDrivesUnderOperationLease(ctx context.Context, tx *rebindTx, ad *storage.ApplyOperation) (bool, error) {
+	var siblings int
+	if err := tx.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM apply_operations WHERE apply_id = ? AND id <> ?
+	`, ad.ApplyID, ad.ID).Scan(&siblings); err != nil {
+		return false, fmt.Errorf("count siblings of redispatched apply_operation %d: %w", ad.ID, err)
+	}
+	if siblings > 0 {
+		return true, nil
+	}
+
+	var manifestJSON []byte
+	if err := tx.QueryRowContext(ctx, `SELECT expected_operation_keys FROM applies WHERE id = ?`, ad.ApplyID).Scan(&manifestJSON); err != nil {
+		return false, fmt.Errorf("load generation manifest for redispatched apply_operation %d: %w", ad.ID, err)
+	}
+	if len(manifestJSON) > 0 {
+		parent := &storage.Apply{}
+		if err := json.Unmarshal(manifestJSON, &parent.ExpectedOperationKeys); err != nil {
+			return false, fmt.Errorf("unmarshal expected_operation_keys for redispatched apply_operation %d: %w", ad.ID, err)
+		}
+		if len(parent.MissingExpectedOperationKeys([]*storage.ApplyOperation{ad})) > 0 {
+			return true, nil
+		}
+	}
+
+	var tasks int
+	if err := tx.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM tasks WHERE apply_operation_id = ?
+	`, ad.ID).Scan(&tasks); err != nil {
+		return false, fmt.Errorf("count tasks of redispatched apply_operation %d: %w", ad.ID, err)
+	}
+	return tasks == 0, nil
+}
+
+// moveRedispatchToRunning moves a failed_retryable operation to running when
+// its parent is still failed_retryable, which is what makes the claim a
+// deliberate redispatch rather than crash recovery. It reports whether the row
+// moved.
+func moveRedispatchToRunning(ctx context.Context, tx *rebindTx, ad *storage.ApplyOperation) (bool, error) {
+	res, err := tx.ExecContext(ctx, `
+		UPDATE apply_operations
+		SET state = ?, error_message = '', completed_at = NULL, updated_at = NOW()
+		WHERE id = ?
+			AND state = ?
+			AND EXISTS (
+				SELECT 1 FROM applies a
+				WHERE a.id = apply_operations.apply_id AND a.state = ?
+			)
+	`, state.ApplyOperation.Running, ad.ID, state.ApplyOperation.FailedRetryable, state.Apply.FailedRetryable)
+	if err != nil {
+		return false, fmt.Errorf("move redispatched apply_operation %d to running: %w", ad.ID, err)
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("read redispatch rows affected for apply_operation %d: %w", ad.ID, err)
+	}
+	return rows > 0, nil
+}
+
 // FindNextApplyOperationCutover atomically claims the next operation parked at
-// the cutover barrier whose turn it is, in deployment order, and rotates a fresh
+// the cutover barrier that no earlier sibling holds, and rotates a fresh
 // operation lease onto it in the same transaction. It is the cutover counterpart
 // to FindNextApplyOperation: that primitive gates the copy phase (pending →
 // running); this one gates the cutover phase (waiting_for_cutover → cutting_over).
@@ -1933,14 +2247,17 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 // Two claim paths, mirroring FindNextApplyOperation:
 //
 //   - Start a parked cutover. A waiting_for_cutover row is claimed and
-//     transitioned to cutting_over only when every earlier operation of the
-//     apply has reached completed, whichever member it belongs to, and no
-//     pending stop control request exists. The gate carries no member filter,
-//     so two shards of one member cut over one after the other.
-//     Unlike the copy gate's barrier relaxation, the cutover gate's "done" set is
-//     completed-only, so the high-risk swaps never overlap and run strictly in
-//     order. The on_failure "continue" exemption lets a terminal-failed earlier
-//     sibling stop blocking, matching the copy gate.
+//     transitioned to cutting_over once no earlier operation holds it
+//     (earlierSiblingHoldsCutoverSQL), no pending stop control request
+//     exists, and the apply has fewer than maxDriversPerApply operations
+//     mid-cutover. An earlier deployment holds it until that deployment has
+//     completed, so deployments cut over strictly in order. Within one
+//     deployment an earlier target holds it only while the rollout halts on
+//     that target, so targets that finish their copies at different times
+//     each cut over when ready rather than queueing behind the slowest earlier
+//     one. The on_failure "continue"
+//     exemption lets a terminal-failed earlier sibling stop holding, matching
+//     the copy gate.
 //   - Recover a stale in-flight cutover. A row already in cutting_over or
 //     revert_window whose heartbeat has gone stale is re-leased without changing
 //     its state — its driver died mid-cutover and another driver resumes it. This
@@ -1962,15 +2279,20 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 // driver pool, so a change to one claim's ordering or eligibility belongs in
 // the other.
 //
-// It carries no maxDriversPerApply cap, unlike the copy claim's
-// pending arm, because the start gate above already bounds an apply to one
-// concurrent cutover: an earlier sibling that is itself parked is not completed,
-// so it blocks every later cutover. A cap could only bind here by exceeding what
-// the ordering gate already allows. Starting a parked cutover is still bound by
-// the process share, though: it takes a fresh lease on this process, and one
-// cutover on top of a full share would hand the apply more than half the pool.
-// The recovery arm is uncapped for the same reason it is there — a stale
-// mid-cutover row must always be re-leasable.
+// The start arm is capped at maxDriversPerApply operations mid-cutover at
+// once (cutoverCapClause): with no ordering between the targets of one
+// deployment, every parked operation of a wide deployment could otherwise
+// take a driver at once, which is
+// the starvation the cap exists to prevent. Only cutting_over and
+// revert_window count, so members still copying never hold a ready cutover
+// back, and it cannot wedge, since each drops out of the count as its
+// cutover settles. The recovery arm is uncapped for the same reason the copy
+// claim's is: a stale mid-cutover row must always be re-leasable.
+//
+// Starting a parked cutover is also bound by the process share (OW-11): it
+// takes a fresh lease on this process, so it waits while the apply already
+// holds its share here. claimMu serializes this process's claims, so the share
+// needs no recount under the parent apply's lock the way the cap does.
 func (s *applyOperationStore) FindNextApplyOperationCutover(ctx context.Context, owner string) (*storage.ApplyOperation, error) {
 	if owner == "" {
 		return nil, fmt.Errorf("operator owner is required to claim apply_operation cutover: %w", storage.ErrApplyLeaseLost)
@@ -1988,12 +2310,12 @@ func (s *applyOperationStore) FindNextApplyOperationCutover(ctx context.Context,
 	// driving — exactly the population OC-2 parks-and-releases. This mirrors
 	// shouldReleaseAtCutoverBarrier in pkg/tern/cutover_barrier.go:
 	//
-	//   1. cutover_policy is ordered (barrier or parallel) — rolling rows are
-	//      never deployment-ordered at the cutover phase. Barrier and parallel
-	//      both park at the barrier and cut over in deployment order; they differ
-	//      only in the copy-start gate, so both are eligible here.
+	//   1. cutover_policy is ordered (barrier or parallel) — rolling rows never
+	//      park at the barrier. Barrier and parallel both park at the barrier
+	//      and cut over through this claim; they differ only in the copy-start
+	//      gate, so both are eligible here.
 	//   2. multi-operation apply (EXISTS sibling) — a single-op apply has no
-	//      siblings to order, so it never auto-defers; its cutover stays on the
+	//      siblings to hold it, so it never auto-defers; its cutover stays on the
 	//      copy/manual path. Mirrors shouldAutoDeferCutover's multiOperation arg.
 	//   3. parent apply NOT started with manual --defer-cutover — that contract
 	//      keeps the operator holding the claim and polling for a manual cutover,
@@ -2005,23 +2327,26 @@ func (s *applyOperationStore) FindNextApplyOperationCutover(ctx context.Context,
 	// The gate wraps BOTH claim branches (start and stale recovery): a stale
 	// cutting_over/revert_window row outside this population reached that state
 	// via the copy/manual path, so recovering it here would steal legitimate work.
+	staleClaimCutoff := s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime, LiteralIntervalAmount(uint64(storage.ApplyLeaseStaleAfter.Microseconds())), IntervalMicrosecond)
+	cutoverCap, cutoverCapArgs := s.cutoverCapClause(staleClaimCutoff)
+	processShare, processShareArgs := s.parkedCutoverProcessShareClause(staleClaimCutoff, owner)
 	queryArgs := []any{storage.CutoverPolicyBarrier, storage.CutoverPolicyParallel}
 	// Start-a-parked-cutover gate (see SQL below). A waiting_for_cutover row is
-	// claimable only when no earlier operation of the apply, whichever member
-	// it belongs to, is still non-completed; releasedFailureExemptionArgs
-	// exempt a terminal-failed earlier sibling so it no longer blocks later
-	// cutovers under "continue", or under "pause" once a release latches the
-	// rollout open; and the pending-stop NOT EXISTS makes `stop` halt remaining
-	// cutovers even under those exemptions.
+	// claimable unless an earlier operation of the apply holds it: one of an
+	// earlier deployment that has not completed, or one of its own deployment
+	// in a state the rollout halts on;
+	// releasedFailureExemptionArgs exempt a terminal-failed earlier sibling so
+	// it no longer holds later cutovers under "continue", or under "pause" once
+	// a release latches the rollout open; the pending-stop NOT EXISTS makes
+	// `stop` halt remaining cutovers even under those exemptions; the cutover
+	// cap bounds how many of the apply's operations cut over at once; and the
+	// process share bounds how many of them this process drives.
 	queryArgs = append(queryArgs, state.ApplyOperation.WaitingForCutover)
 	queryArgs = append(queryArgs, earlierSiblingHoldsCutoverArgs()...)
 	queryArgs = append(queryArgs,
 		storage.ControlOperationStop, storage.ControlRequestPending,
 	)
-	staleClaimCutoff := s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime, LiteralIntervalAmount(uint64(storage.ApplyLeaseStaleAfter.Microseconds())), IntervalMicrosecond)
-	// Process share (OW-11): starting a parked cutover takes a lease on this
-	// process, so it waits while the apply already holds its share here.
-	processShare, processShareArgs := s.parkedCutoverProcessShareClause(staleClaimCutoff, owner)
+	queryArgs = append(queryArgs, cutoverCapArgs...)
 	queryArgs = append(queryArgs, processShareArgs...)
 	// Recovery clause: a row already mid-cutover whose heartbeat has gone stale is
 	// re-leased without changing state, so it carries no ordering gate (but is
@@ -2063,14 +2388,15 @@ func (s *applyOperationStore) FindNextApplyOperationCutover(ctx context.Context,
 						AND cr.operation = ?
 						AND cr.status = ?
 				)
-				AND `+processShare+`
+				AND %s
+				AND %s
 			)
 			OR (state IN (?, ?) AND updated_at < %s)
 		)
 		ORDER BY created_at, id
 		LIMIT 1
 		FOR UPDATE SKIP LOCKED
-	`, applyOperationColumns, deferCutoverIsTrue, staleClaimCutoff), queryArgs...)
+	`, applyOperationColumns, deferCutoverIsTrue, cutoverCap, processShare, staleClaimCutoff), queryArgs...)
 
 	ad, err := scanApplyOperationInto(row)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -2086,6 +2412,13 @@ func (s *applyOperationStore) FindNextApplyOperationCutover(ctx context.Context,
 	leaseAcquiredAt := time.Now()
 
 	if ad.State == state.ApplyOperation.WaitingForCutover {
+		admitted, err := s.admitCutoverUnderCap(ctx, tx, ad, owner, staleClaimCutoff)
+		if err != nil {
+			return nil, err
+		}
+		if !admitted {
+			return nil, nil
+		}
 		// waiting_for_cutover → cutting_over: rotate the lease and refresh the
 		// heartbeat in the same write, leaving started_at untouched (it was
 		// stamped when the copy phase started). WHERE state = ? guards against a
@@ -2140,17 +2473,58 @@ func (s *applyOperationStore) FindNextApplyOperationCutover(ctx context.Context,
 	return ad, nil
 }
 
+// admitCutoverUnderCap makes the cutover cap a hard bound per apply. The
+// claim query's cap filter is evaluated by each claim on its own, so two
+// claims polling in the same instant could both read the count below the cap
+// and both start a cutover. Admission therefore serializes on the parent
+// apply row: the claim locks it, then recounts the apply's fresh cutover
+// leases, which now include any cutover another claim committed before
+// releasing the lock.
+//
+// The lock is taken with SKIP LOCKED, so a claim never waits on the parent
+// row while it holds the candidate operation's row lock. A claim that finds
+// the parent locked backs off, and the candidate is claimable again on the
+// next poll.
+func (s *applyOperationStore) admitCutoverUnderCap(ctx context.Context, tx *rebindTx, ad *storage.ApplyOperation, owner, staleClaimCutoff string) (bool, error) {
+	var parentID int64
+	err := tx.QueryRowContext(ctx, `SELECT id FROM applies WHERE id = ? FOR UPDATE SKIP LOCKED`, ad.ApplyID).Scan(&parentID)
+	if errors.Is(err, sql.ErrNoRows) {
+		slog.Debug("cutover claim backed off: another writer holds the parent apply, so the cutover is retried on the next poll",
+			append(ad.LogAttrs(), "owner", owner)...)
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("lock parent apply to admit the cutover of apply_operation %d: %w", ad.ID, err)
+	}
+
+	capClause, capArgs := s.cutoverCapClause(staleClaimCutoff)
+	var underCap int
+	err = tx.QueryRowContext(ctx, fmt.Sprintf(`
+		SELECT CASE WHEN %s THEN 1 ELSE 0 END
+		FROM apply_operations
+		WHERE id = ?
+	`, capClause), append(capArgs, ad.ID)...).Scan(&underCap)
+	if err != nil {
+		return false, fmt.Errorf("recount cutovers in flight to admit apply_operation %d: %w", ad.ID, err)
+	}
+	if underCap != 1 {
+		slog.Debug("cutover claim backed off: the apply is at its cutover cap, so the cutover starts once one in flight settles",
+			append(ad.LogAttrs(), "owner", owner, "max_drivers_per_apply", s.maxDriversPerApply)...)
+		return false, nil
+	}
+	return true, nil
+}
+
 // CutoverBlocker returns the earliest earlier sibling that holds the given
-// operation's cutover, or nil when it is that operation's turn. It evaluates
+// operation's cutover, or nil when nothing does. It evaluates
 // earlierSiblingHoldsCutoverSQL, the rule the automatic cutover claim gates on,
-// so a manually requested cutover and the automatic one agree on whose turn it
-// is between members. Only operations of another rollout member
-// (earlierRolloutMemberSQL) are considered: under a requested cutover a
-// member's own operations, its shards and tables, cut over together, since the
-// cutover a request sends addresses the member's remote apply and takes
-// whichever of them are parked. The automatic claim has no member filter and
-// still cuts them over one at a time. It reads the order and does not claim
-// anything.
+// so a manually requested cutover and the automatic one agree on when an
+// earlier deployment, or an earlier target's failure, holds a later one. Only operations of another
+// rollout member (earlierRolloutMemberSQL) are considered: under a requested
+// cutover a member's own operations, its shards and tables, cut over
+// together, since the cutover a request sends addresses the member's remote
+// apply and takes whichever of them are parked. It reads the rollout and does
+// not claim anything.
 func (s *applyOperationStore) CutoverBlocker(ctx context.Context, operationID int64) (*storage.ApplyOperation, error) {
 	args := append([]any{operationID}, earlierSiblingHoldsCutoverArgs()...)
 	row := s.db.QueryRowContext(ctx, `
@@ -2317,36 +2691,87 @@ func (s *applyOperationStore) DeleteByApply(ctx context.Context, applyID int64) 
 // Writes are apply-lease guarded when a lease is present in ctx, mirroring
 // DeleteByApply.
 func (s *applyOperationStore) MarkPendingStoppedByApply(ctx context.Context, applyID int64) (int64, error) {
+	return s.markPendingByApply(ctx, applyID, state.ApplyOperation.Stopped, "stop", pendingRows)
+}
+
+// MarkPendingCancelledByApply transitions every operation of an apply that
+// never started to cancelled, returning the number of rows changed: the
+// pending ones, and the ones a stop moved from pending to stopped before any
+// driver claimed them. Neither changed anything on its target, so nothing has
+// to be stopped there. The claim gate would only ever refuse a pending one once
+// the rollout settles, and the rollout settles cancelled without waiting on a
+// never-started stopped one, so either left alone would outlive the cancelled
+// apply. Cancelled is final, so completed_at is stamped. A stopped operation
+// that had started is left to the drive that delivers the cancel to it, and
+// writes are lease guarded exactly as MarkPendingStoppedByApply's.
+func (s *applyOperationStore) MarkPendingCancelledByApply(ctx context.Context, applyID int64) (int64, error) {
+	return s.markPendingByApply(ctx, applyID, state.ApplyOperation.Cancelled, "cancel", neverStartedRows)
+}
+
+// sweptRows selects the operation rows a bulk sweep of an apply settles. The
+// predicate names its columns through the given prefix, "" or a table alias
+// with its trailing dot.
+type sweptRows struct {
+	predicate func(prefix string) string
+	args      []any
+}
+
+// pendingRows are the operations no driver has claimed yet.
+var pendingRows = sweptRows{
+	predicate: func(prefix string) string { return prefix + "state = ?" },
+	args:      []any{state.ApplyOperation.Pending},
+}
+
+// neverStartedRows are the pending operations plus the stopped ones that never
+// started, which a stop reached while they were still pending.
+var neverStartedRows = sweptRows{
+	predicate: func(prefix string) string {
+		return "(" + prefix + "state = ? OR (" + prefix + "state = ? AND " + prefix + "started_at IS NULL))"
+	},
+	args: []any{state.ApplyOperation.Pending, state.ApplyOperation.Stopped},
+}
+
+// markPendingByApply moves the swept operations of an apply to newState,
+// stamping completed_at when newState is terminal and not resumable.
+func (s *applyOperationStore) markPendingByApply(ctx context.Context, applyID int64, newState, verb string, swept sweptRows) (int64, error) {
+	assignments := []JoinedUpdateAssignment{
+		{Column: "state", Expr: "?"},
+		{Column: "updated_at", Expr: "NOW()"},
+	}
+	plainSet := "state = ?, updated_at = NOW()"
+	if newState != state.ApplyOperation.Stopped {
+		assignments = append(assignments, JoinedUpdateAssignment{Column: "completed_at", Expr: "NOW()"})
+		plainSet += ", completed_at = NOW()"
+	}
 	// An operation-lease-only drive (fan-out multi-operation mode) holds no
 	// parent apply lease, but it is still an authorized driver of the apply's
 	// rollout and may terminalize the apply's still-pending sibling operations
-	// under a pending stop. Authorize the bulk stop by joining the owning
-	// operation row and requiring it still carries the lease token, so a
-	// displaced driver that lost its lease fails closed instead of stopping
+	// under a pending stop or cancel. Authorize the bulk write by joining the
+	// owning operation row and requiring it still carries the lease token, so a
+	// displaced driver that lost its lease fails closed instead of moving
 	// siblings it no longer owns. Operation lease takes precedence over the
 	// parent apply lease, matching operationWriteGuardFromContext.
 	if opLease, ok := storage.OperationLeaseFromContext(ctx); ok {
 		if !opLease.Valid() {
-			return 0, fmt.Errorf("invalid operation lease for stopping pending apply_operations of apply %d: %w", applyID, storage.ErrApplyLeaseLost)
+			return 0, fmt.Errorf("invalid operation lease for %s of pending apply_operations of apply %d: %w", verb, applyID, storage.ErrApplyLeaseLost)
 		}
 		if opLease.ApplyID != applyID {
-			return 0, fmt.Errorf("operation lease for apply %d does not authorize stopping pending operations of apply %d: %w", opLease.ApplyID, applyID, storage.ErrApplyLeaseLost)
+			return 0, fmt.Errorf("operation lease for apply %d does not authorize %s of pending operations of apply %d: %w", opLease.ApplyID, verb, applyID, storage.ErrApplyLeaseLost)
 		}
 		query := s.dialect.JoinedUpdate(
 			"apply_operations", "ao", "apply_operations", "owner_op", "owner_op.apply_id = ao.apply_id",
-			[]JoinedUpdateAssignment{
-				{Column: "state", Expr: "?"},
-				{Column: "updated_at", Expr: "NOW()"},
-			},
-			"ao.apply_id = ? AND ao.state = ? AND owner_op.id = ? AND "+s.dialect.LeaseTokenFence("apply_operations", "owner_op", "id", "lease_token"),
+			assignments,
+			"ao.apply_id = ? AND "+swept.predicate("ao.")+" AND owner_op.id = ? AND "+s.dialect.LeaseTokenFence("apply_operations", "owner_op", "id", "lease_token"),
 		)
-		result, err := s.db.ExecContext(ctx, query, state.ApplyOperation.Stopped, applyID, state.ApplyOperation.Pending, opLease.OperationID, opLease.Token)
+		args := append([]any{newState, applyID}, swept.args...)
+		args = append(args, opLease.OperationID, opLease.Token)
+		result, err := s.db.ExecContext(ctx, query, args...)
 		if err != nil {
-			return 0, fmt.Errorf("stop pending apply_operations for apply %d under operation lease: %w", applyID, err)
+			return 0, fmt.Errorf("%s pending apply_operations for apply %d under operation lease: %w", verb, applyID, err)
 		}
 		rows, err := result.RowsAffected()
 		if err != nil {
-			return 0, fmt.Errorf("read stopped pending apply_operations rows affected for apply %d: %w", applyID, err)
+			return 0, fmt.Errorf("read %s pending apply_operations rows affected for apply %d: %w", verb, applyID, err)
 		}
 		if rows == 0 {
 			// No pending rows changed: either there were none (lease still
@@ -2364,36 +2789,36 @@ func (s *applyOperationStore) MarkPendingStoppedByApply(ctx context.Context, app
 	if err != nil {
 		return 0, err
 	}
-	if !hasLease {
-		result, err := s.db.ExecContext(ctx, `
-			UPDATE apply_operations
-			SET state = ?, updated_at = NOW()
-			WHERE apply_id = ? AND state = ?
-		`, state.ApplyOperation.Stopped, applyID, state.ApplyOperation.Pending)
+	if hasLease {
+		query := s.dialect.JoinedUpdate(
+			"apply_operations", "ao", "applies", "a", "a.id = ao.apply_id",
+			assignments,
+			"ao.apply_id = ? AND "+swept.predicate("ao.")+" AND "+s.dialect.LeaseTokenFence("applies", "a", "id", "lease_token"),
+		)
+		args := append([]any{newState, applyID}, swept.args...)
+		args = append(args, lease.Token)
+		result, err := s.db.ExecContext(ctx, query, args...)
 		if err != nil {
-			return 0, fmt.Errorf("stop pending apply_operations for apply %d: %w", applyID, err)
+			return 0, fmt.Errorf("%s pending apply_operations for apply %d: %w", verb, applyID, err)
 		}
-		rows, err := result.RowsAffected()
+		rows, err := confirmLeaseOnZeroRows(ctx, s.db, result, lease, verb+" pending apply_operations", fmt.Sprintf("apply %d", applyID))
 		if err != nil {
-			return 0, fmt.Errorf("read stopped pending apply_operations rows affected for apply %d: %w", applyID, err)
+			return 0, err
 		}
 		return rows, nil
 	}
-	query := s.dialect.JoinedUpdate(
-		"apply_operations", "ao", "applies", "a", "a.id = ao.apply_id",
-		[]JoinedUpdateAssignment{
-			{Column: "state", Expr: "?"},
-			{Column: "updated_at", Expr: "NOW()"},
-		},
-		"ao.apply_id = ? AND ao.state = ? AND "+s.dialect.LeaseTokenFence("applies", "a", "id", "lease_token"),
-	)
-	result, err := s.db.ExecContext(ctx, query, state.ApplyOperation.Stopped, applyID, state.ApplyOperation.Pending, lease.Token)
+	args := append([]any{newState, applyID}, swept.args...)
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE apply_operations
+		SET `+plainSet+`
+		WHERE apply_id = ? AND `+swept.predicate("")+`
+	`, args...)
 	if err != nil {
-		return 0, fmt.Errorf("stop pending apply_operations for apply %d: %w", applyID, err)
+		return 0, fmt.Errorf("%s pending apply_operations for apply %d: %w", verb, applyID, err)
 	}
-	rows, err := confirmLeaseOnZeroRows(ctx, s.db, result, lease, "stopped pending apply_operations", fmt.Sprintf("apply %d", applyID))
+	rows, err := result.RowsAffected()
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("read %s pending apply_operations rows affected for apply %d: %w", verb, applyID, err)
 	}
 	return rows, nil
 }
@@ -2505,11 +2930,11 @@ func unleasedOperationGate(d Dialect) string {
 // where the parent is selected.
 //
 // It reads the lease and nothing else, because state does not tell the two
-// meanings of a lease apart. A redispatched operation keeps its failed_retryable
-// state for the whole drive — the claim rotates the lease and leaves the state
-// alone — so any state filter that admits failed_retryable admits an apply a
-// driver is part-way through retrying, which is the one case a whole-apply write
-// must not land under. Filtering it out instead would exclude the retry but not
+// meanings of a lease apart. A redispatched single-operation row keeps its
+// failed_retryable state for the whole drive — the claim rotates the lease and
+// leaves the state alone — so any state filter that admits failed_retryable
+// admits an apply a driver is part-way through retrying, which is the one case a
+// whole-apply write must not land under. Filtering it out instead would exclude the retry but not
 // the drive.
 //
 // Reading the lease alone only terminalizes because a drive clears its lease as

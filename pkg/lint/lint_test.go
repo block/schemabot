@@ -80,6 +80,58 @@ func TestLintStatements_DropIndex(t *testing.T) {
 	assert.True(t, found, "expected invisible_index_before_drop error for DROP INDEX, got: %+v", results)
 }
 
+// The default linter classifies a destructive change by what it does, never
+// by the table's name: dropping a column and a unique index requires
+// --allow-unsafe on a table called schema_version exactly as on users.
+func TestPlanChangesDefaultConfigFlagsDropsOnEveryTableName(t *testing.T) {
+	for _, name := range []string{"users", "schema_version"} {
+		t.Run(name, func(t *testing.T) {
+			current := []table.TableSchema{{Name: name, Schema: "CREATE TABLE `" + name + "` (" +
+				"`id` bigint NOT NULL, `checksum` int, `script` varchar(100), " +
+				"PRIMARY KEY (`id`), UNIQUE KEY `u_script` (`script`)" +
+				") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"}}
+			desired := []table.TableSchema{{Name: name, Schema: "CREATE TABLE `" + name + "` (" +
+				"`id` bigint NOT NULL, `script` varchar(100), PRIMARY KEY (`id`)" +
+				") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"}}
+
+			plan, err := PlanChanges(current, desired, nil, New().SpiritConfig())
+			require.NoError(t, err)
+			require.Len(t, plan.Changes, 1)
+
+			change := plan.Changes[0]
+			assert.Equal(t, name, change.TableName)
+			assert.Contains(t, change.Statement, "DROP COLUMN `checksum`")
+			assert.Contains(t, change.Statement, "DROP INDEX `u_script`")
+			reason, unsafe := PlannedChangeUnsafeReason(change)
+			assert.True(t, unsafe, "dropping a column and an index on %s must require --allow-unsafe", name)
+			assert.NotEmpty(t, reason)
+		})
+	}
+}
+
+// The default linter judges a table named schema_version the same way as any
+// other on every entry point: dropping it outright requires --allow-unsafe, and
+// a PostgreSQL schema that declares it gets the same findings as users.
+func TestDefaultConfigLintsSchemaVersionOnEveryPath(t *testing.T) {
+	for _, name := range []string{"users", "schema_version"} {
+		t.Run(name, func(t *testing.T) {
+			results, unsafe, err := New().LintStatements([]string{"DROP TABLE `" + name + "`"})
+			require.NoError(t, err)
+			assert.True(t, unsafe, "dropping %s must require --allow-unsafe", name)
+			assert.NotEmpty(t, results)
+
+			pgResults, err := New().LintPostgresSchema(map[string]string{
+				name: "CREATE TABLE " + name + " (version integer);",
+			})
+			require.NoError(t, err)
+			require.NotEmpty(t, pgResults, "the default config must not exempt the PostgreSQL table %s", name)
+			for _, r := range pgResults {
+				assert.Equal(t, name, r.Table)
+			}
+		})
+	}
+}
+
 func TestLintStatements_SafeAlter(t *testing.T) {
 	linter := New()
 
@@ -359,6 +411,53 @@ func TestPlanChangesFlagsTablesSpiritCannotAlter(t *testing.T) {
 		require.Len(t, plan.Statements(), 1)
 		assert.Contains(t, plan.Statements()[0], "CREATE TABLE `events`")
 		assert.Empty(t, spiritCompatibleSeverities(plan, "events"))
+	})
+}
+
+// Narrowing a non-key column's type, or removing an ENUM or SET value, plans
+// with no error-severity finding, so the change does not need --allow-unsafe;
+// whether it loses data is left to the apply. Narrowing the primary key is
+// unsafe only through the key type policy, when the new type is not an
+// allowed key type.
+func TestPlanChangesNarrowingIsNotUnsafe(t *testing.T) {
+	const suffix = " ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+	plan := func(t *testing.T, live, desired string) spiritlint.PlannedChange {
+		t.Helper()
+		current := []table.TableSchema{{Name: "t", Schema: "CREATE TABLE `t` (" + live + ")" + suffix}}
+		wanted := []table.TableSchema{{Name: "t", Schema: "CREATE TABLE `t` (" + desired + ")" + suffix}}
+		p, err := PlanChanges(current, wanted, nil, New().SpiritConfig())
+		require.NoError(t, err)
+		require.Len(t, p.Changes, 1)
+		return p.Changes[0]
+	}
+	withPK := func(col string) string {
+		return "`id` bigint unsigned NOT NULL AUTO_INCREMENT, " + col + ", PRIMARY KEY (`id`)"
+	}
+
+	notUnsafe := []struct{ name, live, desired, wantDDL string }{
+		{"varchar shortened", "`c` varchar(255) NOT NULL", "`c` varchar(10) NOT NULL", "MODIFY COLUMN `c` varchar(10)"},
+		{"bigint to tinyint", "`c` bigint NOT NULL", "`c` tinyint NOT NULL", "MODIFY COLUMN `c` tinyint"},
+		{"enum value removed", "`c` enum('a','b','c') NOT NULL", "`c` enum('a','b') NOT NULL", "MODIFY COLUMN `c` enum('a','b')"},
+		{"set value removed", "`c` set('a','b','c') NOT NULL", "`c` set('a','b') NOT NULL", "MODIFY COLUMN `c` set('a','b')"},
+	}
+	for _, tt := range notUnsafe {
+		t.Run(tt.name, func(t *testing.T) {
+			change := plan(t, withPK(tt.live), withPK(tt.desired))
+			assert.Contains(t, change.Statement, tt.wantDDL)
+			reason, unsafe := PlannedChangeUnsafeReason(change)
+			assert.False(t, unsafe, "reason: %q", reason)
+			assert.Empty(t, change.Errors())
+		})
+	}
+
+	t.Run("primary key narrowed to a type outside the key type policy", func(t *testing.T) {
+		change := plan(t,
+			"`id` bigint unsigned NOT NULL AUTO_INCREMENT, PRIMARY KEY (`id`)",
+			"`id` int unsigned NOT NULL AUTO_INCREMENT, PRIMARY KEY (`id`)")
+		assert.Contains(t, change.Statement, "MODIFY COLUMN `id` int unsigned")
+		reason, unsafe := PlannedChangeUnsafeReason(change)
+		assert.True(t, unsafe)
+		assert.Contains(t, reason, `Primary key column "id" has type "int"`)
 	})
 }
 
