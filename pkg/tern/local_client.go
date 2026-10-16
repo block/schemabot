@@ -3093,6 +3093,17 @@ func (c *LocalClient) attachDispatchOperation(ctx context.Context, req *ternv1.A
 		return nil, fmt.Errorf("no engine configured for type: %s", c.config.Type)
 	}
 
+	// The plan row was drift-checked against the creating dispatch's shard
+	// only, so a sibling shard is checked against its own live schema before
+	// its work is admitted, and runs this shard's rendering of the change.
+	// This runs before the unsafe-change gate so the gate judges the flag this
+	// shard's re-plan set.
+	if scope.shard != "" {
+		if err := c.verifyAttachedShardDispatch(ctx, req, &scope); err != nil {
+			return nil, fmt.Errorf("attach operation %s to apply %s: %w", operationKey, apply.ApplyIdentifier, err)
+		}
+	}
+
 	applyOpts := storage.ApplyOptionsFromMap(req.Options)
 	applyOpts.Target = plan.Target
 	applyOpts.DirectExecution = DirectExecutionPolicyFromProto(req.GetDirectExecution())
