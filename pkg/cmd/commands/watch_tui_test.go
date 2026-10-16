@@ -113,7 +113,7 @@ func TestWatchModel_GivesUpAfterConsecutiveRetryableFailures(t *testing.T) {
 	require.NotNil(t, cmd, "the attempt that reaches the limit ends the watch")
 	assert.IsType(t, tea.QuitMsg{}, cmd())
 	assert.Equal(t, maxConsecutiveProgressFailures, model.consecutiveErrors)
-	assert.Equal(t, progressGiveUpMessage(scriptedApplyID, maxConsecutiveProgressFailures)+": "+failure.errorMsg, model.errorMsg)
+	assert.Equal(t, progressGiveUpMessage(scriptedApplyID, "staging", maxConsecutiveProgressFailures)+": "+failure.errorMsg, model.errorMsg)
 	assert.Contains(t, model.errorMsg, "fetch progress for apply "+scriptedApplyID+": 10 consecutive attempts failed; this watch does not affect the apply")
 	assert.Equal(t, state.Apply.Running, model.state, "the last known state is kept on screen")
 }

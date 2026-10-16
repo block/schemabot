@@ -996,14 +996,25 @@ func WriteStartSuccess(data StartData) {
 	fmt.Printf("%sResuming from checkpoint...%s\n", ANSIDim, ANSIReset)
 }
 
+// ProgressCommand is the command that watches an apply on the server and in
+// the environment this run addressed. A wrapper may route an omitted
+// environment to a default one, so the environment is named whenever this run
+// knew it, along with the routing flags the operator passed.
+func ProgressCommand(applyID, environment string) string {
+	if environment == "" {
+		return cliname.Command("progress", applyID)
+	}
+	return cliname.Command("progress", applyID, "-e", environment)
+}
+
 // WriteStartNoWatch writes the start command output when --watch=false.
 func WriteStartNoWatch(applyID, database, environment string) {
 	fmt.Printf("%s%s▶️  Schema change resumed%s\n", ANSIBold, ANSIGreen, ANSIReset)
 	fmt.Println()
 	if applyID != "" {
-		fmt.Printf("To watch and manage: %s progress %s\n", cliname.Name(), applyID)
+		fmt.Printf("To watch and manage: %s\n", ProgressCommand(applyID, environment))
 	} else {
-		fmt.Printf("To watch and manage: %s status -d %s -e %s\n", cliname.Name(), database, environment)
+		fmt.Printf("To watch and manage: %s\n", cliname.Command("status", "-d", database, "-e", environment))
 	}
 }
 
@@ -1022,7 +1033,7 @@ func WriteReleaseSuccess(data ReleaseData) {
 	fmt.Printf("Environment: %s\n", data.Environment)
 	fmt.Println()
 	if data.ApplyID != "" {
-		fmt.Printf("%sHeld deployments will resume. Use '%s progress %s' to follow them.%s\n", ANSIDim, cliname.Name(), data.ApplyID, ANSIReset)
+		fmt.Printf("%sHeld deployments will resume. Use '%s' to follow them.%s\n", ANSIDim, ProgressCommand(data.ApplyID, data.Environment), ANSIReset)
 	} else {
 		fmt.Printf("%sHeld deployments will resume.%s\n", ANSIDim, ANSIReset)
 	}

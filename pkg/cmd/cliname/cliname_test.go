@@ -46,3 +46,46 @@ func TestFromArgs(t *testing.T) {
 		})
 	}
 }
+
+// TestCommand covers how hints render the recorded route. Like the name, the
+// route is process-global, so both are reset around the test. A run with no
+// routing flags renders the bare command; a wrapper that records a routing
+// flag of its own gets it on every hint, quoted when a shell would split it;
+// and recording an empty route clears it.
+func TestCommand(t *testing.T) {
+	name.Store(nil)
+	route.Store(nil)
+	t.Cleanup(func() {
+		name.Store(nil)
+		route.Store(nil)
+	})
+
+	assert.Equal(t, "schemabot progress apply-1", Command("progress", "apply-1"), "no route renders the bare command")
+
+	Set("acme schemabot")
+	SetRoute("--profile", "prod", "--context", "west cluster")
+	assert.Equal(t, `acme schemabot progress apply-1 -e production --profile prod --context "west cluster"`,
+		Command("progress", "apply-1", "-e", "production"))
+	assert.Equal(t, "acme schemabot start -e <environment> apply-1 --profile prod --context \"west cluster\"",
+		Command("start", "-e", "<environment>", "apply-1"), "caller args, including a placeholder, render as given")
+
+	SetRoute()
+	assert.Equal(t, "acme schemabot progress apply-1", Command("progress", "apply-1"), "an empty route clears it")
+}
+
+func TestQuoteArg(t *testing.T) {
+	tests := []struct {
+		arg  string
+		want string
+	}{
+		{"prod", "prod"},
+		{"https://schemabot.example:8443/api", "https://schemabot.example:8443/api"},
+		{"west cluster", `"west cluster"`},
+		{`a"b`, `"a\"b"`},
+		{"$HOME", `"\$HOME"`},
+		{"", `""`},
+	}
+	for _, tt := range tests {
+		assert.Equal(t, tt.want, quoteArg(tt.arg), "quoteArg(%q)", tt.arg)
+	}
+}

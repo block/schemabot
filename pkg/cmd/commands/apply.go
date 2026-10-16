@@ -421,11 +421,11 @@ func lockKeptReason(applyID, environment string, progress *apitypes.ProgressResp
 	case state.IsState(applyState, state.NoActiveChange):
 		return fmt.Sprintf("the server reported no state for apply %s", applyID)
 	case state.IsState(applyState, state.Apply.Failed) && len(progress.Operations) == 0:
-		return fmt.Sprintf("apply %s is failed and the server reported no deployment rows to check (see %s progress -e %s %s)",
-			applyID, cliname.Name(), environment, applyID)
+		return fmt.Sprintf("apply %s is failed and the server reported no deployment rows to check (see %s)",
+			applyID, templates.ProgressCommand(applyID, environment))
 	case state.IsState(applyState, state.SettledApplyStates...):
-		return fmt.Sprintf("apply %s is %s, but not every deployment and table under it has stopped yet (see %s progress -e %s %s)",
-			applyID, applyState, cliname.Name(), environment, applyID)
+		return fmt.Sprintf("apply %s is %s, but not every deployment and table under it has stopped yet (see %s)",
+			applyID, applyState, templates.ProgressCommand(applyID, environment))
 	default:
 		return fmt.Sprintf("apply %s has not finished (state: %s)", applyID, applyState)
 	}
@@ -474,10 +474,10 @@ func WatchApplyProgressWithFormat(ctx context.Context, endpoint, applyID, enviro
 		if logHeartbeat <= 0 {
 			logHeartbeat = logHeartbeatDefault
 		}
-		return watchApplyProgressLog(newProgressPoller(ctx, endpoint, applyID), logHeartbeat)
+		return watchApplyProgressLog(newProgressPoller(ctx, endpoint, applyID, environment), logHeartbeat)
 	}
 	if format == OutputFormatJSON {
-		return watchApplyProgressJSON(newProgressPoller(ctx, endpoint, applyID))
+		return watchApplyProgressJSON(newProgressPoller(ctx, endpoint, applyID, environment))
 	}
 
 	// Interactive format: use Bubbletea TUI
@@ -486,8 +486,8 @@ func WatchApplyProgressWithFormat(ctx context.Context, endpoint, applyID, enviro
 
 // WatchApplyProgressAfterCutover polls the progress API after cutover has been triggered.
 // It waits for completion without showing the "waiting for cutover" instructions.
-func WatchApplyProgressAfterCutover(ctx context.Context, endpoint, applyID string) error {
-	return watchAfterCutover(newProgressPoller(ctx, endpoint, applyID))
+func WatchApplyProgressAfterCutover(ctx context.Context, endpoint, applyID, environment string) error {
+	return watchAfterCutover(newProgressPoller(ctx, endpoint, applyID, environment))
 }
 
 func watchAfterCutover(poller *progressPoller) error {
@@ -955,7 +955,7 @@ func watchApplyProgressLog(poller *progressPoller, heartbeatInterval time.Durati
 		}
 
 		if state.IsState(curState, state.NoActiveChange) {
-			return noActiveChangeError(poller.applyID)
+			return noActiveChangeError(poller.applyID, poller.environment)
 		}
 
 		tables := ddl.FilterInternalTablesTyped(result.Tables)
@@ -1310,7 +1310,7 @@ func watchApplyProgressJSON(poller *progressPoller) error {
 			return terminalWatchExit(result)
 		}
 		if state.IsState(curState, state.NoActiveChange) {
-			return noActiveChangeError(poller.applyID)
+			return noActiveChangeError(poller.applyID, poller.environment)
 		}
 
 		if err := poller.pause(pollInterval); err != nil {

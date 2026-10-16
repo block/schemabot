@@ -371,13 +371,13 @@ func (m WatchModel) detachedView() string {
 	}
 	b.WriteString("\n")
 	if m.applyID != "" {
-		fmt.Fprintf(&b, "To reattach: %s progress %s\n", cliname.Name(), m.applyID)
+		fmt.Fprintf(&b, "To reattach: %s\n", templates.ProgressCommand(m.applyID, m.environment))
 		if state.IsState(m.state, state.Apply.WaitingForDeploy) {
-			fmt.Fprintf(&b, "To deploy:   %s start -e %s %s\n", cliname.Name(), m.environment, m.applyID)
+			fmt.Fprintf(&b, "To deploy:   %s\n", cliname.Command("start", "-e", m.environment, m.applyID))
 		}
-		fmt.Fprintf(&b, "To stop:     %s stop -e %s %s\n", cliname.Name(), m.environment, m.applyID)
+		fmt.Fprintf(&b, "To stop:     %s\n", cliname.Command("stop", "-e", m.environment, m.applyID))
 	} else {
-		fmt.Fprintf(&b, "Find apply:  %s status -d %s -e %s\n", cliname.Name(), m.database, m.environment)
+		fmt.Fprintf(&b, "Find apply:  %s\n", cliname.Command("status", "-d", m.database, "-e", m.environment))
 	}
 	return b.String()
 }
