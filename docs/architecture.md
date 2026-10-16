@@ -237,8 +237,12 @@ Unsafe operations that produce error-severity violations:
 
 - `DROP TABLE` — deletes the entire table and its data
 - `DROP COLUMN` — deletes a column and its data from every row
-- `MODIFY COLUMN` (type change) — may truncate or lose data if the new type is narrower
 - `DROP INDEX` without first making it invisible — may cause query performance regression
+
+A `MODIFY COLUMN` that narrows a type (for example `varchar(255)` to `varchar(10)`, or
+`bigint` to `tinyint`) and the removal of an `ENUM` or `SET` value are not on this list:
+Spirit's linter reports no error-severity violation for them, so they plan and apply without
+`--allow-unsafe`. Review a narrowing change against the data the column already holds.
 
 For MySQL/Spirit databases, an applied `DROP TABLE` can additionally be
 quarantined instead of executed: the table is renamed into a `_pending_drops`
