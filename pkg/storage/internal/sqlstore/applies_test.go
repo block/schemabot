@@ -5134,3 +5134,32 @@ func TestApplyStore_WithBranchReconcileElection_ReturnsTheReconcileError(t *test
 
 	require.ErrorIs(t, err, reconcileErr)
 }
+
+// A create taking over a stopped apply opens its transaction, and the attach
+// path, which stamps outside the apply target lock, then records an earlier
+// successor on the same stopped apply and commits. The create's stamp must
+// tolerate that earlier successor rather than fail the create: under MySQL's
+// REPEATABLE READ the conditional UPDATE sees the committed marker and changes
+// nothing, so the read-back has to see it too.
+func TestApplyStore_TakeoverToleratesAMarkerCommittedDuringTheCreate(t *testing.T) {
+	ctx := t.Context()
+	clearTables(t)
+	store := NewMySQL(testDB)
+	lock := storagetest.CreateLock(t, store, "takeover_snapshot_db", storage.DatabaseTypeMySQL)
+	holder := storagetest.CreateApplyWithStateAndEnv(t, store, lock, "apply_takeover_snapshot_holder", 9701, state.Apply.Stopped, "staging")
+
+	writeTx, err := beginApplyWriteTx(ctx, store.db, "take over stopped apply")
+	require.NoError(t, err)
+	defer writeTx.close(ctx, "take over stopped apply")
+	var one int
+	require.NoError(t, writeTx.tx.QueryRowContext(ctx, `SELECT 1 FROM applies WHERE id = ?`, holder.ID).Scan(&one),
+		"the create's snapshot starts before the earlier successor's marker commits")
+
+	require.NoError(t, store.Applies().MarkSuperseded(ctx, holder.ID, "apply_earlier"))
+
+	require.NoError(t, markTakenOver(ctx, writeTx.tx, holder.ID, "apply_later"),
+		"an earlier successor's marker must be tolerated")
+	var stored string
+	require.NoError(t, testDB.QueryRowContext(ctx, `SELECT superseded_by FROM applies WHERE id = ?`, holder.ID).Scan(&stored))
+	assert.Equal(t, "apply_earlier", stored, "the first successor keeps the marker")
+}

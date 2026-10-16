@@ -742,8 +742,10 @@ identifier. State alone cannot express this: the apply is still `stopped`, and o
 settles nothing else tells it apart from a stopped apply nobody touched. Starting it would replay
 its statements against a target where that work has already happened, so a stamped apply can never
 be started. The stamp is write-once, because a second and different successor means the takeover
-is ambiguous, and it is never cleared, outliving the successor it names. The create that makes the
-successor writes the stamp in its own transaction, so a successor never exists without it.
+is ambiguous, and it is never cleared, outliving the successor it names. A dispatch that creates
+its successor writes the stamp in the create's own transaction, so that successor never exists
+without it. A dispatch that attaches to an apply that already exists stamps after the attach
+commits, and a stamp that fails there is logged rather than retried.
 
 That refusal holds at every surface that could begin the work again: the API rejects the start
 request and points at the successor, a claim to resume refuses and fails the pending start request
@@ -754,7 +756,8 @@ on the storage apply update (`finishedApplyGuardPredicate`), the named state arm
 claim query, the terminal-state refusals in the control handlers, and the write-once supersession
 marker consulted by the start, resume, and retry paths and written in the successor's create
 transaction (`markTakenOver`, from `Apply.TakesOverApplyIDs`) (`pkg/storage/internal/sqlstore/applies.go`,
-`pkg/api/control_handlers.go`); the reopen policy each caller passes to the rollout projection,
+`pkg/api/control_handlers.go`), or after an attach (`markSupersededHolders`,
+`pkg/tern/local_apply_superseded.go`); the reopen policy each caller passes to the rollout projection,
 with the lease-scoped drive paths opting in and the unscoped reconciler opting out
 (`reopensHeldFailedRollout` in `updateApplyStateFromOperations`, `pkg/api/operator.go`), and the
 pending-request gate on a stopped rollout's reopen and drive (`stoppedRolloutDeliverableRequest`,
