@@ -557,9 +557,87 @@ func TestK8sMultiTarget_FailedTargetHaltsRollout(t *testing.T) {
 	assert.False(t, indexOn(t, dsns[1], "orders", "uq_note"), "shard 2 refused the reviewed DDL")
 }
 
-// heldAtBarrierBehindFailure reports whether p shows the halt rollout of
-// TestK8sMultiTarget_FailedTargetHaltsRollout holding shard 3 at the cutover
-// barrier behind shard 2's failure.
+// Shard 2 has duplicate notes, so its unique index on orders fails after its
+// copy, under the default on_failure: halt. Every shard starts together.
+// Shard 1 has nothing to copy and cuts over ahead of the failure. Shard 3
+// copies three times shard 2's rows, so it is still copying when shard 2
+// fails, and once its copy is ready it holds at the cutover barrier behind
+// the failure instead of cutting over. A cancel releases shard 3 without
+// cutting it over, and the apply settles failed, naming shard 2, whose failed
+// copy stays on the target for a new apply to adopt.
+func TestK8sMultiTarget_FailedCopyHoldsLaterTargetAtBarrier(t *testing.T) {
+	ep := testutil.Endpoint(t)
+	dsns := shardDSNs(t, mtShardApp)
+	resetSchema(t, dsns)
+	cleanupRolloutState(t)
+	execOn(t, dsns, mtOrdersV1, mtUsersV1)
+	seedOrders(t, dsns[1:2], mtCopyRows)
+	execOn(t, dsns[1:2], "INSERT INTO orders (user_id, amount, note) VALUES (1, 1, 'dup'), (2, 2, 'dup')")
+	seedOrders(t, dsns[2:], 3*mtCopyRows)
+
+	plan := planRollout(t, ep, mtShardApp, shardFiles(mtShardApp, map[string]string{"orders": mtOrdersUq, "users": mtUsersV2}))
+	applyID := applyRollout(t, ep, plan.PlanID, nil)
+
+	var held *apitypes.ProgressResponse
+	testutil.Poll(t, mtRolloutDeadline, testutil.PollInterval,
+		func() bool {
+			p, err := testutil.FetchProgress(ep, applyID)
+			if err != nil {
+				return false
+			}
+			held = p
+			return heldAtBarrierBehindFailure(p)
+		},
+		func() string {
+			return "rollout never held shard 3 behind shard 2's failed copy:\n" + describeProgress(held)
+		},
+	)
+	t.Log("held:\n" + describeProgress(held))
+	assert.Equal(t, state.ApplyOperation.Completed, operationStateOn(operationsByStep(held)[1], mtTargets[0]), describeProgress(held))
+	for _, op := range operationsByStep(held)[2] {
+		assert.True(t, state.IsState(op.State, state.ApplyOperation.Pending), "step 2 on %s did not start behind the failure, got %s", op.Target, op.State)
+	}
+	assert.False(t, indexOn(t, dsns[2], "orders", "uq_note"), "shard 3 holds its cutover behind the failure")
+
+	cancelResp, err := client.CallCancelAPI(ep, mtEnvironment, applyID)
+	require.NoError(t, err, "cancel")
+	require.True(t, cancelResp.Accepted, "cancel not accepted: %s", cancelResp.ErrorMessage)
+
+	p := waitForSettled(t, ep, applyID, mtRolloutDeadline, nil)
+	t.Log("settled:\n" + describeProgress(p))
+	require.Equal(t, state.Apply.Failed, p.State, describeProgress(p))
+	assert.Contains(t, p.ErrorMessage, mtTargets[1], "the failure names the target")
+	assert.Equal(t, state.ApplyOperation.Cancelled, operationStateOn(operationsByStep(p)[1], mtTargets[2]), describeProgress(p))
+	assert.True(t, indexOn(t, dsns[0], "orders", "uq_note"), "shard 1 cut over ahead of the failure")
+	assert.False(t, indexOn(t, dsns[2], "orders", "uq_note"), "the cancel released shard 3 without cutting it over")
+	for i, dsn := range dsns {
+		assert.False(t, testutil.ColumnExists(t, dsn, "users", "email"), "users is held after the failed table on %s", mtTargets[i])
+	}
+	// Shard 1 cut over and the cancel released shard 3's copy, asynchronously.
+	// Shard 2's failed copy stays on the target for a new apply to adopt.
+	released := []int{0, 2}
+	testutil.Poll(t, testutil.PollDeadline, time.Second,
+		func() bool {
+			for _, i := range released {
+				if len(shadowTables(t, dsns[i], "orders")) > 0 {
+					return false
+				}
+			}
+			return true
+		},
+		func() string {
+			var b strings.Builder
+			for _, i := range released {
+				b.WriteString(mtTargets[i] + ": " + strings.Join(shadowTables(t, dsns[i], "orders"), ",") + "\n")
+			}
+			return "shadow tables left on a shard that cut over or was cancelled:\n" + b.String()
+		},
+	)
+	assert.NotEmpty(t, shadowTables(t, dsns[1], "orders"), "the failed copy stays on %s for a new apply to adopt", mtTargets[1])
+}
+
+// heldAtBarrierBehindFailure reports whether p shows a halt rollout holding
+// shard 3 at the cutover barrier behind shard 2's failure.
 func heldAtBarrierBehindFailure(p *apitypes.ProgressResponse) bool {
 	ops := operationsByStep(p)[1]
 	return state.IsState(p.State, state.Apply.RunningDegraded) &&
