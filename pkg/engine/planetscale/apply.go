@@ -29,10 +29,24 @@ import (
 )
 
 // noChangesApplyResult builds the result for a converged apply where the deploy
-// request reported no schema differences. It must be Accepted so the tern layer
-// completes the apply's tasks instead of treating the no-op as a failure.
-func noChangesApplyResult(message string) *engine.ApplyResult {
-	return &engine.ApplyResult{Accepted: true, Message: message}
+// request reported no schema differences. It is Accepted and carries a resume
+// state naming the deploy request, so the drive follows it like any other
+// accepted apply: Progress reads the request's no_changes state as completed and
+// the drive completes the apply's tasks instead of treating the no-op as a
+// failure.
+func noChangesApplyResult(message, migrationContext string, meta *psMetadata) (*engine.ApplyResult, error) {
+	encoded, err := encodePSMetadata(meta)
+	if err != nil {
+		return nil, fmt.Errorf("encode metadata for no-changes deploy request #%d: %w", meta.DeployRequestID, err)
+	}
+	return &engine.ApplyResult{
+		Accepted: true,
+		Message:  message,
+		ResumeState: &engine.ResumeState{
+			MigrationContext: migrationContext,
+			Metadata:         encoded,
+		},
+	}, nil
 }
 
 // vschemaDiffsFromChanges extracts the per-keyspace VSchema diffs carried on the
@@ -383,7 +397,13 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (result *e
 			Message:  fmt.Sprintf("Deploy request #%d: no changes detected", dr.Number),
 			Metadata: map[string]string{"deploy_request_id": fmt.Sprintf("%d", dr.Number)},
 		})
-		return noChangesApplyResult("no changes detected"), nil
+		return noChangesApplyResult("no changes detected", migCtx, &psMetadata{
+			BranchName:            branchName,
+			DeployRequestID:       dr.Number,
+			DeployRequestURL:      dr.HtmlURL,
+			VSchemaDiffs:          vschemaDiffs,
+			ExistingMigrationCtxs: existingContexts,
+		})
 	}
 
 	// Determine instant DDL eligibility. Prefer instant when PlanetScale reports
@@ -1068,7 +1088,9 @@ func (e *Engine) resumeApply(ctx context.Context, client psclient.PSClient, org 
 		return nil, fmt.Errorf("deploy request #%d failed on resume (state: %s)", dr.Number, dr.DeploymentState)
 	}
 	if dr.DeploymentState == deployState.NoChanges {
-		return noChangesApplyResult("no changes detected on resume"), nil
+		meta.DeployRequestID = dr.Number
+		meta.DeployRequestURL = dr.HtmlURL
+		return noChangesApplyResult("no changes detected on resume", req.ResumeState.MigrationContext, meta)
 	}
 
 	if deferCutover {
@@ -1218,7 +1240,8 @@ func (e *Engine) resumeExistingDeployRequest(ctx context.Context, client psclien
 	if dr.DeploymentState == deployState.NoChanges {
 		e.logger.Info("recovered deploy request reports no changes on resume",
 			"database", req.Database, "deploy_request", dr.Number)
-		return noChangesApplyResult("no changes detected on resume"), nil
+		meta.DeployRequestURL = dr.HtmlURL
+		return noChangesApplyResult("no changes detected on resume", req.ResumeState.MigrationContext, meta)
 	}
 
 	meta.DeployRequestURL = dr.HtmlURL

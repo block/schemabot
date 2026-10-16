@@ -31,16 +31,46 @@ func (c *permanentVSchemaErrorClient) UpdateKeyspaceVSchema(context.Context, *ps
 }
 
 // A schema that is already converged produces a deploy request with no
-// differences. The apply must be accepted so the orchestrator completes the
-// change's tasks normally rather than reporting a spurious failure.
+// differences. The apply must be accepted with a resume state naming that
+// deploy request, so the orchestrator follows it like any other accepted apply:
+// the next progress poll reads the request's no_changes state as completed and
+// the change's tasks complete normally rather than reporting a spurious failure.
 func TestNoChangesApplyResultIsAccepted(t *testing.T) {
-	fresh := noChangesApplyResult("no changes detected")
-	assert.True(t, fresh.Accepted)
-	assert.Equal(t, "no changes detected", fresh.Message)
+	result, err := noChangesApplyResult("no changes detected", "apply-1a2b3c4d5e6f7890",
+		&psMetadata{BranchName: "schemabot-testdb-same", DeployRequestID: 55, DeployRequestURL: "https://app/dr/55"})
+	require.NoError(t, err)
+	assert.True(t, result.Accepted)
+	assert.Equal(t, "no changes detected", result.Message)
+	require.NotNil(t, result.ResumeState, "the drive needs a resume state to follow the deploy request")
+	assert.Equal(t, "apply-1a2b3c4d5e6f7890", result.ResumeState.MigrationContext)
+	stored, err := decodePSMetadata(result.ResumeState.Metadata)
+	require.NoError(t, err)
+	assert.Equal(t, uint64(55), stored.DeployRequestID)
+	assert.Equal(t, "schemabot-testdb-same", stored.BranchName)
 
-	resume := noChangesApplyResult("no changes detected on resume")
-	assert.True(t, resume.Accepted)
-	assert.Equal(t, "no changes detected on resume", resume.Message)
+	assert.Equal(t, engine.StateCompleted, noChangesProgressState(t, result.ResumeState),
+		"the next progress poll settles the converged apply as completed")
+}
+
+// noChangesProgressState polls Progress with rs against a deploy request that
+// reports no changes, the read the drive makes after the engine accepts.
+func noChangesProgressState(t *testing.T, rs *engine.ResumeState) engine.State {
+	t.Helper()
+	client := &resumeDeployClient{recovered: &ps.DeployRequest{State: deployRequestClosed, DeploymentState: deployState.NoChanges}}
+	e := NewWithClient(slog.New(slog.NewTextHandler(os.Stdout, nil)),
+		func(_, _ string) (psclient.PSClient, error) { return client, nil })
+	progress, err := e.Progress(t.Context(), &engine.ProgressRequest{
+		Database:    "testdb",
+		ResumeState: rs,
+		Credentials: &engine.Credentials{Metadata: map[string]string{
+			"organization": "org",
+			"token_name":   "token",
+			"token_value":  "secret",
+		}},
+	})
+	require.NoError(t, err)
+	require.NotNil(t, progress)
+	return progress.State
 }
 
 func TestApply_MainBranchReuseIsPermanent(t *testing.T) {
@@ -1061,6 +1091,14 @@ func TestResumeExistingDeployRequest_NoChangesIsConverged(t *testing.T) {
 			assert.Equal(t, "no changes detected on resume", result.Message)
 			assert.Equal(t, 0, client.deployCalls)
 			assert.Empty(t, *persisted, "nothing to record for a change that never ran")
+
+			require.NotNil(t, result.ResumeState, "the resumed drive needs a resume state to settle the apply")
+			assert.Equal(t, "apply-1a2b3c4d5e6f7890", result.ResumeState.MigrationContext)
+			stored, err := decodePSMetadata(result.ResumeState.Metadata)
+			require.NoError(t, err)
+			assert.Equal(t, uint64(55), stored.DeployRequestID)
+			assert.Equal(t, engine.StateCompleted, noChangesProgressState(t, result.ResumeState),
+				"the resumed drive's next progress poll settles the converged apply as completed")
 		})
 	}
 }
