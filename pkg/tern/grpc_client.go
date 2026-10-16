@@ -3473,12 +3473,14 @@ func shouldDispatchQueuedRemoteApply(apply *storage.Apply, scope applyTaskScope)
 	if state.IsState(dispatchState, state.Apply.Running) {
 		return true
 	}
-	// A stop catches still-pending operations before they start and moves them
-	// to stopped without a started_at; the start claim then moves the row to
-	// resuming. Such a row never ran, so it was never dispatched either, and
-	// resuming it is its first dispatch. A resuming row that had started is
-	// not: it may have reached remote Tern before its id was stored.
-	return state.IsState(dispatchState, state.Apply.Resuming) && scope.operation.StartedAt == nil
+	// A stop moves an operation with no remote id to stopped in storage alone,
+	// whether it was still pending or had been claimed but not yet dispatched,
+	// and the start claim then moves the row to resuming. Resuming it is a
+	// dispatch under the same reasoning as a running row: the deployment's
+	// key never rotates, so if an earlier dispatch did reach the data plane
+	// the data plane replays that operation rather than starting a second
+	// copy, and otherwise this attaches it for the first time.
+	return state.IsState(dispatchState, state.Apply.Resuming)
 }
 
 // undispatchedControlRequestSettlesLocally reports whether a pending stop or
