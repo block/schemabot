@@ -1528,8 +1528,66 @@ func TestCheckReviewGate_SelfApprovalBlocked(t *testing.T) {
 func TestCheckReviewGate_DisabledByDefault(t *testing.T) {
 	h, _ := setupReviewGateHandler(t, actorAuthTestConfig(false))
 
-	enabled := h.isReviewGateEnabled("octocat/hello-world")
+	enabled := h.isReviewGateEnabled("octocat/hello-world", "orders")
 	assert.False(t, enabled)
+}
+
+// A server instance with the review gate off (a staging instance, say) still
+// gates a database that opts in with its own review_policy: an apply with no
+// approval is blocked and names the database's operators, and an operator's
+// approval lets it through. Another database on the same instance is not
+// gated.
+func TestCheckReviewGate_DatabaseOptIn(t *testing.T) {
+	cfg := actorAuthTestConfig(false, func(cfg *api.ServerConfig) {
+		db := cfg.Databases["orders"]
+		db.OperatorUsers = []string{"bob"}
+		db.ReviewPolicy = api.DatabaseReviewPolicyConfig{Enabled: true}
+		cfg.Databases["orders"] = db
+		cfg.Databases["payments"] = api.DatabaseConfig{Type: "mysql"}
+	})
+	require.False(t, cfg.ReviewPolicy.Enabled, "the instance-wide gate is off")
+
+	for _, tt := range []struct {
+		name    string
+		reviews []*gh.PullRequestReview
+		want    bool
+	}{
+		{name: "no approval blocks"},
+		{
+			name: "an operator's approval of the head lets it through",
+			reviews: []*gh.PullRequestReview{{
+				User: &gh.User{Login: new("bob")}, State: new(ghclient.ReviewApproved),
+				SubmittedAt: &gh.Timestamp{Time: time.Now()}, CommitID: new(reviewGateTestHeadSHA),
+			}},
+			want: true,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			h, mux := setupReviewGateHandler(t, cfg)
+			registerPREndpoint(mux, "alice")
+			registerReviewsEndpoint(mux, tt.reviews)
+			client, err := h.clientForRepo("octocat/hello-world", 12345)
+			require.NoError(t, err)
+
+			result, err := h.checkReviewGate(t.Context(), client, "octocat/hello-world", 1, reviewGateSchema("schema/testdb", reviewGateTestHeadSHA))
+			require.NoError(t, err)
+			require.NotNil(t, result, "the opted-in database is gated")
+			assert.Equal(t, tt.want, result.Approved)
+			assert.Equal(t, []string{"bob"}, result.OperatorReviewers)
+		})
+	}
+
+	t.Run("a database that does not opt in is not gated", func(t *testing.T) {
+		h, _ := setupReviewGateHandler(t, cfg)
+		client, err := h.clientForRepo("octocat/hello-world", 12345)
+		require.NoError(t, err)
+
+		schema := reviewGateSchema("schema/payments", reviewGateTestHeadSHA)
+		schema.Database = "payments"
+		result, err := h.checkReviewGate(t.Context(), client, "octocat/hello-world", 1, schema)
+		require.NoError(t, err)
+		assert.Nil(t, result)
+	})
 }
 
 func TestCheckReviewGate_OperatorTeamApproval(t *testing.T) {

@@ -132,7 +132,7 @@ func reviewGateErrorDetail(err error) string {
 // does not count; it is recorded in UncomparedApprovers so the comment can say
 // why it was not counted.
 func (h *Handler) checkReviewGate(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, schema *ghclient.SchemaRequestResult) (*ReviewGateResult, error) {
-	if !h.isReviewGateEnabled(repo) {
+	if !h.isReviewGateEnabled(repo, schema.Database) {
 		return nil, nil
 	}
 	database, schemaPath, headSHA := schema.Database, schema.SchemaPath, schema.HeadSHA
@@ -563,10 +563,11 @@ func matchReviewGateCodeowners(ctx context.Context, client *ghclient.Installatio
 	return owners, nil
 }
 
-// isReviewGateEnabled checks server config for the review gate toggle.
-func (h *Handler) isReviewGateEnabled(repo string) bool {
-	enabled := h.service != nil && h.service.Config().ReviewPolicyEnabled()
-	h.logger.Debug("review gate: server config", "repo", repo, "enabled", enabled)
+// isReviewGateEnabled checks server config for the review gate toggle, which
+// is on instance-wide or for the database alone.
+func (h *Handler) isReviewGateEnabled(repo, database string) bool {
+	enabled := h.service != nil && h.service.Config().ReviewPolicyEnabledForDatabase(database)
+	h.logger.Debug("review gate: server config", "repo", repo, "database", database, "enabled", enabled)
 	return enabled
 }
 
