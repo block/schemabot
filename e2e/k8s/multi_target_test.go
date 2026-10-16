@@ -312,13 +312,17 @@ func tableOn(t *testing.T, dsn, table string) bool {
 }
 
 const (
-	mtUsersV1   = "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
-	mtUsersV2   = "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  `email` varchar(255) DEFAULT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
-	mtOrdersV1  = "CREATE TABLE `orders` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `user_id` bigint unsigned NOT NULL,\n  `amount` int NOT NULL,\n  `note` varchar(64) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
-	mtOrdersV2  = "CREATE TABLE `orders` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `user_id` bigint unsigned NOT NULL,\n  `amount` int NOT NULL,\n  `note` varchar(64) NOT NULL,\n  PRIMARY KEY (`id`),\n  KEY `idx_user_id` (`user_id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
-	mtOrdersUq  = "CREATE TABLE `orders` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `user_id` bigint unsigned NOT NULL,\n  `amount` int NOT NULL,\n  `note` varchar(64) NOT NULL,\n  PRIMARY KEY (`id`),\n  UNIQUE KEY `uq_note` (`note`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
-	mtAuditV1   = "CREATE TABLE `audit` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `event` varchar(64) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
-	mtOrderRows = 200_000
+	mtUsersV1  = "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+	mtUsersV2  = "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  `email` varchar(255) DEFAULT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+	mtOrdersV1 = "CREATE TABLE `orders` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `user_id` bigint unsigned NOT NULL,\n  `amount` int NOT NULL,\n  `note` varchar(64) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+	mtOrdersV2 = "CREATE TABLE `orders` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `user_id` bigint unsigned NOT NULL,\n  `amount` int NOT NULL,\n  `note` varchar(64) NOT NULL,\n  PRIMARY KEY (`id`),\n  KEY `idx_user_id` (`user_id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+	mtOrdersUq = "CREATE TABLE `orders` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `user_id` bigint unsigned NOT NULL,\n  `amount` int NOT NULL,\n  `note` varchar(64) NOT NULL,\n  PRIMARY KEY (`id`),\n  UNIQUE KEY `uq_note` (`note`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+	// mtOrdersUqShortNote adds the unique index and narrows note, so a row
+	// whose note no longer fits fails the copy itself rather than the checksum
+	// after it.
+	mtOrdersUqShortNote = "CREATE TABLE `orders` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `user_id` bigint unsigned NOT NULL,\n  `amount` int NOT NULL,\n  `note` varchar(16) NOT NULL,\n  PRIMARY KEY (`id`),\n  UNIQUE KEY `uq_note` (`note`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+	mtAuditV1           = "CREATE TABLE `audit` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `event` varchar(64) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+	mtOrderRows         = 200_000
 )
 
 func shardFiles(namespace string, tables map[string]string) map[string]*apitypes.SchemaFiles {
@@ -557,15 +561,15 @@ func TestK8sMultiTarget_FailedTargetHaltsRollout(t *testing.T) {
 	assert.False(t, indexOn(t, dsns[1], "orders", "uq_note"), "shard 2 refused the reviewed DDL")
 }
 
-// mtFailedCopyRows keeps the failing shard's copy small. The checksum that
-// rejects a duplicate re-walks the whole table on every pass, so a large table
-// would delay the failure past the moment a larger shard's copy is ready.
+// mtFailedCopyRows keeps the failing shard's table small, so its copy reaches
+// the row that fails it within seconds.
 const mtFailedCopyRows = 10_000
 
-// Shard 2 has duplicate notes, so its unique index on orders fails after its
-// copy, under the default on_failure: halt. Every shard starts together.
-// Shard 1 has nothing to copy and cuts over ahead of the failure. Shard 2's
-// table is small, so its copy and the checksum that rejects it finish within
+// Shard 2 has a note too long for the narrowed column, so its copy of orders
+// fails, under the default on_failure: halt. A duplicate would only fail the
+// checksum after the copy, whose retries are paced in seconds and outlast a
+// larger shard's copy. Every shard starts together. Shard 1 has nothing to
+// copy and cuts over ahead of the failure. Shard 2's copy fails within
 // seconds, while shard 3 is still copying a large table. Once shard 3's copy
 // is ready it holds at the cutover barrier behind the failure instead of
 // cutting over. A cancel releases shard 3 without cutting it over, and the
@@ -578,10 +582,10 @@ func TestK8sMultiTarget_FailedCopyHoldsLaterTargetAtBarrier(t *testing.T) {
 	cleanupRolloutState(t)
 	execOn(t, dsns, mtOrdersV1, mtUsersV1)
 	seedOrders(t, dsns[1:2], mtFailedCopyRows)
-	execOn(t, dsns[1:2], "INSERT INTO orders (user_id, amount, note) VALUES (1, 1, 'dup'), (2, 2, 'dup')")
+	execOn(t, dsns[1:2], "INSERT INTO orders (user_id, amount, note) VALUES (1, 1, 'a note longer than sixteen')")
 	seedOrders(t, dsns[2:], 3*mtCopyRows)
 
-	plan := planRollout(t, ep, mtShardApp, shardFiles(mtShardApp, map[string]string{"orders": mtOrdersUq, "users": mtUsersV2}))
+	plan := planRollout(t, ep, mtShardApp, shardFiles(mtShardApp, map[string]string{"orders": mtOrdersUqShortNote, "users": mtUsersV2}))
 	applyID := applyRollout(t, ep, plan.PlanID, nil)
 
 	var held *apitypes.ProgressResponse
