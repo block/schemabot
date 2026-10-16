@@ -662,6 +662,12 @@ func (e *Engine) routeAlterStatements(ctx context.Context, target *lazyTargetDB,
 
 		currentCreateTable, err := schema.createTable(ctx, table)
 		if err != nil {
+			if ctx.Err() != nil {
+				// The read was interrupted by a stop, cancel or halt, not by
+				// the target; the caller logs the interruption and keeps the
+				// state the control set, so no failure is logged here.
+				return alterRouting{}, fmt.Errorf("read the current definition of table %q: %w", table, err)
+			}
 			// The raw error carries target infrastructure detail (host, account,
 			// driver internals) and this one surfaces in a PR comment, so the
 			// apply fails with a fixed line and the cause stays in the logs.

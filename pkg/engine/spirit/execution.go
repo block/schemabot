@@ -609,10 +609,23 @@ func (e *Engine) setSchemaChangeCompleted() {
 // detail this drops is still available where it is safe to keep it. An err
 // classified permanent (see classifyRunnerError) is recorded as such, so
 // progress tells the drive a retry would only repeat the same failure.
+//
+// A change the operator has already stopped or cancelled keeps that outcome: a
+// failure its run records on the way out is a consequence of the control, and
+// recording it would turn an accepted stop into a failure the drive retries.
 func (e *Engine) setSchemaChangeFailed(err error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if e.runningSchemaChange != nil {
+	if rm := e.runningSchemaChange; rm != nil {
+		if controlOutcomeStands(rm.state) {
+			e.schemaChangeLogger(rm).Info("failure recorded after the schema change was stopped or cancelled; the control's outcome stands",
+				"database", rm.database,
+				"tables", rm.tables,
+				"state", rm.state,
+				"error", err,
+			)
+			return
+		}
 		e.runningSchemaChange.state = engine.StateFailed
 		if err != nil {
 			e.runningSchemaChange.errorMessage = failureReason(err)
