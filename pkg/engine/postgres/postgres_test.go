@@ -250,7 +250,7 @@ func TestExecutionVerdictForeignKeyChange(t *testing.T) {
 func TestExecutionVerdictGeneratedExpressionChange(t *testing.T) {
 	assert.Equal(t, stepVerdict{
 		mode:   engine.ExecutionModeBlocked,
-		reason: `statement for table "events" changes a stored generated column's expression, which rewrites every row under a lock that blocks reads and writes, so SchemaBot does not apply it; to keep the live expression, declare it in the schema file and re-plan; to change it, run this statement (PostgreSQL 17 or later) outside SchemaBot through a separately reviewed process, then re-plan`,
+		reason: `statement for table "events" changes a stored generated column's expression, which rewrites every row under a lock that blocks reads and writes, so SchemaBot does not apply it; to keep the live expression, declare it in the schema file and re-plan; to change it, declare the live expression to apply the rest of the plan first, then run this statement (PostgreSQL 17 or later) outside SchemaBot through a separately reviewed process and put the new expression back in the file`,
 	}, executionVerdict(pgplan.FormatVersion, pgplan.Statement{
 		Kind:        schemadiff.ChangeSetGeneratedExpression,
 		Disposition: router.DispositionRefuse,

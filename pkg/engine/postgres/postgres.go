@@ -1477,9 +1477,11 @@ func foreignKeyChangeRefusalReason(kind schemadiff.ChangeKind, table string, cro
 // every row under a lock that blocks reads and writes, and there is no online
 // path for it, so the plan shows the change and nothing runs it. The drift is
 // often a live expression the file never caught up with, so the remedy offers
-// declaring the live expression first, which plans no change.
+// declaring the live expression first, which plans no change. A blocked step
+// blocks the whole plan, and a new expression may use a column the same plan
+// adds, so changing it has the rest of the plan applied first.
 func generatedExpressionRefusalReason(table string) string {
-	return fmt.Sprintf("statement for table %q changes a stored generated column's expression, which rewrites every row under a lock that blocks reads and writes, so SchemaBot does not apply it; to keep the live expression, declare it in the schema file and re-plan; to change it, run this statement (PostgreSQL 17 or later) outside SchemaBot through a separately reviewed process, then re-plan", table)
+	return fmt.Sprintf("statement for table %q changes a stored generated column's expression, which rewrites every row under a lock that blocks reads and writes, so SchemaBot does not apply it; to keep the live expression, declare it in the schema file and re-plan; to change it, declare the live expression to apply the rest of the plan first, then run this statement (PostgreSQL 17 or later) outside SchemaBot through a separately reviewed process and put the new expression back in the file", table)
 }
 
 func destructiveReason(destructive bool, table string) string {
