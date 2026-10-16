@@ -353,7 +353,7 @@ func writeTargetTableLine(sb *strings.Builder, table string, cells []TableProgre
 		return
 	}
 	if status == state.Task.Completed {
-		fmt.Fprintf(sb, "**%s**: %s (%d targets)\n", name, shardedTableStatusPhrase(status), len(cells))
+		fmt.Fprintf(sb, "**%s**: %s (%s)\n", name, shardedTableStatusPhrase(status), targetNoun.Count(len(cells)))
 		writeDDL()
 		return
 	}

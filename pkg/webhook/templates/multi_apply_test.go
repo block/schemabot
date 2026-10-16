@@ -2222,3 +2222,24 @@ func TestRenderMultiDeploymentApplyComment_SettledRolloutTableReadsNotStarted(t 
 		assert.NotContains(t, out, "Not started")
 	})
 }
+
+// A settled rollout of `orders` and `docks` across two targets, where only
+// testapp-001 changes `docks`: each completed table line counts the targets
+// that ran it, singular for the table one target ran and plural for the table
+// both ran.
+func TestRenderMultiDeploymentApplyComment_CompletedTableCountsItsTargets(t *testing.T) {
+	ops := []presentation.Operation{
+		parallelTarget("primary", "testapp-001", so.Completed),
+		parallelTarget("primary", "testapp-002", so.Completed),
+	}
+	out := renderTargets(presentation.Derive(ops),
+		tablesDetail("testapp_001",
+			TableProgressData{TableName: "orders", Status: state.Task.Completed, RowsCopied: 1000},
+			TableProgressData{TableName: "docks", Status: state.Task.Completed, RowsCopied: 1000},
+		),
+		tablesDetail("testapp_002", TableProgressData{TableName: "orders", Status: state.Task.Completed, RowsCopied: 1000}),
+	)
+	assert.Contains(t, out, "**`docks`**: ✅ Complete (1 target)\n", out)
+	assert.Contains(t, out, "**`orders`**: ✅ Complete (2 targets)\n", out)
+	assert.NotContains(t, out, "(1 targets)", out)
+}

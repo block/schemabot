@@ -100,7 +100,7 @@ func FormatTargetRollup(v RolloutView, g presentation.Group) string {
 	if headline, ok := tableStepsHeadline(v.Model, g); ok {
 		fmt.Fprintf(&b, "%s %s — %s\n", g.Lead.Emoji, g.Deployment, headline)
 	} else {
-		fmt.Fprintf(&b, "%s %s — %s (%d targets)\n", g.Lead.Emoji, g.Deployment, FormatStateCounts(g.Counts), len(g.Members))
+		fmt.Fprintf(&b, "%s %s — %s (%s)\n", g.Lead.Emoji, g.Deployment, FormatStateCounts(g.Counts), presentation.TargetNoun.Count(len(g.Members)))
 	}
 	if !v.SetupPhase {
 		writeTargetTables(&b, v, g)

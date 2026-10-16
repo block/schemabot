@@ -33,5 +33,5 @@ func CoveragePhrase(noun Noun, count, total int) string {
 	if total > 0 {
 		return fmt.Sprintf("%d of %d %s", count, total, noun.Plural)
 	}
-	return fmt.Sprintf("%d %s", count, noun.Plural)
+	return noun.Count(count)
 }

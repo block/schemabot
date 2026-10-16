@@ -134,14 +134,14 @@ func ListParts(n int, part func(int) Part, noun Noun) []PartListLine {
 		failed++
 	}
 	if more := failed - maxFailedParts; more > 0 {
-		lines = append(lines, PartListLine{Part: -1, Summary: fmt.Sprintf("%d more failed %s", more, noun.Plural)})
+		lines = append(lines, PartListLine{Part: -1, Summary: fmt.Sprintf("%d more failed %s", more, ui.PluralizeLabel(noun.Singular, noun.Plural, more))})
 	}
 	copying := copyingFurthestBehindFirst(n, part)
 	for _, i := range copying[:min(len(copying), maxCopyingParts)] {
 		lines = append(lines, PartListLine{Part: i})
 	}
 	if more := len(copying) - maxCopyingParts; more > 0 {
-		lines = append(lines, PartListLine{Part: -1, Summary: fmt.Sprintf("%d more copying %s", more, noun.Plural)})
+		lines = append(lines, PartListLine{Part: -1, Summary: fmt.Sprintf("%d more copying %s", more, ui.PluralizeLabel(noun.Singular, noun.Plural, more))})
 	}
 	return lines
 }

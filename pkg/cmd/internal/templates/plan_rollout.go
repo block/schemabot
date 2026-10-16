@@ -176,7 +176,7 @@ func WriteRolloutApplyRefused(noun presentation.Noun, refused []*apitypes.PlanMe
 		fmt.Printf("  %s %s\n", cliname.Name(), rerun)
 	}
 	if rest := len(reruns) - shownReruns; rest > 0 {
-		fmt.Printf("  and the same for %d more %s\n", rest, noun.Plural)
+		fmt.Printf("  and the same for %d more %s\n", rest, nounLabel(noun, rest))
 	}
 	fmt.Println()
 }
