@@ -2,9 +2,12 @@ package spirit
 
 import (
 	"context"
+	"net"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/block/spirit/pkg/utils"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -280,6 +283,112 @@ func TestStopOfAStoppedChangeWithNoRunnerAnswersAlreadyStopped(t *testing.T) {
 	assert.True(t, result.Accepted)
 	assert.Equal(t, "Already stopped", result.Message)
 	assert.Equal(t, engine.StateStopped, rm.state)
+}
+
+// silentTarget returns the address of a TCP listener that accepts connections
+// and never sends the MySQL handshake, so any connection attempt against it
+// blocks until its context is cancelled. The returned channel closes once the
+// first connection has been accepted.
+func silentTarget(t *testing.T) (string, <-chan struct{}) {
+	t.Helper()
+	var lc net.ListenConfig
+	ln, err := lc.Listen(t.Context(), "tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	accepted := make(chan struct{})
+	var mu sync.Mutex
+	var conns []net.Conn
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			if len(conns) == 0 {
+				close(accepted)
+			}
+			conns = append(conns, conn)
+			mu.Unlock()
+		}
+	}()
+	t.Cleanup(func() {
+		utils.CloseAndLog(ln)
+		mu.Lock()
+		defer mu.Unlock()
+		for _, conn := range conns {
+			utils.CloseAndLog(conn)
+		}
+	})
+	return ln.Addr().String(), accepted
+}
+
+// An operator stops or cancels a schema change while the engine is still
+// connecting to the target, either to read the current table definitions it
+// routes each ALTER by or to open the pool a direct-routed ALTER runs on. The
+// connection attempt returns because the stop or cancel cancelled its context,
+// not because the target failed, so the change keeps the stopped or cancelled
+// state the operator asked for: progress never reports it as a retryable
+// failure.
+func TestControlDuringTargetConnectionKeepsTheControlOutcome(t *testing.T) {
+	const alter = "ALTER TABLE `users` ADD COLUMN `email` varchar(255) NULL"
+	phases := map[string]func(eng *Engine, ctx context.Context, host string) bool{
+		"ALTER routing": func(eng *Engine, ctx context.Context, host string) bool {
+			return eng.executeAlterPhase(ctx, host, "root", "", "testdb", []string{alter}, false, directPolicy{})
+		},
+		"direct execution connect": func(eng *Engine, ctx context.Context, host string) bool {
+			target := &lazyTargetDB{dsn: targetDSN(host, "root", "", "testdb")}
+			defer target.close()
+			stmts := []directRouted{{stmt: alter, table: "users", reason: "refused by the schema change engine"}}
+			return eng.executeDirectStatements(ctx, target, "testdb", stmts, directPolicy{Enabled: true})
+		},
+	}
+	controls := map[string]struct {
+		run       func(eng *Engine, ctx context.Context) (*engine.ControlResult, error)
+		wantState engine.State
+	}{
+		"stop": {run: func(eng *Engine, ctx context.Context) (*engine.ControlResult, error) {
+			return eng.Stop(ctx, &engine.ControlRequest{})
+		}, wantState: engine.StateStopped},
+		"cancel": {run: func(eng *Engine, ctx context.Context) (*engine.ControlResult, error) {
+			return eng.Cancel(ctx, &engine.ControlRequest{})
+		}, wantState: engine.StateCancelled},
+	}
+	for phaseName, runPhase := range phases {
+		for controlName, control := range controls {
+			t.Run(controlName+" during "+phaseName, func(t *testing.T) {
+				host, accepted := silentTarget(t)
+				eng := New(Config{})
+				rm := registerRunningSchemaChange(eng)
+				runCtx, cancelRun := context.WithCancel(t.Context())
+				rm.cancelFunc = cancelRun
+				finished := make(chan bool, 1)
+				rm.wg.Go(func() {
+					finished <- runPhase(eng, runCtx, host)
+				})
+				select {
+				case <-accepted:
+				case <-time.After(10 * time.Second):
+					t.Fatal("the phase never connected to the target")
+				}
+
+				result, err := control.run(eng, t.Context())
+
+				if controlName == "cancel" {
+					// The cancel goes on to release artifacts against a target this
+					// fixture does not run, so only the state it settled matters here.
+					assert.False(t, engine.IsAlreadyCompleted(err))
+				} else {
+					require.NoError(t, err)
+					assert.True(t, result.Accepted)
+				}
+				assert.False(t, <-finished, "a phase interrupted by a "+controlName+" must not let later phases run")
+				progress := pollProgress(t, eng)
+				assert.Equal(t, control.wantState, progress.State)
+				assert.Empty(t, progress.ErrorMessage)
+				assert.False(t, progress.Retryable)
+			})
+		}
+	}
 }
 
 // Stateless control operations (cutover, deferred cutover sentinel lookup)

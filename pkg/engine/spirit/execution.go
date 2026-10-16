@@ -313,6 +313,13 @@ func (e *Engine) executeAlterPhase(ctx context.Context, host, username, password
 	logger := e.changeLogger()
 	routing, err := e.routeAlterStatements(ctx, target, database, alters, policy)
 	if err != nil {
+		if ctx.Err() != nil {
+			logger.Info("schema change stopped during ALTER routing",
+				"database", database,
+				"reason", ctx.Err(),
+			)
+			return false
+		}
 		logger.Error("ALTER routing failed", "database", database, "error", err)
 		e.setSchemaChangeFailed(err)
 		return false

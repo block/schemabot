@@ -767,6 +767,13 @@ func (e *Engine) executeDirectStatements(ctx context.Context, target *lazyTarget
 	lockWaitSeconds := policy.lockAcquisitionTimeoutSeconds()
 	db, err := openDirectExecutionDB(ctx, target.dsn, lockWaitSeconds)
 	if err != nil {
+		if ctx.Err() != nil {
+			logger.Info("schema change stopped while connecting for direct execution",
+				"database", database,
+				"reason", ctx.Err(),
+			)
+			return false
+		}
 		logger.Error("direct execution failed: cannot connect to target with bounded session lock waits",
 			"database", database, "lock_wait_timeout_seconds", lockWaitSeconds, "error", err)
 		e.setSchemaChangeFailed(fmt.Errorf("connect for direct execution: %w", err))
