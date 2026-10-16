@@ -5,6 +5,7 @@ package tern
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -60,15 +61,7 @@ func TestApplyFailsWhenTheTakeoverCannotBeRecorded(t *testing.T) {
 		"users": "CREATE TABLE users (id INT PRIMARY KEY, email VARCHAR(255))",
 	})
 
-	first := f.dispatch(t, "schemabot:v1:takeover-stamp-first")
-	require.True(t, first.Accepted, "first dispatch must be accepted: %s", first.ErrorMessage)
-	holder, err := f.stor.Applies().GetByApplyIdentifier(t.Context(), first.ApplyId)
-	require.NoError(t, err)
-	require.NotNil(t, holder)
-	_, err = f.db.ExecContext(t.Context(), "UPDATE applies SET state = ? WHERE id = ?", state.Apply.Stopped, holder.ID)
-	require.NoError(t, err)
-	_, err = f.db.ExecContext(t.Context(), "UPDATE tasks SET state = ? WHERE apply_id = ?", state.Task.Stopped, holder.ID)
-	require.NoError(t, err)
+	first, holder := f.dispatchStopped(t, "schemabot:v1:takeover-stamp-first")
 
 	f.client.storage = &takeoverStampStorage{Storage: f.stor, applies: &takeoverStampApplies{ApplyStore: f.stor.Applies()}}
 	req := &ternv1.ApplyRequest{
@@ -91,6 +84,8 @@ func TestApplyFailsWhenTheTakeoverCannotBeRecorded(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, unmarked)
 	assert.Empty(t, unmarked.SupersededBy, "nothing took the stopped apply's work over")
+	assert.Empty(t, supersededEvents(t, f.stor, holder.ID),
+		"the stopped apply's timeline names no successor while none exists")
 
 	retried, err := f.client.Apply(t.Context(), req)
 	require.NoError(t, err)
@@ -102,4 +97,67 @@ func TestApplyFailsWhenTheTakeoverCannotBeRecorded(t *testing.T) {
 	require.NotNil(t, marked)
 	assert.Equal(t, retried.ApplyId, marked.SupersededBy,
 		"the successor's create recorded the handoff, with no separate write left to fail")
+
+	events := supersededEvents(t, f.stor, holder.ID)
+	require.Len(t, events, 1, "the stopped apply's timeline records the handoff once")
+	assert.Contains(t, events[0], "Superseded by "+retried.ApplyId,
+		"the timeline names the apply that took the work over")
+}
+
+// A stopped apply whose work an earlier apply already took over is met again by
+// a new dispatch for the same table. The earlier successor keeps the marker, the
+// new dispatch still goes ahead, and the stopped apply's timeline gains no entry
+// claiming the new dispatch took its work over.
+func TestTakeoverOfAnAlreadyTakenOverApplyLeavesItsTimelineAlone(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+	f := newAdoptTestFixture(t, map[string]string{
+		"users": "CREATE TABLE users (id INT PRIMARY KEY, email VARCHAR(255))",
+	})
+
+	_, holder := f.dispatchStopped(t, "schemabot:v1:takeover-earlier-first")
+	const earlier = "apply_earlier_successor"
+	require.NoError(t, f.stor.Applies().MarkSuperseded(t.Context(), holder.ID, earlier))
+
+	second := f.dispatch(t, "schemabot:v1:takeover-earlier-second")
+	require.True(t, second.Accepted, "the new dispatch must be accepted: %s", second.ErrorMessage)
+
+	marked, err := f.stor.Applies().Get(t.Context(), holder.ID)
+	require.NoError(t, err)
+	require.NotNil(t, marked)
+	assert.Equal(t, earlier, marked.SupersededBy, "the first successor keeps the marker")
+	assert.Empty(t, supersededEvents(t, f.stor, holder.ID),
+		"the timeline must not name a dispatch that did not take the work over")
+}
+
+// dispatchStopped dispatches the fixture's plan and rests the resulting apply
+// and its tasks in stopped, as an operator's stop leaves them, so a later
+// dispatch for the same table takes its work over.
+func (f *adoptTestFixture) dispatchStopped(t *testing.T, key string) (*ternv1.ApplyResponse, *storage.Apply) {
+	t.Helper()
+	resp := f.dispatch(t, key)
+	require.True(t, resp.Accepted, "dispatch must be accepted: %s", resp.ErrorMessage)
+	apply, err := f.stor.Applies().GetByApplyIdentifier(t.Context(), resp.ApplyId)
+	require.NoError(t, err)
+	require.NotNil(t, apply)
+	_, err = f.db.ExecContext(t.Context(), "UPDATE applies SET state = ? WHERE id = ?", state.Apply.Stopped, apply.ID)
+	require.NoError(t, err)
+	_, err = f.db.ExecContext(t.Context(), "UPDATE tasks SET state = ? WHERE apply_id = ?", state.Task.Stopped, apply.ID)
+	require.NoError(t, err)
+	return resp, apply
+}
+
+// supersededEvents is the messages on an apply's timeline that name a successor.
+func supersededEvents(t *testing.T, stor storage.Storage, applyID int64) []string {
+	t.Helper()
+	logs, err := stor.ApplyLogs().GetByApply(t.Context(), applyID)
+	require.NoError(t, err)
+	var events []string
+	for _, l := range logs {
+		if strings.HasPrefix(l.Message, "Superseded by ") {
+			events = append(events, l.Message)
+		}
+	}
+	return events
 }

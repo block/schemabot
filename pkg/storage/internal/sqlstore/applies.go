@@ -1276,8 +1276,12 @@ func markTakenOver(ctx context.Context, tx *rebindTx, holderID int64, successor 
 		successor, holderID); err != nil {
 		return fmt.Errorf("record apply %s taking over stopped apply %d: %w", successor, holderID, err)
 	}
+	// The read-back locks the row so it reads the latest committed marker, as the
+	// UPDATE did. A plain read inside the create's or attach's snapshot can predate a marker
+	// another writer committed since, and would report an earlier successor's
+	// stamp as unset.
 	var stored string
-	err := tx.QueryRowContext(ctx, `SELECT superseded_by FROM applies WHERE id = ?`, holderID).Scan(&stored)
+	err := tx.QueryRowContext(ctx, `SELECT superseded_by FROM applies WHERE id = ? FOR UPDATE`, holderID).Scan(&stored)
 	if errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("record apply %s taking over stopped apply %d: %w", successor, holderID, storage.ErrApplyNotFound)
 	}
