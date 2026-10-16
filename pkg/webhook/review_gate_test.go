@@ -1737,6 +1737,36 @@ func TestCheckReviewGate_CodeownersScopedToSchemaDirectory(t *testing.T) {
 			wantOtherNames: []string{"zoe", "frank"},
 		},
 		{
+			// A root schema directory is matched as ".schema", not "./.schema",
+			// so a rule anchored at the repository root owns it.
+			name:           "repository root schema directory matches an anchored root rule",
+			codeowners:     "/* @frank\n",
+			schemaPath:     ".",
+			approver:       "frank",
+			wantApproved:   true,
+			wantOtherNames: []string{"zoe", "frank"},
+		},
+		{
+			// A file glob owns the schema files but not the directory itself,
+			// so it grants no approval.
+			name:           "file glob rule does not own the schema directory",
+			codeowners:     "*.sql @frank\n",
+			schemaPath:     "schema/payments",
+			approver:       "frank",
+			wantApproved:   false,
+			wantOtherNames: []string{"zoe"},
+		},
+		{
+			// A rule on a namespace subdirectory owns only that subdirectory,
+			// not the database's schema directory.
+			name:           "subdirectory rule does not own the schema directory",
+			codeowners:     "/schema/payments/orders/ @frank\n",
+			schemaPath:     "schema/payments",
+			approver:       "frank",
+			wantApproved:   false,
+			wantOtherNames: []string{"zoe"},
+		},
+		{
 			name:           "configured admin still approves an unmatched directory",
 			codeowners:     "/web/ @frank\n",
 			schemaPath:     "schema/payments",
@@ -1779,12 +1809,17 @@ func TestCheckReviewGate_CodeownersScopedToSchemaDirectory(t *testing.T) {
 // TestCheckReviewGate_UnmatchedCodeownersWithoutOtherReviewersErrors pins that
 // a policy whose only source of reviewers is CODEOWNERS fails closed when no
 // rule owns the schema directory, rather than approving through the owners of
-// unrelated paths.
+// unrelated paths. The error names CODEOWNERS, the base branch and the schema
+// directory and says how to fix it, and the log line explaining why CODEOWNERS
+// contributed no reviewers carries the PR and head commit, so the failure can
+// be tied to the apply that hit it.
 func TestCheckReviewGate_UnmatchedCodeownersWithoutOtherReviewersErrors(t *testing.T) {
 	h, mux := setupReviewGateHandler(t, reviewGateTestConfig(func(cfg *api.ServerConfig) {
 		cfg.ReviewPolicy.IncludeCodeowners = true
 		cfg.ReviewPolicy.IncludeDatabaseOperators = new(false)
 	}))
+	var logs syncBuffer
+	h.logger = slog.New(slog.NewJSONHandler(&logs, nil))
 
 	registerPREndpoint(mux, "alice")
 	registerCodeownersEndpoint(mux, "/web/ @frank\n", true)
@@ -1804,6 +1839,21 @@ func TestCheckReviewGate_UnmatchedCodeownersWithoutOtherReviewersErrors(t *testi
 	require.Error(t, err)
 	assert.Nil(t, result)
 	assert.Contains(t, err.Error(), "no configured reviewers")
+	assert.Contains(t, err.Error(), `no CODEOWNERS rule on base branch "main" assigns owners to schema directory "schema/payments"`)
+	assert.Contains(t, err.Error(), "add a CODEOWNERS rule that owns that directory")
+
+	var noOwnersLog map[string]any
+	for line := range strings.SplitSeq(strings.TrimSpace(logs.String()), "\n") {
+		var entry map[string]any
+		require.NoError(t, json.Unmarshal([]byte(line), &entry))
+		if entry["msg"] == "review gate: CODEOWNERS contributes no reviewers because no CODEOWNERS rule assigns owners to the schema directory" {
+			noOwnersLog = entry
+		}
+	}
+	require.NotNil(t, noOwnersLog, "no log line explains why CODEOWNERS contributed no reviewers")
+	assert.InDelta(t, 1, noOwnersLog["pr"], 0)
+	assert.Equal(t, reviewGateTestHeadSHA, noOwnersLog["head_sha"])
+	assert.Equal(t, "schema/payments", noOwnersLog["schema_path"])
 }
 
 func TestCheckReviewGate_NoConfiguredReviewersErrors(t *testing.T) {
@@ -1821,6 +1871,8 @@ func TestCheckReviewGate_NoConfiguredReviewersErrors(t *testing.T) {
 	require.Error(t, err)
 	assert.Nil(t, result)
 	assert.Contains(t, err.Error(), "no configured reviewers")
+	// CODEOWNERS is not part of this policy, so the error does not point at it.
+	assert.NotContains(t, err.Error(), "CODEOWNERS")
 }
 
 func reviewGateTestConfig(opts ...func(*api.ServerConfig)) *api.ServerConfig {
