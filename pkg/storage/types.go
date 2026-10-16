@@ -57,16 +57,16 @@ const (
 	CutoverPolicyRolling = "rolling"
 
 	// CutoverPolicyBarrier lets later deployments run their copy phase once
-	// earlier siblings reach the cutover barrier, while cutover stays ordered.
+	// earlier siblings reach the cutover barrier. Each then cuts over as soon as
+	// its own copy is parked; an earlier sibling holds a later cutover only
+	// while it has failed, is retrying, or was stopped, cancelled or reverted.
 	CutoverPolicyBarrier = "barrier"
 
 	// CutoverPolicyParallel drops copy-phase ordering: deployments copy
-	// concurrently, bounded by the driver cap and on_failure admission. Only
-	// the cutover phase stays deployment-ordered, exactly like barrier. This
-	// collapses copy wall-clock toward "longest copy" for rollouts whose
-	// hours-long copy dominates, while preserving the ordered, one-at-a-time
-	// cutover swaps. It is the default for an environment whose every member
-	// comes from a targets list.
+	// concurrently, bounded by the driver cap and on_failure admission, and
+	// cut over exactly like barrier. This collapses wall-clock toward "longest
+	// copy" for rollouts whose hours-long copy dominates. It is the default for
+	// an environment whose every member comes from a targets list.
 	CutoverPolicyParallel = "parallel"
 )
 
@@ -1690,7 +1690,7 @@ func MirroredControlRequestMetadata() []byte {
 // cutoverRequestOperationMetadataKey binds a cutover request to the one
 // operation that is to take it. A cutover request is apply-level, so under an
 // ordered cutover policy the binding is what keeps one operator command on the
-// member whose turn it was when the command was accepted, rather than letting
+// member it was accepted for, rather than letting
 // it pass on to the next member once that one has finished.
 const cutoverRequestOperationMetadataKey = "apply_operation_id"
 

@@ -243,55 +243,79 @@ func TestDeriveWaitingForCutover_Ordering(t *testing.T) {
 		label string
 	}{
 		{
-			name:  "earlier completed -> ready, next in order",
+			name:  "earlier completed -> ready",
 			ops:   []Operation{rolling("eu", so.Completed), rolling("us", so.WaitingForCutover)},
 			want:  StateReadyForCutoverNext,
-			label: "ready for cutover — next in order",
+			label: "ready for cutover",
 		},
 		{
-			name:  "earlier still copying -> ready, waiting for it",
-			ops:   []Operation{rolling("eu", so.Running), rolling("us", so.WaitingForCutover)},
-			want:  StateReadyForCutoverWaiting,
-			label: "ready for cutover — waiting for eu",
+			name:  "earlier still copying -> ready, not held",
+			ops:   []Operation{parallel("eu", so.Running), parallel("us", so.WaitingForCutover)},
+			want:  StateReadyForCutoverNext,
+			label: "ready for cutover",
 		},
 		{
-			name:  "barrier: earlier also at barrier still blocks cutover (cutover stays ordered)",
+			name:  "barrier: earlier also at barrier does not hold",
 			ops:   []Operation{barrier("eu", so.WaitingForCutover), barrier("us", so.WaitingForCutover)},
-			want:  StateReadyForCutoverWaiting,
-			label: "ready for cutover — waiting for eu",
+			want:  StateReadyForCutoverNext,
+			label: "ready for cutover",
 		},
 		{
-			name:  "parallel: earlier also at barrier still blocks cutover (cutover stays ordered)",
-			ops:   []Operation{parallel("eu", so.WaitingForCutover), parallel("us", so.WaitingForCutover)},
-			want:  StateReadyForCutoverWaiting,
-			label: "ready for cutover — waiting for eu",
+			name:  "parallel: earlier cutting over does not hold",
+			ops:   []Operation{parallel("eu", so.CuttingOver), parallel("us", so.WaitingForCutover)},
+			want:  StateReadyForCutoverNext,
+			label: "ready for cutover",
 		},
 		{
-			name: "no-halt: earlier failed does not block cutover (rollout continues past it)",
+			name:  "halt: earlier failed holds the cutover",
+			ops:   []Operation{parallel("eu", so.Failed), parallel("us", so.WaitingForCutover)},
+			want:  StateReadyForCutoverWaiting,
+			label: "ready for cutover — held, eu failed",
+		},
+		{
+			name:  "earlier retrying holds the cutover",
+			ops:   []Operation{parallel("eu", so.FailedRetryable), parallel("us", so.WaitingForCutover)},
+			want:  StateReadyForCutoverWaiting,
+			label: "ready for cutover — held, eu retrying",
+		},
+		{
+			name:  "earlier stopped holds the cutover",
+			ops:   []Operation{parallel("eu", so.Stopped), parallel("us", so.WaitingForCutover)},
+			want:  StateReadyForCutoverWaiting,
+			label: "ready for cutover — held, eu stopped",
+		},
+		{
+			name:  "earlier reverted holds the cutover",
+			ops:   []Operation{parallel("eu", so.Reverted), parallel("us", so.WaitingForCutover)},
+			want:  StateReadyForCutoverWaiting,
+			label: "ready for cutover — held, eu reverted",
+		},
+		{
+			name: "no-halt: earlier failed does not hold cutover (rollout continues past it)",
 			ops: []Operation{
 				continuing("eu", so.Failed),
 				continuing("us", so.WaitingForCutover),
 			},
 			want:  StateReadyForCutoverNext,
-			label: "ready for cutover — next in order",
+			label: "ready for cutover",
 		},
 		{
-			name: "pause: earlier failed still blocks cutover until released",
+			name: "pause: earlier failed holds cutover until released",
 			ops: []Operation{
 				pausing("eu", so.Failed),
 				pausing("us", so.WaitingForCutover),
 			},
 			want:  StateReadyForCutoverWaiting,
-			label: "ready for cutover — waiting for eu",
+			label: "ready for cutover — held, eu failed; release or stop",
 		},
 		{
-			name: "released pause: earlier failed no longer blocks cutover",
+			name: "released pause: earlier failed no longer holds cutover",
 			ops: []Operation{
 				released("eu", so.Failed),
 				released("us", so.WaitingForCutover),
 			},
 			want:  StateReadyForCutoverNext,
-			label: "ready for cutover — next in order",
+			label: "ready for cutover",
 		},
 	}
 	for _, tc := range cases {

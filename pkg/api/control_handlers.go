@@ -621,7 +621,7 @@ func (s *Service) executeCutoverForApply(ctx context.Context, client tern.Client
 			return nil, 0, err
 		}
 		if hold := turn.hold; hold != nil {
-			s.logger.Info("cutover request rejected because no parked member is at its turn",
+			s.logger.Info("cutover request rejected because an earlier member holds every parked member",
 				append(apply.LogAttrs(),
 					"requested_by", caller,
 					"parked_member", hold.parked,
@@ -639,7 +639,7 @@ func (s *Service) executeCutoverForApply(ctx context.Context, client tern.Client
 		RequestedBy: caller,
 	}
 	if turn.taker != nil {
-		// Bind the request to the member whose turn it is, so this one command
+		// Bind the request to the member that takes it, so this one command
 		// cuts over that member and cannot pass on to the next one.
 		cutoverReq.Metadata = storage.CutoverRequestMetadata(turn.taker.ID)
 	}
@@ -737,37 +737,43 @@ func (s *Service) cutoverRequestReadiness(ctx context.Context, client tern.Clien
 
 // cutoverTurnHold names the members of an ordered rollout when a cutover
 // request has no member that could take it: the first parked member, and the
-// earlier member whose turn it still is.
+// earlier member whose state holds it.
 type cutoverTurnHold struct {
-	parked       string
-	blocker      string
-	blockerState string
-	// blockerFailed is set when the blocker ended without completing, so the
-	// rollout's on_failure policy (blockerOnFailure) is what holds later
-	// cutovers behind it.
-	blockerFailed    bool
+	parked           string
+	blocker          string
+	blockerState     string
 	blockerOnFailure string
 }
 
-// message is the refusal an operator reads: which member holds the turn, its
-// state, and what lets the rollout go on from there.
+// message is the refusal an operator reads: which member holds the cutover,
+// its state, and what lets the rollout go on from there. Only a state the
+// rollout halts on holds a cutover (storage CutoverBlocker), so each case
+// names the one action that clears it.
 func (h *cutoverTurnHold) message() string {
-	if h.blockerFailed {
+	switch h.blockerState {
+	case state.ApplyOperation.Failed:
 		next := "stop the schema change, or fix the failure and apply again"
 		if h.blockerOnFailure == storage.OnFailurePause {
 			next = "release the rollout to continue past it, or stop the schema change"
 		}
-		return fmt.Sprintf("cutover follows rollout order: %s is %s ahead of %s, and on_failure %s holds every later cutover; %s",
-			h.blocker, h.blockerState, h.parked, h.blockerOnFailure, next)
+		return fmt.Sprintf("cutover is held: %s failed ahead of %s, and on_failure %s holds every later cutover; %s",
+			h.blocker, h.parked, h.blockerOnFailure, next)
+	case state.ApplyOperation.FailedRetryable:
+		return fmt.Sprintf("cutover is held: %s is retrying a failure ahead of %s; run cutover again once %s recovers",
+			h.blocker, h.parked, h.blocker)
+	case state.ApplyOperation.Stopped:
+		return fmt.Sprintf("cutover is held: %s is stopped ahead of %s; start the schema change to resume it, or cancel it",
+			h.blocker, h.parked)
+	default:
+		return fmt.Sprintf("cutover is held: %s was %s ahead of %s, so later members do not cut over; stop the schema change and apply again",
+			h.blocker, h.blockerState, h.parked)
 	}
-	return fmt.Sprintf("cutover follows rollout order: %s is ahead of %s and is %s; run cutover again once %s has completed",
-		h.blocker, h.parked, h.blockerState, h.blocker)
 }
 
 // cutoverTurn is the intake's answer for a cutover request on a
-// multi-operation apply. taker is the parked operation whose turn it is, which
-// the request is bound to; hold is set instead when no parked member may take
-// the request now. Both are nil when the apply's cutover is unordered, or when
+// multi-operation apply. taker is the first parked operation no earlier member
+// holds, which the request is bound to; hold is set instead when no parked
+// member may take the request now. Both are nil when the apply's cutover is unordered, or when
 // no member is parked by task evidence, which leaves the decision to the
 // caller's readiness check.
 type cutoverTurn struct {
@@ -777,10 +783,10 @@ type cutoverTurn struct {
 
 // cutoverTurnForRequest decides which member of a multi-operation apply that
 // has a member parked at cutover may take a cutover request now. The request is
-// apply-level and only a parked member whose turn it is may take it (the
-// drive's own gate, operationCutoverRequestTurn in pkg/tern), so accepting one
-// while every parked member waits on an earlier member would queue it for a
-// consumer that is not there yet. A parked member under an unordered cutover
+// apply-level and only a parked member no earlier member holds may take it
+// (the drive's own gate, operationCutoverRequestTurn in pkg/tern), so
+// accepting one while an earlier member holds every parked member would queue
+// it for a consumer that is not there yet. A parked member under an unordered cutover
 // policy takes the request as it always has. The turn is decided by storage
 // CutoverBlocker, the rule the automatic cutover claim follows.
 func (s *Service) cutoverTurnForRequest(ctx context.Context, apply *storage.Apply) (cutoverTurn, error) {
@@ -827,7 +833,6 @@ func (s *Service) cutoverTurnForRequest(ctx context.Context, apply *storage.Appl
 				parked:           names[i],
 				blocker:          memberDisplayName(ops, names, blocker),
 				blockerState:     blocker.State,
-				blockerFailed:    state.IsApplyOperationTerminal(blocker.State) && !state.IsState(blocker.State, state.ApplyOperation.Completed),
 				blockerOnFailure: blocker.OnFailure,
 			}
 		}

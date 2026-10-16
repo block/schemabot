@@ -112,7 +112,7 @@ func requestCutover(t *testing.T, stor storage.Storage, applyID int64) {
 }
 
 // requestCutoverBoundTo records a pending operator cutover request bound to
-// one operation, as intake binds it to the member whose turn it is. A zero
+// one operation, as intake binds it to the first parked member nothing holds. A zero
 // operation ID records an unbound request.
 func requestCutoverBoundTo(t *testing.T, stor storage.Storage, applyID, operationID int64) {
 	t.Helper()
@@ -174,13 +174,14 @@ func requireCutoverRequestPending(t *testing.T, stor storage.Storage, applyID in
 }
 
 // A barrier rollout started with --defer-cutover has two later deployments
-// parked while the first is still copying. The operator's single cutover
-// request must not be taken by a parked later deployment, whose drive would
-// cut over its own target out of deployment order, nor by the copying
-// deployment, which has nothing to cut over. It waits until the first
-// deployment parks and is then cut over there; the next request goes to the
-// next deployment in order, never past it.
-func TestGRPCClient_CutoverRequestWaitsForTheDeploymentWhoseTurnItIs(t *testing.T) {
+// parked while the first is stopped. The operator's single cutover request
+// must not be taken by a parked later deployment while the stopped one holds
+// every cutover after it, nor by the stopped deployment, which has nothing
+// parked to cut over. Once the first deployment is copying again, it holds
+// nothing: the request goes to the first parked deployment, and the next
+// request to the next one, without waiting for either swap ahead of it to
+// complete.
+func TestGRPCClient_CutoverRequestIsHeldOnlyByAHaltedEarlierDeployment(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping integration test in short mode")
 	}
@@ -192,7 +193,7 @@ func TestGRPCClient_CutoverRequestWaitsForTheDeploymentWhoseTurnItIs(t *testing.
 	client.storage = stor
 
 	apply, ops := seedCutoverTurnApply(t, stor, "apply-cutover-turn-order", storage.CutoverPolicyBarrier, []cutoverTurnMember{
-		{deployment: "eu", remoteID: "remote-eu", opState: state.ApplyOperation.Running, taskState: state.Task.Running},
+		{deployment: "eu", remoteID: "remote-eu", opState: state.ApplyOperation.Stopped, taskState: state.Task.Stopped},
 		{deployment: "us", remoteID: "remote-us", opState: state.ApplyOperation.WaitingForCutover, taskState: state.Task.WaitingForCutover},
 		{deployment: "au", remoteID: "remote-au", opState: state.ApplyOperation.WaitingForCutover, taskState: state.Task.WaitingForCutover},
 	})
@@ -201,24 +202,20 @@ func TestGRPCClient_CutoverRequestWaitsForTheDeploymentWhoseTurnItIs(t *testing.
 	driveCutoverRequestAs(t, client, apply, us)
 	driveCutoverRequestAs(t, client, apply, au)
 	driveCutoverRequestAs(t, client, apply, eu)
-	assert.Empty(t, server.getCutoverApplyID(), "no deployment may cut over while the first in order is still copying")
-	requireCutoverRequestPending(t, stor, apply.ID, true, "the request waits for the deployment whose turn it is")
+	assert.Empty(t, server.getCutoverApplyID(), "no deployment may cut over while an earlier one is stopped")
+	requireCutoverRequestPending(t, stor, apply.ID, true, "the request waits while eu is stopped")
 
-	setMemberState(t, stor, eu, state.ApplyOperation.WaitingForCutover, state.Task.WaitingForCutover)
-	driveCutoverRequestAs(t, client, apply, au)
-	assert.Empty(t, server.getCutoverApplyID(), "a later parked deployment still waits for the first")
+	setMemberState(t, stor, eu, state.ApplyOperation.Running, state.Task.Running)
 	driveCutoverRequestAs(t, client, apply, eu)
-	assert.Equal(t, "remote-eu", server.getCutoverApplyID(), "the first deployment takes the request once it parks")
+	assert.Empty(t, server.getCutoverApplyID(), "a copying deployment has nothing to cut over")
+	driveCutoverRequestAs(t, client, apply, us)
+	assert.Equal(t, "remote-us", server.getCutoverApplyID(), "us cuts over while eu is still copying")
 	requireCutoverRequestPending(t, stor, apply.ID, false, "the request is completed by the deployment that took it")
 
-	setMemberState(t, stor, eu, state.ApplyOperation.Completed, state.Task.Completed)
 	requestCutover(t, stor, apply.ID)
 	driveCutoverRequestAs(t, client, apply, au)
-	assert.Equal(t, "remote-eu", server.getCutoverApplyID(), "the third deployment may not skip past the second")
-	requireCutoverRequestPending(t, stor, apply.ID, true, "the next request waits for the second deployment")
-	driveCutoverRequestAs(t, client, apply, us)
-	assert.Equal(t, "remote-us", server.getCutoverApplyID(), "the second deployment takes the next request")
-	requireCutoverRequestPending(t, stor, apply.ID, false, "the second deployment completes the request")
+	assert.Equal(t, "remote-au", server.getCutoverApplyID(), "au takes the next request without waiting for us to complete")
+	requireCutoverRequestPending(t, stor, apply.ID, false, "au completes the request")
 }
 
 // Under the parallel policy every deployment copies at once, so the first
@@ -308,11 +305,11 @@ func TestGRPCClient_RollingDeploymentTakesCutoverRequestUnchanged(t *testing.T) 
 // Two targets listed under one deployment are separate rollout members, each
 // its own database with its own cutover, sharing the deployment's one remote
 // apply as their own remote operations. A barrier rollout started with
-// --defer-cutover whose first target is still copying therefore holds the
-// second target's cutover exactly as an earlier deployment would, even though
-// both targets belong to the same deployment, and the second target's cutover
-// then names its own remote operation.
-func TestGRPCClient_EarlierTargetOfTheSameDeploymentHoldsCutoverRequest(t *testing.T) {
+// --defer-cutover whose first target is stopped therefore holds the second
+// target's cutover exactly as an earlier deployment would, even though both
+// targets belong to the same deployment. Once the first target is copying
+// again, the second target cuts over, naming its own remote operation.
+func TestGRPCClient_StoppedEarlierTargetOfTheSameDeploymentHoldsCutoverRequest(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping integration test in short mode")
 	}
@@ -324,18 +321,18 @@ func TestGRPCClient_EarlierTargetOfTheSameDeploymentHoldsCutoverRequest(t *testi
 	client.storage = stor
 
 	apply, ops := seedCutoverTurnApply(t, stor, "apply-cutover-turn-targets", storage.CutoverPolicyBarrier, []cutoverTurnMember{
-		{deployment: "primary", target: "orders-001", operationKey: "orders-001", remoteID: "remote-primary", remoteOperationID: "remote-op-001", opState: state.ApplyOperation.Running, taskState: state.Task.Running},
+		{deployment: "primary", target: "orders-001", operationKey: "orders-001", remoteID: "remote-primary", remoteOperationID: "remote-op-001", opState: state.ApplyOperation.Stopped, taskState: state.Task.Stopped},
 		{deployment: "primary", target: "orders-002", operationKey: "orders-002", remoteID: "remote-primary", remoteOperationID: "remote-op-002", opState: state.ApplyOperation.WaitingForCutover, taskState: state.Task.WaitingForCutover},
 	})
 
 	driveCutoverRequestAs(t, client, apply, ops[1])
-	assert.Empty(t, server.getCutoverApplyID(), "a later target may not cut over while an earlier target is still copying")
-	requireCutoverRequestPending(t, stor, apply.ID, true, "the request waits for the earlier target")
+	assert.Empty(t, server.getCutoverApplyID(), "a later target may not cut over while an earlier target is stopped")
+	requireCutoverRequestPending(t, stor, apply.ID, true, "the request waits while the earlier target is stopped")
 
-	setMemberState(t, stor, ops[0], state.ApplyOperation.Completed, state.Task.Completed)
+	setMemberState(t, stor, ops[0], state.ApplyOperation.Running, state.Task.Running)
 	driveCutoverRequestAs(t, client, apply, ops[1])
 	cutoverReq := server.getCutoverRequest()
-	require.NotNil(t, cutoverReq, "the later target takes the request once the earlier one has completed")
+	require.NotNil(t, cutoverReq, "the later target takes the request while the earlier one is copying again")
 	assert.Equal(t, "remote-primary", cutoverReq.ApplyId)
 	assert.Equal(t, "remote-op-002", cutoverReq.ApplyOperationId, "the later target cuts over only its own remote operation")
 	requireCutoverRequestPending(t, stor, apply.ID, false, "the later target completes the request")

@@ -929,27 +929,47 @@ const rolloutMembersOrderedHereSQL = `NOT EXISTS (
 		AND dispatched.idempotency_key IS NOT NULL
 )`
 
-// earlierSiblingHoldsCutoverSQL is the cutover-order rule: an earlier sibling
+// earlierSiblingHoldsCutoverSQL is the cutover hold rule: an earlier sibling
 // (lower created_at, id — deployment_order as materialized at apply-create)
-// holds a later operation's cutover until it has completed, unless
-// releasedFailureExemptionSQL lets a terminal-failed one stop blocking. The
-// swaps are strictly ordered, so a sibling parked at the barrier still holds.
-// It references the apply_operations (the operation whose turn is asked about)
+// holds a later operation's cutover only while it is in a state the rollout
+// halts on (memberHoldStates): failed, retrying a failure, stopped,
+// cancelled, or reverted. A sibling still copying, parked at the barrier,
+// cutting over, or complete holds nothing, so each operation cuts over as
+// soon as its own copy is ready. releasedFailureExemptionSQL lets a
+// terminal-failed sibling stop holding where on_failure continues past it.
+// It references the apply_operations (the operation whose cutover is asked about)
 // and earlier aliases, so the automatic cutover claim
 // (FindNextApplyOperationCutover) and the manual-request turn check
-// (CutoverBlocker) evaluate the same rule. pkg/presentation blocksCutover is
+// (CutoverBlocker) evaluate the same rule. pkg/presentation holdsCutover is
 // the render-side mirror. Placeholders: see earlierSiblingHoldsCutoverArgs.
 func earlierSiblingHoldsCutoverSQL(d Dialect) string {
 	return `earlier.apply_id = apply_operations.apply_id
 	AND (earlier.created_at, earlier.id) < (apply_operations.created_at, apply_operations.id)
-	AND earlier.state <> ?
+	AND earlier.state IN (` + placeholders(len(memberHoldStates())) + `)
 	AND ` + releasedFailureExemptionSQL(d)
 }
 
 // earlierSiblingHoldsCutoverArgs returns the positional arguments for
 // earlierSiblingHoldsCutoverSQL, in placeholder order.
 func earlierSiblingHoldsCutoverArgs() []any {
-	return append([]any{state.ApplyOperation.Completed}, releasedFailureExemptionArgs()...)
+	return append(stringArgs(memberHoldStates()), releasedFailureExemptionArgs()...)
+}
+
+// memberHoldStates lists the states in which an earlier rollout member holds a
+// later member's cutover and finalizer under an ordered cutover policy
+// (barrier or parallel): the states a rollout halts on rather than waits
+// through. Failed is final unless on_failure continues past it; retrying and
+// stopped may still go either way, so they hold until they resolve; cancelled
+// and reverted mean the rollout is not going ahead on that member. The list
+// must match pkg/presentation holdsCutover.
+func memberHoldStates() []string {
+	return []string{
+		state.ApplyOperation.Failed,
+		state.ApplyOperation.FailedRetryable,
+		state.ApplyOperation.Stopped,
+		state.ApplyOperation.Cancelled,
+		state.ApplyOperation.Reverted,
+	}
 }
 
 // earlierFinalizerAtBarrierSQL matches an earlier group_finalizer that the
@@ -985,12 +1005,13 @@ func earlierFinalizerAtBarrierArgs() []any {
 
 // finalizerStartGateSQL is the gate a group_finalizer starts through, on every
 // claim arm that can start one. It waits for the work it finalizes to
-// complete (a namespace whose only change is its VSchema has no such work),
-// and then for every earlier-member sibling to complete, under every
-// cutover_policy, with the on_failure exemption. The fragment references the
-// apply_operations alias; its placeholders, in order, are the work kind,
-// completed, completed, and releasedFailureExemptionArgs (see
-// finalizerStartGateArgs).
+// complete (a namespace whose only change is its VSchema has no such work).
+// Earlier members then hold it the way they hold a cutover: under barrier and
+// parallel only while one is in a memberHoldStates state, and under rolling,
+// and any unrecognized policy, which fails closed to the serial gate, until
+// every earlier member has completed. Both carry the on_failure exemption.
+// The fragment references the apply_operations alias; its placeholders are
+// listed by finalizerStartGateArgs.
 func finalizerStartGateSQL(d Dialect) string {
 	return `(
 	NOT EXISTS (
@@ -1009,7 +1030,16 @@ func finalizerStartGateSQL(d Dialect) string {
 			AND ` + earlierRolloutMemberSQL + `
 			AND ` + rolloutMembersOrderedHereSQL + `
 			AND (earlier.created_at, earlier.id) < (apply_operations.created_at, apply_operations.id)
-			AND earlier.state <> ?
+			AND (
+				(
+					apply_operations.cutover_policy IN (?, ?)
+					AND earlier.state IN (` + placeholders(len(memberHoldStates())) + `)
+				)
+				OR (
+					apply_operations.cutover_policy NOT IN (?, ?)
+					AND earlier.state <> ?
+				)
+			)
 			AND ` + releasedFailureExemptionSQL(d) + `
 	)
 )`
@@ -1021,8 +1051,13 @@ func finalizerStartGateArgs() []any {
 	args := []any{
 		storage.ApplyOperationKindWork,
 		state.ApplyOperation.Completed,
-		state.ApplyOperation.Completed,
+		storage.CutoverPolicyBarrier, storage.CutoverPolicyParallel,
 	}
+	args = append(args, stringArgs(memberHoldStates())...)
+	args = append(args,
+		storage.CutoverPolicyBarrier, storage.CutoverPolicyParallel,
+		state.ApplyOperation.Completed,
+	)
 	return append(args, releasedFailureExemptionArgs()...)
 }
 
@@ -1236,6 +1271,25 @@ func (s *applyOperationStore) driverCapClause(staleClaimCutoff string) (string, 
 	return clause, append(stringArgs(occupyingStates), s.maxDriversPerApply)
 }
 
+// cutoverPhaseOperationStates lists the operation states a driver occupies
+// while it cuts an operation over. The cutover claim caps these on their own
+// lane (cutoverCapClause) rather than against every occupying state, so an
+// operation whose copy is ready never waits for a driver behind other members
+// that are still copying.
+func cutoverPhaseOperationStates() []string {
+	return []string{state.ApplyOperation.CuttingOver, state.ApplyOperation.RevertWindow}
+}
+
+// cutoverCapClause renders the cutover claim's fan-out cap: the apply may hold
+// at most maxDriversPerApply fresh leases mid-cutover at once. Copies count
+// against the copy claim's cap (driverCapClause), which counts cutovers too,
+// so the drivers one apply holds stay bounded at twice the cap.
+func (s *applyOperationStore) cutoverCapClause(staleClaimCutoff string) (string, []any) {
+	cutoverStates := cutoverPhaseOperationStates()
+	clause := fmt.Sprintf(freshLeaseCountSQL, placeholders(len(cutoverStates)), staleClaimCutoff) + " < ?"
+	return clause, append(stringArgs(cutoverStates), s.maxDriversPerApply)
+}
+
 // releasedFailureExemptionArgs returns the positional arguments for
 // releasedFailureExemptionSQL, in placeholder order.
 func releasedFailureExemptionArgs() []any {
@@ -1288,20 +1342,18 @@ func releasedFailureExemptionArgs() []any {
 //     block, so a failed earlier deployment still halts the rollout.
 //   - parallel: earlier siblings do not order a work row's copy start, but a
 //     failed earlier member still gates admission under on_failure. The fan-out
-//     cap below bounds concurrent copies; the cutover claim orders the swaps.
+//     cap below bounds concurrent copies.
 //
-// A group_finalizer's gate is not policy-aware. It waits for the work it
-// finalizes to complete (a namespace whose only change is its VSchema has no
-// such work), and then for every earlier-member sibling to complete, under
-// every policy. A finalizer never parks at the cutover
-// barrier: its drive publishes the member's change in one step, so the barrier
-// and parallel relaxations, which are safe for work only because the work then
-// parks and the cutover claim orders its swap, would let a later member's
-// VSchema go out while an earlier member's is still unapplied or has failed.
-// The finalizer therefore takes the cutover claim's completed-only order at
-// its start, and the stopped+start resume arm holds a stopped finalizer to
-// the same gate (finalizerStartGateSQL), so a stop and start cannot publish
-// it out of order.
+// A group_finalizer waits for the work it finalizes to complete (a namespace
+// whose only change is its VSchema has no such work). Earlier members hold it
+// the way they hold a cutover, since a finalizer never parks at the cutover
+// barrier and its drive publishes the member's change in one step: under
+// rolling until every earlier member has completed, and under barrier and
+// parallel only while an earlier member has failed, is retrying, or was
+// stopped, cancelled or reverted (memberHoldStates), so a later member's
+// VSchema never goes out past a failure the rollout halts on. The stopped+start
+// resume arm holds a stopped finalizer to the same gate (finalizerStartGateSQL),
+// so a stop and start cannot publish it past one either.
 //
 // on_failure (per-apply policy, also captured on each row at create)
 // layers on top of every gate: "halt" (the default) keeps a terminal-failed
@@ -1461,7 +1513,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 	// Stale-active barrier-park exemption (see the staleness clause below): a
 	// multi-deployment operation parked at the cutover barrier under an
 	// ordered-cutover policy (barrier or parallel) is reserved for the
-	// deployment-ordered cutover claim, so the copy claim must not re-lease it as
+	// cutover claim, so the copy claim must not re-lease it as
 	// stale-active work. A single-operation apply has no sibling and is never
 	// exempted, so manual --defer-cutover behaviour is unchanged.
 	queryArgs = append(queryArgs,
@@ -2018,7 +2070,7 @@ func moveRedispatchToRunning(ctx context.Context, tx *rebindTx, ad *storage.Appl
 }
 
 // FindNextApplyOperationCutover atomically claims the next operation parked at
-// the cutover barrier whose turn it is, in deployment order, and rotates a fresh
+// the cutover barrier that no earlier sibling holds, and rotates a fresh
 // operation lease onto it in the same transaction. It is the cutover counterpart
 // to FindNextApplyOperation: that primitive gates the copy phase (pending →
 // running); this one gates the cutover phase (waiting_for_cutover → cutting_over).
@@ -2033,14 +2085,16 @@ func moveRedispatchToRunning(ctx context.Context, tx *rebindTx, ad *storage.Appl
 // Two claim paths, mirroring FindNextApplyOperation:
 //
 //   - Start a parked cutover. A waiting_for_cutover row is claimed and
-//     transitioned to cutting_over only when every earlier operation of the
-//     apply has reached completed, whichever member it belongs to, and no
-//     pending stop control request exists. The gate carries no member filter,
-//     so two shards of one member cut over one after the other.
-//     Unlike the copy gate's barrier relaxation, the cutover gate's "done" set is
-//     completed-only, so the high-risk swaps never overlap and run strictly in
-//     order. The on_failure "continue" exemption lets a terminal-failed earlier
-//     sibling stop blocking, matching the copy gate.
+//     transitioned to cutting_over as soon as its own copy is parked, unless an
+//     earlier operation of the apply, whichever member it belongs to, is in a
+//     state the rollout halts on (earlierSiblingHoldsCutoverSQL), a pending
+//     stop control request exists, or the apply already has
+//     maxDriversPerApply operations mid-cutover. An earlier sibling that is
+//     still copying or cutting over does not hold it, so members that finish
+//     their copies at different times each cut over when ready rather than
+//     queueing behind the slowest earlier one. The on_failure "continue"
+//     exemption lets a terminal-failed earlier sibling stop holding, matching
+//     the copy gate.
 //   - Recover a stale in-flight cutover. A row already in cutting_over or
 //     revert_window whose heartbeat has gone stale is re-leased without changing
 //     its state — its driver died mid-cutover and another driver resumes it. This
@@ -2062,12 +2116,14 @@ func moveRedispatchToRunning(ctx context.Context, tx *rebindTx, ad *storage.Appl
 // driver pool, so a change to one claim's ordering or eligibility belongs in
 // the other.
 //
-// It carries no maxDriversPerApply cap, unlike the copy claim's
-// pending arm, because the start gate above already bounds an apply to one
-// concurrent cutover: an earlier sibling that is itself parked is not completed,
-// so it blocks every later cutover. A cap could only bind here by exceeding what
-// the ordering gate already allows. The recovery arm is uncapped for the same
-// reason it is there — a stale mid-cutover row must always be re-leasable.
+// The start arm is capped at maxDriversPerApply operations mid-cutover at
+// once (cutoverCapClause): with no ordering between members, every parked
+// operation of a wide apply could otherwise take a driver at once, which is
+// the starvation the cap exists to prevent. Only cutting_over and
+// revert_window count, so members still copying never hold a ready cutover
+// back, and it cannot wedge, since each drops out of the count as its
+// cutover settles. The recovery arm is uncapped for the same reason the copy
+// claim's is: a stale mid-cutover row must always be re-leasable.
 func (s *applyOperationStore) FindNextApplyOperationCutover(ctx context.Context, owner string) (*storage.ApplyOperation, error) {
 	if owner == "" {
 		return nil, fmt.Errorf("operator owner is required to claim apply_operation cutover: %w", storage.ErrApplyLeaseLost)
@@ -2083,12 +2139,12 @@ func (s *applyOperationStore) FindNextApplyOperationCutover(ctx context.Context,
 	// driving — exactly the population OC-2 parks-and-releases. This mirrors
 	// shouldReleaseAtCutoverBarrier in pkg/tern/cutover_barrier.go:
 	//
-	//   1. cutover_policy is ordered (barrier or parallel) — rolling rows are
-	//      never deployment-ordered at the cutover phase. Barrier and parallel
-	//      both park at the barrier and cut over in deployment order; they differ
-	//      only in the copy-start gate, so both are eligible here.
+	//   1. cutover_policy is ordered (barrier or parallel) — rolling rows never
+	//      park at the barrier. Barrier and parallel both park at the barrier
+	//      and cut over through this claim; they differ only in the copy-start
+	//      gate, so both are eligible here.
 	//   2. multi-operation apply (EXISTS sibling) — a single-op apply has no
-	//      siblings to order, so it never auto-defers; its cutover stays on the
+	//      siblings to hold it, so it never auto-defers; its cutover stays on the
 	//      copy/manual path. Mirrors shouldAutoDeferCutover's multiOperation arg.
 	//   3. parent apply NOT started with manual --defer-cutover — that contract
 	//      keeps the operator holding the claim and polling for a manual cutover,
@@ -2100,19 +2156,23 @@ func (s *applyOperationStore) FindNextApplyOperationCutover(ctx context.Context,
 	// The gate wraps BOTH claim branches (start and stale recovery): a stale
 	// cutting_over/revert_window row outside this population reached that state
 	// via the copy/manual path, so recovering it here would steal legitimate work.
+	staleClaimCutoff := s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime, LiteralIntervalAmount(uint64(storage.ApplyLeaseStaleAfter.Microseconds())), IntervalMicrosecond)
+	cutoverCap, cutoverCapArgs := s.cutoverCapClause(staleClaimCutoff)
 	queryArgs := []any{storage.CutoverPolicyBarrier, storage.CutoverPolicyParallel}
 	// Start-a-parked-cutover gate (see SQL below). A waiting_for_cutover row is
-	// claimable only when no earlier operation of the apply, whichever member
-	// it belongs to, is still non-completed; releasedFailureExemptionArgs
-	// exempt a terminal-failed earlier sibling so it no longer blocks later
-	// cutovers under "continue", or under "pause" once a release latches the
-	// rollout open; and the pending-stop NOT EXISTS makes `stop` halt remaining
-	// cutovers even under those exemptions.
+	// claimable unless an earlier operation of the apply, whichever member it
+	// belongs to, is in a state the rollout halts on;
+	// releasedFailureExemptionArgs exempt a terminal-failed earlier sibling so
+	// it no longer holds later cutovers under "continue", or under "pause" once
+	// a release latches the rollout open; the pending-stop NOT EXISTS makes
+	// `stop` halt remaining cutovers even under those exemptions; and the
+	// cutover cap bounds how many of the apply's operations cut over at once.
 	queryArgs = append(queryArgs, state.ApplyOperation.WaitingForCutover)
 	queryArgs = append(queryArgs, earlierSiblingHoldsCutoverArgs()...)
 	queryArgs = append(queryArgs,
 		storage.ControlOperationStop, storage.ControlRequestPending,
 	)
+	queryArgs = append(queryArgs, cutoverCapArgs...)
 	// Recovery clause: a row already mid-cutover whose heartbeat has gone stale is
 	// re-leased without changing state, so it carries no ordering gate (but is
 	// still bound by the eligibility gate above).
@@ -2121,7 +2181,6 @@ func (s *applyOperationStore) FindNextApplyOperationCutover(ctx context.Context,
 		state.ApplyOperation.RevertWindow,
 	)
 
-	staleClaimCutoff := s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime, LiteralIntervalAmount(uint64(storage.ApplyLeaseStaleAfter.Microseconds())), IntervalMicrosecond)
 	deferCutoverIsTrue := s.dialect.JSONBooleanIsTrue("a.options", []string{"defer_cutover"})
 	row := tx.QueryRowContext(ctx, fmt.Sprintf(`
 		SELECT %s
@@ -2154,13 +2213,14 @@ func (s *applyOperationStore) FindNextApplyOperationCutover(ctx context.Context,
 						AND cr.operation = ?
 						AND cr.status = ?
 				)
+				AND %s
 			)
 			OR (state IN (?, ?) AND updated_at < %s)
 		)
 		ORDER BY created_at, id
 		LIMIT 1
 		FOR UPDATE SKIP LOCKED
-	`, applyOperationColumns, deferCutoverIsTrue, staleClaimCutoff), queryArgs...)
+	`, applyOperationColumns, deferCutoverIsTrue, cutoverCap, staleClaimCutoff), queryArgs...)
 
 	ad, err := scanApplyOperationInto(row)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -2231,16 +2291,15 @@ func (s *applyOperationStore) FindNextApplyOperationCutover(ctx context.Context,
 }
 
 // CutoverBlocker returns the earliest earlier sibling that holds the given
-// operation's cutover, or nil when it is that operation's turn. It evaluates
+// operation's cutover, or nil when nothing does. It evaluates
 // earlierSiblingHoldsCutoverSQL, the rule the automatic cutover claim gates on,
-// so a manually requested cutover and the automatic one agree on whose turn it
-// is between members. Only operations of another rollout member
-// (earlierRolloutMemberSQL) are considered: under a requested cutover a
-// member's own operations, its shards and tables, cut over together, since the
-// cutover a request sends addresses the member's remote apply and takes
-// whichever of them are parked. The automatic claim has no member filter and
-// still cuts them over one at a time. It reads the order and does not claim
-// anything.
+// so a manually requested cutover and the automatic one agree on when an
+// earlier member's failure holds a later one. Only operations of another
+// rollout member (earlierRolloutMemberSQL) are considered: under a requested
+// cutover a member's own operations, its shards and tables, cut over
+// together, since the cutover a request sends addresses the member's remote
+// apply and takes whichever of them are parked. It reads the rollout and does
+// not claim anything.
 func (s *applyOperationStore) CutoverBlocker(ctx context.Context, operationID int64) (*storage.ApplyOperation, error) {
 	args := append([]any{operationID}, earlierSiblingHoldsCutoverArgs()...)
 	row := s.db.QueryRowContext(ctx, `

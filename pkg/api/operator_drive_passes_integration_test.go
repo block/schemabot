@@ -19,11 +19,11 @@ import (
 )
 
 // A parallel rollout of three members has copied everything and parked at the
-// cutover barrier. Its swaps run one at a time, so only the first is claimable;
-// each completed swap is what makes the next one claimable. With a single
-// driver and an hour-long poll interval, the operator must still cut all three
-// over back to back, in rollout order, because the driver re-runs its claim
-// ladder as soon as a swap settles instead of waiting for its next tick.
+// cutover barrier. Every parked member is ready to cut over, but there is a
+// single driver, so it takes them one swap per pass. With an hour-long poll
+// interval, the operator must still cut all three over back to back, in
+// rollout order, because the driver re-runs its claim ladder as soon as a
+// swap settles instead of waiting for its next tick.
 func TestOperatorCutsOverParallelMembersBackToBackWithoutWaitingForATick(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping integration test in short mode")
@@ -65,7 +65,7 @@ func TestOperatorCutsOverParallelMembersBackToBackWithoutWaitingForATick(t *test
 		time.Sleep(20 * time.Millisecond)
 	}
 
-	assert.Equal(t, members, rec.resumeOrder(), "swaps must run one at a time in rollout order")
+	assert.Equal(t, members, rec.resumeOrder(), "the single driver takes the parked swaps in rollout order")
 	for _, dep := range members {
 		assert.Equal(t, state.ApplyOperation.Completed, opState(t, ctx, stor, seed.opID(dep)),
 			"operation %s must be completed", dep)

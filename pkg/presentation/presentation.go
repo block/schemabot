@@ -5,8 +5,8 @@
 // expand/collapse are computed once and rendered identically everywhere.
 //
 // The derivation adds no persisted state. Labels such as "halted",
-// "paused — <deployment> failed; release or stop", "ready for cutover — waiting
-// for <deployment>", and "queued — next in order" exist only here; they are
+// "paused — <deployment> failed; release or stop", "ready for cutover — held,
+// <deployment> failed", and "queued — next in order" exist only here; they are
 // projections of (operation state, earlier-sibling states, resolved order,
 // cutover_policy, on_failure, release latch). The ordering context is derived
 // from the same gate FindNextApplyOperation evaluates, so the presentation never
@@ -192,8 +192,8 @@ type Deployment struct {
 	Presentation PresentationState
 
 	// Label is the operator-facing summary, including any referenced deployment
-	// (e.g. "ready for cutover — waiting for payments-eu", "halted — payments-us
-	// failed"). It carries no progress percentage — fine-grained copy progress is
+	// (e.g. "ready for cutover — held, payments-eu failed", "halted —
+	// payments-us failed"). It carries no progress percentage — fine-grained copy progress is
 	// joined from the operation's tasks by the renderer (see the design note's
 	// phase-source section).
 	Label string
@@ -624,17 +624,22 @@ func setHeldByEarlierStep(d *Deployment, holder Operation, holderName string) {
 }
 
 // deriveWaitingForCutover splits a copied-and-parked operation into ready-now or
-// ready-but-waiting-on-an-earlier-cutover. Cutover ordering is strict-complete
-// and independent of cutover_policy, which only relaxes copy start.
+// ready-but-held by an earlier sibling the rollout halts on, mirroring the
+// cutover claim's hold rule.
 func deriveWaitingForCutover(d *Deployment, ops []Operation, names []string, i int) {
 	op := ops[i]
 	for j := range i {
-		if blocksCutover(ops[j].State, op.continuesPastFailure()) {
-			d.set(StateReadyForCutoverWaiting, fmt.Sprintf("ready for cutover — waiting for %s", names[j]), "🟡", true)
-			return
+		if !holdsCutover(ops[j].State, op.continuesPastFailure()) {
+			continue
 		}
+		label := fmt.Sprintf("ready for cutover — held, %s %s", names[j], haltedReason(ops[j].State))
+		if ops[j].State == state.ApplyOperation.Failed && op.pausesOnFailure() {
+			label += "; release or stop"
+		}
+		d.set(StateReadyForCutoverWaiting, label, "⏸️", true)
+		return
 	}
-	d.set(StateReadyForCutoverNext, "ready for cutover — next in order", "🟢", true)
+	d.set(StateReadyForCutoverNext, "ready for cutover", "🟢", true)
 }
 
 // blockingSibling returns the index of the earliest earlier sibling that holds
@@ -728,18 +733,24 @@ func isBarrierNonBlocking(s string) bool {
 	}
 }
 
-// blocksCutover reports whether an earlier sibling in earlierState blocks a
-// later deployment's ordered cutover. Cutover is strictly ordered: an earlier
-// sibling blocks until it is completed, except a terminal-failed sibling the
-// rollout is configured to continue past (continue, or a released pause).
-func blocksCutover(earlierState string, continuesPastFailure bool) bool {
-	if earlierState == state.ApplyOperation.Completed {
+// holdsCutover reports whether an earlier sibling in earlierState holds a
+// later deployment's cutover. It mirrors the storage cutover claim's
+// memberHoldStates: a sibling holds only while it has failed, is retrying, or
+// was stopped, cancelled or reverted, except a terminal-failed sibling the
+// rollout is configured to continue past (continue, or a released pause). A
+// sibling still copying, parked, cutting over or complete holds nothing.
+func holdsCutover(earlierState string, continuesPastFailure bool) bool {
+	switch earlierState {
+	case state.ApplyOperation.Failed:
+		return !continuesPastFailure
+	case state.ApplyOperation.FailedRetryable,
+		state.ApplyOperation.Stopped,
+		state.ApplyOperation.Cancelled,
+		state.ApplyOperation.Reverted:
+		return true
+	default:
 		return false
 	}
-	if earlierState == state.ApplyOperation.Failed && continuesPastFailure {
-		return false
-	}
-	return true
 }
 
 // haltedReason returns the deployment-facing reason word for a halting blocker.
@@ -751,6 +762,8 @@ func haltedReason(blockerState string) string {
 		return "cancelled"
 	case state.ApplyOperation.Reverted:
 		return "reverted"
+	case state.ApplyOperation.FailedRetryable:
+		return "retrying"
 	default:
 		return blockerState
 	}
@@ -850,7 +863,7 @@ func nextAction(aggState string, deps []Deployment, failClosed bool) NextAction 
 	if aggState == state.Apply.Stopped {
 		return NextAction{Kind: NextActionResume}
 	}
-	// A deployment that is next in order for cutover is actionable even while the
+	// A deployment that is ready for cutover is actionable even while the
 	// aggregate is still running — an earlier deployment can cut over while a
 	// later one is still copying (waiting_for_cutover does not roll the aggregate
 	// up until every deployment has reached it). This covers both the

@@ -62,13 +62,13 @@ func TestRenderMultiDeploymentApplyComment_BarrierInProgress(t *testing.T) {
 	assert.NotContains(t, out, "schemabot cutover")
 
 	// Per-deployment summary lines, in resolved order, with derived labels.
-	assert.Contains(t, out, "- 🟢 `eu` — ready for cutover — next in order")
+	assert.Contains(t, out, "- 🟢 `eu` — ready for cutover")
 	assert.Contains(t, out, "- 🔄 `us` — running table copy")
 	assert.Contains(t, out, "- ⏳ `au` — waiting for us")
 	assert.Contains(t, out, "- ⏳ `ca` — waiting for us")
 
 	// Active/ready deployments default open; queued ones default collapsed.
-	assert.Contains(t, out, "<details open>\n<summary>🟢 eu — ready for cutover — next in order</summary>")
+	assert.Contains(t, out, "<details open>\n<summary>🟢 eu — ready for cutover</summary>")
 	assert.Contains(t, out, "<details open>\n<summary>🔄 us — running table copy</summary>")
 	assert.Contains(t, out, "<details>\n<summary>⏳ au — waiting for us</summary>")
 	assert.Contains(t, out, "<details>\n<summary>⏳ ca — waiting for us</summary>")

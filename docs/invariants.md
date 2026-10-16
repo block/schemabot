@@ -849,12 +849,13 @@ later member's work waits on every earlier member's, until it completes under `r
 the cutover barrier under `barrier`, while `parallel` does not order copy start at all. Where a
 rollout is laid out table by table, work on a table starts on any target only once every earlier
 table has completed on every target, under every cutover policy and every on_failure value, and
-work held behind an earlier table that settled without completing can never start, so it holds no target. Cutover
-under `barrier` and `parallel` is ordered across every operation, not per member: operations cut
-over strictly one at a time in the order the rollout created them, so two shards of one member cut
-over one after the other. A member's finalizer publishes its change without parking at the
-barrier, so it is ordered like a cutover under every policy: it starts, or resumes after a stop,
-only once all of the work it finalizes and every earlier member have completed. Work a stop caught
+work held behind an earlier table that settled without completing can never start, so it holds no target. Under
+`barrier` and `parallel` an operation cuts over as soon as its own copy is ready: an earlier
+operation holds it only while it is in a state the rollout halts on (failed, retrying a failure,
+stopped, cancelled, or reverted), never while it is still copying or cutting over. A member's
+finalizer publishes its change without parking at the barrier, so it is held like a cutover: it
+starts, or resumes after a stop, only once all of the work it finalizes has completed and no
+earlier member holds it, where under `rolling` every earlier member holds it until it completes. Work a stop caught
 before it started is ordered like pending work, so stopping and starting a rollout cannot reorder
 it. A finalizer whose
 own work has failed can never start, so it holds later members exactly where that failure does and
@@ -882,7 +883,8 @@ without completing the request would refuse the start the hold exists to preserv
 *Enforced:* the ordered-claim gates in `FindNextApplyOperation`, whose work and finalizer arms
 each gate on earlier members and whose stopped+start arm holds a finalizer, and work that never
 started, to the same gate, with the failure exemption shared by every gate and the table-step
-boundary `rolloutStepGateSQL` in the work gate, and `FindNextApplyOperationCutover`
+boundary `rolloutStepGateSQL` in the work gate, and `FindNextApplyOperationCutover`, whose start
+arm gates on the hold rule `earlierSiblingHoldsCutoverSQL` that `CutoverBlocker` shares
 (`pkg/storage/internal/sqlstore/apply_operations.go`), pinned per policy on both dialects by the
 storage parity suite (`pkg/storage/storagetest/apply_operations.go`); on a data plane, an apply a
 dispatcher created leaves member order to the dispatcher's claim (`rolloutMembersOrderedHereSQL`,
