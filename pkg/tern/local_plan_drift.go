@@ -158,6 +158,11 @@ const driftRecoveryHint = "to recover, re-plan against the current live schema t
 // re-plan restricted to the same shard. A request with no target shard is a
 // whole-deployment (or non-sharded) apply, compared against the re-plan's
 // non-sharded changes.
+//
+// A shard dispatch carries one table's changes for its shard, and the shard's
+// other tables are other operations' work, so the shard-scoped comparison is
+// restricted to the tables the dispatch names. A table the dispatch carries
+// that this shard would plan differently, or not at all, still fails closed.
 func (c *LocalClient) verifyMaterializedPlanMatchesLiveSchema(ctx context.Context, req *ternv1.ApplyRequest, schemaFiles schema.SchemaFiles) (replannedChanges, error) {
 	shardScoped := len(req.TargetShards) > 0
 	targetShard := ""
@@ -181,6 +186,9 @@ func (c *LocalClient) verifyMaterializedPlanMatchesLiveSchema(ctx context.Contex
 	dispatched, err := c.driftMultisetFromApplyRequest(req.DdlChanges, targetShard)
 	if err != nil {
 		return replannedChanges{}, fmt.Errorf("dispatched plan: %w", err)
+	}
+	if shardScoped {
+		recomputed = recomputed.restrictedToTablesOf(dispatched)
 	}
 	if err := compareDriftMultisets(recomputed, dispatched); err != nil {
 		return replannedChanges{}, engine.NewPermanentError("local schema has drifted from the reviewed plan (database %q, target %q): %w; %s", c.config.Database, req.Target, err, driftRecoveryHint)
