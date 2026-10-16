@@ -2935,3 +2935,36 @@ func TestMarkOperationFromOwnResult_TasklessVSchemaOnlyMirrorsParentWhenDriveLef
 	assert.False(t, marked, "a still-running operation must be left claimable for a later poll")
 	assert.False(t, opStore.written, "no state write should occur while the operation is still in flight")
 }
+
+// Only the projection that takes a stopped rollout back into flight reattaches
+// the PR progress observer. A lost race, a rollout that was never stopped, and a
+// stop settled by a cancel all leave the observer alone.
+func TestRolloutLeftStop(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		projection applyProjectionResult
+		want       bool
+	}{
+		{
+			name:       "start resumes a stopped rollout",
+			projection: applyProjectionResult{Swapped: true, PreviousState: state.Apply.Stopped, DerivedState: state.Apply.Resuming},
+			want:       true,
+		},
+		{
+			name:       "another drive won the swap",
+			projection: applyProjectionResult{Swapped: false, PreviousState: state.Apply.Stopped, DerivedState: state.Apply.Resuming},
+		},
+		{
+			name:       "rollout was already running",
+			projection: applyProjectionResult{Swapped: true, PreviousState: state.Apply.Running, DerivedState: state.Apply.WaitingForCutover},
+		},
+		{
+			name:       "cancel settles the stopped rollout",
+			projection: applyProjectionResult{Swapped: true, PreviousState: state.Apply.Stopped, DerivedState: state.Apply.Cancelled},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, rolloutLeftStop(tc.projection))
+		})
+	}
+}

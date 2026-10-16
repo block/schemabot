@@ -1295,6 +1295,131 @@ func (s *Service) recoverMultiApplyOperation(ctx context.Context, driverID int, 
 	return s.driveClaimedMultiOperation(ctx, driverID, op, opLease, false)
 }
 
+// rolloutLeftStop reports whether this projection is the one that took a
+// stopped rollout back into flight. Exactly one drive wins that swap, so it is
+// the single owner of what the resume needs beyond the drive itself. A cancel
+// holds the rollout stopped and a settled rollout derives a terminal state, so
+// neither counts.
+func rolloutLeftStop(projection applyProjectionResult) bool {
+	return projection.Swapped &&
+		state.IsState(projection.PreviousState, state.Apply.Stopped) &&
+		!state.IsTerminalApplyState(projection.DerivedState)
+}
+
+// rolloutInFlight reports whether the projection left the rollout running,
+// neither stopped nor settled.
+func rolloutInFlight(projection applyProjectionResult) bool {
+	return !state.IsTerminalApplyState(projection.DerivedState)
+}
+
+// attachResumedRolloutObserver gives a resumed rollout a progress comment
+// observer again. The rollout's observer stopped watching when the rollout
+// stopped, and operation drives never attach one of their own, so without this
+// the PR keeps reading stopped for the whole resumed copy. The observer's first
+// tick sees the stop's summary comment and posts a fresh progress comment at the
+// bottom of the PR. Its GitHub writes go through the durable progress-comment
+// authority, so observers on other pods never edit the comment at the same time.
+//
+// The drive that takes the rollout out of its stop attaches one. A later claim
+// attaches one too while the stop's summary comment is still waiting to be
+// rotated, so a resume whose observer was lost with its pod before the first
+// tick still reaches the bottom of the PR from whichever pod claims next. Once
+// an observer rotates, the summary comment is consumed and claims stop
+// attaching. Each process attaches once per stop summary comment, and every
+// stop posts a new one, so the next stop and start of the same rollout
+// attaches again.
+func (s *Service) attachResumedRolloutObserver(ctx context.Context, driverID int, op *storage.ApplyOperation, apply *storage.Apply, projection applyProjectionResult) {
+	attrs := append(apply.LogAttrs(),
+		"driver", driverID, "apply_operation_id", op.ID,
+		"operation_deployment", op.Deployment)
+	if !rolloutInFlight(projection) {
+		// A stopped or settled rollout's observer has stopped watching, so the
+		// next resume attaches a fresh one here.
+		s.forgetResumeObserver(apply.ID)
+		s.logger.Debug("operator: rollout is not in flight; no progress comment observer to attach",
+			append(attrs, "derived_state", projection.DerivedState)...)
+		return
+	}
+	if s.OnApplyRecovered == nil {
+		s.logger.Debug("operator: resumed rollout has no observer hook; PR progress comment will not follow the resume", attrs...)
+		return
+	}
+	if rolloutLeftStop(projection) {
+		// This drive took the rollout out of its stop, so it attaches whether or
+		// not the stop's summary can be read; the observer finds the summary on
+		// its own first tick.
+		stopSummaryCommentID, _, err := s.stopSummaryAwaitingRotation(ctx, apply)
+		if err != nil {
+			s.logger.Warn("operator: could not load the rollout's stop summary; attaching the progress comment observer anyway, and a later claim in this process may attach one more",
+				append(attrs, "error", err)...)
+		}
+		s.attachResumeObserver(apply, stopSummaryCommentID, "rollout left its stop", attrs)
+		return
+	}
+	stopSummaryCommentID, awaiting, err := s.stopSummaryAwaitingRotation(ctx, apply)
+	if err != nil {
+		s.logger.Warn("operator: could not check whether the PR still shows the rollout's stop; this claim will not attach a progress comment observer",
+			append(attrs, "error", err)...)
+		return
+	}
+	if !awaiting {
+		s.logger.Debug("operator: rollout has no stop summary waiting to be rotated; no progress comment observer to attach", attrs...)
+		return
+	}
+	if s.hasResumeObserverFor(apply.ID, stopSummaryCommentID) {
+		s.logger.Debug("operator: this process already attached a progress comment observer for the rollout's current stop",
+			append(attrs, "stop_summary_comment_id", stopSummaryCommentID)...)
+		return
+	}
+	s.attachResumeObserver(apply, stopSummaryCommentID, "PR still shows the rollout's stop", attrs)
+}
+
+func (s *Service) attachResumeObserver(apply *storage.Apply, stopSummaryCommentID int64, reason string, attrs []any) {
+	s.rememberResumeObserver(apply.ID, stopSummaryCommentID)
+	s.logger.Info("operator: attaching progress comment observer to resumed rollout",
+		append(attrs, "reason", reason, "stop_summary_comment_id", stopSummaryCommentID)...)
+	s.OnApplyRecovered(apply)
+}
+
+// stopSummaryAwaitingRotation loads the apply's summary comment and reports its
+// GitHub comment ID and whether it is still active. On a rollout in flight that
+// comment can only be a stop's, and it stays active until an observer posts the
+// resumed rollout's fresh progress comment and consumes it.
+func (s *Service) stopSummaryAwaitingRotation(ctx context.Context, apply *storage.Apply) (commentID int64, awaiting bool, err error) {
+	summary, err := s.storage.ApplyComments().Get(ctx, apply.ID, state.Comment.Summary)
+	if err != nil {
+		return 0, false, fmt.Errorf("load summary comment for apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	if summary == nil {
+		return 0, false, nil
+	}
+	return summary.GitHubCommentID, summary.SupersededAt == nil, nil
+}
+
+// hasResumeObserverFor reports whether this process already attached an
+// observer to rotate the given stop summary comment.
+func (s *Service) hasResumeObserverFor(applyID, stopSummaryCommentID int64) bool {
+	s.resumeObserversMu.Lock()
+	defer s.resumeObserversMu.Unlock()
+	remembered, ok := s.resumeObservers[applyID]
+	return ok && remembered == stopSummaryCommentID
+}
+
+func (s *Service) rememberResumeObserver(applyID, stopSummaryCommentID int64) {
+	s.resumeObserversMu.Lock()
+	defer s.resumeObserversMu.Unlock()
+	if s.resumeObservers == nil {
+		s.resumeObservers = make(map[int64]int64)
+	}
+	s.resumeObservers[applyID] = stopSummaryCommentID
+}
+
+func (s *Service) forgetResumeObserver(applyID int64) {
+	s.resumeObserversMu.Lock()
+	defer s.resumeObserversMu.Unlock()
+	delete(s.resumeObservers, applyID)
+}
+
 // driveClaimedMultiOperation drives one claimed operation of a multi-operation
 // apply under the operation lease only and settles the parent via the projection
 // CAS. cutover selects the drive phase: false runs the operation's copy phase
@@ -1361,6 +1486,7 @@ func (s *Service) driveClaimedMultiOperation(ctx context.Context, driverID int, 
 				"operation_deployment", op.Deployment, "error", err)...)
 		return claimSpent
 	}
+	s.attachResumedRolloutObserver(operationLeaseCtx, driverID, op, apply, preDrive)
 
 	// Heartbeat the operation row on the apply heartbeat cadence so a peer driver
 	// does not re-claim it during a long drive. The heartbeat writes under the
