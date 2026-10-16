@@ -315,16 +315,18 @@ For Vitess tables, per-shard progress is rendered below the table progress bar. 
 |--------|-------|-------------|--------|
 | ✓ | Green | `completed` | Total rows |
 | ◉ | Cyan | `running` (copying) | Percent, rows copied/total, ETA |
+| ◉ | Cyan | other in-flight phases (`checksumming`, `recovering`, `reverting`, ...) | The phase, with how far a checksum has verified |
 | ● | Yellow | `waiting_for_cutover` | "ready for cutover" |
 | ● | Yellow | `cutting_over` | "cutting over" |
+| ● | Yellow | `revert_window` | The change is applied but not final |
 | ○ | Dim | `pending` | "queued" |
 | ✗ | Red | `failed` | "failed" |
 
-**Order:** failed shards first, then copying shards furthest behind first, then the other phases (waiting for cutover, cutting over), then queued shards in order, so the next to run leads them, and complete shards last. The PR comment lists a table's shards, and a rollout's targets, the same way. The order and the caps below live in `pkg/presentation/part_listing.go`.
+**Order:** up to 8 shards, every shard is named in the parts' own order, so each keeps its line from one update to the next. The PR comment lists a table's shards, and a rollout's targets, the same way. The order and the caps below live in `pkg/presentation/part_listing.go`.
 
-**Wide listings (>8 shards):** only the failed shards (up to 5, then "... N more failed shards") and the 3 slowest copying shards (then "... N more copying shards") are named. The heading already counts every state, so the listing does not repeat the rest.
+**Wide listings (>8 shards):** only the failed shards (up to 5, then "... N more failed shards"), the 3 slowest copying shards (then "... N more copying shards"), and the first 3 shards working past the copy (then "... N more shards past copying") are named. The heading already counts every state, so the listing does not repeat the rest.
 
-**Copying order:** copying shards are listed furthest behind first. A shard that has not reported progress yet is not known to be behind, so it follows the shards that have reported.
+**Copying order in wide listings:** copying shards are listed furthest behind first. A shard that has not reported progress yet is not known to be behind, so it follows the shards that have reported.
 
 **Comment size:** the shard lines share the PR comment's size limit with the DDL. The DDL is cut first; when the comment would not fit even with the DDL cut to nothing, each table keeps its heading line and drops the line per shard.
 
