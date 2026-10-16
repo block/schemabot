@@ -3425,7 +3425,7 @@ func (s *Service) ExecuteRollbackPlanForApply(ctx context.Context, apply *storag
 }
 
 // refuseMultiTargetRollback refuses a rollback of an apply in an environment
-// with more than one target. Rollback is not supported yet across multiple
+// with more than one target. Rollback is not currently supported across multiple
 // targets: a rollback is one plan, made against the target the apply ran its
 // plan from (RV-9), and a rollout of several targets either runs each from a
 // plan of its own or reaches targets that plan was never made against. The
@@ -3522,11 +3522,11 @@ func (s *Service) targetsApplyRanOn(ctx context.Context, apply *storage.Apply, a
 // multiTargetRollbackReason is the refusal's message for callers that pass it
 // on as text, such as the CLI.
 func multiTargetRollbackReason(apply *storage.Apply) string {
-	return fmt.Sprintf("rollback isn't supported for schema changes across multiple targets yet; undo apply %s by applying schema files without the change", apply.ApplyIdentifier)
+	return fmt.Sprintf("rollback isn't currently supported for schema changes across multiple targets; undo apply %s by applying schema files without the change", apply.ApplyIdentifier)
 }
 
 // RolloutRollbackUnsupportedError is a rollback refused because the apply's
-// environment has more than one target, and rollback is not supported yet for
+// environment has more than one target, and rollback is not currently supported for
 // multiple targets. A caller that can name the remedy in its own terms, such
 // as a PR whose schema files can be reverted and applied again, reads it with
 // errors.As instead of passing the message on.

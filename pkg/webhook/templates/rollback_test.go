@@ -490,7 +490,7 @@ func TestRenderRollbackOfRolloutUnsupported(t *testing.T) {
 		PR:             PRStateOpen,
 	}
 	assert.Equal(t, "## Rollback Not Supported — Staging\n\n"+
-		"Rollback isn't supported for schema changes across multiple targets yet.\n\n"+
+		"Rollback isn't currently supported for schema changes across multiple targets.\n\n"+
 		"To undo `apply-a1b2c3d4e5f6`, revert the change in this PR's schema files and add or toggle a `# nonce` comment line in the database's `schemabot.yaml` so the directory is still planned. Push, then run:\n"+
 		"```\nschemabot apply -e staging\n```\n", RenderRollbackOfRolloutUnsupported(data))
 

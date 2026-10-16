@@ -254,7 +254,7 @@ type RollbackOfRolloutUnsupportedData struct {
 
 // RenderRollbackOfRolloutUnsupported renders the message posted when a
 // rollback is refused because the apply's environment has more than one
-// target, and rollback is not supported yet for multiple targets. What undoes
+// target, and rollback is not currently supported for multiple targets. What undoes
 // the change on every target is an apply of schema files without it, and where
 // those files can be applied from depends on the PR: an open PR reverts the
 // change itself, a merged one needs a PR that reverts it, and a closed one
@@ -264,7 +264,7 @@ type RollbackOfRolloutUnsupportedData struct {
 func RenderRollbackOfRolloutUnsupported(data RollbackOfRolloutUnsupportedData) string {
 	var sb strings.Builder
 	writeEnvironmentTitle(&sb, "Rollback Not Supported", data.Environment)
-	sb.WriteString("Rollback isn't supported for schema changes across multiple targets yet.\n\n")
+	sb.WriteString("Rollback isn't currently supported for schema changes across multiple targets.\n\n")
 
 	switch {
 	case data.RoutingChecked && len(data.Unrouted) > 0:

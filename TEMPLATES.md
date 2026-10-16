@@ -7057,7 +7057,7 @@ ALTER TABLE `users` DROP INDEX `idx_email`;
 
 ## Rollback Not Supported — Staging
 
-Rollback isn't supported for schema changes across multiple targets yet.
+Rollback isn't currently supported for schema changes across multiple targets.
 
 To undo `apply-a1b2c3d4e5f6`, revert the change in this PR's schema files and add or toggle a `# nonce` comment line in the database's `schemabot.yaml` so the directory is still planned. Push, then run:
 ```

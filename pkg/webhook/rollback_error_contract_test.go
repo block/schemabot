@@ -829,7 +829,7 @@ func TestRollbackCommandCoreTerminalDispositions(t *testing.T) {
 		assert.Contains(t, body, "rollback DDL rejected by engine")
 	})
 
-	// The apply ran across multiple targets, and rollback is not supported yet
+	// The apply ran across multiple targets, and rollback is not currently supported
 	// for multiple targets. The refusal is the
 	// command's answer, and in a PR it names the remedy the PR already holds:
 	// revert its schema files and apply again.
@@ -885,7 +885,7 @@ func TestRollbackCommandCoreTerminalDispositions(t *testing.T) {
 			assert.Equal(t, 1, lockStore.releaseCalls, "the command-acquired lock must be released after the refusal")
 			body := requireComment(t, comments, "rollout rollback refusal comment")
 			assert.Contains(t, body, "## Rollback Not Supported — Staging")
-			assert.Contains(t, body, "Rollback isn't supported for schema changes across multiple targets yet.\n\n")
+			assert.Contains(t, body, "Rollback isn't currently supported for schema changes across multiple targets.\n\n")
 			assert.Contains(t, body, tc.wantText)
 			assert.Contains(t, body, "```\nschemabot apply -e staging\n```")
 			assert.NotContains(t, body, "Rollback Failed")

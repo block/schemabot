@@ -548,7 +548,7 @@ func workOperations(applyID int64, members ...routing.ExecutionTarget) []*storag
 	return ops
 }
 
-// Rollback is not supported yet for multiple targets: a rollback is one plan
+// Rollback is not currently supported for multiple targets: a rollback is one plan
 // made against the target the apply ran its plan from, and an environment of
 // several targets either runs each from a plan of its own or reaches targets
 // that plan was never made against. Every rollback that would touch more than
@@ -577,7 +577,7 @@ func TestExecuteRollbackPlan_RefusedForAnyMultiTargetRollout(t *testing.T) {
 		}
 		return EnvironmentConfig{Deployments: deployments, DeploymentOrder: order}
 	}
-	const notSupported = "rollback isn't supported for schema changes across multiple targets yet; undo apply apply-rollout by applying schema files without the change"
+	const notSupported = "rollback isn't currently supported for schema changes across multiple targets; undo apply apply-rollout by applying schema files without the change"
 	sharded := workOperations(apply.ID, primary, primary)
 	sharded[0].OperationKey, sharded[1].OperationKey = storage.TargetOperationKey("payments-001", "-80"), storage.TargetOperationKey("payments-001", "80-")
 	sharded = append(sharded, &storage.ApplyOperation{ID: 9, ApplyID: apply.ID, Deployment: DefaultDeployment, OperationKind: storage.ApplyOperationKindGroupFinalizer})
