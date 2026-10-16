@@ -3,6 +3,7 @@ package planetscale
 import (
 	"context"
 	"errors"
+	"io"
 	"log/slog"
 	"os"
 	"strings"
@@ -340,6 +341,104 @@ func TestDeployDeployRequest_ApprovalRequirementFailsImmediately(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "Require administrator approval")
 	assert.Equal(t, 1, client.deployCalls)
+}
+
+// deployOutcomeUnknownClient fails every deploy call with deployErr and serves
+// a fixed deploy request (or getErr) on the re-read, so tests can drive a
+// deploy call whose failure does not say whether PlanetScale started it.
+type deployOutcomeUnknownClient struct {
+	psclient.PSClient
+	deployErr   error
+	reread      *ps.DeployRequest
+	getErr      error
+	deployCalls int
+	getCalls    int
+}
+
+func (c *deployOutcomeUnknownClient) DeployDeployRequest(context.Context, *ps.PerformDeployRequest) (*ps.DeployRequest, error) {
+	c.deployCalls++
+	return nil, c.deployErr
+}
+
+func (c *deployOutcomeUnknownClient) GetDeployRequest(context.Context, *ps.GetDeployRequestRequest) (*ps.DeployRequest, error) {
+	c.getCalls++
+	return c.reread, c.getErr
+}
+
+// PlanetScale accepts the deploy but the connection drops before the response
+// arrives. The re-read shows the deploy queued, so the deploy is tracked as
+// started instead of failing the apply while the schema change runs.
+func TestDeployDeployRequest_LostResponseAdoptsStartedDeploy(t *testing.T) {
+	e := New(slog.New(slog.NewTextHandler(os.Stdout, nil)))
+	client := &deployOutcomeUnknownClient{
+		deployErr: io.ErrUnexpectedEOF,
+		reread:    &ps.DeployRequest{Number: 7, DeploymentState: deployState.Queued},
+	}
+
+	dr, err := e.deployDeployRequest(t.Context(), client, "org", "testdb", 7, false, nil)
+
+	require.NoError(t, err)
+	require.NotNil(t, dr)
+	assert.Equal(t, uint64(7), dr.Number)
+	assert.Equal(t, deployState.Queued, dr.DeploymentState)
+	assert.Equal(t, 1, client.deployCalls)
+	assert.Equal(t, 1, client.getCalls)
+}
+
+// A deploy call that fails while the re-read shows the deploy request still
+// ready to deploy proves PlanetScale did not start it, so the deploy error is
+// returned unchanged.
+func TestDeployDeployRequest_FailedDeployNotStartedReturnsError(t *testing.T) {
+	e := New(slog.New(slog.NewTextHandler(os.Stdout, nil)))
+	client := &deployOutcomeUnknownClient{
+		deployErr: io.ErrUnexpectedEOF,
+		reread:    &ps.DeployRequest{Number: 8, DeploymentState: deployState.Ready},
+	}
+
+	dr, err := e.deployDeployRequest(t.Context(), client, "org", "testdb", 8, false, nil)
+
+	require.Error(t, err)
+	assert.Nil(t, dr)
+	assert.ErrorIs(t, err, io.ErrUnexpectedEOF)
+	assert.Contains(t, err.Error(), "deploy deploy request #8")
+	assert.Equal(t, 1, client.getCalls)
+}
+
+// When the re-read also fails nothing proves the deploy did not start, so the
+// deploy fails with both errors attached rather than either one alone.
+func TestDeployDeployRequest_FailedRereadReturnsBothErrors(t *testing.T) {
+	e := New(slog.New(slog.NewTextHandler(os.Stdout, nil)))
+	rereadErr := errors.New("connection reset by peer")
+	client := &deployOutcomeUnknownClient{deployErr: io.ErrUnexpectedEOF, getErr: rereadErr}
+
+	dr, err := e.deployDeployRequest(t.Context(), client, "org", "testdb", 9, false, nil)
+
+	require.Error(t, err)
+	assert.Nil(t, dr)
+	assert.ErrorIs(t, err, io.ErrUnexpectedEOF)
+	assert.ErrorIs(t, err, rereadErr)
+	assert.Contains(t, err.Error(), "re-reading deploy request #9")
+}
+
+// Every retry of a transient deploy error fails, but an earlier attempt
+// reached PlanetScale and started the deploy. The re-read after the retry
+// budget runs out tracks the running deploy instead of failing the apply.
+func TestDeployDeployRequest_RetriesExhaustedAdoptsStartedDeploy(t *testing.T) {
+	shortenKeyspaceRetries(t, time.Millisecond, time.Second)
+	e := New(slog.New(slog.NewTextHandler(os.Stdout, nil)))
+	deployedAt := time.Date(2026, 10, 15, 12, 0, 0, 0, time.UTC)
+	client := &deployOutcomeUnknownClient{
+		deployErr: &ps.Error{Code: ps.ErrInternal},
+		reread:    &ps.DeployRequest{Number: 10, DeploymentState: deployState.InProgress, DeployedAt: &deployedAt},
+	}
+
+	dr, err := e.deployDeployRequest(t.Context(), client, "org", "testdb", 10, false, nil)
+
+	require.NoError(t, err)
+	require.NotNil(t, dr)
+	assert.Equal(t, deployState.InProgress, dr.DeploymentState)
+	assert.Equal(t, maxRetries, client.deployCalls)
+	assert.Equal(t, 1, client.getCalls)
 }
 
 // resumeDeployClient returns a fixed deploy request on Get and records whether a

@@ -999,7 +999,8 @@ func (e *Engine) deployDeployRequest(ctx context.Context, client psclient.PSClie
 		case isRetryablePSError(err):
 			transientAttempts++
 			if transientAttempts >= maxRetries {
-				return nil, fmt.Errorf("deploy deploy request #%d (after %d attempts): %w", number, maxRetries, err)
+				return e.adoptDeployAfterError(ctx, client, org, database, number,
+					fmt.Errorf("deploy deploy request #%d (after %d attempts): %w", number, maxRetries, err))
 			}
 			delay := retryDelay(transientAttempts, err)
 			e.logger.Warn("retrying deploy request",
@@ -1010,9 +1011,46 @@ func (e *Engine) deployDeployRequest(ctx context.Context, client psclient.PSClie
 			case <-time.After(delay):
 			}
 		default:
-			return nil, fmt.Errorf("deploy deploy request #%d: %w", number, err)
+			return e.adoptDeployAfterError(ctx, client, org, database, number,
+				fmt.Errorf("deploy deploy request #%d: %w", number, err))
 		}
 	}
+}
+
+// adoptDeployAfterError decides the outcome of a deploy call that failed with
+// an error which does not prove PlanetScale refused the deploy. A connection
+// that drops after the request was sent, or a retry PlanetScale rejects because
+// an earlier attempt already started the deploy, leaves the schema change
+// running remotely; failing the apply then would leave it running with nothing
+// tracking it. The deploy request is re-read, and when it reports that its
+// deploy began it is returned as accepted so the drive tracks it. Otherwise
+// deployErr is returned. A failed re-read returns deployErr with the re-read
+// error attached, because nothing proves the deploy did not start.
+func (e *Engine) adoptDeployAfterError(ctx context.Context, client psclient.PSClient, org, database string, number uint64, deployErr error) (*ps.DeployRequest, error) {
+	dr, getErr := client.GetDeployRequest(ctx, &ps.GetDeployRequestRequest{
+		Organization: org,
+		Database:     database,
+		Number:       number,
+	})
+	if getErr != nil {
+		e.logger.Warn("deploy call failed and re-reading the deploy request to check whether the deploy started also failed; failing the deploy",
+			"database", database, "deploy_request", number, "deploy_error", deployErr, "error", getErr)
+		return nil, fmt.Errorf("%w (re-reading deploy request #%d to check whether the deploy started also failed: %w)", deployErr, number, getErr)
+	}
+	if dr == nil {
+		e.logger.Warn("deploy call failed and re-reading the deploy request returned nothing; failing the deploy",
+			"database", database, "deploy_request", number, "deploy_error", deployErr)
+		return nil, fmt.Errorf("%w (re-reading deploy request #%d to check whether the deploy started returned no deploy request)", deployErr, number)
+	}
+	if !deployRequestReportsDeploy(dr) {
+		e.logger.Info("deploy call failed and the deploy request reports no deploy; failing the deploy",
+			"database", database, "deploy_request", number, "deployment_state", dr.DeploymentState, "error", deployErr)
+		return nil, deployErr
+	}
+	e.logger.Warn("deploy call failed but the deploy request reports its deploy began; tracking it as deployed",
+		"database", database, "deploy_request", number, "deployment_state", dr.DeploymentState,
+		"deployed_at", formatDeployedAt(dr.DeployedAt), "error", deployErr)
+	return dr, nil
 }
 
 // waitForDeployRequestPending polls a deploy request until PlanetScale finishes

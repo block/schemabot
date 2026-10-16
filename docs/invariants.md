@@ -253,7 +253,10 @@ in the grouped drive (`pkg/tern/local_apply_grouped.go`), with `outcomeWriteLand
 that returned an error, the resume's refusal to record a failure over an outcome it already stored
 (the no-remaining-work branches of `resumeApplyWithTasks` and `launchAtomicResume` return a
 `postTerminalReconcileError` that `handleGroupedResumeFailure` passes through,
-`pkg/tern/local_control_resume.go`) and the remote progress error limit (`pkg/tern/grpc_client.go`).
+`pkg/tern/local_control_resume.go`), the remote progress error limit (`pkg/tern/grpc_client.go`)
+and the PlanetScale engine's re-read of a deploy request whose deploy call failed, which tracks a
+deploy that started instead of failing it (`adoptDeployAfterError`,
+`pkg/engine/planetscale/branch.go`).
 
 ### AV-5: Panics are contained and permanent
 
