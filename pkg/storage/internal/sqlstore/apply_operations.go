@@ -190,9 +190,11 @@ func (s *applyOperationStore) ListByApplies(ctx context.Context, applyIDs []int6
 }
 
 // ListRecentTargets returns each distinct (database, environment, target) an
-// apply of databaseType ran an operation against, among applies created within
-// lookback of the storage database's clock. The cutoff is computed by the
-// database so it is compared against created_at in the same clock and time
+// apply of databaseType ran an operation against, among applies last written
+// within lookback of the storage database's clock. Every write to an apply,
+// its settlement included, stamps updated_at, so an apply created long ago
+// that settled recently counts as recent. The cutoff is computed by the
+// database so it is compared against updated_at in the same clock and time
 // zone the row was stamped with.
 func (s *applyOperationStore) ListRecentTargets(ctx context.Context, databaseType string, lookback time.Duration) ([]storage.AppliedTarget, error) {
 	// The cutoff is rendered in whole microseconds, so a shorter lookback
@@ -222,7 +224,7 @@ func (s *applyOperationStore) ListRecentTargets(ctx context.Context, databaseTyp
 		JOIN applies a ON a.id = ao.apply_id
 		WHERE a.database_type = ?
 			AND ao.target <> ''
-			AND a.created_at >= `+cutoff+`
+			AND a.updated_at >= `+cutoff+`
 		ORDER BY database_name, environment, target`, databaseType)
 	if err != nil {
 		return nil, fmt.Errorf("query recent %s apply targets within %s: %w", databaseType, lookback, err)

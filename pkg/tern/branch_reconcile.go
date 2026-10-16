@@ -327,10 +327,11 @@ func (c *LocalClient) reclaimBranch(ctx context.Context, target *planetScalePull
 }
 
 // RecentTargetWindow is how far past the grace period a data plane looks back
-// for the PlanetScale targets it applied to. A branch is judged only once it is
-// older than the grace period, and its apply was created before it, so the
-// target stays listed for this long after the branch first becomes reclaimable:
-// a month of hourly passes to reclaim it.
+// for the PlanetScale targets it applied to, measured from each apply's last
+// write. A branch is orphaned no later than its apply settles, and settling
+// writes the apply, so the target stays listed for at least this long after
+// the branch first becomes reclaimable: a month of hourly passes to reclaim
+// it.
 const RecentTargetWindow = 30 * 24 * time.Hour
 
 // RecentTargetsReconcileResult counts what one TargetRouter pass did.
@@ -342,8 +343,8 @@ type RecentTargetsReconcileResult struct {
 }
 
 // ReconcileRecentTargetBranches runs LocalClient.ReconcileOrphanedBranches on
-// every PlanetScale target this data plane applied to within the grace period
-// plus RecentTargetWindow.
+// every PlanetScale target this data plane's applies were written for within
+// the grace period plus RecentTargetWindow.
 //
 // A data plane that resolves targets per request has no static list of
 // databases, so the targets come from its own storage: each distinct
