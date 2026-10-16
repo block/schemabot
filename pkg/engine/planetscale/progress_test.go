@@ -160,6 +160,63 @@ func TestProgress_ClosedUndeployedDeployRequestIsCancelled(t *testing.T) {
 	}
 }
 
+// PlanetScale accepts a cancel by moving the deploy request to
+// in_progress_cancel, and the cancel can still fail to land: the deploy then
+// ends in complete_error rather than complete_cancel. Progress must keep the
+// in-flight cancel non-terminal so the drive keeps polling, and report only the
+// outcome the deploy request settles on — failed for an unconfirmed cancel,
+// cancelled for a confirmed one.
+func TestProgress_InFlightCancelReportsTheSettledOutcome(t *testing.T) {
+	tests := []struct {
+		name         string
+		settledState string
+		wantState    engine.State
+		wantMessage  string
+	}{
+		{name: "cancel the engine never confirmed", settledState: deployState.CompleteError, wantState: engine.StateFailed, wantMessage: "Deployment failed"},
+		{name: "cancel the engine confirmed", settledState: deployState.CompleteCancel, wantState: engine.StateCancelled, wantMessage: "Deployment cancelled"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			deployedAt := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+			client := &resumeDeployClient{recovered: &ps.DeployRequest{
+				State:           "open",
+				DeploymentState: deployState.InProgressCancel,
+				DeployedAt:      &deployedAt,
+			}}
+			e := NewWithClient(slog.New(slog.NewTextHandler(os.Stdout, nil)),
+				func(_, _ string) (psclient.PSClient, error) { return client, nil })
+
+			encoded, err := encodePSMetadata(&psMetadata{BranchName: "schemabot-testdb-cancel", DeployRequestID: 72})
+			require.NoError(t, err)
+			req := &engine.ProgressRequest{
+				Database:    "testdb",
+				ResumeState: &engine.ResumeState{Metadata: encoded},
+				Credentials: &engine.Credentials{Metadata: map[string]string{
+					"organization": "org",
+					"token_name":   "token",
+					"token_value":  "secret",
+				}},
+			}
+
+			inFlight, err := e.Progress(t.Context(), req)
+			require.NoError(t, err)
+			require.NotNil(t, inFlight)
+			assert.False(t, inFlight.State.IsTerminal(), "an unconfirmed cancel must not settle the apply; got %s", inFlight.State)
+			assert.Equal(t, "Cancelling deploy...", inFlight.Message)
+
+			client.recovered.DeploymentState = tt.settledState
+			client.recovered.State = deployRequestClosed
+
+			settled, err := e.Progress(t.Context(), req)
+			require.NoError(t, err)
+			require.NotNil(t, settled)
+			assert.Equal(t, tt.wantState, settled.State)
+			assert.Equal(t, tt.wantMessage, settled.Message)
+		})
+	}
+}
+
 func TestAggregateShardProgress(t *testing.T) {
 	t.Run("two shards one table", func(t *testing.T) {
 		rows := []vitessMigrationRow{

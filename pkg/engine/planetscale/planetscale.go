@@ -42,7 +42,8 @@
 //	             in_progress_vschema, in_progress_cutover
 //	Complete:    complete, complete_pending_revert
 //	Error:       complete_error, error, failed
-//	Cancelled:   in_progress_cancel, complete_cancel, cancelled
+//	Cancelling:  in_progress_cancel
+//	Cancelled:   complete_cancel, cancelled
 //	Revert:      in_progress_revert, in_progress_revert_vschema,
 //	             complete_revert, complete_revert_error
 //
@@ -63,7 +64,7 @@
 //	complete_pending_revert   → StateRevertWindow         Deployment complete (revert available)
 //	complete_error, error     → StateFailed               Deployment failed
 //	failed                    → StateFailed               Deployment failed
-//	in_progress_cancel        → StateCancelled            Cancelling deploy...
+//	in_progress_cancel        → StateRunning              Cancelling deploy...
 //	cancelled, complete_cancel→ StateCancelled            Deployment cancelled
 //	in_progress_revert        → StateRunning              Revert in progress...
 //	in_progress_revert_vschema→ StateRunning              Reverting VSchema changes
@@ -842,7 +843,11 @@ func deployStateToEngineState(drState string) engine.State {
 	case deployState.CompleteError, deployState.Error, deployState.Failed, deployState.CompleteRevertError:
 		return engine.StateFailed
 	case deployState.InProgressCancel:
-		return engine.StateCancelled
+		// PlanetScale has accepted the cancel but not confirmed it, and an
+		// unconfirmed cancel can still end the deploy in complete_error. The
+		// deploy request is still in motion, so it reads as running until it
+		// settles on cancelled or failed.
+		return engine.StateRunning
 	case deployState.CompleteCancel, deployState.Cancelled:
 		return engine.StateCancelled
 	case deployState.InProgressRevert, deployState.InProgressRevertVSchema:
