@@ -743,7 +743,7 @@ func memberTargetName(d presentation.Deployment) string {
 func FormatRolloutFooter(v RolloutView) string {
 	var b strings.Builder
 	applyCommand := func(verb string) string {
-		return fmt.Sprintf("%s %s %s -e %s", cliname.Name(), verb, v.ApplyID, v.Environment)
+		return cliname.Command(verb, v.ApplyID, "-e", v.Environment)
 	}
 	next := v.Model.NextAction
 	switch next.Kind {
@@ -765,7 +765,7 @@ func FormatRolloutFooter(v RolloutView) string {
 		// operator fills it in. Until the apply is terminal the fresh apply
 		// is refused, so stop is offered below instead.
 		if v.Model.OffersRetry() {
-			writeRolloutCommand(&b, presentation.RetryLabel, fmt.Sprintf("%s apply -s <schema_dir> -e %s", cliname.Name(), v.Environment))
+			writeRolloutCommand(&b, presentation.RetryLabel, cliname.Command("apply", "-s", "<schema_dir>", "-e", v.Environment))
 		}
 	case presentation.NextActionNone:
 	}

@@ -1,0 +1,192 @@
+package commands
+
+import (
+	"bytes"
+	"log/slog"
+	"os/exec"
+	"strings"
+	"testing"
+
+	"github.com/alecthomas/kong"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/block/schemabot/pkg/cmd/cliname"
+	"github.com/block/schemabot/pkg/cmd/internal/templates"
+	"github.com/block/schemabot/pkg/state"
+)
+
+// recordRoute records g's routing flags the way main does after parsing, and
+// clears them when the test ends so later tests render unrouted hints.
+func recordRoute(t *testing.T, g Globals) {
+	t.Helper()
+	cliname.SetRoute(g.RouteFlags()...)
+	t.Cleanup(func() { cliname.SetRoute() })
+}
+
+// An operator interrupts a log watch of a production apply started with an
+// explicit profile and endpoint. The resume hint names the environment and
+// both routing flags, so pasting it reaches the same control plane rather
+// than one a wrapper picks for an omitted environment. A watch started with
+// no routing flags keeps the short form.
+func TestResumeWatchHint_CarriesRouting(t *testing.T) {
+	t.Run("default invocation stays short", func(t *testing.T) {
+		recordRoute(t, Globals{})
+		assert.Equal(t, "watch it again with 'schemabot progress apply-7c2e'", resumeWatchHint("apply-7c2e", ""))
+	})
+
+	t.Run("production watch names the environment", func(t *testing.T) {
+		recordRoute(t, Globals{})
+		assert.Equal(t, "watch it again with 'schemabot progress apply-7c2e -e production'", resumeWatchHint("apply-7c2e", "production"))
+	})
+
+	t.Run("profile and endpoint are carried", func(t *testing.T) {
+		recordRoute(t, Globals{Profile: "prod", Endpoint: "https://schemabot.example/api"})
+		assert.Equal(t,
+			"watch it again with 'schemabot progress apply-7c2e -e production --profile prod --endpoint https://schemabot.example/api'",
+			resumeWatchHint("apply-7c2e", "production"))
+	})
+
+	t.Run("stopped notice carries the same hint", func(t *testing.T) {
+		recordRoute(t, Globals{Profile: "prod"})
+		assert.Equal(t,
+			"Stopped watching apply apply-7c2e; stopping the watch does not affect the apply; "+
+				"watch it again with 'schemabot progress apply-7c2e -e production --profile prod'",
+			progressStoppedMessage("apply-7c2e", "production"))
+	})
+}
+
+// The routing flags are printed, so they never carry the token, and the
+// endpoint loses any credentials, query, or fragment it was given.
+func TestGlobalsRouteFlags_NeverPrintsSecrets(t *testing.T) {
+	g := Globals{
+		Profile:  "prod",
+		Endpoint: "https://ops:hunter2@schemabot.example/api?token=abc123#frag",
+		Token:    "bearer-secret",
+	}
+
+	flags := g.RouteFlags()
+
+	assert.Equal(t, []cliname.Flag{
+		{Name: "--profile", Value: "prod"},
+		{Name: "--endpoint", Value: "https://schemabot.example/api"},
+	}, flags)
+	for _, flag := range flags {
+		for _, secret := range []string{"hunter2", "ops:", "abc123", "bearer-secret", "frag"} {
+			assert.NotContains(t, flag.Value, secret)
+		}
+	}
+	assert.Empty(t, (&Globals{Token: "bearer-secret"}).RouteFlags(), "a token alone selects no route")
+}
+
+// An endpoint that does not parse is left out of the hints, and the debug
+// line saying so does not quote it: the credentials it carries never reach a
+// log either.
+func TestGlobalsRouteFlags_UnparseableEndpointNeverLogged(t *testing.T) {
+	var logs bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+
+	g := Globals{Endpoint: "https://demo:example-password@example.invalid/%zz?token=example-token"}
+
+	assert.Empty(t, g.RouteFlags())
+	assert.Contains(t, logs.String(), "leaving an unparseable endpoint out of command hints")
+	for _, secret := range []string{"example-password", "example-token", "demo:", "example.invalid"} {
+		assert.NotContains(t, logs.String(), secret)
+	}
+}
+
+// The hint is only right if pasting it selects what the original command
+// selected. Each case records a route, hands the rendered command to a real
+// shell, and parses the words the shell produced back through kong. The
+// values include ones a shell or the flag parser would mangle unescaped: a
+// hyphen-leading profile, which kong would read as another flag, and profiles
+// with a space or a "!".
+func TestResumeWatchHint_ParsesBackToTheSameRoute(t *testing.T) {
+	for _, g := range []Globals{
+		{Profile: "prod", Endpoint: "https://schemabot.example"},
+		{Profile: "-prod"},
+		{Profile: "prod!cluster"},
+		{Profile: "west cluster"},
+	} {
+		t.Run(g.Profile, func(t *testing.T) {
+			recordRoute(t, g)
+			pasted := pastedResumeCommand("apply-7c2e", "production")
+
+			out, err := exec.CommandContext(t.Context(), "/bin/sh", "-c", `printf '%s\0' `+pasted).Output()
+			require.NoError(t, err)
+			words := strings.Split(strings.TrimSuffix(string(out), "\x00"), "\x00")
+			require.Equal(t, "schemabot", words[0])
+
+			var cli struct {
+				Globals
+				Progress ProgressCmd `cmd:""`
+			}
+			parser, err := kong.New(&cli, kong.Name("schemabot"))
+			require.NoError(t, err)
+			_, err = parser.Parse(words[1:])
+			require.NoError(t, err, "the hint %q must parse", pasted)
+
+			assert.Equal(t, "apply-7c2e", cli.Progress.ApplyID)
+			assert.Equal(t, "production", cli.Progress.Environment)
+			assert.Equal(t, g.Profile, cli.Profile)
+			assert.Equal(t, g.Endpoint, cli.Endpoint)
+		})
+	}
+}
+
+// pastedResumeCommand extracts the command from the resume hint,
+// so the round-trip test checks the text the operator actually copies.
+func pastedResumeCommand(applyID, environment string) string {
+	hint := resumeWatchHint(applyID, environment)
+	return strings.TrimSuffix(strings.TrimPrefix(hint, "watch it again with '"), "'")
+}
+
+// An operator detaches from the interactive watch of a production apply. The
+// reattach line names the environment, matching the stop line beside it.
+func TestDetachedView_ReattachNamesEnvironment(t *testing.T) {
+	recordRoute(t, Globals{Profile: "prod"})
+	model := NewWatchModel("http://schemabot.test", "orders", "production", true)
+	model.applyID = "apply-7c2e"
+
+	view := model.detachedView()
+
+	assert.Contains(t, view, "To reattach: schemabot progress apply-7c2e -e production --profile prod\n")
+	assert.Contains(t, view, "To stop:     schemabot stop -e production apply-7c2e --profile prod\n")
+}
+
+// An operator watching a production apply through an explicit profile sees
+// it stop or wait for cutover. Each command the footer offers carries the
+// profile, so pasting it acts on the apply on that control plane.
+func TestWatchFooter_ControlHintsCarryRouting(t *testing.T) {
+	recordRoute(t, Globals{Profile: "prod"})
+	render := func(applyState, taskState string) string {
+		m := NewWatchModel("http://schemabot.test", "orders", "production", false)
+		m.applyID = "apply-7c2e"
+		updated, _ := m.Update(progressMsg{
+			state:  applyState,
+			tables: []templates.TableProgress{{TableName: "users", Status: taskState, PercentComplete: 40}},
+		})
+		return updated.(WatchModel).View()
+	}
+
+	assert.Contains(t, render(state.Apply.Stopped, state.Task.Stopped), "Use 'schemabot start -e production apply-7c2e --profile prod' to resume.\n")
+	assert.Contains(t, render(state.Apply.WaitingForCutover, state.Task.WaitingForCutover), "To proceed: schemabot cutover -e production apply-7c2e --profile prod\n")
+
+	m := NewWatchModel("http://schemabot.test", "orders", "production", false)
+	m.applyID = "apply-7c2e"
+	assert.Equal(t, "  schemabot status apply-7c2e -e production --profile prod", m.statusCommand())
+}
+
+// Stopping an apply through an explicit endpoint prints a resume command that
+// returns to the server holding the checkpoint.
+func TestStopSuccess_ResumeHintCarriesRouting(t *testing.T) {
+	recordRoute(t, Globals{Endpoint: "https://schemabot.example/api"})
+
+	out := captureStdout(func() {
+		templates.WriteStopSuccess(templates.StopData{Database: "orders", Environment: "production", ApplyID: "apply-7c2e"})
+	})
+
+	assert.Contains(t, out, "Use 'schemabot start -e production apply-7c2e --endpoint https://schemabot.example/api' to resume.")
+}
