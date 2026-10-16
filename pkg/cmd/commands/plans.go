@@ -101,12 +101,12 @@ func (cmd *PlansCmd) Run(g *Globals) error {
 		})
 	}
 	data := templates.PlansListData{
-		Limit:     result.Limit,
-		MaxLimit:  result.MaxLimit,
-		HasMore:   result.HasMore,
-		Last:      cmd.Last,
-		Continued: cmd.After != "",
-		Plans:     rows,
+		Limit:    result.Limit,
+		MaxLimit: result.MaxLimit,
+		HasMore:  result.HasMore,
+		Last:     cmd.Last,
+		After:    cmd.After,
+		Plans:    rows,
 	}
 	templates.WritePlansList(data)
 	return nil

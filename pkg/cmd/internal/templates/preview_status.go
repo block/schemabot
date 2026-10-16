@@ -108,7 +108,7 @@ func previewStatusListOutput() {
 		Limit:       2,
 		MaxLimit:    2,
 		HasMore:     true,
-		Continued:   true,
+		After:       "apply_mno345",
 	})
 }
 

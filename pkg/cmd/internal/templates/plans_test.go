@@ -190,7 +190,15 @@ func TestWritePlansListTruncatedFooter(t *testing.T) {
 	assert.NotContains(t, atCap, "Use --limit")
 
 	data.Limit = 20
-	data.Continued = true
+	data.After = "plan-previous"
 	continued := captureStdout(t, func() { WritePlansList(data) })
 	assert.Contains(t, continued, "Showing 1 more plans. Add --after plan-1700000000000000001 for the next 20.")
+}
+
+// An empty page reached with --after means nothing is older than the plan it
+// continues from, not that nothing matches the filters.
+func TestWritePlansListEmptyContinuedPage(t *testing.T) {
+	output := captureStdout(t, func() { WritePlansList(PlansListData{Limit: 20, Last: "7d", After: "plan-oldest"}) })
+	assert.Contains(t, output, "No plans older than plan-oldest in the last 7d")
+	assert.NotContains(t, output, "No plans found")
 }

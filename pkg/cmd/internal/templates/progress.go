@@ -1101,9 +1101,10 @@ type StatusListData struct {
 	StateCounts    map[string]int
 	ShowExternalID bool
 	Deployment     string
-	// Continued marks a page reached with --after, past the first page.
-	Continued bool
-	Applies   []ActiveApplyData
+	// After is the --after apply this page continues from; empty on a first
+	// page.
+	After   string
+	Applies []ActiveApplyData
 	// Sectioned renders the default view: Active above the finished applies
 	// in Applies, which alone are paged by --limit and --after. Active is
 	// listed in full on a first page and omitted from a continued one.
@@ -1204,7 +1205,7 @@ func writeSectionedStatusList(data StatusListData) {
 		writeEmptyStatusList(data)
 		return
 	}
-	if !data.Continued {
+	if data.After == "" {
 		if len(data.Active) == 0 {
 			fmt.Printf("%sNo active schema changes%s%s\n", ANSIDim, ANSIReset, statusWindowSuffix(data))
 		} else {
@@ -1243,6 +1244,14 @@ func writeEmptyStatusList(data StatusListData) {
 	if parts := statusFilterPhrases(data); len(parts) > 0 {
 		filters = " " + strings.Join(parts, ", ")
 	}
+	if data.After != "" {
+		item := "schema changes"
+		if data.FailuresOnly {
+			item = "failed schema changes"
+		}
+		fmt.Printf("%sNo %s older than %s%s%s\n", ANSIDim, item, data.After, filters, ANSIReset)
+		return
+	}
 	if data.FailuresOnly {
 		fmt.Printf("%sNo recent failed schema changes%s%s\n", ANSIDim, filters, ANSIReset)
 	} else {
@@ -1261,7 +1270,7 @@ func writeStatusListTruncation(data StatusListData, item string) {
 		last = data.Applies[len(data.Applies)-1].ApplyID
 	}
 	switch {
-	case data.Continued && last != "":
+	case data.After != "" && last != "":
 		fmt.Printf("%sShowing %d more %s. Add --after %s for the next %d.%s\n", ANSIDim, len(data.Applies), item, last, data.Limit, ANSIReset)
 	case atCap && last != "":
 		fmt.Printf("%sShowing the %d most recent %s. Add --after %s for the next %d.%s\n", ANSIDim, data.Limit, item, last, data.Limit, ANSIReset)

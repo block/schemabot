@@ -40,9 +40,10 @@ type PlansListData struct {
 	HasMore  bool
 	// Last is the operator's creation-window filter, verbatim, for display.
 	Last string
-	// Continued marks a page reached with --after, past the first page.
-	Continued bool
-	Plans     []PlanSummaryData
+	// After is the --after plan this page continues from; empty on a first
+	// page.
+	After string
+	Plans []PlanSummaryData
 }
 
 // WritePlansList renders stored plans newest-first as a column table, in the
@@ -54,6 +55,10 @@ func WritePlansList(data PlansListData) {
 		window := ""
 		if data.Last != "" {
 			window = fmt.Sprintf(" in the last %s", data.Last)
+		}
+		if data.After != "" {
+			fmt.Printf("%sNo plans older than %s%s%s\n", ANSIDim, data.After, window, ANSIReset)
+			return
 		}
 		fmt.Printf("%sNo plans found%s%s\n", ANSIDim, window, ANSIReset)
 		return
@@ -115,7 +120,7 @@ func writePlansListTruncation(data PlansListData) {
 		last = data.Plans[len(data.Plans)-1].PlanID
 	}
 	switch {
-	case data.Continued && last != "":
+	case data.After != "" && last != "":
 		fmt.Printf("\n  %sShowing %d more plans. Add --after %s for the next %d.%s\n", ANSIDim, len(data.Plans), last, data.Limit, ANSIReset)
 	case atCap && last != "":
 		fmt.Printf("\n  %sShowing the %d most recent plans. Add --after %s for the next %d.%s\n", ANSIDim, data.Limit, last, data.Limit, ANSIReset)
