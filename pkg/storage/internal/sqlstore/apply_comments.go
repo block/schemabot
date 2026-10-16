@@ -14,7 +14,7 @@ import (
 )
 
 // applyCommentColumns lists all columns for SELECT queries.
-const applyCommentColumns = `id, apply_id, comment_state, github_comment_id, posted_phase, pending_freeze_github_comment_id, edit_count, last_edited_at, superseded_at, created_at, updated_at`
+const applyCommentColumns = `id, apply_id, comment_state, github_comment_id, posted_phase, posted_cutover_operation_id, pending_freeze_github_comment_id, edit_count, last_edited_at, superseded_at, created_at, updated_at`
 
 // applyCommentStore implements storage.ApplyCommentStore using MySQL.
 type applyCommentStore struct {
@@ -23,7 +23,7 @@ type applyCommentStore struct {
 }
 
 // applyCommentUpsertStatement renders Upsert's statement. Both renderings bind
-// the five inserted columns first; the leased rendering then binds the apply ID
+// the six inserted columns first; the leased rendering then binds the apply ID
 // and the lease token.
 //
 // The unleased rendering is a plain VALUES upsert. The leased rendering selects
@@ -35,26 +35,27 @@ type applyCommentStore struct {
 // statement's snapshot still holds, at whatever isolation level the storage
 // session runs.
 func applyCommentUpsertStatement(d Dialect, leased bool) string {
-	const insert = "INSERT INTO apply_comments (apply_id, comment_state, github_comment_id, posted_phase, pending_freeze_github_comment_id) "
+	const insert = "INSERT INTO apply_comments (apply_id, comment_state, github_comment_id, posted_phase, posted_cutover_operation_id, pending_freeze_github_comment_id) "
 	upsert := d.UpsertClause(
 		[]string{"apply_id", "comment_state"},
 		[]UpsertAssignment{
 			{Column: "github_comment_id"},
 			{Column: "posted_phase"},
+			{Column: "posted_cutover_operation_id"},
 			{Column: "pending_freeze_github_comment_id"},
 			{Column: "superseded_at", Expr: "NULL"},
 			{Column: "updated_at", Expr: "NOW()"},
 		},
 	)
 	if !leased {
-		return insert + "VALUES (?, ?, ?, ?, ?) " + upsert
+		return insert + "VALUES (?, ?, ?, ?, ?, ?) " + upsert
 	}
-	return insert + "SELECT ?, ?, ?, ?, ? FROM applies a WHERE a.id = ? AND " + d.LeaseSourceFence("applies", "a", "id", "lease_token") + " " + upsert
+	return insert + "SELECT ?, ?, ?, ?, ?, ? FROM applies a WHERE a.id = ? AND " + d.LeaseSourceFence("applies", "a", "id", "lease_token") + " " + upsert
 }
 
 // Upsert creates or updates a comment record.
 // On conflict (same apply_id + comment_state), updates the github_comment_id,
-// posted_phase, and pending_freeze_github_comment_id so the
+// posted_phase, posted_cutover_operation_id, and pending_freeze_github_comment_id so the
 // row always describes the currently tracked comment and the freeze it may
 // still owe. The conflict path also clears superseded_at (the row is live
 // again) and stamps updated_at: that column is the summary-claim freshness
@@ -67,12 +68,12 @@ func (s *applyCommentStore) Upsert(ctx context.Context, comment *storage.ApplyCo
 	}
 	if !hasLease {
 		_, err := s.db.ExecContext(ctx, applyCommentUpsertStatement(s.dialect, false),
-			comment.ApplyID, comment.CommentState, comment.GitHubCommentID, comment.PostedPhase, comment.PendingFreezeCommentID)
+			comment.ApplyID, comment.CommentState, comment.GitHubCommentID, comment.PostedPhase, comment.PostedCutoverOperationID, comment.PendingFreezeCommentID)
 		return err
 	}
 
 	result, err := s.db.ExecContext(ctx, applyCommentUpsertStatement(s.dialect, true),
-		comment.ApplyID, comment.CommentState, comment.GitHubCommentID, comment.PostedPhase, comment.PendingFreezeCommentID, comment.ApplyID, lease.Token)
+		comment.ApplyID, comment.CommentState, comment.GitHubCommentID, comment.PostedPhase, comment.PostedCutoverOperationID, comment.PendingFreezeCommentID, comment.ApplyID, lease.Token)
 	if err != nil {
 		return err
 	}
@@ -428,7 +429,7 @@ func scanApplyCommentInto(s scanner) (*storage.ApplyComment, error) {
 	var comment storage.ApplyComment
 	err := s.Scan(
 		&comment.ID, &comment.ApplyID, &comment.CommentState,
-		&comment.GitHubCommentID, &comment.PostedPhase, &comment.PendingFreezeCommentID, &comment.EditCount,
+		&comment.GitHubCommentID, &comment.PostedPhase, &comment.PostedCutoverOperationID, &comment.PendingFreezeCommentID, &comment.EditCount,
 		&comment.LastEditedAt, &comment.SupersededAt, &comment.CreatedAt, &comment.UpdatedAt,
 	)
 	if err != nil {
