@@ -1719,7 +1719,10 @@ func (c *LocalClient) cancelEngineForTasks(ctx context.Context, eng engine.Engin
 // The engine's own report decides: a progress probe scoped to the task shows
 // whether live work remains. Nothing running resolves to nil so the caller
 // proceeds to terminalize the tasks; live work — or any uncertainty about it
-// (a failed probe) — surfaces the original cancel error unchanged. Typed
+// (a failed probe) — surfaces the original cancel error unchanged. A provider
+// record showing the change already failed with no retry path resolves to a
+// settled-outcome refusal instead, so the failure is never relabelled
+// cancelled. Typed
 // rejections with their own resolution paths also surface unchanged: an
 // already-completed rejection has the caller reconcile stored state to the
 // completed outcome, while an unsupported-operation decline and a
@@ -1751,6 +1754,15 @@ func (c *LocalClient) resolveFailedEngineCancel(ctx context.Context, eng engine.
 		c.logger.Warn("engine cancel failed and the live-work probe also failed; the cancel error surfaces and the drive will retry rather than complete a cancel over unknown engine state",
 			append(task.LogAttrs(), "probe_error", probeErr, "error", cancelErr)...)
 		return fmt.Errorf("cancel engine for task %s: %w", task.TaskIdentifier, cancelErr)
+	}
+	// A provider that closed the change by failing it has settled on an outcome
+	// a cancel must not replace: the refusal resolves the durable request and
+	// the drive's next poll records the failure the provider reports.
+	if providerSettledChangeAsFailed(eng, progress) {
+		c.logger.Warn("engine cancel failed and the provider reports the schema change already failed with no retry path; the cancel is refused so the failure stands",
+			append(task.LogAttrs(), "engine_state", string(progress.State), "error", cancelErr)...)
+		return fmt.Errorf("cancel engine for task %s: %w", task.TaskIdentifier,
+			engine.NewSettledOutcomeError("cancel rejected: the schema change on database %s failed before the cancel arrived; the failure stands, plan and apply again to retry", c.config.Database))
 	}
 	if engineProgressShowsLiveWork(eng, progress) {
 		engineState := ""
@@ -1879,6 +1891,21 @@ func engineProgressShowsLiveWork(eng engine.Engine, progress *engine.ProgressRes
 		}
 	}
 	return progress.State != engine.StatePending
+}
+
+// providerSettledChangeAsFailed reports whether an externally authoritative
+// engine's probe shows the provider closed the change by failing it, with no
+// retry path left. An engine that executes in this process answers that
+// question itself when it refuses the control operation, so only the
+// provider's record is read here.
+func providerSettledChangeAsFailed(eng engine.Engine, progress *engine.ProgressResult) bool {
+	if progress == nil {
+		return false
+	}
+	if !engine.ProgressIsExternallyAuthoritative(eng) {
+		return false
+	}
+	return progress.State == engine.StateFailed && !progress.Retryable
 }
 
 // snapshotEngineProgress captures per-table progress from the engine after stopping.

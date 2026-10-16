@@ -1678,6 +1678,59 @@ func TestLocalClient_PendingControlResolvesSettledEngineFailure(t *testing.T) {
 	}
 }
 
+// A durable cancel reaches a PlanetScale deploy request that the provider has
+// already closed by failing it, with no retry path, before the drive's next
+// poll has recorded the failure. The provider rejects the cancel with a plain
+// error to keep the failed outcome visible. The drive resolves the request as
+// failed with a reason naming the failure and keeps going rather than standing
+// down: the task and apply are not recorded cancelled, and the drive's next
+// poll records the failure the provider reports.
+func TestLocalClient_PendingCancelKeepsProviderSettledFailure(t *testing.T) {
+	operationID := int64(99)
+	apply := &storage.Apply{
+		ID:              42,
+		ApplyIdentifier: "apply-vitess-pending-cancel-failed",
+		State:           state.Apply.Running,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeVitess,
+	}
+	task := &storage.Task{
+		ID:               7,
+		ApplyID:          apply.ID,
+		ApplyOperationID: &operationID,
+		TaskIdentifier:   "task-vitess-pending-cancel-failed",
+		State:            state.Task.Running,
+	}
+	resumeState := &storage.EngineResumeState{
+		ApplyOperationID: operationID,
+		MigrationContext: "ctx-vitess-cancel",
+		Metadata:         `{"deploy_request_id":321}`,
+	}
+	controlRequests := pendingControlRequestStore(apply.ID, storage.ControlOperationCancel)
+	eng := &externallyAuthoritativeCaptureEngine{controlCaptureEngine: controlCaptureEngine{
+		cancelErr:      errors.New("cancel rejected: deploy request state complete_error"),
+		progressResult: &engine.ProgressResult{State: engine.StateFailed},
+	}}
+	client := newVitessControlTestClientWithRequests(apply, []*storage.Task{task}, resumeState, eng, controlRequests)
+
+	standDown, err := client.processPendingCancelControlRequest(t.Context(), apply)
+
+	require.NoError(t, err)
+	assert.False(t, standDown, "the drive must keep going and record the provider's failure, not an operator cancel")
+	require.NotNil(t, eng.cancelReq, "the cancel must reach the engine before the provider's record is read")
+	assert.Equal(t, state.Task.Running, task.State, "the task must not be recorded cancelled over a failed change")
+	assert.Equal(t, state.Apply.Running, apply.State, "the apply must be left for the drive's poll to record the failure")
+	pending, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationCancel)
+	require.NoError(t, err)
+	assert.Nil(t, pending, "the durable request must be resolved, not re-sent on every claim")
+	resolved, err := controlRequests.GetByOperation(t.Context(), apply.ID, storage.ControlOperationCancel)
+	require.NoError(t, err)
+	require.NotNil(t, resolved)
+	assert.Equal(t, storage.ControlRequestFailed, resolved.Status)
+	assert.Equal(t, "cancel rejected: the schema change on database testdb failed before the cancel arrived; the failure stands, plan and apply again to retry",
+		resolved.ErrorMessage, "the failed request must name the failure and how to recover")
+}
+
 // When the live-work probe itself fails, the engine's state is unknown:
 // completing the stop could record running work as stopped. The original stop
 // error surfaces so the drive retries with engine state intact.
