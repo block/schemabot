@@ -99,6 +99,10 @@ func (e *Engine) ReclaimCancelledResumeState(ctx context.Context, req *engine.Re
 	if req.Logger != nil {
 		logger = req.Logger
 	}
+	r := *req
+	r.Database = e.resolveDatabase(req.Credentials, req.Database)
+	req = &r
+
 	result := &engine.ReclaimResumeStateResult{}
 	if req.ResumeState == nil || req.ResumeState.Metadata == "" {
 		logger.Debug("cancelled apply persisted no engine state, so it holds no branch to reclaim",

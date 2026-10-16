@@ -592,22 +592,59 @@ func TestResumeApply_FailureAfterTheDeployRequestLeavesTheBranchToIt(t *testing.
 }
 
 // deployRequestReclaimClient serves the cancelled apply's stored deploy request
-// as dr, or fails the read with getErr, and records each read.
+// as dr, or fails the read with getErr, and records each read and delete.
 type deployRequestReclaimClient struct {
 	resumeReclaimClient
 	dr     *ps.DeployRequest
 	getErr error
 	reads  []uint64
+	// databases records the database each read and delete addressed.
+	databases []string
 }
 
 func (c *deployRequestReclaimClient) GetDeployRequest(_ context.Context, req *ps.GetDeployRequestRequest) (*ps.DeployRequest, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.reads = append(c.reads, req.Number)
+	c.databases = append(c.databases, "read "+req.Database)
 	if c.getErr != nil {
 		return nil, c.getErr
 	}
 	return c.dr, nil
+}
+
+func (c *deployRequestReclaimClient) DeleteBranch(ctx context.Context, req *ps.DeleteDatabaseBranchRequest) error {
+	c.mu.Lock()
+	c.databases = append(c.databases, "delete "+req.Database)
+	c.mu.Unlock()
+	return c.resumeReclaimClient.DeleteBranch(ctx, req)
+}
+
+// A database registered under an identifier other than its PlanetScale name
+// carries the PlanetScale name in its credential metadata. The reclaim reads
+// the deploy request and deletes the branch on the database as PlanetScale
+// knows it, so the branch is found and deleted rather than missed under the
+// registered identifier.
+func TestReclaimCancelledResumeState_ResolvesDatabaseName(t *testing.T) {
+	const ownedBranch = "schemabot-commerce-1a2b"
+	client := &deployRequestReclaimClient{
+		dr: &ps.DeployRequest{Number: 42, State: deployRequestClosed, DeploymentState: "ready"},
+	}
+	encoded, err := encodePSMetadata(&psMetadata{BranchName: ownedBranch, DeployRequestID: 42})
+	require.NoError(t, err)
+	creds := conformanceCredentials()
+	creds.Metadata["database"] = "commerce_main"
+
+	result, err := conformanceEngine(client).ReclaimCancelledResumeState(t.Context(), &engine.ReclaimResumeStateRequest{
+		Database:    "commerce",
+		Credentials: creds,
+		ResumeState: &engine.ResumeState{Metadata: encoded},
+	})
+
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	assert.Equal(t, []string{"read commerce_main", "delete commerce_main"}, client.databases)
+	assert.Equal(t, []string{"branch " + ownedBranch}, result.Reclaimed)
 }
 
 // A cancel of a deferred deploy closes its deploy request before the deploy
