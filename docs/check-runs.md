@@ -626,7 +626,10 @@ Review-time deployment drift is stored to survive a plan that did not
 re-evaluate it, but a plan that does re-evaluate the rollup lifts it once the
 deployments match, so it reads as a guard rather than as a reconciliation.
 Calling it a reconciliation would tell an operator that the one action that
-clears it does not.
+clears it does not. For the same reason a guard block stored on the aggregate
+row reads differently from one on a database's own row: every fold, a plan
+command's included, leaves it in place, so its remedy names a re-run of the
+check or a new commit, which re-verify the whole pull request, never a plan.
 
 The review-time rollup also shows each deployment's blocked change count. This
 is informational beside drift: blocked verdicts do not make matching change

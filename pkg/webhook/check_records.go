@@ -207,6 +207,11 @@ func (h *Handler) storeNamespacePlacementCheck(ctx context.Context, client *ghcl
 	return headSHA, err
 }
 
+// planFailedCheckSummary is the stored Change column for a plan that reported
+// errors and no change to summarize, so the aggregate's row for it points at
+// the plan comment that carries the errors instead of showing nothing.
+const planFailedCheckSummary = "plan failed; see the plan comment"
+
 // planFailedUnstoredSummary is the failing aggregate's summary when the failing
 // check for an environment that could not plan could not be stored either. The
 // aggregate then carries planFailedUnrecordedBlock, which a plan command does
@@ -216,12 +221,13 @@ const planFailedUnstoredSummary = "SchemaBot could not plan this environment or 
 
 // storePlanFailedCheck stores a failing check for an environment whose plan
 // could not be produced at all: its schema request, its environment
-// validation, or the plan itself failed. That environment has no plan row, so
-// without this one the aggregate folds only the environments that did plan and
-// can pass while this one was never planned (MG-1, MG-2). The row records a
-// plan error rather than a blocking reason, so the environment's next plan
-// replaces it like any plan result. The raw error stays in the server logs and
-// the plan comment; the stored row carries only the fixed plan-failed text.
+// validation, or the plan itself failed. Without this row the aggregate folds
+// only the environments that did plan, or this environment's earlier passing
+// row, and can pass while this one was never planned (MG-1, MG-2). The row
+// records a plan error rather than a blocking reason, so the environment's
+// next plan replaces it like any plan result. The raw error stays in the
+// server logs and the plan comment; the stored row carries only the fixed
+// planFailedCheckSummary.
 func (h *Handler) storePlanFailedCheck(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, schema *ghclient.SchemaRequestResult, environment string) (string, error) {
 	failed := &apitypes.PlanResponse{Errors: []string{planFailedCheckText}}
 	headSHA, _, err := h.upsertPlanCheckRecord(ctx, client, repo, pr, schema, failed, environment, reviewDriftOutcome{})
@@ -396,6 +402,9 @@ func (h *Handler) upsertPlanCheckRecord(ctx context.Context, client *ghclient.In
 	changeSummary := summarizePlanChanges(schema, planResp, environment)
 	if changeSummary == "" && drift.work.pending > 0 {
 		changeSummary = drift.work.summary()
+	}
+	if changeSummary == "" && len(planResp.Errors) > 0 {
+		changeSummary = planFailedCheckSummary
 	}
 	blockingReason := ""
 	if driftBlocked {

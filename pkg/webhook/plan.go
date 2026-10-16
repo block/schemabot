@@ -511,19 +511,25 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 		multiEnvData.UnmanagedSchema = unmanagedSchema
 		multiEnvData.UnmanagedEnvironments = h.service.Config().OrderedEnvironments(allowedEnvironments)
 	}
+	// planFailed records an environment whose plan could not be produced: its
+	// error goes on the comment and the environment gets a failing row. Every
+	// such failure goes through here, so none can reach the comment without
+	// also reaching the gate.
+	planFailed := func(env string, err error) {
+		multiEnvData.Errors[env] = userFacingError(err)
+		planFailedEnvironments = append(planFailedEnvironments, env)
+	}
 
 	for _, env := range environments {
 		schemaResult, err := h.createManagedSchemaRequestFromPR(ctx, client, repo, pr, env, databaseName, action.Plan)
 		if err != nil {
 			h.logger.Error("schema request failed", "repo", repo, "pr", pr, "env", env, "error", err)
-			multiEnvData.Errors[env] = userFacingError(err)
-			planFailedEnvironments = append(planFailedEnvironments, env)
+			planFailed(env, err)
 			continue
 		}
 		if err := h.attachServerEnvironments(schemaResult, env); err != nil {
 			h.logger.Error("schema environment validation failed", "repo", repo, "pr", pr, "env", env, "error", err)
-			multiEnvData.Errors[env] = userFacingError(err)
-			planFailedEnvironments = append(planFailedEnvironments, env)
+			planFailed(env, err)
 			continue
 		}
 
@@ -588,8 +594,7 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 		}
 		if err != nil {
 			h.logger.Error("plan execution failed", "repo", repo, "pr", pr, "env", env, "error", err)
-			multiEnvData.Errors[env] = userFacingError(err)
-			planFailedEnvironments = append(planFailedEnvironments, env)
+			planFailed(env, err)
 			continue
 		}
 

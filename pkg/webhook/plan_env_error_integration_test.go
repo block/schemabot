@@ -4,15 +4,21 @@ package webhook
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"sync"
 	"testing"
 
+	gh "github.com/google/go-github/v86/github"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/checkstate"
+	ghclient "github.com/block/schemabot/pkg/github"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/storage"
 )
@@ -75,7 +81,8 @@ func TestE2EMultiEnvPlanEnvironmentErrorFailsAggregate(t *testing.T) {
 	assert.Equal(t, checkConclusionFailure, byEnv["production"].Conclusion)
 	assert.Equal(t, "abc123", byEnv["production"].HeadSHA)
 	assert.Empty(t, byEnv["production"].BlockingReason, "a plan failure is a plan result, not a block")
-	assert.NotContains(t, byEnv["production"].ChangeSummary, "10.0.0.5")
+	assert.Equal(t, planFailedCheckSummary, byEnv["production"].ChangeSummary, "the aggregate's row points at the plan comment, never at the raw error")
+	assert.Contains(t, aggregate.Output.Summary, planFailedCheckSummary)
 
 	// A plan of staging alone folds production's failing row too.
 	assert.NotEmpty(t, p.comment(t, "schemabot plan -e staging"))
@@ -149,6 +156,124 @@ func TestE2EUnrecordedMultiEnvPlanFailureSkipsFold(t *testing.T) {
 	require.NotEmpty(t, aggregates, "the failing aggregate check run is published")
 	assertNoPassingAggregate(t, aggregates, "production's unrecorded plan failure")
 	assert.Equal(t, checkConclusionFailure, aggregates[len(aggregates)-1].Conclusion)
+}
+
+// A pull request plans staging and production together, but production's
+// schema request fails: the repository's config ignores the only namespace
+// production would plan, so it has no schema files to plan. Staging plans
+// with no changes. Production still stores a failing check row, so the
+// aggregate blocks the merge instead of passing on staging's row alone.
+func TestE2EMultiEnvSchemaRequestErrorFailsAggregate(t *testing.T) {
+	table := "CREATE TABLE `orders` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;"
+	p := newMultiEnvPlanHarnessWithRepo(t, []api.TargetEntry{
+		{Target: "orders-001", Namespaces: []string{"ns_production"}},
+	}, &namespaceSelectingTernClient{}, nil, map[string]string{
+		"ns_{env}/orders.sql": table,
+	}, "ignore_namespaces:\n  - ns_production\n")
+
+	assert.Contains(t, p.comment(t, "schemabot plan"), "no schema files found")
+
+	byEnv := p.checksByEnv(t)
+	require.Contains(t, byEnv, "staging")
+	assert.Equal(t, checkConclusionSuccess, byEnv["staging"].Conclusion)
+	require.Contains(t, byEnv, "production", "the environment whose schema request failed still stores check state")
+	assert.Equal(t, checkConclusionFailure, byEnv["production"].Conclusion)
+	assert.Equal(t, planFailedCheckSummary, byEnv["production"].ChangeSummary)
+	aggregate := p.lastAggregate()
+	require.NotNil(t, aggregate, "the aggregate check run is published")
+	assert.Equal(t, checkConclusionFailure, aggregate.Conclusion, "staging passing alone must not pass the aggregate")
+}
+
+// A deployment publishes one aggregate per allowed environment. A pull
+// request plans staging and production together; staging plans with no
+// changes, production's plan fails, and the row recording that cannot be
+// stored. Production's aggregate carries the plan_failed_unrecorded block
+// while staging's aggregate passes on staging's own row, and a later plan of
+// staging alone leaves production's aggregate blocked.
+func TestE2EUnstoredPlanFailureBlocksOnlyItsEnvironmentAggregate(t *testing.T) {
+	p := newMultiEnvPlanHarness(t, []api.TargetEntry{
+		{Target: "orders-001", Namespaces: []string{"ns_0"}},
+		{Target: "orders-002", Namespaces: []string{"ns_1"}},
+	}, &planFailingTernClient{failPlans: 1}, func(st storage.Storage) storage.Storage {
+		return &envPlanResultFailingStorage{Storage: st, env: "production"}
+	})
+	p.handler.service.Config().AllowedEnvironments = []string{"staging", "production"}
+
+	assert.NotEmpty(t, p.comment(t, "schemabot plan"))
+	p.assertEnvAggregate(t, "production", checkConclusionFailure, checkstate.BlockPlanFailedUnrecorded)
+	p.assertEnvAggregate(t, "staging", checkConclusionSuccess, "")
+
+	assert.NotEmpty(t, p.comment(t, "schemabot plan -e staging"))
+	p.assertEnvAggregate(t, "production", checkConclusionFailure, checkstate.BlockPlanFailedUnrecorded)
+	p.assertEnvAggregate(t, "staging", checkConclusionSuccess, "")
+}
+
+// postFailingAggregatesWithBlock reports false whenever the blocked aggregate
+// it set out to post is not both published and stored: a caller about to fold
+// the aggregate from stored check state reads false as "do not fold". It
+// reports true only once the block is in place.
+func TestPostFailingAggregatesWithBlockReportsWhetherTheBlockLanded(t *testing.T) {
+	disabled := false
+	tests := []struct {
+		name         string
+		headSHA      string
+		createStatus int
+		repos        map[string]api.RepoConfig
+		want         bool
+	}{
+		{name: "posted and stored", headSHA: "abc123", createStatus: http.StatusCreated, want: true},
+		{name: "check publishing disabled", headSHA: "abc123", createStatus: http.StatusCreated,
+			repos: map[string]api.RepoConfig{"octocat/hello-world": {EnableChecks: &disabled}}},
+		{name: "head moved", headSHA: "newsha456", createStatus: http.StatusCreated},
+		{name: "check run not created", headSHA: "abc123", createStatus: http.StatusUnprocessableEntity},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			svc := setupE2EServiceWithConfig(t, &api.ServerConfig{Repos: tt.repos})
+			mux := http.NewServeMux()
+			server := httptest.NewServer(mux)
+			t.Cleanup(server.Close)
+			mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1", func(w http.ResponseWriter, _ *http.Request) {
+				_ = json.NewEncoder(w).Encode(gh.PullRequest{
+					Head: &gh.PullRequestBranch{Ref: new("feature-branch"), SHA: new(tt.headSHA)},
+					Base: &gh.PullRequestBranch{Ref: new("main"), SHA: new("def456")},
+					User: &gh.User{Login: new("testuser")},
+				})
+			})
+			mux.HandleFunc("POST /repos/octocat/hello-world/check-runs", func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(tt.createStatus)
+				_ = json.NewEncoder(w).Encode(map[string]any{"id": 300})
+			})
+			client := gh.NewClient(nil)
+			client.BaseURL, _ = url.Parse(server.URL + "/")
+			h := newE2EHandler(t, svc, client)
+			installClient := ghclient.NewInstallationClient(client, h.logger)
+
+			got := h.postFailingAggregatesWithBlock(t.Context(), installClient, "octocat/hello-world", 1, "abc123",
+				map[string]string{"production": planFailedUnstoredSummary}, planFailedUnrecordedBlock)
+			assert.Equal(t, tt.want, got)
+
+			stored, err := svc.Storage().Checks().Get(t.Context(), "octocat/hello-world", 1, aggregateSentinel, aggregateSentinel, aggregateSentinel)
+			require.NoError(t, err)
+			if tt.want {
+				require.NotNil(t, stored, "the blocked aggregate is stored")
+				assert.Equal(t, checkstate.BlockPlanFailedUnrecorded, stored.BlockingReason)
+			} else {
+				assert.Nil(t, stored, "no blocked aggregate is stored")
+			}
+		})
+	}
+}
+
+// assertEnvAggregate asserts the stored per-environment aggregate row's
+// conclusion and blocking reason.
+func (p *namespacePlacementHarness) assertEnvAggregate(t *testing.T, env, conclusion, reason string) {
+	t.Helper()
+	stored, err := p.store.Checks().Get(t.Context(), "octocat/hello-world", 1, env, aggregateSentinel, aggregateSentinel)
+	require.NoError(t, err)
+	require.NotNil(t, stored, "the %s aggregate is stored", env)
+	assert.Equal(t, conclusion, stored.Conclusion, "%s aggregate conclusion", env)
+	assert.Equal(t, reason, stored.BlockingReason, "%s aggregate blocking reason", env)
 }
 
 // aggregateUpsertFailingStorage fails every write of a stored aggregate row and

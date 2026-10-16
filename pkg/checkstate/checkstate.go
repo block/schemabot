@@ -179,7 +179,9 @@ const (
 	// Check Run already says why.
 	ReasonBlocked = "blocked"
 	// ReasonGuardBlocked: a durable guard failed this row closed. It stays
-	// blocking until the condition behind it changes and a plan re-runs it.
+	// blocking until the condition behind it changes and a plan re-runs it, or
+	// on the rollup, until a re-run of the check or a new commit re-verifies
+	// the pull request.
 	ReasonGuardBlocked = "guard_blocked"
 	// ReasonApplyRunning: an apply owns the row and is running against the
 	// commit the PR is gated on.
@@ -336,6 +338,17 @@ func blockingReasonDisposition(check *storage.Check) Disposition {
 	case blockGuard:
 		fallthrough
 	default:
+		// A guard block on the rollup does not record which database and
+		// environment set it, so no plan of one of them can prove it no longer
+		// holds. Only re-verifying the whole pull request releases it.
+		if IsAggregate(check) {
+			return Disposition{
+				Reason:   ReasonGuardBlocked,
+				Summary:  "A guard failed the rollup closed and recorded why, so no plan command clears it.",
+				Remedy:   "The Check Run's summary states what failed. Fix that, then re-run the check or push a commit: either re-verifies the whole pull request and lifts the block once the guard passes.",
+				Blocking: true,
+			}
+		}
 		return Disposition{
 			Reason:   ReasonGuardBlocked,
 			Summary:  "A guard failed this check closed and recorded why, so a write that did not re-evaluate the guard cannot clear it.",
