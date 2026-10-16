@@ -279,6 +279,61 @@ func TestDriftGuard_ShardScopedWrongShardFailsClosed(t *testing.T) {
 	assert.Nil(t, store.created, "must not materialize a drifted shard plan")
 }
 
+// twoTableShardPlan is a shard's re-plan holding changes to two tables, the
+// reviewed ALTER on users and a change to orders.
+func twoTableShardPlan(shard, usersDDL string) *engine.PlanResult {
+	result := alterUsersEmailShardPlan(shard)
+	result.Changes[0].TableChanges[0].DDL = usersDDL
+	result.Changes[0].TableChanges = append(result.Changes[0].TableChanges, engine.TableChange{
+		Table:     "orders",
+		Operation: ddl.StatementAlterTable,
+		DDL:       "ALTER TABLE `orders` ADD COLUMN `note` varchar(255)",
+	})
+	return result
+}
+
+// firstUsersShardDispatch is the first dispatch of a sharded plan: one shard,
+// carrying only the users change, with no stored plan row to attach to.
+func firstUsersShardDispatch(planID string) *ternv1.ApplyRequest {
+	return &ternv1.ApplyRequest{
+		PlanId:       planID,
+		TargetShards: []string{"-80"},
+		DdlChanges: []*ternv1.TableChange{
+			{TableName: "users", Ddl: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)", ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER, Namespace: "testapp"},
+		},
+	}
+}
+
+// A shard dispatch carries one table's change, while this deployment's re-plan
+// of the shard lists every table the shard still needs. The first dispatch of a
+// sharded plan with two changed tables on one shard therefore materializes: the
+// shard's other table is another operation's work, not drift in this one.
+func TestDriftGuard_ShardScopedIgnoresOtherTablesOnTheShard(t *testing.T) {
+	store := &fakePlanStore{getFn: func(string) (*storage.Plan, error) { return nil, nil }, createID: 8}
+	c := newPlanMaterializeClientWithPlan(store, twoTableShardPlan("-80", "ALTER TABLE `users` ADD COLUMN `email` varchar(255)"))
+
+	got, err := c.planForApplyRequest(t.Context(), firstUsersShardDispatch("plan_shard_two_tables"))
+
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	assert.Equal(t, int64(8), got.ID)
+}
+
+// The table a shard dispatch carries is still held to the reviewed DDL when the
+// shard has other tables to change: this shard would add email as varchar(100),
+// so the reviewed varchar(255) has drifted and the dispatch is refused.
+func TestDriftGuard_ShardScopedDispatchedTableDriftFailsClosed(t *testing.T) {
+	store := &fakePlanStore{getFn: func(string) (*storage.Plan, error) { return nil, nil }}
+	c := newPlanMaterializeClientWithPlan(store, twoTableShardPlan("-80", "ALTER TABLE `users` ADD COLUMN `email` varchar(100)"))
+
+	_, err := c.planForApplyRequest(t.Context(), firstUsersShardDispatch("plan_shard_two_tables_drift"))
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "drifted")
+	assert.False(t, engine.IsRetryable(err), "a redispatch carries the same reviewed DDL against the same drifted shard")
+	assert.Nil(t, store.created, "must not materialize a drifted shard plan")
+}
+
 // More than one target shard is a malformed dispatch (the per-shard fan-out
 // emits one shard per operation), so the guard fails closed.
 func TestDriftGuard_MultipleTargetShardsFailsClosed(t *testing.T) {
