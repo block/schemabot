@@ -619,7 +619,7 @@ func TestRenderUnsafeChangesBlockedCarriesLintFindingsAndTheirGuides(t *testing.
 	assert.Contains(t, rendered, "Column rename detected", "the lint fold reaches the decision point")
 	assert.Contains(t, rendered, primaryKeyDocURL, "the blocking finding links its guide")
 	assert.Contains(t, rendered, "#renaming-a-column-or-table")
-	assert.Less(t, strings.Index(rendered, "📖 **Related guidance:**"), strings.Index(rendered, "--allow-unsafe`:**"),
+	assert.Less(t, strings.Index(rendered, "📖 **Related guidance:**"), strings.Index(rendered, "To proceed with these destructive changes**"),
 		"the reading comes before the command it informs")
 }
 
@@ -854,13 +854,13 @@ func TestRenderApplyStatusComment_ShardSummary(t *testing.T) {
 		}},
 	})
 	assert.Contains(t, inline, "- Shards: 5 (1 failed, 2 copying, 1 waiting for cutover, 1 complete)\n"+
-		"  - ✗ `c0-e0`: failed\n"+
-		// A shard that has not reported progress reads as copying, not 0%,
-		// and is listed after the ones that have, which set the pace.
-		"  - ◉ `80-c0`: 45%\n"+
+		// Shards are listed in their own order whatever their phase, and one
+		// that has not reported progress reads as copying, not 0%.
+		"  - ✓ `-40`: complete\n"+
 		"  - ◉ `40-80`: copying\n"+
-		"  - ● `e0-`: waiting for cutover\n"+
-		"  - ✓ `-40`: complete\n")
+		"  - ◉ `80-c0`: 45%\n"+
+		"  - ✗ `c0-e0`: failed\n"+
+		"  - ● `e0-`: waiting for cutover\n")
 
 	many := make([]ShardProgressData, 0, 13)
 	for i := range 9 {
@@ -876,11 +876,12 @@ func TestRenderApplyStatusComment_ShardSummary(t *testing.T) {
 		Database: "shop", Environment: "staging", State: "running", Engine: "Vitess",
 		Tables: []TableProgressData{{TableName: "orders", Status: "running", PercentComplete: 70, Shards: many}},
 	})
-	// Past the inline limit only failures and the slowest copiers are named;
-	// the heading counts the rest.
+	// Past the inline limit only failures, the slowest copiers and the shards
+	// working past the copy are named; the heading counts the rest.
 	assert.Contains(t, collapsed, "- Shards: 13 (2 copying, 1 waiting for cutover, 1 queued, 9 complete)\n"+
 		"  - ◉ `slow1`: 12%\n"+
-		"  - ◉ `fast1`: 80%\n\n")
+		"  - ◉ `fast1`: 80%\n"+
+		"  - ● `ready1`: waiting for cutover\n\n")
 
 	// A table waiting on its deploy request, or reverting, is still in flight,
 	// so it lists its shards too.

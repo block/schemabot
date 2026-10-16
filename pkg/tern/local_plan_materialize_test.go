@@ -432,7 +432,8 @@ func TestShardScopedDispatchScopeCarriesLocalReplannedStatement(t *testing.T) {
 // A dispatched change with no counterpart in the plan row keeps the dispatched
 // statement: the plan row was materialized by a sibling dispatch of the same
 // plan and holds only that dispatch's changes, so the text this dispatch
-// carries is the one it was reviewed and dispatched with.
+// carries is the one it was reviewed and dispatched with. Nothing here
+// re-planned it, so it is marked unsafe for admission to require the opt-in.
 func TestShardScopedDispatchScopeKeepsDispatchedTextWithoutCounterpart(t *testing.T) {
 	const dispatched = "ALTER TABLE `orders` ADD COLUMN `note` varchar(255)"
 	plan := &storage.Plan{
@@ -456,6 +457,8 @@ func TestShardScopedDispatchScopeKeepsDispatchedTextWithoutCounterpart(t *testin
 	require.Len(t, scope.ddlChanges, 1)
 	assert.Equal(t, dispatched, scope.ddlChanges[0].DDL)
 	assert.Empty(t, scope.ddlChanges[0].ExecutionMode)
+	assert.True(t, scope.ddlChanges[0].IsUnsafe)
+	assert.Equal(t, unconfirmedUnsafeReason, scope.ddlChanges[0].UnsafeReason)
 }
 
 // A whole-deployment dispatch already builds its scope from the plan row, so
