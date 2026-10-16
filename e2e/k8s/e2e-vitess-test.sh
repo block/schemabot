@@ -33,6 +33,9 @@ if ! minikube status > /dev/null 2>&1; then
     minikube start --driver=docker --container-runtime=docker --cpus=4 --memory=4096
 fi
 
+# shellcheck source=e2e/k8s/pin-minikube-kubeconfig.sh
+source "$REPO_ROOT/e2e/k8s/pin-minikube-kubeconfig.sh"
+
 # --- Build images into minikube's docker daemon ---
 
 echo "Building schemabot + etre + localscale images for minikube..."
@@ -48,6 +51,7 @@ docker build -t localscale:test -f "$REPO_ROOT/deploy/local/Dockerfile.localscal
 
 PIDS=()
 cleanup() {
+    rm -f "$PINNED_KUBECONFIG"
     echo "Cleaning up port-forwards..."
     for pid in ${PIDS[@]+"${PIDS[@]}"}; do
         kill "$pid" 2>/dev/null || true

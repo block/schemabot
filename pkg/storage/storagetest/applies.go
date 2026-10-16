@@ -767,6 +767,13 @@ func TestApplies(t *testing.T, h Harness) {
 		rollout := CreateApplyWithStateEnvDeployment(t, store, lock, "apply_rollout_retrying", 9320, state.Apply.Pending, "production", "region-a")
 		operationID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{ApplyID: rollout.ID, Deployment: "region-a", OperationKey: "schema", State: state.ApplyOperation.FailedRetryable})
 		require.NoError(t, err)
+		// A lone operation with tasks is driven under the parent lease, the
+		// shape whose retry leaves the row failed_retryable.
+		task := newTask(rollout, "task_rollout_retrying", "users", time.Now())
+		task.State = state.Task.FailedRetryable
+		task.ApplyOperationID = &operationID
+		_, err = store.Tasks().Create(ctx, task)
+		require.NoError(t, err)
 		rollout.State = state.Apply.FailedRetryable
 		require.NoError(t, store.Applies().Update(ctx, rollout))
 
@@ -787,6 +794,206 @@ func TestApplies(t *testing.T, h Harness) {
 		require.NoError(t, err)
 		require.True(t, released)
 		require.NoError(t, createApplyOnDeployment(t, store, lock, "apply_region_a_after_retry", 9322, "region-a"), "a retry no driver holds reserves nothing")
+	})
+
+	// A data-plane outage leaves two targets of a rollout failed_retryable: one
+	// was copying and one never dispatched. The parent reads failed_retryable
+	// while either does. Redispatching the first moves its row to running in the
+	// claim, so the next claim takes the second target instead of re-leasing the
+	// first out from under the driver that is resuming it.
+	t.Run("FindNextApplyOperation_MultiOperationRedispatchMovesTheRowToRunning", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "apply_rollout_redispatch_db", storage.DatabaseTypeMySQL)
+		rollout := CreateApplyWithStateEnvDeployment(t, store, lock, "apply_rollout_redispatch", 9330, state.Apply.Pending, "production", "region-a")
+		copyingID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+			ApplyID: rollout.ID, Deployment: "region-a", Target: "orders-001", OperationKey: "orders-001/schema",
+			State: state.ApplyOperation.FailedRetryable, ErrorMessage: "progress poll failed",
+		})
+		require.NoError(t, err)
+		undispatchedID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+			ApplyID: rollout.ID, Deployment: "region-a", Target: "orders-002", OperationKey: "orders-002/schema",
+			State: state.ApplyOperation.FailedRetryable, ErrorMessage: "dispatch failed",
+		})
+		require.NoError(t, err)
+		rollout.State = state.Apply.FailedRetryable
+		require.NoError(t, store.Applies().Update(ctx, rollout))
+
+		first, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-a")
+		require.NoError(t, err)
+		require.NotNil(t, first, "a failed_retryable operation under a retryable parent must be claimable")
+		assert.Equal(t, state.ApplyOperation.Running, first.State, "the redispatch claim returns the row it moved")
+		redispatched, err := store.ApplyOperations().Get(ctx, first.ID)
+		require.NoError(t, err)
+		require.NotNil(t, redispatched)
+		assert.Equal(t, state.ApplyOperation.Running, redispatched.State)
+		assert.Empty(t, redispatched.ErrorMessage, "the redispatch clears the failure it is retrying")
+		assert.Equal(t, "driver-a", redispatched.LeaseOwner)
+		assert.Equal(t, first.LeaseToken, redispatched.LeaseToken)
+
+		second, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-b")
+		require.NoError(t, err)
+		require.NotNil(t, second, "the other failed_retryable target is claimable next")
+		assert.NotEqual(t, first.ID, second.ID, "the claim never re-leases the target driver-a is resuming")
+		assert.ElementsMatch(t, []int64{copyingID, undispatchedID}, []int64{first.ID, second.ID})
+
+		held, err := store.ApplyOperations().Get(ctx, first.ID)
+		require.NoError(t, err)
+		require.NotNil(t, held)
+		assert.Equal(t, first.LeaseToken, held.LeaseToken, "driver-a still holds the lease it claimed")
+
+		none, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-c")
+		require.NoError(t, err)
+		assert.Nil(t, none, "both targets are being resumed, so there is nothing left to claim")
+	})
+
+	// A halted rollout holds shard 3 parked at the cutover barrier behind
+	// shard 2's failure, so nothing drives shard 3 and its cutover turn never
+	// comes. A cancel makes it claimable once, for the drive that delivers the
+	// cancel to the engine holding its copy. The claim leaves it parked, and
+	// the claim is not repeated while that drive holds the lease. Shard 3's
+	// next table, which never started, is not claimed for the cancel.
+	t.Run("FindNextApplyOperation_PendingCancelClaimsOperationParkedBehindFailure", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "apply_rollout_parked_cancel_db", storage.DatabaseTypeMySQL)
+		rollout := CreateApplyWithStateEnvDeployment(t, store, lock, "apply_rollout_parked_cancel", 9334, state.Apply.Pending, "production", "region-a")
+		insert := func(target, key, operationState string) int64 {
+			id, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+				ApplyID: rollout.ID, Deployment: "region-a", Target: target, OperationKey: storage.TargetOperationKey(target, key),
+				OperationKind: storage.ApplyOperationKindWork, CutoverPolicy: storage.CutoverPolicyBarrier, OnFailure: storage.OnFailureHalt,
+				State: operationState,
+			})
+			require.NoError(t, err)
+			return id
+		}
+		insert("orders-001", "step-1", state.ApplyOperation.Completed)
+		insert("orders-002", "step-1", state.ApplyOperation.Failed)
+		parkedID := insert("orders-003", "step-1", state.ApplyOperation.WaitingForCutover)
+		insert("orders-003", "step-2", state.ApplyOperation.Pending)
+		rollout.State = state.Apply.RunningDegraded
+		require.NoError(t, store.Applies().Update(ctx, rollout))
+
+		idle, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-a")
+		require.NoError(t, err)
+		assert.Nil(t, idle, "without a cancel nothing claims the parked operation or the work behind the failure")
+
+		_, alreadyPending, err := store.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+			ApplyID:   rollout.ID,
+			Operation: storage.ControlOperationCancel,
+			Status:    storage.ControlRequestPending,
+			Metadata:  []byte(`{}`),
+		})
+		require.NoError(t, err)
+		require.False(t, alreadyPending)
+
+		claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-a")
+		require.NoError(t, err)
+		require.NotNil(t, claimed, "a pending cancel makes the parked operation claimable")
+		assert.Equal(t, parkedID, claimed.ID)
+		assert.Equal(t, state.ApplyOperation.WaitingForCutover, claimed.State)
+		held, err := store.ApplyOperations().Get(ctx, parkedID)
+		require.NoError(t, err)
+		require.NotNil(t, held)
+		assert.Equal(t, state.ApplyOperation.WaitingForCutover, held.State, "the claim leaves the operation parked")
+		assert.Equal(t, claimed.LeaseToken, held.LeaseToken)
+
+		again, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-b")
+		require.NoError(t, err)
+		assert.Nil(t, again, "the cancel is delivered by the drive that holds the lease, not re-claimed")
+
+		cutover, err := store.ApplyOperations().FindNextApplyOperationCutover(ctx, "driver-b")
+		require.NoError(t, err)
+		assert.Nil(t, cutover, "the parked operation still does not cut over behind the failure")
+	})
+
+	// A stop reaches a barrier rollout while shard 1 is still copying and
+	// shard 2 has parked at the barrier. Shard 1's drive stops its own copy,
+	// but shard 2's copy drive already exited at the barrier, and a pending
+	// stop keeps the cutover claim away from it. The stop makes it claimable
+	// once, for the drive that settles it stopped; without that the parent
+	// never derives stopped and the stop is never completed. The claim leaves
+	// it parked and is not repeated while that drive holds the lease.
+	t.Run("FindNextApplyOperation_PendingStopClaimsOperationParkedAtBarrier", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "apply_rollout_parked_stop_db", storage.DatabaseTypeMySQL)
+		rollout := CreateApplyWithStateEnvDeployment(t, store, lock, "apply_rollout_parked_stop", 9335, state.Apply.Pending, "production", "region-a")
+		insert := func(target, key, operationState string) int64 {
+			id, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+				ApplyID: rollout.ID, Deployment: "region-a", Target: target, OperationKey: storage.TargetOperationKey(target, key),
+				OperationKind: storage.ApplyOperationKindWork, CutoverPolicy: storage.CutoverPolicyBarrier, OnFailure: storage.OnFailureHalt,
+				State: operationState,
+			})
+			require.NoError(t, err)
+			return id
+		}
+		insert("orders-001", "step-1", state.ApplyOperation.Stopped)
+		parkedID := insert("orders-002", "step-1", state.ApplyOperation.WaitingForCutover)
+		insert("orders-003", "step-1", state.ApplyOperation.Stopped)
+		rollout.State = state.Apply.WaitingForCutover
+		require.NoError(t, store.Applies().Update(ctx, rollout))
+
+		idle, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-a")
+		require.NoError(t, err)
+		assert.Nil(t, idle, "without a control request nothing claims the parked or stopped operations")
+
+		_, alreadyPending, err := store.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+			ApplyID:   rollout.ID,
+			Operation: storage.ControlOperationStop,
+			Status:    storage.ControlRequestPending,
+			Metadata:  []byte(`{}`),
+		})
+		require.NoError(t, err)
+		require.False(t, alreadyPending)
+
+		cutover, err := store.ApplyOperations().FindNextApplyOperationCutover(ctx, "driver-b")
+		require.NoError(t, err)
+		assert.Nil(t, cutover, "a pending stop keeps the parked operation from cutting over")
+
+		claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-a")
+		require.NoError(t, err)
+		require.NotNil(t, claimed, "a pending stop makes the parked operation claimable")
+		assert.Equal(t, parkedID, claimed.ID)
+		held, err := store.ApplyOperations().Get(ctx, parkedID)
+		require.NoError(t, err)
+		require.NotNil(t, held)
+		assert.Equal(t, state.ApplyOperation.WaitingForCutover, held.State, "the claim leaves the operation parked")
+		assert.Equal(t, claimed.LeaseToken, held.LeaseToken)
+
+		again, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-b")
+		require.NoError(t, err)
+		assert.Nil(t, again, "the stop is delivered by the drive that holds the lease, not re-claimed")
+	})
+
+	// A deployment-keyed generation declared two targets and only target-002
+	// attached before the data plane failed. The operator drives that lone row
+	// under its operation lease because the manifest still expects target-001,
+	// so the redispatch claim charges the parent's retry budget and moves the
+	// row to running, the same as when a sibling has attached.
+	t.Run("FindNextApplyOperation_ManifestExpectedRedispatchMovesTheRowToRunning", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "apply_manifest_redispatch_db", storage.DatabaseTypeMySQL)
+		rollout := createManifestGeneration(t, store, lock, "apply_manifest_redispatch", 9333,
+			[]string{"target-001", "target-002"}, state.ApplyOperation.FailedRetryable, state.Task.FailedRetryable)
+		rollout.State = state.Apply.FailedRetryable
+		require.NoError(t, store.Applies().Update(ctx, rollout))
+
+		claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-a")
+		require.NoError(t, err)
+		require.NotNil(t, claimed, "a failed_retryable operation under a retryable parent must be claimable")
+		assert.Equal(t, "target-002", claimed.OperationKey)
+		assert.Equal(t, state.ApplyOperation.Running, claimed.State, "the redispatch claim returns the row it moved")
+
+		parent, err := store.Applies().Get(ctx, rollout.ID)
+		require.NoError(t, err)
+		require.NotNil(t, parent)
+		assert.Equal(t, 1, parent.Attempt, "the redispatch consumes one unit of the parent retry budget")
+
+		again, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-b")
+		require.NoError(t, err)
+		assert.Nil(t, again, "the claim never re-leases the row driver-a is resuming")
 	})
 
 	// Moving an existing apply back into an active state runs the same check as
