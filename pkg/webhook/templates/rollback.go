@@ -240,7 +240,10 @@ const (
 // renders from.
 type RollbackOfRolloutUnsupportedData struct {
 	Environment string
-	ApplyID     string
+	// Database is the apply's database. The apply command names it, so it
+	// runs in a PR that changes several databases.
+	Database string
+	ApplyID  string
 	// RoutingChecked is set when the apply's targets were compared with the
 	// environment's routing now; Unrouted lists the ones no longer routed.
 	RoutingChecked bool
@@ -258,7 +261,7 @@ type RollbackOfRolloutUnsupportedData struct {
 // the change on every target is an apply of schema files without it, and where
 // those files can be applied from depends on the PR: an open PR reverts the
 // change itself, a merged one needs a PR that reverts it, and a closed one
-// needs a PR that plans the default branch, which never had it. A PR whose
+// needs a PR that plans the default branch's schema files. A PR whose
 // revert leaves its schema files equal to the default branch changes no schema
 // file, so it is planned only once its schemabot.yaml changes too.
 func RenderRollbackOfRolloutUnsupported(data RollbackOfRolloutUnsupportedData) string {
@@ -274,18 +277,23 @@ func RenderRollbackOfRolloutUnsupported(data RollbackOfRolloutUnsupportedData) s
 		sb.WriteString("An apply reaches only the targets this environment routes to now, so add back any target it ran on that is no longer routed.\n\n")
 	}
 
-	const nonce = "add or toggle a `# nonce` comment line in the database's `schemabot.yaml`"
+	const nonce = "a `# nonce` comment line in the database's `schemabot.yaml`"
 	switch data.PR {
 	case PRStateOpen:
-		fmt.Fprintf(&sb, "To undo `%s`, revert the change in this PR's schema files and %s so the directory is still planned. Push, then run:\n", data.ApplyID, nonce)
+		fmt.Fprintf(&sb, "To undo `%s`, revert the change in this PR's schema files and add or toggle %s so the directory is still planned. Push, then run:\n", data.ApplyID, nonce)
 	case PRStateMerged:
 		fmt.Fprintf(&sb, "To undo `%s`, open a PR that reverts the change in the schema files, then run there:\n", data.ApplyID)
 	case PRStateClosed:
-		fmt.Fprintf(&sb, "To undo `%s`, open a PR that only adds or toggles a `# nonce` comment line in the database's `schemabot.yaml`. The default branch never had this change, so that PR's plan reverts it. Then run there:\n", data.ApplyID)
+		fmt.Fprintf(&sb, "To undo `%s`, open a PR that only adds or toggles %s. Its plan brings the database back to the default branch's schema files. Then run there:\n", data.ApplyID, nonce)
 	default:
-		fmt.Fprintf(&sb, "To undo `%s`, apply schema files without the change: revert it in this PR if the PR is open, and %s so the directory is still planned, or revert it in a new PR if this one merged. Then run:\n", data.ApplyID, nonce)
+		fmt.Fprintf(&sb, "To undo `%s`, apply schema files without the change:\n", data.ApplyID)
+		fmt.Fprintf(&sb, "- If this PR is open, revert the change here and add or toggle %s so the directory is still planned.\n", nonce)
+		sb.WriteString("- If it merged, revert the change in a new PR.\n")
+		fmt.Fprintf(&sb, "- If it closed without merging, open a PR that only adds or toggles %s.\n\n", nonce)
+		sb.WriteString("Then run:\n")
 	}
-	fmt.Fprintf(&sb, "```\n%s\n```\n", appendTenantFlag(fmt.Sprintf("schemabot apply -e %s", data.Environment), data.Tenant))
+	command := appendDatabaseFlag(fmt.Sprintf("schemabot apply -e %s", data.Environment), data.Database)
+	fmt.Fprintf(&sb, "```\n%s\n```\n", appendTenantFlag(command, data.Tenant))
 	return sb.String()
 }
 

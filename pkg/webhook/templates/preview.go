@@ -3464,6 +3464,7 @@ func PreviewCommentRollbackStatus() string {
 func PreviewCommentRollbackOfRolloutUnsupported() string {
 	return RenderRollbackOfRolloutUnsupported(RollbackOfRolloutUnsupportedData{
 		Environment:    "staging",
+		Database:       "payments",
 		ApplyID:        "apply-a1b2c3d4e5f6",
 		RoutingChecked: true,
 		PR:             PRStateOpen,

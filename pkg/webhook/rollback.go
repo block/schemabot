@@ -262,16 +262,19 @@ func (h *Handler) rollbackCommandCore(parent context.Context, repo string, pr in
 	// after lock acquisition, so the plan can be pinned for confirmation.
 	planResp, err := h.service.ExecuteRollbackPlanForApply(ctx, apply)
 	if unsupported, refused := asRolloutRollbackUnsupported(err); refused {
+		// Release before reading the PR state, so a slow GitHub read does not
+		// hold the database lock for a rollback that was already refused.
+		releaseErr := h.releaseRollbackLockAfterRejectedPlan(ctx, database, dbType, lockOwner, lockAcquiredByCommand)
+		h.logRollbackLockReleaseFailure(repo, pr, database, dbType, lockOwner, releaseErr)
 		comment := templates.RenderRollbackOfRolloutUnsupported(templates.RollbackOfRolloutUnsupportedData{
 			Environment:    environment,
+			Database:       database,
 			ApplyID:        unsupported.ApplyID,
 			RoutingChecked: unsupported.RoutingChecked,
 			Unrouted:       unsupported.Unrouted,
 			PR:             h.prStateForRemedy(ctx, repo, pr, installationID, environment, applyID),
 			Tenant:         h.deploymentTenant(),
 		})
-		releaseErr := h.releaseRollbackLockAfterRejectedPlan(ctx, database, dbType, lockOwner, lockAcquiredByCommand)
-		h.logRollbackLockReleaseFailure(repo, pr, database, dbType, lockOwner, releaseErr)
 		h.logger.Warn("rollback refused: rollback is not supported for an apply in an environment with multiple targets; the PR comment names reverting the PR's schema files and applying again",
 			"repo", repo, "pr", pr, "apply_id", applyID, "environment", environment, "database", database, "error", err)
 		h.postComment(repo, pr, installationID, comment)

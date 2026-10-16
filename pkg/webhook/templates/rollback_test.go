@@ -478,13 +478,15 @@ func TestRenderRollbackRejectedRedactsEndpoints(t *testing.T) {
 // without the change can be applied from, which depends on the PR: an open PR
 // reverts the change and toggles a nonce so its directory is still planned, a
 // merged one needs a reverting PR, and a closed one needs a PR that plans the
-// default branch, which never had the change. A PR whose state could not be
-// read gets wording true for every state. Targets the environment no longer
+// default branch's schema files. A PR whose state could not be read gets each
+// state's step. The command names the apply's database, so it runs in a PR
+// that changes several databases. Targets the environment no longer
 // routes to are named, since the apply that undoes the change would not reach
 // them.
 func TestRenderRollbackOfRolloutUnsupported(t *testing.T) {
 	data := RollbackOfRolloutUnsupportedData{
 		Environment:    "staging",
+		Database:       "payments",
 		ApplyID:        "apply-a1b2c3d4e5f6",
 		RoutingChecked: true,
 		PR:             PRStateOpen,
@@ -492,13 +494,13 @@ func TestRenderRollbackOfRolloutUnsupported(t *testing.T) {
 	assert.Equal(t, "## Rollback Not Supported — Staging\n\n"+
 		"Rollback isn't currently supported for schema changes across multiple targets.\n\n"+
 		"To undo `apply-a1b2c3d4e5f6`, revert the change in this PR's schema files and add or toggle a `# nonce` comment line in the database's `schemabot.yaml` so the directory is still planned. Push, then run:\n"+
-		"```\nschemabot apply -e staging\n```\n", RenderRollbackOfRolloutUnsupported(data))
+		"```\nschemabot apply -e staging -d payments\n```\n", RenderRollbackOfRolloutUnsupported(data))
 
 	t.Run("merged PR", func(t *testing.T) {
 		merged := data
 		merged.PR = PRStateMerged
 		out := RenderRollbackOfRolloutUnsupported(merged)
-		assert.Contains(t, out, "To undo `apply-a1b2c3d4e5f6`, open a PR that reverts the change in the schema files, then run there:\n```\nschemabot apply -e staging\n```\n")
+		assert.Contains(t, out, "To undo `apply-a1b2c3d4e5f6`, open a PR that reverts the change in the schema files, then run there:\n```\nschemabot apply -e staging -d payments\n```\n")
 		assert.NotContains(t, out, "this PR's schema files")
 		assert.NotContains(t, out, "nonce")
 	})
@@ -507,7 +509,7 @@ func TestRenderRollbackOfRolloutUnsupported(t *testing.T) {
 		closed := data
 		closed.PR = PRStateClosed
 		out := RenderRollbackOfRolloutUnsupported(closed)
-		assert.Contains(t, out, "To undo `apply-a1b2c3d4e5f6`, open a PR that only adds or toggles a `# nonce` comment line in the database's `schemabot.yaml`. The default branch never had this change, so that PR's plan reverts it. Then run there:\n")
+		assert.Contains(t, out, "To undo `apply-a1b2c3d4e5f6`, open a PR that only adds or toggles a `# nonce` comment line in the database's `schemabot.yaml`. Its plan brings the database back to the default branch's schema files. Then run there:\n")
 		assert.NotContains(t, out, "this PR's schema files")
 	})
 
@@ -515,7 +517,11 @@ func TestRenderRollbackOfRolloutUnsupported(t *testing.T) {
 		unknown := data
 		unknown.PR = PRStateUnknown
 		out := RenderRollbackOfRolloutUnsupported(unknown)
-		assert.Contains(t, out, "revert it in this PR if the PR is open, and add or toggle a `# nonce` comment line in the database's `schemabot.yaml` so the directory is still planned, or revert it in a new PR if this one merged. Then run:\n")
+		assert.Contains(t, out, "To undo `apply-a1b2c3d4e5f6`, apply schema files without the change:\n"+
+			"- If this PR is open, revert the change here and add or toggle a `# nonce` comment line in the database's `schemabot.yaml` so the directory is still planned.\n"+
+			"- If it merged, revert the change in a new PR.\n"+
+			"- If it closed without merging, open a PR that only adds or toggles a `# nonce` comment line in the database's `schemabot.yaml`.\n\n"+
+			"Then run:\n```\nschemabot apply -e staging -d payments\n```\n")
 	})
 
 	t.Run("targets no longer routed", func(t *testing.T) {
@@ -538,6 +544,6 @@ func TestRenderRollbackOfRolloutUnsupported(t *testing.T) {
 		withTenant := data
 		withTenant.Environment = "production"
 		withTenant.Tenant = "payments"
-		assert.Contains(t, RenderRollbackOfRolloutUnsupported(withTenant), "```\nschemabot apply -e production --tenant payments\n```\n")
+		assert.Contains(t, RenderRollbackOfRolloutUnsupported(withTenant), "```\nschemabot apply -e production -d payments --tenant payments\n```\n")
 	})
 }
