@@ -1173,17 +1173,18 @@ func (e *Engine) resumeApply(ctx context.Context, client psclient.PSClient, org 
 func (e *Engine) resumeExistingDeployRequest(ctx context.Context, client psclient.PSClient, org string, req *engine.ApplyRequest, meta *psMetadata) (*engine.ApplyResult, error) {
 	dr, err := e.getDeployRequest(ctx, client, org, req.Database, meta.DeployRequestID)
 	if err != nil {
-		// Only a genuine not-found means the deploy request was cleaned up and the
-		// apply should start fresh. A transient API error must propagate so resume
-		// retries against the same deploy request — forking a fresh branch and
-		// deploy request here would start a duplicate schema change while the
-		// original is still in flight.
+		// No error here starts the apply fresh: the deploy request this drive
+		// created may still be deploying, and a fresh apply would run a second
+		// schema change beside it. A not-found is permanent, as it is for
+		// Progress: deploy requests are never deleted, so a recorded one that
+		// cannot be found points at credentials that cannot read it, and no
+		// retry of this drive can tell where the change stands. Any other error
+		// propagates so the resume retries against the same deploy request.
 		var psErr *ps.Error
 		if errors.As(err, &psErr) && psErr.Code == ps.ErrNotFound {
-			e.logger.Warn("deploy request not found on resume, starting fresh",
-				"database", req.Database, "deploy_request", meta.DeployRequestID, "error", err)
-			req.ResumeState = nil
-			return e.Apply(ctx, req)
+			e.logger.Error("deploy request not found on resume; failing the apply rather than starting a second schema change",
+				"database", req.Database, "branch", meta.BranchName, "deploy_request", meta.DeployRequestID, "error", err)
+			return nil, engine.NewPermanentError("deploy request #%d not found on resume; check that the credentials can read it, then plan and apply again: %w", meta.DeployRequestID, err)
 		}
 		return nil, fmt.Errorf("get deploy request #%d on resume: %w", meta.DeployRequestID, err)
 	}
@@ -1202,13 +1203,18 @@ func (e *Engine) resumeExistingDeployRequest(ctx context.Context, client psclien
 		}
 	}
 
-	// If the deploy request failed, start fresh with a new branch rather
-	// than resuming a broken deploy.
-	if dr.DeploymentState == deployState.Error || dr.DeploymentState == deployState.CompleteError {
-		e.logger.Warn("deploy request in error state on resume, starting fresh",
-			"database", req.Database, "deploy_request", meta.DeployRequestID, "state", dr.DeploymentState)
-		req.ResumeState = nil
-		return e.Apply(ctx, req)
+	// A recovered deploy request that failed is this apply's failure, reported
+	// as the fresh path reports it. Starting fresh would not start clean: the
+	// fresh apply derives the same branch name and reuses the branch the failed
+	// request was cut from, so it would either fail on DDL that branch already
+	// carries, hiding the real failure, or deploy the change again without
+	// anyone asking for it.
+	if dr.DeploymentState == deployState.Error {
+		return nil, e.failRecoveredDeployRequest(req, meta, dr, formatDeployRequestError(dr))
+	}
+	if dr.DeploymentState == deployState.CompleteError {
+		return nil, e.failRecoveredDeployRequest(req, meta, dr,
+			fmt.Sprintf("deploy request #%d failed while deploying (state: %s)", dr.Number, dr.DeploymentState))
 	}
 
 	// A recovered request whose diff settled to no changes has nothing to
@@ -1370,6 +1376,20 @@ func (e *Engine) resumeExistingDeployRequest(ctx context.Context, client psclien
 			Metadata:         updatedMeta,
 		},
 	}, nil
+}
+
+// failRecoveredDeployRequest reports a recovered deploy request's failure as
+// the apply's own: it records the failure in the apply's events, as the fresh
+// path does when its deploy request fails, and returns it as a permanent error
+// because the deploy request will not leave its failed state.
+func (e *Engine) failRecoveredDeployRequest(req *engine.ApplyRequest, meta *psMetadata, dr *ps.DeployRequest, errMsg string) error {
+	e.logger.Error("recovered deploy request failed; failing the apply rather than starting the schema change again",
+		"database", req.Database, "branch", meta.BranchName, "deploy_request", dr.Number, "state", dr.DeploymentState)
+	e.eventEmitter(req)(engine.ApplyEvent{
+		Message:  errMsg,
+		Metadata: map[string]string{"deploy_request_id": fmt.Sprintf("%d", dr.Number)},
+	})
+	return engine.NewPermanentError("%s", errMsg)
 }
 
 // deployRequestNeedsResumeDeploy reports whether a recovered deploy request must
