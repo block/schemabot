@@ -1188,12 +1188,16 @@ type planetScalePullTarget struct {
 	branch   string
 }
 
+// errPlanetScaleClientNotConfigured is wrapped when a client has no
+// PlanetScale API client to reach its database with.
+var errPlanetScaleClientNotConfigured = errors.New("PlanetScale client is not configured")
+
 func (c *LocalClient) planetScalePullClient() (*planetScalePullTarget, error) {
 	if c.psClientFunc == nil {
 		// A vitess database supports pull; a missing PlanetScale client is a
 		// configuration defect, surfaced as an internal error rather than the
 		// unsupported-type sentinel so it cannot read as "pull not supported".
-		return nil, fmt.Errorf("PlanetScale client is not configured for database %s", c.config.Database)
+		return nil, fmt.Errorf("%w for database %s", errPlanetScaleClientNotConfigured, c.config.Database)
 	}
 	org := c.config.Metadata["organization"]
 	if org == "" {

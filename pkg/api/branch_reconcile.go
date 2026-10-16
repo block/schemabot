@@ -138,10 +138,13 @@ func (s *Service) runBranchReconcilePass(ctx context.Context, grace time.Duratio
 			})
 			deleted += result.Deleted
 			s.logger.Info("branch reconcile visited the PlanetScale targets this data plane recently applied to",
-				"targets", result.Targets, "deleted", result.Deleted, "delete", deleteOrphans)
+				"targets", result.Targets, "unreachable", result.Unreachable, "deleted", result.Deleted, "delete", deleteOrphans)
 			if err != nil {
 				errs = append(errs, fmt.Errorf("reconcile branches of recently applied targets: %w", err))
 			}
+		}
+		if len(errs) == 0 {
+			s.logger.Info("branch reconcile pass complete", "deleted", deleted, "delete", deleteOrphans)
 		}
 		return errors.Join(errs...)
 	})

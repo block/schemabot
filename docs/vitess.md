@@ -112,6 +112,9 @@ all of these hold:
 - no open deploy request uses it.
 
 Anything the pass cannot read keeps the branch, and the next pass tries again.
+On a data plane, a recently applied target that the inventory no longer has,
+or that has no PlanetScale client, is skipped with a warning and does not fail
+the pass; its branches are kept until deleted by hand.
 It is off by default, and when enabled it only logs the branches it would
 delete until `delete: true` is set:
 
