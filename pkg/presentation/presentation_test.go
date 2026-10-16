@@ -233,9 +233,10 @@ func TestDerivePending_Ordering(t *testing.T) {
 	}
 }
 
-// TestDeriveWaitingForCutover_Ordering: cutover stays strictly ordered (an
-// earlier sibling blocks until completed) regardless of cutover_policy, since
-// the policy only relaxes copy start.
+// TestDeriveWaitingForCutover_Ordering: the targets of one deployment each cut
+// over as soon as their own copy is parked, held only by an earlier target the
+// rollout halts on, while a later deployment waits for every earlier
+// deployment to complete, whatever the cutover_policy.
 func TestDeriveWaitingForCutover_Ordering(t *testing.T) {
 	cases := []struct {
 		name  string
@@ -244,55 +245,115 @@ func TestDeriveWaitingForCutover_Ordering(t *testing.T) {
 		label string
 	}{
 		{
-			name:  "earlier completed -> ready, next in order",
-			ops:   []Operation{rolling("eu", so.Completed), rolling("us", so.WaitingForCutover)},
+			name:  "earlier completed -> ready",
+			ops:   targetsOf(rolling("shop-001", so.Completed), rolling("shop-002", so.WaitingForCutover)),
 			want:  StateReadyForCutoverNext,
-			label: "ready for cutover — next in order",
+			label: "ready for cutover",
 		},
 		{
-			name:  "earlier still copying -> ready, waiting for it",
-			ops:   []Operation{rolling("eu", so.Running), rolling("us", so.WaitingForCutover)},
-			want:  StateReadyForCutoverWaiting,
-			label: "ready for cutover — waiting for eu",
-		},
-		{
-			name:  "barrier: earlier also at barrier still blocks cutover (cutover stays ordered)",
-			ops:   []Operation{barrier("eu", so.WaitingForCutover), barrier("us", so.WaitingForCutover)},
-			want:  StateReadyForCutoverWaiting,
-			label: "ready for cutover — waiting for eu",
-		},
-		{
-			name:  "parallel: earlier also at barrier still blocks cutover (cutover stays ordered)",
-			ops:   []Operation{parallel("eu", so.WaitingForCutover), parallel("us", so.WaitingForCutover)},
-			want:  StateReadyForCutoverWaiting,
-			label: "ready for cutover — waiting for eu",
-		},
-		{
-			name: "no-halt: earlier failed does not block cutover (rollout continues past it)",
-			ops: []Operation{
-				continuing("eu", so.Failed),
-				continuing("us", so.WaitingForCutover),
-			},
+			name:  "earlier still copying -> ready, not held",
+			ops:   targetsOf(parallel("shop-001", so.Running), parallel("shop-002", so.WaitingForCutover)),
 			want:  StateReadyForCutoverNext,
-			label: "ready for cutover — next in order",
+			label: "ready for cutover",
 		},
 		{
-			name: "pause: earlier failed still blocks cutover until released",
-			ops: []Operation{
-				pausing("eu", so.Failed),
-				pausing("us", so.WaitingForCutover),
-			},
+			name:  "barrier: earlier also at barrier does not hold",
+			ops:   targetsOf(barrier("shop-001", so.WaitingForCutover), barrier("shop-002", so.WaitingForCutover)),
+			want:  StateReadyForCutoverNext,
+			label: "ready for cutover",
+		},
+		{
+			name:  "parallel: earlier cutting over does not hold",
+			ops:   targetsOf(parallel("shop-001", so.CuttingOver), parallel("shop-002", so.WaitingForCutover)),
+			want:  StateReadyForCutoverNext,
+			label: "ready for cutover",
+		},
+		{
+			name:  "halt: earlier failed holds the cutover",
+			ops:   targetsOf(parallel("shop-001", so.Failed), parallel("shop-002", so.WaitingForCutover)),
+			want:  StateReadyForCutoverWaiting,
+			label: "ready for cutover — held, shop/shop-001 failed",
+		},
+		{
+			name:  "earlier retrying holds the cutover",
+			ops:   targetsOf(parallel("shop-001", so.FailedRetryable), parallel("shop-002", so.WaitingForCutover)),
+			want:  StateReadyForCutoverWaiting,
+			label: "ready for cutover — held, shop/shop-001 retrying",
+		},
+		{
+			name:  "earlier running while a task retries holds the cutover",
+			ops:   targetsOf(retryingTask(parallel("shop-001", so.Running)), parallel("shop-002", so.WaitingForCutover)),
+			want:  StateReadyForCutoverWaiting,
+			label: "ready for cutover — held, shop/shop-001 retrying",
+		},
+		{
+			name:  "earlier stopped holds the cutover",
+			ops:   targetsOf(parallel("shop-001", so.Stopped), parallel("shop-002", so.WaitingForCutover)),
+			want:  StateReadyForCutoverWaiting,
+			label: "ready for cutover — held, shop/shop-001 stopped",
+		},
+		{
+			name:  "earlier reverted holds the cutover",
+			ops:   targetsOf(parallel("shop-001", so.Reverted), parallel("shop-002", so.WaitingForCutover)),
+			want:  StateReadyForCutoverWaiting,
+			label: "ready for cutover — held, shop/shop-001 reverted",
+		},
+		{
+			name: "no-halt: earlier failed does not hold cutover (rollout continues past it)",
+			ops: targetsOf(
+				continuing("shop-001", so.Failed),
+				continuing("shop-002", so.WaitingForCutover),
+			),
+			want:  StateReadyForCutoverNext,
+			label: "ready for cutover",
+		},
+		{
+			name: "pause: earlier failed holds cutover until released",
+			ops: targetsOf(
+				pausing("shop-001", so.Failed),
+				pausing("shop-002", so.WaitingForCutover),
+			),
+			want:  StateReadyForCutoverWaiting,
+			label: "ready for cutover — held, shop/shop-001 failed; release or stop",
+		},
+		{
+			name: "released pause: earlier failed no longer holds cutover",
+			ops: targetsOf(
+				released("shop-001", so.Failed),
+				released("shop-002", so.WaitingForCutover),
+			),
+			want:  StateReadyForCutoverNext,
+			label: "ready for cutover",
+		},
+		{
+			name:  "earlier deployment still copying -> waiting for it",
+			ops:   []Operation{parallel("eu", so.Running), parallel("us", so.WaitingForCutover)},
 			want:  StateReadyForCutoverWaiting,
 			label: "ready for cutover — waiting for eu",
 		},
 		{
-			name: "released pause: earlier failed no longer blocks cutover",
-			ops: []Operation{
-				released("eu", so.Failed),
-				released("us", so.WaitingForCutover),
-			},
+			name:  "earlier deployment in its revert window -> waiting for it",
+			ops:   []Operation{barrier("eu", so.RevertWindow), barrier("us", so.WaitingForCutover)},
+			want:  StateReadyForCutoverWaiting,
+			label: "ready for cutover — waiting for eu",
+		},
+		{
+			name:  "earlier deployment completed -> ready",
+			ops:   []Operation{parallel("eu", so.Completed), parallel("us", so.WaitingForCutover)},
 			want:  StateReadyForCutoverNext,
-			label: "ready for cutover — next in order",
+			label: "ready for cutover",
+		},
+		{
+			name:  "earlier deployment failed holds the cutover",
+			ops:   []Operation{parallel("eu", so.Failed), parallel("us", so.WaitingForCutover)},
+			want:  StateReadyForCutoverWaiting,
+			label: "ready for cutover — held, eu failed",
+		},
+		{
+			name:  "earlier deployment failed, rollout continues past it -> ready",
+			ops:   []Operation{continuing("eu", so.Failed), continuing("us", so.WaitingForCutover)},
+			want:  StateReadyForCutoverNext,
+			label: "ready for cutover",
 		},
 	}
 	for _, tc := range cases {
@@ -300,6 +361,104 @@ func TestDeriveWaitingForCutover_Ordering(t *testing.T) {
 			last := Derive(tc.ops).Deployments[1]
 			assert.Equal(t, tc.want, last.Presentation)
 			assert.Equal(t, tc.label, last.Label)
+		})
+	}
+}
+
+// targetsOf places ops on the targets of one deployment, shop, each op's
+// Deployment naming its target, so the presentation names them shop/<target>.
+func targetsOf(ops ...Operation) []Operation {
+	for i := range ops {
+		ops[i].Target = ops[i].Deployment
+		ops[i].Deployment = "shop"
+	}
+	return ops
+}
+
+// retryingTask marks op as having a task that retries a failure while the
+// row itself still reads its own state.
+func retryingTask(op Operation) Operation {
+	op.Retrying = true
+	return op
+}
+
+// TestDerivePending_FinalizerFollowsTheStartGate: two targets each run one
+// work row and a finalizer. The label on payments-002's pending finalizer
+// agrees with the claim's finalizer start gate: it waits for its own work
+// under every policy, and an earlier target then holds it under barrier and
+// parallel only when that target halts the rollout, as a cutover is held.
+// Under rolling it still waits for every earlier target to complete.
+func TestDerivePending_FinalizerFollowsTheStartGate(t *testing.T) {
+	member := func(policy func(dep, st string) Operation, target, work, finalizer string) []Operation {
+		w := policy("payments-a", work)
+		w.Target, w.OperationKey, w.Work = target, target+"/orders/-/orders", true
+		f := policy("payments-a", finalizer)
+		f.Target, f.OperationKey, f.Finalizer = target, target+"/orders/group_finalizer", true
+		return []Operation{w, f}
+	}
+	cases := []struct {
+		name    string
+		earlier []Operation
+		policy  func(dep, st string) Operation
+		ownWork string
+		want    PresentationState
+		label   string
+	}{
+		{
+			name:    "barrier: an earlier target still copying does not hold it",
+			policy:  barrier,
+			earlier: member(barrier, "payments-001", so.Running, so.Pending),
+			ownWork: so.Completed,
+			want:    StateQueuedNext,
+			label:   "queued — next in order",
+		},
+		{
+			name:    "parallel: an earlier target still copying does not hold it",
+			policy:  parallel,
+			earlier: member(parallel, "payments-001", so.Running, so.Pending),
+			ownWork: so.Completed,
+			want:    StateQueuedNext,
+			label:   "queued — next in order",
+		},
+		{
+			name:    "barrier: it waits for its own work",
+			policy:  barrier,
+			earlier: member(barrier, "payments-001", so.Completed, so.Completed),
+			ownWork: so.WaitingForCutover,
+			want:    StateWaiting,
+			label:   "waiting for payments-a/payments-002",
+		},
+		{
+			name:    "barrier: an earlier failed target halts it",
+			policy:  barrier,
+			earlier: member(barrier, "payments-001", so.Failed, so.Pending),
+			ownWork: so.Completed,
+			want:    StateHalted,
+			label:   "halted — payments-a/payments-001 failed",
+		},
+		{
+			name:    "barrier: an earlier target retrying a task halts it",
+			policy:  barrier,
+			earlier: []Operation{retryingTask(member(barrier, "payments-001", so.Running, so.Pending)[0]), member(barrier, "payments-001", so.Running, so.Pending)[1]},
+			ownWork: so.Completed,
+			want:    StateHalted,
+			label:   "halted — payments-a/payments-001 retrying",
+		},
+		{
+			name:    "rolling: it waits for an earlier target to complete",
+			policy:  rolling,
+			earlier: member(rolling, "payments-001", so.Running, so.Pending),
+			ownWork: so.Completed,
+			want:    StateWaiting,
+			label:   "waiting for payments-a/payments-001",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ops := slices.Concat(tc.earlier, member(tc.policy, "payments-002", tc.ownWork, so.Pending))
+			finalizer := Derive(ops).Deployments[3]
+			assert.Equal(t, tc.want, finalizer.Presentation)
+			assert.Equal(t, tc.label, finalizer.Label)
 		})
 	}
 }

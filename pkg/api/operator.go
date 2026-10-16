@@ -856,6 +856,57 @@ func (s *Service) markDriverBusy(ctx context.Context) func() {
 	}
 }
 
+// claimStartsOperation reports whether a copy claim started its operation,
+// from pending or from a stopped operation an operator asked to start or
+// cancel, rather than redispatching a retry or recovering a crashed drive.
+// FindNextApplyOperation returns the row with the state it was claimed from in
+// exactly these two cases. Starting is how a rollout fans out: the claim that
+// starts one member or shard can leave the next one just as startable.
+//
+// A redispatch is excluded on purpose. A peer woken for it could claim the
+// same operation again the moment a fast failure settles it, and each such
+// claim would wake the next peer, spending the apply's retry budget at claim
+// speed instead of across poll intervals.
+func claimStartsOperation(op *storage.ApplyOperation) bool {
+	switch {
+	case state.IsState(op.State, state.ApplyOperation.Pending):
+		return true
+	case state.IsState(op.State, state.ApplyOperation.Stopped):
+		return true
+	default:
+		return false
+	}
+}
+
+// wakeIdleDriver hands the driver pool one wake token, so an idle peer runs
+// its claim ladder now rather than on its next poll tick. A driver calls it
+// after a claim that started an operation: the wake that queued the work
+// reached one driver, and whatever that start left claimable beside it, a
+// sibling target or the next shard, would otherwise wait out a poll interval.
+// Each peer that starts work wakes the next, so a fan-out spreads one claim at
+// a time up to the apply's driver cap, and the chain ends at the first peer
+// that finds nothing to start. Storage locking still decides ownership; the
+// token only runs a ladder sooner.
+func (s *Service) wakeIdleDriver(driverID int, op *storage.ApplyOperation) {
+	s.operatorMu.Lock()
+	wake := s.operatorWake
+	s.operatorMu.Unlock()
+
+	if wake == nil {
+		s.logger.Debug("operator: no running driver pool to wake beside a started operation; peers claim the work beside it on their next pass",
+			append(op.LogAttrs(), "driver", driverID)...)
+		return
+	}
+	select {
+	case wake <- struct{}{}:
+		s.logger.Debug("operator: woke a peer driver to claim the work beside a started operation",
+			append(op.LogAttrs(), "driver", driverID)...)
+	default:
+		s.logger.Debug("operator: every driver already has a wake pending; no further wake is needed beside a started operation",
+			append(op.LogAttrs(), "driver", driverID)...)
+	}
+}
+
 // recoverApplies claims and resumes work that needs attention. Each call
 // claims at most one unit — a pending-stop reconciliation, a barrier-parked
 // cutover, or an apply operation — to keep the drive loop responsive, and
@@ -936,6 +987,9 @@ func (s *Service) recoverApplyOperation(ctx context.Context, driverID int, owner
 		return claimFellThrough
 	}
 	defer s.markDriverBusy(ctx)()
+	if claimStartsOperation(op) {
+		s.wakeIdleDriver(driverID, op)
+	}
 
 	// The claim rotated a fresh operation lease onto the row. It is the
 	// capability that guards this operation's own writes — its state

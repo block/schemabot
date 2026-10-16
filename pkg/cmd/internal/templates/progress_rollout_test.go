@@ -678,7 +678,7 @@ func TestFormatTargetRollup_AllocationDoesNotScaleWithTargetsTimesTables(t *test
 		}
 	}
 	data.Tables = tables
-	model := presentation.Derive(ProgressOperationsForPresentation(data.Operations, data.Released))
+	model := presentation.Derive(ProgressOperationsForPresentation(data.Operations, data.Tables, data.Released))
 	groups := model.Groups()
 	require.Len(t, groups, 1)
 	view := RolloutView{ApplyID: data.ApplyID, Environment: data.Environment, Engine: data.Engine, Model: model, Tables: data.Tables}
@@ -1108,7 +1108,7 @@ func TestFormatTargetRollup_HeadlineCountsTargets(t *testing.T) {
 		{targets: []rolloutTarget{completedTarget(), copyingTarget(400)}, want: "🔄 1 completed · 1 running (2 targets)\n"},
 	} {
 		data := targetRolloutData(tc.targets)
-		model := presentation.Derive(ProgressOperationsForPresentation(data.Operations, data.Released))
+		model := presentation.Derive(ProgressOperationsForPresentation(data.Operations, data.Tables, data.Released))
 		view := RolloutView{ApplyID: data.ApplyID, Environment: data.Environment, Engine: data.Engine, Model: model, Tables: data.Tables}
 		out := ansiEscape.ReplaceAllString(FormatTargetRollup(view, model.Groups()[0]), "")
 		assert.True(t, strings.HasPrefix(out, tc.want), "want headline %q:\n%s", tc.want, out)

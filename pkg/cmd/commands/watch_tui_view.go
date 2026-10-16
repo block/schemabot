@@ -133,7 +133,7 @@ func (m WatchModel) progressSections() (string, string) {
 	}
 
 	if m.sharded {
-		if counts := templates.ShardCounts(m.operations, m.released); counts != "" {
+		if counts := templates.ShardCounts(m.operations, m.tables, m.released); counts != "" {
 			fmt.Fprintf(&b, "  Shards:  %s\n", counts)
 		}
 	}

@@ -8675,13 +8675,13 @@ No schema changes found for database 'new-db'
 
 **Deployments**: 1 ready for cutover, 1 running, 2 waiting
 
-- 🟢 `eu` — ready for cutover — next in order
+- 🟢 `eu` — ready for cutover
 - 🔄 `us` — running table copy
 - ⏳ `au` — waiting for us
 - ⏳ `ca` — waiting for us
 
 <details open>
-<summary>🟢 eu — ready for cutover — next in order</summary>
+<summary>🟢 eu — ready for cutover</summary>
 <dl><dd>
 
 **Database**: `payments_eu`
@@ -9023,13 +9023,13 @@ ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 
 **Deployments**: 1 ready for cutover, 1 running, 2 waiting
 
-- 🟢 `eu` — ready for cutover — next in order
+- 🟢 `eu` — ready for cutover
 - 🔄 `us` — running table copy
 - ⏳ `au` — waiting for us
 - ⏳ `ca` — waiting for us
 
 <details open>
-<summary>🟢 eu — ready for cutover — next in order</summary>
+<summary>🟢 eu — ready for cutover</summary>
 <dl><dd>
 
 **Database**: `payments_eu`
@@ -10145,7 +10145,7 @@ This schema change was cancelled and cannot be resumed. Open a new schema change
 │  Deployments:  1 ready for cutover · 1 running · 1 waiting  │
 └─────────────────────────────────────────────────────────────┘
 
-🟢 us-east — ready for cutover — next in order (orders-us-east)
+🟢 us-east — ready for cutover (orders-us-east)
 
      ~ orders: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 Waiting for cutover
        ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL;
@@ -11110,7 +11110,7 @@ Deployments: 1 ready for cutover · 1 running · 1 waiting
 Apply ID: apply-multi-a1b2c3d4
 Environment: production
 
-🟢 us-east — ready for cutover — next in order (orders-us-east)
+🟢 us-east — ready for cutover (orders-us-east)
   External operation ID: remote-op-us-east-001
   External apply ID: remote-apply-us-east-001
 

@@ -746,8 +746,8 @@ func (c *GRPCClient) processPendingCutoverControlRequest(ctx context.Context, ap
 		// The apply being ready says only that some member is parked. The
 		// Cutover call below goes to this drive's own remote apply, so the
 		// request is this drive's to take only when its own member is parked
-		// and it is that member's turn; every other drive leaves it pending for
-		// the member whose turn it is.
+		// and no earlier member holds it; every other drive leaves it pending
+		// for the member that may take it.
 		turn, err := operationCutoverRequestTurn(ctx, c.storage, apply, scope, controlReq)
 		if err != nil {
 			return fmt.Errorf("check cutover turn for apply %s: %w", apply.ApplyIdentifier, err)
@@ -773,7 +773,7 @@ func (c *GRPCClient) processPendingCutoverControlRequest(ctx context.Context, ap
 				return failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCutover,
 					fmt.Sprintf("cutover request was not applied because the member it was accepted for is %s", turn.blocker.State))
 			case cutoverRequestUnsettled:
-				logger.InfoContext(ctx, "pending gRPC cutover request left for the member whose turn it is", attrs...)
+				logger.InfoContext(ctx, "pending gRPC cutover request left for the member that may take it", attrs...)
 			}
 			return nil
 		}
@@ -2862,7 +2862,7 @@ func (c *GRPCClient) startStoppedTasklessRemoteApply(ctx context.Context, apply 
 // ResumeApplyOperationCutover drives a single barrier-parked apply_operation
 // through its cutover phase over the remote (gRPC) path. It is the
 // deployment-ordered counterpart to ResumeApplyOperation's copy drive: the
-// operator claims the parked operation whose turn it is and calls this to force
+// operator claims a parked operation no earlier member holds and calls this to force
 // the remote swap, while siblings stay parked. The operation's per-operation
 // remote apply id is authoritative — the drive never falls back to the parent
 // apply's external id and never writes the parent applies row directly, since
@@ -3473,12 +3473,14 @@ func shouldDispatchQueuedRemoteApply(apply *storage.Apply, scope applyTaskScope)
 	if state.IsState(dispatchState, state.Apply.Running) {
 		return true
 	}
-	// A stop catches still-pending operations before they start and moves them
-	// to stopped without a started_at; the start claim then moves the row to
-	// resuming. Such a row never ran, so it was never dispatched either, and
-	// resuming it is its first dispatch. A resuming row that had started is
-	// not: it may have reached remote Tern before its id was stored.
-	return state.IsState(dispatchState, state.Apply.Resuming) && scope.operation.StartedAt == nil
+	// A stop moves an operation with no remote id to stopped in storage alone,
+	// whether it was still pending or had been claimed but not yet dispatched,
+	// and the start claim then moves the row to resuming. Resuming it is a
+	// dispatch under the same reasoning as a running row: the deployment's
+	// key never rotates, so if an earlier dispatch did reach the data plane
+	// the data plane replays that operation rather than starting a second
+	// copy, and otherwise this attaches it for the first time.
+	return state.IsState(dispatchState, state.Apply.Resuming)
 }
 
 // undispatchedControlRequestSettlesLocally reports whether a pending stop or

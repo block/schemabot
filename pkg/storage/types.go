@@ -57,16 +57,18 @@ const (
 	CutoverPolicyRolling = "rolling"
 
 	// CutoverPolicyBarrier lets later deployments run their copy phase once
-	// earlier siblings reach the cutover barrier, while cutover stays ordered.
+	// earlier siblings reach the cutover barrier. Deployments then cut over
+	// strictly in order, each once every earlier deployment has completed.
+	// Within one deployment each target cuts over as soon as its own copy is
+	// parked; an earlier target holds a later one's cutover only while it has
+	// failed, is retrying, or was stopped, cancelled or reverted.
 	CutoverPolicyBarrier = "barrier"
 
 	// CutoverPolicyParallel drops copy-phase ordering: deployments copy
-	// concurrently, bounded by the driver cap and on_failure admission. Only
-	// the cutover phase stays deployment-ordered, exactly like barrier. This
-	// collapses copy wall-clock toward "longest copy" for rollouts whose
-	// hours-long copy dominates, while preserving the ordered, one-at-a-time
-	// cutover swaps. It is the default for an environment whose every member
-	// comes from a targets list.
+	// concurrently, bounded by the driver cap and on_failure admission, and
+	// cut over exactly like barrier. This collapses wall-clock toward "longest
+	// copy" for rollouts whose hours-long copy dominates. It is the default for
+	// an environment whose every member comes from a targets list.
 	CutoverPolicyParallel = "parallel"
 )
 
@@ -1505,6 +1507,42 @@ func (op *ApplyOperation) HasFreshLease(now time.Time) bool {
 	return now.Sub(op.UpdatedAt) < ApplyLeaseStaleAfter
 }
 
+// CutoverHoldState returns the state in which op, an earlier member of an
+// ordered rollout, holds a later member's cutover, as
+// FindNextApplyOperationCutover and CutoverBlocker read it. A row in a state
+// the rollout halts on holds in that state. A live drive riding out a
+// data-plane retry keeps its row active and records the retry only on the
+// operation's tasks, so an active row with a retrying task holds as
+// failed_retryable. Otherwise the row's own state is returned, the state an
+// earlier deployment that has not yet completed holds in. tasks are op's own
+// tasks.
+func (op *ApplyOperation) CutoverHoldState(tasks []*Task) string {
+	if state.IsState(op.State,
+		state.ApplyOperation.Failed,
+		state.ApplyOperation.FailedRetryable,
+		state.ApplyOperation.Stopped,
+		state.ApplyOperation.Cancelled,
+		state.ApplyOperation.Reverted,
+	) {
+		return op.State
+	}
+	if TasksRetrying(tasks) {
+		return state.ApplyOperation.FailedRetryable
+	}
+	return op.State
+}
+
+// TasksRetrying reports whether any of tasks is riding out a retryable
+// failure.
+func TasksRetrying(tasks []*Task) bool {
+	for _, task := range tasks {
+		if state.IsState(task.State, state.Task.FailedRetryable) {
+			return true
+		}
+	}
+	return false
+}
+
 // Lease returns the ownership token for this apply_operation.
 func (op *ApplyOperation) Lease() OperationLease {
 	if op == nil {
@@ -1706,7 +1744,7 @@ func MirroredControlRequestMetadata() []byte {
 // cutoverRequestOperationMetadataKey binds a cutover request to the one
 // operation that is to take it. A cutover request is apply-level, so under an
 // ordered cutover policy the binding is what keeps one operator command on the
-// member whose turn it was when the command was accepted, rather than letting
+// member it was accepted for, rather than letting
 // it pass on to the next member once that one has finished.
 const cutoverRequestOperationMetadataKey = "apply_operation_id"
 

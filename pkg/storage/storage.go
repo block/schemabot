@@ -1535,29 +1535,39 @@ type ApplyOperationStore interface {
 	// target) pair, so the targets of one deployment are ordered exactly like the
 	// deployments of a map, while the operations of one member (a sharded
 	// target's per-shard work) do not gate each other's start. Under barrier
-	// and parallel they are still ordered at cutover, by
-	// FindNextApplyOperationCutover; under rolling they cut over in their own
-	// drives. A member's finalizer starts only once the work it finalizes has
-	// completed, and it waits on earlier members as rolling does, for them to
-	// complete, under every policy.
+	// and parallel they cut over through FindNextApplyOperationCutover; under
+	// rolling they cut over in their own drives. A member's finalizer starts
+	// only once the work it finalizes has completed. Under rolling it then
+	// waits for every earlier member to complete; under barrier and parallel it
+	// waits for every earlier deployment to complete, and an earlier target of
+	// its own deployment holds it only while that target has failed, is
+	// retrying, or was stopped, cancelled or reverted, as at cutover.
 	//
 	// owner identifies the claiming driver and is required; it is recorded as
 	// the operation's lease owner. Returns the claimed row, or nil if nothing
-	// needs work.
+	// needs work. A row claimed from pending or stopped is returned with the
+	// state it was claimed from, which is how the caller tells a claim that
+	// starts an operation from a retry or a recovery.
 	FindNextApplyOperation(ctx context.Context, owner string) (*ApplyOperation, error)
 
 	// FindNextApplyOperationCutover atomically claims the next operation parked
-	// at the cutover barrier whose turn it is, in deployment order, and rotates a
-	// fresh operation lease onto it in the same transaction. It is the cutover
+	// at the cutover barrier that no earlier sibling holds, and rotates a fresh
+	// operation lease onto it in the same transaction. It is the cutover
 	// counterpart to FindNextApplyOperation: that primitive gates the copy phase
 	// (claims pending rows → running); this one gates the cutover phase.
 	//
-	// A waiting_for_cutover row is claimed and transitioned to cutting_over only
-	// when every earlier operation of the apply has reached completed (the
-	// cutover gate is completed-only, with the on_failure "continue" exemption
-	// for a terminal-failed earlier sibling) and no pending stop control request
-	// exists for the apply. The gate covers every earlier operation, whichever
-	// member it belongs to, so one member's shards also cut over one at a time.
+	// A waiting_for_cutover row is claimed and transitioned to cutting_over
+	// once it is parked, unless an earlier operation of another deployment has
+	// not completed, so deployments cut over strictly in order; an earlier
+	// operation of its own deployment has failed, is retrying (by its own state
+	// or a task retrying under it), or was stopped, cancelled or reverted (with
+	// the on_failure "continue" exemption for a terminal-failed one); a stop
+	// control request is pending
+	// for the apply, or the apply already has as many cutovers in flight as its
+	// per-apply driver cap allows. The cap is admitted under a lock on the
+	// parent apply row, so concurrent drivers cannot overshoot it. An earlier
+	// target of the same deployment that is still copying or cutting over does
+	// not hold it.
 	// Separately, a row already in cutting_over or
 	// revert_window whose heartbeat has been stale for more than one minute is
 	// re-leased without changing its state — recovering an in-flight cutover whose
@@ -1569,16 +1579,17 @@ type ApplyOperationStore interface {
 
 	// CutoverBlocker returns the earliest earlier operation of another rollout
 	// member (deployment, target) that holds the operation's cutover, or nil
-	// when it is that operation's turn. It applies the same rule as
-	// FindNextApplyOperationCutover: an earlier sibling holds until it has
-	// completed, unless the rollout's on_failure policy continues past its
-	// terminal failure. A manually requested cutover uses it so that it lands
-	// on the member whose turn it is, in the order the automatic cutover claim
-	// would follow between members. Operations of the same member, its shards
-	// and tables, never hold each other's requested cutover: the request
+	// when nothing does. It applies the same rule as
+	// FindNextApplyOperationCutover: an earlier operation of another deployment
+	// holds until it has completed, and one of the same deployment holds only
+	// while it has failed, is retrying (by its own state or a task under it),
+	// or was stopped, cancelled or reverted, unless the rollout's on_failure
+	// policy continues past its terminal failure. A
+	// manually requested cutover uses it so that it is held exactly where the
+	// automatic cutover claim would be. Operations of the same member, its
+	// shards and tables, never hold each other's requested cutover: the request
 	// addresses the member's remote apply, which takes whichever of them are
-	// parked. The automatic claim still cuts them over one at a time. It claims
-	// nothing.
+	// parked. It claims nothing.
 	CutoverBlocker(ctx context.Context, operationID int64) (*ApplyOperation, error)
 
 	// ReleaseClaim releases an operation lease the calling driver holds but
