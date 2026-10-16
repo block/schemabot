@@ -108,3 +108,72 @@ func TestRenderApplyStartedReflectsWhetherTheApplyHasStarted(t *testing.T) {
 	assert.Contains(t, running, "Schema changes are being applied. This comment will be updated with progress.")
 	assert.NotContains(t, running, "Queued")
 }
+
+// An apply commented while this PR's own apply is still active names the step
+// that state is waiting on, when it waits on an operator, and always ends with
+// the apply to paste once the active one finishes.
+func TestRenderApplyInProgressNamesTheNextStep(t *testing.T) {
+	base := ApplyLockConflictData{
+		Database:          "orders",
+		Environment:       "staging",
+		RequestedBy:       "alice",
+		ApplyID:           "apply-abc123",
+		Tenant:            "payments",
+		ApplyAgainCommand: "schemabot apply -e staging --tenant payments",
+	}
+	applyAgain := "apply again:\n```\nschemabot apply -e staging --tenant payments\n```\n"
+
+	t.Run("a running apply is waited on, then applied again", func(t *testing.T) {
+		data := base
+		data.ApplyState = state.Apply.Running
+		out := RenderApplyInProgress(data)
+		assert.Contains(t, out, "This PR's apply `apply-abc123` is still running (state: `running`), so a second apply cannot start.")
+		assert.Contains(t, out, "Once it finishes, "+applyAgain)
+		assert.NotContains(t, out, "schemabot cutover")
+		assert.NotContains(t, out, "schemabot skip-revert")
+	})
+
+	t.Run("a deferred cutover names the cutover command first", func(t *testing.T) {
+		data := base
+		data.ApplyState = state.Apply.WaitingForCutover
+		data.DeferCutover = true
+		out := RenderApplyInProgress(data)
+		assert.Contains(t, out, "This PR's apply `apply-abc123` is waiting for cutover, so a second apply cannot start.")
+		assert.Contains(t, out, "To cut over:\n```\nschemabot cutover apply-abc123 -e staging --tenant payments\n```\n")
+		assert.Contains(t, out, "Once it completes, "+applyAgain)
+		assert.Less(t, strings.Index(out, "schemabot cutover"), strings.Index(out, "schemabot apply"))
+	})
+
+	t.Run("a cutover SchemaBot triggers itself is only waited on", func(t *testing.T) {
+		data := base
+		data.ApplyState = state.Apply.WaitingForCutover
+		out := RenderApplyInProgress(data)
+		assert.Contains(t, out, "is still running (state: `waiting_for_cutover`)")
+		assert.NotContains(t, out, "schemabot cutover")
+		assert.Contains(t, out, "Once it finishes, "+applyAgain)
+	})
+
+	t.Run("a deploy request waiting to deploy names the cutover command", func(t *testing.T) {
+		data := base
+		data.ApplyState = state.Apply.WaitingForDeploy
+		out := RenderApplyInProgress(data)
+		assert.Contains(t, out, "To cut over:\n```\nschemabot cutover apply-abc123 -e staging --tenant payments\n```\n")
+	})
+
+	t.Run("an open revert window names skip-revert", func(t *testing.T) {
+		data := base
+		data.ApplyState = state.Apply.RevertWindow
+		out := RenderApplyInProgress(data)
+		assert.Contains(t, out, "This PR's apply `apply-abc123` is in its revert window, so a second apply cannot start.")
+		assert.Contains(t, out, "To keep its changes and close the window:\n```\nschemabot skip-revert apply-abc123 -e staging --tenant payments\n```\n")
+		assert.Contains(t, out, "Once it completes, "+applyAgain)
+	})
+
+	t.Run("without a rendered apply command the plain apply is offered", func(t *testing.T) {
+		data := base
+		data.ApplyState = state.Apply.Running
+		data.ApplyAgainCommand = ""
+		out := RenderApplyInProgress(data)
+		assert.Contains(t, out, "apply again:\n```\nschemabot apply -e staging --tenant payments\n```\n")
+	})
+}

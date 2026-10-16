@@ -3980,9 +3980,12 @@ schemabot unlock -d testapp --force
 
 *Requested by @jackjackbits at 2026-01-01 00:00:00 UTC*
 
-An apply is already running for this PR (apply ID: `apply-a1b2c3d4e5f6`, state: `running`).
+This PR's apply `apply-a1b2c3d4e5f6` is still running (state: `running`), so a second apply cannot start.
 
-Wait for it to complete or stop it first.
+Once it finishes, apply again:
+```
+schemabot apply -e staging
+```
 
 </details>
 
