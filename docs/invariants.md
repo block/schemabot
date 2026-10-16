@@ -529,8 +529,16 @@ check as not passing, so having nothing to say has to be said rather than left e
 logic applies in reverse. When SchemaBot expects a check, environment, or config and cannot find
 it, that reads as blocking, never as not-applicable. A gate must not be removable by the very
 change it guards. *Enforced:* aggregate creation on head-commit events
-(`pkg/webhook/check_suite.go`, `pkg/webhook/pull_request.go`); required-check and
-environment-ordering gates (`pkg/webhook/apply_gating.go`, `pkg/webhook/check_prior_env.go`).
+(`pkg/webhook/check_suite.go`, `pkg/webhook/pull_request.go`); config discovery, the command
+path's choice of discovery over a passing refresh, and the aggregate leader's expected-participant
+match, which all read the schema paths a PR vacates as well as those it changes
+(`FindConfigsForPRFiles` in `pkg/github/config.go`, `prHasCurrentSchemaBotFiles` in
+`pkg/webhook/schema_reconciliation.go`, `prFilePaths` in `pkg/webhook/check_publisher.go`);
+required-check and environment-ordering gates (`pkg/webhook/apply_gating.go`,
+`pkg/webhook/check_prior_env.go`); an environment that could not plan while another of the same
+multi-environment plan did, stored as a failing check, or, when that row cannot be stored, a
+failing aggregate carrying a block no fold replaces (`storePlanFailedCheck` in
+`pkg/webhook/check_records.go`, called by `handleMultiEnvPlan` in `pkg/webhook/plan.go`).
 
 ### MG-3: The rollup is conservative
 
@@ -1212,7 +1220,9 @@ a remote state still in motion. *Enforced:* terminal-truth preflights on the con
 engine's settled outcome onto the task rows before a pending command is consumed
 (`pkg/tern/local_control_reconcile.go`); the in-process engine's settled outcome checks on stop
 and cancel (`pkg/engine/spirit/control.go`), including a completion its run records after the
-cancel (`pkg/engine/spirit/execution.go`).
+cancel, and its run's deference to a stop or cancel that interrupted it, which no failure the run
+records afterwards replaces (`setSchemaChangeFailed`, `pkg/engine/spirit/execution.go`,
+`pkg/engine/spirit/direct.go`).
 
 ### CO-4: Stop wins
 
@@ -1239,7 +1249,9 @@ skip-revert in flight — stop, cancel, and cutover are refused for the whole ph
 keeps driving the phase to its own outcome rather than settling on the refused command, because
 storage must never settle on a state that contradicts what the engine is still doing to the
 database underneath. *Enforced:* the revert-phase gate on the control path
-(`pkg/tern/local_control.go`), and the drive loops that act on its answer
+(`pkg/tern/local_control.go`), the resolution of a revert or skip-revert through the apply the
+request names and that apply's own live task (`activeTaskForControlApply`,
+`pkg/tern/local_control.go`), and the drive loops that act on its answer
 (`pkg/tern/local_apply_grouped.go`, `pkg/tern/local_apply_sequential.go`,
 `pkg/tern/local_control_resume.go`, `pkg/tern/grpc_client.go`).
 
@@ -1264,7 +1276,9 @@ Data-plane RPCs identify work by the operation's `external_id`, while every user
 to a data plane is a routing bug, and the internal numeric row ID appears on no surface at all.
 *Enforced:* the remote apply ID invariant
 ([grpc-control-edge-cases.md](grpc-control-edge-cases.md)); ID resolution at the API boundary
-(`pkg/api/control_handlers.go`).
+(`pkg/api/control_handlers.go`); and the local client's resolution of a control request's apply
+identifier within its own database and environment scope (`resolveControlApply` and
+`activeTaskForControlApply`, `pkg/tern/local_control.go`).
 
 ### CO-8: A stop that cannot pause is refused, never quietly made permanent
 
@@ -1652,7 +1666,11 @@ is passed (`blockRollbackUnsafeWithoutOptIn` and `rollbackPlanUnsafeChanges` in
 `pkg/webhook/rollback.go`). The rollback pin lasts only as long as the plan comment that names
 those changes: when that comment cannot be posted, `rollback` withdraws its pin before returning
 (`withdrawUndisclosedRollbackPin` in `pkg/webhook/rollback.go`, over the conditional
-`LockStore.ClearPendingPlanID`).
+`LockStore.ClearPendingPlanID`). On the data plane, apply admission requires the opt-in for the
+applying deployment's own re-planned unsafe verdicts, stamped onto the materialized plan and the
+dispatch scope, with a shard dispatch this deployment never re-planned treated as unsafe
+(`pkg/tern/local_plan_drift.go`, gated by `rejectUnsafeDDLChangesWithoutOptIn` in
+`pkg/tern/local_client.go`).
 
 ### RV-4: Engine refusals are known at plan time and gate the apply
 
@@ -1848,9 +1866,11 @@ both the same. This relies on the default branch requiring review for every chan
 it: a change pushed to it without review is carried past an earlier approval as default branch
 content. *Enforced:* the review gate and actor
 authorization (`pkg/webhook/review_gate.go`, `pkg/webhook/actor_authorization.go`), with the
-comparison in `PRSchemaChangeUnchangedSince` (`pkg/github/client.go`), which proves a MySQL-family
-schema file both the change and the default branch edited generates the same statements with
-`SameTableChange` (`pkg/ddl/table_change.go`).
+comparison in `PRSchemaChangeUnchangedSince` (`pkg/github/client.go`), which proves a schema file
+both the change and the default branch edited generates the same statements: with
+`SameTableChange` (`pkg/ddl/table_change.go`) for MySQL-family files, and on the environment's
+primary target with `CompareSchemaFileChange` (`pkg/engine/postgres/table_change.go`) for
+PostgreSQL files.
 
 ### AZ-5: Commands never guess
 

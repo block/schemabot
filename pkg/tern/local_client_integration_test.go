@@ -3920,13 +3920,14 @@ func TestLocalClient_Revert_NoActiveMigration(t *testing.T) {
 	defer utils.CloseAndLog(client)
 
 	ctx := t.Context()
-	// Revert requires an active schema change - returns error when none exists
+	// Revert acts on the apply it names - returns error when that apply does not exist
 	_, err = client.Revert(ctx, &ternv1.RevertRequest{
+		ApplyId:     "apply-missing",
 		Environment: localClientTestEnvironment,
 	})
-	require.Error(t, err, "expected Revert() to return error when no active schema change")
-	// Error should mention no active schema change
-	assert.Contains(t, err.Error(), "no active schema change")
+	require.Error(t, err, "expected Revert() to return error when the apply does not exist")
+	assert.ErrorIs(t, err, storage.ErrApplyNotFound)
+	assert.Contains(t, err.Error(), "apply-missing")
 }
 
 func TestLocalClient_SkipRevert_NoActiveMigration(t *testing.T) {
@@ -3950,13 +3951,14 @@ func TestLocalClient_SkipRevert_NoActiveMigration(t *testing.T) {
 	defer utils.CloseAndLog(client)
 
 	ctx := t.Context()
-	// SkipRevert requires an active schema change - returns error when none exists
+	// SkipRevert acts on the apply it names - returns error when that apply does not exist
 	_, err = client.SkipRevert(ctx, &ternv1.SkipRevertRequest{
+		ApplyId:     "apply-missing",
 		Environment: localClientTestEnvironment,
 	})
-	require.Error(t, err, "expected SkipRevert() to return error when no active schema change")
-	// Error should mention no active schema change
-	assert.Contains(t, err.Error(), "no active schema change")
+	require.Error(t, err, "expected SkipRevert() to return error when the apply does not exist")
+	assert.ErrorIs(t, err, storage.ErrApplyNotFound)
+	assert.Contains(t, err.Error(), "apply-missing")
 }
 
 // TestLocalClient_Apply_MultiTableSequential tests applying changes to multiple
