@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"slices"
 	"time"
 
 	ps "github.com/planetscale/planetscale-go/planetscale"
@@ -111,12 +112,28 @@ func deployRequestNeverDeployed(dr *ps.DeployRequest) bool {
 // its deploy request but kept for the operator. Each outcome is logged with the
 // identifiers needed to finish the cleanup by hand; the caller returns cause
 // unchanged whatever happens here.
+//
+// ctx is the drive's context. Until the drive returns, the apply is not settled
+// failed, and a drive whose context ends is handed back for a successor to
+// resume against this deploy request and branch, so the cleanup stops issuing
+// requests as soon as ctx ends.
 func (e *Engine) retireDeployRequestOfFailedApply(ctx context.Context, logger *slog.Logger, client psclient.PSClient, org, database string, number uint64, ownedBranch string, cause error) {
 	attrs := []any{"organization", org, "planetscale_database", database, "deploy_request", number, "branch", ownedBranch, "apply_error", cause}
+	driveEnded := func(during string) bool {
+		if ctx.Err() == nil {
+			return false
+		}
+		logger.Warn("drive ended "+during+"; stopping the cleanup of a failed apply's deploy request and leaving the deploy request and branch to the driver that takes over the apply",
+			append(attrs, "error", ctx.Err())...)
+		return true
+	}
 	closeCtx, cancel := context.WithTimeout(ctx, deployRequestCloseTimeout)
 	defer cancel()
 
 	dr, err := e.getDeployRequest(closeCtx, client, org, database, number)
+	if driveEnded("while reading the deploy request") {
+		return
+	}
 	if err != nil {
 		logger.Error("failed to read the deploy request of a failed apply; close it manually if it never deployed, and delete its branch to reclaim branch quota",
 			append(attrs, "error", err)...)
@@ -135,6 +152,15 @@ func (e *Engine) retireDeployRequestOfFailedApply(ctx context.Context, logger *s
 			Database:     database,
 			Number:       number,
 		})
+		if ctx.Err() != nil {
+			endedAttrs := append(slices.Clone(attrs), "error", ctx.Err())
+			if closeErr != nil {
+				endedAttrs = append(endedAttrs, "close_error", closeErr)
+			}
+			logger.Warn("drive ended while closing the deploy request of a failed apply; the close may already have landed; leaving the branch to the driver that takes over the apply",
+				endedAttrs...)
+			return
+		}
 		if closeErr != nil {
 			logger.Error("failed to close the undeployed deploy request of a failed apply; close it manually, and delete its branch to reclaim branch quota",
 				append(attrs, "deployment_state", dr.DeploymentState, "error", closeErr)...)
@@ -157,8 +183,14 @@ func (e *Engine) retireDeployRequestOfFailedApply(ctx context.Context, logger *s
 		logger.Info("the failed apply ran on an operator-supplied branch; keeping it for the operator", attrs...)
 		return
 	}
+	if driveEnded("before deleting the branch") {
+		return
+	}
 	alreadyGone, err := deleteBranch(ctx, client, org, database, ownedBranch)
 	switch {
+	case err != nil && ctx.Err() != nil:
+		logger.Warn("drive ended while deleting the branch of a failed apply after closing its deploy request; abandoned the delete request, which may already have landed",
+			append(attrs, "error", err)...)
 	case err != nil:
 		logger.Error("failed to delete the branch of a failed apply after closing its deploy request; delete it manually to reclaim branch quota",
 			append(attrs, "error", err)...)

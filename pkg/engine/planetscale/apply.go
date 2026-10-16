@@ -203,10 +203,14 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (result *e
 	// auto_delete_branch never fires, so the branch stays against quota. A
 	// failure, as opposed to a drive whose context ended, settles the apply
 	// failed and no driver comes back for it, so the deploy request is closed
-	// and the branch SchemaBot created for it deleted, under a context detached
-	// from the drive. A drive whose context ended is handing the apply back (or
-	// an operator's cancel is retiring the deploy request through the engine's
-	// Cancel), so the deploy request is left to whoever takes it over.
+	// and the branch SchemaBot created for it deleted. A drive whose context
+	// ended is handing the apply back (or an operator's cancel is retiring the
+	// deploy request through the engine's Cancel), so the deploy request is
+	// left to whoever takes it over. The apply is not settled failed until this
+	// drive returns, and a drive that loses its lease during the cleanup is
+	// handed back like any other, so the cleanup runs under the drive's context
+	// and stops at the first sign of it ending rather than closing or deleting
+	// what a successor resumes against.
 	// createdDeployRequest names the deploy request; deployRequestBranch is the
 	// branch it took over from ownedBranch, empty for an operator-supplied one.
 	var createdDeployRequest uint64
@@ -220,7 +224,7 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (result *e
 				"organization", org, "planetscale_database", req.Database, "deploy_request", createdDeployRequest, "branch", branchName, "apply_error", retErr)
 			return
 		}
-		e.retireDeployRequestOfFailedApply(context.WithoutCancel(ctx), e.applyLogger(req), client, org, req.Database, createdDeployRequest, deployRequestBranch, retErr)
+		e.retireDeployRequestOfFailedApply(ctx, e.applyLogger(req), client, org, req.Database, createdDeployRequest, deployRequestBranch, retErr)
 	}()
 
 	if existingBranch != "" {
