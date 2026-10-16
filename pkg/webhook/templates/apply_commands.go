@@ -27,6 +27,18 @@ type ApplyLockConflictData struct {
 	// Active apply info (for "apply in progress" case)
 	ApplyID    string
 	ApplyState string
+	// ApplyEnvironment is the active apply's own environment, which a PR's
+	// applies in other environments can block. The control commands address
+	// it; empty means the requested environment.
+	ApplyEnvironment string
+	// DeferCutover is the active apply's own option: when set, its
+	// waiting_for_cutover state waits on an operator's cutover command
+	// rather than on SchemaBot.
+	DeferCutover bool
+	// ApplyAgainCommand is the apply the requester commented, rendered so it
+	// can be pasted once the active apply finishes. Empty renders the
+	// environment's plain apply command.
+	ApplyAgainCommand string
 
 	// CLIName is the tool name the comment's CLI command hints start with,
 	// the server's cli_name. Empty renders the CLI's own default.
@@ -441,7 +453,10 @@ func cliUnlockArgs(database, databaseType string) string {
 	return args
 }
 
-// RenderApplyInProgress renders a comment when the same PR already has an active apply.
+// RenderApplyInProgress renders a comment when the same PR already has an active
+// apply. The active apply's state decides the next step: one waiting on an
+// operator command (a deferred cutover or deploy, an open revert window) names
+// that command, and every state ends with the apply to run once it finishes.
 func RenderApplyInProgress(data ApplyLockConflictData) string {
 	var sb strings.Builder
 
@@ -449,11 +464,51 @@ func RenderApplyInProgress(data ApplyLockConflictData) string {
 	writeDBLine(&sb, data.Database)
 	writeRequesterOrTimestamp(&sb, data.RequestedBy)
 	sb.WriteString("\n")
-	fmt.Fprintf(&sb, "An apply is already running for this PR (apply ID: `%s`, state: `%s`).\n\n",
-		data.ApplyID, data.ApplyState)
-	sb.WriteString("Wait for it to complete or stop it first.\n")
+
+	applyAgain := data.ApplyAgainCommand
+	if applyAgain == "" {
+		applyAgain = appendTenantFlag("schemabot apply -e "+data.Environment, data.Tenant)
+	}
+	applyEnvironment := data.ApplyEnvironment
+	if applyEnvironment == "" {
+		applyEnvironment = data.Environment
+	}
+	control := func(verb string) string {
+		return appendTenantFlag(fmt.Sprintf("schemabot %s %s -e %s", verb, data.ApplyID, applyEnvironment), data.Tenant)
+	}
+	// An apply in another environment is named by it, since the heading
+	// names the requested one.
+	activeApply := "This PR's apply"
+	if applyEnvironment != data.Environment {
+		activeApply = "This PR's " + applyEnvironment + " apply"
+	}
+
+	switch {
+	case activeApplyAwaitsCutover(data):
+		fmt.Fprintf(&sb, "%s `%s` is waiting for cutover, so a second apply cannot start.\n\n", activeApply, data.ApplyID)
+		fmt.Fprintf(&sb, "To cut over:\n```\n%s\n```\n\n", control("cutover"))
+		fmt.Fprintf(&sb, "Once it completes, apply again:\n```\n%s\n```\n", applyAgain)
+	case state.IsState(data.ApplyState, state.Apply.RevertWindow):
+		fmt.Fprintf(&sb, "%s `%s` is in its revert window, so a second apply cannot start.\n\n", activeApply, data.ApplyID)
+		fmt.Fprintf(&sb, "To keep its changes and close the window:\n```\n%s\n```\n\n", control("skip-revert"))
+		fmt.Fprintf(&sb, "Once it completes, apply again:\n```\n%s\n```\n", applyAgain)
+	default:
+		fmt.Fprintf(&sb, "%s `%s` is still running (state: `%s`), so a second apply cannot start.\n\n", activeApply, data.ApplyID, data.ApplyState)
+		fmt.Fprintf(&sb, "Once it finishes, apply again:\n```\n%s\n```\n", applyAgain)
+	}
 
 	return sb.String()
+}
+
+// activeApplyAwaitsCutover reports whether the active apply is parked until an
+// operator triggers its cutover: a deploy request waiting to be deployed always
+// is, and a waiting_for_cutover apply is only when it was started with deferred
+// cutover (otherwise SchemaBot cuts over on its own).
+func activeApplyAwaitsCutover(data ApplyLockConflictData) bool {
+	if state.IsState(data.ApplyState, state.Apply.WaitingForDeploy) {
+		return true
+	}
+	return data.DeferCutover && state.IsState(data.ApplyState, state.Apply.WaitingForCutover)
 }
 
 // RenderApplyBlockedClosedPR renders a rejection when an apply command targets

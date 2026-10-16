@@ -1388,12 +1388,13 @@ func PreviewCommentApplyBlockedByCLI() string {
 // PreviewCommentApplyInProgress renders a sample "apply already in progress" comment.
 func PreviewCommentApplyInProgress() string {
 	return RenderApplyInProgress(ApplyLockConflictData{
-		Database:     "testapp",
-		DatabaseType: "mysql",
-		Environment:  "staging",
-		RequestedBy:  previewRequestedBy,
-		ApplyID:      "apply-a1b2c3d4e5f6",
-		ApplyState:   "running",
+		Database:          "testapp",
+		DatabaseType:      "mysql",
+		Environment:       "staging",
+		RequestedBy:       previewRequestedBy,
+		ApplyID:           "apply-a1b2c3d4e5f6",
+		ApplyState:        "running",
+		ApplyAgainCommand: ApplyCommand("staging", "", ApplyCommandOptions{}),
 	})
 }
 
