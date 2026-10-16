@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"os/exec"
 	"slices"
 	"strings"
 	"testing"
@@ -187,6 +188,7 @@ func cleanupRolloutState(t *testing.T) {
 	t.Helper()
 	cleanupState(t)
 	dsns := storageDSNs(t)
+	since := time.Now().UTC()
 	t.Cleanup(func() {
 		if !t.Failed() {
 			return
@@ -194,7 +196,52 @@ func cleanupRolloutState(t *testing.T) {
 		for i, plane := range []string{"data plane", "control plane"} {
 			t.Logf("%s storage at failure:\n%s", plane, dumpRolloutRows(dsns[i]))
 		}
+		for _, instance := range []string{"control-plane-mt", "data-plane-mt"} {
+			t.Logf("%s logs since the test started:\n%s", instance, rolloutPodLogs(instance, since))
+		}
 	})
+}
+
+// rolloutPodLogLine reports whether a pod log line belongs in a failure dump:
+// everything at info and above, and the debug lines that say why an operation
+// did or did not start.
+func rolloutPodLogLine(line string) bool {
+	if !strings.Contains(line, `"level":"DEBUG"`) {
+		return true
+	}
+	for _, keep := range []string{"conflict check", "claim", "dispatch", "potentially stale"} {
+		if strings.Contains(line, keep) {
+			return true
+		}
+	}
+	return false
+}
+
+// rolloutPodLogs renders the logs every pod of instance wrote since since,
+// filtered by rolloutPodLogLine. It runs in test cleanup, after the test's own
+// context is cancelled, so it carries its own deadline.
+func rolloutPodLogs(instance string, since time.Time) string {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	pods, err := exec.CommandContext(ctx, "kubectl", "get", "pod", "-n", k8sNamespace, "-l", "app.kubernetes.io/instance="+instance, "-o", "name").Output()
+	if err != nil {
+		return fmt.Sprintf("list pods: %v", err)
+	}
+	var b strings.Builder
+	for pod := range strings.FieldsSeq(string(pods)) {
+		out, err := exec.CommandContext(ctx, "kubectl", "logs", "-n", k8sNamespace, pod, "--since-time="+since.Format(time.RFC3339)).CombinedOutput()
+		if err != nil {
+			fmt.Fprintf(&b, "  %s: kubectl logs: %v\n", pod, err)
+			continue
+		}
+		fmt.Fprintf(&b, "  %s\n", pod)
+		for line := range strings.SplitSeq(string(out), "\n") {
+			if line != "" && rolloutPodLogLine(line) {
+				fmt.Fprintf(&b, "    %s\n", line)
+			}
+		}
+	}
+	return b.String()
 }
 
 // dumpRolloutRows renders the applies, operations, tasks, and control
@@ -209,7 +256,7 @@ func dumpRolloutRows(dsn string) string {
 	defer cancel()
 	queries := []string{
 		"SELECT id, apply_identifier, state, external_id, lease_owner, attempt, updated_at, error_message FROM applies ORDER BY id",
-		"SELECT id, apply_id, operation_key, state, external_id, external_operation_id, lease_owner, lease_token, attempt, started_at, updated_at, error_message FROM apply_operations ORDER BY id",
+		"SELECT id, apply_id, operation_key, state, cutover_policy, on_failure, external_id, external_operation_id, lease_owner, lease_token, attempt, created_at, started_at, updated_at, error_message FROM apply_operations ORDER BY id",
 		"SELECT id, apply_id, apply_operation_id, table_name, state, rows_copied, rows_total, attempt, updated_at FROM tasks ORDER BY id",
 		"SELECT id, apply_id, operation, status, error_message, updated_at FROM apply_control_requests ORDER BY id",
 	}
