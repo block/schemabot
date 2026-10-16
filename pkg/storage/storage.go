@@ -1538,9 +1538,10 @@ type ApplyOperationStore interface {
 	// and parallel they cut over through FindNextApplyOperationCutover; under
 	// rolling they cut over in their own drives. A member's finalizer starts
 	// only once the work it finalizes has completed. Under rolling it then
-	// waits for every earlier member to complete; under barrier and parallel an
-	// earlier member holds it only while that member has failed, is retrying,
-	// or was stopped, cancelled or reverted, as at cutover.
+	// waits for every earlier member to complete; under barrier and parallel it
+	// waits for every earlier deployment to complete, and an earlier target of
+	// its own deployment holds it only while that target has failed, is
+	// retrying, or was stopped, cancelled or reverted, as at cutover.
 	//
 	// owner identifies the claiming driver and is required; it is recorded as
 	// the operation's lease owner. Returns the claimed row, or nil if nothing
@@ -1553,15 +1554,18 @@ type ApplyOperationStore interface {
 	// counterpart to FindNextApplyOperation: that primitive gates the copy phase
 	// (claims pending rows → running); this one gates the cutover phase.
 	//
-	// A waiting_for_cutover row is claimed and transitioned to cutting_over as
-	// soon as it is parked, unless an earlier operation of the apply has
-	// failed, is retrying (by its own state or a task retrying under it), or
-	// was stopped, cancelled or reverted (with the on_failure "continue"
-	// exemption for a terminal-failed one), a stop control request is pending
+	// A waiting_for_cutover row is claimed and transitioned to cutting_over
+	// once it is parked, unless an earlier operation of another deployment has
+	// not completed, so deployments cut over strictly in order; an earlier
+	// operation of its own deployment has failed, is retrying (by its own state
+	// or a task retrying under it), or was stopped, cancelled or reverted (with
+	// the on_failure "continue" exemption for a terminal-failed one); a stop
+	// control request is pending
 	// for the apply, or the apply already has as many cutovers in flight as its
 	// per-apply driver cap allows. The cap is admitted under a lock on the
 	// parent apply row, so concurrent drivers cannot overshoot it. An earlier
-	// operation that is still copying or cutting over does not hold it.
+	// target of the same deployment that is still copying or cutting over does
+	// not hold it.
 	// Separately, a row already in cutting_over or
 	// revert_window whose heartbeat has been stale for more than one minute is
 	// re-leased without changing its state — recovering an in-flight cutover whose
@@ -1574,9 +1578,11 @@ type ApplyOperationStore interface {
 	// CutoverBlocker returns the earliest earlier operation of another rollout
 	// member (deployment, target) that holds the operation's cutover, or nil
 	// when nothing does. It applies the same rule as
-	// FindNextApplyOperationCutover: an earlier sibling holds only while it has
-	// failed, is retrying (by its own state or a task under it), or was stopped, cancelled or reverted, unless the
-	// rollout's on_failure policy continues past its terminal failure. A
+	// FindNextApplyOperationCutover: an earlier operation of another deployment
+	// holds until it has completed, and one of the same deployment holds only
+	// while it has failed, is retrying (by its own state or a task under it),
+	// or was stopped, cancelled or reverted, unless the rollout's on_failure
+	// policy continues past its terminal failure. A
 	// manually requested cutover uses it so that it is held exactly where the
 	// automatic cutover claim would be. Operations of the same member, its
 	// shards and tables, never hold each other's requested cutover: the request

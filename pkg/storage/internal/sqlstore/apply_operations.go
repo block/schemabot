@@ -931,28 +931,59 @@ const rolloutMembersOrderedHereSQL = `NOT EXISTS (
 
 // earlierSiblingHoldsCutoverSQL is the cutover hold rule: an earlier sibling
 // (lower created_at, id — deployment_order as materialized at apply-create)
-// holds a later operation's cutover only while it is in a state the rollout
-// halts on (memberHoldStates): failed, retrying a failure, stopped,
-// cancelled, or reverted. A sibling still copying, parked at the barrier,
-// cutting over, or complete holds nothing, so each operation cuts over as
-// soon as its own copy is ready. releasedFailureExemptionSQL lets a
-// terminal-failed sibling stop holding where on_failure continues past it.
-// It references the apply_operations (the operation whose cutover is asked about)
-// and earlier aliases, so the automatic cutover claim
-// (FindNextApplyOperationCutover) and the manual-request turn check
-// (CutoverBlocker) evaluate the same rule. pkg/presentation holdsCutover is
-// the render-side mirror. Placeholders: see earlierSiblingHoldsCutoverArgs.
+// holds a later operation's cutover as earlierHoldsUnderOrderedCutoverSQL
+// says, unless releasedFailureExemptionSQL lets a terminal-failed one stop
+// holding where on_failure continues past it. It references the
+// apply_operations (the operation whose cutover is asked about) and earlier
+// aliases, so the automatic cutover claim (FindNextApplyOperationCutover) and
+// the manual-request check (CutoverBlocker) evaluate the same rule.
+// pkg/presentation holdsCutover is the render-side mirror. Placeholders: see
+// earlierSiblingHoldsCutoverArgs.
 func earlierSiblingHoldsCutoverSQL(d Dialect) string {
 	return `earlier.apply_id = apply_operations.apply_id
 	AND (earlier.created_at, earlier.id) < (apply_operations.created_at, apply_operations.id)
-	AND ` + earlierMemberHoldsSQL() + `
+	AND ` + earlierHoldsUnderOrderedCutoverSQL() + `
 	AND ` + releasedFailureExemptionSQL(d)
 }
 
 // earlierSiblingHoldsCutoverArgs returns the positional arguments for
 // earlierSiblingHoldsCutoverSQL, in placeholder order.
 func earlierSiblingHoldsCutoverArgs() []any {
-	return append(earlierMemberHoldsArgs(), releasedFailureExemptionArgs()...)
+	return append(earlierHoldsUnderOrderedCutoverArgs(), releasedFailureExemptionArgs()...)
+}
+
+// earlierHoldsUnderOrderedCutoverSQL is the rule by which an earlier operation
+// holds a later one's cutover, and its finalizer, under an ordered cutover
+// policy (barrier or parallel). It splits on deployment:
+//
+//   - An earlier operation of another deployment holds until it has completed,
+//     its revert window included, so deployments cut over strictly in order
+//     and the first one finishes before the next one starts.
+//   - An earlier operation of the same deployment, such as another of its
+//     targets or shards, holds only while it is in a state the rollout halts
+//     on (earlierMemberHoldsSQL). One still copying, parked, cutting over or
+//     complete holds nothing, so the targets of one deployment each cut over
+//     as soon as their own copy is ready.
+//
+// The fragment references the apply_operations and earlier aliases; its
+// placeholders are listed by earlierHoldsUnderOrderedCutoverArgs.
+func earlierHoldsUnderOrderedCutoverSQL() string {
+	return `(
+	(
+		earlier.deployment <> apply_operations.deployment
+		AND earlier.state <> ?
+	)
+	OR (
+		earlier.deployment = apply_operations.deployment
+		AND ` + earlierMemberHoldsSQL() + `
+	)
+)`
+}
+
+// earlierHoldsUnderOrderedCutoverArgs returns the positional arguments for
+// earlierHoldsUnderOrderedCutoverSQL, in placeholder order.
+func earlierHoldsUnderOrderedCutoverArgs() []any {
+	return append([]any{state.ApplyOperation.Completed}, earlierMemberHoldsArgs()...)
 }
 
 // earlierMemberHoldsSQL matches an earlier operation in a state the rollout
@@ -981,10 +1012,10 @@ func earlierMemberHoldsArgs() []any {
 	return append(stringArgs(memberHoldStates()), state.Task.FailedRetryable)
 }
 
-// memberHoldStates lists the states in which an earlier rollout member holds a
-// later member's cutover and finalizer under an ordered cutover policy
-// (barrier or parallel): the states a rollout halts on rather than waits
-// through. Failed is final unless on_failure continues past it; retrying and
+// memberHoldStates lists the states in which an earlier operation of the same
+// deployment holds a later one's cutover and finalizer under an ordered
+// cutover policy (barrier or parallel): the states a rollout halts on rather
+// than waits through. Failed is final unless on_failure continues past it; retrying and
 // stopped may still go either way, so they hold until they resolve; cancelled
 // and reverted mean the rollout is not going ahead on that member. A retry a
 // live drive rides out holds too, by its task rows (earlierMemberHoldsSQL).
@@ -1035,9 +1066,11 @@ func earlierFinalizerAtBarrierArgs() []any {
 // claim arm that can start one. It waits for the work it finalizes to
 // complete (a namespace whose only change is its VSchema has no such work).
 // Earlier members then hold it the way they hold a cutover: under barrier and
-// parallel only while one is in a memberHoldStates state, and under rolling,
-// and any unrecognized policy, which fails closed to the serial gate, until
-// every earlier member has completed. Both carry the on_failure exemption.
+// parallel as earlierHoldsUnderOrderedCutoverSQL says, so an earlier
+// deployment holds until it has completed and an earlier target of the same
+// deployment only while the rollout halts on it, and under rolling, and any
+// unrecognized policy, which fails closed to the serial gate, until every
+// earlier member has completed. Both carry the on_failure exemption.
 // The fragment references the apply_operations alias; its placeholders are
 // listed by finalizerStartGateArgs.
 func finalizerStartGateSQL(d Dialect) string {
@@ -1061,7 +1094,7 @@ func finalizerStartGateSQL(d Dialect) string {
 			AND (
 				(
 					apply_operations.cutover_policy IN (?, ?)
-					AND ` + earlierMemberHoldsSQL() + `
+					AND ` + earlierHoldsUnderOrderedCutoverSQL() + `
 				)
 				OR (
 					apply_operations.cutover_policy NOT IN (?, ?)
@@ -1081,7 +1114,7 @@ func finalizerStartGateArgs() []any {
 		state.ApplyOperation.Completed,
 		storage.CutoverPolicyBarrier, storage.CutoverPolicyParallel,
 	}
-	args = append(args, earlierMemberHoldsArgs()...)
+	args = append(args, earlierHoldsUnderOrderedCutoverArgs()...)
 	args = append(args,
 		storage.CutoverPolicyBarrier, storage.CutoverPolicyParallel,
 		state.ApplyOperation.Completed,
@@ -1377,9 +1410,11 @@ func releasedFailureExemptionArgs() []any {
 // the way they hold a cutover, since a finalizer never parks at the cutover
 // barrier and its drive publishes the member's change in one step: under
 // rolling until every earlier member has completed, and under barrier and
-// parallel only while an earlier member has failed, is retrying, or was
-// stopped, cancelled or reverted (memberHoldStates), so a later member's
-// VSchema never goes out past a failure the rollout halts on. The stopped+start
+// parallel until every earlier deployment has completed and while an earlier
+// target of its own deployment has failed, is retrying, or was stopped,
+// cancelled or reverted (earlierHoldsUnderOrderedCutoverSQL), so a later
+// member's VSchema never goes out ahead of an earlier deployment or past a
+// failure the rollout halts on. The stopped+start
 // resume arm holds a stopped finalizer to the same gate (finalizerStartGateSQL),
 // so a stop and start cannot publish it past one either.
 //
@@ -2113,14 +2148,15 @@ func moveRedispatchToRunning(ctx context.Context, tx *rebindTx, ad *storage.Appl
 // Two claim paths, mirroring FindNextApplyOperation:
 //
 //   - Start a parked cutover. A waiting_for_cutover row is claimed and
-//     transitioned to cutting_over as soon as its own copy is parked, unless an
-//     earlier operation of the apply, whichever member it belongs to, is in a
-//     state the rollout halts on (earlierSiblingHoldsCutoverSQL), a pending
-//     stop control request exists, or the apply already has
-//     maxDriversPerApply operations mid-cutover. An earlier sibling that is
-//     still copying or cutting over does not hold it, so members that finish
-//     their copies at different times each cut over when ready rather than
-//     queueing behind the slowest earlier one. The on_failure "continue"
+//     transitioned to cutting_over once no earlier operation holds it
+//     (earlierSiblingHoldsCutoverSQL), no pending stop control request
+//     exists, and the apply has fewer than maxDriversPerApply operations
+//     mid-cutover. An earlier deployment holds it until that deployment has
+//     completed, so deployments cut over strictly in order. Within one
+//     deployment an earlier target holds it only while the rollout halts on
+//     that target, so targets that finish their copies at different times
+//     each cut over when ready rather than queueing behind the slowest earlier
+//     one. The on_failure "continue"
 //     exemption lets a terminal-failed earlier sibling stop holding, matching
 //     the copy gate.
 //   - Recover a stale in-flight cutover. A row already in cutting_over or
@@ -2145,8 +2181,9 @@ func moveRedispatchToRunning(ctx context.Context, tx *rebindTx, ad *storage.Appl
 // the other.
 //
 // The start arm is capped at maxDriversPerApply operations mid-cutover at
-// once (cutoverCapClause): with no ordering between members, every parked
-// operation of a wide apply could otherwise take a driver at once, which is
+// once (cutoverCapClause): with no ordering between the targets of one
+// deployment, every parked operation of a wide deployment could otherwise
+// take a driver at once, which is
 // the starvation the cap exists to prevent. Only cutting_over and
 // revert_window count, so members still copying never hold a ready cutover
 // back, and it cannot wedge, since each drops out of the count as its
@@ -2188,8 +2225,9 @@ func (s *applyOperationStore) FindNextApplyOperationCutover(ctx context.Context,
 	cutoverCap, cutoverCapArgs := s.cutoverCapClause(staleClaimCutoff)
 	queryArgs := []any{storage.CutoverPolicyBarrier, storage.CutoverPolicyParallel}
 	// Start-a-parked-cutover gate (see SQL below). A waiting_for_cutover row is
-	// claimable unless an earlier operation of the apply, whichever member it
-	// belongs to, is in a state the rollout halts on;
+	// claimable unless an earlier operation of the apply holds it: one of an
+	// earlier deployment that has not completed, or one of its own deployment
+	// in a state the rollout halts on;
 	// releasedFailureExemptionArgs exempt a terminal-failed earlier sibling so
 	// it no longer holds later cutovers under "continue", or under "pause" once
 	// a release latches the rollout open; the pending-stop NOT EXISTS makes
@@ -2371,7 +2409,7 @@ func (s *applyOperationStore) admitCutoverUnderCap(ctx context.Context, tx *rebi
 // operation's cutover, or nil when nothing does. It evaluates
 // earlierSiblingHoldsCutoverSQL, the rule the automatic cutover claim gates on,
 // so a manually requested cutover and the automatic one agree on when an
-// earlier member's failure holds a later one. Only operations of another
+// earlier deployment, or an earlier target's failure, holds a later one. Only operations of another
 // rollout member (earlierRolloutMemberSQL) are considered: under a requested
 // cutover a member's own operations, its shards and tables, cut over
 // together, since the cutover a request sends addresses the member's remote

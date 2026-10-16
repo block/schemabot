@@ -858,12 +858,14 @@ the cutover barrier under `barrier`, while `parallel` does not order copy start 
 rollout is laid out table by table, work on a table starts on any target only once every earlier
 table has completed on every target, under every cutover policy and every on_failure value, and
 work held behind an earlier table that settled without completing can never start, so it holds no target. Under
-`barrier` and `parallel` an operation cuts over as soon as its own copy is ready: an earlier
-operation holds it only while it is in a state the rollout halts on (failed, retrying a failure,
-stopped, cancelled, or reverted), never while it is still copying or cutting over. A member's
-finalizer publishes its change without parking at the barrier, so it is held like a cutover: it
-starts, or resumes after a stop, only once all of the work it finalizes has completed and no
-earlier member holds it, where under `rolling` every earlier member holds it until it completes. Work a stop caught
+`barrier` and `parallel` cutover follows deployment order: an operation cuts over only once every
+operation of every earlier deployment has completed. Within one deployment, an operation cuts over
+as soon as its own copy is ready: an earlier operation of the same deployment holds it only while it
+is in a state the rollout halts on (failed, retrying a failure, stopped, cancelled, or reverted),
+never while it is still copying or cutting over. A member's finalizer publishes its change without
+parking at the barrier, so it is held like a cutover: it starts, or resumes after a stop, only once
+all of the work it finalizes has completed and no earlier member holds it by that rule, where under
+`rolling` every earlier member holds it until it completes. Work a stop caught
 before it started is ordered like pending work, so stopping and starting a rollout cannot reorder
 it. A finalizer whose
 own work has failed can never start, so it holds later members exactly where that failure does and

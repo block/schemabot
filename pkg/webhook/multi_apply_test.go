@@ -318,19 +318,20 @@ func TestDeriveApplyPresentation_MatchesStoredVerdict(t *testing.T) {
 	}
 }
 
-// TestDeriveApplyPresentation_HeldByARetryingTask: eu still reads running
-// while one of its tasks retries a failure, and us is parked. The cutover
-// claim holds us on that task evidence, so the comment labels us held behind
-// eu's retry rather than ready.
+// TestDeriveApplyPresentation_HeldByARetryingTask: shop-001 still reads
+// running while one of its tasks retries a failure, and shop-002, a later
+// target of the same deployment, is parked. The cutover claim holds shop-002
+// on that task evidence, so the comment labels it held behind shop-001's retry
+// rather than ready.
 func TestDeriveApplyPresentation_HeldByARetryingTask(t *testing.T) {
 	ops := []*storage.ApplyOperation{
-		{ID: 1, Deployment: "eu", State: state.ApplyOperation.Running, CutoverPolicy: storage.CutoverPolicyParallel},
-		{ID: 2, Deployment: "us", State: state.ApplyOperation.WaitingForCutover, CutoverPolicy: storage.CutoverPolicyParallel},
+		{ID: 1, Deployment: "shop", Target: "shop-001", State: state.ApplyOperation.Running, CutoverPolicy: storage.CutoverPolicyParallel},
+		{ID: 2, Deployment: "shop", Target: "shop-002", State: state.ApplyOperation.WaitingForCutover, CutoverPolicy: storage.CutoverPolicyParallel},
 	}
 	tasksByOp := map[int64][]*storage.Task{1: {{State: state.Task.FailedRetryable}}}
 
 	got := deriveApplyPresentation(ops, tasksByOp, false)
-	assert.Equal(t, "ready for cutover — held, eu retrying", got.Deployments[1].Label)
+	assert.Equal(t, "ready for cutover — held, shop/shop-001 retrying", got.Deployments[1].Label)
 	assert.Equal(t, "ready for cutover", deriveApplyPresentation(ops, nil, false).Deployments[1].Label)
 }
 

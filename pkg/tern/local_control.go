@@ -2549,7 +2549,7 @@ func (c *LocalClient) boundCutoverRequestTurn(ctx context.Context, apply *storag
 			return false, fmt.Errorf("check the hold on apply_operation %d before taking the pending cutover of apply %s: %w", boundID, apply.ApplyIdentifier, err)
 		}
 		if blocker != nil {
-			logger.Info("pending cutover request is held: an earlier member is in a state the rollout halts on, so the request waits until that member recovers or this operation ends",
+			logger.Info("pending cutover request is held by an earlier member, so the request waits until that member completes or recovers, or this operation ends",
 				"requested_by", controlRequestCaller(controlReq), "bound_operation_id", boundID,
 				"blocking_operation_id", blocker.ID, "blocking_deployment", blocker.Deployment,
 				"blocking_target", blocker.Target, "blocking_state", blocker.State)

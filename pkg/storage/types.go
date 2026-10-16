@@ -57,9 +57,11 @@ const (
 	CutoverPolicyRolling = "rolling"
 
 	// CutoverPolicyBarrier lets later deployments run their copy phase once
-	// earlier siblings reach the cutover barrier. Each then cuts over as soon as
-	// its own copy is parked; an earlier sibling holds a later cutover only
-	// while it has failed, is retrying, or was stopped, cancelled or reverted.
+	// earlier siblings reach the cutover barrier. Deployments then cut over
+	// strictly in order, each once every earlier deployment has completed.
+	// Within one deployment each target cuts over as soon as its own copy is
+	// parked; an earlier target holds a later one's cutover only while it has
+	// failed, is retrying, or was stopped, cancelled or reverted.
 	CutoverPolicyBarrier = "barrier"
 
 	// CutoverPolicyParallel drops copy-phase ordering: deployments copy
@@ -1495,8 +1497,9 @@ func (op *ApplyOperation) HasFreshLease(now time.Time) bool {
 // the rollout halts on holds in that state. A live drive riding out a
 // data-plane retry keeps its row active and records the retry only on the
 // operation's tasks, so an active row with a retrying task holds as
-// failed_retryable. Otherwise the row's own state is returned. tasks are op's
-// own tasks.
+// failed_retryable. Otherwise the row's own state is returned, the state an
+// earlier deployment that has not yet completed holds in. tasks are op's own
+// tasks.
 func (op *ApplyOperation) CutoverHoldState(tasks []*Task) string {
 	if state.IsState(op.State,
 		state.ApplyOperation.Failed,

@@ -408,23 +408,24 @@ func TestProgressOperationsForPresentation_SettlesLikeStoredState(t *testing.T) 
 	}
 }
 
-// TestProgressOperationsForPresentation_HeldByARetryingTable: eu still reads
-// running while its orders table retries a failure, and us is parked. The
-// cutover claim holds us on that retry, so the CLI labels us held behind eu
-// rather than ready. A retry on another target's table holds nothing.
+// TestProgressOperationsForPresentation_HeldByARetryingTable: shop-001 still
+// reads running while its orders table retries a failure, and shop-002, a
+// later target of the same deployment, is parked. The cutover claim holds
+// shop-002 on that retry, so the CLI labels it held behind shop-001 rather
+// than ready. A retry on another target's table holds nothing.
 func TestProgressOperationsForPresentation_HeldByARetryingTable(t *testing.T) {
 	ops := []ProgressOperation{
-		{Deployment: "eu", Target: "orders-eu", State: state.ApplyOperation.Running, CutoverPolicy: storage.CutoverPolicyParallel},
-		{Deployment: "us", Target: "orders-us", State: state.ApplyOperation.WaitingForCutover, CutoverPolicy: storage.CutoverPolicyParallel},
+		{Deployment: "shop", Target: "shop-001", State: state.ApplyOperation.Running, CutoverPolicy: storage.CutoverPolicyParallel},
+		{Deployment: "shop", Target: "shop-002", State: state.ApplyOperation.WaitingForCutover, CutoverPolicy: storage.CutoverPolicyParallel},
 	}
 	label := func(tables []TableProgress) string {
 		return presentation.Derive(ProgressOperationsForPresentation(ops, tables, false)).Deployments[1].Label
 	}
 
-	assert.Equal(t, "ready for cutover — held, eu retrying", label([]TableProgress{
-		{TableName: "orders", Deployment: "eu", Target: "orders-eu", Status: state.Task.FailedRetryable},
+	assert.Equal(t, "ready for cutover — held, shop/shop-001 retrying", label([]TableProgress{
+		{TableName: "orders", Deployment: "shop", Target: "shop-001", Status: state.Task.FailedRetryable},
 	}))
 	assert.Equal(t, "ready for cutover", label([]TableProgress{
-		{TableName: "orders", Deployment: "eu", Target: "orders-other", Status: state.Task.FailedRetryable},
+		{TableName: "orders", Deployment: "shop", Target: "shop-other", Status: state.Task.FailedRetryable},
 	}))
 }

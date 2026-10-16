@@ -4110,12 +4110,11 @@ func TestApplyOperationStore_FindNextApplyOperationCutover_ClaimsEarliestParked(
 	assert.Nil(t, again)
 }
 
-// TestApplyOperationStore_FindNextApplyOperationCutover_TakesParkedSiblingsWhenReady
-// verifies that parked siblings cut over in deployment order without waiting
-// for one another: an earlier sibling that is still cutting over does not
-// hold a later one, and only the per-apply cutover cap bounds how many cut
-// over at once.
-func TestApplyOperationStore_FindNextApplyOperationCutover_TakesParkedSiblingsWhenReady(t *testing.T) {
+// TestApplyOperationStore_FindNextApplyOperationCutover_OrdersSiblings verifies
+// the cutover gate runs strictly in deployment order with a completed-only
+// "done" set: a later sibling is claimable only once every earlier sibling has
+// reached completed, not merely reached the cutover barrier.
+func TestApplyOperationStore_FindNextApplyOperationCutover_OrdersSiblings(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
 	store := NewMySQL(testDB)
@@ -4123,7 +4122,6 @@ func TestApplyOperationStore_FindNextApplyOperationCutover_TakesParkedSiblingsWh
 	lock := createTestLock(t, store, "testdb", "mysql")
 	apply := createTestApply(t, store, lock, "apply_op_cutover_ordered", 1)
 
-	require.Equal(t, 2, storage.DefaultMaxDriversPerApply, "the scenario fills the cutover cap with region-a and region-b")
 	deployments := []string{"region-a", "region-b", "region-c"}
 	ids := make([]int64, len(deployments))
 	for i, deployment := range deployments {
@@ -4135,30 +4133,33 @@ func TestApplyOperationStore_FindNextApplyOperationCutover_TakesParkedSiblingsWh
 		ids[i] = id
 	}
 
-	for i, deployment := range deployments[:2] {
+	for i, deployment := range deployments {
 		claimed, err := store.ApplyOperations().FindNextApplyOperationCutover(ctx, "cutover-operator")
 		require.NoError(t, err)
-		require.NotNil(t, claimed, "cutover %q is claimable while earlier siblings are still cutting over", deployment)
+		require.NotNil(t, claimed, "cutover %q should be claimable once earlier siblings completed", deployment)
 		assert.Equal(t, ids[i], claimed.ID)
 		assert.Equal(t, deployment, claimed.Deployment)
+
+		// The claimed row is now cutting_over (not completed), so it gates its
+		// later siblings: a second claim before completion yields nothing.
+		blocked, err := store.ApplyOperations().FindNextApplyOperationCutover(ctx, "cutover-operator")
+		require.NoError(t, err)
+		assert.Nil(t, blocked, "later cutovers must wait while %q is still cutting over", deployment)
+
+		require.NoError(t, store.ApplyOperations().MarkCompleted(ctx, claimed.ID))
 	}
 
-	capped, err := store.ApplyOperations().FindNextApplyOperationCutover(ctx, "cutover-operator")
+	done, err := store.ApplyOperations().FindNextApplyOperationCutover(ctx, "cutover-operator")
 	require.NoError(t, err)
-	assert.Nil(t, capped, "region-c waits while the apply is at its cutover cap")
-
-	require.NoError(t, store.ApplyOperations().MarkCompleted(ctx, ids[0]))
-	last, err := store.ApplyOperations().FindNextApplyOperationCutover(ctx, "cutover-operator")
-	require.NoError(t, err)
-	require.NotNil(t, last, "region-c cuts over once a cutover slot frees")
-	assert.Equal(t, "region-c", last.Deployment)
+	assert.Nil(t, done)
 }
 
-// TestApplyOperationStore_FindNextApplyOperationCutover_DoesNotWaitOnSiblingInRevertWindow
-// verifies that an earlier sibling in its revert window does not hold a later
-// cutover. The window can stay open for a long time, and the later sibling's
-// copy is ready, so it cuts over without waiting for the window to close.
-func TestApplyOperationStore_FindNextApplyOperationCutover_DoesNotWaitOnSiblingInRevertWindow(t *testing.T) {
+// TestApplyOperationStore_FindNextApplyOperationCutover_BlocksOnSiblingInRevertWindow
+// pins the difference from the copy gate's barrier relaxation: an earlier
+// sibling that has reached its cutover barrier but is not yet completed
+// (revert_window) still blocks a later cutover. The cutover "done" set is
+// completed-only, so swaps never overlap.
+func TestApplyOperationStore_FindNextApplyOperationCutover_BlocksOnSiblingInRevertWindow(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
 	store := NewMySQL(testDB)
@@ -4166,7 +4167,10 @@ func TestApplyOperationStore_FindNextApplyOperationCutover_DoesNotWaitOnSiblingI
 	lock := createTestLock(t, store, "testdb", "mysql")
 	apply := createTestApply(t, store, lock, "apply_op_cutover_revert", 1)
 
-	_, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+	// region-a is in revert_window (fresh, so not stale-recoverable); region-b
+	// is parked behind it. Under the copy gate this sibling would relax the
+	// barrier — under the cutover gate it keeps blocking.
+	earlierID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
 		ApplyID: apply.ID, Deployment: "region-a", State: state.ApplyOperation.RevertWindow,
 		CutoverPolicy: storage.CutoverPolicyBarrier,
 	})
@@ -4179,8 +4183,89 @@ func TestApplyOperationStore_FindNextApplyOperationCutover_DoesNotWaitOnSiblingI
 
 	claimed, err := store.ApplyOperations().FindNextApplyOperationCutover(ctx, "cutover-operator")
 	require.NoError(t, err)
-	require.NotNil(t, claimed, "region-b cuts over while region-a is in its revert window")
-	assert.Equal(t, "region-b", claimed.Deployment)
+	assert.Nil(t, claimed, "a later cutover must wait while an earlier sibling is in revert_window, not yet completed")
+
+	// Sanity: once the earlier sibling completes, region-b becomes claimable —
+	// confirming the nil above was the completed-only gate, not an unrelated skip.
+	require.NoError(t, store.ApplyOperations().MarkCompleted(ctx, earlierID))
+	next, err := store.ApplyOperations().FindNextApplyOperationCutover(ctx, "cutover-operator")
+	require.NoError(t, err)
+	require.NotNil(t, next, "region-b must be claimable once region-a completes")
+	assert.Equal(t, "region-b", next.Deployment)
+}
+
+// TestApplyOperationStore_FindNextApplyOperationCutover_TakesParkedTargetsWhenReady
+// verifies that the parked targets of one deployment cut over in list order
+// without waiting for one another: an earlier target that is still cutting
+// over does not hold a later one, and only the per-apply cutover cap bounds
+// how many cut over at once.
+func TestApplyOperationStore_FindNextApplyOperationCutover_TakesParkedTargetsWhenReady(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql")
+	apply := createTestApply(t, store, lock, "apply_op_cutover_targets_ready", 1)
+
+	require.Equal(t, 2, storage.DefaultMaxDriversPerApply, "the scenario fills the cutover cap with shop-001 and shop-002")
+	targets := []string{"shop-001", "shop-002", "shop-003"}
+	ids := make([]int64, len(targets))
+	for i, target := range targets {
+		id, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+			ApplyID: apply.ID, Deployment: "shop", Target: target, OperationKey: target, State: state.ApplyOperation.WaitingForCutover,
+			CutoverPolicy: storage.CutoverPolicyBarrier,
+		})
+		require.NoError(t, err)
+		ids[i] = id
+	}
+
+	for i, target := range targets[:2] {
+		claimed, err := store.ApplyOperations().FindNextApplyOperationCutover(ctx, "cutover-operator")
+		require.NoError(t, err)
+		require.NotNil(t, claimed, "cutover %q is claimable while earlier targets are still cutting over", target)
+		assert.Equal(t, ids[i], claimed.ID)
+		assert.Equal(t, target, claimed.Target)
+	}
+
+	capped, err := store.ApplyOperations().FindNextApplyOperationCutover(ctx, "cutover-operator")
+	require.NoError(t, err)
+	assert.Nil(t, capped, "shop-003 waits while the apply is at its cutover cap")
+
+	require.NoError(t, store.ApplyOperations().MarkCompleted(ctx, ids[0]))
+	last, err := store.ApplyOperations().FindNextApplyOperationCutover(ctx, "cutover-operator")
+	require.NoError(t, err)
+	require.NotNil(t, last, "shop-003 cuts over once a cutover slot frees")
+	assert.Equal(t, "shop-003", last.Target)
+}
+
+// TestApplyOperationStore_FindNextApplyOperationCutover_TargetDoesNotWaitOnRevertWindow
+// verifies that an earlier target of the same deployment in its revert window
+// does not hold a later target's cutover. The window can stay open for a long
+// time, and the later target's copy is ready, so it cuts over without waiting
+// for the window to close.
+func TestApplyOperationStore_FindNextApplyOperationCutover_TargetDoesNotWaitOnRevertWindow(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql")
+	apply := createTestApply(t, store, lock, "apply_op_cutover_target_revert", 1)
+
+	_, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "shop", Target: "shop-001", OperationKey: "shop-001", State: state.ApplyOperation.RevertWindow,
+		CutoverPolicy: storage.CutoverPolicyBarrier,
+	})
+	require.NoError(t, err)
+	_, err = store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "shop", Target: "shop-002", OperationKey: "shop-002", State: state.ApplyOperation.WaitingForCutover,
+		CutoverPolicy: storage.CutoverPolicyBarrier,
+	})
+	require.NoError(t, err)
+
+	claimed, err := store.ApplyOperations().FindNextApplyOperationCutover(ctx, "cutover-operator")
+	require.NoError(t, err)
+	require.NotNil(t, claimed, "shop-002 cuts over while shop-001 is in its revert window")
+	assert.Equal(t, "shop-002", claimed.Target)
 }
 
 // TestApplyOperationStore_FindNextApplyOperationCutover_HaltsOnFailedSibling

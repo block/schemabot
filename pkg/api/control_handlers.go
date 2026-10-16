@@ -757,9 +757,11 @@ type cutoverTurnHold struct {
 }
 
 // message is the refusal an operator reads: which member holds the cutover,
-// its state, and what lets the rollout go on from there. Only a state the
-// rollout halts on holds a cutover (storage CutoverBlocker), so each case
-// names the one action that clears it.
+// its state, and what lets the rollout go on from there (storage
+// CutoverBlocker). An earlier target of the same deployment holds only in a
+// state the rollout halts on, so each of those cases names the one action
+// that clears it; an earlier deployment holds until it has completed, so the
+// default case names the member to wait for.
 func (h *cutoverTurnHold) message() string {
 	switch h.blockerState {
 	case state.ApplyOperation.Failed:
@@ -775,9 +777,12 @@ func (h *cutoverTurnHold) message() string {
 	case state.ApplyOperation.Stopped:
 		return fmt.Sprintf("cutover is held: %s is stopped ahead of %s; start the schema change to resume it, or cancel it",
 			h.blocker, h.parked)
-	default:
+	case state.ApplyOperation.Cancelled, state.ApplyOperation.Reverted:
 		return fmt.Sprintf("cutover is held: %s was %s ahead of %s, so later members do not cut over; stop the schema change and apply again",
 			h.blocker, h.blockerState, h.parked)
+	default:
+		return fmt.Sprintf("cutover follows deployment order: %s is in an earlier deployment than %s and is %s; run cutover again once %s has completed",
+			h.blocker, h.parked, h.blockerState, h.blocker)
 	}
 }
 

@@ -791,12 +791,12 @@ func TestApplyOperations(t *testing.T, h Harness) {
 		}
 	})
 
-	// CutoverBlocker_HeldOnlyByAnEarlierDeploymentThatHalted verifies when an
-	// earlier deployment holds a later one's cutover. Parked, copying, cutting
-	// over, in its revert window, or completed, it holds nothing; stopped,
-	// retrying a failure, cancelled, or reverted, it holds every later
+	// CutoverBlocker_FollowsDeploymentOrder verifies whose turn it is to cut
+	// over across deployments. An earlier deployment holds a later one's
+	// cutover until it has completed: copying, parked at its own cutover,
+	// cutting over, in its revert window, or halted, it holds every later
 	// cutover, and the blocker named is the earliest one holding it.
-	t.Run("CutoverBlocker_HeldOnlyByAnEarlierDeploymentThatHalted", func(t *testing.T) {
+	t.Run("CutoverBlocker_FollowsDeploymentOrder", func(t *testing.T) {
 		ctx := t.Context()
 		store := h.NewStorage(t)
 		lock := CreateLock(t, store, "cutover_turn_db", storage.DatabaseTypeMySQL)
@@ -811,94 +811,124 @@ func TestApplyOperations(t *testing.T, h Harness) {
 		}
 		euID := insert("eu", state.ApplyOperation.WaitingForCutover)
 		usID := insert("us", state.ApplyOperation.WaitingForCutover)
-		auID := insert("au", state.ApplyOperation.WaitingForCutover)
+		auID := insert("au", state.ApplyOperation.Running)
 
-		requireBlocker := func(operationID, wantBlockerID int64, msg string) {
-			t.Helper()
-			blocker, err := store.ApplyOperations().CutoverBlocker(ctx, operationID)
-			require.NoError(t, err)
-			if wantBlockerID == 0 {
-				assert.Nil(t, blocker, msg)
-				return
-			}
-			require.NotNil(t, blocker, msg)
-			assert.Equal(t, wantBlockerID, blocker.ID, msg)
-		}
+		requireBlocker := cutoverBlockerAsserter(t, store)
 		requireBlocker(euID, 0, "the first deployment's cutover is never held")
-		requireBlocker(usID, 0, "a parked earlier deployment does not hold the next cutover")
-		for _, opState := range []string{state.ApplyOperation.Running, state.ApplyOperation.CuttingOver, state.ApplyOperation.RevertWindow} {
-			require.NoError(t, store.ApplyOperations().UpdateState(ctx, euID, opState))
-			requireBlocker(usID, 0, "an earlier deployment that is "+opState+" does not hold the next cutover")
-		}
-		for _, opState := range []string{state.ApplyOperation.Stopped, state.ApplyOperation.FailedRetryable, state.ApplyOperation.Cancelled, state.ApplyOperation.Reverted} {
+		requireBlocker(usID, euID, "a parked earlier deployment holds the next cutover")
+		requireBlocker(auID, euID, "the earliest deployment holding the turn is the one named")
+		for _, opState := range []string{
+			state.ApplyOperation.Running, state.ApplyOperation.CuttingOver, state.ApplyOperation.RevertWindow,
+			state.ApplyOperation.Stopped, state.ApplyOperation.FailedRetryable, state.ApplyOperation.Cancelled, state.ApplyOperation.Reverted,
+		} {
 			require.NoError(t, store.ApplyOperations().UpdateState(ctx, euID, opState))
 			requireBlocker(usID, euID, "an earlier deployment that is "+opState+" holds the next cutover")
-			requireBlocker(auID, euID, "the earliest deployment holding the cutover is the one named")
 		}
 
 		require.NoError(t, store.ApplyOperations().MarkCompleted(ctx, euID))
-		require.NoError(t, store.ApplyOperations().UpdateState(ctx, usID, state.ApplyOperation.Stopped))
-		requireBlocker(usID, 0, "a completed earlier deployment holds nothing")
-		requireBlocker(auID, usID, "a later deployment's stop holds every cutover after it")
+		requireBlocker(usID, 0, "a completed earlier deployment releases the turn")
+		requireBlocker(auID, usID, "the turn passes one deployment at a time")
+	})
+
+	// CutoverBlocker_HeldOnlyByAnEarlierTargetThatHalted verifies when an
+	// earlier target of the same deployment holds a later target's cutover.
+	// Parked, copying, cutting over, in its revert window, or completed, it
+	// holds nothing; stopped, retrying a failure, cancelled, or reverted, it
+	// holds every later cutover, and the blocker named is the earliest one
+	// holding it.
+	t.Run("CutoverBlocker_HeldOnlyByAnEarlierTargetThatHalted", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "cutover_target_turn_db", storage.DatabaseTypeMySQL)
+		apply := CreateApply(t, store, lock, "apply_cutover_target_turn", 929)
+		insert := func(target, opState string) int64 {
+			t.Helper()
+			id, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+				ApplyID: apply.ID, Deployment: "shop", Target: target, OperationKey: target, State: opState, CutoverPolicy: storage.CutoverPolicyParallel,
+			})
+			require.NoError(t, err)
+			return id
+		}
+		first := insert("shop-001", state.ApplyOperation.WaitingForCutover)
+		second := insert("shop-002", state.ApplyOperation.WaitingForCutover)
+		third := insert("shop-003", state.ApplyOperation.WaitingForCutover)
+
+		requireBlocker := cutoverBlockerAsserter(t, store)
+		requireBlocker(first, 0, "the first target's cutover is never held")
+		requireBlocker(second, 0, "a parked earlier target does not hold the next cutover")
+		for _, opState := range []string{state.ApplyOperation.Running, state.ApplyOperation.CuttingOver, state.ApplyOperation.RevertWindow} {
+			require.NoError(t, store.ApplyOperations().UpdateState(ctx, first, opState))
+			requireBlocker(second, 0, "an earlier target that is "+opState+" does not hold the next cutover")
+		}
+		for _, opState := range []string{state.ApplyOperation.Stopped, state.ApplyOperation.FailedRetryable, state.ApplyOperation.Cancelled, state.ApplyOperation.Reverted} {
+			require.NoError(t, store.ApplyOperations().UpdateState(ctx, first, opState))
+			requireBlocker(second, first, "an earlier target that is "+opState+" holds the next cutover")
+			requireBlocker(third, first, "the earliest target holding the cutover is the one named")
+		}
+
+		require.NoError(t, store.ApplyOperations().MarkCompleted(ctx, first))
+		require.NoError(t, store.ApplyOperations().UpdateState(ctx, second, state.ApplyOperation.Stopped))
+		requireBlocker(second, 0, "a completed earlier target holds nothing")
+		requireBlocker(third, second, "a later target's stop holds every cutover after it")
 	})
 
 	// CutoverBlocker_HeldByARetryTheDriveIsRidingOut verifies that a retry a
-	// live drive rides out holds later cutovers. eu's data plane parks its
-	// apply between recovery attempts while eu's drive keeps its lease, so
-	// eu's operation row stays running and only its task records the retry.
-	// That retry holds us's cutover, both the automatic claim and a requested
-	// one, exactly as a failed_retryable row would; once eu's task resumes,
-	// us cuts over.
+	// live drive rides out holds later cutovers of the same deployment.
+	// shop-001's data plane parks its apply between recovery attempts while
+	// its drive keeps its lease, so shop-001's operation row stays running and
+	// only its task records the retry. That retry holds shop-002's cutover,
+	// both the automatic claim and a requested one, exactly as a
+	// failed_retryable row would; once shop-001's task resumes, shop-002 cuts
+	// over while shop-001 is still copying.
 	t.Run("CutoverBlocker_HeldByARetryTheDriveIsRidingOut", func(t *testing.T) {
 		ctx := t.Context()
 		store := h.NewStorage(t)
 		lock := CreateLock(t, store, "cutover_live_retry_db", storage.DatabaseTypeMySQL)
 		apply := CreateApply(t, store, lock, "apply_cutover_live_retry", 928)
-		insert := func(deployment, opState string) int64 {
+		insert := func(target, opState string) int64 {
 			t.Helper()
 			id, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
-				ApplyID: apply.ID, Deployment: deployment, State: opState,
+				ApplyID: apply.ID, Deployment: "shop", Target: target, OperationKey: target, State: opState,
 				CutoverPolicy: storage.CutoverPolicyParallel, OnFailure: storage.OnFailureHalt,
 			})
 			require.NoError(t, err)
 			return id
 		}
-		euID := insert("eu", state.ApplyOperation.Running)
-		usID := insert("us", state.ApplyOperation.WaitingForCutover)
-		euTask := newTask(apply, "task_eu_live_retry", "orders", time.Now().UTC().Truncate(time.Second))
-		euTask.ApplyOperationID = &euID
-		euTask.State = state.Task.FailedRetryable
-		_, err := store.Tasks().Create(ctx, euTask)
+		firstID := insert("shop-001", state.ApplyOperation.Running)
+		secondID := insert("shop-002", state.ApplyOperation.WaitingForCutover)
+		firstTask := newTask(apply, "task_shop_001_live_retry", "orders", time.Now().UTC().Truncate(time.Second))
+		firstTask.ApplyOperationID = &firstID
+		firstTask.State = state.Task.FailedRetryable
+		_, err := store.Tasks().Create(ctx, firstTask)
 		require.NoError(t, err)
 
-		blocker, err := store.ApplyOperations().CutoverBlocker(ctx, usID)
+		blocker, err := store.ApplyOperations().CutoverBlocker(ctx, secondID)
 		require.NoError(t, err)
-		require.NotNil(t, blocker, "a retry recorded only on eu's task holds us's requested cutover")
-		assert.Equal(t, euID, blocker.ID)
-		assert.Equal(t, state.ApplyOperation.Running, blocker.State, "eu's row stays running while its drive rides out the retry")
+		require.NotNil(t, blocker, "a retry recorded only on shop-001's task holds shop-002's requested cutover")
+		assert.Equal(t, firstID, blocker.ID)
+		assert.Equal(t, state.ApplyOperation.Running, blocker.State, "shop-001's row stays running while its drive rides out the retry")
 		held, err := store.ApplyOperations().FindNextApplyOperationCutover(ctx, "driver-a")
 		require.NoError(t, err)
 		assert.Nil(t, held, "the automatic cutover claim is held by the same retry")
 
-		resumed, err := store.Tasks().Get(ctx, euTask.TaskIdentifier)
+		resumed, err := store.Tasks().Get(ctx, firstTask.TaskIdentifier)
 		require.NoError(t, err)
 		require.NotNil(t, resumed)
 		resumed.State = state.Task.Running
 		require.NoError(t, store.Tasks().Update(ctx, resumed))
-		blocker, err = store.ApplyOperations().CutoverBlocker(ctx, usID)
+		blocker, err = store.ApplyOperations().CutoverBlocker(ctx, secondID)
 		require.NoError(t, err)
-		assert.Nil(t, blocker, "once eu's retry recovers, eu still copying holds nothing")
+		assert.Nil(t, blocker, "once shop-001's retry recovers, shop-001 still copying holds nothing")
 		claimed, err := store.ApplyOperations().FindNextApplyOperationCutover(ctx, "driver-a")
 		require.NoError(t, err)
-		require.NotNil(t, claimed, "us cuts over once the retry ahead of it has recovered")
-		assert.Equal(t, usID, claimed.ID)
+		require.NotNil(t, claimed, "shop-002 cuts over once the retry ahead of it has recovered")
+		assert.Equal(t, secondID, claimed.ID)
 	})
 
 	// CutoverBlocker_ShardSiblingsDoNotTakeTurns verifies that the shard work
 	// rows of one deployment never hold each other's requested cutover. They
 	// share the deployment's one data-plane apply, which a cutover addresses
-	// as a whole, so only an earlier deployment can hold it, and only once
-	// that deployment has halted.
+	// as a whole, so only an earlier deployment can hold it.
 	t.Run("CutoverBlocker_ShardSiblingsDoNotTakeTurns", func(t *testing.T) {
 		ctx := t.Context()
 		store := h.NewStorage(t)
@@ -923,7 +953,8 @@ func TestApplyOperations(t *testing.T, h Harness) {
 
 		blocker, err = store.ApplyOperations().CutoverBlocker(ctx, laterDeployment)
 		require.NoError(t, err)
-		assert.Nil(t, blocker, "a later deployment does not wait for the earlier deployment's copying shard")
+		require.NotNil(t, blocker, "a later deployment waits for the earlier deployment's shards")
+		assert.Equal(t, copyingShard, blocker.ID)
 
 		require.NoError(t, store.ApplyOperations().UpdateState(ctx, copyingShard, state.ApplyOperation.Stopped))
 		blocker, err = store.ApplyOperations().CutoverBlocker(ctx, parkedShard)
@@ -932,7 +963,7 @@ func TestApplyOperations(t *testing.T, h Harness) {
 
 		blocker, err = store.ApplyOperations().CutoverBlocker(ctx, laterDeployment)
 		require.NoError(t, err)
-		require.NotNil(t, blocker, "a stopped shard of an earlier deployment holds a later deployment's cutover")
+		require.NotNil(t, blocker, "a stopped shard of an earlier deployment still holds a later deployment's cutover")
 		assert.Equal(t, copyingShard, blocker.ID)
 		assert.Equal(t, "eu", blocker.Deployment)
 	})
@@ -1047,10 +1078,11 @@ func TestApplyOperations(t *testing.T, h Harness) {
 	// FindNextApplyOperation_FinalizerWaitsOnEarlierMembers verifies that a
 	// finalizer is held by earlier rollout members the way a cutover is. A
 	// VSchema-only rollout over region-a and region-b has one finalizer per
-	// member and no work. Under rolling, region-b's finalizer does not start
-	// while region-a's is running; under barrier and parallel it starts
-	// without waiting for it. Once region-a's fails, region-b's stays held
-	// under halt, and under pause until an operator releases the rollout, so
+	// member and no work. While region-a's is running, region-b's does not
+	// start when the two are separate deployments, under every policy; when
+	// they are targets of one deployment, it starts without waiting under
+	// barrier and parallel. Once region-a's fails, region-b's stays held under
+	// halt, and under pause until an operator releases the rollout, so
 	// region-b's VSchema never goes out behind a failed region-a. Under
 	// continue it starts once region-a's has failed, and under every policy it
 	// starts once region-a's completes.
@@ -1061,8 +1093,11 @@ func TestApplyOperations(t *testing.T, h Harness) {
 			onFailure     string
 			// earlierState is the state region-a's finalizer settles in before
 			// region-b's is offered: running, failed or completed.
-			earlierState  string
-			release       bool
+			earlierState string
+			release      bool
+			// targets makes region-a and region-b targets of one deployment
+			// instead of two deployments.
+			targets       bool
 			laterAdmitted bool
 		}{
 			{name: "rolling_halt_failed", cutoverPolicy: storage.CutoverPolicyRolling, onFailure: storage.OnFailureHalt, earlierState: state.ApplyOperation.Failed},
@@ -1073,10 +1108,13 @@ func TestApplyOperations(t *testing.T, h Harness) {
 			{name: "barrier_continue_failed", cutoverPolicy: storage.CutoverPolicyBarrier, onFailure: storage.OnFailureContinue, earlierState: state.ApplyOperation.Failed, laterAdmitted: true},
 			{name: "parallel_halt_failed", cutoverPolicy: storage.CutoverPolicyParallel, onFailure: storage.OnFailureHalt, earlierState: state.ApplyOperation.Failed},
 			{name: "parallel_continue_failed", cutoverPolicy: storage.CutoverPolicyParallel, onFailure: storage.OnFailureContinue, earlierState: state.ApplyOperation.Failed, laterAdmitted: true},
-			{name: "barrier_halt_running", cutoverPolicy: storage.CutoverPolicyBarrier, onFailure: storage.OnFailureHalt, earlierState: state.ApplyOperation.Running, laterAdmitted: true},
+			{name: "barrier_halt_running", cutoverPolicy: storage.CutoverPolicyBarrier, onFailure: storage.OnFailureHalt, earlierState: state.ApplyOperation.Running},
+			{name: "barrier_halt_running_targets", cutoverPolicy: storage.CutoverPolicyBarrier, onFailure: storage.OnFailureHalt, earlierState: state.ApplyOperation.Running, targets: true, laterAdmitted: true},
 			{name: "barrier_pause_failed", cutoverPolicy: storage.CutoverPolicyBarrier, onFailure: storage.OnFailurePause, earlierState: state.ApplyOperation.Failed},
 			{name: "barrier_pause_released", cutoverPolicy: storage.CutoverPolicyBarrier, onFailure: storage.OnFailurePause, earlierState: state.ApplyOperation.Failed, release: true, laterAdmitted: true},
-			{name: "parallel_halt_running", cutoverPolicy: storage.CutoverPolicyParallel, onFailure: storage.OnFailureHalt, earlierState: state.ApplyOperation.Running, laterAdmitted: true},
+			{name: "parallel_halt_running", cutoverPolicy: storage.CutoverPolicyParallel, onFailure: storage.OnFailureHalt, earlierState: state.ApplyOperation.Running},
+			{name: "parallel_halt_running_targets", cutoverPolicy: storage.CutoverPolicyParallel, onFailure: storage.OnFailureHalt, earlierState: state.ApplyOperation.Running, targets: true, laterAdmitted: true},
+			{name: "parallel_halt_failed_targets", cutoverPolicy: storage.CutoverPolicyParallel, onFailure: storage.OnFailureHalt, earlierState: state.ApplyOperation.Failed, targets: true},
 			{name: "parallel_halt_completed", cutoverPolicy: storage.CutoverPolicyParallel, onFailure: storage.OnFailureHalt, earlierState: state.ApplyOperation.Completed, laterAdmitted: true},
 		} {
 			t.Run(tc.name, func(t *testing.T) {
@@ -1085,13 +1123,17 @@ func TestApplyOperations(t *testing.T, h Harness) {
 				lock := CreateLock(t, store, "operation_finalizer_order_"+tc.name, storage.DatabaseTypeVitess)
 				apply := CreateApply(t, store, lock, "apply_operation_finalizer_order_"+tc.name, 915)
 				ids := make([]int64, 0, 2)
-				for _, deployment := range []string{"region-a", "region-b"} {
-					id, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
-						ApplyID: apply.ID, Deployment: deployment,
+				for _, member := range []string{"region-a", "region-b"} {
+					op := &storage.ApplyOperation{
+						ApplyID: apply.ID, Deployment: member,
 						OperationKey:  "group_finalizer",
 						OperationKind: storage.ApplyOperationKindGroupFinalizer,
 						CutoverPolicy: tc.cutoverPolicy, OnFailure: tc.onFailure,
-					})
+					}
+					if tc.targets {
+						op.Deployment, op.Target, op.OperationKey = "shop", member, member+"/group_finalizer"
+					}
+					id, err := store.ApplyOperations().Insert(ctx, op)
 					require.NoError(t, err)
 					ids = append(ids, id)
 				}
@@ -1101,10 +1143,10 @@ func TestApplyOperations(t *testing.T, h Harness) {
 				require.NotNil(t, first)
 				require.Equal(t, ids[0], first.ID, "region-a's finalizer starts first")
 
-				if tc.cutoverPolicy == storage.CutoverPolicyRolling {
+				if tc.cutoverPolicy == storage.CutoverPolicyRolling || !tc.targets {
 					held, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-b")
 					require.NoError(t, err)
-					assert.Nil(t, held, "region-b's finalizer waits while region-a's is running under rolling")
+					assert.Nil(t, held, "region-b's finalizer waits while region-a's is running")
 				}
 
 				switch tc.earlierState {
@@ -1135,7 +1177,6 @@ func TestApplyOperations(t *testing.T, h Harness) {
 				}
 				require.NotNil(t, next, "%s admits region-b's finalizer", tc.name)
 				assert.Equal(t, ids[1], next.ID)
-				assert.Equal(t, "region-b", next.Deployment)
 			})
 		}
 	})
@@ -2439,4 +2480,21 @@ func requestControl(t *testing.T, store storage.Storage, applyID int64, operatio
 		Metadata:    []byte(`{}`),
 	})
 	require.NoError(t, err)
+}
+
+// cutoverBlockerAsserter returns a check that operationID's cutover is held by
+// wantBlockerID, or by nothing when wantBlockerID is zero.
+func cutoverBlockerAsserter(t *testing.T, store storage.Storage) func(operationID, wantBlockerID int64, msg string) {
+	t.Helper()
+	return func(operationID, wantBlockerID int64, msg string) {
+		t.Helper()
+		blocker, err := store.ApplyOperations().CutoverBlocker(t.Context(), operationID)
+		require.NoError(t, err)
+		if wantBlockerID == 0 {
+			assert.Nil(t, blocker, msg)
+			return
+		}
+		require.NotNil(t, blocker, msg)
+		assert.Equal(t, wantBlockerID, blocker.ID, msg)
+	}
 }
