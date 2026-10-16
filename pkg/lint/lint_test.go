@@ -109,6 +109,29 @@ func TestPlanChangesDefaultConfigFlagsDropsOnEveryTableName(t *testing.T) {
 	}
 }
 
+// The default linter judges a table named schema_version the same way as any
+// other on every entry point: dropping it outright requires --allow-unsafe, and
+// a PostgreSQL schema that declares it gets the same findings as users.
+func TestDefaultConfigLintsSchemaVersionOnEveryPath(t *testing.T) {
+	for _, name := range []string{"users", "schema_version"} {
+		t.Run(name, func(t *testing.T) {
+			results, unsafe, err := New().LintStatements([]string{"DROP TABLE `" + name + "`"})
+			require.NoError(t, err)
+			assert.True(t, unsafe, "dropping %s must require --allow-unsafe", name)
+			assert.NotEmpty(t, results)
+
+			pgResults, err := New().LintPostgresSchema(map[string]string{
+				name: "CREATE TABLE " + name + " (version integer);",
+			})
+			require.NoError(t, err)
+			require.NotEmpty(t, pgResults, "the default config must not exempt the PostgreSQL table %s", name)
+			for _, r := range pgResults {
+				assert.Equal(t, name, r.Table)
+			}
+		})
+	}
+}
+
 func TestLintStatements_SafeAlter(t *testing.T) {
 	linter := New()
 
