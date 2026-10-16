@@ -80,6 +80,58 @@ func TestLintStatements_DropIndex(t *testing.T) {
 	assert.True(t, found, "expected invisible_index_before_drop error for DROP INDEX, got: %+v", results)
 }
 
+// The default linter classifies a destructive change by what it does, never
+// by the table's name: dropping a column and a unique index requires
+// --allow-unsafe on a table called schema_version exactly as on users.
+func TestPlanChangesDefaultConfigFlagsDropsOnEveryTableName(t *testing.T) {
+	for _, name := range []string{"users", "schema_version"} {
+		t.Run(name, func(t *testing.T) {
+			current := []table.TableSchema{{Name: name, Schema: "CREATE TABLE `" + name + "` (" +
+				"`id` bigint NOT NULL, `checksum` int, `script` varchar(100), " +
+				"PRIMARY KEY (`id`), UNIQUE KEY `u_script` (`script`)" +
+				") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"}}
+			desired := []table.TableSchema{{Name: name, Schema: "CREATE TABLE `" + name + "` (" +
+				"`id` bigint NOT NULL, `script` varchar(100), PRIMARY KEY (`id`)" +
+				") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"}}
+
+			plan, err := PlanChanges(current, desired, nil, New().SpiritConfig())
+			require.NoError(t, err)
+			require.Len(t, plan.Changes, 1)
+
+			change := plan.Changes[0]
+			assert.Equal(t, name, change.TableName)
+			assert.Contains(t, change.Statement, "DROP COLUMN `checksum`")
+			assert.Contains(t, change.Statement, "DROP INDEX `u_script`")
+			reason, unsafe := PlannedChangeUnsafeReason(change)
+			assert.True(t, unsafe, "dropping a column and an index on %s must require --allow-unsafe", name)
+			assert.NotEmpty(t, reason)
+		})
+	}
+}
+
+// The default linter judges a table named schema_version the same way as any
+// other on every entry point: dropping it outright requires --allow-unsafe, and
+// a PostgreSQL schema that declares it gets the same findings as users.
+func TestDefaultConfigLintsSchemaVersionOnEveryPath(t *testing.T) {
+	for _, name := range []string{"users", "schema_version"} {
+		t.Run(name, func(t *testing.T) {
+			results, unsafe, err := New().LintStatements([]string{"DROP TABLE `" + name + "`"})
+			require.NoError(t, err)
+			assert.True(t, unsafe, "dropping %s must require --allow-unsafe", name)
+			assert.NotEmpty(t, results)
+
+			pgResults, err := New().LintPostgresSchema(map[string]string{
+				name: "CREATE TABLE " + name + " (version integer);",
+			})
+			require.NoError(t, err)
+			require.NotEmpty(t, pgResults, "the default config must not exempt the PostgreSQL table %s", name)
+			for _, r := range pgResults {
+				assert.Equal(t, name, r.Table)
+			}
+		})
+	}
+}
+
 func TestLintStatements_SafeAlter(t *testing.T) {
 	linter := New()
 
