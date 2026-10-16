@@ -421,6 +421,8 @@ func (c *LocalClient) processPendingCutoverControlRequest(ctx context.Context, a
 		}
 		return fmt.Errorf("process pending cutover for apply %s: %w", apply.ApplyIdentifier, err)
 	}
+	// cutover answers an engine that yields no result as a refusal, so this
+	// branch guards that contract rather than a path the engine can reach.
 	if resp == nil {
 		errorMessage := "the cutover path returned neither a response nor an error"
 		if err := failUnacceptedCutoverRequest(ctx, c.storage, apply, preCutoverState, errorMessage, logger); err != nil {

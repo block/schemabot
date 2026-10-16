@@ -2629,8 +2629,9 @@ func TestLocalClient_ProcessPendingCutoverControlRequestFailsRejectedRequest(t *
 }
 
 // An apply parked at waiting_for_cutover gets an operator cutover that the
-// engine does not take: the cutover errors, comes back with no result, or is
-// refused. The request fails with the engine's reason and the stored apply
+// engine does not take: the cutover errors or is refused. An engine that yields
+// no result is answered by the cutover path as a refusal, so that case runs the
+// refusal branch too. The request fails with the engine's reason and the stored apply
 // returns to waiting_for_cutover rather than staying at cutting_over with no
 // cutover behind it, so the operator's next cutover is recorded as a new
 // request and the next drive sends it to the engine.
@@ -2646,7 +2647,7 @@ func TestLocalClient_ProcessPendingCutoverNotAcceptedRestoresApplyState(t *testi
 			wantRequestErr: "cutover failed: drop sentinel table: connection reset",
 		},
 		{
-			name:           "engine returns no result",
+			name:           "engine yields no result, answered as a refusal",
 			engine:         &fakeControlEngine{cutoverNoResult: true},
 			wantRequestErr: "not accepted",
 		},
@@ -2727,6 +2728,157 @@ func TestLocalClient_ProcessPendingCutoverNotAcceptedRestoresApplyState(t *testi
 			assert.Equal(t, state.Apply.CuttingOver, applies.apply.State)
 		})
 	}
+}
+
+// newLocalParkedCutoverClient wires a local client with a whole-apply drive
+// parked at waiting_for_cutover, one task parked with it, and a pending
+// operator cutover request. The apply store keeps a copy of each write, so the
+// stored row and the in-memory apply can be asserted separately.
+func newLocalParkedCutoverClient(eng *fakeControlEngine) (*LocalClient, *storage.Apply, *mockApplyStore, *exactProgressTaskStore, *testControlRequestStore) {
+	apply := &storage.Apply{
+		ID:              133,
+		ApplyIdentifier: "apply-cutover-restore-local",
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+		State:           state.Apply.WaitingForCutover,
+	}
+	storedApply := *apply
+	applies := &mockApplyStore{apply: &storedApply}
+	tasks := &exactProgressTaskStore{tasks: []*storage.Task{{
+		ID:             466,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task-cutover-restore-local",
+		Database:       "testdb",
+		Namespace:      "testdb",
+		DatabaseType:   storage.DatabaseTypeMySQL,
+		TableName:      "users",
+		State:          state.Task.WaitingForCutover,
+	}}}
+	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationCutover,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "cli:alice",
+	}}}
+	client := &LocalClient{
+		config: LocalConfig{
+			Database: "testdb",
+			Type:     storage.DatabaseTypeMySQL,
+		},
+		storage: &exactProgressStorage{
+			applies:         applies,
+			tasks:           tasks,
+			logs:            &mockApplyLogStore{},
+			controlRequests: controlRequests,
+		},
+		spiritEngine: eng,
+		logger:       slog.Default(),
+	}
+	return client, apply, applies, tasks, controlRequests
+}
+
+// The engine does not take an operator cutover and the write restoring the
+// pre-cutover state also fails. The request stays pending instead of failing,
+// so the next drive re-sends the cutover from the stored cutting_over rather
+// than leaving the apply wedged behind a failed request.
+func TestLocalClient_ProcessPendingCutoverRestoreFailureKeepsRequestPending(t *testing.T) {
+	eng := &fakeControlEngine{cutoverErr: errors.New("drop sentinel table: connection reset")}
+	client, apply, applies, tasks, controlRequests := newLocalParkedCutoverClient(eng)
+	applies.laterUpdateErr = errors.New("storage write unavailable")
+
+	err := client.processPendingCutoverControlRequest(t.Context(), apply, tasks.tasks)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "cutover failed: drop sentinel table: connection reset")
+	assert.Contains(t, err.Error(), "restore apply apply-cutover-restore-local to waiting_for_cutover after unaccepted cutover: storage write unavailable")
+	assert.Equal(t, 1, eng.cutoverCount)
+	assert.Equal(t, state.Apply.CuttingOver, apply.State, "in-memory apply matches the stored row")
+	assert.Equal(t, state.Apply.CuttingOver, applies.apply.State)
+	pending, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationCutover)
+	require.NoError(t, err)
+	require.NotNil(t, pending, "request stays pending so the next drive re-sends the cutover")
+
+	// The storage write recovers and the engine takes the re-sent cutover.
+	applies.laterUpdateErr = nil
+	*eng = fakeControlEngine{cutoverCount: eng.cutoverCount}
+	require.NoError(t, client.processPendingCutoverControlRequest(t.Context(), apply, tasks.tasks))
+	assert.Equal(t, 2, eng.cutoverCount)
+	assert.Equal(t, storage.ControlRequestCompleted, controlRequests.requests[0].Status)
+	assert.Equal(t, state.Apply.CuttingOver, applies.apply.State)
+}
+
+// A drive re-sends a still-pending cutover and finds the apply already stored
+// as cutting_over by the drive that first sent it. When the engine refuses the
+// re-send, the apply returns to the state its tasks derive, so the operator can
+// command cutover again instead of being told one is in progress. Tasks
+// already cutting over are a state the progress sync settles, so nothing is
+// written for them.
+func TestLocalClient_RefusedResentCutoverRestoresStateFromTasks(t *testing.T) {
+	tests := []struct {
+		name        string
+		taskState   string
+		wantState   string
+		wantUpdates int
+	}{
+		{
+			name:        "task parked at waiting_for_cutover",
+			taskState:   state.Task.WaitingForCutover,
+			wantState:   state.Apply.WaitingForCutover,
+			wantUpdates: 1,
+		},
+		{
+			name:        "task already cutting over in the engine",
+			taskState:   state.Task.CuttingOver,
+			wantState:   state.Apply.CuttingOver,
+			wantUpdates: 0,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			eng := &fakeControlEngine{cutoverResult: &engine.ControlResult{Accepted: false, Message: "not ready for cutover"}}
+			client, apply, applies, tasks, controlRequests := newLocalParkedCutoverClient(eng)
+			apply.State = state.Apply.CuttingOver
+			applies.apply.State = state.Apply.CuttingOver
+			tasks.tasks[0].State = tt.taskState
+
+			err := client.processPendingCutoverControlRequest(t.Context(), apply, tasks.tasks)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "not ready for cutover")
+			assert.Equal(t, 1, eng.cutoverCount)
+			assert.Equal(t, tt.wantState, apply.State)
+			assert.Equal(t, tt.wantState, applies.apply.State)
+			assert.Len(t, applies.updates, tt.wantUpdates, "the stored cutting_over is not re-marked; only the restore writes")
+			require.Len(t, controlRequests.requests, 1)
+			assert.Equal(t, storage.ControlRequestFailed, controlRequests.requests[0].Status)
+			assert.Equal(t, "not ready for cutover", controlRequests.requests[0].ErrorMessage)
+		})
+	}
+}
+
+// Under an operation-only lease the parent apply row is not the drive's to
+// write: the mark before the cutover stays in memory, and so does the restore
+// when the engine refuses it. The request is still failed, so the operator sees
+// the refusal and can command cutover again.
+func TestLocalClient_RefusedCutoverUnderOperationLeaseNeverWritesParentApply(t *testing.T) {
+	eng := &fakeControlEngine{cutoverResult: &engine.ControlResult{Accepted: false, Message: "not ready for cutover"}}
+	client, apply, applies, tasks, controlRequests := newLocalParkedCutoverClient(eng)
+	ctx := storage.WithOperationLease(t.Context(), storage.OperationLease{
+		ApplyID:     apply.ID,
+		OperationID: 7,
+		Owner:       "host/1/driver-0",
+		Token:       "operation-token",
+	})
+
+	err := client.processPendingCutoverControlRequest(ctx, apply, tasks.tasks)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "not ready for cutover")
+	assert.Equal(t, 1, eng.cutoverCount)
+	assert.Equal(t, state.Apply.WaitingForCutover, apply.State, "the in-memory mark is undone")
+	assert.Equal(t, state.Apply.WaitingForCutover, applies.apply.State)
+	assert.Empty(t, applies.updates, "neither the mark nor the restore writes the parent row")
+	require.Len(t, controlRequests.requests, 1)
+	assert.Equal(t, storage.ControlRequestFailed, controlRequests.requests[0].Status)
+	assert.Equal(t, "not ready for cutover", controlRequests.requests[0].ErrorMessage)
 }
 
 // A cutover request that the engine backend rejects because it has not yet
