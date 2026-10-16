@@ -1011,9 +1011,11 @@ what attached.
 
 The check runs whenever an apply is created or moved back into an active state, serialized across
 instances by an advisory lock keyed on (database, database type, environment) and held for the
-transaction that decides. That lock excludes only while the connection holding it keeps one server
-session, which OW-9 covers. It does not depend on a user-facing database lock being held: direct
-API callers and `--no-lock` flows are equally bound.
+transaction that decides. Every path takes that lock before it locks an apply row, never while
+holding one, so a holder of the lock is never left waiting on a row its next waiter holds. That
+lock excludes only while the connection holding it keeps one server session, which OW-9 covers.
+It does not depend on a user-facing database lock being held: direct API callers and `--no-lock`
+flows are equally bound.
 
 The rollout verdict correction in ST-1 is the one exception: it writes the parent row without
 re-running the check. It lands from a drive, and the drive's operation is in progress until the

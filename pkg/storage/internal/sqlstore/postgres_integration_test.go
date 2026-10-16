@@ -74,6 +74,13 @@ func TestPostgresStorageParity(t *testing.T) {
 			return NewPostgres(h.db)
 		}, postgresLockWaiter(h.db))
 	})
+	t.Run("StoppedApplyStartRacingItsTakeover", func(t *testing.T) {
+		testStoppedApplyStartRacingItsTakeover(t, func(t *testing.T) *Storage {
+			t.Helper()
+			clearPostgresTables(t, h.db)
+			return NewPostgres(h.db)
+		}, postgresLockWaiter(h.db), postgresAdvisoryLockWaiter(h.db))
+	})
 	t.Run("NonUTCWriterTimesStoreTheirInstant", func(t *testing.T) { testPostgresNonUTCWriterTimesStoreTheirInstant(t, h) })
 	t.Run("FindTerminalWithInProgressCheck", func(t *testing.T) { testPostgresFindTerminalWithInProgressCheck(t, h) })
 }

@@ -2123,15 +2123,59 @@ func (s *applyStore) CountRecentByState(ctx context.Context, filter storage.Rece
 // because another active apply owns the target or because the apply was
 // superseded (the start request is failed in either case; see
 // persistApplyClaim).
+//
+// Resuming a stopped apply re-checks its target under the apply target lock,
+// and that lock is taken before the apply row is locked, the order every write
+// that checks the target reservation uses. The first claim attempt finds that
+// the apply needs the lock and ends its transaction, releasing the row; the
+// lock is then taken and the claim runs again under it. A claim that held the
+// row while waiting for the lock could wait on a create that holds the lock and
+// is stamping this apply as taken over (markTakenOver), while that create waits
+// on the row.
 func (s *applyStore) ClaimApplyByID(ctx context.Context, applyID int64, owner string) (*storage.Apply, error) {
 	if owner == "" {
 		return nil, fmt.Errorf("operator owner is required to claim apply %d: %w", applyID, storage.ErrApplyLeaseLost)
 	}
+	apply, outcome, err := s.claimApplyByIDOnce(ctx, applyID, owner, "")
+	if err != nil {
+		return nil, err
+	}
+	if outcome != claimNeedsTargetLock {
+		return apply, nil
+	}
+
+	database, dbType, environment, _, err := applyTargetForUpdate(ctx, s.db, apply)
+	if err != nil {
+		return nil, err
+	}
+	conn, lockName, err := acquireApplyTargetLockConn(ctx, s.db, s.locker, database, dbType, environment)
+	if err != nil {
+		return nil, err
+	}
+	defer releaseApplyTargetLockConn(ctx, s.locker, conn, lockName, "claim stopped apply")
+
+	apply, outcome, err = s.claimApplyByIDOnce(ctx, applyID, owner, lockName)
+	if err != nil {
+		return nil, err
+	}
+	if outcome == claimNeedsTargetLock {
+		return nil, fmt.Errorf("claim stopped apply %d (%s) on %s/%s/%s: the claim still needs the apply target lock it holds", applyID, apply.ApplyIdentifier, database, dbType, environment)
+	}
+	return apply, nil
+}
+
+// claimApplyByIDOnce runs one claim attempt of ClaimApplyByID in its own
+// transaction. heldTargetLock names the apply target lock the caller already
+// holds, or is empty when it holds none. It returns the claimed apply only for
+// an acquired claim; for claimNeedsTargetLock it returns the selected apply so
+// the caller can take that apply's target lock, after this attempt's
+// transaction has released the row.
+func (s *applyStore) claimApplyByIDOnce(ctx context.Context, applyID int64, owner, heldTargetLock string) (*storage.Apply, claimOutcome, error) {
 	// Read committed keeps concurrent SKIP LOCKED claims from taking next-key
 	// range locks that can serialize drivers across otherwise independent targets.
 	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
-		return nil, fmt.Errorf("begin claim apply %d transaction: %w", applyID, err)
+		return nil, claimLostRace, fmt.Errorf("begin claim apply %d transaction: %w", applyID, err)
 	}
 	defer rollbackTx(ctx, tx, "claim apply by id")
 
@@ -2240,28 +2284,31 @@ func (s *applyStore) ClaimApplyByID(ctx context.Context, applyID int64, owner st
 
 	apply, err := scanApplyInto(row)
 	if errors.Is(err, sql.ErrNoRows) {
-		return nil, nil // apply does not exist, is locked, or is not claimable
+		return nil, claimLostRace, nil // apply does not exist, is locked, or is not claimable
 	}
 	if err != nil {
-		return nil, fmt.Errorf("query claimable apply %d: %w", applyID, err)
+		return nil, claimLostRace, fmt.Errorf("query claimable apply %d: %w", applyID, err)
 	}
 
-	outcome, err := persistApplyClaim(ctx, s.db, s.locker, s.dialect, tx, apply, owner)
+	outcome, err := persistApplyClaim(ctx, s.dialect, tx, apply, owner, heldTargetLock)
 	if err != nil {
-		return nil, err
+		return nil, claimLostRace, err
+	}
+	if outcome == claimNeedsTargetLock {
+		return apply, outcome, nil
 	}
 	if outcome.claimedAndComplete() {
-		return apply, nil
+		return apply, outcome, nil
 	}
 	if outcome != claimAcquired {
-		return nil, nil
+		return nil, outcome, nil
 	}
 
 	if err := tx.Commit(); err != nil {
-		return nil, fmt.Errorf("commit claim apply %d (%s): %w", apply.ID, apply.ApplyIdentifier, err)
+		return nil, claimLostRace, fmt.Errorf("commit claim apply %d (%s): %w", apply.ID, apply.ApplyIdentifier, err)
 	}
 
-	return apply, nil
+	return apply, outcome, nil
 }
 
 // FindNextApplyForStopReconciliation claims one apply eligible for stop
@@ -2364,7 +2411,7 @@ func (s *applyStore) FindNextApplyForStopReconciliation(ctx context.Context, own
 	// stopped apply reaches this path — terminal states are excluded above — so
 	// claimAcquiredCommitted, the stopped-only outcome, cannot occur and the
 	// caller always commits an acquired claim).
-	outcome, err := persistApplyClaim(ctx, s.db, s.locker, s.dialect, tx, apply, owner)
+	outcome, err := persistApplyClaim(ctx, s.dialect, tx, apply, owner, "")
 	if err != nil {
 		return nil, err
 	}
@@ -2449,7 +2496,7 @@ func (s *applyStore) FindNextApplyForOperationProjection(ctx context.Context, ow
 	// persistApplyClaim rotates the lease and refreshes the heartbeat. Refreshing
 	// it is what bounds re-claim churn: a parent the projection cannot settle is
 	// not reconsidered until the staleness window elapses again.
-	outcome, err := persistApplyClaim(ctx, s.db, s.locker, s.dialect, tx, apply, owner)
+	outcome, err := persistApplyClaim(ctx, s.dialect, tx, apply, owner, "")
 	if err != nil {
 		return nil, err
 	}
@@ -2488,6 +2535,11 @@ const (
 	// claimRefusedActiveTarget, the pending start control request was failed and
 	// committed inside persistApplyClaim.
 	claimRefusedSuperseded
+	// claimNeedsTargetLock means a stopped→running claim must re-check its
+	// target under the apply target lock, which the caller does not hold. Nothing
+	// was written; the caller rolls back to release the row, takes the lock, and
+	// claims again under it.
+	claimNeedsTargetLock
 )
 
 // claimedAndComplete reports whether the outcome both acquired the claim and
@@ -2514,14 +2566,17 @@ func (o claimOutcome) claimedAndComplete() bool {
 // the operator sees why. A stopped apply whose unfinished work another apply
 // took over (superseded_by) is refused and its pending start request failed the
 // same way — but where the active-target refusal clears once the other apply
-// settles, the superseded refusal is permanent.
+// settles, the superseded refusal is permanent. heldTargetLock names the apply
+// target lock the caller already holds; a stopped→running claim made without it
+// returns claimNeedsTargetLock rather than waiting for the lock with the row
+// locked.
 //
 // A stopped apply with a pending cancel request is claimed to deliver the
 // cancel, not to resume: the pending cancel routes the claim to
 // claimStoppedApplyForCancel, which rotates only the lease. Cancel wins over a
 // simultaneously pending start — resuming a copy the operator asked to discard
 // is never the right answer.
-func persistApplyClaim(ctx context.Context, db *rebindDB, locker namedlock.Locker, dialect Dialect, tx *rebindTx, apply *storage.Apply, owner string) (claimOutcome, error) {
+func persistApplyClaim(ctx context.Context, dialect Dialect, tx *rebindTx, apply *storage.Apply, owner, heldTargetLock string) (claimOutcome, error) {
 	leaseToken := uuid.NewString()
 	leaseAcquiredAt := time.Now()
 	apply.LeaseOwner = owner
@@ -2536,7 +2591,7 @@ func persistApplyClaim(ctx context.Context, db *rebindDB, locker namedlock.Locke
 		if cancelPending {
 			return claimStoppedApplyForCancel(ctx, tx, apply, owner, leaseToken)
 		}
-		return claimStoppedApplyUnderTargetLock(ctx, db, locker, dialect, tx, apply, owner, leaseToken)
+		return claimStoppedApplyUnderTargetLock(ctx, dialect, tx, apply, owner, leaseToken, heldTargetLock)
 	}
 
 	if isStartingClaim(apply.State) {
@@ -2562,10 +2617,15 @@ func persistApplyClaim(ctx context.Context, db *rebindDB, locker namedlock.Locke
 }
 
 // claimStoppedApplyUnderTargetLock drives the full stopped→resuming claim while
-// holding the apply-target lock: re-check the one-active-apply-per-target
+// the caller holds the apply-target lock: re-check the one-active-apply-per-target
 // invariant, then either transition+commit or refuse+commit. It commits inside
 // the lock so a concurrent create cannot add a second active apply between the
-// re-check and the commit. The lock is released only after the commit.
+// re-check and the commit; the caller releases the lock only after the commit.
+//
+// The caller takes the lock before the transaction that locks this row, the
+// order every write that checks the target reservation uses, so heldTargetLock
+// must name the lock for this apply's target. A claim made without it returns
+// claimNeedsTargetLock once the row-only checks pass, and writes nothing.
 //
 // It first asserts in-transaction that the durable start request the claim
 // predicate matched on is still pending, so a stopped apply can never reach
@@ -2573,7 +2633,7 @@ func persistApplyClaim(ctx context.Context, db *rebindDB, locker namedlock.Locke
 // request can be settled between the claim SELECT and this read — by the cancel
 // routing above, or by another driver that already resumed the apply — and
 // backing off then is the correct outcome, not an error.
-func claimStoppedApplyUnderTargetLock(ctx context.Context, db *rebindDB, locker namedlock.Locker, dialect Dialect, tx *rebindTx, apply *storage.Apply, owner, leaseToken string) (claimOutcome, error) {
+func claimStoppedApplyUnderTargetLock(ctx context.Context, dialect Dialect, tx *rebindTx, apply *storage.Apply, owner, leaseToken, heldTargetLock string) (claimOutcome, error) {
 	startPending, err := hasPendingControlRequestTx(ctx, tx, apply.ID, storage.ControlOperationStart)
 	if err != nil {
 		return claimLostRace, err
@@ -2592,20 +2652,25 @@ func claimStoppedApplyUnderTargetLock(ctx context.Context, db *rebindDB, locker 
 		return claimLostRace, fmt.Errorf("stopped apply %d (%s) is missing target metadata for claim re-check", apply.ID, apply.ApplyIdentifier)
 	}
 
-	// The handoff marker is checked before the target lock because it is a fact
-	// about this row alone, which the claim already holds FOR UPDATE. It also
+	// The handoff marker does not need the target lock to refuse, because it is
+	// a fact about this row alone, which the claim holds FOR UPDATE. It also
 	// outlives the successor: once that apply settles, the target is free again
 	// and the one-active-apply re-check below would let this claim through even
-	// though its work was already taken over.
+	// though its work was already taken over. A create that takes this apply over
+	// writes the marker under the target lock, so the claim made under that lock
+	// reads a marker committed while it waited.
 	if apply.SupersededBy != "" {
 		return refuseStoppedClaimForSupersededApply(ctx, tx, apply, owner, database, dbType, environment)
 	}
 
-	conn, lockName, err := acquireApplyTargetLockConn(ctx, db, locker, database, dbType, environment)
-	if err != nil {
-		return claimLostRace, err
+	if heldTargetLock == "" {
+		slog.DebugContext(ctx, "operator: stopped apply needs the apply target lock to resume; releasing the row to claim again under the lock",
+			append(apply.LogAttrs(), "lease_owner", owner)...)
+		return claimNeedsTargetLock, nil
 	}
-	defer releaseApplyTargetLockConn(ctx, locker, conn, lockName, "claim stopped apply")
+	if lockName := applyTargetLockName(database, dbType, environment); lockName != heldTargetLock {
+		return claimLostRace, fmt.Errorf("stopped apply %d (%s) targets %s/%s/%s, which the held apply target lock does not cover", apply.ID, apply.ApplyIdentifier, database, dbType, environment)
+	}
 
 	deployments, err := operationDeploymentsForApply(ctx, tx, apply.ID)
 	if err != nil {
