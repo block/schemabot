@@ -1,14 +1,18 @@
 package spirit
 
 import (
+	"context"
 	"database/sql/driver"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"testing"
 
 	"github.com/block/mysql"
 	"github.com/block/spirit/pkg/checksum"
 	"github.com/block/spirit/pkg/dbconn"
+	"github.com/block/spirit/pkg/status"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -112,6 +116,139 @@ func TestClassifyRunnerError(t *testing.T) {
 func copyWarningError(code uint16, message string) error {
 	return fmt.Errorf("failed to execute chunklet insert: %w",
 		&dbconn.UnsafeWarningError{Warning: &mysql.MySQLError{Number: code, Message: message}})
+}
+
+// A runner error is read against the evidence Spirit retained for the run.
+// Once the cutover commits, the target holds the change, so an error from the
+// cleanup after it is not the change's outcome. Before the cutover the target
+// holds none of it, and when Spirit cannot tell whether the cutover committed
+// nothing is proven landed.
+func TestClassifyRunnerErrorCutover(t *testing.T) {
+	tests := []struct {
+		name   string
+		result status.WorkflowResult
+		want   runnerErrorCutover
+	}{
+		{
+			name:   "an error before the cutover committed",
+			result: status.WorkflowResult{},
+			want:   runnerErrorBeforeCutover,
+		},
+		{
+			name:   "cleanup failing after the cutover committed keeps the change landed",
+			result: status.WorkflowResult{DurableMutation: true},
+			want:   runnerErrorAfterCutover,
+		},
+		{
+			name:   "an unverified cutover is not proven landed",
+			result: status.WorkflowResult{TerminalOwnership: status.WorkflowTerminalOwnershipAmbiguous},
+			want:   runnerErrorCutoverUnverified,
+		},
+		{
+			name: "ambiguous ownership outranks a durable mutation",
+			result: status.WorkflowResult{
+				DurableMutation:   true,
+				TerminalOwnership: status.WorkflowTerminalOwnershipAmbiguous,
+			},
+			want: runnerErrorCutoverUnverified,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, classifyRunnerErrorCutover(tt.result))
+		})
+	}
+}
+
+// A runner error settles the ALTER as finished only on Spirit's proof that the
+// cutover committed, whether or not a stop, cancel, or shutdown cancelled the
+// run. Without that proof a cancelled run stays as the stop or cancel left it
+// and an uncancelled one is recorded failed; an unverified cutover is never
+// settled as finished, even when Spirit also recorded a durable mutation.
+func TestSettleRunnerError(t *testing.T) {
+	committed := status.WorkflowResult{DurableMutation: true}
+	unverified := status.WorkflowResult{
+		DurableMutation:   true,
+		TerminalOwnership: status.WorkflowTerminalOwnershipAmbiguous,
+	}
+	tests := []struct {
+		name      string
+		cancelled bool
+		result    status.WorkflowResult
+		// wantFinished means the ALTER settles as finished (a nil return).
+		wantFinished bool
+		wantStopped  bool
+		wantState    engine.State
+	}{
+		{
+			name:         "cancelled after the cutover committed settles as finished",
+			cancelled:    true,
+			result:       committed,
+			wantFinished: true,
+			wantState:    engine.StateStopped,
+		},
+		{
+			name:        "cancelled with an unverified cutover stays stopped",
+			cancelled:   true,
+			result:      unverified,
+			wantStopped: true,
+			wantState:   engine.StateStopped,
+		},
+		{
+			name:        "cancelled before the cutover stays stopped",
+			cancelled:   true,
+			result:      status.WorkflowResult{},
+			wantStopped: true,
+			wantState:   engine.StateStopped,
+		},
+		{
+			name:         "uncancelled after the cutover committed settles as finished",
+			result:       committed,
+			wantFinished: true,
+			wantState:    engine.StateRunning,
+		},
+		{
+			name:      "uncancelled with an unverified cutover fails",
+			result:    unverified,
+			wantState: engine.StateFailed,
+		},
+		{
+			name:      "uncancelled before the cutover fails",
+			result:    status.WorkflowResult{},
+			wantState: engine.StateFailed,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			eng := New(Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+			// A stop or cancel sets the state to stopped before it cancels the
+			// run's context.
+			initial := engine.StateRunning
+			if tt.cancelled {
+				initial = engine.StateStopped
+			}
+			eng.runningSchemaChange = &runningSchemaChange{database: "app", state: initial}
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			if tt.cancelled {
+				cancel()
+			}
+			runErr := errors.New("drop checkpoint table: lock wait timeout exceeded")
+
+			err := eng.settleRunnerError(ctx, runErr, tt.result, "app", []string{"orders"})
+
+			switch {
+			case tt.wantFinished:
+				require.NoError(t, err, "a committed cutover settles the ALTER as finished")
+			case tt.wantStopped:
+				require.ErrorIs(t, err, errSchemaChangeStopped)
+			default:
+				require.ErrorIs(t, err, runErr, "the failure carries the runner's error")
+				assert.NotErrorIs(t, err, errSchemaChangeStopped)
+			}
+			assert.Equal(t, tt.wantState, eng.runningSchemaChange.state)
+		})
+	}
 }
 
 // A row the copy cannot write into the new table definition fails every

@@ -69,7 +69,7 @@ func IsAggregate(check *storage.Check) bool {
 // block has to survive later writes that did not re-evaluate the condition, so
 // a non-empty value is always a deliberate decision to keep the gate closed.
 const (
-	BlockSchemaRemovedAfterApplyStarted   = "schema_removed_after_apply_started"
+	BlockSchemaRemovedAfterApplyStarted   = storage.SchemaRemovedAfterApplyStartedBlockingReason
 	BlockRollbackCompleted                = "rollback_completed"
 	BlockApplyCancelled                   = "apply_cancelled"
 	BlockApplyCancelledAfterTaskCompleted = "apply_cancelled_after_task_completed"
@@ -394,7 +394,7 @@ func runningDisposition(check *storage.Check, apply *storage.Apply, coversHead b
 	if applyIsStopped(apply) {
 		return Disposition{
 			Reason:   ReasonApplyStopped,
-			Summary:  "The apply holding this check is stopped, so the check stays in progress and the gate stays closed.",
+			Summary:  "The apply holding this check is stopped, so the gate stays closed.",
 			Remedy:   "Start the apply or cancel it. It does not settle on its own, and no plan replaces a stopped apply's result.",
 			Blocking: true,
 		}

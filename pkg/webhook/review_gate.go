@@ -10,7 +10,9 @@ import (
 
 	"github.com/hmarr/codeowners"
 
+	"github.com/block/schemabot/pkg/ddl"
 	ghclient "github.com/block/schemabot/pkg/github"
+	schemadialect "github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/webhook/templates"
 )
 
@@ -186,14 +188,15 @@ func (h *Handler) checkReviewGate(ctx context.Context, client *ghclient.Installa
 	validApprovals := slices.Concat(headApprovals, earlierApprovals)
 
 	coverage := approvalCoverage{
-		repo:          repo,
-		pr:            pr,
-		database:      database,
-		baseRef:       prInfo.BaseRef,
-		defaultBranch: prInfo.DefaultBranch,
-		headSHA:       headSHA,
-		inputPaths:    reviewGateInputPaths(schema),
-		verdicts:      make(map[string]approvalVerdict),
+		repo:              repo,
+		pr:                pr,
+		database:          database,
+		baseRef:           prInfo.BaseRef,
+		defaultBranch:     prInfo.DefaultBranch,
+		headSHA:           headSHA,
+		inputPaths:        reviewGateInputPaths(schema),
+		compareStatements: statementComparerFor(schema.Type),
+		verdicts:          make(map[string]approvalVerdict),
 	}
 	var changedApprovers, uncomparedApprovers []string
 	for _, approval := range validApprovals {
@@ -280,7 +283,23 @@ type approvalCoverage struct {
 	// inputPaths are the database's schema inputs: every path whose change at
 	// the approved commit must match the head for the approval to count.
 	inputPaths []string
-	verdicts   map[string]approvalVerdict
+	// compareStatements proves a schema file that both the PR and the base
+	// branch edited generates the same statements at both commits, or is nil
+	// when the database's dialect has no such comparison.
+	compareStatements ghclient.SchemaFileChangeComparer
+	verdicts          map[string]approvalVerdict
+}
+
+// statementComparerFor returns the statement comparison for a database
+// type's schema files. MySQL-family files hold one CREATE TABLE each, which
+// ddl.SameTableChange compares. Every other dialect returns nil, so its
+// files are compared by content alone and a file both the PR and the base
+// branch edited always counts as changed.
+func statementComparerFor(databaseType string) ghclient.SchemaFileChangeComparer {
+	if schemadialect.DialectForDatabaseType(databaseType) == schemadialect.DialectMySQL {
+		return ddl.SameTableChange
+	}
+	return nil
 }
 
 // approvalCoversHead decides whether an approval still stands for the PR head.
@@ -325,7 +344,7 @@ func (h *Handler) approvalCoversHead(ctx context.Context, client *ghclient.Insta
 // errApprovalNotComparable, and a GitHub outage is returned as a retryable
 // error.
 func (h *Handler) schemaChangeUnchangedSince(ctx context.Context, client *ghclient.InstallationClient, c *approvalCoverage, approval *ghclient.ReviewInfo) (approvalVerdict, error) {
-	comparison, err := client.PRSchemaChangeUnchangedSince(ctx, c.repo, c.baseRef, c.defaultBranch, approval.CommitID, c.headSHA, c.inputPaths)
+	comparison, err := client.PRSchemaChangeUnchangedSince(ctx, c.repo, c.baseRef, c.defaultBranch, approval.CommitID, c.headSHA, c.inputPaths, c.compareStatements)
 	if err != nil {
 		if ghclient.IsUnavailableError(err) {
 			return approvalVerdict{}, fmt.Errorf("compare schema change for %s#%d database %q at approved commit %s and head %s: %w",
@@ -356,6 +375,7 @@ func (h *Handler) schemaChangeUnchangedSince(ctx context.Context, client *ghclie
 			"head_merge_base_sha", comparison.HeadMergeBaseSHA,
 			"base_moved_forward", comparison.BaseMovedForward,
 			"base_is_default_branch", comparison.BaseIsDefaultBranch,
+			"statement_compared_paths", comparison.StatementComparedPaths,
 			"differing_path", comparison.DifferingPath)
 		return approvalVerdict{}, nil
 	}
@@ -367,6 +387,7 @@ func (h *Handler) schemaChangeUnchangedSince(ctx context.Context, client *ghclie
 		"head_merge_base_sha", comparison.HeadMergeBaseSHA,
 		"base_moved_forward", comparison.BaseMovedForward,
 		"base_is_default_branch", comparison.BaseIsDefaultBranch,
+		"statement_compared_paths", comparison.StatementComparedPaths,
 		"input_paths", c.inputPaths)
 	return approvalVerdict{covers: true}, nil
 }

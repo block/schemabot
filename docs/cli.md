@@ -902,7 +902,7 @@ Waiting on an operator:
     apply: apply-example-68 (rolled_back)
     blocking reason: rollback_completed
     do: Reconcile the target environment. No plan and no new commit clears this on its own.
-  staging/shipments: The apply holding this check is stopped, so the check stays in progress and the gate stays closed.
+  staging/shipments: The apply holding this check is stopped, so the gate stays closed.
     apply: apply-example-81 (stopped)
     do: Start the apply or cancel it. It does not settle on its own, and no plan replaces a stopped apply's result.
 ```

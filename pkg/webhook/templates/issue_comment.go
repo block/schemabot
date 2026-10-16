@@ -362,6 +362,22 @@ func RenderCutoverSupersededComment(data SupersededProgressData) string {
 		data.Repo, data.PR, data.NewCommentID, data.PreviousBody)
 }
 
+// cutoverCommandSupersededPrefix opens every frozen body written when the
+// operator's cutover superseded a deferred apply's progress comment;
+// IsSupersededProgressComment keys on it so a freeze retry can tell an
+// already-frozen comment from a live one.
+const cutoverCommandSupersededPrefix = "Cutover started"
+
+// RenderCutoverCommandSupersededProgressComment renders the frozen body
+// written over a deferred apply's progress comment once the operator's
+// cutover takes effect and rotates in a fresh one. The old comment's
+// waiting-for-cutover rendering stays on the PR as a record, collapsed into a
+// details block, with a pointer to the comment where the cutover is tracked.
+func RenderCutoverCommandSupersededProgressComment(data SupersededProgressData) string {
+	return renderSupersededFold(cutoverCommandSupersededPrefix+" — progress continues in", "Progress before the cutover",
+		data.Repo, data.PR, data.NewCommentID, data.PreviousBody)
+}
+
 // genericSupersededPrefix opens every frozen body written when the superseding
 // rotation is no longer known; IsSupersededProgressComment keys on it so a
 // freeze retry can tell an already-frozen comment from a live one.
@@ -403,6 +419,7 @@ func IsSupersededProgressComment(body string) bool {
 		revertSupersededPrefix,
 		skipRevertSupersededPrefix,
 		cutoverSupersededPrefix,
+		cutoverCommandSupersededPrefix,
 		genericSupersededPrefix,
 	} {
 		if strings.HasPrefix(headline, prefix) {

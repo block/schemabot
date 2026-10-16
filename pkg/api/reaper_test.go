@@ -163,6 +163,23 @@ func TestRunStrandedReaperPassAnswersAStartStrandedOnASettledApply(t *testing.T)
 	})
 }
 
+// A revert left pending on an apply whose revert window expired into a
+// completed outcome is answered by the reaper as not applied: the change is
+// live on the target, so reporting the revert carried out would be false, and
+// leaving it pending would have every later pass list it again.
+func TestRunStrandedReaperPassAnswersARevertStrandedOnACompletedApply(t *testing.T) {
+	apply := &storage.Apply{ID: 9, ApplyIdentifier: "apply-window-expired", State: state.Apply.Completed}
+	svc, controls := strandedControlRequestReaperService(apply,
+		[]*storage.StrandedControlRequest{strandedRequest(apply, storage.ControlOperationRevert)},
+		storage.ControlOperationRevert)
+
+	svc.runStrandedReaperPass(t.Context())
+
+	assert.Empty(t, controls.completed)
+	assert.Equal(t, []storage.ControlOperation{storage.ControlOperationRevert}, controls.failed)
+	assert.Equal(t, []string{"the schema change completed before the revert could take effect; the change is live on the target"}, controls.failureReasons)
+}
+
 // The listing is per request but the settlement is per apply: it reloads the
 // apply and answers every pending request on it in one visit, so an apply that
 // stranded both a stop and a cancel is settled once, not once per row.

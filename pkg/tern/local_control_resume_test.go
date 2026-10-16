@@ -993,8 +993,8 @@ func TestResumeApplyMissingPlanFailsApply(t *testing.T) {
 		"in-flight task must fail with its apply, got %s", tasks[0].State)
 	assert.Equal(t, "plan not found during recovery", tasks[0].ErrorMessage)
 	require.Len(t, requests.requests, 1)
-	assert.Equal(t, storage.ControlRequestCompleted, requests.requests[0].Status,
-		"the terminal outcome moots the pending revert")
+	assert.Equal(t, storage.ControlRequestFailed, requests.requests[0].Status,
+		"the terminal outcome outran the pending revert")
 	require.Len(t, observer.terminal, 1)
 	assert.True(t, state.IsState(observer.terminal[0].State, state.Apply.Failed))
 }

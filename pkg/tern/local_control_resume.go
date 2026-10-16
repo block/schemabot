@@ -142,6 +142,9 @@ func (c *LocalClient) resolveStartRequest(ctx context.Context, req *ternv1.Start
 	if state.IsState(apply.State, state.Apply.WaitingForDeploy) {
 		return apply, 1, 0, nil
 	}
+	if state.IsState(apply.State, state.Apply.Resuming) {
+		return c.joinPendingStart(ctx, apply)
+	}
 	if !state.IsState(apply.State, state.Apply.Stopped) && !state.IsRunningApplyState(apply.State) {
 		return nil, 0, 0, fmt.Errorf("schema change is not stopped (current state: %s)", apply.State)
 	}
@@ -176,6 +179,40 @@ func (c *LocalClient) resolveStartRequest(ctx context.Context, req *ternv1.Start
 	c.logger.Info("Start: resolved resumable work",
 		append(apply.LogAttrs(), "started_count", startedCount, "skipped_count", skippedCount)...)
 	return apply, startedCount, skippedCount, nil
+}
+
+// joinPendingStart answers a start that reaches an apply an earlier start is
+// still resuming. Several control plane operations share one remote apply, and
+// each one's drive asks for the start on its own, so the second can land after
+// the first moved the apply to resuming but before the driver finished it. That
+// start asks for nothing the pending one is not already doing: it joins it and
+// reports the counts the pending one recorded. Refusing it would fail the
+// caller's start and leave that caller's targets stopped while the rest of the
+// rollout moves on. A resuming apply with no pending start is past the point a
+// start can act on, so it is refused as before.
+func (c *LocalClient) joinPendingStart(ctx context.Context, apply *storage.Apply) (*storage.Apply, int64, int64, error) {
+	controlStore := c.storage.ControlRequests()
+	if controlStore == nil {
+		return nil, 0, 0, fmt.Errorf("control request store is not available")
+	}
+	pending, err := controlStore.GetPending(ctx, apply.ID, storage.ControlOperationStart)
+	if err != nil {
+		return nil, 0, 0, fmt.Errorf("load pending start for resuming apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	if pending == nil {
+		c.logger.Info("Start: apply is resuming with no pending start to join, so this start is refused",
+			apply.LogAttrs()...)
+		return nil, 0, 0, fmt.Errorf("schema change is not stopped (current state: %s)", apply.State)
+	}
+	var metadata localStartControlRequestMetadata
+	if len(pending.Metadata) > 0 {
+		if err := json.Unmarshal(pending.Metadata, &metadata); err != nil {
+			return nil, 0, 0, fmt.Errorf("decode pending start metadata for apply %s: %w", apply.ApplyIdentifier, err)
+		}
+	}
+	c.logger.Info("Start: apply is resuming under a pending start; this start joins it",
+		append(apply.LogAttrs(), "started_count", metadata.StartedCount, "skipped_count", metadata.SkippedCount)...)
+	return apply, metadata.StartedCount, metadata.SkippedCount, nil
 }
 
 // noDiscoverableApplyError explains why an unqualified start resolved no apply

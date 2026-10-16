@@ -5,6 +5,7 @@ CREATE TABLE apply_comments (
   github_comment_id bigint NOT NULL,
   posted_volume integer DEFAULT NULL,
   posted_phase varchar(32) DEFAULT NULL,
+  posted_cutover_operation_id bigint DEFAULT NULL,
   pending_freeze_github_comment_id bigint DEFAULT NULL,
   observer_owner varchar(255) DEFAULT NULL,
   observer_heartbeat_at timestamp DEFAULT NULL,
