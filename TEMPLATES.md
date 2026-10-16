@@ -10285,7 +10285,7 @@ A new apply can retry the failure once this one finishes or is stopped; it repro
 
   ❌ First failure: prod/payments-041 — duplicate key name 'idx_orders_source'
 
-❌ prod — 40 completed · 19 running · 4 queued · 1 failed (64 targets)
+❌ 40 completed · 19 running · 4 queued · 1 failed (64 targets)
 
      ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜ 86.72%
        ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL;
@@ -10325,7 +10325,7 @@ To stop this schema change:
 │  Targets:      3 ready for cutover                    │
 └───────────────────────────────────────────────────────┘
 
-🟢 prod — 3 ready for cutover (3 targets)
+🟢 3 ready for cutover (3 targets)
 
      ~ orders: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 Waiting for cutover
        targets payments-001, payments-002
@@ -10364,7 +10364,7 @@ To cut over prod/payments-001:
 │  Targets:      1 completed · 2 stopped                │
 └───────────────────────────────────────────────────────┘
 
-⏹️ prod — 1 completed · 2 stopped (3 targets)
+⏹️ 1 completed · 2 stopped (3 targets)
 
      ~ orders: ⏹️ Stopped
        ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL;

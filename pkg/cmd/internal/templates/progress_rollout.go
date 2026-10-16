@@ -94,13 +94,18 @@ func FormatStateCounts(counts []presentation.StateCount) string {
 // one section, the way a sharded table rolls up its shards: one block per
 // table and DDL across the targets, each DDL once and naming its targets when
 // it runs on only some of them, and the targets that need an operator. Its size grows with distinct changes and failures, not with
-// the number of targets.
+// the number of targets. The status line names the deployment only when the
+// apply has another to tell it apart from, as the PR comment does.
 func FormatTargetRollup(v RolloutView, g presentation.Group) string {
 	var b strings.Builder
-	if headline, ok := tableStepsHeadline(v.Model, g); ok {
-		fmt.Fprintf(&b, "%s %s — %s\n", g.Lead.Emoji, g.Deployment, headline)
+	status, ok := tableStepsHeadline(v.Model, g)
+	if !ok {
+		status = fmt.Sprintf("%s (%d targets)", FormatStateCounts(g.Counts), len(g.Members))
+	}
+	if _, sole := presentation.SoleTargetRollout(v.Model.Groups()); sole {
+		fmt.Fprintf(&b, "%s %s\n", g.Lead.Emoji, status)
 	} else {
-		fmt.Fprintf(&b, "%s %s — %s (%d targets)\n", g.Lead.Emoji, g.Deployment, FormatStateCounts(g.Counts), len(g.Members))
+		fmt.Fprintf(&b, "%s %s — %s\n", g.Lead.Emoji, g.Deployment, status)
 	}
 	if !v.SetupPhase {
 		writeTargetTables(&b, v, g)
