@@ -104,7 +104,7 @@ func WriteProgress(data ProgressData) {
 	}
 	rows = append(rows, BoxRow{"State", displayState})
 	if data.Sharded {
-		if counts := ShardCounts(data.Operations, data.Released); counts != "" {
+		if counts := ShardCounts(data.Operations, data.Tables, data.Released); counts != "" {
 			rows = append(rows, BoxRow{"Shards", counts})
 		}
 	}

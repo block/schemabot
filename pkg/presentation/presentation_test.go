@@ -279,6 +279,12 @@ func TestDeriveWaitingForCutover_Ordering(t *testing.T) {
 			label: "ready for cutover — held, eu retrying",
 		},
 		{
+			name:  "earlier running while a task retries holds the cutover",
+			ops:   []Operation{retryingTask(parallel("eu", so.Running)), parallel("us", so.WaitingForCutover)},
+			want:  StateReadyForCutoverWaiting,
+			label: "ready for cutover — held, eu retrying",
+		},
+		{
 			name:  "earlier stopped holds the cutover",
 			ops:   []Operation{parallel("eu", so.Stopped), parallel("us", so.WaitingForCutover)},
 			want:  StateReadyForCutoverWaiting,
@@ -323,6 +329,94 @@ func TestDeriveWaitingForCutover_Ordering(t *testing.T) {
 			last := Derive(tc.ops).Deployments[1]
 			assert.Equal(t, tc.want, last.Presentation)
 			assert.Equal(t, tc.label, last.Label)
+		})
+	}
+}
+
+// retryingTask marks op as having a task that retries a failure while the
+// row itself still reads its own state.
+func retryingTask(op Operation) Operation {
+	op.Retrying = true
+	return op
+}
+
+// TestDerivePending_FinalizerFollowsTheStartGate: two targets each run one
+// work row and a finalizer. The label on payments-002's pending finalizer
+// agrees with the claim's finalizer start gate: it waits for its own work
+// under every policy, and an earlier target then holds it under barrier and
+// parallel only when that target halts the rollout, as a cutover is held.
+// Under rolling it still waits for every earlier target to complete.
+func TestDerivePending_FinalizerFollowsTheStartGate(t *testing.T) {
+	member := func(policy func(dep, st string) Operation, target, work, finalizer string) []Operation {
+		w := policy("payments-a", work)
+		w.Target, w.OperationKey, w.Work = target, target+"/orders/-/orders", true
+		f := policy("payments-a", finalizer)
+		f.Target, f.OperationKey, f.Finalizer = target, target+"/orders/group_finalizer", true
+		return []Operation{w, f}
+	}
+	cases := []struct {
+		name    string
+		earlier []Operation
+		policy  func(dep, st string) Operation
+		ownWork string
+		want    PresentationState
+		label   string
+	}{
+		{
+			name:    "barrier: an earlier target still copying does not hold it",
+			policy:  barrier,
+			earlier: member(barrier, "payments-001", so.Running, so.Pending),
+			ownWork: so.Completed,
+			want:    StateQueuedNext,
+			label:   "queued — next in order",
+		},
+		{
+			name:    "parallel: an earlier target still copying does not hold it",
+			policy:  parallel,
+			earlier: member(parallel, "payments-001", so.Running, so.Pending),
+			ownWork: so.Completed,
+			want:    StateQueuedNext,
+			label:   "queued — next in order",
+		},
+		{
+			name:    "barrier: it waits for its own work",
+			policy:  barrier,
+			earlier: member(barrier, "payments-001", so.Completed, so.Completed),
+			ownWork: so.WaitingForCutover,
+			want:    StateWaiting,
+			label:   "waiting for payments-a/payments-002",
+		},
+		{
+			name:    "barrier: an earlier failed target halts it",
+			policy:  barrier,
+			earlier: member(barrier, "payments-001", so.Failed, so.Pending),
+			ownWork: so.Completed,
+			want:    StateHalted,
+			label:   "halted — payments-a/payments-001 failed",
+		},
+		{
+			name:    "barrier: an earlier target retrying a task halts it",
+			policy:  barrier,
+			earlier: []Operation{retryingTask(member(barrier, "payments-001", so.Running, so.Pending)[0]), member(barrier, "payments-001", so.Running, so.Pending)[1]},
+			ownWork: so.Completed,
+			want:    StateHalted,
+			label:   "halted — payments-a/payments-001 retrying",
+		},
+		{
+			name:    "rolling: it waits for an earlier target to complete",
+			policy:  rolling,
+			earlier: member(rolling, "payments-001", so.Running, so.Pending),
+			ownWork: so.Completed,
+			want:    StateWaiting,
+			label:   "waiting for payments-a/payments-001",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ops := slices.Concat(tc.earlier, member(tc.policy, "payments-002", tc.ownWork, so.Pending))
+			finalizer := Derive(ops).Deployments[3]
+			assert.Equal(t, tc.want, finalizer.Presentation)
+			assert.Equal(t, tc.label, finalizer.Label)
 		})
 	}
 }

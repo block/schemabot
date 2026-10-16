@@ -2480,8 +2480,12 @@ func (c *LocalClient) getActiveTaskForDatabase(ctx context.Context, database str
 // that operation's own drive while the operation is parked at the cutover. A
 // sibling's drive leaves the request pending, or settles it once the
 // operation it is for has ended, so the request never waits on a drive that
-// no longer exists. The dispatcher decides whose turn it is and says so by
-// naming the operation; this plane does not re-derive the order.
+// no longer exists. The dispatcher picks the operation by naming it. The
+// drive still re-checks the hold when it takes the request (storage
+// CutoverBlocker, the rule the automatic cutover claim follows), because an
+// earlier member can fail or stop between the request's acceptance and its
+// consumption; a held request stays pending until the hold clears or the
+// operation ends.
 func (c *LocalClient) boundCutoverRequestTurn(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, controlReq *storage.ApplyControlRequest, boundID int64, logger *slog.Logger) (take bool, err error) {
 	driveOperationID, err := applyOperationIDForTasks(tasks)
 	if err != nil {
@@ -2489,17 +2493,28 @@ func (c *LocalClient) boundCutoverRequestTurn(ctx context.Context, apply *storag
 			"requested_by", controlRequestCaller(controlReq), "bound_operation_id", boundID, "error", err)
 		return false, nil
 	}
+	store := c.storage.ApplyOperations()
+	if store == nil {
+		return false, fmt.Errorf("apply operation store is not configured")
+	}
 	if driveOperationID == boundID {
 		if !tasksParkedAtCutover(tasks) {
 			logger.Info("pending cutover request is waiting for its operation to park at the cutover",
 				"requested_by", controlRequestCaller(controlReq), "bound_operation_id", boundID)
 			return false, nil
 		}
+		blocker, err := store.CutoverBlocker(ctx, boundID)
+		if err != nil {
+			return false, fmt.Errorf("check the hold on apply_operation %d before taking the pending cutover of apply %s: %w", boundID, apply.ApplyIdentifier, err)
+		}
+		if blocker != nil {
+			logger.Info("pending cutover request is held: an earlier member is in a state the rollout halts on, so the request waits until that member recovers or this operation ends",
+				"requested_by", controlRequestCaller(controlReq), "bound_operation_id", boundID,
+				"blocking_operation_id", blocker.ID, "blocking_deployment", blocker.Deployment,
+				"blocking_target", blocker.Target, "blocking_state", blocker.State)
+			return false, nil
+		}
 		return true, nil
-	}
-	store := c.storage.ApplyOperations()
-	if store == nil {
-		return false, fmt.Errorf("apply operation store is not configured")
 	}
 	bound, err := store.Get(ctx, boundID)
 	if err != nil {

@@ -1555,11 +1555,14 @@ type ApplyOperationStore interface {
 	//
 	// A waiting_for_cutover row is claimed and transitioned to cutting_over as
 	// soon as it is parked, unless an earlier operation of the apply has
-	// failed, is retrying, or was stopped, cancelled or reverted (with the
-	// on_failure "continue" exemption for a terminal-failed one), a stop
-	// control request is pending for the apply, or the apply already holds its
-	// per-apply driver cap. An earlier operation that is still copying or
-	// cutting over does not hold it. Separately, a row already in cutting_over or
+	// failed, is retrying (by its own state or a task retrying under it), or
+	// was stopped, cancelled or reverted (with the on_failure "continue"
+	// exemption for a terminal-failed one), a stop control request is pending
+	// for the apply, or the apply already has as many cutovers in flight as its
+	// per-apply driver cap allows. The cap is admitted under a lock on the
+	// parent apply row, so concurrent drivers cannot overshoot it. An earlier
+	// operation that is still copying or cutting over does not hold it.
+	// Separately, a row already in cutting_over or
 	// revert_window whose heartbeat has been stale for more than one minute is
 	// re-leased without changing its state — recovering an in-flight cutover whose
 	// driver died, which carries no ordering gate.
@@ -1572,7 +1575,7 @@ type ApplyOperationStore interface {
 	// member (deployment, target) that holds the operation's cutover, or nil
 	// when nothing does. It applies the same rule as
 	// FindNextApplyOperationCutover: an earlier sibling holds only while it has
-	// failed, is retrying, or was stopped, cancelled or reverted, unless the
+	// failed, is retrying (by its own state or a task under it), or was stopped, cancelled or reverted, unless the
 	// rollout's on_failure policy continues past its terminal failure. A
 	// manually requested cutover uses it so that it is held exactly where the
 	// automatic cutover claim would be. Operations of the same member, its

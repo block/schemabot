@@ -402,8 +402,29 @@ func TestProgressOperationsForPresentation_SettlesLikeStoredState(t *testing.T) 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			data := ParseProgressResponse(&apitypes.ProgressResponse{State: state.Apply.Failed, Operations: tc.ops})
-			model := presentation.Derive(ProgressOperationsForPresentation(data.Operations, data.Released))
+			model := presentation.Derive(ProgressOperationsForPresentation(data.Operations, data.Tables, data.Released))
 			assert.Equal(t, tc.want, model.State)
 		})
 	}
+}
+
+// TestProgressOperationsForPresentation_HeldByARetryingTable: eu still reads
+// running while its orders table retries a failure, and us is parked. The
+// cutover claim holds us on that retry, so the CLI labels us held behind eu
+// rather than ready. A retry on another target's table holds nothing.
+func TestProgressOperationsForPresentation_HeldByARetryingTable(t *testing.T) {
+	ops := []ProgressOperation{
+		{Deployment: "eu", Target: "orders-eu", State: state.ApplyOperation.Running, CutoverPolicy: storage.CutoverPolicyParallel},
+		{Deployment: "us", Target: "orders-us", State: state.ApplyOperation.WaitingForCutover, CutoverPolicy: storage.CutoverPolicyParallel},
+	}
+	label := func(tables []TableProgress) string {
+		return presentation.Derive(ProgressOperationsForPresentation(ops, tables, false)).Deployments[1].Label
+	}
+
+	assert.Equal(t, "ready for cutover — held, eu retrying", label([]TableProgress{
+		{TableName: "orders", Deployment: "eu", Target: "orders-eu", Status: state.Task.FailedRetryable},
+	}))
+	assert.Equal(t, "ready for cutover", label([]TableProgress{
+		{TableName: "orders", Deployment: "eu", Target: "orders-other", Status: state.Task.FailedRetryable},
+	}))
 }

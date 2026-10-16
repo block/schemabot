@@ -106,11 +106,12 @@ func TestK8sMultiTarget_StopStartMidCopyCompletes(t *testing.T) {
 	}
 }
 
-// Shard 1 is still copying orders while shard 2 has finished its copy and holds
-// at the cutover barrier for it. A stop reaches every target: the copying one,
-// the parked one, and shard 3 wherever it is. The apply reports stopped, and a
-// start resumes every target through the barrier to completion.
-func TestK8sMultiTarget_StopWithTargetsParkedAtBarrierThenStartCompletes(t *testing.T) {
+// Shard 1 is still copying orders while shard 2 has finished its copy and cut
+// over, since an earlier target that is still copying holds no later one's
+// cutover. A stop reaches the targets still working: the copying one and
+// shard 3 wherever it is. The apply reports stopped with shard 2's change in
+// place, and a start resumes the rest to completion.
+func TestK8sMultiTarget_StopAfterALaterTargetCutOverThenStartCompletes(t *testing.T) {
 	ep := testutil.Endpoint(t)
 	dsns := shardDSNs(t, mtShardApp)
 	resetSchema(t, dsns)
@@ -122,34 +123,33 @@ func TestK8sMultiTarget_StopWithTargetsParkedAtBarrierThenStartCompletes(t *test
 	plan := planRollout(t, ep, mtShardApp, shardFiles(mtShardApp, map[string]string{"users": mtUsersV2, "orders": mtOrdersV2}))
 	applyID := applyRollout(t, ep, plan.PlanID, nil)
 
-	var parked *apitypes.ProgressResponse
+	var ahead *apitypes.ProgressResponse
 	testutil.Poll(t, 2*time.Minute, testutil.PollInterval,
 		func() bool {
 			p, err := testutil.FetchProgress(ep, applyID)
 			if err != nil {
 				return false
 			}
-			parked = p
-			require.False(t, state.IsTerminalApplyState(p.State), "apply finished before shard 2 was observed parked:\n%s", describeProgress(p))
+			ahead = p
+			require.False(t, state.IsTerminalApplyState(p.State), "apply finished before shard 2 was observed cut over:\n%s", describeProgress(p))
 			ops := operationsByStep(p)[1]
 			return operationStateOn(ops, mtTargets[0]) == state.ApplyOperation.Running &&
-				operationStateOn(ops, mtTargets[1]) == state.ApplyOperation.WaitingForCutover
+				operationStateOn(ops, mtTargets[1]) == state.ApplyOperation.Completed
 		},
-		func() string { return "shard 2 never parked while shard 1 copied:\n" + describeProgress(parked) },
+		func() string { return "shard 2 never cut over while shard 1 copied:\n" + describeProgress(ahead) },
 	)
-	t.Log("parked:\n" + describeProgress(parked))
+	t.Log("shard 2 cut over:\n" + describeProgress(ahead))
 
 	stop, err := client.CallStopAPI(ep, mtEnvironment, applyID)
 	require.NoError(t, err, "stop")
 	require.True(t, stop.Accepted, "stop not accepted: %s", stop.ErrorMessage)
 	p := waitForStates(t, ep, applyID, 2*time.Minute, state.Apply.Stopped)
 	t.Log("after stop:\n" + describeProgress(p))
-	for _, op := range operationsByStep(p)[1] {
-		assert.Equal(t, state.ApplyOperation.Stopped, state.NormalizeState(op.State), "orders on %s is stopped", op.Target)
-	}
-	for i, dsn := range dsns {
-		assert.False(t, indexOn(t, dsn, "orders", "idx_user_id"), "no target cut over while stopped: %s", mtTargets[i])
-	}
+	ops := operationsByStep(p)[1]
+	assert.Equal(t, state.ApplyOperation.Stopped, operationStateOn(ops, mtTargets[0]), "orders on %s is stopped mid-copy", mtTargets[0])
+	assert.Equal(t, state.ApplyOperation.Completed, operationStateOn(ops, mtTargets[1]), "orders on %s stays cut over", mtTargets[1])
+	assert.False(t, indexOn(t, dsns[0], "orders", "idx_user_id"), "%s did not cut over while stopped", mtTargets[0])
+	assert.True(t, indexOn(t, dsns[1], "orders", "idx_user_id"), "%s cut over ahead of the stop", mtTargets[1])
 
 	start, err := client.CallStartAPI(ep, mtEnvironment, applyID)
 	require.NoError(t, err, "start")

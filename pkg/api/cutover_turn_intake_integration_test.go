@@ -108,6 +108,103 @@ func TestCutoverIntakeFollowsDeploymentOrder(t *testing.T) {
 		requirePending(t, seed.applyID, false)
 	})
 
+	// eu is still running its copy while its data plane rides out a retry:
+	// the drive keeps its lease, so the operation row stays running and only
+	// its task records the retry. That retry holds us all the same, and the
+	// refusal names it as one.
+	t.Run("RefusalNamesARetryTheDriveIsRidingOut", func(t *testing.T) {
+		resetMatrixTables(t, ctx, db)
+		seed := seedGroupedApply(t, ctx, stor, multiOpSeed{
+			applyIdentifier: "cutover-intake-live-retry-ahead",
+			parentState:     state.Apply.Running,
+			cutoverPolicy:   storage.CutoverPolicyParallel,
+			onFailure:       storage.OnFailureHalt,
+			deployments:     []string{"eu", "us"},
+			perOpState: map[string]string{
+				"eu": state.ApplyOperation.Running,
+				"us": state.ApplyOperation.WaitingForCutover,
+			},
+			perTaskState: map[string]string{
+				"eu": state.Task.FailedRetryable,
+				"us": state.Task.WaitingForCutover,
+			},
+		})
+
+		err := requestCutover(t, seed.applyID)
+		require.Error(t, err)
+		assert.Equal(t, http.StatusConflict, controlOperationHTTPStatus(err))
+		assert.EqualError(t, err, "cutover is held: eu is retrying a failure ahead of us; run cutover again once eu recovers")
+		requirePending(t, seed.applyID, false)
+	})
+
+	// eu is still copying and us and au are parked. Each cutover command
+	// starts one member's cutover: the first is bound to us, and once us is
+	// cutting over the next is bound to au rather than answered as already in
+	// progress. With both cutting over and nothing left parked, a third
+	// command is answered as already in progress and records nothing.
+	t.Run("ConsecutiveCommandsCutOverEachParkedMember", func(t *testing.T) {
+		resetMatrixTables(t, ctx, db)
+		seed := seedGroupedApply(t, ctx, stor, multiOpSeed{
+			applyIdentifier: "cutover-intake-consecutive",
+			parentState:     state.Apply.Running,
+			cutoverPolicy:   storage.CutoverPolicyParallel,
+			onFailure:       storage.OnFailureHalt,
+			deployments:     []string{"eu", "us", "au"},
+			perOpState: map[string]string{
+				"eu": state.ApplyOperation.Running,
+				"us": state.ApplyOperation.WaitingForCutover,
+				"au": state.ApplyOperation.WaitingForCutover,
+			},
+			perTaskState: map[string]string{
+				"eu": state.Task.Running,
+				"us": state.Task.WaitingForCutover,
+				"au": state.Task.WaitingForCutover,
+			},
+		})
+		command := func(t *testing.T) int {
+			t.Helper()
+			apply := getApply(t, ctx, stor, seed.applyID)
+			resp, status, err := svc.executeCutoverForApply(ctx, nil, apply, apply.ApplyIdentifier, "cli:alice")
+			require.NoError(t, err)
+			require.NotNil(t, resp)
+			assert.True(t, resp.Accepted)
+			return status
+		}
+		boundTo := func(t *testing.T) int64 {
+			t.Helper()
+			req, err := stor.ControlRequests().GetPending(ctx, seed.applyID, storage.ControlOperationCutover)
+			require.NoError(t, err)
+			require.NotNil(t, req, "an accepted cutover is recorded for the drive to take")
+			boundID, err := req.CutoverOperationID()
+			require.NoError(t, err)
+			return boundID
+		}
+		// takeCutover stands in for the bound member's drive taking the
+		// request: the request completes and the member starts cutting over.
+		takeCutover := func(t *testing.T, member string) {
+			t.Helper()
+			require.NoError(t, stor.ControlRequests().CompletePending(ctx, seed.applyID, storage.ControlOperationCutover))
+			require.NoError(t, stor.ApplyOperations().UpdateState(ctx, seed.opID(member), state.ApplyOperation.CuttingOver))
+			tasks, err := stor.Tasks().GetByApplyOperationID(ctx, seed.opID(member))
+			require.NoError(t, err)
+			for _, task := range tasks {
+				task.State = state.Task.CuttingOver
+				require.NoError(t, stor.Tasks().Update(ctx, task))
+			}
+		}
+
+		assert.Equal(t, http.StatusOK, command(t))
+		assert.Equal(t, seed.opID("us"), boundTo(t), "the first command cuts over the first parked member")
+		takeCutover(t, "us")
+
+		assert.Equal(t, http.StatusOK, command(t), "us cutting over does not make the command for au redundant")
+		assert.Equal(t, seed.opID("au"), boundTo(t), "the second command cuts over the next parked member, not us again")
+		takeCutover(t, "au")
+
+		assert.Equal(t, http.StatusAccepted, command(t), "with nothing left parked the command is answered as already in progress")
+		requirePending(t, seed.applyID, false)
+	})
+
 	t.Run("RefusalNamesTheWayPastAFailedMember", func(t *testing.T) {
 		resetMatrixTables(t, ctx, db)
 		seed := seedGroupedApply(t, ctx, stor, multiOpSeed{

@@ -313,9 +313,25 @@ func TestDeriveApplyPresentation_MatchesStoredVerdict(t *testing.T) {
 			}
 			stored := state.DeriveRolloutApplyState(state.RolloutChildren(rolloutOps))
 			require.Equal(t, state.Apply.Failed, stored)
-			assert.Equal(t, stored, deriveApplyPresentation(ops, false).State)
+			assert.Equal(t, stored, deriveApplyPresentation(ops, nil, false).State)
 		})
 	}
+}
+
+// TestDeriveApplyPresentation_HeldByARetryingTask: eu still reads running
+// while one of its tasks retries a failure, and us is parked. The cutover
+// claim holds us on that task evidence, so the comment labels us held behind
+// eu's retry rather than ready.
+func TestDeriveApplyPresentation_HeldByARetryingTask(t *testing.T) {
+	ops := []*storage.ApplyOperation{
+		{ID: 1, Deployment: "eu", State: state.ApplyOperation.Running, CutoverPolicy: storage.CutoverPolicyParallel},
+		{ID: 2, Deployment: "us", State: state.ApplyOperation.WaitingForCutover, CutoverPolicy: storage.CutoverPolicyParallel},
+	}
+	tasksByOp := map[int64][]*storage.Task{1: {{State: state.Task.FailedRetryable}}}
+
+	got := deriveApplyPresentation(ops, tasksByOp, false)
+	assert.Equal(t, "ready for cutover — held, eu retrying", got.Deployments[1].Label)
+	assert.Equal(t, "ready for cutover", deriveApplyPresentation(ops, nil, false).Deployments[1].Label)
 }
 
 // Tasks without an apply_operation_id (legacy rows) are not attributable to a

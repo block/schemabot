@@ -516,6 +516,76 @@ func TestApplyOperations(t *testing.T, h Harness) {
 		assert.Equal(t, parked[maxDrivers], last.ID)
 	})
 
+	// FindNextApplyOperationCutover_ConcurrentClaimsHoldTheCap verifies the
+	// cutover cap is a hard bound under contention. Eight targets of a parallel
+	// rollout are parked at the cutover, and eight drivers poll in the same
+	// instant. However the claims interleave, no more of them start a cutover
+	// than the per-apply cap allows, and the parked targets they leave stay
+	// parked for the next poll.
+	t.Run("FindNextApplyOperationCutover_ConcurrentClaimsHoldTheCap", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "operation_cutover_contention_db", storage.DatabaseTypeMySQL)
+		apply := CreateApply(t, store, lock, "apply_operation_cutover_contention", 927)
+		const drivers = 8
+		for i := range drivers {
+			target := fmt.Sprintf("payments-%03d", i+1)
+			_, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+				ApplyID: apply.ID, Deployment: "payments-a", Target: target,
+				OperationKey: storage.TargetOperationKey(target, ""), OperationKind: storage.ApplyOperationKindWork,
+				State: state.ApplyOperation.WaitingForCutover, CutoverPolicy: storage.CutoverPolicyParallel, OnFailure: storage.OnFailureHalt,
+			})
+			require.NoError(t, err)
+		}
+
+		start := make(chan struct{})
+		results := make(chan *storage.ApplyOperation, drivers)
+		errs := make(chan error, drivers)
+		var wg sync.WaitGroup
+		for i := range drivers {
+			owner := fmt.Sprintf("driver-%d", i)
+			wg.Go(func() {
+				<-start
+				claimed, err := store.ApplyOperations().FindNextApplyOperationCutover(ctx, owner)
+				if err != nil {
+					errs <- err
+					return
+				}
+				if claimed != nil {
+					results <- claimed
+				}
+			})
+		}
+		close(start)
+		wg.Wait()
+		close(results)
+		close(errs)
+
+		for err := range errs {
+			require.NoError(t, err)
+		}
+		claimed := 0
+		for range results {
+			claimed++
+		}
+		assert.GreaterOrEqual(t, claimed, 1, "the claim that takes the parent apply admits its cutover")
+		assert.LessOrEqual(t, claimed, storage.DefaultMaxDriversPerApply, "no more targets cut over at once than the cap allows")
+
+		ops, err := store.ApplyOperations().ListByApply(ctx, apply.ID)
+		require.NoError(t, err)
+		cuttingOver, parked := 0, 0
+		for _, op := range ops {
+			switch op.State {
+			case state.ApplyOperation.CuttingOver:
+				cuttingOver++
+			case state.ApplyOperation.WaitingForCutover:
+				parked++
+			}
+		}
+		assert.Equal(t, claimed, cuttingOver, "every admitted claim is the only way a target reaches cutting_over")
+		assert.Equal(t, drivers-claimed, parked, "the targets not admitted stay parked")
+	})
+
 	// FindNextApplyOperation_ParallelFailureAdmission verifies that parallel
 	// copy starts remain subject to on_failure. With payments-001 and payments-002
 	// occupying both drivers, payments-003 queues. When payments-001 fails, halt
@@ -770,6 +840,58 @@ func TestApplyOperations(t *testing.T, h Harness) {
 		require.NoError(t, store.ApplyOperations().UpdateState(ctx, usID, state.ApplyOperation.Stopped))
 		requireBlocker(usID, 0, "a completed earlier deployment holds nothing")
 		requireBlocker(auID, usID, "a later deployment's stop holds every cutover after it")
+	})
+
+	// CutoverBlocker_HeldByARetryTheDriveIsRidingOut verifies that a retry a
+	// live drive rides out holds later cutovers. eu's data plane parks its
+	// apply between recovery attempts while eu's drive keeps its lease, so
+	// eu's operation row stays running and only its task records the retry.
+	// That retry holds us's cutover, both the automatic claim and a requested
+	// one, exactly as a failed_retryable row would; once eu's task resumes,
+	// us cuts over.
+	t.Run("CutoverBlocker_HeldByARetryTheDriveIsRidingOut", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "cutover_live_retry_db", storage.DatabaseTypeMySQL)
+		apply := CreateApply(t, store, lock, "apply_cutover_live_retry", 928)
+		insert := func(deployment, opState string) int64 {
+			t.Helper()
+			id, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+				ApplyID: apply.ID, Deployment: deployment, State: opState,
+				CutoverPolicy: storage.CutoverPolicyParallel, OnFailure: storage.OnFailureHalt,
+			})
+			require.NoError(t, err)
+			return id
+		}
+		euID := insert("eu", state.ApplyOperation.Running)
+		usID := insert("us", state.ApplyOperation.WaitingForCutover)
+		euTask := newTask(apply, "task_eu_live_retry", "orders", time.Now().UTC().Truncate(time.Second))
+		euTask.ApplyOperationID = &euID
+		euTask.State = state.Task.FailedRetryable
+		_, err := store.Tasks().Create(ctx, euTask)
+		require.NoError(t, err)
+
+		blocker, err := store.ApplyOperations().CutoverBlocker(ctx, usID)
+		require.NoError(t, err)
+		require.NotNil(t, blocker, "a retry recorded only on eu's task holds us's requested cutover")
+		assert.Equal(t, euID, blocker.ID)
+		assert.Equal(t, state.ApplyOperation.Running, blocker.State, "eu's row stays running while its drive rides out the retry")
+		held, err := store.ApplyOperations().FindNextApplyOperationCutover(ctx, "driver-a")
+		require.NoError(t, err)
+		assert.Nil(t, held, "the automatic cutover claim is held by the same retry")
+
+		resumed, err := store.Tasks().Get(ctx, euTask.TaskIdentifier)
+		require.NoError(t, err)
+		require.NotNil(t, resumed)
+		resumed.State = state.Task.Running
+		require.NoError(t, store.Tasks().Update(ctx, resumed))
+		blocker, err = store.ApplyOperations().CutoverBlocker(ctx, usID)
+		require.NoError(t, err)
+		assert.Nil(t, blocker, "once eu's retry recovers, eu still copying holds nothing")
+		claimed, err := store.ApplyOperations().FindNextApplyOperationCutover(ctx, "driver-a")
+		require.NoError(t, err)
+		require.NotNil(t, claimed, "us cuts over once the retry ahead of it has recovered")
+		assert.Equal(t, usID, claimed.ID)
 	})
 
 	// CutoverBlocker_ShardSiblingsDoNotTakeTurns verifies that the shard work

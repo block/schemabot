@@ -111,6 +111,12 @@ type Operation struct {
 	// leaves Released false (fail-closed).
 	Released bool
 
+	// Retrying is true when a task under the row is retrying a failure the
+	// drive is riding out while the row itself still reads running. The
+	// cutover claim holds a later member's cutover on that task evidence, so
+	// the derivation reads it through holdState to agree with the claim.
+	Retrying bool
+
 	// Error is the operation's error detail, set when State is failed.
 	Error string
 
@@ -126,6 +132,16 @@ type Operation struct {
 // rollout is released. Mirrors the claim predicate's released-failure exemption.
 func (o Operation) continuesPastFailure() bool {
 	return o.ContinueOnFailure || (o.PauseOnFailure && o.Released)
+}
+
+// holdState is the state the cutover hold rule reads for this row: its own
+// state when that already holds, otherwise failed_retryable while one of its
+// tasks retries a failure. It mirrors storage.ApplyOperation.CutoverHoldState.
+func (o Operation) holdState() string {
+	if o.Retrying && !holdsCutover(o.State, false) {
+		return state.ApplyOperation.FailedRetryable
+	}
+	return o.State
 }
 
 // pausesOnFailure reports whether a terminal-failed earlier sibling holds this
@@ -549,6 +565,10 @@ func derivePending(d *Deployment, ops []Operation, names []string, i int) {
 		setHeldByEarlierStep(d, ops[h], names[h])
 		return
 	}
+	if op.Finalizer {
+		deriveFinalizerPending(d, ops, names, i)
+		return
+	}
 	// Under parallel the copy phase has no earlier-sibling ordering, so a
 	// pending operation never waits for an earlier sibling and a cancelled or
 	// reverted one does not hold it. Failure admission still applies: a
@@ -563,6 +583,14 @@ func derivePending(d *Deployment, ops []Operation, names []string, i int) {
 		d.set(StateQueuedNext, "queued — next in order", "⏳", false)
 		return
 	}
+	deriveOrderedPending(d, ops, names, i)
+}
+
+// deriveOrderedPending labels a pending row under an ordered policy: halted
+// or paused behind an earlier member the rollout halts on, waiting behind one
+// the policy still blocks on, or next in order.
+func deriveOrderedPending(d *Deployment, ops []Operation, names []string, i int) {
+	op := ops[i]
 	if h := blockingSibling(ops, i); h >= 0 {
 		if ops[h].State == state.ApplyOperation.Failed {
 			setHeldByFailure(d, op, names[h])
@@ -578,6 +606,70 @@ func derivePending(d *Deployment, ops []Operation, names []string, i int) {
 		}
 	}
 	d.set(StateQueuedNext, "queued — next in order", "⏳", false)
+}
+
+// deriveFinalizerPending labels a pending finalizer, mirroring the claim's
+// finalizerStartGateSQL. A finalizer waits for the work it finalizes under
+// every policy. Under barrier and parallel an earlier member then holds it only
+// in a state the rollout halts on, the same rule that holds a cutover, since a
+// finalizer is the step that makes its member's change live. Under rolling it
+// waits for every earlier member to complete, as a pending copy does.
+func deriveFinalizerPending(d *Deployment, ops []Operation, names []string, i int) {
+	op := ops[i]
+	if w := unfinishedFinalizedWork(ops, i); w >= 0 {
+		if state.StepRowCanNeverPass(ops[w].State) {
+			d.set(StateHalted, fmt.Sprintf("halted — %s %s", names[w], haltedReason(ops[w].State)), "⏸️", true)
+			return
+		}
+		d.set(StateWaiting, fmt.Sprintf("waiting for %s", names[w]), "⏳", false)
+		return
+	}
+	if !op.Barrier && !op.Parallel {
+		deriveOrderedPending(d, ops, names, i)
+		return
+	}
+	for j := range i {
+		if ops[j].Deployment == op.Deployment && ops[j].Target == op.Target {
+			continue
+		}
+		held := ops[j].holdState()
+		if !holdsCutover(held, op.continuesPastFailure()) {
+			continue
+		}
+		if held == state.ApplyOperation.Failed {
+			setHeldByFailure(d, op, names[j])
+			return
+		}
+		d.set(StateHalted, fmt.Sprintf("halted — %s %s", names[j], haltedReason(held)), "⏸️", true)
+		return
+	}
+	d.set(StateQueuedNext, "queued — next in order", "⏳", false)
+}
+
+// unfinishedFinalizedWork returns the index of a work row the finalizer at i
+// finalizes that has not completed, preferring one that can never complete,
+// or -1 when all of its work is done.
+func unfinishedFinalizedWork(ops []Operation, i int) int {
+	op := ops[i]
+	holder := -1
+	for j, w := range ops {
+		if j == i || !w.Work || w.Deployment != op.Deployment {
+			continue
+		}
+		if !state.FinalizerFinalizesWork(op.OperationKey, w.OperationKey) {
+			continue
+		}
+		if w.State == state.ApplyOperation.Completed {
+			continue
+		}
+		if state.StepRowCanNeverPass(w.State) {
+			return j
+		}
+		if holder < 0 {
+			holder = j
+		}
+	}
+	return holder
 }
 
 // earlierStepHolder returns the index of the row that holds a pending table
@@ -629,11 +721,12 @@ func setHeldByEarlierStep(d *Deployment, holder Operation, holderName string) {
 func deriveWaitingForCutover(d *Deployment, ops []Operation, names []string, i int) {
 	op := ops[i]
 	for j := range i {
-		if !holdsCutover(ops[j].State, op.continuesPastFailure()) {
+		held := ops[j].holdState()
+		if !holdsCutover(held, op.continuesPastFailure()) {
 			continue
 		}
-		label := fmt.Sprintf("ready for cutover — held, %s %s", names[j], haltedReason(ops[j].State))
-		if ops[j].State == state.ApplyOperation.Failed && op.pausesOnFailure() {
+		label := fmt.Sprintf("ready for cutover — held, %s %s", names[j], haltedReason(held))
+		if held == state.ApplyOperation.Failed && op.pausesOnFailure() {
 			label += "; release or stop"
 		}
 		d.set(StateReadyForCutoverWaiting, label, "⏸️", true)

@@ -600,7 +600,7 @@ func TestFormatTargetRollup_AllocationDoesNotScaleWithTargetsTimesTables(t *test
 		}
 	}
 	data.Tables = tables
-	model := presentation.Derive(ProgressOperationsForPresentation(data.Operations, data.Released))
+	model := presentation.Derive(ProgressOperationsForPresentation(data.Operations, data.Tables, data.Released))
 	groups := model.Groups()
 	require.Len(t, groups, 1)
 	view := RolloutView{ApplyID: data.ApplyID, Environment: data.Environment, Engine: data.Engine, Model: model, Tables: data.Tables}

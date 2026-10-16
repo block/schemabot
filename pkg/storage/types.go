@@ -1489,6 +1489,41 @@ func (op *ApplyOperation) HasFreshLease(now time.Time) bool {
 	return now.Sub(op.UpdatedAt) < ApplyLeaseStaleAfter
 }
 
+// CutoverHoldState returns the state in which op, an earlier member of an
+// ordered rollout, holds a later member's cutover, as
+// FindNextApplyOperationCutover and CutoverBlocker read it. A row in a state
+// the rollout halts on holds in that state. A live drive riding out a
+// data-plane retry keeps its row active and records the retry only on the
+// operation's tasks, so an active row with a retrying task holds as
+// failed_retryable. Otherwise the row's own state is returned. tasks are op's
+// own tasks.
+func (op *ApplyOperation) CutoverHoldState(tasks []*Task) string {
+	if state.IsState(op.State,
+		state.ApplyOperation.Failed,
+		state.ApplyOperation.FailedRetryable,
+		state.ApplyOperation.Stopped,
+		state.ApplyOperation.Cancelled,
+		state.ApplyOperation.Reverted,
+	) {
+		return op.State
+	}
+	if TasksRetrying(tasks) {
+		return state.ApplyOperation.FailedRetryable
+	}
+	return op.State
+}
+
+// TasksRetrying reports whether any of tasks is riding out a retryable
+// failure.
+func TasksRetrying(tasks []*Task) bool {
+	for _, task := range tasks {
+		if state.IsState(task.State, state.Task.FailedRetryable) {
+			return true
+		}
+	}
+	return false
+}
+
 // Lease returns the ownership token for this apply_operation.
 func (op *ApplyOperation) Lease() OperationLease {
 	if op == nil {

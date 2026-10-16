@@ -475,9 +475,10 @@ func TestK8sMultiTarget_ConvergedMemberCompletes(t *testing.T) {
 }
 
 // Shard 2 has duplicate notes, so a unique index on orders fails there under
-// the default on_failure: halt. Shard 1 is ahead of it in rollout order and
-// cuts over; shard 3 finishes its copy and holds at the cutover barrier rather
-// than cutting over behind the failure, and no shard starts the next table. A
+// the default on_failure: halt. Shard 1 cuts over as soon as its own copy is
+// ready. Shard 3 holds a larger table, so its copy is still running when
+// shard 2 fails; it finishes and holds at the cutover barrier rather than
+// cutting over behind the failure, and no shard starts the next table. A
 // cancel releases shard 3 without cutting it over, and the apply settles
 // failed, naming shard 2, whose failed copy stays for a new apply to adopt.
 func TestK8sMultiTarget_FailedTargetHaltsRollout(t *testing.T) {
@@ -487,6 +488,7 @@ func TestK8sMultiTarget_FailedTargetHaltsRollout(t *testing.T) {
 	cleanupRolloutState(t)
 	execOn(t, dsns, mtOrdersV1, mtUsersV1)
 	execOn(t, dsns[1:2], "INSERT INTO orders (user_id, amount, note) VALUES (1, 1, 'dup'), (2, 2, 'dup')")
+	seedOrders(t, dsns[2:], 3*mtCopyRows)
 
 	plan := planRollout(t, ep, mtShardApp, shardFiles(mtShardApp, map[string]string{"orders": mtOrdersUq, "users": mtUsersV2}))
 	applyID := applyRollout(t, ep, plan.PlanID, nil)

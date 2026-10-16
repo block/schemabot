@@ -102,7 +102,7 @@ func singleOpDisplay(ops []*storage.ApplyOperation, displayByOp map[int64]operat
 func buildMultiApplyData(apply *storage.Apply, ops []*storage.ApplyOperation, released bool, tasks []*storage.Task, displayByOp map[int64]operationDisplay, shardsByTable map[string][]*storage.Task, tenant, cliName string) templates.MultiDeploymentApplyData {
 	tasksByOp := groupTasksByOperation(tasks)
 
-	model := deriveApplyPresentation(ops, released)
+	model := deriveApplyPresentation(ops, tasksByOp, released)
 	// Derive returns one presentation per rollout member, so the details are
 	// built member by member and consumed positionally. A deployment can own
 	// several members, which a name-keyed map could not tell apart. A
@@ -141,10 +141,14 @@ func buildMultiApplyData(apply *storage.Apply, ops []*storage.ApplyOperation, re
 // deriveApplyPresentation maps the apply's operation rows to the surface-neutral
 // presentation inputs and derives the rollup. Rows are already in resolved order.
 // released is the apply-level release latch applied to every operation.
-func deriveApplyPresentation(ops []*storage.ApplyOperation, released bool) presentation.Apply {
+// tasksByOp marks a row retrying while one of its tasks retries a failure, the
+// task evidence the cutover claim holds a later member on.
+func deriveApplyPresentation(ops []*storage.ApplyOperation, tasksByOp map[int64][]*storage.Task, released bool) presentation.Apply {
 	inputs := make([]presentation.Operation, 0, len(ops))
 	for _, op := range ops {
-		inputs = append(inputs, applyOperationToPresentation(op, released))
+		input := applyOperationToPresentation(op, released)
+		input.Retrying = storage.TasksRetrying(tasksByOp[op.ID])
+		inputs = append(inputs, input)
 	}
 	return presentation.Derive(inputs)
 }

@@ -945,14 +945,40 @@ const rolloutMembersOrderedHereSQL = `NOT EXISTS (
 func earlierSiblingHoldsCutoverSQL(d Dialect) string {
 	return `earlier.apply_id = apply_operations.apply_id
 	AND (earlier.created_at, earlier.id) < (apply_operations.created_at, apply_operations.id)
-	AND earlier.state IN (` + placeholders(len(memberHoldStates())) + `)
+	AND ` + earlierMemberHoldsSQL() + `
 	AND ` + releasedFailureExemptionSQL(d)
 }
 
 // earlierSiblingHoldsCutoverArgs returns the positional arguments for
 // earlierSiblingHoldsCutoverSQL, in placeholder order.
 func earlierSiblingHoldsCutoverArgs() []any {
-	return append(stringArgs(memberHoldStates()), releasedFailureExemptionArgs()...)
+	return append(earlierMemberHoldsArgs(), releasedFailureExemptionArgs()...)
+}
+
+// earlierMemberHoldsSQL matches an earlier operation in a state the rollout
+// halts on (memberHoldStates), or one whose drive is riding out a data-plane
+// retry. A remote data plane parks its apply between recovery attempts while
+// the drive keeps its lease and keeps polling, so the operation row stays in
+// its active state and only the operation's task rows record the retry. The
+// rollout halts on that retry exactly as on a failed_retryable row, so the
+// task rows count as the same evidence. The fragment references the earlier
+// alias; its placeholders are listed by earlierMemberHoldsArgs.
+func earlierMemberHoldsSQL() string {
+	return `(
+	earlier.state IN (` + placeholders(len(memberHoldStates())) + `)
+	OR EXISTS (
+		SELECT 1
+		FROM tasks AS retrying_task
+		WHERE retrying_task.apply_operation_id = earlier.id
+			AND retrying_task.state = ?
+	)
+)`
+}
+
+// earlierMemberHoldsArgs returns the positional arguments for
+// earlierMemberHoldsSQL, in placeholder order.
+func earlierMemberHoldsArgs() []any {
+	return append(stringArgs(memberHoldStates()), state.Task.FailedRetryable)
 }
 
 // memberHoldStates lists the states in which an earlier rollout member holds a
@@ -960,8 +986,10 @@ func earlierSiblingHoldsCutoverArgs() []any {
 // (barrier or parallel): the states a rollout halts on rather than waits
 // through. Failed is final unless on_failure continues past it; retrying and
 // stopped may still go either way, so they hold until they resolve; cancelled
-// and reverted mean the rollout is not going ahead on that member. The list
-// must match pkg/presentation holdsCutover.
+// and reverted mean the rollout is not going ahead on that member. A retry a
+// live drive rides out holds too, by its task rows (earlierMemberHoldsSQL).
+// The list must match storage.CutoverHoldState and pkg/presentation
+// holdsCutover.
 func memberHoldStates() []string {
 	return []string{
 		state.ApplyOperation.Failed,
@@ -1033,7 +1061,7 @@ func finalizerStartGateSQL(d Dialect) string {
 			AND (
 				(
 					apply_operations.cutover_policy IN (?, ?)
-					AND earlier.state IN (` + placeholders(len(memberHoldStates())) + `)
+					AND ` + earlierMemberHoldsSQL() + `
 				)
 				OR (
 					apply_operations.cutover_policy NOT IN (?, ?)
@@ -1053,7 +1081,7 @@ func finalizerStartGateArgs() []any {
 		state.ApplyOperation.Completed,
 		storage.CutoverPolicyBarrier, storage.CutoverPolicyParallel,
 	}
-	args = append(args, stringArgs(memberHoldStates())...)
+	args = append(args, earlierMemberHoldsArgs()...)
 	args = append(args,
 		storage.CutoverPolicyBarrier, storage.CutoverPolicyParallel,
 		state.ApplyOperation.Completed,
@@ -2236,6 +2264,13 @@ func (s *applyOperationStore) FindNextApplyOperationCutover(ctx context.Context,
 	leaseAcquiredAt := time.Now()
 
 	if ad.State == state.ApplyOperation.WaitingForCutover {
+		admitted, err := s.admitCutoverUnderCap(ctx, tx, ad, owner, staleClaimCutoff)
+		if err != nil {
+			return nil, err
+		}
+		if !admitted {
+			return nil, nil
+		}
 		// waiting_for_cutover → cutting_over: rotate the lease and refresh the
 		// heartbeat in the same write, leaving started_at untouched (it was
 		// stamped when the copy phase started). WHERE state = ? guards against a
@@ -2288,6 +2323,48 @@ func (s *applyOperationStore) FindNextApplyOperationCutover(ctx context.Context,
 	ad.LeaseAcquiredAt = &leaseAcquiredAt
 
 	return ad, nil
+}
+
+// admitCutoverUnderCap makes the cutover cap a hard bound per apply. The
+// claim query's cap filter is evaluated by each claim on its own, so two
+// claims polling in the same instant could both read the count below the cap
+// and both start a cutover. Admission therefore serializes on the parent
+// apply row: the claim locks it, then recounts the apply's fresh cutover
+// leases, which now include any cutover another claim committed before
+// releasing the lock.
+//
+// The lock is taken with SKIP LOCKED, so a claim never waits on the parent
+// row while it holds the candidate operation's row lock. A claim that finds
+// the parent locked backs off, and the candidate is claimable again on the
+// next poll.
+func (s *applyOperationStore) admitCutoverUnderCap(ctx context.Context, tx *rebindTx, ad *storage.ApplyOperation, owner, staleClaimCutoff string) (bool, error) {
+	var parentID int64
+	err := tx.QueryRowContext(ctx, `SELECT id FROM applies WHERE id = ? FOR UPDATE SKIP LOCKED`, ad.ApplyID).Scan(&parentID)
+	if errors.Is(err, sql.ErrNoRows) {
+		slog.Debug("cutover claim backed off: another writer holds the parent apply, so the cutover is retried on the next poll",
+			append(ad.LogAttrs(), "owner", owner)...)
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("lock parent apply to admit the cutover of apply_operation %d: %w", ad.ID, err)
+	}
+
+	capClause, capArgs := s.cutoverCapClause(staleClaimCutoff)
+	var underCap int
+	err = tx.QueryRowContext(ctx, fmt.Sprintf(`
+		SELECT CASE WHEN %s THEN 1 ELSE 0 END
+		FROM apply_operations
+		WHERE id = ?
+	`, capClause), append(capArgs, ad.ID)...).Scan(&underCap)
+	if err != nil {
+		return false, fmt.Errorf("recount cutovers in flight to admit apply_operation %d: %w", ad.ID, err)
+	}
+	if underCap != 1 {
+		slog.Debug("cutover claim backed off: the apply is at its cutover cap, so the cutover starts once one in flight settles",
+			append(ad.LogAttrs(), "owner", owner, "max_drivers_per_apply", s.maxDriversPerApply)...)
+		return false, nil
+	}
+	return true, nil
 }
 
 // CutoverBlocker returns the earliest earlier sibling that holds the given
