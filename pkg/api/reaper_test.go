@@ -168,11 +168,8 @@ func TestRunStrandedReaperPassAnswersAStartStrandedOnASettledApply(t *testing.T)
 // it: a revert took effect only if the apply reverted, and a skip-revert only if
 // it completed. A revert the completed schema change outran fails with a reason
 // saying the change is live, rather than staying pending and being re-listed on
-// every pass. A request for a retired operation has no driver left to serve it,
-// so the reaper completes it.
+// every pass.
 func TestRunStrandedReaperPassAnswersRevertPhaseRequestsStrandedOnASettledApply(t *testing.T) {
-	retired := storage.RetiredControlOperations()
-	require.NotEmpty(t, retired, "the retired-operation case needs a retired operation to strand")
 	tests := []struct {
 		name          string
 		applyState    string
@@ -188,8 +185,6 @@ func TestRunStrandedReaperPassAnswersRevertPhaseRequestsStrandedOnASettledApply(
 			wantCompleted: []storage.ControlOperation{storage.ControlOperationSkipRevert}},
 		{name: "a revert on a reverted apply completes", applyState: state.Apply.Reverted, op: storage.ControlOperationRevert,
 			wantCompleted: []storage.ControlOperation{storage.ControlOperationRevert}},
-		{name: "a retired operation's request completes", applyState: state.Apply.Completed, op: retired[0],
-			wantCompleted: []storage.ControlOperation{retired[0]}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -204,6 +199,37 @@ func TestRunStrandedReaperPassAnswersRevertPhaseRequestsStrandedOnASettledApply(
 			if tt.wantReason != "" {
 				assert.Equal(t, []string{tt.wantReason}, controls.failureReasons)
 			}
+			assert.Empty(t, controls.pending, "a request the reaper visited must not stay pending for the next pass")
+		})
+	}
+}
+
+// A request no drive will consume once the apply has settled is completed by
+// the reaper rather than re-listed on every pass. A retired operation has no
+// driver left to serve it. A release recorded on a paused on_failure=pause
+// rollout stays pending as the rollout's latch until the apply settles; it is
+// completed, which keeps the rollout released.
+func TestRunStrandedReaperPassCompletesRequestsNoDriveConsumesOnASettledApply(t *testing.T) {
+	retired := storage.RetiredControlOperations()
+	require.NotEmpty(t, retired, "the retired-operation case needs a retired operation to strand")
+	tests := []struct {
+		name       string
+		applyState string
+		op         storage.ControlOperation
+	}{
+		{name: "a retired operation's request completes", applyState: state.Apply.Completed, op: retired[0]},
+		{name: "a release on a failed apply completes", applyState: state.Apply.Failed, op: storage.ControlOperationRelease},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			apply := &storage.Apply{ID: 9, ApplyIdentifier: "apply-settled", State: tt.applyState}
+			svc, controls := strandedControlRequestReaperService(apply,
+				[]*storage.StrandedControlRequest{strandedRequest(apply, tt.op)}, tt.op)
+
+			svc.runStrandedReaperPass(t.Context())
+
+			assert.Equal(t, []storage.ControlOperation{tt.op}, controls.completed)
+			assert.Empty(t, controls.failed)
 			assert.Empty(t, controls.pending, "a request the reaper visited must not stay pending for the next pass")
 		})
 	}

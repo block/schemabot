@@ -1960,10 +1960,10 @@ func (s *Service) driverLogger(driverID int) *slog.Logger {
 // handed to the drive tail's own terminal sweep, which decides from the stored
 // outcome whether each command took effect, so this path settles every
 // operation that sweep does and discloses the same outcome; the start, which
-// the drive answers itself, is settled here on top of it. A
-// still-non-terminal apply resolves only its stop, and only once that stop has
-// reached every operation, along with the cutover that stop superseded. No-op
-// when nothing is pending.
+// the drive answers itself, is settled here on top of it. A still-non-terminal
+// apply resolves only its stop, and only once that stop has reached every
+// operation, along with the cutover that stop superseded. No-op when nothing
+// is pending.
 func (s *Service) completePendingControlRequestsIfApplyResolved(ctx context.Context, logger *slog.Logger, applyID int64) error {
 	apply, err := s.storage.Applies().Get(ctx, applyID)
 	if err != nil {
