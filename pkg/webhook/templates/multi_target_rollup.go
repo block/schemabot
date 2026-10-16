@@ -153,7 +153,10 @@ func targetStrip(data MultiDeploymentApplyData, g presentation.Group, cells []Ta
 	for _, i := range g.Members {
 		name := memberTarget(data.Model.Deployments[i])
 		if c, ok := byTarget[name]; ok {
-			strip = append(strip, ShardProgressData{Shard: name, Status: c.Status, PercentComplete: c.PercentComplete, RowsCopied: c.RowsCopied, RowsTotal: c.RowsTotal})
+			strip = append(strip, ShardProgressData{
+				Shard: name, Status: c.Status, PercentComplete: c.PercentComplete, RowsCopied: c.RowsCopied, RowsTotal: c.RowsTotal,
+				ChecksumRowsChecked: c.ChecksumRowsChecked, ChecksumRowsTotal: c.ChecksumRowsTotal,
+			})
 			continue
 		}
 		if includeUnreported && targetUnreported(data, i) {
@@ -251,14 +254,15 @@ func rankTargetTableLines(lines []targetTableLine, silent int) {
 }
 
 // writeTargetTableLine writes one table's line across the targets that run it.
-// While any target copies, the bar sums the rows of targets copying or done,
-// and the rows line names its coverage only when a target is left out of the
-// sum. Until every target still to copy reports, the ETA (the slowest
-// target's) is a floor, and the bar is the table's share across all of its
-// targets (targetSharePercent) rather than the rows of the ones that reported. Failed targets are counted rather than summed, since
-// their rows are not progressing, and so are retrying targets. A completed
-// target has reported even when it had no rows to copy. With nothing copying,
-// the line names the table's phase. silent is the targets with no progress
+// Until every target completes, the line leads with the table's bar across
+// all of its targets (presentation.PercentAcrossTargets, keepsTargetProgressBar),
+// whatever phase each target is in, and the rows line names its coverage only
+// when a target is left out of the sum. Until every target still to copy
+// reports, the ETA (the slowest target's) is a floor. Failed targets are
+// counted rather than summed, since their rows are not progressing, and so are
+// retrying targets. A completed target has reported even when it had no rows
+// to copy. Once no target is working on the table, the line names where the
+// table settled. silent is the targets with no progress
 // reported at all that this line speaks for; they widen the row denominator
 // and make the ETA a floor. writeDDL writes the table's DDL directly under the
 // headline, and while the table is in flight strip lists each target's state
@@ -308,43 +312,45 @@ func writeTargetTableLine(sb *strings.Builder, table string, cells []TableProgre
 	pending := queued + waiting
 	pendingWord := presentation.PendingWord(settled)
 	coverage := presentation.TargetCoverage(done, running, pending, failed, retrying, pendingWord)
-	if running > 0 && total > 0 {
-		percent := int(copied * 100 / total)
-		if unreported+silent > 0 {
-			percent = targetSharePercent(cells, silent)
-		}
+	status := rollupTaskStatus(cells)
+	if keepsTargetProgressBar(cells, silent, status, done, pending, settled) {
+		percent := presentation.PercentAcrossTargets(targetParts(cells), silent)
 		if pct := ui.RowCopyDisplayPercent(percent, copied); pct > 0 {
-			// The list under the rows counts the targets, so the headline
-			// carries only the table's progress, the way a sharded table's does.
+			// The list under the rows says where each target stands, so the
+			// headline carries only the table's progress across all of them,
+			// the way a sharded table's does.
 			fmt.Fprintf(sb, "**%s**: %s %d%%\n", name, ui.ProgressBarRowCopy(pct), pct)
 			writeDDL()
-			line := fmt.Sprintf("- Rows: %s / %s", ui.FormatNumber(copied), ui.FormatNumber(total))
-			partial := reporting < len(cells)+silent
-			if partial {
-				line += fmt.Sprintf(" across %d of %d targets", reporting, len(cells)+silent)
-			}
-			// The planned size is every target's, including those left out of
-			// the rows, so beside partial rows it names the full span rather
-			// than reading as the reporting targets' size.
-			if size := targetsTableBytes(cells, silent); size != nil {
-				line += ui.FormatTableSizeClause(size)
+			if total > 0 {
+				line := fmt.Sprintf("- Rows: %s / %s", ui.FormatNumber(copied), ui.FormatNumber(total))
+				partial := reporting < len(cells)+silent
 				if partial {
-					line += fmt.Sprintf(" across all %d targets", len(cells))
+					line += fmt.Sprintf(" across %d of %d targets", reporting, len(cells)+silent)
 				}
-			}
-			if eta > 0 {
-				floor := ""
-				if unreported+silent > 0 {
-					floor = "≥ "
+				// The planned size is every target's, including those left out of
+				// the rows, so beside partial rows it names the full span rather
+				// than reading as the reporting targets' size.
+				if size := targetsTableBytes(cells, silent); size != nil {
+					line += ui.FormatTableSizeClause(size)
+					if partial {
+						line += fmt.Sprintf(" across all %d targets", len(cells))
+					}
 				}
-				line += " · ETA: " + floor + ui.FormatETA(eta)
+				if eta > 0 {
+					// A target still to start, or working without its rows
+					// reported yet, can only add time.
+					floor := ""
+					if queued+unreported+silent > 0 {
+						floor = "≥ "
+					}
+					line += " · ETA: " + floor + ui.FormatETA(eta)
+				}
+				sb.WriteString(line + "\n")
 			}
-			sb.WriteString(line + "\n")
 			writeMemberList(sb, presentation.TargetNoun, strip, pendingWord, budget)
 			return
 		}
 	}
-	status := rollupTaskStatus(cells)
 	if partlyCompleted(status, done, pending) {
 		// Complete on some targets and queued on the rest: the change is live
 		// where it completed, so the line leads with that, not with Queued.
@@ -379,6 +385,31 @@ func writeTargetTableLine(sb *strings.Builder, table string, cells []TableProgre
 	}
 }
 
+// keepsTargetProgressBar reports whether a table line across a rollout's
+// targets leads with its progress bar rather than a phase: while targets are
+// working on the table in different phases, and while a rollout that can
+// still run its queued targets has completed the table on others. One
+// target's phase never speaks for siblings in another, so the bar holds until
+// every target completes and the list under it says where each one stands.
+// When every target is in the same phase past the copy, that phase speaks for
+// the table (presentation.OnePhaseSpeaksForParts).
+// silent is the targets that have reported nothing, so have not started it.
+func keepsTargetProgressBar(cells []TableProgressData, silent int, status string, done, pending int, settled bool) bool {
+	if slices.ContainsFunc(cells, func(c TableProgressData) bool { return state.IsInFlightTaskState(c.Status) }) {
+		statuses := make([]string, 0, len(cells)+silent)
+		for _, c := range cells {
+			statuses = append(statuses, c.Status)
+		}
+		for range silent {
+			statuses = append(statuses, state.Task.Pending)
+		}
+		if !presentation.OnePhaseSpeaksForParts(statuses) {
+			return true
+		}
+	}
+	return !settled && partlyCompleted(status, done, pending)
+}
+
 // listsTargets reports whether a table line lists its targets one per line
 // under it (writeMemberList, presentation.ListsTargets), decided by where each
 // target stands rather than by the table's rolled-up status.
@@ -407,33 +438,14 @@ func partlyCompleted(status string, done, queued int) bool {
 	return status == state.Task.Pending || status == state.Task.RevertWindow || status == state.Task.Completed
 }
 
-// targetSharePercent is how much of a table is done across every target that
-// runs it, for a line where some of those targets have not reported rows: a
-// completed target counts in full, a target copying or verifying counts by the
-// rows its engine reports, and every other target counts as nothing yet. It
-// only combines what the engines report, so it is not an estimate. silent is
-// the targets with no progress at all that the line speaks for.
-func targetSharePercent(cells []TableProgressData, silent int) int {
-	targets := len(cells) + silent
-	if targets == 0 {
-		return 0
+// targetParts is a table's progress on each target that runs it, as the
+// shared part rules read it.
+func targetParts(cells []TableProgressData) []presentation.Part {
+	parts := make([]presentation.Part, len(cells))
+	for i, c := range cells {
+		parts[i] = presentation.Part{Status: c.Status, PercentComplete: c.PercentComplete, RowsCopied: c.RowsCopied, RowsTotal: c.RowsTotal}
 	}
-	var share float64
-	for _, c := range cells {
-		switch state.NormalizeTaskStatus(c.Status) {
-		case state.Task.Completed, state.Task.RevertWindow:
-			// A target in its revert window has completed the change, and may
-			// have run it without copying any rows.
-			share++
-		case state.Task.Pending, state.Task.Failed, state.Task.FailedRetryable, state.Task.Stopped, state.Task.Cancelled:
-			// Not copying: queued, halted, or waiting on a retry.
-		default:
-			if c.RowsTotal > 0 {
-				share += float64(ui.ClampRows(c.RowsCopied, c.RowsTotal)) / float64(c.RowsTotal)
-			}
-		}
-	}
-	return int(share * 100 / float64(targets))
+	return parts
 }
 
 // targetsTableBytes totals a table's planned size across the targets that run

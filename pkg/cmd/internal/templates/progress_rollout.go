@@ -10,6 +10,7 @@ import (
 	"github.com/block/schemabot/pkg/presentation"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
+	"github.com/block/schemabot/pkg/ui"
 )
 
 // rolloutAttentionLimit bounds the targets a deployment's attention list
@@ -122,6 +123,7 @@ func FormatTargetRollup(v RolloutView, g presentation.Group) string {
 func writeTargetTables(b *strings.Builder, v RolloutView, g presentation.Group) {
 	var reporting []int
 	silent, converged := 0, 0
+	silentMembers := make(map[int]bool)
 	byMember := tablesByMember(v.Tables)
 	signatures := make(map[string]bool)
 	// settledUnreported counts the settled targets that reported no tables.
@@ -139,6 +141,7 @@ func writeTargetTables(b *strings.Builder, v RolloutView, g presentation.Group) 
 			// reported tables. A stopped one reports once the apply resumes.
 			case !state.IsState(d.State, state.SettledApplyStates...):
 				silent++
+				silentMembers[i] = true
 			default:
 				settledUnreported++
 			}
@@ -154,16 +157,24 @@ func writeTargetTables(b *strings.Builder, v RolloutView, g presentation.Group) 
 	// is not queued, but it is no evidence of a different change either, so a
 	// block that runs on every reporting target speaks for it too, the way the
 	// PR comment's does.
-	lineSilent, lineSettled := silent, settledUnreported
+	// A block that speaks for the unreported targets lists each by name as
+	// queued, in its place in the rollout's order.
+	listed, lineSettled := reporting, settledUnreported
 	if len(signatures) > 1 {
-		lineSilent, lineSettled = 0, 0
+		lineSettled = 0
+	} else {
+		listed = nil
+		for _, i := range g.Members {
+			if silentMembers[i] || slices.Contains(reporting, i) {
+				listed = append(listed, i)
+			}
+		}
 	}
-	rolled := rolledTargetTables(v, byMember, reporting)
+	rolled := rolledTargetTables(v, byMember, listed)
 	settled := v.Model.RolloutSettled(g)
 	for i := range rolled {
-		rolled[i].UnreportedTargets = lineSilent
 		rolled[i].RolloutSettled = settled
-		if covered := len(rolled[i].Shards) + lineSilent + lineSettled; covered < len(g.Members)-converged {
+		if covered := len(rolled[i].Shards) + lineSettled; covered < len(g.Members)-converged {
 			rolled[i].OnTargets = targetSubsetLabel(rolled[i].Shards, len(g.Members)-converged)
 		}
 	}
@@ -182,7 +193,9 @@ func writeTargetTables(b *strings.Builder, v RolloutView, g presentation.Group) 
 	if converged > 0 {
 		fmt.Fprintf(b, "  %s%d of %d targets already had this schema; nothing ran there.%s\n", ANSIDim, converged, len(g.Members), ANSIReset)
 	}
-	if silent > 0 {
+	// A target no block lists is counted here instead: one that has not
+	// reported when the reporting targets run different changes.
+	if silent > 0 && len(signatures) > 1 {
 		fmt.Fprintf(b, "  %s%d of %d targets have not reported progress yet.%s\n", ANSIDim, silent, len(g.Members), ANSIReset)
 	}
 }
@@ -247,14 +260,11 @@ func sortRolledTables(tables []TableProgress) {
 }
 
 // rolledTableRank is a rolled-up table's presentation.TableRolloutRank, from
-// its status on each target and its unreported targets queued.
+// its status on each target, a target that has not reported queued.
 func rolledTableRank(t TableProgress) int {
-	statuses := make([]string, len(t.Shards), len(t.Shards)+t.UnreportedTargets)
+	statuses := make([]string, len(t.Shards))
 	for i, target := range t.Shards {
 		statuses[i] = target.Status
-	}
-	for range t.UnreportedTargets {
-		statuses = append(statuses, state.Task.Pending)
 	}
 	return presentation.TableRolloutRank(statuses)
 }
@@ -319,7 +329,12 @@ func tableAcrossTargets(v RolloutView, byMember map[rolloutMemberKey][]TableProg
 	allInstant := true
 	for _, i := range members {
 		d := v.Model.Deployments[i]
-		for _, t := range byMember[rolloutMemberKey{d.Deployment, d.Target}] {
+		tables := byMember[rolloutMemberKey{d.Deployment, d.Target}]
+		if len(tables) == 0 {
+			rolled.Shards = append(rolled.Shards, ShardProgress{Shard: memberTargetName(d), Status: unreportedTargetStatus(d)})
+			continue
+		}
+		for _, t := range tables {
 			if t.Namespace != table.Namespace || t.TableName != table.TableName || t.DDL != table.DDL {
 				continue
 			}
@@ -332,6 +347,9 @@ func tableAcrossTargets(v RolloutView, byMember map[rolloutMemberKey][]TableProg
 				RowsTotal:       t.RowsTotal,
 				ETASeconds:      t.ETASeconds,
 				PercentComplete: t.PercentComplete,
+
+				ChecksumRowsChecked: t.ChecksumRowsChecked,
+				ChecksumRowsTotal:   t.ChecksumRowsTotal,
 			})
 			allInstant = allInstant && t.IsInstant
 			if countsTowardRolledRows(status) {
@@ -355,6 +373,86 @@ func tableAcrossTargets(v RolloutView, byMember map[rolloutMemberKey][]TableProg
 	return rolled
 }
 
+// keepsAcrossTargetsBar reports whether a table rolled up across targets leads
+// with its progress bar rather than a phase: while targets are working on the
+// change in different phases, and while a rollout that can still run its
+// queued targets has completed the change on others. One target's phase never
+// speaks for siblings in another, so the bar holds until every target
+// completes and the list under it says where each one stands. When every
+// target is in the same phase past the copy, that phase speaks for the table
+// (presentation.OnePhaseSpeaksForParts). The PR comment applies the same rule.
+func keepsAcrossTargetsBar(t TableProgress) bool {
+	if !t.AcrossTargets {
+		return false
+	}
+	if slices.ContainsFunc(t.Shards, func(s ShardProgress) bool { return state.IsInFlightTaskState(s.Status) }) {
+		statuses := make([]string, len(t.Shards))
+		for i, s := range t.Shards {
+			statuses[i] = s.Status
+		}
+		if !presentation.OnePhaseSpeaksForParts(statuses) {
+			return true
+		}
+	}
+	return !t.RolloutSettled && isPartlyCompletedAcrossTargets(t)
+}
+
+// formatAcrossTargetsProgress renders a table rolled up across targets that
+// keeps its bar (keepsAcrossTargetsBar): the bar at the table's progress
+// across every target (presentation.PercentAcrossTargets), the rows of the
+// targets working or done, and each target's line. ok is false when no target
+// has reported progress yet, which leaves the table to its phase.
+func formatAcrossTargetsProgress(t TableProgress) (out string, ok bool) {
+	parts := make([]presentation.Part, len(t.Shards))
+	for i, s := range t.Shards {
+		parts[i] = shardPart(s)
+	}
+	pct := ui.RowCopyDisplayPercent(presentation.PercentAcrossTargets(parts, 0), t.RowsCopied)
+	if pct == 0 {
+		return "", false
+	}
+	var b strings.Builder
+	writeTableLine(&b, t, "%s %d%%%s", ui.ProgressBarRowCopy(pct), pct, throttledSuffix(t))
+	if t.DDL != "" {
+		b.WriteString(formatTableDDL(t))
+	}
+	if t.RowsTotal > 0 {
+		reporting := 0
+		for _, s := range t.Shards {
+			if countsTowardRolledRows(s.Status) {
+				reporting++
+			}
+		}
+		targets := len(t.Shards)
+		line := fmt.Sprintf(indentDetail+"Rows: %s / %s", ui.FormatNumber(ui.ClampRows(t.RowsCopied, t.RowsTotal)), ui.FormatNumber(t.RowsTotal))
+		partial := reporting < targets
+		if partial {
+			line += fmt.Sprintf(" across %d of %d targets", reporting, targets)
+		}
+		if t.ETASeconds > 0 {
+			floor := ""
+			if slices.ContainsFunc(t.Shards, outsideTargetsETA) {
+				floor = "≥ "
+			}
+			line += " · ETA: " + floor + ui.FormatETA(t.ETASeconds)
+		}
+		b.WriteString(line + "\n")
+	}
+	writeThrottleTooltip(&b, t)
+	b.WriteString(formatPartProgress(t.Shards, presentation.TargetNoun, pendingTargetsWord(t)))
+	return b.String(), true
+}
+
+// outsideTargetsETA reports whether a target still has time to add that the
+// rolled-up ETA does not cover: it has not started, or it is working without
+// having reported its rows yet.
+func outsideTargetsETA(s ShardProgress) bool {
+	if state.IsState(s.Status, state.Task.Pending) {
+		return true
+	}
+	return state.IsInFlightTaskState(s.Status) && s.RowsTotal <= 0
+}
+
 // isHaltedAcrossTargets reports whether a table rolled up across targets has
 // halted: no target is still working on the change, and one failed, is
 // retrying, was stopped or was cancelled. Its rolled-up rows cover only the
@@ -376,7 +474,7 @@ func isPartlyCompletedAcrossTargets(t TableProgress) bool {
 		return false
 	}
 	completed, queued := partlyCompletedCounts(t.Shards)
-	return completed > 0 && queued+t.UnreportedTargets > 0 && completed+queued == len(t.Shards)
+	return completed > 0 && queued > 0 && completed+queued == len(t.Shards)
 }
 
 // partlyCompletedCounts counts the targets that have completed a change and
@@ -399,7 +497,7 @@ func partlyCompletedCounts(targets []ShardProgress) (completed, queued int) {
 func formatPartlyCompletedAcrossTargets(t TableProgress) string {
 	var b strings.Builder
 	completed, queued := partlyCompletedCounts(t.Shards)
-	fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: ✓ Complete on %d of %d targets · %d %s\n", t.TableName, completed, len(t.Shards)+t.UnreportedTargets, queued+t.UnreportedTargets, pendingTargetsWord(t))
+	fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: ✓ Complete on %d of %d targets · %d %s\n", t.TableName, completed, len(t.Shards), queued, pendingTargetsWord(t))
 	if t.DDL != "" {
 		b.WriteString(formatTableDDL(t))
 	}
@@ -476,7 +574,7 @@ func targetsCoverage(t TableProgress) string {
 			retrying++
 		}
 	}
-	return presentation.TargetCoverage(done, running, queued+t.UnreportedTargets, failed, retrying, pendingTargetsWord(t))
+	return presentation.TargetCoverage(done, running, queued, failed, retrying, pendingTargetsWord(t))
 }
 
 // haltedAcrossTargetsPhrase names a halted table's state across its targets.
@@ -609,6 +707,16 @@ func writeTargetAttention(b *strings.Builder, v RolloutView, g presentation.Grou
 // and is being retried.
 func isTargetFailureState(opState string) bool {
 	return state.IsState(opState, state.ApplyOperation.Failed, state.ApplyOperation.FailedRetryable)
+}
+
+// unreportedTargetStatus is where a target that has reported no table stands
+// on each table: stopped when its operation stopped, which it reports once the
+// apply resumes, and otherwise not started.
+func unreportedTargetStatus(d presentation.Deployment) string {
+	if state.IsState(d.State, state.ApplyOperation.Stopped) {
+		return state.Task.Stopped
+	}
+	return state.Task.Pending
 }
 
 // memberTargetName is a member's target, or its name when it carries none.

@@ -573,9 +573,10 @@ func keyspaceHasDivergentOutcome(shards []ShardStatus) bool {
 
 // writeShardedTableLine writes one table's rollup line — the table name and its
 // aggregate state, with the shard count on a completed sharded table — followed
-// by the compact per-shard summary while the table is in flight. An actively
-// copying table with reported row figures renders the live progress form (bar,
-// summed rows, slowest-shard ETA); every other state names its phase, and the
+// by the compact per-shard summary while the table is in flight. A table whose
+// shards are working and have reported row figures renders the progress form
+// (bar, summed rows, slowest-shard ETA), whichever phase its most pressing
+// shard is in; every other state names its phase, and the
 // shard summary carries the per-shard percents. When the aggregate is a quiet
 // state (no shard-summary breakdown) but the change has already landed on some
 // shards — a partially-landed table between dispatch waves, or one cancelled
@@ -585,9 +586,12 @@ func keyspaceHasDivergentOutcome(shards []ShardStatus) bool {
 // and shard lines, where the single-deployment comment puts it.
 func writeShardedTableLine(sb *strings.Builder, t ShardedTableStatus, budget *ddlBlockBudget, writeDDL func()) {
 	status := state.NormalizeTaskStatus(t.Status)
-	if status == state.Task.Running && t.RowsTotal > 0 {
+	switch {
+	case status == state.Task.Running && t.RowsTotal > 0:
 		writeShardedTableCopyProgress(sb, t, writeDDL)
-	} else {
+	case keepsShardedProgressBar(status, t):
+		writeShardedTablePhaseProgress(sb, t, writeDDL)
+	default:
 		phrase := shardedTableStatusPhrase(status)
 		if landed := landedShardCount(t.Shards); landed > 0 && landed < len(t.Shards) && !presentation.ListsParts(status) {
 			if status == state.Task.Cancelled {
@@ -605,6 +609,38 @@ func writeShardedTableLine(sb *strings.Builder, t ShardedTableStatus, budget *dd
 		writeDDL()
 	}
 	renderShardSummary(sb, TableProgressData{TableName: t.Table, Status: t.Status, Shards: t.Shards}, budget)
+}
+
+// keepsShardedProgressBar reports whether a sharded table past its row copy
+// still leads with its progress bar: while its shards are working through the
+// change in different phases and have reported rows. The table's status is
+// its most pressing shard's, so one shard waiting for or cutting over would
+// otherwise speak for shards still copying or verifying; the bar holds until
+// every shard completes, and the shard list says where each one stands. When
+// every shard is in the same phase past the copy, that phase speaks for the
+// table (presentation.OnePhaseSpeaksForParts), and a
+// table with no shards listed under it keeps its phase, since nothing else
+// would say where it stands.
+func keepsShardedProgressBar(status string, t ShardedTableStatus) bool {
+	if !state.IsInFlightTaskState(status) || t.RowsTotal <= 0 || len(t.Shards) <= 1 {
+		return false
+	}
+	statuses := make([]string, len(t.Shards))
+	for i, s := range t.Shards {
+		statuses[i] = s.Status
+	}
+	return !presentation.OnePhaseSpeaksForParts(statuses)
+}
+
+// writeShardedTablePhaseProgress renders a sharded table whose shards are past
+// or beside the row copy: the bar from the summed shard rows, held short of
+// complete since the change has not landed on every shard, and the rows line.
+func writeShardedTablePhaseProgress(sb *strings.Builder, t ShardedTableStatus, writeDDL func()) {
+	copied := ui.ClampRows(t.RowsCopied, t.RowsTotal)
+	pct := min(ui.RowCopyDisplayPercent(int(copied*100/t.RowsTotal), copied), 99)
+	fmt.Fprintf(sb, "**%s**: %s %d%%%s\n", inlineCode(t.Table), ui.ProgressBarRowCopy(pct), pct, shardedCopyCoverageSuffix(t))
+	writeDDL()
+	writeShardedRowsAndETA(sb, t)
 }
 
 // writeShardedTableCopyProgress renders an actively copying table's live

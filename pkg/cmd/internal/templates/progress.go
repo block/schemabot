@@ -486,6 +486,11 @@ func writeTableLine(b *strings.Builder, t TableProgress, format string, args ...
 // provided activity bar and label when row-copy progress has exceeded its
 // estimate.
 func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel string) string {
+	if keepsAcrossTargetsBar(t) {
+		if out, ok := formatAcrossTargetsProgress(t); ok {
+			return out
+		}
+	}
 	if isHaltedAcrossTargets(t) {
 		return formatHaltedAcrossTargets(t)
 	}

@@ -2,7 +2,6 @@ package presentation
 
 import (
 	"fmt"
-	"slices"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -53,6 +52,8 @@ func TestPartDetail(t *testing.T) {
 		{Part{Status: task.Running}, "copying"},
 		{Part{Status: task.Pending}, "queued"},
 		{Part{Status: task.WaitingForCutover}, "waiting for cutover"},
+		{Part{Status: task.Checksumming}, "checksumming"},
+		{Part{Status: task.Checksumming, ChecksumRowsChecked: 450, ChecksumRowsTotal: 1000}, "checksumming 45.00% · 450 / 1,000 rows verified"},
 		{Part{Status: task.Failed}, "failed"},
 		{Part{Status: task.Cancelled, RowsCopied: 800000, RowsTotal: 2100000}, "cancelled at 38.10% · 800,000 / 2,100,000 rows"},
 		{Part{Status: task.Stopped}, "stopped"},
@@ -66,32 +67,27 @@ func TestPartDetail(t *testing.T) {
 	assert.Equal(t, "not started", PartDetail(Part{Status: task.Pending}, PendingWord(true)))
 }
 
-// A listing puts where the change is at the top and settled parts last, in
-// the order its heading counts them. Up to the inline limit it names every
-// part. Past it, it names only the failures and the slowest copying parts,
-// since the heading already counts every state, so a wide table stays short.
+// Up to the inline limit a listing names every part in the parts' own order,
+// so a target keeps its line as it moves from copying to checksumming to
+// waiting for cutover. Past it, it names only the failures and the slowest
+// copying parts, since the heading already counts every state, so a wide
+// table stays short.
 func TestListParts(t *testing.T) {
 	task := state.Task
-	t.Run("inline", func(t *testing.T) {
-		parts := []Part{{Name: "a", Status: task.Completed}, {Name: "b", Status: task.Running}, {Name: "c", Status: task.Pending}}
-		got := ListParts(len(parts), func(i int) Part { return parts[i] }, TargetNoun)
-		assert.Equal(t, []PartListLine{{Part: 1}, {Part: 2}, {Part: 0}}, got, "copying, then queued, then complete")
-	})
-	t.Run("inline order", func(t *testing.T) {
+	t.Run("inline keeps the parts' order whatever their phase", func(t *testing.T) {
 		parts := []Part{
-			{Name: "done", Status: task.Completed},
-			{Name: "ahead", Status: task.Running, RowsCopied: 800, RowsTotal: 1000},
-			{Name: "next", Status: task.Pending},
-			{Name: "behind", Status: task.Running, RowsCopied: 200, RowsTotal: 1000},
-			{Name: "ready", Status: task.WaitingForCutover},
-			{Name: "broken", Status: task.Failed},
-			{Name: "last", Status: task.Pending},
+			{Name: "001", Status: task.Checksumming},
+			{Name: "002", Status: task.WaitingForCutover},
+			{Name: "003", Status: task.Running, RowsCopied: 200, RowsTotal: 1000},
+			{Name: "004", Status: task.Pending},
+			{Name: "005", Status: task.Failed},
+			{Name: "006", Status: task.Completed},
 		}
 		var names []string
 		for _, line := range ListParts(len(parts), func(i int) Part { return parts[i] }, TargetNoun) {
 			names = append(names, parts[line.Part].Name)
 		}
-		assert.Equal(t, []string{"broken", "behind", "ahead", "ready", "next", "last", "done"}, names)
+		assert.Equal(t, []string{"001", "002", "003", "004", "005", "006"}, names)
 	})
 	t.Run("wide", func(t *testing.T) {
 		var parts []Part
@@ -118,6 +114,9 @@ func TestListParts(t *testing.T) {
 		// The slowest copying targets, furthest behind first.
 		want = append(want, PartListLine{Part: 22}, PartListLine{Part: 21}, PartListLine{Part: 20})
 		want = append(want, PartListLine{Part: -1, Summary: "4 more copying targets"})
+		// The targets working past the copy, in order, each as live as a copier.
+		want = append(want, PartListLine{Part: 12}, PartListLine{Part: 13}, PartListLine{Part: 14})
+		want = append(want, PartListLine{Part: -1, Summary: "1 more target past copying"})
 		assert.Equal(t, want, got)
 	})
 	t.Run("copiers that have not reported follow the ones that have", func(t *testing.T) {
@@ -139,16 +138,13 @@ func TestListParts(t *testing.T) {
 		assert.Equal(t, []string{"measured0", "measured1", "measured2", "7 more copying shards"}, names,
 			"the slowest measured copiers set the pace; ones with nothing reported are not named ahead of them")
 	})
-	t.Run("lines follow the heading's order", func(t *testing.T) {
+	t.Run("the heading counts an unlisted phase before cancelled", func(t *testing.T) {
 		// A phase outside otherPartStatusOrder, as a new task state would be
 		// until it is added there, sits after the listed phases and before
-		// cancelled in both the heading and the lines.
+		// cancelled.
 		const unlisted = "zz_new_phase"
 		c := PartCounts{Other: map[string]int{state.Task.Stopped: 1, unlisted: 1}, Cancelled: 1}
 		assert.Equal(t, []string{"1 stopped", "1 " + unlisted, "1 cancelled"}, c.Phrases())
-		statuses := []string{task.Cancelled, unlisted, task.Stopped}
-		slices.SortStableFunc(statuses, comparePartStatuses)
-		assert.Equal(t, []string{task.Stopped, unlisted, task.Cancelled}, statuses)
 	})
 }
 
@@ -186,4 +182,69 @@ func TestListsTargets(t *testing.T) {
 	assert.False(t, ListsTargets([]string{state.Task.Completed, state.Task.Failed}), "a settled table counts its targets on its line")
 	assert.False(t, ListsTargets([]string{state.Task.Cancelled, state.Task.Completed}), "a cancelled table counts its targets on its line")
 	assert.False(t, ListsTargets(nil), "a table with no targets lists nothing")
+}
+
+// A part's mark says whether it is working: every phase an engine is working
+// through reads as working, not only the row copy, and only a part that is not
+// working on the change reads as idle.
+func TestPartGlyph(t *testing.T) {
+	task := state.Task
+	for _, s := range []string{task.Running, task.CatchingUp, task.Checksumming, task.PostChecksum, task.WaitingForDeploy, task.Recovering, task.Reverting} {
+		assert.Equalf(t, "◉", PartGlyph(s), "a part %s is working", s)
+	}
+	for _, s := range []string{task.WaitingForCutover, task.CuttingOver} {
+		assert.Equalf(t, "●", PartGlyph(s), "a part %s is at its cutover", s)
+	}
+	for _, s := range []string{task.Pending, task.Stopped, task.Cancelled, task.FailedRetryable} {
+		assert.Equalf(t, "○", PartGlyph(s), "a part %s is not working", s)
+	}
+	assert.Equal(t, "✓", PartGlyph(task.Completed))
+	assert.Equal(t, "✓", PartGlyph(task.RevertWindow), "a part in its revert window has the change live")
+	assert.Equal(t, "✗", PartGlyph(task.Failed))
+}
+
+// A table's bar across its targets counts a target in its revert window as
+// done, weighs the rows of every target once all have reported, and stops
+// short of complete until every target has completed.
+func TestPercentAcrossTargets(t *testing.T) {
+	task := state.Task
+	// orders-001 finished a direct ALTER and is in its revert window with no
+	// rows copied, orders-002 has copied half its rows, and orders-003 has
+	// reported nothing: half the table is done.
+	assert.Equal(t, 50, PercentAcrossTargets([]Part{
+		{Status: task.RevertWindow},
+		{Status: task.Running, RowsCopied: 500, RowsTotal: 1000},
+	}, 1))
+	// Two targets parked at cutover and two queued are half the table.
+	parked := Part{Status: task.WaitingForCutover, RowsCopied: 1000, RowsTotal: 1000}
+	queued := Part{Status: task.Pending}
+	assert.Equal(t, 50, PercentAcrossTargets([]Part{parked, parked, queued, queued}, 0))
+	// Every target parked has copied every row, but none has the change yet.
+	assert.Equal(t, 99, PercentAcrossTargets([]Part{parked, parked}, 0))
+	// With every target reporting, the rows weigh in: 900 + 100 of 2,000.
+	assert.Equal(t, 50, PercentAcrossTargets([]Part{
+		{Status: task.Running, RowsCopied: 900, RowsTotal: 1000},
+		{Status: task.Checksumming, RowsCopied: 100, RowsTotal: 1000},
+	}, 0))
+	// A failed target has not landed the change, so the table reads its share
+	// across all three rather than the rows of the two still in play.
+	assert.Equal(t, 50, PercentAcrossTargets([]Part{
+		{Status: task.Completed, RowsCopied: 1000, RowsTotal: 1000},
+		{Status: task.Running, RowsCopied: 500, RowsTotal: 1000},
+		{Status: task.Failed, RowsCopied: 300, RowsTotal: 1000},
+	}, 0))
+	assert.Equal(t, 100, PercentAcrossTargets([]Part{{Status: task.Completed}, {Status: task.RevertWindow}}, 0))
+	assert.Equal(t, 0, PercentAcrossTargets(nil, 0))
+}
+
+// A phase past the copy that every part shares speaks for the table; parts in
+// different phases, or all still copying, leave the table to its bar.
+func TestOnePhaseSpeaksForParts(t *testing.T) {
+	task := state.Task
+	assert.True(t, OnePhaseSpeaksForParts([]string{task.WaitingForCutover, "STATE_WAITING_FOR_CUTOVER"}))
+	assert.True(t, OnePhaseSpeaksForParts([]string{task.Checksumming}))
+	assert.False(t, OnePhaseSpeaksForParts([]string{task.Checksumming, task.WaitingForCutover}))
+	assert.False(t, OnePhaseSpeaksForParts([]string{task.Running, task.Running}))
+	assert.False(t, OnePhaseSpeaksForParts([]string{task.WaitingForCutover, task.Pending}))
+	assert.False(t, OnePhaseSpeaksForParts(nil))
 }

@@ -115,6 +115,10 @@ type ShardProgressData struct {
 	PercentComplete int
 	RowsCopied      int64
 	RowsTotal       int64
+	// ChecksumRowsChecked and ChecksumRowsTotal are how far a checksumming
+	// member's verify has got, once its engine reports a total.
+	ChecksumRowsChecked int64
+	ChecksumRowsTotal   int64
 }
 
 // ApplyStatusCommentData contains all data needed to render an apply status PR comment.
@@ -1156,7 +1160,10 @@ func writeMemberList(sb *strings.Builder, noun presentation.Noun, members []Shar
 	}
 	part := func(i int) presentation.Part {
 		m := members[i]
-		return presentation.Part{Name: m.Shard, Status: m.Status, PercentComplete: m.PercentComplete, RowsCopied: m.RowsCopied, RowsTotal: m.RowsTotal}
+		return presentation.Part{
+			Name: m.Shard, Status: m.Status, PercentComplete: m.PercentComplete, RowsCopied: m.RowsCopied, RowsTotal: m.RowsTotal,
+			ChecksumRowsChecked: m.ChecksumRowsChecked, ChecksumRowsTotal: m.ChecksumRowsTotal,
+		}
 	}
 	c := presentation.CountParts(len(members), func(i int) string { return members[i].Status })
 	c.PendingLabel = pendingWord
