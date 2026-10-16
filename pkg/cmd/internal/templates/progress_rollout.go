@@ -185,8 +185,9 @@ func writeTargetTables(b *strings.Builder, v RolloutView, g presentation.Group) 
 		fmt.Fprintf(b, "  %s%d of %d targets already had this schema; nothing ran there.%s\n", ANSIDim, converged, len(g.Members), ANSIReset)
 	}
 	// A target no block lists is counted here instead: one that has not
-	// reported when the reporting targets run different changes.
-	if silent > 0 && len(signatures) > 1 {
+	// reported when the reporting targets run different changes, or when no
+	// target has reported and there is no block to list it under.
+	if silent > 0 && (len(signatures) > 1 || len(rolled) == 0) {
 		fmt.Fprintf(b, "  %s%d of %d targets have not reported progress yet.%s\n", ANSIDim, silent, len(g.Members), ANSIReset)
 	}
 }
@@ -377,16 +378,20 @@ func tableAcrossTargets(v RolloutView, byMember map[rolloutMemberKey][]TableProg
 // speaks for siblings in another, so the bar holds until every target
 // completes and the list under it says where each one stands. When every
 // target is in the same phase past the copy, that phase speaks for the table
-// (presentation.OnePhaseSpeaksForParts). The PR comment applies the same rule.
+// (presentation.OnePhaseSpeaksForParts), and so does a revert on any target
+// (presentation.RevertSpeaksForParts). The PR comment applies the same rule.
 func keepsAcrossTargetsBar(t TableProgress) bool {
 	if !t.AcrossTargets {
 		return false
 	}
+	statuses := make([]string, len(t.Shards))
+	for i, s := range t.Shards {
+		statuses[i] = s.Status
+	}
+	if presentation.RevertSpeaksForParts(statuses) {
+		return false
+	}
 	if slices.ContainsFunc(t.Shards, func(s ShardProgress) bool { return state.IsInFlightTaskState(s.Status) }) {
-		statuses := make([]string, len(t.Shards))
-		for i, s := range t.Shards {
-			statuses[i] = s.Status
-		}
 		if !presentation.OnePhaseSpeaksForParts(statuses) {
 			return true
 		}

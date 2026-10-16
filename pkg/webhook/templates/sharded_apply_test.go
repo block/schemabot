@@ -604,7 +604,7 @@ func TestRenderShardedApplyComment_TableCopyProgressBar(t *testing.T) {
 	assert.Contains(t, out, "**`mutes`**: "+ui.ProgressBarRowCopy(62)+" 62%")
 	assert.Contains(t, out, "- Rows: 914,707 / 1,466,232 · ETA: 3m 15s")
 	assert.Contains(t, out, "- Rows: 914,707 / 1,466,232 · ETA: 3m 15s\n- Shards: 2 (2 copying)\n  - ◉ `-40`: 71%\n  - ◉ `80-`: 54%\n",
-		"the shard list sits below the rows line, the shard furthest behind first")
+		"the shard list sits below the rows line, the shards in their own order")
 	assert.NotContains(t, out, "Row copy in progress", "the bar replaces the state phrase")
 	assert.NotContains(t, out, "across", "full coverage needs no disclosure")
 	assert.NotContains(t, out, "62% (", "full coverage carries no headline qualifier")

@@ -232,8 +232,25 @@ func TestPercentAcrossTargets(t *testing.T) {
 		{Status: task.Running, RowsCopied: 500, RowsTotal: 1000},
 		{Status: task.Failed, RowsCopied: 300, RowsTotal: 1000},
 	}, 0))
+	// A reverted target has undone the change, so its copied rows are not
+	// progress: the table reads the other target's half across both, the way
+	// its rows line counts only the target still copying.
+	assert.Equal(t, 25, PercentAcrossTargets([]Part{
+		{Status: task.Reverted, RowsCopied: 1000, RowsTotal: 1000},
+		{Status: task.Running, RowsCopied: 500, RowsTotal: 1000},
+	}, 0))
 	assert.Equal(t, 100, PercentAcrossTargets([]Part{{Status: task.Completed}, {Status: task.RevertWindow}}, 0))
 	assert.Equal(t, 0, PercentAcrossTargets(nil, 0))
+}
+
+// A target undoing the change speaks for the table whatever its siblings are
+// doing, since a bar would count the rows its copy once moved as progress.
+func TestRevertSpeaksForParts(t *testing.T) {
+	task := state.Task
+	assert.True(t, RevertSpeaksForParts([]string{task.Reverting, task.Reverted}))
+	assert.True(t, RevertSpeaksForParts([]string{task.Completed, "STATE_REVERTING"}))
+	assert.False(t, RevertSpeaksForParts([]string{task.RevertWindow, task.Running}))
+	assert.False(t, RevertSpeaksForParts(nil))
 }
 
 // A phase past the copy that every part shares speaks for the table; parts in

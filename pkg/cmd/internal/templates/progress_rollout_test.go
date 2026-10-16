@@ -155,6 +155,41 @@ func TestWriteProgress_ThreeTargetRolloutIsOneSection(t *testing.T) {
 		"stop closes the output:\n%s", out)
 }
 
+// A rollout no target has reported progress for yet has no table block to
+// list its targets under, so it counts them instead, the way the PR comment
+// says no details are available yet.
+func TestWriteProgress_TargetRollupCountsTargetsWhenNoneHaveReported(t *testing.T) {
+	out := renderRollout(t, targetRolloutData([]rolloutTarget{queuedTarget(), queuedTarget(), queuedTarget()}))
+
+	assert.Contains(t, out, "3 of 3 targets have not reported progress yet.", "every target is counted:\n%s", out)
+}
+
+// A rollout where one target is still reverting and the other has reverted
+// is undoing the change, so the table reads as reverting rather than a bar
+// counting the rows the copy once moved, matching the PR comment.
+func TestWriteProgress_TargetRollupRevertSpeaksForTheTable(t *testing.T) {
+	out := renderRollout(t, targetRolloutData([]rolloutTarget{
+		{opState: state.ApplyOperation.Running, status: state.Task.Reverting, rowsCopied: 1000, rowsTotal: 1000},
+		{opState: state.ApplyOperation.Running, status: state.Task.Reverted, rowsCopied: 1000, rowsTotal: 1000},
+	}))
+
+	assert.Contains(t, out, "↩️ Reverting", "%s", out)
+	assert.NotContains(t, out, "99%", "%s", out)
+}
+
+// Targets that copy past their estimates hold the table's bar short of
+// complete, with each target's rows clamped to its estimate, the way the PR
+// comment rolls them up: no target has the change until it cuts over.
+func TestWriteProgress_TargetRollupHoldsPastItsEstimate(t *testing.T) {
+	out := renderRollout(t, targetRolloutData([]rolloutTarget{
+		{opState: state.ApplyOperation.Running, status: state.Task.Running, rowsCopied: 1200, rowsTotal: 1000},
+		{opState: state.ApplyOperation.Running, status: state.Task.Running, rowsCopied: 1100, rowsTotal: 1000},
+	}))
+
+	assert.Contains(t, out, "99%\n", "%s", out)
+	assert.Contains(t, out, "Rows: 2,000 / 2,000\n", "%s", out)
+}
+
 // A target that already held the change is settled completed without a
 // driver ever starting it, so it reports no table progress. A finished apply
 // says so rather than claiming the target has yet to report, and a target

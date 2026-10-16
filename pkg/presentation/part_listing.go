@@ -120,6 +120,20 @@ func ShardsKeepTableBar(tableStatus string, shardStatuses []string) bool {
 	return !OnePhaseSpeaksForParts(shardStatuses)
 }
 
+// RevertSpeaksForParts reports whether any part is reverting the change or
+// has reverted it. A revert undoes the change rather than progressing it, so
+// its phase speaks for the table instead of a bar that would count the rows
+// the copy once moved as progress.
+func RevertSpeaksForParts(statuses []string) bool {
+	return slices.ContainsFunc(statuses, func(status string) bool {
+		switch state.NormalizeTaskStatus(status) {
+		case state.Task.Reverting, state.Task.Reverted:
+			return true
+		}
+		return false
+	})
+}
+
 // OnePhaseSpeaksForParts reports whether every part is in the same phase past
 // the row copy (all checksumming, all waiting for cutover), so that phase
 // speaks for the table as a whole. Parts in different phases leave no one
@@ -496,8 +510,9 @@ func PartStatusLabel(status string) string {
 // copied over the rows planned across them. Otherwise it is the table's share
 // across all of its targets: a completed target counts in full, a working
 // target by the rows its engine reports, and every other target as nothing
-// yet. A target that failed, is retrying, or halted counts as nothing, since
-// it has not landed the change and its rows are not progressing, so one copy
+// yet. A target that failed, is retrying, halted, or is undoing the change
+// counts as nothing, since it has not landed the change and its rows are not
+// progressing, so one copy
 // beside many failures never reads as half done. silent is the targets with no
 // progress reported at all.
 // The percent stops short of complete until every target has completed, since
@@ -526,6 +541,9 @@ func PercentAcrossTargets(parts []Part, silent int) int {
 			}
 		case state.Task.Failed, state.Task.FailedRetryable, state.Task.Stopped, state.Task.Cancelled:
 			// Halted or waiting on a retry: its rows are not progressing.
+			everyReported = false
+		case state.Task.Reverting, state.Task.Reverted:
+			// Undoing the change: the rows its copy moved are not progress.
 			everyReported = false
 		case state.Task.Pending:
 			everyReported = false

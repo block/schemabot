@@ -390,13 +390,17 @@ func writeTargetTableLine(sb *strings.Builder, table string, cells []TableProgre
 // target's phase never speaks for siblings in another, so the bar holds until
 // every target completes and the list under it says where each one stands.
 // When every target is in the same phase past the copy, that phase speaks for
-// the table (presentation.OnePhaseSpeaksForParts).
+// the table (presentation.OnePhaseSpeaksForParts), and so does a revert on any
+// target (presentation.RevertSpeaksForParts).
 func keepsTargetProgressBar(cells []TableProgressData, status string, done, pending int, settled bool) bool {
+	statuses := make([]string, len(cells))
+	for i, c := range cells {
+		statuses[i] = c.Status
+	}
+	if presentation.RevertSpeaksForParts(statuses) {
+		return false
+	}
 	if slices.ContainsFunc(cells, func(c TableProgressData) bool { return state.IsInFlightTaskState(c.Status) }) {
-		statuses := make([]string, len(cells))
-		for i, c := range cells {
-			statuses[i] = c.Status
-		}
 		if !presentation.OnePhaseSpeaksForParts(statuses) {
 			return true
 		}

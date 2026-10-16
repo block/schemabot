@@ -1977,8 +1977,9 @@ func TestRenderMultiDeploymentApplyComment_RolledUpTableCountsUnreportedTargetsA
 // While a table is copying, the list under its rows names each target the way
 // the sharded comment lists a table's shards: the copying target with its
 // progress, and a target that has not reported yet as queued. Past the inline
-// limit the list names only the failed and the slowest copying targets, and
-// its heading counts the rest, so a wide rollout stays a few lines per table.
+// limit the list names only the failed targets, the slowest copying targets
+// and the targets working past the copy, and its heading counts the rest, so a
+// wide rollout stays a few lines per table.
 func TestRenderMultiDeploymentApplyComment_RolledUpTargetListNamesEveryTarget(t *testing.T) {
 	refunds := func(st string, copied int64) TableProgressData {
 		return TableProgressData{TableName: "refunds", Status: st, RowsCopied: copied, PercentComplete: int(copied / 10)}
@@ -2236,6 +2237,20 @@ func TestRenderMultiDeploymentApplyComment_MixedPhasesKeepTheBar(t *testing.T) {
 		"  - ○ `testapp-003`: queued\n"+
 		"  - ○ `testapp-004`: queued\n", "%s", out)
 	assert.NotContains(t, out, shardedTableStatusPhrase(state.Task.Checksumming))
+}
+
+// A rollout of `orders` two targets wide where testapp-001 is still reverting
+// and testapp-002 has reverted. A revert undoes the change, so the rows its
+// copy once moved are not progress: the revert speaks for the table rather
+// than a bar at nearly complete.
+func TestRenderMultiDeploymentApplyComment_RevertSpeaksForTheTable(t *testing.T) {
+	ops := rollingTargets(2)
+	out := renderTargets(presentation.Derive(ops),
+		tablesDetail("testapp_001", TableProgressData{TableName: "orders", Status: state.Task.Reverting, RowsCopied: 1000, RowsTotal: 1000}),
+		tablesDetail("testapp_002", TableProgressData{TableName: "orders", Status: state.Task.Reverted, RowsCopied: 1000, RowsTotal: 1000}),
+	)
+	assert.Contains(t, out, shardedTableStatusPhrase(state.Task.Reverting), "%s", out)
+	assert.NotContains(t, out, "99%", "%s", out)
 }
 
 // Two targets parked at their cutover and two queued is half the table, not
