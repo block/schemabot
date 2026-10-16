@@ -3300,6 +3300,7 @@ func buildApplyTask(
 		ExecutionMode:  ddlChange.ExecutionMode,
 		ModeReason:     ddlChange.ModeReason,
 		EstimatedBytes: ddlChange.TaskEstimatedBytes(shard),
+		EstimatedRows:  ddlChange.TaskEstimatedRows(shard),
 		CreatedAt:      now,
 		UpdatedAt:      now,
 	}

@@ -91,8 +91,9 @@ the agent uses your credentials.
   grants too. See [GitHub permissions](auth.md#github-side-authorization).
 - **Require review before apply.** Enable
   [`review_policy`](configuration.md#review-gate) to require a qualifying
-  approval for the environments served by that instance. The PR author's
-  own approval does not count.
+  approval for the environments served by that instance, or a database's
+  own `review_policy` to require one for that database alone. The PR
+  author's own approval does not count.
 - **Review destructive changes before allowing them.** Changes flagged as unsafe
   require `--allow-unsafe` to proceed. If your agent uses your credentials, it
   can supply that flag too—SchemaBot cannot tell whether you personally

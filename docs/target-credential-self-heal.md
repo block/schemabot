@@ -271,6 +271,7 @@ eligible:
 | `PullSchema` | Yes | Reads catalog state; no target mutation has begun. |
 | `Plan` | Target read phase only | `LocalClient.Plan` reads the live schema through the engine, then persists the plan with `c.storage.Plans().Create` and reads storage again. Only the engine phase talks to the target, so only its failure is eligible; a storage failure after it is not. |
 | `PlanDiff` | Yes | Read-only and non-persisting. |
+| `CompareSchemaFileChange` | Yes | Runs each version of the schema file on the target inside a transaction that is always rolled back, and persists nothing, so a replay leaves no state behind. |
 | Initial client construction or connection probe | Yes | No operation has begun. |
 | `Apply` | No | Materialization and execution share the call boundary; an error does not prove target mutation never started. |
 | Resume, cutover, stop, cancel, revert, skip-revert | No | They act on existing work; replay belongs to their durable, operation-specific reconciliation paths. |

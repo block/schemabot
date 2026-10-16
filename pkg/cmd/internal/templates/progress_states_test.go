@@ -72,29 +72,32 @@ func TestWriteStatusListHasMoreFooter(t *testing.T) {
 	assert.Contains(t, output, "Use 'schemabot status <apply_id>' to view details")
 }
 
+// At the server's cap a larger --limit cannot show more, so the footer names
+// the --after apply that starts the next page. A page reached with --after
+// says it shows more rather than the most recent, and keeps naming the next
+// --after apply.
 func TestWriteStatusListHasMoreFooterAtMaxLimit(t *testing.T) {
-	output := captureStdout(t, func() {
-		WriteStatusList(StatusListData{
-			ActiveCount: 0,
-			Limit:       1000,
-			MaxLimit:    1000,
-			HasMore:     true,
-			Applies: []ActiveApplyData{
-				{
-					ApplyID:     "apply-example",
-					Database:    "orders",
-					Environment: "staging",
-					State:       state.Apply.Completed,
-					StartedAt:   "2026-05-28T12:00:00Z",
-					CompletedAt: "2026-05-28T12:00:02Z",
-					Caller:      "cli",
-				},
-			},
-		})
-	})
+	page := StatusListData{
+		Limit:    1000,
+		MaxLimit: 1000,
+		HasMore:  true,
+		Applies: []ActiveApplyData{{
+			ApplyID: "apply-example", Database: "orders", Environment: "staging", State: state.Apply.Completed,
+			StartedAt: "2026-05-28T12:00:00Z", CompletedAt: "2026-05-28T12:00:02Z", Caller: "cli",
+		}},
+	}
+	first := captureStdout(t, func() { WriteStatusList(page) })
+	assert.Contains(t, first, "Showing the 1000 most recent schema changes. Add --after apply-example for the next 1000.")
+	assert.NotContains(t, first, "Use --limit N to show more.")
 
-	assert.Contains(t, output, "Showing the 1000 most recent schema changes. This server caps status history at 1000.")
-	assert.NotContains(t, output, "Use --limit N to show more.")
+	page.Continued = true
+	continued := captureStdout(t, func() { WriteStatusList(page) })
+	assert.Contains(t, continued, "Showing 1 more schema changes. Add --after apply-example for the next 1000.")
+
+	page.FailuresOnly = true
+	page.Applies[0].State = state.Apply.Failed
+	failed := captureStdout(t, func() { WriteStatusList(page) })
+	assert.Contains(t, failed, "Showing 1 more failed schema changes. Add --after apply-example for the next 1000.")
 }
 
 func TestWriteStatusListStateSummary(t *testing.T) {
@@ -624,6 +627,16 @@ func TestFormatTableProgress_TableSizeBesideRows(t *testing.T) {
 	unsized := base
 	unsized.EstimatedBytes = nil
 	assert.Contains(t, FormatTableProgress(unsized), "Rows: 1,234,567 / 48,200,000 · ETA: 12m 0s\n")
+
+	// A queued table has reported nothing yet, so it shows the plan's
+	// estimates, both approximate, and nothing without them.
+	queued := TableProgress{
+		TableName: "orders", ChangeType: "alter", Status: state.Apply.Pending, DDL: base.DDL,
+		EstimatedRows: new(int64(48_200_000)), EstimatedBytes: &bytes,
+	}
+	assert.Contains(t, FormatTableProgress(queued), "Rows: ~48.2M · ~23.4 GB\n")
+	queued.EstimatedRows = nil
+	assert.NotContains(t, FormatTableProgress(queued), "Rows:")
 }
 
 // A table applying its accumulated changes names the catch-up phase rather

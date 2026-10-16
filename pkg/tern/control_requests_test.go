@@ -1,7 +1,9 @@
 package tern
 
 import (
+	"bytes"
 	"fmt"
+	"log/slog"
 	"testing"
 
 	"github.com/block/schemabot/pkg/state"
@@ -35,7 +37,7 @@ func TestSettlePendingRequestsForTerminalApply(t *testing.T) {
 	controlRequests := &testControlRequestStore{requests: requests}
 	store := &mockStorage{controlRequests: controlRequests}
 
-	require.NoError(t, settlePendingRequestsForTerminalApply(t.Context(), store, discardLogger(), apply))
+	require.NoError(t, SettlePendingRequestsForTerminalApply(t.Context(), store, discardLogger(), apply))
 
 	for _, op := range sweptOps {
 		pending, err := controlRequests.GetPending(t.Context(), apply.ID, op)
@@ -46,6 +48,60 @@ func TestSettlePendingRequestsForTerminalApply(t *testing.T) {
 		require.NotNil(t, swept)
 		assert.Equal(t, storage.ControlRequestCompleted, swept.Status)
 	}
+}
+
+// An on_failure=pause rollout released by an operator and then settled leaves
+// its release pending: no drive consumes it, because the pending row is the
+// latch. The sweep completes it so it does not stay pending forever, and the
+// completed row still latches, so the rollout stays released.
+func TestSettlePendingRequestsForTerminalApplyCompletesAReleaseAndKeepsItsLatch(t *testing.T) {
+	apply := &storage.Apply{
+		ID:              7,
+		ApplyIdentifier: "apply-released-then-failed",
+		Database:        "testdb",
+		Environment:     "staging",
+		State:           state.Apply.Failed,
+	}
+	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{
+		{ApplyID: apply.ID, Operation: storage.ControlOperationRelease, Status: storage.ControlRequestPending, RequestedBy: "cli:alice"},
+	}}
+	store := &mockStorage{controlRequests: controlRequests}
+
+	require.NoError(t, SettlePendingRequestsForTerminalApply(t.Context(), store, discardLogger(), apply))
+
+	pending, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationRelease)
+	require.NoError(t, err)
+	assert.Nil(t, pending, "a release must not stay pending on a terminal apply")
+	release, err := controlRequests.GetByOperation(t.Context(), apply.ID, storage.ControlOperationRelease)
+	require.NoError(t, err)
+	require.NotNil(t, release)
+	assert.Equal(t, storage.ControlRequestCompleted, release.Status)
+	assert.True(t, release.ReleasesPausedRollout(), "completing the release must keep the rollout released")
+}
+
+// When the sweep completes a stop, the server log records it with the
+// operator who asked, so a stop answered by the reaper or the post-drive
+// settlement is traceable to its requester.
+func TestSettlePendingRequestsForTerminalApplyLogsTheCompletedStop(t *testing.T) {
+	apply := &storage.Apply{
+		ID:              7,
+		ApplyIdentifier: "apply-stop-logged",
+		Database:        "testdb",
+		Environment:     "staging",
+		State:           state.Apply.Stopped,
+	}
+	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{
+		{ApplyID: apply.ID, Operation: storage.ControlOperationStop, Status: storage.ControlRequestPending, RequestedBy: "cli:alice"},
+	}}
+	store := &mockStorage{controlRequests: controlRequests}
+	var logged bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logged, nil))
+
+	require.NoError(t, SettlePendingRequestsForTerminalApply(t.Context(), store, logger, apply))
+
+	assert.Contains(t, logged.String(), `msg="completed pending stop request"`)
+	assert.Contains(t, logged.String(), "apply_id=apply-stop-logged")
+	assert.Contains(t, logged.String(), "requested_by=cli:alice")
 }
 
 // A cutover still pending when the apply settles is answered by the outcome the
@@ -81,7 +137,7 @@ func TestSettlePendingRequestsForTerminalApplySettlesCutoverByOutcome(t *testing
 			}}
 			store := &mockStorage{controlRequests: controlRequests, logs: &mockApplyLogStore{}}
 
-			require.NoError(t, settlePendingRequestsForTerminalApply(t.Context(), store, discardLogger(), apply))
+			require.NoError(t, SettlePendingRequestsForTerminalApply(t.Context(), store, discardLogger(), apply))
 
 			settled, err := controlRequests.GetByOperation(t.Context(), apply.ID, storage.ControlOperationCutover)
 			require.NoError(t, err)
@@ -124,7 +180,7 @@ func TestSettlePendingRequestsForTerminalApplySettlesBoundCutoverByOperation(t *
 			}}
 			store := &mockStorage{controlRequests: controlRequests, logs: &mockApplyLogStore{}, operations: ops}
 
-			require.NoError(t, settlePendingRequestsForTerminalApply(t.Context(), store, discardLogger(), apply))
+			require.NoError(t, SettlePendingRequestsForTerminalApply(t.Context(), store, discardLogger(), apply))
 
 			settled, err := controlRequests.GetByOperation(t.Context(), apply.ID, storage.ControlOperationCutover)
 			require.NoError(t, err)
@@ -326,7 +382,7 @@ func TestSettlePendingRequestsForTerminalApplySettlesRevertPhaseByOutcome(t *tes
 			logs := &mockApplyLogStore{}
 			store := &mockStorage{controlRequests: controlRequests, logs: logs}
 
-			require.NoError(t, settlePendingRequestsForTerminalApply(t.Context(), store, discardLogger(), apply))
+			require.NoError(t, SettlePendingRequestsForTerminalApply(t.Context(), store, discardLogger(), apply))
 
 			settled, err := controlRequests.GetByOperation(t.Context(), apply.ID, tc.operation)
 			require.NoError(t, err)
@@ -420,7 +476,7 @@ func TestSettlePendingRequestsForTerminalApplyFailsAnOutrunCancel(t *testing.T) 
 	logs := &mockApplyLogStore{}
 	store := &mockStorage{controlRequests: controlRequests, logs: logs}
 
-	require.NoError(t, settlePendingRequestsForTerminalApply(t.Context(), store, discardLogger(), apply))
+	require.NoError(t, SettlePendingRequestsForTerminalApply(t.Context(), store, discardLogger(), apply))
 
 	pending, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationCancel)
 	require.NoError(t, err)
@@ -511,7 +567,7 @@ func TestSettlePendingRequestsForCancelledApplyCompletesTheCancel(t *testing.T) 
 	logs := &mockApplyLogStore{}
 	store := &mockStorage{controlRequests: controlRequests, logs: logs}
 
-	require.NoError(t, settlePendingRequestsForTerminalApply(t.Context(), store, discardLogger(), apply))
+	require.NoError(t, SettlePendingRequestsForTerminalApply(t.Context(), store, discardLogger(), apply))
 
 	settled, err := controlRequests.GetByOperation(t.Context(), apply.ID, storage.ControlOperationCancel)
 	require.NoError(t, err)
@@ -566,7 +622,7 @@ func TestSettlePendingRequestsForStoppedApplyKeepsCancelPending(t *testing.T) {
 	}}
 	store := &mockStorage{controlRequests: controlRequests}
 
-	require.NoError(t, settlePendingRequestsForTerminalApply(t.Context(), store, discardLogger(), apply))
+	require.NoError(t, SettlePendingRequestsForTerminalApply(t.Context(), store, discardLogger(), apply))
 
 	pendingStop, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationStop)
 	require.NoError(t, err)

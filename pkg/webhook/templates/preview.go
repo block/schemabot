@@ -1388,12 +1388,13 @@ func PreviewCommentApplyBlockedByCLI() string {
 // PreviewCommentApplyInProgress renders a sample "apply already in progress" comment.
 func PreviewCommentApplyInProgress() string {
 	return RenderApplyInProgress(ApplyLockConflictData{
-		Database:     "testapp",
-		DatabaseType: "mysql",
-		Environment:  "staging",
-		RequestedBy:  previewRequestedBy,
-		ApplyID:      "apply-a1b2c3d4e5f6",
-		ApplyState:   "running",
+		Database:          "testapp",
+		DatabaseType:      "mysql",
+		Environment:       "staging",
+		RequestedBy:       previewRequestedBy,
+		ApplyID:           "apply-a1b2c3d4e5f6",
+		ApplyState:        "running",
+		ApplyAgainCommand: ApplyCommand("staging", "", ApplyCommandOptions{}),
 	})
 }
 
@@ -2351,18 +2352,21 @@ func sampleApplyTables() []TableProgressData {
 			Namespace:      "testapp",
 			TableName:      "orders",
 			EstimatedBytes: new(int64(438_000_000)),
+			EstimatedRows:  new(int64(1_620_000)),
 			DDL:            "ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`)",
 		},
 		{
 			Namespace:      "testapp",
 			TableName:      "users",
 			EstimatedBytes: new(int64(391_000_000)),
+			EstimatedRows:  new(int64(1_480_000)),
 			DDL:            "ALTER TABLE `users` ADD INDEX `idx_email` (`email`)",
 		},
 		{
 			Namespace:      "testapp",
 			TableName:      "products",
 			EstimatedBytes: new(int64(157_000_000)),
+			EstimatedRows:  new(int64(612_000)),
 			DDL:            "ALTER TABLE `products` ADD INDEX `idx_price` (`price_cents`)",
 		},
 	}
