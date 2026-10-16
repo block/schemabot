@@ -651,6 +651,12 @@ type ApplyStore interface {
 	// operation row's ApplyID is set to the new apply ID before insert.
 	// Pending applies become operator-claimable only after every row is
 	// committed, so the operator never observes a partially-populated apply.
+	//
+	// Each apply named in apply.TakesOverApplyIDs is stamped with the new apply's
+	// identifier as its SupersededBy marker in the same transaction, with the
+	// write-once semantics of MarkSuperseded: a holder an earlier successor
+	// already stamped is left alone. A holder that does not exist, or a stamp that
+	// does not land, fails the create and leaves neither the apply nor any marker.
 	CreateWithTasksAndOperations(ctx context.Context, apply *Apply, tasks []*Task, operations []*ApplyOperation) (int64, error)
 
 	// CreateWithGroupedOperations stores a new apply and grouped per-deployment
@@ -876,15 +882,17 @@ type ApplyStore interface {
 	// a self-referential handoff would refuse the apply forever while pointing
 	// the operator back at the refused apply itself.
 	//
-	// Callers recording a takeover mark as soon as the successor durably
-	// exists — after its creation, so the marker never names an apply that
-	// does not exist, and before any driver acts on it. The marker does not
-	// carry that window alone: while the successor is active, a claim on the
-	// handed-off apply is refused by the claim-time one-active-apply re-check;
-	// the marker is what keeps refusing once the successor settles and that
-	// re-check has nothing left to catch. A takeover whose mark never lands —
-	// a failed write, or a crash between creating the successor and marking —
-	// therefore leaves an apply that becomes startable again once its
+	// A dispatch that creates its successor records the takeover through
+	// Apply.TakesOverApplyIDs on the create, in the creating transaction, rather
+	// than with this method: the marker then never names an apply that does not
+	// exist, and no takeover is left without its marker. This method is for a
+	// takeover recorded after the fact. The marker does not carry the window
+	// alone: while the successor is active, a claim on the handed-off apply is
+	// refused by the claim-time one-active-apply re-check; the marker is what
+	// keeps refusing once the successor settles and that re-check has nothing
+	// left to catch. A takeover recorded through this method whose mark never
+	// lands — a failed write, or a crash between the successor's commit and the
+	// mark — therefore leaves an apply that becomes startable again once its
 	// successor settles; the failed write is logged with both applies named,
 	// and neither case is retried.
 	//

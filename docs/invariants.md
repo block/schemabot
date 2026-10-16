@@ -750,7 +750,10 @@ identifier. State alone cannot express this: the apply is still `stopped`, and o
 settles nothing else tells it apart from a stopped apply nobody touched. Starting it would replay
 its statements against a target where that work has already happened, so a stamped apply can never
 be started. The stamp is write-once, because a second and different successor means the takeover
-is ambiguous, and it is never cleared, outliving the successor it names.
+is ambiguous, and it is never cleared, outliving the successor it names. A dispatch that creates
+its successor writes the stamp in the create's own transaction, so that successor never exists
+without it. A dispatch that attaches to an apply that already exists stamps after the attach
+commits, and a stamp that fails there is logged rather than retried.
 
 That refusal holds at every surface that could begin the work again: the API rejects the start
 request and points at the successor, a claim to resume refuses and fails the pending start request
@@ -759,8 +762,10 @@ retry. No other claim path can reach a stamped apply, since work must have run b
 can take it over, and an active apply cannot gain one at all. *Enforced:* the finished-apply guard
 on the storage apply update (`finishedApplyGuardPredicate`), the named state arms of the single
 claim query, the terminal-state refusals in the control handlers, and the write-once supersession
-marker consulted by the start, resume, and retry paths (`pkg/storage/internal/sqlstore/applies.go`,
-`pkg/api/control_handlers.go`); the reopen policy each caller passes to the rollout projection,
+marker consulted by the start, resume, and retry paths and written in the successor's create
+transaction (`markTakenOver`, from `Apply.TakesOverApplyIDs`) (`pkg/storage/internal/sqlstore/applies.go`,
+`pkg/api/control_handlers.go`), or after an attach (`markSupersededHolders`,
+`pkg/tern/local_apply_superseded.go`); the reopen policy each caller passes to the rollout projection,
 with the lease-scoped drive paths opting in and the unscoped reconciler opting out
 (`reopensHeldFailedRollout` in `updateApplyStateFromOperations`, `pkg/api/operator.go`), and the
 pending-request gate on a stopped rollout's reopen and drive (`stoppedRolloutDeliverableRequest`,
@@ -1021,9 +1026,11 @@ what attached.
 
 The check runs whenever an apply is created or moved back into an active state, serialized across
 instances by an advisory lock keyed on (database, database type, environment) and held for the
-transaction that decides. That lock excludes only while the connection holding it keeps one server
-session, which OW-9 covers. It does not depend on a user-facing database lock being held: direct
-API callers and `--no-lock` flows are equally bound.
+transaction that decides. Every path takes that lock before it locks an apply row, never while
+holding one, so a holder of the lock is never left waiting on a row its next waiter holds. That
+lock excludes only while the connection holding it keeps one server session, which OW-9 covers.
+It does not depend on a user-facing database lock being held: direct API callers and `--no-lock`
+flows are equally bound.
 
 The rollout verdict correction in ST-1 is the one exception: it writes the parent row without
 re-running the check. It lands from a drive, and the drive's operation is in progress until the
@@ -1036,7 +1043,8 @@ active parents and over terminal parents with an operation in progress
 admission past a settled manifest hold is `checkNoActiveApplyForNewGeneration` and
 `settledManifestHold`, which record the handoff in the create's transaction (`markAdmittedPast`);
 `activeApplyHoldersForTargets` stops counting the held apply once it carries the handoff, and
-`AttachOperationWithTasks` refuses an attach to it, all in the same file. The driver settles the
+`AttachOperationWithTasks` refuses an attach to it, all in the same file. The same create
+transaction records a stopped apply's takeover (`markTakenOver`). The driver settles the
 held apply once its stored row names the apply that took over its work
 (`updateApplyStateFromOperations`, `pkg/api/operator.go`). A control plane retrying an operation
 that never attached dispatches it under its deployment's unchanged key and manifest, so the retry

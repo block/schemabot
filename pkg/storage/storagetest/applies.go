@@ -758,6 +758,102 @@ func TestApplies(t *testing.T, h Harness) {
 			"the failed start request names the apply that took the work over")
 	})
 
+	// A dispatch that takes over a stopped apply's work names that apply when it
+	// creates its successor, and the marker lands in the same transaction as the
+	// successor's rows. Once the create commits, a start on the stopped apply is
+	// refused with the successor named, with no later write left to fail.
+	t.Run("SupersededMarker_CommittedWithTheCreate", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "apply_superseded_create_db", storage.DatabaseTypeMySQL)
+		holder := CreateApplyWithStateAndEnv(t, store, lock, "apply_create_marker_holder", 920, state.Apply.Stopped, "staging")
+
+		successor, err := createApplyTakingOver(t, store, lock, "apply_create_marker_successor", 921, holder.ID)
+		require.NoError(t, err)
+
+		marked, err := store.Applies().Get(ctx, holder.ID)
+		require.NoError(t, err)
+		require.NotNil(t, marked)
+		assert.Equal(t, successor.ApplyIdentifier, marked.SupersededBy, "the create stamped the stopped apply with its successor")
+		assert.Equal(t, state.Apply.Stopped, marked.State, "the handoff does not change the stopped apply's own state")
+
+		created, err := store.Applies().Get(ctx, successor.ID)
+		require.NoError(t, err)
+		require.NotNil(t, created)
+		assert.Empty(t, created.SupersededBy, "the successor's own row carries no marker")
+
+		_, alreadyPending, err := store.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+			ApplyID:   holder.ID,
+			Operation: storage.ControlOperationStart,
+			Status:    storage.ControlRequestPending,
+			Metadata:  []byte(`{}`),
+		})
+		require.NoError(t, err)
+		require.False(t, alreadyPending)
+
+		claimed, err := store.Applies().ClaimApplyByID(ctx, holder.ID, "driver-a")
+		require.NoError(t, err)
+		assert.Nil(t, claimed, "a stopped apply whose work the create took over must not be claimed for a start")
+
+		settled, err := store.ControlRequests().GetByOperation(ctx, holder.ID, storage.ControlOperationStart)
+		require.NoError(t, err)
+		require.NotNil(t, settled)
+		assert.Equal(t, storage.ControlRequestFailed, settled.Status)
+		assert.Contains(t, settled.ErrorMessage, "superseded by "+successor.ApplyIdentifier,
+			"the start is refused because of the marker, naming the successor")
+	})
+
+	// A handoff that cannot be recorded fails the create, so there is never a
+	// successor running over a stopped apply that nothing refuses to start. The
+	// failed create leaves no marker on any holder it named and no successor row,
+	// and the same dispatch retried with a holder it can record commits both.
+	t.Run("SupersededMarker_FailedCreateLeavesNoMark", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "apply_superseded_rollback_db", storage.DatabaseTypeMySQL)
+		holder := CreateApplyWithStateAndEnv(t, store, lock, "apply_rollback_marker_holder", 922, state.Apply.Stopped, "staging")
+
+		_, err := createApplyTakingOver(t, store, lock, "apply_rollback_marker_successor", 923, holder.ID, holder.ID+100000)
+		require.ErrorIs(t, err, storage.ErrApplyNotFound, "a holder the create cannot stamp fails the create")
+
+		untouched, err := store.Applies().Get(ctx, holder.ID)
+		require.NoError(t, err)
+		require.NotNil(t, untouched)
+		assert.Empty(t, untouched.SupersededBy, "the holder stamped before the failure is rolled back with the create")
+
+		missing, err := store.Applies().GetByApplyIdentifier(ctx, "apply_rollback_marker_successor")
+		require.NoError(t, err)
+		assert.Nil(t, missing, "the failed create leaves no successor row")
+
+		successor, err := createApplyTakingOver(t, store, lock, "apply_rollback_marker_successor", 923, holder.ID)
+		require.NoError(t, err, "the retried create commits once every holder can be recorded")
+		retried, err := store.Applies().Get(ctx, holder.ID)
+		require.NoError(t, err)
+		require.NotNil(t, retried)
+		assert.Equal(t, successor.ApplyIdentifier, retried.SupersededBy)
+	})
+
+	// The first successor of a stopped apply owns its marker. A later create that
+	// names the same holder commits without reassigning it, since the stopped
+	// apply is refused either way and overwriting would resolve an ambiguous
+	// takeover.
+	t.Run("SupersededMarker_CreateLeavesAnEarlierSuccessorsMarker", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "apply_superseded_earlier_db", storage.DatabaseTypeMySQL)
+		holder := CreateApplyWithStateAndEnv(t, store, lock, "apply_earlier_marker_holder", 924, state.Apply.Stopped, "staging")
+		require.NoError(t, store.Applies().MarkSuperseded(ctx, holder.ID, "apply_earlier_successor"))
+
+		successor, err := createApplyTakingOver(t, store, lock, "apply_later_marker_successor", 925, holder.ID)
+		require.NoError(t, err, "a holder an earlier successor already stamped does not fail the create")
+		require.NotZero(t, successor.ID)
+
+		stored, err := store.Applies().Get(ctx, holder.ID)
+		require.NoError(t, err)
+		require.NotNil(t, stored)
+		assert.Equal(t, "apply_earlier_successor", stored.SupersededBy, "the first successor keeps the marker")
+	})
+
 	// Automatic retry is the one start surface with no operator request behind
 	// it: a fresh failed_retryable apply within budget is claimed and re-driven
 	// on the next poll, with nobody in the loop. Once another apply has taken
@@ -1673,6 +1769,35 @@ func createApplyOnDeployment(t *testing.T, store storage.Storage, lock *storage.
 		State:           state.Apply.Pending,
 	})
 	return err
+}
+
+// createApplyTakingOver creates a pending staging apply with one task and one
+// operation that takes over the stopped applies named by takesOver, returning the
+// storage error so a test can assert whether the create committed.
+func createApplyTakingOver(t *testing.T, store storage.Storage, lock *storage.Lock, identifier string, planID int64, takesOver ...int64) (*storage.Apply, error) {
+	t.Helper()
+	apply := &storage.Apply{
+		ApplyIdentifier:   identifier,
+		LockID:            lock.ID,
+		PlanID:            planID,
+		Database:          lock.DatabaseName,
+		DatabaseType:      lock.DatabaseType,
+		Repository:        lock.Repository,
+		PullRequest:       lock.PullRequest,
+		Environment:       "staging",
+		Deployment:        "default",
+		Engine:            storage.EngineForType(lock.DatabaseType),
+		State:             state.Apply.Pending,
+		TakesOverApplyIDs: takesOver,
+	}
+	task := newTask(apply, "task_"+identifier, "users", time.Now())
+	op := &storage.ApplyOperation{Deployment: "default", OperationKey: "default", State: state.ApplyOperation.Pending}
+	id, err := store.Applies().CreateWithTasksAndOperations(t.Context(), apply, []*storage.Task{task}, []*storage.ApplyOperation{op})
+	if err != nil {
+		return nil, err
+	}
+	apply.ID = id
+	return apply, nil
 }
 
 // createManifestGeneration creates the first dispatch of a deployment-keyed
