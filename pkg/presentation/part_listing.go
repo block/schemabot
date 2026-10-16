@@ -43,6 +43,30 @@ func PendingWord(settled bool) string {
 	return PendingQueued
 }
 
+// UnreportedTargetStatus is where a rollout member that has reported no table
+// progress stands on each table it runs, given its operation's state: its own
+// halt or outcome once it has one, since that is all there is to say about it,
+// and queued while it is still to run. A stopped member reports its tables
+// once the apply resumes.
+func UnreportedTargetStatus(memberState string) string {
+	switch {
+	case state.IsState(memberState, state.ApplyOperation.Stopped):
+		return state.Task.Stopped
+	case state.IsState(memberState, state.ApplyOperation.Failed):
+		return state.Task.Failed
+	case state.IsState(memberState, state.ApplyOperation.FailedRetryable):
+		return state.Task.FailedRetryable
+	case state.IsState(memberState, state.ApplyOperation.Cancelled):
+		return state.Task.Cancelled
+	case state.IsState(memberState, state.ApplyOperation.Reverted):
+		return state.Task.Reverted
+	case state.IsState(memberState, state.ApplyOperation.Completed):
+		return state.Task.Completed
+	default:
+		return state.Task.Pending
+	}
+}
+
 // partListInlineLimit is the most parts a listing names one per line. Past it,
 // the listing names only the parts that need attention or set the pace, and
 // the heading's counts cover the rest.
@@ -76,6 +100,24 @@ func ListsTargets(statuses []string) bool {
 	return slices.ContainsFunc(statuses, func(status string) bool {
 		return ListsParts(status) || state.NormalizeTaskStatus(status) == state.Task.Stopped
 	})
+}
+
+// ShardsKeepTableBar reports whether a sharded table past its row copy still
+// leads with its bar across its shards rather than its phase: it is still in
+// flight, its shards are in different phases (OnePhaseSpeaksForParts), and
+// there is more than one of them. The table's status is its most pressing
+// shard's, so one shard cutting over would otherwise speak for shards still
+// copying or verifying. A table copying rows, or resuming its copy, already
+// leads with its copy bar, so it is left to it.
+func ShardsKeepTableBar(tableStatus string, shardStatuses []string) bool {
+	if len(shardStatuses) <= 1 || !state.IsInFlightTaskState(tableStatus) {
+		return false
+	}
+	switch state.NormalizeTaskStatus(tableStatus) {
+	case state.Task.Running, state.Task.Recovering:
+		return false
+	}
+	return !OnePhaseSpeaksForParts(shardStatuses)
 }
 
 // OnePhaseSpeaksForParts reports whether every part is in the same phase past
@@ -232,16 +274,16 @@ func partReported(p Part) bool {
 	return p.PercentComplete != 0 || p.RowsCopied != 0
 }
 
-// PartGlyph is the mark a part's line leads with: ✓ complete or in its revert
-// window, ● waiting for
-// or cutting over, ◉ working through any other phase of the change, ✗ failed,
-// and ○ for a part that is not working on it: queued, not started, or halted.
+// PartGlyph is the mark a part's line leads with: ✓ complete, ● at the
+// cutover (waiting for it, cutting over, or in its revert window), ◉ working
+// through any other phase of the change, ✗ failed, and ○ for a part that is
+// not working on it: queued, not started, or halted. A part in its revert
+// window has the change live but not final, so it never reads as done.
 func PartGlyph(status string) string {
 	switch status := state.NormalizeTaskStatus(status); {
-	case status == state.Task.Completed, status == state.Task.RevertWindow:
-		// A part in its revert window has the change live.
+	case status == state.Task.Completed:
 		return "✓"
-	case status == state.Task.WaitingForCutover, status == state.Task.CuttingOver:
+	case status == state.Task.WaitingForCutover, status == state.Task.CuttingOver, status == state.Task.RevertWindow:
 		return "●"
 	case status == state.Task.Failed:
 		return "✗"

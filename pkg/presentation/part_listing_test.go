@@ -192,14 +192,13 @@ func TestPartGlyph(t *testing.T) {
 	for _, s := range []string{task.Running, task.CatchingUp, task.Checksumming, task.PostChecksum, task.WaitingForDeploy, task.Recovering, task.Reverting} {
 		assert.Equalf(t, "◉", PartGlyph(s), "a part %s is working", s)
 	}
-	for _, s := range []string{task.WaitingForCutover, task.CuttingOver} {
+	for _, s := range []string{task.WaitingForCutover, task.CuttingOver, task.RevertWindow} {
 		assert.Equalf(t, "●", PartGlyph(s), "a part %s is at its cutover", s)
 	}
 	for _, s := range []string{task.Pending, task.Stopped, task.Cancelled, task.FailedRetryable} {
 		assert.Equalf(t, "○", PartGlyph(s), "a part %s is not working", s)
 	}
 	assert.Equal(t, "✓", PartGlyph(task.Completed))
-	assert.Equal(t, "✓", PartGlyph(task.RevertWindow), "a part in its revert window has the change live")
 	assert.Equal(t, "✗", PartGlyph(task.Failed))
 }
 

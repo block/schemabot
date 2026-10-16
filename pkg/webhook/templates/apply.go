@@ -106,9 +106,9 @@ func countReadyForCutover(tables []TableProgressData) int {
 	return ready
 }
 
-// ShardProgressData is the high-level status of one shard, for the compact
-// per-shard summary in the PR comment. It intentionally carries only state +
-// percent (no row counts/ETA) to keep the comment quiet.
+// ShardProgressData is one shard's or target's progress, for the compact
+// per-part summary in the PR comment: its state, copy figures, and verify
+// figures, with no ETA to keep the comment quiet.
 type ShardProgressData struct {
 	Shard           string
 	Status          string // canonical lowercase shard/task state
@@ -119,6 +119,14 @@ type ShardProgressData struct {
 	// member's verify has got, once its engine reports a total.
 	ChecksumRowsChecked int64
 	ChecksumRowsTotal   int64
+}
+
+// part is the shard or target as the shared part listing reads it.
+func (m ShardProgressData) part() presentation.Part {
+	return presentation.Part{
+		Name: m.Shard, Status: m.Status, PercentComplete: m.PercentComplete, RowsCopied: m.RowsCopied, RowsTotal: m.RowsTotal,
+		ChecksumRowsChecked: m.ChecksumRowsChecked, ChecksumRowsTotal: m.ChecksumRowsTotal,
+	}
 }
 
 // ApplyStatusCommentData contains all data needed to render an apply status PR comment.
@@ -1158,13 +1166,7 @@ func writeMemberList(sb *strings.Builder, noun presentation.Noun, members []Shar
 	if len(members) <= 1 {
 		return
 	}
-	part := func(i int) presentation.Part {
-		m := members[i]
-		return presentation.Part{
-			Name: m.Shard, Status: m.Status, PercentComplete: m.PercentComplete, RowsCopied: m.RowsCopied, RowsTotal: m.RowsTotal,
-			ChecksumRowsChecked: m.ChecksumRowsChecked, ChecksumRowsTotal: m.ChecksumRowsTotal,
-		}
-	}
+	part := func(i int) presentation.Part { return members[i].part() }
 	c := presentation.CountParts(len(members), func(i int) string { return members[i].Status })
 	c.PendingLabel = pendingWord
 	fmt.Fprintf(sb, "- %s: %d (%s)\n", ui.CapitalizeFirst(noun.Plural), len(members), strings.Join(c.Phrases(), ", "))

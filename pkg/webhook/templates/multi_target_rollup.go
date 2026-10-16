@@ -24,7 +24,12 @@ type targetTableLine struct {
 	cells   []TableProgressData
 	members []int
 	targets []string
-	rank    int
+	// listed and listedTargets are every target the line speaks for, in the
+	// rollout's order: the targets that report the table, and the targets
+	// with no table progress yet when the line speaks for them too.
+	listed        []TableProgressData
+	listedTargets []string
+	rank          int
 }
 
 // writeTargetRollup writes a multi-target deployment's body the way the
@@ -44,13 +49,16 @@ func writeTargetRollup(sb *strings.Builder, data MultiDeploymentApplyData, g pre
 	// A target that has not reported is not known to run any one change, so
 	// when the reporting targets diverge each line counts only its own
 	// targets and the silent ones are counted once, for the deployment.
-	lineSilent, lineWaiting := silent, waitingTargets(data, g)
+	lineSilent := silent
 	if targetsDiverge(data, g) {
-		lineSilent, lineWaiting = 0, 0
+		lineSilent = 0
+	}
+	for li := range lines {
+		lines[li].listed, lines[li].listedTargets = lineTargets(data, g, lines[li], lineSilent > 0)
 	}
 	changing := changingMembers(data.Model, g)
 	settled := data.Model.RolloutSettled(g)
-	rankTargetTableLines(lines, lineSilent)
+	rankTargetTableLines(lines)
 	for _, line := range lines {
 		first := memberDetail(data.Details, line.members[0])
 		dialect := dialectForEngine(first.Engine, data.ApplyID)
@@ -61,8 +69,8 @@ func writeTargetRollup(sb *strings.Builder, data MultiDeploymentApplyData, g pre
 		// target's stored plan and says which other targets run the same.
 		restoreScope := planScopeForLine(budget, line.targets, subset, silent)
 		restorePlan := budget.pointAt(first.storedPlan())
-		strip := targetStrip(data, g, line.cells, line.targets, lineSilent > 0)
-		writeTargetTableLine(sb, line.table.TableName, line.cells, strip, lineSilent, lineWaiting, settled, budget, func() {
+		strip := targetStrip(line.listed, line.listedTargets)
+		writeTargetTableLine(sb, line.table.TableName, line.listed, strip, settled, budget, func() {
 			writeTargetLineDDL(sb, dialect, line, subset, changing, budget)
 		})
 		sb.WriteString("\n")
@@ -117,18 +125,6 @@ func unreportedTargets(data MultiDeploymentApplyData, g presentation.Group) int 
 	return n
 }
 
-// waitingTargets counts the unreported targets still to run: a settled target
-// with no table progress has its outcome and is not queued for any table.
-func waitingTargets(data MultiDeploymentApplyData, g presentation.Group) int {
-	n := 0
-	for _, i := range g.Members {
-		if targetUnreported(data, i) && !state.IsState(data.Model.Deployments[i].State, state.SettledApplyStates...) {
-			n++
-		}
-	}
-	return n
-}
-
 // targetUnreported reports whether member i has work but no table progress to
 // show yet. A target that already had the change ran nothing, so it has
 // nothing to report.
@@ -140,30 +136,39 @@ func targetUnreported(data MultiDeploymentApplyData, i int) bool {
 	return detail == nil || len(detail.Tables) == 0
 }
 
-// targetStrip is a table line's targets in the deployment's order, each with
-// its progress on the table, for the per-target strip under the line. With
-// includeUnreported, a target that has not reported yet is listed as queued,
-// since it has not started any table.
-func targetStrip(data MultiDeploymentApplyData, g presentation.Group, cells []TableProgressData, targets []string, includeUnreported bool) []ShardProgressData {
-	byTarget := make(map[string]TableProgressData, len(cells))
+// targetStrip is a table line's targets, each with its progress on the table,
+// for the per-target strip under the line.
+func targetStrip(cells []TableProgressData, targets []string) []ShardProgressData {
+	strip := make([]ShardProgressData, len(cells))
 	for i, c := range cells {
-		byTarget[targets[i]] = c
-	}
-	strip := make([]ShardProgressData, 0, len(g.Members))
-	for _, i := range g.Members {
-		name := memberTarget(data.Model.Deployments[i])
-		if c, ok := byTarget[name]; ok {
-			strip = append(strip, ShardProgressData{
-				Shard: name, Status: c.Status, PercentComplete: c.PercentComplete, RowsCopied: c.RowsCopied, RowsTotal: c.RowsTotal,
-				ChecksumRowsChecked: c.ChecksumRowsChecked, ChecksumRowsTotal: c.ChecksumRowsTotal,
-			})
-			continue
-		}
-		if includeUnreported && targetUnreported(data, i) {
-			strip = append(strip, ShardProgressData{Shard: name, Status: state.Task.Pending})
+		strip[i] = ShardProgressData{
+			Shard: targets[i], Status: c.Status, PercentComplete: c.PercentComplete, RowsCopied: c.RowsCopied, RowsTotal: c.RowsTotal,
+			ChecksumRowsChecked: c.ChecksumRowsChecked, ChecksumRowsTotal: c.ChecksumRowsTotal,
 		}
 	}
 	return strip
+}
+
+// lineTargets is every target a table line speaks for, in the rollout's
+// order, each with its progress on the table. With includeUnreported, a target
+// that has reported no table progress is among them at where its operation
+// stands (presentation.UnreportedTargetStatus): queued while it is still to
+// run, otherwise its own halt or outcome, and no progress on the table.
+func lineTargets(data MultiDeploymentApplyData, g presentation.Group, line targetTableLine, includeUnreported bool) ([]TableProgressData, []string) {
+	cells := make([]TableProgressData, 0, len(g.Members))
+	targets := make([]string, 0, len(g.Members))
+	for _, i := range g.Members {
+		if k := slices.Index(line.members, i); k >= 0 {
+			cells = append(cells, line.cells[k])
+			targets = append(targets, line.targets[k])
+			continue
+		}
+		if includeUnreported && targetUnreported(data, i) {
+			cells = append(cells, TableProgressData{Status: presentation.UnreportedTargetStatus(data.Model.Deployments[i].State)})
+			targets = append(targets, memberTarget(data.Model.Deployments[i]))
+		}
+	}
+	return cells, targets
 }
 
 // targetTableLines is a deployment's table lines, one per table and DDL across
@@ -234,19 +239,14 @@ func tableChangeSignature(tables []TableProgressData) string {
 }
 
 // rankTargetTableLines orders a rollup's table lines by
-// presentation.TableRolloutRank across each line's targets, so the table being
-// copied leads and one no target has started sits below one already finished
-// on some. silent is the targets with no progress reported that the lines
-// speak for; they have not started any table, so they rank as queued. Lines of
-// equal rank keep plan order.
-func rankTargetTableLines(lines []targetTableLine, silent int) {
+// presentation.TableRolloutRank across every target each line speaks for, so
+// the table being copied leads and one no target has started sits below one
+// already finished on some. Lines of equal rank keep plan order.
+func rankTargetTableLines(lines []targetTableLine) {
 	for li := range lines {
-		statuses := make([]string, len(lines[li].cells), len(lines[li].cells)+silent)
-		for i, c := range lines[li].cells {
+		statuses := make([]string, len(lines[li].listed))
+		for i, c := range lines[li].listed {
 			statuses[i] = c.Status
-		}
-		for range silent {
-			statuses = append(statuses, state.Task.Pending)
 		}
 		lines[li].rank = presentation.TableRolloutRank(statuses)
 	}
@@ -262,15 +262,15 @@ func rankTargetTableLines(lines []targetTableLine, silent int) {
 // counted rather than summed, since their rows are not progressing, and so are
 // retrying targets. A completed target has reported even when it had no rows
 // to copy. Once no target is working on the table, the line names where the
-// table settled. silent is the targets with no progress
-// reported at all that this line speaks for; they widen the row denominator
-// and make the ETA a floor. writeDDL writes the table's DDL directly under the
-// headline, and while the table is in flight strip lists each target's state
-// under the rows, the way the sharded comment lays out a table and its shards.
-// waiting is the silent targets still to run, which the line counts as queued.
-// Once the rollout has settled, a target still pending on the table never
-// starts it, so the line says not started rather than queued.
-func writeTargetTableLine(sb *strings.Builder, table string, cells []TableProgressData, strip []ShardProgressData, silent, waiting int, settled bool, budget *ddlBlockBudget, writeDDL func()) {
+// table settled. cells is every target the line speaks for (lineTargets),
+// including those with no progress reported yet, which widen the row
+// denominator and make the ETA a floor. writeDDL writes the table's DDL
+// directly under the headline, and while the table is in flight strip lists
+// each target's state under the rows, the way the sharded comment lays out a
+// table and its shards. Once the rollout has settled, a target still pending
+// on the table never starts it, so the line says not started rather than
+// queued.
+func writeTargetTableLine(sb *strings.Builder, table string, cells []TableProgressData, strip []ShardProgressData, settled bool, budget *ddlBlockBudget, writeDDL func()) {
 	var done, queued, failed, retrying, reporting, unreported int
 	var copied, total, eta int64
 	var running int
@@ -292,7 +292,7 @@ func writeTargetTableLine(sb *strings.Builder, table string, cells []TableProgre
 		case state.Task.FailedRetryable:
 			retrying++
 			continue
-		case state.Task.Stopped, state.Task.Cancelled:
+		case state.Task.Stopped, state.Task.Cancelled, state.Task.Reverted:
 			continue
 		case state.Task.Running:
 			running++
@@ -307,14 +307,12 @@ func writeTargetTableLine(sb *strings.Builder, table string, cells []TableProgre
 		total += c.RowsTotal
 	}
 	name := inlineCode(table)
-	// A target still to run that has reported no progress has not started the
-	// table, so the line counts it as queued.
-	pending := queued + waiting
+	pending := queued
 	pendingWord := presentation.PendingWord(settled)
 	coverage := presentation.TargetCoverage(done, running, pending, failed, retrying, pendingWord)
 	status := rollupTaskStatus(cells)
-	if keepsTargetProgressBar(cells, silent, status, done, pending, settled) {
-		percent := presentation.PercentAcrossTargets(targetParts(cells), silent)
+	if keepsTargetProgressBar(cells, status, done, pending, settled) {
+		percent := presentation.PercentAcrossTargets(targetParts(cells), 0)
 		if pct := ui.RowCopyDisplayPercent(percent, copied); pct > 0 {
 			// The list under the rows says where each target stands, so the
 			// headline carries only the table's progress across all of them,
@@ -323,14 +321,14 @@ func writeTargetTableLine(sb *strings.Builder, table string, cells []TableProgre
 			writeDDL()
 			if total > 0 {
 				line := fmt.Sprintf("- Rows: %s / %s", ui.FormatNumber(copied), ui.FormatNumber(total))
-				partial := reporting < len(cells)+silent
+				partial := reporting < len(cells)
 				if partial {
-					line += fmt.Sprintf(" across %d of %d targets", reporting, len(cells)+silent)
+					line += fmt.Sprintf(" across %d of %d targets", reporting, len(cells))
 				}
 				// The planned size is every target's, including those left out of
 				// the rows, so beside partial rows it names the full span rather
 				// than reading as the reporting targets' size.
-				if size := targetsTableBytes(cells, silent); size != nil {
+				if size := targetsTableBytes(cells); size != nil {
 					line += ui.FormatTableSizeClause(size)
 					if partial {
 						line += fmt.Sprintf(" across all %d targets", len(cells))
@@ -340,7 +338,7 @@ func writeTargetTableLine(sb *strings.Builder, table string, cells []TableProgre
 					// A target still to start, or working without its rows
 					// reported yet, can only add time.
 					floor := ""
-					if queued+unreported+silent > 0 {
+					if queued+unreported > 0 {
 						floor = "≥ "
 					}
 					line += " · ETA: " + floor + ui.FormatETA(eta)
@@ -354,7 +352,7 @@ func writeTargetTableLine(sb *strings.Builder, table string, cells []TableProgre
 	if partlyCompleted(status, done, pending) {
 		// Complete on some targets and queued on the rest: the change is live
 		// where it completed, so the line leads with that, not with Queued.
-		fmt.Fprintf(sb, "**%s**: %s on %d of %d targets%s\n", name, shardedTableStatusPhrase(state.Task.Completed), done, len(cells)+silent, presentation.TargetCoverage(0, 0, pending, 0, 0, pendingWord))
+		fmt.Fprintf(sb, "**%s**: %s on %d of %d targets%s\n", name, shardedTableStatusPhrase(state.Task.Completed), done, len(cells), presentation.TargetCoverage(0, 0, pending, 0, 0, pendingWord))
 		writeDDL()
 		return
 	}
@@ -393,15 +391,11 @@ func writeTargetTableLine(sb *strings.Builder, table string, cells []TableProgre
 // every target completes and the list under it says where each one stands.
 // When every target is in the same phase past the copy, that phase speaks for
 // the table (presentation.OnePhaseSpeaksForParts).
-// silent is the targets that have reported nothing, so have not started it.
-func keepsTargetProgressBar(cells []TableProgressData, silent int, status string, done, pending int, settled bool) bool {
+func keepsTargetProgressBar(cells []TableProgressData, status string, done, pending int, settled bool) bool {
 	if slices.ContainsFunc(cells, func(c TableProgressData) bool { return state.IsInFlightTaskState(c.Status) }) {
-		statuses := make([]string, 0, len(cells)+silent)
-		for _, c := range cells {
-			statuses = append(statuses, c.Status)
-		}
-		for range silent {
-			statuses = append(statuses, state.Task.Pending)
+		statuses := make([]string, len(cells))
+		for i, c := range cells {
+			statuses[i] = c.Status
 		}
 		if !presentation.OnePhaseSpeaksForParts(statuses) {
 			return true
@@ -451,9 +445,9 @@ func targetParts(cells []TableProgressData) []presentation.Part {
 // targetsTableBytes totals a table's planned size across the targets that run
 // it, since each target copies its own data. It is nil unless every one of
 // those targets carries an estimate: a total that left some out would
-// understate the table, and silent targets have reported nothing at all.
-func targetsTableBytes(cells []TableProgressData, silent int) *int64 {
-	if silent > 0 || len(cells) == 0 {
+// understate the table, and a target that has reported nothing has none.
+func targetsTableBytes(cells []TableProgressData) *int64 {
+	if len(cells) == 0 {
 		return nil
 	}
 	var total int64

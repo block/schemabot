@@ -1219,3 +1219,36 @@ func TestRenderShardedApplyComment_MixedShardPhasesKeepTheBar(t *testing.T) {
 	assert.NotContains(t, out, shardedTableStatusPhrase(state.Task.Checksumming))
 	assert.Contains(t, out, "  - ● `-40`: waiting for cutover\n  - ◉ `40-80`: checksumming 25.00% · 250 / 1,000 rows verified\n  - ◉ `80-`: 50.00% · 500 / 1,000 rows\n", "%s", out)
 }
+
+// A table's bar spans every shard it runs on, as a rollout's bar spans its
+// targets: rows copied on the shards that reported count by their rows, and a
+// shard that is queued or has not attached yet counts as nothing. One shard
+// cutting over beside one copying halfway reads 75%, and one verified shard
+// of four reads 25%, never the reporting shard's own figure.
+func TestRenderShardedApplyComment_PhaseBarSpansEveryShard(t *testing.T) {
+	render := func(table ShardedTableStatus) string {
+		return RenderShardedApplyComment(ShardedApplyData{
+			State: state.Apply.Running, Environment: "staging", Database: "shop", ApplyID: "apply-x",
+			Keyspaces: []ShardedKeyspace{{Keyspace: "shop_001", Tables: []ShardedTableStatus{table}}},
+		})
+	}
+
+	out := render(ShardedTableStatus{
+		Table: "orders", Status: state.Task.CuttingOver, RowsCopied: 1500, RowsTotal: 2000, ShardsReporting: 2,
+		Shards: []ShardProgressData{
+			{Shard: "-80", Status: state.Task.CuttingOver, PercentComplete: 100, RowsCopied: 1000, RowsTotal: 1000},
+			{Shard: "80-", Status: state.Task.Running, PercentComplete: 50, RowsCopied: 500, RowsTotal: 1000},
+		},
+	})
+	assert.Contains(t, out, "**`orders`**: "+ui.ProgressBarRowCopy(75)+" 75%\n", "%s", out)
+
+	out = render(ShardedTableStatus{
+		Table: "orders", Status: state.Task.Checksumming, RowsCopied: 1000, RowsTotal: 1000, ShardsReporting: 1, PlannedShards: 4,
+		Shards: []ShardProgressData{
+			{Shard: "-40", Status: state.Task.Checksumming, PercentComplete: 100, RowsCopied: 1000, RowsTotal: 1000, ChecksumRowsChecked: 250, ChecksumRowsTotal: 1000},
+			{Shard: "40-80", Status: state.Task.Pending},
+		},
+	})
+	assert.Contains(t, out, "**`orders`**: "+ui.ProgressBarRowCopy(25)+" 25%\n", "%s", out)
+	assert.Contains(t, out, "- Rows: 1,000 / 1,000 across 1 of 4 shards\n", "%s", out)
+}

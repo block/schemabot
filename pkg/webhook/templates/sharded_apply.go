@@ -612,33 +612,33 @@ func writeShardedTableLine(sb *strings.Builder, t ShardedTableStatus, budget *dd
 }
 
 // keepsShardedProgressBar reports whether a sharded table past its row copy
-// still leads with its progress bar: while its shards are working through the
-// change in different phases and have reported rows. The table's status is
-// its most pressing shard's, so one shard waiting for or cutting over would
-// otherwise speak for shards still copying or verifying; the bar holds until
-// every shard completes, and the shard list says where each one stands. When
-// every shard is in the same phase past the copy, that phase speaks for the
-// table (presentation.OnePhaseSpeaksForParts), and a
-// table with no shards listed under it keeps its phase, since nothing else
-// would say where it stands.
+// still leads with its progress bar (presentation.ShardsKeepTableBar), once
+// its shards have reported rows; the bar holds until every shard completes,
+// and the shard list says where each one stands.
 func keepsShardedProgressBar(status string, t ShardedTableStatus) bool {
-	if !state.IsInFlightTaskState(status) || t.RowsTotal <= 0 || len(t.Shards) <= 1 {
+	if t.RowsTotal <= 0 {
 		return false
 	}
 	statuses := make([]string, len(t.Shards))
 	for i, s := range t.Shards {
 		statuses[i] = s.Status
 	}
-	return !presentation.OnePhaseSpeaksForParts(statuses)
+	return presentation.ShardsKeepTableBar(status, statuses)
 }
 
 // writeShardedTablePhaseProgress renders a sharded table whose shards are past
-// or beside the row copy: the bar from the summed shard rows, held short of
-// complete since the change has not landed on every shard, and the rows line.
+// or beside the row copy: the bar across every shard the table spans, the way
+// a rollout's bar spans its targets (presentation.PercentAcrossTargets), and
+// the rows line. A shard that has not reported, whether queued or not yet
+// attached, counts as nothing, so one verified shard beside three queued ones
+// reads as a quarter done rather than nearly complete.
 func writeShardedTablePhaseProgress(sb *strings.Builder, t ShardedTableStatus, writeDDL func()) {
-	copied := ui.ClampRows(t.RowsCopied, t.RowsTotal)
-	pct := min(ui.RowCopyDisplayPercent(int(copied*100/t.RowsTotal), copied), 99)
-	fmt.Fprintf(sb, "**%s**: %s %d%%%s\n", inlineCode(t.Table), ui.ProgressBarRowCopy(pct), pct, shardedCopyCoverageSuffix(t))
+	parts := make([]presentation.Part, len(t.Shards))
+	for i, s := range t.Shards {
+		parts[i] = s.part()
+	}
+	pct := presentation.PercentAcrossTargets(parts, t.shardTotal()-len(t.Shards))
+	fmt.Fprintf(sb, "**%s**: %s %d%%\n", inlineCode(t.Table), ui.ProgressBarRowCopy(pct), pct)
 	writeDDL()
 	writeShardedRowsAndETA(sb, t)
 }

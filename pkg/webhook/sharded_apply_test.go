@@ -620,8 +620,8 @@ func TestBuildShardedApplyData_TableRollupFromTasks(t *testing.T) {
 	assert.Equal(t, "mutes", table.Table)
 	assert.Equal(t, state.Task.Running, table.Status, "the copying shard is the most attention-worthy")
 	require.Len(t, table.Shards, 3)
-	assert.Equal(t, templates.ShardProgressData{Shard: "-40", Status: state.Task.Completed, PercentComplete: 100}, table.Shards[0])
-	assert.Equal(t, templates.ShardProgressData{Shard: "40-80", Status: state.Task.Running, PercentComplete: 37}, table.Shards[1])
+	assert.Equal(t, templates.ShardProgressData{Shard: "-40", Status: state.Task.Completed, PercentComplete: 100, RowsCopied: 500000, RowsTotal: 500000}, table.Shards[0])
+	assert.Equal(t, templates.ShardProgressData{Shard: "40-80", Status: state.Task.Running, PercentComplete: 37, RowsCopied: 185000, RowsTotal: 500000}, table.Shards[1])
 	assert.Equal(t, templates.ShardProgressData{Shard: "80-", Status: state.ApplyOperation.Pending, PercentComplete: 0}, table.Shards[2],
 		"an operation without a task contributes its operation state")
 	assert.Equal(t, int64(685000), table.RowsCopied, "rows sum across the shards that have reported")
@@ -1040,4 +1040,26 @@ func isShardedPlanCacheMethod(fn *ast.FuncDecl) bool {
 	}
 	ident, ok := star.X.(*ast.Ident)
 	return ok && ident.Name == "shardedPlanCache"
+}
+
+// A shard's stored copy and verify figures reach the comment's shard list, so
+// a checksumming shard says how far its verify has got rather than only that
+// it is checksumming.
+func TestShardedTableStatusesByKeyspaceCarriesEachShardsCopyAndVerifyFigures(t *testing.T) {
+	ops := []*storage.ApplyOperation{
+		{ID: 1, OperationKey: "ks/-80/orders", State: state.ApplyOperation.Running},
+		{ID: 2, OperationKey: "ks/80-/orders", State: state.ApplyOperation.Running},
+	}
+	tasksByOp := map[int64][]*storage.Task{
+		1: {{State: state.Task.Checksumming, ProgressPercent: 100, RowsCopied: 1000, RowsTotal: 1000, ChecksumRowsChecked: 250, ChecksumRowsTotal: 1000}},
+		2: {{State: state.Task.Running, ProgressPercent: 50, RowsCopied: 500, RowsTotal: 1000}},
+	}
+
+	tables := shardedTableStatusesByKeyspace(ops, tasksByOp, nil)["ks"]
+
+	require.Len(t, tables, 1)
+	assert.Equal(t, []templates.ShardProgressData{
+		{Shard: "-80", Status: state.Task.Checksumming, PercentComplete: 100, RowsCopied: 1000, RowsTotal: 1000, ChecksumRowsChecked: 250, ChecksumRowsTotal: 1000},
+		{Shard: "80-", Status: state.Task.Running, PercentComplete: 50, RowsCopied: 500, RowsTotal: 1000},
+	}, tables[0].Shards)
 }

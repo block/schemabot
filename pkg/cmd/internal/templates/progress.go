@@ -500,6 +500,9 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 	if isNotStartedAcrossTargets(t) {
 		return formatNotStartedAcrossTargets(t)
 	}
+	if keepsShardedBar(t) {
+		return formatShardedPhaseProgress(t)
+	}
 
 	var b strings.Builder
 

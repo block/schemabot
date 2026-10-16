@@ -36,6 +36,42 @@ func formatTableParts(t TableProgress) string {
 	return formatPartProgress(t.Shards, presentation.ShardNoun, presentation.PendingQueued)
 }
 
+// keepsShardedBar reports whether a sharded table past its row copy still
+// leads with its bar across its shards (presentation.ShardsKeepTableBar), once
+// its shards have reported rows, as the PR comment's does.
+func keepsShardedBar(t TableProgress) bool {
+	if t.AcrossTargets || t.RowsTotal <= 0 {
+		return false
+	}
+	statuses := make([]string, len(t.Shards))
+	for i, s := range t.Shards {
+		statuses[i] = s.Status
+	}
+	return presentation.ShardsKeepTableBar(t.Status, statuses)
+}
+
+// formatShardedPhaseProgress renders a sharded table that keeps its bar
+// (keepsShardedBar): the bar across every shard the table spans
+// (presentation.PercentAcrossTargets), counting a shard that has not reported
+// as nothing, then the rows line and each shard's line.
+func formatShardedPhaseProgress(t TableProgress) string {
+	parts := make([]presentation.Part, len(t.Shards))
+	for i, s := range t.Shards {
+		parts[i] = shardPart(s)
+	}
+	pct := presentation.PercentAcrossTargets(parts, shardTotal(t)-len(t.Shards))
+	var b strings.Builder
+	writeTableLine(&b, t, "%s %d%%%s", ui.ProgressBarRowCopy(pct), pct, throttledSuffix(t))
+	if t.DDL != "" {
+		b.WriteString(formatTableDDL(t))
+	}
+	writeStructuredRowsAndETA(&b, t)
+	writeThrottleTooltip(&b, t)
+	b.WriteString("\n")
+	b.WriteString(formatTableParts(t))
+	return b.String()
+}
+
 // listsTargets reports whether a table across a rollout's targets lists them
 // one per line under it (presentation.ListsTargets), decided by where each
 // target stands rather than by the table's rolled-up status.

@@ -698,7 +698,7 @@ func TestFormatTargetRollup_TableCountsItsTargets(t *testing.T) {
 		"one in its revert window and one queued": {
 			targets: []rolloutTarget{{opState: state.ApplyOperation.RevertWindow, status: state.Task.RevertWindow, rowsCopied: 1000, rowsTotal: 1000}, queuedWithRow},
 			line:    "~ orders: " + ui.ProgressBarRowCopy(50) + " 50%\n",
-			counts:  "• Targets: 2 (1 revert window open, 1 queued)\n           ✓ payments-001: revert window open\n           ○ payments-002: queued\n",
+			counts:  "• Targets: 2 (1 revert window open, 1 queued)\n           ● payments-001: revert window open\n           ○ payments-002: queued\n",
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -989,5 +989,37 @@ func TestWriteProgress_SettledRolloutTableReadsNotStarted(t *testing.T) {
 		assert.Contains(t, out, "orders: "+ui.ProgressBarRowCopy(50)+" 50%\n", out)
 		assert.Contains(t, out, "○ payments-002: queued\n", out)
 		assert.NotContains(t, out, "not started", out)
+	})
+}
+
+// A target that has reported no table progress counts toward a rolled-up
+// table at where its operation stands, the way the PR comment counts it: one
+// that failed before reporting is listed as failed and counts as no progress
+// in the bar, and one that stopped before reporting halts the table rather
+// than leaving it complete. A target working without its rows reported is
+// left out of the rows line, which says so.
+func TestFormatTargetRollup_UnreportedTargetCountsAtItsOperationState(t *testing.T) {
+	t.Run("failed before reporting", func(t *testing.T) {
+		out := renderRollout(t, targetRolloutData([]rolloutTarget{
+			completedTarget(), copyingTarget(400),
+			{opState: state.ApplyOperation.Failed, err: "Error 1045: Access denied"},
+			{opState: state.ApplyOperation.Pending},
+		}))
+		assert.Contains(t, out, "~ orders: "+ui.ProgressBarRowCopy(35)+" 35%\n", "a completed target and 40%% of another across four targets:\n%s", out)
+		assert.Contains(t, out, "• Rows: 1,400 / 2,000 across 2 of 4 targets")
+		assert.Contains(t, out, "✗ payments-003: failed\n           ○ payments-004: queued\n")
+	})
+	t.Run("stopped before reporting", func(t *testing.T) {
+		out := renderRollout(t, targetRolloutData([]rolloutTarget{completedTarget(), {opState: state.ApplyOperation.Stopped}}))
+		assert.Contains(t, out, "~ orders: ⏹️ Stopped\n", "%s", out)
+		assert.NotContains(t, out, "Complete", "%s", out)
+		assert.Contains(t, out, "✓ payments-001: 1,000 rows\n           ○ payments-002: stopped\n")
+	})
+	t.Run("working without its rows reported", func(t *testing.T) {
+		out := renderRollout(t, targetRolloutData([]rolloutTarget{
+			copyingTarget(500), {opState: state.ApplyOperation.Running, status: state.Task.Running},
+		}))
+		assert.Contains(t, out, "~ orders: "+ui.ProgressBarRowCopy(25)+" 25%\n", "%s", out)
+		assert.Contains(t, out, "• Rows: 500 / 1,000 across 1 of 2 targets")
 	})
 }

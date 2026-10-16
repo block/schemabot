@@ -235,6 +235,9 @@ func ParseProgressResponse(result *apitypes.ProgressResponse) ProgressData {
 				ETASeconds:      sh.ETASeconds,
 				PercentComplete: pct,
 				CutoverAttempts: int(sh.CutoverAttempts),
+
+				ChecksumRowsChecked: sh.ChecksumRowsChecked,
+				ChecksumRowsTotal:   sh.ChecksumRowsTotal,
 			})
 			// Table-level ETA: the table's own estimate (MySQL/Spirit), or
 			// the slowest shard's for a sharded (Vitess) table.

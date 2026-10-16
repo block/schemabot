@@ -890,6 +890,14 @@ is a floor, and the VSchema change shows its diff:
        +  "orders": {}
 ```
 
+A shard verifying its copy also carries `checksum_rows_checked` and
+`checksum_rows_total`, and its line reads
+`◉ -40: checksumming 25.00% · 250 / 1,000 rows verified`. Once the shards
+are in different phases past the copy, such as `-40` checksumming while the
+other three are queued, the table's bar spans every shard and counts a shard
+that has not reported as nothing, so `orders` reads 25% rather than the
+started shard's own figure.
+
 </details>
 
 <details>
