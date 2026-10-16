@@ -1545,7 +1545,9 @@ type ApplyOperationStore interface {
 	//
 	// owner identifies the claiming driver and is required; it is recorded as
 	// the operation's lease owner. Returns the claimed row, or nil if nothing
-	// needs work.
+	// needs work. A row claimed from pending or stopped is returned with the
+	// state it was claimed from, which is how the caller tells a claim that
+	// starts an operation from a retry or a recovery.
 	FindNextApplyOperation(ctx context.Context, owner string) (*ApplyOperation, error)
 
 	// FindNextApplyOperationCutover atomically claims the next operation parked
