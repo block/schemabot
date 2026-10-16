@@ -210,7 +210,8 @@ const DefaultMaxRecvMsgBytes = 16 << 20 // 16 MiB
 //
 // Only RPCs that are safe to re-send are retried, in two budgets:
 //
-// Caller-facing reads (PullSchema, Plan, PlanDiff) get a long budget: a
+// Caller-facing reads (PullSchema, Plan, PlanDiff, CompareSchemaFileChange)
+// get a long budget: a
 // human or review workflow is waiting on the response, and a data-plane pod
 // restart or mesh drain lasts seconds — well past a sub-second budget — so
 // these ride out up to roughly fifteen seconds before surfacing UNAVAILABLE.
@@ -237,7 +238,8 @@ const retryServiceConfig = `{
 		"name": [
 			{"service": "tern.v1.Tern", "method": "PullSchema"},
 			{"service": "tern.v1.Tern", "method": "Plan"},
-			{"service": "tern.v1.Tern", "method": "PlanDiff"}
+			{"service": "tern.v1.Tern", "method": "PlanDiff"},
+			{"service": "tern.v1.Tern", "method": "CompareSchemaFileChange"}
 		],
 		"retryPolicy": {
 			"maxAttempts": 5,
@@ -289,6 +291,7 @@ func grpcMethodDeadline(fullMethod string) time.Duration {
 	case ternv1.Tern_Apply_FullMethodName,
 		ternv1.Tern_Plan_FullMethodName,
 		ternv1.Tern_PlanDiff_FullMethodName,
+		ternv1.Tern_CompareSchemaFileChange_FullMethodName,
 		ternv1.Tern_PullSchema_FullMethodName,
 		ternv1.Tern_Revert_FullMethodName,
 		ternv1.Tern_SkipRevert_FullMethodName,
@@ -419,6 +422,18 @@ func (c *GRPCClient) Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv1
 
 func (c *GRPCClient) PlanDiff(ctx context.Context, req *ternv1.PlanRequest) (*ternv1.PlanDiffResponse, error) {
 	return c.client.PlanDiff(ctx, req)
+}
+
+// CompareSchemaFileChange asks the remote data plane to compare one schema
+// file. A data plane that cannot compare files, including one that predates
+// the RPC, answers UNIMPLEMENTED, which is returned as
+// ErrCompareSchemaFileChangeUnsupported.
+func (c *GRPCClient) CompareSchemaFileChange(ctx context.Context, req *ternv1.CompareSchemaFileChangeRequest) (*ternv1.CompareSchemaFileChangeResponse, error) {
+	resp, err := c.client.CompareSchemaFileChange(ctx, req)
+	if status.Code(err) == codes.Unimplemented {
+		return nil, fmt.Errorf("remote data plane cannot compare schema files for database %s: %w: %w", req.GetDatabase(), ErrCompareSchemaFileChangeUnsupported, err)
+	}
+	return resp, err
 }
 
 func (c *GRPCClient) PullSchema(ctx context.Context, req *ternv1.PullSchemaRequest) (*ternv1.PullSchemaResponse, error) {
@@ -731,8 +746,8 @@ func (c *GRPCClient) processPendingCutoverControlRequest(ctx context.Context, ap
 		// The apply being ready says only that some member is parked. The
 		// Cutover call below goes to this drive's own remote apply, so the
 		// request is this drive's to take only when its own member is parked
-		// and it is that member's turn; every other drive leaves it pending for
-		// the member whose turn it is.
+		// and no earlier member holds it; every other drive leaves it pending
+		// for the member that may take it.
 		turn, err := operationCutoverRequestTurn(ctx, c.storage, apply, scope, controlReq)
 		if err != nil {
 			return fmt.Errorf("check cutover turn for apply %s: %w", apply.ApplyIdentifier, err)
@@ -758,7 +773,7 @@ func (c *GRPCClient) processPendingCutoverControlRequest(ctx context.Context, ap
 				return failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCutover,
 					fmt.Sprintf("cutover request was not applied because the member it was accepted for is %s", turn.blocker.State))
 			case cutoverRequestUnsettled:
-				logger.InfoContext(ctx, "pending gRPC cutover request left for the member whose turn it is", attrs...)
+				logger.InfoContext(ctx, "pending gRPC cutover request left for the member that may take it", attrs...)
 			}
 			return nil
 		}
@@ -2847,7 +2862,7 @@ func (c *GRPCClient) startStoppedTasklessRemoteApply(ctx context.Context, apply 
 // ResumeApplyOperationCutover drives a single barrier-parked apply_operation
 // through its cutover phase over the remote (gRPC) path. It is the
 // deployment-ordered counterpart to ResumeApplyOperation's copy drive: the
-// operator claims the parked operation whose turn it is and calls this to force
+// operator claims a parked operation no earlier member holds and calls this to force
 // the remote swap, while siblings stay parked. The operation's per-operation
 // remote apply id is authoritative — the drive never falls back to the parent
 // apply's external id and never writes the parent applies row directly, since
@@ -3458,12 +3473,14 @@ func shouldDispatchQueuedRemoteApply(apply *storage.Apply, scope applyTaskScope)
 	if state.IsState(dispatchState, state.Apply.Running) {
 		return true
 	}
-	// A stop catches still-pending operations before they start and moves them
-	// to stopped without a started_at; the start claim then moves the row to
-	// resuming. Such a row never ran, so it was never dispatched either, and
-	// resuming it is its first dispatch. A resuming row that had started is
-	// not: it may have reached remote Tern before its id was stored.
-	return state.IsState(dispatchState, state.Apply.Resuming) && scope.operation.StartedAt == nil
+	// A stop moves an operation with no remote id to stopped in storage alone,
+	// whether it was still pending or had been claimed but not yet dispatched,
+	// and the start claim then moves the row to resuming. Resuming it is a
+	// dispatch under the same reasoning as a running row: the deployment's
+	// key never rotates, so if an earlier dispatch did reach the data plane
+	// the data plane replays that operation rather than starting a second
+	// copy, and otherwise this attaches it for the first time.
+	return state.IsState(dispatchState, state.Apply.Resuming)
 }
 
 // undispatchedControlRequestSettlesLocally reports whether a pending stop or

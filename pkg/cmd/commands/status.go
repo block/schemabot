@@ -18,17 +18,33 @@ type StatusCmd struct {
 	Deployment  string `help:"Deployment filter"`
 	Last        string `help:"Only show applies active within this window, for example 6h or 2d; counts the latest activity on the apply or any of its deployments, so a long-running change stays listed; by default the list is bounded by --limit alone"`
 	State       string `help:"Only show applies in this state, for example running, completed, or failed_retryable; cannot be combined with --failed"`
-	Limit       int    `short:"n" help:"Maximum recent applies to show (default 20, max 1000)"`
+	Limit       int    `short:"n" help:"Maximum recent applies to show; without --state or --failed these are the finished ones, listed below every active apply (default 20, max 1000)"`
 	Failed      bool   `help:"Show only failed recent applies" name:"failed"`
+	After       string `help:"Show the page that follows this apply ID, the last one a previous page showed; repeat that page's filters"`
+	All         bool   `help:"List every matching apply, page by page; with --json the pages merge into one applies array"`
 	ExternalID  bool   `help:"Show external engine apply IDs" name:"external-id"`
 	JSON        bool   `help:"Output as JSON"`
 }
+
+// allPagesStatusLimit is the page size --all asks for when --limit is not set.
+// The server clamps it to its own cap, so a server with a lower cap still pages
+// correctly, only in more requests.
+const allPagesStatusLimit = 1000
 
 // Run executes the status command.
 func (cmd *StatusCmd) Run(g *Globals) error {
 	ep, err := resolveEndpoint(g.Endpoint, g.Profile)
 	if err != nil {
 		return err
+	}
+
+	if cmd.After != "" || cmd.All {
+		if cmd.ApplyIDArg != "" {
+			return fmt.Errorf("--after and --all page the recent applies list; drop them to show one apply")
+		}
+		if cmd.Database != "" {
+			return fmt.Errorf("--after and --all page the recent applies list; -d already shows every apply for the database")
+		}
 	}
 
 	// Mode 1: Show details for specific apply by ID
@@ -53,34 +69,98 @@ func (cmd *StatusCmd) Run(g *Globals) error {
 		}
 		last = window
 	}
-	var result *apitypes.StatusResponse
-	err = withLoading("Loading schema change status...", !cmd.JSON, func() error {
-		var loadErr error
-		result, loadErr = client.GetStatus(ep, client.StatusOptions{
-			Limit:       cmd.Limit,
-			Environment: cmd.Environment,
-			Deployment:  cmd.Deployment,
-			State:       cmd.State,
-			Failed:      cmd.Failed,
-			Last:        last,
+	opts := client.StatusOptions{
+		Limit:       cmd.Limit,
+		Environment: cmd.Environment,
+		Deployment:  cmd.Deployment,
+		State:       cmd.State,
+		Failed:      cmd.Failed,
+		Last:        last,
+		After:       cmd.After,
+	}
+	if cmd.JSON {
+		result, err := cmd.getStatus(ep, opts)
+		if err != nil {
+			return err
+		}
+		return writeJSON(result)
+	}
+	if cmd.State != "" || cmd.Failed {
+		var result *apitypes.StatusResponse
+		err = withLoading("Loading schema change status...", true, func() error {
+			var loadErr error
+			result, loadErr = cmd.getStatus(ep, opts)
+			return loadErr
 		})
-		return loadErr
+		if err != nil {
+			return err
+		}
+		templates.WriteStatusList(cmd.statusListData(result))
+		return nil
+	}
+	return cmd.showSectionedStatus(ep, opts)
+}
+
+// getStatus fetches the page opts names, or every page with --all.
+func (cmd *StatusCmd) getStatus(endpoint string, opts client.StatusOptions) (*apitypes.StatusResponse, error) {
+	var result *apitypes.StatusResponse
+	var err error
+	if cmd.All {
+		result, err = getAllStatusPages(endpoint, opts)
+	} else {
+		result, err = client.GetStatus(endpoint, opts)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if result.StartingAfter != opts.After {
+		return nil, fmt.Errorf("the server did not continue after apply %s; it predates paging, so it cannot show the next page", opts.After)
+	}
+	return result, nil
+}
+
+// showSectionedStatus renders the default view: the finished applies a page at
+// a time, below every active apply on the first page. A server that predates
+// the finished-only filter lists everything for it, so that list is rendered
+// on its own instead, in the order the server chose.
+func (cmd *StatusCmd) showSectionedStatus(endpoint string, opts client.StatusOptions) error {
+	finishedOpts := opts
+	finishedOpts.Finished = true
+	var finished, active *apitypes.StatusResponse
+	err := withLoading("Loading schema change status...", true, func() error {
+		var loadErr error
+		finished, loadErr = cmd.getStatus(endpoint, finishedOpts)
+		if loadErr != nil || finished.Active == nil || cmd.After != "" {
+			return loadErr
+		}
+		activeOpts := opts
+		activeOpts.Active = true
+		activeOpts.Limit = allPagesStatusLimit
+		active, loadErr = client.GetStatus(endpoint, activeOpts)
+		if loadErr != nil {
+			return fmt.Errorf("fetch active schema changes: %w", loadErr)
+		}
+		return nil
 	})
 	if err != nil {
 		return err
 	}
-
-	if cmd.JSON {
-		return writeJSON(result)
+	data := cmd.statusListData(finished)
+	if finished.Active == nil {
+		templates.WriteStatusList(data)
+		return nil
 	}
-
-	// Convert to template format
-	applies := make([]templates.ActiveApplyData, 0, len(result.Applies))
-	for _, a := range result.Applies {
-		applies = append(applies, activeApplyDataFromResponse(a))
+	data.Sectioned = true
+	if active != nil {
+		data.Active = activeApplyDataFromResponses(active.Applies)
+		data.ActiveHasMore = active.HasMore
 	}
+	templates.WriteStatusList(data)
+	return nil
+}
 
-	templates.WriteStatusList(templates.StatusListData{
+func (cmd *StatusCmd) statusListData(result *apitypes.StatusResponse) templates.StatusListData {
+	return templates.StatusListData{
 		ActiveCount:    result.ActiveCount,
 		Limit:          result.Limit,
 		MaxLimit:       result.MaxLimit,
@@ -91,10 +171,53 @@ func (cmd *StatusCmd) Run(g *Globals) error {
 		StateCounts:    result.StateCounts,
 		ShowExternalID: cmd.ExternalID,
 		Deployment:     cmd.Deployment,
-		Applies:        applies,
-	})
+		Continued:      cmd.After != "",
+		Applies:        activeApplyDataFromResponses(result.Applies),
+	}
+}
 
-	return nil
+func activeApplyDataFromResponses(responses []*apitypes.ActiveApplyResponse) []templates.ActiveApplyData {
+	applies := make([]templates.ActiveApplyData, 0, len(responses))
+	for _, a := range responses {
+		applies = append(applies, activeApplyDataFromResponse(a))
+	}
+	return applies
+}
+
+// getAllStatusPages fetches the first page for opts and requests each next
+// page after the last apply of the one before, until the server reports no
+// more, merging every page into one response. The list is ordered by when each
+// apply was created, which never changes, so the walk lists exactly once every
+// apply that matches the filters throughout it. One created during the walk
+// lands above the first page and is not listed, and one whose state moves into
+// or out of a state filter mid-walk is listed only if the move happens before
+// the walk reaches it. State counts are the first page's: every
+// page counts the same filter, and the first count is the one taken before the
+// walk, so they can disagree with the merged list if applies change state
+// during it.
+func getAllStatusPages(endpoint string, opts client.StatusOptions) (*apitypes.StatusResponse, error) {
+	if opts.Limit == 0 {
+		opts.Limit = allPagesStatusLimit
+	}
+	merged, err := client.GetStatus(endpoint, opts)
+	if err != nil {
+		return nil, err
+	}
+	page := merged
+	for page.HasMore && len(page.Applies) > 0 {
+		opts.After = page.Applies[len(page.Applies)-1].ApplyID
+		page, err = client.GetStatus(endpoint, opts)
+		if err != nil {
+			return nil, fmt.Errorf("fetch the status page after apply %s: %w", opts.After, err)
+		}
+		if page.StartingAfter != opts.After {
+			return nil, fmt.Errorf("the server did not continue after apply %s; it predates paging, so --all cannot list every apply", opts.After)
+		}
+		merged.Applies = append(merged.Applies, page.Applies...)
+		merged.ActiveCount += page.ActiveCount
+	}
+	merged.HasMore = false
+	return merged, nil
 }
 
 func activeApplyDataFromResponse(a *apitypes.ActiveApplyResponse) templates.ActiveApplyData {

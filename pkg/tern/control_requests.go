@@ -79,7 +79,12 @@ func completePendingStopControlRequest(ctx context.Context, store storage.Storag
 	if err := SettlePendingCutoverAfterStop(ctx, store, logger, apply); err != nil {
 		return fmt.Errorf("settle the cutover superseded by stop before completing the stop request for apply %s: %w", apply.ApplyIdentifier, err)
 	}
-	return markPendingControlRequestCompleted(ctx, store, apply, storage.ControlOperationStop)
+	if err := markPendingControlRequestCompleted(ctx, store, apply, storage.ControlOperationStop); err != nil {
+		return err
+	}
+	logger.InfoContext(ctx, "completed pending stop request",
+		append(apply.LogAttrs(), "requested_by", controlRequestCaller(stopReq))...)
+	return nil
 }
 
 // markPendingControlRequestCompleted writes the completion of the apply's
@@ -102,18 +107,26 @@ func markPendingControlRequestCompleted(ctx context.Context, store storage.Stora
 	return nil
 }
 
-// settlePendingRequestsForTerminalApply settles the pending control requests
+// SettlePendingRequestsForTerminalApply settles the pending control requests
 // that a terminal apply moots: a pending stop is settled (the apply can no
-// longer be stopped). Sweeping the mooted requests keeps a request issued
-// moments before the apply settled — or one that lost to a contradictory
-// command — from lingering pending forever.
+// longer be stopped), and a pending release completes, keeping its latch.
+// Sweeping the mooted requests keeps a request issued moments before the apply
+// settled — or one that lost to a contradictory command — from lingering
+// pending forever.
 //
 // A pending cutover, cancel, revert, and skip-revert are settled rather than
 // completed outright: the terminal state decides whether the operator's command
 // took effect (CO-2). A pending cancel is mooted by every terminal state except
 // stopped, since a stopped apply remains cancellable and its pending cancel
 // stays deliverable for the next drive.
-func settlePendingRequestsForTerminalApply(ctx context.Context, store storage.Storage, logger *slog.Logger, apply *storage.Apply) error {
+//
+// This is the one terminal sweep: the drive tail runs it on the apply it just
+// settled, and the operator's post-drive settlement and the stranded control
+// request reaper run it on a reloaded terminal apply, so a request a drive
+// failed to settle is answered the same way whichever path reaches it.
+//
+// The caller must have established that the apply is terminal.
+func SettlePendingRequestsForTerminalApply(ctx context.Context, store storage.Storage, logger *slog.Logger, apply *storage.Apply) error {
 	if err := completePendingStopControlRequest(ctx, store, logger, apply); err != nil {
 		return err
 	}
@@ -121,9 +134,22 @@ func settlePendingRequestsForTerminalApply(ctx context.Context, store storage.St
 	// previous release; no driver services it anymore, so this sweep is its
 	// only settlement path.
 	for _, op := range storage.RetiredControlOperations() {
+		controlReq, err := pendingControlRequest(ctx, store, apply, op)
+		if err != nil {
+			return err
+		}
+		if controlReq == nil {
+			logger.DebugContext(ctx, "no pending control request of this operation to settle", append(apply.LogAttrs(), "operation", op)...)
+			continue
+		}
+		logger.InfoContext(ctx, "completing pending control request the terminal apply moots",
+			append(apply.LogAttrs(), "operation", op, "requested_by", controlRequestCaller(controlReq))...)
 		if err := completePendingControlRequests(ctx, store, apply, op); err != nil {
 			return err
 		}
+	}
+	if err := completePendingReleaseForTerminalApply(ctx, store, logger, apply); err != nil {
+		return err
 	}
 	// Requests settled against the outcome the apply reached.
 	if err := SettlePendingCutoverForResolvedApply(ctx, store, logger, apply); err != nil {
@@ -133,6 +159,29 @@ func settlePendingRequestsForTerminalApply(ctx context.Context, store storage.St
 		return err
 	}
 	return SettlePendingCancelForResolvedApply(ctx, store, logger, apply)
+}
+
+// completePendingReleaseForTerminalApply completes a release still pending
+// once the apply is terminal. A release is accepted only on a paused apply and
+// no drive consumes it: its pending row is the latch the claim ordering reads
+// while the rollout runs, so without this it stays pending after the apply
+// settles. A completed release latches exactly as a pending one does (see
+// storage.ApplyControlRequest.ReleasesPausedRollout), so completing it leaves
+// the rollout released and only answers the command.
+//
+// The caller must have established that the apply is terminal.
+func completePendingReleaseForTerminalApply(ctx context.Context, store storage.Storage, logger *slog.Logger, apply *storage.Apply) error {
+	controlReq, err := pendingControlRequest(ctx, store, apply, storage.ControlOperationRelease)
+	if err != nil {
+		return err
+	}
+	if controlReq == nil {
+		logger.DebugContext(ctx, "no pending release request to complete", apply.LogAttrs()...)
+		return nil
+	}
+	logger.InfoContext(ctx, "completing pending release request for terminal apply; the rollout stays released",
+		append(apply.LogAttrs(), "requested_by", controlRequestCaller(controlReq))...)
+	return completePendingControlRequests(ctx, store, apply, storage.ControlOperationRelease)
 }
 
 // SettlePendingRevertPhaseForResolvedApply answers the pending revert and
@@ -389,7 +438,7 @@ func cutoverNotAppliedMessage(applyState string) string {
 // requests stay pending for the operator's post-drive settlement, and an
 // operator can re-issue one; a summary that never posts has no such recovery.
 func (c *LocalClient) settleRequestsForStoredOutcome(ctx context.Context, logger *slog.Logger, apply *storage.Apply) {
-	if err := settlePendingRequestsForTerminalApply(ctx, c.storage, c.logger, apply); err != nil {
+	if err := SettlePendingRequestsForTerminalApply(ctx, c.storage, c.logger, apply); err != nil {
 		logger.Warn("failed to settle pending control requests for the stored terminal outcome; they stay pending for the operator's post-drive settlement and the terminal summary still posts",
 			"state", apply.State, "error", err)
 	}

@@ -7871,9 +7871,10 @@ func TestGRPCClient_QueuedRemoteDispatchPredicate(t *testing.T) {
 // claimed operation reaches dispatch in running with no per-operation remote id
 // yet. That first dispatch must proceed — a running operation with an empty
 // remote id is not the ambiguous crash case the whole-apply path rejects. A
-// stop that catches an operation before it starts leaves it with no started_at,
-// so the start that resumes it is its first dispatch too; a resuming operation
-// that had started may already exist remotely and is not redispatched.
+// stop settles an operation with no remote id in storage alone, whether or not
+// it had been claimed, so the start that resumes it dispatches it under the
+// deployment's unchanged key: a dispatch that had reached the data plane is
+// replayed there rather than duplicated.
 func TestGRPCClient_QueuedRemoteDispatchPredicate_OperationScope(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -7885,7 +7886,7 @@ func TestGRPCClient_QueuedRemoteDispatchPredicate_OperationScope(t *testing.T) {
 	}{
 		{name: "multi-op running without remote id dispatches", opState: state.ApplyOperation.Running, multiOp: true, want: true},
 		{name: "multi-op resuming that never started dispatches", opState: state.ApplyOperation.Resuming, multiOp: true, want: true},
-		{name: "multi-op resuming that started without remote id does not dispatch", opState: state.ApplyOperation.Resuming, started: true, multiOp: true, want: false},
+		{name: "multi-op resuming that was claimed before its stop dispatches", opState: state.ApplyOperation.Resuming, started: true, multiOp: true, want: true},
 		{name: "multi-op resuming with remote id does not dispatch", opState: state.ApplyOperation.Resuming, remoteID: "remote-apply-123", multiOp: true, want: false},
 		{name: "multi-op pending without remote id dispatches", opState: state.ApplyOperation.Pending, multiOp: true, want: true},
 		{name: "multi-op running with remote id does not dispatch", opState: state.ApplyOperation.Running, remoteID: "remote-apply-123", multiOp: true, want: false},
@@ -10607,13 +10608,14 @@ func TestDefaultRPCDeadlineEndsAHungCall(t *testing.T) {
 // bound would cut its legitimate work off.
 func TestGRPCMethodDeadlineCoversEveryTernRPC(t *testing.T) {
 	heavy := map[string]bool{
-		ternv1.Tern_Apply_FullMethodName:             true,
-		ternv1.Tern_Plan_FullMethodName:              true,
-		ternv1.Tern_PlanDiff_FullMethodName:          true,
-		ternv1.Tern_PullSchema_FullMethodName:        true,
-		ternv1.Tern_Revert_FullMethodName:            true,
-		ternv1.Tern_SkipRevert_FullMethodName:        true,
-		ternv1.Tern_StorageSchemaPlan_FullMethodName: true,
+		ternv1.Tern_Apply_FullMethodName:                   true,
+		ternv1.Tern_Plan_FullMethodName:                    true,
+		ternv1.Tern_PlanDiff_FullMethodName:                true,
+		ternv1.Tern_CompareSchemaFileChange_FullMethodName: true,
+		ternv1.Tern_PullSchema_FullMethodName:              true,
+		ternv1.Tern_Revert_FullMethodName:                  true,
+		ternv1.Tern_SkipRevert_FullMethodName:              true,
+		ternv1.Tern_StorageSchemaPlan_FullMethodName:       true,
 	}
 	control := map[string]bool{
 		ternv1.Tern_Progress_FullMethodName: true,

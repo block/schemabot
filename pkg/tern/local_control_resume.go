@@ -1239,12 +1239,17 @@ func sameApplyOperation(a, b *int64) bool {
 // pending tasks remain queued behind the retried work. A requeue write that
 // does not land is returned: the task row is still failed_retryable, so driving
 // on would run its DDL while storage records it at rest. The caller exits the
-// drive with the apply still retryable, and the next claim retries the requeue.
+// drive with the apply still claimable, and the next claim retries the requeue.
+//
+// The requeue is keyed on each task row, not on the apply: a conflict check can
+// settle a stale task failed_retryable while its apply is still running, and
+// the drive that reclaims that apply re-runs the task as a retry all the same,
+// counted as an attempt and without the earlier failure's reason. Only the
+// apply's own retryable pause carries an apply-level reason to clear.
 func (c *LocalClient) prepareRetryableTasksForResume(ctx context.Context, apply *storage.Apply, tasks []*storage.Task) error {
-	if !state.IsState(apply.State, state.Apply.FailedRetryable) {
-		return nil
+	if state.IsState(apply.State, state.Apply.FailedRetryable) {
+		apply.ErrorMessage = ""
 	}
-	apply.ErrorMessage = ""
 	for _, task := range tasks {
 		if !state.IsState(task.State, state.Task.FailedRetryable) {
 			continue

@@ -225,38 +225,53 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 		return nil, fmt.Errorf("plan PostgreSQL database %q: DSN credentials are required", req.Database)
 	}
 
-	caPath, err := caCertPath(req.Credentials)
+	pool, closePool, err := openTargetPool(ctx, req.Credentials)
 	if err != nil {
 		return nil, fmt.Errorf("plan PostgreSQL database %q: %w", req.Database, err)
+	}
+	defer closePool()
+	return planSchemas(ctx, pool, req, e.tableSizeLimit, e.tableOwner)
+}
+
+// openTargetPool opens the pg-sprite pool one engine operation runs on.
+// Before it, it verifies the target through the SchemaBot-managed connection
+// path, including its transport policy, and adapts the same normalized DSN to
+// pg-sprite's pool API. Errors do not name the database or the operation;
+// the caller wraps them with both. The returned close releases the pool and
+// the validation connection.
+func openTargetPool(ctx context.Context, creds *engine.Credentials) (*pgxpool.Pool, func(), error) {
+	caPath, err := caCertPath(creds)
+	if err != nil {
+		return nil, nil, fmt.Errorf("resolve PostgreSQL CA certificate: %w", err)
 	}
 	validationOpts, err := validationRootCAs(caPath)
 	if err != nil {
-		return nil, fmt.Errorf("plan PostgreSQL database %q: %w", req.Database, err)
+		return nil, nil, fmt.Errorf("load PostgreSQL validation root CAs: %w", err)
 	}
-
-	// Validate the SchemaBot-managed connection path, including its transport
-	// policy, before adapting the same normalized DSN to pg-sprite's pool API.
-	db, err := postgresconn.Open(req.Credentials.DSN, validationOpts...)
+	db, err := postgresconn.Open(creds.DSN, validationOpts...)
 	if err != nil {
-		return nil, fmt.Errorf("open PostgreSQL database %q for planning: %w", req.Database, err)
+		return nil, nil, fmt.Errorf("open PostgreSQL connection: %w", err)
 	}
-	defer utils.CloseAndLog(db)
 	// Open only parsed the DSN; this ping is the first dial, so it is where the
 	// target can refuse the session and the only error worth classifying.
 	if err := db.PingContext(ctx); err != nil {
-		return nil, fmt.Errorf("ping PostgreSQL database %q for planning: %w", req.Database, targetauth.Wrap(err))
+		utils.CloseAndLog(db)
+		return nil, nil, fmt.Errorf("ping PostgreSQL target: %w", targetauth.Wrap(err))
 	}
-
-	poolCfg, err := spritePoolConfig(req.Credentials.DSN, caPath)
+	poolCfg, err := spritePoolConfig(creds.DSN, caPath)
 	if err != nil {
-		return nil, fmt.Errorf("plan PostgreSQL database %q: %w", req.Database, err)
+		utils.CloseAndLog(db)
+		return nil, nil, fmt.Errorf("build pg-sprite pool config: %w", err)
 	}
 	pool, err := dbconn.NewPool(ctx, poolCfg)
 	if err != nil {
-		return nil, fmt.Errorf("open pg-sprite pool for PostgreSQL database %q: %w", req.Database, err)
+		utils.CloseAndLog(db)
+		return nil, nil, fmt.Errorf("open pg-sprite pool: %w", err)
 	}
-	defer pool.Close()
-	return planSchemas(ctx, pool, req, e.tableSizeLimit, e.tableOwner)
+	return pool, func() {
+		pool.Close()
+		utils.CloseAndLog(db)
+	}, nil
 }
 
 func planSchemas(ctx context.Context, pool *pgxpool.Pool, req *engine.PlanRequest, tableSizeLimit int64, tableOwner string) (*engine.PlanResult, error) {
@@ -1364,6 +1379,9 @@ func executionVerdict(formatVersion int, statement pgplan.Statement, table strin
 		if statement.Cause == "" && statement.Reason == verdict.ReasonDeclarativeForeignKey {
 			return blocked(foreignKeyChangeRefusalReason(statement.Kind, table, crossNamespaceForeignKeys))
 		}
+		if statement.Kind == schemadiff.ChangeSetGeneratedExpression {
+			return blocked(generatedExpressionRefusalReason(table))
+		}
 		refused := blocked(fmt.Sprintf("statement for table %q is refused: it cannot be executed safely as written", table))
 		// An absent cause is a refusal from outside the create path and the
 		// generic sentence is the right one; only a cause the mapping has no
@@ -1452,6 +1470,18 @@ func foreignKeyChangeRefusalReason(kind schemadiff.ChangeKind, table string, cro
 		return reason
 	}
 	return fmt.Sprintf("statement for table %q changes a foreign key, %s; leave the change out of the schema file to apply the rest of the plan, then run this statement outside SchemaBot and put the change back in the file", table, unsupported)
+}
+
+// generatedExpressionRefusalReason renders the planner's refusal of a changed
+// stored generated column expression. Replacing the expression recomputes
+// every row under a lock that blocks reads and writes, and there is no online
+// path for it, so the plan shows the change and nothing runs it. The drift is
+// often a live expression the file never caught up with, so the remedy offers
+// declaring the live expression first, which plans no change. A blocked step
+// blocks the whole plan, and a new expression may use a column the same plan
+// adds, so changing it has the rest of the plan applied first.
+func generatedExpressionRefusalReason(table string) string {
+	return fmt.Sprintf("statement for table %q changes a stored generated column's expression, which rewrites every row under a lock that blocks reads and writes, so SchemaBot does not apply it; to keep the live expression, declare it in the schema file and re-plan; to change it, declare the live expression to apply the rest of the plan first, then run this statement (PostgreSQL 17 or later) outside SchemaBot through a separately reviewed process and put the new expression back in the file", table)
 }
 
 func destructiveReason(destructive bool, table string) string {
