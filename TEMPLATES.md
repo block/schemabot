@@ -5738,7 +5738,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 ```
 
-**`users`**: 🚫 Cancelled (not started)
+**`users`**: 🚫 Cancelled at 72.00%
 
 ```sql
 ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
@@ -6521,7 +6521,7 @@ schemabot start apply-a1b2c3d4e5f6 -e staging
 ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 ```
 
-**`users`** — Cancelled
+**`users`** — Cancelled at 72.00%
 ```sql
 ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```
