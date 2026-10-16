@@ -591,6 +591,52 @@ func TestResumeApply_FailureAfterTheDeployRequestLeavesTheBranchToIt(t *testing.
 	assert.Empty(t, client.deleteAttempts())
 }
 
+// pendingDeployRequestHandbackClient serves a resumable branch, creates the
+// deploy request the resume asks for while PlanetScale is still computing its
+// diff, and ends the drive at that moment, the way a handback does.
+type pendingDeployRequestHandbackClient struct {
+	resumeReclaimClient
+	cancel context.CancelFunc
+}
+
+func (c *pendingDeployRequestHandbackClient) CreateDeployRequest(context.Context, *ps.CreateDeployRequestRequest) (*ps.DeployRequest, error) {
+	c.cancel()
+	return &ps.DeployRequest{
+		Number:          42,
+		HtmlURL:         "https://app.planetscale.com/org/testdb/deploy-requests/42",
+		DeploymentState: deployState.Pending,
+	}, nil
+}
+
+func (c *pendingDeployRequestHandbackClient) GetDeployRequest(context.Context, *ps.GetDeployRequestRequest) (*ps.DeployRequest, error) {
+	return &ps.DeployRequest{Number: 42, DeploymentState: deployState.Pending}, nil
+}
+
+// A resumed drive that ends while its new deploy request is still pending has
+// already recorded that deploy request, so the driver that picks the apply up
+// next resumes it instead of opening a second deploy request on the branch.
+func TestResumeApply_RecordsTheDeployRequestBeforeWaitingOnIt(t *testing.T) {
+	shortenEngineWaits(t)
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	client := &pendingDeployRequestHandbackClient{cancel: cancel}
+	req := resumeRequest(t, &psMetadata{BranchName: "schemabot-testdb-1a2b"}, "apply-1a2b3c4d5e6f7890")
+	persisted := captureStateChanges(req)
+
+	_, err := conformanceEngine(client).resumeApply(ctx, client, "org", req)
+
+	require.ErrorIs(t, err, context.Canceled)
+	require.NotEmpty(t, *persisted, "the resume records the deploy request it opened")
+	last := (*persisted)[len(*persisted)-1]
+	assert.Equal(t, "apply-1a2b3c4d5e6f7890", last.MigrationContext)
+	meta, err := decodePSMetadata(last.Metadata)
+	require.NoError(t, err)
+	assert.Equal(t, "schemabot-testdb-1a2b", meta.BranchName)
+	assert.Equal(t, uint64(42), meta.DeployRequestID)
+	assert.Equal(t, "https://app.planetscale.com/org/testdb/deploy-requests/42", meta.DeployRequestURL)
+	assert.Empty(t, client.deleteAttempts())
+}
+
 // A cancel that lands between drives finds the branch only in the apply's
 // stored resume state: the drive that created it has exited, and the drive
 // consuming the cancel stands down before it resumes. The reclaim deletes a
