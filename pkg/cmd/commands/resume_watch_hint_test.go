@@ -10,6 +10,8 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/cmd/cliname"
+	"github.com/block/schemabot/pkg/cmd/internal/templates"
+	"github.com/block/schemabot/pkg/state"
 )
 
 // recordRoute records g's routing flags the way main does after parsing, and
@@ -132,4 +134,39 @@ func TestDetachedView_ReattachNamesEnvironment(t *testing.T) {
 
 	assert.Contains(t, view, "To reattach: schemabot progress apply-7c2e -e production --profile prod\n")
 	assert.Contains(t, view, "To stop:     schemabot stop -e production apply-7c2e --profile prod\n")
+}
+
+// An operator watching a production apply through an explicit profile sees
+// it stop or wait for cutover. Each command the footer offers carries the
+// profile, so pasting it acts on the apply on that control plane.
+func TestWatchFooter_ControlHintsCarryRouting(t *testing.T) {
+	recordRoute(t, Globals{Profile: "prod"})
+	render := func(applyState, taskState string) string {
+		m := NewWatchModel("http://schemabot.test", "orders", "production", false)
+		m.applyID = "apply-7c2e"
+		updated, _ := m.Update(progressMsg{
+			state:  applyState,
+			tables: []templates.TableProgress{{TableName: "users", Status: taskState, PercentComplete: 40}},
+		})
+		return updated.(WatchModel).View()
+	}
+
+	assert.Contains(t, render(state.Apply.Stopped, state.Task.Stopped), "Use 'schemabot start -e production apply-7c2e --profile prod' to resume.\n")
+	assert.Contains(t, render(state.Apply.WaitingForCutover, state.Task.WaitingForCutover), "To proceed: schemabot cutover -e production apply-7c2e --profile prod\n")
+
+	m := NewWatchModel("http://schemabot.test", "orders", "production", false)
+	m.applyID = "apply-7c2e"
+	assert.Equal(t, "  schemabot status apply-7c2e -e production --profile prod", m.statusCommand())
+}
+
+// Stopping an apply through an explicit endpoint prints a resume command that
+// returns to the server holding the checkpoint.
+func TestStopSuccess_ResumeHintCarriesRouting(t *testing.T) {
+	recordRoute(t, Globals{Endpoint: "https://schemabot.example/api"})
+
+	out := captureStdout(func() {
+		templates.WriteStopSuccess(templates.StopData{Database: "orders", Environment: "production", ApplyID: "apply-7c2e"})
+	})
+
+	assert.Contains(t, out, "Use 'schemabot start -e production apply-7c2e --endpoint https://schemabot.example/api' to resume.")
 }

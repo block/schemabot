@@ -173,7 +173,7 @@ func WriteRolloutApplyRefused(noun presentation.Noun, refused []*apitypes.PlanMe
 	fmt.Println()
 	shownReruns := min(len(reruns), memberNamesInlineLimit)
 	for _, rerun := range reruns[:shownReruns] {
-		fmt.Printf("  %s %s\n", cliname.Name(), rerun)
+		fmt.Printf("  %s\n", cliname.Command(rerun))
 	}
 	if rest := len(reruns) - shownReruns; rest > 0 {
 		fmt.Printf("  and the same for %d more %s\n", rest, noun.Plural)

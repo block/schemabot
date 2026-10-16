@@ -599,9 +599,9 @@ func (cmd *ApplyCmd) refuseActiveSchemaChange(database string, check func() (*cl
 	fmt.Println(stateMsg)
 	fmt.Println()
 	if state.IsState(active.State, state.Apply.WaitingForDeploy, state.Apply.WaitingForCutover) {
-		fmt.Printf("To trigger cutover:  %s cutover -e %s %s\n", cliname.Name(), cmd.Environment, active.ApplyID)
+		fmt.Printf("To trigger cutover:  %s\n", cliname.Command("cutover", "-e", cmd.Environment, active.ApplyID))
 	}
-	fmt.Printf("To watch and manage: %s status %s\n", cliname.Name(), active.ApplyID)
+	fmt.Printf("To watch and manage: %s\n", cliname.Command("status", active.ApplyID))
 	return fmt.Errorf("schema change already in progress")
 }
 
@@ -673,7 +673,7 @@ func rolloutRefusalSummary(refused []*apitypes.PlanMemberRefusalResponse, enviro
 			entries = append(entries, fmt.Sprintf("%s (%s; no apply runs it, so change the schema files)", r.Member, r.Detail))
 			continue
 		}
-		entries = append(entries, fmt.Sprintf("%s (%s; run it with: %s %s)", r.Member, r.Detail, cliname.Name(), narrowedApplyRerun(r, environment, schemaDir)))
+		entries = append(entries, fmt.Sprintf("%s (%s; run it with: %s)", r.Member, r.Detail, cliname.Command(narrowedApplyRerun(r, environment, schemaDir))))
 	}
 	return strings.Join(entries, "; ")
 }
@@ -1045,7 +1045,7 @@ func watchApplyProgressLog(poller *progressPoller, heartbeatInterval time.Durati
 			case state.IsState(curState, state.Apply.RevertWindow):
 				revertWindowStart = time.Now()
 				lastRevertHeartbeat = time.Now()
-				log.emit("msg", fmt.Sprintf("Revert window open — run '%s revert' to undo or '%s skip-revert' to finalize", cliname.Name(), cliname.Name()))
+				log.emit("msg", fmt.Sprintf("Revert window open — run '%s' to undo or '%s' to finalize", cliname.Command("revert"), cliname.Command("skip-revert")))
 			}
 			lastGlobalState = globalNorm
 		}
