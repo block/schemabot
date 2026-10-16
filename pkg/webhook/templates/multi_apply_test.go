@@ -878,9 +878,11 @@ func TestRenderMultiDeploymentApplyComment_RolledUpTableSizeTotalsTheTargets(t *
 // A target that has not reported its copy yet counts toward the table's rows
 // by the plan's estimate, so the total spans every target from the start. The
 // estimate makes the total approximate, and the ETA a floor, since the queued
-// target's copy is still ahead. The bar stays each target's share of the
-// table, which counts a queued target as nothing yet. Before any target starts, the table shows the
-// estimate summed across them.
+// target's copy is still ahead. The bar is the rows copied over that total,
+// so it does not read the target already copying as most of the work, and it
+// leads from the copy's start, at 0% with the total ahead, and each target
+// still to run stays queued with its own estimate beside it. Before any
+// target starts, the table shows the estimate summed across them.
 func TestRenderMultiDeploymentApplyComment_QueuedTargetsCountByPlannedRows(t *testing.T) {
 	queued := func(database string, rows int64) *ApplyStatusCommentData {
 		detail := targetDetail(database, state.Task.Pending, addNote, 0)
@@ -900,7 +902,7 @@ func TestRenderMultiDeploymentApplyComment_QueuedTargetsCountByPlannedRows(t *te
 		queued("testapp_002", 1_200),
 		queued("testapp_003", 1_800),
 	)
-	assert.Contains(t, out, "**`orders`**: "+ui.ProgressBarRowCopy(16)+" 16%\n")
+	assert.Contains(t, out, "**`orders`**: "+ui.ProgressBarRowCopy(12)+" 12%\n")
 	assert.Contains(t, out, "- Rows: 500 / ~4k · ETA: ≥ "+ui.FormatETA(500)+"\n")
 
 	ops[0].State = so.Pending
@@ -910,6 +912,14 @@ func TestRenderMultiDeploymentApplyComment_QueuedTargetsCountByPlannedRows(t *te
 		queued("testapp_003", 1_800),
 	)
 	assert.Contains(t, out, "- Rows: ~4k across 3 targets\n")
+
+	ops[0].State = so.Running
+	started := targetDetail("testapp_001", state.Task.Running, addNote, 0)
+	started.Tables[0].RowsCopied, started.Tables[0].ETASeconds = 0, 0
+	out = renderTargets(presentation.Derive(ops), started, queued("testapp_002", 1_200), queued("testapp_003", 1_800))
+	assert.Contains(t, out, "**`orders`**: "+ui.ProgressBarRowCopy(0)+" 0%\n", "the copy has started, so the bar leads with the rows ahead")
+	assert.Contains(t, out, "- Rows: 0 / ~4k\n")
+	assert.Contains(t, out, "  - ○ `testapp-002`: queued · ~1.2k rows\n  - ○ `testapp-003`: queued · ~1.8k rows\n", "a target still to run stays queued and says how much it will copy")
 }
 
 // A target past its copy that reports no rows copied an empty table, so its

@@ -758,9 +758,9 @@ func TestFormatTargetRollup_TableCountsItsTargets(t *testing.T) {
 
 // A queued target counts toward the table's rows by the plan's estimate, so
 // the total spans every target from the start instead of reading the one
-// copying target's rows as the table's. The estimate makes the total
-// approximate and the ETA a floor. The bar stays each target's share of the
-// table, which counts a queued target as nothing yet. Before any target
+// copying target's rows as the table's. The bar is the rows copied over that
+// total, and it leads from the copy's start, at 0% with the total ahead. The
+// estimate makes the total approximate and the ETA a floor. Before any target
 // starts, the table shows the estimate summed across its targets.
 func TestFormatTargetRollup_QueuedTargetsCountByPlannedRows(t *testing.T) {
 	queued := func(rows int64) rolloutTarget {
@@ -768,11 +768,21 @@ func TestFormatTargetRollup_QueuedTargetsCountByPlannedRows(t *testing.T) {
 	}
 
 	out := renderRollout(t, targetRolloutData([]rolloutTarget{copyingTarget(500), queued(1_200), queued(1_800)}))
-	assert.Contains(t, out, "~ orders: "+ui.ProgressBarRowCopy(16)+" 16%\n", "%s", out)
+	assert.Contains(t, out, "~ orders: "+ui.ProgressBarRowCopy(12)+" 12%\n", "%s", out)
 	assert.Contains(t, out, "Rows: 500 / ~4k · ETA: ≥ "+ui.FormatETA(120)+"\n", "%s", out)
 
 	out = renderRollout(t, targetRolloutData([]rolloutTarget{queued(1_000), queued(1_200), queued(1_800)}))
 	assert.Contains(t, out, "Rows: ~4k across 3 targets\n", "%s", out)
+
+	// Once the copy starts, the bar leads at 0% with the rows ahead, before
+	// any row moves and before the first target reports its total. A target
+	// still to run stays queued and says how much it will copy.
+	started := rolloutTarget{opState: state.ApplyOperation.Running, status: state.Task.Running, estimatedRows: new(int64(1_000))}
+	out = renderRollout(t, targetRolloutData([]rolloutTarget{started, queued(1_200), queued(1_800)}))
+	assert.Contains(t, out, "~ orders: "+ui.ProgressBarRowCopy(0)+" 0%\n", "%s", out)
+	assert.Contains(t, out, "Rows: 0 / ~4k\n", "%s", out)
+	assert.Contains(t, out, "○ payments-002: queued · ~1.2k rows\n", "%s", out)
+	assert.Contains(t, out, "○ payments-003: queued · ~1.8k rows\n", "%s", out)
 
 	// Each target copies its own data, so the planned size is summed across
 	// the targets like the rows, and only while every target carries one.

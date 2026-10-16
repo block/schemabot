@@ -139,10 +139,11 @@ type ShardProgress struct {
 	// target's verify has got, once its engine reports a total.
 	ChecksumRowsChecked int64
 	ChecksumRowsTotal   int64
-	// RowsEstimated marks a target in a table rolled up across targets whose
-	// copy is still ahead: the plan's row estimate stands in for its rows in
-	// the rolled-up total (TableProgress.RowsTotalPlanned).
-	RowsEstimated bool
+	// PlannedRows is the plan's row estimate for a target in a table rolled up
+	// across targets whose copy is still ahead and has reported no row total,
+	// standing in for its rows in the rolled-up total
+	// (TableProgress.RowsTotalPlanned). Nil otherwise.
+	PlannedRows *int64
 }
 
 // Display-only task states. These are not persisted apply states (see pkg/applystate)

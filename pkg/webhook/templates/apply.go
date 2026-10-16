@@ -123,6 +123,10 @@ type ShardProgressData struct {
 	// member's verify has got, once its engine reports a total.
 	ChecksumRowsChecked int64
 	ChecksumRowsTotal   int64
+	// PlannedRows is the plan's row estimate for a member whose copy is still
+	// ahead with no total reported, so a queued target says how much it will
+	// copy.
+	PlannedRows *int64
 }
 
 // part is the shard or target as the shared part listing reads it.
@@ -130,6 +134,7 @@ func (m ShardProgressData) part() presentation.Part {
 	return presentation.Part{
 		Name: m.Shard, Status: m.Status, PercentComplete: m.PercentComplete, RowsCopied: m.RowsCopied, RowsTotal: m.RowsTotal,
 		ChecksumRowsChecked: m.ChecksumRowsChecked, ChecksumRowsTotal: m.ChecksumRowsTotal,
+		PlannedRows: m.PlannedRows,
 	}
 }
 

@@ -139,11 +139,13 @@ func targetUnreported(data MultiDeploymentApplyData, i int) bool {
 // targetStrip is a table line's targets, each with its progress on the table,
 // for the per-target strip under the line.
 func targetStrip(cells []TableProgressData, targets []string) []ShardProgressData {
+	parts := targetParts(cells)
 	strip := make([]ShardProgressData, len(cells))
 	for i, c := range cells {
 		strip[i] = ShardProgressData{
 			Shard: targets[i], Status: c.Status, PercentComplete: c.PercentComplete, RowsCopied: c.RowsCopied, RowsTotal: c.RowsTotal,
 			ChecksumRowsChecked: c.ChecksumRowsChecked, ChecksumRowsTotal: c.ChecksumRowsTotal,
+			PlannedRows: parts[i].PlannedRows,
 		}
 	}
 	return strip
@@ -328,13 +330,15 @@ func writeTargetTableLine(sb *strings.Builder, table string, cells []TableProgre
 	status := rollupTaskStatus(cells)
 	if keepsTargetProgressBar(cells, status, done, pending, settled) {
 		percent := presentation.PercentAcrossTargets(targetParts(cells), 0)
-		if pct := ui.RowCopyDisplayPercent(percent, copied); pct > 0 {
+		// With the rows to copy known, the bar leads from the copy's start,
+		// even at 0%, so the size of the work shows before any row moves.
+		if pct := ui.RowCopyDisplayPercent(percent, copied); pct > 0 || total+planned > 0 {
 			// The list under the rows says where each target stands, so the
 			// headline carries only the table's progress across all of them,
 			// the way a sharded table's does.
 			fmt.Fprintf(sb, "**%s**: %s %d%%\n", name, ui.ProgressBarRowCopy(pct), pct)
 			writeDDL()
-			if total > 0 {
+			if total+planned > 0 {
 				line := fmt.Sprintf("- Rows: %s / %s", ui.FormatNumber(copied), rolledRowsTotal(total, planned))
 				counted := reporting + estimated
 				partial := counted < len(cells)
@@ -458,11 +462,15 @@ func partlyCompleted(status string, done, queued int) bool {
 }
 
 // targetParts is a table's progress on each target that runs it, as the
-// shared part rules read it.
+// shared part rules read it. A target whose copy is still ahead and has
+// reported no row total carries the plan's estimate in its place.
 func targetParts(cells []TableProgressData) []presentation.Part {
 	parts := make([]presentation.Part, len(cells))
 	for i, c := range cells {
 		parts[i] = presentation.Part{Status: c.Status, PercentComplete: c.PercentComplete, RowsCopied: c.RowsCopied, RowsTotal: c.RowsTotal}
+		if c.RowsTotal == 0 && presentation.CopyStillAhead(c.Status) {
+			parts[i].PlannedRows = c.EstimatedRows
+		}
 	}
 	return parts
 }

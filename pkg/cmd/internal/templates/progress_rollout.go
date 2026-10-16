@@ -345,7 +345,10 @@ func tableAcrossTargets(v RolloutView, byMember map[rolloutMemberKey][]TableProg
 			}
 			status := state.NormalizeTaskStatus(t.Status)
 			statuses = append(statuses, status)
-			estimated := t.RowsTotal == 0 && t.EstimatedRows != nil && presentation.CopyStillAhead(status)
+			var plannedRows *int64
+			if t.RowsTotal == 0 && presentation.CopyStillAhead(status) {
+				plannedRows = t.EstimatedRows
+			}
 			rolled.Shards = append(rolled.Shards, ShardProgress{
 				Shard:           memberTargetName(d),
 				Status:          status,
@@ -356,7 +359,7 @@ func tableAcrossTargets(v RolloutView, byMember map[rolloutMemberKey][]TableProg
 
 				ChecksumRowsChecked: t.ChecksumRowsChecked,
 				ChecksumRowsTotal:   t.ChecksumRowsTotal,
-				RowsEstimated:       estimated,
+				PlannedRows:         plannedRows,
 			})
 			allInstant = allInstant && t.IsInstant
 			if t.EstimatedBytes == nil {
@@ -368,7 +371,7 @@ func tableAcrossTargets(v RolloutView, byMember map[rolloutMemberKey][]TableProg
 				allPlanned = false
 			} else {
 				plannedAll += *t.EstimatedRows
-				if estimated {
+				if plannedRows != nil {
 					planned += *t.EstimatedRows
 				}
 			}
@@ -394,10 +397,10 @@ func tableAcrossTargets(v RolloutView, byMember map[rolloutMemberKey][]TableProg
 	if allSized && reported > 0 {
 		rolled.EstimatedBytes = &plannedBytes
 	}
-	if rolled.RowsTotal > 0 && planned > 0 {
-		// Some targets have reported their copy and the rest have not: the
-		// plan's estimate stands in for the rest, so the total and the bar
-		// span every target instead of only the ones that started.
+	if planned > 0 && slices.ContainsFunc(statuses, state.IsInFlightTaskState) {
+		// The copy has started and some targets have not reported their
+		// rows: the plan's estimate stands in for them, so the total and the
+		// bar span every target instead of only the ones that reported.
 		rolled.RowsTotal += planned
 		rolled.RowsTotalPlanned = true
 	}
@@ -438,15 +441,17 @@ func keepsAcrossTargetsBar(t TableProgress) bool {
 // formatAcrossTargetsProgress renders a table rolled up across targets that
 // keeps its bar (keepsAcrossTargetsBar): the bar at the table's progress
 // across every target (presentation.PercentAcrossTargets), the rows of the
-// targets working or done, and each target's line. ok is false when no target
-// has reported progress yet, which leaves the table to its phase.
+// targets working or done, and each target's line. ok is false while nothing
+// is copied and no target's rows are known, reported or planned, which leaves
+// the table to its phase.
 func formatAcrossTargetsProgress(t TableProgress) (out string, ok bool) {
 	parts := make([]presentation.Part, len(t.Shards))
 	for i, s := range t.Shards {
 		parts[i] = shardPart(s)
 	}
 	pct := ui.RowCopyDisplayPercent(presentation.PercentAcrossTargets(parts, 0), t.RowsCopied)
-	if pct == 0 {
+	if pct == 0 && t.RowsTotal == 0 {
+		// Nothing copied and no rows known: the table's phase says more.
 		return "", false
 	}
 	var b strings.Builder
@@ -493,7 +498,7 @@ func formatAcrossTargetsProgress(t TableProgress) (out string, ok bool) {
 // copying any. A target working without its rows reported yet is left out, so
 // the rows line says the sum covers only some targets.
 func reportsRolledRows(s ShardProgress) bool {
-	if s.RowsEstimated {
+	if s.PlannedRows != nil {
 		return true
 	}
 	if !countsTowardRolledRows(s.Status) {
