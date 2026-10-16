@@ -637,7 +637,8 @@ func TestE2EApplyTeamSlugBlocked(t *testing.T) {
 }
 
 // TestE2EApplyCodeownersOptIn verifies that CODEOWNERS approvals satisfy the
-// review gate only when review policy explicitly includes CODEOWNERS.
+// review gate only when review policy explicitly includes CODEOWNERS, and that
+// the approver is the owner of the database's schema directory.
 func TestE2EApplyCodeownersOptIn(t *testing.T) {
 	dbName := "webhook_review_gate_codeowners"
 	svc := setupE2EService(t, dbName)
@@ -658,7 +659,7 @@ func TestE2EApplyCodeownersOptIn(t *testing.T) {
 	}
 
 	result := setupFakeGitHubForReviewGate(t, mux, schemaFiles, schemabotConfig, dbName,
-		"schema/webhook_review_gate_codeowners/ @bob\n",
+		"/web/ @carol\n/schema/ @bob\n",
 		[]*gh.PullRequestReview{
 			{
 				User:        &gh.User{Login: new("bob")},

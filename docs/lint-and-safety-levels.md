@@ -203,7 +203,12 @@ how the keyspace is onboarded, and a keyspace with one shard routes every
 keyspace id to that shard, so the flag alone re-routes nothing. Removals and
 mutations are detected structurally by comparing the current and desired
 VSchema documents; a VSchema that cannot be parsed fails the plan rather than
-skipping detection.
+skipping detection. A plan treats a keyspace as getting its first VSchema only
+when PlanetScale reports, on two reads, that the branch has no keyspace by
+that name. A keyspace the branch has whose VSchema PlanetScale keeps reporting
+missing fails the plan, including the plan a rollback makes, because an
+absence nothing confirms would skip this detection and record an empty
+VSchema as the rollback baseline.
 
 Unsafe does not mean broken. An unsafe change will usually apply successfully —
 the point of the gate is that it is destructive or irreversible, so SchemaBot
@@ -231,9 +236,11 @@ comment is the *gate firing*. Same data, two moments in time:
 
 So ⚠️ always means "review this before you apply", and ⛔ always means "your
 command was refused". Once an apply *is* acknowledged with `--allow-unsafe`,
-the locked apply comment omits the Issues section — the acknowledgment already
-happened — and carries `--allow-unsafe` forward on the confirm command it
-renders.
+the comment of an apply already running omits the Issues section: the
+acknowledgment already happened, and the DDL on that comment shows what the
+apply runs. A paused apply's comment still lists them, since its
+`apply-confirm` carries `--allow-unsafe` forward and the plan can have changed
+since the operator opted in.
 
 ## Blocked changes (⛔ Cannot apply)
 

@@ -218,9 +218,9 @@ func TestResumeApplyWithTasks_GroupedStartAnswerFailureKeepsTheStoredOutcome(t *
 
 // The same restarted grouped apply, with an operator's revert also pending
 // beside the start. The resume records the apply completed and storage then
-// refuses the start's answer. A completed outcome moots the revert, and the
-// drive is the last owner that will settle it, so the revert is completed even
-// though the start could not be answered.
+// refuses the start's answer. A completed outcome outran the revert, and the
+// drive is the last owner that will settle it, so the revert is answered as
+// not applied even though the start could not be answered.
 func TestResumeApplyWithTasks_GroupedStartAnswerFailureStillSettlesMootedRequests(t *testing.T) {
 	eng := &replanSequenceEngine{plans: []*engine.PlanResult{usersEmailChange(), {}}}
 	r := newGroupedStartResume(t, eng, func(requests *testControlRequestStore) storage.ControlRequestStore {
@@ -241,7 +241,7 @@ func TestResumeApplyWithTasks_GroupedStartAnswerFailureStillSettlesMootedRequest
 		}
 	}
 	require.NotNil(t, revert)
-	assert.Equal(t, storage.ControlRequestCompleted, revert.Status, "the pending revert the completed outcome moots is settled")
+	assert.Equal(t, storage.ControlRequestFailed, revert.Status, "the pending revert the completed outcome outran is settled")
 }
 
 // An operator started a stopped apply again, and the resume's first re-plan

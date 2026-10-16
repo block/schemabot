@@ -856,6 +856,72 @@ jobs:
           echo "=== All pods ==="
           kubectl get pods -n schemabot-e2e-etre -o wide 2>/dev/null || true
 
+  e2e-k8s-multi-target:
+    name: "E2E K8s Multi-Target Tests"
+    needs: changes
+    if: needs.changes.outputs.code == 'true' && (needs.changes.outputs.full == 'true' || github.event_name != 'pull_request')
+    runs-on: ubuntu-latest
+    # Sized so setup (checkout, Go, cache restore, minikube start, the script's
+    # own image builds, and standing up one MySQL server per target beside Etre
+    # and ministack) plus the E2E_TEST_TIMEOUT set on the Deploy and test step
+    # lands inside the job budget with room left for the goroutine dump, the
+    # script's exit trap, and the pod-log capture step.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # actions/checkout@v6
+      - name: "Configure Go"
+        uses: actions/setup-go@4dc6199c7b1a012772edbd06daecab0f50c9053c # actions/setup-go@v6.1
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: "Restore Go cache"
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # actions/cache/restore@v4
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum', 'e2e/consumermodule/go.sum') }}
+          restore-keys: go-${{ runner.os }}-${{ runner.arch }}-
+      - name: "Start minikube"
+        uses: medyagh/setup-minikube@d8c0eb871f6f455542491d86a574477bd3894533 # medyagh/setup-minikube@v0.0.18
+        with:
+          driver: docker
+          # The e2e scripts build images through `minikube docker-env`, which
+          # only yields a usable Docker daemon under the docker runtime.
+          container-runtime: docker
+          # One MySQL server per target plus the control and data plane
+          # stores, Etre and ministack: sized to the script's own minikube.
+          cpus: 4
+          memory: 6144
+      # The script builds the schemabot and etre images into minikube's docker
+      # daemon, so no separate build step is needed here.
+      - name: "Deploy and test"
+        # Keep the namespace on exit so the failure log dump below can read pod
+        # logs; the runner is ephemeral, so there is nothing to clean up after.
+        env:
+          KEEP_NAMESPACE: "1"
+          # go test's own timeout inside the script; the job budget above is
+          # sized to exceed it plus setup, so change the two together.
+          E2E_TEST_TIMEOUT: 18m
+        run: make test-e2e-k8s-multi-target
+      - name: "Pod logs on failure"
+        if: failure()
+        run: |
+          echo "=== Control Plane ==="
+          kubectl logs -n schemabot-e2e-multi-target -l app.kubernetes.io/instance=control-plane-mt --tail=300 2>/dev/null || true
+          echo "=== Data Plane ==="
+          kubectl logs -n schemabot-e2e-multi-target -l app.kubernetes.io/instance=data-plane-mt --tail=300 2>/dev/null || true
+          echo "=== Etre ==="
+          kubectl logs -n schemabot-e2e-multi-target -l app=etre --tail=100 2>/dev/null || true
+          echo "=== ministack ==="
+          kubectl logs -n schemabot-e2e-multi-target -l app=ministack --tail=100 2>/dev/null || true
+          echo "=== Seed jobs ==="
+          kubectl logs -n schemabot-e2e-multi-target -l job-name=etre-mongo-init --tail=50 2>/dev/null || true
+          kubectl logs -n schemabot-e2e-multi-target -l job-name=etre-seed --tail=50 2>/dev/null || true
+          kubectl logs -n schemabot-e2e-multi-target -l job-name=ministack-seed --tail=50 2>/dev/null || true
+          echo "=== All pods ==="
+          kubectl get pods -n schemabot-e2e-multi-target -o wide 2>/dev/null || true
+
   e2e-k8s-vitess:
     name: "E2E K8s Vitess Tests"
     needs: changes
@@ -1077,10 +1143,10 @@ jobs:
   # Stable rollup for the k8s e2e jobs so a single check name can gate a merge.
   # On a PR running the smoke subset these jobs are intentionally skipped and the
   # full k8s coverage runs on push / in the merge queue; on any merge-gating
-  # event all three must succeed.
+  # event all of them must succeed.
   k8s-rollup:
     name: "K8s E2E Tests"
-    needs: [changes, e2e-k8s, e2e-k8s-etre, e2e-k8s-vitess]
+    needs: [changes, e2e-k8s, e2e-k8s-etre, e2e-k8s-vitess, e2e-k8s-multi-target]
     runs-on: ubuntu-latest
     if: always()
     steps:
@@ -1093,6 +1159,7 @@ jobs:
           K8S_RESULT: ${{ needs.e2e-k8s.result }}
           K8S_ETRE_RESULT: ${{ needs.e2e-k8s-etre.result }}
           K8S_VITESS_RESULT: ${{ needs.e2e-k8s-vitess.result }}
+          K8S_MULTI_TARGET_RESULT: ${{ needs.e2e-k8s-multi-target.result }}
         run: |
           set -euo pipefail
           if [ "$CHANGES_RESULT" != "success" ]; then
@@ -1108,9 +1175,9 @@ jobs:
             echo "PR smoke run; full K8s E2E deferred to the merge queue."
             exit 0
           fi
-          for r in "$K8S_RESULT" "$K8S_ETRE_RESULT" "$K8S_VITESS_RESULT"; do
+          for r in "$K8S_RESULT" "$K8S_ETRE_RESULT" "$K8S_VITESS_RESULT" "$K8S_MULTI_TARGET_RESULT"; do
             if [ "$r" != "success" ]; then
-              echo "::error::k8s e2e results: k8s=$K8S_RESULT etre=$K8S_ETRE_RESULT vitess=$K8S_VITESS_RESULT"
+              echo "::error::k8s e2e results: k8s=$K8S_RESULT etre=$K8S_ETRE_RESULT vitess=$K8S_VITESS_RESULT multi-target=$K8S_MULTI_TARGET_RESULT"
               exit 1
             fi
           done

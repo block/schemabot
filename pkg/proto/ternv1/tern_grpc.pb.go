@@ -19,21 +19,22 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	Tern_PullSchema_FullMethodName         = "/tern.v1.Tern/PullSchema"
-	Tern_Plan_FullMethodName               = "/tern.v1.Tern/Plan"
-	Tern_PlanDiff_FullMethodName           = "/tern.v1.Tern/PlanDiff"
-	Tern_Apply_FullMethodName              = "/tern.v1.Tern/Apply"
-	Tern_Progress_FullMethodName           = "/tern.v1.Tern/Progress"
-	Tern_Logs_FullMethodName               = "/tern.v1.Tern/Logs"
-	Tern_Cutover_FullMethodName            = "/tern.v1.Tern/Cutover"
-	Tern_Revert_FullMethodName             = "/tern.v1.Tern/Revert"
-	Tern_SkipRevert_FullMethodName         = "/tern.v1.Tern/SkipRevert"
-	Tern_Health_FullMethodName             = "/tern.v1.Tern/Health"
-	Tern_Stop_FullMethodName               = "/tern.v1.Tern/Stop"
-	Tern_Cancel_FullMethodName             = "/tern.v1.Tern/Cancel"
-	Tern_Start_FullMethodName              = "/tern.v1.Tern/Start"
-	Tern_StorageSchemaPlan_FullMethodName  = "/tern.v1.Tern/StorageSchemaPlan"
-	Tern_StorageSchemaApply_FullMethodName = "/tern.v1.Tern/StorageSchemaApply"
+	Tern_PullSchema_FullMethodName              = "/tern.v1.Tern/PullSchema"
+	Tern_Plan_FullMethodName                    = "/tern.v1.Tern/Plan"
+	Tern_PlanDiff_FullMethodName                = "/tern.v1.Tern/PlanDiff"
+	Tern_CompareSchemaFileChange_FullMethodName = "/tern.v1.Tern/CompareSchemaFileChange"
+	Tern_Apply_FullMethodName                   = "/tern.v1.Tern/Apply"
+	Tern_Progress_FullMethodName                = "/tern.v1.Tern/Progress"
+	Tern_Logs_FullMethodName                    = "/tern.v1.Tern/Logs"
+	Tern_Cutover_FullMethodName                 = "/tern.v1.Tern/Cutover"
+	Tern_Revert_FullMethodName                  = "/tern.v1.Tern/Revert"
+	Tern_SkipRevert_FullMethodName              = "/tern.v1.Tern/SkipRevert"
+	Tern_Health_FullMethodName                  = "/tern.v1.Tern/Health"
+	Tern_Stop_FullMethodName                    = "/tern.v1.Tern/Stop"
+	Tern_Cancel_FullMethodName                  = "/tern.v1.Tern/Cancel"
+	Tern_Start_FullMethodName                   = "/tern.v1.Tern/Start"
+	Tern_StorageSchemaPlan_FullMethodName       = "/tern.v1.Tern/StorageSchemaPlan"
+	Tern_StorageSchemaApply_FullMethodName      = "/tern.v1.Tern/StorageSchemaApply"
 )
 
 // TernClient is the client API for Tern service.
@@ -88,6 +89,18 @@ type TernClient interface {
 	// plan_id — its result is intentionally not applyable. It is idempotent and
 	// safe to retry.
 	PlanDiff(ctx context.Context, in *PlanRequest, opts ...grpc.CallOption) (*PlanDiffResponse, error)
+	// CompareSchemaFileChange reports whether a pull request's edit to one
+	// schema file generates the same schema change on two different bases. The
+	// review gate asks it when a rebase combined the pull request's edit with a
+	// default branch edit to the same file, for a database type whose schema
+	// files can only be understood by running them, so an approval given before
+	// the rebase can keep counting.
+	//
+	// It is read-only: each version of the file is run inside a transaction
+	// that is always rolled back, so nothing persists on the target. An engine
+	// that cannot compare files returns UNIMPLEMENTED, and the caller treats the
+	// file as changed.
+	CompareSchemaFileChange(ctx context.Context, in *CompareSchemaFileChangeRequest, opts ...grpc.CallOption) (*CompareSchemaFileChangeResponse, error)
 	// Apply executes a previously generated plan. Returns immediately with an
 	// apply_id; execution happens asynchronously. Use Progress to track status.
 	//
@@ -236,6 +249,16 @@ func (c *ternClient) PlanDiff(ctx context.Context, in *PlanRequest, opts ...grpc
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(PlanDiffResponse)
 	err := c.cc.Invoke(ctx, Tern_PlanDiff_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *ternClient) CompareSchemaFileChange(ctx context.Context, in *CompareSchemaFileChangeRequest, opts ...grpc.CallOption) (*CompareSchemaFileChangeResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(CompareSchemaFileChangeResponse)
+	err := c.cc.Invoke(ctx, Tern_CompareSchemaFileChange_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -414,6 +437,18 @@ type TernServer interface {
 	// plan_id — its result is intentionally not applyable. It is idempotent and
 	// safe to retry.
 	PlanDiff(context.Context, *PlanRequest) (*PlanDiffResponse, error)
+	// CompareSchemaFileChange reports whether a pull request's edit to one
+	// schema file generates the same schema change on two different bases. The
+	// review gate asks it when a rebase combined the pull request's edit with a
+	// default branch edit to the same file, for a database type whose schema
+	// files can only be understood by running them, so an approval given before
+	// the rebase can keep counting.
+	//
+	// It is read-only: each version of the file is run inside a transaction
+	// that is always rolled back, so nothing persists on the target. An engine
+	// that cannot compare files returns UNIMPLEMENTED, and the caller treats the
+	// file as changed.
+	CompareSchemaFileChange(context.Context, *CompareSchemaFileChangeRequest) (*CompareSchemaFileChangeResponse, error)
 	// Apply executes a previously generated plan. Returns immediately with an
 	// apply_id; execution happens asynchronously. Use Progress to track status.
 	//
@@ -546,6 +581,9 @@ func (UnimplementedTernServer) Plan(context.Context, *PlanRequest) (*PlanRespons
 func (UnimplementedTernServer) PlanDiff(context.Context, *PlanRequest) (*PlanDiffResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method PlanDiff not implemented")
 }
+func (UnimplementedTernServer) CompareSchemaFileChange(context.Context, *CompareSchemaFileChangeRequest) (*CompareSchemaFileChangeResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method CompareSchemaFileChange not implemented")
+}
 func (UnimplementedTernServer) Apply(context.Context, *ApplyRequest) (*ApplyResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Apply not implemented")
 }
@@ -652,6 +690,24 @@ func _Tern_PlanDiff_Handler(srv interface{}, ctx context.Context, dec func(inter
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(TernServer).PlanDiff(ctx, req.(*PlanRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Tern_CompareSchemaFileChange_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CompareSchemaFileChangeRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(TernServer).CompareSchemaFileChange(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Tern_CompareSchemaFileChange_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(TernServer).CompareSchemaFileChange(ctx, req.(*CompareSchemaFileChangeRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -890,6 +946,10 @@ var Tern_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "PlanDiff",
 			Handler:    _Tern_PlanDiff_Handler,
+		},
+		{
+			MethodName: "CompareSchemaFileChange",
+			Handler:    _Tern_CompareSchemaFileChange_Handler,
 		},
 		{
 			MethodName: "Apply",

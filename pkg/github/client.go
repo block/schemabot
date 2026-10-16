@@ -1129,6 +1129,24 @@ func (ic *InstallationClient) SchemaPathsChangedSinceMergeBase(ctx context.Conte
 // earlier approvals stop counting.
 const maxSchemaSymlinkReads = 64
 
+// maxSchemaStatementComparisons bounds how many schema files a schema change
+// comparison reads to compare their statements, each costing up to four blob
+// reads. Only files that both the pull request and the base branch edited are
+// compared this way, which a rebase normally produces for a handful of files,
+// so the value leaves wide headroom. Past it, a file counts as changed.
+const maxSchemaStatementComparisons = 16
+
+// SchemaFileChangeComparer reports whether a pull request's edit to one
+// schema file generates the same schema change statements on two bases:
+// approvedBase to approved at the approved commit, and headBase to head at
+// the head. It is supplied by the database's dialect, since only the dialect
+// can understand the file, and it may run the files on the database's target
+// to do so. same is false, with reason saying why for operator logs, when the
+// statements differ or the head replaces something the base changed in
+// between. An error means the files could not be compared, which proves
+// nothing.
+type SchemaFileChangeComparer func(ctx context.Context, approvedBase, approved, headBase, head string) (same bool, reason string, err error)
+
 // SchemaChangeComparison is the outcome of PRSchemaChangeUnchangedSince.
 type SchemaChangeComparison struct {
 	// Unchanged is true when the pull request's change to the schema paths is
@@ -1148,6 +1166,10 @@ type SchemaChangeComparison struct {
 	// repository's default branch. It is false when the default branch is
 	// unknown, so unknown base content is never trusted.
 	BaseIsDefaultBranch bool
+	// StatementComparedPaths are the schema files whose content differs
+	// between the approved commit and the head but whose statements were
+	// proved the same, for operator logs.
+	StatementComparedPaths []string
 }
 
 // PRSchemaChangeUnchangedSince reports whether the change a pull request
@@ -1176,6 +1198,18 @@ type SchemaChangeComparison struct {
 // path the pull request edits, adds, deletes, or resolves differently at the
 // head does not. Directories that satisfy neither are compared entry by entry.
 //
+// A schema file the pull request and the base branch both edited, as a
+// rebase that combines the two in one file produces, still differs by
+// content. When compareStatements is set, such a file is unchanged if the
+// dialect proves the pull request's edit generates the same schema change
+// statements at both commits without replacing anything the base branch
+// changed (see SchemaFileChangeComparer). The file must be a regular .sql
+// file at all four commits, and when the two bases differ the same
+// default-branch rule applies, since the head's statements then rest on base
+// content. A nil compareStatements, an ineligible file, a comparer that
+// cannot prove the change is the same, or more such files than
+// maxSchemaStatementComparisons all leave the file changed.
+//
 // Git objects are content-addressed, so content is compared by object SHA,
 // type, and mode, and a path absent at a commit is compared as absent. A
 // symlink's object holds only its target, so every symlink at or inside a
@@ -1186,7 +1220,7 @@ type SchemaChangeComparison struct {
 // too large to list completely, a path runs through a symlink, a symlink
 // points outside the repository, or there were more distinct symlinks to read
 // than maxSchemaSymlinkReads.
-func (ic *InstallationClient) PRSchemaChangeUnchangedSince(ctx context.Context, repo, baseRef, defaultBranch, approvedSHA, headSHA string, paths []string) (SchemaChangeComparison, error) {
+func (ic *InstallationClient) PRSchemaChangeUnchangedSince(ctx context.Context, repo, baseRef, defaultBranch, approvedSHA, headSHA string, paths []string, compareStatements SchemaFileChangeComparer) (SchemaChangeComparison, error) {
 	result := SchemaChangeComparison{BaseIsDefaultBranch: defaultBranch != "" && baseRef == defaultBranch}
 	baseTipSHA, err := ic.branchTipSHA(ctx, repo, baseRef)
 	if err != nil {
@@ -1210,8 +1244,11 @@ func (ic *InstallationClient) PRSchemaChangeUnchangedSince(ctx context.Context, 
 		baseContentReviewed: result.BaseIsDefaultBranch && result.BaseMovedForward,
 		levelCache:          make(map[string][]TreeEntry),
 		symlinkText:         make(map[string]string),
+		compareStatements:   compareStatements,
+		blobText:            make(map[string]string),
 	}
 	differingPath, err := comparer.compare(ctx, paths)
+	result.StatementComparedPaths = comparer.statementComparedPaths
 	if err != nil {
 		return result, fmt.Errorf("compare schema change in %s between approved commit %s and head %s: %w", repo, approvedSHA, headSHA, err)
 	}
@@ -1258,6 +1295,15 @@ type schemaChangeComparer struct {
 	// warnedSymlinkBudget is set once the comparison has logged that it read
 	// more than half of maxSchemaSymlinkReads.
 	warnedSymlinkBudget bool
+	// compareStatements is the dialect's statement comparison, or nil when
+	// files are compared by content alone.
+	compareStatements SchemaFileChangeComparer
+	// blobText caches schema file content by blob SHA for statement
+	// comparisons.
+	blobText map[string]string
+	// statementComparedPaths are the files proved unchanged by their
+	// statements; each one used up part of maxSchemaStatementComparisons.
+	statementComparedPaths []string
 }
 
 type schemaChangeItem struct {
@@ -1320,10 +1366,93 @@ func (c *schemaChangeComparer) compare(ctx context.Context, paths []string) (str
 			}
 			pending = append(pending, children...)
 		default:
-			return item.path, nil
+			same, err := c.sameStatements(ctx, item)
+			if err != nil {
+				return "", err
+			}
+			if !same {
+				return item.path, nil
+			}
 		}
 	}
 	return "", nil
+}
+
+// sameStatements reports whether a file whose content differs between the
+// approved commit and the head still generates the same schema change
+// statements (see PRSchemaChangeUnchangedSince). Anything short of proof
+// returns false, so any doubt counts as a change; an error means GitHub could
+// not serve the file's content, or the evaluation was cancelled while the
+// dialect compared the file.
+func (c *schemaChangeComparer) sameStatements(ctx context.Context, item schemaChangeItem) (bool, error) {
+	logAttrs := []any{"repo", c.repo, "path", item.path,
+		"approved_sha", c.commits[sideApproved], "head_sha", c.commits[sideHead]}
+	if c.compareStatements == nil {
+		c.ic.logger.Debug("review gate comparison: schema path differs and its dialect has no statement comparison", logAttrs...)
+		return false, nil
+	}
+	if !statementComparable(item) {
+		c.ic.logger.Debug("review gate comparison: schema path differs and is not a regular .sql file at every commit, so its statements are not compared", logAttrs...)
+		return false, nil
+	}
+	if !sameGitObject(item.sides[sideApprovedBase], item.sides[sideHeadBase]) && !c.baseContentReviewed {
+		c.ic.logger.Info("review gate comparison: schema file differs on two bases that are not both default branch content in order, so its statements are not compared", logAttrs...)
+		return false, nil
+	}
+	if len(c.statementComparedPaths) >= maxSchemaStatementComparisons {
+		c.ic.logger.Warn("review gate comparison reached its statement comparison budget; the schema file counts as changed and the approval on the earlier commit does not count",
+			append(logAttrs, "statement_comparison_budget", maxSchemaStatementComparisons)...)
+		return false, nil
+	}
+	var contents [4]string
+	for i, side := range item.sides {
+		text, ok := c.blobText[side.entry.SHA]
+		if !ok {
+			var err error
+			text, err = c.ic.FetchBlobContent(ctx, c.repo, side.entry.SHA)
+			if err != nil {
+				return false, fmt.Errorf("read schema file %s at %s in repo %s: %w", item.path, c.commits[i], c.repo, err)
+			}
+			c.blobText[side.entry.SHA] = text
+		}
+		contents[i] = text
+	}
+	same, reason, err := c.compareStatements(ctx, contents[sideApprovedBase], contents[sideApproved], contents[sideHeadBase], contents[sideHead])
+	if err != nil {
+		// A comparison cut short by the evaluation's own cancellation proves
+		// nothing about the file, so the evaluation fails instead of
+		// recording the file as changed.
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return false, fmt.Errorf("compare statements of schema file %s in repo %s: evaluation cancelled: %w",
+				item.path, c.repo, errors.Join(ctxErr, err))
+		}
+		c.ic.logger.Info("review gate comparison: cannot compare a schema file's statements, so it counts as changed",
+			append(logAttrs, "error", err)...)
+		return false, nil
+	}
+	if !same {
+		c.ic.logger.Info("review gate comparison: schema file generates different statements at the approved commit and the head",
+			append(logAttrs, "reason", reason)...)
+		return false, nil
+	}
+	c.ic.logger.Info("review gate comparison: schema file's content differs but it generates the same statements at the approved commit and the head", logAttrs...)
+	c.statementComparedPaths = append(c.statementComparedPaths, item.path)
+	return true, nil
+}
+
+// statementComparable reports whether item is a .sql file that is a regular
+// file at all four commits, so its content at each one is a schema file the
+// dialect can parse.
+func statementComparable(item schemaChangeItem) bool {
+	if path.Ext(item.path) != ".sql" {
+		return false
+	}
+	for _, side := range item.sides {
+		if !side.found || side.entry.Type != "blob" || side.entry.Mode == gitSymlinkMode {
+			return false
+		}
+	}
+	return true
 }
 
 // pathUnchanged reports whether the pull request's change to a path is the
@@ -1841,6 +1970,8 @@ type CheckRunResult struct {
 	Name       string
 	Status     string // "queued", "in_progress", "completed"
 	Conclusion string // "success", "failure", "neutral", "action_required"
+	// Title is the run's output title; empty when the run has none.
+	Title string
 	// StartedAt is when the Check Run was started; zero when GitHub did not
 	// report a start time. Lets callers judge how long a run that never
 	// completed has been sitting.
@@ -1911,6 +2042,7 @@ func (ic *InstallationClient) FindCheckRunByName(ctx context.Context, repo, head
 						Name:       run.GetName(),
 						Status:     run.GetStatus(),
 						Conclusion: run.GetConclusion(),
+						Title:      run.GetOutput().GetTitle(),
 						StartedAt:  run.GetStartedAt().Time,
 					}
 				}

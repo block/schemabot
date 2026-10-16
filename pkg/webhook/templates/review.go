@@ -99,14 +99,14 @@ func writeReviewersAndNextSteps(sb *strings.Builder, data ReviewGateData) {
 
 	if hasOperators {
 		fmt.Fprintf(sb, "\n**Operators of `%s`**:\n", data.Database)
-		writeReviewerList(sb, data.OperatorReviewers)
+		writeMentionList(sb, data.OperatorReviewers)
 		if hasOthers {
 			sb.WriteString("\n**Other authorized reviewers**:\n")
-			writeReviewerList(sb, data.OtherReviewers)
+			writeMentionList(sb, data.OtherReviewers)
 		}
 	} else if hasOthers {
 		sb.WriteString("\n**Authorized reviewers**:\n")
-		writeReviewerList(sb, data.OtherReviewers)
+		writeMentionList(sb, data.OtherReviewers)
 	}
 
 	sb.WriteString("\n### Next steps\n")
@@ -123,9 +123,12 @@ func writeReviewersAndNextSteps(sb *strings.Builder, data ReviewGateData) {
 	fmt.Fprintf(sb, "2. Once approved, run `schemabot apply -e %s` again\n", data.Environment)
 }
 
-func writeReviewerList(sb *strings.Builder, reviewers []string) {
-	for _, reviewer := range reviewers {
-		fmt.Fprintf(sb, "- @%s\n", reviewer)
+// writeMentionList renders teams ("org/team") and user logins as a bulleted
+// list of @-mentions. The review-required and command-not-authorized comments
+// both list who can unblock the reader this way.
+func writeMentionList(sb *strings.Builder, logins []string) {
+	for _, login := range logins {
+		fmt.Fprintf(sb, "- @%s\n", login)
 	}
 }
 

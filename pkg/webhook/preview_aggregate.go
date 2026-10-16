@@ -44,15 +44,15 @@ func PreviewAggregateSummary() string {
 		},
 	}
 
-	conclusion, _ := computeAggregate(checks)
+	conclusion, _ := computeAggregate(checks, nil)
 	title, summary := aggregateSummary(checks, conclusion, nil)
 	return title + "\n\n" + summary
 }
 
 // PreviewAggregateCheckStopped renders the aggregate check published while a
-// stopped apply holds the PR: the check stays in progress so merge remains
-// blocked, but the title names the pause so a reader looks for the operator
-// decision the apply is waiting on rather than for progress.
+// stopped apply holds the PR: the check concludes action_required so merge
+// stays blocked without a run left spinning, and the title names the pause so
+// a reader looks for the operator decision the apply is waiting on.
 func PreviewAggregateCheckStopped() string {
 	const stoppedApplyID = 42
 	checks := []*storage.Check{
@@ -66,8 +66,9 @@ func PreviewAggregateCheckStopped() string {
 		},
 	}
 
-	conclusion, _ := computeAggregate(checks)
-	title, summary := aggregateSummary(checks, conclusion, stoppedApplyIDs{stoppedApplyID: true})
+	stopped := stoppedApplyIDs{stoppedApplyID: true}
+	conclusion, _ := computeAggregate(checks, stopped)
+	title, summary := aggregateSummary(checks, conclusion, stopped)
 	return title + "\n\n" + summary
 }
 
