@@ -78,6 +78,17 @@ func (s *rollbackTestPlanStore) List(context.Context, storage.ListPlansOptions) 
 	return nil, nil
 }
 
+// rollbackRoundPlanStore serves the source plan and a review round that
+// stored a plan for each of the rollout's other targets.
+type rollbackRoundPlanStore struct {
+	*rollbackTestPlanStore
+	members []*storage.Plan
+}
+
+func (s *rollbackRoundPlanStore) List(context.Context, storage.ListPlansOptions) ([]*storage.Plan, error) {
+	return s.members, nil
+}
+
 type rollbackTestTaskStore struct {
 	storage.TaskStore
 	tasks []*storage.Task
@@ -808,6 +819,38 @@ func TestRollbackCommandCoreTerminalDispositions(t *testing.T) {
 		assert.Equal(t, 1, lockStore.releaseCalls, "the command-acquired lock must be released after the failed plan")
 		body := requireComment(t, comments, "engine rejection comment")
 		assert.Contains(t, body, "rollback DDL rejected by engine")
+	})
+
+	// The apply ran across a rollout whose targets were each planned against
+	// their own schema, and a rollback is one plan. The refusal is the
+	// command's answer, and in a PR it names the remedy the PR already holds:
+	// revert its schema files and apply again.
+	t.Run("rollback of a rollout planned per target is refused with the PR remedy", func(t *testing.T) {
+		client, mux := setupGitHubServer(t)
+		comments := recordComments(t, mux)
+		lockStore := &rollbackTestLockStore{}
+		st := remotePlanRollbackStorage(lockStore)
+		st.plans = &rollbackRoundPlanStore{
+			rollbackTestPlanStore: st.plans.(*rollbackTestPlanStore),
+			members: []*storage.Plan{
+				{PlanIdentifier: "plan-member-b", Deployment: "tenant-a", Target: "orders-staging-b"},
+				{PlanIdentifier: "plan-member-c", Deployment: "tenant-a", Target: "orders-staging-c"},
+				{PlanIdentifier: "plan-member-d", Deployment: "tenant-a", Target: "orders-staging-d"},
+			},
+		}
+		h := unlockTestHandler(t, st, ghclient.NewInstallationClient(client, testLogger()))
+
+		retry, err := h.rollbackCommandCore(t.Context(), "octocat/hello-world", 1, 12345, "testuser", rollbackCommand())
+
+		require.NoError(t, err)
+		assert.False(t, retry, "the refusal is deterministic for this apply; re-driving would refuse again")
+		assert.Equal(t, 1, lockStore.releaseCalls, "the command-acquired lock must be released after the refusal")
+		body := requireComment(t, comments, "rollout rollback refusal comment")
+		assert.Contains(t, body, "## Rollback Not Supported — Staging")
+		assert.Contains(t, body, "`apply-123` ran on 4 targets, each planned against its own schema")
+		assert.Contains(t, body, "```\nschemabot apply -e staging\n```")
+		assert.NotContains(t, body, "Rollback Failed")
+		assert.NotContains(t, body, "orders-staging", "the PR comment names the remedy, not the API's routing detail")
 	})
 
 	t.Run("lock held by another PR is terminal", func(t *testing.T) {

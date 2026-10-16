@@ -664,10 +664,13 @@ func TestExecuteRollbackPlan_RefusedForARolloutOfIndependentlyPlannedTargets(t *
 		listErr  error
 		wantErr  string
 		wantCode int
+		// wantTargets is the target count a refused rollback reports to a
+		// caller that names its own remedy; zero when it is not refused.
+		wantTargets int
 	}{
 		{
 			name: "three targets planned on their own", env: targetsEnv("payments-001", "payments-002", "payments-003"),
-			round: independentRound, wantErr: plannedOnTheirOwn, wantCode: http.StatusConflict,
+			round: independentRound, wantErr: plannedOnTheirOwn, wantCode: http.StatusConflict, wantTargets: 3,
 		},
 		{
 			name: "three targets planned on their own, since respelled as mirrored deployments",
@@ -675,17 +678,17 @@ func TestExecuteRollbackPlan_RefusedForARolloutOfIndependentlyPlannedTargets(t *
 				Deployments:     map[string]DeploymentTarget{DefaultDeployment: {Target: "payments-001"}, "us": {Target: "payments-002"}},
 				DeploymentOrder: []string{DefaultDeployment, "us"},
 			},
-			round: independentRound, wantErr: plannedOnTheirOwn, wantCode: http.StatusConflict,
+			round: independentRound, wantErr: plannedOnTheirOwn, wantCode: http.StatusConflict, wantTargets: 3,
 		},
 		{
 			name: "three targets planned on their own, since cut to the primary", env: targetsEnv("payments-001"),
-			round: independentRound, wantErr: plannedOnTheirOwn, wantCode: http.StatusConflict,
+			round: independentRound, wantErr: plannedOnTheirOwn, wantCode: http.StatusConflict, wantTargets: 3,
 		},
 		{
 			name: "one plan across the rollout, since respelled as targets planned on their own", env: targetsEnv("payments-001", "payments-002"),
 			wantErr: "apply apply-rollout ran one plan across payments/production, whose 2 targets are now each planned against their own schema, and a rollback is one plan made against " + DefaultDeployment + "/payments-001; " +
 				"rollback of such a rollout is not supported, so restore each target by planning and applying the previous schema with its target",
-			wantCode: http.StatusConflict,
+			wantCode: http.StatusConflict, wantTargets: 2,
 		},
 		{
 			name: "review round unreadable", env: targetsEnv("payments-001"), listErr: errors.New("connection refused"),
@@ -715,6 +718,14 @@ func TestExecuteRollbackPlan_RefusedForARolloutOfIndependentlyPlannedTargets(t *
 			require.Error(t, err)
 			assert.Equal(t, tc.wantErr, err.Error())
 			assert.Equal(t, tc.wantCode, controlOperationHTTPStatus(err))
+			var unsupported *RolloutRollbackUnsupportedError
+			if tc.wantTargets > 0 {
+				require.ErrorAs(t, err, &unsupported, "a refused rollout rollback must be readable as its own error")
+				assert.Equal(t, "apply-rollout", unsupported.ApplyID)
+				assert.Equal(t, tc.wantTargets, unsupported.Targets)
+			} else {
+				assert.NotErrorAs(t, err, &unsupported, "a failure to read the round is not a refusal")
+			}
 			assert.Nil(t, mockClient.planReq, "nothing is planned for a rollback no member could run")
 		})
 	}

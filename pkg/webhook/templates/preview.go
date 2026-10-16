@@ -3462,6 +3462,13 @@ func PreviewCommentRollbackStatus() string {
 // PreviewCommentRollbackSummaryCompleted renders the terminal summary for a
 // completed rollback apply — announced as a rollback, never as an applied
 // schema change.
+// PreviewCommentRollbackOfRolloutUnsupported previews the refusal of a
+// rollback whose apply ran across a rollout of targets each planned against
+// its own schema.
+func PreviewCommentRollbackOfRolloutUnsupported() string {
+	return RenderRollbackOfRolloutUnsupported("staging", "apply-a1b2c3d4e5f6", 4, "")
+}
+
 func PreviewCommentRollbackSummaryCompleted() string {
 	data := sampleSummaryData(state.Apply.Completed, sampleRollbackTables(state.Task.Completed))
 	data.Rollback = true

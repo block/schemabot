@@ -472,3 +472,17 @@ func TestRenderRollbackRejectedRedactsEndpoints(t *testing.T) {
 	assert.NotContains(t, rendered, "db-primary.internal", "internal endpoints are redacted")
 	assert.Contains(t, rendered, "**Reason**: `dial tcp [endpoint redacted]: connection refused`")
 }
+
+// A rollback of an apply that ran on 4 targets, each planned against its own
+// schema, is refused. The comment names the remedy the PR already holds:
+// revert the change in its schema files and apply again.
+func TestRenderRollbackOfRolloutUnsupported(t *testing.T) {
+	out := RenderRollbackOfRolloutUnsupported("staging", "apply-a1b2c3d4e5f6", 4, "")
+	assert.Equal(t, "## Rollback Not Supported — Staging\n\n"+
+		"`apply-a1b2c3d4e5f6` ran on 4 targets, each planned against its own schema, and a rollback runs one plan.\n\n"+
+		"To undo it, revert the change in this PR's schema files, then run:\n"+
+		"```\nschemabot apply -e staging\n```\n", out)
+
+	withTenant := RenderRollbackOfRolloutUnsupported("production", "apply-a1b2c3d4e5f6", 4, "payments")
+	assert.Contains(t, withTenant, "```\nschemabot apply -e production --tenant payments\n```\n")
+}

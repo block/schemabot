@@ -7052,6 +7052,21 @@ ALTER TABLE `users` DROP INDEX `idx_email`;
 </details>
 
 <details>
+<summary><a name="rollback-refused-rollout-of-targets-planned-on-their-own"></a><strong>Rollback Refused: Rollout Of Targets Planned On Their Own</strong></summary>
+
+
+## Rollback Not Supported — Staging
+
+`apply-a1b2c3d4e5f6` ran on 4 targets, each planned against its own schema, and a rollback runs one plan.
+
+To undo it, revert the change in this PR's schema files, then run:
+```
+schemabot apply -e staging
+```
+
+</details>
+
+<details>
 <summary><a name="rollbackconfirm-refused-rollback-plan-stored-without-routing"></a><strong>Rollback-confirm Refused: Rollback Plan Stored Without Routing</strong></summary>
 
 

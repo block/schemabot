@@ -225,6 +225,21 @@ func RenderRollbackBlockedByLock(database, environment, lockOwner, lockRepo stri
 		database, environment, caller.Short(lockOwner)))
 }
 
+// RenderRollbackOfRolloutUnsupported renders the message posted when a
+// rollback is refused because the apply's rollout planned each of its targets
+// against its own schema, and a rollback is one plan. The PR's own schema
+// files are what undo the change on every target: reverting the change there
+// and applying again plans each target on its own. Tenant is the deployment's
+// own tenant; when set, the apply command carries it.
+func RenderRollbackOfRolloutUnsupported(environment, applyID string, targets int, tenant string) string {
+	var sb strings.Builder
+	writeEnvironmentTitle(&sb, "Rollback Not Supported", environment)
+	fmt.Fprintf(&sb, "`%s` ran on %d targets, each planned against its own schema, and a rollback runs one plan.\n\n", applyID, targets)
+	sb.WriteString("To undo it, revert the change in this PR's schema files, then run:\n")
+	fmt.Fprintf(&sb, "```\n%s\n```\n", appendTenantFlag(fmt.Sprintf("schemabot apply -e %s", environment), tenant))
+	return sb.String()
+}
+
 // RenderRollbackNothingToDo renders the message posted when a rollback plan
 // produces no schema changes for the supplied apply ID.
 func RenderRollbackNothingToDo(database, environment, applyID string) string {

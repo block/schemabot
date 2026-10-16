@@ -261,6 +261,14 @@ func (h *Handler) rollbackCommandCore(parent context.Context, repo string, pr in
 	// schema. The lock is already held and the source apply was revalidated
 	// after lock acquisition, so the plan can be pinned for confirmation.
 	planResp, err := h.service.ExecuteRollbackPlanForApply(ctx, apply)
+	if comment, refused := rolloutRollbackRefusalComment(err, environment, h.deploymentTenant()); refused {
+		releaseErr := h.releaseRollbackLockAfterRejectedPlan(ctx, database, dbType, lockOwner, lockAcquiredByCommand)
+		h.logRollbackLockReleaseFailure(repo, pr, database, dbType, lockOwner, releaseErr)
+		h.logger.Warn("rollback refused: the apply's rollout plans each target against its own schema; the PR comment names reverting the PR's schema files and applying again",
+			"repo", repo, "pr", pr, "apply_id", applyID, "environment", environment, "database", database, "error", err)
+		h.postComment(repo, pr, installationID, comment)
+		return false, nil
+	}
 	if err != nil {
 		releaseErr := h.releaseRollbackLockAfterRejectedPlan(ctx, database, dbType, lockOwner, lockAcquiredByCommand)
 		// ExecuteRollbackPlanForApply classifies its own failures: transient
@@ -447,6 +455,19 @@ func (h *Handler) postRollbackTerminalInvariant(logMsg, repo string, pr int, ins
 	}
 	h.logger.Error(logMsg, append(attrs, "error", err)...)
 	h.postCommandError(repo, pr, installationID, action.Rollback, environment, requestedBy, err.Error())
+}
+
+// rolloutRollbackRefusalComment is the comment for a rollback refused because
+// the apply's rollout plans each target against its own schema, and whether
+// err is that refusal. The refusal is the command's answer, not a failure: in
+// a PR the remedy is the PR's own schema files, which the comment names in
+// place of the API's message.
+func rolloutRollbackRefusalComment(err error, environment, tenant string) (string, bool) {
+	var unsupported *api.RolloutRollbackUnsupportedError
+	if !errors.As(err, &unsupported) {
+		return "", false
+	}
+	return templates.RenderRollbackOfRolloutUnsupported(environment, unsupported.ApplyID, unsupported.Targets, tenant), true
 }
 
 func (h *Handler) postRollbackRejected(repo string, pr int, installationID int64, apply *storage.Apply, applyID, environment, database, reason string) {

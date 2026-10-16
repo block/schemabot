@@ -3468,7 +3468,7 @@ func (s *Service) refuseRollbackOfIndependentRollout(ctx context.Context, plan *
 		targets := len(memberPlans) + 1
 		s.logger.Warn("rollback refused: the apply ran each of the rollout's targets from a plan of its own, and a rollback has one plan",
 			append(apply.LogAttrs(), "plan_id", plan.PlanIdentifier, "targets", targets)...)
-		return controlConflictf("apply %s ran across the %d targets of %s/%s, which were each planned against their own schema, and a rollback is one plan made against %s; rollback of such a rollout is not supported, so restore each target by planning and applying the previous schema with its target",
+		return rolloutRollbackUnsupported(apply.ApplyIdentifier, targets, "apply %s ran across the %d targets of %s/%s, which were each planned against their own schema, and a rollback is one plan made against %s; rollback of such a rollout is not supported, so restore each target by planning and applying the previous schema with its target",
 			apply.ApplyIdentifier, targets, apply.Database, apply.Environment, applyPrimary.MemberID())
 	}
 
@@ -3492,8 +3492,34 @@ func (s *Service) refuseRollbackOfIndependentRollout(ctx context.Context, plan *
 	}
 	s.logger.Warn("rollback refused: the rollout's targets are now each planned against their own schema, and a rollback has one plan",
 		append(apply.LogAttrs(), "plan_id", plan.PlanIdentifier, "members", len(members))...)
-	return controlConflictf("apply %s ran one plan across %s/%s, whose %d targets are now each planned against their own schema, and a rollback is one plan made against %s; rollback of such a rollout is not supported, so restore each target by planning and applying the previous schema with its target",
+	return rolloutRollbackUnsupported(apply.ApplyIdentifier, len(members), "apply %s ran one plan across %s/%s, whose %d targets are now each planned against their own schema, and a rollback is one plan made against %s; rollback of such a rollout is not supported, so restore each target by planning and applying the previous schema with its target",
 		apply.ApplyIdentifier, apply.Database, apply.Environment, len(members), applyPrimary.MemberID())
+}
+
+// RolloutRollbackUnsupportedError is a rollback refused because the apply's
+// rollout plans each of its targets against its own schema, and a rollback is
+// one plan. A caller that can name the remedy in its own terms, such as a PR
+// whose schema files can be reverted and applied again, reads it with
+// errors.As instead of passing the message on.
+type RolloutRollbackUnsupportedError struct {
+	// ApplyID is the apply the rollback was asked to reverse.
+	ApplyID string
+	// Targets is how many targets the rollout runs across.
+	Targets int
+	reason  string
+}
+
+func (e *RolloutRollbackUnsupportedError) Error() string {
+	return e.reason
+}
+
+// rolloutRollbackUnsupported is a conflict carrying a
+// RolloutRollbackUnsupportedError whose message is the formatted reason.
+func rolloutRollbackUnsupported(applyID string, targets int, format string, args ...any) error {
+	return &controlOperationHTTPError{
+		status: http.StatusConflict,
+		err:    &RolloutRollbackUnsupportedError{ApplyID: applyID, Targets: targets, reason: fmt.Sprintf(format, args...)},
+	}
 }
 
 // refuseRollbackAfterPrimaryMoved refuses a rollback of a rollout-wide apply
