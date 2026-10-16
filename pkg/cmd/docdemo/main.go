@@ -430,8 +430,7 @@ func busyFleet(now time.Time) []string {
 	data := t.StatusListData{Sectioned: true, ActiveCount: 3, Limit: 12, HasMore: true, StateCounts: map[string]int{state.Apply.Completed: 483, state.Apply.Failed: 9, state.Apply.Stopped: 5}}
 	names := []string{"shop", "billing", "catalog", "accounts", "inventory", "search", "analytics", "notifications"}
 	for i := 0; i < 15; i++ {
-		started := now.Add(-time.Duration(10+i*25) * time.Minute)
-		apply := t.ActiveApplyData{ApplyID: fmt.Sprintf("apply-example-%02d", 73-i), Database: names[i%len(names)], Environment: "staging", State: state.Apply.Running, Caller: fmt.Sprintf("github:alex@acme/store#%d", 42-i), StartedAt: started.Format(time.RFC3339)}
+		apply := t.ActiveApplyData{ApplyID: fmt.Sprintf("apply-example-%02d", 73-i), Database: names[i%len(names)], Environment: "staging", State: state.Apply.Running, Caller: fmt.Sprintf("github:alex@acme/store#%d", 42-i), StartedAt: now.Add(-time.Duration(10+i*25) * time.Minute).Format(time.RFC3339)}
 		if i < 3 {
 			data.Active = append(data.Active, apply)
 			continue
@@ -442,11 +441,6 @@ func busyFleet(now time.Time) []string {
 		}
 		if i == 8 {
 			apply.State = state.Apply.Stopped
-		}
-		ended := started.Add(time.Duration(4+i%5*3) * time.Minute).Format(time.RFC3339)
-		apply.UpdatedAt = ended
-		if apply.State != state.Apply.Stopped {
-			apply.CompletedAt = ended
 		}
 		data.Applies = append(data.Applies, apply)
 	}

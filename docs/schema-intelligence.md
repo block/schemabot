@@ -994,8 +994,8 @@ schemabot status -e production
 Recent schema changes
 1 total: 1 Completed
 
-  APPLY ID          DATABASE  ENV         STATE      STARTED     DURATION  SOURCE
-  apply-example-71  accounts  production  Completed  1 hour ago  57m       example/accounts#18
+  APPLY ID          DATABASE  ENV         STATE      STARTED     SOURCE
+  apply-example-71  accounts  production  Completed  1 hour ago  example/accounts#18
 
 Use 'schemabot status <apply_id>' to view details
 ```
@@ -1045,9 +1045,9 @@ request set it; a server that predates `active=false` omits the echo.
 
 Without `--state` or `--failed`, `schemabot status` makes one request for each
 half. It lists every active apply first, newest first, then the finished ones a
-page at a time under **Recent schema changes**, with a DURATION column: start to
-finish, or start to the moment it stopped. `--limit` and `--after` page the
-finished applies; a page reached with `--after` lists only finished applies.
+page at a time under **Recent schema changes**. `--limit` and `--after` page
+the finished applies; a page reached with `--after` lists only finished
+applies.
 
 When more applies match than one page holds, the response sets `has_more`.
 Request the next page with the same filters and `starting_after` set to the
@@ -1084,10 +1084,10 @@ Output excerpt (illustrative values):
 Recent schema changes
 1170 total: 1150 Completed · 20 Failed
 
-  APPLY ID            DATABASE  ENV      STATE      STARTED         DURATION  SOURCE
-  apply-example-1170  accounts  staging  Completed  40 minutes ago  6m        example/accounts#88
+  APPLY ID            DATABASE  ENV      STATE      STARTED         SOURCE
+  apply-example-1170  accounts  staging  Completed  40 minutes ago  example/accounts#88
   ...
-  apply-example-172   billing   staging  Completed  9 days ago      18m       example/billing#75
+  apply-example-172   billing   staging  Completed  9 days ago      example/billing#75
 
 Showing the 1000 most recent schema changes. Add --after apply-example-172 for the next 1000.
 Use 'schemabot status <apply_id>' to view details
@@ -1103,10 +1103,10 @@ Output excerpt (illustrative values):
 Recent schema changes
 1170 total: 1150 Completed · 20 Failed
 
-  APPLY ID           DATABASE  ENV      STATE      STARTED      DURATION  SOURCE
-  apply-example-171  accounts  staging  Completed  9 days ago   7m        example/accounts#19
+  APPLY ID           DATABASE  ENV      STATE      STARTED      SOURCE
+  apply-example-171  accounts  staging  Completed  9 days ago   example/accounts#19
   ...
-  apply-example-1    shop      staging  Failed     90 days ago  2m        example/store#2
+  apply-example-1    shop      staging  Failed     90 days ago  example/store#2
 
 Use 'schemabot status <apply_id>' to view details
 ```

@@ -1189,7 +1189,7 @@ func WriteStatusList(data StatusListData) {
 	writeStatusStateSummary(data.StateCounts)
 	fmt.Println()
 
-	writeStatusTable(statusListColumns(data, data.Applies, false), data.Applies, func(a ActiveApplyData) string { return a.State })
+	writeStatusTable(statusListColumns(data, data.Applies), data.Applies, func(a ActiveApplyData) string { return a.State })
 
 	writeStatusListFooter(data)
 }
@@ -1210,7 +1210,7 @@ func writeSectionedStatusList(data StatusListData) {
 		} else {
 			writeActiveStatusHeader(data, len(data.Active))
 			fmt.Println()
-			writeStatusTable(statusListColumns(data, data.Active, false), data.Active, func(a ActiveApplyData) string { return a.State })
+			writeStatusTable(statusListColumns(data, data.Active), data.Active, func(a ActiveApplyData) string { return a.State })
 			if data.ActiveHasMore {
 				fmt.Printf("\n%sShowing the %d most recent active schema changes.%s\n", ANSIDim, len(data.Active), ANSIReset)
 			}
@@ -1226,7 +1226,7 @@ func writeSectionedStatusList(data StatusListData) {
 	fmt.Printf("%sRecent schema changes%s%s\n", ANSIBold, ANSIReset, statusWindowSuffix(data))
 	writeStatusStateSummary(data.StateCounts)
 	fmt.Println()
-	writeStatusTable(statusListColumns(data, data.Applies, true), data.Applies, func(a ActiveApplyData) string { return a.State })
+	writeStatusTable(statusListColumns(data, data.Applies), data.Applies, func(a ActiveApplyData) string { return a.State })
 	writeStatusListFooter(data)
 }
 
@@ -1362,11 +1362,7 @@ func writeStatusTable[Row any](columns []statusColumn[Row], rows []Row, rowState
 // already do — the deployment's shared data-plane apply id and the
 // per-operation remote row id — and omits DEPLOYMENT, which every row repeats
 // back to the operator who named it.
-//
-// withDuration adds how long each apply ran, for finished applies: their start
-// time alone does not say when they ended. Active applies leave it out, since
-// their start time already says how long they have been running.
-func statusListColumns(data StatusListData, rows []ActiveApplyData, withDuration bool) []statusColumn[ActiveApplyData] {
+func statusListColumns(data StatusListData, rows []ActiveApplyData) []statusColumn[ActiveApplyData] {
 	columns := []statusColumn[ActiveApplyData]{
 		{header: "APPLY ID", value: func(a ActiveApplyData) string { return a.ApplyID }},
 	}
@@ -1398,27 +1394,10 @@ func statusListColumns(data StatusListData, rows []ActiveApplyData, withDuration
 		statusColumn[ActiveApplyData]{header: "STATE", colored: true, value: func(a ActiveApplyData) string { return state.Label(a.State) }},
 		statusColumn[ActiveApplyData]{header: "STARTED", value: func(a ActiveApplyData) string { return formatStartedAt(a.StartedAt) }},
 	)
-	if withDuration {
-		columns = append(columns,
-			statusColumn[ActiveApplyData]{header: "DURATION", value: finishedApplyDuration},
-		)
-	}
 	columns = append(columns,
 		statusColumn[ActiveApplyData]{header: "SOURCE", last: true, value: func(a ActiveApplyData) string { return applySource(a.Caller) }},
 	)
 	return retainPopulatedStatusColumns(columns, rows)
-}
-
-// finishedApplyDuration is how long a finished apply ran. A stopped apply
-// records no completion time, because it can still be resumed, so its last
-// change, the stop, ends the span instead; measuring to now would make a
-// stopped apply's duration keep growing.
-func finishedApplyDuration(a ActiveApplyData) string {
-	end := a.CompletedAt
-	if end == "" {
-		end = a.UpdatedAt
-	}
-	return formatApplyDuration(a.StartedAt, end)
 }
 
 // retainPopulatedStatusColumns drops every optional column no row fills in.

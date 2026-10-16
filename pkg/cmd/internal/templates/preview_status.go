@@ -34,10 +34,9 @@ func previewStatesOutput() {
 }
 
 // previewStatusApply builds a status row that started startedAgo before the
-// preview time and, when endedAgo is non-zero, last changed endedAgo before it.
-// A terminal row other than stopped completed at that time too.
-func previewStatusApply(id, database, environment, applyState, caller string, startedAgo, endedAgo time.Duration) ActiveApplyData {
-	a := ActiveApplyData{
+// preview time.
+func previewStatusApply(id, database, environment, applyState, caller string, startedAgo time.Duration) ActiveApplyData {
+	return ActiveApplyData{
 		ApplyID:     id,
 		Database:    database,
 		Environment: environment,
@@ -47,24 +46,17 @@ func previewStatusApply(id, database, environment, applyState, caller string, st
 		StartedAt:   previewTime.Add(-startedAgo).Format(time.RFC3339),
 		UpdatedAt:   previewTime.Add(-30 * time.Second).Format(time.RFC3339),
 	}
-	if endedAgo > 0 {
-		a.UpdatedAt = previewTime.Add(-endedAgo).Format(time.RFC3339)
-		if state.IsTerminalApplyState(applyState) && !state.IsState(applyState, state.Apply.Stopped) {
-			a.CompletedAt = a.UpdatedAt
-		}
-	}
-	return a
 }
 
 func previewStatusListOutput() {
 	active := []ActiveApplyData{
-		previewStatusApply("apply_abc123", "orders-db", "staging", state.Apply.Running, "github:octocat@acme/shop#412", 15*time.Minute, 0),
-		previewStatusApply("apply_def456", "users-db", "production", state.Apply.WaitingForCutover, "cli:jdoe@macbook.local", 45*time.Minute, 0),
+		previewStatusApply("apply_abc123", "orders-db", "staging", state.Apply.Running, "github:octocat@acme/shop#412", 15*time.Minute),
+		previewStatusApply("apply_def456", "users-db", "production", state.Apply.WaitingForCutover, "cli:jdoe@macbook.local", 45*time.Minute),
 	}
 	finished := []ActiveApplyData{
-		previewStatusApply("apply_ghi789", "analytics", "staging", state.Apply.Stopped, "github:hubot@acme/analytics#87", 2*time.Hour, 108*time.Minute),
-		previewStatusApply("apply_jkl012", "orders-db", "staging", state.Apply.Completed, "github:octocat@acme/shop#415", 3*time.Hour, 150*time.Minute),
-		previewStatusApply("apply_mno345", "billing-db", "staging", state.Apply.Failed, "cli:jdoe@macbook.local", 5*time.Hour, 270*time.Minute),
+		previewStatusApply("apply_ghi789", "analytics", "staging", state.Apply.Stopped, "github:hubot@acme/analytics#87", 2*time.Hour),
+		previewStatusApply("apply_jkl012", "orders-db", "staging", state.Apply.Completed, "github:octocat@acme/shop#415", 3*time.Hour),
+		previewStatusApply("apply_mno345", "billing-db", "staging", state.Apply.Failed, "cli:jdoe@macbook.local", 5*time.Hour),
 	}
 	finishedCounts := map[string]int{state.Apply.Stopped: 1, state.Apply.Completed: 41, state.Apply.Failed: 2}
 
@@ -109,8 +101,8 @@ func previewStatusListOutput() {
 	WriteStatusList(StatusListData{
 		Sectioned: true,
 		Applies: []ActiveApplyData{
-			previewStatusApply("apply_pqr678", "orders-db", "staging", state.Apply.Completed, "github:octocat@acme/shop#409", 7*time.Hour, 400*time.Minute),
-			previewStatusApply("apply_stu901", "billing-db", "staging", state.Apply.Failed, "cli:jdoe@macbook.local", 9*time.Hour, 530*time.Minute),
+			previewStatusApply("apply_pqr678", "orders-db", "staging", state.Apply.Completed, "github:octocat@acme/shop#409", 7*time.Hour),
+			previewStatusApply("apply_stu901", "billing-db", "staging", state.Apply.Failed, "cli:jdoe@macbook.local", 9*time.Hour),
 		},
 		StateCounts: finishedCounts,
 		Limit:       2,

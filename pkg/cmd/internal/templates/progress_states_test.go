@@ -100,31 +100,6 @@ func TestWriteStatusListHasMoreFooterAtMaxLimit(t *testing.T) {
 	assert.Contains(t, failed, "Showing 1 more failed schema changes. Add --after apply-example for the next 1000.")
 }
 
-// A finished apply's DURATION is how long it ran. A stopped apply records no
-// completion time, since it can be resumed, so its span ends at the stop, its
-// last change, rather than growing with every later call.
-func TestWriteSectionedStatusListDuration(t *testing.T) {
-	output := captureStdout(t, func() {
-		WriteStatusList(StatusListData{
-			Sectioned: true,
-			Limit:     20,
-			Applies: []ActiveApplyData{
-				{
-					ApplyID: "apply-completed", Database: "orders", Environment: "staging", State: state.Apply.Completed,
-					StartedAt: "2026-05-28T12:00:00Z", CompletedAt: "2026-05-28T13:00:00Z", UpdatedAt: "2026-05-28T13:00:05Z", Caller: "cli",
-				},
-				{
-					ApplyID: "apply-stopped", Database: "billing", Environment: "staging", State: state.Apply.Stopped,
-					StartedAt: "2026-05-28T12:00:00Z", UpdatedAt: "2026-05-28T12:12:00Z", Caller: "cli",
-				},
-			},
-		})
-	})
-	assert.Contains(t, output, "No active schema changes")
-	assert.Regexp(t, `apply-completed\s.*\s1h\s`, output)
-	assert.Regexp(t, `apply-stopped\s.*\s12m\s`, output)
-}
-
 func TestWriteStatusListStateSummary(t *testing.T) {
 	output := captureStdout(t, func() {
 		WriteStatusList(StatusListData{

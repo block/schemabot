@@ -256,17 +256,16 @@ $ schemabot status -e staging
 Recent schema changes
 3 total: 2 Completed · 1 Failed
 
-  APPLY ID          DATABASE  ENV      STATE      STARTED      DURATION  SOURCE
-  apply-example-72  billing   staging  Completed  1 hour ago   12m       https://github.com/acme/billing/pull/18
-  apply-example-71  catalog   staging  Failed     2 hours ago  3m        https://github.com/acme/store/pull/40
-  apply-example-70  accounts  staging  Completed  3 hours ago  41m       https://github.com/acme/accounts/pull/12
+  APPLY ID          DATABASE  ENV      STATE      STARTED      SOURCE
+  apply-example-72  billing   staging  Completed  1 hour ago   https://github.com/acme/billing/pull/18
+  apply-example-71  catalog   staging  Failed     2 hours ago  https://github.com/acme/store/pull/40
+  apply-example-70  accounts  staging  Completed  3 hours ago  https://github.com/acme/accounts/pull/12
 
 Use 'schemabot status <apply_id>' to view details
 ```
 
 Every active schema change is listed first, however long ago it started. The
-finished ones follow, newest first, with how long each ran. Raise `--limit` to
-see more of them. Past the server's cap of 1,000, `status` names the apply to
+finished ones follow, newest first. Raise `--limit` to see more of them. Past the server's cap of 1,000, `status` names the apply to
 pass to `--after` for the next page; `--all` follows every page for you. The [schema intelligence guide](schema-intelligence.md#whats-running-across-the-fleet)
 shows a paged walk.
 

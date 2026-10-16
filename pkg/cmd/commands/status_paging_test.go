@@ -8,7 +8,6 @@ import (
 	"strings"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -104,19 +103,15 @@ func statusPage(hasMore bool, running []string, identifiers ...string) apitypes.
 		HasMore:     hasMore,
 		StateCounts: map[string]int{state.Apply.Completed: 5, state.Apply.Running: 1},
 	}
-	started := time.Now().Add(-time.Hour)
 	for _, identifier := range identifiers {
-		apply := &apitypes.ActiveApplyResponse{
-			ApplyID: identifier, Database: "orders", Environment: "staging", State: state.Apply.Completed, Engine: "spirit", Caller: "cli",
-			StartedAt:   started.Format(time.RFC3339),
-			CompletedAt: started.Add(4 * time.Minute).Format(time.RFC3339),
-		}
+		applyState := state.Apply.Completed
 		if slices.Contains(running, identifier) {
-			apply.State = state.Apply.Running
-			apply.CompletedAt = ""
+			applyState = state.Apply.Running
 			page.ActiveCount++
 		}
-		page.Applies = append(page.Applies, apply)
+		page.Applies = append(page.Applies, &apitypes.ActiveApplyResponse{
+			ApplyID: identifier, Database: "orders", Environment: "staging", State: applyState, Engine: "spirit", Caller: "cli",
+		})
 	}
 	return page
 }
@@ -237,8 +232,7 @@ func TestStatusCmdPagingFlagsOnlyApplyToTheList(t *testing.T) {
 
 // The default view lists every active apply above the finished ones, from two
 // requests carrying the same filters: the finished applies a page at a time,
-// and the active ones in full. Only the finished applies show how long each
-// ran, and the footer pages them alone.
+// and the active ones in full. The footer pages the finished applies alone.
 func TestStatusCmdShowsActiveAboveFinished(t *testing.T) {
 	ps, server := newPagedServer(t, "/api/status", map[string]any{
 		"active=false:": statusPage(true, nil, "apply-4", "apply-3"),
@@ -256,11 +250,8 @@ func TestStatusCmdShowsActiveAboveFinished(t *testing.T) {
 	activeSection, recentSection := output[activeHeader:recentHeader], output[recentHeader:]
 	assert.Contains(t, activeSection, "apply-6")
 	assert.Contains(t, activeSection, "apply-5")
-	assert.NotContains(t, activeSection, "DURATION", "a running apply's start time already says how long it has run")
 	assert.Contains(t, recentSection, "apply-4")
 	assert.Contains(t, recentSection, "apply-3")
-	assert.Contains(t, recentSection, "DURATION")
-	assert.Contains(t, recentSection, "4m")
 	assert.Contains(t, recentSection, "Showing the 2 most recent schema changes. Use --limit N to show more.")
 
 	require.Len(t, ps.queries, 2)
@@ -341,6 +332,5 @@ func TestStatusCmdRendersAServerWithoutTheFinishedFilterAsOneTable(t *testing.T)
 	assert.Contains(t, output, "1 active schema change")
 	assert.Contains(t, output, "apply-2")
 	assert.NotContains(t, output, "Recent schema changes")
-	assert.NotContains(t, output, "DURATION")
 	require.Len(t, ps.queries, 1, "the active applies are already in the server's list")
 }
