@@ -1758,7 +1758,8 @@ func pathInsideAny(p string, dirs []string) bool {
 // is the one SchemaBot already privileges — the post-merge reconcile runs for
 // it alone, and a registered repository cannot be pointed at another ref.
 //
-// The result is always a subset of files, so this can only ever narrow
+// The result is always a subset of files, with the previous path of a rename
+// the default branch already holds cleared, so this can only ever narrow
 // discovery: it cannot surface a database that was not already discovered.
 // Only the files discovery keys on are compared, so a pull request that touches
 // no schema costs no API calls.
@@ -1800,27 +1801,36 @@ func (ic *InstallationClient) PRFilesProposedAgainstDefaultBranch(ctx context.Co
 			proposed = append(proposed, file)
 			continue
 		}
+		// The current path and the vacated path are separate claims, so each
+		// is measured on its own: a pull request can edit the destination of a
+		// rename the default branch already holds without proposing the
+		// removal again.
+		keep := false
 		if isDiscoveryInputFile(file.Filename) {
 			differs, err := ic.pathDiffersFromDefaultBranch(ctx, repo, headSHA, defaultTipSHA, file.Filename, levelCache)
 			if err != nil {
 				return nil, defaultTipSHA, err
 			}
-			if differs {
-				proposed = append(proposed, file)
-				continue
-			}
+			keep = differs
 		}
 		// A rename proposes vacating its previous schema path only when the
 		// head lacks that path and the default branch still declares it; a
-		// rename the default branch already holds is inherited history.
+		// rename the default branch already holds is inherited history, so
+		// its previous path is cleared and discovery does not resolve the
+		// config that managed it.
 		if vacated, ok := renamedAwaySchemaPath(file); ok {
 			removes, err := ic.pathRemovedFromDefaultBranch(ctx, repo, headSHA, defaultTipSHA, vacated, levelCache)
 			if err != nil {
 				return nil, defaultTipSHA, err
 			}
 			if removes {
-				proposed = append(proposed, file)
+				keep = true
+			} else {
+				file.PreviousFilename = ""
 			}
+		}
+		if keep {
+			proposed = append(proposed, file)
 		}
 	}
 	return proposed, defaultTipSHA, nil
