@@ -139,11 +139,13 @@ func targetUnreported(data MultiDeploymentApplyData, i int) bool {
 // targetStrip is a table line's targets, each with its progress on the table,
 // for the per-target strip under the line.
 func targetStrip(cells []TableProgressData, targets []string) []ShardProgressData {
+	parts := targetParts(cells)
 	strip := make([]ShardProgressData, len(cells))
 	for i, c := range cells {
 		strip[i] = ShardProgressData{
 			Shard: targets[i], Status: c.Status, PercentComplete: c.PercentComplete, RowsCopied: c.RowsCopied, RowsTotal: c.RowsTotal,
 			ChecksumRowsChecked: c.ChecksumRowsChecked, ChecksumRowsTotal: c.ChecksumRowsTotal,
+			PlannedRows: parts[i].PlannedRows,
 		}
 	}
 	return strip
@@ -257,7 +259,9 @@ func rankTargetTableLines(lines []targetTableLine) {
 // Until every target completes, the line leads with the table's bar across
 // all of its targets (presentation.PercentAcrossTargets, keepsTargetProgressBar),
 // whatever phase each target is in, and the rows line names its coverage only
-// when a target is left out of the sum. Until every target still to copy
+// when a target is left out of the sum. A target that has not reported its
+// copy yet but carries the plan's row estimate is counted by that estimate,
+// which makes the total approximate. Until every target still to copy
 // reports, the ETA (the slowest target's) is a floor. Failed targets are
 // counted rather than summed, since their rows are not progressing, and so are
 // retrying targets. A completed target has reported even when it had no rows
@@ -271,8 +275,8 @@ func rankTargetTableLines(lines []targetTableLine) {
 // on the table never starts it, so the line says not started rather than
 // queued.
 func writeTargetTableLine(sb *strings.Builder, table string, cells []TableProgressData, strip []ShardProgressData, settled bool, budget *ddlBlockBudget, writeDDL func()) {
-	var done, queued, failed, retrying, reporting, unreported int
-	var copied, total, eta int64
+	var done, queued, failed, retrying, reporting, unreported, estimated int
+	var copied, total, planned, eta int64
 	var running int
 	for _, c := range cells {
 		status := state.NormalizeTaskStatus(c.Status)
@@ -299,6 +303,19 @@ func writeTargetTableLine(sb *strings.Builder, table string, cells []TableProgre
 			eta = max(eta, c.ETASeconds)
 		}
 		if c.RowsTotal == 0 {
+			if !presentation.CopyStillAhead(status) {
+				// The target is past its copy, so the table it copied had no
+				// rows: its zero is the engine's answer.
+				reporting++
+				continue
+			}
+			if c.EstimatedRows != nil {
+				// The target has not reported its copy yet, so the plan's
+				// estimate stands in for the rows it will copy.
+				estimated++
+				planned += *c.EstimatedRows
+				continue
+			}
 			unreported++
 			continue
 		}
@@ -313,17 +330,20 @@ func writeTargetTableLine(sb *strings.Builder, table string, cells []TableProgre
 	status := rollupTaskStatus(cells)
 	if keepsTargetProgressBar(cells, status, done, pending, settled) {
 		percent := presentation.PercentAcrossTargets(targetParts(cells), 0)
-		if pct := ui.RowCopyDisplayPercent(percent, copied); pct > 0 {
+		// With the rows to copy known, the bar leads from the copy's start,
+		// even at 0%, so the size of the work shows before any row moves.
+		if pct := ui.RowCopyDisplayPercent(percent, copied); pct > 0 || total+planned > 0 {
 			// The list under the rows says where each target stands, so the
 			// headline carries only the table's progress across all of them,
 			// the way a sharded table's does.
 			fmt.Fprintf(sb, "**%s**: %s %d%%\n", name, ui.ProgressBarRowCopy(pct), pct)
 			writeDDL()
-			if total > 0 {
-				line := fmt.Sprintf("- Rows: %s / %s", ui.FormatNumber(copied), ui.FormatNumber(total))
-				partial := reporting < len(cells)
+			if total+planned > 0 {
+				line := fmt.Sprintf("- Rows: %s / %s", ui.FormatNumber(copied), rolledRowsTotal(total, planned))
+				counted := reporting + estimated
+				partial := counted < len(cells)
 				if partial {
-					line += fmt.Sprintf(" across %d of %d targets", reporting, len(cells))
+					line += fmt.Sprintf(" across %d of %d targets", counted, len(cells))
 				}
 				// The planned size is every target's, including those left out of
 				// the rows, so beside partial rows it names the full span rather
@@ -338,7 +358,7 @@ func writeTargetTableLine(sb *strings.Builder, table string, cells []TableProgre
 					// A target still to start, or working without its rows
 					// reported yet, can only add time.
 					floor := ""
-					if queued+unreported > 0 {
+					if queued+unreported+estimated > 0 {
 						floor = "≥ "
 					}
 					line += " · ETA: " + floor + ui.FormatETA(eta)
@@ -378,6 +398,11 @@ func writeTargetTableLine(sb *strings.Builder, table string, cells []TableProgre
 	}
 	fmt.Fprintf(sb, "**%s**: %s%s\n", name, phrase, coverage)
 	writeDDL()
+	if status == state.Task.Pending && !settled {
+		if rows := targetsPlannedRows(cells); rows != nil {
+			writePlannedRows(sb, rows, targetsTableBytes(cells), presentation.PlannedRowsSpan(len(cells)))
+		}
+	}
 	if lists {
 		writeMemberList(sb, presentation.TargetNoun, strip, pendingWord, budget)
 	}
@@ -437,13 +462,43 @@ func partlyCompleted(status string, done, queued int) bool {
 }
 
 // targetParts is a table's progress on each target that runs it, as the
-// shared part rules read it.
+// shared part rules read it. A target whose copy is still ahead and has
+// reported no row total carries the plan's estimate in its place.
 func targetParts(cells []TableProgressData) []presentation.Part {
 	parts := make([]presentation.Part, len(cells))
 	for i, c := range cells {
 		parts[i] = presentation.Part{Status: c.Status, PercentComplete: c.PercentComplete, RowsCopied: c.RowsCopied, RowsTotal: c.RowsTotal}
+		if c.RowsTotal == 0 && presentation.CopyStillAhead(c.Status) {
+			parts[i].PlannedRows = c.EstimatedRows
+		}
 	}
 	return parts
+}
+
+// rolledRowsTotal is the denominator of a table's rows across targets: the
+// engines' totals, plus the plan's estimate for each target that has not
+// reported yet, which makes the sum approximate.
+func rolledRowsTotal(reported, planned int64) string {
+	if planned > 0 {
+		return ui.FormatApproxRows(reported + planned)
+	}
+	return ui.FormatNumber(reported)
+}
+
+// targetsPlannedRows totals a table's planned rows across the targets that run
+// it, under the same every-target rule as targetsTableBytes.
+func targetsPlannedRows(cells []TableProgressData) *int64 {
+	if len(cells) == 0 {
+		return nil
+	}
+	var total int64
+	for _, c := range cells {
+		if c.EstimatedRows == nil {
+			return nil
+		}
+		total += *c.EstimatedRows
+	}
+	return &total
 }
 
 // targetsTableBytes totals a table's planned size across the targets that run

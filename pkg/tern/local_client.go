@@ -2909,6 +2909,7 @@ func buildDispatchTasks(plan *storage.Plan, scope dispatchScope, environment, en
 			ExecutionMode:  ddlChange.ExecutionMode,
 			ModeReason:     ddlChange.ModeReason,
 			EstimatedBytes: ddlChange.TaskEstimatedBytes(scope.shard),
+			EstimatedRows:  ddlChange.TaskEstimatedRows(scope.shard),
 			CreatedAt:      now,
 			UpdatedAt:      now,
 		}
@@ -3797,6 +3798,7 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 		tp.RowsCopied = t.RowsCopied
 		tp.RowsTotal = t.RowsTotal
 		tp.EstimatedBytes = t.EstimatedBytes
+		tp.EstimatedRows = t.EstimatedRows
 		tp.ChecksumRowsChecked = t.ChecksumRowsChecked
 		tp.ChecksumRowsTotal = t.ChecksumRowsTotal
 		tp.Throttled = t.Throttled

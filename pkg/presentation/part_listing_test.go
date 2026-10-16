@@ -51,6 +51,7 @@ func TestPartDetail(t *testing.T) {
 		{Part{Status: task.Running, PercentComplete: 45}, "45%"},
 		{Part{Status: task.Running}, "copying"},
 		{Part{Status: task.Pending}, "queued"},
+		{Part{Status: task.Pending, PlannedRows: new(int64(1_200))}, "queued · ~1.2k rows"},
 		{Part{Status: task.WaitingForCutover}, "waiting for cutover"},
 		{Part{Status: task.Checksumming}, "checksumming"},
 		{Part{Status: task.Checksumming, ChecksumRowsChecked: 450, ChecksumRowsTotal: 1000}, "checksumming 45.00% · 450 / 1,000 rows verified"},
@@ -65,6 +66,7 @@ func TestPartDetail(t *testing.T) {
 	}
 	// A part a settled rollout will never run reads as not started.
 	assert.Equal(t, "not started", PartDetail(Part{Status: task.Pending}, PendingWord(true)))
+	assert.Equal(t, "not started · ~1.2k rows", PartDetail(Part{Status: task.Pending, PlannedRows: new(int64(1_200))}, PendingWord(true)))
 }
 
 // Up to the inline limit a listing names every part in the parts' own order,
@@ -257,6 +259,43 @@ func TestPercentAcrossTargets(t *testing.T) {
 	}, 0))
 	assert.Equal(t, 100, PercentAcrossTargets([]Part{{Status: task.Completed}, {Status: task.RevertWindow}}, 0))
 	assert.Equal(t, 0, PercentAcrossTargets(nil, 0))
+}
+
+// A target whose copy is still ahead counts by the plan's row estimate, so
+// the bar is the rows copied over the rows to copy across every target from
+// the start. A target without an estimate, or one with no progress at all,
+// leaves the table to its share.
+func TestPercentAcrossTargets_PlannedRows(t *testing.T) {
+	task := state.Task
+	planned := func(rows int64) *int64 { return &rows }
+	copying := Part{Status: task.Running, RowsCopied: 500, RowsTotal: 1000}
+	// 500 of 1,000 + 1,200 + 1,800 planned is 12%, where the share across
+	// three targets would read 16%.
+	assert.Equal(t, 12, PercentAcrossTargets([]Part{
+		copying,
+		{Status: task.Pending, PlannedRows: planned(1200)},
+		{Status: task.Pending, PlannedRows: planned(1800)},
+	}, 0))
+	// A target that started but has not reported its total counts by its
+	// estimate too.
+	assert.Equal(t, 12, PercentAcrossTargets([]Part{
+		copying,
+		{Status: task.Running, PlannedRows: planned(1200)},
+		{Status: task.Pending, PlannedRows: planned(1800)},
+	}, 0))
+	// A target past its copy with no rows had none to copy, so the rows of
+	// the others carry the bar.
+	assert.Equal(t, 50, PercentAcrossTargets([]Part{copying, {Status: task.WaitingForCutover}}, 0))
+	// Without an estimate for every target, the table reads its share.
+	assert.Equal(t, 16, PercentAcrossTargets([]Part{
+		copying,
+		{Status: task.Pending, PlannedRows: planned(1200)},
+		{Status: task.Pending},
+	}, 0))
+	assert.Equal(t, 16, PercentAcrossTargets([]Part{
+		copying,
+		{Status: task.Pending, PlannedRows: planned(1200)},
+	}, 1))
 }
 
 // A target undoing the change speaks for the table whatever its siblings are

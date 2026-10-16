@@ -89,6 +89,14 @@ type TableProgress struct {
 	// EstimatedBytes is the table's on-disk size when it was planned, shown
 	// beside the row counts. Nil when the plan had no estimate.
 	EstimatedBytes *int64
+	// EstimatedRows is the table's row count when it was planned, shown while
+	// the table is queued and before the engine reports RowsTotal. Nil when
+	// the plan had no estimate.
+	EstimatedRows *int64
+	// RowsTotalPlanned marks a RowsTotal rolled up across targets that
+	// includes the plan's estimate for targets that have not reported their
+	// copy yet, so the total renders as approximate.
+	RowsTotalPlanned bool
 	// PlannedShards is how many shards a sharded table's change spans per its
 	// plan, the shards EstimatedBytes covers. Zero when the plan recorded none.
 	PlannedShards int
@@ -131,6 +139,11 @@ type ShardProgress struct {
 	// target's verify has got, once its engine reports a total.
 	ChecksumRowsChecked int64
 	ChecksumRowsTotal   int64
+	// PlannedRows is the plan's row estimate for a target in a table rolled up
+	// across targets whose copy is still ahead and has reported no row total,
+	// standing in for its rows in the rolled-up total
+	// (TableProgress.RowsTotalPlanned). Nil otherwise.
+	PlannedRows *int64
 }
 
 // Display-only task states. These are not persisted apply states (see pkg/applystate)
@@ -209,6 +222,7 @@ func ParseProgressResponse(result *apitypes.ProgressResponse) ProgressData {
 			RowsCopied:          tbl.RowsCopied,
 			RowsTotal:           tbl.RowsTotal,
 			EstimatedBytes:      tbl.EstimatedBytes,
+			EstimatedRows:       tbl.EstimatedRows,
 			PlannedShards:       int(tbl.PlannedShards),
 			PercentComplete:     int(tbl.PercentComplete),
 			ETASeconds:          tbl.ETASeconds,

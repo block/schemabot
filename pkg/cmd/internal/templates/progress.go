@@ -12,6 +12,7 @@ import (
 	"github.com/block/schemabot/pkg/cmd/cliname"
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/glyph"
+	"github.com/block/schemabot/pkg/presentation"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/ui"
@@ -514,6 +515,7 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 		if t.DDL != "" {
 			b.WriteString(formatTableDDL(t))
 		}
+		writePlannedRows(&b, t)
 		b.WriteString("\n")
 		b.WriteString(formatTableParts(t))
 		return b.String()
@@ -854,15 +856,38 @@ func recoveringIsCopyingRows(t TableProgress) bool {
 func writeStructuredRowsAndETA(b *strings.Builder, t TableProgress) {
 	coverage, size, partial := rowsCoverageAndSize(t)
 	eta := ui.FormatETA(t.ETASeconds)
-	if partial {
-		// The unreported shards can only add time, so the ETA is a floor.
+	if partial || t.RowsTotalPlanned {
+		// The unreported shards or targets can only add time, so the ETA is
+		// a floor.
 		eta = "≥ " + eta
 	}
+	total := ui.FormatNumber(t.RowsTotal)
+	if t.RowsTotalPlanned {
+		total = ui.FormatApproxRows(t.RowsTotal)
+	}
 	if t.ETASeconds > 0 {
-		fmt.Fprintf(b, indentDetail+"Rows: %s / %s%s%s · ETA: %s\n", ui.FormatNumber(ui.ClampRows(t.RowsCopied, t.RowsTotal)), ui.FormatNumber(t.RowsTotal), coverage, size, eta)
+		fmt.Fprintf(b, indentDetail+"Rows: %s / %s%s%s · ETA: %s\n", ui.FormatNumber(ui.ClampRows(t.RowsCopied, t.RowsTotal)), total, coverage, size, eta)
 		return
 	}
-	fmt.Fprintf(b, indentDetail+"Rows: %s / %s%s%s\n", ui.FormatNumber(ui.ClampRows(t.RowsCopied, t.RowsTotal)), ui.FormatNumber(t.RowsTotal), coverage, size)
+	fmt.Fprintf(b, indentDetail+"Rows: %s / %s%s%s\n", ui.FormatNumber(ui.ClampRows(t.RowsCopied, t.RowsTotal)), total, coverage, size)
+}
+
+// writePlannedRows writes the rows line of a queued table: the plan's row
+// estimate and size, both approximate, so the work ahead is visible before
+// the copy starts. A table rolled up across targets names them, since its
+// estimate is their sum. It writes nothing when the plan had no row estimate,
+// which a table rolled up across targets lacks while some of its targets have
+// reported nothing at all: their estimates are not known, so a sum of the rest
+// would understate the table (tableAcrossTargets).
+func writePlannedRows(b *strings.Builder, t TableProgress) {
+	if t.EstimatedRows == nil {
+		return
+	}
+	span := ""
+	if t.AcrossTargets {
+		span = presentation.PlannedRowsSpan(len(t.Shards))
+	}
+	fmt.Fprintf(b, indentDetail+"Rows: %s%s%s\n", ui.FormatApproxRows(*t.EstimatedRows), span, ui.FormatTableSizeClause(t.EstimatedBytes))
 }
 
 // rowsCoverageAndSize returns the clauses a table's rows line carries after

@@ -4685,18 +4685,21 @@ schemabot start apply-a1b2c3d4e5f6 -e staging
 ```sql
 ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 ```
+- Rows: ~1.6M · ~438 MB
 
 **`users`**: ⏳ Queued
 
 ```sql
 ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```
+- Rows: ~1.5M · ~391 MB
 
 **`products`**: ⏳ Queued
 
 ```sql
 ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 ```
+- Rows: ~612k · ~157 MB
 
 
 ---
@@ -4738,12 +4741,14 @@ ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 ```sql
 ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```
+- Rows: ~1.5M · ~391 MB
 
 **`products`**: ⏳ Queued
 
 ```sql
 ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 ```
+- Rows: ~612k · ~157 MB
 
 
 ---
@@ -4785,6 +4790,7 @@ ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```sql
 ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 ```
+- Rows: ~612k · ~157 MB
 
 **`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete
 
@@ -4833,6 +4839,7 @@ ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```sql
 ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 ```
+- Rows: ~612k · ~157 MB
 
 **`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete
 
@@ -4881,6 +4888,7 @@ ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```sql
 ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 ```
+- Rows: ~612k · ~157 MB
 
 **`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete
 
@@ -4928,6 +4936,7 @@ ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```sql
 ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 ```
+- Rows: ~612k · ~157 MB
 
 **`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete
 
@@ -4975,6 +4984,7 @@ ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```sql
 ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 ```
+- Rows: ~612k · ~157 MB
 
 **`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete
 
@@ -5024,6 +5034,7 @@ ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```sql
 ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 ```
+- Rows: ~612k · ~157 MB
 
 **`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete
 
@@ -5071,6 +5082,7 @@ ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```sql
 ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 ```
+- Rows: ~612k · ~157 MB
 
 **`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete
 
@@ -5438,6 +5450,7 @@ ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```sql
 ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 ```
+- Rows: ~612k · ~157 MB
 
 **`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete
 
@@ -5485,6 +5498,7 @@ ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```sql
 ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 ```
+- Rows: ~612k · ~157 MB
 
 **`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete
 
@@ -8723,6 +8737,7 @@ ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```sql
 ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 ```
+- Rows: ~612k · ~157 MB
 
 **`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete
 
@@ -8804,12 +8819,14 @@ ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 ```sql
 ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```
+- Rows: ~1.5M · ~391 MB
 
 **`products`**: ⏳ Queued
 
 ```sql
 ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 ```
+- Rows: ~612k · ~157 MB
 
 
 </dd></dl>
@@ -8830,6 +8847,7 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 ```sql
 ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 ```
+- Rows: ~1.6M · ~438 MB
 
 
 </dd></dl>
@@ -9067,6 +9085,7 @@ ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```sql
 ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 ```
+- Rows: ~612k · ~157 MB
 
 **`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete
 

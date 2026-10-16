@@ -578,6 +578,22 @@ func (tc TableChange) TaskEstimatedBytes(shard string) *int64 {
 	return &bytes
 }
 
+// TaskEstimatedRows returns the row estimate a task created from this change
+// carries, under the same whole-table rule as TaskEstimatedBytes: a task
+// scoped to one shard carries none rather than the whole table's count. Only
+// an ALTER copies rows, so a task for any other change carries none either:
+// the plan sizes a table it drops, but that is not work the task will copy.
+func (tc TableChange) TaskEstimatedRows(shard string) *int64 {
+	if shard != "" || tc.EstimatedRows == nil {
+		return nil
+	}
+	if !strings.EqualFold(tc.Operation, "alter") {
+		return nil
+	}
+	rows := *tc.EstimatedRows
+	return &rows
+}
+
 // RequiresUnsafeOptIn reports whether applying this change requires explicit
 // unsafe opt-in. Stored plans keep the planner's unsafe metadata; drop remains
 // fail-closed so older plans without the metadata cannot queue table deletion as
@@ -2035,6 +2051,11 @@ type Task struct {
 	// it. Nil when the plan had no estimate, and for per-shard rows, since a
 	// plan's estimate covers the whole table.
 	EstimatedBytes *int64
+	// EstimatedRows is the planner's approximate row count for the table,
+	// copied from the plan change like EstimatedBytes and under the same
+	// rules, so a task that has not started copying can still show how much
+	// it will copy. The engine's RowsTotal replaces it once the copy reports.
+	EstimatedRows *int64
 	// Checksum phase progress: rows verified so far and total to verify.
 	// Non-zero only while the task is checksumming (verifying copied data).
 	ChecksumRowsChecked int64

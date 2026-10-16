@@ -24,6 +24,11 @@ type Part struct {
 	// part's verify has got, once its engine reports a total.
 	ChecksumRowsChecked int64
 	ChecksumRowsTotal   int64
+	// PlannedRows is the plan's row estimate for a part whose copy is still
+	// ahead (CopyStillAhead) and whose engine has reported no row total yet,
+	// standing in for the rows it will copy. Nil once the part reports a
+	// total, or when the plan had no estimate for it.
+	PlannedRows *int64
 }
 
 // PendingQueued and PendingNotStarted name a part still to run: queued while
@@ -321,6 +326,11 @@ func PartDetail(p Part, pendingWord string) string {
 		}
 		return partProgress(p)
 	case state.Task.Pending:
+		// A part still to run keeps its queued word and says how much it
+		// will copy, once the plan sized it.
+		if p.PlannedRows != nil {
+			return pendingWord + " · " + ui.FormatApproxRows(*p.PlannedRows) + " rows"
+		}
 		return pendingWord
 	case state.Task.Checksumming:
 		if p.ChecksumRowsTotal <= 0 {
@@ -497,20 +507,21 @@ func PartStatusLabel(status string) string {
 }
 
 // PercentAcrossTargets is how far a table is across every target that runs it,
-// for the bar that leads its line until every target completes. Once every
-// target is complete or working and has reported its rows, it is the rows
-// copied over the rows planned across them. Otherwise it is the table's share
-// across all of its targets: a completed target counts in full, a working
-// target by the rows its engine reports, and every other target as nothing
-// yet. A target that failed, is retrying, halted, or is undoing the change
-// counts as nothing, since it has not landed the change and its rows are not
-// progressing, so one copy
-// beside many failures never reads as half done. silent is the targets with no
-// progress reported at all.
-// The percent stops short of complete until every target has completed, since
-// rows copied on a target still verifying or waiting to cut over are not the
-// change landing there. It only combines what the engines report, so it is not
-// an estimate.
+// for the bar that leads its line until every target completes. While every
+// target's rows are known, it is the rows copied over the rows to copy across
+// all of them. A target's rows are known once it has completed, once its
+// engine reports a row total, once it is past its copy (a table with no rows
+// to copy), or, while its copy is still ahead, from the plan's estimate
+// (Part.PlannedRows), which counts as nothing copied yet. Otherwise it is the
+// table's share across all of its targets: a completed target counts in full,
+// a working target by the rows its engine reports, and every other target as
+// nothing yet. A target that failed, is retrying, halted, or is undoing the
+// change leaves the table to its share and counts as nothing, since it has not
+// landed the change and its rows are not progressing, so one copy beside many
+// failures never reads as half done. silent is the targets with no progress
+// reported at all. The percent stops short of complete until every target has
+// completed, since rows copied on a target still verifying or waiting to cut
+// over are not the change landing there.
 func PercentAcrossTargets(parts []Part, silent int) int {
 	targets := len(parts) + silent
 	if targets == 0 {
@@ -538,10 +549,22 @@ func PercentAcrossTargets(parts []Part, silent int) int {
 			// Undoing the change: the rows its copy moved are not progress.
 			everyReported = false
 		case state.Task.Pending:
-			everyReported = false
+			if p.PlannedRows == nil {
+				everyReported = false
+				continue
+			}
+			total += *p.PlannedRows
 		default:
 			if p.RowsTotal <= 0 {
-				everyReported = false
+				switch {
+				case p.PlannedRows != nil:
+					total += *p.PlannedRows
+				case CopyStillAhead(p.Status):
+					everyReported = false
+				default:
+					// Past its copy with no rows reported: the table had
+					// none to copy there.
+				}
 				continue
 			}
 			rows := ui.ClampRows(p.RowsCopied, p.RowsTotal)

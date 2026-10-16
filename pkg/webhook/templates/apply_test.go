@@ -1699,7 +1699,7 @@ func TestRenderApplyStatusComment_RecoveringCopyingRows(t *testing.T) {
 
 // A copying table shows its planned size beside the row counts, before the
 // ETA, and a stopped one keeps it. A table the plan had no estimate for shows
-// the row counts alone.
+// the row counts alone, and a queued table shows the plan's row estimate.
 func TestRenderApplyStatusComment_TableSizeBesideRows(t *testing.T) {
 	bytes := int64(23_400_000_000)
 	for _, tt := range []struct {
@@ -1731,6 +1731,14 @@ func TestRenderApplyStatusComment_TableSizeBesideRows(t *testing.T) {
 			state: state.Apply.Running,
 			table: TableProgressData{TableName: "orders", Status: state.Task.Running, RowsCopied: 1_234_567, RowsTotal: 48_200_000, PercentComplete: 2, ETASeconds: 720},
 			want:  "- Rows: 1,234,567 / 48,200,000 · ETA: 12m 0s\n",
+		},
+		{
+			// A queued table has reported nothing yet, so it shows the
+			// plan's estimates, both approximate.
+			name:  "queued",
+			state: state.Apply.Running,
+			table: TableProgressData{TableName: "orders", Status: state.Task.Pending, EstimatedRows: new(int64(48_200_000)), EstimatedBytes: &bytes},
+			want:  "```\n- Rows: ~48.2M · ~23.4 GB\n",
 		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {

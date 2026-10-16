@@ -31,9 +31,13 @@ type rolloutTarget struct {
 	ddl        string
 	rowsCopied int64
 	rowsTotal  int64
-	eta        int64
-	err        string
-	externalID string
+	// estimatedRows is the plan's row estimate for the target's table.
+	estimatedRows *int64
+	// estimatedBytes is the plan's size estimate for the target's table.
+	estimatedBytes *int64
+	eta            int64
+	err            string
+	externalID     string
 	// externalOperationID is the target's own data-plane operation.
 	externalOperationID string
 	isInstant           bool
@@ -86,7 +90,7 @@ func targetRolloutData(targets []rolloutTarget) ProgressData {
 			Deployment: "prod", Target: name, Namespace: "orders", TableName: "orders",
 			ChangeType: "alter", DDL: ddl, Status: target.status,
 			RowsCopied: target.rowsCopied, RowsTotal: target.rowsTotal, ETASeconds: target.eta, PercentComplete: percent,
-			IsInstant:           target.isInstant,
+			IsInstant: target.isInstant, EstimatedRows: target.estimatedRows, EstimatedBytes: target.estimatedBytes,
 			ChecksumRowsChecked: target.checksumChecked, ChecksumRowsTotal: target.checksumTotal,
 		})
 	}
@@ -750,6 +754,70 @@ func TestFormatTargetRollup_TableCountsItsTargets(t *testing.T) {
 		assert.Contains(t, out, "~ orders: "+ui.ProgressBarComplete()+" ✓ Complete\n", "%s", out)
 		assert.NotContains(t, out, "of 3 targets", "%s", out)
 	})
+}
+
+// A queued target counts toward the table's rows by the plan's estimate, so
+// the total spans every target from the start instead of reading the one
+// copying target's rows as the table's. The bar is the rows copied over that
+// total, and it leads from the copy's start, at 0% with the total ahead. The
+// estimate makes the total approximate and the ETA a floor. Before any target
+// starts, the table shows the estimate summed across its targets.
+func TestFormatTargetRollup_QueuedTargetsCountByPlannedRows(t *testing.T) {
+	queued := func(rows int64) rolloutTarget {
+		return rolloutTarget{opState: state.ApplyOperation.Pending, status: state.Task.Pending, estimatedRows: &rows}
+	}
+
+	out := renderRollout(t, targetRolloutData([]rolloutTarget{copyingTarget(500), queued(1_200), queued(1_800)}))
+	assert.Contains(t, out, "~ orders: "+ui.ProgressBarRowCopy(12)+" 12%\n", "%s", out)
+	assert.Contains(t, out, "Rows: 500 / ~4k · ETA: ≥ "+ui.FormatETA(120)+"\n", "%s", out)
+
+	out = renderRollout(t, targetRolloutData([]rolloutTarget{queued(1_000), queued(1_200), queued(1_800)}))
+	assert.Contains(t, out, "Rows: ~4k across 3 targets\n", "%s", out)
+
+	// Once the copy starts, the bar leads at 0% with the rows ahead, before
+	// any row moves and before the first target reports its total. A target
+	// still to run stays queued and says how much it will copy.
+	started := rolloutTarget{opState: state.ApplyOperation.Running, status: state.Task.Running, estimatedRows: new(int64(1_000))}
+	out = renderRollout(t, targetRolloutData([]rolloutTarget{started, queued(1_200), queued(1_800)}))
+	assert.Contains(t, out, "~ orders: "+ui.ProgressBarRowCopy(0)+" 0%\n", "%s", out)
+	assert.Contains(t, out, "Rows: 0 / ~4k\n", "%s", out)
+	assert.Contains(t, out, "○ payments-002: queued · ~1.2k rows\n", "%s", out)
+	assert.Contains(t, out, "○ payments-003: queued · ~1.8k rows\n", "%s", out)
+
+	// Each target copies its own data, so the planned size is summed across
+	// the targets like the rows, and only while every target carries one.
+	sized := func(rows, bytes int64) rolloutTarget {
+		target := queued(rows)
+		target.estimatedBytes = &bytes
+		return target
+	}
+	totalBytes := int64(6_000_000_000)
+	out = renderRollout(t, targetRolloutData([]rolloutTarget{sized(1_000, 1_000_000_000), sized(1_200, 2_000_000_000), sized(1_800, 3_000_000_000)}))
+	assert.Contains(t, out, "Rows: ~4k across 3 targets"+ui.FormatTableSizeClause(&totalBytes)+"\n", "%s", out)
+	out = renderRollout(t, targetRolloutData([]rolloutTarget{sized(1_000, 1_000_000_000), sized(1_200, 2_000_000_000), queued(1_800)}))
+	assert.Contains(t, out, "Rows: ~4k across 3 targets\n", "a size summed without every target would understate the table:\n%s", out)
+	copying := copyingTarget(500)
+	copying.estimatedBytes = new(int64(1_000_000_000))
+	out = renderRollout(t, targetRolloutData([]rolloutTarget{copying, sized(1_200, 2_000_000_000), queuedTarget()}))
+	assert.NotContains(t, out, ui.FormatTableSizeClause(new(int64(3_000_000_000))), "a target that has reported nothing has no size to add:\n%s", out)
+
+	// A target that has reported nothing has no estimate to add, so a sum of
+	// the others would understate the table and none is shown.
+	out = renderRollout(t, targetRolloutData([]rolloutTarget{queued(1_000), queued(1_200), queuedTarget()}))
+	assert.NotContains(t, out, "~2k", "%s", out)
+	assert.NotContains(t, out, "Rows: ~", "%s", out)
+}
+
+// A target past its copy that reports no rows copied an empty table, so its
+// zero is the engine's answer: the plan's estimate does not stand in for it,
+// and the table's total is the rows the targets reported.
+func TestFormatTargetRollup_PostCopyZeroIsNotEstimated(t *testing.T) {
+	stale := int64(900)
+	emptyTable := rolloutTarget{opState: state.ApplyOperation.WaitingForCutover, status: state.Task.WaitingForCutover, estimatedRows: &stale}
+
+	out := renderRollout(t, targetRolloutData([]rolloutTarget{copyingTarget(500), emptyTable}))
+	assert.Contains(t, out, "Rows: 500 / 1,000 · ETA: "+ui.FormatETA(120)+"\n", "%s", out)
+	assert.NotContains(t, out, "/ ~", "%s", out)
 }
 
 // A failed target is named with its own data-plane identifiers, read from the
