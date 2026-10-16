@@ -7498,6 +7498,45 @@ func TestCutoverHandler(t *testing.T) {
 		assert.Contains(t, resp.Error, "recovering after restart")
 	})
 
+	// A remote data plane can still report waiting-for-cutover after SchemaBot
+	// recorded the apply as terminal. The stored terminal state wins: the request
+	// is refused up front rather than recorded as accepted and failed later.
+	t.Run("rejects cutover against a terminal apply while remote still reports waiting for cutover", func(t *testing.T) {
+		for _, terminal := range []string{state.Apply.Failed, state.Apply.Cancelled, state.Apply.Completed} {
+			t.Run(terminal, func(t *testing.T) {
+				mock := &mockTernClient{
+					isRemote: true,
+					progressResp: &ternv1.ProgressResponse{
+						State: ternv1.State_STATE_WAITING_FOR_CUTOVER,
+					},
+				}
+				apply := activeTestApply("apply-terminal-cutover")
+				apply.ExternalID = "remote-terminal-cutover"
+				apply.State = terminal
+				svc := newControlTestService(mock, apply)
+				mux := http.NewServeMux()
+				svc.ConfigureRoutes(mux)
+
+				body := `{"environment": "staging", "apply_id": "apply-terminal-cutover", "caller": "cli:cutter"}`
+				req := httptest.NewRequestWithContext(t.Context(), "POST", "/api/cutover", strings.NewReader(body))
+				req.Header.Set("Content-Type", "application/json")
+				w := httptest.NewRecorder()
+				mux.ServeHTTP(w, req)
+
+				assert.Equal(t, http.StatusConflict, w.Code, w.Body.String())
+				assert.Nil(t, mock.cutoverReq)
+				controlReq, err := svc.storage.ControlRequests().GetPending(t.Context(), apply.ID, storage.ControlOperationCutover)
+				require.NoError(t, err)
+				assert.Nil(t, controlReq, "no cutover request is recorded against a terminal apply")
+
+				var resp apitypes.ErrorResponse
+				err = json.NewDecoder(w.Body).Decode(&resp)
+				require.NoError(t, err)
+				assert.Contains(t, resp.Error, "schema change is not waiting for cutover (current state: "+terminal+")")
+			})
+		}
+	})
+
 	t.Run("queues cutover when remote progress reaches cutting over before stored state", func(t *testing.T) {
 		mock := &mockTernClient{
 			isRemote: true,
