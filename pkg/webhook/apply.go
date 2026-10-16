@@ -439,6 +439,9 @@ func shardProgressForTable(shardsByTable map[string][]*storage.Task, applyOperat
 			PercentComplete: r.ProgressPercent,
 			RowsCopied:      r.RowsCopied,
 			RowsTotal:       r.RowsTotal,
+
+			ChecksumRowsChecked: r.ChecksumRowsChecked,
+			ChecksumRowsTotal:   r.ChecksumRowsTotal,
 		})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Shard < out[j].Shard })

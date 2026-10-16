@@ -1871,6 +1871,10 @@ type ShardProgressResponse struct {
 	ETASeconds      int64  `json:"eta_seconds,omitempty"`
 	PercentComplete int32  `json:"percent_complete"`
 	CutoverAttempts int32  `json:"cutover_attempts,omitempty"`
+	// Checksum phase progress: rows verified so far and total to verify.
+	// Non-zero only while the shard is checksumming (verifying copied data).
+	ChecksumRowsChecked int64 `json:"checksum_rows_checked,omitempty"`
+	ChecksumRowsTotal   int64 `json:"checksum_rows_total,omitempty"`
 }
 
 // GetTableName implements ddl.TableWithName for filtering Spirit internal tables.

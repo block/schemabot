@@ -487,6 +487,11 @@ func writeTableLine(b *strings.Builder, t TableProgress, format string, args ...
 // provided activity bar and label when row-copy progress has exceeded its
 // estimate.
 func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel string) string {
+	if keepsAcrossTargetsBar(t) {
+		if out, ok := formatAcrossTargetsProgress(t); ok {
+			return out
+		}
+	}
 	if isHaltedAcrossTargets(t) {
 		return formatHaltedAcrossTargets(t)
 	}
@@ -495,6 +500,9 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 	}
 	if isNotStartedAcrossTargets(t) {
 		return formatNotStartedAcrossTargets(t)
+	}
+	if keepsShardedBar(t) {
+		return formatShardedPhaseProgress(t)
 	}
 
 	var b strings.Builder
@@ -868,13 +876,11 @@ func writeStructuredRowsAndETA(b *strings.Builder, t TableProgress) {
 // estimate and size, both approximate, so the work ahead is visible before
 // the copy starts. A table rolled up across targets names them, since its
 // estimate is their sum. It writes nothing when the plan had no row estimate,
-// or when some targets the line speaks for have reported nothing at all: their
-// estimates are not known, so a sum of the rest would understate the table.
+// which a table rolled up across targets lacks while some of its targets have
+// reported nothing at all: their estimates are not known, so a sum of the rest
+// would understate the table (tableAcrossTargets).
 func writePlannedRows(b *strings.Builder, t TableProgress) {
 	if t.EstimatedRows == nil {
-		return
-	}
-	if t.UnreportedTargets > 0 {
 		return
 	}
 	span := ""

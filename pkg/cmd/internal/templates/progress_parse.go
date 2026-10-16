@@ -120,10 +120,6 @@ type TableProgress struct {
 	// are only some of the deployment's, shown above the DDL. Empty when the
 	// DDL runs on every target.
 	OnTargets string
-	// UnreportedTargets counts the targets a rolled-up table speaks for that
-	// are still to run and have reported no progress yet, so have not started
-	// it. A settled target is not among them.
-	UnreportedTargets int
 	// RolloutSettled marks a rolled-up table whose rollout has settled with no
 	// target left to run, so a target still pending on it never starts it and
 	// reads as not started rather than queued.
@@ -139,6 +135,14 @@ type ShardProgress struct {
 	ETASeconds      int64
 	PercentComplete int
 	CutoverAttempts int
+	// ChecksumRowsChecked and ChecksumRowsTotal are how far a checksumming
+	// target's verify has got, once its engine reports a total.
+	ChecksumRowsChecked int64
+	ChecksumRowsTotal   int64
+	// RowsEstimated marks a target in a table rolled up across targets whose
+	// copy is still ahead: the plan's row estimate stands in for its rows in
+	// the rolled-up total (TableProgress.RowsTotalPlanned).
+	RowsEstimated bool
 }
 
 // Display-only task states. These are not persisted apply states (see pkg/applystate)
@@ -244,6 +248,9 @@ func ParseProgressResponse(result *apitypes.ProgressResponse) ProgressData {
 				ETASeconds:      sh.ETASeconds,
 				PercentComplete: pct,
 				CutoverAttempts: int(sh.CutoverAttempts),
+
+				ChecksumRowsChecked: sh.ChecksumRowsChecked,
+				ChecksumRowsTotal:   sh.ChecksumRowsTotal,
 			})
 			// Table-level ETA: the table's own estimate (MySQL/Spirit), or
 			// the slowest shard's for a sharded (Vitess) table.
