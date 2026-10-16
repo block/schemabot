@@ -68,6 +68,56 @@ func TestShouldReleaseAtCutoverBarrier(t *testing.T) {
 	}
 }
 
+func TestParksForDispatcher(t *testing.T) {
+	tests := []struct {
+		name           string
+		idempotencyKey string
+		deferCutover   bool
+		multiOperation bool
+		op             *storage.ApplyOperation
+		want           bool
+	}{
+		{"dispatched with deferred cutover parks", "schemabot:v1:orders", true, true, rollingOp(), true},
+		{"dispatched under an ordered policy parks", "schemabot:v1:orders", true, true, barrierOp(), true},
+		{"dispatched without deferred cutover holds the claim", "schemabot:v1:orders", false, true, rollingOp(), false},
+		{"dispatched single operation holds the claim", "schemabot:v1:orders", true, false, rollingOp(), false},
+		{"manual defer on an apply no dispatcher created holds the claim", "", true, true, rollingOp(), false},
+		{"nil op holds the claim", "schemabot:v1:orders", true, true, nil, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			apply := &storage.Apply{IdempotencyKey: tt.idempotencyKey}
+			apply.SetOptions(storage.ApplyOptions{DeferCutover: tt.deferCutover})
+			assert.Equal(t, tt.want, parksForDispatcher(apply, tt.multiOperation, tt.op))
+		})
+	}
+	assert.False(t, parksForDispatcher(nil, true, rollingOp()), "no apply holds the claim")
+}
+
+// A drive that releases at the barrier exits once its operation is parked,
+// unless it handed a cutover to the engine on this tick: its tasks were read
+// before the handoff, so their parked state no longer describes the swap.
+func TestReleasesAtCutoverBarrier(t *testing.T) {
+	tests := []struct {
+		name    string
+		release bool
+		taken   bool
+		opState string
+		want    bool
+	}{
+		{"parked drive releases", true, false, state.Apply.WaitingForCutover, true},
+		{"drive that took a cutover stays", true, true, state.Apply.WaitingForCutover, false},
+		{"copying drive stays", true, false, state.Apply.Running, false},
+		{"drive that holds at the barrier stays", false, false, state.Apply.WaitingForCutover, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ps := &atomicPollState{cutoverRequestTaken: tt.taken}
+			assert.Equal(t, tt.want, releasesAtCutoverBarrier(tt.release, ps, tt.opState))
+		})
+	}
+}
+
 func TestEffectiveCopyDriveOptions(t *testing.T) {
 	t.Run("multi-op barrier turns on defer cutover", func(t *testing.T) {
 		apply := &storage.Apply{}

@@ -1722,17 +1722,17 @@ func MirroredControlRequestMetadata() []byte {
 	return []byte(`{"` + mirroredControlRequestMetadataKey + `":true}`)
 }
 
-// cutoverRequestOperationMetadataKey binds a cutover request to the one
-// operation that is to take it. A cutover request is apply-level, so under an
-// ordered cutover policy the binding is what keeps one operator command on the
-// member it was accepted for, rather than letting
+// CutoverRequestOperationMetadataKey is the metadata key that binds a cutover
+// request to the one operation that is to take it. A cutover request is
+// apply-level, so under an ordered cutover policy the binding is what keeps
+// one operator command on the member it was accepted for, rather than letting
 // it pass on to the next member once that one has finished.
-const cutoverRequestOperationMetadataKey = "apply_operation_id"
+const CutoverRequestOperationMetadataKey = "apply_operation_id"
 
 // CutoverRequestMetadata returns the metadata that binds a cutover request to
 // the operation that is to take it.
 func CutoverRequestMetadata(applyOperationID int64) []byte {
-	return []byte(`{"` + cutoverRequestOperationMetadataKey + `":` + strconv.FormatInt(applyOperationID, 10) + `}`)
+	return []byte(`{"` + CutoverRequestOperationMetadataKey + `":` + strconv.FormatInt(applyOperationID, 10) + `}`)
 }
 
 // CutoverOperationID returns the operation a cutover request is bound to, or 0

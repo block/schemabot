@@ -48,6 +48,15 @@ type Dialect interface {
 	// identifier object keys (letters, digits, and underscores), ordered from the
 	// root to the value. Implementations panic when a key is not a plain identifier.
 	JSONBooleanIsTrue(expression string, path []string) string
+	// JSONIsNullAt returns a predicate that is true when the JSON value at path
+	// is missing or JSON null, and false for any other value. Path follows the
+	// JSONBooleanIsTrue rules.
+	JSONIsNullAt(expression string, path []string) string
+	// JSONIntegerAt returns an integer expression for the JSON value at path
+	// when that value is an integral JSON number, and SQL NULL otherwise:
+	// missing, JSON null, fractional numbers, strings, booleans, objects, and
+	// arrays all yield NULL. Path follows the JSONBooleanIsTrue rules.
+	JSONIntegerAt(expression string, path []string) string
 	// IndexHint returns an optional table-level hint that directs lookups through
 	// index. The returned text includes any required leading whitespace and is
 	// placed immediately after a table name or alias; dialects without index-hint
@@ -265,6 +274,11 @@ func (d MySQLDialect) RelativeTime(precision TimestampPrecision, direction Relat
 // JSONBooleanIsTrue compares the extracted MySQL JSON value with JSON true
 // using null-safe equality so absent and null values do not match.
 func (MySQLDialect) JSONBooleanIsTrue(expression string, path []string) string {
+	return "(JSON_EXTRACT(" + expression + ", '" + mysqlJSONPath(path) + "') <=> CAST('true' AS JSON))"
+}
+
+// mysqlJSONPath renders path as a MySQL JSON path of quoted object keys.
+func mysqlJSONPath(path []string) string {
 	var jsonPath strings.Builder
 	jsonPath.WriteString("$")
 	for _, key := range path {
@@ -273,7 +287,20 @@ func (MySQLDialect) JSONBooleanIsTrue(expression string, path []string) string {
 		}
 		jsonPath.WriteString(`."` + key + `"`)
 	}
-	return "(JSON_EXTRACT(" + expression + ", '" + jsonPath.String() + "') <=> CAST('true' AS JSON))"
+	return jsonPath.String()
+}
+
+// JSONIsNullAt reads the JSON type at path: JSON_EXTRACT yields SQL NULL for a
+// missing path and JSON_TYPE names JSON null 'NULL'.
+func (MySQLDialect) JSONIsNullAt(expression string, path []string) string {
+	return "(COALESCE(JSON_TYPE(JSON_EXTRACT(" + expression + ", '" + mysqlJSONPath(path) + "')), 'NULL') = 'NULL')"
+}
+
+// JSONIntegerAt casts the value at path only when JSON_TYPE reports an
+// integer, since CAST(... AS SIGNED) reads other JSON values as 0.
+func (MySQLDialect) JSONIntegerAt(expression string, path []string) string {
+	value := "JSON_EXTRACT(" + expression + ", '" + mysqlJSONPath(path) + "')"
+	return "(CASE WHEN JSON_TYPE(" + value + ") IN ('INTEGER', 'UNSIGNED INTEGER') THEN CAST(" + value + " AS SIGNED) END)"
 }
 
 // IndexHint returns a MySQL FORCE INDEX hint for the named index.
@@ -506,6 +533,12 @@ func (PostgresDialect) InsertIfAbsent(conflictColumns []string) InsertIfAbsentSy
 // true using null-safe equality, so missing paths, JSON null, and SQL NULL all
 // yield false rather than NULL.
 func (PostgresDialect) JSONBooleanIsTrue(expression string, path []string) string {
+	return "(jsonb_extract_path(" + expression + ", " + postgresJSONPathArgs(path) + ") IS NOT DISTINCT FROM 'true'::jsonb)"
+}
+
+// postgresJSONPathArgs renders path as the quoted key arguments of
+// jsonb_extract_path.
+func postgresJSONPathArgs(path []string) string {
 	keys := make([]string, len(path))
 	for i, key := range path {
 		if !plainJSONIdentifier.MatchString(key) {
@@ -513,7 +546,23 @@ func (PostgresDialect) JSONBooleanIsTrue(expression string, path []string) strin
 		}
 		keys[i] = "'" + key + "'"
 	}
-	return "(jsonb_extract_path(" + expression + ", " + strings.Join(keys, ", ") + ") IS NOT DISTINCT FROM 'true'::jsonb)"
+	return strings.Join(keys, ", ")
+}
+
+// JSONIsNullAt reads the JSONB type at path: jsonb_extract_path yields SQL
+// NULL for a missing path and jsonb_typeof names JSON null 'null'.
+func (PostgresDialect) JSONIsNullAt(expression string, path []string) string {
+	return "(COALESCE(jsonb_typeof(jsonb_extract_path(" + expression + ", " + postgresJSONPathArgs(path) + ")), 'null') = 'null')"
+}
+
+// JSONIntegerAt casts the value at path only when it is a JSON number whose
+// text is an integer, since casting any other value to bigint raises an error
+// that would fail the whole statement.
+func (PostgresDialect) JSONIntegerAt(expression string, path []string) string {
+	args := postgresJSONPathArgs(path)
+	return "(CASE WHEN jsonb_typeof(jsonb_extract_path(" + expression + ", " + args + ")) = 'number'" +
+		" AND jsonb_extract_path_text(" + expression + ", " + args + ") ~ '^-?[0-9]+$'" +
+		" THEN jsonb_extract_path_text(" + expression + ", " + args + ")::bigint END)"
 }
 
 // IndexHint returns an empty string: PostgreSQL has no index-hint syntax and

@@ -1874,9 +1874,11 @@ func (c *LocalClient) ResumeApplyOperation(ctx context.Context, apply *storage.A
 	multiOperation := len(siblings) > 1
 	// A multi-deployment barrier operation auto-defers its cutover and parks
 	// (releases) the copy drive at the barrier; the deployment-ordered cutover
-	// claim drives the swap later. Single-operation or rolling drives are
-	// unchanged.
-	releaseAtCutoverBarrier := shouldReleaseAtCutoverBarrier(apply, multiOperation, op)
+	// claim drives the swap later. An operation a remote dispatcher sent parks
+	// and releases the same way, for the dispatcher's cutover. Single-operation
+	// or rolling drives are unchanged.
+	releaseAtCutoverBarrier := shouldReleaseAtCutoverBarrier(apply, multiOperation, op) ||
+		parksForDispatcher(apply, multiOperation, op)
 	options := effectiveCopyDriveOptions(apply, multiOperation, op).Map()
 	return c.resumeApplyWithTasks(ctx, apply, op, tasks, options, releaseAtCutoverBarrier, false)
 }
@@ -1932,7 +1934,19 @@ func (c *LocalClient) ResumeApplyOperationCutover(ctx context.Context, apply *st
 	// The barrier park deliberately does not persist DeferCutover onto the
 	// shared apply, so forceCutoverResume tells the resume path to still load
 	// the parked engine checkpoint before driving.
+	//
+	// An operation parked for its dispatcher is the exception: the claim took
+	// it back because the dispatcher's cutover request for it is pending, so
+	// the drive keeps DeferCutover and takes that request, which settles it
+	// with the outcome the dispatcher is waiting on. It still releases at the
+	// barrier when it cannot take the request on its first tick, so a refused
+	// cutover gives the driver back instead of holding it parked.
 	opts := apply.GetOptions()
+	if parksForDispatcher(apply, true, op) {
+		c.logger.Info("driving the cutover the dispatcher requested for an operation parked at the barrier",
+			append(apply.LogAttrs(), "apply_operation_id", op.ID, "operation_deployment", op.Deployment, "operation_target", op.Target)...)
+		return c.resumeApplyWithTasks(ctx, apply, op, tasks, opts.Map(), true, true)
+	}
 	opts.DeferCutover = false
 	return c.resumeApplyWithTasks(ctx, apply, op, tasks, opts.Map(), false, true)
 }

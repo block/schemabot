@@ -674,6 +674,12 @@ type atomicPollState struct {
 	// That is the one exit that leaves the work running by design.
 	parkedAtCutoverBarrier bool
 
+	// cutoverRequestTaken is set once this drive hands a pending cutover
+	// request to the engine. The tasks it synced before taking it still read
+	// as parked at the barrier, so the drive must not read them as a park and
+	// release: it holds the claim through the swap it just started.
+	cutoverRequestTaken bool
+
 	// progressWriteFailures counts consecutive ticks whose task progress
 	// writes did not all land; see pollTaskToCompletion's counterpart.
 	progressWriteFailures int
@@ -1016,7 +1022,7 @@ func (c *LocalClient) pollTaskToCompletion(ctx context.Context, apply *storage.A
 				task.State = state.Task.Stopped
 				return taskStopped
 			}
-			if err := c.processPendingCutoverControlRequest(ctx, apply, []*storage.Task{task}); err != nil {
+			if _, err := c.processPendingCutoverControlRequest(ctx, apply, []*storage.Task{task}); err != nil {
 				logger.Warn("pending cutover request processing failed; current apply owner will exit for operator retry",
 					"task_id", task.TaskIdentifier, "error", err)
 				return taskAbort

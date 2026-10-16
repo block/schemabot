@@ -929,6 +929,79 @@ const rolloutMembersOrderedHereSQL = `NOT EXISTS (
 		AND dispatched.idempotency_key IS NOT NULL
 )`
 
+// dispatchedDeferredCutoverSQL holds when the candidate's apply was created by
+// a remote dispatch with its cutover deferred, which is how a dispatcher sends
+// every operation it means to cut over itself. Such an operation's drive parks
+// at the cutover barrier and releases its claim, and the cutover claim takes
+// it back once the dispatcher's cutover request for it is pending. It mirrors
+// parksForDispatcher in pkg/tern/cutover_barrier.go. The fragment references
+// the apply_operations alias and takes no placeholders.
+func dispatchedDeferredCutoverSQL(d Dialect) string {
+	return `EXISTS (
+	SELECT 1
+	FROM applies AS dispatched
+	WHERE dispatched.id = apply_operations.apply_id
+		AND dispatched.idempotency_key IS NOT NULL
+		AND dispatched.idempotency_key <> ''
+		AND ` + d.JSONBooleanIsTrue("dispatched.options", []string{"defer_cutover"}) + `
+)`
+}
+
+// releasedAtCutoverBarrierSQL matches an operation whose drive released it at
+// the cutover barrier: a waiting_for_cutover operation of a multi-operation
+// apply that either runs under an ordered cutover policy, for the automatic
+// cutover claim, or was dispatched with its cutover deferred, for the
+// dispatcher's cutover (dispatchedDeferredCutoverSQL). Nothing drives such an
+// operation until its cutover is claimed, so the copy claim leaves it to the
+// cutover claim and takes it back only to deliver a pending cancel or stop. It
+// mirrors shouldReleaseAtCutoverBarrier and parksForDispatcher in
+// pkg/tern/cutover_barrier.go. The fragment references the apply_operations
+// alias; see releasedAtCutoverBarrierArgs for its placeholders.
+func releasedAtCutoverBarrierSQL(d Dialect) string {
+	return `(
+	apply_operations.state = ?
+	AND EXISTS (
+		SELECT 1
+		FROM apply_operations AS sibling
+		WHERE sibling.apply_id = apply_operations.apply_id
+			AND sibling.id <> apply_operations.id
+	)
+	AND (
+		apply_operations.cutover_policy IN (?, ?)
+		OR ` + dispatchedDeferredCutoverSQL(d) + `
+	)
+)`
+}
+
+// releasedAtCutoverBarrierArgs returns the positional arguments for
+// releasedAtCutoverBarrierSQL, in placeholder order.
+func releasedAtCutoverBarrierArgs() []any {
+	return []any{state.ApplyOperation.WaitingForCutover, storage.CutoverPolicyBarrier, storage.CutoverPolicyParallel}
+}
+
+// cutoverRequestTakeableSQL matches a pending cutover request of the
+// candidate's apply that the candidate's drive may take: one bound to the
+// candidate, or one bound to no operation, which any parked operation of the
+// apply takes. It mirrors storage.ApplyControlRequest.CutoverOperationID, under
+// which a missing, null, or zero binding is unbound; a binding that is not an
+// integer matches nothing, as the drive refuses a request it cannot read. The
+// fragment references the apply_operations alias; its placeholders are the
+// cutover operation and the pending status.
+func cutoverRequestTakeableSQL(d Dialect) string {
+	path := []string{storage.CutoverRequestOperationMetadataKey}
+	return `EXISTS (
+	SELECT 1
+	FROM apply_control_requests AS takeable
+	WHERE takeable.apply_id = apply_operations.apply_id
+		AND takeable.operation = ?
+		AND takeable.status = ?
+		AND (
+			` + d.JSONIsNullAt("takeable.metadata", path) + `
+			OR ` + d.JSONIntegerAt("takeable.metadata", path) + ` IN (0, apply_operations.id)
+		)
+)`
+}
+
 // earlierSiblingHoldsCutoverSQL is the cutover hold rule: an earlier sibling
 // (lower created_at, id — deployment_order as materialized at apply-create)
 // holds a later operation's cutover only while it is in a state the rollout
@@ -1538,15 +1611,12 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 	// arm's do.
 	queryArgs = append(queryArgs, driverCapArgs...)
 	queryArgs = append(queryArgs, stringArgs(activeStates)...)
-	// Stale-active barrier-park exemption (see the staleness clause below): a
-	// multi-deployment operation parked at the cutover barrier under an
-	// ordered-cutover policy (barrier or parallel) is reserved for the
-	// cutover claim, so the copy claim must not re-lease it as
-	// stale-active work. A single-operation apply has no sibling and is never
-	// exempted, so manual --defer-cutover behaviour is unchanged.
-	queryArgs = append(queryArgs,
-		state.ApplyOperation.WaitingForCutover,
-		storage.CutoverPolicyBarrier, storage.CutoverPolicyParallel)
+	// Stale-active barrier-park exemption (see the staleness clause below): an
+	// operation released at the cutover barrier (releasedAtCutoverBarrierSQL)
+	// is reserved for the cutover claim, so the copy claim must not re-lease
+	// it as stale-active work. A single-operation apply has no sibling and is
+	// never exempted, so manual --defer-cutover behaviour is unchanged.
+	queryArgs = append(queryArgs, releasedAtCutoverBarrierArgs()...)
 	// A stopped operation is reclaimable for start and for cancel, but the two
 	// arms are separate because only one of them terminates itself. The start
 	// claim always resolves — it either moves the row to resuming or the parent
@@ -1591,9 +1661,8 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 	// stopped or cancelled, and the request is never completed. The claim
 	// leaves the row parked, so it carries the rematch guard; the drive moves
 	// it out of waiting_for_cutover once the request lands.
+	queryArgs = append(queryArgs, releasedAtCutoverBarrierArgs()...)
 	queryArgs = append(queryArgs,
-		state.ApplyOperation.WaitingForCutover,
-		storage.CutoverPolicyBarrier, storage.CutoverPolicyParallel,
 		storage.ControlOperationCancel, storage.ControlOperationStop, storage.ControlRequestPending)
 	// Deferred-deploy start gate keys on the PARENT apply state, not the
 	// operation state: the operation row stays active (running) while the apply
@@ -1626,10 +1695,10 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 	//     The cancel arm carries the rematch guard because its claim can leave
 	//     the row stopped; see requestRematchGuardSQL.
 	//
-	//   - An operation parked at the cutover barrier of a multi-operation
-	//     apply whose parent has a pending cancel or stop request is
-	//     reclaimable so the drive can deliver it to the engine holding the
-	//     parked copy.
+	//   - An operation released at the cutover barrier
+	//     (releasedAtCutoverBarrierSQL) whose parent has a pending cancel or
+	//     stop request is reclaimable so the drive can deliver it to the
+	//     engine holding the parked copy.
 	//     Nothing else drives a parked row before its cutover turn, and under
 	//     halt that turn never comes. The arm carries the rematch guard because
 	//     the claim leaves the row parked.
@@ -1722,16 +1791,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 			OR (
 				state IN (%s)
 				AND updated_at < %s
-				AND NOT (
-					state = ?
-					AND cutover_policy IN (?, ?)
-					AND EXISTS (
-						SELECT 1
-						FROM apply_operations AS sibling
-						WHERE sibling.apply_id = apply_operations.apply_id
-							AND sibling.id <> apply_operations.id
-					)
-				)
+				AND NOT `+releasedAtCutoverBarrierSQL(s.dialect)+`
 			)
 			OR (
 				state = ?
@@ -1766,14 +1826,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 				)
 			)
 			OR (
-				state = ?
-				AND cutover_policy IN (?, ?)
-				AND EXISTS (
-					SELECT 1
-					FROM apply_operations AS sibling
-					WHERE sibling.apply_id = apply_operations.apply_id
-						AND sibling.id <> apply_operations.id
-				)
+				`+releasedAtCutoverBarrierSQL(s.dialect)+`
 				AND EXISTS (
 					SELECT 1
 					FROM apply_control_requests cr
@@ -2103,14 +2156,17 @@ func moveRedispatchToRunning(ctx context.Context, tx *rebindTx, ad *storage.Appl
 // to FindNextApplyOperation: that primitive gates the copy phase (pending →
 // running); this one gates the cutover phase (waiting_for_cutover → cutting_over).
 //
-// Both claim paths are bound by a shared eligibility gate — barrier policy, a
-// multi-operation apply, and a parent apply not started with manual
-// --defer-cutover — so the worker only ever drives the operations OC-2
-// parks-and-releases for it (see the gate comment in the body and
-// shouldReleaseAtCutoverBarrier in pkg/tern/cutover_barrier.go). Anything else
-// (single-op, rolling, or manual-defer) stays on the copy/manual cutover path.
+// Every claim path is bound by an eligibility gate, so the worker only ever
+// drives the operations whose drives released them at the barrier
+// (releasedAtCutoverBarrierSQL): either an ordered cutover policy on a
+// multi-operation apply whose parent was not started with manual
+// --defer-cutover (shouldReleaseAtCutoverBarrier in
+// pkg/tern/cutover_barrier.go), or an operation of a multi-operation apply a
+// remote dispatcher created with its cutover deferred (parksForDispatcher).
+// Anything else (single-op, rolling, or manual-defer) stays on the
+// copy/manual cutover path.
 //
-// Two claim paths, mirroring FindNextApplyOperation:
+// Three claim paths, the first two mirroring FindNextApplyOperation:
 //
 //   - Start a parked cutover. A waiting_for_cutover row is claimed and
 //     transitioned to cutting_over as soon as its own copy is parked, unless an
@@ -2128,6 +2184,17 @@ func moveRedispatchToRunning(ctx context.Context, tx *rebindTx, ad *storage.Appl
 //     its state — its driver died mid-cutover and another driver resumes it. This
 //     path carries no ordering gate: the row already started its cutover, so
 //     resuming is recovering work, not starting a new swap.
+//   - Take a dispatcher's cutover. A waiting_for_cutover row of a dispatched
+//     apply is claimed and transitioned to cutting_over once a pending cutover
+//     request the row's drive may take exists (cutoverRequestTakeableSQL): one
+//     bound to the row, or one bound to no operation. The dispatcher decides
+//     when each of its operations cuts over, so nothing else starts these
+//     swaps. The arm applies the hold rule the drive checks before taking the
+//     request (CutoverBlocker), so the claim never hands a driver a request
+//     the drive would leave pending, along with the pending-stop gate and the
+//     cutover cap. A stale mid-cutover row of a dispatched apply is
+//     recovered by the copy claim's stale-active arm, which resumes it under
+//     the same drive that started it.
 //
 // As with FindNextApplyOperation, the returned row carries its pre-claim state:
 // a returned waiting_for_cutover row means a parked cutover was just started (the
@@ -2162,9 +2229,10 @@ func (s *applyOperationStore) FindNextApplyOperationCutover(ctx context.Context,
 	}
 	defer rollbackTx(ctx, tx, "claim apply_operation cutover")
 
-	// Eligibility gate (the three leading conditions in the SQL below). The
-	// cutover worker may only claim operations it is actually responsible for
-	// driving — exactly the population OC-2 parks-and-releases. This mirrors
+	// Eligibility gate of the automatic arms (the leading conditions of the
+	// first branch in the SQL below). The cutover worker may only claim
+	// operations it is actually responsible for driving — exactly the
+	// population OC-2 parks-and-releases. This mirrors
 	// shouldReleaseAtCutoverBarrier in pkg/tern/cutover_barrier.go:
 	//
 	//   1. cutover_policy is ordered (barrier or parallel) — rolling rows never
@@ -2181,9 +2249,11 @@ func (s *applyOperationStore) FindNextApplyOperationCutover(ctx context.Context,
 	//      predicate matches exactly JSON boolean true per Dialect.JSONBooleanIsTrue,
 	//      so absent keys, JSON null, and non-boolean values do not match.
 	//
-	// The gate wraps BOTH claim branches (start and stale recovery): a stale
-	// cutting_over/revert_window row outside this population reached that state
-	// via the copy/manual path, so recovering it here would steal legitimate work.
+	// The gate wraps BOTH automatic branches (start and stale recovery): a
+	// stale cutting_over/revert_window row outside this population reached that
+	// state via the copy/manual path, so recovering it here would steal
+	// legitimate work. The dispatched arm has its own gate
+	// (dispatchedDeferredCutoverSQL) and shares only the sibling check.
 	staleClaimCutoff := s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime, LiteralIntervalAmount(uint64(storage.ApplyLeaseStaleAfter.Microseconds())), IntervalMicrosecond)
 	cutoverCap, cutoverCapArgs := s.cutoverCapClause(staleClaimCutoff)
 	queryArgs := []any{storage.CutoverPolicyBarrier, storage.CutoverPolicyParallel}
@@ -2208,32 +2278,68 @@ func (s *applyOperationStore) FindNextApplyOperationCutover(ctx context.Context,
 		state.ApplyOperation.CuttingOver,
 		state.ApplyOperation.RevertWindow,
 	)
+	// Dispatched-cutover arm: an operation a remote dispatcher parked at the
+	// barrier (dispatchedDeferredCutoverSQL) is claimed once the dispatcher's
+	// cutover request for it is pending, under the same hold rule the drive
+	// checks before taking the request (CutoverBlocker), the same pending-stop
+	// gate, and the same cutover cap.
+	queryArgs = append(queryArgs, state.ApplyOperation.WaitingForCutover)
+	queryArgs = append(queryArgs, earlierSiblingHoldsCutoverArgs()...)
+	queryArgs = append(queryArgs,
+		storage.ControlOperationCutover, storage.ControlRequestPending,
+		storage.ControlOperationStop, storage.ControlRequestPending,
+	)
+	queryArgs = append(queryArgs, cutoverCapArgs...)
 
 	deferCutoverIsTrue := s.dialect.JSONBooleanIsTrue("a.options", []string{"defer_cutover"})
 	row := tx.QueryRowContext(ctx, fmt.Sprintf(`
 		SELECT %s
 		FROM apply_operations
-		WHERE apply_operations.cutover_policy IN (?, ?)
-		AND EXISTS (
+		WHERE EXISTS (
 			SELECT 1
 			FROM apply_operations AS sibling
 			WHERE sibling.apply_id = apply_operations.apply_id
 				AND sibling.id <> apply_operations.id
 		)
-		AND EXISTS (
-			SELECT 1
-			FROM applies AS a
-			WHERE a.id = apply_operations.apply_id
-				AND NOT %s
-		)
 		AND (
 			(
-				state = ?
+				apply_operations.cutover_policy IN (?, ?)
+				AND EXISTS (
+					SELECT 1
+					FROM applies AS a
+					WHERE a.id = apply_operations.apply_id
+						AND NOT %s
+				)
+				AND (
+					(
+						state = ?
+						AND NOT EXISTS (
+							SELECT 1
+							FROM apply_operations AS earlier
+							WHERE `+earlierSiblingHoldsCutoverSQL(s.dialect)+`
+						)
+						AND NOT EXISTS (
+							SELECT 1
+							FROM apply_control_requests cr
+							WHERE cr.apply_id = apply_operations.apply_id
+								AND cr.operation = ?
+								AND cr.status = ?
+						)
+						AND %s
+					)
+					OR (state IN (?, ?) AND updated_at < %s)
+				)
+			)
+			OR (
+				`+dispatchedDeferredCutoverSQL(s.dialect)+`
+				AND state = ?
 				AND NOT EXISTS (
 					SELECT 1
 					FROM apply_operations AS earlier
-					WHERE `+earlierSiblingHoldsCutoverSQL(s.dialect)+`
+					WHERE `+earlierRolloutMemberSQL+`
+						AND `+earlierSiblingHoldsCutoverSQL(s.dialect)+`
 				)
+				AND `+cutoverRequestTakeableSQL(s.dialect)+`
 				AND NOT EXISTS (
 					SELECT 1
 					FROM apply_control_requests cr
@@ -2243,12 +2349,11 @@ func (s *applyOperationStore) FindNextApplyOperationCutover(ctx context.Context,
 				)
 				AND %s
 			)
-			OR (state IN (?, ?) AND updated_at < %s)
 		)
 		ORDER BY created_at, id
 		LIMIT 1
 		FOR UPDATE SKIP LOCKED
-	`, applyOperationColumns, deferCutoverIsTrue, cutoverCap, staleClaimCutoff), queryArgs...)
+	`, applyOperationColumns, deferCutoverIsTrue, cutoverCap, staleClaimCutoff, cutoverCap), queryArgs...)
 
 	ad, err := scanApplyOperationInto(row)
 	if errors.Is(err, sql.ErrNoRows) {

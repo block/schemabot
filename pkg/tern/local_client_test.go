@@ -1744,7 +1744,7 @@ func TestLocalClient_StopSupersedesPendingCutover(t *testing.T) {
 	// A later start resumes the copy, which parks at waiting_for_cutover again.
 	apply.State = state.Apply.WaitingForCutover
 	task.State = state.Task.WaitingForCutover
-	require.NoError(t, client.processPendingCutoverControlRequest(t.Context(), apply, []*storage.Task{task}))
+	assert.False(t, takePendingCutover(t, client, apply, []*storage.Task{task}))
 	assert.Equal(t, 0, fakeEngine.cutoverCount, "the table must not be swapped without a cutover issued after the stop")
 	assert.Equal(t, state.Apply.WaitingForCutover, apply.State)
 }
@@ -1814,7 +1814,7 @@ func TestLocalClient_StopKeepsItsGateUntilTheSupersededCutoverSettles(t *testing
 	// A later start resumes the copy, which parks again.
 	apply.State = state.Apply.WaitingForCutover
 	task.State = state.Task.WaitingForCutover
-	require.NoError(t, client.processPendingCutoverControlRequest(t.Context(), apply, []*storage.Task{task}))
+	assert.False(t, takePendingCutover(t, client, apply, []*storage.Task{task}))
 	assert.Equal(t, 0, fakeEngine.cutoverCount, "the table must not be swapped without a cutover issued after the stop")
 }
 
@@ -2421,7 +2421,7 @@ func TestLocalClient_ProcessPendingCutoverControlRequest(t *testing.T) {
 		logger:       slog.Default(),
 	}
 
-	err := client.processPendingCutoverControlRequest(t.Context(), apply, []*storage.Task{task})
+	_, err := client.processPendingCutoverControlRequest(t.Context(), apply, []*storage.Task{task})
 	require.NoError(t, err)
 	assert.Equal(t, 1, fakeEngine.cutoverCount)
 	controlReq, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationCutover)
@@ -2471,7 +2471,7 @@ func TestLocalClient_ProcessPendingCutoverControlRequestUsesCompletedTaskForCuto
 		logger:       slog.Default(),
 	}
 
-	err := client.processPendingCutoverControlRequest(t.Context(), apply, []*storage.Task{task})
+	_, err := client.processPendingCutoverControlRequest(t.Context(), apply, []*storage.Task{task})
 	require.NoError(t, err)
 	assert.Equal(t, 1, fakeEngine.cutoverCount)
 	controlReq, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationCutover)
@@ -2519,7 +2519,7 @@ func TestLocalClient_ProcessPendingCutoverControlRequestWaitsWhenNotReady(t *tes
 		logger:       slog.Default(),
 	}
 
-	err := client.processPendingCutoverControlRequest(t.Context(), apply, []*storage.Task{task})
+	_, err := client.processPendingCutoverControlRequest(t.Context(), apply, []*storage.Task{task})
 	require.NoError(t, err)
 	assert.Equal(t, 0, fakeEngine.cutoverCount)
 	pending, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationCutover)
@@ -2568,7 +2568,7 @@ func TestLocalClient_ProcessPendingCutoverControlRequestWaitsWhileRecovering(t *
 		logger:       slog.Default(),
 	}
 
-	err := client.processPendingCutoverControlRequest(t.Context(), apply, []*storage.Task{task})
+	_, err := client.processPendingCutoverControlRequest(t.Context(), apply, []*storage.Task{task})
 	require.NoError(t, err)
 	assert.Equal(t, 0, fakeEngine.cutoverCount)
 	pending, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationCutover)
@@ -2617,7 +2617,7 @@ func TestLocalClient_ProcessPendingCutoverControlRequestFailsRejectedRequest(t *
 		logger:       slog.Default(),
 	}
 
-	err := client.processPendingCutoverControlRequest(t.Context(), apply, []*storage.Task{task})
+	_, err := client.processPendingCutoverControlRequest(t.Context(), apply, []*storage.Task{task})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "not ready for cutover")
 	pending, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationCutover)
@@ -2699,7 +2699,7 @@ func TestLocalClient_ProcessPendingCutoverNotAcceptedRestoresApplyState(t *testi
 				logger:       slog.Default(),
 			}
 
-			err := client.processPendingCutoverControlRequest(t.Context(), apply, []*storage.Task{task})
+			_, err := client.processPendingCutoverControlRequest(t.Context(), apply, []*storage.Task{task})
 			require.Error(t, err)
 			assert.Contains(t, err.Error(), tt.wantRequestErr)
 			assert.Equal(t, 1, tt.engine.cutoverCount)
@@ -2722,7 +2722,7 @@ func TestLocalClient_ProcessPendingCutoverNotAcceptedRestoresApplyState(t *testi
 			require.NoError(t, err)
 			require.False(t, alreadyPending)
 			*tt.engine = fakeControlEngine{cutoverCount: tt.engine.cutoverCount}
-			require.NoError(t, client.processPendingCutoverControlRequest(t.Context(), apply, []*storage.Task{task}))
+			assert.True(t, takePendingCutover(t, client, apply, []*storage.Task{task}))
 			assert.Equal(t, 2, tt.engine.cutoverCount)
 			assert.Equal(t, storage.ControlRequestCompleted, controlRequests.requests[0].Status)
 			assert.Equal(t, state.Apply.CuttingOver, applies.apply.State)
@@ -2787,7 +2787,7 @@ func TestLocalClient_ProcessPendingCutoverRestoreFailureKeepsRequestPending(t *t
 	client, apply, applies, tasks, controlRequests := newLocalParkedCutoverClient(eng)
 	applies.laterUpdateErr = errors.New("storage write unavailable")
 
-	err := client.processPendingCutoverControlRequest(t.Context(), apply, tasks.tasks)
+	_, err := client.processPendingCutoverControlRequest(t.Context(), apply, tasks.tasks)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "cutover failed: drop sentinel table: connection reset")
 	assert.Contains(t, err.Error(), "restore apply apply-cutover-restore-local to waiting_for_cutover after unaccepted cutover: storage write unavailable")
@@ -2801,7 +2801,7 @@ func TestLocalClient_ProcessPendingCutoverRestoreFailureKeepsRequestPending(t *t
 	// The storage write recovers and the engine takes the re-sent cutover.
 	applies.laterUpdateErr = nil
 	*eng = fakeControlEngine{cutoverCount: eng.cutoverCount}
-	require.NoError(t, client.processPendingCutoverControlRequest(t.Context(), apply, tasks.tasks))
+	assert.True(t, takePendingCutover(t, client, apply, tasks.tasks))
 	assert.Equal(t, 2, eng.cutoverCount)
 	assert.Equal(t, storage.ControlRequestCompleted, controlRequests.requests[0].Status)
 	assert.Equal(t, state.Apply.CuttingOver, applies.apply.State)
@@ -2841,7 +2841,7 @@ func TestLocalClient_RefusedResentCutoverRestoresStateFromTasks(t *testing.T) {
 			applies.apply.State = state.Apply.CuttingOver
 			tasks.tasks[0].State = tt.taskState
 
-			err := client.processPendingCutoverControlRequest(t.Context(), apply, tasks.tasks)
+			_, err := client.processPendingCutoverControlRequest(t.Context(), apply, tasks.tasks)
 			require.Error(t, err)
 			assert.Contains(t, err.Error(), "not ready for cutover")
 			assert.Equal(t, 1, eng.cutoverCount)
@@ -2869,7 +2869,7 @@ func TestLocalClient_RefusedCutoverUnderOperationLeaseNeverWritesParentApply(t *
 		Token:       "operation-token",
 	})
 
-	err := client.processPendingCutoverControlRequest(ctx, apply, tasks.tasks)
+	_, err := client.processPendingCutoverControlRequest(ctx, apply, tasks.tasks)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "not ready for cutover")
 	assert.Equal(t, 1, eng.cutoverCount)
@@ -2928,7 +2928,7 @@ func TestLocalClient_ProcessPendingCutoverControlRequestRetriesWhenCutoverNotRea
 		logger:       slog.Default(),
 	}
 
-	require.NoError(t, client.processPendingCutoverControlRequest(t.Context(), apply, []*storage.Task{task}))
+	assert.False(t, takePendingCutover(t, client, apply, []*storage.Task{task}))
 	assert.Equal(t, 1, fakeEngine.cutoverCount)
 	pending, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationCutover)
 	require.NoError(t, err)
@@ -2940,7 +2940,7 @@ func TestLocalClient_ProcessPendingCutoverControlRequestRetriesWhenCutoverNotRea
 	// The backend finishes staging: the still-pending request is accepted on
 	// the next tick and completes.
 	fakeEngine.cutoverErr = nil
-	require.NoError(t, client.processPendingCutoverControlRequest(t.Context(), apply, []*storage.Task{task}))
+	assert.True(t, takePendingCutover(t, client, apply, []*storage.Task{task}))
 	assert.Equal(t, 2, fakeEngine.cutoverCount)
 	pending, err = controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationCutover)
 	require.NoError(t, err)

@@ -332,26 +332,28 @@ func (c *LocalClient) queueCutoverRequest(ctx context.Context, apply *storage.Ap
 // request on behalf of the drive that owns tasks. A request bound to one
 // operation is taken only by that operation's drive (see
 // boundCutoverRequestTurn); an unbound request is taken by whichever drive of
-// the apply sees it parked, as before.
-func (c *LocalClient) processPendingCutoverControlRequest(ctx context.Context, apply *storage.Apply, tasks []*storage.Task) error {
+// the apply sees it parked, as before. taken reports that this call handed the
+// cutover to the engine, so the drive knows its tasks' parked state is already
+// stale.
+func (c *LocalClient) processPendingCutoverControlRequest(ctx context.Context, apply *storage.Apply, tasks []*storage.Task) (taken bool, err error) {
 	controlReq, err := pendingControlRequest(ctx, c.storage, apply, storage.ControlOperationCutover)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if controlReq == nil {
-		return nil
+		return false, nil
 	}
 	// Bind the apply's identity once so every consumption log line is
 	// filterable by apply_id/repo/pr without hand-listing the attrs per call.
 	logger := c.logger.With(apply.IdentityLogAttrs()...)
 	boundID, err := controlReq.CutoverOperationID()
 	if err != nil {
-		return fmt.Errorf("process pending cutover for apply %s: %w", apply.ApplyIdentifier, err)
+		return false, fmt.Errorf("process pending cutover for apply %s: %w", apply.ApplyIdentifier, err)
 	}
 	if boundID != 0 {
 		take, err := c.boundCutoverRequestTurn(ctx, apply, tasks, controlReq, boundID, logger)
 		if err != nil || !take {
-			return err
+			return false, err
 		}
 		return c.takeBoundCutoverRequest(ctx, apply, controlReq, boundID, logger)
 	}
@@ -361,43 +363,43 @@ func (c *LocalClient) processPendingCutoverControlRequest(ctx context.Context, a
 			"state", apply.State)
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventCutoverTriggered, storage.LogSourceSchemaBot,
 			fmt.Sprintf("Pending cutover request completed for resolved apply%s", callerApplyLogSuffix(controlRequestCaller(controlReq))), "", "")
-		return completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCutover)
+		return false, completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCutover)
 	}
 	if cutoverRequestFailedByApplyState(apply.State) {
 		message := cutoverNotAppliedMessage(apply.State)
 		if err := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCutover, message); err != nil {
-			return err
+			return false, err
 		}
-		return fmt.Errorf("process pending cutover for apply %s: %s", apply.ApplyIdentifier, message)
+		return false, fmt.Errorf("process pending cutover for apply %s: %s", apply.ApplyIdentifier, message)
 	}
 	if state.IsState(apply.State, state.Apply.Recovering) {
 		logger.Info("pending cutover request is waiting for recovery to complete",
 			"requested_by", controlRequestCaller(controlReq),
 			"state", apply.State)
-		return nil
+		return false, nil
 	}
 	readyForCutover, err := applyReadyForCutoverRequest(ctx, c.storage, apply)
 	if err != nil {
-		return fmt.Errorf("check cutover readiness for apply %s: %w", apply.ApplyIdentifier, err)
+		return false, fmt.Errorf("check cutover readiness for apply %s: %w", apply.ApplyIdentifier, err)
 	}
 	if !readyForCutover {
 		logger.Info("pending cutover request is waiting for cutover-ready state",
 			"requested_by", controlRequestCaller(controlReq),
 			"state", apply.State)
-		return nil
+		return false, nil
 	}
 	if stopReq, err := pendingControlRequest(ctx, c.storage, apply, storage.ControlOperationStop); err != nil {
-		return fmt.Errorf("check pending stop request before pending cutover for apply %s: %w", apply.ApplyIdentifier, err)
+		return false, fmt.Errorf("check pending stop request before pending cutover for apply %s: %w", apply.ApplyIdentifier, err)
 	} else if stopReq != nil {
 		message := "schema change has a pending stop request; cutover is blocked until stop is processed"
-		return fmt.Errorf("process pending cutover for apply %s: %s", apply.ApplyIdentifier, message)
+		return false, fmt.Errorf("process pending cutover for apply %s: %s", apply.ApplyIdentifier, message)
 	}
 	preCutoverState, err := preCutoverStateForRestore(ctx, c.storage, apply)
 	if err != nil {
-		return fmt.Errorf("process pending cutover for apply %s: %w", apply.ApplyIdentifier, err)
+		return false, fmt.Errorf("process pending cutover for apply %s: %w", apply.ApplyIdentifier, err)
 	}
 	if err := markApplyCuttingOverForControlRequest(ctx, c.storage, apply, logger); err != nil {
-		return err
+		return false, err
 	}
 	resp, err := c.cutover(ctx, &ternv1.CutoverRequest{
 		ApplyId:     apply.ApplyIdentifier,
@@ -410,40 +412,40 @@ func (c *LocalClient) processPendingCutoverControlRequest(ctx context.Context, a
 		// deferred cutover until an operator notices and re-issues the command.
 		logger.Info("pending cutover request not accepted yet by engine backend; retrying at the next progress tick",
 			append(apply.MutableLogAttrs(), "requested_by", controlRequestCaller(controlReq), "error", err)...)
-		return nil
+		return false, nil
 	}
 	// Each branch where the engine did not take the cutover restores the
 	// pre-cutover state before failing the request, so the apply is not left
 	// stored as cutting_over with no cutover behind it.
 	if err != nil {
 		if failErr := failUnacceptedCutoverRequest(ctx, c.storage, apply, preCutoverState, err.Error(), logger); failErr != nil {
-			return fmt.Errorf("process pending cutover for apply %s: %w; %w", apply.ApplyIdentifier, err, failErr)
+			return false, fmt.Errorf("process pending cutover for apply %s: %w; %w", apply.ApplyIdentifier, err, failErr)
 		}
-		return fmt.Errorf("process pending cutover for apply %s: %w", apply.ApplyIdentifier, err)
+		return false, fmt.Errorf("process pending cutover for apply %s: %w", apply.ApplyIdentifier, err)
 	}
 	// cutover answers an engine that yields no result as a refusal, so this
 	// branch guards that contract rather than a path the engine can reach.
 	if resp == nil {
 		errorMessage := "the cutover path returned neither a response nor an error"
 		if err := failUnacceptedCutoverRequest(ctx, c.storage, apply, preCutoverState, errorMessage, logger); err != nil {
-			return fmt.Errorf("process pending cutover for apply %s: %s: %w", apply.ApplyIdentifier, errorMessage, err)
+			return false, fmt.Errorf("process pending cutover for apply %s: %s: %w", apply.ApplyIdentifier, errorMessage, err)
 		}
-		return fmt.Errorf("process pending cutover for apply %s: %s", apply.ApplyIdentifier, errorMessage)
+		return false, fmt.Errorf("process pending cutover for apply %s: %s", apply.ApplyIdentifier, errorMessage)
 	}
 	if !resp.Accepted {
 		errorMessage := controlRefusalMessage(storage.ControlOperationCutover, resp.ErrorMessage)
 		if err := failUnacceptedCutoverRequest(ctx, c.storage, apply, preCutoverState, errorMessage, logger); err != nil {
-			return fmt.Errorf("process pending cutover for apply %s: %s: %w", apply.ApplyIdentifier, errorMessage, err)
+			return false, fmt.Errorf("process pending cutover for apply %s: %s: %w", apply.ApplyIdentifier, errorMessage, err)
 		}
-		return fmt.Errorf("process pending cutover for apply %s: %s", apply.ApplyIdentifier, errorMessage)
+		return false, fmt.Errorf("process pending cutover for apply %s: %s", apply.ApplyIdentifier, errorMessage)
 	}
 	if err := completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCutover); err != nil {
-		return err
+		return true, err
 	}
 	logger.Info("pending cutover request accepted and completed",
 		"requested_by", controlRequestCaller(controlReq),
 		"state", apply.State)
-	return nil
+	return true, nil
 }
 
 // Stop pauses an in-progress schema change.
@@ -2549,19 +2551,19 @@ func (c *LocalClient) boundCutoverRequestTurn(ctx context.Context, apply *storag
 // not this request's to read: the members sharing the apply end on their own,
 // so the bound operation's own state (see boundCutoverRequestTurn) decides
 // whether the request can still apply.
-func (c *LocalClient) takeBoundCutoverRequest(ctx context.Context, apply *storage.Apply, controlReq *storage.ApplyControlRequest, boundID int64, logger *slog.Logger) error {
+func (c *LocalClient) takeBoundCutoverRequest(ctx context.Context, apply *storage.Apply, controlReq *storage.ApplyControlRequest, boundID int64, logger *slog.Logger) (taken bool, err error) {
 	if state.IsState(apply.State, state.Apply.Recovering) {
 		// The cutover path refuses a recovering apply, and settling the
 		// request on that refusal would fail an acknowledged cutover the
 		// operator then has to re-issue. It waits for recovery instead.
 		logger.Info("pending cutover request is waiting for recovery to complete",
 			"requested_by", controlRequestCaller(controlReq), "bound_operation_id", boundID, "state", apply.State)
-		return nil
+		return false, nil
 	}
 	if stopReq, err := pendingControlRequest(ctx, c.storage, apply, storage.ControlOperationStop); err != nil {
-		return fmt.Errorf("check pending stop request before pending cutover for apply %s: %w", apply.ApplyIdentifier, err)
+		return false, fmt.Errorf("check pending stop request before pending cutover for apply %s: %w", apply.ApplyIdentifier, err)
 	} else if stopReq != nil {
-		return fmt.Errorf("process pending cutover for apply %s: schema change has a pending stop request; cutover is blocked until stop is processed", apply.ApplyIdentifier)
+		return false, fmt.Errorf("process pending cutover for apply %s: schema change has a pending stop request; cutover is blocked until stop is processed", apply.ApplyIdentifier)
 	}
 	resp, err := c.cutover(ctx, &ternv1.CutoverRequest{
 		ApplyId:          apply.ApplyIdentifier,
@@ -2571,32 +2573,32 @@ func (c *LocalClient) takeBoundCutoverRequest(ctx context.Context, apply *storag
 	if engine.IsNotReady(err) {
 		logger.Info("pending cutover request not accepted yet by engine backend; retrying at the next progress tick",
 			"requested_by", controlRequestCaller(controlReq), "bound_operation_id", boundID, "error", err)
-		return nil
+		return false, nil
 	}
 	if err != nil {
 		if failErr := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCutover, err.Error()); failErr != nil {
-			return fmt.Errorf("process pending cutover for apply %s operation %d: %w; fail pending cutover request: %w", apply.ApplyIdentifier, boundID, err, failErr)
+			return false, fmt.Errorf("process pending cutover for apply %s operation %d: %w; fail pending cutover request: %w", apply.ApplyIdentifier, boundID, err, failErr)
 		}
-		return fmt.Errorf("process pending cutover for apply %s operation %d: %w", apply.ApplyIdentifier, boundID, err)
+		return false, fmt.Errorf("process pending cutover for apply %s operation %d: %w", apply.ApplyIdentifier, boundID, err)
 	}
 	if resp == nil {
 		errorMessage := "the cutover path returned neither a response nor an error"
 		if err := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCutover, errorMessage); err != nil {
-			return err
+			return false, err
 		}
-		return fmt.Errorf("process pending cutover for apply %s operation %d: %s", apply.ApplyIdentifier, boundID, errorMessage)
+		return false, fmt.Errorf("process pending cutover for apply %s operation %d: %s", apply.ApplyIdentifier, boundID, errorMessage)
 	}
 	if !resp.Accepted {
 		errorMessage := controlRefusalMessage(storage.ControlOperationCutover, resp.ErrorMessage)
 		if err := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCutover, errorMessage); err != nil {
-			return err
+			return false, err
 		}
-		return fmt.Errorf("process pending cutover for apply %s operation %d: %s", apply.ApplyIdentifier, boundID, errorMessage)
+		return false, fmt.Errorf("process pending cutover for apply %s operation %d: %s", apply.ApplyIdentifier, boundID, errorMessage)
 	}
 	if err := completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCutover); err != nil {
-		return err
+		return true, err
 	}
 	logger.Info("pending cutover request for one operation accepted and completed",
 		"requested_by", controlRequestCaller(controlReq), "bound_operation_id", boundID)
-	return nil
+	return true, nil
 }

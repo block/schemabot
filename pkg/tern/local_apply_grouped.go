@@ -966,7 +966,11 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 	} else if standDown {
 		return true
 	}
-	if err := c.processPendingCutoverControlRequest(ctx, apply, tasks); err != nil {
+	cutoverTaken, err := c.processPendingCutoverControlRequest(ctx, apply, tasks)
+	if cutoverTaken {
+		ps.cutoverRequestTaken = true
+	}
+	if err != nil {
 		logger.Warn("pending cutover request processing failed after progress sync; current apply owner will exit for operator retry",
 			"error", err)
 		return true
@@ -1127,7 +1131,7 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 				}
 			}
 		}
-		if releaseAtCutoverBarrier && state.IsState(opState, state.Apply.WaitingForCutover) {
+		if releasesAtCutoverBarrier(releaseAtCutoverBarrier, ps, opState) {
 			logger.Info("operation parked at cutover barrier; exiting operation drive",
 				"mode", groupedApplyMode(apply, options), "operation_state", opState)
 			ps.parkedAtCutoverBarrier = true
@@ -1319,7 +1323,7 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 	// deployment-ordered cutover claim. releaseAtCutoverBarrier is set only for
 	// multi-operation barrier operations, so single-operation drives (including
 	// manual --defer-cutover) keep waiting for a manual cutover unchanged.
-	if releaseAtCutoverBarrier && state.IsState(opState, state.Apply.WaitingForCutover) {
+	if releasesAtCutoverBarrier(releaseAtCutoverBarrier, ps, opState) {
 		logger.Info("operation parked at cutover barrier; exiting copy drive",
 			"mode", groupedApplyMode(apply, options), "operation_state", opState, "apply_state", apply.State)
 		ps.parkedAtCutoverBarrier = true

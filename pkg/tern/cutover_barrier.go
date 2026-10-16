@@ -42,6 +42,22 @@ func shouldReleaseAtCutoverBarrier(apply *storage.Apply, multiOperation bool, op
 	return !apply.GetOptions().DeferCutover && shouldAutoDeferCutover(multiOperation, op)
 }
 
+// parksForDispatcher reports whether an operation of an apply a remote
+// dispatcher created parks at the cutover barrier for that dispatcher and
+// releases its claim there. The dispatcher defers every dispatched operation's
+// cutover and sends a cutover bound to the operation once its turn comes, so
+// until then the drive has nothing to do but wait. Waiting under the claim
+// would let parked operations fill the apply's driver cap and hold back the
+// operations of the same apply that have not started copying; a dispatcher
+// whose next cutover waits on one of those never sends it. The cutover claim
+// takes the parked operation back once its cutover request is pending
+// (FindNextApplyOperationCutover), and a manual --defer-cutover keeps its
+// contract on the dispatcher, whose own drive holds the claim and polls.
+func parksForDispatcher(apply *storage.Apply, multiOperation bool, op *storage.ApplyOperation) bool {
+	return apply != nil && apply.IdempotencyKey != "" && apply.GetOptions().DeferCutover &&
+		multiOperation && op != nil
+}
+
 // effectiveCopyDriveOptions returns the apply options that govern a copy-phase
 // drive. It starts from the apply's stored options and turns on DeferCutover
 // when the operation must park at the barrier (see shouldAutoDeferCutover). The
@@ -164,4 +180,15 @@ func tasksParkedAtCutover(tasks []*storage.Task) bool {
 		}
 	}
 	return false
+}
+
+// releasesAtCutoverBarrier reports whether a drive that releases at the
+// cutover barrier exits on this tick: its operation's tasks are parked at the
+// barrier and the drive has not taken a cutover request. A drive that took one
+// read its tasks before handing the cutover to the engine, so their parked
+// state is stale, and releasing would leave the swap running with no drive to
+// record it.
+func releasesAtCutoverBarrier(releaseAtCutoverBarrier bool, ps *atomicPollState, opState string) bool {
+	return releaseAtCutoverBarrier && !ps.cutoverRequestTaken &&
+		state.IsState(opState, state.Apply.WaitingForCutover)
 }

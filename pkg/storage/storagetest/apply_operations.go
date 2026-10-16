@@ -516,6 +516,174 @@ func TestApplyOperations(t *testing.T, h Harness) {
 		assert.Equal(t, parked[maxDrivers], last.ID)
 	})
 
+	// createDispatchedApply creates a running apply as a remote dispatch does:
+	// stamped with its dispatcher's idempotency key and, when deferCutover is
+	// set, with its cutover deferred for the dispatcher to send.
+	createDispatchedApply := func(t *testing.T, store storage.Storage, name string, deferCutover bool) *storage.Apply {
+		t.Helper()
+		lock := CreateLock(t, store, name+"_db", storage.DatabaseTypeMySQL)
+		apply := &storage.Apply{
+			ApplyIdentifier: name, LockID: lock.ID, PlanID: 940,
+			Database: lock.DatabaseName, DatabaseType: lock.DatabaseType,
+			Repository: lock.Repository, PullRequest: lock.PullRequest, Environment: "staging",
+			Engine: storage.EngineSpirit, State: state.Apply.Running,
+			IdempotencyKey: "schemabot:v1:" + name,
+		}
+		apply.SetOptions(storage.ApplyOptions{DeferCutover: deferCutover})
+		id, err := store.Applies().Create(t.Context(), apply)
+		require.NoError(t, err)
+		apply.ID = id
+		return apply
+	}
+
+	// requestCutover records a pending cutover request with the given
+	// metadata, as a dispatcher's cutover does when it names the operation it
+	// is for.
+	requestCutover := func(t *testing.T, store storage.Storage, applyID int64, metadata []byte) {
+		t.Helper()
+		_, _, err := store.ControlRequests().RequestPending(t.Context(), &storage.ApplyControlRequest{
+			ApplyID: applyID, Operation: storage.ControlOperationCutover, Status: storage.ControlRequestPending,
+			RequestedBy: "schemabot:dispatcher", Metadata: metadata,
+		})
+		require.NoError(t, err)
+	}
+
+	// FindNextApplyOperation_DispatchedParkedTargetsGiveBackTheirDrivers
+	// verifies the data plane side of a dispatched rollout over more targets
+	// than the per-apply driver cap. The dispatcher sent payments-001 through
+	// payments-003 with their cutovers deferred, and payments-001 and
+	// payments-002 have copied and parked at the barrier. The parked targets
+	// hold no driver: payments-003 starts its copy, and neither parked target
+	// is re-leased as stale work. Nothing cuts over until the dispatcher's
+	// cutover for payments-002 arrives, which takes payments-002 alone even
+	// though payments-001 parked first.
+	t.Run("FindNextApplyOperation_DispatchedParkedTargetsGiveBackTheirDrivers", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		apply := createDispatchedApply(t, store, "apply_dispatched_parked_targets", true)
+		targets := make([]string, storage.DefaultMaxDriversPerApply+1)
+		for i := range targets {
+			targets[i] = fmt.Sprintf("payments-%03d", i+1)
+		}
+		ids := insertTargetMembers(t, store, apply.ID, storage.CutoverPolicyRolling, storage.OnFailureHalt, targets...)
+		last := len(ids) - 1
+
+		for _, want := range ids[:last] {
+			claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-a")
+			require.NoError(t, err)
+			require.NotNil(t, claimed)
+			require.Equal(t, want, claimed.ID)
+			parkAtBarrier(t, store, claimed)
+		}
+		copyStart, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-b")
+		require.NoError(t, err)
+		require.NotNil(t, copyStart, "%s starts its copy while the earlier targets are parked", targets[last])
+		assert.Equal(t, ids[last], copyStart.ID)
+
+		idle, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-c")
+		require.NoError(t, err)
+		assert.Nil(t, idle, "a parked target is not re-leased as stale work")
+		noCutover, err := store.ApplyOperations().FindNextApplyOperationCutover(ctx, "driver-c")
+		require.NoError(t, err)
+		assert.Nil(t, noCutover, "nothing cuts over before the dispatcher sends a cutover")
+
+		requestCutover(t, store, apply.ID, storage.CutoverRequestMetadata(ids[1]))
+		cutover, err := store.ApplyOperations().FindNextApplyOperationCutover(ctx, "driver-c")
+		require.NoError(t, err)
+		require.NotNil(t, cutover, "the dispatcher's cutover takes the target it names")
+		assert.Equal(t, ids[1], cutover.ID)
+		assert.Equal(t, state.ApplyOperation.WaitingForCutover, cutover.State, "the claim reports the parked state it took the target from")
+		stored, err := store.ApplyOperations().Get(ctx, ids[1])
+		require.NoError(t, err)
+		require.NotNil(t, stored)
+		assert.Equal(t, state.ApplyOperation.CuttingOver, stored.State)
+
+		again, err := store.ApplyOperations().FindNextApplyOperationCutover(ctx, "driver-d")
+		require.NoError(t, err)
+		assert.Nil(t, again, "a cutover bound to payments-002 never takes payments-001")
+	})
+
+	// FindNextApplyOperationCutover_DispatchedCutoverFollowsItsRequest verifies
+	// which pending cutover takes a dispatched target parked at the barrier.
+	// payments-001 and payments-002 are parked. A cutover bound to no target is
+	// taken by the first parked target, as the drive takes it; a binding the
+	// drive cannot read takes nothing; and a pending stop, a halted earlier
+	// target, or an apply whose cutover was never deferred hold the target
+	// back.
+	t.Run("FindNextApplyOperationCutover_DispatchedCutoverFollowsItsRequest", func(t *testing.T) {
+		for _, tc := range []struct {
+			name         string
+			metadata     func(ids []int64) []byte
+			deferCutover bool
+			stop         bool
+			failFirst    bool
+			want         int // index of the target claimed, or -1 for none
+		}{
+			{name: "unbound", metadata: func([]int64) []byte { return []byte(`{}`) }, deferCutover: true, want: 0},
+			{name: "bound_to_zero", metadata: func([]int64) []byte { return []byte(`{"apply_operation_id":0}`) }, deferCutover: true, want: 0},
+			{name: "bound_to_null", metadata: func([]int64) []byte { return []byte(`{"apply_operation_id":null}`) }, deferCutover: true, want: 0},
+			{name: "unreadable_binding", metadata: func([]int64) []byte { return []byte(`{"apply_operation_id":"payments-002"}`) }, deferCutover: true, want: -1},
+			{name: "bound_to_the_second", metadata: func(ids []int64) []byte { return storage.CutoverRequestMetadata(ids[1]) }, deferCutover: true, want: 1},
+			{name: "pending_stop", metadata: func(ids []int64) []byte { return storage.CutoverRequestMetadata(ids[1]) }, deferCutover: true, stop: true, want: -1},
+			{name: "earlier_target_halted", metadata: func(ids []int64) []byte { return storage.CutoverRequestMetadata(ids[1]) }, deferCutover: true, failFirst: true, want: -1},
+			{name: "cutover_not_deferred", metadata: func(ids []int64) []byte { return storage.CutoverRequestMetadata(ids[1]) }, want: -1},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				ctx := t.Context()
+				store := h.NewStorage(t)
+				apply := createDispatchedApply(t, store, "apply_dispatched_cutover_"+tc.name, tc.deferCutover)
+				ids := insertTargetMembers(t, store, apply.ID, storage.CutoverPolicyRolling, storage.OnFailureHalt,
+					"payments-001", "payments-002")
+				for _, id := range ids {
+					require.NoError(t, store.ApplyOperations().UpdateState(ctx, id, state.ApplyOperation.WaitingForCutover))
+				}
+				if tc.failFirst {
+					require.NoError(t, store.ApplyOperations().MarkFailed(ctx, ids[0], "duplicate key name 'idx_orders_source'"))
+				}
+				requestCutover(t, store, apply.ID, tc.metadata(ids))
+				if tc.stop {
+					requestControl(t, store, apply.ID, storage.ControlOperationStop)
+				}
+
+				cutover, err := store.ApplyOperations().FindNextApplyOperationCutover(ctx, "driver-a")
+				require.NoError(t, err)
+				if tc.want < 0 {
+					assert.Nil(t, cutover, "no target cuts over under %s", tc.name)
+					return
+				}
+				require.NotNil(t, cutover, "a target cuts over under %s", tc.name)
+				assert.Equal(t, ids[tc.want], cutover.ID)
+			})
+		}
+	})
+
+	// FindNextApplyOperation_DispatchedParkedTargetTakesAStop verifies that a
+	// stop reaches a dispatched target parked at the barrier, which no drive
+	// holds: the copy claim takes it back to deliver the stop.
+	t.Run("FindNextApplyOperation_DispatchedParkedTargetTakesAStop", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		apply := createDispatchedApply(t, store, "apply_dispatched_parked_stop", true)
+		ids := insertTargetMembers(t, store, apply.ID, storage.CutoverPolicyRolling, storage.OnFailureHalt,
+			"payments-001", "payments-002")
+		claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-a")
+		require.NoError(t, err)
+		require.NotNil(t, claimed)
+		require.Equal(t, ids[0], claimed.ID)
+		parkAtBarrier(t, store, claimed)
+		second, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-a")
+		require.NoError(t, err)
+		require.NotNil(t, second)
+		require.Equal(t, ids[1], second.ID)
+
+		requestControl(t, store, apply.ID, storage.ControlOperationStop)
+		stop, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-b")
+		require.NoError(t, err)
+		require.NotNil(t, stop, "the stop reaches the parked target")
+		assert.Equal(t, ids[0], stop.ID)
+		assert.Equal(t, state.ApplyOperation.WaitingForCutover, stop.State)
+	})
+
 	// FindNextApplyOperationCutover_ConcurrentClaimsHoldTheCap verifies the
 	// cutover cap is a hard bound under contention. Eight targets of a parallel
 	// rollout are parked at the cutover, and eight drivers poll in the same

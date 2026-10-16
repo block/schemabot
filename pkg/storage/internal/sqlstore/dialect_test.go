@@ -29,6 +29,24 @@ func TestMySQLDialectJSONBooleanIsTrueRejectsNonIdentifierKey(t *testing.T) {
 	)
 }
 
+func TestMySQLDialectJSONIsNullAt(t *testing.T) {
+	assert.Equal(t,
+		`(COALESCE(JSON_TYPE(JSON_EXTRACT(cr.metadata, '$."apply_operation_id"')), 'NULL') = 'NULL')`,
+		MySQLDialect{}.JSONIsNullAt("cr.metadata", []string{"apply_operation_id"}),
+	)
+}
+
+func TestMySQLDialectJSONIntegerAt(t *testing.T) {
+	assert.Equal(t,
+		`(CASE WHEN JSON_TYPE(JSON_EXTRACT(cr.metadata, '$."apply_operation_id"')) IN ('INTEGER', 'UNSIGNED INTEGER') THEN CAST(JSON_EXTRACT(cr.metadata, '$."apply_operation_id"') AS SIGNED) END)`,
+		MySQLDialect{}.JSONIntegerAt("cr.metadata", []string{"apply_operation_id"}),
+	)
+	require.PanicsWithValue(t,
+		`sqlstore: JSON path key "apply-operation" is not a plain identifier`,
+		func() { MySQLDialect{}.JSONIntegerAt("cr.metadata", []string{"apply-operation"}) },
+	)
+}
+
 func TestMySQLDialectIndexHint(t *testing.T) {
 	assert.Equal(t, " FORCE INDEX (`idx_database_env_deployment`)", MySQLDialect{}.IndexHint("idx_database_env_deployment"))
 }
@@ -341,6 +359,26 @@ func TestPostgresDialectJSONBooleanIsTrueRejectsNonIdentifierKey(t *testing.T) {
 	require.PanicsWithValue(t,
 		`sqlstore: JSON path key "it's" is not a plain identifier`,
 		func() { PostgresDialect{}.JSONBooleanIsTrue("a.options", []string{"outer", "it's"}) },
+	)
+}
+
+func TestPostgresDialectJSONIsNullAt(t *testing.T) {
+	assert.Equal(t,
+		`(COALESCE(jsonb_typeof(jsonb_extract_path(cr.metadata, 'apply_operation_id')), 'null') = 'null')`,
+		PostgresDialect{}.JSONIsNullAt("cr.metadata", []string{"apply_operation_id"}),
+	)
+}
+
+func TestPostgresDialectJSONIntegerAt(t *testing.T) {
+	assert.Equal(t,
+		`(CASE WHEN jsonb_typeof(jsonb_extract_path(cr.metadata, 'apply_operation_id')) = 'number'`+
+			` AND jsonb_extract_path_text(cr.metadata, 'apply_operation_id') ~ '^-?[0-9]+$'`+
+			` THEN jsonb_extract_path_text(cr.metadata, 'apply_operation_id')::bigint END)`,
+		PostgresDialect{}.JSONIntegerAt("cr.metadata", []string{"apply_operation_id"}),
+	)
+	require.PanicsWithValue(t,
+		`sqlstore: JSON path key "it's" is not a plain identifier`,
+		func() { PostgresDialect{}.JSONIntegerAt("cr.metadata", []string{"it's"}) },
 	)
 }
 

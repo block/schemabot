@@ -50,6 +50,16 @@ func (e *cutoverRecordingEngine) Cutover(ctx context.Context, req *engine.Contro
 	return e.fakeControlEngine.Cutover(ctx, req)
 }
 
+// takePendingCutover runs one drive's pass over the apply's pending cutover
+// request, failing the test on error, and reports whether the drive handed
+// the cutover to the engine.
+func takePendingCutover(t *testing.T, client *LocalClient, apply *storage.Apply, tasks []*storage.Task) bool {
+	t.Helper()
+	taken, err := client.processPendingCutoverControlRequest(t.Context(), apply, tasks)
+	require.NoError(t, err)
+	return taken
+}
+
 // sharedApplyFixture is one data-plane apply that two rollout member targets
 // of a deployment were dispatched into, each as its own operation with one
 // task: payments-001 is operation 11 and payments-002 is operation 12.
@@ -199,11 +209,11 @@ func TestLocalClient_BoundCutoverIsTakenOnlyByItsOwnMembersDrive(t *testing.T) {
 		RequestedBy: "cli:alice", Metadata: storage.CutoverRequestMetadata(fx.second.ID),
 	}}
 
-	require.NoError(t, fx.client.processPendingCutoverControlRequest(t.Context(), fx.apply, []*storage.Task{fx.firstTask}))
+	assert.False(t, takePendingCutover(t, fx.client, fx.apply, []*storage.Task{fx.firstTask}))
 	assert.Empty(t, fx.engine.cutoverContexts, "a sibling member's drive must not take the request")
 	assert.Equal(t, storage.ControlRequestPending, fx.controlRequests.requests[0].Status)
 
-	require.NoError(t, fx.client.processPendingCutoverControlRequest(t.Context(), fx.apply, []*storage.Task{fx.secondTask}))
+	assert.True(t, takePendingCutover(t, fx.client, fx.apply, []*storage.Task{fx.secondTask}))
 	assert.Equal(t, []string{"ctx-op-12"}, fx.engine.cutoverContexts, "the bound member's drive swaps that member alone")
 	assert.Equal(t, storage.ControlRequestCompleted, fx.controlRequests.requests[0].Status)
 }
@@ -223,12 +233,12 @@ func TestLocalClient_BoundCutoverIsHeldByAnEarlierMemberThatFailedAfterAcceptanc
 	opStore := fx.client.storage.(*exactProgressStorage).applyOperations.(*perOperationResumeStore)
 	opStore.blocker = fx.first
 
-	require.NoError(t, fx.client.processPendingCutoverControlRequest(t.Context(), fx.apply, []*storage.Task{fx.secondTask}))
+	assert.False(t, takePendingCutover(t, fx.client, fx.apply, []*storage.Task{fx.secondTask}))
 	assert.Empty(t, fx.engine.cutoverContexts, "a held member must not cut over past the earlier failure")
 	assert.Equal(t, storage.ControlRequestPending, fx.controlRequests.requests[0].Status, "the acknowledged request waits for the hold to clear")
 
 	opStore.blocker = nil
-	require.NoError(t, fx.client.processPendingCutoverControlRequest(t.Context(), fx.apply, []*storage.Task{fx.secondTask}))
+	assert.True(t, takePendingCutover(t, fx.client, fx.apply, []*storage.Task{fx.secondTask}))
 	assert.Equal(t, []string{"ctx-op-12"}, fx.engine.cutoverContexts, "once nothing holds it, the bound member's drive takes the request")
 	assert.Equal(t, storage.ControlRequestCompleted, fx.controlRequests.requests[0].Status)
 }
@@ -242,7 +252,7 @@ func TestLocalClient_BoundCutoverWaitsForItsMemberToPark(t *testing.T) {
 		RequestedBy: "cli:alice", Metadata: storage.CutoverRequestMetadata(fx.second.ID),
 	}}
 
-	require.NoError(t, fx.client.processPendingCutoverControlRequest(t.Context(), fx.apply, []*storage.Task{fx.secondTask}))
+	assert.False(t, takePendingCutover(t, fx.client, fx.apply, []*storage.Task{fx.secondTask}))
 	assert.Empty(t, fx.engine.cutoverContexts)
 	assert.Equal(t, storage.ControlRequestPending, fx.controlRequests.requests[0].Status)
 }
@@ -268,7 +278,7 @@ func TestLocalClient_BoundCutoverSettlesOnceItsMemberHasEnded(t *testing.T) {
 				RequestedBy: "cli:alice", Metadata: storage.CutoverRequestMetadata(fx.second.ID),
 			}}
 
-			require.NoError(t, fx.client.processPendingCutoverControlRequest(t.Context(), fx.apply, []*storage.Task{fx.firstTask}))
+			assert.False(t, takePendingCutover(t, fx.client, fx.apply, []*storage.Task{fx.firstTask}))
 			assert.Empty(t, fx.engine.cutoverContexts, "settling a request never swaps the sibling")
 			assert.Equal(t, tc.want, fx.controlRequests.requests[0].Status)
 		})
@@ -314,12 +324,12 @@ func TestLocalClient_BoundCutoverWaitsForTheApplyToRecover(t *testing.T) {
 		RequestedBy: "cli:alice", Metadata: storage.CutoverRequestMetadata(fx.second.ID),
 	}}
 
-	require.NoError(t, fx.client.processPendingCutoverControlRequest(t.Context(), fx.apply, []*storage.Task{fx.secondTask}))
+	assert.False(t, takePendingCutover(t, fx.client, fx.apply, []*storage.Task{fx.secondTask}))
 	assert.Empty(t, fx.engine.cutoverContexts, "nothing swaps while the apply is recovering")
 	assert.Equal(t, storage.ControlRequestPending, fx.controlRequests.requests[0].Status, "the acknowledged cutover must wait for recovery, not fail")
 
 	fx.apply.State = state.Apply.WaitingForCutover
-	require.NoError(t, fx.client.processPendingCutoverControlRequest(t.Context(), fx.apply, []*storage.Task{fx.secondTask}))
+	assert.True(t, takePendingCutover(t, fx.client, fx.apply, []*storage.Task{fx.secondTask}))
 	assert.Equal(t, []string{"ctx-op-12"}, fx.engine.cutoverContexts, "the bound member swaps once recovery has finished")
 	assert.Equal(t, storage.ControlRequestCompleted, fx.controlRequests.requests[0].Status)
 }
