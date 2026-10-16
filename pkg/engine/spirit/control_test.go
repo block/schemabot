@@ -322,6 +322,10 @@ func silentTarget(t *testing.T) (string, <-chan struct{}) {
 	return ln.Addr().String(), accepted
 }
 
+// controlDuringConnectDeadline bounds a wait for a stop or cancel to return
+// once it has interrupted a connection attempt.
+const controlDuringConnectDeadline = 30 * time.Second
+
 // An operator stops or cancels a schema change while the engine is still
 // connecting to the target, either to read the current table definitions it
 // routes each ALTER by or to open the pool a direct-routed ALTER runs on. The
@@ -371,7 +375,23 @@ func TestControlDuringTargetConnectionKeepsTheControlOutcome(t *testing.T) {
 					t.Fatal("the phase never connected to the target")
 				}
 
-				result, err := control.run(eng, t.Context())
+				type controlOutcome struct {
+					result *engine.ControlResult
+					err    error
+				}
+				controlled := make(chan controlOutcome, 1)
+				go func() {
+					result, err := control.run(eng, t.Context())
+					controlled <- controlOutcome{result: result, err: err}
+				}()
+				var result *engine.ControlResult
+				var err error
+				select {
+				case outcome := <-controlled:
+					result, err = outcome.result, outcome.err
+				case <-time.After(controlDuringConnectDeadline):
+					require.FailNow(t, "the "+controlName+" did not return after interrupting the "+phaseName)
+				}
 
 				if controlName == "cancel" {
 					// The cancel goes on to release artifacts against a target this
