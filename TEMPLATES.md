@@ -5207,10 +5207,10 @@ ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```
 - Rows: 914,707 / 1,466,232 · ETA: 3m 15s
 - Shards: 4 (1 copying, 1 waiting for cutover, 1 queued, 1 complete)
-  - ◉ `80-c0`: 31%
-  - ● `40-80`: waiting for cutover
-  - ○ `c0-`: queued
   - ✓ `-40`: complete
+  - ● `40-80`: waiting for cutover
+  - ◉ `80-c0`: 31%
+  - ○ `c0-`: queued
 
 
 ---
@@ -7966,6 +7966,10 @@ Press Enter to deploy or proceed via the PlanetScale console (ESC to detach)
            ◉ ff-: 10.00% · 101,000 / 1,010,000 rows · ETA: 4m 40s
            ◉ fc-fd: 11.00% · 110,440 / 1,004,000 rows · ETA: 4m 38s
            ... 223 more copying shards
+           ● -01: waiting for cutover
+           ● 01-02: waiting for cutover
+           ● 02-03: waiting for cutover
+           ... 27 more shards past copying
 
 ```
 </details>
@@ -7996,6 +8000,10 @@ Press Enter to deploy or proceed via the PlanetScale console (ESC to detach)
            ◉ f0-f8: 26.00% · 390,000 / 1,500,000 rows · ETA: 2m 34s
            ◉ e8-f0: 29.00% · 432,100 / 1,490,000 rows · ETA: 2m 31s
            ... 17 more copying shards
+           ● -08: waiting for cutover
+           ● 08-10: waiting for cutover
+           ● 10-18: waiting for cutover
+           ... 9 more shards past copying
 
   ── commerce_001 ──
 
@@ -8164,8 +8172,8 @@ Press Enter to deploy or proceed via the PlanetScale console (ESC to detach)
        ALTER TABLE `orders` ADD INDEX `idx_total`(`total_cents`);
        • Rows: 2,800,000 / 4,000,000 · ETA: 2m 0s
        • Shards: 2 (2 copying)
-           ◉ 80-: 42.11% · 800,000 / 1,900,000 rows · ETA: 2m 0s
            ◉ -80: 95.24% · 2,000,000 / 2,100,000 rows · ETA: 10s
+           ◉ 80-: 42.11% · 800,000 / 1,900,000 rows · ETA: 2m 0s
 
 ```
 </details>
@@ -8876,7 +8884,7 @@ ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
   - ◉ `orders_040`: 62.38% · 914,707 / 1,466,232 rows
   - ◉ `orders_041`: 62.38% · 914,707 / 1,466,232 rows
   - ◉ `orders_042`: 62.38% · 914,707 / 1,466,232 rows
-  - … 1 more copying targets
+  - … 1 more copying target
 
 **`orders`**: ❌ Failed · 7 queued, 1 failed
 
@@ -8909,7 +8917,7 @@ ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
   - ◉ `orders_000`: 12.48% · 183,029 / 1,466,232 rows
   - ◉ `orders_001`: 12.48% · 183,029 / 1,466,232 rows
   - ◉ `orders_002`: 12.48% · 183,029 / 1,466,232 rows
-  - … 1 more copying targets
+  - … 1 more copying target
 
 
 </dd></dl>
@@ -8945,9 +8953,9 @@ ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 ```
 - Rows: 2,380,939 / 2,932,464 across 2 of 3 targets · ETA: ≥ 3m 15s
 - Targets: 3 (1 copying, 1 queued, 1 complete)
+  - ✓ `orders_000`: 1,466,232 rows
   - ◉ `orders_001`: 62.38% · 914,707 / 1,466,232 rows
   - ○ `orders_002`: queued
-  - ✓ `orders_000`: 1,466,232 rows
 
 
 ---
@@ -10287,17 +10295,15 @@ A new apply can retry the failure once this one finishes or is stopped; it repro
 
 ❌ prod — 40 completed · 19 running · 4 queued · 1 failed (64 targets)
 
-     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜ 86.72%
+     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜ 79%
        ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL;
-       • Rows: 4,093,000 / 4,720,000 · ETA: 10m 0s
-       • Targets: 60 (1 failed, 19 copying, 40 complete)
+       • Rows: 4,093,000 / 4,720,000 across 59 of 64 targets · ETA: ≥ 10m 0s
+       • Targets: 64 (1 failed, 19 copying, 4 queued, 40 complete)
            ✗ payments-041: failed
            ◉ payments-042: 25.00% · 20,000 / 80,000 rows · ETA: 10m 0s
            ◉ payments-043: 28.75% · 23,000 / 80,000 rows · ETA: 9m 35s
            ◉ payments-044: 32.50% · 26,000 / 80,000 rows · ETA: 9m 10s
            ... 16 more copying targets
-
-  4 of 64 targets have not reported progress yet.
 
   Targets needing attention:
     ❌ payments-041 — failed: duplicate key name 'idx_orders_source'
@@ -10370,9 +10376,9 @@ To cut over prod/payments-001:
        ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL;
 
        • Targets: 3 (2 stopped, 1 complete)
+           ✓ payments-001: 80,000 rows
            ○ payments-002: stopped at 40.00% · 32,000 / 80,000 rows
            ○ payments-003: stopped at 25.00% · 20,000 / 80,000 rows
-           ✓ payments-001: 80,000 rows
 
 To resume from where it stopped:
   schemabot start apply-multi-a1b2c3d4 -e production
