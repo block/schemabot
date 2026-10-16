@@ -60,6 +60,9 @@ func (m *mockPlanLookupStore) Get(context.Context, string) (*storage.Plan, error
 	return m.plan, m.err
 }
 func (m *mockPlanLookupStore) GetByID(context.Context, int64) (*storage.Plan, error) { return nil, nil }
+func (m *mockPlanLookupStore) GetListAnchor(context.Context, string) (*storage.PlanListAnchor, error) {
+	return nil, nil
+}
 func (m *mockPlanLookupStore) GetByLock(context.Context, int64) ([]*storage.Plan, error) {
 	return nil, nil
 }

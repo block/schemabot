@@ -334,3 +334,97 @@ func TestStatusCmdRendersAServerWithoutTheFinishedFilterAsOneTable(t *testing.T)
 	assert.NotContains(t, output, "Recent schema changes")
 	require.Len(t, ps.queries, 1, "the active applies are already in the server's list")
 }
+
+func plansPage(hasMore bool, identifiers ...string) apitypes.PlansResponse {
+	page := apitypes.PlansResponse{Limit: len(identifiers), MaxLimit: 200, HasMore: hasMore}
+	for _, identifier := range identifiers {
+		page.Plans = append(page.Plans, &apitypes.PlanSummaryResponse{PlanID: identifier, Database: "orders", Environment: "staging"})
+	}
+	return page
+}
+
+// list-plans --all --json requests each page after the last plan of the one
+// before and merges every page into one plans array, repeating the listing's
+// filters on every request. A truncated human page ends with the next page's
+// command.
+func TestPlansCmdPaging(t *testing.T) {
+	ps, server := newPagedServer(t, "/api/plans", map[string]any{
+		"":       plansPage(true, "plan-4", "plan-3"),
+		"plan-3": plansPage(false, "plan-2", "plan-1"),
+	})
+
+	var runErr error
+	output := captureOutput(t, func() {
+		runErr = (&PlansCmd{Environment: "staging", Repository: "org/repo", PR: 7, All: true, JSON: true}).Run(&Globals{Endpoint: server.URL})
+	})
+	require.NoError(t, runErr)
+	var merged apitypes.PlansResponse
+	require.NoError(t, json.Unmarshal([]byte(output), &merged))
+	identifiers := make([]string, 0, len(merged.Plans))
+	for _, plan := range merged.Plans {
+		identifiers = append(identifiers, plan.PlanID)
+	}
+	assert.Equal(t, []string{"plan-4", "plan-3", "plan-2", "plan-1"}, identifiers)
+	assert.False(t, merged.HasMore)
+	require.Len(t, ps.queries, 2)
+	for i, query := range ps.queries {
+		assert.Equal(t, "org/repo", query["repository"], "page %d repeats the repository", i)
+		assert.Equal(t, "7", query["pull_request"], "page %d repeats the pull request", i)
+		assert.Equal(t, "200", query["limit"], "page %d asks for full pages", i)
+	}
+	assert.Empty(t, ps.queries[0]["starting_after"])
+	assert.Equal(t, "plan-3", ps.queries[1]["starting_after"])
+
+	human := captureOutput(t, func() {
+		require.NoError(t, (&PlansCmd{Environment: "staging", Repository: "org/repo", PR: 7}).Run(&Globals{Endpoint: server.URL}))
+	})
+	assert.Contains(t, human, "Showing the 2 most recent plans. Use --limit N to show more.")
+	assert.NotContains(t, human, "--after", "below the cap a larger --limit shows more")
+
+	continued := captureOutput(t, func() {
+		require.NoError(t, (&PlansCmd{Environment: "staging", Repository: "org/repo", PR: 7, After: "plan-3"}).Run(&Globals{Endpoint: server.URL}))
+	})
+	assert.Contains(t, continued, "plan-1")
+	assert.NotContains(t, continued, "Use --limit", "the last page has no next page")
+	assert.NotContains(t, continued, "--after", "the last page has no next page")
+}
+
+// At the server's cap a larger --limit cannot show more, so a truncated plan
+// list names the --after plan that starts the next page, as does a page
+// already reached with --after.
+func TestPlansCmdTruncatedFooterAtTheCap(t *testing.T) {
+	atCap := plansPage(true, "plan-4", "plan-3")
+	atCap.MaxLimit = 2
+	continued := plansPage(true, "plan-2", "plan-1")
+	_, server := newPagedServer(t, "/api/plans", map[string]any{"": atCap, "plan-3": continued})
+
+	first := captureOutput(t, func() {
+		require.NoError(t, (&PlansCmd{Environment: "staging", Limit: 5}).Run(&Globals{Endpoint: server.URL}))
+	})
+	assert.Contains(t, first, "Showing the 2 most recent plans. Add --after plan-3 for the next 2.")
+	assert.NotContains(t, first, "Use --limit")
+
+	next := captureOutput(t, func() {
+		require.NoError(t, (&PlansCmd{Environment: "staging", Limit: 2, After: "plan-3"}).Run(&Globals{Endpoint: server.URL}))
+	})
+	assert.Contains(t, next, "Showing 2 more plans. Add --after plan-1 for the next 2.")
+}
+
+// A server that predates paging ignores starting_after and serves its first
+// page, which need not list the plan the operator asked to start after once
+// newer plans push it down. It never echoes starting_after, so both a single
+// page and --all fail rather than presenting the wrong page as the next one.
+func TestPlansCmdRefusesAServerThatIgnoresPaging(t *testing.T) {
+	ps, server := newPagedServer(t, "/api/plans", map[string]any{"": plansPage(true, "plan-5", "plan-4")})
+	ps.setLegacy()
+
+	var runErr error
+	captureOutput(t, func() { runErr = (&PlansCmd{After: "plan-3"}).Run(&Globals{Endpoint: server.URL}) })
+	require.EqualError(t, runErr, "the server did not continue after plan plan-3; it predates paging, so it cannot show the next page")
+
+	captureOutput(t, func() { runErr = (&PlansCmd{All: true, JSON: true}).Run(&Globals{Endpoint: server.URL}) })
+	require.EqualError(t, runErr, "the server did not continue after plan plan-4; it predates paging, so --all cannot list every plan")
+
+	require.EqualError(t, (&PlansCmd{PlanIDArg: "plan-1", After: "plan-2"}).Run(&Globals{Endpoint: server.URL}),
+		"--after and --all page the plan list; drop them to show one plan")
+}

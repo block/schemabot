@@ -897,6 +897,9 @@ type PlansOptions struct {
 	// Last bounds the listing to plans created within this window; zero means
 	// unbounded.
 	Last time.Duration
+	// After requests the page that follows this plan ID, the last plan of the
+	// previous page. The other options must repeat that page's filters.
+	After string
 }
 
 // GetPlans retrieves recent stored plans as summaries, newest first.
@@ -920,6 +923,9 @@ func GetPlans(endpoint string, opts PlansOptions) (*apitypes.PlansResponse, erro
 	}
 	if opts.Last > 0 {
 		values.Set("last", opts.Last.String())
+	}
+	if opts.After != "" {
+		values.Set("starting_after", opts.After)
 	}
 	requestPath := "/api/plans"
 	if encoded := values.Encode(); encoded != "" {

@@ -90,7 +90,7 @@ func TestWriteStatusListHasMoreFooterAtMaxLimit(t *testing.T) {
 	assert.Contains(t, first, "Showing the 1000 most recent schema changes. Add --after apply-example for the next 1000.")
 	assert.NotContains(t, first, "Use --limit N to show more.")
 
-	page.Continued = true
+	page.After = "apply-previous"
 	continued := captureStdout(t, func() { WriteStatusList(page) })
 	assert.Contains(t, continued, "Showing 1 more schema changes. Add --after apply-example for the next 1000.")
 
@@ -98,6 +98,21 @@ func TestWriteStatusListHasMoreFooterAtMaxLimit(t *testing.T) {
 	page.Applies[0].State = state.Apply.Failed
 	failed := captureStdout(t, func() { WriteStatusList(page) })
 	assert.Contains(t, failed, "Showing 1 more failed schema changes. Add --after apply-example for the next 1000.")
+}
+
+// An empty page reached with --after means nothing is older than the apply it
+// continues from, not that nothing matches the filters.
+func TestWriteStatusListEmptyContinuedPage(t *testing.T) {
+	output := captureStdout(t, func() {
+		WriteStatusList(StatusListData{Sectioned: true, Limit: 20, Last: "24h", After: "apply-oldest"})
+	})
+	assert.Contains(t, output, "No schema changes older than apply-oldest updated in the last 24h")
+	assert.NotContains(t, output, "No recent schema changes")
+
+	failed := captureStdout(t, func() {
+		WriteStatusList(StatusListData{FailuresOnly: true, Limit: 20, After: "apply-oldest"})
+	})
+	assert.Contains(t, failed, "No failed schema changes older than apply-oldest")
 }
 
 func TestWriteStatusListStateSummary(t *testing.T) {
