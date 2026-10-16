@@ -93,9 +93,12 @@ The branch reconcile pass finds those branches. It runs with the operator:
 each server runs it when it starts and then hourly, and an election keeps two
 servers from running it at the same time, so a fleet of N servers runs it up
 to N times an hour. Each run checks every PlanetScale database this server
-executes against (each environment with a local `dsn`), including databases
-registered after the server started. It reclaims a branch only when all of
-these hold:
+executes against: each environment with a local `dsn`, including databases
+registered after the server started, and, on a data plane that resolves
+targets through `target_resolver`, each PlanetScale target its applies ran
+against in the last 30 days plus the grace period. A data plane reaches each
+of those targets the way an apply on it does. It reclaims a branch only when
+all of these hold:
 
 - its name has the shape SchemaBot gives the branches it creates for that
   database, so the production branch and operator-created branches are never

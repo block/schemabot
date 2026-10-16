@@ -3,6 +3,7 @@ package tern
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"maps"
 	"testing"
@@ -13,6 +14,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/engine/planetscale"
+	"github.com/block/schemabot/pkg/inventory"
 	"github.com/block/schemabot/pkg/psclient"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
@@ -98,6 +100,18 @@ type branchReconcileOperationStore struct {
 	storage.ApplyOperationStore
 	ops     map[int64][]*storage.ApplyOperation
 	resumes map[int64]*storage.EngineResumeState
+	// recent is what ListRecentTargets serves; lookbacks records each window
+	// it was asked for.
+	recent    []storage.AppliedTarget
+	lookbacks []time.Duration
+}
+
+func (s *branchReconcileOperationStore) ListRecentTargets(_ context.Context, databaseType string, lookback time.Duration) ([]storage.AppliedTarget, error) {
+	if databaseType != storage.DatabaseTypeVitess {
+		return nil, fmt.Errorf("unexpected database type %q", databaseType)
+	}
+	s.lookbacks = append(s.lookbacks, lookback)
+	return s.recent, nil
 }
 
 func (s *branchReconcileOperationStore) ListByApply(_ context.Context, applyID int64) ([]*storage.ApplyOperation, error) {
@@ -396,4 +410,63 @@ func TestReconcileOrphanedBranchesKeepsABranchClaimedDuringThePass(t *testing.T)
 	assert.Empty(t, client.deleted)
 	assert.Equal(t, []string{"orders/vitess/staging"}, applies.held)
 	assert.Equal(t, BranchReconcileResult{Database: "orders", Candidates: 1, Kept: 1}, result)
+}
+
+// A data plane that resolves targets per request reconciles every PlanetScale
+// target its applies recently ran against. Each is reached through the route
+// an apply on it takes, so the reconcile lists the PlanetScale database that
+// target resolves to and, while it deletes, holds the apply target named by
+// the database and environment the applies were stored with. A target that no
+// longer resolves is reported and does not stop the pass from reconciling the
+// targets after it.
+func TestTargetRouterReconcilesTheTargetsItRecentlyAppliedTo(t *testing.T) {
+	old := branchReconcileNow.Add(-48 * time.Hour)
+	planetScale := map[string]*branchReconcileClient{
+		"orders-token":  {branches: []*ps.DatabaseBranch{{Name: "main", Production: true, CreatedAt: old}, {Name: "schemabot-orders-ps-aaaa0001", CreatedAt: old}}},
+		"catalog-token": {branches: []*ps.DatabaseBranch{{Name: "schemabot-catalog-ps-aaaa0002", CreatedAt: old}}},
+	}
+	resolved := map[string]string{"orders-staging": "orders", "catalog-production": "catalog"}
+	resolver := targetRouterResolverFunc(func(_ context.Context, req inventory.Request) (*inventory.Target, error) {
+		name, ok := resolved[req.Target]
+		if !ok {
+			return nil, fmt.Errorf("target %q is not in the inventory", req.Target)
+		}
+		return &inventory.Target{Target: req.Target, DatabaseType: storage.DatabaseTypeVitess, Metadata: map[string]string{
+			inventory.MetadataOrganization: "block",
+			inventory.MetadataTokenName:    "token",
+			inventory.MetadataTokenValue:   name + "-token",
+			inventory.MetadataAPIURL:       "https://api.planetscale.test",
+			"database":                     name + "-ps",
+		}}, nil
+	})
+	applies := &branchReconcileApplyStore{}
+	operations := &branchReconcileOperationStore{recent: []storage.AppliedTarget{
+		{Database: "catalog", Environment: "production", Target: "catalog-production"},
+		{Database: "decommissioned", Environment: "production", Target: "decommissioned-production"},
+		{Database: "orders", Environment: "staging", Target: "orders-staging"},
+	}}
+	router, err := NewTargetRouter(TargetRouterConfig{
+		Resolver: resolver,
+		Storage:  &branchReconcileStorage{applies: applies, operations: operations},
+		Logger:   slog.New(slog.DiscardHandler),
+		LocalClientFactory: func(cfg LocalConfig, st storage.Storage, logger *slog.Logger) (Client, error) {
+			return &LocalClient{config: cfg, storage: st, logger: logger, psClientFunc: func(_, token string) (psclient.PSClient, error) {
+				return planetScale[token], nil
+			}}, nil
+		},
+	})
+	require.NoError(t, err)
+
+	result, err := router.ReconcileRecentTargetBranches(t.Context(), BranchReconcileOptions{
+		Grace: branchReconcileGrace, Delete: true, Now: branchReconcileNow, Environment: "ignored",
+	})
+
+	require.ErrorContains(t, err, `target "decommissioned-production" is not in the inventory`)
+	assert.Equal(t, RecentTargetsReconcileResult{Targets: 3, Deleted: 2}, result)
+	assert.Equal(t, []time.Duration{branchReconcileGrace + RecentTargetWindow}, operations.lookbacks,
+		"the window outlasts the grace period, so a branch becomes reclaimable while its target is still listed")
+	assert.Equal(t, []string{"schemabot-catalog-ps-aaaa0002"}, planetScale["catalog-token"].deleted)
+	assert.Equal(t, []string{"schemabot-orders-ps-aaaa0001"}, planetScale["orders-token"].deleted)
+	assert.Equal(t, []string{"catalog/vitess/production", "orders/vitess/staging"}, applies.held,
+		"each delete holds the apply target its applies were stored under")
 }
