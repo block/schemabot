@@ -102,7 +102,7 @@ func markPendingControlRequestCompleted(ctx context.Context, store storage.Stora
 	return nil
 }
 
-// settlePendingRequestsForTerminalApply settles the pending control requests
+// SettlePendingRequestsForTerminalApply settles the pending control requests
 // that a terminal apply moots: a pending stop is settled (the apply can no
 // longer be stopped). Sweeping the mooted requests keeps a request issued
 // moments before the apply settled — or one that lost to a contradictory
@@ -113,7 +113,14 @@ func markPendingControlRequestCompleted(ctx context.Context, store storage.Stora
 // took effect (CO-2). A pending cancel is mooted by every terminal state except
 // stopped, since a stopped apply remains cancellable and its pending cancel
 // stays deliverable for the next drive.
-func settlePendingRequestsForTerminalApply(ctx context.Context, store storage.Storage, logger *slog.Logger, apply *storage.Apply) error {
+//
+// This is the one terminal sweep: the drive tail runs it on the apply it just
+// settled, and the operator's post-drive settlement and the stranded control
+// request reaper run it on a reloaded terminal apply, so a request a drive
+// failed to settle is answered the same way whichever path reaches it.
+//
+// The caller must have established that the apply is terminal.
+func SettlePendingRequestsForTerminalApply(ctx context.Context, store storage.Storage, logger *slog.Logger, apply *storage.Apply) error {
 	if err := completePendingStopControlRequest(ctx, store, logger, apply); err != nil {
 		return err
 	}
@@ -121,6 +128,16 @@ func settlePendingRequestsForTerminalApply(ctx context.Context, store storage.St
 	// previous release; no driver services it anymore, so this sweep is its
 	// only settlement path.
 	for _, op := range storage.RetiredControlOperations() {
+		controlReq, err := pendingControlRequest(ctx, store, apply, op)
+		if err != nil {
+			return err
+		}
+		if controlReq == nil {
+			logger.DebugContext(ctx, "no pending control request of this operation to settle", append(apply.LogAttrs(), "operation", op)...)
+			continue
+		}
+		logger.InfoContext(ctx, "completing pending control request the terminal apply moots",
+			append(apply.LogAttrs(), "operation", op, "requested_by", controlRequestCaller(controlReq))...)
 		if err := completePendingControlRequests(ctx, store, apply, op); err != nil {
 			return err
 		}
@@ -389,7 +406,7 @@ func cutoverNotAppliedMessage(applyState string) string {
 // requests stay pending for the operator's post-drive settlement, and an
 // operator can re-issue one; a summary that never posts has no such recovery.
 func (c *LocalClient) settleRequestsForStoredOutcome(ctx context.Context, logger *slog.Logger, apply *storage.Apply) {
-	if err := settlePendingRequestsForTerminalApply(ctx, c.storage, c.logger, apply); err != nil {
+	if err := SettlePendingRequestsForTerminalApply(ctx, c.storage, c.logger, apply); err != nil {
 		logger.Warn("failed to settle pending control requests for the stored terminal outcome; they stay pending for the operator's post-drive settlement and the terminal summary still posts",
 			"state", apply.State, "error", err)
 	}

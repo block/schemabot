@@ -1951,17 +1951,16 @@ func (s *Service) driverLogger(driverID int) *slog.Logger {
 	return s.logger.With("driver", driverID)
 }
 
-// completePendingControlRequestsIfApplyResolved settles pending stop, start,
-// cutover, revert, skip-revert, and cancel control requests once the apply has
-// settled to a terminal state, so the requests do not stay pending forever
-// after the rollout resolves. The apply is reloaded because the derived-state
-// write operates on a copy and does not mutate the caller's row. The logger
-// carries the caller's identity — a driver's id, or the reaper — so the
-// settlement lines name who answered. A pending stop completes at any terminal
-// state. A pending start, cutover, revert, skip-revert, and cancel are handed
-// to the shared settlements, which decide from the stored outcome whether the
-// command took effect, so this path discloses the same outcome as every other
-// drive shape. A
+// completePendingControlRequestsIfApplyResolved settles the pending control
+// requests of an apply that has settled to a terminal state, so the requests do
+// not stay pending forever after the rollout resolves. The apply is reloaded
+// because the derived-state write operates on a copy and does not mutate the
+// caller's row. The logger carries the caller's identity — a driver's id, or
+// the reaper — so the settlement lines name who answered. A terminal apply is
+// handed to the drive tail's own terminal sweep, which decides from the stored
+// outcome whether each command took effect, so this path settles every
+// operation that sweep does and discloses the same outcome; the start, which
+// the drive answers itself, is settled here on top of it. A
 // still-non-terminal apply resolves only its stop, and only once that stop has
 // reached every operation, along with the cutover that stop superseded. No-op
 // when nothing is pending.
@@ -1977,22 +1976,13 @@ func (s *Service) completePendingControlRequestsIfApplyResolved(ctx context.Cont
 		return s.completeLandedStopForHeldOpenApply(ctx, logger, apply)
 	}
 
-	// The cutover is settled before the stop completes, so a failed settlement
-	// on a stopped apply leaves the stop pending to gate the cutover off until
-	// the next pass settles it (CO-4).
-	if err := tern.SettlePendingCutoverForResolvedApply(ctx, s.storage, logger, apply); err != nil {
+	// The terminal sweep settles the cutover before the stop completes, so a
+	// failed settlement on a stopped apply leaves the stop pending to gate the
+	// cutover off until the next pass settles it (CO-4).
+	if err := tern.SettlePendingRequestsForTerminalApply(ctx, s.storage, logger, apply); err != nil {
 		return err
 	}
-	if err := s.completePendingRequestForResolvedApply(ctx, logger, apply, storage.ControlOperationStop); err != nil {
-		return err
-	}
-	if err := tern.SettlePendingStartForResolvedApply(ctx, s.storage, logger, apply); err != nil {
-		return err
-	}
-	if err := tern.SettlePendingRevertPhaseForResolvedApply(ctx, s.storage, logger, apply); err != nil {
-		return err
-	}
-	return tern.SettlePendingCancelForResolvedApply(ctx, s.storage, logger, apply)
+	return tern.SettlePendingStartForResolvedApply(ctx, s.storage, logger, apply)
 }
 
 // completeLandedStopForHeldOpenApply completes a pending stop request on an

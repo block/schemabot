@@ -35,7 +35,7 @@ func TestSettlePendingRequestsForTerminalApply(t *testing.T) {
 	controlRequests := &testControlRequestStore{requests: requests}
 	store := &mockStorage{controlRequests: controlRequests}
 
-	require.NoError(t, settlePendingRequestsForTerminalApply(t.Context(), store, discardLogger(), apply))
+	require.NoError(t, SettlePendingRequestsForTerminalApply(t.Context(), store, discardLogger(), apply))
 
 	for _, op := range sweptOps {
 		pending, err := controlRequests.GetPending(t.Context(), apply.ID, op)
@@ -81,7 +81,7 @@ func TestSettlePendingRequestsForTerminalApplySettlesCutoverByOutcome(t *testing
 			}}
 			store := &mockStorage{controlRequests: controlRequests, logs: &mockApplyLogStore{}}
 
-			require.NoError(t, settlePendingRequestsForTerminalApply(t.Context(), store, discardLogger(), apply))
+			require.NoError(t, SettlePendingRequestsForTerminalApply(t.Context(), store, discardLogger(), apply))
 
 			settled, err := controlRequests.GetByOperation(t.Context(), apply.ID, storage.ControlOperationCutover)
 			require.NoError(t, err)
@@ -124,7 +124,7 @@ func TestSettlePendingRequestsForTerminalApplySettlesBoundCutoverByOperation(t *
 			}}
 			store := &mockStorage{controlRequests: controlRequests, logs: &mockApplyLogStore{}, operations: ops}
 
-			require.NoError(t, settlePendingRequestsForTerminalApply(t.Context(), store, discardLogger(), apply))
+			require.NoError(t, SettlePendingRequestsForTerminalApply(t.Context(), store, discardLogger(), apply))
 
 			settled, err := controlRequests.GetByOperation(t.Context(), apply.ID, storage.ControlOperationCutover)
 			require.NoError(t, err)
@@ -326,7 +326,7 @@ func TestSettlePendingRequestsForTerminalApplySettlesRevertPhaseByOutcome(t *tes
 			logs := &mockApplyLogStore{}
 			store := &mockStorage{controlRequests: controlRequests, logs: logs}
 
-			require.NoError(t, settlePendingRequestsForTerminalApply(t.Context(), store, discardLogger(), apply))
+			require.NoError(t, SettlePendingRequestsForTerminalApply(t.Context(), store, discardLogger(), apply))
 
 			settled, err := controlRequests.GetByOperation(t.Context(), apply.ID, tc.operation)
 			require.NoError(t, err)
@@ -420,7 +420,7 @@ func TestSettlePendingRequestsForTerminalApplyFailsAnOutrunCancel(t *testing.T) 
 	logs := &mockApplyLogStore{}
 	store := &mockStorage{controlRequests: controlRequests, logs: logs}
 
-	require.NoError(t, settlePendingRequestsForTerminalApply(t.Context(), store, discardLogger(), apply))
+	require.NoError(t, SettlePendingRequestsForTerminalApply(t.Context(), store, discardLogger(), apply))
 
 	pending, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationCancel)
 	require.NoError(t, err)
@@ -511,7 +511,7 @@ func TestSettlePendingRequestsForCancelledApplyCompletesTheCancel(t *testing.T) 
 	logs := &mockApplyLogStore{}
 	store := &mockStorage{controlRequests: controlRequests, logs: logs}
 
-	require.NoError(t, settlePendingRequestsForTerminalApply(t.Context(), store, discardLogger(), apply))
+	require.NoError(t, SettlePendingRequestsForTerminalApply(t.Context(), store, discardLogger(), apply))
 
 	settled, err := controlRequests.GetByOperation(t.Context(), apply.ID, storage.ControlOperationCancel)
 	require.NoError(t, err)
@@ -566,7 +566,7 @@ func TestSettlePendingRequestsForStoppedApplyKeepsCancelPending(t *testing.T) {
 	}}
 	store := &mockStorage{controlRequests: controlRequests}
 
-	require.NoError(t, settlePendingRequestsForTerminalApply(t.Context(), store, discardLogger(), apply))
+	require.NoError(t, SettlePendingRequestsForTerminalApply(t.Context(), store, discardLogger(), apply))
 
 	pendingStop, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationStop)
 	require.NoError(t, err)
