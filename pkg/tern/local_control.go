@@ -105,6 +105,13 @@ func operationsSpanSeveralTargets(ops []*storage.ApplyOperation) bool {
 // identifier when provided or by the database's active task otherwise. The
 // operation label names the control verb in errors and logs. Returns
 // (nil, nil) when no apply id is given and the database has no active task.
+//
+// An apply named by identifier is checked against this client's database
+// scope before it is returned. Looking up by database can only ever reach this
+// client's own work; looking up by identifier reaches any apply in storage
+// SchemaBot shares with other clients, and a control carried out through this
+// client's engine and credentials against another database's apply would act on
+// the wrong target.
 func (c *LocalClient) resolveControlApply(ctx context.Context, applyID, operation string) (*storage.Apply, error) {
 	if applyID != "" {
 		apply, err := c.storage.Applies().GetByApplyIdentifier(ctx, applyID)
@@ -113,6 +120,11 @@ func (c *LocalClient) resolveControlApply(ctx context.Context, applyID, operatio
 		}
 		if apply == nil {
 			return nil, fmt.Errorf("load apply %s before %s: %w", applyID, operation, storage.ErrApplyNotFound)
+		}
+		if err := c.guardDriveScope(apply); err != nil {
+			c.logger.Warn(operation+" rejected because the apply belongs to another database",
+				append(apply.LogAttrs(), "client_database", c.config.Database)...)
+			return nil, fmt.Errorf("%s refused: %w", operation, err)
 		}
 		return apply, nil
 	}

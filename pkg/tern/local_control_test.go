@@ -3401,3 +3401,102 @@ func TestLocalClientRevertWindowControlsRefuseAnApplyThatIsNotTheirs(t *testing.
 		})
 	}
 }
+
+// A client is bound to one database, but the storage it reads is shared with
+// the clients of other databases. A control that names another database's apply
+// is refused before any engine call or durable request, because carrying it out
+// through this client's engine and credentials would act on the wrong target.
+func TestLocalClientControlsRefuseAnotherDatabasesApply(t *testing.T) {
+	client, eng := newRevertScopeLocalClient()
+	otherOp := int64(30)
+	otherApply := &storage.Apply{
+		ID: 3, ApplyIdentifier: "apply-other-db", Database: "otherdb", Deployment: "otherdb",
+		Environment: "staging", State: state.Apply.RevertWindow,
+	}
+	otherTask := &storage.Task{
+		ID: 3, ApplyID: otherApply.ID, TaskIdentifier: "task-other-db", ApplyOperationID: &otherOp,
+		Database: "otherdb", Environment: "staging", State: state.Task.RevertWindow,
+	}
+	cs := client.storage.(*controlTestStorage)
+	cs.applies.(*revertScopeApplyStore).applies = append(cs.applies.(*revertScopeApplyStore).applies, otherApply)
+	cs.tasks.(*revertScopeTaskStore).tasks = append(cs.tasks.(*revertScopeTaskStore).tasks, otherTask)
+	cs.applyOperations.(*revertScopeOperationStore).resumeMetadata[otherOp] = "deploy-request-otherdb"
+
+	const wantError = `outside this client's database scope ("testdb")`
+
+	_, err := client.Revert(t.Context(), &ternv1.RevertRequest{ApplyId: "apply-other-db", Environment: "staging"})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), wantError)
+	assert.Nil(t, eng.revertReq, "a refused revert never reaches the engine")
+
+	_, err = client.SkipRevert(t.Context(), &ternv1.SkipRevertRequest{ApplyId: "apply-other-db", Environment: "staging"})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), wantError)
+	assert.Nil(t, eng.skipRevertReq, "a refused skip-revert never reaches the engine")
+
+	_, err = client.Cancel(t.Context(), &ternv1.CancelRequest{ApplyId: "apply-other-db"})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), wantError)
+
+	_, err = client.Cutover(t.Context(), &ternv1.CutoverRequest{ApplyId: "apply-other-db", Environment: "staging"})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), wantError)
+}
+
+// A revert-window control acts on the apply's task that is still live. A task
+// that already settled is passed over in favour of a later live one, and an
+// apply whose every task has settled is refused rather than acted on through a
+// settled task.
+func TestLocalClientRevertWindowControlsSelectTheApplysLiveTask(t *testing.T) {
+	settledOp, liveOp := int64(40), int64(50)
+	settledTask := &storage.Task{
+		ID: 4, ApplyID: 1, TaskIdentifier: "task-settled", ApplyOperationID: &settledOp,
+		Database: "testdb", Environment: "staging", State: state.Task.Completed,
+	}
+	liveTask := &storage.Task{
+		ID: 5, ApplyID: 1, TaskIdentifier: "task-live", ApplyOperationID: &liveOp,
+		Database: "testdb", Environment: "staging", State: state.Task.RevertWindow,
+	}
+
+	newClient := func(tasks ...*storage.Task) (*LocalClient, *revertScopeEngine) {
+		client, eng := newRevertScopeLocalClient()
+		cs := client.storage.(*controlTestStorage)
+		cs.tasks.(*revertScopeTaskStore).tasks = tasks
+		cs.applyOperations.(*revertScopeOperationStore).resumeMetadata[settledOp] = "deploy-request-settled"
+		cs.applyOperations.(*revertScopeOperationStore).resumeMetadata[liveOp] = "deploy-request-live"
+		return client, eng
+	}
+
+	t.Run("a settled task is passed over for the live one", func(t *testing.T) {
+		client, eng := newClient(settledTask, liveTask)
+
+		resp, err := client.Revert(t.Context(), &ternv1.RevertRequest{ApplyId: "apply-staging", Environment: "staging"})
+		require.NoError(t, err)
+		assert.True(t, resp.Accepted)
+		require.NotNil(t, eng.revertReq)
+		require.NotNil(t, eng.revertReq.ResumeState)
+		assert.Equal(t, "deploy-request-live", eng.revertReq.ResumeState.Metadata)
+
+		resp2, err := client.SkipRevert(t.Context(), &ternv1.SkipRevertRequest{ApplyId: "apply-staging", Environment: "staging"})
+		require.NoError(t, err)
+		assert.True(t, resp2.Accepted)
+		require.NotNil(t, eng.skipRevertReq)
+		require.NotNil(t, eng.skipRevertReq.ResumeState)
+		assert.Equal(t, "deploy-request-live", eng.skipRevertReq.ResumeState.Metadata)
+	})
+
+	t.Run("an apply whose tasks have all settled is refused", func(t *testing.T) {
+		client, eng := newClient(settledTask)
+
+		_, err := client.Revert(t.Context(), &ternv1.RevertRequest{ApplyId: "apply-staging", Environment: "staging"})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "no active schema change for apply apply-staging")
+
+		_, err = client.SkipRevert(t.Context(), &ternv1.SkipRevertRequest{ApplyId: "apply-staging", Environment: "staging"})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "no active schema change for apply apply-staging")
+
+		assert.Nil(t, eng.revertReq, "a refused revert never reaches the engine")
+		assert.Nil(t, eng.skipRevertReq, "a refused skip-revert never reaches the engine")
+	})
+}
