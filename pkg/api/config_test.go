@@ -4081,17 +4081,17 @@ require_passing_checks: false
 func TestServerConfig_ReviewPolicy(t *testing.T) {
 	t.Run("nil receiver defaults to false", func(t *testing.T) {
 		var cfg *ServerConfig
-		assert.False(t, cfg.ReviewPolicyEnabled("testapp"))
+		assert.False(t, cfg.ReviewPolicyEnabled())
 	})
 
 	t.Run("disabled by default", func(t *testing.T) {
 		cfg := &ServerConfig{}
-		assert.False(t, cfg.ReviewPolicyEnabled("testapp"))
+		assert.False(t, cfg.ReviewPolicyEnabled())
 	})
 
 	t.Run("explicitly enabled", func(t *testing.T) {
 		cfg := &ServerConfig{ReviewPolicy: ReviewPolicyConfig{Enabled: true}}
-		assert.True(t, cfg.ReviewPolicyEnabled("testapp"))
+		assert.True(t, cfg.ReviewPolicyEnabled())
 	})
 
 	t.Run("database operators included by default", func(t *testing.T) {
@@ -4134,7 +4134,7 @@ review_policy:
 		cfg, err := LoadServerConfigFromFile(configPath)
 		require.NoError(t, err)
 
-		assert.True(t, cfg.ReviewPolicyEnabled("testapp"))
+		assert.True(t, cfg.ReviewPolicyEnabled())
 		assert.Equal(t, []string{"octocat/admins"}, cfg.ReviewPolicy.AdminTeams)
 		assert.Equal(t, []string{"mona"}, cfg.ReviewPolicy.AdminUsers)
 		assert.False(t, cfg.ReviewPolicyIncludesDatabaseOperators())
@@ -4172,9 +4172,9 @@ databases:
         dsn: "root@tcp(localhost:3306)/payments"
 `)
 		require.NoError(t, err)
-		assert.True(t, cfg.ReviewPolicyEnabled("orders"))
-		assert.False(t, cfg.ReviewPolicyEnabled("payments"))
-		assert.False(t, cfg.ReviewPolicyEnabled("unknown"))
+		assert.True(t, cfg.ReviewPolicyEnabledForDatabase("orders"))
+		assert.False(t, cfg.ReviewPolicyEnabledForDatabase("payments"))
+		assert.False(t, cfg.ReviewPolicyEnabledForDatabase("unknown"))
 	})
 
 	t.Run("an instance-wide gate covers every database", func(t *testing.T) {
@@ -4182,7 +4182,7 @@ databases:
 			ReviewPolicy: ReviewPolicyConfig{Enabled: true},
 			Databases:    map[string]DatabaseConfig{"payments": {Type: "mysql"}},
 		}
-		assert.True(t, cfg.ReviewPolicyEnabled("payments"))
+		assert.True(t, cfg.ReviewPolicyEnabledForDatabase("payments"))
 	})
 
 	t.Run("a database that opts in with nobody who can approve is rejected", func(t *testing.T) {
@@ -4258,16 +4258,16 @@ databases:
         dsn: "root@tcp(localhost:3306)/orders"
 `)
 		require.NoError(t, err)
-		assert.True(t, cfg.ReviewPolicyEnabled("orders"))
+		assert.True(t, cfg.ReviewPolicyEnabledForDatabase("orders"))
 	})
 
-	for name, approvers := range map[string]string{
-		"instance admins": "review_policy:\n  admin_users:\n    - mona\n",
-		"CODEOWNERS":      "review_policy:\n  include_codeowners: true\n",
-		"repo admins":     "repos:\n  octocat/orders:\n    admin_teams:\n      - octocat/maintainers\n",
-	} {
-		t.Run("an opted-in database approved by "+name+" is accepted", func(t *testing.T) {
-			cfg, err := loadConfig(t, approvers+`
+	t.Run("a repo the database accepts with no admins of its own leaves an opted-in database without an approver", func(t *testing.T) {
+		_, err := loadConfig(t, `
+repos:
+  octocat/a:
+    admin_teams:
+      - octocat/maintainers
+  octocat/b: {}
 databases:
   orders:
     type: mysql
@@ -4277,8 +4277,64 @@ databases:
       staging:
         dsn: "root@tcp(localhost:3306)/orders"
 `)
+		require.ErrorContains(t, err, "databases.orders.review_policy.enabled requires someone who can approve every PR, but repos.octocat/b, which the database accepts schema changes from, has no admin_teams or admin_users")
+	})
+
+	t.Run("CODEOWNERS alone cannot approve an opted-in database", func(t *testing.T) {
+		_, err := loadConfig(t, `
+review_policy:
+  include_codeowners: true
+repos:
+  octocat/orders: {}
+databases:
+  orders:
+    type: mysql
+    review_policy:
+      enabled: true
+    environments:
+      staging:
+        dsn: "root@tcp(localhost:3306)/orders"
+`)
+		require.ErrorContains(t, err, "repos.octocat/orders, which the database accepts schema changes from, has no admin_teams or admin_users")
+	})
+
+	t.Run("an opted-in database that accepts any repository needs approvers beyond repo admins when no repos are configured", func(t *testing.T) {
+		_, err := loadConfig(t, `
+databases:
+  orders:
+    type: mysql
+    review_policy:
+      enabled: true
+    environments:
+      staging:
+        dsn: "root@tcp(localhost:3306)/orders"
+`)
+		require.ErrorContains(t, err, "databases.orders.review_policy.enabled requires someone who can approve every PR, but the database accepts any repository and no repos are configured")
+	})
+
+	for name, approvers := range map[string]string{
+		"instance admins":              "review_policy:\n  admin_users:\n    - mona\n",
+		"repo admins":                  "repos:\n  octocat/orders:\n    admin_teams:\n      - octocat/maintainers\n",
+		"admins of every repo":         "repos:\n  octocat/a:\n    admin_teams:\n      - octocat/maintainers\n  octocat/b:\n    admin_users:\n      - mona\n",
+		"operators beside a bare repo": "repos:\n  octocat/orders: {}\n",
+	} {
+		t.Run("an opted-in database approved by "+name+" is accepted", func(t *testing.T) {
+			operators := ""
+			if strings.HasPrefix(name, "operators") {
+				operators = "    operator_users:\n      - mona\n"
+			}
+			cfg, err := loadConfig(t, approvers+`
+databases:
+  orders:
+    type: mysql
+`+operators+`    review_policy:
+      enabled: true
+    environments:
+      staging:
+        dsn: "root@tcp(localhost:3306)/orders"
+`)
 			require.NoError(t, err)
-			assert.True(t, cfg.ReviewPolicyEnabled("orders"))
+			assert.True(t, cfg.ReviewPolicyEnabledForDatabase("orders"))
 		})
 	}
 }

@@ -545,7 +545,7 @@ func matchReviewGateCodeowners(ctx context.Context, client *ghclient.Installatio
 // isReviewGateEnabled checks server config for the review gate toggle, which
 // is on instance-wide or for the database alone.
 func (h *Handler) isReviewGateEnabled(repo, database string) bool {
-	enabled := h.service != nil && h.service.Config().ReviewPolicyEnabled(database)
+	enabled := h.service != nil && h.service.Config().ReviewPolicyEnabledForDatabase(database)
 	h.logger.Debug("review gate: server config", "repo", repo, "database", database, "enabled", enabled)
 	return enabled
 }

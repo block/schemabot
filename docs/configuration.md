@@ -1935,7 +1935,7 @@ databases:
         dsn: "env:STAGING_DSN"
 ```
 
-The database's own `review_policy` only adds the gate; it cannot turn off an instance-wide one. Who can approve comes from the instance's settings below, so an opted-in database needs at least one of them configured, and SchemaBot refuses to start otherwise. A repo's admins count only when the database's `allowed_repos` accepts that repo, since they approve only its PRs.
+The database's own `review_policy` only adds the gate; it cannot turn off an instance-wide one. Who can approve comes from the instance's settings below, and SchemaBot refuses to start unless every PR the database accepts has someone who can approve it. That takes the database's operators, `review_policy.admin_teams` or `admin_users`, or admins on every repo the database accepts: each repo in its `allowed_repos`, or every repo under `repos:` when `allowed_repos` is empty. CODEOWNERS do not count toward this, because they approve only a PR whose files they own.
 
 When enabled, SchemaBot checks PR approval before proceeding. A satisfying review can come from:
 

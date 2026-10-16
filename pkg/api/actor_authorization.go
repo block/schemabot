@@ -2,6 +2,8 @@ package api
 
 import (
 	"fmt"
+	"maps"
+	"slices"
 	"strings"
 )
 
@@ -37,15 +39,23 @@ func (c *ServerConfig) PRCommandAuthorizationEnabled() bool {
 	return c != nil && c.PRCommandAuthorization.Enabled
 }
 
-// ReviewPolicyEnabled returns true when apply/apply-confirm PR comments for
-// database must pass the review gate: the instance-wide review policy is on,
-// or the database opts in with its own review_policy.
-func (c *ServerConfig) ReviewPolicyEnabled(database string) bool {
+// ReviewPolicyEnabled returns true when the instance-wide review policy is on,
+// so apply/apply-confirm PR comments for every database must pass the review
+// gate. A database can also opt in on its own; ReviewPolicyEnabledForDatabase
+// covers both.
+func (c *ServerConfig) ReviewPolicyEnabled() bool {
+	return c != nil && c.ReviewPolicy.Enabled
+}
+
+// ReviewPolicyEnabledForDatabase returns true when apply/apply-confirm PR
+// comments for database must pass the review gate: the instance-wide review
+// policy is on, or the database opts in with its own review_policy.
+func (c *ServerConfig) ReviewPolicyEnabledForDatabase(database string) bool {
+	if c.ReviewPolicyEnabled() {
+		return true
+	}
 	if c == nil {
 		return false
-	}
-	if c.ReviewPolicy.Enabled {
-		return true
 	}
 	dbConfig := c.Database(database)
 	return dbConfig != nil && dbConfig.ReviewPolicy.Enabled
@@ -92,8 +102,9 @@ func validateReviewPolicy(config ReviewPolicyConfig) error {
 }
 
 // validateDatabaseReviewPolicy rejects a database that opts into the review
-// gate when no configured principal could ever approve its applies, which
-// would block every one of them.
+// gate unless every PR it accepts has a configured principal who can approve
+// it. Without one, the gate fails that PR's every apply with an error instead
+// of asking for a review.
 func (c *ServerConfig) validateDatabaseReviewPolicy(database string, dbConfig DatabaseConfig) error {
 	if !dbConfig.ReviewPolicy.Enabled {
 		return nil
@@ -101,20 +112,28 @@ func (c *ServerConfig) validateDatabaseReviewPolicy(database string, dbConfig Da
 	if c.ReviewPolicyIncludesDatabaseOperators() && (len(dbConfig.OperatorTeams) > 0 || len(dbConfig.OperatorUsers) > 0) {
 		return nil
 	}
-	if len(c.ReviewPolicy.AdminTeams) > 0 || len(c.ReviewPolicy.AdminUsers) > 0 || c.ReviewPolicy.IncludeCodeowners {
+	if len(c.ReviewPolicy.AdminTeams) > 0 || len(c.ReviewPolicy.AdminUsers) > 0 {
 		return nil
 	}
-	// A repo's admins approve only that repo's PRs, so they count only for a
-	// repo the database accepts schema changes from.
-	for repo, repoConfig := range c.Repos {
-		if !databaseAllowsRepo(dbConfig, repo) {
-			continue
+	// Otherwise each repo the database accepts needs admins of its own: a
+	// repo's admins approve only that repo's PRs, and CODEOWNERS approve only
+	// a PR whose files they own, so neither covers every PR.
+	const fix = "set the database's operator_teams or operator_users (with review_policy.include_database_operators left on), or review_policy.admin_teams or admin_users"
+	repos := dbConfig.AllowedRepos
+	if len(repos) == 0 || slices.Contains(repos, "*") {
+		// The database accepts every repository SchemaBot serves, which is
+		// every repository when none are configured.
+		if len(c.Repos) == 0 {
+			return fmt.Errorf("databases.%s.review_policy.enabled requires someone who can approve every PR, but the database accepts any repository and no repos are configured: %s", database, fix)
 		}
-		if len(repoConfig.AdminTeams) > 0 || len(repoConfig.AdminUsers) > 0 {
-			return nil
+		repos = slices.Sorted(maps.Keys(c.Repos))
+	}
+	for _, repo := range repos {
+		if teams, users := c.RepoAdmins(repo); len(teams) == 0 && len(users) == 0 {
+			return fmt.Errorf("databases.%s.review_policy.enabled requires someone who can approve every PR, but repos.%s, which the database accepts schema changes from, has no admin_teams or admin_users: set them, or %s", database, repo, fix)
 		}
 	}
-	return fmt.Errorf("databases.%s.review_policy.enabled requires someone who can approve: set the database's operator_teams or operator_users (with review_policy.include_database_operators left on), review_policy.admin_teams or admin_users, admin_teams or admin_users on a repo in its allowed_repos, or review_policy.include_codeowners", database)
+	return nil
 }
 
 func validateDatabaseActorAuthorization(database string, dbConfig DatabaseConfig) error {
