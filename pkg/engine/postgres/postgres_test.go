@@ -244,6 +244,20 @@ func TestExecutionVerdictForeignKeyChange(t *testing.T) {
 	}
 }
 
+// A changed stored generated expression is refused with its own remedy:
+// declaring the live expression plans no change, and changing it is a
+// rewrite the operator runs outside SchemaBot.
+func TestExecutionVerdictGeneratedExpressionChange(t *testing.T) {
+	assert.Equal(t, stepVerdict{
+		mode:   engine.ExecutionModeBlocked,
+		reason: `statement for table "events" changes a stored generated column's expression, which rewrites every row under a lock that blocks reads and writes, so SchemaBot does not apply it; to keep the live expression, declare it in the schema file and re-plan; to change it, run this statement (PostgreSQL 17 or later) outside SchemaBot through a separately reviewed process, then re-plan`,
+	}, executionVerdict(pgplan.FormatVersion, pgplan.Statement{
+		Kind:        schemadiff.ChangeSetGeneratedExpression,
+		Disposition: router.DispositionRefuse,
+		Reason:      verdict.ReasonUnsupportedStatement,
+	}, "events", nil))
+}
+
 // A foreign key the planner cannot bind fails the plan with the fix appended:
 // the referenced table must already exist on the target, and the planning
 // role must be able to read it. The remedy matches through wrapping, and any

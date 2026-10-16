@@ -1379,6 +1379,9 @@ func executionVerdict(formatVersion int, statement pgplan.Statement, table strin
 		if statement.Cause == "" && statement.Reason == verdict.ReasonDeclarativeForeignKey {
 			return blocked(foreignKeyChangeRefusalReason(statement.Kind, table, crossNamespaceForeignKeys))
 		}
+		if statement.Kind == schemadiff.ChangeSetGeneratedExpression {
+			return blocked(generatedExpressionRefusalReason(table))
+		}
 		refused := blocked(fmt.Sprintf("statement for table %q is refused: it cannot be executed safely as written", table))
 		// An absent cause is a refusal from outside the create path and the
 		// generic sentence is the right one; only a cause the mapping has no
@@ -1467,6 +1470,16 @@ func foreignKeyChangeRefusalReason(kind schemadiff.ChangeKind, table string, cro
 		return reason
 	}
 	return fmt.Sprintf("statement for table %q changes a foreign key, %s; leave the change out of the schema file to apply the rest of the plan, then run this statement outside SchemaBot and put the change back in the file", table, unsupported)
+}
+
+// generatedExpressionRefusalReason renders the planner's refusal of a changed
+// stored generated column expression. Replacing the expression recomputes
+// every row under a lock that blocks reads and writes, and there is no online
+// path for it, so the plan shows the change and nothing runs it. The drift is
+// often a live expression the file never caught up with, so the remedy offers
+// declaring the live expression first, which plans no change.
+func generatedExpressionRefusalReason(table string) string {
+	return fmt.Sprintf("statement for table %q changes a stored generated column's expression, which rewrites every row under a lock that blocks reads and writes, so SchemaBot does not apply it; to keep the live expression, declare it in the schema file and re-plan; to change it, run this statement (PostgreSQL 17 or later) outside SchemaBot through a separately reviewed process, then re-plan", table)
 }
 
 func destructiveReason(destructive bool, table string) string {
