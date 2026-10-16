@@ -457,3 +457,67 @@ func TestOperator_ResumedRolloutObserverSurvivesTheLossOfItsPod(t *testing.T) {
 	assert.Zero(t, another.matrixSummary.recoveredCount(),
 		"once the stop's summary is rotated away, a claim on another pod attaches no observer")
 }
+
+// A rollout was stopped and started twice, and both times the pod that took it
+// out of its stop went away before its observer rotated the stop's summary. The
+// same surviving pod claims after each resume. Each stop posts its own summary
+// comment, so the observer this pod attached for the first resume does not
+// stand in for the second: the pod attaches again when the PR shows the second
+// stop, and only once.
+func TestOperator_ResumedRolloutObserverReattachesAfterALaterStop(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	ctx := t.Context()
+	db := openMatrixStorage(t)
+	stor := mysqlstore.New(db)
+	resetMatrixTables(t, ctx, db)
+
+	seed := seedGroupedApply(t, ctx, stor, multiOpSeed{
+		applyIdentifier: "resumed-rollout-second-stop",
+		parentState:     state.Apply.Running,
+		cutoverPolicy:   storage.CutoverPolicyRolling,
+		onFailure:       storage.OnFailureHalt,
+		deployments:     []string{"region-a", "region-b", "region-c"},
+		opState:         state.ApplyOperation.Pending,
+		taskState:       state.Task.Pending,
+	})
+	require.NoError(t, stor.ApplyComments().Upsert(ctx, &storage.ApplyComment{
+		ApplyID:         seed.applyID,
+		CommentState:    state.Comment.Summary,
+		GitHubCommentID: 4201,
+	}), "record the first stop's summary comment")
+
+	rec := &driveRecorder{}
+	outcomes := map[string]matrixOutcome{
+		"region-a": {taskState: state.Task.Completed},
+		"region-b": {taskState: state.Task.Completed},
+		"region-c": {taskState: state.Task.Completed},
+	}
+	survivor := newMatrixService(t, stor, matrixClients(stor, rec, outcomes))
+
+	driveNextOperation(t, ctx, survivor, 1)
+	require.Equal(t, []string{"region-a"}, rec.resumeOrder())
+	require.Equal(t, 1, survivor.matrixSummary.recoveredCount(),
+		"the first resume attaches an observer while the PR shows the first stop")
+
+	// The first resume's observer rotated the first stop's summary away, then the
+	// rollout was stopped again and that stop posted a summary of its own.
+	require.NoError(t, stor.ApplyComments().Supersede(ctx, seed.applyID, state.Comment.Summary))
+	require.NoError(t, stor.ApplyComments().Upsert(ctx, &storage.ApplyComment{
+		ApplyID:         seed.applyID,
+		CommentState:    state.Comment.Summary,
+		GitHubCommentID: 4202,
+	}), "record the second stop's summary comment")
+
+	driveNextOperation(t, ctx, survivor, 2)
+	require.Equal(t, []string{"region-a", "region-b"}, rec.resumeOrder())
+	assert.Equal(t, 2, survivor.matrixSummary.recoveredCount(),
+		"the second resume attaches a fresh observer while the PR shows the second stop")
+
+	driveNextOperation(t, ctx, survivor, 3)
+	require.Equal(t, []string{"region-a", "region-b", "region-c"}, rec.resumeOrder())
+	assert.Equal(t, 2, survivor.matrixSummary.recoveredCount(),
+		"a later claim of the second resume in the same process does not attach another observer")
+}

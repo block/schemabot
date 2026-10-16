@@ -68,36 +68,54 @@ func (c *LocalClient) notifyMultiOperationObserverUntilSettled(ctx context.Conte
 	ticker := time.NewTicker(c.observerPollInterval())
 	defer ticker.Stop()
 
+	// Captured from the first successful load so the poller's logs stay
+	// searchable by the user-facing apply_id operators triage with. Before the
+	// first load succeeds the identifier is unknown, so it is simply omitted.
+	ident := &observerPollIdentity{}
 	for {
 		select {
 		case <-ctx.Done():
-			c.logger.Debug("observer poll: client closed; stopping poll")
+			c.logger.Debug("observer poll: client closed; stopping poll", ident.attrs()...)
 			return
 		case <-ticker.C:
 		}
 		if c.getObserver(applyID) == nil {
-			c.logger.Debug("observer poll: observer cleared; stopping poll")
+			c.logger.Debug("observer poll: observer cleared; stopping poll", ident.attrs()...)
 			return
 		}
-		if done := c.notifyMultiOperationObserverOnce(ctx, applyID); done {
+		if done := c.notifyMultiOperationObserverOnce(ctx, applyID, ident); done {
 			return
 		}
 	}
 }
 
+// observerPollIdentity carries the apply identifier a poller learned from its
+// last successful load, for the log lines written when no apply is in hand.
+type observerPollIdentity struct {
+	applyIdentifier string
+}
+
+func (i *observerPollIdentity) attrs(extra ...any) []any {
+	if i.applyIdentifier == "" {
+		return extra
+	}
+	return append([]any{"apply_id", i.applyIdentifier}, extra...)
+}
+
 // notifyMultiOperationObserverOnce runs one poll tick and reports whether the
 // poller is done. Load failures are transient: the next tick retries them.
-func (c *LocalClient) notifyMultiOperationObserverOnce(ctx context.Context, applyID int64) bool {
+func (c *LocalClient) notifyMultiOperationObserverOnce(ctx context.Context, applyID int64, ident *observerPollIdentity) bool {
 	apply, err := c.storage.Applies().Get(ctx, applyID)
 	if err != nil {
-		c.logger.Warn("observer poll: failed to load apply; will retry on next tick", "error", err)
+		c.logger.Warn("observer poll: failed to load apply; will retry on next tick", ident.attrs("error", err)...)
 		return false
 	}
 	if apply == nil {
-		c.logger.Warn("observer poll: apply not found; stopping poll")
+		c.logger.Warn("observer poll: apply not found; stopping poll", ident.attrs()...)
 		c.clearObserver(applyID)
 		return true
 	}
+	ident.applyIdentifier = apply.ApplyIdentifier
 	ops, err := c.storage.ApplyOperations().ListByApply(ctx, applyID)
 	if err != nil {
 		c.logger.Warn("observer poll: failed to list operations; will retry on next tick",

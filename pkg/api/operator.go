@@ -1325,7 +1325,9 @@ func rolloutInFlight(projection applyProjectionResult) bool {
 // rotated, so a resume whose observer was lost with its pod before the first
 // tick still reaches the bottom of the PR from whichever pod claims next. Once
 // an observer rotates, the summary comment is consumed and claims stop
-// attaching.
+// attaching. Each process attaches once per stop summary comment, and every
+// stop posts a new one, so the next stop and start of the same rollout
+// attaches again.
 func (s *Service) attachResumedRolloutObserver(ctx context.Context, driverID int, op *storage.ApplyOperation, apply *storage.Apply, projection applyProjectionResult) {
 	attrs := append(apply.LogAttrs(),
 		"driver", driverID, "apply_operation_id", op.ID,
@@ -1342,55 +1344,74 @@ func (s *Service) attachResumedRolloutObserver(ctx context.Context, driverID int
 		s.logger.Debug("operator: resumed rollout has no observer hook; PR progress comment will not follow the resume", attrs...)
 		return
 	}
-	reason := "rollout left its stop"
-	if !rolloutLeftStop(projection) {
-		if s.hasResumeObserver(apply.ID) {
-			s.logger.Debug("operator: resumed rollout already has a progress comment observer in this process", attrs...)
-			return
-		}
-		awaiting, err := s.stopSummaryAwaitingRotation(ctx, apply)
+	if rolloutLeftStop(projection) {
+		// This drive took the rollout out of its stop, so it attaches whether or
+		// not the stop's summary can be read; the observer finds the summary on
+		// its own first tick.
+		stopSummaryCommentID, _, err := s.stopSummaryAwaitingRotation(ctx, apply)
 		if err != nil {
-			s.logger.Warn("operator: could not check whether the PR still shows the rollout's stop; this claim will not attach a progress comment observer",
+			s.logger.Warn("operator: could not load the rollout's stop summary; attaching the progress comment observer anyway, and a later claim in this process may attach one more",
 				append(attrs, "error", err)...)
-			return
 		}
-		if !awaiting {
-			s.logger.Debug("operator: rollout has no stop summary waiting to be rotated; no progress comment observer to attach", attrs...)
-			return
-		}
-		reason = "PR still shows the rollout's stop"
+		s.attachResumeObserver(apply, stopSummaryCommentID, "rollout left its stop", attrs)
+		return
 	}
-	s.rememberResumeObserver(apply.ID)
+	stopSummaryCommentID, awaiting, err := s.stopSummaryAwaitingRotation(ctx, apply)
+	if err != nil {
+		s.logger.Warn("operator: could not check whether the PR still shows the rollout's stop; this claim will not attach a progress comment observer",
+			append(attrs, "error", err)...)
+		return
+	}
+	if !awaiting {
+		s.logger.Debug("operator: rollout has no stop summary waiting to be rotated; no progress comment observer to attach", attrs...)
+		return
+	}
+	if s.hasResumeObserverFor(apply.ID, stopSummaryCommentID) {
+		s.logger.Debug("operator: this process already attached a progress comment observer for the rollout's current stop",
+			append(attrs, "stop_summary_comment_id", stopSummaryCommentID)...)
+		return
+	}
+	s.attachResumeObserver(apply, stopSummaryCommentID, "PR still shows the rollout's stop", attrs)
+}
+
+func (s *Service) attachResumeObserver(apply *storage.Apply, stopSummaryCommentID int64, reason string, attrs []any) {
+	s.rememberResumeObserver(apply.ID, stopSummaryCommentID)
 	s.logger.Info("operator: attaching progress comment observer to resumed rollout",
-		append(attrs, "reason", reason)...)
+		append(attrs, "reason", reason, "stop_summary_comment_id", stopSummaryCommentID)...)
 	s.OnApplyRecovered(apply)
 }
 
-// stopSummaryAwaitingRotation reports whether the apply's summary comment is
-// still active. On a rollout in flight that comment can only be a stop's, and
-// it stays active until an observer posts the resumed rollout's fresh progress
-// comment and consumes it.
-func (s *Service) stopSummaryAwaitingRotation(ctx context.Context, apply *storage.Apply) (bool, error) {
+// stopSummaryAwaitingRotation loads the apply's summary comment and reports its
+// GitHub comment ID and whether it is still active. On a rollout in flight that
+// comment can only be a stop's, and it stays active until an observer posts the
+// resumed rollout's fresh progress comment and consumes it.
+func (s *Service) stopSummaryAwaitingRotation(ctx context.Context, apply *storage.Apply) (commentID int64, awaiting bool, err error) {
 	summary, err := s.storage.ApplyComments().Get(ctx, apply.ID, state.Comment.Summary)
 	if err != nil {
-		return false, fmt.Errorf("load summary comment for apply %s: %w", apply.ApplyIdentifier, err)
+		return 0, false, fmt.Errorf("load summary comment for apply %s: %w", apply.ApplyIdentifier, err)
 	}
-	return summary != nil && summary.SupersededAt == nil, nil
+	if summary == nil {
+		return 0, false, nil
+	}
+	return summary.GitHubCommentID, summary.SupersededAt == nil, nil
 }
 
-func (s *Service) hasResumeObserver(applyID int64) bool {
+// hasResumeObserverFor reports whether this process already attached an
+// observer to rotate the given stop summary comment.
+func (s *Service) hasResumeObserverFor(applyID, stopSummaryCommentID int64) bool {
 	s.resumeObserversMu.Lock()
 	defer s.resumeObserversMu.Unlock()
-	return s.resumeObservers[applyID]
+	remembered, ok := s.resumeObservers[applyID]
+	return ok && remembered == stopSummaryCommentID
 }
 
-func (s *Service) rememberResumeObserver(applyID int64) {
+func (s *Service) rememberResumeObserver(applyID, stopSummaryCommentID int64) {
 	s.resumeObserversMu.Lock()
 	defer s.resumeObserversMu.Unlock()
 	if s.resumeObservers == nil {
-		s.resumeObservers = make(map[int64]bool)
+		s.resumeObservers = make(map[int64]int64)
 	}
-	s.resumeObservers[applyID] = true
+	s.resumeObservers[applyID] = stopSummaryCommentID
 }
 
 func (s *Service) forgetResumeObserver(applyID int64) {
