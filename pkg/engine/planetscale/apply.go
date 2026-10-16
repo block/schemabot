@@ -1060,6 +1060,19 @@ func (e *Engine) resumeApply(ctx context.Context, client psclient.PSClient, org 
 		return nil, fmt.Errorf("create deploy request on resume: %w", err)
 	}
 	handedToDeployRequest = true
+	// Record the deploy request before waiting on it, as a fresh drive does,
+	// so a drive that ends during the wait leaves its successor resuming this
+	// deploy request rather than opening a second one on the same branch.
+	meta.DeployRequestID = dr.Number
+	meta.DeployRequestURL = dr.HtmlURL
+	createdMeta, err := encodePSMetadata(meta)
+	if err != nil {
+		return nil, fmt.Errorf("encode metadata for deploy request #%d on resume: %w", dr.Number, err)
+	}
+	e.saveResumeState(req, &engine.ResumeState{
+		MigrationContext: req.ResumeState.MigrationContext,
+		Metadata:         createdMeta,
+	}, "deploy request opened on resume, before its diff is computed")
 	dr, err = e.waitForDeployRequestPending(ctx, client, org, req.Database, dr, emitEvent)
 	if err != nil {
 		return nil, fmt.Errorf("wait for deploy request on resume: %w", err)
@@ -1099,8 +1112,6 @@ func (e *Engine) resumeApply(ctx context.Context, client psclient.PSClient, org 
 		emitEvent(rowCopyDeclineEvent(unsafe, unsafeReason))
 	}
 
-	meta.DeployRequestID = dr.Number
-	meta.DeployRequestURL = dr.HtmlURL
 	meta.IsInstant = useInstant
 
 	// Deferred deploy on resume: don't start the deploy yet.
