@@ -374,7 +374,9 @@ func writeTargetTableLine(sb *strings.Builder, table string, cells []TableProgre
 	}
 	lists := listsTargets(strip)
 	if status == state.Task.Cancelled {
-		phrase, coverage = cancelledTargetsLine(done, cancelled, pending+unbegun, len(cells)+silent, lists)
+		phrase, coverage = cancelledTargetsLine(cancelledTargets{
+			done: done, cancelled: cancelled, unbegun: unbegun, pending: pending, targets: len(cells) + silent,
+		}, settled, lists)
 	}
 	if lists {
 		// The list counts the targets, so the headline does not repeat them.
@@ -387,24 +389,46 @@ func writeTargetTableLine(sb *strings.Builder, table string, cells []TableProgre
 	}
 }
 
+// cancelledTargets counts where a table stands on each of its targets when
+// the cancel reached it: done completed it first, cancelled were stopped
+// part-way through it, unbegun were cancelled before they began it, and
+// pending have not begun it and were not cancelled.
+type cancelledTargets struct {
+	done, cancelled, unbegun, pending, targets int
+}
+
 // cancelledTargetsLine is the phrase and coverage of a table line whose
-// rollout was cancelled, across the table's targets. cancelled counts the
-// targets the cancel stopped part-way through the table, done the ones that
-// completed it first, and notStarted the ones that never began it. The line
-// says the table was not started only when no target began it; otherwise it
-// counts the targets the cancel stopped, unless the list under the line names
-// them.
-func cancelledTargetsLine(done, cancelled, notStarted, targets int, lists bool) (string, string) {
-	if done == 0 && cancelled == 0 {
+// rolled-up status is cancelled. The line says the table was not started only
+// when no target began it and none is still to run it; otherwise it counts the
+// targets the cancel stopped, unless the list under the line names them.
+//
+// A target that was not cancelled can still be queued to run the table: a
+// failure cancels only the tasks queued behind it on its own target, and the
+// other targets carry on. Until the rollout settles those targets are counted
+// as queued, apart from the ones that will never begin the table.
+func cancelledTargetsLine(t cancelledTargets, settled, lists bool) (string, string) {
+	notStarted, queued := t.unbegun, 0
+	if settled {
+		notStarted += t.pending
+	} else {
+		queued = t.pending
+	}
+	if t.done == 0 && t.cancelled == 0 && queued == 0 {
 		return shardedTableStatusPhrase(state.Task.Cancelled), ""
 	}
 	phrase := "⊘ Cancelled"
-	if cancelled > 0 && !lists {
-		phrase += fmt.Sprintf(" on %d of %d targets", cancelled, targets)
+	if t.cancelled > 0 && !lists {
+		phrase += fmt.Sprintf(" on %d of %d targets", t.cancelled, t.targets)
 	}
-	// A cancelled rollout runs nothing further, so a target that has not begun
-	// the table never starts it.
-	return phrase, presentation.TargetCoverage(done, 0, notStarted, 0, 0, presentation.PendingWord(true))
+	coverage := presentation.TargetCoverage(t.done, 0, queued, 0, 0, presentation.PendingQueued)
+	if notStarted > 0 {
+		separator := ", "
+		if coverage == "" {
+			separator = " · "
+		}
+		coverage += fmt.Sprintf("%s%d %s", separator, notStarted, presentation.PendingNotStarted)
+	}
+	return phrase, coverage
 }
 
 // listsTargets reports whether a table line lists its targets one per line

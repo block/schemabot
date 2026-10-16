@@ -2278,4 +2278,21 @@ func TestRenderMultiDeploymentApplyComment_CancelledRolloutCountsTheTargetsItSto
 		)
 		assert.Contains(t, out, "**`trips`**: ⊘ Cancelled (not started)\n", "%s", out)
 	})
+	// A failure cancels only the tasks queued behind it on its own target, so
+	// while the rollout runs on, a target that was not cancelled is still
+	// queued to run the table.
+	t.Run("a target still to run stays queued until the rollout settles", func(t *testing.T) {
+		model := presentation.Derive([]presentation.Operation{
+			parallelTarget("primary", "testapp-001", so.Completed),
+			parallelTarget("primary", "testapp-002", so.Failed),
+			parallelTarget("primary", "testapp-003", so.Running),
+		})
+		require.False(t, model.RolloutSettled(model.Groups()[0]), "testapp-003 is still running")
+		out := renderTargets(model,
+			trips("testapp_001", TableProgressData{Status: state.Task.Completed, Started: true, RowsCopied: 1000, RowsTotal: 1000}),
+			trips("testapp_002", TableProgressData{Status: state.Task.Cancelled}),
+			trips("testapp_003", queued),
+		)
+		assert.Contains(t, out, "**`trips`**: ⊘ Cancelled · 1 complete, 1 queued, 1 not started\n", "%s", out)
+	})
 }
