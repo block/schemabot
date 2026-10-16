@@ -1508,9 +1508,6 @@ func (c *LocalClient) launchAtomicResume(ctx context.Context, apply *storage.App
 		},
 	})
 	if err != nil {
-		if resumeStateHoldsAcceptedWork(resumeState) {
-			return fmt.Errorf("%w: engine apply failed: %w", errReattachToAcceptedWorkFailed, err)
-		}
 		return fmt.Errorf("engine apply failed: %w", err)
 	}
 	if !result.Accepted {
@@ -1645,21 +1642,6 @@ func (c *LocalClient) persistReattachedResumeStates(ctx context.Context, apply *
 // a later attempt can retry against intact storage — failing the apply here
 // would abandon engine work that is still in flight on the provider.
 var errGroupedResumeStateUnavailable = errors.New("grouped resume state unavailable")
-
-// errReattachToAcceptedWorkFailed marks a grouped resume whose engine apply
-// failed while handing the engine the resume state persisted for work it had
-// already accepted. The engine was reattaching to that work, not starting new
-// work, so the failure takes the accepted-work retry policy rather than the
-// one for starting engine work.
-var errReattachToAcceptedWorkFailed = errors.New("reattach to accepted engine work failed")
-
-// resumeStateHoldsAcceptedWork reports whether a grouped resume hands the
-// engine persisted state for work it already accepted, so the engine
-// reattaches to that work rather than starting fresh from the schema change
-// context alone.
-func resumeStateHoldsAcceptedWork(resumeState *engine.ResumeState) bool {
-	return resumeState != nil && resumeState.Metadata != ""
-}
 
 // errRevertPhaseTaskInSequentialResume marks a sequential resume that found a
 // task in an engine-monitored revert phase. Only the grouped drive reattaches
@@ -3068,12 +3050,14 @@ func (c *LocalClient) handleGroupedResumeFailure(ctx context.Context, apply *sto
 }
 
 // shouldPauseGroupedResumeFailure decides whether a refused grouped resume
-// pauses the apply for operator retry. A failure reattaching to work the
-// engine already accepted takes the accepted-work policy, since that work
-// keeps running whatever this drive concludes and a later claim reattaches to
-// it again; any other refusal takes the policy for starting engine work.
+// pauses the apply for operator retry. A failure the engine reports as
+// reattaching to work it already accepted (engine.ErrReattachFailed) takes the
+// accepted-work policy, since that work keeps running whatever this drive
+// concludes and a later claim reattaches to it again. Any other refusal,
+// including one from an engine that gave up on the stored work and started
+// afresh, takes the policy for starting engine work.
 func (c *LocalClient) shouldPauseGroupedResumeFailure(apply *storage.Apply, tasks []*storage.Task, err error) bool {
-	if errors.Is(err, errReattachToAcceptedWorkFailed) {
+	if errors.Is(err, engine.ErrReattachFailed) {
 		return c.shouldPauseAcceptedWork(apply, tasks, err)
 	}
 	return c.shouldRetryEngineError(err)

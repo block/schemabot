@@ -1469,40 +1469,45 @@ func TestLaunchAtomicResumeAllRevertedTasksTerminalizeAsReverted(t *testing.T) {
 
 // A Vitess apply paused for retry is recovered by handing the engine the
 // persisted state of its deploy request, which keeps running on the provider.
-// A transient error while reattaching to it (the provider rate limiting the
-// deploy request lookup) says nothing about the change, so the recovery pauses
-// the apply again for a later claim to reattach, instead of failing an apply
-// whose deploy request is still live. A resume with no persisted engine work
-// starts fresh and keeps the start-of-work policy, and a revert-phase apply is
-// never paused, so both fail on the same error.
+// A transient error the engine reports while reattaching to it (the provider
+// rate limiting the deploy request lookup) says nothing about the change, so
+// the recovery pauses the apply again for a later claim to reattach, instead
+// of failing an apply whose deploy request is still live. The same transient
+// error fails the apply when the engine did not report a reattach: a resume
+// with no persisted engine work, or one whose engine gave up on the stored
+// deploy request and started afresh, keeps the start-of-work policy. A
+// revert-phase apply is never paused, so it fails on a reattach error too.
 func TestGroupedResumeTransientReattachFailurePausesVitessApply(t *testing.T) {
 	persisted := &storage.EngineResumeState{
 		ApplyOperationID: 7,
 		MigrationContext: "ctx-reattach",
 		Metadata:         `{"branch_name":"branch-1","deploy_request_id":5}`,
 	}
+	reattachErr := fmt.Errorf("%w: get deploy request #5 on resume: rate limited", engine.ErrReattachFailed)
+	freshErr := errors.New("create branch: rate limited")
 	cases := []struct {
 		name       string
 		stored     *storage.EngineResumeState
+		engineErr  error
 		applyState string
 		taskState  string
 		wantApply  string
 		wantTask   string
 	}{
-		{"paused apply reattaching to its deploy request pauses again", persisted, state.Apply.FailedRetryable, state.Task.Pending, state.Apply.FailedRetryable, state.Task.FailedRetryable},
-		{"resume with no persisted engine work fails", nil, state.Apply.FailedRetryable, state.Task.Pending, state.Apply.Failed, state.Task.Failed},
-		{"revert-phase apply reattaching to its deploy request fails", persisted, state.Apply.RevertWindow, state.Task.RevertWindow, state.Apply.Failed, state.Task.Failed},
+		{"paused apply reattaching to its deploy request pauses again", persisted, reattachErr, state.Apply.FailedRetryable, state.Task.Pending, state.Apply.FailedRetryable, state.Task.FailedRetryable},
+		{"resume with no persisted engine work fails", nil, freshErr, state.Apply.FailedRetryable, state.Task.Pending, state.Apply.Failed, state.Task.Failed},
+		{"resume whose engine started afresh fails", persisted, freshErr, state.Apply.FailedRetryable, state.Task.Pending, state.Apply.Failed, state.Task.Failed},
+		{"revert-phase apply reattaching to its deploy request fails", persisted, reattachErr, state.Apply.RevertWindow, state.Task.RevertWindow, state.Apply.Failed, state.Task.Failed},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			client, apply, tasks, plan, applyStore := reattachResumeFixture(&exactProgressApplyOperationStore{data: tc.stored}, nil)
-			client.planetscaleEngine.(*fakeControlEngine).applyErr = errors.New("get deploy request #5 on resume: rate limited")
+			client.planetscaleEngine.(*fakeControlEngine).applyErr = tc.engineErr
 			apply.State = tc.applyState
 			tasks[0].State = tc.taskState
 
 			err := client.launchAtomicResume(t.Context(), apply, tasks, plan, apply.GetOptions().Map(), "Apply resumed from checkpoint", false, false, false)
 			require.Error(t, err)
-			assert.Equal(t, tc.stored != nil, errors.Is(err, errReattachToAcceptedWorkFailed))
 			handled := client.handleGroupedResumeFailure(t.Context(), apply, tasks, err)
 
 			assert.Equal(t, tc.wantApply, applyStore.apply.State)
@@ -3096,53 +3101,70 @@ func TestLocalClient_AutoTriggerCutoverEscalatesWhenNotReadyPersists(t *testing.
 // closed. The deploy request is still live at its cutover, so a later claim
 // reattaches to it and tries again within the recovery retry budget, rather
 // than the apply being failed over work that keeps running on the provider.
+// Such a rejection is not permanent, so it now runs through that budget, ten
+// cutover attempts per recovery, before the apply fails. A task already in
+// its revert phase is never paused, because the pause would erase the state a
+// recovery reattaches by, so there the bound fails the apply as before.
 func TestLocalClient_AutoTriggerCutoverPausesApplyAfterRepeatedHardRejections(t *testing.T) {
-	apply := &storage.Apply{
-		ID:              133,
-		ApplyIdentifier: "apply-auto-cutover-hard-fail",
-		Database:        "testdb",
-		DatabaseType:    storage.DatabaseTypeVitess,
-		Environment:     "staging",
-		State:           state.Apply.WaitingForCutover,
+	cases := []struct {
+		name      string
+		taskState string
+		wantApply string
+		wantTask  string
+	}{
+		{"waiting for cutover pauses", state.Task.WaitingForCutover, state.Apply.FailedRetryable, state.Task.FailedRetryable},
+		{"task in its revert window fails", state.Task.RevertWindow, state.Apply.Failed, state.Task.Failed},
 	}
-	task := &storage.Task{
-		ID:             465,
-		ApplyID:        apply.ID,
-		TaskIdentifier: "task-auto-cutover-hard-fail",
-		Database:       "testdb",
-		DatabaseType:   storage.DatabaseTypeVitess,
-		TableName:      "users",
-		State:          state.Task.WaitingForCutover,
-	}
-	fakeEngine := &fakeControlEngine{cutoverErr: errors.New("apply deploy request: 403 cutover not permitted")}
-	logs := &mockApplyLogStore{}
-	client := &LocalClient{
-		config: LocalConfig{Database: "testdb", Type: storage.DatabaseTypeVitess},
-		storage: &exactProgressStorage{
-			applies: &exactProgressApplyStore{apply: apply},
-			tasks:   &exactProgressTaskStore{tasks: []*storage.Task{task}},
-			logs:    logs,
-		},
-		planetscaleEngine: fakeEngine,
-		logger:            slog.Default(),
-	}
-	controlReq := &engine.ControlRequest{Database: apply.Database}
-	pollState := &atomicPollState{}
-	now := time.Now()
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			apply := &storage.Apply{
+				ID:              133,
+				ApplyIdentifier: "apply-auto-cutover-hard-fail",
+				Database:        "testdb",
+				DatabaseType:    storage.DatabaseTypeVitess,
+				Environment:     "staging",
+				State:           state.Apply.WaitingForCutover,
+			}
+			task := &storage.Task{
+				ID:             465,
+				ApplyID:        apply.ID,
+				TaskIdentifier: "task-auto-cutover-hard-fail",
+				Database:       "testdb",
+				DatabaseType:   storage.DatabaseTypeVitess,
+				TableName:      "users",
+				State:          tc.taskState,
+			}
+			fakeEngine := &fakeControlEngine{cutoverErr: errors.New("apply deploy request: 403 cutover not permitted")}
+			logs := &mockApplyLogStore{}
+			client := &LocalClient{
+				config: LocalConfig{Database: "testdb", Type: storage.DatabaseTypeVitess},
+				storage: &exactProgressStorage{
+					applies: &exactProgressApplyStore{apply: apply},
+					tasks:   &exactProgressTaskStore{tasks: []*storage.Task{task}},
+					logs:    logs,
+				},
+				planetscaleEngine: fakeEngine,
+				logger:            slog.Default(),
+			}
+			controlReq := &engine.ControlRequest{Database: apply.Database}
+			pollState := &atomicPollState{}
+			now := time.Now()
 
-	for i := 1; i < maxConsecutiveCutoverFailures; i++ {
-		require.False(t, client.autoTriggerCutover(t.Context(), fakeEngine, apply, []*storage.Task{task}, controlReq, pollState, now),
-			"the drive must keep retrying below the consecutive-failure bound (attempt %d)", i)
-		assert.Equal(t, state.Apply.WaitingForCutover, apply.State)
-	}
+			for i := 1; i < maxConsecutiveCutoverFailures; i++ {
+				require.False(t, client.autoTriggerCutover(t.Context(), fakeEngine, apply, []*storage.Task{task}, controlReq, pollState, now),
+					"the drive must keep retrying below the consecutive-failure bound (attempt %d)", i)
+				assert.Equal(t, state.Apply.WaitingForCutover, apply.State)
+			}
 
-	require.True(t, client.autoTriggerCutover(t.Context(), fakeEngine, apply, []*storage.Task{task}, controlReq, pollState, now),
-		"the drive owner must exit once the apply is paused")
-	assert.Equal(t, maxConsecutiveCutoverFailures, fakeEngine.cutoverCount)
-	assert.Equal(t, state.Apply.FailedRetryable, apply.State, "repeated hard rejections pause the apply over its live deploy request")
-	assert.Equal(t, state.Task.FailedRetryable, task.State)
-	assert.Contains(t, apply.ErrorMessage, fmt.Sprintf("cutover failed after %d consecutive attempts", maxConsecutiveCutoverFailures))
-	assert.Contains(t, task.ErrorMessage, "403 cutover not permitted")
+			require.True(t, client.autoTriggerCutover(t.Context(), fakeEngine, apply, []*storage.Task{task}, controlReq, pollState, now),
+				"the drive owner must exit once the bound is reached")
+			assert.Equal(t, maxConsecutiveCutoverFailures, fakeEngine.cutoverCount)
+			assert.Equal(t, tc.wantApply, apply.State)
+			assert.Equal(t, tc.wantTask, task.State)
+			assert.Contains(t, apply.ErrorMessage, fmt.Sprintf("cutover failed after %d consecutive attempts", maxConsecutiveCutoverFailures))
+			assert.Contains(t, task.ErrorMessage, "403 cutover not permitted")
+		})
+	}
 }
 
 // A cutover rejection the engine classifies as permanent (the deploy request

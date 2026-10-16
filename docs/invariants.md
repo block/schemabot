@@ -245,7 +245,10 @@ logged and the drive retries it, and a write that cannot land ends at most this 
 error reading something safety-gating ends this drive attempt and leaves the row claimable for
 another. Repeated errors observing remote progress mark the apply
 `failed_retryable` and never trigger a remote stop, because an observation outage only proves the
-control plane cannot see, not that the change is unhealthy. *Enforced:* failure-class handling in
+control plane cannot see, not that the change is unhealthy. One exception remains: an apply in
+its revert phase fails rather than pauses on those errors. A pause rewrites every non-terminal task
+as `failed_retryable`, and that would erase the revert-phase task states that make a recovery
+reattach to the engine instead of settling the tasks from a schema comparison. *Enforced:* failure-class handling in
 the drive loop (`pkg/api/operator.go`), the pre-start task re-read and the outcome-write gate on
 terminal side effects in the sequential drive (`pkg/tern/local_apply_sequential.go`), the same gate
 in the grouped drive (`pkg/tern/local_apply_grouped.go`), with `outcomeWriteLanded`

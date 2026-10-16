@@ -2,11 +2,13 @@ package tern
 
 import (
 	"fmt"
+	"log/slog"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 
 	"github.com/block/schemabot/pkg/engine"
+	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 )
 
@@ -67,6 +69,33 @@ func TestShouldRetryAcceptedWorkErrorByDatabaseType(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			client := &LocalClient{config: LocalConfig{Type: tc.databaseType}}
 			assert.Equal(t, tc.want, client.shouldRetryAcceptedWorkError(tc.err))
+		})
+	}
+}
+
+// A pause rewrites every non-terminal task as failed_retryable, so it never
+// lands while the revert phase is in flight. The apply row and the task rows
+// are written separately, and a drive can hold either one in the revert phase
+// without the other, so each alone keeps the apply from pausing.
+func TestShouldPauseAcceptedWorkNeverPausesInTheRevertPhase(t *testing.T) {
+	transient := fmt.Errorf("get deploy request: rate limited")
+	cases := []struct {
+		name       string
+		applyState string
+		taskState  string
+		want       bool
+	}{
+		{"neither in the revert phase pauses", state.Apply.Running, state.Task.Running, true},
+		{"apply alone in the revert window fails", state.Apply.RevertWindow, state.Task.Running, false},
+		{"task alone in the revert window fails", state.Apply.Running, state.Task.RevertWindow, false},
+		{"task alone reverting fails", state.Apply.Running, state.Task.Reverting, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			client := &LocalClient{config: LocalConfig{Type: storage.DatabaseTypeVitess}, logger: slog.New(slog.DiscardHandler)}
+			apply := &storage.Apply{ApplyIdentifier: "apply-revert-guard", State: tc.applyState}
+			tasks := []*storage.Task{{TaskIdentifier: "task-revert-guard", State: tc.taskState}}
+			assert.Equal(t, tc.want, client.shouldPauseAcceptedWork(apply, tasks, transient))
 		})
 	}
 }
