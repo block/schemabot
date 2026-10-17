@@ -108,8 +108,16 @@ func renderMultiDeploymentApplyComment(data MultiDeploymentApplyData, renderedAt
 	// single-deployment comment so the headline vocabulary stays shared.
 	writeApplyStatusHeader(&sb, ApplyStatusCommentData{State: data.Model.State, Environment: data.Environment, Rollback: data.Rollback})
 	writeAggregateMetadata(&sb, data, renderedAt)
+	// The options are the apply's, so they are stated once here, above the
+	// changing status, rather than in each deployment's section. A rollout
+	// already waiting for cutover puts the command in the footer, which says
+	// it instead.
+	if data.Model.NextAction.Kind != presentation.NextActionCutover {
+		options := rolloutOptions(data.Details)
+		writeApplyOptions(&sb, options.DeferCutover, options.SkipRevert, data.Model.State)
+	}
 	groups := groupsWithChanges(data.Model, data.Model.Groups())
-	if g, ok := soleTargetRollout(groups); ok {
+	if g, ok := presentation.SoleTargetRollout(groups); ok {
 		writeTargetRolloutBody(&sb, data, g, budget)
 		writeRolloutFooter(&sb, data)
 		if !state.IsTerminalApplyState(data.Model.State) {
@@ -155,7 +163,7 @@ func renderMultiDeploymentApplySummaryComment(data MultiDeploymentApplyData, bud
 	writeApplyHeader(&sb, ApplyStatusCommentData{State: data.Model.State, Environment: data.Environment, Rollback: data.Rollback})
 	writeAggregateMetadata(&sb, data, currentTimestamp())
 	groups := groupsWithChanges(data.Model, data.Model.Groups())
-	if g, ok := soleTargetRollout(groups); ok {
+	if g, ok := presentation.SoleTargetRollout(groups); ok {
 		writeTargetRolloutBody(&sb, data, g, budget)
 		writeRolloutFooter(&sb, data)
 		return sb.String()
@@ -170,18 +178,6 @@ func renderMultiDeploymentApplySummaryComment(data MultiDeploymentApplyData, bud
 	writeRolloutFooter(&sb, data)
 
 	return sb.String()
-}
-
-// soleTargetRollout returns the apply's one deployment when it addresses
-// several targets. Such an apply has no other deployment to tell it apart
-// from, so its comment carries no per-deployment wrapper: the status is stated
-// once, and the table lines sit directly under it rather than in a section that
-// collapses once the rollout finishes.
-func soleTargetRollout(groups []presentation.Group) (presentation.Group, bool) {
-	if len(groups) == 1 && len(groups[0].Members) > 1 {
-		return groups[0], true
-	}
-	return presentation.Group{}, false
 }
 
 // writeTargetRolloutBody writes a sole multi-target deployment's comment body:
@@ -423,7 +419,7 @@ func writeAggregateNextAction(sb *strings.Builder, data MultiDeploymentApplyData
 		// Only an apply started with --defer-cutover waits for an operator at
 		// each cutover; otherwise SchemaBot cuts the ready member over itself,
 		// and offering the command would contradict that.
-		if !rolloutDefersCutover(data.Details) {
+		if !rolloutOptions(data.Details).DeferCutover {
 			sb.WriteString("\n---\n\n")
 			fmt.Fprintf(sb, "SchemaBot will cut over %s next — no action needed.\n", inlineCode(na.Name))
 			return
@@ -447,16 +443,16 @@ func writeAggregateNextAction(sb *strings.Builder, data MultiDeploymentApplyData
 	}
 }
 
-// rolloutDefersCutover reports whether the apply was started with
-// --defer-cutover. The members of one apply share its cutover option, so the
-// first member with detail speaks for all, as it does for the rollout footer.
-func rolloutDefersCutover(details []*ApplyStatusCommentData) bool {
+// rolloutOptions returns the options the apply was started with. The members
+// of one apply share its options, so the first member with detail speaks for
+// all, as it does for the rollout footer.
+func rolloutOptions(details []*ApplyStatusCommentData) ApplyStatusCommentData {
 	for _, detail := range details {
 		if detail != nil {
-			return detail.DeferCutover
+			return ApplyStatusCommentData{DeferCutover: detail.DeferCutover, SkipRevert: detail.SkipRevert}
 		}
 	}
-	return false
+	return ApplyStatusCommentData{}
 }
 
 // writeDeploymentSummaryList writes one line per deployment (status glyph,

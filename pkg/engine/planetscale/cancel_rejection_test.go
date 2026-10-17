@@ -20,9 +20,12 @@ import (
 // expectation table.
 func TestClassifyCancelRejection_EveryDeploymentStateIsClassified(t *testing.T) {
 	expected := map[string]cancelRejectionClass{
-		state.DeployRequest.InProgressCancel: cancelRejectionAlreadyCancelled,
-		state.DeployRequest.CompleteCancel:   cancelRejectionAlreadyCancelled,
-		state.DeployRequest.Cancelled:        cancelRejectionAlreadyCancelled,
+		state.DeployRequest.CompleteCancel: cancelRejectionAlreadyCancelled,
+		state.DeployRequest.Cancelled:      cancelRejectionAlreadyCancelled,
+
+		// Cancel accepted but not yet confirmed: the deploy can still end
+		// failed, so the rejection stays an error until the cancel settles.
+		state.DeployRequest.InProgressCancel: cancelRejectionStateError,
 
 		state.DeployRequest.Complete:  cancelRejectionAlreadyCompleted,
 		state.DeployRequest.NoChanges: cancelRejectionAlreadyCompleted,

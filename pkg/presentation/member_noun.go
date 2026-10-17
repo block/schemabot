@@ -14,12 +14,17 @@ var (
 	DeploymentNoun = Noun{Singular: "deployment", Plural: "deployments"}
 )
 
+// Label is the noun for count members: "target" for one, "targets" otherwise.
+func (n Noun) Label(count int) string {
+	if count == 1 {
+		return n.Singular
+	}
+	return n.Plural
+}
+
 // Count is n members by name: "1 target" or "3 targets".
 func (n Noun) Count(count int) string {
-	if count == 1 {
-		return "1 " + n.Singular
-	}
-	return fmt.Sprintf("%d %s", count, n.Plural)
+	return fmt.Sprintf("%d %s", count, n.Label(count))
 }
 
 // CoveragePhrase states how much of the whole a group of count members
@@ -33,5 +38,5 @@ func CoveragePhrase(noun Noun, count, total int) string {
 	if total > 0 {
 		return fmt.Sprintf("%d of %d %s", count, total, noun.Plural)
 	}
-	return fmt.Sprintf("%d %s", count, noun.Plural)
+	return noun.Count(count)
 }

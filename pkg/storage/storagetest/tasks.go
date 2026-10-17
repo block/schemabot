@@ -62,11 +62,11 @@ func TestTasks(t *testing.T, h Harness) {
 		assert.Equal(t, 813, owners[0].PullRequest)
 	})
 
-	// A task's planned table size is written once when the task is created
-	// and read back with it. Progress updates rewrite the task's live figures
-	// but never its size, so a drive that does not carry the size cannot
-	// clear it.
-	t.Run("EstimatedBytes_WrittenAtCreate_SurvivesUpdate", func(t *testing.T) {
+	// A task's planned table size and row count are written once when the
+	// task is created and read back with it. Progress updates rewrite the
+	// task's live figures but never the plan's estimates, so a drive that does
+	// not carry them cannot clear them.
+	t.Run("PlanEstimates_WrittenAtCreate_SurvivesUpdate", func(t *testing.T) {
 		ctx := t.Context()
 		store := h.NewStorage(t)
 		lock := CreateLock(t, store, "task_bytes_db", storage.DatabaseTypeMySQL)
@@ -76,6 +76,8 @@ func TestTasks(t *testing.T, h Harness) {
 		sized := newTask(apply, "task_bytes_sized", "orders", now)
 		bytes := int64(23_400_000_000)
 		sized.EstimatedBytes = &bytes
+		rows := int64(48_200_000)
+		sized.EstimatedRows = &rows
 		_, err := store.Tasks().Create(ctx, sized)
 		require.NoError(t, err)
 		unsized := newTask(apply, "task_bytes_unsized", "users", now)
@@ -87,8 +89,11 @@ func TestTasks(t *testing.T, h Harness) {
 		require.NotNil(t, got)
 		require.NotNil(t, got.EstimatedBytes)
 		assert.Equal(t, bytes, *got.EstimatedBytes)
+		require.NotNil(t, got.EstimatedRows)
+		assert.Equal(t, rows, *got.EstimatedRows)
 
 		got.EstimatedBytes = nil
+		got.EstimatedRows = nil
 		got.State = state.Task.Running
 		got.RowsCopied = 500
 		got.RowsTotal = 1000
@@ -99,11 +104,14 @@ func TestTasks(t *testing.T, h Harness) {
 		assert.Equal(t, int64(500), updated.RowsCopied)
 		require.NotNil(t, updated.EstimatedBytes, "a progress update never clears the planned size")
 		assert.Equal(t, bytes, *updated.EstimatedBytes)
+		require.NotNil(t, updated.EstimatedRows, "a progress update never clears the planned row count")
+		assert.Equal(t, rows, *updated.EstimatedRows)
 
 		gotUnsized, err := store.Tasks().Get(ctx, unsized.TaskIdentifier)
 		require.NoError(t, err)
 		require.NotNil(t, gotUnsized)
 		assert.Nil(t, gotUnsized.EstimatedBytes, "a task created without an estimate reads back without one")
+		assert.Nil(t, gotUnsized.EstimatedRows, "a task created without a row estimate reads back without one")
 	})
 
 	t.Run("Create_Get_Update", func(t *testing.T) {

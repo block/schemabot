@@ -16,7 +16,7 @@ import (
 // and each deployment's section) and its footer (the rollout's next command
 // and the keys the operator can press).
 func (m WatchModel) multiDeploymentProgressSections() (string, string) {
-	model := presentation.Derive(templates.ProgressOperationsForPresentation(m.operations, m.released))
+	model := presentation.Derive(templates.ProgressOperationsForPresentation(m.operations, m.tables, m.released))
 	groups := model.Groups()
 	view := templates.RolloutView{
 		ApplyID:      m.applyID,

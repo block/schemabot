@@ -103,7 +103,7 @@ func (s applyTaskScope) takesCutoverRequestInOrder() bool {
 // that operation while it can still cut over, and settled once it has ended,
 // so one command never cuts over a second member. Otherwise this operation's
 // own tasks must be parked at the cutover (a sibling being parked does not make
-// this member ready), and no earlier sibling may still hold its turn (storage
+// this member ready), and no earlier sibling may hold it (storage
 // CutoverBlocker, the same rule the automatic cutover claim follows).
 func operationCutoverRequestTurn(ctx context.Context, store storage.Storage, apply *storage.Apply, scope applyTaskScope, controlReq *storage.ApplyControlRequest) (cutoverRequestTurn, error) {
 	if store == nil {
@@ -150,7 +150,7 @@ func operationCutoverRequestTurn(ctx context.Context, store storage.Storage, app
 		return cutoverRequestTurn{}, fmt.Errorf("check cutover order for apply_operation %d of apply %s: %w", scope.applyOperationID, apply.ApplyIdentifier, err)
 	}
 	if blocker != nil {
-		return cutoverRequestTurn{reason: "an earlier member has not completed its cutover", blocker: blocker}, nil
+		return cutoverRequestTurn{reason: "an earlier member holds the cutover", blocker: blocker}, nil
 	}
 	return cutoverRequestTurn{ready: true}, nil
 }

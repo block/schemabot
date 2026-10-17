@@ -112,7 +112,7 @@ func TestPlanCheckWriteRefusedByInFlightApply(t *testing.T) {
 	// blocking rather than folding a result computed for another commit.
 	contributions, staleCount := normalizeStaleContributions([]*storage.Check{afterCancel}, newSHA)
 	assert.Equal(t, 1, staleCount)
-	_, status := computeAggregate(contributions)
+	_, status := computeAggregate(contributions, nil)
 	assert.Equal(t, checkStatusInProgress, status)
 	assert.False(t, anyInProgressOnCommit([]*storage.Check{afterCancel}, newSHA),
 		"nothing is running for the current commit, so the title reports an awaited result")
@@ -201,7 +201,7 @@ func TestCheckConvergesAfterSuccessfulApplyOnMovedHead(t *testing.T) {
 	// computed for a commit the PR is no longer gated on.
 	contributions, staleCount := normalizeStaleContributions([]*storage.Check{afterApply}, newSHA)
 	require.Equal(t, 1, staleCount)
-	_, status := computeAggregate(contributions)
+	_, status := computeAggregate(contributions, nil)
 	require.Equal(t, checkStatusInProgress, status)
 
 	// So a plan for the current commit is owed, and the settled row admits it.

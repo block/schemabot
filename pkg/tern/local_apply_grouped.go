@@ -277,7 +277,17 @@ func (c *LocalClient) completeTasklessGroupedApply(ctx context.Context, apply *s
 	apply.CompletedAt = &now
 	apply.UpdatedAt = now
 	if err := c.storage.Applies().Update(ctx, apply); err != nil {
-		return fmt.Errorf("complete task-less grouped apply %s: %w", apply.ApplyIdentifier, err)
+		// The write may have committed with only its reply lost. When storage
+		// holds the apply completed under this drive's lease, the write landed
+		// and the drive goes on to answer for it below; otherwise the stored
+		// apply is still active and nothing that answers for its outcome may run.
+		landed, stored := c.outcomeWriteLanded(ctx, apply, apply.State, apply.ErrorMessage, err)
+		if !landed {
+			return fmt.Errorf("complete task-less grouped apply %s: %w", apply.ApplyIdentifier, err)
+		}
+		c.logger.Warn("the write recording the task-less apply completed returned an error, but storage holds it; continuing with the stored outcome",
+			append(stored.LogAttrs(), "error", err)...)
+		*apply = *stored
 	}
 	if message == "" {
 		message = "Apply completed with state: completed"
@@ -774,7 +784,7 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 		logger.Warn("progress check failed",
 			append(apply.MutableLogAttrs(), "error", err, "consecutive_errors", ps.consecutiveErrors)...)
 		if ps.consecutiveErrors >= maxConsecutiveProgressPollErrors {
-			if c.shouldRetryEngineError(err) {
+			if c.shouldPauseAcceptedWork(apply, tasks, err) {
 				logger.Warn("progress polling failed repeatedly, pausing apply for operator retry",
 					"consecutive_errors", ps.consecutiveErrors)
 				ps.terminalErr = c.markApplyRetryableWithTasks(ctx, apply, tasks, fmt.Sprintf("progress polling failed after %d consecutive errors: %v", ps.consecutiveErrors, err))
@@ -1163,7 +1173,7 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 			"stored_state", freshApply.State,
 			"progress_state", apply.State)
 		*apply = *freshApply
-		if err := settlePendingRequestsForTerminalApply(ctx, c.storage, c.logger, apply); err != nil {
+		if err := SettlePendingRequestsForTerminalApply(ctx, c.storage, c.logger, apply); err != nil {
 			logger.Warn("failed to settle pending control requests for terminal apply; current apply owner will exit for operator retry",
 				"error", err)
 			return true
@@ -1207,15 +1217,26 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 			if c.driveCancelled(ctx, apply, "while persisting the apply's settled state") {
 				return true
 			}
-			// The stored apply is still active, so nothing that answers for its
-			// outcome may run: completing a pending control request here would
-			// resolve an operator's command against an apply storage still
-			// reports active, and the observer would post a terminal summary for
-			// it. The drive exits and a later claim finalizes the apply.
-			logger.Error("failed to persist the apply's settled state; current apply owner will exit for operator retry with the apply still active, its pending control requests pending, and no terminal summary posted",
-				"deployment", apply.Deployment, "stored_state", expectedState, "settled_state", apply.State, "error", err)
-			ps.terminalErr = fmt.Errorf("persist grouped outcome for apply %s: %w", apply.ApplyIdentifier, err)
-			return true
+			// The write may have committed with only its reply lost. When
+			// storage holds this settled state under this drive's lease, the
+			// write landed and the drive goes on to answer for it below.
+			landed, stored := c.outcomeWriteLanded(ctx, apply, apply.State, apply.ErrorMessage, err)
+			if !landed {
+				// The stored apply is still active, so nothing that answers for
+				// its outcome may run: completing a pending control request here
+				// would resolve an operator's command against an apply storage
+				// still reports active, and the observer would post a terminal
+				// summary for it. The drive exits and a later claim finalizes
+				// the apply.
+				logger.Error("failed to persist the apply's settled state; current apply owner will exit for operator retry with the apply still active, its pending control requests pending, and no terminal summary posted",
+					"deployment", apply.Deployment, "stored_state", expectedState, "settled_state", apply.State, "error", err)
+				ps.terminalErr = fmt.Errorf("persist grouped outcome for apply %s: %w", apply.ApplyIdentifier, err)
+				return true
+			}
+			logger.Warn("the write recording the apply's settled state returned an error, but storage holds it; continuing with the stored outcome",
+				append(stored.MutableLogAttrs(), "previous_state", expectedState, "error", err)...)
+			*apply = *stored
+			swapped = true
 		}
 		if !swapped {
 			// Another drive advanced the apply between our reload and write; it
@@ -1483,7 +1504,7 @@ func (c *LocalClient) autoTriggerCutover(ctx context.Context, eng engine.Engine,
 		if ps.consecutiveCutoverFailures < maxConsecutiveCutoverFailures {
 			return false
 		}
-		if c.shouldRetryEngineError(err) {
+		if c.shouldPauseAcceptedWork(apply, tasks, err) {
 			logger.Warn("auto-cutover failed repeatedly, pausing apply for operator retry",
 				append(apply.MutableLogAttrs(), "consecutive_cutover_failures", ps.consecutiveCutoverFailures)...)
 			ps.terminalErr = c.markApplyRetryableWithTasks(ctx, apply, tasks, fmt.Sprintf("cutover failed after %d consecutive attempts: %v", ps.consecutiveCutoverFailures, err))

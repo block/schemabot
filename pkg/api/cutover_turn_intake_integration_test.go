@@ -17,14 +17,16 @@ import (
 	"github.com/block/schemabot/pkg/storage/mysqlstore"
 )
 
-// A cutover request for a multi-member rollout is accepted only when a parked
-// member could take it now. Under an ordered cutover policy that is the parked
-// member whose turn it is, and the request is bound to that member so the one
-// command cannot pass on to the next. A request that arrives while every
-// parked member still waits on an earlier one is refused with the name of the
-// member holding the turn, rather than queued for a drive that will not take
-// it. Unordered rollouts, and shards within one member, are accepted exactly as
-// before.
+// A cutover request for a multi-member rollout is accepted when a parked
+// member could take it now. Under an ordered cutover policy that is the first
+// parked member no earlier member holds, and the request is bound to that
+// member so the one command cannot pass on to the next. An earlier deployment
+// holds every later deployment's cutover until it has completed, while an
+// earlier target of the same deployment that is still copying holds nothing. A request that arrives while an earlier
+// member's failure, retry, or stop holds every parked member is refused with
+// the name of that member and what clears it, rather than queued for a drive
+// that will not take it. Unordered rollouts, and shards within one member, are
+// accepted exactly as before.
 func TestCutoverIntakeFollowsDeploymentOrder(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping integration test in short mode")
@@ -53,7 +55,7 @@ func TestCutoverIntakeFollowsDeploymentOrder(t *testing.T) {
 		require.Nil(t, req, "a refused cutover leaves nothing queued")
 	}
 
-	t.Run("RefusesWhenNoParkedDeploymentIsAtItsTurn", func(t *testing.T) {
+	t.Run("RefusesWhileAnEarlierDeploymentHasNotCompleted", func(t *testing.T) {
 		resetMatrixTables(t, ctx, db)
 		seed := seedGroupedApply(t, ctx, stor, multiOpSeed{
 			applyIdentifier: "cutover-intake-out-of-turn",
@@ -76,7 +78,160 @@ func TestCutoverIntakeFollowsDeploymentOrder(t *testing.T) {
 		err := requestCutover(t, seed.applyID)
 		require.Error(t, err)
 		assert.Equal(t, http.StatusConflict, controlOperationHTTPStatus(err))
-		assert.EqualError(t, err, "cutover follows rollout order: eu is ahead of us and is running; run cutover again once eu has completed")
+		assert.EqualError(t, err, "cutover follows deployment order: eu is in an earlier deployment than us and is running; run cutover again once eu has completed")
+		requirePending(t, seed.applyID, false)
+	})
+
+	t.Run("AcceptsWhileAnEarlierMemberIsStillCopying", func(t *testing.T) {
+		resetMatrixTables(t, ctx, db)
+		seed := seedGroupedApply(t, ctx, stor, multiOpSeed{
+			applyIdentifier: "cutover-intake-earlier-target-copying",
+			parentState:     state.Apply.Running,
+			cutoverPolicy:   storage.CutoverPolicyBarrier,
+			onFailure:       storage.OnFailureHalt,
+			deployments:     []string{"shop"},
+			targets:         []string{"shop-001", "shop-002", "shop-003"},
+			perOpState: map[string]string{
+				"shop-001": state.ApplyOperation.Running,
+				"shop-002": state.ApplyOperation.WaitingForCutover,
+				"shop-003": state.ApplyOperation.WaitingForCutover,
+			},
+			perTaskState: map[string]string{
+				"shop-001": state.Task.Running,
+				"shop-002": state.Task.WaitingForCutover,
+				"shop-003": state.Task.WaitingForCutover,
+			},
+		})
+
+		require.NoError(t, requestCutover(t, seed.applyID))
+		req, err := stor.ControlRequests().GetPending(ctx, seed.applyID, storage.ControlOperationCutover)
+		require.NoError(t, err)
+		require.NotNil(t, req, "an accepted cutover is recorded for the drive to take")
+		boundID, err := req.CutoverOperationID()
+		require.NoError(t, err)
+		assert.Equal(t, seed.opID("shop-002"), boundID, "the request is bound to the first parked target, not held behind shop-001's copy")
+	})
+
+	t.Run("RefusalNamesTheWayPastARetryingMember", func(t *testing.T) {
+		resetMatrixTables(t, ctx, db)
+		seed := seedGroupedApply(t, ctx, stor, multiOpSeed{
+			applyIdentifier: "cutover-intake-retrying-ahead",
+			parentState:     state.Apply.Running,
+			cutoverPolicy:   storage.CutoverPolicyParallel,
+			onFailure:       storage.OnFailureHalt,
+			deployments:     []string{"eu", "us"},
+			perOpState: map[string]string{
+				"eu": state.ApplyOperation.FailedRetryable,
+				"us": state.ApplyOperation.WaitingForCutover,
+			},
+			perTaskState: map[string]string{
+				"eu": state.Task.Running,
+				"us": state.Task.WaitingForCutover,
+			},
+		})
+
+		err := requestCutover(t, seed.applyID)
+		require.Error(t, err)
+		assert.Equal(t, http.StatusConflict, controlOperationHTTPStatus(err))
+		assert.EqualError(t, err, "cutover is held: eu is retrying a failure ahead of us; run cutover again once eu recovers")
+		requirePending(t, seed.applyID, false)
+	})
+
+	// eu is still running its copy while its data plane rides out a retry:
+	// the drive keeps its lease, so the operation row stays running and only
+	// its task records the retry. That retry holds us all the same, and the
+	// refusal names it as one.
+	t.Run("RefusalNamesARetryTheDriveIsRidingOut", func(t *testing.T) {
+		resetMatrixTables(t, ctx, db)
+		seed := seedGroupedApply(t, ctx, stor, multiOpSeed{
+			applyIdentifier: "cutover-intake-live-retry-ahead",
+			parentState:     state.Apply.Running,
+			cutoverPolicy:   storage.CutoverPolicyParallel,
+			onFailure:       storage.OnFailureHalt,
+			deployments:     []string{"eu", "us"},
+			perOpState: map[string]string{
+				"eu": state.ApplyOperation.Running,
+				"us": state.ApplyOperation.WaitingForCutover,
+			},
+			perTaskState: map[string]string{
+				"eu": state.Task.FailedRetryable,
+				"us": state.Task.WaitingForCutover,
+			},
+		})
+
+		err := requestCutover(t, seed.applyID)
+		require.Error(t, err)
+		assert.Equal(t, http.StatusConflict, controlOperationHTTPStatus(err))
+		assert.EqualError(t, err, "cutover is held: eu is retrying a failure ahead of us; run cutover again once eu recovers")
+		requirePending(t, seed.applyID, false)
+	})
+
+	// shop-001 is still copying and shop-002 and shop-003 are parked. Each
+	// cutover command starts one target's cutover: the first is bound to
+	// shop-002, and once shop-002 is cutting over the next is bound to
+	// shop-003 rather than answered as already in progress. With both cutting over and nothing left parked, a third
+	// command is answered as already in progress and records nothing.
+	t.Run("ConsecutiveCommandsCutOverEachParkedMember", func(t *testing.T) {
+		resetMatrixTables(t, ctx, db)
+		seed := seedGroupedApply(t, ctx, stor, multiOpSeed{
+			applyIdentifier: "cutover-intake-consecutive",
+			parentState:     state.Apply.Running,
+			cutoverPolicy:   storage.CutoverPolicyParallel,
+			onFailure:       storage.OnFailureHalt,
+			deployments:     []string{"shop"},
+			targets:         []string{"shop-001", "shop-002", "shop-003"},
+			perOpState: map[string]string{
+				"shop-001": state.ApplyOperation.Running,
+				"shop-002": state.ApplyOperation.WaitingForCutover,
+				"shop-003": state.ApplyOperation.WaitingForCutover,
+			},
+			perTaskState: map[string]string{
+				"shop-001": state.Task.Running,
+				"shop-002": state.Task.WaitingForCutover,
+				"shop-003": state.Task.WaitingForCutover,
+			},
+		})
+		command := func(t *testing.T) int {
+			t.Helper()
+			apply := getApply(t, ctx, stor, seed.applyID)
+			resp, status, err := svc.executeCutoverForApply(ctx, nil, apply, apply.ApplyIdentifier, "cli:alice")
+			require.NoError(t, err)
+			require.NotNil(t, resp)
+			assert.True(t, resp.Accepted)
+			return status
+		}
+		boundTo := func(t *testing.T) int64 {
+			t.Helper()
+			req, err := stor.ControlRequests().GetPending(ctx, seed.applyID, storage.ControlOperationCutover)
+			require.NoError(t, err)
+			require.NotNil(t, req, "an accepted cutover is recorded for the drive to take")
+			boundID, err := req.CutoverOperationID()
+			require.NoError(t, err)
+			return boundID
+		}
+		// takeCutover stands in for the bound member's drive taking the
+		// request: the request completes and the member starts cutting over.
+		takeCutover := func(t *testing.T, member string) {
+			t.Helper()
+			require.NoError(t, stor.ControlRequests().CompletePending(ctx, seed.applyID, storage.ControlOperationCutover))
+			require.NoError(t, stor.ApplyOperations().UpdateState(ctx, seed.opID(member), state.ApplyOperation.CuttingOver))
+			tasks, err := stor.Tasks().GetByApplyOperationID(ctx, seed.opID(member))
+			require.NoError(t, err)
+			for _, task := range tasks {
+				task.State = state.Task.CuttingOver
+				require.NoError(t, stor.Tasks().Update(ctx, task))
+			}
+		}
+
+		assert.Equal(t, http.StatusOK, command(t))
+		assert.Equal(t, seed.opID("shop-002"), boundTo(t), "the first command cuts over the first parked target")
+		takeCutover(t, "shop-002")
+
+		assert.Equal(t, http.StatusOK, command(t), "shop-002 cutting over does not make the command for shop-003 redundant")
+		assert.Equal(t, seed.opID("shop-003"), boundTo(t), "the second command cuts over the next parked target, not shop-002 again")
+		takeCutover(t, "shop-003")
+
+		assert.Equal(t, http.StatusAccepted, command(t), "with nothing left parked the command is answered as already in progress")
 		requirePending(t, seed.applyID, false)
 	})
 
@@ -101,7 +256,7 @@ func TestCutoverIntakeFollowsDeploymentOrder(t *testing.T) {
 		err := requestCutover(t, seed.applyID)
 		require.Error(t, err)
 		assert.Equal(t, http.StatusConflict, controlOperationHTTPStatus(err))
-		assert.EqualError(t, err, "cutover follows rollout order: eu is failed ahead of us, and on_failure halt holds every later cutover; stop the schema change, or fix the failure and apply again",
+		assert.EqualError(t, err, "cutover is held: eu failed ahead of us, and on_failure halt holds every later cutover; stop the schema change, or fix the failure and apply again",
 			"a failed member never completes, so the refusal does not tell the operator to wait for it")
 		requirePending(t, seed.applyID, false)
 	})
@@ -130,7 +285,7 @@ func TestCutoverIntakeFollowsDeploymentOrder(t *testing.T) {
 		require.NoError(t, err)
 		boundID, err := req.CutoverOperationID()
 		require.NoError(t, err)
-		assert.Equal(t, seed.opID("eu"), boundID, "the request is bound to the member whose turn it is")
+		assert.Equal(t, seed.opID("eu"), boundID, "the request is bound to the first parked member no earlier member holds")
 	})
 
 	t.Run("RollingRolloutAcceptsAsBefore", func(t *testing.T) {
