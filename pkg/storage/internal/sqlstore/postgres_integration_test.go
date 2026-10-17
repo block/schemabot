@@ -83,6 +83,13 @@ func TestPostgresStorageParity(t *testing.T) {
 	})
 	t.Run("NonUTCWriterTimesStoreTheirInstant", func(t *testing.T) { testPostgresNonUTCWriterTimesStoreTheirInstant(t, h) })
 	t.Run("FindTerminalWithInProgressCheck", func(t *testing.T) { testPostgresFindTerminalWithInProgressCheck(t, h) })
+	t.Run("ProcessDriverShare", func(t *testing.T) {
+		testProcessDriverShare(t, func(t *testing.T, opts ...storage.Option) *Storage {
+			t.Helper()
+			clearPostgresTables(t, h.db)
+			return NewPostgres(h.db, opts...)
+		})
+	})
 }
 
 // testPostgresFindTerminalWithInProgressCheck verifies the stranded-check query

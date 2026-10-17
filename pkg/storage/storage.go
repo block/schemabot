@@ -83,6 +83,28 @@ const ApplyDriveStallAfter = 5 * time.Minute
 // driver count on more than one pod; size it deliberately when either differs.
 const DefaultMaxDriversPerApply = 2
 
+// DefaultDriversPerProcess is the size of one process's driver pool when a
+// deployment does not configure drivers.
+const DefaultDriversPerProcess = 4
+
+// ProcessDriverShare returns how many of one process's drivers a single apply
+// may hold while starting work: half the pool, and never less than one.
+//
+// DefaultMaxDriversPerApply bounds an apply across the whole plane, but says
+// nothing about where its leases land. Claims race oldest-first, so without a
+// per-process bound one wide fan-out can fill every driver on whichever pods
+// poll first. That concentrates its memory on those pods, and if its drives
+// hang, nothing else can run there. Holding each apply to half of each pool
+// spreads a wide apply across pods, and leaves every pod with drivers free for
+// other databases however many of one apply's drives are stuck. A one-driver
+// pool cannot be split, so there the share is the whole pool.
+//
+// The share gates the same claims the plane-wide cap does: every claim that
+// starts work, and none that recovers or controls (OW-11).
+func ProcessDriverShare(driversPerProcess int) int {
+	return max(1, driversPerProcess/2)
+}
+
 // Storage provides access to all stores.
 type Storage interface {
 	// Locks returns the lock store.
