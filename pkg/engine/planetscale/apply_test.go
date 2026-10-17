@@ -32,16 +32,84 @@ func (c *permanentVSchemaErrorClient) UpdateKeyspaceVSchema(context.Context, *ps
 }
 
 // A schema that is already converged produces a deploy request with no
-// differences. The apply must be accepted so the orchestrator completes the
-// change's tasks normally rather than reporting a spurious failure.
+// differences. The apply must be accepted with a resume state naming that
+// deploy request, so the orchestrator follows it like any other accepted apply:
+// the next progress poll reads the request's no_changes state as completed and
+// the change's tasks complete normally rather than reporting a spurious failure.
 func TestNoChangesApplyResultIsAccepted(t *testing.T) {
-	fresh := noChangesApplyResult("no changes detected")
-	assert.True(t, fresh.Accepted)
-	assert.Equal(t, "no changes detected", fresh.Message)
+	req := &engine.ApplyRequest{Database: "testdb"}
+	result, err := conformanceEngine(nil).noChangesApplyResult(req, "org", "no changes detected", "apply-1a2b3c4d5e6f7890",
+		&psMetadata{BranchName: "schemabot-testdb-same", DeployRequestID: 55, DeployRequestURL: "https://app/dr/55"})
+	require.NoError(t, err)
+	assert.True(t, result.Accepted)
+	assert.Equal(t, "no changes detected", result.Message)
+	require.NotNil(t, result.ResumeState, "the drive needs a resume state to follow the deploy request")
+	assert.Equal(t, "apply-1a2b3c4d5e6f7890", result.ResumeState.MigrationContext)
+	stored, err := decodePSMetadata(result.ResumeState.Metadata)
+	require.NoError(t, err)
+	assert.Equal(t, uint64(55), stored.DeployRequestID)
+	assert.Equal(t, "schemabot-testdb-same", stored.BranchName)
 
-	resume := noChangesApplyResult("no changes detected on resume")
-	assert.True(t, resume.Accepted)
-	assert.Equal(t, "no changes detected on resume", resume.Message)
+	assert.Equal(t, engine.StateCompleted, noChangesProgressState(t, result.ResumeState),
+		"the next progress poll settles the converged apply as completed")
+}
+
+// A no-changes deploy request never deploys, so neither it nor its branch is
+// torn down by PlanetScale's auto-delete, and SchemaBot leaves both in place.
+// The completed apply logs, at info level on the apply's logger, the
+// organization, database, deploy request, and branch it left behind and what
+// the operator can remove: the deploy request and a branch SchemaBot created,
+// or only the deploy request when the branch is operator-supplied.
+func TestNoChangesApplyResultLogsWhatItLeavesInPlanetScale(t *testing.T) {
+	tests := []struct {
+		name    string
+		options map[string]string
+		branch  string
+		wantMsg string
+	}{
+		{name: "a branch SchemaBot created", branch: "schemabot-testdb-same", wantMsg: noChangesLeftInPlaceMsg},
+		{name: "an operator-supplied branch", options: map[string]string{"branch": "my-dev-branch"}, branch: "my-dev-branch", wantMsg: noChangesLeftInPlaceOperatorBranchMsg},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := &engine.ApplyRequest{Database: "testdb", Options: tt.options}
+			logRecord := captureApplyLogs(t, req)
+
+			_, err := conformanceEngine(nil).noChangesApplyResult(req, "org", "no changes detected", "apply-1a2b3c4d5e6f7890",
+				&psMetadata{BranchName: tt.branch, DeployRequestID: 55, DeployRequestURL: "https://app/dr/55"})
+			require.NoError(t, err)
+
+			record := logRecord(tt.wantMsg)
+			require.NotNil(t, record, "the deploy request and branch left in PlanetScale are logged")
+			assert.Equal(t, "INFO", record["level"])
+			assert.Equal(t, "apply-1a2b3c4d5e6f7890", record["apply_id"])
+			assert.Equal(t, "org", record["organization"])
+			assert.Equal(t, "testdb", record["planetscale_database"])
+			assert.Equal(t, float64(55), record["deploy_request"])
+			assert.Equal(t, tt.branch, record["branch"])
+		})
+	}
+}
+
+// noChangesProgressState polls Progress with rs against a deploy request that
+// reports no changes, the read the drive makes after the engine accepts.
+func noChangesProgressState(t *testing.T, rs *engine.ResumeState) engine.State {
+	t.Helper()
+	client := &resumeDeployClient{recovered: &ps.DeployRequest{State: deployRequestClosed, DeploymentState: deployState.NoChanges}}
+	e := NewWithClient(slog.New(slog.NewTextHandler(os.Stdout, nil)),
+		func(_, _ string) (psclient.PSClient, error) { return client, nil })
+	progress, err := e.Progress(t.Context(), &engine.ProgressRequest{
+		Database:    "testdb",
+		ResumeState: rs,
+		Credentials: &engine.Credentials{Metadata: map[string]string{
+			"organization": "org",
+			"token_name":   "token",
+			"token_value":  "secret",
+		}},
+	})
+	require.NoError(t, err)
+	require.NotNil(t, progress)
+	return progress.State
 }
 
 func TestApply_MainBranchReuseIsPermanent(t *testing.T) {
@@ -1520,6 +1588,14 @@ func TestResumeExistingDeployRequest_NoChangesIsConverged(t *testing.T) {
 			assert.Equal(t, "no changes detected on resume", result.Message)
 			assert.Equal(t, 0, client.deployCalls)
 			assert.Empty(t, *persisted, "nothing to record for a change that never ran")
+
+			require.NotNil(t, result.ResumeState, "the resumed drive needs a resume state to settle the apply")
+			assert.Equal(t, "apply-1a2b3c4d5e6f7890", result.ResumeState.MigrationContext)
+			stored, err := decodePSMetadata(result.ResumeState.Metadata)
+			require.NoError(t, err)
+			assert.Equal(t, uint64(55), stored.DeployRequestID)
+			assert.Equal(t, engine.StateCompleted, noChangesProgressState(t, result.ResumeState),
+				"the resumed drive's next progress poll settles the converged apply as completed")
 		})
 	}
 }
@@ -1894,6 +1970,53 @@ func TestResumeApply_BranchResumeDeletesOnlySchemaBotBranch(t *testing.T) {
 			assert.Equal(t, tt.wantAutoDelete, client.lastCreate.AutoDeleteBranch)
 		})
 	}
+}
+
+// noChangesBranchResumeClient serves the branch-resume path like
+// branchResumeClient, but the deploy request the resume creates settles to no
+// changes because the branch already matches main.
+type noChangesBranchResumeClient struct {
+	branchResumeClient
+}
+
+func (c *noChangesBranchResumeClient) CreateDeployRequest(_ context.Context, req *ps.CreateDeployRequestRequest) (*ps.DeployRequest, error) {
+	c.lastCreate = req
+	return &ps.DeployRequest{Number: 42, State: "open", DeploymentState: deployState.NoChanges, HtmlURL: "https://app/dr/42"}, nil
+}
+
+// A resume that recovers a branch whose deploy request was never created, and
+// whose new deploy request reports no changes, completes like the fresh path:
+// the resume state names the deploy request it created, so the resumed drive's
+// next progress poll reads its no_changes state as completed instead of
+// polling a branch with no deploy request forever. Nothing is deployed, and
+// the deploy request and branch left in PlanetScale are logged.
+func TestResumeApply_BranchResumeNoChangesNamesTheDeployRequest(t *testing.T) {
+	shortenEngineWaits(t)
+	client := &noChangesBranchResumeClient{}
+	req := resumeRequest(t, &psMetadata{BranchName: "schemabot-testdb-1a2b"}, "apply-1a2b3c4d5e6f7890")
+	logRecord := captureApplyLogs(t, req)
+
+	result, err := conformanceEngine(client).resumeApply(t.Context(), client, "org", req)
+
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	assert.True(t, result.Accepted)
+	assert.Equal(t, "no changes detected on resume", result.Message)
+	assert.Equal(t, 0, client.deployCalls)
+	require.NotNil(t, result.ResumeState, "the resumed drive needs a resume state to settle the apply")
+	assert.Equal(t, "apply-1a2b3c4d5e6f7890", result.ResumeState.MigrationContext)
+	stored, err := decodePSMetadata(result.ResumeState.Metadata)
+	require.NoError(t, err)
+	assert.Equal(t, uint64(42), stored.DeployRequestID)
+	assert.Equal(t, "https://app/dr/42", stored.DeployRequestURL)
+	assert.Equal(t, "schemabot-testdb-1a2b", stored.BranchName)
+	assert.Equal(t, engine.StateCompleted, noChangesProgressState(t, result.ResumeState),
+		"the resumed drive's next progress poll settles the converged apply as completed")
+
+	record := logRecord(noChangesLeftInPlaceMsg)
+	require.NotNil(t, record, "the deploy request and branch left in PlanetScale are logged")
+	assert.Equal(t, float64(42), record["deploy_request"])
+	assert.Equal(t, "schemabot-testdb-1a2b", record["branch"])
 }
 
 // When resume declines instant DDL on an eligible recovered request, the
