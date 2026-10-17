@@ -1158,12 +1158,19 @@ type PlanSummaryResponse struct {
 
 // PlansResponse is the HTTP response for GET /api/plans.
 type PlansResponse struct {
-	Limit    int  `json:"limit"`
-	MaxLimit int  `json:"max_limit"`
-	HasMore  bool `json:"has_more"`
+	Limit    int `json:"limit"`
+	MaxLimit int `json:"max_limit"`
+	// HasMore reports that more plans match than this page holds. Request the
+	// next page with the same filters and starting_after set to the last
+	// plan's ID.
+	HasMore bool `json:"has_more"`
 	// Last echoes the requested creation window, when one was given.
-	Last  string                 `json:"last,omitempty"`
-	Plans []*PlanSummaryResponse `json:"plans"`
+	Last string `json:"last,omitempty"`
+	// StartingAfter echoes the starting_after plan the page continues from,
+	// so a client can tell this page apart from a first page served by a
+	// server that ignores the parameter.
+	StartingAfter string                 `json:"starting_after,omitempty"`
+	Plans         []*PlanSummaryResponse `json:"plans"`
 }
 
 // StoredPlanResponse is the HTTP response for GET /api/plans/{plan_identifier}:
@@ -1836,6 +1843,11 @@ type TableProgressResponse struct {
 	// estimate covers the whole table. A sharded table rolled up across its
 	// shards carries it, covering every shard.
 	EstimatedBytes *int64 `json:"estimated_bytes,omitempty"`
+	// EstimatedRows is the plan's approximate row count for the table, so a
+	// table that has not started copying can show how much it will copy.
+	// rows_total replaces it once the engine reports. Absent under the same
+	// rules as EstimatedBytes.
+	EstimatedRows *int64 `json:"estimated_rows,omitempty"`
 	// PlannedShards is how many shards a sharded table's change spans per its
 	// plan, the shards EstimatedBytes covers. Zero when the plan recorded no
 	// count and for a table not rolled up across shards.
@@ -1866,6 +1878,10 @@ type ShardProgressResponse struct {
 	ETASeconds      int64  `json:"eta_seconds,omitempty"`
 	PercentComplete int32  `json:"percent_complete"`
 	CutoverAttempts int32  `json:"cutover_attempts,omitempty"`
+	// Checksum phase progress: rows verified so far and total to verify.
+	// Non-zero only while the shard is checksumming (verifying copied data).
+	ChecksumRowsChecked int64 `json:"checksum_rows_checked,omitempty"`
+	ChecksumRowsTotal   int64 `json:"checksum_rows_total,omitempty"`
 }
 
 // GetTableName implements ddl.TableWithName for filtering Spirit internal tables.
@@ -1918,9 +1934,12 @@ type ActiveApplyResponse struct {
 
 // StatusResponse is the HTTP response for GET /api/status.
 type StatusResponse struct {
-	ActiveCount  int  `json:"active_count"`
-	Limit        int  `json:"limit,omitempty"`
-	MaxLimit     int  `json:"max_limit,omitempty"`
+	ActiveCount int `json:"active_count"`
+	Limit       int `json:"limit,omitempty"`
+	MaxLimit    int `json:"max_limit,omitempty"`
+	// HasMore reports that more applies match than this page holds. Request
+	// the next page with the same filters and starting_after set to the last
+	// apply's ID.
 	HasMore      bool `json:"has_more,omitempty"`
 	FailuresOnly bool `json:"failures_only,omitempty"`
 	// Last echoes the window bounding the list to applies updated within it;
@@ -1929,6 +1948,15 @@ type StatusResponse struct {
 	// State echoes the canonical form of the state filter restricting the
 	// list; empty means no state filter.
 	State string `json:"state,omitempty"`
+	// StartingAfter echoes the starting_after apply the page continues from,
+	// so a client can tell this page apart from a first page served by a
+	// server that ignores the parameter.
+	StartingAfter string `json:"starting_after,omitempty"`
+	// Active echoes the active filter: true lists only applies that have not
+	// reached a terminal state, false only the terminal ones, and absent means
+	// no filter. A client that asked for active=false and finds it absent is
+	// talking to a server that lists everything regardless.
+	Active *bool `json:"active,omitempty"`
 	// StateCounts tallies every apply matching the request's filters by state,
 	// unbounded by limit — the applies list may be a truncated page, but these
 	// counts never are.

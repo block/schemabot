@@ -165,6 +165,9 @@ func (r *EtreResolver) ResolveTarget(ctx context.Context, req inventory.Request)
 	}
 
 	entities, err := r.lookup(ctx, selector)
+	if errors.Is(err, ErrNotFound) {
+		return nil, fmt.Errorf("resolve target %q: %w: %w", req.Target, inventory.ErrTargetNotFound, err)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("resolve target %q: %w", req.Target, err)
 	}

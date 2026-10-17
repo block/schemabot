@@ -264,9 +264,10 @@ runs. Below it, the bounded attempt described above is what stands in for a copy
 tried once, and a rewrite is cancelled by its own budget rather than allowed to hold a lock. Some
 statements skip the gamble because PostgreSQL has a genuinely online form of them, and the planner
 substitutes it: an index build becomes `CREATE INDEX CONCURRENTLY`, and a constraint is added `NOT
-VALID` and then validated. Those still sit under the size limit, which is checked once at plan time
-and again in the session that executes, so a table that grew past the limit in between is refused
-rather than run. [postgresql.md](postgresql.md) has
+VALID` and then validated. The constraint steps still sit under the size limit, which is checked
+once at plan time and again in the session that executes, so a table that grew past the limit in
+between is refused rather than run. `CREATE INDEX CONCURRENTLY` is exempt from the size limit and
+is bounded by its own duration budget instead. [postgresql.md](postgresql.md) has
 the full boundary and is worth reading before you point SchemaBot at a PostgreSQL database; it
 tracks the engine more closely than this page does.
 

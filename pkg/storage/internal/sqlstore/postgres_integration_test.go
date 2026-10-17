@@ -74,6 +74,13 @@ func TestPostgresStorageParity(t *testing.T) {
 			return NewPostgres(h.db)
 		}, postgresLockWaiter(h.db))
 	})
+	t.Run("StoppedApplyStartRacingItsTakeover", func(t *testing.T) {
+		testStoppedApplyStartRacingItsTakeover(t, func(t *testing.T) *Storage {
+			t.Helper()
+			clearPostgresTables(t, h.db)
+			return NewPostgres(h.db)
+		}, postgresLockWaiter(h.db), postgresAdvisoryLockWaiter(h.db))
+	})
 	t.Run("NonUTCWriterTimesStoreTheirInstant", func(t *testing.T) { testPostgresNonUTCWriterTimesStoreTheirInstant(t, h) })
 	t.Run("FindTerminalWithInProgressCheck", func(t *testing.T) { testPostgresFindTerminalWithInProgressCheck(t, h) })
 }
@@ -1140,6 +1147,53 @@ func TestPostgresApplyOperationLeaseGuards(t *testing.T) {
 		require.NotNil(t, advanced.StartedAt, "the projection stamps started_at while it is still NULL")
 		assert.WithinDuration(t, startedAt, *advanced.StartedAt, time.Second)
 	})
+}
+
+// ListRecentTargets bounds a data plane's view of the targets it applied to by
+// when each apply was last written on PostgreSQL too: the cutoff is rendered
+// SQL, so it is exercised on each dialect. A target whose applies were all
+// last written before the lookback drops out, while one with any apply written
+// inside the window stays, including one created before the window that
+// settled inside it.
+func TestPostgresListRecentTargetsWindow(t *testing.T) {
+	dsn, fixtureDB := testutil.StartPostgres(t, "sqlstore_recent_targets_window")
+	db, err := postgresconn.Open(dsn)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	require.NoError(t, db.PingContext(t.Context()))
+	applyPostgresTestSchema(t, fixtureDB)
+	clearPostgresTables(t, db)
+
+	ctx := t.Context()
+	store := NewPostgres(db)
+	lock := storagetest.CreateLock(t, store, "orders", storage.DatabaseTypeVitess)
+	seed := func(t *testing.T, applyID string, planID int64, target string, created, updated time.Duration) {
+		t.Helper()
+		apply := storagetest.CreateApplyWithStateAndEnv(t, store, lock, applyID, planID, state.Apply.Completed, "staging")
+		_, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+			ApplyID: apply.ID, Deployment: "region-a", Target: target,
+		})
+		require.NoError(t, err)
+		_, err = db.ExecContext(ctx,
+			fmt.Sprintf(`UPDATE applies SET created_at = CURRENT_TIMESTAMP - INTERVAL '%d seconds', updated_at = CURRENT_TIMESTAMP - INTERVAL '%d seconds' WHERE id = $1`,
+				int(created.Seconds()), int(updated.Seconds())),
+			apply.ID)
+		require.NoError(t, err)
+	}
+	day := 24 * time.Hour
+	seed(t, "apply_stale_only", 9101, "orders-stale", 40*day, 40*day)
+	seed(t, "apply_recent_old", 9102, "orders-recent", 40*day, 40*day)
+	seed(t, "apply_recent_new", 9103, "orders-recent", 2*day, 2*day)
+	// Created before the window but settled inside it: a branch its drive
+	// failed to delete at settlement must stay reachable for the window.
+	seed(t, "apply_settled_late", 9104, "orders-settled-late", 40*day, 1*day)
+
+	targets, err := store.ApplyOperations().ListRecentTargets(ctx, storage.DatabaseTypeVitess, 30*24*time.Hour)
+	require.NoError(t, err)
+	assert.Equal(t, []storage.AppliedTarget{
+		{Database: "orders", Environment: "staging", Target: "orders-recent"},
+		{Database: "orders", Environment: "staging", Target: "orders-settled-late"},
+	}, targets)
 }
 
 func applyPostgresTestSchema(t *testing.T, db *sql.DB) {

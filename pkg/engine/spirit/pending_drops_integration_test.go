@@ -601,20 +601,29 @@ func TestEngine_ResumeDropPhase_ReplayRacingAnAbandonedRename(t *testing.T) {
 	require.NoError(t, err, "lock replay_races_rename")
 
 	const drop = "DROP TABLE `replay_races_rename`"
-	waitingStatements := func() int {
-		var waiting int
-		require.NoError(t, db.QueryRowContext(t.Context(), `
-			SELECT COUNT(*) FROM information_schema.processlist
-			WHERE info LIKE 'RENAME TABLE%replay_races_rename%' OR info LIKE 'CREATE DATABASE IF NOT EXISTS%'`).Scan(&waiting))
-		return waiting
+	// Only statements parked on a metadata lock count. A CREATE DATABASE that is
+	// still executing would otherwise read as the first attempt's blocked RENAME,
+	// letting the test stop that attempt before it ever sent the RENAME.
+	blockedStatements := func(infoPatterns ...string) int {
+		var blocked int
+		for _, pattern := range infoPatterns {
+			var count int
+			require.NoError(t, db.QueryRowContext(t.Context(), `
+				SELECT COUNT(*) FROM information_schema.processlist
+				WHERE state LIKE 'Waiting for %metadata lock' AND info LIKE ?`, pattern).Scan(&count))
+			blocked += count
+		}
+		return blocked
 	}
+	const blockedRename = "RENAME TABLE%replay_races_rename%"
+	const blockedCreateDatabase = "CREATE DATABASE IF NOT EXISTS%"
 
 	target := dropTarget{schema: database, table: "replay_races_rename"}
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 	firstAttempt := make(chan error, 1)
 	go func() { firstAttempt <- eng.quarantineDroppedTables(ctx, host, username, password, database, drop) }()
-	waitFor(t, "the first RENAME to block on the metadata lock", func() bool { return waitingStatements() >= 1 })
+	waitFor(t, "the first RENAME to block on the metadata lock", func() bool { return blockedStatements(blockedRename) >= 1 })
 	cancel()
 	require.Error(t, receiveWithin(t, firstAttempt, "the stopped attempt to return"),
 		"the stopped attempt must report that its RENAME did not complete")
@@ -633,7 +642,9 @@ func TestEngine_ResumeDropPhase_ReplayRacingAnAbandonedRename(t *testing.T) {
 
 	replay := make(chan error, 1)
 	go func() { replay <- eng.quarantineDroppedTables(t.Context(), host, username, password, database, drop) }()
-	waitFor(t, "the replay to queue behind the abandoned RENAME", func() bool { return waitingStatements() >= 2 })
+	waitFor(t, "the replay to queue behind the abandoned RENAME", func() bool {
+		return blockedStatements(blockedRename, blockedCreateDatabase) >= 2
+	})
 	recorded := eng.quarantinedDrops(target)
 	require.Len(t, recorded, 2, "the replay must add its destination to the record, not replace the first")
 	assert.Equal(t, firstRecorded[0], recorded[0], "the stopped attempt's destination stays first")

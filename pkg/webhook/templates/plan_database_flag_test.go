@@ -66,8 +66,8 @@ func TestPlanCommentCommandsCarryScopedDatabase(t *testing.T) {
 				d.UnsafeChanges = []UnsafeChangeData{{Table: "users", Reason: "drops a column", ChangeType: "drop"}}
 			},
 			render:  RenderUnsafeChangesBlocked,
-			unscope: "schemabot apply -e staging --allow-unsafe",
-			scoped:  "schemabot apply -e staging -d orders --allow-unsafe",
+			unscope: "schemabot apply -e staging",
+			scoped:  "schemabot apply -e staging -d orders",
 		},
 	}
 

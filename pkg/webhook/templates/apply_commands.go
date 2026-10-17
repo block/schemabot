@@ -27,6 +27,18 @@ type ApplyLockConflictData struct {
 	// Active apply info (for "apply in progress" case)
 	ApplyID    string
 	ApplyState string
+	// ApplyEnvironment is the active apply's own environment, which a PR's
+	// applies in other environments can block. The control commands address
+	// it; empty means the requested environment.
+	ApplyEnvironment string
+	// DeferCutover is the active apply's own option: when set, its
+	// waiting_for_cutover state waits on an operator's cutover command
+	// rather than on SchemaBot.
+	DeferCutover bool
+	// ApplyAgainCommand is the apply the requester commented, rendered so it
+	// can be pasted once the active apply finishes. Empty renders the
+	// environment's plain apply command.
+	ApplyAgainCommand string
 
 	// CLIName is the tool name the comment's CLI command hints start with,
 	// the server's cli_name. Empty renders the CLI's own default.
@@ -87,35 +99,28 @@ func RenderPRCommandNotAuthorized(data ActorAuthorizationCommentData) string {
 	// The database's own operators lead in their own section so the blocked
 	// user knows who to ask first, mirroring the review-required comment; the
 	// broader principals follow as an explicit fallback. Principals render as
-	// inline code, never @-mentions: the list is guidance for the blocked
-	// user, and mentions would notify every admin team and operator on every
-	// rejected command.
+	// @-mentions, the same as the review-required comment's reviewer list, so
+	// the blocked user can click straight through to each team or user.
 	hasOperators := len(data.OperatorPrincipals) > 0
 	hasOthers := len(data.OtherPrincipals) > 0
 	switch {
 	case hasOperators:
 		fmt.Fprintf(&sb, "**Operators of `%s`** — members of these teams, or these users, can run it:\n", data.Database)
-		writePrincipalList(&sb, data.OperatorPrincipals)
+		writeMentionList(&sb, data.OperatorPrincipals)
 		if hasOthers {
 			sb.WriteString("\n**Other authorized teams and users**:\n")
-			writePrincipalList(&sb, data.OtherPrincipals)
+			writeMentionList(&sb, data.OtherPrincipals)
 		}
 		writeAskPrincipalsGuidance(&sb, data.OperatorPrincipals, data.OtherPrincipals)
 	case hasOthers:
 		sb.WriteString("**Who can run this command** — members of these teams, or these users:\n")
-		writePrincipalList(&sb, data.OtherPrincipals)
+		writeMentionList(&sb, data.OtherPrincipals)
 		writeAskPrincipalsGuidance(&sb, data.OtherPrincipals)
 	default:
 		sb.WriteString("A configured SchemaBot admin/database operator must run this command.\n")
 	}
 
 	return offerSupportChannel(sb.String())
-}
-
-func writePrincipalList(sb *strings.Builder, principals []string) {
-	for _, principal := range principals {
-		fmt.Fprintf(sb, "- `%s`\n", principal)
-	}
 }
 
 // writeAskPrincipalsGuidance closes the principal lists with what the blocked
@@ -178,7 +183,7 @@ func RenderPRCommandAuthorizationUnavailable(data ActorAuthorizationCommentData)
 
 // RenderUnsafeChangesBlocked renders a comment when unsafe changes are detected
 // and --allow-unsafe was not specified. Shows the plan DDL plus a blocking message
-// instructing the user to re-run with --allow-unsafe.
+// instructing the user to re-run the apply with --allow-unsafe added.
 func RenderUnsafeChangesBlocked(data PlanCommentData) string {
 	// Every target's plan renders when the apply runs other targets' plans, so
 	// the refusal shows what each would run. The refusal lists every unsafe
@@ -241,16 +246,18 @@ func renderUnsafeChangesBlocked(data PlanCommentData, budget *ddlBlockBudget) st
 	if data.Tenant != "" {
 		applyCmd += fmt.Sprintf(" --tenant %s", data.Tenant)
 	}
-	writeUnsafeChangesRejection(&sb, data, "Apply rejected", applyCmd+" --allow-unsafe")
+	writeUnsafeChangesRejection(&sb, data, "Apply rejected", applyCmd)
 
 	return appendAgentHint(offerSupportChannel(sb.String()), data.AgentHint)
 }
 
 // writeUnsafeChangesRejection writes the refusal for a command that would run
 // unsafe changes without `--allow-unsafe`: the heading names what was
-// rejected, each unsafe change is listed, and the comment ends in the exact
-// command that consents to them.
-func writeUnsafeChangesRejection(sb *strings.Builder, data PlanCommentData, rejected, retryCommand string) {
+// rejected, each unsafe change is listed, and the comment ends in the command
+// to re-run. Like the plan's apply instruction, the consent requirement leads
+// into the command and the flag stays out of the pasteable command, so
+// consenting to destroy data takes typing it.
+func writeUnsafeChangesRejection(sb *strings.Builder, data PlanCommentData, rejected, command string) {
 	sb.WriteString("---\n\n")
 	unsafeCount := countUnsafeFindings(data.UnsafeChanges)
 	fmt.Fprintf(sb, "**"+glyph.Refused+" %s**: %d unsafe %s detected\n", rejected, unsafeCount, pluralize("change", unsafeCount))
@@ -268,8 +275,13 @@ func writeUnsafeChangesRejection(sb *strings.Builder, data PlanCommentData, reje
 		writeAttributedChanges(sb, data.AttributedChanges)
 	}
 
-	sb.WriteString("**" + glyph.Escalation + " To proceed with these destructive changes, re-run with `--allow-unsafe`:**\n")
-	fmt.Fprintf(sb, "```\n%s\n```\n", retryCommand)
+	consent := unsafeConsent{
+		findings:    unsafeCount,
+		tables:      unsafeChangeTables(data.UnsafeChanges),
+		primaryOnly: !unsafeCountCoversEveryTarget(data.DeploymentDrift),
+	}
+	fmt.Fprintf(sb, "**%s To proceed with these destructive changes**, %s:\n", glyph.Escalation, consent.instruction())
+	fmt.Fprintf(sb, "```\n%s\n```\n", command)
 }
 
 // RenderBlockedChangesApplyRejected renders the rejection comment for an
@@ -329,6 +341,7 @@ func RenderApplyStarted(data ApplyStatusCommentData) string {
 
 	writeApplyStatusHeader(&sb, data)
 	writeApplyMetadata(&sb, data, currentTimestamp())
+	writeApplyOptions(&sb, data.DeferCutover, data.SkipRevert, data.State)
 	if state.IsState(data.State, state.Apply.Pending) {
 		writeApplyStatusDetail(&sb, data)
 		return sb.String()
@@ -440,7 +453,10 @@ func cliUnlockArgs(database, databaseType string) string {
 	return args
 }
 
-// RenderApplyInProgress renders a comment when the same PR already has an active apply.
+// RenderApplyInProgress renders a comment when the same PR already has an active
+// apply. The active apply's state decides the next step: one waiting on an
+// operator command (a deferred cutover or deploy, an open revert window) names
+// that command, and every state ends with the apply to run once it finishes.
 func RenderApplyInProgress(data ApplyLockConflictData) string {
 	var sb strings.Builder
 
@@ -448,11 +464,51 @@ func RenderApplyInProgress(data ApplyLockConflictData) string {
 	writeDBLine(&sb, data.Database)
 	writeRequesterOrTimestamp(&sb, data.RequestedBy)
 	sb.WriteString("\n")
-	fmt.Fprintf(&sb, "An apply is already running for this PR (apply ID: `%s`, state: `%s`).\n\n",
-		data.ApplyID, data.ApplyState)
-	sb.WriteString("Wait for it to complete or stop it first.\n")
+
+	applyAgain := data.ApplyAgainCommand
+	if applyAgain == "" {
+		applyAgain = appendTenantFlag("schemabot apply -e "+data.Environment, data.Tenant)
+	}
+	applyEnvironment := data.ApplyEnvironment
+	if applyEnvironment == "" {
+		applyEnvironment = data.Environment
+	}
+	control := func(verb string) string {
+		return appendTenantFlag(fmt.Sprintf("schemabot %s %s -e %s", verb, data.ApplyID, applyEnvironment), data.Tenant)
+	}
+	// An apply in another environment is named by it, since the heading
+	// names the requested one.
+	activeApply := "This PR's apply"
+	if applyEnvironment != data.Environment {
+		activeApply = "This PR's " + applyEnvironment + " apply"
+	}
+
+	switch {
+	case activeApplyAwaitsCutover(data):
+		fmt.Fprintf(&sb, "%s `%s` is waiting for cutover, so a second apply cannot start.\n\n", activeApply, data.ApplyID)
+		fmt.Fprintf(&sb, "To cut over:\n```\n%s\n```\n\n", control("cutover"))
+		fmt.Fprintf(&sb, "Once it completes, apply again:\n```\n%s\n```\n", applyAgain)
+	case state.IsState(data.ApplyState, state.Apply.RevertWindow):
+		fmt.Fprintf(&sb, "%s `%s` is in its revert window, so a second apply cannot start.\n\n", activeApply, data.ApplyID)
+		fmt.Fprintf(&sb, "To keep its changes and close the window:\n```\n%s\n```\n\n", control("skip-revert"))
+		fmt.Fprintf(&sb, "Once it completes, apply again:\n```\n%s\n```\n", applyAgain)
+	default:
+		fmt.Fprintf(&sb, "%s `%s` is still running (state: `%s`), so a second apply cannot start.\n\n", activeApply, data.ApplyID, data.ApplyState)
+		fmt.Fprintf(&sb, "Once it finishes, apply again:\n```\n%s\n```\n", applyAgain)
+	}
 
 	return sb.String()
+}
+
+// activeApplyAwaitsCutover reports whether the active apply is parked until an
+// operator triggers its cutover: a deploy request waiting to be deployed always
+// is, and a waiting_for_cutover apply is only when it was started with deferred
+// cutover (otherwise SchemaBot cuts over on its own).
+func activeApplyAwaitsCutover(data ApplyLockConflictData) bool {
+	if state.IsState(data.ApplyState, state.Apply.WaitingForDeploy) {
+		return true
+	}
+	return data.DeferCutover && state.IsState(data.ApplyState, state.Apply.WaitingForCutover)
 }
 
 // RenderApplyBlockedClosedPR renders a rejection when an apply command targets
@@ -907,6 +963,23 @@ func RenderApplyBlockedByPriorEnvInProgress(database, environment, priorEnv stri
 	writeDBLine(&sb, database)
 	sb.WriteString("\n")
 	fmt.Fprintf(&sb, "%s is currently in progress. Wait for it to complete before applying to %s.\n\n", capitalizeFirst(priorEnv), environment)
+	fmt.Fprintf(&sb, "Once %s completes, retry:\n", priorEnv)
+	fmt.Fprintf(&sb, "```\nschemabot apply -e %s\n```\n", environment)
+
+	return offerSupportChannel(sb.String())
+}
+
+// RenderApplyBlockedByStoppedPriorEnvApply renders a comment when an apply is
+// blocked because a prior environment's apply is stopped: it holds the prior
+// environment until it is started again, so it is the operator's move, not
+// something to wait for.
+func RenderApplyBlockedByStoppedPriorEnvApply(database, environment, priorEnv string) string {
+	var sb strings.Builder
+
+	writeEnvironmentTitle(&sb, glyph.Refused+" Apply Blocked", environment)
+	writeDBLine(&sb, database)
+	sb.WriteString("\n")
+	fmt.Fprintf(&sb, "%s has a stopped apply. Start it again with the command on its progress comment.\n\n", capitalizeFirst(priorEnv))
 	fmt.Fprintf(&sb, "Once %s completes, retry:\n", priorEnv)
 	fmt.Fprintf(&sb, "```\nschemabot apply -e %s\n```\n", environment)
 
