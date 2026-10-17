@@ -79,6 +79,28 @@ type Drainer interface {
 	DrainContext(ctx context.Context) error
 }
 
+// DrainTarget names the table a drive is about to start work on: the table in
+// its namespace, on the shard it lives on when the namespace is sharded.
+type DrainTarget struct {
+	Namespace string
+	Shard     string
+	Table     string
+}
+
+// TargetDrainer is an optional interface for an engine that runs each table's
+// work on each shard as its own schema change. A drive about to start a task
+// waits only for the in-flight work on that task's table, the only work that
+// can race the drive's read of the table. Copies on sibling shards keep running
+// alongside it instead of finishing one at a time, and a schema change on
+// another table, such as one holding at a deferred cutover, never holds the
+// drive back.
+type TargetDrainer interface {
+	// DrainTargetContext waits for any in-flight background work on target to
+	// complete and clears it, leaving all other work running. When ctx ends
+	// first it returns an error and leaves the work tracked.
+	DrainTargetContext(ctx context.Context, target DrainTarget) error
+}
+
 // ShutdownHalter is an optional capability for engines whose schema change work
 // runs inside this process. Such an engine holds resources on the target — for
 // Spirit, an advisory lock on the table it is copying — for exactly as long as

@@ -1492,6 +1492,7 @@ var optionalCapabilityVerdicts = map[reflect.Type]bool{
 	reflect.TypeFor[engine.CancelledResumeStateReclaimer]():   false,
 	reflect.TypeFor[engine.ControlResumeValidator]():          false,
 	reflect.TypeFor[engine.ShardKeyedPlanning]():              false,
+	reflect.TypeFor[engine.TargetDrainer]():                   false,
 }
 
 // TestOptionalCapabilitySet checks the recorded verdicts against the engine's

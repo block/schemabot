@@ -484,7 +484,10 @@ func (c *LocalClient) resumeApplySequential(ctx context.Context, apply *storage.
 		// Wait for any in-flight engine work to finish before checking schema.
 		// Without this, the previous task's cutover might complete between our
 		// schema check and the new eng.Apply() call, causing "Duplicate key name".
-		if proceed, err := c.drainEngineForDrive(ctx, apply, eng); err != nil || !proceed {
+		// Only work on the task's own table can race it that way, so the wait is
+		// scoped to that table where the engine supports it.
+		target := drainTargetForTask(task)
+		if proceed, err := c.drainEngineForDrive(ctx, apply, eng, &target); err != nil || !proceed {
 			return err
 		}
 
@@ -794,19 +797,48 @@ func replanCoversShards(replanDDL map[shardTableKey][]string, namespace string) 
 // for longer than it holds the apply. It reports whether the drive may go on;
 // a drive cancelled while it waited, or as the wait ended, hands the apply
 // back without verifying or starting anything.
-func (c *LocalClient) drainEngineForDrive(ctx context.Context, apply *storage.Apply, eng engine.Engine) (bool, error) {
-	if drainer, ok := eng.(engine.Drainer); ok {
-		if err := drainer.DrainContext(ctx); err != nil {
-			if c.driveCancelled(ctx, apply, "while waiting for in-process engine work to exit") {
-				return false, nil
-			}
-			return false, fmt.Errorf("wait for in-process engine work before driving apply %s: %w", apply.ApplyIdentifier, err)
+//
+// target names the table the drive is about to start work on, or is nil when
+// the drive covers the whole apply. An engine that runs each table's work on
+// its own waits only for that table's work, so other schema changes keep
+// running; any other engine waits for all of its work.
+func (c *LocalClient) drainEngineForDrive(ctx context.Context, apply *storage.Apply, eng engine.Engine, target *engine.DrainTarget) (bool, error) {
+	if err := drainEngineWork(ctx, eng, target); err != nil {
+		if c.driveCancelled(ctx, apply, "while waiting for in-process engine work to exit") {
+			return false, nil
 		}
+		return false, fmt.Errorf("wait for in-process engine work before driving apply %s: %w", apply.ApplyIdentifier, err)
 	}
 	if c.driveCancelled(ctx, apply, "as in-process engine work exited") {
 		return false, nil
 	}
 	return true, nil
+}
+
+// drainTargetForTask names the table a task changes.
+func drainTargetForTask(task *storage.Task) engine.DrainTarget {
+	return engine.DrainTarget{Namespace: task.Namespace, Shard: task.Shard, Table: task.TableName}
+}
+
+// drainEngineWork waits for the engine's in-flight work that could race a
+// drive on target: only that table's work when the engine drains tables
+// independently and the drive names one, otherwise all of it. An engine with
+// no background work to drain has nothing to wait for.
+func drainEngineWork(ctx context.Context, eng engine.Engine, target *engine.DrainTarget) error {
+	if targetDrainer, ok := eng.(engine.TargetDrainer); ok && target != nil {
+		if err := targetDrainer.DrainTargetContext(ctx, *target); err != nil {
+			return fmt.Errorf("drain engine work on table %s.%s shard %q: %w", target.Namespace, target.Table, target.Shard, err)
+		}
+		return nil
+	}
+	drainer, ok := eng.(engine.Drainer)
+	if !ok {
+		return nil
+	}
+	if err := drainer.DrainContext(ctx); err != nil {
+		return fmt.Errorf("drain engine work: %w", err)
+	}
+	return nil
 }
 
 // replanResult holds the result of replanAndFilterTasks.
@@ -1390,7 +1422,7 @@ func (c *LocalClient) launchAtomicResume(ctx context.Context, apply *storage.App
 		return fmt.Errorf("resolve credentials for grouped resume apply %s: %w", apply.ApplyIdentifier, err)
 	}
 
-	if proceed, err := c.drainEngineForDrive(ctx, apply, eng); err != nil || !proceed {
+	if proceed, err := c.drainEngineForDrive(ctx, apply, eng, nil); err != nil || !proceed {
 		return err
 	}
 
