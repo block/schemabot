@@ -78,6 +78,34 @@ func TestReportQueuedStartWithdrawnTellsThePR(t *testing.T) {
 	})}, posted(), "one comment, with no stopper named for a caller that is not a GitHub user")
 }
 
+// A caller supplied by an API client is not trusted to be a well-formed
+// GitHub caller. One whose username carries markdown is posted without
+// attribution, so the stop cannot write its own heading into the PR comment.
+func TestReportQueuedStartWithdrawnOmitsAMalformedStopper(t *testing.T) {
+	h, posted := startWithdrawnHandler(t)
+
+	h.reportQueuedStartWithdrawn(startWithdrawnApply(), "github:alice\n\n## Forged status\ntext@other/repo#1")
+
+	comments := posted()
+	require.Len(t, comments, 1)
+	assert.Equal(t, templates.RenderStartWithdrawn(templates.StartWithdrawnData{
+		ApplyID:     "apply-a1b2c3d4e5f67890",
+		Environment: "production",
+	}), comments[0])
+	assert.NotContains(t, comments[0], "Forged status")
+}
+
+// A stop from a GitHub user on another PR names them.
+func TestReportQueuedStartWithdrawnNamesAGitHubStopper(t *testing.T) {
+	h, posted := startWithdrawnHandler(t)
+
+	h.reportQueuedStartWithdrawn(startWithdrawnApply(), formatGitHubCaller("alice", "octocat/other", 3))
+
+	comments := posted()
+	require.Len(t, comments, 1)
+	assert.Contains(t, comments[0], "**Stopped by**: @alice\n")
+}
+
 // A stop sent as a command on the same PR already gets a reply saying it
 // withdrew the start, so the PR is not told a second time.
 func TestReportQueuedStartWithdrawnSkipsAStopCommandOnThePR(t *testing.T) {
