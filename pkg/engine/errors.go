@@ -72,8 +72,8 @@ func IsNotReady(err error) bool {
 
 // OutcomeUnknownError wraps an error to indicate the engine asked its backend
 // to start work and cannot tell whether the backend started it: the request
-// failed in a way that does not prove a refusal, and the engine could not read
-// the work's state to settle the question. The work may be running, so the
+// failed in a way that does not prove a refusal, and reading the work's state
+// did not settle the question. The work may be running, so the
 // schema change is not failed. The engine has recorded resume state naming the
 // work, and a recovery attempt re-observes that same work instead of starting
 // it again, so callers must pause the apply for recovery rather than record a
