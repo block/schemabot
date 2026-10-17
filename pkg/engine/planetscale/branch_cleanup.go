@@ -81,20 +81,27 @@ func deleteBranch(ctx context.Context, client psclient.PSClient, org, database, 
 // apply's failure path open.
 const deployRequestCloseTimeout = 30 * time.Second
 
+// reconcileDeployOfFailedApply names what an operator does when a failed
+// apply's deploy request reports a deploy: the target may be taking the change
+// while the apply reads failed.
+const reconcileDeployOfFailedApply = "reconcile the target: in PlanetScale, let the deploy request's deploy finish or cancel it there, then re-plan so the next plan starts from the schema on main"
+
 // deployRequestNeverDeployed reports whether a deploy request is provably one
-// whose deploy never began: it carries no deploy timestamp, and its deployment
-// state precedes a deploy (pending, ready) or records that PlanetScale refused
-// the deploy request before any deploy (error).
+// whose deploy never began, so the cleanup of a failed apply may close it. It
+// is the cancel path's classifier (deployRequestReportsDeploy) with one
+// explicit extra: an error deployment state with no deploy timestamp, which
+// records that PlanetScale refused the deploy request before any deploy. The
+// cancel path keeps that state out of its undeployed set because a cancel
+// answered there must surface the failed outcome rather than report a
+// successful cancel. Here the apply is already failing, so closing the deploy
+// request hides no outcome; it only stops a refused deploy request staying
+// open. Any state the classifier does not know, including one PlanetScale adds
+// later, still reads as a possible deploy and is never closed.
 func deployRequestNeverDeployed(dr *ps.DeployRequest) bool {
-	if dr.DeployedAt != nil {
-		return false
+	if dr.DeploymentState == deployState.Error {
+		return dr.DeployedAt == nil
 	}
-	switch dr.DeploymentState {
-	case deployState.Pending, deployState.Ready, deployState.Error:
-		return true
-	default:
-		return false
-	}
+	return !deployRequestReportsDeploy(dr)
 }
 
 // retireDeployRequestOfFailedApply closes the deploy request a failed apply
@@ -115,23 +122,21 @@ func deployRequestNeverDeployed(dr *ps.DeployRequest) bool {
 //
 // ctx is the drive's context. Until the drive returns, the apply is not settled
 // failed, and a drive whose context ends is handed back for a successor to
-// resume against this deploy request and branch, so the cleanup stops issuing
-// requests as soon as ctx ends.
+// resume against this deploy request and branch, so the cleanup issues nothing
+// once ctx ends. A response that arrives as ctx ends is not acted on: ctx is
+// checked after the read and after the close, the only requests whose answer
+// decides a further request. The branch delete follows one of those checks
+// with no request in between, and it is sent under ctx itself, so a drive
+// that ended by then abandons it rather than sending it.
 func (e *Engine) retireDeployRequestOfFailedApply(ctx context.Context, logger *slog.Logger, client psclient.PSClient, org, database string, number uint64, ownedBranch string, cause error) {
 	attrs := []any{"organization", org, "planetscale_database", database, "deploy_request", number, "branch", ownedBranch, "apply_error", cause}
-	driveEnded := func(during string) bool {
-		if ctx.Err() == nil {
-			return false
-		}
-		logger.Warn("drive ended "+during+"; stopping the cleanup of a failed apply's deploy request and leaving the deploy request and branch to the driver that takes over the apply",
-			append(attrs, "error", ctx.Err())...)
-		return true
-	}
 	closeCtx, cancel := context.WithTimeout(ctx, deployRequestCloseTimeout)
 	defer cancel()
 
 	dr, err := e.getDeployRequest(closeCtx, client, org, database, number)
-	if driveEnded("while reading the deploy request") {
+	if ctx.Err() != nil {
+		logger.Warn("drive ended while reading the deploy request; stopping the cleanup of a failed apply's deploy request and leaving the deploy request and branch to the driver that takes over the apply",
+			append(attrs, "error", ctx.Err())...)
 		return
 	}
 	if err != nil {
@@ -140,7 +145,7 @@ func (e *Engine) retireDeployRequestOfFailedApply(ctx context.Context, logger *s
 		return
 	}
 	if !deployRequestNeverDeployed(dr) {
-		logger.Warn("the deploy request of a failed apply reports a deploy may have begun; leaving it and its branch in place",
+		logger.Error("the deploy request of a failed apply reports a deploy may have begun; the apply is being failed over a deploy that may now be running, so the deploy request and its branch are left in place; "+reconcileDeployOfFailedApply,
 			append(attrs, "deployment_state", dr.DeploymentState, "deployed_at", formatDeployedAt(dr.DeployedAt))...)
 		return
 	}
@@ -172,7 +177,7 @@ func (e *Engine) retireDeployRequestOfFailedApply(ctx context.Context, logger *s
 			return
 		}
 		if !deployRequestNeverDeployed(closed) {
-			logger.Error("closing the deploy request of a failed apply reported a deploy; leaving its branch in place",
+			logger.Error("closing the deploy request of a failed apply reported a deploy began after the cleanup read it; the apply is being failed over a deploy that may now be running, so its branch is left in place; "+reconcileDeployOfFailedApply,
 				append(attrs, "deployment_state", closed.DeploymentState, "deployed_at", formatDeployedAt(closed.DeployedAt))...)
 			return
 		}
@@ -181,9 +186,6 @@ func (e *Engine) retireDeployRequestOfFailedApply(ctx context.Context, logger *s
 	}
 	if ownedBranch == "" {
 		logger.Info("the failed apply ran on an operator-supplied branch; keeping it for the operator", attrs...)
-		return
-	}
-	if driveEnded("before deleting the branch") {
 		return
 	}
 	alreadyGone, err := deleteBranch(ctx, client, org, database, ownedBranch)

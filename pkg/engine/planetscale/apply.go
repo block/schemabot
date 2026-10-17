@@ -211,6 +211,17 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (result *e
 	// handed back like any other, so the cleanup runs under the drive's context
 	// and stops at the first sign of it ending rather than closing or deleting
 	// what a successor resumes against.
+	//
+	// A drive whose context ends after the close has landed but before the
+	// failure is recorded hands the apply back with stored state naming a
+	// deploy request that is now closed and never deployed. A successor that
+	// reads it as ready reattaches to it as closed before deploying, and
+	// Progress settles the apply as cancelled, not as the failure that caused
+	// the close; one that reads it as refused (error) starts fresh, as every
+	// resume does for a refused deploy request. The closed deploy request
+	// deployed nothing, so the target is safe either way; only the verdict
+	// differs from the failure that caused the close.
+	//
 	// createdDeployRequest names the deploy request; deployRequestBranch is the
 	// branch it took over from ownedBranch, empty for an operator-supplied one.
 	var createdDeployRequest uint64
@@ -1007,17 +1018,35 @@ func (e *Engine) resumeApply(ctx context.Context, client psclient.PSClient, org 
 	// (auto_delete_branch) and the reclaim is disarmed. A create response lost
 	// to a timeout leaves the reclaim armed; deleting the branch is still safe
 	// there, for the reasons the fresh drive's cleanup in Apply gives.
-	handedToDeployRequest := false
+	//
+	// A resume that creates the deploy request and then fails before its
+	// deploy begins leaves it open and deployable exactly as a fresh drive
+	// would, so it retires the deploy request under the same rules as the
+	// fresh drive's cleanup in Apply: only after a failure, never after the
+	// drive's context ended, only while the deploy request reads as never
+	// deployed, and never deleting an operator-supplied branch. Only a deploy
+	// request this resume created is retired; one recovered from stored state
+	// is reattached by resumeExistingDeployRequest, which returns before this
+	// point.
+	var createdDeployRequest uint64
 	defer func() {
 		if retErr == nil {
 			return
 		}
-		if handedToDeployRequest {
-			e.applyLogger(req).Info("resumed apply failed after its deploy request was created; the deploy request owns the branch's teardown",
-				"organization", org, "planetscale_database", req.Database, "branch", meta.BranchName, "apply_error", retErr)
+		if createdDeployRequest == 0 {
+			e.reclaimBranchAfterFailedResume(ctx, client, org, req, meta.BranchName, retErr)
 			return
 		}
-		e.reclaimBranchAfterFailedResume(ctx, client, org, req, meta.BranchName, retErr)
+		if ctx.Err() != nil {
+			e.applyLogger(req).Info("resumed drive ended after its deploy request was created; leaving the deploy request to the driver or control operation that takes over the apply",
+				"organization", org, "planetscale_database", req.Database, "deploy_request", createdDeployRequest, "branch", meta.BranchName, "apply_error", retErr)
+			return
+		}
+		ownedBranch := ""
+		if deployRequestDeletesBranch(req.Options) {
+			ownedBranch = meta.BranchName
+		}
+		e.retireDeployRequestOfFailedApply(ctx, e.applyLogger(req), client, org, req.Database, createdDeployRequest, ownedBranch, retErr)
 	}()
 
 	resumePwCtx, resumePwCancel := context.WithTimeout(ctx, 10*time.Second)
@@ -1090,7 +1119,7 @@ func (e *Engine) resumeApply(ctx context.Context, client psclient.PSClient, org 
 	if err != nil {
 		return nil, fmt.Errorf("create deploy request on resume: %w", err)
 	}
-	handedToDeployRequest = true
+	createdDeployRequest = dr.Number
 	dr, err = e.waitForDeployRequestPending(ctx, client, org, req.Database, dr, emitEvent)
 	if err != nil {
 		return nil, fmt.Errorf("wait for deploy request on resume: %w", err)
