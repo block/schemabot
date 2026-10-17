@@ -577,14 +577,24 @@ func (c *LocalClient) requestStop(ctx context.Context, req *ternv1.StopRequest, 
 		return nil, fmt.Errorf("control request store is not available")
 	}
 	requestedBy := controlRequestRequester(caller)
-	_, alreadyPending, err := controlStore.RequestPending(ctx, &storage.ApplyControlRequest{
+	supersedesStart, err := StopSupersedesPendingStart(ctx, c.storage, c.logger, apply, requestedBy)
+	if err != nil {
+		return nil, err
+	}
+	stopReq := &storage.ApplyControlRequest{
 		ApplyID:     apply.ID,
 		Operation:   storage.ControlOperationStop,
 		Status:      storage.ControlRequestPending,
 		RequestedBy: requestedBy,
-	})
+	}
+	var alreadyPending bool
+	if supersedesStart {
+		_, alreadyPending, err = controlStore.RequestPendingSuperseding(ctx, stopReq, storage.ControlOperationStart)
+	} else {
+		_, alreadyPending, err = controlStore.RequestPending(ctx, stopReq)
+	}
 	if err != nil {
-		return nil, fmt.Errorf("record stop control request for apply %s: %w", apply.ApplyIdentifier, err)
+		return nil, fmt.Errorf("record stop control request for apply %s (superseding pending start: %t): %w", apply.ApplyIdentifier, supersedesStart, err)
 	}
 	if alreadyPending {
 		c.logger.Info("stop request already pending for apply owner",
