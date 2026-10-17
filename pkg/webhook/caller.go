@@ -12,6 +12,13 @@ func formatGitHubCaller(user, repo string, pr int) string {
 	return fmt.Sprintf("github:%s@%s#%d", user, repo, pr)
 }
 
+// callerIsPRCommand reports whether caller is a command posted on the given
+// PR, as formatGitHubCaller records it.
+func callerIsPRCommand(caller, repo string, pr int) bool {
+	actor := actorFromCaller(caller)
+	return actor != "" && caller == formatGitHubCaller(actor, repo, pr)
+}
+
 // actorFromCaller extracts the GitHub username from a Caller produced by
 // formatGitHubCaller. It returns "" for any other shape, so display code falls
 // back to a non-attributed line rather than rendering the raw structured caller.

@@ -1485,6 +1485,11 @@ func (s *Service) stopQueuedStart(ctx context.Context, apply *storage.Apply, cal
 	switch outcome {
 	case storage.QueuedStartWithdrawn:
 		s.logger.Info("stop withdrew the queued start of a stopped apply; the apply stays stopped", attrs...)
+		if s.OnQueuedStartWithdrawn != nil {
+			s.OnQueuedStartWithdrawn(apply, caller)
+		} else {
+			s.logger.Debug("no PR is told the queued start was withdrawn: no GitHub surface is registered on this server", attrs...)
+		}
 		return &ternv1.StopResponse{Accepted: true, StoppedCount: stoppedCount, SkippedCount: skippedCount}, apitypes.ControlStatusStartWithdrawn, nil, nil
 	case storage.QueuedStartStopPending:
 		s.logger.Info("stop withdrew the queued start of a stopped apply and is pending for the drive that already claimed an operation", attrs...)

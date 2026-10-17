@@ -37,10 +37,15 @@ func TestStopWithdrawsAQueuedStart(t *testing.T) {
 	stor := mysqlstore.New(db)
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
 	svc := New(stor, &ServerConfig{}, nil, logger)
+	var withdrawnCallers []string
+	svc.OnQueuedStartWithdrawn = func(apply *storage.Apply, caller string) {
+		withdrawnCallers = append(withdrawnCallers, apply.ApplyIdentifier+" "+caller)
+	}
 
 	seedStoppedRollout := func(t *testing.T, identifier string, perOpState map[string]string) int64 {
 		t.Helper()
 		resetMatrixTables(t, ctx, db)
+		withdrawnCallers = nil
 		seed := seedGroupedApply(t, ctx, stor, multiOpSeed{
 			applyIdentifier: identifier,
 			parentState:     state.Apply.Stopped,
@@ -85,6 +90,7 @@ func TestStopWithdrawsAQueuedStart(t *testing.T) {
 		requireStatus(t, applyID, storage.ControlOperationStart, storage.ControlRequestCompleted)
 		requireStatus(t, applyID, storage.ControlOperationStop, storage.ControlRequestCompleted)
 		assert.Equal(t, state.Apply.Stopped, getApply(t, ctx, stor, applyID).State, "the rollout stays stopped")
+		assert.Equal(t, []string{"stop-withdraws-queued-start cli:bob"}, withdrawnCallers, "the PR is told once, with the stop's caller")
 	})
 
 	t.Run("LeavesTheStopToAClaimedOperation", func(t *testing.T) {
@@ -98,6 +104,7 @@ func TestStopWithdrawsAQueuedStart(t *testing.T) {
 
 		requireStatus(t, applyID, storage.ControlOperationStart, storage.ControlRequestCompleted)
 		requireStatus(t, applyID, storage.ControlOperationStop, storage.ControlRequestPending)
+		assert.Empty(t, withdrawnCallers, "the resumed drive updates the PR when the stop lands")
 	})
 
 	// A driver claims an operation for the queued start, and the stop withdraws
@@ -165,6 +172,7 @@ func TestStopWithdrawsAQueuedStart(t *testing.T) {
 
 	t.Run("StopsTheRolloutAClaimResumedSinceTheRead", func(t *testing.T) {
 		resetMatrixTables(t, ctx, db)
+		withdrawnCallers = nil
 		seed := seedGroupedApply(t, ctx, stor, multiOpSeed{
 			applyIdentifier: "stop-after-rollout-resumed",
 			parentState:     state.Apply.Running,
@@ -187,6 +195,7 @@ func TestStopWithdrawsAQueuedStart(t *testing.T) {
 		assert.True(t, resp.Accepted)
 		assert.Empty(t, resp.Status)
 		requireStatus(t, applyID, storage.ControlOperationStop, storage.ControlRequestPending)
+		assert.Empty(t, withdrawnCallers)
 	})
 
 	t.Run("RefusesWithNoStartQueued", func(t *testing.T) {
@@ -200,5 +209,6 @@ func TestStopWithdrawsAQueuedStart(t *testing.T) {
 		row, err := stor.ControlRequests().GetByOperation(ctx, applyID, storage.ControlOperationStop)
 		require.NoError(t, err)
 		assert.Nil(t, row, "a refused stop records nothing")
+		assert.Empty(t, withdrawnCallers)
 	})
 }
