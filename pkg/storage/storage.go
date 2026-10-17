@@ -1799,6 +1799,15 @@ type ControlRequestStore interface {
 	// tern.ApplyDrivesUnderOperationLease).
 	StopQueuedStart(ctx context.Context, stop *ApplyControlRequest, operationLease bool) (*ApplyControlRequest, QueuedStartStop, error)
 
+	// UpdateMetadata rewrites the metadata of the apply's request for operation
+	// under a row lock, so callers that read, change, and write it serialize.
+	// update receives the locked request and returns the metadata to store, or
+	// nil to leave the row as it is. found is false when the apply has no
+	// request for operation. update runs again when a lock conflict retries the
+	// write, so it must decide from the request it is given. The request's
+	// status and timestamps are left as they are.
+	UpdateMetadata(ctx context.Context, applyID int64, operation ControlOperation, update func(*ApplyControlRequest) ([]byte, error)) (found bool, err error)
+
 	// GetPending returns the pending request for an apply operation.
 	GetPending(ctx context.Context, applyID int64, operation ControlOperation) (*ApplyControlRequest, error)
 

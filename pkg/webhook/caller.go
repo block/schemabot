@@ -6,9 +6,11 @@ import (
 	"strings"
 )
 
-// githubLogin matches the shape of a GitHub login: letters, digits, and
-// hyphens, at most 39 characters, with the "[bot]" suffix app accounts carry.
-var githubLogin = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9-]{0,38}(\[bot\])?$`)
+// githubLogin matches the shape of a GitHub login: letters, digits, hyphens,
+// and the underscore that joins an Enterprise Managed User's handle to its
+// enterprise shortcode, at most 39 characters, with the "[bot]" suffix app
+// accounts carry.
+var githubLogin = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]{0,38}(\[bot\])?$`)
 
 // formatGitHubCaller builds the Caller string stored on applies and control
 // requests for a PR command: "github:<user>@<repo>#<pr>". actorFromCaller is its
