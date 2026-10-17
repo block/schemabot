@@ -1553,8 +1553,15 @@ func (w *taskStallWatchdog) observe(now time.Time, snap taskProgressSnapshot) (s
 
 // shouldRetryEngineError decides whether an engine error pauses the apply as
 // failed_retryable for operator recovery instead of failing it permanently.
+// An unknown outcome pauses on every database type: the engine could not tell
+// whether its backend started the work, and recovery re-observes the work its
+// resume state names instead of dispatching it again, so failing the apply
+// would leave work that may be running with nothing tracking it.
 func (c *LocalClient) shouldRetryEngineError(err error) bool {
-	return recoveryResumesFromCheckpoint(c.config.Type) && engine.IsRetryable(err)
+	if !engine.IsRetryable(err) {
+		return false
+	}
+	return recoveryResumesFromCheckpoint(c.config.Type) || engine.IsOutcomeUnknown(err)
 }
 
 // shouldRetryAcceptedWorkError decides whether an error observing or driving
