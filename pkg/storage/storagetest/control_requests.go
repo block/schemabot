@@ -278,6 +278,52 @@ func TestControlRequests(t *testing.T, h Harness) {
 	// row — exactly one caller creates it, every other caller observes the
 	// same row as already pending — so retries and double-clicks do not
 	// create extra work.
+	// UpdateMetadata verifies a metadata rewrite lands on the request without
+	// touching its status or timestamps, that an update returning nil writes
+	// nothing, and that an apply with no such request reports it as not found.
+	t.Run("UpdateMetadata", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		controls := store.ControlRequests()
+
+		applyID := createControlRequestApply(t, store, "control_metadata_db", "apply_control_metadata")
+		start, _, err := controls.RequestPending(ctx, &storage.ApplyControlRequest{
+			ApplyID: applyID, Operation: storage.ControlOperationStart, Status: storage.ControlRequestPending,
+			RequestedBy: "operator", Metadata: []byte(`{"started_count":1}`),
+		})
+		require.NoError(t, err)
+
+		found, err := controls.UpdateMetadata(ctx, applyID, storage.ControlOperationStart, func(req *storage.ApplyControlRequest) ([]byte, error) {
+			assert.JSONEq(t, `{"started_count":1}`, string(req.Metadata))
+			return []byte(`{"started_count":1,"note":"seen"}`), nil
+		})
+		require.NoError(t, err)
+		assert.True(t, found)
+		updated, err := controls.GetByOperation(ctx, applyID, storage.ControlOperationStart)
+		require.NoError(t, err)
+		require.NotNil(t, updated)
+		assert.JSONEq(t, `{"started_count":1,"note":"seen"}`, string(updated.Metadata))
+		assert.Equal(t, storage.ControlRequestPending, updated.Status)
+		assert.WithinDuration(t, start.UpdatedAt, updated.UpdatedAt, 0, "a metadata rewrite is not a change to the request")
+
+		found, err = controls.UpdateMetadata(ctx, applyID, storage.ControlOperationStart, func(*storage.ApplyControlRequest) ([]byte, error) {
+			return nil, nil
+		})
+		require.NoError(t, err)
+		assert.True(t, found)
+		unchanged, err := controls.GetByOperation(ctx, applyID, storage.ControlOperationStart)
+		require.NoError(t, err)
+		require.NotNil(t, unchanged)
+		assert.JSONEq(t, `{"started_count":1,"note":"seen"}`, string(unchanged.Metadata))
+
+		found, err = controls.UpdateMetadata(ctx, applyID, storage.ControlOperationStop, func(*storage.ApplyControlRequest) ([]byte, error) {
+			t.Error("update ran for a request that does not exist")
+			return nil, nil
+		})
+		require.NoError(t, err)
+		assert.False(t, found)
+	})
+
 	t.Run("RequestPending_ConcurrentFirstRequests", func(t *testing.T) {
 		ctx := t.Context()
 		store := h.NewStorage(t)

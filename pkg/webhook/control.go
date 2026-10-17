@@ -7,7 +7,6 @@ import (
 
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/apitypes"
-	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/webhook/action"
 	"github.com/block/schemabot/pkg/webhook/templates"
@@ -325,51 +324,66 @@ func (h *Handler) handleStartCommand(repo string, pr int, installationID int64, 
 		StartedCount: resp.StartedCount,
 		SkippedCount: resp.SkippedCount,
 	}))
-	h.reportStartWithdrawnBeforeAcknowledged(ctx, repo, pr, installationID, result.ApplyID, result.Environment)
+	h.recordStartAcknowledged(ctx, repo, pr, installationID, result.ApplyID, result.Environment, formatGitHubCaller(requestedBy, repo, pr))
 }
 
-// reportStartWithdrawnBeforeAcknowledged re-reads a start once its
-// acknowledgement has landed on the PR. A stop from outside the PR can withdraw
-// the start while that acknowledgement is still being posted, and the
-// withdrawal notice it triggers can land first, leaving the PR on an
-// acknowledgement that promises a resume while the apply stays stopped. If the
-// start is no longer pending and the apply never left stopped, the start was
-// withdrawn, so the notice is posted again after the acknowledgement. A stop
-// that lands after this read posts its own notice, which lands after the
-// acknowledgement as well.
-func (h *Handler) reportStartWithdrawnBeforeAcknowledged(ctx context.Context, repo string, pr int, installationID int64, applyID, environment string) {
+// recordStartAcknowledged records on the start request that its
+// acknowledgement has landed on the PR, and posts the withdrawal notice if a
+// stop from outside the PR withdrew the start first. That stop holds its notice
+// back until the acknowledgement is recorded, so the PR ends on the withdrawal
+// rather than on an acknowledgement promising a resume. Both sides decide under
+// the start request's row lock, so the notice is posted once, by whichever
+// side finds both facts recorded.
+func (h *Handler) recordStartAcknowledged(ctx context.Context, repo string, pr int, installationID int64, applyID, environment, caller string) {
 	attrs := []any{"repo", repo, "pr", pr, "apply_id", applyID, "environment", environment}
 	stor := h.service.Storage()
 	apply, err := stor.Applies().GetByApplyIdentifier(ctx, applyID)
 	if err != nil {
-		h.logger.Warn("failed to re-read apply after acknowledging its start; the PR is not told if a stop withdrew the start before the acknowledgement landed",
+		h.logger.Warn("failed to load apply to record its start acknowledgement; a stop that withdrew the start before the acknowledgement landed is not reported on the PR",
 			append(attrs, "error", err)...)
 		return
 	}
 	if apply == nil {
-		h.logger.Warn("apply not found when re-read after acknowledging its start; the PR is not told if a stop withdrew the start before the acknowledgement landed", attrs...)
+		h.logger.Warn("apply not found when recording its start acknowledgement; a stop that withdrew the start before the acknowledgement landed is not reported on the PR", attrs...)
 		return
 	}
-	if !state.IsState(apply.State, state.Apply.Stopped) {
-		h.logger.Debug("start acknowledged; the apply has left stopped, so the start took effect", append(attrs, "state", apply.State)...)
-		return
-	}
-	start, err := stor.ControlRequests().GetByOperation(ctx, apply.ID, storage.ControlOperationStart)
-	if err != nil {
-		h.logger.Warn("failed to re-read start request after acknowledging it; the PR is not told if a stop withdrew the start before the acknowledgement landed",
+	update, err := updateStartNotice(ctx, stor.ControlRequests(), apply.ID, func(start *storage.ApplyControlRequest, notice *startNotice) bool {
+		if start.RequestedBy != caller {
+			return false
+		}
+		notice.Acknowledged = true
+		return true
+	})
+	switch {
+	case err != nil:
+		h.logger.Warn("failed to record start acknowledgement; a stop that withdrew the start before the acknowledgement landed is not reported on the PR",
 			append(attrs, "error", err)...)
-		return
+	case !update.found:
+		h.logger.Warn("start request not found when recording its acknowledgement; a stop that withdrew the start before the acknowledgement landed is not reported on the PR", attrs...)
+	case !update.applied:
+		h.logger.Info("start request was re-armed by a start from another caller before its acknowledgement was recorded; that start's own acknowledgement owns the PR notice", attrs...)
+	case update.claimed:
+		h.postStartWithdrawnAfterAcknowledgement(ctx, repo, pr, installationID, apply, attrs)
+	case update.notice.Notified:
+		h.logger.Debug("start acknowledged; the withdrawal notice was already posted", attrs...)
+	default:
+		h.logger.Debug("start acknowledged; no stop has withdrawn it, and a stop that does posts its own notice", attrs...)
 	}
-	if start == nil || start.Status != storage.ControlRequestCompleted {
-		h.logger.Debug("start acknowledged; the start is still queued for a driver", attrs...)
-		return
-	}
+}
+
+// postStartWithdrawnAfterAcknowledgement posts the withdrawal notice a stop
+// held back until the start's acknowledgement landed, naming the stopper when
+// the stop request records a GitHub user.
+func (h *Handler) postStartWithdrawnAfterAcknowledgement(ctx context.Context, repo string, pr int, installationID int64, apply *storage.Apply, attrs []any) {
 	stoppedBy := ""
-	stop, err := stor.ControlRequests().GetByOperation(ctx, apply.ID, storage.ControlOperationStop)
-	if err != nil {
+	stop, err := h.service.Storage().ControlRequests().GetByOperation(ctx, apply.ID, storage.ControlOperationStop)
+	switch {
+	case err != nil:
 		h.logger.Warn("failed to read the stop that withdrew an acknowledged start; telling the PR without naming who stopped it",
 			append(attrs, "error", err)...)
-	} else if stop != nil {
+	case stop == nil:
+		h.logger.Warn("no stop request found for a withdrawn start; telling the PR without naming who stopped it", attrs...)
+	default:
 		stoppedBy = actorFromCaller(stop.RequestedBy)
 	}
 	h.logger.Info("start was withdrawn by a stop before its acknowledgement landed; telling the PR after the acknowledgement", attrs...)
@@ -493,8 +507,10 @@ func (h *Handler) handleRevertCommand(repo string, pr int, installationID int64,
 // queued behind it. The apply never left stopped, so no drive runs to update
 // the PR, which would otherwise end on the start's acknowledgement promising a
 // resume. A stop that was itself a command on this PR is skipped: its reply
-// already reports the withdrawal. The post runs off the caller's goroutine,
-// since the stop's response waits on this.
+// already reports the withdrawal. When the start was a command on this PR whose
+// acknowledgement has not landed yet, the notice is left to the start command,
+// which posts it after the acknowledgement (see recordStartAcknowledged). The
+// work runs off the caller's goroutine, since the stop's response waits on this.
 func (h *Handler) reportQueuedStartWithdrawn(apply *storage.Apply, caller string) {
 	if apply.Repository == "" || apply.PullRequest == 0 || apply.InstallationID == 0 {
 		h.logger.Debug("queued start withdrawn; no PR to tell: apply has no GitHub destination",
@@ -511,17 +527,40 @@ func (h *Handler) reportQueuedStartWithdrawn(apply *storage.Apply, caller string
 		return
 	}
 	repo, pr, installationID := apply.Repository, apply.PullRequest, apply.InstallationID
+	attrs := []any{"apply_id", apply.ApplyIdentifier, "repo", repo, "pr", pr, "environment", apply.Environment}
 	body := templates.RenderStartWithdrawn(templates.StartWithdrawnData{
 		ApplyID:     apply.ApplyIdentifier,
 		Environment: apply.Environment,
 		StoppedBy:   actorFromCaller(caller),
 	})
-	h.logger.Info("queued start withdrawn by a stop from outside the PR; telling the PR",
-		"apply_id", apply.ApplyIdentifier,
-		"repo", repo,
-		"pr", pr,
-		"environment", apply.Environment)
 	h.goSafe(repo, pr, installationID, "", func() {
-		h.postComment(repo, pr, installationID, body)
+		ctx, cancel := h.commandContext(context.Background(), commandTimeout)
+		defer cancel()
+		update, err := updateStartNotice(ctx, h.service.Storage().ControlRequests(), apply.ID, func(start *storage.ApplyControlRequest, notice *startNotice) bool {
+			if start.Status != storage.ControlRequestCompleted {
+				return false
+			}
+			notice.Withdrawn = true
+			if !callerIsPRCommand(start.RequestedBy, repo, pr) {
+				notice.Acknowledged = true
+			}
+			return true
+		})
+		switch {
+		case err != nil:
+			h.logger.Warn("failed to record the withdrawal of a queued start; the PR is not told the start was withdrawn",
+				append(attrs, "error", err)...)
+		case !update.found:
+			h.logger.Warn("start request not found when recording its withdrawal; the PR is not told the start was withdrawn", attrs...)
+		case !update.applied:
+			h.logger.Info("a later start re-armed the withdrawn start request; that start's acknowledgement updates the PR", attrs...)
+		case update.claimed:
+			h.logger.Info("queued start withdrawn by a stop from outside the PR; telling the PR", attrs...)
+			h.postComment(repo, pr, installationID, body)
+		case !update.notice.Acknowledged:
+			h.logger.Info("queued start withdrawn before its acknowledgement landed on the PR; the start command posts the notice after it", attrs...)
+		default:
+			h.logger.Debug("queued start withdrawn; the withdrawal notice was already posted", attrs...)
+		}
 	})
 }

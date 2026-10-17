@@ -388,10 +388,10 @@ func TestE2EStartCommandRecordsDurableRequest(t *testing.T) {
 
 // TestE2EStartAcknowledgementDelayedPastAWithdrawal: an operator starts a
 // stopped schema change from its PR, and while the start's acknowledgement is
-// still being posted, a stop from the CLI withdraws the start. The withdrawal
-// notice lands first, then the acknowledgement promising a resume. The start
-// command re-reads the start once its acknowledgement has landed and tells the
-// PR again, so the PR ends on the withdrawal, matching the stopped apply.
+// still being posted, a stop from the CLI withdraws the start. The stop holds
+// its withdrawal notice back until the acknowledgement has landed, and the
+// start command then posts it, so the PR reads acknowledgement, then
+// withdrawal, once each, and ends on the withdrawal, matching the stopped apply.
 func TestE2EStartAcknowledgementDelayedPastAWithdrawal(t *testing.T) {
 	ctx := t.Context()
 	schemabotDB, err := sql.Open("block-mysql", e2eSchemabotDSN)
@@ -438,7 +438,6 @@ func TestE2EStartAcknowledgementDelayedPastAWithdrawal(t *testing.T) {
 		defer mu.Unlock()
 		landed = append(landed, body)
 	}
-	notices := make(chan struct{}, 10)
 	mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", func(w http.ResponseWriter, r *http.Request) {
 		var body struct {
 			Body string `json:"body"`
@@ -446,22 +445,24 @@ func TestE2EStartAcknowledgementDelayedPastAWithdrawal(t *testing.T) {
 		assert.NoError(t, json.NewDecoder(r.Body).Decode(&body))
 		if strings.Contains(body.Body, "Start Request Accepted") {
 			// Hold the acknowledgement until a CLI stop has withdrawn the
-			// start and its notice has landed.
+			// start and the withdrawal is recorded on the start request.
 			resp, err := service.ExecuteStop(ctx, apitypes.ControlRequest{ApplyID: applyIdentifier, Environment: "staging", Caller: "cli:bob@laptop.local"})
 			assert.NoError(t, err)
 			if assert.NotNil(t, resp) {
 				assert.Equal(t, apitypes.ControlStatusStartWithdrawn, resp.Status)
 			}
-			select {
-			case <-notices:
-			case <-time.After(webhookIntegrationCheckRunDeadline):
-				t.Error("timed out waiting for the withdrawal notice")
-			}
+			assert.Eventually(t, func() bool {
+				start, err := store.ControlRequests().GetByOperation(ctx, applyID, storage.ControlOperationStart)
+				if err != nil || start == nil {
+					return false
+				}
+				var metadata struct {
+					Notice startNotice `json:"pr_notice"`
+				}
+				return json.Unmarshal(start.Metadata, &metadata) == nil && metadata.Notice.Withdrawn
+			}, webhookIntegrationCheckRunDeadline, 20*time.Millisecond, "the withdrawal is recorded on the start request")
 		}
 		land(body.Body)
-		if strings.Contains(body.Body, "Start Withdrawn") {
-			notices <- struct{}{}
-		}
 		w.WriteHeader(http.StatusCreated)
 		assert.NoError(t, json.NewEncoder(w).Encode(map[string]any{"id": 99}))
 	})
@@ -482,19 +483,18 @@ func TestE2EStartAcknowledgementDelayedPastAWithdrawal(t *testing.T) {
 	require.Eventually(t, func() bool {
 		mu.Lock()
 		defer mu.Unlock()
-		return len(landed) == 3
-	}, webhookIntegrationCheckRunDeadline, 50*time.Millisecond, "the notice, the acknowledgement, and the notice again")
+		return len(landed) == 2
+	}, webhookIntegrationCheckRunDeadline, 50*time.Millisecond, "the acknowledgement and the notice")
 	drainCtx, cancel := context.WithTimeout(ctx, webhookIntegrationCheckRunDeadline)
 	defer cancel()
 	h.DrainInProcessWebhookWork(drainCtx)
 
 	mu.Lock()
 	defer mu.Unlock()
-	require.Len(t, landed, 3)
-	assert.Contains(t, landed[0], "## Start Withdrawn")
-	assert.Contains(t, landed[1], "Start Request Accepted")
-	assert.Contains(t, landed[2], "## Start Withdrawn", "the PR ends on the withdrawal")
-	assert.NotContains(t, landed[2], "Stopped by", "a CLI stopper is not named")
+	require.Len(t, landed, 2, "the notice is posted once")
+	assert.Contains(t, landed[0], "Start Request Accepted")
+	assert.Contains(t, landed[1], "## Start Withdrawn", "the PR ends on the withdrawal")
+	assert.NotContains(t, landed[1], "Stopped by", "a CLI stopper is not named")
 	final, err := store.Applies().GetByApplyIdentifier(ctx, applyIdentifier)
 	require.NoError(t, err)
 	require.NotNil(t, final)
