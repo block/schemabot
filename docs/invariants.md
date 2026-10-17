@@ -928,8 +928,8 @@ check `CutoverBlocker` (`pkg/storage/internal/sqlstore/apply_operations.go`, sha
 projection builds its children, with `RolloutHeldByResumableChild` (`pkg/state/apply.go`), which
 `updateApplyStateFromOperations` consults to keep a held-open rollout's recovery claim quiet, and
 `completeLandedStopForHeldOpenApply` keeping its stop resolved (`pkg/api/operator.go`), and
-`stopSupersedesPendingStart` completing the pending start of an apply driven under the operation lease in the same write that records a stop
-(`pkg/api/control_handlers.go`, through `RequestPendingSuperseding` in
+`StopSupersedesPendingStart` completing the pending start of an apply driven under the operation lease in the same write that records a stop
+(`pkg/tern/control_requests.go`, reached from `pkg/api/control_handlers.go` and `pkg/tern/local_control.go`, through `RequestPendingSuperseding` in
 `pkg/storage/internal/sqlstore/control_requests.go`).
 
 ## Ownership and leases (OW)

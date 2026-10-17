@@ -927,3 +927,108 @@ func controlRequestRequester(caller string) string {
 func callerApplyLogSuffix(caller string) string {
 	return fmt.Sprintf(" (caller: %s)", storage.ApplyLogCaller(caller))
 }
+
+// StopSupersedesPendingStart reports whether a stop recorded on this apply
+// supersedes its pending start, which the stop's own write then completes in
+// the same transaction. An apply driven under the operation lease keeps its
+// start pending until it settles, because the operations the start resumes are
+// claimed one at a time on its behalf, and a pending start on a stopped apply
+// is what reopens it. Left pending under the new stop, that start would resume
+// the apply as soon as the stop landed on every operation, so the stop the
+// operator issued last would lose to the start they issued first (CO-4). An
+// apply driven under the parent lease consumes its start when its drive
+// resumes, so its start is left to that drive. Both clients record stops
+// through this decision, so a rollout's stop holds on the control plane and on
+// the data plane apply its operations share.
+func StopSupersedesPendingStart(ctx context.Context, store storage.Storage, logger *slog.Logger, apply *storage.Apply, caller string) (bool, error) {
+	start, err := pendingControlRequest(ctx, store, apply, storage.ControlOperationStart)
+	if err != nil {
+		return false, fmt.Errorf("load pending start before recording a stop: %w", err)
+	}
+	if start == nil {
+		return false, nil
+	}
+	ops, err := store.ApplyOperations().ListByApply(ctx, apply.ID)
+	if err != nil {
+		return false, fmt.Errorf("list apply_operations for apply %s before recording a stop: %w", apply.ApplyIdentifier, err)
+	}
+	operationLease, err := ApplyDrivesUnderOperationLease(ctx, store, apply, ops)
+	if err != nil {
+		return false, fmt.Errorf("decide drive mode of apply %s before recording a stop: %w", apply.ApplyIdentifier, err)
+	}
+	if !operationLease {
+		logger.InfoContext(ctx, "stop requested while a start is pending on an apply driven under the parent lease; leaving the start to the drive that resumes it",
+			append(apply.LogAttrs(), "requested_by", caller, "start_requested_by", start.RequestedBy, "operation_count", len(ops))...)
+		return false, nil
+	}
+	logger.InfoContext(ctx, "stop requested while a start is pending on an apply driven under the operation lease; the stop write completes the start it supersedes",
+		append(apply.LogAttrs(), "requested_by", caller, "start_requested_by", start.RequestedBy, "operation_count", len(ops))...)
+	return true, nil
+}
+
+// ApplyDriveMode is the lease an apply's operations are driven under, and the
+// reason the operator chose it.
+type ApplyDriveMode int
+
+const (
+	// ApplyDriveUnattached is an apply with no operation attached yet. It has
+	// not been driven, so no drive mode applies.
+	ApplyDriveUnattached ApplyDriveMode = iota
+	// ApplyDriveParentLease is a lone operation with tasks and no sibling
+	// expected. Its drive holds the parent apply's lease and writes the parent.
+	ApplyDriveParentLease
+	// ApplyDriveOperationSet is a rollout of several attached operations.
+	ApplyDriveOperationSet
+	// ApplyDriveAwaitingSiblings is a lone attached operation whose generation
+	// manifest still expects siblings. A parent-lease drive of it would
+	// terminalize the parent while later dispatches are still on their way.
+	ApplyDriveAwaitingSiblings
+	// ApplyDriveTasklessOperation is a lone operation without tasks, such as
+	// plan-level VSchema work, which apply-level claiming cannot pick up.
+	ApplyDriveTasklessOperation
+)
+
+// UnderOperationLease reports whether the apply's operations are driven under
+// the operation lease, with the parent projected from them, rather than under
+// the parent lease.
+func (m ApplyDriveMode) UnderOperationLease() bool {
+	switch m {
+	case ApplyDriveOperationSet, ApplyDriveAwaitingSiblings, ApplyDriveTasklessOperation:
+		return true
+	default:
+		return false
+	}
+}
+
+// DecideApplyDriveMode is the operator's drive-mode decision for an apply and
+// its attached operations. The operator drives a claimed operation by it, and
+// the control paths that must know how the apply is driven read the same
+// decision, so the two cannot disagree.
+func DecideApplyDriveMode(ctx context.Context, store storage.Storage, apply *storage.Apply, ops []*storage.ApplyOperation) (ApplyDriveMode, error) {
+	switch {
+	case len(ops) == 0:
+		return ApplyDriveUnattached, nil
+	case len(ops) > 1:
+		return ApplyDriveOperationSet, nil
+	case len(apply.MissingExpectedOperationKeys(ops)) > 0:
+		return ApplyDriveAwaitingSiblings, nil
+	}
+	tasks, err := store.Tasks().GetByApplyOperationID(ctx, ops[0].ID)
+	if err != nil {
+		return ApplyDriveUnattached, fmt.Errorf("load tasks for apply_operation %d (deployment %q): %w", ops[0].ID, ops[0].Deployment, err)
+	}
+	if len(tasks) == 0 {
+		return ApplyDriveTasklessOperation, nil
+	}
+	return ApplyDriveParentLease, nil
+}
+
+// ApplyDrivesUnderOperationLease reports whether the apply's operations are
+// driven under the operation lease, by the operator's drive-mode decision.
+func ApplyDrivesUnderOperationLease(ctx context.Context, store storage.Storage, apply *storage.Apply, ops []*storage.ApplyOperation) (bool, error) {
+	mode, err := DecideApplyDriveMode(ctx, store, apply, ops)
+	if err != nil {
+		return false, err
+	}
+	return mode.UnderOperationLease(), nil
+}

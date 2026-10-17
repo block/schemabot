@@ -212,6 +212,11 @@ func TestControlRequests(t *testing.T, h Harness) {
 		assert.Equal(t, "operator-b", second.RequestedBy)
 		assert.Nil(t, second.CompletedAt)
 		assert.JSONEq(t, `{"started_count":2}`, string(second.Metadata))
+		// The re-armed row carries a new command. Re-arming within the same
+		// second as the first request leaves the timestamps equal on dialects
+		// that store them to the second, so the revision is what tells the two
+		// commands apart.
+		assert.Equal(t, first.Revision+1, second.Revision, "re-arming advances the revision")
 	})
 
 	// CompletePending verifies the happy-path resolution: a pending request
