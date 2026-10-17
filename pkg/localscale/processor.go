@@ -362,19 +362,32 @@ func (s *Server) processActiveDeployRequests(ctx context.Context) {
 			if r.revertExpiresAtStr.Valid {
 				if expiresAt, err := time.Parse(storedTimestampLayout, r.revertExpiresAtStr.String); err == nil && time.Now().After(expiresAt) {
 					s.logger.Info("revert window expired", "number", r.number)
-					applied, err := s.advanceDeployState(ctx, ref, r.deployState, dr.Complete)
-					if err != nil {
+					if err := s.completeExpiredRevertWindow(ctx, backend, ref, r.deployState, r.branch); err != nil {
 						s.logger.Error("processor: failed to complete expired revert", "number", r.number, "error", err)
-						continue
 					}
-					if !applied {
-						continue
-					}
-					s.dropBranchDatabases(ctx, backend, r.branch)
 				}
 			}
 		}
 	}
+}
+
+// completeExpiredRevertWindow closes a deploy request's expired revert window
+// and drops its branch databases. The databases are dropped only when this
+// call moved the request to complete: a revert recorded after the processor
+// read complete_pending_revert still needs them, so it keeps both its state
+// and its databases.
+func (s *Server) completeExpiredRevertWindow(ctx context.Context, backend *databaseBackend, ref deployRequest, readState, branch string) error {
+	applied, err := s.advanceDeployState(ctx, ref, readState, dr.Complete)
+	if err != nil {
+		return err
+	}
+	if !applied {
+		s.logger.Info("revert window closed by a newer state; keeping the branch databases",
+			"number", ref.number, "branch", branch)
+		return nil
+	}
+	s.dropBranchDatabases(ctx, backend, branch)
+	return nil
 }
 
 // updateDeployState records a deploy request's state unconditionally. Action
