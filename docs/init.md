@@ -162,7 +162,7 @@ PlanetScale hosts ending in `.psdb.cloud`. When pasting a Go MySQL connection st
 The second connection is to the separate MySQL database where SchemaBot stores its plans
 and progress. It uses that MySQL server's credentials.
 
-![Connect a Vitess database, verify its schema, and preview a change](../assets/init-vitess-demo.gif)
+See the [Vitess setup walkthroughs](vitess.md#get-started) for the PlanetScale CLI and manual paths.
 
 ### Configure the PlanetScale service token
 

@@ -4,6 +4,7 @@
 
 ## Table of Contents
 
+- [Get started](#get-started)
 - [Service token permissions](#service-token-permissions)
 - [Branch cleanup](#branch-cleanup)
 - [Reclaiming orphaned branches](#reclaiming-orphaned-branches)
@@ -17,6 +18,30 @@ page covers what PlanetScale must grant SchemaBot for that to work. See
 [Engines](engines.md) for how the Vitess engine compares with the others, and
 [Configuration](configuration.md#planetscale-mtls) for endpoints that require
 mutual TLS.
+
+## Get started
+
+Run `schemabot init` from your application directory, choose **Vitess**, and pick
+how you want to connect.
+
+### With the PlanetScale CLI
+
+Choose **Set up with PlanetScale CLI**. Sign in through your browser, select your
+organization and database, and review the access SchemaBot will create. It saves
+the credentials privately and verifies both the database connection and API access.
+
+![Sign in with pscale, choose a database, approve scoped credentials, and verify access](../assets/init-pscale-demo.gif)
+
+This walkthrough uses fictional provider responses with the actual wizard screens.
+It ends at the setup review, before schema import. See [initialization](init.md#connect-a-planetscale-vitess-database)
+for prerequisites and credential storage details.
+
+### With existing credentials
+
+Choose **Enter credentials manually** to use a database password and service token
+you already have. Then choose where SchemaBot stores its own plans and progress.
+
+![Enter Vitess credentials, verify the baseline, and preview a schema change](../assets/init-vitess-demo.gif)
 
 ## Service token permissions
 

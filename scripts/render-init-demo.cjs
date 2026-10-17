@@ -8,9 +8,9 @@ const {chromium}=require('playwright');
 (async()=>{
  const root=path.resolve(__dirname,'..'),tmp=fs.mkdtempSync(path.join(os.tmpdir(),'init-gif-'));
  const name=process.argv[2]||'init-demo';
- if(!/^init-((sample|vitess)-)?demo$/.test(name))throw new Error('Use init-demo, init-sample-demo, or init-vitess-demo');
+ if(!/^init-((sample|vitess|pscale)-)?demo$/.test(name))throw new Error('Use init-demo, init-sample-demo, init-vitess-demo, or init-pscale-demo');
  const recording=JSON.parse(fs.readFileSync(path.join(root,'assets/src/'+name+'-recording.json')));
- if(!recording.wizard.includes('Baseline plan: no changes.')||!recording.plan.includes('ALTER'))throw new Error('Record a successful real wizard and plan first');
+ if(!recording.setup_scenes&&(!recording.wizard.includes('Baseline plan: no changes.')||!recording.plan.includes('ALTER')))throw new Error('Record a successful real wizard and plan first');
  if(recording.sample&&!recording.wizard_frames.some(f=>f.rows.some(r=>r.map(s=>s.text).join('').includes('What would you like to try?'))))throw new Error('Sample recording must include the initial sample choice');
  const chrome=process.env.CHROME||'/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
  const browser=await chromium.launch({headless:true,...(fs.existsSync(chrome)?{executablePath:chrome}:{})});
@@ -19,7 +19,7 @@ const {chromium}=require('playwright');
   await page.goto(pathToFileURL(path.join(root,'assets/src/init-demo.html')).href);
   await page.evaluate(data=>window.setRecording(data),recording);
   const frames=[],fps=10;let previous;
-  for(let i=0;i<(recording.apply_frames?30:recording.sample?26:42)*fps;i++){
+  for(let i=0;i<(recording.setup_scenes?2+recording.setup_scenes.reduce((n,s)=>n+s.duration,0):recording.apply_frames?30:recording.sample?26:42)*fps;i++){
    await page.evaluate(t=>window.renderFrame(t,.1),i/fps);
    const frame=path.join(tmp,String(i).padStart(4,'0')+'.png');
    const pixels=await page.screenshot();
