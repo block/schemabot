@@ -245,7 +245,10 @@ logged and the drive retries it, and a write that cannot land ends at most this 
 error reading something safety-gating ends this drive attempt and leaves the row claimable for
 another. Repeated errors observing remote progress mark the apply
 `failed_retryable` and never trigger a remote stop, because an observation outage only proves the
-control plane cannot see, not that the change is unhealthy. *Enforced:* failure-class handling in
+control plane cannot see, not that the change is unhealthy. One exception remains: an apply in
+its revert phase fails rather than pauses on those errors. A pause rewrites every non-terminal task
+as `failed_retryable`, and that would erase the revert-phase task states that make a recovery
+reattach to the engine instead of settling the tasks from a schema comparison. *Enforced:* failure-class handling in
 the drive loop (`pkg/api/operator.go`), the pre-start task re-read and the outcome-write gate on
 terminal side effects in the sequential drive (`pkg/tern/local_apply_sequential.go`), the same gate
 in the grouped drive (`pkg/tern/local_apply_grouped.go`), with `outcomeWriteLanded`
@@ -253,7 +256,16 @@ in the grouped drive (`pkg/tern/local_apply_grouped.go`), with `outcomeWriteLand
 that returned an error, the resume's refusal to record a failure over an outcome it already stored
 (the no-remaining-work branches of `resumeApplyWithTasks` and `launchAtomicResume` return a
 `postTerminalReconcileError` that `handleGroupedResumeFailure` passes through,
-`pkg/tern/local_control_resume.go`) and the remote progress error limit (`pkg/tern/grpc_client.go`).
+`pkg/tern/local_control_resume.go`), the progress-poll error budget in the grouped drive and the
+resume's handling of a failed reattach to accepted engine work, whose pause disposition is
+`shouldPauseAcceptedWork` (`pkg/tern/local_apply_sequential.go`), the remote progress error
+limit (`pkg/tern/grpc_client.go`), and the PlanetScale engine's re-read of a deploy request whose
+deploy call failed, which tracks a deploy that started instead of failing it and reports an
+unknown outcome when PlanetScale did not refuse the deploy and the re-read fails or still reads
+ready (`adoptDeployAfterError`, `pkg/engine/planetscale/branch.go`) and whose failed-apply cleanup
+leaves that deploy request open for the recovery (`pkg/engine/planetscale/apply.go`), with the drive
+pausing an unknown outcome for recovery on every engine (`engine.OutcomeUnknownError`,
+`shouldRetryEngineError` in `pkg/tern/local_apply_sequential.go`).
 
 ### AV-5: Panics are contained and permanent
 
@@ -1235,11 +1247,13 @@ drive resolves the request and records that outcome. And only settled outcomes a
 a remote state still in motion. *Enforced:* terminal-truth preflights on the control paths
 (`pkg/tern/local_control.go`, `pkg/tern/grpc_control_resend.go`); the drive's adoption of the
 engine's settled outcome onto the task rows before a pending command is consumed
-(`pkg/tern/local_control_reconcile.go`); the in-process engine's settled outcome checks on stop
-and cancel (`pkg/engine/spirit/control.go`), including a completion its run records after the
-cancel, and its run's deference to a stop or cancel that interrupted it, which no failure the run
-records afterwards replaces (`setSchemaChangeFailed`, `pkg/engine/spirit/execution.go`,
-`pkg/engine/spirit/direct.go`).
+(`pkg/tern/local_control_reconcile.go`); the PlanetScale engine's reading of a deploy request
+still in motion, including an unconfirmed cancel, as running rather than settled
+(`deployStateToEngineState`, `pkg/engine/planetscale/planetscale.go`); the in-process engine's
+settled outcome checks on stop and cancel (`pkg/engine/spirit/control.go`), including a
+completion its run records after the cancel, and its run's deference to a stop or cancel that
+interrupted it, which no failure the run records afterwards replaces (`setSchemaChangeFailed`,
+`pkg/engine/spirit/execution.go`, `pkg/engine/spirit/direct.go`).
 
 ### CO-4: Stop wins
 

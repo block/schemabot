@@ -1553,8 +1553,64 @@ func (w *taskStallWatchdog) observe(now time.Time, snap taskProgressSnapshot) (s
 
 // shouldRetryEngineError decides whether an engine error pauses the apply as
 // failed_retryable for operator recovery instead of failing it permanently.
+// An unknown outcome pauses on every database type: the engine could not tell
+// whether its backend started the work, and recovery re-observes the work its
+// resume state names instead of dispatching it again, so failing the apply
+// would leave work that may be running with nothing tracking it.
 func (c *LocalClient) shouldRetryEngineError(err error) bool {
-	return recoveryResumesFromCheckpoint(c.config.Type) && engine.IsRetryable(err)
+	if !engine.IsRetryable(err) {
+		return false
+	}
+	return recoveryResumesFromCheckpoint(c.config.Type) || engine.IsOutcomeUnknown(err)
+}
+
+// shouldRetryAcceptedWorkError decides whether an error observing or driving
+// work the engine already accepted — a progress poll or an automatic cutover
+// attempt on a running grouped apply — pauses the apply as failed_retryable
+// instead of failing it permanently. Unlike shouldRetryEngineError, which
+// governs the start of engine work, this pause cannot dispatch duplicate work
+// on an engine whose recovery reattaches to the work it accepted, so such an
+// engine pauses here even though its start errors fail the apply.
+func (c *LocalClient) shouldRetryAcceptedWorkError(err error) bool {
+	if !engine.IsRetryable(err) {
+		return false
+	}
+	return recoveryResumesFromCheckpoint(c.config.Type) || recoveryReattachesToAcceptedWork(c.config.Type)
+}
+
+// shouldPauseAcceptedWork decides whether a retryable error observing,
+// driving, or reattaching to work the engine already accepted pauses the apply
+// as failed_retryable. It applies shouldRetryAcceptedWorkError, except while
+// the apply is in its revert phase: the pause rewrites every non-terminal task
+// as failed_retryable, which erases the revert-phase task states that make a
+// recovery reattach to the engine instead of settling the tasks from a schema
+// comparison that, post-cutover, matches the reviewed target until a revert
+// lands. A revert-phase apply is therefore never paused here, so its outcome
+// is never decided by that comparison.
+func (c *LocalClient) shouldPauseAcceptedWork(apply *storage.Apply, tasks []*storage.Task, err error) bool {
+	if revertPhaseInFlight(apply, tasks) {
+		c.logger.Warn("apply is in its revert phase, so it fails instead of pausing for retry: a pause would erase the revert-phase task states recovery reattaches by",
+			append(apply.LogAttrs(), "error", err)...)
+		return false
+	}
+	return c.shouldRetryAcceptedWorkError(err)
+}
+
+// revertPhaseInFlight reports whether the apply or any of its tasks sits in an
+// engine-monitored revert phase.
+func revertPhaseInFlight(apply *storage.Apply, tasks []*storage.Task) bool {
+	return applyInRevertPhase(apply) || firstRevertPhaseTask(tasks, 0) != nil
+}
+
+// recoveryReattachesToAcceptedWork reports whether the database type's engine
+// keeps accepted work running outside SchemaBot and a re-claimed recovery
+// attempt reattaches to it through the persisted engine resume state. Vitess
+// applies are deploy requests on an external provider that keep running
+// whatever the drive concludes, and a grouped resume hands the stored deploy
+// request back to the engine instead of creating a new one. Failing such an
+// apply permanently would only abandon a deploy request that is still live.
+func recoveryReattachesToAcceptedWork(databaseType string) bool {
+	return databaseType == storage.DatabaseTypeVitess
 }
 
 // recoveryResumesFromCheckpoint reports whether the database type's engine can

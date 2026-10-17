@@ -134,7 +134,23 @@ func TestCancel_AlreadyClosedDeployRequest(t *testing.T) {
 	}
 	closedErr := errors.New("The deploy request is closed.")
 
-	for _, cancelledState := range []string{deployState.InProgressCancel, deployState.CompleteCancel, deployState.Cancelled} {
+	t.Run("cancel still in flight stays a retryable error until it settles", func(t *testing.T) {
+		e := newEngine(&cancelDeployRequestClient{
+			cancelErr: closedErr,
+			dr:        &ps.DeployRequest{Number: 121, DeploymentState: deployState.InProgressCancel},
+		})
+
+		result, err := e.Cancel(t.Context(), controlReq())
+
+		require.Error(t, err)
+		assert.Nil(t, result, "a cancel PlanetScale has not confirmed must not read as accepted")
+		assert.True(t, engine.IsRetryable(err), "the drive retries until the deploy request settles cancelled or failed")
+		assert.False(t, engine.IsAlreadyCompleted(err))
+		assert.Contains(t, err.Error(), fmt.Sprintf("cancel deploy request #121 rejected in deployment state %q", deployState.InProgressCancel))
+		assert.Contains(t, err.Error(), "The deploy request is closed.")
+	})
+
+	for _, cancelledState := range []string{deployState.CompleteCancel, deployState.Cancelled} {
 		t.Run("cancelled deploy request in state "+cancelledState+" reads as success", func(t *testing.T) {
 			e := newEngine(&cancelDeployRequestClient{
 				cancelErr: closedErr,

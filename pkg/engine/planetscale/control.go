@@ -201,8 +201,7 @@ type cancelRejectionClass int
 
 const (
 	// cancelRejectionAlreadyCancelled: the deploy request is already cancelled
-	// or cancelling — the cancel's goal state — so the rejection reads as
-	// success.
+	// — the cancel's goal state — so the rejection reads as success.
 	cancelRejectionAlreadyCancelled cancelRejectionClass = iota
 	// cancelRejectionAlreadyCompleted: the deploy request closed by completing
 	// before the cancel arrived. The rejection is typed AlreadyCompletedError
@@ -229,8 +228,15 @@ const (
 // instead of retried forever.
 func classifyCancelRejection(deploymentState string) (class cancelRejectionClass, classified bool) {
 	switch deploymentState {
-	case deployState.InProgressCancel, deployState.CompleteCancel, deployState.Cancelled:
+	case deployState.CompleteCancel, deployState.Cancelled:
 		return cancelRejectionAlreadyCancelled, true
+	case deployState.InProgressCancel:
+		// An earlier cancel was accepted but PlanetScale has not confirmed it,
+		// and an unconfirmed cancel can still end in a failed deploy. Reading
+		// the rejection as cancelled would settle the apply on an outcome the
+		// deploy request has not reached, so it stays a plain error until the
+		// deploy request settles on cancelled or failed.
+		return cancelRejectionStateError, true
 	case deployState.Complete, deployState.NoChanges:
 		return cancelRejectionAlreadyCompleted, true
 	case deployState.CompletePendingRevert:
