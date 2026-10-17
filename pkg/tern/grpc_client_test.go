@@ -554,6 +554,9 @@ type capturingTernServer struct {
 	// omitProgressScope emulates a data plane that ignores a progress
 	// request's apply_operation_id and answers for the whole apply.
 	omitProgressScope bool
+	// progressScopeEcho, when set, is echoed as the scope of every progress
+	// answer, emulating a data plane that answers for a different operation.
+	progressScopeEcho string
 	cutoverReq        *ternv1.CutoverRequest
 }
 
@@ -711,6 +714,9 @@ func (s *capturingTernServer) Progress(_ context.Context, req *ternv1.ProgressRe
 	scopedTo := req.ApplyOperationId
 	if s.omitProgressScope {
 		scopedTo = ""
+	}
+	if s.progressScopeEcho != "" {
+		scopedTo = s.progressScopeEcho
 	}
 	ps := s.progressState
 	psSet := s.progressStateSet

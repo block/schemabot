@@ -2,6 +2,8 @@ package tern
 
 import (
 	"context"
+	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
@@ -162,15 +164,9 @@ func TestGRPCClient_SiblingShardOperationsPollTheirOwnRemoteOperation(t *testing
 	assert.Equal(t, "902", progressB.ApplyOperationId, "the sibling shard polls its own remote operation")
 }
 
-// A shard's progress comes from its own remote operation, so a data plane that
-// answers for the whole remote apply instead is refused rather than read as the
-// shard's state: the whole apply carries the sibling shards' tasks, which match
-// this shard's by table and DDL.
-func TestGRPCClient_ShardProgressAnsweredForTheWholeApplyIsRefused(t *testing.T) {
-	server := &capturingTernServer{omitProgressScope: true}
-	client, cleanup := testCapturingGRPCClient(t, server)
-	defer cleanup()
-
+// shardProgressScope is one of two sibling shards that share a deployment's
+// remote apply, each polling its own remote operation there.
+func shardProgressScope() (*storage.Apply, applyTaskScope) {
 	apply := &storage.Apply{ID: 7, ApplyIdentifier: "apply-sharded", Database: "commerce", DatabaseType: storage.DatabaseTypeStrata, Environment: "staging", State: state.Apply.Running}
 	scope := applyTaskScope{
 		applyOperationID:        41,
@@ -178,11 +174,105 @@ func TestGRPCClient_ShardProgressAnsweredForTheWholeApplyIsRefused(t *testing.T)
 		deploymentOperationKeys: []string{"commerce/-80/users", "commerce/80-/users"},
 		operation:               &storage.ApplyOperation{ID: 41, ApplyID: 7, Deployment: "commerce-deployment", OperationKey: "commerce/-80/users", ExternalID: "remote-shared-1", ExternalOperationID: "901"},
 	}
+	return apply, scope
+}
+
+// A data plane that predates operation-scoped progress ignores the shard's
+// apply_operation_id and answers for the whole remote apply, which is what
+// every shard read before scoping existed. The control plane deploys first, so
+// it keeps reading that answer rather than failing every sharded apply until
+// the data plane catches up, and the shard still asks for its own operation.
+func TestGRPCClient_ShardProgressFromAnUnscopedDataPlaneIsReadAsTheWholeApply(t *testing.T) {
+	server := &capturingTernServer{omitProgressScope: true}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+	apply, scope := shardProgressScope()
+
+	resp, err := client.remoteProgress(t.Context(), apply, scope, "remote-shared-1")
+
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	assert.Empty(t, resp.GetApplyOperationId(), "the answer is for the whole remote apply")
+	assert.True(t, scope.progressReadFromWholeApply(resp), "the drive reports that it read the whole remote apply")
+	progressReq := server.getProgressRequest()
+	require.NotNil(t, progressReq)
+	assert.Equal(t, "901", progressReq.ApplyOperationId, "the shard asks for its own remote operation")
+}
+
+// A data plane that answers a shard's progress for a different remote
+// operation is refused rather than read as the shard's state: the sibling
+// shard's tasks match this shard's by table and DDL, so its progress would
+// pass for this shard's own.
+func TestGRPCClient_ShardProgressAnsweredForAnotherOperationIsRefused(t *testing.T) {
+	server := &capturingTernServer{progressScopeEcho: "902"}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+	apply, scope := shardProgressScope()
 
 	_, err := client.remoteProgress(t.Context(), apply, scope, "remote-shared-1")
 
-	require.ErrorContains(t, err, `remote progress for apply remote-shared-1 operation 901 came back scoped to ""`)
-	progressReq := server.getProgressRequest()
-	require.NotNil(t, progressReq)
-	assert.Equal(t, "901", progressReq.ApplyOperationId)
+	require.ErrorContains(t, err, `remote progress for apply remote-shared-1 operation 901 came back scoped to "902"`)
+}
+
+// A shard drive against a data plane that predates operation-scoped progress
+// reads the whole remote apply on every poll. It says so once per drive, at
+// warning level, rather than on every poll, so the upgrade it calls for stands
+// out in the drive's logs instead of drowning them.
+func TestGRPCClient_ShardDriveReportsWholeApplyProgressOnce(t *testing.T) {
+	server := &capturingTernServer{
+		remoteApplyID:     "remote-shared-1",
+		remoteOperationID: "901",
+		omitProgressScope: true,
+		progressStates:    []ternv1.State{ternv1.State_STATE_RUNNING, ternv1.State_STATE_RUNNING, ternv1.State_STATE_COMPLETED},
+		progressTables: []*ternv1.TableProgress{{
+			Namespace:       "commerce",
+			TableName:       "users",
+			Status:          state.Task.Completed,
+			PercentComplete: 100,
+		}},
+	}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+	var records []capturedLog
+	client.logger = slog.New(captureHandler{records: &records})
+
+	apply := &storage.Apply{
+		ID:              7,
+		ApplyIdentifier: "apply-sharded",
+		PlanID:          99,
+		Database:        "commerce",
+		DatabaseType:    storage.DatabaseTypeStrata,
+		Environment:     "staging",
+		State:           state.Apply.Pending,
+	}
+	apply.SetOptions(storage.ApplyOptions{Target: "commerce-target"})
+	opA, opB := int64(41), int64(42)
+	client.storage = &mockStorage{
+		applies: &mockApplyStore{apply: apply},
+		tasks: &mockTaskStore{tasks: []*storage.Task{{
+			ID: 11, TaskIdentifier: "task-users-a", ApplyID: apply.ID, ApplyOperationID: &opA,
+			TableName: "users", Shard: "-80", Namespace: "commerce",
+			DDL: "ALTER TABLE users ADD COLUMN email varchar(255)", DDLAction: "alter", State: state.Task.Pending,
+		}}},
+		plans: &mockPlanStore{plan: &storage.Plan{ID: apply.PlanID, PlanIdentifier: "plan-sharded"}},
+		operations: &mockApplyOperationStore{ops: map[int64]*storage.ApplyOperation{
+			opA: {ID: opA, ApplyID: apply.ID, Deployment: "commerce-deployment", OperationKey: "commerce/-80/users", OperationKind: storage.ApplyOperationKindWork, State: state.ApplyOperation.Pending},
+			opB: {ID: opB, ApplyID: apply.ID, Deployment: "commerce-deployment", OperationKey: "commerce/80-/users", OperationKind: storage.ApplyOperationKindWork, State: state.ApplyOperation.Pending},
+		}},
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	require.NoError(t, client.ResumeApplyOperation(ctx, apply, opA))
+
+	var wholeApplyWarnings []capturedLog
+	for _, r := range records {
+		if strings.Contains(r.msg, "read from the whole remote apply") {
+			wholeApplyWarnings = append(wholeApplyWarnings, r)
+		}
+	}
+	require.Len(t, wholeApplyWarnings, 1, "the drive reports the whole-apply read once, not on every poll")
+	assert.Equal(t, slog.LevelWarn, wholeApplyWarnings[0].level)
+	assert.Equal(t, "901", wholeApplyWarnings[0].attrs["remote_operation_id"])
+	assert.Equal(t, "commerce/-80/users", wholeApplyWarnings[0].attrs["operation_key"])
 }

@@ -305,6 +305,43 @@ func TestGRPCClient_RollingDeploymentTakesCutoverRequestUnchanged(t *testing.T) 
 	requireCutoverRequestPending(t, stor, apply.ID, false, "the parked rolling deployment completes the request")
 }
 
+// A rolling rollout started with --defer-cutover runs a deployment's two
+// shards as sibling operations of its one remote apply, each with its own
+// remote operation there. Shard 80- has parked while shard -80 is still
+// copying, so the apply is ready for cutover. A cutover call is scoped to the
+// calling shard's remote operation, so the copying shard's drive leaves the
+// request for the parked shard rather than spending it on a shard that has
+// nothing to cut over, and the parked shard's drive cuts over its own remote
+// operation.
+func TestGRPCClient_CopyingShardLeavesRollingCutoverRequestForParkedShard(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+	_, dsn := setupMySQLContainer(t)
+	stor := createControlPlaneStorage(t, dsn)
+	server := &capturingTernServer{cutoverAccepted: true}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+	client.storage = stor
+
+	apply, ops := seedCutoverTurnApply(t, stor, "apply-cutover-turn-rolling-shards", storage.CutoverPolicyRolling, []cutoverTurnMember{
+		{deployment: "eu", operationKey: "commerce/-80/widgets", remoteID: "remote-eu", remoteOperationID: "901", opState: state.ApplyOperation.Running, taskState: state.Task.Running},
+		{deployment: "eu", operationKey: "commerce/80-/widgets", remoteID: "remote-eu", remoteOperationID: "902", opState: state.ApplyOperation.WaitingForCutover, taskState: state.Task.WaitingForCutover},
+	})
+	copying, parked := ops[0], ops[1]
+
+	driveCutoverRequestAs(t, client, apply, copying)
+	assert.Nil(t, server.getCutoverRequest(), "the copying shard sends no cutover")
+	requireCutoverRequestPending(t, stor, apply.ID, true, "the copying shard leaves the request for the parked shard")
+
+	driveCutoverRequestAs(t, client, apply, parked)
+	cutoverReq := server.getCutoverRequest()
+	require.NotNil(t, cutoverReq, "the parked shard sends the cutover")
+	assert.Equal(t, "remote-eu", cutoverReq.ApplyId)
+	assert.Equal(t, "902", cutoverReq.ApplyOperationId, "the cutover is scoped to the parked shard's own remote operation")
+	requireCutoverRequestPending(t, stor, apply.ID, false, "the parked shard completes the request")
+}
+
 // Two targets listed under one deployment are separate rollout members, each
 // its own database with its own cutover, sharing the deployment's one remote
 // apply as their own remote operations. A barrier rollout started with
