@@ -1241,11 +1241,13 @@ drive resolves the request and records that outcome. And only settled outcomes a
 a remote state still in motion. *Enforced:* terminal-truth preflights on the control paths
 (`pkg/tern/local_control.go`, `pkg/tern/grpc_control_resend.go`); the drive's adoption of the
 engine's settled outcome onto the task rows before a pending command is consumed
-(`pkg/tern/local_control_reconcile.go`); the in-process engine's settled outcome checks on stop
-and cancel (`pkg/engine/spirit/control.go`), including a completion its run records after the
-cancel, and its run's deference to a stop or cancel that interrupted it, which no failure the run
-records afterwards replaces (`setSchemaChangeFailed`, `pkg/engine/spirit/execution.go`,
-`pkg/engine/spirit/direct.go`).
+(`pkg/tern/local_control_reconcile.go`); the PlanetScale engine's reading of a deploy request
+still in motion, including an unconfirmed cancel, as running rather than settled
+(`deployStateToEngineState`, `pkg/engine/planetscale/planetscale.go`); the in-process engine's
+settled outcome checks on stop and cancel (`pkg/engine/spirit/control.go`), including a
+completion its run records after the cancel, and its run's deference to a stop or cancel that
+interrupted it, which no failure the run records afterwards replaces (`setSchemaChangeFailed`,
+`pkg/engine/spirit/execution.go`, `pkg/engine/spirit/direct.go`).
 
 ### CO-4: Stop wins
 

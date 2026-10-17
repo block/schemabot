@@ -615,6 +615,18 @@ type Engine struct {
 	// post-apply validation compares against the desired schema. Tests set
 	// it to drive validation without a branch to connect to.
 	validationBranchSchema func(ctx context.Context, password *ps.DatabaseBranchPassword, keyspaces []string) (map[string][]table.TableSchema, error)
+
+	// now, when set, replaces the wall clock for elapsed-time checks on
+	// deploy request state. Tests set it to place a poll at a chosen time.
+	now func() time.Time
+}
+
+// clock returns the engine's current time.
+func (e *Engine) clock() time.Time {
+	if e.now != nil {
+		return e.now()
+	}
+	return time.Now()
 }
 
 // Compile-time check that Engine implements the interface.
