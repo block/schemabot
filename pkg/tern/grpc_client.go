@@ -3671,6 +3671,9 @@ func (c *GRPCClient) dispatchPendingApply(ctx context.Context, apply *storage.Ap
 	if standDown, err := c.processPendingCancelOrStopControlRequest(ctx, apply, scope); standDown || err != nil {
 		return err
 	}
+	if standDown, err := c.startStoppedDeploymentApplyBeforeAttach(ctx, apply, scope); standDown || err != nil {
+		return err
+	}
 
 	req := &ternv1.ApplyRequest{
 		PlanId:                  plan.PlanIdentifier,
