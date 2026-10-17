@@ -91,6 +91,7 @@ const (
 	ErrCodeRateLimited          = "rate_limited"           // Caller or target exceeded its request budget; retry after the advertised delay
 	ErrCodeUnsafeOptInRequired  = "unsafe_opt_in_required" // Plan carries an unsafe change; retry with allow_unsafe=true to consent to it
 	ErrCodePlanBlocked          = "plan_blocked"           // Plan carries a change the engine refuses; no retry or option can apply it
+	ErrCodeAlreadyStopped       = "already_stopped"        // Stop refused: the schema change is already stopped and no start is queued behind it
 )
 
 var retryableErrorCodes = map[string]bool{
@@ -1712,6 +1713,10 @@ type ControlResponse struct {
 const (
 	ControlStatusAlreadyInProgress = "already_in_progress"
 	ControlStatusAlreadyRequested  = "already_requested"
+	// ControlStatusStartWithdrawn answers a stop that arrived while the
+	// schema change was stopped with a start queued that had not taken effect:
+	// the stop withdrew the start, and the schema change stays stopped.
+	ControlStatusStartWithdrawn = "start_withdrawn"
 )
 
 // StopResponse is the HTTP response for POST /api/stop.

@@ -83,6 +83,23 @@ func TestRenderStopCommandAcceptedAlreadyRequested(t *testing.T) {
 	assert.Contains(t, rendered, "Stop was already requested")
 }
 
+// A stop that withdraws a start which had not taken effect says the schema
+// change stays stopped and how to resume it, and lists no tasks as stopped,
+// since none were.
+func TestRenderStopCommandAcceptedStartWithdrawn(t *testing.T) {
+	rendered := RenderStopCommandAccepted(StopCommandAcceptedData{
+		ApplyID:      "apply_abc123",
+		Environment:  "staging",
+		RequestedBy:  "alice",
+		Status:       apitypes.ControlStatusStartWithdrawn,
+		StoppedCount: 2,
+	})
+	assert.Contains(t, rendered, "Stop Request Accepted")
+	assert.Contains(t, rendered, "this stop withdrew it. The schema change stays stopped; start it again to resume.")
+	assert.NotContains(t, rendered, "Tasks selected for stop")
+	assert.NotContains(t, rendered, "SchemaBot will stop this schema change")
+}
+
 func TestRenderCancelCommandAccepted(t *testing.T) {
 	rendered := RenderCancelCommandAccepted(CancelCommandAcceptedData{
 		ApplyID:        "apply_abc123",

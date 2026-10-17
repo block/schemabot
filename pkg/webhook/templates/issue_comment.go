@@ -124,8 +124,11 @@ func RenderControlMissingApplyID(cliName, command, environment string) string {
 // comment stop command records durable stop intent.
 func RenderStopCommandAccepted(data StopCommandAcceptedData) string {
 	statusLine := "Stop request accepted. SchemaBot will stop this schema change; status remains available from the PR progress comment or CLI."
-	if data.Status == apitypes.ControlStatusAlreadyRequested {
+	switch data.Status {
+	case apitypes.ControlStatusAlreadyRequested:
 		statusLine = "Stop was already requested. SchemaBot will keep the existing stop request pending until the operator owner finishes it."
+	case apitypes.ControlStatusStartWithdrawn:
+		statusLine = "The start requested earlier had not taken effect yet, so this stop withdrew it. The schema change stays stopped; start it again to resume."
 	}
 
 	body := "## Stop Request Accepted\n\n" +
@@ -135,7 +138,7 @@ func RenderStopCommandAccepted(data StopCommandAcceptedData) string {
 		body += fmt.Sprintf("**Requested by**: @%s\n", data.RequestedBy)
 	}
 	body += "\n" + statusLine + "\n"
-	if data.StoppedCount > 0 || data.SkippedCount > 0 {
+	if data.Status != apitypes.ControlStatusStartWithdrawn && (data.StoppedCount > 0 || data.SkippedCount > 0) {
 		body += fmt.Sprintf("\n**Tasks selected for stop**: %d stopped, %d skipped.\n", data.StoppedCount, data.SkippedCount)
 	}
 	return body
