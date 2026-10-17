@@ -1249,7 +1249,11 @@ a remote state still in motion. *Enforced:* terminal-truth preflights on the con
 engine's settled outcome onto the task rows before a pending command is consumed
 (`pkg/tern/local_control_reconcile.go`); the PlanetScale engine's reading of a deploy request
 still in motion, including an unconfirmed cancel, as running rather than settled
-(`deployStateToEngineState`, `pkg/engine/planetscale/planetscale.go`); the in-process engine's
+(`deployStateToEngineState`, `pkg/engine/planetscale/planetscale.go`), and its typing of a
+cancel rejected over a deploy request that failed as a settled-outcome refusal
+(`classifyCancelRejection`, `pkg/engine/planetscale/control.go`), with the cancel fallback's
+refusal over a provider-settled failure its probe reads (`providerSettledChangeAsFailed`,
+`pkg/tern/local_control.go`) as the backstop; the in-process engine's
 settled outcome checks on stop and cancel (`pkg/engine/spirit/control.go`), including a
 completion its run records after the cancel, and its run's deference to a stop or cancel that
 interrupted it, which no failure the run records afterwards replaces (`setSchemaChangeFailed`,

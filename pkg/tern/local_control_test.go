@@ -1727,8 +1727,46 @@ func TestLocalClient_PendingCancelKeepsProviderSettledFailure(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, resolved)
 	assert.Equal(t, storage.ControlRequestFailed, resolved.Status)
-	assert.Equal(t, "cancel rejected: the schema change on database testdb failed before the cancel arrived; the failure stands, plan and apply again to retry",
-		resolved.ErrorMessage, "the failed request must name the failure and how to recover")
+	assert.Equal(t, "cancel rejected: the provider reports the schema change on database testdb already failed with no retry path; the failure stands and a cancel cannot replace it",
+		resolved.ErrorMessage, "the failed request must name the settled failure")
+}
+
+// A cancel error over a failure that is not settled keeps surfacing, so the
+// drive retries with engine state intact: an in-process engine reporting
+// failed still owns work only a retried cancel finishes, and a provider's
+// retryable failure can still be run again. Only a provider-settled,
+// non-retryable failure turns the cancel error into a settled-outcome refusal.
+func TestLocalClient_CancelFailureProbeLeavesUnsettledOutcomeToTheCancelError(t *testing.T) {
+	cancelErr := errors.New("cancel rejected: engine unreachable")
+	tests := []struct {
+		name          string
+		authoritative bool
+		progress      *engine.ProgressResult
+	}{
+		{name: "in-process engine reporting failed", authoritative: false, progress: &engine.ProgressResult{State: engine.StateFailed}},
+		{name: "provider reporting a retryable failure", authoritative: true, progress: &engine.ProgressResult{State: engine.StateFailed, Retryable: true}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			operationID := int64(99)
+			apply := &storage.Apply{ID: 42, ApplyIdentifier: "apply-vitess-cancel-probe", State: state.Apply.Running, Database: "testdb", DatabaseType: storage.DatabaseTypeVitess}
+			task := &storage.Task{ID: 7, ApplyID: apply.ID, ApplyOperationID: &operationID, TaskIdentifier: "task-vitess-cancel-probe", State: state.Task.Running}
+			resumeState := &storage.EngineResumeState{ApplyOperationID: operationID, MigrationContext: "ctx", Metadata: `{"deploy_request_id":321}`}
+			base := controlCaptureEngine{cancelErr: cancelErr, progressResult: tc.progress}
+			var eng engine.Engine = &base
+			if tc.authoritative {
+				eng = &externallyAuthoritativeCaptureEngine{controlCaptureEngine: base}
+			}
+			client := newVitessControlTestClientWithRequests(apply, []*storage.Task{task}, resumeState, eng, pendingControlRequestStore(apply.ID, storage.ControlOperationCancel))
+
+			_, err := client.cancelOwnedApply(t.Context(), &ternv1.CancelRequest{ApplyId: apply.ApplyIdentifier}, "")
+
+			require.ErrorIs(t, err, cancelErr)
+			assert.False(t, engine.IsSettledOutcome(err), "only a provider-settled non-retryable failure is a settled-outcome refusal")
+			assert.Equal(t, state.Task.Running, task.State)
+			assert.Equal(t, state.Apply.Running, apply.State)
+		})
+	}
 }
 
 // When the live-work probe itself fails, the engine's state is unknown:
