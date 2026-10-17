@@ -2112,7 +2112,7 @@ type Task struct {
 	ChecksumRowsChecked int64
 	ChecksumRowsTotal   int64
 	// Throttled reports that the engine's throttler is pausing this table's
-	// active phase (row copy or checksum verify), so stalled row counts read
+	// active phase (row copy or checksum verification), so stalled row counts read
 	// as a deliberate pause rather than a hang. Cleared when the pause lifts.
 	Throttled bool
 	// ThrottleReason names the signal pausing the work, for display (e.g.

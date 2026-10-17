@@ -2,7 +2,9 @@
 const fs=require('node:fs'),path=require('node:path'),os=require('node:os');
 const {execFileSync}=require('node:child_process');
 const {chromium}=require('playwright');
-const illustrations={'spirit-ddl-selection':30,'spirit-change-lifecycle':22,'spirit-checkpoint-resume':22};
+const illustrations={'spirit-ddl-selection':30,'spirit-change-lifecycle':22,'spirit-checkpoint-resume':22,'spirit-throttling':24,'spirit-aurora-upsize':18};
+// Play an illustration faster than its own timeline; its duration is in timeline seconds.
+const speeds={'spirit-throttling':1.3};
 // Keep the lifecycle motion, but allow four to five seconds to read each short phase.
 function frameDelay(name,t){
  if(name!=='spirit-change-lifecycle')return 5;
@@ -18,18 +20,20 @@ browser=await chromium.launch({headless:true,...(process.env.CHROME ? {executabl
  let pageError;
  page.on('pageerror',e=>{pageError=e});
  await page.setContent(fs.readFileSync(path.join(root,'assets/src/'+name+'.html'),'utf8'));await page.evaluate(()=>document.fonts.ready);
- const frames=[],fps=20,duration=illustrations[name];
+ // Chrome can tear the first screenshot after a page loads; discard it.
+ await page.screenshot();
+ const frames=[],fps=20,speed=speeds[name]||1,duration=illustrations[name]/speed;
  let previous;
  for(let i=0;i<fps*duration;i++){
   const f=path.join(framesDir,String(i).padStart(4,'0')+'.png');
-  await page.evaluate(t=>renderFrame(t),i/fps);const png=await page.screenshot();
-  const delay=frameDelay(name,i/fps);
+  await page.evaluate(t=>renderFrame(t),i/fps*speed);const png=await page.screenshot();
+  const delay=frameDelay(name,i/fps*speed);
   if(previous&&png.equals(previous)){frames[frames.length-1].delay+=delay;}
   else{fs.writeFileSync(f,png);frames.push({file:f,delay});previous=png;}
   if(i%100===0)console.log('Rendered frame '+i+'/'+fps*duration);
  }
  if(pageError)throw pageError;
- const colors=['ffffff','f6f8fa','d1d9e0','1f2328','59636e','0969da','ddf4ff','1a7f37','dafbe1','9a6700','fff8c5','8250df','fbefff'];
+ const colors=['ffffff','f6f8fa','d1d9e0','1f2328','59636e','0969da','ddf4ff','1a7f37','dafbe1','9a6700','fff8c5','8250df','fbefff','cf222e','ffebe9'];
  const swatches=path.join(framesDir,'fixed.ppm'),palette=path.join(framesDir,'palette.png'),adaptive=path.join(framesDir,'adaptive.png');
  fs.writeFileSync(swatches,'P3\n'+colors.length+' 1\n255\n'+colors.map(h=>h.match(/../g).map(v=>parseInt(v,16)).join(' ')).join('\n'));
  execFileSync('magick',[...frames.filter((_,i)=>i%20===0).map(f=>f.file),'-append','-colors',String(256-colors.length),'-unique-colors',adaptive]);
