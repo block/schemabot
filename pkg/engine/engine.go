@@ -93,8 +93,10 @@ type DrainTarget struct {
 // can race the drive's read of the table. Copies on sibling shards keep running
 // alongside it instead of finishing one at a time, and a schema change on
 // another table, such as one holding at a deferred cutover, never holds the
-// drive back.
+// drive back. It embeds Drainer because a drive that covers the whole apply
+// still waits for all of the engine's work.
 type TargetDrainer interface {
+	Drainer
 	// DrainTargetContext waits for any in-flight background work on target to
 	// complete and clears it, leaving all other work running. When ctx ends
 	// first it returns an error and leaves the work tracked.
