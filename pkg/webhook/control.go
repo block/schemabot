@@ -434,3 +434,40 @@ func (h *Handler) handleRevertCommand(repo string, pr int, installationID int64,
 		RequestedBy: requestedBy,
 	}))
 }
+
+// reportQueuedStartWithdrawn tells an apply's PR that a stop withdrew the start
+// queued behind it. The apply never left stopped, so no drive runs to update
+// the PR, which would otherwise end on the start's acknowledgement promising a
+// resume. A stop that was itself a command on this PR is skipped: its reply
+// already reports the withdrawal. The post runs off the caller's goroutine,
+// since the stop's response waits on this.
+func (h *Handler) reportQueuedStartWithdrawn(apply *storage.Apply, caller string) {
+	if apply.Repository == "" || apply.PullRequest == 0 || apply.InstallationID == 0 {
+		h.logger.Debug("queued start withdrawn; no PR to tell: apply has no GitHub destination",
+			"apply_id", apply.ApplyIdentifier,
+			"database", apply.Database,
+			"environment", apply.Environment)
+		return
+	}
+	if callerIsPRCommand(caller, apply.Repository, apply.PullRequest) {
+		h.logger.Debug("queued start withdrawn by a stop command on the PR; its reply reports the withdrawal",
+			"apply_id", apply.ApplyIdentifier,
+			"repo", apply.Repository,
+			"pr", apply.PullRequest)
+		return
+	}
+	repo, pr, installationID := apply.Repository, apply.PullRequest, apply.InstallationID
+	body := templates.RenderStartWithdrawn(templates.StartWithdrawnData{
+		ApplyID:     apply.ApplyIdentifier,
+		Environment: apply.Environment,
+		StoppedBy:   actorFromCaller(caller),
+	})
+	h.logger.Info("queued start withdrawn by a stop from outside the PR; telling the PR",
+		"apply_id", apply.ApplyIdentifier,
+		"repo", repo,
+		"pr", pr,
+		"environment", apply.Environment)
+	h.goSafe(repo, pr, installationID, "", func() {
+		h.postComment(repo, pr, installationID, body)
+	})
+}
