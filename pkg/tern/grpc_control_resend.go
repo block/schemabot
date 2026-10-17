@@ -31,9 +31,9 @@ const (
 
 // remoteControlSendGate throttles retransmission of durable control requests
 // to the data plane. Entries are keyed by control-request row ID and remember
-// which arming of that row they sent, so a new request (a fresh operator
-// command) always transmits immediately, including one that re-arms a row this
-// process already sent for. State is in-memory by design: it is a per-process
+// which arming of that row they sent, by its revision and arming stamp, so a
+// new request (a fresh operator command) always transmits immediately,
+// including one that re-arms a row this process already sent for. State is in-memory by design: it is a per-process
 // optimization over the durable request row — after a restart the driver
 // re-sends once and re-enters the throttled cadence.
 type remoteControlSendGate struct {
@@ -44,8 +44,17 @@ type remoteControlSendGate struct {
 // remoteControlSend is one transmission of a control request: when it was
 // sent, and which arming of the request row it carried.
 type remoteControlSend struct {
-	sentAt  time.Time
-	armedAt time.Time
+	sentAt   time.Time
+	armedAt  time.Time
+	revision int64
+}
+
+// carries reports whether this transmission carried the command the request
+// row holds now. The revision tells apart two commands recorded within the
+// same second; the arming stamp tells apart a re-arm written by a server that
+// does not advance the revision.
+func (s remoteControlSend) carries(controlReq *storage.ApplyControlRequest) bool {
+	return s.revision == controlReq.Revision && s.armedAt.Equal(controlRequestArmedAt(controlReq))
 }
 
 // controlRequestArmedAt is when the operator's command behind a pending request
@@ -67,7 +76,7 @@ func (g *remoteControlSendGate) shouldSend(controlReq *storage.ApplyControlReque
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	last, ok := g.lastSent[controlReq.ID]
-	if !ok || !last.armedAt.Equal(controlRequestArmedAt(controlReq)) {
+	if !ok || !last.carries(controlReq) {
 		return true
 	}
 	return now.Sub(last.sentAt) >= remoteControlResendInterval
@@ -81,16 +90,15 @@ func (g *remoteControlSendGate) recordSend(controlReq *storage.ApplyControlReque
 	if g.lastSent == nil {
 		g.lastSent = make(map[int64]remoteControlSend)
 	}
-	armedAt := controlRequestArmedAt(controlReq)
 	last, seen := g.lastSent[controlReq.ID]
-	g.lastSent[controlReq.ID] = remoteControlSend{sentAt: now, armedAt: armedAt}
-	return !seen || !last.armedAt.Equal(armedAt)
+	g.lastSent[controlReq.ID] = remoteControlSend{sentAt: now, armedAt: controlRequestArmedAt(controlReq), revision: controlReq.Revision}
+	return !seen || !last.carries(controlReq)
 }
 
 // clear forgets a control request once its drive completes or fails it. A
 // request resolved elsewhere, such as by the rollout projection on another
 // drive, is never cleared here, so a re-issued command is told apart from the
-// resolved one by its arming stamp rather than by this.
+// resolved one by its arming rather than by this.
 func (g *remoteControlSendGate) clear(controlReqID int64) {
 	g.mu.Lock()
 	defer g.mu.Unlock()

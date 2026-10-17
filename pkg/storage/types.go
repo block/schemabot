@@ -1832,6 +1832,11 @@ type ApplyControlRequest struct {
 	CompletedAt  *time.Time
 	CreatedAt    time.Time
 	UpdatedAt    time.Time
+	// Revision counts how many times the row has been re-armed: 0 for the
+	// command it was created with, advanced in the same write that re-arms it
+	// for a new one. It tells two commands on one row apart even when both were
+	// recorded within the same second, which the timestamps cannot.
+	Revision int64
 }
 
 // ReleasesPausedRollout reports whether this request latches a rollout paused

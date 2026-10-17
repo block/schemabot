@@ -3,7 +3,6 @@ package storagetest
 import (
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -198,12 +197,6 @@ func TestControlRequests(t *testing.T, h Harness) {
 
 		require.NoError(t, store.ControlRequests().CompletePending(ctx, applyID, storage.ControlOperationStart))
 
-		// The re-armed row carries a new command, and its last-write stamp is
-		// what tells that command apart from the one the row carried before.
-		// Timestamps are stored to the second on some dialects, so the re-arm
-		// lands in a later second than the first request.
-		time.Sleep(time.Until(first.UpdatedAt.Truncate(time.Second).Add(time.Second + 100*time.Millisecond)))
-
 		second, alreadyPending, err := store.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
 			ApplyID:     applyID,
 			Operation:   storage.ControlOperationStart,
@@ -219,8 +212,11 @@ func TestControlRequests(t *testing.T, h Harness) {
 		assert.Equal(t, "operator-b", second.RequestedBy)
 		assert.Nil(t, second.CompletedAt)
 		assert.JSONEq(t, `{"started_count":2}`, string(second.Metadata))
-		assert.True(t, second.UpdatedAt.After(first.UpdatedAt),
-			"re-arming stamps the row (first %s, re-armed %s)", first.UpdatedAt, second.UpdatedAt)
+		// The re-armed row carries a new command. Re-arming within the same
+		// second as the first request leaves the timestamps equal on dialects
+		// that store them to the second, so the revision is what tells the two
+		// commands apart.
+		assert.Equal(t, first.Revision+1, second.Revision, "re-arming advances the revision")
 	})
 
 	// CompletePending verifies the happy-path resolution: a pending request

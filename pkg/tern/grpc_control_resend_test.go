@@ -53,6 +53,21 @@ func TestRemoteControlSendGateTransmitsAReArmedRequestImmediately(t *testing.T) 
 	assert.False(t, gate.shouldSend(reArmed, base.Add(5*time.Second)), "the re-armed request is then throttled on its own cadence")
 }
 
+// Storage that keeps timestamps to the second gives a command re-issued within
+// the second of the one before it the same stamps. The re-arm advances the
+// row's revision, so the re-issued command still transmits at once.
+func TestRemoteControlSendGateTransmitsASameSecondReArmImmediately(t *testing.T) {
+	gate := &remoteControlSendGate{}
+	base := time.Now().Truncate(time.Second)
+	first := &storage.ApplyControlRequest{ID: 1, CreatedAt: base, UpdatedAt: base}
+	require.True(t, gate.recordSend(first, base))
+
+	reArmed := &storage.ApplyControlRequest{ID: 1, CreatedAt: base, UpdatedAt: base, Revision: 1}
+	assert.True(t, gate.shouldSend(reArmed, base.Add(500*time.Millisecond)), "a re-arm in the same second transmits without waiting out the previous command's interval")
+	assert.True(t, gate.recordSend(reArmed, base.Add(500*time.Millisecond)), "its transmission is its first")
+	assert.False(t, gate.shouldSend(reArmed, base.Add(time.Second)), "it is then throttled on its own cadence")
+}
+
 // One gate is shared by every apply a process drives, so its three methods are
 // reached concurrently by drives that have nothing else in common. The map
 // behind it is only safe because they serialize.
