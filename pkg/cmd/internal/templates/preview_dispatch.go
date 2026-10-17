@@ -321,6 +321,8 @@ func PreviewCLIOutput(previewType PreviewType) {
 		fmt.Print(webhooktemplates.PreviewCommentApplyBlockedByPriorEnvFailed())
 	case PreviewCommentBlockedByPriorInProg:
 		fmt.Print(webhooktemplates.PreviewCommentApplyBlockedByPriorEnvInProgress())
+	case PreviewCommentBlockedByPriorStopped:
+		fmt.Print(webhooktemplates.PreviewCommentApplyBlockedByStoppedPriorEnvApply())
 	case PreviewCommentReviewRequired:
 		fmt.Print(webhooktemplates.PreviewCommentReviewRequired())
 	case PreviewCommentReviewGateError:

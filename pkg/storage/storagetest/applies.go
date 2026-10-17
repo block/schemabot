@@ -3,6 +3,7 @@ package storagetest
 import (
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
 	"sync"
 	"testing"
@@ -68,6 +69,114 @@ func TestApplies(t *testing.T, h Harness) {
 		deleted, err := store.Applies().Get(ctx, id)
 		require.NoError(t, err)
 		assert.Nil(t, deleted)
+	})
+
+	// An operator walks the recent-applies list page by page, each page starting
+	// below the last apply the previous one showed, while a new apply is created
+	// between pages. Every apply that existed when the walk began is listed
+	// exactly once, newest first, the new one not at all, and an apply outside
+	// the filters never.
+	t.Run("GetRecent_AfterListsEveryApplyOnce", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+
+		inFlight := CreateApplyWithStateAndEnv(t, store, CreateLock(t, store, "walk_inflight", storage.DatabaseTypeMySQL),
+			"apply_walk_inflight", 1, state.Apply.Running, "staging")
+		settledLock := CreateLock(t, store, "walk_settled", storage.DatabaseTypeMySQL)
+		want := []string{inFlight.ApplyIdentifier}
+		for i := range 7 {
+			apply := CreateApplyWithStateAndEnv(t, store, settledLock, fmt.Sprintf("apply_walk_settled_%d", i), int64(10+i), state.Apply.Completed, "staging")
+			want = append([]string{apply.ApplyIdentifier}, want...)
+		}
+		CreateApplyWithStateAndEnv(t, store, settledLock, "apply_walk_other_env", 30, state.Apply.Completed, "production")
+
+		filter := storage.RecentAppliesFilter{Environment: "staging"}
+		var seen []string
+		const pageSize = 3
+		for page := 0; ; page++ {
+			require.Less(t, page, 10, "the walk must end")
+			filter.Limit = pageSize + 1
+			applies, err := store.Applies().GetRecent(ctx, filter)
+			require.NoError(t, err)
+			hasMore := len(applies) > pageSize
+			if hasMore {
+				applies = applies[:pageSize]
+			}
+			for _, apply := range applies {
+				seen = append(seen, apply.ApplyIdentifier)
+			}
+			if !hasMore {
+				break
+			}
+			filter.AfterID = applies[len(applies)-1].ID
+			if page == 0 {
+				CreateApplyWithStateAndEnv(t, store, settledLock, "apply_walk_created_mid_walk", 40, state.Apply.Completed, "staging")
+			}
+		}
+		assert.Equal(t, want, seen)
+	})
+
+	// Three applies are running and an operator pages through the active ones
+	// two at a time. The last apply on the first page finishes before the
+	// second request. It no longer matches the filter, but its place in the
+	// order never moves, so the second page still lists the third running
+	// apply, and the finished-only walk lists the one that finished.
+	t.Run("GetRecent_AfterAnApplyThatFinishedSincePage", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		var running []*storage.Apply
+		for i := range 3 {
+			lock := CreateLock(t, store, fmt.Sprintf("walk_running_%d", i), storage.DatabaseTypeMySQL)
+			running = append(running, CreateApplyWithStateAndEnv(t, store, lock, fmt.Sprintf("apply_walk_running_%d", i), int64(10+i), state.Apply.Running, "staging"))
+		}
+
+		filter := storage.RecentAppliesFilter{Limit: 2, Environment: "staging", ActiveOnly: true}
+		first, err := store.Applies().GetRecent(ctx, filter)
+		require.NoError(t, err)
+		require.Len(t, first, 2)
+		assert.Equal(t, running[2].ApplyIdentifier, first[0].ApplyIdentifier)
+		assert.Equal(t, running[1].ApplyIdentifier, first[1].ApplyIdentifier)
+
+		anchor := first[1]
+		anchor.State = state.Apply.Completed
+		completedAt := time.Now()
+		anchor.CompletedAt = &completedAt
+		require.NoError(t, store.Applies().Update(ctx, anchor))
+
+		filter.AfterID = anchor.ID
+		second, err := store.Applies().GetRecent(ctx, filter)
+		require.NoError(t, err)
+		require.Len(t, second, 1, "the apply after the one that finished is still listed")
+		assert.Equal(t, running[0].ApplyIdentifier, second[0].ApplyIdentifier)
+
+		finished, err := store.Applies().GetRecent(ctx, storage.RecentAppliesFilter{Limit: 10, Environment: "staging", FinishedOnly: true})
+		require.NoError(t, err)
+		require.Len(t, finished, 1)
+		assert.Equal(t, anchor.ApplyIdentifier, finished[0].ApplyIdentifier)
+	})
+
+	t.Run("GetRecent_FiltersByDatabase", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		orders := CreateApplyWithStateAndEnv(t, store, CreateLock(t, store, "orders", storage.DatabaseTypeMySQL),
+			"apply_orders", 1, state.Apply.Completed, "staging")
+		CreateApplyWithStateAndEnv(t, store, CreateLock(t, store, "billing", storage.DatabaseTypeMySQL),
+			"apply_billing", 2, state.Apply.Failed, "staging")
+
+		filter := storage.RecentAppliesFilter{Limit: 10, Database: "ORDERS"}
+		recent, err := store.Applies().GetRecent(ctx, filter)
+		require.NoError(t, err)
+		require.Len(t, recent, 1)
+		assert.Equal(t, orders.ApplyIdentifier, recent[0].ApplyIdentifier)
+
+		filter.AfterID = orders.ID
+		after, err := store.Applies().GetRecent(ctx, filter)
+		require.NoError(t, err)
+		assert.Empty(t, after, "a later page keeps the database filter")
+
+		counts, err := store.Applies().CountRecentByState(ctx, filter)
+		require.NoError(t, err)
+		assert.Equal(t, map[string]int{state.Apply.Completed: 1}, counts, "counts ignore the page position and keep the filter")
 	})
 
 	t.Run("Create_Get_Update", func(t *testing.T) {
@@ -649,6 +758,102 @@ func TestApplies(t *testing.T, h Harness) {
 			"the failed start request names the apply that took the work over")
 	})
 
+	// A dispatch that takes over a stopped apply's work names that apply when it
+	// creates its successor, and the marker lands in the same transaction as the
+	// successor's rows. Once the create commits, a start on the stopped apply is
+	// refused with the successor named, with no later write left to fail.
+	t.Run("SupersededMarker_CommittedWithTheCreate", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "apply_superseded_create_db", storage.DatabaseTypeMySQL)
+		holder := CreateApplyWithStateAndEnv(t, store, lock, "apply_create_marker_holder", 920, state.Apply.Stopped, "staging")
+
+		successor, err := createApplyTakingOver(t, store, lock, "apply_create_marker_successor", 921, holder.ID)
+		require.NoError(t, err)
+
+		marked, err := store.Applies().Get(ctx, holder.ID)
+		require.NoError(t, err)
+		require.NotNil(t, marked)
+		assert.Equal(t, successor.ApplyIdentifier, marked.SupersededBy, "the create stamped the stopped apply with its successor")
+		assert.Equal(t, state.Apply.Stopped, marked.State, "the handoff does not change the stopped apply's own state")
+
+		created, err := store.Applies().Get(ctx, successor.ID)
+		require.NoError(t, err)
+		require.NotNil(t, created)
+		assert.Empty(t, created.SupersededBy, "the successor's own row carries no marker")
+
+		_, alreadyPending, err := store.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+			ApplyID:   holder.ID,
+			Operation: storage.ControlOperationStart,
+			Status:    storage.ControlRequestPending,
+			Metadata:  []byte(`{}`),
+		})
+		require.NoError(t, err)
+		require.False(t, alreadyPending)
+
+		claimed, err := store.Applies().ClaimApplyByID(ctx, holder.ID, "driver-a")
+		require.NoError(t, err)
+		assert.Nil(t, claimed, "a stopped apply whose work the create took over must not be claimed for a start")
+
+		settled, err := store.ControlRequests().GetByOperation(ctx, holder.ID, storage.ControlOperationStart)
+		require.NoError(t, err)
+		require.NotNil(t, settled)
+		assert.Equal(t, storage.ControlRequestFailed, settled.Status)
+		assert.Contains(t, settled.ErrorMessage, "superseded by "+successor.ApplyIdentifier,
+			"the start is refused because of the marker, naming the successor")
+	})
+
+	// A handoff that cannot be recorded fails the create, so there is never a
+	// successor running over a stopped apply that nothing refuses to start. The
+	// failed create leaves no marker on any holder it named and no successor row,
+	// and the same dispatch retried with a holder it can record commits both.
+	t.Run("SupersededMarker_FailedCreateLeavesNoMark", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "apply_superseded_rollback_db", storage.DatabaseTypeMySQL)
+		holder := CreateApplyWithStateAndEnv(t, store, lock, "apply_rollback_marker_holder", 922, state.Apply.Stopped, "staging")
+
+		_, err := createApplyTakingOver(t, store, lock, "apply_rollback_marker_successor", 923, holder.ID, holder.ID+100000)
+		require.ErrorIs(t, err, storage.ErrApplyNotFound, "a holder the create cannot stamp fails the create")
+
+		untouched, err := store.Applies().Get(ctx, holder.ID)
+		require.NoError(t, err)
+		require.NotNil(t, untouched)
+		assert.Empty(t, untouched.SupersededBy, "the holder stamped before the failure is rolled back with the create")
+
+		missing, err := store.Applies().GetByApplyIdentifier(ctx, "apply_rollback_marker_successor")
+		require.NoError(t, err)
+		assert.Nil(t, missing, "the failed create leaves no successor row")
+
+		successor, err := createApplyTakingOver(t, store, lock, "apply_rollback_marker_successor", 923, holder.ID)
+		require.NoError(t, err, "the retried create commits once every holder can be recorded")
+		retried, err := store.Applies().Get(ctx, holder.ID)
+		require.NoError(t, err)
+		require.NotNil(t, retried)
+		assert.Equal(t, successor.ApplyIdentifier, retried.SupersededBy)
+	})
+
+	// The first successor of a stopped apply owns its marker. A later create that
+	// names the same holder commits without reassigning it, since the stopped
+	// apply is refused either way and overwriting would resolve an ambiguous
+	// takeover.
+	t.Run("SupersededMarker_CreateLeavesAnEarlierSuccessorsMarker", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "apply_superseded_earlier_db", storage.DatabaseTypeMySQL)
+		holder := CreateApplyWithStateAndEnv(t, store, lock, "apply_earlier_marker_holder", 924, state.Apply.Stopped, "staging")
+		require.NoError(t, store.Applies().MarkSuperseded(ctx, holder.ID, "apply_earlier_successor"))
+
+		successor, err := createApplyTakingOver(t, store, lock, "apply_later_marker_successor", 925, holder.ID)
+		require.NoError(t, err, "a holder an earlier successor already stamped does not fail the create")
+		require.NotZero(t, successor.ID)
+
+		stored, err := store.Applies().Get(ctx, holder.ID)
+		require.NoError(t, err)
+		require.NotNil(t, stored)
+		assert.Equal(t, "apply_earlier_successor", stored.SupersededBy, "the first successor keeps the marker")
+	})
+
 	// Automatic retry is the one start surface with no operator request behind
 	// it: a fresh failed_retryable apply within budget is claimed and re-driven
 	// on the next poll, with nobody in the loop. Once another apply has taken
@@ -767,6 +972,13 @@ func TestApplies(t *testing.T, h Harness) {
 		rollout := CreateApplyWithStateEnvDeployment(t, store, lock, "apply_rollout_retrying", 9320, state.Apply.Pending, "production", "region-a")
 		operationID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{ApplyID: rollout.ID, Deployment: "region-a", OperationKey: "schema", State: state.ApplyOperation.FailedRetryable})
 		require.NoError(t, err)
+		// A lone operation with tasks is driven under the parent lease, the
+		// shape whose retry leaves the row failed_retryable.
+		task := newTask(rollout, "task_rollout_retrying", "users", time.Now())
+		task.State = state.Task.FailedRetryable
+		task.ApplyOperationID = &operationID
+		_, err = store.Tasks().Create(ctx, task)
+		require.NoError(t, err)
 		rollout.State = state.Apply.FailedRetryable
 		require.NoError(t, store.Applies().Update(ctx, rollout))
 
@@ -787,6 +999,206 @@ func TestApplies(t *testing.T, h Harness) {
 		require.NoError(t, err)
 		require.True(t, released)
 		require.NoError(t, createApplyOnDeployment(t, store, lock, "apply_region_a_after_retry", 9322, "region-a"), "a retry no driver holds reserves nothing")
+	})
+
+	// A data-plane outage leaves two targets of a rollout failed_retryable: one
+	// was copying and one never dispatched. The parent reads failed_retryable
+	// while either does. Redispatching the first moves its row to running in the
+	// claim, so the next claim takes the second target instead of re-leasing the
+	// first out from under the driver that is resuming it.
+	t.Run("FindNextApplyOperation_MultiOperationRedispatchMovesTheRowToRunning", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "apply_rollout_redispatch_db", storage.DatabaseTypeMySQL)
+		rollout := CreateApplyWithStateEnvDeployment(t, store, lock, "apply_rollout_redispatch", 9330, state.Apply.Pending, "production", "region-a")
+		copyingID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+			ApplyID: rollout.ID, Deployment: "region-a", Target: "orders-001", OperationKey: "orders-001/schema",
+			State: state.ApplyOperation.FailedRetryable, ErrorMessage: "progress poll failed",
+		})
+		require.NoError(t, err)
+		undispatchedID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+			ApplyID: rollout.ID, Deployment: "region-a", Target: "orders-002", OperationKey: "orders-002/schema",
+			State: state.ApplyOperation.FailedRetryable, ErrorMessage: "dispatch failed",
+		})
+		require.NoError(t, err)
+		rollout.State = state.Apply.FailedRetryable
+		require.NoError(t, store.Applies().Update(ctx, rollout))
+
+		first, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-a")
+		require.NoError(t, err)
+		require.NotNil(t, first, "a failed_retryable operation under a retryable parent must be claimable")
+		assert.Equal(t, state.ApplyOperation.Running, first.State, "the redispatch claim returns the row it moved")
+		redispatched, err := store.ApplyOperations().Get(ctx, first.ID)
+		require.NoError(t, err)
+		require.NotNil(t, redispatched)
+		assert.Equal(t, state.ApplyOperation.Running, redispatched.State)
+		assert.Empty(t, redispatched.ErrorMessage, "the redispatch clears the failure it is retrying")
+		assert.Equal(t, "driver-a", redispatched.LeaseOwner)
+		assert.Equal(t, first.LeaseToken, redispatched.LeaseToken)
+
+		second, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-b")
+		require.NoError(t, err)
+		require.NotNil(t, second, "the other failed_retryable target is claimable next")
+		assert.NotEqual(t, first.ID, second.ID, "the claim never re-leases the target driver-a is resuming")
+		assert.ElementsMatch(t, []int64{copyingID, undispatchedID}, []int64{first.ID, second.ID})
+
+		held, err := store.ApplyOperations().Get(ctx, first.ID)
+		require.NoError(t, err)
+		require.NotNil(t, held)
+		assert.Equal(t, first.LeaseToken, held.LeaseToken, "driver-a still holds the lease it claimed")
+
+		none, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-c")
+		require.NoError(t, err)
+		assert.Nil(t, none, "both targets are being resumed, so there is nothing left to claim")
+	})
+
+	// A halted rollout holds shard 3 parked at the cutover barrier behind
+	// shard 2's failure, so nothing drives shard 3 and its cutover turn never
+	// comes. A cancel makes it claimable once, for the drive that delivers the
+	// cancel to the engine holding its copy. The claim leaves it parked, and
+	// the claim is not repeated while that drive holds the lease. Shard 3's
+	// next table, which never started, is not claimed for the cancel.
+	t.Run("FindNextApplyOperation_PendingCancelClaimsOperationParkedBehindFailure", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "apply_rollout_parked_cancel_db", storage.DatabaseTypeMySQL)
+		rollout := CreateApplyWithStateEnvDeployment(t, store, lock, "apply_rollout_parked_cancel", 9334, state.Apply.Pending, "production", "region-a")
+		insert := func(target, key, operationState string) int64 {
+			id, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+				ApplyID: rollout.ID, Deployment: "region-a", Target: target, OperationKey: storage.TargetOperationKey(target, key),
+				OperationKind: storage.ApplyOperationKindWork, CutoverPolicy: storage.CutoverPolicyBarrier, OnFailure: storage.OnFailureHalt,
+				State: operationState,
+			})
+			require.NoError(t, err)
+			return id
+		}
+		insert("orders-001", "step-1", state.ApplyOperation.Completed)
+		insert("orders-002", "step-1", state.ApplyOperation.Failed)
+		parkedID := insert("orders-003", "step-1", state.ApplyOperation.WaitingForCutover)
+		insert("orders-003", "step-2", state.ApplyOperation.Pending)
+		rollout.State = state.Apply.RunningDegraded
+		require.NoError(t, store.Applies().Update(ctx, rollout))
+
+		idle, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-a")
+		require.NoError(t, err)
+		assert.Nil(t, idle, "without a cancel nothing claims the parked operation or the work behind the failure")
+
+		_, alreadyPending, err := store.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+			ApplyID:   rollout.ID,
+			Operation: storage.ControlOperationCancel,
+			Status:    storage.ControlRequestPending,
+			Metadata:  []byte(`{}`),
+		})
+		require.NoError(t, err)
+		require.False(t, alreadyPending)
+
+		claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-a")
+		require.NoError(t, err)
+		require.NotNil(t, claimed, "a pending cancel makes the parked operation claimable")
+		assert.Equal(t, parkedID, claimed.ID)
+		assert.Equal(t, state.ApplyOperation.WaitingForCutover, claimed.State)
+		held, err := store.ApplyOperations().Get(ctx, parkedID)
+		require.NoError(t, err)
+		require.NotNil(t, held)
+		assert.Equal(t, state.ApplyOperation.WaitingForCutover, held.State, "the claim leaves the operation parked")
+		assert.Equal(t, claimed.LeaseToken, held.LeaseToken)
+
+		again, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-b")
+		require.NoError(t, err)
+		assert.Nil(t, again, "the cancel is delivered by the drive that holds the lease, not re-claimed")
+
+		cutover, err := store.ApplyOperations().FindNextApplyOperationCutover(ctx, "driver-b")
+		require.NoError(t, err)
+		assert.Nil(t, cutover, "the parked operation still does not cut over behind the failure")
+	})
+
+	// A stop reaches a barrier rollout while shard 1 is still copying and
+	// shard 2 has parked at the barrier. Shard 1's drive stops its own copy,
+	// but shard 2's copy drive already exited at the barrier, and a pending
+	// stop keeps the cutover claim away from it. The stop makes it claimable
+	// once, for the drive that settles it stopped; without that the parent
+	// never derives stopped and the stop is never completed. The claim leaves
+	// it parked and is not repeated while that drive holds the lease.
+	t.Run("FindNextApplyOperation_PendingStopClaimsOperationParkedAtBarrier", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "apply_rollout_parked_stop_db", storage.DatabaseTypeMySQL)
+		rollout := CreateApplyWithStateEnvDeployment(t, store, lock, "apply_rollout_parked_stop", 9335, state.Apply.Pending, "production", "region-a")
+		insert := func(target, key, operationState string) int64 {
+			id, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+				ApplyID: rollout.ID, Deployment: "region-a", Target: target, OperationKey: storage.TargetOperationKey(target, key),
+				OperationKind: storage.ApplyOperationKindWork, CutoverPolicy: storage.CutoverPolicyBarrier, OnFailure: storage.OnFailureHalt,
+				State: operationState,
+			})
+			require.NoError(t, err)
+			return id
+		}
+		insert("orders-001", "step-1", state.ApplyOperation.Stopped)
+		parkedID := insert("orders-002", "step-1", state.ApplyOperation.WaitingForCutover)
+		insert("orders-003", "step-1", state.ApplyOperation.Stopped)
+		rollout.State = state.Apply.WaitingForCutover
+		require.NoError(t, store.Applies().Update(ctx, rollout))
+
+		idle, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-a")
+		require.NoError(t, err)
+		assert.Nil(t, idle, "without a control request nothing claims the parked or stopped operations")
+
+		_, alreadyPending, err := store.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+			ApplyID:   rollout.ID,
+			Operation: storage.ControlOperationStop,
+			Status:    storage.ControlRequestPending,
+			Metadata:  []byte(`{}`),
+		})
+		require.NoError(t, err)
+		require.False(t, alreadyPending)
+
+		cutover, err := store.ApplyOperations().FindNextApplyOperationCutover(ctx, "driver-b")
+		require.NoError(t, err)
+		assert.Nil(t, cutover, "a pending stop keeps the parked operation from cutting over")
+
+		claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-a")
+		require.NoError(t, err)
+		require.NotNil(t, claimed, "a pending stop makes the parked operation claimable")
+		assert.Equal(t, parkedID, claimed.ID)
+		held, err := store.ApplyOperations().Get(ctx, parkedID)
+		require.NoError(t, err)
+		require.NotNil(t, held)
+		assert.Equal(t, state.ApplyOperation.WaitingForCutover, held.State, "the claim leaves the operation parked")
+		assert.Equal(t, claimed.LeaseToken, held.LeaseToken)
+
+		again, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-b")
+		require.NoError(t, err)
+		assert.Nil(t, again, "the stop is delivered by the drive that holds the lease, not re-claimed")
+	})
+
+	// A deployment-keyed generation declared two targets and only target-002
+	// attached before the data plane failed. The operator drives that lone row
+	// under its operation lease because the manifest still expects target-001,
+	// so the redispatch claim charges the parent's retry budget and moves the
+	// row to running, the same as when a sibling has attached.
+	t.Run("FindNextApplyOperation_ManifestExpectedRedispatchMovesTheRowToRunning", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "apply_manifest_redispatch_db", storage.DatabaseTypeMySQL)
+		rollout := createManifestGeneration(t, store, lock, "apply_manifest_redispatch", 9333,
+			[]string{"target-001", "target-002"}, state.ApplyOperation.FailedRetryable, state.Task.FailedRetryable)
+		rollout.State = state.Apply.FailedRetryable
+		require.NoError(t, store.Applies().Update(ctx, rollout))
+
+		claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-a")
+		require.NoError(t, err)
+		require.NotNil(t, claimed, "a failed_retryable operation under a retryable parent must be claimable")
+		assert.Equal(t, "target-002", claimed.OperationKey)
+		assert.Equal(t, state.ApplyOperation.Running, claimed.State, "the redispatch claim returns the row it moved")
+
+		parent, err := store.Applies().Get(ctx, rollout.ID)
+		require.NoError(t, err)
+		require.NotNil(t, parent)
+		assert.Equal(t, 1, parent.Attempt, "the redispatch consumes one unit of the parent retry budget")
+
+		again, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-b")
+		require.NoError(t, err)
+		assert.Nil(t, again, "the claim never re-leases the row driver-a is resuming")
 	})
 
 	// Moving an existing apply back into an active state runs the same check as
@@ -1357,6 +1769,35 @@ func createApplyOnDeployment(t *testing.T, store storage.Storage, lock *storage.
 		State:           state.Apply.Pending,
 	})
 	return err
+}
+
+// createApplyTakingOver creates a pending staging apply with one task and one
+// operation that takes over the stopped applies named by takesOver, returning the
+// storage error so a test can assert whether the create committed.
+func createApplyTakingOver(t *testing.T, store storage.Storage, lock *storage.Lock, identifier string, planID int64, takesOver ...int64) (*storage.Apply, error) {
+	t.Helper()
+	apply := &storage.Apply{
+		ApplyIdentifier:   identifier,
+		LockID:            lock.ID,
+		PlanID:            planID,
+		Database:          lock.DatabaseName,
+		DatabaseType:      lock.DatabaseType,
+		Repository:        lock.Repository,
+		PullRequest:       lock.PullRequest,
+		Environment:       "staging",
+		Deployment:        "default",
+		Engine:            storage.EngineForType(lock.DatabaseType),
+		State:             state.Apply.Pending,
+		TakesOverApplyIDs: takesOver,
+	}
+	task := newTask(apply, "task_"+identifier, "users", time.Now())
+	op := &storage.ApplyOperation{Deployment: "default", OperationKey: "default", State: state.ApplyOperation.Pending}
+	id, err := store.Applies().CreateWithTasksAndOperations(t.Context(), apply, []*storage.Task{task}, []*storage.ApplyOperation{op})
+	if err != nil {
+		return nil, err
+	}
+	apply.ID = id
+	return apply, nil
 }
 
 // createManifestGeneration creates the first dispatch of a deployment-keyed

@@ -367,7 +367,7 @@ func TestE2ERollbackConfirmExecutesAndPostsComments(t *testing.T) {
 	assert.Contains(t, refusal, "**⛔ Rollback rejected**: 1 unsafe change detected")
 	assert.Contains(t, refusal, "`idx_name`")
 	assert.Contains(t, refusal, "DROP INDEX")
-	assert.Contains(t, refusal, "```\nschemabot rollback-confirm -e staging --allow-unsafe\n```")
+	assert.Contains(t, refusal, "```\nschemabot rollback-confirm -e staging\n```")
 	applies, err := svc.Storage().Applies().GetByDatabase(ctx, dbName, "mysql", "staging")
 	require.NoError(t, err)
 	for _, a := range applies {
@@ -1217,6 +1217,14 @@ func (s *recordingCheckStore) MarkStalePlanSuccessful(ctx context.Context, check
 		s.record("mark_stale_plan_successful", check.DatabaseName, check.Status, check.Conclusion)
 	}
 	return updated, err
+}
+
+func (s *recordingCheckStore) BlockStaleStartedApply(ctx context.Context, check *storage.Check, headSHA string) (bool, error) {
+	blocked, err := s.CheckStore.BlockStaleStartedApply(ctx, check, headSHA)
+	if err == nil && blocked {
+		s.record("block_stale_started_apply", check.DatabaseName, check.Status, check.Conclusion)
+	}
+	return blocked, err
 }
 
 func (s *recordingCheckStore) CompleteForApply(ctx context.Context, check *storage.Check, apply *storage.Apply) (bool, error) {

@@ -3,6 +3,7 @@ package planetscale
 import (
 	"context"
 	"errors"
+	"io"
 	"log/slog"
 	"os"
 	"strings"
@@ -372,6 +373,432 @@ func TestDeployDeployRequest_ApprovalRequirementFailsImmediately(t *testing.T) {
 	assert.Equal(t, 1, client.deployCalls)
 }
 
+// deployOutcomeUnknownClient fails every deploy call, the first ones with
+// earlierDeployErrs in order and the rest with deployErr, and serves a fixed
+// deploy request (or getErr) on the re-read, so tests can drive a deploy call
+// whose failure does or does not say whether PlanetScale started it.
+type deployOutcomeUnknownClient struct {
+	psclient.PSClient
+	earlierDeployErrs []error
+	deployErr         error
+	reread            *ps.DeployRequest
+	getErr            error
+	deployCalls       int
+	getCalls          int
+}
+
+func (c *deployOutcomeUnknownClient) DeployDeployRequest(context.Context, *ps.PerformDeployRequest) (*ps.DeployRequest, error) {
+	c.deployCalls++
+	if len(c.earlierDeployErrs) > 0 {
+		err := c.earlierDeployErrs[0]
+		c.earlierDeployErrs = c.earlierDeployErrs[1:]
+		return nil, err
+	}
+	return nil, c.deployErr
+}
+
+func (c *deployOutcomeUnknownClient) GetDeployRequest(context.Context, *ps.GetDeployRequestRequest) (*ps.DeployRequest, error) {
+	c.getCalls++
+	return c.reread, c.getErr
+}
+
+// PlanetScale accepts the deploy but the connection drops before the response
+// arrives. The re-read shows the deploy queued, so the deploy is tracked as
+// started instead of failing the apply while the schema change runs.
+func TestDeployDeployRequest_LostResponseAdoptsStartedDeploy(t *testing.T) {
+	e := New(slog.New(slog.NewTextHandler(os.Stdout, nil)))
+	client := &deployOutcomeUnknownClient{
+		deployErr: io.ErrUnexpectedEOF,
+		reread:    &ps.DeployRequest{Number: 7, DeploymentState: deployState.Queued},
+	}
+
+	dr, err := e.deployDeployRequest(t.Context(), client, "org", "testdb", 7, false, nil)
+
+	require.NoError(t, err)
+	require.NotNil(t, dr)
+	assert.Equal(t, uint64(7), dr.Number)
+	assert.Equal(t, deployState.Queued, dr.DeploymentState)
+	assert.Equal(t, 1, client.deployCalls)
+	assert.Equal(t, 1, client.getCalls)
+}
+
+// PlanetScale answers the deploy call by refusing it, so the deploy did not
+// start. The refusal is returned unchanged as the apply's failure, whether the
+// re-read shows the deploy request still ready or the re-read fails as well:
+// an answer from PlanetScale is not an unknown outcome, so the apply fails
+// promptly instead of pausing for a recovery that would be refused again.
+func TestDeployDeployRequest_RefusedDeployReturnsTheRefusal(t *testing.T) {
+	tests := []struct {
+		name   string
+		code   ps.ErrorCode
+		reread *ps.DeployRequest
+		getErr error
+	}{
+		{name: "permission denied, re-read still ready", code: ps.ErrPermission, reread: &ps.DeployRequest{Number: 8, DeploymentState: deployState.Ready}},
+		{name: "not found, re-read still ready", code: ps.ErrNotFound, reread: &ps.DeployRequest{Number: 8, DeploymentState: deployState.Ready}},
+		{name: "invalid request, re-read still ready", code: ps.ErrInvalid, reread: &ps.DeployRequest{Number: 8, DeploymentState: deployState.Ready}},
+		{name: "permission denied, re-read fails", code: ps.ErrPermission, getErr: &ps.Error{Code: ps.ErrPermission}},
+		{name: "not found, re-read returns nothing", code: ps.ErrNotFound},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			e := New(slog.New(slog.NewTextHandler(os.Stdout, nil)))
+			refusal := &ps.Error{Code: tt.code}
+			client := &deployOutcomeUnknownClient{deployErr: refusal, reread: tt.reread, getErr: tt.getErr}
+
+			dr, err := e.deployDeployRequest(t.Context(), client, "org", "testdb", 8, false, nil)
+
+			require.Error(t, err)
+			assert.Nil(t, dr)
+			assert.ErrorIs(t, err, refusal)
+			assert.Equal(t, "deploy deploy request #8: ", err.Error(), "the refusal is returned as it was, with nothing about the re-read")
+			assert.False(t, engine.IsOutcomeUnknown(err), "a refusal from PlanetScale is not an unknown outcome")
+			assert.Equal(t, 1, client.deployCalls)
+			assert.Equal(t, 1, client.getCalls)
+		})
+	}
+}
+
+// A deploy call that gets no refusal from PlanetScale (the connection drops,
+// PlanetScale answers with an internal error until the retries run out, or a
+// retry is refused after an earlier attempt may already have started the
+// deploy) while the re-read still shows the deploy request ready does not show
+// that the deploy did not start: a deploy still in flight can move the request
+// out of ready after the read. The outcome is reported as unknown, which the
+// drive pauses for a recovery that deploys the request only if it still reads
+// ready.
+func TestDeployDeployRequest_UnrefusedDeployStillReadyReportsUnknownOutcome(t *testing.T) {
+	shortenKeyspaceRetries(t, time.Millisecond, time.Second)
+	tests := []struct {
+		name        string
+		earlierErrs []error
+		deployErr   error
+		wantCalls   int
+	}{
+		{name: "connection dropped", deployErr: io.ErrUnexpectedEOF, wantCalls: 1},
+		{name: "internal error until the retries run out", deployErr: &ps.Error{Code: ps.ErrInternal}, wantCalls: maxRetries},
+		{name: "an answer the SDK does not type", deployErr: &ps.Error{}, wantCalls: 1},
+		{name: "refusal answering a retry", earlierErrs: []error{&ps.Error{Code: ps.ErrInternal}}, deployErr: &ps.Error{Code: ps.ErrInvalid}, wantCalls: 2},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			e := New(slog.New(slog.NewTextHandler(os.Stdout, nil)))
+			client := &deployOutcomeUnknownClient{
+				earlierDeployErrs: tt.earlierErrs,
+				deployErr:         tt.deployErr,
+				reread:            &ps.DeployRequest{Number: 8, DeploymentState: deployState.Ready},
+			}
+
+			dr, err := e.deployDeployRequest(t.Context(), client, "org", "testdb", 8, false, nil)
+
+			require.Error(t, err)
+			assert.Nil(t, dr)
+			assert.ErrorIs(t, err, tt.deployErr)
+			assert.Contains(t, err.Error(), "deploy request #8 still reads ready")
+			assert.True(t, engine.IsOutcomeUnknown(err), "a ready re-read after an unrefused deploy call leaves the outcome unknown")
+			assert.True(t, engine.IsRetryable(err))
+			assert.Equal(t, tt.wantCalls, client.deployCalls)
+			assert.Equal(t, 1, client.getCalls)
+		})
+	}
+}
+
+// When the re-read also fails, or returns no deploy request, nothing shows
+// whether the deploy started, so the outcome is reported as unknown, which the
+// drive pauses for recovery rather than failing, with every error attached
+// rather than either one alone.
+func TestDeployDeployRequest_FailedRereadReportsUnknownOutcome(t *testing.T) {
+	t.Run("re-read fails", func(t *testing.T) {
+		e := New(slog.New(slog.NewTextHandler(os.Stdout, nil)))
+		rereadErr := errors.New("connection reset by peer")
+		client := &deployOutcomeUnknownClient{deployErr: io.ErrUnexpectedEOF, getErr: rereadErr}
+
+		dr, err := e.deployDeployRequest(t.Context(), client, "org", "testdb", 9, false, nil)
+
+		require.Error(t, err)
+		assert.Nil(t, dr)
+		assert.ErrorIs(t, err, io.ErrUnexpectedEOF)
+		assert.ErrorIs(t, err, rereadErr)
+		assert.Contains(t, err.Error(), "re-reading deploy request #9")
+		assert.True(t, engine.IsOutcomeUnknown(err), "a failed re-read leaves the deploy outcome unknown")
+		assert.True(t, engine.IsRetryable(err), "an unknown outcome is never a permanent failure")
+	})
+
+	t.Run("re-read returns no deploy request", func(t *testing.T) {
+		e := New(slog.New(slog.NewTextHandler(os.Stdout, nil)))
+		client := &deployOutcomeUnknownClient{deployErr: io.ErrUnexpectedEOF}
+
+		dr, err := e.deployDeployRequest(t.Context(), client, "org", "testdb", 9, false, nil)
+
+		require.Error(t, err)
+		assert.Nil(t, dr)
+		assert.ErrorIs(t, err, io.ErrUnexpectedEOF)
+		assert.Contains(t, err.Error(), "re-reading deploy request #9 to check whether the deploy started returned no deploy request")
+		assert.True(t, engine.IsOutcomeUnknown(err), "an empty re-read leaves the deploy outcome unknown")
+		assert.True(t, engine.IsRetryable(err))
+	})
+}
+
+// A deploy call refused while the deploy request sits in a state that shows no
+// accepted deploy, such as a failed state, a no-changes result or a state
+// SchemaBot does not know, returns the refusal instead of tracking the request
+// as deployed: the drive would otherwise report a deploy that never ran. A
+// state that shows the deploy was accepted is still tracked, even without a
+// deploy timestamp.
+func TestDeployDeployRequest_ErroredUndeployedRequestIsNotAdopted(t *testing.T) {
+	for _, deploymentState := range []string{deployState.Error, deployState.Failed, deployState.CompleteError, deployState.NoChanges, "some_future_state"} {
+		t.Run(deploymentState+" is not adopted", func(t *testing.T) {
+			e := New(slog.New(slog.NewTextHandler(os.Stdout, nil)))
+			client := &deployOutcomeUnknownClient{
+				deployErr: &ps.Error{Code: ps.ErrNotFound},
+				reread:    &ps.DeployRequest{Number: 7, DeploymentState: deploymentState},
+			}
+
+			dr, err := e.deployDeployRequest(t.Context(), client, "org", "testdb", 7, false, nil)
+
+			require.Error(t, err)
+			assert.Nil(t, dr)
+			assert.False(t, engine.IsOutcomeUnknown(err))
+		})
+	}
+
+	deployedAt := time.Date(2026, 10, 15, 12, 0, 0, 0, time.UTC)
+	for _, accepted := range []*ps.DeployRequest{
+		{Number: 7, DeploymentState: deployState.PendingCutover},
+		{Number: 7, DeploymentState: deployState.Ready, DeployedAt: &deployedAt},
+	} {
+		t.Run(accepted.DeploymentState+" with deployed at "+formatDeployedAt(accepted.DeployedAt)+" is adopted", func(t *testing.T) {
+			e := New(slog.New(slog.NewTextHandler(os.Stdout, nil)))
+			client := &deployOutcomeUnknownClient{deployErr: &ps.Error{Code: ps.ErrNotFound}, reread: accepted}
+
+			dr, err := e.deployDeployRequest(t.Context(), client, "org", "testdb", 7, false, nil)
+
+			require.NoError(t, err)
+			assert.Same(t, accepted, dr)
+		})
+	}
+}
+
+// unansweredDeployClient carries an apply to its deploy: the branch is ready
+// and its credentials are issued, the deploy request it creates is ready to
+// deploy, the deploy call loses its response, and re-reading the deploy
+// request fails too, so the deploy outcome is unknown.
+type unansweredDeployClient struct {
+	branchHandoverClient
+}
+
+func (c *unansweredDeployClient) CreateDeployRequest(context.Context, *ps.CreateDeployRequestRequest) (*ps.DeployRequest, error) {
+	return &ps.DeployRequest{Number: 93, DeploymentState: deployState.Ready, HtmlURL: "https://app/dr/93"}, nil
+}
+
+func (c *unansweredDeployClient) DeployDeployRequest(context.Context, *ps.PerformDeployRequest) (*ps.DeployRequest, error) {
+	return nil, io.ErrUnexpectedEOF
+}
+
+func (c *unansweredDeployClient) GetDeployRequest(context.Context, *ps.GetDeployRequestRequest) (*ps.DeployRequest, error) {
+	return nil, errors.New("connection reset by peer")
+}
+
+// unknownOutcomeRecordCases are the ways the resume state can come to name, or
+// not name, the deploy request whose deploy outcome is unknown. Only a deploy
+// request the stored resume state names can be re-read by recovery, so only
+// then is the unknown outcome paused for recovery; otherwise the apply fails.
+var unknownOutcomeRecordCases = []struct {
+	name          string
+	record        bool
+	saveErr       error
+	wantRetryable bool
+}{
+	{name: "the resume state names the deploy request", record: true, wantRetryable: true},
+	{name: "storage refused the resume state", record: true, saveErr: errors.New("apply apply-0123456789abcdef: storage unavailable"), wantRetryable: false},
+	{name: "no resume state is recorded", record: false, wantRetryable: false},
+}
+
+// assertUnknownDeployOutcome checks the error a drive whose deploy outcome is
+// unknown returns: paused for recovery when the resume state names the deploy
+// request, failed when it does not.
+func assertUnknownDeployOutcome(t *testing.T, err error, wantRetryable bool) {
+	t.Helper()
+	require.Error(t, err)
+	assert.ErrorIs(t, err, io.ErrUnexpectedEOF)
+	assert.Equal(t, wantRetryable, engine.IsRetryable(err))
+	if wantRetryable {
+		assert.True(t, engine.IsOutcomeUnknown(err), "the deploy may be running, so it is paused for recovery")
+		return
+	}
+	assert.Contains(t, err.Error(), "deploy request #93 may have started, but the resume state does not name it for recovery")
+}
+
+// A fresh apply records its deploy request in the resume state before it
+// deploys, and then loses the deploy's response and the re-read. When the save
+// landed, the apply is paused for the recovery that re-reads that deploy
+// request; when it did not, recovery would start the apply over beside a
+// deploy that may be running, so the apply fails instead.
+func TestApply_UnknownDeployOutcomePausesOnlyWhenTheDeployRequestIsRecorded(t *testing.T) {
+	shortenEngineWaits(t)
+	for _, tt := range unknownOutcomeRecordCases {
+		t.Run(tt.name, func(t *testing.T) {
+			req := &engine.ApplyRequest{
+				PlanID:      "plan-0123456789abcdef",
+				Database:    "commerce",
+				Credentials: conformanceCredentials(),
+			}
+			var stored []*engine.ResumeState
+			if tt.record {
+				req.ResumeState = &engine.ResumeState{MigrationContext: "apply-0123456789abcdef"}
+				req.OnStateChange = func(rs *engine.ResumeState) error {
+					if tt.saveErr != nil {
+						return tt.saveErr
+					}
+					stored = append(stored, rs)
+					return nil
+				}
+			}
+
+			_, err := conformanceEngine(&unansweredDeployClient{}).Apply(t.Context(), req)
+
+			assertUnknownDeployOutcome(t, err, tt.wantRetryable)
+			if tt.wantRetryable {
+				require.NotEmpty(t, stored)
+				meta, decodeErr := decodePSMetadata(stored[len(stored)-1].Metadata)
+				require.NoError(t, decodeErr)
+				assert.Equal(t, uint64(93), meta.DeployRequestID, "the stored resume state names the deploy request recovery re-reads")
+			}
+		})
+	}
+}
+
+// A resumed apply creates the deploy request its crashed drive never did,
+// records it, and then loses the deploy's response and the re-read. As on a
+// fresh apply, the unknown outcome is paused for recovery only when the
+// resume state naming the deploy request was saved.
+func TestResumeApply_UnknownDeployOutcomePausesOnlyWhenTheDeployRequestIsRecorded(t *testing.T) {
+	shortenEngineWaits(t)
+	for _, tt := range unknownOutcomeRecordCases {
+		t.Run(tt.name, func(t *testing.T) {
+			client := &unansweredDeployClient{}
+			req := resumeRequest(t, &psMetadata{BranchName: "schemabot-testdb-1a2b"}, "apply-1a2b3c4d5e6f7890")
+			if tt.record {
+				req.OnStateChange = func(*engine.ResumeState) error { return tt.saveErr }
+			}
+
+			_, err := conformanceEngine(client).resumeApply(t.Context(), client, "org", req)
+
+			assertUnknownDeployOutcome(t, err, tt.wantRetryable)
+			assert.Contains(t, err.Error(), "deploy on resume")
+		})
+	}
+}
+
+// A deploy whose outcome is unknown pauses the apply for a recovery that
+// re-reads the deploy request named in the resume state. When the resume state
+// does not name it, that recovery would start the apply over, so the error is
+// made permanent; every other error passes through unchanged.
+func TestUnknownDeployOutcomeNeedsRecord(t *testing.T) {
+	e := New(slog.New(slog.NewTextHandler(os.Stdout, nil)))
+	unknown := engine.NewOutcomeUnknownError("deploy deploy request #12: %w", io.ErrUnexpectedEOF)
+	refused := errors.New("deploy request #12 is closed")
+
+	recorded := e.unknownDeployOutcomeNeedsRecord(unknown, true, "testdb", 12)
+	assert.Same(t, unknown, recorded)
+	assert.True(t, engine.IsRetryable(recorded))
+
+	unrecorded := e.unknownDeployOutcomeNeedsRecord(unknown, false, "testdb", 12)
+	assert.False(t, engine.IsRetryable(unrecorded), "a deploy recovery cannot find is failed, not paused")
+	assert.ErrorIs(t, unrecorded, io.ErrUnexpectedEOF)
+	assert.Contains(t, unrecorded.Error(), "deploy request #12 may have started, but the resume state does not name it for recovery")
+
+	assert.Same(t, refused, e.unknownDeployOutcomeNeedsRecord(refused, false, "testdb", 12))
+}
+
+// lostDeployResponseClient models PlanetScale accepting a deploy whose response
+// never arrives: every deploy call starts the deploy and then fails, and the
+// first rereadFailures re-reads after the deploy started fail too. Before the
+// deploy starts, the deploy request reads ready.
+type lostDeployResponseClient struct {
+	psclient.PSClient
+	rereadErr      error
+	rereadFailures int
+	started        bool
+	getCalls       int
+	deployCalls    int
+}
+
+func (c *lostDeployResponseClient) GetDeployRequest(_ context.Context, req *ps.GetDeployRequestRequest) (*ps.DeployRequest, error) {
+	c.getCalls++
+	if c.started && c.rereadFailures > 0 {
+		c.rereadFailures--
+		return nil, c.rereadErr
+	}
+	dr := &ps.DeployRequest{Number: req.Number, DeploymentState: deployState.Ready, HtmlURL: "https://app/dr/11"}
+	if c.started {
+		dr.DeploymentState = deployState.Queued
+	}
+	return dr, nil
+}
+
+func (c *lostDeployResponseClient) DeployDeployRequest(context.Context, *ps.PerformDeployRequest) (*ps.DeployRequest, error) {
+	c.deployCalls++
+	c.started = true
+	return nil, io.ErrUnexpectedEOF
+}
+
+func (c *lostDeployResponseClient) DeployRequestAutoCutover(context.Context, string, string, uint64) (bool, error) {
+	return false, nil
+}
+
+// A recovered deploy request is deployed, PlanetScale starts the deploy but the
+// response is lost, and the re-read that would show the deploy started fails
+// too. The resume reports an unknown outcome instead of a failure, so the drive
+// pauses the apply. The recovery that follows re-reads the same deploy request
+// from the same resume state, finds the deploy queued, and reattaches to it
+// without deploying again.
+func TestResumeExistingDeployRequest_LostResponseThenFailedRereadRecoversWithoutRedeploying(t *testing.T) {
+	e := New(slog.New(slog.NewTextHandler(os.Stdout, nil)))
+	rereadErr := errors.New("connection reset by peer")
+	client := &lostDeployResponseClient{rereadErr: rereadErr, rereadFailures: 1}
+	meta := &psMetadata{BranchName: "schemabot-testdb-lost", DeployRequestID: 11}
+
+	result, err := e.resumeExistingDeployRequest(t.Context(), client, "org", resumeRequest(t, meta, "singularity:real-context"), meta)
+
+	require.Error(t, err)
+	assert.Nil(t, result)
+	assert.True(t, engine.IsOutcomeUnknown(err), "the deploy may be running, so its outcome is unknown, not failed")
+	assert.True(t, engine.IsRetryable(err))
+	assert.ErrorIs(t, err, io.ErrUnexpectedEOF)
+	assert.ErrorIs(t, err, rereadErr)
+	assert.Equal(t, 1, client.deployCalls)
+
+	result, err = e.resumeExistingDeployRequest(t.Context(), client, "org", resumeRequest(t, meta, "singularity:real-context"), meta)
+
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	assert.True(t, result.Accepted)
+	assert.Contains(t, result.Message, "Resumed deploy request #11 (state: queued)")
+	assert.Equal(t, 1, client.deployCalls, "recovery reattaches to the deploy that started instead of deploying again")
+}
+
+// Every retry of a transient deploy error fails, but an earlier attempt
+// reached PlanetScale and started the deploy. The re-read after the retry
+// budget runs out tracks the running deploy instead of failing the apply.
+func TestDeployDeployRequest_RetriesExhaustedAdoptsStartedDeploy(t *testing.T) {
+	shortenKeyspaceRetries(t, time.Millisecond, time.Second)
+	e := New(slog.New(slog.NewTextHandler(os.Stdout, nil)))
+	deployedAt := time.Date(2026, 10, 15, 12, 0, 0, 0, time.UTC)
+	client := &deployOutcomeUnknownClient{
+		deployErr: &ps.Error{Code: ps.ErrInternal},
+		reread:    &ps.DeployRequest{Number: 10, DeploymentState: deployState.InProgress, DeployedAt: &deployedAt},
+	}
+
+	dr, err := e.deployDeployRequest(t.Context(), client, "org", "testdb", 10, false, nil)
+
+	require.NoError(t, err)
+	require.NotNil(t, dr)
+	assert.Equal(t, deployState.InProgress, dr.DeploymentState)
+	assert.Equal(t, maxRetries, client.deployCalls)
+	assert.Equal(t, 1, client.getCalls)
+}
+
 // resumeDeployClient returns a fixed deploy request on Get and records whether a
 // deploy was started. The recovered deploy request lets resume tests drive the
 // reattach path without a live PlanetScale API or vtgate.
@@ -625,6 +1052,38 @@ func TestResumeExistingDeployRequest_DeploysReadyNeverStarted(t *testing.T) {
 			stored, err := decodePSMetadata(result.ResumeState.Metadata)
 			require.NoError(t, err)
 			assert.Equal(t, tt.wantInstant, stored.IsInstant, "stored state carries the decision that was deployed")
+		})
+	}
+}
+
+// A failure while reattaching to the stored deploy request is marked
+// engine.ErrReattachFailed, so the caller knows the deploy request is still the
+// one a later resume reattaches to. When the stored deploy request is gone and
+// the resume starts afresh, the fresh path's failure is not marked: no stored
+// work is being reattached to any more.
+func TestResumeExistingDeployRequest_MarksOnlyReattachFailures(t *testing.T) {
+	rateLimited := errors.New("rate limited")
+	tests := []struct {
+		name         string
+		getErr       error
+		wantReattach bool
+	}{
+		{name: "transient lookup error reattaching", getErr: rateLimited, wantReattach: true},
+		{name: "deploy request gone, fresh start fails", getErr: &ps.Error{Code: ps.ErrNotFound}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			e := New(slog.New(slog.DiscardHandler))
+			client := &resumeDeployClient{getErr: tt.getErr}
+			meta := &psMetadata{BranchName: "schemabot-testdb-xyz", DeployRequestID: 7}
+
+			_, err := e.resumeExistingDeployRequest(t.Context(), client, "org", resumeRequest(t, meta, ""), meta)
+
+			require.Error(t, err)
+			assert.Equal(t, tt.wantReattach, errors.Is(err, engine.ErrReattachFailed))
+			if tt.wantReattach {
+				assert.ErrorIs(t, err, rateLimited, "the marked error still carries its cause")
+			}
 		})
 	}
 }

@@ -8,6 +8,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -46,6 +48,43 @@ type Globals struct {
 // Resolve resolves the API endpoint from the global flags.
 func (g *Globals) Resolve() (string, error) {
 	return resolveEndpoint(g.Endpoint, g.Profile)
+}
+
+// RouteFlags returns the global flags that select which server a command
+// talks to, as the operator passed them, for cliname.SetRoute. Call it after
+// parsing and before anything rewrites Endpoint with a resolved one. The token
+// is never included, and the endpoint is stripped of any credentials, query,
+// or fragment, because hints are printed to the terminal and to CI logs.
+func (g *Globals) RouteFlags() []cliname.Flag {
+	var flags []cliname.Flag
+	if g.Profile != "" {
+		flags = append(flags, cliname.Flag{Name: "--profile", Value: g.Profile})
+	}
+	if endpoint := endpointForHint(g.Endpoint); endpoint != "" {
+		flags = append(flags, cliname.Flag{Name: "--endpoint", Value: endpoint})
+	}
+	return flags
+}
+
+// endpointForHint is the endpoint as a hint may print it: scheme, host, and
+// path only. An endpoint that does not parse as a URL is left out rather than
+// printed, since there is no way to tell which part of it is a credential.
+// The parse error is not logged for the same reason: it quotes the endpoint.
+func endpointForHint(endpoint string) string {
+	if endpoint == "" {
+		return ""
+	}
+	u, err := url.Parse(endpoint)
+	if err != nil {
+		slog.Debug("leaving an unparseable endpoint out of command hints")
+		return ""
+	}
+	u.User = nil
+	u.RawQuery = ""
+	u.ForceQuery = false
+	u.Fragment = ""
+	u.RawFragment = ""
+	return u.String()
 }
 
 // ControlFlags holds flags for commands that target a specific schema change.
@@ -575,9 +614,9 @@ func buildApplyOptions(planResult *apitypes.PlanResponse, deferCutover, deferDep
 // printWatchInstructions prints the "To watch and manage" hint.
 func printWatchInstructions(applyID, database, environment string) {
 	if applyID != "" {
-		fmt.Printf("To watch and manage: %s progress %s\n", cliname.Name(), applyID)
+		fmt.Printf("To watch and manage: %s\n", templates.ProgressCommand(applyID, environment))
 	} else {
-		fmt.Printf("To watch and manage: %s status -d %s -e %s\n", cliname.Name(), database, environment)
+		fmt.Printf("To watch and manage: %s\n", cliname.Command("status", "-d", database, "-e", environment))
 	}
 }
 

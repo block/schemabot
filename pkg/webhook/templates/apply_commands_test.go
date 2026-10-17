@@ -14,8 +14,8 @@ import (
 // blocked user knows who to ask instead of guessing at the access model. The
 // database's own operators lead in their own section — mirroring the
 // review-required comment — with the broader admins as an explicit fallback.
-// Principals render as inline code, never @-mentions — the list is guidance,
-// and mentions would notify every admin and operator on every rejection.
+// Principals render as @-mentions, the same as the review-required comment's
+// reviewer list.
 func TestRenderPRCommandNotAuthorizedListsPrincipals(t *testing.T) {
 	out := RenderPRCommandNotAuthorized(ActorAuthorizationCommentData{
 		RequestedBy: "dave", CommandName: "apply", Database: "orders", Environment: "production",
@@ -25,23 +25,21 @@ func TestRenderPRCommandNotAuthorizedListsPrincipals(t *testing.T) {
 	require.Contains(t, out, "@dave is not authorized")
 	require.Contains(t, out, "**Operators of `orders`**")
 	require.Contains(t, out, "**Other authorized teams and users**")
-	require.Contains(t, out, "- `octocat/orders-operators`")
-	require.Contains(t, out, "- `lee`")
-	require.Contains(t, out, "- `octocat/db-admins`")
-	require.Contains(t, out, "- `kara`")
-	operatorsIdx := strings.Index(out, "- `octocat/orders-operators`")
-	othersIdx := strings.Index(out, "- `octocat/db-admins`")
+	require.Contains(t, out, "- @octocat/orders-operators")
+	require.Contains(t, out, "- @lee")
+	require.Contains(t, out, "- @octocat/db-admins")
+	require.Contains(t, out, "- @kara")
+	operatorsIdx := strings.Index(out, "- @octocat/orders-operators")
+	othersIdx := strings.Index(out, "- @octocat/db-admins")
 	require.Less(t, operatorsIdx, othersIdx, "the database's operators lead the list")
 	require.Contains(t, out, "request membership in one of the teams above", "teams are listed, so joining one is offered")
-	require.NotContains(t, out, "@octocat/db-admins", "team principals must never render as mentions")
-	require.NotContains(t, out, "@kara", "user principals must never render as mentions")
 
 	noOperators := RenderPRCommandNotAuthorized(ActorAuthorizationCommentData{
 		RequestedBy: "dave", CommandName: "apply", Database: "orders", Environment: "production",
 		OtherPrincipals: []string{"octocat/db-admins", "kara"},
 	})
 	require.Contains(t, noOperators, "**Who can run this command**")
-	require.Contains(t, noOperators, "- `octocat/db-admins`")
+	require.Contains(t, noOperators, "- @octocat/db-admins")
 	require.NotContains(t, noOperators, "Operators of", "a database with no operators renders one flat list")
 
 	usersOnly := RenderPRCommandNotAuthorized(ActorAuthorizationCommentData{
@@ -109,4 +107,87 @@ func TestRenderApplyStartedReflectsWhetherTheApplyHasStarted(t *testing.T) {
 	running := RenderApplyStarted(data)
 	assert.Contains(t, running, "Schema changes are being applied. This comment will be updated with progress.")
 	assert.NotContains(t, running, "Queued")
+}
+
+// An apply commented while this PR's own apply is still active names the step
+// that state is waiting on, when it waits on an operator, and always ends with
+// the apply to paste once the active one finishes.
+func TestRenderApplyInProgressNamesTheNextStep(t *testing.T) {
+	base := ApplyLockConflictData{
+		Database:          "orders",
+		Environment:       "staging",
+		RequestedBy:       "alice",
+		ApplyID:           "apply-abc123",
+		Tenant:            "payments",
+		ApplyAgainCommand: "schemabot apply -e staging --tenant payments",
+	}
+	applyAgain := "apply again:\n```\nschemabot apply -e staging --tenant payments\n```\n"
+
+	t.Run("a running apply is waited on, then applied again", func(t *testing.T) {
+		data := base
+		data.ApplyState = state.Apply.Running
+		out := RenderApplyInProgress(data)
+		assert.Contains(t, out, "This PR's apply `apply-abc123` is still running (state: `running`), so a second apply cannot start.")
+		assert.Contains(t, out, "Once it finishes, "+applyAgain)
+		assert.NotContains(t, out, "schemabot cutover")
+		assert.NotContains(t, out, "schemabot skip-revert")
+	})
+
+	t.Run("a deferred cutover names the cutover command first", func(t *testing.T) {
+		data := base
+		data.ApplyState = state.Apply.WaitingForCutover
+		data.DeferCutover = true
+		out := RenderApplyInProgress(data)
+		assert.Contains(t, out, "This PR's apply `apply-abc123` is waiting for cutover, so a second apply cannot start.")
+		assert.Contains(t, out, "To cut over:\n```\nschemabot cutover apply-abc123 -e staging --tenant payments\n```\n")
+		assert.Contains(t, out, "Once it completes, "+applyAgain)
+		assert.Less(t, strings.Index(out, "schemabot cutover"), strings.Index(out, "schemabot apply"))
+	})
+
+	t.Run("a cutover SchemaBot triggers itself is only waited on", func(t *testing.T) {
+		data := base
+		data.ApplyState = state.Apply.WaitingForCutover
+		out := RenderApplyInProgress(data)
+		assert.Contains(t, out, "is still running (state: `waiting_for_cutover`)")
+		assert.NotContains(t, out, "schemabot cutover")
+		assert.Contains(t, out, "Once it finishes, "+applyAgain)
+	})
+
+	t.Run("a deploy request waiting to deploy names the cutover command", func(t *testing.T) {
+		data := base
+		data.ApplyState = state.Apply.WaitingForDeploy
+		out := RenderApplyInProgress(data)
+		assert.Contains(t, out, "To cut over:\n```\nschemabot cutover apply-abc123 -e staging --tenant payments\n```\n")
+	})
+
+	t.Run("an open revert window names skip-revert", func(t *testing.T) {
+		data := base
+		data.ApplyState = state.Apply.RevertWindow
+		out := RenderApplyInProgress(data)
+		assert.Contains(t, out, "This PR's apply `apply-abc123` is in its revert window, so a second apply cannot start.")
+		assert.Contains(t, out, "To keep its changes and close the window:\n```\nschemabot skip-revert apply-abc123 -e staging --tenant payments\n```\n")
+		assert.Contains(t, out, "Once it completes, "+applyAgain)
+	})
+
+	t.Run("an apply in another environment is named by it and addressed there", func(t *testing.T) {
+		data := base
+		data.ApplyEnvironment = "production"
+		data.ApplyState = state.Apply.WaitingForCutover
+		data.DeferCutover = true
+		out := RenderApplyInProgress(data)
+		assert.Contains(t, out, "This PR's production apply `apply-abc123` is waiting for cutover, so a second apply cannot start.")
+		assert.Contains(t, out, "To cut over:\n```\nschemabot cutover apply-abc123 -e production --tenant payments\n```\n")
+		assert.Contains(t, out, "Once it completes, "+applyAgain, "the apply to run again stays in the requested environment")
+
+		data.ApplyState = state.Apply.RevertWindow
+		assert.Contains(t, RenderApplyInProgress(data), "```\nschemabot skip-revert apply-abc123 -e production --tenant payments\n```\n")
+	})
+
+	t.Run("without a rendered apply command the plain apply is offered", func(t *testing.T) {
+		data := base
+		data.ApplyState = state.Apply.Running
+		data.ApplyAgainCommand = ""
+		out := RenderApplyInProgress(data)
+		assert.Contains(t, out, "apply again:\n```\nschemabot apply -e staging --tenant payments\n```\n")
+	})
 }
