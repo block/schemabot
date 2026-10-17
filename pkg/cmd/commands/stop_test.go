@@ -86,14 +86,17 @@ func TestStopCmdReportsAlreadyStopped(t *testing.T) {
 }
 
 // A server that predates the already-stopped code refuses a stop on a stopped
-// schema change with a bare conflict. The CLI still reports it as already
-// stopped rather than as a failure.
-func TestStopCmdReportsAlreadyStoppedFromAnOlderServer(t *testing.T) {
-	server, _ := stopTestServer(t, http.StatusConflict, apitypes.ErrorResponse{
+// schema change with a bare conflict, including when a start is queued behind
+// it that will still resume the rollout. The CLI surfaces that refusal as an
+// error rather than reporting the schema change as stopped.
+func TestStopCmdSurfacesABareConflictFromAnOlderServer(t *testing.T) {
+	server, stopCalls := stopTestServer(t, http.StatusConflict, apitypes.ErrorResponse{
 		Error: "stop rejected: schema change is already terminal (current state: stopped)",
 	})
 
 	out, err := runStopCmd(t, server.URL)
-	require.NoError(t, err)
-	assert.Equal(t, "Schema change already stopped\n", out)
+	require.Error(t, err)
+	assert.Equal(t, 1, *stopCalls)
+	assert.Contains(t, err.Error(), "stop rejected: schema change is already terminal (current state: stopped)")
+	assert.NotContains(t, out, "Schema change already stopped")
 }

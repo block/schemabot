@@ -22,7 +22,8 @@ import (
 // the same write that records it, so no claim resumes the rollout, and it is
 // answered on the spot rather than left pending on a stopped apply where no
 // drive would consume it (CO-2). Once a claim has already moved an operation to
-// resuming, the stop stays pending for the drive that holds it. A stopped
+// resuming, the stop stays pending for the drive that holds it, which answers
+// it if it stands down without resuming anything. A stopped
 // rollout with no start queued has nothing to stop, and the stop is refused
 // with a code the CLI reports as already stopped (CO-6).
 func TestStopWithdrawsAQueuedStart(t *testing.T) {
@@ -96,6 +97,37 @@ func TestStopWithdrawsAQueuedStart(t *testing.T) {
 
 		requireStatus(t, applyID, storage.ControlOperationStart, storage.ControlRequestCompleted)
 		requireStatus(t, applyID, storage.ControlOperationStop, storage.ControlRequestPending)
+	})
+
+	// A driver claims an operation for the queued start, and the stop withdraws
+	// the start before that driver loads the parent. The drive finds nothing
+	// left to deliver, stands its operation down, and answers the stop it was
+	// left pending for, so the stop does not strand on the stopped rollout.
+	t.Run("SettlesTheStopWhenTheClaimedDriveStandsDown", func(t *testing.T) {
+		applyID := seedStoppedRollout(t, "stop-after-claim-stands-down", nil)
+		requestStart(t, applyID)
+
+		op, err := stor.ApplyOperations().FindNextApplyOperation(ctx, "driver-under-test")
+		require.NoError(t, err)
+		require.NotNil(t, op, "the queued start leases a stopped operation")
+		require.Equal(t, applyID, op.ApplyID)
+
+		resp, _, err := stop(t, getApply(t, ctx, stor, applyID))
+		require.NoError(t, err)
+		assert.True(t, resp.Accepted)
+		assert.Empty(t, resp.Status, "the stop is left pending for the claimed drive")
+		requireStatus(t, applyID, storage.ControlOperationStop, storage.ControlRequestPending)
+
+		svc.recoverMultiApplyOperation(ctx, 1, op, op.Lease())
+
+		requireStatus(t, applyID, storage.ControlOperationStart, storage.ControlRequestCompleted)
+		requireStatus(t, applyID, storage.ControlOperationStop, storage.ControlRequestCompleted)
+		assert.Equal(t, state.Apply.Stopped, getApply(t, ctx, stor, applyID).State, "the rollout stays stopped")
+		ops, err := stor.ApplyOperations().ListByApply(ctx, applyID)
+		require.NoError(t, err)
+		for _, o := range ops {
+			assert.Equal(t, state.ApplyOperation.Stopped, o.State, "operation %s rests stopped", o.Deployment)
+		}
 	})
 
 	t.Run("StopsTheRolloutAClaimResumedSinceTheRead", func(t *testing.T) {

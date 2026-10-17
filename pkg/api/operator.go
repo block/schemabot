@@ -1507,6 +1507,12 @@ func (s *Service) driveClaimedMultiOperation(ctx context.Context, driverID int, 
 		}
 		if stoppedParentRequest == "" {
 			s.reconcileClaimedOperationFromTerminalParent(operationLeaseCtx, driverID, op, apply)
+			if err := s.completeStopForStoodDownRollout(operationLeaseCtx, driverID, apply); err != nil {
+				s.logger.Error("operator: failed to settle pending stop for stopped rollout whose claimed operation stood down; stop stays pending",
+					append(apply.LogAttrs(),
+						"driver", driverID, "apply_operation_id", op.ID,
+						"operation_deployment", op.Deployment, "error", err)...)
+			}
 			return claimSpent
 		}
 		s.logger.Info("operator: driving operation of stopped rollout to deliver pending control request",
@@ -2053,6 +2059,25 @@ func (s *Service) stoppedRolloutDeliverableRequest(ctx context.Context, apply *s
 	return "", nil
 }
 
+// completeStopForStoodDownRollout settles a stop left pending on a stopped
+// rollout for an operation drive that has since stood down. A stop that
+// withdraws a queued start after a claim has moved an operation on stays
+// pending for that drive, but a drive that reads the parent only after the
+// withdrawal finds nothing to deliver and mirrors the parent instead of
+// resuming. Once every operation rests again the stop has reached them all, so
+// it is answered here; while a sibling drive is still working, the stop stays
+// pending for that drive to deliver (CO-4). No-op unless the apply is stopped
+// with a stop pending.
+func (s *Service) completeStopForStoodDownRollout(ctx context.Context, driverID int, apply *storage.Apply) error {
+	if !state.IsState(apply.State, state.Apply.Stopped) {
+		return nil
+	}
+	if err := s.stopPendingOperationsForPendingStop(ctx, driverID, apply); err != nil {
+		return err
+	}
+	return s.completeLandedStopForHeldOpenApply(ctx, s.driverLogger(driverID), apply)
+}
+
 // stoppedRolloutCancelPending reports whether a stopped apply has a pending
 // cancel. The caller must have established that the apply is stopped.
 func (s *Service) stoppedRolloutCancelPending(ctx context.Context, apply *storage.Apply) (bool, error) {
@@ -2164,7 +2189,8 @@ func (s *Service) completePendingControlRequestsIfApplyResolved(ctx context.Cont
 }
 
 // completeLandedStopForHeldOpenApply completes a pending stop request on an
-// apply the rollout projection is still holding open.
+// apply the rollout projection is still holding open, or on a stopped rollout
+// whose claimed operation stood down (completeStopForStoodDownRollout).
 //
 // A stopped operation still holds its target, so a rollout an operator stopped
 // can carry a running-family verdict with every one of its operations already
