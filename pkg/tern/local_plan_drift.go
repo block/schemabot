@@ -169,28 +169,9 @@ func (c *LocalClient) verifyMaterializedPlanMatchesLiveSchema(ctx context.Contex
 		targetShard = shard
 	}
 
-	result, err := c.planWithEngine(ctx, &ternv1.PlanRequest{
-		Database:    c.config.Database,
-		Type:        c.config.Type,
-		Environment: req.Environment,
-		Target:      req.Target,
-		// The re-plan must be asked to withhold what the reviewed plan was
-		// asked to withhold. A withheld table has no declaring file, so a
-		// re-plan that sees it proposes dropping it — a change the reviewed
-		// DDL cannot contain, which would fail this guard on every apply of a
-		// plan that withheld anything. The dispatch carries the whole config
-		// the plan was reviewed under rather than the subset that matched
-		// where it was planned, so an entry naming a table only this
-		// deployment holds withholds it here too.
-		IgnoreTables: req.GetIgnoreTables(),
-		// The guard compares the reviewed DDL against this re-plan, so the
-		// re-plan has to be judged under the dispatch's own policy. Under a
-		// different one a statement the reviewed plan routed directly comes
-		// back blocked, and the guard reads that as drift.
-		DirectExecution: req.GetDirectExecution(),
-	}, c.config.Database, schemaFiles)
+	result, err := c.replanForDispatch(ctx, req, schemaFiles)
 	if err != nil {
-		return replannedChanges{}, fmt.Errorf("recompute local plan: %w", err)
+		return replannedChanges{}, err
 	}
 
 	recomputed, replanned, err := c.driftMultisetFromPlanResult(result, shardScoped, targetShard)
@@ -228,6 +209,136 @@ func (c *LocalClient) verifyMaterializedPlanMatchesLiveSchema(ctx context.Contex
 		}
 	}
 	return replanned, nil
+}
+
+// replanForDispatch recomputes this deployment's plan of the dispatch's
+// reviewed schema files against its own live schema, under the settings the
+// reviewed plan was made with.
+func (c *LocalClient) replanForDispatch(ctx context.Context, req *ternv1.ApplyRequest, schemaFiles schema.SchemaFiles) (*engine.PlanResult, error) {
+	result, err := c.planWithEngine(ctx, &ternv1.PlanRequest{
+		Database:    c.config.Database,
+		Type:        c.config.Type,
+		Environment: req.Environment,
+		Target:      req.Target,
+		// The re-plan must be asked to withhold what the reviewed plan was
+		// asked to withhold. A withheld table has no declaring file, so a
+		// re-plan that sees it proposes dropping it — a change the reviewed
+		// DDL cannot contain, which would fail this guard on every apply of a
+		// plan that withheld anything. The dispatch carries the whole config
+		// the plan was reviewed under rather than the subset that matched
+		// where it was planned, so an entry naming a table only this
+		// deployment holds withholds it here too.
+		IgnoreTables: req.GetIgnoreTables(),
+		// The guard compares the reviewed DDL against this re-plan, so the
+		// re-plan has to be judged under the dispatch's own policy. Under a
+		// different one a statement the reviewed plan routed directly comes
+		// back blocked, and the guard reads that as drift.
+		DirectExecution: req.GetDirectExecution(),
+	}, c.config.Database, schemaFiles)
+	if err != nil {
+		return nil, fmt.Errorf("recompute local plan: %w", err)
+	}
+	return result, nil
+}
+
+// verifyAttachedShardDispatch holds a shard-scoped dispatch that attaches to
+// an existing apply to the same rule as the dispatch that created it: the
+// reviewed change it carries must be what this deployment would plan for that
+// shard and table against its own live schema, or the attach fails closed.
+// The plan row the attach runs from was checked against the creating
+// dispatch's shard only, so without this a sibling shard that drifted would
+// run the reviewed DDL unchecked. On a match the scope's changes take this
+// shard's re-planned statement, execution-mode verdict and unsafe flag, as a
+// materialized plan's do.
+//
+// The comparison is restricted to the tables the dispatch names. A dispatch
+// carries one table's changes for one shard, and the shard's other tables are
+// other operations' work — some already run, some not yet attached — so they
+// are no evidence about this one.
+//
+// A dispatch that carries no schema files has no reviewed schema to re-plan
+// against, and attaches against the plan row as it is: a change no re-plan has
+// judged keeps the mark that makes admission require the unsafe opt-in for it.
+func (c *LocalClient) verifyAttachedShardDispatch(ctx context.Context, req *ternv1.ApplyRequest, scope *dispatchScope) error {
+	if len(req.SchemaFiles) == 0 {
+		c.logger.Debug("shard dispatch carries no schema files to re-plan against; attaching against the plan row as it is",
+			"plan_id", req.PlanId,
+			"shard", scope.shard)
+		return nil
+	}
+	schemaFiles, err := c.normalizeSchemaFiles(protoToSchemaFiles(req.SchemaFiles))
+	if err != nil {
+		return fmt.Errorf("normalize schema files: %w", err)
+	}
+	result, err := c.replanForDispatch(ctx, req, schemaFiles)
+	if err != nil {
+		return err
+	}
+	recomputed, replanned, err := c.driftMultisetFromPlanResult(result, true, scope.shard)
+	if err != nil {
+		return fmt.Errorf("recomputed plan: %w", err)
+	}
+	dispatched, err := c.driftMultisetFromApplyRequest(req.DdlChanges, scope.shard)
+	if err != nil {
+		return fmt.Errorf("dispatched plan: %w", err)
+	}
+	if err := compareDriftMultisets(recomputed.restrictedToTablesOf(dispatched), dispatched); err != nil {
+		return engine.NewPermanentError("local schema has drifted from the reviewed plan (database %q, target %q, shard %q): %w; %s", c.config.Database, req.Target, scope.shard, err, driftRecoveryHint)
+	}
+	parser, err := c.statementParser()
+	if err != nil {
+		return err
+	}
+	if err := restoreDispatchedUnsafeVerdicts(req.DdlChanges, scope.ddlChanges); err != nil {
+		return err
+	}
+	if err := c.stampReplannedTables(parser, scope.ddlChanges, replanned); err != nil {
+		return fmt.Errorf("re-planned changes: %w", err)
+	}
+	return nil
+}
+
+// restoreDispatchedUnsafeVerdicts puts back, on each change this shard's
+// re-plan is about to judge, the unsafe verdict the dispatch itself carried.
+// The scope's changes were already marked by dispatchScopeForApply: unsafe with
+// a "could not be confirmed" reason where no re-planned copy existed, or with
+// the verdict of whichever sibling's re-plan the plan row holds. Neither is a
+// judgement of this shard's change, and stamping only ever tightens the flag,
+// so they would outlive the re-plan that now judges it. Restoring the
+// dispatched verdict first lets the re-plan's own verdict be the one the
+// change carries — safe when it judged the change safe, unsafe with its own
+// reason when it judged it unsafe — while a flag the reviewed plan itself
+// carried is kept. A change the engine blocks is not stamped and keeps the
+// mark it has.
+func restoreDispatchedUnsafeVerdicts(dispatched []*ternv1.TableChange, changes []storage.TableChange) error {
+	if len(dispatched) != len(changes) {
+		return fmt.Errorf("shard dispatch carries %d changes but its scope holds %d", len(dispatched), len(changes))
+	}
+	for i := range changes {
+		if changes[i].EngineBlocked() {
+			continue
+		}
+		changes[i].IsUnsafe = dispatched[i].GetIsUnsafe()
+		changes[i].UnsafeReason = dispatched[i].GetUnsafeReason()
+	}
+	return nil
+}
+
+// restrictedToTablesOf keeps only the changes to a namespace and table the
+// other multiset holds a change for.
+func (ms driftChangeMultiset) restrictedToTablesOf(other driftChangeMultiset) driftChangeMultiset {
+	type namespaceTable struct{ namespace, table string }
+	tables := map[namespaceTable]bool{}
+	for key := range other {
+		tables[namespaceTable{key.namespace, key.table}] = true
+	}
+	out := driftChangeMultiset{}
+	for key, n := range ms {
+		if tables[namespaceTable{key.namespace, key.table}] {
+			out[key] = n
+		}
+	}
+	return out
 }
 
 // driftMultisetFromPlanResult builds the table DDL multiset this deployment
@@ -306,21 +417,30 @@ func (c *LocalClient) stampReplannedChanges(namespaces map[string]*storage.Names
 		return err
 	}
 	for _, nsData := range namespaces {
-		for i := range nsData.Tables {
-			tc := &nsData.Tables[i]
-			if tc.EngineBlocked() {
-				continue
-			}
-			canon, err := canonicalDDLForDrift(parser, tc.DDL)
-			if err != nil {
-				return fmt.Errorf("table %q: %w", tc.Table, err)
-			}
-			change, ok := replanned.byChange[driftChangeKey{c.planNamespace(tc.Namespace), replanned.targetShard, tc.Table, tc.Operation, canon}]
-			if !ok {
-				return fmt.Errorf("table %q: no re-planned change for one the drift comparison matched", tc.Table)
-			}
-			change.stampOnto(tc)
+		if err := c.stampReplannedTables(parser, nsData.Tables, replanned); err != nil {
+			return err
 		}
+	}
+	return nil
+}
+
+// stampReplannedTables stamps each change with its re-planned counterpart,
+// matched under the drift key the comparison admitted it on.
+func (c *LocalClient) stampReplannedTables(parser ddl.StatementParser, tables []storage.TableChange, replanned replannedChanges) error {
+	for i := range tables {
+		tc := &tables[i]
+		if tc.EngineBlocked() {
+			continue
+		}
+		canon, err := canonicalDDLForDrift(parser, tc.DDL)
+		if err != nil {
+			return fmt.Errorf("table %q: %w", tc.Table, err)
+		}
+		change, ok := replanned.byChange[driftChangeKey{c.planNamespace(tc.Namespace), replanned.targetShard, tc.Table, tc.Operation, canon}]
+		if !ok {
+			return fmt.Errorf("table %q: no re-planned change for one the drift comparison matched", tc.Table)
+		}
+		change.stampOnto(tc)
 	}
 	return nil
 }
