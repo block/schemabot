@@ -71,6 +71,10 @@ type PSClient interface {
 	// incompletely; the result is as of a read that may span pages, not a
 	// snapshot.
 	ListKeyspaces(ctx context.Context, req *ps.ListKeyspacesRequest) ([]*ps.Keyspace, error)
+	// GetKeyspace reads one keyspace by name. Unlike ListKeyspaces it is a
+	// single request for that name, so a not-found answer is not an artefact
+	// of the listing's pages shifting.
+	GetKeyspace(ctx context.Context, req *ps.GetKeyspaceRequest) (*ps.Keyspace, error)
 	GetKeyspaceVSchema(ctx context.Context, req *ps.GetKeyspaceVSchemaRequest) (*ps.VSchema, error)
 	UpdateKeyspaceVSchema(ctx context.Context, req *ps.UpdateKeyspaceVSchemaRequest) (*ps.VSchema, error)
 
@@ -420,6 +424,10 @@ var errListingBound = fmt.Errorf("listing bound reached: %w", context.DeadlineEx
 // failed for another reason as the bound fired keeps its own error.
 func listingBoundEnded(listCtx context.Context, err error) bool {
 	return errors.Is(context.Cause(listCtx), errListingBound) && errors.Is(err, context.DeadlineExceeded)
+}
+
+func (w *psClientWrapper) GetKeyspace(ctx context.Context, req *ps.GetKeyspaceRequest) (*ps.Keyspace, error) {
+	return w.client.Keyspaces.Get(ctx, req)
 }
 
 func (w *psClientWrapper) GetKeyspaceVSchema(ctx context.Context, req *ps.GetKeyspaceVSchemaRequest) (*ps.VSchema, error) {

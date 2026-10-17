@@ -1557,6 +1557,55 @@ func (c *LocalClient) shouldRetryEngineError(err error) bool {
 	return recoveryResumesFromCheckpoint(c.config.Type) && engine.IsRetryable(err)
 }
 
+// shouldRetryAcceptedWorkError decides whether an error observing or driving
+// work the engine already accepted — a progress poll or an automatic cutover
+// attempt on a running grouped apply — pauses the apply as failed_retryable
+// instead of failing it permanently. Unlike shouldRetryEngineError, which
+// governs the start of engine work, this pause cannot dispatch duplicate work
+// on an engine whose recovery reattaches to the work it accepted, so such an
+// engine pauses here even though its start errors fail the apply.
+func (c *LocalClient) shouldRetryAcceptedWorkError(err error) bool {
+	if !engine.IsRetryable(err) {
+		return false
+	}
+	return recoveryResumesFromCheckpoint(c.config.Type) || recoveryReattachesToAcceptedWork(c.config.Type)
+}
+
+// shouldPauseAcceptedWork decides whether a retryable error observing,
+// driving, or reattaching to work the engine already accepted pauses the apply
+// as failed_retryable. It applies shouldRetryAcceptedWorkError, except while
+// the apply is in its revert phase: the pause rewrites every non-terminal task
+// as failed_retryable, which erases the revert-phase task states that make a
+// recovery reattach to the engine instead of settling the tasks from a schema
+// comparison that, post-cutover, matches the reviewed target until a revert
+// lands. A revert-phase apply is therefore never paused here, so its outcome
+// is never decided by that comparison.
+func (c *LocalClient) shouldPauseAcceptedWork(apply *storage.Apply, tasks []*storage.Task, err error) bool {
+	if revertPhaseInFlight(apply, tasks) {
+		c.logger.Warn("apply is in its revert phase, so it fails instead of pausing for retry: a pause would erase the revert-phase task states recovery reattaches by",
+			append(apply.LogAttrs(), "error", err)...)
+		return false
+	}
+	return c.shouldRetryAcceptedWorkError(err)
+}
+
+// revertPhaseInFlight reports whether the apply or any of its tasks sits in an
+// engine-monitored revert phase.
+func revertPhaseInFlight(apply *storage.Apply, tasks []*storage.Task) bool {
+	return applyInRevertPhase(apply) || firstRevertPhaseTask(tasks, 0) != nil
+}
+
+// recoveryReattachesToAcceptedWork reports whether the database type's engine
+// keeps accepted work running outside SchemaBot and a re-claimed recovery
+// attempt reattaches to it through the persisted engine resume state. Vitess
+// applies are deploy requests on an external provider that keep running
+// whatever the drive concludes, and a grouped resume hands the stored deploy
+// request back to the engine instead of creating a new one. Failing such an
+// apply permanently would only abandon a deploy request that is still live.
+func recoveryReattachesToAcceptedWork(databaseType string) bool {
+	return databaseType == storage.DatabaseTypeVitess
+}
+
 // recoveryResumesFromCheckpoint reports whether the database type's engine can
 // safely retry a failed attempt: a re-claimed recovery attempt resumes the same
 // in-flight work from the engine's durable checkpoint rather than issuing new
@@ -1637,7 +1686,9 @@ func (c *LocalClient) cancelTasksQueuedBehindFailure(ctx context.Context, apply 
 // posts the terminal summary — run only once the outcome is durably stored.
 // When the apply cannot be reloaded or the outcome write fails, it returns an
 // error with the stored apply still active: the drive exits, and the claim
-// that picks the apply up next finalizes it and settles its requests then.
+// that picks the apply up next finalizes it and settles its requests then. A
+// write that returned an error counts as stored only when outcomeWriteLanded
+// proves storage holds it under this drive's lease.
 // Once the outcome is stored it returns nil whatever happens to the side
 // effects: a failed request settlement is logged and left for the operator's
 // post-drive settlement, and the summary still posts.
@@ -1672,7 +1723,7 @@ func (c *LocalClient) finalizeSequentialApply(ctx context.Context, apply *storag
 		logger.Info("apply already terminal in storage, not overwriting during sequential finalization",
 			"stored_state", freshApply.State)
 		*apply = *freshApply
-		if err := settlePendingRequestsForTerminalApply(ctx, c.storage, c.logger, apply); err != nil {
+		if err := SettlePendingRequestsForTerminalApply(ctx, c.storage, c.logger, apply); err != nil {
 			logger.Warn("failed to settle pending control requests for terminal sequential apply",
 				"error", err)
 		}
@@ -1687,12 +1738,22 @@ func (c *LocalClient) finalizeSequentialApply(ctx context.Context, apply *storag
 		if c.driveCancelled(ctx, apply, "while persisting the sequential outcome") {
 			return nil
 		}
-		// The stored apply is still active, so nothing that answers for its
-		// outcome may run: a pending control request completed here would
-		// resolve an operator's command against an apply storage still reports
-		// running, and the observer would post a terminal summary for it.
-		return fmt.Errorf("persist sequential outcome %s for apply %s (database %s) from stored state %s: %w",
-			apply.State, apply.ApplyIdentifier, apply.Database, previousState, err)
+		// The write may have committed with only its reply lost. When storage
+		// holds this outcome under this drive's lease, the write landed and
+		// the drive goes on to answer for it below.
+		landed, stored := c.outcomeWriteLanded(ctx, apply, apply.State, apply.ErrorMessage, err)
+		if !landed {
+			// The stored apply is still active, so nothing that answers for its
+			// outcome may run: a pending control request completed here would
+			// resolve an operator's command against an apply storage still
+			// reports running, and the observer would post a terminal summary
+			// for it.
+			return fmt.Errorf("persist sequential outcome %s for apply %s (database %s) from stored state %s: %w",
+				apply.State, apply.ApplyIdentifier, apply.Database, previousState, err)
+		}
+		logger.Warn("the write recording the sequential outcome returned an error, but storage holds it; continuing with the stored outcome",
+			append(stored.MutableLogAttrs(), "previous_state", previousState, "error", err)...)
+		*apply = *stored
 	}
 	// A sequential apply's failure reaches the operator through the same
 	// apply log stream as every other path, so a failed table does not read

@@ -140,20 +140,6 @@ func (ic *InstallationClient) FetchCodeownersRuleset(ctx context.Context, repo, 
 	return nil, nil
 }
 
-// FetchCodeowners fetches CODEOWNERS from standard locations in the repo.
-// Returns all owners across all rules (not path-scoped).
-// Returns empty slice (not error) if no CODEOWNERS file exists.
-func (ic *InstallationClient) FetchCodeowners(ctx context.Context, repo, ref string) ([]string, error) {
-	ruleset, err := ic.FetchCodeownersRuleset(ctx, repo, ref)
-	if err != nil {
-		return nil, err
-	}
-	if ruleset == nil {
-		return nil, nil
-	}
-	return OwnerNames(OwnersFromRuleset(ruleset)), nil
-}
-
 // MatchCodeownersPath finds the owners for a specific file path using CODEOWNERS rules.
 // Last matching rule wins (standard CODEOWNERS semantics).
 // Returns nil, nil if no rule matches. Returns an error if pattern matching fails.
@@ -166,22 +152,6 @@ func MatchCodeownersPath(ruleset codeowners.Ruleset, filePath string) ([]codeown
 		return nil, nil
 	}
 	return rule.Owners, nil
-}
-
-// OwnersFromRuleset extracts all unique owners from a ruleset.
-func OwnersFromRuleset(ruleset codeowners.Ruleset) []codeowners.Owner {
-	seen := make(map[string]bool)
-	var owners []codeowners.Owner
-	for _, rule := range ruleset {
-		for _, o := range rule.Owners {
-			key := strings.ToLower(o.String())
-			if !seen[key] {
-				seen[key] = true
-				owners = append(owners, o)
-			}
-		}
-	}
-	return owners
 }
 
 // IsTeamOwner returns true if the owner is a GitHub team (org/team format).
@@ -201,15 +171,6 @@ func TeamParts(o codeowners.Owner) (org, slug string) {
 		return parts[0], parts[1]
 	}
 	return o.Value, ""
-}
-
-// ParseCodeowners parses CODEOWNERS content and returns unique owner names without @ prefix.
-func ParseCodeowners(content string) []string {
-	ruleset, err := codeowners.ParseFile(bytes.NewBufferString(content))
-	if err != nil {
-		return nil
-	}
-	return OwnerNames(OwnersFromRuleset(ruleset))
 }
 
 // OwnerNames converts a slice of codeowners.Owner to string names without @ prefix.

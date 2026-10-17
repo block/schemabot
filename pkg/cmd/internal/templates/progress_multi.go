@@ -13,7 +13,7 @@ import (
 )
 
 func writeMultiDeploymentProgress(data ProgressData) {
-	model := presentation.Derive(ProgressOperationsForPresentation(data.Operations, data.Released))
+	model := presentation.Derive(ProgressOperationsForPresentation(data.Operations, data.Tables, data.Released))
 	groups := model.Groups()
 	view := RolloutView{
 		ApplyID:      data.ApplyID,
@@ -52,8 +52,10 @@ func writeMultiDeploymentProgress(data ProgressData) {
 // ProgressData.Released): a released pause behaves like continue, so the held
 // siblings proceed and the aggregate runs degraded instead of paused. The
 // operation's key, kind and start time carry through, so the header settles
-// exactly as the stored apply state does.
-func ProgressOperationsForPresentation(ops []ProgressOperation, released bool) []presentation.Operation {
+// exactly as the stored apply state does. tables marks an operation retrying
+// when one of its tables is retrying a failure, which holds a later member's
+// cutover as the claim does.
+func ProgressOperationsForPresentation(ops []ProgressOperation, tables []TableProgress, released bool) []presentation.Operation {
 	presentationOps := make([]presentation.Operation, 0, len(ops))
 	for _, op := range ops {
 		presentationOps = append(presentationOps, presentation.Operation{
@@ -71,12 +73,32 @@ func ProgressOperationsForPresentation(ops []ProgressOperation, released bool) [
 			ContinueOnFailure:   op.OnFailure == storage.OnFailureContinue,
 			PauseOnFailure:      op.OnFailure == storage.OnFailurePause,
 			Released:            released,
+			Retrying:            operationTablesRetrying(op, tables),
 			Error:               op.ErrorMessage,
 			ExternalID:          op.ExternalID,
 			ExternalOperationID: op.ExternalOperationID,
 		})
 	}
 	return presentationOps
+}
+
+// operationTablesRetrying reports whether a table op runs, or a shard of one,
+// is retrying a failure.
+func operationTablesRetrying(op ProgressOperation, tables []TableProgress) bool {
+	for _, t := range tables {
+		if t.Deployment != op.Deployment || t.Target != op.Target {
+			continue
+		}
+		if state.IsState(t.Status, state.Task.FailedRetryable) {
+			return true
+		}
+		for _, s := range t.Shards {
+			if state.IsState(s.Status, state.Task.FailedRetryable) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func writeMultiDeploymentHeader(data ProgressData, model presentation.Apply, groups []presentation.Group) {

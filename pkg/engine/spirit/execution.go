@@ -15,6 +15,7 @@ import (
 	spiritflags "github.com/block/spirit/pkg/flags"
 	spiritmigration "github.com/block/spirit/pkg/migration"
 	"github.com/block/spirit/pkg/statement"
+	"github.com/block/spirit/pkg/status"
 	"github.com/block/spirit/pkg/utils"
 
 	"github.com/block/schemabot/pkg/ddl"
@@ -313,6 +314,13 @@ func (e *Engine) executeAlterPhase(ctx context.Context, host, username, password
 	logger := e.changeLogger()
 	routing, err := e.routeAlterStatements(ctx, target, database, alters, policy)
 	if err != nil {
+		if ctx.Err() != nil {
+			logger.Info("schema change stopped during ALTER routing",
+				"database", database,
+				"reason", ctx.Err(),
+			)
+			return false
+		}
 		logger.Error("ALTER routing failed", "database", database, "error", err)
 		e.setSchemaChangeFailed(err)
 		return false
@@ -423,9 +431,126 @@ func (e *Engine) executeSingleStatement(ctx context.Context, host, username, pas
 // as the stop or cancel set it.
 var errSchemaChangeStopped = errors.New("schema change stopped before the ALTER finished")
 
+// runnerErrorCutover is what a Spirit runner's error says about the target,
+// read from the evidence the runner retained for the run (see
+// classifyRunnerErrorCutover).
+type runnerErrorCutover int
+
+const (
+	// runnerErrorBeforeCutover: the cutover never committed, so the target
+	// holds none of the change.
+	runnerErrorBeforeCutover runnerErrorCutover = iota
+	// runnerErrorAfterCutover: the cutover committed, so the target holds the
+	// change and the error came from Spirit's cleanup after it.
+	runnerErrorAfterCutover
+	// runnerErrorCutoverUnverified: Spirit could not tell whether the cutover
+	// committed, so neither outcome is proven.
+	runnerErrorCutoverUnverified
+)
+
+// classifyRunnerErrorCutover reads whether a runner that returned an error had
+// committed its cutover. Spirit marks the run's result with a durable mutation
+// the moment the cutover commits, and every error it returns after that comes
+// from cleanup of a change the target already holds. An ownership-ambiguous
+// result outranks it: Spirit could not tell which table is live, so nothing is
+// proven landed.
+func classifyRunnerErrorCutover(result status.WorkflowResult) runnerErrorCutover {
+	if result.OwnershipAmbiguous() {
+		return runnerErrorCutoverUnverified
+	}
+	if result.DurableMutation {
+		return runnerErrorAfterCutover
+	}
+	return runnerErrorBeforeCutover
+}
+
+// settleRunnerError decides what a Spirit runner error means for the schema
+// change, from whether a stop, cancel, or shutdown cancelled the run's context
+// and from the evidence Spirit retained for the run (result).
+//
+// A nil return means the cutover committed and the error came from Spirit's
+// cleanup after it: the caller settles the ALTER as finished, exactly as it
+// does a runner that returned nil, cancelled or not. Only that proof settles
+// the change as landed. Otherwise the return is what executeSpiritMigration
+// returns: errSchemaChangeStopped when the context was cancelled, leaving the
+// state as the stop or cancel set it, or the classified failure, recorded on
+// the tracked state, when nothing cancelled it.
+func (e *Engine) settleRunnerError(ctx context.Context, runErr error, result status.WorkflowResult, database string, tables []string) error {
+	logger := e.changeLogger()
+	cancelled := ctx.Err() != nil
+	switch classifyRunnerErrorCutover(result) {
+	case runnerErrorAfterCutover:
+		// The error is cleanup Spirit could not finish; it is logged, never
+		// recorded as the change's outcome. Spirit drops its checkpoint table
+		// last, so a cleanup error always leaves it behind. Spirit reads a
+		// checkpoint with no shadow table as a fresh start, so it blocks
+		// nothing, but it holds space until it is dropped.
+		attrs := []any{
+			"database", database,
+			"tables", tables,
+			"checkpoint_table", checkpointTableForBatch(tables),
+			"error", runErr,
+		}
+		if cancelled {
+			attrs = append(attrs, "reason", ctx.Err())
+		}
+		logger.Warn("the schema change's cutover committed, but Spirit's cleanup after the cutover failed; settling the ALTER as finished, since the target holds it, and leaving Spirit's checkpoint table on the target to drop by hand", attrs...)
+		return nil
+	case runnerErrorCutoverUnverified:
+		if !cancelled {
+			return e.failRunnerError(runErr, database, tables)
+		}
+		// Neither outcome is proven, so the change is not recorded completed.
+		// Stopped claims nothing about the target: a resume re-plans against
+		// the live schema first and settles a change that already landed
+		// instead of running it again.
+		logger.Warn("schema change stopped, but Spirit could not verify whether its cutover committed; leaving it stopped, since a resume re-plans against the live schema before running anything",
+			"database", database,
+			"tables", tables,
+			"reason", ctx.Err(),
+			"error", runErr,
+		)
+		return errSchemaChangeStopped
+	case runnerErrorBeforeCutover:
+		if !cancelled {
+			return e.failRunnerError(runErr, database, tables)
+		}
+		logger.Info("schema change stopped",
+			"reason", ctx.Err(),
+		)
+		// Don't change state - Stop() already set it to StateStopped
+		return errSchemaChangeStopped
+	default:
+		if !cancelled {
+			return e.failRunnerError(runErr, database, tables)
+		}
+		logger.Error("schema change stopped with an unrecognized classification of the cancelled run; leaving it stopped",
+			"database", database,
+			"tables", tables,
+			"reason", ctx.Err(),
+			"error", runErr,
+		)
+		return errSchemaChangeStopped
+	}
+}
+
+// failRunnerError records a runner error nothing cancelled, with no proven
+// cutover behind it, as the schema change's failure.
+func (e *Engine) failRunnerError(runErr error, database string, tables []string) error {
+	e.changeLogger().Error("schema change failed",
+		"database", database,
+		"tables", tables,
+		"error", runErr,
+	)
+	classifiedErr := classifyRunnerError(runErr)
+	e.setSchemaChangeFailed(fmt.Errorf("schema change failed: %w", classifiedErr))
+	return classifiedErr
+}
+
 // executeSpiritMigration runs Spirit for ALTER statements. A nil return means
 // the runner finished the ALTER, cutover included, even when the context was
-// cancelled while it ran.
+// cancelled while it ran, and even when Spirit's cleanup after a committed
+// cutover then failed.
 func (e *Engine) executeSpiritMigration(ctx context.Context, host, username, password, database, combinedStatement string, deferCutover bool) error {
 	logger := e.changeLogger()
 	// Parse statements to extract table names
@@ -500,22 +625,13 @@ func (e *Engine) executeSpiritMigration(ctx context.Context, host, username, pas
 	// still in flight, and a progress poll must observe the recorded outcome,
 	// never infer one from a runner mid-teardown.
 	if err := runner.Run(ctx); err != nil {
-		// Check if this was a cancellation (stop) vs a real failure
-		if ctx.Err() != nil {
-			logger.Info("schema change stopped",
-				"reason", ctx.Err(),
-			)
-			// Don't change state - Stop() already set it to StateStopped
+		// Whether the error ended the change is Spirit's to say: an error
+		// after the cutover committed comes from cleanup of a change the
+		// target already holds, whether or not anything cancelled the run.
+		if settleErr := e.settleRunnerError(ctx, err, runner.Result(), database, tables); settleErr != nil {
 			utils.CloseAndLog(runner)
-			return errSchemaChangeStopped
+			return settleErr
 		}
-		logger.Error("schema change failed",
-			"error", err,
-		)
-		classifiedErr := classifyRunnerError(err)
-		e.setSchemaChangeFailed(fmt.Errorf("schema change failed: %w", classifiedErr))
-		utils.CloseAndLog(runner)
-		return classifiedErr
 	}
 
 	utils.CloseAndLog(runner)
@@ -602,10 +718,23 @@ func (e *Engine) setSchemaChangeCompleted() {
 // detail this drops is still available where it is safe to keep it. An err
 // classified permanent (see classifyRunnerError) is recorded as such, so
 // progress tells the drive a retry would only repeat the same failure.
+//
+// A change the operator has already stopped or cancelled keeps that outcome: a
+// failure its run records on the way out is a consequence of the control, and
+// recording it would turn an accepted stop into a failure the drive retries.
 func (e *Engine) setSchemaChangeFailed(err error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if e.runningSchemaChange != nil {
+	if rm := e.runningSchemaChange; rm != nil {
+		if controlOutcomeStands(rm.state) {
+			e.schemaChangeLogger(rm).Info("failure recorded after the schema change was stopped or cancelled; the control's outcome stands",
+				"database", rm.database,
+				"tables", rm.tables,
+				"state", rm.state,
+				"error", err,
+			)
+			return
+		}
 		e.runningSchemaChange.state = engine.StateFailed
 		if err != nil {
 			e.runningSchemaChange.errorMessage = failureReason(err)

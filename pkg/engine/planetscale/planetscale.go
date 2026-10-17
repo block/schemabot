@@ -391,6 +391,7 @@ import (
 	mysql "github.com/block/mysql"
 	ps "github.com/planetscale/planetscale-go/planetscale"
 
+	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/utils"
 
 	"github.com/block/schemabot/pkg/engine"
@@ -610,6 +611,10 @@ type Engine struct {
 	vtgateDBsMu sync.Mutex
 	vtgateDBs   map[string]*sql.DB // dsn -> cached *sql.DB
 
+	// validationBranchSchema, when set, replaces the branch MySQL read that
+	// post-apply validation compares against the desired schema. Tests set
+	// it to drive validation without a branch to connect to.
+	validationBranchSchema func(ctx context.Context, password *ps.DatabaseBranchPassword, keyspaces []string) (map[string][]table.TableSchema, error)
 }
 
 // Compile-time check that Engine implements the interface.

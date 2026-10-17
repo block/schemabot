@@ -1170,7 +1170,18 @@ func (e *Engine) resumeApply(ctx context.Context, client psclient.PSClient, org 
 // driver stopped before recording it, and rediscovers the Vitess
 // migration_context so per-shard progress keeps working for the rest of the
 // apply.
-func (e *Engine) resumeExistingDeployRequest(ctx context.Context, client psclient.PSClient, org string, req *engine.ApplyRequest, meta *psMetadata) (*engine.ApplyResult, error) {
+//
+// A failure while reattaching is wrapped with engine.ErrReattachFailed, so the
+// caller knows the deploy request is still the one a later resume reattaches
+// to. When the stored deploy request is gone or broken and the apply starts
+// afresh, that fresh path's errors are returned as they are.
+func (e *Engine) resumeExistingDeployRequest(ctx context.Context, client psclient.PSClient, org string, req *engine.ApplyRequest, meta *psMetadata) (_ *engine.ApplyResult, retErr error) {
+	startedFresh := false
+	defer func() {
+		if retErr != nil && !startedFresh {
+			retErr = fmt.Errorf("%w: %w", engine.ErrReattachFailed, retErr)
+		}
+	}()
 	dr, err := e.getDeployRequest(ctx, client, org, req.Database, meta.DeployRequestID)
 	if err != nil {
 		// Only a genuine not-found means the deploy request was cleaned up and the
@@ -1183,6 +1194,7 @@ func (e *Engine) resumeExistingDeployRequest(ctx context.Context, client psclien
 			e.logger.Warn("deploy request not found on resume, starting fresh",
 				"database", req.Database, "deploy_request", meta.DeployRequestID, "error", err)
 			req.ResumeState = nil
+			startedFresh = true
 			return e.Apply(ctx, req)
 		}
 		return nil, fmt.Errorf("get deploy request #%d on resume: %w", meta.DeployRequestID, err)
@@ -1208,6 +1220,7 @@ func (e *Engine) resumeExistingDeployRequest(ctx context.Context, client psclien
 		e.logger.Warn("deploy request in error state on resume, starting fresh",
 			"database", req.Database, "deploy_request", meta.DeployRequestID, "state", dr.DeploymentState)
 		req.ResumeState = nil
+		startedFresh = true
 		return e.Apply(ctx, req)
 	}
 

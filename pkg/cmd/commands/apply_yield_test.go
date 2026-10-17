@@ -157,7 +157,7 @@ func TestApplyYield_FailedWatchKeepsLockWithoutQuiescenceProof(t *testing.T) {
 
 	require.ErrorIs(t, runErr, ErrSilent)
 	assert.Zero(t, releases.Load(), "a failed parent without child operation states must keep its lock:\n%s", out)
-	assert.Contains(t, out, "Lock kept for testdb (mysql) despite --yield: apply apply-yield is failed and the server reported no deployment rows to check (see schemabot progress -e staging apply-yield).")
+	assert.Contains(t, out, "Lock kept for testdb (mysql) despite --yield: apply apply-yield is failed and the server reported no deployment rows to check (see schemabot progress apply-yield -e staging).")
 }
 
 // A rollout projects cancelled as soon as one deployment's operation is
@@ -170,7 +170,7 @@ func TestApplyYield_CancelledRolloutWithRunningSiblingKeepsLock(t *testing.T) {
 	out := runYieldApply(t, server, false)
 
 	assert.Zero(t, releases.Load(), "a settled parent with a running operation must keep its lock:\n%s", out)
-	assert.Contains(t, out, "Lock kept for testdb (mysql) despite --yield: apply apply-yield is cancelled, but not every deployment and table under it has stopped yet (see schemabot progress -e staging apply-yield).")
+	assert.Contains(t, out, "Lock kept for testdb (mysql) despite --yield: apply apply-yield is cancelled, but not every deployment and table under it has stopped yet (see schemabot progress apply-yield -e staging).")
 	assert.Contains(t, out, "schemabot unlock -d testdb -t mysql")
 	assert.NotContains(t, out, "Lock released")
 }
@@ -227,7 +227,7 @@ func TestLockKeptReason_SettledParentHeldByChildren(t *testing.T) {
 		Tables:     []*apitypes.TableProgressResponse{{TableName: "users", Status: state.Task.Running}},
 	}
 	assert.Equal(t,
-		"apply apply-yield is failed, but not every deployment and table under it has stopped yet (see schemabot progress -e production apply-yield)",
+		"apply apply-yield is failed, but not every deployment and table under it has stopped yet (see schemabot progress apply-yield -e production)",
 		lockKeptReason(yieldTestApplyID, "production", progress))
 	assert.Equal(t, "apply apply-yield has not finished (state: running)",
 		lockKeptReason(yieldTestApplyID, "production", &apitypes.ProgressResponse{State: state.Apply.Running}))
