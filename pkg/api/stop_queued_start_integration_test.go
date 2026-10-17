@@ -144,6 +144,7 @@ func TestStopWithdrawsAQueuedStart(t *testing.T) {
 	// with no immediate stop sent to the data plane to complete it early.
 	t.Run("LeavesTheStopToTheDriveThatClaimedALoneOperation", func(t *testing.T) {
 		resetMatrixTables(t, ctx, db)
+		withdrawnCallers = nil
 		seed := seedGroupedApply(t, ctx, stor, multiOpSeed{
 			applyIdentifier: "stop-after-lone-operation-claimed",
 			parentState:     state.Apply.Stopped,
@@ -168,6 +169,7 @@ func TestStopWithdrawsAQueuedStart(t *testing.T) {
 		assert.Nil(t, client.stopReq, "no immediate stop is sent for a drive that already claimed the operation")
 		requireStatus(t, applyID, storage.ControlOperationStart, storage.ControlRequestCompleted)
 		requireStatus(t, applyID, storage.ControlOperationStop, storage.ControlRequestPending)
+		assert.Empty(t, withdrawnCallers, "the claimed drive updates the PR when the stop lands")
 	})
 
 	t.Run("StopsTheRolloutAClaimResumedSinceTheRead", func(t *testing.T) {
