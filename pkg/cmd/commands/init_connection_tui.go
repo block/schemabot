@@ -28,7 +28,7 @@ func initConnectionSummary(engine, ref string) string {
 func initConnectionDestination(engine, dsn string) string {
 	var host, database string
 	switch engine {
-	case "mysql":
+	case "mysql", "vitess":
 		cfg, err := mysql.ParseDSN(dsn)
 		if err != nil {
 			return "Connection found; couldn’t read its destination. Check the connection string."
@@ -57,7 +57,7 @@ type initConnectionMsg struct {
 
 func (m *initWizard) checkConnection() tea.Cmd {
 	m.err = ""
-	if m.step == 3 {
+	if m.step == stepDSN {
 		m.applicationConnected = false
 	}
 	m.checkingConnection = true
@@ -73,10 +73,17 @@ func (m *initWizard) checkConnection() tea.Cmd {
 	}
 	ctx, cancel := context.WithCancel(ctx)
 	m.cancelDiscovery = cancel
-	engine := m.fields[0].value
+	engine := m.fields[stepEngine].value
 	dsn, err := m.resolveConnection(strings.TrimSpace(m.input.Value()))
 	if err != nil {
 		return func() tea.Msg { return initConnectionMsg{generation: generation, err: err} }
+	}
+	if m.step == stepAPIToken {
+		target := m.planetScaleTarget(dsn)
+		return func() tea.Msg { defer cancel(); return initConnectionMsg{generation, m.checkAPI(ctx, target)} }
+	}
+	if m.step == stepStorageDSN {
+		engine = initStorageDialect(engine)
 	}
 	check := m.check
 	if check == nil {

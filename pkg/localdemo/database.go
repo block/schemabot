@@ -15,13 +15,13 @@ import (
 	"net"
 	"net/url"
 	"os"
-	"os/exec"
+
 	"path/filepath"
 	"strings"
 	"time"
-	"unicode/utf8"
 
 	"github.com/block/mysql"
+	"github.com/block/schemabot/pkg/localdocker"
 	"github.com/block/schemabot/pkg/mysqlconn"
 	"github.com/block/schemabot/pkg/postgresconn"
 	"github.com/block/spirit/pkg/utils"
@@ -78,22 +78,11 @@ func Ensure(ctx context.Context, project, engine string, progress ...func(string
 		}
 	}
 	report("Checking Docker")
-	endpoint := os.Getenv("DOCKER_HOST")
-	if endpoint == "" || os.Getenv("DOCKER_CONTEXT") != "" {
-		value, err := run(ctx, nil, "context", "inspect", "--format", "{{.Endpoints.docker.Host}}")
-		if err != nil {
-			return Database{}, err
-		}
-		endpoint = strings.TrimSpace(string(value))
-	}
-	if !localDockerEndpoint(endpoint) {
-		return Database{}, fmt.Errorf("sample setup needs a local Docker context; your current Docker endpoint is remote")
-	}
-	if _, err = run(ctx, nil, "info", "--format", "{{.ServerVersion}}"); err != nil {
-		return Database{}, fmt.Errorf("start Docker, then try sample setup again: %w", err)
+	if err := localdocker.Check(ctx); err != nil {
+		return Database{}, err
 	}
 	// Listing distinguishes an absent container from a broken Docker connection.
-	listed, err := run(ctx, nil, "container", "ls", "-a", "--filter", "name=^/"+name+"$", "--format", "{{.ID}}")
+	listed, err := localdocker.Run(ctx, nil, "container", "ls", "-a", "--filter", "name=^/"+name+"$", "--format", "{{.ID}}")
 	if err != nil {
 		return Database{}, err
 	}
@@ -103,14 +92,8 @@ func Ensure(ctx context.Context, project, engine string, progress ...func(string
 		if _, err = rand.Read(password); err != nil {
 			return Database{}, err
 		}
-		images, err := run(ctx, nil, "image", "ls", "--quiet", image)
-		if err != nil {
-			return Database{}, fmt.Errorf("inspect sample image %s: %w", image, err)
-		}
-		if strings.TrimSpace(string(images)) == "" {
-			if _, err := run(ctx, nil, "pull", image); err != nil {
-				return Database{}, fmt.Errorf("pull sample image %s: %w", image, err)
-			}
+		if err := localdocker.EnsureImage(ctx, image); err != nil {
+			return Database{}, err
 		}
 		// Pin Docker's host port so stop/start and daemon restarts keep saved DSNs valid.
 		// Docker claims the port after the listener closes; a race fails startup safely.
@@ -128,7 +111,7 @@ func Ensure(ctx context.Context, project, engine string, progress ...func(string
 			args = append(args, "-e", v)
 		}
 		args = append(args, image)
-		if _, err = run(ctx, []string{keyValue}, args...); err != nil {
+		if _, err = localdocker.Run(ctx, []string{keyValue}, args...); err != nil {
 			return Database{}, err
 		}
 	}
@@ -154,13 +137,13 @@ func Ensure(ctx context.Context, project, engine string, progress ...func(string
 		if err = os.WriteFile(seed, []byte(seedSQL(engine)), 0644); err != nil {
 			return Database{}, err
 		}
-		if _, err = run(ctx, nil, "cp", seed, name+":/docker-entrypoint-initdb.d/01-sample.sql"); err != nil {
+		if _, err = localdocker.Run(ctx, nil, "cp", seed, name+":/docker-entrypoint-initdb.d/01-sample.sql"); err != nil {
 			return Database{}, err
 		}
 	}
 	if !c.State.Running {
 		report("Starting your sample database")
-		if _, err = run(ctx, nil, "start", name); err != nil {
+		if _, err = localdocker.Run(ctx, nil, "start", name); err != nil {
 			if c.State.Status == "created" {
 				return Database{}, fmt.Errorf("start new sample %s: %w; resolve the Docker error and retry setup", name, err)
 			}
@@ -212,7 +195,7 @@ func Ensure(ctx context.Context, project, engine string, progress ...func(string
 	defer ticker.Stop()
 	var probeErr error
 	for {
-		probeErr = containerReady(readyCtx, name, engine)
+		probeErr = localdocker.ProbeDatabase(readyCtx, name, engine)
 		if probeErr == nil {
 			probeErr = ready(readyCtx, engine, result.StorageDSN)
 		}
@@ -245,7 +228,7 @@ func ready(ctx context.Context, engine, dsn string) error {
 }
 
 func inspect(ctx context.Context, name string) (container, error) {
-	b, err := run(ctx, nil, "inspect", name)
+	b, err := localdocker.Run(ctx, nil, "inspect", name)
 	if err != nil {
 		return container{}, err
 	}
@@ -257,42 +240,6 @@ func inspect(ctx context.Context, name string) (container, error) {
 		return container{}, fmt.Errorf("expected one sample container")
 	}
 	return values[0], nil
-}
-
-func run(ctx context.Context, env []string, args ...string) ([]byte, error) {
-	cmd := exec.CommandContext(ctx, "docker", args...)
-	cmd.Env = append(os.Environ(), env...)
-	output, err := cmd.Output()
-	if err != nil {
-		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) {
-			detail := strings.TrimSpace(string(exitErr.Stderr))
-			// Docker may repeat environment arguments in a diagnostic. Never expose credentials.
-			for _, entry := range env {
-				if _, value, ok := strings.Cut(entry, "="); ok && value != "" {
-					detail = strings.ReplaceAll(detail, value, "[redacted]")
-				}
-			}
-			detail = strings.Map(func(r rune) rune {
-				if r < 32 && r != '\n' && r != '\t' {
-					return -1
-				}
-				return r
-			}, detail)
-			if len(detail) > 2048 {
-				end := 2048
-				for !utf8.RuneStart(detail[end]) {
-					end--
-				}
-				detail = detail[:end] + "…"
-			}
-			if detail != "" {
-				return nil, fmt.Errorf("docker %s: %s: %w", args[0], detail, err)
-			}
-		}
-		return nil, fmt.Errorf("docker %s failed; check Docker and retry: %w", args[0], err)
-	}
-	return output, nil
 }
 
 func seedSQL(engine string) string {
@@ -309,27 +256,6 @@ CREATE TABLE orders (id bigint unsigned NOT NULL, customer_id bigint unsigned NO
 INSERT INTO customers VALUES (1, 'alex@example.com');
 INSERT INTO orders VALUES (1, 1, 'pending');
 `
-}
-
-func localDockerEndpoint(endpoint string) bool {
-	if strings.HasPrefix(endpoint, "unix://") || strings.HasPrefix(endpoint, "npipe://") {
-		return true
-	}
-	u, err := url.Parse(endpoint)
-	return err == nil && u.Scheme == "tcp" && (u.Hostname() == "localhost" || u.Hostname() == "127.0.0.1" || u.Hostname() == "::1")
-}
-
-// Probe inside the container until first-boot initialization finishes. Docker's
-// published port can accept a TCP connection before MySQL can greet a client.
-func containerReady(ctx context.Context, name, engine string) error {
-	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
-	defer cancel()
-	args := []string{"exec", name, "pg_isready", "-q", "-h", "127.0.0.1", "-U", "postgres", "-d", "schemabot"}
-	if engine == "mysql" {
-		args = []string{"exec", name, "sh", "-c", `MYSQL_PWD="$MYSQL_ROOT_PASSWORD" mysql -uroot -h127.0.0.1 -Dschemabot -Nse 'SELECT 1'`}
-	}
-	_, err := run(ctx, nil, args...)
-	return err
 }
 
 func sampleName(project, engine string) (string, error) {

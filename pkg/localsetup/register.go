@@ -8,6 +8,7 @@ import (
 
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/localruntime"
+	"github.com/block/schemabot/pkg/localstorage"
 	"github.com/block/schemabot/pkg/serve"
 )
 
@@ -27,6 +28,9 @@ type Registration struct {
 // publishes additions without replacing existing clients or interrupting applies. It does not connect to or create databases, start an executor, or
 // apply changes to the target.
 func Register(m localruntime.Manager, r Registration) (bool, error) {
+	if err := localstorage.ValidateReference(m.Dir, r.Storage.DSN); err != nil {
+		return false, err
+	}
 	if _, err := registrationConfig(nil, r); err != nil {
 		return false, err
 	}

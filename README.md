@@ -69,7 +69,7 @@ schemabot init
 
 ![Choose a PostgreSQL sample, edit its schema, review and apply the change, then verify the result](./assets/init-sample-demo.gif)
 
-The wizard connects to your MySQL or PostgreSQL database, imports its schema into declarative `.sql` files, and verifies a no-change plan before it finishes. It reads your application's schema and never changes it. SchemaBot keeps its own plans and progress in a separate database, which can live on the same server. Make your first edit and run `schemabot plan` to preview changes. Run `schemabot apply` when you’re ready to apply them. [docs/init.md](./docs/init.md) walks through each step, including the flag form for agents and scripts.
+The wizard connects to your MySQL, PostgreSQL, or Vitess database, imports its schema into declarative `.sql` files, and verifies a no-change plan before it finishes. It reads your application's schema and never changes it. SchemaBot keeps its own plans and progress in a separate database, which can live on the same server. Make your first edit and run `schemabot plan` to preview changes. Run `schemabot apply` when you’re ready to apply them. [docs/init.md](./docs/init.md) walks through each step, including the flag form for agents and scripts.
 
 For more local examples, see the [examples guide](./examples/README.md).
 
