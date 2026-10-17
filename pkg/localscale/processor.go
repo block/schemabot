@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/block/schemabot/pkg/state"
@@ -305,14 +306,8 @@ func (s *Server) processActiveDeployRequests(ctx context.Context) {
 			// Cancel phase: wait for all Vitess schema changes to reach terminal state.
 			if r.migrationContext == "" {
 				// No schema changes to cancel (e.g., cancelled during submitting)
-				if err := s.execLog(ctx,
-					`UPDATE localscale_deploy_requests
-					 SET cancelled = TRUE, deployment_state = ?
-					 WHERE org = ? AND database_name = ? AND number = ?`,
-					dr.CompleteCancel, ref.org, ref.database, r.number); err != nil {
+				if err := s.completeCancel(ctx, ref); err != nil {
 					s.logger.Error("processor: update cancel state", "number", r.number, "error", err)
-				} else {
-					s.logger.Info("deploy state transition", "number", r.number, "new_state", dr.CompleteCancel)
 				}
 				continue
 			}
@@ -326,21 +321,34 @@ func (s *Server) processActiveDeployRequests(ctx context.Context) {
 				s.logger.Debug("processor: cancel waiting for schema changes to appear", "number", r.number, "migration_context", r.migrationContext)
 				continue
 			}
-			allTerminal := true
-			for _, m := range migrations {
-				if !state.IsTerminalVitessState(m.status) {
-					allTerminal = false
-				}
-			}
-			if allTerminal {
-				if err := s.execLog(ctx,
-					`UPDATE localscale_deploy_requests
-					 SET cancelled = TRUE, deployment_state = ?
-					 WHERE org = ? AND database_name = ? AND number = ?`,
-					dr.CompleteCancel, ref.org, ref.database, r.number); err != nil {
+			outcome := cancelOutcome(migrations)
+			switch outcome {
+			case cancelPending:
+				s.logger.Debug("processor: cancel waiting for schema changes to settle", "number", r.number, "migration_context", r.migrationContext)
+			case cancelConfirmed:
+				if err := s.completeCancel(ctx, ref); err != nil {
 					s.logger.Error("processor: update cancel state", "number", r.number, "error", err)
-				} else {
-					s.logger.Info("deploy state transition", "number", r.number, "new_state", dr.CompleteCancel)
+				}
+			case cancelLostToCompletion:
+				// Every schema change completed before the cancel reached it,
+				// so the deploy request settles as the completed deploy it is.
+				newState := deriveDeployState(migrations, true, r.instantDDLRequested)
+				if newState == dr.CompletePendingRevert && hasVSchema && !r.vschemaApplied {
+					newState = dr.InProgressVSchema
+				}
+				s.logger.Warn("cancel arrived after every schema change completed; settling the deploy request as completed",
+					"number", r.number, "org", r.org, "database", r.database, "migration_context", r.migrationContext, "new_state", newState)
+				if _, err := s.advanceDeployState(ctx, ref, r.deployState, newState); err != nil {
+					s.logger.Error("processor: failed to settle completed deploy after cancel", "number", r.number, "error", err)
+				}
+			case cancelPartiallyApplied:
+				for _, m := range migrations {
+					s.logger.Error("cancel settled with part of the schema change applied; reporting the deploy request failed",
+						"number", r.number, "org", r.org, "database", r.database, "migration_context", r.migrationContext,
+						"vitess_status", m.status, "ddl_action", m.ddlAction)
+				}
+				if _, err := s.advanceDeployState(ctx, ref, r.deployState, dr.CompleteError); err != nil {
+					s.logger.Error("processor: failed to report partially applied cancel", "number", r.number, "error", err)
 				}
 			}
 
@@ -390,8 +398,9 @@ func (s *Server) completeExpiredRevertWindow(ctx context.Context, backend *datab
 	return nil
 }
 
-// updateDeployState records a deploy request's state unconditionally. Action
-// handlers use it for the transition the operator asked for.
+// updateDeployState records a deploy request's state unconditionally, for a
+// transition no other writer can race: a failed diff before the request can be
+// deployed.
 func (s *Server) updateDeployState(ctx context.Context, ref deployRequest, newState string) error {
 	set, setArgs := deployStateAssignment(newState, int(s.revertWindowDuration.Seconds()))
 	if _, err := s.metadataDB.ExecContext(ctx,
@@ -405,13 +414,13 @@ func (s *Server) updateDeployState(ctx context.Context, ref deployRequest, newSt
 	return nil
 }
 
-// advanceDeployState moves a deploy request from the state the processor read
-// to the one it derived, only while the request still reads that state. An
-// action handler (cancel, revert, skip-revert) can record its own state between
-// the processor's read and its write, and an unconditional write would put the
-// derived state back over the operator's action: a cancelled request would
-// return to pending_cutover and never reach complete_cancel. It reports whether
-// the transition was applied.
+// advanceDeployState moves a deploy request from the state its writer read to
+// the next one, only while the request still reads that state. The processor,
+// the deploy goroutine, and the action handlers (cancel, revert, skip-revert)
+// all write the same row, and an unconditional write puts a stale transition
+// back over a newer one: a cancelled request would return to pending_cutover
+// and never reach complete_cancel. It reports whether the transition was
+// applied.
 func (s *Server) advanceDeployState(ctx context.Context, ref deployRequest, from, to string) (bool, error) {
 	set, setArgs := deployStateAssignment(to, int(s.revertWindowDuration.Seconds()))
 	res, err := s.metadataDB.ExecContext(ctx,
@@ -427,7 +436,7 @@ func (s *Server) advanceDeployState(ctx context.Context, ref deployRequest, from
 		return false, fmt.Errorf("read rows affected advancing deploy state from %s to %s for %d: %w", from, to, ref.number, err)
 	}
 	if rows == 0 {
-		s.logger.Info("deploy state changed after the processor read it; keeping the newer state",
+		s.logger.Info("deploy state changed after it was read; keeping the newer state",
 			"number", ref.number, "from_state", from, "derived_state", to)
 		return false, nil
 	}
@@ -442,6 +451,71 @@ func deployStateAssignment(newState string, revertWindowSeconds int) (string, []
 		return "deployment_state = ?, revert_expires_at = DATE_ADD(NOW(), INTERVAL ? SECOND)", []any{newState, revertWindowSeconds}
 	}
 	return "deployment_state = ?", []any{newState}
+}
+
+// completeCancel settles a cancel the engine confirmed, while the request
+// still reads in_progress_cancel.
+func (s *Server) completeCancel(ctx context.Context, ref deployRequest) error {
+	res, err := s.metadataDB.ExecContext(ctx,
+		`UPDATE localscale_deploy_requests
+		 SET cancelled = TRUE, deployment_state = ?
+		 WHERE org = ? AND database_name = ? AND number = ? AND deployment_state = ?`,
+		dr.CompleteCancel, ref.org, ref.database, ref.number, dr.InProgressCancel)
+	if err != nil {
+		return fmt.Errorf("record confirmed cancel for %d: %w", ref.number, err)
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("read rows affected recording confirmed cancel for %d: %w", ref.number, err)
+	}
+	if rows == 0 {
+		s.logger.Info("deploy request left in_progress_cancel before its cancel was recorded; keeping the newer state", "number", ref.number)
+		return nil
+	}
+	s.logger.Info("deploy state transition", "number", ref.number, "from_state", dr.InProgressCancel, "new_state", dr.CompleteCancel)
+	return nil
+}
+
+// cancelSettlement is what a cancelled deploy request's schema changes ended
+// up doing.
+type cancelSettlement int
+
+const (
+	// cancelPending: a schema change has not reached a terminal status yet.
+	cancelPending cancelSettlement = iota
+	// cancelConfirmed: no schema change completed, so none of the deploy
+	// request's DDL is on the target.
+	cancelConfirmed
+	// cancelLostToCompletion: every schema change completed before the cancel
+	// reached it, so the deploy request's whole schema change is applied.
+	cancelLostToCompletion
+	// cancelPartiallyApplied: some schema changes completed and others were
+	// cancelled or failed, so part of the deploy request's DDL is applied.
+	cancelPartiallyApplied
+)
+
+// cancelOutcome classifies a cancelled deploy request's schema changes once
+// they settle. A terminal status alone does not mean the cancel took effect: a
+// schema change can complete before the cancel reaches it, and reporting that
+// as complete_cancel would claim the target was left unchanged when it was not.
+func cancelOutcome(migrations []migrationInfo) cancelSettlement {
+	complete := 0
+	for _, m := range migrations {
+		if !state.IsTerminalVitessState(m.status) {
+			return cancelPending
+		}
+		if strings.EqualFold(m.status, state.Vitess.Complete) {
+			complete++
+		}
+	}
+	switch complete {
+	case 0:
+		return cancelConfirmed
+	case len(migrations):
+		return cancelLostToCompletion
+	default:
+		return cancelPartiallyApplied
+	}
 }
 
 // migrationInfo holds the key fields from a Vitess schema change needed for state derivation.
