@@ -891,6 +891,57 @@ func TestExecuteGroupedApply_FailureReturnsOweTerminalSideEffects(t *testing.T) 
 	}
 }
 
+// PlanetScale accepts a Vitess deploy but its response is lost, and the
+// re-read that would show the deploy started fails too, so the engine reports
+// the outcome as unknown. The drive pauses the apply as failed_retryable
+// instead of failing it: the deploy may be running, and recovery re-reads the
+// deploy request named in the stored resume state rather than deploying again.
+// Nothing terminal is owed yet, so the pending revert stays pending and no
+// terminal summary posts.
+func TestExecuteGroupedApply_UnknownDeployOutcomePausesForRecovery(t *testing.T) {
+	operationID := int64(7)
+	apply := &storage.Apply{
+		ID: 42, ApplyIdentifier: "apply-grouped-unknown", Database: "testdb",
+		DatabaseType: storage.DatabaseTypeVitess, Engine: storage.EnginePlanetScale,
+		State: state.Apply.Pending,
+	}
+	tasks := []*storage.Task{{
+		ID: 7, ApplyID: apply.ID, ApplyOperationID: &operationID, TaskIdentifier: "task-grouped-unknown",
+		Database: "testdb", DatabaseType: storage.DatabaseTypeVitess, Namespace: "commerce", TableName: "users",
+		DDL: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)", DDLAction: "alter",
+		State: state.Task.Pending,
+	}}
+	plan := &storage.Plan{PlanIdentifier: "plan-grouped-unknown", Namespaces: map[string]*storage.NamespacePlanData{"commerce": {}}}
+	applyStore := &exactProgressApplyStore{apply: apply}
+	requests := pendingControlRequestStore(apply.ID, storage.ControlOperationRevert)
+	eng := &fakeControlEngine{applyErr: engine.NewOutcomeUnknownError(
+		"deploy deploy request #11: unexpected EOF (re-reading deploy request #11 to check whether the deploy started also failed: connection reset by peer)")}
+	client := &LocalClient{
+		config: LocalConfig{Database: "testdb", Type: storage.DatabaseTypeVitess},
+		storage: &exactProgressStorage{
+			applies:         applyStore,
+			tasks:           &exactProgressTaskStore{tasks: tasks},
+			controlRequests: requests,
+			applyOperations: &exactProgressApplyOperationStore{},
+		},
+		planetscaleEngine: eng,
+		heartbeatInterval: time.Hour,
+		logger:            slog.Default(),
+	}
+	observer := &terminalRecordingObserver{}
+	client.SetObserver(apply.ID, observer)
+
+	require.NoError(t, client.executeGroupedApply(t.Context(), apply, tasks, plan, nil, false))
+
+	assert.Equal(t, state.Apply.FailedRetryable, applyStore.apply.State)
+	assert.Contains(t, applyStore.apply.ErrorMessage, "re-reading deploy request #11")
+	assert.Equal(t, state.Task.FailedRetryable, tasks[0].State)
+	require.Len(t, requests.requests, 1)
+	assert.Equal(t, storage.ControlRequestPending, requests.requests[0].Status,
+		"no outcome is settled, so the revert stays pending for the recovery")
+	assert.Empty(t, observer.terminal, "a paused apply owes no terminal summary")
+}
+
 // A grouped apply's engine reports the schema change completed while an
 // operator's revert is still pending, and the rollout projection's write of the
 // completed state fails. Storage still reports the apply running, so the drive

@@ -108,8 +108,10 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (result *e
 	// there's no ResumeState to recover from. The tern layer handles this by retrying
 	// the full Apply on the next heartbeat recovery cycle.
 	// recordedBranch is the branch the persisted resume state names, if any:
-	// the branch a resuming driver will look for.
+	// the branch a resuming driver will look for. recordedDeployRequest is the
+	// deploy request it names, if any: the one a resuming driver re-reads.
 	var recordedBranch string
+	var recordedDeployRequest uint64
 	persistState := func(meta *psMetadata) {
 		if migCtx == "" || req.OnStateChange == nil {
 			return
@@ -132,6 +134,7 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (result *e
 			return
 		}
 		recordedBranch = meta.BranchName
+		recordedDeployRequest = meta.DeployRequestID
 	}
 
 	// Capture the per-keyspace VSchema diffs carried on the plan annotations so
@@ -495,9 +498,10 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (result *e
 	// Deploy (starts the schema change). PlanetScale may still be validating
 	// the deploy request even after it leaves the pending state, and transient
 	// API errors may occur; deployDeployRequest absorbs both.
-	dr, err = e.deployDeployRequest(ctx, client, org, req.Database, dr.Number, useInstant, emitEvent)
+	deployNumber := dr.Number
+	dr, err = e.deployDeployRequest(ctx, client, org, req.Database, deployNumber, useInstant, emitEvent)
 	if err != nil {
-		return nil, err
+		return nil, e.unknownDeployOutcomeNeedsRecord(err, recordedDeployRequest == deployNumber, req.Database, deployNumber)
 	}
 
 	emitEvent(engine.ApplyEvent{
@@ -785,17 +789,35 @@ func (e *Engine) diffBranchForResume(currentSchema map[string][]table.TableSchem
 	return diff, nil
 }
 
-// saveResumeState records a resume milestone through OnStateChange. A save
-// that does not land costs only crash recovery: the apply carries on, and the
-// result it returns carries the same state for the caller to store.
-func (e *Engine) saveResumeState(req *engine.ApplyRequest, rs *engine.ResumeState, milestone string) {
+// unknownDeployOutcomeNeedsRecord returns the error a deploy of deploy request
+// number ended with. A deploy whose outcome is unknown can only be recovered by
+// re-reading the deploy request the stored resume state names, so when recorded
+// reports that the resume state does not name it, the error is made permanent:
+// a recovery would start the apply over and could deploy a second request
+// beside one that may be running.
+func (e *Engine) unknownDeployOutcomeNeedsRecord(err error, recorded bool, database string, number uint64) error {
+	if !engine.IsOutcomeUnknown(err) || recorded {
+		return err
+	}
+	e.logger.Error("deploy outcome is unknown and the resume state does not name the deploy request; failing the apply rather than pausing it for a recovery that could not find the deploy request",
+		"database", database, "deploy_request", number, "error", err)
+	return engine.NewPermanentError("deploy request #%d may have started, but the resume state does not name it for recovery: %w", number, err)
+}
+
+// saveResumeState records a resume milestone through OnStateChange, reporting
+// whether the save landed. A save that does not land costs only crash
+// recovery: the apply carries on, and the result it returns carries the same
+// state for the caller to store.
+func (e *Engine) saveResumeState(req *engine.ApplyRequest, rs *engine.ResumeState, milestone string) bool {
 	if req.OnStateChange == nil {
-		return
+		return false
 	}
 	if err := req.OnStateChange(rs); err != nil {
 		e.logger.Warn("resume state was not saved; the apply continues and returns the state with its result",
 			"database", req.Database, "milestone", milestone, "error", err)
+		return false
 	}
+	return true
 }
 
 // remainingPlannedChanges returns the planned changes a resumed branch still
@@ -1132,7 +1154,7 @@ func (e *Engine) resumeApply(ctx context.Context, client psclient.PSClient, org 
 	if err != nil {
 		return nil, fmt.Errorf("encode metadata on resume: %w", err)
 	}
-	e.saveResumeState(req, &engine.ResumeState{
+	recorded := e.saveResumeState(req, &engine.ResumeState{
 		MigrationContext: req.ResumeState.MigrationContext,
 		Metadata:         persistMeta,
 	}, "deploy request created on resume")
@@ -1141,9 +1163,10 @@ func (e *Engine) resumeApply(ctx context.Context, client psclient.PSClient, org 
 	// context can be identified once Vitess creates migrations for this deploy.
 	existingContexts := e.captureExistingContexts(ctx, client, req.Database, req.Credentials)
 
-	dr, err = e.deployDeployRequest(ctx, client, org, req.Database, dr.Number, useInstant, emitEvent)
+	deployNumber := dr.Number
+	dr, err = e.deployDeployRequest(ctx, client, org, req.Database, deployNumber, useInstant, emitEvent)
 	if err != nil {
-		return nil, fmt.Errorf("deploy on resume: %w", err)
+		return nil, fmt.Errorf("deploy on resume: %w", e.unknownDeployOutcomeNeedsRecord(err, recorded, req.Database, deployNumber))
 	}
 
 	migrationContext := e.resolveResumeSchemaChangeContext(ctx, client, req, existingContexts, dr.CreatedAt)

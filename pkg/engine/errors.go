@@ -79,6 +79,36 @@ func IsNotReady(err error) bool {
 	return errors.As(err, &notReady)
 }
 
+// OutcomeUnknownError wraps an error to indicate the engine asked its backend
+// to start work and cannot tell whether the backend started it: the request
+// failed in a way that does not prove a refusal, and reading the work's state
+// did not settle the question. The work may be running, so the
+// schema change is not failed. The engine has recorded resume state naming the
+// work, and a recovery attempt re-observes that same work instead of starting
+// it again, so callers must pause the apply for recovery rather than record a
+// failure, on every database type.
+type OutcomeUnknownError struct {
+	Err error
+}
+
+func (e *OutcomeUnknownError) Error() string { return e.Err.Error() }
+func (e *OutcomeUnknownError) Unwrap() error { return e.Err }
+
+// NewOutcomeUnknownError wraps err as an unknown-outcome error.
+func NewOutcomeUnknownError(msg string, args ...any) error {
+	return &OutcomeUnknownError{Err: fmt.Errorf(msg, args...)}
+}
+
+// IsOutcomeUnknown reports whether err indicates the engine cannot tell
+// whether its backend started the work it was asked to start.
+func IsOutcomeUnknown(err error) bool {
+	if err == nil {
+		return false
+	}
+	var unknown *OutcomeUnknownError
+	return errors.As(err, &unknown)
+}
+
 // AlreadyCompletedError wraps an error to indicate the engine's backend
 // rejected a control operation because the schema change had already completed
 // before the operation arrived. The backend's terminal outcome is

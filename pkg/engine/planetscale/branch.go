@@ -999,7 +999,9 @@ func (e *Engine) deployDeployRequest(ctx context.Context, client psclient.PSClie
 		case isRetryablePSError(err):
 			transientAttempts++
 			if transientAttempts >= maxRetries {
-				return nil, fmt.Errorf("deploy deploy request #%d (after %d attempts): %w", number, maxRetries, err)
+				return e.adoptDeployAfterError(ctx, client, org, database, number,
+					fmt.Errorf("deploy deploy request #%d (after %d attempts): %w", number, maxRetries, err),
+					deployRefusedByPlanetScale(err, transientAttempts))
 			}
 			delay := retryDelay(transientAttempts, err)
 			e.logger.Warn("retrying deploy request",
@@ -1010,9 +1012,125 @@ func (e *Engine) deployDeployRequest(ctx context.Context, client psclient.PSClie
 			case <-time.After(delay):
 			}
 		default:
-			return nil, fmt.Errorf("deploy deploy request #%d: %w", number, err)
+			return e.adoptDeployAfterError(ctx, client, org, database, number,
+				fmt.Errorf("deploy deploy request #%d: %w", number, err),
+				deployRefusedByPlanetScale(err, transientAttempts))
 		}
 	}
+}
+
+// deployRefusedByPlanetScale reports whether a failed deploy call is PlanetScale
+// answering that it will not deploy the request, which shows the deploy did not
+// start: an HTTP answer the SDK types as not found, permission denied or an
+// invalid request, given to the first deploy attempt. Every other failure
+// leaves the outcome open. A transport failure got no answer, and the deploy
+// may still be in flight. An internal, malformed or retry answer, or one the
+// SDK does not type, does not say the deploy was refused. A refusal given to a
+// retry is not proof either: an earlier attempt may have started the deploy,
+// and the refusal can be PlanetScale reporting that deploy as already under way.
+func deployRefusedByPlanetScale(err error, earlierAttempts int) bool {
+	if earlierAttempts > 0 {
+		return false
+	}
+	var psErr *ps.Error
+	if !errors.As(err, &psErr) {
+		return false
+	}
+	switch psErr.Code {
+	case ps.ErrNotFound, ps.ErrPermission, ps.ErrInvalid:
+		return true
+	default:
+		return false
+	}
+}
+
+// deployRequestShowsDeployAccepted reports whether a deploy request re-read
+// after a failed deploy call shows that PlanetScale accepted a deploy: a deploy
+// timestamp, or a deployment state a deploy request reaches only once its
+// deploy is accepted (queued, running, at or in its cutover, completed, or
+// being cancelled or reverted after it began). A failed state, a no-changes
+// result or a state this list does not name is not an accepted deploy, so it
+// is never tracked as one: the drive would report a deploy that never ran.
+func deployRequestShowsDeployAccepted(dr *ps.DeployRequest) bool {
+	if dr.DeployedAt != nil {
+		return true
+	}
+	switch dr.DeploymentState {
+	case deployState.Submitting, deployState.Queued,
+		deployState.InProgress, deployState.InProgressVSchema,
+		deployState.PendingCutover, deployState.InProgressCutover,
+		deployState.Complete, deployState.CompletePendingRevert,
+		deployState.InProgressCancel, deployState.CompleteCancel,
+		deployState.InProgressRevert, deployState.InProgressRevertVSchema, deployState.CompleteRevert:
+		return true
+	default:
+		return false
+	}
+}
+
+// adoptDeployAfterError decides the outcome of a deploy call that failed with
+// an error other than an approval or still-validating rejection. A connection
+// that drops after the request was sent, or a retry PlanetScale rejects because
+// an earlier attempt already started the deploy, leaves the schema change
+// running remotely; failing the apply then would leave it running with nothing
+// tracking it. The deploy request is re-read, and when it shows PlanetScale
+// accepted the deploy it is returned so the drive tracks it.
+//
+// Otherwise refused, from deployRefusedByPlanetScale, decides. A refusal is
+// PlanetScale's answer, so deployErr is returned even when the re-read fails.
+// Without one, a re-read that fails or returns nothing, or one that still reads
+// ready, leaves the outcome unknown: a deploy still in flight can move the
+// request out of ready after the re-read returns. The error then carries
+// engine.OutcomeUnknownError, so the drive pauses the apply and recovery
+// re-reads this same deploy request, deploying it only if it still reads ready,
+// instead of failing the apply or deploying another request. Any other state
+// shows no deploy to track and is not one recovery would deploy, so deployErr
+// is returned.
+func (e *Engine) adoptDeployAfterError(ctx context.Context, client psclient.PSClient, org, database string, number uint64, deployErr error, refused bool) (*ps.DeployRequest, error) {
+	dr, getErr := client.GetDeployRequest(ctx, &ps.GetDeployRequestRequest{
+		Organization: org,
+		Database:     database,
+		Number:       number,
+	})
+	if getErr != nil {
+		if refused {
+			e.logger.Warn("PlanetScale refused the deploy and re-reading the deploy request failed; failing the deploy with the refusal",
+				"database", database, "deploy_request", number, "deploy_error", deployErr, "error", getErr)
+			return nil, deployErr
+		}
+		e.logger.Warn("deploy call failed and re-reading the deploy request to check whether the deploy started also failed; reporting the deploy outcome as unknown so recovery re-reads this deploy request",
+			"database", database, "deploy_request", number, "deploy_error", deployErr, "error", getErr)
+		return nil, engine.NewOutcomeUnknownError("%w (re-reading deploy request #%d to check whether the deploy started also failed: %w)", deployErr, number, getErr)
+	}
+	if dr == nil {
+		if refused {
+			e.logger.Warn("PlanetScale refused the deploy and re-reading the deploy request returned nothing; failing the deploy with the refusal",
+				"database", database, "deploy_request", number, "deploy_error", deployErr)
+			return nil, deployErr
+		}
+		e.logger.Warn("deploy call failed and re-reading the deploy request returned nothing; reporting the deploy outcome as unknown so recovery re-reads this deploy request",
+			"database", database, "deploy_request", number, "deploy_error", deployErr)
+		return nil, engine.NewOutcomeUnknownError("%w (re-reading deploy request #%d to check whether the deploy started returned no deploy request)", deployErr, number)
+	}
+	if deployRequestShowsDeployAccepted(dr) {
+		e.logger.Warn("deploy call failed but the deploy request shows its deploy was accepted; tracking it as deployed",
+			"database", database, "deploy_request", number, "deployment_state", dr.DeploymentState,
+			"deployed_at", formatDeployedAt(dr.DeployedAt), "error", deployErr)
+		return dr, nil
+	}
+	if refused {
+		e.logger.Info("PlanetScale refused the deploy and the deploy request shows no accepted deploy; failing the deploy",
+			"database", database, "deploy_request", number, "deployment_state", dr.DeploymentState, "error", deployErr)
+		return nil, deployErr
+	}
+	if dr.DeploymentState == deployState.Ready {
+		e.logger.Warn("deploy call failed without a refusal from PlanetScale and the deploy request still reads ready; a deploy still in flight can start after this read, so reporting the deploy outcome as unknown so recovery re-reads this deploy request",
+			"database", database, "deploy_request", number, "error", deployErr)
+		return nil, engine.NewOutcomeUnknownError("%w (deploy request #%d still reads ready, which does not show that the deploy did not start)", deployErr, number)
+	}
+	e.logger.Info("deploy call failed and the deploy request shows no accepted deploy and is not ready; failing the deploy",
+		"database", database, "deploy_request", number, "deployment_state", dr.DeploymentState, "error", deployErr)
+	return nil, deployErr
 }
 
 // waitForDeployRequestPending polls a deploy request until PlanetScale finishes
