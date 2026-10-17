@@ -262,7 +262,10 @@ resume's handling of a failed reattach to accepted engine work, whose pause disp
 limit (`pkg/tern/grpc_client.go`), and the PlanetScale engine's re-read of a deploy request whose
 deploy call failed, which tracks a deploy that started instead of failing it and reports an
 unknown outcome when PlanetScale did not refuse the deploy and the re-read fails or still reads
-ready (`adoptDeployAfterError`, `pkg/engine/planetscale/branch.go`), with the drive pausing an
+ready (`adoptDeployAfterError`, `pkg/engine/planetscale/branch.go`), and leaves that deploy
+request open for the recovery that re-reads it instead of retiring it as a failed apply's (the
+unknown-outcome guard in the cleanup of `Apply` and `resumeApply`,
+`pkg/engine/planetscale/apply.go`), with the drive pausing an
 unknown outcome for recovery on every engine (`engine.OutcomeUnknownError`,
 `shouldRetryEngineError` in `pkg/tern/local_apply_sequential.go`).
 
