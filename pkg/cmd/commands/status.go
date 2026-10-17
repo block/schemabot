@@ -171,7 +171,7 @@ func (cmd *StatusCmd) statusListData(result *apitypes.StatusResponse) templates.
 		StateCounts:    result.StateCounts,
 		ShowExternalID: cmd.ExternalID,
 		Deployment:     cmd.Deployment,
-		Continued:      cmd.After != "",
+		After:          cmd.After,
 		Applies:        activeApplyDataFromResponses(result.Applies),
 	}
 }

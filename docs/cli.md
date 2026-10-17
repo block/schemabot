@@ -265,8 +265,9 @@ Use 'schemabot status <apply_id>' to view details
 ```
 
 Every active schema change is listed first, however long ago it started. The
-finished ones follow, newest first. Raise `--limit` to see more of them. Past the server's cap of 1,000, `status` names the apply to
-pass to `--after` for the next page; `--all` follows every page for you. The [schema intelligence guide](schema-intelligence.md#whats-running-across-the-fleet)
+finished ones follow, newest first. Raise `--limit` to see more of them. Past
+the server's cap (1,000 applies, 200 plans), `status` and `list-plans` name the
+ID to pass to `--after` for the next page; `--all` follows every page for you. The [schema intelligence guide](schema-intelligence.md#whats-running-across-the-fleet)
 shows a paged walk.
 
 Inspect one apply with `status <apply_id>` for a single snapshot, or use
@@ -506,8 +507,10 @@ dispatched, and an apply or plan of the whole environment lifts that block
 once every target has the change. `apply-confirm` takes no `--target`: it confirms the
 target its apply named. The server records the narrowing on the
 stored plan and refuses to apply it anywhere but the target it was made for,
-and a narrowed apply cannot be rolled back with `rollback`: restore that
-target by planning and applying the previous schema with the same `--target`.
+and `rollback` isn't supported for schema changes across multiple targets
+yet: undo one by applying schema files without the change, or restore a
+narrowed apply's target by planning and applying the previous schema with the
+same `--target`.
 In an environment with a single target, `--target` names the whole rollout,
 so the plan and apply are not narrowed.
 

@@ -23,6 +23,15 @@ var ErrTargetHeld = errors.New("target is held by another run of a schema change
 // state, and that work must be kept.
 var ErrCancelledByOperator = errors.New("schema change cancelled by an operator")
 
+// ErrReattachFailed marks an Apply that was resuming work the engine had
+// already accepted, such as a deploy request it created and stored, and failed
+// before it could hand that work back to the caller. The work is still the
+// engine's and a later resume reattaches to it again, so the failure does not
+// mean any new work started. An engine wraps only failures on the reattach
+// path with it: one that gives up on the stored work and starts afresh returns
+// that path's errors unwrapped.
+var ErrReattachFailed = errors.New("reattach to accepted engine work failed")
+
 // CancelledByOperator reports whether ctx ended because an operator cancelled
 // the schema change (ErrCancelledByOperator), as opposed to the drive being
 // handed to another driver.

@@ -7069,6 +7069,21 @@ ALTER TABLE `users` DROP INDEX `idx_email`;
 </details>
 
 <details>
+<summary><a name="rollback-refused-multiple-targets"></a><strong>Rollback Refused: Multiple Targets</strong></summary>
+
+
+## Rollback Not Supported — Staging
+
+Rollback isn't currently supported for schema changes across multiple targets.
+
+To undo `apply-a1b2c3d4e5f6`, revert the change in this PR's schema files and add or toggle a `# nonce` comment line in the database's `schemabot.yaml` so the directory is still planned. Push, then run:
+```
+schemabot apply -e staging -d payments
+```
+
+</details>
+
+<details>
 <summary><a name="rollbackconfirm-refused-rollback-plan-stored-without-routing"></a><strong>Rollback-confirm Refused: Rollback Plan Stored Without Routing</strong></summary>
 
 

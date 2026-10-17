@@ -1026,6 +1026,38 @@ func TestResumeExistingDeployRequest_DeploysReadyNeverStarted(t *testing.T) {
 	}
 }
 
+// A failure while reattaching to the stored deploy request is marked
+// engine.ErrReattachFailed, so the caller knows the deploy request is still the
+// one a later resume reattaches to. When the stored deploy request is gone and
+// the resume starts afresh, the fresh path's failure is not marked: no stored
+// work is being reattached to any more.
+func TestResumeExistingDeployRequest_MarksOnlyReattachFailures(t *testing.T) {
+	rateLimited := errors.New("rate limited")
+	tests := []struct {
+		name         string
+		getErr       error
+		wantReattach bool
+	}{
+		{name: "transient lookup error reattaching", getErr: rateLimited, wantReattach: true},
+		{name: "deploy request gone, fresh start fails", getErr: &ps.Error{Code: ps.ErrNotFound}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			e := New(slog.New(slog.DiscardHandler))
+			client := &resumeDeployClient{getErr: tt.getErr}
+			meta := &psMetadata{BranchName: "schemabot-testdb-xyz", DeployRequestID: 7}
+
+			_, err := e.resumeExistingDeployRequest(t.Context(), client, "org", resumeRequest(t, meta, ""), meta)
+
+			require.Error(t, err)
+			assert.Equal(t, tt.wantReattach, errors.Is(err, engine.ErrReattachFailed))
+			if tt.wantReattach {
+				assert.ErrorIs(t, err, rateLimited, "the marked error still carries its cause")
+			}
+		})
+	}
+}
+
 // A deploy request that is already in flight when the driver resumes must not be
 // re-deployed; resume simply reattaches and preserves the stored progress state.
 func TestResumeExistingDeployRequest_InFlightIsNotRedeployed(t *testing.T) {

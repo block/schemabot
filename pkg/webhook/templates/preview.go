@@ -3463,6 +3463,18 @@ func PreviewCommentRollbackStatus() string {
 	return RenderApplyStatusComment(data)
 }
 
+// PreviewCommentRollbackOfRolloutUnsupported previews the refusal of a
+// rollback of a schema change across multiple targets.
+func PreviewCommentRollbackOfRolloutUnsupported() string {
+	return RenderRollbackOfRolloutUnsupported(RollbackOfRolloutUnsupportedData{
+		Environment:    "staging",
+		Database:       "payments",
+		ApplyID:        "apply-a1b2c3d4e5f6",
+		RoutingChecked: true,
+		PR:             PRStateOpen,
+	})
+}
+
 // PreviewCommentRollbackSummaryCompleted renders the terminal summary for a
 // completed rollback apply — announced as a rollback, never as an applied
 // schema change.

@@ -245,7 +245,10 @@ logged and the drive retries it, and a write that cannot land ends at most this 
 error reading something safety-gating ends this drive attempt and leaves the row claimable for
 another. Repeated errors observing remote progress mark the apply
 `failed_retryable` and never trigger a remote stop, because an observation outage only proves the
-control plane cannot see, not that the change is unhealthy. *Enforced:* failure-class handling in
+control plane cannot see, not that the change is unhealthy. One exception remains: an apply in
+its revert phase fails rather than pauses on those errors. A pause rewrites every non-terminal task
+as `failed_retryable`, and that would erase the revert-phase task states that make a recovery
+reattach to the engine instead of settling the tasks from a schema comparison. *Enforced:* failure-class handling in
 the drive loop (`pkg/api/operator.go`), the pre-start task re-read and the outcome-write gate on
 terminal side effects in the sequential drive (`pkg/tern/local_apply_sequential.go`), the same gate
 in the grouped drive (`pkg/tern/local_apply_grouped.go`), with `outcomeWriteLanded`
@@ -253,13 +256,15 @@ in the grouped drive (`pkg/tern/local_apply_grouped.go`), with `outcomeWriteLand
 that returned an error, the resume's refusal to record a failure over an outcome it already stored
 (the no-remaining-work branches of `resumeApplyWithTasks` and `launchAtomicResume` return a
 `postTerminalReconcileError` that `handleGroupedResumeFailure` passes through,
-`pkg/tern/local_control_resume.go`), the remote progress error limit (`pkg/tern/grpc_client.go`)
-and the PlanetScale engine's re-read of a deploy request whose deploy call failed, which tracks a
-deploy that started instead of failing it and reports an unknown outcome when PlanetScale did not
-refuse the deploy and the re-read fails or still reads ready (`adoptDeployAfterError`,
-`pkg/engine/planetscale/branch.go`), with the drive pausing an unknown
-outcome for recovery on every engine (`engine.OutcomeUnknownError`, `shouldRetryEngineError` in
-`pkg/tern/local_apply_sequential.go`).
+`pkg/tern/local_control_resume.go`), the progress-poll error budget in the grouped drive and the
+resume's handling of a failed reattach to accepted engine work, whose pause disposition is
+`shouldPauseAcceptedWork` (`pkg/tern/local_apply_sequential.go`), the remote progress error
+limit (`pkg/tern/grpc_client.go`), and the PlanetScale engine's re-read of a deploy request whose
+deploy call failed, which tracks a deploy that started instead of failing it and reports an
+unknown outcome when PlanetScale did not refuse the deploy and the re-read fails or still reads
+ready (`adoptDeployAfterError`, `pkg/engine/planetscale/branch.go`), with the drive pausing an
+unknown outcome for recovery on every engine (`engine.OutcomeUnknownError`,
+`shouldRetryEngineError` in `pkg/tern/local_apply_sequential.go`).
 
 ### AV-5: Panics are contained and permanent
 
@@ -1182,7 +1187,10 @@ the cancel and under a deadline inside the claim's staleness window
 (`pkg/tern/local_cancelled_resume_state.go`); and the branch reconcile pass,
 which deletes a SchemaBot branch only while holding the apply target it belongs
 to, across a final read showing no unsettled apply uses it
-(`WithTargetHeld`, `pkg/tern/branch_reconcile.go`).
+(`WithTargetHeld`, `pkg/tern/branch_reconcile.go`); on a data plane that
+resolves targets, the target held is the database and environment the
+target's applies were stored under, reached through the route those applies
+take (`TargetRouter.ReconcileRecentTargetBranches`).
 
 ## Control operations (CO)
 
@@ -1804,8 +1812,8 @@ apply of the whole rollout runs from the rollout primary's plan. An apply that r
 is never rolled back across the rollout. *Enforced:* member pairing at apply creation
 (`resolveApplyMembers` in `pkg/api/apply_members.go`, `applyTargets` in
 `pkg/api/plan_handlers.go`), which holds a plan to the narrowing recorded on its stored row
-(`storage.Plan.NarrowedTo`, recorded on a row the planner stored first by `keepStoredPlanOnRoute`); the narrowed-apply,
-independent-rollout, and moved-primary refusals in `ExecuteRollbackPlanForApply` (`refuseRollbackOfIndependentRollout` and `refuseRollbackAfterPrimaryMoved` in `pkg/api/plan_handlers.go`); on a data plane, the plan each
+(`storage.Plan.NarrowedTo`, recorded on a row the planner stored first by `keepStoredPlanOnRoute`); the refusal of any rollback in an
+environment of more than one target in `ExecuteRollbackPlanForApply` (`refuseMultiTargetRollback` in `pkg/api/plan_handlers.go`); on a data plane, the plan each
 member target's operation records as it attaches to the deployment's apply
 (`attachDispatchOperation`, `pkg/tern/local_client.go`), which its drive runs (`drivePlanID`) and
 its lost-work verification re-plans from (`planIDForTasks`, `pkg/tern/local_control_resume.go`).

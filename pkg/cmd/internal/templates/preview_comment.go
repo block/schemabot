@@ -158,6 +158,7 @@ func previewCommentAllOutput() {
 		{"ROLLBACK CONFIRM BLOCKED (UNSAFE CHANGE)", func() { fmt.Print(webhooktemplates.PreviewCommentRollbackUnsafeBlocked()) }},
 		{"ROLLBACK STATUS: RUNNING", func() { fmt.Print(webhooktemplates.PreviewCommentRollbackStatus()) }},
 		{"SUMMARY: ROLLBACK COMPLETE", func() { fmt.Print(webhooktemplates.PreviewCommentRollbackSummaryCompleted()) }},
+		{"ROLLBACK REFUSED: MULTIPLE TARGETS", func() { fmt.Print(webhooktemplates.PreviewCommentRollbackOfRolloutUnsupported()) }},
 	}
 
 	for i, s := range sections {
@@ -405,6 +406,7 @@ func previewCommentApplyFlowAllOutput() {
 		{"ROLLBACK CONFIRM BLOCKED (UNSAFE CHANGE)", func() { fmt.Print(webhooktemplates.PreviewCommentRollbackUnsafeBlocked()) }},
 		{"ROLLBACK STATUS: RUNNING", func() { fmt.Print(webhooktemplates.PreviewCommentRollbackStatus()) }},
 		{"SUMMARY: ROLLBACK COMPLETE", func() { fmt.Print(webhooktemplates.PreviewCommentRollbackSummaryCompleted()) }},
+		{"ROLLBACK REFUSED: MULTIPLE TARGETS", func() { fmt.Print(webhooktemplates.PreviewCommentRollbackOfRolloutUnsupported()) }},
 		{"ROLLBACK-CONFIRM REFUSED: ROLLBACK PLAN STORED WITHOUT ROUTING", func() { fmt.Print(webhook.PreviewRollbackConfirmPlanWithoutRouting()) }},
 	}
 	printSections(sections)
