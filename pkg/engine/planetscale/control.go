@@ -93,6 +93,16 @@ func (e *Engine) cancelDeployRequest(ctx context.Context, operation engine.Contr
 			return nil, engine.NewAlreadyCompletedError("cancel deploy request #%d rejected: the deploy request completed before the cancel arrived (deployment state %q): %w", meta.DeployRequestID, dr.DeploymentState, err)
 		case cancelRejectionUndeployed:
 			return e.closeUndeployedDeployRequest(ctx, client, req, meta.DeployRequestID, dr, err)
+		case cancelRejectionAlreadyFailed:
+			// The provider's rejection text stays in the log: the refusal's
+			// reason reaches operator surfaces, so it carries only what
+			// SchemaBot knows to be true.
+			e.logger.Warn("cancel rejected: the deploy request failed before the cancel arrived; it stays failed",
+				"database", req.Database,
+				"deploy_request", meta.DeployRequestID,
+				"deployment_state", dr.DeploymentState,
+				"error", err)
+			return nil, engine.NewSettledOutcomeError("cancel rejected: deploy request #%d on database %s failed before the cancel arrived; the failure stands, plan and apply again to retry", meta.DeployRequestID, req.Database)
 		default:
 			return nil, fmt.Errorf("cancel deploy request #%d rejected in deployment state %q: %w", meta.DeployRequestID, dr.DeploymentState, err)
 		}
@@ -213,6 +223,12 @@ const (
 	// request is closed instead, which is how PlanetScale retires one that
 	// never deployed.
 	cancelRejectionUndeployed
+	// cancelRejectionAlreadyFailed: the deploy request closed by failing
+	// before the cancel arrived. The rejection is typed SettledOutcomeError so
+	// the caller resolves the cancel request and records the failure the
+	// deploy request reports, rather than relabelling it cancelled or
+	// retrying a rejection that can never succeed.
+	cancelRejectionAlreadyFailed
 	// cancelRejectionStateError: the rejection stays a plain error naming the
 	// deploy request's live state — reporting a successful cancel or a
 	// completed change there would misrepresent what happened on the target.
@@ -261,9 +277,9 @@ func classifyCancelRejection(deploymentState string) (class cancelRejectionClass
 		// a rejected cancel there must not read as cancelled or completed.
 		return cancelRejectionStateError, true
 	case deployState.CompleteError, deployState.Error, deployState.Failed:
-		// The deploy request closed by failing. The plain error keeps the
-		// failed outcome visible instead of reporting a successful cancel.
-		return cancelRejectionStateError, true
+		// The deploy request closed by failing: the failure is the outcome,
+		// and a cancel must not replace it.
+		return cancelRejectionAlreadyFailed, true
 	default:
 		return cancelRejectionStateError, false
 	}

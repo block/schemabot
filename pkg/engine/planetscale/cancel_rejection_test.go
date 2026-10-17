@@ -52,10 +52,11 @@ func TestClassifyCancelRejection_EveryDeploymentStateIsClassified(t *testing.T) 
 		state.DeployRequest.CompleteRevert:          cancelRejectionStateError,
 		state.DeployRequest.CompleteRevertError:     cancelRejectionStateError,
 
-		// Closed by failing: keep the failed outcome visible.
-		state.DeployRequest.CompleteError: cancelRejectionStateError,
-		state.DeployRequest.Error:         cancelRejectionStateError,
-		state.DeployRequest.Failed:        cancelRejectionStateError,
+		// Closed by failing: the failure is settled and a cancel must not
+		// replace it.
+		state.DeployRequest.CompleteError: cancelRejectionAlreadyFailed,
+		state.DeployRequest.Error:         cancelRejectionAlreadyFailed,
+		state.DeployRequest.Failed:        cancelRejectionAlreadyFailed,
 	}
 
 	deployStates := reflect.ValueOf(state.DeployRequest)
