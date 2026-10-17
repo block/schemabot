@@ -1010,7 +1010,7 @@ func (c *GRPCClient) failRefusedControlRequest(ctx context.Context, logger *slog
 				"apply_operation_id", scope.applyOperationID,
 				"remote_apply_id", remoteID,
 				"error_message", message)...)
-		c.controlSendGate.recordSend(controlReq.ID, time.Now())
+		c.controlSendGate.recordSend(controlReq, time.Now())
 		return false, nil
 	}
 	logger.WarnContext(ctx, "the data plane refused the pending control request; the schema change continues and settles on its own",
@@ -1112,7 +1112,7 @@ func (c *GRPCClient) processPendingStopControlRequest(ctx context.Context, apply
 	// The data plane stores the stop durably on first receipt and its own
 	// driver consumes it, so retransmission is redelivery insurance on a bounded
 	// cadence — not a per-tick send (see the cancel counterpart).
-	if now := time.Now(); c.controlSendGate.shouldSend(controlReq.ID, now) {
+	if now := time.Now(); c.controlSendGate.shouldSend(controlReq, now) {
 		resp, err := c.client.Stop(ctx, &ternv1.StopRequest{
 			ApplyId:     remoteID,
 			Environment: apply.Environment,
@@ -1132,7 +1132,7 @@ func (c *GRPCClient) processPendingStopControlRequest(ctx context.Context, apply
 		if !resp.Accepted {
 			return c.failRefusedControlRequest(ctx, logger, apply, storage.ControlOperationStop, storage.LogEventStopRequested, controlReq, scope, remoteID, resp.ErrorMessage)
 		}
-		if c.controlSendGate.recordSend(controlReq.ID, now) {
+		if c.controlSendGate.recordSend(controlReq, now) {
 			c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStopRequested,
 				fmt.Sprintf("Remote stop accepted for apply %s%s", remoteID, callerApplyLogSuffix(controlRequestCaller(controlReq))), "", "")
 		} else {
@@ -1235,7 +1235,7 @@ func (c *GRPCClient) processPendingCancelControlRequest(ctx context.Context, app
 	// cadence — not a per-tick send, which floods the data plane with duplicate
 	// cancels and the apply log with duplicate accept events while the remote
 	// works (or fails) to consume the first one.
-	if now := time.Now(); c.controlSendGate.shouldSend(controlReq.ID, now) {
+	if now := time.Now(); c.controlSendGate.shouldSend(controlReq, now) {
 		resp, err := c.client.Cancel(ctx, &ternv1.CancelRequest{ApplyId: remoteID, Environment: apply.Environment, Caller: controlReq.RequestedBy})
 		if err != nil {
 			if completed, completeErr := c.completeRemoteCancelFromTerminalProgress(ctx, apply, controlReq, scope); completeErr == nil && completed {
@@ -1251,7 +1251,7 @@ func (c *GRPCClient) processPendingCancelControlRequest(ctx context.Context, app
 		if !resp.Accepted {
 			return c.failRefusedControlRequest(ctx, logger, apply, storage.ControlOperationCancel, storage.LogEventCancelRequested, controlReq, scope, remoteID, resp.ErrorMessage)
 		}
-		if c.controlSendGate.recordSend(controlReq.ID, now) {
+		if c.controlSendGate.recordSend(controlReq, now) {
 			c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventCancelRequested,
 				fmt.Sprintf("Remote cancel accepted for apply %s%s", remoteID, callerApplyLogSuffix(controlRequestCaller(controlReq))), "", "")
 		} else {

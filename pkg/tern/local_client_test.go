@@ -915,6 +915,7 @@ func (s *testControlRequestStore) RequestPending(_ context.Context, req *storage
 			existing.ErrorMessage = ""
 			existing.Metadata = append(existing.Metadata[:0], req.Metadata...)
 			existing.CompletedAt = nil
+			existing.UpdatedAt = time.Now()
 			return cloneTestControlRequest(existing), false, nil
 		}
 	}
