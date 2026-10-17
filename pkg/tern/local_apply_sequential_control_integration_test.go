@@ -25,14 +25,22 @@ import (
 type resumeNamedWorkEngine struct {
 	controlValidatingCaptureEngine
 	resumeState *engine.ResumeState
+	// echoRequestResumeState makes Apply return the resume state the request
+	// carried instead of naming its own work.
+	echoRequestResumeState bool
+	// completes makes Progress report the work completed.
+	completes bool
 	// onApply runs inside Apply, after the engine has accepted the work and
 	// before Apply returns, so a test can land a control request mid-flight.
 	onApply func()
 }
 
-func (e *resumeNamedWorkEngine) Apply(context.Context, *engine.ApplyRequest) (*engine.ApplyResult, error) {
+func (e *resumeNamedWorkEngine) Apply(_ context.Context, req *engine.ApplyRequest) (*engine.ApplyResult, error) {
 	if e.onApply != nil {
 		e.onApply()
+	}
+	if e.echoRequestResumeState {
+		return &engine.ApplyResult{Accepted: true, ResumeState: req.ResumeState}, nil
 	}
 	return &engine.ApplyResult{Accepted: true, ResumeState: e.resumeState}, nil
 }
@@ -41,6 +49,9 @@ func (e *resumeNamedWorkEngine) Progress(_ context.Context, req *engine.Progress
 	e.progressReq = req
 	if e.stopReq != nil {
 		return &engine.ProgressResult{State: engine.StateStopped}, nil
+	}
+	if e.completes {
+		return &engine.ProgressResult{State: engine.StateCompleted}, nil
 	}
 	return &engine.ProgressResult{State: engine.StateRunning}, nil
 }
@@ -255,4 +266,31 @@ func TestLocalClient_SequentialStopCannotCompleteOverUnrecordedLiveWork(t *testi
 	require.NoError(t, err)
 	require.NotNil(t, settled)
 	assert.NotEqual(t, state.Apply.Stopped, settled.State, "the apply is not recorded stopped while the work runs")
+}
+
+// The engine accepts a pending task and echoes back the resume state the drive
+// sent, the way an engine that reaches its work through its own state does.
+// That names nothing a control request could not reach without a record, so
+// the drive records nothing: a resume state write that would fail never halts
+// the work, and the task runs to completion.
+func TestLocalClient_SequentialEchoedResumeStateIsNotRecorded(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+	f := newUnrecordedResumeStateFixture(t)
+	f.eng.echoRequestResumeState = true
+	f.eng.completes = true
+
+	action, task := f.attempt(t)
+
+	assert.Equal(t, taskContinue, action, "the task runs to completion")
+	assert.Equal(t, state.Task.Completed, task.State)
+	assert.Nil(t, f.eng.stopReq, "work that needed no record is never halted")
+	require.NotNil(t, f.eng.progressReq, "the drive polls the work")
+	require.NotNil(t, f.eng.progressReq.ResumeState)
+	assert.Equal(t, task.TaskIdentifier, f.eng.progressReq.ResumeState.MigrationContext, "the poll carries the resume state the engine echoed")
+	operation, err := applyOperationIDForTask(task)
+	require.NoError(t, err)
+	_, err = f.stor.ApplyOperations().GetEngineResumeState(t.Context(), operation)
+	assert.ErrorIs(t, err, storage.ErrEngineResumeStateNotFound, "nothing is recorded on the apply operation")
 }

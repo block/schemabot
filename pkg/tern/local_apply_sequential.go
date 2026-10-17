@@ -539,9 +539,13 @@ func withDriveWorkOwner(ctx context.Context) context.Context {
 // for an accepted task on the task's apply operation. Stop, cancel, and cutover
 // build their engine requests from the recorded state, so an engine that names
 // the work it is driving there can be reached by a control request that arrives
-// while the task runs. An engine that returns no resume state records nothing.
-func (c *LocalClient) saveSequentialEngineResumeState(ctx context.Context, task *storage.Task, resumeState *engine.ResumeState) error {
-	if resumeState == nil {
+// while the task runs. An engine that returns no resume state, or echoes back
+// the one the drive sent, reaches its work through its own state, so nothing is
+// recorded and a failed write can never halt work that needed no record.
+func (c *LocalClient) saveSequentialEngineResumeState(ctx context.Context, task *storage.Task, sent, returned *engine.ResumeState) error {
+	if !resumeStateNamesNewWork(sent, returned) {
+		c.logger.Debug("engine returned no resume state beyond the one the drive sent; nothing recorded, and control requests reach the work through the engine's own state",
+			task.LogAttrs()...)
 		return nil
 	}
 	operationID, err := applyOperationIDForTask(task)
@@ -550,10 +554,22 @@ func (c *LocalClient) saveSequentialEngineResumeState(ctx context.Context, task 
 			append(task.LogAttrs(), "reason", err.Error())...)
 		return nil
 	}
-	if err := c.saveEngineResumeStateForOperation(ctx, operationID, resumeState); err != nil {
+	if err := c.saveEngineResumeStateForOperation(ctx, operationID, returned); err != nil {
 		return fmt.Errorf("save engine resume state for task %s on apply operation %d: %w", task.TaskIdentifier, operationID, err)
 	}
 	return nil
+}
+
+// resumeStateNamesNewWork reports whether an engine's returned resume state
+// carries anything beyond the one the drive sent with the request.
+func resumeStateNamesNewWork(sent, returned *engine.ResumeState) bool {
+	if returned == nil {
+		return false
+	}
+	if sent == nil {
+		return true
+	}
+	return *returned != *sent
 }
 
 // runEngineTaskAttempt calls the engine for a single DDL, marks the task
@@ -622,7 +638,7 @@ func (c *LocalClient) runEngineTaskAttempt(ctx context.Context, apply *storage.A
 			"task_id", task.TaskIdentifier, "table", task.TableName, "state", task.State, "engine_message", result.Message)
 		return c.failureVerdictAction(apply.ApplyIdentifier, task, verdictErr)
 	}
-	if err := c.saveSequentialEngineResumeState(ctx, task, result.ResumeState); err != nil {
+	if err := c.saveSequentialEngineResumeState(ctx, task, request.ResumeState, result.ResumeState); err != nil {
 		return c.abandonUnrecordedEngineWork(ctx, logger, apply, task, taskCreds, result.ResumeState, err)
 	}
 
@@ -633,10 +649,10 @@ func (c *LocalClient) runEngineTaskAttempt(ctx context.Context, apply *storage.A
 	logger.Info("task running", "task_id", task.TaskIdentifier, "table", task.TableName)
 
 	// Poll to completion. Thread the engine's returned resume state into the
-	// poll: a sharded engine (Strata) identifies the operation to report on from
-	// ResumeState.Metadata and errors without it, so Progress must carry what
-	// Apply returned. (Spirit reports per-database and returns no resume state, so
-	// this stays nil and its behaviour is unchanged.)
+	// poll: an engine that names its work in ResumeState.Metadata identifies the
+	// operation to report on from it and errors without it, so Progress must
+	// carry what Apply returned. An engine that echoes the request's resume state
+	// polls with the same state the drive sent.
 	pollAction := c.pollTaskToCompletion(ctx, apply, task, taskCreds, result.ResumeState)
 	if pollAction == taskAbort || pollAction == taskStopped || pollAction == taskHandover || pollAction == taskTargetHeld {
 		return pollAction

@@ -22,8 +22,12 @@ import (
 // operation.
 //
 // It reports standDown when a stop or cancel landed while it waited; that
-// request settles this undispatched operation, so nothing is dispatched. An
-// error leaves the operation resuming for the next claim to retry.
+// request settles this undispatched operation, so nothing is dispatched. Only
+// the operator's pending start is sent on: with none pending, a sibling drive
+// already settled it, so this drive waits without starting anything. When the
+// shared apply still reads stopped once the grace period runs out, the operation
+// goes back to stopped and the pending start fails, so the operator sees the
+// start did not take and no later claim waits on it again.
 func (c *GRPCClient) startStoppedDeploymentApplyBeforeAttach(ctx context.Context, apply *storage.Apply, scope applyTaskScope) (bool, error) {
 	if !scope.usesOperationRemoteResume() || !state.IsState(scope.operation.State, state.Apply.Resuming) {
 		return false, nil
@@ -46,7 +50,7 @@ func (c *GRPCClient) startStoppedDeploymentApplyBeforeAttach(ctx context.Context
 
 	deadline := time.Now().Add(grpcStoppedAfterStartGracePeriod)
 	startRequested := false
-	var startErr error
+	var lastStartErr error
 	for {
 		resp, err := c.client.Progress(ctx, &ternv1.ProgressRequest{ApplyId: remoteID, Environment: apply.Environment})
 		if err != nil {
@@ -66,20 +70,28 @@ func (c *GRPCClient) startStoppedDeploymentApplyBeforeAttach(ctx context.Context
 			return standDown, err
 		}
 		if !time.Now().Before(deadline) {
-			return false, fmt.Errorf("deployment %s's data-plane apply %s still reads stopped %s after this drive asked for its start (last start error: %w); operation %s of apply %s attaches on a later claim", op.Deployment, remoteID, grpcStoppedAfterStartGracePeriod, startErr, op.OperationKey, apply.ApplyIdentifier)
+			return false, c.returnUndispatchedOperationToStopped(ctx, apply, op, remoteID, stillStoppedCause(startRequested, lastStartErr))
 		}
 		if !startRequested {
-			startErr = c.startDeploymentApply(ctx, apply, remoteID)
-			if startErr == nil {
+			startReq, err := pendingStartControlRequest(ctx, c.storage, apply)
+			if err != nil {
+				return false, fmt.Errorf("load pending start of apply %s before starting deployment %s's data-plane apply %s: %w", apply.ApplyIdentifier, op.Deployment, remoteID, err)
+			}
+			if startReq == nil {
+				logger.DebugContext(ctx, "deployment's data-plane apply still reads stopped and no start is pending; waiting without starting it",
+					append(apply.MutableLogAttrs(),
+						"apply_operation_id", op.ID, "operation_deployment", op.Deployment, "remote_apply_id", remoteID)...)
+			} else if _, err := c.client.Start(ctx, &ternv1.StartRequest{ApplyId: remoteID, Environment: apply.Environment, Caller: startReq.RequestedBy}); err != nil {
+				lastStartErr = err
+				logger.WarnContext(ctx, "start of the deployment's stopped data-plane apply failed; retrying until it leaves stopped or the grace period ends",
+					append(apply.MutableLogAttrs(),
+						"apply_operation_id", op.ID, "operation_deployment", op.Deployment,
+						"remote_apply_id", remoteID, "error", err)...)
+			} else {
 				startRequested = true
 				logger.InfoContext(ctx, "deployment's data-plane apply still reads stopped; requested its start before attaching the operation a stop caught before its first dispatch",
 					append(apply.MutableLogAttrs(),
 						"apply_operation_id", op.ID, "operation_deployment", op.Deployment, "remote_apply_id", remoteID)...)
-			} else {
-				logger.WarnContext(ctx, "start of the deployment's stopped data-plane apply failed; retrying until it leaves stopped",
-					append(apply.MutableLogAttrs(),
-						"apply_operation_id", op.ID, "operation_deployment", op.Deployment,
-						"remote_apply_id", remoteID, "error", startErr)...)
 			}
 		}
 		select {
@@ -90,20 +102,39 @@ func (c *GRPCClient) startStoppedDeploymentApplyBeforeAttach(ctx context.Context
 	}
 }
 
-// startDeploymentApply asks the data plane to start the deployment's shared
-// apply on behalf of the operator's pending start. The data plane joins a start
-// a sibling drive already asked for, so the race between drives is harmless.
-func (c *GRPCClient) startDeploymentApply(ctx context.Context, apply *storage.Apply, remoteID string) error {
-	startReq, err := pendingStartControlRequest(ctx, c.storage, apply)
-	if err != nil {
-		return fmt.Errorf("load pending start of apply %s: %w", apply.ApplyIdentifier, err)
+// stillStoppedCause says why the deployment's data-plane apply still reads
+// stopped at the end of the grace period, so the error names the one cause that
+// applies.
+func stillStoppedCause(startRequested bool, lastStartErr error) string {
+	switch {
+	case startRequested:
+		return fmt.Sprintf("it still reads stopped %s after this drive asked for its start", grpcStoppedAfterStartGracePeriod)
+	case lastStartErr != nil:
+		return fmt.Sprintf("every start this drive sent for %s failed (last: %v)", grpcStoppedAfterStartGracePeriod, lastStartErr)
+	default:
+		return fmt.Sprintf("no start was pending for %s, so nothing asked it to resume", grpcStoppedAfterStartGracePeriod)
 	}
-	caller := ""
-	if startReq != nil {
-		caller = startReq.RequestedBy
+}
+
+// returnUndispatchedOperationToStopped puts an operation a stop caught before
+// its first dispatch back to stopped when its deployment's data-plane apply
+// would not leave stopped, and fails the operator's pending start. Left
+// resuming, the operation would be claimed again and wait out the same grace
+// period on every claim with nothing telling the operator the start did not
+// take; stopped, it waits for the operator to issue the start again.
+func (c *GRPCClient) returnUndispatchedOperationToStopped(ctx context.Context, apply *storage.Apply, op *storage.ApplyOperation, remoteID, cause string) error {
+	message := fmt.Sprintf("Deployment %s did not resume, so operation %s stays stopped and the start can be re-issued", op.Deployment, op.OperationKey)
+	c.applyLogger(apply).WarnContext(ctx, "deployment's data-plane apply did not leave stopped within the grace period; returning the undispatched operation to stopped and failing the pending start",
+		append(apply.MutableLogAttrs(),
+			"apply_operation_id", op.ID, "operation_deployment", op.Deployment,
+			"remote_apply_id", remoteID, "cause", cause)...)
+	if err := c.storage.ApplyOperations().UpdateState(ctx, op.ID, state.Apply.Stopped); err != nil {
+		return fmt.Errorf("return operation %s of apply %s to stopped after deployment %s's data-plane apply %s did not resume: %w", op.OperationKey, apply.ApplyIdentifier, op.Deployment, remoteID, err)
 	}
-	if _, err := c.client.Start(ctx, &ternv1.StartRequest{ApplyId: remoteID, Environment: apply.Environment, Caller: caller}); err != nil {
-		return fmt.Errorf("start data-plane apply %s: %w", remoteID, err)
+	op.State = state.Apply.Stopped
+	c.logApplyWarning(ctx, apply, message)
+	if err := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationStart, message, remoteID); err != nil {
+		return fmt.Errorf("fail pending start of apply %s after deployment %s's data-plane apply %s did not resume: %w", apply.ApplyIdentifier, op.Deployment, remoteID, err)
 	}
-	return nil
+	return fmt.Errorf("deployment %s's data-plane apply %s did not resume (%s); operation %s of apply %s is stopped again", op.Deployment, remoteID, cause, op.OperationKey, apply.ApplyIdentifier)
 }
