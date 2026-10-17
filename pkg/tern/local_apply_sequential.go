@@ -535,9 +535,6 @@ func withDriveWorkOwner(ctx context.Context) context.Context {
 	return engine.WithWorkOwner(ctx, driveWorkOwner(ctx))
 }
 
-// runEngineTaskAttempt calls the engine for a single DDL, marks the task
-// running, and polls to completion. Besides runEngineTask's outcomes it returns
-// taskTargetHeld when the engine was refused the target.
 // saveSequentialEngineResumeState records the resume state an engine returned
 // for an accepted task on the task's apply operation. Stop, cancel, and cutover
 // build their engine requests from the recorded state, so an engine that names
@@ -559,6 +556,9 @@ func (c *LocalClient) saveSequentialEngineResumeState(ctx context.Context, task 
 	return nil
 }
 
+// runEngineTaskAttempt calls the engine for a single DDL, marks the task
+// running, and polls to completion. Besides runEngineTask's outcomes it returns
+// taskTargetHeld when the engine was refused the target.
 func (c *LocalClient) runEngineTaskAttempt(ctx context.Context, apply *storage.Apply, task *storage.Task, options map[string]string) taskAction {
 	logger := c.logger.With(apply.IdentityLogAttrs()...)
 	if standDown, err := c.processPendingCancelOrStopControlRequest(ctx, apply); err != nil {
@@ -623,9 +623,7 @@ func (c *LocalClient) runEngineTaskAttempt(ctx context.Context, apply *storage.A
 		return c.failureVerdictAction(apply.ApplyIdentifier, task, verdictErr)
 	}
 	if err := c.saveSequentialEngineResumeState(ctx, task, result.ResumeState); err != nil {
-		logger.Error("failed to record the engine resume state for an accepted task; the drive exits so a stop or cancel is never sent without it",
-			append(task.LogAttrs(), "error", err)...)
-		return taskAbort
+		return c.abandonUnrecordedEngineWork(ctx, logger, apply, task, taskCreds, result.ResumeState, err)
 	}
 
 	// Mark task running
@@ -652,6 +650,48 @@ func (c *LocalClient) runEngineTaskAttempt(ctx context.Context, apply *storage.A
 	default:
 		return taskContinue
 	}
+}
+
+// abandonUnrecordedEngineWork handles an accepted task whose resume state could
+// not be recorded. Stop and cancel reach the engine through the recorded state,
+// so work left running without it could not be reached by a stop or cancel
+// (CO-4). The drive halts the work with the state the engine returned, then
+// records the task failed_retryable: a later drive re-plans it, and should the
+// halt not have taken, stop and cancel still treat the task as live engine work
+// and send it to the engine instead of recording the command over running work.
+// An engine that needs the state to reach the work refuses the request, so the
+// command fails rather than completing while the work runs.
+func (c *LocalClient) abandonUnrecordedEngineWork(ctx context.Context, logger *slog.Logger, apply *storage.Apply, task *storage.Task, creds *engine.Credentials, resumeState *engine.ResumeState, saveErr error) taskAction {
+	if haltErr := c.haltUnrecordedEngineWork(ctx, creds, resumeState); haltErr != nil {
+		logger.Error("failed to record the engine resume state for an accepted task, and the engine did not halt the work; the task is recorded failed_retryable so a stop or cancel cannot complete while the work runs",
+			append(task.LogAttrs(), "error", saveErr, "halt_error", haltErr)...)
+	} else {
+		logger.Error("failed to record the engine resume state for an accepted task; the engine halted the work and the task is recorded failed_retryable for a later drive",
+			append(task.LogAttrs(), "error", saveErr)...)
+	}
+	verdictErr := c.markTaskRetryable(ctx, task, fmt.Sprintf("record engine resume state: %v", saveErr))
+	return c.failureVerdictAction(apply.ApplyIdentifier, task, verdictErr)
+}
+
+// haltUnrecordedEngineWork stops accepted work with the resume state the
+// engine returned for it. The halt runs detached from the drive's context, so a
+// drive that is being cancelled still brings the work down, and is bounded by
+// the same deadline as the halt a drive runs as it returns.
+func (c *LocalClient) haltUnrecordedEngineWork(ctx context.Context, creds *engine.Credentials, resumeState *engine.ResumeState) error {
+	eng := c.getEngine()
+	if eng == nil {
+		return fmt.Errorf("no engine configured for type: %s", c.config.Type)
+	}
+	haltCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), driveHandoverHaltTimeout)
+	defer cancel()
+	if _, err := eng.Stop(haltCtx, &engine.ControlRequest{
+		Database:    c.config.Database,
+		Credentials: creds,
+		ResumeState: resumeState,
+	}); err != nil {
+		return fmt.Errorf("stop engine %s work for database %s: %w", eng.Name(), c.config.Database, err)
+	}
+	return nil
 }
 
 // Timeouts for idle states where user action is expected.
