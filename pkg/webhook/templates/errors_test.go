@@ -230,6 +230,47 @@ func TestRenderInvalidEnv(t *testing.T) {
 	})
 }
 
+// The invalid-command reply opens by naming the token SchemaBot rejected and
+// what is wrong with it, then lists the commands. It names the flag to type
+// but never offers a corrected command to copy, so a typo next to
+// --allow-unsafe can only become an unsafe apply by the commenter typing the
+// flag. A bare mention has no token to blame and gets the list alone.
+func TestRenderInvalidCommand(t *testing.T) {
+	t.Run("names a flag typed without its dashes", func(t *testing.T) {
+		body := RenderInvalidCommand(CommandRejection{Problem: CommandProblemMissingDashes, Token: "allow-unsafe", Accepted: "--allow-unsafe"})
+		assert.Contains(t, body, "## ❌ Invalid Command\n\n`allow-unsafe` is missing its dashes; the flag is `--allow-unsafe`.\n\nAvailable commands:\n\n| Command |")
+		assert.NotContains(t, body, "wasn't recognized")
+		assert.NotContains(t, body, "schemabot apply -e staging --allow-unsafe")
+	})
+
+	t.Run("lists the commands alone when no token is to blame", func(t *testing.T) {
+		body := RenderInvalidCommand(CommandRejection{})
+		assert.Contains(t, body, "## ❌ Invalid Command\n\nThat command wasn't recognized. Available commands:\n\n| Command |")
+	})
+
+	t.Run("every problem renders a reason naming the token", func(t *testing.T) {
+		for problem := CommandProblemNone + 1; problem < numCommandProblems; problem++ {
+			reason := CommandRejection{Problem: problem, Token: "tok", Accepted: "-e"}.sentence()
+			assert.True(t, strings.HasPrefix(reason, "`tok` "), "problem %d renders %q", problem, reason)
+		}
+	})
+
+	t.Run("names the value a value flag is missing", func(t *testing.T) {
+		assert.Equal(t, "`-d` needs a database name after it.", CommandRejection{Problem: CommandProblemMissingValue, Token: "-d", Accepted: "-d"}.sentence())
+		assert.Equal(t, "`--target` needs a target name after it.", CommandRejection{Problem: CommandProblemMissingValue, Token: "--target", Accepted: "--target"}.sentence())
+	})
+
+	t.Run("a token cannot break out of its code span", func(t *testing.T) {
+		reason := CommandRejection{Problem: CommandProblemUnknownFlag, Token: "--a`**b**"}.sentence()
+		assert.Equal(t, "`` --a`**b** `` is not a SchemaBot flag.", reason)
+	})
+
+	t.Run("a long token is clamped", func(t *testing.T) {
+		reason := CommandRejection{Problem: CommandProblemUnknownFlag, Token: "--" + strings.Repeat("x", 200)}.sentence()
+		assert.Equal(t, "`--"+strings.Repeat("x", maxRejectedTokenRunes-2)+"…` is not a SchemaBot flag.", reason)
+	})
+}
+
 // The generic command-failure comment renders untrusted engine and
 // infrastructure error text: internal endpoints are redacted, HTML markup is
 // escaped so it renders as text, and a multi-line error stays inside the
