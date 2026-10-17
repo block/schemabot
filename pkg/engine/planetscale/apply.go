@@ -215,6 +215,11 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (result *e
 	// and stops at the first sign of it ending rather than closing or deleting
 	// what a successor resumes against.
 	//
+	// A deploy whose outcome is unknown (engine.OutcomeUnknownError) is not
+	// retired either: the deploy call failed without a refusal, no read of the
+	// deploy request can show its deploy did not start, and recovery re-reads
+	// this same deploy request, so it and its branch are left in place.
+	//
 	// A drive whose context ends after the close has landed but before the
 	// failure is recorded hands the apply back with stored state naming a
 	// deploy request that is now closed and never deployed. A successor that
@@ -236,6 +241,10 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (result *e
 		if ctx.Err() != nil {
 			e.applyLogger(req).Info("drive ended after the deploy request was created; leaving the deploy request to the driver or control operation that takes over the apply",
 				"organization", org, "planetscale_database", req.Database, "deploy_request", createdDeployRequest, "branch", branchName, "apply_error", retErr)
+			return
+		}
+		if engine.IsOutcomeUnknown(retErr) {
+			leaveDeployRequestOfUnknownDeployOutcome(e.applyLogger(req), org, req.Database, createdDeployRequest, branchName, retErr)
 			return
 		}
 		e.retireDeployRequestOfFailedApply(ctx, e.applyLogger(req), client, org, req.Database, createdDeployRequest, deployRequestBranch, retErr)
@@ -1045,11 +1054,11 @@ func (e *Engine) resumeApply(ctx context.Context, client psclient.PSClient, org 
 	// deploy begins leaves it open and deployable exactly as a fresh drive
 	// would, so it retires the deploy request under the same rules as the
 	// fresh drive's cleanup in Apply: only after a failure, never after the
-	// drive's context ended, only while the deploy request reads as never
-	// deployed, and never deleting an operator-supplied branch. Only a deploy
-	// request this resume created is retired; one recovered from stored state
-	// is reattached by resumeExistingDeployRequest, which returns before this
-	// point.
+	// drive's context ended or with the deploy's outcome unknown, only while
+	// the deploy request reads as never deployed, and never deleting an
+	// operator-supplied branch. Only a deploy request this resume created is
+	// retired; one recovered from stored state is reattached by
+	// resumeExistingDeployRequest, which returns before this point.
 	var createdDeployRequest uint64
 	defer func() {
 		if retErr == nil {
@@ -1062,6 +1071,10 @@ func (e *Engine) resumeApply(ctx context.Context, client psclient.PSClient, org 
 		if ctx.Err() != nil {
 			e.applyLogger(req).Info("resumed drive ended after its deploy request was created; leaving the deploy request to the driver or control operation that takes over the apply",
 				"organization", org, "planetscale_database", req.Database, "deploy_request", createdDeployRequest, "branch", meta.BranchName, "apply_error", retErr)
+			return
+		}
+		if engine.IsOutcomeUnknown(retErr) {
+			leaveDeployRequestOfUnknownDeployOutcome(e.applyLogger(req), org, req.Database, createdDeployRequest, meta.BranchName, retErr)
 			return
 		}
 		ownedBranch := ""
