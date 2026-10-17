@@ -262,8 +262,9 @@ resume's handling of a failed reattach to accepted engine work, whose pause disp
 limit (`pkg/tern/grpc_client.go`), and the PlanetScale engine's re-read of a deploy request whose
 deploy call failed, which tracks a deploy that started instead of failing it and reports an
 unknown outcome when PlanetScale did not refuse the deploy and the re-read fails or still reads
-ready (`adoptDeployAfterError`, `pkg/engine/planetscale/branch.go`), with the drive pausing an
-unknown outcome for recovery on every engine (`engine.OutcomeUnknownError`,
+ready (`adoptDeployAfterError`, `pkg/engine/planetscale/branch.go`) and whose failed-apply cleanup
+leaves that deploy request open for the recovery (`pkg/engine/planetscale/apply.go`), with the drive
+pausing an unknown outcome for recovery on every engine (`engine.OutcomeUnknownError`,
 `shouldRetryEngineError` in `pkg/tern/local_apply_sequential.go`).
 
 ### AV-5: Panics are contained and permanent
@@ -1246,11 +1247,13 @@ drive resolves the request and records that outcome. And only settled outcomes a
 a remote state still in motion. *Enforced:* terminal-truth preflights on the control paths
 (`pkg/tern/local_control.go`, `pkg/tern/grpc_control_resend.go`); the drive's adoption of the
 engine's settled outcome onto the task rows before a pending command is consumed
-(`pkg/tern/local_control_reconcile.go`); the in-process engine's settled outcome checks on stop
-and cancel (`pkg/engine/spirit/control.go`), including a completion its run records after the
-cancel, and its run's deference to a stop or cancel that interrupted it, which no failure the run
-records afterwards replaces (`setSchemaChangeFailed`, `pkg/engine/spirit/execution.go`,
-`pkg/engine/spirit/direct.go`).
+(`pkg/tern/local_control_reconcile.go`); the PlanetScale engine's reading of a deploy request
+still in motion, including an unconfirmed cancel, as running rather than settled
+(`deployStateToEngineState`, `pkg/engine/planetscale/planetscale.go`); the in-process engine's
+settled outcome checks on stop and cancel (`pkg/engine/spirit/control.go`), including a
+completion its run records after the cancel, and its run's deference to a stop or cancel that
+interrupted it, which no failure the run records afterwards replaces (`setSchemaChangeFailed`,
+`pkg/engine/spirit/execution.go`, `pkg/engine/spirit/direct.go`).
 
 ### CO-4: Stop wins
 

@@ -104,6 +104,11 @@ func deployRequestNeverDeployed(dr *ps.DeployRequest) bool {
 	return !deployRequestReportsDeploy(dr)
 }
 
+// deployOutcomeUnknownKeepsDeployRequestLog is logged when a drive fails with a
+// deploy whose outcome is unknown, so the failed-apply cleanup leaves the
+// deploy request and its branch for the recovery that re-reads them.
+const deployOutcomeUnknownKeepsDeployRequestLog = "deploy outcome is unknown; leaving the deploy request and its branch for the recovery that re-reads the deploy request"
+
 // retireDeployRequestOfFailedApply closes the deploy request a failed apply
 // created and deletes the branch the apply created for it, when the deploy
 // request provably never deployed. The deploy request's auto_delete_branch

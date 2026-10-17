@@ -298,29 +298,37 @@ func TestApplyHandsOnlyItsOwnBranchToTheDeployRequest(t *testing.T) {
 // undeployedDeployRequestClient carries a fresh apply to its deploy request and
 // fails the apply there. createdDR is what the create returns, deployErr (when
 // set) rejects the deploy, reread is what every later read of the deploy
-// request returns, and closed (when set) is what the close returns; without it
-// the close returns reread marked closed. readErr, closeErr and deleteErr fail
-// the read, the close and the branch delete; closeNil makes the close return
-// no deploy request. endDrive ends the drive's context at the step endDriveAt
-// names: the deploy, the cleanup's read (which then fails with the ended
-// context's error, as a real request would), the cleanup's read whose response
-// still lands, or the cleanup's close. Reads and closes are recorded.
+// request returns, cleanupReread (when set) is what the cleanup's read returns
+// instead, and closed (when set) is what the close returns; without it the
+// close returns reread marked closed. A rejected deploy re-reads the deploy
+// request to check whether the deploy started, so the cleanup's read is the
+// second. readErr, closeErr and deleteErr fail the read, the close and the
+// branch delete; closeNil makes the close return no deploy request. endDrive
+// ends the drive's context at the step endDriveAt names: the deploy, the
+// cleanup's read (which then fails with the ended context's error, as a real
+// request would), the cleanup's read whose response still lands, or the
+// cleanup's close. Reads and closes are recorded.
 type undeployedDeployRequestClient struct {
 	branchHandoverClient
 
-	createdDR  *ps.DeployRequest
-	reread     *ps.DeployRequest
-	closed     *ps.DeployRequest
-	deployErr  error
-	readErr    error
-	closeErr   error
-	closeNil   bool
-	deleteErr  error
-	endDrive   context.CancelFunc
-	endDriveAt string
-	reads      int
-	closes     []uint64
+	createdDR     *ps.DeployRequest
+	reread        *ps.DeployRequest
+	cleanupReread *ps.DeployRequest
+	closed        *ps.DeployRequest
+	deployErr     error
+	readErr       error
+	closeErr      error
+	closeNil      bool
+	deleteErr     error
+	endDrive      context.CancelFunc
+	endDriveAt    string
+	reads         int
+	closes        []uint64
 }
+
+// cleanupRead is the read of the deploy request the failed-apply cleanup
+// makes, after the one a rejected deploy makes to check whether it started.
+const cleanupRead = 2
 
 const (
 	endDriveAtDeploy      = "deploy"
@@ -340,20 +348,26 @@ func (c *undeployedDeployRequestClient) CreateDeployRequest(_ context.Context, r
 func (c *undeployedDeployRequestClient) GetDeployRequest(ctx context.Context, _ *ps.GetDeployRequestRequest) (*ps.DeployRequest, error) {
 	c.mu.Lock()
 	c.reads++
+	read := c.reads
 	c.mu.Unlock()
-	switch c.endDriveAt {
-	case endDriveAtReread:
-		c.endDrive()
-		if err := ctx.Err(); err != nil {
-			return nil, err
+	if read == cleanupRead {
+		switch c.endDriveAt {
+		case endDriveAtReread:
+			c.endDrive()
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+		case endDriveAtRereadLands:
+			c.endDrive()
 		}
-	case endDriveAtRereadLands:
-		c.endDrive()
 	}
 	if c.readErr != nil {
 		return nil, c.readErr
 	}
 	reread := *c.reread
+	if read == cleanupRead && c.cleanupReread != nil {
+		reread = *c.cleanupReread
+	}
 	return &reread, nil
 }
 
@@ -427,7 +441,8 @@ func TestApplyClosesTheUndeployedDeployRequestOfAFailedApply(t *testing.T) {
 	queued := &ps.DeployRequest{Number: 91, State: "open", DeploymentState: deployState.Queued, DeployedAt: &deployedAt}
 	queuedNotDeployed := &ps.DeployRequest{Number: 91, State: "open", DeploymentState: deployState.Queued}
 	readyDeployed := &ps.DeployRequest{Number: 91, State: "open", DeploymentState: deployState.Ready, DeployedAt: &deployedAt}
-	rejected := errors.New("deploy request #91 cannot be deployed")
+	rejected := &ps.Error{Code: ps.ErrInvalid}
+	unanswered := errors.New("connection reset by peer")
 	const (
 		deployMayRunLog = "the deploy request of a failed apply reports a deploy may have begun; the apply is being failed over a deploy that may now be running, so the deploy request and its branch are left in place; " + reconcileDeployOfFailedApply
 		closeReportsLog = "closing the deploy request of a failed apply reported a deploy began after the cleanup read it; the apply is being failed over a deploy that may now be running, so its branch is left in place; " + reconcileDeployOfFailedApply
@@ -437,18 +452,21 @@ func TestApplyClosesTheUndeployedDeployRequestOfAFailedApply(t *testing.T) {
 	)
 
 	tests := []struct {
-		name       string
-		options    map[string]string
-		createdDR  *ps.DeployRequest
-		reread     *ps.DeployRequest
-		closed     *ps.DeployRequest
-		deployErr  error
-		readErr    error
-		closeErr   error
-		closeNil   bool
-		deleteErr  error
-		endDriveAt string
-		wantCloses []uint64
+		name      string
+		options   map[string]string
+		createdDR *ps.DeployRequest
+		reread    *ps.DeployRequest
+		// cleanupReread is what the cleanup's read returns when it differs
+		// from the read the rejected deploy made.
+		cleanupReread *ps.DeployRequest
+		closed        *ps.DeployRequest
+		deployErr     error
+		readErr       error
+		closeErr      error
+		closeNil      bool
+		deleteErr     error
+		endDriveAt    string
+		wantCloses    []uint64
 		// wantDelete is "" when no delete is sent, "deleted" when the branch
 		// is deleted, and "failed" when the delete is sent and fails.
 		wantDelete string
@@ -464,8 +482,11 @@ func TestApplyClosesTheUndeployedDeployRequestOfAFailedApply(t *testing.T) {
 		{name: "a rejected deploy that never began is closed and its branch deleted",
 			createdDR: ready, reread: ready, deployErr: rejected,
 			wantCloses: []uint64{91}, wantDelete: "deleted", wantLog: deletedLog, wantLevel: "INFO"},
-		{name: "a deploy request that reports a deploy began is left with its branch",
-			createdDR: ready, reread: queued, deployErr: rejected, wantLog: deployMayRunLog, wantLevel: "ERROR"},
+		{name: "a deploy request that reports a deploy began by the cleanup's read is left with its branch",
+			createdDR: ready, reread: ready, cleanupReread: queued, deployErr: rejected, wantLog: deployMayRunLog, wantLevel: "ERROR"},
+		{name: "a deploy whose outcome is unknown leaves the deploy request and branch for recovery",
+			createdDR: ready, reread: ready, deployErr: unanswered,
+			wantLog: deployOutcomeUnknownKeepsDeployRequestLog, wantLevel: "WARN"},
 		{name: "a refused deploy request that carries a deploy timestamp is left with its branch",
 			createdDR: refused, reread: refusedDeployed, wantLog: deployMayRunLog, wantLevel: "ERROR"},
 		{name: "a close response showing the deploy queued keeps the branch",
@@ -510,16 +531,17 @@ func TestApplyClosesTheUndeployedDeployRequestOfAFailedApply(t *testing.T) {
 			ctx, cancel := context.WithCancel(t.Context())
 			defer cancel()
 			client := &undeployedDeployRequestClient{
-				createdDR:  tt.createdDR,
-				reread:     tt.reread,
-				closed:     tt.closed,
-				deployErr:  tt.deployErr,
-				readErr:    tt.readErr,
-				closeErr:   tt.closeErr,
-				closeNil:   tt.closeNil,
-				deleteErr:  tt.deleteErr,
-				endDrive:   cancel,
-				endDriveAt: tt.endDriveAt,
+				createdDR:     tt.createdDR,
+				reread:        tt.reread,
+				cleanupReread: tt.cleanupReread,
+				closed:        tt.closed,
+				deployErr:     tt.deployErr,
+				readErr:       tt.readErr,
+				closeErr:      tt.closeErr,
+				closeNil:      tt.closeNil,
+				deleteErr:     tt.deleteErr,
+				endDrive:      cancel,
+				endDriveAt:    tt.endDriveAt,
 			}
 			req := &engine.ApplyRequest{
 				PlanID:      "plan-0123456789abcdef",
@@ -839,12 +861,13 @@ func TestResumeApply_RejectedDeployRequestReclaimsTheBranch(t *testing.T) {
 type resumedDeployRequestClient struct {
 	resumeReclaimClient
 
-	created   *ps.DeployRequest
-	reread    *ps.DeployRequest
-	deployErr error
-	endDrive  context.CancelFunc
-	reads     int
-	closes    []uint64
+	created       *ps.DeployRequest
+	reread        *ps.DeployRequest
+	cleanupReread *ps.DeployRequest
+	deployErr     error
+	endDrive      context.CancelFunc
+	reads         int
+	closes        []uint64
 }
 
 func (c *resumedDeployRequestClient) CreateDeployRequest(context.Context, *ps.CreateDeployRequestRequest) (*ps.DeployRequest, error) {
@@ -860,6 +883,9 @@ func (c *resumedDeployRequestClient) GetDeployRequest(context.Context, *ps.GetDe
 	defer c.mu.Unlock()
 	c.reads++
 	reread := *c.reread
+	if c.reads == cleanupRead && c.cleanupReread != nil {
+		reread = *c.cleanupReread
+	}
 	return &reread, nil
 }
 
@@ -894,44 +920,50 @@ func TestResumeApply_ClosesTheUndeployedDeployRequestItCreated(t *testing.T) {
 	refused := &ps.DeployRequest{Number: 42, State: "open", DeploymentState: deployState.Error}
 	ready := &ps.DeployRequest{Number: 42, State: "open", DeploymentState: deployState.Ready}
 	queued := &ps.DeployRequest{Number: 42, State: "open", DeploymentState: deployState.Queued, DeployedAt: &deployedAt}
-	rejected := errors.New("deploy request #42 cannot be deployed")
+	rejected := &ps.Error{Code: ps.ErrInvalid}
+	unanswered := errors.New("connection reset by peer")
 
 	tests := []struct {
 		name string
 		// recovered names a deploy request in the stored state, so the resume
 		// reattaches to it instead of creating one.
-		recovered   bool
-		options     map[string]string
-		created     *ps.DeployRequest
-		reread      *ps.DeployRequest
-		deployErr   error
-		endDrive    bool
-		wantErr     string
-		wantCloses  []uint64
-		wantDeleted []string
-		wantReads   int
+		recovered bool
+		options   map[string]string
+		created   *ps.DeployRequest
+		reread    *ps.DeployRequest
+		// cleanupReread is what the cleanup's read returns when it differs
+		// from the read the rejected deploy made.
+		cleanupReread *ps.DeployRequest
+		deployErr     error
+		endDrive      bool
+		wantErr       string
+		wantCloses    []uint64
+		wantDeleted   []string
+		wantReads     int
 	}{
 		{name: "a deploy request the resume created and PlanetScale refused is closed and its branch deleted",
 			created: refused, reread: refused, wantErr: "deploy request #42 failed on resume",
 			wantCloses: []uint64{42}, wantDeleted: []string{branch}, wantReads: 1},
 		{name: "a rejected deploy of a deploy request the resume created is closed and its branch deleted",
 			created: ready, reread: ready, deployErr: rejected, wantErr: "deploy on resume",
-			wantCloses: []uint64{42}, wantDeleted: []string{branch}, wantReads: 1},
+			wantCloses: []uint64{42}, wantDeleted: []string{branch}, wantReads: 2},
 		{name: "an operator-supplied branch is kept after the deploy request the resume created is closed",
 			options: map[string]string{"branch": branch}, created: refused, reread: refused, wantErr: "deploy request #42 failed on resume",
 			wantCloses: []uint64{42}, wantReads: 1},
-		{name: "a deploy request the resume created that reports a deploy began is left with its branch",
-			created: ready, reread: queued, deployErr: rejected, wantErr: "deploy on resume", wantReads: 1},
+		{name: "a deploy request the resume created that reports a deploy began by the cleanup's read is left with its branch",
+			created: ready, reread: ready, cleanupReread: queued, deployErr: rejected, wantErr: "deploy on resume", wantReads: 2},
+		{name: "a deploy of a deploy request the resume created whose outcome is unknown leaves both for recovery",
+			created: ready, reread: ready, deployErr: unanswered, wantErr: "deploy on resume", wantReads: 1},
 		{name: "a resumed drive that ends after creating the deploy request leaves both for the driver that takes over",
 			created: ready, reread: ready, endDrive: true, wantErr: "deploy on resume"},
 		{name: "a deploy request recovered from stored state is never closed",
-			recovered: true, reread: ready, deployErr: rejected, wantErr: "recovered deploy request on resume", wantReads: 1},
+			recovered: true, reread: ready, deployErr: rejected, wantErr: "recovered deploy request on resume", wantReads: 2},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			ctx, cancel := context.WithCancel(t.Context())
 			defer cancel()
-			client := &resumedDeployRequestClient{created: tt.created, reread: tt.reread, deployErr: tt.deployErr}
+			client := &resumedDeployRequestClient{created: tt.created, reread: tt.reread, cleanupReread: tt.cleanupReread, deployErr: tt.deployErr}
 			if tt.endDrive {
 				client.endDrive = cancel
 			}

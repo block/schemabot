@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/block/schemabot/pkg/engine"
+	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/stretchr/testify/assert"
@@ -354,6 +355,61 @@ func TestReconcileEngineTerminalTruth_NonTerminalEngineFallsThroughToCommand(t *
 	require.NoError(t, err)
 	require.NotNil(t, controlReq, "the pending cancel must remain for the command path to consume")
 	assert.Equal(t, storage.ControlRequestPending, controlReq.Status)
+}
+
+// An operator's cancel is pending while the engine's backend reports a cancel
+// it accepted but has not confirmed, which reads as running. The first claim
+// must not adopt anything: the cancel stays pending, and the cancel command
+// fails while the engine still has live work, leaving the stored state as it
+// was. The backend then settles the deploy as failed because the cancel never
+// landed, and the next claim adopts that failure and settles the pending
+// cancel with the reason it did not take effect, so the apply records what the
+// backend reports rather than a cancel that never happened.
+func TestReconcileEngineTerminalTruth_InFlightCancelAdoptsTheFailureItSettlesOn(t *testing.T) {
+	fx := newReconcileFixture(
+		&fakeControlEngine{
+			externallyAuthoritative: true,
+			progressResult:          &engine.ProgressResult{State: engine.StateRunning, Message: "Cancelling deploy..."},
+			cancelErr:               errors.New(`cancel deploy request #72 rejected in deployment state "in_progress_cancel": The deploy request is closed.`),
+		},
+		pendingReconcileRequest(321, storage.ControlOperationCancel),
+	)
+
+	handled, err := fx.client.reconcileEngineTerminalTruthBeforeCommands(t.Context(), fx.apply, []*storage.Task{fx.task})
+	require.NoError(t, err)
+	assert.False(t, handled, "a cancel still in flight is not a settled outcome")
+	assert.Equal(t, state.Task.WaitingForDeploy, fx.task.State)
+	assert.Equal(t, state.Apply.ValidatingDeployRequest, fx.apply.State)
+
+	_, err = fx.client.cancelOwnedApply(t.Context(), &ternv1.CancelRequest{ApplyId: fx.apply.ApplyIdentifier}, "github:alice")
+	require.ErrorContains(t, err, `rejected in deployment state "in_progress_cancel"`,
+		"a cancel rejected while the engine still has live work surfaces for the drive to retry")
+	assert.Equal(t, 1, fx.engine.cancelCount)
+	assert.Equal(t, state.Task.WaitingForDeploy, fx.task.State, "the rejected cancel must not record the task cancelled")
+	assert.Equal(t, state.Apply.ValidatingDeployRequest, fx.apply.State, "the rejected cancel must not record the apply cancelled")
+	controlReq, err := fx.controlRequests.GetPending(t.Context(), fx.apply.ID, storage.ControlOperationCancel)
+	require.NoError(t, err)
+	require.NotNil(t, controlReq, "the cancel stays pending for the next claim")
+
+	fx.engine.progressResult = &engine.ProgressResult{
+		State:        engine.StateFailed,
+		Retryable:    false,
+		ErrorMessage: "Deployment failed",
+	}
+
+	handled, err = fx.client.reconcileEngineTerminalTruthBeforeCommands(t.Context(), fx.apply, []*storage.Task{fx.task})
+	require.NoError(t, err)
+	assert.True(t, handled)
+	assert.Equal(t, 1, fx.engine.cancelCount, "the settled failure moots the cancel without sending it again")
+	assert.Equal(t, state.Task.Failed, fx.task.State)
+	assert.Equal(t, "Deployment failed", fx.task.ErrorMessage)
+	assert.Equal(t, state.Apply.Failed, fx.apply.State)
+	assert.Equal(t, "Deployment failed", fx.apply.ErrorMessage)
+	settled, err := fx.controlRequests.GetByOperation(t.Context(), fx.apply.ID, storage.ControlOperationCancel)
+	require.NoError(t, err)
+	require.NotNil(t, settled)
+	assert.Equal(t, storage.ControlRequestFailed, settled.Status, "a cancel the backend never confirmed did not take effect")
+	assert.Equal(t, "the schema change reached Failed before the cancel could take effect", settled.ErrorMessage)
 }
 
 // A failed progress read must fail toward consuming the command, never toward
