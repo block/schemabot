@@ -10,6 +10,7 @@ import (
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
+	"github.com/block/schemabot/pkg/ui"
 )
 
 // singleShardStrataProgress is a completed apply on a keyspace's only shard:
@@ -159,4 +160,36 @@ func multiShardRunningResponse() *apitypes.ProgressResponse {
 			},
 		}},
 	}
+}
+
+// A sharded table whose shards are in different phases keeps its bar across
+// every shard, as the PR comment does: one shard cutting over beside one
+// copying halfway reads 75% rather than "Cutting over", and one verified
+// shard of four, with the rest queued or not yet attached, reads 25%. The
+// checksumming shard's verify figures reach its line from the server.
+func TestFormatTableProgressKeepsTheBarAcrossShardsInDifferentPhases(t *testing.T) {
+	parse := func(table *apitypes.TableProgressResponse) TableProgress {
+		return ParseProgressResponse(&apitypes.ProgressResponse{State: state.Apply.Running, Sharded: true, Tables: []*apitypes.TableProgressResponse{table}}).Tables[0]
+	}
+
+	output := FormatTableProgress(parse(&apitypes.TableProgressResponse{
+		TableName: "orders", Keyspace: "shop_001", ChangeType: "alter", Status: state.Task.CuttingOver, RowsCopied: 1500, RowsTotal: 2000,
+		Shards: []*apitypes.ShardProgressResponse{
+			{Shard: "-80", Status: state.Task.CuttingOver, RowsCopied: 1000, RowsTotal: 1000, PercentComplete: 100},
+			{Shard: "80-", Status: state.Task.Running, RowsCopied: 500, RowsTotal: 1000, PercentComplete: 50},
+		},
+	}))
+	assert.Contains(t, output, "orders: "+ui.ProgressBarRowCopy(75)+" 75%\n", "%s", output)
+	assert.NotContains(t, output, "Cutting over")
+
+	output = FormatTableProgress(parse(&apitypes.TableProgressResponse{
+		TableName: "orders", Keyspace: "shop_001", ChangeType: "alter", Status: state.Task.Checksumming, RowsCopied: 1000, RowsTotal: 1000, PlannedShards: 4,
+		Shards: []*apitypes.ShardProgressResponse{
+			{Shard: "-40", Status: state.Task.Checksumming, RowsCopied: 1000, RowsTotal: 1000, PercentComplete: 100, ChecksumRowsChecked: 250, ChecksumRowsTotal: 1000},
+			{Shard: "40-80", Status: state.Task.Pending},
+		},
+	}))
+	assert.Contains(t, output, "orders: "+ui.ProgressBarRowCopy(25)+" 25%\n", "%s", output)
+	assert.Contains(t, output, "Rows: 1,000 / 1,000 across 1 of 4 shards\n", "%s", output)
+	assert.Contains(t, output, "checksumming 25.00% · 250 / 1,000 rows verified", "%s", output)
 }

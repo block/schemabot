@@ -141,6 +141,7 @@ func previewCommentAllOutput() {
 		{"RESUMED: SUPERSEDED PROGRESS COMMENT", func() { fmt.Print(webhooktemplates.PreviewCommentResumeSupersededProgress()) }},
 		{"REVERT: SUPERSEDED PROGRESS COMMENT", func() { fmt.Print(webhooktemplates.PreviewCommentRevertSupersededProgress()) }},
 		{"SKIP REVERT: SUPERSEDED PROGRESS COMMENT", func() { fmt.Print(webhooktemplates.PreviewCommentSkipRevertSupersededProgress()) }},
+		{"CUTOVER STARTED: SUPERSEDED PROGRESS COMMENT", func() { fmt.Print(webhooktemplates.PreviewCommentCutoverCommandSupersededProgress()) }},
 		{"CUTOVER COMPLETE: SUPERSEDED CUTOVER PROMPT", func() { fmt.Print(webhooktemplates.PreviewCommentCutoverSuperseded()) }},
 		{"RETRY: SUPERSEDED PROGRESS COMMENT (GENERIC)", func() { fmt.Print(webhooktemplates.PreviewCommentSupersededProgress()) }},
 		{"SUMMARY: COMPLETED", func() { fmt.Print(webhooktemplates.PreviewCommentSummaryCompleted()) }},
@@ -157,6 +158,7 @@ func previewCommentAllOutput() {
 		{"ROLLBACK CONFIRM BLOCKED (UNSAFE CHANGE)", func() { fmt.Print(webhooktemplates.PreviewCommentRollbackUnsafeBlocked()) }},
 		{"ROLLBACK STATUS: RUNNING", func() { fmt.Print(webhooktemplates.PreviewCommentRollbackStatus()) }},
 		{"SUMMARY: ROLLBACK COMPLETE", func() { fmt.Print(webhooktemplates.PreviewCommentRollbackSummaryCompleted()) }},
+		{"ROLLBACK REFUSED: MULTIPLE TARGETS", func() { fmt.Print(webhooktemplates.PreviewCommentRollbackOfRolloutUnsupported()) }},
 	}
 
 	for i, s := range sections {
@@ -308,6 +310,7 @@ func previewCommentApplyFlowAllOutput() {
 		{"APPLY BLOCKED BY PRIOR ENV (PENDING)", func() { fmt.Print(webhooktemplates.PreviewCommentApplyBlockedByPriorEnv()) }},
 		{"APPLY BLOCKED BY PRIOR ENV (FAILED)", func() { fmt.Print(webhooktemplates.PreviewCommentApplyBlockedByPriorEnvFailed()) }},
 		{"APPLY BLOCKED BY PRIOR ENV (IN PROGRESS)", func() { fmt.Print(webhooktemplates.PreviewCommentApplyBlockedByPriorEnvInProgress()) }},
+		{"APPLY BLOCKED BY PRIOR ENV (STOPPED)", func() { fmt.Print(webhooktemplates.PreviewCommentApplyBlockedByStoppedPriorEnvApply()) }},
 		{"APPLY BLOCKED: PRIOR ENV CHECK MISSING", func() { fmt.Print(webhooktemplates.PreviewCommentApplyBlockedByMissingPriorEnvCheck()) }},
 		{"APPLY BLOCKED: PRIOR ENV CHECK ON ANOTHER COMMIT", func() { fmt.Print(webhooktemplates.PreviewCommentApplyBlockedByStalePriorEnvCheck()) }},
 		{"APPLY BLOCKED: PRIOR ENV CHECK READ ERROR", func() { fmt.Print(webhooktemplates.PreviewCommentApplyBlockedByPriorEnvCheckError()) }},
@@ -348,6 +351,7 @@ func previewCommentApplyFlowAllOutput() {
 		{"SECOND TABLE THROTTLED", func() { fmt.Print(webhooktemplates.PreviewCommentApplyThrottled()) }},
 		{"SECOND TABLE CATCHING UP", func() { fmt.Print(webhooktemplates.PreviewCommentApplyCatchingUp()) }},
 		{"SECOND TABLE CHECKSUMMING", func() { fmt.Print(webhooktemplates.PreviewCommentApplyChecksumming()) }},
+		{"SECOND TABLE CHECKSUMMING: CUTOVER DEFERRED", func() { fmt.Print(webhooktemplates.PreviewCommentApplyChecksummingDeferredCutover()) }},
 		{"SECOND TABLE POST-CHECKSUM", func() { fmt.Print(webhooktemplates.PreviewCommentApplyPostChecksum()) }},
 		{"THIRD TABLE RUNNING", func() { fmt.Print(webhooktemplates.PreviewCommentApplyThirdRunning()) }},
 		// PostgreSQL: several statements on one table, each its own row
@@ -382,6 +386,7 @@ func previewCommentApplyFlowAllOutput() {
 		{"RESUMED: SUPERSEDED PROGRESS COMMENT", func() { fmt.Print(webhooktemplates.PreviewCommentResumeSupersededProgress()) }},
 		{"REVERT: SUPERSEDED PROGRESS COMMENT", func() { fmt.Print(webhooktemplates.PreviewCommentRevertSupersededProgress()) }},
 		{"SKIP REVERT: SUPERSEDED PROGRESS COMMENT", func() { fmt.Print(webhooktemplates.PreviewCommentSkipRevertSupersededProgress()) }},
+		{"CUTOVER STARTED: SUPERSEDED PROGRESS COMMENT", func() { fmt.Print(webhooktemplates.PreviewCommentCutoverCommandSupersededProgress()) }},
 		{"CUTOVER COMPLETE: SUPERSEDED CUTOVER PROMPT", func() { fmt.Print(webhooktemplates.PreviewCommentCutoverSuperseded()) }},
 		{"RETRY: SUPERSEDED PROGRESS COMMENT (GENERIC)", func() { fmt.Print(webhooktemplates.PreviewCommentSupersededProgress()) }},
 		// Summaries
@@ -401,6 +406,7 @@ func previewCommentApplyFlowAllOutput() {
 		{"ROLLBACK CONFIRM BLOCKED (UNSAFE CHANGE)", func() { fmt.Print(webhooktemplates.PreviewCommentRollbackUnsafeBlocked()) }},
 		{"ROLLBACK STATUS: RUNNING", func() { fmt.Print(webhooktemplates.PreviewCommentRollbackStatus()) }},
 		{"SUMMARY: ROLLBACK COMPLETE", func() { fmt.Print(webhooktemplates.PreviewCommentRollbackSummaryCompleted()) }},
+		{"ROLLBACK REFUSED: MULTIPLE TARGETS", func() { fmt.Print(webhooktemplates.PreviewCommentRollbackOfRolloutUnsupported()) }},
 		{"ROLLBACK-CONFIRM REFUSED: ROLLBACK PLAN STORED WITHOUT ROUTING", func() { fmt.Print(webhook.PreviewRollbackConfirmPlanWithoutRouting()) }},
 	}
 	printSections(sections)

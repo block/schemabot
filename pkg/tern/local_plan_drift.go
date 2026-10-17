@@ -44,25 +44,56 @@ type driftChangeKey struct {
 type driftChangeMultiset map[driftChangeKey]int
 
 // replannedChange is one change as this deployment's own re-plan produced it:
-// the statement its engine emitted against this target and the execution-mode
-// verdict on how that statement would run here.
+// the statement its engine emitted against this target, the execution-mode
+// verdict on how that statement would run here, and whether its engine judged
+// the statement unsafe.
 type replannedChange struct {
-	ddl    string
-	mode   string
-	reason string
+	ddl          string
+	mode         string
+	reason       string
+	unsafe       bool
+	unsafeReason string
+}
+
+// replannedChangeOf reads the re-planned facts back off a plan row's change,
+// so a change carried from the plan row is stamped exactly as the plan row
+// was.
+func replannedChangeOf(tc storage.TableChange) replannedChange {
+	return replannedChange{ddl: tc.DDL, mode: tc.ExecutionMode, reason: tc.ModeReason, unsafe: tc.IsUnsafe, unsafeReason: tc.UnsafeReason}
+}
+
+// stampOnto writes the re-planned facts onto a change. The statement and
+// execution-mode verdict are this target's and replace what the change
+// carried. The unsafe flag is only ever tightened: a re-plan that judges the
+// statement unsafe marks the change unsafe, so the unsafe-change admission
+// gate requires the opt-in for it, and a re-plan that judges it safe leaves a
+// change already marked unsafe as it is.
+func (r replannedChange) stampOnto(tc *storage.TableChange) {
+	tc.DDL = r.ddl
+	tc.ExecutionMode = r.mode
+	tc.ModeReason = r.reason
+	if !r.unsafe {
+		return
+	}
+	tc.IsUnsafe = true
+	if r.unsafeReason != "" {
+		tc.UnsafeReason = r.unsafeReason
+	}
 }
 
 // replannedChanges records, per change, what this deployment's re-plan
 // produced, keyed exactly as the drift comparison keyed the changes (so
 // targetShard is the shard every key carries: "" for a whole-deployment
-// apply). Both parts are properties of a target, not of the reviewed text.
-// The verdict: the same statement can be executable on the primary's target
-// and refused on this one (a table above the direct-execution size bound
-// here, a grant missing here). The statement: an engine that qualifies DDL
-// with the physical schema it planned against writes the primary's schema
+// apply). All three parts are properties of a target, not of the reviewed
+// text. The verdict: the same statement can be executable on the primary's
+// target and refused on this one (a table above the direct-execution size
+// bound here, a grant missing here). The statement: an engine that qualifies
+// DDL with the physical schema it planned against writes the primary's schema
 // into the dispatched text, and this target's copy of that schema can carry a
-// different name. The dispatched changes carry neither, so the re-plan is the
-// only place they exist.
+// different name. The unsafe flag: whether the statement destroys data is
+// judged by this target's engine against this target's schema. The
+// dispatched changes carry none of them, so the re-plan is the only place
+// they exist.
 type replannedChanges struct {
 	targetShard string
 	byChange    map[driftChangeKey]replannedChange
@@ -71,14 +102,24 @@ type replannedChanges struct {
 // record keeps the re-planned change for a key. A key can repeat when the
 // re-plan holds the same change twice; a blocked verdict then wins because
 // admitting a plan one copy would refuse is the failure this exists to
-// prevent. Otherwise the first seen stands — the copies canonicalize equal by
+// prevent, and an unsafe flag wins for the same reason: the kept copy takes
+// the unsafe flag and reason of the other copy when only that one is unsafe.
+// Otherwise the first seen stands — the copies canonicalize equal by
 // construction of the key, so either statement is this target's own.
 func (r replannedChanges) record(key driftChangeKey, change replannedChange) {
 	existing, seen := r.byChange[key]
-	if seen && (existing.mode == engine.ExecutionModeBlocked || change.mode != engine.ExecutionModeBlocked) {
+	if !seen {
+		r.byChange[key] = change
 		return
 	}
-	r.byChange[key] = change
+	kept, other := existing, change
+	if change.mode == engine.ExecutionModeBlocked && existing.mode != engine.ExecutionModeBlocked {
+		kept, other = change, existing
+	}
+	if other.unsafe && !kept.unsafe {
+		kept.unsafe, kept.unsafeReason = true, other.unsafeReason
+	}
+	r.byChange[key] = kept
 }
 
 // driftRecoveryHint gives a blocked operator the defined next step when the
@@ -221,7 +262,7 @@ func (c *LocalClient) driftMultisetFromPlanResult(result *engine.PlanResult, sha
 			}
 			key := driftChangeKey{ns, shard, tc.Table, ddl.StatementTypeToOp(tc.Operation), canon}
 			ms[key]++
-			replanned.record(key, replannedChange{ddl: tc.DDL, mode: tc.ExecutionMode, reason: tc.ModeReason})
+			replanned.record(key, replannedChange{ddl: tc.DDL, mode: tc.ExecutionMode, reason: tc.ModeReason, unsafe: tc.IsUnsafe, unsafeReason: tc.UnsafeReason})
 		}
 	}
 	return ms, replanned, nil
@@ -254,6 +295,11 @@ func (c *LocalClient) driftMultisetFromPlanResult(result *engine.PlanResult, sha
 // reviewed text it will never run. Every materialized change has a re-planned
 // counterpart because the drift comparison already required the two multisets
 // to match key for key.
+//
+// The unsafe flag is tightened the same way. The dispatch does not carry the
+// flag, and an operation the statement classifies as an alter can still drop
+// data (a dropped column), so without the re-plan's judgement the
+// unsafe-change admission gate would admit it without the opt-in.
 func (c *LocalClient) stampReplannedChanges(namespaces map[string]*storage.NamespacePlanData, replanned replannedChanges) error {
 	parser, err := c.statementParser()
 	if err != nil {
@@ -273,9 +319,7 @@ func (c *LocalClient) stampReplannedChanges(namespaces map[string]*storage.Names
 			if !ok {
 				return fmt.Errorf("table %q: no re-planned change for one the drift comparison matched", tc.Table)
 			}
-			tc.DDL = change.ddl
-			tc.ExecutionMode = change.mode
-			tc.ModeReason = change.reason
+			change.stampOnto(tc)
 		}
 	}
 	return nil
@@ -293,15 +337,24 @@ func (c *LocalClient) stampReplannedChanges(namespaces map[string]*storage.Names
 // target's re-planned text. The substitution here closes that gap: each
 // dispatched change is matched to its counterpart in the plan row under the
 // drift key — the same equivalence the drift comparison admitted it on — and
-// takes the counterpart's statement and execution-mode verdict. A change with
-// no counterpart keeps the dispatched statement: the plan row was materialized
-// by a sibling dispatch of the same plan and holds only that dispatch's
-// changes, or was planned locally and holds its sharded changes per shard, and
-// in both the dispatched text is this deployment's own. The substitution never
-// widens what runs — an unmatched change runs exactly the reviewed text — and
-// the operation key a shard-scoped dispatch is stamped with names the
-// namespace, shard and table only, so the control plane's echo check, which
-// derives the key from the dispatched text, is unaffected.
+// takes the counterpart's statement and execution-mode verdict, and its unsafe
+// flag where the counterpart is marked unsafe. The counterparts come from the
+// dispatched shard's own plan row where the plan judged a namespace per shard
+// (see shardDispatchCounterparts), so a shard whose changes diverge from its
+// siblings' is matched to its own text and verdict.
+//
+// A change with no counterpart was never re-planned here. The plan row was
+// materialized by a sibling dispatch of the same plan and holds only that
+// dispatch's changes, and a later dispatch resolves to the stored row without
+// a re-plan, so nothing on this deployment has judged whether the change
+// destroys data. Such a change keeps the dispatched statement — the reviewed
+// text, the primary's rendering — and is marked unsafe with a reason saying
+// its verdict could not be confirmed here, so the unsafe-change admission
+// gate requires the opt-in for it rather than admitting it on the absence of
+// a verdict. The substitution never widens what runs, and the operation key a
+// shard-scoped dispatch is stamped with names the namespace, shard and table
+// only, so the control plane's echo check, which derives the key from the
+// dispatched text, is unaffected.
 func (c *LocalClient) dispatchScopeForApply(plan *storage.Plan, req *ternv1.ApplyRequest) (dispatchScope, error) {
 	scope, err := deriveDispatchScope(plan, req)
 	if err != nil {
@@ -315,7 +368,7 @@ func (c *LocalClient) dispatchScopeForApply(plan *storage.Plan, req *ternv1.Appl
 		return dispatchScope{}, err
 	}
 	stored := map[driftChangeKey][]storage.TableChange{}
-	for _, tc := range plan.FlatDDLChanges() {
+	for _, tc := range c.shardDispatchCounterparts(plan, scope.shard) {
 		canon, err := canonicalDDLForDrift(parser, tc.DDL)
 		if err != nil {
 			return dispatchScope{}, fmt.Errorf("plan table %q: %w", tc.Table, err)
@@ -332,21 +385,72 @@ func (c *LocalClient) dispatchScopeForApply(plan *storage.Plan, req *ternv1.Appl
 		key := driftChangeKey{c.planNamespace(ch.Namespace), scope.shard, ch.Table, ch.Operation, canon}
 		matches := stored[key]
 		if len(matches) == 0 {
-			c.logger.Debug("dispatched change has no counterpart in the plan row; the task keeps the dispatched statement",
+			c.logger.Warn("dispatched change has no counterpart in the plan row; the task keeps the dispatched statement and admission will require allow_unsafe for it",
 				"plan_id", req.PlanId,
+				"database", c.config.Database,
 				"shard", scope.shard,
 				"namespace", ch.Namespace,
 				"table", ch.Table,
 				"operation", ch.Operation)
+			markUnconfirmedUnsafe(ch)
 			continue
 		}
 		// Consume the match so a duplicated change pairs one to one.
 		stored[key] = matches[1:]
-		ch.DDL = matches[0].DDL
-		ch.ExecutionMode = matches[0].ExecutionMode
-		ch.ModeReason = matches[0].ModeReason
+		replannedChangeOf(matches[0]).stampOnto(ch)
 	}
 	return scope, nil
+}
+
+// unconfirmedUnsafeReason is the unsafe reason a dispatched change carries
+// when this deployment holds no re-planned copy of it to judge it by.
+const unconfirmedUnsafeReason = "its unsafe verdict could not be confirmed on this deployment, which holds no re-planned copy of this shard's change"
+
+// markUnconfirmedUnsafe fails a change with no re-planned verdict closed: it
+// is marked unsafe so admission requires the opt-in for it. A reason the
+// change already carries is kept, since it names a judgement that was made.
+func markUnconfirmedUnsafe(tc *storage.TableChange) {
+	tc.IsUnsafe = true
+	if tc.UnsafeReason == "" {
+		tc.UnsafeReason = unconfirmedUnsafeReason
+	}
+}
+
+// shardDispatchCounterparts returns the plan's copies of the changes a dispatch
+// scoped to shard can be matched against. A namespace the plan judged per
+// shard lists each table once at namespace level, with the text and verdict of
+// whichever shard was planned first, while every shard's own changes live on
+// its shard row; so for such a namespace the counterparts are the dispatched
+// shard's row, and a shard whose changes diverge from its siblings' is matched
+// to its own text and verdict rather than to another shard's. Every other
+// namespace, including every namespace of a plan materialized from a dispatch
+// (which carries no shard rows), contributes its namespace-level changes.
+func (c *LocalClient) shardDispatchCounterparts(plan *storage.Plan, shard string) []storage.TableChange {
+	carriedByShards := map[string]bool{}
+	for _, sp := range plan.Shards {
+		if len(sp.Changes) > 0 {
+			carriedByShards[c.planNamespace(sp.Namespace)] = true
+		}
+	}
+	var counterparts []storage.TableChange
+	for _, tc := range plan.FlatDDLChanges() {
+		if carriedByShards[c.planNamespace(tc.Namespace)] {
+			continue
+		}
+		counterparts = append(counterparts, tc)
+	}
+	for _, sp := range plan.Shards {
+		if sp.Shard != shard {
+			continue
+		}
+		for _, tc := range sp.Changes {
+			if tc.Namespace == "" {
+				tc.Namespace = sp.Namespace
+			}
+			counterparts = append(counterparts, tc)
+		}
+	}
+	return counterparts
 }
 
 // driftMultisetFromApplyRequest builds the table DDL multiset the dispatch

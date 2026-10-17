@@ -133,7 +133,7 @@ func (m WatchModel) progressSections() (string, string) {
 	}
 
 	if m.sharded {
-		if counts := templates.ShardCounts(m.operations, m.released); counts != "" {
+		if counts := templates.ShardCounts(m.operations, m.tables, m.released); counts != "" {
 			fmt.Fprintf(&b, "  Shards:  %s\n", counts)
 		}
 	}
@@ -199,9 +199,9 @@ func (m WatchModel) progressSections() (string, string) {
 		f.WriteString(templates.FormatApplyStopped())
 		f.WriteString("\n")
 		if m.applyID != "" {
-			fmt.Fprintf(&f, "Use '%s start -e %s %s' to resume.\n", cliname.Name(), m.environment, m.applyID)
+			fmt.Fprintf(&f, "Use '%s' to resume.\n", cliname.Command("start", "-e", m.environment, m.applyID))
 		} else {
-			fmt.Fprintf(&f, "Use '%s status -d %s -e %s' to find the apply ID.\n", cliname.Name(), m.database, m.environment)
+			fmt.Fprintf(&f, "Use '%s' to find the apply ID.\n", cliname.Command("status", "-d", m.database, "-e", m.environment))
 		}
 	case isCuttingOver:
 		// During cutover, show minimal footer - no detach/stop allowed
@@ -227,9 +227,9 @@ func (m WatchModel) progressSections() (string, string) {
 			f.WriteString("Press Enter to deploy or proceed via the PlanetScale console (ESC to detach)\n")
 		} else {
 			if m.applyID != "" {
-				fmt.Fprintf(&f, "To proceed: %s start -e %s %s\n", cliname.Name(), m.environment, m.applyID)
+				fmt.Fprintf(&f, "To proceed: %s\n", cliname.Command("start", "-e", m.environment, m.applyID))
 			} else {
-				fmt.Fprintf(&f, "To find the apply ID: %s status -d %s -e %s\n", cliname.Name(), m.database, m.environment)
+				fmt.Fprintf(&f, "To find the apply ID: %s\n", cliname.Command("status", "-d", m.database, "-e", m.environment))
 			}
 			f.WriteString("Watching for deploy... (ESC to detach)\n")
 		}
@@ -241,9 +241,9 @@ func (m WatchModel) progressSections() (string, string) {
 			f.WriteString("Press Enter to proceed with cutover (or ESC to detach)\n")
 		} else {
 			if m.applyID != "" {
-				fmt.Fprintf(&f, "To proceed: %s cutover -e %s %s\n", cliname.Name(), m.environment, m.applyID)
+				fmt.Fprintf(&f, "To proceed: %s\n", cliname.Command("cutover", "-e", m.environment, m.applyID))
 			} else {
-				fmt.Fprintf(&f, "To find the apply ID: %s status -d %s -e %s\n", cliname.Name(), m.database, m.environment)
+				fmt.Fprintf(&f, "To find the apply ID: %s\n", cliname.Command("status", "-d", m.database, "-e", m.environment))
 			}
 			f.WriteString("Watching for cutover... (ESC to detach)\n")
 		}
@@ -371,13 +371,13 @@ func (m WatchModel) detachedView() string {
 	}
 	b.WriteString("\n")
 	if m.applyID != "" {
-		fmt.Fprintf(&b, "To reattach: %s progress %s\n", cliname.Name(), m.applyID)
+		fmt.Fprintf(&b, "To reattach: %s\n", templates.ProgressCommand(m.applyID, m.environment))
 		if state.IsState(m.state, state.Apply.WaitingForDeploy) {
-			fmt.Fprintf(&b, "To deploy:   %s start -e %s %s\n", cliname.Name(), m.environment, m.applyID)
+			fmt.Fprintf(&b, "To deploy:   %s\n", cliname.Command("start", "-e", m.environment, m.applyID))
 		}
-		fmt.Fprintf(&b, "To stop:     %s stop -e %s %s\n", cliname.Name(), m.environment, m.applyID)
+		fmt.Fprintf(&b, "To stop:     %s\n", cliname.Command("stop", "-e", m.environment, m.applyID))
 	} else {
-		fmt.Fprintf(&b, "Find apply:  %s status -d %s -e %s\n", cliname.Name(), m.database, m.environment)
+		fmt.Fprintf(&b, "Find apply:  %s\n", cliname.Command("status", "-d", m.database, "-e", m.environment))
 	}
 	return b.String()
 }

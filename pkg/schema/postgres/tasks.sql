@@ -22,6 +22,7 @@ CREATE TABLE tasks (
   rows_copied bigint DEFAULT 0,
   rows_total bigint DEFAULT 0,
   estimated_bytes bigint DEFAULT NULL,
+  estimated_rows bigint DEFAULT NULL,
   progress_percent integer DEFAULT 0,
   eta_seconds integer DEFAULT NULL,
   checksum_rows_checked bigint DEFAULT 0,

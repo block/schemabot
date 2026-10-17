@@ -833,6 +833,12 @@ type StatusOptions struct {
 	// state, so a caller asking whether a target is busy does not page through
 	// settled history.
 	Active bool
+	// Finished restricts the list to applies in a terminal state, the
+	// complement of Active. It is ignored when Active is set.
+	Finished bool
+	// After fetches the page that follows this apply ID, the last one an
+	// earlier page listed. The other options must repeat that page's filters.
+	After string
 }
 
 // GetStatus fetches recent schema changes.
@@ -861,6 +867,11 @@ func GetStatus(endpoint string, opts ...StatusOptions) (*apitypes.StatusResponse
 		}
 		if opts[0].Active {
 			values.Set("active", "true")
+		} else if opts[0].Finished {
+			values.Set("active", "false")
+		}
+		if opts[0].After != "" {
+			values.Set("starting_after", opts[0].After)
 		}
 		if encoded := values.Encode(); encoded != "" {
 			requestPath += "?" + encoded
@@ -886,6 +897,9 @@ type PlansOptions struct {
 	// Last bounds the listing to plans created within this window; zero means
 	// unbounded.
 	Last time.Duration
+	// After requests the page that follows this plan ID, the last plan of the
+	// previous page. The other options must repeat that page's filters.
+	After string
 }
 
 // GetPlans retrieves recent stored plans as summaries, newest first.
@@ -909,6 +923,9 @@ func GetPlans(endpoint string, opts PlansOptions) (*apitypes.PlansResponse, erro
 	}
 	if opts.Last > 0 {
 		values.Set("last", opts.Last.String())
+	}
+	if opts.After != "" {
+		values.Set("starting_after", opts.After)
 	}
 	requestPath := "/api/plans"
 	if encoded := values.Encode(); encoded != "" {

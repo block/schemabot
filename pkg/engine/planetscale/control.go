@@ -93,6 +93,16 @@ func (e *Engine) cancelDeployRequest(ctx context.Context, operation engine.Contr
 			return nil, engine.NewAlreadyCompletedError("cancel deploy request #%d rejected: the deploy request completed before the cancel arrived (deployment state %q): %w", meta.DeployRequestID, dr.DeploymentState, err)
 		case cancelRejectionUndeployed:
 			return e.closeUndeployedDeployRequest(ctx, client, req, meta.DeployRequestID, dr, err)
+		case cancelRejectionAlreadyFailed:
+			// The provider's rejection text stays in the log: the refusal's
+			// reason reaches operator surfaces, so it carries only what
+			// SchemaBot knows to be true.
+			e.logger.Warn("cancel rejected: the deploy request failed before the cancel arrived; it stays failed",
+				"database", req.Database,
+				"deploy_request", meta.DeployRequestID,
+				"deployment_state", dr.DeploymentState,
+				"error", err)
+			return nil, engine.NewSettledOutcomeError("cancel rejected: deploy request #%d on database %s failed before the cancel arrived; the failure stands, plan and apply again to retry", meta.DeployRequestID, req.Database)
 		default:
 			return nil, fmt.Errorf("cancel deploy request #%d rejected in deployment state %q: %w", meta.DeployRequestID, dr.DeploymentState, err)
 		}
@@ -201,8 +211,7 @@ type cancelRejectionClass int
 
 const (
 	// cancelRejectionAlreadyCancelled: the deploy request is already cancelled
-	// or cancelling — the cancel's goal state — so the rejection reads as
-	// success.
+	// — the cancel's goal state — so the rejection reads as success.
 	cancelRejectionAlreadyCancelled cancelRejectionClass = iota
 	// cancelRejectionAlreadyCompleted: the deploy request closed by completing
 	// before the cancel arrived. The rejection is typed AlreadyCompletedError
@@ -214,6 +223,12 @@ const (
 	// request is closed instead, which is how PlanetScale retires one that
 	// never deployed.
 	cancelRejectionUndeployed
+	// cancelRejectionAlreadyFailed: the deploy request closed by failing
+	// before the cancel arrived. The rejection is typed SettledOutcomeError so
+	// the caller resolves the cancel request and records the failure the
+	// deploy request reports, rather than relabelling it cancelled or
+	// retrying a rejection that can never succeed.
+	cancelRejectionAlreadyFailed
 	// cancelRejectionStateError: the rejection stays a plain error naming the
 	// deploy request's live state — reporting a successful cancel or a
 	// completed change there would misrepresent what happened on the target.
@@ -229,8 +244,15 @@ const (
 // instead of retried forever.
 func classifyCancelRejection(deploymentState string) (class cancelRejectionClass, classified bool) {
 	switch deploymentState {
-	case deployState.InProgressCancel, deployState.CompleteCancel, deployState.Cancelled:
+	case deployState.CompleteCancel, deployState.Cancelled:
 		return cancelRejectionAlreadyCancelled, true
+	case deployState.InProgressCancel:
+		// An earlier cancel was accepted but PlanetScale has not confirmed it,
+		// and an unconfirmed cancel can still end in a failed deploy. Reading
+		// the rejection as cancelled would settle the apply on an outcome the
+		// deploy request has not reached, so it stays a plain error until the
+		// deploy request settles on cancelled or failed.
+		return cancelRejectionStateError, true
 	case deployState.Complete, deployState.NoChanges:
 		return cancelRejectionAlreadyCompleted, true
 	case deployState.CompletePendingRevert:
@@ -255,9 +277,9 @@ func classifyCancelRejection(deploymentState string) (class cancelRejectionClass
 		// a rejected cancel there must not read as cancelled or completed.
 		return cancelRejectionStateError, true
 	case deployState.CompleteError, deployState.Error, deployState.Failed:
-		// The deploy request closed by failing. The plain error keeps the
-		// failed outcome visible instead of reporting a successful cancel.
-		return cancelRejectionStateError, true
+		// The deploy request closed by failing: the failure is the outcome,
+		// and a cancel must not replace it.
+		return cancelRejectionAlreadyFailed, true
 	default:
 		return cancelRejectionStateError, false
 	}

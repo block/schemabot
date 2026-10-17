@@ -1388,12 +1388,13 @@ func PreviewCommentApplyBlockedByCLI() string {
 // PreviewCommentApplyInProgress renders a sample "apply already in progress" comment.
 func PreviewCommentApplyInProgress() string {
 	return RenderApplyInProgress(ApplyLockConflictData{
-		Database:     "testapp",
-		DatabaseType: "mysql",
-		Environment:  "staging",
-		RequestedBy:  previewRequestedBy,
-		ApplyID:      "apply-a1b2c3d4e5f6",
-		ApplyState:   "running",
+		Database:          "testapp",
+		DatabaseType:      "mysql",
+		Environment:       "staging",
+		RequestedBy:       previewRequestedBy,
+		ApplyID:           "apply-a1b2c3d4e5f6",
+		ApplyState:        "running",
+		ApplyAgainCommand: ApplyCommand("staging", "", ApplyCommandOptions{}),
 	})
 }
 
@@ -1593,6 +1594,12 @@ func PreviewCommentApplyBlockedByCheckStatusError() string {
 			GitHubApp:          "schemabot-app",
 			MissingPermissions: []string{"Checks: Read", "Commit statuses: Read"},
 		})
+}
+
+// PreviewCommentApplyBlockedByStoppedPriorEnvApply renders a sample "production
+// blocked by a stopped staging apply" comment.
+func PreviewCommentApplyBlockedByStoppedPriorEnvApply() string {
+	return RenderApplyBlockedByStoppedPriorEnvApply("testapp", "production", "staging")
 }
 
 // PreviewCommentApplyBlockedByPriorEnvCheckError renders a sample fail-closed
@@ -2345,18 +2352,21 @@ func sampleApplyTables() []TableProgressData {
 			Namespace:      "testapp",
 			TableName:      "orders",
 			EstimatedBytes: new(int64(438_000_000)),
+			EstimatedRows:  new(int64(1_620_000)),
 			DDL:            "ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`)",
 		},
 		{
 			Namespace:      "testapp",
 			TableName:      "users",
 			EstimatedBytes: new(int64(391_000_000)),
+			EstimatedRows:  new(int64(1_480_000)),
 			DDL:            "ALTER TABLE `users` ADD INDEX `idx_email` (`email`)",
 		},
 		{
 			Namespace:      "testapp",
 			TableName:      "products",
 			EstimatedBytes: new(int64(157_000_000)),
+			EstimatedRows:  new(int64(612_000)),
 			DDL:            "ALTER TABLE `products` ADD INDEX `idx_price` (`price_cents`)",
 		},
 	}
@@ -2450,6 +2460,21 @@ func PreviewCommentApplyChecksumming() string {
 	tables[1].ChecksumRowsTotal = 1466232
 	tables[2].Status = state.Task.Pending
 	return RenderApplyStatusComment(sampleApplyData(state.Apply.Checksumming, tables))
+}
+
+// PreviewCommentApplyChecksummingDeferredCutover renders the checksumming
+// comment for an apply started with --defer-cutover, which carries the
+// deferred-cutover option.
+func PreviewCommentApplyChecksummingDeferredCutover() string {
+	tables := sampleApplyTables()
+	tables[0].Status = state.Task.Completed
+	tables[1].Status = state.Task.Checksumming
+	tables[1].ChecksumRowsChecked = 321450
+	tables[1].ChecksumRowsTotal = 1466232
+	tables[2].Status = state.Task.Pending
+	data := sampleApplyData(state.Apply.Checksumming, tables)
+	data.DeferCutover = true
+	return RenderApplyStatusComment(data)
 }
 
 // PreviewCommentApplyPostChecksum renders an apply comment where a table has
@@ -3301,6 +3326,26 @@ func PreviewCommentSkipRevertSupersededProgress() string {
 	})
 }
 
+// PreviewCommentCutoverCommandSupersededProgress renders the progress comment
+// that waited at the deferred-cutover gate after the operator's cutover took
+// effect: the waiting-for-cutover rendering collapses into a details block
+// under a pointer to the fresh comment now tracking the cutover.
+func PreviewCommentCutoverCommandSupersededProgress() string {
+	table := sampleSingleTable()
+	table.Status = state.Task.WaitingForCutover
+	table.RowsCopied = 7200000
+	table.RowsTotal = 7200000
+	table.PercentComplete = 100
+	data := sampleSingleApplyData(state.Apply.WaitingForCutover, table)
+	data.DeferCutover = true
+	return RenderCutoverCommandSupersededProgressComment(SupersededProgressData{
+		Repo:         "acme/testapp",
+		PR:           42,
+		NewCommentID: 2222222222,
+		PreviousBody: RenderApplyStatusComment(data),
+	})
+}
+
 // PreviewCommentCutoverSuperseded renders a spent cutover prompt after a
 // deferred cutover completed into a still-active apply: the prompt collapses
 // into a details block under a pointer to the fresh comment now tracking the
@@ -3312,6 +3357,7 @@ func PreviewCommentCutoverSuperseded() string {
 	table.RowsTotal = 7200000
 	table.PercentComplete = 100
 	data := sampleSingleApplyData(state.Apply.WaitingForCutover, table)
+	data.DeferCutover = true
 	return RenderCutoverSupersededComment(SupersededProgressData{
 		Repo:         "acme/testapp",
 		PR:           42,
@@ -3415,6 +3461,18 @@ func PreviewCommentRollbackStatus() string {
 	data := sampleApplyData(state.Apply.Running, tables)
 	data.Rollback = true
 	return RenderApplyStatusComment(data)
+}
+
+// PreviewCommentRollbackOfRolloutUnsupported previews the refusal of a
+// rollback of a schema change across multiple targets.
+func PreviewCommentRollbackOfRolloutUnsupported() string {
+	return RenderRollbackOfRolloutUnsupported(RollbackOfRolloutUnsupportedData{
+		Environment:    "staging",
+		Database:       "payments",
+		ApplyID:        "apply-a1b2c3d4e5f6",
+		RoutingChecked: true,
+		PR:             PRStateOpen,
+	})
 }
 
 // PreviewCommentRollbackSummaryCompleted renders the terminal summary for a

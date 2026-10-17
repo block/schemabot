@@ -53,6 +53,13 @@ func (c *LocalClient) SetObserver(applyID int64, observer ProgressObserver) {
 		return
 	}
 	c.observers[applyID] = observer
+	if c.storage == nil {
+		return
+	}
+	if c.observerPollCtx == nil {
+		c.observerPollCtx, c.observerPollCancel = context.WithCancel(context.Background())
+	}
+	go c.pollMultiOperationObserver(c.observerPollCtx, applyID)
 }
 
 // SetPendingObserver sets an observer that will be consumed by the next direct

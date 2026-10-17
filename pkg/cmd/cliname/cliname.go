@@ -9,6 +9,9 @@
 // parsing. Every hint renders through Name so pasted commands work as
 // printed.
 //
+// A hint that sends the operator back to the server this run used also needs
+// the flags that selected it; see SetRoute and Command.
+//
 // The server renders the CLI command hints in its PR comments with the same
 // name, configured as cli_name in the server config; a wrapper operator sets
 // the same value in both places.
