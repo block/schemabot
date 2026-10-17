@@ -43,6 +43,13 @@ you already have. Then choose where SchemaBot stores its own plans and progress.
 
 ![Enter Vitess credentials, verify the baseline, and preview a schema change](../assets/init-vitess-demo.gif)
 
+For a new, empty database with one unsharded keyspace, the wizard offers **Try a
+sample schema change** after setup. It saves `schemabot_example.sql` alongside
+your imported schema and shows the real plan. Approve it to create the table
+through a PlanetScale deploy request and watch its progress. Choose **Finish
+setup** to leave the database empty. If you cancel the apply, the example file
+stays local for you to edit or remove.
+
 ## Service token permissions
 
 SchemaBot calls the PlanetScale API with a service token. Grant the token

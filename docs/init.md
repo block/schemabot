@@ -134,7 +134,10 @@ volume goes missing, SchemaBot asks you to restore it instead of creating empty 
 Keep a backup before moving to a shared server; switching storage is not an automatic migration.
 
 Setup initializes SchemaBot's metadata tables in the state database. Baseline planning also
-needs the engine's scratch privileges. Setup never applies application schema changes.
+needs the engine's scratch privileges. Setup itself never applies application schema changes.
+After setup, an empty, unsharded PlanetScale database can opt into a
+[guided first change](vitess.md#get-started). That separate apply shows its plan
+and requires approval before creating the example table.
 
 Private databases do not need a public endpoint. Run SchemaBot somewhere that can reach
 them: on your VPN, through an existing tunnel, or on a machine inside the private network.

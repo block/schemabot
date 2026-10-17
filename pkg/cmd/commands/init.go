@@ -97,7 +97,7 @@ func (cmd *InitCmd) Run(ctx context.Context, g *Globals) error {
 		invocation = initCommandName(invocation, os.Args[0])
 	}
 	fmt.Print(initCompletion(&display, cmd.Environment, defaultProfile, invocation))
-	return nil
+	return cmd.offerFirstChange(ctx, g, result)
 }
 
 func (cmd *InitCmd) initialize(ctx context.Context, g *Globals) (*initResult, error) {
