@@ -784,6 +784,24 @@ type resumeDeployClient struct {
 	// pendingGets is how many Get calls report the deploy request as still
 	// computing its schema diff before the recovered state is served.
 	pendingGets int
+	// goneAfterPending makes every Get after the pending ones report the
+	// deploy request as not found.
+	goneAfterPending bool
+	closed           []uint64
+	deletedBranches  []string
+}
+
+func (c *resumeDeployClient) CloseDeployRequest(_ context.Context, req *ps.CloseDeployRequestRequest) (*ps.DeployRequest, error) {
+	c.closed = append(c.closed, req.Number)
+	dr := *c.recovered
+	dr.Number = req.Number
+	dr.State = deployRequestClosed
+	return &dr, nil
+}
+
+func (c *resumeDeployClient) DeleteBranch(_ context.Context, req *ps.DeleteDatabaseBranchRequest) error {
+	c.deletedBranches = append(c.deletedBranches, req.Branch)
+	return nil
 }
 
 func (c *resumeDeployClient) DeployRequestAutoCutover(_ context.Context, _, _ string, _ uint64) (bool, error) {
@@ -794,6 +812,12 @@ func (c *resumeDeployClient) GetDeployRequest(_ context.Context, req *ps.GetDepl
 	c.getCalls++
 	if c.getErr != nil {
 		return nil, c.getErr
+	}
+	if c.goneAfterPending && c.getCalls > c.pendingGets {
+		return nil, &ps.Error{Code: ps.ErrNotFound}
+	}
+	if c.recovered == nil {
+		return &ps.DeployRequest{Number: req.Number, DeploymentState: deployState.Pending}, nil
 	}
 	dr := *c.recovered
 	dr.Number = req.Number
@@ -1591,8 +1615,35 @@ func TestResumeExistingDeployRequest_FailedDeployRequestFailsTheApply(t *testing
 			assert.Equal(t, "5", events[0].Metadata["deploy_request_id"])
 			require.NotNil(t, req.ResumeState, "the recovered deploy request stays the apply's record")
 			assert.Equal(t, "apply-1a2b3c4d5e6f7890", req.ResumeState.MigrationContext)
+			if tt.state == deployState.Error {
+				assert.Equal(t, []uint64{5}, client.closed, "a refused deploy request that never deployed is closed, as the fresh path closes its own")
+				assert.Equal(t, []string{"schemabot-testdb-err"}, client.deletedBranches, "the branch SchemaBot created for it is reclaimed")
+			} else {
+				assert.Empty(t, client.closed, "a deploy request that deployed is left as evidence of the change that ran")
+				assert.Empty(t, client.deletedBranches)
+			}
 		})
 	}
+}
+
+// A recovered deploy request that reads pending and then is reported not
+// found while the resume waits for its diff fails the apply the same way a
+// not-found on the first read does: the outcome cannot depend on which read
+// first missed it.
+func TestResumeExistingDeployRequest_NotFoundWhileWaitingIsPermanent(t *testing.T) {
+	client := &resumeDeployClient{pendingGets: 1, goneAfterPending: true}
+	meta := &psMetadata{BranchName: "schemabot-testdb-gone", DeployRequestID: 13}
+	req := resumeRequest(t, meta, "apply-1a2b3c4d5e6f7890")
+	e, freshApplyCalled := engineRefusingFreshApply(req)
+
+	_, err := e.resumeExistingDeployRequest(t.Context(), client, "org", req, meta)
+
+	require.Error(t, err)
+	assert.False(t, engine.IsRetryable(err), "a deploy request that vanished while pending fails the apply, as at the first read")
+	assert.NotErrorIs(t, err, engine.ErrReattachFailed)
+	assert.Contains(t, err.Error(), "deploy request #13 not found on resume")
+	assert.False(t, *freshApplyCalled)
+	assert.Equal(t, 0, client.deployCalls)
 }
 
 // A transient error fetching the recovered deploy request must NOT be treated as

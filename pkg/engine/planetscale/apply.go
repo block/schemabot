@@ -220,10 +220,10 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (result *e
 	// deploy request that is now closed and never deployed. A successor that
 	// reads it as ready reattaches to it as closed before deploying, and
 	// Progress settles the apply as cancelled, not as the failure that caused
-	// the close; one that reads it as refused (error) starts fresh, as every
-	// resume does for a refused deploy request. The closed deploy request
-	// deployed nothing, so the target is safe either way; only the verdict
-	// differs from the failure that caused the close.
+	// the close; one that reads it as refused (error) reports the refusal as
+	// the apply's failure. The closed deploy request deployed nothing, so the
+	// target is safe either way; only the ready case's verdict differs from
+	// the failure that caused the close.
 	//
 	// A deploy whose outcome is unknown is not retired either: the apply pauses
 	// for a recovery that re-reads this deploy request and deploys it only if
@@ -1286,16 +1286,11 @@ func (e *Engine) resumeExistingDeployRequest(ctx context.Context, client psclien
 	if err != nil {
 		// No error here starts the apply fresh: the deploy request this drive
 		// created may still be deploying, and a fresh apply would run a second
-		// schema change beside it. A not-found is permanent, as it is for
-		// Progress: deploy requests are never deleted, so a recorded one that
-		// cannot be found points at credentials that cannot read it, and no
-		// retry of this drive can tell where the change stands. Any other error
-		// propagates so the resume retries against the same deploy request.
-		var psErr *ps.Error
-		if errors.As(err, &psErr) && psErr.Code == ps.ErrNotFound {
-			e.logger.Error("deploy request not found on resume; failing the apply rather than starting a second schema change",
-				"database", req.Database, "branch", meta.BranchName, "deploy_request", meta.DeployRequestID, "error", err)
-			return nil, engine.NewPermanentError("deploy request #%d not found on resume; check that the credentials can read it, then plan and apply again: %w", meta.DeployRequestID, err)
+		// schema change beside it. A not-found fails the apply; any other
+		// error propagates so the resume retries against the same deploy
+		// request.
+		if isDeployRequestNotFound(err) {
+			return nil, e.failRecoveredDeployRequestNotFound(req, meta, err)
 		}
 		return nil, fmt.Errorf("get deploy request #%d on resume: %w", meta.DeployRequestID, err)
 	}
@@ -1310,6 +1305,9 @@ func (e *Engine) resumeExistingDeployRequest(ctx context.Context, client psclien
 			"database", req.Database, "deploy_request", dr.Number)
 		dr, err = e.waitForDeployRequestPending(ctx, client, org, req.Database, dr, e.eventEmitter(req))
 		if err != nil {
+			if isDeployRequestNotFound(err) {
+				return nil, e.failRecoveredDeployRequestNotFound(req, meta, err)
+			}
 			return nil, fmt.Errorf("wait for recovered deploy request #%d on resume: %w", meta.DeployRequestID, err)
 		}
 	}
@@ -1321,7 +1319,9 @@ func (e *Engine) resumeExistingDeployRequest(ctx context.Context, client psclien
 	// carries, hiding the real failure, or deploy the change again without
 	// anyone asking for it.
 	if dr.DeploymentState == deployState.Error {
-		return nil, e.failRecoveredDeployRequest(req, meta, dr, formatDeployRequestError(dr))
+		failure := e.failRecoveredDeployRequest(req, meta, dr, formatDeployRequestError(dr))
+		e.retireRecoveredRefusedDeployRequest(ctx, client, org, req, meta, dr, failure)
+		return nil, failure
 	}
 	if dr.DeploymentState == deployState.CompleteError {
 		return nil, e.failRecoveredDeployRequest(req, meta, dr,
@@ -1494,13 +1494,57 @@ func (e *Engine) resumeExistingDeployRequest(ctx context.Context, client psclien
 // path does when its deploy request fails, and returns it as a permanent error
 // because the deploy request will not leave its failed state.
 func (e *Engine) failRecoveredDeployRequest(req *engine.ApplyRequest, meta *psMetadata, dr *ps.DeployRequest, errMsg string) error {
-	e.logger.Error("recovered deploy request failed; failing the apply rather than starting the schema change again",
+	e.applyLogger(req).Error("recovered deploy request failed; failing the apply rather than starting the schema change again",
 		"database", req.Database, "branch", meta.BranchName, "deploy_request", dr.Number, "state", dr.DeploymentState)
 	e.eventEmitter(req)(engine.ApplyEvent{
 		Message:  errMsg,
 		Metadata: map[string]string{"deploy_request_id": fmt.Sprintf("%d", dr.Number)},
 	})
 	return engine.NewPermanentError("%s", errMsg)
+}
+
+// retireRecoveredRefusedDeployRequest cleans up after a recovered deploy
+// request PlanetScale refused before it deployed, as the fresh path's cleanup
+// does when its own deploy request is refused: it closes the deploy request
+// and deletes the branch when SchemaBot owns it. A drive whose context has
+// ended leaves both to the driver that takes over the apply, and the cleanup
+// re-reads the deploy request and leaves it in place if a deploy may have
+// begun. A refused deploy request is the only failed state cleaned up here: a
+// complete_error one deployed, so its deploy request and branch are evidence
+// of a change that ran.
+func (e *Engine) retireRecoveredRefusedDeployRequest(ctx context.Context, client psclient.PSClient, org string, req *engine.ApplyRequest, meta *psMetadata, dr *ps.DeployRequest, failure error) {
+	if ctx.Err() != nil {
+		e.applyLogger(req).Info("resumed drive ended before cleaning up its refused deploy request; leaving the deploy request and branch to the driver that takes over the apply",
+			"organization", org, "planetscale_database", req.Database, "deploy_request", dr.Number, "branch", meta.BranchName, "apply_error", failure)
+		return
+	}
+	ownedBranch := ""
+	if deployRequestDeletesBranch(req.Options) {
+		ownedBranch = meta.BranchName
+	}
+	e.retireDeployRequestOfFailedApply(ctx, e.applyLogger(req), client, org, req.Database, dr.Number, ownedBranch, failure)
+}
+
+// isDeployRequestNotFound reports whether err, from any read of a recorded
+// deploy request, is PlanetScale's not-found.
+func isDeployRequestNotFound(err error) bool {
+	var psErr *ps.Error
+	return errors.As(err, &psErr) && psErr.Code == ps.ErrNotFound
+}
+
+// failRecoveredDeployRequestNotFound fails the apply on a recorded deploy
+// request PlanetScale reports as not found. Deploy requests are never
+// deleted, so the most likely cause is credentials that cannot see it, and
+// where the change stands is unknown. Failing rather than pausing is
+// deliberate: it gives the resume the verdict Progress gives a running drive
+// for the same read, so the apply's outcome does not depend on which of the
+// two reads the deploy request first. A credentials problem PlanetScale
+// reports as a permission error still pauses, as every other retryable read
+// does.
+func (e *Engine) failRecoveredDeployRequestNotFound(req *engine.ApplyRequest, meta *psMetadata, err error) error {
+	e.applyLogger(req).Error("deploy request not found on resume; failing the apply rather than starting a second schema change",
+		"database", req.Database, "branch", meta.BranchName, "deploy_request", meta.DeployRequestID, "error", err)
+	return engine.NewPermanentError("deploy request #%d not found on resume; check that the credentials can read it, then plan and apply again: %w", meta.DeployRequestID, err)
 }
 
 // deployRequestNeedsResumeDeploy reports whether a recovered deploy request must
