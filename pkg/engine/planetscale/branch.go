@@ -1085,13 +1085,20 @@ func deployRequestShowsDeployAccepted(dr *ps.DeployRequest) bool {
 // re-reads this same deploy request, deploying it only if it still reads ready,
 // instead of failing the apply or deploying another request. Any other state
 // shows no deploy to track and is not one recovery would deploy, so deployErr
-// is returned.
+// is returned. A drive whose context already ended sends no re-read, and the
+// outcome is decided as for a re-read that failed.
 func (e *Engine) adoptDeployAfterError(ctx context.Context, client psclient.PSClient, org, database string, number uint64, deployErr error, refused bool) (*ps.DeployRequest, error) {
-	dr, getErr := client.GetDeployRequest(ctx, &ps.GetDeployRequestRequest{
-		Organization: org,
-		Database:     database,
-		Number:       number,
-	})
+	var dr *ps.DeployRequest
+	var getErr error
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		getErr = fmt.Errorf("drive ended before the deploy request was re-read: %w", ctxErr)
+	} else {
+		dr, getErr = client.GetDeployRequest(ctx, &ps.GetDeployRequestRequest{
+			Organization: org,
+			Database:     database,
+			Number:       number,
+		})
+	}
 	if getErr != nil {
 		if refused {
 			e.logger.Warn("PlanetScale refused the deploy and re-reading the deploy request failed; failing the deploy with the refusal",
