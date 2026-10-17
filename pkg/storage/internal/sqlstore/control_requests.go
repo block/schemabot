@@ -365,7 +365,7 @@ func (s *controlRequestStore) recordStopTx(ctx context.Context, tx *rebindTx, st
 		if _, err := tx.ExecContext(ctx, `
 			UPDATE apply_control_requests
 			SET status = ?, requested_by = ?, error_message = NULL, metadata = ?,
-				completed_at = `+completedAt+`, updated_at = NOW()
+				completed_at = `+completedAt+`, updated_at = NOW(), revision = revision + 1
 			WHERE id = ?
 		`, status, stop.RequestedBy, metadata, existing.ID); err != nil {
 			return nil, fmt.Errorf("record %s stop control request for apply %d: %w", status, stop.ApplyID, err)

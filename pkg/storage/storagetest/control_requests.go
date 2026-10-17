@@ -215,8 +215,8 @@ func TestControlRequests(t *testing.T, h Harness) {
 	})
 
 	// StopQueuedStart_RearmsASettledStop verifies the stop row an earlier stop
-	// left completed is re-armed with the new caller, keeping one row per
-	// apply and operation.
+	// left completed is re-armed with the new caller and a new revision,
+	// keeping one row per apply and operation.
 	t.Run("StopQueuedStart_RearmsASettledStop", func(t *testing.T) {
 		store := h.NewStorage(t)
 		applyID := createControlRequestApply(t, store, "control_withdraw_rearm_db", "apply_control_withdraw_rearm")
@@ -234,6 +234,7 @@ func TestControlRequests(t *testing.T, h Harness) {
 		assert.Equal(t, earlier.ID, stop.ID)
 		assert.Equal(t, "stop-operator", stop.RequestedBy)
 		assert.Equal(t, storage.ControlRequestCompleted, stop.Status)
+		assert.Equal(t, earlier.Revision+1, stop.Revision, "re-arming advances the revision")
 	})
 
 	// StopQueuedStart_WritesNothingOnceAClaimResumedTheApply verifies that a
