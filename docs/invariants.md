@@ -1272,7 +1272,10 @@ before it hands a VSchema to the engine (`finalizerStandsDownForPendingControl`,
 `pkg/tern/local_control_resume.go`); cancel-before-stop consumption on both clients
 (`processPendingCancelOrStopControlRequest`, `pkg/tern/local_control.go`,
 `pkg/tern/grpc_client.go`); conflict rejection at request intake
-(`pkg/api/control_handlers.go`); and failing the cutover a stop superseded before the stop's
+(`pkg/api/control_handlers.go`); a stop on a stopped apply withdrawing the start queued behind it
+in the write that records the stop, under the locks the resuming claims take (`StopQueuedStart`,
+`pkg/storage/internal/sqlstore/control_requests.go`, reached from `pkg/api/control_handlers.go`);
+and failing the cutover a stop superseded before the stop's
 request completes (`completePendingStopControlRequest` and `SettlePendingCutoverAfterStop`,
 `pkg/tern/control_requests.go`, reached from both clients and from
 `pkg/api/control_handlers.go` and `pkg/api/operator.go`).

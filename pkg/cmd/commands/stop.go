@@ -1,7 +1,9 @@
 package commands
 
 import (
+	"errors"
 	"fmt"
+	"net/http"
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/cmd/client"
@@ -45,11 +47,9 @@ func (cmd *StopCmd) Run(g *Globals) error {
 		fmt.Println("Schema change already complete - nothing to stop")
 		return nil
 	}
-	if state.IsState(curState, state.Apply.Stopped) {
-		fmt.Println("Schema change already stopped")
-		return nil
-	}
-	if !state.IsRunningApplyState(curState) && !state.IsState(curState, state.Apply.Paused, state.Apply.CuttingOver, state.Apply.WaitingForDeploy, state.Apply.WaitingForCutover, state.Apply.Pending) {
+	// A stopped schema change still goes to the server: a start requested
+	// moments ago may be queued behind it, and only the server can withdraw it.
+	if !state.IsRunningApplyState(curState) && !state.IsState(curState, state.Apply.Stopped, state.Apply.Paused, state.Apply.CuttingOver, state.Apply.WaitingForDeploy, state.Apply.WaitingForCutover, state.Apply.Pending) {
 		return fmt.Errorf("cannot stop schema change in state: %s", curState)
 	}
 
@@ -60,6 +60,10 @@ func (cmd *StopCmd) Run(g *Globals) error {
 		stopResult, stopErr = client.CallStopAPI(ep, cmd.Environment, cmd.ApplyID)
 		return stopErr
 	})
+	if stopRefusedAsAlreadyStopped(err, curState) {
+		fmt.Println("Schema change already stopped")
+		return nil
+	}
 	if err != nil {
 		return err
 	}
@@ -69,11 +73,27 @@ func (cmd *StopCmd) Run(g *Globals) error {
 	}
 
 	templates.WriteStopSuccess(templates.StopData{
-		Database:     cmd.Database,
-		Environment:  cmd.Environment,
-		ApplyID:      cmd.ApplyID,
-		StoppedCount: int(stopResult.StoppedCount),
-		SkippedCount: int(stopResult.SkippedCount),
+		Database:       cmd.Database,
+		Environment:    cmd.Environment,
+		ApplyID:        cmd.ApplyID,
+		StoppedCount:   int(stopResult.StoppedCount),
+		SkippedCount:   int(stopResult.SkippedCount),
+		StartWithdrawn: stopResult.Status == apitypes.ControlStatusStartWithdrawn,
 	})
 	return nil
+}
+
+// stopRefusedAsAlreadyStopped reports whether the server refused the stop
+// because the schema change is already stopped with no start queued. A server
+// that predates the already_stopped code refuses the same stop with a bare
+// conflict, which on a schema change read as stopped means the same thing.
+func stopRefusedAsAlreadyStopped(err error, readState string) bool {
+	var apiErr *client.APIError
+	if !errors.As(err, &apiErr) {
+		return false
+	}
+	if apiErr.ErrorCode == apitypes.ErrCodeAlreadyStopped {
+		return true
+	}
+	return apiErr.ErrorCode == "" && apiErr.Status == http.StatusConflict && state.IsState(readState, state.Apply.Stopped)
 }

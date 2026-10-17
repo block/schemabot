@@ -150,6 +150,10 @@ apply does not do better.
 is the deliberate pause state: resuming through the `start` command re-checks
 that no other apply is active on the same target, then hands the work to a
 fresh driver, continuing from engine checkpoints rather than starting over.
+A `stop` sent before any driver has acted on that `start` withdraws it: the
+apply stays `stopped` and the response carries `"status": "start_withdrawn"`.
+A `stop` on a `stopped` apply with no `start` waiting is refused with
+`409 already_stopped`.
 
 ## The retry budget
 

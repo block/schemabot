@@ -29,6 +29,7 @@ func controlStatus(accepted bool) string {
 
 type controlOperationHTTPError struct {
 	status int
+	code   string
 	err    error
 }
 
@@ -61,11 +62,31 @@ func controlConflictf(format string, args ...any) error {
 	}
 }
 
+// controlConflictCodef is controlConflictf with an error code, for a rejection
+// a client acts on by its code rather than by its message.
+func controlConflictCodef(code, format string, args ...any) error {
+	return &controlOperationHTTPError{
+		status: http.StatusConflict,
+		code:   code,
+		err:    fmt.Errorf(format, args...),
+	}
+}
+
 // terminalControlf marks a control failure that retrying the same request
 // cannot repair: an internal data invariant violation or a deterministic
 // downstream rejection.
 func terminalControlf(format string, args ...any) error {
 	return &terminalControlError{err: fmt.Errorf(format, args...)}
+}
+
+// controlOperationErrorCode is the error code a rejection carries, empty for
+// one that carries none.
+func controlOperationErrorCode(err error) string {
+	var httpErr *controlOperationHTTPError
+	if errors.As(err, &httpErr) {
+		return httpErr.code
+	}
+	return ""
 }
 
 func controlOperationHTTPStatus(err error) int {
@@ -336,7 +357,7 @@ func (s *Service) writeControlError(w http.ResponseWriter, opName string, apply 
 		s.writeError(w, status, opName+" failed: "+err.Error())
 	} else {
 		s.logger.Warn(opName+" rejected", attrs...)
-		s.writeError(w, status, opName+" rejected: "+err.Error())
+		s.writeErrorCode(w, status, controlOperationErrorCode(err), opName+" rejected: "+err.Error())
 	}
 }
 
@@ -975,15 +996,23 @@ func (s *Service) executeStopForApply(ctx context.Context, client tern.Client, a
 	metrics.RecordControlOperation(ctx, "stop", apply.Database, apply.Deployment, apply.Environment, controlStatus(resp.Accepted))
 	if resp.Accepted {
 		logMessage := "Stop requested by user"
-		if responseStatus == stopResponseStatusAlreadyRequested {
+		switch responseStatus {
+		case stopResponseStatusAlreadyRequested:
 			logMessage = "Stop requested by user while stop request already pending"
+		case apitypes.ControlStatusStartWithdrawn:
+			logMessage = "Stop requested by user withdrew the queued start; schema change stays stopped"
 		}
 		s.logControlOperationForApply(ctx, apply, caller, storage.LogEventStopRequested, logMessage)
-		if responseStatus == stopResponseStatusAlreadyRequested {
+		switch responseStatus {
+		case apitypes.ControlStatusStartWithdrawn:
+			s.logger.Info("immediate stop skipped because the stop withdrew a queued start and the apply is still stopped",
+				append(apply.LogAttrs(),
+					"requested_by", caller)...)
+		case stopResponseStatusAlreadyRequested:
 			s.logger.Info("immediate stop skipped because stop request is already pending",
 				append(apply.LogAttrs(),
 					"requested_by", caller)...)
-		} else {
+		default:
 			s.tryImmediateStopAfterQueue(ctx, client, apply, ternApplyID, environment, caller)
 		}
 		s.wakeOperator(apply.ApplyIdentifier, apply.Database, apply.Environment)
@@ -1356,14 +1385,21 @@ func (s *Service) queueStopForApplyOwner(ctx context.Context, apply *storage.App
 	if resp, responseStatus, found, err := s.pendingStopResponseIfPresent(ctx, apply); err != nil || found {
 		return resp, responseStatus, err
 	}
-	if state.IsTerminalApplyState(apply.State) {
-		return nil, "", controlConflictf("schema change is already terminal (current state: %s)", apply.State)
-	}
 	tasks, err := s.storage.Tasks().GetByApplyID(ctx, apply.ID)
 	if err != nil {
 		return nil, "", fmt.Errorf("get tasks for apply %s: %w", apply.ApplyIdentifier, err)
 	}
 	stoppedCount, skippedCount := stopRequestCounts(tasks)
+	if state.IsState(apply.State, state.Apply.Stopped) {
+		resp, responseStatus, resumed, err := s.stopQueuedStart(ctx, apply, caller, stoppedCount, skippedCount)
+		if err != nil || resumed == nil {
+			return resp, responseStatus, err
+		}
+		apply = resumed
+	}
+	if state.IsTerminalApplyState(apply.State) {
+		return nil, "", controlConflictf("schema change is already terminal (current state: %s)", apply.State)
+	}
 	if stoppedCount == 0 && skippedCount == 0 {
 		// The apply owns no task rows: it was queued before its first drive
 		// created them, or it is a VSchema-only apply that never has any. The
@@ -1394,6 +1430,70 @@ func (s *Service) queueStopForApplyOwner(ctx context.Context, apply *storage.App
 		StoppedCount: stoppedCount,
 		SkippedCount: skippedCount,
 	}, "", nil
+}
+
+// stopQueuedStart answers a stop on a stopped apply. The apply is stopped, but
+// an operator's start may be queued behind it that no driver has acted on yet,
+// and the stop must win over that start (CO-4): it withdraws the start in the
+// same write that records the stop, so no claim can resume the apply. With no
+// start queued there is nothing to stop and the stop is refused (CO-6).
+//
+// A claim may resume the apply between the caller's read and the write, which
+// leaves the start to the drive it resumed. resumed is then the reloaded apply,
+// for the caller to stop along the path for a running one; otherwise the stop
+// is answered here and resumed is nil.
+func (s *Service) stopQueuedStart(ctx context.Context, apply *storage.Apply, caller string, stoppedCount, skippedCount int64) (*ternv1.StopResponse, string, *storage.Apply, error) {
+	controlStore := s.storage.ControlRequests()
+	if controlStore == nil {
+		return nil, "", nil, fmt.Errorf("control request store is not available")
+	}
+	ops, err := s.storage.ApplyOperations().ListByApply(ctx, apply.ID)
+	if err != nil {
+		return nil, "", nil, fmt.Errorf("list apply_operations for stopped apply %s before stopping its queued start: %w", apply.ApplyIdentifier, err)
+	}
+	operationLease, err := tern.ApplyDrivesUnderOperationLease(ctx, s.storage, apply, ops)
+	if err != nil {
+		return nil, "", nil, fmt.Errorf("decide drive mode of stopped apply %s before stopping its queued start: %w", apply.ApplyIdentifier, err)
+	}
+	metadata, err := json.Marshal(stopControlRequestMetadata{StoppedCount: stoppedCount, SkippedCount: skippedCount})
+	if err != nil {
+		return nil, "", nil, fmt.Errorf("marshal stop control request metadata for apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	_, outcome, err := controlStore.StopQueuedStart(ctx, &storage.ApplyControlRequest{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationStop,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: caller,
+		Metadata:    metadata,
+	}, operationLease)
+	if err != nil {
+		return nil, "", nil, fmt.Errorf("record stop against the queued start of stopped apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	attrs := append(apply.LogAttrs(), "requested_by", caller, "operation_lease", operationLease, "outcome", string(outcome))
+	switch outcome {
+	case storage.QueuedStartWithdrawn:
+		s.logger.Info("stop withdrew the queued start of a stopped apply; the apply stays stopped", attrs...)
+		return &ternv1.StopResponse{Accepted: true, StoppedCount: stoppedCount, SkippedCount: skippedCount}, apitypes.ControlStatusStartWithdrawn, nil, nil
+	case storage.QueuedStartStopPending:
+		s.logger.Info("stop withdrew the queued start of a stopped apply and is pending for the drive that already claimed an operation", attrs...)
+		return &ternv1.StopResponse{Accepted: true, StoppedCount: stoppedCount, SkippedCount: skippedCount}, "", nil, nil
+	case storage.QueuedStartNone:
+		s.logger.Info("stop rejected: the apply is already stopped and no start is queued", attrs...)
+		return nil, "", nil, controlConflictCodef(apitypes.ErrCodeAlreadyStopped, "schema change is already stopped")
+	case storage.QueuedStartApplyNotStopped:
+		resumed, err := s.storage.Applies().Get(ctx, apply.ID)
+		if err != nil {
+			return nil, "", nil, fmt.Errorf("reload apply %s after a claim resumed it: %w", apply.ApplyIdentifier, err)
+		}
+		if resumed == nil {
+			return nil, "", nil, fmt.Errorf("reload apply %s after a claim resumed it: apply not found", apply.ApplyIdentifier)
+		}
+		s.logger.Info("stop found the apply already resumed by a claim; stopping it as a running apply",
+			append(resumed.LogAttrs(), "requested_by", caller)...)
+		return nil, "", resumed, nil
+	default:
+		return nil, "", nil, fmt.Errorf("record stop against the queued start of stopped apply %s: unknown outcome %q", apply.ApplyIdentifier, outcome)
+	}
 }
 
 func stopRequestCounts(tasks []*storage.Task) (int64, int64) {
