@@ -852,6 +852,24 @@ type resumeDeployClient struct {
 	// pendingGets is how many Get calls report the deploy request as still
 	// computing its schema diff before the recovered state is served.
 	pendingGets int
+	// goneAfterPending makes every Get after the pending ones report the
+	// deploy request as not found.
+	goneAfterPending bool
+	closed           []uint64
+	deletedBranches  []string
+}
+
+func (c *resumeDeployClient) CloseDeployRequest(_ context.Context, req *ps.CloseDeployRequestRequest) (*ps.DeployRequest, error) {
+	c.closed = append(c.closed, req.Number)
+	dr := *c.recovered
+	dr.Number = req.Number
+	dr.State = deployRequestClosed
+	return &dr, nil
+}
+
+func (c *resumeDeployClient) DeleteBranch(_ context.Context, req *ps.DeleteDatabaseBranchRequest) error {
+	c.deletedBranches = append(c.deletedBranches, req.Branch)
+	return nil
 }
 
 func (c *resumeDeployClient) DeployRequestAutoCutover(_ context.Context, _, _ string, _ uint64) (bool, error) {
@@ -862,6 +880,12 @@ func (c *resumeDeployClient) GetDeployRequest(_ context.Context, req *ps.GetDepl
 	c.getCalls++
 	if c.getErr != nil {
 		return nil, c.getErr
+	}
+	if c.goneAfterPending && c.getCalls > c.pendingGets {
+		return nil, &ps.Error{Code: ps.ErrNotFound}
+	}
+	if c.recovered == nil {
+		return &ps.DeployRequest{Number: req.Number, DeploymentState: deployState.Pending}, nil
 	}
 	dr := *c.recovered
 	dr.Number = req.Number
@@ -1094,12 +1118,12 @@ func TestResumeExistingDeployRequest_DeploysReadyNeverStarted(t *testing.T) {
 	}
 }
 
-// A failure while reattaching to the stored deploy request is marked
+// A retryable failure reattaching to the stored deploy request is marked
 // engine.ErrReattachFailed, so the caller knows the deploy request is still the
-// one a later resume reattaches to. When the stored deploy request is gone and
-// the resume starts afresh, the fresh path's failure is not marked: no stored
-// work is being reattached to any more.
-func TestResumeExistingDeployRequest_MarksOnlyReattachFailures(t *testing.T) {
+// one a later resume reattaches to and pauses the apply. A deploy request that
+// cannot be found is a permanent failure, returned unmarked: the resume never
+// starts afresh, and the caller fails the apply on it.
+func TestResumeExistingDeployRequest_MarksRetryableReattachFailures(t *testing.T) {
 	rateLimited := errors.New("rate limited")
 	tests := []struct {
 		name         string
@@ -1107,7 +1131,7 @@ func TestResumeExistingDeployRequest_MarksOnlyReattachFailures(t *testing.T) {
 		wantReattach bool
 	}{
 		{name: "transient lookup error reattaching", getErr: rateLimited, wantReattach: true},
-		{name: "deploy request gone, fresh start fails", getErr: &ps.Error{Code: ps.ErrNotFound}},
+		{name: "deploy request not found", getErr: &ps.Error{Code: ps.ErrNotFound}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -1119,9 +1143,8 @@ func TestResumeExistingDeployRequest_MarksOnlyReattachFailures(t *testing.T) {
 
 			require.Error(t, err)
 			assert.Equal(t, tt.wantReattach, errors.Is(err, engine.ErrReattachFailed))
-			if tt.wantReattach {
-				assert.ErrorIs(t, err, rateLimited, "the marked error still carries its cause")
-			}
+			assert.Equal(t, tt.wantReattach, engine.IsRetryable(err), "only a retryable failure is marked; a permanent one fails the apply")
+			assert.ErrorIs(t, err, tt.getErr, "the error still carries its cause")
 		})
 	}
 }
@@ -1600,26 +1623,103 @@ func TestResumeExistingDeployRequest_NoChangesIsConverged(t *testing.T) {
 	}
 }
 
-// A failed deploy request must not be resumed; the apply restarts fresh on a new
-// branch. With nil credentials the fresh Apply fails fast, proving the recovered
-// request was abandoned rather than reattached.
-func TestResumeExistingDeployRequest_ErrorStateStartsFresh(t *testing.T) {
+// engineRefusingFreshApply returns an engine whose client factory records that it
+// was asked for a client and then refuses, and gives req the token credentials a
+// fresh Apply needs to reach that factory. resumeExistingDeployRequest is handed
+// its client directly, so a factory call can only come from a fresh Apply, the
+// path that would create a second branch and deploy request.
+func engineRefusingFreshApply(req *engine.ApplyRequest) (*Engine, *bool) {
+	req.Credentials.Metadata["token_name"] = "test-token"
+	req.Credentials.Metadata["token_value"] = "test-secret"
+	freshApplyCalled := false
 	e := NewWithClient(slog.New(slog.NewTextHandler(os.Stdout, nil)),
 		func(_, _ string) (psclient.PSClient, error) {
-			return nil, errors.New("client unavailable")
+			freshApplyCalled = true
+			return nil, errors.New("fresh apply must not run")
 		})
-	client := &resumeDeployClient{
-		recovered: &ps.DeployRequest{DeploymentState: deployState.Error},
-	}
+	return e, &freshApplyCalled
+}
 
-	meta := &psMetadata{BranchName: "schemabot-testdb-err", DeployRequestID: 5}
+// A recovered deploy request that failed is the apply's failure. The resume
+// reports it the way the fresh path reports a failed deploy request — the
+// failure reason in the error and in the apply's events — and never starts the
+// schema change again, which would reuse the failed request's branch.
+func TestResumeExistingDeployRequest_FailedDeployRequestFailsTheApply(t *testing.T) {
+	tests := []struct {
+		name    string
+		state   string
+		wantMsg string
+	}{
+		{
+			name:    "error",
+			state:   deployState.Error,
+			wantMsg: "deploy request #5 failed during preparation (state: error)\n  [duplicate_column] column: Duplicate column name 'email' (keyspace: commerce, table: users)",
+		},
+		{
+			name:    "complete_error",
+			state:   deployState.CompleteError,
+			wantMsg: "deploy request #5 failed while deploying (state: complete_error)",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client := &resumeDeployClient{
+				recovered: &ps.DeployRequest{
+					DeploymentState: tt.state,
+					Deployment: &ps.Deployment{LintErrors: []*ps.DeploymentLintError{{
+						LintError: "duplicate_column", SubjectType: "column",
+						ErrorDescription: "Duplicate column name 'email'", Keyspace: "commerce", Table: "users",
+					}}},
+				},
+			}
+			meta := &psMetadata{BranchName: "schemabot-testdb-err", DeployRequestID: 5}
+			req := resumeRequest(t, meta, "apply-1a2b3c4d5e6f7890")
+			e, freshApplyCalled := engineRefusingFreshApply(req)
+			var events []engine.ApplyEvent
+			req.OnEvent = func(ev engine.ApplyEvent) { events = append(events, ev) }
+
+			result, err := e.resumeExistingDeployRequest(t.Context(), client, "org", req, meta)
+
+			require.Error(t, err)
+			assert.Nil(t, result)
+			assert.Equal(t, tt.wantMsg, err.Error())
+			assert.False(t, engine.IsRetryable(err), "the deploy request will not leave its failed state")
+			assert.False(t, *freshApplyCalled, "no second branch or deploy request is created")
+			assert.Equal(t, 0, client.deployCalls)
+			require.Len(t, events, 1)
+			assert.Equal(t, tt.wantMsg, events[0].Message)
+			assert.Equal(t, "5", events[0].Metadata["deploy_request_id"])
+			require.NotNil(t, req.ResumeState, "the recovered deploy request stays the apply's record")
+			assert.Equal(t, "apply-1a2b3c4d5e6f7890", req.ResumeState.MigrationContext)
+			if tt.state == deployState.Error {
+				assert.Equal(t, []uint64{5}, client.closed, "a refused deploy request that never deployed is closed, as the fresh path closes its own")
+				assert.Equal(t, []string{"schemabot-testdb-err"}, client.deletedBranches, "the branch SchemaBot created for it is reclaimed")
+			} else {
+				assert.Empty(t, client.closed, "a deploy request that deployed is left as evidence of the change that ran")
+				assert.Empty(t, client.deletedBranches)
+			}
+		})
+	}
+}
+
+// A recovered deploy request that reads pending and then is reported not
+// found while the resume waits for its diff fails the apply the same way a
+// not-found on the first read does: the outcome cannot depend on which read
+// first missed it.
+func TestResumeExistingDeployRequest_NotFoundWhileWaitingIsPermanent(t *testing.T) {
+	client := &resumeDeployClient{pendingGets: 1, goneAfterPending: true}
+	meta := &psMetadata{BranchName: "schemabot-testdb-gone", DeployRequestID: 13}
 	req := resumeRequest(t, meta, "apply-1a2b3c4d5e6f7890")
+	e, freshApplyCalled := engineRefusingFreshApply(req)
 
 	_, err := e.resumeExistingDeployRequest(t.Context(), client, "org", req, meta)
 
 	require.Error(t, err)
+	assert.False(t, engine.IsRetryable(err), "a deploy request that vanished while pending fails the apply, as at the first read")
+	assert.NotErrorIs(t, err, engine.ErrReattachFailed)
+	assert.Contains(t, err.Error(), "deploy request #13 not found on resume")
+	assert.False(t, *freshApplyCalled)
 	assert.Equal(t, 0, client.deployCalls)
-	assert.Nil(t, req.ResumeState)
 }
 
 // A transient error fetching the recovered deploy request must NOT be treated as
@@ -1628,17 +1728,12 @@ func TestResumeExistingDeployRequest_ErrorStateStartsFresh(t *testing.T) {
 // deploying. Resume must propagate the transient error so it retries against the
 // same deploy request instead of forking a duplicate schema change.
 func TestResumeExistingDeployRequest_TransientGetErrorDoesNotFork(t *testing.T) {
-	freshApplyCalled := false
-	e := NewWithClient(slog.New(slog.NewTextHandler(os.Stdout, nil)),
-		func(_, _ string) (psclient.PSClient, error) {
-			freshApplyCalled = true
-			return nil, errors.New("fresh apply must not run")
-		})
 	transientErr := &ps.Error{Code: ps.ErrInternal}
 	client := &resumeDeployClient{getErr: transientErr}
 
 	meta := &psMetadata{BranchName: "schemabot-testdb-xyz", DeployRequestID: 7}
 	req := resumeRequest(t, meta, "singularity:in-flight")
+	e, freshApplyCalled := engineRefusingFreshApply(req)
 
 	_, err := e.resumeExistingDeployRequest(t.Context(), client, "org", req, meta)
 
@@ -1646,7 +1741,8 @@ func TestResumeExistingDeployRequest_TransientGetErrorDoesNotFork(t *testing.T) 
 	assert.ErrorIs(t, err, transientErr)
 	assert.Contains(t, err.Error(), "get deploy request #7 on resume")
 	// No fresh apply, no second deploy: the original deploy request is untouched.
-	assert.False(t, freshApplyCalled)
+	assert.False(t, *freshApplyCalled)
+	assert.True(t, engine.IsRetryable(err), "a transient read error leaves the resume free to retry the same deploy request")
 	assert.Equal(t, 0, client.deployCalls)
 	assert.Equal(t, 1, client.getCalls)
 	// ResumeState is preserved so the next resume retries the same deploy request.
@@ -1654,29 +1750,30 @@ func TestResumeExistingDeployRequest_TransientGetErrorDoesNotFork(t *testing.T) 
 	assert.Equal(t, "singularity:in-flight", req.ResumeState.MigrationContext)
 }
 
-// A genuine not-found means the deploy request really was cleaned up, so resume
-// abandons the stale record and starts a fresh apply. The fresh Apply fails fast
-// on the recovered request's incomplete credentials, proving the not-found path
-// takes the start-fresh branch (which clears ResumeState) rather than
-// propagating the not-found as a retryable error.
-func TestResumeExistingDeployRequest_NotFoundStartsFresh(t *testing.T) {
-	e := NewWithClient(slog.New(slog.NewTextHandler(os.Stdout, nil)),
-		func(_, _ string) (psclient.PSClient, error) {
-			return nil, errors.New("client unavailable")
-		})
-	client := &resumeDeployClient{getErr: &ps.Error{Code: ps.ErrNotFound}}
+// A recorded deploy request the provider reports as not found cannot be shown
+// to have stopped, so the resume fails the apply permanently instead of starting
+// a second schema change beside one that may still be deploying. The error names
+// the deploy request and tells the operator what to check.
+func TestResumeExistingDeployRequest_NotFoundFailsWithoutStartingFresh(t *testing.T) {
+	notFound := &ps.Error{Code: ps.ErrNotFound}
+	client := &resumeDeployClient{getErr: notFound}
 
 	meta := &psMetadata{BranchName: "schemabot-testdb-gone", DeployRequestID: 13}
 	req := resumeRequest(t, meta, "apply-1a2b3c4d5e6f7890")
+	e, freshApplyCalled := engineRefusingFreshApply(req)
 
-	_, err := e.resumeExistingDeployRequest(t.Context(), client, "org", req, meta)
+	result, err := e.resumeExistingDeployRequest(t.Context(), client, "org", req, meta)
 
 	require.Error(t, err)
+	assert.Nil(t, result)
+	assert.ErrorIs(t, err, notFound)
+	assert.False(t, engine.IsRetryable(err), "a retry of this drive cannot learn where the change stands")
+	assert.Contains(t, err.Error(), "deploy request #13 not found on resume; check that the credentials can read it, then plan and apply again")
+	assert.False(t, *freshApplyCalled, "no second branch or deploy request is created")
 	assert.Equal(t, 0, client.deployCalls)
 	assert.Equal(t, 1, client.getCalls)
-	// The start-fresh branch clears ResumeState before re-running Apply, unlike
-	// the transient-error path which preserves it for retry.
-	assert.Nil(t, req.ResumeState)
+	require.NotNil(t, req.ResumeState, "the recorded deploy request stays the apply's record")
+	assert.Equal(t, "apply-1a2b3c4d5e6f7890", req.ResumeState.MigrationContext)
 }
 
 // When no vtgate DSN is configured, resume cannot rediscover a Vitess context;
