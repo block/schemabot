@@ -48,7 +48,8 @@ connection string or **Ctrl+E** to use an environment variable or file. Password
 confirm saving entered credentials in private, **unencrypted** files under
 `~/.schemabot/credentials`, outside the project. These files persist across terminal and
 laptop restarts; keep them private and include them in your credential-management practices.
-Cancelling before final confirmation writes no credentials.
+For manually entered connections, cancelling before final confirmation writes no credentials.
+The PlanetScale CLI path has its own credential-creation confirmation, described below.
 
 If `DATABASE_URL` is already set, the wizard shows its destination and offers to use it.
 Environment-variable and absolute file references remain available as an advanced option;
@@ -74,13 +75,52 @@ wizard toggle: drain in-flight work, stop the runtime, transfer the complete sta
 update its connection configuration, and verify it before restarting. Keep the original state
 until the new connection is verified. Re-running `init` never replaces existing state storage.
 
-The Vitess connection screen links to PlanetScale’s [database password setup guide](https://planetscale.com/docs/vitess/connecting/connection-strings).
-For Vitess, the connection-details form reuses the PlanetScale database name you already entered.
-The application connection is your vtgate address, and the wizard also asks for the
-PlanetScale organization and a [service token](#configure-the-planetscale-service-token).
-SchemaBot opens deploy requests with that token and reads keyspaces from the `main` branch.
-Its own state lives in a MySQL database outside Vitess. The storage choice appears immediately
-after the application connection, before PlanetScale API setup.
+## Connect a PlanetScale Vitess database
+
+Choose **Vitess**, then choose how to connect:
+
+- **Set up with PlanetScale CLI:** sign in with `pscale auth login`, choose your
+  organization and Vitess database, then review the access SchemaBot will create.
+  SchemaBot runs `pscale service-token create`, grants access only to the selected
+  database, and uses `pscale password create` to create a read-only password for
+  the `main` branch. You do not copy connection strings or tokens between tools.
+- **Enter credentials manually:** provide your existing database password and
+  service token. This path does not require the PlanetScale CLI.
+
+```text
+Vitess
+├── PlanetScale CLI → sign in → organization → database → approve access
+└── Manual          → database → connection details
+                       ↓
+              Local or Standalone storage
+                       ↓
+              Verify access → import schema → review your first plan
+```
+
+The CLI path requires an installed [PlanetScale CLI](https://planetscale.com/docs/cli/planetscale-environment-setup)
+and an account that can create service tokens and database passwords. It opens the
+browser for sign-in, then returns to the wizard. Only Vitess databases appear in
+its database picker. The access review lists the exact database permissions before
+anything is created. No organization-wide permissions are granted.
+
+After you approve access, credentials are saved in private, **unencrypted** files
+under `~/.schemabot/credentials`. They remain available if you cancel a later step.
+SchemaBot does not print either secret or put secrets in subprocess arguments.
+If creation fails partway through, SchemaBot attempts to revoke the credentials
+it just created. If a request has an unknown outcome or cleanup fails, the error
+identifies the credential name to check in PlanetScale before retrying.
+
+The manual connection screen links to PlanetScale’s
+[database password setup guide](https://planetscale.com/docs/vitess/connecting/connection-strings).
+Its connection-details form reuses the PlanetScale database name you entered.
+The connection is your vtgate address; the organization and
+[service token](#configure-the-planetscale-service-token) are separate API credentials.
+Use this path for a custom PlanetScale API address.
+
+Both paths verify the database connection and API access before importing the schema.
+SchemaBot opens deploy requests with the service token and reads keyspaces from `main`.
+Its own state lives in a MySQL database outside Vitess. Choose **Local (Docker)**
+for a local start or **Standalone** for an existing MySQL state database.
 
 **Local (Docker)** needs a running local Docker installation. After you confirm setup, SchemaBot
 creates a MySQL container with a loopback-only port, generated credentials, and a persistent Docker

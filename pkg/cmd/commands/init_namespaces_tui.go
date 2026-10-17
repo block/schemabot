@@ -188,6 +188,10 @@ func (m *initWizard) advance() tea.Cmd {
 		m.step++
 	}
 	m.loadField()
+	if m.pscale.complete && m.isVitess() && (m.step == stepDSN || m.step == stepAPIToken) {
+		m.connectionEditor.mode = "ready"
+		return tea.Batch(m.checkConnection(), m.spinner.Tick)
+	}
 	if m.step == stepNamespaces && !m.explicitNamespaces {
 		m.input.SetValue("")
 		m.input.Placeholder = "Search namespaces"

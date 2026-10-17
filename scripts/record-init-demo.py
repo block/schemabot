@@ -118,6 +118,8 @@ engine_keys = [(0.9, '\x1b[B'), (0.8, '\r')] if args.engine == 'postgres' else [
 if args.engine == 'vitess':
     engine_keys = [(0.9, '\x1b[A'), (0.8, '\r')]
 steps = [('Database engine', engine_keys), ('Database name', [(0.25, c) for c in 'shop'] + [(0.7, '\r')])]
+if args.engine == 'vitess':
+    steps.insert(1, ('Enter credentials manually', [(1.0, '\x1b[B'), (0.7, '\r')]))
 if args.connection_details:
     details = json.loads(env.pop('DEMO_CONNECTION_DETAILS'))
     labels = ['Host', 'Port', 'Database', 'Username', 'Password (hidden; Enter for none)']

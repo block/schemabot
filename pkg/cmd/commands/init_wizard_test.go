@@ -381,7 +381,7 @@ func TestInitCopyBackPreservesConnectionsAndDoesNotInitialize(t *testing.T) {
 	require.NoError(t, os.WriteFile(filepath.Join(root, "schemabot.yaml"), []byte("database: shop\ntype: postgres\n"), 0600))
 	original := InitCmd{Namespaces: []string{"sales", "west"}, StorageDSN: "env:STATE"}
 	m := newInitWizard(&original, "default", io.Discard)
-	values := []string{"postgres", "shop", "development", "env:APP", "env:STATE", "", "", "sales, west", root, "chosen"}
+	values := []string{"postgres", "", "shop", "development", "env:APP", "env:STATE", "", "", "sales, west", root, "chosen"}
 	for i, v := range values {
 		m.fields[i].value = v
 	}
@@ -569,7 +569,7 @@ func TestInitWizardDetectsExistingProjectBeforeReview(t *testing.T) {
 	require.Equal(t, "shop", m.fields[stepName].value)
 	require.Equal(t, "mysql", m.fields[stepEngine].value)
 	require.Contains(t, m.View(), "Found")
-	for _, changed := range []int{0, 1} {
+	for _, changed := range []int{stepEngine, stepName} {
 		m := newInitWizard(&InitCmd{SchemaDir: root}, "default", io.Discard)
 		m.fields[changed].value = "other"
 		m.step = len(m.fields)
@@ -602,6 +602,9 @@ func TestInitWizardVitessStepsAndReview(t *testing.T) {
 	m := newInitWizard(&InitCmd{Namespaces: []string{"commerce"}, APIURL: "http://localscale"}, "default", io.Discard)
 	wizardKey(m, tea.KeyUp)
 	require.Equal(t, "vitess", m.engine())
+	wizardKey(m, tea.KeyEnter)
+	require.Equal(t, stepPlanetScale, m.step)
+	wizardKey(m, tea.KeyDown)
 	wizardKey(m, tea.KeyEnter)
 	require.Equal(t, stepName, m.step)
 	require.Contains(t, m.View(), "PlanetScale database name")

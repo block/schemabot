@@ -183,13 +183,13 @@ func TestInitConnectionAutoAdvance(t *testing.T) {
 			case "edit":
 				m.connectionChecked = false
 			}
-			m.Update(initConnectionAdvanceMsg{generation: generation, step: 3})
+			m.Update(initConnectionAdvanceMsg{generation: generation, step: stepDSN})
 			if action == "advance" {
 				require.Equal(t, stepStorageDSN, m.step)
 				require.Contains(t, stripANSI(m.View()), "✓ Database connected")
 				require.Equal(t, "env:DATABASE_URL", m.fields[stepDSN].value)
 				require.False(t, m.confirmed)
-				m.Update(initConnectionAdvanceMsg{generation: generation, step: 3})
+				m.Update(initConnectionAdvanceMsg{generation: generation, step: stepDSN})
 				require.Equal(t, stepStorageDSN, m.step)
 			} else {
 				require.Equal(t, stepDSN, m.step)
@@ -215,6 +215,10 @@ func TestInitDetailsPlanetScaleTLS(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Setenv("DATABASE_URL", "")
 			m := newInitWizard(&InitCmd{Type: tc.engine, Database: "shop"}, "default", io.Discard)
+			if tc.engine == "vitess" {
+				wizardKey(m, tea.KeyDown)
+				wizardKey(m, tea.KeyEnter)
+			}
 			values := []string{tc.host, "3306", "shop", "demo", "secret@:/"}
 			if tc.engine == "vitess" {
 				values = []string{tc.host, "3306", "demo", "secret@:/"}
@@ -338,6 +342,8 @@ func TestInitPlanetScaleDatabaseNameIsReused(t *testing.T) {
 	t.Setenv("DATABASE_URL", "")
 	t.Setenv("SCHEMABOT_STORAGE_DSN", "")
 	m := newInitWizard(&InitCmd{Type: "vitess", Database: "shop"}, "demo", io.Discard)
+	wizardKey(m, tea.KeyDown)
+	wizardKey(m, tea.KeyEnter)
 	m.input.SetValue("aws.connect.psdb.cloud")
 	wizardKey(m, tea.KeyEnter)
 	m.input.SetValue("3306")

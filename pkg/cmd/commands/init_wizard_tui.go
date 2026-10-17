@@ -28,6 +28,7 @@ var initVariable = regexp.MustCompile(`^env:[A-Za-z_][A-Za-z0-9_]*$`)
 // connection to the state connection.
 const (
 	stepEngine = iota
+	stepPlanetScale
 	stepName
 	stepEnvironment
 	stepDSN
@@ -60,6 +61,8 @@ type initField struct{ label, hint, value string }
 // The wizard edits a private draft. Only explicit confirmation copies it back;
 // initialize remains the sole registration and verification path (AZ-7, AZ-8, AZ-9).
 type initWizard struct {
+	pscale initPScaleWizard
+
 	connectionEditor                         initConnectionEditor
 	draftConnections                         map[string]string
 	suggestions                              map[int]string
@@ -102,6 +105,7 @@ func newInitWizard(cmd *InitCmd, profile string, output io.Writer) *initWizard {
 	}
 	m := &initWizard{width: 72, height: 24, renderer: lipgloss.NewRenderer(output), fields: []initField{
 		{"Database engine", "Which database are you working with?", value(cmd.Type, "mysql")},
+		{"PlanetScale setup", "How would you like to connect?", ""},
 		{"Database name", "Give your database a name, like shop or analytics.", cmd.Database},
 		{"Environment", "Where are you working? Start with development if you’re trying things out.", value(cmd.Environment, "development")},
 		{"Connect your database", "Use a connection variable you’ve already set. Confirm it below, or edit the variable name.", value(cmd.DSN, "env:DATABASE_URL")},
@@ -121,6 +125,9 @@ func newInitWizard(cmd *InitCmd, profile string, output io.Writer) *initWizard {
 		}
 		m.existingProject = fmt.Sprintf("Found %s\n%s · %s", initTerminalText(filepath.Join(m.fields[stepSchemaDir].value, "schemabot.yaml")), initTerminalText(cfg.Database), initTerminalText(cfg.Type))
 	}
+	m.pscale.client = initPScale{run: runInitPScale, save: func(purpose, secret string) (string, error) {
+		return saveInitConnection(cmd.Runtime, "planetscale", "setup", purpose, secret)
+	}}
 	m.suggestions = map[int]string{}
 	m.editedFields = map[int]bool{}
 	for step, supplied := range map[int]string{stepEnvironment: cmd.Environment, stepDSN: cmd.DSN, stepAPIToken: cmd.APIToken, stepStorageDSN: cmd.StorageDSN, stepSchemaDir: cmd.SchemaDir} {
@@ -150,6 +157,12 @@ func (m *initWizard) Init() tea.Cmd {
 func (m *initWizard) engine() string { return m.fields[stepEngine].value }
 func (m *initWizard) isVitess() bool { return m.engine() == "vitess" }
 func (m *initWizard) hidden(step int) bool {
+	if step == stepPlanetScale {
+		return !m.isVitess()
+	}
+	if m.isVitess() && m.pscale.complete && (step == stepName || step == stepOrganization) {
+		return true
+	}
 	return (step == stepOrganization || step == stepAPIToken) && !m.isVitess()
 }
 
@@ -271,6 +284,9 @@ func (m *initWizard) cycleEngine(delta int) {
 	m.fields[stepEngine].value = initEngines[(index+delta+len(initEngines))%len(initEngines)].key
 }
 func (m *initWizard) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	if handled, cmd := m.updatePScale(msg); handled {
+		return m, cmd
+	}
 	switch msg := msg.(type) {
 	case initConnectionMsg:
 		if msg.generation != m.generation || !m.checkingConnection {
@@ -466,6 +482,9 @@ func (m *initWizard) contentView() string {
 	b.WriteString(bold.Render("SchemaBot") + muted.Render("  /  "+stage) + "\n\n")
 	if m.confirmed {
 		return ""
+	}
+	if m.step == stepPlanetScale {
+		return m.renderer.NewStyle().Width(m.width + 2).PaddingLeft(2).Render(b.String() + m.pscaleView())
 	}
 	if m.step < len(m.fields) {
 		f := m.fields[m.step]
