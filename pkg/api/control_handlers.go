@@ -947,6 +947,13 @@ type stopControlRequestMetadata struct {
 
 const stopResponseStatusAlreadyRequested = apitypes.ControlStatusAlreadyRequested
 
+// stopResponseStatusLeftToClaimedDrive marks a stop recorded on a stopped apply
+// whose operation a drive has already claimed. The parent stays stopped while
+// that drive resumes the operation, so a stopped parent is no proof the stop
+// landed, and only the drive may complete the stop. It never reaches the wire:
+// the caller sees an ordinary pending stop.
+const stopResponseStatusLeftToClaimedDrive = "left_to_claimed_drive"
+
 // handleStop handles POST /api/stop requests.
 // Records durable stop intent for the apply owner to process.
 func (s *Service) handleStop(w http.ResponseWriter, r *http.Request) {
@@ -1012,6 +1019,11 @@ func (s *Service) executeStopForApply(ctx context.Context, client tern.Client, a
 			s.logger.Info("immediate stop skipped because stop request is already pending",
 				append(apply.LogAttrs(),
 					"requested_by", caller)...)
+		case stopResponseStatusLeftToClaimedDrive:
+			s.logger.Info("immediate stop skipped because a drive already claimed an operation of the stopped apply; that drive completes the pending stop",
+				append(apply.LogAttrs(),
+					"requested_by", caller)...)
+			responseStatus = ""
 		default:
 			s.tryImmediateStopAfterQueue(ctx, client, apply, ternApplyID, environment, caller)
 		}
@@ -1476,7 +1488,7 @@ func (s *Service) stopQueuedStart(ctx context.Context, apply *storage.Apply, cal
 		return &ternv1.StopResponse{Accepted: true, StoppedCount: stoppedCount, SkippedCount: skippedCount}, apitypes.ControlStatusStartWithdrawn, nil, nil
 	case storage.QueuedStartStopPending:
 		s.logger.Info("stop withdrew the queued start of a stopped apply and is pending for the drive that already claimed an operation", attrs...)
-		return &ternv1.StopResponse{Accepted: true, StoppedCount: stoppedCount, SkippedCount: skippedCount}, "", nil, nil
+		return &ternv1.StopResponse{Accepted: true, StoppedCount: stoppedCount, SkippedCount: skippedCount}, stopResponseStatusLeftToClaimedDrive, nil, nil
 	case storage.QueuedStartNone:
 		s.logger.Info("stop rejected: the apply is already stopped and no start is queued", attrs...)
 		return nil, "", nil, controlConflictCodef(apitypes.ErrCodeAlreadyStopped, "schema change is already stopped")

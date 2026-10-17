@@ -12,6 +12,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/apitypes"
+	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/storage/mysqlstore"
@@ -128,6 +129,38 @@ func TestStopWithdrawsAQueuedStart(t *testing.T) {
 		for _, o := range ops {
 			assert.Equal(t, state.ApplyOperation.Stopped, o.State, "operation %s rests stopped", o.Deployment)
 		}
+	})
+
+	// A lone operation whose manifest still expects a sibling drives under the
+	// operation lease, so its claim leaves the parent stopped. The stopped parent
+	// is no proof the stop landed: the stop stays pending for the claimed drive,
+	// with no immediate stop sent to the data plane to complete it early.
+	t.Run("LeavesTheStopToTheDriveThatClaimedALoneOperation", func(t *testing.T) {
+		resetMatrixTables(t, ctx, db)
+		seed := seedGroupedApply(t, ctx, stor, multiOpSeed{
+			applyIdentifier: "stop-after-lone-operation-claimed",
+			parentState:     state.Apply.Stopped,
+			cutoverPolicy:   storage.CutoverPolicyBarrier,
+			onFailure:       storage.OnFailureHalt,
+			deployments:     []string{"eu"},
+			opState:         state.ApplyOperation.Resuming,
+			taskState:       state.Task.Stopped,
+		})
+		applyID := seed.applyID
+		_, err := db.ExecContext(ctx, "UPDATE applies SET expected_operation_keys = ? WHERE id = ?", `["eu","us"]`, applyID)
+		require.NoError(t, err)
+		requestStart(t, applyID)
+		client := &mockTernClient{stopResp: &ternv1.StopResponse{Accepted: true}}
+		apply := getApply(t, ctx, stor, applyID)
+
+		resp, _, err := svc.executeStopForApply(ctx, client, apply, apply.ApplyIdentifier, apply.Environment, "cli:bob")
+		require.NoError(t, err)
+		assert.True(t, resp.Accepted)
+		assert.Empty(t, resp.Status, "the stop is pending like any stop of a running rollout")
+
+		assert.Nil(t, client.stopReq, "no immediate stop is sent for a drive that already claimed the operation")
+		requireStatus(t, applyID, storage.ControlOperationStart, storage.ControlRequestCompleted)
+		requireStatus(t, applyID, storage.ControlOperationStop, storage.ControlRequestPending)
 	})
 
 	t.Run("StopsTheRolloutAClaimResumedSinceTheRead", func(t *testing.T) {
