@@ -1031,16 +1031,6 @@ func (s *Service) recoverApplyOperation(ctx context.Context, driverID int, owner
 		metrics.RecordOperatorClaimFailure(ctx, "operation_set_missing")
 		return claimSpent
 	}
-	if len(ops) > 1 {
-		return s.recoverMultiApplyOperation(ctx, driverID, op, opLease)
-	}
-	// One attached operation does not prove a single-operation apply: a
-	// deployment-keyed apply's operations attach one dispatch at a time, and
-	// its generation manifest is the authority for whether siblings are still
-	// on their way. Consult it before choosing the drive mode — a parent-lease
-	// drive of the first-attached operation would terminalize the parent apply
-	// while the manifest still expects siblings, and every later dispatch would
-	// then be refused against the terminal apply.
 	apply, err := s.storage.Applies().Get(ctx, op.ApplyID)
 	if err != nil {
 		s.logClaimFailure(ctx, "operator: failed to load parent apply for the drive-mode decision; operation will not be driven", "operation_parent_load_error",
@@ -1055,41 +1045,49 @@ func (s *Service) recoverApplyOperation(ctx context.Context, driverID int, owner
 		metrics.RecordOperatorClaimFailure(ctx, "operation_parent_missing")
 		return claimSpent
 	}
-	if missing := apply.MissingExpectedOperationKeys(ops); len(missing) > 0 {
-		s.logger.Info("operator: generation manifest expects operations that have not attached; driving under the operation lease so the projection owns the parent",
-			append(apply.LogAttrs(),
-				"driver", driverID,
-				"lease_owner", owner,
-				"operation_key", op.OperationKey,
-				"operation_deployment", op.Deployment,
-				"missing_operation_count", len(missing))...)
-		return s.recoverMultiApplyOperation(ctx, driverID, op, opLease)
-	}
-	hasTasks, err := s.claimedOperationHasTasks(ctx, op)
+	mode, err := tern.DecideApplyDriveMode(ctx, s.storage, apply, ops)
 	if err != nil {
 		s.logClaimFailure(ctx, "operator: failed to inspect claimed operation tasks; operation will not be driven", "operation_task_inspect_error",
 			append(op.LogAttrs(),
 				"driver", driverID, "lease_owner", owner, "error", err)...)
 		return claimSpent
 	}
-	if !hasTasks {
+	switch mode {
+	case tern.ApplyDriveOperationSet:
+		return s.recoverMultiApplyOperation(ctx, driverID, op, opLease)
+	case tern.ApplyDriveAwaitingSiblings:
+		// One attached operation does not prove a single-operation apply: a
+		// deployment-keyed apply's operations attach one dispatch at a time, and
+		// its generation manifest is the authority for whether siblings are still
+		// on their way. A parent-lease drive of the first-attached operation would
+		// terminalize the parent apply while the manifest still expects siblings,
+		// and every later dispatch would then be refused against the terminal
+		// apply.
+		s.logger.Info("operator: generation manifest expects operations that have not attached; driving under the operation lease so the projection owns the parent",
+			append(apply.LogAttrs(),
+				"driver", driverID,
+				"lease_owner", owner,
+				"operation_key", op.OperationKey,
+				"operation_deployment", op.Deployment,
+				"missing_operation_count", len(apply.MissingExpectedOperationKeys(ops)))...)
+		return s.recoverMultiApplyOperation(ctx, driverID, op, opLease)
+	case tern.ApplyDriveTasklessOperation:
 		// Apply-level claiming is task-gated, so a valid task-less operation (for
 		// example plan-level VSchema work) cannot be driven through the legacy
 		// parent-lease path. Drive it under the operation lease and project the
 		// parent from the operation row, the same fail-closed path multi-operation
 		// applies use.
 		return s.driveClaimedMultiOperation(ctx, driverID, op, opLease, false)
+	case tern.ApplyDriveParentLease:
+		return s.recoverSingleApplyOperation(ctx, driverID, owner, op, opLease)
+	default:
+		s.logger.Error("operator: no drive mode for the claimed operation; operation will not be driven",
+			append(apply.LogAttrs(),
+				"driver", driverID, "lease_owner", owner, "operation_key", op.OperationKey,
+				"operation_deployment", op.Deployment, "drive_mode", int(mode))...)
+		metrics.RecordOperatorClaimFailure(ctx, "operation_set_missing")
+		return claimSpent
 	}
-
-	return s.recoverSingleApplyOperation(ctx, driverID, owner, op, opLease)
-}
-
-func (s *Service) claimedOperationHasTasks(ctx context.Context, op *storage.ApplyOperation) (bool, error) {
-	tasks, err := s.storage.Tasks().GetByApplyOperationID(ctx, op.ID)
-	if err != nil {
-		return false, fmt.Errorf("load tasks for apply_operation %d (deployment %q): %w", op.ID, op.Deployment, err)
-	}
-	return len(tasks) > 0, nil
 }
 
 // operationSetContainsID reports whether id is one of the apply's operation
