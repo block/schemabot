@@ -34,11 +34,16 @@ import (
 // accepted apply: Progress reads the request's no_changes state as completed and
 // the drive completes the apply's tasks instead of treating the no-op as a
 // failure.
-func noChangesApplyResult(message, migrationContext string, meta *psMetadata) (*engine.ApplyResult, error) {
+//
+// A no-changes deploy request never deploys, so nothing tears it or its branch
+// down: the branch's auto-delete fires only when a deploy finishes. SchemaBot
+// leaves both in place and logs where they are so an operator can remove them.
+func (e *Engine) noChangesApplyResult(req *engine.ApplyRequest, org, message, migrationContext string, meta *psMetadata) (*engine.ApplyResult, error) {
 	encoded, err := encodePSMetadata(meta)
 	if err != nil {
 		return nil, fmt.Errorf("encode metadata for no-changes deploy request #%d: %w", meta.DeployRequestID, err)
 	}
+	e.logNoChangesDeployRequestLeftInPlace(req, org, meta)
 	return &engine.ApplyResult{
 		Accepted: true,
 		Message:  message,
@@ -47,6 +52,31 @@ func noChangesApplyResult(message, migrationContext string, meta *psMetadata) (*
 			Metadata:         encoded,
 		},
 	}, nil
+}
+
+// Log messages for a completed no-changes apply, naming what SchemaBot leaves
+// in PlanetScale and what the operator can do about it. A branch SchemaBot
+// created is the operator's to delete; an operator-supplied branch is kept.
+const (
+	noChangesLeftInPlaceMsg = "no-changes deploy request never deploys, so SchemaBot leaves it and its branch in place " +
+		"(the branch's auto-delete does not fire); close the deploy request and delete the branch in PlanetScale"
+	noChangesLeftInPlaceOperatorBranchMsg = "no-changes deploy request never deploys, so SchemaBot leaves it in place " +
+		"and keeps the operator-supplied branch; close the deploy request in PlanetScale"
+)
+
+// logNoChangesDeployRequestLeftInPlace records the deploy request and branch a
+// completed no-changes apply leaves behind in PlanetScale.
+func (e *Engine) logNoChangesDeployRequestLeftInPlace(req *engine.ApplyRequest, org string, meta *psMetadata) {
+	msg := noChangesLeftInPlaceMsg
+	if !deployRequestDeletesBranch(req.Options) {
+		msg = noChangesLeftInPlaceOperatorBranchMsg
+	}
+	e.applyLogger(req).Info(msg,
+		"organization", org,
+		"planetscale_database", req.Database,
+		"deploy_request", meta.DeployRequestID,
+		"branch", meta.BranchName,
+	)
 }
 
 // vschemaDiffsFromChanges extracts the per-keyspace VSchema diffs carried on the
@@ -400,7 +430,7 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (result *e
 			Message:  fmt.Sprintf("Deploy request #%d: no changes detected", dr.Number),
 			Metadata: map[string]string{"deploy_request_id": fmt.Sprintf("%d", dr.Number)},
 		})
-		return noChangesApplyResult("no changes detected", migCtx, &psMetadata{
+		return e.noChangesApplyResult(req, org, "no changes detected", migCtx, &psMetadata{
 			BranchName:            branchName,
 			DeployRequestID:       dr.Number,
 			DeployRequestURL:      dr.HtmlURL,
@@ -1112,7 +1142,7 @@ func (e *Engine) resumeApply(ctx context.Context, client psclient.PSClient, org 
 	if dr.DeploymentState == deployState.NoChanges {
 		meta.DeployRequestID = dr.Number
 		meta.DeployRequestURL = dr.HtmlURL
-		return noChangesApplyResult("no changes detected on resume", req.ResumeState.MigrationContext, meta)
+		return e.noChangesApplyResult(req, org, "no changes detected on resume", req.ResumeState.MigrationContext, meta)
 	}
 
 	if deferCutover {
@@ -1277,7 +1307,7 @@ func (e *Engine) resumeExistingDeployRequest(ctx context.Context, client psclien
 		e.logger.Info("recovered deploy request reports no changes on resume",
 			"database", req.Database, "deploy_request", dr.Number)
 		meta.DeployRequestURL = dr.HtmlURL
-		return noChangesApplyResult("no changes detected on resume", req.ResumeState.MigrationContext, meta)
+		return e.noChangesApplyResult(req, org, "no changes detected on resume", req.ResumeState.MigrationContext, meta)
 	}
 
 	meta.DeployRequestURL = dr.HtmlURL

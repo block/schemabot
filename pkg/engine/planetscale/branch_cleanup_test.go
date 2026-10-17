@@ -254,7 +254,9 @@ func (c *branchHandoverClient) CreateDeployRequest(_ context.Context, req *ps.Cr
 // deploy request deploys, while an operator-supplied branch is the operator's
 // and outlives the deploy. A resumed drive that creates the deploy request
 // later makes the same decision from the same stored options, so the fresh
-// drive's answer is the one the resume has to match.
+// drive's answer is the one the resume has to match. The deploy request here
+// reports no changes, and either way the returned resume state names it, so
+// the drive's next progress poll settles the apply as completed.
 func TestApplyHandsOnlyItsOwnBranchToTheDeployRequest(t *testing.T) {
 	applyRequest := func(options map[string]string) *engine.ApplyRequest {
 		return &engine.ApplyRequest{
@@ -278,6 +280,7 @@ func TestApplyHandsOnlyItsOwnBranchToTheDeployRequest(t *testing.T) {
 		assert.Equal(t, created[0], client.lastCreate.Branch)
 		assert.True(t, client.lastCreate.AutoDeleteBranch)
 		assert.Equal(t, branchPasswordTTL(0), client.passwordTTL, "the branch password is sized by the keyspaces the apply can touch")
+		assertResumeStateNamesNoChangesDeployRequest(t, result, created[0])
 	})
 
 	t.Run("an operator-supplied branch outlives the deploy request", func(t *testing.T) {
@@ -292,7 +295,22 @@ func TestApplyHandsOnlyItsOwnBranchToTheDeployRequest(t *testing.T) {
 		require.NotNil(t, client.lastCreate)
 		assert.Equal(t, "operator-branch", client.lastCreate.Branch)
 		assert.False(t, client.lastCreate.AutoDeleteBranch)
+		assertResumeStateNamesNoChangesDeployRequest(t, result, "operator-branch")
 	})
+}
+
+// assertResumeStateNamesNoChangesDeployRequest checks that the fresh apply's
+// no-changes result names deploy request #91 and its branch, so the drive's
+// next progress poll reads that deploy request and settles the apply.
+func assertResumeStateNamesNoChangesDeployRequest(t *testing.T, result *engine.ApplyResult, branch string) {
+	t.Helper()
+	require.NotNil(t, result.ResumeState, "the drive needs a resume state to follow the deploy request")
+	stored, err := decodePSMetadata(result.ResumeState.Metadata)
+	require.NoError(t, err)
+	assert.Equal(t, uint64(91), stored.DeployRequestID)
+	assert.Equal(t, branch, stored.BranchName)
+	assert.Equal(t, engine.StateCompleted, noChangesProgressState(t, result.ResumeState),
+		"the next progress poll settles the converged apply as completed")
 }
 
 // resumeReclaimClient serves a resumed branch that is ready and issues its
