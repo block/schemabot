@@ -1406,6 +1406,11 @@ func (c *schemaChangeComparer) sameStatements(ctx context.Context, item schemaCh
 	}
 	var contents [4]string
 	for i, side := range item.sides {
+		// A base the file is absent from is passed as "", which the dialect
+		// reads as a file the pull request adds.
+		if !side.found {
+			continue
+		}
 		text, ok := c.blobText[side.entry.SHA]
 		if !ok {
 			var err error
@@ -1440,19 +1445,30 @@ func (c *schemaChangeComparer) sameStatements(ctx context.Context, item schemaCh
 	return true, nil
 }
 
-// statementComparable reports whether item is a .sql file that is a regular
-// file at all four commits, so its content at each one is a schema file the
-// dialect can parse.
+// statementComparable reports whether item is a .sql file whose content at
+// each commit is a schema file the dialect can parse: a regular file at all
+// four commits, or a file the pull request adds, absent at both bases and a
+// regular file at the approved commit and the head.
 func statementComparable(item schemaChangeItem) bool {
 	if path.Ext(item.path) != ".sql" {
 		return false
 	}
-	for _, side := range item.sides {
-		if !side.found || side.entry.Type != "blob" || side.entry.Mode == gitSymlinkMode {
+	added := !item.sides[sideApprovedBase].found && !item.sides[sideHeadBase].found
+	for i, side := range item.sides {
+		if added && (i == sideApprovedBase || i == sideHeadBase) {
+			continue
+		}
+		if !regularFile(side) {
 			return false
 		}
 	}
 	return true
+}
+
+// regularFile reports whether side is a regular file, not a directory, a
+// symlink, or absent.
+func regularFile(side gitSide) bool {
+	return side.found && side.entry.Type == "blob" && side.entry.Mode != gitSymlinkMode
 }
 
 // pathUnchanged reports whether the pull request's change to a path is the

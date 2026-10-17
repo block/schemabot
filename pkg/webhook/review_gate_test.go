@@ -321,6 +321,9 @@ func TestCheckReviewGate_ApprovalCoverage(t *testing.T) {
 		// postgresTarget answers the PostgreSQL schema file comparison on the
 		// environment's target; nil leaves the environment with no target.
 		postgresTarget *schemaFileCompareTernClient
+		// postgresComparedPath is the file the target compares, the orders
+		// table's by default.
+		postgresComparedPath string
 		// cancelDuringCompare cancels the evaluation while the target
 		// compares the file.
 		cancelDuringCompare bool
@@ -331,7 +334,9 @@ func TestCheckReviewGate_ApprovalCoverage(t *testing.T) {
 		headFileStatus   int
 		treesUnavailable bool
 		want             string
-		wantErr          error
+		// wantChangedPath is the schema input the comment names as changed.
+		wantChangedPath string
+		wantErr         error
 	}{
 		{
 			name:     "a rebase onto a default branch that added tables beside the PR's counts",
@@ -424,6 +429,38 @@ func TestCheckReviewGate_ApprovalCoverage(t *testing.T) {
 				files["schema/testdb/orders/votes.sql"] = "CREATE TABLE `votes` (`id` bigint NOT NULL, `score` int, PRIMARY KEY (`id`))"
 			},
 			want: wantChanged,
+		},
+		{
+			name:     "the PR reformatting the table file it adds after the approval counts",
+			prChange: addVotes,
+			headChange: func(files map[string]string) {
+				files["schema/testdb/orders/votes.sql"] = "-- One row per vote.\nCREATE TABLE `votes` (\n  `id` bigint NOT NULL,\n  PRIMARY KEY (`id`)\n);\n"
+			},
+			want: wantCovers,
+		},
+		{
+			name: "the PR changing a column type in the table file it adds after the approval does not count",
+			prChange: func(files map[string]string) {
+				files["schema/testdb/orders/votes.sql"] = "CREATE TABLE `votes` (`id` bigint NOT NULL, `cast_at` timestamp, PRIMARY KEY (`id`))"
+			},
+			headChange: func(files map[string]string) {
+				files["schema/testdb/orders/votes.sql"] = "CREATE TABLE `votes` (`id` bigint NOT NULL, `cast_at` datetime, PRIMARY KEY (`id`))"
+			},
+			want:            wantChanged,
+			wantChangedPath: "schema/testdb/orders/votes.sql",
+		},
+		{
+			name:         "the PR reformatting the PostgreSQL table file it adds after the approval counts when the target finds the same change",
+			databaseType: "postgres",
+			prChange: func(files map[string]string) {
+				files["schema/testdb/orders/votes.sql"] = "CREATE TABLE votes (id bigint PRIMARY KEY);"
+			},
+			headChange: func(files map[string]string) {
+				files["schema/testdb/orders/votes.sql"] = "-- One row per vote.\ncreate table votes (\n  id bigint primary key\n);\n"
+			},
+			postgresTarget:       &schemaFileCompareTernClient{resp: &ternv1.CompareSchemaFileChangeResponse{Same: true}},
+			postgresComparedPath: "schema/testdb/orders/votes.sql",
+			want:                 wantCovers,
 		},
 		{
 			// The PR was stacked on another, so its approved diff carried the
@@ -874,12 +911,23 @@ func TestCheckReviewGate_ApprovalCoverage(t *testing.T) {
 			require.NoError(t, err, "an approval that does not count blocks on the merits, not as an evaluation failure")
 			require.NotNil(t, result)
 			assertApprovalVerdict(t, result, tt.want, "bob")
+			if tt.want == wantChanged {
+				require.Len(t, result.ChangedPaths, 1, "the comment names the schema input whose change differs")
+				if tt.wantChangedPath != "" {
+					assert.Equal(t, tt.wantChangedPath, result.ChangedPaths[0])
+				}
+			} else {
+				assert.Empty(t, result.ChangedPaths)
+			}
 			if !result.Approved {
 				assert.Equal(t, "main", result.BaseRef, "the review-required comment names the PR's base branch")
 				assert.Equal(t, defaultBranch, result.DefaultBranch, "the review-required comment names the default branch")
 			}
 			if tt.postgresTarget != nil {
-				const path = "schema/testdb/orders/orders.sql"
+				path := "schema/testdb/orders/orders.sql"
+				if tt.postgresComparedPath != "" {
+					path = tt.postgresComparedPath
+				}
 				reqs := tt.postgresTarget.requests()
 				require.Len(t, reqs, 1, "the combined file is compared once on the environment's target")
 				assert.Equal(t, "orders", reqs[0].GetDatabase())
@@ -2236,7 +2284,8 @@ func TestEnforceReviewGate(t *testing.T) {
 		select {
 		case body := <-comments:
 			assert.Contains(t, body, "Review Required")
-			assert.Contains(t, body, "Approvals on an earlier commit no longer count because this PR's schema change is different now: @bob.")
+			assert.Contains(t, body, "Approvals on an earlier commit no longer count because this PR's schema change is different now: @bob. "+
+				"Changed since the approval: `schema/testdb/orders.sql`.")
 		case <-time.After(2 * time.Second):
 			require.Fail(t, "timed out waiting for review-required comment")
 		}
