@@ -1680,7 +1680,9 @@ privilege and size gates in `pkg/engine/postgres/postgres.go`, plus RLS admissio
 in `pkg/engine/postgres/row_security.go` that abort plan creation and the apply-time gate in
 `pkg/engine/postgres/row_security_apply.go`); the whole-plan
 blocked verdict (`storage.Plan.BlockedApplyError`, `pkg/storage`) checked at every apply admission
-path (`pkg/api/plan_handlers.go`, `pkg/tern/local_client.go`), and the CLI's `apply` and `rollback`
+path (`pkg/api/plan_handlers.go`, `pkg/tern/local_client.go`), and for a shard dispatch attaching
+to an existing apply its re-planned scope (`storage.BlockedChangeError` in
+`attachDispatchOperation`, `pkg/tern/local_client.go`), and the CLI's `apply` and `rollback`
 refusing the namespace and shard verdicts of the plan they submit (a rollout's primary plan)
 before prompting or locking (`blockedPlanError` over `PlanResponse.FirstBlockedChange`, in
 `pkg/cmd/commands/apply.go`, called there and from `pkg/cmd/commands/rollback.go`), with a materialized plan carrying

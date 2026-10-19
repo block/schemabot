@@ -1053,11 +1053,20 @@ func (p *Plan) BlockedChanges() []TableChange {
 // a blocked change. Keeping this with the whole-plan verdict ensures every
 // admission path gives the same remedy.
 func (p *Plan) BlockedApplyError() error {
-	blocked := p.BlockedChanges()
-	if len(blocked) == 0 {
+	return BlockedChangeError(p.PlanIdentifier, p.BlockedChanges())
+}
+
+// BlockedChangeError returns the whole-plan refusal for the first blocked
+// change among changes of the named plan, or nil when none is blocked. An
+// admission path judging a subset of a plan's changes, such as a shard
+// dispatch's re-planned scope, refuses with it so it gives the same remedy as
+// BlockedApplyError.
+func BlockedChangeError(planIdentifier string, changes []TableChange) error {
+	i := slices.IndexFunc(changes, TableChange.EngineBlocked)
+	if i < 0 {
 		return nil
 	}
-	change := blocked[0]
+	change := changes[i]
 	reason := change.ModeReason
 	if reason == "" {
 		reason = "the engine refuses this statement"
@@ -1065,9 +1074,9 @@ func (p *Plan) BlockedApplyError() error {
 	// Independent causes are listed one per line so an operator fixing the
 	// first is not surprised by the second on the next attempt.
 	if causes := engine.BlockedCauses(reason); len(causes) > 1 {
-		return fmt.Errorf("stored plan %s contains a blocked change for table %q:\n- %s", p.PlanIdentifier, change.Table, strings.Join(causes, "\n- "))
+		return fmt.Errorf("stored plan %s contains a blocked change for table %q:\n- %s", planIdentifier, change.Table, strings.Join(causes, "\n- "))
 	}
-	return fmt.Errorf("stored plan %s contains a blocked change for table %q: %s", p.PlanIdentifier, change.Table, reason)
+	return fmt.Errorf("stored plan %s contains a blocked change for table %q: %s", planIdentifier, change.Table, reason)
 }
 
 // HasOriginalFilesCapture reports whether every stored namespace has an

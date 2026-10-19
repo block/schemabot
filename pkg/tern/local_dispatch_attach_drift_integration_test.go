@@ -4,7 +4,9 @@ package tern
 
 import (
 	"context"
+	"strconv"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -12,6 +14,7 @@ import (
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
+	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 )
 
@@ -20,9 +23,19 @@ import (
 // is put back before the client is closed.
 func replanShard80(t *testing.T, client *LocalClient, changes ...engine.TableChange) {
 	t.Helper()
+	replanShard80After(t, client, nil, changes...)
+}
+
+// replanShard80After is replanShard80 with a hook that runs as the re-plan
+// starts reading live schema, for interleaving concurrent work before it.
+func replanShard80After(t *testing.T, client *LocalClient, before func(context.Context), changes ...engine.TableChange) {
+	t.Helper()
 	real := client.spiritEngine
 	t.Cleanup(func() { client.spiritEngine = real })
-	client.spiritEngine = fakePlanEngine{planFn: func(context.Context, *engine.PlanRequest) (*engine.PlanResult, error) {
+	client.spiritEngine = fakePlanEngine{planFn: func(ctx context.Context, _ *engine.PlanRequest) (*engine.PlanResult, error) {
+		if before != nil {
+			before(ctx)
+		}
 		return &engine.PlanResult{Changes: []engine.SchemaChange{{
 			Namespace:    "testdb",
 			Shard:        engine.Shard{Name: "80-"},
@@ -246,4 +259,91 @@ func TestLocalClient_Apply_SiblingShardDispatchCarriesItsUnsafeVerdict(t *testin
 	ops, err := stor.ApplyOperations().ListByApply(ctx, apply.ID)
 	require.NoError(t, err)
 	assert.Len(t, ops, 1, "the refused sibling must not attach an operation")
+}
+
+// A sibling shard whose re-plan still needs exactly the reviewed change, but
+// whose engine refuses it there (and does not judge it unsafe), is refused at
+// admission like a blocked plan, even with allow_unsafe: no opt-in makes a
+// refused statement executable, and no operation or task is left to fail at
+// drive time.
+func TestLocalClient_Apply_SiblingShardDispatchBlockedOnItsShardIsRefused(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	stor, client, planID := setupAttachDispatchClient(t)
+	ctx := t.Context()
+	const key = "schemabot:v1:sibling-blocked-test"
+
+	first, err := client.Apply(ctx, shardDispatchRequest(planID, key, "-80"))
+	require.NoError(t, err)
+	require.True(t, first.Accepted, "first shard dispatch must be accepted: %s", first.ErrorMessage)
+
+	replanShard80(t, client, engine.TableChange{
+		Table:         "users",
+		Operation:     ddl.StatementAlterTable,
+		DDL:           "ALTER TABLE `users` ADD COLUMN `email` varchar(255) NULL",
+		ExecutionMode: engine.ExecutionModeBlocked,
+		ModeReason:    "requires privileges unavailable to the engine on this shard",
+	})
+	sibling := siblingDispatchWithSchemaFiles(planID, key)
+	sibling.Options = map[string]string{"allow_unsafe": "true"}
+	second, err := client.Apply(ctx, sibling)
+	require.NoError(t, err)
+	assert.False(t, second.Accepted, "a change the sibling shard's engine refuses must be refused at admission")
+	assert.Contains(t, second.ErrorMessage, `contains a blocked change for table "users": requires privileges unavailable to the engine on this shard`)
+
+	apply, err := stor.Applies().GetByApplyIdentifier(ctx, first.ApplyId)
+	require.NoError(t, err)
+	require.NotNil(t, apply)
+	ops, err := stor.ApplyOperations().ListByApply(ctx, apply.ID)
+	require.NoError(t, err)
+	assert.Len(t, ops, 1, "the refused sibling must not attach an operation")
+	tasks, err := stor.Tasks().GetByApplyID(ctx, apply.ID)
+	require.NoError(t, err)
+	assert.Len(t, tasks, 1, "the refused sibling must not insert tasks")
+}
+
+// Two dispatches of the same 80- sibling race. This one's operation lookup
+// misses, then the other attaches the operation and its DDL lands before this
+// one's re-plan reads live schema, so the re-plan no longer lists the change.
+// This dispatch replays the winner's operation instead of failing with a
+// drift error for work that succeeded.
+func TestLocalClient_Apply_SiblingShardDriftAfterConcurrentAttachReplaysWinner(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	stor, client, planID := setupAttachDispatchClient(t)
+	ctx := t.Context()
+	const key = "schemabot:v1:sibling-drift-race-test"
+	apply, plan, scope, siblingReq := attachFixture(t, stor, client, planID, key)
+
+	// The re-plan sees 80-'s users table with the column already added: the
+	// concurrent winner attached the operation and ran its DDL first.
+	var winner *storage.ApplyOperation
+	replanShard80After(t, client, func(hookCtx context.Context) {
+		now := time.Now()
+		winner = &storage.ApplyOperation{
+			Deployment:   "testdb",
+			OperationKey: "testdb/80-/users",
+			Target:       plan.Target,
+			State:        state.ApplyOperation.Pending,
+			CreatedAt:    now,
+			UpdatedAt:    now,
+		}
+		require.NoError(t, stor.Applies().AttachOperationWithTasks(hookCtx, apply, winner, buildDispatchTasks(plan, scope, siblingReq.Environment, "spirit", []byte("{}"), now)))
+	})
+
+	resp, err := client.Apply(ctx, siblingDispatchWithSchemaFiles(planID, key))
+	require.NoError(t, err, "the losing dispatch must replay the winner, not fail on drift")
+	require.NotNil(t, winner, "the concurrent attach must have run before the re-plan")
+	require.True(t, resp.Accepted, "the losing dispatch must be replayed, not refused: %s", resp.ErrorMessage)
+	assert.Equal(t, apply.ApplyIdentifier, resp.ApplyId)
+	assert.Equal(t, strconv.FormatInt(winner.ID, 10), resp.ApplyOperationId, "the loser must resolve to the winner's operation row")
+	assert.Equal(t, "testdb/80-/users", resp.OperationKey)
+
+	ops, err := stor.ApplyOperations().ListByApply(ctx, apply.ID)
+	require.NoError(t, err)
+	assert.Len(t, ops, 2, "the replayed dispatch must not insert a duplicate operation")
 }
