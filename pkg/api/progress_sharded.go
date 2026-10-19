@@ -167,6 +167,9 @@ func shardedTableRow(namespace, table string, tableOps []*storage.ApplyOperation
 			RowsTotal:       sc.RowsTotal,
 			ETASeconds:      sc.ETASeconds,
 			PercentComplete: int32(sc.PercentComplete),
+
+			ChecksumRowsChecked: sc.ChecksumRowsChecked,
+			ChecksumRowsTotal:   sc.ChecksumRowsTotal,
 		})
 		shardRows := rowsByOp[op.ID]
 		if len(shardRows) == 0 {
@@ -246,6 +249,9 @@ func taskCopies(tasks []*storage.Task) []presentation.ShardCopy {
 			RowsCopied:      t.RowsCopied,
 			RowsTotal:       t.RowsTotal,
 			ETASeconds:      int64(t.ETASeconds),
+
+			ChecksumRowsChecked: t.ChecksumRowsChecked,
+			ChecksumRowsTotal:   t.ChecksumRowsTotal,
 		})
 	}
 	return copies

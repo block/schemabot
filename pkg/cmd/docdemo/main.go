@@ -427,23 +427,30 @@ func fleetInventory() string {
 }
 
 func busyFleet(now time.Time) []string {
-	data := t.StatusListData{ActiveCount: 3, Limit: 20, HasMore: true, StateCounts: map[string]int{state.Apply.Completed: 483, state.Apply.Running: 3, state.Apply.Failed: 9, state.Apply.Stopped: 5}}
+	data := t.StatusListData{Sectioned: true, ActiveCount: 3, Limit: 12, HasMore: true, StateCounts: map[string]int{state.Apply.Completed: 483, state.Apply.Failed: 9, state.Apply.Stopped: 5}}
 	names := []string{"shop", "billing", "catalog", "accounts", "inventory", "search", "analytics", "notifications"}
-	for i := 0; i < 20; i++ {
-		phase := state.Apply.Completed
+	for i := 0; i < 15; i++ {
+		apply := t.ActiveApplyData{ApplyID: fmt.Sprintf("apply-example-%02d", 73-i), Database: names[i%len(names)], Environment: "staging", State: state.Apply.Running, Caller: fmt.Sprintf("github:alex@acme/store#%d", 42-i), StartedAt: now.Add(-time.Duration(10+i*25) * time.Minute).Format(time.RFC3339)}
 		if i < 3 {
-			phase = state.Apply.Running
+			data.Active = append(data.Active, apply)
+			continue
 		}
+		apply.State = state.Apply.Completed
 		if i == 5 {
-			phase = state.Apply.Failed
+			apply.State = state.Apply.Failed
 		}
 		if i == 8 {
-			phase = state.Apply.Stopped
+			apply.State = state.Apply.Stopped
 		}
-		data.Applies = append(data.Applies, t.ActiveApplyData{ApplyID: fmt.Sprintf("apply-example-%02d", 73-i), Database: names[i%len(names)], Environment: "staging", State: phase, Caller: fmt.Sprintf("github:alex@acme/store#%d", 42-i), StartedAt: now.Add(-time.Duration(10+i*25) * time.Minute).Format(time.RFC3339)})
+		data.Applies = append(data.Applies, apply)
 	}
+	// The capture pipe is not a TTY; this frame represents an interactive
+	// terminal, where SOURCE is a short labeled link.
+	previousHyperlinks := ui.Hyperlinks
+	ui.Hyperlinks = true
 	output := capture(func() { t.WriteStatusList(data) })
-	if !strings.Contains(output, "500 total:") || !strings.Contains(output, "20 most recent") {
+	ui.Hyperlinks = previousHyperlinks
+	if !strings.Contains(output, "3 active schema changes") || !strings.Contains(output, "497 total:") || !strings.Contains(output, "12 most recent") {
 		panic("fleet summary missing")
 	}
 	return strings.Split(strings.TrimRight(output, "\n"), "\n")
@@ -544,7 +551,7 @@ func main() {
 	demos = append(demos, Demo{Name: "cli-ops", Title: "Know your database fleet.", Height: 960, Frames: []Frame{
 		{2, "schemabot databases", "See the databases and environments in your fleet", fleetInventory()},
 		{3.5, "schemabot pull -d shop -e staging --table orders --lint", "Inspect the live schema and its lint findings", pull},
-		{4, "schemabot status -e staging", "500 changes; the latest 20 at a glance", strings.Join(fleetLines, "\n")},
+		{4, "schemabot status -e staging -n 12", "Running changes first, then the latest finished ones", strings.Join(fleetLines, "\n")},
 		{1, "schemabot logs apply-example-73 -f", "Follow the engine logs as they arrive", followLogView(5)},
 		{0.6, "", "", followLogView(9)},
 		{0.9, "", "See why copying slows down", followLogView(10)},

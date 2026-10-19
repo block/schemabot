@@ -535,6 +535,43 @@ func withDriveWorkOwner(ctx context.Context) context.Context {
 	return engine.WithWorkOwner(ctx, driveWorkOwner(ctx))
 }
 
+// saveSequentialEngineResumeState records the resume state an engine returned
+// for an accepted task on the task's apply operation. Stop, cancel, and cutover
+// build their engine requests from the recorded state, so an engine that names
+// the work it is driving there can be reached by a control request that arrives
+// while the task runs. An engine that returns no resume state, or echoes back
+// the one the drive sent, reaches its work through its own state, so nothing is
+// recorded and a failed write can never halt work that needed no record.
+func (c *LocalClient) saveSequentialEngineResumeState(ctx context.Context, task *storage.Task, sent, returned *engine.ResumeState) error {
+	if !resumeStateNamesNewWork(sent, returned) {
+		c.logger.Debug("engine returned no resume state beyond the one the drive sent; nothing recorded, and control requests reach the work through the engine's own state",
+			task.LogAttrs()...)
+		return nil
+	}
+	operationID, err := applyOperationIDForTask(task)
+	if err != nil {
+		c.logger.Warn("engine returned a resume state for a task with no apply operation to record it on; control requests for this task go to the engine without it",
+			append(task.LogAttrs(), "reason", err.Error())...)
+		return nil
+	}
+	if err := c.saveEngineResumeStateForOperation(ctx, operationID, returned); err != nil {
+		return fmt.Errorf("save engine resume state for task %s on apply operation %d: %w", task.TaskIdentifier, operationID, err)
+	}
+	return nil
+}
+
+// resumeStateNamesNewWork reports whether an engine's returned resume state
+// carries anything beyond the one the drive sent with the request.
+func resumeStateNamesNewWork(sent, returned *engine.ResumeState) bool {
+	if returned == nil {
+		return false
+	}
+	if sent == nil {
+		return true
+	}
+	return *returned != *sent
+}
+
 // runEngineTaskAttempt calls the engine for a single DDL, marks the task
 // running, and polls to completion. Besides runEngineTask's outcomes it returns
 // taskTargetHeld when the engine was refused the target.
@@ -601,6 +638,9 @@ func (c *LocalClient) runEngineTaskAttempt(ctx context.Context, apply *storage.A
 			"task_id", task.TaskIdentifier, "table", task.TableName, "state", task.State, "engine_message", result.Message)
 		return c.failureVerdictAction(apply.ApplyIdentifier, task, verdictErr)
 	}
+	if err := c.saveSequentialEngineResumeState(ctx, task, request.ResumeState, result.ResumeState); err != nil {
+		return c.abandonUnrecordedEngineWork(ctx, logger, apply, task, taskCreds, result.ResumeState, err)
+	}
 
 	// Mark task running
 	now := time.Now()
@@ -609,10 +649,10 @@ func (c *LocalClient) runEngineTaskAttempt(ctx context.Context, apply *storage.A
 	logger.Info("task running", "task_id", task.TaskIdentifier, "table", task.TableName)
 
 	// Poll to completion. Thread the engine's returned resume state into the
-	// poll: a sharded engine (Strata) identifies the operation to report on from
-	// ResumeState.Metadata and errors without it, so Progress must carry what
-	// Apply returned. (Spirit reports per-database and returns no resume state, so
-	// this stays nil and its behaviour is unchanged.)
+	// poll: an engine that names its work in ResumeState.Metadata identifies the
+	// operation to report on from it and errors without it, so Progress must
+	// carry what Apply returned. An engine that echoes the request's resume state
+	// polls with the same state the drive sent.
 	pollAction := c.pollTaskToCompletion(ctx, apply, task, taskCreds, result.ResumeState)
 	if pollAction == taskAbort || pollAction == taskStopped || pollAction == taskHandover || pollAction == taskTargetHeld {
 		return pollAction
@@ -626,6 +666,48 @@ func (c *LocalClient) runEngineTaskAttempt(ctx context.Context, apply *storage.A
 	default:
 		return taskContinue
 	}
+}
+
+// abandonUnrecordedEngineWork handles an accepted task whose resume state could
+// not be recorded. Stop and cancel reach the engine through the recorded state,
+// so work left running without it could not be reached by a stop or cancel
+// (CO-4). The drive halts the work with the state the engine returned, then
+// records the task failed_retryable: a later drive re-plans it, and should the
+// halt not have taken, stop and cancel still treat the task as live engine work
+// and send it to the engine instead of recording the command over running work.
+// An engine that needs the state to reach the work refuses the request, so the
+// command fails rather than completing while the work runs.
+func (c *LocalClient) abandonUnrecordedEngineWork(ctx context.Context, logger *slog.Logger, apply *storage.Apply, task *storage.Task, creds *engine.Credentials, resumeState *engine.ResumeState, saveErr error) taskAction {
+	if haltErr := c.haltUnrecordedEngineWork(ctx, creds, resumeState); haltErr != nil {
+		logger.Error("failed to record the engine resume state for an accepted task, and the engine did not halt the work; the task is recorded failed_retryable so a stop or cancel cannot complete while the work runs",
+			append(task.LogAttrs(), "error", saveErr, "halt_error", haltErr)...)
+	} else {
+		logger.Error("failed to record the engine resume state for an accepted task; the engine halted the work and the task is recorded failed_retryable for a later drive",
+			append(task.LogAttrs(), "error", saveErr)...)
+	}
+	verdictErr := c.markTaskRetryable(ctx, task, fmt.Sprintf("record engine resume state: %v", saveErr))
+	return c.failureVerdictAction(apply.ApplyIdentifier, task, verdictErr)
+}
+
+// haltUnrecordedEngineWork stops accepted work with the resume state the
+// engine returned for it. The halt runs detached from the drive's context, so a
+// drive that is being cancelled still brings the work down, and is bounded by
+// the same deadline as the halt a drive runs as it returns.
+func (c *LocalClient) haltUnrecordedEngineWork(ctx context.Context, creds *engine.Credentials, resumeState *engine.ResumeState) error {
+	eng := c.getEngine()
+	if eng == nil {
+		return fmt.Errorf("no engine configured for type: %s", c.config.Type)
+	}
+	haltCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), driveHandoverHaltTimeout)
+	defer cancel()
+	if _, err := eng.Stop(haltCtx, &engine.ControlRequest{
+		Database:    c.config.Database,
+		Credentials: creds,
+		ResumeState: resumeState,
+	}); err != nil {
+		return fmt.Errorf("stop engine %s work for database %s: %w", eng.Name(), c.config.Database, err)
+	}
+	return nil
 }
 
 // Timeouts for idle states where user action is expected.
@@ -1553,8 +1635,64 @@ func (w *taskStallWatchdog) observe(now time.Time, snap taskProgressSnapshot) (s
 
 // shouldRetryEngineError decides whether an engine error pauses the apply as
 // failed_retryable for operator recovery instead of failing it permanently.
+// An unknown outcome pauses on every database type: the engine could not tell
+// whether its backend started the work, and recovery re-observes the work its
+// resume state names instead of dispatching it again, so failing the apply
+// would leave work that may be running with nothing tracking it.
 func (c *LocalClient) shouldRetryEngineError(err error) bool {
-	return recoveryResumesFromCheckpoint(c.config.Type) && engine.IsRetryable(err)
+	if !engine.IsRetryable(err) {
+		return false
+	}
+	return recoveryResumesFromCheckpoint(c.config.Type) || engine.IsOutcomeUnknown(err)
+}
+
+// shouldRetryAcceptedWorkError decides whether an error observing or driving
+// work the engine already accepted — a progress poll or an automatic cutover
+// attempt on a running grouped apply — pauses the apply as failed_retryable
+// instead of failing it permanently. Unlike shouldRetryEngineError, which
+// governs the start of engine work, this pause cannot dispatch duplicate work
+// on an engine whose recovery reattaches to the work it accepted, so such an
+// engine pauses here even though its start errors fail the apply.
+func (c *LocalClient) shouldRetryAcceptedWorkError(err error) bool {
+	if !engine.IsRetryable(err) {
+		return false
+	}
+	return recoveryResumesFromCheckpoint(c.config.Type) || recoveryReattachesToAcceptedWork(c.config.Type)
+}
+
+// shouldPauseAcceptedWork decides whether a retryable error observing,
+// driving, or reattaching to work the engine already accepted pauses the apply
+// as failed_retryable. It applies shouldRetryAcceptedWorkError, except while
+// the apply is in its revert phase: the pause rewrites every non-terminal task
+// as failed_retryable, which erases the revert-phase task states that make a
+// recovery reattach to the engine instead of settling the tasks from a schema
+// comparison that, post-cutover, matches the reviewed target until a revert
+// lands. A revert-phase apply is therefore never paused here, so its outcome
+// is never decided by that comparison.
+func (c *LocalClient) shouldPauseAcceptedWork(apply *storage.Apply, tasks []*storage.Task, err error) bool {
+	if revertPhaseInFlight(apply, tasks) {
+		c.logger.Warn("apply is in its revert phase, so it fails instead of pausing for retry: a pause would erase the revert-phase task states recovery reattaches by",
+			append(apply.LogAttrs(), "error", err)...)
+		return false
+	}
+	return c.shouldRetryAcceptedWorkError(err)
+}
+
+// revertPhaseInFlight reports whether the apply or any of its tasks sits in an
+// engine-monitored revert phase.
+func revertPhaseInFlight(apply *storage.Apply, tasks []*storage.Task) bool {
+	return applyInRevertPhase(apply) || firstRevertPhaseTask(tasks, 0) != nil
+}
+
+// recoveryReattachesToAcceptedWork reports whether the database type's engine
+// keeps accepted work running outside SchemaBot and a re-claimed recovery
+// attempt reattaches to it through the persisted engine resume state. Vitess
+// applies are deploy requests on an external provider that keep running
+// whatever the drive concludes, and a grouped resume hands the stored deploy
+// request back to the engine instead of creating a new one. Failing such an
+// apply permanently would only abandon a deploy request that is still live.
+func recoveryReattachesToAcceptedWork(databaseType string) bool {
+	return databaseType == storage.DatabaseTypeVitess
 }
 
 // recoveryResumesFromCheckpoint reports whether the database type's engine can
@@ -1674,7 +1812,7 @@ func (c *LocalClient) finalizeSequentialApply(ctx context.Context, apply *storag
 		logger.Info("apply already terminal in storage, not overwriting during sequential finalization",
 			"stored_state", freshApply.State)
 		*apply = *freshApply
-		if err := settlePendingRequestsForTerminalApply(ctx, c.storage, c.logger, apply); err != nil {
+		if err := SettlePendingRequestsForTerminalApply(ctx, c.storage, c.logger, apply); err != nil {
 			logger.Warn("failed to settle pending control requests for terminal sequential apply",
 				"error", err)
 		}

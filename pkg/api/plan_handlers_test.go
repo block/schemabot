@@ -22,19 +22,32 @@ func TestBuildApplyTaskCopiesExecutionVerdict(t *testing.T) {
 	assert.Equal(t, "requires privileges unavailable to the engine", task.ModeReason)
 }
 
-// Apply tasks carry the table's planned size so progress can show it beside
-// the row counts. A task created for one shard of a table carries none.
-func TestBuildApplyTaskCarriesPlannedSize(t *testing.T) {
+// Apply tasks carry the table's planned size and row count so progress can
+// show them beside the row counts, and before the copy reports any. A task
+// created for one shard of a table carries neither, and a drop carries the
+// table's size but no rows, since it copies none.
+func TestBuildApplyTaskCarriesPlanEstimates(t *testing.T) {
 	bytes := int64(23_400_000_000)
-	change := storage.TableChange{Namespace: "testdb", Table: "orders", Operation: "alter", EstimatedBytes: &bytes}
+	rows := int64(48_200_000)
+	change := storage.TableChange{Namespace: "testdb", Table: "orders", Operation: "alter", EstimatedBytes: &bytes, EstimatedRows: &rows}
 	plan := &storage.Plan{ID: 7, DatabaseType: storage.DatabaseTypeMySQL}
 
 	task := buildApplyTask(plan, change, "production", storage.ApplyOptions{}, "", time.Now())
 	require.NotNil(t, task.EstimatedBytes)
 	assert.Equal(t, bytes, *task.EstimatedBytes)
+	require.NotNil(t, task.EstimatedRows)
+	assert.Equal(t, rows, *task.EstimatedRows)
 
 	shardTask := buildApplyTask(plan, change, "production", storage.ApplyOptions{}, "-80", time.Now())
 	assert.Nil(t, shardTask.EstimatedBytes)
+	assert.Nil(t, shardTask.EstimatedRows)
+
+	drop := change
+	drop.Operation = "drop"
+	dropTask := buildApplyTask(plan, drop, "production", storage.ApplyOptions{}, "", time.Now())
+	require.NotNil(t, dropTask.EstimatedBytes)
+	assert.Equal(t, bytes, *dropTask.EstimatedBytes)
+	assert.Nil(t, dropTask.EstimatedRows, "a drop copies no rows")
 }
 
 // TestPullNamespaces exercises the API-boundary pull gate: requested

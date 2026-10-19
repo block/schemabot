@@ -60,6 +60,9 @@ func (m *mockPlanLookupStore) Get(context.Context, string) (*storage.Plan, error
 	return m.plan, m.err
 }
 func (m *mockPlanLookupStore) GetByID(context.Context, int64) (*storage.Plan, error) { return nil, nil }
+func (m *mockPlanLookupStore) GetListAnchor(context.Context, string) (*storage.PlanListAnchor, error) {
+	return nil, nil
+}
 func (m *mockPlanLookupStore) GetByLock(context.Context, int64) ([]*storage.Plan, error) {
 	return nil, nil
 }
@@ -103,10 +106,20 @@ func (s *capturingPlanStore) Create(_ context.Context, plan *storage.Plan) (int6
 
 type mockStorageWithPlanLookup struct {
 	mockStorage
-	plans storage.PlanStore
+	plans      storage.PlanStore
+	operations storage.ApplyOperationStore
 }
 
 func (m *mockStorageWithPlanLookup) Plans() storage.PlanStore { return m.plans }
+
+// ApplyOperations serves an apply that recorded no operations unless the test
+// sets its own.
+func (m *mockStorageWithPlanLookup) ApplyOperations() storage.ApplyOperationStore {
+	if m.operations == nil {
+		return &staticApplyOperationStore{}
+	}
+	return m.operations
+}
 
 type mockStorageWithApplyStores struct {
 	mockStorage
@@ -372,6 +385,18 @@ func (s *recentApplyStore) GetRecent(_ context.Context, filter storage.RecentApp
 		return applies[:filter.Limit], nil
 	}
 	return applies, nil
+}
+
+func (s *recentApplyStore) GetByApplyIdentifier(_ context.Context, applyIdentifier string) (*storage.Apply, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
+	for _, apply := range s.applies {
+		if apply.ApplyIdentifier == applyIdentifier {
+			return apply, nil
+		}
+	}
+	return nil, nil
 }
 
 func (s *recentApplyStore) CountRecentByState(_ context.Context, filter storage.RecentAppliesFilter) (map[string]int, error) {

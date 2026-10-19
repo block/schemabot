@@ -746,8 +746,8 @@ func (c *GRPCClient) processPendingCutoverControlRequest(ctx context.Context, ap
 		// The apply being ready says only that some member is parked. The
 		// Cutover call below goes to this drive's own remote apply, so the
 		// request is this drive's to take only when its own member is parked
-		// and it is that member's turn; every other drive leaves it pending for
-		// the member whose turn it is.
+		// and no earlier member holds it; every other drive leaves it pending
+		// for the member that may take it.
 		turn, err := operationCutoverRequestTurn(ctx, c.storage, apply, scope, controlReq)
 		if err != nil {
 			return fmt.Errorf("check cutover turn for apply %s: %w", apply.ApplyIdentifier, err)
@@ -773,7 +773,7 @@ func (c *GRPCClient) processPendingCutoverControlRequest(ctx context.Context, ap
 				return failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCutover,
 					fmt.Sprintf("cutover request was not applied because the member it was accepted for is %s", turn.blocker.State))
 			case cutoverRequestUnsettled:
-				logger.InfoContext(ctx, "pending gRPC cutover request left for the member whose turn it is", attrs...)
+				logger.InfoContext(ctx, "pending gRPC cutover request left for the member that may take it", attrs...)
 			}
 			return nil
 		}
@@ -792,6 +792,25 @@ func (c *GRPCClient) processPendingCutoverControlRequest(ctx context.Context, ap
 			return failErr
 		}
 		return fmt.Errorf("process pending gRPC cutover for apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	if remoteOperationID != "" && !scope.takesCutoverRequestInOrder() {
+		// The Cutover call below is scoped to this drive's own remote
+		// operation, and the apply being ready says only that some member is
+		// parked. The request is this drive's to take only once its own member
+		// is parked; otherwise it stays pending for the parked sibling's drive.
+		parked, err := operationParkedAtCutover(ctx, c.storage, apply, scope)
+		if err != nil {
+			return fmt.Errorf("check cutover readiness of apply_operation %d of apply %s: %w", scope.applyOperationID, apply.ApplyIdentifier, err)
+		}
+		if !parked {
+			logger.InfoContext(ctx, "pending gRPC cutover request left for a parked sibling member; this member has not reached cutover",
+				append(apply.MutableLogAttrs(),
+					"requested_by", controlRequestCaller(controlReq),
+					"operation_deployment", scope.operation.Deployment,
+					"operation_key", scope.operation.OperationKey,
+					"remote_operation_id", remoteOperationID)...)
+			return nil
+		}
 	}
 	if stopReq, err := pendingControlRequest(ctx, c.storage, apply, storage.ControlOperationStop); err != nil {
 		return fmt.Errorf("check pending stop request before pending gRPC cutover for apply %s: %w", apply.ApplyIdentifier, err)
@@ -1010,7 +1029,7 @@ func (c *GRPCClient) failRefusedControlRequest(ctx context.Context, logger *slog
 				"apply_operation_id", scope.applyOperationID,
 				"remote_apply_id", remoteID,
 				"error_message", message)...)
-		c.controlSendGate.recordSend(controlReq.ID, time.Now())
+		c.controlSendGate.recordSend(controlReq, time.Now())
 		return false, nil
 	}
 	logger.WarnContext(ctx, "the data plane refused the pending control request; the schema change continues and settles on its own",
@@ -1112,7 +1131,7 @@ func (c *GRPCClient) processPendingStopControlRequest(ctx context.Context, apply
 	// The data plane stores the stop durably on first receipt and its own
 	// driver consumes it, so retransmission is redelivery insurance on a bounded
 	// cadence — not a per-tick send (see the cancel counterpart).
-	if now := time.Now(); c.controlSendGate.shouldSend(controlReq.ID, now) {
+	if now := time.Now(); c.controlSendGate.shouldSend(controlReq, now) {
 		resp, err := c.client.Stop(ctx, &ternv1.StopRequest{
 			ApplyId:     remoteID,
 			Environment: apply.Environment,
@@ -1132,7 +1151,7 @@ func (c *GRPCClient) processPendingStopControlRequest(ctx context.Context, apply
 		if !resp.Accepted {
 			return c.failRefusedControlRequest(ctx, logger, apply, storage.ControlOperationStop, storage.LogEventStopRequested, controlReq, scope, remoteID, resp.ErrorMessage)
 		}
-		if c.controlSendGate.recordSend(controlReq.ID, now) {
+		if c.controlSendGate.recordSend(controlReq, now) {
 			c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStopRequested,
 				fmt.Sprintf("Remote stop accepted for apply %s%s", remoteID, callerApplyLogSuffix(controlRequestCaller(controlReq))), "", "")
 		} else {
@@ -1235,7 +1254,7 @@ func (c *GRPCClient) processPendingCancelControlRequest(ctx context.Context, app
 	// cadence — not a per-tick send, which floods the data plane with duplicate
 	// cancels and the apply log with duplicate accept events while the remote
 	// works (or fails) to consume the first one.
-	if now := time.Now(); c.controlSendGate.shouldSend(controlReq.ID, now) {
+	if now := time.Now(); c.controlSendGate.shouldSend(controlReq, now) {
 		resp, err := c.client.Cancel(ctx, &ternv1.CancelRequest{ApplyId: remoteID, Environment: apply.Environment, Caller: controlReq.RequestedBy})
 		if err != nil {
 			if completed, completeErr := c.completeRemoteCancelFromTerminalProgress(ctx, apply, controlReq, scope); completeErr == nil && completed {
@@ -1251,7 +1270,7 @@ func (c *GRPCClient) processPendingCancelControlRequest(ctx context.Context, app
 		if !resp.Accepted {
 			return c.failRefusedControlRequest(ctx, logger, apply, storage.ControlOperationCancel, storage.LogEventCancelRequested, controlReq, scope, remoteID, resp.ErrorMessage)
 		}
-		if c.controlSendGate.recordSend(controlReq.ID, now) {
+		if c.controlSendGate.recordSend(controlReq, now) {
 			c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventCancelRequested,
 				fmt.Sprintf("Remote cancel accepted for apply %s%s", remoteID, callerApplyLogSuffix(controlRequestCaller(controlReq))), "", "")
 		} else {
@@ -1902,28 +1921,94 @@ func (s applyTaskScope) stampMemberTarget(req *ternv1.ApplyRequest, plan *storag
 	}
 }
 
+// sharesRemoteApplyWithSiblings reports whether this drive's operation is one
+// of several its deployment dispatches into the deployment's one remote apply:
+// a shard of a sharded deployment, or a target of a deployment that addresses
+// several. The remote apply then holds every sibling's tasks, and only the
+// operation's own remote operation says which of them are this drive's.
+func (s applyTaskScope) sharesRemoteApplyWithSiblings() bool {
+	return s.usesOperationRemoteResume() && len(s.deploymentOperationKeys) > 1
+}
+
 // remoteOperationScope returns the remote operation id this drive's Progress
 // and Cutover calls are scoped to, or "" when they address the whole remote
-// apply. A rollout member target shares its deployment's remote apply with its
-// sibling targets, so its progress is its own remote operation's and its
-// cutover is for that operation alone; every other drive keeps the
-// apply-level calls it always made. A member whose remote operation id was
-// never recorded cannot be told apart from its siblings, so it is refused.
+// apply. An operation that shares its deployment's remote apply with sibling
+// operations (a rollout member target, or a shard) has its own remote
+// operation there, so its progress is that operation's and its cutover is for
+// that operation alone; every other drive keeps the apply-level calls it
+// always made. A member target whose remote operation id was never recorded
+// cannot be told apart from its siblings, so it is refused. A shard dispatched
+// by a build that did not record the id keeps the apply-level calls that build
+// made (see dispatchedWithoutRemoteOperationID): its remote work runs on
+// either way, and refusing would fail the operation while it does.
 func (s applyTaskScope) remoteOperationScope() (string, error) {
-	if s.memberTarget == "" || s.operation == nil {
+	if s.operation == nil {
 		return "", nil
 	}
-	if s.operation.ExternalOperationID == "" {
-		return "", fmt.Errorf("rollout member target %s (apply_operation %d) records remote apply %s but no remote operation id, so its progress, cutover and control calls cannot be scoped apart from its sibling targets' and are refused. SchemaBot records both ids in one write, so this row was changed outside it: look up target %s's operation in remote apply %s on the data plane and record its id as this apply_operation's external_operation_id, then the next drive resumes it", s.memberTarget, s.operation.ID, s.operation.RemoteApplyID(), s.memberTarget, s.operation.RemoteApplyID())
+	if s.memberTarget != "" {
+		if s.operation.ExternalOperationID == "" {
+			return "", fmt.Errorf("rollout member target %s (apply_operation %d) records remote apply %s but no remote operation id, so its progress, cutover and control calls cannot be scoped apart from its sibling targets' and are refused. SchemaBot records both ids in one write, so this row was changed outside it: look up target %s's operation in remote apply %s on the data plane and record its id as this apply_operation's external_operation_id, then the next drive resumes it", s.memberTarget, s.operation.ID, s.operation.RemoteApplyID(), s.memberTarget, s.operation.RemoteApplyID())
+		}
+		return s.operation.ExternalOperationID, nil
+	}
+	if !s.sharesRemoteApplyWithSiblings() {
+		return "", nil
 	}
 	return s.operation.ExternalOperationID, nil
 }
 
+// dispatchedWithoutRemoteOperationID reports whether this drive's operation
+// shares its remote apply with sibling operations but records no remote
+// operation id to scope its calls with, so they address the whole remote apply
+// and its progress reads its siblings' tasks alongside its own.
+func (s applyTaskScope) dispatchedWithoutRemoteOperationID() bool {
+	return s.sharesRemoteApplyWithSiblings() && s.memberTarget == "" && s.operation.ExternalOperationID == ""
+}
+
+// acceptsUnscopedProgressAnswer reports whether a scoped progress answer that
+// echoes no operation id is still this drive's to read. A data plane that does
+// not scope progress leaves the echo empty and answers for the whole remote
+// apply, the read a shard made before its progress was scoped, so a shard keeps
+// that read rather than failing while its remote work runs on. A member
+// target's progress is always scoped, so its unscoped answer is refused.
+func (s applyTaskScope) acceptsUnscopedProgressAnswer(echoedOperationID string) bool {
+	return s.memberTarget == "" && echoedOperationID == ""
+}
+
+// progressReadFromWholeApply reports whether a progress answer this drive
+// accepted covers the whole remote apply its operation shares with sibling
+// operations rather than the operation alone: the operation records no remote
+// operation id, or the data plane did not scope its answer to it.
+func (s applyTaskScope) progressReadFromWholeApply(resp *ternv1.ProgressResponse) bool {
+	if s.dispatchedWithoutRemoteOperationID() {
+		return true
+	}
+	return s.sharesRemoteApplyWithSiblings() && s.acceptsUnscopedProgressAnswer(resp.GetApplyOperationId())
+}
+
+// logProgressReadFromWholeApply warns that this drive's progress covers its
+// sibling operations' tasks alongside its own. The drive calls it once, not
+// on every poll, since the cause holds for as long as the drive runs.
+func (c *GRPCClient) logProgressReadFromWholeApply(ctx context.Context, apply *storage.Apply, scope applyTaskScope, remoteID string) {
+	reason := "the data plane does not scope progress to an operation; upgrade the data plane to read this operation's progress alone"
+	if scope.dispatchedWithoutRemoteOperationID() {
+		reason = "the operation records no remote operation id"
+	}
+	c.applyLogger(apply).WarnContext(ctx, "operation's progress is read from the whole remote apply it shares with its sibling operations",
+		append(apply.MutableLogAttrs(),
+			"reason", reason,
+			"remote_apply_id", remoteID,
+			"apply_operation_id", scope.operation.ID,
+			"remote_operation_id", scope.operation.ExternalOperationID,
+			"operation_key", scope.operation.OperationKey,
+			"operation_deployment", scope.operation.Deployment)...)
+}
+
 // remoteProgress polls the remote apply for this drive, scoped to its remote
-// operation when the drive is a rollout member target (see
-// remoteOperationScope). A scoped answer that does not echo the operation came
-// from a data plane that answered for the whole apply, and it is refused
-// rather than read as this member's state.
+// operation when the drive's operation shares the remote apply with sibling
+// operations (see remoteOperationScope). A scoped answer that names another
+// operation is refused rather than read as this operation's state, and so is
+// an unscoped one unless acceptsUnscopedProgressAnswer allows it.
 func (c *GRPCClient) remoteProgress(ctx context.Context, apply *storage.Apply, scope applyTaskScope, remoteID string) (*ternv1.ProgressResponse, error) {
 	remoteOperationID, err := scope.remoteOperationScope()
 	if err != nil {
@@ -1938,13 +2023,19 @@ func (c *GRPCClient) remoteProgress(ctx context.Context, apply *storage.Apply, s
 		return resp, err
 	}
 	if remoteOperationID != "" && resp != nil && resp.GetApplyOperationId() != remoteOperationID {
-		c.applyLogger(apply).ErrorContext(ctx, "remote progress for a rollout member target did not come back scoped to its operation; refusing to read the whole remote apply as this member's",
+		if scope.acceptsUnscopedProgressAnswer(resp.GetApplyOperationId()) {
+			c.applyLogger(apply).DebugContext(ctx, "remote progress for a shard came back unscoped; reading the whole remote apply",
+				append(apply.MutableLogAttrs(), "remote_apply_id", remoteID, "remote_operation_id", remoteOperationID)...)
+			return resp, nil
+		}
+		c.applyLogger(apply).ErrorContext(ctx, "remote progress for an operation that shares its remote apply did not come back scoped to that operation; refusing to read the whole remote apply as this operation's",
 			append(apply.MutableLogAttrs(),
 				"remote_apply_id", remoteID,
 				"remote_operation_id", remoteOperationID,
 				"echoed_operation_id", resp.GetApplyOperationId(),
+				"operation_key", scope.operation.OperationKey,
 				"member_target", scope.memberTarget)...)
-		return nil, fmt.Errorf("remote progress for apply %s operation %s came back scoped to %q; the data plane answered for the whole apply, which its sibling targets share", remoteID, remoteOperationID, resp.GetApplyOperationId())
+		return nil, fmt.Errorf("remote progress for apply %s operation %s came back scoped to %q; the data plane answered for the whole apply, which its sibling operations share", remoteID, remoteOperationID, resp.GetApplyOperationId())
 	}
 	return resp, nil
 }
@@ -2862,7 +2953,7 @@ func (c *GRPCClient) startStoppedTasklessRemoteApply(ctx context.Context, apply 
 // ResumeApplyOperationCutover drives a single barrier-parked apply_operation
 // through its cutover phase over the remote (gRPC) path. It is the
 // deployment-ordered counterpart to ResumeApplyOperation's copy drive: the
-// operator claims the parked operation whose turn it is and calls this to force
+// operator claims a parked operation no earlier member holds and calls this to force
 // the remote swap, while siblings stay parked. The operation's per-operation
 // remote apply id is authoritative — the drive never falls back to the parent
 // apply's external id and never writes the parent applies row directly, since
@@ -3473,12 +3564,14 @@ func shouldDispatchQueuedRemoteApply(apply *storage.Apply, scope applyTaskScope)
 	if state.IsState(dispatchState, state.Apply.Running) {
 		return true
 	}
-	// A stop catches still-pending operations before they start and moves them
-	// to stopped without a started_at; the start claim then moves the row to
-	// resuming. Such a row never ran, so it was never dispatched either, and
-	// resuming it is its first dispatch. A resuming row that had started is
-	// not: it may have reached remote Tern before its id was stored.
-	return state.IsState(dispatchState, state.Apply.Resuming) && scope.operation.StartedAt == nil
+	// A stop moves an operation with no remote id to stopped in storage alone,
+	// whether it was still pending or had been claimed but not yet dispatched,
+	// and the start claim then moves the row to resuming. Resuming it is a
+	// dispatch under the same reasoning as a running row: the deployment's
+	// key never rotates, so if an earlier dispatch did reach the data plane
+	// the data plane replays that operation rather than starting a second
+	// copy, and otherwise this attaches it for the first time.
+	return state.IsState(dispatchState, state.Apply.Resuming)
 }
 
 // undispatchedControlRequestSettlesLocally reports whether a pending stop or
@@ -3576,6 +3669,9 @@ func (c *GRPCClient) dispatchPendingApply(ctx context.Context, apply *storage.Ap
 		target = apply.Database
 	}
 	if standDown, err := c.processPendingCancelOrStopControlRequest(ctx, apply, scope); standDown || err != nil {
+		return err
+	}
+	if standDown, err := c.startStoppedDeploymentApplyBeforeAttach(ctx, apply, scope); standDown || err != nil {
 		return err
 	}
 
@@ -4889,6 +4985,7 @@ func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply
 	consecutiveProgressErrors := 0
 	loggedStoppedAfterStart := false
 	loggedRetryablePause := false
+	loggedWholeApplyProgress := false
 	var stoppedAfterStartDeadline time.Time
 	var lastDisplayBlob string
 	lastHeartbeatSuccess := time.Now()
@@ -4969,6 +5066,10 @@ func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply
 				continue
 			}
 			consecutiveProgressErrors = 0
+			if !loggedWholeApplyProgress && scope.progressReadFromWholeApply(resp) {
+				c.logProgressReadFromWholeApply(ctx, apply, scope, remoteID)
+				loggedWholeApplyProgress = true
+			}
 			if resp.State == ternv1.State_STATE_NO_ACTIVE_CHANGE {
 				message := fmt.Sprintf("remote apply %s returned no active schema change for exact apply_id", apply.ExternalID)
 				return c.failMissingRemoteApply(ctx, apply, message, nil, scope)

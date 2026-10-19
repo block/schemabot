@@ -13,7 +13,7 @@ import (
 )
 
 const controlRequestColumns = `id, apply_id, operation, status,
-	requested_by, error_message, metadata, completed_at, created_at, updated_at`
+	requested_by, error_message, metadata, completed_at, created_at, updated_at, revision`
 
 type controlRequestStore struct {
 	db         *rebindDB
@@ -205,7 +205,7 @@ func (s *controlRequestStore) requestPending(ctx context.Context, req *storage.A
 		_, err := tx.ExecContext(ctx, `
 			UPDATE apply_control_requests
 			SET status = ?, requested_by = ?, error_message = NULL, metadata = ?,
-				completed_at = NULL, updated_at = NOW()
+				completed_at = NULL, updated_at = NOW(), revision = revision + 1
 			WHERE id = ?
 		`, storage.ControlRequestPending, req.RequestedBy, metadata, existing.ID)
 		if err != nil {
@@ -540,7 +540,7 @@ func scanControlRequest(s scanner) (*storage.ApplyControlRequest, error) {
 	err := s.Scan(
 		&req.ID, &req.ApplyID, &req.Operation, &req.Status,
 		&req.RequestedBy, &errorMessage, &req.Metadata, &completedAt,
-		&req.CreatedAt, &req.UpdatedAt,
+		&req.CreatedAt, &req.UpdatedAt, &req.Revision,
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {

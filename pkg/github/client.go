@@ -1752,12 +1752,16 @@ func pathInsideAny(p string, dirs []string) bool {
 // A file is kept when its object at headSHA differs from the object at the
 // default branch tip, which is what "this pull request proposes it" means: if
 // the content already matches what the default branch declares, merging changes
-// nothing for that file. The default branch is the right yardstick because it
+// nothing for that file. A rename is also kept when it vacates a schema path the
+// default branch still holds, since merging it stops declaring that file's
+// tables. The default branch is the right yardstick because it
 // is the one SchemaBot already privileges — the post-merge reconcile runs for
 // it alone, and a registered repository cannot be pointed at another ref.
 //
-// The result is always a subset of files, so this can only ever narrow
-// discovery: it cannot surface a database that was not already discovered.
+// Every kept file is one of files, unchanged except that a rename the default
+// branch already holds has its PreviousFilename cleared, so this can only ever
+// narrow discovery: it cannot surface a database that was not already
+// discovered.
 // Only the files discovery keys on are compared, so a pull request that touches
 // no schema costs no API calls.
 func (ic *InstallationClient) PRFilesProposedAgainstDefaultBranch(ctx context.Context, repo, headSHA string, files []PRFile) (proposed []PRFile, defaultTipSHA string, err error) {
@@ -1794,28 +1798,78 @@ func (ic *InstallationClient) PRFilesProposedAgainstDefaultBranch(ctx context.Co
 	levelCache := make(map[string][]TreeEntry)
 	proposed = make([]PRFile, 0, len(files))
 	for _, file := range files {
-		if !isDiscoveryInputFile(file.Filename) {
+		if !isDiscoveryInputPRFile(file) {
 			proposed = append(proposed, file)
 			continue
 		}
-		headObjectSHA, headObjectType, headFound, err := ic.resolveGitObjectSHA(ctx, repo, headSHA, file.Filename, levelCache)
-		if err != nil {
-			return nil, defaultTipSHA, fmt.Errorf("resolve %s at head %s: %w", file.Filename, headSHA, err)
+		// The current path and the vacated path are separate claims, so each
+		// is measured on its own: a pull request can edit the destination of a
+		// rename the default branch already holds without proposing the
+		// removal again.
+		keep := false
+		if isDiscoveryInputFile(file.Filename) {
+			differs, err := ic.pathDiffersFromDefaultBranch(ctx, repo, headSHA, defaultTipSHA, file.Filename, levelCache)
+			if err != nil {
+				return nil, defaultTipSHA, err
+			}
+			keep = differs
 		}
-		defaultObjectSHA, defaultObjectType, defaultFound, err := ic.resolveGitObjectSHA(ctx, repo, defaultTipSHA, file.Filename, levelCache)
-		if err != nil {
-			return nil, defaultTipSHA, fmt.Errorf("resolve %s at default branch tip %s: %w", file.Filename, defaultTipSHA, err)
+		// A rename proposes vacating its previous schema path only when the
+		// head lacks that path and the default branch still declares it; a
+		// rename the default branch already holds is inherited history, so
+		// its previous path is cleared and discovery does not resolve the
+		// config that managed it.
+		if vacated, ok := renamedAwaySchemaPath(file); ok {
+			removes, err := ic.pathRemovedFromDefaultBranch(ctx, repo, headSHA, defaultTipSHA, vacated, levelCache)
+			if err != nil {
+				return nil, defaultTipSHA, err
+			}
+			if removes {
+				keep = true
+			} else {
+				file.PreviousFilename = ""
+			}
 		}
-
-		switch {
-		case headFound != defaultFound:
-			// Added by this pull request, or deleted by it.
-			proposed = append(proposed, file)
-		case headFound && (headObjectSHA != defaultObjectSHA || headObjectType != defaultObjectType):
+		if keep {
 			proposed = append(proposed, file)
 		}
 	}
 	return proposed, defaultTipSHA, nil
+}
+
+// pathDiffersFromDefaultBranch reports whether objectPath at headSHA differs
+// from the default branch tip: added, deleted, or changed in content or type.
+func (ic *InstallationClient) pathDiffersFromDefaultBranch(ctx context.Context, repo, headSHA, defaultTipSHA, objectPath string, levelCache map[string][]TreeEntry) (bool, error) {
+	headObjectSHA, headObjectType, headFound, err := ic.resolveGitObjectSHA(ctx, repo, headSHA, objectPath, levelCache)
+	if err != nil {
+		return false, fmt.Errorf("resolve %s at head %s: %w", objectPath, headSHA, err)
+	}
+	defaultObjectSHA, defaultObjectType, defaultFound, err := ic.resolveGitObjectSHA(ctx, repo, defaultTipSHA, objectPath, levelCache)
+	if err != nil {
+		return false, fmt.Errorf("resolve %s at default branch tip %s: %w", objectPath, defaultTipSHA, err)
+	}
+	if headFound != defaultFound {
+		// Added by this pull request, or deleted by it.
+		return true, nil
+	}
+	return headFound && (headObjectSHA != defaultObjectSHA || headObjectType != defaultObjectType), nil
+}
+
+// pathRemovedFromDefaultBranch reports whether merging headSHA removes
+// objectPath: the default branch tip holds it and the head does not.
+func (ic *InstallationClient) pathRemovedFromDefaultBranch(ctx context.Context, repo, headSHA, defaultTipSHA, objectPath string, levelCache map[string][]TreeEntry) (bool, error) {
+	_, _, headFound, err := ic.resolveGitObjectSHA(ctx, repo, headSHA, objectPath, levelCache)
+	if err != nil {
+		return false, fmt.Errorf("resolve vacated %s at head %s: %w", objectPath, headSHA, err)
+	}
+	if headFound {
+		return false, nil
+	}
+	_, _, defaultFound, err := ic.resolveGitObjectSHA(ctx, repo, defaultTipSHA, objectPath, levelCache)
+	if err != nil {
+		return false, fmt.Errorf("resolve vacated %s at default branch tip %s: %w", objectPath, defaultTipSHA, err)
+	}
+	return defaultFound, nil
 }
 
 // CheckRunOptions contains options for creating or updating a GitHub Check Run.

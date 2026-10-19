@@ -9,6 +9,9 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/block/schemabot/pkg/state"
+	"github.com/block/schemabot/pkg/storage"
 )
 
 // drivePassesDeadline bounds a run of claim passes in these tests, and how
@@ -47,4 +50,20 @@ func TestDrivePassesDoesNotRetryAFailedClaim(t *testing.T) {
 
 	assert.Equal(t, 1, ops.claims, "a failed claim must not send the driver into another pass")
 	assert.Equal(t, 1, applies.stopProbes, "the ladder runs exactly once")
+}
+
+// Only a claim that starts an operation wakes a peer driver. A retry
+// redispatch, or a recovery that re-leases a crashed drive, must not, or a
+// fast failure would hand the same retry from peer to peer at claim speed.
+func TestClaimStartsOperationOnlyForStarts(t *testing.T) {
+	for claimedFrom, starts := range map[string]bool{
+		state.ApplyOperation.Pending:         true,
+		state.ApplyOperation.Stopped:         true,
+		state.ApplyOperation.Running:         false,
+		state.ApplyOperation.FailedRetryable: false,
+		state.ApplyOperation.Resuming:        false,
+	} {
+		assert.Equal(t, starts, claimStartsOperation(&storage.ApplyOperation{State: claimedFrom}),
+			"a claim from %s", claimedFrom)
+	}
 }

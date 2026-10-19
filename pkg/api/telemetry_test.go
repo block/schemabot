@@ -1285,3 +1285,7 @@ func TestResumeClaimedApplyCountsARefusedTaskRequeue(t *testing.T) {
 		})
 	}
 }
+
+func (*mockPlanStore) GetListAnchor(context.Context, string) (*storage.PlanListAnchor, error) {
+	return nil, nil
+}

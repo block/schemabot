@@ -382,7 +382,7 @@ func backdateOperationLease(t *testing.T, ctx context.Context, store *Storage, o
 // Exercise both orderings at the candidate-scan boundary using actual row locks
 // and the public operation claim. Parent claims alone cannot protect fan-out.
 func testRetryableExpiryOperationFence(t *testing.T, newStore func(*testing.T) *Storage) {
-	for _, scenario := range []string{"claim wins", "expiry wins", "busy sibling", "heartbeat wins", "cutover claim wins", "expiry blocks cutover"} {
+	for _, scenario := range []string{"claim wins", "expiry wins", "busy sibling", "heartbeat wins", "cutover claim yields", "expiry blocks cutover"} {
 		t.Run(scenario, func(t *testing.T) {
 			ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 			defer cancel()
@@ -403,7 +403,7 @@ func testRetryableExpiryOperationFence(t *testing.T, newStore func(*testing.T) *
 				require.NoError(t, err)
 				opIDs = append(opIDs, id)
 			}
-			if scenario == "cutover claim wins" || scenario == "expiry blocks cutover" {
+			if scenario == "cutover claim yields" || scenario == "expiry blocks cutover" {
 				_, err = store.db.ExecContext(ctx, "UPDATE apply_operations SET state = ?, cutover_policy = ?, updated_at = "+staleHeartbeat+" WHERE id = ?", state.ApplyOperation.Completed, storage.CutoverPolicyParallel, opIDs[0])
 				require.NoError(t, err)
 				_, err = store.db.ExecContext(ctx, "UPDATE apply_operations SET state = ?, cutover_policy = ?, updated_at = "+staleHeartbeat+" WHERE id = ?", state.ApplyOperation.WaitingForCutover, storage.CutoverPolicyParallel, opIDs[1])
@@ -445,16 +445,21 @@ func testRetryableExpiryOperationFence(t *testing.T, newStore func(*testing.T) *
 			require.NoError(t, tx.QueryRowContext(ctx, "SELECT id FROM applies WHERE id = ? AND state = ? AND attempt >= ? AND "+gate+" FOR UPDATE", args...).Scan(&id))
 
 			switch scenario {
-			case "claim wins", "cutover claim wins":
-				claim := store.ApplyOperations().FindNextApplyOperation
-				if scenario == "cutover claim wins" {
-					claim = store.ApplyOperations().FindNextApplyOperationCutover
-				}
-				claimed, err := claim(ctx, "new-driver")
+			case "claim wins":
+				claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "new-driver")
 				require.NoError(t, err)
 				require.NotNil(t, claimed)
 				assert.False(t, lockUndrivenApply(ctx, t, expiryStore, tx, apply.ID),
 					"lease recheck must reject a claim made after candidate selection")
+			case "cutover claim yields":
+				// The cutover claim admits a swap only under the parent apply's
+				// row lock, which candidate selection already holds, so it
+				// backs off rather than commit inside expiry's window.
+				claimed, err := store.ApplyOperations().FindNextApplyOperationCutover(ctx, "new-driver")
+				require.NoError(t, err)
+				assert.Nil(t, claimed, "cutover claim must back off while expiry holds the parent apply")
+				assert.True(t, lockUndrivenApply(ctx, t, expiryStore, tx, apply.ID),
+					"expiry keeps the tree the cutover claim backed off from")
 			case "heartbeat wins":
 				err := store.ApplyOperations().Heartbeat(storage.WithOperationLease(ctx, storage.OperationLease{ApplyID: apply.ID, OperationID: opIDs[0], Token: "old-token"}), opIDs[0])
 				require.NoError(t, err)

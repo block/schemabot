@@ -163,21 +163,76 @@ func TestRunStrandedReaperPassAnswersAStartStrandedOnASettledApply(t *testing.T)
 	})
 }
 
-// A revert left pending on an apply whose revert window expired into a
-// completed outcome is answered by the reaper as not applied: the change is
-// live on the target, so reporting the revert carried out would be false, and
-// leaving it pending would have every later pass list it again.
-func TestRunStrandedReaperPassAnswersARevertStrandedOnACompletedApply(t *testing.T) {
-	apply := &storage.Apply{ID: 9, ApplyIdentifier: "apply-window-expired", State: state.Apply.Completed}
-	svc, controls := strandedControlRequestReaperService(apply,
-		[]*storage.StrandedControlRequest{strandedRequest(apply, storage.ControlOperationRevert)},
-		storage.ControlOperationRevert)
+// A revert or skip-revert left pending on a settled apply is answered by the
+// reaper from the outcome, the same way the drive tail's terminal sweep answers
+// it: a revert took effect only if the apply reverted, and a skip-revert only if
+// it completed. A revert the completed schema change outran fails with a reason
+// saying the change is live, rather than staying pending and being re-listed on
+// every pass.
+func TestRunStrandedReaperPassAnswersRevertPhaseRequestsStrandedOnASettledApply(t *testing.T) {
+	tests := []struct {
+		name          string
+		applyState    string
+		op            storage.ControlOperation
+		wantCompleted []storage.ControlOperation
+		wantFailed    []storage.ControlOperation
+		wantReason    string
+	}{
+		{name: "a revert the completed apply outran fails", applyState: state.Apply.Completed, op: storage.ControlOperationRevert,
+			wantFailed: []storage.ControlOperation{storage.ControlOperationRevert},
+			wantReason: "the schema change completed before the revert could take effect; the change is live on the target"},
+		{name: "a skip-revert on a completed apply completes", applyState: state.Apply.Completed, op: storage.ControlOperationSkipRevert,
+			wantCompleted: []storage.ControlOperation{storage.ControlOperationSkipRevert}},
+		{name: "a revert on a reverted apply completes", applyState: state.Apply.Reverted, op: storage.ControlOperationRevert,
+			wantCompleted: []storage.ControlOperation{storage.ControlOperationRevert}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			apply := &storage.Apply{ID: 9, ApplyIdentifier: "apply-settled", State: tt.applyState}
+			svc, controls := strandedControlRequestReaperService(apply,
+				[]*storage.StrandedControlRequest{strandedRequest(apply, tt.op)}, tt.op)
 
-	svc.runStrandedReaperPass(t.Context())
+			svc.runStrandedReaperPass(t.Context())
 
-	assert.Empty(t, controls.completed)
-	assert.Equal(t, []storage.ControlOperation{storage.ControlOperationRevert}, controls.failed)
-	assert.Equal(t, []string{"the schema change completed before the revert could take effect; the change is live on the target"}, controls.failureReasons)
+			assert.Equal(t, tt.wantCompleted, controls.completed)
+			assert.Equal(t, tt.wantFailed, controls.failed)
+			if tt.wantReason != "" {
+				assert.Equal(t, []string{tt.wantReason}, controls.failureReasons)
+			}
+			assert.Empty(t, controls.pending, "a request the reaper visited must not stay pending for the next pass")
+		})
+	}
+}
+
+// A request no drive will consume once the apply has settled is completed by
+// the reaper rather than re-listed on every pass. A retired operation has no
+// driver left to serve it. A release recorded on a paused on_failure=pause
+// rollout stays pending as the rollout's latch until the apply settles; it is
+// completed, which keeps the rollout released.
+func TestRunStrandedReaperPassCompletesRequestsNoDriveConsumesOnASettledApply(t *testing.T) {
+	retired := storage.RetiredControlOperations()
+	require.NotEmpty(t, retired, "the retired-operation case needs a retired operation to strand")
+	tests := []struct {
+		name       string
+		applyState string
+		op         storage.ControlOperation
+	}{
+		{name: "a retired operation's request completes", applyState: state.Apply.Completed, op: retired[0]},
+		{name: "a release on a failed apply completes", applyState: state.Apply.Failed, op: storage.ControlOperationRelease},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			apply := &storage.Apply{ID: 9, ApplyIdentifier: "apply-settled", State: tt.applyState}
+			svc, controls := strandedControlRequestReaperService(apply,
+				[]*storage.StrandedControlRequest{strandedRequest(apply, tt.op)}, tt.op)
+
+			svc.runStrandedReaperPass(t.Context())
+
+			assert.Equal(t, []storage.ControlOperation{tt.op}, controls.completed)
+			assert.Empty(t, controls.failed)
+			assert.Empty(t, controls.pending, "a request the reaper visited must not stay pending for the next pass")
+		})
+	}
 }
 
 // The listing is per request but the settlement is per apply: it reloads the

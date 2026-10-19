@@ -590,6 +590,37 @@ func (s *Service) executeCutoverForApply(ctx context.Context, client tern.Client
 		metrics.RecordControlOperation(ctx, "cutover", apply.Database, apply.Deployment, apply.Environment, "error")
 		return nil, 0, err
 	}
+	// One member's cutover in progress does not make the request redundant
+	// for the rest of a multi-operation apply: under an ordered policy another
+	// member can be parked and free to cut over at the same time. The turn is
+	// decided before the in-progress answer, so the request lands on that
+	// member, and the in-progress answer is left for when nothing is.
+	var turn cutoverTurn
+	if multiOp && (readiness == cutoverRequestReady || readiness == cutoverRequestAlreadyInProgress) {
+		turn, err = s.cutoverTurnForRequest(ctx, apply)
+		if err != nil {
+			err := fmt.Errorf("check cutover order for apply %s: %w", apply.ApplyIdentifier, err)
+			metrics.RecordControlOperation(ctx, "cutover", apply.Database, apply.Deployment, apply.Environment, "error")
+			return nil, 0, err
+		}
+		if hold := turn.hold; hold != nil {
+			s.logger.Info("cutover request rejected because an earlier member holds every parked member",
+				append(apply.LogAttrs(),
+					"requested_by", caller,
+					"parked_member", hold.parked,
+					"blocking_member", hold.blocker,
+					"blocking_state", hold.blockerState)...)
+			err := controlConflictf("%s", hold.message())
+			metrics.RecordControlOperation(ctx, "cutover", apply.Database, apply.Deployment, apply.Environment, "rejected")
+			return nil, 0, err
+		}
+		switch {
+		case turn.taker != nil:
+			readiness = cutoverRequestReady
+		case turn.inProgress:
+			readiness = cutoverRequestAlreadyInProgress
+		}
+	}
 	if readiness == cutoverRequestAlreadyInProgress {
 		metrics.RecordControlOperation(ctx, "cutover", apply.Database, apply.Deployment, apply.Environment, "success")
 		s.logControlOperationForApply(ctx, apply, caller, storage.LogEventCutoverTriggered,
@@ -612,26 +643,6 @@ func (s *Service) executeCutoverForApply(ctx context.Context, client tern.Client
 		metrics.RecordControlOperation(ctx, "cutover", apply.Database, apply.Deployment, apply.Environment, "rejected")
 		return nil, 0, err
 	}
-	var turn cutoverTurn
-	if multiOp {
-		turn, err = s.cutoverTurnForRequest(ctx, apply)
-		if err != nil {
-			err := fmt.Errorf("check cutover order for apply %s: %w", apply.ApplyIdentifier, err)
-			metrics.RecordControlOperation(ctx, "cutover", apply.Database, apply.Deployment, apply.Environment, "error")
-			return nil, 0, err
-		}
-		if hold := turn.hold; hold != nil {
-			s.logger.Info("cutover request rejected because no parked member is at its turn",
-				append(apply.LogAttrs(),
-					"requested_by", caller,
-					"parked_member", hold.parked,
-					"blocking_member", hold.blocker,
-					"blocking_state", hold.blockerState)...)
-			err := controlConflictf("%s", hold.message())
-			metrics.RecordControlOperation(ctx, "cutover", apply.Database, apply.Deployment, apply.Environment, "rejected")
-			return nil, 0, err
-		}
-	}
 	cutoverReq := &storage.ApplyControlRequest{
 		ApplyID:     apply.ID,
 		Operation:   storage.ControlOperationCutover,
@@ -639,7 +650,7 @@ func (s *Service) executeCutoverForApply(ctx context.Context, client tern.Client
 		RequestedBy: caller,
 	}
 	if turn.taker != nil {
-		// Bind the request to the member whose turn it is, so this one command
+		// Bind the request to the member that takes it, so this one command
 		// cuts over that member and cannot pass on to the next one.
 		cutoverReq.Metadata = storage.CutoverRequestMetadata(turn.taker.ID)
 	}
@@ -737,50 +748,65 @@ func (s *Service) cutoverRequestReadiness(ctx context.Context, client tern.Clien
 
 // cutoverTurnHold names the members of an ordered rollout when a cutover
 // request has no member that could take it: the first parked member, and the
-// earlier member whose turn it still is.
+// earlier member whose state holds it.
 type cutoverTurnHold struct {
-	parked       string
-	blocker      string
-	blockerState string
-	// blockerFailed is set when the blocker ended without completing, so the
-	// rollout's on_failure policy (blockerOnFailure) is what holds later
-	// cutovers behind it.
-	blockerFailed    bool
+	parked           string
+	blocker          string
+	blockerState     string
 	blockerOnFailure string
 }
 
-// message is the refusal an operator reads: which member holds the turn, its
-// state, and what lets the rollout go on from there.
+// message is the refusal an operator reads: which member holds the cutover,
+// its state, and what lets the rollout go on from there (storage
+// CutoverBlocker). An earlier target of the same deployment holds only in a
+// state the rollout halts on, so each of those cases names the one action
+// that clears it; an earlier deployment holds until it has completed, so the
+// default case names the member to wait for.
 func (h *cutoverTurnHold) message() string {
-	if h.blockerFailed {
+	switch h.blockerState {
+	case state.ApplyOperation.Failed:
 		next := "stop the schema change, or fix the failure and apply again"
 		if h.blockerOnFailure == storage.OnFailurePause {
 			next = "release the rollout to continue past it, or stop the schema change"
 		}
-		return fmt.Sprintf("cutover follows rollout order: %s is %s ahead of %s, and on_failure %s holds every later cutover; %s",
-			h.blocker, h.blockerState, h.parked, h.blockerOnFailure, next)
+		return fmt.Sprintf("cutover is held: %s failed ahead of %s, and on_failure %s holds every later cutover; %s",
+			h.blocker, h.parked, h.blockerOnFailure, next)
+	case state.ApplyOperation.FailedRetryable:
+		return fmt.Sprintf("cutover is held: %s is retrying a failure ahead of %s; run cutover again once %s recovers",
+			h.blocker, h.parked, h.blocker)
+	case state.ApplyOperation.Stopped:
+		return fmt.Sprintf("cutover is held: %s is stopped ahead of %s; start the schema change to resume it, or cancel it",
+			h.blocker, h.parked)
+	case state.ApplyOperation.Cancelled, state.ApplyOperation.Reverted:
+		return fmt.Sprintf("cutover is held: %s was %s ahead of %s, so later members do not cut over; stop the schema change and apply again",
+			h.blocker, h.blockerState, h.parked)
+	default:
+		return fmt.Sprintf("cutover follows deployment order: %s is in an earlier deployment than %s and is %s; run cutover again once %s has completed",
+			h.blocker, h.parked, h.blockerState, h.blocker)
 	}
-	return fmt.Sprintf("cutover follows rollout order: %s is ahead of %s and is %s; run cutover again once %s has completed",
-		h.blocker, h.parked, h.blockerState, h.blocker)
 }
 
 // cutoverTurn is the intake's answer for a cutover request on a
-// multi-operation apply. taker is the parked operation whose turn it is, which
-// the request is bound to; hold is set instead when no parked member may take
-// the request now. Both are nil when the apply's cutover is unordered, or when
-// no member is parked by task evidence, which leaves the decision to the
+// multi-operation apply. taker is the first parked operation whose cutover has
+// not started and that no earlier member holds, which the request is bound
+// to; hold is set instead when an earlier member holds every such operation.
+// inProgress reports, under an ordered policy with no taker and no hold, that
+// a member's cutover has already started, so the request has nothing left to
+// start. All are unset when the apply's cutover is unordered, or when no
+// member is parked by task evidence, which leaves the decision to the
 // caller's readiness check.
 type cutoverTurn struct {
-	taker *storage.ApplyOperation
-	hold  *cutoverTurnHold
+	taker      *storage.ApplyOperation
+	hold       *cutoverTurnHold
+	inProgress bool
 }
 
 // cutoverTurnForRequest decides which member of a multi-operation apply that
 // has a member parked at cutover may take a cutover request now. The request is
-// apply-level and only a parked member whose turn it is may take it (the
-// drive's own gate, operationCutoverRequestTurn in pkg/tern), so accepting one
-// while every parked member waits on an earlier member would queue it for a
-// consumer that is not there yet. A parked member under an unordered cutover
+// apply-level and only a parked member no earlier member holds may take it
+// (the drive's own gate, operationCutoverRequestTurn in pkg/tern), so
+// accepting one while an earlier member holds every parked member would queue
+// it for a consumer that is not there yet. A parked member under an unordered cutover
 // policy takes the request as it always has. The turn is decided by storage
 // CutoverBlocker, the rule the automatic cutover claim follows.
 func (s *Service) cutoverTurnForRequest(ctx context.Context, apply *storage.Apply) (cutoverTurn, error) {
@@ -797,19 +823,22 @@ func (s *Service) cutoverTurnForRequest(ctx context.Context, apply *storage.Appl
 	if err != nil {
 		return cutoverTurn{}, fmt.Errorf("load tasks for apply %s: %w", apply.ApplyIdentifier, err)
 	}
-	parked := make(map[int64]bool, len(ops))
+	tasksByOp := make(map[int64][]*storage.Task, len(ops))
 	for _, task := range tasks {
 		if task.ApplyOperationID == nil {
 			continue
 		}
-		if state.IsState(task.State, state.Task.WaitingForCutover, state.Task.CuttingOver) {
-			parked[*task.ApplyOperationID] = true
-		}
+		tasksByOp[*task.ApplyOperationID] = append(tasksByOp[*task.ApplyOperationID], task)
 	}
 	names := memberDisplayNames(ops)
 	var turn cutoverTurn
+	cutoverStarted := false
 	for i, op := range ops {
-		if !parked[op.ID] {
+		if cutoverStartedOnTasks(tasksByOp[op.ID]) {
+			cutoverStarted = true
+			continue
+		}
+		if !parkedOnTasks(tasksByOp[op.ID]) {
 			continue
 		}
 		if !storage.IsOrderedCutoverPolicy(op.CutoverPolicy) {
@@ -826,13 +855,39 @@ func (s *Service) cutoverTurnForRequest(ctx context.Context, apply *storage.Appl
 			turn.hold = &cutoverTurnHold{
 				parked:           names[i],
 				blocker:          memberDisplayName(ops, names, blocker),
-				blockerState:     blocker.State,
-				blockerFailed:    state.IsApplyOperationTerminal(blocker.State) && !state.IsState(blocker.State, state.ApplyOperation.Completed),
+				blockerState:     blocker.CutoverHoldState(tasksByOp[blocker.ID]),
 				blockerOnFailure: blocker.OnFailure,
 			}
 		}
 	}
+	if turn.hold == nil {
+		turn.inProgress = cutoverStarted
+	}
 	return turn, nil
+}
+
+// parkedOnTasks reports whether an operation's tasks are parked at the
+// cutover.
+func parkedOnTasks(tasks []*storage.Task) bool {
+	for _, task := range tasks {
+		if state.IsState(task.State, state.Task.WaitingForCutover) {
+			return true
+		}
+	}
+	return false
+}
+
+// cutoverStartedOnTasks reports whether an operation's cutover has started:
+// one of its tasks is cutting over. A request cuts over a member's remote
+// apply as a whole, so a member that has started is not one a later request
+// can take again.
+func cutoverStartedOnTasks(tasks []*storage.Task) bool {
+	for _, task := range tasks {
+		if state.IsState(task.State, state.Task.CuttingOver) {
+			return true
+		}
+	}
+	return false
 }
 
 // memberDisplayNames resolves the operator-facing name of every operation of
@@ -1319,7 +1374,7 @@ func (s *Service) queueStopForApplyOwner(ctx context.Context, apply *storage.App
 		s.logger.Info("stop requested for a task-less apply; recording the durable request for the task-less settle path",
 			append(apply.LogAttrs(), "requested_by", caller)...)
 	}
-	supersedesStart, err := s.stopSupersedesPendingStart(ctx, apply, caller)
+	supersedesStart, err := tern.StopSupersedesPendingStart(ctx, s.storage, s.logger, apply, caller)
 	if err != nil {
 		return nil, "", err
 	}
@@ -1339,69 +1394,6 @@ func (s *Service) queueStopForApplyOwner(ctx context.Context, apply *storage.App
 		StoppedCount: stoppedCount,
 		SkippedCount: skippedCount,
 	}, "", nil
-}
-
-// stopSupersedesPendingStart reports whether a stop recorded on this apply
-// supersedes a pending start, which the stop's own write then completes in the
-// same transaction. An apply driven under the operation lease keeps its start
-// pending until it settles, because the operations the start resumes are
-// claimed one at a time on its behalf, and a pending start on a stopped apply
-// is what reopens it. Left pending under the new stop, that start would resume
-// the apply as soon as the stop landed on every operation. A stop is only
-// accepted for a non-terminal apply, so the start it supersedes has already
-// taken effect. An apply driven under the parent lease consumes its start when
-// its drive resumes, so its start is left to that drive.
-func (s *Service) stopSupersedesPendingStart(ctx context.Context, apply *storage.Apply, caller string) (bool, error) {
-	controlStore := s.storage.ControlRequests()
-	if controlStore == nil {
-		return false, fmt.Errorf("control request store is not available")
-	}
-	start, err := controlStore.GetPending(ctx, apply.ID, storage.ControlOperationStart)
-	if err != nil {
-		return false, fmt.Errorf("load pending start request for apply %s before recording a stop: %w", apply.ApplyIdentifier, err)
-	}
-	if start == nil {
-		return false, nil
-	}
-	ops, err := s.storage.ApplyOperations().ListByApply(ctx, apply.ID)
-	if err != nil {
-		return false, fmt.Errorf("list apply_operations for apply %s before recording a stop: %w", apply.ApplyIdentifier, err)
-	}
-	operationLease, err := s.applyDrivesUnderOperationLease(ctx, apply, ops)
-	if err != nil {
-		return false, fmt.Errorf("decide drive mode of apply %s before recording a stop: %w", apply.ApplyIdentifier, err)
-	}
-	if !operationLease {
-		s.logger.Info("stop requested while a start is pending on an apply driven under the parent lease; leaving the start to the drive that resumes it",
-			append(apply.LogAttrs(), "requested_by", caller, "start_requested_by", start.RequestedBy, "operation_count", len(ops))...)
-		return false, nil
-	}
-	s.logger.Info("stop requested while a start is pending on an apply driven under the operation lease; the stop write completes the start it supersedes",
-		append(apply.LogAttrs(), "requested_by", caller, "start_requested_by", start.RequestedBy, "operation_count", len(ops))...)
-	return true, nil
-}
-
-// applyDrivesUnderOperationLease reports whether the apply's operations are
-// driven under the operation lease, with the parent projected from them, rather
-// than under the parent lease. It mirrors the drive-mode decision in
-// recoverApplyOperation: a rollout of several operations, a lone operation
-// whose generation manifest still expects siblings, and a lone task-less
-// operation all drive under the operation lease. An apply with no operation
-// attached has not been driven yet, so no drive mode applies.
-func (s *Service) applyDrivesUnderOperationLease(ctx context.Context, apply *storage.Apply, ops []*storage.ApplyOperation) (bool, error) {
-	switch {
-	case len(ops) == 0:
-		return false, nil
-	case len(ops) > 1:
-		return true, nil
-	case len(apply.MissingExpectedOperationKeys(ops)) > 0:
-		return true, nil
-	}
-	hasTasks, err := s.claimedOperationHasTasks(ctx, ops[0])
-	if err != nil {
-		return false, err
-	}
-	return !hasTasks, nil
 }
 
 func stopRequestCounts(tasks []*storage.Task) (int64, int64) {

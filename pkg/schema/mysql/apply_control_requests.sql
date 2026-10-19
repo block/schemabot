@@ -9,6 +9,7 @@ CREATE TABLE `apply_control_requests` (
   `completed_at` datetime DEFAULT NULL,
   `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
   `updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  `revision` bigint NOT NULL DEFAULT '0',
   PRIMARY KEY (`id`),
   UNIQUE KEY `idx_apply_control_request_apply_operation` (`apply_id`,`operation`),
   KEY `idx_apply_control_request_status` (`status`,`created_at`)

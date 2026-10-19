@@ -920,7 +920,7 @@ func rolloutShapeRefusalMessage(refused *api.RolloutShapeRefusedError, command, 
 			if tenant != "" {
 				unlock += " --tenant " + tenant
 			}
-			return fmt.Sprintf("A rollback to more than one deployment is not supported yet when a deployment has several targets. Release this PR's lock with `%s`, then revert the schema files in a new PR and apply it one target at a time, starting with %s.", unlock, narrowed)
+			return fmt.Sprintf("A rollback to more than one deployment is not currently supported when a deployment has several targets. Release this PR's lock with `%s`, then revert the schema files in a new PR and apply it one target at a time, starting with %s.", unlock, narrowed)
 		}
 		return "An apply to more than one deployment is not supported yet when a deployment has several targets. Apply one target at a time, starting with " + narrowed + "."
 	}

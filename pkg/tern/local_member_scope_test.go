@@ -19,9 +19,15 @@ import (
 
 // perOperationResumeStore answers each operation's engine resume state with a
 // context naming that operation, so a test can tell whose engine state a
-// control call carried.
+// control call carried. blocker is the earlier member CutoverBlocker reports
+// as holding every cutover, nil when nothing holds.
 type perOperationResumeStore struct {
 	*exactProgressApplyOperationStore
+	blocker *storage.ApplyOperation
+}
+
+func (s *perOperationResumeStore) CutoverBlocker(context.Context, int64) (*storage.ApplyOperation, error) {
+	return s.blocker, nil
 }
 
 func (s *perOperationResumeStore) GetEngineResumeState(_ context.Context, operationID int64) (*storage.EngineResumeState, error) {
@@ -87,7 +93,7 @@ func newSharedApplyFixture(firstState, secondState, firstTaskState, secondTaskSt
 			applies:         &exactProgressApplyStore{apply: apply},
 			tasks:           &exactProgressTaskStore{tasks: []*storage.Task{firstTask, secondTask}},
 			controlRequests: controlRequests,
-			applyOperations: &perOperationResumeStore{&exactProgressApplyOperationStore{ops: []*storage.ApplyOperation{first, second}}},
+			applyOperations: &perOperationResumeStore{exactProgressApplyOperationStore: &exactProgressApplyOperationStore{ops: []*storage.ApplyOperation{first, second}}},
 		},
 		spiritEngine: eng,
 		logger:       slog.Default(),
@@ -199,6 +205,31 @@ func TestLocalClient_BoundCutoverIsTakenOnlyByItsOwnMembersDrive(t *testing.T) {
 
 	require.NoError(t, fx.client.processPendingCutoverControlRequest(t.Context(), fx.apply, []*storage.Task{fx.secondTask}))
 	assert.Equal(t, []string{"ctx-op-12"}, fx.engine.cutoverContexts, "the bound member's drive swaps that member alone")
+	assert.Equal(t, storage.ControlRequestCompleted, fx.controlRequests.requests[0].Status)
+}
+
+// An operator's cutover for payments-002 was accepted and bound to it while
+// payments-001 was still copying, and payments-001 then failed under
+// `on_failure: halt` before payments-002's drive took the request. The drive
+// re-checks the hold when it takes the request, so payments-002 does not cut
+// over past the failure: the request stays pending, and is taken once nothing
+// holds payments-002 any longer.
+func TestLocalClient_BoundCutoverIsHeldByAnEarlierMemberThatFailedAfterAcceptance(t *testing.T) {
+	fx := newSharedApplyFixture(state.ApplyOperation.Failed, state.ApplyOperation.WaitingForCutover, state.Task.Failed, state.Task.WaitingForCutover)
+	fx.controlRequests.requests = []*storage.ApplyControlRequest{{
+		ID: 1, ApplyID: fx.apply.ID, Operation: storage.ControlOperationCutover, Status: storage.ControlRequestPending,
+		RequestedBy: "cli:alice", Metadata: storage.CutoverRequestMetadata(fx.second.ID),
+	}}
+	opStore := fx.client.storage.(*exactProgressStorage).applyOperations.(*perOperationResumeStore)
+	opStore.blocker = fx.first
+
+	require.NoError(t, fx.client.processPendingCutoverControlRequest(t.Context(), fx.apply, []*storage.Task{fx.secondTask}))
+	assert.Empty(t, fx.engine.cutoverContexts, "a held member must not cut over past the earlier failure")
+	assert.Equal(t, storage.ControlRequestPending, fx.controlRequests.requests[0].Status, "the acknowledged request waits for the hold to clear")
+
+	opStore.blocker = nil
+	require.NoError(t, fx.client.processPendingCutoverControlRequest(t.Context(), fx.apply, []*storage.Task{fx.secondTask}))
+	assert.Equal(t, []string{"ctx-op-12"}, fx.engine.cutoverContexts, "once nothing holds it, the bound member's drive takes the request")
 	assert.Equal(t, storage.ControlRequestCompleted, fx.controlRequests.requests[0].Status)
 }
 
