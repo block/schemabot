@@ -260,6 +260,14 @@ type Service struct {
 	// what storage records. It must not block: the drive waits on it.
 	OnStoppedApplyClaimed func(apply *storage.Apply)
 
+	// OnQueuedStartWithdrawn is called after a stop withdrew a start no driver
+	// had acted on, whatever surface sent the stop. The apply never left
+	// stopped, so no drive runs to update its PR, which would otherwise end on
+	// the start's acknowledgement. Set by the webhook handler to tell the PR
+	// the start was withdrawn. caller is the stop's caller. It must not block:
+	// the stop's response waits on it.
+	OnQueuedStartWithdrawn func(apply *storage.Apply, caller string)
+
 	// OnApplyTerminalSummary is called after an apply is terminalized by the
 	// aggregate projection CAS or by retryable expiry. Set by the webhook handler to publish the
 	// apply-level terminal PR summary and refresh GitHub check state; the

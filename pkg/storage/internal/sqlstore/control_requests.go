@@ -383,6 +383,57 @@ func (s *controlRequestStore) recordStopTx(ctx context.Context, tx *rebindTx, st
 	return s.getByIDForUpdate(ctx, tx, id)
 }
 
+// UpdateMetadata rewrites a request's metadata under a row lock. See
+// storage.ControlRequestStore.
+func (s *controlRequestStore) UpdateMetadata(ctx context.Context, applyID int64, operation storage.ControlOperation, update func(*storage.ApplyControlRequest) ([]byte, error)) (bool, error) {
+	var found bool
+	err := withLockRetry(ctx, s.classifier, fmt.Sprintf("update %s control request metadata for apply %d", operation, applyID), func() error {
+		var attemptErr error
+		found, attemptErr = s.updateMetadata(ctx, applyID, operation, update)
+		return attemptErr
+	})
+	if err != nil {
+		return false, err
+	}
+	return found, nil
+}
+
+func (s *controlRequestStore) updateMetadata(ctx context.Context, applyID int64, operation storage.ControlOperation, update func(*storage.ApplyControlRequest) ([]byte, error)) (bool, error) {
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	if err != nil {
+		return false, fmt.Errorf("begin %s control request metadata update for apply %d: %w", operation, applyID, err)
+	}
+	defer rollbackTx(ctx, tx, "update control request metadata")
+
+	req, err := s.getByApplyOperationForUpdate(ctx, tx, applyID, operation)
+	if err != nil {
+		return false, err
+	}
+	if req == nil {
+		return false, nil
+	}
+	metadata, err := update(req)
+	if err != nil {
+		return true, fmt.Errorf("update metadata of %s control request for apply %d: %w", operation, applyID, err)
+	}
+	if metadata == nil {
+		return true, nil
+	}
+	// updated_at = updated_at keeps the column's ON UPDATE default from
+	// stamping a metadata rewrite as a change to the request itself.
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE apply_control_requests
+		SET metadata = ?, updated_at = updated_at
+		WHERE id = ?
+	`, nullJSON(metadata), req.ID); err != nil {
+		return true, fmt.Errorf("write metadata of %s control request for apply %d: %w", operation, applyID, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return true, fmt.Errorf("commit metadata of %s control request for apply %d: %w", operation, applyID, err)
+	}
+	return true, nil
+}
+
 func (s *controlRequestStore) GetPending(ctx context.Context, applyID int64, operation storage.ControlOperation) (*storage.ApplyControlRequest, error) {
 	row := s.db.QueryRowContext(ctx, `
 		SELECT `+controlRequestColumns+`

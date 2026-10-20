@@ -152,6 +152,9 @@ that no other apply is active on the same target, then hands the work to a
 fresh driver, continuing from engine checkpoints rather than starting over.
 A `stop` sent before any driver has acted on that `start` withdraws it: the
 apply stays `stopped` and the response carries `"status": "start_withdrawn"`.
+When the apply belongs to a PR, the PR is told: a `stop` command on the PR says
+so in its reply, and a `stop` sent from anywhere else gets a "Start Withdrawn"
+comment on the PR.
 A `stop` on a `stopped` apply with no `start` waiting is refused with
 `409 already_stopped`.
 
