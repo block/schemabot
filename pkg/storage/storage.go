@@ -1787,6 +1787,18 @@ type ControlRequestStore interface {
 	// failed request leaves the superseded one still deliverable.
 	RequestPendingSuperseding(ctx context.Context, req *ApplyControlRequest, superseded ControlOperation) (*ApplyControlRequest, bool, error)
 
+	// StopQueuedStart records stop against a stopped apply whose start request
+	// no driver has acted on yet, completing that start in the same
+	// transaction. It locks the apply and its operation rows, so it is ordered
+	// against every claim that would resume the apply: a claim that already
+	// took the apply out of stopped leaves nothing written and the outcome says
+	// so. The stop is recorded completed when nothing is left to stop, and
+	// pending when operationLease is set and an operation was already claimed,
+	// so the drive that claimed it stands down. operationLease reports whether
+	// the apply's operations are driven under their own leases (see
+	// tern.ApplyDrivesUnderOperationLease).
+	StopQueuedStart(ctx context.Context, stop *ApplyControlRequest, operationLease bool) (*ApplyControlRequest, QueuedStartStop, error)
+
 	// GetPending returns the pending request for an apply operation.
 	GetPending(ctx context.Context, applyID int64, operation ControlOperation) (*ApplyControlRequest, error)
 

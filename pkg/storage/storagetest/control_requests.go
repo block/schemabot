@@ -1,6 +1,7 @@
 package storagetest
 
 import (
+	"fmt"
 	"sync"
 	"testing"
 
@@ -117,6 +118,159 @@ func TestControlRequests(t *testing.T, h Harness) {
 		stop, err := store.ControlRequests().GetByOperation(ctx, applyID, storage.ControlOperationStop)
 		require.NoError(t, err)
 		assert.Nil(t, stop)
+	})
+
+	requestStart := func(t *testing.T, store storage.Storage, applyID int64) {
+		t.Helper()
+		_, _, err := store.ControlRequests().RequestPending(t.Context(), &storage.ApplyControlRequest{
+			ApplyID: applyID, Operation: storage.ControlOperationStart, Status: storage.ControlRequestPending, RequestedBy: "start-operator",
+		})
+		require.NoError(t, err)
+	}
+	stopRequest := func(applyID int64) *storage.ApplyControlRequest {
+		return &storage.ApplyControlRequest{
+			ApplyID: applyID, Operation: storage.ControlOperationStop, Status: storage.ControlRequestPending, RequestedBy: "stop-operator",
+			Metadata: []byte(`{"stopped_count":2}`),
+		}
+	}
+	requireRequestStatus := func(t *testing.T, store storage.Storage, applyID int64, operation storage.ControlOperation, want storage.ControlRequestStatus) *storage.ApplyControlRequest {
+		t.Helper()
+		row, err := store.ControlRequests().GetByOperation(t.Context(), applyID, operation)
+		require.NoError(t, err)
+		require.NotNil(t, row, "%s request row", operation)
+		assert.Equal(t, want, row.Status, "%s request status", operation)
+		return row
+	}
+	// insertOperations attaches one operation per state to the apply.
+	insertOperations := func(t *testing.T, store storage.Storage, applyID int64, opStates ...string) {
+		t.Helper()
+		for i, opState := range opStates {
+			id, err := store.ApplyOperations().Insert(t.Context(), &storage.ApplyOperation{ApplyID: applyID, Deployment: fmt.Sprintf("region-%d", i), OperationKey: "schema"})
+			require.NoError(t, err)
+			require.NoError(t, store.ApplyOperations().UpdateState(t.Context(), id, opState))
+		}
+	}
+
+	// StopQueuedStart_WithdrawsTheStart verifies that a stop arriving while a
+	// stopped rollout's start waits for its first claim withdraws that start and
+	// is itself answered on the spot: both requests are completed, so no claim
+	// resumes the rollout and no stop is left pending on a stopped apply, where
+	// no drive would ever consume it.
+	t.Run("StopQueuedStart_WithdrawsTheStart", func(t *testing.T) {
+		store := h.NewStorage(t)
+		applyID := createControlRequestApply(t, store, "control_withdraw_db", "apply_control_withdraw")
+		insertOperations(t, store, applyID, state.ApplyOperation.Stopped, state.ApplyOperation.Stopped)
+		requestStart(t, store, applyID)
+
+		stop, outcome, err := store.ControlRequests().StopQueuedStart(t.Context(), stopRequest(applyID), true)
+		require.NoError(t, err)
+		assert.Equal(t, storage.QueuedStartWithdrawn, outcome)
+		require.NotNil(t, stop)
+		assert.Equal(t, storage.ControlRequestCompleted, stop.Status)
+		assert.Equal(t, "stop-operator", stop.RequestedBy)
+		assert.JSONEq(t, `{"stopped_count":2}`, string(stop.Metadata))
+		assert.NotNil(t, stop.CompletedAt)
+
+		requireRequestStatus(t, store, applyID, storage.ControlOperationStart, storage.ControlRequestCompleted)
+		requireRequestStatus(t, store, applyID, storage.ControlOperationStop, storage.ControlRequestCompleted)
+	})
+
+	// StopQueuedStart_LeavesTheStopToAClaimedOperation verifies that once a
+	// claim has moved one of a rollout's operations to resuming, the stop is
+	// recorded pending for the drive that holds it, so that drive stands down,
+	// while the start it would otherwise resume the rest of the rollout under
+	// is still withdrawn.
+	t.Run("StopQueuedStart_LeavesTheStopToAClaimedOperation", func(t *testing.T) {
+		store := h.NewStorage(t)
+		applyID := createControlRequestApply(t, store, "control_withdraw_claimed_db", "apply_control_withdraw_claimed")
+		insertOperations(t, store, applyID, state.ApplyOperation.Resuming, state.ApplyOperation.Stopped)
+		requestStart(t, store, applyID)
+
+		stop, outcome, err := store.ControlRequests().StopQueuedStart(t.Context(), stopRequest(applyID), true)
+		require.NoError(t, err)
+		assert.Equal(t, storage.QueuedStartStopPending, outcome)
+		require.NotNil(t, stop)
+		assert.Equal(t, storage.ControlRequestPending, stop.Status)
+		assert.Nil(t, stop.CompletedAt)
+
+		requireRequestStatus(t, store, applyID, storage.ControlOperationStart, storage.ControlRequestCompleted)
+		requireRequestStatus(t, store, applyID, storage.ControlOperationStop, storage.ControlRequestPending)
+	})
+
+	// StopQueuedStart_ParentLeaseClaimNeedsNoStop verifies that an apply driven
+	// under its own lease gets a completed stop even when an operation was
+	// claimed: that drive must claim the apply itself before it resumes
+	// anything, and the claim refuses once the start is no longer pending.
+	t.Run("StopQueuedStart_ParentLeaseClaimNeedsNoStop", func(t *testing.T) {
+		store := h.NewStorage(t)
+		applyID := createControlRequestApply(t, store, "control_withdraw_parent_db", "apply_control_withdraw_parent")
+		insertOperations(t, store, applyID, state.ApplyOperation.Resuming)
+		requestStart(t, store, applyID)
+
+		_, outcome, err := store.ControlRequests().StopQueuedStart(t.Context(), stopRequest(applyID), false)
+		require.NoError(t, err)
+		assert.Equal(t, storage.QueuedStartWithdrawn, outcome)
+		requireRequestStatus(t, store, applyID, storage.ControlOperationStart, storage.ControlRequestCompleted)
+		requireRequestStatus(t, store, applyID, storage.ControlOperationStop, storage.ControlRequestCompleted)
+	})
+
+	// StopQueuedStart_RearmsASettledStop verifies the stop row an earlier stop
+	// left completed is re-armed with the new caller and a new revision,
+	// keeping one row per apply and operation.
+	t.Run("StopQueuedStart_RearmsASettledStop", func(t *testing.T) {
+		store := h.NewStorage(t)
+		applyID := createControlRequestApply(t, store, "control_withdraw_rearm_db", "apply_control_withdraw_rearm")
+		earlier, _, err := store.ControlRequests().RequestPending(t.Context(), &storage.ApplyControlRequest{
+			ApplyID: applyID, Operation: storage.ControlOperationStop, Status: storage.ControlRequestPending, RequestedBy: "earlier-operator",
+		})
+		require.NoError(t, err)
+		require.NoError(t, store.ControlRequests().CompletePending(t.Context(), applyID, storage.ControlOperationStop))
+		requestStart(t, store, applyID)
+
+		stop, outcome, err := store.ControlRequests().StopQueuedStart(t.Context(), stopRequest(applyID), true)
+		require.NoError(t, err)
+		assert.Equal(t, storage.QueuedStartWithdrawn, outcome)
+		require.NotNil(t, stop)
+		assert.Equal(t, earlier.ID, stop.ID)
+		assert.Equal(t, "stop-operator", stop.RequestedBy)
+		assert.Equal(t, storage.ControlRequestCompleted, stop.Status)
+		assert.Equal(t, earlier.Revision+1, stop.Revision, "re-arming advances the revision")
+	})
+
+	// StopQueuedStart_WritesNothingOnceAClaimResumedTheApply verifies that a
+	// claim which already moved the apply out of stopped wins: nothing is
+	// written, so the start that claim acted on stays pending for its drive,
+	// and the stop is left to the path for a running apply.
+	t.Run("StopQueuedStart_WritesNothingOnceAClaimResumedTheApply", func(t *testing.T) {
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "control_withdraw_resumed_db", storage.DatabaseTypeMySQL)
+		apply := CreateApplyWithStateAndEnv(t, store, lock, "apply_control_withdraw_resumed", 801, state.Apply.Resuming, "staging")
+		requestStart(t, store, apply.ID)
+
+		stop, outcome, err := store.ControlRequests().StopQueuedStart(t.Context(), stopRequest(apply.ID), true)
+		require.NoError(t, err)
+		assert.Equal(t, storage.QueuedStartApplyNotStopped, outcome)
+		assert.Nil(t, stop)
+		requireRequestStatus(t, store, apply.ID, storage.ControlOperationStart, storage.ControlRequestPending)
+		row, err := store.ControlRequests().GetByOperation(t.Context(), apply.ID, storage.ControlOperationStop)
+		require.NoError(t, err)
+		assert.Nil(t, row)
+	})
+
+	// StopQueuedStart_WritesNothingWithoutAQueuedStart verifies a stop on a
+	// stopped apply with no start waiting records nothing: there is nothing
+	// for it to stop.
+	t.Run("StopQueuedStart_WritesNothingWithoutAQueuedStart", func(t *testing.T) {
+		store := h.NewStorage(t)
+		applyID := createControlRequestApply(t, store, "control_withdraw_none_db", "apply_control_withdraw_none")
+
+		stop, outcome, err := store.ControlRequests().StopQueuedStart(t.Context(), stopRequest(applyID), true)
+		require.NoError(t, err)
+		assert.Equal(t, storage.QueuedStartNone, outcome)
+		assert.Nil(t, stop)
+		row, err := store.ControlRequests().GetByOperation(t.Context(), applyID, storage.ControlOperationStop)
+		require.NoError(t, err)
+		assert.Nil(t, row)
 	})
 
 	// RequestPending_ConcurrentFirstRequests verifies concurrent operator
@@ -752,6 +906,14 @@ func TestControlRequests(t *testing.T, h Harness) {
 	t.Run("ClearRemoteFailure_DBError", func(t *testing.T) {
 		store := h.NewUnreachableStorage(t)
 		_, err := store.ControlRequests().ClearRemoteFailure(t.Context(), 1, storage.ControlOperationStart)
+		require.Error(t, err)
+	})
+
+	t.Run("StopQueuedStart_DBError", func(t *testing.T) {
+		store := h.NewUnreachableStorage(t)
+		_, _, err := store.ControlRequests().StopQueuedStart(t.Context(), &storage.ApplyControlRequest{
+			ApplyID: 1, Operation: storage.ControlOperationStop, Status: storage.ControlRequestPending,
+		}, true)
 		require.Error(t, err)
 	})
 

@@ -958,6 +958,9 @@ type StopData struct {
 	StoppedCount   int
 	SkippedCount   int
 	ProgressBefore int // Progress percentage before stop
+	// StartWithdrawn reports that the schema change was still stopped and the
+	// stop withdrew a start that had not taken effect, so no table was stopped.
+	StartWithdrawn bool
 }
 
 // WriteStopSuccess writes the stop command success output.
@@ -966,11 +969,16 @@ func WriteStopSuccess(data StopData) {
 	fmt.Println()
 	fmt.Printf("Database:    %s\n", data.Database)
 	fmt.Printf("Environment: %s\n", data.Environment)
-	if data.StoppedCount > 0 {
-		fmt.Printf("Stopped:     %d table(s)\n", data.StoppedCount)
-	}
-	if data.SkippedCount > 0 {
-		fmt.Printf("Skipped:     %d table(s) (already complete)\n", data.SkippedCount)
+	if data.StartWithdrawn {
+		fmt.Println()
+		fmt.Println("The start requested earlier had not taken effect yet, so this stop withdrew it.")
+	} else {
+		if data.StoppedCount > 0 {
+			fmt.Printf("Stopped:     %d table(s)\n", data.StoppedCount)
+		}
+		if data.SkippedCount > 0 {
+			fmt.Printf("Skipped:     %d table(s) (already complete)\n", data.SkippedCount)
+		}
 	}
 	fmt.Println()
 	if data.ApplyID != "" {
