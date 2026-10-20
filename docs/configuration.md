@@ -259,6 +259,47 @@ The PostgreSQL shape differs from MySQL in three ways:
   endpoint fails resolution: a verified CA is required, and the ambient trust
   store is never an implicit fallback.
 
+### Etre inventory environment mapping
+
+A logical environment can use clusters hosted in another infrastructure
+environment. Configure `environment_mapping` on the Etre resolver to change
+only the `env_label` selector:
+
+```yaml
+target_resolver:
+  etre:
+    - addr: https://etre.example.com
+      database_type: mysql
+      entity_type: cluster
+      target_label: dsid
+      env_label: env
+      environment_mapping:
+        sandbox: production
+      mysql:
+        host_field: writer_endpoint
+      credentials:
+        type: secret_ref
+        username: ddl
+        password_ref: env:DDL_PASSWORD
+```
+
+A sandbox request for `orders-002` queries `dsid=orders-002,env=production`.
+The exact target is unchanged. Credentials come from that resolved entity;
+credential resolvers still receive the original logical request. Schema names,
+plans, applies, checks and lifecycle requests retain `sandbox`.
+This does not rewrite `orders_sandbox` to `orders_production`.
+
+Unmapped environments retain their request name. Values are literal inventory
+labels, never recursive aliases or fallback queries. A mapping requires
+`env_label`, and keys and values must be nonempty lowercase environment names
+containing only letters, digits, underscores or hyphens, starting with a letter
+or digit. Requests still require an environment when `env_label` is set.
+
+Environment mapping is server-owned routing configuration (AZ-1). Before
+changing it, hold affected work, drain active or resumable applies, deploy
+consistent configuration to every replica, discard old plans, and replan.
+Never resume stored work across a mapping change.
+
 ### Etre targets with more than one match
 
 An `etre` resolver expects its lookup to match one entity. Some inventories

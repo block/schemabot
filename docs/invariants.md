@@ -1850,11 +1850,13 @@ plan, because re-resolving is exactly the step that could produce a different an
 the operator reviewed.
 
 The stored route binds the logical target and deployment, not a MySQL schema
-override within that target. Adding, changing, or removing an override requires
+override within that target or an inventory environment mapping. Adding, changing,
+or removing either requires
 holding affected operations, draining or retiring resumable applies, deploying
 consistent configuration to every replica, and discarding old plans before
 re-planning. This procedure is an operational prerequisite; durable schema-mapping
-binding across driver restarts is not enforced. See [schema override rollout](configuration.md#per-target-schema-overrides).
+binding across driver restarts is not enforced. See [schema override rollout](configuration.md#per-target-schema-overrides)
+and [inventory environment mapping](configuration.md#etre-inventory-environment-mapping).
 
 The schema source is held to the same standard, and checked twice. A repository and a path inside
 it count as a source for a database only because server config says so, verified when the plan is
@@ -1862,8 +1864,9 @@ made and verified again before the apply runs. Config that cannot answer the que
 refusal, never a default. *Breaks if violated:* a change reviewed against one database is applied
 to another. *Enforced:* server-side routing (`pkg/tern/target_router.go`), the schema override
 allowlist (`pkg/tern/local_client.go`, validated by `pkg/inventory/static.go`), configured
-resolver identity assertions (`pkg/inventory/overrides.go`), rollout member
-selection (`pkg/api/rollout_member_selector.go`, `applyTargets` in `pkg/api/plan_handlers.go`), the PostgreSQL
+resolver identity assertions (`pkg/inventory/overrides.go`), discovery scoped to the
+configured inventory environment (`pkg/etre/resolver.go`), rollout member selection
+(`pkg/api/rollout_member_selector.go`, `applyTargets` in `pkg/api/plan_handlers.go`), the PostgreSQL
 apply's check that planned DDL names the schema it targets (`pkg/engine/postgres/apply.go`), and
 source policy (`pkg/webhook/schema_source_policy.go`).
 
