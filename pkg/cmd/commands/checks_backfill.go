@@ -218,6 +218,7 @@ scanning:
 		page := 1
 		repoScanned := 0
 		repoEstimate := 0
+		repoStart := report.mark()
 		for {
 			chunk, err := cmdclient.ChecksScan(ctx, endpoint, apitypes.ChecksScanRequest{
 				Repo:         repo,
@@ -230,6 +231,9 @@ scanning:
 				// "2d" verbatim would fail the first page and abort the
 				// sweep. The report keeps the spelling the operator used.
 				StuckAfter: stuckAfter.String(),
+				// This command handles the not-installed skip below, so the
+				// server may answer with it instead of an error.
+				ReportAppNotInstalled: true,
 			})
 			if canceled := backfillCanceledError(err, stopProgress); canceled != nil {
 				return canceled
@@ -239,8 +243,12 @@ scanning:
 			}
 			// The server skips repos whose Check Run publishing is turned
 			// off rather than reporting every open PR as missing; record the
-			// skip for the report and move to the next repo.
+			// skip for the report and move to the next repo. A skip can land
+			// on a later page (the config or installation changed mid-scan),
+			// so it also drops whatever this repo's earlier pages added: a
+			// skipped repo has no findings, and none of them reach synthesis.
 			if chunk.ChecksDisabled {
+				held -= report.rollback(repoStart, checkNamesSeen)
 				skippedByServer[repo] = true
 				report.SkippedDisabled = append(report.SkippedDisabled, repo)
 				continue scanning
@@ -254,6 +262,7 @@ scanning:
 				if !cmd.AllRepos {
 					return appNotInstalledError(repo, chunk.GitHubApp)
 				}
+				held -= report.rollback(repoStart, checkNamesSeen)
 				skippedByServer[repo] = true
 				report.SkippedAppNotInstalled = append(report.SkippedAppNotInstalled, repo)
 				continue scanning
@@ -336,6 +345,37 @@ scanning:
 		return err
 	}
 	return attentionExitError(report)
+}
+
+// checksScanMark is how much of a report existed before one repository's scan
+// began.
+type checksScanMark struct {
+	actions, stuck, scanned, checkNames int
+}
+
+func (r *checksBackfillReport) mark() checksScanMark {
+	return checksScanMark{actions: len(r.Actions), stuck: len(r.Stuck), scanned: r.Scanned, checkNames: len(r.CheckNames)}
+}
+
+// rollback removes everything added to the report since m, for a repository
+// the server skipped after some of its pages were already scanned, and
+// returns how many held PRs it removed. A repository's findings are appended
+// contiguously, so truncating to the mark removes exactly that repository's.
+func (r *checksBackfillReport) rollback(m checksScanMark, checkNamesSeen map[string]bool) int {
+	held := 0
+	for _, action := range r.Actions[m.actions:] {
+		if action.Held {
+			held++
+		}
+	}
+	for _, name := range r.CheckNames[m.checkNames:] {
+		delete(checkNamesSeen, name)
+	}
+	r.Actions = r.Actions[:m.actions]
+	r.Stuck = r.Stuck[:m.stuck]
+	r.Scanned = m.scanned
+	r.CheckNames = r.CheckNames[:m.checkNames]
+	return held
 }
 
 // appNotInstalledError tells the operator who named repo that its GitHub App

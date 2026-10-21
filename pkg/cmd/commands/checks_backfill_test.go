@@ -513,14 +513,18 @@ func lineContaining(t *testing.T, rendered, needle string) string {
 }
 
 // checksBackfillFleetServer serves a fleet sweep: the declared repositories,
-// then each repository's single-page scan from scans. A repository listed in
-// scanErrors answers its scan with that server error instead. It records the
-// repositories scanned, in order.
+// then each repository's scan pages from scans, and a synthesize that recreates
+// every requested PR's Check Run. A repository listed in scanErrors answers
+// its scan with that server error instead. It records the repositories
+// scanned, in order, and the PRs sent for synthesis.
 type checksBackfillFleetServer struct {
 	*httptest.Server
 
-	mu      sync.Mutex
-	scanned []string
+	mu          sync.Mutex
+	scanned     []string
+	synthesized map[string][]int
+	// optedIn is false once any scan request omitted report_app_not_installed.
+	optedIn bool
 }
 
 func (s *checksBackfillFleetServer) scannedRepos() []string {
@@ -529,8 +533,33 @@ func (s *checksBackfillFleetServer) scannedRepos() []string {
 	return slices.Clone(s.scanned)
 }
 
-func newChecksBackfillFleetServer(t *testing.T, declared []string, scans map[string]apitypes.ChecksScanResponse, scanErrors map[string]string) *checksBackfillFleetServer {
-	fleet := &checksBackfillFleetServer{}
+func (s *checksBackfillFleetServer) synthesizedPRs() map[string][]int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make(map[string][]int, len(s.synthesized))
+	for repo, prs := range s.synthesized {
+		out[repo] = slices.Clone(prs)
+	}
+	return out
+}
+
+func (s *checksBackfillFleetServer) everyScanOptedIn() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.optedIn
+}
+
+// singlePage serves each repository's scan as one page.
+func singlePage(scans map[string]apitypes.ChecksScanResponse) map[string][]apitypes.ChecksScanResponse {
+	pages := make(map[string][]apitypes.ChecksScanResponse, len(scans))
+	for repo, scan := range scans {
+		pages[repo] = []apitypes.ChecksScanResponse{scan}
+	}
+	return pages
+}
+
+func newChecksBackfillFleetServer(t *testing.T, declared []string, scans map[string][]apitypes.ChecksScanResponse, scanErrors map[string]string) *checksBackfillFleetServer {
+	fleet := &checksBackfillFleetServer{synthesized: map[string][]int{}, optedIn: true}
 	fleet.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
@@ -544,18 +573,34 @@ func newChecksBackfillFleetServer(t *testing.T, declared []string, scans map[str
 			}
 			fleet.mu.Lock()
 			fleet.scanned = append(fleet.scanned, req.Repo)
+			fleet.optedIn = fleet.optedIn && req.ReportAppNotInstalled
 			fleet.mu.Unlock()
 			if message, ok := scanErrors[req.Repo]; ok {
 				w.WriteHeader(http.StatusInternalServerError)
 				assert.NoError(t, json.NewEncoder(w).Encode(apitypes.ErrorResponse{Error: message}))
 				return
 			}
-			scan, ok := scans[req.Repo]
-			if !assert.True(t, ok, "unexpected scan of %s", req.Repo) {
+			page := max(req.Page, 1)
+			pages := scans[req.Repo]
+			if !assert.LessOrEqual(t, page, len(pages), "unexpected scan of %s page %d", req.Repo, page) {
 				w.WriteHeader(http.StatusInternalServerError)
 				return
 			}
-			assert.NoError(t, json.NewEncoder(w).Encode(scan))
+			assert.NoError(t, json.NewEncoder(w).Encode(pages[page-1]))
+		case "/api/checks/synthesize":
+			var req apitypes.ChecksSynthesizeRequest
+			if !assert.NoError(t, json.NewDecoder(r.Body).Decode(&req)) {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			fleet.mu.Lock()
+			fleet.synthesized[req.Repo] = append(fleet.synthesized[req.Repo], req.PRs...)
+			fleet.mu.Unlock()
+			response := apitypes.ChecksSynthesizeResponse{Repo: req.Repo}
+			for _, pr := range req.PRs {
+				response.Results = append(response.Results, apitypes.ChecksSynthesizeResult{PR: pr, Outcome: "created 1 Check Run"})
+			}
+			assert.NoError(t, json.NewEncoder(w).Encode(response))
 		default:
 			t.Errorf("unexpected request path %s", r.URL.Path)
 			w.WriteHeader(http.StatusNotFound)
@@ -597,7 +642,7 @@ func fleetScansWithOneUninstalledRepo() ([]string, map[string]apitypes.ChecksSca
 // the full report.
 func TestChecksBackfillAllReposSkipsRepoWithoutTheAppInstalled(t *testing.T) {
 	declared, scans := fleetScansWithOneUninstalledRepo()
-	server := newChecksBackfillFleetServer(t, declared, scans, nil)
+	server := newChecksBackfillFleetServer(t, declared, singlePage(scans), nil)
 
 	cmd := &ChecksBackfillCmd{AllRepos: true, Environment: "staging", Last: "2h", DryRun: true, StuckAfter: "1h", JSON: true}
 	var runErr error
@@ -606,6 +651,7 @@ func TestChecksBackfillAllReposSkipsRepoWithoutTheAppInstalled(t *testing.T) {
 	})
 
 	assert.Equal(t, declared, server.scannedRepos(), "the repository after the skipped one is still scanned")
+	assert.True(t, server.everyScanOptedIn(), "every scan tells the server this command handles the not-installed skip")
 	require.Error(t, runErr)
 	assert.EqualError(t, runErr, "checks backfill left 1 PR with missing Check Runs and 1 repository without the GitHub App installed needing attention")
 
@@ -625,7 +671,7 @@ func TestChecksBackfillAllReposSkipsRepoWithoutTheAppInstalled(t *testing.T) {
 // scanned.
 func TestChecksBackfillAllReposReportsTheUninstalledRepoSkip(t *testing.T) {
 	declared, scans := fleetScansWithOneUninstalledRepo()
-	server := newChecksBackfillFleetServer(t, declared, scans, nil)
+	server := newChecksBackfillFleetServer(t, declared, singlePage(scans), nil)
 
 	cmd := &ChecksBackfillCmd{AllRepos: true, Environment: "staging", DryRun: true, StuckAfter: "1h"}
 	var runErr error
@@ -653,7 +699,7 @@ func TestChecksBackfillAllReposStopsWhenAScanFails(t *testing.T) {
 	scanErrors := map[string]string{
 		"octo/flaky": `resolve GitHub App "staging" installation for octo/flaky: find installation for octo/flaky: GET https://api.github.com/repos/octo/flaky/installation: 502 Bad Gateway []`,
 	}
-	server := newChecksBackfillFleetServer(t, declared, scans, scanErrors)
+	server := newChecksBackfillFleetServer(t, declared, singlePage(scans), scanErrors)
 
 	cmd := &ChecksBackfillCmd{AllRepos: true, Environment: "staging", DryRun: true, StuckAfter: "1h", JSON: true}
 	var runErr error
@@ -673,7 +719,7 @@ func TestChecksBackfillAllReposStopsWhenAScanFails(t *testing.T) {
 // wrong and how to fix it instead of reporting a skip.
 func TestChecksBackfillNamedRepoWithoutTheAppInstalledFails(t *testing.T) {
 	declared, scans := fleetScansWithOneUninstalledRepo()
-	server := newChecksBackfillFleetServer(t, declared, scans, nil)
+	server := newChecksBackfillFleetServer(t, declared, singlePage(scans), nil)
 
 	cmd := &ChecksBackfillCmd{Repo: "octo/onboarding", DryRun: true, StuckAfter: "1h", JSON: true}
 	var runErr error
@@ -705,4 +751,66 @@ func TestWriteChecksBackfillReportNoRepoHasTheAppInstalled(t *testing.T) {
 		"Skipped repositories the server's GitHub App is not installed on: octo/new, octo/newer. Install the App on each, or remove it from the server's repos config.\n",
 		out.String())
 	assert.EqualError(t, attentionExitError(report), "checks backfill left 2 repositories without the GitHub App installed needing attention")
+}
+
+// The App can be uninstalled from a repository while a sweep is paging through
+// it, so the skip arrives after earlier pages already reported findings. Those
+// findings belong to a repository the App can no longer act on: they are
+// dropped with the rest of the repository, never sent for synthesis, and the
+// healthy repository after it is still repaired.
+func TestChecksBackfillDropsTheFindingsOfARepoUninstalledMidScan(t *testing.T) {
+	declared := []string{"octo/alpha", "octo/zeta"}
+	scans := map[string][]apitypes.ChecksScanResponse{
+		"octo/alpha": {
+			{
+				Repo:       "octo/alpha",
+				CheckNames: []string{"SchemaBot (staging)"},
+				Scanned:    2,
+				NextPage:   2,
+				Missing: []apitypes.MissingCheckPR{
+					{Number: 3, URL: "https://github.com/octo/alpha/pull/3", Title: "add index", HeadSHA: "sha3", MissingNames: []string{"SchemaBot (staging)"}},
+					{Number: 4, URL: "https://github.com/octo/alpha/pull/4", Title: "held", HeadSHA: "sha4", MissingNames: []string{"SchemaBot (staging)"}},
+				},
+				Stuck: []apitypes.StuckCheckPR{
+					{
+						Number: 4, URL: "https://github.com/octo/alpha/pull/4", Title: "held", HeadSHA: "sha4",
+						Checks: []apitypes.IncompleteCheckRun{{Name: "SchemaBot (production)", CheckRunID: 40, Status: "queued"}},
+					},
+				},
+			},
+			{Repo: "octo/alpha", AppNotInstalled: true, GitHubApp: "staging"},
+		},
+		"octo/zeta": {
+			{
+				Repo:       "octo/zeta",
+				CheckNames: []string{"SchemaBot (staging)"},
+				Scanned:    4,
+				Missing: []apitypes.MissingCheckPR{
+					{Number: 8, URL: "https://github.com/octo/zeta/pull/8", Title: "add column", HeadSHA: "sha8", MissingNames: []string{"SchemaBot (staging)"}},
+				},
+			},
+		},
+	}
+	server := newChecksBackfillFleetServer(t, declared, scans, nil)
+
+	cmd := &ChecksBackfillCmd{AllRepos: true, Environment: "staging", StuckAfter: "1h", JSON: true}
+	var runErr error
+	output := captureStdout(func() {
+		runErr = cmd.Run(t.Context(), &Globals{Endpoint: server.URL})
+	})
+
+	assert.Equal(t, map[string][]int{"octo/zeta": {8}}, server.synthesizedPRs(), "only the healthy repository's PRs are sent for synthesis")
+	require.Error(t, runErr)
+	assert.EqualError(t, runErr, "checks backfill left 1 repository without the GitHub App installed needing attention")
+
+	var report checksBackfillReport
+	require.NoError(t, json.Unmarshal([]byte(output), &report))
+	assert.Equal(t, []string{"octo/zeta"}, report.Repos)
+	assert.Equal(t, []string{"octo/alpha"}, report.SkippedAppNotInstalled)
+	assert.Equal(t, 4, report.Scanned, "the skipped repository's pages do not count as scanned")
+	assert.Empty(t, report.Stuck, "the skipped repository's stuck runs are dropped with it")
+	require.Len(t, report.Actions, 1)
+	assert.Equal(t, "octo/zeta", report.Actions[0].Repo)
+	assert.Equal(t, 8, report.Actions[0].PR)
+	assert.Equal(t, "created 1 Check Run", report.Actions[0].Outcome)
 }

@@ -445,11 +445,13 @@ func executeChecksScanWith(ctx context.Context, cfg *ServerConfig, store storage
 		return nil, err
 	}
 	installationClient, err := resolve(ctx, app, req.Repo, logger)
-	if errors.Is(err, ghclient.ErrAppNotInstalled) {
+	if errors.Is(err, ghclient.ErrAppNotInstalled) && req.ReportAppNotInstalled {
 		// GitHub confirmed the App has no installation covering the repo, so
 		// there is nothing this App can scan or recreate there. Report the
-		// skip as a normal response so a fleet sweep keeps going; every other
-		// lookup failure leaves coverage unknown and stays an error below.
+		// skip as a normal response so a fleet sweep keeps going. A caller
+		// that did not ask for the skip gets the error below instead: it
+		// would ignore the flag and read the repo as scanned clean. Every
+		// other lookup failure leaves coverage unknown and stays an error.
 		logger.Warn("checks scan skipping repository: its GitHub App is not installed on it; install the App on the repository or remove the repository from the repos config",
 			"operation", "checks_scan", "repo", req.Repo, "environment", req.Environment, "github_app", app.Name, "error", err)
 		return &ChecksScanResponse{Repo: req.Repo, AppNotInstalled: true, GitHubApp: app.Name}, nil

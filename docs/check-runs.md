@@ -679,7 +679,9 @@ the checks that instance owns:
   answers the installation lookup with 404, for example while the repository's
   onboarding is still in progress) is also skipped by an `--all-repos` sweep
   and named in the report. Unlike a disabled repository it makes the run exit
-  nonzero, since the sweep never read it. Naming such a repository explicitly
+  nonzero, since the sweep never read it. A repository skipped part-way
+  through its pages drops whatever its earlier pages found, so none of it is
+  sent for recreation. Naming such a repository explicitly
   fails with the App and repository to fix. Any other scan failure — a GitHub
   5xx, timeout, rate limit, or auth error — stops the sweep, because a
   repository that could not be read is not one with nothing to backfill.

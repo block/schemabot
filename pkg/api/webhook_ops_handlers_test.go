@@ -1015,7 +1015,7 @@ func TestExecuteChecksScanSkipsRepoWithoutTheAppInstalled(t *testing.T) {
 	var logs bytes.Buffer
 	logger := slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
-	response, err := executeChecksScanWith(t.Context(), cfg, nil, ChecksScanRequest{Repo: "octo/onboarding", Environment: "staging"}, logger, resolve)
+	response, err := executeChecksScanWith(t.Context(), cfg, nil, ChecksScanRequest{Repo: "octo/onboarding", Environment: "staging", ReportAppNotInstalled: true}, logger, resolve)
 	require.NoError(t, err)
 	assert.True(t, response.AppNotInstalled)
 	assert.Equal(t, "main", response.GitHubApp)
@@ -1034,6 +1034,27 @@ func TestExecuteChecksScanSkipsRepoWithoutTheAppInstalled(t *testing.T) {
 	assert.Equal(t, "staging", entry["environment"])
 	assert.Equal(t, "main", entry["github_app"])
 	assert.Contains(t, entry["error"], "404 Not Found")
+}
+
+// A caller that does not say it handles the not-installed skip predates it,
+// and would ignore the flag and read the unread repository as scanned clean.
+// It gets the lookup error instead, naming the App and the repository.
+func TestExecuteChecksScanFailsForACallerThatDoesNotReportTheSkip(t *testing.T) {
+	t.Parallel()
+
+	cfg := &ServerConfig{
+		Apps:  map[string]GitHubAppConfig{"main": {AppID: "1", PrivateKey: "key"}},
+		Repos: map[string]RepoConfig{"octo/onboarding": {GitHubApp: "main"}},
+	}
+	notInstalled := fmt.Errorf("find installation for octo/onboarding: %w: GET https://api.github.com/repos/octo/onboarding/installation: 404 Not Found []", ghclient.ErrAppNotInstalled)
+	resolve := checksScanResolverByRepo(nil, map[string]error{"octo/onboarding": notInstalled})
+
+	response, err := executeChecksScanWith(t.Context(), cfg, nil, ChecksScanRequest{Repo: "octo/onboarding"}, discardLogger(), resolve)
+	require.Error(t, err)
+	assert.Nil(t, response)
+	require.ErrorIs(t, err, ghclient.ErrAppNotInstalled)
+	assert.Contains(t, err.Error(), `resolve GitHub App "main" installation for octo/onboarding`)
+	assert.Contains(t, err.Error(), "GitHub App is not installed on the repository")
 }
 
 // Any installation lookup failure other than GitHub confirming the App is not
