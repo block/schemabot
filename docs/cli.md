@@ -1000,6 +1000,19 @@ when findings remain; do not treat every nonzero exit as a transport error.
 This is an admin operation. See [PR recovery](pre-merge-workflow.md) for the
 workflow and automatic recovery behavior.
 
+An `--all-repos` sweep skips a declared repository the server's GitHub App is
+not installed on, names it, and keeps scanning the rest. The skip still makes
+the run exit nonzero, because that repository was never read. Any other scan
+failure stops the sweep.
+
+```console
+$ schemabot checks backfill --all-repos -e staging --last 2h --dry-run
+Scanned 6 open PRs updated in the last 2h in acme/store, acme/ledger for SchemaBot (staging).
+Skipped repositories the server's GitHub App is not installed on: acme/payroll. Install the App on each, or remove it from the server's repos config.
+No missing SchemaBot Check Runs found.
+Error: checks backfill left 1 repository without the GitHub App installed needing attention
+```
+
 A sweep that does find unfinished checks says what each one is waiting on, so
 the report can be triaged without opening every pull request in it:
 

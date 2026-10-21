@@ -275,6 +275,14 @@ type ChecksScanResponse struct {
 	// PR would trivially be missing a check the server refuses to create.
 	// When set, no PRs were scanned and the other fields are zero.
 	ChecksDisabled bool `json:"checks_disabled,omitempty"`
+	// AppNotInstalled reports that GitHub has no installation of the
+	// repository's configured GitHub App (the installation lookup answered
+	// 404), so the scan was skipped: the App can neither read nor publish the
+	// repository's Check Runs. GitHubApp names the configured App. When set, no
+	// PRs were scanned and the other fields are zero. Any other lookup failure
+	// is an error response, never this flag.
+	AppNotInstalled bool   `json:"app_not_installed,omitempty"`
+	GitHubApp       string `json:"github_app,omitempty"`
 	// EstimatedOpenPRs is the repository's total open-PR count as GitHub
 	// reports it for this page's listing — an upper bound while more pages
 	// remain, exact on the final page. Recomputed every page so the caller
