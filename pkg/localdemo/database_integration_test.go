@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/block/schemabot/pkg/localdocker"
 	"github.com/block/schemabot/pkg/mysqlconn"
 	"github.com/block/schemabot/pkg/postgresconn"
 	"github.com/block/spirit/pkg/utils"
@@ -62,7 +63,7 @@ func TestSampleDatabaseLifecycle(t *testing.T) {
 			c, err := inspect(ctx, sample.Name)
 			require.NoError(t, err)
 			// NetworkSettings may omit stopped bindings; inspect the configured host port.
-			port, err := run(ctx, nil, "inspect", "--format", "{{range .HostConfig.PortBindings}}{{(index . 0).HostPort}}{{end}}", sample.Name)
+			port, err := localdocker.Run(ctx, nil, "inspect", "--format", "{{range .HostConfig.PortBindings}}{{(index . 0).HostPort}}{{end}}", sample.Name)
 			require.NoError(t, err)
 			require.False(t, c.State.Running)
 			occupied, err := new(net.ListenConfig).Listen(ctx, "tcp4", net.JoinHostPort("127.0.0.1", strings.TrimSpace(string(port))))

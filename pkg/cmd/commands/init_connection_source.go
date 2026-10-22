@@ -34,7 +34,7 @@ func resolveInitConnection(ref string) (string, error) {
 }
 
 func normalizeInitConnection(engine, value string) (string, error) {
-	if engine == "mysql" && strings.HasPrefix(value, "mysql://") {
+	if (engine == "mysql" || engine == "vitess") && strings.HasPrefix(value, "mysql://") {
 		u, err := url.Parse(value)
 		if err != nil || u.Hostname() == "" || u.User == nil || u.Fragment != "" {
 			return "", fmt.Errorf("check the MySQL connection string format")
@@ -57,7 +57,7 @@ func normalizeInitConnection(engine, value string) (string, error) {
 	return value, nil
 }
 
-// Persist only after the final review. Stable identities make retries reuse the
+// Persist only after explicit credential confirmation. Stable identities make retries reuse the
 // same reference; a changed secret cannot overwrite an existing runtime's file.
 func saveInitConnection(runtime, database, environment, purpose, dsn string) (string, error) {
 	home, err := os.UserHomeDir()

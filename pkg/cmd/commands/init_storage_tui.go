@@ -16,26 +16,37 @@ func (m *initWizard) storageChoiceView() string {
 		b.WriteString(green.Render("✓ Database connected") + "\n\n")
 	}
 	b.WriteString(bold.Render("Where should SchemaBot store its own data?") + "\n\n")
-	for _, choice := range []struct {
+	choices := []struct {
 		label, hint string
 		integrated  bool
 	}{
 		{"Integrated", "A simple setup for a single database project.", true},
 		{"Standalone", "A good fit for teams managing multiple databases.", false},
-	} {
+	}
+	selected := m.integrated
+	if m.isVitess() {
+		choices[0].label = "Local (Docker)"
+		choices[0].hint = "A simple setup on this computer. Requires Docker."
+		selected = m.localStorage
+	}
+	for _, choice := range choices {
 		label := "  " + choice.label
-		if choice.integrated == m.integrated {
+		if choice.integrated == selected {
 			label = blue.Render("› " + choice.label)
 		}
 		b.WriteString(label + "\n  " + muted.Render(choice.hint) + "\n\n")
 	}
 	engine := "MySQL"
-	if m.fields[0].value == "postgres" {
+	if m.fields[stepEngine].value == "postgres" {
 		engine = "PostgreSQL"
 	}
-	if m.integrated {
+	switch {
+	case m.isVitess() && m.localStorage:
+		b.WriteString("PlanetScale\n└── Your application database\n\nThis computer · Docker\n└── schemabot\n    └── SchemaBot’s plans and progress\n\n")
+		b.WriteString("Data stays in a Docker volume between restarts.\n\n")
+	case m.integrated:
 		b.WriteString("Your " + engine + " server\n├── Your application database\n│   └── Your application’s tables\n└── schemabot (new database)\n    └── SchemaBot’s own tables\n\n")
-	} else {
+	default:
 		b.WriteString("Your application’s server\n└── Your application database\n    └── Your application’s tables\n\nSeparate server\n└── SchemaBot’s database\n    └── SchemaBot’s own tables\n\n")
 		b.WriteString("Next, connect an existing database for SchemaBot’s own data.\n\n")
 	}

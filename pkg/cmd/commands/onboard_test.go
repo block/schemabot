@@ -1011,3 +1011,31 @@ func TestOnboardConfigYAML_EmptyExclusionsOmitTheirKeys(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "database: testapp\ntype: mysql\n", out)
 }
+
+// An empty Vitess keyspace still has routing metadata. Importing it must keep
+// both its VSchema and an editable SQL starter, without inventing a table.
+func TestOnboardEmptyVitessKeyspaceThenFirstTable(t *testing.T) {
+	root := t.TempDir()
+	const vschema = `{"sharded":false,"tables":{}}`
+	plan, err := buildOnboardWritePlan(root, &apitypes.PullSchemaResponse{
+		Database: "shop", Type: "vitess", Environment: "development",
+		Namespaces: map[string]*apitypes.PulledNamespace{
+			"commerce": {Tables: map[string]string{}, Artifacts: map[string]string{"vschema.json": vschema}},
+		},
+	}, client.PlanExclusions{})
+	require.NoError(t, err)
+	require.NoError(t, plan.write())
+	starter := filepath.Join(root, "commerce", "schema.sql")
+	contents, err := os.ReadFile(starter)
+	require.NoError(t, err)
+	require.Equal(t, schema.EmptyNamespaceDeclaration, string(contents))
+	files, _, err := client.ReadSchemaFiles(root, "development", nil)
+	require.NoError(t, err)
+	require.Len(t, files, 1)
+	require.Equal(t, map[string]string{"vschema.json": vschema}, files["commerce"].Files)
+	const ddl = "CREATE TABLE customers (id bigint NOT NULL PRIMARY KEY);\n"
+	require.NoError(t, os.WriteFile(starter, []byte(ddl), 0600))
+	files, _, err = client.ReadSchemaFiles(root, "development", nil)
+	require.NoError(t, err)
+	require.Equal(t, map[string]string{"schema.sql": ddl, "vschema.json": vschema}, files["commerce"].Files)
+}
