@@ -11,7 +11,8 @@ import (
 // TestEmptiedPRNamespaces covers the two steps that turn a pull request's
 // changed-file list into the namespaces it emptied: vacatedSchemaFiles picks
 // the schema paths the pull request deleted or renamed away, and
-// emptiedPRNamespaces keeps those whose namespace no file at head declares.
+// emptiedPRNamespaces keeps those whose namespace no file at head declares,
+// returning the ones ignore_namespaces withholds separately.
 func TestEmptiedPRNamespaces(t *testing.T) {
 	grouped := map[string]*ternv1.SchemaFiles{
 		"surviving": {Files: map[string]string{"users.sql": "CREATE TABLE users (id bigint)"}},
@@ -22,6 +23,7 @@ func TestEmptiedPRNamespaces(t *testing.T) {
 		files       []PRFile
 		environment string
 		want        []string
+		wantIgnored []string
 	}{
 		{name: "one namespace emptied among two", files: []PRFile{{Filename: "schema/removed/orders.sql", Status: "removed"}}, want: []string{"removed"}},
 		{name: "two namespaces emptied", files: []PRFile{{Filename: "schema/removed_b/orders.sql", Status: "removed"}, {Filename: "schema/removed_a/items.sql", Status: "removed"}}, want: []string{"removed_a", "removed_b"}},
@@ -30,9 +32,11 @@ func TestEmptiedPRNamespaces(t *testing.T) {
 		{name: "removed empty-namespace declaration", files: []PRFile{{Filename: "schema/removed/empty.sql", Status: "removed"}}, want: []string{"removed"}},
 		{name: "removed file nested below a namespace", files: []PRFile{{Filename: "schema/payments/archive/backfill.sql", Status: "removed"}}},
 		{name: "outside schema root", files: []PRFile{{Filename: "other/removed/orders.sql", Status: "removed"}}},
-		{name: "ignored namespace", ignored: []string{"removed_$ENV"}, environment: "test", files: []PRFile{{Filename: "schema/removed_$ENV/orders.sql", Status: "removed"}}},
-		{name: "ignored brace namespace", ignored: []string{"removed_{env}"}, environment: "test", files: []PRFile{{Filename: "schema/removed_{env}/orders.sql", Status: "removed"}}},
-		{name: "ignored by pattern", ignored: []string{"/removed_[0-9]+_test/"}, environment: "test", files: []PRFile{{Filename: "schema/removed_3_{env}/orders.sql", Status: "removed"}}},
+		{name: "ignored namespace", ignored: []string{"removed_$ENV"}, environment: "test", files: []PRFile{{Filename: "schema/removed_$ENV/orders.sql", Status: "removed"}}, wantIgnored: []string{"removed_test"}},
+		{name: "ignored brace namespace", ignored: []string{"removed_{env}"}, environment: "test", files: []PRFile{{Filename: "schema/removed_{env}/orders.sql", Status: "removed"}}, wantIgnored: []string{"removed_test"}},
+		{name: "ignored by pattern", ignored: []string{"/removed_[0-9]+_test/"}, environment: "test", files: []PRFile{{Filename: "schema/removed_3_{env}/orders.sql", Status: "removed"}}, wantIgnored: []string{"removed_3_test"}},
+		{name: "ignored and emptied together", ignored: []string{"/removed_[0-9]+/"}, files: []PRFile{{Filename: "schema/removed_4/orders.sql", Status: "removed"}, {Filename: "schema/removed_2/orders.sql", Status: "removed"}, {Filename: "schema/removed/items.sql", Status: "removed"}}, want: []string{"removed"}, wantIgnored: []string{"removed_2", "removed_4"}},
+		{name: "ignored namespace with surviving sibling", ignored: []string{"surviving"}, files: []PRFile{{Filename: "schema/surviving/orders.sql", Status: "removed"}}},
 		{name: "pattern for another environment", ignored: []string{"/removed_[0-9]+_production/"}, environment: "test", files: []PRFile{{Filename: "schema/removed_3_{env}/orders.sql", Status: "removed"}}, want: []string{"removed_3_test"}},
 		{name: "flat file", files: []PRFile{{Filename: "schema/orders.sql", Status: "removed"}}},
 		{name: "renamed out of its namespace", files: []PRFile{{Filename: "schema/surviving/orders.sql", PreviousFilename: "schema/removed/orders.sql", Status: "renamed"}}, want: []string{"removed"}},
@@ -47,9 +51,10 @@ func TestEmptiedPRNamespaces(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			vacated := vacatedSchemaFiles(tt.files, "schema")
-			emptied, err := emptiedPRNamespaces(grouped, tt.ignored, vacated, "schema", tt.environment)
+			emptied, vacatedIgnored, err := emptiedPRNamespaces(grouped, tt.ignored, vacated, "schema", tt.environment)
 			require.NoError(t, err)
 			assert.Equal(t, tt.want, emptied)
+			assert.Equal(t, tt.wantIgnored, vacatedIgnored)
 		})
 	}
 }
