@@ -319,7 +319,7 @@ func (c *Client) InstallationIDForRepo(ctx context.Context, repo string) (int64,
 
 	installation, _, err := appClient.Apps.FindRepositoryInstallation(ctx, owner, name)
 	if err != nil {
-		return 0, fmt.Errorf("find installation for %s: %w", repo, err)
+		return 0, findInstallationError(repo, err)
 	}
 	id := installation.GetID()
 	if id == 0 {
@@ -331,6 +331,25 @@ func (c *Client) InstallationIDForRepo(ctx context.Context, repo string) (int64,
 	c.repoInstallationsMu.Unlock()
 	c.logger.Info("resolved GitHub App installation for repo", "repo", repo, "installation_id", id)
 	return id, nil
+}
+
+// ErrAppNotInstalled reports that GitHub has no installation of this App
+// covering the repository: GET /repos/{owner}/{repo}/installation answered
+// 404. GitHub gives the same answer when the repository does not exist, since
+// an App cannot see a repository it is not installed on. Either way the App can
+// neither read nor publish the repository's Check Runs until it is installed.
+var ErrAppNotInstalled = errors.New("GitHub App is not installed on the repository")
+
+// findInstallationError wraps a failed installation lookup for repo. Only a 404
+// from the lookup itself carries ErrAppNotInstalled; every other failure (5xx,
+// rate limit, auth, transport) stays a plain error, because the App's coverage
+// of the repository is then unknown rather than known to be absent.
+func findInstallationError(repo string, err error) error {
+	var errResp *gh.ErrorResponse
+	if errors.As(err, &errResp) && errResp.Response != nil && errResp.Response.StatusCode == http.StatusNotFound {
+		return fmt.Errorf("find installation for %s: %w: %w", repo, ErrAppNotInstalled, err)
+	}
+	return fmt.Errorf("find installation for %s: %w", repo, err)
 }
 
 // NewInstallationClient creates an InstallationClient from a pre-configured go-github client.

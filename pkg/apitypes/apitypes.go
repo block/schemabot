@@ -263,6 +263,12 @@ type ChecksScanRequest struct {
 	// annotated: a start time that cannot prove a run is young must not be
 	// read as deciding that it is.
 	StuckAfter string `json:"stuck_after,omitempty"`
+	// ReportAppNotInstalled declares that the caller understands
+	// ChecksScanResponse.AppNotInstalled. Only then does a repository whose
+	// GitHub App is not installed come back as that skip; any other caller
+	// gets an error, so a client that predates the field never reads an unread
+	// repository as one scanned clean.
+	ReportAppNotInstalled bool `json:"report_app_not_installed,omitempty"`
 }
 
 type ChecksScanResponse struct {
@@ -275,6 +281,15 @@ type ChecksScanResponse struct {
 	// PR would trivially be missing a check the server refuses to create.
 	// When set, no PRs were scanned and the other fields are zero.
 	ChecksDisabled bool `json:"checks_disabled,omitempty"`
+	// AppNotInstalled reports that GitHub has no installation of the
+	// repository's configured GitHub App (the installation lookup answered
+	// 404), so the scan was skipped: the App can neither read nor publish the
+	// repository's Check Runs. GitHubApp names the configured App. When set, no
+	// PRs were scanned and the other fields are zero. Any other lookup failure
+	// is an error response, never this flag, and so is this one unless the
+	// request set ReportAppNotInstalled.
+	AppNotInstalled bool   `json:"app_not_installed,omitempty"`
+	GitHubApp       string `json:"github_app,omitempty"`
 	// EstimatedOpenPRs is the repository's total open-PR count as GitHub
 	// reports it for this page's listing — an upper bound while more pages
 	// remain, exact on the final page. Recomputed every page so the caller
