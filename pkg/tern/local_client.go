@@ -3114,13 +3114,13 @@ func (c *LocalClient) attachDispatchOperation(ctx context.Context, req *ternv1.A
 		return nil, fmt.Errorf("no engine configured for type: %s", c.config.Type)
 	}
 
-	// The plan row was drift-checked against the creating dispatch's shard
-	// only, so a sibling shard is checked against its own live schema before
+	// The plan row was drift-checked against the creating dispatch's shard at
+	// most, so a sibling shard is checked against its own live schema before
 	// its work is admitted, and runs this shard's rendering of the change.
 	// This runs before the blocked and unsafe-change gates so they judge the
 	// verdicts this shard's re-plan set.
 	if scope.shard != "" {
-		if err := c.verifyAttachedShardDispatch(ctx, req, &scope); err != nil {
+		if err := c.verifyAttachedShardDispatch(ctx, req, apply, operationKey, &scope); err != nil {
 			return c.replayConcurrentAttachOrFail(ctx, req, apply, operationKey,
 				fmt.Errorf("attach operation %s to apply %s: %w", operationKey, apply.ApplyIdentifier, err))
 		}
@@ -3243,6 +3243,12 @@ func (c *LocalClient) replayConcurrentAttachOrFail(ctx context.Context, req *ter
 		return nil, errors.Join(verifyErr, fmt.Errorf("re-read operation %s after its drift check failed: %w", operationKey, err))
 	}
 	if winner == nil {
+		c.logger.Warn("Apply: refusing shard dispatch whose drift check failed; dispatch is rejected",
+			append(apply.LogAttrs(),
+				"operation_key", operationKey,
+				"idempotency_key", req.IdempotencyKey,
+				"shard", req.GetTargetShards(),
+				"error", verifyErr)...)
 		return nil, verifyErr
 	}
 	return c.replayConcurrentAttachWinner(ctx, req, apply, winner, operationKey, "drift check"), nil

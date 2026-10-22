@@ -241,13 +241,14 @@ func (c *LocalClient) replanForDispatch(ctx context.Context, req *ternv1.ApplyRe
 	return result, nil
 }
 
-// verifyAttachedShardDispatch holds a shard-scoped dispatch that attaches to
-// an existing apply to the same rule as the dispatch that created it: the
-// reviewed change it carries must be what this deployment would plan for that
-// shard and table against its own live schema, or the attach fails closed.
-// The plan row the attach runs from was checked against the creating
-// dispatch's shard only, so without this a sibling shard that drifted would
-// run the reviewed DDL unchecked. On a match the scope's changes take this
+// verifyAttachedShardDispatch checks a shard-scoped dispatch that attaches to
+// an existing apply against its own shard: the reviewed change it carries must
+// be what this deployment would plan for that shard and table against its own
+// live schema, or the attach fails closed. The plan row the attach runs from
+// was checked against the creating dispatch's shard at most — only when that
+// dispatch materialized it; a plan row already stored on the deployment is
+// taken as it is — so without this a sibling shard that drifted would run the
+// reviewed DDL unchecked. On a match the scope's changes take this
 // shard's re-planned statement, execution-mode verdict and unsafe flag, as a
 // materialized plan's do.
 //
@@ -259,11 +260,13 @@ func (c *LocalClient) replanForDispatch(ctx context.Context, req *ternv1.ApplyRe
 // A dispatch that carries no schema files has no reviewed schema to re-plan
 // against, and attaches against the plan row as it is: a change no re-plan has
 // judged keeps the mark that makes admission require the unsafe opt-in for it.
-func (c *LocalClient) verifyAttachedShardDispatch(ctx context.Context, req *ternv1.ApplyRequest, scope *dispatchScope) error {
+func (c *LocalClient) verifyAttachedShardDispatch(ctx context.Context, req *ternv1.ApplyRequest, apply *storage.Apply, operationKey string, scope *dispatchScope) error {
 	if len(req.SchemaFiles) == 0 {
-		c.logger.Debug("shard dispatch carries no schema files to re-plan against; attaching against the plan row as it is",
-			"plan_id", req.PlanId,
-			"shard", scope.shard)
+		c.logger.Warn("shard dispatch carries no schema files to re-plan against; attaching against the plan row, which will require the unsafe opt-in for every change it could not confirm",
+			append(apply.LogAttrs(),
+				"plan_id", req.PlanId,
+				"operation_key", operationKey,
+				"shard", scope.shard)...)
 		return nil
 	}
 	schemaFiles, err := c.normalizeSchemaFiles(protoToSchemaFiles(req.SchemaFiles))
