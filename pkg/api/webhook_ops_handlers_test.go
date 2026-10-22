@@ -1094,7 +1094,8 @@ func TestExecuteChecksScanScansThroughTheResolvedInstallation(t *testing.T) {
 		}},
 	}, nil)
 
-	response, err := executeChecksScanWith(t.Context(), cfg, nil, ChecksScanRequest{Repo: "octo/repo"}, discardLogger(), resolve)
+	store := &inspectStorage{checks: &inspectCheckStore{}}
+	response, err := executeChecksScanWith(t.Context(), cfg, store, ChecksScanRequest{Repo: "octo/repo"}, discardLogger(), resolve)
 	require.NoError(t, err)
 	assert.False(t, response.AppNotInstalled)
 	assert.Empty(t, response.GitHubApp)
