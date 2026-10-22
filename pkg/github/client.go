@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/block/schemabot/pkg/metrics"
+	"github.com/block/schemabot/pkg/schema"
 	"github.com/bradleyfalzon/ghinstallation/v2"
 	"github.com/gofri/go-github-ratelimit/v2/github_ratelimit"
 	"github.com/gofri/go-github-ratelimit/v2/github_ratelimit/github_secondary_ratelimit"
@@ -3002,7 +3003,7 @@ func (ic *InstallationClient) symlinkedNamespaceLocators(ctx context.Context, re
 		return nil, fmt.Errorf("schema namespace symlink %s points to absolute path %s", entry.GetPath(), target)
 	}
 	resolved := path.Clean(path.Join(schemaPath, target))
-	if !schemaPathWithinDirectory(".", resolved) {
+	if !schema.PathWithinDirectory(".", resolved) {
 		return nil, fmt.Errorf("schema namespace symlink %s points outside the repository: %s", entry.GetPath(), target)
 	}
 	if resolved == "." || resolved == path.Clean(schemaPath) || resolved == path.Clean(entry.GetPath()) {

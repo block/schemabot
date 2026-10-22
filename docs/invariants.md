@@ -1795,7 +1795,8 @@ cap, a truncated git tree, or config discovery that cannot prove exhaustiveness 
 because a missing file must never read as a deleted table and produce a spurious `DROP TABLE`
 proposal. Symlinked namespaces resolving outside the repository root, or to themselves, are
 rejected. *Enforced:* truncation and symlink guards on every schema-fetch path
-(`pkg/github/schema.go`, `pkg/github/client.go`); on the target side, the live-schema reads that
+(`pkg/github/schema.go`, `pkg/github/client.go`; environment schema roots for pull requests
+and the CLI alike in `pkg/schema/environment_root.go`); on the target side, the live-schema reads that
 feed a plan end it on any table they cannot read (`fetchCurrentSchema` in
 `pkg/engine/spirit/spirit.go`, `renderPostgresTables` in `pkg/engine/postgres/pull.go`).
 They also end it on a VSchema reported missing for a keyspace the target still has
