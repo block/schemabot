@@ -2045,37 +2045,36 @@ checksDone:
 	assert.True(t, hasAggregate, "expected aggregate check run")
 }
 
-// A known database served only by another deployment contributes no local
-// work. The served aggregate still passes after discovery verifies the PR, so
-// a broadly required environment does not strand the PR.
-func TestE2EAutoPlanPassesWhenDatabaseHasNoServedEnvironments(t *testing.T) {
+// A documentation PR preserves the registered production requirement without
+// publishing an unregistered optional environment.
+func TestE2EAutoPlanUsesRepositoryEnvironmentCoverage(t *testing.T) {
 	dbName := "webhook_no_owned_envs"
-	svc := setupE2EServiceWithAllowedEnvs(t, []string{"sandbox"})
+	svc := setupE2EServiceWithAllowedEnvs(t, []string{"sandbox", "production"})
 	configureE2EServiceEnvironments(t, svc, dbName, "staging", "production")
 	client, mux := setupGitHubServer(t)
-	result := setupFakeGitHubForPlan(t, mux, map[string]string{
+	result := setupFakeGitHubForPlanWithPRFiles(t, mux, map[string]string{
 		"users.sql": "CREATE TABLE users (id BIGINT PRIMARY KEY)",
-	}, fmt.Sprintf("database: %s\ntype: mysql\n", dbName), dbName)
+	}, fmt.Sprintf("database: %s\ntype: mysql\n", dbName), dbName, []*gh.CommitFile{{Filename: new("README.md"), Status: new("modified")}})
 	h := newE2EHandler(t, svc, client)
 	drainWebhookWorkOnCleanup(t, h)
 	req := buildPRWebhookRequest(t, prWebhookPayloadOpts{action: "opened", headSHA: "abc123", headRef: "feature-branch"}, nil)
 	rr := httptest.NewRecorder()
 	h.ServeHTTP(rr, req)
 	require.Equal(t, http.StatusOK, rr.Code)
-	cr := collectAggregateConclusion(t, result.checkRuns, "SchemaBot (sandbox)", checkConclusionSuccess)
+	cr := collectAggregateConclusion(t, result.checkRuns, "SchemaBot (production)", checkConclusionSuccess)
 	assert.Equal(t, "abc123", cr.HeadSHA)
 	assert.Equal(t, checkStatusCompleted, cr.Status)
 	require.NotNil(t, cr.Output)
-	assert.Equal(t, "No schema changes managed in sandbox", cr.Output.Title)
+	assert.Equal(t, "No schema files changed", cr.Output.Title)
 	require.Eventually(t, func() bool {
-		aggregate, err := svc.Storage().Checks().Get(t.Context(), "octocat/hello-world", 1, "sandbox", aggregateSentinel, aggregateSentinel)
+		aggregate, err := svc.Storage().Checks().Get(t.Context(), "octocat/hello-world", 1, "production", aggregateSentinel, aggregateSentinel)
 		return err == nil && aggregate != nil && aggregate.Conclusion == checkConclusionSuccess && aggregate.BlockingReason == ""
 	}, webhookIntegrationCheckRunDeadline, 10*time.Millisecond)
 }
 
-// A staging-only schema PR still receives all three served aggregates. The
-// staging plan requires an apply; the other environments have verified no work.
-func TestE2EAutoPlanPublishesAllServedEnvironmentChecks(t *testing.T) {
+// Schema PRs publish only applicable environment names, on new commits and
+// guarded backfill as well as their first plan.
+func TestE2EAutoPlanPublishesApplicableEnvironmentChecks(t *testing.T) {
 	for _, tc := range []struct {
 		name        string
 		served      []string
@@ -2119,6 +2118,12 @@ func TestE2EAutoPlanPublishesAllServedEnvironmentChecks(t *testing.T) {
 				require.Eventually(t, func() bool {
 					for _, env := range tc.served {
 						check, err := svc.Storage().Checks().Get(t.Context(), "octocat/hello-world", 1, env, aggregateSentinel, aggregateSentinel)
+						if env != tc.databaseEnv {
+							if err != nil || check != nil {
+								return false
+							}
+							continue
+						}
 						if err != nil || check == nil || check.HeadSHA != headSHA {
 							return false
 						}
@@ -2137,18 +2142,17 @@ func TestE2EAutoPlanPublishesAllServedEnvironmentChecks(t *testing.T) {
 			defer cancel()
 			h.DrainInProcessWebhookWork(ctx)
 			require.NoError(t, ctx.Err())
-			// Backfill restores a missing served aggregate through the same
-			// guarded discovery flow, even though this database has no sandbox.
-			sandbox, err := svc.Storage().Checks().Get(ctx, "octocat/hello-world", 1, "sandbox", aggregateSentinel, aggregateSentinel)
+			// Backfill restores the applicable name without inventing coverage.
+			missing, err := svc.Storage().Checks().Get(ctx, "octocat/hello-world", 1, tc.databaseEnv, aggregateSentinel, aggregateSentinel)
 			require.NoError(t, err)
-			require.NotNil(t, sandbox)
-			require.NoError(t, svc.Storage().Checks().Delete(ctx, sandbox.ID))
+			require.NotNil(t, missing)
+			require.NoError(t, svc.Storage().Checks().Delete(ctx, missing.ID))
 			outcome, err := h.BackfillPRCheckRuns(ctx, "octocat/hello-world", 1, 12345)
 			require.NoError(t, err)
 			assert.Equal(t, "auto-plan started", outcome)
 			require.Eventually(t, func() bool {
-				check, err := svc.Storage().Checks().Get(ctx, "octocat/hello-world", 1, "sandbox", aggregateSentinel, aggregateSentinel)
-				return err == nil && check != nil && check.HeadSHA == "newsha222" && check.Conclusion == checkConclusionSuccess
+				check, err := svc.Storage().Checks().Get(ctx, "octocat/hello-world", 1, tc.databaseEnv, aggregateSentinel, aggregateSentinel)
+				return err == nil && check != nil && check.HeadSHA == "newsha222" && check.Conclusion == checkConclusionActionRequired
 			}, webhookIntegrationCheckRunDeadline, 10*time.Millisecond)
 		})
 	}

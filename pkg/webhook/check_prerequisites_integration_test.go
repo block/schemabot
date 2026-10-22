@@ -3,10 +3,15 @@
 package webhook
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
+	"slices"
 	"testing"
 	"time"
+
+	"github.com/block/schemabot/pkg/api"
+	"github.com/block/schemabot/pkg/storage"
 
 	"github.com/block/schemabot/pkg/checkstate"
 	ghclient "github.com/block/schemabot/pkg/github"
@@ -54,7 +59,7 @@ func TestEnvironmentPrerequisiteFoldWithStorage(t *testing.T) {
 	aggregate, err := svc.Storage().Checks().Get(t.Context(), "octocat/hello-world", 1, "production", checkstate.AggregateSentinel, checkstate.AggregateSentinel)
 	require.NoError(t, err)
 	assert.Equal(t, checkConclusionSuccess, aggregate.Conclusion)
-	applies, err := svc.Storage().Applies().GetByPR(t.Context(), "octocat/hello-world", 1)
+	applies, err := appliesForTestDatabase(t.Context(), svc, "orders")
 	require.NoError(t, err)
 	assert.Empty(t, applies)
 }
@@ -98,26 +103,26 @@ func TestSandboxAndProductionAppliesRemainSeparate(t *testing.T) {
 	h := newE2EHandler(t, svc, client)
 	_, err = h.applyCommandCore(t.Context(), "octocat/hello-world", 1, "production", database, 12345, "testuser", CommandResult{})
 	require.NoError(t, err)
-	applies, err := svc.Storage().Applies().GetByPR(t.Context(), "octocat/hello-world", 1)
+	applies, err := appliesForTestDatabase(t.Context(), svc, database)
 	require.NoError(t, err)
 	require.Empty(t, applies)
 	_, err = h.applyCommandCore(t.Context(), "octocat/hello-world", 1, "sandbox", database, 12345, "testuser", CommandResult{})
 	require.NoError(t, err)
 	require.Eventually(t, func() bool {
-		applies, err := svc.Storage().Applies().GetByPR(t.Context(), "octocat/hello-world", 1)
+		applies, err := appliesForTestDatabase(t.Context(), svc, database)
 		if err != nil || len(applies) != 1 {
 			return false
 		}
 		return applies[0].Environment == "sandbox" && state.IsState(applies[0].State, state.Apply.Completed)
 	}, 30*time.Second, 50*time.Millisecond)
-	applies, err = svc.Storage().Applies().GetByPR(t.Context(), "octocat/hello-world", 1)
+	applies, err = appliesForTestDatabase(t.Context(), svc, database)
 	require.NoError(t, err)
 	require.Len(t, applies, 1)
 	sandboxID := applies[0].ApplyIdentifier
 	_, err = h.applyCommandCore(t.Context(), "octocat/hello-world", 1, "production", database, 12345, "testuser", CommandResult{})
 	require.NoError(t, err)
 	require.Eventually(t, func() bool {
-		applies, err := svc.Storage().Applies().GetByPR(t.Context(), "octocat/hello-world", 1)
+		applies, err := appliesForTestDatabase(t.Context(), svc, database)
 		if err != nil || len(applies) != 2 {
 			return false
 		}
@@ -128,7 +133,7 @@ func TestSandboxAndProductionAppliesRemainSeparate(t *testing.T) {
 		}
 		return true
 	}, 30*time.Second, 50*time.Millisecond)
-	applies, err = svc.Storage().Applies().GetByPR(t.Context(), "octocat/hello-world", 1)
+	applies, err = appliesForTestDatabase(t.Context(), svc, database)
 	require.NoError(t, err)
 	require.Len(t, applies, 2)
 	for _, apply := range applies {
@@ -136,4 +141,12 @@ func TestSandboxAndProductionAppliesRemainSeparate(t *testing.T) {
 			assert.NotEqual(t, sandboxID, apply.ApplyIdentifier)
 		}
 	}
+}
+
+func appliesForTestDatabase(ctx context.Context, svc *api.Service, database string) ([]*storage.Apply, error) {
+	applies, err := svc.Storage().Applies().GetByPR(ctx, "octocat/hello-world", 1)
+	if err != nil {
+		return nil, err
+	}
+	return slices.DeleteFunc(applies, func(apply *storage.Apply) bool { return apply.Database != database }), nil
 }

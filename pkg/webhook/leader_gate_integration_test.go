@@ -333,7 +333,11 @@ func TestE2ELeaderBlocksOnParticipantFileRenamedOutOfItsPaths(t *testing.T) {
 				installClient := ghclient.NewInstallationClientWithSlug(client, testLogger(), leaderOwnAppSlug, trustedTenantAppSlug)
 				_, err := h.updateAggregateCheckOnce(t.Context(), installClient, "octocat/hello-world", 1, headSHA)
 				require.ErrorContains(t, err, "cannot resolve ownership")
-				assert.Empty(t, checkRuns)
+				require.NotEmpty(t, checkRuns)
+				for len(checkRuns) > 0 {
+					check := <-checkRuns
+					assert.NotEqual(t, checkConclusionSuccess, check.Conclusion)
+				}
 				return
 			}
 			req := buildParticipantCompletedRequest(t, aggregateCheckNameForEnv(tenantBCheckName, "production"), headSHA)
