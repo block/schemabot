@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"os"
 	"sync"
 	"testing"
 	"time"
@@ -1031,6 +1032,31 @@ func (c *deployRequestReclaimClient) DeleteBranch(ctx context.Context, req *ps.D
 	return c.resumeReclaimClient.DeleteBranch(ctx, req)
 }
 
+// The client that would read the deploy request cannot be built. Only a read
+// proves the deploy request will never deploy, so the branch is kept, never
+// sent a delete, and reported so the apply log names it.
+func TestReclaimCancelledResumeState_UnreachableClientWithDeployRequestKeepsBranch(t *testing.T) {
+	const ownedBranch = "schemabot-commerce-1a2b"
+	e := NewWithClient(slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError})),
+		func(_, _ string) (psclient.PSClient, error) {
+			return nil, errors.New("planetscale unreachable")
+		})
+	encoded, err := encodePSMetadata(&psMetadata{BranchName: ownedBranch, DeployRequestID: 42})
+	require.NoError(t, err)
+
+	result, err := e.ReclaimCancelledResumeState(t.Context(), &engine.ReclaimResumeStateRequest{
+		Database:    "commerce",
+		Credentials: conformanceCredentials(),
+		ResumeState: &engine.ResumeState{Metadata: encoded},
+	})
+
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	assert.Empty(t, result.Reclaimed)
+	assert.Equal(t, []string{"branch " + ownedBranch}, result.Kept)
+	assert.Contains(t, result.KeptReason, "delete the branch by hand")
+}
+
 // A database registered under an identifier other than its PlanetScale name
 // carries the PlanetScale name in its credential metadata. The reclaim reads
 // the deploy request and deletes the branch on the database as PlanetScale
@@ -1064,9 +1090,10 @@ func TestReclaimCancelledResumeState_ResolvesDatabaseName(t *testing.T) {
 // has nothing else to remove it. The reclaim reads the stored deploy request
 // and deletes the branch only when the read proves the deploy request closed
 // without deploying. A deploy request that is still open, or that closed by
-// deploying, owns the branch; a deploy request that cannot be read is left to
-// own it; and an operator-supplied branch is kept for the operator without
-// reading the deploy request at all.
+// deploying, owns the branch; a deploy request that cannot be read keeps the
+// branch and reports it, so the apply log can say it is still in PlanetScale;
+// and an operator-supplied branch is kept for the operator without reading
+// the deploy request at all.
 func TestReclaimCancelledResumeState_DeployRequest(t *testing.T) {
 	const ownedBranch = "schemabot-commerce-1a2b"
 	deployedAt := time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC)
@@ -1100,10 +1127,10 @@ func TestReclaimCancelledResumeState_DeployRequest(t *testing.T) {
 			wantReads: []uint64{42},
 		},
 		{
-			name:      "a branch whose deploy request cannot be read is left to the deploy request",
+			name:      "a branch whose deploy request cannot be read is kept and reported",
 			meta:      &psMetadata{BranchName: ownedBranch, DeployRequestID: 42},
 			getErr:    errors.New("planetscale unavailable"),
-			wantReads: []uint64{42},
+			wantReads: []uint64{42}, wantKept: []string{"branch " + ownedBranch},
 		},
 		{
 			name: "an operator-supplied branch with a deploy request is kept for the operator",
@@ -1125,7 +1152,7 @@ func TestReclaimCancelledResumeState_DeployRequest(t *testing.T) {
 				ResumeState: &engine.ResumeState{Metadata: encoded},
 			})
 
-			require.NoError(t, err, "a reclaim that leaves the branch to its deploy request is not a failure")
+			require.NoError(t, err, "a reclaim that keeps the branch because a deploy request may own it is not a failure")
 			require.NotNil(t, result)
 			assert.Equal(t, tt.wantReads, client.reads)
 			assert.Equal(t, tt.wantAttempts, client.deleteAttempts(), "a kept branch is never sent a delete")
@@ -1138,11 +1165,12 @@ func TestReclaimCancelledResumeState_DeployRequest(t *testing.T) {
 
 // A cancel that lands between drives finds the branch only in the apply's
 // stored resume state: the drive that created it has exited, and the drive
-// consuming the cancel stands down before it resumes. The reclaim deletes a
-// branch SchemaBot created and no deploy request owns, and leaves alone a
-// branch the deploy request tears down, a branch the operator supplied, and a
-// branch a drive already removed, reporting each so the apply log can say what
-// is still in PlanetScale and why.
+// consuming the cancel stands down before it resumes. These cases cover a
+// state without a deploy request, plus the deploy-request cases that need no
+// read; TestReclaimCancelledResumeState_DeployRequest covers the rest. The
+// reclaim deletes a branch SchemaBot created, and leaves alone a branch the
+// operator supplied and a branch a drive already removed, reporting each so
+// the apply log can say what is still in PlanetScale and why.
 func TestReclaimCancelledResumeState(t *testing.T) {
 	const ownedBranch = "schemabot-commerce-1a2b"
 	tests := []struct {

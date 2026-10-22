@@ -261,10 +261,17 @@ func (e *Engine) ReclaimCancelledResumeState(ctx context.Context, req *engine.Re
 		return result, nil
 	}
 
+	// Only a read proves a deploy request will never deploy, so a deploy
+	// request that cannot be read keeps the branch. The result names it, so
+	// the apply log can tell an operator the branch is still in PlanetScale
+	// and how to reclaim it if the deploy request did close undeployed.
+	const unreadKeptReason = "its deploy request could not be read; if it was closed without deploying, delete the branch by hand to reclaim branch quota"
 	client, err := e.getClient(req.Credentials)
 	if err != nil && meta.DeployRequestID != 0 {
-		logger.Warn("could not reach PlanetScale to read the cancelled apply's deploy request; leaving the branch to the deploy request",
+		logger.Warn("could not reach PlanetScale to read the cancelled apply's deploy request; keeping the branch",
 			"organization", org, "planetscale_database", req.Database, "branch", meta.BranchName, "deploy_request", meta.DeployRequestID, "error", err)
+		result.Kept = []string{branch}
+		result.KeptReason = unreadKeptReason
 		return result, nil
 	}
 	if err != nil {
@@ -279,8 +286,10 @@ func (e *Engine) ReclaimCancelledResumeState(ctx context.Context, req *engine.Re
 			Number:       meta.DeployRequestID,
 		})
 		if err != nil {
-			logger.Warn("could not read the cancelled apply's deploy request; leaving the branch to the deploy request",
+			logger.Warn("could not read the cancelled apply's deploy request; keeping the branch",
 				"organization", org, "planetscale_database", req.Database, "branch", meta.BranchName, "deploy_request", meta.DeployRequestID, "error", err)
+			result.Kept = []string{branch}
+			result.KeptReason = unreadKeptReason
 			return result, nil
 		}
 		if !deployRequestClosedUndeployed(dr) {
