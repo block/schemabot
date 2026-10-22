@@ -9,6 +9,8 @@ import (
 
 // WithAggregateCheckLock holds a session advisory lock across the full fold,
 // including GitHub publication, so an older snapshot cannot publish last.
+// The callback context routes store queries through this same session, leaving
+// the fold independent of spare pool capacity. It must not outlive the callback.
 func (s *checkStore) WithAggregateCheckLock(ctx context.Context, repo string, pr int, fold func(context.Context) error) error {
 	if s.locker == nil {
 		return fmt.Errorf("aggregate publication for %s#%d requires a session advisory locker", repo, pr)
@@ -29,5 +31,5 @@ func (s *checkStore) WithAggregateCheckLock(ctx context.Context, repo string, pr
 		return fmt.Errorf("aggregate %s#%d is being published by another fold", repo, pr)
 	}
 	defer releaseApplyTargetLockConn(ctx, s.locker, conn, name, "publish aggregate")
-	return fold(ctx)
+	return fold(context.WithValue(ctx, pinnedDBKey{s.db}, conn))
 }

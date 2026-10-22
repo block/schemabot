@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"fmt"
+	"path"
 	"slices"
 
 	"github.com/block/schemabot/pkg/checkstate"
@@ -44,7 +45,12 @@ func (c *ServerConfig) CheckEnvironmentsForRepo(ctx context.Context, client Chec
 		if err != nil {
 			return nil, fmt.Errorf("discover check coverage for %s@%s: %w", repo, headSHA, err)
 		}
-		if len(discovered.InvalidConfigs) > 0 {
+		for _, invalid := range discovered.InvalidConfigs {
+			// Malformed YAML cannot identify a database, but an explicit directory
+			// policy can still prove this deployment does not own it.
+			if c.RepoHasSchemaDirAllowlist(repo) && !c.SchemaPathAllowedForRepo(repo, path.Dir(invalid.Path)) {
+				continue
+			}
 			return nil, fmt.Errorf("check coverage for %s@%s contains invalid configs", repo, headSHA)
 		}
 		for _, found := range discovered.ValidConfigs {
@@ -98,11 +104,32 @@ func (c *ServerConfig) CheckEnvironmentsForRepo(ctx context.Context, client Chec
 	return environments, nil
 }
 
+// ValidateCheckEnvironmentOrder refuses to infer precedence for a local
+// environment omitted from the effective order. An empty database uses the
+// global order, which is the only ordering a participant leader can know.
+func (c *ServerConfig) ValidateCheckEnvironmentOrder(database string, environments []string) error {
+	order := c.PromotionEnvironmentOrder()
+	if database != "" {
+		order = c.PromotionOrderForDatabase(database)
+	}
+	for _, env := range environments {
+		if c.IsEnvironmentAllowed(env) && !slices.Contains(order, env) {
+			return fmt.Errorf("environment %q is missing from the effective environment_order for database %q", env, database)
+		}
+	}
+	return nil
+}
+
 // LocalCheckPrerequisites derives earlier, registered environments owned by
 // this publisher. Retained results also preserve removed registrations.
 func (c *ServerConfig) LocalCheckPrerequisites(database, environment string, retained []string) []string {
 	order := c.PromotionOrderForDatabase(database)
-	index := max(slices.Index(order, environment), 0)
+	index := slices.Index(order, environment)
+	// Inspection can run before validation; an unlisted target must never be
+	// treated as the first environment. Keep every possible local predecessor.
+	if index < 0 {
+		index = len(order)
+	}
 	var result []string
 	db := c.Database(database)
 	for _, prior := range order[:index] {
@@ -123,7 +150,7 @@ func (c *ServerConfig) LocalCheckPrerequisites(database, environment string, ret
 		if prior == environment || !c.IsEnvironmentAllowed(prior) || slices.Contains(result, prior) {
 			continue
 		}
-		if db == nil || !slices.Contains(order, prior) {
+		if db == nil || !slices.Contains(order, prior) || !slices.Contains(order, environment) {
 			result = append(result, prior)
 		}
 	}

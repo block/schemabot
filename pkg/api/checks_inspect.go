@@ -215,7 +215,9 @@ func inspectChecks(ctx context.Context, cfg *ServerConfig, store storage.Storage
 
 	expected, err := resolvedWebhookCheckNames(ctx, cfg, client, req.Repo, prInfo.HeadSHA, req.Environment, "", stored)
 	if err != nil {
-		return nil, fmt.Errorf("resolve inspection coverage: %w", err)
+		logger.Warn("check inspection could not resolve coverage; returning stored state", "repo", req.Repo, "pr", req.PullRequest, "head_sha", prInfo.HeadSHA, "error", err)
+		response.CoverageError = "Could not determine which SchemaBot checks should exist. Check repository configuration and server logs, then retry."
+		return response, nil
 	}
 	names := make([]string, 0, len(expected))
 	for _, target := range expected {

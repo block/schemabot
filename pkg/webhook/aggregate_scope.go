@@ -49,6 +49,13 @@ func (h *Handler) discoverAggregatePRScope(ctx context.Context, client *ghclient
 	// selection as leaders. A touched README within those paths still needs a
 	// no-work report; a PR outside them stays silent.
 	scope.participantSelected = h.participantPathsTouched(repo, files)
+	if len(config.ExpectedParticipantChecksForPR(repo, prFilePaths(files))) > 0 {
+		// A leader cannot infer per-database overrides in another deployment.
+		// Every applicable environment needs a position in the global order.
+		if err := config.ValidateCheckEnvironmentOrder("", environments); err != nil {
+			return nil, err
+		}
+	}
 
 	for _, cfg := range configs {
 		if cfg.Config == nil {
@@ -69,6 +76,9 @@ func (h *Handler) discoverAggregatePRScope(ctx context.Context, client *ghclient
 		}
 		if len(environments) == 0 {
 			return nil, fmt.Errorf("aggregate scope %s#%d database %q has no configured environments", repo, pr, cfg.Config.Database)
+		}
+		if err := config.ValidateCheckEnvironmentOrder(cfg.Config.Database, environments); err != nil {
+			return nil, err
 		}
 		scope.participantSelected = true
 		for _, environment := range environments {

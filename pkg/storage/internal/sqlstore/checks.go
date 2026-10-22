@@ -545,6 +545,39 @@ func newerWriteOwnsStaleCheck(storedApplyID sql.NullInt64, storedHeadSHA string,
 	return storedHeadSHA != readHeadSHA && storedHeadSHA != headSHA
 }
 
+// MarkPlanPending invalidates success without releasing apply ownership or
+// weakening an existing block. In particular, a completed apply's provenance
+// survives so stale-schema cleanup still knows that it changed the target.
+func (s *checkStore) MarkPlanPending(ctx context.Context, check *storage.Check) error {
+	canonicalizeCheck(check)
+	passing := "checks.status = '" + checkStatusCompleted + "' AND checks.conclusion = '" + checkConclusionSuccess + "' AND COALESCE(checks.blocking_reason, '') = ''"
+	pending := func(column, value string) string {
+		return "CASE WHEN " + passing + " THEN " + value + " ELSE checks." + column + " END"
+	}
+	// Conclusion is assigned last: MySQL evaluates assignments left to right.
+	upsert := s.dialect.UpsertClause(
+		[]string{"repository", "pull_request", "environment", "database_type", "database_name"},
+		[]UpsertAssignment{
+			{Column: "head_sha", Expr: pending("head_sha", s.dialect.ExcludedValue("head_sha"))},
+			{Column: "has_changes", Expr: pending("has_changes", s.dialect.ExcludedValue("has_changes"))},
+			{Column: "change_summary", Expr: pending("change_summary", s.dialect.ExcludedValue("change_summary"))},
+			{Column: "updated_at", Expr: pending("updated_at", s.dialect.CurrentTimestamp(TimestampPrecisionDefault))},
+			{Column: "conclusion", Expr: pending("conclusion", s.dialect.ExcludedValue("conclusion"))},
+		},
+	)
+	_, err := s.db.ExecContext(ctx, `
+  INSERT INTO checks (
+   repository, pull_request, head_sha, environment, database_type, database_name,
+   has_changes, status, conclusion, change_summary
+  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`+upsert,
+		check.Repository, check.PullRequest, check.HeadSHA, check.Environment, check.DatabaseType, check.DatabaseName,
+		true, checkStatusCompleted, checkConclusionActionRequired, "Waiting for a fresh plan")
+	if err != nil {
+		return fmt.Errorf("mark plan pending for %s#%d %s/%s/%s: %w", check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName, err)
+	}
+	return nil
+}
+
 // ClearAggregateBlock clears the blocking reason on stored aggregate check
 // state. The WHERE clause pins the head SHA and blocking reason the caller
 // read, making the clear an optimistic-concurrency write: a block recorded

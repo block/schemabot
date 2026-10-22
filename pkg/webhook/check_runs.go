@@ -181,9 +181,8 @@ var narrowedApplyBlock = checkBlockReason{
 // Stored check state then holds nothing of the failure, so a fold from it, on
 // this plan or on a later plan of another environment, could pass on the
 // environments that did plan. The block keeps every such fold off the
-// aggregate until the auto-plan guards re-verify the PR, which a re-run of
-// the check or a new commit does by re-planning every environment
-// (planFailedUnstoredSummary).
+// aggregate until auto-plan re-verifies the PR and durably invalidates prior
+// successful results. Only replacement results can then pass the aggregate.
 var planFailedUnrecordedBlock = checkBlockReason{
 	blockingReason: checkstate.BlockPlanFailedUnrecorded,
 	message:        planFailedUnstoredSummary,

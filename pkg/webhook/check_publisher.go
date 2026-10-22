@@ -335,6 +335,8 @@ func (h *Handler) foldAggregateChecksForPR(ctx context.Context, client *ghclient
 			// A leader cannot know another tenant's per-database promotion order.
 			// Earlier covered environments conservatively remain prerequisites.
 			order := config.PromotionEnvironmentOrder()
+			// Scope validation rejects unlisted participant environments. A local
+			// database override may still name an environment with no participants.
 			preceding := max(slices.Index(order, env), 0)
 			for _, prior := range order[:preceding] {
 				if !config.IsEnvironmentAllowed(prior) {
@@ -1187,13 +1189,22 @@ func sanitizeCheckRunErrorSummary(summary string) string {
 // config, and — re-checked here — every discovered database resolves to at
 // least one registered environment. A known database served only by another
 // publisher is no local work. Recompute paths never release blocks, so this
-// is the only way a blocked aggregate can start passing again; the auto-plan
-// that follows publishes the fresh aggregate state.
+// releases the aggregate block only after replacing old successes with durable
+// pending evidence. The auto-plan that follows must store replacement results.
 //
 // The storage clear is conditional on the head SHA and reason of the row that
 // was read, so a block recorded concurrently (for example by a newer commit's
 // guards on another pod) stays authoritative.
 func (h *Handler) clearAggregateBlocksForVerifiedPR(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA string, configs []ghclient.DiscoveredConfig) {
+	if err := h.withAggregateFoldLock(ctx, repo, pr, func(ctx context.Context) error {
+		h.clearAggregateBlocksForVerifiedPRUnlocked(ctx, client, repo, pr, headSHA, configs)
+		return nil
+	}); err != nil {
+		h.logger.Error("could not lock aggregate block recovery; retaining blocks", "repo", repo, "pr", pr, "error", err)
+	}
+}
+
+func (h *Handler) clearAggregateBlocksForVerifiedPRUnlocked(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA string, configs []ghclient.DiscoveredConfig) {
 	for _, cfg := range configs {
 		environments, err := h.configuredDatabaseEnvironments(cfg.Config.Database)
 		if err != nil {
@@ -1230,6 +1241,13 @@ func (h *Handler) clearAggregateBlocksForVerifiedPR(ctx context.Context, client 
 		if existing == nil || existing.BlockingReason == "" {
 			h.logger.Debug("no stored aggregate block to clear",
 				"repo", repo, "pr", pr, "environment", target.environment, "head_sha", headSHA)
+			continue
+		}
+		// Discovery alone cannot supersede a failed plan. Replace old successes
+		// with durable pending evidence before releasing the aggregate block. A
+		// crash or another failed write then leaves every fold blocking (MG-1/2).
+		if err := h.markAggregatePlansPending(ctx, repo, pr, headSHA, target.environment, configs); err != nil {
+			h.logger.Error("could not invalidate prior plan evidence; retaining aggregate block", "repo", repo, "pr", pr, "environment", target.environment, "error", err)
 			continue
 		}
 		cleared, err := h.service.Storage().Checks().ClearAggregateBlock(ctx, existing)
@@ -1272,6 +1290,29 @@ func (h *Handler) clearAggregateBlocksForVerifiedPR(ctx context.Context, client 
 			"head_sha", headSHA, "blocked_head_sha", existing.HeadSHA,
 			"blocking_reason", existing.BlockingReason)
 	}
+}
+
+// markAggregatePlansPending covers every local database because an aggregate
+// failure does not identify which database's result failed to persist.
+func (h *Handler) markAggregatePlansPending(ctx context.Context, repo string, pr int, headSHA, aggregateEnvironment string, configs []ghclient.DiscoveredConfig) error {
+	for _, cfg := range configs {
+		environments, err := h.configuredDatabaseEnvironments(cfg.Config.Database)
+		if err != nil {
+			return err
+		}
+		for _, env := range environments {
+			if !h.service.Config().IsEnvironmentAllowed(env) || (aggregateEnvironment != aggregateSentinel && aggregateEnvironment != env) {
+				continue
+			}
+			if err := h.service.Storage().Checks().MarkPlanPending(ctx, &storage.Check{
+				Repository: repo, PullRequest: pr, HeadSHA: headSHA, Environment: env,
+				DatabaseType: string(cfg.Config.GetType()), DatabaseName: cfg.Config.Database,
+			}); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 // passingAggregateOutput is the title and summary of a passing aggregate for

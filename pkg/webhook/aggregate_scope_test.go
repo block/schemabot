@@ -129,7 +129,7 @@ func TestAggregateParticipantEnvironmentScope(t *testing.T) {
 		{name: "neither selected", path: "README.md"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			cfg := &api.ServerConfig{AllowedEnvironments: []string{"sandbox", "production"}, Repos: map[string]api.RepoConfig{"octocat/hello-world": {Aggregate: &api.AggregateConfig{Role: api.AggregateRoleLeader, ExpectedTenants: []api.ExpectedTenant{
+			cfg := &api.ServerConfig{AllowedEnvironments: []string{"sandbox", "production"}, EnvironmentOrder: []string{"sandbox", "production"}, Repos: map[string]api.RepoConfig{"octocat/hello-world": {Aggregate: &api.AggregateConfig{Role: api.AggregateRoleLeader, ExpectedTenants: []api.ExpectedTenant{
 				{Tenant: "a", Paths: []string{"services/a"}, CheckName: "SchemaBot A", Environments: []string{"production"}},
 				{Tenant: "b", Paths: []string{"services/b"}, CheckName: "SchemaBot B", Environments: []string{"sandbox", "production"}},
 			}}}}}
@@ -266,7 +266,7 @@ func TestAggregateScopeRejectsMovingPR(t *testing.T) {
 // because the leader's registry lacks the database.
 func TestAggregateScopeRejectsUnknownOwnership(t *testing.T) {
 	store := &foldCheckStore{}
-	cfg := &api.ServerConfig{AllowedEnvironments: []string{"sandbox", "production"}, Repos: map[string]api.RepoConfig{"octocat/hello-world": {Aggregate: &api.AggregateConfig{
+	cfg := &api.ServerConfig{AllowedEnvironments: []string{"sandbox", "production"}, EnvironmentOrder: []string{"sandbox", "production"}, Repos: map[string]api.RepoConfig{"octocat/hello-world": {Aggregate: &api.AggregateConfig{
 		Role:            api.AggregateRoleLeader,
 		ExpectedTenants: []api.ExpectedTenant{{Tenant: "b", Paths: []string{"services/b"}, CheckName: "SchemaBot B", Environments: []string{"production"}}},
 	}}}}

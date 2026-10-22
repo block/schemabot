@@ -54,6 +54,9 @@ func TestPostgresStorageParity(t *testing.T) {
 
 	h := postgresHarness{db: db, dsn: dsn}
 	storagetest.Run(t, h)
+	t.Run("AggregatePublicationBoundedPool", func(t *testing.T) {
+		testAggregatePublicationBoundedPool(t, NewPostgres(h.db))
+	})
 	t.Run("AggregatePublicationLockSerializesPublishers", func(t *testing.T) {
 		testAggregatePublicationLock(t, NewPostgres(h.db), NewPostgres(h.db), postgresAdvisoryLockWaiter(h.db))
 	})

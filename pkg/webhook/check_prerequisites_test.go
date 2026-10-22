@@ -188,3 +188,47 @@ func TestPrerequisiteSummaryRespectsGitHubTextLimit(t *testing.T) {
 	assert.Contains(t, summary, "More database results omitted.")
 	assert.Contains(t, summary, "Waiting for sandbox")
 }
+
+// An incomplete order cannot turn a clean later plan into a passing check,
+// whether the missing environment belongs to a local database or a participant.
+func TestAggregateRejectsIncompletePromotionOrder(t *testing.T) {
+	for _, scenario := range []string{"local target", "local predecessor", "participant predecessor", "participant target"} {
+		t.Run(scenario, func(t *testing.T) {
+			cfg := prerequisiteConfig()
+			db := cfg.Databases["orders"]
+			db.EnvironmentOrder = nil
+			cfg.Databases["orders"] = db
+			files := []string{"schemabot.yaml"}
+			yaml := "database: orders\ntype: mysql\n"
+			switch scenario {
+			case "local target":
+				cfg.EnvironmentOrder = []string{"sandbox"}
+			case "local predecessor":
+				cfg.EnvironmentOrder = []string{"production"}
+			default:
+				cfg.Databases = nil
+				cfg.Repos["octocat/hello-world"] = api.RepoConfig{Aggregate: &api.AggregateConfig{Role: api.AggregateRoleLeader, ExpectedTenants: []api.ExpectedTenant{{Tenant: "a", Paths: []string{"schema"}, CheckName: "SchemaBot A", Environments: []string{"sandbox", "production"}}}}}
+				files, yaml = []string{"schema/README.md"}, ""
+				if scenario == "participant predecessor" {
+					cfg.EnvironmentOrder = nil
+				} else {
+					cfg.EnvironmentOrder = []string{"sandbox"}
+				}
+			}
+			store := &foldCheckStore{byPR: []*storage.Check{
+				{Environment: "sandbox", DatabaseType: "mysql", DatabaseName: "orders", HeadSHA: "abc123", Status: checkStatusCompleted, Conclusion: checkConclusionActionRequired},
+				{Environment: "production", DatabaseType: "mysql", DatabaseName: "orders", HeadSHA: "abc123", Status: checkStatusCompleted, Conclusion: checkConclusionSuccess},
+			}}
+			h, mux, client := newFoldHandler(t, cfg, store)
+			serveHeadSHA(t, mux, "abc123")
+			serveAggregateScopeInputs(t, mux, files, yaml)
+			serveCheckRunCreate(t, mux)
+			_, err := h.updateAggregateCheckOnce(t.Context(), client, "octocat/hello-world", 1, "abc123")
+			require.ErrorContains(t, err, "missing from the effective environment_order")
+			require.Len(t, store.upserted, 2)
+			for _, row := range store.upserted {
+				assert.Equal(t, checkConclusionFailure, row.Conclusion)
+			}
+		})
+	}
+}

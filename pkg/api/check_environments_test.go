@@ -76,3 +76,51 @@ func TestScanUsesApplicableNamesAndPreservesExplicitOverrides(t *testing.T) {
 		})
 	}
 }
+
+func TestCheckEnvironmentOrderUsesDatabaseOverride(t *testing.T) {
+	cfg := &ServerConfig{AllowedEnvironments: []string{"sandbox", "canary"}, EnvironmentOrder: []string{"sandbox", "production"}, Databases: map[string]DatabaseConfig{
+		"orders": {Environments: map[string]EnvironmentConfig{"sandbox": {}, "canary": {}}},
+	}}
+	require.ErrorContains(t, cfg.ValidateCheckEnvironmentOrder("orders", []string{"sandbox", "canary"}), "canary")
+	assert.Equal(t, []string{"sandbox"}, cfg.LocalCheckPrerequisites("orders", "canary", []string{"sandbox"}))
+	db := cfg.Databases["orders"]
+	db.EnvironmentOrder = []string{"sandbox", "canary"}
+	cfg.Databases["orders"] = db
+	require.NoError(t, cfg.ValidateCheckEnvironmentOrder("orders", []string{"sandbox", "canary"}))
+	// Remote environments need not be present in this publisher's local order.
+	require.NoError(t, cfg.ValidateCheckEnvironmentOrder("orders", []string{"remote"}))
+}
+
+func TestCheckCoverageRespectsInvalidConfigOwnership(t *testing.T) {
+	cfg := &ServerConfig{AllowedEnvironments: []string{"production"}, Databases: map[string]DatabaseConfig{
+		"orders": {AllowedDirs: []string{"services/a"}, Environments: map[string]EnvironmentConfig{"production": {}}},
+	}}
+	discovery := coverageDiscovery{result: &ghclient.FindAllConfigsResult{ValidConfigs: []ghclient.DiscoveredConfig{
+		{Config: &ghclient.SchemabotConfig{Database: "orders"}, SchemaDir: "services/a"},
+	}}}
+	for _, tc := range []struct {
+		path    string
+		blocked bool
+	}{
+		{"services/b/schemabot.yaml", false},
+		{"services/a/schemabot.yaml", true},
+		{"services/a/nested/schemabot.yaml", true},
+	} {
+		t.Run(tc.path, func(t *testing.T) {
+			discovery.result.InvalidConfigs = []ghclient.InvalidConfigInfo{{Path: tc.path, Error: "invalid YAML"}}
+			envs, err := cfg.CheckEnvironmentsForRepo(t.Context(), discovery, "org/repo", "head")
+			if tc.blocked {
+				require.ErrorContains(t, err, "invalid configs")
+			} else {
+				require.NoError(t, err)
+				assert.Equal(t, []string{"production"}, envs)
+			}
+		})
+	}
+	// Without an explicit ownership boundary the malformed config stays unsafe.
+	db := cfg.Databases["orders"]
+	db.AllowedDirs = nil
+	cfg.Databases["orders"] = db
+	_, err := cfg.CheckEnvironmentsForRepo(t.Context(), discovery, "org/repo", "head")
+	require.ErrorContains(t, err, "invalid configs")
+}

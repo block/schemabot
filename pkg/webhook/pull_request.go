@@ -471,7 +471,8 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 	// Config discovery and the managed-directory guard just re-verified this
 	// commit, and the clear re-checks allowed-environment coverage for every
 	// discovered database. Together those cover every condition that records
-	// an aggregate blocking reason, so a stored block can now be released.
+	// a discovery block. Prior plan successes are invalidated before a stored
+	// aggregate block is released, so only replacement results can pass.
 	h.clearAggregateBlocksForVerifiedPR(ctx, client, repo, pr, headSHA, configs)
 
 	affectedDatabases := checkDatabaseKeysForConfigs(configs)
