@@ -1,6 +1,7 @@
 package webhook
 
 import (
+	"context"
 	"fmt"
 	"slices"
 	"strings"
@@ -62,6 +63,22 @@ func (h *Handler) leaderExpectsParticipantsForPR(repo string, files []ghclient.P
 	return len(config.ExpectedParticipantChecksForPR(repo, prFilePaths(files))) > 0
 }
 
+// participantPathsTouched reports whether the PR selects this participant's
+// managed directories even though no schema config resolved (for example a
+// documentation-only change inside a participant's paths).
+func (h *Handler) participantPathsTouched(repo string, files []ghclient.PRFile) bool {
+	config, ok := h.serverConfig()
+	if !ok || !config.RepoHasSchemaDirAllowlist(repo) {
+		return false
+	}
+	for _, file := range prFilePaths(files) {
+		if config.SchemaPathAllowedForRepo(repo, file) {
+			return true
+		}
+	}
+	return false
+}
+
 func (h *Handler) aggregateCheckNameForRepo(repo string) string {
 	config, ok := h.serverConfig()
 	if !ok {
@@ -88,8 +105,9 @@ func (h *Handler) aggregateCheckTargetsForRepo(repo string) []aggregateCheckTarg
 	if !ok || len(config.AllowedEnvironments) == 0 {
 		return []aggregateCheckTarget{{name: base, environment: aggregateSentinel}}
 	}
-	targets := make([]aggregateCheckTarget, 0, len(config.AllowedEnvironments))
-	for _, env := range config.AllowedEnvironments {
+	environments, _ := config.CheckEnvironmentsForRepo(context.Background(), nil, repo, "")
+	targets := make([]aggregateCheckTarget, 0, len(environments))
+	for _, env := range environments {
 		targets = append(targets, aggregateCheckTarget{
 			name:        aggregateCheckNameForEnv(base, env),
 			environment: env,
@@ -247,10 +265,10 @@ func computeAggregate(checks []*storage.Check, stopped stoppedApplyIDs) (conclus
 	// below, still blocking merge, rather than as a run that never finishes.
 	heldByStoppedApply := false
 	for _, c := range checks {
-		if c.Status != checkStatusInProgress {
+		if c.Status == checkStatusCompleted {
 			continue
 		}
-		if stopped.holds(c) {
+		if c.Status == checkStatusInProgress && stopped.holds(c) {
 			heldByStoppedApply = true
 			continue
 		}
@@ -260,7 +278,15 @@ func computeAggregate(checks []*storage.Check, stopped stoppedApplyIDs) (conclus
 	// Every remaining check is completed or held by a stopped apply — compute
 	// the conclusion.
 	for _, c := range checks {
-		if c.Conclusion == checkConclusionFailure {
+		if c.Status != checkStatusCompleted {
+			continue
+		}
+		if c.BlockingReason != "" && c.Conclusion == checkConclusionSuccess {
+			return checkConclusionFailure, checkStatusCompleted
+		}
+		switch c.Conclusion {
+		case checkConclusionSuccess, checkConclusionActionRequired:
+		default:
 			return checkConclusionFailure, checkStatusCompleted
 		}
 	}

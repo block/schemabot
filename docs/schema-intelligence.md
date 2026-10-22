@@ -30,6 +30,12 @@ include `Authorization: Bearer <token>`; for forward-auth, send requests through
 your installation's authenticating proxy. Local installations with authentication
 disabled need no token. The examples below omit authentication headers.
 
+For a PR's merge gate, `GET /api/checks/inspect?repo=org/repo&pull_request=42&environment=production`
+reads current-head check evidence. The environment filter also includes unresolved
+local predecessors, with pending placeholders for missing results. Expected Check
+Run names follow verified repository registrations, so an absent optional
+environment is not reported as a missing check. See [Check Runs](check-runs.md).
+
 ## What databases exist?
 
 Start with `schemabot databases`. It lists the

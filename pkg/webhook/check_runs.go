@@ -189,10 +189,9 @@ var planFailedUnrecordedBlock = checkBlockReason{
 	message:        planFailedUnstoredSummary,
 }
 
-// noAllowedConfiguredEnvironmentsBlock is used when schema files changed but
-// the server-configured environments for the database do not overlap this
-// service's allowed_environments. SchemaBot cannot safely plan the schema
-// change in that configuration, so the aggregate check must fail closed.
+// noAllowedConfiguredEnvironmentsBlock holds the gate when a changed database
+// has no configured environments. A known database registered only in another
+// publisher's environments instead has verified no local work.
 var noAllowedConfiguredEnvironmentsBlock = checkBlockReason{
 	blockingReason: checkstate.BlockNoAllowedConfiguredEnvironments,
 	message:        "SchemaBot found schema changes, but no configured environment for this database is allowed for this SchemaBot deployment. Align server environment configuration with allowed_environments, then retry the check.",

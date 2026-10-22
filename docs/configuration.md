@@ -993,6 +993,12 @@ per-replica ceiling.
 
 ### Check inspection
 
+An environment filter selects its Check Runs and its database rows, plus any
+unresolved local predecessors that explain its gate. Missing predecessor results
+appear as pending evidence. Expected names follow the same verified repository
+coverage as publication and guarded backfill; an unregistered optional
+environment is not reported as a missing check.
+
 `GET /api/checks/inspect` (`schemabot checks show`) reads the pull request
 and each expected Check Run from GitHub on every call, uncached, through the
 same GitHub App installation SchemaBot publishes its Check Runs through. A
@@ -2386,13 +2392,46 @@ others. Operators can still direct help to a specific deployment with
 
 When a PR is opened or updated, each instance auto-plans only the environments it owns. The staging instance plans staging, the production instance plans production. Each posts its own plan comment and creates its own per-environment aggregate check.
 
-If a PR changes managed schema files but a deployment's `allowed_environments`
-does not overlap any environment configured server-side for the database, that
-deployment publishes a failing aggregate check instead of treating the PR as
-safe. This usually means the database environment config and deployment scoping
-disagree. Align the server environment config with the deployment's
-`allowed_environments`, then run `schemabot plan -e <environment>` or push a new
-commit to refresh checks.
+Check names follow repository environment coverage, resolved from server
+registrations with `allowed_repos` or verified repository discovery. An
+application without sandbox receives no sandbox run, including on documentation
+PRs. A repository registered in sandbox keeps its no-work sandbox result even
+when a particular PR changes only another database. Missing applicable outcomes
+remain pending before the planner stores its first row. Unknown ownership,
+discovery errors, stale results, and retained applies never establish no work.
+
+Later checks also fold successful current-head outcomes of registered local
+predecessors from each database's `environment_order`. This covers clean later
+plans that never run an apply. It does not combine execution: every environment
+still needs its own command, plan, apply, and authorization.
+
+Leaders may declare the checks each participant publishes:
+
+```yaml
+repos:
+  octocat/shared-repo:
+    aggregate:
+      role: leader
+      expected_tenants:
+        - tenant: tenant-a
+          paths: [services/a]
+          check_name: SchemaBot A
+          environments: [production]
+        - tenant: tenant-b
+          paths: [services/b]
+          check_name: SchemaBot B
+          environments: [sandbox, production]
+```
+
+A leader selects contributions by touched paths and environment coverage.
+Declared coverage also contributes to the repository's published names. Omitted `environments`
+conservatively expects every served environment during migration. Explicit
+empty lists, duplicates, and invalid identifiers fail config validation. Populate
+coverage before enabling a new environment on the leader. Keep participants'
+`allowed_dirs` aligned with the leader's path prefixes: selected participants
+publish verified no-work results even for documentation changes in those paths,
+while unrelated PRs and merge-group commits remain silent on participants.
+Legacy unscoped aggregates retain their existing participant expectations.
 
 ### Plan comment retirement
 

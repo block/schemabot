@@ -6,6 +6,7 @@
 package webhook
 
 import (
+	"context"
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
@@ -2044,73 +2045,112 @@ checksDone:
 	assert.True(t, hasAggregate, "expected aggregate check run")
 }
 
-// TestE2EAutoPlanFailsWhenConfiguredEnvironmentsAreNotAllowed verifies that
-// SchemaBot fails closed when schema files changed, but the server-configured
-// database environments do not overlap this service's allowed environments.
-// This is a configuration mismatch, not "no work".
-func TestE2EAutoPlanFailsWhenConfiguredEnvironmentsAreNotAllowed(t *testing.T) {
+// A known database served only by another deployment contributes no local
+// work. The served aggregate still passes after discovery verifies the PR, so
+// a broadly required environment does not strand the PR.
+func TestE2EAutoPlanPassesWhenDatabaseHasNoServedEnvironments(t *testing.T) {
 	dbName := "webhook_no_owned_envs"
 	svc := setupE2EServiceWithAllowedEnvs(t, []string{"sandbox"})
 	configureE2EServiceEnvironments(t, svc, dbName, "staging", "production")
-
-	mux := http.NewServeMux()
-	server := httptest.NewServer(mux)
-	t.Cleanup(server.Close)
-
-	client := gh.NewClient(nil)
-	client.BaseURL, _ = url.Parse(server.URL + "/")
-
-	// The database is configured for staging and production, but this test service
-	// processes only sandbox. SchemaBot cannot safely plan this schema change
-	// because none of the configured environments are allowed.
-	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
-	schemaFiles := map[string]string{
-		"users.sql": "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
-	}
-
-	result := setupFakeGitHubForPlan(t, mux, schemaFiles, schemabotConfig, dbName)
+	client, mux := setupGitHubServer(t)
+	result := setupFakeGitHubForPlan(t, mux, map[string]string{
+		"users.sql": "CREATE TABLE users (id BIGINT PRIMARY KEY)",
+	}, fmt.Sprintf("database: %s\ntype: mysql\n", dbName), dbName)
 	h := newE2EHandler(t, svc, client)
-
-	req := buildPRWebhookRequest(t, prWebhookPayloadOpts{
-		action:  "opened",
-		headSHA: "abc123",
-		headRef: "feature-branch",
-	}, nil)
-
+	drainWebhookWorkOnCleanup(t, h)
+	req := buildPRWebhookRequest(t, prWebhookPayloadOpts{action: "opened", headSHA: "abc123", headRef: "feature-branch"}, nil)
 	rr := httptest.NewRecorder()
 	h.ServeHTTP(rr, req)
-
 	require.Equal(t, http.StatusOK, rr.Code)
-	assert.Contains(t, rr.Body.String(), "auto-plan started")
-
-	// The webhook still accepts the PR event asynchronously, but auto-plan posts
-	// a failing aggregate because this service cannot process any environment
-	// configured for the database.
-	select {
-	case cr := <-result.checkRuns:
-		assert.Equal(t, "SchemaBot (sandbox)", cr.Name)
-		assert.Equal(t, "abc123", cr.HeadSHA)
-		assert.Equal(t, checkStatusCompleted, cr.Status)
-		assert.Equal(t, checkConclusionFailure, cr.Conclusion)
-		require.NotNil(t, cr.Output)
-		assert.Equal(t, noAllowedConfiguredEnvironmentsBlock.message, cr.Output.Summary)
-	case <-time.After(webhookIntegrationCheckRunDeadline):
-		t.Fatal("timed out waiting for failing aggregate for allowed environment")
-	}
-
+	cr := collectAggregateConclusion(t, result.checkRuns, "SchemaBot (sandbox)", checkConclusionSuccess)
+	assert.Equal(t, "abc123", cr.HeadSHA)
+	assert.Equal(t, checkStatusCompleted, cr.Status)
+	require.NotNil(t, cr.Output)
+	assert.Equal(t, "No schema changes managed in sandbox", cr.Output.Title)
 	require.Eventually(t, func() bool {
 		aggregate, err := svc.Storage().Checks().Get(t.Context(), "octocat/hello-world", 1, "sandbox", aggregateSentinel, aggregateSentinel)
-		return err == nil && aggregate != nil &&
-			aggregate.Conclusion == checkConclusionFailure &&
-			aggregate.BlockingReason == noAllowedConfiguredEnvironmentsBlock.blockingReason &&
-			aggregate.ErrorMessage == noAllowedConfiguredEnvironmentsBlock.message
-	}, 5*time.Second, 100*time.Millisecond, "failing aggregate should be stored for allowed environment")
+		return err == nil && aggregate != nil && aggregate.Conclusion == checkConclusionSuccess && aggregate.BlockingReason == ""
+	}, webhookIntegrationCheckRunDeadline, 10*time.Millisecond)
+}
 
-	// There should be no plan comment because no environment reached planning.
-	select {
-	case body := <-result.comments:
-		t.Fatalf("expected no plan comment when no configured environments are allowed, got: %s", body)
-	case <-time.After(500 * time.Millisecond):
+// A staging-only schema PR still receives all three served aggregates. The
+// staging plan requires an apply; the other environments have verified no work.
+func TestE2EAutoPlanPublishesAllServedEnvironmentChecks(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		served      []string
+		databaseEnv string
+	}{
+		{name: "production only", served: []string{"sandbox", "production"}, databaseEnv: "production"},
+		{name: "staging only", served: []string{"staging", "sandbox", "production"}, databaseEnv: "staging"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dbName := "webhook_served_scope"
+			svc := setupE2EServiceMultiEnv(t, dbName)
+			svc.Config().AllowedEnvironments = tc.served
+			dbConfig := svc.Config().Databases[dbName]
+			for environment := range dbConfig.Environments {
+				if environment != tc.databaseEnv {
+					delete(dbConfig.Environments, environment)
+				}
+			}
+			svc.Config().Databases[dbName] = dbConfig
+			client, mux := setupGitHubServer(t)
+			result := setupFakeGitHubForPlan(t, mux, map[string]string{
+				"orders.sql": "CREATE TABLE `orders` (\n  `id` bigint unsigned NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+			}, fmt.Sprintf("database: %s\ntype: mysql\n", dbName), dbName)
+			h := newE2EHandler(t, svc, client)
+			drainWebhookWorkOnCleanup(t, h)
+			for _, action := range []string{"opened", "synchronize"} {
+				headSHA := "abc123"
+				if action == "synchronize" {
+					ctx, cancel := context.WithTimeout(t.Context(), webhookIntegrationCheckRunDeadline)
+					h.DrainInProcessWebhookWork(ctx)
+					require.NoError(t, ctx.Err())
+					cancel()
+					headSHA = "newsha222"
+					result.HeadSHAs = []string{headSHA}
+				}
+				req := buildPRWebhookRequest(t, prWebhookPayloadOpts{action: action, headSHA: headSHA, headRef: "feature-branch"}, nil)
+				rr := httptest.NewRecorder()
+				h.ServeHTTP(rr, req)
+				require.Equal(t, http.StatusOK, rr.Code)
+				collectAggregateConclusion(t, result.checkRuns, aggregateCheckNameForEnv("SchemaBot", tc.databaseEnv), checkConclusionActionRequired)
+				require.Eventually(t, func() bool {
+					for _, env := range tc.served {
+						check, err := svc.Storage().Checks().Get(t.Context(), "octocat/hello-world", 1, env, aggregateSentinel, aggregateSentinel)
+						if err != nil || check == nil || check.HeadSHA != headSHA {
+							return false
+						}
+						want := checkConclusionSuccess
+						if env == tc.databaseEnv {
+							want = checkConclusionActionRequired
+						}
+						if check.Conclusion != want {
+							return false
+						}
+					}
+					return true
+				}, webhookIntegrationCheckRunDeadline, 10*time.Millisecond)
+			}
+			ctx, cancel := context.WithTimeout(t.Context(), webhookIntegrationCheckRunDeadline)
+			defer cancel()
+			h.DrainInProcessWebhookWork(ctx)
+			require.NoError(t, ctx.Err())
+			// Backfill restores a missing served aggregate through the same
+			// guarded discovery flow, even though this database has no sandbox.
+			sandbox, err := svc.Storage().Checks().Get(ctx, "octocat/hello-world", 1, "sandbox", aggregateSentinel, aggregateSentinel)
+			require.NoError(t, err)
+			require.NotNil(t, sandbox)
+			require.NoError(t, svc.Storage().Checks().Delete(ctx, sandbox.ID))
+			outcome, err := h.BackfillPRCheckRuns(ctx, "octocat/hello-world", 1, 12345)
+			require.NoError(t, err)
+			assert.Equal(t, "auto-plan started", outcome)
+			require.Eventually(t, func() bool {
+				check, err := svc.Storage().Checks().Get(ctx, "octocat/hello-world", 1, "sandbox", aggregateSentinel, aggregateSentinel)
+				return err == nil && check != nil && check.HeadSHA == "newsha222" && check.Conclusion == checkConclusionSuccess
+			}, webhookIntegrationCheckRunDeadline, 10*time.Millisecond)
+		})
 	}
 }
 

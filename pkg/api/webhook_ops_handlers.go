@@ -459,7 +459,7 @@ func executeChecksScanWith(ctx context.Context, cfg *ServerConfig, store storage
 	if err != nil {
 		return nil, err
 	}
-	response, err := scanWebhookMissingChecks(ctx, installationClient, store, req.Repo, webhookExpectedCheckNames(cfg, req.Repo, req.Environment, req.CheckName), req.Page, updatedSince, annotateAfter, logger)
+	response, err := scanWebhookMissingChecks(ctx, installationClient, store, req.Repo, webhookExpectedCheckNames(cfg, req.Repo, req.Environment, req.CheckName), req.Page, updatedSince, annotateAfter, logger, checkScanScope{config: cfg, environment: req.Environment, override: req.CheckName})
 	if err != nil {
 		return nil, err
 	}
@@ -916,8 +916,9 @@ func webhookExpectedCheckNames(cfg *ServerConfig, repo, environment, override st
 		return []webhookExpectedCheckName{{Name: fmt.Sprintf("%s (%s)", base, environment), Environment: environment}}
 	}
 	if len(cfg.AllowedEnvironments) > 0 {
-		out := make([]webhookExpectedCheckName, 0, len(cfg.AllowedEnvironments))
-		for _, env := range cfg.AllowedEnvironments {
+		environments, _ := cfg.CheckEnvironmentsForRepo(context.Background(), nil, repo, "")
+		out := make([]webhookExpectedCheckName, 0, len(environments))
+		for _, env := range environments {
 			out = append(out, webhookExpectedCheckName{Name: fmt.Sprintf("%s (%s)", base, env), Environment: env})
 		}
 		return out
@@ -983,7 +984,13 @@ func checkRunSittingLongEnough(startedAt time.Time, threshold time.Duration, now
 	return now.Sub(startedAt) >= threshold
 }
 
-func scanWebhookMissingChecks(ctx context.Context, client webhookMissingCheckScanClient, store storage.Storage, repo string, expectedNames []webhookExpectedCheckName, page int, updatedSince time.Time, annotateAfter time.Duration, logger *slog.Logger) (*ChecksScanResponse, error) {
+type checkScanScope struct {
+	config      *ServerConfig
+	environment string
+	override    string
+}
+
+func scanWebhookMissingChecks(ctx context.Context, client webhookMissingCheckScanClient, store storage.Storage, repo string, expectedNames []webhookExpectedCheckName, page int, updatedSince time.Time, annotateAfter time.Duration, logger *slog.Logger, scopes ...checkScanScope) (*ChecksScanResponse, error) {
 	prs, nextPage, lastPage, err := client.ListOpenPullRequestsPage(ctx, repo, page, webhookScanPRPageSize)
 	if err != nil {
 		return nil, err
@@ -1025,7 +1032,18 @@ func scanWebhookMissingChecks(ctx context.Context, client webhookMissingCheckSca
 		// is about to render. Letting the young one speak for both would send
 		// back the run an operator is looking at with nothing explaining it.
 		var annotate []bool
-		for _, expected := range expectedNames {
+		prNames := expectedNames
+		if len(scopes) > 0 {
+			stored, err := store.Checks().GetByPR(ctx, repo, pr.Number)
+			if err != nil {
+				return nil, fmt.Errorf("read retained check coverage %s#%d: %w", repo, pr.Number, err)
+			}
+			prNames, err = resolvedWebhookCheckNames(ctx, scopes[0].config, client, repo, pr.HeadSHA, scopes[0].environment, scopes[0].override, stored)
+			if err != nil {
+				return nil, err
+			}
+		}
+		for _, expected := range prNames {
 			run, untrustedApps, err := client.FindCheckRunByName(ctx, repo, pr.HeadSHA, expected.Name)
 			if err != nil {
 				return nil, fmt.Errorf("scan %s#%d for check %q at %s: %w", repo, pr.Number, expected.Name, pr.HeadSHA, err)
@@ -1067,6 +1085,19 @@ func scanWebhookMissingChecks(ctx context.Context, client webhookMissingCheckSca
 					continue
 				}
 				scoped := storedRowsForEnvironment(rows, incompleteEnvironments[i])
+				if len(scopes) > 0 {
+					for _, row := range rows {
+						if row.Environment == incompleteEnvironments[i] {
+							continue
+						}
+						for _, own := range scoped {
+							if own.Database == row.Database && own.DatabaseType == row.DatabaseType && slices.Contains(scopes[0].config.LocalCheckPrerequisites(own.Database, incompleteEnvironments[i], []string{row.Environment}), row.Environment) {
+								scoped = append(scoped, row)
+								break
+							}
+						}
+					}
+				}
 				incomplete[i].StoredRows = scoped
 				incomplete[i].WaitingOn = waitingOnForStoredRows(scoped)
 			}

@@ -167,13 +167,37 @@ When all environments are owned by one SchemaBot deployment, require this check:
 SchemaBot
 ```
 
-When `allowed_environments` is configured, SchemaBot publishes one aggregate per
-owned environment. Require each environment check that applies to the repository:
+When `allowed_environments` is configured, SchemaBot publishes the existing
+per-environment names for the repository's registered environments. Repository
+ownership comes from server-side `allowed_repos` or complete config discovery;
+missing stored results never establish that an environment is absent. For a
+repository registered in sandbox and production, the same App publishes:
 
 ```text
-SchemaBot (staging)
+SchemaBot (sandbox)
 SchemaBot (production)
 ```
+
+A repository without sandbox registration receives only its production check,
+including on documentation PRs. Repositories with sandbox keep its no-work check
+when a particular PR does not change sandbox-managed schema. An applicable clean
+plan stays visible. Discovery failures, missing or stale results, and retained
+unfinished applies block instead of becoming no-work success.
+
+A later environment's check also requires successful current-head outcomes from
+its databases' registered local predecessors in `environment_order`. Its summary
+keeps its own results and adds a notice such as `Waiting for sandbox: orders`
+linking to the earlier Check Run. Prerequisite blocks are computed from raw
+per-database state and never written into the later database's own result. Every
+earlier plan, apply, stop/resume, and rollback event refolds all applicable names,
+so finishing sandbox can unblock a clean production plan without a production
+apply. Commands and applies remain separate; completing sandbox never starts
+production. Remote promotion evidence and required-check names stay unchanged.
+
+Leaders select participants by changed paths and declared environment coverage,
+and conservatively fold earlier covered local environment Check Runs as well.
+Participant names and trusted App identity checks are unchanged. See
+[auto-plan configuration](configuration.md#auto-plan-behavior).
 
 If the GitHub App config sets `check-name`, require that configured base name
 instead. For example, `check-name: SchemaBot X` publishes `SchemaBot X` for a
@@ -538,7 +562,7 @@ Run output remains human-readable and may change.
 | `github_schema_config_discovery_unavailable` | Aggregate row | SchemaBot knew the PR head SHA, but GitHub was unavailable while SchemaBot inspected changed files or repository contents. |
 | `schema_config_discovery_failed` | Aggregate row | SchemaBot could reach GitHub, but could not determine the managed schema configuration or schema files. |
 | `pr_file_cap_exceeded` | Aggregate row | The PR changes more files than GitHub will report for a single pull request, so SchemaBot's changed-file list is incomplete. Unlike the reasons above this is a property of the PR itself, so it clears only when the PR is split — not by retrying. |
-| `no_allowed_configured_environments` | Aggregate row | Schema files changed, but none of the database's server-configured environments are allowed for this deployment. |
+| `no_allowed_configured_environments` | Aggregate row | The database has no configured environments from which scope can be established. |
 | `plan_failed_unrecorded` | Aggregate row | One environment of a multi-environment plan could not plan, and its failing per-database row could not be stored, so stored check state holds nothing of the failure. No plan command releases it; a re-run of the check or a new commit re-plans every environment and does. |
 | `narrowed_apply` | Per-database row | The rollout is going one target at a time (`--target`), so nothing yet shows the other targets have the change. It does not replace a reconciliation, review-time drift, or namespace placement block already on the row: the narrowed apply evaluated none of them. An apply or plan of the whole environment (`schemabot apply -e <environment>`) replaces it with its own result. |
 
@@ -1152,19 +1176,12 @@ continues to block until a new plan shows no changes or the changes are applied.
 
 ### Schema changes but no configured environments are allowed
 
-When `allowed_environments` is configured, a SchemaBot deployment may discover
-that the PR touches a managed database but none of that database's
-server-configured environments are allowed for this deployment. That is treated
-as a configuration mismatch, not a no-op. SchemaBot publishes a failing aggregate
-for the environments this deployment is responsible for, stores
-`blocking_reason=no_allowed_configured_environments`, and does not post a plan
-comment because no environment reached planning.
-
-This is different from a PR that touches no managed schema files. A PR with no
-managed schema files gets a passing aggregate so branch protection is not left
-waiting for SchemaBot. A PR with managed schema changes but no allowed configured
-environment gets a failing aggregate because SchemaBot found work it cannot
-safely plan.
+A known database with no registration in this deployment's served environments
+has no local work. After successful discovery verifies that scope, the deployment
+publishes no-work aggregates for its served environments. It does not add a
+database target or authorize an apply. An unknown database or an empty/unreadable
+registration fails closed. Existing aggregate guard blocks clear only after the
+normal auto-plan guards re-verify the PR.
 
 ### Stale in-progress check
 
@@ -1362,6 +1379,15 @@ After GitHub or webhook recovery, run a new plan or otherwise refresh the PR so
 branch protection reflects the current database state.
 
 ## Branch Protection Setup
+
+Before enabling an optional environment, audit required names and their App
+bindings. Preserve any already-required environment's registration until its
+explicit requirement migration is complete. Populate participant coverage and a
+complete promotion order first. Fence older publishers during upgrade, then
+recompute open PR heads through guarded backfill. A rollback must retain
+prerequisite-aware gating while earlier work remains unfinished; do not restore
+a publisher that can overwrite that block with a later-only success.
+
 
 Require the aggregate SchemaBot check in branch protection.
 

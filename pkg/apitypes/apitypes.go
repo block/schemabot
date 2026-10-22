@@ -429,7 +429,9 @@ type IncompleteCheckRun struct {
 type ChecksInspectRequest struct {
 	Repo        string `json:"repo"`
 	PullRequest int    `json:"pull_request"`
-	// Environment, when set, narrows the response to that environment's rows.
+	// Environment, when set, selects that environment's rows and unresolved
+	// local prerequisites explaining its gate. Missing prerequisite results are
+	// represented as pending evidence.
 	Environment string `json:"environment,omitempty"`
 }
 

@@ -116,7 +116,7 @@ func (h *Handler) convergeAggregatesForNoManagedSchemaChanges(ctx context.Contex
 	// retains them as blocking.
 	h.cleanupStaleChecks(repo, pr, headSHA, installationID, nil)
 
-	if h.isAggregateParticipant(repo) {
+	if h.isAggregateParticipant(repo) && !h.participantPathsTouched(repo, files) {
 		h.logger.Info("aggregate participant staying silent on plan for PR with no managed schema changes",
 			"repo", repo, "pr", pr, "head_sha", headSHA, "requested_by", requestedBy)
 		return nil

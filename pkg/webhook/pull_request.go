@@ -496,7 +496,7 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 		// leader publishes the required check and gates on participants' own
 		// checks when they exist, so a silent participant cannot wedge branch
 		// protection (its check is non-required by the aggregate contract).
-		if h.isAggregateParticipant(repo) {
+		if h.isAggregateParticipant(repo) && !h.participantPathsTouched(repo, files) {
 			h.logger.Info("aggregate participant staying silent on PR with no managed schema changes",
 				"repo", repo, "pr", pr, "head_sha", headSHA, "source", source, "delivery_id", deliveryID)
 			metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
@@ -567,6 +567,12 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 			"repo", repo, "pr", pr, "head_sha", headSHA, "base_ref", baseRef,
 			"source", source, "delivery_id", deliveryID)
 		return "auto-plan discarded because the PR moved during discovery", nil
+	}
+
+	// Discovery is complete. Publish empty environments and pending placeholders
+	// before independent database planners can finish in a different order.
+	if len(h.service.Config().AllowedEnvironments) > 0 {
+		h.updateAggregateCheck(ctx, client, repo, pr, headSHA)
 	}
 
 	postPlanComment := shouldPostComment()

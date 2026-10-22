@@ -1566,3 +1566,11 @@ func TestScanWebhookMissingChecksReportsStuckRunsWhenStoredStateIsUnreadable(t *
 	assert.Empty(t, result.Stuck[0].Checks[0].WaitingOn)
 	require.Len(t, result.Stuck[0].Checks, 1, "the finding the backfill acts on survives the failed read")
 }
+
+// Inspection and backfill share the registered environment candidate set.
+func TestWebhookExpectedCheckNamesUsesRegisteredEnvironments(t *testing.T) {
+	cfg := &ServerConfig{AllowedEnvironments: []string{"staging", "sandbox", "production"}, Databases: map[string]DatabaseConfig{"orders": {Environments: map[string]EnvironmentConfig{"staging": {}}}}}
+	assert.Equal(t, []webhookExpectedCheckName{
+		{Name: "SchemaBot (staging)", Environment: "staging"},
+	}, webhookExpectedCheckNames(cfg, "octocat/repo", "", ""))
+}

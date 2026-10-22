@@ -104,6 +104,7 @@ type Handler struct {
 	// aggregate re-folds have been armed while expected participants remain
 	// unresolved. Bounded by maxParticipantRefoldAttempts and cleared when a
 	// fold resolves every participant. Guarded by participantRefoldMu.
+	aggregateFoldMu           sync.Mutex
 	participantRefoldMu       sync.Mutex
 	participantRefoldAttempts map[string]int
 

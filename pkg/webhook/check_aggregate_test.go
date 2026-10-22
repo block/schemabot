@@ -578,3 +578,16 @@ func TestAnyInProgressOnCommit(t *testing.T) {
 	checks = append(checks, &storage.Check{HeadSHA: "current", DatabaseName: "billing", Status: checkStatusInProgress})
 	assert.True(t, anyInProgressOnCommit(checks, "current"))
 }
+
+func TestAggregateRequiresRecognizedTerminalSuccess(t *testing.T) {
+	for _, check := range []*storage.Check{
+		{Status: checkStatusCompleted, Conclusion: "neutral"},
+		{Status: checkStatusCompleted, Conclusion: "timed_out"},
+		{Status: checkStatusCompleted},
+		{Status: checkStatusCompleted, Conclusion: checkConclusionSuccess, BlockingReason: "reconciliation_required"},
+		{Status: "queued", Conclusion: checkConclusionSuccess},
+	} {
+		conclusion, _ := computeAggregate([]*storage.Check{check}, nil)
+		assert.NotEqual(t, checkConclusionSuccess, conclusion)
+	}
+}

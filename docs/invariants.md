@@ -541,7 +541,9 @@ check as not passing, so having nothing to say has to be said rather than left e
 logic applies in reverse. When SchemaBot expects a check, environment, or config and cannot find
 it, that reads as blocking, never as not-applicable. A gate must not be removable by the very
 change it guards. *Enforced:* aggregate creation on head-commit events
-(`pkg/webhook/check_suite.go`, `pkg/webhook/pull_request.go`); config discovery, the command
+(`pkg/webhook/check_suite.go`, `pkg/webhook/pull_request.go`); verified per-environment
+scope and pending contributions for missing local results (`pkg/webhook/aggregate_scope.go`,
+`pkg/webhook/check_publisher.go`); config discovery, the command
 path's choice of discovery over a passing refresh, and the aggregate leader's expected-participant
 match, which all read the schema paths a PR vacates as well as those it changes
 (`FindConfigsForPRFiles` in `pkg/github/config.go`, `prHasCurrentSchemaBotFiles` in
@@ -556,8 +558,10 @@ failing aggregate carrying a block no fold replaces (`storePlanFailedCheck` in
 
 The aggregate check reports the worst result among its per-database checks: one `in_progress`
 blocks, one `failure` fails, one `action_required` demands action, and the aggregate passes only
-when every database passes. A conclusion SchemaBot does not recognize blocks. *Enforced:* the
-aggregate rollup (`pkg/webhook/check_aggregate.go`).
+when every database and every applicable local predecessor passes on the current head. A
+conclusion SchemaBot does not recognize blocks. *Enforced:* the aggregate rollup
+(`pkg/webhook/check_aggregate.go`, `pkg/webhook/check_prerequisites.go`), with full folds
+serialized across publishers (`pkg/storage/internal/sqlstore/aggregate_lock.go`).
 
 ### MG-4: A check belongs to exactly one commit
 
