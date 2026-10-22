@@ -22,7 +22,7 @@ import (
 type OnboardCmd struct {
 	Database          string   `short:"d" required:"" help:"Database name from SchemaBot server config"`
 	Environment       string   `short:"e" required:"" help:"Source environment to pull from"`
-	SchemaDir         string   `short:"s" required:"" help:"Schema root to write schemabot.yaml and namespace directories" name:"schema_dir"`
+	SchemaDir         string   `short:"s" required:"" help:"Directory to write schemabot.yaml to; namespace directories go in its <environment> schema root when it has one" name:"schema_dir"`
 	Type              string   `help:"Database type override; resolved from the server's registered config when omitted"`
 	Namespaces        []string `name:"namespace" help:"Concrete live namespace to onboard. Repeat for multiple namespaces. Omit to discover all non-reserved namespaces."`
 	TemplateEnvSuffix bool     `help:"Write namespaces ending in _<environment> as _{env} directories" name:"template-env-suffix"`
@@ -125,9 +125,12 @@ func (cmd *OnboardCmd) Run(g *Globals) error {
 }
 
 type onboardWritePlan struct {
-	root         string
-	databaseType string
-	files        map[string]string
+	root string
+	// namespacePrefix is the environment schema root's path relative to
+	// root, "." when root is the schema root itself.
+	namespacePrefix string
+	databaseType    string
+	files           map[string]string
 	// exclusions carries an existing config's ignore_namespaces and
 	// ignore_tables through a rewrite, so re-onboarding does not drop the
 	// exclusions an operator configured, and plan verification excludes the
@@ -229,6 +232,18 @@ func buildOnboardWritePlan(schemaRoot string, resp *apitypes.PullSchemaResponse,
 		return nil, fmt.Errorf("pull schema returned no tables for database %s environment %s", resp.Database, resp.Environment)
 	}
 	root := filepath.Clean(schemaRoot)
+	// Namespace files go where the source environment's schema lives: the
+	// environment's own schema root when the config directory has one, so the
+	// files written are the files a plan of that environment reads. The config
+	// stays in the config directory either way.
+	environmentRoot, err := client.ResolveEnvironmentSchemaRoot(root, resp.Environment)
+	if err != nil {
+		return nil, fmt.Errorf("resolve the schema root for environment %s under %s: %w", resp.Environment, root, err)
+	}
+	namespacePrefix, err := filepath.Rel(root, environmentRoot)
+	if err != nil {
+		return nil, fmt.Errorf("locate environment schema root %s under %s: %w", environmentRoot, root, err)
+	}
 	configYAML, err := onboardConfigYAML(resp.Database, string(resp.Type), exclusions)
 	if err != nil {
 		return nil, err
@@ -302,7 +317,7 @@ func buildOnboardWritePlan(schemaRoot string, resp *apitypes.PullSchemaResponse,
 			// while preserving the namespace for future plans and version control.
 			// A namespace whose every table is withheld lands here too — the
 			// namespace is still the plan's, it simply declares nothing.
-			files[filepath.Join(namespace, "schema.sql")] = schema.EmptyNamespaceDeclaration
+			files[filepath.Join(namespacePrefix, namespace, "schema.sql")] = schema.EmptyNamespaceDeclaration
 		}
 		for _, tableName := range tableNames {
 			if err := validateRelativePathPart("table", tableName); err != nil {
@@ -312,11 +327,11 @@ func buildOnboardWritePlan(schemaRoot string, resp *apitypes.PullSchemaResponse,
 			if err != nil {
 				formatErrors = append(formatErrors, fmt.Errorf("format pulled schema for namespace %s table %s: %w", namespace, tableName, err))
 			} else {
-				files[filepath.Join(namespace, tableName+".sql")] = content
+				files[filepath.Join(namespacePrefix, namespace, tableName+".sql")] = content
 			}
 		}
 		if vschema := pulled.Artifacts["vschema.json"]; vschema != "" {
-			files[filepath.Join(namespace, "vschema.json")] = vschema
+			files[filepath.Join(namespacePrefix, namespace, "vschema.json")] = vschema
 		}
 	}
 
@@ -330,11 +345,12 @@ func buildOnboardWritePlan(schemaRoot string, resp *apitypes.PullSchemaResponse,
 	}
 
 	return &onboardWritePlan{
-		root:         root,
-		databaseType: resp.Type,
-		files:        files,
-		exclusions:   exclusions,
-		withheld:     withheldGroups,
+		root:            root,
+		namespacePrefix: namespacePrefix,
+		databaseType:    resp.Type,
+		files:           files,
+		exclusions:      exclusions,
+		withheld:        withheldGroups,
 	}, nil
 }
 
@@ -503,7 +519,7 @@ func (p *onboardWritePlan) withheldTableFilePaths() map[string]bool {
 	paths := make(map[string]bool)
 	for _, group := range p.withheld {
 		for _, table := range group.Tables {
-			paths[filepath.Join(group.Namespace, table+".sql")] = true
+			paths[filepath.Join(p.namespacePrefix, group.Namespace, table+".sql")] = true
 		}
 	}
 	return paths

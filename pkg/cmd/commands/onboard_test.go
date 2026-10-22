@@ -1011,3 +1011,75 @@ func TestOnboardConfigYAML_EmptyExclusionsOmitTheirKeys(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "database: testapp\ntype: mysql\n", out)
 }
+
+// Onboarding an environment whose schema lives in its own environment root
+// writes the namespace files there, through the environment symlink, and keeps
+// schemabot.yaml in the config directory: the files written are the files a
+// plan of that environment reads.
+func TestBuildOnboardWritePlanWritesIntoSymlinkedEnvironmentRoot(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "orders")
+	require.NoError(t, os.MkdirAll(filepath.Join(root, "base"), 0o755))
+	require.NoError(t, os.Symlink("base", filepath.Join(root, "production")))
+
+	plan, err := buildOnboardWritePlan(root, &apitypes.PullSchemaResponse{
+		Database:    "orders",
+		Type:        "mysql",
+		Environment: "production",
+		Namespaces: map[string]*apitypes.PulledNamespace{
+			"orders_001": {Tables: map[string]string{"users": "CREATE TABLE `users` (`id` bigint NOT NULL);\n"}},
+		},
+	}, client.PlanExclusions{})
+	require.NoError(t, err)
+	require.NoError(t, plan.write())
+
+	assert.Equal(t, []string{
+		filepath.Join(root, "base", "orders_001", "users.sql"),
+		filepath.Join(root, "schemabot.yaml"),
+	}, plan.paths())
+	assertOnboardedFilesArePlanned(t, root, "production", map[string]map[string]string{
+		"orders_001": {"users.sql": "CREATE TABLE `users` (\n    `id` bigint NOT NULL\n);\n"},
+	})
+}
+
+// An environment directory of namespace symlinks into a shared tree receives
+// the pulled files through those symlinks, so they land in the shared tree that
+// every environment listing the namespace reads.
+func TestBuildOnboardWritePlanWritesThroughEnvironmentNamespaceSymlinks(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "app")
+	shared := filepath.Join(root, "tables", "app_{env}")
+	require.NoError(t, os.MkdirAll(shared, 0o755))
+	require.NoError(t, os.MkdirAll(filepath.Join(root, "staging"), 0o755))
+	require.NoError(t, os.Symlink(filepath.Join("..", "tables", "app_{env}"), filepath.Join(root, "staging", "app_{env}")))
+
+	plan, err := buildOnboardWritePlan(root, &apitypes.PullSchemaResponse{
+		Database:    "app",
+		Type:        "mysql",
+		Environment: "staging",
+		Namespaces: map[string]*apitypes.PulledNamespace{
+			"app_{env}": {Tables: map[string]string{"items": "CREATE TABLE `items` (`id` bigint NOT NULL);\n"}},
+		},
+	}, client.PlanExclusions{})
+	require.NoError(t, err)
+	require.NoError(t, plan.write())
+
+	content, err := os.ReadFile(filepath.Join(shared, "items.sql"))
+	require.NoError(t, err)
+	assert.Equal(t, "CREATE TABLE `items` (\n    `id` bigint NOT NULL\n);\n", string(content))
+	assert.NoDirExists(t, filepath.Join(root, "app_{env}"), "nothing is written beside the environment roots")
+	assertOnboardedFilesArePlanned(t, root, "staging", map[string]map[string]string{
+		"app_staging": {"items.sql": "CREATE TABLE `items` (\n    `id` bigint NOT NULL\n);\n"},
+	})
+}
+
+func assertOnboardedFilesArePlanned(t *testing.T, root, environment string, want map[string]map[string]string) {
+	t.Helper()
+	schemaRoot, err := client.ResolveEnvironmentSchemaRoot(root, environment)
+	require.NoError(t, err)
+	grouped, _, err := client.ReadSchemaFiles(schemaRoot, environment, nil)
+	require.NoError(t, err)
+	got := make(map[string]map[string]string, len(grouped))
+	for namespace, files := range grouped {
+		got[namespace] = files.Files
+	}
+	assert.Equal(t, want, got)
+}

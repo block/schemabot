@@ -316,7 +316,11 @@ Next: open a normal PR with these files. SchemaBot will reconcile other configur
 `onboard` writes local files and verifies them with a plan; it does not apply
 DDL. It refuses to overwrite existing files by default. Keep the complete
 schema for the namespaces you manage: omitting an existing table can propose
-a drop. See [namespace scope](namespaces.md) for shared databases.
+a drop. See [namespace scope](namespaces.md) for shared databases. When the
+`-s` directory has an [environment schema root](namespaces.md#per-environment-schema-roots)
+for the source environment, `onboard` writes the namespace files there and
+keeps `schemabot.yaml` in the `-s` directory. `plan` and `apply` read that root
+for the environment too.
 
 The command's PR hint is for GitHub automation. You can also use the generated
 files directly with the CLI, as shown below.
