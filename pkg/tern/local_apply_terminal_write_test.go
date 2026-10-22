@@ -13,6 +13,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/engine"
+	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/panicsafe"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
@@ -105,6 +106,135 @@ func TestFinalizeSequentialApply_OutcomeSideEffectsWaitForTheStoredOutcome(t *te
 			require.Len(t, controlRequests.requests, 1)
 			assert.Equal(t, tc.wantStopStatus, controlRequests.requests[0].Status)
 			assert.Len(t, observer.terminal, tc.wantTerminalCalls)
+		})
+	}
+}
+
+// A sequential drive records its apply completed while an operator's stop is
+// pending. The write commits but its reply is lost, so the drive sees an error
+// even though storage holds the apply completed. When the completed row is
+// under this drive's lease, the write landed: the drive takes the stored row as
+// its own, settles the stop the outcome moots, posts the terminal summary, and
+// releases the active-apply gauge. When the row carries another lease's token,
+// nothing proves the write was this drive's (OW-2): the drive returns the write
+// error, the stop stays pending, nothing posts, and the gauge keeps its count.
+func TestFinalizeSequentialApply_SettledWriteWithALostReplyIsAdopted(t *testing.T) {
+	storedAt := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	cases := []struct {
+		name           string
+		storedToken    string
+		adopted        bool
+		wantStopStatus storage.ControlRequestStatus
+		wantGaugeDelta int64
+	}{
+		{name: "completed under this drive's lease", storedToken: "tok-a", adopted: true, wantStopStatus: storage.ControlRequestCompleted, wantGaugeDelta: 0},
+		{name: "completed under another lease", storedToken: "tok-b", wantStopStatus: storage.ControlRequestPending, wantGaugeDelta: 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			reader := newTernMetricsReader(t)
+			stored := failureLogTestApply(state.Apply.Running, 0)
+			stored.LeaseToken = tc.storedToken
+			writeErr := errors.New("connection reset by peer")
+			applies := &lostReplyApplyStore{snapshotApplyStore: &snapshotApplyStore{stored: *stored}, err: writeErr, storedAt: storedAt}
+			done := &storage.Task{ID: 1, TaskIdentifier: "task-1", ApplyID: stored.ID, TableName: "orders", State: state.Task.Completed}
+			controlRequests := pendingControlRequestStore(stored.ID, storage.ControlOperationStop)
+			client := &LocalClient{
+				config: LocalConfig{Database: "orders", Type: storage.DatabaseTypeMySQL},
+				storage: &exactProgressStorage{
+					applies:         applies,
+					tasks:           &exactProgressTaskStore{tasks: []*storage.Task{done}},
+					logs:            &mockApplyLogStore{},
+					controlRequests: controlRequests,
+				},
+				logger: slog.Default(),
+			}
+			observer := &terminalRecordingObserver{}
+			client.SetObserver(stored.ID, observer)
+			ctx := storage.WithApplyLease(t.Context(), storage.ApplyLease{ApplyID: stored.ID, Owner: "driver-a", Token: "tok-a"})
+			// The claim that admitted this drive counted the apply.
+			metrics.AdjustActiveApplies(ctx, 1, stored.Database, stored.Deployment, stored.Environment)
+
+			drive := *stored
+			err := client.finalizeSequentialApply(ctx, &drive, []*storage.Task{done}, nil, false)
+
+			assert.Equal(t, state.Apply.Completed, applies.stored.State, "the write committed either way")
+			if tc.adopted {
+				require.NoError(t, err)
+				assert.Equal(t, state.Apply.Completed, drive.State, "the drive adopts the outcome storage holds")
+				assert.Equal(t, storedAt, drive.UpdatedAt, "the drive takes the stored row, not its own copy")
+				require.Len(t, observer.terminal, 1)
+				assert.Equal(t, state.Apply.Completed, observer.terminal[0].State)
+			} else {
+				require.ErrorIs(t, err, writeErr)
+				assert.Empty(t, observer.terminal)
+			}
+			require.Len(t, controlRequests.requests, 1)
+			assert.Equal(t, tc.wantStopStatus, controlRequests.requests[0].Status)
+			assert.Equal(t, tc.wantGaugeDelta, activeAppliesDelta(t, reader))
+		})
+	}
+}
+
+// A grouped apply with no tasks (a VSchema-only plan) has nothing left to run,
+// and the write recording it completed commits but its reply is lost. When the
+// completed row is under this drive's lease, the write landed: the drive takes
+// the stored row as its own, records the transition in the apply log, releases
+// the active-apply gauge, and posts the terminal summary. When the row carries
+// another lease's token, nothing proves the write was this drive's (OW-2): the
+// drive returns the write error, logs and posts nothing, and the gauge keeps
+// its count.
+func TestCompleteTasklessGroupedApply_SettledWriteWithALostReplyIsAdoptedOnlyUnderThisLease(t *testing.T) {
+	storedAt := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	cases := []struct {
+		name           string
+		storedToken    string
+		adopted        bool
+		wantGaugeDelta int64
+	}{
+		{name: "completed under this drive's lease", storedToken: "tok-a", adopted: true, wantGaugeDelta: 0},
+		{name: "completed under another lease", storedToken: "tok-b", wantGaugeDelta: 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			reader := newTernMetricsReader(t)
+			stored := failureLogTestApply(state.Apply.Running, 0)
+			stored.LeaseToken = tc.storedToken
+			writeErr := errors.New("connection reset by peer")
+			applies := &lostReplyApplyStore{snapshotApplyStore: &snapshotApplyStore{stored: *stored}, err: writeErr, storedAt: storedAt}
+			logs := &mockApplyLogStore{}
+			client := &LocalClient{
+				config: LocalConfig{Database: "orders", Type: storage.DatabaseTypeVitess},
+				storage: &exactProgressStorage{
+					applies:         applies,
+					logs:            logs,
+					controlRequests: &testControlRequestStore{},
+				},
+				logger: slog.Default(),
+			}
+			observer := &terminalRecordingObserver{}
+			client.SetObserver(stored.ID, observer)
+			ctx := storage.WithApplyLease(t.Context(), storage.ApplyLease{ApplyID: stored.ID, Owner: "driver-a", Token: "tok-a"})
+			// The claim that admitted this drive counted the apply.
+			metrics.AdjustActiveApplies(ctx, 1, stored.Database, stored.Deployment, stored.Environment)
+
+			drive := *stored
+			err := client.completeTasklessGroupedApply(ctx, &drive, "")
+
+			assert.Equal(t, state.Apply.Completed, applies.stored.State, "the write committed either way")
+			if tc.adopted {
+				require.NoError(t, err)
+				assert.Equal(t, state.Apply.Completed, drive.State, "the drive adopts the outcome storage holds")
+				assert.Equal(t, storedAt, drive.UpdatedAt, "the drive takes the stored row, not its own copy")
+				assert.True(t, hasLogMessageContaining(logs.logs, "Apply completed with state: completed"))
+				require.Len(t, observer.terminal, 1)
+				assert.Equal(t, state.Apply.Completed, observer.terminal[0].State)
+			} else {
+				require.ErrorIs(t, err, writeErr)
+				assert.Empty(t, logs.logs)
+				assert.Empty(t, observer.terminal)
+			}
+			assert.Equal(t, tc.wantGaugeDelta, activeAppliesDelta(t, reader))
 		})
 	}
 }
@@ -258,11 +388,47 @@ func TestResumeApplyWithTasks_NoRemainingWorkSettlesMootedRequests(t *testing.T)
 	assert.Equal(t, state.Apply.Completed, applies.stored.State)
 	assert.Equal(t, int64(-1), activeAppliesDelta(t, reader), "completing the apply releases it from the active-apply gauge")
 	require.Len(t, controlRequests.requests, 1)
-	assert.Equal(t, storage.ControlRequestCompleted, controlRequests.requests[0].Status,
-		"the completed outcome moots the pending revert")
+	assert.Equal(t, storage.ControlRequestFailed, controlRequests.requests[0].Status,
+		"the completed outcome outran the pending revert")
+	assert.True(t, hasLogMessageContaining(logs.logs, "Revert did not take effect: the schema change completed before the revert could take effect"),
+		"the apply history records that the revert never landed")
 	require.Len(t, observer.terminal, 1)
 	assert.Equal(t, state.Apply.Completed, observer.terminal[0].State)
 	assert.Empty(t, eng.applied, "an apply with no remaining work hands nothing to the engine")
+}
+
+// The same re-claimed apply with an operator's skip-revert pending instead.
+// The completed outcome is the revert window closing with the change kept,
+// which is what the skip-revert asked for, so the drive that stores it answers
+// the skip-revert as carried out rather than leaving it pending.
+func TestResumeApplyWithTasks_NoRemainingWorkCompletesPendingSkipRevert(t *testing.T) {
+	logs := &mockApplyLogStore{}
+	taskStore := &exactProgressTaskStore{}
+	c, _, apply, applies, tasks := newLandedSiblingResume(t, taskStore, logs)
+	plan := &storage.Plan{ID: 5}
+	apply.PlanID = plan.ID
+	applies.stored = *apply
+	store := c.storage.(*exactProgressStorage)
+	store.plans = &fakePlanStore{getByIDFn: func(int64) (*storage.Plan, error) { return plan, nil }}
+	controlRequests := pendingControlRequestStore(apply.ID, storage.ControlOperationSkipRevert)
+	store.controlRequests = controlRequests
+	for _, task := range tasks {
+		task.State = state.Task.Completed
+	}
+	taskStore.tasks = tasks
+	observer := &terminalRecordingObserver{}
+	c.SetObserver(apply.ID, observer)
+
+	require.NoError(t, c.resumeApplyWithTasks(t.Context(), apply, nil, tasks, nil, false, false))
+
+	assert.Equal(t, state.Apply.Completed, applies.stored.State)
+	require.Len(t, controlRequests.requests, 1)
+	assert.Equal(t, storage.ControlRequestCompleted, controlRequests.requests[0].Status,
+		"the completed outcome is the skip-revert having taken effect")
+	assert.False(t, hasLogMessageContaining(logs.logs, "did not take effect"),
+		"a skip-revert that took effect is not disclosed as not applied")
+	require.Len(t, observer.terminal, 1)
+	assert.Equal(t, state.Apply.Completed, observer.terminal[0].State)
 }
 
 // A grouped drive failed every task of an apply, then the write recording the
@@ -299,8 +465,8 @@ func TestResumeApplyWithTasks_SettledFailedTaskFailsTheApply(t *testing.T) {
 	assert.Equal(t, "deploy request 5 not found", applies.stored.ErrorMessage)
 	assert.Equal(t, state.Task.Failed, failed.State, "a failed task stays failed")
 	require.Len(t, controlRequests.requests, 1)
-	assert.Equal(t, storage.ControlRequestCompleted, controlRequests.requests[0].Status,
-		"the failed outcome moots the pending revert")
+	assert.Equal(t, storage.ControlRequestFailed, controlRequests.requests[0].Status,
+		"the failed outcome outran the pending revert")
 	require.Len(t, observer.terminal, 1)
 	assert.Equal(t, state.Apply.Failed, observer.terminal[0].State)
 	assert.Empty(t, eng.applied, "an apply whose tasks are all settled hands nothing to the engine")
@@ -585,7 +751,7 @@ func TestResumeApplyWithTasks_BlockedTaskFailureOwesEveryTerminalSideEffect(t *t
 		{
 			name:             "request writes land",
 			wantStartStatus:  storage.ControlRequestFailed,
-			wantRevertStatus: storage.ControlRequestCompleted,
+			wantRevertStatus: storage.ControlRequestFailed,
 		},
 		{
 			name:             "request writes are refused",
@@ -717,12 +883,168 @@ func TestExecuteGroupedApply_FailureReturnsOweTerminalSideEffects(t *testing.T) 
 			assert.Contains(t, applyStore.apply.ErrorMessage, tc.wantErrorText)
 			assert.Equal(t, state.Task.Failed, tasks[0].State)
 			require.Len(t, requests.requests, 1)
-			assert.Equal(t, storage.ControlRequestCompleted, requests.requests[0].Status,
-				"the failed outcome moots the pending revert")
+			assert.Equal(t, storage.ControlRequestFailed, requests.requests[0].Status,
+				"the failed outcome outran the pending revert")
 			require.Len(t, observer.terminal, 1, "the stored failure owes its terminal summary")
 			assert.Equal(t, state.Apply.Failed, observer.terminal[0].State)
 		})
 	}
+}
+
+// A fresh grouped Vitess drive whose change is already in place on the target:
+// the engine accepts it with a resume state naming a deploy request that
+// reported no changes, and the first progress poll reads that request as
+// completed. The apply and its task settle as completed, with one terminal
+// summary, rather than failing for a resume state the drive did receive.
+func TestExecuteGroupedApply_ConvergedDeployRequestCompletes(t *testing.T) {
+	operationID := int64(7)
+	apply := &storage.Apply{
+		ID: 42, ApplyIdentifier: "apply-grouped-converged", Database: "testdb",
+		DatabaseType: storage.DatabaseTypeVitess, Engine: storage.EnginePlanetScale,
+		State: state.Apply.Pending,
+	}
+	tasks := []*storage.Task{{
+		ID: 7, ApplyID: apply.ID, ApplyOperationID: &operationID, TaskIdentifier: "task-grouped-converged",
+		Database: "testdb", DatabaseType: storage.DatabaseTypeVitess, Namespace: "commerce", TableName: "users",
+		DDL: "ALTER TABLE `users` MODIFY COLUMN `email` varchar(255)", DDLAction: "alter",
+		State: state.Task.Pending,
+	}}
+	plan := &storage.Plan{
+		PlanIdentifier: "plan-grouped-converged",
+		Namespaces:     map[string]*storage.NamespacePlanData{"commerce": {}},
+	}
+	applyStore := &snapshotApplyStore{stored: *apply}
+	eng := &fakeControlEngine{
+		applyResult: &engine.ApplyResult{
+			Accepted: true,
+			Message:  "no changes detected",
+			ResumeState: &engine.ResumeState{
+				MigrationContext: apply.ApplyIdentifier,
+				Metadata:         `{"branch_name":"branch-1","deploy_request_id":5}`,
+			},
+		},
+		progressResult: &engine.ProgressResult{State: engine.StateCompleted, Message: "No changes detected"},
+	}
+	client := &LocalClient{
+		config: LocalConfig{Database: "testdb", Type: storage.DatabaseTypeVitess},
+		storage: &exactProgressStorage{
+			applies:         applyStore,
+			tasks:           &exactProgressTaskStore{tasks: tasks},
+			controlRequests: &testControlRequestStore{},
+			applyOperations: &exactProgressApplyOperationStore{ops: []*storage.ApplyOperation{
+				{ID: operationID, ApplyID: apply.ID, State: state.Apply.Pending},
+			}},
+		},
+		planetscaleEngine:        eng,
+		heartbeatInterval:        time.Hour,
+		taskPollIntervalOverride: time.Millisecond,
+		logger:                   slog.Default(),
+	}
+	observer := &terminalRecordingObserver{}
+	client.SetObserver(apply.ID, observer)
+
+	require.NoError(t, client.executeGroupedApply(t.Context(), apply, tasks, plan, nil, false))
+
+	assert.Equal(t, state.Apply.Completed, applyStore.stored.State)
+	assert.Empty(t, applyStore.stored.ErrorMessage)
+	assert.Equal(t, state.Task.Completed, tasks[0].State)
+	require.NotNil(t, eng.progressReq, "the drive follows the converged deploy request through a progress poll")
+	assert.Equal(t, `{"branch_name":"branch-1","deploy_request_id":5}`, eng.progressReq.ResumeState.Metadata)
+	require.Len(t, observer.terminal, 1, "the completed apply owes its terminal summary")
+	assert.Equal(t, state.Apply.Completed, observer.terminal[0].State)
+}
+
+// A grouped Vitess resume whose stored state names no deploy request yet
+// reattaches, and the engine finds the change already in place: it accepts the
+// resume with a resume state naming a deploy request that reported no changes.
+// The resume follows that state to a completed outcome instead of exiting for a
+// resume state it did receive and re-reading the same result on every retry.
+func TestLaunchAtomicResume_ConvergedDeployRequestCompletes(t *testing.T) {
+	operationStore := &exactProgressApplyOperationStore{
+		data: &storage.EngineResumeState{ApplyOperationID: 7, MigrationContext: "apply-reattach-vitess"},
+	}
+	operationStore.ops = []*storage.ApplyOperation{{ID: 7, ApplyID: 42, State: state.Apply.Recovering}}
+	applyResult := &engine.ApplyResult{
+		Accepted: true,
+		Message:  "no changes detected",
+		ResumeState: &engine.ResumeState{
+			MigrationContext: "apply-reattach-vitess",
+			Metadata:         `{"branch_name":"branch-1","deploy_request_id":5}`,
+		},
+	}
+	client, apply, tasks, plan, _ := reattachResumeFixture(operationStore, applyResult)
+	eng := client.planetscaleEngine.(*fakeControlEngine)
+	eng.progressResult = &engine.ProgressResult{State: engine.StateCompleted, Message: "No changes detected"}
+	store := client.storage.(*exactProgressStorage)
+	applyStore := &snapshotApplyStore{stored: *apply}
+	store.applies = applyStore
+	store.controlRequests = &testControlRequestStore{}
+	store.logs = &mockApplyLogStore{}
+	client.heartbeatInterval = time.Hour
+	client.taskPollIntervalOverride = time.Millisecond
+	observer := &terminalRecordingObserver{}
+	client.SetObserver(apply.ID, observer)
+
+	err := client.launchAtomicResume(t.Context(), apply, tasks, plan, apply.GetOptions().Map(), "Recovering from checkpoint", true, false, false)
+
+	require.NoError(t, err, "a resume state naming the converged deploy request is enough to follow it")
+	assert.Equal(t, state.Apply.Completed, applyStore.stored.State)
+	assert.Equal(t, state.Task.Completed, tasks[0].State)
+	require.NotNil(t, eng.progressReq)
+	assert.Equal(t, `{"branch_name":"branch-1","deploy_request_id":5}`, eng.progressReq.ResumeState.Metadata)
+	require.Len(t, observer.terminal, 1, "the completed apply owes its terminal summary")
+	assert.Equal(t, state.Apply.Completed, observer.terminal[0].State)
+}
+
+// PlanetScale accepts a Vitess deploy but its response is lost, and the
+// re-read that would show the deploy started fails too, so the engine reports
+// the outcome as unknown. The drive pauses the apply as failed_retryable
+// instead of failing it: the deploy may be running, and recovery re-reads the
+// deploy request named in the stored resume state rather than deploying again.
+// Nothing terminal is owed yet, so the pending revert stays pending and no
+// terminal summary posts.
+func TestExecuteGroupedApply_UnknownDeployOutcomePausesForRecovery(t *testing.T) {
+	operationID := int64(7)
+	apply := &storage.Apply{
+		ID: 42, ApplyIdentifier: "apply-grouped-unknown", Database: "testdb",
+		DatabaseType: storage.DatabaseTypeVitess, Engine: storage.EnginePlanetScale,
+		State: state.Apply.Pending,
+	}
+	tasks := []*storage.Task{{
+		ID: 7, ApplyID: apply.ID, ApplyOperationID: &operationID, TaskIdentifier: "task-grouped-unknown",
+		Database: "testdb", DatabaseType: storage.DatabaseTypeVitess, Namespace: "commerce", TableName: "users",
+		DDL: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)", DDLAction: "alter",
+		State: state.Task.Pending,
+	}}
+	plan := &storage.Plan{PlanIdentifier: "plan-grouped-unknown", Namespaces: map[string]*storage.NamespacePlanData{"commerce": {}}}
+	applyStore := &exactProgressApplyStore{apply: apply}
+	requests := pendingControlRequestStore(apply.ID, storage.ControlOperationRevert)
+	eng := &fakeControlEngine{applyErr: engine.NewOutcomeUnknownError(
+		"deploy deploy request #11: unexpected EOF (re-reading deploy request #11 to check whether the deploy started also failed: connection reset by peer)")}
+	client := &LocalClient{
+		config: LocalConfig{Database: "testdb", Type: storage.DatabaseTypeVitess},
+		storage: &exactProgressStorage{
+			applies:         applyStore,
+			tasks:           &exactProgressTaskStore{tasks: tasks},
+			controlRequests: requests,
+			applyOperations: &exactProgressApplyOperationStore{},
+		},
+		planetscaleEngine: eng,
+		heartbeatInterval: time.Hour,
+		logger:            slog.Default(),
+	}
+	observer := &terminalRecordingObserver{}
+	client.SetObserver(apply.ID, observer)
+
+	require.NoError(t, client.executeGroupedApply(t.Context(), apply, tasks, plan, nil, false))
+
+	assert.Equal(t, state.Apply.FailedRetryable, applyStore.apply.State)
+	assert.Contains(t, applyStore.apply.ErrorMessage, "re-reading deploy request #11")
+	assert.Equal(t, state.Task.FailedRetryable, tasks[0].State)
+	require.Len(t, requests.requests, 1)
+	assert.Equal(t, storage.ControlRequestPending, requests.requests[0].Status,
+		"no outcome is settled, so the revert stays pending for the recovery")
+	assert.Empty(t, observer.terminal, "a paused apply owes no terminal summary")
 }
 
 // A grouped apply's engine reports the schema change completed while an
@@ -750,7 +1072,7 @@ func TestPollForCompletionAtomic_OutcomeSideEffectsWaitForTheStoredOutcome(t *te
 		{
 			name:              "outcome write lands",
 			wantStoredState:   state.Apply.Completed,
-			wantRevertStatus:  storage.ControlRequestCompleted,
+			wantRevertStatus:  storage.ControlRequestFailed,
 			wantTerminalCalls: 1,
 		},
 	}
@@ -780,6 +1102,154 @@ func TestPollForCompletionAtomic_OutcomeSideEffectsWaitForTheStoredOutcome(t *te
 			require.Len(t, controlRequests.requests, 1)
 			assert.Equal(t, tc.wantRevertStatus, controlRequests.requests[0].Status)
 			assert.Len(t, observer.terminal, tc.wantTerminalCalls)
+		})
+	}
+}
+
+// lostReplyDerivedStateApplyStore commits the rollout projection's state write
+// and then reports err, modelling a grouped drive's settled-state write whose
+// acknowledgement was lost when the connection dropped. The committed row
+// carries storedAt, when set, as its updated_at, the way a real store stamps
+// the write's own time, so a drive that adopts the stored row is told apart
+// from one that kept its own copy.
+type lostReplyDerivedStateApplyStore struct {
+	*snapshotApplyStore
+	err      error
+	storedAt time.Time
+}
+
+func (s *lostReplyDerivedStateApplyStore) UpdateDerivedState(ctx context.Context, id int64, expectedState, newState, errorMessage string, startedAt, completedAt *time.Time) (bool, error) {
+	if _, err := s.snapshotApplyStore.UpdateDerivedState(ctx, id, expectedState, newState, errorMessage, startedAt, completedAt); err != nil {
+		return false, err
+	}
+	if !s.storedAt.IsZero() {
+		s.stored.UpdatedAt = s.storedAt
+	}
+	return false, s.err
+}
+
+// CheckLease accepts the lease the stored apply carries, so the drive's
+// settlement writes run under it once the outcome is stored.
+func (s *lostReplyDerivedStateApplyStore) CheckLease(_ context.Context, lease storage.ApplyLease) error {
+	if s.stored.LeaseToken != lease.Token {
+		return storage.ErrApplyLeaseLost
+	}
+	return nil
+}
+
+// A grouped apply over two shards settles while an operator's revert is
+// pending, and the write recording the settled state commits but its reply is
+// lost, so the drive sees an error. When storage holds that state under this
+// drive's lease, the write landed: the drive takes the stored row as its own
+// and answers for the outcome the way a write with a reply would, rather than
+// leaving it for the next restart's reconciliation. A completed, failed, or
+// stopped apply answers the revert it outran as not applied (none of them is
+// the reverted outcome the revert asked for) and posts its terminal summary; a
+// stopped apply stays counted on the active-apply gauge and the others release
+// it. A failed_retryable pause answers the revert the same way, releases the
+// gauge, and sends a progress update rather than a terminal summary. When the stored row
+// carries another lease's token, nothing proves the write was this drive's
+// (OW-2): the drive exits with the write error, the revert stays pending,
+// nothing posts, and the gauge is left alone.
+func TestPollForCompletionAtomic_SettledWriteWithALostReplyIsAdoptedOnlyUnderThisLease(t *testing.T) {
+	const engineFailure = "copy of shard -80 failed"
+	writeErr := errors.New("connection reset by peer")
+	storedAt := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	cases := []struct {
+		name              string
+		result            engine.ProgressResult
+		storedToken       string
+		wantState         string
+		wantRevertStatus  storage.ControlRequestStatus
+		wantTerminalCalls int
+		wantProgressCalls int
+		wantGaugeDelta    int64
+	}{
+		{
+			name:              "completed under this drive's lease",
+			result:            engine.ProgressResult{State: engine.StateCompleted},
+			storedToken:       "tok-a",
+			wantState:         state.Apply.Completed,
+			wantRevertStatus:  storage.ControlRequestFailed,
+			wantTerminalCalls: 1,
+			wantGaugeDelta:    -1,
+		},
+		{
+			name:              "failed under this drive's lease",
+			result:            engine.ProgressResult{State: engine.StateFailed, ErrorMessage: engineFailure},
+			storedToken:       "tok-a",
+			wantState:         state.Apply.Failed,
+			wantRevertStatus:  storage.ControlRequestFailed,
+			wantTerminalCalls: 1,
+			wantGaugeDelta:    -1,
+		},
+		{
+			name:              "stopped under this drive's lease",
+			result:            engine.ProgressResult{State: engine.StateStopped},
+			storedToken:       "tok-a",
+			wantState:         state.Apply.Stopped,
+			wantRevertStatus:  storage.ControlRequestFailed,
+			wantTerminalCalls: 1,
+			wantGaugeDelta:    0,
+		},
+		{
+			name:              "paused for retry under this drive's lease",
+			result:            engine.ProgressResult{State: engine.StateFailed, Retryable: true, ErrorMessage: engineFailure},
+			storedToken:       "tok-a",
+			wantState:         state.Apply.FailedRetryable,
+			wantRevertStatus:  storage.ControlRequestFailed,
+			wantProgressCalls: 1,
+			wantGaugeDelta:    -1,
+		},
+		{
+			name:             "completed under another lease",
+			result:           engine.ProgressResult{State: engine.StateCompleted},
+			storedToken:      "tok-b",
+			wantState:        state.Apply.Completed,
+			wantRevertStatus: storage.ControlRequestPending,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			reader := newTernMetricsReader(t)
+			result := tc.result
+			eng := &lostWorkEngine{phaseSequenceEngine: phaseSequenceEngine{results: []*engine.ProgressResult{&result}}}
+			client, apply, tasks, _ := lostWorkAtomicPollFixture(eng, lostWorkTrustBudgetAmple)
+			store := client.storage.(*exactProgressStorage)
+			snapshot, ok := store.applies.(*snapshotApplyStore)
+			require.True(t, ok)
+			snapshot.stored.LeaseToken = tc.storedToken
+			apply.LeaseToken = "tok-a"
+			store.applies = &lostReplyDerivedStateApplyStore{snapshotApplyStore: snapshot, err: writeErr, storedAt: storedAt}
+			controlRequests := pendingControlRequestStore(apply.ID, storage.ControlOperationRevert)
+			store.controlRequests = controlRequests
+			observer := &progressRecordingObserver{}
+			client.SetObserver(apply.ID, observer)
+			ctx := storage.WithApplyLease(t.Context(), storage.ApplyLease{ApplyID: apply.ID, Owner: "driver-a", Token: "tok-a"})
+
+			pollErr := client.pollForCompletionAtomic(ctx, apply, tasks, nil, nil, map[string]string{}, false)
+
+			assert.Equal(t, tc.wantState, snapshot.stored.State, "the write committed either way")
+			adopted := tc.wantTerminalCalls+tc.wantProgressCalls > 0
+			if adopted {
+				require.NoError(t, pollErr)
+				assert.Equal(t, tc.wantState, apply.State, "the drive adopts the outcome storage holds")
+				assert.Equal(t, storedAt, apply.UpdatedAt, "the drive takes the stored row, not its own copy")
+			} else {
+				require.ErrorIs(t, pollErr, writeErr)
+			}
+			require.Len(t, controlRequests.requests, 1)
+			assert.Equal(t, tc.wantRevertStatus, controlRequests.requests[0].Status)
+			require.Len(t, observer.terminal, tc.wantTerminalCalls)
+			if tc.wantTerminalCalls > 0 {
+				assert.Equal(t, tc.wantState, observer.terminal[0].State)
+			}
+			require.Len(t, observer.progress, tc.wantProgressCalls)
+			if tc.wantProgressCalls > 0 {
+				assert.Equal(t, tc.wantState, observer.progress[0].State)
+				assert.Equal(t, engineFailure, observer.progress[0].ErrorMessage)
+			}
+			assert.Equal(t, tc.wantGaugeDelta, activeAppliesDelta(t, reader))
 		})
 	}
 }
@@ -1231,7 +1701,7 @@ func TestPollForCompletionAtomic_PermanentFailureSideEffectsWaitForTheStoredFail
 			name:              "failure write lands",
 			wantStoredState:   state.Apply.Failed,
 			wantDriveState:    state.Apply.Failed,
-			wantRevertStatus:  storage.ControlRequestCompleted,
+			wantRevertStatus:  storage.ControlRequestFailed,
 			wantTerminalCalls: 1,
 		},
 	}
@@ -1282,10 +1752,14 @@ func (o *progressRecordingObserver) OnProgress(apply *storage.Apply, _ []*storag
 }
 
 // lostReplyApplyStore commits every apply write and then reports err, modelling
-// a write whose acknowledgement was lost when the connection dropped.
+// a write whose acknowledgement was lost when the connection dropped. When
+// storedAt is set, the committed row carries it as its updated_at, the way a
+// real store stamps the write's own time, so a drive that adopts the stored row
+// is told apart from one that kept its own copy.
 type lostReplyApplyStore struct {
 	*snapshotApplyStore
-	err error
+	err      error
+	storedAt time.Time
 }
 
 // CheckLease accepts the lease the stored apply carries, so the drive's
@@ -1300,6 +1774,9 @@ func (s *lostReplyApplyStore) CheckLease(_ context.Context, lease storage.ApplyL
 func (s *lostReplyApplyStore) Update(ctx context.Context, apply *storage.Apply) error {
 	if err := s.snapshotApplyStore.Update(ctx, apply); err != nil {
 		return err
+	}
+	if !s.storedAt.IsZero() {
+		s.stored.UpdatedAt = s.storedAt
 	}
 	return s.err
 }
@@ -1343,7 +1820,7 @@ func TestFailApplyAndNotify_LandedWriteWithALostReplyOwesItsSideEffects(t *testi
 	assert.Equal(t, state.Apply.Failed, drive.State, "the drive adopts the outcome storage holds")
 	require.Len(t, controlRequests.requests, 2)
 	assert.Equal(t, storage.ControlRequestFailed, controlRequests.requests[0].Status, "the admitting start is answered with the failure")
-	assert.Equal(t, storage.ControlRequestCompleted, controlRequests.requests[1].Status, "the failure moots the pending revert")
+	assert.Equal(t, storage.ControlRequestFailed, controlRequests.requests[1].Status, "the failure outran the pending revert")
 	assert.True(t, hasLogMessageContaining(logs.logs, "Apply failed: engine lost its connection to the target"))
 	require.Len(t, observer.terminal, 1)
 	assert.Equal(t, state.Apply.Failed, observer.terminal[0].State)
@@ -1416,27 +1893,31 @@ func TestFailApplyAndNotify_AFailureThisDriveCannotProveIsNotLanded(t *testing.T
 	}
 }
 
-// The re-read after a failure write returned an error proves the write landed
-// only when storage holds the apply failed, with this drive's message, under
-// the lease this drive holds for this apply. A stored row that is still active
-// is not landed even when it already carries this drive's token and an equal
-// message; a lease held for a different apply proves nothing about this one;
-// and a re-read that fails proves nothing at all.
-func TestFailureWriteLanded_ProvesTheWriteOnlyFromAFailedRowUnderThisLease(t *testing.T) {
+// The re-read after an outcome write returned an error proves the write landed
+// only when storage holds the apply in the state the write was recording, with
+// this drive's message, under the lease this drive holds for this apply. That
+// holds for a failure and for a pause for retry alike. A stored row in any
+// other state is not landed even when it already carries this drive's token and
+// an equal message; a lease held for a different apply proves nothing about
+// this one; and a re-read that fails proves nothing at all.
+func TestOutcomeWriteLanded_ProvesTheWriteOnlyFromTheWantedStateUnderThisLease(t *testing.T) {
 	const failure = "engine lost its connection to the target"
 	writeErr := errors.New("connection reset by peer")
 	cases := []struct {
 		name                 string
 		storedState          string
+		wantState            string
 		reReadErr            error
 		leaseForAnotherApply bool
 		landed               bool
 	}{
-		{name: "failed row under this lease", storedState: state.Apply.Failed, landed: true},
-		{name: "active row with a matching message and token", storedState: state.Apply.Running},
-		{name: "cancelled row with a matching message and token", storedState: state.Apply.Cancelled},
-		{name: "lease held for another apply", storedState: state.Apply.Failed, leaseForAnotherApply: true},
-		{name: "re-read fails", storedState: state.Apply.Failed, reReadErr: errors.New("replica unavailable")},
+		{name: "failed row under this lease", storedState: state.Apply.Failed, wantState: state.Apply.Failed, landed: true},
+		{name: "failed_retryable row under this lease", storedState: state.Apply.FailedRetryable, wantState: state.Apply.FailedRetryable, landed: true},
+		{name: "failed row when the write recorded a pause", storedState: state.Apply.Failed, wantState: state.Apply.FailedRetryable},
+		{name: "active row with a matching message and token", storedState: state.Apply.Running, wantState: state.Apply.Failed},
+		{name: "cancelled row with a matching message and token", storedState: state.Apply.Cancelled, wantState: state.Apply.Failed},
+		{name: "lease held for another apply", storedState: state.Apply.Failed, wantState: state.Apply.Failed, leaseForAnotherApply: true},
+		{name: "re-read fails", storedState: state.Apply.Failed, wantState: state.Apply.Failed, reReadErr: errors.New("replica unavailable")},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1454,12 +1935,12 @@ func TestFailureWriteLanded_ProvesTheWriteOnlyFromAFailedRowUnderThisLease(t *te
 			}
 			ctx := storage.WithApplyLease(t.Context(), lease)
 
-			landed, got := client.failureWriteLanded(ctx, stored, failure, writeErr)
+			landed, got := client.outcomeWriteLanded(ctx, stored, tc.wantState, failure, writeErr)
 
 			assert.Equal(t, tc.landed, landed)
 			if tc.landed {
 				require.NotNil(t, got)
-				assert.Equal(t, state.Apply.Failed, got.State)
+				assert.Equal(t, tc.wantState, got.State)
 				assert.Equal(t, failure, got.ErrorMessage)
 			} else {
 				assert.Nil(t, got)

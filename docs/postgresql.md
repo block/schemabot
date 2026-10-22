@@ -454,17 +454,37 @@ a reviewed drop before the rest can be pulled. `CREATE UNLOGGED TABLE`,
 `PARTITION BY` and a child of `INHERITS` flattened to its own columns are all
 accepted in a hand-written file.
 
-Foreign keys change which remedy is available, and the plan says which. The
-declarative format does not support foreign keys, so a table that owns them
-cannot be declared: a file for it fails to parse, and a file that omits them
-plans their removal as a destructive `DROP CONSTRAINT`. The plan names the
-constraints; the table must be dropped, or have its foreign keys removed
-before it is declared, through a separately reviewed process. A table that
-other tables reference can be declared — the constraints live on the
-referencing tables, not in its own definition — but only by a hand-written
-file, because the pull refuses to render a table it would describe
-incompletely; and a drop has to take the referencing constraints with it. The
-plan names those constraints too, so both sides of one relationship explain
+Foreign keys are planned but not applied. A file may declare a foreign key
+whose referenced table is unqualified and already exists on the target in the
+same namespace; a file that creates the referenced table in the same plan does
+not count, so leave the foreign key out of the file, apply the referenced
+table first, then run the `ADD CONSTRAINT` outside SchemaBot and add the
+foreign key back to the file. A declared foreign key that matches the live one plans no change. One the file
+adds plans as an `ADD CONSTRAINT` that names the referenced table with its
+namespace, and a live one the file omits plans as a destructive
+`DROP CONSTRAINT`; both are shown for review and blocked, because SchemaBot
+does not apply foreign-key changes on PostgreSQL yet. A blocked step blocks the
+whole plan. A dropped foreign key is usually one the file left out: declare
+it in the file to keep it, which plans no change, or run the `DROP CONSTRAINT`
+outside SchemaBot and re-plan to remove it. A foreign key into another
+namespace cannot be declared, so when the table carries one, the blocked step
+names it and the plan stays blocked until it is removed. An added one may sit
+on a column the same plan adds, so leave it out of the file to apply the rest of the plan first, then run the `ADD CONSTRAINT`
+outside SchemaBot and add the foreign key back to the file. A new table that
+declares a foreign key is blocked as a whole: leave the foreign key out of the
+file to create the table, then add it the same way. Planning copies each
+referenced table's shape, so the planning role needs `SELECT` on it; it never
+blocks writes to it.
+
+The pull refuses to render a table with a foreign key on either side, because
+it would describe the table incompletely, so such a table needs a hand-written
+file. One that owns foreign keys is declared with them; one that other tables
+reference is declared without them, since the constraints live on the
+referencing tables, not in its own definition. A table that owns a foreign key
+into another namespace cannot be declared at all: remove that foreign key or
+drop the table through a separately reviewed process. A drop of a referenced
+table has to take the referencing constraints with it. The plan names the
+constraints on both sides, so both sides of one relationship explain
 themselves.
 
 Archive tables named `<table>_archive_YYYY[_MM[_DD]]` with no schema file are
@@ -665,6 +685,7 @@ solely from a state this engine never reports.
 | `engine.CancelledResumeStateReclaimer.ReclaimCancelledResumeState` | Not applicable; not implemented | Each statement runs in this process against the target directly; nothing is set up in a remote service ahead of the work that owns its teardown, so a cancel that lands between drives finds no stored resume state naming work to reclaim. | [`pkg/engine/engine.go`](../pkg/engine/engine.go), [`pkg/engine/postgres/apply.go`](../pkg/engine/postgres/apply.go) |
 | `engine.ControlResumeValidator.ValidateControlResumeState` | Not applicable; not implemented | Control requests use `ResumeState.MigrationContext` only as the in-memory apply key and have no opaque, operation-specific remote state to validate. | [`pkg/engine/postgres/apply.go`](../pkg/engine/postgres/apply.go), [`pkg/engine/postgres/cancel.go`](../pkg/engine/postgres/cancel.go) |
 | `engine.ShardKeyedPlanning.PlansEachShard` | Not applicable; not implemented | A PostgreSQL target is not sharded, so its tasks carry no shard and the plan never needs to speak for one. | [`pkg/engine/engine.go`](../pkg/engine/engine.go) |
+| `engine.TargetDrainer.DrainTargetContext` | Not applicable; not implemented | The PostgreSQL engine tracks its in-flight work as a whole, so a drive waits for all of it through `DrainContext`. | [`pkg/engine/engine.go`](../pkg/engine/engine.go) |
 
 ## Failure and recovery
 
@@ -747,7 +768,9 @@ schema inside a transaction it then rolls back, so the planning role also
 needs `CREATE` on the target database, and the connection must be read-write
 rather than a hot standby. Nothing persists — the transaction is rolled back —
 but a role provisioned with only the apply-time privileges fails at plan time
-with a permission error on the database.
+with a permission error on the database. A schema file that declares a foreign
+key also needs `SELECT` on each referenced table, because planning copies that
+table's shape.
 
 ## Supabase compatibility tests
 

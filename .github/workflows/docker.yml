@@ -209,7 +209,7 @@ jobs:
           path: |
             ~/go/pkg/mod
             ~/.cache/go-build
-          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum', 'e2e/consumermodule/go.sum') }}
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum', 'e2e/consumermodule/go.sum', '.github/go-cache-epoch') }}
           restore-keys: go-${{ runner.os }}-${{ runner.arch }}-
       - name: "Build LocalScale binary"
         run: CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o bin/localscale-linux ./cmd/localscale

@@ -14,6 +14,11 @@ on:
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
+env:
+  # The installed minikube and the key of its cached node image and preload
+  # read this one value, so a version bump cannot leave a stale cache entry
+  # that exactly matches the old key.
+  MINIKUBE_VERSION: "1.39.0"
 jobs:
   # Detect whether the change touches any non-markdown file.
   # PRs that touch only docs skip the heavy jobs below; pushes (main/tags)
@@ -99,7 +104,7 @@ jobs:
           path: |
             ~/go/pkg/mod
             ~/.cache/go-build
-          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum', 'e2e/consumermodule/go.sum') }}
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum', 'e2e/consumermodule/go.sum', '.github/go-cache-epoch') }}
           restore-keys: go-${{ runner.os }}-${{ runner.arch }}-
       - name: "Build"
         run: go build -v ./...
@@ -114,13 +119,18 @@ jobs:
       - name: "Warm consumer-module cache"
         working-directory: e2e/consumermodule
         run: go test -race -run '^$' ./...
+      # The e2e and LocalScale jobs build static linux binaries, and turning
+      # cgo off changes the build of every package, so none of the builds above
+      # cover them. Compiling them here puts that build in the saved cache.
+      - name: "Warm static-binary cache"
+        run: CGO_ENABLED=0 GOOS=linux go build -o /dev/null ./pkg/cmd ./cmd/localscale
       - name: "Save Go cache"
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # actions/cache/save@v4
         with:
           path: |
             ~/go/pkg/mod
             ~/.cache/go-build
-          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum', 'e2e/consumermodule/go.sum') }}
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum', 'e2e/consumermodule/go.sum', '.github/go-cache-epoch') }}
 
   unit:
     name: "Unit Tests"
@@ -141,7 +151,7 @@ jobs:
           path: |
             ~/go/pkg/mod
             ~/.cache/go-build
-          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum', 'e2e/consumermodule/go.sum') }}
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum', 'e2e/consumermodule/go.sum', '.github/go-cache-epoch') }}
           restore-keys: go-${{ runner.os }}-${{ runner.arch }}-
       - name: "Test"
         run: make test-unit
@@ -203,7 +213,7 @@ jobs:
           path: |
             ~/go/pkg/mod
             ~/.cache/go-build
-          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum', 'e2e/consumermodule/go.sum') }}
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum', 'e2e/consumermodule/go.sum', '.github/go-cache-epoch') }}
           restore-keys: go-${{ runner.os }}-${{ runner.arch }}-
       # Pre-pull external images with retries so transient registry outages
       # surface here as a named, retryable, fail-fast step instead of as many
@@ -385,7 +395,7 @@ jobs:
           path: |
             ~/go/pkg/mod
             ~/.cache/go-build
-          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum', 'e2e/consumermodule/go.sum') }}
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum', 'e2e/consumermodule/go.sum', '.github/go-cache-epoch') }}
           restore-keys: go-${{ runner.os }}-${{ runner.arch }}-
       # Pre-pull external images with retries so a transient registry outage
       # fails fast in a named, retryable step instead of failing the image
@@ -434,7 +444,7 @@ jobs:
           path: |
             ~/go/pkg/mod
             ~/.cache/go-build
-          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum', 'e2e/consumermodule/go.sum') }}
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum', 'e2e/consumermodule/go.sum', '.github/go-cache-epoch') }}
           restore-keys: go-${{ runner.os }}-${{ runner.arch }}-
       # Pre-pull external images with retries so a transient registry outage
       # fails fast in a named, retryable step instead of failing the compose
@@ -491,7 +501,7 @@ jobs:
           path: |
             ~/go/pkg/mod
             ~/.cache/go-build
-          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum', 'e2e/consumermodule/go.sum') }}
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum', 'e2e/consumermodule/go.sum', '.github/go-cache-epoch') }}
           restore-keys: go-${{ runner.os }}-${{ runner.arch }}-
       # Pre-pull external images with retries so a transient registry outage
       # fails fast in a named, retryable step instead of failing the compose
@@ -564,7 +574,7 @@ jobs:
           path: |
             ~/go/pkg/mod
             ~/.cache/go-build
-          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum', 'e2e/consumermodule/go.sum') }}
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum', 'e2e/consumermodule/go.sum', '.github/go-cache-epoch') }}
           restore-keys: go-${{ runner.os }}-${{ runner.arch }}-
       # Pre-pull external images with retries so a transient registry outage
       # fails fast in a named, retryable step instead of failing the compose
@@ -692,7 +702,7 @@ jobs:
           path: |
             ~/go/pkg/mod
             ~/.cache/go-build
-          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum', 'e2e/consumermodule/go.sum') }}
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum', 'e2e/consumermodule/go.sum', '.github/go-cache-epoch') }}
           restore-keys: go-${{ runner.os }}-${{ runner.arch }}-
       # Pre-pull external images with retries so a transient registry outage
       # fails fast in a named, retryable step instead of failing the compose
@@ -749,8 +759,19 @@ jobs:
           path: |
             ~/go/pkg/mod
             ~/.cache/go-build
-          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum', 'e2e/consumermodule/go.sum') }}
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum', 'e2e/consumermodule/go.sum', '.github/go-cache-epoch') }}
           restore-keys: go-${{ runner.os }}-${{ runner.arch }}-
+      # setup-minikube's own download cache cannot reach the cache service, so
+      # every run would download the node image and the Kubernetes preload.
+      # The pinned minikube version decides both, so it alone keys the cache.
+      - name: "Restore minikube cache"
+        id: minikube-cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # actions/cache/restore@v4
+        with:
+          path: |
+            ~/.minikube/cache/kic
+            ~/.minikube/cache/preloaded-tarball
+          key: minikube-${{ env.MINIKUBE_VERSION }}-${{ runner.os }}-${{ runner.arch }}
       - name: "Start minikube"
         uses: medyagh/setup-minikube@d8c0eb871f6f455542491d86a574477bd3894533 # medyagh/setup-minikube@v0.0.18
         with:
@@ -760,6 +781,19 @@ jobs:
           container-runtime: docker
           cpus: 2
           memory: 2048
+          minikube-version: ${{ env.MINIKUBE_VERSION }}
+          cache: false
+          # The scripts wait for each of their own pods, so minikube need not
+          # also wait for every system pod to turn Ready before they start.
+          wait: apiserver,system_pods,default_sa,node_ready
+      - name: "Save minikube cache"
+        if: steps.minikube-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # actions/cache/save@v4
+        with:
+          path: |
+            ~/.minikube/cache/kic
+            ~/.minikube/cache/preloaded-tarball
+          key: minikube-${{ env.MINIKUBE_VERSION }}-${{ runner.os }}-${{ runner.arch }}
       # The script builds the schemabot image into minikube's docker daemon
       # under its own per-run tag, so no separate build step is needed here.
       - name: "Deploy and test"
@@ -817,8 +851,19 @@ jobs:
           path: |
             ~/go/pkg/mod
             ~/.cache/go-build
-          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum', 'e2e/consumermodule/go.sum') }}
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum', 'e2e/consumermodule/go.sum', '.github/go-cache-epoch') }}
           restore-keys: go-${{ runner.os }}-${{ runner.arch }}-
+      # setup-minikube's own download cache cannot reach the cache service, so
+      # every run would download the node image and the Kubernetes preload.
+      # The pinned minikube version decides both, so it alone keys the cache.
+      - name: "Restore minikube cache"
+        id: minikube-cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # actions/cache/restore@v4
+        with:
+          path: |
+            ~/.minikube/cache/kic
+            ~/.minikube/cache/preloaded-tarball
+          key: minikube-${{ env.MINIKUBE_VERSION }}-${{ runner.os }}-${{ runner.arch }}
       - name: "Start minikube"
         uses: medyagh/setup-minikube@d8c0eb871f6f455542491d86a574477bd3894533 # medyagh/setup-minikube@v0.0.18
         with:
@@ -828,6 +873,19 @@ jobs:
           container-runtime: docker
           cpus: 2
           memory: 4096
+          minikube-version: ${{ env.MINIKUBE_VERSION }}
+          cache: false
+          # The scripts wait for each of their own pods, so minikube need not
+          # also wait for every system pod to turn Ready before they start.
+          wait: apiserver,system_pods,default_sa,node_ready
+      - name: "Save minikube cache"
+        if: steps.minikube-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # actions/cache/save@v4
+        with:
+          path: |
+            ~/.minikube/cache/kic
+            ~/.minikube/cache/preloaded-tarball
+          key: minikube-${{ env.MINIKUBE_VERSION }}-${{ runner.os }}-${{ runner.arch }}
       # The script builds both the schemabot and etre images into minikube's
       # docker daemon, so no separate build step is needed here.
       - name: "Deploy and test"
@@ -856,6 +914,148 @@ jobs:
           echo "=== All pods ==="
           kubectl get pods -n schemabot-e2e-etre -o wide 2>/dev/null || true
 
+  e2e-k8s-multi-target-matrix:
+    name: "E2E K8s Multi-Target Matrix"
+    needs: changes
+    if: needs.changes.outputs.code == 'true' && (needs.changes.outputs.full == 'true' || github.event_name != 'pull_request')
+    runs-on: ubuntu-latest
+    timeout-minutes: 1
+    outputs:
+      shards: ${{ steps.gen.outputs.shards }}
+    steps:
+      - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # actions/checkout@v6
+      - name: "Generate shard matrix"
+        id: gen
+        run: |
+          set -euo pipefail
+          NUM_SHARDS=2
+          # Deterministic order so a test always lands in the same bucket, and
+          # a new multi-target test joins a bucket without a list to update.
+          # Anchoring on the line start matches declarations, not prose that
+          # mentions a test. grep exits 1 when nothing matches and 2 when the
+          # tree is unusable; the status check below is the fail-closed gate,
+          # so an unreadable test file cannot drop its tests out of every
+          # shard while the job passes.
+          set +e
+          matches=$(grep -r --include='*_test.go' -h -o '^func TestK8sMultiTarget_[A-Za-z0-9_]*' e2e/k8s)
+          grep_status=$?
+          set -e
+          if [ "$grep_status" -gt 1 ]; then
+            echo "::error::e2e/k8s is unusable for test discovery (grep exited $grep_status)"
+            exit 1
+          fi
+          tests=$(printf '%s\n' "$matches" | sed 's/^func //' | sort -u)
+          count=$(printf '%s\n' "$tests" | grep -c . || true)
+          if [ "$count" -lt "$NUM_SHARDS" ]; then
+            echo "::error::discovered $count multi-target tests, fewer than the $NUM_SHARDS shards"
+            exit 1
+          fi
+          # Each filter is anchored so a test name that prefixes another
+          # cannot also run in the other shard.
+          shards=$(printf '%s\n' "$tests" | awk -v n="$NUM_SHARDS" '
+            { bucket[NR % n] = bucket[NR % n] (bucket[NR % n] ? "|" : "") $0 }
+            END { for (i=0; i<n; i++) printf "{\"shard\":\"%d\",\"run_filter\":\"^(%s)$\"}\n", i+1, bucket[i] }
+          ' | jq -cs '.')
+          echo "shards=$shards" >> "$GITHUB_OUTPUT"
+          echo "$count tests across $NUM_SHARDS shards"
+
+  e2e-k8s-multi-target:
+    name: "E2E K8s Multi-Target Tests (${{ matrix.shard }})"
+    needs: [changes, e2e-k8s-multi-target-matrix]
+    if: needs.changes.outputs.code == 'true' && (needs.changes.outputs.full == 'true' || github.event_name != 'pull_request')
+    runs-on: ubuntu-latest
+    # Sized so setup (checkout, Go, cache restore, minikube start, the script's
+    # own image builds, and standing up one MySQL server per target beside Etre
+    # and ministack) plus the E2E_TEST_TIMEOUT set on the Deploy and test step
+    # lands inside the job budget with room left for the goroutine dump, the
+    # script's exit trap, and the pod-log capture step.
+    timeout-minutes: 30
+    # Each shard stands up the whole stack, so the split pays the setup on
+    # every runner to run the tests across them.
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.e2e-k8s-multi-target-matrix.outputs.shards) }}
+    steps:
+      - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # actions/checkout@v6
+      - name: "Configure Go"
+        uses: actions/setup-go@4dc6199c7b1a012772edbd06daecab0f50c9053c # actions/setup-go@v6.1
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: "Restore Go cache"
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # actions/cache/restore@v4
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum', 'e2e/consumermodule/go.sum', '.github/go-cache-epoch') }}
+          restore-keys: go-${{ runner.os }}-${{ runner.arch }}-
+      # setup-minikube's own download cache cannot reach the cache service, so
+      # every run would download the node image and the Kubernetes preload.
+      # The pinned minikube version decides both, so it alone keys the cache.
+      - name: "Restore minikube cache"
+        id: minikube-cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # actions/cache/restore@v4
+        with:
+          path: |
+            ~/.minikube/cache/kic
+            ~/.minikube/cache/preloaded-tarball
+          key: minikube-${{ env.MINIKUBE_VERSION }}-${{ runner.os }}-${{ runner.arch }}
+      - name: "Start minikube"
+        uses: medyagh/setup-minikube@d8c0eb871f6f455542491d86a574477bd3894533 # medyagh/setup-minikube@v0.0.18
+        with:
+          driver: docker
+          # The e2e scripts build images through `minikube docker-env`, which
+          # only yields a usable Docker daemon under the docker runtime.
+          container-runtime: docker
+          # One MySQL server per target plus the control and data plane
+          # stores, Etre and ministack: sized to the script's own minikube.
+          cpus: 4
+          memory: 6144
+          minikube-version: ${{ env.MINIKUBE_VERSION }}
+          cache: false
+          # The scripts wait for each of their own pods, so minikube need not
+          # also wait for every system pod to turn Ready before they start.
+          wait: apiserver,system_pods,default_sa,node_ready
+      - name: "Save minikube cache"
+        if: steps.minikube-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # actions/cache/save@v4
+        with:
+          path: |
+            ~/.minikube/cache/kic
+            ~/.minikube/cache/preloaded-tarball
+          key: minikube-${{ env.MINIKUBE_VERSION }}-${{ runner.os }}-${{ runner.arch }}
+      # The script builds the schemabot and etre images into minikube's docker
+      # daemon, so no separate build step is needed here.
+      - name: "Deploy and test"
+        # Keep the namespace on exit so the failure log dump below can read pod
+        # logs; the runner is ephemeral, so there is nothing to clean up after.
+        env:
+          KEEP_NAMESPACE: "1"
+          # go test's own timeout inside the script; the job budget above is
+          # sized to exceed it plus setup, so change the two together.
+          E2E_TEST_TIMEOUT: 18m
+          E2E_TEST_RUN: ${{ matrix.run_filter }}
+        run: make test-e2e-k8s-multi-target
+      - name: "Pod logs on failure"
+        if: failure()
+        run: |
+          echo "=== Control Plane ==="
+          kubectl logs -n schemabot-e2e-multi-target -l app.kubernetes.io/instance=control-plane-mt --tail=300 2>/dev/null || true
+          echo "=== Data Plane ==="
+          kubectl logs -n schemabot-e2e-multi-target -l app.kubernetes.io/instance=data-plane-mt --tail=300 2>/dev/null || true
+          echo "=== Etre ==="
+          kubectl logs -n schemabot-e2e-multi-target -l app=etre --tail=100 2>/dev/null || true
+          echo "=== ministack ==="
+          kubectl logs -n schemabot-e2e-multi-target -l app=ministack --tail=100 2>/dev/null || true
+          echo "=== Seed jobs ==="
+          kubectl logs -n schemabot-e2e-multi-target -l job-name=etre-mongo-init --tail=50 2>/dev/null || true
+          kubectl logs -n schemabot-e2e-multi-target -l job-name=etre-seed --tail=50 2>/dev/null || true
+          kubectl logs -n schemabot-e2e-multi-target -l job-name=ministack-seed --tail=50 2>/dev/null || true
+          echo "=== All pods ==="
+          kubectl get pods -n schemabot-e2e-multi-target -o wide 2>/dev/null || true
+
   e2e-k8s-vitess:
     name: "E2E K8s Vitess Tests"
     needs: changes
@@ -877,7 +1077,7 @@ jobs:
           path: |
             ~/go/pkg/mod
             ~/.cache/go-build
-          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum', 'e2e/consumermodule/go.sum') }}
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum', 'e2e/consumermodule/go.sum', '.github/go-cache-epoch') }}
           restore-keys: go-${{ runner.os }}-${{ runner.arch }}-
       # The runner ships a preinstalled MySQL whose AppArmor profile confines
       # /usr/sbin/mysqld to its packaged data dirs. LocalScale runs vtcombo's
@@ -890,6 +1090,17 @@ jobs:
             sudo apparmor_parser -R /etc/apparmor.d/usr.sbin.mysqld || true
             sudo ln -sf /etc/apparmor.d/usr.sbin.mysqld /etc/apparmor.d/disable/ || true
           fi
+      # setup-minikube's own download cache cannot reach the cache service, so
+      # every run would download the node image and the Kubernetes preload.
+      # The pinned minikube version decides both, so it alone keys the cache.
+      - name: "Restore minikube cache"
+        id: minikube-cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # actions/cache/restore@v4
+        with:
+          path: |
+            ~/.minikube/cache/kic
+            ~/.minikube/cache/preloaded-tarball
+          key: minikube-${{ env.MINIKUBE_VERSION }}-${{ runner.os }}-${{ runner.arch }}
       - name: "Start minikube"
         uses: medyagh/setup-minikube@d8c0eb871f6f455542491d86a574477bd3894533 # medyagh/setup-minikube@v0.0.18
         with:
@@ -899,6 +1110,19 @@ jobs:
           container-runtime: docker
           cpus: 2
           memory: 6144
+          minikube-version: ${{ env.MINIKUBE_VERSION }}
+          cache: false
+          # The scripts wait for each of their own pods, so minikube need not
+          # also wait for every system pod to turn Ready before they start.
+          wait: apiserver,system_pods,default_sa,node_ready
+      - name: "Save minikube cache"
+        if: steps.minikube-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # actions/cache/save@v4
+        with:
+          path: |
+            ~/.minikube/cache/kic
+            ~/.minikube/cache/preloaded-tarball
+          key: minikube-${{ env.MINIKUBE_VERSION }}-${{ runner.os }}-${{ runner.arch }}
       # The script builds the schemabot, etre, and localscale images into
       # minikube's docker daemon, so no separate build step is needed here.
       - name: "Deploy and test"
@@ -1077,10 +1301,10 @@ jobs:
   # Stable rollup for the k8s e2e jobs so a single check name can gate a merge.
   # On a PR running the smoke subset these jobs are intentionally skipped and the
   # full k8s coverage runs on push / in the merge queue; on any merge-gating
-  # event all three must succeed.
+  # event all of them must succeed.
   k8s-rollup:
     name: "K8s E2E Tests"
-    needs: [changes, e2e-k8s, e2e-k8s-etre, e2e-k8s-vitess]
+    needs: [changes, e2e-k8s, e2e-k8s-etre, e2e-k8s-vitess, e2e-k8s-multi-target]
     runs-on: ubuntu-latest
     if: always()
     steps:
@@ -1093,6 +1317,7 @@ jobs:
           K8S_RESULT: ${{ needs.e2e-k8s.result }}
           K8S_ETRE_RESULT: ${{ needs.e2e-k8s-etre.result }}
           K8S_VITESS_RESULT: ${{ needs.e2e-k8s-vitess.result }}
+          K8S_MULTI_TARGET_RESULT: ${{ needs.e2e-k8s-multi-target.result }}
         run: |
           set -euo pipefail
           if [ "$CHANGES_RESULT" != "success" ]; then
@@ -1108,9 +1333,9 @@ jobs:
             echo "PR smoke run; full K8s E2E deferred to the merge queue."
             exit 0
           fi
-          for r in "$K8S_RESULT" "$K8S_ETRE_RESULT" "$K8S_VITESS_RESULT"; do
+          for r in "$K8S_RESULT" "$K8S_ETRE_RESULT" "$K8S_VITESS_RESULT" "$K8S_MULTI_TARGET_RESULT"; do
             if [ "$r" != "success" ]; then
-              echo "::error::k8s e2e results: k8s=$K8S_RESULT etre=$K8S_ETRE_RESULT vitess=$K8S_VITESS_RESULT"
+              echo "::error::k8s e2e results: k8s=$K8S_RESULT etre=$K8S_ETRE_RESULT vitess=$K8S_VITESS_RESULT multi-target=$K8S_MULTI_TARGET_RESULT"
               exit 1
             fi
           done

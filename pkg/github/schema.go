@@ -247,48 +247,36 @@ func vacatedSchemaPath(file PRFile) (string, bool) {
 	return vacated, true
 }
 
+// resolveSchemaRootForEnvironment returns the directory holding environment's
+// schema files at ref, by the rules of schema.ResolveEnvironmentSchemaRoot.
 func (ic *InstallationClient) resolveSchemaRootForEnvironment(ctx context.Context, repo, ref, configDir, environment string) (schemaRoot, schemaLinkPath string, err error) {
-	if environment == "" {
-		return configDir, "", nil
-	}
-	if err := validateEnvironmentPathSegment(environment); err != nil {
-		return "", "", err
-	}
-
-	candidate := path.Join(configDir, environment)
-	content, directoryContent, err := ic.fetchRepositoryContents(ctx, repo, candidate, ref)
+	schemaRoot, schemaLinkPath, err = schema.ResolveEnvironmentSchemaRoot(configDir, environment, func(entryPath string) (schema.Entry, error) {
+		return ic.repositoryEntry(ctx, repo, ref, entryPath)
+	})
 	if err != nil {
-		if IsNotFoundError(err) {
-			return configDir, "", nil
-		}
-		return "", "", fmt.Errorf("resolve schema root for environment %s at %s: %w", environment, candidate, err)
+		return "", "", fmt.Errorf("repo %s ref %s: %w", repo, ref, err)
 	}
-	if directoryContent != nil {
-		return candidate, "", nil
-	}
-	if content == nil || content.GetType() != "symlink" {
-		return "", "", fmt.Errorf("environment schema root %s in repo %s ref %s is not a directory or symlink", candidate, repo, ref)
-	}
-
-	resolved, err := resolveSchemaRootSymlinkTarget(configDir, candidate, content.GetTarget())
-	if err != nil {
-		return "", "", err
-	}
-	resolvedContent, resolvedDirectoryContent, err := ic.fetchRepositoryContents(ctx, repo, resolved, ref)
-	if err != nil {
-		return "", "", fmt.Errorf("resolve environment schema root symlink %s target %s: %w", candidate, resolved, err)
-	}
-	if resolvedContent != nil || resolvedDirectoryContent == nil {
-		return "", "", fmt.Errorf("environment schema root symlink %s points to non-directory path %s", candidate, resolved)
-	}
-	return resolved, candidate, nil
+	return schemaRoot, schemaLinkPath, nil
 }
 
-func validateEnvironmentPathSegment(environment string) error {
-	if environment == "." || environment == ".." || strings.ContainsAny(environment, `/\`) {
-		return fmt.Errorf("environment %q must be a single path segment", environment)
+// repositoryEntry reports what the repository holds at entryPath on ref,
+// without following a symlink there: the Contents API returns a symlink's own
+// object, with its target, when the symlink path is fetched directly.
+func (ic *InstallationClient) repositoryEntry(ctx context.Context, repo, ref, entryPath string) (schema.Entry, error) {
+	content, directoryContent, err := ic.fetchRepositoryContents(ctx, repo, entryPath, ref)
+	if err != nil {
+		if IsNotFoundError(err) {
+			return schema.Entry{Kind: schema.EntryMissing}, nil
+		}
+		return schema.Entry{}, err
 	}
-	return nil
+	if directoryContent != nil {
+		return schema.Entry{Kind: schema.EntryDirectory}, nil
+	}
+	if content != nil && content.GetType() == "symlink" {
+		return schema.Entry{Kind: schema.EntrySymlink, SymlinkTarget: content.GetTarget()}, nil
+	}
+	return schema.Entry{Kind: schema.EntryOther}, nil
 }
 
 func (ic *InstallationClient) fetchRepositoryContents(ctx context.Context, repo, filePath, ref string) (*gh.RepositoryContent, []*gh.RepositoryContent, error) {
@@ -297,32 +285,6 @@ func (ic *InstallationClient) fetchRepositoryContents(ctx context.Context, repo,
 		return nil, nil, err
 	}
 	return result.fileContent, result.directoryContent, nil
-}
-
-func resolveSchemaRootSymlinkTarget(configDir, symlinkPath, target string) (string, error) {
-	target = strings.TrimSpace(target)
-	if target == "" {
-		return "", fmt.Errorf("environment schema root symlink %s has empty target", symlinkPath)
-	}
-	if strings.HasPrefix(target, "/") {
-		return "", fmt.Errorf("environment schema root symlink %s points to absolute path %s", symlinkPath, target)
-	}
-
-	resolved := path.Clean(path.Join(path.Dir(symlinkPath), target))
-	cleanConfigDir := path.Clean(configDir)
-	if !schemaPathWithinDirectory(cleanConfigDir, resolved) {
-		return "", fmt.Errorf("environment schema root symlink %s points outside schema directory: %s", symlinkPath, target)
-	}
-	return resolved, nil
-}
-
-func schemaPathWithinDirectory(directory, candidate string) bool {
-	directory = path.Clean(directory)
-	candidate = path.Clean(candidate)
-	if directory == "." {
-		return candidate == "." || candidate != ".." && !strings.HasPrefix(candidate, "../") && !strings.HasPrefix(candidate, "/")
-	}
-	return candidate == directory || strings.HasPrefix(candidate, directory+"/")
 }
 
 // groupFilesByNamespace groups fetched files into the proto SchemaFiles format.

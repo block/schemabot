@@ -1,6 +1,8 @@
 package planetscale
 
 import (
+	"bytes"
+	"encoding/json"
 	"log/slog"
 	"os"
 	"testing"
@@ -156,6 +158,132 @@ func TestProgress_ClosedUndeployedDeployRequestIsCancelled(t *testing.T) {
 			require.NotNil(t, result)
 			assert.Equal(t, tt.wantState, result.State)
 			assert.Equal(t, tt.wantMessage, result.Message)
+		})
+	}
+}
+
+// PlanetScale accepts a cancel by moving the deploy request to
+// in_progress_cancel, and the cancel can still fail to land: the deploy then
+// ends in complete_error rather than complete_cancel. Progress must keep the
+// in-flight cancel non-terminal so the drive keeps polling, and report only the
+// outcome the deploy request settles on — failed for an unconfirmed cancel,
+// cancelled for a confirmed one.
+func TestProgress_InFlightCancelReportsTheSettledOutcome(t *testing.T) {
+	tests := []struct {
+		name         string
+		settledState string
+		wantState    engine.State
+		wantMessage  string
+	}{
+		{name: "cancel the engine never confirmed", settledState: deployState.CompleteError, wantState: engine.StateFailed, wantMessage: "Deployment failed"},
+		{name: "cancel the engine confirmed", settledState: deployState.CompleteCancel, wantState: engine.StateCancelled, wantMessage: "Deployment cancelled"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			deployedAt := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+			client := &resumeDeployClient{recovered: &ps.DeployRequest{
+				State:           "open",
+				DeploymentState: deployState.InProgressCancel,
+				DeployedAt:      &deployedAt,
+			}}
+			e := NewWithClient(slog.New(slog.NewTextHandler(os.Stdout, nil)),
+				func(_, _ string) (psclient.PSClient, error) { return client, nil })
+
+			encoded, err := encodePSMetadata(&psMetadata{BranchName: "schemabot-testdb-cancel", DeployRequestID: 72})
+			require.NoError(t, err)
+			req := &engine.ProgressRequest{
+				Database:    "testdb",
+				ResumeState: &engine.ResumeState{Metadata: encoded},
+				Credentials: &engine.Credentials{Metadata: map[string]string{
+					"organization": "org",
+					"token_name":   "token",
+					"token_value":  "secret",
+				}},
+			}
+
+			inFlight, err := e.Progress(t.Context(), req)
+			require.NoError(t, err)
+			require.NotNil(t, inFlight)
+			assert.False(t, inFlight.State.IsTerminal(), "an unconfirmed cancel must not settle the apply; got %s", inFlight.State)
+			assert.Equal(t, engine.StateRunning, inFlight.State,
+				"a deploy request in motion reads as running, not pending: an externally authoritative pending is an open change waiting to start")
+			assert.Equal(t, "Cancelling deploy...", inFlight.Message)
+
+			client.recovered.DeploymentState = tt.settledState
+			client.recovered.State = deployRequestClosed
+
+			settled, err := e.Progress(t.Context(), req)
+			require.NoError(t, err)
+			require.NotNil(t, settled)
+			assert.Equal(t, tt.wantState, settled.State)
+			assert.Equal(t, tt.wantMessage, settled.Message)
+		})
+	}
+}
+
+// A deploy request can stay in in_progress_cancel indefinitely if PlanetScale
+// never settles the cancel, and the apply stays active the whole time. Once
+// the cancel has been in flight past the warning threshold, each progress poll
+// warns with the deploy request, its state, and how long it has been in
+// flight, so a stuck cancel is triageable from the logs. The poll's outcome
+// does not change: the deploy request still reads as running.
+func TestProgress_CancelInFlightTooLongWarns(t *testing.T) {
+	updatedAt := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	tests := []struct {
+		name     string
+		elapsed  time.Duration
+		wantWarn bool
+	}{
+		{name: "within the threshold", elapsed: cancelInFlightWarnAfter, wantWarn: false},
+		{name: "past the threshold", elapsed: cancelInFlightWarnAfter + 5*time.Minute, wantWarn: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var logs bytes.Buffer
+			client := &resumeDeployClient{recovered: &ps.DeployRequest{
+				State:           "open",
+				DeploymentState: deployState.InProgressCancel,
+				UpdatedAt:       updatedAt,
+			}}
+			e := NewWithClient(slog.New(slog.NewJSONHandler(&logs, nil)),
+				func(_, _ string) (psclient.PSClient, error) { return client, nil })
+			e.now = func() time.Time { return updatedAt.Add(tt.elapsed) }
+
+			encoded, err := encodePSMetadata(&psMetadata{BranchName: "schemabot-testdb-cancel", DeployRequestID: 72})
+			require.NoError(t, err)
+			result, err := e.Progress(t.Context(), &engine.ProgressRequest{
+				Database:    "testdb",
+				ResumeState: &engine.ResumeState{Metadata: encoded},
+				Credentials: &engine.Credentials{Metadata: map[string]string{
+					"organization": "org",
+					"token_name":   "token",
+					"token_value":  "secret",
+				}},
+			})
+			require.NoError(t, err)
+			require.NotNil(t, result)
+			assert.Equal(t, engine.StateRunning, result.State, "the warning never changes the fail-closed outcome")
+
+			var warnings []map[string]any
+			for line := range bytes.Lines(logs.Bytes()) {
+				var record map[string]any
+				require.NoError(t, json.Unmarshal(line, &record), "log line: %s", line)
+				if record["level"] == "WARN" {
+					warnings = append(warnings, record)
+				}
+			}
+			if !tt.wantWarn {
+				assert.Empty(t, warnings, "a cancel inside the threshold is routine and must not warn")
+				return
+			}
+			require.Len(t, warnings, 1, "logs: %s", logs.String())
+			warning := warnings[0]
+			assert.Equal(t, cancelInFlightTooLongLog, warning["msg"])
+			assert.Equal(t, "testdb", warning["database"])
+			assert.InDelta(t, 72, warning["deploy_request"], 0)
+			assert.Equal(t, deployState.InProgressCancel, warning["deployment_state"])
+			assert.Equal(t, tt.elapsed.String(), warning["elapsed"])
+			assert.Equal(t, cancelInFlightWarnAfter.String(), warning["warn_after"])
 		})
 	}
 }

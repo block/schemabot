@@ -574,7 +574,7 @@ func WriteUnsafeChangesBlocked(changes []UnsafeChange, rerun string) {
 	}
 	fmt.Println(glyph.Escalation + " To proceed with these destructive changes, re-run with --allow-unsafe:")
 	fmt.Println()
-	fmt.Printf("  %s %s\n", cliname.Name(), rerun)
+	fmt.Printf("  %s\n", cliname.Command(rerun))
 	fmt.Println()
 }
 
@@ -584,8 +584,8 @@ func WriteUnsafeChangesBlocked(changes []UnsafeChange, rerun string) {
 // name so it runs as pasted. rerun is built as for WriteUnsafeChangesBlocked.
 func UnsafeChangesBlockedSummary(changes []UnsafeChange, rerun string) string {
 	findings := unsafeFindingLines(changes)
-	return fmt.Sprintf("apply blocked: %d unsafe change(s) detected (%s); to proceed with these destructive changes, re-run with: %s %s",
-		len(findings), strings.Join(findings, "; "), cliname.Name(), rerun)
+	return fmt.Sprintf("apply blocked: %d unsafe change(s) detected (%s); to proceed with these destructive changes, re-run with: %s",
+		len(findings), strings.Join(findings, "; "), cliname.Command(rerun))
 }
 
 // WriteUnsafeWarningAllowed writes a warning when destructive changes are

@@ -18,6 +18,8 @@ import (
 	"github.com/block/pg-sprite/pkg/planner"
 	"github.com/block/pg-sprite/pkg/preflight"
 	"github.com/block/pg-sprite/pkg/router"
+	"github.com/block/pg-sprite/pkg/schemadiff"
+	"github.com/block/pg-sprite/pkg/verdict"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -137,7 +139,7 @@ func TestExecutionVerdict(t *testing.T) {
 				mode:         tt.wantMode,
 				reason:       tt.wantReason,
 				unrecognized: tt.wantUnrecognized,
-			}, executionVerdict(version, tt.statement, "users"))
+			}, executionVerdict(version, tt.statement, "users", nil))
 		})
 	}
 }
@@ -157,6 +159,7 @@ var createShapeRefusalSentences = map[executor.CreateShapeCause]string{
 	executor.CreateShapeConcurrently:       `statement for table "users" declares CONCURRENTLY for an index on a new table, which SchemaBot's PostgreSQL create path does not support; remove CONCURRENTLY so the index can be built before the table receives traffic`,
 	executor.CreateShapeDuplicateName:      `statement for table "users" declares the same relation name more than once; give every table, index, constraint, and sequence a unique name`,
 	executor.CreateShapeMultipleOperations: `statement for table "users" contains multiple create operations in one statement; split them into separate CREATE TABLE or CREATE INDEX statements`,
+	executor.CreateShapeForeignKey:         `statement for table "users" declares a foreign key, which SchemaBot plans but does not apply on PostgreSQL yet; leave the foreign key out of the schema file to create the table, then add the foreign key outside SchemaBot and back to the file`,
 	executor.CreateShapeUnsupportedKind:    `statement for table "users" uses a statement kind SchemaBot's PostgreSQL create path does not support; use CREATE TABLE or CREATE INDEX, or create the object outside SchemaBot`,
 }
 
@@ -179,7 +182,7 @@ func TestCreateShapeRefusalReasonCoversEveryCause(t *testing.T) {
 				executionVerdict(pgplan.FormatVersion, pgplan.Statement{
 					Disposition: router.DispositionRefuse,
 					Cause:       cause,
-				}, "users"))
+				}, "users", nil))
 		})
 	}
 }
@@ -194,7 +197,7 @@ func TestExecutionVerdictUnknownCreateShapeCause(t *testing.T) {
 	}, executionVerdict(pgplan.FormatVersion, pgplan.Statement{
 		Disposition: router.DispositionRefuse,
 		Cause:       executor.CreateShapeCause("unknown"),
-	}, "users"))
+	}, "users", nil))
 }
 
 // A refusal with no cause comes from outside the create path; the generic
@@ -205,7 +208,76 @@ func TestExecutionVerdictEmptyCreateShapeCause(t *testing.T) {
 		reason: `statement for table "users" is refused: it cannot be executed safely as written`,
 	}, executionVerdict(pgplan.FormatVersion, pgplan.Statement{
 		Disposition: router.DispositionRefuse,
-	}, "users"))
+	}, "users", nil))
+}
+
+// A foreign-key change on a live table is planned so it can be reviewed, but
+// the engine does not run it: the step is blocked with a sentence naming
+// whether the statement adds or drops the foreign key, and nothing is
+// reported as unrecognized vocabulary. An added foreign key's remedy applies
+// the rest of the plan first, since its column may be one the same plan adds.
+// A dropped foreign key's remedy offers declaring it before removing it, so
+// an operator whose file left it out keeps the constraint. Only a table that
+// carries foreign keys into another namespace gets the clause naming them,
+// since those cannot be declared and removal is the only way forward.
+func TestExecutionVerdictForeignKeyChange(t *testing.T) {
+	const dropReason = `statement for table "users" drops a foreign key, which SchemaBot plans but does not apply on PostgreSQL yet; to keep the foreign key, declare it in the schema file and re-plan; to remove it, run this statement outside SchemaBot, then re-plan`
+	for _, tt := range []struct {
+		name           string
+		kind           schemadiff.ChangeKind
+		crossNamespace []string
+		want           string
+	}{
+		{"add", schemadiff.ChangeAddForeignKey, nil, `statement for table "users" adds a foreign key, which SchemaBot plans but does not apply on PostgreSQL yet; leave the foreign key out of the schema file to apply the rest of the plan, then run this statement outside SchemaBot and add the foreign key back to the file`},
+		{"drop", schemadiff.ChangeDropForeignKey, nil, dropReason},
+		{"drop with cross-namespace foreign keys", schemadiff.ChangeDropForeignKey, []string{"users_account_id_fkey", "users_region_id_fkey"},
+			dropReason + `; foreign key constraint(s) "users_account_id_fkey", "users_region_id_fkey" reference another namespace and cannot be declared, so the plan stays blocked until they are removed through a separately reviewed process`},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, stepVerdict{mode: engine.ExecutionModeBlocked, reason: tt.want},
+				executionVerdict(pgplan.FormatVersion, pgplan.Statement{
+					Kind:        tt.kind,
+					Disposition: router.DispositionRefuse,
+					Reason:      verdict.ReasonDeclarativeForeignKey,
+				}, "users", tt.crossNamespace))
+		})
+	}
+}
+
+// A changed stored generated expression is refused with its own remedy:
+// declaring the live expression plans no change, and changing it is a
+// rewrite the operator runs outside SchemaBot.
+func TestExecutionVerdictGeneratedExpressionChange(t *testing.T) {
+	assert.Equal(t, stepVerdict{
+		mode:   engine.ExecutionModeBlocked,
+		reason: `statement for table "events" changes a stored generated column's expression, which rewrites every row under a lock that blocks reads and writes, so SchemaBot does not apply it; to keep the live expression, declare it in the schema file and re-plan; to change it, declare the live expression to apply the rest of the plan first, then run this statement (PostgreSQL 17 or later) outside SchemaBot through a separately reviewed process and put the new expression back in the file`,
+	}, executionVerdict(pgplan.FormatVersion, pgplan.Statement{
+		Kind:        schemadiff.ChangeSetGeneratedExpression,
+		Disposition: router.DispositionRefuse,
+		Reason:      verdict.ReasonUnsupportedStatement,
+	}, "events", nil))
+}
+
+// A foreign key the planner cannot bind fails the plan with the fix appended:
+// the referenced table must already exist on the target, and the planning
+// role must be able to read it. The remedy matches through wrapping, and any
+// other failure gets none.
+func TestReferencedTableRemedy(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		err  error
+		want string
+	}{
+		{"not found", fmt.Errorf("plan: %w: public.customers", schemadiff.ErrReferencedTableNotFound),
+			"; a foreign key can reference only a table that already exists on the target, so leave the foreign key out of the schema file, apply the referenced table first, then run the ADD CONSTRAINT outside SchemaBot and add the foreign key back to the file"},
+		{"not readable", fmt.Errorf("plan: %w: public.customers", schemadiff.ErrReferencedTableNotReadable),
+			"; grant the planning role SELECT on the referenced table, then re-plan"},
+		{"other failure", errors.New("connection reset"), ""},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, referencedTableRemedy(tt.err))
+		})
+	}
 }
 
 func TestTableChangesMapsDestructiveSafety(t *testing.T) {
@@ -231,7 +303,7 @@ func TestTableChangesMapsDestructiveSafety(t *testing.T) {
 		},
 	}
 
-	changes, _, _, err := tableChanges(report, parser)
+	changes, _, _, err := tableChanges(report, nil, parser)
 	require.NoError(t, err)
 	require.Len(t, changes, 2)
 	assert.True(t, changes[0].IsUnsafe)
@@ -258,7 +330,7 @@ func TestTableChangesRendersOrderedExecutionSteps(t *testing.T) {
 		},
 	}}
 
-	changes, tiers, _, err := tableChanges(report, parser)
+	changes, tiers, _, err := tableChanges(report, nil, parser)
 	require.NoError(t, err)
 	require.Len(t, changes, 2)
 	assert.Equal(t, "ALTER TABLE public.users ADD COLUMN email text", changes[0].DDL)
@@ -286,7 +358,7 @@ func TestTableChangesCollapsesGreenfieldCreateSet(t *testing.T) {
 		{SQL: "CREATE INDEX widgets_id_idx ON public.widgets (id)", Route: planner.RouteNative, Backend: router.BackendNative, Disposition: router.DispositionExecute, ExecSQL: []string{"CREATE INDEX CONCURRENTLY widgets_id_idx ON public.widgets (id)"}},
 	}
 
-	changes, tiers, _, err := tableChanges(report, parser)
+	changes, tiers, _, err := tableChanges(report, nil, parser)
 	require.NoError(t, err)
 	require.Len(t, changes, 1)
 	assert.Equal(t, "CREATE TABLE public.widgets (id bigint PRIMARY KEY, name text);\nCREATE UNIQUE INDEX widgets_name_key ON public.widgets (name);\nCREATE INDEX widgets_id_idx ON public.widgets (id)", changes[0].DDL)
@@ -310,7 +382,7 @@ func TestTableChangesKeepsGreenfieldVerdictsPerStatement(t *testing.T) {
 		{SQL: "CREATE INDEX widgets_id_idx ON public.widgets (id)", Route: planner.RouteNative, Backend: router.BackendNative, Disposition: router.DispositionExecute, ExecSQL: []string{"CREATE INDEX CONCURRENTLY widgets_id_idx ON public.widgets (id)"}},
 	}
 
-	changes, tiers, _, err := tableChanges(report, parser)
+	changes, tiers, _, err := tableChanges(report, nil, parser)
 	require.NoError(t, err)
 	require.Len(t, changes, 3)
 	blockAbsentTableDependents(changes, tiers, report.Table)
@@ -384,7 +456,7 @@ func TestTableChangesMixedVerdictsFailClosedPerStatement(t *testing.T) {
 			Backend: router.BackendCopyAndSwap, Disposition: router.DispositionUnavailable},
 	}
 
-	changes, _, _, err := tableChanges(report, parser)
+	changes, _, _, err := tableChanges(report, nil, parser)
 	require.NoError(t, err)
 	require.Len(t, changes, 2)
 	assert.Empty(t, changes[0].ExecutionMode)
@@ -415,7 +487,7 @@ func TestTableChangesReportsUnrecognizedPlannerVocabularyOncePerStatement(t *tes
 			}},
 	}
 
-	changes, _, unrecognized, err := tableChanges(report, parser)
+	changes, _, unrecognized, err := tableChanges(report, nil, parser)
 	require.NoError(t, err)
 	require.Len(t, changes, 4)
 	assert.Equal(t, engine.ExecutionModeBlocked, changes[0].ExecutionMode)
@@ -435,7 +507,7 @@ func TestTableChangesRejectsUnparseablePlanSQL(t *testing.T) {
 	report.Table = "users"
 	report.Statements = []pgplan.Statement{{SQL: "not ddl", Disposition: router.DispositionRefuse}}
 
-	_, _, _, err = tableChanges(report, parser)
+	_, _, _, err = tableChanges(report, nil, parser)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), `classify planned statement for table "users"`)
 }
@@ -554,7 +626,7 @@ func TestTableChangesDerivesTiersForBlockedSteps(t *testing.T) {
 		{SQL: "DROP INDEX public.users_legacy_idx", Route: planner.RouteNative, Backend: router.BackendNative, Disposition: router.DispositionUnavailable},
 	}
 
-	changes, tiers, _, err := tableChanges(report, parser)
+	changes, tiers, _, err := tableChanges(report, nil, parser)
 	require.NoError(t, err)
 	require.Len(t, changes, 3)
 	for _, change := range changes {
@@ -585,7 +657,7 @@ func TestBlockMissingPrivilegesNamesGrantOnPlannerBlockedPlan(t *testing.T) {
 		{SQL: "ALTER TABLE public.users ADD CONSTRAINT users_email_key UNIQUE (email)", Route: planner.RouteNative, Backend: router.BackendNative, Disposition: router.DispositionRewriteRequired},
 		{SQL: "DROP INDEX public.users_legacy_idx", Route: planner.RouteNative, Backend: router.BackendNative, Disposition: router.DispositionUnavailable},
 	}
-	changes, tiers, _, err := tableChanges(report, parser)
+	changes, tiers, _, err := tableChanges(report, nil, parser)
 	require.NoError(t, err)
 	plannerReasons := []string{changes[0].ModeReason, changes[1].ModeReason, changes[2].ModeReason}
 
@@ -655,7 +727,7 @@ func plannerBlockedGreenfieldPlan(t *testing.T, indexExecutable bool) (pgplan.Re
 		{SQL: "CREATE TABLE public.widgets PARTITION OF public.gadgets FOR VALUES IN (1)", Route: planner.RouteNative, Backend: router.BackendNative, Disposition: router.DispositionRefuse, Cause: executor.CreateShapePartitionOf},
 		index,
 	}
-	changes, tiers, _, err := tableChanges(report, parser)
+	changes, tiers, _, err := tableChanges(report, nil, parser)
 	require.NoError(t, err)
 	require.Equal(t, []preflight.Tier{preflight.TierCreateTable, preflight.TierIndexBuild}, tiers)
 	return report, changes, tiers
@@ -1028,7 +1100,7 @@ func TestTableChangesNeutralizesCauseSeparatorInTableName(t *testing.T) {
 			Backend: router.BackendCopyAndSwap, Disposition: router.DispositionUnavailable},
 	}
 
-	changes, _, _, err := tableChanges(report, parser)
+	changes, _, _, err := tableChanges(report, nil, parser)
 	require.NoError(t, err)
 	require.Len(t, changes, 1)
 	assert.Equal(t, engine.ExecutionModeBlocked, changes[0].ExecutionMode)
@@ -1420,6 +1492,7 @@ var optionalCapabilityVerdicts = map[reflect.Type]bool{
 	reflect.TypeFor[engine.CancelledResumeStateReclaimer]():   false,
 	reflect.TypeFor[engine.ControlResumeValidator]():          false,
 	reflect.TypeFor[engine.ShardKeyedPlanning]():              false,
+	reflect.TypeFor[engine.TargetDrainer]():                   false,
 }
 
 // TestOptionalCapabilitySet checks the recorded verdicts against the engine's
@@ -1512,9 +1585,10 @@ func TestNewWithTableSizeLimitTreatsZeroAsUnset(t *testing.T) {
 
 // The undeclared-table reason offers only remedies the operator can carry
 // out, and which remedy applies depends on where the table's foreign key
-// constraints live: none, on the table itself, on other tables, or both. Every
-// constraint on either side is named so the operator knows what a drop or a
-// hand-written file has to account for.
+// constraints live: none, on the table itself, on other tables, or both, and
+// whether one the table owns references another namespace, which no schema
+// file can declare. Every constraint the remedy depends on is named so the
+// operator knows what a drop or a hand-written file has to account for.
 func TestUndeclaredTableReasonNamesRemedyPerForeignKeySide(t *testing.T) {
 	const preamble = `table "orders" exists on the target but no schema file in namespace "public" declares it; converging would drop the table, which SchemaBot's PostgreSQL support never executes`
 	tests := []struct {
@@ -1530,22 +1604,32 @@ func TestUndeclaredTableReasonNamesRemedyPerForeignKeySide(t *testing.T) {
 		{
 			name: "owns one foreign key",
 			live: liveTable{name: "orders", foreignKeys: []string{"orders_user_id_fkey"}},
-			want: preamble + `; the table cannot be declared while it carries foreign key constraint(s) "orders_user_id_fkey", which schema files do not support — drop the table, or remove its foreign keys before declaring it, through a separately reviewed process`,
+			want: preamble + `; it carries foreign key constraint(s) "orders_user_id_fkey", so the schema pull cannot write a file for it — declare the table by hand in a schema file, foreign keys included, to keep it under management, or drop it through a separately reviewed process`,
 		},
 		{
 			name: "owns several foreign keys",
 			live: liveTable{name: "orders", foreignKeys: []string{"orders_shop_id_fkey", "orders_user_id_fkey"}},
-			want: preamble + `; the table cannot be declared while it carries foreign key constraint(s) "orders_shop_id_fkey", "orders_user_id_fkey", which schema files do not support — drop the table, or remove its foreign keys before declaring it, through a separately reviewed process`,
+			want: preamble + `; it carries foreign key constraint(s) "orders_shop_id_fkey", "orders_user_id_fkey", so the schema pull cannot write a file for it — declare the table by hand in a schema file, foreign keys included, to keep it under management, or drop it through a separately reviewed process`,
+		},
+		{
+			name: "owns a foreign key into another namespace",
+			live: liveTable{name: "orders", foreignKeys: []string{"orders_account_id_fkey", "orders_user_id_fkey"}, crossNamespaceForeignKeys: []string{"orders_account_id_fkey"}},
+			want: preamble + `; the table cannot be declared while it carries foreign key constraint(s) "orders_account_id_fkey", which reference another namespace and schema files do not support — drop the table, or remove those foreign keys before declaring it, through a separately reviewed process`,
 		},
 		{
 			name: "referenced by foreign keys on other tables",
 			live: liveTable{name: "orders", referencedBy: []string{"invoices_order_id_fkey", "shipments_order_id_fkey"}},
-			want: preamble + `; foreign key constraint(s) "invoices_order_id_fkey", "shipments_order_id_fkey" on other tables reference it, and schema files do not support foreign keys, so the schema pull cannot write a file for it — declare the table by hand in a schema file to keep it under management, or drop it together with the referencing constraints through a separately reviewed process`,
+			want: preamble + `; foreign key constraint(s) "invoices_order_id_fkey", "shipments_order_id_fkey" on other tables reference it, so the schema pull cannot write a file for it — declare the table by hand in a schema file to keep it under management, or drop it together with the referencing constraints through a separately reviewed process`,
 		},
 		{
 			name: "owns and is referenced by foreign keys",
 			live: liveTable{name: "orders", foreignKeys: []string{"orders_user_id_fkey"}, referencedBy: []string{"invoices_order_id_fkey"}},
-			want: preamble + `; the table cannot be declared while it carries foreign key constraint(s) "orders_user_id_fkey", which schema files do not support, and foreign key constraint(s) "invoices_order_id_fkey" on other tables reference it — drop the table together with the referencing constraints, or remove its own foreign keys and declare it by hand, through a separately reviewed process`,
+			want: preamble + `; it carries foreign key constraint(s) "orders_user_id_fkey" and foreign key constraint(s) "invoices_order_id_fkey" on other tables reference it, so the schema pull cannot write a file for it — declare the table by hand in a schema file, foreign keys included, to keep it under management, or drop it together with the referencing constraints through a separately reviewed process`,
+		},
+		{
+			name: "owns a foreign key into another namespace and is referenced",
+			live: liveTable{name: "orders", foreignKeys: []string{"orders_account_id_fkey"}, crossNamespaceForeignKeys: []string{"orders_account_id_fkey"}, referencedBy: []string{"invoices_order_id_fkey"}},
+			want: preamble + `; the table cannot be declared while it carries foreign key constraint(s) "orders_account_id_fkey", which reference another namespace and schema files do not support, and foreign key constraint(s) "invoices_order_id_fkey" on other tables reference it — drop the table together with the referencing constraints, or remove those foreign keys and declare it by hand, through a separately reviewed process`,
 		},
 	}
 	for _, tt := range tests {

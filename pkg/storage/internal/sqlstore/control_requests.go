@@ -8,12 +8,13 @@ import (
 	"log/slog"
 
 	"github.com/block/schemabot/pkg/namedlock"
+	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/spirit/pkg/utils"
 )
 
 const controlRequestColumns = `id, apply_id, operation, status,
-	requested_by, error_message, metadata, completed_at, created_at, updated_at`
+	requested_by, error_message, metadata, completed_at, created_at, updated_at, revision`
 
 type controlRequestStore struct {
 	db         *rebindDB
@@ -122,12 +123,31 @@ func (s *controlRequestStore) listStrandedPending(ctx context.Context, limit int
 }
 
 func (s *controlRequestStore) RequestPending(ctx context.Context, req *storage.ApplyControlRequest) (*storage.ApplyControlRequest, bool, error) {
+	return s.requestPendingWithRetry(ctx, req, "")
+}
+
+// RequestPendingSuperseding is RequestPending with the superseded operation's
+// pending request completed in the same transaction. See
+// storage.ControlRequestStore.
+func (s *controlRequestStore) RequestPendingSuperseding(ctx context.Context, req *storage.ApplyControlRequest, superseded storage.ControlOperation) (*storage.ApplyControlRequest, bool, error) {
+	if superseded == "" {
+		return nil, false, fmt.Errorf("request control request for apply %d operation %s: superseded operation is required", req.ApplyID, req.Operation)
+	}
+	if superseded == req.Operation {
+		return nil, false, fmt.Errorf("request control request for apply %d operation %s: a request cannot supersede its own operation", req.ApplyID, req.Operation)
+	}
+	return s.requestPendingWithRetry(ctx, req, superseded)
+}
+
+// requestPendingWithRetry records req, completing superseded's pending request
+// in the same transaction when superseded is set.
+func (s *controlRequestStore) requestPendingWithRetry(ctx context.Context, req *storage.ApplyControlRequest, superseded storage.ControlOperation) (*storage.ApplyControlRequest, bool, error) {
 	var controlReq *storage.ApplyControlRequest
 	var alreadyPending bool
 	op := fmt.Sprintf("request control request for apply %d operation %s", req.ApplyID, req.Operation)
 	err := withLockRetry(ctx, s.classifier, op, func() error {
 		var attemptErr error
-		controlReq, alreadyPending, attemptErr = s.requestPending(ctx, req)
+		controlReq, alreadyPending, attemptErr = s.requestPending(ctx, req, superseded)
 		if attemptErr == nil || !s.classifier.IsDuplicateKey(attemptErr) {
 			return attemptErr
 		}
@@ -142,7 +162,7 @@ func (s *controlRequestStore) RequestPending(ctx context.Context, req *storage.A
 		// losing insert returns the winning row as "already requested"; if the
 		// re-read also fails, return that storage error instead of hiding an
 		// unexpected conflict.
-		controlReq, alreadyPending, attemptErr = s.requestPending(ctx, req)
+		controlReq, alreadyPending, attemptErr = s.requestPending(ctx, req, superseded)
 		if attemptErr != nil {
 			return fmt.Errorf("retry control request after duplicate insert for apply %d operation %s: %w", req.ApplyID, req.Operation, attemptErr)
 		}
@@ -154,13 +174,23 @@ func (s *controlRequestStore) RequestPending(ctx context.Context, req *storage.A
 	return controlReq, alreadyPending, nil
 }
 
-func (s *controlRequestStore) requestPending(ctx context.Context, req *storage.ApplyControlRequest) (*storage.ApplyControlRequest, bool, error) {
+func (s *controlRequestStore) requestPending(ctx context.Context, req *storage.ApplyControlRequest, superseded storage.ControlOperation) (*storage.ApplyControlRequest, bool, error) {
 	metadata := nullJSON(req.Metadata)
 	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
 		return nil, false, fmt.Errorf("begin control request transaction for apply %d operation %s: %w", req.ApplyID, req.Operation, err)
 	}
 	defer rollbackTx(ctx, tx, "request pending")
+
+	if superseded != "" {
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE apply_control_requests
+			SET status = ?, completed_at = COALESCE(completed_at, NOW()), updated_at = NOW()
+			WHERE apply_id = ? AND operation = ? AND status = ?
+		`, storage.ControlRequestCompleted, req.ApplyID, superseded, storage.ControlRequestPending); err != nil {
+			return nil, false, fmt.Errorf("complete pending %s control request for apply %d superseded by %s: %w", superseded, req.ApplyID, req.Operation, err)
+		}
+	}
 
 	existing, err := s.getByApplyOperationForUpdate(ctx, tx, req.ApplyID, req.Operation)
 	if err != nil {
@@ -176,7 +206,7 @@ func (s *controlRequestStore) requestPending(ctx context.Context, req *storage.A
 		_, err := tx.ExecContext(ctx, `
 			UPDATE apply_control_requests
 			SET status = ?, requested_by = ?, error_message = NULL, metadata = ?,
-				completed_at = NULL, updated_at = NOW()
+				completed_at = NULL, updated_at = NOW(), revision = revision + 1
 			WHERE id = ?
 		`, storage.ControlRequestPending, req.RequestedBy, metadata, existing.ID)
 		if err != nil {
@@ -212,6 +242,196 @@ func (s *controlRequestStore) requestPending(ctx context.Context, req *storage.A
 		return nil, false, fmt.Errorf("commit control request for apply %d operation %s: %w", req.ApplyID, req.Operation, err)
 	}
 	return created, false, nil
+}
+
+// StopQueuedStart records a stop against a stopped apply whose start no driver
+// has acted on yet. See storage.ControlRequestStore.
+func (s *controlRequestStore) StopQueuedStart(ctx context.Context, stop *storage.ApplyControlRequest, operationLease bool) (*storage.ApplyControlRequest, storage.QueuedStartStop, error) {
+	if stop.Operation != storage.ControlOperationStop {
+		return nil, "", fmt.Errorf("stop queued start for apply %d: request operation is %s, not stop", stop.ApplyID, stop.Operation)
+	}
+	var (
+		recorded *storage.ApplyControlRequest
+		outcome  storage.QueuedStartStop
+	)
+	err := withLockRetry(ctx, s.classifier, fmt.Sprintf("stop queued start for apply %d", stop.ApplyID), func() error {
+		var attemptErr error
+		recorded, outcome, attemptErr = s.stopQueuedStart(ctx, stop, operationLease)
+		return attemptErr
+	})
+	if err != nil {
+		return nil, "", err
+	}
+	return recorded, outcome, nil
+}
+
+// stopQueuedStart takes its locks in the order the claims that resume a stopped
+// apply take theirs: the apply row, which the apply-level claim holds while it
+// moves the apply to resuming, then the operation rows, which the operation
+// claim holds while it moves one to resuming. Holding both means no claim can
+// act on the start this transaction completes, and a claim that committed first
+// is visible here.
+func (s *controlRequestStore) stopQueuedStart(ctx context.Context, stop *storage.ApplyControlRequest, operationLease bool) (*storage.ApplyControlRequest, storage.QueuedStartStop, error) {
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	if err != nil {
+		return nil, "", fmt.Errorf("begin stop queued start transaction for apply %d: %w", stop.ApplyID, err)
+	}
+	defer rollbackTx(ctx, tx, "stop queued start")
+
+	var applyState string
+	if err := tx.QueryRowContext(ctx, `SELECT state FROM applies WHERE id = ? FOR UPDATE`, stop.ApplyID).Scan(&applyState); err != nil {
+		return nil, "", fmt.Errorf("lock apply %d to stop its queued start: %w", stop.ApplyID, err)
+	}
+	if !state.IsState(applyState, state.Apply.Stopped) {
+		return nil, storage.QueuedStartApplyNotStopped, nil
+	}
+
+	start, err := s.getByApplyOperationForUpdate(ctx, tx, stop.ApplyID, storage.ControlOperationStart)
+	if err != nil {
+		return nil, "", err
+	}
+	if start == nil || start.Status != storage.ControlRequestPending {
+		return nil, storage.QueuedStartNone, nil
+	}
+
+	claimed, err := lockOperationsAndFindClaimed(ctx, tx, stop.ApplyID)
+	if err != nil {
+		return nil, "", err
+	}
+	outcome := storage.QueuedStartWithdrawn
+	if operationLease && claimed {
+		outcome = storage.QueuedStartStopPending
+	}
+
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE apply_control_requests
+		SET status = ?, completed_at = COALESCE(completed_at, NOW()), updated_at = NOW()
+		WHERE id = ?
+	`, storage.ControlRequestCompleted, start.ID); err != nil {
+		return nil, "", fmt.Errorf("complete start control request for apply %d withdrawn by stop: %w", stop.ApplyID, err)
+	}
+	recorded, err := s.recordStopTx(ctx, tx, stop, outcome == storage.QueuedStartStopPending)
+	if err != nil {
+		return nil, "", err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, "", fmt.Errorf("commit stop of queued start for apply %d: %w", stop.ApplyID, err)
+	}
+	return recorded, outcome, nil
+}
+
+// lockOperationsAndFindClaimed locks the apply's operation rows and reports
+// whether any of them was claimed for a drive: every row of a stopped apply
+// rests in pending, stopped, or a terminal state until a claim moves it on.
+func lockOperationsAndFindClaimed(ctx context.Context, tx *rebindTx, applyID int64) (bool, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT state FROM apply_operations WHERE apply_id = ? FOR UPDATE`, applyID)
+	if err != nil {
+		return false, fmt.Errorf("lock operations of apply %d to stop its queued start: %w", applyID, err)
+	}
+	defer utils.CloseAndLog(rows)
+	claimed := false
+	for rows.Next() {
+		var opState string
+		if err := rows.Scan(&opState); err != nil {
+			return false, fmt.Errorf("scan operation state of apply %d: %w", applyID, err)
+		}
+		if !state.IsTerminalApplyState(opState) && !state.IsState(opState, state.ApplyOperation.Pending) {
+			claimed = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return false, fmt.Errorf("read operations of apply %d: %w", applyID, err)
+	}
+	return claimed, nil
+}
+
+// recordStopTx writes the apply's stop request as pending or completed,
+// re-arming the existing row when there is one.
+func (s *controlRequestStore) recordStopTx(ctx context.Context, tx *rebindTx, stop *storage.ApplyControlRequest, pending bool) (*storage.ApplyControlRequest, error) {
+	status := storage.ControlRequestCompleted
+	completedAt := "NOW()"
+	if pending {
+		status = storage.ControlRequestPending
+		completedAt = "NULL"
+	}
+	metadata := nullJSON(stop.Metadata)
+	existing, err := s.getByApplyOperationForUpdate(ctx, tx, stop.ApplyID, storage.ControlOperationStop)
+	if err != nil {
+		return nil, err
+	}
+	id := int64(0)
+	if existing != nil {
+		id = existing.ID
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE apply_control_requests
+			SET status = ?, requested_by = ?, error_message = NULL, metadata = ?,
+				completed_at = `+completedAt+`, updated_at = NOW(), revision = revision + 1
+			WHERE id = ?
+		`, status, stop.RequestedBy, metadata, existing.ID); err != nil {
+			return nil, fmt.Errorf("record %s stop control request for apply %d: %w", status, stop.ApplyID, err)
+		}
+	} else {
+		id, err = s.identity.InsertID(ctx, tx, `
+			INSERT INTO apply_control_requests (
+				apply_id, operation, status, requested_by, metadata, completed_at
+			) VALUES (?, ?, ?, ?, ?, `+completedAt+`)
+		`, stop.ApplyID, storage.ControlOperationStop, status, stop.RequestedBy, metadata)
+		if err != nil {
+			return nil, fmt.Errorf("create %s stop control request for apply %d: %w", status, stop.ApplyID, err)
+		}
+	}
+	return s.getByIDForUpdate(ctx, tx, id)
+}
+
+// UpdateMetadata rewrites a request's metadata under a row lock. See
+// storage.ControlRequestStore.
+func (s *controlRequestStore) UpdateMetadata(ctx context.Context, applyID int64, operation storage.ControlOperation, update func(*storage.ApplyControlRequest) ([]byte, error)) (bool, error) {
+	var found bool
+	err := withLockRetry(ctx, s.classifier, fmt.Sprintf("update %s control request metadata for apply %d", operation, applyID), func() error {
+		var attemptErr error
+		found, attemptErr = s.updateMetadata(ctx, applyID, operation, update)
+		return attemptErr
+	})
+	if err != nil {
+		return false, err
+	}
+	return found, nil
+}
+
+func (s *controlRequestStore) updateMetadata(ctx context.Context, applyID int64, operation storage.ControlOperation, update func(*storage.ApplyControlRequest) ([]byte, error)) (bool, error) {
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	if err != nil {
+		return false, fmt.Errorf("begin %s control request metadata update for apply %d: %w", operation, applyID, err)
+	}
+	defer rollbackTx(ctx, tx, "update control request metadata")
+
+	req, err := s.getByApplyOperationForUpdate(ctx, tx, applyID, operation)
+	if err != nil {
+		return false, err
+	}
+	if req == nil {
+		return false, nil
+	}
+	metadata, err := update(req)
+	if err != nil {
+		return true, fmt.Errorf("update metadata of %s control request for apply %d: %w", operation, applyID, err)
+	}
+	if metadata == nil {
+		return true, nil
+	}
+	// updated_at = updated_at keeps the column's ON UPDATE default from
+	// stamping a metadata rewrite as a change to the request itself.
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE apply_control_requests
+		SET metadata = ?, updated_at = updated_at
+		WHERE id = ?
+	`, nullJSON(metadata), req.ID); err != nil {
+		return true, fmt.Errorf("write metadata of %s control request for apply %d: %w", operation, applyID, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return true, fmt.Errorf("commit metadata of %s control request for apply %d: %w", operation, applyID, err)
+	}
+	return true, nil
 }
 
 func (s *controlRequestStore) GetPending(ctx context.Context, applyID int64, operation storage.ControlOperation) (*storage.ApplyControlRequest, error) {
@@ -511,7 +731,7 @@ func scanControlRequest(s scanner) (*storage.ApplyControlRequest, error) {
 	err := s.Scan(
 		&req.ID, &req.ApplyID, &req.Operation, &req.Status,
 		&req.RequestedBy, &errorMessage, &req.Metadata, &completedAt,
-		&req.CreatedAt, &req.UpdatedAt,
+		&req.CreatedAt, &req.UpdatedAt, &req.Revision,
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {

@@ -404,7 +404,10 @@ Apply reaches terminal state
         |
         +-- completed ----------> per-db completed/success
         |
-        +-- failed/stopped/etc -> per-db completed/failure
+        +-- failed/cancelled ---> per-db completed/failure
+        |
+        +-- stopped ------------> per-db stays in_progress,
+                                  aggregate action_required
         |
         v
 Recompute aggregate check
@@ -436,7 +439,10 @@ Rollback reaches terminal state
         |
         +-- completed ----------> per-db completed/action_required
         |
-        +-- failed/stopped/etc -> per-db completed/failure
+        +-- failed/cancelled ---> per-db completed/failure
+        |
+        +-- stopped ------------> per-db stays in_progress,
+                                  aggregate action_required
         |
         v
 Recompute aggregate check
@@ -533,6 +539,7 @@ Run output remains human-readable and may change.
 | `schema_config_discovery_failed` | Aggregate row | SchemaBot could reach GitHub, but could not determine the managed schema configuration or schema files. |
 | `pr_file_cap_exceeded` | Aggregate row | The PR changes more files than GitHub will report for a single pull request, so SchemaBot's changed-file list is incomplete. Unlike the reasons above this is a property of the PR itself, so it clears only when the PR is split — not by retrying. |
 | `no_allowed_configured_environments` | Aggregate row | Schema files changed, but none of the database's server-configured environments are allowed for this deployment. |
+| `plan_failed_unrecorded` | Aggregate row | One environment of a multi-environment plan could not plan, and its failing per-database row could not be stored, so stored check state holds nothing of the failure. No plan command releases it; a re-run of the check or a new commit re-plans every environment and does. |
 | `narrowed_apply` | Per-database row | The rollout is going one target at a time (`--target`), so nothing yet shows the other targets have the change. It does not replace a reconciliation, review-time drift, or namespace placement block already on the row: the narrowed apply evaluated none of them. An apply or plan of the whole environment (`schemabot apply -e <environment>`) replaces it with its own result. |
 
 Generic plan and apply errors can still publish `completed` / `failure` without
@@ -619,7 +626,10 @@ Review-time deployment drift is stored to survive a plan that did not
 re-evaluate it, but a plan that does re-evaluate the rollup lifts it once the
 deployments match, so it reads as a guard rather than as a reconciliation.
 Calling it a reconciliation would tell an operator that the one action that
-clears it does not.
+clears it does not. For the same reason a guard block stored on the aggregate
+row reads differently from one on a database's own row: every fold, a plan
+command's included, leaves it in place, so its remedy names a re-run of the
+check or a new commit, which re-verify the whole pull request, never a plan.
 
 The review-time rollup also shows each deployment's blocked change count. This
 is informational beside drift: blocked verdicts do not make matching change
@@ -665,6 +675,16 @@ the checks that instance owns:
   would trivially read as missing one. The skip is reported, never an error:
   an `--all-repos` sweep keeps going, and naming a disabled repository
   explicitly reports it as skipped with the reason instead of scanning it.
+  A declared repository the instance's GitHub App is not installed on (GitHub
+  answers the installation lookup with 404, for example while the repository's
+  onboarding is still in progress) is also skipped by an `--all-repos` sweep
+  and named in the report. Unlike a disabled repository it makes the run exit
+  nonzero, since the sweep never read it. A repository skipped part-way
+  through its pages drops whatever its earlier pages found, so none of it is
+  sent for recreation. Naming such a repository explicitly
+  fails with the App and repository to fix. Any other scan failure — a GitHub
+  5xx, timeout, rate limit, or auth error — stops the sweep, because a
+  repository that could not be read is not one with nothing to backfill.
 - **Apps.** Each repository resolves to the GitHub App that owns it (see
   [Multi-App Routing](configuration.md#multi-app-routing)); the scan and the
   recreated Check Runs both use that App's installation. An instance hosting
@@ -1070,8 +1090,15 @@ When the apply reaches a terminal state:
 
 - `completed` sets the internal record to `success` and lets the aggregate pass
   if every other record is also successful.
-- `failed`, `stopped`, `cancelled`, or other non-success terminal states set the
-  internal record to `failure` and the aggregate fails.
+- `failed`, `cancelled`, or other non-success terminal states set the internal
+  record to `failure` and the aggregate fails.
+- `stopped` leaves the internal record `in_progress` and owned by the apply,
+  since the apply has not settled. The aggregate Check Run concludes
+  `action_required` titled "1 apply stopped", so merge stays blocked without a
+  run left spinning. When a driver claims the apply to start it again, SchemaBot
+  republishes the aggregate and the Check Run returns to in progress. If that
+  publish fails, the run keeps saying the apply is stopped until the next
+  aggregate publish for the PR; merge stays blocked either way.
 
 Completion is conditional on ownership: the watcher can only update the row if
 the row still represents that `apply_id` and no newer apply exists for the same
@@ -1217,6 +1244,7 @@ another SchemaBot deployment.
 | --- | --- | --- |
 | `success` on the PR head commit | Yes | Prior environment is clean for the commit being applied. |
 | `action_required` on the PR head commit | No | Apply the prior environment first. |
+| `action_required` held by a stopped apply | No | Start the stopped apply in the prior environment again. |
 | `in_progress` | No | Wait for the prior environment to finish. |
 | `failure` on the PR head commit | No | Fix and re-apply the prior environment. |
 | Completed on another commit | No | The result says nothing about the commit being applied. Re-check the prior environment on the PR head with `schemabot plan -e <prior-environment>`. |
@@ -1238,7 +1266,10 @@ environment:
   environment.
 - If another deployment owns the prior environment, SchemaBot reads the
   environment aggregate check run from GitHub, such as `SchemaBot (staging)` or
-  the deployment's configured check name.
+  the deployment's configured check name. The run's conclusion decides whether
+  the apply is blocked; when it is `action_required` with a stopped-apply title
+  such as "1 apply stopped", the blocked comment asks for the stopped apply to
+  be started again instead of for a fresh apply.
 
 The GitHub lookup verifies which App created the check run: only this
 deployment's own GitHub App and the sibling deployment Apps listed in

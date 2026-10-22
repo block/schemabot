@@ -39,9 +39,15 @@ type ChecksCmd struct {
 // Without --last the scan covers every open PR, which is the one-time
 // backfill for a repository that predates check enablement. --dry-run
 // reports without acting.
+//
+// A sweep skips and reports a declared repository the server's GitHub App is
+// not installed on, so one repository mid-onboarding does not hide the rest of
+// the fleet; the skip still makes the run exit nonzero. Every other scan
+// failure stops the sweep, since a repository that could not be read is not
+// one with nothing to backfill.
 type ChecksBackfillCmd struct {
 	Repo           string `arg:"" optional:"" help:"Repository to backfill, in owner/name form; omit with --all-repos"`
-	AllRepos       bool   `help:"Scan every repository declared in the server's repos config"`
+	AllRepos       bool   `help:"Scan every repository declared in the server's repos config, skipping and reporting any the server's GitHub App is not installed on"`
 	Last           string `help:"Only scan PRs updated within this window, for example 1h or 1d; by default every open PR is scanned"`
 	Environment    string `short:"e" help:"Only backfill this environment's SchemaBot Check Run name"`
 	CheckName      string `help:"Override the SchemaBot Check Run name to look for"`
@@ -122,8 +128,14 @@ type checksBackfillReport struct {
 	// Check Run publishing is turned off (enable_checks: false) — the server
 	// refuses to create their checks, so every open PR would read as missing.
 	SkippedDisabled []string `json:"skipped_checks_disabled,omitempty"`
-	CheckNames      []string `json:"check_names"`
-	Scanned         int      `json:"scanned"`
+	// SkippedAppNotInstalled are repositories the sweep did not scan because
+	// GitHub has no installation of their configured GitHub App on them, so
+	// the App can neither read nor publish their Check Runs. Unlike a disabled
+	// repository this is a misconfiguration, so it counts toward the run's
+	// nonzero exit.
+	SkippedAppNotInstalled []string `json:"skipped_app_not_installed,omitempty"`
+	CheckNames             []string `json:"check_names"`
+	Scanned                int      `json:"scanned"`
 	// Last echoes the --last window bounding the sweep; empty means every
 	// open PR was scanned.
 	Last       string                 `json:"last,omitempty"`
@@ -206,6 +218,7 @@ scanning:
 		page := 1
 		repoScanned := 0
 		repoEstimate := 0
+		repoStart := report.mark()
 		for {
 			chunk, err := cmdclient.ChecksScan(ctx, endpoint, apitypes.ChecksScanRequest{
 				Repo:         repo,
@@ -218,6 +231,9 @@ scanning:
 				// "2d" verbatim would fail the first page and abort the
 				// sweep. The report keeps the spelling the operator used.
 				StuckAfter: stuckAfter.String(),
+				// This command handles the not-installed skip below, so the
+				// server may answer with it instead of an error.
+				ReportAppNotInstalled: true,
 			})
 			if canceled := backfillCanceledError(err, stopProgress); canceled != nil {
 				return canceled
@@ -227,10 +243,28 @@ scanning:
 			}
 			// The server skips repos whose Check Run publishing is turned
 			// off rather than reporting every open PR as missing; record the
-			// skip for the report and move to the next repo.
+			// skip for the report and move to the next repo. A skip can land
+			// on a later page (the config or installation changed mid-scan),
+			// so it also drops whatever this repo's earlier pages added: a
+			// skipped repo has no findings, and none of them reach synthesis.
 			if chunk.ChecksDisabled {
+				held -= report.rollback(repoStart, checkNamesSeen)
 				skippedByServer[repo] = true
 				report.SkippedDisabled = append(report.SkippedDisabled, repo)
+				continue scanning
+			}
+			// GitHub confirmed the repo's App is not installed on it. A named
+			// repo is the operator asking about that one repo, so say what to
+			// fix; a sweep records the skip and moves on, so one repo whose
+			// onboarding is still in progress does not hide every repo after
+			// it. Any other scan failure stopped the sweep above.
+			if chunk.AppNotInstalled {
+				if !cmd.AllRepos {
+					return appNotInstalledError(repo, chunk.GitHubApp)
+				}
+				held -= report.rollback(repoStart, checkNamesSeen)
+				skippedByServer[repo] = true
+				report.SkippedAppNotInstalled = append(report.SkippedAppNotInstalled, repo)
 				continue scanning
 			}
 			for _, name := range chunk.CheckNames {
@@ -286,9 +320,8 @@ scanning:
 	}
 	sort.Strings(report.CheckNames)
 
-	// The report's scanned-repo list and its skip list stay disjoint: a repo
-	// the server reported as disabled was never scanned, so it belongs only
-	// in the skip list.
+	// The report's scanned-repo list and its skip lists stay disjoint: a repo
+	// the server skipped was never scanned, so it belongs only in a skip list.
 	if len(skippedByServer) > 0 {
 		report.Repos = slices.DeleteFunc(report.Repos, func(r string) bool { return skippedByServer[r] })
 	}
@@ -312,6 +345,47 @@ scanning:
 		return err
 	}
 	return attentionExitError(report)
+}
+
+// checksScanMark is how much of a report existed before one repository's scan
+// began.
+type checksScanMark struct {
+	actions, stuck, scanned, checkNames int
+}
+
+func (r *checksBackfillReport) mark() checksScanMark {
+	return checksScanMark{actions: len(r.Actions), stuck: len(r.Stuck), scanned: r.Scanned, checkNames: len(r.CheckNames)}
+}
+
+// rollback removes everything added to the report since m, for a repository
+// the server skipped after some of its pages were already scanned, and
+// returns how many held PRs it removed. A repository's findings are appended
+// contiguously, so truncating to the mark removes exactly that repository's.
+func (r *checksBackfillReport) rollback(m checksScanMark, checkNamesSeen map[string]bool) int {
+	held := 0
+	for _, action := range r.Actions[m.actions:] {
+		if action.Held {
+			held++
+		}
+	}
+	for _, name := range r.CheckNames[m.checkNames:] {
+		delete(checkNamesSeen, name)
+	}
+	r.Actions = r.Actions[:m.actions]
+	r.Stuck = r.Stuck[:m.stuck]
+	r.Scanned = m.scanned
+	r.CheckNames = r.CheckNames[:m.checkNames]
+	return held
+}
+
+// appNotInstalledError tells the operator who named repo that its GitHub App
+// is not installed there, and the two ways to resolve it.
+func appNotInstalledError(repo, app string) error {
+	appName := "the server's GitHub App"
+	if app != "" {
+		appName = fmt.Sprintf("GitHub App %q", app)
+	}
+	return fmt.Errorf("%s is not installed on %s, so SchemaBot cannot read or create its Check Runs; install the App on %s, or remove %s from the server's repos config", appName, repo, repo, repo)
 }
 
 // attentionExitError makes the exit code mean "nothing needs an operator
@@ -358,6 +432,11 @@ func attentionExitError(report *checksBackfillReport) error {
 	}
 	if n := len(report.Stuck); n > 0 {
 		parts = append(parts, fmt.Sprintf("%d stuck %s", n, ui.Pluralize("Check Run", n)))
+	}
+	// A repo the App is not installed on was never scanned, so the run cannot
+	// say it has nothing to backfill.
+	if n := len(report.SkippedAppNotInstalled); n > 0 {
+		parts = append(parts, fmt.Sprintf("%d %s without the GitHub App installed", n, ui.PluralizeLabel("repository", "repositories", n)))
 	}
 	if len(parts) == 0 {
 		return nil
@@ -595,6 +674,12 @@ func (cmd *ChecksBackfillCmd) write(report *checksBackfillReport) error {
 }
 
 func writeChecksBackfillReport(w io.Writer, report *checksBackfillReport) error {
+	if len(report.Repos) == 0 && len(report.SkippedAppNotInstalled) > 0 {
+		if _, err := fmt.Fprintln(w, "No repositories scanned."); err != nil {
+			return err
+		}
+		return writeChecksSkippedRepos(w, report)
+	}
 	if len(report.Repos) == 0 && len(report.SkippedDisabled) > 0 {
 		if len(report.SkippedDisabled) == 1 {
 			_, err := fmt.Fprintf(w, "Repository %s has Check Runs disabled (enable_checks: false); nothing to scan.\n", report.SkippedDisabled[0])
@@ -618,10 +703,8 @@ func writeChecksBackfillReport(w io.Writer, report *checksBackfillReport) error 
 	if _, err := fmt.Fprintf(w, "Scanned %d open PRs%s in %s%s.\n", report.Scanned, window, repoScope, checkScope); err != nil {
 		return err
 	}
-	if len(report.SkippedDisabled) > 0 {
-		if _, err := fmt.Fprintf(w, "Skipped repositories with Check Runs disabled (enable_checks: false): %s.\n", strings.Join(report.SkippedDisabled, ", ")); err != nil {
-			return err
-		}
+	if err := writeChecksSkippedRepos(w, report); err != nil {
+		return err
 	}
 	if err := writeChecksStuckSection(w, report); err != nil {
 		return err
@@ -670,6 +753,22 @@ func writeChecksBackfillReport(w io.Writer, report *checksBackfillReport) error 
 	}
 	if failed > 0 {
 		return fmt.Errorf("%d Check Run backfills failed; see the outcomes above", failed)
+	}
+	return nil
+}
+
+// writeChecksSkippedRepos names the repositories the sweep did not scan, one
+// line per reason.
+func writeChecksSkippedRepos(w io.Writer, report *checksBackfillReport) error {
+	if len(report.SkippedDisabled) > 0 {
+		if _, err := fmt.Fprintf(w, "Skipped repositories with Check Runs disabled (enable_checks: false): %s.\n", strings.Join(report.SkippedDisabled, ", ")); err != nil {
+			return err
+		}
+	}
+	if len(report.SkippedAppNotInstalled) > 0 {
+		if _, err := fmt.Fprintf(w, "Skipped repositories the server's GitHub App is not installed on: %s. Install the App on each, or remove it from the server's repos config.\n", strings.Join(report.SkippedAppNotInstalled, ", ")); err != nil {
+			return err
+		}
 	}
 	return nil
 }

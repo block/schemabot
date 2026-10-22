@@ -44,6 +44,7 @@ func buildApplyCommentData(apply *storage.Apply, tasks []*storage.Task, display 
 		Tenant:           tenant,
 		Rollback:         apply.IsRollback(),
 		DeferCutover:     apply.GetOptions().DeferCutover,
+		SkipRevert:       apply.GetOptions().SkipRevert,
 	}
 	if apply.StartedAt != nil {
 		data.StartedAt = apply.StartedAt.Format(time.RFC3339)
@@ -405,6 +406,7 @@ func tableProgressFromTasks(databaseFallback string, tasks []*storage.Task, shar
 			RowsCopied:          t.RowsCopied,
 			RowsTotal:           t.RowsTotal,
 			EstimatedBytes:      t.EstimatedBytes,
+			EstimatedRows:       t.EstimatedRows,
 			PercentComplete:     t.ProgressPercent,
 			ETASeconds:          int64(t.ETASeconds),
 			ChecksumRowsChecked: t.ChecksumRowsChecked,
@@ -412,6 +414,7 @@ func tableProgressFromTasks(databaseFallback string, tasks []*storage.Task, shar
 			Throttled:           t.Throttled,
 			ThrottleReason:      t.ThrottleReason,
 			IsInstant:           t.IsInstant,
+			Started:             t.StartedAt != nil,
 			ErrorMessage:        t.ErrorMessage,
 			Shards:              shardProgressForTable(shardsByTable, t.ApplyOperationID, t.Namespace, t.TableName),
 		})
@@ -437,6 +440,9 @@ func shardProgressForTable(shardsByTable map[string][]*storage.Task, applyOperat
 			PercentComplete: r.ProgressPercent,
 			RowsCopied:      r.RowsCopied,
 			RowsTotal:       r.RowsTotal,
+
+			ChecksumRowsChecked: r.ChecksumRowsChecked,
+			ChecksumRowsTotal:   r.ChecksumRowsTotal,
 		})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Shard < out[j].Shard })

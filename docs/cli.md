@@ -249,16 +249,26 @@ findings, each with output examples.
 ```console
 $ schemabot status -e staging
 1 active schema change
-4 total: 2 Completed · 1 Failed · 1 Running
 
-  APPLY ID          DATABASE  ENV      STATE      STARTED         SOURCE
-  apply-example-73  shop      staging  Running    10 minutes ago  https://github.com/acme/store/pull/42
-  apply-example-72  billing   staging  Completed  1 hour ago      https://github.com/acme/billing/pull/18
-  apply-example-71  catalog   staging  Failed     2 hours ago     https://github.com/acme/store/pull/40
-  apply-example-70  accounts  staging  Completed  3 hours ago     https://github.com/acme/accounts/pull/12
+  APPLY ID          DATABASE  ENV      STATE    STARTED         SOURCE
+  apply-example-73  shop      staging  Running  10 minutes ago  https://github.com/acme/store/pull/42
+
+Recent schema changes
+3 total: 2 Completed · 1 Failed
+
+  APPLY ID          DATABASE  ENV      STATE      STARTED      SOURCE
+  apply-example-72  billing   staging  Completed  1 hour ago   https://github.com/acme/billing/pull/18
+  apply-example-71  catalog   staging  Failed     2 hours ago  https://github.com/acme/store/pull/40
+  apply-example-70  accounts  staging  Completed  3 hours ago  https://github.com/acme/accounts/pull/12
 
 Use 'schemabot status <apply_id>' to view details
 ```
+
+Every active schema change is listed first, however long ago it started. The
+finished ones follow, newest first. Raise `--limit` to see more of them. Past
+the server's cap (1,000 applies, 200 plans), `status` and `list-plans` name the
+ID to pass to `--after` for the next page; `--all` follows every page for you. The [schema intelligence guide](schema-intelligence.md#whats-running-across-the-fleet)
+shows a paged walk.
 
 Inspect one apply with `status <apply_id>` for a single snapshot, or use
 `progress <apply_id>` to keep watching. The [progress example](#follow-and-control-a-change) shows the live view.
@@ -306,7 +316,14 @@ Next: open a normal PR with these files. SchemaBot will reconcile other configur
 `onboard` writes local files and verifies them with a plan; it does not apply
 DDL. It refuses to overwrite existing files by default. Keep the complete
 schema for the namespaces you manage: omitting an existing table can propose
-a drop. See [namespace scope](namespaces.md) for shared databases.
+a drop. See [namespace scope](namespaces.md) for shared databases. When the
+`-s` directory has an [environment schema root](namespaces.md#per-environment-schema-roots)
+for the source environment, `onboard` writes the namespace files there and
+keeps `schemabot.yaml` in the `-s` directory. `plan` and `apply` read that root
+for the environment too. Without one, `onboard` refuses a namespace named for
+the environment, because writing it would create the environment's root and
+hide the other namespaces. It also refuses namespaces whose directories are
+symlinks to one directory unless the pull returns the same schema for each.
 
 The command's PR hint is for GitHub automation. You can also use the generated
 files directly with the CLI, as shown below.
@@ -497,8 +514,10 @@ dispatched, and an apply or plan of the whole environment lifts that block
 once every target has the change. `apply-confirm` takes no `--target`: it confirms the
 target its apply named. The server records the narrowing on the
 stored plan and refuses to apply it anywhere but the target it was made for,
-and a narrowed apply cannot be rolled back with `rollback`: restore that
-target by planning and applying the previous schema with the same `--target`.
+and `rollback` isn't supported for schema changes across multiple targets
+yet: undo one by applying schema files without the change, or restore a
+narrowed apply's target by planning and applying the previous schema with the
+same `--target`.
 In an environment with a single target, `--target` names the whole rollout,
 so the plan and apply are not narrowed.
 
@@ -686,10 +705,10 @@ $ schemabot progress apply-example-84
        ALTER TABLE `orders` ADD INDEX `idx_status`(`status`);
        • Rows: 2,900,000 / 4,000,000 · ETA: 2m 45s
        • Shards: 4 (3 copying, 1 complete)
-           ◉ c0-: 45.00% · 450,000 / 1,000,000 rows · ETA: 2m 45s
-           ◉ 80-c0: 65.00% · 650,000 / 1,000,000 rows · ETA: 1m 45s
-           ◉ 40-80: 80.00% · 800,000 / 1,000,000 rows · ETA: 1m 0s
            ✓ -40: 1,000,000 rows
+           ◉ 40-80: 80.00% · 800,000 / 1,000,000 rows · ETA: 1m 0s
+           ◉ 80-c0: 65.00% · 650,000 / 1,000,000 rows · ETA: 1m 45s
+           ◉ c0-: 45.00% · 450,000 / 1,000,000 rows · ETA: 2m 45s
 
 
 ESC detach • c cancel
@@ -902,7 +921,7 @@ Waiting on an operator:
     apply: apply-example-68 (rolled_back)
     blocking reason: rollback_completed
     do: Reconcile the target environment. No plan and no new commit clears this on its own.
-  staging/shipments: The apply holding this check is stopped, so the check stays in progress and the gate stays closed.
+  staging/shipments: The apply holding this check is stopped, so the gate stays closed.
     apply: apply-example-81 (stopped)
     do: Start the apply or cancel it. It does not settle on its own, and no plan replaces a stopped apply's result.
 ```
@@ -988,18 +1007,31 @@ when findings remain; do not treat every nonzero exit as a transport error.
 This is an admin operation. See [PR recovery](pre-merge-workflow.md) for the
 workflow and automatic recovery behavior.
 
+An `--all-repos` sweep skips a declared repository the server's GitHub App is
+not installed on, names it, and keeps scanning the rest. The skip still makes
+the run exit nonzero, because that repository was never read. Any other scan
+failure stops the sweep.
+
+```console
+$ schemabot checks backfill --all-repos -e staging --last 2h --dry-run
+Scanned 6 open PRs updated in the last 2h in acme/ledger, acme/store for SchemaBot (staging).
+Skipped repositories the server's GitHub App is not installed on: acme/payroll. Install the App on each, or remove it from the server's repos config.
+No missing SchemaBot Check Runs found.
+Error: checks backfill left 1 repository without the GitHub App installed needing attention
+```
+
 A sweep that does find unfinished checks says what each one is waiting on, so
 the report can be triaged without opening every pull request in it:
 
 ```console
 $ schemabot checks backfill --all-repos --dry-run
-Scanned 148 open PRs in acme/store, acme/ledger for SchemaBot (staging), SchemaBot (production).
+Scanned 148 open PRs in acme/ledger, acme/store for SchemaBot (staging), SchemaBot (production).
 
 Stuck Check Runs — uncompleted for over 1h (backfill does not act on existing Check Runs; investigate the apply or plan that owns each):
 PR                                      CHECK                   STATUS       AGE      WAITING ON  REASON
-https://github.com/acme/store/pull/412  SchemaBot (staging)     in_progress  5h12m0s  schemabot   awaiting_replan_after_apply
 https://github.com/acme/ledger/pull/88  SchemaBot (production)  in_progress  31h0m0s  operator    reconciliation_owed
 https://github.com/acme/ledger/pull/91  SchemaBot (production)  queued       unknown  -           -
+https://github.com/acme/store/pull/412  SchemaBot (staging)     in_progress  5h12m0s  schemabot   awaiting_replan_after_apply
 
 A run waiting on an operator will not clear on its own. Read the stored rows behind one with `sq schemabot checks show <owner/repo> <pr>`.
 
@@ -1202,7 +1234,9 @@ names the `start` command that resumes it. A watcher that cannot reach the
 server retries with backoff, and exits non-zero once polls have kept failing
 for a few minutes in a row; the interactive watcher gives up on the same
 schedule. Giving up does not affect the apply. The error tells the operator to
-run `progress` with the apply ID to watch it again. When a refused poll
+run `progress` with the apply ID to watch it again. That command names the
+environment and any `--profile` or `--endpoint` the watch was started with, so
+pasting it reaches the same server. When a refused poll
 carries a `Retry-After` header, as a proxy or rate limiter in front of
 SchemaBot may send, a watcher waits at least that long before polling again,
 up to 5 minutes per poll, so a watcher held off this way takes longer to give
