@@ -753,64 +753,95 @@ func TestWriteChecksBackfillReportNoRepoHasTheAppInstalled(t *testing.T) {
 	assert.EqualError(t, attentionExitError(report), "checks backfill left 2 repositories without the GitHub App installed needing attention")
 }
 
-// The App can be uninstalled from a repository while a sweep is paging through
-// it, so the skip arrives after earlier pages already reported findings. Those
-// findings belong to a repository the App can no longer act on: they are
+// A repository can stop being scannable while a sweep is paging through it:
+// the App is uninstalled, or a config reload turns its Check Runs off. The
+// skip then arrives after earlier pages already reported findings. Those
+// findings belong to a repository the sweep no longer covers: they are
 // dropped with the rest of the repository, never sent for synthesis, and the
-// healthy repository after it is still repaired.
-func TestChecksBackfillDropsTheFindingsOfARepoUninstalledMidScan(t *testing.T) {
-	declared := []string{"octo/alpha", "octo/zeta"}
-	scans := map[string][]apitypes.ChecksScanResponse{
-		"octo/alpha": {
-			{
-				Repo:       "octo/alpha",
-				CheckNames: []string{"SchemaBot (staging)"},
-				Scanned:    2,
-				NextPage:   2,
-				Missing: []apitypes.MissingCheckPR{
-					{Number: 3, URL: "https://github.com/octo/alpha/pull/3", Title: "add index", HeadSHA: "sha3", MissingNames: []string{"SchemaBot (staging)"}},
-					{Number: 4, URL: "https://github.com/octo/alpha/pull/4", Title: "held", HeadSHA: "sha4", MissingNames: []string{"SchemaBot (staging)"}},
-				},
-				Stuck: []apitypes.StuckCheckPR{
-					{
-						Number: 4, URL: "https://github.com/octo/alpha/pull/4", Title: "held", HeadSHA: "sha4",
-						Checks: []apitypes.IncompleteCheckRun{{Name: "SchemaBot (production)", CheckRunID: 40, Status: "queued"}},
-					},
-				},
-			},
-			{Repo: "octo/alpha", AppNotInstalled: true, GitHubApp: "staging"},
+// healthy repository after it is still repaired and still named in the
+// report's check scope.
+func TestChecksBackfillDropsTheFindingsOfARepoSkippedMidScan(t *testing.T) {
+	cases := []struct {
+		name string
+		// skip is the page-2 answer for octo/alpha.
+		skip                       apitypes.ChecksScanResponse
+		wantErr                    string
+		wantSkippedAppNotInstalled []string
+		wantSkippedDisabled        []string
+	}{
+		{
+			name:                       "GitHub App uninstalled",
+			skip:                       apitypes.ChecksScanResponse{Repo: "octo/alpha", AppNotInstalled: true, GitHubApp: "staging"},
+			wantErr:                    "checks backfill left 1 repository without the GitHub App installed needing attention",
+			wantSkippedAppNotInstalled: []string{"octo/alpha"},
 		},
-		"octo/zeta": {
-			{
-				Repo:       "octo/zeta",
-				CheckNames: []string{"SchemaBot (staging)"},
-				Scanned:    4,
-				Missing: []apitypes.MissingCheckPR{
-					{Number: 8, URL: "https://github.com/octo/zeta/pull/8", Title: "add column", HeadSHA: "sha8", MissingNames: []string{"SchemaBot (staging)"}},
-				},
-			},
+		{
+			name:                "Check Runs disabled",
+			skip:                apitypes.ChecksScanResponse{Repo: "octo/alpha", ChecksDisabled: true},
+			wantSkippedDisabled: []string{"octo/alpha"},
 		},
 	}
-	server := newChecksBackfillFleetServer(t, declared, scans, nil)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			declared := []string{"octo/alpha", "octo/zeta"}
+			scans := map[string][]apitypes.ChecksScanResponse{
+				"octo/alpha": {
+					{
+						Repo:       "octo/alpha",
+						CheckNames: []string{"SchemaBot (staging)"},
+						Scanned:    2,
+						NextPage:   2,
+						Missing: []apitypes.MissingCheckPR{
+							{Number: 3, URL: "https://github.com/octo/alpha/pull/3", Title: "add index", HeadSHA: "sha3", MissingNames: []string{"SchemaBot (staging)"}},
+							{Number: 4, URL: "https://github.com/octo/alpha/pull/4", Title: "held", HeadSHA: "sha4", MissingNames: []string{"SchemaBot (staging)"}},
+						},
+						Stuck: []apitypes.StuckCheckPR{
+							{
+								Number: 4, URL: "https://github.com/octo/alpha/pull/4", Title: "held", HeadSHA: "sha4",
+								Checks: []apitypes.IncompleteCheckRun{{Name: "SchemaBot (production)", CheckRunID: 40, Status: "queued"}},
+							},
+						},
+					},
+					tc.skip,
+				},
+				"octo/zeta": {
+					{
+						Repo:       "octo/zeta",
+						CheckNames: []string{"SchemaBot (staging)"},
+						Scanned:    4,
+						Missing: []apitypes.MissingCheckPR{
+							{Number: 8, URL: "https://github.com/octo/zeta/pull/8", Title: "add column", HeadSHA: "sha8", MissingNames: []string{"SchemaBot (staging)"}},
+						},
+					},
+				},
+			}
+			server := newChecksBackfillFleetServer(t, declared, scans, nil)
 
-	cmd := &ChecksBackfillCmd{AllRepos: true, Environment: "staging", StuckAfter: "1h", JSON: true}
-	var runErr error
-	output := captureStdout(func() {
-		runErr = cmd.Run(t.Context(), &Globals{Endpoint: server.URL})
-	})
+			cmd := &ChecksBackfillCmd{AllRepos: true, Environment: "staging", StuckAfter: "1h", JSON: true}
+			var runErr error
+			output := captureStdout(func() {
+				runErr = cmd.Run(t.Context(), &Globals{Endpoint: server.URL})
+			})
 
-	assert.Equal(t, map[string][]int{"octo/zeta": {8}}, server.synthesizedPRs(), "only the healthy repository's PRs are sent for synthesis")
-	require.Error(t, runErr)
-	assert.EqualError(t, runErr, "checks backfill left 1 repository without the GitHub App installed needing attention")
+			assert.Equal(t, map[string][]int{"octo/zeta": {8}}, server.synthesizedPRs(), "only the healthy repository's PRs are sent for synthesis")
+			if tc.wantErr == "" {
+				require.NoError(t, runErr)
+			} else {
+				require.EqualError(t, runErr, tc.wantErr)
+			}
 
-	var report checksBackfillReport
-	require.NoError(t, json.Unmarshal([]byte(output), &report))
-	assert.Equal(t, []string{"octo/zeta"}, report.Repos)
-	assert.Equal(t, []string{"octo/alpha"}, report.SkippedAppNotInstalled)
-	assert.Equal(t, 4, report.Scanned, "the skipped repository's pages do not count as scanned")
-	assert.Empty(t, report.Stuck, "the skipped repository's stuck runs are dropped with it")
-	require.Len(t, report.Actions, 1)
-	assert.Equal(t, "octo/zeta", report.Actions[0].Repo)
-	assert.Equal(t, 8, report.Actions[0].PR)
-	assert.Equal(t, "created 1 Check Run", report.Actions[0].Outcome)
+			var report checksBackfillReport
+			require.NoError(t, json.Unmarshal([]byte(output), &report))
+			assert.Equal(t, []string{"octo/zeta"}, report.Repos)
+			assert.Equal(t, tc.wantSkippedAppNotInstalled, report.SkippedAppNotInstalled)
+			assert.Equal(t, tc.wantSkippedDisabled, report.SkippedDisabled)
+			assert.Equal(t, []string{"SchemaBot (staging)"}, report.CheckNames, "a check name the skipped repository reported first is still recorded for the repository after it")
+			assert.Equal(t, 4, report.Scanned, "the skipped repository's pages do not count as scanned")
+			assert.Empty(t, report.Stuck, "the skipped repository's stuck runs are dropped with it")
+			require.Len(t, report.Actions, 1)
+			assert.Equal(t, "octo/zeta", report.Actions[0].Repo)
+			assert.Equal(t, 8, report.Actions[0].PR)
+			assert.Equal(t, "created 1 Check Run", report.Actions[0].Outcome)
+		})
+	}
 }

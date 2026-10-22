@@ -1007,7 +1007,7 @@ failure stops the sweep.
 
 ```console
 $ schemabot checks backfill --all-repos -e staging --last 2h --dry-run
-Scanned 6 open PRs updated in the last 2h in acme/store, acme/ledger for SchemaBot (staging).
+Scanned 6 open PRs updated in the last 2h in acme/ledger, acme/store for SchemaBot (staging).
 Skipped repositories the server's GitHub App is not installed on: acme/payroll. Install the App on each, or remove it from the server's repos config.
 No missing SchemaBot Check Runs found.
 Error: checks backfill left 1 repository without the GitHub App installed needing attention
@@ -1018,13 +1018,13 @@ the report can be triaged without opening every pull request in it:
 
 ```console
 $ schemabot checks backfill --all-repos --dry-run
-Scanned 148 open PRs in acme/store, acme/ledger for SchemaBot (staging), SchemaBot (production).
+Scanned 148 open PRs in acme/ledger, acme/store for SchemaBot (staging), SchemaBot (production).
 
 Stuck Check Runs — uncompleted for over 1h (backfill does not act on existing Check Runs; investigate the apply or plan that owns each):
 PR                                      CHECK                   STATUS       AGE      WAITING ON  REASON
-https://github.com/acme/store/pull/412  SchemaBot (staging)     in_progress  5h12m0s  schemabot   awaiting_replan_after_apply
 https://github.com/acme/ledger/pull/88  SchemaBot (production)  in_progress  31h0m0s  operator    reconciliation_owed
 https://github.com/acme/ledger/pull/91  SchemaBot (production)  queued       unknown  -           -
+https://github.com/acme/store/pull/412  SchemaBot (staging)     in_progress  5h12m0s  schemabot   awaiting_replan_after_apply
 
 A run waiting on an operator will not clear on its own. Read the stored rows behind one with `sq schemabot checks show <owner/repo> <pr>`.
 
