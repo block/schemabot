@@ -1827,6 +1827,24 @@ const (
 	ControlRequestFailed ControlRequestStatus = "failed"
 )
 
+// QueuedStartStop is what ControlRequestStore.StopQueuedStart found and did.
+type QueuedStartStop string
+
+const (
+	// QueuedStartApplyNotStopped means a claim already took the apply out of
+	// stopped. Nothing was written; the stop takes the path for a running apply.
+	QueuedStartApplyNotStopped QueuedStartStop = "apply_not_stopped"
+	// QueuedStartNone means the apply is stopped with no pending start, so
+	// there is nothing to stop. Nothing was written.
+	QueuedStartNone QueuedStartStop = "no_queued_start"
+	// QueuedStartWithdrawn means the start was completed before any driver
+	// acted on it and the stop was recorded completed: the apply stays stopped.
+	QueuedStartWithdrawn QueuedStartStop = "withdrawn"
+	// QueuedStartStopPending means the start was completed and the stop was
+	// recorded pending for the drive that already claimed an operation.
+	QueuedStartStopPending QueuedStartStop = "stop_pending"
+)
+
 // ApplyControlRequest records durable user control intent.
 // Use this when an HTTP control operation can be accepted before the engine has
 // actually performed the operation.

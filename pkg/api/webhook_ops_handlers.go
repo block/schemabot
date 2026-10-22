@@ -369,7 +369,33 @@ func executeWebhookRedrive(ctx context.Context, cfg *ServerConfig, req WebhookRe
 	return response, nil
 }
 
+// checksScanClient is the GitHub surface a checks scan reads through: the
+// repository's open PRs, the Check Runs on their heads, and the installation's
+// remaining budget.
+type checksScanClient interface {
+	webhookMissingCheckScanClient
+	CoreRateLimit(ctx context.Context) (remaining, limit int, resetAt time.Time, err error)
+}
+
+// checksScanClientResolver returns the GitHub client a scan of repo reads
+// through, using app's installation on the repository.
+type checksScanClientResolver func(ctx context.Context, app ResolvedGitHubApp, repo string, logger *slog.Logger) (checksScanClient, error)
+
+// installationChecksScanClient reads through app's installation on repo, the
+// same one SchemaBot publishes the repository's Check Runs through.
+func installationChecksScanClient(ctx context.Context, app ResolvedGitHubApp, repo string, logger *slog.Logger) (checksScanClient, error) {
+	client, _, err := resolveAppInstallationClient(ctx, app, repo, logger)
+	if err != nil {
+		return nil, err
+	}
+	return client, nil
+}
+
 func executeChecksScan(ctx context.Context, cfg *ServerConfig, store storage.Storage, req ChecksScanRequest, logger *slog.Logger) (*ChecksScanResponse, error) {
+	return executeChecksScanWith(ctx, cfg, store, req, logger, installationChecksScanClient)
+}
+
+func executeChecksScanWith(ctx context.Context, cfg *ServerConfig, store storage.Storage, req ChecksScanRequest, logger *slog.Logger, resolve checksScanClientResolver) (*ChecksScanResponse, error) {
 	if cfg == nil {
 		return nil, fmt.Errorf("server config is nil")
 	}
@@ -414,7 +440,22 @@ func executeChecksScan(ctx context.Context, cfg *ServerConfig, store storage.Sto
 		logger.Info("checks scan skipping repository with checks disabled", "repo", req.Repo)
 		return &ChecksScanResponse{Repo: req.Repo, ChecksDisabled: true}, nil
 	}
-	installationClient, _, err := resolveRepoInstallationClient(ctx, cfg, req.Repo, logger)
+	app, err := cfg.ResolveGitHubAppForRepo(req.Repo)
+	if err != nil {
+		return nil, err
+	}
+	installationClient, err := resolve(ctx, app, req.Repo, logger)
+	if errors.Is(err, ghclient.ErrAppNotInstalled) && req.ReportAppNotInstalled {
+		// GitHub confirmed the App has no installation covering the repo, so
+		// there is nothing this App can scan or recreate there. Report the
+		// skip as a normal response so a fleet sweep keeps going. A caller
+		// that did not ask for the skip gets the error below instead: it
+		// would ignore the flag and read the repo as scanned clean. Every
+		// other lookup failure leaves coverage unknown and stays an error.
+		logger.Warn("checks scan skipping repository: its GitHub App is not installed on it; install the App on the repository or remove the repository from the repos config",
+			"operation", "checks_scan", "repo", req.Repo, "environment", req.Environment, "github_app", app.Name, "error", err)
+		return &ChecksScanResponse{Repo: req.Repo, AppNotInstalled: true, GitHubApp: app.Name}, nil
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -472,6 +513,13 @@ func resolveRepoInstallationClient(ctx context.Context, cfg *ServerConfig, repo 
 	if err != nil {
 		return nil, 0, err
 	}
+	return resolveAppInstallationClient(ctx, app, repo, logger)
+}
+
+// resolveAppInstallationClient builds an installation-scoped GitHub client for
+// app's installation on repo. An error wrapping ghclient.ErrAppNotInstalled
+// means GitHub confirmed app has no installation covering repo.
+func resolveAppInstallationClient(ctx context.Context, app ResolvedGitHubApp, repo string, logger *slog.Logger) (*ghclient.InstallationClient, int64, error) {
 	creds, err := app.Config.ResolveCredentials()
 	if err != nil {
 		return nil, 0, fmt.Errorf("app %q: %w", app.Name, err)
@@ -480,7 +528,7 @@ func resolveRepoInstallationClient(ctx context.Context, cfg *ServerConfig, repo 
 		ghclient.WithTrustedCheckAppSlugs(app.Config.TrustedCheckAppSlugs))
 	installationID, err := client.InstallationIDForRepo(ctx, repo)
 	if err != nil {
-		return nil, 0, fmt.Errorf("resolve GitHub App installation for %s: %w", repo, err)
+		return nil, 0, fmt.Errorf("resolve GitHub App %q installation for %s: %w", app.Name, repo, err)
 	}
 	installationClient, err := client.ForInstallation(installationID)
 	if err != nil {

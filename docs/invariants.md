@@ -1272,7 +1272,10 @@ before it hands a VSchema to the engine (`finalizerStandsDownForPendingControl`,
 `pkg/tern/local_control_resume.go`); cancel-before-stop consumption on both clients
 (`processPendingCancelOrStopControlRequest`, `pkg/tern/local_control.go`,
 `pkg/tern/grpc_client.go`); conflict rejection at request intake
-(`pkg/api/control_handlers.go`); and failing the cutover a stop superseded before the stop's
+(`pkg/api/control_handlers.go`); a stop on a stopped apply withdrawing the start queued behind it
+in the write that records the stop, under the locks the resuming claims take (`StopQueuedStart`,
+`pkg/storage/internal/sqlstore/control_requests.go`, reached from `pkg/api/control_handlers.go`);
+and failing the cutover a stop superseded before the stop's
 request completes (`completePendingStopControlRequest` and `SettlePendingCutoverAfterStop`,
 `pkg/tern/control_requests.go`, reached from both clients and from
 `pkg/api/control_handlers.go` and `pkg/api/operator.go`).
@@ -1797,7 +1800,8 @@ cap, a truncated git tree, or config discovery that cannot prove exhaustiveness 
 because a missing file must never read as a deleted table and produce a spurious `DROP TABLE`
 proposal. Symlinked namespaces resolving outside the repository root, or to themselves, are
 rejected. *Enforced:* truncation and symlink guards on every schema-fetch path
-(`pkg/github/schema.go`, `pkg/github/client.go`); on the target side, the live-schema reads that
+(`pkg/github/schema.go`, `pkg/github/client.go`; environment schema roots for pull requests
+and the CLI alike in `pkg/schema/environment_root.go`); on the target side, the live-schema reads that
 feed a plan end it on any table they cannot read (`fetchCurrentSchema` in
 `pkg/engine/spirit/spirit.go`, `renderPostgresTables` in `pkg/engine/postgres/pull.go`).
 They also end it on a VSchema reported missing for a keyspace the target still has
@@ -1852,11 +1856,13 @@ plan, because re-resolving is exactly the step that could produce a different an
 the operator reviewed.
 
 The stored route binds the logical target and deployment, not a MySQL schema
-override within that target. Adding, changing, or removing an override requires
+override within that target or an inventory environment mapping. Adding, changing,
+or removing either requires
 holding affected operations, draining or retiring resumable applies, deploying
 consistent configuration to every replica, and discarding old plans before
 re-planning. This procedure is an operational prerequisite; durable schema-mapping
-binding across driver restarts is not enforced. See [schema override rollout](configuration.md#per-target-schema-overrides).
+binding across driver restarts is not enforced. See [schema override rollout](configuration.md#per-target-schema-overrides)
+and [inventory environment mapping](configuration.md#etre-inventory-environment-mapping).
 
 The schema source is held to the same standard, and checked twice. A repository and a path inside
 it count as a source for a database only because server config says so, verified when the plan is
@@ -1864,8 +1870,9 @@ made and verified again before the apply runs. Config that cannot answer the que
 refusal, never a default. *Breaks if violated:* a change reviewed against one database is applied
 to another. *Enforced:* server-side routing (`pkg/tern/target_router.go`), the schema override
 allowlist (`pkg/tern/local_client.go`, validated by `pkg/inventory/static.go`), configured
-resolver identity assertions (`pkg/inventory/overrides.go`), rollout member
-selection (`pkg/api/rollout_member_selector.go`, `applyTargets` in `pkg/api/plan_handlers.go`), the PostgreSQL
+resolver identity assertions (`pkg/inventory/overrides.go`), discovery scoped to the
+configured inventory environment (`pkg/etre/resolver.go`), rollout member selection
+(`pkg/api/rollout_member_selector.go`, `applyTargets` in `pkg/api/plan_handlers.go`), the PostgreSQL
 apply's check that planned DDL names the schema it targets (`pkg/engine/postgres/apply.go`), and
 source policy (`pkg/webhook/schema_source_policy.go`).
 

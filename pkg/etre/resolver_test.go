@@ -29,15 +29,80 @@ func newEtreResolverForTest(t *testing.T, gotQuery *string, entities []etre.Enti
 // capturingCredResolver records what the resolver passes to credential
 // resolution so tests can assert the surfaced attributes.
 type capturingCredResolver struct {
-	gotTarget string
-	gotAttrs  map[string]string
-	creds     *inventory.Credentials
+	gotTarget      string
+	gotEnvironment string
+	gotAttrs       map[string]string
+	creds          *inventory.Credentials
 }
 
 func (c *capturingCredResolver) ResolveCredentials(_ context.Context, req inventory.Request, attrs map[string]string) (*inventory.Credentials, error) {
 	c.gotTarget = req.Target
+	c.gotEnvironment = req.Environment
 	c.gotAttrs = attrs
 	return c.creds, nil
+}
+
+// Inventory environment aliases select the exact registered target while
+// credentials and repeated lifecycle resolutions retain the logical identity.
+func TestEtreResolverEnvironmentMapping(t *testing.T) {
+	for _, env := range []string{"sandbox", "staging", "production"} {
+		t.Run(env, func(t *testing.T) {
+			var query string
+			creds := &capturingCredResolver{creds: &inventory.Credentials{Username: "ddl", Password: "pw"}}
+			mapping := map[string]string{"sandbox": "production"}
+			r := newEtreResolverForTest(t, &query, []etre.Entity{{
+				"writer_endpoint": "orders.example", "aws_account_id": "123456789012",
+			}}, EtreResolverConfig{
+				TargetLabel: "dsid", EnvLabel: "env", EnvironmentMapping: mapping,
+				HostField: "writer_endpoint", AttributeFields: []string{"aws_account_id"}, Credentials: creds,
+			})
+			// The constructed resolver owns its mapping even if the caller edits config.
+			mapping["sandbox"] = "staging"
+			req := inventory.Request{Target: "orders-002", DatabaseType: "mysql", Environment: env}
+			for range 2 {
+				target, err := r.ResolveTarget(t.Context(), req)
+				require.NoError(t, err)
+				inventoryEnv := env
+				if env == "sandbox" {
+					inventoryEnv = "production"
+				}
+				assert.Equal(t, "dsid=orders-002,env="+inventoryEnv, query)
+				assert.Equal(t, req.Target, target.Target)
+				assert.Equal(t, env, creds.gotEnvironment)
+				assert.Equal(t, map[string]string{"aws_account_id": "123456789012"}, creds.gotAttrs)
+				assert.Empty(t, target.SchemaOverrides)
+				dsn, err := mysql.ParseDSN(target.DSN)
+				require.NoError(t, err)
+				assert.Equal(t, "orders.example:3306", dsn.Addr)
+				assert.Empty(t, dsn.DBName)
+			}
+		})
+	}
+}
+
+func TestNewEtreResolverValidatesEnvironmentMapping(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		envLabel string
+		mapping  map[string]string
+	}{
+		{"no env label", "", map[string]string{"sandbox": "production"}},
+		{"empty key", "env", map[string]string{"": "production"}},
+		{"empty value", "env", map[string]string{"sandbox": ""}},
+		{"whitespace", "env", map[string]string{"sandbox": " production"}},
+		{"uppercase", "env", map[string]string{"Sandbox": "production"}},
+		{"selector syntax", "env", map[string]string{"sandbox": "production,dsid=other"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := NewEtreResolver(EtreResolverConfig{
+				Client:      newClient(mockClient(nil, nil, nil), "cluster", nil),
+				TargetLabel: "dsid", EnvLabel: tc.envLabel, EnvironmentMapping: tc.mapping,
+				Credentials: inventory.SecretRefCredentialResolver{Username: "ddl", PasswordRef: "pw"},
+				Assembler:   inventory.MySQLConnectionAssembler{},
+			})
+			require.ErrorContains(t, err, "environment mapping")
+		})
+	}
 }
 
 // fakeAssembler records what the resolver hands the assembler and returns a

@@ -1489,6 +1489,7 @@ func PreviewCommentReviewRequiredStaleApproval() string {
 		OtherReviewers:    []string{"acme/schema-reviewers", "jdoe"},
 		PRAuthor:          previewRequestedBy,
 		ChangedApprovers:  []string{"jdoe"},
+		ChangedPaths:      []string{"schema/testapp/orders.sql"},
 	})
 }
 
@@ -1504,6 +1505,7 @@ func PreviewCommentReviewRequiredStaleApprovalOtherBranch() string {
 		OtherReviewers:    []string{"acme/schema-reviewers", "jdoe"},
 		PRAuthor:          previewRequestedBy,
 		ChangedApprovers:  []string{"jdoe"},
+		ChangedPaths:      []string{"schema/testapp/orders.sql"},
 		BaseRef:           "release-1.2",
 		DefaultBranch:     "main",
 	})
