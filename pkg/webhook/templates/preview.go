@@ -1489,6 +1489,7 @@ func PreviewCommentReviewRequiredStaleApproval() string {
 		OtherReviewers:    []string{"acme/schema-reviewers", "jdoe"},
 		PRAuthor:          previewRequestedBy,
 		ChangedApprovers:  []string{"jdoe"},
+		ChangedPaths:      []string{"schema/testapp/orders.sql"},
 	})
 }
 
@@ -1504,6 +1505,7 @@ func PreviewCommentReviewRequiredStaleApprovalOtherBranch() string {
 		OtherReviewers:    []string{"acme/schema-reviewers", "jdoe"},
 		PRAuthor:          previewRequestedBy,
 		ChangedApprovers:  []string{"jdoe"},
+		ChangedPaths:      []string{"schema/testapp/orders.sql"},
 		BaseRef:           "release-1.2",
 		DefaultBranch:     "main",
 	})
@@ -3461,6 +3463,18 @@ func PreviewCommentRollbackStatus() string {
 	data := sampleApplyData(state.Apply.Running, tables)
 	data.Rollback = true
 	return RenderApplyStatusComment(data)
+}
+
+// PreviewCommentRollbackOfRolloutUnsupported previews the refusal of a
+// rollback of a schema change across multiple targets.
+func PreviewCommentRollbackOfRolloutUnsupported() string {
+	return RenderRollbackOfRolloutUnsupported(RollbackOfRolloutUnsupportedData{
+		Environment:    "staging",
+		Database:       "payments",
+		ApplyID:        "apply-a1b2c3d4e5f6",
+		RoutingChecked: true,
+		PR:             PRStateOpen,
+	})
 }
 
 // PreviewCommentRollbackSummaryCompleted renders the terminal summary for a

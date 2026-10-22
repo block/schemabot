@@ -114,7 +114,7 @@ func (c *LocalClient) reconcileEngineTerminalTruthBeforeCommands(ctx context.Con
 	// of them is stopped, the one state that keeps a cancel deliverable). The
 	// adopted state is the engine's terminal truth, so a cancel it overtook is
 	// failed with that reason rather than reported applied.
-	if err := settlePendingRequestsForTerminalApply(ctx, c.storage, c.logger, apply); err != nil {
+	if err := SettlePendingRequestsForTerminalApply(ctx, c.storage, c.logger, apply); err != nil {
 		return true, err
 	}
 	c.notifyTerminalObserver(apply, tasks)
@@ -137,7 +137,7 @@ func adoptableEngineTerminalStates(s engine.State, retryable bool) (applyState, 
 	case engine.StateCompleted:
 		return state.Apply.Completed, state.Task.Completed, true
 	case engine.StateFailed:
-		if retryable {
+		if !failureIsSettled(s, retryable) {
 			return "", "", false
 		}
 		return state.Apply.Failed, state.Task.Failed, true
@@ -148,6 +148,14 @@ func adoptableEngineTerminalStates(s engine.State, retryable bool) (applyState, 
 	default:
 		return "", "", false
 	}
+}
+
+// failureIsSettled reports whether an engine's progress state is a failure
+// with no retry path left: the outcome a pending cancel must never replace,
+// whether the drive adopts it before consuming the cancel or the cancel's
+// fallback refuses over it.
+func failureIsSettled(s engine.State, retryable bool) bool {
+	return s == engine.StateFailed && !retryable
 }
 
 // firstTaskWithLiveEngineWork returns the first task whose state says the

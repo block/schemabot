@@ -1234,12 +1234,23 @@ func (s *fakeControlRequestStore) GetPending(_ context.Context, _ int64, op stor
 	return s.pending[op], nil
 }
 
+// CompletePending and FailPending settle only a request that is still pending,
+// as the storage update does, so a settlement that finds nothing pending
+// records nothing.
 func (s *fakeControlRequestStore) CompletePending(_ context.Context, _ int64, op storage.ControlOperation) error {
+	if s.pending[op] == nil {
+		return nil
+	}
+	delete(s.pending, op)
 	s.completed = append(s.completed, op)
 	return nil
 }
 
 func (s *fakeControlRequestStore) FailPending(_ context.Context, _ int64, op storage.ControlOperation, reason string) error {
+	if s.pending[op] == nil {
+		return nil
+	}
+	delete(s.pending, op)
 	s.failed = append(s.failed, op)
 	s.failureReasons = append(s.failureReasons, reason)
 	return nil

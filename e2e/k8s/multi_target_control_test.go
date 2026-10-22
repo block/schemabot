@@ -292,9 +292,10 @@ func TestK8sMultiTarget_DriftAfterPlanFailsNamingTarget(t *testing.T) {
 	assert.Equal(t, []string{mtTargets[1]}, drifted, describeProgress(p))
 }
 
-// A completed rollout whose shards were each planned against their own schema
-// cannot be rolled back as one plan. The rollback is refused before anything
-// is planned, and the refusal names the remedy that restores each shard.
+// Rollback isn't currently supported for schema changes across multiple targets. A completed rollout
+// across the shards is refused before anything is planned, and the refusal
+// names the remedy that restores each shard: an apply of schema files without
+// the change.
 func TestK8sMultiTarget_RollbackOfIndependentRolloutIsRefused(t *testing.T) {
 	ep := testutil.Endpoint(t)
 	dsns := shardDSNs(t, mtShardApp)
@@ -307,10 +308,9 @@ func TestK8sMultiTarget_RollbackOfIndependentRolloutIsRefused(t *testing.T) {
 	requireCompleted(t, ep, applyID)
 
 	_, err := client.CallRollbackPlanAPI(ep, applyID, mtEnvironment)
-	require.Error(t, err, "rollback of a rollout planned per target")
+	require.Error(t, err, "rollback of an apply across multiple targets")
 	t.Log(err)
-	assert.Contains(t, err.Error(), "rollback of such a rollout is not supported")
-	assert.Contains(t, err.Error(), "restore each target by planning and applying the previous schema with its target")
+	assert.Contains(t, err.Error(), "rollback isn't currently supported for schema changes across multiple targets; undo apply "+applyID+" by applying schema files without the change")
 	for i, dsn := range dsns {
 		assert.True(t, testutil.ColumnExists(t, dsn, "users", "email"), "nothing was rolled back on %s", mtTargets[i])
 	}

@@ -1093,6 +1093,10 @@ type EtreConfig struct {
 	TargetLabel string `yaml:"target_label"`
 	// EnvLabel, when set, scopes the lookup to the request environment.
 	EnvLabel string `yaml:"env_label,omitempty"`
+	// EnvironmentMapping changes only the inventory env_label predicate. The
+	// logical environment remains on plans, applies, credentials and schemas.
+	// Unmapped environments use their request name; values are not recursive.
+	EnvironmentMapping map[string]string `yaml:"environment_mapping,omitempty"`
 	// Labels are fixed selector predicates added to every lookup (e.g. a region).
 	Labels map[string]string `yaml:"labels,omitempty"`
 	// AttributeFields are entity fields surfaced to the credential resolver.

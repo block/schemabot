@@ -1,9 +1,11 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/url"
@@ -967,6 +969,140 @@ func TestExecuteChecksScanSkipsRepoWithChecksDisabled(t *testing.T) {
 	assert.Equal(t, "octo/repo", response.Repo)
 	assert.Zero(t, response.Scanned)
 	assert.Empty(t, response.Missing)
+}
+
+// fakeChecksScanClient adds the installation budget read a scan page ends
+// with to the open-PR and Check Run reads the scan itself makes.
+type fakeChecksScanClient struct {
+	fakeWebhookMissingCheckScanClient
+}
+
+func (fakeChecksScanClient) CoreRateLimit(context.Context) (int, int, time.Time, error) {
+	return 4000, 5000, time.Now().Add(time.Hour), nil
+}
+
+// checksScanResolverByRepo serves each repository's scan from clients, and
+// fails the installation lookup for any repository in lookupErrs with that
+// error, the way the production resolver surfaces a failed lookup.
+func checksScanResolverByRepo(clients map[string]checksScanClient, lookupErrs map[string]error) checksScanClientResolver {
+	return func(_ context.Context, app ResolvedGitHubApp, repo string, _ *slog.Logger) (checksScanClient, error) {
+		if err, ok := lookupErrs[repo]; ok {
+			return nil, fmt.Errorf("resolve GitHub App %q installation for %s: %w", app.Name, repo, err)
+		}
+		client, ok := clients[repo]
+		if !ok {
+			return nil, fmt.Errorf("no fake scan client for %s", repo)
+		}
+		return client, nil
+	}
+}
+
+// A repository declared in the repos config before its GitHub App is installed
+// on it, for example while its onboarding PR is still open, is reported as
+// skipped with the App's name rather than failing the scan. A fleet sweep that
+// reaches it keeps going, and the server logs the skip at Warn with what an
+// operator needs to fix it.
+func TestExecuteChecksScanSkipsRepoWithoutTheAppInstalled(t *testing.T) {
+	t.Parallel()
+
+	cfg := &ServerConfig{
+		Apps:                map[string]GitHubAppConfig{"main": {AppID: "1", PrivateKey: "key"}},
+		Repos:               map[string]RepoConfig{"octo/onboarding": {GitHubApp: "main"}},
+		AllowedEnvironments: []string{"staging", "production"},
+	}
+	notInstalled := fmt.Errorf("find installation for octo/onboarding: %w: GET https://api.github.com/repos/octo/onboarding/installation: 404 Not Found []", ghclient.ErrAppNotInstalled)
+	resolve := checksScanResolverByRepo(nil, map[string]error{"octo/onboarding": notInstalled})
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelInfo}))
+
+	response, err := executeChecksScanWith(t.Context(), cfg, nil, ChecksScanRequest{Repo: "octo/onboarding", Environment: "staging", ReportAppNotInstalled: true}, logger, resolve)
+	require.NoError(t, err)
+	assert.True(t, response.AppNotInstalled)
+	assert.Equal(t, "main", response.GitHubApp)
+	assert.Equal(t, "octo/onboarding", response.Repo)
+	assert.False(t, response.ChecksDisabled)
+	assert.Zero(t, response.Scanned)
+	assert.Empty(t, response.Missing)
+	assert.Empty(t, response.CheckNames)
+
+	var entry map[string]any
+	require.NoError(t, json.Unmarshal(logs.Bytes(), &entry), "exactly one log line: %s", logs.String())
+	assert.Equal(t, "WARN", entry["level"])
+	assert.Contains(t, entry["msg"], "GitHub App is not installed")
+	assert.Equal(t, "checks_scan", entry["operation"])
+	assert.Equal(t, "octo/onboarding", entry["repo"])
+	assert.Equal(t, "staging", entry["environment"])
+	assert.Equal(t, "main", entry["github_app"])
+	assert.Contains(t, entry["error"], "404 Not Found")
+}
+
+// A caller that does not say it handles the not-installed skip predates it,
+// and would ignore the flag and read the unread repository as scanned clean.
+// It gets the lookup error instead, naming the App and the repository.
+func TestExecuteChecksScanFailsForACallerThatDoesNotReportTheSkip(t *testing.T) {
+	t.Parallel()
+
+	cfg := &ServerConfig{
+		Apps:  map[string]GitHubAppConfig{"main": {AppID: "1", PrivateKey: "key"}},
+		Repos: map[string]RepoConfig{"octo/onboarding": {GitHubApp: "main"}},
+	}
+	notInstalled := fmt.Errorf("find installation for octo/onboarding: %w: GET https://api.github.com/repos/octo/onboarding/installation: 404 Not Found []", ghclient.ErrAppNotInstalled)
+	resolve := checksScanResolverByRepo(nil, map[string]error{"octo/onboarding": notInstalled})
+
+	response, err := executeChecksScanWith(t.Context(), cfg, nil, ChecksScanRequest{Repo: "octo/onboarding"}, discardLogger(), resolve)
+	require.Error(t, err)
+	assert.Nil(t, response)
+	require.ErrorIs(t, err, ghclient.ErrAppNotInstalled)
+	assert.Contains(t, err.Error(), `resolve GitHub App "main" installation for octo/onboarding`)
+	assert.Contains(t, err.Error(), "GitHub App is not installed on the repository")
+}
+
+// Any installation lookup failure other than GitHub confirming the App is not
+// installed leaves the App's coverage of the repository unknown. A scan that
+// skipped it would let a fleet sweep report the repository as having nothing
+// to backfill when it was never looked at, so the failure stays an error.
+func TestExecuteChecksScanFailsWhenTheInstallationLookupFails(t *testing.T) {
+	t.Parallel()
+
+	cfg := &ServerConfig{
+		Apps:  map[string]GitHubAppConfig{"main": {AppID: "1", PrivateKey: "key"}},
+		Repos: map[string]RepoConfig{"octo/repo": {GitHubApp: "main"}},
+	}
+	outage := errors.New("find installation for octo/repo: GET https://api.github.com/repos/octo/repo/installation: 502 Bad Gateway []")
+	resolve := checksScanResolverByRepo(nil, map[string]error{"octo/repo": outage})
+
+	response, err := executeChecksScanWith(t.Context(), cfg, nil, ChecksScanRequest{Repo: "octo/repo"}, discardLogger(), resolve)
+	require.Error(t, err)
+	assert.Nil(t, response)
+	require.ErrorIs(t, err, outage)
+	assert.NotErrorIs(t, err, ghclient.ErrAppNotInstalled)
+	assert.Contains(t, err.Error(), "502 Bad Gateway")
+}
+
+// A repository the App is installed on scans through the resolved
+// installation client and reports what it found.
+func TestExecuteChecksScanScansThroughTheResolvedInstallation(t *testing.T) {
+	t.Parallel()
+
+	cfg := &ServerConfig{
+		Apps:  map[string]GitHubAppConfig{"main": {AppID: "1", PrivateKey: "key"}},
+		Repos: map[string]RepoConfig{"octo/repo": {GitHubApp: "main"}},
+	}
+	resolve := checksScanResolverByRepo(map[string]checksScanClient{
+		"octo/repo": fakeChecksScanClient{fakeWebhookMissingCheckScanClient{
+			prs: []ghclient.OpenPullRequest{{Number: 7, Title: "add column", HeadSHA: "sha7", HeadRef: "feature-7"}},
+		}},
+	}, nil)
+
+	response, err := executeChecksScanWith(t.Context(), cfg, nil, ChecksScanRequest{Repo: "octo/repo"}, discardLogger(), resolve)
+	require.NoError(t, err)
+	assert.False(t, response.AppNotInstalled)
+	assert.Empty(t, response.GitHubApp)
+	assert.Equal(t, 1, response.Scanned)
+	require.Len(t, response.Missing, 1)
+	assert.Equal(t, 7, response.Missing[0].Number)
+	require.NotNil(t, response.RateLimit)
+	assert.Equal(t, 4000, response.RateLimit.Remaining)
 }
 
 // A missing check whose name is already taken by an untrusted app's Check Run

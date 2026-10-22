@@ -5683,16 +5683,17 @@ func TestApplyOperationClaimOrderingIsIndexed(t *testing.T) {
 }
 
 // ListRecentTargets bounds a data plane's view of the targets it applied to by
-// the age of the apply: a target whose only applies are older than the lookback
-// drops out, while one with any apply inside the window stays, however old its
-// other applies are.
+// when each apply was last written: a target whose applies were all last
+// written before the lookback drops out, while one with any apply written
+// inside the window stays, however old its other applies are, and so does one
+// whose only apply was created before the window but settled inside it.
 func TestApplyOperationStore_ListRecentTargetsWindow(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
 	store := NewMySQL(testDB)
 
 	lock := createTestLock(t, store, "orders", storage.DatabaseTypeVitess)
-	seed := func(t *testing.T, applyID string, planID int64, target string, age time.Duration) {
+	seed := func(t *testing.T, applyID string, planID int64, target string, created, updated time.Duration) {
 		t.Helper()
 		apply := createTestApplyWithStateAndEnv(t, store, lock, applyID, planID, state.Apply.Completed, "staging")
 		_, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
@@ -5700,17 +5701,23 @@ func TestApplyOperationStore_ListRecentTargetsWindow(t *testing.T) {
 		})
 		require.NoError(t, err)
 		_, err = testDB.ExecContext(ctx,
-			fmt.Sprintf(`UPDATE applies SET created_at = NOW() - INTERVAL %d SECOND WHERE id = ?`, int(age.Seconds())),
+			fmt.Sprintf(`UPDATE applies SET created_at = NOW() - INTERVAL %d SECOND, updated_at = NOW() - INTERVAL %d SECOND WHERE id = ?`,
+				int(created.Seconds()), int(updated.Seconds())),
 			apply.ID)
 		require.NoError(t, err)
 	}
-	seed(t, "apply_stale_only", 9101, "orders-stale", 40*24*time.Hour)
-	seed(t, "apply_recent_old", 9102, "orders-recent", 40*24*time.Hour)
-	seed(t, "apply_recent_new", 9103, "orders-recent", 2*24*time.Hour)
+	day := 24 * time.Hour
+	seed(t, "apply_stale_only", 9101, "orders-stale", 40*day, 40*day)
+	seed(t, "apply_recent_old", 9102, "orders-recent", 40*day, 40*day)
+	seed(t, "apply_recent_new", 9103, "orders-recent", 2*day, 2*day)
+	// Created before the window but settled inside it: a branch its drive
+	// failed to delete at settlement must stay reachable for the window.
+	seed(t, "apply_settled_late", 9104, "orders-settled-late", 40*day, 1*day)
 
 	targets, err := store.ApplyOperations().ListRecentTargets(ctx, storage.DatabaseTypeVitess, 30*24*time.Hour)
 	require.NoError(t, err)
 	assert.Equal(t, []storage.AppliedTarget{
 		{Database: "orders", Environment: "staging", Target: "orders-recent"},
+		{Database: "orders", Environment: "staging", Target: "orders-settled-late"},
 	}, targets)
 }

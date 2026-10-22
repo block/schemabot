@@ -3,6 +3,8 @@ package commands
 import (
 	"errors"
 	"fmt"
+	"io/fs"
+	"maps"
 	"os"
 	"path/filepath"
 	"sort"
@@ -22,7 +24,7 @@ import (
 type OnboardCmd struct {
 	Database          string   `short:"d" required:"" help:"Database name from SchemaBot server config"`
 	Environment       string   `short:"e" required:"" help:"Source environment to pull from"`
-	SchemaDir         string   `short:"s" required:"" help:"Schema root to write schemabot.yaml and namespace directories" name:"schema_dir"`
+	SchemaDir         string   `short:"s" required:"" help:"Directory to write schemabot.yaml to; namespace directories go in its <environment> schema root when it has one" name:"schema_dir"`
 	Type              string   `help:"Database type override; resolved from the server's registered config when omitted"`
 	Namespaces        []string `name:"namespace" help:"Concrete live namespace to onboard. Repeat for multiple namespaces. Omit to discover all non-reserved namespaces."`
 	TemplateEnvSuffix bool     `help:"Write namespaces ending in _<environment> as _{env} directories" name:"template-env-suffix"`
@@ -125,9 +127,12 @@ func (cmd *OnboardCmd) Run(g *Globals) error {
 }
 
 type onboardWritePlan struct {
-	root         string
-	databaseType string
-	files        map[string]string
+	root string
+	// namespacePrefix is the environment schema root's path relative to
+	// root, "." when root is the schema root itself.
+	namespacePrefix string
+	databaseType    string
+	files           map[string]string
 	// exclusions carries an existing config's ignore_namespaces and
 	// ignore_tables through a rewrite, so re-onboarding does not drop the
 	// exclusions an operator configured, and plan verification excludes the
@@ -229,6 +234,18 @@ func buildOnboardWritePlan(schemaRoot string, resp *apitypes.PullSchemaResponse,
 		return nil, fmt.Errorf("pull schema returned no tables for database %s environment %s", resp.Database, resp.Environment)
 	}
 	root := filepath.Clean(schemaRoot)
+	// Namespace files go where the source environment's schema lives: the
+	// environment's own schema root when the config directory has one, so the
+	// files written are the files a plan of that environment reads. The config
+	// stays in the config directory either way.
+	environmentRoot, err := client.ResolveEnvironmentSchemaRoot(root, resp.Environment)
+	if err != nil {
+		return nil, fmt.Errorf("resolve the schema root for environment %s under %s: %w", resp.Environment, root, err)
+	}
+	namespacePrefix, err := filepath.Rel(root, environmentRoot)
+	if err != nil {
+		return nil, fmt.Errorf("locate environment schema root %s under %s: %w", environmentRoot, root, err)
+	}
 	configYAML, err := onboardConfigYAML(resp.Database, string(resp.Type), exclusions)
 	if err != nil {
 		return nil, err
@@ -244,6 +261,11 @@ func buildOnboardWritePlan(schemaRoot string, resp *apitypes.PullSchemaResponse,
 	sort.Strings(namespaces)
 	if err := rejectCaseCollisions("namespace", namespaces); err != nil {
 		return nil, err
+	}
+	if namespacePrefix == "." {
+		if err := rejectEnvironmentNamedNamespace(root, resp.Environment, namespaces); err != nil {
+			return nil, err
+		}
 	}
 	// A pull answers with the target's whole catalog: the request carries no
 	// exclusions, so a table the config withholds from the planner comes back
@@ -302,7 +324,7 @@ func buildOnboardWritePlan(schemaRoot string, resp *apitypes.PullSchemaResponse,
 			// while preserving the namespace for future plans and version control.
 			// A namespace whose every table is withheld lands here too — the
 			// namespace is still the plan's, it simply declares nothing.
-			files[filepath.Join(namespace, "schema.sql")] = schema.EmptyNamespaceDeclaration
+			files[filepath.Join(namespacePrefix, namespace, "schema.sql")] = schema.EmptyNamespaceDeclaration
 		}
 		for _, tableName := range tableNames {
 			if err := validateRelativePathPart("table", tableName); err != nil {
@@ -312,11 +334,11 @@ func buildOnboardWritePlan(schemaRoot string, resp *apitypes.PullSchemaResponse,
 			if err != nil {
 				formatErrors = append(formatErrors, fmt.Errorf("format pulled schema for namespace %s table %s: %w", namespace, tableName, err))
 			} else {
-				files[filepath.Join(namespace, tableName+".sql")] = content
+				files[filepath.Join(namespacePrefix, namespace, tableName+".sql")] = content
 			}
 		}
 		if vschema := pulled.Artifacts["vschema.json"]; vschema != "" {
-			files[filepath.Join(namespace, "vschema.json")] = vschema
+			files[filepath.Join(namespacePrefix, namespace, "vschema.json")] = vschema
 		}
 	}
 
@@ -329,13 +351,104 @@ func buildOnboardWritePlan(schemaRoot string, resp *apitypes.PullSchemaResponse,
 			"Editing local files and rerunning onboard will not help: onboard pulls the source again", errors.Join(formatErrors...))
 	}
 
+	if err := rejectAliasedNamespaceDirectories(root, files); err != nil {
+		return nil, err
+	}
+
 	return &onboardWritePlan{
-		root:         root,
-		databaseType: resp.Type,
-		files:        files,
-		exclusions:   exclusions,
-		withheld:     withheldGroups,
+		root:            root,
+		namespacePrefix: namespacePrefix,
+		databaseType:    resp.Type,
+		files:           files,
+		exclusions:      exclusions,
+		withheld:        withheldGroups,
 	}, nil
+}
+
+// rejectEnvironmentNamedNamespace refuses a namespace named for the source
+// environment when the config directory is the schema root. Writing it would
+// create <root>/<environment>, which every later plan of that environment
+// reads as its schema root, so the other namespaces written beside it would
+// drop out of verification and out of every plan after it. The name is
+// compared ignoring case because a case-insensitive filesystem finds the
+// directory either way.
+func rejectEnvironmentNamedNamespace(root, environment string, namespaces []string) error {
+	if environment == "" {
+		return nil
+	}
+	for _, namespace := range namespaces {
+		if strings.EqualFold(namespace, environment) {
+			return fmt.Errorf("namespace %q has the name of environment %q: written to %s it would become the environment's schema root and hide every other namespace from its plans. Create %s as the environment's schema root (a directory, or a symlink to one inside %s), then onboard again to write every namespace inside it",
+				namespace, environment, filepath.Join(root, namespace), filepath.Join(root, environment), root)
+		}
+	}
+	return nil
+}
+
+// rejectAliasedNamespaceDirectories refuses namespaces whose directories are
+// one directory on disk, reached through symlinks, unless the pull returned
+// the same files for each. An environment root of namespace symlinks into a
+// shared tree has exactly this shape. Namespaces that differ would write
+// into one directory: a table file one of them declares would be overwritten
+// by the other's, or declared for a namespace that does not hold it.
+func rejectAliasedNamespaceDirectories(root string, files map[string]string) error {
+	byDirectory := make(map[string]map[string]string)
+	for relativePath, content := range files {
+		dir := filepath.Dir(relativePath)
+		if dir == "." {
+			continue
+		}
+		if byDirectory[dir] == nil {
+			byDirectory[dir] = make(map[string]string)
+		}
+		byDirectory[dir][filepath.Base(relativePath)] = content
+	}
+	dirs := make([]string, 0, len(byDirectory))
+	for dir := range byDirectory {
+		dirs = append(dirs, dir)
+	}
+	sort.Strings(dirs)
+
+	firstByPhysical := make(map[string]string, len(dirs))
+	for _, dir := range dirs {
+		physical, err := physicalPath(filepath.Join(root, dir))
+		if err != nil {
+			return fmt.Errorf("resolve where namespace directory %s is written: %w", filepath.Join(root, dir), err)
+		}
+		first, aliased := firstByPhysical[physical]
+		if !aliased {
+			firstByPhysical[physical] = dir
+			continue
+		}
+		if !maps.Equal(byDirectory[first], byDirectory[dir]) {
+			return fmt.Errorf("namespace directories %s and %s are the same directory %s through symlinks, and the pulled schemas of their namespaces differ, so writing both would leave one namespace declaring the other's tables. Point each at its own directory and onboard again",
+				filepath.Join(root, first), filepath.Join(root, dir), physical)
+		}
+	}
+	return nil
+}
+
+// physicalPath returns where p is on disk with every symlink resolved,
+// including for a path whose tail does not exist yet: the existing prefix is
+// resolved and the missing components are appended to it.
+func physicalPath(p string) (string, error) {
+	var missing []string
+	current := p
+	for {
+		resolved, err := filepath.EvalSymlinks(current)
+		if err == nil {
+			return filepath.Join(append([]string{resolved}, missing...)...), nil
+		}
+		if !errors.Is(err, fs.ErrNotExist) {
+			return "", fmt.Errorf("resolve symlinks in %s: %w", current, err)
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return p, nil
+		}
+		missing = append([]string{filepath.Base(current)}, missing...)
+		current = parent
+	}
 }
 
 // Generated paths must remain distinct on case-insensitive filesystems too.
@@ -503,7 +616,7 @@ func (p *onboardWritePlan) withheldTableFilePaths() map[string]bool {
 	paths := make(map[string]bool)
 	for _, group := range p.withheld {
 		for _, table := range group.Tables {
-			paths[filepath.Join(group.Namespace, table+".sql")] = true
+			paths[filepath.Join(p.namespacePrefix, group.Namespace, table+".sql")] = true
 		}
 	}
 	return paths

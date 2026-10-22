@@ -577,14 +577,24 @@ func (c *LocalClient) requestStop(ctx context.Context, req *ternv1.StopRequest, 
 		return nil, fmt.Errorf("control request store is not available")
 	}
 	requestedBy := controlRequestRequester(caller)
-	_, alreadyPending, err := controlStore.RequestPending(ctx, &storage.ApplyControlRequest{
+	supersedesStart, err := StopSupersedesPendingStart(ctx, c.storage, c.logger, apply, requestedBy)
+	if err != nil {
+		return nil, err
+	}
+	stopReq := &storage.ApplyControlRequest{
 		ApplyID:     apply.ID,
 		Operation:   storage.ControlOperationStop,
 		Status:      storage.ControlRequestPending,
 		RequestedBy: requestedBy,
-	})
+	}
+	var alreadyPending bool
+	if supersedesStart {
+		_, alreadyPending, err = controlStore.RequestPendingSuperseding(ctx, stopReq, storage.ControlOperationStart)
+	} else {
+		_, alreadyPending, err = controlStore.RequestPending(ctx, stopReq)
+	}
 	if err != nil {
-		return nil, fmt.Errorf("record stop control request for apply %s: %w", apply.ApplyIdentifier, err)
+		return nil, fmt.Errorf("record stop control request for apply %s (superseding pending start: %t): %w", apply.ApplyIdentifier, supersedesStart, err)
 	}
 	if alreadyPending {
 		c.logger.Info("stop request already pending for apply owner",
@@ -1739,12 +1749,14 @@ func (c *LocalClient) cancelEngineForTasks(ctx context.Context, eng engine.Engin
 // The engine's own report decides: a progress probe scoped to the task shows
 // whether live work remains. Nothing running resolves to nil so the caller
 // proceeds to terminalize the tasks; live work — or any uncertainty about it
-// (a failed probe) — surfaces the original cancel error unchanged. Typed
-// rejections with their own resolution paths also surface unchanged: an
-// already-completed rejection has the caller reconcile stored state to the
-// completed outcome, while an unsupported-operation decline and a
-// settled-outcome refusal each resolve the durable request without recording a
-// cancel.
+// (a failed probe) — surfaces the original cancel error unchanged. A provider
+// record showing the change already failed with no retry path resolves to a
+// settled-outcome refusal instead, so the failure is never relabelled
+// cancelled. Typed rejections with their own resolution paths also surface
+// unchanged: an already-completed rejection has the caller reconcile stored
+// state to the completed outcome, while an unsupported-operation decline and
+// a settled-outcome refusal each resolve the durable request without
+// recording a cancel.
 func (c *LocalClient) resolveFailedEngineCancel(ctx context.Context, eng engine.Engine, task *storage.Task, creds *engine.Credentials, resumeState *engine.ResumeState, cancelErr error) error {
 	if engine.IsAlreadyCompleted(cancelErr) {
 		return fmt.Errorf("cancel engine for task %s: %w", task.TaskIdentifier, cancelErr)
@@ -1771,6 +1783,19 @@ func (c *LocalClient) resolveFailedEngineCancel(ctx context.Context, eng engine.
 		c.logger.Warn("engine cancel failed and the live-work probe also failed; the cancel error surfaces and the drive will retry rather than complete a cancel over unknown engine state",
 			append(task.LogAttrs(), "probe_error", probeErr, "error", cancelErr)...)
 		return fmt.Errorf("cancel engine for task %s: %w", task.TaskIdentifier, cancelErr)
+	}
+	// A provider that closed the change by failing it has settled on an outcome
+	// a cancel must not replace: the refusal resolves the durable request and
+	// the drive's next poll records the failure the provider reports. The
+	// engine types this itself when it reads the failure on the rejection;
+	// this covers a cancel that failed without that read, such as one lost in
+	// transit. The wording stays general because the provider's failed state
+	// also covers a failed revert, whose recovery is not a fresh apply.
+	if providerSettledChangeAsFailed(eng, progress) {
+		c.logger.Warn("engine cancel failed and the provider reports the schema change already failed with no retry path; the cancel is refused so the failure stands",
+			append(task.LogAttrs(), "engine_state", string(progress.State), "error", cancelErr)...)
+		return fmt.Errorf("cancel engine for task %s: %w", task.TaskIdentifier,
+			engine.NewSettledOutcomeError("cancel rejected: the provider reports the schema change on database %s already failed with no retry path; the failure stands and a cancel cannot replace it", c.config.Database))
 	}
 	if engineProgressShowsLiveWork(eng, progress) {
 		engineState := ""
@@ -1868,7 +1893,10 @@ func (c *LocalClient) wrapFailedEngineStop(task *storage.Task, stopErr error) er
 //   - An engine whose progress is externally authoritative relays the
 //     provider's record of the change, so only a provider answer that closed
 //     the change clears the probe: cancelled, or failed with no retry path.
-//     Pending from such an engine is an open change the provider can still
+//     The cancel fallback refuses over a settled failure before it consults
+//     this helper (providerSettledChangeAsFailed), so for cancel only
+//     cancelled clears it; the failed case keeps a stop from treating a
+//     settled failure as live work. Pending from such an engine is an open change the provider can still
 //     run, and a retryable failure remains runnable — both keep the control
 //     error surfacing so the change is never recorded stopped or cancelled
 //     while the provider can still land it.
@@ -1899,6 +1927,21 @@ func engineProgressShowsLiveWork(eng engine.Engine, progress *engine.ProgressRes
 		}
 	}
 	return progress.State != engine.StatePending
+}
+
+// providerSettledChangeAsFailed reports whether an externally authoritative
+// engine's probe shows the provider closed the change by failing it, with no
+// retry path left. An engine that executes in this process answers that
+// question itself when it refuses the control operation, so only the
+// provider's record is read here.
+func providerSettledChangeAsFailed(eng engine.Engine, progress *engine.ProgressResult) bool {
+	if progress == nil {
+		return false
+	}
+	if !engine.ProgressIsExternallyAuthoritative(eng) {
+		return false
+	}
+	return failureIsSettled(progress.State, progress.Retryable)
 }
 
 // snapshotEngineProgress captures per-table progress from the engine after stopping.

@@ -33,8 +33,87 @@ type supersededHolder struct {
 	table           string
 }
 
+// supersededTakeovers selects the released holders whose work the dispatch's
+// changes meet, one takeover per holder apply, in the order the holders were
+// released.
+//
+// The marker and the refusal it backs are apply-granular, so holders collapse to
+// one takeover per apply: several released tasks of one apply (shards of one
+// table, or several tables) met by one dispatch are one handoff and one timeline
+// event naming everything taken over.
+func (c *LocalClient) supersededTakeovers(successor *storage.Apply, holders []supersededHolder, changes []storage.TableChange) []*supersededTakeover {
+	if len(holders) == 0 {
+		return nil
+	}
+
+	changedTables, changedNamespaces := c.changedTableKeys(changes)
+
+	byApply := map[int64]*supersededTakeover{}
+	var takeovers []*supersededTakeover
+	for _, holder := range holders {
+		if !c.dispatchMeetsHolderWork(holder, changedTables, changedNamespaces) {
+			c.logger.Debug("dispatch does not meet the released holder's work, so the holder keeps its own",
+				"holder_apply_id", holder.applyIdentifier, "holder_table", holder.table,
+				"holder_namespace", holder.namespace, "successor_apply_id", successor.ApplyIdentifier)
+			continue
+		}
+		takeover := byApply[holder.applyID]
+		if takeover == nil {
+			takeover = &supersededTakeover{applyID: holder.applyID, applyIdentifier: holder.applyIdentifier}
+			byApply[holder.applyID] = takeover
+			takeovers = append(takeovers, takeover)
+		}
+		takeover.addTable(holder.table)
+	}
+	return takeovers
+}
+
+// takeoverApplyIDs is the row IDs of the stopped applies a dispatch takes over,
+// in the form the create records them (storage.Apply.TakesOverApplyIDs).
+func takeoverApplyIDs(takeovers []*supersededTakeover) []int64 {
+	ids := make([]int64, 0, len(takeovers))
+	for _, takeover := range takeovers {
+		ids = append(ids, takeover.applyID)
+	}
+	return ids
+}
+
+// announceSupersededTakeovers tells the stopped applies' timelines who took their
+// work over, once the successor's create has committed the marker. The handoff
+// itself is already durable by then: this only records it for the operator, so a
+// failure to read the marker back or to log the event is reported and does not
+// fail a dispatch whose work is already under way.
+//
+// A holder whose marker names a different, earlier successor was not taken over
+// by this dispatch, so it gets no event claiming it was.
+func (c *LocalClient) announceSupersededTakeovers(ctx context.Context, successor *storage.Apply, takeovers []*supersededTakeover) {
+	for _, takeover := range takeovers {
+		owner, err := c.storage.Applies().GetSupersededBy(ctx, takeover.applyID)
+		if err != nil {
+			c.logger.Error("failed to read the marker of a stopped apply this dispatch took over, so its timeline does not name the successor",
+				append(successor.LogAttrs(),
+					"superseded_apply_id", takeover.applyIdentifier, "superseded_tables", takeover.tables, "error", err)...)
+			continue
+		}
+		if owner != successor.ApplyIdentifier {
+			c.logger.Info("a stopped apply's work was already taken over by an earlier apply, so this dispatch left its marker alone",
+				append(successor.LogAttrs(),
+					"superseded_apply_id", takeover.applyIdentifier, "marker_names", owner)...)
+			continue
+		}
+		c.logger.Info("recorded the apply that took over a stopped apply's unfinished work",
+			append(successor.LogAttrs(),
+				"superseded_apply_id", takeover.applyIdentifier, "superseded_tables", takeover.tables)...)
+		c.logApplyEvent(ctx, takeover.applyID, nil, storage.LogLevelInfo, storage.LogEventInfo, storage.LogSourceSchemaBot,
+			takeover.event(successor.ApplyIdentifier), "", "")
+	}
+}
+
 // markSupersededHolders records successor as the apply that took over the
-// unfinished work of every released holder whose work it is about to meet.
+// unfinished work of every released holder whose work it is about to meet, after
+// the successor was created. It serves the attach path, whose operation is added
+// to an apply that already exists; a dispatch that creates its successor records
+// the takeover in the create itself (storage.Apply.TakesOverApplyIDs).
 //
 // It runs after the successor is durably created, so the marker never names an
 // apply that does not exist. The cost of that ordering is that a successor which
@@ -45,36 +124,8 @@ type supersededHolder struct {
 // dispatched and taking the work over regardless, so failing the dispatch here
 // would refuse work that is already under way.
 func (c *LocalClient) markSupersededHolders(ctx context.Context, successor *storage.Apply, holders []supersededHolder, changes []storage.TableChange) {
-	if len(holders) == 0 {
-		return
-	}
-
-	changedTables, changedNamespaces := c.changedTableKeys(changes)
-
-	// The marker and the refusal it backs are apply-granular, so holders
-	// collapse to one takeover per apply: several released tasks of one apply
-	// (shards of one table, or several tables) met by one dispatch record one
-	// mark and one timeline event naming everything taken over.
-	takeovers := map[int64]*supersededTakeover{}
-	var order []int64
-	for _, holder := range holders {
-		if !c.dispatchMeetsHolderWork(holder, changedTables, changedNamespaces) {
-			c.logger.Debug("dispatch does not meet the released holder's work, so the holder keeps its own",
-				"holder_apply_id", holder.applyIdentifier, "holder_table", holder.table,
-				"holder_namespace", holder.namespace, "successor_apply_id", successor.ApplyIdentifier)
-			continue
-		}
-		takeover := takeovers[holder.applyID]
-		if takeover == nil {
-			takeover = &supersededTakeover{applyIdentifier: holder.applyIdentifier}
-			takeovers[holder.applyID] = takeover
-			order = append(order, holder.applyID)
-		}
-		takeover.addTable(holder.table)
-	}
-
-	for _, applyID := range order {
-		takeover := takeovers[applyID]
+	for _, takeover := range c.supersededTakeovers(successor, holders, changes) {
+		applyID := takeover.applyID
 		err := c.storage.Applies().MarkSuperseded(ctx, applyID, successor.ApplyIdentifier)
 		switch {
 		case err == nil:
@@ -100,6 +151,7 @@ func (c *LocalClient) markSupersededHolders(ctx context.Context, successor *stor
 // dispatch took over, so the handoff is recorded once for the apply rather
 // than once per released task.
 type supersededTakeover struct {
+	applyID         int64
 	applyIdentifier string
 	tables          []string
 }

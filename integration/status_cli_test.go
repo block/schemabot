@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"regexp"
+	"strings"
 	"testing"
 	"time"
 
@@ -27,12 +28,19 @@ var statusApplyRowRE = regexp.MustCompile(`(?m)^  apply-\S+`)
 var statusFollowUpCommandRE = regexp.MustCompile(`(?m)^schemabot status apply-\S+`)
 
 // TestCLI_Status_DefaultLimitShowsTwentyMostRecent verifies that the no-flag
-// recent status view uses the operator-facing default and tells users how to
-// request more rows when history is truncated.
+// status view lists every active apply above the twenty most recent finished
+// ones, and tells users how to request more rows when history is truncated. An
+// apply still running after more than a page of newer applies finished stays on
+// screen.
 func TestCLI_Status_DefaultLimitShowsTwentyMostRecent(t *testing.T) {
 	binPath := buildBinary(t, "schemabot", "./pkg/cmd")
 	endpoint, store := startStatusOnlySchemaBot(t)
 
+	seedStatusApply(t, store, statusApplySeed{
+		ApplyID:  "apply-status-default-running",
+		Database: "status_default_running",
+		State:    state.Apply.Running,
+	})
 	for i := 1; i <= 21; i++ {
 		seedStatusApply(t, store, statusApplySeed{
 			ApplyID:  fmt.Sprintf("apply-status-default-%02d", i),
@@ -44,10 +52,14 @@ func TestCLI_Status_DefaultLimitShowsTwentyMostRecent(t *testing.T) {
 	out := runCLI(t, binPath, "status", "--endpoint", endpoint)
 	stripped := stripANSI(out)
 
-	assert.Equal(t, 20, statusApplyRowCount(out))
+	assert.Equal(t, 21, statusApplyRowCount(out), "the running apply plus twenty finished ones")
+	assert.Contains(t, stripped, "1 active schema change\n")
+	assert.Contains(t, stripped, "apply-status-default-running")
 	assert.Contains(t, stripped, "apply-status-default-21")
 	assert.Contains(t, stripped, "apply-status-default-02")
 	assert.NotContains(t, stripped, "apply-status-default-01")
+	assert.Less(t, strings.Index(stripped, "apply-status-default-running"), strings.Index(stripped, "Recent schema changes"),
+		"the running apply is listed above the finished ones")
 	assert.Contains(t, stripped, "Showing the 20 most recent schema changes. Use --limit N to show more.")
 }
 
@@ -69,6 +81,7 @@ func TestCLI_Status_LimitShowsRequestedRecentApplies(t *testing.T) {
 	stripped := stripANSI(out)
 
 	assert.Equal(t, 3, statusApplyRowCount(out))
+	assert.Contains(t, stripped, "No active schema changes")
 	assert.Contains(t, stripped, "apply-status-limit-05")
 	assert.Contains(t, stripped, "apply-status-limit-04")
 	assert.Contains(t, stripped, "apply-status-limit-03")
@@ -159,10 +172,11 @@ func TestCLI_Status_ExternalIDShowsRemoteApplyIDs(t *testing.T) {
 	assert.Contains(t, stripped, "apply-status-external-local")
 }
 
-// TestCLI_Status_MaxLimitFooterDoesNotSuggestHigherLimit verifies that a
-// clamped request tells operators they are at the server maximum instead of
-// suggesting an impossible larger --limit value.
-func TestCLI_Status_MaxLimitFooterDoesNotSuggestHigherLimit(t *testing.T) {
+// TestCLI_Status_AfterReachesPastTheCap verifies that a request clamped to the
+// server's maximum page still reaches the rest of the history: the footer names
+// the --after apply instead of an impossible larger --limit, and the page after
+// it lists the apply the first page could not hold.
+func TestCLI_Status_AfterReachesPastTheCap(t *testing.T) {
 	binPath := buildBinary(t, "schemabot", "./pkg/cmd")
 	endpoint, store := startStatusOnlySchemaBot(t)
 
@@ -179,8 +193,16 @@ func TestCLI_Status_MaxLimitFooterDoesNotSuggestHigherLimit(t *testing.T) {
 
 	assert.Equal(t, 1000, statusApplyRowCount(out))
 	assert.Contains(t, stripped, "apply-status-cap-1001")
-	assert.Contains(t, stripped, "Showing the 1000 most recent schema changes. This server caps status history at 1000.")
+	assert.NotContains(t, stripped, "apply-status-cap-0001")
 	assert.NotContains(t, stripped, "Use --limit N to show more.")
+	assert.Contains(t, stripped, "Showing the 1000 most recent schema changes. Add --after apply-status-cap-0002 for the next 1000.")
+
+	nextOut := runCLI(t, binPath, "status", "--endpoint", endpoint, "--limit", "2000", "--after", "apply-status-cap-0002")
+	nextStripped := stripANSI(nextOut)
+	assert.Equal(t, 1, statusApplyRowCount(nextOut))
+	assert.Contains(t, nextStripped, "apply-status-cap-0001")
+	assert.NotContains(t, nextStripped, "--after")
+	assert.NotContains(t, nextStripped, "active schema change", "a continued page lists only finished applies")
 }
 
 type statusApplySeed struct {

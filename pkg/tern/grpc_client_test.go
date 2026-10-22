@@ -545,15 +545,23 @@ type capturingTernServer struct {
 	cutoverAccepted   bool
 	cutoverMessage    string
 	startCalled       bool // tracks whether Start was actually invoked
-	stopCalls         int
-	cancelCalls       int
-	stopRefusal       string // when set, Stop answers Accepted=false with this reason
-	cancelRefusal     string // when set, Cancel answers Accepted=false with this reason
-	omitOperationKey  bool   // emulate a data plane that does not echo the operation key
-	echoOperationKey  string // when set, echoed in place of the derived key, emulating a response for another operation
+	startCalls        int
+	startCaller       string
+	// startHook, when set, runs on every Start with the call's 1-based number
+	// and returns that call's error in place of startErr.
+	startHook        func(call int) error
+	stopCalls        int
+	cancelCalls      int
+	stopRefusal      string // when set, Stop answers Accepted=false with this reason
+	cancelRefusal    string // when set, Cancel answers Accepted=false with this reason
+	omitOperationKey bool   // emulate a data plane that does not echo the operation key
+	echoOperationKey string // when set, echoed in place of the derived key, emulating a response for another operation
 	// omitProgressScope emulates a data plane that ignores a progress
 	// request's apply_operation_id and answers for the whole apply.
 	omitProgressScope bool
+	// progressScopeEcho, when set, is echoed as the scope of every progress
+	// answer, emulating a data plane that answers for a different operation.
+	progressScopeEcho string
 	cutoverReq        *ternv1.CutoverRequest
 }
 
@@ -626,7 +634,12 @@ func (s *capturingTernServer) Start(_ context.Context, req *ternv1.StartRequest)
 	s.mu.Lock()
 	s.startApplyID = req.ApplyId
 	s.startCalled = true
+	s.startCalls++
+	s.startCaller = req.Caller
 	err := s.startErr
+	if s.startHook != nil {
+		err = s.startHook(s.startCalls)
+	}
 	if err != nil {
 		s.mu.Unlock()
 		return nil, err
@@ -711,6 +724,9 @@ func (s *capturingTernServer) Progress(_ context.Context, req *ternv1.ProgressRe
 	scopedTo := req.ApplyOperationId
 	if s.omitProgressScope {
 		scopedTo = ""
+	}
+	if s.progressScopeEcho != "" {
+		scopedTo = s.progressScopeEcho
 	}
 	ps := s.progressState
 	psSet := s.progressStateSet

@@ -29,6 +29,7 @@ func controlStatus(accepted bool) string {
 
 type controlOperationHTTPError struct {
 	status int
+	code   string
 	err    error
 }
 
@@ -61,11 +62,31 @@ func controlConflictf(format string, args ...any) error {
 	}
 }
 
+// controlConflictCodef is controlConflictf with an error code, for a rejection
+// a client acts on by its code rather than by its message.
+func controlConflictCodef(code, format string, args ...any) error {
+	return &controlOperationHTTPError{
+		status: http.StatusConflict,
+		code:   code,
+		err:    fmt.Errorf(format, args...),
+	}
+}
+
 // terminalControlf marks a control failure that retrying the same request
 // cannot repair: an internal data invariant violation or a deterministic
 // downstream rejection.
 func terminalControlf(format string, args ...any) error {
 	return &terminalControlError{err: fmt.Errorf(format, args...)}
+}
+
+// controlOperationErrorCode is the error code a rejection carries, empty for
+// one that carries none.
+func controlOperationErrorCode(err error) string {
+	var httpErr *controlOperationHTTPError
+	if errors.As(err, &httpErr) {
+		return httpErr.code
+	}
+	return ""
 }
 
 func controlOperationHTTPStatus(err error) int {
@@ -336,7 +357,7 @@ func (s *Service) writeControlError(w http.ResponseWriter, opName string, apply 
 		s.writeError(w, status, opName+" failed: "+err.Error())
 	} else {
 		s.logger.Warn(opName+" rejected", attrs...)
-		s.writeError(w, status, opName+" rejected: "+err.Error())
+		s.writeErrorCode(w, status, controlOperationErrorCode(err), opName+" rejected: "+err.Error())
 	}
 }
 
@@ -926,6 +947,13 @@ type stopControlRequestMetadata struct {
 
 const stopResponseStatusAlreadyRequested = apitypes.ControlStatusAlreadyRequested
 
+// stopResponseStatusLeftToClaimedDrive marks a stop recorded on a stopped apply
+// whose operation a drive has already claimed. The parent stays stopped while
+// that drive resumes the operation, so a stopped parent is no proof the stop
+// landed, and only the drive may complete the stop. It never reaches the wire:
+// the caller sees an ordinary pending stop.
+const stopResponseStatusLeftToClaimedDrive = "left_to_claimed_drive"
+
 // handleStop handles POST /api/stop requests.
 // Records durable stop intent for the apply owner to process.
 func (s *Service) handleStop(w http.ResponseWriter, r *http.Request) {
@@ -975,15 +1003,28 @@ func (s *Service) executeStopForApply(ctx context.Context, client tern.Client, a
 	metrics.RecordControlOperation(ctx, "stop", apply.Database, apply.Deployment, apply.Environment, controlStatus(resp.Accepted))
 	if resp.Accepted {
 		logMessage := "Stop requested by user"
-		if responseStatus == stopResponseStatusAlreadyRequested {
+		switch responseStatus {
+		case stopResponseStatusAlreadyRequested:
 			logMessage = "Stop requested by user while stop request already pending"
+		case apitypes.ControlStatusStartWithdrawn:
+			logMessage = "Stop requested by user withdrew the queued start; schema change stays stopped"
 		}
 		s.logControlOperationForApply(ctx, apply, caller, storage.LogEventStopRequested, logMessage)
-		if responseStatus == stopResponseStatusAlreadyRequested {
+		switch responseStatus {
+		case apitypes.ControlStatusStartWithdrawn:
+			s.logger.Info("immediate stop skipped because the stop withdrew a queued start and the apply is still stopped",
+				append(apply.LogAttrs(),
+					"requested_by", caller)...)
+		case stopResponseStatusAlreadyRequested:
 			s.logger.Info("immediate stop skipped because stop request is already pending",
 				append(apply.LogAttrs(),
 					"requested_by", caller)...)
-		} else {
+		case stopResponseStatusLeftToClaimedDrive:
+			s.logger.Info("immediate stop skipped because a drive already claimed an operation of the stopped apply; that drive completes the pending stop",
+				append(apply.LogAttrs(),
+					"requested_by", caller)...)
+			responseStatus = ""
+		default:
 			s.tryImmediateStopAfterQueue(ctx, client, apply, ternApplyID, environment, caller)
 		}
 		s.wakeOperator(apply.ApplyIdentifier, apply.Database, apply.Environment)
@@ -1356,14 +1397,21 @@ func (s *Service) queueStopForApplyOwner(ctx context.Context, apply *storage.App
 	if resp, responseStatus, found, err := s.pendingStopResponseIfPresent(ctx, apply); err != nil || found {
 		return resp, responseStatus, err
 	}
-	if state.IsTerminalApplyState(apply.State) {
-		return nil, "", controlConflictf("schema change is already terminal (current state: %s)", apply.State)
-	}
 	tasks, err := s.storage.Tasks().GetByApplyID(ctx, apply.ID)
 	if err != nil {
 		return nil, "", fmt.Errorf("get tasks for apply %s: %w", apply.ApplyIdentifier, err)
 	}
 	stoppedCount, skippedCount := stopRequestCounts(tasks)
+	if state.IsState(apply.State, state.Apply.Stopped) {
+		resp, responseStatus, resumed, err := s.stopQueuedStart(ctx, apply, caller, stoppedCount, skippedCount)
+		if err != nil || resumed == nil {
+			return resp, responseStatus, err
+		}
+		apply = resumed
+	}
+	if state.IsTerminalApplyState(apply.State) {
+		return nil, "", controlConflictf("schema change is already terminal (current state: %s)", apply.State)
+	}
 	if stoppedCount == 0 && skippedCount == 0 {
 		// The apply owns no task rows: it was queued before its first drive
 		// created them, or it is a VSchema-only apply that never has any. The
@@ -1374,7 +1422,7 @@ func (s *Service) queueStopForApplyOwner(ctx context.Context, apply *storage.App
 		s.logger.Info("stop requested for a task-less apply; recording the durable request for the task-less settle path",
 			append(apply.LogAttrs(), "requested_by", caller)...)
 	}
-	supersedesStart, err := s.stopSupersedesPendingStart(ctx, apply, caller)
+	supersedesStart, err := tern.StopSupersedesPendingStart(ctx, s.storage, s.logger, apply, caller)
 	if err != nil {
 		return nil, "", err
 	}
@@ -1396,67 +1444,73 @@ func (s *Service) queueStopForApplyOwner(ctx context.Context, apply *storage.App
 	}, "", nil
 }
 
-// stopSupersedesPendingStart reports whether a stop recorded on this apply
-// supersedes a pending start, which the stop's own write then completes in the
-// same transaction. An apply driven under the operation lease keeps its start
-// pending until it settles, because the operations the start resumes are
-// claimed one at a time on its behalf, and a pending start on a stopped apply
-// is what reopens it. Left pending under the new stop, that start would resume
-// the apply as soon as the stop landed on every operation. A stop is only
-// accepted for a non-terminal apply, so the start it supersedes has already
-// taken effect. An apply driven under the parent lease consumes its start when
-// its drive resumes, so its start is left to that drive.
-func (s *Service) stopSupersedesPendingStart(ctx context.Context, apply *storage.Apply, caller string) (bool, error) {
+// stopQueuedStart answers a stop on a stopped apply. The apply is stopped, but
+// an operator's start may be queued behind it that no driver has acted on yet,
+// and the stop must win over that start (CO-4): it withdraws the start in the
+// same write that records the stop, so no claim can resume the apply. With no
+// start queued there is nothing to stop and the stop is refused (CO-6).
+//
+// A claim may resume the apply between the caller's read and the write, which
+// leaves the start to the drive it resumed. resumed is then the reloaded apply,
+// for the caller to stop along the path for a running one; otherwise the stop
+// is answered here and resumed is nil.
+func (s *Service) stopQueuedStart(ctx context.Context, apply *storage.Apply, caller string, stoppedCount, skippedCount int64) (*ternv1.StopResponse, string, *storage.Apply, error) {
 	controlStore := s.storage.ControlRequests()
 	if controlStore == nil {
-		return false, fmt.Errorf("control request store is not available")
-	}
-	start, err := controlStore.GetPending(ctx, apply.ID, storage.ControlOperationStart)
-	if err != nil {
-		return false, fmt.Errorf("load pending start request for apply %s before recording a stop: %w", apply.ApplyIdentifier, err)
-	}
-	if start == nil {
-		return false, nil
+		return nil, "", nil, fmt.Errorf("control request store is not available")
 	}
 	ops, err := s.storage.ApplyOperations().ListByApply(ctx, apply.ID)
 	if err != nil {
-		return false, fmt.Errorf("list apply_operations for apply %s before recording a stop: %w", apply.ApplyIdentifier, err)
+		return nil, "", nil, fmt.Errorf("list apply_operations for stopped apply %s before stopping its queued start: %w", apply.ApplyIdentifier, err)
 	}
-	operationLease, err := s.applyDrivesUnderOperationLease(ctx, apply, ops)
+	operationLease, err := tern.ApplyDrivesUnderOperationLease(ctx, s.storage, apply, ops)
 	if err != nil {
-		return false, fmt.Errorf("decide drive mode of apply %s before recording a stop: %w", apply.ApplyIdentifier, err)
+		return nil, "", nil, fmt.Errorf("decide drive mode of stopped apply %s before stopping its queued start: %w", apply.ApplyIdentifier, err)
 	}
-	if !operationLease {
-		s.logger.Info("stop requested while a start is pending on an apply driven under the parent lease; leaving the start to the drive that resumes it",
-			append(apply.LogAttrs(), "requested_by", caller, "start_requested_by", start.RequestedBy, "operation_count", len(ops))...)
-		return false, nil
-	}
-	s.logger.Info("stop requested while a start is pending on an apply driven under the operation lease; the stop write completes the start it supersedes",
-		append(apply.LogAttrs(), "requested_by", caller, "start_requested_by", start.RequestedBy, "operation_count", len(ops))...)
-	return true, nil
-}
-
-// applyDrivesUnderOperationLease reports whether the apply's operations are
-// driven under the operation lease, with the parent projected from them, rather
-// than under the parent lease. It mirrors the drive-mode decision in
-// recoverApplyOperation: a rollout of several operations, a lone operation
-// whose generation manifest still expects siblings, and a lone task-less
-// operation all drive under the operation lease. An apply with no operation
-// attached has not been driven yet, so no drive mode applies.
-func (s *Service) applyDrivesUnderOperationLease(ctx context.Context, apply *storage.Apply, ops []*storage.ApplyOperation) (bool, error) {
-	switch {
-	case len(ops) == 0:
-		return false, nil
-	case len(ops) > 1:
-		return true, nil
-	case len(apply.MissingExpectedOperationKeys(ops)) > 0:
-		return true, nil
-	}
-	hasTasks, err := s.claimedOperationHasTasks(ctx, ops[0])
+	metadata, err := json.Marshal(stopControlRequestMetadata{StoppedCount: stoppedCount, SkippedCount: skippedCount})
 	if err != nil {
-		return false, err
+		return nil, "", nil, fmt.Errorf("marshal stop control request metadata for apply %s: %w", apply.ApplyIdentifier, err)
 	}
-	return !hasTasks, nil
+	_, outcome, err := controlStore.StopQueuedStart(ctx, &storage.ApplyControlRequest{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationStop,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: caller,
+		Metadata:    metadata,
+	}, operationLease)
+	if err != nil {
+		return nil, "", nil, fmt.Errorf("record stop against the queued start of stopped apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	attrs := append(apply.LogAttrs(), "requested_by", caller, "operation_lease", operationLease, "outcome", string(outcome))
+	switch outcome {
+	case storage.QueuedStartWithdrawn:
+		s.logger.Info("stop withdrew the queued start of a stopped apply; the apply stays stopped", attrs...)
+		if s.OnQueuedStartWithdrawn != nil {
+			s.OnQueuedStartWithdrawn(apply, caller)
+		} else {
+			s.logger.Debug("no PR is told the queued start was withdrawn: no GitHub surface is registered on this server", attrs...)
+		}
+		return &ternv1.StopResponse{Accepted: true, StoppedCount: stoppedCount, SkippedCount: skippedCount}, apitypes.ControlStatusStartWithdrawn, nil, nil
+	case storage.QueuedStartStopPending:
+		s.logger.Info("stop withdrew the queued start of a stopped apply and is pending for the drive that already claimed an operation", attrs...)
+		return &ternv1.StopResponse{Accepted: true, StoppedCount: stoppedCount, SkippedCount: skippedCount}, stopResponseStatusLeftToClaimedDrive, nil, nil
+	case storage.QueuedStartNone:
+		s.logger.Info("stop rejected: the apply is already stopped and no start is queued", attrs...)
+		return nil, "", nil, controlConflictCodef(apitypes.ErrCodeAlreadyStopped, "schema change is already stopped")
+	case storage.QueuedStartApplyNotStopped:
+		resumed, err := s.storage.Applies().Get(ctx, apply.ID)
+		if err != nil {
+			return nil, "", nil, fmt.Errorf("reload apply %s after a claim resumed it: %w", apply.ApplyIdentifier, err)
+		}
+		if resumed == nil {
+			return nil, "", nil, fmt.Errorf("reload apply %s after a claim resumed it: apply not found", apply.ApplyIdentifier)
+		}
+		s.logger.Info("stop found the apply already resumed by a claim; stopping it as a running apply",
+			append(resumed.LogAttrs(), "requested_by", caller)...)
+		return nil, "", resumed, nil
+	default:
+		return nil, "", nil, fmt.Errorf("record stop against the queued start of stopped apply %s: unknown outcome %q", apply.ApplyIdentifier, outcome)
+	}
 }
 
 func stopRequestCounts(tasks []*storage.Task) (int64, int64) {

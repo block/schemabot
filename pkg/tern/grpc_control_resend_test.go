@@ -20,19 +20,52 @@ import (
 func TestRemoteControlSendGate(t *testing.T) {
 	gate := &remoteControlSendGate{}
 	base := time.Now()
+	stop := &storage.ApplyControlRequest{ID: 1, CreatedAt: base, UpdatedAt: base}
+	cancel := &storage.ApplyControlRequest{ID: 2, CreatedAt: base, UpdatedAt: base}
 
-	assert.True(t, gate.shouldSend(1, base), "a request never sent by this process transmits immediately")
-	assert.True(t, gate.recordSend(1, base), "the first transmission is reported as first")
+	assert.True(t, gate.shouldSend(stop, base), "a request never sent by this process transmits immediately")
+	assert.True(t, gate.recordSend(stop, base), "the first transmission is reported as first")
 
-	assert.False(t, gate.shouldSend(1, base.Add(time.Second)), "a just-sent request is not retransmitted within the interval")
-	assert.True(t, gate.shouldSend(1, base.Add(remoteControlResendInterval)), "the request retransmits once the interval elapses")
-	assert.False(t, gate.recordSend(1, base.Add(remoteControlResendInterval)), "a retransmission is not reported as first")
+	assert.False(t, gate.shouldSend(stop, base.Add(time.Second)), "a just-sent request is not retransmitted within the interval")
+	assert.True(t, gate.shouldSend(stop, base.Add(remoteControlResendInterval)), "the request retransmits once the interval elapses")
+	assert.False(t, gate.recordSend(stop, base.Add(remoteControlResendInterval)), "a retransmission is not reported as first")
 
-	assert.True(t, gate.shouldSend(2, base), "gating is per control request, not per process")
+	assert.True(t, gate.shouldSend(cancel, base), "gating is per control request, not per process")
 
-	gate.clear(1)
-	assert.True(t, gate.shouldSend(1, base.Add(2*time.Second)), "a cleared request transmits immediately again")
-	assert.True(t, gate.recordSend(1, base.Add(2*time.Second)), "a cleared request's next transmission is first again")
+	gate.clear(stop.ID)
+	assert.True(t, gate.shouldSend(stop, base.Add(2*time.Second)), "a cleared request transmits immediately again")
+	assert.True(t, gate.recordSend(stop, base.Add(2*time.Second)), "a cleared request's next transmission is first again")
+}
+
+// A command resolved by another drive is never cleared from this process's
+// gate, and re-issuing it re-arms the same request row. The re-issued command
+// is the operator's new intent, so it transmits at once and is reported as a
+// first send, not throttled behind the transmission of the command before it.
+func TestRemoteControlSendGateTransmitsAReArmedRequestImmediately(t *testing.T) {
+	gate := &remoteControlSendGate{}
+	base := time.Now()
+	first := &storage.ApplyControlRequest{ID: 1, CreatedAt: base, UpdatedAt: base}
+	require.True(t, gate.recordSend(first, base))
+
+	reArmed := &storage.ApplyControlRequest{ID: 1, CreatedAt: base, UpdatedAt: base.Add(4 * time.Second)}
+	assert.True(t, gate.shouldSend(reArmed, base.Add(4*time.Second)), "a re-armed request transmits without waiting out the previous command's interval")
+	assert.True(t, gate.recordSend(reArmed, base.Add(4*time.Second)), "a re-armed request's transmission is its first")
+	assert.False(t, gate.shouldSend(reArmed, base.Add(5*time.Second)), "the re-armed request is then throttled on its own cadence")
+}
+
+// Storage that keeps timestamps to the second gives a command re-issued within
+// the second of the one before it the same stamps. The re-arm advances the
+// row's revision, so the re-issued command still transmits at once.
+func TestRemoteControlSendGateTransmitsASameSecondReArmImmediately(t *testing.T) {
+	gate := &remoteControlSendGate{}
+	base := time.Now().Truncate(time.Second)
+	first := &storage.ApplyControlRequest{ID: 1, CreatedAt: base, UpdatedAt: base}
+	require.True(t, gate.recordSend(first, base))
+
+	reArmed := &storage.ApplyControlRequest{ID: 1, CreatedAt: base, UpdatedAt: base, Revision: 1}
+	assert.True(t, gate.shouldSend(reArmed, base.Add(500*time.Millisecond)), "a re-arm in the same second transmits without waiting out the previous command's interval")
+	assert.True(t, gate.recordSend(reArmed, base.Add(500*time.Millisecond)), "its transmission is its first")
+	assert.False(t, gate.shouldSend(reArmed, base.Add(time.Second)), "it is then throttled on its own cadence")
 }
 
 // One gate is shared by every apply a process drives, so its three methods are
@@ -45,17 +78,17 @@ func TestRemoteControlSendGateIsConcurrentlyAccessed(t *testing.T) {
 	var wg sync.WaitGroup
 	for i := range 8 {
 		wg.Go(func() {
-			id := int64(i)
+			req := &storage.ApplyControlRequest{ID: int64(i), CreatedAt: base}
 			for range 50 {
-				gate.shouldSend(id, base)
-				gate.recordSend(id, base)
-				gate.clear(id)
+				gate.shouldSend(req, base)
+				gate.recordSend(req, base)
+				gate.clear(req.ID)
 			}
 		})
 	}
 	wg.Wait()
 
-	assert.True(t, gate.shouldSend(1, base), "every request was cleared, so each transmits immediately again")
+	assert.True(t, gate.shouldSend(&storage.ApplyControlRequest{ID: 1, CreatedAt: base}, base), "every request was cleared, so each transmits immediately again")
 }
 
 // An accepted cancel is stored durably by the data plane and consumed by its
@@ -108,8 +141,9 @@ func TestGRPCClient_PendingCancelRetransmissionThrottled(t *testing.T) {
 	// Once the resend interval elapses the driver retransmits as redelivery
 	// insurance — without appending another accept event.
 	client.controlSendGate.mu.Lock()
-	for id := range client.controlSendGate.lastSent {
-		client.controlSendGate.lastSent[id] = time.Now().Add(-remoteControlResendInterval)
+	for id, sent := range client.controlSendGate.lastSent {
+		sent.sentAt = time.Now().Add(-remoteControlResendInterval)
+		client.controlSendGate.lastSent[id] = sent
 	}
 	client.controlSendGate.mu.Unlock()
 
@@ -486,4 +520,81 @@ func TestGRPCClient_RefusedStopBeforeStartLogsTheDeferralOnce(t *testing.T) {
 	assert.True(t, deferred, "the start defers to the operator while the apply-level stop is unresolved")
 	assert.Equal(t, 1, strings.Count(logged.String(), "operation-only drive leaving apply-level stop request for operator projection"),
 		"the deferral is accounted for once per pass, not once by the refusal and again by the caller")
+}
+
+// A rollout's operation drives leave the shared apply-level stop to the rollout
+// projection, which completes it without touching any drive's send gate. When
+// the operator then starts the rollout and stops it again, the second stop
+// re-arms the same request row while the copy runs. That stop is a new
+// command: the next drive pass transmits it, rather than holding it behind the
+// first stop's resend interval while the copy it should halt keeps going.
+func TestGRPCClient_ReissuedStopOnRolloutOperationTransmitsImmediately(t *testing.T) {
+	server := &capturingTernServer{
+		progressState:    ternv1.State_STATE_RUNNING,
+		progressStateSet: true,
+		progressTables: []*ternv1.TableProgress{{
+			Namespace: "default",
+			TableName: "orders",
+			Status:    state.Task.Running,
+		}},
+	}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+
+	apply := &storage.Apply{
+		ID:              7,
+		ApplyIdentifier: "apply-grpc-stop-reissued",
+		ExternalID:      "remote-grpc-stop-reissued",
+		PlanID:          99,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+		State:           state.Apply.Running,
+	}
+	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{{
+		ID:          1,
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationStop,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "cli:alice",
+		CreatedAt:   time.Now(),
+	}}}
+	storedApply := *apply
+	logs := &mockApplyLogStore{}
+	client.storage = &mockStorage{
+		applies:         &mockApplyStore{apply: &storedApply},
+		tasks:           &mockTaskStore{},
+		logs:            logs,
+		controlRequests: controlRequests,
+	}
+	scope := applyTaskScope{
+		applyOperationID:   42,
+		operation:          &storage.ApplyOperation{ID: 42, ApplyID: apply.ID, Deployment: "deployment-a"},
+		operationLeaseOnly: true,
+	}
+	require.True(t, scope.suppressesDirectParentApplyWrites(), "the scope under test must be one that cannot write the parent apply")
+
+	_, err := client.processPendingStopControlRequest(t.Context(), apply, scope)
+	require.NoError(t, err)
+	require.Equal(t, 1, server.getStopCalls(), "the first stop transmits")
+
+	// The rollout projection completes the first stop once every operation has
+	// stopped; it holds no reference to this drive's gate.
+	controlRequests.requests[0].Status = storage.ControlRequestCompleted
+	_, alreadyPending, err := controlRequests.RequestPending(t.Context(), &storage.ApplyControlRequest{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationStop,
+		RequestedBy: "cli:bob",
+	})
+	require.NoError(t, err)
+	require.False(t, alreadyPending, "the second stop re-arms the resolved row")
+
+	_, err = client.processPendingStopControlRequest(t.Context(), apply, scope)
+	require.NoError(t, err)
+	assert.Equal(t, 2, server.getStopCalls(), "the re-issued stop transmits on the next drive pass")
+	assert.Equal(t, 2, countLogMessages(logs.logs, "Remote stop accepted"), "each operator stop is recorded as accepted once")
+
+	_, err = client.processPendingStopControlRequest(t.Context(), apply, scope)
+	require.NoError(t, err)
+	assert.Equal(t, 2, server.getStopCalls(), "the re-issued stop is then retransmitted on its own bounded cadence")
 }

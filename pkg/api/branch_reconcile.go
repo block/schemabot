@@ -34,6 +34,14 @@ type branchReconciler interface {
 	ReconcileOrphanedBranches(ctx context.Context, opts tern.BranchReconcileOptions) (tern.BranchReconcileResult, error)
 }
 
+// recentTargetsBranchReconciler is the capability of a data plane's default
+// client that resolves targets per request (tern.TargetRouter). It has no
+// static databases to visit, so it reconciles the PlanetScale targets its own
+// applies recently ran against.
+type recentTargetsBranchReconciler interface {
+	ReconcileRecentTargetBranches(ctx context.Context, opts tern.BranchReconcileOptions) (tern.RecentTargetsReconcileResult, error)
+}
+
 // branchReconcileTarget is one PlanetScale database environment this process
 // executes against itself.
 type branchReconcileTarget struct {
@@ -53,7 +61,9 @@ type branchReconcileTarget struct {
 //
 // The targets are read on every pass rather than here, because a local server
 // can register databases while it runs; a process with none yet still starts
-// the pass so it picks them up.
+// the pass so it picks them up. A data plane whose default client resolves
+// targets per request also reconciles the targets its applies recently ran
+// against, through that client.
 func (s *Service) branchReconcilePass() (func(context.Context), bool) {
 	if !s.config.BranchReconcile.Enabled {
 		s.logger.Debug("branch reconcile pass not started because it is disabled; orphaned PlanetScale branches are left until deleted by hand")
@@ -69,7 +79,8 @@ func (s *Service) branchReconcilePass() (func(context.Context), bool) {
 	deleteOrphans := s.config.BranchReconcile.Delete
 	s.logger.Info("branch reconcile pass enabled",
 		"delete", deleteOrphans, "grace", grace, "interval", BranchReconcileInterval,
-		"local_planetscale_targets", len(s.branchReconcileTargets()))
+		"local_planetscale_targets", len(s.branchReconcileTargets()),
+		"reconciles_recently_applied_targets", s.recentTargetsBranchReconciler() != nil)
 	return func(ctx context.Context) {
 		s.runBranchReconcilePass(ctx, grace, deleteOrphans)
 	}, true
@@ -98,12 +109,14 @@ func (s *Service) branchReconcileTargets() []branchReconcileTarget {
 }
 
 // runBranchReconcilePass reconciles every current target on the elected
-// instance. The targets are independent databases, so one that fails is logged
-// and the pass moves on to the next; the failures are joined into the pass's
-// outcome.
+// instance: each local PlanetScale environment, then, on a data plane that
+// resolves targets per request, each target its applies recently ran against.
+// The targets are independent databases, so one that fails is logged and the
+// pass moves on to the next; the failures are joined into the pass's outcome.
 func (s *Service) runBranchReconcilePass(ctx context.Context, grace time.Duration, deleteOrphans bool) {
 	targets := s.branchReconcileTargets()
-	if len(targets) == 0 {
+	resolved := s.recentTargetsBranchReconciler()
+	if len(targets) == 0 && resolved == nil {
 		s.logger.Debug("branch reconcile pass skipped: no local PlanetScale database targets; the deployment that executes against each database reconciles its branches")
 		return
 	}
@@ -117,9 +130,34 @@ func (s *Service) runBranchReconcilePass(ctx context.Context, grace time.Duratio
 				errs = append(errs, err)
 			}
 		}
+		if resolved != nil {
+			result, err := resolved.ReconcileRecentTargetBranches(ctx, tern.BranchReconcileOptions{
+				Grace:  grace,
+				Delete: deleteOrphans,
+				Now:    s.clock.Now(),
+			})
+			deleted += result.Deleted
+			s.logger.Info("branch reconcile visited the PlanetScale targets this data plane recently applied to",
+				"targets", result.Targets, "unreachable", result.Unreachable, "deleted", result.Deleted, "delete", deleteOrphans)
+			if err != nil {
+				errs = append(errs, fmt.Errorf("reconcile branches of recently applied targets: %w", err))
+			}
+		}
+		if len(errs) == 0 {
+			s.logger.Info("branch reconcile pass complete", "deleted", deleted, "delete", deleteOrphans)
+		}
 		return errors.Join(errs...)
 	})
 	s.recordSweepOutcome(ctx, branchReconcileSweep, deleted, err)
+}
+
+// recentTargetsBranchReconciler returns the default tern client when it
+// reconciles recently applied targets, and nil otherwise.
+func (s *Service) recentTargetsBranchReconciler() recentTargetsBranchReconciler {
+	s.ternMu.Lock()
+	defer s.ternMu.Unlock()
+	reconciler, _ := s.defaultTernClient.(recentTargetsBranchReconciler)
+	return reconciler
 }
 
 // reconcileTargetBranches runs the reconcile on one target and returns how
