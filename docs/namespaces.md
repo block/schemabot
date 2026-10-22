@@ -339,7 +339,9 @@ Every plan that excluded namespaces says so: the PR plan comment renders an
 `ℹ️ Namespaces excluded from this plan by ignore_namespaces: …` line under the
 plan summary (also on "no changes" results, so a withheld namespace is
 distinguishable from an unchanged one), and the CLI prints the same disclosure
-for `plan` and `apply`.
+for `plan` and `apply`. Past five namespaces the PR comment's line leads with
+its count and folds the names into a collapsed block, so how many were withheld
+stays visible unexpanded.
 When reviewing a PR that *introduces* an `ignore_namespaces` entry, the
 disclosure plus the config diff is the review surface: the plan stops
 reconciling that namespace from this PR onward.
