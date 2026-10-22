@@ -44,12 +44,13 @@ type: vitess
 ignore_namespaces:
   - local_fixtures
   - fixtures_$ENV
+  - /^fixtures_[0-9]+_staging$/
 `
 	var config SchemabotConfig
 	decoder := yaml.NewDecoder(strings.NewReader(yamlData))
 	decoder.KnownFields(true)
 	require.NoError(t, decoder.Decode(&config))
-	assert.Equal(t, []string{"local_fixtures", "fixtures_$ENV"}, config.IgnoreNamespaces)
+	assert.Equal(t, []string{"local_fixtures", "fixtures_$ENV", "/^fixtures_[0-9]+_staging$/"}, config.IgnoreNamespaces)
 }
 
 func TestHasSchemaInputFiles(t *testing.T) {
@@ -1452,6 +1453,10 @@ func TestFetchConfigRejectsUnusableExclusionEntries(t *testing.T) {
 		"padded ignore_namespaces entry": {
 			yaml: "database: payments\ntype: mysql\nignore_namespaces:\n  - \" local_fixtures\"\n",
 			want: "ignore_namespaces",
+		},
+		"ignore_namespaces pattern that does not compile": {
+			yaml: "database: payments\ntype: mysql\nignore_namespaces:\n  - /^payments_(\\d+_staging$/\n",
+			want: `ignore_namespaces entry "/^payments_(\d+_staging$/" is not a valid regular expression`,
 		},
 	} {
 		t.Run(name, func(t *testing.T) {

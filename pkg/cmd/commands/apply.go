@@ -96,8 +96,11 @@ func (cmd *ApplyCmd) Run(ctx context.Context, g *Globals) error {
 		return err
 	}
 	if cmd.Output != OutputFormatJSON {
-		templates.WriteIgnoredNamespaces(ignoredNamespaces,
-			schema.UnmatchedIgnoreEntries(cfg.IgnoreNamespaces, cmd.Environment, ignoredNamespaces))
+		unmatched, err := schema.UnmatchedIgnoreEntries(cfg.IgnoreNamespaces, cmd.Environment, ignoredNamespaces)
+		if err != nil {
+			return fmt.Errorf("check ignore_namespaces entries for %s: %w", cmd.Environment, err)
+		}
+		templates.WriteIgnoredNamespaces(ignoredNamespaces, unmatched)
 	}
 
 	// Validate engine-specific options

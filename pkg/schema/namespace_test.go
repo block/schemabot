@@ -1,6 +1,9 @@
 package schema
 
 import (
+	"fmt"
+	"maps"
+	"slices"
 	"strings"
 	"testing"
 
@@ -318,7 +321,9 @@ func TestGroupFilesByNamespace_IgnoreNamespacesNoMatch(t *testing.T) {
 	require.Len(t, result, 1)
 	assert.Contains(t, result, "payments")
 	assert.Empty(t, removed)
-	assert.Equal(t, []string{"nonexistent"}, UnmatchedIgnoreEntries([]string{"nonexistent"}, "development", removed))
+	unmatched, err := UnmatchedIgnoreEntries([]string{"nonexistent"}, "development", removed)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"nonexistent"}, unmatched)
 }
 
 func TestGroupFilesByNamespace_IgnoreNamespacesCaseSensitive(t *testing.T) {
@@ -336,18 +341,34 @@ func TestGroupFilesByNamespace_IgnoreNamespacesCaseSensitive(t *testing.T) {
 	require.Len(t, result, 1)
 	assert.Contains(t, result, "payments")
 	assert.Empty(t, removed)
-	assert.Equal(t, []string{"Payments"}, UnmatchedIgnoreEntries([]string{"Payments"}, "development", removed))
+	unmatched, err := UnmatchedIgnoreEntries([]string{"Payments"}, "development", removed)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"Payments"}, unmatched)
 }
 
 func TestUnmatchedIgnoreEntries(t *testing.T) {
-	assert.Nil(t, UnmatchedIgnoreEntries(nil, "staging", nil))
+	unmatched, err := UnmatchedIgnoreEntries(nil, "staging", nil)
+	require.NoError(t, err)
+	assert.Nil(t, unmatched)
 
 	// Entries are resolved with $ENV before comparison against the removed
 	// keys, so a matched $ENV entry is not reported.
-	assert.Nil(t, UnmatchedIgnoreEntries(
-		[]string{"fixtures_$ENV"}, "staging", []string{"fixtures_staging"}))
-	assert.Equal(t, []string{"typo"}, UnmatchedIgnoreEntries(
-		[]string{"fixtures_$ENV", "typo"}, "staging", []string{"fixtures_staging"}))
+	unmatched, err = UnmatchedIgnoreEntries([]string{"fixtures_$ENV"}, "staging", []string{"fixtures_staging"})
+	require.NoError(t, err)
+	assert.Nil(t, unmatched)
+	unmatched, err = UnmatchedIgnoreEntries([]string{"fixtures_$ENV", "typo"}, "staging", []string{"fixtures_staging"})
+	require.NoError(t, err)
+	assert.Equal(t, []string{"typo"}, unmatched)
+
+	// A pattern is matched when it withheld any namespace, and is reported as
+	// written when it withheld none, as one written for another environment
+	// does.
+	unmatched, err = UnmatchedIgnoreEntries([]string{"/^shop_[0-9]+_staging$/", "/^shop_[0-9]+_production$/"}, "staging", []string{"shop_2_staging", "shop_3_staging"})
+	require.NoError(t, err)
+	assert.Equal(t, []string{"/^shop_[0-9]+_production$/"}, unmatched)
+
+	_, err = UnmatchedIgnoreEntries([]string{"/shop_(/"}, "staging", nil)
+	require.ErrorContains(t, err, `ignore_namespaces entry "/shop_(/" is not a valid regular expression`)
 }
 
 func TestValidateIgnoreNamespaces(t *testing.T) {
@@ -373,22 +394,162 @@ func TestValidateIgnoreNamespaces(t *testing.T) {
 	err = ValidateIgnoreNamespaces([]string{"schema/local_fixtures"})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "not a path")
+	assert.Contains(t, err.Error(), "wrap a regular expression in slashes")
+
+	assert.NoError(t, ValidateIgnoreNamespaces([]string{"local_fixtures", "/^shop_[0-9]+_production$/"}))
 
 	err = ValidateIgnoreNamespaces([]string{`schema\local_fixtures`})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "not a path")
 }
 
-func TestResolveIgnoreNamespaces(t *testing.T) {
-	assert.Nil(t, ResolveIgnoreNamespaces(nil, "staging"))
-	assert.Equal(t, []string{"fixtures_staging", "local_fixtures"},
-		ResolveIgnoreNamespaces([]string{"fixtures_$ENV", "local_fixtures"}, "staging"))
-	assert.Equal(t, []string{"fixtures_$ENV"},
-		ResolveIgnoreNamespaces([]string{"fixtures_$ENV"}, ""))
-	assert.Equal(t, []string{"fixtures_staging", "legacy_staging"},
-		ResolveIgnoreNamespaces([]string{"fixtures_{env}", "legacy_$ENV"}, "staging"))
-	assert.Equal(t, []string{"fixtures_{env}"},
-		ResolveIgnoreNamespaces([]string{"fixtures_{env}"}, ""))
+func TestCompileIgnoreNamespaces_PlainEntriesResolveTokens(t *testing.T) {
+	tests := []struct {
+		name        string
+		entries     []string
+		environment string
+		ignored     []string
+		kept        []string
+	}{
+		{name: "legacy token", entries: []string{"fixtures_$ENV"}, environment: "staging", ignored: []string{"fixtures_staging"}, kept: []string{"fixtures_$ENV", "fixtures_production"}},
+		{name: "brace token", entries: []string{"fixtures_{env}"}, environment: "staging", ignored: []string{"fixtures_staging"}, kept: []string{"fixtures_{env}"}},
+		{name: "no environment keeps the token", entries: []string{"fixtures_{env}"}, ignored: []string{"fixtures_{env}"}, kept: []string{"fixtures_staging"}},
+		{name: "literal", entries: []string{"local_fixtures"}, environment: "staging", ignored: []string{"local_fixtures"}, kept: []string{"Local_fixtures", "local_fixtures_2"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ignore, err := CompileIgnoreNamespaces(tt.entries, tt.environment)
+			require.NoError(t, err)
+			for _, ns := range tt.ignored {
+				assert.True(t, ignore.Ignores(ns), "should ignore %s", ns)
+			}
+			for _, ns := range tt.kept {
+				assert.False(t, ignore.Ignores(ns), "should keep %s", ns)
+			}
+		})
+	}
+}
+
+// TestCompileIgnoreNamespaces_Patterns pins how a pattern entry matches: the
+// whole name, case-sensitively, so a pattern written for one family of shard
+// schemas cannot reach a namespace that merely contains a match.
+func TestCompileIgnoreNamespaces_Patterns(t *testing.T) {
+	tests := []struct {
+		name    string
+		entry   string
+		ignored []string
+		kept    []string
+	}{
+		{
+			name:    "unanchored pattern matches whole names only",
+			entry:   "/shop_[0-9]+_production/",
+			ignored: []string{"shop_1_production", "shop_32_production"},
+			kept:    []string{"shop_production", "shop_1_staging", "old_shop_1_production", "shop_1_production_backup"},
+		},
+		{
+			name:    "numeric range",
+			entry:   "/^shop_([4-9]|[12][0-9]|3[01])_staging$/",
+			ignored: []string{"shop_4_staging", "shop_19_staging", "shop_31_staging"},
+			kept:    []string{"shop_staging", "shop_0_staging", "shop_3_staging", "shop_32_staging"},
+		},
+		{
+			name:    "alternation stays inside the anchors",
+			entry:   "/shop_1_staging|shop_2_staging/",
+			ignored: []string{"shop_1_staging", "shop_2_staging"},
+			kept:    []string{"shop_1_staging_x", "x_shop_2_staging"},
+		},
+		{
+			name:    "case-sensitive unless asked",
+			entry:   "/shop_[0-9]+_staging/",
+			ignored: []string{"shop_1_staging"},
+			kept:    []string{"Shop_1_Staging"},
+		},
+		{
+			name:    "case folding on request",
+			entry:   "/(?i)shop_[0-9]+_staging/",
+			ignored: []string{"shop_1_staging", "Shop_1_Staging"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ignore, err := CompileIgnoreNamespaces([]string{tt.entry}, "staging")
+			require.NoError(t, err)
+			for _, ns := range tt.ignored {
+				assert.True(t, ignore.Ignores(ns), "should ignore %s", ns)
+			}
+			for _, ns := range tt.kept {
+				assert.False(t, ignore.Ignores(ns), "should keep %s", ns)
+			}
+		})
+	}
+}
+
+func TestCompileIgnoreNamespacePattern_Refusals(t *testing.T) {
+	tests := []struct {
+		name  string
+		entry string
+		want  string
+	}{
+		{name: "empty pattern", entry: "//", want: `ignore_namespaces entry "//" is an empty pattern`},
+		{name: "invalid expression", entry: "/shop_(/", want: `ignore_namespaces entry "/shop_(/" is not a valid regular expression`},
+		{name: "expression that only parses once wrapped", entry: "/a)|(b/", want: `ignore_namespaces entry "/a)|(b/" is not a valid regular expression`},
+		{name: "brace token", entry: "/shop_[0-9]+_{env}/", want: `ignore_namespaces entry "/shop_[0-9]+_{env}/" is a pattern and cannot use {env} or $ENV`},
+		{name: "legacy token", entry: "/shop_[0-9]+_$ENV/", want: `ignore_namespaces entry "/shop_[0-9]+_$ENV/" is a pattern and cannot use {env} or $ENV`},
+		{name: "path", entry: "/schema/shop_1/", want: `ignore_namespaces entry "/schema/shop_1/" must be a namespace name or a pattern, not a path`},
+		{name: "too long", entry: "/" + strings.Repeat("a", maxIgnoreNamespacePatternBytes) + "/", want: "is longer than 256 bytes"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := CompileIgnoreNamespacePattern(tt.entry)
+			require.ErrorContains(t, err, tt.want)
+			require.ErrorContains(t, ValidateIgnoreNamespaces([]string{tt.entry}), tt.want, "validation refuses what a plan would")
+		})
+	}
+}
+
+func TestValidateIgnoreNamespaces_PatternBudget(t *testing.T) {
+	pattern := func(i int) string { return fmt.Sprintf("/^shop_%03d_%s$/", i, strings.Repeat("x", 180)) }
+	within := []string{pattern(1), pattern(2), pattern(3), pattern(3), pattern(4), pattern(5)}
+	require.NoError(t, ValidateIgnoreNamespaces(within), "a repeated pattern counts once")
+
+	err := ValidateIgnoreNamespaces(append(within, pattern(6)))
+	require.ErrorContains(t, err, "ignore_namespaces pattern entries total")
+	require.ErrorContains(t, err, "over the 1024-byte limit")
+}
+
+// TestGroupFilesByNamespace_IgnoreNamespacesPattern models a sharded database
+// whose schema root holds one directory per shard schema, all linked to one
+// definition, while staging runs fewer shards than production. One pattern
+// per environment withholds the shards that environment does not run, and the
+// removed list names every namespace a pattern withheld so the plan can
+// disclose each one.
+func TestGroupFilesByNamespace_IgnoreNamespacesPattern(t *testing.T) {
+	files := map[string]string{}
+	for _, dir := range []string{"shop_{env}", "shop_0_{env}", "shop_1_{env}", "shop_2_{env}", "shop_3_{env}"} {
+		files[dir+"/orders.sql"] = "CREATE TABLE orders (id bigint);"
+	}
+	entries := []string{"/^shop_[23]_staging$/"}
+
+	staging, removed, err := GroupFilesByNamespace(files, "shop", "staging", entries)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"shop_2_staging", "shop_3_staging"}, removed)
+	assert.ElementsMatch(t, []string{"shop_staging", "shop_0_staging", "shop_1_staging"}, slices.Collect(maps.Keys(staging)))
+	unmatched, err := UnmatchedIgnoreEntries(entries, "staging", removed)
+	require.NoError(t, err)
+	assert.Empty(t, unmatched)
+
+	production, removed, err := GroupFilesByNamespace(files, "shop", "production", entries)
+	require.NoError(t, err)
+	assert.Empty(t, removed)
+	assert.Len(t, production, 5)
+	unmatched, err = UnmatchedIgnoreEntries(entries, "production", removed)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"/^shop_[23]_staging$/"}, unmatched)
+}
+
+func TestGroupFilesByNamespace_InvalidIgnorePattern(t *testing.T) {
+	_, _, err := GroupFilesByNamespace(map[string]string{"shop/orders.sql": "CREATE TABLE orders (id bigint);"}, "shop", "staging", []string{"/shop_(/"})
+	require.ErrorContains(t, err, `ignore_namespaces entry "/shop_(/" is not a valid regular expression`)
 }
 
 func TestGroupFilesByNamespaceEmptyDeclaration(t *testing.T) {

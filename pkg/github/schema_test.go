@@ -32,6 +32,8 @@ func TestEmptiedPRNamespaces(t *testing.T) {
 		{name: "outside schema root", files: []PRFile{{Filename: "other/removed/orders.sql", Status: "removed"}}},
 		{name: "ignored namespace", ignored: []string{"removed_$ENV"}, environment: "test", files: []PRFile{{Filename: "schema/removed_$ENV/orders.sql", Status: "removed"}}},
 		{name: "ignored brace namespace", ignored: []string{"removed_{env}"}, environment: "test", files: []PRFile{{Filename: "schema/removed_{env}/orders.sql", Status: "removed"}}},
+		{name: "ignored by pattern", ignored: []string{"/removed_[0-9]+_test/"}, environment: "test", files: []PRFile{{Filename: "schema/removed_3_{env}/orders.sql", Status: "removed"}}},
+		{name: "pattern for another environment", ignored: []string{"/removed_[0-9]+_production/"}, environment: "test", files: []PRFile{{Filename: "schema/removed_3_{env}/orders.sql", Status: "removed"}}, want: []string{"removed_3_test"}},
 		{name: "flat file", files: []PRFile{{Filename: "schema/orders.sql", Status: "removed"}}},
 		{name: "renamed out of its namespace", files: []PRFile{{Filename: "schema/surviving/orders.sql", PreviousFilename: "schema/removed/orders.sql", Status: "renamed"}}, want: []string{"removed"}},
 		{name: "renamed within its namespace", files: []PRFile{{Filename: "schema/surviving/orders_v2.sql", PreviousFilename: "schema/surviving/orders.sql", Status: "renamed"}}},
@@ -45,7 +47,9 @@ func TestEmptiedPRNamespaces(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			vacated := vacatedSchemaFiles(tt.files, "schema")
-			assert.Equal(t, tt.want, emptiedPRNamespaces(grouped, tt.ignored, vacated, "schema", tt.environment))
+			emptied, err := emptiedPRNamespaces(grouped, tt.ignored, vacated, "schema", tt.environment)
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, emptied)
 		})
 	}
 }

@@ -3,6 +3,9 @@ package schema
 import (
 	"fmt"
 	"path"
+	"regexp"
+	"regexp/syntax"
+	"slices"
 	"sort"
 	"strings"
 )
@@ -55,18 +58,23 @@ const EmptyNamespaceDeclaration = "-- This namespace is empty. Add CREATE TABLE 
 // ignoreNamespaces lists namespaces to exclude from the result — schema
 // directories that exist in the repository but must not be reconciled against
 // the live database (for example a keyspace only used by local test
-// infrastructure). Entries receive the same substitution as directory
-// names and are matched against the post-substitution namespace keys. Layout
+// infrastructure). Plain entries receive the same substitution as directory
+// names and pattern entries are compiled (see CompileIgnoreNamespaces); both
+// are matched against the post-substitution namespace keys. Layout
 // validation still sees ignored directories: a mixed flat/subdirectory layout
 // is rejected even when the subdirectories are all ignored.
 //
 // The second return value lists the namespace keys that were actually removed
 // by ignoreNamespaces, sorted. An entry that matches no namespace removes
-// nothing (matching is exact and case-sensitive); callers that report
+// nothing (matching is case-sensitive); callers that report
 // exclusions must report the removed keys, and should warn when a configured
 // entry is absent from them so a typo or stale entry is visible instead of
 // silently reconciling the namespace it was meant to exclude.
 func GroupFilesByNamespace(files map[string]string, defaultNamespace string, environment string, ignoreNamespaces []string) (SchemaFiles, []string, error) {
+	ignore, err := CompileIgnoreNamespaces(ignoreNamespaces, environment)
+	if err != nil {
+		return nil, nil, err
+	}
 	result := make(SchemaFiles)
 	resolvedSources := make(map[string]string)
 	var hasFlatFile, hasNamespacedFile bool
@@ -109,12 +117,13 @@ func GroupFilesByNamespace(files map[string]string, defaultNamespace string, env
 	}
 
 	var removed []string
-	for _, ignored := range ResolveIgnoreNamespaces(ignoreNamespaces, environment) {
-		if _, ok := result[ignored]; !ok {
-			continue
+	for namespace := range result {
+		if ignore.Ignores(namespace) {
+			removed = append(removed, namespace)
 		}
-		delete(result, ignored)
-		removed = append(removed, ignored)
+	}
+	for _, namespace := range removed {
+		delete(result, namespace)
 	}
 	sort.Strings(removed)
 
@@ -153,47 +162,197 @@ func ResolveNamespaceEnvironment(namespace, environment string) string {
 	return replacer.Replace(namespace)
 }
 
-// ResolveIgnoreNamespaces applies the same placeholder substitution to
-// ignore_namespaces entries that GroupFilesByNamespace applies to namespace
-// directory names, returning the configured entries as they will be matched
-// against namespace keys for the environment. Resolution does not check
-// existence — an entry may match no namespace; GroupFilesByNamespace reports
-// which entries actually removed one.
-func ResolveIgnoreNamespaces(namespaces []string, environment string) []string {
-	if len(namespaces) == 0 {
-		return nil
-	}
-	resolved := make([]string, len(namespaces))
-	for i, ns := range namespaces {
-		resolved[i] = ResolveNamespaceEnvironment(ns, environment)
-	}
-	return resolved
+// ignoreNamespacePatternDelimiter wraps a pattern entry, the same delimiter
+// ignore_tables uses. A namespace name cannot carry it, since a plain entry
+// containing a path separator is refused, so an entry it wraps is
+// unambiguously a pattern and every other entry keeps meaning the one
+// namespace it names.
+const ignoreNamespacePatternDelimiter = "/"
+
+// maxIgnoreNamespacePatternBytes caps a pattern entry's length, slashes
+// included, and maxIgnoreNamespacePatternsTotalBytes caps a config's distinct
+// pattern entries taken together, so the compilation work every plan does
+// before it groups schema files stays bounded. A namespace name is a database
+// or keyspace name, short enough that a pattern describing a family of them
+// never needs to come close to either cap.
+const (
+	maxIgnoreNamespacePatternBytes       = 256
+	maxIgnoreNamespacePatternsTotalBytes = 1024
+)
+
+// IgnoreNamespaces is a schemabot.yaml ignore_namespaces list resolved for one
+// environment: plain entries with {env} and $ENV substituted the way namespace
+// directory names are, and pattern entries compiled. It is the one rule every
+// reader of the config applies, so the CLI, the GitHub flow, and the
+// unmatched-entry warnings agree on which namespaces a list withholds.
+type IgnoreNamespaces struct {
+	entries []ignoreNamespaceEntry
 }
 
-// UnmatchedIgnoreEntries returns the resolved ignore_namespaces entries that
-// removed no namespace during grouping — a typo, a case mismatch, or a stale
-// entry for a directory that no longer exists. The namespaces such entries
-// name are fully reconciled, so callers should warn with the returned values
-// rather than letting the config imply an exclusion that is not happening.
-func UnmatchedIgnoreEntries(configured []string, environment string, removed []string) []string {
-	removedSet := make(map[string]bool, len(removed))
-	for _, ns := range removed {
-		removedSet[ns] = true
+type ignoreNamespaceEntry struct {
+	// written is the entry as an operator finds it in schemabot.yaml, with
+	// {env} and $ENV substituted for a plain entry. Unmatched reports it.
+	written string
+	// pattern is set for a pattern entry; a plain entry matches written
+	// exactly.
+	pattern *regexp.Regexp
+}
+
+// CompileIgnoreNamespaces resolves an ignore_namespaces list for environment.
+// A plain entry receives the same substitution as directory names and matches
+// one namespace exactly and case-sensitively. An entry wrapped in slashes is a
+// pattern (see CompileIgnoreNamespacePattern). With no environment, plain
+// entries keep their tokens and so match the unsubstituted directory names.
+func CompileIgnoreNamespaces(entries []string, environment string) (*IgnoreNamespaces, error) {
+	if err := checkIgnoreNamespacePatternBudget(entries); err != nil {
+		return nil, err
 	}
+	ignore := &IgnoreNamespaces{entries: make([]ignoreNamespaceEntry, 0, len(entries))}
+	for _, entry := range entries {
+		if !IsIgnoreNamespacePattern(entry) {
+			ignore.entries = append(ignore.entries, ignoreNamespaceEntry{written: ResolveNamespaceEnvironment(entry, environment)})
+			continue
+		}
+		re, err := CompileIgnoreNamespacePattern(entry)
+		if err != nil {
+			return nil, err
+		}
+		ignore.entries = append(ignore.entries, ignoreNamespaceEntry{written: entry, pattern: re})
+	}
+	return ignore, nil
+}
+
+// Ignores reports whether any entry withholds namespace.
+func (l *IgnoreNamespaces) Ignores(namespace string) bool {
+	return slices.ContainsFunc(l.entries, func(e ignoreNamespaceEntry) bool { return e.matches(namespace) })
+}
+
+// Unmatched returns the entries that withheld none of removed, the namespaces
+// grouping actually withheld: a typo, a case mismatch, a stale entry for a
+// directory that no longer exists, or a pattern written for another
+// environment. The namespaces a mistaken entry was meant to name are fully
+// reconciled, so callers should warn with the returned values rather than let
+// the config imply an exclusion that is not happening.
+func (l *IgnoreNamespaces) Unmatched(removed []string) []string {
 	var unmatched []string
-	for _, ns := range ResolveIgnoreNamespaces(configured, environment) {
-		if !removedSet[ns] {
-			unmatched = append(unmatched, ns)
+	for _, e := range l.entries {
+		if !slices.ContainsFunc(removed, e.matches) {
+			unmatched = append(unmatched, e.written)
 		}
 	}
 	return unmatched
 }
 
+func (e ignoreNamespaceEntry) matches(namespace string) bool {
+	if e.pattern != nil {
+		return e.pattern.MatchString(namespace)
+	}
+	return e.written == namespace
+}
+
+// UnmatchedIgnoreEntries returns the configured ignore_namespaces entries,
+// resolved for environment, that withheld none of removed. See
+// IgnoreNamespaces.Unmatched.
+func UnmatchedIgnoreEntries(configured []string, environment string, removed []string) ([]string, error) {
+	ignore, err := CompileIgnoreNamespaces(configured, environment)
+	if err != nil {
+		return nil, err
+	}
+	return ignore.Unmatched(removed), nil
+}
+
+// IsIgnoreNamespacePattern reports whether an ignore_namespaces entry is a
+// pattern: a regular expression wrapped in slashes. A lone slash is not one;
+// it is refused as a path.
+func IsIgnoreNamespacePattern(entry string) bool {
+	return len(entry) >= 2 &&
+		strings.HasPrefix(entry, ignoreNamespacePatternDelimiter) &&
+		strings.HasSuffix(entry, ignoreNamespacePatternDelimiter)
+}
+
+// CompileIgnoreNamespacePattern compiles a pattern entry into a regular
+// expression that matches a namespace name only in full: the expression is
+// anchored at both ends whether or not it is written with anchors, so a
+// pattern meant for one family of namespaces cannot reach one that merely
+// contains a matching run of characters. Matching is case-sensitive, the same
+// as a plain entry. The syntax is Go's RE2, which has no backtracking, and an
+// entry longer than maxIgnoreNamespacePatternBytes is refused, so no pattern
+// can stall a plan.
+//
+// A pattern is matched against namespace names after {env} and $ENV are
+// substituted, so it cannot use either token: an entry written for one
+// environment spells that environment out. Refusing the tokens keeps a
+// pattern's meaning the same in every environment, so an entry that passes
+// validation never fails a plan for its expression.
+//
+// The expression is compiled on its own before it is anchored, which is what
+// makes the anchoring hold: an expression that only parses once wrapped, such
+// as `a)|(b`, would otherwise close the anchoring group early and match any
+// name starting with a or ending with b.
+func CompileIgnoreNamespacePattern(entry string) (*regexp.Regexp, error) {
+	quoted := QuoteIgnoreTablesEntry(entry)
+	if !IsIgnoreNamespacePattern(entry) {
+		return nil, fmt.Errorf("ignore_namespaces entry %s is not a pattern: a pattern is a regular expression wrapped in slashes", quoted)
+	}
+	if len(entry) > maxIgnoreNamespacePatternBytes {
+		return nil, fmt.Errorf("ignore_namespaces entry %s is longer than %d bytes: split it into several pattern entries", quoted, maxIgnoreNamespacePatternBytes)
+	}
+	expr := entry[len(ignoreNamespacePatternDelimiter) : len(entry)-len(ignoreNamespacePatternDelimiter)]
+	if expr == "" {
+		return nil, fmt.Errorf("ignore_namespaces entry %s is an empty pattern: write a regular expression between the slashes", quoted)
+	}
+	if HasNamespaceEnvironmentPlaceholder(expr) {
+		return nil, fmt.Errorf("ignore_namespaces entry %s is a pattern and cannot use {env} or $ENV: a pattern is matched against namespace names after substitution, so write the environment out, as in \"/^fixtures_[0-9]+_staging$/\"", quoted)
+	}
+	if _, err := regexp.Compile(expr); err != nil {
+		return nil, fmt.Errorf("ignore_namespaces entry %s is not a valid regular expression: %w", quoted, err)
+	}
+	// The anchors wrap the parsed expression's canonical form, not the text as
+	// written: a quote opened by \Q runs to the end of the text, so wrapped
+	// as written it would swallow the closing group and anchor.
+	parsed, err := syntax.Parse(expr, syntax.Perl)
+	if err != nil {
+		return nil, fmt.Errorf("ignore_namespaces entry %s is not a valid regular expression: %w", quoted, err)
+	}
+	if requiresSlash(parsed) {
+		return nil, fmt.Errorf("ignore_namespaces entry %s must be a namespace name or a pattern, not a path: a pattern cannot require a slash, since no namespace name has one", quoted)
+	}
+	re, err := regexp.Compile(`\A(?:` + parsed.String() + `)\z`)
+	if err != nil {
+		return nil, fmt.Errorf("ignore_namespaces entry %s is not a valid regular expression: %w", quoted, err)
+	}
+	return re, nil
+}
+
+// checkIgnoreNamespacePatternBudget refuses a config whose distinct pattern
+// entries, taken together, are longer than
+// maxIgnoreNamespacePatternsTotalBytes. It runs before any pattern compiles,
+// so an over-budget config costs nothing to refuse.
+func checkIgnoreNamespacePatternBudget(entries []string) error {
+	seen := make(map[string]bool)
+	total := 0
+	for _, entry := range entries {
+		if !IsIgnoreNamespacePattern(entry) || seen[entry] {
+			continue
+		}
+		seen[entry] = true
+		total += len(entry)
+	}
+	if total > maxIgnoreNamespacePatternsTotalBytes {
+		return fmt.Errorf("ignore_namespaces pattern entries total %d bytes, over the %d-byte limit for all patterns together: remove or shorten pattern entries", total, maxIgnoreNamespacePatternsTotalBytes)
+	}
+	return nil
+}
+
 // ValidateIgnoreNamespaces rejects ignore_namespaces entries that cannot match
 // a namespace subdirectory of the schema root: blank entries, entries padded
 // with whitespace (namespace keys are never padded, so such an entry would
-// silently exclude nothing), and entries with path separators.
+// silently exclude nothing), entries with path separators, and pattern
+// entries that do not compile.
 func ValidateIgnoreNamespaces(namespaces []string) error {
+	if err := checkIgnoreNamespacePatternBudget(namespaces); err != nil {
+		return err
+	}
 	for _, ns := range namespaces {
 		if strings.TrimSpace(ns) == "" {
 			return fmt.Errorf("ignore_namespaces entries must not be blank")
@@ -201,8 +360,14 @@ func ValidateIgnoreNamespaces(namespaces []string) error {
 		if ns != strings.TrimSpace(ns) {
 			return fmt.Errorf("ignore_namespaces entry %q must not have leading or trailing whitespace", ns)
 		}
+		if IsIgnoreNamespacePattern(ns) {
+			if _, err := CompileIgnoreNamespacePattern(ns); err != nil {
+				return err
+			}
+			continue
+		}
 		if strings.ContainsAny(ns, `/\`) {
-			return fmt.Errorf("ignore_namespaces entry %q must be a namespace name, not a path", ns)
+			return fmt.Errorf("ignore_namespaces entry %q must be a namespace name, not a path. To match a family of namespaces, wrap a regular expression in slashes, such as \"/^fixtures_[0-9]+_staging$/\"", ns)
 		}
 	}
 	return nil

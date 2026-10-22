@@ -111,7 +111,11 @@ func (ic *InstallationClient) CreateSchemaRequestForConfig(ctx context.Context, 
 	// stale entry for a deleted directory — the namespace it names is being
 	// fully reconciled, so surface it rather than letting the config imply an
 	// exclusion that is not happening.
-	if unmatched := schema.UnmatchedIgnoreEntries(config.IgnoreNamespaces, environment, ignoredNamespaces); len(unmatched) > 0 {
+	unmatched, err := schema.UnmatchedIgnoreEntries(config.IgnoreNamespaces, environment, ignoredNamespaces)
+	if err != nil {
+		return nil, fmt.Errorf("check ignore_namespaces entries for %s: %w", environment, err)
+	}
+	if len(unmatched) > 0 {
 		ic.logger.Warn("ignore_namespaces entries matched no namespace and excluded nothing",
 			"repo", repo, "pr", pr, "database", config.Database, "environment", environment,
 			"schema_root", schemaRoot, "unmatched_entries", unmatched)
@@ -145,7 +149,11 @@ func (ic *InstallationClient) CreateSchemaRequestForConfig(ctx context.Context, 
 		}
 		return nil, fmt.Errorf("no schema files found under %s for environment %q", schemaRoot, environment)
 	}
-	for _, namespace := range emptiedPRNamespaces(schemaFiles, config.IgnoreNamespaces, vacated, schemaRoot, environment) {
+	emptied, err := emptiedPRNamespaces(schemaFiles, config.IgnoreNamespaces, vacated, schemaRoot, environment)
+	if err != nil {
+		return nil, fmt.Errorf("find the namespaces %s#%d empties: %w", repo, pr, err)
+	}
+	for _, namespace := range emptied {
 		schemaFiles[namespace] = &ternv1.SchemaFiles{Files: map[string]string{}}
 		ic.logger.Info("namespace has no remaining schema files in this pull request; the plan will surface every live table it holds as a DROP TABLE change",
 			"repo", repo, "pr", pr, "head_sha", prInfo.HeadSHA, "database", config.Database,
@@ -198,10 +206,10 @@ func vacatedSchemaFiles(prFiles []PRFile, schemaRoot string) []PRFile {
 // the head commit still declares. Absent from the grouped files, such a
 // namespace would otherwise vanish from the plan while every table it holds
 // stays live.
-func emptiedPRNamespaces(grouped map[string]*ternv1.SchemaFiles, ignored []string, vacated []PRFile, schemaRoot, environment string) []string {
-	ignoredSet := make(map[string]bool, len(ignored))
-	for _, namespace := range schema.ResolveIgnoreNamespaces(ignored, environment) {
-		ignoredSet[namespace] = true
+func emptiedPRNamespaces(grouped map[string]*ternv1.SchemaFiles, ignored []string, vacated []PRFile, schemaRoot, environment string) ([]string, error) {
+	ignore, err := schema.CompileIgnoreNamespaces(ignored, environment)
+	if err != nil {
+		return nil, err
 	}
 
 	prefix := path.Clean(schemaRoot) + "/"
@@ -212,7 +220,7 @@ func emptiedPRNamespaces(grouped map[string]*ternv1.SchemaFiles, ignored []strin
 			continue
 		}
 		namespace, namespaced := schema.NamespaceForRelativePath(relativePath, path.Base(schemaRoot), environment)
-		if !namespaced || ignoredSet[namespace] || grouped[namespace] != nil {
+		if !namespaced || ignore.Ignores(namespace) || grouped[namespace] != nil {
 			continue
 		}
 		emptied[namespace] = true
@@ -223,10 +231,10 @@ func emptiedPRNamespaces(grouped map[string]*ternv1.SchemaFiles, ignored []strin
 		result = append(result, namespace)
 	}
 	if len(result) == 0 {
-		return nil
+		return nil, nil
 	}
 	sort.Strings(result)
-	return result
+	return result, nil
 }
 
 // vacatedSchemaPath reports the schema file path a pull request file left
