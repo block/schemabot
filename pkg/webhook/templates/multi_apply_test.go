@@ -1651,8 +1651,9 @@ func TestRenderMultiDeploymentApplyComment_TargetThatAlreadyHadTheChangeIsLeftOu
 // An apply whose one deployment addresses several targets has no other
 // deployment to tell it apart from, so it states its status once, with no
 // counts line, no per-deployment list, and no section wrapping the table
-// lines: they sit under the status line and stay visible once the rollout
-// finishes. Beside a second deployment, each deployment keeps its section.
+// lines: they sit under the status line. Once the rollout completes, the
+// final summary folds them into "Apply details", as a single-target completed
+// summary does. Beside a second deployment, each deployment keeps its section.
 // Neither layout names or counts the target that already had the change.
 func TestRenderMultiDeploymentApplyComment_SoleMultiTargetDeploymentHasNoWrapper(t *testing.T) {
 	converged := parallelTarget("primary", "testapp-003", so.Completed)
@@ -1670,14 +1671,18 @@ func TestRenderMultiDeploymentApplyComment_SoleMultiTargetDeploymentHasNoWrapper
 	}
 	data := MultiDeploymentApplyData{Model: presentation.Derive(ops), ApplyID: "apply-123", Environment: "production", Details: details}
 
-	for name, out := range map[string]string{
-		"status":  RenderMultiDeploymentApplyComment(data),
-		"summary": RenderMultiDeploymentApplySummaryComment(data),
+	for name, tc := range map[string]struct {
+		out     string
+		lineTop string
+	}{
+		"status":  {RenderMultiDeploymentApplyComment(data), "\n✅ Rolled out to 2 targets\n\n"},
+		"summary": {RenderMultiDeploymentApplySummaryComment(data), "\n✅ Rolled out to 2 targets\n\n<details><summary>Apply details (1 table)</summary>\n\n"},
 	} {
 		t.Run(name, func(t *testing.T) {
-			assert.Contains(t, out, "\n✅ Rolled out to 2 targets\n\n**`orders`**: ✅ Complete (2 targets)\n")
+			out := tc.out
+			assert.Contains(t, out, tc.lineTop+"**`orders`**: ✅ Complete (2 targets)\n")
 			assert.NotContains(t, out, "already had")
-			assert.NotContains(t, out, "<details")
+			assert.Equal(t, strings.Count(tc.lineTop, "<details"), strings.Count(out, "<details"), "only the completed summary folds the table lines:\n%s", out)
 			assert.NotContains(t, out, "**Targets**:")
 			assert.NotContains(t, out, "- ✅ `primary`")
 		})
@@ -1692,6 +1697,29 @@ func TestRenderMultiDeploymentApplyComment_SoleMultiTargetDeploymentHasNoWrapper
 	assert.NotContains(t, out, "already had")
 	assert.NotContains(t, out, "testapp-003")
 	assert.NotContains(t, out, "Rolled out to")
+}
+
+// A one-deployment rollout that ends with a failed target keeps its table
+// lines open in the final summary, as a single-target failed summary does, so
+// the failed target and its table stay in view without a click.
+func TestRenderMultiDeploymentApplySummaryComment_SoleMultiTargetFailureStaysOpen(t *testing.T) {
+	data := MultiDeploymentApplyData{
+		Model: presentation.Derive([]presentation.Operation{
+			parallelTarget("primary", "testapp-001", so.Completed),
+			parallelTarget("primary", "testapp-002", so.Failed),
+		}),
+		ApplyID: "apply-123", Environment: "production",
+		Details: []*ApplyStatusCommentData{
+			targetDetail("testapp_001", state.Task.Completed, addNote, 1000),
+			targetDetail("testapp_002", state.Task.Failed, addNote, 420),
+		},
+	}
+	require.True(t, state.IsState(data.Model.State, state.Apply.Failed), "a failed target settles the rollout as failed, got %q", data.Model.State)
+
+	out := RenderMultiDeploymentApplySummaryComment(data)
+	assert.Contains(t, out, "**`orders`**:")
+	assert.Contains(t, out, addNote)
+	assert.NotContains(t, out, "Apply details", "a failed rollout does not fold its table lines:\n%s", out)
 }
 
 // A deployment whose every target already had the change ran nothing, so the
