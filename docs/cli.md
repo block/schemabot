@@ -320,7 +320,10 @@ a drop. See [namespace scope](namespaces.md) for shared databases. When the
 `-s` directory has an [environment schema root](namespaces.md#per-environment-schema-roots)
 for the source environment, `onboard` writes the namespace files there and
 keeps `schemabot.yaml` in the `-s` directory. `plan` and `apply` read that root
-for the environment too.
+for the environment too. Without one, `onboard` refuses a namespace named for
+the environment, because writing it would create the environment's root and
+hide the other namespaces. It also refuses namespaces whose directories are
+symlinks to one directory unless the pull returns the same schema for each.
 
 The command's PR hint is for GitHub automation. You can also use the generated
 files directly with the CLI, as shown below.

@@ -136,6 +136,14 @@ func TestResolveEnvironmentSchemaRootRefusals(t *testing.T) {
 			want: "points to non-directory path schema/base",
 		},
 		{
+			name: "symlink target reached through a symlinked directory",
+			entries: map[string]Entry{
+				"schema/production": {Kind: EntrySymlink, SymlinkTarget: "bridge/base"},
+				"schema/bridge":     {Kind: EntrySymlink, SymlinkTarget: "../other"},
+			},
+			want: "target schema/bridge/base runs through schema/bridge, which is not a directory",
+		},
+		{
 			name:   "lookup failure",
 			lookup: func(string) (Entry, error) { return Entry{}, lookupErr },
 			want:   "resolve schema root for environment production at schema/production: listing unavailable",

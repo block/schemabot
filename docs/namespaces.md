@@ -316,9 +316,11 @@ production plans `app_production`.
 
 - An environment with no entry of its own reads the config directory.
 - An environment symlink must use a relative target that resolves to a
-  directory inside the config directory. An absolute target, a target outside
-  the config directory, or a target that is not a directory fails the plan
-  instead of falling back to the config directory.
+  directory inside the config directory, and every directory on the way to the
+  target must be a real directory. An absolute target, a target outside the
+  config directory, a target reached through another symlinked directory, or a
+  target that is not a directory fails the plan instead of falling back to the
+  config directory.
 - An entry named for the environment that is neither a directory nor a symlink
   also fails the plan.
 - Namespace symlinks inside an environment directory resolve relative to that

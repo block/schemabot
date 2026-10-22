@@ -104,22 +104,49 @@ func TestEnvironmentSchemaRootMatchesBetweenPullRequestAndCLI(t *testing.T) {
 	}
 }
 
-// Both flows refuse an environment symlink that leaves the config directory.
+// Both flows refuse an environment symlink whose target is outside the config
+// directory, whether the target names the outside path or reaches it through
+// a symlinked directory that only looks inside.
 func TestEnvironmentSchemaRootOutsideConfigDirectoryRefusedByPullRequestAndCLI(t *testing.T) {
-	repoRoot := t.TempDir()
-	configDir := filepath.Join(repoRoot, "schema")
-	writeParityFile(t, filepath.Join(configDir, "schemabot.yaml"), "database: orders\ntype: mysql\n")
-	writeParityFile(t, filepath.Join(repoRoot, "other", "orders_001", "orders.sql"), "CREATE TABLE orders (id bigint primary key);\n")
-	require.NoError(t, os.Symlink(filepath.Join("..", "other"), filepath.Join(configDir, "production")))
+	cases := []struct {
+		name   string
+		layout func(t *testing.T, configDir string)
+		want   string
+	}{
+		{
+			name: "target outside the config directory",
+			layout: func(t *testing.T, configDir string) {
+				require.NoError(t, os.Symlink(filepath.Join("..", "other"), filepath.Join(configDir, "production")))
+			},
+			want: "points outside schema directory",
+		},
+		{
+			name: "target reached through a symlinked directory",
+			layout: func(t *testing.T, configDir string) {
+				require.NoError(t, os.Symlink(filepath.Join("bridge", "base"), filepath.Join(configDir, "production")))
+				require.NoError(t, os.Symlink(filepath.Join("..", "other"), filepath.Join(configDir, "bridge")))
+			},
+			want: "schema/bridge, which is not a directory",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			repoRoot := t.TempDir()
+			configDir := filepath.Join(repoRoot, "schema")
+			writeParityFile(t, filepath.Join(configDir, "schemabot.yaml"), "database: orders\ntype: mysql\n")
+			writeParityFile(t, filepath.Join(repoRoot, "other", "base", "orders_001", "orders.sql"), "CREATE TABLE orders (id bigint primary key);\n")
+			tc.layout(t, configDir)
 
-	ic := diskBackedInstallationClient(t, repoRoot)
-	_, _, prErr := ic.resolveSchemaRootForEnvironment(t.Context(), "octocat/hello-world", "abc123", "schema", "production")
-	require.Error(t, prErr)
-	assert.Contains(t, prErr.Error(), "points outside schema directory")
+			ic := diskBackedInstallationClient(t, repoRoot)
+			_, _, prErr := ic.resolveSchemaRootForEnvironment(t.Context(), "octocat/hello-world", "abc123", "schema", "production")
+			require.Error(t, prErr)
+			assert.Contains(t, prErr.Error(), tc.want)
 
-	_, cliErr := client.ResolveEnvironmentSchemaRoot(configDir, "production")
-	require.Error(t, cliErr)
-	assert.Contains(t, cliErr.Error(), "points outside schema directory")
+			_, cliErr := client.ResolveEnvironmentSchemaRoot(configDir, "production")
+			require.Error(t, cliErr)
+			assert.Contains(t, cliErr.Error(), tc.want)
+		})
+	}
 }
 
 // pullRequestEnvironmentSchema runs the pull request flow's schema discovery

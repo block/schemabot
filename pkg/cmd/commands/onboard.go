@@ -3,6 +3,8 @@ package commands
 import (
 	"errors"
 	"fmt"
+	"io/fs"
+	"maps"
 	"os"
 	"path/filepath"
 	"sort"
@@ -260,6 +262,11 @@ func buildOnboardWritePlan(schemaRoot string, resp *apitypes.PullSchemaResponse,
 	if err := rejectCaseCollisions("namespace", namespaces); err != nil {
 		return nil, err
 	}
+	if namespacePrefix == "." {
+		if err := rejectEnvironmentNamedNamespace(root, resp.Environment, namespaces); err != nil {
+			return nil, err
+		}
+	}
 	// A pull answers with the target's whole catalog: the request carries no
 	// exclusions, so a table the config withholds from the planner comes back
 	// like any other. Declaring it would state the contradiction the engines
@@ -344,6 +351,10 @@ func buildOnboardWritePlan(schemaRoot string, resp *apitypes.PullSchemaResponse,
 			"Editing local files and rerunning onboard will not help: onboard pulls the source again", errors.Join(formatErrors...))
 	}
 
+	if err := rejectAliasedNamespaceDirectories(root, files); err != nil {
+		return nil, err
+	}
+
 	return &onboardWritePlan{
 		root:            root,
 		namespacePrefix: namespacePrefix,
@@ -352,6 +363,92 @@ func buildOnboardWritePlan(schemaRoot string, resp *apitypes.PullSchemaResponse,
 		exclusions:      exclusions,
 		withheld:        withheldGroups,
 	}, nil
+}
+
+// rejectEnvironmentNamedNamespace refuses a namespace named for the source
+// environment when the config directory is the schema root. Writing it would
+// create <root>/<environment>, which every later plan of that environment
+// reads as its schema root, so the other namespaces written beside it would
+// drop out of verification and out of every plan after it. The name is
+// compared ignoring case because a case-insensitive filesystem finds the
+// directory either way.
+func rejectEnvironmentNamedNamespace(root, environment string, namespaces []string) error {
+	if environment == "" {
+		return nil
+	}
+	for _, namespace := range namespaces {
+		if strings.EqualFold(namespace, environment) {
+			return fmt.Errorf("namespace %q has the name of environment %q: written to %s it would become the environment's schema root and hide every other namespace from its plans. Create %s as the environment's schema root (a directory, or a symlink to one inside %s), then onboard again to write every namespace inside it",
+				namespace, environment, filepath.Join(root, namespace), filepath.Join(root, environment), root)
+		}
+	}
+	return nil
+}
+
+// rejectAliasedNamespaceDirectories refuses namespaces whose directories are
+// one directory on disk, reached through symlinks, unless the pull returned
+// the same files for each. An environment root of namespace symlinks into a
+// shared tree has exactly this shape. Namespaces that differ would write
+// into one directory: a table file one of them declares would be overwritten
+// by the other's, or declared for a namespace that does not hold it.
+func rejectAliasedNamespaceDirectories(root string, files map[string]string) error {
+	byDirectory := make(map[string]map[string]string)
+	for relativePath, content := range files {
+		dir := filepath.Dir(relativePath)
+		if dir == "." {
+			continue
+		}
+		if byDirectory[dir] == nil {
+			byDirectory[dir] = make(map[string]string)
+		}
+		byDirectory[dir][filepath.Base(relativePath)] = content
+	}
+	dirs := make([]string, 0, len(byDirectory))
+	for dir := range byDirectory {
+		dirs = append(dirs, dir)
+	}
+	sort.Strings(dirs)
+
+	firstByPhysical := make(map[string]string, len(dirs))
+	for _, dir := range dirs {
+		physical, err := physicalPath(filepath.Join(root, dir))
+		if err != nil {
+			return fmt.Errorf("resolve where namespace directory %s is written: %w", filepath.Join(root, dir), err)
+		}
+		first, aliased := firstByPhysical[physical]
+		if !aliased {
+			firstByPhysical[physical] = dir
+			continue
+		}
+		if !maps.Equal(byDirectory[first], byDirectory[dir]) {
+			return fmt.Errorf("namespace directories %s and %s are the same directory %s through symlinks, and the pulled schemas of their namespaces differ, so writing both would leave one namespace declaring the other's tables. Point each at its own directory and onboard again",
+				filepath.Join(root, first), filepath.Join(root, dir), physical)
+		}
+	}
+	return nil
+}
+
+// physicalPath returns where p is on disk with every symlink resolved,
+// including for a path whose tail does not exist yet: the existing prefix is
+// resolved and the missing components are appended to it.
+func physicalPath(p string) (string, error) {
+	var missing []string
+	current := p
+	for {
+		resolved, err := filepath.EvalSymlinks(current)
+		if err == nil {
+			return filepath.Join(append([]string{resolved}, missing...)...), nil
+		}
+		if !errors.Is(err, fs.ErrNotExist) {
+			return "", fmt.Errorf("resolve symlinks in %s: %w", current, err)
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return p, nil
+		}
+		missing = append([]string{filepath.Base(current)}, missing...)
+		current = parent
+	}
 }
 
 // Generated paths must remain distinct on case-insensitive filesystems too.

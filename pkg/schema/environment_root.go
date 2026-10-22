@@ -72,6 +72,9 @@ func ResolveEnvironmentSchemaRoot(configDir, environment string, lookup EntryLoo
 	if err != nil {
 		return "", "", err
 	}
+	if err := refuseSymlinkedIntermediates(configDir, candidate, resolved, lookup); err != nil {
+		return "", "", err
+	}
 	target, err := lookup(resolved)
 	if err != nil {
 		return "", "", fmt.Errorf("resolve environment schema root symlink %s target %s: %w", candidate, resolved, err)
@@ -80,6 +83,50 @@ func ResolveEnvironmentSchemaRoot(configDir, environment string, lookup EntryLoo
 		return "", "", fmt.Errorf("environment schema root symlink %s points to non-directory path %s", candidate, resolved)
 	}
 	return resolved, candidate, nil
+}
+
+// refuseSymlinkedIntermediates requires every directory between configDir and
+// an environment symlink's resolved target to be a real directory. The
+// containment check on the target is lexical, so a symlink on the way would
+// let the target land outside configDir while still reading as inside it. A
+// pull request could not follow it either: the Contents API does not traverse
+// symlinked directories.
+func refuseSymlinkedIntermediates(configDir, symlinkPath, resolved string, lookup EntryLookup) error {
+	relative := relativeWithinDirectory(configDir, resolved)
+	if relative == "" {
+		return nil
+	}
+	segments := strings.Split(relative, "/")
+	current := path.Clean(configDir)
+	for _, segment := range segments[:len(segments)-1] {
+		current = path.Join(current, segment)
+		entry, err := lookup(current)
+		if err != nil {
+			return fmt.Errorf("resolve environment schema root symlink %s target %s at %s: %w", symlinkPath, resolved, current, err)
+		}
+		if entry.Kind != EntryDirectory {
+			return fmt.Errorf("environment schema root symlink %s target %s runs through %s, which is not a directory; point the symlink at the real directory", symlinkPath, resolved, current)
+		}
+	}
+	return nil
+}
+
+// relativeWithinDirectory returns candidate's slash-separated path below
+// directory, empty when candidate is directory itself. The caller has already
+// established that candidate lies within directory.
+func relativeWithinDirectory(directory, candidate string) string {
+	directory = path.Clean(directory)
+	candidate = path.Clean(candidate)
+	switch {
+	case candidate == directory:
+		return ""
+	case directory == ".":
+		return candidate
+	case directory == "/":
+		return strings.TrimPrefix(candidate, "/")
+	default:
+		return strings.TrimPrefix(candidate, directory+"/")
+	}
 }
 
 // ValidateEnvironmentPathSegment refuses an environment name that would
