@@ -1471,153 +1471,32 @@ func TestApplyStore_GetRecentLimitAndEnvironment(t *testing.T) {
 	assert.Equal(t, "apply_recent_staging_failed", applies[0].ApplyIdentifier)
 }
 
-// The status list puts in-flight work first: a copy that has been running for
-// days stays on the first page while applies created after it — and finished
-// since — sort below it.
-func TestApplyStore_GetRecentPutsInFlightWorkFirst(t *testing.T) {
+// The status list is ordered by when each apply was created, newest first,
+// whatever has happened to the applies since. A copy started days ago and
+// still heartbeating sorts below newer applies that have long finished: a
+// caller that shows in-flight work first asks for it separately.
+func TestApplyStore_GetRecentOrdersByCreation(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
 	store := NewMySQL(testDB)
 	now := time.Now()
 
-	lock := createTestLock(t, store, "activitydb", "mysql")
-	longRunning := createTestApplyWithStateAndEnv(t, store, lock, "apply_long_running", 230, state.Apply.Running, "staging")
-	finishedRecently := createTestApplyWithStateAndEnv(t, store, lock, "apply_finished_recently", 231, state.Apply.Completed, "staging")
-	finishedEarlier := createTestApplyWithStateAndEnv(t, store, lock, "apply_finished_earlier", 232, state.Apply.Completed, "staging")
+	lock := createTestLock(t, store, "creation_order", "mysql")
+	longRunning := createTestApplyWithStateAndEnv(t, store, lock, "apply_created_first", 230, state.Apply.Running, "staging")
+	createTestApplyWithStateAndEnv(t, store, lock, "apply_created_second", 231, state.Apply.Completed, "staging")
+	finished := createTestApplyWithStateAndEnv(t, store, lock, "apply_created_third", 232, state.Apply.Completed, "staging")
 
-	// The long-running apply was requested first and is still heartbeating; the
-	// two that follow were created after it and have since gone quiet.
 	setApplyStartedAt(t, longRunning.ID, now.Add(-48*time.Hour))
 	setApplyUpdatedAt(t, longRunning.ID, now)
-	setApplyUpdatedAt(t, finishedRecently.ID, now.Add(-time.Hour))
-	setApplyUpdatedAt(t, finishedEarlier.ID, now.Add(-2*time.Hour))
+	setApplyUpdatedAt(t, finished.ID, now.Add(-2*time.Hour))
+	insertOperationWithUpdatedAt(t, longRunning.ID, "deploy-a", state.ApplyOperation.Running, now)
 
-	applies, err := store.Applies().GetRecent(ctx, storage.RecentAppliesFilter{
-		Limit:       3,
-		Environment: "staging",
-	})
+	applies, err := store.Applies().GetRecent(ctx, storage.RecentAppliesFilter{Limit: 3, Environment: "staging"})
 	require.NoError(t, err)
 	require.Len(t, applies, 3)
-	assert.Equal(t, "apply_long_running", applies[0].ApplyIdentifier)
-	assert.Equal(t, "apply_finished_recently", applies[1].ApplyIdentifier)
-	assert.Equal(t, "apply_finished_earlier", applies[2].ApplyIdentifier)
-}
-
-// Every driver heartbeats on the same interval, so concurrent applies all carry
-// a timestamp from within one interval. Ordering them by that timestamp would
-// reshuffle the top of the list between calls, so in-flight applies are ordered
-// by when they started, oldest first — the longest-held table reads first and a
-// newly started apply joins the bottom of the group.
-func TestApplyStore_GetRecentOrdersInFlightByStart(t *testing.T) {
-	clearTables(t)
-	ctx := t.Context()
-	store := NewMySQL(testDB)
-	now := time.Now()
-
-	// One database admits one in-flight apply, so concurrent rollouts are always
-	// against different databases.
-	oldest := createTestApplyWithStateAndEnv(t, store, createTestLock(t, store, "concurrent_a", "mysql"),
-		"apply_running_oldest", 250, state.Apply.Running, "staging")
-	middle := createTestApplyWithStateAndEnv(t, store, createTestLock(t, store, "concurrent_b", "mysql"),
-		"apply_running_middle", 251, state.Apply.Running, "staging")
-	newest := createTestApplyWithStateAndEnv(t, store, createTestLock(t, store, "concurrent_c", "mysql"),
-		"apply_running_newest", 252, state.Apply.Running, "staging")
-
-	setApplyStartedAt(t, oldest.ID, now.Add(-48*time.Hour))
-	setApplyStartedAt(t, middle.ID, now.Add(-2*time.Hour))
-	setApplyStartedAt(t, newest.ID, now.Add(-5*time.Minute))
-
-	// Heartbeats land in a different order than the applies started, spread
-	// across one heartbeat interval the way concurrent drivers produce.
-	setApplyUpdatedAt(t, middle.ID, now)
-	setApplyUpdatedAt(t, newest.ID, now.Add(-3*time.Second))
-	setApplyUpdatedAt(t, oldest.ID, now.Add(-6*time.Second))
-
-	applies, err := store.Applies().GetRecent(ctx, storage.RecentAppliesFilter{
-		Limit:       3,
-		Environment: "staging",
-	})
-	require.NoError(t, err)
-	require.Len(t, applies, 3)
-	assert.Equal(t, "apply_running_oldest", applies[0].ApplyIdentifier)
-	assert.Equal(t, "apply_running_middle", applies[1].ApplyIdentifier)
-	assert.Equal(t, "apply_running_newest", applies[2].ApplyIdentifier)
-}
-
-// An apply left in a non-terminal state with nothing driving it stops
-// heartbeating, so it is not in flight and does not hold the top of the list
-// ahead of work that is actually moving.
-func TestApplyStore_GetRecentSinksAbandonedApplies(t *testing.T) {
-	clearTables(t)
-	ctx := t.Context()
-	store := NewMySQL(testDB)
-	now := time.Now()
-
-	abandonedLock := createTestLock(t, store, "abandoned_a", "mysql")
-	liveLock := createTestLock(t, store, "abandoned_b", "mysql")
-	abandoned := createTestApplyWithStateAndEnv(t, store, abandonedLock, "apply_abandoned", 260, state.Apply.FailedRetryable, "staging")
-	running := createTestApplyWithStateAndEnv(t, store, liveLock, "apply_still_running", 261, state.Apply.Running, "staging")
-	finished := createTestApplyWithStateAndEnv(t, store, abandonedLock, "apply_finished", 262, state.Apply.Completed, "staging")
-
-	setApplyStartedAt(t, abandoned.ID, now.Add(-72*time.Hour))
-	setApplyStartedAt(t, running.ID, now.Add(-time.Hour))
-	setApplyUpdatedAt(t, abandoned.ID, now.Add(-72*time.Hour))
-	setApplyUpdatedAt(t, running.ID, now)
-	setApplyUpdatedAt(t, finished.ID, now.Add(-time.Minute*30))
-
-	applies, err := store.Applies().GetRecent(ctx, storage.RecentAppliesFilter{
-		Limit:       3,
-		Environment: "staging",
-	})
-	require.NoError(t, err)
-	require.Len(t, applies, 3)
-	assert.Equal(t, "apply_still_running", applies[0].ApplyIdentifier)
-	assert.Equal(t, "apply_finished", applies[1].ApplyIdentifier, "the abandoned apply does not outrank work that settled since")
-	assert.Equal(t, "apply_abandoned", applies[2].ApplyIdentifier)
-}
-
-// A fanned-out apply is driven per operation, and an operation-scoped drive is
-// refused a parent heartbeat, so the parent row stays frozen while the rollout
-// advances. Its operations' heartbeats keep it in flight.
-func TestApplyStore_GetRecentTreatsOperationActivityAsInFlight(t *testing.T) {
-	clearTables(t)
-	ctx := t.Context()
-	store := NewMySQL(testDB)
-	now := time.Now()
-
-	lock := createTestLock(t, store, "opactivitydb", "mysql")
-	fannedOut := createTestApplyWithStateAndEnv(t, store, lock, "apply_fanned_out", 240, state.Apply.Running, "staging")
-	finished := createTestApplyWithStateAndEnv(t, store, lock, "apply_finished", 241, state.Apply.Completed, "staging")
-
-	// Only the operation is heartbeating: the parent apply row last changed
-	// before the finished apply did.
-	setApplyStartedAt(t, fannedOut.ID, now.Add(-24*time.Hour))
-	setApplyUpdatedAt(t, fannedOut.ID, now.Add(-3*time.Hour))
-	setApplyUpdatedAt(t, finished.ID, now.Add(-time.Hour))
-	insertOperationWithUpdatedAt(t, fannedOut.ID, "deploy-a", state.ApplyOperation.Running, now)
-
-	applies, err := store.Applies().GetRecent(ctx, storage.RecentAppliesFilter{
-		Limit:       2,
-		Environment: "staging",
-	})
-	require.NoError(t, err)
-	require.Len(t, applies, 2)
-	assert.Equal(t, "apply_fanned_out", applies[0].ApplyIdentifier)
-	assert.Equal(t, "apply_finished", applies[1].ApplyIdentifier)
-
-	// An operation quieter than its parent must not drag the apply down: the
-	// parent's own state change is the later activity.
-	setApplyUpdatedAt(t, finished.ID, now.Add(-4*time.Hour))
-	insertOperationWithUpdatedAt(t, finished.ID, "deploy-b", state.ApplyOperation.Completed, now.Add(-5*time.Hour))
-
-	applies, err = store.Applies().GetRecent(ctx, storage.RecentAppliesFilter{
-		Limit:       2,
-		Environment: "staging",
-	})
-	require.NoError(t, err)
-	require.Len(t, applies, 2)
-	assert.Equal(t, "apply_fanned_out", applies[0].ApplyIdentifier)
-	assert.Equal(t, "apply_finished", applies[1].ApplyIdentifier)
+	assert.Equal(t, "apply_created_third", applies[0].ApplyIdentifier)
+	assert.Equal(t, "apply_created_second", applies[1].ApplyIdentifier)
+	assert.Equal(t, "apply_created_first", applies[2].ApplyIdentifier)
 }
 
 func setApplyStartedAt(t *testing.T, applyID int64, at time.Time) {
@@ -1679,37 +1558,6 @@ func TestApplyStore_GetRecentUpdatedSince(t *testing.T) {
 	require.Len(t, applies, 2)
 }
 
-// Work that just finished reads newest-first, not as if it were still running.
-// A terminal apply's last heartbeat stays fresh for as long as the staleness
-// window, so recency of activity alone would group it with the live work and
-// sort it by start time — showing an operator the oldest of the applies that
-// just settled, under a heading that says in flight.
-func TestApplyStore_GetRecentOrdersSettledWorkByFinish(t *testing.T) {
-	clearTables(t)
-	ctx := t.Context()
-	store := NewMySQL(testDB)
-	now := time.Now()
-
-	lock := createTestLock(t, store, "settled", "mysql")
-	earlier := createTestApplyWithStateAndEnv(t, store, lock, "apply_settled_earlier", 280, state.Apply.Completed, "staging")
-	later := createTestApplyWithStateAndEnv(t, store, lock, "apply_settled_later", 281, state.Apply.Completed, "staging")
-
-	// Both finished within the staleness window, the longer-running one first.
-	setApplyStartedAt(t, earlier.ID, now.Add(-3*time.Hour))
-	setApplyStartedAt(t, later.ID, now.Add(-2*time.Hour))
-	setApplyUpdatedAt(t, earlier.ID, now.Add(-30*time.Second))
-	setApplyUpdatedAt(t, later.ID, now.Add(-10*time.Second))
-
-	applies, err := store.Applies().GetRecent(ctx, storage.RecentAppliesFilter{
-		Limit:       10,
-		Environment: "staging",
-	})
-	require.NoError(t, err)
-	require.Len(t, applies, 2)
-	assert.Equal(t, "apply_settled_later", applies[0].ApplyIdentifier)
-	assert.Equal(t, "apply_settled_earlier", applies[1].ApplyIdentifier)
-}
-
 // A time window keeps a fanned-out apply visible while it is still working. An
 // operation-scoped drive is refused a parent heartbeat by design, so the parent
 // row can be hours stale while the operations tick every few seconds; windowing
@@ -1742,47 +1590,9 @@ func TestApplyStore_GetRecentWindowKeepsOperationActivity(t *testing.T) {
 	assert.Equal(t, 1, counts[state.Apply.Running])
 }
 
-// A deployment-scoped view answers for the deployment the operator asked about.
-// A rollout still heartbeating in some other deployment reads as quiet here,
-// matching the per-deployment state rendered on the same row.
-func TestApplyStore_GetRecentScopesActivityToDeployment(t *testing.T) {
-	clearTables(t)
-	ctx := t.Context()
-	store := NewMySQL(testDB)
-	now := time.Now()
-
-	// Two fanned-out applies. In one deployment the first is still working and
-	// the second went quiet hours ago; in the other it is the other way round.
-	first := createTestApplyWithStateAndEnv(t, store, createTestLock(t, store, "scoped_a", "mysql"),
-		"apply_scoped_first", 290, state.Apply.Running, "staging")
-	second := createTestApplyWithStateAndEnv(t, store, createTestLock(t, store, "scoped_b", "mysql"),
-		"apply_scoped_second", 291, state.Apply.Running, "staging")
-
-	insertOperationWithUpdatedAt(t, first.ID, "deploy-east", state.ApplyOperation.Running, now)
-	insertOperationWithUpdatedAt(t, first.ID, "deploy-west", state.ApplyOperation.Completed, now.Add(-3*time.Hour))
-	insertOperationWithUpdatedAt(t, second.ID, "deploy-east", state.ApplyOperation.Completed, now.Add(-3*time.Hour))
-	insertOperationWithUpdatedAt(t, second.ID, "deploy-west", state.ApplyOperation.Running, now)
-	setApplyUpdatedAt(t, first.ID, now.Add(-3*time.Hour))
-	setApplyUpdatedAt(t, second.ID, now.Add(-3*time.Hour))
-
-	east, err := store.Applies().GetRecent(ctx, storage.RecentAppliesFilter{
-		Limit: 10, Environment: "staging", Deployment: "deploy-east",
-	})
-	require.NoError(t, err)
-	require.Len(t, east, 2)
-	assert.Equal(t, "apply_scoped_first", east[0].ApplyIdentifier)
-
-	west, err := store.Applies().GetRecent(ctx, storage.RecentAppliesFilter{
-		Limit: 10, Environment: "staging", Deployment: "deploy-west",
-	})
-	require.NoError(t, err)
-	require.Len(t, west, 2)
-	assert.Equal(t, "apply_scoped_second", west[0].ApplyIdentifier)
-}
-
-// A deployment-scoped time window is scoped the same way as the ordering, so an
-// apply quiet in the requested deployment falls outside the window even while
-// another deployment keeps heartbeating.
+// A deployment-scoped time window answers for the requested deployment, so an
+// apply quiet in it falls outside the window even while another deployment
+// keeps heartbeating, matching the per-deployment state the same row renders.
 func TestApplyStore_GetRecentDeploymentWindowScopesActivity(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
@@ -1846,6 +1656,24 @@ func TestApplyStore_GetRecentActiveOnly(t *testing.T) {
 		got = append(got, a.ApplyIdentifier)
 	}
 	assert.ElementsMatch(t, []string{"apply_active_running", "apply_active_retryable", "apply_active_unknown"}, got)
+
+	// The finished-only query is the complement, so a view listing both lists
+	// every apply exactly once.
+	finished, err := store.Applies().GetRecent(ctx, storage.RecentAppliesFilter{
+		Limit: 10, Environment: "staging", FinishedOnly: true,
+	})
+	require.NoError(t, err)
+	got = got[:0]
+	for _, a := range finished {
+		got = append(got, a.ApplyIdentifier)
+	}
+	assert.Equal(t, []string{"apply_active_stopped", "apply_active_completed"}, got, "newest first")
+
+	counts, err := store.Applies().CountRecentByState(ctx, storage.RecentAppliesFilter{
+		Environment: "staging", FinishedOnly: true,
+	})
+	require.NoError(t, err)
+	assert.Equal(t, map[string]int{state.Apply.Completed: 1, state.Apply.Stopped: 1}, counts)
 }
 
 // A status summary must tally every apply matching the filters — unbounded by

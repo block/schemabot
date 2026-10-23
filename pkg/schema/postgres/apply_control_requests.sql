@@ -9,6 +9,7 @@ CREATE TABLE apply_control_requests (
   completed_at timestamp DEFAULT NULL,
   created_at timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  revision bigint NOT NULL DEFAULT 0,
   PRIMARY KEY (id)
 );
 CREATE UNIQUE INDEX idx_apply_control_requests_apply_operation ON apply_control_requests (apply_id, operation);

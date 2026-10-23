@@ -1,12 +1,13 @@
 package ddl
 
 import (
-	"encoding/json"
 	"fmt"
 	"slices"
 	"sort"
 	"strings"
 
+	"github.com/block/spirit/pkg/parser/ast"
+	"github.com/block/spirit/pkg/parser/format"
 	"github.com/block/spirit/pkg/statement"
 )
 
@@ -38,11 +39,22 @@ import (
 //     engine, charset, partitioning, or row format exemptions), so any
 //     difference the planner could act on counts.
 //
+// A file the pull request adds is absent at both bases, passed as "". Its
+// change is the CREATE TABLE itself, so it is the same when the approved
+// commit and the head declare the same elements in the same column order:
+// formatting and comments may differ, nothing the table is built from may.
+//
 // When the change is not the same, reason says why, for operator logs. Each
 // file must hold exactly one CREATE TABLE, all four naming the same table,
 // and an element may be declared only once per file; an error means the files
 // could not be compared and proves nothing.
 func SameTableChange(approvedBase, approved, headBase, head string) (same bool, reason string, err error) {
+	if approvedBase == "" && headBase == "" {
+		return sameAddedTable(approved, head)
+	}
+	if approvedBase == "" || headBase == "" {
+		return false, "", fmt.Errorf("the file is absent at one base but not the other")
+	}
 	files := [...]struct {
 		name    string
 		content string
@@ -96,6 +108,44 @@ func SameTableChange(approvedBase, approved, headBase, head string) (same bool, 
 	if !slices.Equal(approvedChange, headChange) {
 		return false, fmt.Sprintf("table %s: the approved commit generates %q but the head generates %q",
 			aBase.TableName, approvedChange, headChange), nil
+	}
+	return true, "", nil
+}
+
+// sameAddedTable compares a table file the pull request adds at the approved
+// commit and at the head.
+func sameAddedTable(approved, head string) (same bool, reason string, err error) {
+	files := [...]struct {
+		name    string
+		content string
+	}{
+		{"approved commit", approved},
+		{"head", head},
+	}
+	var tables [len(files)]*statement.CreateTable
+	var elements [len(files)]map[string]string
+	for i, f := range files {
+		ct, err := parseSingleCreateTable(f.content)
+		if err != nil {
+			return false, "", fmt.Errorf("parse the schema file at the %s: %w", f.name, err)
+		}
+		e, err := tableElements(ct)
+		if err != nil {
+			return false, "", fmt.Errorf("read table %s at the %s: %w", ct.TableName, f.name, err)
+		}
+		tables[i], elements[i] = ct, e
+	}
+	a, h := tables[0], tables[1]
+	if a.TableName != h.TableName {
+		return false, fmt.Sprintf("the file declares table %s at the approved commit but %s at the head", a.TableName, h.TableName), nil
+	}
+	// With no base, every element is the pull request's own, so the merge
+	// holds exactly when the head declares each one as approved.
+	if why := UnmergedElement(nil, elements[0], nil, elements[1]); why != "" {
+		return false, fmt.Sprintf("table %s: %s", a.TableName, why), nil
+	}
+	if !sameColumnOrder(a, h) {
+		return false, fmt.Sprintf("table %s: the head orders columns differently from the approved commit", a.TableName), nil
 	}
 	return true, "", nil
 }
@@ -202,71 +252,97 @@ func sameColumnOrder(x, y *statement.CreateTable) bool {
 
 // tableElements keys every column, index, and constraint of ct by kind and
 // lowercased name (MySQL matches them case-insensitively), every table option
-// and CREATE modifier ct sets by name, and its partitioning, and maps each to
-// its parsed definition. Each option is its own element, so the pull request
-// and the base can change different options of the same table. Column
-// position is not part of a column's definition; sameColumnOrder checks it.
-// An element declared twice cannot be told apart from the other, so it is an
-// error.
+// by name, and everything else the statement declares (its modifiers,
+// partitioning, and any LIKE or AS SELECT clause) as one element, and maps
+// each to its definition as the parser read it. Elements come from the parse
+// tree rather than Spirit's model of the table, so a clause the model does
+// not carry (an ENCRYPTION option, a LIKE source) still takes part. Each
+// option is its own element, so the pull request and the base can change
+// different options of the same table. Column position is not part of a
+// column's definition; sameColumnOrder checks it. An element declared twice
+// cannot be told apart from the other, so it is an error.
 func tableElements(ct *statement.CreateTable) (map[string]string, error) {
+	if ct.Raw == nil {
+		return nil, fmt.Errorf("table %s has no parse tree", ct.TableName)
+	}
 	elements := make(map[string]string)
-	add := func(key string, definition any) error {
+	add := func(key string, node ast.Node) error {
+		definition, err := restoreNode(node)
+		if err != nil {
+			return fmt.Errorf("restore %s: %w", key, err)
+		}
+		if key == "" {
+			key = definition
+		}
 		if _, dup := elements[key]; dup {
 			return fmt.Errorf("%s is declared more than once", key)
 		}
-		encoded, err := json.Marshal(definition)
-		if err != nil {
-			return fmt.Errorf("encode %s: %w", key, err)
-		}
-		elements[key] = string(encoded)
+		elements[key] = definition
 		return nil
 	}
-	for _, col := range ct.Columns {
-		if err := add("column "+strings.ToLower(col.Name), col); err != nil {
+	for _, col := range ct.Raw.Cols {
+		if err := add("column "+col.Name.Name.L, col); err != nil {
 			return nil, err
 		}
 	}
-	for _, idx := range ct.Indexes {
-		if err := add("index "+strings.ToLower(idx.Name), idx); err != nil {
+	for _, c := range ct.Raw.Constraints {
+		if err := add(constraintKey(c), c); err != nil {
 			return nil, err
 		}
 	}
-	for _, c := range ct.Constraints {
-		if err := add("constraint "+strings.ToLower(c.Name), c); err != nil {
-			return nil, err
-		}
-	}
-	if ct.Temporary {
-		if err := add("the TEMPORARY modifier", true); err != nil {
-			return nil, err
-		}
-	}
-	if ct.IfNotExists {
-		if err := add("the IF NOT EXISTS modifier", true); err != nil {
-			return nil, err
-		}
-	}
-	if ct.TableOptions != nil {
-		// TableOptions omits every option the statement does not set, so
-		// its encoded fields are exactly the options declared.
-		encoded, err := json.Marshal(ct.TableOptions)
+	for _, opt := range ct.Raw.Options {
+		key, err := tableOptionKey(opt)
 		if err != nil {
-			return nil, fmt.Errorf("encode table options: %w", err)
-		}
-		var options map[string]json.RawMessage
-		if err := json.Unmarshal(encoded, &options); err != nil {
-			return nil, fmt.Errorf("decode table options: %w", err)
-		}
-		for name, value := range options {
-			if err := add("table option "+name, value); err != nil {
-				return nil, err
-			}
-		}
-	}
-	if ct.Partition != nil {
-		if err := add("partitioning", ct.Partition); err != nil {
 			return nil, err
 		}
+		if err := add(key, opt); err != nil {
+			return nil, err
+		}
+	}
+	rest := *ct.Raw
+	rest.Cols, rest.Constraints, rest.Options = nil, nil, nil
+	if err := add("the CREATE TABLE clauses", &rest); err != nil {
+		return nil, err
 	}
 	return elements, nil
+}
+
+// constraintKey names an index or constraint the way MySQL does: indexes,
+// foreign keys, and CHECK constraints are each their own namespace, so a
+// foreign key and a CHECK may share a name, and the primary key has no name of
+// its own. An unnamed one is keyed by its definition.
+func constraintKey(c *ast.Constraint) string {
+	switch {
+	case c.Tp == ast.ConstraintPrimaryKey:
+		return "the primary key"
+	case c.Name == "":
+		return ""
+	case c.Tp == ast.ConstraintForeignKey:
+		return "foreign key " + strings.ToLower(c.Name)
+	case c.Tp == ast.ConstraintCheck:
+		return "check constraint " + strings.ToLower(c.Name)
+	default:
+		return "index " + strings.ToLower(c.Name)
+	}
+}
+
+// tableOptionKey names a table option by what it sets: the restored option
+// up to its value.
+func tableOptionKey(opt *ast.TableOption) (string, error) {
+	restored, err := restoreNode(opt)
+	if err != nil {
+		return "", fmt.Errorf("restore a table option: %w", err)
+	}
+	name, _, _ := strings.Cut(restored, " = ")
+	return "table option " + name, nil
+}
+
+// restoreNode renders a parse tree node as SQL in the parser's canonical
+// form, so formatting, comments, and keyword case do not count.
+func restoreNode(node ast.Node) (string, error) {
+	var sb strings.Builder
+	if err := node.Restore(format.NewRestoreCtx(format.DefaultRestoreFlags, &sb)); err != nil {
+		return "", err
+	}
+	return sb.String(), nil
 }

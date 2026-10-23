@@ -22,6 +22,9 @@ type ReviewGateData struct {
 	// ChangedApprovers are authorized reviewers whose approval was given on
 	// an earlier commit at which the PR's schema change differed from the head.
 	ChangedApprovers []string
+	// ChangedPaths are the schema inputs whose change differs between those
+	// approvals and the head.
+	ChangedPaths []string
 	// UncomparedApprovers are authorized reviewers whose approval was given
 	// on an earlier commit the review gate could not compare with the head.
 	UncomparedApprovers []string
@@ -78,6 +81,9 @@ func writeChangedApprovers(sb *strings.Builder, data ReviewGateData) {
 	}
 	fmt.Fprintf(sb, "\nApprovals on an earlier commit no longer count because this PR's schema change is different now: %s.",
 		mentionList(data.ChangedApprovers))
+	if len(data.ChangedPaths) > 0 {
+		fmt.Fprintf(sb, " Changed since the approval: %s.", strings.Join(inlineCodeList(data.ChangedPaths), ", "))
+	}
 	if targetsOtherThanDefaultBranch(data) {
 		fmt.Fprintf(sb, " This PR targets `%s`, not `%s`, so changes that reach `%s` count as a change too.",
 			data.BaseRef, data.DefaultBranch, data.BaseRef)

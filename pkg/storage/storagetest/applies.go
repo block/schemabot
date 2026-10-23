@@ -3,6 +3,7 @@ package storagetest
 import (
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
 	"sync"
 	"testing"
@@ -68,6 +69,114 @@ func TestApplies(t *testing.T, h Harness) {
 		deleted, err := store.Applies().Get(ctx, id)
 		require.NoError(t, err)
 		assert.Nil(t, deleted)
+	})
+
+	// An operator walks the recent-applies list page by page, each page starting
+	// below the last apply the previous one showed, while a new apply is created
+	// between pages. Every apply that existed when the walk began is listed
+	// exactly once, newest first, the new one not at all, and an apply outside
+	// the filters never.
+	t.Run("GetRecent_AfterListsEveryApplyOnce", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+
+		inFlight := CreateApplyWithStateAndEnv(t, store, CreateLock(t, store, "walk_inflight", storage.DatabaseTypeMySQL),
+			"apply_walk_inflight", 1, state.Apply.Running, "staging")
+		settledLock := CreateLock(t, store, "walk_settled", storage.DatabaseTypeMySQL)
+		want := []string{inFlight.ApplyIdentifier}
+		for i := range 7 {
+			apply := CreateApplyWithStateAndEnv(t, store, settledLock, fmt.Sprintf("apply_walk_settled_%d", i), int64(10+i), state.Apply.Completed, "staging")
+			want = append([]string{apply.ApplyIdentifier}, want...)
+		}
+		CreateApplyWithStateAndEnv(t, store, settledLock, "apply_walk_other_env", 30, state.Apply.Completed, "production")
+
+		filter := storage.RecentAppliesFilter{Environment: "staging"}
+		var seen []string
+		const pageSize = 3
+		for page := 0; ; page++ {
+			require.Less(t, page, 10, "the walk must end")
+			filter.Limit = pageSize + 1
+			applies, err := store.Applies().GetRecent(ctx, filter)
+			require.NoError(t, err)
+			hasMore := len(applies) > pageSize
+			if hasMore {
+				applies = applies[:pageSize]
+			}
+			for _, apply := range applies {
+				seen = append(seen, apply.ApplyIdentifier)
+			}
+			if !hasMore {
+				break
+			}
+			filter.AfterID = applies[len(applies)-1].ID
+			if page == 0 {
+				CreateApplyWithStateAndEnv(t, store, settledLock, "apply_walk_created_mid_walk", 40, state.Apply.Completed, "staging")
+			}
+		}
+		assert.Equal(t, want, seen)
+	})
+
+	// Three applies are running and an operator pages through the active ones
+	// two at a time. The last apply on the first page finishes before the
+	// second request. It no longer matches the filter, but its place in the
+	// order never moves, so the second page still lists the third running
+	// apply, and the finished-only walk lists the one that finished.
+	t.Run("GetRecent_AfterAnApplyThatFinishedSincePage", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		var running []*storage.Apply
+		for i := range 3 {
+			lock := CreateLock(t, store, fmt.Sprintf("walk_running_%d", i), storage.DatabaseTypeMySQL)
+			running = append(running, CreateApplyWithStateAndEnv(t, store, lock, fmt.Sprintf("apply_walk_running_%d", i), int64(10+i), state.Apply.Running, "staging"))
+		}
+
+		filter := storage.RecentAppliesFilter{Limit: 2, Environment: "staging", ActiveOnly: true}
+		first, err := store.Applies().GetRecent(ctx, filter)
+		require.NoError(t, err)
+		require.Len(t, first, 2)
+		assert.Equal(t, running[2].ApplyIdentifier, first[0].ApplyIdentifier)
+		assert.Equal(t, running[1].ApplyIdentifier, first[1].ApplyIdentifier)
+
+		anchor := first[1]
+		anchor.State = state.Apply.Completed
+		completedAt := time.Now()
+		anchor.CompletedAt = &completedAt
+		require.NoError(t, store.Applies().Update(ctx, anchor))
+
+		filter.AfterID = anchor.ID
+		second, err := store.Applies().GetRecent(ctx, filter)
+		require.NoError(t, err)
+		require.Len(t, second, 1, "the apply after the one that finished is still listed")
+		assert.Equal(t, running[0].ApplyIdentifier, second[0].ApplyIdentifier)
+
+		finished, err := store.Applies().GetRecent(ctx, storage.RecentAppliesFilter{Limit: 10, Environment: "staging", FinishedOnly: true})
+		require.NoError(t, err)
+		require.Len(t, finished, 1)
+		assert.Equal(t, anchor.ApplyIdentifier, finished[0].ApplyIdentifier)
+	})
+
+	t.Run("GetRecent_FiltersByDatabase", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		orders := CreateApplyWithStateAndEnv(t, store, CreateLock(t, store, "orders", storage.DatabaseTypeMySQL),
+			"apply_orders", 1, state.Apply.Completed, "staging")
+		CreateApplyWithStateAndEnv(t, store, CreateLock(t, store, "billing", storage.DatabaseTypeMySQL),
+			"apply_billing", 2, state.Apply.Failed, "staging")
+
+		filter := storage.RecentAppliesFilter{Limit: 10, Database: "ORDERS"}
+		recent, err := store.Applies().GetRecent(ctx, filter)
+		require.NoError(t, err)
+		require.Len(t, recent, 1)
+		assert.Equal(t, orders.ApplyIdentifier, recent[0].ApplyIdentifier)
+
+		filter.AfterID = orders.ID
+		after, err := store.Applies().GetRecent(ctx, filter)
+		require.NoError(t, err)
+		assert.Empty(t, after, "a later page keeps the database filter")
+
+		counts, err := store.Applies().CountRecentByState(ctx, filter)
+		require.NoError(t, err)
+		assert.Equal(t, map[string]int{state.Apply.Completed: 1}, counts, "counts ignore the page position and keep the filter")
 	})
 
 	t.Run("Create_Get_Update", func(t *testing.T) {

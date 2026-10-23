@@ -1,7 +1,6 @@
 package presentation
 
 import (
-	"cmp"
 	"fmt"
 	"slices"
 	"sort"
@@ -21,6 +20,15 @@ type Part struct {
 	PercentComplete int
 	RowsCopied      int64
 	RowsTotal       int64
+	// ChecksumRowsChecked and ChecksumRowsTotal are how far a checksumming
+	// part's verify has got, once its engine reports a total.
+	ChecksumRowsChecked int64
+	ChecksumRowsTotal   int64
+	// PlannedRows is the plan's row estimate for a part whose copy is still
+	// ahead (CopyStillAhead) and whose engine has reported no row total yet,
+	// standing in for the rows it will copy. Nil once the part reports a
+	// total, or when the plan had no estimate for it.
+	PlannedRows *int64
 }
 
 // PendingQueued and PendingNotStarted name a part still to run: queued while
@@ -38,6 +46,30 @@ func PendingWord(settled bool) string {
 		return PendingNotStarted
 	}
 	return PendingQueued
+}
+
+// UnreportedTargetStatus is where a rollout member that has reported no table
+// progress stands on each table it runs, given its operation's state: its own
+// halt or outcome once it has one, since that is all there is to say about it,
+// and queued while it is still to run. A stopped member reports its tables
+// once the apply resumes.
+func UnreportedTargetStatus(memberState string) string {
+	switch {
+	case state.IsState(memberState, state.ApplyOperation.Stopped):
+		return state.Task.Stopped
+	case state.IsState(memberState, state.ApplyOperation.Failed):
+		return state.Task.Failed
+	case state.IsState(memberState, state.ApplyOperation.FailedRetryable):
+		return state.Task.FailedRetryable
+	case state.IsState(memberState, state.ApplyOperation.Cancelled):
+		return state.Task.Cancelled
+	case state.IsState(memberState, state.ApplyOperation.Reverted):
+		return state.Task.Reverted
+	case state.IsState(memberState, state.ApplyOperation.Completed):
+		return state.Task.Completed
+	default:
+		return state.Task.Pending
+	}
 }
 
 // partListInlineLimit is the most parts a listing names one per line. Past it,
@@ -75,6 +107,60 @@ func ListsTargets(statuses []string) bool {
 	})
 }
 
+// ShardsKeepTableBar reports whether a sharded table past its row copy still
+// leads with its bar across its shards rather than its phase: it is still in
+// flight, its shards are in different phases (OnePhaseSpeaksForParts), and
+// there is more than one of them. The table's status is its most pressing
+// shard's, so one shard cutting over would otherwise speak for shards still
+// copying or verifying. A table copying rows, or resuming its copy, already
+// leads with its copy bar, so it is left to it.
+func ShardsKeepTableBar(tableStatus string, shardStatuses []string) bool {
+	if len(shardStatuses) <= 1 || !state.IsInFlightTaskState(tableStatus) {
+		return false
+	}
+	switch state.NormalizeTaskStatus(tableStatus) {
+	case state.Task.Running, state.Task.Recovering:
+		return false
+	}
+	return !OnePhaseSpeaksForParts(shardStatuses)
+}
+
+// RevertSpeaksForParts reports whether any part is reverting the change or
+// has reverted it. A revert undoes the change rather than progressing it, so
+// its phase speaks for the table instead of a bar that would count the rows
+// the copy once moved as progress.
+func RevertSpeaksForParts(statuses []string) bool {
+	return slices.ContainsFunc(statuses, func(status string) bool {
+		switch state.NormalizeTaskStatus(status) {
+		case state.Task.Reverting, state.Task.Reverted:
+			return true
+		}
+		return false
+	})
+}
+
+// OnePhaseSpeaksForParts reports whether every part is in the same phase past
+// the row copy (all checksumming, all waiting for cutover), so that phase
+// speaks for the table as a whole. Parts in different phases leave no one
+// phase that does, so the table reads its progress across them and the list
+// under it says where each one stands; parts all copying read their progress
+// too, since the copy is what a bar measures.
+func OnePhaseSpeaksForParts(statuses []string) bool {
+	if len(statuses) == 0 {
+		return false
+	}
+	phase := state.NormalizeTaskStatus(statuses[0])
+	if phase == state.Task.Running {
+		return false
+	}
+	for _, status := range statuses[1:] {
+		if state.NormalizeTaskStatus(status) != phase {
+			return false
+		}
+	}
+	return true
+}
+
 // TargetCoverage is the " · 40 complete, 4 copying, 19 queued, 1 failed,
 // 1 retrying" suffix of a table's line across a rollout's targets, naming only
 // the states some target is in, or "" when there are none. Queued targets are
@@ -110,17 +196,20 @@ type PartListLine struct {
 	Summary string
 }
 
-// ListParts is the lines a table's part listing shows, given its n parts, in
-// the order the heading counts them (PartCounts.Phrases): failed parts first,
-// then copying parts furthest behind first, then the other phases, then queued
-// parts in order, so the next to run leads them, and complete parts last. Up
-// to the inline limit every part is named. Past it, only the failed parts and
-// the slowest copying parts are named, each followed by a count of the ones of
-// its kind left unnamed; the heading already counts every other state, so the
-// listing does not repeat the rest.
+// ListParts is the lines a table's part listing shows, given its n parts. Up
+// to the inline limit every part is named, in the parts' own order, so each
+// part keeps its line from one update to the next and a reader follows it by
+// where it sits. Past it, only the failed parts, the slowest copying parts and
+// the parts working past the copy are named, each followed by a count of the
+// ones of its kind left unnamed; the heading already counts every other
+// state, so the listing does not repeat the rest.
 func ListParts(n int, part func(int) Part, noun Noun) []PartListLine {
 	if n <= partListInlineLimit {
-		return listEveryPart(n, part)
+		lines := make([]PartListLine, n)
+		for i := range n {
+			lines[i] = PartListLine{Part: i}
+		}
+		return lines
 	}
 	var lines []PartListLine
 	failed := 0
@@ -134,45 +223,39 @@ func ListParts(n int, part func(int) Part, noun Noun) []PartListLine {
 		failed++
 	}
 	if more := failed - maxFailedParts; more > 0 {
-		lines = append(lines, PartListLine{Part: -1, Summary: fmt.Sprintf("%d more failed %s", more, noun.Plural)})
+		lines = append(lines, PartListLine{Part: -1, Summary: fmt.Sprintf("%d more failed %s", more, noun.Label(more))})
 	}
 	copying := copyingFurthestBehindFirst(n, part)
 	for _, i := range copying[:min(len(copying), maxCopyingParts)] {
 		lines = append(lines, PartListLine{Part: i})
 	}
 	if more := len(copying) - maxCopyingParts; more > 0 {
-		lines = append(lines, PartListLine{Part: -1, Summary: fmt.Sprintf("%d more copying %s", more, noun.Plural)})
+		lines = append(lines, PartListLine{Part: -1, Summary: fmt.Sprintf("%d more copying %s", more, noun.Label(more))})
+	}
+	// A part working through any later phase is as live as a copying one, so
+	// it is named too, in its own order, rather than hidden in the heading.
+	working := workingPastCopy(n, part)
+	for _, i := range working[:min(len(working), maxCopyingParts)] {
+		lines = append(lines, PartListLine{Part: i})
+	}
+	if more := len(working) - maxCopyingParts; more > 0 {
+		lines = append(lines, PartListLine{Part: -1, Summary: fmt.Sprintf("%d more %s past copying", more, noun.Label(more))})
 	}
 	return lines
 }
 
-// listEveryPart names each of n parts in the listing's order: failed, copying
-// furthest behind first, the other phases, queued, then complete.
-func listEveryPart(n int, part func(int) Part) []PartListLine {
-	var failed, phases, queued, complete []int
+// workingPastCopy is the parts among n an engine is working on past the row
+// copy (checksumming, waiting for or cutting over, recovering, reverting), in
+// order.
+func workingPastCopy(n int, part func(int) Part) []int {
+	var working []int
 	for i := range n {
-		switch status := state.NormalizeTaskStatus(part(i).Status); {
-		case status == state.Task.Failed:
-			failed = append(failed, i)
-		case status == state.Task.Pending:
-			queued = append(queued, i)
-		case status == state.Task.Completed:
-			complete = append(complete, i)
-		case status != state.Task.Running:
-			phases = append(phases, i)
+		status := state.NormalizeTaskStatus(part(i).Status)
+		if status != state.Task.Running && state.IsInFlightTaskState(status) {
+			working = append(working, i)
 		}
 	}
-	// The other phases follow the order the heading counts them in.
-	sort.SliceStable(phases, func(a, b int) bool {
-		return comparePartStatuses(state.NormalizeTaskStatus(part(phases[a]).Status), state.NormalizeTaskStatus(part(phases[b]).Status)) < 0
-	})
-	lines := make([]PartListLine, 0, n)
-	for _, group := range [][]int{failed, copyingFurthestBehindFirst(n, part), phases, queued, complete} {
-		for _, i := range group {
-			lines = append(lines, PartListLine{Part: i})
-		}
-	}
-	return lines
+	return working
 }
 
 // copyingFurthestBehindFirst is the copying parts among n, the one furthest
@@ -202,18 +285,21 @@ func partReported(p Part) bool {
 	return p.PercentComplete != 0 || p.RowsCopied != 0
 }
 
-// PartGlyph is the mark a part's line leads with: ✓ complete, ◉ copying,
-// ● waiting for or cutting over, ✗ failed, and ○ for every other state.
+// PartGlyph is the mark a part's line leads with: ✓ complete, ● at the
+// cutover (waiting for it, cutting over, or in its revert window), ◉ working
+// through any other phase of the change, ✗ failed, and ○ for a part that is
+// not working on it: queued, not started, or halted. A part in its revert
+// window has the change live but not final, so it never reads as done.
 func PartGlyph(status string) string {
-	switch state.NormalizeTaskStatus(status) {
-	case state.Task.Completed:
+	switch status := state.NormalizeTaskStatus(status); {
+	case status == state.Task.Completed:
 		return "✓"
-	case state.Task.Running:
-		return "◉"
-	case state.Task.WaitingForCutover, state.Task.CuttingOver:
+	case status == state.Task.WaitingForCutover, status == state.Task.CuttingOver, status == state.Task.RevertWindow:
 		return "●"
-	case state.Task.Failed:
+	case status == state.Task.Failed:
 		return "✗"
+	case state.IsInFlightTaskState(status):
+		return "◉"
 	default:
 		return "○"
 	}
@@ -240,7 +326,21 @@ func PartDetail(p Part, pendingWord string) string {
 		}
 		return partProgress(p)
 	case state.Task.Pending:
+		// A part still to run keeps its queued word and says how much it
+		// will copy, once the plan sized it.
+		if p.PlannedRows != nil {
+			return pendingWord + " · " + ui.FormatApproxRows(*p.PlannedRows) + " rows"
+		}
 		return pendingWord
+	case state.Task.Checksumming:
+		if p.ChecksumRowsTotal <= 0 {
+			return PartStatusLabel(status)
+		}
+		// A checksum reads like a copy, the percent and then its rows, the
+		// way the single-deployment comment reads it.
+		checked := ui.ClampRows(p.ChecksumRowsChecked, p.ChecksumRowsTotal)
+		pct := ui.ClampPercent(int(checked * 100 / p.ChecksumRowsTotal))
+		return fmt.Sprintf("checksumming %s · %s / %s rows verified", ui.FormatRowCopyPercent(pct, checked, p.ChecksumRowsTotal), ui.FormatNumber(checked), ui.FormatNumber(p.ChecksumRowsTotal))
 	case state.Task.Stopped, state.Task.Cancelled:
 		// A part that had copied rows says how far it got before it halted.
 		if p.RowsCopied > 0 && p.RowsTotal > 0 {
@@ -365,30 +465,6 @@ var otherPartStatusOrder = []string{
 	state.Task.Reverted,
 }
 
-// comparePartStatuses orders two statuses the way Phrases counts them, so a
-// listing's lines follow its heading: otherPartStatusOrder, then any status
-// outside it alphabetically, then cancelled, which PartCounts counts on its
-// own after the rest. Both statuses are normalized.
-func comparePartStatuses(a, b string) int {
-	if c := cmp.Compare(partStatusRank(a), partStatusRank(b)); c != 0 {
-		return c
-	}
-	return cmp.Compare(a, b)
-}
-
-// partStatusRank is where a status falls in the heading's order: its index in
-// otherPartStatusOrder, one past it for any status outside it, and last for
-// cancelled.
-func partStatusRank(status string) int {
-	if status == state.Task.Cancelled {
-		return len(otherPartStatusOrder) + 1
-	}
-	if i := slices.Index(otherPartStatusOrder, status); i >= 0 {
-		return i
-	}
-	return len(otherPartStatusOrder)
-}
-
 // orderedPartStatuses is the statuses counted in counts, in
 // otherPartStatusOrder and then any others alphabetically.
 func orderedPartStatuses(counts map[string]int) []string {
@@ -428,4 +504,81 @@ func PartStatusLabel(status string) string {
 	default:
 		return status
 	}
+}
+
+// PercentAcrossTargets is how far a table is across every target that runs it,
+// for the bar that leads its line until every target completes. While every
+// target's rows are known, it is the rows copied over the rows to copy across
+// all of them. A target's rows are known once it has completed, once its
+// engine reports a row total, once it is past its copy (a table with no rows
+// to copy), or, while its copy is still ahead, from the plan's estimate
+// (Part.PlannedRows), which counts as nothing copied yet. Otherwise it is the
+// table's share across all of its targets: a completed target counts in full,
+// a working target by the rows its engine reports, and every other target as
+// nothing yet. A target that failed, is retrying, halted, or is undoing the
+// change leaves the table to its share and counts as nothing, since it has not
+// landed the change and its rows are not progressing, so one copy beside many
+// failures never reads as half done. silent is the targets with no progress
+// reported at all. The percent stops short of complete until every target has
+// completed, since rows copied on a target still verifying or waiting to cut
+// over are not the change landing there.
+func PercentAcrossTargets(parts []Part, silent int) int {
+	targets := len(parts) + silent
+	if targets == 0 {
+		return 0
+	}
+	var share float64
+	var copied, total int64
+	done := 0
+	everyReported := silent == 0
+	for _, p := range parts {
+		switch state.NormalizeTaskStatus(p.Status) {
+		case state.Task.Completed, state.Task.RevertWindow:
+			// A target in its revert window has completed the change, and may
+			// have run it without copying any rows.
+			share++
+			done++
+			if p.RowsTotal > 0 {
+				copied += p.RowsTotal
+				total += p.RowsTotal
+			}
+		case state.Task.Failed, state.Task.FailedRetryable, state.Task.Stopped, state.Task.Cancelled:
+			// Halted or waiting on a retry: its rows are not progressing.
+			everyReported = false
+		case state.Task.Reverting, state.Task.Reverted:
+			// Undoing the change: the rows its copy moved are not progress.
+			everyReported = false
+		case state.Task.Pending:
+			if p.PlannedRows == nil {
+				everyReported = false
+				continue
+			}
+			total += *p.PlannedRows
+		default:
+			if p.RowsTotal <= 0 {
+				switch {
+				case p.PlannedRows != nil:
+					total += *p.PlannedRows
+				case CopyStillAhead(p.Status):
+					everyReported = false
+				default:
+					// Past its copy with no rows reported: the table had
+					// none to copy there.
+				}
+				continue
+			}
+			rows := ui.ClampRows(p.RowsCopied, p.RowsTotal)
+			share += float64(rows) / float64(p.RowsTotal)
+			copied += rows
+			total += p.RowsTotal
+		}
+	}
+	percent := int(share * 100 / float64(targets))
+	if everyReported && total > 0 {
+		percent = int(copied * 100 / total)
+	}
+	if done < targets {
+		percent = min(percent, 99)
+	}
+	return percent
 }

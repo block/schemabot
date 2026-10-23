@@ -79,6 +79,30 @@ type Drainer interface {
 	DrainContext(ctx context.Context) error
 }
 
+// DrainTarget names the table a drive is about to start work on: the table in
+// its namespace, on the shard it lives on when the namespace is sharded.
+type DrainTarget struct {
+	Namespace string
+	Shard     string
+	Table     string
+}
+
+// TargetDrainer is an optional interface for an engine that runs each table's
+// work on each shard as its own schema change. A drive about to start a task
+// waits only for the in-flight work on that task's table, the only work that
+// can race the drive's read of the table. Copies on sibling shards keep running
+// alongside it instead of finishing one at a time, and a schema change on
+// another table, such as one holding at a deferred cutover, never holds the
+// drive back. It embeds Drainer because a drive that covers the whole apply
+// still waits for all of the engine's work.
+type TargetDrainer interface {
+	Drainer
+	// DrainTargetContext waits for any in-flight background work on target to
+	// complete and clears it, leaving all other work running. When ctx ends
+	// first it returns an error and leaves the work tracked.
+	DrainTargetContext(ctx context.Context, target DrainTarget) error
+}
+
 // ShutdownHalter is an optional capability for engines whose schema change work
 // runs inside this process. Such an engine holds resources on the target — for
 // Spirit, an advisory lock on the table it is copying — for exactly as long as
@@ -382,10 +406,10 @@ func ReleaseCancelledArtifacts(ctx context.Context, eng Engine, req *ReleaseArti
 // CancelledResumeStateReclaimer is an optional capability for engines whose
 // drive sets up work in the service it drives before anything in that service
 // owns the work's teardown, and records the work in the apply's stored resume
-// state so a later drive can continue from it. A PlanetScale branch before its
-// deploy request is one: the deploy request tears the branch down once it
-// exists, and until then the branch is kept only so a resume can finish
-// preparing it.
+// state so a later drive can continue from it. A PlanetScale branch is one:
+// its deploy request tears the branch down when its deploy finishes, and
+// until then the branch is kept only so a resume can finish preparing it or
+// the deploy can run from it.
 //
 // A driver consumes a cancel at its checkpoints, which run between engine
 // calls, so the drive that consumes it stands down without any engine call
@@ -399,9 +423,12 @@ func ReleaseCancelledArtifacts(ctx context.Context, eng Engine, req *ReleaseArti
 // The reclaim is stateless by design, like ReleaseCancelledArtifacts: it may
 // run on an instance that never drove the apply, so it takes the stored state
 // and the apply's options from the caller rather than from memory. Work the
-// service already owns the teardown of (a branch with a deploy request) is
-// left to the service; work SchemaBot did not create (an operator-supplied
-// branch) is left to its owner. Both are logged, not reclaimed.
+// service will still tear down (a branch whose deploy request is open or
+// deployed) is left to the service; work SchemaBot did not create (an
+// operator-supplied branch) is left to its owner. Work nothing will tear down
+// any more (a branch whose deploy request closed without deploying) is
+// reclaimed. Work the engine cannot prove is safe to remove is kept and
+// returned in the result, so the caller can tell an operator.
 type CancelledResumeStateReclaimer interface {
 	// ReclaimCancelledResumeState removes the work the stored resume state
 	// names when nothing else owns its teardown and SchemaBot created it, and

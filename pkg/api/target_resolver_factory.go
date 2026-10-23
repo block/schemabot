@@ -128,7 +128,8 @@ func buildEtreResolvers(ctx context.Context, etres []EtreConfig, logger *slog.Lo
 func logEtreResolver(logger *slog.Logger, cfg EtreConfig) {
 	logger.Info("gRPC server etre resolver configured",
 		"database_type", cfg.DatabaseType, "entity_type", cfg.EntityType,
-		"target_label", cfg.TargetLabel, "credentials", credentialType(cfg.Credentials))
+		"target_label", cfg.TargetLabel, "credentials", credentialType(cfg.Credentials),
+		"env_label", cfg.EnvLabel, "environment_mapping", cfg.EnvironmentMapping)
 }
 
 // buildEtreResolver assembles the Etre-backed resolver from config: the Etre
@@ -162,17 +163,18 @@ func buildEtreResolver(ctx context.Context, cfg EtreConfig, logger *slog.Logger)
 		return nil, fmt.Errorf("build etre client: %w", err)
 	}
 	return etre.NewEtreResolver(etre.EtreResolverConfig{
-		Client:          client,
-		TargetLabel:     cfg.TargetLabel,
-		Labels:          cfg.Labels,
-		EnvLabel:        cfg.EnvLabel,
-		HostField:       etreHostField(cfg),
-		AttributeFields: resolverAttributeFields(cfg),
-		Credentials:     creds,
-		Assembler:       assembler,
-		TableOwner:      etreTableOwner(cfg),
-		WriterProbe:     etreWriterProbe(cfg),
-		Logger:          logger,
+		Client:             client,
+		TargetLabel:        cfg.TargetLabel,
+		Labels:             cfg.Labels,
+		EnvLabel:           cfg.EnvLabel,
+		EnvironmentMapping: cfg.EnvironmentMapping,
+		HostField:          etreHostField(cfg),
+		AttributeFields:    resolverAttributeFields(cfg),
+		Credentials:        creds,
+		Assembler:          assembler,
+		TableOwner:         etreTableOwner(cfg),
+		WriterProbe:        etreWriterProbe(cfg),
+		Logger:             logger,
 	})
 }
 

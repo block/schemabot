@@ -215,6 +215,15 @@ type Service struct {
 	heldOperationClaimsMu       sync.Mutex
 	heldOperationClaims         map[int64]heldOperationClaim
 	heldOperationClaimsDraining bool
+	// resumeObservers records, per apply id, the GitHub comment of the stop
+	// summary this process last attached a progress comment observer to
+	// rotate, so later claims of the same resume here do not attach another.
+	// It narrows the durable signal, the stop's summary comment that stays
+	// unconsumed until an observer rotates it, to one attach per process per
+	// stop. Each stop posts its own summary comment, so a later stop of the
+	// same rollout never matches the entry an earlier resume left behind.
+	resumeObserversMu sync.Mutex
+	resumeObservers   map[int64]int64
 
 	remoteHealthMu       sync.Mutex
 	remoteHealthCancel   context.CancelFunc
@@ -250,6 +259,14 @@ type Service struct {
 	// it republishes from the apply's state in storage, so both claims show
 	// what storage records. It must not block: the drive waits on it.
 	OnStoppedApplyClaimed func(apply *storage.Apply)
+
+	// OnQueuedStartWithdrawn is called after a stop withdrew a start no driver
+	// had acted on, whatever surface sent the stop. The apply never left
+	// stopped, so no drive runs to update its PR, which would otherwise end on
+	// the start's acknowledgement. Set by the webhook handler to tell the PR
+	// the start was withdrawn. caller is the stop's caller. It must not block:
+	// the stop's response waits on it.
+	OnQueuedStartWithdrawn func(apply *storage.Apply, caller string)
 
 	// OnApplyTerminalSummary is called after an apply is terminalized by the
 	// aggregate projection CAS or by retryable expiry. Set by the webhook handler to publish the

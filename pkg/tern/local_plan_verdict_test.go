@@ -32,14 +32,16 @@ func TestBuildDispatchTasksCopiesAsymmetricVerdicts(t *testing.T) {
 	assert.Empty(t, tasks[1].ModeReason)
 }
 
-// Dispatched tasks carry the table's planned size so progress can show it
-// beside the row counts. A dispatch scoped to one shard creates tasks without
-// one, since the plan's figure covers every shard of the table.
-func TestBuildDispatchTasksCarryPlannedSize(t *testing.T) {
+// Dispatched tasks carry the table's planned size and row count so progress
+// can show them beside the row counts, and before the copy reports any. A
+// dispatch scoped to one shard creates tasks without them, since the plan's
+// figures cover every shard of the table.
+func TestBuildDispatchTasksCarryPlanEstimates(t *testing.T) {
 	plan := &storage.Plan{ID: 7, Database: "testdb", DatabaseType: storage.DatabaseTypeMySQL}
 	bytes := int64(23_400_000_000)
+	rows := int64(48_200_000)
 	changes := []storage.TableChange{
-		{Namespace: "testdb", Table: "orders", DDL: "ALTER TABLE orders ADD INDEX idx_created_at (created_at)", Operation: "alter", EstimatedBytes: &bytes},
+		{Namespace: "testdb", Table: "orders", DDL: "ALTER TABLE orders ADD INDEX idx_created_at (created_at)", Operation: "alter", EstimatedBytes: &bytes, EstimatedRows: &rows},
 		{Namespace: "testdb", Table: "users", DDL: "ALTER TABLE users ADD INDEX idx_email (email)", Operation: "alter"},
 	}
 
@@ -47,11 +49,15 @@ func TestBuildDispatchTasksCarryPlannedSize(t *testing.T) {
 	require.Len(t, tasks, 2)
 	require.NotNil(t, tasks[0].EstimatedBytes)
 	assert.Equal(t, bytes, *tasks[0].EstimatedBytes)
+	require.NotNil(t, tasks[0].EstimatedRows)
+	assert.Equal(t, rows, *tasks[0].EstimatedRows)
 	assert.Nil(t, tasks[1].EstimatedBytes)
+	assert.Nil(t, tasks[1].EstimatedRows)
 
 	shardTasks := buildDispatchTasks(plan, dispatchScope{ddlChanges: changes, shard: "-80"}, "production", storage.EngineSpirit, []byte("{}"), time.Now())
 	require.Len(t, shardTasks, 2)
 	assert.Nil(t, shardTasks[0].EstimatedBytes)
+	assert.Nil(t, shardTasks[0].EstimatedRows)
 }
 
 // A shard-scoped dispatch is built from task rows, so its changes arrive with

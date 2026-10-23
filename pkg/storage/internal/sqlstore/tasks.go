@@ -27,7 +27,7 @@ import (
 const taskColumns = `id, task_identifier, apply_id, apply_operation_id, plan_id, database_name, database_type,
 	namespace, table_name, shard, ddl, ddl_action,
 	engine, repository, pull_request, environment, state, error_message, options, attempt,
-	rows_copied, rows_total, estimated_bytes, progress_percent, eta_seconds, checksum_rows_checked, checksum_rows_total, throttled, throttle_reason, execution_mode, mode_reason, cutover_attempts,
+	rows_copied, rows_total, estimated_bytes, estimated_rows, progress_percent, eta_seconds, checksum_rows_checked, checksum_rows_total, throttled, throttle_reason, execution_mode, mode_reason, cutover_attempts,
 	is_instant, engine_migration_id,
 	started_at, completed_at, created_at, updated_at`
 
@@ -84,16 +84,16 @@ func insertTask(ctx context.Context, exec queryExecer, identity identityInserter
 			task_identifier, apply_id, apply_operation_id, plan_id, database_name, database_type,
 			namespace, table_name, shard, ddl, ddl_action,
 			engine, repository, pull_request, environment, state, error_message, options, attempt,
-			rows_copied, rows_total, estimated_bytes, progress_percent, eta_seconds, checksum_rows_checked, checksum_rows_total, throttled, throttle_reason, execution_mode, mode_reason, cutover_attempts,
+			rows_copied, rows_total, estimated_bytes, estimated_rows, progress_percent, eta_seconds, checksum_rows_checked, checksum_rows_total, throttled, throttle_reason, execution_mode, mode_reason, cutover_attempts,
 			is_instant, engine_migration_id,
 			started_at, completed_at, created_at, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
 		task.TaskIdentifier, task.ApplyID, nullInt64Ptr(task.ApplyOperationID), task.PlanID, task.Database, task.DatabaseType,
 		task.Namespace, nullString(task.TableName), task.Shard, nullString(task.DDL), nullString(task.DDLAction),
 		task.Engine, task.Repository, task.PullRequest, task.Environment,
 		task.State, nullString(task.ErrorMessage), string(options), task.Attempt,
-		task.RowsCopied, task.RowsTotal, nullInt64Ptr(task.EstimatedBytes), task.ProgressPercent, task.ETASeconds, task.ChecksumRowsChecked, task.ChecksumRowsTotal, task.Throttled, task.ThrottleReason, task.ExecutionMode, nullString(task.ModeReason), task.CutoverAttempts,
+		task.RowsCopied, task.RowsTotal, nullInt64Ptr(task.EstimatedBytes), nullInt64Ptr(task.EstimatedRows), task.ProgressPercent, task.ETASeconds, task.ChecksumRowsChecked, task.ChecksumRowsTotal, task.Throttled, task.ThrottleReason, task.ExecutionMode, nullString(task.ModeReason), task.CutoverAttempts,
 		task.IsInstant, nullString(task.EngineMigrationID),
 		task.StartedAt, task.CompletedAt, task.CreatedAt, task.UpdatedAt,
 	)
@@ -485,7 +485,7 @@ const shardTaskInsertColumns = `
 	task_identifier, apply_id, apply_operation_id, plan_id, database_name, database_type,
 	namespace, table_name, shard, ddl, ddl_action,
 	engine, repository, pull_request, environment, state, error_message, options, attempt,
-	rows_copied, rows_total, estimated_bytes, progress_percent, eta_seconds, checksum_rows_checked, checksum_rows_total, throttled, throttle_reason, execution_mode, mode_reason, cutover_attempts,
+	rows_copied, rows_total, estimated_bytes, estimated_rows, progress_percent, eta_seconds, checksum_rows_checked, checksum_rows_total, throttled, throttle_reason, execution_mode, mode_reason, cutover_attempts,
 	is_instant, engine_migration_id,
 	started_at, completed_at, created_at, updated_at`
 
@@ -499,13 +499,13 @@ func shardTaskInsertValues(task *storage.Task) (string, []any) {
 	if len(options) == 0 {
 		options = []byte("{}")
 	}
-	return `?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?`,
+	return `?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?`,
 		[]any{
 			task.TaskIdentifier, task.ApplyID, nullInt64Ptr(task.ApplyOperationID), task.PlanID, task.Database, task.DatabaseType,
 			task.Namespace, nullString(task.TableName), task.Shard, nullString(task.DDL), nullString(task.DDLAction),
 			task.Engine, task.Repository, task.PullRequest, task.Environment,
 			task.State, nullString(task.ErrorMessage), string(options), task.Attempt,
-			task.RowsCopied, task.RowsTotal, nullInt64Ptr(task.EstimatedBytes), task.ProgressPercent, task.ETASeconds, task.ChecksumRowsChecked, task.ChecksumRowsTotal, task.Throttled, task.ThrottleReason, task.ExecutionMode, nullString(task.ModeReason), task.CutoverAttempts,
+			task.RowsCopied, task.RowsTotal, nullInt64Ptr(task.EstimatedBytes), nullInt64Ptr(task.EstimatedRows), task.ProgressPercent, task.ETASeconds, task.ChecksumRowsChecked, task.ChecksumRowsTotal, task.Throttled, task.ThrottleReason, task.ExecutionMode, nullString(task.ModeReason), task.CutoverAttempts,
 			task.IsInstant, nullString(task.EngineMigrationID),
 			task.StartedAt, task.CompletedAt, task.CreatedAt, task.UpdatedAt,
 		}
@@ -1289,7 +1289,7 @@ func scanTaskInto(s scanner) (*storage.Task, error) {
 	var options []byte
 	var applyOperationID, etaSeconds sql.NullInt64
 	var startedAt, completedAt sql.NullTime
-	var estimatedBytes sql.NullInt64
+	var estimatedBytes, estimatedRows sql.NullInt64
 
 	err := s.Scan(
 		&task.ID,
@@ -1315,6 +1315,7 @@ func scanTaskInto(s scanner) (*storage.Task, error) {
 		&task.RowsCopied,
 		&task.RowsTotal,
 		&estimatedBytes,
+		&estimatedRows,
 		&task.ProgressPercent,
 		&etaSeconds,
 		&task.ChecksumRowsChecked,
@@ -1351,6 +1352,10 @@ func scanTaskInto(s scanner) (*storage.Task, error) {
 	if estimatedBytes.Valid {
 		v := estimatedBytes.Int64
 		task.EstimatedBytes = &v
+	}
+	if estimatedRows.Valid {
+		v := estimatedRows.Int64
+		task.EstimatedRows = &v
 	}
 	if startedAt.Valid {
 		task.StartedAt = &startedAt.Time

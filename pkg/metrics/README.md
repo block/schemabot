@@ -343,7 +343,7 @@ operation, counted on `schemabot.remote_apply_attach_total`:
 | Outcome | Meaning | Operator action |
 |---|---|---|
 | `attached` | A sibling dispatch added its operation and tasks to the deployment's shared keyed apply. | None — this is the normal fan-out event; its rate tracks sharded dispatch volume. |
-| `attach_race` | A concurrent same-operation attach lost the unique-index insert and was resolved to the winner's row. | None in isolation — the dispatch replayed the winner. A sustained rate means a caller is double-dispatching the same operation; the paired info log carries the apply and operation key. |
+| `attach_race` | A concurrent same-operation attach won, found either at the unique-index insert or after this dispatch's drift check failed, and the dispatch was resolved to the winner's row. | None in isolation — the dispatch replayed the winner. A sustained rate means a caller is double-dispatching the same operation; the paired info log carries the apply and operation key. |
 | `terminal_refused` | The shared apply was already terminal, so the attach was refused fail-closed. | Investigate: the deployment's remaining operations cannot join a finished apply. The caller must re-dispatch under a fresh generation; the paired warn log names the apply, its state, and the refused operation key. |
 
 On the control plane, `schemabot.remote_apply_key_echo_mismatch_total` counts

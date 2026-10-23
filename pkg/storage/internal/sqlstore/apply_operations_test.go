@@ -4194,6 +4194,80 @@ func TestApplyOperationStore_FindNextApplyOperationCutover_BlocksOnSiblingInReve
 	assert.Equal(t, "region-b", next.Deployment)
 }
 
+// TestApplyOperationStore_FindNextApplyOperationCutover_TakesParkedTargetsWhenReady
+// verifies that the parked targets of one deployment cut over in list order
+// without waiting for one another: an earlier target that is still cutting
+// over does not hold a later one, and only the per-apply cutover cap bounds
+// how many cut over at once.
+func TestApplyOperationStore_FindNextApplyOperationCutover_TakesParkedTargetsWhenReady(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql")
+	apply := createTestApply(t, store, lock, "apply_op_cutover_targets_ready", 1)
+
+	require.Equal(t, 2, storage.DefaultMaxDriversPerApply, "the scenario fills the cutover cap with shop-001 and shop-002")
+	targets := []string{"shop-001", "shop-002", "shop-003"}
+	ids := make([]int64, len(targets))
+	for i, target := range targets {
+		id, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+			ApplyID: apply.ID, Deployment: "shop", Target: target, OperationKey: target, State: state.ApplyOperation.WaitingForCutover,
+			CutoverPolicy: storage.CutoverPolicyBarrier,
+		})
+		require.NoError(t, err)
+		ids[i] = id
+	}
+
+	for i, target := range targets[:2] {
+		claimed, err := store.ApplyOperations().FindNextApplyOperationCutover(ctx, "cutover-operator")
+		require.NoError(t, err)
+		require.NotNil(t, claimed, "cutover %q is claimable while earlier targets are still cutting over", target)
+		assert.Equal(t, ids[i], claimed.ID)
+		assert.Equal(t, target, claimed.Target)
+	}
+
+	capped, err := store.ApplyOperations().FindNextApplyOperationCutover(ctx, "cutover-operator")
+	require.NoError(t, err)
+	assert.Nil(t, capped, "shop-003 waits while the apply is at its cutover cap")
+
+	require.NoError(t, store.ApplyOperations().MarkCompleted(ctx, ids[0]))
+	last, err := store.ApplyOperations().FindNextApplyOperationCutover(ctx, "cutover-operator")
+	require.NoError(t, err)
+	require.NotNil(t, last, "shop-003 cuts over once a cutover slot frees")
+	assert.Equal(t, "shop-003", last.Target)
+}
+
+// TestApplyOperationStore_FindNextApplyOperationCutover_TargetDoesNotWaitOnRevertWindow
+// verifies that an earlier target of the same deployment in its revert window
+// does not hold a later target's cutover. The window can stay open for a long
+// time, and the later target's copy is ready, so it cuts over without waiting
+// for the window to close.
+func TestApplyOperationStore_FindNextApplyOperationCutover_TargetDoesNotWaitOnRevertWindow(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql")
+	apply := createTestApply(t, store, lock, "apply_op_cutover_target_revert", 1)
+
+	_, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "shop", Target: "shop-001", OperationKey: "shop-001", State: state.ApplyOperation.RevertWindow,
+		CutoverPolicy: storage.CutoverPolicyBarrier,
+	})
+	require.NoError(t, err)
+	_, err = store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "shop", Target: "shop-002", OperationKey: "shop-002", State: state.ApplyOperation.WaitingForCutover,
+		CutoverPolicy: storage.CutoverPolicyBarrier,
+	})
+	require.NoError(t, err)
+
+	claimed, err := store.ApplyOperations().FindNextApplyOperationCutover(ctx, "cutover-operator")
+	require.NoError(t, err)
+	require.NotNil(t, claimed, "shop-002 cuts over while shop-001 is in its revert window")
+	assert.Equal(t, "shop-002", claimed.Target)
+}
+
 // TestApplyOperationStore_FindNextApplyOperationCutover_HaltsOnFailedSibling
 // verifies the default fail-closed behaviour: a terminal-failed earlier sibling
 // blocks a later cutover.
@@ -5608,16 +5682,17 @@ func TestApplyOperationClaimOrderingIsIndexed(t *testing.T) {
 }
 
 // ListRecentTargets bounds a data plane's view of the targets it applied to by
-// the age of the apply: a target whose only applies are older than the lookback
-// drops out, while one with any apply inside the window stays, however old its
-// other applies are.
+// when each apply was last written: a target whose applies were all last
+// written before the lookback drops out, while one with any apply written
+// inside the window stays, however old its other applies are, and so does one
+// whose only apply was created before the window but settled inside it.
 func TestApplyOperationStore_ListRecentTargetsWindow(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
 	store := NewMySQL(testDB)
 
 	lock := createTestLock(t, store, "orders", storage.DatabaseTypeVitess)
-	seed := func(t *testing.T, applyID string, planID int64, target string, age time.Duration) {
+	seed := func(t *testing.T, applyID string, planID int64, target string, created, updated time.Duration) {
 		t.Helper()
 		apply := createTestApplyWithStateAndEnv(t, store, lock, applyID, planID, state.Apply.Completed, "staging")
 		_, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
@@ -5625,17 +5700,23 @@ func TestApplyOperationStore_ListRecentTargetsWindow(t *testing.T) {
 		})
 		require.NoError(t, err)
 		_, err = testDB.ExecContext(ctx,
-			fmt.Sprintf(`UPDATE applies SET created_at = NOW() - INTERVAL %d SECOND WHERE id = ?`, int(age.Seconds())),
+			fmt.Sprintf(`UPDATE applies SET created_at = NOW() - INTERVAL %d SECOND, updated_at = NOW() - INTERVAL %d SECOND WHERE id = ?`,
+				int(created.Seconds()), int(updated.Seconds())),
 			apply.ID)
 		require.NoError(t, err)
 	}
-	seed(t, "apply_stale_only", 9101, "orders-stale", 40*24*time.Hour)
-	seed(t, "apply_recent_old", 9102, "orders-recent", 40*24*time.Hour)
-	seed(t, "apply_recent_new", 9103, "orders-recent", 2*24*time.Hour)
+	day := 24 * time.Hour
+	seed(t, "apply_stale_only", 9101, "orders-stale", 40*day, 40*day)
+	seed(t, "apply_recent_old", 9102, "orders-recent", 40*day, 40*day)
+	seed(t, "apply_recent_new", 9103, "orders-recent", 2*day, 2*day)
+	// Created before the window but settled inside it: a branch its drive
+	// failed to delete at settlement must stay reachable for the window.
+	seed(t, "apply_settled_late", 9104, "orders-settled-late", 40*day, 1*day)
 
 	targets, err := store.ApplyOperations().ListRecentTargets(ctx, storage.DatabaseTypeVitess, 30*24*time.Hour)
 	require.NoError(t, err)
 	assert.Equal(t, []storage.AppliedTarget{
 		{Database: "orders", Environment: "staging", Target: "orders-recent"},
+		{Database: "orders", Environment: "staging", Target: "orders-settled-late"},
 	}, targets)
 }

@@ -1,9 +1,12 @@
 package api
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"log/slog"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -116,6 +119,67 @@ func TestRunBranchReconcilePassReconcilesEveryTargetOnTheElectedInstance(t *test
 	assert.Equal(t, []tern.BranchReconcileOptions{{Grace: 36 * time.Hour, Delete: true, Now: now, Environment: "staging"}}, healthy.calls,
 		"a failed database does not stop the pass")
 	assert.Equal(t, []string{"branch_reconcile_error"}, claimFailureReasons(t, reader))
+}
+
+// resolvingTernClient is a data plane's default client that resolves targets
+// per request; it records each reconcile of its recently applied targets.
+type resolvingTernClient struct {
+	mockTernClient
+	result tern.RecentTargetsReconcileResult
+	err    error
+	calls  []tern.BranchReconcileOptions
+}
+
+func (c *resolvingTernClient) ReconcileRecentTargetBranches(_ context.Context, opts tern.BranchReconcileOptions) (tern.RecentTargetsReconcileResult, error) {
+	c.calls = append(c.calls, opts)
+	return c.result, c.err
+}
+
+// A data plane with no local PlanetScale databases still runs the pass when its
+// default client resolves targets per request: the elected instance hands that
+// client the configured grace and delete mode and the service clock's time,
+// and a failure on it is the pass's outcome.
+func TestRunBranchReconcilePassReconcilesRecentlyAppliedTargetsOnADataPlane(t *testing.T) {
+	reader := reaperMetricReader(t)
+	onlyMySQL := map[string]DatabaseConfig{"payments": branchReconcileDatabases()["payments"]}
+	applies := &electingApplyStore{}
+	svc := newBranchReconcileService(t, BranchReconcileConfig{Enabled: true, Delete: true}, onlyMySQL, applies)
+	now := time.Date(2026, 10, 14, 12, 0, 0, 0, time.UTC)
+	require.NoError(t, svc.SetClock(clock.NewFake(now)))
+	router := &resolvingTernClient{result: tern.RecentTargetsReconcileResult{Targets: 2, Deleted: 1}, err: errors.New("target not in the inventory")}
+	svc.SetDefaultTernClient(router)
+
+	svc.runBranchReconcilePass(t.Context(), 36*time.Hour, true)
+
+	assert.Equal(t, 1, applies.elections)
+	assert.Equal(t, []tern.BranchReconcileOptions{{Grace: 36 * time.Hour, Delete: true, Now: now}}, router.calls)
+	assert.Equal(t, []string{"branch_reconcile_error"}, claimFailureReasons(t, reader))
+}
+
+// A pass that reconciles every target reports how many branches it deleted in
+// total, across the local PlanetScale environments and the targets the data
+// plane recently applied to, and records no failure.
+func TestRunBranchReconcilePassReportsTheBranchesItDeletedAcrossEveryTarget(t *testing.T) {
+	reader := reaperMetricReader(t)
+	svc := newBranchReconcileService(t, BranchReconcileConfig{Enabled: true, Delete: true}, branchReconcileDatabases(), &electingApplyStore{})
+	var logs bytes.Buffer
+	svc.logger = slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	svc.ternClients["orders/staging"] = &reconcilingTernClient{result: tern.BranchReconcileResult{Database: "orders", Candidates: 1, Orphaned: 1, Deleted: 1}}
+	svc.SetDefaultTernClient(&resolvingTernClient{result: tern.RecentTargetsReconcileResult{Targets: 3, Deleted: 2, Unreachable: 1}})
+
+	svc.runBranchReconcilePass(t.Context(), 36*time.Hour, true)
+
+	var complete []map[string]any
+	for line := range strings.SplitSeq(strings.TrimSpace(logs.String()), "\n") {
+		var entry map[string]any
+		require.NoError(t, json.Unmarshal([]byte(line), &entry), "log line must be JSON: %s", line)
+		if entry["msg"] == "branch reconcile pass complete" {
+			complete = append(complete, entry)
+		}
+	}
+	require.Len(t, complete, 1, "a pass with no failures logs that it completed; got: %s", logs.String())
+	assert.InDelta(t, 3, complete[0]["deleted"], 0, "one local deletion plus two on recently applied targets")
+	assert.Empty(t, claimFailureReasons(t, reader), "a target the data plane can no longer reach is not a failure")
 }
 
 // Losing the election is the expected outcome on every instance but one, so the

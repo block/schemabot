@@ -61,21 +61,12 @@ for port in "${LOCAL_PORTS[@]}"; do
     fi
 done
 
-echo "Building schemabot + etre images for minikube..."
-CGO_ENABLED=0 GOOS=linux go build -o "$REPO_ROOT/bin/schemabot-linux" ./pkg/cmd
-cp "$REPO_ROOT/bin/schemabot-linux" "$REPO_ROOT/deploy/local/schemabot-dev"
-# The tag names the binary, so a re-run into a kept namespace rolls the pods
-# whenever the code changed instead of leaving them on the previous build.
-IMAGE_TAG="test-$(shasum -a 256 "$REPO_ROOT/bin/schemabot-linux" | cut -c1-12)"
-eval "$(minikube docker-env)"
-docker build -t "schemabot:$IMAGE_TAG" -f "$REPO_ROOT/deploy/local/Dockerfile.dev" "$REPO_ROOT/deploy/local/"
-rm -f "$REPO_ROOT/deploy/local/schemabot-dev"
-docker build -t etre:test "$REPO_ROOT/e2e/k8s/etre/"
-
+# PIDS holds every background process the script starts, the port-forwards and
+# the background compiles alike, so an early exit stops them all.
 PIDS=()
 cleanup() {
     rm -f "$PINNED_KUBECONFIG"
-    echo "Cleaning up port-forwards..."
+    echo "Cleaning up background processes..."
     for pid in ${PIDS[@]+"${PIDS[@]}"}; do
         kill "$pid" 2>/dev/null || true
     done
@@ -112,9 +103,24 @@ wait_for_ready_pods() {
 echo "Creating namespace..."
 kubectl create namespace "$NAMESPACE" 2>/dev/null || true
 
-echo "Deploying MySQL + shards + Etre + MongoDB + ministack..."
+# The MySQL servers use stock images, so they start before the build and come
+# up while the images below compile.
+echo "Deploying MySQL + shards..."
 kubectl apply -n "$NAMESPACE" -f "$REPO_ROOT/e2e/k8s/mysql.yaml"
 kubectl apply -n "$NAMESPACE" -f "$REPO_ROOT/e2e/k8s/multi-target/mysql-shards.yaml"
+
+# The schemabot binary compiles in the background while the etre image builds,
+# since the two do not depend on each other.
+echo "Building schemabot + etre images for minikube..."
+eval "$(minikube docker-env)"
+CGO_ENABLED=0 GOOS=linux go build -o "$REPO_ROOT/bin/schemabot-linux" ./pkg/cmd &
+SCHEMABOT_BUILD_PID=$!
+PIDS+=("$SCHEMABOT_BUILD_PID")
+docker build -t etre:test "$REPO_ROOT/e2e/k8s/etre/"
+
+# The etre deployment never pulls its image, so the stack is applied only once
+# the image is in minikube's daemon.
+echo "Deploying Etre + MongoDB + ministack..."
 # Build the entity fixtures ConfigMap from this suite's shard entities so the
 # seed Jobs load exactly what is checked in under e2e/k8s/multi-target/fixtures.
 kubectl create configmap etre-fixtures \
@@ -125,6 +131,28 @@ kubectl create configmap etre-fixtures \
 # deterministically.
 kubectl delete job etre-mongo-init etre-seed ministack-seed -n "$NAMESPACE" --ignore-not-found
 kubectl apply -n "$NAMESPACE" -f "$REPO_ROOT/e2e/k8s/etre-stack.yaml"
+
+# The namespace was created before the build so MySQL could start early, so a
+# failed build tears it down rather than leaving its pods behind.
+if ! wait "$SCHEMABOT_BUILD_PID"; then
+    echo "Error: building the schemabot binary failed"
+    teardown_namespace
+    exit 1
+fi
+cp "$REPO_ROOT/bin/schemabot-linux" "$REPO_ROOT/deploy/local/schemabot-dev"
+# The tag names the binary, so a re-run into a kept namespace rolls the pods
+# whenever the code changed instead of leaving them on the previous build.
+IMAGE_TAG="test-$(shasum -a 256 "$REPO_ROOT/bin/schemabot-linux" | cut -c1-12)"
+docker build -t "schemabot:$IMAGE_TAG" -f "$REPO_ROOT/deploy/local/Dockerfile.dev" "$REPO_ROOT/deploy/local/"
+rm -f "$REPO_ROOT/deploy/local/schemabot-dev"
+
+# The test binary compiles while the stack comes up, so go test below only
+# links it. A failure here is reported by that go test, with the compiler's
+# own output.
+go test -tags=e2e -c -o /dev/null ./e2e/k8s &
+TEST_COMPILE_PID=$!
+PIDS+=("$TEST_COMPILE_PID")
+
 wait_for_ready_pods "app=mysql-control-plane"
 wait_for_ready_pods "app=mysql-data-plane"
 for shard in "${SHARDS[@]}"; do
@@ -183,6 +211,10 @@ for i in $(seq 1 30); do
 done
 
 # --- Test ---
+
+if ! wait "$TEST_COMPILE_PID"; then
+    echo "Compiling the e2e test binary failed; go test below reports the errors"
+fi
 
 echo "Running multi-target k8s e2e..."
 TEST_EXIT_CODE=0

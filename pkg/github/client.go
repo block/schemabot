@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/block/schemabot/pkg/metrics"
+	"github.com/block/schemabot/pkg/schema"
 	"github.com/bradleyfalzon/ghinstallation/v2"
 	"github.com/gofri/go-github-ratelimit/v2/github_ratelimit"
 	"github.com/gofri/go-github-ratelimit/v2/github_ratelimit/github_secondary_ratelimit"
@@ -319,7 +320,7 @@ func (c *Client) InstallationIDForRepo(ctx context.Context, repo string) (int64,
 
 	installation, _, err := appClient.Apps.FindRepositoryInstallation(ctx, owner, name)
 	if err != nil {
-		return 0, fmt.Errorf("find installation for %s: %w", repo, err)
+		return 0, findInstallationError(repo, err)
 	}
 	id := installation.GetID()
 	if id == 0 {
@@ -331,6 +332,25 @@ func (c *Client) InstallationIDForRepo(ctx context.Context, repo string) (int64,
 	c.repoInstallationsMu.Unlock()
 	c.logger.Info("resolved GitHub App installation for repo", "repo", repo, "installation_id", id)
 	return id, nil
+}
+
+// ErrAppNotInstalled reports that GitHub has no installation of this App
+// covering the repository: GET /repos/{owner}/{repo}/installation answered
+// 404. GitHub gives the same answer when the repository does not exist, since
+// an App cannot see a repository it is not installed on. Either way the App can
+// neither read nor publish the repository's Check Runs until it is installed.
+var ErrAppNotInstalled = errors.New("GitHub App is not installed on the repository")
+
+// findInstallationError wraps a failed installation lookup for repo. Only a 404
+// from the lookup itself carries ErrAppNotInstalled; every other failure (5xx,
+// rate limit, auth, transport) stays a plain error, because the App's coverage
+// of the repository is then unknown rather than known to be absent.
+func findInstallationError(repo string, err error) error {
+	var errResp *gh.ErrorResponse
+	if errors.As(err, &errResp) && errResp.Response != nil && errResp.Response.StatusCode == http.StatusNotFound {
+		return fmt.Errorf("find installation for %s: %w: %w", repo, ErrAppNotInstalled, err)
+	}
+	return fmt.Errorf("find installation for %s: %w", repo, err)
 }
 
 // NewInstallationClient creates an InstallationClient from a pre-configured go-github client.
@@ -1406,6 +1426,11 @@ func (c *schemaChangeComparer) sameStatements(ctx context.Context, item schemaCh
 	}
 	var contents [4]string
 	for i, side := range item.sides {
+		// A base the file is absent from is passed as "", which the dialect
+		// reads as a file the pull request adds.
+		if !side.found {
+			continue
+		}
 		text, ok := c.blobText[side.entry.SHA]
 		if !ok {
 			var err error
@@ -1440,19 +1465,30 @@ func (c *schemaChangeComparer) sameStatements(ctx context.Context, item schemaCh
 	return true, nil
 }
 
-// statementComparable reports whether item is a .sql file that is a regular
-// file at all four commits, so its content at each one is a schema file the
-// dialect can parse.
+// statementComparable reports whether item is a .sql file whose content at
+// each commit is a schema file the dialect can parse: a regular file at all
+// four commits, or a file the pull request adds, absent at both bases and a
+// regular file at the approved commit and the head.
 func statementComparable(item schemaChangeItem) bool {
 	if path.Ext(item.path) != ".sql" {
 		return false
 	}
-	for _, side := range item.sides {
-		if !side.found || side.entry.Type != "blob" || side.entry.Mode == gitSymlinkMode {
+	added := !item.sides[sideApprovedBase].found && !item.sides[sideHeadBase].found
+	for i, side := range item.sides {
+		if added && (i == sideApprovedBase || i == sideHeadBase) {
+			continue
+		}
+		if !regularFile(side) {
 			return false
 		}
 	}
 	return true
+}
+
+// regularFile reports whether side is a regular file, not a directory, a
+// symlink, or absent.
+func regularFile(side gitSide) bool {
+	return side.found && side.entry.Type == "blob" && side.entry.Mode != gitSymlinkMode
 }
 
 // pathUnchanged reports whether the pull request's change to a path is the
@@ -1752,12 +1788,16 @@ func pathInsideAny(p string, dirs []string) bool {
 // A file is kept when its object at headSHA differs from the object at the
 // default branch tip, which is what "this pull request proposes it" means: if
 // the content already matches what the default branch declares, merging changes
-// nothing for that file. The default branch is the right yardstick because it
+// nothing for that file. A rename is also kept when it vacates a schema path the
+// default branch still holds, since merging it stops declaring that file's
+// tables. The default branch is the right yardstick because it
 // is the one SchemaBot already privileges — the post-merge reconcile runs for
 // it alone, and a registered repository cannot be pointed at another ref.
 //
-// The result is always a subset of files, so this can only ever narrow
-// discovery: it cannot surface a database that was not already discovered.
+// Every kept file is one of files, unchanged except that a rename the default
+// branch already holds has its PreviousFilename cleared, so this can only ever
+// narrow discovery: it cannot surface a database that was not already
+// discovered.
 // Only the files discovery keys on are compared, so a pull request that touches
 // no schema costs no API calls.
 func (ic *InstallationClient) PRFilesProposedAgainstDefaultBranch(ctx context.Context, repo, headSHA string, files []PRFile) (proposed []PRFile, defaultTipSHA string, err error) {
@@ -1794,28 +1834,78 @@ func (ic *InstallationClient) PRFilesProposedAgainstDefaultBranch(ctx context.Co
 	levelCache := make(map[string][]TreeEntry)
 	proposed = make([]PRFile, 0, len(files))
 	for _, file := range files {
-		if !isDiscoveryInputFile(file.Filename) {
+		if !isDiscoveryInputPRFile(file) {
 			proposed = append(proposed, file)
 			continue
 		}
-		headObjectSHA, headObjectType, headFound, err := ic.resolveGitObjectSHA(ctx, repo, headSHA, file.Filename, levelCache)
-		if err != nil {
-			return nil, defaultTipSHA, fmt.Errorf("resolve %s at head %s: %w", file.Filename, headSHA, err)
+		// The current path and the vacated path are separate claims, so each
+		// is measured on its own: a pull request can edit the destination of a
+		// rename the default branch already holds without proposing the
+		// removal again.
+		keep := false
+		if isDiscoveryInputFile(file.Filename) {
+			differs, err := ic.pathDiffersFromDefaultBranch(ctx, repo, headSHA, defaultTipSHA, file.Filename, levelCache)
+			if err != nil {
+				return nil, defaultTipSHA, err
+			}
+			keep = differs
 		}
-		defaultObjectSHA, defaultObjectType, defaultFound, err := ic.resolveGitObjectSHA(ctx, repo, defaultTipSHA, file.Filename, levelCache)
-		if err != nil {
-			return nil, defaultTipSHA, fmt.Errorf("resolve %s at default branch tip %s: %w", file.Filename, defaultTipSHA, err)
+		// A rename proposes vacating its previous schema path only when the
+		// head lacks that path and the default branch still declares it; a
+		// rename the default branch already holds is inherited history, so
+		// its previous path is cleared and discovery does not resolve the
+		// config that managed it.
+		if vacated, ok := renamedAwaySchemaPath(file); ok {
+			removes, err := ic.pathRemovedFromDefaultBranch(ctx, repo, headSHA, defaultTipSHA, vacated, levelCache)
+			if err != nil {
+				return nil, defaultTipSHA, err
+			}
+			if removes {
+				keep = true
+			} else {
+				file.PreviousFilename = ""
+			}
 		}
-
-		switch {
-		case headFound != defaultFound:
-			// Added by this pull request, or deleted by it.
-			proposed = append(proposed, file)
-		case headFound && (headObjectSHA != defaultObjectSHA || headObjectType != defaultObjectType):
+		if keep {
 			proposed = append(proposed, file)
 		}
 	}
 	return proposed, defaultTipSHA, nil
+}
+
+// pathDiffersFromDefaultBranch reports whether objectPath at headSHA differs
+// from the default branch tip: added, deleted, or changed in content or type.
+func (ic *InstallationClient) pathDiffersFromDefaultBranch(ctx context.Context, repo, headSHA, defaultTipSHA, objectPath string, levelCache map[string][]TreeEntry) (bool, error) {
+	headObjectSHA, headObjectType, headFound, err := ic.resolveGitObjectSHA(ctx, repo, headSHA, objectPath, levelCache)
+	if err != nil {
+		return false, fmt.Errorf("resolve %s at head %s: %w", objectPath, headSHA, err)
+	}
+	defaultObjectSHA, defaultObjectType, defaultFound, err := ic.resolveGitObjectSHA(ctx, repo, defaultTipSHA, objectPath, levelCache)
+	if err != nil {
+		return false, fmt.Errorf("resolve %s at default branch tip %s: %w", objectPath, defaultTipSHA, err)
+	}
+	if headFound != defaultFound {
+		// Added by this pull request, or deleted by it.
+		return true, nil
+	}
+	return headFound && (headObjectSHA != defaultObjectSHA || headObjectType != defaultObjectType), nil
+}
+
+// pathRemovedFromDefaultBranch reports whether merging headSHA removes
+// objectPath: the default branch tip holds it and the head does not.
+func (ic *InstallationClient) pathRemovedFromDefaultBranch(ctx context.Context, repo, headSHA, defaultTipSHA, objectPath string, levelCache map[string][]TreeEntry) (bool, error) {
+	_, _, headFound, err := ic.resolveGitObjectSHA(ctx, repo, headSHA, objectPath, levelCache)
+	if err != nil {
+		return false, fmt.Errorf("resolve vacated %s at head %s: %w", objectPath, headSHA, err)
+	}
+	if headFound {
+		return false, nil
+	}
+	_, _, defaultFound, err := ic.resolveGitObjectSHA(ctx, repo, defaultTipSHA, objectPath, levelCache)
+	if err != nil {
+		return false, fmt.Errorf("resolve vacated %s at default branch tip %s: %w", objectPath, defaultTipSHA, err)
+	}
+	return defaultFound, nil
 }
 
 // CheckRunOptions contains options for creating or updating a GitHub Check Run.
@@ -2913,7 +3003,7 @@ func (ic *InstallationClient) symlinkedNamespaceLocators(ctx context.Context, re
 		return nil, fmt.Errorf("schema namespace symlink %s points to absolute path %s", entry.GetPath(), target)
 	}
 	resolved := path.Clean(path.Join(schemaPath, target))
-	if !schemaPathWithinDirectory(".", resolved) {
+	if !schema.PathWithinDirectory(".", resolved) {
 		return nil, fmt.Errorf("schema namespace symlink %s points outside the repository: %s", entry.GetPath(), target)
 	}
 	if resolved == "." || resolved == path.Clean(schemaPath) || resolved == path.Clean(entry.GetPath()) {

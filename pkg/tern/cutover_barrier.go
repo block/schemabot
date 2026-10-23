@@ -103,7 +103,7 @@ func (s applyTaskScope) takesCutoverRequestInOrder() bool {
 // that operation while it can still cut over, and settled once it has ended,
 // so one command never cuts over a second member. Otherwise this operation's
 // own tasks must be parked at the cutover (a sibling being parked does not make
-// this member ready), and no earlier sibling may still hold its turn (storage
+// this member ready), and no earlier sibling may hold it (storage
 // CutoverBlocker, the same rule the automatic cutover claim follows).
 func operationCutoverRequestTurn(ctx context.Context, store storage.Storage, apply *storage.Apply, scope applyTaskScope, controlReq *storage.ApplyControlRequest) (cutoverRequestTurn, error) {
 	if store == nil {
@@ -134,15 +134,11 @@ func operationCutoverRequestTurn(ctx context.Context, store storage.Storage, app
 			return cutoverRequestTurn{reason: "the request is bound to another member", blocker: bound}, nil
 		}
 	}
-	taskStore := store.Tasks()
-	if taskStore == nil {
-		return cutoverRequestTurn{}, fmt.Errorf("task store is not available")
-	}
-	tasks, err := taskStore.GetByApplyOperationID(ctx, scope.applyOperationID)
+	parked, err := operationParkedAtCutover(ctx, store, apply, scope)
 	if err != nil {
-		return cutoverRequestTurn{}, fmt.Errorf("load tasks for apply_operation %d of apply %s before cutover request: %w", scope.applyOperationID, apply.ApplyIdentifier, err)
+		return cutoverRequestTurn{}, err
 	}
-	if !tasksParkedAtCutover(tasks) {
+	if !parked {
 		return cutoverRequestTurn{reason: "this member has not reached cutover"}, nil
 	}
 	blocker, err := opStore.CutoverBlocker(ctx, scope.applyOperationID)
@@ -150,9 +146,26 @@ func operationCutoverRequestTurn(ctx context.Context, store storage.Storage, app
 		return cutoverRequestTurn{}, fmt.Errorf("check cutover order for apply_operation %d of apply %s: %w", scope.applyOperationID, apply.ApplyIdentifier, err)
 	}
 	if blocker != nil {
-		return cutoverRequestTurn{reason: "an earlier member has not completed its cutover", blocker: blocker}, nil
+		return cutoverRequestTurn{reason: "an earlier member holds the cutover", blocker: blocker}, nil
 	}
 	return cutoverRequestTurn{ready: true}, nil
+}
+
+// operationParkedAtCutover reports whether this drive's own operation has a
+// task parked at, or already in, its cutover.
+func operationParkedAtCutover(ctx context.Context, store storage.Storage, apply *storage.Apply, scope applyTaskScope) (bool, error) {
+	if store == nil {
+		return false, fmt.Errorf("storage is not available")
+	}
+	taskStore := store.Tasks()
+	if taskStore == nil {
+		return false, fmt.Errorf("task store is not available")
+	}
+	tasks, err := taskStore.GetByApplyOperationID(ctx, scope.applyOperationID)
+	if err != nil {
+		return false, fmt.Errorf("load tasks for apply_operation %d of apply %s before cutover request: %w", scope.applyOperationID, apply.ApplyIdentifier, err)
+	}
+	return tasksParkedAtCutover(tasks), nil
 }
 
 // tasksParkedAtCutover reports whether any of an operation's tasks is parked
