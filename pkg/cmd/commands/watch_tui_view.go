@@ -69,13 +69,8 @@ func (m WatchModel) progressSections() (string, string) {
 	// Status line with spinner for active states
 	// Note: spinner.Dot already includes trailing space
 	switch {
-	case m.stopTriggered && !state.IsState(m.state, state.Apply.Stopped, state.Apply.Cancelled):
-		// Stop/cancel has been triggered but state hasn't updated yet
-		if m.isPlanetScale() {
-			b.WriteString(m.spinner.View() + "Cancelling...\n")
-		} else {
-			b.WriteString(m.spinner.View() + "Stopping...\n")
-		}
+	case m.stopAwaitingConfirmation():
+		b.WriteString(m.spinner.View() + m.stopPendingLabel() + "\n")
 	case effectivelyStopped:
 		// Don't show status line - stopped message comes after tables
 	case state.IsState(m.state, state.Apply.Running) && !m.cutoverTriggered && !m.deployTriggered:
@@ -342,6 +337,21 @@ func (m WatchModel) formatFooter() string {
 }
 
 // isPlanetScale returns true if the current apply is using the PlanetScale engine.
+// stopAwaitingConfirmation reports whether the operator pressed s and the
+// server has not yet reported the apply stopped or cancelled.
+func (m WatchModel) stopAwaitingConfirmation() bool {
+	return m.stopTriggered && !state.IsState(m.state, state.Apply.Stopped, state.Apply.Cancelled)
+}
+
+// stopPendingLabel names what the s key requested: PlanetScale cancels the
+// deploy request, every other engine stops the copy at its checkpoint.
+func (m WatchModel) stopPendingLabel() string {
+	if m.isPlanetScale() {
+		return "Cancelling..."
+	}
+	return "Stopping..."
+}
+
 func (m WatchModel) isPlanetScale() bool {
 	return strings.EqualFold(m.engine, "PlanetScale") || strings.EqualFold(m.engine, "planetscale")
 }

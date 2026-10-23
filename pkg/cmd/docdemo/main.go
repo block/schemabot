@@ -45,6 +45,7 @@ type Frame struct {
 }
 type Demo struct {
 	Height int     `json:"height,omitempty"`
+	Bar    string  `json:"bar,omitempty"`
 	Name   string  `json:"name"`
 	Title  string  `json:"title"`
 	Frames []Frame `json:"frames"`
@@ -456,6 +457,451 @@ func busyFleet(now time.Time) []string {
 	return strings.Split(strings.TrimRight(output, "\n"), "\n")
 }
 
+// The multi-target scenarios apply one index to a production environment whose
+// deployment lists four targets. The apply command runs against a loopback
+// fixture that answers as the server does for a targets list: a plan of every
+// member, or a plan narrowed to one, and one operation per target.
+const (
+	rolloutDeployment = "prod"
+	rolloutApplyID    = "apply-example-91"
+	narrowedApplyID   = "apply-example-92"
+)
+
+var rolloutTargets = []string{"shop-001", "shop-002", "shop-003", "shop-004"}
+
+// rolloutRows is each target's own table size; the targets hold different
+// data, so their copies finish at different times.
+var rolloutRows = map[string]int64{"shop-001": 6_000_000, "shop-002": 9_000_000, "shop-003": 7_500_000, "shop-004": 4_500_000}
+
+func rolloutMember(target string) string { return rolloutDeployment + "/" + target }
+
+func rolloutPlan(target string) apitypes.PlanResponse {
+	changes := []*apitypes.SchemaChangeResponse{{Namespace: "shop", TableChanges: []*apitypes.TableChangeResponse{{TableName: "orders", ChangeType: "alter", DDL: ddl}}}}
+	plan := apitypes.PlanResponse{PlanID: "plan-example-rollout", Database: "shop", DatabaseType: "mysql", Environment: "production", Engine: "Spirit",
+		Deployment: rolloutDeployment, Target: rolloutTargets[0], Changes: changes}
+	if target != "" {
+		plan.PlanID = "plan-example-" + target
+		plan.Target = target
+		plan.NarrowedTo = rolloutMember(target)
+		return plan
+	}
+	members := make([]string, 0, len(rolloutTargets))
+	for _, target := range rolloutTargets {
+		members = append(members, rolloutMember(target))
+	}
+	rollout := &apitypes.PlanRolloutResponse{Members: len(members), Independent: true, MultiTarget: true,
+		Groups: []*apitypes.PlanMemberGroupResponse{{Members: members, Primary: true, Changes: changes}}}
+	for _, target := range rolloutTargets {
+		bytes := rolloutRows[target] * 500
+		rollout.TableSizes = append(rollout.TableSizes, &apitypes.PlanMemberTableSizeResponse{Member: rolloutMember(target), Namespace: "shop", Table: "orders", EstimatedBytes: &bytes})
+	}
+	plan.Rollout = rollout
+	return plan
+}
+
+// cuttingOver marks a target whose copy has finished and is swapping tables.
+const cuttingOver = -1
+
+// rolloutProgress is the apply's progress with each listed target at its own
+// percentage. A target at 100 has cut over and completed; the apply completes
+// once every target has.
+func rolloutProgress(applyID string, targets []string, percents []int) apitypes.ProgressResponse {
+	response := apitypes.ProgressResponse{ApplyID: applyID, Database: "shop", DatabaseType: "mysql", Environment: "production", Engine: "Spirit", State: state.Apply.Completed}
+	for i, target := range targets {
+		p := percents[i]
+		opState, taskState := state.Apply.Running, state.Task.Running
+		switch {
+		case p == cuttingOver:
+			p = 100
+			opState, taskState = state.Apply.CuttingOver, state.Task.CuttingOver
+			response.State = state.Apply.Running
+		case p >= 100:
+			opState, taskState = state.Apply.Completed, state.Task.Completed
+		default:
+			response.State = state.Apply.Running
+		}
+		total := rolloutRows[target]
+		var eta int64
+		if p < 100 {
+			eta = int64(100-p) * total / 1_000_000 / 2
+		}
+		response.Operations = append(response.Operations, &apitypes.ProgressOperationResponse{Deployment: rolloutDeployment, Target: target, State: opState, CutoverPolicy: "parallel"})
+		response.Tables = append(response.Tables, &apitypes.TableProgressResponse{TableName: "orders", DDL: ddl, Deployment: rolloutDeployment, Target: target, Keyspace: "shop", ChangeType: "alter",
+			Status: taskState, RowsCopied: total * int64(p) / 100, RowsTotal: total, PercentComplete: int32(p), ETASeconds: eta})
+	}
+	return response
+}
+
+// runningTargets lists the targets of a rollout whose work has not finished.
+func runningTargets(response apitypes.ProgressResponse) []string {
+	var running []string
+	for _, table := range response.Tables {
+		if !state.IsState(table.Status, state.Task.Completed) {
+			running = append(running, table.Target)
+		}
+	}
+	return running
+}
+
+// rolloutStopped is the rollout once a stop has reached it: every target that
+// was still copying stopped at its own checkpoint, and a target that had
+// finished stays finished.
+func rolloutStopped(percents []int) apitypes.ProgressResponse {
+	response := rolloutProgress(rolloutApplyID, rolloutTargets, percents)
+	response.State = state.Apply.Stopped
+	for i, op := range response.Operations {
+		if state.IsState(op.State, state.Apply.Completed) {
+			continue
+		}
+		op.State = state.Apply.Stopped
+		response.Tables[i].Status = state.Task.Stopped
+		response.Tables[i].ETASeconds = 0
+	}
+	return response
+}
+
+// rolloutStart runs the real start command against a loopback fixture holding
+// the stopped rollout. The fixture checks the start request and scripts the
+// watcher start opens through polls to completion. It returns what start
+// printed before the watcher took over.
+func rolloutStart(stoppedAt []int) string {
+	stopped := rolloutStopped(stoppedAt)
+	resumed := len(runningTargets(stopped))
+	polls := [][]int{{60, 45, 52, 100}, {100, 100, 100, 100}}
+	var requests []string
+	var fixtureMu sync.Mutex
+	poll := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fixtureMu.Lock()
+		defer fixtureMu.Unlock()
+		requests = append(requests, r.Method+" "+r.URL.Path)
+		w.Header().Set("Content-Type", "application/json")
+		var response any
+		switch r.Method + " " + r.URL.Path {
+		case "GET /api/progress/apply/" + rolloutApplyID:
+			switch {
+			case len(requests) == 1:
+				response = stopped
+			case poll < len(polls):
+				response = rolloutProgress(rolloutApplyID, rolloutTargets, polls[poll])
+				poll++
+			default:
+				panic("start watcher polled after completion")
+			}
+		case "POST /api/start":
+			var request apitypes.ControlRequest
+			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+				panic(err)
+			}
+			if request.ApplyID != rolloutApplyID || request.Environment != "production" {
+				panic("wrong start request")
+			}
+			response = apitypes.StartResponse{Accepted: true, StartedCount: int64(resumed), SkippedCount: int64(len(rolloutTargets) - resumed)}
+		default:
+			panic("unexpected start request: " + r.Method + " " + r.URL.Path)
+		}
+		if err := json.NewEncoder(w).Encode(response); err != nil {
+			panic(err)
+		}
+	}))
+	defer server.Close()
+	output := runInTerminalWithInput("", "start-fixture", server.URL)
+	fixtureMu.Lock()
+	sequence := strings.Join(requests, ",")
+	fixtureMu.Unlock()
+	want := "GET /api/progress/apply/" + rolloutApplyID + ",POST /api/start" + strings.Repeat(",GET /api/progress/apply/"+rolloutApplyID, len(polls))
+	if sequence != want {
+		panic("wrong start request sequence: " + sequence)
+	}
+	if !strings.Contains(output, "Apply complete!") {
+		panic("start watcher did not reach completion: " + output)
+	}
+	const resuming = "Resuming from checkpoint..."
+	before, after, found := strings.Cut(output, resuming)
+	if !found {
+		panic("start did not resume: " + output)
+	}
+	reset, _, _ := strings.Cut(after, "\n")
+	return before + resuming + reset + "\n"
+}
+
+// watchView renders the production watcher's view of one progress response.
+func watchView(response apitypes.ProgressResponse) string {
+	return watchViewPressing(response, false)
+}
+
+// watchViewPressing renders the production watcher's view of one progress
+// response, after pressing s when stop is set. The fixture checks that the
+// key sends one stop request for the apply being watched.
+func watchViewPressing(response apitypes.ProgressResponse, stop bool) string {
+	var stops int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		var body any = response
+		switch {
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/api/progress/apply/"):
+		case stop && r.Method == http.MethodPost && r.URL.Path == "/api/stop":
+			var request apitypes.ControlRequest
+			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+				panic(err)
+			}
+			if request.ApplyID != response.ApplyID || request.Environment != response.Environment {
+				panic("wrong stop request")
+			}
+			stops++
+			body = apitypes.StopResponse{Accepted: true, StoppedCount: int64(len(runningTargets(response))), SkippedCount: int64(len(response.Tables) - len(runningTargets(response)))}
+		default:
+			panic("unexpected watch request: " + r.Method + " " + r.URL.Path)
+		}
+		if err := json.NewEncoder(w).Encode(body); err != nil {
+			panic(err)
+		}
+	}))
+	defer server.Close()
+	model := commands.NewWatchModel(server.URL, response.Database, response.Environment, true)
+	batch := model.Init()().(tea.BatchMsg)
+	updated, _ := model.Update(batch[0]())
+	if stop {
+		var cmd tea.Cmd
+		updated, cmd = updated.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+		if cmd == nil {
+			panic("stop key did not request stop")
+		}
+		updated, _ = updated.Update(cmd())
+		if stops != 1 {
+			panic("expected one stop request")
+		}
+	}
+	view := updated.View()
+	if strings.Contains(view, "Error:") || strings.Contains(view, "Loading...") {
+		panic(view)
+	}
+	return view
+}
+
+// rolloutApply runs the real apply command, confirmed with yes, against a
+// loopback fixture for the multi-target environment. An empty target applies
+// the whole rollout. The fixture checks every request the command sends and
+// scripts the automatic watcher through polls to completion. It returns the
+// command's output up to the watcher's announcement.
+func rolloutApply(target string) string {
+	applyID := rolloutApplyID
+	if target != "" {
+		applyID = narrowedApplyID
+	}
+	var polls [][]int
+	targets := rolloutTargets
+	if target == "" {
+		polls = [][]int{{10, 8, 9, 12}, {60, 40, 50, 80}, {100, 100, 100, 100}}
+	} else {
+		targets = []string{target}
+		polls = [][]int{{10}, {60}, {100}}
+	}
+	plan := rolloutPlan(target)
+	var requests []string
+	var fixtureMu sync.Mutex
+	poll := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fixtureMu.Lock()
+		defer fixtureMu.Unlock()
+		requests = append(requests, r.Method+" "+r.URL.Path)
+		w.Header().Set("Content-Type", "application/json")
+		var response any
+		switch r.Method + " " + r.URL.Path {
+		case "GET /api/status":
+			query := r.URL.Query()
+			wantDeployment := ""
+			if target != "" {
+				wantDeployment = rolloutDeployment
+			}
+			if query.Get("environment") != "production" || query.Get("active") != "true" || query.Get("deployment") != wantDeployment {
+				panic("wrong active schema change preflight: " + r.URL.RawQuery)
+			}
+			response = apitypes.StatusResponse{}
+		case "POST /api/plan":
+			var request apitypes.PlanRequest
+			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+				panic(err)
+			}
+			if request.Database != "shop" || request.Environment != "production" || request.Target != target || !request.RendersRollout {
+				panic("wrong rollout plan request")
+			}
+			if files := request.SchemaFiles["shop"]; files == nil || !strings.Contains(files.Files["orders.sql"], "`idx_status`") {
+				panic("plan request did not carry the schema files")
+			}
+			response = plan
+		case "GET /api/locks/shop/mysql", "POST /api/locks/acquire":
+			response = map[string]any{"lock": nil}
+		case "POST /api/apply":
+			var request apitypes.ApplyRequest
+			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+				panic(err)
+			}
+			if request.PlanID != plan.PlanID || request.Environment != "production" || request.Target != plan.NarrowedTo || !request.RendersRollout || request.Options["defer_cutover"] != "" {
+				panic("wrong rollout apply request")
+			}
+			response = apitypes.ApplyResponse{Accepted: true, ApplyID: applyID}
+		case "GET /api/progress/apply/" + applyID:
+			if poll >= len(polls) {
+				panic("automatic watcher polled after completion")
+			}
+			response = rolloutProgress(applyID, targets, polls[poll])
+			poll++
+		default:
+			panic("unexpected rollout request: " + r.Method + " " + r.URL.Path)
+		}
+		if err := json.NewEncoder(w).Encode(response); err != nil {
+			panic(err)
+		}
+	}))
+	defer server.Close()
+
+	dir, err := os.MkdirTemp("", "docdemo-rollout-")
+	if err != nil {
+		panic(err)
+	}
+	defer func() {
+		if err := os.RemoveAll(dir); err != nil {
+			panic(err)
+		}
+	}()
+	schemaDir := filepath.Join(dir, "schema")
+	if err := os.MkdirAll(filepath.Join(schemaDir, "shop"), 0o755); err != nil {
+		panic(err)
+	}
+	if err := os.WriteFile(filepath.Join(schemaDir, "schemabot.yaml"), []byte("database: shop\ntype: mysql\n"), 0o644); err != nil {
+		panic(err)
+	}
+	orders := "CREATE TABLE `orders` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `status` varchar(32) NOT NULL,\n  PRIMARY KEY (`id`),\n  KEY `idx_status` (`status`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;\n"
+	if err := os.WriteFile(filepath.Join(schemaDir, "shop", "orders.sql"), []byte(orders), 0o644); err != nil {
+		panic(err)
+	}
+	args := []string{"apply-fixture", server.URL, schemaDir}
+	if target != "" {
+		args = append(args, target)
+	}
+	output := runInTerminal(args...)
+
+	fixtureMu.Lock()
+	sequence := strings.Join(requests, ",")
+	fixtureMu.Unlock()
+	progress := strings.Repeat(",GET /api/progress/apply/"+applyID, len(polls))
+	want := "GET /api/status,POST /api/plan,GET /api/locks/shop/mysql,POST /api/locks/acquire,POST /api/apply" + progress
+	if target != "" {
+		want = "POST /api/plan,GET /api/status,GET /api/locks/shop/mysql,POST /api/locks/acquire,POST /api/apply" + progress
+	}
+	if sequence != want {
+		panic("wrong rollout request sequence: " + sequence)
+	}
+	if !strings.Contains(output, "Apply complete!") {
+		panic("automatic rollout watcher did not reach completion: " + output)
+	}
+	submitted, _, found := strings.Cut(output, "Watching progress...\n")
+	if !found || !strings.Contains(submitted, "Apply started: "+applyID) {
+		panic("rollout apply did not start: " + output)
+	}
+	return submitted + "Watching progress...\n"
+}
+
+// rolloutDemo follows an apply of the whole environment: every target copies at
+// once under the default parallel cutover policy, and each cuts over as soon
+// as its own copy is ready.
+func rolloutDemo() Demo {
+	command := "schemabot apply -s ./schema -e production"
+	output := rolloutApply("")
+	preview, submitted := splitAtConfirmation(output)
+	if !strings.Contains(ansi.Strip(preview), "shop-004") {
+		panic("rollout plan does not name every target: " + preview)
+	}
+	frames := []Frame{
+		{4, command, "One plan covers every target of the environment", preview + "▌"},
+		{0.3, "", "Type yes to apply it to all four", preview + "y▌"},
+		{0.3, "", "", preview + "ye▌"},
+		{0.8, "", "", preview + "yes"},
+		{1.5, "", "One apply fans out to every target", submitted},
+	}
+	steps := [][]int{{5, 4, 5, 8}, {20, 14, 17, 30}, {35, 25, 30, 52}, {50, 36, 44, 75}, {65, 46, 57, cuttingOver}, {80, 57, 70, 100}, {95, 68, 83, 100}, {cuttingOver, 79, 96, 100}, {100, 89, cuttingOver, 100}, {100, 97, 100, 100}}
+	for i, p := range steps {
+		caption := "Every target copies at once"
+		if i >= 4 {
+			caption = "Each target cuts over as soon as its own copy is ready"
+		}
+		frames = append(frames, Frame{0.9, "", caption, watchView(rolloutProgress(rolloutApplyID, rolloutTargets, p))})
+	}
+	final := watchView(rolloutProgress(rolloutApplyID, rolloutTargets, []int{100, 100, 100, 100}))
+	if !strings.Contains(final, "Apply complete!") {
+		panic("rollout completion missing: " + final)
+	}
+	frames = append(frames, Frame{4, "", "The index lands on every target", final})
+	return Demo{Name: "cli-multi-target", Title: "One apply. Every target.", Height: 820, Bar: "shop · production", Frames: frames}
+}
+
+// targetDemo applies the change to one member of the rollout with --target.
+func targetDemo() Demo {
+	command := "schemabot apply -s ./schema -e production --target shop-002"
+	output := rolloutApply("shop-002")
+	preview, submitted := splitAtConfirmation(output)
+	if !strings.Contains(preview, "Target: "+rolloutMember("shop-002")+" (this plan covers only this rollout member)") {
+		panic("narrowed plan header missing: " + preview)
+	}
+	frames := []Frame{
+		{4, command, "The plan covers only shop-002", preview + "▌"},
+		{0.3, "", "Type yes to apply it to that target alone", preview + "y▌"},
+		{0.3, "", "", preview + "ye▌"},
+		{0.8, "", "", preview + "yes"},
+		{1.5, "", "The apply runs on shop-002 only", submitted},
+	}
+	for p := 10; p < 100; p += 10 {
+		frames = append(frames, Frame{0.4, "", "Follow the one target to completion", watchView(rolloutProgress(narrowedApplyID, []string{"shop-002"}, []int{p}))})
+	}
+	final := watchView(rolloutProgress(narrowedApplyID, []string{"shop-002"}, []int{100}))
+	if !strings.Contains(final, "Apply complete!") {
+		panic("narrowed completion missing: " + final)
+	}
+	frames = append(frames, Frame{4, "", "shop-002 has the index; the other targets are unchanged", final})
+	return Demo{Name: "cli-target", Title: "Apply to one target first.", Height: 740, Bar: "shop · production", Frames: frames}
+}
+
+// rolloutStopDemo stops a rollout partway through its copies and starts it
+// again: one stop halts every target still copying, a finished target stays
+// finished, and start resumes each target from its own checkpoint.
+func rolloutStopDemo() Demo {
+	stoppedAt := []int{45, 30, 37, 100}
+	frames := []Frame{
+		{1.5, "", "Every target copies in parallel", watchView(rolloutProgress(rolloutApplyID, rolloutTargets, []int{38, 25, 31, 92}))},
+		{1.5, "", "shop-004 finishes first", watchView(rolloutProgress(rolloutApplyID, rolloutTargets, stoppedAt))},
+		{2, "", "Press s to stop the apply", watchViewPressing(rolloutProgress(rolloutApplyID, rolloutTargets, stoppedAt), true)},
+	}
+	stopped := watchView(rolloutStopped(stoppedAt))
+	if !strings.Contains(stopped, "schemabot start") {
+		panic("stopped rollout does not say how to resume: " + stopped)
+	}
+	frames = append(frames, Frame{3.5, "", "Every target still copying stops; shop-004 stays done", stopped})
+	started := rolloutStart(stoppedAt)
+	frames = append(frames, Frame{2, "schemabot start -e production " + rolloutApplyID, "Start resumes every stopped target", started})
+	steps := [][]int{{45, 30, 37, 100}, {55, 40, 47, 100}, {65, 50, 57, 100}, {75, 60, 67, 100}, {85, 70, 77, 100}, {95, 80, 87, 100}, {cuttingOver, 90, 97, 100}, {100, 100, cuttingOver, 100}, {100, cuttingOver, 100, 100}}
+	for _, p := range steps {
+		frames = append(frames, Frame{0.6, "", "Each target resumes from its own checkpoint", watchView(rolloutProgress(rolloutApplyID, rolloutTargets, p))})
+	}
+	final := watchView(rolloutProgress(rolloutApplyID, rolloutTargets, []int{100, 100, 100, 100}))
+	if !strings.Contains(final, "Apply complete!") {
+		panic("resumed rollout completion missing: " + final)
+	}
+	frames = append(frames, Frame{4, "", "The index lands on every target", final})
+	return Demo{Name: "cli-multi-target-stop", Title: "Stop every target. Resume each one.", Height: 820, Bar: "shop · production", Frames: frames}
+}
+
+// splitAtConfirmation separates the plan and prompt the apply command printed
+// from what it printed once confirmed, so the renderer can type the answer.
+func splitAtConfirmation(output string) (string, string) {
+	prompt := applyPrompt()
+	before, after, found := strings.Cut(output, prompt)
+	if !found {
+		panic("apply prompt missing: " + output)
+	}
+	return before + prompt, strings.TrimPrefix(after, "\n")
+}
+
 func main() {
 	t.SetPreviewMode()
 	time.Local = time.UTC
@@ -473,6 +919,37 @@ func main() {
 			panic("rollback fixture requires a loopback HTTP endpoint")
 		}
 		cmd := commands.RollbackCmd{ApplyID: "apply-example-85", Environment: "staging", Watch: true}
+		if err := cmd.Run(context.Background(), &commands.Globals{Endpoint: endpoint.String()}); err != nil {
+			panic(err)
+		}
+		return
+	}
+	if len(os.Args) == 3 && os.Args[1] == "start-fixture" {
+		endpoint, err := url.Parse(os.Args[2])
+		if err != nil {
+			panic(err)
+		}
+		if endpoint.Scheme != "http" || endpoint.Hostname() != "127.0.0.1" {
+			panic("start fixture requires a loopback HTTP endpoint")
+		}
+		cmd := commands.StartCmd{ControlFlags: commands.ControlFlags{ApplyID: rolloutApplyID, Environment: "production"}, Watch: true}
+		if err := cmd.Run(&commands.Globals{Endpoint: endpoint.String()}); err != nil {
+			panic(err)
+		}
+		return
+	}
+	if (len(os.Args) == 4 || len(os.Args) == 5) && os.Args[1] == "apply-fixture" {
+		endpoint, err := url.Parse(os.Args[2])
+		if err != nil {
+			panic(err)
+		}
+		if endpoint.Scheme != "http" || endpoint.Hostname() != "127.0.0.1" {
+			panic("apply fixture requires a loopback HTTP endpoint")
+		}
+		cmd := commands.ApplyCmd{SchemaDir: os.Args[3], Environment: "production", Watch: true, Output: commands.OutputFormatInteractive, LogHeartbeat: 10 * time.Second}
+		if len(os.Args) == 5 {
+			cmd.Target = os.Args[4]
+		}
 		if err := cmd.Run(context.Background(), &commands.Globals{Endpoint: endpoint.String()}); err != nil {
 			panic(err)
 		}
@@ -539,7 +1016,7 @@ func main() {
 	}
 	stopFrames = append(stopFrames, Frame{3, "", "The watcher confirms completion", live(100, state.Apply.Completed, false, "")})
 	demos = append(demos, Demo{Name: "cli-stop", Title: "Stop and resume a change.", Frames: stopFrames})
-	demos = append(demos, vitessDemo(), rollbackDemo())
+	demos = append(demos, vitessDemo(), rollbackDemo(), rolloutDemo(), targetDemo(), rolloutStopDemo())
 	fleetLines := busyFleet(now)
 	pull := capture(func() {
 		// The capture pipe is not a TTY; this frame represents an interactive terminal.
@@ -750,6 +1227,18 @@ func rollbackDemo() Demo {
 // rollbackInteractive gives the actual command terminal input while capturing
 // its output. The helper process runs this generator's loopback-only mode.
 func rollbackInteractive(endpoint string) string {
+	return runInTerminal("rollback-fixture", endpoint)
+}
+
+// runInTerminal runs this generator in one of its loopback-only fixture modes
+// with terminal input that answers the confirmation prompt with yes.
+func runInTerminal(args ...string) string {
+	return runInTerminalWithInput("yes\n", args...)
+}
+
+// runInTerminalWithInput runs a child fixture mode in a terminal, typing input
+// before the command starts reading.
+func runInTerminalWithInput(input string, args ...string) string {
 	executable, err := os.Executable()
 	if err != nil {
 		panic(err)
@@ -758,11 +1247,12 @@ func rollbackInteractive(endpoint string) string {
 	helper := filepath.Join(filepath.Dir(source), "../../../scripts/cli-demo-tty.py")
 	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "python3", helper, executable, "rollback-fixture", endpoint)
+	cmd := exec.CommandContext(ctx, "python3", append([]string{helper, executable}, args...)...)
+	cmd.Env = append(os.Environ(), "CLI_DEMO_INPUT="+input)
 	cmd.Stderr = os.Stderr
 	output, err := cmd.Output()
 	if err != nil {
-		panic(fmt.Errorf("run interactive rollback fixture: %w", err))
+		panic(fmt.Errorf("run interactive %s: %w", args[0], err))
 	}
 	return string(output)
 }
