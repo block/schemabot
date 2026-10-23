@@ -917,13 +917,61 @@ func TestWatchModel_MultiTargetRollupScopesTablesToTheirMember(t *testing.T) {
 		"target testapp-002",
 		"users_001",
 		"target testapp-001",
-		"To stop this schema change:",
-		"schemabot stop apply-multi-target -e production",
-		"ESC to detach",
+		"ESC detach • s stop",
 	)
 	assert.NotContains(t, view, "primary —", "a sole deployment is not named")
 	assert.Equal(t, 1, strings.Count(view, "users_001:"))
 	assert.Equal(t, 1, strings.Count(view, "users_002:"))
+}
+
+// A rollout of several targets is stopped from the watcher with the same key as
+// a single target, and the footer says so the same way: "ESC detach • s stop",
+// or "c cancel" on PlanetScale. The key stays offered while the stop lands, and
+// gives way to a wait message during cutover, when the watcher ignores keys.
+// Where the key does nothing the footer keeps the stop command instead.
+func TestWatchModel_MultiTargetFooterOffersTheStopKey(t *testing.T) {
+	rollout := func(applyState string) WatchModel {
+		m := NewWatchModel("http://localhost:8080", "testapp", "production", true)
+		m.applyID = "apply-multi-target"
+		m.state = applyState
+		m.initialized = true
+		m.operations = []templates.ProgressOperation{
+			{Deployment: "primary", Target: "testapp-001", State: state.ApplyOperation.Running},
+			{Deployment: "primary", Target: "testapp-002", State: state.ApplyOperation.Running},
+		}
+		m.tables = []templates.TableProgress{
+			{Deployment: "primary", Target: "testapp-001", TableName: "users", ChangeType: "alter", Status: state.Task.Running, PercentComplete: 40},
+			{Deployment: "primary", Target: "testapp-002", TableName: "users", ChangeType: "alter", Status: state.Task.Running, PercentComplete: 20},
+		}
+		return m
+	}
+	footer := func(m WatchModel) string {
+		_, f := m.multiDeploymentProgressSections()
+		return stripANSI(f)
+	}
+
+	running := footer(rollout(state.Apply.Running))
+	assert.Contains(t, running, "ESC detach • s stop")
+	assert.NotContains(t, running, "schemabot stop", "the key replaces the typed command")
+
+	stopping := rollout(state.Apply.Running)
+	updated, cmd := stopping.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+	require.NotNil(t, cmd, "s requests a stop of the rollout")
+	assert.Contains(t, footer(updated.(WatchModel)), "ESC detach • s stop", "the key stays offered while the stop lands")
+
+	planetScale := rollout(state.Apply.Running)
+	planetScale.engine = "PlanetScale"
+	assert.Contains(t, footer(planetScale), "ESC detach • c cancel")
+
+	cuttingOver := footer(rollout(state.Apply.CuttingOver))
+	assert.Contains(t, cuttingOver, "Cutover in progress - please wait...")
+	assert.NotContains(t, cuttingOver, "ESC", "the watcher ignores ESC during cutover")
+	assert.NotContains(t, cuttingOver, "s stop")
+
+	queued := footer(rollout(state.Apply.Pending))
+	assert.NotContains(t, queued, "s stop", "s does nothing before the apply runs")
+	assert.Contains(t, queued, "schemabot stop apply-multi-target -e production")
+	assert.Contains(t, queued, "ESC to detach")
 }
 
 // An apply SchemaBot has accepted but not yet started reads as queued in the

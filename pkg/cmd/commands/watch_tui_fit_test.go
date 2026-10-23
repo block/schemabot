@@ -53,7 +53,7 @@ func TestWatchViewFitsTheWindow(t *testing.T) {
 	assert.Equal(t, 20, frameRows(fitted))
 	assert.Equal(t, strings.SplitN(stripANSI(full), "\n", 2)[0], strings.SplitN(plain, "\n", 2)[0], "the status line stays on top")
 	assert.Contains(t, plain, "Apply ID: apply-abc123")
-	assert.True(t, strings.HasSuffix(plain, "ESC to detach\n"), plain)
+	assert.True(t, strings.HasSuffix(plain, "ESC detach • s stop\n"), plain)
 
 	_, footer := m.multiDeploymentProgressSections()
 	assert.True(t, strings.HasSuffix(fitted, footer), "the footer stays whole")

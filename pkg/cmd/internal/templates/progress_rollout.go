@@ -37,6 +37,10 @@ type RolloutView struct {
 	// cutover. Without it SchemaBot cuts a ready member over itself, so the
 	// footer offers no cutover command.
 	DeferCutover bool
+	// StopByKey is whether the view's own footer offers stop as a key, as the
+	// live watcher does. The rollout footer then leaves out the stop command,
+	// so the view offers one way to stop rather than two.
+	StopByKey bool
 }
 
 // RolloutCountsUnit is what the rollout's status counts count: targets once
@@ -831,11 +835,13 @@ func FormatRolloutFooter(v RolloutView) string {
 	if !v.Model.OffersRolloutStop() {
 		return b.String()
 	}
-	verb, label := "stop", "To stop this schema change"
-	if strings.EqualFold(v.Engine, storage.EnginePlanetScale) {
-		verb, label = "cancel", "To cancel this schema change"
+	if !v.StopByKey {
+		verb, label := "stop", "To stop this schema change"
+		if strings.EqualFold(v.Engine, storage.EnginePlanetScale) {
+			verb, label = "cancel", "To cancel this schema change"
+		}
+		writeRolloutCommand(&b, label, applyCommand(verb))
 	}
-	writeRolloutCommand(&b, label, applyCommand(verb))
 	if v.Model.RetryWaitsOnActiveApply() {
 		fmt.Fprintf(&b, "%s\n", presentation.RetryOnceSettledNote)
 	}

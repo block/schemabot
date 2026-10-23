@@ -202,7 +202,7 @@ func (m WatchModel) progressSections() (string, string) {
 		// During cutover, show minimal footer - no detach/stop allowed
 		f.WriteString("\n\n")
 		dimStyle := lipgloss.NewStyle().Faint(true)
-		f.WriteString(dimStyle.Render("Cutover in progress - please wait..."))
+		f.WriteString(dimStyle.Render(cutoverInProgressFooter))
 		f.WriteString("\n")
 	case m.deployTriggered:
 		f.WriteString("\n\n")
@@ -325,6 +325,10 @@ func (m WatchModel) renderTables(b *strings.Builder, tables []templates.TablePro
 		}
 	}
 }
+
+// cutoverInProgressFooter replaces the keys a watcher offers while a cutover is
+// underway, since it ignores them until the cutover lands.
+const cutoverInProgressFooter = "Cutover in progress - please wait..."
 
 // formatFooter returns the standard footer.
 func (m WatchModel) formatFooter() string {

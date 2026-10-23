@@ -1202,6 +1202,8 @@ The `⠋` is a Braille spinner (animated in the TUI, static here).
 | Cutting over | `Cutover in progress - please wait...` |
 | Stopped | `Use 'schemabot start -e <env> <id>' to resume.` |
 
+A rollout of several targets offers the same keys: `s` stops every target still copying, and the footer reads `ESC detach • s stop` while it does. Above the keys, the rollout's own footer names its next step, such as the target SchemaBot cuts over next, and a stopped rollout ends on the `schemabot start` command that resumes it.
+
 </details>
 
 ## Use the CLI from scripts and agents

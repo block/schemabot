@@ -11243,10 +11243,8 @@ Environment: production
 
 
 SchemaBot will cut over us-east next — no action needed.
-To stop this schema change:
-  schemabot stop apply-multi-a1b2c3d4 -e production
 
-ESC to detach
+ESC detach • s stop
 ```
 
 

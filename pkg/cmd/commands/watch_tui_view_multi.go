@@ -26,6 +26,7 @@ func (m WatchModel) multiDeploymentProgressSections() (string, string) {
 		Tables:       m.tables,
 		SetupPhase:   state.IsSetupPhase(m.state),
 		DeferCutover: m.deferCutover,
+		StopByKey:    m.rolloutStopByKey(model),
 	}
 
 	var b strings.Builder
@@ -50,8 +51,16 @@ func (m WatchModel) multiDeploymentProgressSections() (string, string) {
 	if footer := templates.FormatRolloutFooter(view); footer != "" {
 		f.WriteString(footer + "\n")
 	}
-	m.writeMultiDeploymentFooter(&f, model)
+	m.writeMultiDeploymentFooter(&f, model, view.StopByKey)
 	return b.String(), f.String()
+}
+
+// rolloutStopByKey reports whether the watcher offers stop as a key for this
+// rollout: the rollout footer would offer a stop, and the key acts in the
+// apply's state. Elsewhere the footer keeps the stop command, since the key
+// would do nothing.
+func (m WatchModel) rolloutStopByKey(model presentation.Apply) bool {
+	return model.OffersRolloutStop() && m.stopKeyAvailable()
 }
 
 func (m WatchModel) writeMultiDeploymentHeader(b *strings.Builder, model presentation.Apply, groups []presentation.Group) {
@@ -136,7 +145,7 @@ func tablesForMember(tables []templates.TableProgress, deployment, target string
 // failed or stopped rollout ends on the footer's command, the way the progress
 // output does: the header already names the state, and a second banner would
 // repeat the recovery guidance beneath the command it describes.
-func (m WatchModel) writeMultiDeploymentFooter(b *strings.Builder, model presentation.Apply) {
+func (m WatchModel) writeMultiDeploymentFooter(b *strings.Builder, model presentation.Apply, stopByKey bool) {
 	switch {
 	case state.IsState(model.State, state.Apply.Completed):
 		b.WriteString("\n")
@@ -144,6 +153,13 @@ func (m WatchModel) writeMultiDeploymentFooter(b *strings.Builder, model present
 		b.WriteString("\n")
 	case state.IsState(model.State, state.Apply.Failed, state.Apply.Stopped):
 		// Nothing follows the rollout footer's command.
+	case m.cuttingOver():
+		// The watcher ignores ESC and stop until the cutover lands.
+		b.WriteString(lipgloss.NewStyle().Faint(true).Render(cutoverInProgressFooter))
+		b.WriteString("\n")
+	case stopByKey:
+		b.WriteString(m.formatFooter())
+		b.WriteString("\n")
 	default:
 		dimStyle := lipgloss.NewStyle().Faint(true)
 		b.WriteString(dimStyle.Render("ESC to detach"))
