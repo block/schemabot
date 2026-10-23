@@ -307,18 +307,20 @@ func tableElements(ct *statement.CreateTable) (map[string]string, error) {
 	return elements, nil
 }
 
-// constraintKey names an index or constraint the way MySQL does: indexes and
-// constraints (foreign keys and checks) are separate namespaces, and the
-// primary key has no name of its own. An unnamed one is keyed by its
-// definition.
+// constraintKey names an index or constraint the way MySQL does: indexes,
+// foreign keys, and CHECK constraints are each their own namespace, so a
+// foreign key and a CHECK may share a name, and the primary key has no name of
+// its own. An unnamed one is keyed by its definition.
 func constraintKey(c *ast.Constraint) string {
 	switch {
 	case c.Tp == ast.ConstraintPrimaryKey:
 		return "the primary key"
 	case c.Name == "":
 		return ""
-	case c.Tp == ast.ConstraintForeignKey || c.Tp == ast.ConstraintCheck:
-		return "constraint " + strings.ToLower(c.Name)
+	case c.Tp == ast.ConstraintForeignKey:
+		return "foreign key " + strings.ToLower(c.Name)
+	case c.Tp == ast.ConstraintCheck:
+		return "check constraint " + strings.ToLower(c.Name)
 	default:
 		return "index " + strings.ToLower(c.Name)
 	}

@@ -1,6 +1,7 @@
 package ddl
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -345,6 +346,51 @@ func TestSameTableChange_AddedTable(t *testing.T) {
 				return
 			}
 			assert.Contains(t, reason, tt.wantReason)
+		})
+	}
+}
+
+// MySQL gives foreign keys and CHECK constraints separate namespaces, so one
+// of each may share a name, while two of the same kind may not.
+func TestSameTableChange_ConstraintNamespaces(t *testing.T) {
+	const (
+		fk       = "CONSTRAINT `c` FOREIGN KEY (`parent_id`) REFERENCES `parent` (`id`)"
+		check    = "CONSTRAINT `c` CHECK (`parent_id` > 0)"
+		otherFK  = "CONSTRAINT `C` FOREIGN KEY (`id`) REFERENCES `parent` (`id`)"
+		otherChk = "CONSTRAINT `C` CHECK (`id` > 0)"
+	)
+	table := func(withX bool, constraints ...string) string {
+		cols := "`id` bigint NOT NULL, `parent_id` bigint NOT NULL"
+		if withX {
+			cols += ", `x` int"
+		}
+		return "CREATE TABLE `t` (" + cols + ", PRIMARY KEY (`id`), " + strings.Join(constraints, ", ") + ")"
+	}
+
+	t.Run("a foreign key and a CHECK sharing a name", func(t *testing.T) {
+		base, edited := table(false, fk, check), table(true, fk, check)
+		same, reason, err := SameTableChange(base, edited, base, edited)
+		require.NoError(t, err)
+		assert.True(t, same)
+		assert.Empty(t, reason)
+	})
+
+	tests := []struct {
+		name        string
+		constraints []string
+		wantErr     string
+	}{
+		{name: "two foreign keys sharing a name", constraints: []string{fk, otherFK}, wantErr: "read table t at the head: foreign key c is declared more than once"},
+		{name: "two CHECKs sharing a name", constraints: []string{check, otherChk}, wantErr: "read table t at the head: check constraint c is declared more than once"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			base := table(false, fk)
+			same, reason, err := SameTableChange(base, table(true, fk), base, table(true, tt.constraints...))
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tt.wantErr)
+			assert.False(t, same)
+			assert.Empty(t, reason)
 		})
 	}
 }
