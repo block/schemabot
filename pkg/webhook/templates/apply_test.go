@@ -619,7 +619,7 @@ func TestRenderUnsafeChangesBlockedCarriesLintFindingsAndTheirGuides(t *testing.
 	assert.Contains(t, rendered, "Column rename detected", "the lint fold reaches the decision point")
 	assert.Contains(t, rendered, primaryKeyDocURL, "the blocking finding links its guide")
 	assert.Contains(t, rendered, "#renaming-a-column-or-table")
-	assert.Less(t, strings.Index(rendered, "📖 **Related guidance:**"), strings.Index(rendered, "--allow-unsafe`:**"),
+	assert.Less(t, strings.Index(rendered, "📖 **Related guidance:**"), strings.Index(rendered, "To proceed with these destructive changes**"),
 		"the reading comes before the command it informs")
 }
 
@@ -854,13 +854,13 @@ func TestRenderApplyStatusComment_ShardSummary(t *testing.T) {
 		}},
 	})
 	assert.Contains(t, inline, "- Shards: 5 (1 failed, 2 copying, 1 waiting for cutover, 1 complete)\n"+
-		"  - ✗ `c0-e0`: failed\n"+
-		// A shard that has not reported progress reads as copying, not 0%,
-		// and is listed after the ones that have, which set the pace.
-		"  - ◉ `80-c0`: 45%\n"+
+		// Shards are listed in their own order whatever their phase, and one
+		// that has not reported progress reads as copying, not 0%.
+		"  - ✓ `-40`: complete\n"+
 		"  - ◉ `40-80`: copying\n"+
-		"  - ● `e0-`: waiting for cutover\n"+
-		"  - ✓ `-40`: complete\n")
+		"  - ◉ `80-c0`: 45%\n"+
+		"  - ✗ `c0-e0`: failed\n"+
+		"  - ● `e0-`: waiting for cutover\n")
 
 	many := make([]ShardProgressData, 0, 13)
 	for i := range 9 {
@@ -876,11 +876,24 @@ func TestRenderApplyStatusComment_ShardSummary(t *testing.T) {
 		Database: "shop", Environment: "staging", State: "running", Engine: "Vitess",
 		Tables: []TableProgressData{{TableName: "orders", Status: "running", PercentComplete: 70, Shards: many}},
 	})
-	// Past the inline limit only failures and the slowest copiers are named;
-	// the heading counts the rest.
+	// Past the inline limit only failures, the slowest copiers and the shards
+	// working past the copy are named; the heading counts the rest.
 	assert.Contains(t, collapsed, "- Shards: 13 (2 copying, 1 waiting for cutover, 1 queued, 9 complete)\n"+
 		"  - ◉ `slow1`: 12%\n"+
-		"  - ◉ `fast1`: 80%\n\n")
+		"  - ◉ `fast1`: 80%\n"+
+		"  - ● `ready1`: waiting for cutover\n\n")
+
+	// A table waiting on its deploy request, or reverting, is still in flight,
+	// so it lists its shards too.
+	for _, status := range []string{state.Task.WaitingForDeploy, state.Task.Reverting} {
+		phase := RenderApplyStatusComment(ApplyStatusCommentData{
+			Database: "shop", Environment: "staging", State: "running", Engine: "Vitess",
+			Tables: []TableProgressData{{TableName: "users", Status: status,
+				Shards: []ShardProgressData{{Shard: "-80", Status: status}, {Shard: "80-", Status: "completed"}}}},
+		})
+		assert.Containsf(t, phase, "- Shards: 2 (", "a table %s lists its shards:\n%s", status, phase)
+		assert.Containsf(t, phase, "  - ✓ `80-`: complete\n", "a table %s lists its shards:\n%s", status, phase)
+	}
 
 	// Suppressed once the table completes — no shard line even with shard rows.
 	done := RenderApplyStatusComment(ApplyStatusCommentData{
@@ -1686,7 +1699,7 @@ func TestRenderApplyStatusComment_RecoveringCopyingRows(t *testing.T) {
 
 // A copying table shows its planned size beside the row counts, before the
 // ETA, and a stopped one keeps it. A table the plan had no estimate for shows
-// the row counts alone.
+// the row counts alone, and a queued table shows the plan's row estimate.
 func TestRenderApplyStatusComment_TableSizeBesideRows(t *testing.T) {
 	bytes := int64(23_400_000_000)
 	for _, tt := range []struct {
@@ -1718,6 +1731,14 @@ func TestRenderApplyStatusComment_TableSizeBesideRows(t *testing.T) {
 			state: state.Apply.Running,
 			table: TableProgressData{TableName: "orders", Status: state.Task.Running, RowsCopied: 1_234_567, RowsTotal: 48_200_000, PercentComplete: 2, ETASeconds: 720},
 			want:  "- Rows: 1,234,567 / 48,200,000 · ETA: 12m 0s\n",
+		},
+		{
+			// A queued table has reported nothing yet, so it shows the
+			// plan's estimates, both approximate.
+			name:  "queued",
+			state: state.Apply.Running,
+			table: TableProgressData{TableName: "orders", Status: state.Task.Pending, EstimatedRows: new(int64(48_200_000)), EstimatedBytes: &bytes},
+			want:  "```\n- Rows: ~48.2M · ~23.4 GB\n",
 		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
@@ -2844,4 +2865,33 @@ func TestRenderApplySummaryComment_Rollback(t *testing.T) {
 	failed := RenderApplySummaryComment(data)
 	assert.Contains(t, failed, "## ❌ Rollback Failed")
 	assert.NotContains(t, failed, "Schema Change Failed")
+}
+
+// A cancel stops `orders` part-way through its row copy, reaches `users`
+// after its engine began it but before it reported rows, and reaches
+// `products` while it is still queued. Only `products` reads not started; the
+// progress comment and the terminal summary both say how far `orders` got.
+func TestRenderApplyComments_CancelledTableSaysHowFarItGot(t *testing.T) {
+	data := ApplyStatusCommentData{
+		Database:    "testapp",
+		Environment: "staging",
+		RequestedBy: "aparajon",
+		State:       state.Apply.Cancelled,
+		Engine:      "Spirit",
+		Tables: []TableProgressData{
+			{TableName: "orders", DDL: "ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`)", Status: state.Task.Cancelled, Started: true, PercentComplete: 40, RowsCopied: 400, RowsTotal: 1000},
+			{TableName: "users", DDL: "ALTER TABLE `users` ADD INDEX `idx_email` (`email`)", Status: state.Task.Cancelled, Started: true},
+			{TableName: "products", DDL: "ALTER TABLE `products` ADD INDEX `idx_price` (`price_cents`)", Status: state.Task.Cancelled},
+		},
+	}
+
+	progress := RenderApplyStatusComment(data)
+	assert.Contains(t, progress, "**`orders`**: 🚫 Cancelled at 40.00%\n", "%s", progress)
+	assert.Contains(t, progress, "**`users`**: 🚫 Cancelled\n", "%s", progress)
+	assert.Contains(t, progress, "**`products`**: 🚫 Cancelled (not started)\n", "%s", progress)
+
+	summary := RenderApplySummaryComment(data)
+	assert.Contains(t, summary, "**`orders`** — Cancelled at 40.00%\n", "%s", summary)
+	assert.Contains(t, summary, "**`users`** — Cancelled\n", "%s", summary)
+	assert.Contains(t, summary, "**`products`** — Cancelled\n", "%s", summary)
 }

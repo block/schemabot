@@ -12,7 +12,6 @@ import (
 
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
-	"github.com/block/schemabot/pkg/metrics"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/routing"
 	"github.com/block/schemabot/pkg/state"
@@ -143,6 +142,9 @@ func (c *LocalClient) resolveStartRequest(ctx context.Context, req *ternv1.Start
 	if state.IsState(apply.State, state.Apply.WaitingForDeploy) {
 		return apply, 1, 0, nil
 	}
+	if state.IsState(apply.State, state.Apply.Resuming) {
+		return c.joinPendingStart(ctx, apply)
+	}
 	if !state.IsState(apply.State, state.Apply.Stopped) && !state.IsRunningApplyState(apply.State) {
 		return nil, 0, 0, fmt.Errorf("schema change is not stopped (current state: %s)", apply.State)
 	}
@@ -177,6 +179,40 @@ func (c *LocalClient) resolveStartRequest(ctx context.Context, req *ternv1.Start
 	c.logger.Info("Start: resolved resumable work",
 		append(apply.LogAttrs(), "started_count", startedCount, "skipped_count", skippedCount)...)
 	return apply, startedCount, skippedCount, nil
+}
+
+// joinPendingStart answers a start that reaches an apply an earlier start is
+// still resuming. Several control plane operations share one remote apply, and
+// each one's drive asks for the start on its own, so the second can land after
+// the first moved the apply to resuming but before the driver finished it. That
+// start asks for nothing the pending one is not already doing: it joins it and
+// reports the counts the pending one recorded. Refusing it would fail the
+// caller's start and leave that caller's targets stopped while the rest of the
+// rollout moves on. A resuming apply with no pending start is past the point a
+// start can act on, so it is refused as before.
+func (c *LocalClient) joinPendingStart(ctx context.Context, apply *storage.Apply) (*storage.Apply, int64, int64, error) {
+	controlStore := c.storage.ControlRequests()
+	if controlStore == nil {
+		return nil, 0, 0, fmt.Errorf("control request store is not available")
+	}
+	pending, err := controlStore.GetPending(ctx, apply.ID, storage.ControlOperationStart)
+	if err != nil {
+		return nil, 0, 0, fmt.Errorf("load pending start for resuming apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	if pending == nil {
+		c.logger.Info("Start: apply is resuming with no pending start to join, so this start is refused",
+			apply.LogAttrs()...)
+		return nil, 0, 0, fmt.Errorf("schema change is not stopped (current state: %s)", apply.State)
+	}
+	var metadata localStartControlRequestMetadata
+	if len(pending.Metadata) > 0 {
+		if err := json.Unmarshal(pending.Metadata, &metadata); err != nil {
+			return nil, 0, 0, fmt.Errorf("decode pending start metadata for apply %s: %w", apply.ApplyIdentifier, err)
+		}
+	}
+	c.logger.Info("Start: apply is resuming under a pending start; this start joins it",
+		append(apply.LogAttrs(), "started_count", metadata.StartedCount, "skipped_count", metadata.SkippedCount)...)
+	return apply, metadata.StartedCount, metadata.SkippedCount, nil
 }
 
 // noDiscoverableApplyError explains why an unqualified start resolved no apply
@@ -448,7 +484,10 @@ func (c *LocalClient) resumeApplySequential(ctx context.Context, apply *storage.
 		// Wait for any in-flight engine work to finish before checking schema.
 		// Without this, the previous task's cutover might complete between our
 		// schema check and the new eng.Apply() call, causing "Duplicate key name".
-		if proceed, err := c.drainEngineForDrive(ctx, apply, eng); err != nil || !proceed {
+		// Only work on the task's own table can race it that way, so the wait is
+		// scoped to that table where the engine supports it.
+		target := drainTargetForTask(task)
+		if proceed, err := c.drainEngineForDrive(ctx, apply, eng, &target); err != nil || !proceed {
 			return err
 		}
 
@@ -758,14 +797,17 @@ func replanCoversShards(replanDDL map[shardTableKey][]string, namespace string) 
 // for longer than it holds the apply. It reports whether the drive may go on;
 // a drive cancelled while it waited, or as the wait ended, hands the apply
 // back without verifying or starting anything.
-func (c *LocalClient) drainEngineForDrive(ctx context.Context, apply *storage.Apply, eng engine.Engine) (bool, error) {
-	if drainer, ok := eng.(engine.Drainer); ok {
-		if err := drainer.DrainContext(ctx); err != nil {
-			if c.driveCancelled(ctx, apply, "while waiting for in-process engine work to exit") {
-				return false, nil
-			}
-			return false, fmt.Errorf("wait for in-process engine work before driving apply %s: %w", apply.ApplyIdentifier, err)
+//
+// target names the table the drive is about to start work on, or is nil when
+// the drive covers the whole apply. An engine that runs each table's work on
+// its own waits only for that table's work, so other schema changes keep
+// running; any other engine waits for all of its work.
+func (c *LocalClient) drainEngineForDrive(ctx context.Context, apply *storage.Apply, eng engine.Engine, target *engine.DrainTarget) (bool, error) {
+	if err := drainEngineWork(ctx, eng, target); err != nil {
+		if c.driveCancelled(ctx, apply, "while waiting for in-process engine work to exit") {
+			return false, nil
 		}
+		return false, fmt.Errorf("wait for in-process engine work before driving apply %s: %w", apply.ApplyIdentifier, err)
 	}
 	if c.driveCancelled(ctx, apply, "as in-process engine work exited") {
 		return false, nil
@@ -773,21 +815,53 @@ func (c *LocalClient) drainEngineForDrive(ctx context.Context, apply *storage.Ap
 	return true, nil
 }
 
+// drainTargetForTask names the table a task changes.
+func drainTargetForTask(task *storage.Task) engine.DrainTarget {
+	return engine.DrainTarget{Namespace: task.Namespace, Shard: task.Shard, Table: task.TableName}
+}
+
+// drainEngineWork waits for the engine's in-flight work that could race a
+// drive on target: only that table's work when the engine drains tables
+// independently and the drive names one, otherwise all of it. An engine with
+// no background work to drain has nothing to wait for.
+func drainEngineWork(ctx context.Context, eng engine.Engine, target *engine.DrainTarget) error {
+	if targetDrainer, ok := eng.(engine.TargetDrainer); ok && target != nil {
+		if err := targetDrainer.DrainTargetContext(ctx, *target); err != nil {
+			return fmt.Errorf("drain engine work on table %s.%s shard %q: %w", target.Namespace, target.Table, target.Shard, err)
+		}
+		return nil
+	}
+	drainer, ok := eng.(engine.Drainer)
+	if !ok {
+		return nil
+	}
+	if err := drainer.DrainContext(ctx); err != nil {
+		return fmt.Errorf("drain engine work: %w", err)
+	}
+	return nil
+}
+
 // replanResult holds the result of replanAndFilterTasks.
 type replanResult struct {
-	// ActiveTasks are tasks that still need changes. Each carries the DDL the
-	// re-plan would now run and, where the re-plan refuses that statement,
-	// the blocked verdict it reached.
+	// ActiveTasks are the tasks the drive still has to weigh, in drive order.
+	// A task that still needs changes carries the DDL the re-plan would now
+	// run and, where the re-plan refuses that statement, the blocked verdict
+	// it reached. A task a previous drive failed permanently is kept exactly
+	// as stored, with its reviewed DDL, for the drive to read as the apply's
+	// verdict; it needs no change, so the count of active tasks is not a
+	// count of remaining work.
 	ActiveTasks []*storage.Task
 	// CompletedCount is the number of tasks marked completed (no longer in diff).
 	CompletedCount int64
 }
 
 // replanAndFilterTasks re-plans against the current DB state to determine which
-// tasks still need changes. Tasks whose tables no longer appear in the diff are
-// marked completed. Remaining tasks get their DDL updated from the re-plan result.
-// Used by both Start() and ResumeApply() to handle tables that completed before
-// stop or crash.
+// tasks still need changes. Tasks whose tables no longer appear in the diff, or
+// whose own statement already landed, are marked completed. Remaining tasks get
+// their DDL updated from the re-plan result. A task a previous drive failed
+// permanently is neither settled nor re-planned: it stays active as stored for
+// the drive to read as the apply's verdict. Used by the resume paths that pick
+// up an apply whose tables may have completed before a stop or crash.
 func (c *LocalClient) replanAndFilterTasks(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, plan *storage.Plan) (*replanResult, error) {
 	replanOut, err := c.planWithEngine(ctx, &ternv1.PlanRequest{
 		IgnoreTables:    plan.IgnoreTables(),
@@ -816,6 +890,21 @@ func (c *LocalClient) replanAndFilterTasks(ctx context.Context, apply *storage.A
 			// remaining resume work, and re-activating it would flip a terminal
 			// task back to running until the engine re-terminalizes it.
 			c.logger.Debug("leaving reverted task terminal during resume re-plan", task.LogAttrs()...)
+			continue
+		}
+		if state.IsState(task.State, state.Task.Failed) {
+			// A task a previous drive failed permanently already holds the
+			// apply's outcome, and the drive reads that verdict from the stored row
+			// (checkTaskReady). A schema match does not overturn it: the live
+			// table can match the reviewed target after a failure (a statement
+			// that landed before the engine reported failing, or a change
+			// applied outside SchemaBot), and settling the task completed here
+			// would let the apply finish as a success, running its remaining
+			// tasks after a permanent failure. The task stays active as stored,
+			// with its reviewed DDL, for the drive to weigh.
+			c.logger.Info("keeping failed task as stored through resume re-plan; the drive reads its verdict from the stored row",
+				task.LogAttrs()...)
+			activeTasks = append(activeTasks, task)
 			continue
 		}
 		if taskInRevertPhase(task) {
@@ -851,7 +940,11 @@ func (c *LocalClient) replanAndFilterTasks(ctx context.Context, apply *storage.A
 			// this shard's live schema. A table dropping out of that diff means
 			// live already matches the reviewed target, so there is no remaining
 			// resume work for it — treat it as completed rather than drifted.
+			// A task that paused on a retryable failure arrives here with that
+			// failure's message still on it; the settlement is its outcome, so
+			// the completed row carries no error.
 			task.ProgressPercent = 100
+			task.ErrorMessage = ""
 			task.CompletedAt = &now
 			// The completed state must durably land before the task counts as
 			// settled: the caller derives parent apply state from this
@@ -1178,12 +1271,17 @@ func sameApplyOperation(a, b *int64) bool {
 // pending tasks remain queued behind the retried work. A requeue write that
 // does not land is returned: the task row is still failed_retryable, so driving
 // on would run its DDL while storage records it at rest. The caller exits the
-// drive with the apply still retryable, and the next claim retries the requeue.
+// drive with the apply still claimable, and the next claim retries the requeue.
+//
+// The requeue is keyed on each task row, not on the apply: a conflict check can
+// settle a stale task failed_retryable while its apply is still running, and
+// the drive that reclaims that apply re-runs the task as a retry all the same,
+// counted as an attempt and without the earlier failure's reason. Only the
+// apply's own retryable pause carries an apply-level reason to clear.
 func (c *LocalClient) prepareRetryableTasksForResume(ctx context.Context, apply *storage.Apply, tasks []*storage.Task) error {
-	if !state.IsState(apply.State, state.Apply.FailedRetryable) {
-		return nil
+	if state.IsState(apply.State, state.Apply.FailedRetryable) {
+		apply.ErrorMessage = ""
 	}
-	apply.ErrorMessage = ""
 	for _, task := range tasks {
 		if !state.IsState(task.State, state.Task.FailedRetryable) {
 			continue
@@ -1195,7 +1293,7 @@ func (c *LocalClient) prepareRetryableTasksForResume(ctx context.Context, apply 
 		if err := c.persistTaskStateTransition(ctx, task, apply.ID, state.Task.Pending,
 			fmt.Sprintf("Task %s queued for retry", task.TaskIdentifier)); err != nil {
 			*task = previous
-			return fmt.Errorf("requeue retryable task %s for retry of apply %s: %w", task.TaskIdentifier, apply.ApplyIdentifier, err)
+			return fmt.Errorf("%w: retryable task %s for retry of apply %s: %w", ErrTaskRequeueRefused, task.TaskIdentifier, apply.ApplyIdentifier, err)
 		}
 	}
 	return nil
@@ -1218,7 +1316,7 @@ func (c *LocalClient) prepareStoppedTasksForResume(ctx context.Context, apply *s
 		if err := c.persistTaskStateTransition(ctx, task, apply.ID, state.Task.Pending,
 			fmt.Sprintf("Task %s queued for start", task.TaskIdentifier)); err != nil {
 			*task = previous
-			return fmt.Errorf("requeue stopped task %s for start of apply %s: %w", task.TaskIdentifier, apply.ApplyIdentifier, err)
+			return fmt.Errorf("%w: stopped task %s for start of apply %s: %w", ErrTaskRequeueRefused, task.TaskIdentifier, apply.ApplyIdentifier, err)
 		}
 	}
 	return nil
@@ -1324,7 +1422,7 @@ func (c *LocalClient) launchAtomicResume(ctx context.Context, apply *storage.App
 		return fmt.Errorf("resolve credentials for grouped resume apply %s: %w", apply.ApplyIdentifier, err)
 	}
 
-	if proceed, err := c.drainEngineForDrive(ctx, apply, eng); err != nil || !proceed {
+	if proceed, err := c.drainEngineForDrive(ctx, apply, eng, nil); err != nil || !proceed {
 		return err
 	}
 
@@ -1365,14 +1463,17 @@ func (c *LocalClient) launchAtomicResume(ctx context.Context, apply *storage.App
 			c.logger.Error("failed to update apply state", append(apply.LogAttrs(), "error", err)...)
 			return fmt.Errorf("mark grouped resume apply %s %s after final schema check: %w", apply.ApplyIdentifier, terminalState, err)
 		}
+		// The outcome is stored from here, so a start that cannot be answered
+		// is reconciliation left undone, not a failure of the schema change:
+		// the stored outcome still owes its gauge release, settlement, and
+		// summary, and the caller must not record a failure over it.
+		var reconcileErr error
 		if startRequested {
 			if err := completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationStart); err != nil {
-				return err
+				reconcileErr = &postTerminalReconcileError{storedState: terminalState, err: err}
 			}
 		}
-		if !state.IsTerminalApplyState(oldApplyState) {
-			metrics.AdjustActiveApplies(ctx, -1, apply.Database, apply.Deployment, apply.Environment)
-		}
+		releaseActiveApplyForDriveOutcome(ctx, apply, oldApplyState)
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStateTransition, storage.LogSourceSchemaBot,
 			"All tasks already terminal on resume (final schema check shows no remaining changes)", oldApplyState, terminalState)
 		// A previous drive can have settled every task and exited before it
@@ -1380,7 +1481,7 @@ func (c *LocalClient) launchAtomicResume(ctx context.Context, apply *storage.App
 		// pending. Settle them before the summary posts.
 		c.settleRequestsForStoredOutcome(ctx, c.logger.With(apply.IdentityLogAttrs()...), apply)
 		c.notifyTerminalObserver(apply, allTasks)
-		return nil
+		return reconcileErr
 	}
 
 	resumeState, err := c.groupedResumeState(ctx, apply, tasks)
@@ -1415,16 +1516,17 @@ func (c *LocalClient) launchAtomicResume(ctx context.Context, apply *storage.App
 	// engine keys per-table progress on the same namespace/table pairs the
 	// tasks carry.
 	result, err := c.applyWithEngine(ctx, eng, &engine.ApplyRequest{
-		Database:     apply.Database,
-		PlanID:       plan.PlanIdentifier,
-		Changes:      groupedResumeChanges(tasks, plan),
-		TargetShards: taskTargetShards(tasks),
-		SchemaFiles:  plan.SchemaFiles,
-		IgnoreTables: plan.IgnoreTables(),
-		Options:      options,
-		ResumeState:  resumeState,
-		Credentials:  creds,
-		Logger:       c.logger.With(apply.IdentityLogAttrs()...),
+		ApplyIdentifier: apply.ApplyIdentifier,
+		Database:        apply.Database,
+		PlanID:          plan.PlanIdentifier,
+		Changes:         groupedResumeChanges(tasks, plan),
+		TargetShards:    taskTargetShards(tasks),
+		SchemaFiles:     plan.SchemaFiles,
+		IgnoreTables:    plan.IgnoreTables(),
+		Options:         options,
+		ResumeState:     resumeState,
+		Credentials:     creds,
+		Logger:          c.logger.With(apply.IdentityLogAttrs()...),
 		OnStateChange: func(rs *engine.ResumeState) error {
 			if rs == nil {
 				c.logger.Debug("OnStateChange: nil resume state", "apply_id", apply.ApplyIdentifier)
@@ -2102,16 +2204,17 @@ func (c *LocalClient) driveGroupFinalizer(ctx context.Context, apply *storage.Ap
 		"database", apply.Database,
 	)
 	result, err := c.applyWithEngine(ctx, eng, &engine.ApplyRequest{
-		Database:      apply.Database,
-		PlanID:        plan.PlanIdentifier,
-		Changes:       changes,
-		SchemaFiles:   plan.SchemaFiles,
-		IgnoreTables:  plan.IgnoreTables(),
-		Options:       apply.GetOptions().Map(),
-		ResumeState:   resumeState,
-		Credentials:   creds,
-		Logger:        c.logger.With(apply.IdentityLogAttrs()...),
-		OnStateChange: saveResume,
+		ApplyIdentifier: apply.ApplyIdentifier,
+		Database:        apply.Database,
+		PlanID:          plan.PlanIdentifier,
+		Changes:         changes,
+		SchemaFiles:     plan.SchemaFiles,
+		IgnoreTables:    plan.IgnoreTables(),
+		Options:         apply.GetOptions().Map(),
+		ResumeState:     resumeState,
+		Credentials:     creds,
+		Logger:          c.logger.With(apply.IdentityLogAttrs()...),
+		OnStateChange:   saveResume,
 	})
 	if err != nil {
 		return failClosed(fmt.Errorf("group_finalizer %s (apply %s): %w", work, apply.ApplyIdentifier, err))
@@ -2437,13 +2540,62 @@ func failedTaskDecidingOutcome(tasks []*storage.Task, grouped bool) *storage.Tas
 // failedTaskDecidingResume returns the failed task that decides the outcome of
 // the apply this drive is resuming, or nil when the drive must go on to its
 // pending requests and re-plan. A stopped apply is claimed only to deliver a
-// pending control request, so its failed tasks never decide: the stop already
-// settled them, and the pending start or cancel is answered first.
+// pending control request, so its failed tasks do not decide here: the pending
+// cancel is answered first, and a pending start is refused over them
+// (failedTaskRefusingStart).
 func (c *LocalClient) failedTaskDecidingResume(apply *storage.Apply, tasks []*storage.Task, options map[string]string) *storage.Task {
 	if state.IsState(apply.State, state.Apply.Stopped) {
 		return nil
 	}
 	return failedTaskDecidingOutcome(tasks, c.usesGroupedApply(apply, options))
+}
+
+// failedTaskRefusingStart returns the failed task that refuses a start on a
+// stopped apply, or nil when none does. Any failed task of the operation the
+// drive holds refuses it, whatever state its siblings were stopped in. Tasks
+// spanning more than one operation never do: a sibling deployment's failure is
+// the rollout projection's to weigh under the apply's failure policy (see
+// failedTaskDecidingOutcome).
+func failedTaskRefusingStart(tasks []*storage.Task) *storage.Task {
+	if !tasksShareOneOperation(tasks) {
+		return nil
+	}
+	for _, task := range tasks {
+		if state.IsState(task.State, state.Task.Failed) {
+			return task
+		}
+	}
+	return nil
+}
+
+// startRefusedForFailedTaskMessage is the reason a start refused over a failed
+// task records on the apply and on the start request, naming the table that
+// failed, why, and what the operator does next. The why is the task's stored
+// failure message, the operator sentence the engine authored when the task
+// failed and the same one a failure recorded while the apply was running puts
+// on the apply.
+func startRefusedForFailedTaskMessage(task *storage.Task) string {
+	return fmt.Sprintf("start refused: table %s failed before the apply was stopped (%s); plan the schema change again and apply the new plan",
+		task.TableName, settledTaskFailureMessage(task))
+}
+
+// storedFailureAheadOfWork returns the task a previous drive failed permanently
+// when a sequential drive would read it before handing any task to the engine:
+// every task ahead of it in drive order is already terminal. It returns nil
+// when no task is failed or when a task that still has to run comes first. A
+// failed task found this way is the apply's verdict before the resume does
+// anything, so the start that admitted the claim is answered with that failure
+// rather than completed over a resume that never resumed.
+func storedFailureAheadOfWork(tasks []*storage.Task) *storage.Task {
+	for _, task := range tasks {
+		if state.IsState(task.State, state.Task.Failed) {
+			return task
+		}
+		if !state.IsTerminalTaskState(task.State) {
+			return nil
+		}
+	}
+	return nil
 }
 
 // tasksShareOneOperation reports whether every task belongs to the same
@@ -2560,6 +2712,16 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 				apply.MutableLogAttrs()...)
 			return nil
 		}
+		// A task that failed before the stop already decided the schema
+		// change: the stop only hid the failure behind a resumable state.
+		// Resuming would re-plan the failed task and run its statement again
+		// on the operator's start, so the start is answered with the failure
+		// instead, and the apply records it.
+		if failed := failedTaskRefusingStart(tasks); failed != nil {
+			logger.Warn("refusing the start of a stopped apply whose task failed before the stop; recording the apply failed from that task, so the change is planned again before it runs",
+				append(apply.MutableLogAttrs(), "failed_task_id", failed.TaskIdentifier, "requested_by", controlRequestCaller(startReq))...)
+			return c.failApplyAndNotify(ctx, apply, tasks, startRefusedForFailedTaskMessage(failed))
+		}
 	}
 
 	// Get the plan to retrieve original DDLs. A storage read failure says
@@ -2629,6 +2791,7 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 			// recovery retries, and notify the observer only after a durable write.
 			return fmt.Errorf("complete task-less apply %s during recovery: %w", apply.ApplyIdentifier, err)
 		}
+		releaseActiveApplyForDriveOutcome(ctx, apply, previousState)
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStateTransition, storage.LogSourceSchemaBot,
 			"Apply owns no task work; completed without engine work", previousState, state.Apply.Completed)
 		c.notifyTerminalObserver(apply, tasks)
@@ -2672,10 +2835,10 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 				if err := c.markApplyRecovering(ctx, apply, tasks); err != nil {
 					return err
 				}
-				resumeCtx, cancelResume := context.WithCancel(ctx)
+				resumeCtx, cancelResume := context.WithCancelCause(ctx)
 				cancelGeneration := c.setApplyCancel(cancelResume)
 				defer c.clearApplyCancel(cancelGeneration)
-				defer cancelResume()
+				defer cancelResume(nil)
 				if err := c.launchAtomicResume(resumeCtx, apply, tasks, plan, options, "Recovering from checkpoint", true, false, releaseAtCutoverBarrier); err != nil {
 					if errors.Is(err, errGroupedResumeStateUnavailable) {
 						logger.Warn("deferred cutover recovery could not load persisted engine resume state; current apply owner will exit for operator retry",
@@ -2721,6 +2884,7 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 	if len(activeTasks) == 0 {
 		logger.Info("all tasks already completed, marking apply as completed")
 		now := time.Now()
+		claimedState := apply.State
 		apply.State = state.Apply.Completed
 		apply.CompletedAt = &now
 		apply.UpdatedAt = now
@@ -2735,9 +2899,15 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 		if err := c.storage.Applies().Update(ctx, apply); err != nil {
 			return fmt.Errorf("mark resumed apply %s completed after re-plan found no remaining work: %w", apply.ApplyIdentifier, err)
 		}
+		releaseActiveApplyForDriveOutcome(ctx, apply, claimedState)
+		// The outcome is stored from here, so a start that cannot be answered
+		// is reconciliation left undone, not a failure of the schema change:
+		// the stored outcome still owes its settlement and summary, and the
+		// drive reports the error only after they run.
+		var reconcileErr error
 		if startRequested {
 			if err := completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationStart); err != nil {
-				return err
+				reconcileErr = &postTerminalReconcileError{storedState: state.Apply.Completed, err: err}
 			}
 		}
 		// A previous drive can have settled every task and exited before it
@@ -2746,7 +2916,11 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 		// re-claims a completed apply to do it.
 		c.settleRequestsForStoredOutcome(ctx, logger, apply)
 		c.notifyTerminalObserver(apply, tasks)
-		return nil
+		if reconcileErr != nil {
+			logger.Warn("resume stored the apply completed but could not reconcile after it; the stored outcome stands, no failure is recorded over it, and the current apply owner will exit with the error",
+				append(apply.MutableLogAttrs(), "error", reconcileErr)...)
+		}
+		return reconcileErr
 	}
 
 	grouped := c.usesGroupedApply(apply, options)
@@ -2798,10 +2972,10 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 	}
 
 	if grouped {
-		resumeCtx, cancelResume := context.WithCancel(ctx)
+		resumeCtx, cancelResume := context.WithCancelCause(ctx)
 		cancelGeneration := c.setApplyCancel(cancelResume)
 		defer c.clearApplyCancel(cancelGeneration)
-		defer cancelResume()
+		defer cancelResume(nil)
 		if err := c.launchAtomicResume(resumeCtx, apply, activeTasks, plan, options, fmt.Sprintf("Apply resumed from checkpoint (%s)", groupedApplyModeDescription(apply, options)), true, startRequested, releaseAtCutoverBarrier); err != nil {
 			if errors.Is(err, errGroupedResumeStateUnavailable) {
 				logger.Warn("grouped resume could not load persisted engine resume state; current apply owner will exit for operator retry",
@@ -2811,7 +2985,18 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 			return c.handleGroupedResumeFailure(ctx, apply, activeTasks, err)
 		}
 	} else {
-		// Sequential mode: process each task one at a time
+		// Sequential mode: process each task one at a time.
+		//
+		// A permanent failure a previous drive stored, with nothing left to run
+		// ahead of it, is the first thing the drive would read, so the apply
+		// fails from it here without being written running or resuming
+		// anything: finalization cancels the tasks behind it and answers the
+		// admitting start with the failure instead of reporting it completed.
+		if failed := storedFailureAheadOfWork(activeTasks); failed != nil {
+			logger.Warn("a stored task failure is the first thing the sequential resume would read; recording the apply failed from it without resuming",
+				append(apply.MutableLogAttrs(), "failed_task_id", failed.TaskIdentifier, "table", failed.TableName)...)
+			return c.finalizeSequentialApply(ctx, apply, activeTasks, failed, false)
+		}
 		now := time.Now()
 		apply.State = state.Apply.Running
 		apply.UpdatedAt = now
@@ -2835,10 +3020,10 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 				"Apply resumed from checkpoint (sequential)", "", state.Apply.Running)
 		}
 
-		resumeCtx, cancelResume := context.WithCancel(ctx)
+		resumeCtx, cancelResume := context.WithCancelCause(ctx)
 		cancelGeneration := c.setApplyCancel(cancelResume)
 		defer c.clearApplyCancel(cancelGeneration)
-		defer cancelResume()
+		defer cancelResume(nil)
 		if err := c.resumeApplySequential(resumeCtx, apply, activeTasks, plan, options); err != nil {
 			return err
 		}
@@ -2861,14 +3046,25 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 // error would read as a transient drive failure that leaves the operation
 // claimable, re-leasing already-settled work instead of letting the claim loop
 // persist the operation row from its now-failed tasks immediately.
+//
+// A resume that already stored the apply's terminal outcome and then failed
+// to reconcile after it is not a refusal at all: the outcome stands as stored,
+// its side effects ran where it was stored, so nothing is paused or failed
+// over it and the error is returned for the drive to report.
 func (c *LocalClient) handleGroupedResumeFailure(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, err error) error {
 	logger := c.logger.With(apply.IdentityLogAttrs()...)
+	var reconcileErr *postTerminalReconcileError
+	if errors.As(err, &reconcileErr) {
+		logger.Warn("grouped resume stored the apply's terminal outcome but could not reconcile after it; the stored outcome stands, no failure is recorded over it, and the current apply owner will exit with the error",
+			append(apply.MutableLogAttrs(), "error", err)...)
+		return err
+	}
 	// A cancelled drive is why the resume returned, so the error describes the
 	// driver rather than the schema change it was reattaching to.
 	if c.driveCancelled(ctx, apply, "while resuming the apply") {
 		return nil
 	}
-	if c.shouldRetryEngineError(err) {
+	if c.shouldPauseGroupedResumeFailure(apply, tasks, err) {
 		logger.Warn("engine apply failed during recovery, pausing apply for operator retry",
 			"error", err)
 		return c.markApplyRetryableWithTasks(ctx, apply, tasks, err.Error())
@@ -2885,11 +3081,25 @@ func (c *LocalClient) handleGroupedResumeFailure(ctx context.Context, apply *sto
 	return err
 }
 
+// shouldPauseGroupedResumeFailure decides whether a refused grouped resume
+// pauses the apply for operator retry. A failure the engine reports as
+// reattaching to work it already accepted (engine.ErrReattachFailed) takes the
+// accepted-work policy, since that work keeps running whatever this drive
+// concludes and a later claim reattaches to it again. Any other refusal,
+// including one from an engine that gave up on the stored work and started
+// afresh, takes the policy for starting engine work.
+func (c *LocalClient) shouldPauseGroupedResumeFailure(apply *storage.Apply, tasks []*storage.Task, err error) bool {
+	if errors.Is(err, engine.ErrReattachFailed) {
+		return c.shouldPauseAcceptedWork(apply, tasks, err)
+	}
+	return c.shouldRetryEngineError(err)
+}
+
 func (c *LocalClient) dispatchQueuedApply(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, plan *storage.Plan, options map[string]string, releaseAtCutoverBarrier bool) error {
-	applyCtx, cancelApply := context.WithCancel(ctx)
+	applyCtx, cancelApply := context.WithCancelCause(ctx)
 	cancelGeneration := c.setApplyCancel(cancelApply)
 	defer c.clearApplyCancel(cancelGeneration)
-	defer cancelApply()
+	defer cancelApply(nil)
 
 	c.logger.Info("dispatching queued apply",
 		"apply_id", apply.ApplyIdentifier,

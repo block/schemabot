@@ -150,6 +150,13 @@ apply does not do better.
 is the deliberate pause state: resuming through the `start` command re-checks
 that no other apply is active on the same target, then hands the work to a
 fresh driver, continuing from engine checkpoints rather than starting over.
+A `stop` sent before any driver has acted on that `start` withdraws it: the
+apply stays `stopped` and the response carries `"status": "start_withdrawn"`.
+When the apply belongs to a PR, the PR is told: a `stop` command on the PR says
+so in its reply, and a `stop` sent from anywhere else gets a "Start Withdrawn"
+comment on the PR.
+A `stop` on a `stopped` apply with no `start` waiting is refused with
+`409 already_stopped`.
 
 ## The retry budget
 
@@ -161,7 +168,9 @@ apply to `failed_retryable` instead of `failed`, and recovery is automatic: a
 recovery driver reclaims the apply and continues it from where it left off,
 using engine checkpoints so completed work is not redone. Failures where
 retrying cannot help — the engine rejected a statement, the target refused the
-change — skip this state and go straight to permanent `failed`.
+change, a row already in the table cannot be stored under the new definition
+(a NULL in a column the change makes `NOT NULL`) — skip this state and go
+straight to permanent `failed`.
 
 A clean shutdown is not one of these failures. A process that stops on purpose
 hands its claims back and leaves the apply active, so a peer driver resumes it

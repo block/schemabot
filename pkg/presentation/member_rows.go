@@ -89,10 +89,12 @@ func foldMember(ops []Operation, rows []int) (Operation, int) {
 	states := make([]string, len(rows))
 	member.NeverStarted = true
 	member.AlreadyConverged = true
+	member.Retrying = false
 	for k, i := range rows {
 		states[k] = ops[i].State
 		member.NeverStarted = member.NeverStarted && ops[i].NeverStarted
 		member.AlreadyConverged = member.AlreadyConverged && ops[i].AlreadyConverged
+		member.Retrying = member.Retrying || ops[i].Retrying
 	}
 	member.State = state.DeriveApplyState(states)
 	if member.State == state.ApplyOperation.Pending && parkedAtEarliestUnfinishedTable(ops, rows) {

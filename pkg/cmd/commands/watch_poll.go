@@ -13,6 +13,7 @@ import (
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/cmd/client"
 	"github.com/block/schemabot/pkg/cmd/cliname"
+	"github.com/block/schemabot/pkg/cmd/internal/templates"
 	"github.com/block/schemabot/pkg/state"
 )
 
@@ -26,20 +27,61 @@ const maxConsecutiveProgressFailures = 10
 // progressPoller fetches one apply's progress for the non-interactive watch
 // loops (log, JSON, and post-cutover). It owns every wait those loops make, so
 // a test can drive a loop through its states without real time passing.
+//
+// ctx is the command's run context, which the first Ctrl-C cancels. Both the
+// fetch and the wait end as soon as it is done, and the poller then reports
+// that the operator stopped the watch.
+//
+// environment is the environment the command that started the watch targeted,
+// which its hints carry so a pasted command reaches the same control plane.
+// Empty when the command did not name one.
 type progressPoller struct {
-	applyID string
-	fetch   func() (*apitypes.ProgressResponse, error)
-	sleep   func(time.Duration)
+	ctx         context.Context
+	applyID     string
+	environment string
+	fetch       func() (*apitypes.ProgressResponse, error)
+	sleep       func(time.Duration)
 }
 
-func newProgressPoller(endpoint, applyID string) *progressPoller {
+func newProgressPoller(ctx context.Context, endpoint, applyID, environment string) *progressPoller {
 	return &progressPoller{
-		applyID: applyID,
+		ctx:         ctx,
+		applyID:     applyID,
+		environment: environment,
 		fetch: func() (*apitypes.ProgressResponse, error) {
-			return client.GetProgress(endpoint, applyID)
+			return client.GetProgressCtx(ctx, endpoint, applyID)
 		},
-		sleep: time.Sleep,
+		sleep: func(d time.Duration) { sleepUnlessDone(ctx, d) },
 	}
+}
+
+// sleepUnlessDone waits for d, or until ctx is done if that comes first.
+func sleepUnlessDone(ctx context.Context, d time.Duration) {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+	case <-timer.C:
+	}
+}
+
+// pause waits d between polls. It returns the stopped-watching error once the
+// operator has cancelled the watch, whether before or during the wait.
+func (p *progressPoller) pause(d time.Duration) error {
+	p.sleep(d)
+	if p.ctx.Err() != nil {
+		return p.watchStopped()
+	}
+	return nil
+}
+
+// watchStopped tells the operator their Ctrl-C ended only the watch, and how
+// to pick it up again. The notice goes to stderr so a JSON stream on stdout
+// stays machine-readable, and the error is silent so the CLI exits with the
+// interrupt status without repeating it as a raw "context canceled" line.
+func (p *progressPoller) watchStopped() error {
+	fmt.Fprintln(os.Stderr, progressStoppedMessage(p.applyID, p.environment))
+	return interrupted(p.ctx)
 }
 
 // progressRetry describes one transient progress failure the poller is about
@@ -55,22 +97,32 @@ type progressRetry struct {
 // onRetry and retried with backoff, up to maxConsecutiveProgressFailures in a
 // row. A permanent failure, or one transient failure too many, is returned.
 // Watching is read-only, so giving up never affects the apply itself; the
-// returned error says how to resume watching it.
+// returned error says how to resume watching it. A fetch or wait that the
+// operator's Ctrl-C cut short is reported as the watch stopping, never as a
+// failed fetch to retry. A fetch that answered before the Ctrl-C landed is
+// still returned: the frame may be the apply's final state, which the
+// operator pressed Ctrl-C believing they would not see, and the caller's next
+// wait reports the stop.
 func (p *progressPoller) next(onRetry func(progressRetry)) (*apitypes.ProgressResponse, error) {
 	for failures := 1; ; failures++ {
 		result, err := p.fetch()
 		if err == nil {
 			return result, nil
 		}
+		if p.ctx.Err() != nil {
+			return nil, p.watchStopped()
+		}
 		if !isRetryableFetchError(err) {
 			return nil, fmt.Errorf("fetch progress for apply %s: %w", p.applyID, err)
 		}
 		if failures >= maxConsecutiveProgressFailures {
-			return nil, fmt.Errorf("%s: %w", progressGiveUpMessage(p.applyID, failures), err)
+			return nil, fmt.Errorf("%s: %w", progressGiveUpMessage(p.applyID, p.environment, failures), err)
 		}
 		wait := progressRetryWait(err, failures)
 		onRetry(progressRetry{err: err, attempt: failures, wait: wait})
-		p.sleep(wait)
+		if err := p.pause(wait); err != nil {
+			return nil, err
+		}
 	}
 }
 
@@ -78,9 +130,24 @@ func (p *progressPoller) next(onRetry func(progressRetry)) (*apitypes.ProgressRe
 // stayed unreadable for this many polls in a row. The watcher cannot see the
 // apply at that point, so the message claims nothing about its state and
 // points at the commands that will show it.
-func progressGiveUpMessage(applyID string, failures int) string {
-	return fmt.Sprintf("fetch progress for apply %s: %d consecutive attempts failed; this watch does not affect the apply; rerun the original watch command, or '%s progress %s', to see its current state",
-		applyID, failures, cliname.Name(), applyID)
+func progressGiveUpMessage(applyID, environment string, failures int) string {
+	return fmt.Sprintf("fetch progress for apply %s: %d consecutive attempts failed; this watch does not affect the apply; %s",
+		applyID, failures, resumeWatchHint(applyID, environment))
+}
+
+// progressStoppedMessage is what every non-interactive watch reports when the
+// operator stops it with Ctrl-C. Only the watch ends; the apply carries on.
+func progressStoppedMessage(applyID, environment string) string {
+	return fmt.Sprintf("Stopped watching apply %s; stopping the watch does not affect the apply; %s",
+		applyID, resumeWatchHint(applyID, environment))
+}
+
+// resumeWatchHint names the command that watches an apply this watch can no
+// longer follow. It names only a read: the command the operator ran to start
+// this watch was an apply, a rollback, or a cutover, and running that again
+// would submit a second one rather than show the first.
+func resumeWatchHint(applyID, environment string) string {
+	return fmt.Sprintf("watch it again with '%s'", templates.ProgressCommand(applyID, environment))
 }
 
 // isRetryableFetchError reports whether a failed progress fetch is worth
@@ -181,14 +248,14 @@ func startCommand(applyID, environment string) string {
 	if environment == "" {
 		environment = "<environment>"
 	}
-	return fmt.Sprintf("%s start -e %s %s", cliname.Name(), environment, applyID)
+	return cliname.Command("start", "-e", environment, applyID)
 }
 
 // noActiveChangeError ends a watch whose apply the server reports no active
 // schema change for. Progress by apply ID carries the apply's stored state, so
 // this answer means the watcher never saw how the apply ended; it fails rather
 // than guessing, and points at a command that will show the apply.
-func noActiveChangeError(applyID string) error {
-	return fmt.Errorf("progress for apply %s reported no active schema change, so this watch cannot tell how the apply ended; check '%s progress %s'",
-		applyID, cliname.Name(), applyID)
+func noActiveChangeError(applyID, environment string) error {
+	return fmt.Errorf("progress for apply %s reported no active schema change, so this watch cannot tell how the apply ended; check '%s'",
+		applyID, templates.ProgressCommand(applyID, environment))
 }

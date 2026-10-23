@@ -297,6 +297,7 @@ func TestLocalClient_FinalizerWithoutPendingCommandAppliesVSchema(t *testing.T) 
 
 	applies := f.eng.applies()
 	require.Len(t, applies, 1)
+	assert.Equal(t, f.apply.ApplyIdentifier, applies[0].ApplyIdentifier, "the engine learns which apply the finalizer belongs to")
 	require.Len(t, applies[0].Changes, 1)
 	assert.Equal(t, "ns_0", applies[0].Changes[0].Namespace)
 	assert.Equal(t, "true", applies[0].Changes[0].Metadata[storage.PlanMetadataVSchemaChanged])

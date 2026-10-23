@@ -783,25 +783,164 @@ func TestResumeApplyPlanLoadStorageErrorStaysRecoverable(t *testing.T) {
 	assert.Empty(t, observer.terminal, "a transient plan-load failure must not notify the terminal observer")
 }
 
-func TestResumeStoppedGroupedApplyHandlesPendingStartBeforeFailedTasks(t *testing.T) {
-	storageErr := errors.New("storage unavailable")
-	client, apply, tasks, applyStore := recoveryPlanLoadFixture(&scriptedPlanStore{err: storageErr})
+// stoppedApplyWithPendingStartFixture builds a stopped apply claimed for a
+// pending start — the stored row already moved to resuming, the drive still
+// holding the claim-time snapshot — whose `users` task rests stopped beside a
+// sibling task for `orders` in the given state. The sibling belongs to the same
+// operation. The plan store is scripted to fail, so a resume that goes on to
+// load its plan is told apart from one refused before it.
+func stoppedApplyWithPendingStartFixture(siblingState, siblingMessage string) (*LocalClient, *storage.Apply, []*storage.Task, *exactProgressApplyStore, *testControlRequestStore, error) {
+	planErr := errors.New("the resume must reach the plan load")
+	client, apply, tasks, applyStore := recoveryPlanLoadFixture(&scriptedPlanStore{err: planErr})
 	apply.State = state.Apply.Stopped
 	applyStore.apply = &storage.Apply{}
 	*applyStore.apply = *apply
 	applyStore.apply.State = state.Apply.Resuming
-	tasks[0].State = state.Task.Failed
+	tasks[0].State = state.Task.Stopped
+	sibling := *tasks[0]
+	sibling.ID = 3
+	sibling.TaskIdentifier = "task-recover-plan-orders"
+	sibling.TableName = "orders"
+	sibling.State = siblingState
+	sibling.ErrorMessage = siblingMessage
+	tasks = append(tasks, &sibling)
+	client.storage.(*exactProgressStorage).tasks = &exactProgressTaskStore{tasks: tasks}
 	requests := pendingControlRequestStore(apply.ID, storage.ControlOperationStart)
 	client.storage.(*exactProgressStorage).controlRequests = requests
+	return client, apply, tasks, applyStore, requests, planErr
+}
+
+const duplicateKeyFailureMessage = "Existing rows hold duplicate values for a unique key. Resolve the duplicates before applying a change that adds or narrows that key."
+
+// An operator stops an apply whose `orders` table had already failed while
+// `users` was still to run, then starts it. The failure decided the schema
+// change before the stop, so the start must not re-plan the failed table and
+// run its statement again. The start is refused with the failure, the apply
+// records it in place of the stopped state, the stopped sibling settles failed
+// with the same reason, and the operator is told to plan the change again. No
+// plan is loaded and no engine work starts.
+func TestResumeStoppedApplyRefusesAStartOverAFailedTask(t *testing.T) {
+	client, apply, tasks, applyStore, requests, _ := stoppedApplyWithPendingStartFixture(state.Task.Failed, duplicateKeyFailureMessage)
+	observer := &terminalRecordingObserver{}
+	client.SetObserver(apply.ID, observer)
 
 	err := client.resumeApplyWithTasks(t.Context(), apply, nil, tasks, nil, false, false)
 
-	require.ErrorIs(t, err, storageErr)
-	assert.Equal(t, state.Apply.Resuming, applyStore.apply.State,
-		"the stopped snapshot must not overwrite the stored start transition")
+	require.NoError(t, err)
+	want := "start refused: table orders failed before the apply was stopped (" + duplicateKeyFailureMessage + "); plan the schema change again and apply the new plan"
+	assert.Equal(t, state.Apply.Failed, applyStore.apply.State)
+	assert.Equal(t, want, applyStore.apply.ErrorMessage)
+	assert.Equal(t, state.Task.Failed, tasks[0].State, "the stopped sibling settles with the apply rather than staying resumable")
+	assert.Equal(t, want, tasks[0].ErrorMessage)
+	assert.Equal(t, duplicateKeyFailureMessage, tasks[1].ErrorMessage, "the failed task keeps its own reason")
 	require.Len(t, requests.requests, 1)
-	assert.Equal(t, storage.ControlRequestPending, requests.requests[0].Status,
-		"the start remains deliverable after a recoverable plan read failure")
+	assert.Equal(t, storage.ControlRequestFailed, requests.requests[0].Status, "the start is answered, not left pending")
+	assert.Contains(t, requests.requests[0].ErrorMessage, want)
+	require.Len(t, observer.terminal, 1, "the failed outcome posts its summary")
+}
+
+// A stopped apply whose other table already completed is the usual shape a
+// start finds, and a completed sibling is no reason to refuse it: the resume
+// continues to the plan load with the start still pending for it.
+func TestResumeStoppedApplyStartIsNotRefusedByCompletedSibling(t *testing.T) {
+	client, apply, tasks, applyStore, requests, planErr := stoppedApplyWithPendingStartFixture(state.Task.Completed, "")
+
+	err := client.resumeApplyWithTasks(t.Context(), apply, nil, tasks, nil, false, false)
+
+	require.ErrorIs(t, err, planErr, "the start must not be refused; the resume continues to the plan load")
+	assert.Equal(t, state.Apply.Resuming, applyStore.apply.State)
+	assert.Empty(t, applyStore.apply.ErrorMessage)
+	assert.Equal(t, state.Task.Stopped, tasks[0].State)
+	assert.Equal(t, storage.ControlRequestPending, requests.requests[0].Status)
+}
+
+// A retryable failure is resumable by design — the next claim requeues the
+// task — so a retryable sibling beside a stopped table does not refuse the
+// start either; only a permanent failure does.
+func TestResumeStoppedApplyStartIsNotRefusedByRetryableSibling(t *testing.T) {
+	client, apply, tasks, applyStore, requests, planErr := stoppedApplyWithPendingStartFixture(state.Task.FailedRetryable, "engine busy")
+
+	err := client.resumeApplyWithTasks(t.Context(), apply, nil, tasks, nil, false, false)
+
+	require.ErrorIs(t, err, planErr, "the start must not be refused; the resume continues to the plan load")
+	assert.Equal(t, state.Apply.Resuming, applyStore.apply.State)
+	assert.Empty(t, applyStore.apply.ErrorMessage)
+	assert.Equal(t, state.Task.Stopped, tasks[0].State)
+	assert.Equal(t, storage.ControlRequestPending, requests.requests[0].Status)
+}
+
+// A rollout's start is claimed one operation at a time, so the drive that
+// refuses it holds an operation lease only and owns its operation's tasks, not
+// the parent row. The refusal fails the operation's tasks — the stopped
+// sibling with the refusal, the failed task keeping its own reason — and
+// returns without writing the parent or answering the start: the operator
+// derives the operation row from the tasks, projects the parent under the
+// rollout's failure policy (ST-1), and settles the start from the projected
+// outcome (SettlePendingStartForResolvedApply). No plan is loaded.
+func TestResumeStoppedOperationRefusesAStartOverAFailedTaskWithoutWritingTheParent(t *testing.T) {
+	client, apply, tasks, applyStore, requests, _ := stoppedApplyWithPendingStartFixture(state.Task.Failed, duplicateKeyFailureMessage)
+	observer := &terminalRecordingObserver{}
+	client.SetObserver(apply.ID, observer)
+	ctx := storage.WithOperationLease(t.Context(), storage.OperationLease{ApplyID: apply.ID, OperationID: *tasks[0].ApplyOperationID, Owner: "driver", Token: "token"})
+
+	err := client.resumeApplyWithTasks(ctx, apply, nil, tasks, nil, false, false)
+
+	require.NoError(t, err)
+	want := "start refused: table orders failed before the apply was stopped (" + duplicateKeyFailureMessage + "); plan the schema change again and apply the new plan"
+	assert.Equal(t, state.Task.Failed, tasks[0].State, "the operation's stopped task settles failed for the operator to derive the operation row from")
+	assert.Equal(t, want, tasks[0].ErrorMessage)
+	assert.Equal(t, duplicateKeyFailureMessage, tasks[1].ErrorMessage)
+	assert.Equal(t, state.Apply.Resuming, applyStore.apply.State, "the parent row is the projection's to write")
+	assert.Empty(t, applyStore.apply.ErrorMessage)
+	assert.Equal(t, storage.ControlRequestPending, requests.requests[0].Status, "the start is the projection's to settle from the parent's outcome")
+	assert.Empty(t, observer.terminal, "the summary posts from the projection, not from the operation drive")
+}
+
+// An operator stops a rollout in which one deployment's table had already
+// failed and another deployment's table was still running, then starts it.
+// The failed table belongs to a sibling operation, whose failure the rollout
+// projection weighs under the apply's failure policy (ST-1); it is not the
+// resumed operation's verdict, so the start is not refused and the resume
+// goes on to load its plan. The resume is proven to have continued by the
+// plan-load failure it runs into, which a refused start would never reach.
+//
+// No production drive loads two operations' tasks under a pending start: a
+// rollout's start is claimed per operation (ResumeApplyOperation), where the
+// failed deployment's own drive refuses it, and the whole-apply drive
+// (ResumeApply) is reached only by stop reconciliation, which consumes a
+// pending stop and stands down. This pins the one-operation check that keeps
+// the refusal to the drive's own operation should a whole-apply start drive
+// ever be added.
+func TestResumeStoppedRolloutStartIsNotRefusedBySiblingOperationFailure(t *testing.T) {
+	planErr := errors.New("the resume must reach the plan load")
+	client, apply, tasks, applyStore := recoveryPlanLoadFixture(&scriptedPlanStore{err: planErr})
+	apply.State = state.Apply.Stopped
+	applyStore.apply = &storage.Apply{}
+	*applyStore.apply = *apply
+	applyStore.apply.State = state.Apply.Resuming
+	siblingOperationID := int64(4)
+	sibling := *tasks[0]
+	sibling.ID = 3
+	sibling.ApplyOperationID = &siblingOperationID
+	sibling.TaskIdentifier = "task-recover-plan-sibling"
+	sibling.TableName = "orders"
+	sibling.State = state.Task.Failed
+	sibling.ErrorMessage = "Existing rows hold duplicate values for a unique key. Resolve the duplicates before applying a change that adds or narrows that key."
+	tasks = append(tasks, &sibling)
+	client.storage.(*exactProgressStorage).tasks = &exactProgressTaskStore{tasks: tasks}
+	requests := pendingControlRequestStore(apply.ID, storage.ControlOperationStart)
+	client.storage.(*exactProgressStorage).controlRequests = requests
+	observer := &terminalRecordingObserver{}
+	client.SetObserver(apply.ID, observer)
+
+	err := client.resumeApplyWithTasks(t.Context(), apply, nil, tasks, nil, false, false)
+
+	require.ErrorIs(t, err, planErr, "the start must not be refused; the resume continues to the plan load")
+	assert.Equal(t, state.Apply.Resuming, applyStore.apply.State, "the apply is not failed from the sibling's task")
+	assert.Empty(t, applyStore.apply.ErrorMessage)
+	require.Len(t, requests.requests, 1)
+	assert.Equal(t, storage.ControlRequestPending, requests.requests[0].Status, "the start stays pending for the resume it admitted")
+	assert.Empty(t, observer.terminal, "no terminal outcome is posted")
 }
 
 // A resume claim that finds a pending cancel against a schema change already
@@ -854,8 +993,8 @@ func TestResumeApplyMissingPlanFailsApply(t *testing.T) {
 		"in-flight task must fail with its apply, got %s", tasks[0].State)
 	assert.Equal(t, "plan not found during recovery", tasks[0].ErrorMessage)
 	require.Len(t, requests.requests, 1)
-	assert.Equal(t, storage.ControlRequestCompleted, requests.requests[0].Status,
-		"the terminal outcome moots the pending revert")
+	assert.Equal(t, storage.ControlRequestFailed, requests.requests[0].Status,
+		"the terminal outcome outran the pending revert")
 	require.Len(t, observer.terminal, 1)
 	assert.True(t, state.IsState(observer.terminal[0].State, state.Apply.Failed))
 }
@@ -1177,6 +1316,155 @@ func TestResumeApplySequential_SettlesLandedStatementWithoutReexecution(t *testi
 	require.NoError(t, err)
 	assert.True(t, state.IsState(stored.State, state.Apply.Completed), "stored apply state was %q", stored.State)
 	assert.NotNil(t, stored.CompletedAt)
+}
+
+// A sequential drive failed its first task permanently, then exited before it
+// cancelled the second task or recorded the apply failed, so the apply was
+// re-claimed running. The failed task's statement had landed on the table
+// before the engine reported the failure, so the resume's re-plan reads its
+// table as done. The failure still decides the apply: the re-claim records the
+// apply failed with that task's error, leaves the task failed, cancels the
+// second task, and hands nothing to the engine, rather than settling the
+// failed task completed and running the rest.
+func TestResumeApplyWithTasks_FailedTaskWhoseStatementLandedKeepsItsVerdict(t *testing.T) {
+	logs := &mockApplyLogStore{}
+	taskStore := &exactProgressTaskStore{}
+	c, eng, apply, applies, tasks := newLandedSiblingResume(t, taskStore, logs)
+	plan := &storage.Plan{ID: 5}
+	apply.PlanID = plan.ID
+	applies.stored = *apply
+	store := c.storage.(*exactProgressStorage)
+	store.plans = &fakePlanStore{getByIDFn: func(int64) (*storage.Plan, error) { return plan, nil }}
+	failed, pending := tasks[0], tasks[1]
+	failed.State = state.Task.Failed
+	failed.ErrorMessage = "lost connection to the target during cutover"
+	pending.State = state.Task.Pending
+	taskStore.tasks = tasks
+	observer := &terminalRecordingObserver{}
+	c.SetObserver(apply.ID, observer)
+
+	require.NoError(t, c.resumeApplyWithTasks(t.Context(), apply, nil, tasks, nil, false, false))
+
+	stored, err := applies.Get(t.Context(), apply.ID)
+	require.NoError(t, err)
+	assert.Equal(t, state.Apply.Failed, stored.State)
+	assert.Equal(t, "table users failed: lost connection to the target during cutover", stored.ErrorMessage)
+	assert.Equal(t, state.Task.Failed, failed.State, "the failed task is not settled completed by the re-plan")
+	assert.Equal(t, state.Task.Cancelled, pending.State, "the task behind a permanent failure does not run")
+	assert.Empty(t, eng.applied, "nothing reaches the engine after a permanent failure")
+	require.Len(t, observer.terminal, 1)
+	assert.Equal(t, state.Apply.Failed, observer.terminal[0].State)
+}
+
+// A drive lost its connection to the target mid-copy on `users` and exited
+// before it saved the failure, so a later conflict check settled the task
+// failed_retryable from the engine's report while the apply stayed running
+// under a stale lease. When recovery reclaims that running apply, the task is
+// requeued like any retried task: the re-run is counted as an attempt, and the
+// earlier failure's reason does not survive onto the completed row.
+func TestResumeApplyWithTasks_RequeuesARetryableTaskUnderARunningApply(t *testing.T) {
+	taskStore := &exactProgressTaskStore{}
+	c, eng, apply, applies, tasks := newLandedSiblingResume(t, taskStore, &mockApplyLogStore{})
+	plan := &storage.Plan{ID: 5}
+	apply.PlanID = plan.ID
+	applies.stored = *apply
+	c.storage.(*exactProgressStorage).plans = &fakePlanStore{getByIDFn: func(int64) (*storage.Plan, error) { return plan, nil }}
+	landed, retried := tasks[0], tasks[1]
+	now := time.Now()
+	landed.State = state.Task.Completed
+	landed.CompletedAt = &now
+	retried.State = state.Task.FailedRetryable
+	retried.ErrorMessage = "lost connection to the target during the copy"
+	taskStore.tasks = tasks
+
+	require.NoError(t, c.resumeApplyWithTasks(t.Context(), apply, nil, tasks, nil, false, false))
+
+	assert.Equal(t, []string{"ALTER TABLE `users` ADD COLUMN `name` varchar(255)"}, eng.applied, "only the retried task runs")
+	assert.Equal(t, state.Task.Completed, retried.State)
+	assert.Equal(t, 1, retried.Attempt, "the retry is counted as an attempt")
+	assert.Empty(t, retried.ErrorMessage, "a completed task carries no failure reason")
+	assert.Equal(t, 0, landed.Attempt, "a completed task is not requeued")
+	stored, err := applies.Get(t.Context(), apply.ID)
+	require.NoError(t, err)
+	assert.Equal(t, state.Apply.Completed, stored.State)
+}
+
+// The same re-claim, but the failed task's table has left the re-plan diff
+// entirely: live already matches the reviewed target for it, so the re-plan
+// would otherwise read the table as done. The stored failure still decides the
+// apply, the task stays failed, the task behind it is cancelled, and nothing
+// reaches the engine.
+func TestResumeApplyWithTasks_FailedTaskWhoseTableLeftTheDiffKeepsItsVerdict(t *testing.T) {
+	logs := &mockApplyLogStore{}
+	taskStore := &exactProgressTaskStore{}
+	c, eng, apply, applies, tasks := newLandedSiblingResume(t, taskStore, logs)
+	plan := &storage.Plan{ID: 5}
+	apply.PlanID = plan.ID
+	applies.stored = *apply
+	store := c.storage.(*exactProgressStorage)
+	store.plans = &fakePlanStore{getByIDFn: func(int64) (*storage.Plan, error) { return plan, nil }}
+	failed, pending := tasks[0], tasks[1]
+	failed.TableName = "orders"
+	failed.DDL = "ALTER TABLE `orders` ADD COLUMN `email` varchar(255)"
+	failed.State = state.Task.Failed
+	failed.ErrorMessage = "lost connection to the target during cutover"
+	pending.State = state.Task.Pending
+	taskStore.tasks = tasks
+	observer := &terminalRecordingObserver{}
+	c.SetObserver(apply.ID, observer)
+
+	require.NoError(t, c.resumeApplyWithTasks(t.Context(), apply, nil, tasks, nil, false, false))
+
+	stored, err := applies.Get(t.Context(), apply.ID)
+	require.NoError(t, err)
+	assert.Equal(t, state.Apply.Failed, stored.State)
+	assert.Equal(t, "table orders failed: lost connection to the target during cutover", stored.ErrorMessage)
+	assert.Equal(t, state.Task.Failed, failed.State, "a table that left the diff does not settle its failed task completed")
+	assert.Equal(t, state.Task.Cancelled, pending.State, "the task behind a permanent failure does not run")
+	assert.Empty(t, eng.applied, "nothing reaches the engine after a permanent failure")
+	require.Len(t, observer.terminal, 1)
+	assert.Equal(t, state.Apply.Failed, observer.terminal[0].State)
+}
+
+// An apply paused for operator retry holds a permanently failed task ahead of
+// a task that never ran, and an operator's start admits the claim. The stored
+// failure is the first thing the sequential drive would read, so the apply
+// fails from it without resuming anything, and the start is answered with that
+// failure rather than reported completed over a resume that never happened
+// (CO-2). The task behind the failure is cancelled, as on every sequential
+// failure.
+func TestResumeApplyWithTasks_FailedTaskAheadOfPendingTaskAnswersTheAdmittingStart(t *testing.T) {
+	logs := &mockApplyLogStore{}
+	taskStore := &exactProgressTaskStore{}
+	c, eng, apply, applies, tasks := newLandedSiblingResume(t, taskStore, logs)
+	plan := &storage.Plan{ID: 5}
+	apply.PlanID = plan.ID
+	apply.State = state.Apply.FailedRetryable
+	applies.stored = *apply
+	store := c.storage.(*exactProgressStorage)
+	store.plans = &fakePlanStore{getByIDFn: func(int64) (*storage.Plan, error) { return plan, nil }}
+	requests := pendingControlRequestStore(apply.ID, storage.ControlOperationStart)
+	store.controlRequests = requests
+	failed, pending := tasks[0], tasks[1]
+	failed.State = state.Task.Failed
+	failed.ErrorMessage = "lost connection to the target during cutover"
+	pending.State = state.Task.Pending
+	taskStore.tasks = tasks
+	observer := &terminalRecordingObserver{}
+	c.SetObserver(apply.ID, observer)
+
+	require.NoError(t, c.resumeApplyWithTasks(t.Context(), apply, nil, tasks, nil, false, false))
+
+	assert.Equal(t, state.Apply.Failed, applies.stored.State)
+	assert.Equal(t, "table users failed: lost connection to the target during cutover", applies.stored.ErrorMessage)
+	require.Len(t, requests.requests, 1)
+	assert.Equal(t, storage.ControlRequestFailed, requests.requests[0].Status,
+		"the start that admitted the claim is answered with the failure, not reported completed")
+	assert.Contains(t, requests.requests[0].ErrorMessage, "lost connection to the target during cutover")
+	assert.Equal(t, state.Task.Cancelled, pending.State, "the task behind a permanent failure does not run")
+	assert.Empty(t, eng.applied, "nothing reaches the engine after a permanent failure")
+	require.Len(t, observer.terminal, 1)
+	assert.Equal(t, state.Apply.Failed, observer.terminal[0].State)
 }
 
 // A landed-statement settlement on the sequential path is only real once the
@@ -1618,7 +1906,8 @@ func TestResumeApplyWithTasks_RetryStaysPendingWhenRetryableTaskRequeueFails(t *
 	err := c.resumeApplyWithTasks(t.Context(), apply, nil, []*storage.Task{task}, nil, false, false)
 
 	require.ErrorIs(t, err, storageErr)
-	assert.ErrorContains(t, err, "requeue retryable task task_email for retry of apply apply-retry-requeue-refused")
+	require.ErrorIs(t, err, ErrTaskRequeueRefused)
+	assert.ErrorContains(t, err, "retryable task task_email for retry of apply apply-retry-requeue-refused")
 	assert.True(t, state.IsState(task.State, state.Task.FailedRetryable), "the refused requeue leaves the task retryable, got %s", task.State)
 	assert.Empty(t, eng.applied, "nothing is handed to the engine")
 	stored, err := applies.Get(t.Context(), apply.ID)
@@ -1686,7 +1975,8 @@ func TestResumeApplyWithTasks_StartStaysPendingWhenStoppedTaskRequeueFails(t *te
 	err := c.resumeApplyWithTasks(t.Context(), apply, nil, []*storage.Task{task}, nil, false, false)
 
 	require.ErrorIs(t, err, storageErr)
-	assert.ErrorContains(t, err, "requeue stopped task task_email for start of apply apply-start-requeue-refused")
+	require.ErrorIs(t, err, ErrTaskRequeueRefused)
+	assert.ErrorContains(t, err, "stopped task task_email for start of apply apply-start-requeue-refused")
 	assert.True(t, state.IsState(task.State, state.Task.Stopped), "the refused requeue leaves the task stopped, got %s", task.State)
 	assert.Empty(t, eng.applied, "nothing is handed to the engine")
 	stored, err := applies.Get(t.Context(), apply.ID)
@@ -1788,7 +2078,8 @@ func TestResumeApplyWithTasks_StartStaysPendingWhenGroupedStoppedTaskRequeueFail
 	err := c.resumeApplyWithTasks(t.Context(), apply, nil, tasks, nil, false, false)
 
 	require.ErrorIs(t, err, storageErr)
-	assert.ErrorContains(t, err, "requeue stopped task task_name for start of apply apply-grouped-start-requeue-refused")
+	require.ErrorIs(t, err, ErrTaskRequeueRefused)
+	assert.ErrorContains(t, err, "stopped task task_name for start of apply apply-grouped-start-requeue-refused")
 	assert.True(t, state.IsState(tasks[0].State, state.Task.Pending), "the requeue that landed stays pending, got %s", tasks[0].State)
 	assert.True(t, state.IsState(tasks[1].State, state.Task.Stopped), "the refused requeue leaves the task stopped, got %s", tasks[1].State)
 	assert.Empty(t, eng.applied, "nothing is handed to the engine")

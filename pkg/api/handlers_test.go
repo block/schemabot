@@ -60,6 +60,9 @@ func (m *mockPlanLookupStore) Get(context.Context, string) (*storage.Plan, error
 	return m.plan, m.err
 }
 func (m *mockPlanLookupStore) GetByID(context.Context, int64) (*storage.Plan, error) { return nil, nil }
+func (m *mockPlanLookupStore) GetListAnchor(context.Context, string) (*storage.PlanListAnchor, error) {
+	return nil, nil
+}
 func (m *mockPlanLookupStore) GetByLock(context.Context, int64) ([]*storage.Plan, error) {
 	return nil, nil
 }
@@ -103,10 +106,20 @@ func (s *capturingPlanStore) Create(_ context.Context, plan *storage.Plan) (int6
 
 type mockStorageWithPlanLookup struct {
 	mockStorage
-	plans storage.PlanStore
+	plans      storage.PlanStore
+	operations storage.ApplyOperationStore
 }
 
 func (m *mockStorageWithPlanLookup) Plans() storage.PlanStore { return m.plans }
+
+// ApplyOperations serves an apply that recorded no operations unless the test
+// sets its own.
+func (m *mockStorageWithPlanLookup) ApplyOperations() storage.ApplyOperationStore {
+	if m.operations == nil {
+		return &staticApplyOperationStore{}
+	}
+	return m.operations
+}
 
 type mockStorageWithApplyStores struct {
 	mockStorage
@@ -219,6 +232,8 @@ type staticPlanStore struct {
 	// listed by the round the apply was created from.
 	memberPlans []*storage.Plan
 	err         error
+	// errByID fails GetByID for the listed plan IDs only.
+	errByID map[int64]error
 }
 
 func (s *staticPlanStore) List(_ context.Context, opts storage.ListPlansOptions) ([]*storage.Plan, error) {
@@ -244,6 +259,9 @@ func (s *staticPlanStore) Get(context.Context, string) (*storage.Plan, error) {
 func (s *staticPlanStore) GetByID(_ context.Context, id int64) (*storage.Plan, error) {
 	if s.err != nil {
 		return nil, s.err
+	}
+	if err := s.errByID[id]; err != nil {
+		return nil, err
 	}
 	if s.plansByID != nil {
 		return s.plansByID[id], nil
@@ -369,6 +387,18 @@ func (s *recentApplyStore) GetRecent(_ context.Context, filter storage.RecentApp
 	return applies, nil
 }
 
+func (s *recentApplyStore) GetByApplyIdentifier(_ context.Context, applyIdentifier string) (*storage.Apply, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
+	for _, apply := range s.applies {
+		if apply.ApplyIdentifier == applyIdentifier {
+			return apply, nil
+		}
+	}
+	return nil, nil
+}
+
 func (s *recentApplyStore) CountRecentByState(_ context.Context, filter storage.RecentAppliesFilter) (map[string]int, error) {
 	if s.err != nil {
 		return nil, s.err
@@ -427,6 +457,13 @@ func (s *memoryControlRequestStore) RequestPending(_ context.Context, req *stora
 	return cloneControlRequest(stored), false, nil
 }
 
+func (s *memoryControlRequestStore) RequestPendingSuperseding(ctx context.Context, req *storage.ApplyControlRequest, superseded storage.ControlOperation) (*storage.ApplyControlRequest, bool, error) {
+	if err := s.CompletePending(ctx, req.ApplyID, superseded); err != nil {
+		return nil, false, err
+	}
+	return s.RequestPending(ctx, req)
+}
+
 func (s *memoryControlRequestStore) GetPending(_ context.Context, applyID int64, operation storage.ControlOperation) (*storage.ApplyControlRequest, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -448,6 +485,10 @@ func (s *memoryControlRequestStore) GetByOperation(_ context.Context, applyID in
 			return cloneControlRequest(req), nil
 		}
 	}
+	return nil, nil
+}
+
+func (s *memoryControlRequestStore) ListStrandedPending(context.Context, int) ([]*storage.StrandedControlRequest, error) {
 	return nil, nil
 }
 
@@ -881,13 +922,20 @@ func hasApplyLogMessageContaining(logs []*storage.ApplyLog, want string) bool {
 
 // mockTernClient implements tern.Client for testing.
 type mockTernClient struct {
-	healthErr    error
-	planResp     *ternv1.PlanResponse
-	planErr      error
-	planReq      *ternv1.PlanRequest
-	planDiffResp *ternv1.PlanDiffResponse
-	planDiffErr  error
-	planDiffReq  *ternv1.PlanRequest
+	compareMu   sync.Mutex
+	compareReqs []*ternv1.CompareSchemaFileChangeRequest
+	// compareDeadlines holds each comparison's context deadline, the zero
+	// time when it had none.
+	compareDeadlines []time.Time
+	compareResp      *ternv1.CompareSchemaFileChangeResponse
+	compareErr       error
+	healthErr        error
+	planResp         *ternv1.PlanResponse
+	planErr          error
+	planReq          *ternv1.PlanRequest
+	planDiffResp     *ternv1.PlanDiffResponse
+	planDiffErr      error
+	planDiffReq      *ternv1.PlanRequest
 	// planDiffMu guards planDiffReq: a rollout plan diffs its members
 	// concurrently, so one client can serve several diffs at once.
 	planDiffMu     sync.Mutex
@@ -966,6 +1014,21 @@ func (m *mockTernClient) Plan(ctx context.Context, req *ternv1.PlanRequest) (*te
 	}
 	return nil, m.planErr
 }
+func (m *mockTernClient) CompareSchemaFileChange(ctx context.Context, req *ternv1.CompareSchemaFileChangeRequest) (*ternv1.CompareSchemaFileChangeResponse, error) {
+	m.compareMu.Lock()
+	defer m.compareMu.Unlock()
+	m.compareReqs = append(m.compareReqs, req)
+	deadline, _ := ctx.Deadline()
+	m.compareDeadlines = append(m.compareDeadlines, deadline)
+	if m.compareErr != nil {
+		return nil, m.compareErr
+	}
+	if m.compareResp == nil {
+		return nil, fmt.Errorf("mock tern client has no schema file comparison response")
+	}
+	return m.compareResp, nil
+}
+
 func (m *mockTernClient) PlanDiff(ctx context.Context, req *ternv1.PlanRequest) (*ternv1.PlanDiffResponse, error) {
 	m.planDiffMu.Lock()
 	m.planDiffReq = req
@@ -5167,6 +5230,69 @@ func TestValidateRollbackSourceApplyRejectsPlannerSourceMismatchForOlderApply(t 
 	assert.Contains(t, err.Error(), "current rollback planner would select")
 }
 
+// A rollout whose targets are each planned against their own schema runs every
+// target but the primary from a member plan bound to the primary, so the latest
+// task can point at a member plan of the apply's own review round. That task is
+// still this apply's work and passes the source check. A task on a plan bound
+// to some other review round, or on a plan that is no longer stored, is
+// rejected for good. A plan that fails to load is a storage failure the caller
+// can retry, never a verdict on the task.
+func TestValidateRollbackSourceApplyAcceptsMemberPlanOfTheApplysRound(t *testing.T) {
+	now := time.Now().UTC()
+	for _, tc := range []struct {
+		name          string
+		memberPrimary string
+		memberMissing bool
+		memberLoadErr error
+		wantErr       string
+		wantTerminal  bool
+	}{
+		{name: "member plan of the apply's round", memberPrimary: "plan-primary"},
+		{name: "member plan of another round", memberPrimary: "plan-other", wantErr: "latest schema change task for database orders points to plan 11", wantTerminal: true},
+		{name: "member plan no longer stored", memberMissing: true, wantErr: "latest schema change task for database orders points to plan 11", wantTerminal: true},
+		{name: "member plan fails to load", memberPrimary: "plan-primary", memberLoadErr: errors.New("connection refused"), wantErr: "load plan 11 of rollback source task"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			apply := rollbackGuardrailApply("apply_rollout", 1, 10, now)
+			primary := rollbackGuardrailPlan(10, true)
+			primary.PlanIdentifier = "plan-primary"
+			plans := map[int64]*storage.Plan{10: primary}
+			if !tc.memberMissing {
+				member := rollbackGuardrailPlan(11, true)
+				member.PlanIdentifier = "plan-member"
+				member.PrimaryPlanIdentifier = tc.memberPrimary
+				plans[11] = member
+			}
+			svc := newRollbackGuardrailServiceWithApplies([]*storage.Apply{apply}, plans,
+				[]*storage.Task{rollbackGuardrailTask(1, 11, now)})
+			if tc.memberLoadErr != nil {
+				svc.storage.Plans().(*staticPlanStore).errByID = map[int64]error{11: tc.memberLoadErr}
+			}
+
+			_, gotPlan, err := svc.ValidateRollbackSourceApply(t.Context(), RollbackSourceRequest{
+				ApplyIdentifier: "apply_rollout",
+				Environment:     "staging",
+				Repository:      "org/repo",
+				PullRequest:     1,
+			})
+
+			if tc.wantErr != "" {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tc.wantErr)
+				var terminal *terminalControlError
+				assert.Equal(t, tc.wantTerminal, errors.As(err, &terminal), "whether retrying the same request can succeed")
+				if tc.memberLoadErr != nil {
+					assert.ErrorIs(t, err, tc.memberLoadErr, "the storage failure stays in the chain for the caller")
+				}
+				return
+			}
+			require.NoError(t, err)
+			require.NotNil(t, gotPlan)
+			assert.Equal(t, int64(10), gotPlan.ID, "the source plan stays the apply's primary plan")
+		})
+	}
+}
+
 func TestValidateRollbackSourceApplyScopesLatestCompletedTaskByEnvironment(t *testing.T) {
 	now := time.Now().UTC()
 	apply := rollbackGuardrailApply("apply_staging", 1, 10, now.Add(-time.Minute))
@@ -7397,6 +7523,45 @@ func TestCutoverHandler(t *testing.T) {
 		assert.Contains(t, resp.Error, "recovering after restart")
 	})
 
+	// A remote data plane can still report waiting-for-cutover after SchemaBot
+	// recorded the apply as terminal. The stored terminal state wins: the request
+	// is refused up front rather than recorded as accepted and failed later.
+	t.Run("rejects cutover against a terminal apply while remote still reports waiting for cutover", func(t *testing.T) {
+		for _, terminal := range []string{state.Apply.Failed, state.Apply.Cancelled, state.Apply.Completed} {
+			t.Run(terminal, func(t *testing.T) {
+				mock := &mockTernClient{
+					isRemote: true,
+					progressResp: &ternv1.ProgressResponse{
+						State: ternv1.State_STATE_WAITING_FOR_CUTOVER,
+					},
+				}
+				apply := activeTestApply("apply-terminal-cutover")
+				apply.ExternalID = "remote-terminal-cutover"
+				apply.State = terminal
+				svc := newControlTestService(mock, apply)
+				mux := http.NewServeMux()
+				svc.ConfigureRoutes(mux)
+
+				body := `{"environment": "staging", "apply_id": "apply-terminal-cutover", "caller": "cli:cutter"}`
+				req := httptest.NewRequestWithContext(t.Context(), "POST", "/api/cutover", strings.NewReader(body))
+				req.Header.Set("Content-Type", "application/json")
+				w := httptest.NewRecorder()
+				mux.ServeHTTP(w, req)
+
+				assert.Equal(t, http.StatusConflict, w.Code, w.Body.String())
+				assert.Nil(t, mock.cutoverReq)
+				controlReq, err := svc.storage.ControlRequests().GetPending(t.Context(), apply.ID, storage.ControlOperationCutover)
+				require.NoError(t, err)
+				assert.Nil(t, controlReq, "no cutover request is recorded against a terminal apply")
+
+				var resp apitypes.ErrorResponse
+				err = json.NewDecoder(w.Body).Decode(&resp)
+				require.NoError(t, err)
+				assert.Contains(t, resp.Error, "schema change is not waiting for cutover (current state: "+terminal+")")
+			})
+		}
+	})
+
 	t.Run("queues cutover when remote progress reaches cutting over before stored state", func(t *testing.T) {
 		mock := &mockTernClient{
 			isRemote: true,
@@ -7589,6 +7754,64 @@ func TestRevertHandler(t *testing.T) {
 		assert.Equal(t, "staging", mock.revertReq.Environment)
 	})
 
+	// A multi-operation apply drives each operation against its own deployment,
+	// so an immediate call keyed on one apply id would revert one operation and
+	// leave its siblings. The durable request is queued and the operator fans it
+	// out instead.
+	t.Run("skips the immediate call for a multi-operation apply", func(t *testing.T) {
+		mock := &mockTernClient{revertResp: &ternv1.RevertResponse{Accepted: true}}
+		apply := activeTestApply("apply-rev-multi")
+		apply.State = state.Apply.RevertWindow
+		apply.Engine = storage.EnginePlanetScale
+		apply.DatabaseType = storage.DatabaseTypeVitess
+		svc := newControlTestServiceWithOperations(mock, apply, nil, []*storage.ApplyOperation{
+			{ID: 1, ApplyID: apply.ID, Deployment: "deploy-a", Target: "target-a", State: state.ApplyOperation.RevertWindow},
+			{ID: 2, ApplyID: apply.ID, Deployment: "deploy-b", Target: "target-b", State: state.ApplyOperation.RevertWindow},
+		})
+		mux := http.NewServeMux()
+		svc.ConfigureRoutes(mux)
+
+		body := `{"environment": "staging", "apply_id": "apply-rev-multi"}`
+		req := httptest.NewRequestWithContext(t.Context(), "POST", "/api/revert", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, req)
+
+		assert.Equal(t, http.StatusAccepted, w.Code, w.Body.String())
+		assert.Nil(t, mock.revertReq, "the immediate revert must not reach a single deployment")
+		pending, err := svc.storage.ControlRequests().GetPending(t.Context(), apply.ID, storage.ControlOperationRevert)
+		require.NoError(t, err)
+		assert.NotNil(t, pending, "the durable revert request stays queued for the operator")
+	})
+
+	// When the operation count cannot be read the apply may span several
+	// operations, and an accepted immediate call would complete the request
+	// before the siblings receive it. The request stays pending for the driver.
+	t.Run("skips the immediate call when the operation count is unknown", func(t *testing.T) {
+		mock := &mockTernClient{revertResp: &ternv1.RevertResponse{Accepted: true}}
+		apply := activeTestApply("apply-rev-count-unknown")
+		apply.State = state.Apply.RevertWindow
+		apply.Engine = storage.EnginePlanetScale
+		apply.DatabaseType = storage.DatabaseTypeVitess
+		svc := newControlTestServiceWithOperations(mock, apply, nil, nil)
+		svc.storage.(*mockStorageWithApplyStores).operations.(*staticApplyOperationStore).err = errors.New("operation store unavailable")
+		mux := http.NewServeMux()
+		svc.ConfigureRoutes(mux)
+
+		body := `{"environment": "staging", "apply_id": "apply-rev-count-unknown"}`
+		req := httptest.NewRequestWithContext(t.Context(), "POST", "/api/revert", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, req)
+
+		assert.Equal(t, http.StatusAccepted, w.Code, w.Body.String())
+		assert.Nil(t, mock.revertReq, "the immediate revert must not reach a single deployment")
+		pending, err := svc.storage.ControlRequests().GetPending(t.Context(), apply.ID, storage.ControlOperationRevert)
+		require.NoError(t, err)
+		require.NotNil(t, pending, "the durable revert request stays queued for the driver")
+		assert.Equal(t, storage.ControlRequestPending, pending.Status)
+	})
+
 	t.Run("requires apply_id", func(t *testing.T) {
 		mock := &mockTernClient{}
 		svc := newControlTestService(mock, activeTestApply("apply-active-revert"))
@@ -7631,6 +7854,57 @@ func TestSkipRevertHandler(t *testing.T) {
 		require.NotNil(t, mock.skipRevertReq)
 		assert.Equal(t, "apply-skip456", mock.skipRevertReq.ApplyId)
 		assert.Equal(t, "staging", mock.skipRevertReq.Environment)
+	})
+
+	t.Run("skips the immediate call for a multi-operation apply", func(t *testing.T) {
+		mock := &mockTernClient{skipRevertResp: &ternv1.SkipRevertResponse{Accepted: true}}
+		apply := activeTestApply("apply-skip-multi")
+		apply.State = state.Apply.RevertWindow
+		apply.Engine = storage.EnginePlanetScale
+		apply.DatabaseType = storage.DatabaseTypeVitess
+		svc := newControlTestServiceWithOperations(mock, apply, nil, []*storage.ApplyOperation{
+			{ID: 1, ApplyID: apply.ID, Deployment: "deploy-a", Target: "target-a", State: state.ApplyOperation.RevertWindow},
+			{ID: 2, ApplyID: apply.ID, Deployment: "deploy-b", Target: "target-b", State: state.ApplyOperation.RevertWindow},
+		})
+		mux := http.NewServeMux()
+		svc.ConfigureRoutes(mux)
+
+		body := `{"environment": "staging", "apply_id": "apply-skip-multi"}`
+		req := httptest.NewRequestWithContext(t.Context(), "POST", "/api/skip-revert", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, req)
+
+		assert.Equal(t, http.StatusAccepted, w.Code, w.Body.String())
+		assert.Nil(t, mock.skipRevertReq, "the immediate skip-revert must not reach a single deployment")
+		pending, err := svc.storage.ControlRequests().GetPending(t.Context(), apply.ID, storage.ControlOperationSkipRevert)
+		require.NoError(t, err)
+		assert.NotNil(t, pending, "the durable skip-revert request stays queued for the operator")
+	})
+
+	t.Run("skips the immediate call when the operation count is unknown", func(t *testing.T) {
+		mock := &mockTernClient{skipRevertResp: &ternv1.SkipRevertResponse{Accepted: true}}
+		apply := activeTestApply("apply-skip-count-unknown")
+		apply.State = state.Apply.RevertWindow
+		apply.Engine = storage.EnginePlanetScale
+		apply.DatabaseType = storage.DatabaseTypeVitess
+		svc := newControlTestServiceWithOperations(mock, apply, nil, nil)
+		svc.storage.(*mockStorageWithApplyStores).operations.(*staticApplyOperationStore).err = errors.New("operation store unavailable")
+		mux := http.NewServeMux()
+		svc.ConfigureRoutes(mux)
+
+		body := `{"environment": "staging", "apply_id": "apply-skip-count-unknown"}`
+		req := httptest.NewRequestWithContext(t.Context(), "POST", "/api/skip-revert", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, req)
+
+		assert.Equal(t, http.StatusAccepted, w.Code, w.Body.String())
+		assert.Nil(t, mock.skipRevertReq, "the immediate skip-revert must not reach a single deployment")
+		pending, err := svc.storage.ControlRequests().GetPending(t.Context(), apply.ID, storage.ControlOperationSkipRevert)
+		require.NoError(t, err)
+		require.NotNil(t, pending, "the durable skip-revert request stays queued for the driver")
+		assert.Equal(t, storage.ControlRequestPending, pending.Status)
 	})
 
 	t.Run("requires apply_id", func(t *testing.T) {

@@ -171,6 +171,7 @@ func progressResponseFromProto(resp *ternv1.ProgressResponse) *apitypes.Progress
 			RowsCopied:          t.RowsCopied,
 			RowsTotal:           t.RowsTotal,
 			EstimatedBytes:      t.EstimatedBytes,
+			EstimatedRows:       t.EstimatedRows,
 			PercentComplete:     t.PercentComplete,
 			ETASeconds:          t.EtaSeconds,
 			ChecksumRowsChecked: t.ChecksumRowsChecked,
@@ -278,25 +279,53 @@ func progressOperationsFromRows(ops []*storage.ApplyOperation) ([]*apitypes.Prog
 	return responses, memberByOperationID
 }
 
+// storedProgressOperations is every projection the storage-served progress
+// response needs from an apply's operation rows.
+type storedProgressOperations struct {
+	// responses are the API operation entries.
+	responses []*apitypes.ProgressOperationResponse
+	// memberByOperationID maps each operation row to the member it runs on.
+	memberByOperationID map[int64]routing.ExecutionTarget
+	// rows are the raw operation rows, for the stored engine metadata overlay.
+	rows []*storage.ApplyOperation
+	// released is the rollout's release latch.
+	released bool
+	// listed is false when the rows could not be read, so the fields above say
+	// nothing about which operations the apply has.
+	listed bool
+}
+
 // bestEffortProgressOperations loads the apply's operation rows once and
 // returns every projection the storage-served progress response needs from
-// them: the API operation entries, the operation-id→member map, the raw rows
-// (for the stored engine metadata overlay), and the release latch.
-func (s *Service) bestEffortProgressOperations(ctx context.Context, apply *storage.Apply) ([]*apitypes.ProgressOperationResponse, map[int64]routing.ExecutionTarget, []*storage.ApplyOperation, bool) {
+// them, or none, with listed false, when they cannot be read.
+func (s *Service) bestEffortProgressOperations(ctx context.Context, apply *storage.Apply) storedProgressOperations {
 	if apply == nil {
 		s.logger.Warn("progress response will omit per-deployment operations: apply is nil")
-		return nil, nil, nil, false
+		return storedProgressOperations{}
 	}
 	operations, memberByOperationID, ops, err := s.progressOperationsForApply(ctx, apply)
 	if err != nil {
 		// Operation rows are observability enrichment, not an apply safety gate.
 		// Serve progress without the enrichment and log the storage uncertainty.
-		s.logger.Warn("progress response will omit per-deployment operations",
+		s.logger.Warn("progress response will omit per-deployment operations and serve each task row as stored",
 			append(apply.LogAttrs(),
 				"error", err)...)
-		return nil, nil, nil, false
+		return storedProgressOperations{}
 	}
-	return operations, memberByOperationID, ops, s.resolveReleaseLatch(ctx, apply, ops)
+	return storedProgressOperations{
+		responses:           operations,
+		memberByOperationID: memberByOperationID,
+		rows:                ops,
+		released:            s.resolveReleaseLatch(ctx, apply, ops),
+		listed:              true,
+	}
+}
+
+// isMultiOperationApply reports whether an apply is made of more than one
+// operation: more than one is attached, or its generation manifest declares
+// more than one, of which some are still to attach one dispatch at a time.
+func isMultiOperationApply(apply *storage.Apply, ops []*storage.ApplyOperation) bool {
+	return len(ops) > 1 || len(apply.ExpectedOperationKeys) > 1
 }
 
 // handleProgressByApplyID handles GET /api/progress/apply/{apply_id} requests.
@@ -340,7 +369,11 @@ func (s *Service) handleProgressByApplyID(w http.ResponseWriter, r *http.Request
 	// path below, so a polled progress read hits apply_operations a single time.
 	ops, opsErr := s.storage.ApplyOperations().ListByApply(r.Context(), apply.ID)
 	if opsErr != nil {
-		s.logger.Warn("could not determine apply operation count; serving progress via the single-deployment path",
+		path := "the single-deployment path"
+		if isMultiOperationApply(apply, nil) {
+			path = "storage, as its generation manifest declares several operations"
+		}
+		s.logger.Warn("failed to list apply operations; serving progress from "+path,
 			append(apply.LogAttrs(),
 				"error", opsErr)...)
 	}
@@ -350,10 +383,11 @@ func (s *Service) handleProgressByApplyID(w http.ResponseWriter, r *http.Request
 	// operator from the operation rows. Serve it from storage so operators see
 	// the real aggregate state and the per-deployment breakdown, not a
 	// single-deployment remote view keyed on a parent id that does not exist
-	// (which would also rewrite a running aggregate to pending). On a storage
-	// error, fall back to the single-deployment path: every apply created today
-	// has one operation, so this only degrades the dormant multi-op case.
-	if opsErr == nil && len(ops) > 1 {
+	// (which would also rewrite a running aggregate to pending). When the
+	// operation rows cannot be listed, the generation manifest alone still says
+	// whether the apply declares several operations; only an apply without one
+	// falls back to the single-deployment path, which describes one operation.
+	if isMultiOperationApply(apply, ops) {
 		httpResp, err := s.progressFromLocalStorage(r.Context(), apply)
 		if err != nil {
 			s.logger.Warn("failed to read multi-operation apply progress from storage; falling back to the single-deployment path",
@@ -860,7 +894,7 @@ func (s *Service) handleStatus(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	activeOnly, err := parseStatusActiveOnly(r)
+	activeFilter, err := parseStatusActive(r)
 	if err != nil {
 		s.writeError(w, http.StatusBadRequest, err.Error())
 		return
@@ -870,6 +904,7 @@ func (s *Service) handleStatus(w http.ResponseWriter, r *http.Request) {
 		Limit:       limit + 1,
 		Environment: storage.CanonicalKey(r.URL.Query().Get("environment")),
 		Deployment:  storage.CanonicalKey(r.URL.Query().Get("deployment")),
+		Database:    storage.CanonicalKey(r.URL.Query().Get("database")),
 	}
 	if failuresOnly {
 		filter.States = []string{state.Apply.Failed, state.Apply.FailedRetryable}
@@ -877,15 +912,30 @@ func (s *Service) handleStatus(w http.ResponseWriter, r *http.Request) {
 	if stateFilter != "" {
 		filter.States = []string{stateFilter}
 	}
-	if activeOnly {
-		filter.ActiveOnly = true
+	if activeFilter != nil {
+		filter.ActiveOnly = *activeFilter
+		filter.FinishedOnly = !*activeFilter
 	}
 	if last > 0 {
 		filter.UpdatedSince = time.Now().Add(-last)
 	}
+	startingAfter := r.URL.Query().Get("starting_after")
+	if startingAfter != "" {
+		anchorID, status, err := s.statusListAnchor(r.Context(), startingAfter, filter)
+		if err != nil {
+			s.writeError(w, status, err.Error())
+			return
+		}
+		filter.AfterID = anchorID
+	}
 	applies, err := s.storage.Applies().GetRecent(r.Context(), filter)
 	if err != nil {
-		s.logger.Error("get recent applies failed", "error", err)
+		s.logger.Error("get recent applies failed",
+			"environment", filter.Environment,
+			"deployment", filter.Deployment,
+			"database", filter.Database,
+			"starting_after", startingAfter,
+			"error", err)
 		s.writeError(w, http.StatusInternalServerError, "failed to get recent applies")
 		return
 	}
@@ -901,12 +951,14 @@ func (s *Service) handleStatus(w http.ResponseWriter, r *http.Request) {
 	}
 
 	resp := &apitypes.StatusResponse{
-		Limit:        limit,
-		MaxLimit:     maxStatusLimit,
-		HasMore:      hasMore,
-		FailuresOnly: failuresOnly,
-		StateCounts:  stateCounts,
-		Applies:      make([]*apitypes.ActiveApplyResponse, 0, len(applies)),
+		Limit:         limit,
+		MaxLimit:      maxStatusLimit,
+		HasMore:       hasMore,
+		FailuresOnly:  failuresOnly,
+		StartingAfter: startingAfter,
+		Active:        activeFilter,
+		StateCounts:   stateCounts,
+		Applies:       make([]*apitypes.ActiveApplyResponse, 0, len(applies)),
 	}
 	if last > 0 {
 		resp.Last = last.String()
@@ -946,6 +998,69 @@ func (s *Service) handleStatus(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.writeJSON(w, http.StatusOK, resp)
+}
+
+// statusListAnchor resolves the starting_after apply of a status page to its
+// row id. The apply must exist and match the request's environment, database,
+// and deployment, which never change for an apply, so a page continues the
+// list the anchor came from rather than one with different filters. The
+// state, failed, active, and last filters are not checked: the anchor's state
+// and activity may have moved since the page that showed it. It returns the
+// HTTP status to answer with alongside any error.
+func (s *Service) statusListAnchor(ctx context.Context, applyIdentifier string, filter storage.RecentAppliesFilter) (int64, int, error) {
+	anchor, err := s.storage.Applies().GetByApplyIdentifier(ctx, applyIdentifier)
+	if err != nil {
+		s.logger.Error("look up status page anchor failed",
+			"apply_id", applyIdentifier,
+			"environment", filter.Environment,
+			"deployment", filter.Deployment,
+			"database", filter.Database,
+			"error", err)
+		return 0, http.StatusInternalServerError, fmt.Errorf("failed to look up starting_after apply %s", applyIdentifier)
+	}
+	if anchor == nil {
+		return 0, http.StatusBadRequest, fmt.Errorf("starting_after apply %s does not exist; pass the last apply ID from the previous page", applyIdentifier)
+	}
+	if filter.Environment != "" && storage.CanonicalKey(anchor.Environment) != filter.Environment {
+		return 0, http.StatusBadRequest, fmt.Errorf("starting_after apply %s is in environment %s, not %s; repeat the previous page's filters",
+			applyIdentifier, anchor.Environment, filter.Environment)
+	}
+	if filter.Database != "" && storage.CanonicalKey(anchor.Database) != filter.Database {
+		return 0, http.StatusBadRequest, fmt.Errorf("starting_after apply %s is for database %s, not %s; repeat the previous page's filters",
+			applyIdentifier, anchor.Database, filter.Database)
+	}
+	if filter.Deployment != "" {
+		inDeployment, err := s.applyTouchesDeployment(ctx, anchor, filter.Deployment)
+		if err != nil {
+			s.logger.Error("check status page anchor deployment failed",
+				append(anchor.LogAttrs(), "requested_deployment", filter.Deployment, "error", err)...)
+			return 0, http.StatusInternalServerError, fmt.Errorf("failed to check the deployments of starting_after apply %s", applyIdentifier)
+		}
+		if !inDeployment {
+			return 0, http.StatusBadRequest, fmt.Errorf("starting_after apply %s does not touch deployment %s; repeat the previous page's filters",
+				applyIdentifier, filter.Deployment)
+		}
+	}
+	return anchor.ID, http.StatusOK, nil
+}
+
+// applyTouchesDeployment reports whether an apply runs in a deployment, by the
+// same rule the deployment filter of the status list applies: the apply's own
+// deployment, or any of its operations'.
+func (s *Service) applyTouchesDeployment(ctx context.Context, apply *storage.Apply, deployment string) (bool, error) {
+	if storage.CanonicalKey(apply.Deployment) == deployment {
+		return true, nil
+	}
+	ops, err := s.storage.ApplyOperations().ListByApplies(ctx, []int64{apply.ID})
+	if err != nil {
+		return false, fmt.Errorf("list operations of apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	for _, op := range ops {
+		if storage.CanonicalKey(op.Deployment) == deployment {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // statusOperationForDeployment narrows an apply's operations to the requested
@@ -1091,19 +1206,21 @@ func parseStatusLast(r *http.Request) (time.Duration, error) {
 	return last, nil
 }
 
-// parseStatusActiveOnly parses the optional `active` query parameter restricting
-// the status list to applies that have not reached a terminal state. Callers use
-// it to ask whether a target is busy without paging through settled history.
-func parseStatusActiveOnly(r *http.Request) (bool, error) {
+// parseStatusActive parses the optional `active` query parameter. true restricts
+// the status list to applies that have not reached a terminal state, which is
+// how a caller asks whether a target is busy without paging through settled
+// history; false restricts it to the terminal ones, so a caller can list the
+// two halves separately. nil means no filter.
+func parseStatusActive(r *http.Request) (*bool, error) {
 	raw := r.URL.Query().Get("active")
 	if raw == "" {
-		return false, nil
+		return nil, nil
 	}
 	active, err := strconv.ParseBool(raw)
 	if err != nil {
-		return false, fmt.Errorf("active must be a boolean")
+		return nil, fmt.Errorf("active must be a boolean")
 	}
-	return active, nil
+	return &active, nil
 }
 
 func parseStatusFailuresOnly(r *http.Request) (bool, error) {
@@ -1180,11 +1297,12 @@ func (s *Service) progressFromLocalStorage(ctx context.Context, apply *storage.A
 	}
 	overlayApplyOptions(httpResp, apply)
 	setRevertSkippedMetadata(httpResp, apply)
-	operations, memberByOperationID, ops, released := s.bestEffortProgressOperations(ctx, apply)
-	httpResp.Operations = operations
-	httpResp.Released = released
-	overlayStoredDisplayMetadata(httpResp, apply, ops)
+	stored := s.bestEffortProgressOperations(ctx, apply)
+	httpResp.Operations = stored.responses
+	httpResp.Released = stored.released
+	overlayStoredDisplayMetadata(httpResp, apply, stored.rows)
 
+	rows := make([]*apitypes.TableProgressResponse, 0, len(tasks))
 	for _, task := range tasks {
 		tpr := &apitypes.TableProgressResponse{
 			TableName:           task.TableName,
@@ -1195,6 +1313,7 @@ func (s *Service) progressFromLocalStorage(ctx context.Context, apply *storage.A
 			RowsCopied:          task.RowsCopied,
 			RowsTotal:           task.RowsTotal,
 			EstimatedBytes:      task.EstimatedBytes,
+			EstimatedRows:       task.EstimatedRows,
 			PercentComplete:     int32(task.ProgressPercent),
 			ChecksumRowsChecked: task.ChecksumRowsChecked,
 			ChecksumRowsTotal:   task.ChecksumRowsTotal,
@@ -1202,15 +1321,23 @@ func (s *Service) progressFromLocalStorage(ctx context.Context, apply *storage.A
 			ThrottleReason:      task.ThrottleReason,
 			IsInstant:           task.IsInstant,
 		}
-		attributeStoredTask(tpr, task, memberByOperationID)
+		attributeStoredTask(tpr, task, stored.memberByOperationID)
 		if task.StartedAt != nil {
 			tpr.StartedAt = task.StartedAt.Format(time.RFC3339)
 		}
 		if task.CompletedAt != nil {
 			tpr.CompletedAt = task.CompletedAt.Format(time.RFC3339)
 		}
-		httpResp.Tables = append(httpResp.Tables, tpr)
+		rows = append(rows, tpr)
 	}
+	if !stored.listed {
+		// Without the operation rows nothing says which shards the apply has
+		// attached, so a declared shard cannot be told from a running one; the
+		// task rows are served as they are.
+		httpResp.Tables = rows
+		return httpResp, nil
+	}
+	s.rollUpShardedProgress(ctx, httpResp, apply, stored.rows, tasks, rows)
 
 	return httpResp, nil
 }

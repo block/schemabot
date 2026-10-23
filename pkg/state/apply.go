@@ -172,6 +172,9 @@ func DeriveApplyState(taskStates []string) string {
 	if counts[Apply.Running] > 0 {
 		return Apply.Running
 	}
+	if counts[Apply.Resuming] > 0 {
+		return Apply.Resuming
+	}
 	if postCopyPhaseWithQueuedWork(counts) {
 		return Apply.Running
 	}
@@ -188,7 +191,8 @@ func DeriveApplyState(taskStates []string) string {
 }
 
 // cutoverIsLeastAdvancedActiveWork reports whether a task is cutting over
-// with no sibling in an earlier active phase — queued, copying, or verifying.
+// with no sibling in an earlier active phase — queued, resuming, copying, or
+// verifying.
 // A cutover is the last step of a table's work, so surfacing it at the apply
 // level while earlier work is still active would overstate progress and force
 // the derived state to fall back once that cutover completes; it surfaces
@@ -199,6 +203,7 @@ func cutoverIsLeastAdvancedActiveWork(counts map[string]int) bool {
 	return counts[Apply.CuttingOver] > 0 &&
 		counts[Apply.Pending] == 0 &&
 		counts[Apply.Running] == 0 &&
+		counts[Apply.Resuming] == 0 &&
 		counts[Apply.CatchingUp] == 0 &&
 		counts[Apply.Checksumming] == 0 &&
 		counts[Apply.PostChecksum] == 0
@@ -267,8 +272,9 @@ type RolloutChild struct {
 // child operations, accounting for the on_failure rollout-continuation policy.
 //
 // It builds on DeriveApplyState: the base projection is computed the same way,
-// and any non-failed base is returned unchanged. The policy only modulates the
-// failed case. continue governs rollout *continuation*, never the apply's
+// and any base other than failed or cancelled is returned unchanged. A
+// cancelled base waits for the cancel to reach every sibling already under way
+// (see deriveCancelledRollout). The policy only modulates the failed case. continue governs rollout *continuation*, never the apply's
 // pass/fail verdict — so an apply that suffered a continuable failure still
 // settles to failed once every sibling is terminal; the policy only delays that
 // verdict so the remaining siblings get their turn instead of the first failure
@@ -305,6 +311,12 @@ func DeriveRolloutApplyState(children []RolloutChild) string {
 		childStates[i] = c.State
 	}
 	base := DeriveApplyState(childStates)
+	if IsState(base, Apply.Cancelled) {
+		return deriveCancelledRollout(children)
+	}
+	if IsState(base, Apply.Stopped) {
+		return deriveStoppedRollout(children)
+	}
 	if !IsState(base, Apply.Failed) {
 		return base
 	}
@@ -367,6 +379,56 @@ func DeriveRolloutApplyState(children []RolloutChild) string {
 		return Apply.Failed
 	}
 	return Apply.RunningDegraded
+}
+
+// deriveCancelledRollout projects a rollout in which at least one child was
+// cancelled. A cancel reaches a rollout one child at a time: a child no driver
+// has started settles on the spot, while one already copying settles only when
+// its own engine has stopped writing to its target. The rollout is cancelled
+// once every child that started has settled. Until then it reports the state of
+// the work still under way, so the pending cancel stays deliverable to that work
+// and the parent never reads cancelled over a target that is still changing.
+//
+// A cancel can follow a stop that has not landed everywhere, leaving a stopped
+// child beside one still copying. That work under way is read the way a
+// stopped rollout reads it, so the parent reports the copy rather than stopped,
+// and the stopped child stays outstanding until the cancel reaches it.
+func deriveCancelledRollout(children []RolloutChild) string {
+	var underWay []string
+	for _, c := range children {
+		if childHoldsItsTarget(c) && !childNotYetStarted(c) {
+			underWay = append(underWay, c.State)
+		}
+	}
+	if len(underWay) == 0 {
+		return Apply.Cancelled
+	}
+	derived := DeriveApplyState(underWay)
+	if IsState(derived, Apply.Stopped) {
+		return deriveStoppedRollout(children)
+	}
+	return derived
+}
+
+// deriveStoppedRollout projects a rollout in which at least one child is
+// stopped. Stop and start both reach a rollout one child at a time: a stop lands
+// on each started child only when its own engine has stopped writing, and a
+// start resumes the stopped children one claim at a time, the ones a stop caught
+// before they began only once the members ahead of them finish. The rollout is
+// stopped once no child is still working. Until then it reports the state of the
+// work under way, so it never reads stopped over a target that is still
+// changing, and a stop that has not landed everywhere stays deliverable.
+func deriveStoppedRollout(children []RolloutChild) string {
+	var underWay []string
+	for _, c := range children {
+		if childHoldsItsTarget(c) && !childNotYetStarted(c) && !IsState(c.State, Apply.Stopped) {
+			underWay = append(underWay, c.State)
+		}
+	}
+	if len(underWay) == 0 {
+		return Apply.Stopped
+	}
+	return DeriveApplyState(underWay)
 }
 
 // childHoldsItsTarget reports whether a child still holds the deployment it was
@@ -493,6 +555,8 @@ func normalizeApplyState(raw string) string {
 		return Apply.FailedRetryable
 	case "STOPPED":
 		return Apply.Stopped
+	case "RESUMING":
+		return Apply.Resuming
 	case "CANCELLED":
 		return Apply.Cancelled
 	case "REVERTED":
@@ -548,6 +612,21 @@ var SettledApplyStates = []string{
 	Apply.Failed,
 	Apply.Cancelled,
 	Apply.Reverted,
+}
+
+// CountsAsActiveApply reports whether an apply in applyState is counted on the
+// active-apply gauge. An apply is counted from acceptance until it settles,
+// stopped included, because a stopped apply still holds its database until an
+// operator starts or cancels it, however long that takes. The gauge therefore
+// counts applies parked on an operator as well as applies a driver is running.
+//
+// A retryable pause also holds its database but is not counted: it is released
+// when the apply pauses and counted again by the drive that retries it. That
+// keeps it balanced on the paths that leave a pause without a drive, since a
+// cancel and the retry budget running out both settle it without moving the
+// gauge.
+func CountsAsActiveApply(applyState string) bool {
+	return !IsState(applyState, SettledApplyStates...) && !IsState(applyState, Apply.FailedRetryable)
 }
 
 // IsManifestGatedVerdict reports whether a derived apply state asserts a

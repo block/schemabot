@@ -9,7 +9,6 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
-	"github.com/block/schemabot/pkg/cmd/cliname"
 	"github.com/block/schemabot/pkg/cmd/internal/templates"
 	"github.com/block/schemabot/pkg/state"
 )
@@ -33,6 +32,9 @@ type WatchModel struct {
 	tables     []templates.TableProgress
 	operations []templates.ProgressOperation
 	released   bool // apply-level release latch: a released pause runs degraded, not paused
+	// sharded is whether the apply is one change fanned out across its
+	// keyspaces' shards, so it renders without operation sections.
+	sharded bool
 	// deferCutover is whether the apply waits for an operator at each cutover.
 	deferCutover bool
 	errorMsg     string
@@ -69,6 +71,7 @@ type progressMsg struct {
 	tables       []templates.TableProgress
 	operations   []templates.ProgressOperation
 	released     bool              // apply-level release latch: a released pause runs degraded, not paused
+	sharded      bool              // one change fanned out across its keyspaces' shards
 	deferCutover bool              // the apply waits for an operator at each cutover
 	errorMsg     string            // Human-readable error message
 	failed       bool              // true when the API call didn't return usable progress data
@@ -172,7 +175,7 @@ func (m WatchModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.errorMsg = msg.errorMsg
 			m.requestedRetryDelay = msg.retryAfter
 			if m.consecutiveErrors >= maxConsecutiveProgressFailures {
-				m.errorMsg = progressGiveUpMessage(m.applyID, m.consecutiveErrors) + ": " + msg.errorMsg
+				m.errorMsg = progressGiveUpMessage(m.applyID, m.environment, m.consecutiveErrors) + ": " + msg.errorMsg
 				m.initialized = true
 				return m, tea.Quit
 			}
@@ -196,6 +199,7 @@ func (m WatchModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.tables = msg.tables
 		m.operations = msg.operations
 		m.released = msg.released
+		m.sharded = msg.sharded
 		m.deferCutover = msg.deferCutover
 		m.errorMsg = msg.errorMsg
 
@@ -382,11 +386,7 @@ func formatExitContext(applyID, deployRequestURL, environment string) string {
 	if deployRequestURL != "" {
 		fmt.Fprintf(&b, "  Deploy Request:  %s\n", deployRequestURL)
 	}
-	cmd := fmt.Sprintf("%s progress %s", cliname.Name(), applyID)
-	if environment != "" {
-		cmd += " -e " + environment
-	}
-	fmt.Fprintf(&b, "  Resume:    %s\n", cmd)
+	fmt.Fprintf(&b, "  Resume:    %s\n", templates.ProgressCommand(applyID, environment))
 	b.WriteString("\n")
 	return b.String()
 }

@@ -564,6 +564,7 @@ type fakeControlEngine struct {
 	cutoverCount            int
 	cutoverResult           *engine.ControlResult
 	cutoverErr              error
+	cutoverNoResult         bool
 	progressReq             *engine.ProgressRequest
 	progressResult          *engine.ProgressResult
 	progressErr             error
@@ -633,6 +634,9 @@ func (e *fakeControlEngine) Start(context.Context, *engine.ControlRequest) (*eng
 
 func (e *fakeControlEngine) Cutover(context.Context, *engine.ControlRequest) (*engine.ControlResult, error) {
 	e.cutoverCount++
+	if e.cutoverNoResult {
+		return nil, nil
+	}
 	if e.cutoverResult != nil || e.cutoverErr != nil {
 		return e.cutoverResult, e.cutoverErr
 	}
@@ -859,15 +863,15 @@ func TestLoadStoredProgressMetadataReturnsEmptyMapForNull(t *testing.T) {
 
 func TestApplyCancelHandleDoesNotCancelNewerOwner(t *testing.T) {
 	client := &LocalClient{}
-	oldCtx, oldCancel := context.WithCancel(t.Context())
+	oldCtx, oldCancel := context.WithCancelCause(t.Context())
 	oldGeneration := client.setApplyCancel(oldCancel)
 	oldHandle := client.currentApplyCancel()
 
-	newCtx, newCancel := context.WithCancel(t.Context())
-	defer newCancel()
+	newCtx, newCancel := context.WithCancelCause(t.Context())
+	defer newCancel(nil)
 	newGeneration := client.setApplyCancel(newCancel)
 
-	client.cancelApplyHandle(oldHandle)
+	client.cancelApplyHandle(oldHandle, nil)
 	assert.Equal(t, oldGeneration, oldHandle.generation)
 	require.Eventually(t, func() bool {
 		return oldCtx.Err() != nil
@@ -911,6 +915,8 @@ func (s *testControlRequestStore) RequestPending(_ context.Context, req *storage
 			existing.ErrorMessage = ""
 			existing.Metadata = append(existing.Metadata[:0], req.Metadata...)
 			existing.CompletedAt = nil
+			existing.UpdatedAt = time.Now()
+			existing.Revision++
 			return cloneTestControlRequest(existing), false, nil
 		}
 	}
@@ -1463,6 +1469,59 @@ func TestLaunchAtomicResumeAllRevertedTasksTerminalizeAsReverted(t *testing.T) {
 	assert.Equal(t, state.Task.Reverted, tasks[0].State, "terminal task state must not be rewritten by the resume")
 }
 
+// A Vitess apply paused for retry is recovered by handing the engine the
+// persisted state of its deploy request, which keeps running on the provider.
+// A transient error the engine reports while reattaching to it (the provider
+// rate limiting the deploy request lookup) says nothing about the change, so
+// the recovery pauses the apply again for a later claim to reattach, instead
+// of failing an apply whose deploy request is still live. The same transient
+// error fails the apply when the engine did not report a reattach: a resume
+// with no persisted engine work, or one whose engine gave up on the stored
+// deploy request and started afresh, keeps the start-of-work policy. A
+// revert-phase apply is never paused, so it fails on a reattach error too.
+func TestGroupedResumeTransientReattachFailurePausesVitessApply(t *testing.T) {
+	persisted := &storage.EngineResumeState{
+		ApplyOperationID: 7,
+		MigrationContext: "ctx-reattach",
+		Metadata:         `{"branch_name":"branch-1","deploy_request_id":5}`,
+	}
+	reattachErr := fmt.Errorf("%w: get deploy request #5 on resume: rate limited", engine.ErrReattachFailed)
+	freshErr := errors.New("create branch: rate limited")
+	cases := []struct {
+		name       string
+		stored     *storage.EngineResumeState
+		engineErr  error
+		applyState string
+		taskState  string
+		wantApply  string
+		wantTask   string
+	}{
+		{"paused apply reattaching to its deploy request pauses again", persisted, reattachErr, state.Apply.FailedRetryable, state.Task.Pending, state.Apply.FailedRetryable, state.Task.FailedRetryable},
+		{"resume with no persisted engine work fails", nil, freshErr, state.Apply.FailedRetryable, state.Task.Pending, state.Apply.Failed, state.Task.Failed},
+		{"resume whose engine started afresh fails", persisted, freshErr, state.Apply.FailedRetryable, state.Task.Pending, state.Apply.Failed, state.Task.Failed},
+		{"revert-phase apply reattaching to its deploy request fails", persisted, reattachErr, state.Apply.RevertWindow, state.Task.RevertWindow, state.Apply.Failed, state.Task.Failed},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			client, apply, tasks, plan, applyStore := reattachResumeFixture(&exactProgressApplyOperationStore{data: tc.stored}, nil)
+			client.planetscaleEngine.(*fakeControlEngine).applyErr = tc.engineErr
+			apply.State = tc.applyState
+			tasks[0].State = tc.taskState
+
+			err := client.launchAtomicResume(t.Context(), apply, tasks, plan, apply.GetOptions().Map(), "Apply resumed from checkpoint", false, false, false)
+			require.Error(t, err)
+			handled := client.handleGroupedResumeFailure(t.Context(), apply, tasks, err)
+
+			assert.Equal(t, tc.wantApply, applyStore.apply.State)
+			assert.Equal(t, tc.wantTask, tasks[0].State)
+			assert.Contains(t, applyStore.apply.ErrorMessage, "rate limited")
+			if tc.wantApply == state.Apply.FailedRetryable {
+				assert.NoError(t, handled, "the pause is stored, so the drive exits cleanly")
+			}
+		})
+	}
+}
+
 // After the engine accepts a grouped Vitess apply, a deploy request is live on
 // the provider. A failure to persist the engine resume state is storage
 // uncertainty, not a failed schema change: the apply pauses for operator retry
@@ -1662,6 +1721,156 @@ func TestLocalClient_ProcessPendingStopControlRequest(t *testing.T) {
 	require.NoError(t, err)
 	assert.Nil(t, controlReq)
 	assert.True(t, hasLogMessageContaining(logs.logs, "Stop requested: 1 tasks stopped, 0 skipped (caller: cli:alice)"))
+}
+
+// TestLocalClient_StopSupersedesPendingCutover covers a deferred-cutover apply
+// parked at waiting_for_cutover that receives cutover and then stop before the
+// next drive tick. The stop takes effect first, and the queued cutover is failed
+// with a reason the operator can act on rather than left pending. Once a later
+// start brings the copy back to waiting_for_cutover, the drive finds no cutover
+// to take, so the table is not swapped until the operator issues a fresh one.
+func TestLocalClient_StopSupersedesPendingCutover(t *testing.T) {
+	apply := &storage.Apply{
+		ID:              129,
+		ApplyIdentifier: "apply-stop-supersedes-cutover",
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+		State:           state.Apply.WaitingForCutover,
+	}
+	task := &storage.Task{
+		ID:             462,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task-stop-supersedes-cutover",
+		Database:       "testdb",
+		Namespace:      "testdb",
+		DatabaseType:   storage.DatabaseTypeMySQL,
+		TableName:      "users",
+		State:          state.Task.WaitingForCutover,
+	}
+	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{
+		{
+			ID:          1,
+			ApplyID:     apply.ID,
+			Operation:   storage.ControlOperationCutover,
+			Status:      storage.ControlRequestPending,
+			RequestedBy: "cli:alice",
+		},
+		{
+			ID:          2,
+			ApplyID:     apply.ID,
+			Operation:   storage.ControlOperationStop,
+			Status:      storage.ControlRequestPending,
+			RequestedBy: "cli:bob",
+		},
+	}}
+	fakeEngine := &fakeControlEngine{}
+	client := &LocalClient{
+		config: LocalConfig{
+			Database: "testdb",
+			Type:     storage.DatabaseTypeMySQL,
+		},
+		storage: &exactProgressStorage{
+			applies:         &exactProgressApplyStore{apply: apply},
+			tasks:           &exactProgressTaskStore{tasks: []*storage.Task{task}},
+			logs:            &mockApplyLogStore{},
+			controlRequests: controlRequests,
+		},
+		spiritEngine: fakeEngine,
+		logger:       slog.Default(),
+	}
+
+	standDown, err := client.processPendingStopControlRequest(t.Context(), apply)
+	require.NoError(t, err)
+	assert.True(t, standDown)
+	assert.Equal(t, 1, fakeEngine.stopCount)
+	require.Equal(t, state.Apply.Stopped, apply.State)
+
+	cutoverReq, err := controlRequests.GetByOperation(t.Context(), apply.ID, storage.ControlOperationCutover)
+	require.NoError(t, err)
+	require.NotNil(t, cutoverReq)
+	assert.Equal(t, storage.ControlRequestFailed, cutoverReq.Status)
+	assert.Equal(t, cutoverSupersededByStopMessage, cutoverReq.ErrorMessage)
+	stopReq, err := controlRequests.GetByOperation(t.Context(), apply.ID, storage.ControlOperationStop)
+	require.NoError(t, err)
+	require.NotNil(t, stopReq)
+	assert.Equal(t, storage.ControlRequestCompleted, stopReq.Status)
+
+	// A later start resumes the copy, which parks at waiting_for_cutover again.
+	apply.State = state.Apply.WaitingForCutover
+	task.State = state.Task.WaitingForCutover
+	require.NoError(t, client.processPendingCutoverControlRequest(t.Context(), apply, []*storage.Task{task}))
+	assert.Equal(t, 0, fakeEngine.cutoverCount, "the table must not be swapped without a cutover issued after the stop")
+	assert.Equal(t, state.Apply.WaitingForCutover, apply.State)
+}
+
+// failFirstCutoverSettleStore fails the first FailPending of a cutover request,
+// the way a transient storage error would while a stop settles the cutover it
+// superseded.
+type failFirstCutoverSettleStore struct {
+	*testControlRequestStore
+	failed bool
+}
+
+func (s *failFirstCutoverSettleStore) FailPending(ctx context.Context, applyID int64, op storage.ControlOperation, msg string) error {
+	if op == storage.ControlOperationCutover && !s.failed {
+		s.failed = true
+		return errors.New("transient storage error")
+	}
+	return s.testControlRequestStore.FailPending(ctx, applyID, op, msg)
+}
+
+// TestLocalClient_StopKeepsItsGateUntilTheSupersededCutoverSettles covers a
+// stop whose write settling the queued cutover fails. The stop stays pending,
+// so the owner's retry settles the cutover before the stop completes, and the
+// copy a later start parks at waiting_for_cutover is not swapped by the old
+// command.
+func TestLocalClient_StopKeepsItsGateUntilTheSupersededCutoverSettles(t *testing.T) {
+	apply := &storage.Apply{ID: 129, ApplyIdentifier: "apply-stop-gate", Database: "testdb", DatabaseType: storage.DatabaseTypeMySQL, Environment: "staging", State: state.Apply.WaitingForCutover}
+	task := &storage.Task{ID: 462, ApplyID: apply.ID, TaskIdentifier: "task-stop-gate", Database: "testdb", Namespace: "testdb", DatabaseType: storage.DatabaseTypeMySQL, TableName: "users", State: state.Task.WaitingForCutover}
+	base := &testControlRequestStore{requests: []*storage.ApplyControlRequest{
+		{ID: 1, ApplyID: apply.ID, Operation: storage.ControlOperationCutover, Status: storage.ControlRequestPending, RequestedBy: "cli:alice"},
+		{ID: 2, ApplyID: apply.ID, Operation: storage.ControlOperationStop, Status: storage.ControlRequestPending, RequestedBy: "cli:bob"},
+	}}
+	controlRequests := &failFirstCutoverSettleStore{testControlRequestStore: base}
+	fakeEngine := &fakeControlEngine{}
+	client := &LocalClient{
+		config: LocalConfig{Database: "testdb", Type: storage.DatabaseTypeMySQL},
+		storage: &exactProgressStorage{
+			applies:         &exactProgressApplyStore{apply: apply},
+			tasks:           &exactProgressTaskStore{tasks: []*storage.Task{task}},
+			logs:            &mockApplyLogStore{},
+			controlRequests: controlRequests,
+		},
+		spiritEngine: fakeEngine,
+		logger:       slog.Default(),
+	}
+
+	_, err := client.processPendingStopControlRequest(t.Context(), apply)
+	require.ErrorContains(t, err, "transient storage error")
+	stopReq, err := base.GetByOperation(t.Context(), apply.ID, storage.ControlOperationStop)
+	require.NoError(t, err)
+	require.NotNil(t, stopReq)
+	assert.Equal(t, storage.ControlRequestPending, stopReq.Status, "the stop must stay pending until the cutover it superseded is settled")
+
+	_, err = client.processPendingStopControlRequest(t.Context(), apply)
+	require.NoError(t, err)
+
+	cutoverReq, err := base.GetByOperation(t.Context(), apply.ID, storage.ControlOperationCutover)
+	require.NoError(t, err)
+	require.NotNil(t, cutoverReq)
+	assert.Equal(t, storage.ControlRequestFailed, cutoverReq.Status, "the owner's retry settles the cutover queued before the stop")
+	assert.Equal(t, cutoverSupersededByStopMessage, cutoverReq.ErrorMessage)
+	stopReq, err = base.GetByOperation(t.Context(), apply.ID, storage.ControlOperationStop)
+	require.NoError(t, err)
+	require.NotNil(t, stopReq)
+	assert.Equal(t, storage.ControlRequestCompleted, stopReq.Status)
+
+	// A later start resumes the copy, which parks again.
+	apply.State = state.Apply.WaitingForCutover
+	task.State = state.Task.WaitingForCutover
+	require.NoError(t, client.processPendingCutoverControlRequest(t.Context(), apply, []*storage.Task{task}))
+	assert.Equal(t, 0, fakeEngine.cutoverCount, "the table must not be swapped without a cutover issued after the stop")
 }
 
 func TestLocalClient_ProcessPendingCancelControlRequest(t *testing.T) {
@@ -2474,6 +2683,259 @@ func TestLocalClient_ProcessPendingCutoverControlRequestFailsRejectedRequest(t *
 	assert.Equal(t, "not ready for cutover", controlRequests.requests[0].ErrorMessage)
 }
 
+// An apply parked at waiting_for_cutover gets an operator cutover that the
+// engine does not take: the cutover errors or is refused. An engine that yields
+// no result is answered by the cutover path as a refusal, so that case runs the
+// refusal branch too. The request fails with the engine's reason and the stored apply
+// returns to waiting_for_cutover rather than staying at cutting_over with no
+// cutover behind it, so the operator's next cutover is recorded as a new
+// request and the next drive sends it to the engine.
+func TestLocalClient_ProcessPendingCutoverNotAcceptedRestoresApplyState(t *testing.T) {
+	tests := []struct {
+		name           string
+		engine         *fakeControlEngine
+		wantRequestErr string
+	}{
+		{
+			name:           "engine cutover fails",
+			engine:         &fakeControlEngine{cutoverErr: errors.New("drop sentinel table: connection reset")},
+			wantRequestErr: "cutover failed: drop sentinel table: connection reset",
+		},
+		{
+			name:           "engine yields no result, answered as a refusal",
+			engine:         &fakeControlEngine{cutoverNoResult: true},
+			wantRequestErr: "not accepted",
+		},
+		{
+			name:           "engine refuses the cutover",
+			engine:         &fakeControlEngine{cutoverResult: &engine.ControlResult{Accepted: false, Message: "not ready for cutover"}},
+			wantRequestErr: "not ready for cutover",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			apply := &storage.Apply{
+				ID:              132,
+				ApplyIdentifier: "apply-cutover-not-accepted-local",
+				Database:        "testdb",
+				DatabaseType:    storage.DatabaseTypeMySQL,
+				Environment:     "staging",
+				State:           state.Apply.WaitingForCutover,
+			}
+			task := &storage.Task{
+				ID:             465,
+				ApplyID:        apply.ID,
+				TaskIdentifier: "task-cutover-not-accepted-local",
+				Database:       "testdb",
+				Namespace:      "testdb",
+				DatabaseType:   storage.DatabaseTypeMySQL,
+				TableName:      "users",
+				State:          state.Task.WaitingForCutover,
+			}
+			controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{{
+				ApplyID:     apply.ID,
+				Operation:   storage.ControlOperationCutover,
+				Status:      storage.ControlRequestPending,
+				RequestedBy: "cli:alice",
+			}}}
+			applies := &exactProgressApplyStore{apply: apply}
+			client := &LocalClient{
+				config: LocalConfig{
+					Database: "testdb",
+					Type:     storage.DatabaseTypeMySQL,
+				},
+				storage: &exactProgressStorage{
+					applies:         applies,
+					tasks:           &exactProgressTaskStore{tasks: []*storage.Task{task}},
+					logs:            &mockApplyLogStore{},
+					controlRequests: controlRequests,
+				},
+				spiritEngine: tt.engine,
+				logger:       slog.Default(),
+			}
+
+			err := client.processPendingCutoverControlRequest(t.Context(), apply, []*storage.Task{task})
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tt.wantRequestErr)
+			assert.Equal(t, 1, tt.engine.cutoverCount)
+			assert.Equal(t, state.Apply.WaitingForCutover, apply.State)
+			assert.Equal(t, state.Apply.WaitingForCutover, applies.apply.State)
+			require.Len(t, controlRequests.requests, 1)
+			assert.Equal(t, storage.ControlRequestFailed, controlRequests.requests[0].Status)
+			assert.Equal(t, tt.wantRequestErr, controlRequests.requests[0].ErrorMessage)
+
+			// The operator comments cutover again. The stored apply is waiting
+			// for cutover, so the API records a new durable request rather than
+			// answering that a cutover is already in progress, and the next
+			// drive sends it to the engine.
+			_, alreadyPending, err := controlRequests.RequestPending(t.Context(), &storage.ApplyControlRequest{
+				ApplyID:     apply.ID,
+				Operation:   storage.ControlOperationCutover,
+				Status:      storage.ControlRequestPending,
+				RequestedBy: "cli:alice",
+			})
+			require.NoError(t, err)
+			require.False(t, alreadyPending)
+			*tt.engine = fakeControlEngine{cutoverCount: tt.engine.cutoverCount}
+			require.NoError(t, client.processPendingCutoverControlRequest(t.Context(), apply, []*storage.Task{task}))
+			assert.Equal(t, 2, tt.engine.cutoverCount)
+			assert.Equal(t, storage.ControlRequestCompleted, controlRequests.requests[0].Status)
+			assert.Equal(t, state.Apply.CuttingOver, applies.apply.State)
+		})
+	}
+}
+
+// newLocalParkedCutoverClient wires a local client with a whole-apply drive
+// parked at waiting_for_cutover, one task parked with it, and a pending
+// operator cutover request. The apply store keeps a copy of each write, so the
+// stored row and the in-memory apply can be asserted separately.
+func newLocalParkedCutoverClient(eng *fakeControlEngine) (*LocalClient, *storage.Apply, *mockApplyStore, *exactProgressTaskStore, *testControlRequestStore) {
+	apply := &storage.Apply{
+		ID:              133,
+		ApplyIdentifier: "apply-cutover-restore-local",
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+		State:           state.Apply.WaitingForCutover,
+	}
+	storedApply := *apply
+	applies := &mockApplyStore{apply: &storedApply}
+	tasks := &exactProgressTaskStore{tasks: []*storage.Task{{
+		ID:             466,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task-cutover-restore-local",
+		Database:       "testdb",
+		Namespace:      "testdb",
+		DatabaseType:   storage.DatabaseTypeMySQL,
+		TableName:      "users",
+		State:          state.Task.WaitingForCutover,
+	}}}
+	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationCutover,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "cli:alice",
+	}}}
+	client := &LocalClient{
+		config: LocalConfig{
+			Database: "testdb",
+			Type:     storage.DatabaseTypeMySQL,
+		},
+		storage: &exactProgressStorage{
+			applies:         applies,
+			tasks:           tasks,
+			logs:            &mockApplyLogStore{},
+			controlRequests: controlRequests,
+		},
+		spiritEngine: eng,
+		logger:       slog.Default(),
+	}
+	return client, apply, applies, tasks, controlRequests
+}
+
+// The engine does not take an operator cutover and the write restoring the
+// pre-cutover state also fails. The request stays pending instead of failing,
+// so the next drive re-sends the cutover from the stored cutting_over rather
+// than leaving the apply wedged behind a failed request.
+func TestLocalClient_ProcessPendingCutoverRestoreFailureKeepsRequestPending(t *testing.T) {
+	eng := &fakeControlEngine{cutoverErr: errors.New("drop sentinel table: connection reset")}
+	client, apply, applies, tasks, controlRequests := newLocalParkedCutoverClient(eng)
+	applies.laterUpdateErr = errors.New("storage write unavailable")
+
+	err := client.processPendingCutoverControlRequest(t.Context(), apply, tasks.tasks)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "cutover failed: drop sentinel table: connection reset")
+	assert.Contains(t, err.Error(), "restore apply apply-cutover-restore-local to waiting_for_cutover after unaccepted cutover: storage write unavailable")
+	assert.Equal(t, 1, eng.cutoverCount)
+	assert.Equal(t, state.Apply.CuttingOver, apply.State, "in-memory apply matches the stored row")
+	assert.Equal(t, state.Apply.CuttingOver, applies.apply.State)
+	pending, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationCutover)
+	require.NoError(t, err)
+	require.NotNil(t, pending, "request stays pending so the next drive re-sends the cutover")
+
+	// The storage write recovers and the engine takes the re-sent cutover.
+	applies.laterUpdateErr = nil
+	*eng = fakeControlEngine{cutoverCount: eng.cutoverCount}
+	require.NoError(t, client.processPendingCutoverControlRequest(t.Context(), apply, tasks.tasks))
+	assert.Equal(t, 2, eng.cutoverCount)
+	assert.Equal(t, storage.ControlRequestCompleted, controlRequests.requests[0].Status)
+	assert.Equal(t, state.Apply.CuttingOver, applies.apply.State)
+}
+
+// A drive re-sends a still-pending cutover and finds the apply already stored
+// as cutting_over by the drive that first sent it. When the engine refuses the
+// re-send, the apply returns to the state its tasks derive, so the operator can
+// command cutover again instead of being told one is in progress. Tasks
+// already cutting over are a state the progress sync settles, so nothing is
+// written for them.
+func TestLocalClient_RefusedResentCutoverRestoresStateFromTasks(t *testing.T) {
+	tests := []struct {
+		name        string
+		taskState   string
+		wantState   string
+		wantUpdates int
+	}{
+		{
+			name:        "task parked at waiting_for_cutover",
+			taskState:   state.Task.WaitingForCutover,
+			wantState:   state.Apply.WaitingForCutover,
+			wantUpdates: 1,
+		},
+		{
+			name:        "task already cutting over in the engine",
+			taskState:   state.Task.CuttingOver,
+			wantState:   state.Apply.CuttingOver,
+			wantUpdates: 0,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			eng := &fakeControlEngine{cutoverResult: &engine.ControlResult{Accepted: false, Message: "not ready for cutover"}}
+			client, apply, applies, tasks, controlRequests := newLocalParkedCutoverClient(eng)
+			apply.State = state.Apply.CuttingOver
+			applies.apply.State = state.Apply.CuttingOver
+			tasks.tasks[0].State = tt.taskState
+
+			err := client.processPendingCutoverControlRequest(t.Context(), apply, tasks.tasks)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "not ready for cutover")
+			assert.Equal(t, 1, eng.cutoverCount)
+			assert.Equal(t, tt.wantState, apply.State)
+			assert.Equal(t, tt.wantState, applies.apply.State)
+			assert.Len(t, applies.updates, tt.wantUpdates, "the stored cutting_over is not re-marked; only the restore writes")
+			require.Len(t, controlRequests.requests, 1)
+			assert.Equal(t, storage.ControlRequestFailed, controlRequests.requests[0].Status)
+			assert.Equal(t, "not ready for cutover", controlRequests.requests[0].ErrorMessage)
+		})
+	}
+}
+
+// Under an operation-only lease the parent apply row is not the drive's to
+// write: the mark before the cutover stays in memory, and so does the restore
+// when the engine refuses it. The request is still failed, so the operator sees
+// the refusal and can command cutover again.
+func TestLocalClient_RefusedCutoverUnderOperationLeaseNeverWritesParentApply(t *testing.T) {
+	eng := &fakeControlEngine{cutoverResult: &engine.ControlResult{Accepted: false, Message: "not ready for cutover"}}
+	client, apply, applies, tasks, controlRequests := newLocalParkedCutoverClient(eng)
+	ctx := storage.WithOperationLease(t.Context(), storage.OperationLease{
+		ApplyID:     apply.ID,
+		OperationID: 7,
+		Owner:       "host/1/driver-0",
+		Token:       "operation-token",
+	})
+
+	err := client.processPendingCutoverControlRequest(ctx, apply, tasks.tasks)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "not ready for cutover")
+	assert.Equal(t, 1, eng.cutoverCount)
+	assert.Equal(t, state.Apply.WaitingForCutover, apply.State, "the in-memory mark is undone")
+	assert.Equal(t, state.Apply.WaitingForCutover, applies.apply.State)
+	assert.Empty(t, applies.updates, "neither the mark nor the restore writes the parent row")
+	require.Len(t, controlRequests.requests, 1)
+	assert.Equal(t, storage.ControlRequestFailed, controlRequests.requests[0].Status)
+	assert.Equal(t, "not ready for cutover", controlRequests.requests[0].ErrorMessage)
+}
+
 // A cutover request that the engine backend rejects because it has not yet
 // staged the cutover must stay pending: the drive retries it on the next
 // progress tick and the operator's command takes effect without being
@@ -2636,56 +3098,75 @@ func TestLocalClient_AutoTriggerCutoverEscalatesWhenNotReadyPersists(t *testing.
 // rejecting with a hard error (revoked cutover permission, persistent API
 // rejection) cannot retry forever — that would pin the apply at
 // waiting_for_cutover holding the database's deploy queue and lock until a
-// human cancels. After the consecutive-failure bound the drive settles the
-// apply as failed and this owner exits, so the check gate stays closed and an
-// operator gets a settled apply to act on instead of a silent spin.
-func TestLocalClient_AutoTriggerCutoverFailsApplyAfterRepeatedHardRejections(t *testing.T) {
-	apply := &storage.Apply{
-		ID:              133,
-		ApplyIdentifier: "apply-auto-cutover-hard-fail",
-		Database:        "testdb",
-		DatabaseType:    storage.DatabaseTypeVitess,
-		Environment:     "staging",
-		State:           state.Apply.WaitingForCutover,
+// human cancels. After the consecutive-failure bound the drive pauses the
+// apply as failed_retryable and this owner exits, so the check gate stays
+// closed. The deploy request is still live at its cutover, so a later claim
+// reattaches to it and tries again within the recovery retry budget, rather
+// than the apply being failed over work that keeps running on the provider.
+// Such a rejection is not permanent, so it now runs through that budget, ten
+// cutover attempts per recovery, before the apply fails. A task already in
+// its revert phase is never paused, because the pause would erase the state a
+// recovery reattaches by, so there the bound fails the apply as before.
+func TestLocalClient_AutoTriggerCutoverPausesApplyAfterRepeatedHardRejections(t *testing.T) {
+	cases := []struct {
+		name      string
+		taskState string
+		wantApply string
+		wantTask  string
+	}{
+		{"waiting for cutover pauses", state.Task.WaitingForCutover, state.Apply.FailedRetryable, state.Task.FailedRetryable},
+		{"task in its revert window fails", state.Task.RevertWindow, state.Apply.Failed, state.Task.Failed},
 	}
-	task := &storage.Task{
-		ID:             465,
-		ApplyID:        apply.ID,
-		TaskIdentifier: "task-auto-cutover-hard-fail",
-		Database:       "testdb",
-		DatabaseType:   storage.DatabaseTypeVitess,
-		TableName:      "users",
-		State:          state.Task.WaitingForCutover,
-	}
-	fakeEngine := &fakeControlEngine{cutoverErr: errors.New("apply deploy request: 403 cutover not permitted")}
-	logs := &mockApplyLogStore{}
-	client := &LocalClient{
-		config: LocalConfig{Database: "testdb", Type: storage.DatabaseTypeVitess},
-		storage: &exactProgressStorage{
-			applies: &exactProgressApplyStore{apply: apply},
-			tasks:   &exactProgressTaskStore{tasks: []*storage.Task{task}},
-			logs:    logs,
-		},
-		planetscaleEngine: fakeEngine,
-		logger:            slog.Default(),
-	}
-	controlReq := &engine.ControlRequest{Database: apply.Database}
-	pollState := &atomicPollState{}
-	now := time.Now()
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			apply := &storage.Apply{
+				ID:              133,
+				ApplyIdentifier: "apply-auto-cutover-hard-fail",
+				Database:        "testdb",
+				DatabaseType:    storage.DatabaseTypeVitess,
+				Environment:     "staging",
+				State:           state.Apply.WaitingForCutover,
+			}
+			task := &storage.Task{
+				ID:             465,
+				ApplyID:        apply.ID,
+				TaskIdentifier: "task-auto-cutover-hard-fail",
+				Database:       "testdb",
+				DatabaseType:   storage.DatabaseTypeVitess,
+				TableName:      "users",
+				State:          tc.taskState,
+			}
+			fakeEngine := &fakeControlEngine{cutoverErr: errors.New("apply deploy request: 403 cutover not permitted")}
+			logs := &mockApplyLogStore{}
+			client := &LocalClient{
+				config: LocalConfig{Database: "testdb", Type: storage.DatabaseTypeVitess},
+				storage: &exactProgressStorage{
+					applies: &exactProgressApplyStore{apply: apply},
+					tasks:   &exactProgressTaskStore{tasks: []*storage.Task{task}},
+					logs:    logs,
+				},
+				planetscaleEngine: fakeEngine,
+				logger:            slog.Default(),
+			}
+			controlReq := &engine.ControlRequest{Database: apply.Database}
+			pollState := &atomicPollState{}
+			now := time.Now()
 
-	for i := 1; i < maxConsecutiveCutoverFailures; i++ {
-		require.False(t, client.autoTriggerCutover(t.Context(), fakeEngine, apply, []*storage.Task{task}, controlReq, pollState, now),
-			"the drive must keep retrying below the consecutive-failure bound (attempt %d)", i)
-		assert.Equal(t, state.Apply.WaitingForCutover, apply.State)
-	}
+			for i := 1; i < maxConsecutiveCutoverFailures; i++ {
+				require.False(t, client.autoTriggerCutover(t.Context(), fakeEngine, apply, []*storage.Task{task}, controlReq, pollState, now),
+					"the drive must keep retrying below the consecutive-failure bound (attempt %d)", i)
+				assert.Equal(t, state.Apply.WaitingForCutover, apply.State)
+			}
 
-	require.True(t, client.autoTriggerCutover(t.Context(), fakeEngine, apply, []*storage.Task{task}, controlReq, pollState, now),
-		"the drive owner must exit once the apply is settled")
-	assert.Equal(t, maxConsecutiveCutoverFailures, fakeEngine.cutoverCount)
-	assert.Equal(t, state.Apply.Failed, apply.State, "repeated hard rejections must settle the apply as failed")
-	assert.Equal(t, state.Task.Failed, task.State)
-	assert.Contains(t, apply.ErrorMessage, "cutover failed after 10 consecutive attempts")
-	assert.Contains(t, task.ErrorMessage, "403 cutover not permitted")
+			require.True(t, client.autoTriggerCutover(t.Context(), fakeEngine, apply, []*storage.Task{task}, controlReq, pollState, now),
+				"the drive owner must exit once the bound is reached")
+			assert.Equal(t, maxConsecutiveCutoverFailures, fakeEngine.cutoverCount)
+			assert.Equal(t, tc.wantApply, apply.State)
+			assert.Equal(t, tc.wantTask, task.State)
+			assert.Contains(t, apply.ErrorMessage, fmt.Sprintf("cutover failed after %d consecutive attempts", maxConsecutiveCutoverFailures))
+			assert.Contains(t, task.ErrorMessage, "403 cutover not permitted")
+		})
+	}
 }
 
 // A cutover rejection the engine classifies as permanent (the deploy request

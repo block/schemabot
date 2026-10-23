@@ -21,6 +21,7 @@
 - [Postgres](#postgres)
 - [Target TLS Posture](#target-tls-posture)
 - [PlanetScale Service Token](#planetscale-service-token)
+- [Branch Reconcile](#branch-reconcile)
 - [PlanetScale mTLS](#planetscale-mtls)
 - [Storage Schema Changes](#storage-schema-changes)
 - [Support Channel](#support-channel)
@@ -133,6 +134,67 @@ With the `config_paths` example above, SchemaBot reads:
 `dsn` and `dsn_from` are mutually exclusive for each storage or database
 environment entry.
 
+### Per-target schema overrides
+
+Static `target_resolver.targets` entries require exact lowercase engine types
+without surrounding whitespace, such as `mysql` and `postgres`. Values such as
+`MySQL` or ` mysql ` are rejected at startup, with or without overrides.
+
+A data plane can attach a canonical-to-physical schema mapping after resolving
+an exact `(environment, target)` through Etre or static inventory:
+
+```yaml
+target_resolver:
+  targets:
+    cluster-002:
+      type: mysql
+      dsn: "env:CLUSTER_DSN" # namespace-free
+  overrides:
+    - environment: production
+      target: cluster-002
+      type: mysql
+      schema_overrides:
+        orders_production: orders_sandbox
+```
+
+`overrides` is not a discovery backend. Configure exactly one of `targets` or
+`etre`. Each override requires an explicit lowercase environment, exact target,
+and engine type, plus exactly one mapping. MySQL and PostgreSQL mappings use the
+same identifier validation as static `schema_overrides`; other engines, unknown
+fields, duplicate environment/target pairs, and empty mappings are rejected.
+An override cannot also own a mapping in static inventory or a custom resolver.
+
+Discovery and credentials are resolved using the original request. There is no
+fallback environment or target. Only after successful discovery does the
+resolver check the resolved identity and type and attach a copied mapping.
+An absent entry preserves the backend result, including any static mapping.
+Enumeration and single-engine reporting retain the underlying resolver's
+capabilities. Startup logs name configured mappings; debug logs record use.
+Neither log includes connection strings or credentials.
+
+The engine operates on the physical schema and returns canonical namespace
+keys. The mapping is a strict allowlist: another namespace is refused. MySQL
+connections must remain namespace-free. A PostgreSQL mapping selects a schema
+within the database already named by the DSN.
+
+Before enabling a mapping, resolve the target and pull/plan using its canonical
+namespace. Configuration validation cannot prove that a target exists. In a
+multi-target rollout, plan every target against its own live schema; sharing
+desired SQL does not imply identical plans after partial completion.
+
+**Adding, changing, or removing mappings requires draining work.** This includes
+the first override: an older plan may refer to the canonical schema directly.
+Hold new operations for the affected target. Complete or explicitly retire all
+active, deferred-cutover, stopped, or otherwise resumable applies first. Hold
+affected target operations until every serving replica has the same config,
+and re-plan after every mapping change. A new mapping changes the client cache
+identity, but does not durably bind an old MySQL plan across driver restarts.
+Never execute a pre-change plan with a new mapping. To roll back, withdraw the
+affected route and drain its work before removing the mapping: removal restores
+identity mapping and can address a different schema. There is no hot reload.
+Durable mapping identity on plans is not enforced; this release depends on the
+drain-and-replan procedure, including discarding unused pre-change plans.
+
 ### PostgreSQL `dsn_from` targets
 
 `target_resolver` is the data-plane connection resolver: a server exposing the
@@ -196,6 +258,85 @@ The PostgreSQL shape differs from MySQL in three ways:
   When omitted, an RDS endpoint defaults to the embedded bundle and a non-RDS
   endpoint fails resolution: a verified CA is required, and the ambient trust
   store is never an implicit fallback.
+
+### Etre inventory environment mapping
+
+A logical environment can use clusters hosted in another infrastructure
+environment. Configure `environment_mapping` on the Etre resolver to change
+only the `env_label` selector:
+
+```yaml
+target_resolver:
+  etre:
+    - addr: https://etre.example.com
+      database_type: mysql
+      entity_type: cluster
+      target_label: dsid
+      env_label: env
+      environment_mapping:
+        sandbox: production
+      mysql:
+        host_field: writer_endpoint
+      credentials:
+        type: secret_ref
+        username: ddl
+        password_ref: env:DDL_PASSWORD
+```
+
+A sandbox request for `orders-002` queries `dsid=orders-002,env=production`.
+The exact target is unchanged. Credentials come from that resolved entity;
+credential resolvers still receive the original logical request. Schema names,
+plans, applies, checks and lifecycle requests retain `sandbox`.
+This does not rewrite `orders_sandbox` to `orders_production`.
+
+Unmapped environments retain their request name. Values are literal inventory
+labels, never recursive aliases or fallback queries. A mapping requires
+`env_label`, and keys and values must be nonempty lowercase environment names
+containing only letters, digits, underscores or hyphens, starting with a letter
+or digit. Requests still require an environment when `env_label` is set.
+
+Environment mapping is server-owned routing configuration (AZ-1). Before
+changing it, hold affected work, drain active or resumable applies, deploy
+consistent configuration to every replica, discard old plans, and replan.
+Never resume stored work across a mapping change.
+
+### Etre targets with more than one match
+
+An `etre` resolver expects its lookup to match one entity. Some inventories
+record both sides of a replicated pair under one target, such as a cluster and
+its standby during a blue/green switchover. A `mysql` resolver handles these
+without any configuration: when its lookup matches more than one entity, it
+connects to each match and reads `read_only`, `innodb_read_only`,
+`server_uuid`, and `SHOW REPLICA STATUS`. The target resolves to the match that
+accepts writes only when both of these hold:
+
+- Exactly one match has `read_only` and `innodb_read_only` off.
+- Every other match replicates from it: its replication status names the
+  writable match's `server_uuid` as a source.
+- The writable match replicates from no server outside the matches. It may
+  replicate back from its own standby, but a writable relay fed from elsewhere
+  is not the authoritative copy, and a change made on it would collide with
+  the same change arriving from its source.
+
+Anything else refuses to resolve the target, and the error names each match
+and what it reported. That covers no writable match, two writable matches, a
+read-only match that replicates from somewhere else or from nothing, and a
+match the probe cannot connect to. A read-only match that does not replicate
+from the writer is refused rather than ignored, because nothing then shows that
+the two matches are copies of one database.
+
+A lookup that matches one entity is not probed. A lookup that matches more than
+four is refused without probing. The matches are probed at the same time, each
+under its own timeout. The probe runs each time the target is
+resolved, so a switchover is picked up on the next request without any change
+to the inventory. It chooses the writer when a request resolves the target; it
+does not watch an apply that is already running.
+
+The probe connects with the same credentials and TLS settings as the schema
+change, and needs the `REPLICATION CLIENT` privilege to read the replication
+status. `SHOW REPLICA STATUS` needs MySQL 8.0.22 or later; on an older server
+the probe refuses the target and its error says so. Resolvers for the other
+database types refuse a lookup that matches more than one entity.
 
 ### PostgreSQL Etre targets
 
@@ -463,7 +604,7 @@ Rules:
 - The map MUST contain at least one entry, each entry MUST set a non-empty `target`, and each map key MUST resolve through `tern_deployments` with an endpoint configured for this environment.
 - Keys under `deployments:` must be lowercase; the server refuses to start otherwise.
 - A single-entry map is accepted and behaves identically to the scalar `target` / `deployment` shape. Single-deployment environments should continue to use the scalar shape.
-- `cutover_policy` and `on_failure` are only valid alongside a `deployments` map or a `targets` list. `cutover_policy` accepts `rolling` (the default), `barrier`, or `parallel`; `on_failure` accepts `halt` (the default), `continue`, or `pause`. Both values are captured on every operation row when the apply is created, so the policy in force at that moment travels with the rollout.
+- `cutover_policy` and `on_failure` are only valid alongside a `deployments` map or a `targets` list. `cutover_policy` accepts `rolling`, `barrier`, or `parallel`, and defaults to `parallel` when every member of the environment comes from a `targets` list and to `rolling` otherwise, including for a `deployments` map that mixes `targets` entries with single `target` entries; `on_failure` accepts `halt` (the default), `continue`, or `pause`. Both values are captured on every operation row when the apply is created, so the policy in force at that moment travels with the rollout.
 
 ### Planning and the Primary Deployment
 
@@ -480,7 +621,7 @@ Being primary decides which plan is stored, not which deployment is reviewed. A 
 Every deployment name in `deployment_order` must be lowercase; the server
 refuses to start otherwise.
 
-Under `cutover_policy: barrier` or `parallel`, cutovers run one rollout member at a time in this order, and a later member waits until every earlier one has completed. A member is one deployment of a `deployments` map, or one target of a `targets` list. An earlier member that failed stops holding the rollout under `on_failure: continue`, or under `pause` once the rollout is released; under `halt`, and under `pause` until a release, it holds every later cutover. An apply started with `--defer-cutover` follows the same order. A deployment with a `targets` list is the exception: each of its targets cuts over as its table finishes, so an apply to it refuses `--defer-cutover`; apply one target at a time with `--target` to hold a target's cutover. Each `schemabot cutover` cuts over the member whose turn it is, and only that member: a second member waits for a second command. A cutover requested while every ready member is still waiting on an earlier one is refused, and the refusal names the member holding the turn. Within a member, copies never wait on each other to start, and how the cutovers are ordered depends on what triggers them. The automatic cutover takes one operation at a time, so two shards of one member cut over one after the other, in the order the rollout created them. A `schemabot cutover` addresses the member's data-plane apply as a whole, so SchemaBot does not order that member's shards and tables among themselves.
+Under `cutover_policy: barrier` or `parallel`, copies start in this order and cutovers follow it: a deployment cuts over only once every earlier deployment has completed, revert window included. An earlier deployment that failed stops holding the rollout under `on_failure: continue`, or under `pause` once the rollout is released; under `halt`, and under `pause` until a release, it holds every later cutover. An apply started with `--defer-cutover` follows the same order. Each `schemabot cutover` cuts over the deployment whose turn it is, and only that deployment: a second deployment waits for a second command. A cutover requested while every ready deployment is still waiting on an earlier one is refused, and the refusal names the deployment holding the turn. Within a deployment, copies never wait on each other to start, and each shard cuts over as soon as it is parked, at most the server's `max_drivers_per_apply` operations of one apply at once. A `schemabot cutover` addresses the deployment's data-plane apply as a whole, so SchemaBot does not order that deployment's shards and tables among themselves. The targets of a `targets` list do not wait for each other this way; [Multi-Target Environment](#multi-target-environment-preview) describes how they cut over. An apply that spans several deployments while one of them has a `targets` list is refused, so one apply never mixes the two.
 
 ## Multi-Target Environment (preview)
 
@@ -488,7 +629,7 @@ A database that lives on more than one target replaces the scalar `target` with 
 
 > **MySQL only.** `targets` is rejected at startup on any other database type. Addressing N targets has to be represented on every operator-facing surface — the plan comment, progress, the terminal summary — and that presentation is built per engine, so the feature is enabled per engine as the work lands.
 
-> **Presentation is still landing.** An environment's targets are each planned against their own live schema, and the apply runs each member against the plan that member was planned for, so one target's DDL is never run against another. What is not finished is how a rollout reads on the pull request: the plan comment, progress, and the terminal summary still describe the environment as a whole rather than naming each member and attributing its work to it. A multi-target rollout is safe to run before those surfaces land, but coarse to read.
+> Each target is planned against its own live schema, and the apply runs each member against the plan that member was planned for, so one target's DDL is never run against another. The progress comment lists each target and its copy; the plan comment and terminal summary say how many targets the change rolls out to. [Multi-target environments](mysql.md#multi-target-environments) shows a rollout on a pull request.
 
 ```yaml
 databases:
@@ -501,6 +642,10 @@ databases:
           - payments-001
           - payments-002
 ```
+
+An apply of the environment fans out to every listed target and follows each target's copy in one watcher. Under the default `cutover_policy: parallel`, the targets copy at once, as many as the server's [`max_drivers_per_apply`](#per-apply-driver-cap) allows (2 by default, so the rest wait as queued), and each target cuts over as soon as its own copy is ready. The animation runs with a cap of 4, so all four targets copy together:
+
+![Apply an index to four targets of one environment and follow their copies in parallel](../assets/cli-multi-target.gif)
 
 A `targets` list can also sit inside a `deployments` map entry, for a database whose targets are spread across several deployments:
 
@@ -515,7 +660,11 @@ A `targets` list can also sit inside a `deployments` map entry, for a database w
             target: payments-003
 ```
 
-An apply that spans several deployments, one of them with a `targets` list, is not supported yet and is refused before it takes the lock. Apply one target at a time instead, in rollout order: `schemabot apply -e production --target payments-001`, then the next target. The refusal names the first one. A rollout already up to date applies nothing, so an apply that confirms it converged still succeeds.
+An apply that spans several deployments, one of them with a `targets` list, is not supported yet and is refused before it takes the lock. Apply one target at a time instead, in rollout order: `schemabot apply -e production --target payments-001`, then the next target. The refusal names the first one. [Apply to one target of a rollout](cli.md#apply-to-one-target-of-a-rollout) shows a narrowed apply:
+
+![Plan and apply an index to one target of a multi-target environment](../assets/cli-target.gif)
+
+A rollout already up to date applies nothing, so an apply that confirms it converged still succeeds.
 
 ### Selecting namespaces per target
 
@@ -542,7 +691,7 @@ Rules:
 - An environment-level `targets` list is mutually exclusive with an environment-level `deployments` map, the same way an environment-level `target` is. A `targets` list inside a `deployments` entry is how the two combine.
 - The list MUST contain at least one entry, and no entry may be empty.
 - A rollout across the listed targets runs table by table: each table lands on every target before any target starts the next. Tables run in the order the reviewed plan lists them, then any table only another target's plan changes, sorted by name. A target whose plan does not change a table has nothing to run for it, and two statements on one table run together. The exception is a rollout where a target's plan changes a VSchema, which applies with that target's tables, so each target then runs its whole change in one go.
-- `cutover_policy` and `on_failure` order the listed targets within each table the same way they order the deployments of a `deployments` map: each target is a rollout member, taken in list order. The default, `rolling`, runs one target at a time, and under the default `on_failure: halt` a failed target stops every later one from starting. A large fleet can set `cutover_policy: parallel`, which starts up to the server's `max_drivers_per_apply` targets' copies at once, queues the rest, and still cuts over one target at a time in list order. Whatever `on_failure` says, a table that failed on any target ends the rollout at that table: `continue` or a released `pause` still runs it on the remaining targets, but no target starts the next table.
+- `cutover_policy` and `on_failure` order the listed targets' copies within each table the same way they order the deployments of a `deployments` map: each target is a rollout member, taken in list order. Cutover is where targets differ from deployments. The default here is `parallel`: it starts up to the server's `max_drivers_per_apply` targets' copies at once, queues the rest, and cuts each target over as soon as its copy is ready: a target never waits for an earlier target's copy or cutover to finish, and an earlier target holds a later target's cutover only while it is failed, retrying a failure, stopped, cancelled, or reverted. The [multi-target apply animation](#multi-target-environment-preview) shows this default with four targets. A deployment with a `targets` list therefore refuses `--defer-cutover`; apply one target at a time with `--target` to hold a target's cutover. Under the default `on_failure: halt` a failed target stops every queued target from starting, and holds the cutover of every later target already copying: each of those finishes its copy and waits at the cutover barrier until an operator stops or cancels it. `max_drivers_per_apply` is therefore what bounds how many targets copy at once, and how many a failure can leave holding a finished copy, so raising it widens both; size it for the targets that share a host's disk and network as well as for throughput. An environment that relies on an unset `cutover_policy` running one target at a time needs `cutover_policy: rolling` to keep doing so: a failed target then stops every later one before it starts copying. Whatever `on_failure` says, a table that failed on any target ends the rollout at that table: `continue` or a released `pause` still runs it on the remaining targets, but no target starts the next table.
 - No entry may contain `/`. A deployment addressing several targets names each one in its members' operation keys, and `/` separates a key's components.
 - One deployment may not list the same target twice. A rollout member is identified by its deployment and target together, so the same target under two different deployments is two distinct members and is allowed.
 - Members resolve deployments outermost: every target of the first deployment, then every target of the next.
@@ -751,7 +900,7 @@ A single apply that fans out across many deployments or shards claims its operat
 max_drivers_per_apply: 2
 ```
 
-`max_drivers_per_apply` caps how many operations one apply may have in flight at once, across every replica. Size it against `drivers × replicas`: set too high it bounds nothing, set too low a sharded fan-out drives only a few operations at a time.
+`max_drivers_per_apply` caps how many operations one apply may have in flight at once, across every replica. Size it against `drivers × replicas`: set too high it bounds nothing, set too low a sharded fan-out drives only a few operations at a time. For a [multi-target environment](#multi-target-environment-preview), each target's copy of a table is one operation, so the cap is how many targets copy at once; the animation there shows four targets copying together under a cap of at least four.
 
 The cap applies only to *starting* new operations — a first start, a resume after a stop, and a deferred deploy are all capped. Recovering an operation whose driver crashed, and consuming a stop or cancel request, are never capped: an apply already at its cap must still be able to recover and to be controlled, or the cap becomes the thing that wedges the apply it is bounding.
 
@@ -933,22 +1082,51 @@ local-mode MySQL and `cleanup_enabled: true`.
 
 For MySQL databases executed by the Spirit engine, some ALTER statements are
 deterministically refused by the engine — for example dropping a primary key or
-adding a foreign key, which its online copy cannot preserve. By default those
-statements block the apply. The `direct_execution` policy lets a refused
-statement instead run verbatim as native MySQL DDL when the target table is
-small enough. See [Direct Execution](direct-execution.md) for how routing
-works and what other engines need to adopt it.
+adding a foreign key, which its online copy cannot preserve. The
+`direct_execution` policy lets a refused statement instead run verbatim as
+native MySQL DDL when the target table is small enough. With no policy
+configured, the default applies: enabled, bounded at 100MiB of data and
+indexes, which is an estimate (see `max_table_bytes` below). Set
+`enabled: false` to leave refused statements blocked, or `max_table_rows` for a
+bound the engine corroborates with an exact count. See
+[Direct Execution](direct-execution.md) for how routing works and what other
+engines need to adopt it.
 
 Set it at the top level of the server config to state one policy for every
 MySQL database the server drives:
 
 ```yaml
 direct_execution:
-  enabled: true           # default: false
+  enabled: true           # required to enable; omitted in a stated block means false
   max_table_rows: 100000  # the size bound: set exactly one of max_table_rows
                           # or max_table_bytes (e.g. max_table_bytes: 100MiB)
   lock_acquisition_timeout: 10s  # optional; whole seconds; default 10s
 ```
+
+Only omitting the block entirely selects the default policy. A stated block is
+taken as written: it does not inherit the default's size bound, so one that
+enables direct execution must name its own.
+
+State the policy, including an opt-out, on the control plane. A control plane
+forwards the policy it resolves with every plan, and the server that runs the
+statement uses it in place of its own. A control plane with no
+`direct_execution` block forwards the default, so `enabled: false` set only on
+a data plane is overridden.
+
+Upgrade order: upgrade every server that executes statements to a build that
+reads `max_table_bytes` before upgrading the control plane to a build with this
+default. An older server rejects the forwarded default as missing its row
+bound, so every MySQL plan and apply it serves fails until it is upgraded.
+Stating a `max_table_rows` policy on the control plane first avoids this.
+
+Between the two upgrades, plans and applies disagree. The older control plane
+forwards no policy, so an upgraded server plans a refused statement as direct
+under its own default. The control plane records that plan as judged under no
+policy, and the apply carries that record, so the server blocks at apply the
+statement the plan showed as direct. To keep the two in agreement, set
+`enabled: false` on the upgraded servers until the control plane is upgraded.
+Once it is, the control plane's policy is the one forwarded, so the setting no
+longer has any effect.
 
 This is the form to reach for on a fleet: a per-database block for every
 database is the same policy written many times, and each copy is one more
@@ -1152,6 +1330,41 @@ specific to the storage database — `dsn_from` on a `target_resolver` target
 supports both `mysql` and `postgres`.) See
 [docs/storage-schema.md](storage-schema.md) for how schema
 bootstrapping differs between the two dialects.
+
+### MySQL storage sessions run in UTC
+
+Storage writes UTC timestamps from Go and compares them against the session's
+`NOW()` in lease, lock, and webhook retry predicates, so every session the
+MySQL storage pool opens runs with `time_zone='+00:00'` and the Go MySQL
+driver reads and writes `DATETIME` values as UTC. The storage server's own
+default time zone does not affect SchemaBot, and any `time_zone` the storage
+DSN carries is replaced. Target-database connections are not pinned: their
+timestamps are application data. PostgreSQL storage sessions are pinned the
+same way.
+
+The server's default zone does matter once, on a storage server whose default
+zone is not UTC (`@@GLOBAL.time_zone` other than `+00:00`, or `SYSTEM` on a
+host whose clock is not UTC): a pod from a build that does not pin the session
+stamps lease heartbeats in that zone, while a pod from a build that does
+judges them against a UTC cutoff. Run side by side, the pinned pod reads a
+heartbeat written a moment ago as stale by the zone offset and reclaims the
+apply from its live driver. So when moving between such builds in either
+direction, upgrade or rollback, **stop every old pod before starting a new one**
+rather than rolling them. SchemaBot measures the server's default zone against
+UTC when it connects to storage and logs a warning naming this rule, with the
+offset, whenever the two differ; a server already in UTC (the RDS and Aurora
+default) logs nothing and needs no ordering.
+
+Rows the database stamped before the first pinned pod connected keep the
+reading the old zone gave them: `created_at`, `updated_at`, and
+`completed_at` on existing applies and locks, for example, so history read
+across that point shows a step of the zone offset. Until a row is next
+stamped, anything that measures its age against the clock, from the lease
+staleness window to retention cutoffs, sees it as older by the offset west of
+UTC and younger by the offset east of it. The case that is visible is an
+apply in flight at the restart, whose last heartbeat carries the old reading:
+west of UTC the restarted fleet reclaims it as soon as it starts, east of UTC
+only once the offset has elapsed on top of the staleness window.
 
 ### PostgreSQL storage needs a session-per-connection endpoint
 
@@ -1440,6 +1653,22 @@ silently never consulted.
 The Vitess engine calls the PlanetScale API with a service token. The
 permissions it needs, and the ones it does not, are listed in
 [Vitess on PlanetScale](vitess.md#service-token-permissions).
+
+## Branch Reconcile
+
+The `branch_reconcile` block turns on a background pass that reclaims
+PlanetScale branches SchemaBot created and no apply will resume or delete. It
+is off by default, and when enabled it only logs what it would delete until
+`delete: true` is set. See
+[Reclaiming orphaned branches](vitess.md#reclaiming-orphaned-branches) for
+what the pass checks before it deletes a branch.
+
+```yaml
+branch_reconcile:
+  enabled: true   # default: false
+  delete: false   # default: false — log the orphaned branches instead of deleting them
+  grace: 24h      # default: 24h
+```
 
 ## PlanetScale mTLS
 
@@ -1740,6 +1969,23 @@ databases:
         dsn: "env:STAGING_DSN"
 ```
 
+An instance with the review gate off can still turn it on for one database. For example, a staging instance whose databases apply without review by default can require one for `payments`:
+
+```yaml
+databases:
+  payments:
+    type: mysql
+    operator_teams:
+      - myorg/payments-operators
+    review_policy:
+      enabled: true
+    environments:
+      staging:
+        dsn: "env:STAGING_DSN"
+```
+
+The database's own `review_policy` only adds the gate; it cannot turn off an instance-wide one. Who can approve comes from the instance's settings below, and SchemaBot refuses to start unless every PR the database accepts has someone who can approve it. That takes the database's operators, `review_policy.admin_teams` or `admin_users`, or admins on every repo the database accepts: each repo in its `allowed_repos`, or every repo under `repos:` when `allowed_repos` is empty. CODEOWNERS do not count toward this, because they approve only a PR whose files they own.
+
 When enabled, SchemaBot checks PR approval before proceeding. A satisfying review can come from:
 
 1. `review_policy.admin_teams` or `review_policy.admin_users`, which apply to every configured database.
@@ -1761,13 +2007,15 @@ CODEOWNERS support is opt-in because CODEOWNERS is repo-controlled while review 
 
 The base branch is used, not the PR's head branch, to prevent a PR from relaxing its own approval requirements by modifying CODEOWNERS.
 
+Only the owners of the database's schema directory count. The rule must match the schema directory path itself, which SchemaBot checks as a file directly inside it (`<schema dir>/.schema`), and the last matching rule wins. Rules such as `/schema/payments/`, `/schema/`, and `/schema/payments/*` match it. A file-glob rule such as `*.sql` or `/schema/payments/*.sql`, a rule on a subdirectory of the schema directory, and a rule on an environment symlink path do not, so they grant no approval even though GitHub would request review from their owners for the files they match. A schema directory that no rule matches, or that a rule leaves explicitly unowned, has no code owners, so CODEOWNERS adds no reviewers for it and only the other configured principals can approve. Owners of other paths in the repository never satisfy the gate. If CODEOWNERS is the only source of reviewers and no rule owns the schema directory, the review gate fails with an error until a rule covers it or another principal is configured; the error in the server log names the base branch and the schema directory.
+
 Approval is checked at the time of `schemabot apply` and `schemabot apply-confirm`. Once an apply is executing, there is no ongoing approval check. Team membership and CODEOWNERS are evaluated fresh at each gate check.
 
 An approval counts only for the schema change it reviewed, whatever the repository's branch protection does with stale approvals. Each reviewer's latest decisive review is used, and an approval satisfies the gate when it was given on the PR's current head commit, or on an earlier commit at which the PR's change to the database's schema inputs is the same as at the head. A database's schema inputs are its schema directory, the environment symlink that directory was resolved through (if any), its `schemabot.yaml`, and the target of every symlink inside them. Changes elsewhere in the repository, including another database's schema, do not affect the approval.
 
-The PR's change is measured against the default branch it was built on: SchemaBot finds the merge base of each commit with the base branch's current tip and compares content at all four commits. A schema input counts as unchanged when the PR turns the same base content into the same result at both commits, or when the PR leaves it as the base branch has it at both commits and the head was built on newer default branch content than the approved commit. So rebasing onto, or merging in, a newer default branch keeps the approval even when that default branch added tables beside the PR's, changed the database's `schemabot.yaml`, or removed a namespace: those changes are not the PR's, and they reached the default branch through their own PR and review. The approval stops counting when the PR edits, adds, or removes a schema input after it, including when a rebase combines the PR's edit with a default branch edit to the same file, keeps the PR's version over the default branch's, or restores content the default branch changed. Rebuilding the PR on an older default branch commit than the one it was approved on also stops the approval from counting when any schema input differs between the two, since the head would carry a version of that input nobody approved for this PR. Keeping an approval across default branch changes relies on the default branch requiring review for every change that reaches it: a change pushed to it directly, without its own review, is carried past an earlier approval like any other default branch change. Protect the default branch with required reviews when the review gate is enabled.
+The PR's change is measured against the default branch it was built on: SchemaBot finds the merge base of each commit with the base branch's current tip and compares content at all four commits. A schema input counts as unchanged when the PR turns the same base content into the same result at both commits, or when the PR leaves it as the base branch has it at both commits and the head was built on newer default branch content than the approved commit. So rebasing onto, or merging in, a newer default branch keeps the approval even when that default branch added tables beside the PR's, changed the database's `schemabot.yaml`, or removed a namespace: those changes are not the PR's, and they reached the default branch through their own PR and review. The same holds for a stacked PR: when the PR below it merges, even with revisions, and this PR is rebased onto it, the schema files that came from the lower PR are now the default branch's, and the approval keeps counting as long as this PR's own change is the same. On MySQL, Vitess, and Strata databases, a rebase that combines the PR's edit with a default branch edit to the same table's file also keeps the approval when the PR's edit generates the same schema change statements on both bases, the head declares every column, index, constraint, table option, and partitioning clause as the approved commit does where the default branch left it alone and as the default branch does where it changed it, and neither side reorders the other's columns. A column, index, or option both the PR and the default branch changed always needs a new approval. For example, when the default branch added two columns to a table the PR adds a third column to, both commits generate the same `ADD COLUMN`, so the approval counts. The file must hold a single `CREATE TABLE` at all four commits; a file that does not, or more such files than a comparison reads, counts as changed. A table file the PR adds has no base content, so its change is the `CREATE TABLE` itself: reformatting it or editing its comments keeps the approval, and any change to a column, index, constraint, table option, partitioning clause, column order, or any other clause the file declares needs a new one. Every element is read from the parser's parse tree, so a clause such as `ENCRYPTION` or a `LIKE` source counts too. PostgreSQL databases keep the approval in the same case, by the same rules except column order, which PostgreSQL does not manage. The merge reads every clause each file declares, including storage parameters, tablespaces, and identity sequence options. SchemaBot cannot tell which statements a PostgreSQL file generates without running it, so the environment's primary target runs all four versions on a scratch schema in a transaction it always rolls back and diffs the tables it built. A schema file the PR adds is compared by PostgreSQL's parse tree alone, without running it on the target database: it keeps the approval when its statements parse the same at both commits, in the same order. A file that declares row security or a foreign key, that the target cannot run, or that it cannot compare within 30 seconds counts as changed, and so does every such file when the target is unreachable or its data plane predates the comparison. One review gate check spends at most 90 seconds comparing files on the target across all its approvals, compares a file two approvals share once, and counts every file left after that as changed. A check cancelled while the target compares a file fails as an evaluation error that asks for a retry, rather than counting the file as changed. The approval stops counting when the PR edits, adds, or removes a schema input after it, or stops changing a schema input the default branch has not changed since, including when a rebase combines the PR's edit with a default branch edit to the same file in a way that changes the statements the PR's edit generates, keeps the PR's version over the default branch's, or restores content the default branch changed. Rebuilding the PR on an older default branch commit than the one it was approved on also stops the approval from counting when any schema input differs between the two, since the head would carry a version of that input nobody approved for this PR. These rules trust default branch content, so they apply only to a PR that targets the repository's default branch; a PR targeting any other branch keeps an approval only for a schema input whose base content and PR change are both the same at the two commits, so on such a PR, a rebase or merge that brings in any change to its schema inputs needs a new approval, and the Review Required comment names the target branch to say so. Keeping an approval across default branch changes relies on the default branch requiring review for every change that reaches it: a change pushed to it directly, without its own review, is carried past an earlier approval like any other default branch change. Protect the default branch with required reviews when the review gate is enabled.
 
-If the PR's change differs, the Review Required comment names the reviewers whose approvals no longer count, and the reviewer must approve the current head. If the comparison cannot be completed (GitHub cannot find the approved commit, a directory is too large to list, a symlink points outside the repository, or there are more distinct symlinks than a comparison reads) and no other approval covers the head, that approval does not count and the apply is blocked with a Review Gate Error comment. The comment names the approval that did not count, lists who can approve, and asks for an approval of the latest commit, which needs no comparison. The reason goes to the server logs. Asking GitHub again would return the same answer, so the command is not retried. If GitHub is unavailable while the gate compares the commits, the command fails with a retryable error instead of reporting that a review is required. `apply-confirm` re-checks the gate, so a schema change pushed between `apply` and `apply-confirm` also needs a fresh approval.
+If the PR's change differs, the Review Required comment names the reviewers whose approvals no longer count and the schema file whose change differs, and the reviewer must approve the current head. If the comparison cannot be completed (GitHub cannot find the approved commit, a directory is too large to list, a symlink points outside the repository, or there are more distinct symlinks than a comparison reads) and no other approval covers the head, that approval does not count and the apply is blocked with a Review Gate Error comment. The comment names the approval that did not count, lists who can approve, and asks for an approval of the latest commit, which needs no comparison. The reason goes to the server logs. Asking GitHub again would return the same answer, so the command is not retried. If GitHub is unavailable while the gate compares the commits, the command fails with a retryable error instead of reporting that a review is required. `apply-confirm` re-checks the gate, so a schema change pushed between `apply` and `apply-confirm` also needs a fresh approval.
 
 ## Authentication
 
@@ -1881,7 +2129,7 @@ The decision has two halves. The middleware admits any caller in `write_groups` 
 
 Two consequences of the environment-less lock grant are worth stating outright. First, a scoped operator's lock holds applies off **every** environment of their database, including environments outside `operator_environments` — an operator scoped to staging can still freeze production applies of their own database. That direction is fail-safe (a lock only ever prevents changes), so the grant deliberately allows it. Second, the reverse direction is not: force release (`force: true`) bypasses the lock ownership check, so it could undo another holder's safety brake — for example an admin's incident lock. Force release therefore stays admin-only (`write_groups`).
 
-A scoped operator's normal release is held to who took the lock, not to the owner string it carries: that string is visible to anyone who can list locks, so sending it proves nothing. A lock acquired through `POST /api/locks/acquire` records its verified acquirer and which of the database's `operator_groups` that acquirer belonged to, and a scoped operator may release it only when they share at least one of those groups — a teammate can release a lock another member of their group took, and nobody outside the group can. A lock that records no acquirer (a PR apply's lock, a lock taken on a deployment with no `operator_groups`, a lock taken by a server version that did not record acquirers, or one taken through the loopback break-glass lane, whose identity headers are not proxy-verified) or whose acquirer held none of the database's operator groups belongs to no group, so a scoped operator cannot release it; a `write_groups` member can, by owner or with `force`. A refused release is a `403` naming the groups that may release the lock, and the lock stays held. The release is decided against the lock row it read and deletes only that row, so a lock released and acquired again while the release runs is reported as a `409` and the new lock stays held. The same rule decides whether a scoped operator who acquires a lock already held under the owner they sent is told they hold it: re-acquiring a lock their own group took succeeds without changing it, and sending the owner of another group's lock, or of a lock that belongs to no group, is a `403` naming the groups that may release it, with the lock unchanged. `write_groups` members, and every caller on a deployment without `operator_groups`, re-acquire and release by owner alone. A lock records its acquirer's groups when it is taken, while the caller's groups are read from the current configuration, so editing `operator_groups` strands locks: after a group is renamed, no scoped operator can release or re-acquire a lock taken under its old name, and an operator moved out of every group a lock recorded can no longer release or re-acquire the lock they took, until a `write_groups` member (or, for a moved operator, a remaining member of one of those groups) releases it.
+A scoped operator's normal release is held to who took the lock, not to the owner string it carries: that string is visible to anyone who can list locks, so sending it proves nothing. A lock acquired through `POST /api/locks/acquire` records its verified acquirer and which of the database's `operator_groups` that acquirer belonged to, and a scoped operator may release it only when they share at least one of those groups — a teammate can release a lock another member of their group took, and nobody outside the group can. A lock that records no acquirer (a PR apply's lock, a lock taken on a deployment with no `operator_groups`, a lock taken by a server version that did not record acquirers, or one taken through the loopback break-glass lane, whose identity headers are not proxy-verified) or whose acquirer held none of the database's operator groups belongs to no group, so a scoped operator cannot release it; a `write_groups` member can, by owner or with `force`. A scoped operator cannot create such a lock: an acquire from a scoped operator whose identity is not verified, as on the loopback break-glass lane, is refused with a `403` before anything is taken, since the lock would record no acquirer and they could never release or re-acquire it. The refusal is decided before the lock is read, so it also answers an unverified operator re-sending the owner of a lock their own group already holds: the lock stays held and unchanged, but the request is not told it holds it, because the groups of an unverified caller are only claimed. `schemabot apply` (unless `--no-lock` is set) and `schemabot rollback` take this lock before they start, so on the loopback break-glass lane they stop at the same refusal before changing anything; a deployment write group member can run them instead. A refused release is a `403` naming the groups that may release the lock, and the lock stays held. The release is decided against the lock row it read and deletes only that row, so a lock released and acquired again while the release runs is reported as a `409` and the new lock stays held. The same rule decides whether a scoped operator who acquires a lock already held under the owner they sent is told they hold it: re-acquiring a lock their own group took succeeds without changing it when their identity is verified, and sending the owner of another group's lock, or of a lock that belongs to no group, is a `403` naming the groups that may release it, with the lock unchanged. `write_groups` members, and every caller on a deployment without `operator_groups`, re-acquire and release by owner alone. A lock records its acquirer's groups when it is taken, while the caller's groups are read from the current configuration, so editing `operator_groups` strands locks: after a group is renamed, no scoped operator can release or re-acquire a lock taken under its old name, and an operator moved out of every group a lock recorded can no longer release or re-acquire the lock they took, until a `write_groups` member (or, for a moved operator, a remaining member of one of those groups) releases it.
 
 The grant fails closed everywhere: an unconfigured database or an environment outside `operator_environments` denies scoped callers with a `403` naming the groups that would grant access, and a target that cannot be resolved at decision time — a stored plan or apply lookup failure — surfaces as the operation's own `500`, never as an authorization. Misconfiguration is a startup error, not a silent no-op: any `operator_groups` grant requires a non-empty `operator_environments` (and the reverse), requires `auth.type: forward_auth`, and every granted database must have at least one of its environments in `operator_environments` — a grant that could never authorize anything is rejected at startup.
 

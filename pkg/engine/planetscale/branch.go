@@ -90,7 +90,11 @@ func (e *Engine) verifyBranchMatchesDesiredWithRetry(ctx context.Context, client
 // returns stale schema until an asynchronous schema snapshot completes after
 // DDL execution.
 func (e *Engine) verifyBranchMatchesDesired(ctx context.Context, client psclient.PSClient, org, database, branch string, keyspaces []string, schemaFiles schema.SchemaFiles, ignored engine.IgnoredTables, password *ps.DatabaseBranchPassword) error {
-	branchSchema, err := e.fetchBranchSchemaViaMySQL(ctx, password, keyspaces)
+	fetchBranchSchema := e.fetchBranchSchemaViaMySQL
+	if e.validationBranchSchema != nil {
+		fetchBranchSchema = e.validationBranchSchema
+	}
+	branchSchema, err := fetchBranchSchema(ctx, password, keyspaces)
 	if err != nil {
 		return fmt.Errorf("fetch branch schema via MySQL for validation: %w", err)
 	}
@@ -104,7 +108,12 @@ func (e *Engine) verifyBranchMatchesDesired(ctx context.Context, client psclient
 			continue
 		}
 
-		diff, err := e.diffKeyspace(ctx, client, org, database, branch, ks, ns, branchSchema)
+		// A VSchema the API reports missing is taken as absent here: the
+		// desired document is never empty when one is checked, so the absence
+		// surfaces as a VSchema difference and the caller's retry reads it
+		// again on its own schedule. Reading it again here as well would
+		// stack the two waits.
+		diff, err := e.diffKeyspace(ctx, client, org, database, branch, ks, ns, branchSchema, acceptMissingVSchema)
 		if err != nil {
 			return fmt.Errorf("validate keyspace %s: %w", ks, err)
 		}
@@ -233,10 +242,31 @@ type keyspaceDiff struct {
 	currentVSchemaRaw string
 }
 
+// missingVSchemaPolicy says what a diff does with a VSchema the API reports
+// missing. A not-found answer means either that the keyspace has never had a
+// VSchema or that the API has not converged after a recent write, and the two
+// call for opposite plans: absence makes the desired document the keyspace's
+// first, which switches off the checks that compare it against what it
+// replaces (removals and vindex or routing mutations).
+type missingVSchemaPolicy int
+
+const (
+	// rereadMissingVSchema believes the absence only for a keyspace the branch
+	// does not have; for a keyspace it has, it reads the VSchema again, a
+	// bounded number of times, and refuses if it is still missing. This is
+	// the policy for a diff whose answer is acted on as read.
+	rereadMissingVSchema missingVSchemaPolicy = iota
+	// acceptMissingVSchema believes the first not-found. This is the policy for
+	// a caller whose own retry loop reads the keyspace again on a VSchema
+	// difference, so a lagging answer costs one of its attempts rather than a
+	// second wait nested inside the first.
+	acceptMissingVSchema
+)
+
 // diffKeyspace diffs a single keyspace's schema between a branch and the
 // desired schema files, linting the planned statements in the same pass.
 // Shared by Plan() and verifyBranchMatchesDesired().
-func (e *Engine) diffKeyspace(ctx context.Context, client psclient.PSClient, org, database, branch, ks string, ns *schema.Namespace, currentSchema map[string][]table.TableSchema) (keyspaceDiff, error) {
+func (e *Engine) diffKeyspace(ctx context.Context, client psclient.PSClient, org, database, branch, ks string, ns *schema.Namespace, currentSchema map[string][]table.TableSchema, missing missingVSchemaPolicy) (keyspaceDiff, error) {
 	var currentTableSchemas []table.TableSchema
 	if tables, ok := currentSchema[ks]; ok {
 		currentTableSchemas = append(currentTableSchemas, tables...)
@@ -321,24 +351,9 @@ func (e *Engine) diffKeyspace(ctx context.Context, client psclient.PSClient, org
 	vschemaChanged := false
 	currentVSchemaRaw := ""
 	if content, ok := ns.Files["vschema.json"]; ok && content != "" {
-		currentVSchema, fetchErr := client.GetKeyspaceVSchema(ctx, &ps.GetKeyspaceVSchemaRequest{
-			Organization: org,
-			Database:     database,
-			Branch:       branch,
-			Keyspace:     ks,
-		})
-		if fetchErr != nil {
-			var psErr *ps.Error
-			if !errors.As(fetchErr, &psErr) || psErr.Code != ps.ErrNotFound {
-				return keyspaceDiff{}, fmt.Errorf("fetch VSchema for keyspace %s: %w", ks, fetchErr)
-			}
-			// Keyspace has no VSchema on this branch yet — either it has
-			// never had one, or the API has not converged after a recent
-			// write. Treat as empty so the desired VSchema appears as a
-			// change; validation callers absorb convergence lag through
-			// the VSchema staleness retry.
-			e.logger.Warn("VSchema not found for keyspace, treating as empty",
-				"keyspace", ks, "branch", branch)
+		currentVSchema, err := e.fetchKeyspaceVSchema(ctx, client, org, database, branch, ks, missing)
+		if err != nil {
+			return keyspaceDiff{}, err
 		}
 		if currentVSchema != nil {
 			currentVSchemaRaw = currentVSchema.Raw
@@ -397,7 +412,12 @@ func (e *Engine) verifyBranchMatchesMain(ctx context.Context, client psclient.PS
 			mainNS.Files[t.Name+".sql"] = t.Schema + ";"
 		}
 
-		diff, diffErr := e.diffKeyspace(ctx, client, org, database, branchName, ks, mainNS, branchSchema)
+		// mainNS carries only table files, so this diff never reads a
+		// VSchema and the policy is not reached today. It is the re-read
+		// policy because this gate acts on its answer (a difference means
+		// the branch is stale), which is what a VSchema comparison added
+		// here would need.
+		diff, diffErr := e.diffKeyspace(ctx, client, org, database, branchName, ks, mainNS, branchSchema, rereadMissingVSchema)
 		if diffErr != nil {
 			return fmt.Errorf("diff branch vs main for %s: %w", ks, diffErr)
 		}
@@ -409,6 +429,129 @@ func (e *Engine) verifyBranchMatchesMain(ctx context.Context, client psclient.PS
 
 	e.logger.Info("branch schema matches main", "branch", branchName, "keyspaces", len(keyspaces))
 	return nil
+}
+
+// vschemaAbsenceRereads and vschemaAbsenceRereadInterval bound how long a
+// VSchema the API reports missing is read again under rereadMissingVSchema
+// before the plan is refused. keyspaceAbsenceRereads bounds how many times a
+// keyspace the API reports missing is read again, after the same interval,
+// before the plan takes it as absent.
+var (
+	vschemaAbsenceRereads        = 3
+	vschemaAbsenceRereadInterval = 2 * time.Second
+	keyspaceAbsenceRereads       = 1
+)
+
+// unconfirmedVSchemaAbsenceError refuses a plan for a keyspace the branch
+// has but whose VSchema the API still reports missing after the bounded
+// re-reads. Planning on would make the desired document the keyspace's first:
+// the VSchema removal and routing mutation checks would have nothing to
+// compare against, and the rollback baseline would record an empty VSchema
+// that a rollback would write over the real one. A rollback plans through the
+// same read, so the message names a retry of whichever command reached it
+// rather than a plan alone.
+type unconfirmedVSchemaAbsenceError struct {
+	database string
+	branch   string
+	keyspace string
+	reads    int
+}
+
+func (e *unconfirmedVSchemaAbsenceError) Error() string {
+	return fmt.Sprintf("PlanetScale has keyspace %s on branch %s of database %s but reported no VSchema for it on %d reads, "+
+		"so the plan cannot tell an absent VSchema from one the API has not caught up on. "+
+		"Retry once PlanetScale shows the keyspace's VSchema. "+
+		"If the keyspace has never had one, set an empty VSchema ({}) on it in PlanetScale, then retry",
+		e.keyspace, e.branch, e.database, e.reads)
+}
+
+// fetchKeyspaceVSchema reads the keyspace's VSchema on branch, returning nil
+// when the keyspace has none.
+//
+// A not-found answer means either that the keyspace has no VSchema or that the
+// API has not converged after a recent write, and nothing the diff holds tells
+// the two apart: a keyspace with no physical tables can still carry a VSchema,
+// and the table list the diff sees has already had ignore_tables withheld from
+// it. Under rereadMissingVSchema the absence is believed only for a keyspace
+// the branch does not have yet, which has no VSchema to lag. That is asked of
+// the keyspace by name rather than read from the keyspace listing, whose pages
+// can shift and leave out a keyspace that exists, and a not-found is itself
+// read again once before it is believed. For a keyspace the branch
+// has, the read is repeated a bounded number of times, and a VSchema that
+// stays missing refuses the plan with unconfirmedVSchemaAbsenceError rather
+// than planning against an absence nothing confirms.
+func (e *Engine) fetchKeyspaceVSchema(ctx context.Context, client psclient.PSClient, org, database, branch, ks string, missing missingVSchemaPolicy) (*ps.VSchema, error) {
+	req := &ps.GetKeyspaceVSchemaRequest{Organization: org, Database: database, Branch: branch, Keyspace: ks}
+	for attempt := 0; ; attempt++ {
+		current, err := client.GetKeyspaceVSchema(ctx, req)
+		if err == nil {
+			if attempt > 0 {
+				e.logger.Info("VSchema found after an earlier read reported it missing",
+					"keyspace", ks, "branch", branch, "reads", attempt+1)
+			}
+			return current, nil
+		}
+		if !isNotFound(err) {
+			return nil, fmt.Errorf("fetch VSchema for keyspace %s: %w", ks, err)
+		}
+		if missing == acceptMissingVSchema {
+			e.logger.Info("VSchema not found for keyspace; taking it as absent for this read, the caller reads it again on a VSchema difference",
+				"keyspace", ks, "branch", branch)
+			return nil, nil
+		}
+		if attempt == 0 {
+			exists, existsErr := e.keyspaceExists(ctx, client, org, database, branch, ks)
+			if existsErr != nil {
+				return nil, existsErr
+			}
+			if !exists {
+				e.logger.Info("VSchema not found for a keyspace the branch does not have yet; planning the keyspace's first VSchema",
+					"keyspace", ks, "branch", branch)
+				return nil, nil
+			}
+		}
+		if attempt >= vschemaAbsenceRereads {
+			e.logger.Warn("VSchema still reported missing for a keyspace the branch has; refusing the plan",
+				"database", database, "keyspace", ks, "branch", branch, "reads", attempt+1)
+			return nil, &unconfirmedVSchemaAbsenceError{database: database, branch: branch, keyspace: ks, reads: attempt + 1}
+		}
+		e.logger.Info("VSchema reported missing; reading it again in case the API has not converged",
+			"keyspace", ks, "branch", branch, "read", attempt+1, "delay", vschemaAbsenceRereadInterval)
+		select {
+		case <-ctx.Done():
+			return nil, fmt.Errorf("re-read VSchema for keyspace %s: %w", ks, ctx.Err())
+		case <-time.After(vschemaAbsenceRereadInterval):
+		}
+	}
+}
+
+// keyspaceExists reports whether branch has keyspace ks, reading it by name.
+// Only a not-found answer means it does not; any other error is returned, so
+// an absence is never assumed from a read that failed. The API can answer
+// not-found for a keyspace created moments before while it catches up, just
+// as it can for a VSchema, so a not-found is read again once, after
+// vschemaAbsenceRereadInterval, before it is believed.
+func (e *Engine) keyspaceExists(ctx context.Context, client psclient.PSClient, org, database, branch, ks string) (bool, error) {
+	req := &ps.GetKeyspaceRequest{Organization: org, Database: database, Branch: branch, Keyspace: ks}
+	for attempt := 0; ; attempt++ {
+		_, err := client.GetKeyspace(ctx, req)
+		if err == nil {
+			return true, nil
+		}
+		if !isNotFound(err) {
+			return false, fmt.Errorf("read keyspace %s on branch %s of database %s to confirm it has no VSchema: %w", ks, branch, database, err)
+		}
+		if attempt >= keyspaceAbsenceRereads {
+			return false, nil
+		}
+		e.logger.Info("keyspace reported missing; reading it again in case the API has not converged",
+			"keyspace", ks, "branch", branch, "read", attempt+1, "delay", vschemaAbsenceRereadInterval)
+		select {
+		case <-ctx.Done():
+			return false, fmt.Errorf("re-read keyspace %s on branch %s of database %s: %w", ks, branch, database, ctx.Err())
+		case <-time.After(vschemaAbsenceRereadInterval):
+		}
+	}
 }
 
 func (e *Engine) fetchDatabaseSchema(ctx context.Context, client psclient.PSClient, org, database, branch string, keyspaces []string) (map[string][]table.TableSchema, error) {
@@ -856,7 +999,9 @@ func (e *Engine) deployDeployRequest(ctx context.Context, client psclient.PSClie
 		case isRetryablePSError(err):
 			transientAttempts++
 			if transientAttempts >= maxRetries {
-				return nil, fmt.Errorf("deploy deploy request #%d (after %d attempts): %w", number, maxRetries, err)
+				return e.adoptDeployAfterError(ctx, client, org, database, number,
+					fmt.Errorf("deploy deploy request #%d (after %d attempts): %w", number, maxRetries, err),
+					deployRefusedByPlanetScale(err, transientAttempts))
 			}
 			delay := retryDelay(transientAttempts, err)
 			e.logger.Warn("retrying deploy request",
@@ -867,9 +1012,132 @@ func (e *Engine) deployDeployRequest(ctx context.Context, client psclient.PSClie
 			case <-time.After(delay):
 			}
 		default:
-			return nil, fmt.Errorf("deploy deploy request #%d: %w", number, err)
+			return e.adoptDeployAfterError(ctx, client, org, database, number,
+				fmt.Errorf("deploy deploy request #%d: %w", number, err),
+				deployRefusedByPlanetScale(err, transientAttempts))
 		}
 	}
+}
+
+// deployRefusedByPlanetScale reports whether a failed deploy call is PlanetScale
+// answering that it will not deploy the request, which shows the deploy did not
+// start: an HTTP answer the SDK types as not found, permission denied or an
+// invalid request, given to the first deploy attempt. Every other failure
+// leaves the outcome open. A transport failure got no answer, and the deploy
+// may still be in flight. An internal, malformed or retry answer, or one the
+// SDK does not type, does not say the deploy was refused. A refusal given to a
+// retry is not proof either: an earlier attempt may have started the deploy,
+// and the refusal can be PlanetScale reporting that deploy as already under way.
+func deployRefusedByPlanetScale(err error, earlierAttempts int) bool {
+	if earlierAttempts > 0 {
+		return false
+	}
+	var psErr *ps.Error
+	if !errors.As(err, &psErr) {
+		return false
+	}
+	switch psErr.Code {
+	case ps.ErrNotFound, ps.ErrPermission, ps.ErrInvalid:
+		return true
+	default:
+		return false
+	}
+}
+
+// deployRequestShowsDeployAccepted reports whether a deploy request re-read
+// after a failed deploy call shows that PlanetScale accepted a deploy: a deploy
+// timestamp, or a deployment state a deploy request reaches only once its
+// deploy is accepted (queued, running, at or in its cutover, completed, or
+// being cancelled or reverted after it began). A failed state, a no-changes
+// result or a state this list does not name is not an accepted deploy, so it
+// is never tracked as one: the drive would report a deploy that never ran.
+func deployRequestShowsDeployAccepted(dr *ps.DeployRequest) bool {
+	if dr.DeployedAt != nil {
+		return true
+	}
+	switch dr.DeploymentState {
+	case deployState.Submitting, deployState.Queued,
+		deployState.InProgress, deployState.InProgressVSchema,
+		deployState.PendingCutover, deployState.InProgressCutover,
+		deployState.Complete, deployState.CompletePendingRevert,
+		deployState.InProgressCancel, deployState.CompleteCancel,
+		deployState.InProgressRevert, deployState.InProgressRevertVSchema, deployState.CompleteRevert:
+		return true
+	default:
+		return false
+	}
+}
+
+// adoptDeployAfterError decides the outcome of a deploy call that failed with
+// an error other than an approval or still-validating rejection. A connection
+// that drops after the request was sent, or a retry PlanetScale rejects because
+// an earlier attempt already started the deploy, leaves the schema change
+// running remotely; failing the apply then would leave it running with nothing
+// tracking it. The deploy request is re-read, and when it shows PlanetScale
+// accepted the deploy it is returned so the drive tracks it.
+//
+// Otherwise refused, from deployRefusedByPlanetScale, decides. A refusal is
+// PlanetScale's answer, so deployErr is returned even when the re-read fails.
+// Without one, a re-read that fails or returns nothing, or one that still reads
+// ready, leaves the outcome unknown: a deploy still in flight can move the
+// request out of ready after the re-read returns. The error then carries
+// engine.OutcomeUnknownError, so the drive pauses the apply and recovery
+// re-reads this same deploy request, deploying it only if it still reads ready,
+// instead of failing the apply or deploying another request. Any other state
+// shows no deploy to track and is not one recovery would deploy, so deployErr
+// is returned. A drive whose context already ended sends no re-read, and the
+// outcome is decided as for a re-read that failed.
+func (e *Engine) adoptDeployAfterError(ctx context.Context, client psclient.PSClient, org, database string, number uint64, deployErr error, refused bool) (*ps.DeployRequest, error) {
+	var dr *ps.DeployRequest
+	var getErr error
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		getErr = fmt.Errorf("drive ended before the deploy request was re-read: %w", ctxErr)
+	} else {
+		dr, getErr = client.GetDeployRequest(ctx, &ps.GetDeployRequestRequest{
+			Organization: org,
+			Database:     database,
+			Number:       number,
+		})
+	}
+	if getErr != nil {
+		if refused {
+			e.logger.Warn("PlanetScale refused the deploy and re-reading the deploy request failed; failing the deploy with the refusal",
+				"database", database, "deploy_request", number, "deploy_error", deployErr, "error", getErr)
+			return nil, deployErr
+		}
+		e.logger.Warn("deploy call failed and re-reading the deploy request to check whether the deploy started also failed; reporting the deploy outcome as unknown so recovery re-reads this deploy request",
+			"database", database, "deploy_request", number, "deploy_error", deployErr, "error", getErr)
+		return nil, engine.NewOutcomeUnknownError("%w (re-reading deploy request #%d to check whether the deploy started also failed: %w)", deployErr, number, getErr)
+	}
+	if dr == nil {
+		if refused {
+			e.logger.Warn("PlanetScale refused the deploy and re-reading the deploy request returned nothing; failing the deploy with the refusal",
+				"database", database, "deploy_request", number, "deploy_error", deployErr)
+			return nil, deployErr
+		}
+		e.logger.Warn("deploy call failed and re-reading the deploy request returned nothing; reporting the deploy outcome as unknown so recovery re-reads this deploy request",
+			"database", database, "deploy_request", number, "deploy_error", deployErr)
+		return nil, engine.NewOutcomeUnknownError("%w (re-reading deploy request #%d to check whether the deploy started returned no deploy request)", deployErr, number)
+	}
+	if deployRequestShowsDeployAccepted(dr) {
+		e.logger.Warn("deploy call failed but the deploy request shows its deploy was accepted; tracking it as deployed",
+			"database", database, "deploy_request", number, "deployment_state", dr.DeploymentState,
+			"deployed_at", formatDeployedAt(dr.DeployedAt), "error", deployErr)
+		return dr, nil
+	}
+	if refused {
+		e.logger.Info("PlanetScale refused the deploy and the deploy request shows no accepted deploy; failing the deploy",
+			"database", database, "deploy_request", number, "deployment_state", dr.DeploymentState, "error", deployErr)
+		return nil, deployErr
+	}
+	if dr.DeploymentState == deployState.Ready {
+		e.logger.Warn("deploy call failed without a refusal from PlanetScale and the deploy request still reads ready; a deploy still in flight can start after this read, so reporting the deploy outcome as unknown so recovery re-reads this deploy request",
+			"database", database, "deploy_request", number, "error", deployErr)
+		return nil, engine.NewOutcomeUnknownError("%w (deploy request #%d still reads ready, which does not show that the deploy did not start)", deployErr, number)
+	}
+	e.logger.Info("deploy call failed and the deploy request shows no accepted deploy and is not ready; failing the deploy",
+		"database", database, "deploy_request", number, "deployment_state", dr.DeploymentState, "error", deployErr)
+	return nil, deployErr
 }
 
 // waitForDeployRequestPending polls a deploy request until PlanetScale finishes

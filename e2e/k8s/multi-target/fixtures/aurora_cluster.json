@@ -1,0 +1,29 @@
+[
+  {
+    "name": "shard-001-cluster",
+    "app": "shardapp",
+    "dsid": "dsid-shard-001",
+    "env": "staging",
+    "aws_region": "us-east-1",
+    "aws_account_id": "000000000000",
+    "writer_endpoint": "mysql-shard-001"
+  },
+  {
+    "name": "shard-002-cluster",
+    "app": "shardapp",
+    "dsid": "dsid-shard-002",
+    "env": "staging",
+    "aws_region": "us-east-1",
+    "aws_account_id": "000000000000",
+    "writer_endpoint": "mysql-shard-002"
+  },
+  {
+    "name": "shard-003-cluster",
+    "app": "shardapp",
+    "dsid": "dsid-shard-003",
+    "env": "staging",
+    "aws_region": "us-east-1",
+    "aws_account_id": "000000000000",
+    "writer_endpoint": "mysql-shard-003"
+  }
+]

@@ -7,6 +7,7 @@ import (
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/glyph"
+	"github.com/block/schemabot/pkg/presentation"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
@@ -197,6 +198,9 @@ func renderShardedApplyComment(data ShardedApplyData, renderedAt string, formatt
 	writeApplyStatusHeader(&sb, ApplyStatusCommentData{State: data.State, Environment: data.Environment, Rollback: data.Rollback})
 	writeShardedMetadata(&sb, data, renderedAt)
 	writeShardedStatusLine(&sb, data)
+	if state.IsState(data.State, state.Apply.Pending) {
+		sb.WriteString("\n" + queuedApplyExplanation + "\n")
+	}
 
 	writeShardCounts(&sb, allShardStatuses(data.Keyspaces))
 	writeShardedFailure(&sb, data)
@@ -569,9 +573,10 @@ func keyspaceHasDivergentOutcome(shards []ShardStatus) bool {
 
 // writeShardedTableLine writes one table's rollup line — the table name and its
 // aggregate state, with the shard count on a completed sharded table — followed
-// by the compact per-shard summary while the table is in flight. An actively
-// copying table with reported row figures renders the live progress form (bar,
-// summed rows, slowest-shard ETA); every other state names its phase, and the
+// by the compact per-shard summary while the table is in flight. A table whose
+// shards are working and have reported row figures renders the progress form
+// (bar, summed rows, slowest-shard ETA), whichever phase its most pressing
+// shard is in; every other state names its phase, and the
 // shard summary carries the per-shard percents. When the aggregate is a quiet
 // state (no shard-summary breakdown) but the change has already landed on some
 // shards — a partially-landed table between dispatch waves, or one cancelled
@@ -581,11 +586,14 @@ func keyspaceHasDivergentOutcome(shards []ShardStatus) bool {
 // and shard lines, where the single-deployment comment puts it.
 func writeShardedTableLine(sb *strings.Builder, t ShardedTableStatus, budget *ddlBlockBudget, writeDDL func()) {
 	status := state.NormalizeTaskStatus(t.Status)
-	if status == state.Task.Running && t.RowsTotal > 0 {
+	switch {
+	case status == state.Task.Running && t.RowsTotal > 0:
 		writeShardedTableCopyProgress(sb, t, writeDDL)
-	} else {
+	case keepsShardedProgressBar(status, t):
+		writeShardedTablePhaseProgress(sb, t, writeDDL)
+	default:
 		phrase := shardedTableStatusPhrase(status)
-		if landed := landedShardCount(t.Shards); landed > 0 && landed < len(t.Shards) && !shardSummaryBreakdownState(status) {
+		if landed := landedShardCount(t.Shards); landed > 0 && landed < len(t.Shards) && !presentation.ListsParts(status) {
 			if status == state.Task.Cancelled {
 				// The pure-cancelled parenthetical ("not started") would be false
 				// here: the change is live on the landed shards.
@@ -601,6 +609,38 @@ func writeShardedTableLine(sb *strings.Builder, t ShardedTableStatus, budget *dd
 		writeDDL()
 	}
 	renderShardSummary(sb, TableProgressData{TableName: t.Table, Status: t.Status, Shards: t.Shards}, budget)
+}
+
+// keepsShardedProgressBar reports whether a sharded table past its row copy
+// still leads with its progress bar (presentation.ShardsKeepTableBar), once
+// its shards have reported rows; the bar holds until every shard completes,
+// and the shard list says where each one stands.
+func keepsShardedProgressBar(status string, t ShardedTableStatus) bool {
+	if t.RowsTotal <= 0 {
+		return false
+	}
+	statuses := make([]string, len(t.Shards))
+	for i, s := range t.Shards {
+		statuses[i] = s.Status
+	}
+	return presentation.ShardsKeepTableBar(status, statuses)
+}
+
+// writeShardedTablePhaseProgress renders a sharded table whose shards are past
+// or beside the row copy: the bar across every shard the table spans, the way
+// a rollout's bar spans its targets (presentation.PercentAcrossTargets), and
+// the rows line. A shard that has not reported, whether queued or not yet
+// attached, counts as nothing, so one verified shard beside three queued ones
+// reads as a quarter done rather than nearly complete.
+func writeShardedTablePhaseProgress(sb *strings.Builder, t ShardedTableStatus, writeDDL func()) {
+	parts := make([]presentation.Part, len(t.Shards))
+	for i, s := range t.Shards {
+		parts[i] = s.part()
+	}
+	pct := presentation.PercentAcrossTargets(parts, t.shardTotal()-len(t.Shards))
+	fmt.Fprintf(sb, "**%s**: %s %d%%\n", inlineCode(t.Table), ui.ProgressBarRowCopy(pct), pct)
+	writeDDL()
+	writeShardedRowsAndETA(sb, t)
 }
 
 // writeShardedTableCopyProgress renders an actively copying table's live
@@ -668,24 +708,11 @@ func writeShardedRowsAndETA(sb *strings.Builder, t ShardedTableStatus) {
 		ui.FormatNumber(ui.ClampRows(t.RowsCopied, t.RowsTotal)),
 		ui.FormatNumber(t.RowsTotal),
 		t.ShardsReporting, t.shardTotal())
-	// The planned size is the whole table's, so beside rows that cover only
-	// some shards it names the full span rather than reading as theirs.
-	if t.EstimatedBytes != nil {
-		line += fmt.Sprintf(" · %s %s", ui.FormatApproxBytes(*t.EstimatedBytes), plannedShardSpan(t.PlannedShards))
-	}
+	line += ui.FormatShardedTableSizeClause(t.EstimatedBytes, t.PlannedShards)
 	if t.ETASeconds > 0 {
 		line += fmt.Sprintf(" · ETA: ≥ %s", ui.FormatETA(t.ETASeconds))
 	}
 	sb.WriteString(line + "\n")
-}
-
-// plannedShardSpan names the shards a table's planned size covers: the plan's
-// count when it recorded one, otherwise every shard without a number.
-func plannedShardSpan(plannedShards int) string {
-	if plannedShards > 0 {
-		return fmt.Sprintf("across all %d shards", plannedShards)
-	}
-	return "across all shards"
 }
 
 // shardedTableStatusPhrase maps a table's aggregate task state to its display
@@ -716,7 +743,7 @@ func shardedTableStatusPhrase(status string) string {
 	case state.Task.FailedRetryable:
 		return "🔄 Interrupted — retrying automatically"
 	case state.Task.Stopped:
-		return "⏸ Stopped"
+		return "⏹️ Stopped"
 	case state.Task.Cancelled:
 		return "⊘ Cancelled (not started)"
 	case state.Task.RevertWindow:
@@ -804,35 +831,16 @@ func shardList(shards []ShardStatus, totalShards int) string {
 }
 
 // writeShardCounts writes the per-status histogram across shards so rollout
-// health is visible at a glance — the shard-unit analogue of the
-// multi-deployment "Deployments:" line.
+// health is visible at a glance (presentation.ShardCounts).
 func writeShardCounts(sb *strings.Builder, shards []ShardStatus) {
 	if len(shards) == 0 {
 		return
 	}
-	order := make([]string, 0, len(shards))
-	counts := make(map[string]int, len(shards))
+	labels := make([]string, 0, len(shards))
 	for _, s := range shards {
-		label := shardCountLabel(s)
-		if _, seen := counts[label]; !seen {
-			order = append(order, label)
-		}
-		counts[label]++
+		labels = append(labels, s.Label)
 	}
-	parts := make([]string, 0, len(order))
-	for _, label := range order {
-		parts = append(parts, fmt.Sprintf("%d %s", counts[label], label))
-	}
-	fmt.Fprintf(sb, "\n**Shards**: %s\n", strings.Join(parts, ", "))
-}
-
-// shardCountLabel collapses a shard's full label to its leading state word
-// ("halted — …" → "halted") for the histogram.
-func shardCountLabel(s ShardStatus) string {
-	if i := strings.Index(s.Label, " — "); i >= 0 {
-		return s.Label[:i]
-	}
-	return s.Label
+	fmt.Fprintf(sb, "\n**Shards**: %s\n", presentation.ShardCounts(labels))
 }
 
 // isShardFailureState reports whether a shard's state carries an operator-facing

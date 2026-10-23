@@ -112,13 +112,63 @@ var ErrApplyTasksNotLoaded = errors.New("apply owns task rows the drive loader d
 // an operator intervenes.
 var ErrApplyTaskRowMissing = errors.New("apply task row not found on re-read")
 
+// ErrTaskRequeueRefused is returned by a resume whose write putting a
+// failed_retryable task back to pending for a retry, or a stopped task back to
+// pending for a start, did not land. The drive exits with the task row still at
+// rest and the next claim repeats the requeue. A local drive and a gRPC drive
+// dispatching a retry exit before any engine work starts, since running the
+// task's DDL while storage records it at rest would leave work no stored state
+// accounts for. A gRPC drive requeues its stopped tasks only after the data
+// plane accepted the start, so there the remote work is already running; the
+// start request stays pending, and the next claim adopts the data plane's
+// state and retries the requeue before completing it. A retry's claim spends
+// one of the apply's recovery attempts, so that loop ends with the recovery
+// budget; a start's claim spends none, so the request stays pending until the
+// write lands. The operator counts every exit under its own resume failure
+// reason, so a requeue that keeps being refused is visible rather than one
+// warning per claim.
+var ErrTaskRequeueRefused = errors.New("task requeue refused")
+
+// ErrTaskVerdictRefused is returned by a drive whose write recording a task's
+// terminal outcome — failed, failed_retryable, cancelled behind a permanent
+// failure, or an outcome adopted from the engine — did not land. The apply's
+// outcome, and in a multi-operation drive the operation row the operator
+// derives, is read from the task rows, so the drive records nothing on top of
+// a verdict storage never took: the apply stays active and the next claim reads
+// every task as stored and settles it. Verdicts already stored for earlier
+// tasks stay stored. The operator leaves an operation whose drive returned this
+// as found, running and claimable, rather than deriving its row from a task
+// set that is only partly settled: a stored failure ahead of a refused write
+// would otherwise terminalize the operation over a task that still reads
+// active, and a terminal operation gets no next claim.
+var ErrTaskVerdictRefused = errors.New("task verdict refused")
+
+// ErrPostTerminalReconcile is matched by a drive's failure in the work an apply
+// owes after its terminal outcome is stored, such as answering the start that
+// admitted the claim. The drive has already settled the schema change and
+// nothing re-claims a settled apply, so a caller runs its post-drive settlement
+// rather than treating the drive as unfinished.
+var ErrPostTerminalReconcile = errors.New("reconcile after the stored terminal outcome failed")
+
 var (
 	// ErrPullSchemaUnsupportedType marks a pull request for a database type that
 	// the data plane does not yet support.
 	ErrPullSchemaUnsupportedType = errors.New("pull schema unsupported database type")
 	// ErrPullSchemaInvalidRequest marks a malformed pull request.
 	ErrPullSchemaInvalidRequest = errors.New("pull schema invalid request")
+	// ErrCompareSchemaFileChangeUnsupported marks a schema file comparison
+	// for a database type whose engine cannot compare files.
+	ErrCompareSchemaFileChangeUnsupported = errors.New("schema file comparison unsupported for database type")
 )
+
+// SchemaFileChangeComparer is the optional engine capability behind
+// CompareSchemaFileChange. An engine whose schema files can only be
+// understood by running them on the target implements it; LocalClient fails
+// closed with ErrCompareSchemaFileChangeUnsupported for an engine that does
+// not.
+type SchemaFileChangeComparer interface {
+	CompareSchemaFileChange(ctx context.Context, req *ternv1.CompareSchemaFileChangeRequest) (*ternv1.CompareSchemaFileChangeResponse, error)
+}
 
 // SchemaPuller is the optional engine capability that answers PullSchema for
 // database types without a built-in pull path. An engine supplied through
@@ -144,6 +194,12 @@ type Client interface {
 	// plan. Its result is not applyable (no plan_id); it is the read-only
 	// producer the control plane runs per deployment to detect review-time drift.
 	PlanDiff(ctx context.Context, req *ternv1.PlanRequest) (*ternv1.PlanDiffResponse, error)
+
+	// CompareSchemaFileChange reports whether a pull request's edit to one
+	// schema file generates the same schema change on two bases, by running
+	// each version on the target in a rolled-back transaction. It is
+	// read-only; the review gate asks it for files it cannot compare offline.
+	CompareSchemaFileChange(ctx context.Context, req *ternv1.CompareSchemaFileChangeRequest) (*ternv1.CompareSchemaFileChangeResponse, error)
 
 	// Apply executes a previously generated plan.
 	// Validates that the schema hasn't changed since Plan was called.

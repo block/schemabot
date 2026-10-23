@@ -53,7 +53,7 @@ stay put, where this page moves as engines gain features.
 |---|---|---|---|
 | **Cheap native path tried first** | yes, instant DDL | yes, instant DDL | yes, attempted under budgets that cancel a rewrite |
 | **Online DDL (copy and swap)** | yes, when instant is not possible | yes, when instant is not possible | planned; meanwhile a rewrite is refused above a size limit and cancelled by its budget below it |
-| **Escape hatch for refused statements** | direct execution: opt-in and size-bounded | none, excluded by design | none, native execution is already the only path |
+| **Escape hatch for refused statements** | direct execution: on by default, size-bounded | none, excluded by design | none, native execution is already the only path |
 | **`stop`** | yes | no | planned |
 | **`start`** | yes | deferred deploys only | planned |
 | **Deferred cutover** | yes | yes | planned |
@@ -225,16 +225,16 @@ which table the engine chooses to keep, not where the change ran.
 
 ### Direct execution
 
-This is a third path, MySQL only, and it is deliberately hard to turn on. Some statements can
-never run through a copy: dropping a primary key and adding a foreign key are the usual examples.
-By default they block the apply. An operator can enable a policy, per environment, that lets those
-statements run as ordinary MySQL DDL instead. The policy covers only tables under a configured row
-count, and the plan comment discloses each statement that will run this way.
+This is a third path, MySQL only, and it is deliberately bounded. Some statements can never run
+through a copy: dropping a primary key and adding a foreign key are the usual examples. By default
+they run as ordinary MySQL DDL when the table holds at most 100MiB of data and indexes, and block
+the apply above that. An operator can replace that policy server-wide or per environment, bounding
+it by row count or by bytes instead, or turn it off so those statements always block. The plan
+comment discloses each statement that will run this way.
 
 What runs then is not an online change. It is synchronous, it blocks writes to the table for its
-full duration, nothing throttles it, and nothing checkpoints it. The row
-count in the policy is what bounds that outage, since how long the table is blocked scales with
-its size. The other bound is on the way in: native DDL queues on the table's metadata lock behind
+full duration, nothing throttles it, and nothing checkpoints it. The size bound in the policy is
+what bounds that outage, since how long the table is blocked scales with its size. The other bound is on the way in: native DDL queues on the table's metadata lock behind
 any open transaction that has touched it, and everything arriving after queues behind the DDL, so
 a statement that cannot take the lock quickly stalls all traffic to the table rather than just
 waiting. Direct statements run with a short lock acquisition timeout and kill the transactions
@@ -264,9 +264,10 @@ runs. Below it, the bounded attempt described above is what stands in for a copy
 tried once, and a rewrite is cancelled by its own budget rather than allowed to hold a lock. Some
 statements skip the gamble because PostgreSQL has a genuinely online form of them, and the planner
 substitutes it: an index build becomes `CREATE INDEX CONCURRENTLY`, and a constraint is added `NOT
-VALID` and then validated. Those still sit under the size limit, which is checked once at plan time
-and again in the session that executes, so a table that grew past the limit in between is refused
-rather than run. [postgresql.md](postgresql.md) has
+VALID` and then validated. The constraint steps still sit under the size limit, which is checked
+once at plan time and again in the session that executes, so a table that grew past the limit in
+between is refused rather than run. `CREATE INDEX CONCURRENTLY` is exempt from the size limit and
+is bounded by its own duration budget instead. [postgresql.md](postgresql.md) has
 the full boundary and is worth reading before you point SchemaBot at a PostgreSQL database; it
 tracks the engine more closely than this page does.
 
@@ -304,7 +305,7 @@ MySQL engine is GA without them.
 
 Everything else in the matrix is a difference rather than a gap. Adaptive pacing and a drop
 quarantine each make an engine better in their own way, and an engine without one is not below the
-bar. Direct execution says nothing about maturity in either direction: it is an opt-in escape
+bar. Direct execution says nothing about maturity in either direction: it is a size-bounded escape
 hatch for statements no copy can run, and the engine that lacks it lacks it on purpose.
 
 ## Load management

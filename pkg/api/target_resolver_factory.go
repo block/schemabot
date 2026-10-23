@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"slices"
 	"sort"
+	"time"
 
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 
@@ -22,11 +23,47 @@ import (
 // embedder calling this directly gets the same guarantees the server enforces
 // rather than a silent backend preference.
 func (c TargetResolverConfig) BuildResolver(ctx context.Context, logger *slog.Logger) (inventory.Resolver, error) {
+	if err := c.validateTargetConfig(); err != nil {
+		return nil, err
+	}
+	resolver, err := c.buildBackend(ctx, logger)
+	if err != nil {
+		return nil, err
+	}
+	return inventory.NewOverrideResolver(resolver, c.Overrides, logger)
+}
+
+func (c TargetResolverConfig) validateTargetConfig() error {
+	for name, target := range c.Targets {
+		if err := target.ValidateTypeSpelling(); err != nil {
+			return fmt.Errorf("target_resolver target %q: %w", name, err)
+		}
+	}
+	if len(c.Overrides) > 0 && !c.Enabled() {
+		return fmt.Errorf("target_resolver.overrides requires an etre or static backend")
+	}
+	if err := inventory.ValidateTargetOverrides(c.Overrides); err != nil {
+		return fmt.Errorf("target_resolver: %w", err)
+	}
+	for _, entry := range c.Overrides {
+		if target, ok := c.Targets[entry.Target]; ok {
+			if len(target.SchemaOverrides) != 0 {
+				return fmt.Errorf("target_resolver override target %q already has static schema_overrides", entry.Target)
+			}
+			if target.DatabaseType != entry.DatabaseType {
+				return fmt.Errorf("target_resolver override target %q type does not match static target", entry.Target)
+			}
+		}
+	}
+	return nil
+}
+
+func (c TargetResolverConfig) buildBackend(ctx context.Context, logger *slog.Logger) (inventory.Resolver, error) {
 	etreConfigured := len(c.Etre) > 0
 	staticConfigured := c.Configured()
 	switch {
 	case etreConfigured && staticConfigured:
-		return nil, fmt.Errorf("target_resolver configures both etre and static targets; per-target overrides are not yet supported — use one")
+		return nil, fmt.Errorf("target_resolver configures both etre and static targets; use one discovery backend")
 	case etreConfigured:
 		return buildEtreResolvers(ctx, c.Etre, logger)
 	case staticConfigured:
@@ -91,7 +128,8 @@ func buildEtreResolvers(ctx context.Context, etres []EtreConfig, logger *slog.Lo
 func logEtreResolver(logger *slog.Logger, cfg EtreConfig) {
 	logger.Info("gRPC server etre resolver configured",
 		"database_type", cfg.DatabaseType, "entity_type", cfg.EntityType,
-		"target_label", cfg.TargetLabel, "credentials", credentialType(cfg.Credentials))
+		"target_label", cfg.TargetLabel, "credentials", credentialType(cfg.Credentials),
+		"env_label", cfg.EnvLabel, "environment_mapping", cfg.EnvironmentMapping)
 }
 
 // buildEtreResolver assembles the Etre-backed resolver from config: the Etre
@@ -125,16 +163,34 @@ func buildEtreResolver(ctx context.Context, cfg EtreConfig, logger *slog.Logger)
 		return nil, fmt.Errorf("build etre client: %w", err)
 	}
 	return etre.NewEtreResolver(etre.EtreResolverConfig{
-		Client:          client,
-		TargetLabel:     cfg.TargetLabel,
-		Labels:          cfg.Labels,
-		EnvLabel:        cfg.EnvLabel,
-		HostField:       etreHostField(cfg),
-		AttributeFields: resolverAttributeFields(cfg),
-		Credentials:     creds,
-		Assembler:       assembler,
-		TableOwner:      etreTableOwner(cfg),
+		Client:             client,
+		TargetLabel:        cfg.TargetLabel,
+		Labels:             cfg.Labels,
+		EnvLabel:           cfg.EnvLabel,
+		EnvironmentMapping: cfg.EnvironmentMapping,
+		HostField:          etreHostField(cfg),
+		AttributeFields:    resolverAttributeFields(cfg),
+		Credentials:        creds,
+		Assembler:          assembler,
+		TableOwner:         etreTableOwner(cfg),
+		WriterProbe:        etreWriterProbe(cfg),
+		Logger:             logger,
 	})
+}
+
+// writerProbeConnectTimeout bounds the dial to each candidate a writer probe
+// checks.
+const writerProbeConnectTimeout = 5 * time.Second
+
+// etreWriterProbe returns the writer probe for the configured engine, or nil
+// for an engine without one, where a lookup matching more than one entity is
+// refused. Only MySQL has one: a MySQL target is the server the schema change
+// runs on, so the probe checks the server that will be changed.
+func etreWriterProbe(cfg EtreConfig) inventory.WriterProbe {
+	if cfg.DatabaseType != storage.DatabaseTypeMySQL {
+		return nil
+	}
+	return inventory.MySQLWriterProbe{ConnectTimeout: writerProbeConnectTimeout}
 }
 
 // etreHostField returns the entity field holding the connection host for the

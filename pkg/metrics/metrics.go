@@ -793,7 +793,10 @@ func RecordPromotionConfigErrorBlock(ctx context.Context, repository, database, 
 }
 
 // AdjustActiveApplies increments or decrements the active applies gauge.
-// Use delta=1 when an apply is accepted and delta=-1 when it reaches a terminal state.
+// Use delta=1 when an apply is accepted and delta=-1 when it settles
+// (completed, failed, cancelled, or reverted). A stopped apply stays counted
+// until it settles; a retryable pause is released when it pauses and counted
+// again when a driver reclaims it.
 func AdjustActiveApplies(ctx context.Context, delta int64, database, deployment, environment string) {
 	addUpDownCounter(ctx, "schemabot.active_applies", delta,
 		"Number of currently in-progress applies", "{apply}",
@@ -1077,7 +1080,7 @@ func RecordUnrecognizedEngineTaskStatus(ctx context.Context, database, databaseT
 
 // RecordLockOperation increments the lock operations counter.
 // Operation should be "acquire" or "release".
-// Status should be "success", "conflict", "not_found", "not_owned", or "error".
+// Status should be "success", "conflict", "not_found", "not_owned", "no_acquirer", or "error".
 func RecordLockOperation(ctx context.Context, operation, database, status string) {
 	addCounter(ctx, "schemabot.lock_operations_total",
 		"Total number of lock acquire/release operations", "{operation}",
@@ -1133,8 +1136,9 @@ var knownRemoteApplyAttachOutcomes = map[string]bool{
 //   - "attached": a sibling dispatch added its operation to the deployment's
 //     shared apply (the normal fan-out event; its rate tracks sharded
 //     dispatch volume).
-//   - "attach_race": a concurrent same-operation attach lost the insert and
-//     was resolved to the winner's row instead of a spurious error.
+//   - "attach_race": a concurrent same-operation attach won, found either
+//     at the insert or after this dispatch's drift check failed, and the
+//     dispatch was resolved to the winner's row instead of a spurious error.
 //   - "terminal_refused": the shared apply was already terminal, so the
 //     attach was refused fail-closed — the deployment's remaining operations
 //     cannot dispatch until an operator reconciles the apply, so investigate
@@ -1280,6 +1284,9 @@ var knownOperatorClaimFailureReasons = map[string]bool{
 	"expire_retryable_error":                   true,
 	"stranded_reaper_error":                    true,
 	"stranded_task_reaper_error":               true,
+	"stranded_active_task_reaper_error":        true,
+	"stranded_control_request_reaper_error":    true,
+	"branch_reconcile_error":                   true,
 	"missing_lease_token":                      true,
 	"operation_storage_error":                  true,
 	"missing_operation_lease_token":            true,
@@ -2086,14 +2093,14 @@ func RecordWebhookDispatchDuration(ctx context.Context, appName, eventType, repo
 }
 
 // RecordSummaryCommentRepaired counts terminal summary comments posted by
-// startup reconciliation because no publisher had posted one — the driver's
+// summary reconciliation because no publisher had posted one — the driver's
 // observer lost its lease or crashed, or a claimed publish died before
 // posting. A nonzero rate means terminal summaries are being missed at apply
 // time; investigate the terminal-publish paths (observer lease churn, stop
 // reconciliation, aggregate CAS publisher) for the apply state on the label.
 func RecordSummaryCommentRepaired(ctx context.Context, repo string, applyState string) {
 	addCounter(ctx, "schemabot.webhook.summary_comments_repaired_total",
-		"Total number of missing terminal summary comments posted by startup reconciliation", "{comment}",
+		"Total number of missing terminal summary comments posted by summary reconciliation", "{comment}",
 		EnvironmentAttribute(""),
 		attribute.String("repository", repo),
 		attribute.String("apply_state", applyState))

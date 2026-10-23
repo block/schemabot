@@ -91,6 +91,7 @@ const (
 	ErrCodeRateLimited          = "rate_limited"           // Caller or target exceeded its request budget; retry after the advertised delay
 	ErrCodeUnsafeOptInRequired  = "unsafe_opt_in_required" // Plan carries an unsafe change; retry with allow_unsafe=true to consent to it
 	ErrCodePlanBlocked          = "plan_blocked"           // Plan carries a change the engine refuses; no retry or option can apply it
+	ErrCodeAlreadyStopped       = "already_stopped"        // Stop refused: the schema change is already stopped and no start is queued behind it
 )
 
 var retryableErrorCodes = map[string]bool{
@@ -262,6 +263,12 @@ type ChecksScanRequest struct {
 	// annotated: a start time that cannot prove a run is young must not be
 	// read as deciding that it is.
 	StuckAfter string `json:"stuck_after,omitempty"`
+	// ReportAppNotInstalled declares that the caller understands
+	// ChecksScanResponse.AppNotInstalled. Only then does a repository whose
+	// GitHub App is not installed come back as that skip; any other caller
+	// gets an error, so a client that predates the field never reads an unread
+	// repository as one scanned clean.
+	ReportAppNotInstalled bool `json:"report_app_not_installed,omitempty"`
 }
 
 type ChecksScanResponse struct {
@@ -274,6 +281,15 @@ type ChecksScanResponse struct {
 	// PR would trivially be missing a check the server refuses to create.
 	// When set, no PRs were scanned and the other fields are zero.
 	ChecksDisabled bool `json:"checks_disabled,omitempty"`
+	// AppNotInstalled reports that GitHub has no installation of the
+	// repository's configured GitHub App (the installation lookup answered
+	// 404), so the scan was skipped: the App can neither read nor publish the
+	// repository's Check Runs. GitHubApp names the configured App. When set, no
+	// PRs were scanned and the other fields are zero. Any other lookup failure
+	// is an error response, never this flag, and so is this one unless the
+	// request set ReportAppNotInstalled.
+	AppNotInstalled bool   `json:"app_not_installed,omitempty"`
+	GitHubApp       string `json:"github_app,omitempty"`
 	// EstimatedOpenPRs is the repository's total open-PR count as GitHub
 	// reports it for this page's listing — an upper bound while more pages
 	// remain, exact on the final page. Recomputed every page so the caller
@@ -1158,12 +1174,19 @@ type PlanSummaryResponse struct {
 
 // PlansResponse is the HTTP response for GET /api/plans.
 type PlansResponse struct {
-	Limit    int  `json:"limit"`
-	MaxLimit int  `json:"max_limit"`
-	HasMore  bool `json:"has_more"`
+	Limit    int `json:"limit"`
+	MaxLimit int `json:"max_limit"`
+	// HasMore reports that more plans match than this page holds. Request the
+	// next page with the same filters and starting_after set to the last
+	// plan's ID.
+	HasMore bool `json:"has_more"`
 	// Last echoes the requested creation window, when one was given.
-	Last  string                 `json:"last,omitempty"`
-	Plans []*PlanSummaryResponse `json:"plans"`
+	Last string `json:"last,omitempty"`
+	// StartingAfter echoes the starting_after plan the page continues from,
+	// so a client can tell this page apart from a first page served by a
+	// server that ignores the parameter.
+	StartingAfter string                 `json:"starting_after,omitempty"`
+	Plans         []*PlanSummaryResponse `json:"plans"`
 }
 
 // StoredPlanResponse is the HTTP response for GET /api/plans/{plan_identifier}:
@@ -1513,6 +1536,20 @@ func (r *PlanResponse) RenderedTables() []*TableChangeResponse {
 	return tables
 }
 
+// FinalizesOnly reports whether a namespace's only work in the plan is the
+// finalize its engine asked for: no VSchema change to show and no DDL, whether
+// the namespace carries its DDL itself or on its shards. A namespace with DDL
+// finalizes as part of that work, so surfaces name the finalize on its own line
+// only when this holds.
+func (r *PlanResponse) FinalizesOnly(sc *SchemaChangeResponse) bool {
+	if sc == nil || !sc.NeedsFinalizer() || sc.ShowsVSchemaChange() || len(sc.TableChanges) > 0 {
+		return false
+	}
+	return !slices.ContainsFunc(r.Shards, func(sp *ShardPlanResponse) bool {
+		return sp != nil && sp.Namespace == sc.Namespace && len(sp.Changes) > 0
+	})
+}
+
 // HasChanges reports whether the plan carries any work an apply would execute:
 // table DDL in any namespace or on any shard, a VSchema update, or a finalizer
 // the engine asked for. Gates that decide whether a plan is actionable must use
@@ -1691,6 +1728,10 @@ type ControlResponse struct {
 const (
 	ControlStatusAlreadyInProgress = "already_in_progress"
 	ControlStatusAlreadyRequested  = "already_requested"
+	// ControlStatusStartWithdrawn answers a stop that arrived while the
+	// schema change was stopped with a start queued that had not taken effect:
+	// the stop withdrew the start, and the schema change stays stopped.
+	ControlStatusStartWithdrawn = "start_withdrawn"
 )
 
 // StopResponse is the HTTP response for POST /api/stop.
@@ -1754,6 +1795,13 @@ type ProgressResponse struct {
 	// on_failure=pause no longer holds later deployments — the rollout proceeds
 	// like continue. Apply-level: it applies to every operation of the apply.
 	Released bool `json:"released,omitempty"`
+	// Sharded is true when the apply is one change fanned out across its
+	// keyspaces' shards. Tables then carries one row per keyspace table with
+	// its shards listed under it (a table on its keyspace's only shard keeps
+	// its own row and names no shard), and Metadata carries each finalizer's
+	// VSchema change. Operations still lists every shard and finalizer row,
+	// but a client renders the apply as one change, the way its PR comments do.
+	Sharded bool `json:"sharded,omitempty"`
 }
 
 // ProgressOperationResponse represents progress for one deployment operation.
@@ -1812,8 +1860,18 @@ type TableProgressResponse struct {
 	// (data plus indexes), for display beside the row counts. It is the
 	// table's size when planned, not a measure of copy progress. Absent when
 	// the plan had no estimate and for a task scoped to one shard, since the
-	// estimate covers the whole table.
+	// estimate covers the whole table. A sharded table rolled up across its
+	// shards carries it, covering every shard.
 	EstimatedBytes *int64 `json:"estimated_bytes,omitempty"`
+	// EstimatedRows is the plan's approximate row count for the table, so a
+	// table that has not started copying can show how much it will copy.
+	// rows_total replaces it once the engine reports. Absent under the same
+	// rules as EstimatedBytes.
+	EstimatedRows *int64 `json:"estimated_rows,omitempty"`
+	// PlannedShards is how many shards a sharded table's change spans per its
+	// plan, the shards EstimatedBytes covers. Zero when the plan recorded no
+	// count and for a table not rolled up across shards.
+	PlannedShards int32 `json:"planned_shards,omitempty"`
 	// Checksum phase progress: rows verified so far and total to verify.
 	// Non-zero only while the table is checksumming (verifying copied data).
 	ChecksumRowsChecked int64 `json:"checksum_rows_checked,omitempty"`
@@ -1840,6 +1898,10 @@ type ShardProgressResponse struct {
 	ETASeconds      int64  `json:"eta_seconds,omitempty"`
 	PercentComplete int32  `json:"percent_complete"`
 	CutoverAttempts int32  `json:"cutover_attempts,omitempty"`
+	// Checksum phase progress: rows verified so far and total to verify.
+	// Non-zero only while the shard is checksumming (verifying copied data).
+	ChecksumRowsChecked int64 `json:"checksum_rows_checked,omitempty"`
+	ChecksumRowsTotal   int64 `json:"checksum_rows_total,omitempty"`
 }
 
 // GetTableName implements ddl.TableWithName for filtering Spirit internal tables.
@@ -1892,9 +1954,12 @@ type ActiveApplyResponse struct {
 
 // StatusResponse is the HTTP response for GET /api/status.
 type StatusResponse struct {
-	ActiveCount  int  `json:"active_count"`
-	Limit        int  `json:"limit,omitempty"`
-	MaxLimit     int  `json:"max_limit,omitempty"`
+	ActiveCount int `json:"active_count"`
+	Limit       int `json:"limit,omitempty"`
+	MaxLimit    int `json:"max_limit,omitempty"`
+	// HasMore reports that more applies match than this page holds. Request
+	// the next page with the same filters and starting_after set to the last
+	// apply's ID.
 	HasMore      bool `json:"has_more,omitempty"`
 	FailuresOnly bool `json:"failures_only,omitempty"`
 	// Last echoes the window bounding the list to applies updated within it;
@@ -1903,6 +1968,15 @@ type StatusResponse struct {
 	// State echoes the canonical form of the state filter restricting the
 	// list; empty means no state filter.
 	State string `json:"state,omitempty"`
+	// StartingAfter echoes the starting_after apply the page continues from,
+	// so a client can tell this page apart from a first page served by a
+	// server that ignores the parameter.
+	StartingAfter string `json:"starting_after,omitempty"`
+	// Active echoes the active filter: true lists only applies that have not
+	// reached a terminal state, false only the terminal ones, and absent means
+	// no filter. A client that asked for active=false and finds it absent is
+	// talking to a server that lists everything regardless.
+	Active *bool `json:"active,omitempty"`
 	// StateCounts tallies every apply matching the request's filters by state,
 	// unbounded by limit — the applies list may be a truncated page, but these
 	// counts never are.

@@ -85,6 +85,11 @@ func main() {
 	cli.Commit = commit
 	cli.Date = date
 
+	// Record the routing flags as typed, before a local runtime replaces the
+	// endpoint below, so hints that send the operator back to this server
+	// reach it again when pasted.
+	cliname.SetRoute(cli.RouteFlags()...)
+
 	// Authenticate every API request with the resolved Bearer token, renewing an
 	// expired cached token first. Empty when no token is configured, which is
 	// correct against a server with auth off.
@@ -150,7 +155,7 @@ func main() {
 		}
 		select {
 		case <-sigCh:
-			os.Exit(130)
+			os.Exit(commands.ExitInterrupted)
 		case <-runDone:
 		}
 	}()

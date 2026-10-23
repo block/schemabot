@@ -212,6 +212,11 @@ type ServerConfig struct {
 	// forever.
 	PendingDrops PendingDropsConfig `yaml:"pending_drops,omitempty"`
 
+	// BranchReconcile configures the reaper pass that finds PlanetScale
+	// branches SchemaBot created and no apply will resume or delete, and
+	// reclaims them. It is off by default.
+	BranchReconcile BranchReconcileConfig `yaml:"branch_reconcile,omitempty"`
+
 	// Spirit overrides the Spirit engine's default run settings for every
 	// MySQL database this server drives directly. Unset fields keep the
 	// engine defaults (see pkg/engine/spirit), so the block is only needed
@@ -227,8 +232,13 @@ type ServerConfig struct {
 	// direct_execution block replaces this policy whole rather than merging
 	// field by field, so an override can never enable direct execution while
 	// inheriting a size bound stated somewhere else, and an override that
-	// disables it is a complete opt out. Unset (the default) leaves refused
-	// statements blocked everywhere.
+	// disables it is a complete opt out. Unset, the default policy applies
+	// (see defaultDirectExecution): enabled, bounded by the table's data and
+	// index footprint. Set enabled: false to leave refused statements blocked
+	// on the databases this server plans. A control plane forwards its policy
+	// with every plan, and the server that runs the statement uses it in place
+	// of its own, so an opt-out stated only on a server that executes plans
+	// sent by a control plane is overridden.
 	DirectExecution *DirectExecutionConfig `yaml:"direct_execution,omitempty"`
 
 	// PlanetScale configures process-wide behavior for the Vitess engine's
@@ -343,6 +353,41 @@ type PendingDropsConfig struct {
 	// DryRun makes the cleaner log the tables it would drop without dropping
 	// them. The quarantine itself is unaffected.
 	DryRun bool `yaml:"dry_run,omitempty"`
+}
+
+// BranchReconcileConfig configures the branch reconcile pass for the
+// PlanetScale databases this process executes against.
+type BranchReconcileConfig struct {
+	// Enabled starts the pass with the operator. Defaults to false.
+	Enabled bool `yaml:"enabled,omitempty"`
+
+	// Delete deletes the orphaned branches the pass finds. Defaults to false,
+	// so an enabled pass only logs the branches it would delete.
+	Delete bool `yaml:"delete,omitempty"`
+
+	// Grace is how old a branch must be before the pass judges it, as a Go
+	// duration string (e.g. "24h"). Defaults to 24 hours.
+	Grace string `yaml:"grace,omitempty"`
+}
+
+// DefaultBranchReconcileGrace is the branch age the reconcile pass waits for
+// when branch_reconcile.grace is not set.
+const DefaultBranchReconcileGrace = 24 * time.Hour
+
+// BranchReconcileGrace returns the configured grace period for the branch
+// reconcile pass, or DefaultBranchReconcileGrace when it is not set.
+func (c *ServerConfig) BranchReconcileGrace() (time.Duration, error) {
+	if c.BranchReconcile.Grace == "" {
+		return DefaultBranchReconcileGrace, nil
+	}
+	d, err := time.ParseDuration(c.BranchReconcile.Grace)
+	if err != nil {
+		return 0, fmt.Errorf("parse branch_reconcile.grace %q: %w", c.BranchReconcile.Grace, err)
+	}
+	if d <= 0 {
+		return 0, fmt.Errorf("branch_reconcile.grace must be positive, got %q", c.BranchReconcile.Grace)
+	}
+	return d, nil
 }
 
 // SupportChannelConfig configures an optional support destination shown in
@@ -1001,6 +1046,8 @@ type TargetResolverConfig struct {
 	// each entry's database_type) so one data plane can serve several engines at
 	// once and the request's database type selects among them.
 	Etre []EtreConfig `yaml:"etre,omitempty"`
+	// Overrides decorates discovery; it is not itself a backend.
+	Overrides []inventory.TargetOverride `yaml:"overrides,omitempty"`
 }
 
 // Configured reports whether the data plane has any static target inventory.
@@ -1042,6 +1089,10 @@ type EtreConfig struct {
 	TargetLabel string `yaml:"target_label"`
 	// EnvLabel, when set, scopes the lookup to the request environment.
 	EnvLabel string `yaml:"env_label,omitempty"`
+	// EnvironmentMapping changes only the inventory env_label predicate. The
+	// logical environment remains on plans, applies, credentials and schemas.
+	// Unmapped environments use their request name; values are not recursive.
+	EnvironmentMapping map[string]string `yaml:"environment_mapping,omitempty"`
 	// Labels are fixed selector predicates added to every lookup (e.g. a region).
 	Labels map[string]string `yaml:"labels,omitempty"`
 	// AttributeFields are entity fields surfaced to the credential resolver.
@@ -1234,6 +1285,20 @@ type DatabaseConfig struct {
 	// must never move into repo-editable configuration, where a database team
 	// could grant themselves direct write with a self-merged PR.
 	OperatorGroups []string `yaml:"operator_groups,omitempty"`
+
+	// ReviewPolicy opts this database into the review gate on this server
+	// instance when the instance-wide review_policy leaves it off. It can
+	// only add the gate, never remove it.
+	ReviewPolicy DatabaseReviewPolicyConfig `yaml:"review_policy,omitempty"`
+}
+
+// DatabaseReviewPolicyConfig configures the review gate for one database.
+type DatabaseReviewPolicyConfig struct {
+	// Enabled turns on the review gate for this database's applies on this
+	// server instance, even when review_policy.enabled is false. Who can
+	// approve still comes from the instance-wide review_policy: its admins,
+	// repo admins, this database's operators, and CODEOWNERS when included.
+	Enabled bool `yaml:"enabled,omitempty"`
 }
 
 // PRCommandAuthorizationConfig configures actor authorization for mutating
@@ -1342,14 +1407,17 @@ type EnvironmentConfig struct {
 
 	// CutoverPolicy controls how a multi-member rollout sequences the copy and
 	// cutover phases of its members: the deployments of a Deployments map, or
-	// the targets of a Targets list, in resolved order. "rolling" (the default,
-	// also used when unset) keeps the rollout fully serial: a later member does
-	// not start until every earlier member has completed. "barrier" lets later
-	// members run their copy phase once earlier members reach the cutover
-	// barrier, while cutover itself stays ordered. "parallel" starts every
-	// member's copy without waiting on earlier members, up to the server's
-	// max_drivers_per_apply at once, and still cuts over one member at a time in
-	// order. Only meaningful alongside a Deployments map or a Targets list.
+	// the targets of a Targets list, in resolved order. "rolling" keeps the
+	// rollout fully serial: a later member does not start until every earlier
+	// member has completed. "barrier" lets later members run their copy phase
+	// once earlier members reach the cutover barrier, while cutover itself
+	// stays ordered. "parallel" starts every member's copy without waiting on
+	// earlier members, up to the server's max_drivers_per_apply at once, and
+	// still cuts over one member at a time in order. Left unset, an environment
+	// whose every member comes from a Targets list uses "parallel", and any
+	// other, including a Deployments map that mixes Targets lists with single
+	// targets, uses "rolling". Only meaningful alongside a Deployments map or a
+	// Targets list.
 	CutoverPolicy string `yaml:"cutover_policy,omitempty"`
 
 	// OnFailure controls multi-member rollout continuation when a member
@@ -1487,11 +1555,12 @@ func (c *DirectExecutionConfig) EngineMetadata() (map[string]string, error) {
 // the system carries it in: forwarded to the server that will run the
 // statement, and recorded on the apply that statement belongs to.
 //
-// Nil means the configuration states nothing, and a request that states
-// nothing leaves refused statements blocked wherever it lands. A configured
-// block that is disabled is not nothing: it is an opt-out, and it resolves to
-// a disabled policy so that it travels and overrides a grant the server that
-// runs the statement holds of its own.
+// Nil means this block states nothing and resolves to no policy: a request
+// carrying none leaves the executing server's own policy in force, which
+// ServerConfig.ResolveDirectExecution fills with the default when that server
+// states none. A configured block that is disabled is not nothing: it is an
+// opt-out, and it resolves to a disabled policy so that it travels and
+// overrides a grant the server that runs the statement holds of its own.
 func (c *DirectExecutionConfig) Policy() (*storage.DirectExecutionPolicy, error) {
 	if c == nil {
 		return nil, nil
@@ -2008,6 +2077,28 @@ func (c EnvironmentConfig) UsesTargetsList() bool {
 	return false
 }
 
+// routesOnlyThroughTargetsLists reports whether every member of an
+// environment comes from a targets list: an environment-level targets list,
+// or a deployments map whose every entry spells one. It is narrower than
+// UsesTargetsList, which one such entry satisfies. A deployments map that
+// mixes the two spellings also has single-target members, which are expected
+// to hold the same schema as each other, so serializing them is what lets an
+// operator watch one before the next starts.
+func (c EnvironmentConfig) routesOnlyThroughTargetsLists() bool {
+	if c.Targets != nil {
+		return true
+	}
+	if len(c.Deployments) == 0 {
+		return false
+	}
+	for _, dt := range c.Deployments {
+		if dt.Targets == nil {
+			return false
+		}
+	}
+	return true
+}
+
 // validateMultiTargetSupport rejects a targets list on a database whose engine
 // cannot drive several targets from one database entry. Multi-target work is
 // planned and applied per target, which not every engine supports yet, and a
@@ -2255,6 +2346,9 @@ func (c *ServerConfig) Validate() error {
 	if err := c.ValidateExperimentalStrata(); err != nil {
 		return err
 	}
+	if err := c.TargetResolver.validateTargetConfig(); err != nil {
+		return err
+	}
 	if err := c.validateTargetTableOwners(); err != nil {
 		return err
 	}
@@ -2313,6 +2407,11 @@ func (c *ServerConfig) Validate() error {
 			return err
 		}
 	}
+	if c.BranchReconcile.Enabled {
+		if _, err := c.BranchReconcileGrace(); err != nil {
+			return err
+		}
+	}
 	// The server-wide policy carries no database type, so unlike a
 	// per-database block it is not rejected on a server that also registers
 	// non-MySQL databases: it simply never reaches their engines.
@@ -2347,6 +2446,9 @@ func (c *ServerConfig) Validate() error {
 			return err
 		}
 		if err := validateDatabaseActorAuthorization(name, dbConfig); err != nil {
+			return err
+		}
+		if err := c.validateDatabaseReviewPolicy(name, dbConfig); err != nil {
 			return err
 		}
 		if err := validateDatabaseApp(name, dbConfig); err != nil {
@@ -3111,15 +3213,24 @@ func (c *ServerConfig) DatabaseEnvironment(database, environment string) *Enviro
 }
 
 // CutoverPolicyFor returns the resolved cutover policy for a database+environment.
-// It defaults to CutoverPolicyRolling (today's serial behaviour) when the
-// environment is unconfigured or leaves cutover_policy unset, preserving the
-// conservative rolling rollout as the safe default.
+// An explicit cutover_policy always wins. Left unset, an environment whose
+// every member comes from a targets list (routesOnlyThroughTargetsLists)
+// defaults to CutoverPolicyParallel: those targets each hold their own schema,
+// so their copies run side by side while cutover stays one target at a time
+// in list order. Every other environment, and an unconfigured one, defaults to
+// CutoverPolicyRolling, the fully serial rollout.
 func (c *ServerConfig) CutoverPolicyFor(database, environment string) string {
 	env := c.DatabaseEnvironment(database, environment)
-	if env == nil || env.CutoverPolicy == "" {
+	if env == nil {
 		return storage.CutoverPolicyRolling
 	}
-	return env.CutoverPolicy
+	if env.CutoverPolicy != "" {
+		return env.CutoverPolicy
+	}
+	if env.routesOnlyThroughTargetsLists() {
+		return storage.CutoverPolicyParallel
+	}
+	return storage.CutoverPolicyRolling
 }
 
 // OnFailure returns the resolved rollout-continuation policy for a
@@ -3975,11 +4086,24 @@ func (c *ServerConfig) validateServerDirectExecutionReachesAnEngine() error {
 	return fmt.Errorf("server config sets direct_execution, which no registered database can honor: it is only supported for %s databases", storage.DatabaseTypeMySQL)
 }
 
+// defaultDirectExecutionMaxTableBytes is the size bound of the server-wide
+// direct execution policy a server config that states none runs under.
+const defaultDirectExecutionMaxTableBytes = "100MiB"
+
+// defaultDirectExecution returns the server-wide direct execution policy a
+// server config that states none runs under: enabled, bounded by the table's
+// data and index footprint. A fresh value each call, so no caller can change
+// the default another resolves.
+func defaultDirectExecution() *DirectExecutionConfig {
+	return &DirectExecutionConfig{Enabled: true, MaxTableBytes: defaultDirectExecutionMaxTableBytes}
+}
+
 // ResolveDirectExecution returns the direct execution policy in force for one
 // database environment: the environment's own block when it states one,
-// otherwise the server-wide policy. The override replaces the server policy
-// whole, so an environment that states the policy disabled opts out of a
-// global grant instead of inheriting its bound.
+// otherwise the server-wide policy, which is the default policy when the
+// server config states none. The override replaces the server policy whole,
+// so an environment that states the policy disabled opts out of a global grant
+// instead of inheriting its bound.
 //
 // The server-wide policy reaches only the engines that can honor it. An
 // explicit per-database block is rejected at startup on every other database
@@ -3996,6 +4120,9 @@ func (c *ServerConfig) ResolveDirectExecution(envConfig *EnvironmentConfig, data
 	}
 	if !directExecutionSupported(databaseType) {
 		return nil
+	}
+	if c.DirectExecution == nil {
+		return defaultDirectExecution()
 	}
 	return c.DirectExecution
 }

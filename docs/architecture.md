@@ -237,8 +237,19 @@ Unsafe operations that produce error-severity violations:
 
 - `DROP TABLE` — deletes the entire table and its data
 - `DROP COLUMN` — deletes a column and its data from every row
-- `MODIFY COLUMN` (type change) — may truncate or lose data if the new type is narrower
 - `DROP INDEX` without first making it invisible — may cause query performance regression
+
+A `MODIFY COLUMN` that narrows a non-key column's type (for example `varchar(255)` to
+`varchar(10)`, or `bigint` to `tinyint`) and the removal of an `ENUM` or `SET` value are not
+on this list, on any engine: Spirit's linter reports no error-severity violation for them,
+Vitess targets take the same verdict, and pg-sprite marks only drops destructive, so they
+plan and apply without `--allow-unsafe`. Narrowing a primary key column is caught only when
+the new type falls outside the allowed key types (the `primary_key` rule), not because it
+narrows. Whether a narrowing loses data is decided at apply time, not plan time: Spirit
+copies the rows and fails the apply before cutover when its checksum finds a copied value
+that no longer matches, and PostgreSQL rejects a value that does not fit the new type.
+SchemaBot adds no check of its own on any engine, so review a narrowing change against the
+data the column already holds before applying it.
 
 For MySQL/Spirit databases, an applied `DROP TABLE` can additionally be
 quarantined instead of executed: the table is renamed into a `_pending_drops`
@@ -991,7 +1002,7 @@ For the operator-facing display examples and controls, see the
 
 The operator is part of Tern orchestration. The API service starts it on server startup because the server owns process lifecycle, configuration, and the Tern client pool, but the operator's work is to coordinate applies: claim storage records, refresh their heartbeat lease, and call `ResumeApply()` on the right Tern client.
 
-Each operator driver runs immediately on startup, then polls every 10 seconds. The driver claims at most one apply per tick and resumes it through the Tern client for that apply's deployment and environment. Fresh applies also send a best-effort wake signal after their apply and task rows are committed, so a driver can claim them immediately instead of waiting for the next poll tick.
+Each operator driver runs immediately on startup, then polls every 10 seconds. Each pass of the claim ladder claims at most one unit of work and resumes it through the Tern client for that apply's deployment and environment. When that drive settles the work it claimed, the driver runs another pass straight away instead of waiting for its next tick, because settling one operation is often what makes the next one claimable: the next member of a `rolling` rollout, the next deployment's swap once an earlier deployment completes, or a parked swap that was waiting for a cutover slot. A pass that claims nothing, fails, leaves its work in flight, or ends in a `failed_retryable` retry returns the driver to its poll loop, so a storage error never spins it and retries keep the poll cadence. Fresh applies also send a best-effort wake signal after their apply and task rows are committed, so a driver can claim them immediately instead of waiting for the next poll tick. That wake reaches one driver, so a driver whose claim starts an operation, from `pending` or from a stopped operation an operator started again, wakes one idle peer in turn: the targets of a `parallel` rollout and the shards of a sharded target then start together, up to `max_drivers_per_apply`, instead of one per poll tick. A retry claim wakes no peer, so a fast failure cannot pass the same retry from driver to driver.
 
 `drivers` controls operator concurrency. The default is four drivers, so an untuned server can still make progress across independent databases and environments concurrently. More drivers help larger installations with many independent schema changes because each driver can claim and resume a different target during the same operator tick.
 
@@ -1085,7 +1096,7 @@ A running apply becomes claimable after its heartbeat has been stale for more th
 
 The staleness window covers unclean kills. When a process shuts down cleanly it brings its in-process engines down first — releasing each target's lock — and then hands its claims back explicitly, so the work is claimable on the next poll rather than after the window. Claims whose engine did not come down are the exception: they are left to go stale, because a driver handed a target this process still holds the lock on would only be refused.
 
-Freshly queued applies are also claimable once their task rows exist. `ExecuteApply` stores the pending apply and its initial tasks in one transaction, then sends a best-effort wake signal to the operator. The wake path is only a latency optimization: it nudges one driver to call the same claim path immediately instead of waiting for the next poll tick. It never bypasses storage claims or creates a second queue. If the operator is stopped or a wake is already pending, the signal is skipped and the normal poll loop still finds the apply.
+Freshly queued applies are also claimable once their task rows exist. `ExecuteApply` stores the pending apply and its initial tasks in one transaction, then sends a best-effort wake signal to the operator. The wake path is only a latency optimization: it nudges one driver to call the same claim path immediately instead of waiting for the next poll tick, and each driver that starts an operation nudges one more. It never bypasses storage claims or creates a second queue. If the operator is stopped or a wake is already pending, the signal is skipped and the normal poll loop still finds the apply.
 
 ```
 HTTP apply request

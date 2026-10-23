@@ -12,6 +12,7 @@ import (
 	"github.com/block/schemabot/pkg/cmd/cliname"
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/glyph"
+	"github.com/block/schemabot/pkg/presentation"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/ui"
@@ -73,7 +74,7 @@ func WriteProgress(data ProgressData) {
 		fmt.Println("No active schema change")
 		return
 	}
-	if len(data.Operations) > 1 {
+	if RendersOperationSections(data.Operations, data.Sharded) {
 		writeMultiDeploymentProgress(data)
 		return
 	}
@@ -103,6 +104,11 @@ func WriteProgress(data ProgressData) {
 		rows = append(rows, BoxRow{"Environment", data.Environment})
 	}
 	rows = append(rows, BoxRow{"State", displayState})
+	if data.Sharded {
+		if counts := ShardCounts(data.Operations, data.Tables, data.Released); counts != "" {
+			rows = append(rows, BoxRow{"Shards", counts})
+		}
+	}
 	rows = append(rows, callerAndSourceBoxRows(data.Caller, data.PullRequestURL)...)
 	if len(data.Options) > 0 {
 		var opts []string
@@ -327,7 +333,13 @@ func FormatNamespacedTablesWithActivity(tables []TableProgress, activityBar, act
 			}
 		} else {
 			b.WriteString(FormatKeyspaceHeader(g.namespaces[0]))
-			for _, t := range g.tables {
+			for i, t := range g.tables {
+				// A blank line sets every table after the first apart from
+				// the one before it, unless that one already ended on a blank
+				// line, as a table whose shards or targets are listed does.
+				if i > 0 && !strings.HasSuffix(b.String(), "\n\n") {
+					b.WriteString("\n")
+				}
 				b.WriteString(FormatTableProgressWithActivity(t, activityBar, activityLabel))
 			}
 		}
@@ -335,20 +347,21 @@ func FormatNamespacedTablesWithActivity(tables []TableProgress, activityBar, act
 	return b.String()
 }
 
-// FormatVSchemaStatus renders each keyspace's VSchema-application status and
-// diff surfaced on a progress response's display metadata. Returns empty when
-// the apply carries no VSchema change. A keyspace's diff is a VSchema diff (not
-// SQL), rendered with diff coloring via colorizeDiffLine.
+// FormatVSchemaStatus renders the VSchema-application status and diff of each
+// keyspace surfaced on a progress response's display metadata that carries a
+// diff to show. Returns empty when no change does. A keyspace's diff is a
+// VSchema diff (not SQL), rendered with diff coloring via colorizeDiffLine.
 func FormatVSchemaStatus(changes []apitypes.VSchemaChange) string {
-	if len(changes) == 0 {
-		return ""
-	}
 	var b strings.Builder
 	for _, c := range changes {
-		fmt.Fprintf(&b, "    ~ VSchema (%s): %s\n", c.Namespace, ui.VSchemaStatusLabel(c.Status))
-		if c.Diff != "" {
-			b.WriteString(FormatVSchemaDiff(c.Diff, indentContent))
+		if c.Diff == "" {
+			continue
 		}
+		fmt.Fprintf(&b, "    ~ VSchema (%s): %s\n", c.Namespace, ui.VSchemaStatusLabel(c.Status))
+		b.WriteString(FormatVSchemaDiff(c.Diff, indentContent))
+	}
+	if b.Len() == 0 {
+		return ""
 	}
 	b.WriteString("\n")
 	return b.String()
@@ -382,7 +395,7 @@ func FormatProgressState(s string) string {
 	case state.NoActiveChange:
 		return "No active schema change"
 	case state.Apply.Pending:
-		return "⏳ Starting..."
+		return "⏳ Queued"
 	case state.Apply.PreparingBranch:
 		return ANSICyan + "🔄 Preparing branch..." + ANSIReset
 	case state.Apply.ApplyingBranchChanges:
@@ -474,6 +487,11 @@ func writeTableLine(b *strings.Builder, t TableProgress, format string, args ...
 // provided activity bar and label when row-copy progress has exceeded its
 // estimate.
 func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel string) string {
+	if keepsAcrossTargetsBar(t) {
+		if out, ok := formatAcrossTargetsProgress(t); ok {
+			return out
+		}
+	}
 	if isHaltedAcrossTargets(t) {
 		return formatHaltedAcrossTargets(t)
 	}
@@ -482,6 +500,9 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 	}
 	if isNotStartedAcrossTargets(t) {
 		return formatNotStartedAcrossTargets(t)
+	}
+	if keepsShardedBar(t) {
+		return formatShardedPhaseProgress(t)
 	}
 
 	var b strings.Builder
@@ -494,6 +515,7 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 		if t.DDL != "" {
 			b.WriteString(formatTableDDL(t))
 		}
+		writePlannedRows(&b, t)
 		b.WriteString("\n")
 		b.WriteString(formatTableParts(t))
 		return b.String()
@@ -532,8 +554,8 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 		if t.ChecksumRowsTotal > 0 {
 			checksumPct := int(math.Round(float64(t.ChecksumRowsChecked) * 100 / float64(t.ChecksumRowsTotal)))
 			pct := ui.RowCopyDisplayPercent(checksumPct, t.ChecksumRowsChecked)
-			writeTableLine(&b, t, "%s 🔍 Checksumming to verify data (%s)%s", ui.ProgressBarRowCopy(pct),
-				ui.FormatRowCopyPercent(checksumPct, t.ChecksumRowsChecked, t.ChecksumRowsTotal), throttledSuffix(t))
+			writeTableLine(&b, t, "%s 🔍 Checksumming to verify data (%s%s)%s", ui.ProgressBarRowCopy(pct),
+				ui.FormatRowCopyPercent(checksumPct, t.ChecksumRowsChecked, t.ChecksumRowsTotal), shardCoverageSuffix(t), throttledSuffix(t))
 			if t.DDL != "" {
 				b.WriteString(formatTableDDL(t))
 			}
@@ -576,8 +598,8 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 		if recoveringIsCopyingRows(t) {
 			pct := ui.RowCopyDisplayPercent(t.PercentComplete, t.RowsCopied)
 			bar := ui.ProgressBarRowCopy(pct)
-			writeTableLine(&b, t, "%s Row copy in progress (%s)", bar,
-				ui.FormatRowCopyPercent(t.PercentComplete, t.RowsCopied, t.RowsTotal))
+			writeTableLine(&b, t, "%s Row copy in progress (%s%s)", bar,
+				ui.FormatRowCopyPercent(t.PercentComplete, t.RowsCopied, t.RowsTotal), shardCoverageSuffix(t))
 			if t.DDL != "" {
 				b.WriteString(formatTableDDL(t))
 			}
@@ -674,8 +696,8 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 		if t.PercentComplete > 0 || t.RowsCopied > 0 {
 			cancelledPercent := ui.RowCopyDisplayPercent(t.PercentComplete, t.RowsCopied)
 			bar := ui.ProgressBar(cancelledPercent, ui.ColorOrange)
-			writeTableLine(&b, t, "%s 🚫 Cancelled at %s", bar,
-				ui.FormatRowCopyPercent(t.PercentComplete, t.RowsCopied, t.RowsTotal))
+			writeTableLine(&b, t, "%s 🚫 Cancelled at %s%s", bar,
+				ui.FormatRowCopyPercent(t.PercentComplete, t.RowsCopied, t.RowsTotal), shardCoverageSuffix(t))
 		} else {
 			writeTableLine(&b, t, "🚫 Cancelled (not started)")
 		}
@@ -694,8 +716,8 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 			// At 100% = was waiting for cutover when stopped
 			writeTableLine(&b, t, "%s ⏹️ Stopped (was waiting for cutover)", bar)
 		case t.PercentComplete > 0 || t.RowsCopied > 0:
-			writeTableLine(&b, t, "%s ⏹️ Stopped at %s", bar,
-				ui.FormatRowCopyPercent(t.PercentComplete, t.RowsCopied, t.RowsTotal))
+			writeTableLine(&b, t, "%s ⏹️ Stopped at %s%s", bar,
+				ui.FormatRowCopyPercent(t.PercentComplete, t.RowsCopied, t.RowsTotal), shardCoverageSuffix(t))
 		default:
 			writeTableLine(&b, t, "⏹️ Stopped (not started)")
 		}
@@ -703,7 +725,8 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 			b.WriteString(formatTableDDL(t))
 		}
 		if t.RowsTotal > 0 && (t.PercentComplete > 0 || t.RowsCopied > 0) {
-			fmt.Fprintf(&b, indentDetail+"Rows: %s / %s%s\n", ui.FormatNumber(ui.ClampRows(t.RowsCopied, t.RowsTotal)), ui.FormatNumber(t.RowsTotal), ui.FormatTableSizeClause(t.EstimatedBytes))
+			coverage, size, _ := rowsCoverageAndSize(t)
+			fmt.Fprintf(&b, indentDetail+"Rows: %s / %s%s%s\n", ui.FormatNumber(ui.ClampRows(t.RowsCopied, t.RowsTotal)), ui.FormatNumber(t.RowsTotal), coverage, size)
 		}
 		b.WriteString("\n")
 		b.WriteString(formatTableParts(t))
@@ -733,8 +756,8 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 		// Row copy in progress — show progress bar with structured fields
 		displayPercent := ui.RowCopyDisplayPercent(t.PercentComplete, t.RowsCopied)
 		bar := ui.ProgressBarRowCopy(displayPercent)
-		writeTableLine(&b, t, "%s %s%s", bar,
-			ui.FormatRowCopyPercent(t.PercentComplete, t.RowsCopied, t.RowsTotal), throttledSuffix(t))
+		writeTableLine(&b, t, "%s %s%s%s", bar,
+			ui.FormatRowCopyPercent(t.PercentComplete, t.RowsCopied, t.RowsTotal), shardCoverageSuffix(t), throttledSuffix(t))
 
 		if t.DDL != "" {
 			b.WriteString(formatTableDDL(t))
@@ -831,12 +854,87 @@ func recoveringIsCopyingRows(t TableProgress) bool {
 }
 
 func writeStructuredRowsAndETA(b *strings.Builder, t TableProgress) {
-	size := ui.FormatTableSizeClause(t.EstimatedBytes)
+	coverage, size, partial := rowsCoverageAndSize(t)
+	eta := ui.FormatETA(t.ETASeconds)
+	if partial || t.RowsTotalPlanned {
+		// The unreported shards or targets can only add time, so the ETA is
+		// a floor.
+		eta = "≥ " + eta
+	}
+	total := ui.FormatNumber(t.RowsTotal)
+	if t.RowsTotalPlanned {
+		total = ui.FormatApproxRows(t.RowsTotal)
+	}
 	if t.ETASeconds > 0 {
-		fmt.Fprintf(b, indentDetail+"Rows: %s / %s%s · ETA: %s\n", ui.FormatNumber(ui.ClampRows(t.RowsCopied, t.RowsTotal)), ui.FormatNumber(t.RowsTotal), size, ui.FormatETA(t.ETASeconds))
+		fmt.Fprintf(b, indentDetail+"Rows: %s / %s%s%s · ETA: %s\n", ui.FormatNumber(ui.ClampRows(t.RowsCopied, t.RowsTotal)), total, coverage, size, eta)
 		return
 	}
-	fmt.Fprintf(b, indentDetail+"Rows: %s / %s%s\n", ui.FormatNumber(ui.ClampRows(t.RowsCopied, t.RowsTotal)), ui.FormatNumber(t.RowsTotal), size)
+	fmt.Fprintf(b, indentDetail+"Rows: %s / %s%s%s\n", ui.FormatNumber(ui.ClampRows(t.RowsCopied, t.RowsTotal)), total, coverage, size)
+}
+
+// writePlannedRows writes the rows line of a queued table: the plan's row
+// estimate and size, both approximate, so the work ahead is visible before
+// the copy starts. A table rolled up across targets names them, since its
+// estimate is their sum. It writes nothing when the plan had no row estimate,
+// which a table rolled up across targets lacks while some of its targets have
+// reported nothing at all: their estimates are not known, so a sum of the rest
+// would understate the table (tableAcrossTargets).
+func writePlannedRows(b *strings.Builder, t TableProgress) {
+	if t.EstimatedRows == nil {
+		return
+	}
+	span := ""
+	if t.AcrossTargets {
+		span = presentation.PlannedRowsSpan(len(t.Shards))
+	}
+	fmt.Fprintf(b, indentDetail+"Rows: %s%s%s\n", ui.FormatApproxRows(*t.EstimatedRows), span, ui.FormatTableSizeClause(t.EstimatedBytes))
+}
+
+// rowsCoverageAndSize returns the clauses a table's rows line carries after
+// its row counts: the shards the counts cover when only some have reported,
+// and the table's planned size, which then names the shards it covers. partial
+// reports whether the counts cover only some shards.
+func rowsCoverageAndSize(t TableProgress) (coverage, size string, partial bool) {
+	reporting, ok := partialShardCoverage(t)
+	if !ok {
+		return "", ui.FormatTableSizeClause(t.EstimatedBytes), false
+	}
+	return fmt.Sprintf(" across %d of %d shards", reporting, shardTotal(t)),
+		ui.FormatShardedTableSizeClause(t.EstimatedBytes, t.PlannedShards), true
+}
+
+// partialShardCoverage returns how many of a sharded table's shards have
+// reported a row total, and whether that is only some of them: while later
+// shards have not started, the table's row figures cover the started ones
+// alone, so the bar and the rows line say so rather than passing those
+// shards' fraction off as the table's, as the PR comment does.
+func partialShardCoverage(t TableProgress) (int, bool) {
+	if t.AcrossTargets || len(t.Shards) < 2 {
+		return 0, false
+	}
+	reporting := 0
+	for _, sh := range t.Shards {
+		if sh.RowsTotal > 0 {
+			reporting++
+		}
+	}
+	return reporting, reporting > 0 && reporting < shardTotal(t)
+}
+
+// shardTotal is how many shards a sharded table's copy spans: the plan's
+// count, or the shards listed when more are listed than the plan recorded or
+// it recorded none, as the PR comment counts them.
+func shardTotal(t TableProgress) int {
+	return max(len(t.Shards), t.PlannedShards)
+}
+
+// shardCoverageSuffix annotates a sharded table's copy percentage with the
+// shards it covers when only some have reported (partialShardCoverage).
+func shardCoverageSuffix(t TableProgress) string {
+	if reporting, ok := partialShardCoverage(t); ok {
+		return fmt.Sprintf(" (%d of %d shards)", reporting, shardTotal(t))
+	}
+	return ""
 }
 
 // writeEstimateExceededTable writes the header and detail lines of a table
@@ -860,6 +958,9 @@ type StopData struct {
 	StoppedCount   int
 	SkippedCount   int
 	ProgressBefore int // Progress percentage before stop
+	// StartWithdrawn reports that the schema change was still stopped and the
+	// stop withdrew a start that had not taken effect, so no table was stopped.
+	StartWithdrawn bool
 }
 
 // WriteStopSuccess writes the stop command success output.
@@ -868,17 +969,22 @@ func WriteStopSuccess(data StopData) {
 	fmt.Println()
 	fmt.Printf("Database:    %s\n", data.Database)
 	fmt.Printf("Environment: %s\n", data.Environment)
-	if data.StoppedCount > 0 {
-		fmt.Printf("Stopped:     %d table(s)\n", data.StoppedCount)
-	}
-	if data.SkippedCount > 0 {
-		fmt.Printf("Skipped:     %d table(s) (already complete)\n", data.SkippedCount)
+	if data.StartWithdrawn {
+		fmt.Println()
+		fmt.Println("The start requested earlier had not taken effect yet, so this stop withdrew it.")
+	} else {
+		if data.StoppedCount > 0 {
+			fmt.Printf("Stopped:     %d table(s)\n", data.StoppedCount)
+		}
+		if data.SkippedCount > 0 {
+			fmt.Printf("Skipped:     %d table(s) (already complete)\n", data.SkippedCount)
+		}
 	}
 	fmt.Println()
 	if data.ApplyID != "" {
-		fmt.Printf("%sCheckpoint saved. Use '%s start -e %s %s' to resume.%s\n", ANSIDim, cliname.Name(), data.Environment, data.ApplyID, ANSIReset)
+		fmt.Printf("%sCheckpoint saved. Use '%s' to resume.%s\n", ANSIDim, cliname.Command("start", "-e", data.Environment, data.ApplyID), ANSIReset)
 	} else {
-		fmt.Printf("%sCheckpoint saved. Use '%s start' to resume from where you left off.%s\n", ANSIDim, cliname.Name(), ANSIReset)
+		fmt.Printf("%sCheckpoint saved. Use '%s' to resume from where you left off.%s\n", ANSIDim, cliname.Command("start"), ANSIReset)
 	}
 }
 
@@ -931,14 +1037,25 @@ func WriteStartSuccess(data StartData) {
 	fmt.Printf("%sResuming from checkpoint...%s\n", ANSIDim, ANSIReset)
 }
 
+// ProgressCommand is the command that watches an apply on the server and in
+// the environment this run addressed. A wrapper may route an omitted
+// environment to a default one, so the environment is named whenever this run
+// knew it, along with the routing flags the operator passed.
+func ProgressCommand(applyID, environment string) string {
+	if environment == "" {
+		return cliname.Command("progress", applyID)
+	}
+	return cliname.Command("progress", applyID, "-e", environment)
+}
+
 // WriteStartNoWatch writes the start command output when --watch=false.
 func WriteStartNoWatch(applyID, database, environment string) {
 	fmt.Printf("%s%s▶️  Schema change resumed%s\n", ANSIBold, ANSIGreen, ANSIReset)
 	fmt.Println()
 	if applyID != "" {
-		fmt.Printf("To watch and manage: %s progress %s\n", cliname.Name(), applyID)
+		fmt.Printf("To watch and manage: %s\n", ProgressCommand(applyID, environment))
 	} else {
-		fmt.Printf("To watch and manage: %s status -d %s -e %s\n", cliname.Name(), database, environment)
+		fmt.Printf("To watch and manage: %s\n", cliname.Command("status", "-d", database, "-e", environment))
 	}
 }
 
@@ -957,7 +1074,7 @@ func WriteReleaseSuccess(data ReleaseData) {
 	fmt.Printf("Environment: %s\n", data.Environment)
 	fmt.Println()
 	if data.ApplyID != "" {
-		fmt.Printf("%sHeld deployments will resume. Use '%s progress %s' to follow them.%s\n", ANSIDim, cliname.Name(), data.ApplyID, ANSIReset)
+		fmt.Printf("%sHeld deployments will resume. Use '%s' to follow them.%s\n", ANSIDim, ProgressCommand(data.ApplyID, data.Environment), ANSIReset)
 	} else {
 		fmt.Printf("%sHeld deployments will resume.%s\n", ANSIDim, ANSIReset)
 	}
@@ -992,7 +1109,18 @@ type StatusListData struct {
 	StateCounts    map[string]int
 	ShowExternalID bool
 	Deployment     string
-	Applies        []ActiveApplyData
+	// After is the --after apply this page continues from; empty on a first
+	// page.
+	After   string
+	Applies []ActiveApplyData
+	// Sectioned renders the default view: Active above the finished applies
+	// in Applies, which alone are paged by --limit and --after. Active is
+	// listed in full on a first page and omitted from a continued one.
+	Sectioned bool
+	Active    []ActiveApplyData
+	// ActiveHasMore reports more active applies than the server returns in
+	// one request.
+	ActiveHasMore bool
 }
 
 // statusWindowSuffix renders the active list filters (--state, --last) as a
@@ -1048,16 +1176,12 @@ func writeStatusStateSummary(counts map[string]int) {
 
 // WriteStatusList writes the status list output.
 func WriteStatusList(data StatusListData) {
+	if data.Sectioned {
+		writeSectionedStatusList(data)
+		return
+	}
 	if len(data.Applies) == 0 {
-		filters := ""
-		if parts := statusFilterPhrases(data); len(parts) > 0 {
-			filters = " " + strings.Join(parts, ", ")
-		}
-		if data.FailuresOnly {
-			fmt.Printf("%sNo recent failed schema changes%s%s\n", ANSIDim, filters, ANSIReset)
-		} else {
-			fmt.Printf("%sNo recent schema changes%s%s\n", ANSIDim, filters, ANSIReset)
-		}
+		writeEmptyStatusList(data)
 		return
 	}
 	if data.FailuresOnly {
@@ -1067,31 +1191,102 @@ func WriteStatusList(data StatusListData) {
 
 	// Header
 	if data.ActiveCount > 0 {
-		if data.ActiveCount == 1 {
-			fmt.Printf("%s1 active schema change%s%s\n", ANSIBold, ANSIReset, statusWindowSuffix(data))
-		} else {
-			fmt.Printf("%s%d active schema changes%s%s\n", ANSIBold, data.ActiveCount, ANSIReset, statusWindowSuffix(data))
-		}
+		writeActiveStatusHeader(data, data.ActiveCount)
 	} else {
 		fmt.Printf("%sRecent schema changes%s%s\n", ANSIBold, ANSIReset, statusWindowSuffix(data))
 	}
 	writeStatusStateSummary(data.StateCounts)
 	fmt.Println()
 
-	writeStatusTable(statusListColumns(data), data.Applies, func(a ActiveApplyData) string { return a.State })
+	writeStatusTable(statusListColumns(data, data.Applies), data.Applies, func(a ActiveApplyData) string { return a.State })
 
 	writeStatusListFooter(data)
 }
 
-// writeStatusListTruncation says how much of the history a truncated page holds,
-// and how to see more of it — or that the server will not serve more, when the
-// page is already at the cap.
-func writeStatusListTruncation(data StatusListData, item string) {
-	if data.MaxLimit > 0 && data.Limit >= data.MaxLimit {
-		fmt.Printf("%sShowing the %d most recent %s. This server caps status history at %d.%s\n", ANSIDim, data.Limit, item, data.MaxLimit, ANSIReset)
+// writeSectionedStatusList writes the default status view: every active apply,
+// then the finished ones a page at a time. The two come from separate requests
+// over an order that never changes, so paging the finished applies cannot skip
+// or repeat one whose state moves between pages, and active work is always on
+// screen however many applies finished since it started.
+func writeSectionedStatusList(data StatusListData) {
+	if len(data.Active) == 0 && len(data.Applies) == 0 {
+		writeEmptyStatusList(data)
 		return
 	}
-	fmt.Printf("%sShowing the %d most recent %s. Use --limit N to show more.%s\n", ANSIDim, data.Limit, item, ANSIReset)
+	if data.After == "" {
+		if len(data.Active) == 0 {
+			fmt.Printf("%sNo active schema changes%s%s\n", ANSIDim, ANSIReset, statusWindowSuffix(data))
+		} else {
+			writeActiveStatusHeader(data, len(data.Active))
+			fmt.Println()
+			writeStatusTable(statusListColumns(data, data.Active), data.Active, func(a ActiveApplyData) string { return a.State })
+			if data.ActiveHasMore {
+				fmt.Printf("\n%sShowing the %d most recent active schema changes.%s\n", ANSIDim, len(data.Active), ANSIReset)
+			}
+		}
+		fmt.Println()
+	}
+
+	if len(data.Applies) == 0 {
+		fmt.Printf("%sNo recent finished schema changes%s%s\n", ANSIDim, ANSIReset, statusWindowSuffix(data))
+		writeStatusListFooter(data)
+		return
+	}
+	fmt.Printf("%sRecent schema changes%s%s\n", ANSIBold, ANSIReset, statusWindowSuffix(data))
+	writeStatusStateSummary(data.StateCounts)
+	fmt.Println()
+	writeStatusTable(statusListColumns(data, data.Applies), data.Applies, func(a ActiveApplyData) string { return a.State })
+	writeStatusListFooter(data)
+}
+
+func writeActiveStatusHeader(data StatusListData, count int) {
+	if count == 1 {
+		fmt.Printf("%s1 active schema change%s%s\n", ANSIBold, ANSIReset, statusWindowSuffix(data))
+		return
+	}
+	fmt.Printf("%s%d active schema changes%s%s\n", ANSIBold, count, ANSIReset, statusWindowSuffix(data))
+}
+
+func writeEmptyStatusList(data StatusListData) {
+	filters := ""
+	if parts := statusFilterPhrases(data); len(parts) > 0 {
+		filters = " " + strings.Join(parts, ", ")
+	}
+	if data.After != "" {
+		item := "schema changes"
+		if data.FailuresOnly {
+			item = "failed schema changes"
+		}
+		fmt.Printf("%sNo %s older than %s%s%s\n", ANSIDim, item, data.After, filters, ANSIReset)
+		return
+	}
+	if data.FailuresOnly {
+		fmt.Printf("%sNo recent failed schema changes%s%s\n", ANSIDim, filters, ANSIReset)
+	} else {
+		fmt.Printf("%sNo recent schema changes%s%s\n", ANSIDim, filters, ANSIReset)
+	}
+}
+
+// writeStatusListTruncation says how much of the history a truncated page holds
+// and how to see more of it. Below the server's cap a larger --limit shows
+// more; once the page is at the cap, or the operator is already paging, the
+// next page starts --after the last apply this one shows.
+func writeStatusListTruncation(data StatusListData, item string) {
+	atCap := data.MaxLimit > 0 && data.Limit >= data.MaxLimit
+	last := ""
+	if len(data.Applies) > 0 {
+		last = data.Applies[len(data.Applies)-1].ApplyID
+	}
+	switch {
+	case data.After != "" && last != "":
+		fmt.Printf("%sShowing %d more %s. Add --after %s for the next %d.%s\n", ANSIDim, len(data.Applies), item, last, data.Limit, ANSIReset)
+	case atCap && last != "":
+		fmt.Printf("%sShowing the %d most recent %s. Add --after %s for the next %d.%s\n", ANSIDim, data.Limit, item, last, data.Limit, ANSIReset)
+	case atCap:
+		fmt.Printf("%sShowing the %d most recent %s. This server caps status history at %d.%s\n", ANSIDim, data.Limit, item, data.MaxLimit, ANSIReset)
+	default:
+		fmt.Printf("%sShowing the %d most recent %s. Use --limit N to show more.%s\n", ANSIDim, data.Limit, item, ANSIReset)
+	}
 }
 
 func writeStatusListFooter(data StatusListData) {
@@ -1103,7 +1298,7 @@ func writeStatusListFooter(data StatusListData) {
 		}
 		writeStatusListTruncation(data, item)
 	}
-	fmt.Printf("%sUse '%s status <apply_id>' to view details%s\n", ANSIDim, cliname.Name(), ANSIReset)
+	fmt.Printf("%sUse '%s' to view details%s\n", ANSIDim, cliname.Command("status", "<apply_id>"), ANSIReset)
 }
 
 func writeFailedStatusList(data StatusListData) {
@@ -1122,7 +1317,7 @@ func writeFailedStatusList(data StatusListData) {
 			statusFailureActor(a, data.ShowExternalID),
 			formatFailureTimestamp(a),
 			compactStatusFailureReason(a.ErrorMessage))
-		fmt.Printf("%s status %s\n", cliname.Name(), a.ApplyID)
+		fmt.Println(cliname.Command("status", a.ApplyID))
 	}
 
 	if data.HasMore && data.Limit > 0 {
@@ -1184,7 +1379,7 @@ func writeStatusTable[Row any](columns []statusColumn[Row], rows []Row, rowState
 // already do — the deployment's shared data-plane apply id and the
 // per-operation remote row id — and omits DEPLOYMENT, which every row repeats
 // back to the operator who named it.
-func statusListColumns(data StatusListData) []statusColumn[ActiveApplyData] {
+func statusListColumns(data StatusListData, rows []ActiveApplyData) []statusColumn[ActiveApplyData] {
 	columns := []statusColumn[ActiveApplyData]{
 		{header: "APPLY ID", value: func(a ActiveApplyData) string { return a.ApplyID }},
 	}
@@ -1215,9 +1410,11 @@ func statusListColumns(data StatusListData) []statusColumn[ActiveApplyData] {
 	columns = append(columns,
 		statusColumn[ActiveApplyData]{header: "STATE", colored: true, value: func(a ActiveApplyData) string { return state.Label(a.State) }},
 		statusColumn[ActiveApplyData]{header: "STARTED", value: func(a ActiveApplyData) string { return formatStartedAt(a.StartedAt) }},
+	)
+	columns = append(columns,
 		statusColumn[ActiveApplyData]{header: "SOURCE", last: true, value: func(a ActiveApplyData) string { return applySource(a.Caller) }},
 	)
-	return retainPopulatedStatusColumns(columns, data.Applies)
+	return retainPopulatedStatusColumns(columns, rows)
 }
 
 // retainPopulatedStatusColumns drops every optional column no row fills in.
@@ -1379,7 +1576,7 @@ func WriteDatabaseHistory(data DatabaseHistoryData) {
 	writeStatusTable(databaseHistoryColumns(), data.Applies, func(a ApplyHistoryData) string { return a.State })
 
 	fmt.Println()
-	fmt.Printf("%sUse '%s status <apply_id>' to view details%s\n", ANSIDim, cliname.Name(), ANSIReset)
+	fmt.Printf("%sUse '%s' to view details%s\n", ANSIDim, cliname.Command("status", "<apply_id>"), ANSIReset)
 }
 
 // stateColorFunc returns an ANSI color function for the given state.

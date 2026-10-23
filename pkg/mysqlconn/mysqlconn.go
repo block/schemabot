@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -66,6 +67,33 @@ func WithConnectTimeout(d time.Duration) Option {
 		if d > 0 {
 			cfg.Timeout = d
 		}
+	}
+}
+
+// WithUTCSession pins both halves of a connection's time handling to UTC: the
+// Go MySQL driver reads and writes DATETIME values as UTC (loc), and every
+// session runs with time_zone='+00:00', so NOW() and DEFAULT CURRENT_TIMESTAMP
+// produce the same reading as a UTC time.Time written by Go. SchemaBot's
+// storage compares Go-written timestamps against the session's NOW() in lease,
+// lock, and retry predicates, so the two must agree whatever the server's
+// system time zone is. Any time_zone the DSN carries is replaced; system
+// variable names are case-insensitive on the server, so every spelling goes.
+//
+// Use it for SchemaBot's own storage only. Target-database connections keep
+// the server's zone: their timestamps are application data this package hands
+// back unaltered.
+func WithUTCSession() Option {
+	return func(cfg *mysql.Config) {
+		cfg.Loc = time.UTC
+		for key := range cfg.Params {
+			if strings.EqualFold(key, "time_zone") {
+				delete(cfg.Params, key)
+			}
+		}
+		if cfg.Params == nil {
+			cfg.Params = map[string]string{}
+		}
+		cfg.Params["time_zone"] = "'+00:00'"
 	}
 }
 

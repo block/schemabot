@@ -4,12 +4,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"path"
 	"slices"
 	"strings"
 
 	"github.com/hmarr/codeowners"
 
+	"github.com/block/schemabot/pkg/ddl"
 	ghclient "github.com/block/schemabot/pkg/github"
+	schemadialect "github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/webhook/templates"
 )
 
@@ -28,11 +31,20 @@ type ReviewGateResult struct {
 	// head, so the review-required comment can say why an approval visible on
 	// the PR does not count.
 	ChangedApprovers []string
+	// ChangedPaths are the schema inputs whose change differs between those
+	// approvals and the head, so the comment can name what changed.
+	ChangedPaths []string
 	// UncomparedApprovers are authorized reviewers whose approval was given
 	// on an earlier commit the gate could not compare with the head. Nothing
 	// proves such an approval still describes the head, so it does not count,
 	// and the gate-error comment names the remedy that needs no comparison.
 	UncomparedApprovers []string
+	// BaseRef and DefaultBranch are the PR's base branch and the repository's
+	// default branch. An approval is carried across base branch changes only
+	// when they are the same, so the review-required comment says so when they
+	// differ.
+	BaseRef       string
+	DefaultBranch string
 }
 
 // errApprovalNotComparable marks an approval on an earlier commit that could
@@ -61,7 +73,7 @@ var errApprovalNotComparable = errors.New("an approval on an earlier commit cann
 // evaluation-failure comment on durable attempts, where the driver retries
 // and posts the single terminal answer instead; blocks always comment.
 func (h *Handler) enforceReviewGate(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, installationID int64, schemaResult *ghclient.SchemaRequestResult, environment, requestedBy, commandName string, suppressRetryComments bool) (blocked bool, err error) {
-	gateResult, err := h.checkReviewGate(ctx, client, repo, pr, schemaResult)
+	gateResult, err := h.checkReviewGate(ctx, client, repo, pr, environment, schemaResult)
 	if err != nil {
 		h.logger.Error("review gate check failed", "repo", repo, "pr", pr,
 			"database", schemaResult.Database, "environment", environment,
@@ -80,7 +92,10 @@ func (h *Handler) enforceReviewGate(ctx context.Context, client *ghclient.Instal
 			OtherReviewers:      gateResult.OtherReviewers,
 			PRAuthor:            gateResult.PRAuthor,
 			ChangedApprovers:    gateResult.ChangedApprovers,
+			ChangedPaths:        gateResult.ChangedPaths,
 			UncomparedApprovers: gateResult.UncomparedApprovers,
+			BaseRef:             gateResult.BaseRef,
+			DefaultBranch:       gateResult.DefaultBranch,
 		}
 		if len(gateResult.UncomparedApprovers) > 0 {
 			h.postComment(repo, pr, installationID, templates.RenderReviewGateError(data))
@@ -108,6 +123,8 @@ func reviewGateErrorDetail(err error) string {
 // Returns nil if review gating is disabled (apply proceeds).
 // Returns a result with Approved=true if gate passes.
 // Returns a result with Approved=false if gate blocks.
+// environment is the one the command targets; a PostgreSQL schema file
+// comparison runs on its primary target.
 // schema identifies the database and where its schema inputs live: the schema
 // directory, the environment symlink it was resolved through (if any), and the
 // config file. schema.HeadSHA is the commit the schema files being applied
@@ -121,8 +138,8 @@ func reviewGateErrorDetail(err error) string {
 // An approval on an earlier commit that cannot be compared with HeadSHA at all
 // does not count; it is recorded in UncomparedApprovers so the comment can say
 // why it was not counted.
-func (h *Handler) checkReviewGate(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, schema *ghclient.SchemaRequestResult) (*ReviewGateResult, error) {
-	if !h.isReviewGateEnabled(repo) {
+func (h *Handler) checkReviewGate(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, environment string, schema *ghclient.SchemaRequestResult) (*ReviewGateResult, error) {
+	if !h.isReviewGateEnabled(repo, schema.Database) {
 		return nil, nil
 	}
 	database, schemaPath, headSHA := schema.Database, schema.SchemaPath, schema.HeadSHA
@@ -140,12 +157,23 @@ func (h *Handler) checkReviewGate(ctx context.Context, client *ghclient.Installa
 		return nil, fmt.Errorf("fetch PR reviews: %w", err)
 	}
 
-	policy, err := h.loadReviewGatePolicy(ctx, client, repo, prInfo.BaseRef, database, schemaPath)
+	policy, err := h.loadReviewGatePolicy(ctx, client, repo, pr, prInfo.BaseRef, headSHA, database, schemaPath)
 	if err != nil {
 		return nil, err
 	}
 	if len(policy.OperatorReviewers) == 0 && len(policy.OtherReviewers) == 0 {
+		if policy.IncludeCodeowners {
+			// CODEOWNERS was the only possible source of reviewers and it
+			// contributed none, so name it and the fix: the generic error
+			// would leave the operator to guess which source was empty.
+			return nil, fmt.Errorf("review policy has no configured reviewers for database %q: no reviewers besides CODEOWNERS are configured, and no CODEOWNERS rule on base branch %q assigns owners to schema directory %q; add a CODEOWNERS rule that owns that directory, or configure admins or database operators in the review policy", database, prInfo.BaseRef, schemaPath)
+		}
 		return nil, fmt.Errorf("review policy has no configured reviewers for database %q", database)
+	}
+
+	if prInfo.DefaultBranch == "" {
+		h.logger.Warn("review gate: GitHub reports no default branch for the PR's repository, so approvals on earlier commits will count only where base branch content is unchanged",
+			"repo", repo, "pr", pr, "database", database, "base_ref", prInfo.BaseRef, "head_sha", headSHA)
 	}
 
 	approvals := ghclient.GetApprovedReviews(reviews)
@@ -172,15 +200,17 @@ func (h *Handler) checkReviewGate(ctx context.Context, client *ghclient.Installa
 	validApprovals := slices.Concat(headApprovals, earlierApprovals)
 
 	coverage := approvalCoverage{
-		repo:       repo,
-		pr:         pr,
-		database:   database,
-		baseRef:    prInfo.BaseRef,
-		headSHA:    headSHA,
-		inputPaths: reviewGateInputPaths(schema),
-		verdicts:   make(map[string]approvalVerdict),
+		repo:              repo,
+		pr:                pr,
+		database:          database,
+		baseRef:           prInfo.BaseRef,
+		defaultBranch:     prInfo.DefaultBranch,
+		headSHA:           headSHA,
+		inputPaths:        reviewGateInputPaths(schema),
+		compareStatements: h.statementComparerFor(repo, pr, database, environment, schema.Type),
+		verdicts:          make(map[string]approvalVerdict),
 	}
-	var changedApprovers, uncomparedApprovers []string
+	var changedApprovers, changedPaths, uncomparedApprovers []string
 	for _, approval := range validApprovals {
 		reviewer := approval.User
 		matched, principal, err := policy.Matches(ctx, client, reviewer)
@@ -192,7 +222,7 @@ func (h *Handler) checkReviewGate(ctx context.Context, client *ghclient.Installa
 				"repo", repo, "pr", pr, "database", database, "reviewer", reviewer)
 			continue
 		}
-		covers, err := h.approvalCoversHead(ctx, client, &coverage, approval)
+		covers, differingPath, err := h.approvalCoversHead(ctx, client, &coverage, approval)
 		// An approval that cannot be compared does not count, but another
 		// approval may still cover the head, so the rest are still checked.
 		if errors.Is(err, errApprovalNotComparable) {
@@ -206,6 +236,9 @@ func (h *Handler) checkReviewGate(ctx context.Context, client *ghclient.Installa
 		// like a reviewer who has not approved.
 		if !covers {
 			changedApprovers = append(changedApprovers, reviewer)
+			if differingPath != "" {
+				changedPaths = appendUniqueString(changedPaths, differingPath)
+			}
 			continue
 		}
 		h.logger.Info("review gate: approved",
@@ -235,14 +268,20 @@ func (h *Handler) checkReviewGate(ctx context.Context, client *ghclient.Installa
 		OtherReviewers:      policy.OtherReviewers,
 		PRAuthor:            prInfo.User,
 		ChangedApprovers:    changedApprovers,
+		ChangedPaths:        changedPaths,
 		UncomparedApprovers: uncomparedApprovers,
+		BaseRef:             prInfo.BaseRef,
+		DefaultBranch:       prInfo.DefaultBranch,
 	}, nil
 }
 
 // approvalVerdict is the cached outcome of comparing one approved commit
 // with the head: whether it covers the head, or why it cannot be compared.
 type approvalVerdict struct {
-	covers        bool
+	covers bool
+	// differingPath is the first schema input whose change differs, when
+	// the approval does not cover the head.
+	differingPath string
 	notComparable error
 }
 
@@ -256,11 +295,46 @@ type approvalCoverage struct {
 	// baseRef is the PR's base branch, which each commit's change is measured
 	// against.
 	baseRef string
-	headSHA string
+	// defaultBranch is the repository's default branch. Base branch content
+	// is trusted only when baseRef is the default branch.
+	defaultBranch string
+	headSHA       string
 	// inputPaths are the database's schema inputs: every path whose change at
 	// the approved commit must match the head for the approval to count.
 	inputPaths []string
-	verdicts   map[string]approvalVerdict
+	// compareStatements proves a schema file that both the PR and the base
+	// branch edited generates the same statements at both commits, or is nil
+	// when the database's dialect has no such comparison.
+	compareStatements ghclient.SchemaFileChangeComparer
+	verdicts          map[string]approvalVerdict
+}
+
+// statementComparerFor returns the statement comparison for a database
+// type's schema files, or nil when the dialect has none, so its files are
+// compared by content alone and a file both the PR and the base branch edited
+// always counts as changed.
+//
+// MySQL-family files hold one CREATE TABLE each, which ddl.SameTableChange
+// compares from the files alone. PostgreSQL has no offline model of a schema
+// file, so the environment's primary target runs each version on a scratch
+// schema and compares what it built (see targetStatementComparer); a target
+// that cannot answer within the evaluation's budget leaves the file changed.
+func (h *Handler) statementComparerFor(repo string, pr int, database, environment, databaseType string) ghclient.SchemaFileChangeComparer {
+	switch schemadialect.DialectForDatabaseType(databaseType) {
+	case schemadialect.DialectMySQL:
+		return func(_ context.Context, approvedBase, approved, headBase, head string) (bool, string, error) {
+			return ddl.SameTableChange(approvedBase, approved, headBase, head)
+		}
+	case schemadialect.DialectPostgres:
+		if h.service == nil {
+			h.logger.Warn("review gate: no service is wired, so PostgreSQL schema files both the PR and the base branch edited will count as changed",
+				"repo", repo, "pr", pr, "database", database, "environment", environment)
+			return nil
+		}
+		return h.newTargetStatementComparer(repo, pr, database, environment).compare
+	default:
+		return nil
+	}
 }
 
 // approvalCoversHead decides whether an approval still stands for the PR head.
@@ -272,27 +346,27 @@ type approvalCoverage struct {
 // is returned as an errApprovalNotComparable error. A comparison GitHub could
 // not answer — it was unavailable, or the evaluation was cancelled — is
 // returned as an error too, and never cached as a verdict.
-func (h *Handler) approvalCoversHead(ctx context.Context, client *ghclient.InstallationClient, c *approvalCoverage, approval *ghclient.ReviewInfo) (bool, error) {
+func (h *Handler) approvalCoversHead(ctx context.Context, client *ghclient.InstallationClient, c *approvalCoverage, approval *ghclient.ReviewInfo) (covers bool, differingPath string, err error) {
 	approvedSHA := approval.CommitID
 	if approvedSHA == "" {
 		h.logger.Warn("review gate: cannot compare an approval with the head because GitHub reports no commit for it",
 			"repo", c.repo, "pr", c.pr, "database", c.database, "reviewer", approval.User,
 			"head_sha", c.headSHA)
-		return false, fmt.Errorf("review gate for %s#%d database %q: approval by %s has no commit: %w",
+		return false, "", fmt.Errorf("review gate for %s#%d database %q: approval by %s has no commit: %w",
 			c.repo, c.pr, c.database, approval.User, errApprovalNotComparable)
 	}
 	if approvedSHA == c.headSHA {
-		return true, nil
+		return true, "", nil
 	}
-	if verdict, ok := c.verdicts[approvedSHA]; ok {
-		return verdict.covers, verdict.notComparable
+	verdict, ok := c.verdicts[approvedSHA]
+	if !ok {
+		verdict, err = h.schemaChangeUnchangedSince(ctx, client, c, approval)
+		if err != nil {
+			return false, "", err
+		}
+		c.verdicts[approvedSHA] = verdict
 	}
-	verdict, err := h.schemaChangeUnchangedSince(ctx, client, c, approval)
-	if err != nil {
-		return false, err
-	}
-	c.verdicts[approvedSHA] = verdict
-	return verdict.covers, verdict.notComparable
+	return verdict.covers, verdict.differingPath, verdict.notComparable
 }
 
 // schemaChangeUnchangedSince compares the PR's change to the database's schema
@@ -305,7 +379,7 @@ func (h *Handler) approvalCoversHead(ctx context.Context, client *ghclient.Insta
 // errApprovalNotComparable, and a GitHub outage is returned as a retryable
 // error.
 func (h *Handler) schemaChangeUnchangedSince(ctx context.Context, client *ghclient.InstallationClient, c *approvalCoverage, approval *ghclient.ReviewInfo) (approvalVerdict, error) {
-	comparison, err := client.PRSchemaChangeUnchangedSince(ctx, c.repo, c.baseRef, approval.CommitID, c.headSHA, c.inputPaths)
+	comparison, err := client.PRSchemaChangeUnchangedSince(ctx, c.repo, c.baseRef, c.defaultBranch, approval.CommitID, c.headSHA, c.inputPaths, c.compareStatements)
 	if err != nil {
 		if ghclient.IsUnavailableError(err) {
 			return approvalVerdict{}, fmt.Errorf("compare schema change for %s#%d database %q at approved commit %s and head %s: %w",
@@ -322,6 +396,7 @@ func (h *Handler) schemaChangeUnchangedSince(ctx context.Context, client *ghclie
 			"approved_merge_base_sha", comparison.ApprovedMergeBaseSHA,
 			"head_merge_base_sha", comparison.HeadMergeBaseSHA,
 			"base_moved_forward", comparison.BaseMovedForward,
+			"base_is_default_branch", comparison.BaseIsDefaultBranch,
 			"input_paths", c.inputPaths, "error", err)
 		return approvalVerdict{notComparable: fmt.Errorf("compare schema change for %s#%d database %q at approved commit %s and head %s: %w",
 			c.repo, c.pr, c.database, approval.CommitID, c.headSHA, errors.Join(errApprovalNotComparable, err))}, nil
@@ -334,8 +409,10 @@ func (h *Handler) schemaChangeUnchangedSince(ctx context.Context, client *ghclie
 			"approved_merge_base_sha", comparison.ApprovedMergeBaseSHA,
 			"head_merge_base_sha", comparison.HeadMergeBaseSHA,
 			"base_moved_forward", comparison.BaseMovedForward,
+			"base_is_default_branch", comparison.BaseIsDefaultBranch,
+			"statement_compared_paths", comparison.StatementComparedPaths,
 			"differing_path", comparison.DifferingPath)
-		return approvalVerdict{}, nil
+		return approvalVerdict{differingPath: comparison.DifferingPath}, nil
 	}
 	h.logger.Info("review gate: approval on an earlier commit counts because the PR's schema change is the same at it and the head",
 		"repo", c.repo, "pr", c.pr, "database", c.database, "reviewer", approval.User,
@@ -344,6 +421,8 @@ func (h *Handler) schemaChangeUnchangedSince(ctx context.Context, client *ghclie
 		"approved_merge_base_sha", comparison.ApprovedMergeBaseSHA,
 		"head_merge_base_sha", comparison.HeadMergeBaseSHA,
 		"base_moved_forward", comparison.BaseMovedForward,
+		"base_is_default_branch", comparison.BaseIsDefaultBranch,
+		"statement_compared_paths", comparison.StatementComparedPaths,
 		"input_paths", c.inputPaths)
 	return approvalVerdict{covers: true}, nil
 }
@@ -373,6 +452,9 @@ type reviewGatePolicy struct {
 	OperatorTeams      []string
 	OperatorUsers      []string
 	CodeownerReviewers map[string]struct{}
+	// IncludeCodeowners records that CODEOWNERS was consulted, so an empty
+	// reviewer set can name CODEOWNERS as the source that contributed none.
+	IncludeCodeowners bool
 	// OperatorReviewers and OtherReviewers are the PR-facing reviewer lists on
 	// the review-required comment. The database's own operators get their own
 	// leading section — they are the reviewers the author should ping — while
@@ -426,7 +508,7 @@ func (p reviewGatePolicy) Matches(ctx context.Context, client *ghclient.Installa
 	return false, "", nil
 }
 
-func (h *Handler) loadReviewGatePolicy(ctx context.Context, client *ghclient.InstallationClient, repo, baseRef, database, schemaPath string) (reviewGatePolicy, error) {
+func (h *Handler) loadReviewGatePolicy(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, baseRef, headSHA, database, schemaPath string) (reviewGatePolicy, error) {
 	if h.service == nil || h.service.Config() == nil {
 		return reviewGatePolicy{}, fmt.Errorf("server config is unavailable")
 	}
@@ -473,7 +555,8 @@ func (h *Handler) loadReviewGatePolicy(ctx context.Context, client *ghclient.Ins
 	appendOtherReviewers(reviewPolicy.AdminTeams, reviewPolicy.AdminUsers, repoAdminTeams, repoAdminUsers)
 
 	if reviewPolicy.IncludeCodeowners {
-		owners, err := matchReviewGateCodeowners(ctx, client, repo, baseRef, schemaPath)
+		policy.IncludeCodeowners = true
+		owners, err := h.matchReviewGateCodeowners(ctx, client, repo, pr, baseRef, headSHA, database, schemaPath)
 		if err != nil {
 			return reviewGatePolicy{}, err
 		}
@@ -497,33 +580,50 @@ func (h *Handler) loadReviewGatePolicy(ctx context.Context, client *ghclient.Ins
 	return policy, nil
 }
 
-func matchReviewGateCodeowners(ctx context.Context, client *ghclient.InstallationClient, repo, baseRef, schemaPath string) ([]codeowners.Owner, error) {
+// matchReviewGateCodeowners returns the CODEOWNERS owners of the database's
+// schema directory: the owners of the last rule matching the directory path
+// itself, which is matched as one synthetic file directly inside it. A rule
+// that matches only some files (a file glob such as *.sql), a subdirectory,
+// or an environment symlink path does not match it. A directory no rule
+// matches, or one matched by a rule that names no owners, has no code owners,
+// so CODEOWNERS contributes no reviewers for it; the gate then relies on the
+// configured admins and operators alone.
+// An unknown schema directory cannot be matched, so it is treated the same
+// way rather than borrowing owners from unrelated paths.
+func (h *Handler) matchReviewGateCodeowners(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, baseRef, headSHA, database, schemaPath string) ([]codeowners.Owner, error) {
+	if schemaPath == "" {
+		h.logger.Warn("review gate: CODEOWNERS contributes no reviewers because the database's schema directory is unknown",
+			"repo", repo, "pr", pr, "head_sha", headSHA, "database", database, "base_ref", baseRef)
+		return nil, nil
+	}
 	ruleset, err := client.FetchCodeownersRuleset(ctx, repo, baseRef)
 	if err != nil {
 		return nil, fmt.Errorf("fetch CODEOWNERS: %w", err)
 	}
 	if ruleset == nil {
+		h.logger.Info("review gate: CODEOWNERS contributes no reviewers because the base branch has no CODEOWNERS file",
+			"repo", repo, "pr", pr, "head_sha", headSHA, "database", database, "base_ref", baseRef)
 		return nil, nil
 	}
 
-	var owners []codeowners.Owner
-	if schemaPath != "" {
-		matchPath := strings.TrimSuffix(schemaPath, "/") + "/.schema"
-		owners, err = ghclient.MatchCodeownersPath(ruleset, matchPath)
-		if err != nil {
-			return nil, fmt.Errorf("match CODEOWNERS for %s: %w", schemaPath, err)
-		}
+	matchPath := path.Join(schemaPath, ".schema")
+	owners, err := ghclient.MatchCodeownersPath(ruleset, matchPath)
+	if err != nil {
+		return nil, fmt.Errorf("match CODEOWNERS for %s: %w", schemaPath, err)
 	}
-	if owners == nil {
-		owners = ghclient.OwnersFromRuleset(ruleset)
+	if len(owners) == 0 {
+		h.logger.Info("review gate: CODEOWNERS contributes no reviewers because no CODEOWNERS rule assigns owners to the schema directory",
+			"repo", repo, "pr", pr, "head_sha", headSHA, "database", database, "base_ref", baseRef, "schema_path", schemaPath)
+		return nil, nil
 	}
 	return owners, nil
 }
 
-// isReviewGateEnabled checks server config for the review gate toggle.
-func (h *Handler) isReviewGateEnabled(repo string) bool {
-	enabled := h.service != nil && h.service.Config().ReviewPolicyEnabled()
-	h.logger.Debug("review gate: server config", "repo", repo, "enabled", enabled)
+// isReviewGateEnabled checks server config for the review gate toggle, which
+// is on instance-wide or for the database alone.
+func (h *Handler) isReviewGateEnabled(repo, database string) bool {
+	enabled := h.service != nil && h.service.Config().ReviewPolicyEnabledForDatabase(database)
+	h.logger.Debug("review gate: server config", "repo", repo, "database", database, "enabled", enabled)
 	return enabled
 }
 

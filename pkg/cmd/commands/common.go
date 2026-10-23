@@ -3,10 +3,13 @@ package commands
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -45,6 +48,43 @@ type Globals struct {
 // Resolve resolves the API endpoint from the global flags.
 func (g *Globals) Resolve() (string, error) {
 	return resolveEndpoint(g.Endpoint, g.Profile)
+}
+
+// RouteFlags returns the global flags that select which server a command
+// talks to, as the operator passed them, for cliname.SetRoute. Call it after
+// parsing and before anything rewrites Endpoint with a resolved one. The token
+// is never included, and the endpoint is stripped of any credentials, query,
+// or fragment, because hints are printed to the terminal and to CI logs.
+func (g *Globals) RouteFlags() []cliname.Flag {
+	var flags []cliname.Flag
+	if g.Profile != "" {
+		flags = append(flags, cliname.Flag{Name: "--profile", Value: g.Profile})
+	}
+	if endpoint := endpointForHint(g.Endpoint); endpoint != "" {
+		flags = append(flags, cliname.Flag{Name: "--endpoint", Value: endpoint})
+	}
+	return flags
+}
+
+// endpointForHint is the endpoint as a hint may print it: scheme, host, and
+// path only. An endpoint that does not parse as a URL is left out rather than
+// printed, since there is no way to tell which part of it is a credential.
+// The parse error is not logged for the same reason: it quotes the endpoint.
+func endpointForHint(endpoint string) string {
+	if endpoint == "" {
+		return ""
+	}
+	u, err := url.Parse(endpoint)
+	if err != nil {
+		slog.Debug("leaving an unparseable endpoint out of command hints")
+		return ""
+	}
+	u.User = nil
+	u.RawQuery = ""
+	u.ForceQuery = false
+	u.Fragment = ""
+	u.RawFragment = ""
+	return u.String()
 }
 
 // ControlFlags holds flags for commands that target a specific schema change.
@@ -476,11 +516,14 @@ func writeNarrowedTo(planResult *apitypes.PlanResponse) {
 // rollout-wide apply (apitypes.ApplyRequest.RendersRollout). Each caller
 // decides it for its own output, so a new caller has to decide it rather than
 // inherit it.
-func applyAndWatch(ep string, planResult *apitypes.PlanResponse, rendersRollout bool, database, environment, caller, operation string,
+func applyAndWatch(ctx context.Context, ep string, planResult *apitypes.PlanResponse, rendersRollout bool, database, environment, caller, operation string,
 	deferCutover, deferDeploy, skipRevert, allowUnsafe bool, branch string, watch bool, format OutputFormat, logHeartbeat time.Duration) (string, error) {
 
 	if planResult.PlanID == "" {
 		return "", fmt.Errorf("no plan_id in response")
+	}
+	if ctx.Err() != nil {
+		return "", stoppedBeforeSubmit(ctx, operation)
 	}
 
 	options := buildApplyOptions(planResult, deferCutover, deferDeploy, skipRevert, allowUnsafe, branch, watch, format)
@@ -527,11 +570,22 @@ func applyAndWatch(ep string, planResult *apitypes.PlanResponse, rendersRollout 
 	}
 
 	fmt.Println("Watching progress...")
-	if err := WatchApplyProgressWithFormat(ep, applyID, environment, true, format, logHeartbeat); err != nil {
+	if err := WatchApplyProgressWithFormat(ctx, ep, applyID, environment, true, format, logHeartbeat); err != nil {
 		return applyID, err
 	}
 
 	return applyID, nil
+}
+
+// stoppedBeforeSubmit ends a command whose operator pressed Ctrl-C before its
+// schema change was submitted. The signal arrived while the command was still
+// planning or taking the lock, so nothing that starts a schema change has
+// reached the server; the notice says so, because the command would otherwise
+// answer the signal by starting the schema change and stopping its watch at
+// once, which reads as a deliberate stop of something that ran.
+func stoppedBeforeSubmit(ctx context.Context, operation string) error {
+	fmt.Fprintf(os.Stderr, "Stopped before the %s was submitted; nothing was started.\n", operation)
+	return interrupted(ctx)
 }
 
 func buildApplyOptions(planResult *apitypes.PlanResponse, deferCutover, deferDeploy, skipRevert, allowUnsafe bool, branch string, watch bool, format OutputFormat) map[string]string {
@@ -560,9 +614,9 @@ func buildApplyOptions(planResult *apitypes.PlanResponse, deferCutover, deferDep
 // printWatchInstructions prints the "To watch and manage" hint.
 func printWatchInstructions(applyID, database, environment string) {
 	if applyID != "" {
-		fmt.Printf("To watch and manage: %s progress %s\n", cliname.Name(), applyID)
+		fmt.Printf("To watch and manage: %s\n", templates.ProgressCommand(applyID, environment))
 	} else {
-		fmt.Printf("To watch and manage: %s status -d %s -e %s\n", cliname.Name(), database, environment)
+		fmt.Printf("To watch and manage: %s\n", cliname.Command("status", "-d", database, "-e", environment))
 	}
 }
 

@@ -1424,16 +1424,16 @@ func (s *Service) handleApply(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if errors.Is(err, storage.ErrPlanNotFound) {
-			s.logger.Warn("apply rejected because the stored plan does not exist", "plan_id", req.PlanID, "environment", req.Environment)
+			s.logger.Warn("apply rejected because the stored plan does not exist", "plan_id", req.PlanID, "environment", req.Environment, "error", err)
 			s.writeErrorCode(w, http.StatusNotFound, apitypes.ErrCodeNotFound, storedPlanNotFoundMessage("apply", req.PlanID))
 			return
 		}
-		if _, ok := errors.AsType[*planEnvironmentMismatchError](err); ok {
+		if _, ok := errors.AsType[*PlanEnvironmentMismatchError](err); ok {
 			s.logger.Warn("apply rejected because the stored plan was created for another environment", "plan_id", req.PlanID, "environment", req.Environment, "error", err)
 			s.writeErrorCode(w, http.StatusBadRequest, apitypes.ErrCodeInvalidRequest, "apply rejected: "+err.Error())
 			return
 		}
-		if _, ok := errors.AsType[*planRoutingMetadataError](err); ok {
+		if _, ok := errors.AsType[*PlanRoutingMetadataError](err); ok {
 			s.logger.Warn("apply rejected because the stored plan lacks routing metadata", "plan_id", req.PlanID,
 				"environment", req.Environment, "error", err)
 			s.writeErrorCode(w, http.StatusBadRequest, apitypes.ErrCodeInvalidRequest, "apply rejected: "+err.Error())
@@ -1498,6 +1498,12 @@ func (s *Service) handleApply(w http.ResponseWriter, r *http.Request) {
 		if _, ok := errors.AsType[*RolloutShapeRefusedError](err); ok {
 			s.logger.Warn("apply rejected: the multi-target rollout does not run what the apply asked for", "plan_id", req.PlanID, "environment", req.Environment, "error", err)
 			s.writeErrorCode(w, http.StatusBadRequest, apitypes.ErrCodeInvalidRequest, "apply rejected: "+err.Error())
+			return
+		}
+		if storageErr, ok := errors.AsType[*applyStorageError](err); ok {
+			s.logger.Error("apply failed: storage failure while queueing the apply",
+				append(storageErr.LogAttrs(), "environment", req.Environment, "error", err)...)
+			s.writeErrorCode(w, http.StatusInternalServerError, apitypes.ErrCodeStorageError, applyStorageFailedMessage(req.PlanID))
 			return
 		}
 		s.logger.Error("apply failed", "plan_id", req.PlanID, "error", err)
@@ -1572,31 +1578,129 @@ func storedPlanNotFoundMessage(operation, planID string) string {
 	return fmt.Sprintf("%s rejected: plan not found: %s; check the plan_id or create a new plan", operation, planID)
 }
 
-// planEnvironmentMismatchError identifies an apply that names a different
+// applyStorageError marks a storage read or write that failed while queueing
+// an apply for a plan that was already loaded and validated. The request was
+// valid; the server could not record it. The error text carries the SQL
+// driver's message, so it belongs in server logs: callers that present the
+// failure answer with applyStorageFailedMessage instead. Refusals storage
+// reports as sentinels (an active apply on the target, a changed lock intent)
+// are not wrapped in it, because each has an answer of its own.
+type applyStorageError struct {
+	// Operation names the storage step that failed, for logs.
+	Operation string
+	// Plan is the loaded plan the apply was being queued for; its routing
+	// and provenance identify the attempt in logs.
+	Plan *storage.Plan
+	// ApplyIdentifier and Caller name the apply being queued and who asked
+	// for it, as the stored row would have recorded them. A failure reported
+	// before either is known leaves them empty for the caller to fill.
+	ApplyIdentifier string
+	Caller          string
+	Err             error
+}
+
+func (e *applyStorageError) Error() string {
+	return fmt.Sprintf("%s: %v", e.Operation, e.Err)
+}
+
+func (e *applyStorageError) Unwrap() error { return e.Err }
+
+// LogAttrs returns the triage attributes for the failed attempt: the plan's
+// identity, routing and PR provenance, the apply being queued, who asked for
+// it, and the storage step that failed. Append call-specific attributes after
+// it.
+func (e *applyStorageError) LogAttrs() []any {
+	attrs := []any{
+		"plan_id", e.Plan.PlanIdentifier,
+		"database", e.Plan.Database,
+		"database_type", e.Plan.DatabaseType,
+		"deployment", e.Plan.Deployment,
+		"apply_id", e.ApplyIdentifier,
+		"operation", e.Operation,
+	}
+	if e.Plan.Repository != "" {
+		attrs = append(attrs, "repo", e.Plan.Repository)
+	}
+	if e.Plan.PullRequest > 0 {
+		attrs = append(attrs, "pr", e.Plan.PullRequest)
+	}
+	if e.Caller != "" {
+		attrs = append(attrs, "caller", e.Caller)
+	}
+	return attrs
+}
+
+// applyStorageFailedMessage is the response for an apply whose storage step
+// failed after its plan was validated. The storage error stays in the server
+// log. While an apply the failed write did store is still active, it holds its
+// target and a retry is refused as a conflict; once it has run to the end,
+// nothing refuses the retry, so the caller checks the apply's state first.
+func applyStorageFailedMessage(planID string) string {
+	return fmt.Sprintf("apply failed: storage error while queueing plan %s; see server logs and check for a stored apply before retrying", planID)
+}
+
+// isApplyCreationStorageRefusal reports whether storing an apply failed with
+// a refusal storage decides on the merits rather than a storage failure: the
+// target already has an active apply, or the lock no longer carries the intent
+// the apply was created under. Each has its own answer, so it keeps its
+// sentinel and is never presented as a storage error.
+func isApplyCreationStorageRefusal(err error) bool {
+	if errors.Is(err, storage.ErrActiveApplyExists) {
+		return true
+	}
+	return errors.Is(err, storage.ErrLockIntentChanged)
+}
+
+// PlanNotFoundError identifies an apply that names a plan SchemaBot has no
+// record of. It matches storage.ErrPlanNotFound, and carries the plan
+// identifier so a caller can name the plan without presenting the error text.
+type PlanNotFoundError struct {
+	PlanID string
+	// Cause is the store's own report of the missing plan, kept for the log
+	// line when the store attached a reason to it. Nil when the store answered
+	// with no plan and no error.
+	Cause error
+}
+
+func (e *PlanNotFoundError) Error() string {
+	if e.Cause != nil {
+		return fmt.Sprintf("%v: %s", e.Cause, e.PlanID)
+	}
+	return fmt.Sprintf("%s: %s", storage.ErrPlanNotFound, e.PlanID)
+}
+
+func (e *PlanNotFoundError) Unwrap() []error {
+	if e.Cause == nil {
+		return []error{storage.ErrPlanNotFound}
+	}
+	return []error{storage.ErrPlanNotFound, e.Cause}
+}
+
+// PlanEnvironmentMismatchError identifies an apply that names a different
 // environment than the one its stored plan was created for. The plan was
 // reviewed for its own environment only, so the request is refused as a
 // caller error rather than applied somewhere it was not reviewed for.
-type planEnvironmentMismatchError struct {
+type PlanEnvironmentMismatchError struct {
 	PlanID               string
 	PlanEnvironment      string
 	RequestedEnvironment string
 }
 
-func (e *planEnvironmentMismatchError) Error() string {
+func (e *PlanEnvironmentMismatchError) Error() string {
 	return fmt.Sprintf("plan %s was created for environment %q, not %q; apply it to %q or create a plan for %q",
 		e.PlanID, e.PlanEnvironment, e.RequestedEnvironment, e.PlanEnvironment, e.RequestedEnvironment)
 }
 
-// planRoutingMetadataError identifies a stored plan that lacks one of the
+// PlanRoutingMetadataError identifies a stored plan that lacks one of the
 // server-side routing fields (deployment, target) the operator needs to
 // dispatch it. The plan cannot be repaired from the apply request, so the
 // caller is told to create a new plan rather than retry this one.
-type planRoutingMetadataError struct {
+type PlanRoutingMetadataError struct {
 	PlanID string
 	Field  string
 }
 
-func (e *planRoutingMetadataError) Error() string {
+func (e *PlanRoutingMetadataError) Error() string {
 	return fmt.Sprintf("plan %s is missing server-side routing metadata field %q; create a new plan and retry apply",
 		e.PlanID, e.Field)
 }
@@ -1691,22 +1795,23 @@ func (s *Service) loadPlanForApply(ctx context.Context, span trace.Span, req App
 		span.RecordError(err)
 		if errors.Is(err, storage.ErrPlanNotFound) {
 			// A store that reports a missing plan as the sentinel rather than
-			// a nil plan is still a caller error, not a storage failure.
+			// a nil plan is still a caller error, not a storage failure; the
+			// reason it attached stays on the error for the log line.
 			span.SetStatus(otelcodes.Error, "plan not found")
-			return nil, fmt.Errorf("%w: %s", err, req.PlanID)
+			return nil, &PlanNotFoundError{PlanID: req.PlanID, Cause: err}
 		}
 		span.SetStatus(otelcodes.Error, "plan lookup failed")
 		return nil, fmt.Errorf("%w for %s: %w", errPlanLookupFailed, req.PlanID, err)
 	}
 	if plan == nil {
-		planErr := fmt.Errorf("%w: %s", storage.ErrPlanNotFound, req.PlanID)
+		planErr := &PlanNotFoundError{PlanID: req.PlanID}
 		span.RecordError(planErr)
 		span.SetStatus(otelcodes.Error, "plan not found")
 		return nil, planErr
 	}
 	span.SetAttributes(attribute.String("database", plan.Database))
 	if plan.Environment != req.Environment {
-		applyErr := &planEnvironmentMismatchError{
+		applyErr := &PlanEnvironmentMismatchError{
 			PlanID:               req.PlanID,
 			PlanEnvironment:      plan.Environment,
 			RequestedEnvironment: req.Environment,
@@ -1717,14 +1822,14 @@ func (s *Service) loadPlanForApply(ctx context.Context, span trace.Span, req App
 		return nil, applyErr
 	}
 	if plan.Deployment == "" {
-		applyErr := &planRoutingMetadataError{PlanID: req.PlanID, Field: "deployment"}
+		applyErr := &PlanRoutingMetadataError{PlanID: req.PlanID, Field: "deployment"}
 		span.RecordError(applyErr)
 		span.SetStatus(otelcodes.Error, "missing stored deployment")
 		metrics.RecordApply(ctx, plan.Repository, plan.Database, plan.Deployment, req.Environment, "error")
 		return nil, applyErr
 	}
 	if plan.Target == "" {
-		applyErr := &planRoutingMetadataError{PlanID: req.PlanID, Field: "target"}
+		applyErr := &PlanRoutingMetadataError{PlanID: req.PlanID, Field: "target"}
 		span.RecordError(applyErr)
 		span.SetStatus(otelcodes.Error, "missing stored target")
 		metrics.RecordApply(ctx, plan.Repository, plan.Database, plan.Deployment, req.Environment, "error")
@@ -1941,18 +2046,24 @@ func (s *Service) createStoredApply(
 	// tell it changed that member alone and not the whole rollout.
 	applyOpts.NarrowedTo = narrowedTo
 
+	// Attribute the apply to the authenticated caller when the request carried a
+	// real identity (API auth enabled); see resolveCaller.
+	caller := resolveCaller(ctx, req.Caller)
+
 	var lockID int64
 	lock, err := s.storage.Locks().Get(ctx, plan.Database, plan.DatabaseType)
 	if err != nil {
-		return nil, 0, fmt.Errorf("lookup lock for %s/%s: %w", plan.Database, plan.DatabaseType, err)
+		return nil, 0, &applyStorageError{
+			Operation:       fmt.Sprintf("lookup lock for %s/%s", plan.Database, plan.DatabaseType),
+			Plan:            plan,
+			ApplyIdentifier: applyIdentifier,
+			Caller:          caller,
+			Err:             err,
+		}
 	}
 	if lock != nil {
 		lockID = lock.ID
 	}
-
-	// Attribute the apply to the authenticated caller when the request carried a
-	// real identity (API auth enabled); see resolveCaller.
-	caller := resolveCaller(ctx, req.Caller)
 
 	apply := &storage.Apply{
 		ApplyIdentifier:       applyIdentifier,
@@ -1980,6 +2091,13 @@ func (s *Service) createStoredApply(
 	onFailure := s.config.OnFailure(plan.Database, req.Environment)
 	members, err := s.resolveApplyMembers(ctx, plan, req.Environment, targets)
 	if err != nil {
+		// The member-plan lookup reports its storage failure without the apply
+		// it was queueing or who asked for it; name both here, where they are
+		// known, so the failure log can be matched to the attempt.
+		if storageErr, ok := errors.AsType[*applyStorageError](err); ok && storageErr.ApplyIdentifier == "" {
+			storageErr.ApplyIdentifier = applyIdentifier
+			storageErr.Caller = caller
+		}
 		return nil, 0, err
 	}
 	// Admission is per member, because the plan a member runs is the plan it was
@@ -2046,7 +2164,16 @@ func (s *Service) createStoredApply(
 
 	storedApplyID, err := s.storage.Applies().CreateWithGroupedOperations(ctx, apply, groups)
 	if err != nil {
-		return nil, 0, fmt.Errorf("store apply and tasks: %w", err)
+		if isApplyCreationStorageRefusal(err) {
+			return nil, 0, fmt.Errorf("store apply and tasks: %w", err)
+		}
+		return nil, 0, &applyStorageError{
+			Operation:       "store apply and tasks",
+			Plan:            plan,
+			ApplyIdentifier: applyIdentifier,
+			Caller:          caller,
+			Err:             err,
+		}
 	}
 	apply.ID = storedApplyID
 
@@ -3173,6 +3300,7 @@ func buildApplyTask(
 		ExecutionMode:  ddlChange.ExecutionMode,
 		ModeReason:     ddlChange.ModeReason,
 		EstimatedBytes: ddlChange.TaskEstimatedBytes(shard),
+		EstimatedRows:  ddlChange.TaskEstimatedRows(shard),
 		CreatedAt:      now,
 		UpdatedAt:      now,
 	}
@@ -3189,17 +3317,6 @@ func (s *Service) ExecuteRollbackPlanForApply(ctx context.Context, apply *storag
 	if !state.IsState(apply.State, state.Apply.Completed) {
 		return nil, controlConflictf("apply %s is in state %q; only completed applies can be rolled back", apply.ApplyIdentifier, apply.State)
 	}
-	// A rollback plan is applied to the whole rollout, and a narrowed apply
-	// changed one member. Reverting it everywhere would run the reversal on
-	// members that never received the change, so it is refused until rollback
-	// can be narrowed the same way.
-	if member := apply.GetOptions().NarrowedTo; member != "" {
-		s.logger.Warn("rollback refused for an apply narrowed to one rollout member",
-			append(apply.LogAttrs(), "narrowed_to", member)...)
-		return nil, controlConflictf("apply %s ran on rollout member %s only; rollback of a narrowed apply is not supported, so restore that target by planning and applying the previous schema with target %s",
-			apply.ApplyIdentifier, member, member)
-	}
-
 	plan, err := s.storage.Plans().GetByID(ctx, apply.PlanID)
 	if err != nil {
 		return nil, fmt.Errorf("get rollback source plan: %w", err)
@@ -3224,10 +3341,7 @@ func (s *Service) ExecuteRollbackPlanForApply(ctx context.Context, apply *storag
 	if plan.Target == "" {
 		return nil, terminalControlf("plan %s is missing server-side routing metadata field %q; create a new plan and retry rollback", plan.PlanIdentifier, "target")
 	}
-	if err := s.refuseRollbackOfIndependentRollout(ctx, plan, apply, routing.ExecutionTarget{Deployment: deployment, Target: plan.Target}); err != nil {
-		return nil, err
-	}
-	if err := s.refuseRollbackAfterPrimaryMoved(apply, routing.ExecutionTarget{Deployment: deployment, Target: plan.Target}); err != nil {
+	if err := s.refuseMultiTargetRollback(ctx, apply, routing.ExecutionTarget{Deployment: deployment, Target: plan.Target}); err != nil {
 		return nil, err
 	}
 	// Client resolution is a config lookup: a deployment that cannot resolve a
@@ -3311,91 +3425,136 @@ func (s *Service) ExecuteRollbackPlanForApply(ctx context.Context, apply *storag
 	return planResponseFromProto(resp), nil
 }
 
-// refuseRollbackOfIndependentRollout refuses a rollback of an apply across a
-// rollout whose members are each planned against their own schema.
+// refuseMultiTargetRollback refuses a rollback of an apply in an environment
+// with more than one target. Rollback is not currently supported across multiple
+// targets: a rollback is one plan, made against the target the apply ran its
+// plan from (RV-9), and a rollout of several targets either runs each from a
+// plan of its own or reaches targets that plan was never made against. The
+// remedy that does undo the apply on every target is an apply of schema files
+// without the change, which plans each target against its own live schema.
 //
-// A rollback is one plan, made against the rollout primary, and such a
-// rollout runs no member from another member's plan (RV-9): apply creation
-// pairs each member with a plan stored for it, and a rollback stores none. The
-// rollback is refused here, before a plan is made, with the remedy that does
-// restore each member: an apply narrowed to it of the previous schema.
-//
-// The apply's own review round decides, not the configuration as it reads now.
-// A round that planned its members on their own stored a plan for each, bound
-// to the source plan, and the apply ran each member from its own plan however
-// the environment has been respelled since: as mirrored deployments, or with
-// fewer targets. A round that cannot be read refuses the rollback, since it is
-// the only record of how the apply ran. A round that stored no member plan ran
-// one plan on every member, and the configuration is still read for the one
-// case that rollback cannot reach either: an environment respelled since as
-// targets planned on their own, whose apply creation would find no plan for
-// any member but the primary.
-func (s *Service) refuseRollbackOfIndependentRollout(ctx context.Context, plan *storage.Plan, apply *storage.Apply, applyPrimary routing.ExecutionTarget) error {
-	memberPlans, err := s.MemberPlansForReviewRound(ctx, plan, apply.Environment)
+// Three records can each show more than one target, and any of them refuses:
+// the operations the apply ran (the targets it actually reached), a narrowing
+// to one member (which only a rollout of several has), and the environment's
+// routing now (the targets a rollback apply would reach). Operations that
+// cannot be read refuse the rollback, since they are the only record of where
+// the apply ran. Routing that cannot be resolved is left to apply creation
+// when the apply ran on one target, as it is for any other single-target
+// rollback.
+func (s *Service) refuseMultiTargetRollback(ctx context.Context, apply *storage.Apply, applyPrimary routing.ExecutionTarget) error {
+	ranOn, err := s.targetsApplyRanOn(ctx, apply, applyPrimary)
 	if err != nil {
-		s.logger.Error("rollback refused: the source plan's review round could not be read to tell whether its targets were each planned against their own schema",
-			append(apply.LogAttrs(), "plan_id", plan.PlanIdentifier, "error", err)...)
-		return fmt.Errorf("rollback of apply %s: read the review round of its plan %s: %w", apply.ApplyIdentifier, plan.PlanIdentifier, err)
+		s.logger.Error("rollback refused: the apply's operations could not be read to tell which targets it ran on",
+			append(apply.LogAttrs(), "error", err)...)
+		return fmt.Errorf("rollback of apply %s: %w", apply.ApplyIdentifier, err)
 	}
-	if len(memberPlans) > 0 {
-		targets := len(memberPlans) + 1
-		s.logger.Warn("rollback refused: the apply ran each of the rollout's targets from a plan of its own, and a rollback has one plan",
-			append(apply.LogAttrs(), "plan_id", plan.PlanIdentifier, "targets", targets)...)
-		return controlConflictf("apply %s ran across the %d targets of %s/%s, which were each planned against their own schema, and a rollback is one plan made against %s; rollback of such a rollout is not supported, so restore each target by planning and applying the previous schema with its target",
-			apply.ApplyIdentifier, targets, apply.Database, apply.Environment, applyPrimary.MemberID())
-	}
+	narrowedTo := apply.GetOptions().NarrowedTo
 
+	unsupported := &RolloutRollbackUnsupportedError{ApplyID: apply.ApplyIdentifier, RanOn: len(ranOn)}
 	members, err := s.config.ResolveDatabaseTargets(apply.Database, apply.Environment)
 	if err != nil {
-		s.logger.Debug("rollback member planning check skipped: the apply's round planned no target on its own, and config did not resolve the rollout members; apply creation pairs each member with its own plan",
+		if len(ranOn) <= 1 && narrowedTo == "" {
+			s.logger.Debug("rollback target check skipped: the apply ran on one target, and config did not resolve the environment's targets; apply creation holds the plan to its stored target",
+				append(apply.LogAttrs(), "error", err)...)
+			return nil
+		}
+		s.logger.Warn("rollback refusal cannot compare the apply's targets with the current routing: config did not resolve the environment's targets",
 			append(apply.LogAttrs(), "error", err)...)
+	} else {
+		unsupported.Targets = len(members)
+		unsupported.RoutingChecked = true
+		routed := make(map[string]bool, len(members))
+		for _, member := range members {
+			routed[member.MemberID()] = true
+		}
+		for _, memberID := range ranOn {
+			if !routed[memberID] {
+				unsupported.Unrouted = append(unsupported.Unrouted, memberID)
+			}
+		}
+	}
+
+	if len(ranOn) <= 1 && narrowedTo == "" && unsupported.Targets <= 1 {
 		return nil
 	}
-	if len(members) <= 1 {
-		return nil
-	}
-	planning, err := s.config.MemberPlanningFor(apply.Database, apply.Environment)
-	if err != nil {
-		s.logger.Debug("rollback member planning check skipped: the apply's round planned no target on its own, and config did not resolve member planning; apply creation pairs each member with its own plan",
-			append(apply.LogAttrs(), "error", err)...)
-		return nil
-	}
-	if planning != PlanIndependent {
-		return nil
-	}
-	s.logger.Warn("rollback refused: the rollout's targets are now each planned against their own schema, and a rollback has one plan",
-		append(apply.LogAttrs(), "plan_id", plan.PlanIdentifier, "members", len(members))...)
-	return controlConflictf("apply %s ran one plan across %s/%s, whose %d targets are now each planned against their own schema, and a rollback is one plan made against %s; rollback of such a rollout is not supported, so restore each target by planning and applying the previous schema with its target",
-		apply.ApplyIdentifier, apply.Database, apply.Environment, len(members), applyPrimary.MemberID())
+	s.logger.Warn("rollback refused: rollback is not supported for an apply in an environment with multiple targets",
+		append(apply.LogAttrs(), "ran_on", ranOn, "narrowed_to", narrowedTo, "environment_targets", unsupported.Targets, "unrouted", unsupported.Unrouted)...)
+	unsupported.reason = multiTargetRollbackReason(apply)
+	return rolloutRollbackConflict(unsupported)
 }
 
-// refuseRollbackAfterPrimaryMoved refuses a rollback of a rollout-wide apply
-// whose rollout primary is no longer the environment's first member.
-//
-// A rollback plan is made against the member the forward apply ran its plan
-// from, and a rollout-wide apply runs only from the current primary's plan
-// (RV-9). Once a reorder moves another member to the front, the
-// rollback plan can no longer be applied to the rollout, and applying it to its
-// own member alone would revert that member and leave the others on the
-// forward schema. The rollback is refused here, before a plan is made, with
-// the one remedy that reverts every member: restore the rollout order the
-// apply ran under. A configuration that cannot resolve the environment is left to apply
-// creation, which then runs the plan on its stored member only when the
-// rollout has no other.
-func (s *Service) refuseRollbackAfterPrimaryMoved(apply *storage.Apply, applyPrimary routing.ExecutionTarget) error {
-	members, err := s.config.ResolveDatabaseTargets(apply.Database, apply.Environment)
+// targetsApplyRanOn lists the targets an apply's operations ran on, as sorted
+// rollout member IDs. A sharded target runs several operations and counts
+// once, and a group finalizer runs no target's work of its own. An apply with
+// no operation rows ran on the target its plan was made against.
+func (s *Service) targetsApplyRanOn(ctx context.Context, apply *storage.Apply, applyPrimary routing.ExecutionTarget) ([]string, error) {
+	opStore := s.storage.ApplyOperations()
+	if opStore == nil {
+		return nil, fmt.Errorf("apply operations store is not available")
+	}
+	ops, err := opStore.ListByApply(ctx, apply.ID)
 	if err != nil {
-		s.logger.Debug("rollback primary check skipped: config did not resolve the rollout members; apply creation holds the plan to its stored member",
-			append(apply.LogAttrs(), "error", err)...)
-		return nil
+		return nil, fmt.Errorf("list apply_operations for apply %s: %w", apply.ApplyIdentifier, err)
 	}
-	if len(members) <= 1 || (members[0].Deployment == applyPrimary.Deployment && members[0].Target == applyPrimary.Target) {
-		return nil
+	seen := map[string]bool{}
+	var ranOn []string
+	for _, op := range ops {
+		if op.OperationKind == storage.ApplyOperationKindGroupFinalizer {
+			continue
+		}
+		member := routing.ExecutionTarget{Deployment: op.Deployment, Target: op.Target}
+		if member.Target == "" && member.Deployment == applyPrimary.Deployment {
+			member = applyPrimary
+		}
+		if id := member.MemberID(); !seen[id] {
+			seen[id] = true
+			ranOn = append(ranOn, id)
+		}
 	}
-	s.logger.Warn("rollback refused: the rollout primary changed since the apply ran",
-		append(apply.LogAttrs(), "apply_primary", applyPrimary.MemberID(), "rollout_primary", members[0].MemberID())...)
-	return controlConflictf("apply %s ran across the rollout from rollout primary %s, but the rollout primary is now %s; a rollback made against %s cannot be applied to the rollout, and applying it to that target alone would leave the others on the applied schema. Restore the rollout order the apply ran under (deployment_order) so %s is first, then retry the rollback",
-		apply.ApplyIdentifier, applyPrimary.MemberID(), members[0].MemberID(), applyPrimary.MemberID(), applyPrimary.MemberID())
+	if len(ranOn) == 0 {
+		s.logger.Debug("rollback target check: the apply recorded no operations, so it ran on the target its plan was made against",
+			apply.LogAttrs()...)
+		return []string{applyPrimary.MemberID()}, nil
+	}
+	slices.Sort(ranOn)
+	return ranOn, nil
+}
+
+// multiTargetRollbackReason is the refusal's message for callers that pass it
+// on as text, such as the CLI.
+func multiTargetRollbackReason(apply *storage.Apply) string {
+	return fmt.Sprintf("rollback isn't currently supported for schema changes across multiple targets; undo apply %s by applying schema files without the change", apply.ApplyIdentifier)
+}
+
+// RolloutRollbackUnsupportedError is a rollback refused because the apply's
+// environment has more than one target, and rollback is not currently supported for
+// multiple targets. A caller that can name the remedy in its own terms, such
+// as a PR whose schema files can be reverted and applied again, reads it with
+// errors.As instead of passing the message on.
+type RolloutRollbackUnsupportedError struct {
+	// ApplyID is the apply the rollback was asked to reverse.
+	ApplyID string
+	// RanOn is how many targets the apply ran on.
+	RanOn int
+	// Targets is how many targets the environment routes to now; zero when
+	// the routing could not be resolved.
+	Targets int
+	// RoutingChecked is set when the targets the apply ran on were compared
+	// with the ones the environment routes to now; Unrouted lists those it no
+	// longer routes to, which an apply of the previous schema would not reach.
+	RoutingChecked bool
+	Unrouted       []string
+	reason         string
+}
+
+func (e *RolloutRollbackUnsupportedError) Error() string {
+	return e.reason
+}
+
+// rolloutRollbackConflict is the conflict a refused rollout rollback returns,
+// carrying the typed error so a caller can read it with errors.As.
+func rolloutRollbackConflict(unsupported *RolloutRollbackUnsupportedError) error {
+	return &controlOperationHTTPError{status: http.StatusConflict, err: unsupported}
 }
 
 func rollbackSourcePlanMatchesApply(plan *storage.Plan, apply *storage.Apply) bool {

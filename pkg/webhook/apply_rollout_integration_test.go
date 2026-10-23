@@ -1242,7 +1242,9 @@ func TestE2EApplyConfirmRefusesWhenHowTheReviewedTargetsStatementRunsMoves(t *te
 			dbName:     "webhook_rollout_reviewed_newly_blocked",
 			pinnedMode: "direct",
 			confirmVia: func(t *testing.T, svc *api.Service, dbName string) *api.Service {
-				return rolloutServiceOver(t, svc, dbName, "eu", "us")
+				switchedOff := rolloutServiceOver(t, svc, dbName, "eu", "us")
+				switchedOff.Config().DirectExecution = &api.DirectExecutionConfig{Enabled: false}
+				return switchedOff
 			},
 		},
 	} {
@@ -1615,9 +1617,10 @@ func awaitApplyLockReleased(t *testing.T, svc *api.Service, dbName, msg string) 
 // apply command posts us's `ADD COLUMN` and runs it in the same step. Between
 // that comment and the re-plan the apply runs from, eu's primary key is
 // reshaped out of band, so bringing eu back to the PR's schema now means
-// dropping a primary key, which the engine refuses. No confirmation could run
-// that plan, so the apply rejects it outright and releases its lock instead of
-// asking for an apply-confirm that would only be rejected in turn.
+// dropping a primary key, which the engine refuses and the server's opted-out
+// policy leaves blocked. No confirmation could run that plan, so the apply
+// rejects it outright and releases its lock instead of asking for an
+// apply-confirm that would only be rejected in turn.
 func TestE2EApplyRejectsAPrimaryPlanTheEngineBlocksWhileStarting(t *testing.T) {
 	dbName := "webhook_rollout_primary_blocked_auto"
 	var hooked *afterLockStorage
@@ -1628,6 +1631,7 @@ func TestE2EApplyRejectsAPrimaryPlanTheEngineBlocksWhileStarting(t *testing.T) {
 		hooked = &afterLockStorage{Storage: st}
 		return hooked
 	})
+	svc.Config().DirectExecution = &api.DirectExecutionConfig{Enabled: false}
 	t.Cleanup(func() {
 		_ = svc.Storage().Locks().ForceRelease(context.WithoutCancel(t.Context()), dbName, "mysql")
 	})

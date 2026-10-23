@@ -55,11 +55,15 @@ func TestGroupFilesByNamespace_BraceEnvironment(t *testing.T) {
 		{Path: "schema/orders_{env}/users.sql", Name: "users.sql", Content: "CREATE TABLE users (id bigint);"},
 		{Path: "schema/fixtures_{env}/widgets.sql", Name: "widgets.sql", Content: "CREATE TABLE widgets (id bigint);"},
 	}
-	grouped, ignored, err := groupFilesByNamespace(files, "schema", "staging", []string{"fixtures_{env}"})
-	require.NoError(t, err)
-	assert.Contains(t, grouped, "orders_staging")
-	assert.NotContains(t, grouped, "fixtures_staging")
-	assert.Equal(t, []string{"fixtures_staging"}, ignored)
+	for _, env := range []string{"staging", "sandbox", "production"} {
+		t.Run(env, func(t *testing.T) {
+			grouped, ignored, err := groupFilesByNamespace(files, "schema", env, []string{"fixtures_{env}"})
+			require.NoError(t, err)
+			require.Len(t, grouped, 1)
+			assert.Contains(t, grouped, "orders_"+env)
+			assert.Equal(t, []string{"fixtures_" + env}, ignored)
+		})
+	}
 }
 
 // TestVacatedSchemaFilesReportsDeletionsOfTheVacatedPath pins the shape the

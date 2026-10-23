@@ -74,7 +74,63 @@ func TestPostgresStorageParity(t *testing.T) {
 			return NewPostgres(h.db)
 		}, postgresLockWaiter(h.db))
 	})
+	t.Run("StoppedApplyStartRacingItsTakeover", func(t *testing.T) {
+		testStoppedApplyStartRacingItsTakeover(t, func(t *testing.T) *Storage {
+			t.Helper()
+			clearPostgresTables(t, h.db)
+			return NewPostgres(h.db)
+		}, postgresLockWaiter(h.db), postgresAdvisoryLockWaiter(h.db))
+	})
 	t.Run("NonUTCWriterTimesStoreTheirInstant", func(t *testing.T) { testPostgresNonUTCWriterTimesStoreTheirInstant(t, h) })
+	t.Run("FindTerminalWithInProgressCheck", func(t *testing.T) { testPostgresFindTerminalWithInProgressCheck(t, h) })
+}
+
+// testPostgresFindTerminalWithInProgressCheck verifies the stranded-check query
+// runs on Postgres: a failed apply whose stored check state is still in
+// progress is returned, and one whose check completed is not.
+func testPostgresFindTerminalWithInProgressCheck(t *testing.T, h postgresHarness) {
+	store := h.NewStorage(t)
+	ctx := t.Context()
+
+	seed := func(name, checkStatus string, planID int64) *storage.Apply {
+		lock := storagetest.CreateLock(t, store, name+"_db", storage.DatabaseTypeMySQL)
+		apply := &storage.Apply{
+			ApplyIdentifier: name,
+			LockID:          lock.ID,
+			PlanID:          planID,
+			Database:        lock.DatabaseName,
+			DatabaseType:    lock.DatabaseType,
+			Repository:      lock.Repository,
+			PullRequest:     lock.PullRequest,
+			Environment:     "staging",
+			Caller:          "org/repo#123",
+			InstallationID:  12345,
+			Engine:          storage.EngineSpirit,
+			State:           state.Apply.Failed,
+		}
+		applyID, err := store.Applies().Create(ctx, apply)
+		require.NoError(t, err)
+		apply.ID = applyID
+		require.NoError(t, store.Checks().Upsert(ctx, &storage.Check{
+			Repository:   apply.Repository,
+			PullRequest:  apply.PullRequest,
+			HeadSHA:      "abc123",
+			Environment:  apply.Environment,
+			DatabaseType: apply.DatabaseType,
+			DatabaseName: apply.Database,
+			ApplyID:      apply.ID,
+			HasChanges:   true,
+			Status:       checkStatus,
+		}))
+		return apply
+	}
+	stranded := seed("apply_pg_check_stranded", checkStatusInProgress, 740)
+	seed("apply_pg_check_completed", "completed", 741)
+
+	applies, err := store.Applies().FindTerminalWithInProgressCheck(ctx, 10)
+	require.NoError(t, err)
+	require.Len(t, applies, 1)
+	assert.Equal(t, stranded.ApplyIdentifier, applies[0].ApplyIdentifier)
 }
 
 // testPostgresNonUTCWriterTimesStoreTheirInstant verifies that a driver running
@@ -82,15 +138,14 @@ func TestPostgresStorageParity(t *testing.T) {
 // started_at and completed_at from its own clock, so the values carry its
 // location; every datetime column is a plain timestamp, which keeps only a
 // wall-clock reading. The stored reading must be the UTC one: the apply reads
-// back at the instant it finished, and a GitHub-backed apply that finished
-// moments ago with no summary comment is still inside the now()-relative
-// reconciliation window, so its terminal summary is posted after a restart.
+// back at the instant it finished, which is what every now()-relative window
+// over it, such as summary reconciliation's, is measured against.
 func testPostgresNonUTCWriterTimesStoreTheirInstant(t *testing.T, h postgresHarness) {
 	store := h.NewStorage(t)
 	ctx := t.Context()
 
 	// West of UTC, so a local wall-clock reading taken for UTC lands hours in
-	// the past, outside the reconciliation window.
+	// the past.
 	driverZone := time.FixedZone("UTC-5", -5*60*60)
 	completedAt := time.Now().In(driverZone).Truncate(time.Microsecond)
 	startedAt := completedAt.Add(-time.Minute)
@@ -130,10 +185,17 @@ func testPostgresNonUTCWriterTimesStoreTheirInstant(t *testing.T, h postgresHarn
 	assert.Equal(t, startedAt.UTC(), *stored.StartedAt, "started_at reads back as the instant the driver wrote, in UTC")
 	assert.Equal(t, completedAt.UTC(), *stored.CompletedAt, "completed_at reads back as the instant the driver wrote, in UTC")
 
-	missing, err := store.Applies().FindMissingSummaryComment(ctx)
+	missing, err := store.Applies().FindMissingSummaryComment(ctx, 0, 100)
 	require.NoError(t, err)
 	require.Len(t, missing, 1, "an apply that finished moments ago with no summary is inside the reconciliation window")
 	assert.Equal(t, apply.ApplyIdentifier, missing[0].ApplyIdentifier)
+
+	// A completed_at stored at the driver's local wall clock would read hours
+	// old and clear the settle floor; stored at its instant, the apply finished
+	// moments ago and is still its live publisher's.
+	unsettled, err := store.Applies().FindMissingSummaryComment(ctx, storage.SummaryClaimStaleAfter, 100)
+	require.NoError(t, err)
+	assert.Empty(t, unsettled, "an apply that finished moments ago has not settled")
 }
 
 // reopenRaceDeadline bounds each wait in the snapshot race: the update reaching
@@ -1087,6 +1149,53 @@ func TestPostgresApplyOperationLeaseGuards(t *testing.T) {
 	})
 }
 
+// ListRecentTargets bounds a data plane's view of the targets it applied to by
+// when each apply was last written on PostgreSQL too: the cutoff is rendered
+// SQL, so it is exercised on each dialect. A target whose applies were all
+// last written before the lookback drops out, while one with any apply written
+// inside the window stays, including one created before the window that
+// settled inside it.
+func TestPostgresListRecentTargetsWindow(t *testing.T) {
+	dsn, fixtureDB := testutil.StartPostgres(t, "sqlstore_recent_targets_window")
+	db, err := postgresconn.Open(dsn)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	require.NoError(t, db.PingContext(t.Context()))
+	applyPostgresTestSchema(t, fixtureDB)
+	clearPostgresTables(t, db)
+
+	ctx := t.Context()
+	store := NewPostgres(db)
+	lock := storagetest.CreateLock(t, store, "orders", storage.DatabaseTypeVitess)
+	seed := func(t *testing.T, applyID string, planID int64, target string, created, updated time.Duration) {
+		t.Helper()
+		apply := storagetest.CreateApplyWithStateAndEnv(t, store, lock, applyID, planID, state.Apply.Completed, "staging")
+		_, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+			ApplyID: apply.ID, Deployment: "region-a", Target: target,
+		})
+		require.NoError(t, err)
+		_, err = db.ExecContext(ctx,
+			fmt.Sprintf(`UPDATE applies SET created_at = CURRENT_TIMESTAMP - INTERVAL '%d seconds', updated_at = CURRENT_TIMESTAMP - INTERVAL '%d seconds' WHERE id = $1`,
+				int(created.Seconds()), int(updated.Seconds())),
+			apply.ID)
+		require.NoError(t, err)
+	}
+	day := 24 * time.Hour
+	seed(t, "apply_stale_only", 9101, "orders-stale", 40*day, 40*day)
+	seed(t, "apply_recent_old", 9102, "orders-recent", 40*day, 40*day)
+	seed(t, "apply_recent_new", 9103, "orders-recent", 2*day, 2*day)
+	// Created before the window but settled inside it: a branch its drive
+	// failed to delete at settlement must stay reachable for the window.
+	seed(t, "apply_settled_late", 9104, "orders-settled-late", 40*day, 1*day)
+
+	targets, err := store.ApplyOperations().ListRecentTargets(ctx, storage.DatabaseTypeVitess, 30*24*time.Hour)
+	require.NoError(t, err)
+	assert.Equal(t, []storage.AppliedTarget{
+		{Database: "orders", Environment: "staging", Target: "orders-recent"},
+		{Database: "orders", Environment: "staging", Target: "orders-settled-late"},
+	}, targets)
+}
+
 func applyPostgresTestSchema(t *testing.T, db *sql.DB) {
 	t.Helper()
 	entries, err := schema.PostgresFS.ReadDir("postgres")
@@ -1248,6 +1357,60 @@ func TestPostgresReapStrandedRetryableDefersToTheOperationLease(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, reaped, 1, "a lease a peer could reclaim no longer speaks for the row")
 	assert.Equal(t, state.Task.Failed, taskState(t))
+}
+
+// The stranded control-request listing renders the same parent and lease
+// gates, keyed on the request's apply rather than on a task's operation, so
+// PostgreSQL has to execute that rendering too. A pending start on a
+// long-settled apply is the reaper's only once no driver holds an operation of
+// that apply.
+func TestPostgresListStrandedPendingDefersToAFreshOperationLease(t *testing.T) {
+	dsn, fixtureDB := testutil.StartPostgres(t, "sqlstore_stranded_control")
+	db, err := postgresconn.Open(dsn)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	require.NoError(t, db.PingContext(t.Context()))
+	applyPostgresTestSchema(t, fixtureDB)
+
+	h := postgresHarness{db: db, dsn: dsn}
+	store := h.NewStorage(t)
+
+	var applyID int64
+	require.NoError(t, db.QueryRowContext(t.Context(), `
+		INSERT INTO applies (apply_identifier, lock_id, plan_id, database_name, database_type,
+			repository, pull_request, environment, engine, state, options, error_message, updated_at)
+		VALUES ('apply-stranded-control', 1, 1, 'testdb', 'mysql', 'org/repo', 7, 'staging', 'spirit', $1, '{}',
+			'', NOW() - make_interval(secs => $2))
+		RETURNING id`, state.Apply.Completed,
+		int64((strandedParentQuiescence+time.Minute).Seconds())).Scan(&applyID))
+
+	// The operation a sibling driver is holding, heartbeated as of now.
+	var opID int64
+	require.NoError(t, db.QueryRowContext(t.Context(), `
+		INSERT INTO apply_operations (apply_id, deployment, operation_key, state, lease_owner, lease_token)
+		VALUES ($1, 'region-a', 'op-1', $2, 'driver', 'op-token')
+		RETURNING id`, applyID, state.ApplyOperation.Running).Scan(&opID))
+
+	_, alreadyPending, err := store.ControlRequests().RequestPending(t.Context(), &storage.ApplyControlRequest{
+		ApplyID: applyID, Operation: storage.ControlOperationStart, RequestedBy: "operator",
+	})
+	require.NoError(t, err)
+	require.False(t, alreadyPending)
+
+	listed, err := store.ControlRequests().ListStrandedPending(t.Context(), 10)
+	require.NoError(t, err)
+	assert.Empty(t, listed, "a driver holds an operation of the apply, so the request is that drive's to answer")
+
+	_, err = db.ExecContext(t.Context(),
+		`UPDATE apply_operations SET updated_at = NOW() - make_interval(secs => $1) WHERE id = $2`,
+		int64((storage.ApplyLeaseStaleAfter + time.Minute).Seconds()), opID)
+	require.NoError(t, err)
+
+	listed, err = store.ControlRequests().ListStrandedPending(t.Context(), 10)
+	require.NoError(t, err)
+	require.Len(t, listed, 1, "a lease a peer could reclaim no longer speaks for the apply")
+	assert.Equal(t, storage.ControlOperationStart, listed[0].Request.Operation)
+	assert.Equal(t, "apply-stranded-control", listed[0].Apply.ApplyIdentifier)
 }
 
 // Recovering a crashed retry admits one driver per staleness window on

@@ -249,7 +249,7 @@ type LocalClient struct {
 	// or executeGroupedApply. Set when an apply starts, called by Stop().
 	// Protected by cancelMu since Apply and Stop run on different goroutines.
 	cancelMu              sync.Mutex
-	cancelApply           context.CancelFunc
+	cancelApply           context.CancelCauseFunc
 	cancelApplyGeneration uint64
 
 	// observers holds per-apply progress observers. The progress poller notifies
@@ -264,11 +264,22 @@ type LocalClient struct {
 	// observer in the registry.
 	// Protected by observerMu.
 	pendingObserver ProgressObserver
+
+	// observerPollCtx bounds every multi-operation observer poller this client
+	// starts; Close cancels it. Created with the first poller.
+	// Protected by observerMu.
+	observerPollCtx    context.Context
+	observerPollCancel context.CancelFunc
+
+	// observerPollIntervalOverride, when positive, replaces
+	// defaultObserverPollInterval. Tests lower it to observe notifications
+	// without waiting out the production cadence.
+	observerPollIntervalOverride time.Duration
 }
 
 type applyCancelHandle struct {
 	generation uint64
-	cancel     context.CancelFunc
+	cancel     context.CancelCauseFunc
 }
 
 // Compile-time check that LocalClient implements Client.
@@ -448,7 +459,12 @@ func engineNameToProto(name string) (ternv1.Engine, error) {
 
 // Close closes the client and releases resources.
 func (c *LocalClient) Close() error {
-	// LocalClient doesn't own storage, so nothing to close
+	// LocalClient doesn't own storage; it only stops its observer pollers.
+	c.observerMu.Lock()
+	defer c.observerMu.Unlock()
+	if c.observerPollCancel != nil {
+		c.observerPollCancel()
+	}
 	return nil
 }
 
@@ -1188,12 +1204,16 @@ type planetScalePullTarget struct {
 	branch   string
 }
 
+// errPlanetScaleClientNotConfigured is wrapped when a client has no
+// PlanetScale API client to reach its database with.
+var errPlanetScaleClientNotConfigured = errors.New("PlanetScale client is not configured")
+
 func (c *LocalClient) planetScalePullClient() (*planetScalePullTarget, error) {
 	if c.psClientFunc == nil {
 		// A vitess database supports pull; a missing PlanetScale client is a
 		// configuration defect, surfaced as an internal error rather than the
 		// unsupported-type sentinel so it cannot read as "pull not supported".
-		return nil, fmt.Errorf("PlanetScale client is not configured for database %s", c.config.Database)
+		return nil, fmt.Errorf("%w for database %s", errPlanetScaleClientNotConfigured, c.config.Database)
 	}
 	org := c.config.Metadata["organization"]
 	if org == "" {
@@ -1645,6 +1665,32 @@ func (c *LocalClient) Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv
 		ExistingCopies: c.protoExistingCopies(result, c.runningCopiesForPlan(ctx, result, req.Environment, localPlanTarget(req, c.config.Database))),
 		ExemptTables:   protoExemptTables(result.ExemptTables),
 	}, nil
+}
+
+// CompareSchemaFileChange delegates a schema file comparison to the engine's
+// SchemaFileChangeComparer capability, and fails closed with
+// ErrCompareSchemaFileChangeUnsupported when the engine has none.
+func (c *LocalClient) CompareSchemaFileChange(ctx context.Context, req *ternv1.CompareSchemaFileChangeRequest) (*ternv1.CompareSchemaFileChangeResponse, error) {
+	if req == nil {
+		return nil, fmt.Errorf("schema file comparison request is required")
+	}
+	if req.Type != "" && req.Type != c.config.Type {
+		return nil, fmt.Errorf("compare schema file for database %s: request type %q does not match client type %q", c.config.Database, req.Type, c.config.Type)
+	}
+	comparer, ok := c.getEngine().(SchemaFileChangeComparer)
+	if !ok {
+		return nil, fmt.Errorf("compare schema file for database %s type %s: %w", c.config.Database, c.config.Type, ErrCompareSchemaFileChangeUnsupported)
+	}
+	resp, err := comparer.CompareSchemaFileChange(ctx, req)
+	if err != nil {
+		return nil, fmt.Errorf("compare schema file for database %s: %w", c.config.Database, err)
+	}
+	c.logger.Info("LocalClient.CompareSchemaFileChange: compared schema file",
+		"database", c.config.Database,
+		"type", c.config.Type,
+		"same", resp.GetSame(),
+		"reason", resp.GetReason())
+	return resp, nil
 }
 
 // PlanDiff computes this deployment's desired-vs-live diff without persisting a
@@ -2174,14 +2220,33 @@ func (c *LocalClient) planForApplyRequest(ctx context.Context, req *ternv1.Apply
 	if !applyRequestCarriesPlanPayload(req) {
 		return nil, nil
 	}
-	// A table step's dispatch carries one table of its target's plan, so a plan
-	// built from it would hold that table alone and the next step's table
-	// would have nothing to run against. Apply creation refuses a multi-target
-	// rollout across deployments, so a step's target was planned on this
-	// deployment and its plan is stored here; a step that arrives without one
-	// is refused rather than materialized short.
+	// A table step's ddl_changes name one table of its target's plan, so a plan
+	// built from them would hold that table alone and the target's later steps
+	// would have nothing to run against. A member other than the primary is
+	// planned without this deployment storing its plan, so its first step to
+	// arrive builds the plan from the whole plan the dispatch carries beside
+	// the step: verified against this target's live schema like any other
+	// materialized plan, and stored under the member's plan ID, where every
+	// later step finds it. The step's table is then run from that stored plan.
 	if step, ok := req.GetOptions()[dispatchRolloutStepOption]; ok {
-		return nil, fmt.Errorf("dispatch for rollout step %s has no plan %s stored on this deployment; a step carries one table of its target's plan, so refusing to build the plan from it", step, req.PlanId)
+		if len(req.GetPlanDdlChanges()) == 0 {
+			// Every control plane that dispatches table steps stamps the whole
+			// plan on each attempt, so only one older than that sends a step
+			// without it. The refusal stays retryable: once the control plane
+			// is upgraded, its next attempt carries the plan and the step runs,
+			// whichever plane was upgraded first.
+			return nil, fmt.Errorf("dispatch for rollout step %s has no plan %s stored on this deployment and carries no plan to build it from; refusing to build the plan from one step's table", step, req.PlanId)
+		}
+		c.logger.Info("Apply: building a rollout member's plan from its table step's dispatch",
+			"plan_id", req.PlanId,
+			"database", c.config.Database,
+			"target", req.Target,
+			"rollout_step", step,
+			"plan_change_count", len(req.GetPlanDdlChanges()),
+		)
+		whole := proto.Clone(req).(*ternv1.ApplyRequest)
+		whole.DdlChanges = req.GetPlanDdlChanges()
+		return c.materializeApplyRequestPlan(ctx, whole)
 	}
 	return c.materializeApplyRequestPlan(ctx, req)
 }
@@ -2546,8 +2611,9 @@ func rejectUnsafeVSchemaChangesWithoutOptIn(plan *storage.Plan, applyOpts storag
 // existingIdempotentApply returns the apply previously created for
 // req.IdempotencyKey, or nil when the key is empty or unseen. The match is
 // returned regardless of the existing apply's state: the key encodes the
-// dispatch generation (apply id + attempt + operation), so "same key" means
-// "same generation", and a deliberate retry rotates the key via apply.Attempt.
+// dispatch generation, so "same key" means "same generation". A whole-apply
+// retry rotates the key via apply.Attempt; an operation-scoped dispatch keeps
+// its deployment's key across retries, since a deployment has one apply.
 // A stored apply whose environment, database, or type disagrees with the request
 // signals an accidental key reuse or a control-plane bug, which is surfaced as
 // an error rather than silently aliased.
@@ -2863,6 +2929,7 @@ func buildDispatchTasks(plan *storage.Plan, scope dispatchScope, environment, en
 			ExecutionMode:  ddlChange.ExecutionMode,
 			ModeReason:     ddlChange.ModeReason,
 			EstimatedBytes: ddlChange.TaskEstimatedBytes(scope.shard),
+			EstimatedRows:  ddlChange.TaskEstimatedRows(scope.shard),
 			CreatedAt:      now,
 			UpdatedAt:      now,
 		}
@@ -3047,6 +3114,35 @@ func (c *LocalClient) attachDispatchOperation(ctx context.Context, req *ternv1.A
 		return nil, fmt.Errorf("no engine configured for type: %s", c.config.Type)
 	}
 
+	// The plan row was drift-checked against the creating dispatch's shard at
+	// most, so a sibling shard is checked against its own live schema before
+	// its work is admitted, and runs this shard's rendering of the change.
+	// This runs before the blocked and unsafe-change gates so they judge the
+	// verdicts this shard's re-plan set.
+	if scope.shard != "" {
+		if err := c.verifyAttachedShardDispatch(ctx, req, apply, operationKey, &scope); err != nil {
+			return c.replayConcurrentAttachOrFail(ctx, req, apply, operationKey,
+				fmt.Errorf("attach operation %s to apply %s: %w", operationKey, apply.ApplyIdentifier, err))
+		}
+	}
+
+	// The plan row's blocked verdict was judged before this attach, but a
+	// shard's re-plan can block a change the plan row did not. No opt-in makes
+	// a statement the engine refuses executable, so the scope is refused
+	// before any operation or task row exists.
+	if err := storage.BlockedChangeError(plan.PlanIdentifier, scope.ddlChanges); err != nil {
+		c.logger.Warn("Apply: refusing operation whose re-planned scope holds a blocked change; dispatch is rejected",
+			append(apply.LogAttrs(),
+				"operation_key", operationKey,
+				"idempotency_key", req.IdempotencyKey,
+				"shard", scope.shard,
+				"error", err)...)
+		return &ternv1.ApplyResponse{
+			Accepted:     false,
+			ErrorMessage: err.Error(),
+		}, nil
+	}
+
 	applyOpts := storage.ApplyOptionsFromMap(req.Options)
 	applyOpts.Target = plan.Target
 	applyOpts.DirectExecution = DirectExecutionPolicyFromProto(req.GetDirectExecution())
@@ -3095,12 +3191,7 @@ func (c *LocalClient) attachDispatchOperation(ctx context.Context, req *ternv1.A
 		if winner == nil {
 			return nil, fmt.Errorf("operation %s of apply %s exists per the unique index but was not found on re-read", operationKey, apply.ApplyIdentifier)
 		}
-		c.logger.Info("Apply: concurrent attach won the operation insert; replaying the winner's row",
-			append(apply.LogAttrs(),
-				"operation_key", operationKey,
-				"idempotency_key", req.IdempotencyKey)...)
-		metrics.RecordRemoteApplyAttach(ctx, req.Database, req.Environment, "attach_race")
-		return dispatchApplyResponse(apply, winner.ID, operationKey), nil
+		return c.replayConcurrentAttachWinner(ctx, req, apply, winner, operationKey, "operation insert"), nil
 	case errors.Is(err, storage.ErrApplyNotActive):
 		return c.refuseAttachToTerminalApply(ctx, req, apply, operationKey), nil
 	case errors.Is(err, storage.ErrApplyOperationKeyingMismatch):
@@ -3124,6 +3215,43 @@ func (c *LocalClient) attachDispatchOperation(ctx context.Context, req *ternv1.A
 	c.wakeOperatorForQueuedApply(apply)
 
 	return dispatchApplyResponse(apply, operation.ID, operationKey), nil
+}
+
+// replayConcurrentAttachWinner resolves a dispatch that lost a race to a
+// concurrent attach of the same operation to the winner's row, as the replay
+// of an already-seen dispatch does. lostAt names the step where this dispatch
+// found the winner.
+func (c *LocalClient) replayConcurrentAttachWinner(ctx context.Context, req *ternv1.ApplyRequest, apply *storage.Apply, winner *storage.ApplyOperation, operationKey, lostAt string) *ternv1.ApplyResponse {
+	c.logger.Info("Apply: a concurrent attach of this operation won; replaying the winner's row",
+		append(apply.LogAttrs(),
+			"operation_key", operationKey,
+			"idempotency_key", req.IdempotencyKey,
+			"lost_at", lostAt)...)
+	metrics.RecordRemoteApplyAttach(ctx, req.Database, req.Environment, "attach_race")
+	return dispatchApplyResponse(apply, winner.ID, operationKey)
+}
+
+// replayConcurrentAttachOrFail settles a shard dispatch whose drift check
+// failed. A concurrent attach of the same operation can land between this
+// dispatch's operation lookup and its re-plan, and once its DDL has run the
+// re-plan no longer lists the change and reads as drift. The operation is
+// re-read, and when it exists the dispatch replays it; otherwise the
+// verification error stands.
+func (c *LocalClient) replayConcurrentAttachOrFail(ctx context.Context, req *ternv1.ApplyRequest, apply *storage.Apply, operationKey string, verifyErr error) (*ternv1.ApplyResponse, error) {
+	winner, err := c.findApplyOperationByKey(ctx, apply, operationKey)
+	if err != nil {
+		return nil, errors.Join(verifyErr, fmt.Errorf("re-read operation %s after its drift check failed: %w", operationKey, err))
+	}
+	if winner == nil {
+		c.logger.Warn("Apply: refusing shard dispatch whose drift check failed; dispatch is rejected",
+			append(apply.LogAttrs(),
+				"operation_key", operationKey,
+				"idempotency_key", req.IdempotencyKey,
+				"shard", req.GetTargetShards(),
+				"error", verifyErr)...)
+		return nil, verifyErr
+	}
+	return c.replayConcurrentAttachWinner(ctx, req, apply, winner, operationKey, "drift check"), nil
 }
 
 // refuseAttachKeyingMismatch rejects an attach whose key shape disagrees with
@@ -3341,6 +3469,14 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 		UpdatedAt:             now,
 	}
 
+	// The stopped applies whose resting copies this dispatch meets are stamped
+	// with the new apply in the same transaction that creates it, so the handoff
+	// is durable exactly when the apply is: a stamp that cannot be written fails
+	// the create, and the dispatch is retried whole rather than leaving a
+	// stopped apply that a later start would replay.
+	takeovers := c.supersededTakeovers(apply, releasedHolders, scope.ddlChanges)
+	apply.TakesOverApplyIDs = takeoverApplyIDs(takeovers)
+
 	c.logger.Info("Apply: creating tasks",
 		"plan_id", plan.PlanIdentifier,
 		"ddl_change_count", len(scope.ddlChanges),
@@ -3415,7 +3551,7 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 	}
 	apply.ID = applyID
 
-	c.markSupersededHolders(ctx, apply, releasedHolders, scope.ddlChanges)
+	c.announceSupersededTakeovers(ctx, apply, takeovers)
 
 	// Record the queue event in the apply's durable log; the drive itself starts
 	// when an operator claims the apply, which the timeline records separately.
@@ -3751,6 +3887,7 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 		tp.RowsCopied = t.RowsCopied
 		tp.RowsTotal = t.RowsTotal
 		tp.EstimatedBytes = t.EstimatedBytes
+		tp.EstimatedRows = t.EstimatedRows
 		tp.ChecksumRowsChecked = t.ChecksumRowsChecked
 		tp.ChecksumRowsTotal = t.ChecksumRowsTotal
 		tp.Throttled = t.Throttled

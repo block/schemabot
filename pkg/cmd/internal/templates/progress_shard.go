@@ -23,11 +23,64 @@ func FormatShardProgress(shards []ShardProgress) string {
 
 // formatTableParts renders a table's per-part progress: its shards, or its
 // targets when the table stands for one change across a rollout's targets.
+// Its targets are listed only while the change is in flight on one of them or
+// one of them stopped, as the PR comment lists them (listsTargets): otherwise
+// the table's line counts them.
 func formatTableParts(t TableProgress) string {
 	if t.AcrossTargets {
+		if !listsTargets(t) {
+			return ""
+		}
 		return formatPartProgress(t.Shards, presentation.TargetNoun, pendingTargetsWord(t))
 	}
 	return formatPartProgress(t.Shards, presentation.ShardNoun, presentation.PendingQueued)
+}
+
+// keepsShardedBar reports whether a sharded table past its row copy still
+// leads with its bar across its shards (presentation.ShardsKeepTableBar), once
+// its shards have reported rows, as the PR comment's does.
+func keepsShardedBar(t TableProgress) bool {
+	if t.AcrossTargets || t.RowsTotal <= 0 {
+		return false
+	}
+	statuses := make([]string, len(t.Shards))
+	for i, s := range t.Shards {
+		statuses[i] = s.Status
+	}
+	return presentation.ShardsKeepTableBar(t.Status, statuses)
+}
+
+// formatShardedPhaseProgress renders a sharded table that keeps its bar
+// (keepsShardedBar): the bar across every shard the table spans
+// (presentation.PercentAcrossTargets), counting a shard that has not reported
+// as nothing, then the rows line and each shard's line.
+func formatShardedPhaseProgress(t TableProgress) string {
+	parts := make([]presentation.Part, len(t.Shards))
+	for i, s := range t.Shards {
+		parts[i] = shardPart(s)
+	}
+	pct := presentation.PercentAcrossTargets(parts, shardTotal(t)-len(t.Shards))
+	var b strings.Builder
+	writeTableLine(&b, t, "%s %d%%%s", ui.ProgressBarRowCopy(pct), pct, throttledSuffix(t))
+	if t.DDL != "" {
+		b.WriteString(formatTableDDL(t))
+	}
+	writeStructuredRowsAndETA(&b, t)
+	writeThrottleTooltip(&b, t)
+	b.WriteString("\n")
+	b.WriteString(formatTableParts(t))
+	return b.String()
+}
+
+// listsTargets reports whether a table across a rollout's targets lists them
+// one per line under it (presentation.ListsTargets), decided by where each
+// target stands rather than by the table's rolled-up status.
+func listsTargets(t TableProgress) bool {
+	statuses := make([]string, len(t.Shards))
+	for i, s := range t.Shards {
+		statuses[i] = s.Status
+	}
+	return presentation.ListsTargets(statuses)
 }
 
 // formatPartProgress renders the parts one table's change runs across — the
@@ -56,12 +109,17 @@ func formatPartProgress(shards []ShardProgress, noun presentation.Noun, pendingW
 // shardPart is a shard's or target's progress as the shared part listing
 // reads it.
 func shardPart(s ShardProgress) presentation.Part {
-	return presentation.Part{Name: s.Shard, Status: s.Status, PercentComplete: s.PercentComplete, RowsCopied: s.RowsCopied, RowsTotal: s.RowsTotal}
+	return presentation.Part{
+		Name: s.Shard, Status: s.Status, PercentComplete: s.PercentComplete, RowsCopied: s.RowsCopied, RowsTotal: s.RowsTotal,
+		ChecksumRowsChecked: s.ChecksumRowsChecked, ChecksumRowsTotal: s.ChecksumRowsTotal,
+		PlannedRows: s.PlannedRows,
+	}
 }
 
 // formatShardLine renders one part's line: its mark and name in the color of
-// its state, then its state in words, with a copying part's ETA. pendingWord
-// names a part still pending.
+// its state, then its state in words, with a copying part's ETA. Every phase
+// an engine works through is colored as working; only a part that is not
+// working on the change is dimmed. pendingWord names a part still pending.
 func formatShardLine(s ShardProgress, pendingWord string) string {
 	detail := presentation.PartDetail(shardPart(s), pendingWord)
 	glyph := presentation.PartGlyph(s.Status)
@@ -77,6 +135,11 @@ func formatShardLine(s ShardProgress, pendingWord string) string {
 		return fmt.Sprintf(indentShardLine+"%s%s %s%s: %s\n", ANSIYellow, glyph, s.Shard, ANSIReset, detail)
 	case state.Task.Failed:
 		return fmt.Sprintf(indentShardLine+"%s%s %s%s: %s\n", ANSIRed, glyph, s.Shard, ANSIReset, detail)
+	}
+	switch {
+	case state.IsInFlightTaskState(s.Status):
+		// Every other phase an engine works through reads as working, like a copy.
+		return fmt.Sprintf(indentShardLine+"%s%s %s%s: %s\n", ANSICyan, glyph, s.Shard, ANSIReset, detail)
 	default:
 		return fmt.Sprintf(indentShardLine+"%s%s %s: %s%s\n", ANSIDim, glyph, s.Shard, detail, ANSIReset)
 	}

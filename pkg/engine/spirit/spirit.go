@@ -147,9 +147,18 @@ type runningSchemaChange struct {
 	// quarantinedDrops records every table this attempt of the schema change
 	// set out to move into pending drops, keyed by source table, so a DROP
 	// phase replayed through Start skips the tables it already moved and still
-	// fails on a table that vanished some other way. It lives in this process
-	// only; a resume that goes through Apply starts with an empty record.
-	quarantinedDrops map[dropTarget]pendingdrops.QuarantinedTable
+	// fails on a table that vanished some other way. A table keeps every
+	// destination recorded for it, oldest first, since a RENAME a stop
+	// abandoned can still land after a replay recorded a newer one. It lives
+	// in this process only; the target's quarantine log keeps the same record
+	// durably for a schema change that names its apply (applyIdentifier).
+	quarantinedDrops map[dropTarget][]pendingdrops.QuarantinedTable
+
+	// applyIdentifier names the apply this schema change belongs to
+	// (engine.ApplyRequest.ApplyIdentifier), or is empty when it belongs to
+	// none. It keys the target's quarantine log, so an attempt in another
+	// process recognizes the tables this apply quarantined.
+	applyIdentifier string
 
 	// owner is the drive the run belongs to (engine.WithWorkOwner), set when
 	// Apply starts the run and again when Start resumes it, under Engine.mu.
@@ -639,10 +648,11 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 	if err != nil {
 		return nil, fmt.Errorf("plan database %s: %w", database, err)
 	}
-	currentSchema, withheld, err := e.fetchCurrentSchema(ctx, req.Credentials.DSN, database, ignored)
+	current, err := e.fetchCurrentSchema(ctx, req.Credentials.DSN, database, ignored)
 	if err != nil {
 		return nil, fmt.Errorf("fetch current schema: %w", err)
 	}
+	currentSchema, withheld, lowerCaseTableNames := current.tables, current.withheld, current.lowerCaseTableNames
 	e.logger.Debug("fetched current schema", "database", database, "tables", len(currentSchema))
 	for i, ts := range currentSchema {
 		e.logger.Debug("current schema table", "index", i, "stmt", ts.Schema[:min(200, len(ts.Schema))])
@@ -656,9 +666,13 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 	// table's namespace is recorded from its declaration, so the plan groups
 	// changes by namespace from the parse rather than by searching the files.
 	var desiredSchemas []table.TableSchema
-	var declared ddl.TableDeclarations
+	// Declarations compare table names the way the target does, so a pair the
+	// target treats as one table is refused here with both files named,
+	// rather than by the differ, which sees table names only.
+	declared := ddl.TableDeclarations{LowerCaseTableNames: lowerCaseTableNames}
 	declaredByNamespace := make(map[string][]string, len(req.SchemaFiles))
 	namespaceByTable := make(map[string]string)
+	liveName := liveTableNameResolver(currentSchema, lowerCaseTableNames)
 	for _, namespace := range slices.Sorted(maps.Keys(req.SchemaFiles)) {
 		ns := req.SchemaFiles[namespace]
 		for _, filename := range slices.Sorted(maps.Keys(ns.Files)) {
@@ -679,9 +693,12 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 				if err := declared.Declare(namespace+"/"+filename, ct.TableName); err != nil {
 					return nil, err
 				}
-				desiredSchemas = append(desiredSchemas, table.TableSchema{Name: ct.TableName, Schema: stmt})
-				declaredByNamespace[namespace] = append(declaredByNamespace[namespace], ct.TableName)
-				namespaceByTable[ct.TableName] = namespace
+				// The diff names a live table the way it exists, so every
+				// lookup below keys the declaration by that spelling.
+				name := liveName(ct.TableName)
+				desiredSchemas = append(desiredSchemas, table.TableSchema{Name: name, Schema: stmt})
+				declaredByNamespace[namespace] = append(declaredByNamespace[namespace], name)
+				namespaceByTable[name] = namespace
 			}
 		}
 	}
@@ -699,7 +716,13 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 	// Use Spirit's PlanChanges to diff + lint in one call.
 	// This combines DeclarativeToImperative (diff) with RunLinters (lint),
 	// returning per-statement lint results with severity levels.
-	plan, err := lint.PlanChanges(currentSchema, desiredSchemas, nil, e.linter.SpiritConfig())
+	// The differ matches table names the way the target compares them, so on a
+	// server with lower_case_table_names set, a schema file that writes
+	// `Orders` for a live `orders` plans an ALTER of `orders` rather than a
+	// CREATE the server refuses and a DROP of the live table.
+	diffOpts := statement.NewDiffOptions()
+	diffOpts.LowerCaseTableNames = lowerCaseTableNames
+	plan, err := lint.PlanChanges(currentSchema, desiredSchemas, diffOpts, e.linter.SpiritConfig())
 	if err != nil {
 		return nil, err
 	}
@@ -829,7 +852,7 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 		lintViolations = append(lintViolations, lint.PlannedChangeViolations(pc)...)
 	}
 
-	schemaChanges, err := groupChangesByNamespace(changes, currentSchema, namespaceByTable, req.SchemaFiles)
+	schemaChanges, err := groupChangesByNamespace(changes, currentSchema, namespaceByTable, req.SchemaFiles, database)
 	if err != nil {
 		return nil, err
 	}
@@ -940,21 +963,22 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 	// reaches it.
 	bgCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
 	rm := &runningSchemaChange{
-		logger:         logger,
-		spiritLogger:   spiritLogger,
-		database:       database,
-		tableNamespace: tableNamespace,
-		tables:         nil, // Tables will be populated by executeSchemaChange
-		originalDDLs:   req.FlatDDL(),
-		state:          engine.StateRunning,
-		started:        time.Now(),
-		deferCutover:   deferCutover,
-		directPolicy:   directExecPolicy,
-		host:           host,
-		username:       username,
-		password:       password,
-		cancelFunc:     cancel,
-		owner:          engine.WorkOwnerFromContext(ctx),
+		logger:          logger,
+		spiritLogger:    spiritLogger,
+		database:        database,
+		tableNamespace:  tableNamespace,
+		tables:          nil, // Tables will be populated by executeSchemaChange
+		originalDDLs:    req.FlatDDL(),
+		state:           engine.StateRunning,
+		started:         time.Now(),
+		deferCutover:    deferCutover,
+		directPolicy:    directExecPolicy,
+		host:            host,
+		username:        username,
+		password:        password,
+		cancelFunc:      cancel,
+		owner:           engine.WorkOwnerFromContext(ctx),
+		applyIdentifier: req.ApplyIdentifier,
 	}
 	e.installRunningSchemaChange(rm)
 
@@ -1244,30 +1268,69 @@ func liveSchemaFilterOptions(ignored engine.IgnoredTables) []table.FilterOption 
 	return opts
 }
 
+// liveTableNameResolver returns how a desired table's name is spelled for the
+// plan's lookups. On a target that compares table names case-insensitively
+// (lower_case_table_names nonzero), a desired table that matches a live one in
+// another case is the live table, and the diff names it the way it exists, so
+// the declaration is keyed by that spelling. A name with no live match, or any
+// name on a case-sensitive target, is kept as written.
+func liveTableNameResolver(current []table.TableSchema, lowerCaseTableNames int) func(string) string {
+	if lowerCaseTableNames == 0 {
+		return func(name string) string { return name }
+	}
+	byFolded := make(map[string]string, len(current))
+	for _, ts := range current {
+		byFolded[strings.ToLower(ts.Name)] = ts.Name
+	}
+	return func(name string) string {
+		if live, ok := byFolded[strings.ToLower(name)]; ok {
+			return live
+		}
+		return name
+	}
+}
+
+// liveSchema is what a plan reads from the target before diffing.
+type liveSchema struct {
+	// tables is the live schema the diff sees, with internal and archive
+	// tables and the withheld tables filtered out.
+	tables []table.TableSchema
+	// withheld is what ignore_tables actually withheld, sorted, for the plan
+	// to disclose: the diff never sees these tables, so without the
+	// disclosure a withheld table would be indistinguishable from an
+	// unchanged one.
+	withheld []string
+	// lowerCaseTableNames is the target's @@lower_case_table_names, which
+	// decides whether the diff compares table names case-insensitively.
+	lowerCaseTableNames int
+}
+
 // fetchCurrentSchema retrieves table schemas from the database, filtering out
 // internal tables (Spirit shadow/checkpoint tables and other _-prefixed tables)
 // and archive tables that are maintained outside declarative schema files.
 //
-// ignored withholds the tables the repository's ignore_tables config names. The
-// second return value is what it actually withheld, sorted, for the plan to
-// disclose: the diff never sees these tables, so without the disclosure a
-// withheld table would be indistinguishable from an unchanged one.
-func (e *Engine) fetchCurrentSchema(ctx context.Context, dsn, database string, ignored engine.IgnoredTables) ([]table.TableSchema, []string, error) {
+// ignored withholds the tables the repository's ignore_tables config names.
+func (e *Engine) fetchCurrentSchema(ctx context.Context, dsn, database string, ignored engine.IgnoredTables) (*liveSchema, error) {
 	db, err := mysqlconn.Open(dsn)
 	if err != nil {
-		return nil, nil, fmt.Errorf("open target database: %w", err)
+		return nil, fmt.Errorf("open target database: %w", err)
 	}
 	defer utils.CloseAndLog(db)
 
 	// Open only parsed the DSN; this ping is the first dial, so it is where the
 	// target can refuse the session and the only error worth classifying.
 	if err := db.PingContext(ctx); err != nil {
-		return nil, nil, fmt.Errorf("ping target database: %w", targetauth.Wrap(err))
+		return nil, fmt.Errorf("ping target database: %w", targetauth.Wrap(err))
+	}
+
+	var lowerCaseTableNames int
+	if err := db.QueryRowContext(ctx, "SELECT @@lower_case_table_names").Scan(&lowerCaseTableNames); err != nil {
+		return nil, fmt.Errorf("read lower_case_table_names: %w", err)
 	}
 
 	tables, err := table.LoadSchemaFromDB(ctx, db, liveSchemaFilterOptions(ignored)...)
 	if err != nil {
-		return nil, nil, fmt.Errorf("load schema: %w", err)
+		return nil, fmt.Errorf("load schema: %w", err)
 	}
 
 	// The archive-naming exclusion is applied here when the loader was not
@@ -1297,7 +1360,7 @@ func (e *Engine) fetchCurrentSchema(ctx context.Context, dsn, database string, i
 		e.logger.Info("live tables withheld from the plan by ignore_tables",
 			"database", database, "tables", withheld)
 	}
-	return kept, withheld, nil
+	return &liveSchema{tables: kept, withheld: withheld, lowerCaseTableNames: lowerCaseTableNames}, nil
 }
 
 // tableSizeEstimate is one table's approximate plan-time size read from

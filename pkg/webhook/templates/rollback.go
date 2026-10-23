@@ -42,7 +42,7 @@ func renderRollbackPlanComment(data PlanCommentData, budget *ddlBlockBudget) str
 	// The rollback's unsafe changes are named here, because confirming them
 	// takes --allow-unsafe and the operator should see what that destroys.
 	if data.HasUnsafeChanges && len(data.UnsafeChanges) > 0 {
-		writeUnsafeWarning(&sb, data.UnsafeChanges, nil, data.DatabaseType, data.IsMySQL, true)
+		writeUnsafeWarning(&sb, data.UnsafeChanges, nil, data.DatabaseType, data.IsMySQL)
 	}
 
 	// Lint violations. Only the lint fold names a finding's rule here: the
@@ -70,7 +70,7 @@ func renderRollbackPlanComment(data PlanCommentData, budget *ddlBlockBudget) str
 	} else {
 		sb.WriteString("To confirm this rollback, comment:\n")
 	}
-	fmt.Fprintf(&sb, "```\n%s\n```\n\n", tenantCommand("schemabot rollback-confirm", data.Environment, data.Tenant))
+	fmt.Fprintf(&sb, "```\n%s\n```\n\n", TenantCommand("schemabot rollback-confirm", data.Environment, data.Tenant))
 	writeRollbackCancel(&sb, data.Tenant)
 
 	return appendAgentHint(sb.String(), data.AgentHint)
@@ -84,9 +84,9 @@ func writeRollbackCancel(sb *strings.Builder, tenant string) {
 // RenderRollbackUnsafeChangesBlocked renders the refusal posted when
 // rollback-confirm is given without `--allow-unsafe` and the pinned rollback
 // plan carries unsafe changes. It mirrors the apply refusal: the rollback plan,
-// each unsafe change, and the exact rollback-confirm command that consents to
-// them. Nothing ran and the lock still pins the rollback plan, so the
-// re-issued command confirms the same plan, and unlock cancels it.
+// each unsafe change, and the rollback-confirm command to re-issue with
+// `--allow-unsafe`. Nothing ran and the lock still pins the rollback plan, so
+// the re-issued command confirms the same plan, and unlock cancels it.
 func RenderRollbackUnsafeChangesBlocked(data PlanCommentData) string {
 	return renderWithinCommentLimit(countPlanDDLBlocks(data.Changes), 0, func(budget *ddlBlockBudget) string {
 		return renderRollbackUnsafeChangesBlocked(data, budget)
@@ -109,12 +109,12 @@ func renderRollbackUnsafeChangesBlocked(data PlanCommentData, budget *ddlBlockBu
 
 	// The retry keeps every option the rejected command carried, so following
 	// it changes only the consent, never how the rollback runs.
-	retryCommand := tenantCommand("schemabot rollback-confirm", data.Environment, data.Tenant) + " --allow-unsafe"
+	retryCommand := TenantCommand("schemabot rollback-confirm", data.Environment, data.Tenant)
 	if data.DeferCutover {
 		retryCommand += " --defer-cutover"
 	}
 	writeUnsafeChangesRejection(&sb, data, "Rollback rejected", retryCommand)
-	sb.WriteString("\nThe lock still pins this rollback plan, so the command above confirms it.\n\n")
+	sb.WriteString("\nThe lock still pins this rollback plan, so the command above, with `--allow-unsafe`, confirms it.\n\n")
 	writeRollbackCancel(&sb, data.Tenant)
 
 	return appendAgentHint(offerSupportChannel(sb.String()), data.AgentHint)
@@ -124,7 +124,7 @@ func renderRollbackUnsafeChangesBlocked(data PlanCommentData, budget *ddlBlockBu
 // without a held lock. Tenant is the deployment's own tenant; when set, the
 // suggested command carries it so pasting the hint addresses this deployment.
 func RenderRollbackConfirmNoLock(database, environment, tenant string) string {
-	rollbackCmd := tenantCommand("schemabot rollback <apply-id>", environment, tenant)
+	rollbackCmd := TenantCommand("schemabot rollback <apply-id>", environment, tenant)
 	if database == "" {
 		return fmt.Sprintf("## 🔒 No Lock Found\n\n"+
 			"**Environment**: `%s`\n\n"+
@@ -147,8 +147,8 @@ func RenderRollbackConfirmNoLock(database, environment, tenant string) string {
 // through its endpoint or profile, which cliName's wrapper selects.
 func RenderRollbackMissingApplyID(cliName, environment, tenant string) string {
 	return offerSupportChannel("## Missing Apply ID\n\n" +
-		fmt.Sprintf("Usage: `%s`\n\n", tenantCommand("schemabot rollback <apply-id>", "<environment>", tenant)) +
-		fmt.Sprintf("Confirm a generated rollback with `%s`.\n\n", tenantCommand("schemabot rollback-confirm", "<environment>", tenant)) +
+		fmt.Sprintf("Usage: `%s`\n\n", TenantCommand("schemabot rollback <apply-id>", "<environment>", tenant)) +
+		fmt.Sprintf("Confirm a generated rollback with `%s`.\n\n", TenantCommand("schemabot rollback-confirm", "<environment>", tenant)) +
 		"You can find the apply ID in the summary comment of a completed apply, " +
 		fmt.Sprintf("or by running `%s`.", cliCommand(cliName, "status "+environmentFlag(environment))))
 }
@@ -223,6 +223,98 @@ func RenderRollbackBlockedByLock(database, environment, lockOwner, lockRepo stri
 		"A lock is currently held by `%s`.\n\n"+
 		"Wait for that operation to complete, or ask the lock owner to release it.",
 		database, environment, caller.Short(lockOwner)))
+}
+
+// PRState is what a lookup found about the pull request a command came from.
+// The zero value is a lookup that did not succeed.
+type PRState int
+
+const (
+	PRStateUnknown PRState = iota
+	PRStateOpen
+	PRStateClosed
+	PRStateMerged
+)
+
+// RollbackOfRolloutUnsupportedData is what the refused-rollout-rollback comment
+// renders from.
+type RollbackOfRolloutUnsupportedData struct {
+	Environment string
+	// Database is the apply's database. The apply command names it, so it
+	// runs in a PR that changes several databases.
+	Database string
+	ApplyID  string
+	// RoutingChecked is set when the apply's targets were compared with the
+	// environment's routing now; Unrouted lists the ones no longer routed.
+	RoutingChecked bool
+	Unrouted       []string
+	// PR is the state of the PR the rollback was commented on.
+	PR PRState
+	// Tenant is the deployment's own tenant; when set, the apply command
+	// carries it.
+	Tenant string
+}
+
+// RenderRollbackOfRolloutUnsupported renders the message posted when a
+// rollback is refused because the apply's environment has more than one
+// target, and rollback is not currently supported for multiple targets. What undoes
+// the change on every target is an apply of schema files without it, and where
+// those files can be applied from depends on the PR: an open PR reverts the
+// change itself, a merged one needs a PR that reverts it, and a closed one
+// needs a PR that plans the default branch's schema files. A PR whose
+// revert leaves its schema files equal to the default branch changes no schema
+// file, so it is planned only once its schemabot.yaml changes too.
+func RenderRollbackOfRolloutUnsupported(data RollbackOfRolloutUnsupportedData) string {
+	var sb strings.Builder
+	writeEnvironmentTitle(&sb, "Rollback Not Supported", data.Environment)
+	sb.WriteString("Rollback isn't currently supported for schema changes across multiple targets.\n\n")
+
+	switch {
+	case data.RoutingChecked && len(data.Unrouted) > 0:
+		fmt.Fprintf(&sb, "%s no longer routed in this environment, so an apply would not reach %s. Add %s back to the server config first.\n\n",
+			unroutedTargetsPhrase(data.Unrouted), pronoun(len(data.Unrouted), "it", "them"), pronoun(len(data.Unrouted), "it", "them"))
+	case !data.RoutingChecked:
+		sb.WriteString("An apply reaches only the targets this environment routes to now, so add back any target it ran on that is no longer routed.\n\n")
+	}
+
+	const nonce = "a `# nonce` comment line in the database's `schemabot.yaml`"
+	switch data.PR {
+	case PRStateOpen:
+		fmt.Fprintf(&sb, "To undo `%s`, revert the change in this PR's schema files and add or toggle %s so the directory is still planned. Push, then run:\n", data.ApplyID, nonce)
+	case PRStateMerged:
+		fmt.Fprintf(&sb, "To undo `%s`, open a PR that reverts the change in the schema files, then run there:\n", data.ApplyID)
+	case PRStateClosed:
+		fmt.Fprintf(&sb, "To undo `%s`, open a PR that only adds or toggles %s. Its plan brings the database back to the default branch's schema files. Then run there:\n", data.ApplyID, nonce)
+	default:
+		fmt.Fprintf(&sb, "To undo `%s`, apply schema files without the change:\n", data.ApplyID)
+		fmt.Fprintf(&sb, "- If this PR is open, revert the change here and add or toggle %s so the directory is still planned.\n", nonce)
+		sb.WriteString("- If it merged, revert the change in a new PR.\n")
+		fmt.Fprintf(&sb, "- If it closed without merging, open a PR that only adds or toggles %s.\n\n", nonce)
+		sb.WriteString("Then run:\n")
+	}
+	command := appendDatabaseFlag(fmt.Sprintf("schemabot apply -e %s", data.Environment), data.Database)
+	fmt.Fprintf(&sb, "```\n%s\n```\n", appendTenantFlag(command, data.Tenant))
+	return sb.String()
+}
+
+// unroutedTargetsPhrase names the targets an environment no longer routes to,
+// as the subject of a sentence.
+func unroutedTargetsPhrase(targets []string) string {
+	quoted := make([]string, len(targets))
+	for i, target := range targets {
+		quoted[i] = "`" + target + "`"
+	}
+	if len(quoted) == 1 {
+		return quoted[0] + " is"
+	}
+	return strings.Join(quoted[:len(quoted)-1], ", ") + " and " + quoted[len(quoted)-1] + " are"
+}
+
+func pronoun(n int, one, many string) string {
+	if n == 1 {
+		return one
+	}
+	return many
 }
 
 // RenderRollbackNothingToDo renders the message posted when a rollback plan

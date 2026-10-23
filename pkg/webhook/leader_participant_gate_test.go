@@ -128,7 +128,7 @@ func TestParticipantCheckOutcomesFold(t *testing.T) {
 			assert.Equal(t, headSHA, c.HeadSHA)
 			assert.Equal(t, tc.wantRetriable, retriable, "retriable must mark exactly the outcomes a re-read can improve")
 
-			conclusion, status := computeAggregate(checks)
+			conclusion, status := computeAggregate(checks, nil)
 			assert.Equal(t, tc.wantConclusion, conclusion)
 			assert.Equal(t, tc.wantStatus, status)
 		})
@@ -152,7 +152,7 @@ func TestParticipantCheckOutcomesUnresolvedAfterBudgetExhausted(t *testing.T) {
 	require.Len(t, checks, 1)
 	assert.True(t, retriable)
 
-	conclusion, status := computeAggregate(checks)
+	conclusion, status := computeAggregate(checks, nil)
 	assert.Equal(t, checkConclusionActionRequired, conclusion)
 	assert.Equal(t, checkStatusCompleted, status)
 
@@ -170,7 +170,7 @@ func TestAggregateSummaryWaitingForParticipants(t *testing.T) {
 	checks, _ := h.participantCheckOutcomes(t.Context(), &fakeCheckRunFinder{}, "octocat/shared-repo", 7, "staging", "abc123", expected, true)
 	require.Len(t, checks, 1)
 
-	conclusion, status := computeAggregate(checks)
+	conclusion, status := computeAggregate(checks, nil)
 	require.Empty(t, conclusion)
 	require.Equal(t, checkStatusInProgress, status)
 
@@ -198,7 +198,7 @@ func TestParticipantCheckOutcomesEmptyCheckNameBlocks(t *testing.T) {
 	require.Len(t, checks, 1)
 	assert.False(t, retriable, "a config error cannot be fixed by re-reading; no re-fold should be scheduled")
 
-	conclusion, status := computeAggregate(checks)
+	conclusion, status := computeAggregate(checks, nil)
 	assert.Equal(t, checkConclusionActionRequired, conclusion)
 	assert.Equal(t, checkStatusCompleted, status)
 }

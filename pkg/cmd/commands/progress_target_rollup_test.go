@@ -17,8 +17,9 @@ import (
 
 // A finished barrier rollout whose eu and us deployments each address two
 // targets: `schemabot progress` renders each deployment as one rollup
-// section, counted in targets, with a line per target and the shared change
-// shown once per deployment.
+// section, counted in targets, with the shared change shown once per
+// deployment. The finished table counts its targets in the deployment line and
+// lists none of them, as the PR comment does.
 func TestProgressCmd_MultiTargetDeploymentsRenderAsRollups(t *testing.T) {
 	const applyID = "apply-5e21"
 	alters := map[string]string{
@@ -82,17 +83,12 @@ func TestProgressCmd_MultiTargetDeploymentsRenderAsRollups(t *testing.T) {
 	assertContainsInOrder(t, out,
 		"✅ eu — 2 completed (2 targets)",
 		"ALTER TABLE `orders` ADD COLUMN `email` varchar(255) DEFAULT NULL;",
-		"• Targets: 2 (2 complete)",
-		"✓ payments-001: 1,000 rows",
-		"✓ payments-002: 1,000 rows",
 		"✅ us — 2 completed (2 targets)",
 		"ADD COLUMN `name` varchar(255) NOT NULL,",
-		"• Targets: 2 (2 complete)",
-		"✓ payments-003: 1,000 rows",
-		"✓ payments-004: 1,000 rows",
 	)
 	for _, target := range []string{"payments-001", "payments-002", "payments-003", "payments-004"} {
-		assert.Equalf(t, 1, strings.Count(out, target), "%s is one line of its deployment's rollup, not a section of its own:\n%s", target, out)
+		assert.NotContainsf(t, out, target, "%s is counted in its deployment's rollup, not listed or given a section of its own:\n%s", target, out)
 	}
+	assert.NotContains(t, out, "• Targets:", "a finished table lists no targets:\n%s", out)
 	assert.Equal(t, 1, strings.Count(out, "ALTER TABLE `orders` ADD COLUMN `email` varchar(255) DEFAULT NULL;"), "eu's change is shown once for both targets:\n%s", out)
 }

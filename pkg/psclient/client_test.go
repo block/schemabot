@@ -3,6 +3,7 @@ package psclient
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -256,6 +257,44 @@ func TestRawRequestFailureRendersOnlyTheAPIsOwnRefusal(t *testing.T) {
 	}
 }
 
+// A plan decides that a branch has no keyspace by a given name only on the
+// API's not-found answer to a read of that one keyspace. The read addresses
+// the keyspace by name, and a 404 comes back as the typed not-found error the
+// plan recognizes, while a keyspace that exists comes back by name.
+func TestGetKeyspaceReadsOneKeyspaceByName(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, http.MethodGet, r.Method)
+		switch r.URL.Path {
+		case "/v1/organizations/block/databases/orders/branches/main/keyspaces/commerce":
+			_, _ = w.Write([]byte(`{"name":"commerce","sharded":true}`))
+		case "/v1/organizations/block/databases/orders/branches/main/keyspaces/billing":
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"code":"not_found","message":"Not Found"}`))
+		default:
+			t.Errorf("unexpected request path %s", r.URL.Path)
+			w.WriteHeader(http.StatusTeapot)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	client, err := NewPSClientWithBaseURL("token-name", "token-value", srv.URL)
+	require.NoError(t, err)
+
+	t.Run("a keyspace the branch has", func(t *testing.T) {
+		keyspace, err := client.GetKeyspace(t.Context(), &ps.GetKeyspaceRequest{Organization: "block", Database: "orders", Branch: "main", Keyspace: "commerce"})
+		require.NoError(t, err)
+		assert.Equal(t, "commerce", keyspace.Name)
+	})
+
+	t.Run("a keyspace the branch does not have", func(t *testing.T) {
+		keyspace, err := client.GetKeyspace(t.Context(), &ps.GetKeyspaceRequest{Organization: "block", Database: "orders", Branch: "main", Keyspace: "billing"})
+		var psErr *ps.Error
+		require.ErrorAs(t, err, &psErr)
+		assert.Equal(t, ps.ErrNotFound, psErr.Code)
+		assert.Nil(t, keyspace)
+	})
+}
+
 // keyspacesServer serves the keyspace list endpoint for branch main of
 // block/orders, answering each requested page with the body pages maps it to.
 // A page with no entry is answered 404, so a request the test did not expect
@@ -466,6 +505,139 @@ func TestListKeyspacesFailsWhenNextPageDoesNotAdvance(t *testing.T) {
 	assert.Equal(t, []string{"1", "2"}, requested)
 }
 
+// stalledPageRequestTimeout is the per-request timeout in the stalled-listing
+// tests. It is far longer than the bounds those tests exercise, so a listing
+// that ends in time was ended by the bound under test, not by a page timeout.
+const stalledPageRequestTimeout = 10 * time.Second
+
+// stalledKeyspacesWrapper returns a wrapper whose API answers the pages in
+// pages and never answers any other page: the request stays open until the
+// client gives up on it. Its listing bound is listingTimeout.
+func stalledKeyspacesWrapper(t *testing.T, pages map[string]string, listingTimeout time.Duration) *psClientWrapper {
+	t.Helper()
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if body, ok := pages[r.URL.Query().Get("page")]; ok {
+			_, _ = w.Write([]byte(body))
+			return
+		}
+		select {
+		case <-r.Context().Done():
+		case <-release:
+		}
+	}))
+	// Cleanups run last-registered-first: release any stalled handler before
+	// Close waits for its connection.
+	t.Cleanup(srv.Close)
+	t.Cleanup(func() { close(release) })
+
+	client, err := NewPSClientWithBaseURL("token-name", "token-value", srv.URL)
+	require.NoError(t, err)
+	wrapper, ok := client.(*psClientWrapper)
+	require.True(t, ok)
+	wrapper.httpClient.Timeout = stalledPageRequestTimeout
+	wrapper.keyspaceListingTimeout = listingTimeout
+	return wrapper
+}
+
+func listOrdersKeyspacesWith(ctx context.Context, wrapper *psClientWrapper) ([]*ps.Keyspace, error) {
+	return wrapper.ListKeyspaces(ctx, &ps.ListKeyspacesRequest{
+		Organization: "block",
+		Database:     "orders",
+		Branch:       "main",
+	})
+}
+
+// A caller with no deadline of its own lists a branch whose API answers the
+// first page and then stops answering. The listing ends at its overall bound,
+// long before any page request times out, and the error says the listing as a
+// whole timed out, which branch it was, and how far it got.
+func TestListKeyspacesEndsAtTheOverallBound(t *testing.T) {
+	wrapper := stalledKeyspacesWrapper(t, map[string]string{
+		"1": `{"current_page":1,"next_page":2,"data":[{"name":"orders"}]}`,
+	}, 200*time.Millisecond)
+
+	start := time.Now()
+	keyspaces, err := listOrdersKeyspacesWith(t.Context(), wrapper)
+	elapsed := time.Since(start)
+
+	require.Error(t, err)
+	assert.Nil(t, keyspaces)
+	assert.Contains(t, err.Error(), "list keyspaces for block/orders branch main: listing as a whole timed out after 200ms (pages read: 1, waiting on page 2)")
+	assert.ErrorIs(t, err, context.DeadlineExceeded)
+	assert.Less(t, elapsed, stalledPageRequestTimeout/2, "the listing must end at its overall bound, not at a page timeout")
+}
+
+// The default bound is two per-request timeouts: one slow page can spend its
+// whole budget and the rest of the listing still has room to finish, and no
+// listing can hold a driver for the page bound times the per-request timeout.
+func TestDefaultKeyspaceListingTimeoutValue(t *testing.T) {
+	require.Equal(t, 2*planetScaleHTTPTimeout, defaultKeyspaceListingTimeout)
+}
+
+// A wrapper built as a struct literal carries no listing bound of its own. It
+// lists under the default bound rather than expiring before its first request.
+func TestListKeyspacesOnLiteralWrapper(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"current_page":1,"data":[{"name":"orders"}]}`))
+	}))
+	t.Cleanup(srv.Close)
+	wrapper := &psClientWrapper{httpClient: srv.Client(), baseURL: srv.URL, tokenName: "token-name", tokenValue: "token-value"}
+
+	keyspaces, err := listOrdersKeyspacesWith(t.Context(), wrapper)
+	require.NoError(t, err)
+	require.Len(t, keyspaces, 1)
+	assert.Equal(t, "orders", keyspaces[0].Name)
+}
+
+// Which deadline ended a page request is decided by which fired first, not by
+// which contexts have ended by the time the failure is classified. Both
+// deadlines have expired before classification in every case here.
+func TestListingBoundEndedFollowsTheFirstDeadline(t *testing.T) {
+	t.Run("listing bound fired before the caller's deadline", func(t *testing.T) {
+		caller, cancelCaller := context.WithTimeout(t.Context(), 50*time.Millisecond)
+		defer cancelCaller()
+		listCtx, cancel := context.WithTimeoutCause(caller, time.Millisecond, errListingBound)
+		defer cancel()
+		<-listCtx.Done()
+		<-caller.Done()
+
+		assert.True(t, listingBoundEnded(listCtx, fmt.Errorf("page 2: %w", context.DeadlineExceeded)))
+		assert.False(t, listingBoundEnded(listCtx, errors.New("page 2: connection reset")), "a page that failed for its own reason keeps its error")
+	})
+
+	t.Run("caller's deadline fired before the listing bound", func(t *testing.T) {
+		caller, cancelCaller := context.WithTimeout(t.Context(), time.Millisecond)
+		defer cancelCaller()
+		listCtx, cancel := context.WithTimeoutCause(caller, 50*time.Millisecond, errListingBound)
+		defer cancel()
+		<-caller.Done()
+		<-listCtx.Done()
+
+		assert.False(t, listingBoundEnded(listCtx, fmt.Errorf("page 1: %w", context.DeadlineExceeded)))
+	})
+}
+
+// A caller whose own deadline comes before the listing's bound ends the
+// listing at that deadline, and the error reports the caller's context
+// ending on the page in flight rather than the listing bound.
+func TestListKeyspacesCallerDeadlineWins(t *testing.T) {
+	wrapper := stalledKeyspacesWrapper(t, map[string]string{}, stalledPageRequestTimeout)
+	ctx, cancel := context.WithTimeout(t.Context(), 200*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	keyspaces, err := listOrdersKeyspacesWith(ctx, wrapper)
+	elapsed := time.Since(start)
+
+	require.Error(t, err)
+	assert.Nil(t, keyspaces)
+	assert.Contains(t, err.Error(), "list keyspaces for block/orders branch main page 1")
+	assert.NotContains(t, err.Error(), "listing as a whole")
+	assert.ErrorIs(t, err, context.DeadlineExceeded)
+	assert.Less(t, elapsed, stalledPageRequestTimeout/2, "the listing must end at the caller's deadline")
+}
+
 // requestedURL makes one SDK call and one raw-HTTP call on a cancelled context,
 // so neither leaves the process, and returns the URL each was addressed to.
 func requestedURL(t *testing.T, client PSClient) (sdkURL, rawURL string) {
@@ -593,6 +765,7 @@ func TestPSClientConstructorsBoundRawRequests(t *testing.T) {
 		require.True(t, ok, name)
 		require.NotNil(t, wrapper.httpClient, name)
 		assert.Equal(t, planetScaleHTTPTimeout, wrapper.httpClient.Timeout, name)
+		assert.Equal(t, defaultKeyspaceListingTimeout, wrapper.keyspaceListingTimeout, name)
 	}
 }
 
@@ -649,4 +822,59 @@ func TestRawRequestReturnsWhenTheServerHangs(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "read auto_cutover for block/orders deploy request #132")
 	assert.Less(t, time.Since(start), 10*time.Second, "the call must return at the client timeout")
+}
+
+// A database with more branches than fit on one page is listed in full from
+// the database's branches path, so a branch on a later page is not mistaken
+// for one that does not exist.
+func TestListBranchesReadsEveryPage(t *testing.T) {
+	var requested []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "/v1/organizations/block/databases/orders/branches", r.URL.Path)
+		page := r.URL.Query().Get("page")
+		requested = append(requested, page)
+		switch page {
+		case "1":
+			_, _ = w.Write([]byte(`{"type":"list","next_page":2,"data":[{"name":"main","production":true},{"name":"schemabot-orders-1a2b3c4d"}]}`))
+		case "2":
+			_, _ = w.Write([]byte(`{"type":"list","next_page":null,"data":[{"name":"schemabot-orders-5e6f7a8b","created_at":"2026-10-01T10:00:00Z"}]}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	client, err := NewPSClientWithBaseURL("token-name", "token-value", srv.URL)
+	require.NoError(t, err)
+
+	branches, err := client.ListBranches(t.Context(), &ps.ListDatabaseBranchesRequest{Organization: "block", Database: "orders"})
+
+	require.NoError(t, err)
+	require.Len(t, branches, 3)
+	assert.Equal(t, []string{"main", "schemabot-orders-1a2b3c4d", "schemabot-orders-5e6f7a8b"},
+		[]string{branches[0].Name, branches[1].Name, branches[2].Name})
+	assert.True(t, branches[0].Production)
+	assert.Equal(t, time.Date(2026, 10, 1, 10, 0, 0, 0, time.UTC), branches[2].CreatedAt.UTC())
+	assert.Equal(t, []string{"1", "2"}, requested)
+}
+
+// A page that fails ends the listing with an error naming the database and the
+// page, rather than returning the branches read so far as the whole set.
+func TestListBranchesFailsOnALaterPage(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("page") == "1" {
+			_, _ = w.Write([]byte(`{"type":"list","next_page":2,"data":[{"name":"main"}]}`))
+			return
+		}
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`{"message":"branch listing unavailable"}`))
+	}))
+	t.Cleanup(srv.Close)
+	client, err := NewPSClientWithBaseURL("token-name", "token-value", srv.URL)
+	require.NoError(t, err)
+
+	branches, err := client.ListBranches(t.Context(), &ps.ListDatabaseBranchesRequest{Organization: "block", Database: "orders"})
+
+	require.Error(t, err)
+	assert.Nil(t, branches)
+	assert.Contains(t, err.Error(), "list branches for block/orders page 2")
 }

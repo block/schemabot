@@ -1626,15 +1626,55 @@ func TestServerConfig_ResolveDirectExecutionOverrideReplacesServerPolicy(t *test
 	})
 }
 
-// With no policy configured anywhere, refused statements stay blocked: the
-// engine metadata carries no direct execution keys at all.
-func TestServerConfig_ResolveDirectExecutionDefaultsToBlocked(t *testing.T) {
-	cfg := ServerConfig{}
+// A server config that states no policy runs MySQL databases under the default
+// one: direct execution enabled, bounded at 100MiB of data and indexes. A
+// server-wide block that disables it opts every database out, and engines that
+// cannot honor it never receive the default.
+func TestServerConfig_ResolveDirectExecutionDefaultsToEnabledAt100MiB(t *testing.T) {
+	t.Run("no policy configured", func(t *testing.T) {
+		cfg := ServerConfig{}
+		assert.Equal(t, &DirectExecutionConfig{Enabled: true, MaxTableBytes: "100MiB"},
+			cfg.ResolveDirectExecution(&EnvironmentConfig{}, storage.DatabaseTypeMySQL))
+		policy, err := cfg.DirectExecutionPolicyFor("anything", "production", storage.DatabaseTypeMySQL)
+		require.NoError(t, err)
+		assert.Equal(t, &storage.DirectExecutionPolicy{Enabled: true, MaxTableBytes: 100 << 20}, policy)
+	})
 
-	metadata, err := cfg.DirectExecutionMetadata(&EnvironmentConfig{}, storage.DatabaseTypeMySQL)
+	// The default is built in code rather than read from a config file, so
+	// it never passes startup validation on its own. Holding it to the same
+	// validation a stated block gets keeps a malformed default from failing
+	// every MySQL plan at resolve time instead of failing here.
+	t.Run("default passes the validation a stated block gets", func(t *testing.T) {
+		require.NoError(t, defaultDirectExecution().Validate("default direct_execution policy"))
+	})
 
-	require.NoError(t, err)
-	assert.Empty(t, metadata)
+	t.Run("server-wide opt out", func(t *testing.T) {
+		cfg := ServerConfig{DirectExecution: &DirectExecutionConfig{Enabled: false}}
+		policy, err := cfg.DirectExecutionPolicyFor("anything", "production", storage.DatabaseTypeMySQL)
+		require.NoError(t, err)
+		assert.Equal(t, &storage.DirectExecutionPolicy{Enabled: false}, policy,
+			"an explicit opt out travels as one rather than falling back to the default")
+	})
+
+	t.Run("environment opt out", func(t *testing.T) {
+		cfg := ServerConfig{}
+		envConfig := &EnvironmentConfig{DirectExecution: &DirectExecutionConfig{Enabled: false}}
+		assert.Equal(t, &DirectExecutionConfig{Enabled: false}, cfg.ResolveDirectExecution(envConfig, storage.DatabaseTypeMySQL))
+	})
+
+	t.Run("engine that cannot honor it", func(t *testing.T) {
+		cfg := ServerConfig{}
+		for _, dbType := range []string{storage.DatabaseTypeVitess, storage.DatabaseTypePostgres} {
+			assert.Nil(t, cfg.ResolveDirectExecution(&EnvironmentConfig{}, dbType), "the default must not reach %s", dbType)
+		}
+	})
+
+	t.Run("each resolution is its own value", func(t *testing.T) {
+		cfg := ServerConfig{}
+		first := cfg.ResolveDirectExecution(nil, storage.DatabaseTypeMySQL)
+		first.MaxTableBytes = "1GiB"
+		assert.Equal(t, "100MiB", cfg.ResolveDirectExecution(nil, storage.DatabaseTypeMySQL).MaxTableBytes)
+	})
 }
 
 // A well-formed revert_window_duration parses to the configured window.
@@ -2376,28 +2416,53 @@ func TestValidateDeploymentOrder_EmptyMapKey(t *testing.T) {
 	assert.NotContains(t, err.Error(), `missing deployment ""`)
 }
 
-// TestServerConfig_CutoverPolicyFor verifies the cutover-policy resolver:
-// it defaults to rolling (today's serial rollout) when unset or unconfigured,
-// and honours an explicit barrier policy.
+// TestServerConfig_CutoverPolicyFor verifies the cutover-policy resolver: an
+// explicit policy always wins; left unset, an environment whose every member
+// comes from a targets list (at the environment level, or in every entry of a
+// deployments map) resolves to parallel, and every other environment,
+// configured or not, resolves to rolling. A deployments map that mixes a
+// targets list with a single target resolves to rolling, since its
+// single-target members are the ones a serial rollout lets an operator watch
+// one region at a time.
 func TestServerConfig_CutoverPolicyFor(t *testing.T) {
+	oneTargetMap := map[string]DeploymentTarget{"payments-a": {Target: "payments"}}
+	targetsList := []TargetEntry{{Target: "payments-001"}, {Target: "payments-002"}}
 	cfg := &ServerConfig{
 		Databases: map[string]DatabaseConfig{
 			"payments": {
 				Type: "mysql",
 				Environments: map[string]EnvironmentConfig{
-					"policy-unset":    {Target: "payments", Deployment: "payments-a"},
-					"policy-rolling":  {Deployments: map[string]DeploymentTarget{"payments-a": {Target: "payments"}}, CutoverPolicy: storage.CutoverPolicyRolling},
-					"policy-barrier":  {Deployments: map[string]DeploymentTarget{"payments-a": {Target: "payments"}}, CutoverPolicy: storage.CutoverPolicyBarrier},
-					"policy-parallel": {Deployments: map[string]DeploymentTarget{"payments-a": {Target: "payments"}}, CutoverPolicy: storage.CutoverPolicyParallel},
+					"policy-unset":               {Target: "payments", Deployment: "payments-a"},
+					"policy-rolling":             {Deployments: oneTargetMap, CutoverPolicy: storage.CutoverPolicyRolling},
+					"policy-barrier":             {Deployments: oneTargetMap, CutoverPolicy: storage.CutoverPolicyBarrier},
+					"policy-parallel":            {Deployments: oneTargetMap, CutoverPolicy: storage.CutoverPolicyParallel},
+					"deployments-unset":          {Deployments: map[string]DeploymentTarget{"payments-a": {Target: "payments"}, "payments-b": {Target: "payments"}}},
+					"targets-unset":              {Targets: targetsList, Deployment: "payments-a"},
+					"targets-rolling":            {Targets: targetsList, Deployment: "payments-a", CutoverPolicy: storage.CutoverPolicyRolling},
+					"targets-barrier":            {Targets: targetsList, Deployment: "payments-a", CutoverPolicy: storage.CutoverPolicyBarrier},
+					"deployment-targets-unset":   {Deployments: map[string]DeploymentTarget{"payments-a": {Targets: targetsList}}},
+					"deployment-targets-rolling": {Deployments: map[string]DeploymentTarget{"payments-a": {Targets: targetsList}}, CutoverPolicy: storage.CutoverPolicyRolling},
+					"every-deployment-targets":   {Deployments: map[string]DeploymentTarget{"us": {Targets: []TargetEntry{{Target: "shop-001"}}}, "eu": {Targets: []TargetEntry{{Target: "shop-002"}}}}},
+					"mixed-deployments-unset":    {Deployments: map[string]DeploymentTarget{"us": {Targets: []TargetEntry{{Target: "shop-001"}}}, "eu": {Target: "shop-eu"}}},
+					"mixed-deployments-parallel": {Deployments: map[string]DeploymentTarget{"us": {Targets: []TargetEntry{{Target: "shop-001"}}}, "eu": {Target: "shop-eu"}}, CutoverPolicy: storage.CutoverPolicyParallel},
 				},
 			},
 		},
 	}
 
-	assert.Equal(t, storage.CutoverPolicyRolling, cfg.CutoverPolicyFor("payments", "policy-unset"), "unset defaults to rolling")
+	assert.Equal(t, storage.CutoverPolicyRolling, cfg.CutoverPolicyFor("payments", "policy-unset"), "a single target defaults to rolling")
 	assert.Equal(t, storage.CutoverPolicyRolling, cfg.CutoverPolicyFor("payments", "policy-rolling"), "explicit rolling is rolling")
 	assert.Equal(t, storage.CutoverPolicyBarrier, cfg.CutoverPolicyFor("payments", "policy-barrier"), "explicit barrier is barrier")
 	assert.Equal(t, storage.CutoverPolicyParallel, cfg.CutoverPolicyFor("payments", "policy-parallel"), "explicit parallel is parallel")
+	assert.Equal(t, storage.CutoverPolicyRolling, cfg.CutoverPolicyFor("payments", "deployments-unset"), "a deployments map of single targets defaults to rolling")
+	assert.Equal(t, storage.CutoverPolicyParallel, cfg.CutoverPolicyFor("payments", "targets-unset"), "a targets list defaults to parallel")
+	assert.Equal(t, storage.CutoverPolicyRolling, cfg.CutoverPolicyFor("payments", "targets-rolling"), "explicit rolling on a targets list is rolling")
+	assert.Equal(t, storage.CutoverPolicyBarrier, cfg.CutoverPolicyFor("payments", "targets-barrier"), "explicit barrier on a targets list is barrier")
+	assert.Equal(t, storage.CutoverPolicyParallel, cfg.CutoverPolicyFor("payments", "deployment-targets-unset"), "a targets list inside a deployments entry defaults to parallel")
+	assert.Equal(t, storage.CutoverPolicyRolling, cfg.CutoverPolicyFor("payments", "deployment-targets-rolling"), "explicit rolling on a deployment's targets list is rolling")
+	assert.Equal(t, storage.CutoverPolicyParallel, cfg.CutoverPolicyFor("payments", "every-deployment-targets"), "a deployments map whose every entry is a targets list defaults to parallel")
+	assert.Equal(t, storage.CutoverPolicyRolling, cfg.CutoverPolicyFor("payments", "mixed-deployments-unset"), "a deployments map mixing a targets list with a single target defaults to rolling")
+	assert.Equal(t, storage.CutoverPolicyParallel, cfg.CutoverPolicyFor("payments", "mixed-deployments-parallel"), "explicit parallel on a mixed deployments map is parallel")
 	assert.Equal(t, storage.CutoverPolicyRolling, cfg.CutoverPolicyFor("payments", "missing-env"), "unconfigured env defaults to rolling")
 	assert.Equal(t, storage.CutoverPolicyRolling, cfg.CutoverPolicyFor("missing-db", "policy-barrier"), "unconfigured database defaults to rolling")
 }
@@ -4077,6 +4142,203 @@ review_policy:
 	})
 }
 
+// An instance with the review gate off can turn it on for one database. The
+// opt-in covers only that database, and a database that opts in must name
+// someone who can approve, or every one of its applies would be blocked.
+func TestServerConfig_DatabaseReviewPolicy(t *testing.T) {
+	loadConfig := func(t *testing.T, content string) (*ServerConfig, error) {
+		t.Helper()
+		configPath := filepath.Join(t.TempDir(), "config.yaml")
+		require.NoError(t, os.WriteFile(configPath, []byte(content), 0644))
+		return LoadServerConfigFromFile(configPath)
+	}
+
+	t.Run("a database that opts in is gated and the others are not", func(t *testing.T) {
+		cfg, err := loadConfig(t, `
+databases:
+  orders:
+    type: mysql
+    operator_teams:
+      - octocat/orders-owners
+    review_policy:
+      enabled: true
+    environments:
+      staging:
+        dsn: "root@tcp(localhost:3306)/orders"
+  payments:
+    type: mysql
+    environments:
+      staging:
+        dsn: "root@tcp(localhost:3306)/payments"
+`)
+		require.NoError(t, err)
+		assert.True(t, cfg.ReviewPolicyEnabledForDatabase("orders"))
+		assert.False(t, cfg.ReviewPolicyEnabledForDatabase("payments"))
+		assert.False(t, cfg.ReviewPolicyEnabledForDatabase("unknown"))
+	})
+
+	t.Run("an instance-wide gate covers every database", func(t *testing.T) {
+		cfg := &ServerConfig{
+			ReviewPolicy: ReviewPolicyConfig{Enabled: true},
+			Databases:    map[string]DatabaseConfig{"payments": {Type: "mysql"}},
+		}
+		assert.True(t, cfg.ReviewPolicyEnabledForDatabase("payments"))
+	})
+
+	t.Run("a database that opts in with nobody who can approve is rejected", func(t *testing.T) {
+		_, err := loadConfig(t, `
+databases:
+  orders:
+    type: mysql
+    review_policy:
+      enabled: true
+    environments:
+      staging:
+        dsn: "root@tcp(localhost:3306)/orders"
+`)
+		require.ErrorContains(t, err, "databases.orders.review_policy.enabled requires someone who can approve")
+	})
+
+	t.Run("operators excluded from the review policy cannot approve an opted-in database", func(t *testing.T) {
+		_, err := loadConfig(t, `
+review_policy:
+  include_database_operators: false
+databases:
+  orders:
+    type: mysql
+    operator_users:
+      - mona
+    review_policy:
+      enabled: true
+    environments:
+      staging:
+        dsn: "root@tcp(localhost:3306)/orders"
+`)
+		require.ErrorContains(t, err, "databases.orders.review_policy.enabled requires someone who can approve")
+	})
+
+	t.Run("admins of a repo the database does not allow cannot approve an opted-in database", func(t *testing.T) {
+		_, err := loadConfig(t, `
+repos:
+  octocat/unrelated:
+    admin_teams:
+      - octocat/maintainers
+databases:
+  orders:
+    type: mysql
+    allowed_repos:
+      - octocat/orders
+    review_policy:
+      enabled: true
+    environments:
+      staging:
+        dsn: "root@tcp(localhost:3306)/orders"
+`)
+		require.ErrorContains(t, err, "databases.orders.review_policy.enabled requires someone who can approve")
+	})
+
+	t.Run("admins of a repo the database allows can approve an opted-in database", func(t *testing.T) {
+		cfg, err := loadConfig(t, `
+repos:
+  octocat/unrelated:
+    admin_teams:
+      - octocat/maintainers
+  octocat/orders:
+    admin_users:
+      - mona
+databases:
+  orders:
+    type: mysql
+    allowed_repos:
+      - octocat/orders
+    review_policy:
+      enabled: true
+    environments:
+      staging:
+        dsn: "root@tcp(localhost:3306)/orders"
+`)
+		require.NoError(t, err)
+		assert.True(t, cfg.ReviewPolicyEnabledForDatabase("orders"))
+	})
+
+	t.Run("a repo the database accepts with no admins of its own leaves an opted-in database without an approver", func(t *testing.T) {
+		_, err := loadConfig(t, `
+repos:
+  octocat/a:
+    admin_teams:
+      - octocat/maintainers
+  octocat/b: {}
+databases:
+  orders:
+    type: mysql
+    review_policy:
+      enabled: true
+    environments:
+      staging:
+        dsn: "root@tcp(localhost:3306)/orders"
+`)
+		require.ErrorContains(t, err, "databases.orders.review_policy.enabled requires someone who can approve every PR, but repos.octocat/b, which the database accepts schema changes from, has no admin_teams or admin_users")
+	})
+
+	t.Run("CODEOWNERS alone cannot approve an opted-in database", func(t *testing.T) {
+		_, err := loadConfig(t, `
+review_policy:
+  include_codeowners: true
+repos:
+  octocat/orders: {}
+databases:
+  orders:
+    type: mysql
+    review_policy:
+      enabled: true
+    environments:
+      staging:
+        dsn: "root@tcp(localhost:3306)/orders"
+`)
+		require.ErrorContains(t, err, "repos.octocat/orders, which the database accepts schema changes from, has no admin_teams or admin_users")
+	})
+
+	t.Run("an opted-in database that accepts any repository needs approvers beyond repo admins when no repos are configured", func(t *testing.T) {
+		_, err := loadConfig(t, `
+databases:
+  orders:
+    type: mysql
+    review_policy:
+      enabled: true
+    environments:
+      staging:
+        dsn: "root@tcp(localhost:3306)/orders"
+`)
+		require.ErrorContains(t, err, "databases.orders.review_policy.enabled requires someone who can approve every PR, but the database accepts any repository and no repos are configured")
+	})
+
+	for name, approvers := range map[string]string{
+		"instance admins":              "review_policy:\n  admin_users:\n    - mona\n",
+		"repo admins":                  "repos:\n  octocat/orders:\n    admin_teams:\n      - octocat/maintainers\n",
+		"admins of every repo":         "repos:\n  octocat/a:\n    admin_teams:\n      - octocat/maintainers\n  octocat/b:\n    admin_users:\n      - mona\n",
+		"operators beside a bare repo": "repos:\n  octocat/orders: {}\n",
+	} {
+		t.Run("an opted-in database approved by "+name+" is accepted", func(t *testing.T) {
+			operators := ""
+			if strings.HasPrefix(name, "operators") {
+				operators = "    operator_users:\n      - mona\n"
+			}
+			cfg, err := loadConfig(t, approvers+`
+databases:
+  orders:
+    type: mysql
+`+operators+`    review_policy:
+      enabled: true
+    environments:
+      staging:
+        dsn: "root@tcp(localhost:3306)/orders"
+`)
+			require.NoError(t, err)
+			assert.True(t, cfg.ReviewPolicyEnabledForDatabase("orders"))
+		})
+	}
+}
+
 func TestServerConfig_IsCheckRequired(t *testing.T) {
 	t.Run("nil receiver requires all checks", func(t *testing.T) {
 		var cfg *ServerConfig
@@ -4760,6 +5022,55 @@ func TestPendingDropsConfig(t *testing.T) {
 			},
 			PendingDrops: PendingDropsConfig{Enabled: boolPtr(false), Retention: "not-a-duration"},
 		}
+		assert.NoError(t, cfg.Validate())
+	})
+}
+
+func TestBranchReconcileConfig(t *testing.T) {
+	t.Run("parsed from YAML", func(t *testing.T) {
+		var cfg ServerConfig
+		require.NoError(t, yaml.Unmarshal([]byte("branch_reconcile:\n  enabled: true\n  delete: true\n  grace: 36h\n"), &cfg))
+		assert.Equal(t, BranchReconcileConfig{Enabled: true, Delete: true, Grace: "36h"}, cfg.BranchReconcile)
+		grace, err := cfg.BranchReconcileGrace()
+		require.NoError(t, err)
+		assert.Equal(t, 36*time.Hour, grace)
+	})
+
+	t.Run("default grace", func(t *testing.T) {
+		cfg := ServerConfig{}
+		grace, err := cfg.BranchReconcileGrace()
+		require.NoError(t, err)
+		assert.Equal(t, 24*time.Hour, grace)
+	})
+
+	t.Run("invalid grace rejected", func(t *testing.T) {
+		cfg := ServerConfig{BranchReconcile: BranchReconcileConfig{Grace: "soon"}}
+		_, err := cfg.BranchReconcileGrace()
+		assert.ErrorContains(t, err, "branch_reconcile.grace")
+	})
+
+	t.Run("non-positive grace rejected", func(t *testing.T) {
+		cfg := ServerConfig{BranchReconcile: BranchReconcileConfig{Grace: "0s"}}
+		_, err := cfg.BranchReconcileGrace()
+		assert.ErrorContains(t, err, "must be positive")
+	})
+
+	databases := map[string]DatabaseConfig{
+		"orders": {
+			Type: "vitess",
+			Environments: map[string]EnvironmentConfig{
+				"staging": {DSN: "root:pass@tcp(localhost:3306)/orders"},
+			},
+		},
+	}
+
+	t.Run("validate rejects invalid grace when enabled", func(t *testing.T) {
+		cfg := ServerConfig{Databases: databases, BranchReconcile: BranchReconcileConfig{Enabled: true, Grace: "soon"}}
+		assert.ErrorContains(t, cfg.Validate(), "branch_reconcile.grace")
+	})
+
+	t.Run("validate ignores invalid grace when disabled", func(t *testing.T) {
+		cfg := ServerConfig{Databases: databases, BranchReconcile: BranchReconcileConfig{Grace: "soon"}}
 		assert.NoError(t, cfg.Validate())
 	})
 }
@@ -5925,11 +6236,6 @@ func TestServerConfig_DirectExecutionPolicyForResolvesByName(t *testing.T) {
 		assert.Nil(t, policy)
 	})
 
-	t.Run("no server-wide policy leaves refused statements blocked", func(t *testing.T) {
-		policy, err := (&ServerConfig{}).DirectExecutionPolicyFor("anything", "production", storage.DatabaseTypeMySQL)
-		require.NoError(t, err)
-		assert.Nil(t, policy)
-	})
 }
 
 // targetNames builds a targets list of bare target names, the spelling that

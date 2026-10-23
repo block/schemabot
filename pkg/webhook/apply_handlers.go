@@ -221,11 +221,15 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 			if a.Database == database && !state.IsTerminalApplyState(a.State) {
 				h.logger.Info("apply blocked by in-progress apply", "repo", repo, "pr", pr, "database", database, "apply_id", a.ApplyIdentifier, "state", a.State)
 				h.postComment(repo, pr, installationID, templates.RenderApplyInProgress(templates.ApplyLockConflictData{
-					Database:    database,
-					Environment: environment,
-					RequestedBy: requestedBy,
-					ApplyID:     a.ApplyIdentifier,
-					ApplyState:  a.State,
+					Database:          database,
+					Environment:       environment,
+					RequestedBy:       requestedBy,
+					ApplyID:           a.ApplyIdentifier,
+					ApplyState:        a.State,
+					ApplyEnvironment:  a.Environment,
+					DeferCutover:      a.GetOptions().DeferCutover,
+					Tenant:            h.deploymentTenant(),
+					ApplyAgainCommand: templates.ApplyCommand(environment, databaseName, applyCommandOptionsOf(result)),
 				}))
 				return false, nil
 			}
@@ -457,7 +461,7 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 			"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
 			"plan_id", planResp.PlanID, "targets", refused.Targets, "deployments", refused.Deployments, "defer_cutover", result.DeferCutover)
 		h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy,
-			rolloutShapeRefusalMessage(refused, action.Apply, environment))
+			rolloutShapeRefusalMessage(refused, action.Apply, environment, h.deploymentTenant()))
 		return false, nil
 	}
 

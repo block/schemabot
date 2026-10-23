@@ -218,7 +218,7 @@ func TestEnginePullSchemaReturnsCancelledContext(t *testing.T) {
 
 	require.ErrorIs(t, err, context.Canceled)
 	assert.Nil(t, response)
-	assert.Contains(t, err.Error(), `PostgreSQL database "pull_cancel_test" for schema pull`)
+	assert.Contains(t, err.Error(), `pull PostgreSQL database "pull_cancel_test": ping PostgreSQL target`)
 	assert.NotContains(t, err.Error(), "refused incomplete baseline")
 }
 
@@ -1159,10 +1159,10 @@ func TestEnginePlanCreateTableIgnoresSizeCeiling(t *testing.T) {
 // surfaces it as a DROP TABLE that is both destructive and blocked, so the
 // reviewer sees the divergence and the apply path can never run the drop. The
 // verdict prescribes only remedies the operator can follow — a table that owns
-// a foreign key cannot be declared, and a table that another table's foreign
-// key references cannot be declared by a pulled file, so each reason names the
-// constraint and the side it lives on instead of a file that cannot be
-// written. A declared table that already matches its file contributes nothing,
+// a foreign key into another namespace cannot be declared, and any other table
+// with a foreign key on either side cannot be declared by a pulled file, so
+// each reason names the constraint and the side it lives on instead of a file
+// that cannot be written. A declared table that already matches its file contributes nothing,
 // even when foreign keys elsewhere reference it. Tables whose definition lives
 // elsewhere are not reported on their own: a partition belongs to its parent
 // and an extension-owned table to its extension. Archive tables are exempt by
@@ -1177,6 +1177,9 @@ func TestEnginePlanUndeclaredTableIsBlockedDrop(t *testing.T) {
 		CREATE TABLE public.orders (id bigint PRIMARY KEY, user_id bigint REFERENCES public.users (id));
 		CREATE TABLE public.regions (id bigint PRIMARY KEY);
 		CREATE TABLE public.warehouses (id bigint PRIMARY KEY, region_id bigint REFERENCES public.regions (id));
+		CREATE SCHEMA billing;
+		CREATE TABLE billing.accounts (id bigint PRIMARY KEY);
+		CREATE TABLE public.invoices (id bigint PRIMARY KEY, account_id bigint REFERENCES billing.accounts (id));
 		CREATE TABLE public.events (id bigint, day date) PARTITION BY RANGE (day);
 		CREATE TABLE public.events_2026 PARTITION OF public.events
 			FOR VALUES FROM ('2026-01-01') TO ('2027-01-01');
@@ -1211,21 +1214,23 @@ func TestEnginePlanUndeclaredTableIsBlockedDrop(t *testing.T) {
 	assert.Equal(t, []string{"audit_log_archive_2019"}, result.ExemptTables[0].Tables)
 	assert.Equal(t, "archive naming", result.ExemptTables[0].Reason)
 	assert.NotContains(t, result.ExemptTables[0].Tables, "legacy_users")
-	require.Len(t, result.Changes[0].TableChanges, 8,
+	require.Len(t, result.Changes[0].TableChanges, 9,
 		"every undeclared table with a definition of its own is reported; the declared table, its partition, the extension-owned table and the archive table are not")
 
 	const declarable = "declare the table in a schema file to keep it under management, or drop it through a separately reviewed process"
-	const ownsForeignKey = `cannot be declared while it carries foreign key constraint(s) "orders_user_id_fkey", which schema files do not support — drop the table, or remove its foreign keys before declaring it, through a separately reviewed process`
-	const referencedByForeignKey = `foreign key constraint(s) "warehouses_region_id_fkey" on other tables reference it, and schema files do not support foreign keys, so the schema pull cannot write a file for it — declare the table by hand in a schema file to keep it under management, or drop it together with the referencing constraints through a separately reviewed process`
+	const ownsForeignKey = `it carries foreign key constraint(s) "orders_user_id_fkey", so the schema pull cannot write a file for it — declare the table by hand in a schema file, foreign keys included, to keep it under management, or drop it through a separately reviewed process`
+	const ownsCrossNamespaceForeignKey = `the table cannot be declared while it carries foreign key constraint(s) "invoices_account_id_fkey", which reference another namespace and schema files do not support — drop the table, or remove those foreign keys before declaring it, through a separately reviewed process`
+	const referencedByForeignKey = `foreign key constraint(s) "warehouses_region_id_fkey" on other tables reference it, so the schema pull cannot write a file for it — declare the table by hand in a schema file to keep it under management, or drop it together with the referencing constraints through a separately reviewed process`
 	for i, want := range []struct{ table, ddl, remedy string }{
 		{"_settings", "DROP TABLE public._settings", declarable},
 		{"events", "DROP TABLE public.events", declarable},
+		{"invoices", "DROP TABLE public.invoices", ownsCrossNamespaceForeignKey},
 		{"legacy_users", "DROP TABLE public.legacy_users", declarable},
 		{"orders", "DROP TABLE public.orders", ownsForeignKey},
 		{"regions", "DROP TABLE public.regions", referencedByForeignKey},
 		{"scratch", "DROP TABLE public.scratch", declarable},
 		{"users_history", "DROP TABLE public.users_history", declarable},
-		{"warehouses", "DROP TABLE public.warehouses", `cannot be declared while it carries foreign key constraint(s) "warehouses_region_id_fkey"`},
+		{"warehouses", "DROP TABLE public.warehouses", `it carries foreign key constraint(s) "warehouses_region_id_fkey", so the schema pull cannot write a file for it`},
 	} {
 		change := result.Changes[0].TableChanges[i]
 		assert.Equal(t, want.table, change.Table)
@@ -1238,7 +1243,7 @@ func TestEnginePlanUndeclaredTableIsBlockedDrop(t *testing.T) {
 		assert.Contains(t, change.ModeReason, `table "`+want.table+`" exists on the target but no schema file in namespace "public" declares it`)
 		assert.Contains(t, change.ModeReason, want.remedy)
 	}
-	for _, table := range []string{"legacy_users", "orders", "regions", "warehouses", "scratch", "users_history", "_settings", "audit_log_archive_2019", "ext_owned_config"} {
+	for _, table := range []string{"legacy_users", "orders", "regions", "warehouses", "invoices", "scratch", "users_history", "_settings", "audit_log_archive_2019", "ext_owned_config"} {
 		assert.True(t, testutil.PostgresTableExists(t, db, "public", table), "planning must never touch the target")
 	}
 }
@@ -1362,6 +1367,8 @@ func TestLiveTablesUnderShadowingSearchPath(t *testing.T) {
 		CREATE TABLE public.ext_owned_config (key text PRIMARY KEY);
 		ALTER EXTENSION hstore ADD TABLE public.ext_owned_config;
 		CREATE SCHEMA hostile;
+		CREATE TABLE hostile.accounts (id bigint PRIMARY KEY);
+		CREATE TABLE public.invoices (id bigint PRIMARY KEY, account_id bigint REFERENCES hostile.accounts (id));
 		CREATE TABLE hostile.pg_class (oid oid, relname name, relnamespace oid, relkind "char", relispartition boolean,
 			relrowsecurity boolean, relforcerowsecurity boolean, reloptions text[]);
 		CREATE TABLE hostile.pg_namespace (oid oid, nspname name);
@@ -1399,14 +1406,15 @@ func TestLiveTablesUnderShadowingSearchPath(t *testing.T) {
 	tables, err := liveTables(t.Context(), pool, "public")
 	require.NoError(t, err)
 	assert.Equal(t, []liveTable{
-		{name: "events", foreignKeys: []string{}, referencedBy: []string{}},
-		{name: "orders", foreignKeys: []string{"orders_user_id_fkey"}, referencedBy: []string{}},
-		{name: "users", foreignKeys: []string{}, referencedBy: []string{"orders_user_id_fkey"}},
+		{name: "events", foreignKeys: []string{}, crossNamespaceForeignKeys: []string{}, referencedBy: []string{}},
+		{name: "invoices", foreignKeys: []string{"invoices_account_id_fkey"}, crossNamespaceForeignKeys: []string{"invoices_account_id_fkey"}, referencedBy: []string{}},
+		{name: "orders", foreignKeys: []string{"orders_user_id_fkey"}, crossNamespaceForeignKeys: []string{}, referencedBy: []string{}},
+		{name: "users", foreignKeys: []string{}, crossNamespaceForeignKeys: []string{}, referencedBy: []string{"orders_user_id_fkey"}},
 	}, tables, "every live table and its foreign keys must be enumerated, and only the partition and the extension-owned table left out, despite the shadowing search_path")
 
 	pulled, err := schemadiff.ListManagedTables(t.Context(), pool, "public")
 	require.NoError(t, err)
-	assert.Equal(t, []string{"events", "orders", "users"}, pulled, "the pull must render the same set the plan holds files accountable for")
+	assert.Equal(t, []string{"events", "invoices", "orders", "users"}, pulled, "the pull must render the same set the plan holds files accountable for")
 
 	namespaces, err := pullNamespaces(t.Context(), pool, "")
 	require.NoError(t, err)
@@ -1944,14 +1952,15 @@ func TestEngineCancelConcurrentIndexBuildWithoutABackendSignal(t *testing.T) {
 	// builder is found through the lock it waits on — the writer's virtual
 	// transaction — rather than through what it is running.
 	var builderPID int
+	var indexOID uint32
 	var builderState sql.NullString
 	require.Eventually(t, func() bool {
 		err := db.QueryRowContext(t.Context(), `
-			SELECT a.pid, a.state
+			SELECT a.pid, a.state, i.indexrelid
 			FROM pg_locks l
 			JOIN pg_stat_activity a ON a.pid = l.pid
 			JOIN pg_index i ON i.indexrelid = to_regclass('public.orders_ref_idx')
-			WHERE a.datname = current_database() AND l.locktype = 'virtualxid' AND NOT l.granted AND NOT i.indisvalid`).Scan(&builderPID, &builderState)
+			WHERE a.datname = current_database() AND l.locktype = 'virtualxid' AND NOT l.granted AND NOT i.indisvalid`).Scan(&builderPID, &builderState, &indexOID)
 		return err == nil
 	}, postgresApplyDeadline, 10*time.Millisecond, "the build never parked behind the writer after creating its invalid catalog entry")
 	require.Equal(t, "disabled", builderState.String, "the server must hide the builder's state, or the tracker signals it and the context path is not what settles the cancel")
@@ -1964,11 +1973,31 @@ func TestEngineCancelConcurrentIndexBuildWithoutABackendSignal(t *testing.T) {
 	got := awaitPostgresProgress(t, eng, "orders")
 	assert.Equal(t, engine.StateCancelled, got.State, "progress: %+v", got)
 	assert.Equal(t, "cancelled", got.Metadata["phase"])
-	assert.Equal(t, `index "public"."orders_ref_idx" may be invalid but its catalog state could not be verified; inspect pg_index.indisvalid on the target before any recovery, then retry`, got.ErrorMessage)
 	assertBackendGone(t, db, builderPID)
 
+	// The detached verdict races the backend's disconnect. If it still
+	// sees the disabled backend, it cannot prove the build stopped and
+	// leaves the original name alone. If the backend is already gone, the
+	// cleanup can prove abandonment and quarantine the index, but its drop
+	// cannot finish while this writer stays open. In either case the same
+	// invalid index must survive, and the detail must match its identity.
+	var indexName string
+	var valid bool
+	err = db.QueryRowContext(t.Context(), `
+		SELECT c.relname, i.indisvalid
+		FROM pg_class c JOIN pg_index i ON i.indexrelid = c.oid
+		WHERE c.oid = $1 AND i.indrelid = 'public.orders'::regclass`, indexOID).Scan(&indexName, &valid)
+	require.NoError(t, err, "the cancelled build's original index must remain on orders")
+	assert.False(t, valid, "the cancelled build must not leave a valid index")
+	expectedDetails := map[string]string{
+		"orders_ref_idx": `index "public"."orders_ref_idx" may be invalid but its catalog state could not be verified; inspect pg_index.indisvalid on the target before any recovery, then retry`,
+		fmt.Sprintf("pgsprite_abandoned_%d", indexOID): `Concurrent index build cancelled; the invalid index remains under "public"."orders_ref_idx" or an identity-derived pgsprite_abandoned_<oid> name; query pg_index joined to pg_class for invalid indexes on the table, then follow the PostgreSQL invalid-index recovery guidance`,
+	}
+	require.Contains(t, expectedDetails, indexName, "only the original or its OID-derived quarantine name is allowed")
+	assert.Equal(t, expectedDetails[indexName], got.ErrorMessage)
+	t.Logf("cancelled index %d remains as %s", indexOID, indexName)
+
 	writer.release(t)
-	assertIndexInvalid(t, db, "orders_ref_idx")
 }
 
 // TestEngineApplyConcurrentIndexBoundEndsTheBuild proves the configured

@@ -16,9 +16,9 @@ import (
 	"time"
 
 	"github.com/block/mysql"
+	"github.com/block/spirit/pkg/check"
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/block/spirit/pkg/dbconn/sqlescape"
-	"github.com/block/spirit/pkg/migration/check"
 	"github.com/block/spirit/pkg/statement"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/utils"
@@ -662,6 +662,12 @@ func (e *Engine) routeAlterStatements(ctx context.Context, target *lazyTargetDB,
 
 		currentCreateTable, err := schema.createTable(ctx, table)
 		if err != nil {
+			if ctx.Err() != nil {
+				// The read was interrupted by a stop, cancel or halt, not by
+				// the target; the caller logs the interruption and keeps the
+				// state the control set, so no failure is logged here.
+				return alterRouting{}, fmt.Errorf("read the current definition of table %q: %w", table, err)
+			}
 			// The raw error carries target infrastructure detail (host, account,
 			// driver internals) and this one surfaces in a PR comment, so the
 			// apply fails with a fixed line and the cause stays in the logs.
@@ -767,6 +773,13 @@ func (e *Engine) executeDirectStatements(ctx context.Context, target *lazyTarget
 	lockWaitSeconds := policy.lockAcquisitionTimeoutSeconds()
 	db, err := openDirectExecutionDB(ctx, target.dsn, lockWaitSeconds)
 	if err != nil {
+		if ctx.Err() != nil {
+			logger.Info("schema change stopped while connecting for direct execution",
+				"database", database,
+				"reason", ctx.Err(),
+			)
+			return false
+		}
 		logger.Error("direct execution failed: cannot connect to target with bounded session lock waits",
 			"database", database, "lock_wait_timeout_seconds", lockWaitSeconds, "error", err)
 		e.setSchemaChangeFailed(fmt.Errorf("connect for direct execution: %w", err))

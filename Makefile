@@ -32,7 +32,7 @@ E2E_GRPC_MD_RUN ?= TestGRPCMultiDeploy
 # reproducing on CI runners.
 export COMPOSE_BAKE := false
 
-.PHONY: help lint lint-fix setup docs-toc check-docs-toc docs-assets templates check-templates check-terminology check-vulnerabilities test test-unit test-consumer-module test-e2e test-e2e-grpc test-e2e-grpc-multideploy test-e2e-k8s test-e2e-local-down test-e2e-mysql test-e2e-vitess test-integration test-localscale build-localscale-image test-coverage build install clean proto up up-telemetry up-grpc down down-grpc status mysql logs logs-grpc test-endpoints plan-testapp apply-testapp seed-testapp seed-testapp-large seed-vitess demo demo-full demo-vitess demo-grpc demo-grpc-logs wait-healthy wait-healthy-grpc wait-localscale cli
+.PHONY: help lint lint-fix setup docs-toc check-docs-toc docs-assets templates check-templates check-terminology check-vulnerabilities test test-unit test-consumer-module test-e2e test-e2e-grpc test-e2e-grpc-multideploy test-e2e-k8s test-e2e-k8s-multi-target test-e2e-local-down test-e2e-mysql test-e2e-vitess test-integration test-localscale build-localscale-image test-coverage build install clean proto up up-telemetry up-grpc down down-grpc status mysql logs logs-grpc test-endpoints plan-testapp apply-testapp seed-testapp seed-testapp-large seed-vitess demo demo-full demo-vitess demo-grpc demo-grpc-logs wait-healthy wait-healthy-grpc wait-localscale cli
 
 # Multi-line message definitions
 define HELP_HEADER
@@ -190,6 +190,7 @@ check-docs-toc: ## Fail if a Table of Contents behind TOC markers is stale
 
 docs-assets: templates ## Re-render the PR mock-ups and animations the docs embed (needs gh, Chrome, ImageMagick, Node.js/Playwright)
 	@python3 scripts/prepare-pr-demo.py
+	@python3 scripts/prepare-pr-multi-target-demo.py
 	@python3 scripts/render-pr-mockups.py --prepared
 	@bash scripts/render-pr-demo.sh
 	@python3 scripts/render-animation.py assets/src/pipeline-never-waits.html assets/pipeline-never-waits.gif
@@ -545,6 +546,12 @@ test-e2e-k8s-etre: ## Run the etre-resolver k8s e2e on minikube
 
 test-e2e-k8s-vitess: ## Run the vitess-resolver k8s e2e on minikube
 	@e2e/k8s/e2e-vitess-test.sh
+
+# Run the multi-target k8s e2e on minikube: one data plane serves several
+# targets, each resolved through Etre to its own MySQL server, and every apply
+# rolls out table by table across them over gRPC.
+test-e2e-k8s-multi-target: ## Run the multi-target rollout k8s e2e on minikube
+	@e2e/k8s/e2e-multi-target-test.sh
 
 # Start local dev environment with gRPC backend (separate Tern server)
 up-grpc:

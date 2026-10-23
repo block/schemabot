@@ -49,21 +49,26 @@ const MaxWebhookEventAttempts = 5
 // environment config at apply-create time and persisted on each apply_operations
 // row so the policy in force when the apply was created travels with it.
 const (
-	// CutoverPolicyRolling is the default: a later deployment does not start
-	// until every earlier sibling in deployment_order has completed, keeping the
-	// rollout fully serial.
+	// CutoverPolicyRolling keeps the rollout fully serial: a later deployment
+	// does not start until every earlier sibling in deployment_order has
+	// completed. It is the default for an environment with any member outside
+	// a targets list, and the fallback for an operation inserted without a
+	// policy.
 	CutoverPolicyRolling = "rolling"
 
 	// CutoverPolicyBarrier lets later deployments run their copy phase once
-	// earlier siblings reach the cutover barrier, while cutover stays ordered.
+	// earlier siblings reach the cutover barrier. Deployments then cut over
+	// strictly in order, each once every earlier deployment has completed.
+	// Within one deployment each target cuts over as soon as its own copy is
+	// parked; an earlier target holds a later one's cutover only while it has
+	// failed, is retrying, or was stopped, cancelled or reverted.
 	CutoverPolicyBarrier = "barrier"
 
 	// CutoverPolicyParallel drops copy-phase ordering: deployments copy
-	// concurrently, bounded by the driver cap and on_failure admission. Only
-	// the cutover phase stays deployment-ordered, exactly like barrier. This
-	// collapses copy wall-clock toward "longest copy" for rollouts whose
-	// hours-long copy dominates, while preserving the ordered, one-at-a-time
-	// cutover swaps.
+	// concurrently, bounded by the driver cap and on_failure admission, and
+	// cut over exactly like barrier. This collapses wall-clock toward "longest
+	// copy" for rollouts whose hours-long copy dominates. It is the default for
+	// an environment whose every member comes from a targets list.
 	CutoverPolicyParallel = "parallel"
 )
 
@@ -251,6 +256,12 @@ const ReviewTimeDeploymentDriftBlockingReason = "review_time_deployment_drift"
 // not-evaluated write exactly like a drift block, since only a plan that
 // re-evaluates placement can lift it.
 const NamespacePlacementRefusedBlockingReason = "namespace_placement_refused"
+
+// SchemaRemovedAfterApplyStartedBlockingReason is the stable
+// Check.BlockingReason value for a row whose schema change left the PR after
+// an apply started. CompleteForApply keeps a row carrying this reason blocked,
+// so an apply finishing after stale cleanup recorded it cannot write it away.
+const SchemaRemovedAfterApplyStartedBlockingReason = "schema_removed_after_apply_started"
 
 type Check struct {
 	// ID is the unique identifier (BIGINT AUTO_INCREMENT).
@@ -569,6 +580,22 @@ func (tc TableChange) TaskEstimatedBytes(shard string) *int64 {
 	return &bytes
 }
 
+// TaskEstimatedRows returns the row estimate a task created from this change
+// carries, under the same whole-table rule as TaskEstimatedBytes: a task
+// scoped to one shard carries none rather than the whole table's count. Only
+// an ALTER copies rows, so a task for any other change carries none either:
+// the plan sizes a table it drops, but that is not work the task will copy.
+func (tc TableChange) TaskEstimatedRows(shard string) *int64 {
+	if shard != "" || tc.EstimatedRows == nil {
+		return nil
+	}
+	if !strings.EqualFold(tc.Operation, "alter") {
+		return nil
+	}
+	rows := *tc.EstimatedRows
+	return &rows
+}
+
 // RequiresUnsafeOptIn reports whether applying this change requires explicit
 // unsafe opt-in. Stored plans keep the planner's unsafe metadata; drop remains
 // fail-closed so older plans without the metadata cannot queue table deletion as
@@ -661,6 +688,13 @@ func (n *NamespacePlanData) ChangesVSchema() bool {
 		return false
 	}
 	return n.Artifacts[VSchemaArtifactName] != ""
+}
+
+// FinalizesWithoutVSchemaChange reports whether the engine finalizes this
+// namespace with no VSchema change for plan and apply surfaces to show: its
+// finalizer runs, but there is nothing of its own to review.
+func (n *NamespacePlanData) FinalizesWithoutVSchemaChange() bool {
+	return n != nil && n.Finalize && !n.ShowsVSchemaChange()
 }
 
 // ShowsVSchemaChange reports whether plan and apply surfaces show this
@@ -1037,11 +1071,20 @@ func (p *Plan) BlockedChanges() []TableChange {
 // a blocked change. Keeping this with the whole-plan verdict ensures every
 // admission path gives the same remedy.
 func (p *Plan) BlockedApplyError() error {
-	blocked := p.BlockedChanges()
-	if len(blocked) == 0 {
+	return BlockedChangeError(p.PlanIdentifier, p.BlockedChanges())
+}
+
+// BlockedChangeError returns the whole-plan refusal for the first blocked
+// change among changes of the named plan, or nil when none is blocked. An
+// admission path judging a subset of a plan's changes, such as a shard
+// dispatch's re-planned scope, refuses with it so it gives the same remedy as
+// BlockedApplyError.
+func BlockedChangeError(planIdentifier string, changes []TableChange) error {
+	i := slices.IndexFunc(changes, TableChange.EngineBlocked)
+	if i < 0 {
 		return nil
 	}
-	change := blocked[0]
+	change := changes[i]
 	reason := change.ModeReason
 	if reason == "" {
 		reason = "the engine refuses this statement"
@@ -1049,9 +1092,9 @@ func (p *Plan) BlockedApplyError() error {
 	// Independent causes are listed one per line so an operator fixing the
 	// first is not surprised by the second on the next attempt.
 	if causes := engine.BlockedCauses(reason); len(causes) > 1 {
-		return fmt.Errorf("stored plan %s contains a blocked change for table %q:\n- %s", p.PlanIdentifier, change.Table, strings.Join(causes, "\n- "))
+		return fmt.Errorf("stored plan %s contains a blocked change for table %q:\n- %s", planIdentifier, change.Table, strings.Join(causes, "\n- "))
 	}
-	return fmt.Errorf("stored plan %s contains a blocked change for table %q: %s", p.PlanIdentifier, change.Table, reason)
+	return fmt.Errorf("stored plan %s contains a blocked change for table %q: %s", planIdentifier, change.Table, reason)
 }
 
 // HasOriginalFilesCapture reports whether every stored namespace has an
@@ -1144,6 +1187,14 @@ type Apply struct {
 	// key outside the manifest is refused. Empty (stored as NULL) means the
 	// apply carries no manifest and completion derives from attached rows alone.
 	ExpectedOperationKeys []string
+
+	// TakesOverApplyIDs names the stopped applies whose unfinished work this
+	// apply takes over, by row ID. It is read only when the apply is created
+	// through CreateWithTasksAndOperations or CreateWithGroupedOperations, which
+	// stamp each named apply's SupersededBy with this apply's identifier in the
+	// transaction that creates it, so the apply and the handoff become visible
+	// together or not at all. It is never stored on the new apply's own row.
+	TakesOverApplyIDs []int64
 
 	// Engine is the schema change engine: "spirit", "planetscale", etc.
 	Engine string
@@ -1290,6 +1341,15 @@ func (a *Apply) IsRollback() bool {
 	return ParseApplyOptions(a.Options).Rollback
 }
 
+// AppliedTarget is one target an apply ran an operation against: the
+// database identifier the apply was registered under, its environment, and
+// the opaque target the data plane resolved.
+type AppliedTarget struct {
+	Database    string
+	Environment string
+	Target      string
+}
+
 // ApplyOperation represents one child row in the apply_operations table:
 // the per-(deployment, operation_key) slice of a multi-operation apply, and the
 // unit of work the driver claim loop reconciles.
@@ -1357,10 +1417,10 @@ type ApplyOperation struct {
 
 	// CutoverPolicy is the rollout sequencing policy captured for this
 	// operation's parent apply at apply-create time, drawn from the resolved
-	// environment config. "rolling" (the default) keeps the fully serial
-	// rollout — a later deployment waits for every earlier sibling to complete.
-	// "barrier" allows later deployments to run their copy phase once earlier
-	// siblings reach the cutover barrier. Persisted on each row so the policy in
+	// environment config. "rolling" keeps the fully serial rollout — a later
+	// deployment waits for every earlier sibling to complete. "barrier" allows
+	// later deployments to run their copy phase once earlier siblings reach the
+	// cutover barrier, and "parallel" starts their copies without waiting. Persisted on each row so the policy in
 	// force when the apply was created travels with the operation. Insert treats
 	// an empty value as "rolling", matching the column's NOT NULL DEFAULT.
 	CutoverPolicy string
@@ -1382,12 +1442,13 @@ type ApplyOperation struct {
 	// and advances only when a driver re-claims the row as a deliberate retry —
 	// the operation is failed_retryable and so is its parent apply. It does not
 	// advance on a crash-recovery re-lease (a still-active parent with a stale
-	// heartbeat, or an in-flight drive whose driver died), so an orphaned
-	// dispatch's idempotency key stays stable and is reused rather than
-	// duplicated. It is the operation-local counterpart to applies.attempt: a
-	// sibling operation's retry advances the shared parent attempt but never this
-	// row's, so an operation-scoped dispatch generation rotates only on its own
-	// retry.
+	// heartbeat, or an in-flight drive whose driver died), so the
+	// count records only retries. It is the operation-local counterpart to
+	// applies.attempt: a sibling operation's retry advances the shared parent
+	// attempt but never this row's. It is a record for triage, not a dispatch
+	// generation: the operation-scoped idempotency key ignores it, so every
+	// dispatch of a deployment, retries included, carries the same key and
+	// lands on the deployment's one remote apply (OW-5).
 	Attempt int
 
 	// AlreadyConverged is true for an operation recorded completed when its
@@ -1461,6 +1522,42 @@ func (op *ApplyOperation) HasFreshLease(now time.Time) bool {
 		return false
 	}
 	return now.Sub(op.UpdatedAt) < ApplyLeaseStaleAfter
+}
+
+// CutoverHoldState returns the state in which op, an earlier member of an
+// ordered rollout, holds a later member's cutover, as
+// FindNextApplyOperationCutover and CutoverBlocker read it. A row in a state
+// the rollout halts on holds in that state. A live drive riding out a
+// data-plane retry keeps its row active and records the retry only on the
+// operation's tasks, so an active row with a retrying task holds as
+// failed_retryable. Otherwise the row's own state is returned, the state an
+// earlier deployment that has not yet completed holds in. tasks are op's own
+// tasks.
+func (op *ApplyOperation) CutoverHoldState(tasks []*Task) string {
+	if state.IsState(op.State,
+		state.ApplyOperation.Failed,
+		state.ApplyOperation.FailedRetryable,
+		state.ApplyOperation.Stopped,
+		state.ApplyOperation.Cancelled,
+		state.ApplyOperation.Reverted,
+	) {
+		return op.State
+	}
+	if TasksRetrying(tasks) {
+		return state.ApplyOperation.FailedRetryable
+	}
+	return op.State
+}
+
+// TasksRetrying reports whether any of tasks is riding out a retryable
+// failure.
+func TasksRetrying(tasks []*Task) bool {
+	for _, task := range tasks {
+		if state.IsState(task.State, state.Task.FailedRetryable) {
+			return true
+		}
+	}
+	return false
 }
 
 // Lease returns the ownership token for this apply_operation.
@@ -1617,6 +1714,13 @@ func (o ControlOperation) Valid() bool {
 	return false
 }
 
+// Command returns the operation spelled as the command an operator types
+// (skip-revert, not the stored skip_revert), for surfaces that name the command
+// back to them.
+func (o ControlOperation) Command() string {
+	return strings.ReplaceAll(string(o), "_", "-")
+}
+
 // retiredControlOperations are operations a previous release recognized that
 // this release removed. Durable rows and data-plane reports naming them can
 // survive an upgrade; no driver services them anymore, so consumers skip them
@@ -1657,7 +1761,7 @@ func MirroredControlRequestMetadata() []byte {
 // cutoverRequestOperationMetadataKey binds a cutover request to the one
 // operation that is to take it. A cutover request is apply-level, so under an
 // ordered cutover policy the binding is what keeps one operator command on the
-// member whose turn it was when the command was accepted, rather than letting
+// member it was accepted for, rather than letting
 // it pass on to the next member once that one has finished.
 const cutoverRequestOperationMetadataKey = "apply_operation_id"
 
@@ -1723,6 +1827,24 @@ const (
 	ControlRequestFailed ControlRequestStatus = "failed"
 )
 
+// QueuedStartStop is what ControlRequestStore.StopQueuedStart found and did.
+type QueuedStartStop string
+
+const (
+	// QueuedStartApplyNotStopped means a claim already took the apply out of
+	// stopped. Nothing was written; the stop takes the path for a running apply.
+	QueuedStartApplyNotStopped QueuedStartStop = "apply_not_stopped"
+	// QueuedStartNone means the apply is stopped with no pending start, so
+	// there is nothing to stop. Nothing was written.
+	QueuedStartNone QueuedStartStop = "no_queued_start"
+	// QueuedStartWithdrawn means the start was completed before any driver
+	// acted on it and the stop was recorded completed: the apply stays stopped.
+	QueuedStartWithdrawn QueuedStartStop = "withdrawn"
+	// QueuedStartStopPending means the start was completed and the stop was
+	// recorded pending for the drive that already claimed an operation.
+	QueuedStartStopPending QueuedStartStop = "stop_pending"
+)
+
 // ApplyControlRequest records durable user control intent.
 // Use this when an HTTP control operation can be accepted before the engine has
 // actually performed the operation.
@@ -1737,6 +1859,11 @@ type ApplyControlRequest struct {
 	CompletedAt  *time.Time
 	CreatedAt    time.Time
 	UpdatedAt    time.Time
+	// Revision counts how many times the row has been re-armed: 0 for the
+	// command it was created with, advanced in the same write that re-arms it
+	// for a new one. It tells two commands on one row apart even when both were
+	// recorded within the same second, which the timestamps cannot.
+	Revision int64
 }
 
 // ReleasesPausedRollout reports whether this request latches a rollout paused
@@ -2002,6 +2129,11 @@ type Task struct {
 	// it. Nil when the plan had no estimate, and for per-shard rows, since a
 	// plan's estimate covers the whole table.
 	EstimatedBytes *int64
+	// EstimatedRows is the planner's approximate row count for the table,
+	// copied from the plan change like EstimatedBytes and under the same
+	// rules, so a task that has not started copying can still show how much
+	// it will copy. The engine's RowsTotal replaces it once the copy reports.
+	EstimatedRows *int64
 	// Checksum phase progress: rows verified so far and total to verify.
 	// Non-zero only while the task is checksumming (verifying copied data).
 	ChecksumRowsChecked int64
@@ -2068,6 +2200,16 @@ type ApplyComment struct {
 	// meaningful, or a row predating phase tracking) is treated the same as
 	// empty: the comment still predates whatever phase the apply is in now.
 	PostedPhase *string
+
+	// PostedCutoverOperationID records which rollout member's cutover a
+	// progress comment posted at or past a deferred cutover tracks: the
+	// operation the apply's cutover request was bound to at post time. A
+	// cutover request is apply-level and is re-bound to each member in turn,
+	// so the phase alone cannot tell one member's cutover from the next; a
+	// request bound to a different member than the tracked comment records is
+	// a cutover the comment does not track yet. Nil when the comment tracks no
+	// member's cutover, including an apply whose cutover request names none.
+	PostedCutoverOperationID *int64
 
 	// PendingFreezeCommentID records the GitHub comment ID of a progress
 	// comment this row's comment superseded whose frozen rendering has not yet

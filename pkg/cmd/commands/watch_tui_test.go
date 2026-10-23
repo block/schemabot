@@ -113,7 +113,7 @@ func TestWatchModel_GivesUpAfterConsecutiveRetryableFailures(t *testing.T) {
 	require.NotNil(t, cmd, "the attempt that reaches the limit ends the watch")
 	assert.IsType(t, tea.QuitMsg{}, cmd())
 	assert.Equal(t, maxConsecutiveProgressFailures, model.consecutiveErrors)
-	assert.Equal(t, progressGiveUpMessage(scriptedApplyID, maxConsecutiveProgressFailures)+": "+failure.errorMsg, model.errorMsg)
+	assert.Equal(t, progressGiveUpMessage(scriptedApplyID, "staging", maxConsecutiveProgressFailures)+": "+failure.errorMsg, model.errorMsg)
 	assert.Contains(t, model.errorMsg, "fetch progress for apply "+scriptedApplyID+": 10 consecutive attempts failed; this watch does not affect the apply")
 	assert.Equal(t, state.Apply.Running, model.state, "the last known state is kept on screen")
 }
@@ -504,6 +504,43 @@ func TestWatchModel_SingleDeploymentOutputDoesNotUseMultiView(t *testing.T) {
 	assert.NotContains(t, withSingleOperation, "us-east — running table copy")
 }
 
+// A sharded apply watches as one change, as its PR comments render it: the
+// shards counted by status, each table once under its keyspace with its
+// shards listed beneath it, and no section for a shard or the finalizer.
+func TestWatchModel_ShardedApplyDoesNotUseMultiView(t *testing.T) {
+	progress := apitypes.ProgressResponse{
+		State:       state.Apply.Running,
+		ApplyID:     "apply-sharded",
+		Database:    "shop",
+		Environment: "staging",
+		Sharded:     true,
+		Operations: []*apitypes.ProgressOperationResponse{
+			{Deployment: "data-plane", OperationKey: "shop_001/-80/orders", OperationKind: storage.ApplyOperationKindWork, State: state.ApplyOperation.Running},
+			{Deployment: "data-plane", OperationKey: "shop_001/80-/orders", OperationKind: storage.ApplyOperationKindWork, State: state.ApplyOperation.Running},
+			{Deployment: "data-plane", OperationKey: "shop_001/group_finalizer", OperationKind: storage.ApplyOperationKindGroupFinalizer, State: state.ApplyOperation.Pending},
+		},
+		Tables: []*apitypes.TableProgressResponse{{
+			Deployment: "data-plane", Keyspace: "shop_001", TableName: "orders", ChangeType: "alter",
+			DDL: "ALTER TABLE `orders` ADD COLUMN `note` text", Status: state.Task.Running, RowsCopied: 840, RowsTotal: 2000, PercentComplete: 42,
+			Shards: []*apitypes.ShardProgressResponse{
+				{Shard: "-80", Status: state.Task.Running, RowsCopied: 420, RowsTotal: 1000, PercentComplete: 42},
+				{Shard: "80-", Status: state.Task.Running, RowsCopied: 420, RowsTotal: 1000, PercentComplete: 42},
+			},
+		}},
+	}
+	m := NewWatchModel("http://localhost:8080", "shop", "staging", false)
+	m.initialized = true
+	updated, _ := m.Update(parseProgressResult(&progress))
+
+	view := updated.(WatchModel).View()
+
+	assert.Equal(t, 1, strings.Count(view, "orders:"), "the table renders once:\n%s", view)
+	assert.Contains(t, view, "Shards:  2 running table copy")
+	assert.Contains(t, view, "Shards: 2 (2 copying)")
+	assert.NotContains(t, view, "group_finalizer")
+	assert.NotContains(t, view, "Deployments:")
+}
+
 func multiDeploymentTUITestProgress() apitypes.ProgressResponse {
 	return apitypes.ProgressResponse{
 		State:       state.Apply.Failed,
@@ -875,7 +912,7 @@ func TestWatchModel_MultiTargetRollupScopesTablesToTheirMember(t *testing.T) {
 
 	assertContainsInOrder(t, view,
 		"Targets: 1 completed · 1 running",
-		"primary — 1 completed · 1 running (2 targets)",
+		"1 completed · 1 running (2 targets)",
 		"users_002",
 		"target testapp-002",
 		"users_001",
@@ -884,6 +921,21 @@ func TestWatchModel_MultiTargetRollupScopesTablesToTheirMember(t *testing.T) {
 		"schemabot stop apply-multi-target -e production",
 		"ESC to detach",
 	)
+	assert.NotContains(t, view, "primary —", "a sole deployment is not named")
 	assert.Equal(t, 1, strings.Count(view, "users_001:"))
 	assert.Equal(t, 1, strings.Count(view, "users_002:"))
+}
+
+// An apply SchemaBot has accepted but not yet started reads as queued in the
+// watch view, matching the PR comment, so a wait for capacity never looks like
+// an apply that hung on startup.
+func TestWatchModel_PendingApplyReadsAsQueued(t *testing.T) {
+	m := NewWatchModel("http://localhost:8080", "testdb", "staging", true)
+	m.initialized = true
+	m.state = state.Apply.Pending
+
+	view := m.View()
+
+	assert.Contains(t, view, "Queued, starts automatically")
+	assert.NotContains(t, view, "Starting")
 }

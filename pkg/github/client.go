@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/block/schemabot/pkg/metrics"
+	"github.com/block/schemabot/pkg/schema"
 	"github.com/bradleyfalzon/ghinstallation/v2"
 	"github.com/gofri/go-github-ratelimit/v2/github_ratelimit"
 	"github.com/gofri/go-github-ratelimit/v2/github_ratelimit/github_secondary_ratelimit"
@@ -319,7 +320,7 @@ func (c *Client) InstallationIDForRepo(ctx context.Context, repo string) (int64,
 
 	installation, _, err := appClient.Apps.FindRepositoryInstallation(ctx, owner, name)
 	if err != nil {
-		return 0, fmt.Errorf("find installation for %s: %w", repo, err)
+		return 0, findInstallationError(repo, err)
 	}
 	id := installation.GetID()
 	if id == 0 {
@@ -331,6 +332,25 @@ func (c *Client) InstallationIDForRepo(ctx context.Context, repo string) (int64,
 	c.repoInstallationsMu.Unlock()
 	c.logger.Info("resolved GitHub App installation for repo", "repo", repo, "installation_id", id)
 	return id, nil
+}
+
+// ErrAppNotInstalled reports that GitHub has no installation of this App
+// covering the repository: GET /repos/{owner}/{repo}/installation answered
+// 404. GitHub gives the same answer when the repository does not exist, since
+// an App cannot see a repository it is not installed on. Either way the App can
+// neither read nor publish the repository's Check Runs until it is installed.
+var ErrAppNotInstalled = errors.New("GitHub App is not installed on the repository")
+
+// findInstallationError wraps a failed installation lookup for repo. Only a 404
+// from the lookup itself carries ErrAppNotInstalled; every other failure (5xx,
+// rate limit, auth, transport) stays a plain error, because the App's coverage
+// of the repository is then unknown rather than known to be absent.
+func findInstallationError(repo string, err error) error {
+	var errResp *gh.ErrorResponse
+	if errors.As(err, &errResp) && errResp.Response != nil && errResp.Response.StatusCode == http.StatusNotFound {
+		return fmt.Errorf("find installation for %s: %w: %w", repo, ErrAppNotInstalled, err)
+	}
+	return fmt.Errorf("find installation for %s: %w", repo, err)
 }
 
 // NewInstallationClient creates an InstallationClient from a pre-configured go-github client.
@@ -771,7 +791,10 @@ type PullRequestInfo struct {
 	HeadRef string
 	HeadSHA string
 	BaseRef string
-	User    string
+	// DefaultBranch is the default branch of the repository the PR targets,
+	// read from the same response as BaseRef.
+	DefaultBranch string
+	User          string
 	// State is the PR's lifecycle state as GitHub reports it: "open" or
 	// "closed" (a merged PR reads as closed).
 	State string
@@ -938,12 +961,13 @@ func (ic *InstallationClient) fetchPullRequest(ctx context.Context, repo string,
 		return nil, err
 	}
 	return &PullRequestInfo{
-		HeadRef: ghPR.GetHead().GetRef(),
-		HeadSHA: ghPR.GetHead().GetSHA(),
-		BaseRef: ghPR.GetBase().GetRef(),
-		User:    ghPR.GetUser().GetLogin(),
-		State:   ghPR.GetState(),
-		Merged:  ghPR.GetMerged(),
+		HeadRef:       ghPR.GetHead().GetRef(),
+		HeadSHA:       ghPR.GetHead().GetSHA(),
+		BaseRef:       ghPR.GetBase().GetRef(),
+		DefaultBranch: ghPR.GetBase().GetRepo().GetDefaultBranch(),
+		User:          ghPR.GetUser().GetLogin(),
+		State:         ghPR.GetState(),
+		Merged:        ghPR.GetMerged(),
 	}, nil
 }
 
@@ -1125,6 +1149,24 @@ func (ic *InstallationClient) SchemaPathsChangedSinceMergeBase(ctx context.Conte
 // earlier approvals stop counting.
 const maxSchemaSymlinkReads = 64
 
+// maxSchemaStatementComparisons bounds how many schema files a schema change
+// comparison reads to compare their statements, each costing up to four blob
+// reads. Only files that both the pull request and the base branch edited are
+// compared this way, which a rebase normally produces for a handful of files,
+// so the value leaves wide headroom. Past it, a file counts as changed.
+const maxSchemaStatementComparisons = 16
+
+// SchemaFileChangeComparer reports whether a pull request's edit to one
+// schema file generates the same schema change statements on two bases:
+// approvedBase to approved at the approved commit, and headBase to head at
+// the head. It is supplied by the database's dialect, since only the dialect
+// can understand the file, and it may run the files on the database's target
+// to do so. same is false, with reason saying why for operator logs, when the
+// statements differ or the head replaces something the base changed in
+// between. An error means the files could not be compared, which proves
+// nothing.
+type SchemaFileChangeComparer func(ctx context.Context, approvedBase, approved, headBase, head string) (same bool, reason string, err error)
+
 // SchemaChangeComparison is the outcome of PRSchemaChangeUnchangedSince.
 type SchemaChangeComparison struct {
 	// Unchanged is true when the pull request's change to the schema paths is
@@ -1140,6 +1182,14 @@ type SchemaChangeComparison struct {
 	// BaseMovedForward is true when the head's merge base is the approved
 	// commit's merge base or a descendant of it.
 	BaseMovedForward bool
+	// BaseIsDefaultBranch is true when the pull request targets the
+	// repository's default branch. It is false when the default branch is
+	// unknown, so unknown base content is never trusted.
+	BaseIsDefaultBranch bool
+	// StatementComparedPaths are the schema files whose content differs
+	// between the approved commit and the head but whose statements were
+	// proved the same, for operator logs.
+	StatementComparedPaths []string
 }
 
 // PRSchemaChangeUnchangedSince reports whether the change a pull request
@@ -1151,16 +1201,34 @@ type SchemaChangeComparison struct {
 // when the pull request turns the same base content into the same result at
 // both commits, or when it leaves the path as its base branch has it at both
 // commits, so any difference came from the base branch rather than from the
-// pull request. That second rule holds only when the head's base content is
-// newer than the approved commit's: the head's merge base must descend from
-// the approved commit's. A head rebuilt on older base content would otherwise
-// carry an older version of a path the pull request never touched, which
-// nobody approved for this change. Identical content on different bases is
-// not unchanged either: the head would undo or overwrite the base branch's
-// change. Rebasing onto, or
-// merging in, a newer base branch therefore leaves the change unchanged; a
+// pull request. A path the pull request no longer touches at the head is also
+// unchanged when the base branch changed it since the approved commit's base:
+// what the pull request did there has been replaced by base branch content,
+// as when a stacked pull request below this one merges and this one is
+// rebased. Both rules hold only when baseRef is defaultBranch, the
+// repository's default branch, whose changes are expected to have had their
+// own review, and only when the head's base content is newer than the
+// approved commit's: the head's merge base must descend from the approved
+// commit's. A head rebuilt on older base content would otherwise carry an
+// older version of a path the pull request never touched, which nobody
+// approved for this change. Identical content on different bases is not
+// unchanged either: the head would undo or overwrite the base branch's
+// change. Rebasing onto, or merging in, a newer base branch therefore leaves
+// the change unchanged; a
 // path the pull request edits, adds, deletes, or resolves differently at the
 // head does not. Directories that satisfy neither are compared entry by entry.
+//
+// A schema file the pull request and the base branch both edited, as a
+// rebase that combines the two in one file produces, still differs by
+// content. When compareStatements is set, such a file is unchanged if the
+// dialect proves the pull request's edit generates the same schema change
+// statements at both commits without replacing anything the base branch
+// changed (see SchemaFileChangeComparer). The file must be a regular .sql
+// file at all four commits, and when the two bases differ the same
+// default-branch rule applies, since the head's statements then rest on base
+// content. A nil compareStatements, an ineligible file, a comparer that
+// cannot prove the change is the same, or more such files than
+// maxSchemaStatementComparisons all leave the file changed.
 //
 // Git objects are content-addressed, so content is compared by object SHA,
 // type, and mode, and a path absent at a commit is compared as absent. A
@@ -1172,8 +1240,8 @@ type SchemaChangeComparison struct {
 // too large to list completely, a path runs through a symlink, a symlink
 // points outside the repository, or there were more distinct symlinks to read
 // than maxSchemaSymlinkReads.
-func (ic *InstallationClient) PRSchemaChangeUnchangedSince(ctx context.Context, repo, baseRef, approvedSHA, headSHA string, paths []string) (SchemaChangeComparison, error) {
-	var result SchemaChangeComparison
+func (ic *InstallationClient) PRSchemaChangeUnchangedSince(ctx context.Context, repo, baseRef, defaultBranch, approvedSHA, headSHA string, paths []string, compareStatements SchemaFileChangeComparer) (SchemaChangeComparison, error) {
+	result := SchemaChangeComparison{BaseIsDefaultBranch: defaultBranch != "" && baseRef == defaultBranch}
 	baseTipSHA, err := ic.branchTipSHA(ctx, repo, baseRef)
 	if err != nil {
 		return result, err
@@ -1190,14 +1258,17 @@ func (ic *InstallationClient) PRSchemaChangeUnchangedSince(ctx context.Context, 
 	}
 
 	comparer := &schemaChangeComparer{
-		ic:               ic,
-		repo:             repo,
-		commits:          [4]string{approvedSHA, result.ApprovedMergeBaseSHA, headSHA, result.HeadMergeBaseSHA},
-		baseMovedForward: result.BaseMovedForward,
-		levelCache:       make(map[string][]TreeEntry),
-		symlinkText:      make(map[string]string),
+		ic:                  ic,
+		repo:                repo,
+		commits:             [4]string{approvedSHA, result.ApprovedMergeBaseSHA, headSHA, result.HeadMergeBaseSHA},
+		baseContentReviewed: result.BaseIsDefaultBranch && result.BaseMovedForward,
+		levelCache:          make(map[string][]TreeEntry),
+		symlinkText:         make(map[string]string),
+		compareStatements:   compareStatements,
+		blobText:            make(map[string]string),
 	}
 	differingPath, err := comparer.compare(ctx, paths)
+	result.StatementComparedPaths = comparer.statementComparedPaths
 	if err != nil {
 		return result, fmt.Errorf("compare schema change in %s between approved commit %s and head %s: %w", repo, approvedSHA, headSHA, err)
 	}
@@ -1232,17 +1303,27 @@ type schemaChangeComparer struct {
 	ic      *InstallationClient
 	repo    string
 	commits [4]string
-	// baseMovedForward is true when the head's merge base descends from the
-	// approved commit's, so a path the pull request leaves as its base has it
-	// at both commits differs only by newer base content.
-	baseMovedForward bool
-	levelCache       map[string][]TreeEntry
+	// baseContentReviewed is true when the pull request targets the default
+	// branch and the head's merge base descends from the approved commit's, so
+	// base content that differs between the two is newer default branch
+	// content that had its own review.
+	baseContentReviewed bool
+	levelCache          map[string][]TreeEntry
 	// symlinkText caches each symlink object's target text by blob SHA, so
 	// links with the same target text cost one read.
 	symlinkText map[string]string
 	// warnedSymlinkBudget is set once the comparison has logged that it read
 	// more than half of maxSchemaSymlinkReads.
 	warnedSymlinkBudget bool
+	// compareStatements is the dialect's statement comparison, or nil when
+	// files are compared by content alone.
+	compareStatements SchemaFileChangeComparer
+	// blobText caches schema file content by blob SHA for statement
+	// comparisons.
+	blobText map[string]string
+	// statementComparedPaths are the files proved unchanged by their
+	// statements; each one used up part of maxSchemaStatementComparisons.
+	statementComparedPaths []string
 }
 
 type schemaChangeItem struct {
@@ -1283,7 +1364,7 @@ func (c *schemaChangeComparer) compare(ctx context.Context, paths []string) (str
 		s := item.sides
 		identical := sameGitObject(s[sideApproved], s[sideHead])
 		switch {
-		case sameChange(s) || (c.baseMovedForward && untouchedByPR(s)):
+		case c.pathUnchanged(s):
 			sides := []gitSide{s[sideHead]}
 			if !identical {
 				sides = append(sides, s[sideApproved])
@@ -1305,10 +1386,130 @@ func (c *schemaChangeComparer) compare(ctx context.Context, paths []string) (str
 			}
 			pending = append(pending, children...)
 		default:
-			return item.path, nil
+			same, err := c.sameStatements(ctx, item)
+			if err != nil {
+				return "", err
+			}
+			if !same {
+				return item.path, nil
+			}
 		}
 	}
 	return "", nil
+}
+
+// sameStatements reports whether a file whose content differs between the
+// approved commit and the head still generates the same schema change
+// statements (see PRSchemaChangeUnchangedSince). Anything short of proof
+// returns false, so any doubt counts as a change; an error means GitHub could
+// not serve the file's content, or the evaluation was cancelled while the
+// dialect compared the file.
+func (c *schemaChangeComparer) sameStatements(ctx context.Context, item schemaChangeItem) (bool, error) {
+	logAttrs := []any{"repo", c.repo, "path", item.path,
+		"approved_sha", c.commits[sideApproved], "head_sha", c.commits[sideHead]}
+	if c.compareStatements == nil {
+		c.ic.logger.Debug("review gate comparison: schema path differs and its dialect has no statement comparison", logAttrs...)
+		return false, nil
+	}
+	if !statementComparable(item) {
+		c.ic.logger.Debug("review gate comparison: schema path differs and is not a regular .sql file at every commit, so its statements are not compared", logAttrs...)
+		return false, nil
+	}
+	if !sameGitObject(item.sides[sideApprovedBase], item.sides[sideHeadBase]) && !c.baseContentReviewed {
+		c.ic.logger.Info("review gate comparison: schema file differs on two bases that are not both default branch content in order, so its statements are not compared", logAttrs...)
+		return false, nil
+	}
+	if len(c.statementComparedPaths) >= maxSchemaStatementComparisons {
+		c.ic.logger.Warn("review gate comparison reached its statement comparison budget; the schema file counts as changed and the approval on the earlier commit does not count",
+			append(logAttrs, "statement_comparison_budget", maxSchemaStatementComparisons)...)
+		return false, nil
+	}
+	var contents [4]string
+	for i, side := range item.sides {
+		// A base the file is absent from is passed as "", which the dialect
+		// reads as a file the pull request adds.
+		if !side.found {
+			continue
+		}
+		text, ok := c.blobText[side.entry.SHA]
+		if !ok {
+			var err error
+			text, err = c.ic.FetchBlobContent(ctx, c.repo, side.entry.SHA)
+			if err != nil {
+				return false, fmt.Errorf("read schema file %s at %s in repo %s: %w", item.path, c.commits[i], c.repo, err)
+			}
+			c.blobText[side.entry.SHA] = text
+		}
+		contents[i] = text
+	}
+	same, reason, err := c.compareStatements(ctx, contents[sideApprovedBase], contents[sideApproved], contents[sideHeadBase], contents[sideHead])
+	if err != nil {
+		// A comparison cut short by the evaluation's own cancellation proves
+		// nothing about the file, so the evaluation fails instead of
+		// recording the file as changed.
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return false, fmt.Errorf("compare statements of schema file %s in repo %s: evaluation cancelled: %w",
+				item.path, c.repo, errors.Join(ctxErr, err))
+		}
+		c.ic.logger.Info("review gate comparison: cannot compare a schema file's statements, so it counts as changed",
+			append(logAttrs, "error", err)...)
+		return false, nil
+	}
+	if !same {
+		c.ic.logger.Info("review gate comparison: schema file generates different statements at the approved commit and the head",
+			append(logAttrs, "reason", reason)...)
+		return false, nil
+	}
+	c.ic.logger.Info("review gate comparison: schema file's content differs but it generates the same statements at the approved commit and the head", logAttrs...)
+	c.statementComparedPaths = append(c.statementComparedPaths, item.path)
+	return true, nil
+}
+
+// statementComparable reports whether item is a .sql file whose content at
+// each commit is a schema file the dialect can parse: a regular file at all
+// four commits, or a file the pull request adds, absent at both bases and a
+// regular file at the approved commit and the head.
+func statementComparable(item schemaChangeItem) bool {
+	if path.Ext(item.path) != ".sql" {
+		return false
+	}
+	added := !item.sides[sideApprovedBase].found && !item.sides[sideHeadBase].found
+	for i, side := range item.sides {
+		if added && (i == sideApprovedBase || i == sideHeadBase) {
+			continue
+		}
+		if !regularFile(side) {
+			return false
+		}
+	}
+	return true
+}
+
+// regularFile reports whether side is a regular file, not a directory, a
+// symlink, or absent.
+func regularFile(side gitSide) bool {
+	return side.found && side.entry.Type == "blob" && side.entry.Mode != gitSymlinkMode
+}
+
+// pathUnchanged reports whether the pull request's change to a path is the
+// same at the approved commit and the head, or differs only by base branch
+// content that had its own review: the pull request makes the same change on
+// the same base, it leaves the path alone at both commits, or it no longer
+// touches a path the base branch has changed since the approval. The last two
+// trust base branch content, so they hold only when that content is newer
+// default branch content (see baseContentReviewed).
+//
+// supersededByBase never decides a directory on every side: inside it, a file
+// the pull request dropped without the base branch changing it must still
+// count as a change, so the directory is compared entry by entry instead.
+func (c *schemaChangeComparer) pathUnchanged(s [4]gitSide) bool {
+	if sameChange(s) {
+		return true
+	}
+	if !c.baseContentReviewed {
+		return false
+	}
+	return untouchedByPR(s) || (supersededByBase(s) && !onlyTrees(s))
 }
 
 // sameChange reports whether the pull request turns the same base content
@@ -1324,6 +1525,18 @@ func sameChange(sides [4]gitSide) bool {
 // base branch.
 func untouchedByPR(sides [4]gitSide) bool {
 	return sameGitObject(sides[sideApproved], sides[sideApprovedBase]) && sameGitObject(sides[sideHead], sides[sideHeadBase])
+}
+
+// supersededByBase reports whether the pull request leaves the path as its
+// base branch has it at the head, and the base branch has changed the path
+// since the approved commit's base. Whatever the pull request did to the path
+// when it was approved has been replaced by base branch content that reached
+// the base branch through its own review, as when a stacked pull request
+// below this one merges and this one is rebased onto it. A path the pull
+// request stopped changing that the base branch did not change is not
+// superseded: dropping part of a change is a different change.
+func supersededByBase(sides [4]gitSide) bool {
+	return sameGitObject(sides[sideHead], sides[sideHeadBase]) && !sameGitObject(sides[sideApprovedBase], sides[sideHeadBase])
 }
 
 // onlyTrees reports whether every side where the path exists is a directory,
@@ -1436,6 +1649,26 @@ func (c *schemaChangeComparer) resolveSymlinks(ctx context.Context, links []Tree
 		targets = append(targets, target)
 	}
 	return targets, nil
+}
+
+// repositoryDefaultBranch returns the name of repo's default branch.
+func (ic *InstallationClient) repositoryDefaultBranch(ctx context.Context, repo string) (string, error) {
+	owner, repoName := splitRepo(repo)
+	repository, err := retryGitHubUnavailableRead(ctx, ic.logger, "resolve repository default branch", []any{"repo", repo}, func(ctx context.Context) (*gh.Repository, error) {
+		repository, _, err := ic.client.Repositories.Get(ctx, owner, repoName)
+		if err != nil {
+			return nil, fmt.Errorf("get repository: %w", classifyGitHubAPIError(err))
+		}
+		return repository, nil
+	})
+	if err != nil {
+		return "", err
+	}
+	defaultBranch := repository.GetDefaultBranch()
+	if defaultBranch == "" {
+		return "", fmt.Errorf("repository %s reports no default branch", repo)
+	}
+	return defaultBranch, nil
 }
 
 // branchTipSHA resolves branch to the commit it points at now.
@@ -1555,12 +1788,16 @@ func pathInsideAny(p string, dirs []string) bool {
 // A file is kept when its object at headSHA differs from the object at the
 // default branch tip, which is what "this pull request proposes it" means: if
 // the content already matches what the default branch declares, merging changes
-// nothing for that file. The default branch is the right yardstick because it
+// nothing for that file. A rename is also kept when it vacates a schema path the
+// default branch still holds, since merging it stops declaring that file's
+// tables. The default branch is the right yardstick because it
 // is the one SchemaBot already privileges — the post-merge reconcile runs for
 // it alone, and a registered repository cannot be pointed at another ref.
 //
-// The result is always a subset of files, so this can only ever narrow
-// discovery: it cannot surface a database that was not already discovered.
+// Every kept file is one of files, unchanged except that a rename the default
+// branch already holds has its PreviousFilename cleared, so this can only ever
+// narrow discovery: it cannot surface a database that was not already
+// discovered.
 // Only the files discovery keys on are compared, so a pull request that touches
 // no schema costs no API calls.
 func (ic *InstallationClient) PRFilesProposedAgainstDefaultBranch(ctx context.Context, repo, headSHA string, files []PRFile) (proposed []PRFile, defaultTipSHA string, err error) {
@@ -1569,19 +1806,9 @@ func (ic *InstallationClient) PRFilesProposedAgainstDefaultBranch(ctx context.Co
 	}
 
 	owner, repoName := splitRepo(repo)
-	repository, err := retryGitHubUnavailableRead(ctx, ic.logger, "resolve repository default branch", []any{"repo", repo}, func(ctx context.Context) (*gh.Repository, error) {
-		repository, _, err := ic.client.Repositories.Get(ctx, owner, repoName)
-		if err != nil {
-			return nil, fmt.Errorf("get repository: %w", classifyGitHubAPIError(err))
-		}
-		return repository, nil
-	})
+	defaultBranch, err := ic.repositoryDefaultBranch(ctx, repo)
 	if err != nil {
 		return nil, "", err
-	}
-	defaultBranch := repository.GetDefaultBranch()
-	if defaultBranch == "" {
-		return nil, "", fmt.Errorf("repository %s reports no default branch", repo)
 	}
 
 	// Pin the tip up front so a commit landing on the default branch mid-pass
@@ -1607,28 +1834,78 @@ func (ic *InstallationClient) PRFilesProposedAgainstDefaultBranch(ctx context.Co
 	levelCache := make(map[string][]TreeEntry)
 	proposed = make([]PRFile, 0, len(files))
 	for _, file := range files {
-		if !isDiscoveryInputFile(file.Filename) {
+		if !isDiscoveryInputPRFile(file) {
 			proposed = append(proposed, file)
 			continue
 		}
-		headObjectSHA, headObjectType, headFound, err := ic.resolveGitObjectSHA(ctx, repo, headSHA, file.Filename, levelCache)
-		if err != nil {
-			return nil, defaultTipSHA, fmt.Errorf("resolve %s at head %s: %w", file.Filename, headSHA, err)
+		// The current path and the vacated path are separate claims, so each
+		// is measured on its own: a pull request can edit the destination of a
+		// rename the default branch already holds without proposing the
+		// removal again.
+		keep := false
+		if isDiscoveryInputFile(file.Filename) {
+			differs, err := ic.pathDiffersFromDefaultBranch(ctx, repo, headSHA, defaultTipSHA, file.Filename, levelCache)
+			if err != nil {
+				return nil, defaultTipSHA, err
+			}
+			keep = differs
 		}
-		defaultObjectSHA, defaultObjectType, defaultFound, err := ic.resolveGitObjectSHA(ctx, repo, defaultTipSHA, file.Filename, levelCache)
-		if err != nil {
-			return nil, defaultTipSHA, fmt.Errorf("resolve %s at default branch tip %s: %w", file.Filename, defaultTipSHA, err)
+		// A rename proposes vacating its previous schema path only when the
+		// head lacks that path and the default branch still declares it; a
+		// rename the default branch already holds is inherited history, so
+		// its previous path is cleared and discovery does not resolve the
+		// config that managed it.
+		if vacated, ok := renamedAwaySchemaPath(file); ok {
+			removes, err := ic.pathRemovedFromDefaultBranch(ctx, repo, headSHA, defaultTipSHA, vacated, levelCache)
+			if err != nil {
+				return nil, defaultTipSHA, err
+			}
+			if removes {
+				keep = true
+			} else {
+				file.PreviousFilename = ""
+			}
 		}
-
-		switch {
-		case headFound != defaultFound:
-			// Added by this pull request, or deleted by it.
-			proposed = append(proposed, file)
-		case headFound && (headObjectSHA != defaultObjectSHA || headObjectType != defaultObjectType):
+		if keep {
 			proposed = append(proposed, file)
 		}
 	}
 	return proposed, defaultTipSHA, nil
+}
+
+// pathDiffersFromDefaultBranch reports whether objectPath at headSHA differs
+// from the default branch tip: added, deleted, or changed in content or type.
+func (ic *InstallationClient) pathDiffersFromDefaultBranch(ctx context.Context, repo, headSHA, defaultTipSHA, objectPath string, levelCache map[string][]TreeEntry) (bool, error) {
+	headObjectSHA, headObjectType, headFound, err := ic.resolveGitObjectSHA(ctx, repo, headSHA, objectPath, levelCache)
+	if err != nil {
+		return false, fmt.Errorf("resolve %s at head %s: %w", objectPath, headSHA, err)
+	}
+	defaultObjectSHA, defaultObjectType, defaultFound, err := ic.resolveGitObjectSHA(ctx, repo, defaultTipSHA, objectPath, levelCache)
+	if err != nil {
+		return false, fmt.Errorf("resolve %s at default branch tip %s: %w", objectPath, defaultTipSHA, err)
+	}
+	if headFound != defaultFound {
+		// Added by this pull request, or deleted by it.
+		return true, nil
+	}
+	return headFound && (headObjectSHA != defaultObjectSHA || headObjectType != defaultObjectType), nil
+}
+
+// pathRemovedFromDefaultBranch reports whether merging headSHA removes
+// objectPath: the default branch tip holds it and the head does not.
+func (ic *InstallationClient) pathRemovedFromDefaultBranch(ctx context.Context, repo, headSHA, defaultTipSHA, objectPath string, levelCache map[string][]TreeEntry) (bool, error) {
+	_, _, headFound, err := ic.resolveGitObjectSHA(ctx, repo, headSHA, objectPath, levelCache)
+	if err != nil {
+		return false, fmt.Errorf("resolve vacated %s at head %s: %w", objectPath, headSHA, err)
+	}
+	if headFound {
+		return false, nil
+	}
+	_, _, defaultFound, err := ic.resolveGitObjectSHA(ctx, repo, defaultTipSHA, objectPath, levelCache)
+	if err != nil {
+		return false, fmt.Errorf("resolve vacated %s at default branch tip %s: %w", objectPath, defaultTipSHA, err)
+	}
+	return defaultFound, nil
 }
 
 // CheckRunOptions contains options for creating or updating a GitHub Check Run.
@@ -1740,6 +2017,8 @@ type CheckRunResult struct {
 	Name       string
 	Status     string // "queued", "in_progress", "completed"
 	Conclusion string // "success", "failure", "neutral", "action_required"
+	// Title is the run's output title; empty when the run has none.
+	Title string
 	// StartedAt is when the Check Run was started; zero when GitHub did not
 	// report a start time. Lets callers judge how long a run that never
 	// completed has been sitting.
@@ -1810,6 +2089,7 @@ func (ic *InstallationClient) FindCheckRunByName(ctx context.Context, repo, head
 						Name:       run.GetName(),
 						Status:     run.GetStatus(),
 						Conclusion: run.GetConclusion(),
+						Title:      run.GetOutput().GetTitle(),
 						StartedAt:  run.GetStartedAt().Time,
 					}
 				}
@@ -2723,7 +3003,7 @@ func (ic *InstallationClient) symlinkedNamespaceLocators(ctx context.Context, re
 		return nil, fmt.Errorf("schema namespace symlink %s points to absolute path %s", entry.GetPath(), target)
 	}
 	resolved := path.Clean(path.Join(schemaPath, target))
-	if !schemaPathWithinDirectory(".", resolved) {
+	if !schema.PathWithinDirectory(".", resolved) {
 		return nil, fmt.Errorf("schema namespace symlink %s points outside the repository: %s", entry.GetPath(), target)
 	}
 	if resolved == "." || resolved == path.Clean(schemaPath) || resolved == path.Clean(entry.GetPath()) {

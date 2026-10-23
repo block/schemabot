@@ -1,6 +1,7 @@
 package commands
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -43,7 +44,7 @@ type ApplyCmd struct {
 }
 
 // Run executes the apply command.
-func (cmd *ApplyCmd) Run(g *Globals) error {
+func (cmd *ApplyCmd) Run(ctx context.Context, g *Globals) error {
 	if cmd.NoLock && cmd.Force {
 		return fmt.Errorf("--force requires locking to break an existing lock; remove --no-lock to use it")
 	}
@@ -262,6 +263,12 @@ func (cmd *ApplyCmd) Run(g *Globals) error {
 
 	// Step 4: Acquire lock and apply the plan
 
+	// A Ctrl-C during planning or the prompt ends the command here, before
+	// any lock is taken or released on the operator's behalf.
+	if ctx.Err() != nil {
+		return stoppedBeforeSubmit(ctx, "apply")
+	}
+
 	if !cmd.NoLock {
 		// If --force, break any existing lock first
 		if cmd.Force {
@@ -326,7 +333,7 @@ func (cmd *ApplyCmd) Run(g *Globals) error {
 	// what each runs. Members the server listed as refused were turned away
 	// before the prompt; a member whose own plan apply creation refuses
 	// without having listed it is refused by POST /api/apply instead.
-	applyID, err := applyAndWatch(ep, planResult, true, cfg.Database, cmd.Environment, owner, "apply", cmd.DeferCutover, cmd.DeferDeploy, cmd.SkipRevert, cmd.AllowUnsafe, cmd.Branch, cmd.Watch, cmd.Output, cmd.LogHeartbeat)
+	applyID, err := applyAndWatch(ctx, ep, planResult, true, cfg.Database, cmd.Environment, owner, "apply", cmd.DeferCutover, cmd.DeferDeploy, cmd.SkipRevert, cmd.AllowUnsafe, cmd.Branch, cmd.Watch, cmd.Output, cmd.LogHeartbeat)
 	if err != nil {
 		if cmd.Yield && !cmd.NoLock && applyID != "" {
 			return errors.Join(err, yieldLock(ep, cfg.Database, cfg.Type, owner, cmd.Environment, applyID))
@@ -414,11 +421,11 @@ func lockKeptReason(applyID, environment string, progress *apitypes.ProgressResp
 	case state.IsState(applyState, state.NoActiveChange):
 		return fmt.Sprintf("the server reported no state for apply %s", applyID)
 	case state.IsState(applyState, state.Apply.Failed) && len(progress.Operations) == 0:
-		return fmt.Sprintf("apply %s is failed and the server reported no deployment rows to check (see %s progress -e %s %s)",
-			applyID, cliname.Name(), environment, applyID)
+		return fmt.Sprintf("apply %s is failed and the server reported no deployment rows to check (see %s)",
+			applyID, templates.ProgressCommand(applyID, environment))
 	case state.IsState(applyState, state.SettledApplyStates...):
-		return fmt.Sprintf("apply %s is %s, but not every deployment and table under it has stopped yet (see %s progress -e %s %s)",
-			applyID, applyState, cliname.Name(), environment, applyID)
+		return fmt.Sprintf("apply %s is %s, but not every deployment and table under it has stopped yet (see %s)",
+			applyID, applyState, templates.ProgressCommand(applyID, environment))
 	default:
 		return fmt.Sprintf("apply %s has not finished (state: %s)", applyID, applyState)
 	}
@@ -461,16 +468,16 @@ const (
 // WatchApplyProgressWithFormat polls the progress API by apply ID with the
 // specified output format. logHeartbeat controls the interval between progress
 // heartbeats in log mode (0 = default 10s).
-func WatchApplyProgressWithFormat(endpoint, applyID, environment string, allowControlActions bool, format OutputFormat, logHeartbeat time.Duration) error {
+func WatchApplyProgressWithFormat(ctx context.Context, endpoint, applyID, environment string, allowControlActions bool, format OutputFormat, logHeartbeat time.Duration) error {
 	// Use log format for CI/server environments
 	if format == OutputFormatLog {
 		if logHeartbeat <= 0 {
 			logHeartbeat = logHeartbeatDefault
 		}
-		return watchApplyProgressLog(newProgressPoller(endpoint, applyID), logHeartbeat)
+		return watchApplyProgressLog(newProgressPoller(ctx, endpoint, applyID, environment), logHeartbeat)
 	}
 	if format == OutputFormatJSON {
-		return watchApplyProgressJSON(newProgressPoller(endpoint, applyID))
+		return watchApplyProgressJSON(newProgressPoller(ctx, endpoint, applyID, environment))
 	}
 
 	// Interactive format: use Bubbletea TUI
@@ -479,8 +486,8 @@ func WatchApplyProgressWithFormat(endpoint, applyID, environment string, allowCo
 
 // WatchApplyProgressAfterCutover polls the progress API after cutover has been triggered.
 // It waits for completion without showing the "waiting for cutover" instructions.
-func WatchApplyProgressAfterCutover(endpoint, applyID string) error {
-	return watchAfterCutover(newProgressPoller(endpoint, applyID))
+func WatchApplyProgressAfterCutover(ctx context.Context, endpoint, applyID, environment string) error {
+	return watchAfterCutover(newProgressPoller(ctx, endpoint, applyID, environment))
 }
 
 func watchAfterCutover(poller *progressPoller) error {
@@ -516,7 +523,9 @@ func watchAfterCutover(poller *progressPoller) error {
 		}
 
 		// Still processing - just wait (don't show waiting instructions since cutover was already triggered)
-		poller.sleep(pollInterval)
+		if err := poller.pause(pollInterval); err != nil {
+			return err
+		}
 	}
 }
 
@@ -590,9 +599,9 @@ func (cmd *ApplyCmd) refuseActiveSchemaChange(database string, check func() (*cl
 	fmt.Println(stateMsg)
 	fmt.Println()
 	if state.IsState(active.State, state.Apply.WaitingForDeploy, state.Apply.WaitingForCutover) {
-		fmt.Printf("To trigger cutover:  %s cutover -e %s %s\n", cliname.Name(), cmd.Environment, active.ApplyID)
+		fmt.Printf("To trigger cutover:  %s\n", cliname.Command("cutover", "-e", cmd.Environment, active.ApplyID))
 	}
-	fmt.Printf("To watch and manage: %s status %s\n", cliname.Name(), active.ApplyID)
+	fmt.Printf("To watch and manage: %s\n", cliname.Command("status", active.ApplyID))
 	return fmt.Errorf("schema change already in progress")
 }
 
@@ -664,7 +673,7 @@ func rolloutRefusalSummary(refused []*apitypes.PlanMemberRefusalResponse, enviro
 			entries = append(entries, fmt.Sprintf("%s (%s; no apply runs it, so change the schema files)", r.Member, r.Detail))
 			continue
 		}
-		entries = append(entries, fmt.Sprintf("%s (%s; run it with: %s %s)", r.Member, r.Detail, cliname.Name(), narrowedApplyRerun(r, environment, schemaDir)))
+		entries = append(entries, fmt.Sprintf("%s (%s; run it with: %s)", r.Member, r.Detail, cliname.Command(narrowedApplyRerun(r, environment, schemaDir))))
 	}
 	return strings.Join(entries, "; ")
 }
@@ -946,7 +955,7 @@ func watchApplyProgressLog(poller *progressPoller, heartbeatInterval time.Durati
 		}
 
 		if state.IsState(curState, state.NoActiveChange) {
-			return noActiveChangeError(poller.applyID)
+			return noActiveChangeError(poller.applyID, poller.environment)
 		}
 
 		tables := ddl.FilterInternalTablesTyped(result.Tables)
@@ -1036,7 +1045,7 @@ func watchApplyProgressLog(poller *progressPoller, heartbeatInterval time.Durati
 			case state.IsState(curState, state.Apply.RevertWindow):
 				revertWindowStart = time.Now()
 				lastRevertHeartbeat = time.Now()
-				log.emit("msg", fmt.Sprintf("Revert window open — run '%s revert' to undo or '%s skip-revert' to finalize", cliname.Name(), cliname.Name()))
+				log.emit("msg", fmt.Sprintf("Revert window open — run '%s' to undo or '%s' to finalize", cliname.Command("revert"), cliname.Command("skip-revert")))
 			}
 			lastGlobalState = globalNorm
 		}
@@ -1064,7 +1073,9 @@ func watchApplyProgressLog(poller *progressPoller, heartbeatInterval time.Durati
 			return terminalWatchExit(result)
 		}
 
-		poller.sleep(pollInterval)
+		if err := poller.pause(pollInterval); err != nil {
+			return err
+		}
 		// Ramp up to 5s over the first few polls to avoid hammering the API on long schema changes
 		if pollInterval < 5*time.Second {
 			pollInterval *= 2
@@ -1299,10 +1310,12 @@ func watchApplyProgressJSON(poller *progressPoller) error {
 			return terminalWatchExit(result)
 		}
 		if state.IsState(curState, state.NoActiveChange) {
-			return noActiveChangeError(poller.applyID)
+			return noActiveChangeError(poller.applyID, poller.environment)
 		}
 
-		poller.sleep(pollInterval)
+		if err := poller.pause(pollInterval); err != nil {
+			return err
+		}
 	}
 }
 

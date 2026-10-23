@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"strings"
@@ -12,6 +13,31 @@ import (
 // of the schema change: the work can start once the holder releases the target,
 // and retrying sooner is only refused again.
 var ErrTargetHeld = errors.New("target is held by another run of a schema change")
+
+// ErrCancelledByOperator is the cause a driver cancels a drive's context with
+// when an operator command ends the schema change for good, as a cancel does.
+// No driver resumes the change afterwards, so work the engine set up for it
+// and kept only so a resume could continue from it is the engine's to remove.
+// A drive cancelled for any other reason, such as a lost lease or a shutdown,
+// carries no such cause: another driver resumes the change from its stored
+// state, and that work must be kept.
+var ErrCancelledByOperator = errors.New("schema change cancelled by an operator")
+
+// ErrReattachFailed marks an Apply that was resuming work the engine had
+// already accepted, such as a deploy request it created and stored, and failed
+// before it could hand that work back to the caller. The work is still the
+// engine's and a later resume reattaches to it again, so the failure does not
+// mean any new work started. An engine wraps only failures on the reattach
+// path with it: one that gives up on the stored work and starts afresh returns
+// that path's errors unwrapped.
+var ErrReattachFailed = errors.New("reattach to accepted engine work failed")
+
+// CancelledByOperator reports whether ctx ended because an operator cancelled
+// the schema change (ErrCancelledByOperator), as opposed to the drive being
+// handed to another driver.
+func CancelledByOperator(ctx context.Context) bool {
+	return errors.Is(context.Cause(ctx), ErrCancelledByOperator)
+}
 
 // PermanentError wraps an error to indicate it should not be retried.
 // Engines return this when the error is permanent.
@@ -51,6 +77,36 @@ func IsNotReady(err error) bool {
 	}
 	var notReady *NotReadyError
 	return errors.As(err, &notReady)
+}
+
+// OutcomeUnknownError wraps an error to indicate the engine asked its backend
+// to start work and cannot tell whether the backend started it: the request
+// failed in a way that does not prove a refusal, and reading the work's state
+// did not settle the question. The work may be running, so the
+// schema change is not failed. The engine has recorded resume state naming the
+// work, and a recovery attempt re-observes that same work instead of starting
+// it again, so callers must pause the apply for recovery rather than record a
+// failure, on every database type.
+type OutcomeUnknownError struct {
+	Err error
+}
+
+func (e *OutcomeUnknownError) Error() string { return e.Err.Error() }
+func (e *OutcomeUnknownError) Unwrap() error { return e.Err }
+
+// NewOutcomeUnknownError wraps err as an unknown-outcome error.
+func NewOutcomeUnknownError(msg string, args ...any) error {
+	return &OutcomeUnknownError{Err: fmt.Errorf(msg, args...)}
+}
+
+// IsOutcomeUnknown reports whether err indicates the engine cannot tell
+// whether its backend started the work it was asked to start.
+func IsOutcomeUnknown(err error) bool {
+	if err == nil {
+		return false
+	}
+	var unknown *OutcomeUnknownError
+	return errors.As(err, &unknown)
 }
 
 // AlreadyCompletedError wraps an error to indicate the engine's backend
