@@ -318,6 +318,15 @@ type Check struct {
 	// aggregate rows and for rows recorded before this field existed.
 	ChangeSummary string
 
+	// RolloutTargets and RolloutTargetsWithWork count the targets of a rollout
+	// of several and how many of them the change summary's work is on, so the
+	// aggregate title can say how far the change has rolled out. They are
+	// written with ChangeSummary and kept with it: a write that keeps the stored
+	// summary keeps the stored counts too. Zero when the summary describes no
+	// rollout of several targets.
+	RolloutTargets         int
+	RolloutTargetsWithWork int
+
 	// CreatedAt is when the check was created.
 	CreatedAt time.Time
 

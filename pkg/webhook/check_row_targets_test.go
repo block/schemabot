@@ -6,6 +6,7 @@ import (
 	"github.com/stretchr/testify/assert"
 
 	"github.com/block/schemabot/pkg/api"
+	"github.com/block/schemabot/pkg/storage"
 )
 
 // A reviewer reads the aggregate check to decide whether a PR is ready to
@@ -80,4 +81,37 @@ func TestNarrowedApplyCheckSummaryNamesTheTarget(t *testing.T) {
 		"a deployment addressing several targets is qualified with the target")
 	assert.Equal(t, "shop-002/shop", h.narrowedTargetName("shop-002/shop", "shop", "qa"),
 		"an environment that cannot be resolved names the member in full")
+}
+
+// The aggregate title is what the PR's merge box shows next to the check name.
+// When one row holds the check, the title says how many of its rollout's
+// targets the work is on. Titles over several rows, and rows that name no
+// rollout of several targets, keep their counts of applies.
+func TestAggregateTitleNamesRolloutTargets(t *testing.T) {
+	rollout := func(status, conclusion string, targets, withWork int) *storage.Check {
+		return &storage.Check{
+			DatabaseType: "mysql", DatabaseName: "orders", HasChanges: true, Status: status, Conclusion: conclusion,
+			RolloutTargets: targets, RolloutTargetsWithWork: withWork,
+		}
+	}
+	other := &storage.Check{DatabaseType: "mysql", DatabaseName: "inventory", HasChanges: true, Status: checkStatusCompleted, Conclusion: checkConclusionActionRequired}
+
+	for _, tc := range []struct {
+		name   string
+		checks []*storage.Check
+		want   string
+	}{
+		{name: "pending on some targets", checks: []*storage.Check{rollout(checkStatusCompleted, checkConclusionActionRequired, 4, 3)}, want: "1 apply pending on 3 of 4 targets"},
+		{name: "pending on every target", checks: []*storage.Check{rollout(checkStatusCompleted, checkConclusionActionRequired, 4, 4)}, want: "1 apply pending on all 4 targets"},
+		{name: "running on some targets", checks: []*storage.Check{rollout(checkStatusInProgress, "", 4, 2)}, want: "Apply in progress on 2 of 4 targets"},
+		{name: "single target", checks: []*storage.Check{rollout(checkStatusCompleted, checkConclusionActionRequired, 0, 0)}, want: "1 apply pending"},
+		{name: "several databases", checks: []*storage.Check{rollout(checkStatusCompleted, checkConclusionActionRequired, 4, 3), other}, want: "2 applies pending"},
+		{name: "complete", checks: []*storage.Check{rollout(checkStatusCompleted, checkConclusionSuccess, 4, 3)}, want: "All applies complete"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			conclusion, _ := computeAggregate(tc.checks, nil)
+			title, _ := aggregateSummary(tc.checks, conclusion, nil)
+			assert.Equal(t, tc.want, title)
+		})
+	}
 }

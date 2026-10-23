@@ -162,6 +162,16 @@ func (w memberWork) summary() string {
 	return clampDriftSummary(fmt.Sprintf("%d of %d targets %s this change: %s", w.pending, w.members, verb, w.namedPending()))
 }
 
+// rolloutCounts returns the stored counts that go with a summary naming the
+// targets with work: the rollout's members and how many of them have work.
+// Zero when the summary names no targets.
+func (w memberWork) rolloutCounts() (targets, withWork int) {
+	if w.members <= 1 || w.pending == 0 {
+		return 0, 0
+	}
+	return w.members, w.pending
+}
+
 // scope names the targets with work out of the rollout's members: every one
 // of them, or how many and which.
 func (w memberWork) scope() string {
@@ -456,12 +466,15 @@ func (h *Handler) upsertPlanCheckRecord(ctx context.Context, client *ghclient.In
 	// block rides on BlockingReason + Conclusion so a stored drift block is
 	// legible and durable across write paths.
 	changeSummary := drift.changeSummary(summarizePlanChanges(schema, planResp, environment))
+	rolloutTargets, rolloutTargetsWithWork := drift.work.rolloutCounts()
 	if changeSummary == "" && len(planResp.Errors) > 0 {
 		changeSummary = planFailedCheckSummary
 	}
 	blockingReason := ""
 	if driftBlocked {
+		// The block's summary names no targets, so no counts go with it.
 		changeSummary = drift.summary
+		rolloutTargets, rolloutTargetsWithWork = 0, 0
 		blockingReason = drift.blockingReason()
 	}
 
@@ -477,6 +490,9 @@ func (h *Handler) upsertPlanCheckRecord(ctx context.Context, client *ghclient.In
 		Conclusion:     conclusion,
 		BlockingReason: blockingReason,
 		ChangeSummary:  changeSummary,
+
+		RolloutTargets:         rolloutTargets,
+		RolloutTargetsWithWork: rolloutTargetsWithWork,
 	}
 	var stored bool
 	if driftBlocked && len(drift.preserve) > 0 {
@@ -946,6 +962,9 @@ func (h *Handler) updateCheckRecordForApplyResult(ctx context.Context, repo stri
 			check.ErrorMessage = narrowedApplyBlock.message
 			check.ChangeSummary = narrowedApplyCompletedSummary(
 				h.narrowedTargetName(storage.ParseApplyOptions(apply.Options).NarrowedTo, apply.Database, apply.Environment))
+			// The narrowed apply says nothing about the other targets, so the
+			// row carries no counts of them.
+			check.RolloutTargets, check.RolloutTargetsWithWork = 0, 0
 		}
 		// MarkActionRequiredForApply releases check ownership, so the plan of
 		// the whole environment that lifts this block can write its result.

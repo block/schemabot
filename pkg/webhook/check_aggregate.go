@@ -294,6 +294,7 @@ func aggregateSummary(checks []*storage.Check, conclusion string, stopped stoppe
 		unresolved := 0
 		tenantApplies := 0
 		stoppedApplies := 0
+		var pendingCheck *storage.Check
 		for _, c := range checks {
 			if c.Status == checkStatusInProgress && stopped.holds(c) {
 				stoppedApplies++
@@ -303,6 +304,7 @@ func aggregateSummary(checks []*storage.Check, conclusion string, stopped stoppe
 				continue
 			}
 			pending++
+			pendingCheck = c
 			switch {
 			case isUnresolvedParticipantCheck(c):
 				unresolved++
@@ -350,7 +352,7 @@ func aggregateSummary(checks []*storage.Check, conclusion string, stopped stoppe
 		case tenantApplies > 0:
 			title = fmt.Sprintf("%d applies pending (%d tenant)", pending, tenantApplies)
 		case pending == 1:
-			title = "1 apply pending"
+			title = "1 apply pending" + rolloutTargetsPhrase(pendingCheck)
 		default:
 			title = fmt.Sprintf("%d applies pending", pending)
 		}
@@ -363,11 +365,13 @@ func aggregateSummary(checks []*storage.Check, conclusion string, stopped stoppe
 		inProgress := 0
 		waiting := 0
 		paused := 0
+		var inProgressCheck *storage.Check
 		for _, c := range checks {
 			if c.Status != checkStatusInProgress {
 				continue
 			}
 			inProgress++
+			inProgressCheck = c
 			switch {
 			case isUnresolvedParticipantCheck(c):
 				waiting++
@@ -386,12 +390,29 @@ func aggregateSummary(checks []*storage.Check, conclusion string, stopped stoppe
 			}
 		case paused > 0:
 			title = fmt.Sprintf("Apply in progress (%d stopped)", paused)
+		case inProgress == 1:
+			title = "Apply in progress" + rolloutTargetsPhrase(inProgressCheck)
 		default:
 			title = "Apply in progress"
 		}
 		summary = buildAggregateTable(checks, stopped)
 	}
 	return title, summary
+}
+
+// rolloutTargetsPhrase says how many of a rollout's targets a row's work is on,
+// for a title that speaks for that one row, so the PR's merge box shows how far
+// the change has rolled out. A row that names no rollout of several targets
+// adds nothing. Titles over several rows leave it out: counts from different
+// databases do not add up to anything a reader can act on.
+func rolloutTargetsPhrase(c *storage.Check) string {
+	if c.RolloutTargets <= 1 || c.RolloutTargetsWithWork <= 0 {
+		return ""
+	}
+	if c.RolloutTargetsWithWork >= c.RolloutTargets {
+		return fmt.Sprintf(" on all %d targets", c.RolloutTargets)
+	}
+	return fmt.Sprintf(" on %d of %d targets", c.RolloutTargetsWithWork, c.RolloutTargets)
 }
 
 // stoppedAppliesTitle names the stopped applies holding the aggregate.

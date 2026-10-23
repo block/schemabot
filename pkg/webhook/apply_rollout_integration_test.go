@@ -214,6 +214,8 @@ func TestE2EConvergedPrimaryWithPendingTargetAppliesEveryTarget(t *testing.T) {
 	assert.Equal(t, "action_required", check.Conclusion, "a target that still needs the change keeps the check from passing")
 	assert.True(t, check.HasChanges, "work on a non-primary target is work on the rollout")
 	assert.Equal(t, "1 of 2 targets needs this change: `us`", check.ChangeSummary, "the check names the target the PR is still waiting on")
+	assert.Equal(t, 2, check.RolloutTargets, "the aggregate title counts the rollout's targets")
+	assert.Equal(t, 1, check.RolloutTargetsWithWork)
 	assert.Empty(t, check.BlockingReason, "independent targets differing is not drift")
 
 	apply := runRolloutCommand(t, svc, dbName, "schemabot apply -e "+driftEnv)
@@ -230,6 +232,8 @@ func TestE2EConvergedPrimaryWithPendingTargetAppliesEveryTarget(t *testing.T) {
 	assert.True(t, check.HasChanges)
 	assert.Equal(t, "1 of 2 targets: `us`", check.ChangeSummary,
 		"the apply's row names the target it runs on, which stays true once the row reads Applied")
+	assert.Equal(t, 2, check.RolloutTargets)
+	assert.Equal(t, 1, check.RolloutTargetsWithWork, "the apply runs on the one target with work")
 
 	operations, err := svc.Storage().ApplyOperations().ListByApply(t.Context(), created.ID)
 	require.NoError(t, err)
