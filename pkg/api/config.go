@@ -145,6 +145,10 @@ type ServerConfig struct {
 	// Drivers is the number of concurrent operator drivers that claim and drive
 	// applies. Each driver independently polls for claimable work with FOR
 	// UPDATE SKIP LOCKED queries to prevent races. Defaults to DefaultDrivers.
+	//
+	// One apply may hold at most half of this process's drivers while starting
+	// work (storage.ProcessDriverShare), so a wide or hung apply always leaves
+	// drivers free for other databases and spreads its own work across pods.
 	Drivers int `yaml:"drivers"`
 
 	// MaxDriversPerApply caps how many operation leases a single apply may hold

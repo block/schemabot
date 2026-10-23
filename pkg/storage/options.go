@@ -9,6 +9,11 @@ type Options struct {
 	// uncapped mode, because an uncapped claim path is what lets one wide
 	// fan-out take every driver on the plane.
 	MaxDriversPerApply int
+
+	// DriversPerProcess is the size of this process's driver pool. The claim
+	// path holds each apply to ProcessDriverShare of it. Zero or negative
+	// selects DefaultDriversPerProcess.
+	DriversPerProcess int
 }
 
 // Option adjusts Options. The per-dialect constructors take options variadically
@@ -23,6 +28,14 @@ func WithMaxDriversPerApply(n int) Option {
 	}
 }
 
+// WithDriversPerProcess sets the size of this process's driver pool. Zero or
+// negative selects DefaultDriversPerProcess.
+func WithDriversPerProcess(n int) Option {
+	return func(o *Options) {
+		o.DriversPerProcess = n
+	}
+}
+
 // BuildOptions applies opts over the defaults and returns the resolved settings.
 func BuildOptions(opts ...Option) Options {
 	var resolved Options
@@ -31,6 +44,9 @@ func BuildOptions(opts ...Option) Options {
 	}
 	if resolved.MaxDriversPerApply <= 0 {
 		resolved.MaxDriversPerApply = DefaultMaxDriversPerApply
+	}
+	if resolved.DriversPerProcess <= 0 {
+		resolved.DriversPerProcess = DefaultDriversPerProcess
 	}
 	return resolved
 }
