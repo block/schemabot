@@ -199,7 +199,7 @@ func writeTargetRolloutSummaryDetails(sb *strings.Builder, data MultiDeploymentA
 		writeTargetRollup(sb, data, g, budget)
 		return
 	}
-	fmt.Fprintf(sb, "<details><summary>Apply details (%d %s)</summary>\n\n", len(tables), pluralize(progressUnit(tables), len(tables)))
+	fmt.Fprintf(sb, "<details><summary>%s</summary>\n\n", completedSummaryDetailsLabel(ApplyStatusCommentData{Tables: tables}))
 	writeTargetRollup(sb, data, g, budget)
 	sb.WriteString("</details>\n")
 }

@@ -1699,27 +1699,66 @@ func TestRenderMultiDeploymentApplyComment_SoleMultiTargetDeploymentHasNoWrapper
 	assert.NotContains(t, out, "Rolled out to")
 }
 
-// A one-deployment rollout that ends with a failed target keeps its table
-// lines open in the final summary, as a single-target failed summary does, so
-// the failed target and its table stay in view without a click.
-func TestRenderMultiDeploymentApplySummaryComment_SoleMultiTargetFailureStaysOpen(t *testing.T) {
+// A one-deployment rollout that ends any way other than completed keeps its
+// table lines open in the final summary, as a single-target summary does, so
+// a failed, stopped, cancelled or reverted target and its table stay in view
+// without a click.
+func TestRenderMultiDeploymentApplySummaryComment_SoleMultiTargetUnfinishedStaysOpen(t *testing.T) {
+	for _, tc := range []struct {
+		ended      string
+		taskStatus string
+		want       string
+	}{
+		{so.Failed, state.Task.Failed, state.Apply.Failed},
+		{so.Stopped, state.Task.Stopped, state.Apply.Stopped},
+		{so.Cancelled, state.Task.Cancelled, state.Apply.Cancelled},
+		{so.Reverted, state.Task.Reverted, state.Apply.Reverted},
+	} {
+		t.Run(tc.ended, func(t *testing.T) {
+			data := MultiDeploymentApplyData{
+				Model: presentation.Derive([]presentation.Operation{
+					parallelTarget("primary", "testapp-001", so.Completed),
+					parallelTarget("primary", "testapp-002", tc.ended),
+				}),
+				ApplyID: "apply-123", Environment: "production",
+				Details: []*ApplyStatusCommentData{
+					targetDetail("testapp_001", state.Task.Completed, addNote, 1000),
+					targetDetail("testapp_002", tc.taskStatus, addNote, 420),
+				},
+			}
+			require.True(t, state.IsState(data.Model.State, tc.want), "a %s target settles the rollout as %s, got %q", tc.ended, tc.want, data.Model.State)
+
+			out := RenderMultiDeploymentApplySummaryComment(data)
+			assert.Contains(t, out, "**`orders`**:")
+			assert.Contains(t, out, addNote)
+			assert.NotContains(t, out, "Apply details", "a %s rollout does not fold its table lines:\n%s", tc.ended, out)
+		})
+	}
+}
+
+// A completed one-deployment rollout that changes two tables on each of its
+// targets counts the two table changes once each in its "Apply details" label,
+// not once per target.
+func TestRenderMultiDeploymentApplySummaryComment_SoleMultiTargetCountsTableChanges(t *testing.T) {
+	twoTables := func(database string) *ApplyStatusCommentData {
+		d := targetDetail(database, state.Task.Completed, addNote, 1000)
+		d.Tables = append(d.Tables, TableProgressData{TableName: "users", DDL: "ALTER TABLE `users` ADD COLUMN `nickname` text", Status: state.Task.Completed, RowsCopied: 1000, RowsTotal: 1000})
+		return d
+	}
 	data := MultiDeploymentApplyData{
 		Model: presentation.Derive([]presentation.Operation{
 			parallelTarget("primary", "testapp-001", so.Completed),
-			parallelTarget("primary", "testapp-002", so.Failed),
+			parallelTarget("primary", "testapp-002", so.Completed),
+			parallelTarget("primary", "testapp-003", so.Completed),
 		}),
 		ApplyID: "apply-123", Environment: "production",
-		Details: []*ApplyStatusCommentData{
-			targetDetail("testapp_001", state.Task.Completed, addNote, 1000),
-			targetDetail("testapp_002", state.Task.Failed, addNote, 420),
-		},
+		Details: []*ApplyStatusCommentData{twoTables("testapp_001"), twoTables("testapp_002"), twoTables("testapp_003")},
 	}
-	require.True(t, state.IsState(data.Model.State, state.Apply.Failed), "a failed target settles the rollout as failed, got %q", data.Model.State)
 
 	out := RenderMultiDeploymentApplySummaryComment(data)
-	assert.Contains(t, out, "**`orders`**:")
-	assert.Contains(t, out, addNote)
-	assert.NotContains(t, out, "Apply details", "a failed rollout does not fold its table lines:\n%s", out)
+	assert.Contains(t, out, "<details><summary>Apply details (2 tables)</summary>\n\n")
+	assert.Contains(t, out, "**`orders`**: ✅ Complete (3 targets)")
+	assert.Contains(t, out, "**`users`**: ✅ Complete (3 targets)")
 }
 
 // A deployment whose every target already had the change ran nothing, so the
