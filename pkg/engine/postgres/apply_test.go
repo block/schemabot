@@ -1056,6 +1056,34 @@ func TestAcceptedBlockingOutcomesCarryTheirOwnRemedies(t *testing.T) {
 	assert.Contains(t, unknown.remedy, "inspect the target catalog before re-running")
 }
 
+// A change whose target moved between plan and apply is refused with a
+// remedy that names what the operator has to change, and a COMMIT whose
+// outcome is unknown fails closed rather than falling into the retryable
+// tail.
+func TestDriftAndCommitOutcomesCarryTheirOwnRemedies(t *testing.T) {
+	tests := []struct {
+		code   executor.Code
+		reason string
+		cause  string
+		remedy string
+	}{
+		{executor.CodeCommitOutcomeUnknown, "commit-outcome-unknown", `whether the change to "users" committed is unknown`, "inspect the target catalog before re-running"},
+		{executor.CodeReplicaIdentityDrop, "replica-identity-drop", `the change to "users" would drop what its replica identity index is built on`, "point REPLICA IDENTITY elsewhere, then re-plan"},
+		{executor.CodeAdoptedIndexDrift, "adopted-index-drift", `the index a new constraint on "users" takes over changed after planning`, "re-plan against the current schema"},
+		{executor.CodeValidatedConstraintDrift, "validated-constraint-drift", `the constraint the change to "users" validates changed after planning`, "re-plan against the current schema"},
+	}
+	for _, tt := range tests {
+		t.Run(string(tt.code), func(t *testing.T) {
+			r, known := refusalForOutcome(tt.code, "users")
+			require.True(t, known)
+			require.NotNil(t, r)
+			assert.Equal(t, tt.reason, r.reason)
+			assert.Equal(t, tt.cause, r.cause)
+			assert.Equal(t, tt.remedy, r.remedy)
+		})
+	}
+}
+
 // The unverified cause carries only the table name, so like the collision
 // detail it can promise its remedy's lead for a table name of any legal
 // length and spelling. The read-back runs right after the CREATE TABLE, so
@@ -2461,6 +2489,9 @@ func TestRefusalForOutcomeTotalOverExecutorCodes(t *testing.T) {
 		// Keep the outcome vocabulary total. pg-sprite requires catalog inspection
 		// before retrying an unknown commit outcome.
 		executor.CodeRowSecurityOutcomeUnknown: "inspect the catalog before deciding whether to retry",
+		// Same shape as the blocking outcome: a bounded attempt's COMMIT may
+		// have landed, and SchemaBot's retry replays the identical statement.
+		executor.CodeCommitOutcomeUnknown: "a retry replays a statement that may have committed",
 	}
 	for _, code := range executor.Codes() {
 		t.Run(string(code), func(t *testing.T) {

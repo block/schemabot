@@ -915,6 +915,36 @@ func refusalForOutcome(code executor.Code, table string) (*refusal, bool) {
 		return &refusal{reason: "blocking-outcome-unknown",
 			cause:  fmt.Sprintf("whether the blocking statement for %s committed is unknown", quotedTable(table)),
 			remedy: "inspect the target catalog before re-running"}, true
+	case executor.CodeCommitOutcomeUnknown:
+		// A bounded attempt's COMMIT never returned success, so whether the
+		// change landed is open. Like the blocking outcome above, a retry
+		// would re-run the identical statement onto a result that may have
+		// committed, so the apply fails closed until an operator has read
+		// the catalog.
+		return &refusal{reason: "commit-outcome-unknown",
+			cause:  fmt.Sprintf("whether the change to %s committed is unknown", quotedTable(table)),
+			remedy: "inspect the target catalog before re-running"}, true
+	case executor.CodeReplicaIdentityDrop:
+		// Read again under the table's lock, so nothing was dropped. No
+		// re-plan clears it while the replica identity still rests on what
+		// the change drops; the operator moves the identity first.
+		return &refusal{reason: "replica-identity-drop",
+			cause:  fmt.Sprintf("the change to %s would drop what its replica identity index is built on", quotedTable(table)),
+			remedy: "point REPLICA IDENTITY elsewhere, then re-plan"}, true
+	case executor.CodeAdoptedIndexDrift:
+		// The index changed between plan and apply, read again under the
+		// table's lock, so nothing was attached; a fresh plan reads the
+		// index as it stands.
+		return &refusal{reason: "adopted-index-drift",
+			cause:  fmt.Sprintf("the index a new constraint on %s takes over changed after planning", quotedTable(table)),
+			remedy: replanRemedy}, true
+	case executor.CodeValidatedConstraintDrift:
+		// The constraint changed between plan and apply, read again under
+		// the table's lock, so nothing was validated; a fresh plan reads
+		// the constraint as it stands.
+		return &refusal{reason: "validated-constraint-drift",
+			cause:  fmt.Sprintf("the constraint the change to %s validates changed after planning", quotedTable(table)),
+			remedy: replanRemedy}, true
 	case executor.CodeBudgetStatementExceeded:
 		// Normally consumed upstream by the typed BudgetError arm, which
 		// renders the budget's own figures; this mapping keeps the outcome
