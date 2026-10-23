@@ -40,6 +40,14 @@ SchemaBot is declarative and GitOps-driven: SQL files in your repository provide
 
 <img src="./assets/cli-ops.gif" width="800" alt="Inspect fleet status, follow one change, and read its logs">
 
+**Apply to every target at once.** One apply fans an environment out to all its targets, copies them in parallel, and cuts each over as soon as its copy is ready.
+
+<img src="./assets/cli-multi-target.gif" width="800" alt="Apply an index to four targets of one environment and follow their copies in parallel">
+
+**Apply to one target first.** Narrow the plan and apply to a single target with `--target` before rolling out to the rest.
+
+<img src="./assets/cli-target.gif" width="800" alt="Plan and apply an index to one target of a multi-target environment">
+
 [Get started with the CLI](./docs/cli.md) · [Explore your database fleet](./docs/schema-intelligence.md)
 
 Block runs SchemaBot for the majority of its production schema changes, including MySQL tables spanning terabytes and Vitess databases with hundreds of shards.

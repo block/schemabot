@@ -643,6 +643,10 @@ databases:
           - payments-002
 ```
 
+An apply of the environment fans out to every listed target and follows each target's copy in one watcher. Under the default `cutover_policy: parallel`, every target copies at once, up to the server's [`max_drivers_per_apply`](#per-apply-driver-cap), and each target cuts over as soon as its own copy is ready:
+
+![Apply an index to four targets of one environment and follow their copies in parallel](../assets/cli-multi-target.gif)
+
 A `targets` list can also sit inside a `deployments` map entry, for a database whose targets are spread across several deployments:
 
 ```yaml
@@ -656,7 +660,11 @@ A `targets` list can also sit inside a `deployments` map entry, for a database w
             target: payments-003
 ```
 
-An apply that spans several deployments, one of them with a `targets` list, is not supported yet and is refused before it takes the lock. Apply one target at a time instead, in rollout order: `schemabot apply -e production --target payments-001`, then the next target. The refusal names the first one. A rollout already up to date applies nothing, so an apply that confirms it converged still succeeds.
+An apply that spans several deployments, one of them with a `targets` list, is not supported yet and is refused before it takes the lock. Apply one target at a time instead, in rollout order: `schemabot apply -e production --target payments-001`, then the next target. The refusal names the first one. [Apply to one target of a rollout](cli.md#apply-to-one-target-of-a-rollout) shows a narrowed apply:
+
+![Plan and apply an index to one target of a multi-target environment](../assets/cli-target.gif)
+
+A rollout already up to date applies nothing, so an apply that confirms it converged still succeeds.
 
 ### Selecting namespaces per target
 
@@ -683,7 +691,7 @@ Rules:
 - An environment-level `targets` list is mutually exclusive with an environment-level `deployments` map, the same way an environment-level `target` is. A `targets` list inside a `deployments` entry is how the two combine.
 - The list MUST contain at least one entry, and no entry may be empty.
 - A rollout across the listed targets runs table by table: each table lands on every target before any target starts the next. Tables run in the order the reviewed plan lists them, then any table only another target's plan changes, sorted by name. A target whose plan does not change a table has nothing to run for it, and two statements on one table run together. The exception is a rollout where a target's plan changes a VSchema, which applies with that target's tables, so each target then runs its whole change in one go.
-- `cutover_policy` and `on_failure` order the listed targets' copies within each table the same way they order the deployments of a `deployments` map: each target is a rollout member, taken in list order. Cutover is where targets differ from deployments. The default here is `parallel`: it starts up to the server's `max_drivers_per_apply` targets' copies at once, queues the rest, and cuts each target over as soon as its copy is ready: a target never waits for an earlier target's copy or cutover to finish, and an earlier target holds a later target's cutover only while it is failed, retrying a failure, stopped, cancelled, or reverted. A deployment with a `targets` list therefore refuses `--defer-cutover`; apply one target at a time with `--target` to hold a target's cutover. Under the default `on_failure: halt` a failed target stops every queued target from starting, and holds the cutover of every later target already copying: each of those finishes its copy and waits at the cutover barrier until an operator stops or cancels it. `max_drivers_per_apply` is therefore what bounds how many targets copy at once, and how many a failure can leave holding a finished copy, so raising it widens both; size it for the targets that share a host's disk and network as well as for throughput. An environment that relies on an unset `cutover_policy` running one target at a time needs `cutover_policy: rolling` to keep doing so: a failed target then stops every later one before it starts copying. Whatever `on_failure` says, a table that failed on any target ends the rollout at that table: `continue` or a released `pause` still runs it on the remaining targets, but no target starts the next table.
+- `cutover_policy` and `on_failure` order the listed targets' copies within each table the same way they order the deployments of a `deployments` map: each target is a rollout member, taken in list order. Cutover is where targets differ from deployments. The default here is `parallel`: it starts up to the server's `max_drivers_per_apply` targets' copies at once, queues the rest, and cuts each target over as soon as its copy is ready: a target never waits for an earlier target's copy or cutover to finish, and an earlier target holds a later target's cutover only while it is failed, retrying a failure, stopped, cancelled, or reverted. The [multi-target apply animation](#multi-target-environment-preview) shows this default with four targets. A deployment with a `targets` list therefore refuses `--defer-cutover`; apply one target at a time with `--target` to hold a target's cutover. Under the default `on_failure: halt` a failed target stops every queued target from starting, and holds the cutover of every later target already copying: each of those finishes its copy and waits at the cutover barrier until an operator stops or cancels it. `max_drivers_per_apply` is therefore what bounds how many targets copy at once, and how many a failure can leave holding a finished copy, so raising it widens both; size it for the targets that share a host's disk and network as well as for throughput. An environment that relies on an unset `cutover_policy` running one target at a time needs `cutover_policy: rolling` to keep doing so: a failed target then stops every later one before it starts copying. Whatever `on_failure` says, a table that failed on any target ends the rollout at that table: `continue` or a released `pause` still runs it on the remaining targets, but no target starts the next table.
 - No entry may contain `/`. A deployment addressing several targets names each one in its members' operation keys, and `/` separates a key's components.
 - One deployment may not list the same target twice. A rollout member is identified by its deployment and target together, so the same target under two different deployments is two distinct members and is allowed.
 - Members resolve deployments outermost: every target of the first deployment, then every target of the next.
@@ -892,7 +900,7 @@ A single apply that fans out across many deployments or shards claims its operat
 max_drivers_per_apply: 2
 ```
 
-`max_drivers_per_apply` caps how many operations one apply may have in flight at once, across every replica. Size it against `drivers × replicas`: set too high it bounds nothing, set too low a sharded fan-out drives only a few operations at a time.
+`max_drivers_per_apply` caps how many operations one apply may have in flight at once, across every replica. Size it against `drivers × replicas`: set too high it bounds nothing, set too low a sharded fan-out drives only a few operations at a time. For a [multi-target environment](#multi-target-environment-preview), each target's copy of a table is one operation, so the cap is how many targets copy at once; the animation there shows four targets copying together under a cap of at least four.
 
 The cap applies only to *starting* new operations — a first start, a resume after a stop, and a deferred deploy are all capped. Recovering an operation whose driver crashed, and consuming a stop or cancel request, are never capped: an apply already at its cap must still be able to recover and to be controlled, or the cap becomes the thing that wedges the apply it is bounding.
 
