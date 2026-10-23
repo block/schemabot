@@ -214,17 +214,36 @@ func (s *Server) handleRevertDeployRequest(w http.ResponseWriter, r *http.Reques
 	// will fail if VSchema still references the table. Conversely, reverting a DROP TABLE
 	// (= recreating it) is safe even if VSchema doesn't reference it yet.
 	hasOriginalVSchema := hasVSchemaData(vschemaOriginalSQL)
+	revertContext := fmt.Sprintf("localscale-revert:%d", number)
+
+	// Claim the revert before doing any of it. The processor closes an expired
+	// revert window by moving complete_pending_revert to complete and dropping
+	// the branch databases; claiming first means either the window closes and
+	// this revert is refused before it touches the target, or the revert holds
+	// the request and the window's expiry leaves it alone.
+	claimState := dr.InProgressRevert
 	if hasOriginalVSchema && !vschemaReverted {
-		// Set transitional state before VSchema revert
-		if err := s.updateDeployState(r.Context(), ref, dr.InProgressRevertVSchema); err != nil {
-			return newHTTPError(http.StatusInternalServerError, "update deploy state: %v", err)
+		claimState = dr.InProgressRevertVSchema
+	}
+	claimed, err := s.claimRevert(r.Context(), ref, claimState, revertContext)
+	if err != nil {
+		return newHTTPError(http.StatusInternalServerError, "claim revert: %v", err)
+	}
+	if !claimed {
+		return newHTTPError(http.StatusConflict, "cannot revert: deploy request left complete_pending_revert before the revert started")
+	}
+	// releaseRevert hands the request back to its revert window after a
+	// failure, so the revert can be retried while the window is open.
+	releaseRevert := func(cause string) {
+		if err := s.releaseRevert(context.WithoutCancel(r.Context()), ref, claimState); err != nil {
+			s.logger.Error("failed to release revert after failure", "number", number, "cause", cause, "error", err)
 		}
+	}
+
+	if claimState == dr.InProgressRevertVSchema {
 		if err := s.revertPendingVSchema(r.Context(), backend, ref, vschemaOriginalSQL.String); err != nil {
 			s.logger.Error("revert vschema failed", "number", number, "error", err)
-			// Best-effort state restore so the operation can be retried.
-			if restoreErr := s.updateDeployState(r.Context(), ref, dr.CompletePendingRevert); restoreErr != nil {
-				s.logger.Error("failed to restore state after revert failure", "number", number, "error", restoreErr)
-			}
+			releaseRevert("revert vschema")
 			return newHTTPError(http.StatusInternalServerError, "revert vschema: %v", err)
 		}
 	}
@@ -232,26 +251,29 @@ func (s *Server) handleRevertDeployRequest(w http.ResponseWriter, r *http.Reques
 	// DDL revert: compute reverse DDL from stored pre-deploy schema snapshot and
 	// submit as new online DDL. This avoids REVERT VITESS_MIGRATION which doesn't
 	// work for instant DDL (no vreplication stream to revert from).
-	revertContext := fmt.Sprintf("localscale-revert:%d", number)
 	var revertCount int
 	if schemaBeforeSQL.Valid && schemaBeforeSQL.String != "" {
 		var schemaBefore map[string][]string
 		if err := json.Unmarshal([]byte(schemaBeforeSQL.String), &schemaBefore); err != nil {
+			releaseRevert("parse schema_before")
 			return newHTTPError(http.StatusInternalServerError, "parse schema_before: %v", err)
 		}
 		var ddlByKeyspace map[string][]string
 		if ddlJSON != "" {
 			if err := json.Unmarshal([]byte(ddlJSON), &ddlByKeyspace); err != nil {
+				releaseRevert("unmarshal ddl_statements")
 				return newHTTPError(http.StatusInternalServerError, "unmarshal ddl_statements: %v", err)
 			}
 		}
 		reverseDDL, err := s.computeReverseDDL(r.Context(), backend, schemaBefore, ddlByKeyspace)
 		if err != nil {
+			releaseRevert("compute reverse DDL")
 			return newHTTPError(http.StatusInternalServerError, "compute reverse DDL: %v", err)
 		}
 		if len(reverseDDL) > 0 {
 			strategy := buildDDLStrategy(true) // always use --prefer-instant-ddl for revert
 			if err := s.submitOnlineDDL(r.Context(), backend, reverseDDL, strategy, revertContext); err != nil {
+				releaseRevert("submit reverse DDL")
 				return newHTTPError(http.StatusInternalServerError, "submit reverse DDL: %v", err)
 			}
 			for _, stmts := range reverseDDL {
@@ -269,9 +291,9 @@ func (s *Server) handleRevertDeployRequest(w http.ResponseWriter, r *http.Reques
 
 	if err := s.execLog(r.Context(),
 		`UPDATE localscale_deploy_requests
-		 SET reverted = TRUE, revert_migration_context = ?, deployment_state = ?
-		 WHERE org = ? AND database_name = ? AND number = ?`,
-		revertContext, revertState, ref.org, ref.database, number,
+		 SET reverted = TRUE, deployment_state = ?
+		 WHERE org = ? AND database_name = ? AND number = ? AND deployment_state = ?`,
+		revertState, ref.org, ref.database, number, claimState,
 	); err != nil {
 		return newHTTPError(http.StatusInternalServerError, "update deploy state: %v", err)
 	}
@@ -672,6 +694,47 @@ func (s *Server) getMigrationInfos(ctx context.Context, backend *databaseBackend
 		})
 	}
 	return migrations
+}
+
+// claimRevert moves a deploy request out of its revert window into
+// claimState, recording the revert context its reverse DDL will be submitted
+// under, only while the request still reads complete_pending_revert. It
+// reports whether the claim was taken. Until the reverse DDL is submitted the
+// processor sees no schema changes under the context and keeps waiting.
+func (s *Server) claimRevert(ctx context.Context, ref deployRequest, claimState, revertContext string) (bool, error) {
+	res, err := s.metadataDB.ExecContext(ctx,
+		`UPDATE localscale_deploy_requests
+		 SET deployment_state = ?, revert_migration_context = ?
+		 WHERE org = ? AND database_name = ? AND number = ? AND deployment_state = ?`,
+		claimState, revertContext, ref.org, ref.database, ref.number, dr.CompletePendingRevert)
+	if err != nil {
+		return false, fmt.Errorf("claim revert of deploy request %d: %w", ref.number, err)
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("read rows affected claiming revert of deploy request %d: %w", ref.number, err)
+	}
+	if rows == 0 {
+		s.logger.Info("revert refused; deploy request left complete_pending_revert after it was read", "number", ref.number)
+		return false, nil
+	}
+	s.logger.Info("deploy state transition", "number", ref.number, "from_state", dr.CompletePendingRevert, "new_state", claimState)
+	return true, nil
+}
+
+// releaseRevert returns a claimed revert to complete_pending_revert after it
+// failed before any reverse DDL was submitted. The revert window keeps its
+// original expiry, so a failed revert does not extend it.
+func (s *Server) releaseRevert(ctx context.Context, ref deployRequest, claimState string) error {
+	if _, err := s.metadataDB.ExecContext(ctx,
+		`UPDATE localscale_deploy_requests
+		 SET deployment_state = ?, revert_migration_context = ''
+		 WHERE org = ? AND database_name = ? AND number = ? AND deployment_state = ?`,
+		dr.CompletePendingRevert, ref.org, ref.database, ref.number, claimState); err != nil {
+		return fmt.Errorf("release revert of deploy request %d: %w", ref.number, err)
+	}
+	s.logger.Info("deploy state transition", "number", ref.number, "from_state", claimState, "new_state", dr.CompletePendingRevert)
+	return nil
 }
 
 // deriveRevertState determines the revert progress for a deploy request.

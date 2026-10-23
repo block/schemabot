@@ -1,17 +1,72 @@
 package api
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gopkg.in/yaml.v3"
 
 	"github.com/block/schemabot/pkg/inventory"
 	"github.com/block/schemabot/pkg/storage"
 )
+
+// The public YAML config reaches the Etre lookup without changing the logical
+// environment or target, including a later resolution of the same operation.
+func TestBuildTargetResolverInventoryEnvironmentMapping(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	queries := make(chan string, 2)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		queries <- r.URL.Query().Get("query")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[{"writer_endpoint":"orders.example"}]`))
+	}))
+	t.Cleanup(srv.Close)
+	var cfg TargetResolverConfig
+	require.NoError(t, yaml.Unmarshal(fmt.Appendf(nil, `
+etre:
+  - addr: %s
+    database_type: mysql
+    entity_type: cluster
+    target_label: dsid
+    env_label: env
+    environment_mapping:
+      sandbox: production
+    mysql:
+      host_field: writer_endpoint
+    credentials:
+      username: ddl
+      password_ref: pw
+`, srv.URL), &cfg))
+	resolver, err := cfg.BuildResolver(ctx, slog.New(slog.DiscardHandler))
+	require.NoError(t, err)
+	for range 2 {
+		target, err := resolver.ResolveTarget(ctx, inventory.Request{
+			Target: "orders-002", DatabaseType: "mysql", Environment: "sandbox",
+		})
+		require.NoError(t, err)
+		select {
+		case query := <-queries:
+			assert.Equal(t, "dsid=orders-002,env=production", query)
+		case <-ctx.Done():
+			require.FailNow(t, "inventory query was not recorded", "%v", ctx.Err())
+		}
+		assert.Equal(t, "orders-002", target.Target)
+		assert.Empty(t, target.SchemaOverrides)
+	}
+	// A mapping that would otherwise be silently ignored is a startup error.
+	cfg.Etre[0].EnvLabel = ""
+	_, err = cfg.BuildResolver(ctx, slog.New(slog.DiscardHandler))
+	require.ErrorContains(t, err, "environment mapping requires an env label")
+}
 
 // A data plane that serves more than one engine configures one etre block per
 // database type; they compose into a per-type router that selects the engine

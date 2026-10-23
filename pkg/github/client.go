@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/block/schemabot/pkg/metrics"
+	"github.com/block/schemabot/pkg/schema"
 	"github.com/bradleyfalzon/ghinstallation/v2"
 	"github.com/gofri/go-github-ratelimit/v2/github_ratelimit"
 	"github.com/gofri/go-github-ratelimit/v2/github_ratelimit/github_secondary_ratelimit"
@@ -319,7 +320,7 @@ func (c *Client) InstallationIDForRepo(ctx context.Context, repo string) (int64,
 
 	installation, _, err := appClient.Apps.FindRepositoryInstallation(ctx, owner, name)
 	if err != nil {
-		return 0, fmt.Errorf("find installation for %s: %w", repo, err)
+		return 0, findInstallationError(repo, err)
 	}
 	id := installation.GetID()
 	if id == 0 {
@@ -331,6 +332,25 @@ func (c *Client) InstallationIDForRepo(ctx context.Context, repo string) (int64,
 	c.repoInstallationsMu.Unlock()
 	c.logger.Info("resolved GitHub App installation for repo", "repo", repo, "installation_id", id)
 	return id, nil
+}
+
+// ErrAppNotInstalled reports that GitHub has no installation of this App
+// covering the repository: GET /repos/{owner}/{repo}/installation answered
+// 404. GitHub gives the same answer when the repository does not exist, since
+// an App cannot see a repository it is not installed on. Either way the App can
+// neither read nor publish the repository's Check Runs until it is installed.
+var ErrAppNotInstalled = errors.New("GitHub App is not installed on the repository")
+
+// findInstallationError wraps a failed installation lookup for repo. Only a 404
+// from the lookup itself carries ErrAppNotInstalled; every other failure (5xx,
+// rate limit, auth, transport) stays a plain error, because the App's coverage
+// of the repository is then unknown rather than known to be absent.
+func findInstallationError(repo string, err error) error {
+	var errResp *gh.ErrorResponse
+	if errors.As(err, &errResp) && errResp.Response != nil && errResp.Response.StatusCode == http.StatusNotFound {
+		return fmt.Errorf("find installation for %s: %w: %w", repo, ErrAppNotInstalled, err)
+	}
+	return fmt.Errorf("find installation for %s: %w", repo, err)
 }
 
 // NewInstallationClient creates an InstallationClient from a pre-configured go-github client.
@@ -1406,6 +1426,11 @@ func (c *schemaChangeComparer) sameStatements(ctx context.Context, item schemaCh
 	}
 	var contents [4]string
 	for i, side := range item.sides {
+		// A base the file is absent from is passed as "", which the dialect
+		// reads as a file the pull request adds.
+		if !side.found {
+			continue
+		}
 		text, ok := c.blobText[side.entry.SHA]
 		if !ok {
 			var err error
@@ -1440,19 +1465,30 @@ func (c *schemaChangeComparer) sameStatements(ctx context.Context, item schemaCh
 	return true, nil
 }
 
-// statementComparable reports whether item is a .sql file that is a regular
-// file at all four commits, so its content at each one is a schema file the
-// dialect can parse.
+// statementComparable reports whether item is a .sql file whose content at
+// each commit is a schema file the dialect can parse: a regular file at all
+// four commits, or a file the pull request adds, absent at both bases and a
+// regular file at the approved commit and the head.
 func statementComparable(item schemaChangeItem) bool {
 	if path.Ext(item.path) != ".sql" {
 		return false
 	}
-	for _, side := range item.sides {
-		if !side.found || side.entry.Type != "blob" || side.entry.Mode == gitSymlinkMode {
+	added := !item.sides[sideApprovedBase].found && !item.sides[sideHeadBase].found
+	for i, side := range item.sides {
+		if added && (i == sideApprovedBase || i == sideHeadBase) {
+			continue
+		}
+		if !regularFile(side) {
 			return false
 		}
 	}
 	return true
+}
+
+// regularFile reports whether side is a regular file, not a directory, a
+// symlink, or absent.
+func regularFile(side gitSide) bool {
+	return side.found && side.entry.Type == "blob" && side.entry.Mode != gitSymlinkMode
 }
 
 // pathUnchanged reports whether the pull request's change to a path is the
@@ -2967,7 +3003,7 @@ func (ic *InstallationClient) symlinkedNamespaceLocators(ctx context.Context, re
 		return nil, fmt.Errorf("schema namespace symlink %s points to absolute path %s", entry.GetPath(), target)
 	}
 	resolved := path.Clean(path.Join(schemaPath, target))
-	if !schemaPathWithinDirectory(".", resolved) {
+	if !schema.PathWithinDirectory(".", resolved) {
 		return nil, fmt.Errorf("schema namespace symlink %s points outside the repository: %s", entry.GetPath(), target)
 	}
 	if resolved == "." || resolved == path.Clean(schemaPath) || resolved == path.Clean(entry.GetPath()) {

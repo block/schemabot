@@ -1136,8 +1136,9 @@ var knownRemoteApplyAttachOutcomes = map[string]bool{
 //   - "attached": a sibling dispatch added its operation to the deployment's
 //     shared apply (the normal fan-out event; its rate tracks sharded
 //     dispatch volume).
-//   - "attach_race": a concurrent same-operation attach lost the insert and
-//     was resolved to the winner's row instead of a spurious error.
+//   - "attach_race": a concurrent same-operation attach won, found either
+//     at the insert or after this dispatch's drift check failed, and the
+//     dispatch was resolved to the winner's row instead of a spurious error.
 //   - "terminal_refused": the shared apply was already terminal, so the
 //     attach was refused fail-closed — the deployment's remaining operations
 //     cannot dispatch until an operator reconciles the apply, so investigate

@@ -288,7 +288,9 @@ func (s *Server) handleDeployDeployRequest(w http.ResponseWriter, r *http.Reques
 				return
 			}
 			s.logger.Error("deploy execution failed", "number", number, "error", err)
-			if stateErr := s.updateDeployState(s.shutdownCtx, params.ref, dr.Error); stateErr != nil {
+			// A cancel recorded while the deploy was submitting owns the
+			// outcome; the processor settles it.
+			if _, stateErr := s.advanceDeployState(s.shutdownCtx, params.ref, dr.Submitting, dr.Error); stateErr != nil {
 				s.logger.Error("failed to set error state", "number", number, "error", stateErr)
 			}
 		}
@@ -589,8 +591,17 @@ func (s *Server) executeDeployRequest(ctx context.Context, p deployExecParams) e
 	if p.totalDDL == 0 {
 		initialState = dr.CompletePendingRevert
 	}
-	if err := s.updateDeployState(ctx, p.ref, initialState); err != nil {
-		return fmt.Errorf("update deploy state to %s for deploy request %d: %w", initialState, p.ref.number, err)
+	// A cancel recorded while the deploy was submitting keeps its state: the
+	// processor re-issues CANCEL for the schema changes just submitted and
+	// settles the request from what they did.
+	advanced, err := s.advanceDeployState(ctx, p.ref, dr.Submitting, initialState)
+	if err != nil {
+		return fmt.Errorf("advance deploy request %d from %s to %s: %w", p.ref.number, dr.Submitting, initialState, err)
+	}
+	if !advanced {
+		s.logger.Info("deploy request changed state while its deploy was submitting; leaving it to the processor",
+			"number", p.ref.number, "migration_context", p.migrationContext)
+		return nil
 	}
 
 	s.logger.Info("deployed deploy request",

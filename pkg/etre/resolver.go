@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"maps"
+	"regexp"
 	"slices"
 	"strings"
 	"sync"
@@ -25,6 +26,8 @@ const maxWriterCandidates = 4
 
 // writerProbeTimeout bounds probing one candidate, dial and queries together.
 const writerProbeTimeout = 10 * time.Second
+
+var environmentNamePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]*$`)
 
 // EtreResolverConfig configures an inventory.Resolver backed by Etre.
 //
@@ -47,6 +50,12 @@ type EtreResolverConfig struct {
 
 	// EnvLabel, when set, adds the request environment as a selector predicate.
 	EnvLabel string
+
+	// EnvironmentMapping maps logical request environments to inventory label
+	// values. It changes only the EnvLabel predicate, never the request passed
+	// to credentials or the engine. Unmapped environments use their own name.
+	// Values are literal inventory environments, not recursively mapped keys.
+	EnvironmentMapping map[string]string
 
 	// HostField is the entity field holding the connection host, passed to the
 	// assembler. It may be empty for engines that connect by attribute rather
@@ -116,6 +125,15 @@ func NewEtreResolver(cfg EtreResolverConfig) (*EtreResolver, error) {
 	if err := inventory.ValidateTableOwner(cfg.Assembler.DatabaseType(), cfg.TableOwner); err != nil {
 		return nil, fmt.Errorf("etre resolver: %w", err)
 	}
+	if len(cfg.EnvironmentMapping) > 0 && cfg.EnvLabel == "" {
+		return nil, fmt.Errorf("environment mapping requires an env label")
+	}
+	for logical, physical := range cfg.EnvironmentMapping {
+		if !environmentNamePattern.MatchString(logical) || !environmentNamePattern.MatchString(physical) {
+			return nil, fmt.Errorf("environment mapping %q -> %q requires lowercase environment names containing only letters, digits, underscores or hyphens", logical, physical)
+		}
+	}
+	cfg.EnvironmentMapping = maps.Clone(cfg.EnvironmentMapping)
 	// Fixed labels must not collide with the target or env predicates, which
 	// would let a misconfigured label silently override them and resolve the
 	// wrong entity.
@@ -162,6 +180,9 @@ func (r *EtreResolver) ResolveTarget(ctx context.Context, req inventory.Request)
 			return nil, fmt.Errorf("target %q requires an environment because env label %q is configured", req.Target, r.cfg.EnvLabel)
 		}
 		selector[r.cfg.EnvLabel] = req.Environment
+		if mapped, ok := r.cfg.EnvironmentMapping[req.Environment]; ok {
+			selector[r.cfg.EnvLabel] = mapped
+		}
 	}
 
 	entities, err := r.lookup(ctx, selector)

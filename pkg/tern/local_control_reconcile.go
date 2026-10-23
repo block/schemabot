@@ -137,7 +137,7 @@ func adoptableEngineTerminalStates(s engine.State, retryable bool) (applyState, 
 	case engine.StateCompleted:
 		return state.Apply.Completed, state.Task.Completed, true
 	case engine.StateFailed:
-		if retryable {
+		if !failureIsSettled(s, retryable) {
 			return "", "", false
 		}
 		return state.Apply.Failed, state.Task.Failed, true
@@ -148,6 +148,14 @@ func adoptableEngineTerminalStates(s engine.State, retryable bool) (applyState, 
 	default:
 		return "", "", false
 	}
+}
+
+// failureIsSettled reports whether an engine's progress state is a failure
+// with no retry path left: the outcome a pending cancel must never replace,
+// whether the drive adopts it before consuming the cancel or the cancel's
+// fallback refuses over it.
+func failureIsSettled(s engine.State, retryable bool) bool {
+	return s == engine.StateFailed && !retryable
 }
 
 // firstTaskWithLiveEngineWork returns the first task whose state says the

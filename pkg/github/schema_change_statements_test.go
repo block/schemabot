@@ -12,7 +12,8 @@ import (
 
 // A schema file whose content differs between the approved commit and the
 // head is handed to the dialect's statement comparison only when it is a
-// regular .sql file at all four commits, its bases are either the same or
+// regular .sql file at all four commits, or one the PR adds (absent at both
+// bases, passed to the dialect as ""), its bases are either the same or
 // trusted default branch content, and the comparison budget is not spent.
 // Every other case, and any comparison that does not prove the statements
 // are the same, leaves the file changed without asking the dialect.
@@ -67,9 +68,30 @@ func TestSameStatements(t *testing.T) {
 			baseContentReviewed: true, compareSame: true,
 		},
 		{
-			name: "a file the PR added", path: "schema/db/orders.sql",
+			name: "a file the PR adds, absent at both bases", path: "schema/db/orders.sql",
+			sides:       [4]gitSide{file("approved"), {}, file("head"), {}},
+			compareSame: true, wantCompared: true, wantSame: true,
+		},
+		{
+			name: "a file the PR adds whose statements the dialect finds different", path: "schema/db/orders.sql",
+			sides:        [4]gitSide{file("approved"), {}, file("head"), {}},
+			wantCompared: true,
+		},
+		{
+			name: "a file absent at the approved commit's base only", path: "schema/db/orders.sql",
 			sides:               [4]gitSide{file("approved"), {}, file("head"), file("head-base")},
 			baseContentReviewed: true, compareSame: true,
+		},
+		{
+			name: "a file the PR adds that is absent at the head", path: "schema/db/orders.sql",
+			sides:       [4]gitSide{file("approved"), {}, {}, {}},
+			compareSame: true,
+		},
+		{
+			name: "a file the PR adds as a symlink at the head", path: "schema/db/orders.sql",
+			sides: [4]gitSide{file("approved"), {},
+				{entry: TreeEntry{Mode: gitSymlinkMode, Type: "blob", SHA: "head"}, found: true}, {}},
+			compareSame: true,
 		},
 		{
 			name: "a file that is a symlink at one commit", path: "schema/db/orders.sql",

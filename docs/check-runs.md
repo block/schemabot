@@ -675,6 +675,16 @@ the checks that instance owns:
   would trivially read as missing one. The skip is reported, never an error:
   an `--all-repos` sweep keeps going, and naming a disabled repository
   explicitly reports it as skipped with the reason instead of scanning it.
+  A declared repository the instance's GitHub App is not installed on (GitHub
+  answers the installation lookup with 404, for example while the repository's
+  onboarding is still in progress) is also skipped by an `--all-repos` sweep
+  and named in the report. Unlike a disabled repository it makes the run exit
+  nonzero, since the sweep never read it. A repository skipped part-way
+  through its pages drops whatever its earlier pages found, so none of it is
+  sent for recreation. Naming such a repository explicitly
+  fails with the App and repository to fix. Any other scan failure — a GitHub
+  5xx, timeout, rate limit, or auth error — stops the sweep, because a
+  repository that could not be read is not one with nothing to backfill.
 - **Apps.** Each repository resolves to the GitHub App that owns it (see
   [Multi-App Routing](configuration.md#multi-app-routing)); the scan and the
   recreated Check Runs both use that App's installation. An instance hosting

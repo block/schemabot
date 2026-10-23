@@ -262,11 +262,9 @@ resume's handling of a failed reattach to accepted engine work, whose pause disp
 limit (`pkg/tern/grpc_client.go`), and the PlanetScale engine's re-read of a deploy request whose
 deploy call failed, which tracks a deploy that started instead of failing it and reports an
 unknown outcome when PlanetScale did not refuse the deploy and the re-read fails or still reads
-ready (`adoptDeployAfterError`, `pkg/engine/planetscale/branch.go`), and leaves that deploy
-request open for the recovery that re-reads it instead of retiring it as a failed apply's (the
-unknown-outcome guard in the cleanup of `Apply` and `resumeApply`,
-`pkg/engine/planetscale/apply.go`), with the drive pausing an
-unknown outcome for recovery on every engine (`engine.OutcomeUnknownError`,
+ready (`adoptDeployAfterError`, `pkg/engine/planetscale/branch.go`) and whose failed-apply cleanup
+leaves that deploy request open for the recovery (`pkg/engine/planetscale/apply.go`), with the drive
+pausing an unknown outcome for recovery on every engine (`engine.OutcomeUnknownError`,
 `shouldRetryEngineError` in `pkg/tern/local_apply_sequential.go`).
 
 ### AV-5: Panics are contained and permanent
@@ -930,8 +928,8 @@ check `CutoverBlocker` (`pkg/storage/internal/sqlstore/apply_operations.go`, sha
 projection builds its children, with `RolloutHeldByResumableChild` (`pkg/state/apply.go`), which
 `updateApplyStateFromOperations` consults to keep a held-open rollout's recovery claim quiet, and
 `completeLandedStopForHeldOpenApply` keeping its stop resolved (`pkg/api/operator.go`), and
-`stopSupersedesPendingStart` completing the pending start of an apply driven under the operation lease in the same write that records a stop
-(`pkg/api/control_handlers.go`, through `RequestPendingSuperseding` in
+`StopSupersedesPendingStart` completing the pending start of an apply driven under the operation lease in the same write that records a stop
+(`pkg/tern/control_requests.go`, reached from `pkg/api/control_handlers.go` and `pkg/tern/local_control.go`, through `RequestPendingSuperseding` in
 `pkg/storage/internal/sqlstore/control_requests.go`).
 
 ## Ownership and leases (OW)
@@ -1249,11 +1247,17 @@ drive resolves the request and records that outcome. And only settled outcomes a
 a remote state still in motion. *Enforced:* terminal-truth preflights on the control paths
 (`pkg/tern/local_control.go`, `pkg/tern/grpc_control_resend.go`); the drive's adoption of the
 engine's settled outcome onto the task rows before a pending command is consumed
-(`pkg/tern/local_control_reconcile.go`); the in-process engine's settled outcome checks on stop
-and cancel (`pkg/engine/spirit/control.go`), including a completion its run records after the
-cancel, and its run's deference to a stop or cancel that interrupted it, which no failure the run
-records afterwards replaces (`setSchemaChangeFailed`, `pkg/engine/spirit/execution.go`,
-`pkg/engine/spirit/direct.go`).
+(`pkg/tern/local_control_reconcile.go`); the PlanetScale engine's reading of a deploy request
+still in motion, including an unconfirmed cancel, as running rather than settled
+(`deployStateToEngineState`, `pkg/engine/planetscale/planetscale.go`), and its typing of a
+cancel rejected over a deploy request that failed as a settled-outcome refusal
+(`classifyCancelRejection`, `pkg/engine/planetscale/control.go`), with the cancel fallback's
+refusal over a provider-settled failure its probe reads (`providerSettledChangeAsFailed`,
+`pkg/tern/local_control.go`) as the backstop; the in-process engine's
+settled outcome checks on stop and cancel (`pkg/engine/spirit/control.go`), including a
+completion its run records after the cancel, and its run's deference to a stop or cancel that
+interrupted it, which no failure the run records afterwards replaces (`setSchemaChangeFailed`,
+`pkg/engine/spirit/execution.go`, `pkg/engine/spirit/direct.go`).
 
 ### CO-4: Stop wins
 
@@ -1268,7 +1272,10 @@ before it hands a VSchema to the engine (`finalizerStandsDownForPendingControl`,
 `pkg/tern/local_control_resume.go`); cancel-before-stop consumption on both clients
 (`processPendingCancelOrStopControlRequest`, `pkg/tern/local_control.go`,
 `pkg/tern/grpc_client.go`); conflict rejection at request intake
-(`pkg/api/control_handlers.go`); and failing the cutover a stop superseded before the stop's
+(`pkg/api/control_handlers.go`); a stop on a stopped apply withdrawing the start queued behind it
+in the write that records the stop, under the locks the resuming claims take (`StopQueuedStart`,
+`pkg/storage/internal/sqlstore/control_requests.go`, reached from `pkg/api/control_handlers.go`);
+and failing the cutover a stop superseded before the stop's
 request completes (`completePendingStopControlRequest` and `SettlePendingCutoverAfterStop`,
 `pkg/tern/control_requests.go`, reached from both clients and from
 `pkg/api/control_handlers.go` and `pkg/api/operator.go`).
@@ -1643,7 +1650,8 @@ apply operation on that table that is neither terminal nor in a revert phase —
 still run it forward. A statement the re-plan still lists that only a terminal or revert-phase
 sibling was reviewed with refuses the resume instead, since nothing will run it forward.
 *Enforced:* `verifyMaterializedPlanMatchesLiveSchema`, `stampReplannedChanges` and
-`dispatchScopeForApply` on the apply path (`pkg/tern/local_plan_drift.go`, called from
+`dispatchScopeForApply` on the apply path, and `verifyAttachedShardDispatch` for a shard
+dispatch attaching to an existing apply (`pkg/tern/local_plan_drift.go`, called from
 `pkg/tern/local_client.go`);
 `verifyReplannedTaskDDL` on the resume path (`pkg/tern/local_control_resume.go`, called from
 `replanAndFilterTasks` and `resumeApplySequential`, and from the re-plan before a drive starts
@@ -1699,8 +1707,10 @@ those changes: when that comment cannot be posted, `rollback` withdraws its pin 
 (`withdrawUndisclosedRollbackPin` in `pkg/webhook/rollback.go`, over the conditional
 `LockStore.ClearPendingPlanID`). On the data plane, apply admission requires the opt-in for the
 applying deployment's own re-planned unsafe verdicts, stamped onto the materialized plan and the
-dispatch scope, with a shard dispatch this deployment never re-planned treated as unsafe
-(`pkg/tern/local_plan_drift.go`, gated by `rejectUnsafeDDLChangesWithoutOptIn` in
+dispatch scope, an attaching shard dispatch re-planned against its own shard and stamped with that
+shard's verdict, and a shard dispatch this deployment could not re-plan (it carries no schema
+files) treated as unsafe (`verifyAttachedShardDispatch` and `restoreDispatchedUnsafeVerdicts` in
+`pkg/tern/local_plan_drift.go`, gated by `rejectUnsafeDDLChangesWithoutOptIn` in
 `pkg/tern/local_client.go`).
 
 ### RV-4: Engine refusals are known at plan time and gate the apply
@@ -1718,7 +1728,9 @@ privilege and size gates in `pkg/engine/postgres/postgres.go`, plus RLS admissio
 in `pkg/engine/postgres/row_security.go` that abort plan creation and the apply-time gate in
 `pkg/engine/postgres/row_security_apply.go`); the whole-plan
 blocked verdict (`storage.Plan.BlockedApplyError`, `pkg/storage`) checked at every apply admission
-path (`pkg/api/plan_handlers.go`, `pkg/tern/local_client.go`), and the CLI's `apply` and `rollback`
+path (`pkg/api/plan_handlers.go`, `pkg/tern/local_client.go`), and for a shard dispatch attaching
+to an existing apply its re-planned scope (`storage.BlockedChangeError` in
+`attachDispatchOperation`, `pkg/tern/local_client.go`), and the CLI's `apply` and `rollback`
 refusing the namespace and shard verdicts of the plan they submit (a rollout's primary plan)
 before prompting or locking (`blockedPlanError` over `PlanResponse.FirstBlockedChange`, in
 `pkg/cmd/commands/apply.go`, called there and from `pkg/cmd/commands/rollback.go`), with a materialized plan carrying
@@ -1788,7 +1800,8 @@ cap, a truncated git tree, or config discovery that cannot prove exhaustiveness 
 because a missing file must never read as a deleted table and produce a spurious `DROP TABLE`
 proposal. Symlinked namespaces resolving outside the repository root, or to themselves, are
 rejected. *Enforced:* truncation and symlink guards on every schema-fetch path
-(`pkg/github/schema.go`, `pkg/github/client.go`); on the target side, the live-schema reads that
+(`pkg/github/schema.go`, `pkg/github/client.go`; environment schema roots for pull requests
+and the CLI alike in `pkg/schema/environment_root.go`); on the target side, the live-schema reads that
 feed a plan end it on any table they cannot read (`fetchCurrentSchema` in
 `pkg/engine/spirit/spirit.go`, `renderPostgresTables` in `pkg/engine/postgres/pull.go`).
 They also end it on a VSchema reported missing for a keyspace the target still has
@@ -1843,11 +1856,13 @@ plan, because re-resolving is exactly the step that could produce a different an
 the operator reviewed.
 
 The stored route binds the logical target and deployment, not a MySQL schema
-override within that target. Adding, changing, or removing an override requires
+override within that target or an inventory environment mapping. Adding, changing,
+or removing either requires
 holding affected operations, draining or retiring resumable applies, deploying
 consistent configuration to every replica, and discarding old plans before
 re-planning. This procedure is an operational prerequisite; durable schema-mapping
-binding across driver restarts is not enforced. See [schema override rollout](configuration.md#per-target-schema-overrides).
+binding across driver restarts is not enforced. See [schema override rollout](configuration.md#per-target-schema-overrides)
+and [inventory environment mapping](configuration.md#etre-inventory-environment-mapping).
 
 The schema source is held to the same standard, and checked twice. A repository and a path inside
 it count as a source for a database only because server config says so, verified when the plan is
@@ -1855,8 +1870,9 @@ made and verified again before the apply runs. Config that cannot answer the que
 refusal, never a default. *Breaks if violated:* a change reviewed against one database is applied
 to another. *Enforced:* server-side routing (`pkg/tern/target_router.go`), the schema override
 allowlist (`pkg/tern/local_client.go`, validated by `pkg/inventory/static.go`), configured
-resolver identity assertions (`pkg/inventory/overrides.go`), rollout member
-selection (`pkg/api/rollout_member_selector.go`, `applyTargets` in `pkg/api/plan_handlers.go`), the PostgreSQL
+resolver identity assertions (`pkg/inventory/overrides.go`), discovery scoped to the
+configured inventory environment (`pkg/etre/resolver.go`), rollout member selection
+(`pkg/api/rollout_member_selector.go`, `applyTargets` in `pkg/api/plan_handlers.go`), the PostgreSQL
 apply's check that planned DDL names the schema it targets (`pkg/engine/postgres/apply.go`), and
 source policy (`pkg/webhook/schema_source_policy.go`).
 

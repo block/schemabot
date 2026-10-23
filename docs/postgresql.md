@@ -685,6 +685,7 @@ solely from a state this engine never reports.
 | `engine.CancelledResumeStateReclaimer.ReclaimCancelledResumeState` | Not applicable; not implemented | Each statement runs in this process against the target directly; nothing is set up in a remote service ahead of the work that owns its teardown, so a cancel that lands between drives finds no stored resume state naming work to reclaim. | [`pkg/engine/engine.go`](../pkg/engine/engine.go), [`pkg/engine/postgres/apply.go`](../pkg/engine/postgres/apply.go) |
 | `engine.ControlResumeValidator.ValidateControlResumeState` | Not applicable; not implemented | Control requests use `ResumeState.MigrationContext` only as the in-memory apply key and have no opaque, operation-specific remote state to validate. | [`pkg/engine/postgres/apply.go`](../pkg/engine/postgres/apply.go), [`pkg/engine/postgres/cancel.go`](../pkg/engine/postgres/cancel.go) |
 | `engine.ShardKeyedPlanning.PlansEachShard` | Not applicable; not implemented | A PostgreSQL target is not sharded, so its tasks carry no shard and the plan never needs to speak for one. | [`pkg/engine/engine.go`](../pkg/engine/engine.go) |
+| `engine.TargetDrainer.DrainTargetContext` | Not applicable; not implemented | The PostgreSQL engine tracks its in-flight work as a whole, so a drive waits for all of it through `DrainContext`. | [`pkg/engine/engine.go`](../pkg/engine/engine.go) |
 
 ## Failure and recovery
 

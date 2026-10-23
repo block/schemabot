@@ -1071,11 +1071,20 @@ func (p *Plan) BlockedChanges() []TableChange {
 // a blocked change. Keeping this with the whole-plan verdict ensures every
 // admission path gives the same remedy.
 func (p *Plan) BlockedApplyError() error {
-	blocked := p.BlockedChanges()
-	if len(blocked) == 0 {
+	return BlockedChangeError(p.PlanIdentifier, p.BlockedChanges())
+}
+
+// BlockedChangeError returns the whole-plan refusal for the first blocked
+// change among changes of the named plan, or nil when none is blocked. An
+// admission path judging a subset of a plan's changes, such as a shard
+// dispatch's re-planned scope, refuses with it so it gives the same remedy as
+// BlockedApplyError.
+func BlockedChangeError(planIdentifier string, changes []TableChange) error {
+	i := slices.IndexFunc(changes, TableChange.EngineBlocked)
+	if i < 0 {
 		return nil
 	}
-	change := blocked[0]
+	change := changes[i]
 	reason := change.ModeReason
 	if reason == "" {
 		reason = "the engine refuses this statement"
@@ -1083,9 +1092,9 @@ func (p *Plan) BlockedApplyError() error {
 	// Independent causes are listed one per line so an operator fixing the
 	// first is not surprised by the second on the next attempt.
 	if causes := engine.BlockedCauses(reason); len(causes) > 1 {
-		return fmt.Errorf("stored plan %s contains a blocked change for table %q:\n- %s", p.PlanIdentifier, change.Table, strings.Join(causes, "\n- "))
+		return fmt.Errorf("stored plan %s contains a blocked change for table %q:\n- %s", planIdentifier, change.Table, strings.Join(causes, "\n- "))
 	}
-	return fmt.Errorf("stored plan %s contains a blocked change for table %q: %s", p.PlanIdentifier, change.Table, reason)
+	return fmt.Errorf("stored plan %s contains a blocked change for table %q: %s", planIdentifier, change.Table, reason)
 }
 
 // HasOriginalFilesCapture reports whether every stored namespace has an
@@ -1818,6 +1827,24 @@ const (
 	ControlRequestFailed ControlRequestStatus = "failed"
 )
 
+// QueuedStartStop is what ControlRequestStore.StopQueuedStart found and did.
+type QueuedStartStop string
+
+const (
+	// QueuedStartApplyNotStopped means a claim already took the apply out of
+	// stopped. Nothing was written; the stop takes the path for a running apply.
+	QueuedStartApplyNotStopped QueuedStartStop = "apply_not_stopped"
+	// QueuedStartNone means the apply is stopped with no pending start, so
+	// there is nothing to stop. Nothing was written.
+	QueuedStartNone QueuedStartStop = "no_queued_start"
+	// QueuedStartWithdrawn means the start was completed before any driver
+	// acted on it and the stop was recorded completed: the apply stays stopped.
+	QueuedStartWithdrawn QueuedStartStop = "withdrawn"
+	// QueuedStartStopPending means the start was completed and the stop was
+	// recorded pending for the drive that already claimed an operation.
+	QueuedStartStopPending QueuedStartStop = "stop_pending"
+)
+
 // ApplyControlRequest records durable user control intent.
 // Use this when an HTTP control operation can be accepted before the engine has
 // actually performed the operation.
@@ -1832,6 +1859,11 @@ type ApplyControlRequest struct {
 	CompletedAt  *time.Time
 	CreatedAt    time.Time
 	UpdatedAt    time.Time
+	// Revision counts how many times the row has been re-armed: 0 for the
+	// command it was created with, advanced in the same write that re-arms it
+	// for a new one. It tells two commands on one row apart even when both were
+	// recorded within the same second, which the timestamps cannot.
+	Revision int64
 }
 
 // ReleasesPausedRollout reports whether this request latches a rollout paused
