@@ -3447,6 +3447,21 @@ SchemaBot cannot determine whether this PR contains managed schema changes: the 
 
 </details>
 
+
+## Aggregate Check — Multi-Target Rollout Names Its Targets
+
+<details>
+<summary><strong>Aggregate Check — Multi-Target Rollout Names Its Targets</strong></summary>
+
+2 applies pending
+
+| Database | Type | Change | Status |
+|----------|------|--------|--------|
+| `orders` | mysql | 1 alter · pending on 3 of 4 targets: `shop-001`, `shop-003`, `shop-004` | Pending |
+| `inventory` | mysql | `shop-002` applied; apply the rest of the environment to finish | Pending |
+
+</details>
+
 ## Locking
 
 ### PR Comments

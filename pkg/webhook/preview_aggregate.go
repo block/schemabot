@@ -72,6 +72,38 @@ func PreviewAggregateCheckStopped() string {
 	return title + "\n\n" + summary
 }
 
+// PreviewAggregateCheckRollout renders the aggregate check of a production
+// environment rolled out to four targets: one database whose plan of the whole
+// environment finds the change still pending on three of them, and one whose
+// last apply was narrowed to a single target. Each row names the targets, so a
+// reviewer reads which targets have the change from the check alone.
+func PreviewAggregateCheckRollout() string {
+	pending := reviewDriftOutcome{state: driftClean, work: memberWork{pending: 3, members: 4, names: []string{"shop-001", "shop-003", "shop-004"}}}
+	checks := []*storage.Check{
+		{
+			DatabaseType:  "mysql",
+			DatabaseName:  "orders",
+			HasChanges:    true,
+			Status:        checkStatusCompleted,
+			Conclusion:    checkConclusionActionRequired,
+			ChangeSummary: pending.changeSummary("1 alter"),
+		},
+		{
+			DatabaseType:   "mysql",
+			DatabaseName:   "inventory",
+			HasChanges:     true,
+			Status:         checkStatusCompleted,
+			Conclusion:     checkConclusionActionRequired,
+			BlockingReason: narrowedApplyBlock.blockingReason,
+			ChangeSummary:  narrowedApplyCompletedSummary("shop-002"),
+		},
+	}
+
+	conclusion, _ := computeAggregate(checks, nil)
+	title, summary := aggregateSummary(checks, conclusion, nil)
+	return title + "\n\n" + summary
+}
+
 // PreviewAggregateCheckFileCapBlocked renders the failing aggregate-check
 // output published when a PR changes more files than GitHub will report for a
 // single pull request: the fixed failure title plus the cap message telling

@@ -213,7 +213,7 @@ func TestE2EConvergedPrimaryWithPendingTargetAppliesEveryTarget(t *testing.T) {
 	check := rolloutCheck(t, svc, dbName)
 	assert.Equal(t, "action_required", check.Conclusion, "a target that still needs the change keeps the check from passing")
 	assert.True(t, check.HasChanges, "work on a non-primary target is work on the rollout")
-	assert.Equal(t, "1 target needs this change", check.ChangeSummary)
+	assert.Equal(t, "1 of 2 targets needs this change: `us`", check.ChangeSummary, "the check names the target the PR is still waiting on")
 	assert.Empty(t, check.BlockingReason, "independent targets differing is not drift")
 
 	apply := runRolloutCommand(t, svc, dbName, "schemabot apply -e "+driftEnv)
@@ -228,6 +228,8 @@ func TestE2EConvergedPrimaryWithPendingTargetAppliesEveryTarget(t *testing.T) {
 	check = rolloutCheck(t, svc, dbName)
 	assert.NotEqual(t, "success", check.Conclusion, "us still needs the change while the apply runs, so the check never passes on eu's empty plan")
 	assert.True(t, check.HasChanges)
+	assert.Equal(t, "1 of 2 targets: `us`", check.ChangeSummary,
+		"the apply's row names the target it runs on, which stays true once the row reads Applied")
 
 	operations, err := svc.Storage().ApplyOperations().ListByApply(t.Context(), created.ID)
 	require.NoError(t, err)
@@ -1337,7 +1339,9 @@ func TestE2EUnstoredPendingRolloutFailsCheckClosed(t *testing.T) {
 		{name: "eu", liveSchema: usersWithEmailSchema},
 		{name: "us", liveSchema: usersBaseSchema},
 	}
-	pending := "(1 target needs this change)"
+	// The failing summary escapes the backticks around the target name, which
+	// still render as the same text.
+	pending := checkRunSummaryEscaper.Replace("(1 of 2 targets needs this change: `us`)")
 	for _, tc := range []struct {
 		name    string
 		dbName  string

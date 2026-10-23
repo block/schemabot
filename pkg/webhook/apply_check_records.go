@@ -4,11 +4,13 @@ import (
 	"context"
 	"fmt"
 	"slices"
+	"strings"
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/checkstate"
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/metrics"
+	"github.com/block/schemabot/pkg/routing"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 )
@@ -31,18 +33,50 @@ func (h *Handler) storeApplyCheckRecord(ctx context.Context, client *ghclient.In
 		return h.storeNarrowedApplyCheck(ctx, client, repo, pr, schema, planResp, environment)
 	}
 	if runsMemberWork {
+		rollout.dispatchesApply = true
 		return h.storePlanCheckRecord(ctx, client, repo, pr, schema, planResp, environment, rollout)
 	}
 	return h.storePlanCheckRecord(ctx, client, repo, pr, schema, planResp, environment, reviewDriftOutcome{state: driftNotEvaluated})
 }
 
 // narrowedApplyCheckSummary is the stored Change column for an environment
-// whose last apply was narrowed to one target. It is written before the apply
-// dispatches and kept once it completes, so it describes the rollout rather
-// than the apply, which holds whether or not it went on to run. Rolling out
-// one target at a time is an ordinary rollout, so it names the next step
-// rather than a problem. The apply comment names the target.
-const narrowedApplyCheckSummary = "rolling out one target at a time; apply the rest of the environment to finish"
+// whose apply was narrowed to one target, written before the apply dispatches.
+// It describes the rollout step rather than the apply, which holds whether or
+// not it goes on to run. Rolling out one target at a time is an ordinary
+// rollout, so it names the next step rather than a problem.
+func narrowedApplyCheckSummary(target string) string {
+	return clampDriftSummary(fmt.Sprintf("rolling out `%s` alone; apply the rest of the environment to finish", target))
+}
+
+// narrowedApplyCompletedSummary is the stored Change column once an apply
+// narrowed to one target completes, so a reviewer reading the check sees which
+// target the rollout last reached.
+func narrowedApplyCompletedSummary(target string) string {
+	return clampDriftSummary(fmt.Sprintf("`%s` applied; apply the rest of the environment to finish", target))
+}
+
+// narrowedTargetName names the rollout member a narrowed plan or apply was
+// made for the way every PR surface names it: by its deployment, qualified with
+// the target when the deployment addresses several targets in the environment.
+// Targets that cannot be resolved leave the name qualified, which never reads
+// as another target.
+func (h *Handler) narrowedTargetName(memberID, database, environment string) string {
+	// The first slash always ends the deployment (routing.ExecutionTarget.MemberID).
+	deployment, target, ok := strings.Cut(memberID, "/")
+	if !ok {
+		h.logger.Warn("narrowed rollout member has no target; naming it as recorded",
+			"database", database, "environment", environment, "narrowed_to", memberID)
+		return memberID
+	}
+	member := routing.ExecutionTarget{Deployment: deployment, Target: target}
+	targets, err := h.service.Config().ResolveDatabaseTargets(database, environment)
+	if err != nil {
+		h.logger.Warn("could not resolve the environment's targets to name the narrowed target; naming it with its target",
+			"database", database, "environment", environment, "narrowed_to", memberID, "error", err)
+		return member.MemberID()
+	}
+	return routing.DisplayNames(append([]routing.ExecutionTarget{member}, targets...))[0]
+}
 
 // storeNarrowedApplyCheck blocks the environment's check before an apply
 // narrowed to one rollout member dispatches. The narrowed plan says nothing
@@ -58,7 +92,7 @@ func (h *Handler) storeNarrowedApplyCheck(ctx context.Context, client *ghclient.
 		"plan_id", planResp.PlanID, "narrowed_to", planResp.NarrowedTo)
 	blocked := reviewDriftOutcome{
 		state:    driftBlocked,
-		summary:  narrowedApplyCheckSummary,
+		summary:  narrowedApplyCheckSummary(h.narrowedTargetName(planResp.NarrowedTo, schema.Database, environment)),
 		block:    narrowedApplyBlock,
 		preserve: narrowedApplyKeptBlockingReasons(),
 	}
