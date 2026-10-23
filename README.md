@@ -30,6 +30,16 @@ SchemaBot is declarative and GitOps-driven: SQL files in your repository provide
 
 [Walk through the illustrated PR workflow](./docs/pre-merge-workflow.md#the-pr-workflow-step-by-step)
 
+**Roll out to every target.** One apply copies every target of an environment in parallel, and the check passes once all of them have the change.
+
+<img src="./assets/pr-multi-target-demo.gif" width="800" alt="A PR applies an index to four targets in parallel, follows each target's copy, and merges once every target has the change">
+
+**Start with one target.** `--target` applies one target first, and the check keeps blocking merge until the rest have the change.
+
+<img src="./assets/pr-target-demo.gif" width="800" alt="A PR applies an index to one target with --target, and the schema check keeps blocking merge until every target has the change">
+
+[Roll out to several targets](./docs/mysql.md#multi-target-environments)
+
 ## From your terminal
 
 **Plan and apply a change.** Review the SQL, apply the change, and follow it to completion.
