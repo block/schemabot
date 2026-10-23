@@ -407,7 +407,7 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 			return
 		}
 		h.acknowledgeCommand(repo, pr, installationID, deliveryID, result.CommentID)
-		h.postComment(repo, pr, installationID, templates.RenderInvalidCommand())
+		h.postComment(repo, pr, installationID, templates.RenderInvalidCommand(result.Rejection))
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "invalid command"})
 		return
 	}
@@ -573,7 +573,7 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 		})
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "revert started"})
 	default:
-		h.postComment(repo, pr, installationID, templates.RenderInvalidCommand())
+		h.postComment(repo, pr, installationID, templates.RenderInvalidCommand(result.Rejection))
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "invalid command"})
 	}
 }

@@ -4,8 +4,20 @@ import (
 	"testing"
 
 	"github.com/block/schemabot/pkg/webhook/action"
+	"github.com/block/schemabot/pkg/webhook/templates"
 	"github.com/stretchr/testify/assert"
 )
+
+// rejection is the reason a command line is rejected: the token to blame,
+// what is wrong with it, and the accepted spelling the reply names.
+func rejection(problem templates.CommandProblem, token, accepted string) templates.CommandRejection {
+	return templates.CommandRejection{Problem: problem, Token: token, Accepted: accepted}
+}
+
+// rejectedBy is the parse result of a command line rejected for one token.
+func rejectedBy(problem templates.CommandProblem, token, accepted string) CommandResult {
+	return CommandResult{IsMention: true, Rejection: rejection(problem, token, accepted)}
+}
 
 // TestCommandSpecs_CoverEveryDispatcherAction enforces that every command the
 // dispatcher branches on has a spec in the registry. A spec missing here is
@@ -188,6 +200,7 @@ func TestParseTenantFlag(t *testing.T) {
 			result: CommandResult{
 				Tenant:    "alpha",
 				IsMention: true,
+				Rejection: rejection(templates.CommandProblemUnknownCommand, "wat", ""),
 			},
 		},
 		{
@@ -336,6 +349,7 @@ func TestParseCommand(t *testing.T) {
 			expected: CommandResult{
 				Tenant:    "alpha",
 				IsMention: true,
+				Rejection: rejection(templates.CommandProblemMissingValue, "-e", "-e"),
 			},
 		},
 		{
@@ -459,18 +473,14 @@ func TestParseCommand(t *testing.T) {
 			},
 		},
 		{
-			name: "mistyped command",
-			body: "schemabot aply -e staging",
-			expected: CommandResult{
-				IsMention: true,
-			},
+			name:     "mistyped command",
+			body:     "schemabot aply -e staging",
+			expected: rejectedBy(templates.CommandProblemUnknownCommand, "aply", ""),
 		},
 		{
-			name: "mistyped command with apply ID",
-			body: "schemabot stpo apply-abc123 -e staging",
-			expected: CommandResult{
-				IsMention: true,
-			},
+			name:     "mistyped command with apply ID",
+			body:     "schemabot stpo apply-abc123 -e staging",
+			expected: rejectedBy(templates.CommandProblemUnknownCommand, "stpo", ""),
 		},
 		{
 			name: "bare mention",
@@ -505,11 +515,9 @@ func TestParseCommand(t *testing.T) {
 			expected: CommandResult{ProseMention: true},
 		},
 		{
-			name: "command word with trailing punctuation is not the command",
-			body: "SchemaBot plan.",
-			expected: CommandResult{
-				IsMention: true,
-			},
+			name:     "command word with trailing punctuation is not the command",
+			body:     "SchemaBot plan.",
+			expected: rejectedBy(templates.CommandProblemPunctuatedCommand, "plan.", "plan"),
 		},
 		{
 			name:     "single word with sentence punctuation that is not a command is prose",
@@ -542,11 +550,9 @@ func TestParseCommand(t *testing.T) {
 			},
 		},
 		{
-			name: "mistyped command after a sentence opening with the product name",
-			body: "SchemaBot planned this earlier.\n\nschemabot aply -e staging",
-			expected: CommandResult{
-				IsMention: true,
-			},
+			name:     "mistyped command after a sentence opening with the product name",
+			body:     "SchemaBot planned this earlier.\n\nschemabot aply -e staging",
+			expected: rejectedBy(templates.CommandProblemUnknownCommand, "aply", ""),
 		},
 		{
 			name:     "inline prose mention ignored",
@@ -1170,46 +1176,52 @@ func TestFlagHelpers_ReadOnlyTheCommandLine(t *testing.T) {
 // directive, so a command on a later line does not run in its place.
 func TestParseCommand_MalformedCommand(t *testing.T) {
 	parser := NewCommandParser()
-	rejected := CommandResult{IsMention: true}
 
 	tests := []struct {
 		name     string
 		body     string
 		expected CommandResult
 	}{
-		{name: "unsafe flag with a full stop", body: "schemabot apply -e staging --allow-unsafe.", expected: rejected},
-		{name: "unsafe flag with a comma", body: "schemabot apply -e staging --allow-unsafe,", expected: rejected},
-		{name: "flag with a value glued on", body: "schemabot apply -e staging --allow-unsafe=true", expected: rejected},
-		{name: "unknown flag", body: "schemabot apply -e staging --foo", expected: rejected},
-		{name: "auto-confirm flag with a full stop", body: "schemabot apply -e staging -y.", expected: rejected},
-		{name: "database with a full stop", body: "schemabot apply -e staging -d billing.", expected: rejected},
-		{name: "database flag without a value", body: "schemabot apply -e staging -d", expected: rejected},
-		{name: "database flag followed by another flag", body: "schemabot apply -e staging -d --allow-unsafe", expected: rejected},
-		{name: "apply ID with a full stop", body: "schemabot rollback apply-abc123. -e staging", expected: rejected},
-		{name: "apply ID with trailing letters", body: "schemabot rollback apply-abc123xyz -e staging", expected: rejected},
-		{name: "two apply IDs", body: "schemabot rollback apply-abc123 apply-def456 -e staging", expected: rejected},
-		{name: "command word with a comma", body: "schemabot apply, -e staging", expected: rejected},
-		{name: "unsafe flag autocorrected to an em dash", body: "schemabot apply -e staging \u2014allow-unsafe", expected: rejected},
-		{name: "environment flag autocorrected to an en dash", body: "schemabot apply \u2013e staging", expected: rejected},
-		{name: "optional environment copied from usage text", body: "schemabot plan [-e <env>]", expected: rejected},
-		{name: "optional tenant copied from usage text", body: "schemabot rollback <apply-id> -e staging [-t <tenant>]", expected: rejected},
-		{name: "environment flag without a value", body: "schemabot plan -e", expected: rejected},
-		{name: "environment flag followed by another flag", body: "schemabot plan -e -d billing", expected: rejected},
-		{name: "environment given twice", body: "schemabot apply -e staging -e production", expected: rejected},
+		{name: "unsafe flag with a full stop", body: "schemabot apply -e staging --allow-unsafe.", expected: rejectedBy(templates.CommandProblemPunctuatedFlag, "--allow-unsafe.", "--allow-unsafe")},
+		{name: "unsafe flag with a comma", body: "schemabot apply -e staging --allow-unsafe,", expected: rejectedBy(templates.CommandProblemPunctuatedFlag, "--allow-unsafe,", "--allow-unsafe")},
+		{name: "flag with a value glued on", body: "schemabot apply -e staging --allow-unsafe=true", expected: rejectedBy(templates.CommandProblemUnknownFlag, "--allow-unsafe=true", "")},
+		{name: "unknown flag", body: "schemabot apply -e staging --foo", expected: rejectedBy(templates.CommandProblemUnknownFlag, "--foo", "")},
+		{name: "auto-confirm flag with a full stop", body: "schemabot apply -e staging -y.", expected: rejectedBy(templates.CommandProblemPunctuatedFlag, "-y.", "-y")},
+		{name: "database with a full stop", body: "schemabot apply -e staging -d billing.", expected: rejectedBy(templates.CommandProblemInvalidDatabase, "billing.", "")},
+		{name: "database flag without a value", body: "schemabot apply -e staging -d", expected: rejectedBy(templates.CommandProblemMissingValue, "-d", "-d")},
+		{name: "database flag followed by another flag", body: "schemabot apply -e staging -d --allow-unsafe", expected: rejectedBy(templates.CommandProblemMissingValue, "-d", "-d")},
+		{name: "apply ID with a full stop", body: "schemabot rollback apply-abc123. -e staging", expected: rejectedBy(templates.CommandProblemInvalidApplyID, "apply-abc123.", "")},
+		{name: "apply ID with trailing letters", body: "schemabot rollback apply-abc123xyz -e staging", expected: rejectedBy(templates.CommandProblemInvalidApplyID, "apply-abc123xyz", "")},
+		{name: "two apply IDs", body: "schemabot rollback apply-abc123 apply-def456 -e staging", expected: rejectedBy(templates.CommandProblemSecondApplyID, "apply-def456", "")},
+		{name: "command word with a comma", body: "schemabot apply, -e staging", expected: rejectedBy(templates.CommandProblemPunctuatedCommand, "apply,", "apply")},
+		{name: "unsafe flag autocorrected to an em dash", body: "schemabot apply -e staging \u2014allow-unsafe", expected: rejectedBy(templates.CommandProblemAutocorrectedDash, "\u2014allow-unsafe", "--allow-unsafe")},
+		{name: "environment flag autocorrected to an en dash", body: "schemabot apply \u2013e staging", expected: rejectedBy(templates.CommandProblemAutocorrectedDash, "\u2013e", "-e")},
+		{name: "optional environment copied from usage text", body: "schemabot plan [-e <env>]", expected: rejectedBy(templates.CommandProblemUsageNotation, "[-e", "")},
+		{name: "optional tenant copied from usage text", body: "schemabot rollback <apply-id> -e staging [-t <tenant>]", expected: rejectedBy(templates.CommandProblemUsageNotation, "[-t", "")},
+		{name: "environment flag without a value", body: "schemabot plan -e", expected: rejectedBy(templates.CommandProblemMissingValue, "-e", "-e")},
+		{name: "environment flag followed by another flag", body: "schemabot plan -e -d billing", expected: rejectedBy(templates.CommandProblemMissingValue, "-e", "-e")},
+		{name: "environment given twice", body: "schemabot apply -e staging -e production", expected: rejectedBy(templates.CommandProblemRepeatedFlag, "-e", "-e")},
+		{name: "bare dashes with no flag after them", body: "schemabot apply -e staging --", expected: rejectedBy(templates.CommandProblemUnknownFlag, "--", "")},
+		{name: "unsafe flag split from its dashes", body: "schemabot apply -e staging -- allow-unsafe", expected: rejectedBy(templates.CommandProblemMissingDashes, "allow-unsafe", "--allow-unsafe")},
+		{name: "unsafe flag without its dashes", body: "schemabot apply -e staging allow-unsafe", expected: rejectedBy(templates.CommandProblemMissingDashes, "allow-unsafe", "--allow-unsafe")},
+		{name: "skip-revert flag split from its dashes", body: "schemabot apply -e staging -- skip-revert", expected: rejectedBy(templates.CommandProblemMissingDashes, "skip-revert", "--skip-revert")},
+		{name: "defer-cutover flag split from its dashes", body: "schemabot apply -e staging -- defer-cutover", expected: rejectedBy(templates.CommandProblemMissingDashes, "defer-cutover", "--defer-cutover")},
+		{name: "auto-confirm flag without its dashes", body: "schemabot apply -e staging yes", expected: rejectedBy(templates.CommandProblemMissingDashes, "yes", "--yes")},
+		{name: "target flag without its dashes takes its value", body: "schemabot apply -e staging target us-west", expected: rejectedBy(templates.CommandProblemMissingDashes, "target", "--target")},
 		{
 			name:     "tenant given twice has no single routing target",
 			body:     "schemabot plan -e staging -t tenant-a --tenant tenant-b",
-			expected: CommandResult{TenantError: true, IsMention: true},
+			expected: CommandResult{TenantError: true, IsMention: true, Rejection: rejection(templates.CommandProblemRepeatedFlag, "--tenant", "-t")},
 		},
 		{
 			name:     "rejected line keeps its tenant so the right deployment answers",
 			body:     "schemabot apply -e staging -t tenant-a --allow-unsafe.",
-			expected: CommandResult{Tenant: "tenant-a", IsMention: true},
+			expected: CommandResult{Tenant: "tenant-a", IsMention: true, Rejection: rejection(templates.CommandProblemPunctuatedFlag, "--allow-unsafe.", "--allow-unsafe")},
 		},
 		{
 			name:     "rejected line is the directive; a later command does not run",
 			body:     "schemabot apply -e staging --allow-unsafe.\n\nschemabot plan -e staging",
-			expected: rejected,
+			expected: rejectedBy(templates.CommandProblemPunctuatedFlag, "--allow-unsafe.", "--allow-unsafe"),
 		},
 		{
 			name:     "a bracketed plain word is a sentence, not usage text",
@@ -1220,6 +1232,21 @@ func TestParseCommand_MalformedCommand(t *testing.T) {
 			name:     "a plain word makes the line a sentence, not a rejected command",
 			body:     "SchemaBot apply --allow-unsafe. went fine",
 			expected: CommandResult{ProseMention: true},
+		},
+		{
+			name:     "a flag name in a sentence does not reject it",
+			body:     "SchemaBot apply -e staging force pushed past the lint",
+			expected: CommandResult{ProseMention: true},
+		},
+		{
+			name:     "a sentence reporting an apply stays a sentence",
+			body:     "SchemaBot apply -e staging succeeded",
+			expected: CommandResult{ProseMention: true},
+		},
+		{
+			name:     "unsafe flag typed exactly",
+			body:     "schemabot apply -e staging --allow-unsafe",
+			expected: CommandResult{Action: "apply", Environment: "staging", AllowUnsafe: true, Found: true, IsMention: true},
 		},
 		{
 			name:     "environment with a full stop gets the environment usage answer",
@@ -1543,12 +1570,12 @@ func TestParseCommandTargetFlag(t *testing.T) {
 		{
 			name:     "missing value",
 			body:     "schemabot apply -e staging --target",
-			expected: CommandResult{IsMention: true},
+			expected: rejectedBy(templates.CommandProblemMissingValue, "--target", "--target"),
 		},
 		{
 			name:     "value swallowed by the next flag",
 			body:     "schemabot apply -e staging --target --allow-unsafe",
-			expected: CommandResult{IsMention: true},
+			expected: rejectedBy(templates.CommandProblemMissingValue, "--target", "--target"),
 		},
 		{
 			name: "opaque target name forwarded as typed",
@@ -1569,7 +1596,7 @@ func TestParseCommandTargetFlag(t *testing.T) {
 		{
 			name:     "given twice",
 			body:     "schemabot apply -e staging --target payments-001 --target payments-002",
-			expected: CommandResult{IsMention: true},
+			expected: rejectedBy(templates.CommandProblemRepeatedFlag, "--target", "--target"),
 		},
 		{
 			name: "command that takes no target parses without one",
