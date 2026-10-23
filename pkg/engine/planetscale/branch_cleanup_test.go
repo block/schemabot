@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"os"
 	"sync"
 	"testing"
 	"time"
@@ -1003,15 +1004,15 @@ func TestResumeApply_ClosesTheUndeployedDeployRequestItCreated(t *testing.T) {
 }
 
 // pendingDeployRequestHandbackClient serves a resumable branch, creates the
-// deploy request the resume asks for while PlanetScale is still computing its
-// diff, and ends the drive at that moment, the way a handback does.
+// deploy request the resume asks for, and ends the drive on the first read of
+// that deploy request, while PlanetScale is still computing its diff, the way
+// a handback mid-wait does.
 type pendingDeployRequestHandbackClient struct {
 	resumeReclaimClient
 	cancel context.CancelFunc
 }
 
 func (c *pendingDeployRequestHandbackClient) CreateDeployRequest(context.Context, *ps.CreateDeployRequestRequest) (*ps.DeployRequest, error) {
-	c.cancel()
 	return &ps.DeployRequest{
 		Number:          42,
 		HtmlURL:         "https://app.planetscale.com/org/testdb/deploy-requests/42",
@@ -1020,41 +1021,249 @@ func (c *pendingDeployRequestHandbackClient) CreateDeployRequest(context.Context
 }
 
 func (c *pendingDeployRequestHandbackClient) GetDeployRequest(context.Context, *ps.GetDeployRequestRequest) (*ps.DeployRequest, error) {
+	c.cancel()
 	return &ps.DeployRequest{Number: 42, DeploymentState: deployState.Pending}, nil
 }
 
 // A resumed drive that ends while its new deploy request is still pending has
 // already recorded that deploy request, so the driver that picks the apply up
 // next resumes it instead of opening a second deploy request on the branch.
+// The save runs under the drive's context, as the real one does, so a drive
+// that has ended can no longer save. When the save was refused, the drive
+// warns that the deploy request it leaves behind is one no successor can
+// find, naming it for the operator to close. Either way the branch is kept.
 func TestResumeApply_RecordsTheDeployRequestBeforeWaitingOnIt(t *testing.T) {
-	shortenEngineWaits(t)
-	ctx, cancel := context.WithCancel(t.Context())
-	defer cancel()
-	client := &pendingDeployRequestHandbackClient{cancel: cancel}
-	req := resumeRequest(t, &psMetadata{BranchName: "schemabot-testdb-1a2b"}, "apply-1a2b3c4d5e6f7890")
-	persisted := captureStateChanges(req)
+	const url = "https://app.planetscale.com/org/testdb/deploy-requests/42"
+	tests := []struct {
+		name      string
+		saveErr   error
+		wantLog   string
+		wantLevel string
+	}{
+		{
+			name:      "the save landed, so the successor resumes the deploy request",
+			wantLog:   "resumed drive ended after its deploy request was created; leaving the deploy request to the driver or control operation that takes over the apply",
+			wantLevel: "INFO",
+		},
+		{
+			name:      "the save was refused, so the deploy request is named for the operator",
+			saveErr:   errors.New("apply apply-1a2b3c4d5e6f7890: storage unavailable"),
+			wantLog:   "resumed drive ended after its deploy request was created, but no save naming it landed; the driver that takes over cannot find this deploy request and will open another, so close it by hand",
+			wantLevel: "WARN",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			shortenEngineWaits(t)
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			client := &pendingDeployRequestHandbackClient{cancel: cancel}
+			req := resumeRequest(t, &psMetadata{BranchName: "schemabot-testdb-1a2b"}, "apply-1a2b3c4d5e6f7890")
+			logRecord := captureApplyLogs(t, req)
+			var saved []*engine.ResumeState
+			req.OnStateChange = func(rs *engine.ResumeState) error {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+				if tt.saveErr != nil {
+					return tt.saveErr
+				}
+				saved = append(saved, rs)
+				return nil
+			}
 
-	_, err := conformanceEngine(client).resumeApply(ctx, client, "org", req)
+			_, err := conformanceEngine(client).resumeApply(ctx, client, "org", req)
 
-	require.ErrorIs(t, err, context.Canceled)
-	require.NotEmpty(t, *persisted, "the resume records the deploy request it opened")
-	last := (*persisted)[len(*persisted)-1]
-	assert.Equal(t, "apply-1a2b3c4d5e6f7890", last.MigrationContext)
-	meta, err := decodePSMetadata(last.Metadata)
+			require.ErrorIs(t, err, context.Canceled)
+			assert.Empty(t, client.deleteAttempts(), "the branch is kept for whoever takes the apply over")
+			record := logRecord(tt.wantLog)
+			require.NotNil(t, record, "the drive's end is logged on the apply's logger")
+			assert.Equal(t, tt.wantLevel, record["level"])
+			assert.Equal(t, float64(42), record["deploy_request"])
+			assert.Equal(t, "schemabot-testdb-1a2b", record["branch"])
+			if tt.saveErr != nil {
+				assert.Empty(t, saved)
+				return
+			}
+			require.Len(t, saved, 1, "the resume records the deploy request it opened before waiting on it")
+			assert.Equal(t, "apply-1a2b3c4d5e6f7890", saved[0].MigrationContext)
+			meta, err := decodePSMetadata(saved[0].Metadata)
+			require.NoError(t, err)
+			assert.Equal(t, "schemabot-testdb-1a2b", meta.BranchName)
+			assert.Equal(t, uint64(42), meta.DeployRequestID)
+			assert.Equal(t, url, meta.DeployRequestURL)
+		})
+	}
+}
+
+// deployRequestReclaimClient serves the cancelled apply's stored deploy request
+// as dr, or fails the read with getErr, and records each read and delete.
+type deployRequestReclaimClient struct {
+	resumeReclaimClient
+	dr     *ps.DeployRequest
+	getErr error
+	reads  []uint64
+	// databases records the database each read and delete addressed.
+	databases []string
+}
+
+func (c *deployRequestReclaimClient) GetDeployRequest(_ context.Context, req *ps.GetDeployRequestRequest) (*ps.DeployRequest, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.reads = append(c.reads, req.Number)
+	c.databases = append(c.databases, "read "+req.Database)
+	if c.getErr != nil {
+		return nil, c.getErr
+	}
+	return c.dr, nil
+}
+
+func (c *deployRequestReclaimClient) DeleteBranch(ctx context.Context, req *ps.DeleteDatabaseBranchRequest) error {
+	c.mu.Lock()
+	c.databases = append(c.databases, "delete "+req.Database)
+	c.mu.Unlock()
+	return c.resumeReclaimClient.DeleteBranch(ctx, req)
+}
+
+// The client that would read the deploy request cannot be built. Only a read
+// proves the deploy request will never deploy, so the branch is kept, never
+// sent a delete, and reported so the apply log names it.
+func TestReclaimCancelledResumeState_UnreachableClientWithDeployRequestKeepsBranch(t *testing.T) {
+	const ownedBranch = "schemabot-commerce-1a2b"
+	e := NewWithClient(slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError})),
+		func(_, _ string) (psclient.PSClient, error) {
+			return nil, errors.New("planetscale unreachable")
+		})
+	encoded, err := encodePSMetadata(&psMetadata{BranchName: ownedBranch, DeployRequestID: 42})
 	require.NoError(t, err)
-	assert.Equal(t, "schemabot-testdb-1a2b", meta.BranchName)
-	assert.Equal(t, uint64(42), meta.DeployRequestID)
-	assert.Equal(t, "https://app.planetscale.com/org/testdb/deploy-requests/42", meta.DeployRequestURL)
-	assert.Empty(t, client.deleteAttempts())
+
+	result, err := e.ReclaimCancelledResumeState(t.Context(), &engine.ReclaimResumeStateRequest{
+		Database:    "commerce",
+		Credentials: conformanceCredentials(),
+		ResumeState: &engine.ResumeState{Metadata: encoded},
+	})
+
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	assert.Empty(t, result.Reclaimed)
+	assert.Equal(t, []string{"branch " + ownedBranch}, result.Kept)
+	assert.Contains(t, result.KeptReason, "delete the branch by hand")
+}
+
+// A database registered under an identifier other than its PlanetScale name
+// carries the PlanetScale name in its credential metadata. The reclaim reads
+// the deploy request and deletes the branch on the database as PlanetScale
+// knows it, so the branch is found and deleted rather than missed under the
+// registered identifier.
+func TestReclaimCancelledResumeState_ResolvesDatabaseName(t *testing.T) {
+	const ownedBranch = "schemabot-commerce-1a2b"
+	client := &deployRequestReclaimClient{
+		dr: &ps.DeployRequest{Number: 42, State: deployRequestClosed, DeploymentState: "ready"},
+	}
+	encoded, err := encodePSMetadata(&psMetadata{BranchName: ownedBranch, DeployRequestID: 42})
+	require.NoError(t, err)
+	creds := conformanceCredentials()
+	creds.Metadata["database"] = "commerce_main"
+
+	result, err := conformanceEngine(client).ReclaimCancelledResumeState(t.Context(), &engine.ReclaimResumeStateRequest{
+		Database:    "commerce",
+		Credentials: creds,
+		ResumeState: &engine.ResumeState{Metadata: encoded},
+	})
+
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	assert.Equal(t, []string{"read commerce_main", "delete commerce_main"}, client.databases)
+	assert.Equal(t, []string{"branch " + ownedBranch}, result.Reclaimed)
+}
+
+// A cancel of a deferred deploy closes its deploy request before the deploy
+// starts, and a deploy request tears its branch down only when its deploy
+// finishes, so a branch SchemaBot created for a deploy request closed that way
+// has nothing else to remove it. The reclaim reads the stored deploy request
+// and deletes the branch only when the read proves the deploy request closed
+// without deploying. A deploy request that is still open, or that closed by
+// deploying, owns the branch; a deploy request that cannot be read keeps the
+// branch and reports it, so the apply log can say it is still in PlanetScale;
+// and an operator-supplied branch is kept for the operator without reading
+// the deploy request at all.
+func TestReclaimCancelledResumeState_DeployRequest(t *testing.T) {
+	const ownedBranch = "schemabot-commerce-1a2b"
+	deployedAt := time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name          string
+		meta          *psMetadata
+		options       map[string]string
+		dr            *ps.DeployRequest
+		getErr        error
+		wantReads     []uint64
+		wantAttempts  []string
+		wantReclaimed []string
+		wantKept      []string
+	}{
+		{
+			name:      "a branch whose deploy request closed before it deployed is deleted",
+			meta:      &psMetadata{BranchName: ownedBranch, DeployRequestID: 42},
+			dr:        &ps.DeployRequest{Number: 42, State: deployRequestClosed, DeploymentState: "ready"},
+			wantReads: []uint64{42}, wantAttempts: []string{ownedBranch}, wantReclaimed: []string{"branch " + ownedBranch},
+		},
+		{
+			name:      "a branch whose deploy request closed by deploying is left to the deploy request",
+			meta:      &psMetadata{BranchName: ownedBranch, DeployRequestID: 42},
+			dr:        &ps.DeployRequest{Number: 42, State: deployRequestClosed, DeploymentState: "complete", DeployedAt: &deployedAt},
+			wantReads: []uint64{42},
+		},
+		{
+			name:      "a branch whose deploy request is still open is left to the deploy request",
+			meta:      &psMetadata{BranchName: ownedBranch, DeployRequestID: 42},
+			dr:        &ps.DeployRequest{Number: 42, State: "open", DeploymentState: "ready"},
+			wantReads: []uint64{42},
+		},
+		{
+			name:      "a branch whose deploy request cannot be read is kept and reported",
+			meta:      &psMetadata{BranchName: ownedBranch, DeployRequestID: 42},
+			getErr:    errors.New("planetscale unavailable"),
+			wantReads: []uint64{42}, wantKept: []string{"branch " + ownedBranch},
+		},
+		{
+			name: "an operator-supplied branch with a deploy request is kept for the operator",
+			meta: &psMetadata{BranchName: "my-dev-branch", DeployRequestID: 42}, options: map[string]string{"branch": "my-dev-branch"},
+			dr:       &ps.DeployRequest{Number: 42, State: deployRequestClosed, DeploymentState: "ready"},
+			wantKept: []string{"branch my-dev-branch"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client := &deployRequestReclaimClient{dr: tt.dr, getErr: tt.getErr}
+			encoded, err := encodePSMetadata(tt.meta)
+			require.NoError(t, err)
+
+			result, err := conformanceEngine(client).ReclaimCancelledResumeState(t.Context(), &engine.ReclaimResumeStateRequest{
+				Database:    "commerce",
+				Credentials: conformanceCredentials(),
+				Options:     tt.options,
+				ResumeState: &engine.ResumeState{Metadata: encoded},
+			})
+
+			require.NoError(t, err, "a reclaim that keeps the branch because a deploy request may own it is not a failure")
+			require.NotNil(t, result)
+			assert.Equal(t, tt.wantReads, client.reads)
+			assert.Equal(t, tt.wantAttempts, client.deleteAttempts(), "a kept branch is never sent a delete")
+			assert.Equal(t, tt.wantReclaimed, result.Reclaimed)
+			assert.Equal(t, tt.wantKept, result.Kept)
+			assert.Equal(t, len(tt.wantKept) > 0, result.KeptReason != "", "a kept branch carries its reason")
+		})
+	}
 }
 
 // A cancel that lands between drives finds the branch only in the apply's
 // stored resume state: the drive that created it has exited, and the drive
-// consuming the cancel stands down before it resumes. The reclaim deletes a
-// branch SchemaBot created and no deploy request owns, and leaves alone a
-// branch the deploy request tears down, a branch the operator supplied, and a
-// branch a drive already removed, reporting each so the apply log can say what
-// is still in PlanetScale and why.
+// consuming the cancel stands down before it resumes. These cases cover a
+// state without a deploy request, plus the deploy-request cases that need no
+// read; TestReclaimCancelledResumeState_DeployRequest covers the rest. The
+// reclaim deletes a branch SchemaBot created, and leaves alone a branch the
+// operator supplied and a branch a drive already removed, reporting each so
+// the apply log can say what is still in PlanetScale and why.
 func TestReclaimCancelledResumeState(t *testing.T) {
 	const ownedBranch = "schemabot-commerce-1a2b"
 	tests := []struct {
@@ -1070,9 +1279,6 @@ func TestReclaimCancelledResumeState(t *testing.T) {
 		{
 			name: "a branch with no deploy request is deleted", meta: &psMetadata{BranchName: ownedBranch},
 			wantAttempts: []string{ownedBranch}, wantReclaimed: []string{"branch " + ownedBranch},
-		},
-		{
-			name: "a branch its deploy request owns is left to the deploy request", meta: &psMetadata{BranchName: ownedBranch, DeployRequestID: 42},
 		},
 		{
 			name: "an operator-supplied branch is kept for the operator", meta: &psMetadata{BranchName: "my-dev-branch"}, options: map[string]string{"branch": "my-dev-branch"},

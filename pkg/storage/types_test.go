@@ -140,13 +140,15 @@ func TestPlanAllChangesDirect(t *testing.T) {
 
 // TestPlanBlockedApplyError verifies the refusal every admission path returns
 // for a plan with a blocked step: it names the first blocked table and its
-// reason, falls back to a fixed reason when the engine recorded none, and is
+// reason (the first, when several are blocked, since the remedy text tells the
+// operator what to fix first), falls back to a fixed reason when the engine recorded none, and is
 // nil for a plan whose every step is executable.
 func TestPlanBlockedApplyError(t *testing.T) {
 	blocked := &Plan{PlanIdentifier: "plan-blocked", Namespaces: map[string]*NamespacePlanData{
 		"public": {Tables: []TableChange{
 			{Table: "orders", Operation: "alter"},
 			{Table: "users", Operation: "alter", ExecutionMode: "blocked", ModeReason: "requires privileges unavailable to the engine"},
+			{Table: "accounts", Operation: "alter", ExecutionMode: "blocked", ModeReason: "table exceeds the native-safe size ceiling"},
 		}},
 	}}
 	require.EqualError(t, blocked.BlockedApplyError(), `stored plan plan-blocked contains a blocked change for table "users": requires privileges unavailable to the engine`)
