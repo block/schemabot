@@ -320,6 +320,33 @@ func TestReadSchemaFiles_IgnoreNamespaces(t *testing.T) {
 	assert.Equal(t, []string{"local_fixtures"}, removed)
 }
 
+// A sharded schema root links one directory per shard schema to a single
+// definition. Production runs four shards and staging two, so a pattern
+// withholds the shards staging does not run, through the symlinks, while
+// production plans all four.
+func TestReadSchemaFiles_IgnoreNamespacePatternThroughSymlinks(t *testing.T) {
+	dir := t.TempDir()
+	definition := filepath.Join(dir, "shop_0_{env}")
+	require.NoError(t, os.MkdirAll(definition, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(definition, "orders.sql"), []byte("CREATE TABLE orders (id INT)"), 0o644))
+	for _, shard := range []string{"shop_1_{env}", "shop_2_{env}", "shop_3_{env}"} {
+		require.NoError(t, os.Symlink("shop_0_{env}", filepath.Join(dir, shard)))
+	}
+	ignore := []string{"/^shop_[23]_staging$/"}
+
+	staging, removed, err := ReadSchemaFiles(dir, "staging", ignore)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"shop_2_staging", "shop_3_staging"}, removed)
+	require.Len(t, staging, 2)
+	assert.Contains(t, staging["shop_0_staging"].Files, "orders.sql")
+	assert.Contains(t, staging["shop_1_staging"].Files, "orders.sql")
+
+	production, removed, err := ReadSchemaFiles(dir, "production", ignore)
+	require.NoError(t, err)
+	assert.Empty(t, removed)
+	assert.Len(t, production, 4)
+}
+
 // A flat-layout schema directory has exactly one namespace — the directory
 // name itself — so ignoring it removes every schema file. The plan call must
 // fail with an error naming the exclusion rather than planning an empty

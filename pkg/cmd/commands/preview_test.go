@@ -18,6 +18,7 @@ func TestPreviewPlanDisclosuresSelectIndividually(t *testing.T) {
 		want        string
 	}{
 		{templates.PreviewCommentPlanIgnoredNamespaces, "excluded from this plan by `ignore_namespaces`"},
+		{templates.PreviewCommentPlanIgnoredNamespacesFolded, "7 namespaces excluded from this plan by <code>ignore_namespaces</code>"},
 		{templates.PreviewCommentPlanExemptTables, "Ignored tables in namespace"},
 		{templates.PreviewCommentPlanUnmanagedSchema, "- `services/inventory/schema` declares database `inventory`"},
 		// The reason is engine prose, so it is escaped like any other: the

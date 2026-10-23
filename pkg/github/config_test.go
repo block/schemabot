@@ -44,12 +44,13 @@ type: vitess
 ignore_namespaces:
   - local_fixtures
   - fixtures_$ENV
+  - /^fixtures_[0-9]+_staging$/
 `
 	var config SchemabotConfig
 	decoder := yaml.NewDecoder(strings.NewReader(yamlData))
 	decoder.KnownFields(true)
 	require.NoError(t, decoder.Decode(&config))
-	assert.Equal(t, []string{"local_fixtures", "fixtures_$ENV"}, config.IgnoreNamespaces)
+	assert.Equal(t, []string{"local_fixtures", "fixtures_$ENV", "/^fixtures_[0-9]+_staging$/"}, config.IgnoreNamespaces)
 }
 
 func TestHasSchemaInputFiles(t *testing.T) {
@@ -716,6 +717,33 @@ func TestCreateSchemaRequestFromPRSurfacesEmptiedNamespace(t *testing.T) {
 	assert.Equal(t, "CREATE TABLE users (id bigint primary key);\n", result.SchemaFiles["surviving"].Files["users.sql"])
 }
 
+// A pull request that deletes the last file of a namespace ignore_namespaces
+// withholds leaves that namespace out of the head tree, but it is still
+// withheld: its tables stay live. The request names it among the ignored
+// namespaces, so the plan discloses it and a target diffed as one unit
+// refuses the plan rather than reading those tables as deleted.
+func TestCreateSchemaRequestFromPRKeepsVacatedIgnoredNamespaceWithheld(t *testing.T) {
+	client, mux := setupConfigTestGitHubServer(t)
+	registerPullRequest(t, mux, "head-sha")
+	registerPullRequestFiles(t, mux, []*gh.CommitFile{{
+		Filename: new("schema/removed_2/orders.sql"),
+		Status:   new("removed"),
+	}})
+	proposedFilesRepo{
+		head:       map[string]string{"schema/surviving/users.sql": "blob-users"},
+		defaultTip: map[string]string{"schema/removed_2/orders.sql": "blob-orders", "schema/surviving/users.sql": "blob-users"},
+	}.serve(t, mux)
+	registerEmptiedNamespaceSchemaRoot(t, mux, "ignore_namespaces:\n  - /removed_[0-9]+/\n")
+
+	ic := NewInstallationClient(client, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	result, err := ic.CreateSchemaRequestFromPR(t.Context(), "octocat/hello-world", 1, "", "", nil)
+
+	require.NoError(t, err)
+	assert.Equal(t, []string{"removed_2"}, result.IgnoredNamespaces)
+	assert.NotContains(t, result.SchemaFiles, "removed_2", "a withheld namespace must not be planned as emptied")
+	assert.Contains(t, result.SchemaFiles, "surviving")
+}
+
 // A repository withholds live tables from the planner by naming them in its
 // schemabot.yaml, and the plan request is what carries that statement to the
 // server. The entries travel with the schema files read from the same commit,
@@ -803,10 +831,10 @@ func TestCreateSchemaRequestFromPRFailsClosedWhenPullRequestEmptiesSchemaRoot(t 
 
 // registerEmptiedNamespaceSchemaRoot serves a schema root whose config sits at
 // the root and whose only surviving namespace directory holds one table.
-func registerEmptiedNamespaceSchemaRoot(t *testing.T, mux *http.ServeMux) {
+func registerEmptiedNamespaceSchemaRoot(t *testing.T, mux *http.ServeMux, extraConfig ...string) {
 	t.Helper()
 
-	registerFileContent(t, mux, "/repos/octocat/hello-world/contents/schema/schemabot.yaml", "database: orders\ntype: mysql\n")
+	registerFileContent(t, mux, "/repos/octocat/hello-world/contents/schema/schemabot.yaml", "database: orders\ntype: mysql\n"+strings.Join(extraConfig, ""))
 	registerDirectoryContent(t, mux, "/repos/octocat/hello-world/contents/schema", []*gh.RepositoryContent{
 		{Type: new("file"), Name: new("schemabot.yaml"), Path: new("schema/schemabot.yaml")},
 		{Type: new("dir"), Name: new("surviving"), Path: new("schema/surviving")},
@@ -1452,6 +1480,10 @@ func TestFetchConfigRejectsUnusableExclusionEntries(t *testing.T) {
 		"padded ignore_namespaces entry": {
 			yaml: "database: payments\ntype: mysql\nignore_namespaces:\n  - \" local_fixtures\"\n",
 			want: "ignore_namespaces",
+		},
+		"ignore_namespaces pattern that does not compile": {
+			yaml: "database: payments\ntype: mysql\nignore_namespaces:\n  - /^payments_(\\d+_staging$/\n",
+			want: `ignore_namespaces entry "/^payments_(\d+_staging$/" is not a valid regular expression`,
 		},
 	} {
 		t.Run(name, func(t *testing.T) {

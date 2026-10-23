@@ -74,6 +74,19 @@ func PreviewCommentPlanIgnoredNamespaces() string {
 	return RenderPlanComment(data)
 }
 
+// PreviewCommentPlanIgnoredNamespacesFolded renders a sample plan whose
+// ignore_namespaces pattern withholds more shard namespaces than fit on the
+// disclosure line, so the names fold into a collapsed block under the count.
+func PreviewCommentPlanIgnoredNamespacesFolded() string {
+	data := previewPlanData()
+	data.LintViolations = nil
+	data.IgnoredNamespaces = []string{
+		"testapp_2_staging", "testapp_3_staging", "testapp_4_staging", "testapp_5_staging",
+		"testapp_6_staging", "testapp_7_staging", "testapp_8_staging",
+	}
+	return RenderPlanComment(data)
+}
+
 // PreviewCommentPlanUnmanagedSchema renders the plan comment a staging-scoped
 // deployment posts for a PR that also changes a schema directory it does not
 // manage. It posts no separate notice, since a deployment serving another

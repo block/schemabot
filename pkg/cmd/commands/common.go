@@ -119,7 +119,8 @@ type CLIConfig struct {
 	Database string `yaml:"database"`
 	Type     string `yaml:"type"`
 	// IgnoreNamespaces lists namespace subdirectories of the schema root that
-	// SchemaBot must not reconcile against the live database.
+	// SchemaBot must not reconcile against the live database, by name or,
+	// wrapped in slashes, by a regular expression over the whole name.
 	IgnoreNamespaces []string `yaml:"ignore_namespaces"`
 	// IgnoreTables lists live tables SchemaBot must not reconcile, by name or,
 	// wrapped in slashes, by a regular expression over the whole name. Without

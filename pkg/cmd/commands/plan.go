@@ -117,13 +117,17 @@ func (cmd *PlanCmd) Run(g *Globals) error {
 		return writeJSON(allResults)
 	}
 
-	// Disclose ignore_namespaces once per distinct resolution: entries resolve
-	// from config alone and differ between environments only when they use
-	// {env} or $ENV, so several environments usually share one notice.
+	// Disclose ignore_namespaces once per distinct resolution: what entries
+	// withhold differs between environments only when they or the namespace
+	// directories use {env} or $ENV, or a pattern spells an environment out,
+	// so several environments usually share one notice.
 	disclosed := make(map[string]bool)
 	for _, env := range environments {
 		ignored := ignoredByEnv[env]
-		unmatched := schema.UnmatchedIgnoreEntries(cfg.IgnoreNamespaces, env, ignored)
+		unmatched, err := schema.UnmatchedIgnoreEntries(cfg.IgnoreNamespaces, env, ignored)
+		if err != nil {
+			return fmt.Errorf("check ignore_namespaces entries for %s: %w", env, err)
+		}
 		key := strings.Join(ignored, ",") + "|" + strings.Join(unmatched, ",")
 		if disclosed[key] {
 			continue

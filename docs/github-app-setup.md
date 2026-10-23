@@ -184,7 +184,7 @@ type: mysql
 |-------|----------|-------------|
 | `database` | Yes | Must match a database name in your SchemaBot server config |
 | `type` | Yes | `"mysql"`, `"vitess"`, `"strata"` (experimental; requires server opt-in — see [Strata](strata-engine.md)), or `"postgres"` |
-| `ignore_namespaces` | No | Namespace subdirectories to exclude from plans, applies, and checks (see [Ignoring Namespaces](namespaces.md#ignoring-namespaces)) |
+| `ignore_namespaces` | No | Namespace subdirectories to exclude from plans, applies, and checks. An entry wrapped in slashes, such as `/^shop_[0-9]+_staging$/`, is a regular expression matched against the whole namespace name (see [Ignoring Namespaces](namespaces.md#ignoring-namespaces)) |
 | `ignore_tables` | No | Live table names to withhold from the planner, so an undeclared table is neither created nor dropped. An entry wrapped in slashes, such as `/^relay_[0-9]+_feed$/`, is a regular expression matched against the whole name (see [Ignoring Tables](namespaces.md#ignoring-tables)) |
 
 Environment availability and promotion order are configured on the SchemaBot server.
