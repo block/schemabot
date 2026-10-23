@@ -1106,6 +1106,80 @@ func TestExecuteChecksScanScansThroughTheResolvedInstallation(t *testing.T) {
 	assert.Equal(t, 4000, response.RateLimit.Remaining)
 }
 
+func TestExecuteChecksScanFixedNamesSurviveStorageOutage(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name         string
+		environments []string
+		override     string
+		checkName    string
+	}{
+		{name: "unscoped", checkName: "SchemaBot"},
+		{name: "explicit override", environments: []string{"production"}, override: "Custom Gate", checkName: "Custom Gate"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			cfg := &ServerConfig{
+				Apps:                map[string]GitHubAppConfig{"main": {AppID: "1", PrivateKey: "key"}},
+				Repos:               map[string]RepoConfig{"octo/repo": {GitHubApp: "main"}},
+				AllowedEnvironments: tc.environments,
+			}
+			resolve := checksScanResolverByRepo(map[string]checksScanClient{
+				"octo/repo": fakeChecksScanClient{fakeWebhookMissingCheckScanClient{
+					prs: []ghclient.OpenPullRequest{
+						{Number: 7, HeadSHA: "sha7"},
+						{Number: 8, HeadSHA: "sha8"},
+					},
+					runs: map[string]*ghclient.CheckRunResult{
+						"sha8/" + tc.checkName: {ID: 80, Name: tc.checkName, Status: "in_progress"},
+					},
+				}},
+			}, nil)
+			checks := &inspectCheckStore{err: errors.New("storage unavailable")}
+			store := &inspectStorage{checks: checks}
+
+			response, err := executeChecksScanWith(t.Context(), cfg, store, ChecksScanRequest{Repo: "octo/repo", CheckName: tc.override}, discardLogger(), resolve)
+
+			require.NoError(t, err)
+			assert.Equal(t, 2, response.Scanned)
+			require.Len(t, response.Missing, 1)
+			assert.Equal(t, 7, response.Missing[0].Number)
+			assert.Equal(t, []string{tc.checkName}, response.Missing[0].MissingNames)
+			require.Len(t, response.Stuck, 1)
+			assert.Equal(t, 8, response.Stuck[0].Number)
+			require.Len(t, response.Stuck[0].Checks, 1)
+			assert.Equal(t, tc.checkName, response.Stuck[0].Checks[0].Name)
+			assert.Empty(t, response.Stuck[0].Checks[0].StoredRows)
+			assert.Empty(t, response.Stuck[0].Checks[0].WaitingOn)
+			assert.Equal(t, 1, checks.reads, "only stuck-run annotation needs storage")
+		})
+	}
+}
+
+func TestExecuteChecksScanRequiresRetainedEnvironmentCoverage(t *testing.T) {
+	t.Parallel()
+
+	cfg := &ServerConfig{
+		Apps:                map[string]GitHubAppConfig{"main": {AppID: "1", PrivateKey: "key"}},
+		Repos:               map[string]RepoConfig{"octo/repo": {GitHubApp: "main"}},
+		AllowedEnvironments: []string{"production"},
+	}
+	resolve := checksScanResolverByRepo(map[string]checksScanClient{
+		"octo/repo": fakeChecksScanClient{fakeWebhookMissingCheckScanClient{
+			prs: []ghclient.OpenPullRequest{{Number: 7, HeadSHA: "sha7"}},
+		}},
+	}, nil)
+	outage := errors.New("storage unavailable")
+	store := &inspectStorage{checks: &inspectCheckStore{err: outage}}
+
+	response, err := executeChecksScanWith(t.Context(), cfg, store, ChecksScanRequest{Repo: "octo/repo"}, discardLogger(), resolve)
+
+	require.ErrorIs(t, err, outage)
+	assert.ErrorContains(t, err, "read retained check coverage octo/repo#7")
+	assert.Nil(t, response)
+}
+
 // A missing check whose name is already taken by an untrusted app's Check Run
 // is reported distinctly, so the operator knows backfill alone leaves a
 // conflicting check to resolve.

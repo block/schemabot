@@ -990,6 +990,10 @@ type checkScanScope struct {
 	override    string
 }
 
+func (s checkScanScope) requiresCoverageDiscovery() bool {
+	return s.override == "" && len(s.config.AllowedEnvironments) > 0
+}
+
 func scanWebhookMissingChecks(ctx context.Context, client webhookMissingCheckScanClient, store storage.Storage, repo string, expectedNames []webhookExpectedCheckName, page int, updatedSince time.Time, annotateAfter time.Duration, logger *slog.Logger, scopes ...checkScanScope) (*ChecksScanResponse, error) {
 	prs, nextPage, lastPage, err := client.ListOpenPullRequestsPage(ctx, repo, page, webhookScanPRPageSize)
 	if err != nil {
@@ -1033,7 +1037,9 @@ func scanWebhookMissingChecks(ctx context.Context, client webhookMissingCheckSca
 		// back the run an operator is looking at with nothing explaining it.
 		var annotate []bool
 		prNames := expectedNames
-		if len(scopes) > 0 {
+		// Fixed names need no retained coverage. Storage is only an optional
+		// source of annotations for their stuck runs.
+		if len(scopes) > 0 && scopes[0].requiresCoverageDiscovery() {
 			stored, err := store.Checks().GetByPR(ctx, repo, pr.Number)
 			if err != nil {
 				return nil, fmt.Errorf("read retained check coverage %s#%d: %w", repo, pr.Number, err)
