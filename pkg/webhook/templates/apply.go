@@ -43,7 +43,7 @@ type TableProgressData struct {
 	ChecksumRowsChecked int64
 	ChecksumRowsTotal   int64
 	// The engine's throttler is pausing this table's active phase (row copy
-	// or checksum verify). ThrottleReason names the signal for display and is
+	// or checksum verification). ThrottleReason names the signal for display and is
 	// empty when Throttled is false.
 	Throttled      bool
 	ThrottleReason string
@@ -685,7 +685,7 @@ func writeProgressSummary(sb *strings.Builder, tables []TableProgressData) {
 				runningPctText = ui.FormatRowCopyPercent(t.PercentComplete, t.RowsCopied, t.RowsTotal)
 			}
 		case state.Task.CatchingUp, state.Task.PostChecksum:
-			// Both binlog drains (before and after the verify) read as
+			// Both binlog drains (before and after the verification) read as
 			// "catching up" in the compact summary; the per-table rows
 			// distinguish them.
 			catchingUp++
@@ -1039,7 +1039,7 @@ func renderTableProgress(sb *strings.Builder, dialect schema.Dialect, table Tabl
 	case state.Task.Checksumming:
 		// Row copy is complete; the engine is verifying the copied data against
 		// the source before cutover. On a large table this can run for hours, so
-		// show how far the verify has progressed once Spirit reports a total.
+		// show how far the verification has progressed once Spirit reports a total.
 		if table.ChecksumRowsTotal > 0 {
 			pct := ui.ClampPercent(int(table.ChecksumRowsChecked * 100 / table.ChecksumRowsTotal))
 			fmt.Fprintf(sb, "**%s**: %s \U0001f50d Checksumming to verify data (%s)%s\n", inlineCode(table.TableName), ui.ProgressBarRowCopy(pct),
@@ -1054,7 +1054,7 @@ func renderTableProgress(sb *strings.Builder, dialect schema.Dialect, table Tabl
 		writeThrottleTooltip(sb, table)
 
 	case state.Task.PostChecksum:
-		// The verify passed and the engine is draining the changes that
+		// The verification passed and the engine is draining the changes that
 		// accumulated on the source while it ran. Named separately from the
 		// pre-checksum catch-up so the row doesn't rewind to an earlier phase.
 		fmt.Fprintf(sb, "**%s**: %s ⏩ Data verified, applying final changes...\n", inlineCode(table.TableName), ui.ProgressBarRowCopy(100))
@@ -1256,7 +1256,7 @@ func writeThrottleTooltip(sb *strings.Builder, table TableProgressData) {
 	// whose signal has no tip renders alone so a new engine signal degrades
 	// to raw text rather than a wrong explanation.
 	if tip := ui.ThrottleTip(table.ThrottleReason); tip != "" {
-		fmt.Fprintf(sb, "- "+glyph.Info+" _Throttled: %s · %s ([docs](%s))_\n", escapeInlineMarkdown(table.ThrottleReason), tip, ui.ThrottleDocURL)
+		fmt.Fprintf(sb, "- "+glyph.Info+" _Throttled: %s · %s ([docs](%s))_\n", escapeInlineMarkdown(table.ThrottleReason), tip, ui.MySQLThrottleDocURL)
 		return
 	}
 	fmt.Fprintf(sb, "- "+glyph.Info+" _Throttled: %s_\n", escapeInlineMarkdown(table.ThrottleReason))

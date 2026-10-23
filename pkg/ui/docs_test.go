@@ -62,7 +62,7 @@ func TestDocRef(t *testing.T) {
 		url  string
 		want string
 	}{
-		"docs page":       {ThrottleDocURL, "docs/throttle.md"},
+		"docs page":       {MySQLThrottleDocURL, "docs/mysql.md"},
 		"anchor dropped":  {DocsBaseURL + "schema-config.md#layout", "docs/schema-config.md"},
 		"outside docs":    {"https://example.com/guide", "https://example.com/guide"},
 		"no shorter form": {"https://github.com/block/schemabot", "https://github.com/block/schemabot"},
