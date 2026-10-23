@@ -56,6 +56,32 @@ type reviewDriftOutcome struct {
 	// replace: a row already carrying one keeps it, because it is the stronger
 	// block. Empty for outcomes the rollup reports, which rewrite any block.
 	preserve []string
+	// dispatchesApply marks a record written as an apply of the rollout
+	// dispatches. The row is kept through the apply's completion, so its Change
+	// column names the targets the apply runs on rather than calling them
+	// pending, which would go stale once the apply lands.
+	dispatchesApply bool
+}
+
+// changeSummary composes the check's Change column from the primary plan's
+// summary and the rollout's member work. In an environment of several targets
+// it names the targets with work, so the check row says how far the change has
+// rolled out without opening the plan comment.
+func (o reviewDriftOutcome) changeSummary(planSummary string) string {
+	w := o.work
+	if w.members <= 1 || w.pending == 0 {
+		return planSummary
+	}
+	switch {
+	case o.dispatchesApply && planSummary == "":
+		return w.scope()
+	case o.dispatchesApply:
+		return clampDriftSummary(planSummary + " · " + w.scope())
+	case planSummary == "":
+		return w.summary()
+	default:
+		return clampDriftSummary(planSummary + " · pending on " + w.scope())
+	}
 }
 
 // blockingReason is the stored reason for a blocked outcome.
@@ -119,14 +145,54 @@ func memberWorkOf(rollup *api.PlanRollup) memberWork {
 	return work
 }
 
-// summary says how many targets still need the change, for a check whose
-// primary plan has nothing of its own to summarize. Targets already at the
-// schema are left out of the count, as every PR surface leaves them out.
+// maxNamedPendingTargets bounds how many targets a check's Change column names
+// before counting the rest, so the row stays one readable line.
+const maxNamedPendingTargets = 3
+
+// summary says which targets still need the change, for a check whose primary
+// plan has nothing of its own to summarize, so the work is on the rollout's
+// other targets. Targets already at the schema are left out, as every PR
+// surface leaves them out, so the row tells a reviewer which targets the PR is
+// still waiting on.
 func (w memberWork) summary() string {
+	verb := "need"
 	if w.pending == 1 {
-		return "1 target needs this change"
+		verb = "needs"
 	}
-	return fmt.Sprintf("%d targets need this change", w.pending)
+	return clampDriftSummary(fmt.Sprintf("%d of %d targets %s this change: %s", w.pending, w.members, verb, w.namedPending()))
+}
+
+// rolloutCounts returns the stored counts that go with a summary naming the
+// targets with work: the rollout's members and how many of them have work.
+// Zero when the summary names no targets.
+func (w memberWork) rolloutCounts() (targets, withWork int) {
+	if w.members <= 1 || w.pending == 0 {
+		return 0, 0
+	}
+	return w.members, w.pending
+}
+
+// scope names the targets with work out of the rollout's members: every one
+// of them, or how many and which.
+func (w memberWork) scope() string {
+	if w.pending == w.members {
+		return fmt.Sprintf("all %d targets", w.members)
+	}
+	return clampDriftSummary(fmt.Sprintf("%d of %d targets: %s", w.pending, w.members, w.namedPending()))
+}
+
+// namedPending names the targets with work in rollout order, counting those
+// past maxNamedPendingTargets.
+func (w memberWork) namedPending() string {
+	shown := w.names
+	if len(shown) > maxNamedPendingTargets {
+		shown = shown[:maxNamedPendingTargets]
+	}
+	named := "`" + strings.Join(shown, "`, `") + "`"
+	if rest := len(w.names) - len(shown); rest > 0 {
+		named += fmt.Sprintf(" and %d more", rest)
+	}
+	return named
 }
 
 // pendingTargets names the targets that still need the change, for a refusal
@@ -399,16 +465,16 @@ func (h *Handler) upsertPlanCheckRecord(ctx context.Context, client *ghclient.In
 	// plan facts: HasChanges stays "some rollout member has changes", and the
 	// block rides on BlockingReason + Conclusion so a stored drift block is
 	// legible and durable across write paths.
-	changeSummary := summarizePlanChanges(schema, planResp, environment)
-	if changeSummary == "" && drift.work.pending > 0 {
-		changeSummary = drift.work.summary()
-	}
+	changeSummary := drift.changeSummary(summarizePlanChanges(schema, planResp, environment))
+	rolloutTargets, rolloutTargetsWithWork := drift.work.rolloutCounts()
 	if changeSummary == "" && len(planResp.Errors) > 0 {
 		changeSummary = planFailedCheckSummary
 	}
 	blockingReason := ""
 	if driftBlocked {
+		// The block's summary names no targets, so no counts go with it.
 		changeSummary = drift.summary
+		rolloutTargets, rolloutTargetsWithWork = 0, 0
 		blockingReason = drift.blockingReason()
 	}
 
@@ -424,6 +490,9 @@ func (h *Handler) upsertPlanCheckRecord(ctx context.Context, client *ghclient.In
 		Conclusion:     conclusion,
 		BlockingReason: blockingReason,
 		ChangeSummary:  changeSummary,
+
+		RolloutTargets:         rolloutTargets,
+		RolloutTargetsWithWork: rolloutTargetsWithWork,
 	}
 	var stored bool
 	if driftBlocked && len(drift.preserve) > 0 {
@@ -891,7 +960,11 @@ func (h *Handler) updateCheckRecordForApplyResult(ctx context.Context, repo stri
 		if !narrowedApplyKeepsBlock(check.BlockingReason) {
 			check.BlockingReason = narrowedApplyBlock.blockingReason
 			check.ErrorMessage = narrowedApplyBlock.message
-			check.ChangeSummary = narrowedApplyCheckSummary
+			check.ChangeSummary = narrowedApplyCompletedSummary(
+				h.narrowedTargetName(storage.ParseApplyOptions(apply.Options).NarrowedTo, apply.Database, apply.Environment))
+			// The narrowed apply says nothing about the other targets, so the
+			// row carries no counts of them.
+			check.RolloutTargets, check.RolloutTargetsWithWork = 0, 0
 		}
 		// MarkActionRequiredForApply releases check ownership, so the plan of
 		// the whole environment that lifts this block can write its result.
