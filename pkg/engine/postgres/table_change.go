@@ -49,12 +49,28 @@ const comparisonSchema = "public"
 // head that reorders columns the pull request changed generates a
 // different change and keeps no approval.
 //
+// A file the pull request adds is absent at both bases, passed as "". Its
+// change is the file's own statements, so it is the same when the approved
+// commit and the head parse to the same statements in the same order:
+// formatting and comments may differ, nothing the statements build may. That
+// needs only the parse tree, so the target is not dialed.
+//
 // Each file must declare one table, the same one at all four commits, and no
 // row security or foreign key. A file that does not, or that the target cannot run, is an
 // error: it proves nothing, and the caller treats the file as changed.
 func (e *Engine) CompareSchemaFileChange(ctx context.Context, req *ternv1.CompareSchemaFileChangeRequest) (*ternv1.CompareSchemaFileChangeResponse, error) {
 	if req == nil {
 		return nil, fmt.Errorf("compare PostgreSQL schema file change: request is required")
+	}
+	if req.GetApprovedBase() == "" && req.GetHeadBase() == "" {
+		resp, err := sameAddedSchemaFile(req.GetApproved(), req.GetHead())
+		if err != nil {
+			return nil, fmt.Errorf("compare PostgreSQL schema file the pull request adds for database %q: %w", e.pullDatabase, err)
+		}
+		return resp, nil
+	}
+	if req.GetApprovedBase() == "" || req.GetHeadBase() == "" {
+		return nil, fmt.Errorf("compare PostgreSQL schema file change for database %q: the file is absent at one base but not the other", e.pullDatabase)
 	}
 	if e.pullCredentials == nil || e.pullCredentials.DSN == "" {
 		return nil, fmt.Errorf("compare PostgreSQL schema file change for database %q: DSN credentials are required", e.pullDatabase)
@@ -119,6 +135,51 @@ func (e *Engine) CompareSchemaFileChange(ctx context.Context, req *ternv1.Compar
 		reason = fmt.Sprintf("table %s: %s", table, reason)
 	}
 	return &ternv1.CompareSchemaFileChangeResponse{Same: reason == "", Reason: reason}, nil
+}
+
+// sameAddedSchemaFile compares a schema file the pull request adds at the
+// approved commit and at the head by their statements' parse trees.
+func sameAddedSchemaFile(approved, head string) (*ternv1.CompareSchemaFileChangeResponse, error) {
+	approvedStmts, err := parsedStatements(approved)
+	if err != nil {
+		return nil, fmt.Errorf("read the file at the approved commit: %w", err)
+	}
+	headStmts, err := parsedStatements(head)
+	if err != nil {
+		return nil, fmt.Errorf("read the file at the head: %w", err)
+	}
+	if slices.Equal(approvedStmts, headStmts) {
+		return &ternv1.CompareSchemaFileChangeResponse{Same: true}, nil
+	}
+	for i := range min(len(approvedStmts), len(headStmts)) {
+		if approvedStmts[i] != headStmts[i] {
+			return &ternv1.CompareSchemaFileChangeResponse{Reason: fmt.Sprintf(
+				"statement %d of the file differs between the approved commit and the head", i+1)}, nil
+		}
+	}
+	return &ternv1.CompareSchemaFileChangeResponse{Reason: fmt.Sprintf(
+		"the file holds %d statements at the approved commit but %d at the head", len(approvedStmts), len(headStmts))}, nil
+}
+
+// parsedStatements parses content and encodes each statement's parse tree,
+// in file order, with every source position removed.
+func parsedStatements(content string) ([]string, error) {
+	tree, err := pgquery.Parse(content)
+	if err != nil {
+		return nil, fmt.Errorf("parse: %w", err)
+	}
+	if len(tree.GetStmts()) == 0 {
+		return nil, fmt.Errorf("the file holds no statements")
+	}
+	stmts := make([]string, 0, len(tree.GetStmts()))
+	for i, raw := range tree.GetStmts() {
+		encoded, err := encodeParseNode(raw.GetStmt())
+		if err != nil {
+			return nil, fmt.Errorf("encode statement %d: %w", i+1, err)
+		}
+		stmts = append(stmts, encoded)
+	}
+	return stmts, nil
 }
 
 // comparableSchema admits a schema file the comparison can run: one table

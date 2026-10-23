@@ -34,7 +34,7 @@ func TestDeployStateToEngineState(t *testing.T) {
 		{"complete_error", engine.StateFailed},
 		{"error", engine.StateFailed},
 		{"failed", engine.StateFailed},
-		{"in_progress_cancel", engine.StateCancelled},
+		{"in_progress_cancel", engine.StateRunning},
 		{"cancelled", engine.StateCancelled},
 		{"complete_cancel", engine.StateCancelled},
 		{"in_progress_revert", engine.StateReverting},
@@ -50,6 +50,15 @@ func TestDeployStateToEngineState(t *testing.T) {
 			assert.Equal(t, tt.expectedState, got)
 		})
 	}
+}
+
+// A cancel PlanetScale has accepted but not yet confirmed can still end in a
+// failed deploy, so the in-flight cancel must never read as a settled outcome:
+// only complete_cancel and cancelled close the deploy request as cancelled.
+func TestDeployStateToEngineState_CancelInFlightIsNotTerminal(t *testing.T) {
+	assert.False(t, deployStateToEngineState(deployState.InProgressCancel).IsTerminal())
+	assert.True(t, deployStateToEngineState(deployState.CompleteCancel).IsTerminal())
+	assert.True(t, deployStateToEngineState(deployState.Cancelled).IsTerminal())
 }
 
 func TestDeployStateToMessage(t *testing.T) {

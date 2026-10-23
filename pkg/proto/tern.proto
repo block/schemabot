@@ -979,6 +979,10 @@ message TableProgress {
   // for display beside the row counts. Unset when the plan had no estimate and
   // for a task scoped to one shard, since the estimate covers the whole table.
   optional int64 estimated_bytes = 19;
+  // The plan's approximate row count for the table, so a table that has not
+  // started copying can show how much it will copy. rows_total replaces it
+  // once the engine reports. Unset under the same rules as estimated_bytes.
+  optional int64 estimated_rows = 20;
 }
 
 // SettledControlRequest reports the fate of a durable control request the

@@ -10,6 +10,10 @@ type ShardCopy struct {
 	RowsCopied      int64
 	RowsTotal       int64
 	ETASeconds      int64
+	// ChecksumRowsChecked and ChecksumRowsTotal are how far a checksumming
+	// shard's verify has got, once its engine reports a total.
+	ChecksumRowsChecked int64
+	ChecksumRowsTotal   int64
 }
 
 // ShardOperationCopy resolves one (shard, table) operation's progress from its

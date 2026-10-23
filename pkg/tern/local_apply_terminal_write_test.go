@@ -891,6 +891,162 @@ func TestExecuteGroupedApply_FailureReturnsOweTerminalSideEffects(t *testing.T) 
 	}
 }
 
+// A fresh grouped Vitess drive whose change is already in place on the target:
+// the engine accepts it with a resume state naming a deploy request that
+// reported no changes, and the first progress poll reads that request as
+// completed. The apply and its task settle as completed, with one terminal
+// summary, rather than failing for a resume state the drive did receive.
+func TestExecuteGroupedApply_ConvergedDeployRequestCompletes(t *testing.T) {
+	operationID := int64(7)
+	apply := &storage.Apply{
+		ID: 42, ApplyIdentifier: "apply-grouped-converged", Database: "testdb",
+		DatabaseType: storage.DatabaseTypeVitess, Engine: storage.EnginePlanetScale,
+		State: state.Apply.Pending,
+	}
+	tasks := []*storage.Task{{
+		ID: 7, ApplyID: apply.ID, ApplyOperationID: &operationID, TaskIdentifier: "task-grouped-converged",
+		Database: "testdb", DatabaseType: storage.DatabaseTypeVitess, Namespace: "commerce", TableName: "users",
+		DDL: "ALTER TABLE `users` MODIFY COLUMN `email` varchar(255)", DDLAction: "alter",
+		State: state.Task.Pending,
+	}}
+	plan := &storage.Plan{
+		PlanIdentifier: "plan-grouped-converged",
+		Namespaces:     map[string]*storage.NamespacePlanData{"commerce": {}},
+	}
+	applyStore := &snapshotApplyStore{stored: *apply}
+	eng := &fakeControlEngine{
+		applyResult: &engine.ApplyResult{
+			Accepted: true,
+			Message:  "no changes detected",
+			ResumeState: &engine.ResumeState{
+				MigrationContext: apply.ApplyIdentifier,
+				Metadata:         `{"branch_name":"branch-1","deploy_request_id":5}`,
+			},
+		},
+		progressResult: &engine.ProgressResult{State: engine.StateCompleted, Message: "No changes detected"},
+	}
+	client := &LocalClient{
+		config: LocalConfig{Database: "testdb", Type: storage.DatabaseTypeVitess},
+		storage: &exactProgressStorage{
+			applies:         applyStore,
+			tasks:           &exactProgressTaskStore{tasks: tasks},
+			controlRequests: &testControlRequestStore{},
+			applyOperations: &exactProgressApplyOperationStore{ops: []*storage.ApplyOperation{
+				{ID: operationID, ApplyID: apply.ID, State: state.Apply.Pending},
+			}},
+		},
+		planetscaleEngine:        eng,
+		heartbeatInterval:        time.Hour,
+		taskPollIntervalOverride: time.Millisecond,
+		logger:                   slog.Default(),
+	}
+	observer := &terminalRecordingObserver{}
+	client.SetObserver(apply.ID, observer)
+
+	require.NoError(t, client.executeGroupedApply(t.Context(), apply, tasks, plan, nil, false))
+
+	assert.Equal(t, state.Apply.Completed, applyStore.stored.State)
+	assert.Empty(t, applyStore.stored.ErrorMessage)
+	assert.Equal(t, state.Task.Completed, tasks[0].State)
+	require.NotNil(t, eng.progressReq, "the drive follows the converged deploy request through a progress poll")
+	assert.Equal(t, `{"branch_name":"branch-1","deploy_request_id":5}`, eng.progressReq.ResumeState.Metadata)
+	require.Len(t, observer.terminal, 1, "the completed apply owes its terminal summary")
+	assert.Equal(t, state.Apply.Completed, observer.terminal[0].State)
+}
+
+// A grouped Vitess resume whose stored state names no deploy request yet
+// reattaches, and the engine finds the change already in place: it accepts the
+// resume with a resume state naming a deploy request that reported no changes.
+// The resume follows that state to a completed outcome instead of exiting for a
+// resume state it did receive and re-reading the same result on every retry.
+func TestLaunchAtomicResume_ConvergedDeployRequestCompletes(t *testing.T) {
+	operationStore := &exactProgressApplyOperationStore{
+		data: &storage.EngineResumeState{ApplyOperationID: 7, MigrationContext: "apply-reattach-vitess"},
+	}
+	operationStore.ops = []*storage.ApplyOperation{{ID: 7, ApplyID: 42, State: state.Apply.Recovering}}
+	applyResult := &engine.ApplyResult{
+		Accepted: true,
+		Message:  "no changes detected",
+		ResumeState: &engine.ResumeState{
+			MigrationContext: "apply-reattach-vitess",
+			Metadata:         `{"branch_name":"branch-1","deploy_request_id":5}`,
+		},
+	}
+	client, apply, tasks, plan, _ := reattachResumeFixture(operationStore, applyResult)
+	eng := client.planetscaleEngine.(*fakeControlEngine)
+	eng.progressResult = &engine.ProgressResult{State: engine.StateCompleted, Message: "No changes detected"}
+	store := client.storage.(*exactProgressStorage)
+	applyStore := &snapshotApplyStore{stored: *apply}
+	store.applies = applyStore
+	store.controlRequests = &testControlRequestStore{}
+	store.logs = &mockApplyLogStore{}
+	client.heartbeatInterval = time.Hour
+	client.taskPollIntervalOverride = time.Millisecond
+	observer := &terminalRecordingObserver{}
+	client.SetObserver(apply.ID, observer)
+
+	err := client.launchAtomicResume(t.Context(), apply, tasks, plan, apply.GetOptions().Map(), "Recovering from checkpoint", true, false, false)
+
+	require.NoError(t, err, "a resume state naming the converged deploy request is enough to follow it")
+	assert.Equal(t, state.Apply.Completed, applyStore.stored.State)
+	assert.Equal(t, state.Task.Completed, tasks[0].State)
+	require.NotNil(t, eng.progressReq)
+	assert.Equal(t, `{"branch_name":"branch-1","deploy_request_id":5}`, eng.progressReq.ResumeState.Metadata)
+	require.Len(t, observer.terminal, 1, "the completed apply owes its terminal summary")
+	assert.Equal(t, state.Apply.Completed, observer.terminal[0].State)
+}
+
+// PlanetScale accepts a Vitess deploy but its response is lost, and the
+// re-read that would show the deploy started fails too, so the engine reports
+// the outcome as unknown. The drive pauses the apply as failed_retryable
+// instead of failing it: the deploy may be running, and recovery re-reads the
+// deploy request named in the stored resume state rather than deploying again.
+// Nothing terminal is owed yet, so the pending revert stays pending and no
+// terminal summary posts.
+func TestExecuteGroupedApply_UnknownDeployOutcomePausesForRecovery(t *testing.T) {
+	operationID := int64(7)
+	apply := &storage.Apply{
+		ID: 42, ApplyIdentifier: "apply-grouped-unknown", Database: "testdb",
+		DatabaseType: storage.DatabaseTypeVitess, Engine: storage.EnginePlanetScale,
+		State: state.Apply.Pending,
+	}
+	tasks := []*storage.Task{{
+		ID: 7, ApplyID: apply.ID, ApplyOperationID: &operationID, TaskIdentifier: "task-grouped-unknown",
+		Database: "testdb", DatabaseType: storage.DatabaseTypeVitess, Namespace: "commerce", TableName: "users",
+		DDL: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)", DDLAction: "alter",
+		State: state.Task.Pending,
+	}}
+	plan := &storage.Plan{PlanIdentifier: "plan-grouped-unknown", Namespaces: map[string]*storage.NamespacePlanData{"commerce": {}}}
+	applyStore := &exactProgressApplyStore{apply: apply}
+	requests := pendingControlRequestStore(apply.ID, storage.ControlOperationRevert)
+	eng := &fakeControlEngine{applyErr: engine.NewOutcomeUnknownError(
+		"deploy deploy request #11: unexpected EOF (re-reading deploy request #11 to check whether the deploy started also failed: connection reset by peer)")}
+	client := &LocalClient{
+		config: LocalConfig{Database: "testdb", Type: storage.DatabaseTypeVitess},
+		storage: &exactProgressStorage{
+			applies:         applyStore,
+			tasks:           &exactProgressTaskStore{tasks: tasks},
+			controlRequests: requests,
+			applyOperations: &exactProgressApplyOperationStore{},
+		},
+		planetscaleEngine: eng,
+		heartbeatInterval: time.Hour,
+		logger:            slog.Default(),
+	}
+	observer := &terminalRecordingObserver{}
+	client.SetObserver(apply.ID, observer)
+
+	require.NoError(t, client.executeGroupedApply(t.Context(), apply, tasks, plan, nil, false))
+
+	assert.Equal(t, state.Apply.FailedRetryable, applyStore.apply.State)
+	assert.Contains(t, applyStore.apply.ErrorMessage, "re-reading deploy request #11")
+	assert.Equal(t, state.Task.FailedRetryable, tasks[0].State)
+	require.Len(t, requests.requests, 1)
+	assert.Equal(t, storage.ControlRequestPending, requests.requests[0].Status,
+		"no outcome is settled, so the revert stays pending for the recovery")
+	assert.Empty(t, observer.terminal, "a paused apply owes no terminal summary")
+}
+
 // A grouped apply's engine reports the schema change completed while an
 // operator's revert is still pending, and the rollout projection's write of the
 // completed state fails. Storage still reports the apply running, so the drive

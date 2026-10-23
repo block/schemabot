@@ -9,7 +9,6 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
-	"github.com/block/schemabot/pkg/cmd/cliname"
 	"github.com/block/schemabot/pkg/cmd/internal/templates"
 	"github.com/block/schemabot/pkg/state"
 )
@@ -176,7 +175,7 @@ func (m WatchModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.errorMsg = msg.errorMsg
 			m.requestedRetryDelay = msg.retryAfter
 			if m.consecutiveErrors >= maxConsecutiveProgressFailures {
-				m.errorMsg = progressGiveUpMessage(m.applyID, m.consecutiveErrors) + ": " + msg.errorMsg
+				m.errorMsg = progressGiveUpMessage(m.applyID, m.environment, m.consecutiveErrors) + ": " + msg.errorMsg
 				m.initialized = true
 				return m, tea.Quit
 			}
@@ -387,11 +386,7 @@ func formatExitContext(applyID, deployRequestURL, environment string) string {
 	if deployRequestURL != "" {
 		fmt.Fprintf(&b, "  Deploy Request:  %s\n", deployRequestURL)
 	}
-	cmd := fmt.Sprintf("%s progress %s", cliname.Name(), applyID)
-	if environment != "" {
-		cmd += " -e " + environment
-	}
-	fmt.Fprintf(&b, "  Resume:    %s\n", cmd)
+	fmt.Fprintf(&b, "  Resume:    %s\n", templates.ProgressCommand(applyID, environment))
 	b.WriteString("\n")
 	return b.String()
 }

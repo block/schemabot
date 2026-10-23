@@ -275,6 +275,55 @@ func TestE2ELeaderBlocksOnMissingParticipantCheck(t *testing.T) {
 	assert.Empty(t, cr.Conclusion, "the wait for a participant re-read blocks without a conclusion")
 }
 
+// A PR that renames a file out of a participant's paths changes what that
+// participant declares, as a deletion does, so the leader's refold still
+// expects the participant's Check Run and blocks while it is missing, rather
+// than finding no participant path changed and publishing nothing. This holds
+// for a schema file and for the participant's config alike.
+func TestE2ELeaderBlocksOnParticipantFileRenamedOutOfItsPaths(t *testing.T) {
+	tests := []struct {
+		name     string
+		previous string
+		current  string
+	}{
+		{name: "schema file", previous: tenantBSchemaDir + "/users.sql", current: "archive/users.sql"},
+		{name: "config file", previous: tenantBSchemaDir + "/schemabot.yaml", current: "archive/schemabot.yaml"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			svc := setupE2EServiceWithConfig(t, leaderRepoConfig())
+
+			mux := http.NewServeMux()
+			server := httptest.NewServer(mux)
+			t.Cleanup(server.Close)
+
+			client := gh.NewClient(nil)
+			client.BaseURL, _ = url.Parse(server.URL + "/")
+
+			const headSHA = "abc123"
+			mockLeaderPRHead(mux, headSHA)
+			mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1/files", func(w http.ResponseWriter, _ *http.Request) {
+				_ = json.NewEncoder(w).Encode([]*gh.CommitFile{
+					{Filename: new(tt.current), PreviousFilename: new(tt.previous), Status: new("renamed")},
+				})
+			})
+			mockParticipantCheckRuns(mux, nil)
+			checkRuns := captureLeaderCheckRuns(mux)
+
+			h := newLeaderHandler(t, svc, client)
+			req := buildParticipantCompletedRequest(t, aggregateCheckNameForEnv(tenantBCheckName, "production"), headSHA)
+			rr := httptest.NewRecorder()
+			h.ServeHTTP(rr, req)
+			require.Equal(t, http.StatusOK, rr.Code)
+
+			cr := collectAggregate(t, checkRuns, aggregateCheckNameForEnv("SchemaBot", "production"))
+			assert.Equal(t, headSHA, cr.HeadSHA)
+			assert.Equal(t, checkStatusInProgress, cr.Status, "the leader waits for the participant the rename affects")
+			assert.Empty(t, cr.Conclusion)
+		})
+	}
+}
+
 // While the participant's Check Run is still in progress, the leader's
 // aggregate must stay in_progress (no conclusion), which blocks merge until the
 // participant reaches a terminal state.

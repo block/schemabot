@@ -377,6 +377,10 @@ func NewHandlerWithDispatch(service *api.Service, ghClients github.ClientSet, we
 			})
 		}
 
+		// A stop that withdraws a queued start leaves the apply stopped, so no
+		// drive runs to update the PR; tell it the start was withdrawn.
+		service.OnQueuedStartWithdrawn = h.reportQueuedStartWithdrawn
+
 		// Register the aggregate terminal-summary callback, invoked by the
 		// operator that won the aggregate projection CAS and by the
 		// retryable-expiry pass for each apply it settles. A multi-operation apply

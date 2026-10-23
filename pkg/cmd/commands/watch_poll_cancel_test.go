@@ -151,7 +151,7 @@ func runApplyUntilWatchCancelled(t *testing.T, cmd *ApplyCmd, srv *httptest.Serv
 }
 
 const stoppedWatchingNotice = "Stopped watching apply apply-7c2e; stopping the watch does not affect the apply; " +
-	"watch it again with 'schemabot progress apply-7c2e'\n"
+	"watch it again with 'schemabot progress apply-7c2e -e staging'\n"
 
 // An operator presses Ctrl-C while the watch is waiting out a server that
 // asked for 30 seconds before the next poll. The watch ends at once with the
@@ -167,7 +167,7 @@ func TestProgressPoller_CancelDuringRetryWaitStopsPromptly(t *testing.T) {
 	t.Cleanup(srv.Close)
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
-	poller := newProgressPoller(ctx, srv.URL, cancelApplyID)
+	poller := newProgressPoller(ctx, srv.URL, cancelApplyID, "")
 
 	retrying := make(chan progressRetry, 1)
 	done := make(chan error, 1)
@@ -182,7 +182,7 @@ func TestProgressPoller_CancelDuringRetryWaitStopsPromptly(t *testing.T) {
 		requireWatchStopped(t, awaitSignal(t, done, "the cancelled watch to end"))
 	})
 
-	assert.Contains(t, stderr, progressStoppedMessage(cancelApplyID))
+	assert.Contains(t, stderr, progressStoppedMessage(cancelApplyID, ""))
 }
 
 // An operator presses Ctrl-C while a progress fetch is still waiting on the
@@ -193,7 +193,7 @@ func TestProgressPoller_CancelDuringFetchStopsWithoutRetry(t *testing.T) {
 	srv, inFlight := blockingProgressServer(t, nil)
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
-	poller := newProgressPoller(ctx, srv.URL, cancelApplyID)
+	poller := newProgressPoller(ctx, srv.URL, cancelApplyID, "")
 
 	var retries atomic.Int32
 	done := make(chan error, 1)
@@ -207,7 +207,7 @@ func TestProgressPoller_CancelDuringFetchStopsWithoutRetry(t *testing.T) {
 		requireWatchStopped(t, awaitSignal(t, done, "the cancelled fetch to end the watch"))
 	})
 
-	assert.Contains(t, stderr, progressStoppedMessage(cancelApplyID))
+	assert.Contains(t, stderr, progressStoppedMessage(cancelApplyID, ""))
 	assert.Zero(t, retries.Load(), "a cancelled fetch must not be retried")
 }
 

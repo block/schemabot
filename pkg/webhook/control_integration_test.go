@@ -15,6 +15,7 @@ import (
 
 	_ "github.com/block/mysql"
 	"github.com/block/schemabot/pkg/api"
+	"github.com/block/schemabot/pkg/apitypes"
 	ghclient "github.com/block/schemabot/pkg/github"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/state"
@@ -383,6 +384,121 @@ func TestE2EStartCommandRecordsDurableRequest(t *testing.T) {
 
 	assertReactionEventually(t, reactions)
 	assertReactionEventually(t, reactions)
+}
+
+// TestE2EStartAcknowledgementDelayedPastAWithdrawal: an operator starts a
+// stopped schema change from its PR, and while the start's acknowledgement is
+// still being posted, a stop from the CLI withdraws the start. The stop holds
+// its withdrawal notice back until the acknowledgement has landed, and the
+// start command then posts it, so the PR reads acknowledgement, then
+// withdrawal, once each, and ends on the withdrawal, matching the stopped apply.
+func TestE2EStartAcknowledgementDelayedPastAWithdrawal(t *testing.T) {
+	ctx := t.Context()
+	schemabotDB, err := sql.Open("block-mysql", e2eSchemabotDSN)
+	require.NoError(t, err)
+	require.NoError(t, schemabotDB.PingContext(ctx))
+
+	store := mysqlstore.New(schemabotDB)
+	applyIdentifier := "apply_bcdf6789"
+	database := "start_withdrawn_pr_comments_db"
+	cleanupStopCommandTestRows(t, schemabotDB, applyIdentifier, database)
+	t.Cleanup(func() {
+		cleanupStopCommandTestRows(t, schemabotDB, applyIdentifier, database)
+		utils.CloseAndLog(schemabotDB)
+	})
+
+	applyID := createStopCommandApply(t, store, applyIdentifier, database)
+	storedApply, err := store.Applies().GetByApplyIdentifier(ctx, applyIdentifier)
+	require.NoError(t, err)
+	require.NotNil(t, storedApply)
+	storedApply.State = state.Apply.Stopped
+	storedApply.UpdatedAt = time.Now().UTC()
+	require.NoError(t, store.Applies().Update(ctx, storedApply))
+	// The apply was started from this PR's installation, so a stop from
+	// elsewhere has a PR to tell.
+	_, err = schemabotDB.ExecContext(ctx, "UPDATE applies SET installation_id = ? WHERE id = ?", 12345, applyID)
+	require.NoError(t, err)
+	storedTasks, err := store.Tasks().GetByApplyID(ctx, applyID)
+	require.NoError(t, err)
+	require.Len(t, storedTasks, 1)
+	storedTasks[0].State = state.Task.Stopped
+	storedTasks[0].UpdatedAt = time.Now().UTC()
+	require.NoError(t, store.Tasks().Update(ctx, storedTasks[0]))
+
+	service := apiServiceForStopCommandTest(t, store, database)
+	service.RegisterTernClient(database, "staging", &stopCommandTernClient{})
+
+	client, mux := setupGitHubServer(t)
+	var (
+		mu     sync.Mutex
+		landed []string
+	)
+	land := func(body string) {
+		mu.Lock()
+		defer mu.Unlock()
+		landed = append(landed, body)
+	}
+	mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Body string `json:"body"`
+		}
+		assert.NoError(t, json.NewDecoder(r.Body).Decode(&body))
+		if strings.Contains(body.Body, "Start Request Accepted") {
+			// Hold the acknowledgement until a CLI stop has withdrawn the
+			// start and the withdrawal is recorded on the start request.
+			resp, err := service.ExecuteStop(ctx, apitypes.ControlRequest{ApplyID: applyIdentifier, Environment: "staging", Caller: "cli:bob@laptop.local"})
+			assert.NoError(t, err)
+			if assert.NotNil(t, resp) {
+				assert.Equal(t, apitypes.ControlStatusStartWithdrawn, resp.Status)
+			}
+			assert.Eventually(t, func() bool {
+				start, err := store.ControlRequests().GetByOperation(ctx, applyID, storage.ControlOperationStart)
+				if err != nil || start == nil {
+					return false
+				}
+				var metadata struct {
+					Notice startNotice `json:"pr_notice"`
+				}
+				return json.Unmarshal(start.Metadata, &metadata) == nil && metadata.Notice.Withdrawn
+			}, webhookIntegrationCheckRunDeadline, 20*time.Millisecond, "the withdrawal is recorded on the start request")
+		}
+		land(body.Body)
+		w.WriteHeader(http.StatusCreated)
+		assert.NoError(t, json.NewEncoder(w).Encode(map[string]any{"id": 99}))
+	})
+	mux.HandleFunc("POST /repos/octocat/hello-world/issues/comments/42/reactions", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusCreated)
+		assert.NoError(t, json.NewEncoder(w).Encode(map[string]any{"id": 1}))
+	})
+
+	h := &Handler{
+		service:   service,
+		ghClients: ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: ghclient.NewInstallationClient(client, testLogger())}),
+		logger:    testLogger(),
+	}
+	service.OnQueuedStartWithdrawn = h.reportQueuedStartWithdrawn
+
+	postStartCommand(t, h, applyIdentifier, "alice")
+
+	require.Eventually(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(landed) == 2
+	}, webhookIntegrationCheckRunDeadline, 50*time.Millisecond, "the acknowledgement and the notice")
+	drainCtx, cancel := context.WithTimeout(ctx, webhookIntegrationCheckRunDeadline)
+	defer cancel()
+	h.DrainInProcessWebhookWork(drainCtx)
+
+	mu.Lock()
+	defer mu.Unlock()
+	require.Len(t, landed, 2, "the notice is posted once")
+	assert.Contains(t, landed[0], "Start Request Accepted")
+	assert.Contains(t, landed[1], "## Start Withdrawn", "the PR ends on the withdrawal")
+	assert.NotContains(t, landed[1], "Stopped by", "a CLI stopper is not named")
+	final, err := store.Applies().GetByApplyIdentifier(ctx, applyIdentifier)
+	require.NoError(t, err)
+	require.NotNil(t, final)
+	assert.Equal(t, state.Apply.Stopped, final.State, "the stop won; the apply stays stopped")
 }
 
 // TestE2EStartCommandRejectsCompletedApply verifies that a PR comment start

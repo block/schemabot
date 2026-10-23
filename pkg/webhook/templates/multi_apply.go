@@ -117,7 +117,7 @@ func renderMultiDeploymentApplyComment(data MultiDeploymentApplyData, renderedAt
 		writeApplyOptions(&sb, options.DeferCutover, options.SkipRevert, data.Model.State)
 	}
 	groups := groupsWithChanges(data.Model, data.Model.Groups())
-	if g, ok := soleTargetRollout(groups); ok {
+	if g, ok := presentation.SoleTargetRollout(groups); ok {
 		writeTargetRolloutBody(&sb, data, g, budget)
 		writeRolloutFooter(&sb, data)
 		if !state.IsTerminalApplyState(data.Model.State) {
@@ -163,8 +163,9 @@ func renderMultiDeploymentApplySummaryComment(data MultiDeploymentApplyData, bud
 	writeApplyHeader(&sb, ApplyStatusCommentData{State: data.Model.State, Environment: data.Environment, Rollback: data.Rollback})
 	writeAggregateMetadata(&sb, data, currentTimestamp())
 	groups := groupsWithChanges(data.Model, data.Model.Groups())
-	if g, ok := soleTargetRollout(groups); ok {
-		writeTargetRolloutBody(&sb, data, g, budget)
+	if g, ok := presentation.SoleTargetRollout(groups); ok {
+		writeTargetRolloutStatus(&sb, data, g)
+		writeTargetRolloutSummaryDetails(&sb, data, g, budget)
 		writeRolloutFooter(&sb, data)
 		return sb.String()
 	}
@@ -180,21 +181,44 @@ func renderMultiDeploymentApplySummaryComment(data MultiDeploymentApplyData, bud
 	return sb.String()
 }
 
-// soleTargetRollout returns the apply's one deployment when it addresses
-// several targets. Such an apply has no other deployment to tell it apart
-// from, so its comment carries no per-deployment wrapper: the status is stated
-// once, and the table lines sit directly under it rather than in a section that
-// collapses once the rollout finishes.
-func soleTargetRollout(groups []presentation.Group) (presentation.Group, bool) {
-	if len(groups) == 1 && len(groups[0].Members) > 1 {
-		return groups[0], true
-	}
-	return presentation.Group{}, false
-}
-
 // writeTargetRolloutBody writes a sole multi-target deployment's comment body:
 // its status line, the first failure, and the rolled-up table lines.
 func writeTargetRolloutBody(sb *strings.Builder, data MultiDeploymentApplyData, g presentation.Group, budget *ddlBlockBudget) {
+	writeTargetRolloutStatus(sb, data, g)
+	writeTargetRollup(sb, data, g, budget)
+}
+
+// writeTargetRolloutSummaryDetails writes a sole multi-target deployment's
+// rolled-up table lines in its final summary. A completed rollout folds them
+// into the same "Apply details" block a single-target completed summary uses,
+// since nothing in them needs the reader's attention; any other outcome leaves
+// them open so the failed or unfinished targets stay in view.
+func writeTargetRolloutSummaryDetails(sb *strings.Builder, data MultiDeploymentApplyData, g presentation.Group, budget *ddlBlockBudget) {
+	tables := targetRolloutTables(data, g)
+	if !state.IsState(data.Model.State, state.Apply.Completed) || len(tables) == 0 {
+		writeTargetRollup(sb, data, g, budget)
+		return
+	}
+	fmt.Fprintf(sb, "<details><summary>%s</summary>\n\n", completedSummaryDetailsLabel(ApplyStatusCommentData{Tables: tables}))
+	writeTargetRollup(sb, data, g, budget)
+	sb.WriteString("</details>\n")
+}
+
+// targetRolloutTables is one row per rolled-up line of a target rollout, so
+// its count is the number of table changes the rollout ran, not that number
+// times its targets.
+func targetRolloutTables(data MultiDeploymentApplyData, g presentation.Group) []TableProgressData {
+	lines := targetTableLines(data, g)
+	tables := make([]TableProgressData, len(lines))
+	for i, line := range lines {
+		tables[i] = line.table
+	}
+	return tables
+}
+
+// writeTargetRolloutStatus writes a sole multi-target deployment's status line
+// and its first failure, the part of its body that stays visible.
+func writeTargetRolloutStatus(sb *strings.Builder, data MultiDeploymentApplyData, g presentation.Group) {
 	settled := state.IsState(data.Model.State, state.SettledApplyStates...)
 	progress := data.Model.TargetProgress(g)
 	// The comment leaves out a deployment only when every target in it
@@ -211,7 +235,6 @@ func writeTargetRolloutBody(sb *strings.Builder, data MultiDeploymentApplyData, 
 	fmt.Fprintf(sb, "\n%s\n", glyphTag(g.Lead.Emoji, status))
 	writeAggregateFirstFailure(sb, data.Model.FirstFailure)
 	sb.WriteString("\n")
-	writeTargetRollup(sb, data, g, budget)
 }
 
 // targetRolloutStatus states a multi-target rollout's progress in one line:
