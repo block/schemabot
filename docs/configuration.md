@@ -629,7 +629,7 @@ A database that lives on more than one target replaces the scalar `target` with 
 
 > **MySQL only.** `targets` is rejected at startup on any other database type. Addressing N targets has to be represented on every operator-facing surface — the plan comment, progress, the terminal summary — and that presentation is built per engine, so the feature is enabled per engine as the work lands.
 
-> Each target is planned against its own live schema, and the apply runs each member against the plan that member was planned for, so one target's DDL is never run against another. The plan comment, progress, and terminal summary name the rollout's targets; [Multi-target environments](mysql.md#multi-target-environments) shows a rollout on a pull request.
+> Each target is planned against its own live schema, and the apply runs each member against the plan that member was planned for, so one target's DDL is never run against another. The progress comment lists each target and its copy; the plan comment and terminal summary say how many targets the change rolls out to. [Multi-target environments](mysql.md#multi-target-environments) shows a rollout on a pull request.
 
 ```yaml
 databases:
@@ -643,7 +643,7 @@ databases:
           - payments-002
 ```
 
-An apply of the environment fans out to every listed target and follows each target's copy in one watcher. Under the default `cutover_policy: parallel`, every target copies at once, up to the server's [`max_drivers_per_apply`](#per-apply-driver-cap), and each target cuts over as soon as its own copy is ready:
+An apply of the environment fans out to every listed target and follows each target's copy in one watcher. Under the default `cutover_policy: parallel`, the targets copy at once, as many as the server's [`max_drivers_per_apply`](#per-apply-driver-cap) allows (2 by default, so the rest wait as queued), and each target cuts over as soon as its own copy is ready. The animation runs with a cap of 4, so all four targets copy together:
 
 ![Apply an index to four targets of one environment and follow their copies in parallel](../assets/cli-multi-target.gif)
 

@@ -123,7 +123,6 @@ func detail(target, opState string, tables []templates.TableProgressData) *templ
 	return &templates.ApplyStatusCommentData{
 		Database:    target,
 		Environment: environment,
-		RequestedBy: requestedBy,
 		State:       opState,
 		Engine:      "Spirit",
 		ApplyID:     "apply-example-91",
@@ -154,7 +153,6 @@ func rolloutCommentStopped(percents []int, elapsed time.Duration, summary, stopp
 		Model:       presentation.Derive(ops),
 		ApplyID:     "apply-example-91",
 		Environment: environment,
-		RequestedBy: requestedBy,
 		StartedAt:   startedAt.Format(time.RFC3339),
 		Details:     details,
 	}
@@ -175,7 +173,6 @@ func narrowedComment(target string, percent int, elapsed time.Duration, summary 
 	data := templates.ApplyStatusCommentData{
 		Database:    database,
 		Environment: environment,
-		RequestedBy: requestedBy,
 		State:       operationState(percent, false),
 		Engine:      "Spirit",
 		ApplyID:     "apply-example-92",

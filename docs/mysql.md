@@ -322,7 +322,7 @@ Each target is planned against its own live schema and runs its own Spirit chang
 
 ### Apply every target at once
 
-`schemabot apply -e production` fans the change out to every target. Under the default `cutover_policy: parallel`, every target copies at once, up to the server's [`max_drivers_per_apply`](configuration.md#per-apply-driver-cap). Each target cuts over as soon as its own copy is ready, so the smallest finishes first. The progress comment counts the targets done, cutting over, and running, and lists each target's copy. The schema check passes once the apply completes on every target.
+`schemabot apply -e production` fans the change out to every target. Under the default `cutover_policy: parallel`, the targets copy at once, as many as the server's [`max_drivers_per_apply`](configuration.md#per-apply-driver-cap) allows. That cap defaults to 2, so by default shop-001 and shop-002 copy first and the other targets wait as queued, starting in list order as copies finish. Each target cuts over as soon as its own copy is ready. The progress comment counts the targets done, cutting over, running, and queued, and lists each target's copy. The recordings below run with `max_drivers_per_apply: 4`, so all four targets copy together and the smallest, shop-004, finishes first. The schema check passes once the apply completes on every target.
 
 ![A PR applies an index to four targets in parallel, follows each target's copy, and merges once every target has the change](../assets/pr-multi-target-demo.gif)
 

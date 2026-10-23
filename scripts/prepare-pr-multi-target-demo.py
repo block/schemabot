@@ -9,7 +9,11 @@ import json,re,runpy,subprocess
 root=Path(__file__).resolve().parent.parent
 m=runpy.run_path(str(root/'scripts/render-pr-mockups.py'))
 cache={}
-raw=json.loads(subprocess.run(['go','run','./pkg/cmd/prdemo/main.go'],cwd=root,check=True,capture_output=True,text=True).stdout)
+try:
+ out=subprocess.run(['go','run','./pkg/cmd/prdemo/main.go'],cwd=root,check=True,capture_output=True,text=True).stdout
+except subprocess.CalledProcessError as e:
+ m['fail'](f"go run ./pkg/cmd/prdemo/main.go failed: {e.stderr.strip()}")
+raw=json.loads(out)
 def render(body):
  # The templates stamp the current time; pin it so the output is reproducible.
  body=re.sub(r'\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} UTC','2026-09-01 10:00:00 UTC',body)

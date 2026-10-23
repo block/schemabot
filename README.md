@@ -30,7 +30,7 @@ SchemaBot is declarative and GitOps-driven: SQL files in your repository provide
 
 [Walk through the illustrated PR workflow](./docs/pre-merge-workflow.md#the-pr-workflow-step-by-step)
 
-**Roll out to every target.** One apply copies every target of an environment in parallel, and the check passes once all of them have the change.
+**Roll out to every target.** One apply copies an environment's targets in parallel, as many at once as the server's per-apply driver cap allows, and the check passes once all of them have the change.
 
 <img src="./assets/pr-multi-target-demo.gif" width="800" alt="A PR applies an index to four targets in parallel, follows each target's copy, and merges once every target has the change">
 
@@ -50,7 +50,7 @@ SchemaBot is declarative and GitOps-driven: SQL files in your repository provide
 
 <img src="./assets/cli-ops.gif" width="800" alt="Inspect fleet status, follow one change, and read its logs">
 
-**Apply to every target at once.** One apply fans an environment out to all its targets, copies them in parallel, and cuts each over as soon as its copy is ready.
+**Apply to every target at once.** One apply fans an environment out to all its targets, copies them in parallel up to the per-apply driver cap, and cuts each over as soon as its copy is ready.
 
 <img src="./assets/cli-multi-target.gif" width="800" alt="Apply an index to four targets of one environment and follow their copies in parallel">
 
