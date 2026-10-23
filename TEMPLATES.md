@@ -9074,12 +9074,15 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 ✅ Rolled out to 3 targets
 
+<details><summary>Apply details (1 table)</summary>
+
 **`orders`**: ✅ Complete (3 targets)
 
 ```sql
 ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 ```
 
+</details>
 
 </details>
 
