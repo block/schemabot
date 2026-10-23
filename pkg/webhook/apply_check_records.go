@@ -23,9 +23,11 @@ import (
 //
 // Otherwise the apply-time plan does not evaluate review-time deployment drift,
 // so it must not clear a stored drift block: the block depends on live
-// deployment state, not PR content, and only a fresh rollup may clear it. It
-// also deliberately skips the manual plan path's apply-owned no-op recovery: an
-// in_progress row stamped with an apply ID may belong to a live apply whose
+// deployment state, not PR content, and only a fresh rollup may clear it. The
+// rollout's member work still names the targets the apply runs on, as it does
+// when only the primary target has work or the other targets mirror its plan.
+// It also deliberately skips the manual plan path's apply-owned no-op recovery:
+// an in_progress row stamped with an apply ID may belong to a live apply whose
 // terminal outcome must land on it, so only the manual plan command may
 // override that claim.
 func (h *Handler) storeApplyCheckRecord(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, schema *ghclient.SchemaRequestResult, planResp *apitypes.PlanResponse, environment string, rollout reviewDriftOutcome, runsMemberWork bool) (string, error) {
@@ -36,7 +38,50 @@ func (h *Handler) storeApplyCheckRecord(ctx context.Context, client *ghclient.In
 		rollout.dispatchesApply = true
 		return h.storePlanCheckRecord(ctx, client, repo, pr, schema, planResp, environment, rollout)
 	}
-	return h.storePlanCheckRecord(ctx, client, repo, pr, schema, planResp, environment, reviewDriftOutcome{state: driftNotEvaluated})
+	return h.storePlanCheckRecord(ctx, client, repo, pr, schema, planResp, environment, primaryPlanApplyOutcome(rollout))
+}
+
+// primaryPlanApplyOutcome is the outcome an apply running the primary plan
+// records: drift not evaluated, so a stored drift block stays, and the
+// rollout's member work, so the row names the targets the apply runs on.
+func primaryPlanApplyOutcome(rollout reviewDriftOutcome) reviewDriftOutcome {
+	return reviewDriftOutcome{state: driftNotEvaluated, work: rollout.work, dispatchesApply: true}
+}
+
+// applyChangeSummary is the Change column an apply's row carries from the
+// moment the apply starts, with the rollout counts that go with it. The row is
+// kept through the apply's completion, so the text names what the apply runs
+// rather than what a plan found pending, which would go stale once the apply
+// lands. Empty text leaves the stored summary as it is.
+type applyChangeSummary struct {
+	text     string
+	targets  int
+	withWork int
+}
+
+// rolloutApplyChangeSummary is the Change column for an apply of the rollout:
+// the primary plan's summary and the targets the apply runs on. An apply
+// narrowed to one target names that target instead, and no counts go with it.
+func (h *Handler) rolloutApplyChangeSummary(schema *ghclient.SchemaRequestResult, planResp *apitypes.PlanResponse, environment string, work memberWork) applyChangeSummary {
+	if planResp.NarrowedTo != "" {
+		return applyChangeSummary{text: narrowedApplyCheckSummary(h.narrowedTargetName(planResp.NarrowedTo, schema.Database, environment))}
+	}
+	targets, withWork := work.rolloutCounts()
+	return applyChangeSummary{
+		text:     reviewDriftOutcome{work: work, dispatchesApply: true}.changeSummary(summarizePlanChanges(schema, planResp, environment)),
+		targets:  targets,
+		withWork: withWork,
+	}
+}
+
+// applyTo writes the summary onto a check row the apply is claiming.
+func (s applyChangeSummary) applyTo(check *storage.Check) {
+	if s.text == "" {
+		return
+	}
+	check.ChangeSummary = s.text
+	check.RolloutTargets = s.targets
+	check.RolloutTargetsWithWork = s.withWork
 }
 
 // narrowedApplyCheckSummary is the stored Change column for an environment
@@ -137,11 +182,17 @@ func isNarrowedApply(apply *storage.Apply) bool {
 // brought back in line, and the block stays until a rollup of the whole
 // environment clears it.
 //
+// summary is the Change column the apply's row carries while the apply runs and
+// after it completes. A plan of the whole environment can rewrite the row
+// between the apply command and its confirmation, so the claim writes it rather
+// than keeping whatever the last plan stored. A row whose block the apply
+// keeps keeps its summary too, since the summary explains that block.
+//
 // The apply parameter is the caller's pre-claim snapshot: only its identifiers
 // (ID, ApplyIdentifier) and its creation-time options are read here. Live state is reloaded from storage
 // after the claim lands, so a snapshot that went stale between accept and
 // claim cannot leak outdated state into the check row.
-func (h *Handler) updateCheckRecordForApplyStart(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, schema *ghclient.SchemaRequestResult, environment string, apply *storage.Apply) error {
+func (h *Handler) updateCheckRecordForApplyStart(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, schema *ghclient.SchemaRequestResult, environment string, apply *storage.Apply, summary applyChangeSummary) error {
 	// Fail closed on a missing or non-persisted apply before touching check
 	// state: claiming the check row without a real apply row would record
 	// ownership nothing can ever reconcile.
@@ -253,6 +304,7 @@ func (h *Handler) updateCheckRecordForApplyStart(ctx context.Context, client *gh
 			Status:       checkStatusInProgress,
 			Conclusion:   "",
 		}
+		summary.applyTo(check)
 	} else {
 		check.ApplyID = apply.ID
 		check.HasChanges = true
@@ -268,6 +320,7 @@ func (h *Handler) updateCheckRecordForApplyStart(ctx context.Context, client *gh
 		} else {
 			check.BlockingReason = ""
 			check.ErrorMessage = ""
+			summary.applyTo(check)
 		}
 	}
 

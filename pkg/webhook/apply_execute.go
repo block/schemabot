@@ -606,7 +606,8 @@ func (h *Handler) executeApply(
 	h.postInitialProgressComment(ctx, repo, pr, installationID, apply, progressBody)
 
 	// Update stored check state to in_progress (transitions action_required to in_progress).
-	if err := h.updateCheckRecordForApplyStart(ctx, client, repo, pr, schemaResult, environment, apply); err != nil {
+	if err := h.updateCheckRecordForApplyStart(ctx, client, repo, pr, schemaResult, environment, apply,
+		h.rolloutApplyChangeSummary(schemaResult, planResp, environment, rollout.work)); err != nil {
 		h.logger.Error("failed to mark check in_progress for apply",
 			append(apply.LogAttrs(), "error", err)...)
 		h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy, "Apply was accepted, but SchemaBot could not update the required status check: "+err.Error())

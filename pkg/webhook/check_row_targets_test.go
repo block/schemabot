@@ -6,6 +6,8 @@ import (
 	"github.com/stretchr/testify/assert"
 
 	"github.com/block/schemabot/pkg/api"
+	"github.com/block/schemabot/pkg/apitypes"
+	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/storage"
 )
 
@@ -55,6 +57,61 @@ func TestCheckRowNamesRolloutTargets(t *testing.T) {
 // names shop-002 the way the plan and apply comments do: by its deployment,
 // qualified with the target only when the deployment addresses several.
 func TestNarrowedApplyCheckSummaryNamesTheTarget(t *testing.T) {
+	h := shopRolloutHandler()
+
+	assert.Equal(t, "rolling out `shop-002` alone; apply the rest of the environment to finish",
+		narrowedApplyCheckSummary(h.narrowedTargetName("shop-002/shop", "shop", "production")))
+	assert.Equal(t, "`shop-002` applied; apply the rest of the environment to finish",
+		narrowedApplyCompletedSummary(h.narrowedTargetName("shop-002/shop", "shop", "production")))
+	assert.Equal(t, "region-a/shop-002", h.narrowedTargetName("region-a/shop-002", "shop", "staging"),
+		"a deployment addressing several targets is qualified with the target")
+	assert.Equal(t, "shop-002/shop", h.narrowedTargetName("shop-002/shop", "shop", "qa"),
+		"an environment that cannot be resolved names the member in full")
+}
+
+// An apply's row is kept from the moment the apply starts through its
+// completion, so its Change column names the targets the apply runs on, never
+// the targets a plan found pending. That holds when only the primary target
+// has work, and when a plan of the whole environment rewrote the row between
+// the apply command and its confirmation: the claim writes the apply's own
+// summary over it. A row with nothing to say keeps what it has.
+func TestApplyRowNamesTheTargetsItRuns(t *testing.T) {
+	h := shopRolloutHandler()
+	schema := &ghclient.SchemaRequestResult{Type: "mysql", Database: "shop"}
+	alter := &apitypes.PlanResponse{Changes: []*apitypes.SchemaChangeResponse{{
+		Namespace: "shop",
+		TableChanges: []*apitypes.TableChangeResponse{{
+			TableName: "orders", ChangeType: "alter", DDL: "ALTER TABLE `orders` ADD COLUMN `note` varchar(255)",
+		}},
+	}}}
+	primaryOnly := memberWork{pending: 1, members: 4, names: []string{"shop-001"}, primary: "shop-001"}
+
+	outcome := primaryPlanApplyOutcome(reviewDriftOutcome{state: driftClean, work: primaryOnly})
+	assert.Equal(t, driftNotEvaluated, outcome.state, "an apply of the primary plan never clears a stored drift block")
+	assert.Equal(t, "1 alter · 1 of 4 targets: `shop-001`", outcome.changeSummary("1 alter"))
+
+	summary := h.rolloutApplyChangeSummary(schema, alter, "production", memberWork{pending: 3, members: 4, names: []string{"shop-001", "shop-003", "shop-004"}})
+	assert.Equal(t, applyChangeSummary{text: "1 alter · 3 of 4 targets: `shop-001`, `shop-003`, `shop-004`", targets: 4, withWork: 3}, summary)
+
+	replanned := &storage.Check{ChangeSummary: "1 alter · pending on 3 of 4 targets: `shop-001`, `shop-003`, `shop-004`", RolloutTargets: 4, RolloutTargetsWithWork: 3}
+	summary.applyTo(replanned)
+	assert.Equal(t, "1 alter · 3 of 4 targets: `shop-001`, `shop-003`, `shop-004`", replanned.ChangeSummary)
+	assert.Equal(t, 4, replanned.RolloutTargets)
+	assert.Equal(t, 3, replanned.RolloutTargetsWithWork)
+
+	narrowed := &apitypes.PlanResponse{NarrowedTo: "shop-002/shop"}
+	assert.Equal(t, applyChangeSummary{text: "rolling out `shop-002` alone; apply the rest of the environment to finish"},
+		h.rolloutApplyChangeSummary(schema, narrowed, "production", primaryOnly))
+
+	kept := &storage.Check{ChangeSummary: "1 alter", RolloutTargets: 0}
+	applyChangeSummary{}.applyTo(kept)
+	assert.Equal(t, "1 alter", kept.ChangeSummary, "an empty summary leaves the stored one")
+}
+
+// shopRolloutHandler serves a database whose production environment has two
+// deployments of one target each, and whose staging environment has one
+// deployment addressing two targets.
+func shopRolloutHandler() *Handler {
 	cfg := &api.ServerConfig{
 		Databases: map[string]api.DatabaseConfig{
 			"shop": {
@@ -71,16 +128,7 @@ func TestNarrowedApplyCheckSummaryNamesTheTarget(t *testing.T) {
 			},
 		},
 	}
-	h := &Handler{service: api.New(nil, cfg, nil, testLogger()), logger: testLogger()}
-
-	assert.Equal(t, "rolling out `shop-002` alone; apply the rest of the environment to finish",
-		narrowedApplyCheckSummary(h.narrowedTargetName("shop-002/shop", "shop", "production")))
-	assert.Equal(t, "`shop-002` applied; apply the rest of the environment to finish",
-		narrowedApplyCompletedSummary(h.narrowedTargetName("shop-002/shop", "shop", "production")))
-	assert.Equal(t, "region-a/shop-002", h.narrowedTargetName("region-a/shop-002", "shop", "staging"),
-		"a deployment addressing several targets is qualified with the target")
-	assert.Equal(t, "shop-002/shop", h.narrowedTargetName("shop-002/shop", "shop", "qa"),
-		"an environment that cannot be resolved names the member in full")
+	return &Handler{service: api.New(nil, cfg, nil, testLogger()), logger: testLogger()}
 }
 
 // The aggregate title is what the PR's merge box shows next to the check name.

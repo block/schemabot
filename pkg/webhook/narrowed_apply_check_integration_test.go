@@ -142,7 +142,7 @@ func (f *narrowedApplyCheckFixture) runNarrowedApply(t *testing.T, identifier st
 	require.NoError(t, err)
 	apply.ID = applyID
 
-	require.NoError(t, f.h.updateCheckRecordForApplyStart(ctx, f.client, f.repo, f.pr, f.schema, f.env, apply),
+	require.NoError(t, f.h.updateCheckRecordForApplyStart(ctx, f.client, f.repo, f.pr, f.schema, f.env, apply, applyChangeSummary{}),
 		"a narrowed apply is not refused by a block it keeps")
 	started = f.check(t)
 
