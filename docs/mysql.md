@@ -341,3 +341,13 @@ From the CLI, the plan header says the plan covers only that rollout member:
 ![Plan and apply an index to one target of a multi-target environment](../assets/cli-target.gif)
 
 [Apply to one target of a rollout](cli.md#apply-to-one-target-of-a-rollout) covers target names, refusals, and undoing a narrowed apply.
+
+### Stop and resume a rollout
+
+`schemabot stop apply-example-91 -e production` stops the whole apply, so every target still copying stops at its checkpoint. A target that has already finished stays finished. The progress comment shows each target where it stopped, a stopped summary posts at the bottom of the pull request, and the schema check reads `1 apply stopped` and keeps blocking merge. `schemabot start apply-example-91 -e production` resumes every stopped target from its own checkpoint. The stopped progress comment folds into a pointer to a fresh progress comment, which follows the resumed copies to completion. Stop and start take no `--target`. To control one target on its own, apply it with `--target` first; stop and start then act on that one-target apply.
+
+![A PR stops a four-target rollout, the finished target stays done, and start resumes the other three from their checkpoints through to merge](../assets/pr-multi-target-stop-demo.gif)
+
+In the CLI watcher, **s** stops the rollout the same way:
+
+![Press s to stop a four-target rollout, then start resumes each stopped target from its checkpoint](../assets/cli-multi-target-stop.gif)

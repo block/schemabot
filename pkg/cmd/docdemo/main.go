@@ -532,14 +532,128 @@ func rolloutProgress(applyID string, targets []string, percents []int) apitypes.
 	return response
 }
 
+// runningTargets lists the targets of a rollout whose work has not finished.
+func runningTargets(response apitypes.ProgressResponse) []string {
+	var running []string
+	for _, table := range response.Tables {
+		if !state.IsState(table.Status, state.Task.Completed) {
+			running = append(running, table.Target)
+		}
+	}
+	return running
+}
+
+// rolloutStopped is the rollout once a stop has reached it: every target that
+// was still copying stopped at its own checkpoint, and a target that had
+// finished stays finished.
+func rolloutStopped(percents []int) apitypes.ProgressResponse {
+	response := rolloutProgress(rolloutApplyID, rolloutTargets, percents)
+	response.State = state.Apply.Stopped
+	for i, op := range response.Operations {
+		if state.IsState(op.State, state.Apply.Completed) {
+			continue
+		}
+		op.State = state.Apply.Stopped
+		response.Tables[i].Status = state.Task.Stopped
+		response.Tables[i].ETASeconds = 0
+	}
+	return response
+}
+
+// rolloutStart runs the real start command against a loopback fixture holding
+// the stopped rollout. The fixture checks the start request and scripts the
+// watcher start opens through polls to completion. It returns what start
+// printed before the watcher took over.
+func rolloutStart(stoppedAt []int) string {
+	stopped := rolloutStopped(stoppedAt)
+	resumed := len(runningTargets(stopped))
+	polls := [][]int{{60, 45, 52, 100}, {100, 100, 100, 100}}
+	var requests []string
+	var fixtureMu sync.Mutex
+	poll := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fixtureMu.Lock()
+		defer fixtureMu.Unlock()
+		requests = append(requests, r.Method+" "+r.URL.Path)
+		w.Header().Set("Content-Type", "application/json")
+		var response any
+		switch r.Method + " " + r.URL.Path {
+		case "GET /api/progress/apply/" + rolloutApplyID:
+			switch {
+			case len(requests) == 1:
+				response = stopped
+			case poll < len(polls):
+				response = rolloutProgress(rolloutApplyID, rolloutTargets, polls[poll])
+				poll++
+			default:
+				panic("start watcher polled after completion")
+			}
+		case "POST /api/start":
+			var request apitypes.ControlRequest
+			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+				panic(err)
+			}
+			if request.ApplyID != rolloutApplyID || request.Environment != "production" {
+				panic("wrong start request")
+			}
+			response = apitypes.StartResponse{Accepted: true, StartedCount: int64(resumed), SkippedCount: int64(len(rolloutTargets) - resumed)}
+		default:
+			panic("unexpected start request: " + r.Method + " " + r.URL.Path)
+		}
+		if err := json.NewEncoder(w).Encode(response); err != nil {
+			panic(err)
+		}
+	}))
+	defer server.Close()
+	output := runInTerminalWithInput("", "start-fixture", server.URL)
+	fixtureMu.Lock()
+	sequence := strings.Join(requests, ",")
+	fixtureMu.Unlock()
+	want := "GET /api/progress/apply/" + rolloutApplyID + ",POST /api/start" + strings.Repeat(",GET /api/progress/apply/"+rolloutApplyID, len(polls))
+	if sequence != want {
+		panic("wrong start request sequence: " + sequence)
+	}
+	if !strings.Contains(output, "Apply complete!") {
+		panic("start watcher did not reach completion: " + output)
+	}
+	const resuming = "Resuming from checkpoint..."
+	before, after, found := strings.Cut(output, resuming)
+	if !found {
+		panic("start did not resume: " + output)
+	}
+	reset, _, _ := strings.Cut(after, "\n")
+	return before + resuming + reset + "\n"
+}
+
 // watchView renders the production watcher's view of one progress response.
 func watchView(response apitypes.ProgressResponse) string {
+	return watchViewPressing(response, false)
+}
+
+// watchViewPressing renders the production watcher's view of one progress
+// response, after pressing s when stop is set. The fixture checks that the
+// key sends one stop request for the apply being watched.
+func watchViewPressing(response apitypes.ProgressResponse, stop bool) string {
+	var stops int
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet || !strings.HasPrefix(r.URL.Path, "/api/progress/apply/") {
+		w.Header().Set("Content-Type", "application/json")
+		var body any = response
+		switch {
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/api/progress/apply/"):
+		case stop && r.Method == http.MethodPost && r.URL.Path == "/api/stop":
+			var request apitypes.ControlRequest
+			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+				panic(err)
+			}
+			if request.ApplyID != response.ApplyID || request.Environment != response.Environment {
+				panic("wrong stop request")
+			}
+			stops++
+			body = apitypes.StopResponse{Accepted: true, StoppedCount: int64(len(runningTargets(response))), SkippedCount: int64(len(response.Tables) - len(runningTargets(response)))}
+		default:
 			panic("unexpected watch request: " + r.Method + " " + r.URL.Path)
 		}
-		w.Header().Set("Content-Type", "application/json")
-		if err := json.NewEncoder(w).Encode(response); err != nil {
+		if err := json.NewEncoder(w).Encode(body); err != nil {
 			panic(err)
 		}
 	}))
@@ -547,6 +661,17 @@ func watchView(response apitypes.ProgressResponse) string {
 	model := commands.NewWatchModel(server.URL, response.Database, response.Environment, true)
 	batch := model.Init()().(tea.BatchMsg)
 	updated, _ := model.Update(batch[0]())
+	if stop {
+		var cmd tea.Cmd
+		updated, cmd = updated.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+		if cmd == nil {
+			panic("stop key did not request stop")
+		}
+		updated, _ = updated.Update(cmd())
+		if stops != 1 {
+			panic("expected one stop request")
+		}
+	}
 	view := updated.View()
 	if strings.Contains(view, "Error:") || strings.Contains(view, "Loading...") {
 		panic(view)
@@ -737,6 +862,35 @@ func targetDemo() Demo {
 	return Demo{Name: "cli-target", Title: "Apply to one target first.", Height: 740, Bar: "shop · production", Frames: frames}
 }
 
+// rolloutStopDemo stops a rollout partway through its copies and starts it
+// again: one stop halts every target still copying, a finished target stays
+// finished, and start resumes each target from its own checkpoint.
+func rolloutStopDemo() Demo {
+	stoppedAt := []int{45, 30, 37, 100}
+	frames := []Frame{
+		{1.5, "", "Every target copies in parallel", watchView(rolloutProgress(rolloutApplyID, rolloutTargets, []int{38, 25, 31, 92}))},
+		{1.5, "", "shop-004 finishes first", watchView(rolloutProgress(rolloutApplyID, rolloutTargets, stoppedAt))},
+		{2, "", "Press s to stop the apply", watchViewPressing(rolloutProgress(rolloutApplyID, rolloutTargets, stoppedAt), true)},
+	}
+	stopped := watchView(rolloutStopped(stoppedAt))
+	if !strings.Contains(stopped, "schemabot start") {
+		panic("stopped rollout does not say how to resume: " + stopped)
+	}
+	frames = append(frames, Frame{3.5, "", "Every target still copying stops; shop-004 stays done", stopped})
+	started := rolloutStart(stoppedAt)
+	frames = append(frames, Frame{2, "schemabot start -e production " + rolloutApplyID, "Start resumes every stopped target", started})
+	steps := [][]int{{45, 30, 37, 100}, {55, 40, 47, 100}, {65, 50, 57, 100}, {75, 60, 67, 100}, {85, 70, 77, 100}, {95, 80, 87, 100}, {cuttingOver, 90, 97, 100}, {100, 100, cuttingOver, 100}, {100, cuttingOver, 100, 100}}
+	for _, p := range steps {
+		frames = append(frames, Frame{0.6, "", "Each target resumes from its own checkpoint", watchView(rolloutProgress(rolloutApplyID, rolloutTargets, p))})
+	}
+	final := watchView(rolloutProgress(rolloutApplyID, rolloutTargets, []int{100, 100, 100, 100}))
+	if !strings.Contains(final, "Apply complete!") {
+		panic("resumed rollout completion missing: " + final)
+	}
+	frames = append(frames, Frame{4, "", "The index lands on every target", final})
+	return Demo{Name: "cli-multi-target-stop", Title: "Stop every target. Resume each one.", Height: 820, Bar: "shop · production", Frames: frames}
+}
+
 // splitAtConfirmation separates the plan and prompt the apply command printed
 // from what it printed once confirmed, so the renderer can type the answer.
 func splitAtConfirmation(output string) (string, string) {
@@ -766,6 +920,20 @@ func main() {
 		}
 		cmd := commands.RollbackCmd{ApplyID: "apply-example-85", Environment: "staging", Watch: true}
 		if err := cmd.Run(context.Background(), &commands.Globals{Endpoint: endpoint.String()}); err != nil {
+			panic(err)
+		}
+		return
+	}
+	if len(os.Args) == 3 && os.Args[1] == "start-fixture" {
+		endpoint, err := url.Parse(os.Args[2])
+		if err != nil {
+			panic(err)
+		}
+		if endpoint.Scheme != "http" || endpoint.Hostname() != "127.0.0.1" {
+			panic("start fixture requires a loopback HTTP endpoint")
+		}
+		cmd := commands.StartCmd{ControlFlags: commands.ControlFlags{ApplyID: rolloutApplyID, Environment: "production"}, Watch: true}
+		if err := cmd.Run(&commands.Globals{Endpoint: endpoint.String()}); err != nil {
 			panic(err)
 		}
 		return
@@ -848,7 +1016,7 @@ func main() {
 	}
 	stopFrames = append(stopFrames, Frame{3, "", "The watcher confirms completion", live(100, state.Apply.Completed, false, "")})
 	demos = append(demos, Demo{Name: "cli-stop", Title: "Stop and resume a change.", Frames: stopFrames})
-	demos = append(demos, vitessDemo(), rollbackDemo(), rolloutDemo(), targetDemo())
+	demos = append(demos, vitessDemo(), rollbackDemo(), rolloutDemo(), targetDemo(), rolloutStopDemo())
 	fleetLines := busyFleet(now)
 	pull := capture(func() {
 		// The capture pipe is not a TTY; this frame represents an interactive terminal.
@@ -1065,6 +1233,12 @@ func rollbackInteractive(endpoint string) string {
 // runInTerminal runs this generator in one of its loopback-only fixture modes
 // with terminal input that answers the confirmation prompt with yes.
 func runInTerminal(args ...string) string {
+	return runInTerminalWithInput("yes\n", args...)
+}
+
+// runInTerminalWithInput runs a child fixture mode in a terminal, typing input
+// before the command starts reading.
+func runInTerminalWithInput(input string, args ...string) string {
 	executable, err := os.Executable()
 	if err != nil {
 		panic(err)
@@ -1074,6 +1248,7 @@ func runInTerminal(args ...string) string {
 	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "python3", append([]string{helper, executable}, args...)...)
+	cmd.Env = append(os.Environ(), "CLI_DEMO_INPUT="+input)
 	cmd.Stderr = os.Stderr
 	output, err := cmd.Output()
 	if err != nil {

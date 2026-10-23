@@ -658,6 +658,13 @@ to resume from the checkpoint and reopen live progress.
 
 ![Press s, wait for Stopped, then run start and follow the change to completion](../assets/cli-stop.gif)
 
+On a [multi-target environment](mysql.md#multi-target-environments), stop
+and start act on the whole apply. Every target still copying stops at its
+checkpoint, a target that already finished stays finished, and `start`
+resumes each stopped target from its own checkpoint:
+
+![Press s to stop a four-target rollout, then start resumes each stopped target from its checkpoint](../assets/cli-multi-target-stop.gif)
+
 ### Choose when to cut over
 
 For engines that support deferred cutover, start the apply with

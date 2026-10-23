@@ -12,6 +12,7 @@ through the production Go templates and interactive `commands.WatchModel`:
 - `cli-vitess.gif`: create a deploy request, deploy with Enter, follow four shards, and close the revert window
 - `cli-multi-target.gif`: apply an index to an environment with four targets, follow their parallel copies, and watch each cut over as its copy finishes
 - `cli-target.gif`: apply the same index to one target with `--target` and follow it to completion
+- `cli-multi-target-stop.gif`: press **s** to stop the four-target rollout part-way, then run `start` and follow every stopped target from its checkpoint to completion
 
 They are template-based illustrations, not recordings of a live database.
 Commands are typed by the renderer, long operations are compressed, and the
@@ -53,7 +54,7 @@ and underlined in the recording so their labels remain recognizable as links.
 
 Review a plan frame, the fleet table, the throttle reason and ETA, the waiting
 state, and the completed state after rendering. Check the GIFs at README
-width as well as their native size (1100 × 670, 1100 × 740 for the shard, rollback, and single-target views, 1100 × 820 for the multi-target view, or 1100 × 960 for the fleet view). Keep the rendering method and timing choices documented here.
+width as well as their native size (1100 × 670, 1100 × 740 for the shard, rollback, and single-target views, 1100 × 820 for the multi-target views, or 1100 × 960 for the fleet view). Keep the rendering method and timing choices documented here.
 
 Pass a scenario name, such as `cli-vitess`, as the renderer’s first argument
 to refresh only that GIF. The PlanetScale fixture checks Enter against start
@@ -74,4 +75,4 @@ The rollback command runs in a child process with terminal input supplied by `sc
 
 Rollback previews use the production boxed context and dialect-aware SQL formatting. A canonical comparison preserves identifiers and literal values when a display transformation would change them. All remaining scenarios use production SQL highlighting; the operations pull view retains the multiline schema supplied by the engine.
 
-The multi-target scenarios run `ApplyCmd` in the same child process as the rollback, once for the whole environment and once with `--target shop-002`, against a loopback fixture for a deployment that lists four targets. The fixture checks the request order, that the plan and apply both carry the client's rollout capability, that the narrowed apply names the member its plan was made for, and that no apply defers cutover. It scripts the automatic watcher's polls through completion. The selected watcher frames render the production view with each target at its own progress under the default `parallel` cutover policy, including a target cutting over while the others still copy. Both scenarios label the terminal `shop · production`.
+The multi-target scenarios run `ApplyCmd` in the same child process as the rollback, once for the whole environment and once with `--target shop-002`, against a loopback fixture for a deployment that lists four targets. The fixture checks the request order, that the plan and apply both carry the client's rollout capability, that the narrowed apply names the member its plan was made for, and that no apply defers cutover. It scripts the automatic watcher's polls through completion. The selected watcher frames render the production view with each target at its own progress under the default `parallel` cutover policy, including a target cutting over while the others still copy. Both scenarios label the terminal `shop · production`. The stop scenario presses **s** in the real watcher against a fixture that checks exactly one `POST /api/stop` for the apply and environment, and renders the stopped rollout the fixture then reports. It runs `StartCmd` in a child process against a fixture that returns the stopped rollout, checks `POST /api/start`, and polls the resumed copies through completion. The PTY helper sends no input to that child, since the watcher would read it as key presses.

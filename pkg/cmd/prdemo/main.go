@@ -1,8 +1,8 @@
 //go:build ignore
 
 // Generate fictional multi-target PR comments through the production webhook
-// templates, for the PR workflow recordings. scripts/prepare-pr-demo.py runs it
-// from the repository root: go run ./pkg/cmd/prdemo/main.go
+// templates, for the PR workflow recordings. scripts/prepare-pr-multi-target-demo.py
+// runs it from the repository root: go run ./pkg/cmd/prdemo/main.go
 package main
 
 import (
@@ -86,10 +86,13 @@ func planComment(target string, locked bool) string {
 // cuttingOver marks a target whose copy is done and whose cutover is running.
 const cuttingOver = -1
 
-func tableProgress(target string, percent int) templates.TableProgressData {
+func tableProgress(target string, percent int, stopped bool) templates.TableProgressData {
 	total := rows[target]
 	table := templates.TableProgressData{TableName: "orders", DDL: addIndex, RowsTotal: total}
 	switch {
+	case stopped && percent >= 0 && percent < 100:
+		table.Status, table.PercentComplete = state.Task.Stopped, percent
+		table.RowsCopied = total * int64(percent) / 100
 	case percent == cuttingOver:
 		table.Status, table.RowsCopied, table.PercentComplete = state.Task.CuttingOver, total, 100
 	case percent >= 100:
@@ -103,8 +106,10 @@ func tableProgress(target string, percent int) templates.TableProgressData {
 	return table
 }
 
-func operationState(percent int) string {
+func operationState(percent int, stopped bool) string {
 	switch {
+	case stopped && percent >= 0 && percent < 100:
+		return state.ApplyOperation.Stopped
 	case percent == cuttingOver:
 		return state.ApplyOperation.CuttingOver
 	case percent >= 100:
@@ -130,14 +135,20 @@ func detail(target, opState string, tables []templates.TableProgressData) *templ
 // rolloutComment renders the progress comment of the parallel rollout, or its
 // summary once every target has completed and summary is set.
 func rolloutComment(percents []int, elapsed time.Duration, summary bool) string {
+	return rolloutCommentStopped(percents, elapsed, summary, false)
+}
+
+// rolloutCommentStopped renders the rollout like rolloutComment; when stopped
+// is set, every target still copying is stopped at its percent.
+func rolloutCommentStopped(percents []int, elapsed time.Duration, summary, stopped bool) string {
 	var ops []presentation.Operation
 	var details []*templates.ApplyStatusCommentData
 	done := true
 	for i, target := range targets {
-		opState := operationState(percents[i])
+		opState := operationState(percents[i], stopped)
 		done = done && opState == state.ApplyOperation.Completed
 		ops = append(ops, presentation.Operation{Deployment: deployment, Target: target, State: opState, Parallel: true})
-		details = append(details, detail(target, opState, []templates.TableProgressData{tableProgress(target, percents[i])}))
+		details = append(details, detail(target, opState, []templates.TableProgressData{tableProgress(target, percents[i], stopped)}))
 	}
 	data := templates.MultiDeploymentApplyData{
 		Model:       presentation.Derive(ops),
@@ -147,7 +158,7 @@ func rolloutComment(percents []int, elapsed time.Duration, summary bool) string 
 		StartedAt:   startedAt.Format(time.RFC3339),
 		Details:     details,
 	}
-	if done {
+	if done || stopped {
 		data.CompletedAt = startedAt.Add(elapsed).Format(time.RFC3339)
 	}
 	if summary {
@@ -160,12 +171,12 @@ func rolloutComment(percents []int, elapsed time.Duration, summary bool) string 
 // target, or its summary once it has completed and summary is set. It runs one
 // operation, so it takes the single-deployment layout.
 func narrowedComment(target string, percent int, elapsed time.Duration, summary bool) string {
-	table := tableProgress(target, percent)
+	table := tableProgress(target, percent, false)
 	data := templates.ApplyStatusCommentData{
 		Database:    database,
 		Environment: environment,
 		RequestedBy: requestedBy,
-		State:       operationState(percent),
+		State:       operationState(percent, false),
 		Engine:      "Spirit",
 		ApplyID:     "apply-example-92",
 		StartedAt:   startedAt.Format(time.RFC3339),
@@ -178,6 +189,27 @@ func narrowedComment(target string, percent int, elapsed time.Duration, summary 
 		return templates.RenderApplySummaryComment(data)
 	}
 	return templates.RenderApplyStatusComment(data)
+}
+
+// stopScenario is the rollout an operator stops part-way and starts again. The
+// stop leaves the progress comment in place at Stopped and posts a stopped
+// summary; the start folds that comment and tracks the resumed copy in a fresh
+// one at the bottom of the PR.
+type stopScenario struct {
+	Command   string   `json:"command"`
+	Plan      string   `json:"plan"`
+	Apply     string   `json:"apply"`
+	Progress  []string `json:"progress"`
+	Stop      string   `json:"stop"`
+	StopAck   string   `json:"stopAck"`
+	Stopped   string   `json:"stopped"`
+	StoppedAt string   `json:"stoppedSummary"`
+	Start     string   `json:"start"`
+	StartAck  string   `json:"startAck"`
+	Frozen    string   `json:"frozen"`
+	Resumed   []string `json:"resumed"`
+	Complete  string   `json:"complete"`
+	Summary   string   `json:"summary"`
 }
 
 type scenario struct {
@@ -228,11 +260,60 @@ func main() {
 		narrowed.Progress = append(narrowed.Progress, narrowedComment(narrowedTo, percent, 0, false))
 	}
 
-	out := map[string]scenario{"multiTarget": fanOut, "target": narrowed}
+	out := map[string]any{"multiTarget": fanOut, "target": narrowed, "stop": stopDemo()}
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetIndent("", " ")
 	if err := enc.Encode(out); err != nil {
 		fmt.Fprintln(os.Stderr, "encode PR demo comments:", err)
 		os.Exit(1)
 	}
+}
+
+func stopDemo() stopScenario {
+	const applyID = "apply-example-91"
+	// shop-004 holds the fewest rows, so it has finished when the stop lands.
+	running := [][]int{{22, 15, 18, 29}, {31, 21, 25, 51}, {38, 25, 31, 75}, {45, 30, 37, 100}}
+	stoppedAt := running[len(running)-1]
+	resumed := [][]int{
+		{45, 30, 37, 100},
+		{58, 39, 47, 100},
+		{71, 48, 58, 100},
+		{84, 57, 69, 100},
+		{97, 66, 80, 100},
+		{cuttingOver, 75, 91, 100},
+		{100, 84, cuttingOver, 100},
+		{100, 93, 100, 100},
+		{100, cuttingOver, 100, 100},
+	}
+	complete := []int{100, 100, 100, 100}
+	stopped := rolloutCommentStopped(stoppedAt, 2*time.Minute, false, true)
+	demo := stopScenario{
+		Command: "schemabot apply -e production",
+		Plan:    planComment("", false),
+		Apply:   planComment("", true),
+		Stop:    "schemabot stop " + applyID + " -e production",
+		// Stop and start act on every task of the apply: the targets still
+		// copying stop, and the one that already finished is skipped.
+		StopAck: templates.RenderStopCommandAccepted(templates.StopCommandAcceptedData{
+			ApplyID: applyID, Environment: environment, RequestedBy: requestedBy, StoppedCount: 3, SkippedCount: 1,
+		}),
+		Stopped:   stopped,
+		StoppedAt: rolloutCommentStopped(stoppedAt, 2*time.Minute, true, true),
+		Start:     "schemabot start " + applyID + " -e production",
+		StartAck: templates.RenderStartCommandAccepted(templates.StartCommandAcceptedData{
+			ApplyID: applyID, Environment: environment, RequestedBy: requestedBy, StartedCount: 3, SkippedCount: 1,
+		}),
+		Frozen: templates.RenderResumeSupersededProgressComment(templates.SupersededProgressData{
+			Repo: repository, PR: 42, NewCommentID: 1002, PreviousBody: stopped,
+		}),
+		Complete: rolloutComment(complete, 7*time.Minute, false),
+		Summary:  rolloutComment(complete, 7*time.Minute, true),
+	}
+	for _, percents := range running {
+		demo.Progress = append(demo.Progress, rolloutComment(percents, 0, false))
+	}
+	for _, percents := range resumed {
+		demo.Resumed = append(demo.Resumed, rolloutComment(percents, 0, false))
+	}
+	return demo
 }
