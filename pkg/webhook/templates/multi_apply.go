@@ -117,7 +117,7 @@ func renderMultiDeploymentApplyComment(data MultiDeploymentApplyData, renderedAt
 		writeApplyOptions(&sb, options.DeferCutover, options.SkipRevert, data.Model.State)
 	}
 	groups := groupsWithChanges(data.Model, data.Model.Groups())
-	if g, ok := soleTargetRollout(groups); ok {
+	if g, ok := presentation.SoleTargetRollout(groups); ok {
 		writeTargetRolloutBody(&sb, data, g, budget)
 		writeRolloutFooter(&sb, data)
 		if !state.IsTerminalApplyState(data.Model.State) {
@@ -163,7 +163,7 @@ func renderMultiDeploymentApplySummaryComment(data MultiDeploymentApplyData, bud
 	writeApplyHeader(&sb, ApplyStatusCommentData{State: data.Model.State, Environment: data.Environment, Rollback: data.Rollback})
 	writeAggregateMetadata(&sb, data, currentTimestamp())
 	groups := groupsWithChanges(data.Model, data.Model.Groups())
-	if g, ok := soleTargetRollout(groups); ok {
+	if g, ok := presentation.SoleTargetRollout(groups); ok {
 		writeTargetRolloutBody(&sb, data, g, budget)
 		writeRolloutFooter(&sb, data)
 		return sb.String()
@@ -178,18 +178,6 @@ func renderMultiDeploymentApplySummaryComment(data MultiDeploymentApplyData, bud
 	writeRolloutFooter(&sb, data)
 
 	return sb.String()
-}
-
-// soleTargetRollout returns the apply's one deployment when it addresses
-// several targets. Such an apply has no other deployment to tell it apart
-// from, so its comment carries no per-deployment wrapper: the status is stated
-// once, and the table lines sit directly under it rather than in a section that
-// collapses once the rollout finishes.
-func soleTargetRollout(groups []presentation.Group) (presentation.Group, bool) {
-	if len(groups) == 1 && len(groups[0].Members) > 1 {
-		return groups[0], true
-	}
-	return presentation.Group{}, false
 }
 
 // writeTargetRolloutBody writes a sole multi-target deployment's comment body:

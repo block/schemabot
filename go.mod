@@ -1,6 +1,6 @@
 module github.com/block/schemabot
 
-go 1.26.9
+go 1.26.10
 
 require (
 	github.com/alecthomas/kong v1.16.1
@@ -10,7 +10,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/secretsmanager v1.44.5
 	github.com/aws/aws-sdk-go-v2/service/sts v1.43.3
 	github.com/block/mysql v0.0.0-20260906224346-ee0a93fe50d6
-	github.com/block/pg-sprite v0.3.4-0.20261015205501-93e25cbe6465
+	github.com/block/pg-sprite v0.3.4-0.20261016150733-a9a7ad9dcc9b
 	github.com/block/spirit v0.18.1-0.20261013202624-12a4a2d3e8cd
 	github.com/bradleyfalzon/ghinstallation/v2 v2.18.0
 	github.com/charmbracelet/bubbles v1.0.0

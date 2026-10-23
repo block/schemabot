@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"os/exec"
 	"slices"
 	"strings"
 	"testing"
@@ -187,6 +188,7 @@ func cleanupRolloutState(t *testing.T) {
 	t.Helper()
 	cleanupState(t)
 	dsns := storageDSNs(t)
+	since := time.Now().UTC()
 	t.Cleanup(func() {
 		if !t.Failed() {
 			return
@@ -194,7 +196,52 @@ func cleanupRolloutState(t *testing.T) {
 		for i, plane := range []string{"data plane", "control plane"} {
 			t.Logf("%s storage at failure:\n%s", plane, dumpRolloutRows(dsns[i]))
 		}
+		for _, instance := range []string{"control-plane-mt", "data-plane-mt"} {
+			t.Logf("%s logs since the test started:\n%s", instance, rolloutPodLogs(instance, since))
+		}
 	})
+}
+
+// rolloutPodLogLine reports whether a pod log line belongs in a failure dump:
+// everything at info and above, and the debug lines that say why an operation
+// did or did not start.
+func rolloutPodLogLine(line string) bool {
+	if !strings.Contains(line, `"level":"DEBUG"`) {
+		return true
+	}
+	for _, keep := range []string{"conflict check", "claim", "dispatch", "potentially stale"} {
+		if strings.Contains(line, keep) {
+			return true
+		}
+	}
+	return false
+}
+
+// rolloutPodLogs renders the logs every pod of instance wrote since since,
+// filtered by rolloutPodLogLine. It runs in test cleanup, after the test's own
+// context is cancelled, so it carries its own deadline.
+func rolloutPodLogs(instance string, since time.Time) string {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	pods, err := exec.CommandContext(ctx, "kubectl", "get", "pod", "-n", k8sNamespace, "-l", "app.kubernetes.io/instance="+instance, "-o", "name").Output()
+	if err != nil {
+		return fmt.Sprintf("list pods: %v", err)
+	}
+	var b strings.Builder
+	for pod := range strings.FieldsSeq(string(pods)) {
+		out, err := exec.CommandContext(ctx, "kubectl", "logs", "-n", k8sNamespace, pod, "--since-time="+since.Format(time.RFC3339)).CombinedOutput()
+		if err != nil {
+			fmt.Fprintf(&b, "  %s: kubectl logs: %v\n", pod, err)
+			continue
+		}
+		fmt.Fprintf(&b, "  %s\n", pod)
+		for line := range strings.SplitSeq(string(out), "\n") {
+			if line != "" && rolloutPodLogLine(line) {
+				fmt.Fprintf(&b, "    %s\n", line)
+			}
+		}
+	}
+	return b.String()
 }
 
 // dumpRolloutRows renders the applies, operations, tasks, and control
@@ -209,7 +256,7 @@ func dumpRolloutRows(dsn string) string {
 	defer cancel()
 	queries := []string{
 		"SELECT id, apply_identifier, state, external_id, lease_owner, attempt, updated_at, error_message FROM applies ORDER BY id",
-		"SELECT id, apply_id, operation_key, state, external_id, external_operation_id, lease_owner, lease_token, attempt, started_at, updated_at, error_message FROM apply_operations ORDER BY id",
+		"SELECT id, apply_id, operation_key, state, cutover_policy, on_failure, external_id, external_operation_id, lease_owner, lease_token, attempt, created_at, started_at, updated_at, error_message FROM apply_operations ORDER BY id",
 		"SELECT id, apply_id, apply_operation_id, table_name, state, rows_copied, rows_total, attempt, updated_at FROM tasks ORDER BY id",
 		"SELECT id, apply_id, operation, status, error_message, updated_at FROM apply_control_requests ORDER BY id",
 	}
@@ -312,13 +359,17 @@ func tableOn(t *testing.T, dsn, table string) bool {
 }
 
 const (
-	mtUsersV1   = "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
-	mtUsersV2   = "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  `email` varchar(255) DEFAULT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
-	mtOrdersV1  = "CREATE TABLE `orders` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `user_id` bigint unsigned NOT NULL,\n  `amount` int NOT NULL,\n  `note` varchar(64) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
-	mtOrdersV2  = "CREATE TABLE `orders` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `user_id` bigint unsigned NOT NULL,\n  `amount` int NOT NULL,\n  `note` varchar(64) NOT NULL,\n  PRIMARY KEY (`id`),\n  KEY `idx_user_id` (`user_id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
-	mtOrdersUq  = "CREATE TABLE `orders` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `user_id` bigint unsigned NOT NULL,\n  `amount` int NOT NULL,\n  `note` varchar(64) NOT NULL,\n  PRIMARY KEY (`id`),\n  UNIQUE KEY `uq_note` (`note`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
-	mtAuditV1   = "CREATE TABLE `audit` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `event` varchar(64) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
-	mtOrderRows = 200_000
+	mtUsersV1  = "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+	mtUsersV2  = "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  `email` varchar(255) DEFAULT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+	mtOrdersV1 = "CREATE TABLE `orders` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `user_id` bigint unsigned NOT NULL,\n  `amount` int NOT NULL,\n  `note` varchar(64) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+	mtOrdersV2 = "CREATE TABLE `orders` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `user_id` bigint unsigned NOT NULL,\n  `amount` int NOT NULL,\n  `note` varchar(64) NOT NULL,\n  PRIMARY KEY (`id`),\n  KEY `idx_user_id` (`user_id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+	mtOrdersUq = "CREATE TABLE `orders` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `user_id` bigint unsigned NOT NULL,\n  `amount` int NOT NULL,\n  `note` varchar(64) NOT NULL,\n  PRIMARY KEY (`id`),\n  UNIQUE KEY `uq_note` (`note`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+	// mtOrdersUqShortNote adds the unique index and narrows note, so a row
+	// whose note no longer fits fails the copy itself rather than the checksum
+	// after it.
+	mtOrdersUqShortNote = "CREATE TABLE `orders` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `user_id` bigint unsigned NOT NULL,\n  `amount` int NOT NULL,\n  `note` varchar(16) NOT NULL,\n  PRIMARY KEY (`id`),\n  UNIQUE KEY `uq_note` (`note`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+	mtAuditV1           = "CREATE TABLE `audit` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `event` varchar(64) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+	mtOrderRows         = 200_000
 )
 
 func shardFiles(namespace string, tables map[string]string) map[string]*apitypes.SchemaFiles {
@@ -474,21 +525,115 @@ func TestK8sMultiTarget_ConvergedMemberCompletes(t *testing.T) {
 	}
 }
 
-// Shard 2 has duplicate notes, so a unique index on orders fails there under
-// the default on_failure: halt. Shard 1 is ahead of it in rollout order and
-// cuts over; shard 3 finishes its copy and holds at the cutover barrier rather
-// than cutting over behind the failure, and no shard starts the next table. A
-// cancel releases shard 3 without cutting it over, and the apply settles
-// failed, naming shard 2, whose failed copy stays for a new apply to adopt.
+// After the plan is reviewed, shard 2's orders drifts, so shard 2 refuses the
+// reviewed DDL and fails as soon as it is dispatched, under the default
+// on_failure: halt. Shard 1 cuts over as soon as its own copy is ready. Shard
+// 3 holds a larger table and is claimed at about the moment shard 2 refuses,
+// so the rollout halts it in one of two places: either shard 3 never starts,
+// or it starts, finishes its copy and holds at the cutover barrier until a
+// cancel releases it without cutting it over. Either way nothing cuts over
+// behind the failure, no shard starts the next table, and the apply settles
+// failed, naming shard 2.
 func TestK8sMultiTarget_FailedTargetHaltsRollout(t *testing.T) {
 	ep := testutil.Endpoint(t)
 	dsns := shardDSNs(t, mtShardApp)
 	resetSchema(t, dsns)
 	cleanupRolloutState(t)
 	execOn(t, dsns, mtOrdersV1, mtUsersV1)
-	execOn(t, dsns[1:2], "INSERT INTO orders (user_id, amount, note) VALUES (1, 1, 'dup'), (2, 2, 'dup')")
+	seedOrders(t, dsns[2:], 3*mtCopyRows)
 
 	plan := planRollout(t, ep, mtShardApp, shardFiles(mtShardApp, map[string]string{"orders": mtOrdersUq, "users": mtUsersV2}))
+	execOn(t, dsns[1:2], "ALTER TABLE orders ADD COLUMN extra int DEFAULT NULL")
+	applyID := applyRollout(t, ep, plan.PlanID, nil)
+
+	var halted *apitypes.ProgressResponse
+	testutil.Poll(t, mtRolloutDeadline, testutil.PollInterval,
+		func() bool {
+			p, err := testutil.FetchProgress(ep, applyID)
+			if err != nil {
+				return false
+			}
+			halted = p
+			return state.IsState(p.State, state.SettledApplyStates...) || heldAtBarrierBehindFailure(p)
+		},
+		func() string { return "rollout never halted behind the failure:\n" + describeProgress(halted) },
+	)
+	t.Log("halted:\n" + describeProgress(halted))
+	assert.Equal(t, state.ApplyOperation.Failed, operationStateOn(operationsByStep(halted)[1], mtTargets[1]), describeProgress(halted))
+	assert.Equal(t, state.ApplyOperation.Completed, operationStateOn(operationsByStep(halted)[1], mtTargets[0]), describeProgress(halted))
+	for _, op := range operationsByStep(halted)[2] {
+		assert.True(t, state.IsState(op.State, state.ApplyOperation.Pending), "step 2 on %s did not start behind the failure, got %s", op.Target, op.State)
+	}
+	assert.False(t, indexOn(t, dsns[2], "orders", "uq_note"), "shard 3 does not cut over behind the failure")
+
+	p := halted
+	if heldAtBarrierBehindFailure(halted) {
+		cancelResp, err := client.CallCancelAPI(ep, mtEnvironment, applyID)
+		require.NoError(t, err, "cancel")
+		require.True(t, cancelResp.Accepted, "cancel not accepted: %s", cancelResp.ErrorMessage)
+		p = waitForSettled(t, ep, applyID, mtRolloutDeadline, nil)
+		assert.Equal(t, state.ApplyOperation.Cancelled, operationStateOn(operationsByStep(p)[1], mtTargets[2]), describeProgress(p))
+	} else {
+		assert.Equal(t, state.ApplyOperation.Pending, operationStateOn(operationsByStep(p)[1], mtTargets[2]), "shard 3 never started behind the failure: %s", describeProgress(p))
+	}
+	t.Log("settled:\n" + describeProgress(p))
+	require.Equal(t, state.Apply.Failed, p.State, describeProgress(p))
+	assert.Contains(t, p.ErrorMessage, mtTargets[1], "the failure names the target")
+	assert.True(t, indexOn(t, dsns[0], "orders", "uq_note"), "shard 1 cut over ahead of the failure")
+	assert.False(t, indexOn(t, dsns[2], "orders", "uq_note"), "shard 3 never cut over behind the failure")
+	for i, dsn := range dsns {
+		assert.False(t, testutil.ColumnExists(t, dsn, "users", "email"), "users is held after the failed table on %s", mtTargets[i])
+	}
+	// Shard 1 cut over, and a cancel releases a copy shard 3 started,
+	// asynchronously. Shard 2 refused the reviewed DDL before it copied
+	// anything.
+	released := []int{0, 1, 2}
+	testutil.Poll(t, testutil.PollDeadline, time.Second,
+		func() bool {
+			for _, i := range released {
+				if len(shadowTables(t, dsns[i], "orders")) > 0 {
+					return false
+				}
+			}
+			return true
+		},
+		func() string {
+			var b strings.Builder
+			for _, i := range released {
+				b.WriteString(mtTargets[i] + ": " + strings.Join(shadowTables(t, dsns[i], "orders"), ",") + "\n")
+			}
+			return "shadow tables left on a shard that cut over, refused, or was cancelled:\n" + b.String()
+		},
+	)
+	assert.False(t, indexOn(t, dsns[1], "orders", "uq_note"), "shard 2 refused the reviewed DDL")
+}
+
+// mtFailedCopyRows sizes the failing shard's table so its copy is still
+// running when the drive starts the next shard, and reaches the failing row,
+// inserted last, well before the larger shard's copy is ready.
+const mtFailedCopyRows = mtCopyRows
+
+// Shard 2 has a note too long for the narrowed column in its last row, so its
+// copy of orders fails near the end, under the default on_failure: halt. A
+// duplicate would only fail the checksum after the copy, whose retries are
+// paced in seconds and outlast a larger shard's copy. The drive starts the
+// shards in order. Shard 1 has nothing to copy and cuts over ahead of the
+// failure. Shard 2's copy fails while shard 3 is still copying a table three
+// times its size. Once shard 3's copy is ready it holds at the cutover barrier
+// behind the failure instead of cutting over. A cancel releases shard 3
+// without cutting it over, and the apply settles failed, naming shard 2, whose
+// failed copy stays on the target for a new apply to adopt.
+func TestK8sMultiTarget_FailedCopyHoldsLaterTargetAtBarrier(t *testing.T) {
+	ep := testutil.Endpoint(t)
+	dsns := shardDSNs(t, mtShardApp)
+	resetSchema(t, dsns)
+	cleanupRolloutState(t)
+	execOn(t, dsns, mtOrdersV1, mtUsersV1)
+	seedOrders(t, dsns[1:2], mtFailedCopyRows)
+	execOn(t, dsns[1:2], "INSERT INTO orders (user_id, amount, note) VALUES (1, 1, 'a note longer than sixteen')")
+	seedOrders(t, dsns[2:], 3*mtCopyRows)
+
+	plan := planRollout(t, ep, mtShardApp, shardFiles(mtShardApp, map[string]string{"orders": mtOrdersUqShortNote, "users": mtUsersV2}))
 	applyID := applyRollout(t, ep, plan.PlanID, nil)
 
 	var held *apitypes.ProgressResponse
@@ -499,12 +644,11 @@ func TestK8sMultiTarget_FailedTargetHaltsRollout(t *testing.T) {
 				return false
 			}
 			held = p
-			ops := operationsByStep(p)[1]
-			return state.IsState(p.State, state.Apply.RunningDegraded) &&
-				operationStateOn(ops, mtTargets[1]) == state.ApplyOperation.Failed &&
-				operationStateOn(ops, mtTargets[2]) == state.ApplyOperation.WaitingForCutover
+			return heldAtBarrierBehindFailure(p)
 		},
-		func() string { return "rollout never held shard 3 behind the failure:\n" + describeProgress(held) },
+		func() string {
+			return "rollout never held shard 3 behind shard 2's failed copy:\n" + describeProgress(held)
+		},
 	)
 	t.Log("held:\n" + describeProgress(held))
 	assert.Equal(t, state.ApplyOperation.Completed, operationStateOn(operationsByStep(held)[1], mtTargets[0]), describeProgress(held))
@@ -548,6 +692,15 @@ func TestK8sMultiTarget_FailedTargetHaltsRollout(t *testing.T) {
 		},
 	)
 	assert.NotEmpty(t, shadowTables(t, dsns[1], "orders"), "the failed copy stays on %s for a new apply to adopt", mtTargets[1])
+}
+
+// heldAtBarrierBehindFailure reports whether p shows a halt rollout holding
+// shard 3 at the cutover barrier behind shard 2's failure.
+func heldAtBarrierBehindFailure(p *apitypes.ProgressResponse) bool {
+	ops := operationsByStep(p)[1]
+	return state.IsState(p.State, state.Apply.RunningDegraded) &&
+		operationStateOn(ops, mtTargets[1]) == state.ApplyOperation.Failed &&
+		operationStateOn(ops, mtTargets[2]) == state.ApplyOperation.WaitingForCutover
 }
 
 // operationStateOn returns the state of the operation in ops on target, or ""

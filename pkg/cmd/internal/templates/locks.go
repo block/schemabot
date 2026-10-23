@@ -37,7 +37,7 @@ func WriteLockReleased(database, dbType string) {
 // left to run.
 func WriteLockKept(database, dbType, reason string) {
 	fmt.Printf("🔒 Lock kept for %s (%s) despite --yield: %s.\n", database, dbType, reason)
-	fmt.Printf("   Release it once nothing is left to run: %s unlock -d %s -t %s\n", cliname.Name(), database, dbType)
+	fmt.Printf("   Release it once nothing is left to run: %s\n", cliname.Command("unlock", "-d", database, "-t", dbType))
 }
 
 // WriteLockForceReleased writes the force release message.
@@ -78,8 +78,8 @@ func WriteLockConflict(data LockConflictData) {
 	fmt.Println()
 	fmt.Println("Options:")
 	fmt.Println("  • Wait for the current schema change to complete")
-	fmt.Printf("  • Ask the lock owner to release: %s unlock -d %s\n", cliname.Name(), data.Database)
-	fmt.Printf("  • Force unlock: %s unlock -d %s --force\n", cliname.Name(), data.Database)
+	fmt.Printf("  • Ask the lock owner to release: %s\n", cliname.Command("unlock", "-d", data.Database))
+	fmt.Printf("  • Force unlock: %s\n", cliname.Command("unlock", "-d", data.Database, "--force"))
 	fmt.Println()
 }
 
@@ -106,8 +106,8 @@ func WriteLocksList(locks []LockData) {
 	}
 
 	fmt.Println("To release a lock:")
-	fmt.Printf("  %s unlock -d <database> -t <type>\n", cliname.Name())
-	fmt.Printf("  %s unlock -d <database> -t <type> --force  # override ownership\n", cliname.Name())
+	fmt.Printf("  %s\n", cliname.Command("unlock", "-d", "<database>", "-t", "<type>"))
+	fmt.Printf("  %s  # override ownership\n", cliname.Command("unlock", "-d", "<database>", "-t", "<type>", "--force"))
 }
 
 // WriteNoLockFound writes the message when a lock doesn't exist.
@@ -122,7 +122,7 @@ func WriteNoLockFound(database, dbType string) {
 // the wrong namespace — point them at the lock that actually exists.
 func WriteLockExistsUnderOtherType(database, requestedType, foundType string) {
 	fmt.Printf("No lock found for %s (%s), but a %s lock exists for this database.\n", database, requestedType, foundType)
-	fmt.Printf("Release it with: %s unlock -d %s -t %s\n", cliname.Name(), database, foundType)
+	fmt.Printf("Release it with: %s\n", cliname.Command("unlock", "-d", database, "-t", foundType))
 }
 
 // WriteLockTypeScanFailed writes the message when the check for locks under

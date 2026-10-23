@@ -176,7 +176,7 @@ func (r *StaticResolver) ResolveTarget(ctx context.Context, req Request) (*Targe
 	}
 	entry, ok := r.targets[req.Target]
 	if !ok {
-		return nil, fmt.Errorf("target %q is not configured", req.Target)
+		return nil, fmt.Errorf("target %q is not configured: %w", req.Target, ErrTargetNotFound)
 	}
 	if strings.TrimSpace(req.DatabaseType) != "" {
 		requestedType := canonicalDatabaseType(req.DatabaseType)

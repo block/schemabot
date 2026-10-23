@@ -31,6 +31,9 @@ type ReviewGateResult struct {
 	// head, so the review-required comment can say why an approval visible on
 	// the PR does not count.
 	ChangedApprovers []string
+	// ChangedPaths are the schema inputs whose change differs between those
+	// approvals and the head, so the comment can name what changed.
+	ChangedPaths []string
 	// UncomparedApprovers are authorized reviewers whose approval was given
 	// on an earlier commit the gate could not compare with the head. Nothing
 	// proves such an approval still describes the head, so it does not count,
@@ -89,6 +92,7 @@ func (h *Handler) enforceReviewGate(ctx context.Context, client *ghclient.Instal
 			OtherReviewers:      gateResult.OtherReviewers,
 			PRAuthor:            gateResult.PRAuthor,
 			ChangedApprovers:    gateResult.ChangedApprovers,
+			ChangedPaths:        gateResult.ChangedPaths,
 			UncomparedApprovers: gateResult.UncomparedApprovers,
 			BaseRef:             gateResult.BaseRef,
 			DefaultBranch:       gateResult.DefaultBranch,
@@ -206,7 +210,7 @@ func (h *Handler) checkReviewGate(ctx context.Context, client *ghclient.Installa
 		compareStatements: h.statementComparerFor(repo, pr, database, environment, schema.Type),
 		verdicts:          make(map[string]approvalVerdict),
 	}
-	var changedApprovers, uncomparedApprovers []string
+	var changedApprovers, changedPaths, uncomparedApprovers []string
 	for _, approval := range validApprovals {
 		reviewer := approval.User
 		matched, principal, err := policy.Matches(ctx, client, reviewer)
@@ -218,7 +222,7 @@ func (h *Handler) checkReviewGate(ctx context.Context, client *ghclient.Installa
 				"repo", repo, "pr", pr, "database", database, "reviewer", reviewer)
 			continue
 		}
-		covers, err := h.approvalCoversHead(ctx, client, &coverage, approval)
+		covers, differingPath, err := h.approvalCoversHead(ctx, client, &coverage, approval)
 		// An approval that cannot be compared does not count, but another
 		// approval may still cover the head, so the rest are still checked.
 		if errors.Is(err, errApprovalNotComparable) {
@@ -232,6 +236,9 @@ func (h *Handler) checkReviewGate(ctx context.Context, client *ghclient.Installa
 		// like a reviewer who has not approved.
 		if !covers {
 			changedApprovers = append(changedApprovers, reviewer)
+			if differingPath != "" {
+				changedPaths = appendUniqueString(changedPaths, differingPath)
+			}
 			continue
 		}
 		h.logger.Info("review gate: approved",
@@ -261,6 +268,7 @@ func (h *Handler) checkReviewGate(ctx context.Context, client *ghclient.Installa
 		OtherReviewers:      policy.OtherReviewers,
 		PRAuthor:            prInfo.User,
 		ChangedApprovers:    changedApprovers,
+		ChangedPaths:        changedPaths,
 		UncomparedApprovers: uncomparedApprovers,
 		BaseRef:             prInfo.BaseRef,
 		DefaultBranch:       prInfo.DefaultBranch,
@@ -270,7 +278,10 @@ func (h *Handler) checkReviewGate(ctx context.Context, client *ghclient.Installa
 // approvalVerdict is the cached outcome of comparing one approved commit
 // with the head: whether it covers the head, or why it cannot be compared.
 type approvalVerdict struct {
-	covers        bool
+	covers bool
+	// differingPath is the first schema input whose change differs, when
+	// the approval does not cover the head.
+	differingPath string
 	notComparable error
 }
 
@@ -335,27 +346,27 @@ func (h *Handler) statementComparerFor(repo string, pr int, database, environmen
 // is returned as an errApprovalNotComparable error. A comparison GitHub could
 // not answer — it was unavailable, or the evaluation was cancelled — is
 // returned as an error too, and never cached as a verdict.
-func (h *Handler) approvalCoversHead(ctx context.Context, client *ghclient.InstallationClient, c *approvalCoverage, approval *ghclient.ReviewInfo) (bool, error) {
+func (h *Handler) approvalCoversHead(ctx context.Context, client *ghclient.InstallationClient, c *approvalCoverage, approval *ghclient.ReviewInfo) (covers bool, differingPath string, err error) {
 	approvedSHA := approval.CommitID
 	if approvedSHA == "" {
 		h.logger.Warn("review gate: cannot compare an approval with the head because GitHub reports no commit for it",
 			"repo", c.repo, "pr", c.pr, "database", c.database, "reviewer", approval.User,
 			"head_sha", c.headSHA)
-		return false, fmt.Errorf("review gate for %s#%d database %q: approval by %s has no commit: %w",
+		return false, "", fmt.Errorf("review gate for %s#%d database %q: approval by %s has no commit: %w",
 			c.repo, c.pr, c.database, approval.User, errApprovalNotComparable)
 	}
 	if approvedSHA == c.headSHA {
-		return true, nil
+		return true, "", nil
 	}
-	if verdict, ok := c.verdicts[approvedSHA]; ok {
-		return verdict.covers, verdict.notComparable
+	verdict, ok := c.verdicts[approvedSHA]
+	if !ok {
+		verdict, err = h.schemaChangeUnchangedSince(ctx, client, c, approval)
+		if err != nil {
+			return false, "", err
+		}
+		c.verdicts[approvedSHA] = verdict
 	}
-	verdict, err := h.schemaChangeUnchangedSince(ctx, client, c, approval)
-	if err != nil {
-		return false, err
-	}
-	c.verdicts[approvedSHA] = verdict
-	return verdict.covers, verdict.notComparable
+	return verdict.covers, verdict.differingPath, verdict.notComparable
 }
 
 // schemaChangeUnchangedSince compares the PR's change to the database's schema
@@ -401,7 +412,7 @@ func (h *Handler) schemaChangeUnchangedSince(ctx context.Context, client *ghclie
 			"base_is_default_branch", comparison.BaseIsDefaultBranch,
 			"statement_compared_paths", comparison.StatementComparedPaths,
 			"differing_path", comparison.DifferingPath)
-		return approvalVerdict{}, nil
+		return approvalVerdict{differingPath: comparison.DifferingPath}, nil
 	}
 	h.logger.Info("review gate: approval on an earlier commit counts because the PR's schema change is the same at it and the head",
 		"repo", c.repo, "pr", c.pr, "database", c.database, "reviewer", approval.User,

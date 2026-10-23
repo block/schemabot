@@ -62,13 +62,13 @@ func TestRenderMultiDeploymentApplyComment_BarrierInProgress(t *testing.T) {
 	assert.NotContains(t, out, "schemabot cutover")
 
 	// Per-deployment summary lines, in resolved order, with derived labels.
-	assert.Contains(t, out, "- 🟢 `eu` — ready for cutover — next in order")
+	assert.Contains(t, out, "- 🟢 `eu` — ready for cutover")
 	assert.Contains(t, out, "- 🔄 `us` — running table copy")
 	assert.Contains(t, out, "- ⏳ `au` — waiting for us")
 	assert.Contains(t, out, "- ⏳ `ca` — waiting for us")
 
 	// Active/ready deployments default open; queued ones default collapsed.
-	assert.Contains(t, out, "<details open>\n<summary>🟢 eu — ready for cutover — next in order</summary>")
+	assert.Contains(t, out, "<details open>\n<summary>🟢 eu — ready for cutover</summary>")
 	assert.Contains(t, out, "<details open>\n<summary>🔄 us — running table copy</summary>")
 	assert.Contains(t, out, "<details>\n<summary>⏳ au — waiting for us</summary>")
 	assert.Contains(t, out, "<details>\n<summary>⏳ ca — waiting for us</summary>")
@@ -687,7 +687,7 @@ func TestRenderMultiDeploymentApplyComment_RollsUpADeploymentsTargets(t *testing
 	assert.Contains(t, out, "<details open>\n<summary>🔄 primary — 1 completed, 2 running (3 targets)</summary>\n<dl><dd>\n\n")
 	assert.Contains(t, out, "**`orders`**: "+ui.ProgressBarRowCopy(53)+" 53%\n\n```sql\nALTER TABLE `orders` ADD COLUMN `note` text;\n```\n"+
 		"- Rows: 1,600 / 3,000 · ETA: "+ui.FormatETA(420)+"\n"+
-		"- Targets: 3 (2 copying, 1 complete)\n  - ◉ `testapp-003`: 18.00% · 180 / 1,000 rows\n  - ◉ `testapp-002`: 42.00% · 420 / 1,000 rows\n  - ✓ `testapp-001`: 1,000 rows\n")
+		"- Targets: 3 (2 copying, 1 complete)\n  - ✓ `testapp-001`: 1,000 rows\n  - ◉ `testapp-002`: 42.00% · 420 / 1,000 rows\n  - ◉ `testapp-003`: 18.00% · 180 / 1,000 rows\n")
 
 	// The shared DDL renders once for primary's three targets and once in
 	// eu-west's own body; no target gets a body of its own.
@@ -824,19 +824,26 @@ func TestRenderMultiDeploymentApplyComment_SoleGroupCutDDLSpeaksOnlyForReporting
 // whose every target failed still fits in one comment; the <summary> counts
 // carry the total.
 func TestRenderMultiDeploymentApplyComment_RolledUpFailedTargetsAreNamed(t *testing.T) {
-	var ops []presentation.Operation
-	var details []*ApplyStatusCommentData
-	for i := range failedTargetRowLimit + 5 {
-		target := fmt.Sprintf("testapp-%03d", i)
-		ops = append(ops, presentation.Operation{Deployment: "primary", Target: target, State: so.Failed, Parallel: true, ContinueOnFailure: true, Error: "Error 1062: Duplicate entry | for key"})
-		details = append(details, targetDetail(target, state.Task.Failed, addNote, 0))
+	render := func(failed int) string {
+		var ops []presentation.Operation
+		var details []*ApplyStatusCommentData
+		for i := range failed {
+			target := fmt.Sprintf("testapp-%03d", i)
+			ops = append(ops, presentation.Operation{Deployment: "primary", Target: target, State: so.Failed, Parallel: true, ContinueOnFailure: true, Error: "Error 1062: Duplicate entry | for key"})
+			details = append(details, targetDetail(target, state.Task.Failed, addNote, 0))
+		}
+		return renderTargets(presentation.Derive(ops), details...)
 	}
-	out := renderTargets(presentation.Derive(ops), details...)
 
+	out := render(failedTargetRowLimit + 5)
 	assert.Contains(t, out, "\n❌ Rolled out to no targets, 25 failed\n")
 	assert.Contains(t, out, "\n| Target | Status |\n| --- | --- |\n| `testapp-000` | ❌ failed — Error 1062: Duplicate entry / for key |\n")
 	assert.Equal(t, failedTargetRowLimit, strings.Count(out, "| ❌ failed"))
 	assert.Contains(t, out, "\n…and 5 more failed targets.\n")
+
+	out = render(failedTargetRowLimit + 1)
+	assert.Equal(t, failedTargetRowLimit, strings.Count(out, "| ❌ failed"))
+	assert.Contains(t, out, "\n…and 1 more failed target.\n", out)
 }
 
 // A table copying on several targets shows its planned size summed across
@@ -875,21 +882,89 @@ func TestRenderMultiDeploymentApplyComment_RolledUpTableSizeTotalsTheTargets(t *
 	assert.Contains(t, out, "- Rows: 750 / 2,000 across 2 of 3 targets · ~5.0 GB across all 3 targets · ETA: "+ui.FormatETA(500)+"\n")
 }
 
+// A target that has not reported its copy yet counts toward the table's rows
+// by the plan's estimate, so the total spans every target from the start. The
+// estimate makes the total approximate, and the ETA a floor, since the queued
+// target's copy is still ahead. The bar is the rows copied over that total,
+// so it does not read the target already copying as most of the work, and it
+// leads from the copy's start, at 0% with the total ahead, and each target
+// still to run stays queued with its own estimate beside it. Before any
+// target starts, the table shows the estimate summed across them.
+func TestRenderMultiDeploymentApplyComment_QueuedTargetsCountByPlannedRows(t *testing.T) {
+	queued := func(database string, rows int64) *ApplyStatusCommentData {
+		detail := targetDetail(database, state.Task.Pending, addNote, 0)
+		detail.State = state.Apply.Pending
+		detail.Tables[0].RowsTotal, detail.Tables[0].ETASeconds = 0, 0
+		detail.Tables[0].EstimatedRows = &rows
+		return detail
+	}
+	ops := []presentation.Operation{
+		{Deployment: "primary", Target: "testapp-001", State: so.Running},
+		{Deployment: "primary", Target: "testapp-002", State: so.Pending},
+		{Deployment: "primary", Target: "testapp-003", State: so.Pending},
+	}
+
+	out := renderTargets(presentation.Derive(ops),
+		targetDetail("testapp_001", state.Task.Running, addNote, 500),
+		queued("testapp_002", 1_200),
+		queued("testapp_003", 1_800),
+	)
+	assert.Contains(t, out, "**`orders`**: "+ui.ProgressBarRowCopy(12)+" 12%\n")
+	assert.Contains(t, out, "- Rows: 500 / ~4k · ETA: ≥ "+ui.FormatETA(500)+"\n")
+
+	ops[0].State = so.Pending
+	out = renderTargets(presentation.Derive(ops),
+		queued("testapp_001", 1_000),
+		queued("testapp_002", 1_200),
+		queued("testapp_003", 1_800),
+	)
+	assert.Contains(t, out, "- Rows: ~4k across 3 targets\n")
+
+	ops[0].State = so.Running
+	started := targetDetail("testapp_001", state.Task.Running, addNote, 0)
+	started.Tables[0].RowsCopied, started.Tables[0].ETASeconds = 0, 0
+	out = renderTargets(presentation.Derive(ops), started, queued("testapp_002", 1_200), queued("testapp_003", 1_800))
+	assert.Contains(t, out, "**`orders`**: "+ui.ProgressBarRowCopy(0)+" 0%\n", "the copy has started, so the bar leads with the rows ahead")
+	assert.Contains(t, out, "- Rows: 0 / ~4k\n")
+	assert.Contains(t, out, "  - ○ `testapp-002`: queued · ~1.2k rows\n  - ○ `testapp-003`: queued · ~1.8k rows\n", "a target still to run stays queued and says how much it will copy")
+}
+
+// A target past its copy that reports no rows copied an empty table, so its
+// zero is the engine's answer: the plan's estimate does not stand in for it,
+// and the table's total is the rows the targets reported.
+func TestRenderMultiDeploymentApplyComment_PostCopyZeroIsNotEstimated(t *testing.T) {
+	emptyTable := targetDetail("testapp_002", state.Task.WaitingForCutover, addNote, 0)
+	emptyTable.Tables[0].RowsCopied, emptyTable.Tables[0].RowsTotal, emptyTable.Tables[0].ETASeconds = 0, 0, 0
+	stale := int64(900)
+	emptyTable.Tables[0].EstimatedRows = &stale
+	ops := []presentation.Operation{
+		{Deployment: "primary", Target: "testapp-001", State: so.Running},
+		{Deployment: "primary", Target: "testapp-002", State: so.WaitingForCutover},
+	}
+
+	out := renderTargets(presentation.Derive(ops),
+		targetDetail("testapp_001", state.Task.Running, addNote, 500),
+		emptyTable,
+	)
+	assert.Contains(t, out, "- Rows: 500 / 1,000 · ETA: "+ui.FormatETA(500)+"\n")
+	assert.NotContains(t, out, "/ ~")
+}
+
 func TestTargetsTableBytes(t *testing.T) {
 	one, two := int64(1_500_000_000), int64(2_000_000_000)
 	cells := []TableProgressData{{EstimatedBytes: &one}, {EstimatedBytes: &two}}
 
-	total := targetsTableBytes(cells, 0)
+	total := targetsTableBytes(cells)
 	require.NotNil(t, total)
 	assert.Equal(t, int64(3_500_000_000), *total)
-	assert.Nil(t, targetsTableBytes(cells, 1), "a silent target has no estimate to add")
-	assert.Nil(t, targetsTableBytes([]TableProgressData{{EstimatedBytes: &one}, {}}, 0), "a target without an estimate leaves the total unknown")
-	assert.Nil(t, targetsTableBytes(nil, 0))
+	assert.Nil(t, targetsTableBytes([]TableProgressData{{EstimatedBytes: &one}, {}}), "a target without an estimate leaves the total unknown")
+	assert.Nil(t, targetsTableBytes(nil))
 }
 
 // One failed target among several still copying does not hide their progress:
-// the table keeps its bar from the targets that are copying or done, leaves the
-// failed target's rows out of it, and lists the failed target first.
+// the table keeps its bar at its share across all three targets, the failed
+// one counting as not done, sums the rows of the targets copying or done, and
+// lists every target in rollout order.
 func TestRenderMultiDeploymentApplyComment_RolledUpFailureKeepsTheOthersProgress(t *testing.T) {
 	ops := []presentation.Operation{
 		parallelTarget("primary", "testapp-001", so.Completed),
@@ -902,9 +977,9 @@ func TestRenderMultiDeploymentApplyComment_RolledUpFailureKeepsTheOthersProgress
 		targetDetail("testapp_003", state.Task.Failed, addNote, 900),
 	)
 
-	assert.Contains(t, out, "**`orders`**: "+ui.ProgressBarRowCopy(75)+" 75%\n")
+	assert.Contains(t, out, "**`orders`**: "+ui.ProgressBarRowCopy(50)+" 50%\n")
 	assert.Contains(t, out, "- Rows: 1,500 / 2,000 across 2 of 3 targets · ETA: "+ui.FormatETA(500)+"\n"+
-		"- Targets: 3 (1 failed, 1 copying, 1 complete)\n  - ✗ `testapp-003`: failed\n  - ◉ `testapp-002`: 50.00% · 500 / 1,000 rows\n  - ✓ `testapp-001`: 1,000 rows\n")
+		"- Targets: 3 (1 failed, 1 copying, 1 complete)\n  - ✓ `testapp-001`: 1,000 rows\n  - ◉ `testapp-002`: 50.00% · 500 / 1,000 rows\n  - ✗ `testapp-003`: failed\n")
 	assert.Contains(t, out, "| `testapp-003` | ❌ failed |")
 
 	// A target that has yet to report its rows can only add time, so while one
@@ -1003,7 +1078,7 @@ func TestRenderMultiDeploymentApplyComment_RolledUpTableWithTwoStatements(t *tes
 
 	assert.Contains(t, out, "**`orders`**: "+ui.ProgressBarRowCopy(70)+" 70%\n")
 	assert.Contains(t, out, "- Rows: 1,400 / 2,000 · ETA: "+ui.FormatETA(800)+"\n"+
-		"- Targets: 2 (2 copying)\n  - ◉ `testapp-002`: 60.00% · 600 / 1,000 rows\n  - ◉ `testapp-001`: 80.00% · 800 / 1,000 rows\n")
+		"- Targets: 2 (2 copying)\n  - ◉ `testapp-001`: 80.00% · 800 / 1,000 rows\n  - ◉ `testapp-002`: 60.00% · 600 / 1,000 rows\n")
 	assert.Contains(t, out, "**`orders`**: "+ui.ProgressBarRowCopy(20)+" 20%\n")
 	assert.Contains(t, out, "- Rows: 400 / 2,000 · ETA: "+ui.FormatETA(300)+"\n"+
 		"- Targets: 2 (2 copying)\n  - ◉ `testapp-001`: 10.00% · 100 / 1,000 rows\n  - ◉ `testapp-002`: 30.00% · 300 / 1,000 rows\n")
@@ -1858,9 +1933,10 @@ func tablesDetail(database string, tables ...TableProgressData) *ApplyStatusComm
 // its three tables, lists its tables by where the rollout is rather than in
 // schema order: the table a target is copying first, then the one finished on
 // that target and queued on the other three, then the one no target has
-// started. The table finished on one target says so rather than reading as
-// queued, and the copying table's bar is its share of all four targets, not
-// the one target that has reported rows.
+// started. The table finished on one target keeps its bar at that target's
+// share of all four rather than reading as queued or complete, and the copying
+// table's bar is its share of all four targets, not the one target that has
+// reported rows.
 func TestRenderMultiDeploymentApplyComment_RolledUpTablesListWhereTheRolloutIs(t *testing.T) {
 	queuedTarget := func(database string) *ApplyStatusCommentData {
 		return tablesDetail(database,
@@ -1887,7 +1963,7 @@ func TestRenderMultiDeploymentApplyComment_RolledUpTablesListWhereTheRolloutIs(t
 	assert.Less(t, refunds, orders, "the copying table leads")
 	assert.Less(t, orders, invoices, "the table finished on one target leads the one no target has started")
 
-	assert.Contains(t, out, "**`orders`**: ✅ Complete on 1 of 4 targets · 3 queued\n")
+	assert.Contains(t, out, "**`orders`**: "+ui.ProgressBarRowCopy(25)+" 25%\n")
 	assert.Contains(t, out, "**`refunds`**: "+ui.ProgressBarRowCopy(24)+" 24%\n")
 	assert.Contains(t, out, "- Rows: 970 / 1,000 across 1 of 4 targets")
 	assert.Contains(t, out, "- Targets: 4 (1 copying, 3 queued)\n  - ◉ `testapp-001`: 97.00% · 970 / 1,000 rows\n  - ○ `testapp-002`: queued\n  - ○ `testapp-003`: queued\n  - ○ `testapp-004`: queued\n",
@@ -1928,15 +2004,16 @@ func TestRenderMultiDeploymentApplyComment_UnreportedTargetsRankAsQueued(t *test
 }
 
 // A table in its revert window on one target and queued on the other has
-// completed where it ran, so its line counts that target as complete, the way
-// the CLI does. Once every target is in its revert window, the line keeps the
+// completed where it ran, so its bar counts that target in full and its list
+// marks it done. Once every target is in its revert window, the line keeps the
 // revert window's wording.
 func TestRenderMultiDeploymentApplyComment_RevertWindowTargetCountsAsComplete(t *testing.T) {
 	partial := renderTargets(presentation.Derive(rollingTargets(2)),
 		tablesDetail("testapp_001", TableProgressData{TableName: "orders", Status: state.Task.RevertWindow, RowsCopied: 1000}),
 		tablesDetail("testapp_002", TableProgressData{TableName: "orders", Status: state.Task.Pending}),
 	)
-	assert.Contains(t, partial, "**`orders`**: ✅ Complete on 1 of 2 targets · 1 queued\n")
+	assert.Contains(t, partial, "**`orders`**: "+ui.ProgressBarRowCopy(50)+" 50%\n")
+	assert.Contains(t, partial, "  - ● `testapp-001`: revert window open\n  - ○ `testapp-002`: queued\n")
 
 	everywhere := renderTargets(presentation.Derive(rollingTargets(2)),
 		tablesDetail("testapp_001", TableProgressData{TableName: "orders", Status: state.Task.RevertWindow, RowsCopied: 1000}),
@@ -1946,15 +2023,10 @@ func TestRenderMultiDeploymentApplyComment_RevertWindowTargetCountsAsComplete(t 
 	assert.NotContains(t, everywhere, "Complete on")
 }
 
-// While a table is copying, the list under its rows names each target the way
-// the sharded comment lists a table's shards: the copying target with its
-// progress, and a target that has not reported yet as queued. Past the inline
-// limit the list names only the failed and the slowest copying targets, and
-
 // A rolling rollout of `refunds` across four targets where testapp-001 has
 // finished it, and the other targets have not reported progress or report it
 // queued. A target with no progress reported has not started the table, so the
-// line counts it among the queued rather than reading complete on every target
+// bar counts it as nothing done rather than reading complete on every target
 // that reported.
 func TestRenderMultiDeploymentApplyComment_RolledUpTableCountsUnreportedTargetsAsQueued(t *testing.T) {
 	refunds := func(st string, copied int64) TableProgressData {
@@ -1967,16 +2039,22 @@ func TestRenderMultiDeploymentApplyComment_RolledUpTableCountsUnreportedTargetsA
 			tablesDetail("testapp_001", refunds(state.Task.Completed, 1000)),
 			tablesDetail("testapp_002", refunds(state.Task.Pending, 0)),
 		)
-		assert.Contains(t, out, "**`refunds`**: ✅ Complete on 1 of 4 targets · 3 queued\n")
+		assert.Contains(t, out, "**`refunds`**: "+ui.ProgressBarRowCopy(25)+" 25%\n")
+		assert.Contains(t, out, "- Targets: 4 (3 queued, 1 complete)\n")
 	})
 	t.Run("only the finished target reported", func(t *testing.T) {
 		out := renderTargets(presentation.Derive(ops), tablesDetail("testapp_001", refunds(state.Task.Completed, 1000)))
-		assert.Contains(t, out, "**`refunds`**: ✅ Complete on 1 of 4 targets · 3 queued\n")
+		assert.Contains(t, out, "**`refunds`**: "+ui.ProgressBarRowCopy(25)+" 25%\n")
 		assert.NotContains(t, out, "Complete (1 targets)")
 	})
 }
 
-// its heading counts the rest, so a wide rollout stays a few lines per table.
+// While a table is copying, the list under its rows names each target the way
+// the sharded comment lists a table's shards: the copying target with its
+// progress, and a target that has not reported yet as queued. Past the inline
+// limit the list names only the failed targets, the slowest copying targets
+// and the targets working past the copy, and its heading counts the rest, so a
+// wide rollout stays a few lines per table.
 func TestRenderMultiDeploymentApplyComment_RolledUpTargetListNamesEveryTarget(t *testing.T) {
 	refunds := func(st string, copied int64) TableProgressData {
 		return TableProgressData{TableName: "refunds", Status: st, RowsCopied: copied, PercentComplete: int(copied / 10)}
@@ -2000,18 +2078,6 @@ func TestRenderMultiDeploymentApplyComment_RolledUpTargetListNamesEveryTarget(t 
 		assert.Contains(t, out, fmt.Sprintf("- Targets: %d (1 copying, %d queued, 1 complete)\n  - ◉ `testapp-002`: 31.00%% · 310 / 1,000 rows\n\n", n, n-2))
 		assert.NotContains(t, out, "`testapp-003`", "past the inline limit a queued target is only counted")
 	})
-}
-
-// A table runs on three targets: orders-001 finished a direct ALTER and is in
-// its revert window with no rows copied, orders-002 has copied half its rows,
-// and orders-003 has reported nothing. The bar counts orders-001 as done, the
-// way the line's coverage does, so the table reads half done.
-func TestTargetSharePercentCountsTheRevertWindowAsDone(t *testing.T) {
-	cells := []TableProgressData{
-		{TableName: "orders", Status: state.Task.RevertWindow},
-		{TableName: "orders", Status: state.Task.Running, RowsCopied: 500, RowsTotal: 1000},
-	}
-	assert.Equal(t, 50, targetSharePercent(cells, 1))
 }
 
 // steppedTarget is a target's row for one table of a rollout run table by
@@ -2064,7 +2130,7 @@ func TestRenderMultiDeploymentApplyComment_StoppedTableListsWhereEachTargetStopp
 	)
 
 	assert.Contains(t, out, "**`orders`**: ⏹️ Stopped\n", "%s", out)
-	assert.Contains(t, out, "- Targets: 2 (1 stopped, 1 complete)\n  - ○ `testapp-002`: stopped at 40.00% · 400 / 1,000 rows\n", "%s", out)
+	assert.Contains(t, out, "- Targets: 2 (1 stopped, 1 complete)\n  - ✓ `testapp-001`: 1,000 rows\n  - ○ `testapp-002`: stopped at 40.00% · 400 / 1,000 rows\n", "%s", out)
 }
 
 // orders rolls out to four targets. testapp-002 fails, and the operator stops
@@ -2220,5 +2286,212 @@ func TestRenderMultiDeploymentApplyComment_SettledRolloutTableReadsNotStarted(t 
 		assert.Contains(t, out, "**`refunds`**: ⏳ Queued")
 		assert.NotContains(t, out, "not started")
 		assert.NotContains(t, out, "Not started")
+	})
+}
+
+// A rollout of `trips` was cancelled with some targets part-way through the
+// table. The line counts the targets the cancel stopped and the ones that
+// never began the table, and says the table was not started only when no
+// target began it.
+func TestRenderMultiDeploymentApplyComment_CancelledRolloutCountsTheTargetsItStopped(t *testing.T) {
+	trips := func(database string, table TableProgressData) *ApplyStatusCommentData {
+		table.TableName = "trips"
+		d := tablesDetail(database, table)
+		d.State = state.Apply.Cancelled
+		return d
+	}
+	cancelledTargets := func(n int) presentation.Apply {
+		ops := make([]presentation.Operation, n)
+		for i := range ops {
+			ops[i] = parallelTarget("primary", fmt.Sprintf("testapp-%03d", i+1), so.Cancelled)
+		}
+		model := presentation.Derive(ops)
+		require.Equal(t, state.Apply.Cancelled, model.State)
+		return model
+	}
+	midCopy := TableProgressData{Status: state.Task.Cancelled, Started: true, RowsCopied: 400, RowsTotal: 1000}
+	queued := TableProgressData{Status: state.Task.Pending}
+
+	t.Run("targets stopped mid-copy", func(t *testing.T) {
+		out := renderTargets(cancelledTargets(4),
+			trips("testapp_001", midCopy),
+			trips("testapp_002", midCopy),
+			trips("testapp_003", queued),
+			trips("testapp_004", queued),
+		)
+		assert.Contains(t, out, "**`trips`**: ⊘ Cancelled on 2 of 4 targets · 2 not started\n", "%s", out)
+		assert.NotContains(t, out, "(not started)", "%s", out)
+	})
+	t.Run("a target that began without reporting rows", func(t *testing.T) {
+		out := renderTargets(cancelledTargets(2),
+			trips("testapp_001", TableProgressData{Status: state.Task.Cancelled, Started: true}),
+			trips("testapp_002", TableProgressData{Status: state.Task.Cancelled}),
+		)
+		assert.Contains(t, out, "**`trips`**: ⊘ Cancelled on 1 of 2 targets · 1 not started\n", "%s", out)
+	})
+	t.Run("some targets completed first", func(t *testing.T) {
+		out := renderTargets(cancelledTargets(3),
+			trips("testapp_001", TableProgressData{Status: state.Task.Completed, Started: true, RowsCopied: 1000, RowsTotal: 1000}),
+			trips("testapp_002", midCopy),
+			trips("testapp_003", queued),
+		)
+		assert.Contains(t, out, "**`trips`**: ⊘ Cancelled on 1 of 3 targets · 1 complete, 1 not started\n", "%s", out)
+	})
+	t.Run("no target began it", func(t *testing.T) {
+		out := renderTargets(cancelledTargets(2),
+			trips("testapp_001", TableProgressData{Status: state.Task.Cancelled}),
+			trips("testapp_002", queued),
+		)
+		assert.Contains(t, out, "**`trips`**: ⊘ Cancelled (not started)\n", "%s", out)
+	})
+	// A failure cancels only the tasks queued behind it on its own target, so
+	// while the rollout runs on, a target that was not cancelled is still
+	// queued to run the table.
+	t.Run("a target still to run stays queued until the rollout settles", func(t *testing.T) {
+		model := presentation.Derive([]presentation.Operation{
+			parallelTarget("primary", "testapp-001", so.Completed),
+			parallelTarget("primary", "testapp-002", so.Failed),
+			parallelTarget("primary", "testapp-003", so.Running),
+		})
+		require.False(t, model.RolloutSettled(model.Groups()[0]), "testapp-003 is still running")
+		out := renderTargets(model,
+			trips("testapp_001", TableProgressData{Status: state.Task.Completed, Started: true, RowsCopied: 1000, RowsTotal: 1000}),
+			trips("testapp_002", TableProgressData{Status: state.Task.Cancelled}),
+			trips("testapp_003", queued),
+		)
+		assert.Contains(t, out, "**`trips`**: ⊘ Cancelled · 1 complete, 1 queued, 1 not started\n", "%s", out)
+	})
+}
+
+// A settled rollout of `orders` and `docks` across two targets, where only
+// testapp-001 changes `docks`: each completed table line counts the targets
+// that ran it, singular for the table one target ran and plural for the table
+// both ran.
+func TestRenderMultiDeploymentApplyComment_CompletedTableCountsItsTargets(t *testing.T) {
+	ops := []presentation.Operation{
+		parallelTarget("primary", "testapp-001", so.Completed),
+		parallelTarget("primary", "testapp-002", so.Completed),
+	}
+	out := renderTargets(presentation.Derive(ops),
+		tablesDetail("testapp_001",
+			TableProgressData{TableName: "orders", Status: state.Task.Completed, RowsCopied: 1000},
+			TableProgressData{TableName: "docks", Status: state.Task.Completed, RowsCopied: 1000},
+		),
+		tablesDetail("testapp_002", TableProgressData{TableName: "orders", Status: state.Task.Completed, RowsCopied: 1000}),
+	)
+	assert.Contains(t, out, "**`docks`**: ✅ Complete (1 target)\n", out)
+	assert.Contains(t, out, "**`orders`**: ✅ Complete (2 targets)\n", out)
+	assert.NotContains(t, out, "(1 targets)", out)
+}
+
+// A rollout of `orders` four targets wide where testapp-001 is checksumming,
+// testapp-002 has parked at its cutover, and the last two are queued. No one
+// target's phase speaks for the table, so the line keeps its bar at the
+// table's share across all four, and the list under it keeps the targets in
+// rollout order, the checksumming target marked as working with how far its
+// verify has got.
+func TestRenderMultiDeploymentApplyComment_MixedPhasesKeepTheBar(t *testing.T) {
+	ops := rollingTargets(4)
+	ops[1].State = so.WaitingForCutover
+	checksumming := TableProgressData{TableName: "orders", Status: state.Task.Checksumming, RowsCopied: 1000, ChecksumRowsChecked: 450, ChecksumRowsTotal: 1000}
+	out := renderTargets(presentation.Derive(ops),
+		tablesDetail("testapp_001", checksumming),
+		tablesDetail("testapp_002", TableProgressData{TableName: "orders", Status: state.Task.WaitingForCutover, RowsCopied: 1000}),
+		tablesDetail("testapp_003", TableProgressData{TableName: "orders", Status: state.Task.Pending}),
+		tablesDetail("testapp_004", TableProgressData{TableName: "orders", Status: state.Task.Pending}),
+	)
+	assert.Contains(t, out, "**`orders`**: "+ui.ProgressBarRowCopy(50)+" 50%\n", "%s", out)
+	assert.Contains(t, out, "- Targets: 4 (1 waiting for cutover, 1 checksumming, 2 queued)\n"+
+		"  - ◉ `testapp-001`: checksumming 45.00% · 450 / 1,000 rows verified\n"+
+		"  - ● `testapp-002`: waiting for cutover\n"+
+		"  - ○ `testapp-003`: queued\n"+
+		"  - ○ `testapp-004`: queued\n", "%s", out)
+	assert.NotContains(t, out, shardedTableStatusPhrase(state.Task.Checksumming))
+}
+
+// A rollout of `orders` two targets wide where testapp-001 is still reverting
+// and testapp-002 has reverted. A revert undoes the change, so the rows its
+// copy once moved are not progress: the revert speaks for the table rather
+// than a bar at nearly complete.
+func TestRenderMultiDeploymentApplyComment_RevertSpeaksForTheTable(t *testing.T) {
+	ops := rollingTargets(2)
+	out := renderTargets(presentation.Derive(ops),
+		tablesDetail("testapp_001", TableProgressData{TableName: "orders", Status: state.Task.Reverting, RowsCopied: 1000, RowsTotal: 1000}),
+		tablesDetail("testapp_002", TableProgressData{TableName: "orders", Status: state.Task.Reverted, RowsCopied: 1000, RowsTotal: 1000}),
+	)
+	assert.Contains(t, out, shardedTableStatusPhrase(state.Task.Reverting), "%s", out)
+	assert.NotContains(t, out, "99%", "%s", out)
+}
+
+// Two targets parked at their cutover and two queued is half the table, not
+// a table waiting for cutover: the line keeps its bar, and the targets still
+// to copy stay visible in the list.
+func TestRenderMultiDeploymentApplyComment_ParkedAndQueuedKeepTheBar(t *testing.T) {
+	ops := rollingTargets(4)
+	ops[0].State, ops[1].State = so.WaitingForCutover, so.WaitingForCutover
+	parked := func(database string) *ApplyStatusCommentData {
+		return tablesDetail(database, TableProgressData{TableName: "orders", Status: state.Task.WaitingForCutover, RowsCopied: 1000})
+	}
+	queued := func(database string) *ApplyStatusCommentData {
+		return tablesDetail(database, TableProgressData{TableName: "orders", Status: state.Task.Pending})
+	}
+	out := renderTargets(presentation.Derive(ops), parked("testapp_001"), parked("testapp_002"), queued("testapp_003"), queued("testapp_004"))
+	assert.Contains(t, out, "**`orders`**: "+ui.ProgressBarRowCopy(50)+" 50%\n", "%s", out)
+	assert.NotContains(t, out, shardedTableStatusPhrase(state.Task.WaitingForCutover))
+}
+
+// Every target parked at its cutover is in the one phase, so that phase speaks
+// for the table rather than a bar that could only stop short of complete, and
+// the list under it names each target.
+func TestRenderMultiDeploymentApplyComment_EveryTargetParkedReadsItsPhase(t *testing.T) {
+	ops := rollingTargets(2)
+	ops[0].State, ops[1].State = so.WaitingForCutover, so.WaitingForCutover
+	parked := func(database string) *ApplyStatusCommentData {
+		return tablesDetail(database, TableProgressData{TableName: "orders", Status: state.Task.WaitingForCutover, RowsCopied: 1000})
+	}
+	out := renderTargets(presentation.Derive(ops), parked("testapp_001"), parked("testapp_002"))
+	assert.Contains(t, out, "**`orders`**: 🟡 Waiting for cutover\n", "%s", out)
+	assert.Contains(t, out, "- Targets: 2 (2 waiting for cutover)\n"+
+		"  - ● `testapp-001`: waiting for cutover\n"+
+		"  - ● `testapp-002`: waiting for cutover\n", "%s", out)
+}
+
+// A target that has reported no table progress counts toward a rolled-up
+// table at where its operation stands, the way the CLI counts it: one that
+// failed before reporting is listed as failed and counts as no progress in
+// the bar, and one that stopped before reporting halts the table rather than
+// leaving it complete. A target working without its rows reported is left out
+// of the rows line, which says so.
+func TestRenderMultiDeploymentApplyComment_UnreportedTargetCountsAtItsOperationState(t *testing.T) {
+	t.Run("failed before reporting", func(t *testing.T) {
+		out := renderTargets(presentation.Derive([]presentation.Operation{
+			parallelTarget("primary", "testapp-001", so.Completed),
+			parallelTarget("primary", "testapp-002", so.Running),
+			parallelTarget("primary", "testapp-003", so.Failed),
+			parallelTarget("primary", "testapp-004", so.Pending),
+		}), targetDetail("testapp_001", state.Task.Completed, addNote, 1000), targetDetail("testapp_002", state.Task.Running, addNote, 400), nil, nil)
+		assert.Contains(t, out, "**`orders`**: "+ui.ProgressBarRowCopy(35)+" 35%\n", "a completed target and 40%% of another across four targets:\n%s", out)
+		assert.Contains(t, out, "- Rows: 1,400 / 2,000 across 2 of 4 targets")
+		assert.Contains(t, out, "  - ✗ `testapp-003`: failed\n  - ○ `testapp-004`: queued\n")
+	})
+	t.Run("stopped before reporting", func(t *testing.T) {
+		out := renderTargets(presentation.Derive([]presentation.Operation{
+			parallelTarget("primary", "testapp-001", so.Completed),
+			parallelTarget("primary", "testapp-002", so.Stopped),
+		}), targetDetail("testapp_001", state.Task.Completed, addNote, 1000), nil)
+		assert.Contains(t, out, "**`orders`**: ⏹️ Stopped\n", "%s", out)
+		assert.Contains(t, out, "  - ✓ `testapp-001`: 1,000 rows\n  - ○ `testapp-002`: stopped\n")
+	})
+	t.Run("working without its rows reported", func(t *testing.T) {
+		unsized := &ApplyStatusCommentData{
+			Database: "testapp_002", State: state.Apply.Running, ApplyID: "apply-123", Environment: "production", Engine: storage.EngineSpirit,
+			Tables: []TableProgressData{{TableName: "orders", DDL: addNote, Status: state.Task.Running}},
+		}
+		out := renderTargets(presentation.Derive([]presentation.Operation{
+			parallelTarget("primary", "testapp-001", so.Running),
+			parallelTarget("primary", "testapp-002", so.Running),
+		}), targetDetail("testapp_001", state.Task.Running, addNote, 500), unsized)
+		assert.Contains(t, out, "**`orders`**: "+ui.ProgressBarRowCopy(25)+" 25%\n", "%s", out)
+		assert.Contains(t, out, "- Rows: 500 / 1,000 across 1 of 2 targets")
 	})
 }

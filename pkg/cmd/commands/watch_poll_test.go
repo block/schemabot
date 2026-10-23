@@ -434,7 +434,7 @@ func proxiedProgressPoller(t *testing.T, responses ...proxyResponse) (*progressP
 	t.Cleanup(srv.Close)
 
 	var waits []time.Duration
-	p := newProgressPoller(t.Context(), srv.URL, scriptedApplyID)
+	p := newProgressPoller(t.Context(), srv.URL, scriptedApplyID, "")
 	p.sleep = func(d time.Duration) { waits = append(waits, d) }
 	return p, &waits
 }

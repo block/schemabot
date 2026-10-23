@@ -103,6 +103,32 @@ func (s *planStore) Get(ctx context.Context, planIdentifier string) (*storage.Pl
 	return scanPlan(row)
 }
 
+// GetListAnchor returns a plan's listing position and filter fields by
+// plan_identifier, or nil if not found. It selects neither schema_files nor
+// plan_data, the bulk of a plan row.
+func (s *planStore) GetListAnchor(ctx context.Context, planIdentifier string) (*storage.PlanListAnchor, error) {
+	var anchor storage.PlanListAnchor
+	err := s.db.QueryRowContext(ctx, `
+		SELECT id, created_at, database_name, environment, repository, pull_request
+		FROM plans
+		WHERE plan_identifier = ?
+	`, planIdentifier).Scan(
+		&anchor.Position.ID,
+		&anchor.Position.CreatedAt,
+		&anchor.Database,
+		&anchor.Environment,
+		&anchor.Repository,
+		&anchor.PullRequest,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get list anchor of plan %s: %w", planIdentifier, err)
+	}
+	return &anchor, nil
+}
+
 // GetByID returns a plan by ID, or nil if not found.
 func (s *planStore) GetByID(ctx context.Context, id int64) (*storage.Plan, error) {
 	row := s.db.QueryRowContext(ctx, `
@@ -193,6 +219,12 @@ func (s *planStore) List(ctx context.Context, opts storage.ListPlansOptions) ([]
 	if !opts.Since.IsZero() {
 		where = append(where, "created_at >= ?")
 		args = append(args, opts.Since)
+	}
+	if after := opts.StartAfter; after != nil {
+		// The keyset matches the ORDER BY below, so a page resumes exactly
+		// where the previous one ended.
+		where = append(where, "(created_at < ? OR (created_at = ? AND id < ?))")
+		args = append(args, after.CreatedAt, after.CreatedAt, after.ID)
 	}
 
 	query := "SELECT " + planListColumns + " FROM plans"

@@ -3536,3 +3536,70 @@ func TestE2EInitialProgressCommentFinalizedForFastApply(t *testing.T) {
 		}
 	})
 }
+
+// A rollout's operations run on several clients that each hold the same
+// observer, and each delivers the settled apply's terminal state to it. The
+// observer publishes each terminal state once: the first delivery of the stop
+// edits the progress comment and posts the stop's summary, and the repeated
+// deliveries, concurrent or not, leave the PR untouched. Once the rollout is
+// started again and the observer sees it in flight, stopping it a second time
+// publishes the second stop.
+func TestE2EObserverPublishesEachTerminalOnceAcrossDeliveries(t *testing.T) {
+	f := setupApplyCommentFixture(t, applyCommentFixtureParams{
+		repo:       "org/repo-terminal-once",
+		pr:         147,
+		database:   "e2e_terminal_once_db",
+		applyState: state.Apply.Running,
+	})
+	apply, task, capture := f.apply, f.task, f.capture
+	f.handler.postAndTrackComment(t.Context(), apply.Repository, apply.PullRequest, 12345, apply, state.Comment.Progress, "Running at 50%")
+	requireCommentCreate(t, capture)
+	obs := f.newObserver(f.st, clock.NewFake(task.CreatedAt))
+
+	apply.State = state.Apply.Stopped
+	task.State = state.Task.Stopped
+	obs.OnTerminal(apply, []*storage.Task{task})
+	assert.Equal(t, 1, drainSummaryCreates(capture, "Schema Change Stopped"),
+		"the first delivery of the stop posts its summary")
+	drainCommentEdits(capture)
+
+	var wg sync.WaitGroup
+	for range 3 {
+		wg.Go(func() { obs.OnTerminal(apply, []*storage.Task{task}) })
+	}
+	wg.Wait()
+	assert.Zero(t, len(capture.creates), "a repeated delivery of the stop posts no comment")
+	assert.Zero(t, len(capture.edits), "a repeated delivery of the stop edits no comment")
+
+	apply.State = state.Apply.Running
+	task.State = state.Task.Running
+	obs.OnProgress(apply, []*storage.Task{task})
+
+	drainSummaryCreates(capture, "")
+	drainCommentEdits(capture)
+
+	apply.State = state.Apply.Stopped
+	task.State = state.Task.Stopped
+	obs.OnTerminal(apply, []*storage.Task{task})
+	assert.Equal(t, 1, drainSummaryCreates(capture, "Schema Change Stopped"),
+		"the second stop of the resumed rollout posts its own summary")
+}
+
+// drainSummaryCreates empties the captured comment creates and counts those
+// whose body contains headline.
+func drainSummaryCreates(capture *commentCapture, headline string) int {
+	var count int
+	for range len(capture.creates) {
+		if created := <-capture.creates; strings.Contains(created.Body, headline) {
+			count++
+		}
+	}
+	return count
+}
+
+// drainCommentEdits empties the captured comment edits.
+func drainCommentEdits(capture *commentCapture) {
+	for range len(capture.edits) {
+		<-capture.edits
+	}
+}

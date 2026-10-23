@@ -60,6 +60,9 @@ func (m *mockPlanLookupStore) Get(context.Context, string) (*storage.Plan, error
 	return m.plan, m.err
 }
 func (m *mockPlanLookupStore) GetByID(context.Context, int64) (*storage.Plan, error) { return nil, nil }
+func (m *mockPlanLookupStore) GetListAnchor(context.Context, string) (*storage.PlanListAnchor, error) {
+	return nil, nil
+}
 func (m *mockPlanLookupStore) GetByLock(context.Context, int64) ([]*storage.Plan, error) {
 	return nil, nil
 }
@@ -103,10 +106,20 @@ func (s *capturingPlanStore) Create(_ context.Context, plan *storage.Plan) (int6
 
 type mockStorageWithPlanLookup struct {
 	mockStorage
-	plans storage.PlanStore
+	plans      storage.PlanStore
+	operations storage.ApplyOperationStore
 }
 
 func (m *mockStorageWithPlanLookup) Plans() storage.PlanStore { return m.plans }
+
+// ApplyOperations serves an apply that recorded no operations unless the test
+// sets its own.
+func (m *mockStorageWithPlanLookup) ApplyOperations() storage.ApplyOperationStore {
+	if m.operations == nil {
+		return &staticApplyOperationStore{}
+	}
+	return m.operations
+}
 
 type mockStorageWithApplyStores struct {
 	mockStorage
@@ -372,6 +385,18 @@ func (s *recentApplyStore) GetRecent(_ context.Context, filter storage.RecentApp
 		return applies[:filter.Limit], nil
 	}
 	return applies, nil
+}
+
+func (s *recentApplyStore) GetByApplyIdentifier(_ context.Context, applyIdentifier string) (*storage.Apply, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
+	for _, apply := range s.applies {
+		if apply.ApplyIdentifier == applyIdentifier {
+			return apply, nil
+		}
+	}
+	return nil, nil
 }
 
 func (s *recentApplyStore) CountRecentByState(_ context.Context, filter storage.RecentAppliesFilter) (map[string]int, error) {
@@ -7729,6 +7754,64 @@ func TestRevertHandler(t *testing.T) {
 		assert.Equal(t, "staging", mock.revertReq.Environment)
 	})
 
+	// A multi-operation apply drives each operation against its own deployment,
+	// so an immediate call keyed on one apply id would revert one operation and
+	// leave its siblings. The durable request is queued and the operator fans it
+	// out instead.
+	t.Run("skips the immediate call for a multi-operation apply", func(t *testing.T) {
+		mock := &mockTernClient{revertResp: &ternv1.RevertResponse{Accepted: true}}
+		apply := activeTestApply("apply-rev-multi")
+		apply.State = state.Apply.RevertWindow
+		apply.Engine = storage.EnginePlanetScale
+		apply.DatabaseType = storage.DatabaseTypeVitess
+		svc := newControlTestServiceWithOperations(mock, apply, nil, []*storage.ApplyOperation{
+			{ID: 1, ApplyID: apply.ID, Deployment: "deploy-a", Target: "target-a", State: state.ApplyOperation.RevertWindow},
+			{ID: 2, ApplyID: apply.ID, Deployment: "deploy-b", Target: "target-b", State: state.ApplyOperation.RevertWindow},
+		})
+		mux := http.NewServeMux()
+		svc.ConfigureRoutes(mux)
+
+		body := `{"environment": "staging", "apply_id": "apply-rev-multi"}`
+		req := httptest.NewRequestWithContext(t.Context(), "POST", "/api/revert", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, req)
+
+		assert.Equal(t, http.StatusAccepted, w.Code, w.Body.String())
+		assert.Nil(t, mock.revertReq, "the immediate revert must not reach a single deployment")
+		pending, err := svc.storage.ControlRequests().GetPending(t.Context(), apply.ID, storage.ControlOperationRevert)
+		require.NoError(t, err)
+		assert.NotNil(t, pending, "the durable revert request stays queued for the operator")
+	})
+
+	// When the operation count cannot be read the apply may span several
+	// operations, and an accepted immediate call would complete the request
+	// before the siblings receive it. The request stays pending for the driver.
+	t.Run("skips the immediate call when the operation count is unknown", func(t *testing.T) {
+		mock := &mockTernClient{revertResp: &ternv1.RevertResponse{Accepted: true}}
+		apply := activeTestApply("apply-rev-count-unknown")
+		apply.State = state.Apply.RevertWindow
+		apply.Engine = storage.EnginePlanetScale
+		apply.DatabaseType = storage.DatabaseTypeVitess
+		svc := newControlTestServiceWithOperations(mock, apply, nil, nil)
+		svc.storage.(*mockStorageWithApplyStores).operations.(*staticApplyOperationStore).err = errors.New("operation store unavailable")
+		mux := http.NewServeMux()
+		svc.ConfigureRoutes(mux)
+
+		body := `{"environment": "staging", "apply_id": "apply-rev-count-unknown"}`
+		req := httptest.NewRequestWithContext(t.Context(), "POST", "/api/revert", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, req)
+
+		assert.Equal(t, http.StatusAccepted, w.Code, w.Body.String())
+		assert.Nil(t, mock.revertReq, "the immediate revert must not reach a single deployment")
+		pending, err := svc.storage.ControlRequests().GetPending(t.Context(), apply.ID, storage.ControlOperationRevert)
+		require.NoError(t, err)
+		require.NotNil(t, pending, "the durable revert request stays queued for the driver")
+		assert.Equal(t, storage.ControlRequestPending, pending.Status)
+	})
+
 	t.Run("requires apply_id", func(t *testing.T) {
 		mock := &mockTernClient{}
 		svc := newControlTestService(mock, activeTestApply("apply-active-revert"))
@@ -7771,6 +7854,57 @@ func TestSkipRevertHandler(t *testing.T) {
 		require.NotNil(t, mock.skipRevertReq)
 		assert.Equal(t, "apply-skip456", mock.skipRevertReq.ApplyId)
 		assert.Equal(t, "staging", mock.skipRevertReq.Environment)
+	})
+
+	t.Run("skips the immediate call for a multi-operation apply", func(t *testing.T) {
+		mock := &mockTernClient{skipRevertResp: &ternv1.SkipRevertResponse{Accepted: true}}
+		apply := activeTestApply("apply-skip-multi")
+		apply.State = state.Apply.RevertWindow
+		apply.Engine = storage.EnginePlanetScale
+		apply.DatabaseType = storage.DatabaseTypeVitess
+		svc := newControlTestServiceWithOperations(mock, apply, nil, []*storage.ApplyOperation{
+			{ID: 1, ApplyID: apply.ID, Deployment: "deploy-a", Target: "target-a", State: state.ApplyOperation.RevertWindow},
+			{ID: 2, ApplyID: apply.ID, Deployment: "deploy-b", Target: "target-b", State: state.ApplyOperation.RevertWindow},
+		})
+		mux := http.NewServeMux()
+		svc.ConfigureRoutes(mux)
+
+		body := `{"environment": "staging", "apply_id": "apply-skip-multi"}`
+		req := httptest.NewRequestWithContext(t.Context(), "POST", "/api/skip-revert", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, req)
+
+		assert.Equal(t, http.StatusAccepted, w.Code, w.Body.String())
+		assert.Nil(t, mock.skipRevertReq, "the immediate skip-revert must not reach a single deployment")
+		pending, err := svc.storage.ControlRequests().GetPending(t.Context(), apply.ID, storage.ControlOperationSkipRevert)
+		require.NoError(t, err)
+		assert.NotNil(t, pending, "the durable skip-revert request stays queued for the operator")
+	})
+
+	t.Run("skips the immediate call when the operation count is unknown", func(t *testing.T) {
+		mock := &mockTernClient{skipRevertResp: &ternv1.SkipRevertResponse{Accepted: true}}
+		apply := activeTestApply("apply-skip-count-unknown")
+		apply.State = state.Apply.RevertWindow
+		apply.Engine = storage.EnginePlanetScale
+		apply.DatabaseType = storage.DatabaseTypeVitess
+		svc := newControlTestServiceWithOperations(mock, apply, nil, nil)
+		svc.storage.(*mockStorageWithApplyStores).operations.(*staticApplyOperationStore).err = errors.New("operation store unavailable")
+		mux := http.NewServeMux()
+		svc.ConfigureRoutes(mux)
+
+		body := `{"environment": "staging", "apply_id": "apply-skip-count-unknown"}`
+		req := httptest.NewRequestWithContext(t.Context(), "POST", "/api/skip-revert", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, req)
+
+		assert.Equal(t, http.StatusAccepted, w.Code, w.Body.String())
+		assert.Nil(t, mock.skipRevertReq, "the immediate skip-revert must not reach a single deployment")
+		pending, err := svc.storage.ControlRequests().GetPending(t.Context(), apply.ID, storage.ControlOperationSkipRevert)
+		require.NoError(t, err)
+		require.NotNil(t, pending, "the durable skip-revert request stays queued for the driver")
+		assert.Equal(t, storage.ControlRequestPending, pending.Status)
 	})
 
 	t.Run("requires apply_id", func(t *testing.T) {

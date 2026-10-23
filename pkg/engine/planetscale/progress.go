@@ -86,6 +86,10 @@ func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*en
 		message = fmt.Sprintf("Deploy request #%d closed before it was deployed", dr.Number)
 	}
 
+	if dr.DeploymentState == deployState.InProgressCancel {
+		e.warnOnCancelInFlightTooLong(req.Database, dr)
+	}
+
 	// Recover the instant DDL flag for an apply whose metadata was persisted
 	// before the deploy decision was made.
 	//
@@ -243,6 +247,46 @@ func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*en
 	}
 
 	return result, nil
+}
+
+// cancelInFlightWarnAfter is how long a deploy request may sit in
+// in_progress_cancel before each progress poll warns that the cancel has not
+// settled. The apply stays active for as long as the cancel is in flight, and
+// nothing on SchemaBot's side ends that wait, so the warning is what makes a
+// stuck cancel visible to an operator.
+const cancelInFlightWarnAfter = 15 * time.Minute
+
+const cancelInFlightTooLongLog = "deploy request cancel has not settled; the apply stays active until PlanetScale reports the deploy request cancelled or failed; check the deploy request's deployment status in PlanetScale"
+
+// warnOnCancelInFlightTooLong warns when a deploy request has stayed in
+// in_progress_cancel for longer than cancelInFlightWarnAfter. The outcome is
+// unchanged: the deploy request keeps reading as running until it settles on
+// cancelled or failed. The elapsed time is measured from the deploy request's
+// last update, which for a request sitting in in_progress_cancel is no
+// earlier than when it entered that state, so the warning never fires early.
+func (e *Engine) warnOnCancelInFlightTooLong(database string, dr *ps.DeployRequest) {
+	if dr.UpdatedAt.IsZero() {
+		e.logger.Debug("deploy request reports no update time; cannot tell how long its cancel has been in flight",
+			"database", database,
+			"deploy_request", dr.Number,
+			"deployment_state", dr.DeploymentState)
+		return
+	}
+	elapsed := e.clock().Sub(dr.UpdatedAt)
+	if elapsed <= cancelInFlightWarnAfter {
+		e.logger.Debug("deploy request cancel in flight",
+			"database", database,
+			"deploy_request", dr.Number,
+			"deployment_state", dr.DeploymentState,
+			"elapsed", elapsed.Round(time.Second).String())
+		return
+	}
+	e.logger.Warn(cancelInFlightTooLongLog,
+		"database", database,
+		"deploy_request", dr.Number,
+		"deployment_state", dr.DeploymentState,
+		"elapsed", elapsed.Round(time.Second).String(),
+		"warn_after", cancelInFlightWarnAfter.String())
 }
 
 // baselineContextRetention bounds how much terminal history

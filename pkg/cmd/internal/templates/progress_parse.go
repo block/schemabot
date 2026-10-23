@@ -89,6 +89,14 @@ type TableProgress struct {
 	// EstimatedBytes is the table's on-disk size when it was planned, shown
 	// beside the row counts. Nil when the plan had no estimate.
 	EstimatedBytes *int64
+	// EstimatedRows is the table's row count when it was planned, shown while
+	// the table is queued and before the engine reports RowsTotal. Nil when
+	// the plan had no estimate.
+	EstimatedRows *int64
+	// RowsTotalPlanned marks a RowsTotal rolled up across targets that
+	// includes the plan's estimate for targets that have not reported their
+	// copy yet, so the total renders as approximate.
+	RowsTotalPlanned bool
 	// PlannedShards is how many shards a sharded table's change spans per its
 	// plan, the shards EstimatedBytes covers. Zero when the plan recorded none.
 	PlannedShards int
@@ -112,10 +120,6 @@ type TableProgress struct {
 	// are only some of the deployment's, shown above the DDL. Empty when the
 	// DDL runs on every target.
 	OnTargets string
-	// UnreportedTargets counts the targets a rolled-up table speaks for that
-	// are still to run and have reported no progress yet, so have not started
-	// it. A settled target is not among them.
-	UnreportedTargets int
 	// RolloutSettled marks a rolled-up table whose rollout has settled with no
 	// target left to run, so a target still pending on it never starts it and
 	// reads as not started rather than queued.
@@ -131,6 +135,15 @@ type ShardProgress struct {
 	ETASeconds      int64
 	PercentComplete int
 	CutoverAttempts int
+	// ChecksumRowsChecked and ChecksumRowsTotal are how far a checksumming
+	// target's verify has got, once its engine reports a total.
+	ChecksumRowsChecked int64
+	ChecksumRowsTotal   int64
+	// PlannedRows is the plan's row estimate for a target in a table rolled up
+	// across targets whose copy is still ahead and has reported no row total,
+	// standing in for its rows in the rolled-up total
+	// (TableProgress.RowsTotalPlanned). Nil otherwise.
+	PlannedRows *int64
 }
 
 // Display-only task states. These are not persisted apply states (see pkg/applystate)
@@ -209,6 +222,7 @@ func ParseProgressResponse(result *apitypes.ProgressResponse) ProgressData {
 			RowsCopied:          tbl.RowsCopied,
 			RowsTotal:           tbl.RowsTotal,
 			EstimatedBytes:      tbl.EstimatedBytes,
+			EstimatedRows:       tbl.EstimatedRows,
 			PlannedShards:       int(tbl.PlannedShards),
 			PercentComplete:     int(tbl.PercentComplete),
 			ETASeconds:          tbl.ETASeconds,
@@ -235,6 +249,9 @@ func ParseProgressResponse(result *apitypes.ProgressResponse) ProgressData {
 				ETASeconds:      sh.ETASeconds,
 				PercentComplete: pct,
 				CutoverAttempts: int(sh.CutoverAttempts),
+
+				ChecksumRowsChecked: sh.ChecksumRowsChecked,
+				ChecksumRowsTotal:   sh.ChecksumRowsTotal,
 			})
 			// Table-level ETA: the table's own estimate (MySQL/Spirit), or
 			// the slowest shard's for a sharded (Vitess) table.
