@@ -162,37 +162,6 @@ func (h *Handler) applyAggregateFoldFollowUp(ctx context.Context, client *ghclie
 //   - ALL checks "success"        → aggregate "success"
 //   - NO applicable contributions → verified no-work success
 func (h *Handler) updateAggregateCheckOnce(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA string) (aggregateFoldFollowUp, error) {
-	var followUp aggregateFoldFollowUp
-	invoked := false
-	fold := func(ctx context.Context) error {
-		invoked = true
-		var err error
-		followUp, err = h.foldAggregateChecksForPR(ctx, client, repo, pr, headSHA)
-		return err
-	}
-	if !h.shouldPublishChecks(ctx, repo, "aggregate_check_sync") {
-		return aggregateFoldNoFollowUp, nil
-	}
-	if err := h.withAggregateFoldLock(ctx, repo, pr, fold); err != nil {
-		if invoked {
-			return followUp, err
-		}
-		return aggregateFoldScheduleParticipantRefold, err
-	}
-	return followUp, nil
-}
-
-func (h *Handler) withAggregateFoldLock(ctx context.Context, repo string, pr int, fold func(context.Context) error) error {
-	if locker, ok := h.service.Storage().Checks().(storage.AggregateCheckLocker); ok {
-		return locker.WithAggregateCheckLock(ctx, storage.CanonicalKey(repo), pr, fold)
-	}
-	// In-memory stores used by embedders serialize within this handler.
-	h.aggregateFoldMu.Lock()
-	defer h.aggregateFoldMu.Unlock()
-	return fold(ctx)
-}
-
-func (h *Handler) foldAggregateChecksForPR(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA string) (aggregateFoldFollowUp, error) {
 	if !h.shouldPublishChecks(ctx, repo, "aggregate_check_sync") {
 		return aggregateFoldNoFollowUp, nil
 	}
@@ -270,7 +239,7 @@ func (h *Handler) foldAggregateChecksForPR(ctx context.Context, client *ghclient
 			for _, target := range h.aggregateCheckTargetsForRepo(repo) {
 				errorsByEnvironment[target.environment] = "Environment coverage could not be verified. Retry planning this PR."
 			}
-			h.postFailingAggregatesWithBlockUnlocked(ctx, client, repo, pr, headSHA, errorsByEnvironment, checkBlockReason{})
+			h.postFailingAggregatesWithBlock(ctx, client, repo, pr, headSHA, errorsByEnvironment, checkBlockReason{})
 			return aggregateFoldScheduleParticipantRefold, scopeErr
 		}
 		expectedParticipants = config.ExpectedParticipantChecksForPR(repo, prFilePaths(scope.files))
@@ -529,8 +498,8 @@ type aggregateFold struct {
 // aggregateSentinel. DatabaseType and DatabaseName always use aggregateSentinel.
 //
 // Two fail-closed rules shape the fold:
-//   - Stored aggregate state carrying a blocking reason is never replaced by a
-//     recompute. Blocking reasons record PR-level guard failures (config
+//   - A blocking reason read from stored aggregate state prevents this
+//     recompute from publishing. Blocking reasons record PR-level guard failures (config
 //     discovery, managed-directory coverage, environment coverage) and are
 //     released only after the auto-plan guards re-verify the PR
 //     (clearAggregateBlocksForVerifiedPR).
@@ -544,7 +513,8 @@ type aggregateFold struct {
 // failed GitHub or storage write. A stored blocking reason is an intentional
 // fail-closed skip, not an operational failure, so it returns no error. It also
 // returns what it published from, so the caller can check whether the stopped
-// applies moved while it published.
+// applies moved while it published. Concurrent folds are not serialized: a
+// guard or result recorded after these reads can be overwritten by publication.
 func (h *Handler) foldAggregateCheckRun(
 	ctx context.Context, client *ghclient.InstallationClient,
 	repo string, pr int, headSHA string,
@@ -987,22 +957,6 @@ func (h *Handler) postFailingAggregatesWithBlock(ctx context.Context, client *gh
 	if !h.shouldPublishChecks(ctx, repo, "aggregate_check_sync") {
 		return false
 	}
-	stored := false
-	err := h.withAggregateFoldLock(ctx, repo, pr, func(ctx context.Context) error {
-		stored = h.postFailingAggregatesWithBlockUnlocked(ctx, client, repo, pr, headSHA, errors, block)
-		return nil
-	})
-	if err != nil {
-		h.logger.Error("failed to serialize aggregate guard publication", "repo", repo, "pr", pr, "head_sha", headSHA, "error", err)
-		return false
-	}
-	return stored
-}
-
-func (h *Handler) postFailingAggregatesWithBlockUnlocked(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA string, errors map[string]string, block checkBlockReason) bool {
-	if !h.shouldPublishChecks(ctx, repo, "aggregate_check_sync") {
-		return false
-	}
 
 	if !h.verifyHeadSHAStillCurrentForPR(ctx, client, repo, pr, headSHA, "aggregate_check_sync") {
 		return false
@@ -1196,15 +1150,6 @@ func sanitizeCheckRunErrorSummary(summary string) string {
 // was read, so a block recorded concurrently (for example by a newer commit's
 // guards on another pod) stays authoritative.
 func (h *Handler) clearAggregateBlocksForVerifiedPR(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA string, configs []ghclient.DiscoveredConfig) {
-	if err := h.withAggregateFoldLock(ctx, repo, pr, func(ctx context.Context) error {
-		h.clearAggregateBlocksForVerifiedPRUnlocked(ctx, client, repo, pr, headSHA, configs)
-		return nil
-	}); err != nil {
-		h.logger.Error("could not lock aggregate block recovery; retaining blocks", "repo", repo, "pr", pr, "error", err)
-	}
-}
-
-func (h *Handler) clearAggregateBlocksForVerifiedPRUnlocked(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA string, configs []ghclient.DiscoveredConfig) {
 	for _, cfg := range configs {
 		environments, err := h.configuredDatabaseEnvironments(cfg.Config.Database)
 		if err != nil {

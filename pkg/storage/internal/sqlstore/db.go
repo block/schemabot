@@ -45,44 +45,25 @@ func newRebindDB(pool *sql.DB, b binder) *rebindDB {
 	return &rebindDB{pool: pool, binder: b}
 }
 
-// sqlExecutor is shared by a pool and a pinned session. Aggregate publication
-// carries its session in the callback context so all stores sharing this DB use
-// the lock-holding connection instead of waiting for another pool slot.
-type sqlExecutor interface {
-	ExecContext(context.Context, string, ...any) (sql.Result, error)
-	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
-	QueryRowContext(context.Context, string, ...any) *sql.Row
-	BeginTx(context.Context, *sql.TxOptions) (*sql.Tx, error)
-}
-
-type pinnedDBKey struct{ db *rebindDB }
-
-func (d *rebindDB) executor(ctx context.Context) sqlExecutor {
-	if conn, ok := ctx.Value(pinnedDBKey{d}).(*rebindConn); ok {
-		return conn.conn
-	}
-	return d.pool
-}
-
 // ExecContext rebinds the query's placeholders and executes it on the pool.
 func (d *rebindDB) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
-	return d.executor(ctx).ExecContext(ctx, d.binder.Rebind(query), args...)
+	return d.pool.ExecContext(ctx, d.binder.Rebind(query), args...)
 }
 
 // QueryContext rebinds the query's placeholders and runs it on the pool.
 func (d *rebindDB) QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
-	return d.executor(ctx).QueryContext(ctx, d.binder.Rebind(query), args...)
+	return d.pool.QueryContext(ctx, d.binder.Rebind(query), args...)
 }
 
 // QueryRowContext rebinds the query's placeholders and runs it on the pool.
 func (d *rebindDB) QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row {
-	return d.executor(ctx).QueryRowContext(ctx, d.binder.Rebind(query), args...)
+	return d.pool.QueryRowContext(ctx, d.binder.Rebind(query), args...)
 }
 
 // BeginTx starts a transaction on the underlying pool, wrapped so statements
 // executed on it rebind their placeholders like direct pool execution.
 func (d *rebindDB) BeginTx(ctx context.Context, opts *sql.TxOptions) (*rebindTx, error) {
-	tx, err := d.executor(ctx).BeginTx(ctx, opts)
+	tx, err := d.pool.BeginTx(ctx, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -147,9 +128,8 @@ func (t *rebindTx) Rollback() error {
 }
 
 // rebindConn wraps a pinned pool connection. It exists for the advisory-lock
-// flows, which hold a session-scoped lock and run their database work on that
-// same session. Apply writes use transactions; aggregate folds also read and
-// write directly through the callback context.
+// flow, which holds a session-scoped lock on the pinned session and runs its
+// apply writes in transactions begun on that same session.
 type rebindConn struct {
 	conn   *sql.Conn
 	binder binder

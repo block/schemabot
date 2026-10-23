@@ -531,7 +531,9 @@ apply must surface as a blocking or absent check, never a passing one. *Breaks i
 merges while its schema state is unknown. *Enforced:* every check-state write and aggregate
 publish path (`pkg/webhook/check_publisher.go`, `pkg/webhook/check_aggregate.go`), and the
 automatic apply, which dispatches only after its pending changes are stored
-(`applyCommandCore` in `pkg/webhook/apply_handlers.go`).
+(`applyCommandCore` in `pkg/webhook/apply_handlers.go`). These guards apply to the state a
+fold observes; concurrent publication can leave stale success over a later blocker
+([publication concurrency](check-runs.md#publication-concurrency)).
 
 ### MG-2: Absence never passes
 
@@ -560,9 +562,11 @@ retry preparation durably invalidating old successes before releasing aggregate 
 The aggregate check reports the worst result among its per-database checks: one `in_progress`
 blocks, one `failure` fails, one `action_required` demands action, and the aggregate passes only
 when every database and every applicable local predecessor passes on the current head. A
-conclusion SchemaBot does not recognize blocks. *Enforced:* the aggregate rollup
-(`pkg/webhook/check_aggregate.go`, `pkg/webhook/check_prerequisites.go`), with full folds
-serialized across publishers (`pkg/storage/internal/sqlstore/aggregate_lock.go`).
+conclusion SchemaBot does not recognize blocks. This rule applies to the contributions read by
+one fold; publication is not serialized, so concurrent folds can publish out of order and leave
+a stale passing or blocking result. See [publication concurrency](check-runs.md#publication-concurrency).
+*Enforced:* the aggregate rollup (`pkg/webhook/check_aggregate.go`,
+`pkg/webhook/check_prerequisites.go`).
 
 ### MG-4: A check belongs to exactly one commit
 
@@ -665,6 +669,8 @@ that would clear the block without the divergence behind it being addressed.
 *Enforced:* stale-check reconciliation (`pkg/webhook/check_records.go`), aggregate re-evaluation
 (`pkg/webhook/check_aggregate.go`, `pkg/webhook/checks_backfill.go`), and the re-plan a settled
 apply owes a PR whose head moved past the commit its check names (`pkg/webhook/handler.go`).
+A concurrent stale publication can leave an obsolete blocker without arming these retries;
+that case requires another fold ([publication concurrency](check-runs.md#publication-concurrency)).
 
 ### MG-11: A terminal outcome lands on the commit the PR is gated on
 

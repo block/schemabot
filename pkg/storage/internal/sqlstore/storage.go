@@ -94,7 +94,7 @@ func NewWithDependencies(deps Dependencies) *Storage {
 		applyComments:   &applyCommentStore{db: rdb, dialect: deps.Dialect},
 		planComments:    &planCommentStore{db: rdb, identity: deps.Identity, dialect: deps.Dialect},
 		applyOperations: &applyOperationStore{db: rdb, dialect: deps.Dialect, identity: deps.Identity, locker: deps.Locker, classifier: deps.Classifier, maxDriversPerApply: maxDriversPerApply},
-		checks:          &checkStore{db: rdb, dialect: deps.Dialect, classifier: deps.Classifier, locker: deps.Locker},
+		checks:          &checkStore{db: rdb, dialect: deps.Dialect, classifier: deps.Classifier},
 		settings:        &settingsStore{db: rdb, dialect: deps.Dialect, classifier: deps.Classifier},
 		webhookEvents:   &webhookEventStore{db: rdb, dialect: deps.Dialect, identity: deps.Identity, classifier: deps.Classifier},
 	}

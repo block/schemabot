@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/block/schemabot/pkg/namedlock"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/spirit/pkg/utils"
@@ -30,7 +29,6 @@ const (
 
 // checkStore implements storage.CheckStore using MySQL.
 type checkStore struct {
-	locker     namedlock.Locker
 	db         *rebindDB
 	dialect    Dialect
 	classifier ErrorClassifier
