@@ -674,7 +674,7 @@ from the watch or with the cutover command. The CLI acknowledges the request
 and then watches progress. Initial output:
 
 ```console
-$ schemabot cutover -e staging apply-example-73
+$ schemabot cutover apply-example-73 -e staging
 ✓ Cutover requested successfully.
 🔄 Cutting over...
 ...
@@ -1183,12 +1183,14 @@ The TUI shows a single status line above the table list. It varies by overall st
 |-------|-------------|
 | Starting | `⠋ Loading...` |
 | Pending | `⠋ Queued, starts automatically` |
-| Running | `⠋ 🔄 Copying rows... ETA 5m 30s` |
+| Running | `⠋ Running...` |
 | Stopping | `⠋ Stopping...` |
 | Waiting for cutover | *(cutover prompt shown in footer instead)* |
 | Cutting over | `⠋ Cutting over...` |
 | Completed | *(no status line — completion message shown after tables)* |
 | Stopped | *(no status line — stopped message shown after tables)* |
+
+A rollout of several targets uses the same status line and adds its counts to it, such as `⠋ Running... 1 completed · 3 running (4 targets)`, or `⠋ Running on all 4 targets...` while every target is in the same state. A finished rollout has no status line either: its outcome follows the tables with the same counts, such as `⏹️ Apply stopped: 1 completed · 3 stopped (4 targets)`.
 
 The `⠋` is a Braille spinner (animated in the TUI, static here).
 
@@ -1198,9 +1200,11 @@ The `⠋` is a Braille spinner (animated in the TUI, static here).
 |-------|--------|
 | Running | `ESC detach • s stop` |
 | Waiting for cutover (with `--cutover`) | `Press Enter to proceed with cutover (or ESC to detach)` |
-| Waiting for cutover (no `--cutover`) | `To proceed: schemabot cutover -e <env> <id>` |
+| Waiting for cutover (no `--cutover`) | `To proceed: schemabot cutover <id> -e <env>` |
 | Cutting over | `Cutover in progress - please wait...` |
-| Stopped | `Use 'schemabot start -e <env> <id>' to resume.` |
+| Stopped | `To resume from where it stopped:` followed by `schemabot start <id> -e <env>` |
+
+A rollout of several targets offers the same keys: `s` stops every target still copying, and the footer reads `ESC detach • s stop` while it does. Above the keys, the rollout's own footer names its next step, such as the target SchemaBot cuts over next, and a stopped rollout ends on the same resume command as a single target.
 
 </details>
 

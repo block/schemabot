@@ -341,7 +341,7 @@ func TestIsRetryableFetchError_InsecureTokenRefusalIsPermanent(t *testing.T) {
 func TestTerminalWatchExit_StoppedNamesTheResumeCommand(t *testing.T) {
 	err := terminalWatchExit(&apitypes.ProgressResponse{ApplyID: scriptedApplyID, Environment: "staging", State: state.Apply.Stopped})
 
-	require.EqualError(t, err, "apply "+scriptedApplyID+" was stopped, so the schema change is not on the target; use 'schemabot start -e staging "+scriptedApplyID+"' to resume it")
+	require.EqualError(t, err, "apply "+scriptedApplyID+" was stopped, so the schema change is not on the target; use 'schemabot start "+scriptedApplyID+" -e staging' to resume it")
 	assert.Equal(t, 1, ExitCodeFor(err))
 }
 

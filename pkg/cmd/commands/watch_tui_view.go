@@ -194,7 +194,7 @@ func (m WatchModel) progressSections() (string, string) {
 		f.WriteString(templates.FormatApplyStopped())
 		f.WriteString("\n")
 		if m.applyID != "" {
-			fmt.Fprintf(&f, "Use '%s' to resume.\n", cliname.Command("start", "-e", m.environment, m.applyID))
+			f.WriteString(templates.FormatNextCommand(templates.ResumeLabel, templates.ControlCommand("start", m.applyID, m.environment)))
 		} else {
 			fmt.Fprintf(&f, "Use '%s' to find the apply ID.\n", cliname.Command("status", "-d", m.database, "-e", m.environment))
 		}
@@ -202,7 +202,7 @@ func (m WatchModel) progressSections() (string, string) {
 		// During cutover, show minimal footer - no detach/stop allowed
 		f.WriteString("\n\n")
 		dimStyle := lipgloss.NewStyle().Faint(true)
-		f.WriteString(dimStyle.Render("Cutover in progress - please wait..."))
+		f.WriteString(dimStyle.Render(cutoverInProgressFooter))
 		f.WriteString("\n")
 	case m.deployTriggered:
 		f.WriteString("\n\n")
@@ -222,7 +222,7 @@ func (m WatchModel) progressSections() (string, string) {
 			f.WriteString("Press Enter to deploy or proceed via the PlanetScale console (ESC to detach)\n")
 		} else {
 			if m.applyID != "" {
-				fmt.Fprintf(&f, "To proceed: %s\n", cliname.Command("start", "-e", m.environment, m.applyID))
+				fmt.Fprintf(&f, "To proceed: %s\n", templates.ControlCommand("start", m.applyID, m.environment))
 			} else {
 				fmt.Fprintf(&f, "To find the apply ID: %s\n", cliname.Command("status", "-d", m.database, "-e", m.environment))
 			}
@@ -236,7 +236,7 @@ func (m WatchModel) progressSections() (string, string) {
 			f.WriteString("Press Enter to proceed with cutover (or ESC to detach)\n")
 		} else {
 			if m.applyID != "" {
-				fmt.Fprintf(&f, "To proceed: %s\n", cliname.Command("cutover", "-e", m.environment, m.applyID))
+				fmt.Fprintf(&f, "To proceed: %s\n", templates.ControlCommand("cutover", m.applyID, m.environment))
 			} else {
 				fmt.Fprintf(&f, "To find the apply ID: %s\n", cliname.Command("status", "-d", m.database, "-e", m.environment))
 			}
@@ -326,6 +326,10 @@ func (m WatchModel) renderTables(b *strings.Builder, tables []templates.TablePro
 	}
 }
 
+// cutoverInProgressFooter replaces the keys a watcher offers while a cutover is
+// underway, since it ignores them until the cutover lands.
+const cutoverInProgressFooter = "Cutover in progress - please wait..."
+
 // formatFooter returns the standard footer.
 func (m WatchModel) formatFooter() string {
 	dimStyle := lipgloss.NewStyle().Faint(true)
@@ -383,9 +387,9 @@ func (m WatchModel) detachedView() string {
 	if m.applyID != "" {
 		fmt.Fprintf(&b, "To reattach: %s\n", templates.ProgressCommand(m.applyID, m.environment))
 		if state.IsState(m.state, state.Apply.WaitingForDeploy) {
-			fmt.Fprintf(&b, "To deploy:   %s\n", cliname.Command("start", "-e", m.environment, m.applyID))
+			fmt.Fprintf(&b, "To deploy:   %s\n", templates.ControlCommand("start", m.applyID, m.environment))
 		}
-		fmt.Fprintf(&b, "To stop:     %s\n", cliname.Command("stop", "-e", m.environment, m.applyID))
+		fmt.Fprintf(&b, "To stop:     %s\n", templates.ControlCommand("stop", m.applyID, m.environment))
 	} else {
 		fmt.Fprintf(&b, "Find apply:  %s\n", cliname.Command("status", "-d", m.database, "-e", m.environment))
 	}

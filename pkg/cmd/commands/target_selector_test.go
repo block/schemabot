@@ -229,7 +229,7 @@ func TestApplyCmd_TargetRefusedWhileItsDeploymentHasAnActiveSchemaChange(t *test
 			assert.Contains(t, out, tc.wantMsg)
 			assert.Contains(t, out, "status apply-running")
 			if tc.cutover {
-				assert.Contains(t, out, "cutover -e production apply-running")
+				assert.Contains(t, out, "cutover apply-running -e production")
 			} else {
 				assert.NotContains(t, out, "cutover -e production")
 			}

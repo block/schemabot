@@ -12,7 +12,6 @@ import (
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/cmd/client"
-	"github.com/block/schemabot/pkg/cmd/cliname"
 	"github.com/block/schemabot/pkg/cmd/internal/templates"
 	"github.com/block/schemabot/pkg/state"
 )
@@ -248,7 +247,7 @@ func startCommand(applyID, environment string) string {
 	if environment == "" {
 		environment = "<environment>"
 	}
-	return cliname.Command("start", "-e", environment, applyID)
+	return templates.ControlCommand("start", applyID, environment)
 }
 
 // noActiveChangeError ends a watch whose apply the server reports no active
