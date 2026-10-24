@@ -29,8 +29,8 @@ func (m WatchModel) multiDeploymentProgressSections() (string, string) {
 		StopByKey:    m.rolloutStopByKey(model),
 	}
 
-	var b strings.Builder
-	m.writeMultiDeploymentHeader(&b, model, groups)
+	var header, b strings.Builder
+	m.writeMultiDeploymentHeader(&header, model, groups)
 
 	// A deployment that addresses several targets renders as one rollup
 	// section, shared with the progress output; any other member keeps a
@@ -47,12 +47,19 @@ func (m WatchModel) multiDeploymentProgressSections() (string, string) {
 	}
 
 	b.WriteString(templates.FormatThrottleReference(m.tables))
+	body := b.String()
+	// Table blocks open on a blank line of their own; a deployment's section
+	// does not, so the header gives it one.
+	if header.Len() > 0 && !strings.HasPrefix(body, "\n") {
+		header.WriteString("\n")
+	}
 	var f strings.Builder
+	m.writeMultiDeploymentOutcome(&f, model, groups)
 	if footer := templates.FormatRolloutFooter(view); footer != "" {
 		f.WriteString(footer + "\n")
 	}
 	m.writeMultiDeploymentFooter(&f, model, view.StopByKey)
-	return b.String(), f.String()
+	return header.String() + body, f.String()
 }
 
 // rolloutStopByKey reports whether the watcher offers stop as a key for this
@@ -63,19 +70,21 @@ func (m WatchModel) rolloutStopByKey(model presentation.Apply) bool {
 	return model.OffersRolloutStop() && m.stopKeyAvailable()
 }
 
+// writeMultiDeploymentHeader writes the rollout's state line, the way the
+// single-target watcher writes its own: a spinner and the state while the
+// apply is active, followed by the rollout's counts. A finished apply has no
+// state line; its outcome closes the view instead (writeMultiDeploymentFooter).
 func (m WatchModel) writeMultiDeploymentHeader(b *strings.Builder, model presentation.Apply, groups []presentation.Group) {
 	switch {
 	case m.stopAwaitingConfirmation():
 		// Until the server reports the stop, the targets still read as
-		// running, so the status line acknowledges the key press instead.
+		// running, so the state line acknowledges the key press instead.
 		b.WriteString(m.spinner.View() + m.stopPendingLabel() + "\n")
-	case state.IsRunningApplyState(model.State) || state.IsState(model.State, state.Apply.Pending, state.Apply.WaitingForCutover, state.Apply.CuttingOver, state.Apply.Recovering):
-		b.WriteString(m.spinner.View() + model.Label + m.elapsed() + "\n")
+	case state.IsTerminalApplyState(model.State):
+	case rolloutStateIsActive(model.State):
+		b.WriteString(m.spinner.View() + rolloutStateLine(model, groups, "...") + "\n")
 	default:
-		b.WriteString(model.Label + "\n")
-	}
-	if label, counts := templates.RolloutCounts(model, groups); counts != "" {
-		fmt.Fprintf(b, "%s: %s\n", label, counts)
+		b.WriteString(rolloutStateLine(model, groups, "") + "\n")
 	}
 	if model.FirstFailure != nil {
 		errStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("9"))
@@ -85,13 +94,31 @@ func (m WatchModel) writeMultiDeploymentHeader(b *strings.Builder, model present
 			fmt.Fprintf(b, "%s\n", errStyle.Render(fmt.Sprintf(glyph.Failed+" First failure: %s", model.FirstFailure.Name)))
 		}
 	}
-	if m.applyID != "" {
-		fmt.Fprintf(b, "Apply ID: %s\n", m.applyID)
+}
+
+// rolloutStateIsActive reports whether the rollout is still working toward its
+// outcome, so its state line carries the spinner.
+func rolloutStateIsActive(s string) bool {
+	return state.IsRunningApplyState(s) || state.IsState(s, state.Apply.Pending, state.Apply.WaitingForCutover, state.Apply.CuttingOver, state.Apply.Recovering)
+}
+
+// rolloutStateLine is the rollout's state, capitalized as the single-target
+// watcher writes it, and how its members stand: "Running on all 4
+// targets..." while they agree, "Running... 1 completed · 3 running (4
+// targets)" once they differ. suffix follows the state, "..." while the apply
+// is active.
+func rolloutStateLine(model presentation.Apply, groups []presentation.Group, suffix string) string {
+	label := model.Label
+	if label != "" {
+		label = strings.ToUpper(label[:1]) + label[1:]
 	}
-	if m.environment != "" {
-		fmt.Fprintf(b, "Environment: %s\n", m.environment)
+	if coverage := templates.RolloutCoverage(model, groups); coverage != "" {
+		return label + " on " + coverage + suffix
 	}
-	b.WriteString("\n")
+	if counts := templates.RolloutCountsLine(model, groups); counts != "" {
+		return label + suffix + " " + counts
+	}
+	return label + suffix
 }
 
 func (m WatchModel) writeDeploymentSection(b *strings.Builder, deployment presentation.Deployment, op templates.ProgressOperation) {
@@ -141,18 +168,59 @@ func tablesForMember(tables []templates.TableProgress, deployment, target string
 	return memberTables
 }
 
-// writeMultiDeploymentFooter closes the view below the rollout footer. A
-// failed or stopped rollout ends on the footer's command, the way the progress
-// output does: the header already names the state, and a second banner would
-// repeat the recovery guidance beneath the command it describes.
-func (m WatchModel) writeMultiDeploymentFooter(b *strings.Builder, model presentation.Apply, stopByKey bool) {
+// writeMultiDeploymentOutcome states how a finished rollout ended, above the
+// rollout footer's command, the way the single-target watcher closes: what
+// happened, then what to run next.
+func (m WatchModel) writeMultiDeploymentOutcome(b *strings.Builder, model presentation.Apply, groups []presentation.Group) {
 	switch {
 	case state.IsState(model.State, state.Apply.Completed):
+		summary := countRolloutTableChanges(m.tables).summary()
+		if targets := len(model.Deployments); targets > 1 && summary != "" {
+			on := templates.RolloutCoverage(model, groups)
+			if on == "" {
+				on = rolloutMemberNoun(groups).Count(targets)
+			}
+			summary = strings.TrimSuffix(summary, ".") + " on " + on + "."
+		}
+		b.WriteString(templates.FormatApplyCompleteWithSummary(summary, m.applyID))
 		b.WriteString("\n")
-		b.WriteString(templates.FormatApplyCompleteWithSummary(countTableProgressChanges(m.tables).summary(), m.applyID))
-		b.WriteString("\n")
-	case state.IsState(model.State, state.Apply.Failed, state.Apply.Stopped):
-		// Nothing follows the rollout footer's command.
+	case state.IsState(model.State, state.Apply.Stopped):
+		b.WriteString(templates.FormatApplyStopped() + outcomeCounts(model, groups) + "\n")
+	case state.IsState(model.State, state.Apply.Failed):
+		b.WriteString(templates.FormatApplyFailedHeadline() + outcomeCounts(model, groups) + "\n")
+	case state.IsState(model.State, state.Apply.Cancelled):
+		b.WriteString("🚫 Schema change cancelled" + outcomeCounts(model, groups) + "\n")
+	}
+}
+
+// outcomeCounts follows a finished rollout's outcome with how its members
+// ended: " on all 4 targets" when they agree, ": 1 completed · 3 stopped (4
+// targets)" when they differ.
+func outcomeCounts(model presentation.Apply, groups []presentation.Group) string {
+	if coverage := templates.RolloutCoverage(model, groups); coverage != "" {
+		return " on " + coverage
+	}
+	if counts := templates.RolloutCountsLine(model, groups); counts != "" {
+		return ": " + counts
+	}
+	return ""
+}
+
+// rolloutMemberNoun is what the rollout's counts count (templates.RolloutCountsUnit).
+func rolloutMemberNoun(groups []presentation.Group) presentation.Noun {
+	if templates.RolloutCountsUnit(groups) == "Targets" {
+		return presentation.TargetNoun
+	}
+	return presentation.DeploymentNoun
+}
+
+// writeMultiDeploymentFooter closes the view with the keys the operator can
+// press. A finished rollout has none: its outcome and the rollout footer's
+// command already close it.
+func (m WatchModel) writeMultiDeploymentFooter(b *strings.Builder, model presentation.Apply, stopByKey bool) {
+	switch {
+	case state.IsTerminalApplyState(model.State):
+		// Nothing follows the outcome and the rollout footer's command.
 	case m.cuttingOver():
 		// The watcher ignores ESC and stop until the cutover lands.
 		b.WriteString(lipgloss.NewStyle().Faint(true).Render(cutoverInProgressFooter))

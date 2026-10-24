@@ -829,7 +829,7 @@ func previewWaitingForCutoverOutput() {
 	fmt.Println("Row copy complete. All data has been copied and new writes")
 	fmt.Println("continue to be replicated to keep the shadow table in sync.")
 	fmt.Println()
-	fmt.Printf("To proceed: %s cutover -e staging <apply_id>\n", cliname.Name())
+	fmt.Printf("To proceed: %s cutover <apply_id> -e staging\n", cliname.Name())
 	fmt.Println("Watching for cutover... (Ctrl+C to detach)")
 }
 
@@ -934,7 +934,8 @@ func previewStoppedOutput() {
 		},
 	}
 	WriteProgress(data)
-	fmt.Printf("\nStopped. Use '%s start -e staging <apply_id>' to resume from checkpoint.\n", cliname.Name())
+	fmt.Printf("\n%s\n", FormatApplyStopped())
+	fmt.Print(FormatNextCommand(ResumeLabel, ControlCommand("start", "<apply_id>", "staging")))
 }
 
 func previewApplyWatchOutput() {
@@ -1014,7 +1015,7 @@ func previewApplyStoppedOutput() {
 	WriteProgress(data)
 
 	fmt.Printf("%s\n", FormatApplyStopped())
-	fmt.Printf("Use '%s start -e staging <apply_id>' to resume.\n", cliname.Name())
+	fmt.Print(FormatNextCommand(ResumeLabel, ControlCommand("start", "<apply_id>", "staging")))
 }
 
 // =============================================================================
@@ -1022,7 +1023,7 @@ func previewApplyStoppedOutput() {
 // =============================================================================
 
 func previewStopCommandOutput() {
-	fmt.Printf("Stop command: User runs '%s stop -e staging <apply_id>'\n", cliname.Name())
+	fmt.Printf("Stop command: User runs '%s stop <apply_id> -e staging'\n", cliname.Name())
 	fmt.Println()
 
 	WriteStopSuccess(StopData{
@@ -1060,7 +1061,7 @@ func previewStopCommandOutput() {
 }
 
 func previewStartCommandOutput() {
-	fmt.Printf("Start command: User runs '%s start -e staging <apply_id>'\n", cliname.Name())
+	fmt.Printf("Start command: User runs '%s start <apply_id> -e staging'\n", cliname.Name())
 	fmt.Println()
 
 	WriteStartSuccess(StartData{

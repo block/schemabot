@@ -52,7 +52,7 @@ func TestWatchViewFitsTheWindow(t *testing.T) {
 
 	assert.Equal(t, 20, frameRows(fitted))
 	assert.Equal(t, strings.SplitN(stripANSI(full), "\n", 2)[0], strings.SplitN(plain, "\n", 2)[0], "the status line stays on top")
-	assert.Contains(t, plain, "Apply ID: apply-abc123")
+	assert.Contains(t, plain, "shard_00", "the first section stays below the status line")
 	assert.True(t, strings.HasSuffix(plain, "ESC detach • s stop\n"), plain)
 
 	_, footer := m.multiDeploymentProgressSections()
@@ -152,7 +152,7 @@ func TestRolloutViewAcknowledgesAPendingStop(t *testing.T) {
 	lines := strings.Split(m.View(), "\n")
 	require.GreaterOrEqual(t, len(lines), 2)
 	assert.True(t, strings.HasSuffix(lines[0], "Stopping..."), "status line acknowledges the stop: %q", lines[0])
-	assert.Equal(t, "Deployments: 4 running", lines[1], "the targets keep their reported state until the stop lands")
+	assert.Contains(t, m.View(), "running table copy", "the targets keep their reported state until the stop lands")
 
 	m.state = state.Apply.Stopped
 	for i := range m.operations {

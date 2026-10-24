@@ -382,8 +382,8 @@ func TestWatchModel_MultiDeploymentView(t *testing.T) {
 
 	assert.Contains(t, view, "1 completed · 1 halted · 1 failed")
 	assert.Contains(t, view, "❌ First failure: eu-west — duplicate key name 'idx_orders_source'")
-	assert.Contains(t, view, "Apply ID: apply-multi-test")
-	assert.Contains(t, view, "Environment: production")
+	assert.NotContains(t, view, "Apply ID:", "the rollout names its apply where the command that needs it does")
+	assert.Contains(t, view, "✗ Apply failed"+templates.ANSIReset+": 1 completed · 1 halted · 1 failed (3 deployments)")
 	assertContainsInOrder(t, view,
 		"✅ us-east — completed (orders-us-east)",
 		"External operation ID: remote-op-us-east-test",
@@ -413,7 +413,7 @@ func TestWatchModel_MultiDeploymentViewRunningDegraded(t *testing.T) {
 
 	view := m.View()
 
-	assert.Contains(t, view, "running (degraded)")
+	assert.Contains(t, view, "Running (degraded)... 1 running · 1 failed (2 deployments)")
 	assert.Contains(t, view, "1 running · 1 failed")
 	assert.Contains(t, view, "❌ First failure: eu — duplicate column")
 	assert.Contains(t, view, "🔄 us — running table copy")
@@ -479,7 +479,9 @@ func TestWatchModel_MultiTargetRolloutEndsOnItsRecoveryCommand(t *testing.T) {
 	stopped := render(state.Apply.Stopped, state.ApplyOperation.Stopped)
 	assert.True(t, strings.HasSuffix(stopped, "schemabot start apply-rollout-end -e production"+templates.ANSIReset+"\n\n"),
 		"the resume command closes the view:\n%s", stopped)
-	assert.NotContains(t, stopped, "Apply stopped")
+	assert.Contains(t, stopped, "⏹️ Apply stopped"+templates.ANSIReset+": 1 completed · 1 stopped (2 targets)\nTo resume from where it stopped:\n",
+		"the outcome states how the targets ended above the command:\n%s", stopped)
+	assert.Equal(t, 1, strings.Count(stopped, "Apply stopped"), "the outcome is said once:\n%s", stopped)
 }
 
 func TestWatchModel_SingleDeploymentOutputDoesNotUseMultiView(t *testing.T) {
@@ -911,8 +913,7 @@ func TestWatchModel_MultiTargetRollupScopesTablesToTheirMember(t *testing.T) {
 	view := m.View()
 
 	assertContainsInOrder(t, view,
-		"Targets: 1 completed · 1 running",
-		"1 completed · 1 running (2 targets)",
+		"Running... 1 completed · 1 running (2 targets)",
 		"users_002",
 		"target testapp-002",
 		"users_001",
@@ -986,4 +987,35 @@ func TestWatchModel_PendingApplyReadsAsQueued(t *testing.T) {
 
 	assert.Contains(t, view, "Queued, starts automatically")
 	assert.NotContains(t, view, "Starting")
+}
+
+// A rollout reads the way a single target does: a spinner and its state while
+// it runs, with the targets' counts on the same line, and no state line once it
+// finishes, where the outcome counts the change once however many targets ran
+// it. Targets that agree are named together rather than counted twice.
+func TestWatchModel_MultiTargetStateLineMatchesTheSingleTarget(t *testing.T) {
+	render := func(opStates []string, taskStatus string, applyState string) string {
+		m := NewWatchModel("http://localhost:8080", "shop", "production", false)
+		m.applyID = "apply-rollout-line"
+		m.state = applyState
+		m.initialized = true
+		for i, opState := range opStates {
+			target := fmt.Sprintf("shop-%03d", i+1)
+			m.operations = append(m.operations, templates.ProgressOperation{Deployment: "prod", Target: target, State: opState, CutoverPolicy: storage.CutoverPolicyParallel, OnFailure: storage.OnFailureHalt})
+			m.tables = append(m.tables, templates.TableProgress{Deployment: "prod", Target: target, TableName: "orders", ChangeType: "alter", Status: taskStatus, RowsCopied: 500, RowsTotal: 1000, PercentComplete: 50})
+		}
+		return stripANSI(m.View())
+	}
+
+	running := render([]string{state.ApplyOperation.Running, state.ApplyOperation.Running, state.ApplyOperation.Running}, state.Task.Running, state.Apply.Running)
+	assert.Contains(t, running, "Running on all 3 targets...\n", running)
+	assert.NotContains(t, running, "Apply ID:", running)
+	assert.Contains(t, running, "50.00%", "the percent across targets has a single target's precision:\n%s", running)
+
+	mixed := render([]string{state.ApplyOperation.Completed, state.ApplyOperation.Running, state.ApplyOperation.Running}, state.Task.Running, state.Apply.Running)
+	assert.Contains(t, mixed, "Running... 1 completed · 2 running (3 targets)\n", mixed)
+
+	completed := render([]string{state.ApplyOperation.Completed, state.ApplyOperation.Completed, state.ApplyOperation.Completed}, state.Task.Completed, state.Apply.Completed)
+	assert.NotContains(t, completed, "Completed on", "a finished rollout has no state line:\n%s", completed)
+	assert.Contains(t, completed, "✓ Apply complete! Changes: 1 altered on all 3 targets. Apply ID: apply-rollout-line\n", completed)
 }

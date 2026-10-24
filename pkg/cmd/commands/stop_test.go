@@ -66,7 +66,7 @@ func TestStopCmdWithdrawsAQueuedStart(t *testing.T) {
 	assert.Equal(t, 1, *stopCalls, "a stopped schema change still sends the stop, so a queued start can be withdrawn")
 	assert.Contains(t, out, "Schema change stopped")
 	assert.Contains(t, out, "The start requested earlier had not taken effect yet, so this stop withdrew it.")
-	assert.Contains(t, out, "start -e staging "+stopTestApplyID)
+	assert.Contains(t, out, "start "+stopTestApplyID+" -e staging")
 	assert.NotContains(t, out, "Stopped:")
 }
 

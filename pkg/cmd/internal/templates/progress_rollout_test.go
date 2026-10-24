@@ -145,7 +145,7 @@ func TestWriteProgress_ThreeTargetRolloutIsOneSection(t *testing.T) {
 	out := renderRollout(t, targetRolloutData([]rolloutTarget{completedTarget(), copyingTarget(400), queuedTarget()}))
 
 	assert.Contains(t, out, "Targets:      1 completed · 1 running · 1 queued")
-	assert.Contains(t, out, "🔄 1 completed · 1 running · 1 queued (3 targets)")
+	assert.NotContains(t, out, "(3 targets)", "the header already counts the targets, so the section does not repeat them:\n%s", out)
 	assert.Equal(t, 1, strings.Count(out, "ADD COLUMN `region`"), "the shared change's DDL is shown once:\n%s", out)
 	assert.Contains(t, out, "46%", "the bar is the table's progress across all three targets")
 	assert.Contains(t, out, "Rows: 1,400 / 2,000 across 2 of 3 targets · ETA: ≥ 2m 0s")
@@ -190,7 +190,7 @@ func TestWriteProgress_TargetRollupHoldsPastItsEstimate(t *testing.T) {
 		{opState: state.ApplyOperation.Running, status: state.Task.Running, rowsCopied: 1100, rowsTotal: 1000},
 	}))
 
-	assert.Contains(t, out, "99%\n", "%s", out)
+	assert.Contains(t, out, "99.99%\n", "%s", out)
 	assert.Contains(t, out, "Rows: 2,000 / 2,000\n", "%s", out)
 }
 
@@ -209,7 +209,7 @@ func TestWriteProgress_TargetRollupCountsSettledTargetsApart(t *testing.T) {
 	finished := targetRolloutData([]rolloutTarget{ran, ran, converged})
 	finished.State = state.Apply.Completed
 	out := renderRollout(t, finished)
-	assert.Contains(t, out, "✅ 2 completed · 1 already had it (3 targets)")
+	assert.Contains(t, out, "Targets:      2 completed · 1 already had it")
 	assert.Contains(t, out, "1 of 3 targets already had this schema; nothing ran there.")
 	assert.NotContains(t, out, "have not reported progress yet", "a finished target is not waiting to report:\n%s", out)
 
@@ -217,7 +217,7 @@ func TestWriteProgress_TargetRollupCountsSettledTargetsApart(t *testing.T) {
 	settled := targetRolloutData([]rolloutTarget{ran, ran, reaped})
 	settled.State = state.Apply.Completed
 	out = renderRollout(t, settled)
-	assert.Contains(t, out, "✅ 3 completed (3 targets)")
+	assert.Contains(t, out, "Targets:      3 completed")
 	assert.NotContains(t, out, "already had", "a reaped target is not one that already had the change:\n%s", out)
 
 	failedEarly := rolloutTarget{opState: state.ApplyOperation.Failed, startedAt: "2026-09-30T12:00:00Z", err: "connection refused"}
@@ -294,7 +294,7 @@ func TestWriteProgress_SixtyFourTargetRolloutStaysOneScreen(t *testing.T) {
 	out := renderRollout(t, wideRollout())
 
 	assert.Less(t, strings.Count(out, "\n"), 50, "the rollout is not a section per target:\n%s", out)
-	assert.Contains(t, out, "❌ 40 completed · 19 running · 4 queued · 1 failed (64 targets)")
+	assert.Contains(t, out, "Targets:      40 completed · 19 running · 4 queued · 1 failed")
 	assert.Equal(t, 1, strings.Count(out, "ADD COLUMN `region`"))
 	assert.NotContains(t, out, "❌ Failed", "a table still copying on 19 targets does not read as failed")
 	assert.Contains(t, out, "• Targets: 64 (1 failed, 19 copying, 4 queued, 40 complete)\n"+
@@ -424,7 +424,7 @@ func TestWriteProgress_TargetRollupSumsTargetsPastRowCopy(t *testing.T) {
 	waiting := rolloutTarget{opState: state.ApplyOperation.WaitingForCutover, status: state.Task.WaitingForCutover, rowsCopied: 1000, rowsTotal: 1000}
 
 	out := renderRollout(t, targetRolloutData([]rolloutTarget{waiting, copyingTarget(200)}))
-	assert.Contains(t, out, "60%", "the bar sums every target past the start of its copy:\n%s", out)
+	assert.Contains(t, out, "60.00%", "the bar sums every target past the start of its copy:\n%s", out)
 	assert.Contains(t, out, "Rows: 1,200 / 2,000 · ETA: 2m 0s")
 	assert.Contains(t, out, "• Targets: 2 (1 copying, 1 waiting for cutover)\n"+
 		"           ● payments-001: waiting for cutover\n"+
@@ -545,9 +545,11 @@ func TestInFlightRollupOrder_CoversEveryInFlightTaskState(t *testing.T) {
 }
 
 // A table on which no target is still working and one has halted reads as
-// its halt, the way the PR comment's table line does. Its summed rows would
-// cover only the targets that finished, so no bar or rows line speaks for the
-// table. A table with a stopped target lists its targets, each stopped
+// its halt. A stopped table reads the way a stopped table of one target does,
+// its bar and rows at where its targets stopped, each target counted as far
+// as it copied; a table halted any other way has no bar or rows line, since
+// its rows would cover only the targets that finished. A table with a stopped
+// target lists its targets, each stopped
 // target's line saying where it stopped, since that is where it resumes, even
 // when a failed sibling makes the table read as failed; any other counts on
 // its own line the targets that finished or failed. "not started" is said only when no
@@ -563,16 +565,19 @@ func TestWriteProgress_HaltedTargetRollupReadsAsItsHalt(t *testing.T) {
 	for name, tc := range map[string]struct {
 		targets []rolloutTarget
 		line    string
+		rows    string
 		listing []string
 	}{
 		"two targets stopped part-way": {
 			targets: []rolloutTarget{stoppedAt(400), stoppedAt(400)},
-			line:    "~ orders: ⏹️ Stopped\n",
+			line:    "~ orders: " + ui.ProgressBarStopped(40) + " ⏹️ Stopped at 40.00%\n",
+			rows:    "• Rows: 800 / 2,000\n",
 			listing: []string{"• Targets: 2 (2 stopped)", "○ payments-001: stopped at 40.00% · 400 / 1,000 rows", "○ payments-002: stopped at 40.00% · 400 / 1,000 rows"},
 		},
 		"one target done and one stopped part-way": {
 			targets: []rolloutTarget{completedTarget(), stoppedAt(400)},
-			line:    "~ orders: ⏹️ Stopped\n",
+			line:    "~ orders: " + ui.ProgressBarStopped(70) + " ⏹️ Stopped at 70.00%\n",
+			rows:    "• Rows: 1,400 / 2,000\n",
 			listing: []string{"• Targets: 2 (1 stopped, 1 complete)", "✓ payments-001: 1,000 rows", "○ payments-002: stopped at 40.00% · 400 / 1,000 rows"},
 		},
 		"one target done and one failed part-way": {
@@ -595,7 +600,7 @@ func TestWriteProgress_HaltedTargetRollupReadsAsItsHalt(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			out := renderRollout(t, targetRolloutData(tc.targets))
-			assert.Contains(t, out, tc.line, "the table reads as its halt, with no bar:\n%s", out)
+			assert.Contains(t, out, tc.line, "the table reads as its halt:\n%s", out)
 			if len(tc.listing) == 0 {
 				assert.NotContains(t, out, "• Targets:", "only a table with a stopped target lists its targets:\n%s", out)
 			} else {
@@ -605,7 +610,11 @@ func TestWriteProgress_HaltedTargetRollupReadsAsItsHalt(t *testing.T) {
 					prev = line
 				}
 			}
-			assert.NotContains(t, out, "Rows:", "no summed rows speak for a halted table:\n%s", out)
+			if tc.rows == "" {
+				assert.NotContains(t, out, "Rows:", "no summed rows speak for a table halted short of a stop:\n%s", out)
+			} else {
+				assert.Contains(t, out, tc.rows, "a stopped table sums the rows its targets copied:\n%s", out)
+			}
 			assert.NotContains(t, out, "was waiting for cutover")
 			if !strings.Contains(tc.line, "not started") {
 				assert.NotContains(t, out, "not started")
@@ -1097,15 +1106,15 @@ func TestWriteProgress_SettledRolloutTableReadsNotStarted(t *testing.T) {
 
 // A rollup's headline counts the deployment's targets, singular for a
 // deployment of one target and plural for several. An apply whose only
-// deployment rolls out to several targets leads with the counts, with no
-// deployment name to tell it apart (presentation.SoleTargetRollout).
+// deployment rolls out to several targets has no headline: the rollout's own
+// state line already counts them (presentation.SoleTargetRollout).
 func TestFormatTargetRollup_HeadlineCountsTargets(t *testing.T) {
 	for _, tc := range []struct {
 		targets []rolloutTarget
 		want    string
 	}{
 		{targets: []rolloutTarget{copyingTarget(400)}, want: "🔄 prod — 1 running (1 target)\n"},
-		{targets: []rolloutTarget{completedTarget(), copyingTarget(400)}, want: "🔄 1 completed · 1 running (2 targets)\n"},
+		{targets: []rolloutTarget{completedTarget(), copyingTarget(400)}, want: "\n  ── orders ──\n"},
 	} {
 		data := targetRolloutData(tc.targets)
 		model := presentation.Derive(ProgressOperationsForPresentation(data.Operations, data.Tables, data.Released))
