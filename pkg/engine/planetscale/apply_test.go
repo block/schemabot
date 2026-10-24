@@ -752,6 +752,32 @@ func TestResumeApply_UnknownDeployOutcomePausesOnlyWhenTheDeployRequestIsRecorde
 	}
 }
 
+// A resumed apply saves the deploy request twice: once as it opens it and
+// once with the deploy decisions. When only the first save lands, the stored
+// state still names the deploy request, so recovery can re-read it and an
+// unknown deploy outcome pauses rather than fails.
+func TestResumeApply_UnknownDeployOutcomePausesWhenOnlyTheLaterSaveFails(t *testing.T) {
+	shortenEngineWaits(t)
+	client := &unansweredDeployClient{}
+	req := resumeRequest(t, &psMetadata{BranchName: "schemabot-testdb-1a2b"}, "apply-1a2b3c4d5e6f7890")
+	var stored []*engine.ResumeState
+	req.OnStateChange = func(rs *engine.ResumeState) error {
+		if len(stored) > 0 {
+			return errors.New("apply apply-1a2b3c4d5e6f7890: storage unavailable")
+		}
+		stored = append(stored, rs)
+		return nil
+	}
+
+	_, err := conformanceEngine(client).resumeApply(t.Context(), client, "org", req)
+
+	assertUnknownDeployOutcome(t, err, true)
+	require.Len(t, stored, 1, "only the save made as the deploy request was opened landed")
+	meta, decodeErr := decodePSMetadata(stored[0].Metadata)
+	require.NoError(t, decodeErr)
+	assert.Equal(t, uint64(93), meta.DeployRequestID, "the stored resume state names the deploy request recovery re-reads")
+}
+
 // A deploy whose outcome is unknown pauses the apply for a recovery that
 // re-reads the deploy request named in the resume state. When the resume state
 // does not name it, that recovery would start the apply over, so the error is

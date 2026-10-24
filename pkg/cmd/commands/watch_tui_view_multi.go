@@ -55,9 +55,14 @@ func (m WatchModel) multiDeploymentProgressSections() (string, string) {
 }
 
 func (m WatchModel) writeMultiDeploymentHeader(b *strings.Builder, model presentation.Apply, groups []presentation.Group) {
-	if state.IsRunningApplyState(model.State) || state.IsState(model.State, state.Apply.Pending, state.Apply.WaitingForCutover, state.Apply.CuttingOver, state.Apply.Recovering) {
+	switch {
+	case m.stopAwaitingConfirmation():
+		// Until the server reports the stop, the targets still read as
+		// running, so the status line acknowledges the key press instead.
+		b.WriteString(m.spinner.View() + m.stopPendingLabel() + "\n")
+	case state.IsRunningApplyState(model.State) || state.IsState(model.State, state.Apply.Pending, state.Apply.WaitingForCutover, state.Apply.CuttingOver, state.Apply.Recovering):
 		b.WriteString(m.spinner.View() + model.Label + m.elapsed() + "\n")
-	} else {
+	default:
 		b.WriteString(model.Label + "\n")
 	}
 	if label, counts := templates.RolloutCounts(model, groups); counts != "" {

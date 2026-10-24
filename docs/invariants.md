@@ -1232,7 +1232,9 @@ on both clients (`pkg/tern/local_control.go`, `pkg/tern/grpc_client.go`), and th
 of requests left pending on an apply that has settled and that no drive still holds
 (`pkg/api/reaper.go`, `ListStrandedPending` in `pkg/storage/internal/sqlstore/control_requests.go`),
 which answers them through the drive tail's own terminal sweep
-(`SettlePendingRequestsForTerminalApply`, `pkg/tern/control_requests.go`).
+(`SettlePendingRequestsForTerminalApply`, `pkg/tern/control_requests.go`),
+and the cutover admission gate, which refuses a request against an apply already in a terminal
+state instead of recording it (`cutoverRequestReadiness`, `pkg/api/control_handlers.go`).
 
 ### CO-3: Engine terminal truth outranks a queued command
 

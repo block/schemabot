@@ -30,6 +30,16 @@ SchemaBot is declarative and GitOps-driven: SQL files in your repository provide
 
 [Walk through the illustrated PR workflow](./docs/pre-merge-workflow.md#the-pr-workflow-step-by-step)
 
+**Roll out to every target.** One apply copies an environment's targets in parallel, as many at once as the server's per-apply driver cap allows, and the check passes once all of them have the change.
+
+<img src="./assets/pr-multi-target-demo.gif" width="800" alt="A PR applies an index to four targets in parallel, follows each target's copy, and merges once every target has the change">
+
+**Start with one target.** `--target` applies one target first, and the check keeps blocking merge until the rest have the change.
+
+<img src="./assets/pr-target-demo.gif" width="800" alt="A PR applies an index to one target with --target, and the schema check keeps blocking merge until every target has the change">
+
+[Roll out to several targets](./docs/mysql.md#multi-target-environments)
+
 ## From your terminal
 
 **Plan and apply a change.** Review the SQL, apply the change, and follow it to completion.
@@ -39,6 +49,14 @@ SchemaBot is declarative and GitOps-driven: SQL files in your repository provide
 **Know your database fleet.** Explore live schemas, spot lint issues, and follow changes through their logs.
 
 <img src="./assets/cli-ops.gif" width="800" alt="Inspect fleet status, follow one change, and read its logs">
+
+**Apply to every target at once.** One apply fans an environment out to all its targets, copies them in parallel up to the per-apply driver cap, and cuts each over as soon as its copy is ready.
+
+<img src="./assets/cli-multi-target.gif" width="800" alt="Apply an index to four targets of one environment and follow their copies in parallel">
+
+**Apply to one target first.** Narrow the plan and apply to a single target with `--target` before rolling out to the rest.
+
+<img src="./assets/cli-target.gif" width="800" alt="Plan and apply an index to one target of a multi-target environment">
 
 [Get started with the CLI](./docs/cli.md) · [Explore your database fleet](./docs/schema-intelligence.md)
 

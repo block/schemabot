@@ -489,6 +489,8 @@ An environment can fan out to several targets, from a `targets:` list or a
 Pass `--target` to plan and apply one member only, for example to land a
 change on one target before the rest:
 
+![Plan and apply an index to one target of a multi-target environment](../assets/cli-target.gif)
+
 ```console
 $ schemabot apply -s ./schema -e production --target payments-002
 ...
@@ -522,7 +524,12 @@ In an environment with a single target, `--target` names the whole rollout,
 so the plan and apply are not narrowed.
 
 A plan of the whole rollout plans every target beside the first one and shows
-what applies where. It reports no changes only when every target is at the
+what applies where. Applying it fans the change out to every target and
+follows each target's copy in the same watcher:
+
+![Apply an index to four targets of one environment and follow their copies in parallel](../assets/cli-multi-target.gif)
+
+The plan reports no changes only when every target is at the
 desired schema, so a re-run of an `apply` that already landed, or the
 verification step of `onboard`, reads as up to date. When the first target is
 already at the desired schema, for example after an apply narrowed to it,
@@ -650,6 +657,13 @@ to resume from the checkpoint and reopen live progress.
 **Esc** only detaches your terminal and leaves the change running.
 
 ![Press s, wait for Stopped, then run start and follow the change to completion](../assets/cli-stop.gif)
+
+On a [multi-target environment](mysql.md#multi-target-environments), stop
+and start act on the whole apply. Every target still copying stops at its
+checkpoint, a target that already finished stays finished, and `start`
+resumes each stopped target from its own checkpoint:
+
+![Press s to stop a four-target rollout, then start resumes each stopped target from its checkpoint](../assets/cli-multi-target-stop.gif)
 
 ### Choose when to cut over
 
