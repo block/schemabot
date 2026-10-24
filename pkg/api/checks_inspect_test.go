@@ -593,3 +593,23 @@ func TestChecksInspectRequestFromQueryFoldsRepositoryCase(t *testing.T) {
 	assert.Equal(t, "acme/store", req.Repo)
 	assert.Equal(t, 412, req.PullRequest)
 }
+
+type failingInspectDiscovery struct{ *inspectGitHubClient }
+
+func (*failingInspectDiscovery) FindAllConfigs(context.Context, string, string) (*ghclient.FindAllConfigsResult, error) {
+	return &ghclient.FindAllConfigsResult{InvalidConfigs: []ghclient.InvalidConfigInfo{{Path: "schemabot.yaml", Error: "invalid YAML"}}}, nil
+}
+
+func TestInspectionRetainsStoredFailureWhenCoverageFails(t *testing.T) {
+	cfg := &ServerConfig{AllowedEnvironments: []string{"production"}, Databases: map[string]DatabaseConfig{"orders": {Environments: map[string]EnvironmentConfig{"production": {}}}}}
+	store := &inspectStorage{checks: &inspectCheckStore{checks: []*storage.Check{{Repository: "org/repo", PullRequest: 1, HeadSHA: "head", Environment: "production", DatabaseName: "_aggregate", DatabaseType: "_aggregate", Status: checkstate.StatusCompleted, Conclusion: checkstate.ConclusionFailure, BlockingReason: checkstate.BlockConfigDiscoveryFailed}}}, applies: &inspectApplyStore{}}
+	client := &failingInspectDiscovery{&inspectGitHubClient{prInfo: &ghclient.PullRequestInfo{HeadSHA: "head"}}}
+	response, err := inspectChecks(t.Context(), cfg, store, client, ChecksInspectRequest{Repo: "org/repo", PullRequest: 1}, discardLogger())
+	require.NoError(t, err)
+	require.Len(t, response.Rows, 1)
+	assert.Equal(t, checkstate.ConclusionFailure, response.Rows[0].Conclusion)
+	assert.True(t, response.Rows[0].Blocking)
+	assert.Contains(t, response.CoverageError, "Could not determine which SchemaBot checks should exist")
+	assert.Empty(t, response.MissingCheckRunNames)
+	assert.Equal(t, 0, client.runCalls)
+}

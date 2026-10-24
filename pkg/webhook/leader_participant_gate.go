@@ -139,6 +139,15 @@ func (h *Handler) participantCheckOutcomes(
 	checks := make([]*storage.Check, 0, len(expected))
 	retriable := false
 	for _, tenant := range expected {
+		coverageEnvironment := env
+		if env == aggregateSentinel {
+			coverageEnvironment = ""
+		}
+		if !tenant.PublishesEnvironment(coverageEnvironment) {
+			h.logger.Debug("participant does not publish checks for aggregate environment",
+				"repo", repo, "pr", pr, "environment", env, "tenant", tenant.Tenant)
+			continue
+		}
 		outcome := h.resolveParticipantOutcome(ctx, client, repo, pr, env, headSHA, tenant)
 		retriable = retriable || outcome.retriable
 		checks = append(checks, synthesizeParticipantCheck(outcome, repo, pr, headSHA, env, retryPending))

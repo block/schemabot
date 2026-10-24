@@ -284,7 +284,18 @@ type passingAggregateCheckContent struct {
 // names as the PR-head aggregates so branch protection's required checks
 // always match.
 func (h *Handler) postPassingAggregateChecks(ctx context.Context, client *ghclient.InstallationClient, repo, headSHA string, content passingAggregateCheckContent) error {
-	for _, target := range h.aggregateCheckTargetsForRepo(repo) {
+	targets := h.aggregateCheckTargetsForRepo(repo)
+	if config, ok := h.serverConfig(); ok && len(config.AllowedEnvironments) > 0 {
+		environments, err := config.CheckEnvironmentsForRepo(ctx, client, repo, headSHA)
+		if err != nil {
+			return fmt.Errorf("resolve %s coverage: %w", content.operation, err)
+		}
+		targets = nil
+		for _, env := range environments {
+			targets = append(targets, aggregateCheckTarget{name: aggregateCheckNameForEnv(h.aggregateCheckNameForRepo(repo), env), environment: env})
+		}
+	}
+	for _, target := range targets {
 		opts := ghclient.CheckRunOptions{
 			Name:       target.name,
 			Status:     checkStatusCompleted,

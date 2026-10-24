@@ -147,7 +147,7 @@ func TestUpdateAggregateCheckOnceFollowUpContract(t *testing.T) {
 
 		followUp, err := h.updateAggregateCheckOnce(t.Context(), client, "octocat/hello-world", 1, "")
 
-		assert.Equal(t, aggregateFoldScheduleLeaderRefold, followUp)
+		assert.Equal(t, aggregateFoldScheduleRefold, followUp)
 		assert.Error(t, err)
 	})
 
@@ -157,7 +157,7 @@ func TestUpdateAggregateCheckOnceFollowUpContract(t *testing.T) {
 
 		followUp, err := h.updateAggregateCheckOnce(t.Context(), client, "octocat/hello-world", 1, "stale111")
 
-		assert.Equal(t, aggregateFoldScheduleLeaderRefold, followUp)
+		assert.Equal(t, aggregateFoldScheduleRefold, followUp)
 		assert.NoError(t, err, "a genuinely newer head is not an operational failure")
 	})
 
@@ -169,7 +169,7 @@ func TestUpdateAggregateCheckOnceFollowUpContract(t *testing.T) {
 
 		followUp, err := h.updateAggregateCheckOnce(t.Context(), client, "octocat/hello-world", 1, "abc123")
 
-		assert.Equal(t, aggregateFoldScheduleLeaderRefold, followUp)
+		assert.Equal(t, aggregateFoldScheduleRefold, followUp)
 		assert.Error(t, err)
 	})
 
@@ -180,7 +180,7 @@ func TestUpdateAggregateCheckOnceFollowUpContract(t *testing.T) {
 
 		followUp, err := h.updateAggregateCheckOnce(t.Context(), client, "octocat/hello-world", 1, "abc123")
 
-		assert.Equal(t, aggregateFoldScheduleLeaderRefold, followUp)
+		assert.Equal(t, aggregateFoldScheduleRefold, followUp)
 		assert.Error(t, err)
 	})
 
@@ -272,6 +272,7 @@ func TestUpdateAggregateCheckOnceFollowUpContract(t *testing.T) {
 		}
 		h, mux, client := newFoldHandler(t, cfg, store)
 		serveHeadSHA(t, mux, "abc123")
+		serveLeaderPRFiles(t, mux, "README.md")
 		serveCheckRunCreate(t, mux)
 
 		followUp, err := h.updateAggregateCheckOnce(t.Context(), client, "octocat/hello-world", 1, "abc123")
