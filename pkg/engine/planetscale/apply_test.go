@@ -577,6 +577,30 @@ func TestDeployDeployRequest_FailedRereadReportsUnknownOutcome(t *testing.T) {
 	})
 }
 
+// A drive whose context ends while its deploy call is in flight is handing the
+// apply to the driver that resumes it from stored state, which re-reads the
+// deploy request itself. The ended drive sends no re-read and reports the
+// context's end, not an unknown deploy outcome it never observed.
+func TestDeployDeployRequest_DriveEndedDuringTheDeployCallSendsNoReread(t *testing.T) {
+	e := New(slog.New(slog.NewTextHandler(os.Stdout, nil)))
+	ctx, endDrive := context.WithCancel(t.Context())
+	endDrive()
+	client := &deployOutcomeUnknownClient{
+		deployErr: context.Canceled,
+		reread:    &ps.DeployRequest{Number: 9, DeploymentState: deployState.Ready},
+	}
+
+	dr, err := e.deployDeployRequest(ctx, client, "org", "testdb", 9, false, nil)
+
+	require.Error(t, err)
+	assert.Nil(t, dr)
+	assert.ErrorIs(t, err, context.Canceled)
+	assert.Contains(t, err.Error(), "drive ended before deploy request #9 could be re-read")
+	assert.False(t, engine.IsOutcomeUnknown(err), "a drive that ended observed no deploy outcome")
+	assert.Equal(t, 1, client.deployCalls)
+	assert.Zero(t, client.getCalls, "no request reaches PlanetScale once the drive has ended")
+}
+
 // A deploy call refused while the deploy request sits in a state that shows no
 // accepted deploy, such as a failed state, a no-changes result or a state
 // SchemaBot does not know, returns the refusal instead of tracking the request
