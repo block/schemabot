@@ -49,11 +49,18 @@ func (h *Handler) discoverAggregatePRScope(ctx context.Context, client *ghclient
 	// selection as leaders. A touched README within those paths still needs a
 	// no-work report; a PR outside them stays silent.
 	scope.participantSelected = h.participantPathsTouched(repo, files)
-	if len(config.ExpectedParticipantChecksForPR(repo, prFilePaths(files))) > 0 {
+	for _, tenant := range config.ExpectedParticipantChecksForPR(repo, prFilePaths(files)) {
 		// A leader cannot infer per-database overrides in another deployment.
-		// Every applicable environment needs a position in the global order.
-		if err := config.ValidateCheckEnvironmentOrder("", environments); err != nil {
-			return nil, err
+		// Only the selected participant's coverage uses the global order;
+		// local databases are validated against their own effective orders.
+		var covered []string
+		for _, env := range environments {
+			if tenant.PublishesEnvironment(env) {
+				covered = append(covered, env)
+			}
+		}
+		if err := config.ValidateCheckEnvironmentOrder("", covered); err != nil {
+			return nil, fmt.Errorf("validate environment order for participant %q: %w", tenant.Tenant, err)
 		}
 	}
 

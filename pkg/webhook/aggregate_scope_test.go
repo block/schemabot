@@ -157,6 +157,50 @@ func TestAggregateParticipantEnvironmentScope(t *testing.T) {
 	}
 }
 
+func TestAggregateParticipantOrderAllowsLocalOverrides(t *testing.T) {
+	for _, otherEnvironment := range []string{"production", "canary"} {
+		t.Run("unselected participant covers "+otherEnvironment, func(t *testing.T) {
+			cfg := &api.ServerConfig{
+				AllowedEnvironments: []string{"canary", "production"},
+				EnvironmentOrder:    []string{"production"},
+				Databases: map[string]api.DatabaseConfig{"orders": {
+					Type: "mysql", AllowedRepos: []string{"octocat/hello-world"}, AllowedDirs: []string{"services/local"},
+					EnvironmentOrder: []string{"canary", "production"},
+					Environments: map[string]api.EnvironmentConfig{
+						"canary": {DSN: "root@tcp(localhost:3306)/orders"}, "production": {DSN: "root@tcp(localhost:3307)/orders"},
+					},
+				}},
+				Repos: map[string]api.RepoConfig{"octocat/hello-world": {Aggregate: &api.AggregateConfig{
+					Role: api.AggregateRoleLeader,
+					ExpectedTenants: []api.ExpectedTenant{
+						{Tenant: "remote", Paths: []string{"services/remote"}, CheckName: "SchemaBot Remote", Environments: []string{"production"}},
+						{Tenant: "other", Paths: []string{"services/other"}, CheckName: "SchemaBot Other", Environments: []string{otherEnvironment}},
+					},
+				}}},
+			}
+			require.NoError(t, cfg.Validate())
+			store := &foldCheckStore{}
+			h, mux, client := newFoldHandler(t, cfg, store)
+			serveHeadSHA(t, mux, "abc123")
+			serveAggregateScopeInputs(t, mux, []string{"services/remote/README.md"}, "")
+			mux.HandleFunc("GET /repos/octocat/hello-world/commits/abc123/check-runs", func(w http.ResponseWriter, r *http.Request) {
+				name := r.URL.Query().Get("check_name")
+				require.NoError(t, json.NewEncoder(w).Encode(map[string]any{"total_count": 1, "check_runs": []map[string]any{{
+					"id": 1, "name": name, "head_sha": "abc123", "status": checkStatusCompleted, "conclusion": checkConclusionSuccess,
+					"app": map[string]any{"slug": "schemabot"},
+				}}}))
+			})
+			serveCheckRunCreate(t, mux)
+			_, err := h.updateAggregateCheckOnce(t.Context(), client, "octocat/hello-world", 1, "abc123")
+			require.NoError(t, err)
+			require.Len(t, store.upserted, 2)
+			for _, check := range store.upserted {
+				assert.Equal(t, checkConclusionSuccess, check.Conclusion)
+			}
+		})
+	}
+}
+
 func TestAggregateScopeKeepsRetainedBlockers(t *testing.T) {
 	for _, tc := range []struct {
 		name             string

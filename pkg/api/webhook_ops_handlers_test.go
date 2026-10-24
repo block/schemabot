@@ -1345,6 +1345,57 @@ func TestScanWebhookMissingChecksScopesStoredRowsToEachRunsEnvironment(t *testin
 		"one read serves every annotated run on a pull request")
 }
 
+func TestScanWebhookMissingChecksIncludesPrerequisiteEvidence(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name       string
+		checks     []*storage.Check
+		wantReason string
+		wantWait   string
+	}{
+		{
+			name: "missing predecessor",
+			checks: []*storage.Check{{Environment: "production", DatabaseType: "mysql", DatabaseName: "orders", HeadSHA: "sha14",
+				Status: checkstate.StatusCompleted, Conclusion: checkstate.ConclusionSuccess}},
+			wantReason: checkstate.ReasonAwaitingPlan, wantWait: apitypes.WaitingOnSchemaBot,
+		},
+		{
+			name: "retained predecessor without later result",
+			checks: []*storage.Check{{Environment: "sandbox", DatabaseType: "mysql", DatabaseName: "orders", HeadSHA: "sha14",
+				Status: checkstate.StatusCompleted, Conclusion: checkstate.ConclusionActionRequired}},
+			wantReason: checkstate.ReasonBlocked, wantWait: apitypes.WaitingOnOperator,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			cfg := &ServerConfig{
+				AllowedEnvironments: []string{"sandbox", "production"}, EnvironmentOrder: []string{"sandbox", "production"},
+				Databases: map[string]DatabaseConfig{"orders": {Type: "mysql", AllowedRepos: []string{"octo/repo"},
+					Environments: map[string]EnvironmentConfig{"sandbox": {}, "production": {}}}},
+			}
+			client := fakeWebhookMissingCheckScanClient{
+				prs: []ghclient.OpenPullRequest{{Number: 14, HeadSHA: "sha14"}},
+				runs: map[string]*ghclient.CheckRunResult{
+					"sha14/SchemaBot (production)": {ID: 141, Name: "SchemaBot (production)", Status: "in_progress"},
+				},
+			}
+			store := &inspectStorage{checks: &inspectCheckStore{checks: tc.checks}, applies: &inspectApplyStore{}}
+			result, err := scanWebhookMissingChecks(t.Context(), client, store, "octo/repo", productionCheckName, 0, time.Time{}, 0, discardLogger(), checkScanScope{config: cfg, environment: "production"})
+			require.NoError(t, err)
+			require.Len(t, result.Stuck, 1)
+			require.Len(t, result.Stuck[0].Checks, 1)
+			check := result.Stuck[0].Checks[0]
+			assert.Equal(t, tc.wantWait, check.WaitingOn)
+			require.Len(t, check.StoredRows, 2)
+			assert.Equal(t, "production", check.StoredRows[0].Environment)
+			assert.Equal(t, "sandbox", check.StoredRows[1].Environment)
+			assert.Equal(t, "orders", check.StoredRows[1].Database)
+			assert.Equal(t, tc.wantReason, check.StoredRows[1].Reason)
+			assert.True(t, check.StoredRows[1].Blocking)
+		})
+	}
+}
+
 // A deployment publishing a single unscoped check gates every environment on
 // one Check Run, so that run is explained by every stored row on the pull
 // request. Narrowing it to one environment would blank the annotation for the
