@@ -117,7 +117,7 @@ func TestUpdateCheckRecordForApplyStart_ConvergesWhenApplyAlreadyTerminal(t *tes
 	// stored check state to the apply's terminal outcome instead of leaving the
 	// row in_progress with no writer left to complete it.
 	schema := &ghclient.SchemaRequestResult{Type: "mysql", Database: dbn}
-	require.NoError(t, h.updateCheckRecordForApplyStart(ctx, installClient, repo, pr, schema, env, apply))
+	require.NoError(t, h.updateCheckRecordForApplyStart(ctx, installClient, repo, pr, schema, env, apply, applyChangeSummary{}))
 
 	check, err = st.Checks().Get(ctx, repo, pr, env, "mysql", dbn)
 	require.NoError(t, err)
@@ -197,7 +197,7 @@ func TestUpdateCheckRecordForApplyStart_KeepsInProgressForRunningApply(t *testin
 	}))
 
 	schema := &ghclient.SchemaRequestResult{Type: "mysql", Database: dbn}
-	require.NoError(t, h.updateCheckRecordForApplyStart(ctx, installClient, repo, pr, schema, env, apply))
+	require.NoError(t, h.updateCheckRecordForApplyStart(ctx, installClient, repo, pr, schema, env, apply, applyChangeSummary{}))
 
 	check, err := st.Checks().Get(ctx, repo, pr, env, "mysql", dbn)
 	require.NoError(t, err)
@@ -206,6 +206,108 @@ func TestUpdateCheckRecordForApplyStart_KeepsInProgressForRunningApply(t *testin
 	assert.Empty(t, check.Conclusion)
 	assert.Equal(t, applyID, check.ApplyID)
 	assert.True(t, check.HasChanges)
+}
+
+// A plan of the whole environment can rewrite the check row after the apply
+// command posts its confirmation, leaving a Change column that calls the
+// targets pending. When the confirmed apply starts, the claim writes the
+// apply's own summary over it, and that summary is the one the row keeps once
+// the apply completes, so an Applied row never says the change is pending.
+func TestUpdateCheckRecordForApplyStart_ApplyRowNamesTheTargetsItRan(t *testing.T) {
+	ctx := t.Context()
+
+	db, err := sql.Open("block-mysql", e2eSchemabotDSN)
+	require.NoError(t, err)
+	require.NoError(t, db.PingContext(ctx))
+	t.Cleanup(func() { assert.NoError(t, db.Close()) })
+
+	const (
+		repo = "octocat/claim-rollout-summary"
+		pr   = 11
+		dbn  = "claim_rollout_summary_db"
+		env  = "production"
+	)
+
+	clear := func(c context.Context) {
+		_, err := db.ExecContext(c, "DELETE FROM checks WHERE repository = ? AND pull_request = ?", repo, pr)
+		require.NoError(t, err)
+		_, err = db.ExecContext(c, "DELETE FROM applies WHERE repository = ? AND pull_request = ?", repo, pr)
+		require.NoError(t, err)
+	}
+	clear(ctx)
+	// Cleanup runs after t.Context() is cancelled, so derive a non-cancelled
+	// context from it for the cleanup deletes.
+	t.Cleanup(func() { clear(context.WithoutCancel(ctx)) })
+
+	st := mysqlstore.New(db)
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	svc := api.New(st, &api.ServerConfig{}, nil, logger)
+
+	ghClient := gh.NewClient(nil)
+	ghClient.BaseURL, err = url.Parse("http://127.0.0.1:0/")
+	require.NoError(t, err)
+	installClient := ghclient.NewInstallationClient(ghClient, logger)
+	factory := &fakeClientFactory{client: installClient}
+	h := NewHandler(svc, factory, nil, logger)
+
+	apply := &storage.Apply{
+		ApplyIdentifier: "apply-claim-rollout-summary",
+		Database:        dbn,
+		DatabaseType:    "mysql",
+		Repository:      repo,
+		PullRequest:     pr,
+		Environment:     env,
+		Engine:          storage.EngineSpirit,
+		InstallationID:  4242,
+		State:           state.Apply.Running,
+	}
+	applyID, err := st.Applies().Create(ctx, apply)
+	require.NoError(t, err)
+	apply.ID = applyID
+
+	// What the plan of the whole environment stored after the confirmation
+	// was posted.
+	require.NoError(t, st.Checks().Upsert(ctx, &storage.Check{
+		Repository:             repo,
+		PullRequest:            pr,
+		HeadSHA:                "abc123",
+		Environment:            env,
+		DatabaseType:           "mysql",
+		DatabaseName:           dbn,
+		CheckRunID:             1,
+		HasChanges:             true,
+		Status:                 checkStatusCompleted,
+		Conclusion:             checkConclusionActionRequired,
+		ChangeSummary:          "1 alter · pending on 3 of 4 targets: `shop-001`, `shop-003`, `shop-004`",
+		RolloutTargets:         4,
+		RolloutTargetsWithWork: 3,
+	}))
+
+	schema := &ghclient.SchemaRequestResult{Type: "mysql", Database: dbn}
+	ran := applyChangeSummary{text: "1 alter · 3 of 4 targets: `shop-001`, `shop-003`, `shop-004`", targets: 4, withWork: 3}
+	require.NoError(t, h.updateCheckRecordForApplyStart(ctx, installClient, repo, pr, schema, env, apply, ran))
+
+	check, err := st.Checks().Get(ctx, repo, pr, env, "mysql", dbn)
+	require.NoError(t, err)
+	require.NotNil(t, check)
+	assert.Equal(t, checkStatusInProgress, check.Status)
+	assert.Equal(t, ran.text, check.ChangeSummary, "the claim replaces the plan's pending wording with the apply's")
+	assert.Equal(t, 4, check.RolloutTargets)
+	assert.Equal(t, 3, check.RolloutTargetsWithWork)
+
+	apply.State = state.Apply.Completed
+	require.NoError(t, st.Applies().Update(ctx, apply))
+	updated, err := h.updateCheckRecordForApplyResult(ctx, repo, pr, apply)
+	require.NoError(t, err)
+	require.True(t, updated, "the apply owns the row, so its completion lands")
+
+	check, err = st.Checks().Get(ctx, repo, pr, env, "mysql", dbn)
+	require.NoError(t, err)
+	require.NotNil(t, check)
+	assert.Equal(t, checkConclusionSuccess, check.Conclusion)
+	assert.Equal(t, ran.text, check.ChangeSummary, "the completed row keeps the apply's summary")
+	assert.Equal(t, 4, check.RolloutTargets)
+	assert.Equal(t, 3, check.RolloutTargetsWithWork)
 }
 
 // The full merge-gate chain for an apply that starts on a commit whose
@@ -333,7 +435,7 @@ func TestUpdateCheckRecordForApplyStart_RollbackOnConcludedAggregatePublishesFre
 	rollbackApply.ID = rollbackApplyID
 
 	schema := &ghclient.SchemaRequestResult{Type: "mysql", Database: dbn}
-	require.NoError(t, h.updateCheckRecordForApplyStart(ctx, installClient, repo, pr, schema, env, rollbackApply))
+	require.NoError(t, h.updateCheckRecordForApplyStart(ctx, installClient, repo, pr, schema, env, rollbackApply, applyChangeSummary{}))
 
 	// The rollback now owns the per-database check, back in progress.
 	check, err := st.Checks().Get(ctx, repo, pr, env, "mysql", dbn)

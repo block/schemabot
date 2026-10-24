@@ -1003,6 +1003,99 @@ func TestResumeApply_ClosesTheUndeployedDeployRequestItCreated(t *testing.T) {
 	}
 }
 
+// pendingDeployRequestHandbackClient serves a resumable branch, creates the
+// deploy request the resume asks for, and ends the drive on the first read of
+// that deploy request, while PlanetScale is still computing its diff, the way
+// a handback mid-wait does.
+type pendingDeployRequestHandbackClient struct {
+	resumeReclaimClient
+	cancel context.CancelFunc
+}
+
+func (c *pendingDeployRequestHandbackClient) CreateDeployRequest(context.Context, *ps.CreateDeployRequestRequest) (*ps.DeployRequest, error) {
+	return &ps.DeployRequest{
+		Number:          42,
+		HtmlURL:         "https://app.planetscale.com/org/testdb/deploy-requests/42",
+		DeploymentState: deployState.Pending,
+	}, nil
+}
+
+func (c *pendingDeployRequestHandbackClient) GetDeployRequest(context.Context, *ps.GetDeployRequestRequest) (*ps.DeployRequest, error) {
+	c.cancel()
+	return &ps.DeployRequest{Number: 42, DeploymentState: deployState.Pending}, nil
+}
+
+// A resumed drive that ends while its new deploy request is still pending has
+// already recorded that deploy request, so the driver that picks the apply up
+// next resumes it instead of opening a second deploy request on the branch.
+// The save runs under the drive's context, as the real one does, so a drive
+// that has ended can no longer save. When the save was refused, the drive
+// warns that the deploy request it leaves behind is one no successor can
+// find, naming it for the operator to close. Either way the branch is kept.
+func TestResumeApply_RecordsTheDeployRequestBeforeWaitingOnIt(t *testing.T) {
+	const url = "https://app.planetscale.com/org/testdb/deploy-requests/42"
+	tests := []struct {
+		name      string
+		saveErr   error
+		wantLog   string
+		wantLevel string
+	}{
+		{
+			name:      "the save landed, so the successor resumes the deploy request",
+			wantLog:   "resumed drive ended after its deploy request was created; leaving the deploy request to the driver or control operation that takes over the apply",
+			wantLevel: "INFO",
+		},
+		{
+			name:      "the save was refused, so the deploy request is named for the operator",
+			saveErr:   errors.New("apply apply-1a2b3c4d5e6f7890: storage unavailable"),
+			wantLog:   "resumed drive ended after its deploy request was created, but no save naming it landed; the driver that takes over cannot find this deploy request and will open another, so close it by hand",
+			wantLevel: "WARN",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			shortenEngineWaits(t)
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			client := &pendingDeployRequestHandbackClient{cancel: cancel}
+			req := resumeRequest(t, &psMetadata{BranchName: "schemabot-testdb-1a2b"}, "apply-1a2b3c4d5e6f7890")
+			logRecord := captureApplyLogs(t, req)
+			var saved []*engine.ResumeState
+			req.OnStateChange = func(rs *engine.ResumeState) error {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+				if tt.saveErr != nil {
+					return tt.saveErr
+				}
+				saved = append(saved, rs)
+				return nil
+			}
+
+			_, err := conformanceEngine(client).resumeApply(ctx, client, "org", req)
+
+			require.ErrorIs(t, err, context.Canceled)
+			assert.Empty(t, client.deleteAttempts(), "the branch is kept for whoever takes the apply over")
+			record := logRecord(tt.wantLog)
+			require.NotNil(t, record, "the drive's end is logged on the apply's logger")
+			assert.Equal(t, tt.wantLevel, record["level"])
+			assert.Equal(t, float64(42), record["deploy_request"])
+			assert.Equal(t, "schemabot-testdb-1a2b", record["branch"])
+			if tt.saveErr != nil {
+				assert.Empty(t, saved)
+				return
+			}
+			require.Len(t, saved, 1, "the resume records the deploy request it opened before waiting on it")
+			assert.Equal(t, "apply-1a2b3c4d5e6f7890", saved[0].MigrationContext)
+			meta, err := decodePSMetadata(saved[0].Metadata)
+			require.NoError(t, err)
+			assert.Equal(t, "schemabot-testdb-1a2b", meta.BranchName)
+			assert.Equal(t, uint64(42), meta.DeployRequestID)
+			assert.Equal(t, url, meta.DeployRequestURL)
+		})
+	}
+}
+
 // deployRequestReclaimClient serves the cancelled apply's stored deploy request
 // as dr, or fails the read with getErr, and records each read and delete.
 type deployRequestReclaimClient struct {

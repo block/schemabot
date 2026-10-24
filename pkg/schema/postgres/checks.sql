@@ -14,6 +14,8 @@ CREATE TABLE checks (
   blocking_reason varchar(255) DEFAULT NULL,
   error_message text,
   change_summary varchar(255) DEFAULT NULL,
+  rollout_targets integer NOT NULL DEFAULT 0,
+  rollout_targets_with_work integer NOT NULL DEFAULT 0,
   created_at timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
   PRIMARY KEY (id)
