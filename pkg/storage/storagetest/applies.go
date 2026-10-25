@@ -854,6 +854,118 @@ func TestApplies(t *testing.T, h Harness) {
 		assert.Equal(t, "apply_earlier_successor", stored.SupersededBy, "the first successor keeps the marker")
 	})
 
+	// A dispatch that attaches its operation to an existing apply and takes over a
+	// stopped apply's work names that apply on the attach, and the marker lands in
+	// the same transaction as the attached operation. Once the attach commits, a
+	// start on the stopped apply is refused with the apply it was attached to
+	// named, with no later write left to fail.
+	t.Run("SupersededMarker_CommittedWithTheAttach", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "apply_superseded_attach_db", storage.DatabaseTypeMySQL)
+		holder := CreateApplyWithStateAndEnv(t, store, lock, "apply_attach_marker_holder", 940, state.Apply.Stopped, "staging")
+		successor, err := createApplyTakingOver(t, store, lock, "apply_attach_marker_successor", 941)
+		require.NoError(t, err)
+
+		require.NoError(t, attachOperationTakingOver(t, store, successor, "attached_marker_operation", holder.ID))
+
+		marked, err := store.Applies().Get(ctx, holder.ID)
+		require.NoError(t, err)
+		require.NotNil(t, marked)
+		assert.Equal(t, successor.ApplyIdentifier, marked.SupersededBy, "the attach stamped the stopped apply with the apply it attached to")
+		assert.Equal(t, state.Apply.Stopped, marked.State, "the handoff does not change the stopped apply's own state")
+
+		attachedTo, err := store.Applies().Get(ctx, successor.ID)
+		require.NoError(t, err)
+		require.NotNil(t, attachedTo)
+		assert.Empty(t, attachedTo.SupersededBy, "the apply the operation attached to carries no marker of its own")
+		ops, err := store.ApplyOperations().ListByApply(ctx, successor.ID)
+		require.NoError(t, err)
+		assert.Len(t, ops, 2, "the operation attached beside the apply's first")
+
+		_, alreadyPending, err := store.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+			ApplyID:   holder.ID,
+			Operation: storage.ControlOperationStart,
+			Status:    storage.ControlRequestPending,
+			Metadata:  []byte(`{}`),
+		})
+		require.NoError(t, err)
+		require.False(t, alreadyPending)
+
+		claimed, err := store.Applies().ClaimApplyByID(ctx, holder.ID, "driver-a")
+		require.NoError(t, err)
+		assert.Nil(t, claimed, "a stopped apply whose work the attach took over must not be claimed for a start")
+
+		settled, err := store.ControlRequests().GetByOperation(ctx, holder.ID, storage.ControlOperationStart)
+		require.NoError(t, err)
+		require.NotNil(t, settled)
+		assert.Equal(t, storage.ControlRequestFailed, settled.Status)
+		assert.Contains(t, settled.ErrorMessage, "superseded by "+successor.ApplyIdentifier,
+			"the start is refused because of the marker, naming the apply the operation attached to")
+	})
+
+	// A handoff that cannot be recorded fails the attach, so an operation never
+	// runs beside a stopped apply that nothing refuses to start. The failed
+	// attach leaves no marker on any holder it named and no operation row, and the
+	// same dispatch retried with a holder it can record commits both.
+	t.Run("SupersededMarker_FailedAttachLeavesNoMark", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "apply_superseded_attach_rollback_db", storage.DatabaseTypeMySQL)
+		holder := CreateApplyWithStateAndEnv(t, store, lock, "apply_attach_rollback_holder", 942, state.Apply.Stopped, "staging")
+		successor, err := createApplyTakingOver(t, store, lock, "apply_attach_rollback_successor", 943)
+		require.NoError(t, err)
+
+		err = attachOperationTakingOver(t, store, successor, "attached_rollback_operation", holder.ID, holder.ID+100000)
+		require.ErrorIs(t, err, storage.ErrApplyNotFound, "a holder the attach cannot stamp fails the attach")
+		err = attachOperationTakingOver(t, store, successor, "attached_rollback_operation", successor.ID)
+		require.Error(t, err, "an apply cannot take over its own work")
+
+		untouched, err := store.Applies().Get(ctx, holder.ID)
+		require.NoError(t, err)
+		require.NotNil(t, untouched)
+		assert.Empty(t, untouched.SupersededBy, "the holder stamped before the failure is rolled back with the attach")
+		unmarked, err := store.Applies().Get(ctx, successor.ID)
+		require.NoError(t, err)
+		require.NotNil(t, unmarked)
+		assert.Empty(t, unmarked.SupersededBy, "a refused self-handoff stamps nothing")
+		ops, err := store.ApplyOperations().ListByApply(ctx, successor.ID)
+		require.NoError(t, err)
+		assert.Len(t, ops, 1, "the failed attaches leave no operation row")
+
+		require.NoError(t, attachOperationTakingOver(t, store, successor, "attached_rollback_operation", holder.ID),
+			"the retried attach commits once every holder can be recorded")
+		retried, err := store.Applies().Get(ctx, holder.ID)
+		require.NoError(t, err)
+		require.NotNil(t, retried)
+		assert.Equal(t, successor.ApplyIdentifier, retried.SupersededBy)
+		ops, err = store.ApplyOperations().ListByApply(ctx, successor.ID)
+		require.NoError(t, err)
+		assert.Len(t, ops, 2)
+	})
+
+	// The first successor of a stopped apply owns its marker. A later attach that
+	// names the same holder commits without reassigning it, since the stopped
+	// apply is refused either way and overwriting would resolve an ambiguous
+	// takeover.
+	t.Run("SupersededMarker_AttachLeavesAnEarlierSuccessorsMarker", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "apply_superseded_attach_earlier_db", storage.DatabaseTypeMySQL)
+		holder := CreateApplyWithStateAndEnv(t, store, lock, "apply_attach_earlier_holder", 944, state.Apply.Stopped, "staging")
+		require.NoError(t, store.Applies().MarkSuperseded(ctx, holder.ID, "apply_attach_earlier_successor"))
+		successor, err := createApplyTakingOver(t, store, lock, "apply_attach_later_successor", 945)
+		require.NoError(t, err)
+
+		require.NoError(t, attachOperationTakingOver(t, store, successor, "attached_earlier_operation", holder.ID),
+			"a holder an earlier successor already stamped does not fail the attach")
+
+		stored, err := store.Applies().Get(ctx, holder.ID)
+		require.NoError(t, err)
+		require.NotNil(t, stored)
+		assert.Equal(t, "apply_attach_earlier_successor", stored.SupersededBy, "the first successor keeps the marker")
+	})
+
 	// Automatic retry is the one start surface with no operator request behind
 	// it: a fresh failed_retryable apply within budget is claimed and re-driven
 	// on the next poll, with nobody in the loop. Once another apply has taken
@@ -1798,6 +1910,18 @@ func createApplyTakingOver(t *testing.T, store storage.Storage, lock *storage.Lo
 	}
 	apply.ID = id
 	return apply, nil
+}
+
+// attachOperationTakingOver attaches one operation and one task to apply, and
+// asks the attach to stamp the stopped applies named by takesOver as taken over
+// by apply. It returns the storage error so a test can assert whether the attach
+// committed.
+func attachOperationTakingOver(t *testing.T, store storage.Storage, apply *storage.Apply, operationKey string, takesOver ...int64) error {
+	t.Helper()
+	apply.TakesOverApplyIDs = takesOver
+	operation := &storage.ApplyOperation{Deployment: "default", OperationKey: operationKey, State: state.ApplyOperation.Pending}
+	task := newTask(apply, "task_"+operationKey, "users", time.Now())
+	return store.Applies().AttachOperationWithTasks(t.Context(), apply, operation, []*storage.Task{task})
 }
 
 // createManifestGeneration creates the first dispatch of a deployment-keyed

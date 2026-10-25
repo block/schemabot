@@ -13,32 +13,27 @@ import (
 	"github.com/block/schemabot/pkg/storage"
 )
 
-// supersedeCall is one recorded handoff write, so a test can assert both which
-// apply was marked and which successor it names.
-type supersedeCall struct {
-	applyID   int64
-	successor string
-}
-
-// recordingApplyStore records every handoff write and answers each with a
-// scripted result, standing in for a store that already carries a marker or
-// cannot be written to.
-type recordingApplyStore struct {
+// markerStore stands in for storage whose stopped applies carry the markers the
+// test scripts: a successor that already committed the handoff, an earlier
+// successor that owned it first, or a marker that cannot be read back.
+type markerStore struct {
 	storage.ApplyStore
-	calls []supersedeCall
-	err   error
+	markers map[int64]string
+	errs    map[int64]error
 }
 
-func (s *recordingApplyStore) MarkSuperseded(_ context.Context, applyID int64, successor string) error {
-	s.calls = append(s.calls, supersedeCall{applyID: applyID, successor: successor})
-	return s.err
+func (s *markerStore) GetSupersededBy(_ context.Context, applyID int64) (string, error) {
+	if err := s.errs[applyID]; err != nil {
+		return "", err
+	}
+	return s.markers[applyID], nil
 }
 
-// supersedeClient builds a client whose handoff writes land in the returned
-// store, with a MySQL database so a change that names no namespace normalizes
-// to it the way a real dispatch's does. Its logs are captured so a test can
-// tell a benign outcome from one an operator has to act on.
-func supersedeClient(applies *recordingApplyStore, logs *mockApplyLogStore) (*LocalClient, *bytes.Buffer) {
+// supersedeClient builds a client over the returned store, with a MySQL
+// database so a change that names no namespace normalizes to it the way a real
+// dispatch's does. Its logs are captured so a test can tell a benign outcome
+// from one an operator has to act on.
+func supersedeClient(applies *markerStore, logs *mockApplyLogStore) (*LocalClient, *bytes.Buffer) {
 	captured := &bytes.Buffer{}
 	return &LocalClient{
 		config: LocalConfig{Database: "testdb", Type: storage.DatabaseTypeMySQL},
@@ -68,23 +63,28 @@ func supersedeSuccessor() *storage.Apply {
 	}
 }
 
+// takeoverIDs is the stopped applies a dispatch takes over, as the create or
+// attach records them.
+func takeoverIDs(client *LocalClient, holders []supersededHolder, changes []storage.TableChange) []int64 {
+	return takeoverApplyIDs(client.supersededTakeovers(supersedeSuccessor(), holders, changes))
+}
+
 // A dispatch that changes the same table as a released stopped apply meets the
 // copy that apply left resting on the target, and the engine decides on its own
 // whether to resume or replace it. The stopped apply's work is no longer its
-// own to continue, so the successor is recorded on it and its timeline says who
-// took the work over.
-func TestMarkSupersededHoldersRecordsTheTakeover(t *testing.T) {
-	applies := &recordingApplyStore{}
+// own to continue, so the create or attach names it as taken over, and once that
+// commits its timeline says who took the work over.
+func TestSupersededTakeoversRecordTheTakeover(t *testing.T) {
+	applies := &markerStore{markers: map[int64]string{7: "apply-successor"}}
 	logs := &mockApplyLogStore{}
 	client, _ := supersedeClient(applies, logs)
 	successor := supersedeSuccessor()
 
-	client.markSupersededHolders(t.Context(), successor, []supersededHolder{supersedeHolder()},
+	takeovers := client.supersededTakeovers(successor, []supersededHolder{supersedeHolder()},
 		[]storage.TableChange{{Namespace: "testdb", Table: "users", Operation: "alter"}})
+	assert.Equal(t, []int64{7}, takeoverApplyIDs(takeovers), "the holder whose table the dispatch changes is taken over")
 
-	require.Len(t, applies.calls, 1, "the holder whose table the dispatch changes is marked")
-	assert.Equal(t, int64(7), applies.calls[0].applyID)
-	assert.Equal(t, "apply-successor", applies.calls[0].successor)
+	client.announceSupersededTakeovers(t.Context(), successor, takeovers)
 
 	require.Len(t, logs.logs, 1, "the holder's timeline records the handoff")
 	assert.Equal(t, int64(7), logs.logs[0].ApplyID, "the event belongs to the superseded apply, not the successor")
@@ -97,28 +97,29 @@ func TestMarkSupersededHoldersRecordsTheTakeover(t *testing.T) {
 }
 
 // The marker and the refusal it backs are apply-granular: several released
-// tasks of one apply met by one dispatch are a single handoff, recorded with
-// one mark and one timeline event naming every table taken over — not one
+// tasks of one apply met by one dispatch are a single handoff, named once and
+// announced with one timeline event naming every table taken over — not one
 // event per task, which would read as several takeovers of the same apply.
-func TestMarkSupersededHoldersRecordsOneHandoffPerApply(t *testing.T) {
-	applies := &recordingApplyStore{}
+func TestSupersededTakeoversRecordOneHandoffPerApply(t *testing.T) {
+	applies := &markerStore{markers: map[int64]string{7: "apply-successor"}}
 	logs := &mockApplyLogStore{}
 	client, _ := supersedeClient(applies, logs)
+	successor := supersedeSuccessor()
 
 	usersShardA := supersedeHolder()
 	usersShardB := supersedeHolder()
 	accounts := supersedeHolder()
 	accounts.table = "accounts"
 
-	client.markSupersededHolders(t.Context(), supersedeSuccessor(),
+	takeovers := client.supersededTakeovers(successor,
 		[]supersededHolder{usersShardA, usersShardB, accounts},
 		[]storage.TableChange{
 			{Namespace: "testdb", Table: "users", Operation: "alter"},
 			{Namespace: "testdb", Table: "accounts", Operation: "alter"},
 		})
+	assert.Equal(t, []int64{7}, takeoverApplyIDs(takeovers), "one apply's released tasks are one handoff")
 
-	require.Len(t, applies.calls, 1, "one apply's released tasks are one handoff, marked once")
-	assert.Equal(t, int64(7), applies.calls[0].applyID)
+	client.announceSupersededTakeovers(t.Context(), successor, takeovers)
 
 	require.Len(t, logs.logs, 1, "one timeline event records the whole handoff")
 	assert.Contains(t, logs.logs[0].Message, "users, accounts",
@@ -129,37 +130,35 @@ func TestMarkSupersededHoldersRecordsOneHandoffPerApply(t *testing.T) {
 // dispatch that touches the same table meets the copy it left behind. A
 // dispatch that changes a different table takes over nothing, so the holder
 // keeps its own work and stays startable.
-func TestMarkSupersededHoldersLeavesAHolderOfAnUntouchedTable(t *testing.T) {
-	applies := &recordingApplyStore{}
-	logs := &mockApplyLogStore{}
-	client, _ := supersedeClient(applies, logs)
+func TestSupersededTakeoversLeaveAHolderOfAnUntouchedTable(t *testing.T) {
+	client, _ := supersedeClient(&markerStore{}, &mockApplyLogStore{})
 
-	client.markSupersededHolders(t.Context(), supersedeSuccessor(), []supersededHolder{supersedeHolder()},
+	ids := takeoverIDs(client, []supersededHolder{supersedeHolder()},
 		[]storage.TableChange{{Namespace: "testdb", Table: "orders", Operation: "alter"}})
 
-	assert.Empty(t, applies.calls, "a dispatch that changes another table takes over no work")
-	assert.Empty(t, logs.logs, "a holder that keeps its work gets no handoff event")
+	assert.Empty(t, ids, "a dispatch that changes another table takes over no work")
 }
 
 // A holder whose task names no table is a multi-table atomic change: its
 // resting copies are real, just not keyed by table. Any table change the
 // dispatch makes in that namespace may meet one of them, and the ambiguity
-// resolves toward marking — an unmarked holder whose copy was met can be
-// started into replaying work the successor now owns, while a marked holder's
-// remaining work still reaches the database through a fresh apply.
-func TestMarkSupersededHoldersMarksATablelessHolderOnItsNamespace(t *testing.T) {
-	applies := &recordingApplyStore{}
+// resolves toward taking the work over — an unmarked holder whose copy was met
+// can be started into replaying work the successor now owns, while a marked
+// holder's remaining work still reaches the database through a fresh apply.
+func TestSupersededTakeoversTakeOverATablelessHolderOnItsNamespace(t *testing.T) {
+	applies := &markerStore{markers: map[int64]string{7: "apply-successor"}}
 	logs := &mockApplyLogStore{}
 	client, _ := supersedeClient(applies, logs)
+	successor := supersedeSuccessor()
 
 	holder := supersedeHolder()
 	holder.table = ""
 
-	client.markSupersededHolders(t.Context(), supersedeSuccessor(), []supersededHolder{holder},
+	takeovers := client.supersededTakeovers(successor, []supersededHolder{holder},
 		[]storage.TableChange{{Namespace: "testdb", Table: "users", Operation: "alter"}})
+	assert.Equal(t, []int64{7}, takeoverApplyIDs(takeovers), "a table change in the holder's namespace meets its unkeyed copies")
 
-	require.Len(t, applies.calls, 1, "a table change in the holder's namespace meets its unkeyed copies")
-	assert.Equal(t, int64(7), applies.calls[0].applyID)
+	client.announceSupersededTakeovers(t.Context(), successor, takeovers)
 
 	require.Len(t, logs.logs, 1)
 	assert.Contains(t, logs.logs[0].Message, "this change's unfinished work",
@@ -170,7 +169,7 @@ func TestMarkSupersededHoldersMarksATablelessHolderOnItsNamespace(t *testing.T) 
 // namespace-level work: a dispatch of VSchema-only changes leaves no copy on
 // the target and meets none, and a table change in another namespace says
 // nothing about this holder's copies. Either way the holder keeps its work.
-func TestMarkSupersededHoldersLeavesATablelessHolderUnmet(t *testing.T) {
+func TestSupersededTakeoversLeaveATablelessHolderUnmet(t *testing.T) {
 	tests := []struct {
 		name    string
 		changes []storage.TableChange
@@ -187,17 +186,14 @@ func TestMarkSupersededHoldersLeavesATablelessHolderUnmet(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			applies := &recordingApplyStore{}
-			logs := &mockApplyLogStore{}
-			client, _ := supersedeClient(applies, logs)
+			client, _ := supersedeClient(&markerStore{}, &mockApplyLogStore{})
 
 			holder := supersedeHolder()
 			holder.table = ""
 
-			client.markSupersededHolders(t.Context(), supersedeSuccessor(), []supersededHolder{holder}, tt.changes)
+			ids := takeoverIDs(client, []supersededHolder{holder}, tt.changes)
 
-			assert.Empty(t, applies.calls, "no table change meets the holder's namespace, so nothing is taken over")
-			assert.Empty(t, logs.logs)
+			assert.Empty(t, ids, "no table change meets the holder's namespace, so nothing is taken over")
 		})
 	}
 }
@@ -205,7 +201,7 @@ func TestMarkSupersededHoldersLeavesATablelessHolderUnmet(t *testing.T) {
 // A namespace left absent means the dispatch's own database, on the change and
 // on the task row alike. Both sides must be read that way, or a MySQL dispatch
 // misses the holder whose copy it is about to meet.
-func TestMarkSupersededHoldersMatchesAnAbsentNamespaceAgainstTheDatabase(t *testing.T) {
+func TestSupersededTakeoversMatchAnAbsentNamespaceAgainstTheDatabase(t *testing.T) {
 	tests := []struct {
 		name            string
 		holderNamespace string
@@ -218,65 +214,56 @@ func TestMarkSupersededHoldersMatchesAnAbsentNamespaceAgainstTheDatabase(t *test
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			applies := &recordingApplyStore{}
-			client, _ := supersedeClient(applies, &mockApplyLogStore{})
+			client, _ := supersedeClient(&markerStore{}, &mockApplyLogStore{})
 
 			holder := supersedeHolder()
 			holder.namespace = tt.holderNamespace
 
-			client.markSupersededHolders(t.Context(), supersedeSuccessor(), []supersededHolder{holder},
+			ids := takeoverIDs(client, []supersededHolder{holder},
 				[]storage.TableChange{{Namespace: tt.changeNamespace, Table: "users", Operation: "alter"}})
 
-			require.Len(t, applies.calls, 1, "an absent namespace is the dispatch's own database")
-			assert.Equal(t, int64(7), applies.calls[0].applyID)
+			assert.Equal(t, []int64{7}, ids, "an absent namespace is the dispatch's own database")
 		})
 	}
 }
 
 // The first successor of a stopped apply owns its marker. A later dispatch that
-// meets the same released holder changes nothing rather than reassigning the
-// handoff, and says so instead of reporting a failure.
-func TestMarkSupersededHoldersToleratesAnEarlierHandoff(t *testing.T) {
-	applies := &recordingApplyStore{err: storage.ErrApplyAlreadySuperseded}
+// meets the same released holder leaves the handoff as it is, and says so
+// instead of claiming a takeover on the stopped apply's timeline or reporting a
+// failure.
+func TestAnnounceSupersededTakeoversToleratesAnEarlierHandoff(t *testing.T) {
+	applies := &markerStore{markers: map[int64]string{7: "apply-earlier-successor"}}
 	logs := &mockApplyLogStore{}
 	client, logged := supersedeClient(applies, logs)
 
-	client.markSupersededHolders(t.Context(), supersedeSuccessor(), []supersededHolder{supersedeHolder()},
-		[]storage.TableChange{{Namespace: "testdb", Table: "users", Operation: "alter"}})
+	client.announceSupersededTakeovers(t.Context(), supersedeSuccessor(),
+		[]*supersededTakeover{{applyID: 7, applyIdentifier: "apply-stopped-holder", tables: []string{"users"}}})
 
-	require.Len(t, applies.calls, 1)
 	assert.Empty(t, logs.logs, "the earlier successor already recorded the handoff, so this one adds no event")
 	assert.NotContains(t, logged.String(), "level=ERROR",
 		"a handoff another dispatch already recorded is a benign race, not something an operator has to act on")
 }
 
-// The successor is already dispatched and taking the work over by the time the
-// marker is written, so a failed write cannot un-take it. The dispatch carries
-// on, and every remaining holder is still attempted.
-func TestMarkSupersededHoldersContinuesPastAFailedMark(t *testing.T) {
-	applies := &recordingApplyStore{err: errors.New("storage down")}
+// The handoff is already committed with the successor's work by the time it is
+// announced, so a marker that cannot be read back cannot un-take it. The
+// dispatch carries on, and every remaining holder is still announced.
+func TestAnnounceSupersededTakeoversContinuesPastAnUnreadableMarker(t *testing.T) {
+	applies := &markerStore{
+		markers: map[int64]string{9: "apply-successor"},
+		errs:    map[int64]error{7: errors.New("storage down")},
+	}
 	logs := &mockApplyLogStore{}
 	client, logged := supersedeClient(applies, logs)
 
-	second := supersedeHolder()
-	second.applyID = 9
-	second.applyIdentifier = "apply-second-holder"
-	second.table = "accounts"
+	client.announceSupersededTakeovers(t.Context(), supersedeSuccessor(), []*supersededTakeover{
+		{applyID: 7, applyIdentifier: "apply-stopped-holder", tables: []string{"users"}},
+		{applyID: 9, applyIdentifier: "apply-second-holder", tables: []string{"accounts"}},
+	})
 
-	client.markSupersededHolders(t.Context(), supersedeSuccessor(),
-		[]supersededHolder{supersedeHolder(), second},
-		[]storage.TableChange{
-			{Namespace: "testdb", Table: "users", Operation: "alter"},
-			{Namespace: "testdb", Table: "accounts", Operation: "alter"},
-		})
-
-	require.Len(t, applies.calls, 2, "a failed mark does not abandon the remaining holders")
-	assert.Equal(t, int64(9), applies.calls[1].applyID)
-	assert.Empty(t, logs.logs, "a handoff that was not recorded must not claim one on the timeline")
+	require.Len(t, logs.logs, 1, "an unreadable marker does not abandon the remaining holders")
+	assert.Equal(t, int64(9), logs.logs[0].ApplyID)
 
 	failures := logged.String()
-	assert.Contains(t, failures, "level=ERROR",
-		"a marker that was not written leaves a start unrefused, which an operator has to act on")
-	assert.Contains(t, failures, "apply-stopped-holder", "the log names each holder left without a marker")
-	assert.Contains(t, failures, "apply-second-holder")
+	assert.Contains(t, failures, "level=ERROR", "a timeline that cannot name the successor is reported")
+	assert.Contains(t, failures, "apply-stopped-holder", "the log names the holder whose timeline is missing the event")
 }

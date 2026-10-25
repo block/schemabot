@@ -11,7 +11,6 @@ package tern
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"slices"
 	"strings"
@@ -69,7 +68,7 @@ func (c *LocalClient) supersededTakeovers(successor *storage.Apply, holders []su
 }
 
 // takeoverApplyIDs is the row IDs of the stopped applies a dispatch takes over,
-// in the form the create records them (storage.Apply.TakesOverApplyIDs).
+// in the form the create or attach records them (storage.Apply.TakesOverApplyIDs).
 func takeoverApplyIDs(takeovers []*supersededTakeover) []int64 {
 	ids := make([]int64, 0, len(takeovers))
 	for _, takeover := range takeovers {
@@ -79,7 +78,7 @@ func takeoverApplyIDs(takeovers []*supersededTakeover) []int64 {
 }
 
 // announceSupersededTakeovers tells the stopped applies' timelines who took their
-// work over, once the successor's create has committed the marker. The handoff
+// work over, once the successor's create or attach has committed the marker. The handoff
 // itself is already durable by then: this only records it for the operator, so a
 // failure to read the marker back or to log the event is reported and does not
 // fail a dispatch whose work is already under way.
@@ -106,44 +105,6 @@ func (c *LocalClient) announceSupersededTakeovers(ctx context.Context, successor
 				"superseded_apply_id", takeover.applyIdentifier, "superseded_tables", takeover.tables)...)
 		c.logApplyEvent(ctx, takeover.applyID, nil, storage.LogLevelInfo, storage.LogEventInfo, storage.LogSourceSchemaBot,
 			takeover.event(successor.ApplyIdentifier), "", "")
-	}
-}
-
-// markSupersededHolders records successor as the apply that took over the
-// unfinished work of every released holder whose work it is about to meet, after
-// the successor was created. It serves the attach path, whose operation is added
-// to an apply that already exists; a dispatch that creates its successor records
-// the takeover in the create itself (storage.Apply.TakesOverApplyIDs).
-//
-// It runs after the successor is durably created, so the marker never names an
-// apply that does not exist. The cost of that ordering is that a successor which
-// fails immediately still leaves the marker behind — the holder is then resolved
-// by cancelling it, which reclaims its copy, rather than by starting it.
-//
-// A failure to mark is reported and not retried: the successor is already
-// dispatched and taking the work over regardless, so failing the dispatch here
-// would refuse work that is already under way.
-func (c *LocalClient) markSupersededHolders(ctx context.Context, successor *storage.Apply, holders []supersededHolder, changes []storage.TableChange) {
-	for _, takeover := range c.supersededTakeovers(successor, holders, changes) {
-		applyID := takeover.applyID
-		err := c.storage.Applies().MarkSuperseded(ctx, applyID, successor.ApplyIdentifier)
-		switch {
-		case err == nil:
-			c.logger.Info("recorded the apply that took over a stopped apply's unfinished work",
-				append(successor.LogAttrs(),
-					"superseded_apply_id", takeover.applyIdentifier, "superseded_tables", takeover.tables)...)
-			c.logApplyEvent(ctx, applyID, nil, storage.LogLevelInfo, storage.LogEventInfo, storage.LogSourceSchemaBot,
-				takeover.event(successor.ApplyIdentifier), "", "")
-		case errors.Is(err, storage.ErrApplyAlreadySuperseded):
-			// An earlier dispatch already recorded the handoff. The first
-			// successor owns the marker, so this one changes nothing.
-			c.logger.Info("a stopped apply's work was already taken over by an earlier apply, so this dispatch leaves its marker alone",
-				append(successor.LogAttrs(), "superseded_apply_id", takeover.applyIdentifier)...)
-		default:
-			c.logger.Error("failed to record the apply that took over a stopped apply's unfinished work; a start on the stopped apply will not be refused by its marker",
-				append(successor.LogAttrs(),
-					"superseded_apply_id", takeover.applyIdentifier, "superseded_tables", takeover.tables, "error", err)...)
-		}
 	}
 }
 

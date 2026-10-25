@@ -45,7 +45,7 @@ import (
 // environment is the dispatch's own environment. It plays no part in what
 // blocks — a namesake's active work on the shared database name still refuses
 // the dispatch — but it decides which released holders the dispatch may later
-// mark superseded (see markSupersededHolders): only work attributable to the
+// mark superseded (see supersededTakeovers): only work attributable to the
 // same environment and target is the dispatch's to take over.
 func (c *LocalClient) checkActiveTaskConflict(ctx context.Context, plan *storage.Plan, environment, dispatchShard string, attachApplyID int64) (blockingTask, []supersededHolder, error) {
 	memo := newConflictScanMemo()
