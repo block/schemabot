@@ -429,7 +429,9 @@ type IncompleteCheckRun struct {
 type ChecksInspectRequest struct {
 	Repo        string `json:"repo"`
 	PullRequest int    `json:"pull_request"`
-	// Environment, when set, narrows the response to that environment's rows.
+	// Environment, when set, selects that environment's rows and unresolved
+	// local prerequisites explaining its gate. Missing prerequisite results are
+	// represented as pending evidence.
 	Environment string `json:"environment,omitempty"`
 }
 
@@ -455,6 +457,10 @@ type ChecksInspectResponse struct {
 	// CheckRunsOnHead is every Check Run this deployment publishes that was
 	// found on the head, one per expected name.
 	CheckRunsOnHead []InspectedCheckRun `json:"check_runs_on_head,omitempty"`
+	// CoverageError explains why expected Check Run names could not be resolved.
+	// Rows remain available, but empty run lists make no claim about GitHub.
+	CoverageError string `json:"coverage_error,omitempty"`
+
 	// MissingCheckRunNames is every expected Check Run name GitHub was read
 	// for and reported no run on the head. Branch protection requires each
 	// name on its own, so one present run never says the gate is clear while

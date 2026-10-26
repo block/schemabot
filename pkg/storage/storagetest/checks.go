@@ -8,6 +8,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/schemabot/pkg/checkstate"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 )
@@ -1144,6 +1145,57 @@ func TestChecks(t *testing.T, h Harness) {
 		assert.Equal(t, "action_required", stored.Conclusion)
 		assert.Equal(t, storage.SchemaRemovedAfterApplyStartedBlockingReason, stored.BlockingReason)
 		assert.Equal(t, "recorded by the completion", stored.ErrorMessage)
+	})
+
+	// Retrying a failed plan replaces old success with blocking evidence, while
+	// preserving both live and completed apply provenance and stronger blocks.
+	t.Run("MarkPlanPending", func(t *testing.T) {
+		for _, scenario := range []string{"missing", "success", "completed apply", "running apply", "guard block"} {
+			t.Run(scenario, func(t *testing.T) {
+				ctx := t.Context()
+				store := h.NewStorage(t)
+				lock := CreateLock(t, store, "pending_plan_db", storage.DatabaseTypeMySQL)
+				check := &storage.Check{Repository: lock.Repository, PullRequest: lock.PullRequest, HeadSHA: "same-head", Environment: "staging", DatabaseType: lock.DatabaseType, DatabaseName: lock.DatabaseName, Status: checkstate.StatusCompleted, Conclusion: checkstate.ConclusionSuccess}
+				if scenario == "completed apply" || scenario == "running apply" {
+					apply := CreateApplyWithStateAndEnv(t, store, lock, "pending-plan", 730, state.Apply.Running, "staging")
+					check.ApplyID = apply.ID
+					if scenario == "running apply" {
+						check.Status, check.Conclusion = checkstate.StatusInProgress, ""
+					}
+				}
+				if scenario == "guard block" {
+					check.Conclusion, check.BlockingReason = checkstate.ConclusionActionRequired, storage.SchemaRemovedAfterApplyStartedBlockingReason
+				}
+				if scenario != "missing" {
+					require.NoError(t, store.Checks().Upsert(ctx, check))
+				}
+				require.NoError(t, store.Checks().MarkPlanPending(ctx, check))
+				stored, err := store.Checks().Get(ctx, check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName)
+				require.NoError(t, err)
+				require.NotNil(t, stored)
+				assert.Equal(t, check.ApplyID, stored.ApplyID)
+				assert.Equal(t, check.BlockingReason, stored.BlockingReason)
+				if scenario == "running apply" {
+					assert.Equal(t, checkstate.StatusInProgress, stored.Status)
+					assert.Empty(t, stored.Conclusion)
+				} else {
+					assert.Equal(t, checkstate.StatusCompleted, stored.Status)
+					assert.Equal(t, checkstate.ConclusionActionRequired, stored.Conclusion)
+				}
+				if scenario == "success" || scenario == "missing" || scenario == "completed apply" {
+					assert.Equal(t, "Waiting for a fresh plan", stored.ChangeSummary)
+					assert.True(t, stored.HasChanges)
+					stored.Conclusion = checkstate.ConclusionSuccess
+					stored.HasChanges = false
+					written, err := store.Checks().UpsertPlanResult(ctx, stored, storage.PlanDriftClean)
+					require.NoError(t, err)
+					require.True(t, written)
+					refreshed, err := store.Checks().Get(ctx, check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName)
+					require.NoError(t, err)
+					assert.Equal(t, checkstate.ConclusionSuccess, refreshed.Conclusion)
+				}
+			})
+		}
 	})
 
 	t.Run("ClearAggregateBlock", func(t *testing.T) {

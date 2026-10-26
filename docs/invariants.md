@@ -531,7 +531,9 @@ apply must surface as a blocking or absent check, never a passing one. *Breaks i
 merges while its schema state is unknown. *Enforced:* every check-state write and aggregate
 publish path (`pkg/webhook/check_publisher.go`, `pkg/webhook/check_aggregate.go`), and the
 automatic apply, which dispatches only after its pending changes are stored
-(`applyCommandCore` in `pkg/webhook/apply_handlers.go`).
+(`applyCommandCore` in `pkg/webhook/apply_handlers.go`). These guards apply to the state a
+fold observes; concurrent publication can leave stale success over a later blocker
+([publication concurrency](check-runs.md#publication-concurrency)).
 
 ### MG-2: Absence never passes
 
@@ -541,7 +543,9 @@ check as not passing, so having nothing to say has to be said rather than left e
 logic applies in reverse. When SchemaBot expects a check, environment, or config and cannot find
 it, that reads as blocking, never as not-applicable. A gate must not be removable by the very
 change it guards. *Enforced:* aggregate creation on head-commit events
-(`pkg/webhook/check_suite.go`, `pkg/webhook/pull_request.go`); config discovery, the command
+(`pkg/webhook/check_suite.go`, `pkg/webhook/pull_request.go`); verified per-environment
+scope and pending contributions for missing local results (`pkg/webhook/aggregate_scope.go`,
+`pkg/webhook/check_publisher.go`); config discovery, the command
 path's choice of discovery over a passing refresh, and the aggregate leader's expected-participant
 match, which all read the schema paths a PR vacates as well as those it changes
 (`FindConfigsForPRFiles` in `pkg/github/config.go`, `prHasCurrentSchemaBotFiles` in
@@ -550,14 +554,19 @@ required-check and environment-ordering gates (`pkg/webhook/apply_gating.go`,
 `pkg/webhook/check_prior_env.go`); an environment that could not plan while another of the same
 multi-environment plan did, stored as a failing check, or, when that row cannot be stored, a
 failing aggregate carrying a block no fold replaces (`storePlanFailedCheck` in
-`pkg/webhook/check_records.go`, called by `handleMultiEnvPlan` in `pkg/webhook/plan.go`).
+`pkg/webhook/check_records.go`, called by `handleMultiEnvPlan` in `pkg/webhook/plan.go`);
+retry preparation durably invalidating old successes before releasing aggregate blocks (`MarkPlanPending` in `pkg/storage/internal/sqlstore/checks.go`).
 
 ### MG-3: The rollup is conservative
 
 The aggregate check reports the worst result among its per-database checks: one `in_progress`
 blocks, one `failure` fails, one `action_required` demands action, and the aggregate passes only
-when every database passes. A conclusion SchemaBot does not recognize blocks. *Enforced:* the
-aggregate rollup (`pkg/webhook/check_aggregate.go`).
+when every database and every applicable local predecessor passes on the current head. A
+conclusion SchemaBot does not recognize blocks. This rule applies to the contributions read by
+one fold; publication is not serialized, so concurrent folds can publish out of order and leave
+a stale passing or blocking result. See [publication concurrency](check-runs.md#publication-concurrency).
+*Enforced:* the aggregate rollup (`pkg/webhook/check_aggregate.go`,
+`pkg/webhook/check_prerequisites.go`).
 
 ### MG-4: A check belongs to exactly one commit
 
@@ -660,6 +669,8 @@ that would clear the block without the divergence behind it being addressed.
 *Enforced:* stale-check reconciliation (`pkg/webhook/check_records.go`), aggregate re-evaluation
 (`pkg/webhook/check_aggregate.go`, `pkg/webhook/checks_backfill.go`), and the re-plan a settled
 apply owes a PR whose head moved past the commit its check names (`pkg/webhook/handler.go`).
+A concurrent stale publication can leave an obsolete blocker without arming these retries;
+that case requires another fold ([publication concurrency](check-runs.md#publication-concurrency)).
 
 ### MG-11: A terminal outcome lands on the commit the PR is gated on
 
@@ -762,10 +773,9 @@ identifier. State alone cannot express this: the apply is still `stopped`, and o
 settles nothing else tells it apart from a stopped apply nobody touched. Starting it would replay
 its statements against a target where that work has already happened, so a stamped apply can never
 be started. The stamp is write-once, because a second and different successor means the takeover
-is ambiguous, and it is never cleared, outliving the successor it names. A dispatch that creates
-its successor writes the stamp in the create's own transaction, so that successor never exists
-without it. A dispatch that attaches to an apply that already exists stamps after the attach
-commits, and a stamp that fails there is logged rather than retried.
+is ambiguous, and it is never cleared, outliving the successor it names. The create that makes the
+successor, or the attach that adds its work to an existing apply, writes the stamp in its own
+transaction, so a successor never exists without it.
 
 That refusal holds at every surface that could begin the work again: the API rejects the start
 request and points at the successor, a claim to resume refuses and fails the pending start request
@@ -774,10 +784,9 @@ retry. No other claim path can reach a stamped apply, since work must have run b
 can take it over, and an active apply cannot gain one at all. *Enforced:* the finished-apply guard
 on the storage apply update (`finishedApplyGuardPredicate`), the named state arms of the single
 claim query, the terminal-state refusals in the control handlers, and the write-once supersession
-marker consulted by the start, resume, and retry paths and written in the successor's create
-transaction (`markTakenOver`, from `Apply.TakesOverApplyIDs`) (`pkg/storage/internal/sqlstore/applies.go`,
-`pkg/api/control_handlers.go`), or after an attach (`markSupersededHolders`,
-`pkg/tern/local_apply_superseded.go`); the reopen policy each caller passes to the rollout projection,
+marker consulted by the start, resume, and retry paths and written in the successor's create or
+attach transaction (`markTakenOver`, from `Apply.TakesOverApplyIDs`) (`pkg/storage/internal/sqlstore/applies.go`,
+`pkg/api/control_handlers.go`); the reopen policy each caller passes to the rollout projection,
 with the lease-scoped drive paths opting in and the unscoped reconciler opting out
 (`reopensHeldFailedRollout` in `updateApplyStateFromOperations`, `pkg/api/operator.go`), and the
 pending-request gate on a stopped rollout's reopen and drive (`stoppedRolloutDeliverableRequest`,
@@ -1056,7 +1065,8 @@ admission past a settled manifest hold is `checkNoActiveApplyForNewGeneration` a
 `settledManifestHold`, which record the handoff in the create's transaction (`markAdmittedPast`);
 `activeApplyHoldersForTargets` stops counting the held apply once it carries the handoff, and
 `AttachOperationWithTasks` refuses an attach to it, all in the same file. The same create
-transaction records a stopped apply's takeover (`markTakenOver`). The driver settles the
+transaction, and the attach transaction (`AttachOperationWithTasks`), record a stopped apply's
+takeover (`markTakenOver`). The driver settles the
 held apply once its stored row names the apply that took over its work
 (`updateApplyStateFromOperations`, `pkg/api/operator.go`). A control plane retrying an operation
 that never attached dispatches it under its deployment's unchanged key and manifest, so the retry

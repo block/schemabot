@@ -15,12 +15,14 @@ import (
 // fakeCheckRunFinder returns canned results per check name so the aggregate
 // leader's participant fold can be exercised without GitHub.
 type fakeCheckRunFinder struct {
+	calls     []string
 	results   map[string]*ghclient.CheckRunResult
 	untrusted map[string][]string
 	errs      map[string]error
 }
 
 func (f *fakeCheckRunFinder) FindCheckRunByName(_ context.Context, _, _, checkName string) (*ghclient.CheckRunResult, []string, error) {
+	f.calls = append(f.calls, checkName)
 	if err, ok := f.errs[checkName]; ok {
 		return nil, nil, err
 	}
@@ -208,4 +210,26 @@ func TestParticipantCheckOutcomesEmptyCheckNameBlocks(t *testing.T) {
 func TestParticipantCheckNameSingleAggregate(t *testing.T) {
 	assert.Equal(t, "SchemaBot Tenant A", participantCheckName("SchemaBot Tenant A", aggregateSentinel))
 	assert.Equal(t, "SchemaBot Tenant A (production)", participantCheckName("SchemaBot Tenant A", "production"))
+}
+
+func TestParticipantCoverageWithOverlappingPaths(t *testing.T) {
+	cfg := &api.ServerConfig{Repos: map[string]api.RepoConfig{"octocat/shared-repo": {Aggregate: &api.AggregateConfig{
+		Role: api.AggregateRoleLeader,
+		ExpectedTenants: []api.ExpectedTenant{
+			{Tenant: "a", Paths: []string{"services"}, CheckName: "SchemaBot A", Environments: []string{"production"}},
+			{Tenant: "b", Paths: []string{"services/b"}, CheckName: "SchemaBot B", Environments: []string{"sandbox", "production"}},
+		},
+	}}}}
+	expected := cfg.ExpectedParticipantChecksForPR("octocat/shared-repo", []string{"services/b/orders.sql"})
+	require.Len(t, expected, 2)
+	finder := &fakeCheckRunFinder{results: map[string]*ghclient.CheckRunResult{
+		"SchemaBot B (sandbox)": {Status: checkStatusCompleted, Conclusion: checkConclusionSuccess},
+	}}
+	h := &Handler{logger: testLogger()}
+	checks, retry := h.participantCheckOutcomes(t.Context(), finder, "octocat/shared-repo", 1, "sandbox", "head", expected, true)
+	assert.False(t, retry)
+	assert.Equal(t, []string{"SchemaBot B (sandbox)"}, finder.calls)
+	require.Len(t, checks, 1)
+	assert.Equal(t, "b", checks[0].DatabaseName)
+	assert.Equal(t, checkConclusionSuccess, checks[0].Conclusion)
 }
