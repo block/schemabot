@@ -459,7 +459,7 @@ func executeChecksScanWith(ctx context.Context, cfg *ServerConfig, store storage
 	if err != nil {
 		return nil, err
 	}
-	response, err := scanWebhookMissingChecks(ctx, installationClient, store, req.Repo, webhookExpectedCheckNames(cfg, req.Repo, req.Environment, req.CheckName), req.Page, updatedSince, annotateAfter, logger)
+	response, err := scanWebhookMissingChecks(ctx, installationClient, store, req.Repo, webhookExpectedCheckNames(cfg, req.Repo, req.Environment, req.CheckName), req.Page, updatedSince, annotateAfter, logger, checkScanScope{config: cfg, environment: req.Environment, override: req.CheckName})
 	if err != nil {
 		return nil, err
 	}
@@ -916,8 +916,9 @@ func webhookExpectedCheckNames(cfg *ServerConfig, repo, environment, override st
 		return []webhookExpectedCheckName{{Name: fmt.Sprintf("%s (%s)", base, environment), Environment: environment}}
 	}
 	if len(cfg.AllowedEnvironments) > 0 {
-		out := make([]webhookExpectedCheckName, 0, len(cfg.AllowedEnvironments))
-		for _, env := range cfg.AllowedEnvironments {
+		environments, _ := cfg.CheckEnvironmentsForRepo(context.Background(), nil, repo, "")
+		out := make([]webhookExpectedCheckName, 0, len(environments))
+		for _, env := range environments {
 			out = append(out, webhookExpectedCheckName{Name: fmt.Sprintf("%s (%s)", base, env), Environment: env})
 		}
 		return out
@@ -983,7 +984,17 @@ func checkRunSittingLongEnough(startedAt time.Time, threshold time.Duration, now
 	return now.Sub(startedAt) >= threshold
 }
 
-func scanWebhookMissingChecks(ctx context.Context, client webhookMissingCheckScanClient, store storage.Storage, repo string, expectedNames []webhookExpectedCheckName, page int, updatedSince time.Time, annotateAfter time.Duration, logger *slog.Logger) (*ChecksScanResponse, error) {
+type checkScanScope struct {
+	config      *ServerConfig
+	environment string
+	override    string
+}
+
+func (s checkScanScope) requiresCoverageDiscovery() bool {
+	return s.override == "" && len(s.config.AllowedEnvironments) > 0
+}
+
+func scanWebhookMissingChecks(ctx context.Context, client webhookMissingCheckScanClient, store storage.Storage, repo string, expectedNames []webhookExpectedCheckName, page int, updatedSince time.Time, annotateAfter time.Duration, logger *slog.Logger, scopes ...checkScanScope) (*ChecksScanResponse, error) {
 	prs, nextPage, lastPage, err := client.ListOpenPullRequestsPage(ctx, repo, page, webhookScanPRPageSize)
 	if err != nil {
 		return nil, err
@@ -1025,7 +1036,23 @@ func scanWebhookMissingChecks(ctx context.Context, client webhookMissingCheckSca
 		// is about to render. Letting the young one speak for both would send
 		// back the run an operator is looking at with nothing explaining it.
 		var annotate []bool
-		for _, expected := range expectedNames {
+		prNames := expectedNames
+		var stored []*storage.Check
+		storedRead := false
+		// Fixed names need no retained coverage. Storage is only an optional
+		// source of annotations for their stuck runs.
+		if len(scopes) > 0 && scopes[0].requiresCoverageDiscovery() {
+			stored, err = store.Checks().GetByPR(ctx, repo, pr.Number)
+			if err != nil {
+				return nil, fmt.Errorf("read retained check coverage %s#%d: %w", repo, pr.Number, err)
+			}
+			storedRead = true
+			prNames, err = resolvedWebhookCheckNames(ctx, scopes[0].config, client, repo, pr.HeadSHA, scopes[0].environment, scopes[0].override, stored)
+			if err != nil {
+				return nil, err
+			}
+		}
+		for _, expected := range prNames {
 			run, untrustedApps, err := client.FindCheckRunByName(ctx, repo, pr.HeadSHA, expected.Name)
 			if err != nil {
 				return nil, fmt.Errorf("scan %s#%d for check %q at %s: %w", repo, pr.Number, expected.Name, pr.HeadSHA, err)
@@ -1056,9 +1083,8 @@ func scanWebhookMissingChecks(ctx context.Context, client webhookMissingCheckSca
 			// One read serves every run on this PR that earned an annotation,
 			// so it is made once and only when at least one did; each run then
 			// keeps only the rows for the environment it gates.
-			var rows []InspectedCheck
-			if slices.Contains(annotate, true) {
-				rows = storedRowsBehindStuckCheck(ctx, store, repo, pr.Number, pr.HeadSHA, logger)
+			if slices.Contains(annotate, true) && !storedRead {
+				stored = storedChecksBehindStuckCheck(ctx, store, repo, pr.Number, pr.HeadSHA, logger)
 			}
 			for i := range incomplete {
 				if !annotate[i] {
@@ -1066,7 +1092,13 @@ func scanWebhookMissingChecks(ctx context.Context, client webhookMissingCheckSca
 						"repo", repo, "pr", pr.Number, "head_sha", pr.HeadSHA, "check_name", incomplete[i].Name)
 					continue
 				}
-				scoped := storedRowsForEnvironment(rows, incompleteEnvironments[i])
+				var checks []*storage.Check
+				if len(scopes) > 0 {
+					checks = scopes[0].config.CheckRowsForEnvironment(stored, incompleteEnvironments[i], repo, pr.Number, pr.HeadSHA)
+				} else {
+					checks = checkRowsForScanEnvironment(stored, incompleteEnvironments[i])
+				}
+				scoped := inspectRowsBehindStuckCheck(ctx, store, checks, pr.HeadSHA, logger)
 				incomplete[i].StoredRows = scoped
 				incomplete[i].WaitingOn = waitingOnForStoredRows(scoped)
 			}
@@ -1111,7 +1143,7 @@ func estimateOpenPRCount(page, lastPage, pageLen int) int {
 	return (page-1)*webhookScanPRPageSize + pageLen
 }
 
-// storedRowsBehindStuckCheck reads the stored check state behind a Check Run
+// storedChecksBehindStuckCheck reads the stored check state behind a Check Run
 // that exists on an open PR's head and never completed.
 //
 // The run alone says the gate is open and nothing else: not which database,
@@ -1123,7 +1155,7 @@ func estimateOpenPRCount(page, lastPage, pageLen int) int {
 // findings are what the backfill acts on and they are already in hand, so
 // failing the whole scan over the explanation would trade the answer for the
 // annotation.
-func storedRowsBehindStuckCheck(ctx context.Context, store storage.Storage, repo string, pr int, headSHA string, logger *slog.Logger) []InspectedCheck {
+func storedChecksBehindStuckCheck(ctx context.Context, store storage.Storage, repo string, pr int, headSHA string, logger *slog.Logger) []*storage.Check {
 	if store == nil {
 		logger.Warn("checks scan reports a stuck Check Run without the stored state behind it: storage is not configured",
 			"repo", repo, "pr", pr, "head_sha", headSHA)
@@ -1140,27 +1172,34 @@ func storedRowsBehindStuckCheck(ctx context.Context, store storage.Storage, repo
 			"repo", repo, "pr", pr, "head_sha", headSHA)
 		return nil
 	}
-	rows := make([]InspectedCheck, 0, len(stored))
-	for _, check := range stored {
+	return stored
+}
+
+func inspectRowsBehindStuckCheck(ctx context.Context, store storage.Storage, checks []*storage.Check, headSHA string, logger *slog.Logger) []InspectedCheck {
+	rows := make([]InspectedCheck, 0, len(checks))
+	for _, check := range checks {
 		rows = append(rows, inspectedCheck(ctx, store, check, headSHA, logger))
 	}
 	sort.Slice(rows, func(i, j int) bool {
 		if rows[i].Environment != rows[j].Environment {
 			return rows[i].Environment < rows[j].Environment
 		}
-		return rows[i].Database < rows[j].Database
+		if rows[i].Database != rows[j].Database {
+			return rows[i].Database < rows[j].Database
+		}
+		return rows[i].DatabaseType < rows[j].DatabaseType
 	})
 	return rows
 }
 
-// storedRowsForEnvironment narrows a PR's stored rows to the ones a single
+// checkRowsForScanEnvironment narrows a PR's stored rows to the ones a single
 // Check Run gates on. An unscoped run keeps all of them: the deployment
 // publishes one run covering every environment, so every row is its own.
-func storedRowsForEnvironment(rows []InspectedCheck, environment string) []InspectedCheck {
+func checkRowsForScanEnvironment(rows []*storage.Check, environment string) []*storage.Check {
 	if environment == "" {
 		return rows
 	}
-	var scoped []InspectedCheck
+	var scoped []*storage.Check
 	for _, row := range rows {
 		if row.Environment == environment {
 			scoped = append(scoped, row)

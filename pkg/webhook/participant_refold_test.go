@@ -4,6 +4,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/block/schemabot/pkg/api"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -50,4 +51,14 @@ func TestParticipantRefoldBudget(t *testing.T) {
 	h.scheduleParticipantRefold(t.Context(), repo, pr, 42)
 	n, _ = attempts()
 	assert.Equal(t, 1, n)
+}
+
+func TestScopedPublisherRetriesWithoutLeaderRole(t *testing.T) {
+	cfg := &api.ServerConfig{AllowedEnvironments: []string{"sandbox", "production"}}
+	h, _, _ := newFoldHandler(t, cfg, &foldCheckStore{})
+	h.participantRefoldDelayOverride = time.Hour
+	h.scheduleAggregateRefoldIfConfigured(t.Context(), "octocat/hello-world", 1, 12345)
+	h.participantRefoldMu.Lock()
+	defer h.participantRefoldMu.Unlock()
+	assert.Equal(t, 1, h.participantRefoldAttempts[participantRefoldKey("octocat/hello-world", 1)])
 }

@@ -129,6 +129,12 @@ func renderChecksInspection(w io.Writer, response *apitypes.ChecksInspectRespons
 // run says nothing about an absent production run, and folding them into a
 // single line would hide the one an operator has to act on.
 func writeCheckRunLines(w io.Writer, response *apitypes.ChecksInspectResponse) error {
+	if response.CoverageError != "" {
+		if _, err := fmt.Fprintln(w, "Check coverage unavailable: "+response.CoverageError); err != nil {
+			return err
+		}
+	}
+
 	for _, run := range response.CheckRunsOnHead {
 		line := fmt.Sprintf("Check Run %q on %s: %s", run.Name, shortSHA(response.HeadSHA), run.Status)
 		if run.Conclusion != "" {
@@ -318,6 +324,11 @@ func writeChecksBlockingSection(w io.Writer, response *apitypes.ChecksInspectRes
 // to one. Rows outside that environment were never read, so an unqualified
 // claim about the whole pull request would be one this response cannot make.
 func writeChecksNothingBlockingLine(w io.Writer, response *apitypes.ChecksInspectResponse) error {
+	if response.CoverageError != "" {
+		_, err := fmt.Fprintln(w, "\nNo stored row blocks merge, but expected Check Run coverage could not be verified.")
+		return err
+	}
+
 	if len(response.MissingCheckRunNames) > 0 && response.ChecksEnabled {
 		if _, err := fmt.Fprintf(w, "\nNo stored row is holding the merge gate open, but a missing Check Run is: branch protection cannot pass without %s.\n",
 			strings.Join(response.MissingCheckRunNames, ", ")); err != nil {

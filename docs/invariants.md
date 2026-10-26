@@ -531,7 +531,9 @@ apply must surface as a blocking or absent check, never a passing one. *Breaks i
 merges while its schema state is unknown. *Enforced:* every check-state write and aggregate
 publish path (`pkg/webhook/check_publisher.go`, `pkg/webhook/check_aggregate.go`), and the
 automatic apply, which dispatches only after its pending changes are stored
-(`applyCommandCore` in `pkg/webhook/apply_handlers.go`).
+(`applyCommandCore` in `pkg/webhook/apply_handlers.go`). These guards apply to the state a
+fold observes; concurrent publication can leave stale success over a later blocker
+([publication concurrency](check-runs.md#publication-concurrency)).
 
 ### MG-2: Absence never passes
 
@@ -541,7 +543,9 @@ check as not passing, so having nothing to say has to be said rather than left e
 logic applies in reverse. When SchemaBot expects a check, environment, or config and cannot find
 it, that reads as blocking, never as not-applicable. A gate must not be removable by the very
 change it guards. *Enforced:* aggregate creation on head-commit events
-(`pkg/webhook/check_suite.go`, `pkg/webhook/pull_request.go`); config discovery, the command
+(`pkg/webhook/check_suite.go`, `pkg/webhook/pull_request.go`); verified per-environment
+scope and pending contributions for missing local results (`pkg/webhook/aggregate_scope.go`,
+`pkg/webhook/check_publisher.go`); config discovery, the command
 path's choice of discovery over a passing refresh, and the aggregate leader's expected-participant
 match, which all read the schema paths a PR vacates as well as those it changes
 (`FindConfigsForPRFiles` in `pkg/github/config.go`, `prHasCurrentSchemaBotFiles` in
@@ -550,14 +554,19 @@ required-check and environment-ordering gates (`pkg/webhook/apply_gating.go`,
 `pkg/webhook/check_prior_env.go`); an environment that could not plan while another of the same
 multi-environment plan did, stored as a failing check, or, when that row cannot be stored, a
 failing aggregate carrying a block no fold replaces (`storePlanFailedCheck` in
-`pkg/webhook/check_records.go`, called by `handleMultiEnvPlan` in `pkg/webhook/plan.go`).
+`pkg/webhook/check_records.go`, called by `handleMultiEnvPlan` in `pkg/webhook/plan.go`);
+retry preparation durably invalidating old successes before releasing aggregate blocks (`MarkPlanPending` in `pkg/storage/internal/sqlstore/checks.go`).
 
 ### MG-3: The rollup is conservative
 
 The aggregate check reports the worst result among its per-database checks: one `in_progress`
 blocks, one `failure` fails, one `action_required` demands action, and the aggregate passes only
-when every database passes. A conclusion SchemaBot does not recognize blocks. *Enforced:* the
-aggregate rollup (`pkg/webhook/check_aggregate.go`).
+when every database and every applicable local predecessor passes on the current head. A
+conclusion SchemaBot does not recognize blocks. This rule applies to the contributions read by
+one fold; publication is not serialized, so concurrent folds can publish out of order and leave
+a stale passing or blocking result. See [publication concurrency](check-runs.md#publication-concurrency).
+*Enforced:* the aggregate rollup (`pkg/webhook/check_aggregate.go`,
+`pkg/webhook/check_prerequisites.go`).
 
 ### MG-4: A check belongs to exactly one commit
 
@@ -660,6 +669,8 @@ that would clear the block without the divergence behind it being addressed.
 *Enforced:* stale-check reconciliation (`pkg/webhook/check_records.go`), aggregate re-evaluation
 (`pkg/webhook/check_aggregate.go`, `pkg/webhook/checks_backfill.go`), and the re-plan a settled
 apply owes a PR whose head moved past the commit its check names (`pkg/webhook/handler.go`).
+A concurrent stale publication can leave an obsolete blocker without arming these retries;
+that case requires another fold ([publication concurrency](check-runs.md#publication-concurrency)).
 
 ### MG-11: A terminal outcome lands on the commit the PR is gated on
 

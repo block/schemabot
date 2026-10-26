@@ -265,6 +265,11 @@ type CheckStore interface {
 	// hold the values stored.
 	BlockStaleStartedApply(ctx context.Context, check *Check, headSHA string) (bool, error)
 
+	// MarkPlanPending inserts a blocking placeholder or invalidates a successful
+	// result before retrying a failed plan. Existing blocking state and apply
+	// ownership are preserved; only a replacement result may restore success.
+	MarkPlanPending(ctx context.Context, check *Check) error
+
 	// ClearAggregateBlock clears the blocking reason on stored aggregate check
 	// state after the PR-level guards re-verified that the blocking condition
 	// no longer applies. The update is conditional on the head SHA and blocking

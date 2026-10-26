@@ -195,10 +195,7 @@ func inspectChecks(ctx context.Context, cfg *ServerConfig, store storage.Storage
 		Rows:          make([]InspectedCheck, 0, len(stored)),
 	}
 
-	for _, check := range stored {
-		if req.Environment != "" && check.Environment != req.Environment {
-			continue
-		}
+	for _, check := range cfg.CheckRowsForEnvironment(stored, req.Environment, req.Repo, req.PullRequest, prInfo.HeadSHA) {
 		response.Rows = append(response.Rows, inspectedCheck(ctx, store, check, prInfo.HeadSHA, logger))
 	}
 	// Ordered on every field that distinguishes two rows, so the answer does
@@ -216,7 +213,17 @@ func inspectChecks(ctx context.Context, cfg *ServerConfig, store storage.Storage
 		return a.DatabaseType < b.DatabaseType
 	})
 
-	runs := checkRunsOnHead(ctx, cfg, client, req.Repo, prInfo.HeadSHA, req.Environment, logger)
+	expected, err := resolvedWebhookCheckNames(ctx, cfg, client, req.Repo, prInfo.HeadSHA, req.Environment, "", stored)
+	if err != nil {
+		logger.Warn("check inspection could not resolve coverage; returning stored state", "repo", req.Repo, "pr", req.PullRequest, "head_sha", prInfo.HeadSHA, "error", err)
+		response.CoverageError = "Could not determine which SchemaBot checks should exist. Check repository configuration and server logs, then retry."
+		return response, nil
+	}
+	names := make([]string, 0, len(expected))
+	for _, target := range expected {
+		names = append(names, target.Name)
+	}
+	runs := checkRunsOnHead(ctx, cfg, client, req.Repo, prInfo.HeadSHA, req.Environment, logger, names)
 	response.CheckRunsOnHead = runs.found
 	response.MissingCheckRunNames = runs.missing
 	response.UnreadableCheckRunNames = runs.unreadable
@@ -317,8 +324,11 @@ func applyHoldingCheck(ctx context.Context, store storage.Storage, check *storag
 // On a deployment that publishes no checks for the repository no name is
 // conflicted either: a conflict claims another app's run competes with
 // SchemaBot's, and there is none of SchemaBot's here for it to compete with.
-func checkRunsOnHead(ctx context.Context, cfg *ServerConfig, client checksInspectClient, repo, headSHA, environment string, logger *slog.Logger) headCheckRuns {
+func checkRunsOnHead(ctx context.Context, cfg *ServerConfig, client checksInspectClient, repo, headSHA, environment string, logger *slog.Logger, resolved ...[]string) headCheckRuns {
 	names := webhookMissingCheckNames(cfg, repo, environment, "")
+	if len(resolved) > 0 {
+		names = resolved[0]
+	}
 	if len(names) == 0 || headSHA == "" {
 		return headCheckRuns{}
 	}
