@@ -334,6 +334,25 @@ func TestDriftGuard_ShardScopedDispatchedTableDriftFailsClosed(t *testing.T) {
 	assert.Nil(t, store.created, "must not materialize a drifted shard plan")
 }
 
+// A shard whose re-plan still has work, but none of it on the table the
+// dispatch carries, has drifted on that table: this shard would change orders
+// only, so the reviewed users change is refused rather than waved through with
+// the shard's other work.
+func TestDriftGuard_ShardScopedDispatchedTableAbsentFromReplanFailsClosed(t *testing.T) {
+	store := &fakePlanStore{getFn: func(string) (*storage.Plan, error) { return nil, nil }}
+	result := twoTableShardPlan("-80", "ALTER TABLE `users` ADD COLUMN `email` varchar(255)")
+	result.Changes[0].TableChanges = result.Changes[0].TableChanges[1:]
+	c := newPlanMaterializeClientWithPlan(store, result)
+
+	_, err := c.planForApplyRequest(t.Context(), firstUsersShardDispatch("plan_shard_users_absent"))
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "drifted")
+	assert.Contains(t, err.Error(), "testapp[-80].users/alter", "the refusal names the dispatched table this shard would not change")
+	assert.False(t, engine.IsRetryable(err), "a redispatch carries the same reviewed DDL against the same drifted shard")
+	assert.Nil(t, store.created, "must not materialize a drifted shard plan")
+}
+
 // More than one target shard is a malformed dispatch (the per-shard fan-out
 // emits one shard per operation), so the guard fails closed.
 func TestDriftGuard_MultipleTargetShardsFailsClosed(t *testing.T) {
