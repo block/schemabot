@@ -3,6 +3,7 @@ package metrics
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"strconv"
 	"sync"
@@ -22,6 +23,24 @@ const (
 	unknownDeployment  = "unknown"
 	unknownEnvironment = "unknown"
 )
+
+// RegisterTelemetryHeartbeat registers one process heartbeat per metrics provider.
+// Collection observes a constant value even when no work or storage is available.
+// The provider owns the callback's lifetime; call this once during its setup.
+func RegisterTelemetryHeartbeat(provider otelmetric.MeterProvider) error {
+	_, err := provider.Meter(meterName).Int64ObservableGauge("schemabot.telemetry.heartbeat",
+		otelmetric.WithDescription("Application metrics endpoint heartbeat; absence indicates collection or process failure"),
+		otelmetric.WithUnit("1"),
+		otelmetric.WithInt64Callback(func(_ context.Context, observer otelmetric.Int64Observer) error {
+			observer.Observe(1, otelmetric.WithAttributes(EnvironmentAttribute("")))
+			return nil
+		}),
+	)
+	if err != nil {
+		return fmt.Errorf("register telemetry heartbeat: %w", err)
+	}
+	return nil
+}
 
 // addCounter increments a named Int64Counter by one with the given attributes,
 // logging and skipping if the instrument cannot be created. Centralizing the
@@ -1824,6 +1843,32 @@ func isKnownGitHubRateLimitResource(resource string) bool {
 	}
 }
 
+// WebhookFailureReason is a bounded classification of a committed permanent failure.
+type WebhookFailureReason string
+
+const (
+	WebhookFailurePRFileCap       WebhookFailureReason = "pr_file_cap"
+	WebhookFailureInvalidPayload  WebhookFailureReason = "invalid_payload"
+	WebhookFailureUnresolvedRoute WebhookFailureReason = "unresolved_route"
+	WebhookFailureOther           WebhookFailureReason = "other"
+)
+
+// RecordWebhookPermanentFailure records the existing permanent-failure event
+// with a bounded reason, after the delivery's terminal write succeeds. Unknown
+// reasons stay actionable as "other". Delivery origin and identifiers belong
+// in logs, not additional metric dimensions.
+func RecordWebhookPermanentFailure(ctx context.Context, appName, eventType, action, repo string, reason WebhookFailureReason) {
+	switch reason {
+	case WebhookFailurePRFileCap, WebhookFailureInvalidPayload, WebhookFailureUnresolvedRoute:
+	default:
+		reason = WebhookFailureOther
+	}
+	attrs := webhookEventAttributes(appName, eventType, action, repo, "durable_dispatch_failed_permanent")
+	attrs = append(attrs, attribute.String("failure_reason", string(reason)))
+	addCounter(ctx, "schemabot.webhook.events_total",
+		"Total number of GitHub webhook events received", "{event}", attrs...)
+}
+
 // RecordWebhookEvent increments the webhook events counter.
 // Unknown event types and actions are normalized to "unknown" to prevent unbounded cardinality.
 // Repo is not allowlisted since it's bounded by the repos configured in SchemaBot;
@@ -1835,6 +1880,12 @@ func isKnownGitHubRateLimitResource(resource string) bool {
 // header). Pass "" in legacy single-App mode and the metric will record
 // "default".
 func RecordWebhookEvent(ctx context.Context, appName, eventType, action, repo, status string) {
+	addCounter(ctx, "schemabot.webhook.events_total",
+		"Total number of GitHub webhook events received", "{event}",
+		webhookEventAttributes(appName, eventType, action, repo, status)...)
+}
+
+func webhookEventAttributes(appName, eventType, action, repo, status string) []attribute.KeyValue {
 	if !knownWebhookEvents[eventType] {
 		logUnknownWebhookMetricLabel("schemabot.webhook.events_total", "event_type", eventType, appName, repo, status)
 		eventType = "unknown"
@@ -1858,9 +1909,7 @@ func RecordWebhookEvent(ctx context.Context, appName, eventType, action, repo, s
 	if repo != "" {
 		attrs = append(attrs, attribute.String("repository", repo))
 	}
-	addCounter(ctx, "schemabot.webhook.events_total",
-		"Total number of GitHub webhook events received", "{event}",
-		attrs...)
+	return attrs
 }
 
 // logUnknownWebhookMetricLabel warns once per distinct label tuple when a

@@ -998,8 +998,8 @@ func (h *Handler) enqueueDurableIssueComment(ctx context.Context, body []byte, d
 // route — completes as a no-op rather than running unrouted work.
 func (h *Handler) processDurableIssueComment(ctx context.Context, event *storage.WebhookEvent) (retry bool, err error) {
 	var payload webhookPayload
-	if err := json.Unmarshal(event.Payload, &payload); err != nil {
-		return false, fmt.Errorf("decode durable issue_comment delivery %s: %w", event.DeliveryID, err)
+	if err := decodeDurablePayload(event, &payload); err != nil {
+		return false, err
 	}
 	if payload.Action != "created" || payload.Issue == nil || payload.Issue.PullRequest == nil ||
 		payload.Comment == nil || payload.Repository == nil {

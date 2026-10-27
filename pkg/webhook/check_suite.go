@@ -193,8 +193,8 @@ func (h *Handler) handleCheckSuite(ctx context.Context, metricApp string, w http
 // planned during the grace — every candidate is covered and the pass no-ops.
 func (h *Handler) processDurableCheckSuite(ctx context.Context, event *storage.WebhookEvent) (retry bool, err error) {
 	var payload checkSuitePayload
-	if err := json.Unmarshal(event.Payload, &payload); err != nil {
-		return false, fmt.Errorf("decode durable check_suite delivery %s: %w", event.DeliveryID, err)
+	if err := decodeDurablePayload(event, &payload); err != nil {
+		return false, err
 	}
 	// Re-validate the action fail-closed: rows can arrive via replay or a
 	// future producer, and a non-requested action carries no recovery work.

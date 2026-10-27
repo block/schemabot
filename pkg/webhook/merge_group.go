@@ -200,8 +200,8 @@ func (h *Handler) enqueueDurableMergeGroup(ctx context.Context, payload mergeGro
 // so a retry after a partial post reconciles rather than duplicates.
 func (h *Handler) processDurableMergeGroup(ctx context.Context, event *storage.WebhookEvent) (retry bool, err error) {
 	var payload mergeGroupPayload
-	if err := json.Unmarshal(event.Payload, &payload); err != nil {
-		return false, fmt.Errorf("decode durable merge_group delivery %s: %w", event.DeliveryID, err)
+	if err := decodeDurablePayload(event, &payload); err != nil {
+		return false, err
 	}
 
 	if payload.Action != "checks_requested" {
