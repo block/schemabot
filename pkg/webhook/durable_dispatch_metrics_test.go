@@ -520,7 +520,8 @@ func TestDurablePermanentFailureReasons(t *testing.T) {
 }
 
 // A retry or unsuccessful terminal write never claims that a committed dead
-// letter exists, including when a peer has already replaced the delivery lease.
+// letter exists. Failed writes retain the processing cause and permanent reason
+// in logs, including when a peer has already replaced the delivery lease.
 func TestDurablePermanentFailureRequiresSuccessfulWrite(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
@@ -551,6 +552,21 @@ func TestDurablePermanentFailureRequiresSuccessfulWrite(t *testing.T) {
 				assert.False(t, hasReason)
 			}
 			assert.NotContains(t, logs.String(), "dead-lettered")
+			if tc.writeErr != nil {
+				message := "durable webhook driver failed to record delivery failure"
+				outcome := "finish_error"
+				if errors.Is(tc.writeErr, storage.ErrWebhookEventLeaseLost) || errors.Is(tc.writeErr, storage.ErrWebhookEventNotFound) {
+					message = "durable webhook driver lost the delivery lease before recording failure; another driver owns the delivery or the row is gone"
+					outcome = "lease_lost"
+				}
+				record := findLogRecord(t, logs.Bytes(), message)
+				assert.Equal(t, ghclient.ErrPRFilesIncomplete.Error(), record["process_error"])
+				assert.Equal(t, tc.writeErr.Error(), record["error"])
+				assert.Equal(t, "pr_file_cap", record["failure_reason"])
+				durations := collectDispatchHistogramPoints(t, reader, "schemabot.webhook.dispatch_duration_seconds")
+				require.Len(t, durations, 1)
+				assertStringAttr(t, durations[0].Attributes, "outcome", outcome)
+			}
 		})
 	}
 }

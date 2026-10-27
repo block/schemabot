@@ -357,9 +357,11 @@ func (h *Handler) driveClaimedDurableWebhook(ctx context.Context, driverID int, 
 		}
 		var markErr error
 		var outcome string
+		var failureReason metrics.WebhookFailureReason
 		var notifyTerminalCommand bool
 		switch {
 		case !retry:
+			failureReason = durableFailureReason(processErr)
 			// The processor proved this delivery can never succeed for its head
 			// (a deterministic failure such as GitHub's per-PR file-listing cap
 			// or an undecodable row), so it dead-letters immediately: the
@@ -387,23 +389,26 @@ func (h *Handler) driveClaimedDurableWebhook(ctx context.Context, driverID int, 
 			notifyTerminalCommand = true
 		}
 		if markErr != nil {
+			failureAttrs := []any{
+				"driver", driverID, "delivery_id", event.DeliveryID, "event", event.Event,
+				"repo", event.Repository, "pr", event.PullRequest,
+				"error", markErr, "process_error", processErr,
+			}
+			if failureReason != "" {
+				failureAttrs = append(failureAttrs, "failure_reason", string(failureReason))
+			}
 			if errors.Is(markErr, storage.ErrWebhookEventLeaseLost) || errors.Is(markErr, storage.ErrWebhookEventNotFound) {
 				recordOutcome("lease_lost")
-				h.logger.Warn("durable webhook driver lost the delivery lease before recording failure; another driver owns the delivery or the row is gone",
-					"driver", driverID, "delivery_id", event.DeliveryID, "event", event.Event,
-					"repo", event.Repository, "pr", event.PullRequest)
+				h.logger.Warn("durable webhook driver lost the delivery lease before recording failure; another driver owns the delivery or the row is gone", failureAttrs...)
 				return
 			}
 			recordOutcome("finish_error")
-			h.logger.Error("durable webhook driver failed to record delivery failure",
-				"driver", driverID, "delivery_id", event.DeliveryID, "event", event.Event,
-				"repo", event.Repository, "pr", event.PullRequest, "error", markErr)
+			h.logger.Error("durable webhook driver failed to record delivery failure", failureAttrs...)
 			return
 		}
 		recordOutcome(outcome)
 		if outcome == "failed_permanent" {
-			reason := durableFailureReason(processErr)
-			metrics.RecordWebhookPermanentFailure(finishCtx, appName, event.Event, event.Action, event.Repository, reason)
+			metrics.RecordWebhookPermanentFailure(finishCtx, appName, event.Event, event.Action, event.Repository, failureReason)
 			origin := "organic"
 			if strings.HasPrefix(event.DeliveryID, storage.SynthesizedWebhookDeliveryIDPrefix) {
 				origin = "synthesized"
@@ -411,7 +416,7 @@ func (h *Handler) driveClaimedDurableWebhook(ctx context.Context, driverID int, 
 			h.logger.Error("durable webhook delivery failed permanently and is dead-lettered; re-run it with GitHub Redeliver for an organic delivery, or a new head push / SchemaBot check re-run for a synthesized one",
 				"driver", driverID, "delivery_id", event.DeliveryID, "event", event.Event,
 				"action", event.Action, "repo", event.Repository, "pr", event.PullRequest,
-				"attempts", event.Attempts, "failure_reason", string(reason), "origin", origin, "error", processErr)
+				"attempts", event.Attempts, "failure_reason", string(failureReason), "origin", origin, "error", processErr)
 		} else {
 			metrics.RecordWebhookEvent(finishCtx, appName, event.Event, event.Action, event.Repository, "durable_dispatch_"+outcome)
 		}
