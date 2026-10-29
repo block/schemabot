@@ -132,6 +132,13 @@ func (c *ServerConfig) LocalCheckPrerequisites(database, environment string, ret
 	}
 	var result []string
 	db := c.Database(database)
+	// A database registered without this environment, and with no retained work
+	// in it, has nothing to promote here, so its earlier environments gate nothing.
+	if db != nil && !slices.Contains(retained, environment) {
+		if _, registered := db.Environments[environment]; !registered {
+			return nil
+		}
+	}
 	for _, prior := range order[:index] {
 		if !c.IsEnvironmentAllowed(prior) {
 			continue

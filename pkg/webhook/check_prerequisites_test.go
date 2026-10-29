@@ -86,6 +86,36 @@ func TestPrerequisitesAreDatabaseSpecific(t *testing.T) {
 	assert.Same(t, own, checks[0])
 }
 
+// The repository publishes a sandbox check because another database is
+// registered there, but the database this PR changes is registered only in
+// production. Its pending production apply is not a sandbox prerequisite, so the
+// sandbox check reports no work instead of waiting on production.
+func TestLaterEnvironmentIgnoresDatabaseNotRegisteredThere(t *testing.T) {
+	cfg := prerequisiteConfig()
+	cfg.EnvironmentOrder = []string{"staging", "production"}
+	cfg.Databases["payments"] = api.DatabaseConfig{Type: "mysql", AllowedRepos: []string{"octocat/hello-world"}, Environments: map[string]api.EnvironmentConfig{"production": {}}}
+	production := &storage.Check{Environment: "production", DatabaseType: "mysql", DatabaseName: "payments", HeadSHA: "abc123", Status: checkStatusCompleted, Conclusion: checkConclusionActionRequired}
+	store := &foldCheckStore{byPR: []*storage.Check{production}}
+	h, mux, client := newFoldHandler(t, cfg, store)
+	serveHeadSHA(t, mux, "abc123")
+	serveAggregateScopeInputs(t, mux, []string{"schemabot.yaml"}, "database: payments\ntype: mysql\n")
+	outputs := map[string]ghclient.CheckRunOptions{}
+	mux.HandleFunc("POST /repos/octocat/hello-world/check-runs", func(w http.ResponseWriter, r *http.Request) {
+		var opts ghclient.CheckRunOptions
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&opts))
+		outputs[opts.Name] = opts
+		w.WriteHeader(http.StatusCreated)
+		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{"id": 555}))
+	})
+	_, err := h.updateAggregateCheckOnce(t.Context(), client, "octocat/hello-world", 1, "abc123")
+	require.NoError(t, err)
+	sandbox := outputs["SchemaBot (sandbox)"]
+	require.NotNil(t, sandbox.Output)
+	assert.Equal(t, checkConclusionSuccess, sandbox.Conclusion)
+	assert.NotContains(t, sandbox.Output.Summary, "Waiting for production")
+	assert.Equal(t, checkConclusionActionRequired, outputs["SchemaBot (production)"].Conclusion)
+}
+
 // Removing both the registration and its promotion order cannot make retained
 // unfinished work disappear from a later environment's existing required gate.
 func TestRetainedPrerequisiteSurvivesRemovedDatabase(t *testing.T) {
