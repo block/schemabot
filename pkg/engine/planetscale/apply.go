@@ -259,6 +259,11 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (result *e
 	// and stops at the first sign of it ending rather than closing or deleting
 	// what a successor resumes against.
 	//
+	// A deploy whose outcome is unknown (engine.OutcomeUnknownError) is not
+	// retired either: the deploy call failed without a refusal, no read of the
+	// deploy request can show its deploy did not start, and recovery re-reads
+	// this same deploy request, so it and its branch are left in place.
+	//
 	// A drive whose context ends after the close has landed but before the
 	// failure is recorded hands the apply back with stored state naming a
 	// deploy request that is now closed and never deployed. A successor that
@@ -288,8 +293,7 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (result *e
 			return
 		}
 		if engine.IsOutcomeUnknown(retErr) {
-			e.applyLogger(req).Warn(deployOutcomeUnknownKeepsDeployRequestLog,
-				"organization", org, "planetscale_database", req.Database, "deploy_request", createdDeployRequest, "branch", branchName, "apply_error", retErr)
+			leaveDeployRequestOfUnknownDeployOutcome(e.applyLogger(req), org, req.Database, createdDeployRequest, branchName, retErr)
 			return
 		}
 		e.retireDeployRequestOfFailedApply(ctx, e.applyLogger(req), client, org, req.Database, createdDeployRequest, deployRequestBranch, retErr)
@@ -1136,8 +1140,7 @@ func (e *Engine) resumeApply(ctx context.Context, client psclient.PSClient, org 
 			return
 		}
 		if engine.IsOutcomeUnknown(retErr) {
-			e.applyLogger(req).Warn(deployOutcomeUnknownKeepsDeployRequestLog,
-				"organization", org, "planetscale_database", req.Database, "deploy_request", createdDeployRequest, "branch", meta.BranchName, "apply_error", retErr)
+			leaveDeployRequestOfUnknownDeployOutcome(e.applyLogger(req), org, req.Database, createdDeployRequest, meta.BranchName, retErr)
 			return
 		}
 		ownedBranch := ""
