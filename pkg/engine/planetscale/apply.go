@@ -1089,10 +1089,13 @@ func (e *Engine) resumeApply(ctx context.Context, client psclient.PSClient, org 
 	// crash and recovery; only then does the resume start fresh. A cancelled
 	// drive or a wait that ran out says nothing about the branch, and starting
 	// fresh on either would create a branch the drive cannot finish preparing.
+	// The fresh drive keeps the apply's MigrationContext, as a first drive
+	// carries it, so the branch and deploy request it creates are saved for the
+	// next resume rather than left for no driver to find.
 	if err := e.waitForBranchReady(ctx, client, org, req.Database, meta.BranchName, emitEvent); err != nil {
 		if ctx.Err() == nil && isNotFound(err) {
 			e.logger.Warn("branch no longer exists on resume, starting fresh", "branch", meta.BranchName, "error", err)
-			req.ResumeState = nil
+			req.ResumeState = &engine.ResumeState{MigrationContext: req.ResumeState.MigrationContext}
 			return e.Apply(ctx, req)
 		}
 		return nil, fmt.Errorf("wait for branch %s on resume: %w", meta.BranchName, err)
