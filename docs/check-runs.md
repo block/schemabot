@@ -188,7 +188,9 @@ unfinished applies block instead of becoming no-work success.
 A later environment's check also requires successful current-head outcomes from
 its databases' registered local predecessors in `environment_order`. Its summary
 keeps its own results and adds a notice such as `Waiting for sandbox: orders`
-linking to the earlier Check Run. Prerequisite blocks are computed from raw
+linking to the earlier Check Run. A database not registered in the later
+environment, and with no retained result there, adds no prerequisites to it.
+Prerequisite blocks are computed from raw
 per-database state and never written into the later database's own result. Every
 earlier plan, apply, stop/resume, and rollback event refolds all applicable names,
 so finishing sandbox can unblock a clean production plan without a production
