@@ -319,13 +319,30 @@ func TestResumeApply_CancelledBranchWaitDoesNotStartFresh(t *testing.T) {
 
 // branchGoneOnResumeClient reports the resumed branch as missing until the
 // drive creates a branch, then carries the fresh drive to a deploy whose
-// outcome is unknown.
+// outcome is unknown. It records the deploy requests the drives create and
+// read so a later resume can be checked against them.
 type branchGoneOnResumeClient struct {
 	unansweredDeployClient
 
-	goneBranch    string
-	branchMu      sync.Mutex
-	branchCreated bool
+	goneBranch           string
+	branchMu             sync.Mutex
+	branchCreated        bool
+	deployRequestCreates int
+	deployRequestReads   []uint64
+}
+
+func (c *branchGoneOnResumeClient) CreateDeployRequest(ctx context.Context, req *ps.CreateDeployRequestRequest) (*ps.DeployRequest, error) {
+	c.branchMu.Lock()
+	c.deployRequestCreates++
+	c.branchMu.Unlock()
+	return c.unansweredDeployClient.CreateDeployRequest(ctx, req)
+}
+
+func (c *branchGoneOnResumeClient) GetDeployRequest(ctx context.Context, req *ps.GetDeployRequestRequest) (*ps.DeployRequest, error) {
+	c.branchMu.Lock()
+	c.deployRequestReads = append(c.deployRequestReads, req.Number)
+	c.branchMu.Unlock()
+	return c.unansweredDeployClient.GetDeployRequest(ctx, req)
 }
 
 func (c *branchGoneOnResumeClient) GetBranch(ctx context.Context, req *ps.GetDatabaseBranchRequest) (*ps.DatabaseBranch, error) {
@@ -350,7 +367,9 @@ func (c *branchGoneOnResumeClient) CreateBranch(ctx context.Context, req *ps.Cre
 // branch, which takes the plan's branch name again, and its deploy request are
 // saved for the next resume. That deploy request is then the one recovery
 // re-reads, so a deploy whose outcome is unknown pauses the apply rather than
-// failing it beside a deploy that may be running.
+// failing it beside a deploy that may be running, and the resume that follows
+// reattaches to that deploy request instead of opening another branch or
+// deploy request beside it.
 func TestResumeApply_DeletedBranchStartsFreshAndSavesTheNewBranch(t *testing.T) {
 	shortenEngineWaits(t)
 	const planID = "plan-0123456789abcdef"
@@ -369,10 +388,27 @@ func TestResumeApply_DeletedBranchStartsFreshAndSavesTheNewBranch(t *testing.T) 
 	for _, rs := range *persisted {
 		assert.Equal(t, "apply-1a2b3c4d5e6f7890", rs.MigrationContext)
 	}
-	last, decodeErr := decodePSMetadata((*persisted)[len(*persisted)-1].Metadata)
+	saved := (*persisted)[len(*persisted)-1]
+	last, decodeErr := decodePSMetadata(saved.Metadata)
 	require.NoError(t, decodeErr)
 	assert.Equal(t, client.created[0], last.BranchName, "the saved state names the fresh branch")
 	assert.Equal(t, uint64(93), last.DeployRequestID, "the saved state names the fresh deploy request")
+	require.Equal(t, 1, client.deployRequestCreates)
+
+	// The next resume starts from the saved state and goes to deploy request
+	// #93, whose outcome is still unknown; it opens nothing new beside it.
+	readsBefore := len(client.deployRequestReads)
+	next := resumeRequest(t, last, saved.MigrationContext)
+	next.PlanID = planID
+	next.Credentials = conformanceCredentials()
+
+	_, err = conformanceEngine(client).resumeApply(t.Context(), client, "org", next)
+
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "get deploy request #93 on resume")
+	assert.Equal(t, []uint64{93}, client.deployRequestReads[readsBefore:], "the resume re-reads the saved deploy request")
+	assert.Equal(t, []string{gone}, client.created, "the resume creates no second branch")
+	assert.Equal(t, 1, client.deployRequestCreates, "the resume opens no second deploy request")
 }
 
 // pendingThenReadyClient keeps a deploy request pending until the test
