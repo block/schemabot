@@ -51,10 +51,9 @@ func (cmd *SkipRevertCmd) Run(g *Globals) error {
 		return fmt.Errorf("skip-revert failed: %w", err)
 	}
 
-	if resp.Accepted {
-		fmt.Printf("Revert window skipped for %s — schema change finalized\n", formatControlTarget(cmd.ApplyID, cmd.Database, cmd.Environment))
-	} else {
-		fmt.Printf("Skip-revert not accepted: %s\n", resp.ErrorMessage)
+	if err := checkAccepted(controlResponseWrapper{resp}, "skip-revert"); err != nil {
+		return err
 	}
+	fmt.Printf("Revert window skipped for %s — schema change finalized\n", formatControlTarget(cmd.ApplyID, cmd.Database, cmd.Environment))
 	return nil
 }
