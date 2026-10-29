@@ -80,9 +80,9 @@ Users interact with SchemaBot through three interfaces:
 schemabot plan -s ./schema -e staging       # Preview changes
 schemabot apply -s ./schema -e staging -y   # Apply changes
 schemabot progress <apply_id>               # Watch progress
-schemabot cutover -e staging <apply_id>     # Trigger cutover
-schemabot stop -e staging <apply_id>        # Pause execution
-schemabot start -e staging <apply_id>       # Resume execution
+schemabot cutover <apply_id> -e staging     # Trigger cutover
+schemabot stop <apply_id> -e staging        # Pause execution
+schemabot start <apply_id> -e staging       # Resume execution
 schemabot revert -e staging <apply_id>      # Revert during the revert window (Vitess)
 schemabot skip-revert -e staging <apply_id> # Finalize (Vitess)
 ```

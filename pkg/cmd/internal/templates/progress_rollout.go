@@ -37,6 +37,10 @@ type RolloutView struct {
 	// cutover. Without it SchemaBot cuts a ready member over itself, so the
 	// footer offers no cutover command.
 	DeferCutover bool
+	// StopByKey is whether the view's own footer offers stop as a key, as the
+	// live watcher does. The rollout footer then leaves out the stop command,
+	// so the view offers one way to stop rather than two.
+	StopByKey bool
 }
 
 // RolloutCountsUnit is what the rollout's status counts count: targets once
@@ -82,6 +86,38 @@ func tableStepsHeadline(model presentation.Apply, g presentation.Group) (string,
 	return presentation.TableStepsHeadline(steps, progress, settled, false), true
 }
 
+// RolloutCountsLine is the rollout's status counts with how many members they
+// cover, "1 completed · 3 stopped (4 targets)", for the line that states the
+// rollout's state. It is empty when RolloutCounts is, and when every member is
+// in the same state, which RolloutCoverage states instead.
+func RolloutCountsLine(model presentation.Apply, groups []presentation.Group) string {
+	label, counts := RolloutCounts(model, groups)
+	if counts == "" || len(model.Counts) == 1 {
+		return ""
+	}
+	return fmt.Sprintf("%s (%s)", counts, rolloutNoun(label).Count(len(model.Deployments)))
+}
+
+// RolloutCoverage is "all 4 targets" when every member of the rollout is in
+// the same state, so its state line reads "Running on all 4 targets" rather
+// than counting one state twice. It is empty otherwise.
+func RolloutCoverage(model presentation.Apply, groups []presentation.Group) string {
+	label, counts := RolloutCounts(model, groups)
+	if counts == "" || len(model.Counts) != 1 {
+		return ""
+	}
+	n := len(model.Deployments)
+	return presentation.CoveragePhrase(rolloutNoun(label), n, n)
+}
+
+// rolloutNoun is the noun for what RolloutCountsUnit's label counts.
+func rolloutNoun(label string) presentation.Noun {
+	if label == "Targets" {
+		return presentation.TargetNoun
+	}
+	return presentation.DeploymentNoun
+}
+
 // FormatStateCounts joins a status histogram into "40 completed · 3 running".
 func FormatStateCounts(counts []presentation.StateCount) string {
 	parts := make([]string, 0, len(counts))
@@ -104,7 +140,11 @@ func FormatTargetRollup(v RolloutView, g presentation.Group) string {
 		status = fmt.Sprintf("%s (%s)", FormatStateCounts(g.Counts), presentation.TargetNoun.Count(len(g.Members)))
 	}
 	if _, sole := presentation.SoleTargetRollout(v.Model.Groups()); sole {
-		fmt.Fprintf(&b, "%s %s\n", g.Lead.Emoji, status)
+		// The rollout's own state line already counts a sole deployment's
+		// targets, so only a table-by-table headline adds anything here.
+		if ok {
+			fmt.Fprintf(&b, "%s %s\n", g.Lead.Emoji, status)
+		}
 	} else {
 		fmt.Fprintf(&b, "%s %s — %s\n", g.Lead.Emoji, g.Deployment, status)
 	}
@@ -460,18 +500,19 @@ func formatAcrossTargetsProgress(t TableProgress) (out string, ok bool) {
 		return "", false
 	}
 	var b strings.Builder
-	writeTableLine(&b, t, "%s %d%%%s", ui.ProgressBarRowCopy(pct), pct, throttledSuffix(t))
+	reporting := 0
+	for _, s := range t.Shards {
+		if reportsRolledRows(s) {
+			reporting++
+		}
+	}
+	targets := len(t.Shards)
+	exact := reporting == targets && !t.RowsTotalPlanned
+	writeTableLine(&b, t, "%s %s%s", ui.ProgressBarRowCopy(pct), acrossTargetsPercent(pct, exact, t.RowsCopied, t.RowsTotal), throttledSuffix(t))
 	if t.DDL != "" {
 		b.WriteString(formatTableDDL(t))
 	}
 	if t.RowsTotal > 0 {
-		reporting := 0
-		for _, s := range t.Shards {
-			if reportsRolledRows(s) {
-				reporting++
-			}
-		}
-		targets := len(t.Shards)
 		total := ui.FormatNumber(t.RowsTotal)
 		if t.RowsTotalPlanned {
 			// The plan's estimate stands in for the targets still to copy.
@@ -494,6 +535,22 @@ func formatAcrossTargetsProgress(t TableProgress) (out string, ok bool) {
 	writeThrottleTooltip(&b, t)
 	b.WriteString(formatPartProgress(t.Shards, presentation.TargetNoun, pendingTargetsWord(t)))
 	return b.String(), true
+}
+
+// acrossTargetsPercent renders a table's percent across its targets. When
+// every target's rows are known the percent is the rows copied of the rows to
+// copy, at the precision a single target's percent has; otherwise it is an
+// estimate from each target's share and stays whole. It never reads 100%
+// before pct, which waits for every target to complete, does.
+func acrossTargetsPercent(pct int, exact bool, copied, total int64) string {
+	if !exact || total <= 0 {
+		return fmt.Sprintf("%d%%", pct)
+	}
+	if pct < 100 && copied >= total {
+		// Every row is copied but a target has yet to complete the change.
+		return "99.99%"
+	}
+	return ui.FormatRowCopyPercent(pct, copied, total)
 }
 
 // reportsRolledRows reports whether a target's rows are in the table's
@@ -603,10 +660,12 @@ func pendingTargetsWord(t TableProgress) string {
 	return presentation.PendingWord(t.RolloutSettled)
 }
 
-// formatHaltedAcrossTargets renders a halted table across targets the way the
-// PR comment's table line does: the table reads as its halt, with no bar. A
-// table with a stopped or in-flight target lists its targets, each stopped
-// target's line saying where it stopped; any other counts them on its line.
+// formatHaltedAcrossTargets renders a halted table across targets: the table
+// reads as its halt. A stopped table that a target got started on keeps its
+// bar at where the targets stopped, the way a stopped table of one target
+// does, once every target's rows are known; any other halt has no bar. A table with a stopped or in-flight target
+// lists its targets, each stopped target's line saying where it stopped; any
+// other counts them on its line.
 func formatHaltedAcrossTargets(t TableProgress) string {
 	var b strings.Builder
 	coverage := targetsCoverage(t)
@@ -614,13 +673,59 @@ func formatHaltedAcrossTargets(t TableProgress) string {
 		// The list counts the targets, so the line does not repeat them.
 		coverage = ""
 	}
-	writeTableLine(&b, t, "%s%s", haltedAcrossTargetsPhrase(t), coverage)
+	stopped, ok := stoppedAcrossTargets(t.Shards)
+	if !ok || !state.IsState(t.Status, state.Task.Stopped) || !anyTargetStarted(t.Shards) {
+		writeTableLine(&b, t, "%s%s", haltedAcrossTargetsPhrase(t), coverage)
+		if t.DDL != "" {
+			b.WriteString(formatTableDDL(t))
+		}
+		b.WriteString("\n")
+		b.WriteString(formatTableParts(t))
+		return b.String()
+	}
+	// Laid out the way a stopped table of one target is: its bar, its DDL,
+	// and the rows its targets copied.
+	writeTableLine(&b, t, "%s ⏹️ Stopped at %s%s", ui.ProgressBarStopped(stopped.pct), stopped.text, coverage)
 	if t.DDL != "" {
 		b.WriteString(formatTableDDL(t))
 	}
-	b.WriteString("\n")
+	fmt.Fprintf(&b, indentDetail+"Rows: %s / %s\n", ui.FormatNumber(stopped.copied), ui.FormatNumber(stopped.total))
 	b.WriteString(formatTableParts(t))
 	return b.String()
+}
+
+// stoppedAcrossTargets is how far a stopped table got across its targets: the
+// rows its targets copied of the rows they had to copy, where a target that
+// completed the change counts in full. ok is false when a target's rows are
+// not known, since a bar would then guess at how far that target got.
+func stoppedAcrossTargets(targets []ShardProgress) (stoppedProgress, bool) {
+	var p stoppedProgress
+	for _, target := range targets {
+		if target.RowsTotal <= 0 {
+			return stoppedProgress{}, false
+		}
+		p.total += target.RowsTotal
+		if state.IsState(target.Status, state.Task.Completed, state.Task.RevertWindow) {
+			p.copied += target.RowsTotal
+			continue
+		}
+		p.copied += ui.ClampRows(target.RowsCopied, target.RowsTotal)
+	}
+	if p.total == 0 {
+		return stoppedProgress{}, false
+	}
+	whole := min(int(p.copied*100/p.total), 99)
+	p.pct = ui.RowCopyDisplayPercent(whole, p.copied)
+	p.text = acrossTargetsPercent(whole, true, p.copied, p.total)
+	return p, true
+}
+
+// stoppedProgress is where a stopped table's targets stopped, as rows, as the
+// percent its bar fills, and as the percent its line reads.
+type stoppedProgress struct {
+	copied, total int64
+	pct           int
+	text          string
 }
 
 // targetsCoverage counts a rolled-up table's targets for its line, as the PR
@@ -799,7 +904,7 @@ func memberTargetName(d presentation.Deployment) string {
 func FormatRolloutFooter(v RolloutView) string {
 	var b strings.Builder
 	applyCommand := func(verb string) string {
-		return cliname.Command(verb, v.ApplyID, "-e", v.Environment)
+		return ControlCommand(verb, v.ApplyID, v.Environment)
 	}
 	next := v.Model.NextAction
 	switch next.Kind {
@@ -813,7 +918,7 @@ func FormatRolloutFooter(v RolloutView) string {
 		}
 		writeRolloutCommand(&b, fmt.Sprintf("To cut over %s", next.Name), applyCommand("cutover"))
 	case presentation.NextActionResume:
-		writeRolloutCommand(&b, "To resume from where it stopped", applyCommand("start"))
+		writeRolloutCommand(&b, ResumeLabel, applyCommand("start"))
 	case presentation.NextActionReviewFailure:
 		// A failed apply is recovered by a fresh apply, which resumes from
 		// where this one stopped. Progress is read by apply ID and does not
@@ -831,11 +936,13 @@ func FormatRolloutFooter(v RolloutView) string {
 	if !v.Model.OffersRolloutStop() {
 		return b.String()
 	}
-	verb, label := "stop", "To stop this schema change"
-	if strings.EqualFold(v.Engine, storage.EnginePlanetScale) {
-		verb, label = "cancel", "To cancel this schema change"
+	if !v.StopByKey {
+		verb, label := "stop", "To stop this schema change"
+		if strings.EqualFold(v.Engine, storage.EnginePlanetScale) {
+			verb, label = "cancel", "To cancel this schema change"
+		}
+		writeRolloutCommand(&b, label, applyCommand(verb))
 	}
-	writeRolloutCommand(&b, label, applyCommand(verb))
 	if v.Model.RetryWaitsOnActiveApply() {
 		fmt.Fprintf(&b, "%s\n", presentation.RetryOnceSettledNote)
 	}
@@ -844,5 +951,21 @@ func FormatRolloutFooter(v RolloutView) string {
 
 // writeRolloutCommand writes one labelled command of the rollout footer.
 func writeRolloutCommand(b *strings.Builder, label, command string) {
-	fmt.Fprintf(b, "%s:\n  %s%s%s\n", label, ANSICyan, command, ANSIReset)
+	b.WriteString(FormatNextCommand(label, command))
+}
+
+// ResumeLabel introduces the command that resumes a stopped apply, on every
+// CLI surface that offers it.
+const ResumeLabel = "To resume from where it stopped"
+
+// ControlCommand is a control operation on one apply, in the one argument
+// order every CLI surface uses: the apply ID, then its environment.
+func ControlCommand(verb, applyID, environment string) string {
+	return cliname.Command(verb, applyID, "-e", environment)
+}
+
+// FormatNextCommand renders a labelled command on a line of its own, so it
+// can be copied whole.
+func FormatNextCommand(label, command string) string {
+	return fmt.Sprintf("%s:\n  %s%s%s\n", label, ANSICyan, command, ANSIReset)
 }

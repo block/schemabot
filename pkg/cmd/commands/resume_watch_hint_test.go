@@ -153,7 +153,7 @@ func TestDetachedView_ReattachNamesEnvironment(t *testing.T) {
 	view := model.detachedView()
 
 	assert.Contains(t, view, "To reattach: schemabot progress apply-7c2e -e production --profile prod\n")
-	assert.Contains(t, view, "To stop:     schemabot stop -e production apply-7c2e --profile prod\n")
+	assert.Contains(t, view, "To stop:     schemabot stop apply-7c2e -e production --profile prod\n")
 }
 
 // An operator watching a production apply through an explicit profile sees
@@ -171,8 +171,8 @@ func TestWatchFooter_ControlHintsCarryRouting(t *testing.T) {
 		return updated.(WatchModel).View()
 	}
 
-	assert.Contains(t, render(state.Apply.Stopped, state.Task.Stopped), "Use 'schemabot start -e production apply-7c2e --profile prod' to resume.\n")
-	assert.Contains(t, render(state.Apply.WaitingForCutover, state.Task.WaitingForCutover), "To proceed: schemabot cutover -e production apply-7c2e --profile prod\n")
+	assert.Contains(t, render(state.Apply.Stopped, state.Task.Stopped), "To resume from where it stopped:\n  "+templates.ANSICyan+"schemabot start apply-7c2e -e production --profile prod"+templates.ANSIReset+"\n")
+	assert.Contains(t, render(state.Apply.WaitingForCutover, state.Task.WaitingForCutover), "To proceed: schemabot cutover apply-7c2e -e production --profile prod\n")
 
 	m := NewWatchModel("http://schemabot.test", "orders", "production", false)
 	m.applyID = "apply-7c2e"
@@ -188,5 +188,5 @@ func TestStopSuccess_ResumeHintCarriesRouting(t *testing.T) {
 		templates.WriteStopSuccess(templates.StopData{Database: "orders", Environment: "production", ApplyID: "apply-7c2e"})
 	})
 
-	assert.Contains(t, out, "Use 'schemabot start -e production apply-7c2e --endpoint https://schemabot.example/api' to resume.")
+	assert.Contains(t, out, "schemabot start apply-7c2e -e production --endpoint https://schemabot.example/api")
 }

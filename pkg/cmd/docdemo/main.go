@@ -878,7 +878,7 @@ func rolloutStopDemo() Demo {
 	}
 	frames = append(frames, Frame{3.5, "", "Every target still copying stops; shop-004 stays done", stopped})
 	started := rolloutStart(stoppedAt)
-	frames = append(frames, Frame{2, "schemabot start -e production " + rolloutApplyID, "Start resumes every stopped target", started})
+	frames = append(frames, Frame{2, "schemabot start " + rolloutApplyID + " -e production", "Start resumes every stopped target", started})
 	steps := [][]int{{45, 30, 37, 100}, {55, 40, 47, 100}, {65, 50, 57, 100}, {75, 60, 67, 100}, {85, 70, 77, 100}, {95, 80, 87, 100}, {cuttingOver, 90, 97, 100}, {100, 100, cuttingOver, 100}, {100, cuttingOver, 100, 100}}
 	for _, p := range steps {
 		frames = append(frames, Frame{0.6, "", "Each target resumes from its own checkpoint", watchView(rolloutProgress(rolloutApplyID, rolloutTargets, p))})
@@ -1006,7 +1006,7 @@ func main() {
 		{1, "", "", live(55, state.Apply.Running, false, "")},
 		{2, "", "Press s to request a stop", live(55, state.Apply.Running, false, "s")},
 		{3, "", "Wait for Stopped; the CLI shows how to resume", live(55, state.Apply.Stopped, false, "")},
-		{2, "schemabot start -e staging apply-example-73", "Resume the stopped change", capture(func() {
+		{2, "schemabot start apply-example-73 -e staging", "Resume the stopped change", capture(func() {
 			t.WriteStartSuccess(t.StartData{Database: "shop", Environment: "staging", ApplyID: "apply-example-73", StartedCount: 1})
 		})},
 		{1, "", "Start opens the live watcher automatically", live(55, state.Apply.Running, false, "")},
