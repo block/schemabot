@@ -78,7 +78,11 @@ jobs:
 
   lint-chart:
     needs: changes
-    runs-on: ubuntu-latest
+    # ubuntu-26.04 ships Python 3.14, and the yamale 4.0.4 that
+    # chart-testing-action v2.7.0 installs uses ast.Num, which 3.14 removed.
+    # Return to ubuntu-latest once the chart lint installs a yamale release
+    # that runs on Python 3.14.
+    runs-on: ubuntu-24.04
     if: github.event_name == 'pull_request' && needs.changes.outputs.code == 'true'
     steps:
       - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # actions/checkout@v6
