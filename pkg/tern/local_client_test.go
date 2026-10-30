@@ -1586,6 +1586,155 @@ func TestExecuteGroupedApplySaveFailureAfterAcceptPausesForRetry(t *testing.T) {
 	}
 }
 
+// groupedStartFixture builds a fresh grouped Spirit drive over two tables whose
+// engine reports completed on its first poll, so a drive that goes on to poll
+// settles the apply as completed.
+func groupedStartFixture(taskUpdateErr func(*storage.Task) error) (*LocalClient, *storage.Apply, []*storage.Task, *storage.Plan, *snapshotApplyStore, *fakeControlEngine) {
+	apply := &storage.Apply{
+		ID: 42, ApplyIdentifier: "apply-grouped-start", Database: "testdb",
+		DatabaseType: storage.DatabaseTypeMySQL, State: state.Apply.Pending,
+	}
+	tasks := []*storage.Task{
+		{ID: 1, ApplyID: apply.ID, TaskIdentifier: "task-orders", Database: "testdb", Namespace: "testdb", TableName: "orders",
+			DDL: "ALTER TABLE `orders` ADD COLUMN `note` varchar(255)", DDLAction: "alter", State: state.Task.Pending},
+		{ID: 2, ApplyID: apply.ID, TaskIdentifier: "task-users", Database: "testdb", Namespace: "testdb", TableName: "users",
+			DDL: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)", DDLAction: "alter", State: state.Task.Pending},
+	}
+	plan := &storage.Plan{PlanIdentifier: "plan-grouped-start", Namespaces: map[string]*storage.NamespacePlanData{"testdb": {}}}
+	applyStore := &snapshotApplyStore{stored: *apply}
+	eng := &fakeControlEngine{progressResult: &engine.ProgressResult{State: engine.StateCompleted, Message: "Complete"}}
+	client := &LocalClient{
+		config:       LocalConfig{Database: "testdb", Type: storage.DatabaseTypeMySQL},
+		spiritEngine: eng,
+		storage: &exactProgressStorage{
+			applies: applyStore,
+			tasks: &exactProgressTaskStore{tasks: tasks, updateErr: func(_ context.Context, task *storage.Task) error {
+				if state.IsState(task.State, state.Task.Running) {
+					return taskUpdateErr(task)
+				}
+				return nil
+			}},
+			controlRequests: &testControlRequestStore{},
+			applyOperations: &exactProgressApplyOperationStore{},
+		},
+		heartbeatInterval:        time.Hour,
+		taskPollIntervalOverride: time.Millisecond,
+		logger:                   slog.Default(),
+	}
+	return client, apply, tasks, plan, applyStore, eng
+}
+
+// The engine has accepted the work, so a storage failure writing the tasks as
+// running is storage uncertainty, not a failed schema change. The drive stops
+// before polling and pauses the apply for operator retry, rather than driving
+// on over tasks storage does not hold as running.
+func TestExecuteGroupedApplyTaskStartWriteFailurePausesForRetry(t *testing.T) {
+	client, apply, tasks, plan, applyStore, eng := groupedStartFixture(func(*storage.Task) error {
+		return errors.New("storage unavailable")
+	})
+
+	require.NoError(t, client.executeGroupedApply(t.Context(), apply, tasks, plan, nil, false))
+
+	assert.True(t, state.IsState(applyStore.stored.State, state.Apply.FailedRetryable),
+		"apply must pause for operator retry, got %s", applyStore.stored.State)
+	assert.Contains(t, applyStore.stored.ErrorMessage, "mark task task-orders running for apply apply-grouped-start")
+	for _, task := range tasks {
+		assert.True(t, state.IsState(task.State, state.Task.FailedRetryable),
+			"task %s must pause for operator retry, got %s", task.TableName, task.State)
+	}
+	assert.Nil(t, eng.progressReq, "a drive that could not record the start never polls the engine")
+}
+
+// A task start write refused because another driver holds the lease is not the
+// schema change's failure and not this driver's to settle: the drive stands
+// down and leaves the apply and its tasks as stored for the lease holder.
+func TestExecuteGroupedApplyTaskStartWriteLeaseLostStandsDown(t *testing.T) {
+	client, apply, tasks, plan, applyStore, eng := groupedStartFixture(func(*storage.Task) error {
+		return fmt.Errorf("apply apply-grouped-start lease taken by another driver: %w", storage.ErrApplyLeaseLost)
+	})
+
+	require.NoError(t, client.executeGroupedApply(t.Context(), apply, tasks, plan, nil, false))
+
+	assert.True(t, state.IsState(applyStore.stored.State, state.Apply.Running),
+		"the apply stays as stored for the lease holder, got %s", applyStore.stored.State)
+	for _, task := range tasks {
+		assert.True(t, state.IsState(task.State, state.Task.Pending),
+			"task %s is not recorded running or settled, got %s", task.TableName, task.State)
+		assert.Nil(t, task.StartedAt)
+	}
+	assert.Nil(t, eng.progressReq, "a displaced drive never polls the engine")
+}
+
+// refusingStateApplyStore refuses the write that records the apply in one
+// state and stores every other.
+type refusingStateApplyStore struct {
+	*snapshotApplyStore
+	refuse string
+	err    error
+}
+
+func (s *refusingStateApplyStore) Update(ctx context.Context, apply *storage.Apply) error {
+	if state.IsState(apply.State, s.refuse) {
+		return s.err
+	}
+	return s.snapshotApplyStore.Update(ctx, apply)
+}
+
+// A storage failure writing the apply's own running state, after the tasks
+// were recorded running, pauses the apply for operator retry the same way, and
+// leaves the in-memory apply at the state storage holds when the pause is
+// recorded from it.
+func TestExecuteGroupedApplyApplyStartWriteFailurePausesForRetry(t *testing.T) {
+	operationID := int64(7)
+	apply := &storage.Apply{
+		ID: 42, ApplyIdentifier: "apply-grouped-start-vitess", Database: "testdb",
+		DatabaseType: storage.DatabaseTypeVitess, Engine: storage.EnginePlanetScale, State: state.Apply.Pending,
+	}
+	tasks := []*storage.Task{{
+		ID: 7, ApplyID: apply.ID, ApplyOperationID: &operationID, TaskIdentifier: "task-grouped-start",
+		Database: "testdb", DatabaseType: storage.DatabaseTypeVitess, Namespace: "commerce", TableName: "users",
+		DDL: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)", DDLAction: "alter", State: state.Task.Pending,
+	}}
+	plan := &storage.Plan{PlanIdentifier: "plan-grouped-start-vitess", Namespaces: map[string]*storage.NamespacePlanData{"commerce": {}}}
+	snapshot := &snapshotApplyStore{stored: *apply}
+	eng := &fakeControlEngine{
+		applyResult: &engine.ApplyResult{
+			Accepted: true,
+			ResumeState: &engine.ResumeState{
+				MigrationContext: "ctx-grouped",
+				Metadata:         `{"branch_name":"branch-1","deploy_request_id":5}`,
+			},
+		},
+		progressResult: &engine.ProgressResult{State: engine.StateCompleted, Message: "Complete"},
+	}
+	client := &LocalClient{
+		config: LocalConfig{Database: "testdb", Type: storage.DatabaseTypeVitess},
+		storage: &exactProgressStorage{
+			applies: &refusingStateApplyStore{
+				snapshotApplyStore: snapshot,
+				refuse:             state.Apply.ValidatingDeployRequest,
+				err:                errors.New("storage unavailable"),
+			},
+			tasks:           &exactProgressTaskStore{tasks: tasks},
+			controlRequests: &testControlRequestStore{},
+			applyOperations: &exactProgressApplyOperationStore{},
+		},
+		planetscaleEngine:        eng,
+		heartbeatInterval:        time.Hour,
+		taskPollIntervalOverride: time.Millisecond,
+		logger:                   slog.Default(),
+	}
+
+	require.NoError(t, client.executeGroupedApply(t.Context(), apply, tasks, plan, nil, false))
+
+	assert.True(t, state.IsState(snapshot.stored.State, state.Apply.FailedRetryable),
+		"apply must pause for operator retry, got %s", snapshot.stored.State)
+	assert.Contains(t, snapshot.stored.ErrorMessage, "record apply apply-grouped-start-vitess")
+	assert.True(t, state.IsState(tasks[0].State, state.Task.FailedRetryable),
+		"task must pause for operator retry, got %s", tasks[0].State)
+	assert.Nil(t, eng.progressReq, "a drive that could not record the start never polls the engine")
+}
+
 // Rebuilt resume changes must preserve each task's namespace and table so
 // engines key per-table progress on the same identity the stored tasks carry.
 func TestGroupedResumeChangesGroupsTasksByNamespace(t *testing.T) {
