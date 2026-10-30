@@ -317,21 +317,98 @@ func TestResumeApply_CancelledBranchWaitDoesNotStartFresh(t *testing.T) {
 	assert.Same(t, resumeState, req.ResumeState, "the stored resume state must survive for the next driver")
 }
 
-// A resume whose branch is gone — deleted between the crash and the recovery —
-// starts the apply fresh. The fresh Apply here fails fast building its
-// PlanetScale client from the request's incomplete credentials, which proves the not-found took the start-fresh branch
-// (clearing ResumeState) rather than failing the resume.
-func TestResumeApply_DeletedBranchStartsFresh(t *testing.T) {
-	shortenEngineWaits(t)
-	e := New(slog.New(slog.NewTextHandler(os.Stdout, nil)))
-	client := &readinessClient{getErr: &ps.Error{Code: ps.ErrNotFound}}
-	req := resumeRequest(t, &psMetadata{BranchName: "schemabot-testdb-gone"}, "apply-1a2b3c4d5e6f7890")
+// branchGoneOnResumeClient reports the resumed branch as missing until the
+// drive creates a branch, then carries the fresh drive to a deploy whose
+// outcome is unknown. It records the deploy requests the drives create and
+// read so a later resume can be checked against them.
+type branchGoneOnResumeClient struct {
+	unansweredDeployClient
 
-	_, err := e.resumeApply(t.Context(), client, "org", req)
+	goneBranch           string
+	branchMu             sync.Mutex
+	branchCreated        bool
+	deployRequestCreates int
+	deployRequestReads   []uint64
+}
+
+func (c *branchGoneOnResumeClient) CreateDeployRequest(ctx context.Context, req *ps.CreateDeployRequestRequest) (*ps.DeployRequest, error) {
+	c.branchMu.Lock()
+	c.deployRequestCreates++
+	c.branchMu.Unlock()
+	return c.unansweredDeployClient.CreateDeployRequest(ctx, req)
+}
+
+func (c *branchGoneOnResumeClient) GetDeployRequest(ctx context.Context, req *ps.GetDeployRequestRequest) (*ps.DeployRequest, error) {
+	c.branchMu.Lock()
+	c.deployRequestReads = append(c.deployRequestReads, req.Number)
+	c.branchMu.Unlock()
+	return c.unansweredDeployClient.GetDeployRequest(ctx, req)
+}
+
+func (c *branchGoneOnResumeClient) GetBranch(ctx context.Context, req *ps.GetDatabaseBranchRequest) (*ps.DatabaseBranch, error) {
+	c.branchMu.Lock()
+	created := c.branchCreated
+	c.branchMu.Unlock()
+	if req.Branch == c.goneBranch && !created {
+		return nil, &ps.Error{Code: ps.ErrNotFound}
+	}
+	return c.unansweredDeployClient.GetBranch(ctx, req)
+}
+
+func (c *branchGoneOnResumeClient) CreateBranch(ctx context.Context, req *ps.CreateDatabaseBranchRequest) (*ps.DatabaseBranch, error) {
+	c.branchMu.Lock()
+	c.branchCreated = true
+	c.branchMu.Unlock()
+	return c.unansweredDeployClient.CreateBranch(ctx, req)
+}
+
+// A resume whose branch is gone — deleted between the crash and the recovery —
+// starts the apply fresh under the apply's own MigrationContext, so the fresh
+// branch, which takes the plan's branch name again, and its deploy request are
+// saved for the next resume. That deploy request is then the one recovery
+// re-reads, so a deploy whose outcome is unknown pauses the apply rather than
+// failing it beside a deploy that may be running, and the resume that follows
+// reattaches to that deploy request instead of opening another branch or
+// deploy request beside it.
+func TestResumeApply_DeletedBranchStartsFreshAndSavesTheNewBranch(t *testing.T) {
+	shortenEngineWaits(t)
+	const planID = "plan-0123456789abcdef"
+	gone := GenerateBranchName("testdb", planID)
+	client := &branchGoneOnResumeClient{goneBranch: gone}
+	req := resumeRequest(t, &psMetadata{BranchName: gone}, "apply-1a2b3c4d5e6f7890")
+	req.PlanID = planID
+	req.Credentials = conformanceCredentials()
+	persisted := captureStateChanges(req)
+
+	_, err := conformanceEngine(client).resumeApply(t.Context(), client, "org", req)
+
+	assertUnknownDeployOutcome(t, err, true)
+	require.Equal(t, []string{gone}, client.created, "the resume creates one fresh branch under the plan's branch name")
+	require.NotEmpty(t, *persisted, "the fresh drive saves its resume state")
+	for _, rs := range *persisted {
+		assert.Equal(t, "apply-1a2b3c4d5e6f7890", rs.MigrationContext)
+	}
+	saved := (*persisted)[len(*persisted)-1]
+	last, decodeErr := decodePSMetadata(saved.Metadata)
+	require.NoError(t, decodeErr)
+	assert.Equal(t, client.created[0], last.BranchName, "the saved state names the fresh branch")
+	assert.Equal(t, uint64(93), last.DeployRequestID, "the saved state names the fresh deploy request")
+	require.Equal(t, 1, client.deployRequestCreates)
+
+	// The next resume starts from the saved state and goes to deploy request
+	// #93, whose outcome is still unknown; it opens nothing new beside it.
+	readsBefore := len(client.deployRequestReads)
+	next := resumeRequest(t, last, saved.MigrationContext)
+	next.PlanID = planID
+	next.Credentials = conformanceCredentials()
+
+	_, err = conformanceEngine(client).resumeApply(t.Context(), client, "org", next)
 
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "get planetscale client")
-	assert.Nil(t, req.ResumeState)
+	assert.ErrorContains(t, err, "get deploy request #93 on resume")
+	assert.Equal(t, []uint64{93}, client.deployRequestReads[readsBefore:], "the resume re-reads the saved deploy request")
+	assert.Equal(t, []string{gone}, client.created, "the resume creates no second branch")
+	assert.Equal(t, 1, client.deployRequestCreates, "the resume opens no second deploy request")
 }
 
 // pendingThenReadyClient keeps a deploy request pending until the test
