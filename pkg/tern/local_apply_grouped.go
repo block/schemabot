@@ -186,15 +186,20 @@ func (c *LocalClient) executeGroupedApply(ctx context.Context, apply *storage.Ap
 			}
 		}
 	}
-	c.markTasksRunning(ctx, tasks)
-	if c.config.Type == storage.DatabaseTypeVitess {
-		apply.State = state.Apply.ValidatingDeployRequest
-	} else {
-		apply.State = state.Apply.Running
-	}
-	apply.UpdatedAt = time.Now()
-	if err := c.storage.Applies().Update(ctx, apply); err != nil {
-		logger.Error("failed to update apply state", append(apply.MutableLogAttrs(), "error", err)...)
+	if err := c.recordAcceptedApplyRunning(ctx, apply, tasks); err != nil {
+		// The drive returns before handing the work to a poll, so the deferred
+		// halt brings the accepted engine work down with it.
+		if c.driveCancelled(ctx, apply, "while recording that the engine started") {
+			return nil
+		}
+		if applyWriteEndsDrive(err) {
+			logger.Warn("apply is no longer this driver's to run; drive will stand down and halt the engine work it started",
+				append(apply.MutableLogAttrs(), "error", err)...)
+			return nil
+		}
+		logger.Warn("failed to record the accepted engine work as running; pausing apply for operator retry",
+			append(apply.MutableLogAttrs(), "error", err)...)
+		return c.markApplyRetryableWithTasks(ctx, apply, tasks, fmt.Sprintf("failed to record apply running: %v", err))
 	}
 	logger.Info("apply started", "mode", mode, "task_count", len(tasks))
 	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStateTransition, storage.LogSourceSchemaBot,
@@ -203,6 +208,34 @@ func (c *LocalClient) executeGroupedApply(ctx context.Context, apply *storage.Ap
 	// Poll for completion - all tasks share the same state
 	work.handToPoll()
 	return c.pollForCompletionAtomic(ctx, apply, tasks, creds, resumeState, options, releaseAtCutoverBarrier)
+}
+
+// recordAcceptedApplyRunning stores the running state of the tasks and the
+// apply once the engine has accepted the work. A refused write is returned with
+// the in-memory apply and the refused task put back to what they were, so the
+// caller settles from the state storage holds. A multi-operation drive owns
+// only its operation, so the parent apply write is the operator's projection to
+// make.
+func (c *LocalClient) recordAcceptedApplyRunning(ctx context.Context, apply *storage.Apply, tasks []*storage.Task) error {
+	if err := c.markTasksRunning(ctx, apply, tasks); err != nil {
+		return err
+	}
+	previous := *apply
+	if c.config.Type == storage.DatabaseTypeVitess {
+		apply.State = state.Apply.ValidatingDeployRequest
+	} else {
+		apply.State = state.Apply.Running
+	}
+	apply.UpdatedAt = time.Now()
+	if suppressParentApplyWrites(ctx) {
+		return nil
+	}
+	if err := c.storage.Applies().Update(ctx, apply); err != nil {
+		*apply = previous
+		return fmt.Errorf("record apply %s (database %s) running from stored state %s: %w",
+			apply.ApplyIdentifier, apply.Database, previous.State, err)
+	}
+	return nil
 }
 
 // mirrorEngineEventLiveness persists every task row when the engine reports an
