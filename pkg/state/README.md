@@ -155,15 +155,25 @@ Next dispatch:
 2. Any task **failed_retryable** → apply `failed_retryable`
 3. Any task **cancelled** → apply `cancelled`
 4. Any task **stopped** → apply `stopped`
-5. Any task **reverted** → apply `reverted`
-6. All tasks **completed** → apply `completed`
-7. Any task **recovering** → apply `recovering`
-8. Any task **cutting_over** → apply `cutting_over`
-9. All non-completed tasks **waiting_for_cutover** → apply `waiting_for_cutover`
-10. All non-completed tasks **waiting_for_deploy** → apply `waiting_for_deploy`
-11. Any task **revert_window** → apply `revert_window`
-12. Any task **running** → apply `running`
-13. Otherwise → apply `pending`
+5. Any task **paused** → apply `paused`
+6. Any task **reverting** → apply `reverting`
+7. Any task **reverted** → apply `reverted`
+8. All tasks **completed** → apply `completed`
+9. Any task **recovering** → apply `recovering`
+10. Any task **cutting_over**, with no task still queued, staging its deploy, resuming, copying, or verifying → apply `cutting_over`
+11. All non-completed tasks **waiting_for_cutover** → apply `waiting_for_cutover`
+12. All non-completed tasks **waiting_for_deploy** → apply `waiting_for_deploy`
+13. Any task **revert_window** → apply `revert_window`
+14. Any task **skipping_revert** → apply `skipping_revert`
+15. Any task **running_degraded** → apply `running_degraded`
+16. Any task **running** → apply `running`
+17. Any task **resuming** → apply `resuming`
+18. Any task draining, verifying, or cutting over while another has not begun copying → apply `running`
+19. Any task **catching_up**, then **checksumming**, then **post_checksum** → that phase
+20. Any task in a deploy setup phase (`preparing_branch` … `validating_deploy_request`) → the least advanced one
+21. Otherwise → apply `pending`
+
+Every apply state derives to itself when it is the only input; `TestDeriveApplyState_EveryStateDerivesToItself` fails when a new state has no place in this order.
 
 Apply terminal states (`completed`, `failed`, `stopped`, `cancelled`, `reverted`) are checked via `IsTerminalApplyState()`. Note: `failed_retryable` is not terminal because scheduler recovery can retry it, and `stopped` is not terminal at the task level because a stopped task can be resumed via Start.
 
