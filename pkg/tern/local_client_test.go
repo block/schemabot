@@ -1626,14 +1626,18 @@ func groupedStartFixture(taskUpdateErr func(*storage.Task) error) (*LocalClient,
 
 // The engine has accepted the work, so a storage failure writing the tasks as
 // running is storage uncertainty, not a failed schema change. The drive stops
-// before polling and pauses the apply for operator retry, rather than driving
-// on over tasks storage does not hold as running.
+// before polling, pauses the apply for operator retry rather than driving on
+// over tasks storage does not hold as running, and halts the accepted engine
+// work under its own claim as it returns.
 func TestExecuteGroupedApplyTaskStartWriteFailurePausesForRetry(t *testing.T) {
 	client, apply, tasks, plan, applyStore, eng := groupedStartFixture(func(*storage.Task) error {
 		return errors.New("storage unavailable")
 	})
+	halts := &haltRecordingControlEngine{fakeControlEngine: eng}
+	client.spiritEngine = halts
+	drive := driveContext(t.Context(), "token-a")
 
-	require.NoError(t, client.executeGroupedApply(t.Context(), apply, tasks, plan, nil, false))
+	require.NoError(t, client.executeGroupedApply(drive, apply, tasks, plan, nil, false))
 
 	assert.True(t, state.IsState(applyStore.stored.State, state.Apply.FailedRetryable),
 		"apply must pause for operator retry, got %s", applyStore.stored.State)
@@ -1643,17 +1647,22 @@ func TestExecuteGroupedApplyTaskStartWriteFailurePausesForRetry(t *testing.T) {
 			"task %s must pause for operator retry, got %s", task.TableName, task.State)
 	}
 	assert.Nil(t, eng.progressReq, "a drive that could not record the start never polls the engine")
+	assert.Equal(t, []string{driveWorkOwner(drive)}, halts.haltOwners, "the accepted work is halted under the drive's own owner")
 }
 
 // A task start write refused because another driver holds the lease is not the
 // schema change's failure and not this driver's to settle: the drive stands
-// down and leaves the apply and its tasks as stored for the lease holder.
+// down, leaves the apply and its tasks as stored for the lease holder, and
+// halts the engine work it started under its own claim.
 func TestExecuteGroupedApplyTaskStartWriteLeaseLostStandsDown(t *testing.T) {
 	client, apply, tasks, plan, applyStore, eng := groupedStartFixture(func(*storage.Task) error {
 		return fmt.Errorf("apply apply-grouped-start lease taken by another driver: %w", storage.ErrApplyLeaseLost)
 	})
+	halts := &haltRecordingControlEngine{fakeControlEngine: eng}
+	client.spiritEngine = halts
+	drive := driveContext(t.Context(), "token-a")
 
-	require.NoError(t, client.executeGroupedApply(t.Context(), apply, tasks, plan, nil, false))
+	require.NoError(t, client.executeGroupedApply(drive, apply, tasks, plan, nil, false))
 
 	assert.True(t, state.IsState(applyStore.stored.State, state.Apply.Running),
 		"the apply stays as stored for the lease holder, got %s", applyStore.stored.State)
@@ -1663,6 +1672,7 @@ func TestExecuteGroupedApplyTaskStartWriteLeaseLostStandsDown(t *testing.T) {
 		assert.Nil(t, task.StartedAt)
 	}
 	assert.Nil(t, eng.progressReq, "a displaced drive never polls the engine")
+	assert.Equal(t, []string{driveWorkOwner(drive)}, halts.haltOwners, "the accepted work is halted under the drive's own owner")
 }
 
 // refusingStateApplyStore refuses the write that records the apply in one
