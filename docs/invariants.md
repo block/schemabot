@@ -1203,6 +1203,18 @@ resolves targets, the target held is the database and environment the
 target's applies were stored under, reached through the route those applies
 take (`TargetRouter.ReconcileRecentTargetBranches`).
 
+### OW-11: No apply holds more than half of any process's drivers
+
+While starting work, one apply holds at most half of a process's driver pool, rounded down and never
+less than one driver. On every process with two or more drivers, then, an apply whose drives all hang
+still leaves drivers free to claim other databases' work, and a wide apply spreads across processes
+instead of filling whichever polled first. Every claim that starts work counts against the share,
+including starting a parked cutover. Recovering a crashed operation and consuming a stop or cancel
+are exempt, so the bound never wedges the apply it limits. *Enforced:* the start arms of the copy
+claim and the start branch of the cutover claim, serialized per process so concurrent drivers
+cannot overshoot the share (`processShareClause` and `parkedCutoverProcessShareClause`, `pkg/storage/internal/sqlstore/apply_operations.go`);
+the pool size reaches storage from the server config (`pkg/serve/serve.go`).
+
 ## Control operations (CO)
 
 Full doctrine: [grpc-control-edge-cases.md](grpc-control-edge-cases.md) and the Control

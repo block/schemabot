@@ -12,7 +12,9 @@ import (
 	"log/slog"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 
@@ -40,6 +42,19 @@ type applyOperationStore struct {
 	// substitutes storage.DefaultMaxDriversPerApply for an unset value, so the
 	// claim path has no uncapped mode.
 	maxDriversPerApply int
+
+	// processDriverShare caps how many operation leases one apply may hold on
+	// one process; see storage.ProcessDriverShare. Always positive.
+	processDriverShare int
+
+	// claimMu serializes this store's operation claims, so the process share is
+	// exact rather than soft. The plane-wide cap stays soft (see
+	// storage.DefaultMaxDriversPerApply) because bounding it would serialize
+	// claims across pods. Within one process the claims are cheap and a pool's
+	// worth of drivers at most, so serializing them costs little and keeps
+	// concurrent drivers from each reading the pre-claim count and overshooting
+	// the share together.
+	claimMu sync.Mutex
 }
 
 // Insert stores a new apply_operations row and returns its ID.
@@ -1319,8 +1334,83 @@ func driverOccupyingOperationStates() []string {
 	return append(claimableApplyStates(), state.ApplyOperation.FailedRetryable)
 }
 
+// processFreshLeaseCountSQL is freshLeaseCountSQL narrowed to the leases one
+// process holds. A lease owner is "<process>/<claimer>", so the claimer's
+// process prefix selects them, compared byte-exact.
+//
+// It takes three format arguments in order: the occupying-state placeholder
+// list, the dialect's staleness cutoff expression, and the lease owner prefix
+// comparison. Its positional arguments are one per occupying state, then the
+// prefix.
+const processFreshLeaseCountSQL = `(
+			SELECT COUNT(*)
+			FROM apply_operations AS busy
+			WHERE busy.apply_id = apply_operations.apply_id
+				AND busy.lease_owner <> ''
+				AND busy.state IN (%s)
+				AND busy.updated_at >= %s
+				AND %s
+		)`
+
+// leaseOwnerProcessPrefix returns the part of a lease owner that names its
+// process, including the trailing delimiter: "<host>/<pid>/" for
+// "<host>/<pid>/driver-1". The delimiter keeps one process from matching
+// another whose name it begins, so "<host>/1/" never matches "<host>/12/...".
+// An owner with no delimiter is a claimer that is its own process; ok is false,
+// and the caller compares the whole owner instead of a prefix.
+func leaseOwnerProcessPrefix(owner string) (prefix string, ok bool) {
+	i := strings.LastIndex(owner, "/")
+	if i < 0 {
+		return "", false
+	}
+	return owner[:i+1], true
+}
+
+// processShareClause renders the per-process share predicate and returns it
+// with its positional arguments: the apply holds fewer than processDriverShare
+// fresh leases on the claimer's own process.
+func (s *applyOperationStore) processShareClause(staleClaimCutoff, owner string) (string, []any) {
+	return s.processShareClauseMatching(staleClaimCutoff, owner, "TRUE", nil)
+}
+
+// parkedCutoverProcessShareClause is processShareClause for the cutover claim,
+// leaving out the apply's rows parked at the cutover barrier.
+//
+// Every apply the cutover claim considers is one whose copy drives park at the
+// barrier and return, so a parked row occupies no driver. It keeps the lease
+// of the drive that parked it until that lease goes stale, though, and counting
+// that leftover would hold a cutover, its own included, behind drivers already
+// free. The copy claim cannot leave these rows out the same way: it also sees
+// applies whose drives hold their claim while waiting for a cutover.
+func (s *applyOperationStore) parkedCutoverProcessShareClause(staleClaimCutoff, owner string) (string, []any) {
+	return s.processShareClauseMatching(staleClaimCutoff, owner,
+		`NOT (busy.state = ? AND busy.cutover_policy IN (?, ?))`,
+		[]any{state.ApplyOperation.WaitingForCutover, storage.CutoverPolicyBarrier, storage.CutoverPolicyParallel})
+}
+
+// processShareClauseMatching renders the process share predicate over the
+// apply's rows that also satisfy busyFilter, whose positional arguments are
+// filterArgs.
+func (s *applyOperationStore) processShareClauseMatching(staleClaimCutoff, owner, busyFilter string, filterArgs []any) (string, []any) {
+	occupyingStates := driverOccupyingOperationStates()
+	ownerMatch := s.dialect.BinaryCollation(`busy.lease_owner`) + ` = ?`
+	ownerArg := owner
+	if prefix, ok := leaseOwnerProcessPrefix(owner); ok {
+		ownerMatch = s.dialect.BinaryCollation(`LEFT(busy.lease_owner, `+strconv.Itoa(utf8.RuneCountInString(prefix))+`)`) + ` = ?`
+		ownerArg = prefix
+	}
+	clause := fmt.Sprintf(processFreshLeaseCountSQL, placeholders(len(occupyingStates)), staleClaimCutoff, ownerMatch+` AND `+busyFilter) + ` < ?`
+	args := append(stringArgs(occupyingStates), ownerArg)
+	args = append(args, filterArgs...)
+	return clause, append(args, s.processDriverShare)
+}
+
 // driverCapClause renders the fan-out cap predicate and returns it with its
 // positional arguments, so an arm can be gated by appending both together.
+//
+// The predicate is two bounds that must both hold: the apply holds fewer than
+// maxDriversPerApply fresh leases across the plane, and fewer than
+// processDriverShare on the claimer's own process (processShareClause).
 //
 // The clause is rendered here rather than spliced into the claim query as `%s`
 // verbs on purpose. The claim is a long hand-ordered query with many positional
@@ -1328,10 +1418,15 @@ func driverOccupyingOperationStates() []string {
 // would put them in the middle of it, where one misplaced entry shifts every
 // later binding and silently corrupts eligibility for unrelated arms. Rendering
 // the count up front keeps each site's arguments to one named unit.
-func (s *applyOperationStore) driverCapClause(staleClaimCutoff string) (string, []any) {
+func (s *applyOperationStore) driverCapClause(staleClaimCutoff, owner string) (string, []any) {
 	occupyingStates := driverOccupyingOperationStates()
-	clause := fmt.Sprintf(freshLeaseCountSQL, placeholders(len(occupyingStates)), staleClaimCutoff) + " < ?"
-	return clause, append(stringArgs(occupyingStates), s.maxDriversPerApply)
+	processShare, processShareArgs := s.processShareClause(staleClaimCutoff, owner)
+	clause := `(` +
+		fmt.Sprintf(freshLeaseCountSQL, placeholders(len(occupyingStates)), staleClaimCutoff) + ` < ?
+				AND ` + processShare + `
+			)`
+	args := append(stringArgs(occupyingStates), s.maxDriversPerApply)
+	return clause, append(args, processShareArgs...)
 }
 
 // cutoverPhaseOperationStates lists the operation states a driver occupies
@@ -1484,11 +1579,14 @@ func releasedFailureExemptionArgs() []any {
 // Oldest-first is fair only between applies of comparable width. On its own it
 // lets one wide fan-out hold every driver on the plane for as long as its
 // slowest operation runs, so the pending arm is additionally capped at
-// maxDriversPerApply fresh leases per apply (see freshLeaseCountSQL).
+// maxDriversPerApply fresh leases per apply (see freshLeaseCountSQL), and at
+// processDriverShare of them on any one process (see processFreshLeaseCountSQL).
 func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner string) (*storage.ApplyOperation, error) {
 	if owner == "" {
 		return nil, fmt.Errorf("operator owner is required to claim apply_operation: %w", storage.ErrApplyLeaseLost)
 	}
+	s.claimMu.Lock()
+	defer s.claimMu.Unlock()
 	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
 		return nil, fmt.Errorf("begin claim apply_operation transaction: %w", err)
@@ -1499,7 +1597,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 	activeStatePlaceholders := placeholders(len(activeStates))
 	parentClaimable := claimableParentSQL(placeholders(len(terminalApplyStates())))
 	staleClaimCutoff := s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime, LiteralIntervalAmount(uint64(storage.ApplyLeaseStaleAfter.Microseconds())), IntervalMicrosecond)
-	driverCap, driverCapArgs := s.driverCapClause(staleClaimCutoff)
+	driverCap, driverCapArgs := s.driverCapClause(staleClaimCutoff, owner)
 
 	queryArgs := []any{state.ApplyOperation.Pending}
 	// Member-order gate for the pending claim (operationStartGateSQL): a work
@@ -1550,7 +1648,8 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 	// parent's state.
 	queryArgs = append(queryArgs, claimableParentArgs()...)
 	// Fan-out cap: a pending row is claimable only while its apply holds fewer
-	// than maxDriversPerApply fresh operation leases.
+	// than maxDriversPerApply fresh operation leases across the plane, and
+	// fewer than processDriverShare on the claiming process.
 	//
 	// The cap gates every arm that *starts* work — this pending arm, the
 	// stopped+start resume arm, the deferred-deploy arm, and the deliberate
@@ -2191,10 +2290,17 @@ func moveRedispatchToRunning(ctx context.Context, tx *rebindTx, ad *storage.Appl
 // back, and it cannot wedge, since each drops out of the count as its
 // cutover settles. The recovery arm is uncapped for the same reason the copy
 // claim's is: a stale mid-cutover row must always be re-leasable.
+//
+// Starting a parked cutover is also bound by the process share (OW-11): it
+// takes a fresh lease on this process, so it waits while the apply already
+// holds its share here. claimMu serializes this process's claims, so the share
+// needs no recount under the parent apply's lock the way the cap does.
 func (s *applyOperationStore) FindNextApplyOperationCutover(ctx context.Context, owner string) (*storage.ApplyOperation, error) {
 	if owner == "" {
 		return nil, fmt.Errorf("operator owner is required to claim apply_operation cutover: %w", storage.ErrApplyLeaseLost)
 	}
+	s.claimMu.Lock()
+	defer s.claimMu.Unlock()
 	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
 		return nil, fmt.Errorf("begin claim apply_operation cutover transaction: %w", err)
@@ -2225,6 +2331,7 @@ func (s *applyOperationStore) FindNextApplyOperationCutover(ctx context.Context,
 	// via the copy/manual path, so recovering it here would steal legitimate work.
 	staleClaimCutoff := s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime, LiteralIntervalAmount(uint64(storage.ApplyLeaseStaleAfter.Microseconds())), IntervalMicrosecond)
 	cutoverCap, cutoverCapArgs := s.cutoverCapClause(staleClaimCutoff)
+	processShare, processShareArgs := s.parkedCutoverProcessShareClause(staleClaimCutoff, owner)
 	queryArgs := []any{storage.CutoverPolicyBarrier, storage.CutoverPolicyParallel}
 	// Start-a-parked-cutover gate (see SQL below). A waiting_for_cutover row is
 	// claimable unless an earlier operation of the apply holds it: one of an
@@ -2233,14 +2340,16 @@ func (s *applyOperationStore) FindNextApplyOperationCutover(ctx context.Context,
 	// releasedFailureExemptionArgs exempt a terminal-failed earlier sibling so
 	// it no longer holds later cutovers under "continue", or under "pause" once
 	// a release latches the rollout open; the pending-stop NOT EXISTS makes
-	// `stop` halt remaining cutovers even under those exemptions; and the
-	// cutover cap bounds how many of the apply's operations cut over at once.
+	// `stop` halt remaining cutovers even under those exemptions; the cutover
+	// cap bounds how many of the apply's operations cut over at once; and the
+	// process share bounds how many of them this process drives.
 	queryArgs = append(queryArgs, state.ApplyOperation.WaitingForCutover)
 	queryArgs = append(queryArgs, earlierSiblingHoldsCutoverArgs()...)
 	queryArgs = append(queryArgs,
 		storage.ControlOperationStop, storage.ControlRequestPending,
 	)
 	queryArgs = append(queryArgs, cutoverCapArgs...)
+	queryArgs = append(queryArgs, processShareArgs...)
 	// Recovery clause: a row already mid-cutover whose heartbeat has gone stale is
 	// re-leased without changing state, so it carries no ordering gate (but is
 	// still bound by the eligibility gate above).
@@ -2282,13 +2391,14 @@ func (s *applyOperationStore) FindNextApplyOperationCutover(ctx context.Context,
 						AND cr.status = ?
 				)
 				AND %s
+				AND %s
 			)
 			OR (state IN (?, ?) AND updated_at < %s)
 		)
 		ORDER BY created_at, id
 		LIMIT 1
 		FOR UPDATE SKIP LOCKED
-	`, applyOperationColumns, deferCutoverIsTrue, cutoverCap, staleClaimCutoff), queryArgs...)
+	`, applyOperationColumns, deferCutoverIsTrue, cutoverCap, processShare, staleClaimCutoff), queryArgs...)
 
 	ad, err := scanApplyOperationInto(row)
 	if errors.Is(err, sql.ErrNoRows) {

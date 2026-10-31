@@ -83,6 +83,10 @@ func NewWithDependencies(deps Dependencies) *Storage {
 	if maxDriversPerApply <= 0 {
 		maxDriversPerApply = storage.DefaultMaxDriversPerApply
 	}
+	driversPerProcess := deps.Options.DriversPerProcess
+	if driversPerProcess <= 0 {
+		driversPerProcess = storage.DefaultDriversPerProcess
+	}
 	return &Storage{
 		db:              rdb,
 		locks:           &lockStore{db: rdb, dialect: deps.Dialect, identity: deps.Identity, classifier: deps.Classifier},
@@ -93,7 +97,7 @@ func NewWithDependencies(deps Dependencies) *Storage {
 		controlRequests: &controlRequestStore{db: rdb, identity: deps.Identity, classifier: deps.Classifier, dialect: deps.Dialect, locker: deps.Locker},
 		applyComments:   &applyCommentStore{db: rdb, dialect: deps.Dialect},
 		planComments:    &planCommentStore{db: rdb, identity: deps.Identity, dialect: deps.Dialect},
-		applyOperations: &applyOperationStore{db: rdb, dialect: deps.Dialect, identity: deps.Identity, locker: deps.Locker, classifier: deps.Classifier, maxDriversPerApply: maxDriversPerApply},
+		applyOperations: &applyOperationStore{db: rdb, dialect: deps.Dialect, identity: deps.Identity, locker: deps.Locker, classifier: deps.Classifier, maxDriversPerApply: maxDriversPerApply, processDriverShare: storage.ProcessDriverShare(driversPerProcess)},
 		checks:          &checkStore{db: rdb, dialect: deps.Dialect, classifier: deps.Classifier},
 		settings:        &settingsStore{db: rdb, dialect: deps.Dialect, classifier: deps.Classifier},
 		webhookEvents:   &webhookEventStore{db: rdb, dialect: deps.Dialect, identity: deps.Identity, classifier: deps.Classifier},
