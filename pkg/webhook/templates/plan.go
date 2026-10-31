@@ -1100,14 +1100,39 @@ func planSummaryText(changes []KeyspaceChangeData, databaseType string, isMySQL 
 // when nothing was excluded, so plans from repos without the config render
 // unchanged.
 func writeIgnoredNamespaces(sb *strings.Builder, ignored []string) {
+	writeIgnoredNamespacesForEnv(sb, ignored, "")
+}
+
+// writeIgnoredNamespacesForEnv renders the ignore_namespaces disclosure,
+// naming the environment when the caller breaks the disclosure down per
+// environment. A pattern entry can withhold a long run of namespaces, so past
+// exemptTablesInlineLimit the line leads with its count and folds the names
+// into a collapsed block, the same way the exempt-table disclosure does. The
+// count stays on the visible line so a reviewer can see the plan withheld
+// namespaces, and how many, without opening anything.
+func writeIgnoredNamespacesForEnv(sb *strings.Builder, ignored []string, env string) {
 	if len(ignored) == 0 {
 		return
 	}
-	quoted := make([]string, len(ignored))
-	for i, ns := range ignored {
-		quoted[i] = inlineCode(ns)
+	names := strings.Join(inlineCodeList(ignored), ", ")
+
+	if len(ignored) <= exemptTablesInlineLimit {
+		prefix, noun := "", "Namespaces"
+		if env != "" {
+			prefix, noun = fmt.Sprintf("**%s**: ", capitalizeFirst(env)), "namespaces"
+		}
+		fmt.Fprintf(sb, glyph.Info+" %s%s excluded from this plan by `ignore_namespaces`: %s\n\n", prefix, noun, names)
+		return
 	}
-	fmt.Fprintf(sb, glyph.Info+" Namespaces excluded from this plan by `ignore_namespaces`: %s\n\n", strings.Join(quoted, ", "))
+
+	// GitHub renders <summary> content as HTML, not markdown, so the folded
+	// header names the config key in a <code> tag and escapes as HTML.
+	prefix := ""
+	if env != "" {
+		prefix = fmt.Sprintf("<b>%s</b>: ", html.EscapeString(capitalizeFirst(env)))
+	}
+	fmt.Fprintf(sb, "<details>\n<summary>"+glyph.Info+" %s%d namespaces excluded from this plan by <code>ignore_namespaces</code></summary>\n\n%s\n\n</details>\n\n",
+		prefix, len(ignored), names)
 }
 
 // exemptTablesInlineLimit caps how many exempt table names render inline in
@@ -1277,11 +1302,7 @@ func writeMultiEnvIgnoredNamespaces(sb *strings.Builder, data MultiEnvPlanCommen
 		if !ok || plan == nil || len(plan.IgnoredNamespaces) == 0 {
 			continue
 		}
-		quoted := make([]string, len(plan.IgnoredNamespaces))
-		for i, ns := range plan.IgnoredNamespaces {
-			quoted[i] = inlineCode(ns)
-		}
-		fmt.Fprintf(sb, glyph.Info+" **%s**: namespaces excluded from this plan by `ignore_namespaces`: %s\n\n", capitalizeFirst(env), strings.Join(quoted, ", "))
+		writeIgnoredNamespacesForEnv(sb, plan.IgnoredNamespaces, env)
 	}
 }
 

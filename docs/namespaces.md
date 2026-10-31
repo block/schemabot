@@ -355,12 +355,43 @@ ignore_namespaces:
   - commerce_test
 ```
 
+### Patterns
+
+A sharded database often runs fewer shards in staging than in production, while its schema root carries one directory per shard schema in either environment, each linked to one definition. Every shard number staging does not run is a namespace staging must not plan. Rather than list each one, wrap a regular expression in slashes:
+
+```
+myapp/schema/
+├── schemabot.yaml
+├── shop_{env}/             ← the definition
+├── shop_0_{env} -> shop_{env}
+├── shop_1_{env} -> shop_{env}
+├── ...
+└── shop_31_{env} -> shop_{env}
+```
+
+```yaml
+# schemabot.yaml: staging runs shop_0 through shop_3, production shop_0 through shop_31
+database: shop
+type: mysql
+ignore_namespaces:
+  - /^shop_([4-9]|[12][0-9]|3[01])_staging$/
+```
+
+- A pattern is matched against namespace names after `{env}` and `$ENV` are substituted, so it cannot use either token; spell the environment out. A pattern naming one environment matches nothing in the others and is reported there as unmatched, one line per pattern.
+- A pattern matches the **whole** namespace name, whether or not you write `^` and `$`. `/shop_[0-9]+_staging/` withholds `shop_7_staging`, but not `old_shop_7_staging` or `shop_7_staging_copy`.
+- Matching is case-sensitive, the same as a plain entry. Start the expression with `(?i)` to ignore case.
+- The syntax is [RE2](https://github.com/google/re2/wiki/Syntax), the same as `ignore_tables` patterns. A pattern is at most 256 bytes, slashes included, and all of a config's patterns together are at most 1024 bytes.
+- A pattern that does not compile, uses `{env}` or `$ENV`, or requires a slash is an error naming the entry, raised when the config is loaded, so the plan fails rather than skipping the entry.
+- Every namespace a pattern withholds is listed in the plan's exclusion disclosure, so a pattern broader than intended shows up in review as a namespace that should not be on the list.
+
+Upgrade the SchemaBot server and CLI before adding a pattern. An older build refuses the entry as a path when it reads `schemabot.yaml`, so the plan fails rather than reconciling the namespaces the pattern was meant to withhold. Data planes need no upgrade: they receive the withheld namespace names, never the patterns.
+
 ### Rules
 
-- Entries are bare namespace names, not paths. An entry containing `/` or `\` (e.g., `schema/commerce_test`) is rejected when the config is loaded.
+- Entries are bare namespace names or slash-wrapped patterns, not paths. An entry containing `/` or `\` that is not a pattern (e.g., `schema/commerce_test`) is rejected when the config is loaded.
 - Ignored namespaces are excluded from plans, applies, and merge-gate checks. This applies to both the GitHub PR flow and the CLI (`schemabot plan` / `schemabot apply` read the same `schemabot.yaml`).
-- `{env}` and legacy `$ENV` substitution apply to entries the same way they apply to directory names: `fixtures_{env}` ignores the `fixtures_staging` namespace when planning for staging.
-- Matching is exact and case-sensitive. An entry that matches no namespace directory excludes nothing; the plan proceeds and the unmatched entry is reported (a CLI warning, a server-side log) so a typo or stale entry is visible.
+- `{env}` and legacy `$ENV` substitution apply to plain entries the same way they apply to directory names: `fixtures_{env}` ignores the `fixtures_staging` namespace when planning for staging.
+- A plain entry matches exactly and case-sensitively. An entry that matches no namespace directory excludes nothing; the plan proceeds and the unmatched entry is reported (a CLI warning, a server-side log) so a typo or stale entry is visible.
 - Ignoring every namespace in the schema root is an error: the plan fails rather than reconciling an empty desired state.
 - Ignoring a namespace does not exempt the directory from layout validation; a schema root mixing flat files and subdirectories is still rejected.
 
@@ -370,7 +401,9 @@ Every plan that excluded namespaces says so: the PR plan comment renders an
 `ℹ️ Namespaces excluded from this plan by ignore_namespaces: …` line under the
 plan summary (also on "no changes" results, so a withheld namespace is
 distinguishable from an unchanged one), and the CLI prints the same disclosure
-for `plan` and `apply`.
+for `plan` and `apply`. Past five namespaces the PR comment's line leads with
+its count and folds the names into a collapsed block, so how many were withheld
+stays visible unexpanded.
 When reviewing a PR that *introduces* an `ignore_namespaces` entry, the
 disclosure plus the config diff is the review surface: the plan stops
 reconciling that namespace from this PR onward.
