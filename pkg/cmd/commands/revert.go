@@ -51,10 +51,9 @@ func (cmd *RevertCmd) Run(g *Globals) error {
 		return fmt.Errorf("revert failed: %w", err)
 	}
 
-	if resp.Accepted {
-		fmt.Printf("Revert initiated for %s\n", formatControlTarget(cmd.ApplyID, cmd.Database, cmd.Environment))
-	} else {
-		fmt.Printf("Revert not accepted: %s\n", resp.ErrorMessage)
+	if err := checkAccepted(controlResponseWrapper{resp}, "revert"); err != nil {
+		return err
 	}
+	fmt.Printf("Revert initiated for %s\n", formatControlTarget(cmd.ApplyID, cmd.Database, cmd.Environment))
 	return nil
 }
