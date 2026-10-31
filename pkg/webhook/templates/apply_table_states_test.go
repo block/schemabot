@@ -41,25 +41,45 @@ func TestRenderTableProgress_EveryStateHasItsOwnRow(t *testing.T) {
 
 // A reverted apply's comment shows each table as reverted, and an apply
 // holding for its deploy shows each table as waiting for the deploy, rather
-// than as a copy that is still running.
+// than as a copy that is still running. Row counters the table carries from
+// before it settled do not bring back a partial copy bar, and the table keeps
+// its DDL. A table waiting for its deploy is still in flight, so it lists its
+// shards; a reverted table has settled, so it does not.
 func TestRenderApplyStatusComment_RevertedAndWaitingForDeployTables(t *testing.T) {
 	for _, tc := range []struct {
 		applyState string
 		taskState  string
 		want       string
+		listShards bool
 	}{
-		{state.Apply.Reverted, state.Task.Reverted, "**`users`**: 🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧 ↩️ Reverted\n"},
-		{state.Apply.WaitingForDeploy, state.Task.WaitingForDeploy, "**`users`**: ⏸️ Waiting for deploy\n"},
+		{state.Apply.Reverted, state.Task.Reverted, "**`users`**: 🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧 ↩️ Reverted\n", false},
+		{state.Apply.WaitingForDeploy, state.Task.WaitingForDeploy, "**`users`**: ⏸️ Waiting for deploy\n", true},
 	} {
 		t.Run(tc.taskState, func(t *testing.T) {
 			comment := RenderApplyStatusComment(ApplyStatusCommentData{
 				Database: "shop", Environment: "staging", State: tc.applyState, Engine: "Vitess",
 				ApplyID: "apply-c3d4e5f6a7b89012",
-				Tables:  []TableProgressData{{TableName: "users", Status: tc.taskState}},
+				Tables: []TableProgressData{{
+					TableName: "users", Status: tc.taskState,
+					DDL:        "ALTER TABLE `users` ADD COLUMN `nickname` varchar(64)",
+					RowsCopied: 400, RowsTotal: 1000, PercentComplete: 40,
+					Shards: []ShardProgressData{
+						{Shard: "-80", Status: tc.taskState},
+						{Shard: "80-", Status: tc.taskState},
+					},
+				}},
 			})
 
 			assert.Contains(t, comment, tc.want)
 			assert.NotContains(t, comment, "Running...")
+			assert.NotContains(t, comment, "🟦", "the stale counters do not render a copy bar")
+			assert.NotContains(t, comment, "Rows: 400", "the stale counters do not render copy progress")
+			assert.Contains(t, comment, "ADD COLUMN `nickname`")
+			if tc.listShards {
+				assert.Contains(t, comment, "- Shards: 2 (")
+			} else {
+				assert.NotContains(t, comment, "- Shards:")
+			}
 		})
 	}
 }
