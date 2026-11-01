@@ -1174,6 +1174,10 @@ type SchemaChangeComparison struct {
 	Unchanged bool
 	// DifferingPath names the first path where the change differs.
 	DifferingPath string
+	// DifferingPathBaseOnly means that path has the same object at the
+	// approved commit and the head, but different objects at their merge
+	// bases. The rejection must not claim the file itself changed.
+	DifferingPathBaseOnly bool
 	// BaseTipSHA, ApprovedMergeBaseSHA, and HeadMergeBaseSHA are the commits
 	// the comparison was measured against, for operator logs.
 	BaseTipSHA           string
@@ -1273,6 +1277,7 @@ func (ic *InstallationClient) PRSchemaChangeUnchangedSince(ctx context.Context, 
 		return result, fmt.Errorf("compare schema change in %s between approved commit %s and head %s: %w", repo, approvedSHA, headSHA, err)
 	}
 	result.DifferingPath = differingPath
+	result.DifferingPathBaseOnly = comparer.differingPathBaseOnly
 	result.Unchanged = differingPath == ""
 	return result, nil
 }
@@ -1324,6 +1329,7 @@ type schemaChangeComparer struct {
 	// statementComparedPaths are the files proved unchanged by their
 	// statements; each one used up part of maxSchemaStatementComparisons.
 	statementComparedPaths []string
+	differingPathBaseOnly  bool
 }
 
 type schemaChangeItem struct {
@@ -1391,6 +1397,8 @@ func (c *schemaChangeComparer) compare(ctx context.Context, paths []string) (str
 				return "", err
 			}
 			if !same {
+				// Equal objects on equal bases already passed pathUnchanged.
+				c.differingPathBaseOnly = identical
 				return item.path, nil
 			}
 		}

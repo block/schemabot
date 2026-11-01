@@ -25,6 +25,9 @@ type ReviewGateData struct {
 	// ChangedPaths are the schema inputs whose change differs between those
 	// approvals and the head.
 	ChangedPaths []string
+	// ChangedBasePaths have unchanged approved/head content but different
+	// merge-base versions, so they need a base-aware explanation.
+	ChangedBasePaths []string
 	// UncomparedApprovers are authorized reviewers whose approval was given
 	// on an earlier commit the review gate could not compare with the head.
 	UncomparedApprovers []string
@@ -83,6 +86,9 @@ func writeChangedApprovers(sb *strings.Builder, data ReviewGateData) {
 		mentionList(data.ChangedApprovers))
 	if len(data.ChangedPaths) > 0 {
 		fmt.Fprintf(sb, " Changed since the approval: %s.", strings.Join(inlineCodeList(data.ChangedPaths), ", "))
+	}
+	if len(data.ChangedBasePaths) > 0 {
+		fmt.Fprintf(sb, " File contents are unchanged, but their merge-base versions differ: %s.", strings.Join(inlineCodeList(data.ChangedBasePaths), ", "))
 	}
 	if targetsOtherThanDefaultBranch(data) {
 		fmt.Fprintf(sb, " This PR targets `%s`, not `%s`, so changes that reach `%s` count as a change too.",
