@@ -336,6 +336,7 @@ func TestCheckReviewGate_ApprovalCoverage(t *testing.T) {
 		want             string
 		// wantChangedPath is the schema input the comment names as changed.
 		wantChangedPath string
+		wantBaseOnly    bool
 		wantErr         error
 	}{
 		{
@@ -660,12 +661,13 @@ func TestCheckReviewGate_ApprovalCoverage(t *testing.T) {
 		{
 			// Both commits modify amount with the same statement, but on the
 			// newer default branch that statement also drops its NOT NULL.
-			name:       "a rebase that kept the PR's version of a column the default branch changed does not count",
-			base:       map[string]string{"schema/testdb/schemabot.yaml": "database: orders\n", "schema/testdb/orders/orders.sql": ordersWith("`id` bigint NOT NULL, `amount` int")},
-			prChange:   setOrders("`id` bigint NOT NULL, `amount` bigint"),
-			baseChange: setOrders("`id` bigint NOT NULL, `amount` int NOT NULL"),
-			headChange: setOrders("`id` bigint NOT NULL, `amount` bigint"),
-			want:       wantChanged,
+			name:         "a rebase that kept the PR's version of a column the default branch changed does not count",
+			base:         map[string]string{"schema/testdb/schemabot.yaml": "database: orders\n", "schema/testdb/orders/orders.sql": ordersWith("`id` bigint NOT NULL, `amount` int")},
+			prChange:     setOrders("`id` bigint NOT NULL, `amount` bigint"),
+			baseChange:   setOrders("`id` bigint NOT NULL, `amount` int NOT NULL"),
+			headChange:   setOrders("`id` bigint NOT NULL, `amount` bigint"),
+			want:         wantChanged,
+			wantBaseOnly: true,
 		},
 		{
 			name:               "a rebase onto a target branch other than the default that combined the PR's column with the branch's does not count",
@@ -693,8 +695,9 @@ func TestCheckReviewGate_ApprovalCoverage(t *testing.T) {
 			baseChange: func(files map[string]string) {
 				files["schema/testdb/orders/orders.sql"] = "CREATE TABLE `orders` (`id` bigint NOT NULL, `total` bigint, PRIMARY KEY (`id`))"
 			},
-			headChange: addVotesAnd(func(files map[string]string) { files["schema/testdb/orders/orders.sql"] = ordersTable }),
-			want:       wantChanged,
+			headChange:   addVotesAnd(func(files map[string]string) { files["schema/testdb/orders/orders.sql"] = ordersTable }),
+			want:         wantChanged,
+			wantBaseOnly: true,
 		},
 		{
 			name: "a rebase that kept the PR's version of a file over the default branch's does not count",
@@ -707,7 +710,8 @@ func TestCheckReviewGate_ApprovalCoverage(t *testing.T) {
 			headChange: func(files map[string]string) {
 				files["schema/testdb/orders/orders.sql"] = "CREATE TABLE `orders` (`id` bigint NOT NULL, `note` text, PRIMARY KEY (`id`))"
 			},
-			want: wantChanged,
+			want:         wantChanged,
+			wantBaseOnly: true,
 		},
 		{
 			name:     "the PR changing the config after the approval does not count",
@@ -911,13 +915,19 @@ func TestCheckReviewGate_ApprovalCoverage(t *testing.T) {
 			require.NoError(t, err, "an approval that does not count blocks on the merits, not as an evaluation failure")
 			require.NotNil(t, result)
 			assertApprovalVerdict(t, result, tt.want, "bob")
-			if tt.want == wantChanged {
+			switch {
+			case tt.wantBaseOnly:
+				assert.Equal(t, []string{"schema/testdb/orders/orders.sql"}, result.ChangedBasePaths)
+				assert.Empty(t, result.ChangedPaths)
+			case tt.want == wantChanged:
+				assert.Empty(t, result.ChangedBasePaths)
 				require.Len(t, result.ChangedPaths, 1, "the comment names the schema input whose change differs")
 				if tt.wantChangedPath != "" {
 					assert.Equal(t, tt.wantChangedPath, result.ChangedPaths[0])
 				}
-			} else {
+			default:
 				assert.Empty(t, result.ChangedPaths)
+				assert.Empty(t, result.ChangedBasePaths)
 			}
 			if !result.Approved {
 				assert.Equal(t, "main", result.BaseRef, "the review-required comment names the PR's base branch")
@@ -2256,40 +2266,67 @@ func TestEnforceReviewGate(t *testing.T) {
 		}
 	})
 
-	t.Run("approval on an earlier commit is named in the review-required comment", func(t *testing.T) {
-		h, mux := setupReviewGateHandler(t, reviewGateTestConfig(func(cfg *api.ServerConfig) {
-			db := cfg.Databases["orders"]
-			db.OperatorUsers = []string{"bob"}
-			cfg.Databases["orders"] = db
-		}))
-		registerPREndpoint(mux, "alice")
-		registerReviewsEndpoint(mux, []*gh.PullRequestReview{
-			{User: &gh.User{Login: new("bob")}, State: new(ghclient.ReviewApproved), SubmittedAt: &gh.Timestamp{Time: time.Now()}, CommitID: new(reviewGateApproved)},
+	// The approved file stays byte-identical after a rebase, but its new
+	// base adds total. Applying the file would now remove total as well as
+	// add note, so the gate must block and explain the changed base.
+	for _, tt := range []struct {
+		name        string
+		headBase    string
+		headColumns string
+		wantDetail  string
+	}{
+		{
+			name:        "approval on an earlier commit is named in the review-required comment",
+			headBase:    reviewGateOldBase,
+			headColumns: "`memo` text",
+			wantDetail:  "Changed since the approval: `schema/testdb/orders.sql`.",
+		},
+		{
+			name:        "identical files on different bases name the base difference",
+			headBase:    reviewGateBaseTip,
+			headColumns: "`note` text",
+			wantDetail:  "Compared with some earlier approvals, file contents are unchanged, but their merge-base versions differ: `schema/testdb/orders.sql`.",
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			h, mux := setupReviewGateHandler(t, reviewGateTestConfig(func(cfg *api.ServerConfig) {
+				db := cfg.Databases["orders"]
+				db.OperatorUsers = []string{"bob"}
+				cfg.Databases["orders"] = db
+			}))
+			registerPREndpoint(mux, "alice")
+			registerReviewsEndpoint(mux, []*gh.PullRequestReview{
+				{User: &gh.User{Login: new("bob")}, State: new(ghclient.ReviewApproved), SubmittedAt: &gh.Timestamp{Time: time.Now()}, CommitID: new(reviewGateApproved)},
+			})
+			registerReviewGateBaseBranch(t, mux, map[string]string{reviewGateApproved: reviewGateOldBase, reviewGateTestHeadSHA: tt.headBase})
+			registerReviewGateGitObjects(t, mux, map[string]map[string]string{
+				reviewGateOldBase:     {"schema/testdb/orders.sql": "CREATE TABLE `orders` (`id` bigint NOT NULL, PRIMARY KEY (`id`))"},
+				reviewGateBaseTip:     {"schema/testdb/orders.sql": "CREATE TABLE `orders` (`id` bigint NOT NULL, `total` bigint, PRIMARY KEY (`id`))"},
+				reviewGateApproved:    {"schema/testdb/orders.sql": "CREATE TABLE `orders` (`id` bigint NOT NULL, `note` text, PRIMARY KEY (`id`))"},
+				reviewGateTestHeadSHA: {"schema/testdb/orders.sql": "CREATE TABLE `orders` (`id` bigint NOT NULL, " + tt.headColumns + ", PRIMARY KEY (`id`))"},
+			})
+			comments := registerCommentsCapture(mux)
+
+			client, err := h.clientForRepo("octocat/hello-world", 12345)
+			require.NoError(t, err)
+
+			blocked, err := h.enforceReviewGate(t.Context(), client, "octocat/hello-world", 1, 12345, schemaResult, "staging", "alice", "apply", false)
+			require.NoError(t, err)
+			assert.True(t, blocked)
+
+			select {
+			case body := <-comments:
+				assert.Contains(t, body, "Review Required")
+				assert.Contains(t, body, "Approvals on an earlier commit no longer count because this PR's schema change is different now: @bob. "+
+					tt.wantDetail)
+				if tt.headBase == reviewGateBaseTip {
+					assert.NotContains(t, body, "Changed since the approval:")
+				}
+			case <-time.After(2 * time.Second):
+				require.Fail(t, "timed out waiting for review-required comment")
+			}
 		})
-		registerReviewGateBaseBranch(t, mux, map[string]string{reviewGateApproved: reviewGateOldBase, reviewGateTestHeadSHA: reviewGateOldBase})
-		registerReviewGateGitObjects(t, mux, map[string]map[string]string{
-			reviewGateOldBase:     {"schema/testdb/orders.sql": "CREATE TABLE `orders` (`id` bigint NOT NULL, PRIMARY KEY (`id`))"},
-			reviewGateApproved:    {"schema/testdb/orders.sql": "CREATE TABLE `orders` (`id` bigint NOT NULL, `note` text, PRIMARY KEY (`id`))"},
-			reviewGateTestHeadSHA: {"schema/testdb/orders.sql": "CREATE TABLE `orders` (`id` bigint NOT NULL, `memo` text, PRIMARY KEY (`id`))"},
-		})
-		comments := registerCommentsCapture(mux)
-
-		client, err := h.clientForRepo("octocat/hello-world", 12345)
-		require.NoError(t, err)
-
-		blocked, err := h.enforceReviewGate(t.Context(), client, "octocat/hello-world", 1, 12345, schemaResult, "staging", "alice", "apply", false)
-		require.NoError(t, err)
-		assert.True(t, blocked)
-
-		select {
-		case body := <-comments:
-			assert.Contains(t, body, "Review Required")
-			assert.Contains(t, body, "Approvals on an earlier commit no longer count because this PR's schema change is different now: @bob. "+
-				"Changed since the approval: `schema/testdb/orders.sql`.")
-		case <-time.After(2 * time.Second):
-			require.Fail(t, "timed out waiting for review-required comment")
-		}
-	})
+	}
 
 	t.Run("approved review passes without comment", func(t *testing.T) {
 		h, mux := setupReviewGateHandler(t, reviewGateTestConfig(func(cfg *api.ServerConfig) {
