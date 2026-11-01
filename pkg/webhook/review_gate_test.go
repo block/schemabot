@@ -2285,7 +2285,7 @@ func TestEnforceReviewGate(t *testing.T) {
 			name:        "identical files on different bases name the base difference",
 			headBase:    reviewGateBaseTip,
 			headColumns: "`note` text",
-			wantDetail:  "File contents are unchanged, but their merge-base versions differ: `schema/testdb/orders.sql`.",
+			wantDetail:  "Compared with some earlier approvals, file contents are unchanged, but their merge-base versions differ: `schema/testdb/orders.sql`.",
 		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {

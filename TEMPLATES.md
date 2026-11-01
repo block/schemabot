@@ -4443,7 +4443,7 @@ Approvals on an earlier commit no longer count because this PR's schema change i
 
 Schema changes require approval from an authorized reviewer before applying.
 
-Approvals on an earlier commit no longer count because this PR's schema change is different now: @jdoe. File contents are unchanged, but their merge-base versions differ: `schema/testapp/orders.sql`. Ask for an approval of the latest commit.
+Approvals on an earlier commit no longer count because this PR's schema change is different now: @jdoe. Compared with some earlier approvals, file contents are unchanged, but their merge-base versions differ: `schema/testapp/orders.sql`. Ask for an approval of the latest commit.
 
 **Operators of `testapp`**:
 - @acme/testapp-operators

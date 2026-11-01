@@ -88,7 +88,7 @@ func writeChangedApprovers(sb *strings.Builder, data ReviewGateData) {
 		fmt.Fprintf(sb, " Changed since the approval: %s.", strings.Join(inlineCodeList(data.ChangedPaths), ", "))
 	}
 	if len(data.ChangedBasePaths) > 0 {
-		fmt.Fprintf(sb, " File contents are unchanged, but their merge-base versions differ: %s.", strings.Join(inlineCodeList(data.ChangedBasePaths), ", "))
+		fmt.Fprintf(sb, " Compared with some earlier approvals, file contents are unchanged, but their merge-base versions differ: %s.", strings.Join(inlineCodeList(data.ChangedBasePaths), ", "))
 	}
 	if targetsOtherThanDefaultBranch(data) {
 		fmt.Fprintf(sb, " This PR targets `%s`, not `%s`, so changes that reach `%s` count as a change too.",
