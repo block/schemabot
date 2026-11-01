@@ -61,8 +61,8 @@ func runRevertControl(t *testing.T, operation, endpoint string) (string, error) 
 // The server can refuse a revert or skip-revert after the CLI has seen the
 // schema change in its revert window — the window closed in between, or
 // another operator's control got there first. The CLI returns the refusal as
-// an error, so the command exits non-zero and a script never mistakes the
-// refusal for a request that went through.
+// an error, which the top-level command prints to stderr and exits 1 on, so a
+// script never mistakes the refusal for a request that went through.
 func TestRevertControlsReturnARefusalAsAnError(t *testing.T) {
 	for _, operation := range []string{"revert", "skip-revert"} {
 		t.Run(operation, func(t *testing.T) {
@@ -74,6 +74,8 @@ func TestRevertControlsReturnARefusalAsAnError(t *testing.T) {
 
 			require.EqualError(t, err, operation+" not accepted: the revert window has closed")
 			assert.Empty(t, out)
+			assert.NotErrorIs(t, err, ErrSilent, "the refusal is printed as an error, not suppressed")
+			assert.Equal(t, 1, ExitCodeFor(err), "the command exits 1 on the refusal")
 		})
 	}
 }
