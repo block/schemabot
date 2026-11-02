@@ -766,3 +766,25 @@ func TestRolloutShapeRefusalMessage(t *testing.T) {
 	assert.Contains(t, rollbackExecutionErrorMessage("production", "acme", wrapped(spanning)),
 		"Release this PR's lock with `schemabot unlock --tenant acme`, then revert the schema files in a new PR and apply it one target at a time, starting with `schemabot apply -e production --tenant acme --target orders-001`.")
 }
+
+// A deferred apply refused for capacity tells the operator both counts and the
+// command that runs instead. Waiting is offered only when other deferred
+// applies hold part of the capacity, since an apply wider than all of it never
+// fits.
+func TestDispatchErrorMessageNamesDeferredCutoverCapacity(t *testing.T) {
+	crowded := &api.DeferredCutoverCapacityError{Database: "commerce", Environment: "production", Operations: 128, Reserved: 128, Capacity: 192, LiveServers: 64}
+	assert.Equal(t,
+		"`--defer-cutover` would hold 128 operations at their cutover at once, and other deferred applies hold 128 of the 192 deferred operations SchemaBot runs. Run `schemabot apply-confirm -e production --tenant acme` again without `--defer-cutover`, or once those applies finish.",
+		deferredCutoverCapacityMessage(crowded, action.ApplyConfirm, "production", "acme"))
+
+	tooWide := &api.DeferredCutoverCapacityError{Database: "commerce", Environment: "production", Operations: 100, Capacity: 96, LiveServers: 32}
+	msg := applyExecutionErrorMessage(action.ApplyConfirm, "production", "", tooWide)
+	assert.Contains(t, msg,
+		"`--defer-cutover` would hold 100 operations at their cutover at once, and SchemaBot runs at most 96 deferred operations. Run `schemabot apply-confirm -e production` again without `--defer-cutover`.")
+	assert.NotContains(t, msg, "once those applies finish")
+
+	unreported := &api.DeferredCutoverCapacityError{Database: "commerce", Environment: "production", Operations: 4}
+	assert.Equal(t,
+		"`--defer-cutover` would hold 4 operations at their cutover at once, and no SchemaBot server has reported its drivers in the last minute. Run `schemabot apply-confirm -e production` again without `--defer-cutover`.",
+		deferredCutoverCapacityMessage(unreported, action.ApplyConfirm, "production", ""))
+}

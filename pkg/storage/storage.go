@@ -121,6 +121,9 @@ type Storage interface {
 	// WebhookEvents returns the durable webhook event inbox store.
 	WebhookEvents() WebhookEventStore
 
+	// OperatorServers returns the registry of servers running an operator.
+	OperatorServers() OperatorServerStore
+
 	// Ping verifies the database connection is alive.
 	Ping(ctx context.Context) error
 
@@ -371,6 +374,38 @@ type SettingsStore interface {
 	// Delete removes a setting by key. It returns ErrSettingNotFound when no
 	// setting with that key exists.
 	Delete(ctx context.Context, key string) error
+}
+
+// OperatorServerLiveWindow is how recently a server must have heartbeated for
+// OperatorServerStore.ListLive and deferred cutover admission to count its
+// drivers. It matches ApplyLeaseStaleAfter, so a server's drivers leave the
+// count at the moment its leases become reclaimable by peers.
+const OperatorServerLiveWindow = ApplyLeaseStaleAfter
+
+// OperatorServerRetention is how long a server's row outlives its last
+// heartbeat before Heartbeat removes it. A server that exits cleanly removes
+// its own row; this bounds the rows a crashed one leaves behind.
+const OperatorServerRetention = time.Hour
+
+// OperatorServerStore is the registry of servers running an operator and the
+// drivers each runs. Each server heartbeats its own row, so the drivers live
+// across every replica are read from storage rather than configured, and they
+// follow the replica count as it changes.
+type OperatorServerStore interface {
+	// Heartbeat records that server's operator is running now, with its
+	// driver counts, creating its row on the first beat. The time recorded is
+	// the database's clock, so servers whose clocks disagree are still
+	// compared on one. It also removes rows not heard from within
+	// OperatorServerRetention.
+	Heartbeat(ctx context.Context, server *OperatorServer) error
+
+	// Deregister removes server's row. Removing a row that does not exist is
+	// not an error.
+	Deregister(ctx context.Context, serverID string) error
+
+	// ListLive returns the servers that heartbeated within
+	// OperatorServerLiveWindow, ordered by server ID.
+	ListLive(ctx context.Context) ([]*OperatorServer, error)
 }
 
 // WebhookEventStore manages durable webhook inbox rows. It is the storage
@@ -1512,6 +1547,12 @@ type ApplyOperationStore interface {
 	// tells a data plane, which resolves targets on demand rather than
 	// listing them in config, which targets it has applied to.
 	ListRecentTargets(ctx context.Context, databaseType string, lookback time.Duration) ([]AppliedTarget, error)
+
+	// ListActiveDeferredCutoverWidths returns, for each apply started with
+	// --defer-cutover that is not in a terminal state, how many of its work
+	// operations are not terminal, ordered by apply identifier. Applies with
+	// no such operation are left out.
+	ListActiveDeferredCutoverWidths(ctx context.Context) ([]DeferredCutoverWidth, error)
 
 	// UpdateState transitions a child row to a new state. Updates the state
 	// column only; for transitions that should also stamp started_at or

@@ -862,6 +862,13 @@ func dispatchErrorMessage(err error, msgs dispatchMessages) string {
 		}
 		return strings.Join(parts, " ")
 	}
+	if refused, ok := errors.AsType[*api.DeferredCutoverCapacityError](err); ok {
+		parts := []string{deferredCutoverCapacityMessage(refused, msgs.command, msgs.environment, msgs.tenant)}
+		if msgs.afterRefusal != "" {
+			parts = append(parts, msgs.afterRefusal)
+		}
+		return strings.Join(parts, " ")
+	}
 	if missing, ok := errors.AsType[*api.PlanNotFoundError](err); ok {
 		return templates.PlanNotFoundDetail(missing.PlanID, msgs.replan)
 	}
@@ -926,6 +933,26 @@ func rolloutShapeRefusalMessage(refused *api.RolloutShapeRefusedError, command, 
 		return "An apply to more than one deployment is not supported yet when a deployment has several targets. Apply one target at a time, starting with " + narrowed + "."
 	}
 	return "This rollout shape is not supported. See SchemaBot server logs for details."
+}
+
+// deferredCutoverCapacityMessage is the PR comment line for an apply started
+// with --defer-cutover whose operations could not all wait at their cutover at
+// once on this server. It reads only the refusal's counts, so no error text
+// reaches the comment. Re-issuing without the flag always runs; waiting helps
+// only when other deferred applies hold part of the capacity.
+func deferredCutoverCapacityMessage(refused *api.DeferredCutoverCapacityError, command, environment, tenant string) string {
+	rerun := fmt.Sprintf("Run `%s` again without `--defer-cutover`", templates.TenantCommand("schemabot "+command, environment, tenant))
+	switch {
+	case refused.LiveServers == 0:
+		return fmt.Sprintf("`--defer-cutover` would hold %d operations at their cutover at once, and no SchemaBot server has reported its drivers in the last %s. %s.",
+			refused.Operations, api.LiveWindowText(), rerun)
+	case refused.ExceedsCapacity():
+		return fmt.Sprintf("`--defer-cutover` would hold %d operations at their cutover at once, and SchemaBot runs at most %d deferred operations. %s.",
+			refused.Operations, refused.Capacity, rerun)
+	default:
+		return fmt.Sprintf("`--defer-cutover` would hold %d operations at their cutover at once, and other deferred applies hold %d of the %d deferred operations SchemaBot runs. %s, or once those applies finish.",
+			refused.Operations, refused.Reserved, refused.Capacity, rerun)
+	}
 }
 
 // postAutoConfirmDowngrade posts the locked plan comment that pauses an

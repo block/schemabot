@@ -184,7 +184,10 @@ type Service struct {
 	// claimingStopped records that stopRecovery has been closed, so the claim
 	// gate can be closed ahead of StopOperator and closed at most once.
 	claimingStopped bool
-	recoveryWg      sync.WaitGroup
+	// operatorServerID is this run's row in the operator server registry,
+	// set by StartOperator and removed by StopOperator.
+	operatorServerID string
+	recoveryWg       sync.WaitGroup
 	// maintenanceWg holds the reaper passes, which share the driver lifecycle
 	// but claim nothing and drive nothing. They are waited on apart from the
 	// drivers so that a reaper which does not return cannot decide whether the
@@ -192,7 +195,9 @@ type Service struct {
 	maintenanceWg        sync.WaitGroup
 	operatorPollInterval time.Duration
 	strandedReaperEvery  time.Duration
-	retryableExpiryEvery time.Duration
+	// operatorHeartbeatEvery overrides OperatorHeartbeatInterval in tests.
+	operatorHeartbeatEvery time.Duration
+	retryableExpiryEvery   time.Duration
 	// driversBusy counts this process's operator drivers that currently hold
 	// claimed work; it backs the drivers-busy gauge.
 	driversBusy atomic.Int64

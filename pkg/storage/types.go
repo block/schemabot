@@ -1207,6 +1207,17 @@ type Apply struct {
 	// on this apply's own row.
 	TakesOverApplyIDs []int64
 
+	// DeferredCutoverOperations is how many operations this apply would hold
+	// at a deferred cutover at once. When it is two or more, the apply store's
+	// create methods admit the apply only if those operations
+	// fit, beside every other admitted deferred apply of two or more, in the
+	// deferred cutover drivers of the live operator servers, and refuse it
+	// with a *DeferredCutoverCapacityError otherwise. Admission is serialized
+	// across every server and read in the transaction that stores the apply,
+	// so two applies admitted at once cannot together exceed the drivers. It
+	// is not persisted.
+	DeferredCutoverOperations int
+
 	// Engine is the schema change engine: "spirit", "planetscale", etc.
 	Engine string
 
@@ -1359,6 +1370,65 @@ type AppliedTarget struct {
 	Database    string
 	Environment string
 	Target      string
+}
+
+// OperatorServer is one server's row in the operator registry.
+type OperatorServer struct {
+	// ServerID identifies one run of a server's operator.
+	ServerID string
+	// Drivers is how many drivers the operator runs.
+	Drivers int
+	// DeferredCutoverDrivers is how many of them may run work for an apply
+	// deferring its cutover.
+	DeferredCutoverDrivers int
+	CreatedAt              time.Time
+	// UpdatedAt is the server's last heartbeat, at the database's clock.
+	UpdatedAt time.Time
+}
+
+// DeferredCutoverCapacityError is apply creation refusing an apply deferring
+// its cutover whose operations could not all wait at the cutover at once. Each
+// waiting operation keeps its driver and the apply is ready only when every
+// one waits, so an apply wider than the drivers left for it would hold part of
+// them, with nothing ever cut over, until it timed out.
+type DeferredCutoverCapacityError struct {
+	// Operations is how many operations the refused apply would hold.
+	Operations int
+	// Reserved is how many operations other admitted deferred applies hold or
+	// will hold.
+	Reserved int
+	// Capacity is how many deferred cutover drivers the live operator servers
+	// run together.
+	Capacity int
+	// LiveServers is how many operator servers heartbeated within
+	// OperatorServerLiveWindow.
+	LiveServers int
+	// HoldingApplyIDs names the admitted deferred applies counted in Reserved.
+	HoldingApplyIDs []string
+}
+
+// ExceedsCapacity reports whether the apply is wider than every live deferred
+// cutover driver together, so waiting for other deferred applies would not
+// admit it.
+func (e *DeferredCutoverCapacityError) ExceedsCapacity() bool {
+	return e.Operations > e.Capacity
+}
+
+func (e *DeferredCutoverCapacityError) Error() string {
+	return fmt.Sprintf("deferred cutover of %d operations refused: %d of %d deferred cutover drivers on %d live operator servers are reserved by %v",
+		e.Operations, e.Reserved, e.Capacity, e.LiveServers, e.HoldingApplyIDs)
+}
+
+// DeferredCutoverWidth is how many drivers one apply started with
+// --defer-cutover will hold at once: its work operations that have not reached
+// a terminal state. A deferred operation keeps its driver while it waits for
+// the cutover, and the apply is ready to cut over only once all of them wait,
+// so this is the driver count it needs at the same moment.
+type DeferredCutoverWidth struct {
+	ApplyIdentifier string
+	Database        string
+	Environment     string
+	Operations      int
 }
 
 // ApplyOperation represents one child row in the apply_operations table:

@@ -28,6 +28,7 @@ type Storage struct {
 	checks          *checkStore
 	settings        *settingsStore
 	webhookEvents   *webhookEventStore
+	operatorServers *operatorServerStore
 }
 
 var _ storage.Storage = (*Storage)(nil)
@@ -97,6 +98,7 @@ func NewWithDependencies(deps Dependencies) *Storage {
 		checks:          &checkStore{db: rdb, dialect: deps.Dialect, classifier: deps.Classifier},
 		settings:        &settingsStore{db: rdb, dialect: deps.Dialect, classifier: deps.Classifier},
 		webhookEvents:   &webhookEventStore{db: rdb, dialect: deps.Dialect, identity: deps.Identity, classifier: deps.Classifier},
+		operatorServers: &operatorServerStore{db: rdb, dialect: deps.Dialect},
 	}
 }
 
@@ -158,6 +160,11 @@ func (s *Storage) Settings() storage.SettingsStore {
 // WebhookEvents returns the durable webhook event inbox store.
 func (s *Storage) WebhookEvents() storage.WebhookEventStore {
 	return s.webhookEvents
+}
+
+// OperatorServers returns the operator server registry.
+func (s *Storage) OperatorServers() storage.OperatorServerStore {
+	return s.operatorServers
 }
 
 // Ping verifies the database connection is alive.

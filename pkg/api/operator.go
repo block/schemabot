@@ -64,10 +64,7 @@ func (s *Service) StartOperator(ctx context.Context) {
 		return
 	}
 
-	driverCount := s.config.Drivers
-	if driverCount <= 0 {
-		driverCount = DefaultDrivers
-	}
+	driverCount := s.config.resolvedDrivers()
 
 	stop := make(chan struct{})
 	wake := make(chan struct{}, driverCount)
@@ -85,7 +82,21 @@ func (s *Service) StartOperator(ctx context.Context) {
 	s.operatorWake = wake
 	s.claimingStopped = false
 	s.operatorDrivers.Store(int64(driverCount))
+	server := &storage.OperatorServer{
+		ServerID:               newOperatorServerID(),
+		Drivers:                driverCount,
+		DeferredCutoverDrivers: deferredCutoverDrivers(driverCount),
+	}
+	s.operatorServerID = server.ServerID
+	heartbeatEvery := s.operatorHeartbeatEvery
+	if heartbeatEvery <= 0 {
+		heartbeatEvery = OperatorHeartbeatInterval
+	}
 	s.operatorMu.Unlock()
+
+	// Register before any driver claims, so a deferred apply created as this
+	// server starts is admitted against drivers that are about to run.
+	s.heartbeatOperatorServer(driverCtx, server)
 
 	// Seed both occupancy gauges before any driver claims so the pool's
 	// capacity is visible from startup: pool size minus busy, summed across
@@ -109,6 +120,9 @@ func (s *Service) StartOperator(ctx context.Context) {
 	s.maintenanceWg.Go(func() {
 		s.reaperLoop(driverCtx, stop, expiryEvery, "retryable expiry", s.runRetryableExpiryPass)
 	})
+	s.maintenanceWg.Go(func() {
+		s.operatorHeartbeatLoop(driverCtx, stop, heartbeatEvery, server)
+	})
 	if pass, ok := s.branchReconcilePass(); ok {
 		s.maintenanceWg.Go(func() {
 			s.reaperLoop(driverCtx, stop, BranchReconcileInterval, "branch reconcile", pass)
@@ -121,7 +135,9 @@ func (s *Service) StartOperator(ctx context.Context) {
 	// to the default in storage. Log the resolved cap beside the pool size.
 	s.logger.Info("operator started",
 		"drivers", driverCount,
-		"deferred_cutover_drivers", deferredCutoverDrivers(driverCount),
+		"deferred_cutover_drivers", server.DeferredCutoverDrivers,
+		"server_id", server.ServerID,
+		"heartbeat_interval", heartbeatEvery,
 		"max_drivers_per_apply", storage.BuildOptions(storage.WithMaxDriversPerApply(s.config.MaxDriversPerApply)).MaxDriversPerApply,
 		"interval", s.operatorPollInterval,
 		"stranded_reaper_interval", reaperEvery,
@@ -214,9 +230,11 @@ func (s *Service) StopOperator() {
 	// StopClaiming at the shutdown signal.
 	s.stopClaimingLocked()
 	cancel := s.cancelRecovery
+	serverID := s.operatorServerID
 	s.stopRecovery = nil
 	s.cancelRecovery = nil
 	s.operatorWake = nil
+	s.operatorServerID = ""
 	s.operatorMu.Unlock()
 
 	// From here on a drive that returns leaves its claim registered. A drive
@@ -243,6 +261,12 @@ func (s *Service) StopOperator() {
 	// deciding the drives' fate on a stuck maintenance pass would leave this
 	// process's engines copying and its healthy claims to expire for nothing.
 	s.drainMonitor(&s.maintenanceWg, "operator_reapers")
+
+	// The drives are gone or abandoned to peers either way, so this server's
+	// drivers no longer run deferred work. The heartbeat has stopped with the
+	// other maintenance loops; removing the row stops them counting now
+	// rather than once the live window lapses.
+	s.deregisterOperatorServer(serverID)
 
 	if !drivesReturned {
 		return

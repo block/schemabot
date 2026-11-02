@@ -31,8 +31,9 @@ import (
 
 // mockStorage implements storage.Storage for testing.
 type mockStorage struct {
-	pingErr       error
-	webhookEvents storage.WebhookEventStore
+	pingErr         error
+	webhookEvents   storage.WebhookEventStore
+	operatorServers memoryOperatorServers
 }
 
 func (m *mockStorage) Locks() storage.LockStore                     { return nil }
@@ -47,8 +48,47 @@ func (m *mockStorage) ApplyOperations() storage.ApplyOperationStore { return nil
 func (m *mockStorage) Checks() storage.CheckStore                   { return nil }
 func (m *mockStorage) Settings() storage.SettingsStore              { return nil }
 func (m *mockStorage) WebhookEvents() storage.WebhookEventStore     { return m.webhookEvents }
-func (m *mockStorage) Ping(ctx context.Context) error               { return m.pingErr }
-func (m *mockStorage) Close() error                                 { return nil }
+func (m *mockStorage) OperatorServers() storage.OperatorServerStore {
+	return &m.operatorServers
+}
+func (m *mockStorage) Ping(ctx context.Context) error { return m.pingErr }
+func (m *mockStorage) Close() error                   { return nil }
+
+// memoryOperatorServers is an in-memory operator server registry whose
+// heartbeats are always live.
+type memoryOperatorServers struct {
+	mu      sync.Mutex
+	servers map[string]storage.OperatorServer
+	beats   int
+}
+
+func (m *memoryOperatorServers) Heartbeat(_ context.Context, server *storage.OperatorServer) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.servers == nil {
+		m.servers = map[string]storage.OperatorServer{}
+	}
+	m.servers[server.ServerID] = *server
+	m.beats++
+	return nil
+}
+
+func (m *memoryOperatorServers) Deregister(_ context.Context, serverID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.servers, serverID)
+	return nil
+}
+
+func (m *memoryOperatorServers) ListLive(context.Context) ([]*storage.OperatorServer, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	servers := make([]*storage.OperatorServer, 0, len(m.servers))
+	for _, server := range m.servers {
+		servers = append(servers, &server)
+	}
+	return servers, nil
+}
 
 type mockPlanLookupStore struct {
 	plan *storage.Plan

@@ -245,6 +245,51 @@ func (s *applyOperationStore) ListRecentTargets(ctx context.Context, databaseTyp
 	return targets, nil
 }
 
+// ListActiveDeferredCutoverWidths returns how many work operations each
+// non-terminal apply started with --defer-cutover still has to drive, read
+// from the same applies.options key the deferred-work claim filter reads.
+// Stopped counts as terminal here, as it does for claiming: a stopped apply's
+// drives have ended and hold no driver.
+func (s *applyOperationStore) ListActiveDeferredCutoverWidths(ctx context.Context) ([]storage.DeferredCutoverWidth, error) {
+	return listActiveDeferredCutoverWidths(ctx, s.db, s.dialect)
+}
+
+// listActiveDeferredCutoverWidths runs ListActiveDeferredCutoverWidths on q, so
+// deferred cutover admission can read it inside the create transaction.
+func listActiveDeferredCutoverWidths(ctx context.Context, q rowsQueryer, dialect Dialect) ([]storage.DeferredCutoverWidth, error) {
+	terminal := terminalApplyStates()
+	args := stringArgs(terminal)
+	args = append(args, stringArgs(terminal)...)
+	args = append(args, storage.ApplyOperationKindWork)
+	rows, err := q.QueryContext(ctx, `
+		SELECT a.apply_identifier, a.database_name, a.environment, COUNT(*)
+		FROM apply_operations ao
+		JOIN applies a ON a.id = ao.apply_id
+		WHERE `+dialect.JSONBooleanIsTrue("a.options", []string{"defer_cutover"})+`
+			AND a.state NOT IN (`+placeholders(len(terminal))+`)
+			AND ao.state NOT IN (`+placeholders(len(terminal))+`)
+			AND ao.operation_kind = ?
+		GROUP BY a.apply_identifier, a.database_name, a.environment
+		ORDER BY a.apply_identifier`, args...)
+	if err != nil {
+		return nil, fmt.Errorf("query active deferred cutover widths: %w", err)
+	}
+	defer utils.CloseAndLog(rows)
+
+	var widths []storage.DeferredCutoverWidth
+	for rows.Next() {
+		var width storage.DeferredCutoverWidth
+		if err := rows.Scan(&width.ApplyIdentifier, &width.Database, &width.Environment, &width.Operations); err != nil {
+			return nil, fmt.Errorf("scan active deferred cutover width: %w", err)
+		}
+		widths = append(widths, width)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("read active deferred cutover widths: %w", err)
+	}
+	return widths, nil
+}
+
 // execStateUpdate runs a guarded UPDATE against a single apply_operations row,
 // applying the given SET assignments with their placeholder args and the write
 // guard's statement rendering. It centralizes the guard load, argument

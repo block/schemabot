@@ -1985,6 +1985,57 @@ func TestApplyOperations(t *testing.T, h Harness) {
 		assert.Equal(t, deferredOp, got.ID)
 	})
 
+	// ListActiveDeferredCutoverWidths verifies the count apply admission sizes
+	// a deferred cutover against: per active apply started with
+	// --defer-cutover, the work operations still to drive. Settled work and
+	// finalizers are not counted, and neither are applies that do not defer
+	// their cutover or have reached a terminal state.
+	t.Run("ListActiveDeferredCutoverWidths", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+
+		deferred := func(applyID string, planID int64, applyState string) *storage.Apply {
+			t.Helper()
+			apply := CreateApplyWithStateAndEnv(t, store, CreateLock(t, store, applyID+"_db", storage.DatabaseTypeMySQL), applyID, planID, applyState, "staging")
+			apply.Options = []byte(`{"defer_cutover":true}`)
+			require.NoError(t, store.Applies().Update(ctx, apply))
+			return apply
+		}
+		insert := func(apply *storage.Apply, key, kind, opState string) {
+			t.Helper()
+			_, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+				ApplyID: apply.ID, Deployment: "region-a",
+				OperationKey: key, OperationKind: kind, State: opState,
+			})
+			require.NoError(t, err)
+		}
+
+		wide := deferred("apply_deferred_wide", 961, state.Apply.Running)
+		insert(wide, "commerce/-80/users", storage.ApplyOperationKindWork, state.ApplyOperation.Running)
+		insert(wide, "commerce/80-/users", storage.ApplyOperationKindWork, state.ApplyOperation.Pending)
+		insert(wide, "commerce/c0-/users", storage.ApplyOperationKindWork, state.ApplyOperation.WaitingForCutover)
+		insert(wide, "commerce/40-80/users", storage.ApplyOperationKindWork, state.ApplyOperation.Completed)
+		insert(wide, "commerce/finalize", storage.ApplyOperationKindGroupFinalizer, state.ApplyOperation.Pending)
+
+		narrow := deferred("apply_deferred_narrow", 962, state.Apply.Pending)
+		insert(narrow, "schema", storage.ApplyOperationKindWork, state.ApplyOperation.Pending)
+
+		finished := deferred("apply_deferred_cancelled", 963, state.Apply.Cancelled)
+		insert(finished, "commerce/-80/orders", storage.ApplyOperationKindWork, state.ApplyOperation.Cancelled)
+		insert(finished, "commerce/80-/orders", storage.ApplyOperationKindWork, state.ApplyOperation.Cancelled)
+
+		regular := CreateApplyWithStateAndEnv(t, store, CreateLock(t, store, "apply_regular_db", storage.DatabaseTypeMySQL), "apply_regular", 964, state.Apply.Running, "staging")
+		insert(regular, "commerce/-80/items", storage.ApplyOperationKindWork, state.ApplyOperation.Running)
+		insert(regular, "commerce/80-/items", storage.ApplyOperationKindWork, state.ApplyOperation.Running)
+
+		widths, err := store.ApplyOperations().ListActiveDeferredCutoverWidths(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, []storage.DeferredCutoverWidth{
+			{ApplyIdentifier: "apply_deferred_narrow", Database: narrow.Database, Environment: "staging", Operations: 1},
+			{ApplyIdentifier: "apply_deferred_wide", Database: wide.Database, Environment: "staging", Operations: 3},
+		}, widths)
+	})
+
 	// LeaseGuardsSingleAndJoinedWrites verifies both guarded DML shapes. An
 	// operation lease fences a single-row write on the child token, while an
 	// apply lease fences a joined child/parent write; stale holders lose
