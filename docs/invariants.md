@@ -851,8 +851,9 @@ On stop, every non-terminal task goes `stopped` whatever its engine sub-state sa
 engine refuses the stop because the change already settled on its own outcome, in which case the
 drive records that outcome instead (CO-3). A task is
 never promoted to `completed` on partial engine progress, and the stop snapshot is taken only
-after the engine's own stop returns. *Enforced:* stop handling in `pkg/tern/local_control.go` and
-`pkg/tern/stop_terminality.go`.
+after the engine's own stop returns. *Enforced:* stop handling in `pkg/tern/local_control.go`,
+whose engine sweep (`stopEngineForTasks`, `cancelEngineForTasks`) reaches every task with live
+engine work before any is recorded stopped or cancelled, and `pkg/tern/stop_terminality.go`.
 
 ### ST-8: Every state has a recovery story
 

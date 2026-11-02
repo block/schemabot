@@ -1655,19 +1655,35 @@ func hasLiveEngineWork(taskState string) bool {
 		state.Task.FailedRetryable)
 }
 
-// stopEngineForTasks calls eng.Stop() if any targeted task has live engine work.
-// Returns an error if the engine stop fails. Storage must not record stopped
-// state until the apply owner has stopped the live engine work.
+// engineRunsEachTargetSeparately reports whether the engine runs each table's
+// work on each shard as its own schema change, the shape engine.TargetDrainer
+// declares. A control call to such an engine reaches only the work its request
+// names, so a stop or cancel has to address every task with live work. Any
+// other engine drives an apply as a single engine operation (one Spirit runner
+// or one PlanetScale deploy request), and one control call covers the apply.
+func engineRunsEachTargetSeparately(eng engine.Engine) bool {
+	_, ok := eng.(engine.TargetDrainer)
+	return ok
+}
+
+// stopEngineForTasks calls eng.Stop() for the targeted tasks that have live
+// engine work. Returns an error if an engine stop fails. Storage must not record
+// stopped state until the apply owner has stopped the live engine work.
 //
-// It stops at the first task with live engine work and returns: an apply drives
-// a single engine operation (one Spirit runner or one PlanetScale deploy
-// request) whose stop terminates the whole operation, so one eng.Stop covers the
-// targeted apply.
+// For an engine that drives the apply as a single operation, the first task
+// with live work is stopped and the sweep returns, since that stop terminates
+// the whole operation. For an engine that runs each target separately, every
+// task with live work is stopped in turn: stopping one would leave its siblings
+// running under a stopped record. A sibling the engine reports already
+// completed is settled completed on its own task row, so the stop records the
+// outcome each target actually reached.
 func (c *LocalClient) stopEngineForTasks(ctx context.Context, eng engine.Engine, tasks []*storage.Task, targetApplyID int64) (*engine.Credentials, error) {
 	if eng == nil {
 		c.logger.Error("stopEngineForTasks: engine is nil")
 		return nil, fmt.Errorf("no engine configured for type: %s", c.config.Type)
 	}
+	eachTarget := engineRunsEachTargetSeparately(eng)
+	var stopCreds *engine.Credentials
 	for _, task := range tasks {
 		if targetApplyID > 0 && task.ApplyID != targetApplyID {
 			continue
@@ -1690,25 +1706,48 @@ func (c *LocalClient) stopEngineForTasks(ctx context.Context, eng engine.Engine,
 			return nil, fmt.Errorf("build stop request for task %s: %w", task.TaskIdentifier, err)
 		}
 		if _, stopErr := eng.Stop(ctx, req); stopErr != nil {
+			if eachTarget && engine.IsAlreadyCompleted(stopErr) {
+				if err := c.settleTaskCompletedOnEngine(ctx, task, "stop", time.Now()); err != nil {
+					return nil, err
+				}
+				continue
+			}
 			if err := c.resolveFailedEngineStop(ctx, eng, task, creds, req.ResumeState, stopErr); err != nil {
 				return nil, err
+			}
+			if eachTarget {
+				c.logger.Info("engine has no live work for this target; the stop continues to the remaining targets",
+					append(task.LogAttrs(), "error", stopErr)...)
+				continue
 			}
 			// The engine tracks nothing for this task, so there is no live
 			// progress to snapshot: returning no stop credentials keeps the
 			// persisted checkpoint progress on the task rows.
 			return nil, nil
 		}
-		return creds, nil
+		if !eachTarget {
+			return creds, nil
+		}
+		stopCreds = creds
 	}
-	c.logger.Debug("no targeted task has live engine work to stop", "database", c.config.Database, "type", c.config.Type, "target_apply_id", targetApplyID)
-	return nil, nil
+	if stopCreds == nil {
+		c.logger.Debug("no targeted task had live engine work left to stop", "database", c.config.Database, "type", c.config.Type, "target_apply_id", targetApplyID)
+	}
+	return stopCreds, nil
 }
 
+// cancelEngineForTasks calls eng.Cancel() for the targeted tasks that have live
+// engine work, covering the targets the same way stopEngineForTasks does: one
+// call for an engine that drives the apply as a single operation, and a call per
+// task with live work for an engine that runs each target separately, settling a
+// target the engine reports already completed on its own task row.
 func (c *LocalClient) cancelEngineForTasks(ctx context.Context, eng engine.Engine, tasks []*storage.Task, targetApplyID int64) error {
 	if eng == nil {
 		c.logger.Error("cancelEngineForTasks: engine is nil")
 		return fmt.Errorf("no engine configured for type: %s", c.config.Type)
 	}
+	eachTarget := engineRunsEachTargetSeparately(eng)
+	cancelledAny := false
 	for _, task := range tasks {
 		if targetApplyID > 0 && task.ApplyID != targetApplyID {
 			continue
@@ -1731,11 +1770,30 @@ func (c *LocalClient) cancelEngineForTasks(ctx context.Context, eng engine.Engin
 			return fmt.Errorf("build cancel request for task %s: %w", task.TaskIdentifier, err)
 		}
 		if _, cancelErr := eng.Cancel(ctx, req); cancelErr != nil {
-			return c.resolveFailedEngineCancel(ctx, eng, task, creds, req.ResumeState, cancelErr)
+			if !eachTarget {
+				return c.resolveFailedEngineCancel(ctx, eng, task, creds, req.ResumeState, cancelErr)
+			}
+			if engine.IsAlreadyCompleted(cancelErr) {
+				if err := c.settleTaskCompletedOnEngine(ctx, task, "cancel", time.Now()); err != nil {
+					return err
+				}
+				continue
+			}
+			if err := c.resolveFailedEngineCancel(ctx, eng, task, creds, req.ResumeState, cancelErr); err != nil {
+				return err
+			}
+			c.logger.Info("engine has no live work for this target; the cancel continues to the remaining targets",
+				append(task.LogAttrs(), "error", cancelErr)...)
+			continue
 		}
-		return nil
+		if !eachTarget {
+			return nil
+		}
+		cancelledAny = true
 	}
-	c.logger.Debug("no targeted task has live engine work to cancel", "database", c.config.Database, "type", c.config.Type, "target_apply_id", targetApplyID)
+	if !cancelledAny {
+		c.logger.Debug("no targeted task had live engine work left to cancel", "database", c.config.Database, "type", c.config.Type, "target_apply_id", targetApplyID)
+	}
 	return nil
 }
 
@@ -2271,6 +2329,26 @@ func (c *LocalClient) markApplyCancelled(ctx context.Context, applyID int64) err
 	return nil
 }
 
+// settleTaskCompletedOnEngine records one task completed after the engine
+// rejected a stop or cancel because the task's schema change had already
+// completed.
+//
+// The completed state must durably land before the settle proceeds: resolving
+// the durable control request and terminalizing the apply over a refused write
+// — e.g. a lease-guarded update that lost to a peer driver — would record the
+// settle as done while the task row durably stays non-terminal. Failing the
+// settle keeps the request pending so a later claim redoes it under a current
+// lease.
+func (c *LocalClient) settleTaskCompletedOnEngine(ctx context.Context, task *storage.Task, operation string, now time.Time) error {
+	task.ProgressPercent = 100
+	task.CompletedAt = &now
+	if err := c.persistTaskStateTransition(ctx, task, task.ApplyID, state.Task.Completed,
+		fmt.Sprintf("Task %s completed on the engine before the %s took effect", task.TaskIdentifier, operation)); err != nil {
+		return fmt.Errorf("settle task %s completed after the engine rejected the %s as already completed: %w", task.TaskIdentifier, operation, err)
+	}
+	return nil
+}
+
 // settleControlForCompletedEngineChange terminalizes a stop or cancel that the
 // engine rejected because the schema change had already completed on its
 // backend before the operation arrived. The backend's terminal outcome is
@@ -2299,17 +2377,8 @@ func (c *LocalClient) settleControlForCompletedEngineChange(ctx context.Context,
 			skippedCount++
 			continue
 		}
-		task.ProgressPercent = 100
-		task.CompletedAt = &now
-		// The completed state must durably land before the settle proceeds:
-		// resolving the durable control request and terminalizing the apply
-		// over a refused write — e.g. a lease-guarded update that lost to a
-		// peer driver — would record the settle as done while the task row
-		// durably stays non-terminal. Failing the settle keeps the request
-		// pending so a later claim redoes it under a current lease.
-		if err := c.persistTaskStateTransition(ctx, task, task.ApplyID, state.Task.Completed,
-			fmt.Sprintf("Task %s completed on the engine before the %s took effect", task.TaskIdentifier, operation)); err != nil {
-			return 0, fmt.Errorf("settle task %s completed after the engine rejected the %s as already completed: %w", task.TaskIdentifier, operation, err)
+		if err := c.settleTaskCompletedOnEngine(ctx, task, operation, now); err != nil {
+			return 0, err
 		}
 		completedCount++
 	}
