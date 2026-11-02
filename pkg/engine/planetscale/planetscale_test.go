@@ -227,6 +227,7 @@ func TestSplitStatements(t *testing.T) {
 func TestIsSnapshotInProgress(t *testing.T) {
 	assert.True(t, isSnapshotInProgress(fmt.Errorf("Cannot update VSchema while a schema snapshot is in progress.")))
 	assert.True(t, isSnapshotInProgress(fmt.Errorf("wrapped: schema snapshot is in progress")))
+	assert.True(t, isSnapshotInProgress(fmt.Errorf("fetch VSchema for keyspace commerce: schema refreshing; please try again in a few moments")))
 	assert.False(t, isSnapshotInProgress(fmt.Errorf("connection refused")))
 	assert.False(t, isSnapshotInProgress(nil))
 }

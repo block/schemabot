@@ -628,14 +628,16 @@ func TestApplyKeyspaceChanges_TransientFailuresInARowFailTheKeyspace(t *testing.
 
 // One branch password carries every keyspace's changes and the validation
 // after them, so it must outlive the longest apply the retry budgets allow:
-// every batch of maxConcurrentKeyspaces waiting out a full snapshot window.
-// It never drops below an hour.
+// every batch of maxConcurrentKeyspaces waiting out a full snapshot window,
+// then the validation waiting out one more and spending its bounded retries
+// on top. It never drops below an hour.
 func TestBranchPasswordTTLOutlivesTheLongestApply(t *testing.T) {
 	assert.Equal(t, 3600, branchPasswordTTL(0))
 	assert.Equal(t, 3600, branchPasswordTTL(1))
 	for keyspaces := 1; keyspaces <= 256; keyspaces++ {
 		batches := (keyspaces + maxConcurrentKeyspaces - 1) / maxConcurrentKeyspaces
-		longest := time.Duration(batches)*snapshotRetryWait + 90*time.Second
+		validationRetries := time.Duration(branchValidationAttempts) * branchValidationPollInterval
+		longest := time.Duration(batches+1)*snapshotRetryWait + validationRetries
 		assert.Greater(t, time.Duration(branchPasswordTTL(keyspaces))*time.Second, longest, "%d keyspaces", keyspaces)
 	}
 }
