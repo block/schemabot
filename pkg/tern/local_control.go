@@ -1672,18 +1672,27 @@ func engineRunsEachTargetSeparately(eng engine.Engine) bool {
 //
 // For an engine that drives the apply as a single operation, the first task
 // with live work is stopped and the sweep returns, since that stop terminates
-// the whole operation. For an engine that runs each target separately, every
-// task with live work is stopped in turn: stopping one would leave its siblings
-// running under a stopped record. A sibling the engine reports already
-// completed is settled completed on its own task row, so the stop records the
-// outcome each target actually reached.
+// the whole operation. The returned credentials are the ones that stop used,
+// for the caller's progress snapshot.
+//
+// For an engine that runs each target separately, every task with live work is
+// stopped in turn: stopping one would leave its siblings running under a
+// stopped record. Each stopped target reads its own progress onto its task as
+// it stops, so no shared snapshot follows and the returned credentials are nil.
+// A sibling the engine reports already completed is settled completed on its
+// own task row, so the stop records the outcome each target actually reached.
+// When a later target ends the sweep with an error, the targets already stopped
+// are recorded stopped first (see settleTargetsBeforeSweepFailure).
 func (c *LocalClient) stopEngineForTasks(ctx context.Context, eng engine.Engine, tasks []*storage.Task, targetApplyID int64) (*engine.Credentials, error) {
 	if eng == nil {
 		c.logger.Error("stopEngineForTasks: engine is nil")
 		return nil, fmt.Errorf("no engine configured for type: %s", c.config.Type)
 	}
 	eachTarget := engineRunsEachTargetSeparately(eng)
-	var stopCreds *engine.Credentials
+	var stopped []*storage.Task
+	endSweep := func(task *storage.Task, sweepErr error) (*engine.Credentials, error) {
+		return nil, c.settleTargetsBeforeSweepFailure(ctx, stopped, task, targetApplyID, state.Task.Stopped, "stop", sweepErr)
+	}
 	for _, task := range tasks {
 		if targetApplyID > 0 && task.ApplyID != targetApplyID {
 			continue
@@ -1699,21 +1708,21 @@ func (c *LocalClient) stopEngineForTasks(ctx context.Context, eng engine.Engine,
 		}
 		creds, err := c.credentialsForTask(task)
 		if err != nil {
-			return nil, fmt.Errorf("resolve credentials for stop task %s: %w", task.TaskIdentifier, err)
+			return endSweep(task, fmt.Errorf("resolve credentials for stop task %s: %w", task.TaskIdentifier, err))
 		}
 		req, err := c.buildControlRequest(ctx, task, creds, eng, engine.ControlStop)
 		if err != nil {
-			return nil, fmt.Errorf("build stop request for task %s: %w", task.TaskIdentifier, err)
+			return endSweep(task, fmt.Errorf("build stop request for task %s: %w", task.TaskIdentifier, err))
 		}
 		if _, stopErr := eng.Stop(ctx, req); stopErr != nil {
 			if eachTarget && engine.IsAlreadyCompleted(stopErr) {
 				if err := c.settleTaskCompletedOnEngine(ctx, task, "stop", time.Now()); err != nil {
-					return nil, err
+					return endSweep(task, err)
 				}
 				continue
 			}
 			if err := c.resolveFailedEngineStop(ctx, eng, task, creds, req.ResumeState, stopErr); err != nil {
-				return nil, err
+				return endSweep(task, err)
 			}
 			if eachTarget {
 				c.logger.Info("engine has no live work for this target; the stop continues to the remaining targets",
@@ -1728,12 +1737,67 @@ func (c *LocalClient) stopEngineForTasks(ctx context.Context, eng engine.Engine,
 		if !eachTarget {
 			return creds, nil
 		}
-		stopCreds = creds
+		c.recordTargetProgressAfterStop(ctx, eng, task, creds, req.ResumeState)
+		stopped = append(stopped, task)
 	}
-	if stopCreds == nil {
+	if len(stopped) == 0 {
 		c.logger.Debug("no targeted task had live engine work left to stop", "database", c.config.Database, "type", c.config.Type, "target_apply_id", targetApplyID)
 	}
-	return stopCreds, nil
+	return nil, nil
+}
+
+// recordTargetProgressAfterStop reads one stopped target's own progress, scoped
+// by its resume state, onto its task, so the stopped record keeps the rows that
+// target copied. An apply-wide snapshot matches progress to tasks by table,
+// which cannot tell two targets of the same table apart. A failed read keeps
+// the task's stored progress, as the apply-wide snapshot does.
+func (c *LocalClient) recordTargetProgressAfterStop(ctx context.Context, eng engine.Engine, task *storage.Task, creds *engine.Credentials, resumeState *engine.ResumeState) {
+	progress, err := c.progressWithEngine(ctx, eng, &engine.ProgressRequest{
+		Database:    c.config.Database,
+		Credentials: creds,
+		ResumeState: resumeState,
+	})
+	if err != nil {
+		c.logger.Warn("failed to read the stopped target's progress; its task keeps the stored progress",
+			append(task.LogAttrs(), "error", err)...)
+		return
+	}
+	if progress == nil {
+		c.logger.Debug("engine reported no progress for the stopped target; its task keeps the stored progress", task.LogAttrs()...)
+		return
+	}
+	et, ok := indexEngineTableProgress(progress.Tables).ForTask(task)
+	if !ok {
+		c.logger.Debug("stopped target's progress has no entry for its table; its task keeps the stored progress", task.LogAttrs()...)
+		return
+	}
+	applyTableProgress(task, et)
+}
+
+// settleTargetsBeforeSweepFailure records the targets a per-target sweep
+// already stopped or cancelled on the engine before a later target's error
+// ended the sweep, then returns that error. Their engine work is down, so an
+// active row would report work that no longer runs, and a refusal from the
+// later target resolves the request with no retry left to record them. The
+// drive keeps going after such a refusal and records the refusing target's own
+// outcome, and the settled rows hold against its later progress polls.
+//
+// If a settled target cannot be recorded, the error drops the later target's
+// typed refusal, so the request stays pending and a retry repeats the sweep
+// rather than resolving over rows that still read active.
+func (c *LocalClient) settleTargetsBeforeSweepFailure(ctx context.Context, settled []*storage.Task, failed *storage.Task, targetApplyID int64, newState, operation string, sweepErr error) error {
+	if len(settled) == 0 {
+		return sweepErr
+	}
+	c.logger.Warn("a target ended the sweep with an error after earlier targets took effect on the engine; those targets are recorded first",
+		append(failed.LogAttrs(), "operation", operation, "settled_targets", len(settled), "target_state", newState, "error", sweepErr)...)
+	if _, _, _, err := c.markTasksWithState(ctx, settled, targetApplyID, StatementIndex[engine.TableProgress]{}, newState); err != nil {
+		// The later target's error is carried as text, not wrapped, so its
+		// typed refusal cannot resolve the request over the unrecorded rows.
+		return fmt.Errorf("record the %d targets the %s already reached as %s: %w; the %s then failed on task %s: %s",
+			len(settled), operation, newState, err, operation, failed.TaskIdentifier, sweepErr.Error())
+	}
+	return sweepErr
 }
 
 // cancelEngineForTasks calls eng.Cancel() for the targeted tasks that have live
@@ -1747,7 +1811,10 @@ func (c *LocalClient) cancelEngineForTasks(ctx context.Context, eng engine.Engin
 		return fmt.Errorf("no engine configured for type: %s", c.config.Type)
 	}
 	eachTarget := engineRunsEachTargetSeparately(eng)
-	cancelledAny := false
+	var cancelled []*storage.Task
+	endSweep := func(task *storage.Task, sweepErr error) error {
+		return c.settleTargetsBeforeSweepFailure(ctx, cancelled, task, targetApplyID, state.Task.Cancelled, "cancel", sweepErr)
+	}
 	for _, task := range tasks {
 		if targetApplyID > 0 && task.ApplyID != targetApplyID {
 			continue
@@ -1763,11 +1830,11 @@ func (c *LocalClient) cancelEngineForTasks(ctx context.Context, eng engine.Engin
 		}
 		creds, err := c.credentialsForTask(task)
 		if err != nil {
-			return fmt.Errorf("resolve credentials for cancel task %s: %w", task.TaskIdentifier, err)
+			return endSweep(task, fmt.Errorf("resolve credentials for cancel task %s: %w", task.TaskIdentifier, err))
 		}
 		req, err := c.buildControlRequest(ctx, task, creds, eng, engine.ControlCancel)
 		if err != nil {
-			return fmt.Errorf("build cancel request for task %s: %w", task.TaskIdentifier, err)
+			return endSweep(task, fmt.Errorf("build cancel request for task %s: %w", task.TaskIdentifier, err))
 		}
 		if _, cancelErr := eng.Cancel(ctx, req); cancelErr != nil {
 			if !eachTarget {
@@ -1775,12 +1842,12 @@ func (c *LocalClient) cancelEngineForTasks(ctx context.Context, eng engine.Engin
 			}
 			if engine.IsAlreadyCompleted(cancelErr) {
 				if err := c.settleTaskCompletedOnEngine(ctx, task, "cancel", time.Now()); err != nil {
-					return err
+					return endSweep(task, err)
 				}
 				continue
 			}
 			if err := c.resolveFailedEngineCancel(ctx, eng, task, creds, req.ResumeState, cancelErr); err != nil {
-				return err
+				return endSweep(task, err)
 			}
 			c.logger.Info("engine has no live work for this target; the cancel continues to the remaining targets",
 				append(task.LogAttrs(), "error", cancelErr)...)
@@ -1789,9 +1856,9 @@ func (c *LocalClient) cancelEngineForTasks(ctx context.Context, eng engine.Engin
 		if !eachTarget {
 			return nil
 		}
-		cancelledAny = true
+		cancelled = append(cancelled, task)
 	}
-	if !cancelledAny {
+	if len(cancelled) == 0 {
 		c.logger.Debug("no targeted task had live engine work left to cancel", "database", c.config.Database, "type", c.config.Type, "target_apply_id", targetApplyID)
 	}
 	return nil
@@ -2010,7 +2077,7 @@ func (c *LocalClient) snapshotEngineProgress(ctx context.Context, eng engine.Eng
 		return none
 	}
 	if creds == nil {
-		c.logger.Debug("skipping engine progress snapshot because no live engine work was stopped", "database", c.config.Database, "type", c.config.Type)
+		c.logger.Debug("skipping apply-wide engine progress snapshot: no live engine work was stopped, or each stopped target recorded its own progress", "database", c.config.Database, "type", c.config.Type)
 		return none
 	}
 	progress, err := c.progressWithEngine(ctx, eng, &engine.ProgressRequest{
@@ -2061,12 +2128,7 @@ func (c *LocalClient) markTasksWithState(ctx context.Context, tasks []*storage.T
 		// IsComplete means "row copy done", NOT "cutover done". The re-plan
 		// during Start() will detect which tables truly completed.
 		if et, ok := engineProgress.ForTask(task); ok {
-			task.RowsCopied = et.RowsCopied
-			task.RowsTotal = et.RowsTotal
-			task.ProgressPercent = et.Progress
-			task.ETASeconds = int(et.ETASeconds)
-			task.ChecksumRowsChecked = et.ChecksumRowsChecked
-			task.ChecksumRowsTotal = et.ChecksumRowsTotal
+			applyTableProgress(task, et)
 		}
 
 		if err := c.persistTaskStateTransition(ctx, task, task.ApplyID, newState,
@@ -2085,6 +2147,16 @@ func (c *LocalClient) markTasksWithState(ctx context.Context, tasks []*storage.T
 			len(refused), int64(len(refused))+stoppedCount, newState, errors.Join(refused...))
 	}
 	return stoppedCount, skippedCount, applyID, nil
+}
+
+// applyTableProgress copies one table's engine progress onto its task.
+func applyTableProgress(task *storage.Task, et *engine.TableProgress) {
+	task.RowsCopied = et.RowsCopied
+	task.RowsTotal = et.RowsTotal
+	task.ProgressPercent = et.Progress
+	task.ETASeconds = int(et.ETASeconds)
+	task.ChecksumRowsChecked = et.ChecksumRowsChecked
+	task.ChecksumRowsTotal = et.ChecksumRowsTotal
 }
 
 // firstFailedTaskError returns an apply-level failure reason derived from task
