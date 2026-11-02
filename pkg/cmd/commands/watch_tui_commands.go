@@ -185,13 +185,11 @@ func isTableStopped(s string) bool {
 }
 
 // watchHasEnded reports whether the apply has reached a state the watch
-// exits on: it finished, failed, stopped, or was cancelled, or there is no
-// active schema change to follow.
+// exits on: any terminal apply state, or no active schema change to follow.
+// It reads the terminal set from pkg/state, so a terminal state added there
+// ends the watch without a change here.
 func (m WatchModel) watchHasEnded() bool {
-	return state.IsState(m.state,
-		state.Apply.Completed, state.Apply.Failed,
-		state.Apply.Stopped, state.Apply.Cancelled,
-		state.NoActiveChange)
+	return state.IsTerminalApplyState(m.state) || state.IsState(m.state, state.NoActiveChange)
 }
 
 // isEffectivelyStopped returns true if the apply is effectively stopped.
