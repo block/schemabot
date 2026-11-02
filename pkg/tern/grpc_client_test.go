@@ -529,6 +529,7 @@ type capturingTernServer struct {
 	skipRevertApplyID string
 	revertApplyID     string
 	progressApplyID   string
+	progressCalls     int
 	progressReq       *ternv1.ProgressRequest
 	progressState     ternv1.State // state returned by Progress; 0 = STATE_COMPLETED
 	progressStateSet  bool
@@ -715,6 +716,7 @@ func (s *capturingTernServer) Revert(_ context.Context, req *ternv1.RevertReques
 
 func (s *capturingTernServer) Progress(_ context.Context, req *ternv1.ProgressRequest) (*ternv1.ProgressResponse, error) {
 	s.mu.Lock()
+	s.progressCalls++
 	s.progressReq = &ternv1.ProgressRequest{
 		ApplyId:          req.ApplyId,
 		Environment:      req.Environment,
