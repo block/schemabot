@@ -1895,6 +1895,49 @@ func TestApplyOperations(t *testing.T, h Harness) {
 		assert.NotNil(t, operation.StartedAt)
 	})
 
+	// MarkFailedRetryable verifies the pause write records the failure reason
+	// on a resumable row, leaving completed_at unset because the row is not
+	// terminal, and that it takes the same lease fence as the other operation
+	// writes: a holder whose lease was rotated away changes nothing.
+	t.Run("MarkFailedRetryable", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "operation_failed_retryable_db", storage.DatabaseTypeMySQL)
+		apply := CreateApply(t, store, lock, "apply_operation_failed_retryable", 912)
+		opID := createOperation(t, store, apply.ID, "region-a", "commerce/group_finalizer")
+		claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "current-driver")
+		require.NoError(t, err)
+		require.NotNil(t, claimed)
+
+		staleCtx := storage.WithOperationLease(ctx, storage.OperationLease{
+			ApplyID: apply.ID, OperationID: opID, Owner: "old-driver", Token: "stale-token",
+		})
+		require.ErrorIs(t, store.ApplyOperations().MarkFailedRetryable(staleCtx, opID, "storage unavailable"), storage.ErrApplyLeaseLost)
+		operation, err := store.ApplyOperations().Get(ctx, opID)
+		require.NoError(t, err)
+		require.NotNil(t, operation)
+		assert.Equal(t, state.ApplyOperation.Running, operation.State, "a stale lease holder must not pause the row")
+		assert.Empty(t, operation.ErrorMessage)
+
+		ownedCtx := storage.WithOperationLease(ctx, storage.OperationLease{
+			ApplyID: apply.ID, OperationID: opID, Owner: claimed.LeaseOwner, Token: claimed.LeaseToken,
+		})
+		require.NoError(t, store.ApplyOperations().MarkFailedRetryable(ownedCtx, opID, "storage unavailable"))
+		operation, err = store.ApplyOperations().Get(ctx, opID)
+		require.NoError(t, err)
+		require.NotNil(t, operation)
+		assert.Equal(t, state.ApplyOperation.FailedRetryable, operation.State)
+		assert.Equal(t, "storage unavailable", operation.ErrorMessage)
+		assert.Nil(t, operation.CompletedAt, "a resumable row carries no completion time")
+		assert.False(t, state.IsApplyOperationTerminal(operation.State))
+
+		require.NoError(t, store.ApplyOperations().MarkFailedRetryable(ownedCtx, opID, "storage unavailable"),
+			"re-issuing the same pause is a no-op, not an error")
+
+		err = store.ApplyOperations().MarkFailedRetryable(ctx, 999999, "storage unavailable")
+		require.ErrorIs(t, err, storage.ErrApplyOperationNotFound)
+	})
+
 	// MarkPendingStoppedByApply verifies the bulk transition changes only
 	// pending siblings, leaves running and terminal rows intact, preserves the
 	// resumable stopped timestamp contract, and enforces the caller's lease.

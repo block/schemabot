@@ -1527,6 +1527,16 @@ type ApplyOperationStore interface {
 	// MarkFailed sets state=failed, error_message, and completed_at on a child row.
 	MarkFailed(ctx context.Context, id int64, errMsg string) error
 
+	// MarkFailedRetryable pauses a child row for automatic retry: it sets
+	// state=failed_retryable and error_message and leaves completed_at unset,
+	// since the row is resumable rather than terminal. The claim re-leases the
+	// row only while its parent apply is failed_retryable and has retry budget
+	// left, so the pause is bounded by the parent's recovery budget. Use it for
+	// a drive that records its own outcome on a row with no tasks to derive one
+	// from, such as a group_finalizer; a row with tasks derives the state from
+	// them and writes it through UpdateState.
+	MarkFailedRetryable(ctx context.Context, id int64, errMsg string) error
+
 	// MarkTerminal sets a terminal state and stamps completed_at on a child row.
 	// Use for terminal states that record a reconciliation time (cancelled,
 	// reverted). Do not use for stopped: stopped is resumable, so it keeps

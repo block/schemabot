@@ -3227,7 +3227,8 @@ func (s *Service) markOperationFromApplyState(ctx context.Context, driverID int,
 func (s *Service) markOperationFromOwnResult(ctx context.Context, driverID int, op *storage.ApplyOperation) (updated bool, err error) {
 	// A group_finalizer carries no tasks: its terminal state was written by the
 	// drive (driveGroupFinalizer marks it completed only on an accepted apply,
-	// failed otherwise). Deriving from its empty task set would overwrite that
+	// failed_retryable on an error retrying can cure, failed otherwise).
+	// Deriving from its empty task set would overwrite that
 	// outcome, so leave the row as the drive set it and let the parent derivation
 	// read it.
 	if op.OperationKind == storage.ApplyOperationKindGroupFinalizer {

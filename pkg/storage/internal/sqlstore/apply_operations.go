@@ -553,6 +553,23 @@ func (s *applyOperationStore) MarkFailed(ctx context.Context, id int64, errMsg s
 		state.ApplyOperation.Failed, nullString(errMsg))
 }
 
+// MarkFailedRetryable sets state=failed_retryable and error_message, leaving
+// completed_at untouched: the row is resumable, not terminal, so it carries no
+// completion time. The write goes through the same lease guard as MarkFailed.
+// Returns storage.ErrApplyOperationNotFound if no row matches the ID.
+//
+// Idempotent for the same reason as MarkFailed: re-issuing it against a row
+// already failed_retryable with the same message may report zero rows changed,
+// which checkUpdatedOrExists disambiguates from a missing row.
+func (s *applyOperationStore) MarkFailedRetryable(ctx context.Context, id int64, errMsg string) error {
+	return s.execStateUpdate(ctx, id, "mark apply_operation failed_retryable",
+		[]JoinedUpdateAssignment{
+			{Column: "state", Expr: "?"},
+			{Column: "error_message", Expr: "?"},
+		},
+		state.ApplyOperation.FailedRetryable, nullString(errMsg))
+}
+
 // MarkTerminal sets the given terminal state and stamps completed_at=NOW().
 // Returns storage.ErrApplyOperationNotFound if no row matches the ID.
 //

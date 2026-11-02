@@ -1117,6 +1117,16 @@ func (m *mockApplyOperationStore) MarkFailed(_ context.Context, id int64, errMsg
 	return nil
 }
 
+func (m *mockApplyOperationStore) MarkFailedRetryable(_ context.Context, id int64, errMsg string) error {
+	op, ok := m.ops[id]
+	if !ok {
+		return storage.ErrApplyOperationNotFound
+	}
+	op.State = state.ApplyOperation.FailedRetryable
+	op.ErrorMessage = errMsg
+	return nil
+}
+
 func (m *mockApplyOperationStore) SaveExternalID(_ context.Context, applyID, operationID int64, externalID, externalOperationID string) error {
 	if m.saveErr != nil {
 		return m.saveErr
