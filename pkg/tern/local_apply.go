@@ -1035,17 +1035,25 @@ func (c *LocalClient) persistTaskStateTransition(ctx context.Context, task *stor
 	return nil
 }
 
-// markTasksRunning sets DDL tasks to running state with a start timestamp.
-func (c *LocalClient) markTasksRunning(ctx context.Context, tasks []*storage.Task) {
+// markTasksRunning sets DDL tasks to running state with a start timestamp. The
+// first refused write stops the loop and is returned: the task it was writing
+// is put back to the values it arrived with, so nothing downstream reads a
+// running task storage does not hold. Tasks written before it stay running in
+// storage and in memory, for the caller's settlement to move on.
+func (c *LocalClient) markTasksRunning(ctx context.Context, apply *storage.Apply, tasks []*storage.Task) error {
 	now := time.Now()
 	for _, task := range tasks {
+		previous := *task
 		task.State = state.Task.Running
 		task.StartedAt = &now
 		task.UpdatedAt = now
 		if err := c.storage.Tasks().Update(ctx, task); err != nil {
-			c.logger.Error("failed to update task state", append(task.LogAttrs(), "error", err)...)
+			*task = previous
+			return fmt.Errorf("mark task %s running for apply %s (database %s): %w",
+				task.TaskIdentifier, apply.ApplyIdentifier, apply.Database, err)
 		}
 	}
+	return nil
 }
 
 // runWithRecovery wraps an apply function with panic recovery so a single panic
