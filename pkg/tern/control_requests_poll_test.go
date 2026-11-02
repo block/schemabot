@@ -3,12 +3,14 @@ package tern
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 )
@@ -172,4 +174,41 @@ func TestHandleAtomicProgressTickReadsPendingControlRequestsOncePerCheck(t *test
 		assert.Equal(t, 1, counting.pendingReads, "only the revert request is reloaded")
 		assert.Equal(t, 1, f.eng.revertCount, "the queued revert reaches the engine")
 	})
+}
+
+// A sequential local drive answers cancel, stop, and cutover on every poll.
+// With nothing pending, each tick reads the apply's pending requests once and
+// runs none of the per-operation lookups.
+func TestPollTaskToCompletionReadsPendingControlRequestsOncePerTick(t *testing.T) {
+	task := &storage.Task{
+		ID: 1, ApplyID: 1, TaskIdentifier: "task-quiet-poll",
+		Database: "orders", TableName: "line_items", State: state.Task.Running,
+	}
+	apply := &storage.Apply{
+		ID: 1, ApplyIdentifier: "apply-quiet-poll", Database: "orders",
+		Environment: "staging", State: state.Apply.Running,
+	}
+	eng := &fakeControlEngine{progressResult: &engine.ProgressResult{
+		State:  engine.StateRunning,
+		Tables: []engine.TableProgress{{Namespace: "orders", Table: "line_items", State: state.Task.Running, Progress: 40}},
+	}}
+	controlRequests := &pollReadCountingControlRequestStore{testControlRequestStore: &testControlRequestStore{}}
+	client := &LocalClient{
+		customEngine:             eng,
+		taskPollIntervalOverride: 5 * time.Millisecond,
+		storage: &exactProgressStorage{
+			applies:         &exactProgressApplyStore{apply: apply},
+			tasks:           &exactProgressTaskStore{tasks: []*storage.Task{task}},
+			controlRequests: controlRequests,
+			logs:            &mockApplyLogStore{},
+		},
+		logger: slog.Default(),
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
+	defer cancel()
+	assert.Equal(t, taskHandover, client.pollTaskToCompletion(ctx, apply, task, nil, nil))
+
+	assert.Greater(t, controlRequests.listReads, 2, "every tick reads the pending requests")
+	assert.Zero(t, controlRequests.pendingReads, "no per-operation read when nothing is pending")
 }
