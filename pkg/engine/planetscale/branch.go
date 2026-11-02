@@ -43,54 +43,71 @@ import (
 const foreignKeyRefusalReason = "foreign key constraints are not supported"
 
 // branchValidationAttempts and branchValidationPollInterval bound how long
-// post-apply branch validation is retried before the apply fails.
+// post-apply branch validation retries a VSchema difference or a transient
+// error before the apply fails. A schema snapshot is waited out separately,
+// for snapshotRetryWait.
 var (
 	branchValidationAttempts     = 18
 	branchValidationPollInterval = 5 * time.Second
 )
 
-// verifyBranchMatchesDesiredWithRetry retries verifyBranchMatchesDesired up to
-// 90s while the PlanetScale API catches up after the branch was changed. Two
-// failures are retried: a VSchema difference, since GetKeyspaceVSchema may
-// return stale data after UpdateKeyspaceVSchema, and a transient read error,
-// such as the "schema refreshing" answer PlanetScale gives while the schema
-// snapshot that follows DDL runs. DDL schema is fetched via MySQL (real-time),
+// verifyBranchMatchesDesiredWithRetry retries verifyBranchMatchesDesired while
+// the PlanetScale API catches up after the branch was changed. A schema
+// snapshot, which PlanetScale takes after DDL and during which it answers
+// VSchema reads with "schema refreshing", is waited out for snapshotRetryWait
+// from its first answer, the same window the keyspace apply gives it. A
+// VSchema difference, since GetKeyspaceVSchema may return stale data after
+// UpdateKeyspaceVSchema, and any other transient error share a bound of
+// branchValidationAttempts reads. DDL schema is fetched via MySQL (real-time),
 // so a DDL mismatch is a genuine failure and fails fast.
 func (e *Engine) verifyBranchMatchesDesiredWithRetry(ctx context.Context, client psclient.PSClient, org, database, branch string, keyspaces []string, schemaFiles schema.SchemaFiles, ignored engine.IgnoredTables, password *ps.DatabaseBranchPassword) error {
-	var lastErr error
-	for attempt := range branchValidationAttempts {
-		if attempt > 0 {
-			e.logger.Info("retrying branch schema validation, waiting for the PlanetScale API to converge",
-				"branch", branch, "attempt", attempt+1, "delay", branchValidationPollInterval)
-			select {
-			case <-ctx.Done():
-				return fmt.Errorf("context cancelled waiting for schema validation: %w", ctx.Err())
-			case <-time.After(branchValidationPollInterval):
-			}
-		}
-
-		lastErr = e.verifyBranchMatchesDesired(ctx, client, org, database, branch, keyspaces, schemaFiles, ignored, password)
-		if lastErr == nil {
-			if attempt > 0 {
+	var snapshotSince time.Time
+	boundedFailures := 0
+	for attempt := 1; ; attempt++ {
+		err := e.verifyBranchMatchesDesired(ctx, client, org, database, branch, keyspaces, schemaFiles, ignored, password)
+		if err == nil {
+			if attempt > 1 {
 				e.logger.Info("branch schema validated after retry",
-					"branch", branch, "attempts", attempt+1)
+					"branch", branch, "attempts", attempt)
 			}
 			return nil
 		}
 
 		switch {
-		case isVSchemaDifferenceError(lastErr):
+		case isSnapshotInProgress(err):
+			if snapshotSince.IsZero() {
+				snapshotSince = time.Now()
+			}
+			if time.Since(snapshotSince)+branchValidationPollInterval > snapshotRetryWait {
+				return fmt.Errorf("PlanetScale was still taking a schema snapshot of branch %s after %s (%d validation attempts): %w",
+					branch, snapshotRetryWait, attempt, err)
+			}
+			e.logger.Info("PlanetScale is taking a schema snapshot of the branch; validating again once it finishes",
+				"database", database, "branch", branch, "attempt", attempt, "snapshot_wait_left", (snapshotRetryWait - time.Since(snapshotSince)).Round(time.Second))
+		case isVSchemaDifferenceError(err):
+			boundedFailures++
 			e.logger.Debug("VSchema validation attempt failed (API may be stale)",
-				"branch", branch, "attempt", attempt+1, "error", lastErr)
-		case isRetryableEngineError(lastErr):
+				"branch", branch, "attempt", attempt, "error", err)
+		case isRetryableEngineError(err):
+			boundedFailures++
 			e.logger.Warn("transient error validating the branch schema; validating again",
-				"database", database, "branch", branch, "attempt", attempt+1, "error", lastErr)
+				"database", database, "branch", branch, "attempt", attempt, "error", err)
 		default:
-			return lastErr
+			return err
+		}
+		if boundedFailures >= branchValidationAttempts {
+			return fmt.Errorf("branch schema still not validated after %d attempts (%s): %w",
+				branchValidationAttempts, time.Duration(branchValidationAttempts)*branchValidationPollInterval, err)
+		}
+
+		e.logger.Info("retrying branch schema validation, waiting for the PlanetScale API to converge",
+			"branch", branch, "attempt", attempt+1, "delay", branchValidationPollInterval)
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("context cancelled waiting for schema validation: %w", ctx.Err())
+		case <-time.After(branchValidationPollInterval):
 		}
 	}
-	return fmt.Errorf("branch schema still not validated after %d attempts (%s): %w",
-		branchValidationAttempts, time.Duration(branchValidationAttempts)*branchValidationPollInterval, lastErr)
 }
 
 // isVSchemaDifferenceError reports whether a validation failed because the

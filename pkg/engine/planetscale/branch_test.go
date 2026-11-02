@@ -756,17 +756,21 @@ func TestChangesContainUnsafe(t *testing.T) {
 	})
 }
 
-// transientVSchemaClient answers the first VSchema reads with the given
-// errors, then with vschema.
+// transientVSchemaClient answers every VSchema read with always when it is
+// set, and otherwise the first reads with the given errors, then with vschema.
 type transientVSchemaClient struct {
 	psclient.PSClient
 	failures []error
+	always   error
 	vschema  *ps.VSchema
 	reads    int
 }
 
 func (c *transientVSchemaClient) GetKeyspaceVSchema(context.Context, *ps.GetKeyspaceVSchemaRequest) (*ps.VSchema, error) {
 	c.reads++
+	if c.always != nil {
+		return nil, c.always
+	}
 	if c.reads <= len(c.failures) {
 		return nil, c.failures[c.reads-1]
 	}
@@ -784,8 +788,9 @@ func shortenBranchValidationPollInterval(t *testing.T) {
 // snapshot that follows it, so the VSchema read is answered with "schema
 // refreshing" or a retryable API error. Validation reads the branch again
 // once the snapshot finishes instead of failing an apply whose branch is
-// correct. An error that will not clear on its own still fails on the first
-// read.
+// correct, waiting out a snapshot for the same window the keyspace apply
+// gives it, longer than the bound on other transient errors. An error that
+// will not clear on its own still fails on the first read.
 func TestVerifyBranchMatchesDesiredWithRetry_TransientVSchemaReadErrors(t *testing.T) {
 	shortenBranchValidationPollInterval(t)
 
@@ -833,15 +838,31 @@ func TestVerifyBranchMatchesDesiredWithRetry_TransientVSchemaReadErrors(t *testi
 		assert.Equal(t, 1, client.reads)
 	})
 
-	t.Run("schema refreshing that never clears fails after the bound", func(t *testing.T) {
-		failures := make([]error, branchValidationAttempts)
+	t.Run("schema refreshing outlasting the transient bound is still waited out", func(t *testing.T) {
+		failures := make([]error, branchValidationAttempts+7)
 		for i := range failures {
 			failures[i] = errors.New("schema refreshing; please try again in a few moments")
 		}
 		client := &transientVSchemaClient{failures: failures, vschema: &ps.VSchema{Raw: desiredVSchema}}
+		require.NoError(t, validate(client))
+		assert.Equal(t, branchValidationAttempts+8, client.reads)
+	})
+
+	t.Run("schema refreshing that never clears fails after the snapshot window", func(t *testing.T) {
+		origWait := snapshotRetryWait
+		snapshotRetryWait = 50 * time.Millisecond
+		t.Cleanup(func() { snapshotRetryWait = origWait })
+
+		client := &transientVSchemaClient{always: errors.New("schema refreshing; please try again in a few moments")}
+		err := validate(client)
+		require.ErrorContains(t, err, "PlanetScale was still taking a schema snapshot of branch schemabot-mydb-abc after 50ms")
+		require.ErrorContains(t, err, "schema refreshing; please try again in a few moments")
+	})
+
+	t.Run("retryable API error that never clears fails after the transient bound", func(t *testing.T) {
+		client := &transientVSchemaClient{always: &ps.Error{Code: ps.ErrRetry}}
 		err := validate(client)
 		require.ErrorContains(t, err, "branch schema still not validated after 18 attempts")
-		require.ErrorContains(t, err, "schema refreshing; please try again in a few moments")
 		assert.Equal(t, branchValidationAttempts, client.reads)
 	})
 }

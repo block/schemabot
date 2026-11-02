@@ -437,8 +437,9 @@ var deployRequestPendingWait = 30 * time.Minute
 var snapshotRetryWait = 10 * time.Minute
 
 // branchPasswordHeadroom is the part of a branch password's lifetime that is
-// not spent waiting out schema snapshots: the transient retries, the DDL and
-// VSchema writes themselves, and the branch validation after them.
+// not spent on the keyspaces' snapshot windows: the transient retries, the DDL
+// and VSchema writes themselves, and the branch validation after them, which
+// can itself wait out a snapshot for snapshotRetryWait.
 const branchPasswordHeadroom = 30 * time.Minute
 
 // branchPasswordTTL is how long, in seconds, the branch password an apply
