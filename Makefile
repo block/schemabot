@@ -358,7 +358,6 @@ E2E_DC = docker compose -f deploy/e2e/docker-compose.yml
 # that prints the LocalScale logs while the CI job still has time to collect
 # them, instead of a runner cancellation that captures nothing.
 E2E_SEED_APPLY_TIMEOUT ?= 180
-E2E_SEED_APPLY = scripts/e2e-seed-apply.sh $(E2E_SEED_APPLY_TIMEOUT)
 
 # Run local e2e tests in an isolated environment (no conflicts with make demo)
 # Keeps containers alive between runs for fast iteration. Use FRESH=1 to rebuild from scratch.
@@ -391,24 +390,7 @@ endif
 		sleep 1; \
 	done
 	@echo "Applying schemas (MySQL + Vitess in parallel)..."
-	@( $(E2E_SEED_APPLY) mysql-staging -s examples/mysql/schema/testapp -e staging --endpoint http://localhost:14370 -y --allow-unsafe -o log && \
-	   $(E2E_SEED_APPLY) mysql-production -s examples/mysql/schema/testapp -e production --endpoint http://localhost:14370 -y --allow-unsafe -o log ) & \
-	MYSQL_PID=$$!; \
-	for ks in testapp testapp_sharded; do \
-		if [ -f examples/vitess/schema/$$ks/vschema.json ]; then \
-			curl -sf -X POST "http://localhost:14374/admin/seed-vschema" \
-				-H "Content-Type: application/json" \
-				-d "{\"org\":\"localscale-staging\",\"database\":\"testapp-vitess\",\"keyspace\":\"$$ks\",\"vschema\":$$(cat examples/vitess/schema/$$ks/vschema.json)}"; \
-			curl -sf -X POST "http://localhost:14374/admin/seed-vschema" \
-				-H "Content-Type: application/json" \
-				-d "{\"org\":\"localscale-production\",\"database\":\"testapp-vitess\",\"keyspace\":\"$$ks\",\"vschema\":$$(cat examples/vitess/schema/$$ks/vschema.json)}"; \
-		fi; \
-	done; \
-	$(E2E_SEED_APPLY) vitess-staging -s examples/vitess/schema -e staging --endpoint http://localhost:14370 -y --allow-unsafe -o log || \
-		{ echo "=== LocalScale logs ==="; $(E2E_DC) logs localscale --tail=200; kill $$MYSQL_PID 2>/dev/null; exit 1; }; \
-	$(E2E_SEED_APPLY) vitess-production -s examples/vitess/schema -e production --endpoint http://localhost:14370 -y --allow-unsafe -o log || \
-		{ echo "=== LocalScale logs ==="; $(E2E_DC) logs localscale --tail=200; kill $$MYSQL_PID 2>/dev/null; exit 1; }; \
-	wait $$MYSQL_PID
+	@E2E_SEED_APPLY_TIMEOUT=$(E2E_SEED_APPLY_TIMEOUT) scripts/e2e-seed.sh
 	@echo "Running e2e tests..."
 	@E2E_SCHEMABOT_URL=http://localhost:14370 \
 	LOCALSCALE_URL=http://localhost:14374 \
@@ -663,6 +645,7 @@ test: proto test-unit test-consumer-module test-integration test-e2e ## Run all 
 # Run unit tests only (with race detection, no testcontainers)
 test-unit: ## Run unit tests with race detection
 	$(GOTEST) -race ./...
+	python3 -B -m unittest discover -s scripts -p 'test_e2e_seed.py'
 
 # Verify schemabot's startup surface from a consumer module that pins a newer
 # OpenTelemetry SDK than this repo. Host binaries embedding schemabot resolve
