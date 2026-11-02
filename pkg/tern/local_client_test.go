@@ -1675,6 +1675,36 @@ func TestExecuteGroupedApplyTaskStartWriteLeaseLostStandsDown(t *testing.T) {
 	assert.Equal(t, []string{driveWorkOwner(drive)}, halts.haltOwners, "the accepted work is halted under the drive's own owner")
 }
 
+// stateRecordingApplyStore records the state of every apply write it stores.
+type stateRecordingApplyStore struct {
+	*snapshotApplyStore
+	written []string
+}
+
+func (s *stateRecordingApplyStore) Update(ctx context.Context, apply *storage.Apply) error {
+	s.written = append(s.written, apply.State)
+	return s.snapshotApplyStore.Update(ctx, apply)
+}
+
+// A drive that holds only its operation's claim records its tasks as running
+// but leaves the parent apply's running state to the operator's projection: it
+// sends no parent write for the start, and goes on to poll the accepted work
+// rather than reading the skipped write as a failure.
+func TestExecuteGroupedApplyOperationScopedStartSkipsTheParentWrite(t *testing.T) {
+	client, apply, tasks, plan, applyStore, eng := groupedStartFixture(func(*storage.Task) error { return nil })
+	recorder := &stateRecordingApplyStore{snapshotApplyStore: applyStore}
+	client.storage.(*exactProgressStorage).applies = recorder
+	drive := storage.WithOperationLease(t.Context(), storage.OperationLease{ApplyID: apply.ID, OperationID: 7, Owner: "driver", Token: "op-token"})
+
+	require.NoError(t, client.executeGroupedApply(drive, apply, tasks, plan, nil, false))
+
+	assert.NotContains(t, recorder.written, state.Apply.Running, "the parent apply's running state is not this drive's to write")
+	for _, task := range tasks {
+		assert.NotNil(t, task.StartedAt, "task %s is recorded running", task.TableName)
+	}
+	assert.NotNil(t, eng.progressReq, "the drive polls the accepted work")
+}
+
 // refusingStateApplyStore refuses the write that records the apply in one
 // state and stores every other.
 type refusingStateApplyStore struct {
