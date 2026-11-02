@@ -755,3 +755,93 @@ func TestChangesContainUnsafe(t *testing.T) {
 		assert.Empty(t, reason)
 	})
 }
+
+// transientVSchemaClient answers the first VSchema reads with the given
+// errors, then with vschema.
+type transientVSchemaClient struct {
+	psclient.PSClient
+	failures []error
+	vschema  *ps.VSchema
+	reads    int
+}
+
+func (c *transientVSchemaClient) GetKeyspaceVSchema(context.Context, *ps.GetKeyspaceVSchemaRequest) (*ps.VSchema, error) {
+	c.reads++
+	if c.reads <= len(c.failures) {
+		return nil, c.failures[c.reads-1]
+	}
+	return c.vschema, nil
+}
+
+func shortenBranchValidationPollInterval(t *testing.T) {
+	t.Helper()
+	origInterval := branchValidationPollInterval
+	branchValidationPollInterval = time.Millisecond
+	t.Cleanup(func() { branchValidationPollInterval = origInterval })
+}
+
+// The DDL has landed on the branch and PlanetScale is taking the schema
+// snapshot that follows it, so the VSchema read is answered with "schema
+// refreshing" or a retryable API error. Validation reads the branch again
+// once the snapshot finishes instead of failing an apply whose branch is
+// correct. An error that will not clear on its own still fails on the first
+// read.
+func TestVerifyBranchMatchesDesiredWithRetry_TransientVSchemaReadErrors(t *testing.T) {
+	shortenBranchValidationPollInterval(t)
+
+	desiredVSchema := `{"sharded": true, "vindexes": {"hash": {"type": "hash"}}}`
+	files := schema.SchemaFiles{"commerce": &schema.Namespace{Files: map[string]string{"vschema.json": desiredVSchema}}}
+	e := &Engine{
+		linter: lint.New(),
+		logger: slog.New(slog.DiscardHandler),
+		validationBranchSchema: func(context.Context, *ps.DatabaseBranchPassword, []string) (map[string][]table.TableSchema, error) {
+			return map[string][]table.TableSchema{"commerce": nil}, nil
+		},
+	}
+	validate := func(client psclient.PSClient) error {
+		return e.verifyBranchMatchesDesiredWithRetry(t.Context(), client, "org", "mydb", "schemabot-mydb-abc", []string{"commerce"}, files, engine.IgnoredTables{}, &ps.DatabaseBranchPassword{})
+	}
+
+	t.Run("schema refreshing clears once the snapshot finishes", func(t *testing.T) {
+		client := &transientVSchemaClient{
+			failures: []error{
+				errors.New("schema refreshing; please try again in a few moments"),
+				errors.New("schema refreshing; please try again in a few moments"),
+			},
+			vschema: &ps.VSchema{Raw: desiredVSchema},
+		}
+		require.NoError(t, validate(client))
+		assert.Equal(t, 3, client.reads)
+	})
+
+	t.Run("retryable API error clears on a later read", func(t *testing.T) {
+		client := &transientVSchemaClient{
+			failures: []error{&ps.Error{Code: ps.ErrRetry}},
+			vschema:  &ps.VSchema{Raw: desiredVSchema},
+		}
+		require.NoError(t, validate(client))
+		assert.Equal(t, 2, client.reads)
+	})
+
+	t.Run("permission error fails on the first read", func(t *testing.T) {
+		client := &transientVSchemaClient{
+			failures: []error{&ps.Error{Code: ps.ErrPermission}},
+			vschema:  &ps.VSchema{Raw: desiredVSchema},
+		}
+		err := validate(client)
+		require.ErrorContains(t, err, "validate keyspace commerce: fetch VSchema for keyspace commerce")
+		assert.Equal(t, 1, client.reads)
+	})
+
+	t.Run("schema refreshing that never clears fails after the bound", func(t *testing.T) {
+		failures := make([]error, branchValidationAttempts)
+		for i := range failures {
+			failures[i] = errors.New("schema refreshing; please try again in a few moments")
+		}
+		client := &transientVSchemaClient{failures: failures, vschema: &ps.VSchema{Raw: desiredVSchema}}
+		err := validate(client)
+		require.ErrorContains(t, err, "branch schema still not validated after 18 attempts")
+		require.ErrorContains(t, err, "schema refreshing; please try again in a few moments")
+		assert.Equal(t, branchValidationAttempts, client.reads)
+	})
+}

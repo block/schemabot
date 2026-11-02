@@ -42,24 +42,30 @@ import (
 // rules, and getting that wrong would refuse changes that work.
 const foreignKeyRefusalReason = "foreign key constraints are not supported"
 
-// verifyBranchMatchesDesiredWithRetry retries verifyBranchMatchesDesired up to
-// 90s to handle PlanetScale VSchema API staleness. DDL schema is fetched via
-// MySQL (real-time) and fails fast on mismatch. Only VSchema errors are
-// retried, since GetKeyspaceVSchema may return stale data after
-// UpdateKeyspaceVSchema.
-func (e *Engine) verifyBranchMatchesDesiredWithRetry(ctx context.Context, client psclient.PSClient, org, database, branch string, keyspaces []string, schemaFiles schema.SchemaFiles, ignored engine.IgnoredTables, password *ps.DatabaseBranchPassword) error {
-	const maxAttempts = 18
-	const pollInterval = 5 * time.Second
+// branchValidationAttempts and branchValidationPollInterval bound how long
+// post-apply branch validation is retried before the apply fails.
+var (
+	branchValidationAttempts     = 18
+	branchValidationPollInterval = 5 * time.Second
+)
 
+// verifyBranchMatchesDesiredWithRetry retries verifyBranchMatchesDesired up to
+// 90s while the PlanetScale API catches up after the branch was changed. Two
+// failures are retried: a VSchema difference, since GetKeyspaceVSchema may
+// return stale data after UpdateKeyspaceVSchema, and a transient read error,
+// such as the "schema refreshing" answer PlanetScale gives while the schema
+// snapshot that follows DDL runs. DDL schema is fetched via MySQL (real-time),
+// so a DDL mismatch is a genuine failure and fails fast.
+func (e *Engine) verifyBranchMatchesDesiredWithRetry(ctx context.Context, client psclient.PSClient, org, database, branch string, keyspaces []string, schemaFiles schema.SchemaFiles, ignored engine.IgnoredTables, password *ps.DatabaseBranchPassword) error {
 	var lastErr error
-	for attempt := range maxAttempts {
+	for attempt := range branchValidationAttempts {
 		if attempt > 0 {
-			e.logger.Info("retrying branch schema validation, waiting for VSchema API to converge",
-				"branch", branch, "attempt", attempt+1, "delay", pollInterval)
+			e.logger.Info("retrying branch schema validation, waiting for the PlanetScale API to converge",
+				"branch", branch, "attempt", attempt+1, "delay", branchValidationPollInterval)
 			select {
 			case <-ctx.Done():
 				return fmt.Errorf("context cancelled waiting for schema validation: %w", ctx.Err())
-			case <-time.After(pollInterval):
+			case <-time.After(branchValidationPollInterval):
 			}
 		}
 
@@ -72,16 +78,26 @@ func (e *Engine) verifyBranchMatchesDesiredWithRetry(ctx context.Context, client
 			return nil
 		}
 
-		// Only retry VSchema staleness errors. DDL validation uses MySQL
-		// (real-time) so DDL mismatches are genuine failures.
-		if !strings.Contains(lastErr.Error(), "unexpected VSchema difference") {
+		switch {
+		case isVSchemaDifferenceError(lastErr):
+			e.logger.Debug("VSchema validation attempt failed (API may be stale)",
+				"branch", branch, "attempt", attempt+1, "error", lastErr)
+		case isRetryableEngineError(lastErr):
+			e.logger.Warn("transient error validating the branch schema; validating again",
+				"database", database, "branch", branch, "attempt", attempt+1, "error", lastErr)
+		default:
 			return lastErr
 		}
-		e.logger.Debug("VSchema validation attempt failed (API may be stale)",
-			"branch", branch, "attempt", attempt+1, "error", lastErr)
 	}
-	return fmt.Errorf("VSchema still mismatched after %d attempts (%ds): %w",
-		maxAttempts, maxAttempts*int(pollInterval.Seconds()), lastErr)
+	return fmt.Errorf("branch schema still not validated after %d attempts (%s): %w",
+		branchValidationAttempts, time.Duration(branchValidationAttempts)*branchValidationPollInterval, lastErr)
+}
+
+// isVSchemaDifferenceError reports whether a validation failed because the
+// branch VSchema differs from the desired one, which a stale API read can
+// cause and a later read can clear.
+func isVSchemaDifferenceError(err error) bool {
+	return strings.Contains(err.Error(), "unexpected VSchema difference")
 }
 
 // verifyBranchMatchesDesired validates that the branch schema matches the
