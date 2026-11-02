@@ -801,7 +801,10 @@ is not revived: its failed operation stays failed and is never run again. *Enfor
 and by one refusal. No write re-runs a failed operation, and the rollout projection is the only
 write that moves a failed apply to an active state (ST-1); a start on a stopped apply whose
 operation holds a failed task is refused with that failure (`failedTaskRefusingStart`,
-`pkg/tern/local_control_resume.go`).
+`pkg/tern/local_control_resume.go`). An operation row carries no terminal-state guard in storage; a
+displaced drive's late write over a terminal operation is refused by the lease fence
+(`ErrApplyLeaseLost`), pinned by `UpdateState_DisplacedLeaseCannotWriteOverTerminalOperation`
+(`pkg/storage/storagetest/apply_operations.go`).
 
 ### ST-3: Apply state flows upward, never downward
 
@@ -830,7 +833,10 @@ the drive loop reconciles through (`taskStateWithNoBackwardProgress`,
 `pkg/tern/local_client.go`), and the resume's reading of a settled failed task as the apply's
 outcome rather than as work to re-plan (`failedTaskDecidingOutcome` and `replanAndFilterTasks`,
 `pkg/tern/local_control_resume.go`; `checkTaskReady`, `pkg/tern/local_apply_sequential.go`, where
-the sequential drive reads the kept failed row as the verdict).
+the sequential drive reads the kept failed row as the verdict). A task row carries no terminal-state
+guard in storage; a displaced drive's late write over a terminal task is refused by the lease fence
+(`ErrApplyLeaseLost`), pinned by `Update_DisplacedLeaseCannotWriteOverTerminalTask`
+(`pkg/storage/storagetest/tasks.go`).
 
 ### ST-5: Unknown engine states are visible and blocking
 
