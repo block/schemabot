@@ -170,6 +170,10 @@ func (m WatchModel) progressSections() (string, string) {
 		f.WriteString("\n\n")
 		f.WriteString("🚫 Schema change cancelled.\n")
 		f.WriteString("The deploy request has been cancelled. Start a new apply to retry.\n")
+	case state.IsState(m.state, state.Apply.Reverted):
+		f.WriteString("\n\n")
+		f.WriteString("↩️ Schema change reverted.\n")
+		f.WriteString("The schema change was undone after cutover. Start a new apply to make it again.\n")
 	case state.IsState(m.state, state.Apply.Reverting):
 		f.WriteString("\n\n")
 		f.WriteString(m.spinner.View() + "Reverting — undoing the schema change...\n")

@@ -353,15 +353,21 @@ func runWatchModel(model WatchModel) (err error) {
 		printExitContext(m.applyID, m.deployRequestURL, m.environment)
 	}
 
-	// The TUI view already displays errors inline, so return ErrSilent
-	// to exit with code 1 without printing the error again.
+	return m.exitError()
+}
+
+// exitError is the watch's exit status for its final model. The TUI view
+// already displays errors inline, so a failure returns ErrSilent to exit
+// with code 1 without printing the error again. A reverted apply did not
+// leave the change in place, so it exits non-zero too, as the
+// non-interactive watch does.
+func (m WatchModel) exitError() error {
 	if m.errorMsg != "" && !state.IsState(m.state, state.Apply.Completed) {
 		return ErrSilent
 	}
-	if state.IsState(m.state, state.Apply.Failed) {
+	if state.IsState(m.state, state.Apply.Failed, state.Apply.Reverted) {
 		return ErrSilent
 	}
-
 	return nil
 }
 

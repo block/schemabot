@@ -939,3 +939,44 @@ func TestWatchModel_PendingApplyReadsAsQueued(t *testing.T) {
 	assert.Contains(t, view, "Queued, starts automatically")
 	assert.NotContains(t, view, "Starting")
 }
+
+// An apply that is reverted after cutover is over: the interactive watch
+// stops polling, says the change was undone, and exits non-zero, the same
+// outcome the non-interactive watch reports. Every other terminal state
+// ends the watch too.
+func TestWatchModel_EndsOnEveryTerminalState(t *testing.T) {
+	for _, terminal := range []string{
+		state.Apply.Completed,
+		state.Apply.Failed,
+		state.Apply.Stopped,
+		state.Apply.Cancelled,
+		state.Apply.Reverted,
+	} {
+		t.Run(terminal, func(t *testing.T) {
+			require.True(t, state.IsTerminalApplyState(terminal))
+			m := NewWatchModel("http://localhost:8080", "testdb", "staging", false)
+			updated, cmd := m.Update(progressMsg{
+				state:  terminal,
+				tables: []templates.TableProgress{{TableName: "users", Status: state.Task.Completed}},
+			})
+			require.NotNil(t, cmd, "a terminal state ends the watch")
+			assert.IsType(t, tea.QuitMsg{}, cmd())
+			assert.Equal(t, terminal, updated.(WatchModel).state)
+		})
+	}
+
+	t.Run("reverted says the change was undone and exits non-zero", func(t *testing.T) {
+		m := NewWatchModel("http://localhost:8080", "testdb", "staging", false)
+		m.applyID = "apply-reverted"
+		updated, _ := m.Update(progressMsg{
+			state:  state.Apply.Reverted,
+			tables: []templates.TableProgress{{TableName: "users", Status: state.Task.Reverted}},
+		})
+		model := updated.(WatchModel)
+		view := model.View()
+		assert.Contains(t, view, "Schema change reverted.")
+		assert.Contains(t, view, "Start a new apply to make it again.")
+		assert.NotContains(t, view, "Apply complete")
+		assert.ErrorIs(t, model.exitError(), ErrSilent)
+	})
+}
