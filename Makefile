@@ -405,9 +405,9 @@ endif
 		fi; \
 	done; \
 	$(E2E_SEED_APPLY) vitess-staging -s examples/vitess/schema -e staging --endpoint http://localhost:14370 -y --allow-unsafe -o log || \
-		(echo "=== LocalScale logs ===" && $(E2E_DC) logs localscale --tail=200 && false); \
+		{ echo "=== LocalScale logs ==="; $(E2E_DC) logs localscale --tail=200; kill $$MYSQL_PID 2>/dev/null; exit 1; }; \
 	$(E2E_SEED_APPLY) vitess-production -s examples/vitess/schema -e production --endpoint http://localhost:14370 -y --allow-unsafe -o log || \
-		(echo "=== LocalScale logs ===" && $(E2E_DC) logs localscale --tail=200 && false); \
+		{ echo "=== LocalScale logs ==="; $(E2E_DC) logs localscale --tail=200; kill $$MYSQL_PID 2>/dev/null; exit 1; }; \
 	wait $$MYSQL_PID
 	@echo "Running e2e tests..."
 	@E2E_SCHEMABOT_URL=http://localhost:14370 \
