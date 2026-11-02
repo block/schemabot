@@ -786,12 +786,20 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 	if c.driveCancelled(ctx, apply, "before a progress tick") {
 		return true
 	}
-	if standDown, err := c.processPendingCancelOrStopControlRequest(ctx, apply); err != nil {
-		logger.Warn("pending stop request processing failed; current apply owner will exit for operator retry",
+	pendingBeforeProgress, err := loadPendingControlOperations(ctx, c.storage, apply)
+	if err != nil {
+		logger.Warn("pending control request read failed; current apply owner will exit for operator retry",
 			"error", err)
 		return true
-	} else if standDown {
-		return true
+	}
+	if pendingBeforeProgress.has(storage.ControlOperationCancel, storage.ControlOperationStop) {
+		if standDown, err := c.processPendingCancelOrStopControlRequest(ctx, apply); err != nil {
+			logger.Warn("pending stop request processing failed; current apply owner will exit for operator retry",
+				"error", err)
+			return true
+		} else if standDown {
+			return true
+		}
 	}
 
 	result, err := c.progressWithEngine(ctx, eng, &engine.ProgressRequest{
@@ -992,17 +1000,27 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 	} else {
 		ps.progressWriteFailures = 0
 	}
-	if standDown, err := c.processPendingCancelOrStopControlRequest(ctx, apply); err != nil {
-		logger.Warn("pending stop request processing failed after progress sync; current apply owner will exit for operator retry",
+	pendingAfterProgress, err := loadPendingControlOperations(ctx, c.storage, apply)
+	if err != nil {
+		logger.Warn("pending control request read failed after progress sync; current apply owner will exit for operator retry",
 			"error", err)
-		return true
-	} else if standDown {
 		return true
 	}
-	if err := c.processPendingCutoverControlRequest(ctx, apply, tasks); err != nil {
-		logger.Warn("pending cutover request processing failed after progress sync; current apply owner will exit for operator retry",
-			"error", err)
-		return true
+	if pendingAfterProgress.has(storage.ControlOperationCancel, storage.ControlOperationStop) {
+		if standDown, err := c.processPendingCancelOrStopControlRequest(ctx, apply); err != nil {
+			logger.Warn("pending stop request processing failed after progress sync; current apply owner will exit for operator retry",
+				"error", err)
+			return true
+		} else if standDown {
+			return true
+		}
+	}
+	if pendingAfterProgress.has(storage.ControlOperationCutover) {
+		if err := c.processPendingCutoverControlRequest(ctx, apply, tasks); err != nil {
+			logger.Warn("pending cutover request processing failed after progress sync; current apply owner will exit for operator retry",
+				"error", err)
+			return true
+		}
 	}
 	opts := storage.ApplyOptionsFromMap(options)
 	controlReq := &engine.ControlRequest{
@@ -1071,7 +1089,7 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 	// vs the upfront --skip-revert flag above) was queued; honor it. This is the
 	// apply owner's retry path: the API's immediate skip attempt may have failed
 	// or its process may have died, leaving the request pending for the drive.
-	if result.State == engine.StateRevertWindow && !ps.revertSkipped && !ps.revertTriggered {
+	if result.State == engine.StateRevertWindow && !ps.revertSkipped && !ps.revertTriggered && pendingAfterProgress.has(storage.ControlOperationSkipRevert) {
 		if pending, err := pendingControlRequest(ctx, c.storage, apply, storage.ControlOperationSkipRevert); err != nil {
 			logger.Warn("could not load pending skip-revert control request", "error", err)
 		} else if pending != nil && c.skipRevertAllowed(ctx, logger, apply, ps) {
@@ -1100,7 +1118,7 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 	// revert attempt may have failed or its process may have died, leaving the
 	// request pending for the drive.
 	revertedByControlRequest := false
-	if result.State == engine.StateRevertWindow && !ps.revertSkipped && !ps.revertTriggered {
+	if result.State == engine.StateRevertWindow && !ps.revertSkipped && !ps.revertTriggered && pendingAfterProgress.has(storage.ControlOperationRevert) {
 		if pending, err := pendingControlRequest(ctx, c.storage, apply, storage.ControlOperationRevert); err != nil {
 			logger.Warn("could not load pending revert control request", "error", err)
 		} else if pending != nil {

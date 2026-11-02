@@ -1090,18 +1090,28 @@ func (c *LocalClient) pollTaskToCompletion(ctx context.Context, apply *storage.A
 				"task_id", task.TaskIdentifier, "table", task.TableName)
 			return taskHandover
 		case <-ticker.C:
-			if standDown, err := c.processPendingCancelOrStopControlRequest(ctx, apply); err != nil {
-				logger.Warn("pending stop request processing failed; current apply owner will exit for operator retry",
+			pending, err := loadPendingControlOperations(ctx, c.storage, apply)
+			if err != nil {
+				logger.Warn("pending control request read failed; current apply owner will exit for operator retry",
 					"task_id", task.TaskIdentifier, "error", err)
 				return taskAbort
-			} else if standDown {
-				task.State = state.Task.Stopped
-				return taskStopped
 			}
-			if err := c.processPendingCutoverControlRequest(ctx, apply, []*storage.Task{task}); err != nil {
-				logger.Warn("pending cutover request processing failed; current apply owner will exit for operator retry",
-					"task_id", task.TaskIdentifier, "error", err)
-				return taskAbort
+			if pending.has(storage.ControlOperationCancel, storage.ControlOperationStop) {
+				if standDown, err := c.processPendingCancelOrStopControlRequest(ctx, apply); err != nil {
+					logger.Warn("pending stop request processing failed; current apply owner will exit for operator retry",
+						"task_id", task.TaskIdentifier, "error", err)
+					return taskAbort
+				} else if standDown {
+					task.State = state.Task.Stopped
+					return taskStopped
+				}
+			}
+			if pending.has(storage.ControlOperationCutover) {
+				if err := c.processPendingCutoverControlRequest(ctx, apply, []*storage.Task{task}); err != nil {
+					logger.Warn("pending cutover request processing failed; current apply owner will exit for operator retry",
+						"task_id", task.TaskIdentifier, "error", err)
+					return taskAbort
+				}
 			}
 			// Re-fetch task state from storage to detect external changes (e.g., Stop).
 			// This also guards against a race where a new apply starts and the engine's
