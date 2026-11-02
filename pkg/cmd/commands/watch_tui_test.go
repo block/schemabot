@@ -1060,6 +1060,12 @@ func TestWatchModel_MultiTargetOutcomeReportsWhatRan(t *testing.T) {
 	)
 	assert.Contains(t, differentTables, "✓ Apply complete! Changes: 2 altered across 2 targets.", "targets that ran different changes are not said to run all of them:\n%s", differentTables)
 
+	sameTableDifferentStatements := render(state.Apply.Completed,
+		member{"shop-001", done, []templates.TableProgress{table("orders", byEmail, state.Task.Completed)}},
+		member{"shop-002", done, []templates.TableProgress{table("orders", byStatus, state.Task.Completed)}},
+	)
+	assert.Contains(t, sameTableDifferentStatements, "✓ Apply complete! Changes: 2 altered across 2 targets.", "one table changed by a different statement on each target counts both statements, on neither target in full:\n%s", sameTableDifferentStatements)
+
 	reverted := state.ApplyOperation.Reverted
 	revertedTables := []templates.TableProgress{table("orders", byEmail, state.Task.Reverted)}
 	rolledBack := render(state.Apply.Reverted, member{"shop-001", reverted, revertedTables}, member{"shop-002", reverted, revertedTables})
