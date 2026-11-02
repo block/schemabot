@@ -1065,3 +1065,66 @@ func TestWatchModel_MultiTargetOutcomeReportsWhatRan(t *testing.T) {
 	rolledBack := render(state.Apply.Reverted, member{"shop-001", reverted, revertedTables}, member{"shop-002", reverted, revertedTables})
 	assert.Contains(t, rolledBack, "↩️ Schema change reverted on all 2 targets\n", rolledBack)
 }
+
+// The interactive watch ends on every terminal apply state and on no active
+// schema change, and exits the way the non-interactive watch does: 0 only
+// when the apply completed, and 1 for every other end, because the schema
+// change is not on the target.
+func TestWatchModel_EndsOnEveryTerminalState(t *testing.T) {
+	for _, tc := range []struct {
+		end      string
+		terminal bool
+		wantErr  bool
+	}{
+		{state.Apply.Completed, true, false},
+		{state.Apply.Failed, true, true},
+		{state.Apply.Stopped, true, true},
+		{state.Apply.Cancelled, true, true},
+		{state.Apply.Reverted, true, true},
+		{state.NoActiveChange, false, true},
+	} {
+		t.Run(tc.end, func(t *testing.T) {
+			require.Equal(t, tc.terminal, state.IsTerminalApplyState(tc.end))
+			m := NewWatchModel("http://localhost:8080", "testdb", "staging", false)
+			updated, cmd := m.Update(progressMsg{
+				state:  tc.end,
+				tables: []templates.TableProgress{{TableName: "users", Status: state.Task.Completed}},
+			})
+			require.NotNil(t, cmd, "the watch ends")
+			assert.IsType(t, tea.QuitMsg{}, cmd())
+			model := updated.(WatchModel)
+			assert.Equal(t, tc.end, model.state)
+			if tc.wantErr {
+				assert.ErrorIs(t, model.exitError(), ErrSilent)
+			} else {
+				assert.NoError(t, model.exitError())
+			}
+		})
+	}
+
+	// An error the view already shows fails the watch; detaching while
+	// the apply still runs is not an outcome and exits 0.
+	t.Run("an error fails the watch and a detach does not", func(t *testing.T) {
+		m := NewWatchModel("http://localhost:8080", "testdb", "staging", false)
+		updated, _ := m.Update(progressMsg{state: state.Apply.Running})
+		running := updated.(WatchModel)
+		assert.NoError(t, running.exitError(), "detached while running")
+		running.errorMsg = "progress polls kept failing"
+		assert.ErrorIs(t, running.exitError(), ErrSilent)
+	})
+
+	t.Run("reverted says the change was undone and exits non-zero", func(t *testing.T) {
+		m := NewWatchModel("http://localhost:8080", "testdb", "staging", false)
+		m.applyID = "apply-reverted"
+		updated, _ := m.Update(progressMsg{
+			state:  state.Apply.Reverted,
+			tables: []templates.TableProgress{{TableName: "users", Status: state.Task.Reverted}},
+		})
+		model := updated.(WatchModel)
+		view := model.View()
+		assert.Contains(t, view, "Schema change reverted.")
+		assert.Contains(t, view, "Start a new apply to make it again.")
+		assert.NotContains(t, view, "Apply complete")
+		assert.ErrorIs(t, model.exitError(), ErrSilent)
+	})
+}

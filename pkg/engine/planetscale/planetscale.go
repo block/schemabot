@@ -437,8 +437,9 @@ var deployRequestPendingWait = 30 * time.Minute
 var snapshotRetryWait = 10 * time.Minute
 
 // branchPasswordHeadroom is the part of a branch password's lifetime that is
-// not spent waiting out schema snapshots: the transient retries, the DDL and
-// VSchema writes themselves, and the branch validation after them.
+// not spent on the keyspaces' snapshot windows: the transient retries, the DDL
+// and VSchema writes themselves, and the branch validation after them, which
+// can itself wait out a snapshot for snapshotRetryWait.
 const branchPasswordHeadroom = 30 * time.Minute
 
 // branchPasswordTTL is how long, in seconds, the branch password an apply
@@ -793,10 +794,17 @@ func isRetryableMySQLConnectionError(err error) bool {
 }
 
 // isSnapshotInProgress returns true if the error indicates PlanetScale is
-// running a schema snapshot (e.g., after RefreshSchema). VSchema updates
-// are blocked while the snapshot completes.
+// running a schema snapshot (e.g., after RefreshSchema or DDL on a branch).
+// VSchema updates are rejected while the snapshot completes ("schema snapshot
+// is in progress"), and VSchema reads are answered with "schema refreshing;
+// please try again in a few moments". Both clear on their own once the
+// snapshot finishes.
 func isSnapshotInProgress(err error) bool {
-	return err != nil && strings.Contains(err.Error(), "schema snapshot is in progress")
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "schema snapshot is in progress") || strings.Contains(msg, "schema refreshing")
 }
 
 // isDeployStillValidatingError reports whether the PlanetScale API rejected a
