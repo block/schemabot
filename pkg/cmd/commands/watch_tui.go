@@ -356,16 +356,19 @@ func runWatchModel(model WatchModel) (err error) {
 	return m.exitError()
 }
 
-// exitError is the watch's exit status for its final model. The TUI view
-// already displays errors inline, so a failure returns ErrSilent to exit
-// with code 1 without printing the error again. A reverted apply did not
-// leave the change in place, so it exits non-zero too, as the
-// non-interactive watch does.
+// exitError is the watch's exit status for its final model, the same rule
+// terminalWatchExit and noActiveChangeError give the non-interactive watch:
+// only a completed apply succeeds. Any other end (stopped, failed,
+// cancelled, reverted, no active schema change) or an error means the
+// schema change is not on the target. The view already shows the outcome,
+// including the start command for a stopped apply, so the failure is
+// ErrSilent. Detaching while the apply still runs is not an outcome, so it
+// exits 0.
 func (m WatchModel) exitError() error {
-	if m.errorMsg != "" && !state.IsState(m.state, state.Apply.Completed) {
-		return ErrSilent
+	if state.IsState(m.state, state.Apply.Completed) {
+		return nil
 	}
-	if state.IsState(m.state, state.Apply.Failed, state.Apply.Reverted) {
+	if m.errorMsg != "" || m.watchHasEnded() {
 		return ErrSilent
 	}
 	return nil
