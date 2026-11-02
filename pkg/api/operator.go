@@ -84,6 +84,7 @@ func (s *Service) StartOperator(ctx context.Context) {
 	s.cancelRecovery = cancel
 	s.operatorWake = wake
 	s.claimingStopped = false
+	s.operatorDrivers.Store(int64(driverCount))
 	s.operatorMu.Unlock()
 
 	// Seed both occupancy gauges before any driver claims so the pool's
@@ -120,6 +121,7 @@ func (s *Service) StartOperator(ctx context.Context) {
 	// to the default in storage. Log the resolved cap beside the pool size.
 	s.logger.Info("operator started",
 		"drivers", driverCount,
+		"deferred_cutover_drivers", deferredCutoverDrivers(driverCount),
 		"max_drivers_per_apply", storage.BuildOptions(storage.WithMaxDriversPerApply(s.config.MaxDriversPerApply)).MaxDriversPerApply,
 		"interval", s.operatorPollInterval,
 		"stranded_reaper_interval", reaperEvery,
@@ -954,6 +956,39 @@ func (s *Service) recoverApplies(ctx context.Context, driverID int, stop <-chan 
 	return s.recoverApplyOperation(ctx, driverID, owner)
 }
 
+// reservedDriverID is the driver on each pod that never starts, resumes, or
+// recovers an operation of an apply deferring its cutover.
+//
+// A deferred drive holds its driver until an operator cuts over, which can
+// take days. Held operations stop counting against the per-apply cap, so the
+// rest of a wide deferred apply keeps starting and every driver can end up
+// waiting on a person. The reserved driver keeps one driver per pod for
+// everything else: other databases' applies, recoveries, finalizers, and stops
+// on applies that have not started. It still delivers stop and cancel requests
+// to a deferred apply, since those end its work.
+//
+// A pod with a single driver reserves nothing, so its only driver can still
+// run a deferred apply.
+const reservedDriverID = 0
+
+// deferredCutoverDrivers reports how many of a pool of drivers may run work
+// for an apply deferring its cutover.
+func deferredCutoverDrivers(drivers int) int {
+	if drivers < 2 {
+		return drivers
+	}
+	return drivers - 1
+}
+
+// operationClaimOptions returns the filter driverID's operation claims run
+// under: the reserved driver skips deferred-cutover work (see reservedDriverID).
+func (s *Service) operationClaimOptions(driverID int) []storage.OperationClaimOption {
+	if driverID != reservedDriverID || s.operatorDrivers.Load() < 2 {
+		return nil
+	}
+	return []storage.OperationClaimOption{storage.SkipDeferredCutoverWork()}
+}
+
 // claimGateClosedBeforeRung reports whether StopClaiming closed the claim gate
 // while an earlier rung of the ladder was running, logging the rung the pass
 // stops short of so a shutdown trace shows where claiming ceased.
@@ -976,7 +1011,7 @@ func (s *Service) claimGateClosedBeforeRung(stop <-chan struct{}, driverID int, 
 // the same tasks as the whole apply. It reports claimSettled only when the
 // drive succeeded and settled the operation it claimed.
 func (s *Service) recoverApplyOperation(ctx context.Context, driverID int, owner string) claimOutcome {
-	op, err := s.storage.ApplyOperations().FindNextApplyOperation(ctx, owner)
+	op, err := s.storage.ApplyOperations().FindNextApplyOperation(ctx, owner, s.operationClaimOptions(driverID)...)
 	if err != nil {
 		s.logClaimFailure(ctx, "operator: failed to claim apply_operation", "operation_storage_error",
 			"driver", driverID, "lease_owner", owner, "error", err)

@@ -34,3 +34,33 @@ func BuildOptions(opts ...Option) Options {
 	}
 	return resolved
 }
+
+// OperationClaimFilter narrows which operations FindNextApplyOperation may
+// claim. The zero value claims anything claimable.
+type OperationClaimFilter struct {
+	// SkipDeferredCutoverWork leaves out every claim that starts, resumes, or
+	// recovers an operation of an apply deferring its cutover, so the claiming
+	// driver cannot end up holding at a cutover only an operator can release.
+	// Claims that deliver a stop or cancel request to such an operation still
+	// match, because they end its work rather than start it.
+	SkipDeferredCutoverWork bool
+}
+
+// OperationClaimOption adjusts an OperationClaimFilter.
+type OperationClaimOption func(*OperationClaimFilter)
+
+// SkipDeferredCutoverWork sets OperationClaimFilter.SkipDeferredCutoverWork.
+func SkipDeferredCutoverWork() OperationClaimOption {
+	return func(f *OperationClaimFilter) {
+		f.SkipDeferredCutoverWork = true
+	}
+}
+
+// BuildOperationClaimFilter applies opts over the zero filter.
+func BuildOperationClaimFilter(opts ...OperationClaimOption) OperationClaimFilter {
+	var filter OperationClaimFilter
+	for _, opt := range opts {
+		opt(&filter)
+	}
+	return filter
+}

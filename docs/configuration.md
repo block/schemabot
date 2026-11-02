@@ -890,7 +890,7 @@ metrics_port: 9102
 
 The listener binds `:9102` by default; set `metrics_port` to move it. The API port (the `PORT` environment variable) does not serve `/metrics`.
 
-**Sizing:** each driver drives one claimed apply synchronously to a terminal state, and that includes waiting states such as deferred cutovers and revert windows, so a server's effective apply concurrency is `drivers × replicas`. Size that product to the number of applies you expect to be in flight at once, counting parked ones — a deferred cutover holds its driver for the full wait. A control plane that dispatches to remote servers bounds end-to-end concurrency with its own driver pool the same way.
+**Sizing:** each driver drives one claimed apply synchronously to a terminal state, and that includes waiting states such as deferred cutovers and revert windows, so a server's effective apply concurrency is `drivers × replicas`. Size that product to the number of applies you expect to be in flight at once, counting parked ones — a deferred cutover holds its driver for the full wait. One driver on each server with two or more never starts, resumes, or recovers work for an apply started with `--defer-cutover`, so a server whose other drivers are all waiting on an operator's cutover still picks up other databases' applies, recoveries, and stops. That driver still delivers stop and cancel requests to a deferred apply. Count it out when sizing for deferred applies: `drivers: 4` across four replicas runs up to twelve deferred operations at once. A server with a single driver reserves nothing. A control plane that dispatches to remote servers bounds end-to-end concurrency with its own driver pool the same way.
 
 ### Per-apply driver cap
 
@@ -906,7 +906,7 @@ The cap applies only to *starting* new operations — a first start, a resume af
 
 **The cap is a steady-state bound, not a hard admission limit.** Each claim evaluates the count independently, so drivers polling in the same instant can all read the same pre-claim value and admit together — a pod restart or rolling deploy, where every driver's first poll lands at once, is the shape that produces it. The transient ceiling is the number of drivers claiming in that window; once those leases commit, the next claim counts them and the cap binds again. Size against the steady-state number, and do not treat the cap as a guarantee that an apply can never briefly exceed it.
 
-A multi-shard apply started with a manual `--defer-cutover` keeps its drivers while it waits: unlike the automatic barrier park, a manually deferred operation holds its claim and keeps heartbeating, so it stays counted. Cutting over such an apply therefore takes one `cutover` per capped batch rather than one for the whole fan-out, and shards that have not yet advanced are still subject to the manual-inaction timeout.
+An operation of an apply started with `--defer-cutover` keeps its driver while it waits for the cutover, holding its claim and heartbeating, but once it has nothing left to copy it no longer counts against the cap: the cap bounds how many operations copy against their targets at once, and a held operation has finished copying. The rest of a sharded apply therefore keeps starting while earlier shards wait, up to the drivers available for deferred work. An operation that will copy again after its cutover lands, because it has a later table still to copy, stays counted.
 
 ## Rate Limits
 

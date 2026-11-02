@@ -643,6 +643,26 @@ func (s *taskStore) CountByApplyID(ctx context.Context, applyID int64) (int64, e
 	return count, nil
 }
 
+// driveTaskPredicate matches the task rows, aliased task, that drive the
+// apply_operation aliased op, leaving out reflected per-shard progress rows:
+// an unsharded operation's per-table rows (shard = ""), and for a sharded work
+// operation the row whose namespace/shard/table matches its operation key. It
+// has one placeholder, bound to storage.ApplyOperationKindWork.
+//
+// The key is built to match storage.ShardOperationKey's namespace/shard/table
+// format. table_name is stored as NULL when empty, and MySQL's CONCAT returns
+// NULL when any operand is NULL (Postgres's concat() ignores NULLs), so
+// COALESCE keeps the key equal to the Go construction on both dialects.
+func driveTaskPredicate(task, op string) string {
+	return fmt.Sprintf(`(
+				%[1]s.shard = ''
+				OR (
+					%[2]s.operation_kind = ?
+					AND %[2]s.operation_key = CONCAT(%[1]s.namespace, '/', %[1]s.shard, '/', COALESCE(%[1]s.table_name, ''))
+				)
+			)`, task, op)
+}
+
 // GetByApplyOperationID returns the drive tasks for a single apply_operation.
 // Unsharded operations load their per-table rows (shard = ""). Sharded work
 // operations load the row whose namespace/shard/table matches the operation key,
@@ -660,18 +680,7 @@ func (s *taskStore) GetByApplyOperationID(ctx context.Context, applyOperationID 
 		FROM tasks t
 		JOIN apply_operations ao ON ao.id = t.apply_operation_id
 		WHERE t.apply_operation_id = ?
-			AND (
-				t.shard = ''
-				OR (
-					ao.operation_kind = ?
-					-- Keep this in sync with storage.ShardOperationKey's namespace/shard/table
-					-- format. table_name is stored as NULL when empty, and MySQL's CONCAT
-					-- returns NULL when any operand is NULL (Postgres's concat() ignores
-					-- NULLs), so COALESCE keeps the key equal to the Go construction on
-					-- both dialects.
-					AND ao.operation_key = CONCAT(t.namespace, '/', t.shard, '/', COALESCE(t.table_name, ''))
-				)
-			)
+			AND `+driveTaskPredicate("t", "ao")+`
 		ORDER BY t.created_at, t.id
 	`, applyOperationID, storage.ApplyOperationKindWork)
 	if err != nil {

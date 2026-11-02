@@ -49,12 +49,12 @@ type gateClosingOperationStore struct {
 	closeGate func()
 }
 
-func (s *gateClosingOperationStore) FindNextApplyOperation(ctx context.Context, owner string) (*storage.ApplyOperation, error) {
+func (s *gateClosingOperationStore) FindNextApplyOperation(ctx context.Context, owner string, opts ...storage.OperationClaimOption) (*storage.ApplyOperation, error) {
 	if s.closeGate != nil {
 		s.closeGate()
 		s.closeGate = nil
 	}
-	return s.claimLadderOperationStore.FindNextApplyOperation(ctx, owner)
+	return s.claimLadderOperationStore.FindNextApplyOperation(ctx, owner, opts...)
 }
 
 // Claiming stops while a driver is mid-claim and a wake for newly queued work
