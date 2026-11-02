@@ -353,6 +353,13 @@ test-e2e: test-e2e-local test-e2e-grpc ## Run all e2e tests
 # E2E local environment shorthand
 E2E_DC = docker compose -f deploy/e2e/docker-compose.yml
 
+# Bound on each seed apply test-e2e-local runs before the tests. A healthy seed
+# apply finishes in seconds; the bound turns a stalled one into a setup failure
+# that prints the LocalScale logs while the CI job still has time to collect
+# them, instead of a runner cancellation that captures nothing.
+E2E_SEED_APPLY_TIMEOUT ?= 180
+E2E_SEED_APPLY = scripts/e2e-seed-apply.sh $(E2E_SEED_APPLY_TIMEOUT)
+
 # Run local e2e tests in an isolated environment (no conflicts with make demo)
 # Keeps containers alive between runs for fast iteration. Use FRESH=1 to rebuild from scratch.
 # Use `make test-e2e-local-down` to tear down manually.
@@ -384,8 +391,8 @@ endif
 		sleep 1; \
 	done
 	@echo "Applying schemas (MySQL + Vitess in parallel)..."
-	@( ./bin/schemabot apply -s examples/mysql/schema/testapp -e staging --endpoint http://localhost:14370 -y --allow-unsafe -o log && \
-	   ./bin/schemabot apply -s examples/mysql/schema/testapp -e production --endpoint http://localhost:14370 -y --allow-unsafe -o log ) & \
+	@( $(E2E_SEED_APPLY) mysql-staging -s examples/mysql/schema/testapp -e staging --endpoint http://localhost:14370 -y --allow-unsafe -o log && \
+	   $(E2E_SEED_APPLY) mysql-production -s examples/mysql/schema/testapp -e production --endpoint http://localhost:14370 -y --allow-unsafe -o log ) & \
 	MYSQL_PID=$$!; \
 	for ks in testapp testapp_sharded; do \
 		if [ -f examples/vitess/schema/$$ks/vschema.json ]; then \
@@ -397,9 +404,9 @@ endif
 				-d "{\"org\":\"localscale-production\",\"database\":\"testapp-vitess\",\"keyspace\":\"$$ks\",\"vschema\":$$(cat examples/vitess/schema/$$ks/vschema.json)}"; \
 		fi; \
 	done; \
-	./bin/schemabot apply -s examples/vitess/schema -e staging --endpoint http://localhost:14370 -y --allow-unsafe -o log || \
+	$(E2E_SEED_APPLY) vitess-staging -s examples/vitess/schema -e staging --endpoint http://localhost:14370 -y --allow-unsafe -o log || \
 		(echo "=== LocalScale logs ===" && $(E2E_DC) logs localscale --tail=200 && false); \
-	./bin/schemabot apply -s examples/vitess/schema -e production --endpoint http://localhost:14370 -y --allow-unsafe -o log || \
+	$(E2E_SEED_APPLY) vitess-production -s examples/vitess/schema -e production --endpoint http://localhost:14370 -y --allow-unsafe -o log || \
 		(echo "=== LocalScale logs ===" && $(E2E_DC) logs localscale --tail=200 && false); \
 	wait $$MYSQL_PID
 	@echo "Running e2e tests..."
