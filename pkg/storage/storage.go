@@ -1822,6 +1822,13 @@ type ControlRequestStore interface {
 	// GetPending returns the pending request for an apply operation.
 	GetPending(ctx context.Context, applyID int64, operation ControlOperation) (*ApplyControlRequest, error)
 
+	// ListPending returns every pending request for an apply, ordered by
+	// operation ascending, or an empty result when none is pending. A drive
+	// that checks several operations on each poll reads them here once rather
+	// than once per operation; the ordering is lowercase ASCII and so the same
+	// on every dialect, as ListSettled notes.
+	ListPending(ctx context.Context, applyID int64) ([]*ApplyControlRequest, error)
+
 	// GetByOperation returns the request for an apply operation regardless of
 	// status (nil if none). Unlike GetPending it does not filter on status, so
 	// callers can observe a completed or failed latch — for example the release

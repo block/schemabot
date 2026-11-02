@@ -677,6 +677,48 @@ func TestControlRequests(t *testing.T, h Harness) {
 		assert.Equal(t, storage.ControlRequestCompleted, settled[1].Status)
 	})
 
+	// ListPending verifies the read a drive makes on every poll: an apply with
+	// nothing pending returns an empty result, only pending rows are included,
+	// another apply's pending request is not, and rows come back ordered by
+	// operation.
+	t.Run("ListPending", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+
+		applyID := createControlRequestApply(t, store, "control_pending_list_db", "apply_control_pending_list")
+		otherApplyID := createControlRequestApply(t, store, "control_pending_list_other_db", "apply_control_pending_list_other")
+
+		pending, err := store.ControlRequests().ListPending(ctx, applyID)
+		require.NoError(t, err)
+		assert.Empty(t, pending)
+
+		request := func(applyID int64, operation storage.ControlOperation) {
+			t.Helper()
+			_, _, err := store.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+				ApplyID: applyID, Operation: operation,
+				Status: storage.ControlRequestPending, Metadata: []byte(`{}`),
+			})
+			require.NoError(t, err)
+		}
+		// A pending stop and cutover, a completed start, and another apply's
+		// pending cancel.
+		request(applyID, storage.ControlOperationStop)
+		request(applyID, storage.ControlOperationCutover)
+		request(applyID, storage.ControlOperationStart)
+		require.NoError(t, store.ControlRequests().CompletePending(ctx, applyID, storage.ControlOperationStart))
+		request(otherApplyID, storage.ControlOperationCancel)
+
+		pending, err = store.ControlRequests().ListPending(ctx, applyID)
+		require.NoError(t, err)
+		require.Len(t, pending, 2, "a completed request and another apply's request are not pending here")
+		assert.Equal(t, storage.ControlOperationCutover, pending[0].Operation)
+		assert.Equal(t, storage.ControlRequestPending, pending[0].Status)
+		assert.Equal(t, applyID, pending[0].ApplyID)
+		assert.Equal(t, storage.ControlOperationStop, pending[1].Operation)
+		assert.Equal(t, storage.ControlRequestPending, pending[1].Status)
+		assert.Equal(t, applyID, pending[1].ApplyID)
+	})
+
 	// RecordRemoteFailure_CreatesFailedRowWhenMissing verifies mirroring a
 	// rejection this plane never queued: the mirror creates a failed row
 	// carrying the reported error and the mirrored-rejection marker, so the
@@ -931,6 +973,12 @@ func TestControlRequests(t *testing.T, h Harness) {
 	t.Run("FailPending_DBError", func(t *testing.T) {
 		store := h.NewUnreachableStorage(t)
 		require.Error(t, store.ControlRequests().FailPending(t.Context(), 1, storage.ControlOperationStart, "failure"))
+	})
+
+	t.Run("ListPending_DBError", func(t *testing.T) {
+		store := h.NewUnreachableStorage(t)
+		_, err := store.ControlRequests().ListPending(t.Context(), 1)
+		require.Error(t, err)
 	})
 
 	t.Run("ListSettled_DBError", func(t *testing.T) {

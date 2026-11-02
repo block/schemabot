@@ -443,6 +443,32 @@ func (s *controlRequestStore) GetPending(ctx context.Context, applyID int64, ope
 	return scanControlRequest(row)
 }
 
+func (s *controlRequestStore) ListPending(ctx context.Context, applyID int64) ([]*storage.ApplyControlRequest, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT `+controlRequestColumns+`
+		FROM apply_control_requests
+		WHERE apply_id = ? AND status = ?
+		ORDER BY operation
+	`, applyID, storage.ControlRequestPending)
+	if err != nil {
+		return nil, fmt.Errorf("list pending control requests for apply %d: %w", applyID, err)
+	}
+	defer utils.CloseAndLog(rows)
+
+	var requests []*storage.ApplyControlRequest
+	for rows.Next() {
+		req, err := scanControlRequest(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan pending control request for apply %d: %w", applyID, err)
+		}
+		requests = append(requests, req)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("read pending control requests for apply %d: %w", applyID, err)
+	}
+	return requests, nil
+}
+
 func (s *controlRequestStore) GetByOperation(ctx context.Context, applyID int64, operation storage.ControlOperation) (*storage.ApplyControlRequest, error) {
 	row := s.db.QueryRowContext(ctx, `
 		SELECT `+controlRequestColumns+`

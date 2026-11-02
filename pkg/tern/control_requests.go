@@ -27,6 +27,45 @@ func pendingControlRequest(ctx context.Context, store storage.Storage, apply *st
 	return controlReq, nil
 }
 
+// pendingControlOperations is the set of control operations pending for an
+// apply as of one read. A drive's poll consults several operations, and nearly
+// always none is pending, so it reads them all in one query and runs only the
+// processors whose operation is in the set. The set only gates: a processor it
+// lets through loads its own request again, so it acts on the stored row and
+// never on this snapshot. A request recorded after the read is answered on the
+// next poll.
+type pendingControlOperations map[storage.ControlOperation]struct{}
+
+// loadPendingControlOperations reads the operations pending for an apply.
+func loadPendingControlOperations(ctx context.Context, store storage.Storage, apply *storage.Apply) (pendingControlOperations, error) {
+	if store == nil {
+		return nil, fmt.Errorf("storage is not available")
+	}
+	controlStore := store.ControlRequests()
+	if controlStore == nil {
+		return nil, fmt.Errorf("control request store is not available")
+	}
+	requests, err := controlStore.ListPending(ctx, apply.ID)
+	if err != nil {
+		return nil, fmt.Errorf("list pending control requests for apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	pending := make(pendingControlOperations, len(requests))
+	for _, req := range requests {
+		pending[req.Operation] = struct{}{}
+	}
+	return pending, nil
+}
+
+// has reports whether any of the operations is pending.
+func (p pendingControlOperations) has(operations ...storage.ControlOperation) bool {
+	for _, operation := range operations {
+		if _, ok := p[operation]; ok {
+			return true
+		}
+	}
+	return false
+}
+
 // controlRequestAccepted reports whether the engine has accepted a control
 // request of the given operation for an apply: its durable request row is
 // completed. The row is completed by whichever process carried the request

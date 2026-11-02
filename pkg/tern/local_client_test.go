@@ -936,6 +936,19 @@ func (s *testControlRequestStore) GetPending(_ context.Context, applyID int64, o
 	return nil, nil
 }
 
+func (s *testControlRequestStore) ListPending(_ context.Context, applyID int64) ([]*storage.ApplyControlRequest, error) {
+	var pending []*storage.ApplyControlRequest
+	for _, req := range s.requests {
+		if req.ApplyID == applyID && req.Status == storage.ControlRequestPending {
+			pending = append(pending, cloneTestControlRequest(req))
+		}
+	}
+	slices.SortStableFunc(pending, func(a, b *storage.ApplyControlRequest) int {
+		return strings.Compare(string(a.Operation), string(b.Operation))
+	})
+	return pending, nil
+}
+
 func (s *testControlRequestStore) GetByOperation(_ context.Context, applyID int64, operation storage.ControlOperation) (*storage.ApplyControlRequest, error) {
 	if s.getByOperationErr != nil {
 		return nil, s.getByOperationErr
