@@ -687,7 +687,9 @@ jobs:
     # the Test step (8m for these shards, not the 10m the other e2e jobs use)
     # lands inside the job budget with room for the goroutine dump and the
     # log-capture step: a hung test panics with its dump instead of the runner
-    # cancelling the job first.
+    # cancelling the job first. The seed applies before the tests are bounded
+    # by E2E_SEED_APPLY_TIMEOUT in the Makefile, so a stalled one fails the
+    # setup inside this budget, where the log-capture steps still run.
     timeout-minutes: 14
     strategy:
       fail-fast: false
