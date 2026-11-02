@@ -2138,6 +2138,17 @@ func (c *LocalClient) handleStopAllTasksTerminal(ctx context.Context, applyID in
 		return nil, fmt.Errorf("load apply %d after stop found all tasks terminal: %w", applyID, storage.ErrApplyNotFound)
 	}
 
+	// A multi-operation drive owns only its operation. Its tasks already carry
+	// the outcome, and the operator derives the operation row from them and
+	// projects the parent, so the parent write is the operator's to make. A
+	// direct write here fails closed under the operation-only lease and would
+	// turn an accepted stop into a drive error the claim loop re-runs forever.
+	if suppressParentApplyWrites(ctx) {
+		c.logger.Info("stop found all tasks terminal; operation drive leaves the apply outcome to the operator's projection",
+			append(apply.LogAttrs(), "skipped_count", skippedCount)...)
+		return &ternv1.StopResponse{Accepted: true, SkippedCount: skippedCount}, nil
+	}
+
 	if !state.IsTerminalApplyState(apply.State) {
 		tasks, err := c.storage.Tasks().GetByApplyID(ctx, applyID)
 		if err != nil {

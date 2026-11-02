@@ -15,29 +15,42 @@ import (
 
 // eachTargetControlEngine is an engine that runs each target as its own schema
 // change: it implements engine.TargetDrainer, and every Stop or Cancel call
-// reaches one target only. It answers its Nth control call with the Nth entry of
-// stopErrs / cancelErrs (nil once the list runs out), so a test can script what
-// each target's engine work reports.
+// reaches only the target its request's resume state names, which it records.
+// It answers its Nth control call with the Nth entry of stopErrs / cancelErrs
+// (nil once the list runs out), so a test can script what each target's engine
+// work reports.
 type eachTargetControlEngine struct {
 	*controlCaptureEngine
-	stopCalls   int
-	cancelCalls int
-	stopErrs    []error
-	cancelErrs  []error
+	stopCalls     int
+	cancelCalls   int
+	stopErrs      []error
+	cancelErrs    []error
+	stopTargets   []string
+	cancelTargets []string
 }
 
-func (e *eachTargetControlEngine) Stop(_ context.Context, _ *engine.ControlRequest) (*engine.ControlResult, error) {
+// requestTarget returns the target a control request's resume state names.
+func requestTarget(req *engine.ControlRequest) string {
+	if req == nil || req.ResumeState == nil {
+		return ""
+	}
+	return req.ResumeState.Metadata
+}
+
+func (e *eachTargetControlEngine) Stop(_ context.Context, req *engine.ControlRequest) (*engine.ControlResult, error) {
 	call := e.stopCalls
 	e.stopCalls++
+	e.stopTargets = append(e.stopTargets, requestTarget(req))
 	if call < len(e.stopErrs) && e.stopErrs[call] != nil {
 		return nil, e.stopErrs[call]
 	}
 	return &engine.ControlResult{Accepted: true}, nil
 }
 
-func (e *eachTargetControlEngine) Cancel(_ context.Context, _ *engine.ControlRequest) (*engine.ControlResult, error) {
+func (e *eachTargetControlEngine) Cancel(_ context.Context, req *engine.ControlRequest) (*engine.ControlResult, error) {
 	call := e.cancelCalls
 	e.cancelCalls++
+	e.cancelTargets = append(e.cancelTargets, requestTarget(req))
 	if call < len(e.cancelErrs) && e.cancelErrs[call] != nil {
 		return nil, e.cancelErrs[call]
 	}
@@ -50,16 +63,48 @@ func (e *eachTargetControlEngine) DrainTargetContext(context.Context, engine.Dra
 	return nil
 }
 
+// perOperationResumeStateStore serves each apply operation its own persisted
+// engine resume state, the routing a per-target engine reads to find the work
+// a control request is for.
+type perOperationResumeStateStore struct {
+	storage.ApplyOperationStore
+	byOperation map[int64]*storage.EngineResumeState
+}
+
+func (s *perOperationResumeStateStore) GetEngineResumeState(_ context.Context, operationID int64) (*storage.EngineResumeState, error) {
+	if stored, ok := s.byOperation[operationID]; ok {
+		return stored, nil
+	}
+	return nil, storage.ErrEngineResumeStateNotFound
+}
+
+func (s *perOperationResumeStateStore) ListByApply(context.Context, int64) ([]*storage.ApplyOperation, error) {
+	return nil, nil
+}
+
 // newEachTargetControlTestClient builds a MySQL-family control test client
 // whose engine runs each target separately.
 func newEachTargetControlTestClient(apply *storage.Apply, tasks []*storage.Task, eng *eachTargetControlEngine) *LocalClient {
-	client := newMySQLControlTestClient(apply, tasks, eng.controlCaptureEngine)
+	client := newPerOperationControlTestClient(apply, tasks, eng.controlCaptureEngine)
 	client.spiritEngine = eng
 	return client
 }
 
+// newPerOperationControlTestClient builds a MySQL-family control test client
+// where each task's apply operation persists resume state naming the task's
+// shard.
+func newPerOperationControlTestClient(apply *storage.Apply, tasks []*storage.Task, eng *controlCaptureEngine) *LocalClient {
+	client := newMySQLControlTestClient(apply, tasks, eng)
+	resumeStates := &perOperationResumeStateStore{byOperation: map[int64]*storage.EngineResumeState{}}
+	for _, task := range tasks {
+		resumeStates.byOperation[*task.ApplyOperationID] = &storage.EngineResumeState{Metadata: task.Shard}
+	}
+	client.storage.(*controlTestStorage).applyOperations = resumeStates
+	return client
+}
+
 // eachTargetTestApply returns a running apply with one task per shard of the
-// same table, every task in the given state.
+// same table, each in its own apply operation and in the given state.
 func eachTargetTestApply(identifier string, taskStates ...string) (*storage.Apply, []*storage.Task) {
 	apply := &storage.Apply{
 		ID:              42,
@@ -72,14 +117,16 @@ func eachTargetTestApply(identifier string, taskStates ...string) (*storage.Appl
 	shards := []string{"-40", "40-80", "80-c0", "c0-"}
 	tasks := make([]*storage.Task, 0, len(taskStates))
 	for i, taskState := range taskStates {
+		operationID := int64(100 + i)
 		tasks = append(tasks, &storage.Task{
-			ID:             int64(i + 1),
-			ApplyID:        apply.ID,
-			TaskIdentifier: identifier + "-task-" + shards[i],
-			Database:       "testdb",
-			Namespace:      "testdb",
-			Shard:          shards[i],
-			State:          taskState,
+			ID:               int64(i + 1),
+			ApplyID:          apply.ID,
+			ApplyOperationID: &operationID,
+			TaskIdentifier:   identifier + "-task-" + shards[i],
+			Database:         "testdb",
+			Namespace:        "testdb",
+			Shard:            shards[i],
+			State:            taskState,
 		})
 	}
 	return apply, tasks
@@ -98,7 +145,7 @@ func TestLocalClient_StopReachesEveryTargetWithLiveWork(t *testing.T) {
 	resp, err := client.stopOwnedApply(t.Context(), &ternv1.StopRequest{ApplyId: apply.ApplyIdentifier}, "")
 
 	require.NoError(t, err)
-	assert.Equal(t, 2, eng.stopCalls, "each shard with live work gets its own engine stop")
+	assert.Equal(t, []string{"-40", "40-80"}, eng.stopTargets, "each shard with live work gets its own engine stop")
 	assert.True(t, resp.Accepted)
 	assert.Equal(t, int64(3), resp.StoppedCount)
 	for _, task := range tasks {
@@ -124,7 +171,7 @@ func TestLocalClient_StopSettlesTargetThatAlreadyCompleted(t *testing.T) {
 	resp, err := client.stopOwnedApply(t.Context(), &ternv1.StopRequest{ApplyId: apply.ApplyIdentifier}, "")
 
 	require.NoError(t, err)
-	assert.Equal(t, 2, eng.stopCalls, "the stop continues past the completed shard to the copying one")
+	assert.Equal(t, []string{"-40", "40-80"}, eng.stopTargets, "the stop continues past the completed shard to the copying one")
 	assert.True(t, resp.Accepted)
 	assert.Equal(t, int64(1), resp.StoppedCount)
 	assert.Equal(t, int64(1), resp.SkippedCount)
@@ -197,7 +244,7 @@ func TestLocalClient_CancelReachesEveryTargetWithLiveWork(t *testing.T) {
 	resp, err := client.cancelOwnedApply(t.Context(), &ternv1.CancelRequest{ApplyId: apply.ApplyIdentifier}, "")
 
 	require.NoError(t, err)
-	assert.Equal(t, 2, eng.cancelCalls, "each shard with live work gets its own engine cancel")
+	assert.Equal(t, []string{"-40", "40-80"}, eng.cancelTargets, "each shard with live work gets its own engine cancel")
 	assert.True(t, resp.Accepted)
 	assert.Equal(t, int64(3), resp.CancelledCount)
 	for _, task := range tasks {
@@ -221,7 +268,7 @@ func TestLocalClient_CancelSettlesTargetThatAlreadyCompleted(t *testing.T) {
 	resp, err := client.cancelOwnedApply(t.Context(), &ternv1.CancelRequest{ApplyId: apply.ApplyIdentifier}, "")
 
 	require.NoError(t, err)
-	assert.Equal(t, 2, eng.cancelCalls, "the cancel continues past the completed shard to the copying one")
+	assert.Equal(t, []string{"-40", "40-80"}, eng.cancelTargets, "the cancel continues past the completed shard to the copying one")
 	assert.True(t, resp.Accepted)
 	assert.Equal(t, int64(1), resp.CancelledCount)
 	assert.Equal(t, state.Task.Completed, tasks[0].State)
@@ -236,7 +283,7 @@ func TestLocalClient_StopCallsSingleOperationEngineOnce(t *testing.T) {
 	eng := &controlCaptureEngine{}
 	stopCalls := 0
 	eng.onStop = func() { stopCalls++ }
-	client := newMySQLControlTestClient(apply, tasks, eng)
+	client := newPerOperationControlTestClient(apply, tasks, eng)
 
 	resp, err := client.stopOwnedApply(t.Context(), &ternv1.StopRequest{ApplyId: apply.ApplyIdentifier}, "")
 
