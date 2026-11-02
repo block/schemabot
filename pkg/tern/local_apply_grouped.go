@@ -725,6 +725,7 @@ func (c *LocalClient) pollForCompletionAtomic(ctx context.Context, apply *storag
 		lastProgressLog: time.Now(),
 		revertSkipped:   apply.RevertSkippedAt != nil,
 		lostWork:        lostEngineWorkTracker{budget: c.lostEngineWorkPendingBudget(eng)},
+		parked:          newParkedPoll(),
 	}
 
 	// Every exit but the cutover barrier's leaves no engine work running behind
@@ -743,6 +744,9 @@ func (c *LocalClient) pollForCompletionAtomic(ctx context.Context, apply *storag
 				apply.IdentityLogAttrs()...)
 			return nil
 		case <-ticker.C:
+			if !ps.parked.runFullPoll(ctx, c.storage, apply, time.Now(), c.logger.With(apply.IdentityLogAttrs()...)) {
+				continue
+			}
 			if done := c.handleAtomicProgressTick(ctx, eng, apply, tasks, creds, resumeState, ps, options, releaseAtCutoverBarrier); done {
 				return ps.terminalErr
 			}
@@ -1056,6 +1060,14 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 		if _, err := eng.Stop(ctx, controlReq); err != nil {
 			logger.Error("timeout stop failed", append(apply.MutableLogAttrs(), "error", err)...)
 		}
+	}
+
+	// The progress sync above recorded every task waiting for its cutover, so
+	// a deferred cutover slows its poll until an operator acts. A barrier park
+	// releases its claim below instead, and a sync that did not land keeps the
+	// full cadence until a write does.
+	if result.State == engine.StateWaitingForCutover && opts.DeferCutover && !releaseAtCutoverBarrier && ps.progressWriteFailures == 0 {
+		ps.parked.hold()
 	}
 
 	// Timeout: cancel the apply if waiting for manual cutover too long. An

@@ -4989,6 +4989,7 @@ func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply
 	var stoppedAfterStartDeadline time.Time
 	var lastDisplayBlob string
 	lastHeartbeatSuccess := time.Now()
+	parked := newParkedPoll()
 	for {
 		select {
 		case <-ctx.Done():
@@ -5011,6 +5012,9 @@ func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply
 				return stopErr
 			}
 		case <-ticker.C:
+			if !parked.runFullPoll(ctx, c.storage, apply, time.Now(), logger) {
+				continue
+			}
 			if standDown, err := c.processPendingControlRequestsAtPoll(ctx, apply, scope); err != nil {
 				return err
 			} else if standDown {
@@ -5160,6 +5164,11 @@ func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply
 				logger.InfoContext(ctx, "operation parked at cutover barrier; exiting remote copy drive",
 					apply.MutableLogAttrs()...)
 				return nil
+			}
+			// A manual deferred cutover keeps polling the held remote, but nothing
+			// changes there until an operator acts, so the drive slows its poll.
+			if apply.GetOptions().DeferCutover && state.IsState(apply.State, state.Apply.WaitingForCutover) {
+				parked.hold()
 			}
 		}
 	}

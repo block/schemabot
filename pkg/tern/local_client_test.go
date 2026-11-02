@@ -566,6 +566,7 @@ type fakeControlEngine struct {
 	cutoverErr              error
 	cutoverNoResult         bool
 	progressReq             *engine.ProgressRequest
+	progressCalls           int
 	progressResult          *engine.ProgressResult
 	progressErr             error
 	planResult              *engine.PlanResult
@@ -604,6 +605,7 @@ func (e *fakeControlEngine) Apply(context.Context, *engine.ApplyRequest) (*engin
 }
 
 func (e *fakeControlEngine) Progress(_ context.Context, req *engine.ProgressRequest) (*engine.ProgressResult, error) {
+	e.progressCalls++
 	e.progressReq = req
 	if e.progressResult != nil || e.progressErr != nil {
 		return e.progressResult, e.progressErr

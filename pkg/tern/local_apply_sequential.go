@@ -788,6 +788,9 @@ type atomicPollState struct {
 	// That is the one exit that leaves the work running by design.
 	parkedAtCutoverBarrier bool
 
+	// parked paces the poll while the drive holds at a deferred cutover.
+	parked parkedPoll
+
 	// progressWriteFailures counts consecutive ticks whose task progress
 	// writes did not all land; see pollTaskToCompletion's counterpart.
 	progressWriteFailures int
@@ -1083,7 +1086,9 @@ func (c *LocalClient) lostEngineWorkPendingBudget(eng engine.Engine) time.Durati
 // reads tasks.updated_at as the drive's liveness signal (ApplyDriveStallAfter)
 // and cancels a drive whose rows stop advancing, so the write must stay
 // unconditional — including through parked states such as deferred cutovers
-// and revert windows, where nothing changes tick to tick.
+// and revert windows, where nothing changes tick to tick. A drive held at a
+// deferred cutover runs the full poll less often (see parkedPoll), still well
+// inside that window.
 func (c *LocalClient) pollTaskToCompletion(ctx context.Context, apply *storage.Apply, task *storage.Task, creds *engine.Credentials, resumeState *engine.ResumeState) taskAction {
 	eng := c.getEngine()
 	ticker := time.NewTicker(c.taskPollInterval())
@@ -1114,6 +1119,7 @@ func (c *LocalClient) pollTaskToCompletion(ctx context.Context, apply *storage.A
 	var progressMetadataLeaseLost bool
 	lostWork := lostEngineWorkTracker{budget: c.lostEngineWorkPendingBudget(eng)}
 	watchdog := taskStallWatchdog{interval: c.taskStallWarnInterval()}
+	parked := newParkedPoll()
 
 	for {
 		select {
@@ -1122,6 +1128,9 @@ func (c *LocalClient) pollTaskToCompletion(ctx context.Context, apply *storage.A
 				"task_id", task.TaskIdentifier, "table", task.TableName)
 			return taskHandover
 		case <-ticker.C:
+			if !parked.runFullPoll(ctx, c.storage, apply, time.Now(), logger) {
+				continue
+			}
 			pending, err := loadPendingControlOperations(ctx, c.storage, apply)
 			if err != nil {
 				logger.Warn("pending control request read failed; current apply owner will exit for operator retry",
@@ -1370,6 +1379,12 @@ func (c *LocalClient) pollTaskToCompletion(ctx context.Context, apply *storage.A
 			}
 			terminalWriteFailures = 0
 			progressWriteFailures = 0
+
+			// The row now says the task waits for its cutover, so a deferred
+			// cutover slows its poll until an operator acts.
+			if state.IsState(task.State, state.Task.WaitingForCutover) && apply.GetOptions().DeferCutover {
+				parked.hold()
+			}
 
 			// Notify observer with full apply + tasks context
 			if obs := c.getObserver(task.ApplyID); obs != nil {
