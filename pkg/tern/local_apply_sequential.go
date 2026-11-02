@@ -642,10 +642,9 @@ func (c *LocalClient) runEngineTaskAttempt(ctx context.Context, apply *storage.A
 		return c.abandonUnrecordedEngineWork(ctx, logger, apply, task, taskCreds, result.ResumeState, err)
 	}
 
-	// Mark task running
-	now := time.Now()
-	task.StartedAt = &now
-	c.transitionTaskState(ctx, task, 0, state.Task.Running, "")
+	if action, ok := c.recordSequentialTaskRunning(ctx, logger, apply, task); !ok {
+		return action
+	}
 	logger.Info("task running", "task_id", task.TaskIdentifier, "table", task.TableName)
 
 	// Poll to completion. Thread the engine's returned resume state into the
@@ -666,6 +665,32 @@ func (c *LocalClient) runEngineTaskAttempt(ctx context.Context, apply *storage.A
 	default:
 		return taskContinue
 	}
+}
+
+// recordSequentialTaskRunning stores that the engine accepted a task's work,
+// and reports whether the drive may poll it. A refused write ends the attempt:
+// the drive returns, and its exit halt brings the accepted work down with it
+// (OW-3). A cancelled drive hands the apply back, and a write refused because
+// the apply is no longer this driver's stands down without a verdict. Any
+// other failure records the task failed_retryable, so the apply pauses for an
+// operator retry rather than running work storage does not show as started.
+func (c *LocalClient) recordSequentialTaskRunning(ctx context.Context, logger *slog.Logger, apply *storage.Apply, task *storage.Task) (taskAction, bool) {
+	err := c.markTasksRunning(ctx, apply, []*storage.Task{task})
+	if err == nil {
+		return taskContinue, true
+	}
+	if c.driveCancelled(ctx, apply, "while recording that the engine started task "+task.TaskIdentifier) {
+		return taskHandover, false
+	}
+	if applyWriteEndsDrive(err) {
+		logger.Warn("task is no longer this driver's to run; drive will stand down and halt the engine work it started",
+			append(task.LogAttrs(), "error", err)...)
+		return taskAbort, false
+	}
+	logger.Warn("failed to record the accepted engine work as running; pausing the task for operator retry",
+		append(task.LogAttrs(), "error", err)...)
+	verdictErr := c.markTaskRetryable(ctx, task, fmt.Sprintf("failed to record task running: %v", err))
+	return c.failureVerdictAction(apply.ApplyIdentifier, task, verdictErr), false
 }
 
 // abandonUnrecordedEngineWork handles an accepted task whose resume state could
