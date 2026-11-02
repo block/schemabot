@@ -10,6 +10,7 @@ import (
 	_ "google.golang.org/genproto/googleapis/api/annotations"
 	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
 	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
+	descriptorpb "google.golang.org/protobuf/types/descriptorpb"
 	reflect "reflect"
 	sync "sync"
 	unsafe "unsafe"
@@ -1480,7 +1481,8 @@ type DirectExecutionPolicy struct {
 	// A size bound on the target table's data plus index footprint, in bytes;
 	// zero states no byte bound. A refused statement runs directly when the
 	// table is within the policy's bound. A negative value is an unusable
-	// bound, which the engine refuses.
+	// bound, which the engine refuses. A data plane that predates the field
+	// reads a byte-bound policy as one with no bound at all.
 	MaxTableBytes int64 `protobuf:"varint,4,opt,name=max_table_bytes,json=maxTableBytes,proto3" json:"max_table_bytes,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -4101,8 +4103,18 @@ func (*HealthRequest) Descriptor() ([]byte, []int) {
 
 // HealthResponse is the health check response.
 type HealthResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Status        string                 `protobuf:"bytes,1,opt,name=status,proto3" json:"status,omitempty"`
+	state  protoimpl.MessageState `protogen:"open.v1"`
+	Status string                 `protobuf:"bytes,1,opt,name=status,proto3" json:"status,omitempty"`
+	// SchemaBot version of the binary that answered, for attribution in a
+	// caller's messages only. Empty when the binary cannot name its version.
+	// A caller decides what the data plane supports from capabilities, never
+	// from this.
+	Version string `protobuf:"bytes,2,opt,name=version,proto3" json:"version,omitempty"`
+	// Every requires_remote_capability name this server's schema declares. A
+	// caller about to send a request that sets an annotated field reads this
+	// first. Absence means unsupported, and a server that predates this
+	// field reports nothing.
+	Capabilities  []string `protobuf:"bytes,3,rep,name=capabilities,proto3" json:"capabilities,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -4142,6 +4154,20 @@ func (x *HealthResponse) GetStatus() string {
 		return x.Status
 	}
 	return ""
+}
+
+func (x *HealthResponse) GetVersion() string {
+	if x != nil {
+		return x.Version
+	}
+	return ""
+}
+
+func (x *HealthResponse) GetCapabilities() []string {
+	if x != nil {
+		return x.Capabilities
+	}
+	return nil
 }
 
 // StopRequest pauses an in-progress schema change by apply ID.
@@ -5116,12 +5142,56 @@ func (x *StorageSchemaApplyResponse) GetRemaining() *StorageSchemaReport {
 	return nil
 }
 
+var file_tern_proto_extTypes = []protoimpl.ExtensionInfo{
+	{
+		ExtendedType:  (*descriptorpb.FieldOptions)(nil),
+		ExtensionType: (*string)(nil),
+		Field:         78241,
+		Name:          "tern.v1.requires_remote_capability",
+		Tag:           "bytes,78241,opt,name=requires_remote_capability",
+		Filename:      "tern.proto",
+	},
+}
+
+// Extension fields to descriptorpb.FieldOptions.
+var (
+	// Names the capability the receiving server must advertise before a caller
+	// sets this field. A field carries it when a server that predates the
+	// field would misread a request that sets it, rather than merely ignore
+	// it: proto3 drops a field the receiver does not know without a trace, so
+	// the rest of the request can then say something the caller never meant.
+	//
+	// A caller sends a request that sets an annotated field only to a server
+	// whose HealthResponse.capabilities lists the name, and refuses the
+	// request itself otherwise. A server advertises every name its compiled
+	// schema declares, so the annotation lands in the same change as the
+	// server code that reads the field. Name a capability after the feature
+	// an operator configures, since refusals show it to them.
+	//
+	// The capability read is a call of its own ahead of the request, so it
+	// cannot bind the request to the server that answered it: during a
+	// rollout behind a per-request load balancer, the request can still reach
+	// a replica that does not advertise the name. Annotate a field only when
+	// an older server that misreads it still fails closed. The annotation
+	// turns that failure into a refusal that names the upgrade; it does not
+	// make an unsafe misread safe.
+	//
+	// The number is process-wide: the protobuf runtime refuses to start a
+	// binary in which two linked schemas extend FieldOptions with the same
+	// number, and a host that embeds SchemaBot links whatever else it links.
+	// The low end of the in-house range is crowded (etcd, which Vitess links,
+	// takes 50000 through 50003), so this sits well away from it.
+	//
+	// optional string requires_remote_capability = 78241;
+	E_RequiresRemoteCapability = &file_tern_proto_extTypes[0]
+)
+
 var File_tern_proto protoreflect.FileDescriptor
 
 const file_tern_proto_rawDesc = "" +
 	"\n" +
 	"\n" +
-	"tern.proto\x12\atern.v1\x1a\x1cgoogle/api/annotations.proto\"~\n" +
+	"tern.proto\x12\atern.v1\x1a\x1cgoogle/api/annotations.proto\x1a google/protobuf/descriptor.proto\"~\n" +
 	"\vSchemaFiles\x125\n" +
 	"\x05files\x18\x01 \x03(\v2\x1f.tern.v1.SchemaFiles.FilesEntryR\x05files\x1a8\n" +
 	"\n" +
@@ -5229,12 +5299,12 @@ const file_tern_proto_rawDesc = "" +
 	"\x10SchemaFilesEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12*\n" +
 	"\x05value\x18\x02 \x01(\v2\x14.tern.v1.SchemaFilesR\x05value:\x028\x01B\x14\n" +
-	"\x12_grouped_executionJ\x04\b\a\x10\b\"\xc8\x01\n" +
+	"\x12_grouped_executionJ\x04\b\a\x10\b\"\xee\x01\n" +
 	"\x15DirectExecutionPolicy\x12\x18\n" +
 	"\aenabled\x18\x01 \x01(\bR\aenabled\x12$\n" +
 	"\x0emax_table_rows\x18\x02 \x01(\x03R\fmaxTableRows\x12G\n" +
-	" lock_acquisition_timeout_seconds\x18\x03 \x01(\x03R\x1dlockAcquisitionTimeoutSeconds\x12&\n" +
-	"\x0fmax_table_bytes\x18\x04 \x01(\x03R\rmaxTableBytes\"\xcc\x05\n" +
+	" lock_acquisition_timeout_seconds\x18\x03 \x01(\x03R\x1dlockAcquisitionTimeoutSeconds\x12L\n" +
+	"\x0fmax_table_bytes\x18\x04 \x01(\x03B$\x8a\x9a& direct_execution.max_table_bytesR\rmaxTableBytes\"\xcc\x05\n" +
 	"\vTableChange\x12\x1d\n" +
 	"\n" +
 	"table_name\x18\x01 \x01(\tR\ttableName\x12\x10\n" +
@@ -5479,9 +5549,11 @@ const file_tern_proto_rawDesc = "" +
 	"\x12SkipRevertResponse\x12\x1a\n" +
 	"\baccepted\x18\x01 \x01(\bR\baccepted\x12#\n" +
 	"\rerror_message\x18\x02 \x01(\tR\ferrorMessage\"\x0f\n" +
-	"\rHealthRequest\"(\n" +
+	"\rHealthRequest\"f\n" +
 	"\x0eHealthResponse\x12\x16\n" +
-	"\x06status\x18\x01 \x01(\tR\x06status\"b\n" +
+	"\x06status\x18\x01 \x01(\tR\x06status\x12\x18\n" +
+	"\aversion\x18\x02 \x01(\tR\aversion\x12\"\n" +
+	"\fcapabilities\x18\x03 \x03(\tR\fcapabilities\"b\n" +
 	"\vStopRequest\x12\x19\n" +
 	"\bapply_id\x18\x01 \x01(\tR\aapplyId\x12 \n" +
 	"\venvironment\x18\x02 \x01(\tR\venvironment\x12\x16\n" +
@@ -5619,7 +5691,8 @@ const file_tern_proto_rawDesc = "" +
 	"/v1/cancel\x12L\n" +
 	"\x05Start\x12\x15.tern.v1.StartRequest\x1a\x16.tern.v1.StartResponse\"\x14\x82\xd3\xe4\x93\x02\x0e:\x01*\"\t/v1/start\x12~\n" +
 	"\x11StorageSchemaPlan\x12!.tern.v1.StorageSchemaPlanRequest\x1a\".tern.v1.StorageSchemaPlanResponse\"\"\x82\xd3\xe4\x93\x02\x1c:\x01*\"\x17/v1/storage-schema/plan\x12\x82\x01\n" +
-	"\x12StorageSchemaApply\x12\".tern.v1.StorageSchemaApplyRequest\x1a#.tern.v1.StorageSchemaApplyResponse\"#\x82\xd3\xe4\x93\x02\x1d:\x01*\"\x18/v1/storage-schema/applyB-Z+github.com/block/schemabot/pkg/proto/ternv1b\x06proto3"
+	"\x12StorageSchemaApply\x12\".tern.v1.StorageSchemaApplyRequest\x1a#.tern.v1.StorageSchemaApplyResponse\"#\x82\xd3\xe4\x93\x02\x1d:\x01*\"\x18/v1/storage-schema/apply:]\n" +
+	"\x1arequires_remote_capability\x12\x1d.google.protobuf.FieldOptions\x18\xa1\xe3\x04 \x01(\tR\x18requiresRemoteCapabilityB-Z+github.com/block/schemabot/pkg/proto/ternv1b\x06proto3"
 
 var (
 	file_tern_proto_rawDescOnce sync.Once
@@ -5708,6 +5781,7 @@ var file_tern_proto_goTypes = []any{
 	nil,                                     // 69: tern.v1.ProgressResponse.MetadataEntry
 	nil,                                     // 70: tern.v1.StorageSchemaPlanRequest.SchemaFilesEntry
 	nil,                                     // 71: tern.v1.StorageSchemaApplyRequest.SchemaFilesEntry
+	(*descriptorpb.FieldOptions)(nil),       // 72: google.protobuf.FieldOptions
 }
 var file_tern_proto_depIdxs = []int32{
 	58, // 0: tern.v1.SchemaFiles.files:type_name -> tern.v1.SchemaFiles.FilesEntry
@@ -5767,42 +5841,43 @@ var file_tern_proto_depIdxs = []int32{
 	9,  // 54: tern.v1.PullSchemaResponse.NamespacesEntry.value:type_name -> tern.v1.PulledNamespace
 	5,  // 55: tern.v1.PlanRequest.SchemaFilesEntry.value:type_name -> tern.v1.SchemaFiles
 	5,  // 56: tern.v1.ApplyRequest.SchemaFilesEntry.value:type_name -> tern.v1.SchemaFiles
-	8,  // 57: tern.v1.Tern.PullSchema:input_type -> tern.v1.PullSchemaRequest
-	16, // 58: tern.v1.Tern.Plan:input_type -> tern.v1.PlanRequest
-	16, // 59: tern.v1.Tern.PlanDiff:input_type -> tern.v1.PlanRequest
-	6,  // 60: tern.v1.Tern.CompareSchemaFileChange:input_type -> tern.v1.CompareSchemaFileChangeRequest
-	27, // 61: tern.v1.Tern.Apply:input_type -> tern.v1.ApplyRequest
-	30, // 62: tern.v1.Tern.Progress:input_type -> tern.v1.ProgressRequest
-	31, // 63: tern.v1.Tern.Logs:input_type -> tern.v1.LogsRequest
-	38, // 64: tern.v1.Tern.Cutover:input_type -> tern.v1.CutoverRequest
-	40, // 65: tern.v1.Tern.Revert:input_type -> tern.v1.RevertRequest
-	42, // 66: tern.v1.Tern.SkipRevert:input_type -> tern.v1.SkipRevertRequest
-	44, // 67: tern.v1.Tern.Health:input_type -> tern.v1.HealthRequest
-	46, // 68: tern.v1.Tern.Stop:input_type -> tern.v1.StopRequest
-	48, // 69: tern.v1.Tern.Cancel:input_type -> tern.v1.CancelRequest
-	50, // 70: tern.v1.Tern.Start:input_type -> tern.v1.StartRequest
-	52, // 71: tern.v1.Tern.StorageSchemaPlan:input_type -> tern.v1.StorageSchemaPlanRequest
-	56, // 72: tern.v1.Tern.StorageSchemaApply:input_type -> tern.v1.StorageSchemaApplyRequest
-	15, // 73: tern.v1.Tern.PullSchema:output_type -> tern.v1.PullSchemaResponse
-	25, // 74: tern.v1.Tern.Plan:output_type -> tern.v1.PlanResponse
-	26, // 75: tern.v1.Tern.PlanDiff:output_type -> tern.v1.PlanDiffResponse
-	7,  // 76: tern.v1.Tern.CompareSchemaFileChange:output_type -> tern.v1.CompareSchemaFileChangeResponse
-	29, // 77: tern.v1.Tern.Apply:output_type -> tern.v1.ApplyResponse
-	37, // 78: tern.v1.Tern.Progress:output_type -> tern.v1.ProgressResponse
-	33, // 79: tern.v1.Tern.Logs:output_type -> tern.v1.LogsResponse
-	39, // 80: tern.v1.Tern.Cutover:output_type -> tern.v1.CutoverResponse
-	41, // 81: tern.v1.Tern.Revert:output_type -> tern.v1.RevertResponse
-	43, // 82: tern.v1.Tern.SkipRevert:output_type -> tern.v1.SkipRevertResponse
-	45, // 83: tern.v1.Tern.Health:output_type -> tern.v1.HealthResponse
-	47, // 84: tern.v1.Tern.Stop:output_type -> tern.v1.StopResponse
-	49, // 85: tern.v1.Tern.Cancel:output_type -> tern.v1.CancelResponse
-	51, // 86: tern.v1.Tern.Start:output_type -> tern.v1.StartResponse
-	55, // 87: tern.v1.Tern.StorageSchemaPlan:output_type -> tern.v1.StorageSchemaPlanResponse
-	57, // 88: tern.v1.Tern.StorageSchemaApply:output_type -> tern.v1.StorageSchemaApplyResponse
-	73, // [73:89] is the sub-list for method output_type
-	57, // [57:73] is the sub-list for method input_type
-	57, // [57:57] is the sub-list for extension type_name
-	57, // [57:57] is the sub-list for extension extendee
+	72, // 57: tern.v1.requires_remote_capability:extendee -> google.protobuf.FieldOptions
+	8,  // 58: tern.v1.Tern.PullSchema:input_type -> tern.v1.PullSchemaRequest
+	16, // 59: tern.v1.Tern.Plan:input_type -> tern.v1.PlanRequest
+	16, // 60: tern.v1.Tern.PlanDiff:input_type -> tern.v1.PlanRequest
+	6,  // 61: tern.v1.Tern.CompareSchemaFileChange:input_type -> tern.v1.CompareSchemaFileChangeRequest
+	27, // 62: tern.v1.Tern.Apply:input_type -> tern.v1.ApplyRequest
+	30, // 63: tern.v1.Tern.Progress:input_type -> tern.v1.ProgressRequest
+	31, // 64: tern.v1.Tern.Logs:input_type -> tern.v1.LogsRequest
+	38, // 65: tern.v1.Tern.Cutover:input_type -> tern.v1.CutoverRequest
+	40, // 66: tern.v1.Tern.Revert:input_type -> tern.v1.RevertRequest
+	42, // 67: tern.v1.Tern.SkipRevert:input_type -> tern.v1.SkipRevertRequest
+	44, // 68: tern.v1.Tern.Health:input_type -> tern.v1.HealthRequest
+	46, // 69: tern.v1.Tern.Stop:input_type -> tern.v1.StopRequest
+	48, // 70: tern.v1.Tern.Cancel:input_type -> tern.v1.CancelRequest
+	50, // 71: tern.v1.Tern.Start:input_type -> tern.v1.StartRequest
+	52, // 72: tern.v1.Tern.StorageSchemaPlan:input_type -> tern.v1.StorageSchemaPlanRequest
+	56, // 73: tern.v1.Tern.StorageSchemaApply:input_type -> tern.v1.StorageSchemaApplyRequest
+	15, // 74: tern.v1.Tern.PullSchema:output_type -> tern.v1.PullSchemaResponse
+	25, // 75: tern.v1.Tern.Plan:output_type -> tern.v1.PlanResponse
+	26, // 76: tern.v1.Tern.PlanDiff:output_type -> tern.v1.PlanDiffResponse
+	7,  // 77: tern.v1.Tern.CompareSchemaFileChange:output_type -> tern.v1.CompareSchemaFileChangeResponse
+	29, // 78: tern.v1.Tern.Apply:output_type -> tern.v1.ApplyResponse
+	37, // 79: tern.v1.Tern.Progress:output_type -> tern.v1.ProgressResponse
+	33, // 80: tern.v1.Tern.Logs:output_type -> tern.v1.LogsResponse
+	39, // 81: tern.v1.Tern.Cutover:output_type -> tern.v1.CutoverResponse
+	41, // 82: tern.v1.Tern.Revert:output_type -> tern.v1.RevertResponse
+	43, // 83: tern.v1.Tern.SkipRevert:output_type -> tern.v1.SkipRevertResponse
+	45, // 84: tern.v1.Tern.Health:output_type -> tern.v1.HealthResponse
+	47, // 85: tern.v1.Tern.Stop:output_type -> tern.v1.StopResponse
+	49, // 86: tern.v1.Tern.Cancel:output_type -> tern.v1.CancelResponse
+	51, // 87: tern.v1.Tern.Start:output_type -> tern.v1.StartResponse
+	55, // 88: tern.v1.Tern.StorageSchemaPlan:output_type -> tern.v1.StorageSchemaPlanResponse
+	57, // 89: tern.v1.Tern.StorageSchemaApply:output_type -> tern.v1.StorageSchemaApplyResponse
+	74, // [74:90] is the sub-list for method output_type
+	58, // [58:74] is the sub-list for method input_type
+	58, // [58:58] is the sub-list for extension type_name
+	57, // [57:58] is the sub-list for extension extendee
 	0,  // [0:57] is the sub-list for field type_name
 }
 
@@ -5822,13 +5897,14 @@ func file_tern_proto_init() {
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_tern_proto_rawDesc), len(file_tern_proto_rawDesc)),
 			NumEnums:      5,
 			NumMessages:   67,
-			NumExtensions: 0,
+			NumExtensions: 1,
 			NumServices:   1,
 		},
 		GoTypes:           file_tern_proto_goTypes,
 		DependencyIndexes: file_tern_proto_depIdxs,
 		EnumInfos:         file_tern_proto_enumTypes,
 		MessageInfos:      file_tern_proto_msgTypes,
+		ExtensionInfos:    file_tern_proto_extTypes,
 	}.Build()
 	File_tern_proto = out.File
 	file_tern_proto_goTypes = nil
