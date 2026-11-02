@@ -2,12 +2,14 @@ package api
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"net/url"
 	"os"
 
+	"github.com/block/schemabot/pkg/metrics"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.opentelemetry.io/otel"
@@ -116,13 +118,16 @@ func SetupTelemetry(logger *slog.Logger) (*Telemetry, error) {
 	}
 
 	mp := sdkmetric.NewMeterProvider(meterOpts...)
-	otel.SetMeterProvider(mp)
-
-	return &Telemetry{
+	tel := &Telemetry{
 		MetricsHandler: promhttp.HandlerFor(registry, promhttp.HandlerOpts{}),
 		meterProvider:  mp,
 		tracerProvider: tp,
-	}, nil
+	}
+	if err := metrics.RegisterTelemetryHeartbeat(mp); err != nil {
+		return nil, errors.Join(err, tel.Shutdown(ctx))
+	}
+	otel.SetMeterProvider(mp)
+	return tel, nil
 }
 
 // Shutdown flushes pending telemetry data and releases resources.

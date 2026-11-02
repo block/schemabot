@@ -485,7 +485,11 @@ func TestApplyClosesTheUndeployedDeployRequestOfAFailedApply(t *testing.T) {
 		closeNil      bool
 		deleteErr     error
 		endDriveAt    string
-		wantCloses    []uint64
+		// recorded gives the apply a resume state that names the deploy
+		// request, so an unknown deploy outcome pauses for recovery instead
+		// of failing the apply.
+		recorded   bool
+		wantCloses []uint64
 		// wantDelete is "" when no delete is sent, "deleted" when the branch
 		// is deleted, and "failed" when the delete is sent and fails.
 		wantDelete string
@@ -504,8 +508,11 @@ func TestApplyClosesTheUndeployedDeployRequestOfAFailedApply(t *testing.T) {
 		{name: "a deploy request that reports a deploy began by the cleanup's read is left with its branch",
 			createdDR: ready, reread: ready, cleanupReread: queued, deployErr: rejected, wantLog: deployMayRunLog, wantLevel: "ERROR"},
 		{name: "a deploy whose outcome is unknown leaves the deploy request and branch for recovery",
-			createdDR: ready, reread: ready, deployErr: unanswered,
+			createdDR: ready, reread: ready, deployErr: unanswered, recorded: true,
 			wantLog: deployOutcomeUnknownKeepsDeployRequestLog, wantLevel: "WARN"},
+		{name: "a deploy whose outcome is unknown and whose apply cannot pause leaves both and tells the operator to reconcile",
+			createdDR: ready, reread: ready, deployErr: unanswered,
+			wantLog: deployOutcomeUnknownApplyFailingLog, wantLevel: "ERROR"},
 		{name: "a refused deploy request that carries a deploy timestamp is left with its branch",
 			createdDR: refused, reread: refusedDeployed, wantLog: deployMayRunLog, wantLevel: "ERROR"},
 		{name: "a close response showing the deploy queued keeps the branch",
@@ -567,6 +574,10 @@ func TestApplyClosesTheUndeployedDeployRequestOfAFailedApply(t *testing.T) {
 				Database:    "commerce",
 				Credentials: conformanceCredentials(),
 				Options:     tt.options,
+			}
+			if tt.recorded {
+				req.ResumeState = &engine.ResumeState{MigrationContext: "apply-1a2b3c4d5e6f7890"}
+				req.OnStateChange = func(*engine.ResumeState) error { return nil }
 			}
 			logRecord := captureApplyLogs(t, req)
 

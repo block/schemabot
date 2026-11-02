@@ -471,7 +471,8 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 	// Config discovery and the managed-directory guard just re-verified this
 	// commit, and the clear re-checks allowed-environment coverage for every
 	// discovered database. Together those cover every condition that records
-	// an aggregate blocking reason, so a stored block can now be released.
+	// a discovery block. Prior plan successes are invalidated before a stored
+	// aggregate block is released, so only replacement results can pass.
 	h.clearAggregateBlocksForVerifiedPR(ctx, client, repo, pr, headSHA, configs)
 
 	affectedDatabases := checkDatabaseKeysForConfigs(configs)
@@ -496,7 +497,7 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 		// leader publishes the required check and gates on participants' own
 		// checks when they exist, so a silent participant cannot wedge branch
 		// protection (its check is non-required by the aggregate contract).
-		if h.isAggregateParticipant(repo) {
+		if h.isAggregateParticipant(repo) && !h.participantPathsTouched(repo, files) {
 			h.logger.Info("aggregate participant staying silent on PR with no managed schema changes",
 				"repo", repo, "pr", pr, "head_sha", headSHA, "source", source, "delivery_id", deliveryID)
 			metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
@@ -567,6 +568,12 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 			"repo", repo, "pr", pr, "head_sha", headSHA, "base_ref", baseRef,
 			"source", source, "delivery_id", deliveryID)
 		return "auto-plan discarded because the PR moved during discovery", nil
+	}
+
+	// Discovery is complete. Publish empty environments and pending placeholders
+	// before independent database planners can finish in a different order.
+	if len(h.service.Config().AllowedEnvironments) > 0 {
+		h.updateAggregateCheck(ctx, client, repo, pr, headSHA)
 	}
 
 	postPlanComment := shouldPostComment()

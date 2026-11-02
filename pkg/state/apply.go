@@ -87,26 +87,39 @@ var Apply = struct {
 // State priority (highest to lowest):
 //  1. Any task FAILED → Apply FAILED
 //  2. Any task FAILED_RETRYABLE → Apply FAILED_RETRYABLE
-//  3. Any task STOPPED → Apply STOPPED
-//  4. Any task REVERTED → Apply REVERTED
-//  5. All tasks COMPLETED → Apply COMPLETED
-//  6. Any task RECOVERING → Apply RECOVERING
-//  7. Any task CUTTING_OVER, no task in an earlier active phase (PENDING,
-//     RUNNING, or a post-copy verification phase) → Apply CUTTING_OVER
-//  8. All non-completed tasks WAITING_FOR_CUTOVER → Apply WAITING_FOR_CUTOVER
-//  9. All non-completed tasks WAITING_FOR_DEPLOY → Apply WAITING_FOR_DEPLOY
-//  10. Any task REVERT_WINDOW → Apply REVERT_WINDOW
-//  11. Any task RUNNING → Apply RUNNING
-//  12. Any task in a post-copy phase or cutting over while any task is still
-//     PENDING → Apply RUNNING
-//  13. Any task CATCHING_UP → Apply CATCHING_UP
-//  14. Any task CHECKSUMMING → Apply CHECKSUMMING
-//  15. Any task POST_CHECKSUM → Apply POST_CHECKSUM
-//  16. Otherwise → Apply PENDING
+//  3. Any task CANCELLED → Apply CANCELLED
+//  4. Any task STOPPED → Apply STOPPED
+//  5. Any task PAUSED → Apply PAUSED
+//  6. Any task REVERTING → Apply REVERTING
+//  7. Any task REVERTED → Apply REVERTED
+//  8. All tasks COMPLETED → Apply COMPLETED
+//  9. Any task RECOVERING → Apply RECOVERING
+//  10. Any task CUTTING_OVER, no task in an earlier active phase (PENDING, a
+//     deploy setup phase, RESUMING, RUNNING, or a post-copy verification
+//     phase) → Apply CUTTING_OVER
+//  11. All non-completed tasks WAITING_FOR_CUTOVER → Apply WAITING_FOR_CUTOVER
+//  12. All non-completed tasks WAITING_FOR_DEPLOY → Apply WAITING_FOR_DEPLOY
+//  13. Any task REVERT_WINDOW → Apply REVERT_WINDOW
+//  14. Any task SKIPPING_REVERT → Apply SKIPPING_REVERT
+//  15. Any task RUNNING_DEGRADED → Apply RUNNING_DEGRADED
+//  16. Any task RUNNING → Apply RUNNING
+//  17. Any task RESUMING → Apply RESUMING
+//  18. Any task in a post-copy phase or cutting over while any task has not
+//     begun copying (PENDING or a deploy setup phase) → Apply RUNNING
+//  19. Any task CATCHING_UP → Apply CATCHING_UP
+//  20. Any task CHECKSUMMING → Apply CHECKSUMMING
+//  21. Any task POST_CHECKSUM → Apply POST_CHECKSUM
+//  22. Any task in a deploy setup phase → the least advanced such phase
+//  23. Otherwise → Apply PENDING
 //
-// The post-copy phases (13–15) surface the least-advanced active phase, and
+// Every Apply state derives to itself when it is the only input, so a state
+// added to Apply needs a place in this order before it can be derived.
+//
+// The post-copy phases (19–21) surface the least-advanced active phase, and
 // only once every table has started: while any table is still copying rows —
 // or still queued with its whole copy ahead of it — the apply is Running.
+// The deploy setup phases (22) stage the change before any rows move, so they
+// rank with a queued table: ahead of pending, behind any table already copying.
 // Once every table has at least begun and the active ones are draining or
 // verifying, the apply names that phase. The cutover gate (7) resolves
 // least-advanced-first the same way: a drive cuts tables over as each
@@ -143,6 +156,9 @@ func DeriveApplyState(taskStates []string) string {
 	if counts[Apply.Stopped] > 0 {
 		return Apply.Stopped
 	}
+	if counts[Apply.Paused] > 0 {
+		return Apply.Paused
+	}
 	if counts[Apply.Reverting] > 0 {
 		return Apply.Reverting
 	}
@@ -169,6 +185,12 @@ func DeriveApplyState(taskStates []string) string {
 	if counts[Apply.RevertWindow] > 0 {
 		return Apply.RevertWindow
 	}
+	if counts[Apply.SkippingRevert] > 0 {
+		return Apply.SkippingRevert
+	}
+	if counts[Apply.RunningDegraded] > 0 {
+		return Apply.RunningDegraded
+	}
 	if counts[Apply.Running] > 0 {
 		return Apply.Running
 	}
@@ -187,12 +209,38 @@ func DeriveApplyState(taskStates []string) string {
 	if counts[Apply.PostChecksum] > 0 {
 		return Apply.PostChecksum
 	}
+	for _, phase := range deploySetupPhases {
+		if counts[phase] > 0 {
+			return phase
+		}
+	}
 	return Apply.Pending
 }
 
+// deploySetupPhases lists the phases an engine stages a deploy through before
+// any rows move, least advanced first. A table in one of them has its whole
+// copy ahead of it, like a queued table.
+var deploySetupPhases = []string{
+	Apply.PreparingBranch,
+	Apply.ApplyingBranchChanges,
+	Apply.ValidatingBranch,
+	Apply.CreatingDeployRequest,
+	Apply.ValidatingDeployRequest,
+}
+
+// countNotYetCopying counts the tasks that have not begun copying rows: queued,
+// or still in a deploy setup phase.
+func countNotYetCopying(counts map[string]int) int {
+	n := counts[Apply.Pending]
+	for _, phase := range deploySetupPhases {
+		n += counts[phase]
+	}
+	return n
+}
+
 // cutoverIsLeastAdvancedActiveWork reports whether a task is cutting over
-// with no sibling in an earlier active phase — queued, resuming, copying, or
-// verifying.
+// with no sibling in an earlier active phase — queued, staging its deploy,
+// resuming, copying, or verifying.
 // A cutover is the last step of a table's work, so surfacing it at the apply
 // level while earlier work is still active would overstate progress and force
 // the derived state to fall back once that cutover completes; it surfaces
@@ -201,8 +249,9 @@ func DeriveApplyState(taskStates []string) string {
 // working.
 func cutoverIsLeastAdvancedActiveWork(counts map[string]int) bool {
 	return counts[Apply.CuttingOver] > 0 &&
-		counts[Apply.Pending] == 0 &&
+		countNotYetCopying(counts) == 0 &&
 		counts[Apply.Running] == 0 &&
+		counts[Apply.RunningDegraded] == 0 &&
 		counts[Apply.Resuming] == 0 &&
 		counts[Apply.CatchingUp] == 0 &&
 		counts[Apply.Checksumming] == 0 &&
@@ -211,11 +260,11 @@ func cutoverIsLeastAdvancedActiveWork(counts map[string]int) bool {
 
 // postCopyPhaseWithQueuedWork reports whether a task is draining, verifying
 // (catching up, checksumming, or post-checksum), or cutting over while
-// another task has not started. Naming the phase at the apply level would
-// overstate progress — the queued tables still have their whole copy ahead —
-// so the apply stays Running until every table has begun.
+// another task has not begun copying. Naming the phase at the apply level
+// would overstate progress — the queued tables still have their whole copy
+// ahead — so the apply stays Running until every table has begun.
 func postCopyPhaseWithQueuedWork(counts map[string]int) bool {
-	if counts[Apply.Pending] == 0 {
+	if countNotYetCopying(counts) == 0 {
 		return false
 	}
 	return counts[Apply.CatchingUp] > 0 || counts[Apply.Checksumming] > 0 ||
@@ -518,56 +567,19 @@ func hasLaterUnsettled(children []RolloutChild, failedIndex int) bool {
 	return false
 }
 
-// normalizeApplyState converts a task state string to its canonical lowercase form.
+// normalizeApplyState converts a task or apply state string in any format to
+// its canonical lowercase Apply state. Every state in the Apply registry maps
+// to itself, "complete" (the Vitess spelling) maps to completed, and anything
+// the registry does not know maps to pending.
 func normalizeApplyState(raw string) string {
-	switch strings.ToUpper(raw) {
-	case "PENDING":
-		return Apply.Pending
-	case "RUNNING":
-		return Apply.Running
-	case "CATCHING_UP":
-		return Apply.CatchingUp
-	case "CHECKSUMMING":
-		return Apply.Checksumming
-	case "POST_CHECKSUM":
-		return Apply.PostChecksum
-	case "RUNNING_DEGRADED":
-		return Apply.RunningDegraded
-	case "PAUSED":
-		return Apply.Paused
-	case "WAITING_FOR_DEPLOY":
-		return Apply.WaitingForDeploy
-	case "WAITING_FOR_CUTOVER":
-		return Apply.WaitingForCutover
-	case "RECOVERING", "RECOVERING_CUTOVER":
-		return Apply.Recovering
-	case "CUTTING_OVER":
-		return Apply.CuttingOver
-	case "REVERT_WINDOW":
-		return Apply.RevertWindow
-	case "REVERTING":
-		return Apply.Reverting
-	case "COMPLETED", "COMPLETE":
+	s := NormalizeState(raw)
+	if s == "complete" {
 		return Apply.Completed
-	case "FAILED":
-		return Apply.Failed
-	case "FAILED_RETRYABLE":
-		return Apply.FailedRetryable
-	case "STOPPED":
-		return Apply.Stopped
-	case "RESUMING":
-		return Apply.Resuming
-	case "CANCELLED":
-		return Apply.Cancelled
-	case "REVERTED":
-		return Apply.Reverted
-	case "VALIDATING_BRANCH":
-		return Apply.ValidatingBranch
-	case "VALIDATING_DEPLOY_REQUEST":
-		return Apply.ValidatingDeployRequest
-	default:
+	}
+	if _, ok := LookupApply(s); !ok {
 		return Apply.Pending
 	}
+	return s
 }
 
 // IsState checks if the given state matches any of the expected states.

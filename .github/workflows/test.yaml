@@ -162,7 +162,11 @@ jobs:
     name: "Integration Tests (${{ matrix.shard }})"
     needs: changes
     if: needs.changes.outputs.code == 'true'
-    runs-on: ubuntu-latest
+    # ubuntu-26.04 ships Docker 29, which stops publishing a container's ports
+    # for good after a start fails on a taken port, so the sample database in
+    # TestSampleDatabaseLifecycle never comes back. Return to ubuntu-latest
+    # once a Docker release keeps the container's network after a failed start.
+    runs-on: ubuntu-24.04
     # Sized so setup (checkout, Go, cache restore, image prepull — about two
     # minutes) plus go test's own per-binary timeout below can land inside
     # the job budget: a hung binary that starts early in the shard then

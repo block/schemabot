@@ -454,6 +454,17 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 	configuredEnvironments = append([]string(nil), configuredEnvironments...)
 	allowedEnvironments := append([]string(nil), h.service.Config().AllowedEnvironments...)
 
+	if len(environments) == 0 && len(configuredEnvironments) > 0 {
+		prInfo, err := client.FetchPullRequest(ctx, repo, pr)
+		if err != nil {
+			h.logger.Error("failed to fetch PR for environment with no local work", "repo", repo, "pr", pr, "error", err)
+			return
+		}
+		h.logger.Info("database has no environments served by this deployment; refreshing aggregate scope",
+			"repo", repo, "pr", pr, "head_sha", prInfo.HeadSHA, "database", schemaDatabase)
+		h.updateAggregateCheck(ctx, client, repo, pr, prInfo.HeadSHA)
+		return
+	}
 	if len(environments) == 0 {
 		prInfo, err := client.FetchPullRequest(ctx, repo, pr)
 		if err != nil {

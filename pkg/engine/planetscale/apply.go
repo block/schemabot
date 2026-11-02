@@ -259,6 +259,11 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (result *e
 	// and stops at the first sign of it ending rather than closing or deleting
 	// what a successor resumes against.
 	//
+	// A deploy whose outcome is unknown (engine.OutcomeUnknownError) is not
+	// retired either: the deploy call failed without a refusal, no read of the
+	// deploy request can show its deploy did not start, and recovery re-reads
+	// this same deploy request, so it and its branch are left in place.
+	//
 	// A drive whose context ends after the close has landed but before the
 	// failure is recorded hands the apply back with stored state naming a
 	// deploy request that is now closed and never deployed. A successor that
@@ -288,8 +293,7 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (result *e
 			return
 		}
 		if engine.IsOutcomeUnknown(retErr) {
-			e.applyLogger(req).Warn(deployOutcomeUnknownKeepsDeployRequestLog,
-				"organization", org, "planetscale_database", req.Database, "deploy_request", createdDeployRequest, "branch", branchName, "apply_error", retErr)
+			leaveDeployRequestOfUnknownDeployOutcome(e.applyLogger(req), org, req.Database, createdDeployRequest, branchName, retErr)
 			return
 		}
 		e.retireDeployRequestOfFailedApply(ctx, e.applyLogger(req), client, org, req.Database, createdDeployRequest, deployRequestBranch, retErr)
@@ -1085,10 +1089,13 @@ func (e *Engine) resumeApply(ctx context.Context, client psclient.PSClient, org 
 	// crash and recovery; only then does the resume start fresh. A cancelled
 	// drive or a wait that ran out says nothing about the branch, and starting
 	// fresh on either would create a branch the drive cannot finish preparing.
+	// The fresh drive keeps the apply's MigrationContext, as a first drive
+	// carries it, so the branch and deploy request it creates are saved for the
+	// next resume rather than left for no driver to find.
 	if err := e.waitForBranchReady(ctx, client, org, req.Database, meta.BranchName, emitEvent); err != nil {
 		if ctx.Err() == nil && isNotFound(err) {
 			e.logger.Warn("branch no longer exists on resume, starting fresh", "branch", meta.BranchName, "error", err)
-			req.ResumeState = nil
+			req.ResumeState = &engine.ResumeState{MigrationContext: req.ResumeState.MigrationContext}
 			return e.Apply(ctx, req)
 		}
 		return nil, fmt.Errorf("wait for branch %s on resume: %w", meta.BranchName, err)
@@ -1136,8 +1143,7 @@ func (e *Engine) resumeApply(ctx context.Context, client psclient.PSClient, org 
 			return
 		}
 		if engine.IsOutcomeUnknown(retErr) {
-			e.applyLogger(req).Warn(deployOutcomeUnknownKeepsDeployRequestLog,
-				"organization", org, "planetscale_database", req.Database, "deploy_request", createdDeployRequest, "branch", meta.BranchName, "apply_error", retErr)
+			leaveDeployRequestOfUnknownDeployOutcome(e.applyLogger(req), org, req.Database, createdDeployRequest, meta.BranchName, retErr)
 			return
 		}
 		ownedBranch := ""

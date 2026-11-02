@@ -33,10 +33,9 @@ import (
 // deployment is not one, so an outcome aimed at the wrong commit is published
 // nowhere at all.
 //
-// The PR head is read once and answers both the commit to publish on and the
-// fold's own currency check, so the PR is fetched exactly once. The PR here is
-// closed so no re-plan follows the publish, isolating the commit the terminal
-// refresh chooses on its own.
+// The initial head answers both the publish target and the fold's currency
+// check. A final uncached read verifies that target just before publication.
+// The PR is closed so no re-plan follows the terminal refresh.
 func TestRefreshChecksForTerminalApplyPublishesOnPRHead(t *testing.T) {
 	ctx := t.Context()
 
@@ -141,6 +140,6 @@ func TestRefreshChecksForTerminalApplyPublishesOnPRHead(t *testing.T) {
 		t.Fatal("terminal refresh published no aggregate Check Run")
 	}
 
-	assert.Equal(t, int64(1), prFetches.Load(),
-		"one read of the head answers both the publish target and the fold's currency check")
+	assert.Equal(t, int64(2), prFetches.Load(),
+		"the fold reuses the publish target, then re-verifies the head just before publication")
 }
