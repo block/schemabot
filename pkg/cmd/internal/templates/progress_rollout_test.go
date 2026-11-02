@@ -181,6 +181,20 @@ func TestWriteProgress_TargetRollupRevertSpeaksForTheTable(t *testing.T) {
 	assert.NotContains(t, out, "99%", "%s", out)
 }
 
+// One target copying past its estimate never covers another's unfinished
+// copy: each target's rows count only up to its own total, so the percent
+// and the rows read what the bar shows.
+func TestWriteProgress_TargetRollupOverrunDoesNotMaskAnotherTarget(t *testing.T) {
+	out := renderRollout(t, targetRolloutData([]rolloutTarget{
+		{opState: state.ApplyOperation.Running, status: state.Task.Running, rowsCopied: 1500, rowsTotal: 1000},
+		{opState: state.ApplyOperation.Running, status: state.Task.Running, rowsCopied: 500, rowsTotal: 1000},
+	}))
+
+	assert.Contains(t, out, "75.00%", "%s", out)
+	assert.Contains(t, out, "Rows: 1,500 / 2,000", "%s", out)
+	assert.NotContains(t, out, "99.99%", "%s", out)
+}
+
 // Targets that copy past their estimates hold the table's bar short of
 // complete, with each target's rows clamped to its estimate, the way the PR
 // comment rolls them up: no target has the change until it cuts over.

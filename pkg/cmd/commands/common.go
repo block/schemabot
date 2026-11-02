@@ -646,12 +646,13 @@ func countTableProgressChanges(tables []templates.TableProgress) applyChangeCoun
 }
 
 // countRolloutTableChanges counts a rollout's changes once each, however
-// many targets ran them: one table altered on four targets is one alter.
+// many targets ran them: one table altered on four targets is one alter. Two
+// different statements on one table, such as two new indexes, count as two.
 func countRolloutTableChanges(tables []templates.TableProgress) applyChangeCounts {
 	var counts applyChangeCounts
-	seen := make(map[[3]string]bool)
+	seen := make(map[[4]string]bool)
 	for _, table := range tables {
-		key := [3]string{table.Namespace, table.TableName, table.ChangeType}
+		key := [4]string{table.Namespace, table.TableName, table.ChangeType, table.DDL}
 		if seen[key] {
 			continue
 		}

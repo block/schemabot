@@ -1019,3 +1019,49 @@ func TestWatchModel_MultiTargetStateLineMatchesTheSingleTarget(t *testing.T) {
 	assert.NotContains(t, completed, "Completed on", "a finished rollout has no state line:\n%s", completed)
 	assert.Contains(t, completed, "✓ Apply complete! Changes: 1 altered on all 3 targets. Apply ID: apply-rollout-line\n", completed)
 }
+
+// A finished rollout's outcome line reports what actually ran. Each distinct
+// statement counts once however many targets ran it, the changes are said to
+// run "on all" targets only when every target ran the same ones, and a reverted
+// rollout states its outcome like every other finished one.
+func TestWatchModel_MultiTargetOutcomeReportsWhatRan(t *testing.T) {
+	type member struct {
+		target, opState string
+		tables          []templates.TableProgress
+	}
+	render := func(applyState string, members ...member) string {
+		m := NewWatchModel("http://localhost:8080", "shop", "production", false)
+		m.applyID = "apply-rollout-outcome"
+		m.state = applyState
+		m.initialized = true
+		for _, mem := range members {
+			m.operations = append(m.operations, templates.ProgressOperation{Deployment: "prod", Target: mem.target, State: mem.opState, CutoverPolicy: storage.CutoverPolicyParallel, OnFailure: storage.OnFailureHalt})
+			for _, table := range mem.tables {
+				table.Deployment, table.Target = "prod", mem.target
+				m.tables = append(m.tables, table)
+			}
+		}
+		return stripANSI(m.View())
+	}
+	table := func(name, ddl, status string) templates.TableProgress {
+		return templates.TableProgress{Namespace: "shop", TableName: name, ChangeType: "alter", DDL: ddl, Status: status, RowsCopied: 1000, RowsTotal: 1000, PercentComplete: 100}
+	}
+	byEmail := "ALTER TABLE `orders` ADD INDEX `idx_email` (`email`)"
+	byStatus := "ALTER TABLE `orders` ADD INDEX `idx_status` (`status`)"
+	done := state.ApplyOperation.Completed
+
+	twoIndexes := []templates.TableProgress{table("orders", byEmail, state.Task.Completed), table("orders", byStatus, state.Task.Completed)}
+	sameStatements := render(state.Apply.Completed, member{"shop-001", done, twoIndexes}, member{"shop-002", done, twoIndexes})
+	assert.Contains(t, sameStatements, "✓ Apply complete! Changes: 2 altered on all 2 targets.", "two statements on one table count as two:\n%s", sameStatements)
+
+	differentTables := render(state.Apply.Completed,
+		member{"shop-001", done, []templates.TableProgress{table("users_001", "ALTER TABLE `users_001` ADD COLUMN `note` text", state.Task.Completed)}},
+		member{"shop-002", done, []templates.TableProgress{table("users_002", "ALTER TABLE `users_002` ADD COLUMN `note` text", state.Task.Completed)}},
+	)
+	assert.Contains(t, differentTables, "✓ Apply complete! Changes: 2 altered across 2 targets.", "targets that ran different changes are not said to run all of them:\n%s", differentTables)
+
+	reverted := state.ApplyOperation.Reverted
+	revertedTables := []templates.TableProgress{table("orders", byEmail, state.Task.Reverted)}
+	rolledBack := render(state.Apply.Reverted, member{"shop-001", reverted, revertedTables}, member{"shop-002", reverted, revertedTables})
+	assert.Contains(t, rolledBack, "↩️ Schema change reverted on all 2 targets\n", rolledBack)
+}

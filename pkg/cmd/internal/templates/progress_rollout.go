@@ -508,17 +508,23 @@ func formatAcrossTargetsProgress(t TableProgress) (out string, ok bool) {
 	}
 	targets := len(t.Shards)
 	exact := reporting == targets && !t.RowsTotalPlanned
-	writeTableLine(&b, t, "%s %s%s", ui.ProgressBarRowCopy(pct), acrossTargetsPercent(pct, exact, t.RowsCopied, t.RowsTotal), throttledSuffix(t))
+	rowsCopied, rowsTotal := ui.ClampRows(t.RowsCopied, t.RowsTotal), t.RowsTotal
+	if exact {
+		if copied, total := rowsAcrossTargets(t.Shards); total > 0 {
+			rowsCopied, rowsTotal = copied, total
+		}
+	}
+	writeTableLine(&b, t, "%s %s%s", ui.ProgressBarRowCopy(pct), acrossTargetsPercent(pct, exact, rowsCopied, rowsTotal), throttledSuffix(t))
 	if t.DDL != "" {
 		b.WriteString(formatTableDDL(t))
 	}
-	if t.RowsTotal > 0 {
-		total := ui.FormatNumber(t.RowsTotal)
+	if rowsTotal > 0 {
+		total := ui.FormatNumber(rowsTotal)
 		if t.RowsTotalPlanned {
 			// The plan's estimate stands in for the targets still to copy.
-			total = ui.FormatApproxRows(t.RowsTotal)
+			total = ui.FormatApproxRows(rowsTotal)
 		}
-		line := fmt.Sprintf(indentDetail+"Rows: %s / %s", ui.FormatNumber(ui.ClampRows(t.RowsCopied, t.RowsTotal)), total)
+		line := fmt.Sprintf(indentDetail+"Rows: %s / %s", ui.FormatNumber(rowsCopied), total)
 		partial := reporting < targets
 		if partial {
 			line += fmt.Sprintf(" across %d of %d targets", reporting, targets)
@@ -551,6 +557,22 @@ func acrossTargetsPercent(pct int, exact bool, copied, total int64) string {
 		return "99.99%"
 	}
 	return ui.FormatRowCopyPercent(pct, copied, total)
+}
+
+// rowsAcrossTargets sums a table's rows across its targets the way
+// presentation.PercentAcrossTargets weighs them: each target's copied rows are
+// capped at its own total, and a target past its copy counts in full, so one
+// target copying past its estimate never covers another's unfinished copy.
+func rowsAcrossTargets(targets []ShardProgress) (copied, total int64) {
+	for _, target := range targets {
+		total += target.RowsTotal
+		if state.IsState(target.Status, state.Task.Completed, state.Task.RevertWindow) {
+			copied += target.RowsTotal
+			continue
+		}
+		copied += ui.ClampRows(target.RowsCopied, target.RowsTotal)
+	}
+	return copied, total
 }
 
 // reportsRolledRows reports whether a target's rows are in the table's
@@ -699,18 +721,13 @@ func formatHaltedAcrossTargets(t TableProgress) string {
 // completed the change counts in full. ok is false when a target's rows are
 // not known, since a bar would then guess at how far that target got.
 func stoppedAcrossTargets(targets []ShardProgress) (stoppedProgress, bool) {
-	var p stoppedProgress
 	for _, target := range targets {
 		if target.RowsTotal <= 0 {
 			return stoppedProgress{}, false
 		}
-		p.total += target.RowsTotal
-		if state.IsState(target.Status, state.Task.Completed, state.Task.RevertWindow) {
-			p.copied += target.RowsTotal
-			continue
-		}
-		p.copied += ui.ClampRows(target.RowsCopied, target.RowsTotal)
 	}
+	var p stoppedProgress
+	p.copied, p.total = rowsAcrossTargets(targets)
 	if p.total == 0 {
 		return stoppedProgress{}, false
 	}

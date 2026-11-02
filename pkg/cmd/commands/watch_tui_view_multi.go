@@ -2,6 +2,7 @@ package commands
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/charmbracelet/lipgloss"
@@ -176,11 +177,7 @@ func (m WatchModel) writeMultiDeploymentOutcome(b *strings.Builder, model presen
 	case state.IsState(model.State, state.Apply.Completed):
 		summary := countRolloutTableChanges(m.tables).summary()
 		if targets := len(model.Deployments); targets > 1 && summary != "" {
-			on := templates.RolloutCoverage(model, groups)
-			if on == "" {
-				on = rolloutMemberNoun(groups).Count(targets)
-			}
-			summary = strings.TrimSuffix(summary, ".") + " on " + on + "."
+			summary = strings.TrimSuffix(summary, ".") + " " + rolloutChangesCoverage(m.tables, model, groups) + "."
 		}
 		b.WriteString(templates.FormatApplyCompleteWithSummary(summary, m.applyID))
 		b.WriteString("\n")
@@ -190,7 +187,47 @@ func (m WatchModel) writeMultiDeploymentOutcome(b *strings.Builder, model presen
 		b.WriteString(templates.FormatApplyFailedHeadline() + outcomeCounts(model, groups) + "\n")
 	case state.IsState(model.State, state.Apply.Cancelled):
 		b.WriteString("🚫 Schema change cancelled" + outcomeCounts(model, groups) + "\n")
+	case state.IsState(model.State, state.Apply.Reverted):
+		b.WriteString("↩️ Schema change reverted" + outcomeCounts(model, groups) + "\n")
 	}
+}
+
+// rolloutChangesCoverage says where a completed rollout's changes ran: "on all
+// 4 targets" only when every member ran the same changes, and "across 4
+// targets" when the members ran different ones, so the outcome never claims a
+// change ran on a target that did not run it.
+func rolloutChangesCoverage(tables []templates.TableProgress, model presentation.Apply, groups []presentation.Group) string {
+	targets := len(model.Deployments)
+	if coverage := templates.RolloutCoverage(model, groups); coverage != "" && membersRanSameChanges(tables, targets) {
+		return "on " + coverage
+	}
+	return "across " + rolloutMemberNoun(groups).Count(targets)
+}
+
+// membersRanSameChanges reports whether each of a rollout's members ran the
+// same set of changes: the same statement on the same table of the same
+// schema.
+func membersRanSameChanges(tables []templates.TableProgress, members int) bool {
+	changes := make(map[[2]string][]string)
+	for _, table := range tables {
+		member := [2]string{table.Deployment, table.Target}
+		changes[member] = append(changes[member], strings.Join([]string{table.Namespace, table.TableName, table.ChangeType, table.DDL}, "\x00"))
+	}
+	if len(changes) != members {
+		return false
+	}
+	var first []string
+	for _, memberChanges := range changes {
+		slices.Sort(memberChanges)
+		if first == nil {
+			first = memberChanges
+			continue
+		}
+		if !slices.Equal(memberChanges, first) {
+			return false
+		}
+	}
+	return true
 }
 
 // outcomeCounts follows a finished rollout's outcome with how its members
