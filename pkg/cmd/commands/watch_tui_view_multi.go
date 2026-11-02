@@ -79,8 +79,9 @@ func (m WatchModel) writeMultiDeploymentHeader(b *strings.Builder, model present
 	switch {
 	case m.stopAwaitingConfirmation():
 		// Until the server reports the stop, the targets still read as
-		// running, so the state line acknowledges the key press instead.
-		b.WriteString(m.spinner.View() + m.stopPendingLabel() + "\n")
+		// running, so the state line acknowledges the key press in place of
+		// the state, and keeps how the members stand.
+		b.WriteString(m.spinner.View() + rolloutLine(strings.TrimSuffix(m.stopPendingLabel(), "..."), model, groups, "...") + "\n")
 	case state.IsTerminalApplyState(model.State):
 	case rolloutStateIsActive(model.State):
 		b.WriteString(m.spinner.View() + rolloutStateLine(model, groups, "...") + "\n")
@@ -113,6 +114,12 @@ func rolloutStateLine(model presentation.Apply, groups []presentation.Group, suf
 	if label != "" {
 		label = strings.ToUpper(label[:1]) + label[1:]
 	}
+	return rolloutLine(label, model, groups, suffix)
+}
+
+// rolloutLine follows label with how the rollout's members stand, as
+// rolloutStateLine does for the rollout's own state.
+func rolloutLine(label string, model presentation.Apply, groups []presentation.Group, suffix string) string {
 	if coverage := templates.RolloutCoverage(model, groups); coverage != "" {
 		return label + " on " + coverage + suffix
 	}

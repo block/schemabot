@@ -83,8 +83,8 @@ schemabot progress <apply_id>               # Watch progress
 schemabot cutover <apply_id> -e staging     # Trigger cutover
 schemabot stop <apply_id> -e staging        # Pause execution
 schemabot start <apply_id> -e staging       # Resume execution
-schemabot revert -e staging <apply_id>      # Revert during the revert window (Vitess)
-schemabot skip-revert -e staging <apply_id> # Finalize (Vitess)
+schemabot revert <apply_id> -e staging      # Revert during the revert window (Vitess)
+schemabot skip-revert <apply_id> -e staging # Finalize (Vitess)
 ```
 
 **PR Comments** — SchemaBot is a GitHub app installed on repos. The PR workflow:

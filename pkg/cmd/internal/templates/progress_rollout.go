@@ -507,12 +507,15 @@ func formatAcrossTargetsProgress(t TableProgress) (out string, ok bool) {
 		}
 	}
 	targets := len(t.Shards)
-	exact := reporting == targets && !t.RowsTotalPlanned
+	copied, total, estimated := rowsAcrossTargets(t.Shards)
+	// The percent has a single target's precision only when every target's
+	// rows are its own count; a plan's estimate for a target still to copy
+	// keeps it whole.
+	exact := reporting == targets && !t.RowsTotalPlanned && !estimated
 	rowsCopied, rowsTotal := ui.ClampRows(t.RowsCopied, t.RowsTotal), t.RowsTotal
-	if exact {
-		if copied, total := rowsAcrossTargets(t.Shards); total > 0 {
-			rowsCopied, rowsTotal = copied, total
-		}
+	approxTotal := t.RowsTotalPlanned
+	if reporting == targets && !t.RowsTotalPlanned && total > 0 {
+		rowsCopied, rowsTotal, approxTotal = copied, total, estimated
 	}
 	writeTableLine(&b, t, "%s %s%s", ui.ProgressBarRowCopy(pct), acrossTargetsPercent(pct, exact, rowsCopied, rowsTotal), throttledSuffix(t))
 	if t.DDL != "" {
@@ -520,7 +523,7 @@ func formatAcrossTargetsProgress(t TableProgress) (out string, ok bool) {
 	}
 	if rowsTotal > 0 {
 		total := ui.FormatNumber(rowsTotal)
-		if t.RowsTotalPlanned {
+		if approxTotal {
 			// The plan's estimate stands in for the targets still to copy.
 			total = ui.FormatApproxRows(rowsTotal)
 		}
@@ -561,18 +564,26 @@ func acrossTargetsPercent(pct int, exact bool, copied, total int64) string {
 
 // rowsAcrossTargets sums a table's rows across its targets the way
 // presentation.PercentAcrossTargets weighs them: each target's copied rows are
-// capped at its own total, and a target past its copy counts in full, so one
-// target copying past its estimate never covers another's unfinished copy.
-func rowsAcrossTargets(targets []ShardProgress) (copied, total int64) {
+// capped at its own total, a target past its copy counts in full, and a target
+// still to copy counts the plan's estimate, so neither one target copying past
+// its estimate nor a target yet to start makes the table read as done.
+// estimated reports whether a plan's estimate is in the total.
+func rowsAcrossTargets(targets []ShardProgress) (copied, total int64, estimated bool) {
 	for _, target := range targets {
-		total += target.RowsTotal
 		if state.IsState(target.Status, state.Task.Completed, state.Task.RevertWindow) {
+			total += target.RowsTotal
 			copied += target.RowsTotal
 			continue
 		}
+		if target.RowsTotal <= 0 && target.PlannedRows != nil {
+			total += *target.PlannedRows
+			estimated = true
+			continue
+		}
+		total += target.RowsTotal
 		copied += ui.ClampRows(target.RowsCopied, target.RowsTotal)
 	}
-	return copied, total
+	return copied, total, estimated
 }
 
 // reportsRolledRows reports whether a target's rows are in the table's
@@ -727,7 +738,8 @@ func stoppedAcrossTargets(targets []ShardProgress) (stoppedProgress, bool) {
 		}
 	}
 	var p stoppedProgress
-	p.copied, p.total = rowsAcrossTargets(targets)
+	// Every target reported its rows above, so no estimate is in the total.
+	p.copied, p.total, _ = rowsAcrossTargets(targets)
 	if p.total == 0 {
 		return stoppedProgress{}, false
 	}

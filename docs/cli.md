@@ -1190,7 +1190,7 @@ The TUI shows a single status line above the table list. It varies by overall st
 | Completed | *(no status line — completion message shown after tables)* |
 | Stopped | *(no status line — stopped message shown after tables)* |
 
-A rollout of several targets uses the same status line and adds its counts to it, such as `⠋ Running... 1 completed · 3 running (4 targets)`, or `⠋ Running on all 4 targets...` while every target is in the same state. A finished rollout has no status line either: its outcome follows the tables with the same counts, such as `⏹️ Apply stopped: 1 completed · 3 stopped (4 targets)`.
+A rollout of several targets uses the same status line and adds its counts to it, such as `⠋ Running... 1 completed · 3 running (4 targets)`, or `⠋ Running on all 4 targets...` while every target is in the same state. A stop that has not landed yet keeps the counts too, such as `⠋ Stopping on all 4 targets...`. A finished rollout has no status line either: its outcome follows the tables with the same counts, such as `⏹️ Apply stopped: 1 completed · 3 stopped (4 targets)`.
 
 The `⠋` is a Braille spinner (animated in the TUI, static here).
 

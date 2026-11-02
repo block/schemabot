@@ -195,6 +195,19 @@ func TestWriteProgress_TargetRollupOverrunDoesNotMaskAnotherTarget(t *testing.T)
 	assert.NotContains(t, out, "99.99%", "%s", out)
 }
 
+// A table complete on one target and still queued on another reads half done:
+// the queued target's planned rows are in the total, so the percent never
+// claims every row is copied while a target has yet to start its copy, and it
+// stays whole because the total is partly an estimate.
+func TestWriteProgress_TargetRollupQueuedTargetKeepsTableShort(t *testing.T) {
+	queued := rolloutTarget{opState: state.ApplyOperation.Pending, status: state.Task.Pending, estimatedRows: new(int64(1_000))}
+	out := renderRollout(t, targetRolloutData([]rolloutTarget{completedTarget(), queued}))
+
+	assert.Contains(t, out, "orders: "+ui.ProgressBarRowCopy(50)+" 50%\n", "%s", out)
+	assert.Contains(t, out, "Rows: 1,000 / ~2k\n", "%s", out)
+	assert.NotContains(t, out, "99.99%", "%s", out)
+}
+
 // Targets that copy past their estimates hold the table's bar short of
 // complete, with each target's rows clamped to its estimate, the way the PR
 // comment rolls them up: no target has the change until it cuts over.

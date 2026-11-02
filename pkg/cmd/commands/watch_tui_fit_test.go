@@ -144,14 +144,14 @@ func TestFitToWindowWithoutAFooter(t *testing.T) {
 }
 
 // An operator who presses s on a rollout sees the status line acknowledge the
-// stop while every target still reads as copying, and the targets' stopped
-// state once the server reports it.
+// stop, with how the members stand, while every target still reads as
+// copying, and the targets' stopped state once the server reports it.
 func TestRolloutViewAcknowledgesAPendingStop(t *testing.T) {
 	m := tallRollout(4)
 	m.stopTriggered = true
 	lines := strings.Split(m.View(), "\n")
 	require.GreaterOrEqual(t, len(lines), 2)
-	assert.True(t, strings.HasSuffix(lines[0], "Stopping..."), "status line acknowledges the stop: %q", lines[0])
+	assert.True(t, strings.HasSuffix(stripANSI(lines[0]), "Stopping on all 4 deployments..."), "status line acknowledges the stop and keeps the targets' counts: %q", lines[0])
 	assert.Contains(t, m.View(), "running table copy", "the targets keep their reported state until the stop lands")
 
 	m.state = state.Apply.Stopped
@@ -159,5 +159,5 @@ func TestRolloutViewAcknowledgesAPendingStop(t *testing.T) {
 		m.operations[i].State = state.ApplyOperation.Stopped
 		m.tables[i].Status = state.Task.Stopped
 	}
-	assert.NotContains(t, m.View(), "Stopping...")
+	assert.NotContains(t, m.View(), "Stopping")
 }
