@@ -976,6 +976,17 @@ type PRFile struct {
 	Filename         string
 	PreviousFilename string
 	Status           string // added, removed, modified, renamed
+	// Additions and Deletions are the line counts GitHub reports for the
+	// change to this file.
+	Additions int
+	Deletions int
+	// Symlink is true when the path names a symlink at the head, or at the
+	// base for a file the change removes or renames away. GitHub's file
+	// listings carry no file mode, so the fetchers read it from the tree for
+	// every file that could be a symlink (see mayBeSymlink). A symlink named
+	// like a schema file is a schema input by name already, so it is not
+	// read.
+	Symlink bool
 }
 
 // GitHub caps pull request file listings at this documented maximum and does
@@ -1048,6 +1059,8 @@ func (ic *InstallationClient) fetchPRFiles(ctx context.Context, repo string, pr 
 				Filename:         f.GetFilename(),
 				PreviousFilename: f.GetPreviousFilename(),
 				Status:           f.GetStatus(),
+				Additions:        f.GetAdditions(),
+				Deletions:        f.GetDeletions(),
 			})
 		}
 		if len(allFiles) >= maxGitHubPRFiles {
@@ -1059,6 +1072,16 @@ func (ic *InstallationClient) fetchPRFiles(ctx context.Context, repo string, pr 
 		opts.Page = readResult.resp.NextPage
 	}
 
+	if !slices.ContainsFunc(allFiles, mayBeSymlink) {
+		return allFiles, nil
+	}
+	prInfo, err := ic.FetchPullRequest(ctx, repo, pr)
+	if err != nil {
+		return nil, fmt.Errorf("read PR %s#%d to find which changed files are symlinks: %w", repo, pr, err)
+	}
+	if err := ic.markSymlinks(ctx, repo, prInfo.HeadSHA, prInfo.BaseRef, allFiles); err != nil {
+		return nil, fmt.Errorf("find which files PR %s#%d changes are symlinks: %w", repo, pr, err)
+	}
 	return allFiles, nil
 }
 
@@ -1086,12 +1109,90 @@ func (ic *InstallationClient) FetchChangedFilesBetween(ctx context.Context, repo
 			Filename:         f.GetFilename(),
 			PreviousFilename: f.GetPreviousFilename(),
 			Status:           f.GetStatus(),
+			Additions:        f.GetAdditions(),
+			Deletions:        f.GetDeletions(),
 		})
 	}
 	if len(files) >= maxGitHubCompareFiles {
 		return nil, fmt.Errorf("compare commits %s...%s for %s reached GitHub API file limit: %w", base, head, repo, ErrPRFilesIncomplete)
 	}
+	if err := ic.markSymlinks(ctx, repo, head, base, files); err != nil {
+		return nil, fmt.Errorf("find which files changed between %s and %s in %s are symlinks: %w", base, head, repo, err)
+	}
 	return files, nil
+}
+
+// mayBeSymlink reports whether a changed file could name a symlink at the
+// commit its path is read at (see symlinkCandidates).
+func mayBeSymlink(file PRFile) bool {
+	current, vacated := symlinkCandidates(file)
+	return current || vacated
+}
+
+// symlinkCandidates reports whether a changed file's path could name a
+// symlink, and whether the path a rename vacated could have named one. A
+// symlink's content is its target on one line, so a path that is a symlink
+// after the change has at most one line added, and one that was a symlink
+// before it has at most one line deleted. Every other file is skipped without
+// reading the tree. A path named like a schema input is one already.
+func symlinkCandidates(file PRFile) (current, vacated bool) {
+	if file.Filename != "" && !isSchemaInputFile(file.Filename) {
+		if isRemovedPRFile(file.Status) {
+			current = file.Deletions <= 1
+		} else {
+			current = file.Additions <= 1
+		}
+	}
+	if isRenamedPRFile(file.Status) && file.PreviousFilename != "" && !isSchemaInputFile(file.PreviousFilename) {
+		vacated = file.Deletions <= 1
+	}
+	return current, vacated
+}
+
+// markSymlinks sets Symlink on every file in files that names a symlink: at
+// head for its current path, and at base for a path the change removes or
+// renames away. Only paths symlinkCandidates admits are read. A path absent
+// at its commit is not a symlink.
+func (ic *InstallationClient) markSymlinks(ctx context.Context, repo, head, base string, files []PRFile) error {
+	levelCache := make(map[string][]TreeEntry)
+	isSymlink := func(ref, filePath string) (bool, error) {
+		entry, found, err := ic.resolveGitTreeEntry(ctx, repo, ref, filePath, levelCache)
+		if errors.Is(err, errGitPathThroughNonTree) {
+			// A path below a file is not an entry of its own at ref.
+			return false, nil
+		}
+		if err != nil {
+			return false, fmt.Errorf("read the mode of %s at %s: %w", filePath, ref, err)
+		}
+		return found && entry.Mode == gitSymlinkMode, nil
+	}
+	for i := range files {
+		file := &files[i]
+		readCurrent, readVacated := symlinkCandidates(*file)
+		if readCurrent {
+			ref := head
+			if isRemovedPRFile(file.Status) {
+				ref = base
+			}
+			linked, err := isSymlink(ref, file.Filename)
+			if err != nil {
+				return err
+			}
+			file.Symlink = linked
+		}
+		if !file.Symlink && readVacated {
+			linked, err := isSymlink(base, file.PreviousFilename)
+			if err != nil {
+				return err
+			}
+			file.Symlink = linked
+		}
+		if file.Symlink {
+			ic.logger.Debug("changed file is a symlink, so it counts as a schema input",
+				"repo", repo, "path", file.Filename, "previous_path", file.PreviousFilename, "status", file.Status)
+		}
+	}
+	return nil
 }
 
 // SchemaPathsChangedSinceMergeBase reports whether any schema path has a
@@ -1851,7 +1952,7 @@ func (ic *InstallationClient) PRFilesProposedAgainstDefaultBranch(ctx context.Co
 		// rename the default branch already holds without proposing the
 		// removal again.
 		keep := false
-		if isDiscoveryInputFile(file.Filename) {
+		if file.Symlink || isDiscoveryInputFile(file.Filename) {
 			differs, err := ic.pathDiffersFromDefaultBranch(ctx, repo, headSHA, defaultTipSHA, file.Filename, levelCache)
 			if err != nil {
 				return nil, defaultTipSHA, err

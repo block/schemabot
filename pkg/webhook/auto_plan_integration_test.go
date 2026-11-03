@@ -1360,8 +1360,8 @@ func TestE2EAutoPlanNoSchemaFiles(t *testing.T) {
 	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1/files", func(w http.ResponseWriter, r *http.Request) {
 		filesFetchedOnce.Do(func() { close(filesFetched) })
 		files := []*gh.CommitFile{
-			{Filename: new("README.md"), Status: new("modified")},
-			{Filename: new("main.go"), Status: new("modified")},
+			{Filename: new("README.md"), Status: new("modified"), Additions: new(6), Deletions: new(2)},
+			{Filename: new("main.go"), Status: new("modified"), Additions: new(14), Deletions: new(3)},
 		}
 		_ = json.NewEncoder(w).Encode(files)
 	})
