@@ -668,7 +668,7 @@ CREATE TABLE `customers` (
 
 ---
 
-▶️ **To apply**, with `--allow-unsafe` to confirm 1 unsafe change on `customers`:
+▶️ **To apply**, add `--allow-unsafe` to confirm 1 unsafe change on `customers`:
 ```
 schemabot apply -e staging
 ```
@@ -749,7 +749,7 @@ ALTER TABLE `events` ADD INDEX `idx_created_at`(`created_at`);
 
 ---
 
-▶️ **To apply**, with `--allow-unsafe` to confirm 1 unsafe change on `users`:
+▶️ **To apply**, add `--allow-unsafe` to confirm 1 unsafe change on `users`:
 ```
 schemabot apply -e staging
 ```
@@ -903,7 +903,7 @@ Before allowing a destructive drop, first deploy application code that no longer
 
 ---
 
-▶️ **To apply**, with `--allow-unsafe` to confirm 1 unsafe change on `orders`:
+▶️ **To apply**, add `--allow-unsafe` to confirm 1 unsafe change on `orders`:
 ```
 schemabot apply -e staging
 ```
@@ -946,7 +946,7 @@ Before allowing a destructive drop, first deploy application code that no longer
 
 ---
 
-▶️ **To apply**, with `--allow-unsafe` to confirm 2 unsafe changes on `orders` and `reconcile_state`:
+▶️ **To apply**, add `--allow-unsafe` to confirm 2 unsafe changes on `orders` and `reconcile_state`:
 ```
 schemabot apply -e staging
 ```
@@ -1525,7 +1525,7 @@ schemabot apply -e staging
 
 ---
 
-▶️ **To apply**, with `--allow-unsafe` to confirm 2 unsafe changes on `commerce_sharded` VSchema:
+▶️ **To apply**, add `--allow-unsafe` to confirm 2 unsafe changes on `commerce_sharded` VSchema:
 ```
 schemabot apply -e staging
 ```
@@ -2489,7 +2489,7 @@ Before allowing a destructive drop, first deploy application code that no longer
 
 </details>
 
-**🚨 To proceed with these destructive changes**, with `--allow-unsafe` to confirm 1 unsafe change on `customers`:
+**🚨 To proceed with these destructive changes**, add `--allow-unsafe` to confirm 1 unsafe change on `customers`:
 ```
 schemabot apply -e staging
 ```
@@ -2525,7 +2525,7 @@ Before dropping an index in MySQL, first make the dropped index invisible and ve
 
 </details>
 
-**🚨 To proceed with these destructive changes**, with `--allow-unsafe` to confirm 1 unsafe change on `customers`:
+**🚨 To proceed with these destructive changes**, add `--allow-unsafe` to confirm 1 unsafe change on `customers`:
 ```
 schemabot apply -e staging
 ```
@@ -2568,7 +2568,7 @@ ALTER TABLE `users` RENAME COLUMN `email` TO `email_address`;
 2. `orders`: Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19. Consider using `DATETIME` instead.
 3. `users`: Column rename detected in table `users`: `email` to `email_address`. Renaming a column cannot be done atomically across application pods, and ORMs that generate column names at compile time (e.g. jOOQ) will break until code is recompiled
 
-**🚨 To proceed with these destructive changes**, with `--allow-unsafe` to confirm 3 unsafe changes on `orders` and `users`:
+**🚨 To proceed with these destructive changes**, add `--allow-unsafe` to confirm 3 unsafe changes on `orders` and `users`:
 ```
 schemabot apply -e staging
 ```
@@ -7016,7 +7016,7 @@ Before allowing a destructive drop, first deploy application code that no longer
 
 ---
 
-To confirm this rollback, with `--allow-unsafe` to confirm 1 unsafe change on `audit_log`:
+To confirm this rollback, add `--allow-unsafe` to confirm 1 unsafe change on `audit_log`:
 ```
 schemabot rollback-confirm -e staging
 ```
@@ -7056,7 +7056,7 @@ Before allowing a destructive drop, first deploy application code that no longer
 
 </details>
 
-**🚨 To proceed with these destructive changes**, with `--allow-unsafe` to confirm 1 unsafe change on `audit_log`:
+**🚨 To proceed with these destructive changes**, add `--allow-unsafe` to confirm 1 unsafe change on `audit_log`:
 ```
 schemabot rollback-confirm -e staging
 ```
@@ -9940,7 +9940,7 @@ Before allowing a destructive drop, first deploy application code that no longer
 
 ---
 
-▶️ **To apply**, with `--allow-unsafe` to confirm 1 unsafe change on `mutes`:
+▶️ **To apply**, add `--allow-unsafe` to confirm 1 unsafe change on `mutes`:
 ```
 schemabot apply -e production
 ```

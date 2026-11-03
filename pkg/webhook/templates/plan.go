@@ -831,9 +831,9 @@ func (c unsafeConsent) instruction() string {
 		noun = "unsafe changes"
 	}
 	if c.primaryOnly {
-		return fmt.Sprintf("with `--allow-unsafe` to confirm %d %s on %s, and any the other targets carry", c.findings, noun, c.tables)
+		return fmt.Sprintf("add `--allow-unsafe` to confirm %d %s on %s, and any the other targets carry", c.findings, noun, c.tables)
 	}
-	return fmt.Sprintf("with `--allow-unsafe` to confirm %d %s on %s", c.findings, noun, c.tables)
+	return fmt.Sprintf("add `--allow-unsafe` to confirm %d %s on %s", c.findings, noun, c.tables)
 }
 
 // unsafeConsentTablesShown caps how many names the consent sentence lists.
