@@ -122,8 +122,10 @@ func TestFetchChangedFilesBetweenRequiresLinearHistory(t *testing.T) {
 				require.NoError(t, json.NewEncoder(w).Encode(gh.CommitsComparison{
 					Status: &tt.status,
 					Files: []*gh.CommitFile{{
-						Filename: new("app/service.go"),
-						Status:   new("modified"),
+						Filename:  new("app/service.go"),
+						Status:    new("modified"),
+						Additions: new(4),
+						Deletions: new(2),
 					}},
 				}))
 			})

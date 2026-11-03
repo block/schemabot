@@ -1029,7 +1029,9 @@ type ApplyStore interface {
 	// resumable stop keeps completed_at NULL) but whose progress comment was
 	// never followed by a summary comment — no summary marker exists, the
 	// marker is superseded (a stop's summary consumed by a resume rotation, so
-	// the current terminal state's summary was never posted), or only a claim
+	// the current terminal state's summary was never posted), the posted
+	// marker records a state other than the apply's current one (a summary of
+	// an earlier terminal state, or one a resume rotated past), or only a claim
 	// sentinel stale for longer than SummaryClaimStaleAfter remains from a
 	// publisher that crashed before posting. "Recently" is MissingSummaryLookback.
 	// An apply qualifies only once it has been terminal for at least settledFor,
@@ -1370,17 +1372,39 @@ type ApplyCommentStore interface {
 	ClearPendingFreeze(ctx context.Context, applyID int64, commentState string) error
 
 	// ClaimSummaryComment atomically claims the right to publish the terminal
-	// summary comment for an apply by inserting the summary marker as a claim
-	// sentinel (github_comment_id = 0). A superseded marker — a stop's summary
-	// consumed by a resume rotation — does not block the claim: it is converted
-	// back into a claim sentinel, since the summary it recorded belongs to an
-	// earlier terminal state. Exactly one caller wins per terminal state: the
-	// winner posts the summary and records the real comment ID via Upsert; every
-	// loser skips. The claim — not the apply lease — is the exactly-once
-	// authority for the summary, so a writer whose lease was re-claimed (stop
+	// summary comment for an apply in terminalState by inserting the summary
+	// marker as a claim sentinel (github_comment_id = 0). A marker that records
+	// a summary posted for an earlier terminal state does not block the claim:
+	// it is converted back into a claim sentinel. That is a marker a resume
+	// rotation superseded, or an active marker whose SummarizedState names a
+	// different terminal state the apply can leave, such as a stop's summary
+	// when the started apply completes before any rotation consumed it. A
+	// marker for a settled state blocks every claim, since that outcome is
+	// final and a claim for another state comes from a stale read. An active
+	// marker for a different state converts only while the apply is still in
+	// terminalState, so a claim read before the apply was started again cannot
+	// record a summary of a state the apply has left. Exactly one caller wins
+	// per terminal state: the winner posts the summary and records
+	// the real comment ID and the state it describes via Upsert; every loser
+	// skips. The claim — not the apply lease — is the exactly-once authority
+	// for the summary, so a writer whose lease was re-claimed (stop
 	// reconciliation, resume) can still be beaten to the post without a
 	// duplicate. Returns true when this caller won the claim.
-	ClaimSummaryComment(ctx context.Context, applyID int64) (bool, error)
+	ClaimSummaryComment(ctx context.Context, applyID int64, terminalState string) (bool, error)
+
+	// SettleSummaryForResume settles the summary marker a resume rotation
+	// rotated for, in one write decided under a lock on the apply row, and
+	// reports what it did. It touches the marker only while the marker is
+	// active and still records githubCommentID: a terminal publish that came
+	// after the summary the rotation saw owns the marker from then on. While
+	// the apply is active it consumes the marker, so the apply's next terminal
+	// publish claims a fresh summary. Once the apply has reached its next
+	// terminal state it marks the marker SummaryRotatedPast instead: consuming
+	// it would leave the next resume nothing to rotate on, and leaving it
+	// as it was would block the summary that state is owed. With a lease in
+	// context the write requires it, and a lost lease surfaces as
+	// ErrApplyLeaseLost.
+	SettleSummaryForResume(ctx context.Context, applyID int64, githubCommentID int64) (ResumeSummarySettlement, error)
 
 	// ReclaimStaleSummaryClaim takes over a summary claim sentinel whose holder
 	// crashed between claiming and posting: a sentinel (github_comment_id = 0)
@@ -1484,6 +1508,13 @@ type ApplyOperationStore interface {
 	// Get returns a child row by ID, or nil if not found.
 	Get(ctx context.Context, id int64) (*ApplyOperation, error)
 
+	// GetLocked returns a child row by ID read under its row lock, or nil if
+	// not found. A claim holds that lock from the moment it selects the row
+	// until it commits, so the answer reflects any claim in flight on the row
+	// when GetLocked was called: it waits for that claim to commit or roll
+	// back. Use it to confirm a decision a claim racing the read would change.
+	GetLocked(ctx context.Context, id int64) (*ApplyOperation, error)
+
 	// GetByApplyAndDeployment returns the legacy unkeyed child row for
 	// (apply_id, deployment), or nil if not found.
 	GetByApplyAndDeployment(ctx context.Context, applyID int64, deployment string) (*ApplyOperation, error)
@@ -1517,6 +1548,20 @@ type ApplyOperationStore interface {
 	// column only; for transitions that should also stamp started_at or
 	// completed_at, use MarkStarted / MarkCompleted / MarkFailed instead.
 	UpdateState(ctx context.Context, id int64, newState string) error
+
+	// MarkStoppedNeverStarted returns an operation claimed out of pending to
+	// stopped before its first dispatch, clearing the started_at its claim
+	// stamped, so the row still reads as never started: a later start requeues
+	// it and a cancel settles it as never started. It is fenced like
+	// UpdateState.
+	MarkStoppedNeverStarted(ctx context.Context, id int64) error
+
+	// MarkResumedRunning moves an operation a start resumed from resuming to
+	// running once its engine is working again, and reports whether it did. It
+	// changes nothing when the row has moved on from resuming. It requires the
+	// operation lease in ctx for this row, and a row that no longer carries
+	// that lease surfaces as ErrApplyLeaseLost.
+	MarkResumedRunning(ctx context.Context, id int64) (bool, error)
 
 	// MarkStarted sets state=running and started_at on a child row.
 	MarkStarted(ctx context.Context, id int64) error
@@ -1581,6 +1626,15 @@ type ApplyOperationStore interface {
 	// GetEngineResumeState returns opaque engine resume state for the operation.
 	GetEngineResumeState(ctx context.Context, operationID int64) (*EngineResumeState, error)
 
+	// ClearEngineResumeState removes the operation's engine resume state, so a
+	// later GetEngineResumeState reports ErrEngineResumeStateNotFound and the
+	// next drive starts the engine work afresh. Use it only when the engine has
+	// proved it holds none of the work the state described; state naming work
+	// that may be live is never cleared. The write takes the same lease guard
+	// as the other operation writes. Returns ErrApplyOperationNotFound if no
+	// row matches the ID.
+	ClearEngineResumeState(ctx context.Context, operationID int64) error
+
 	// SaveProgressMetadata stores the latest engine progress display metadata.
 	// A new attempt can display the prior attempt's position until its first progress save.
 	SaveProgressMetadata(ctx context.Context, operationID int64, metadata map[string]string) error
@@ -1615,7 +1669,9 @@ type ApplyOperationStore interface {
 	// needs work. A row claimed from pending or stopped is returned with the
 	// state it was claimed from, which is how the caller tells a claim that
 	// starts an operation from a retry or a recovery.
-	FindNextApplyOperation(ctx context.Context, owner string) (*ApplyOperation, error)
+	//
+	// opts narrow what the claim may match; see OperationClaimFilter.
+	FindNextApplyOperation(ctx context.Context, owner string, opts ...OperationClaimOption) (*ApplyOperation, error)
 
 	// FindNextApplyOperationCutover atomically claims the next operation parked
 	// at the cutover barrier that no earlier sibling holds, and rotates a fresh
@@ -1727,6 +1783,17 @@ type ApplyOperationStore interface {
 	// drive that delivers the cancel to it. completed_at is stamped, and writes
 	// are lease guarded the same way as MarkPendingStoppedByApply.
 	MarkPendingCancelledByApply(ctx context.Context, applyID int64) (int64, error)
+
+	// RequeueNeverStartedForStartByApply moves every stopped operation of an
+	// apply that never started back to pending, returning the number of rows
+	// changed. A stop reaches such a row while it is still pending, so it has
+	// written nothing to its target; once a start is pending it is queued
+	// work again, and pending is what it is. The write happens only while a
+	// start request is pending and neither a stop nor a cancel request is,
+	// checked in the same transaction under the apply row's lock, so a stop
+	// or cancel accepted after the start keeps every row it reached. The
+	// caller's lease is checked in that transaction too.
+	RequeueNeverStartedForStartByApply(ctx context.Context, applyID int64) (int64, error)
 
 	// ReapStranded mirrors the parent's outcome onto pending, unleased operation
 	// rows whose parent apply settled long enough ago to be quiescent, returning

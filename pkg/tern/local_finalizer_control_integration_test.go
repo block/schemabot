@@ -33,16 +33,26 @@ type finalizerControlEngine struct {
 	applyErrs []error
 	// applyResult, when set, is what a call that returns no error reports.
 	applyResult *engine.ApplyResult
+	// applyHook, when set, runs on every Apply call with the drive's context
+	// before applyErrs is consulted; a non-nil error it returns ends the call.
+	applyHook func(context.Context) error
 	// progressState, when set, is the terminal state Progress reports.
 	progressState engine.State
+	// progressErr, when set, is the error every Progress call returns.
+	progressErr error
 }
 
 func (e *finalizerControlEngine) Name() string { return "finalizer-control" }
 
-func (e *finalizerControlEngine) Apply(_ context.Context, req *engine.ApplyRequest) (*engine.ApplyResult, error) {
+func (e *finalizerControlEngine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.ApplyResult, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.requests = append(e.requests, req)
+	if e.applyHook != nil {
+		if err := e.applyHook(ctx); err != nil {
+			return nil, err
+		}
+	}
 	if len(e.applyErrs) > 0 {
 		err := e.applyErrs[0]
 		e.applyErrs = e.applyErrs[1:]
@@ -59,6 +69,9 @@ func (e *finalizerControlEngine) Apply(_ context.Context, req *engine.ApplyReque
 func (e *finalizerControlEngine) Progress(context.Context, *engine.ProgressRequest) (*engine.ProgressResult, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	if e.progressErr != nil {
+		return nil, e.progressErr
+	}
 	if e.progressState != "" {
 		return &engine.ProgressResult{State: e.progressState}, nil
 	}
@@ -483,6 +496,9 @@ type failingFinalizerWritesStorage struct {
 	// failGetResumeStateOnce fails the next read of the finalizer's engine
 	// resume state, the read the drive makes before it starts.
 	failGetResumeStateOnce bool
+	// failMarkFailedRetryable fails every pause write, standing in for storage
+	// going away between the engine's answer and the drive recording it.
+	failMarkFailedRetryable bool
 }
 
 func (s *failingFinalizerWritesStorage) ApplyOperations() storage.ApplyOperationStore {
@@ -515,6 +531,13 @@ func (o *failingFinalizerWritesOperations) SaveEngineResumeState(ctx context.Con
 		return fmt.Errorf("save engine resume state for apply_operation %d: connection lost", id)
 	}
 	return o.ApplyOperationStore.SaveEngineResumeState(ctx, id, rs)
+}
+
+func (o *failingFinalizerWritesOperations) MarkFailedRetryable(ctx context.Context, id int64, errMsg string) error {
+	if o.parent.failMarkFailedRetryable {
+		return fmt.Errorf("mark apply_operation %d failed_retryable: connection lost", id)
+	}
+	return o.ApplyOperationStore.MarkFailedRetryable(ctx, id, errMsg)
 }
 
 // ns_0's finalizer publishes its VSchema on a synchronous engine, which reports
@@ -674,6 +697,161 @@ func TestLocalClient_FinalizerResumeStateReadErrorPausesThenRedriveCompletes(t *
 	assert.Equal(t, state.ApplyOperation.Completed, f.finalizerOperation(t).State)
 }
 
+// requireHandoffRecorded asserts the finalizer row carries the drive's own
+// handoff record, with nothing the engine reported since.
+func (f *finalizerControlFixture) requireHandoffRecorded(t *testing.T) {
+	t.Helper()
+	stored, err := f.stor.ApplyOperations().GetEngineResumeState(t.Context(), f.finalizerID)
+	require.NoError(t, err, "the handoff record must still be on the row")
+	assert.True(t, isFinalizerHandoffRecordOnly(stored), "the row carries the drive's handoff record, not engine state")
+}
+
+// The engine refuses ns_0's VSchema with a transient error, so nothing is live
+// on it. While the finalizer sits paused the operator stops the rollout. The
+// re-drive must honor that stop before it reaches the engine: the pause
+// withdrew the handoff record the refused drive wrote, so the re-drive reads
+// the row as never handed to the engine and settles it stopped without
+// re-applying, the way a never-started finalizer does (CO-4).
+func TestLocalClient_RefusedFinalizerPauseWithdrawsHandoffSoRedriveHonorsPendingStop(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+	f := newFinalizerControlFixture(t, state.ApplyOperation.Running)
+	f.eng.applyErrs = []error{fmt.Errorf("vschema deploy endpoint unreachable")}
+
+	require.ErrorContains(t, f.client.ResumeApplyOperation(f.opCtx, f.apply, f.finalizerID), "vschema deploy endpoint unreachable")
+	require.Equal(t, state.ApplyOperation.FailedRetryable, f.finalizerState(t))
+	_, err := f.stor.ApplyOperations().GetEngineResumeState(t.Context(), f.finalizerID)
+	require.ErrorIs(t, err, storage.ErrEngineResumeStateNotFound, "a refused drive leaves no handoff behind")
+
+	f.requestPending(t, storage.ControlOperationStop)
+	redriveCtx := f.redispatch(t)
+	require.NoError(t, f.client.ResumeApplyOperation(redriveCtx, f.apply, f.finalizerID))
+
+	require.Len(t, f.eng.applies(), 1, "the re-drive must not re-apply under a pending stop when nothing is live")
+	assert.Equal(t, state.ApplyOperation.Stopped, f.finalizerState(t))
+	f.requireRequestPending(t, storage.ControlOperationStop)
+}
+
+// The engine cannot tell whether it started ns_0's VSchema deploy, so the
+// drive pauses but keeps its handoff record: the work may be live. A stop the
+// operator issues meanwhile cannot pause work the engine may be carrying out,
+// so the re-drive re-applies the idempotent VSchema and records the outcome
+// the engine reports, leaving the stop for the rollout to resolve as outrun.
+func TestLocalClient_UnknownOutcomeFinalizerPauseKeepsHandoffSoRedriveReobservesWork(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+	f := newFinalizerControlFixture(t, state.ApplyOperation.Running)
+	f.eng.applyErrs = []error{engine.NewOutcomeUnknownError("deploy request may have been created")}
+
+	require.ErrorContains(t, f.client.ResumeApplyOperation(f.opCtx, f.apply, f.finalizerID), "deploy request may have been created")
+	require.Equal(t, state.ApplyOperation.FailedRetryable, f.finalizerState(t))
+	f.requireHandoffRecorded(t)
+
+	f.requestPending(t, storage.ControlOperationStop)
+	redriveCtx := f.redispatch(t)
+	require.NoError(t, f.client.ResumeApplyOperation(redriveCtx, f.apply, f.finalizerID))
+
+	require.Len(t, f.eng.applies(), 2, "the re-drive re-observes work that may be live rather than settling over it")
+	assert.Equal(t, state.ApplyOperation.Completed, f.finalizerState(t))
+	f.requireRequestPending(t, storage.ControlOperationStop)
+}
+
+// An earlier drive published ns_0's VSchema and died before recording the
+// finalizer completed, leaving its handoff on the row. A later drive is
+// refused by the engine and pauses. That pause must not withdraw the earlier
+// drive's handoff: the VSchema is live, and a stop the operator issues
+// meanwhile must not settle the row over it, so the re-drive re-applies and
+// completes.
+func TestLocalClient_EarlierDriveHandoffSurvivesLaterRefusedFinalizerPause(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+	wrapper := &failingFinalizerWritesStorage{failMarkCompletedOnce: true}
+	f := newFinalizerControlFixtureWith(t, state.ApplyOperation.Running, finalizerControlOptions{
+		wrapStorage: func(stor storage.Storage) storage.Storage {
+			wrapper.Storage = stor
+			return wrapper
+		},
+	})
+
+	require.Error(t, f.client.ResumeApplyOperation(f.opCtx, f.apply, f.finalizerID),
+		"the first drive fails recording the finalizer completed")
+	require.Len(t, f.eng.applies(), 1, "the first drive published ns_0's VSchema")
+	require.Equal(t, state.ApplyOperation.Running, f.finalizerState(t))
+	f.requireHandoffRecorded(t)
+
+	f.eng.applyErrs = []error{fmt.Errorf("vschema deploy endpoint unreachable")}
+	require.ErrorContains(t, f.client.ResumeApplyOperation(f.opCtx, f.apply, f.finalizerID), "vschema deploy endpoint unreachable")
+	require.Len(t, f.eng.applies(), 2)
+	require.Equal(t, state.ApplyOperation.FailedRetryable, f.finalizerState(t))
+	f.requireHandoffRecorded(t)
+
+	f.requestPending(t, storage.ControlOperationStop)
+	redriveCtx := f.redispatch(t)
+	require.NoError(t, f.client.ResumeApplyOperation(redriveCtx, f.apply, f.finalizerID))
+
+	require.Len(t, f.eng.applies(), 3, "the re-drive re-applies the published VSchema rather than settling over it")
+	assert.Equal(t, state.ApplyOperation.Completed, f.finalizerState(t))
+	f.requireRequestPending(t, storage.ControlOperationStop)
+}
+
+// The engine refuses ns_0's VSchema with a transient error and storage then
+// refuses the pause write. The row stays running for a later drive, and the
+// drive's error names both the engine's refusal and the refused pause, so the
+// log shows the row was left as it is on purpose.
+func TestLocalClient_FinalizerPauseRefusedByStorageLeavesRowRunning(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+	wrapper := &failingFinalizerWritesStorage{failMarkFailedRetryable: true}
+	f := newFinalizerControlFixtureWith(t, state.ApplyOperation.Running, finalizerControlOptions{
+		wrapStorage: func(stor storage.Storage) storage.Storage {
+			wrapper.Storage = stor
+			return wrapper
+		},
+	})
+	f.eng.applyErrs = []error{fmt.Errorf("vschema deploy endpoint unreachable")}
+
+	err := f.client.ResumeApplyOperation(f.opCtx, f.apply, f.finalizerID)
+	require.ErrorContains(t, err, "vschema deploy endpoint unreachable")
+	require.ErrorContains(t, err, "pause group_finalizer")
+
+	op := f.finalizerOperation(t)
+	assert.Equal(t, state.ApplyOperation.Running, op.State, "a refused pause leaves the row as the drive found it")
+	assert.Empty(t, op.ErrorMessage)
+	require.Len(t, f.eng.applies(), 1)
+}
+
+// The drive is cancelled while the engine is applying ns_0's VSchema, and the
+// engine returns the cancellation. The error describes the driver, not the
+// VSchema work, so the drive records nothing: the row stays running with no
+// error and its handoff in place, and the driver that reclaims it decides the
+// outcome.
+func TestLocalClient_CancelledFinalizerDriveRecordsNothing(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+	f := newFinalizerControlFixture(t, state.ApplyOperation.Running)
+	driveCtx, cancelDrive := context.WithCancel(f.opCtx)
+	defer cancelDrive()
+	f.eng.applyHook = func(ctx context.Context) error {
+		cancelDrive()
+		return ctx.Err()
+	}
+
+	err := f.client.ResumeApplyOperation(driveCtx, f.apply, f.finalizerID)
+	require.ErrorIs(t, err, context.Canceled)
+	assert.NotContains(t, err.Error(), "pause group_finalizer", "a cancelled drive attempts no pause")
+
+	op := f.finalizerOperation(t)
+	assert.Equal(t, state.ApplyOperation.Running, op.State)
+	assert.Empty(t, op.ErrorMessage, "a cancelled drive records no outcome on the row")
+	f.requireHandoffRecorded(t)
+	require.Len(t, f.eng.applies(), 1)
+}
+
 // A failure retrying cannot cure fails the finalizer for good, and nothing
 // revives a failed row: the claim never offers it again, even under a parent
 // that is failed_retryable with budget left.
@@ -702,9 +880,10 @@ func TestLocalClient_FinalizerPermanentEngineErrorFailsWithoutRetry(t *testing.T
 	}
 }
 
-// The engine's own refusals and a non-success terminal outcome are confirmed
-// failures: the VSchema did not apply and retrying the same request cannot
-// change that, so the finalizer fails instead of pausing.
+// The engine's own refusals, a non-success terminal outcome, and a progress
+// poll the engine fails permanently are confirmed failures: the VSchema did
+// not apply and retrying the same request cannot change that, so the finalizer
+// fails instead of pausing.
 func TestLocalClient_FinalizerNonSuccessOutcomeFailsWithoutRetry(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping integration test in short mode")
@@ -728,6 +907,14 @@ func TestLocalClient_FinalizerNonSuccessOutcomeFailsWithoutRetry(t *testing.T) {
 				e.progressState = engine.StateFailed
 			},
 			message: "ended in non-success state",
+		},
+		{
+			name: "progress poll fails permanently",
+			prepare: func(e *finalizerControlEngine) {
+				e.applyResult = &engine.ApplyResult{Accepted: true, ResumeState: &engine.ResumeState{MigrationContext: "deploy-ns-0"}}
+				e.progressErr = engine.NewPermanentError("deploy request deploy-ns-0 not found")
+			},
+			message: "progress poll failed permanently",
 		},
 	}
 	for _, tt := range tests {

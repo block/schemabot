@@ -31,8 +31,10 @@ type ShardStatus struct {
 // ("waiting for -40", "halted — -40 failed") name sibling shards. A shard's
 // identity is its name, qualified by keyspace ("keyspace/shard") when the
 // apply spans more than one keyspace, since shard names repeat across
-// keyspaces and a label naming a bare duplicate would be ambiguous.
-func DeriveShards(shards []ShardWork) []ShardStatus {
+// keyspaces and a label naming a bare duplicate would be ambiguous. The
+// shards of an apply in applyState read as the rollout's members do
+// (ResumeClaimed), so a start under way never counts its shards as stopped.
+func DeriveShards(applyState string, shards []ShardWork) []ShardStatus {
 	keyspaces := make(map[string]bool)
 	for _, sw := range shards {
 		keyspaces[sw.Keyspace] = true
@@ -66,7 +68,7 @@ func DeriveShards(shards []ShardWork) []ShardStatus {
 		})
 	}
 	byIdentity := make(map[string]Deployment, len(inputs))
-	for _, d := range Derive(inputs).Deployments {
+	for _, d := range Derive(ResumeClaimed(applyState, inputs)).Deployments {
 		byIdentity[d.Deployment] = d
 	}
 	out := make([]ShardStatus, 0, len(inputs))
