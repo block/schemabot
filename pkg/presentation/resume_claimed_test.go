@@ -33,6 +33,28 @@ func TestResumeClaimed(t *testing.T) {
 	assert.Equal(t, NextActionResume, stopped.NextAction.Kind)
 }
 
+// A rolling rollout stopped before its later member began resumes only the
+// member that had started. The later one has nothing to resume: it reads as
+// still to run, behind the member ahead of it, and keeps that reading once the
+// apply is running again.
+func TestResumeClaimedLeavesAMemberThatNeverStartedToRunInItsTurn(t *testing.T) {
+	so := state.ApplyOperation
+	ops := []Operation{
+		{Deployment: "us", State: so.Stopped, Work: true, RolloutStep: 1},
+		{Deployment: "eu", State: so.Stopped, Work: true, RolloutStep: 2, NeverStarted: true},
+	}
+
+	claimed := ResumeClaimed(state.Apply.Resuming, ops)
+	assert.Equal(t, []string{so.Resuming, so.Pending}, []string{claimed[0].State, claimed[1].State})
+	assert.True(t, claimed[1].NeverStarted)
+
+	model := Derive(claimed)
+	assert.Equal(t, state.Apply.Resuming, model.State)
+	assert.Equal(t, NextActionNone, model.NextAction.Kind)
+	assert.NotEqual(t, StateHalted, model.Deployments[1].Presentation, "the member still to run does not read as halted")
+	assert.NotContains(t, model.Deployments[1].Label, "stopped")
+}
+
 // A table of a resuming apply reads as resuming only while it stands where the
 // stop left it on every part: stopped on some, finished or not yet begun on
 // the rest, which its line keeps as counts. Once a part moves it on, its own

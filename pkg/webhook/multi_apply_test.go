@@ -1,6 +1,7 @@
 package webhook
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -132,8 +133,6 @@ func TestFormatApplySummaryComment_MultipleOperationsRendersMulti(t *testing.T) 
 	assert.Contains(t, out, "- ✅ `us` — completed")
 }
 
-// Each deployment's tasks are routed into that deployment's section only, by
-// apply_operation_id — a task for `us` must not appear under `eu`.
 // A start moves a stopped rollout to resuming before its targets' rows leave
 // stopped, and a remote data plane can keep reporting them stopped until it
 // acts on the start. Through that window the progress comment reads as the
@@ -150,7 +149,7 @@ func TestFormatApplyStatusComment_ResumingRolloutReadsAsResuming(t *testing.T) {
 			for i, target := range []string{"orders-001", "orders-002"} {
 				first, second := int64(2*i+1), int64(2*i+2)
 				ops = append(ops,
-					&storage.ApplyOperation{ID: first, Deployment: "eu", Target: target, OperationKey: target + "/bikes", OperationKind: storage.ApplyOperationKindWork, State: rowState, RolloutStep: 1},
+					&storage.ApplyOperation{ID: first, Deployment: "eu", Target: target, OperationKey: target + "/bikes", OperationKind: storage.ApplyOperationKindWork, State: rowState, RolloutStep: 1, StartedAt: new(time.Now())},
 					&storage.ApplyOperation{ID: second, Deployment: "eu", Target: target, OperationKey: target + "/docks", OperationKind: storage.ApplyOperationKindWork, State: state.ApplyOperation.Stopped, RolloutStep: 2},
 				)
 				tasks = append(tasks,
@@ -180,8 +179,8 @@ func TestFormatApplyStatusComment_ResumingRolloutKeepsTargetsThatMovedOn(t *test
 		apply := runningApply()
 		apply.State = state.Apply.Resuming
 		ops := []*storage.ApplyOperation{
-			{ID: 1, Deployment: "eu", Target: "orders-001", OperationKind: storage.ApplyOperationKindWork, State: state.ApplyOperation.Stopped},
-			{ID: 2, Deployment: "eu", Target: "orders-002", OperationKind: storage.ApplyOperationKindWork, State: state.ApplyOperation.Stopped},
+			{ID: 1, Deployment: "eu", Target: "orders-001", OperationKind: storage.ApplyOperationKindWork, State: state.ApplyOperation.Stopped, StartedAt: new(time.Now())},
+			{ID: 2, Deployment: "eu", Target: "orders-002", OperationKind: storage.ApplyOperationKindWork, State: state.ApplyOperation.Stopped, StartedAt: new(time.Now())},
 		}
 		first.ApplyOperationID = new(int64(1))
 		tasks := []*storage.Task{
@@ -200,8 +199,34 @@ func TestFormatApplyStatusComment_ResumingRolloutKeepsTargetsThatMovedOn(t *test
 	assert.Contains(t, copying, "70 / 100 rows", "the target copying again shows its live progress")
 }
 
+// A rollout whose deployments each address one target renders a section per
+// target. While the apply resumes, each section reads its stopped table as
+// resuming, and a table no target began stays queued, as the rollup reads it.
+func TestFormatApplyStatusComment_ResumingSingleTargetSections(t *testing.T) {
+	apply := runningApply()
+	apply.State = state.Apply.Resuming
+	var ops []*storage.ApplyOperation
+	var tasks []*storage.Task
+	for i, deployment := range []string{"us", "eu"} {
+		id := int64(i + 1)
+		ops = append(ops, &storage.ApplyOperation{ID: id, Deployment: deployment, Target: "orders-" + deployment, OperationKind: storage.ApplyOperationKindWork, State: state.ApplyOperation.Stopped, StartedAt: new(time.Now()), CutoverPolicy: storage.CutoverPolicyParallel})
+		tasks = append(tasks,
+			&storage.Task{ApplyOperationID: new(id), TableName: "bikes", DDL: bikesDDL, State: state.Task.Stopped, RowsCopied: 57, RowsTotal: 100},
+			&storage.Task{ApplyOperationID: new(id), TableName: "docks", DDL: "ALTER TABLE `docks` DROP COLUMN `note`", State: state.Task.Pending},
+		)
+	}
+
+	out := formatApplyStatusComment(apply, ops, false, tasks, nil, nil, nil, "", "")
+	assert.Equal(t, 2, strings.Count(out, "**`bikes`**: 🔄 Resuming…\n"), out)
+	assert.Equal(t, 2, strings.Count(out, "**`docks`**: ⏳ Queued"), out)
+	assert.NotContains(t, out, "**`docks`**: 🔄 Resuming…")
+	assert.NotContains(t, out, "57 / 100")
+}
+
 const bikesDDL = "ALTER TABLE `bikes` ADD INDEX `idx_status`(`status`)"
 
+// Each deployment's tasks are routed into that deployment's section only, by
+// apply_operation_id — a task for `us` must not appear under `eu`.
 func TestBuildMultiApplyData_RoutesTasksByOperation(t *testing.T) {
 	ops := []*storage.ApplyOperation{
 		{ID: 1, Deployment: "eu", State: state.ApplyOperation.Running},

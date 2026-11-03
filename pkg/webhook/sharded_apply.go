@@ -136,7 +136,7 @@ func buildShardedApplyData(apply *storage.Apply, ops []*storage.ApplyOperation, 
 		errorMessage = finalizerError
 	}
 
-	shardsByKeyspace := shardStatusesByKeyspace(groupOrder, released, tasksByOp)
+	shardsByKeyspace := shardStatusesByKeyspace(apply.State, groupOrder, released, tasksByOp)
 	tablesByKeyspace := shardedTableStatusesByKeyspace(ops, tasksByOp, view)
 	keyspaces := make([]templates.ShardedKeyspace, 0, len(keyspaceOrder))
 	for _, ns := range keyspaceOrder {
@@ -376,8 +376,9 @@ func isOperationFailureState(opState string) bool {
 // shardStatusesByKeyspace derives one status per (keyspace, shard) group
 // (presentation.DeriveShards) and buckets the results per keyspace, preserving
 // resolved order. The status row's Shard is the plain name; it renders under
-// its keyspace heading.
-func shardStatusesByKeyspace(groups []shardWorkGroup, released bool, tasksByOp map[int64][]*storage.Task) map[string][]templates.ShardStatus {
+// its keyspace heading. The shards of an apply in applyState read as
+// presentation.DeriveShards reads them.
+func shardStatusesByKeyspace(applyState string, groups []shardWorkGroup, released bool, tasksByOp map[int64][]*storage.Task) map[string][]templates.ShardStatus {
 	work := make([]presentation.ShardWork, 0, len(groups))
 	for _, g := range groups {
 		sw := presentation.ShardWork{Keyspace: g.namespace, Shard: g.shard}
@@ -395,7 +396,7 @@ func shardStatusesByKeyspace(groups []shardWorkGroup, released bool, tasksByOp m
 		work = append(work, sw)
 	}
 	out := make(map[string][]templates.ShardStatus, len(groups))
-	for _, s := range presentation.DeriveShards(work) {
+	for _, s := range presentation.DeriveShards(applyState, work) {
 		out[s.Keyspace] = append(out[s.Keyspace], templates.ShardStatus{
 			Shard: s.Shard,
 			Emoji: s.Emoji,

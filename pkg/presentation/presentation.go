@@ -525,17 +525,24 @@ func AwaitingResume(statuses []string) (coverage string, ok bool) {
 // claims them one at a time, and a remote data plane can report them stopped
 // until it acts on the start. Every stopped operation of a resuming apply is
 // one that start resumes, so it reads as resuming; rendered stopped, it would
-// ask the operator for the start they already sent. Operations of an apply in
-// any other state are returned as they are.
+// ask the operator for the start they already sent. One the stop reached
+// before it began has nothing to resume: the start runs it in its turn, so it
+// reads as still to run, behind the members ahead of it. Operations of an
+// apply in any other state are returned as they are.
 func ResumeClaimed(applyState string, ops []Operation) []Operation {
 	if !state.IsState(applyState, state.Apply.Resuming) {
 		return ops
 	}
 	claimed := slices.Clone(ops)
 	for i := range claimed {
-		if claimed[i].State == state.ApplyOperation.Stopped {
-			claimed[i].State = state.ApplyOperation.Resuming
+		if claimed[i].State != state.ApplyOperation.Stopped {
+			continue
 		}
+		if claimed[i].NeverStarted {
+			claimed[i].State = state.ApplyOperation.Pending
+			continue
+		}
+		claimed[i].State = state.ApplyOperation.Resuming
 	}
 	return claimed
 }
