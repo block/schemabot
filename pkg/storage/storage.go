@@ -265,6 +265,11 @@ type CheckStore interface {
 	// hold the values stored.
 	BlockStaleStartedApply(ctx context.Context, check *Check, headSHA string) (bool, error)
 
+	// MarkPlanPending inserts a blocking placeholder or invalidates a successful
+	// result before retrying a failed plan. Existing blocking state and apply
+	// ownership are preserved; only a replacement result may restore success.
+	MarkPlanPending(ctx context.Context, check *Check) error
+
 	// ClearAggregateBlock clears the blocking reason on stored aggregate check
 	// state after the PR-level guards re-verified that the blocking condition
 	// no longer applies. The update is conditional on the head SHA and blocking
@@ -706,8 +711,13 @@ type ApplyStore interface {
 	// operations of the apply are not keyed that way, and the reverse, so one
 	// target's work can never attach under two keys. An attach to an apply
 	// whose work a newer generation took over (Apply.SupersededBy) fails with
-	// ErrApplyTakenOver. On success the operation's ID and every
-	// task's ID and ApplyOperationID are populated.
+	// ErrApplyTakenOver. Each apply named in apply.TakesOverApplyIDs is stamped
+	// with apply's identifier as its SupersededBy marker in the same
+	// transaction, with the write-once semantics of MarkSuperseded: a holder an
+	// earlier successor already stamped is left alone. A holder that does not
+	// exist, equals apply itself, or whose stamp does not land fails the attach
+	// and leaves neither the operation nor any marker. On success the operation's
+	// ID and every task's ID and ApplyOperationID are populated.
 	AttachOperationWithTasks(ctx context.Context, apply *Apply, operation *ApplyOperation, tasks []*Task) error
 
 	// Get returns an apply by ID, or nil if not found.
@@ -910,11 +920,12 @@ type ApplyStore interface {
 	// a self-referential handoff would refuse the apply forever while pointing
 	// the operator back at the refused apply itself.
 	//
-	// A dispatch that creates its successor records the takeover through
-	// Apply.TakesOverApplyIDs on the create, in the creating transaction, rather
-	// than with this method: the marker then never names an apply that does not
-	// exist, and no takeover is left without its marker. This method is for a
-	// takeover recorded after the fact. The marker does not carry the window
+	// A dispatch that creates its successor, or attaches an operation to an
+	// existing apply, records the takeover through Apply.TakesOverApplyIDs on that
+	// create or attach, in its transaction, rather than with this method: the
+	// marker then never names an apply that does not exist, and no takeover is
+	// left without its marker. This method is for a takeover recorded after the
+	// fact. The marker does not carry the window
 	// alone: while the successor is active, a claim on the handed-off apply is
 	// refused by the claim-time one-active-apply re-check; the marker is what
 	// keeps refusing once the successor settles and that re-check has nothing
@@ -1018,7 +1029,9 @@ type ApplyStore interface {
 	// resumable stop keeps completed_at NULL) but whose progress comment was
 	// never followed by a summary comment — no summary marker exists, the
 	// marker is superseded (a stop's summary consumed by a resume rotation, so
-	// the current terminal state's summary was never posted), or only a claim
+	// the current terminal state's summary was never posted), the posted
+	// marker records a state other than the apply's current one (a summary of
+	// an earlier terminal state, or one a resume rotated past), or only a claim
 	// sentinel stale for longer than SummaryClaimStaleAfter remains from a
 	// publisher that crashed before posting. "Recently" is MissingSummaryLookback.
 	// An apply qualifies only once it has been terminal for at least settledFor,
@@ -1359,17 +1372,39 @@ type ApplyCommentStore interface {
 	ClearPendingFreeze(ctx context.Context, applyID int64, commentState string) error
 
 	// ClaimSummaryComment atomically claims the right to publish the terminal
-	// summary comment for an apply by inserting the summary marker as a claim
-	// sentinel (github_comment_id = 0). A superseded marker — a stop's summary
-	// consumed by a resume rotation — does not block the claim: it is converted
-	// back into a claim sentinel, since the summary it recorded belongs to an
-	// earlier terminal state. Exactly one caller wins per terminal state: the
-	// winner posts the summary and records the real comment ID via Upsert; every
-	// loser skips. The claim — not the apply lease — is the exactly-once
-	// authority for the summary, so a writer whose lease was re-claimed (stop
+	// summary comment for an apply in terminalState by inserting the summary
+	// marker as a claim sentinel (github_comment_id = 0). A marker that records
+	// a summary posted for an earlier terminal state does not block the claim:
+	// it is converted back into a claim sentinel. That is a marker a resume
+	// rotation superseded, or an active marker whose SummarizedState names a
+	// different terminal state the apply can leave, such as a stop's summary
+	// when the started apply completes before any rotation consumed it. A
+	// marker for a settled state blocks every claim, since that outcome is
+	// final and a claim for another state comes from a stale read. An active
+	// marker for a different state converts only while the apply is still in
+	// terminalState, so a claim read before the apply was started again cannot
+	// record a summary of a state the apply has left. Exactly one caller wins
+	// per terminal state: the winner posts the summary and records
+	// the real comment ID and the state it describes via Upsert; every loser
+	// skips. The claim — not the apply lease — is the exactly-once authority
+	// for the summary, so a writer whose lease was re-claimed (stop
 	// reconciliation, resume) can still be beaten to the post without a
 	// duplicate. Returns true when this caller won the claim.
-	ClaimSummaryComment(ctx context.Context, applyID int64) (bool, error)
+	ClaimSummaryComment(ctx context.Context, applyID int64, terminalState string) (bool, error)
+
+	// SettleSummaryForResume settles the summary marker a resume rotation
+	// rotated for, in one write decided under a lock on the apply row, and
+	// reports what it did. It touches the marker only while the marker is
+	// active and still records githubCommentID: a terminal publish that came
+	// after the summary the rotation saw owns the marker from then on. While
+	// the apply is active it consumes the marker, so the apply's next terminal
+	// publish claims a fresh summary. Once the apply has reached its next
+	// terminal state it marks the marker SummaryRotatedPast instead: consuming
+	// it would leave the next resume nothing to rotate on, and leaving it
+	// as it was would block the summary that state is owed. With a lease in
+	// context the write requires it, and a lost lease surfaces as
+	// ErrApplyLeaseLost.
+	SettleSummaryForResume(ctx context.Context, applyID int64, githubCommentID int64) (ResumeSummarySettlement, error)
 
 	// ReclaimStaleSummaryClaim takes over a summary claim sentinel whose holder
 	// crashed between claiming and posting: a sentinel (github_comment_id = 0)
@@ -1594,7 +1629,9 @@ type ApplyOperationStore interface {
 	// needs work. A row claimed from pending or stopped is returned with the
 	// state it was claimed from, which is how the caller tells a claim that
 	// starts an operation from a retry or a recovery.
-	FindNextApplyOperation(ctx context.Context, owner string) (*ApplyOperation, error)
+	//
+	// opts narrow what the claim may match; see OperationClaimFilter.
+	FindNextApplyOperation(ctx context.Context, owner string, opts ...OperationClaimOption) (*ApplyOperation, error)
 
 	// FindNextApplyOperationCutover atomically claims the next operation parked
 	// at the cutover barrier that no earlier sibling holds, and rotates a fresh
@@ -1810,6 +1847,13 @@ type ControlRequestStore interface {
 
 	// GetPending returns the pending request for an apply operation.
 	GetPending(ctx context.Context, applyID int64, operation ControlOperation) (*ApplyControlRequest, error)
+
+	// ListPending returns every pending request for an apply, ordered by
+	// operation ascending, or an empty result when none is pending. A drive
+	// that checks several operations on each poll reads them here once rather
+	// than once per operation; the ordering is lowercase ASCII and so the same
+	// on every dialect, as ListSettled notes.
+	ListPending(ctx context.Context, applyID int64) ([]*ApplyControlRequest, error)
 
 	// GetByOperation returns the request for an apply operation regardless of
 	// status (nil if none). Unlike GetPending it does not filter on status, so

@@ -3114,6 +3114,35 @@ func (c *LocalClient) attachDispatchOperation(ctx context.Context, req *ternv1.A
 		return nil, fmt.Errorf("no engine configured for type: %s", c.config.Type)
 	}
 
+	// The plan row was drift-checked against the creating dispatch's shard at
+	// most, so a sibling shard is checked against its own live schema before
+	// its work is admitted, and runs this shard's rendering of the change.
+	// This runs before the blocked and unsafe-change gates so they judge the
+	// verdicts this shard's re-plan set.
+	if scope.shard != "" {
+		if err := c.verifyAttachedShardDispatch(ctx, req, apply, operationKey, &scope); err != nil {
+			return c.replayConcurrentAttachOrFail(ctx, req, apply, operationKey,
+				fmt.Errorf("attach operation %s to apply %s: %w", operationKey, apply.ApplyIdentifier, err))
+		}
+	}
+
+	// The plan row's blocked verdict was judged before this attach, but a
+	// shard's re-plan can block a change the plan row did not. No opt-in makes
+	// a statement the engine refuses executable, so the scope is refused
+	// before any operation or task row exists.
+	if err := storage.BlockedChangeError(plan.PlanIdentifier, scope.ddlChanges); err != nil {
+		c.logger.Warn("Apply: refusing operation whose re-planned scope holds a blocked change; dispatch is rejected",
+			append(apply.LogAttrs(),
+				"operation_key", operationKey,
+				"idempotency_key", req.IdempotencyKey,
+				"shard", scope.shard,
+				"error", err)...)
+		return &ternv1.ApplyResponse{
+			Accepted:     false,
+			ErrorMessage: err.Error(),
+		}, nil
+	}
+
 	applyOpts := storage.ApplyOptionsFromMap(req.Options)
 	applyOpts.Target = plan.Target
 	applyOpts.DirectExecution = DirectExecutionPolicyFromProto(req.GetDirectExecution())
@@ -3150,6 +3179,14 @@ func (c *LocalClient) attachDispatchOperation(ctx context.Context, req *ternv1.A
 		UpdatedAt:     now,
 	}
 
+	// The stopped applies whose resting copies this dispatch meets are stamped
+	// as taken over in the transaction that attaches the operation, so the
+	// handoff is durable exactly when the attach is: a stamp that cannot be
+	// written fails the attach, and the dispatch is retried whole rather than
+	// leaving a stopped apply that a later start would replay.
+	takeovers := c.supersededTakeovers(apply, releasedHolders, scope.ddlChanges)
+	apply.TakesOverApplyIDs = takeoverApplyIDs(takeovers)
+
 	err = c.storage.Applies().AttachOperationWithTasks(ctx, apply, operation, tasks)
 	switch {
 	case errors.Is(err, storage.ErrApplyOperationExists):
@@ -3162,12 +3199,7 @@ func (c *LocalClient) attachDispatchOperation(ctx context.Context, req *ternv1.A
 		if winner == nil {
 			return nil, fmt.Errorf("operation %s of apply %s exists per the unique index but was not found on re-read", operationKey, apply.ApplyIdentifier)
 		}
-		c.logger.Info("Apply: concurrent attach won the operation insert; replaying the winner's row",
-			append(apply.LogAttrs(),
-				"operation_key", operationKey,
-				"idempotency_key", req.IdempotencyKey)...)
-		metrics.RecordRemoteApplyAttach(ctx, req.Database, req.Environment, "attach_race")
-		return dispatchApplyResponse(apply, winner.ID, operationKey), nil
+		return c.replayConcurrentAttachWinner(ctx, req, apply, winner, operationKey, "operation insert"), nil
 	case errors.Is(err, storage.ErrApplyNotActive):
 		return c.refuseAttachToTerminalApply(ctx, req, apply, operationKey), nil
 	case errors.Is(err, storage.ErrApplyOperationKeyingMismatch):
@@ -3178,7 +3210,7 @@ func (c *LocalClient) attachDispatchOperation(ctx context.Context, req *ternv1.A
 		return nil, fmt.Errorf("attach operation %s to apply %s: %w", operationKey, apply.ApplyIdentifier, err)
 	}
 
-	c.markSupersededHolders(ctx, apply, releasedHolders, scope.ddlChanges)
+	c.announceSupersededTakeovers(ctx, apply, takeovers)
 
 	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventInfo, storage.LogSourceSchemaBot,
 		fmt.Sprintf("Operation attached: %s", operationKey), "", apply.State)
@@ -3191,6 +3223,43 @@ func (c *LocalClient) attachDispatchOperation(ctx context.Context, req *ternv1.A
 	c.wakeOperatorForQueuedApply(apply)
 
 	return dispatchApplyResponse(apply, operation.ID, operationKey), nil
+}
+
+// replayConcurrentAttachWinner resolves a dispatch that lost a race to a
+// concurrent attach of the same operation to the winner's row, as the replay
+// of an already-seen dispatch does. lostAt names the step where this dispatch
+// found the winner.
+func (c *LocalClient) replayConcurrentAttachWinner(ctx context.Context, req *ternv1.ApplyRequest, apply *storage.Apply, winner *storage.ApplyOperation, operationKey, lostAt string) *ternv1.ApplyResponse {
+	c.logger.Info("Apply: a concurrent attach of this operation won; replaying the winner's row",
+		append(apply.LogAttrs(),
+			"operation_key", operationKey,
+			"idempotency_key", req.IdempotencyKey,
+			"lost_at", lostAt)...)
+	metrics.RecordRemoteApplyAttach(ctx, req.Database, req.Environment, "attach_race")
+	return dispatchApplyResponse(apply, winner.ID, operationKey)
+}
+
+// replayConcurrentAttachOrFail settles a shard dispatch whose drift check
+// failed. A concurrent attach of the same operation can land between this
+// dispatch's operation lookup and its re-plan, and once its DDL has run the
+// re-plan no longer lists the change and reads as drift. The operation is
+// re-read, and when it exists the dispatch replays it; otherwise the
+// verification error stands.
+func (c *LocalClient) replayConcurrentAttachOrFail(ctx context.Context, req *ternv1.ApplyRequest, apply *storage.Apply, operationKey string, verifyErr error) (*ternv1.ApplyResponse, error) {
+	winner, err := c.findApplyOperationByKey(ctx, apply, operationKey)
+	if err != nil {
+		return nil, errors.Join(verifyErr, fmt.Errorf("re-read operation %s after its drift check failed: %w", operationKey, err))
+	}
+	if winner == nil {
+		c.logger.Warn("Apply: refusing shard dispatch whose drift check failed; dispatch is rejected",
+			append(apply.LogAttrs(),
+				"operation_key", operationKey,
+				"idempotency_key", req.IdempotencyKey,
+				"shard", req.GetTargetShards(),
+				"error", verifyErr)...)
+		return nil, verifyErr
+	}
+	return c.replayConcurrentAttachWinner(ctx, req, apply, winner, operationKey, "drift check"), nil
 }
 
 // refuseAttachKeyingMismatch rejects an attach whose key shape disagrees with

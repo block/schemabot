@@ -1524,6 +1524,21 @@ func PreviewCommentReviewRequiredStaleApprovalOtherBranch() string {
 	})
 }
 
+// PreviewCommentReviewRequiredChangedBase renders the rejection of an
+// earlier approval when identical files have different merge-base versions.
+func PreviewCommentReviewRequiredChangedBase() string {
+	return RenderReviewRequired(ReviewGateData{
+		Database:          "testapp",
+		Environment:       "staging",
+		RequestedBy:       previewRequestedBy,
+		OperatorReviewers: []string{"acme/testapp-operators"},
+		OtherReviewers:    []string{"acme/schema-reviewers", "jdoe"},
+		PRAuthor:          previewRequestedBy,
+		ChangedApprovers:  []string{"jdoe"},
+		ChangedBasePaths:  []string{"schema/testapp/orders.sql"},
+	})
+}
+
 // PreviewCommentReviewGateError renders a sample review gate error comment (fail-closed).
 func PreviewCommentReviewGateError() string {
 	return RenderGenericError(SchemaErrorData{

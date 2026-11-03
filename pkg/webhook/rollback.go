@@ -845,7 +845,7 @@ func (h *Handler) rollbackConfirmCommandCore(parent context.Context, repo string
 			"apply_id", applyResp.ApplyID)
 		return false, nil
 	}
-	if err := h.updateCheckRecordForApplyStart(ctx, client, repo, pr, schemaResult, environment, apply); err != nil {
+	if err := h.updateCheckRecordForApplyStart(ctx, client, repo, pr, schemaResult, environment, apply, applyChangeSummary{}); err != nil {
 		h.logger.Error("failed to mark check in_progress for rollback",
 			append(apply.LogAttrs(), "error", err)...)
 		h.postCommandError(repo, pr, installationID, action.RollbackConfirm, environment, requestedBy, "Rollback was accepted, but SchemaBot could not update the required status check: "+err.Error())

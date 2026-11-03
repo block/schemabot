@@ -69,13 +69,8 @@ func (m WatchModel) progressSections() (string, string) {
 	// Status line with spinner for active states
 	// Note: spinner.Dot already includes trailing space
 	switch {
-	case m.stopTriggered && !state.IsState(m.state, state.Apply.Stopped, state.Apply.Cancelled):
-		// Stop/cancel has been triggered but state hasn't updated yet
-		if m.isPlanetScale() {
-			b.WriteString(m.spinner.View() + "Cancelling...\n")
-		} else {
-			b.WriteString(m.spinner.View() + "Stopping...\n")
-		}
+	case m.stopAwaitingConfirmation():
+		b.WriteString(m.spinner.View() + m.stopPendingLabel() + "\n")
 	case effectivelyStopped:
 		// Don't show status line - stopped message comes after tables
 	case state.IsState(m.state, state.Apply.Running) && !m.cutoverTriggered && !m.deployTriggered:
@@ -175,6 +170,10 @@ func (m WatchModel) progressSections() (string, string) {
 		f.WriteString("\n\n")
 		f.WriteString("🚫 Schema change cancelled.\n")
 		f.WriteString("The deploy request has been cancelled. Start a new apply to retry.\n")
+	case state.IsState(m.state, state.Apply.Reverted):
+		f.WriteString("\n\n")
+		f.WriteString("↩️ Schema change reverted.\n")
+		f.WriteString("The schema change was undone after cutover. Start a new apply to make it again.\n")
 	case state.IsState(m.state, state.Apply.Reverting):
 		f.WriteString("\n\n")
 		f.WriteString(m.spinner.View() + "Reverting — undoing the schema change...\n")
@@ -199,7 +198,7 @@ func (m WatchModel) progressSections() (string, string) {
 		f.WriteString(templates.FormatApplyStopped())
 		f.WriteString("\n")
 		if m.applyID != "" {
-			fmt.Fprintf(&f, "Use '%s' to resume.\n", cliname.Command("start", "-e", m.environment, m.applyID))
+			f.WriteString(templates.FormatNextCommand(templates.ResumeLabel, templates.ControlCommand("start", m.applyID, m.environment)))
 		} else {
 			fmt.Fprintf(&f, "Use '%s' to find the apply ID.\n", cliname.Command("status", "-d", m.database, "-e", m.environment))
 		}
@@ -207,7 +206,7 @@ func (m WatchModel) progressSections() (string, string) {
 		// During cutover, show minimal footer - no detach/stop allowed
 		f.WriteString("\n\n")
 		dimStyle := lipgloss.NewStyle().Faint(true)
-		f.WriteString(dimStyle.Render("Cutover in progress - please wait..."))
+		f.WriteString(dimStyle.Render(cutoverInProgressFooter))
 		f.WriteString("\n")
 	case m.deployTriggered:
 		f.WriteString("\n\n")
@@ -227,7 +226,7 @@ func (m WatchModel) progressSections() (string, string) {
 			f.WriteString("Press Enter to deploy or proceed via the PlanetScale console (ESC to detach)\n")
 		} else {
 			if m.applyID != "" {
-				fmt.Fprintf(&f, "To proceed: %s\n", cliname.Command("start", "-e", m.environment, m.applyID))
+				fmt.Fprintf(&f, "To proceed: %s\n", templates.ControlCommand("start", m.applyID, m.environment))
 			} else {
 				fmt.Fprintf(&f, "To find the apply ID: %s\n", cliname.Command("status", "-d", m.database, "-e", m.environment))
 			}
@@ -241,7 +240,7 @@ func (m WatchModel) progressSections() (string, string) {
 			f.WriteString("Press Enter to proceed with cutover (or ESC to detach)\n")
 		} else {
 			if m.applyID != "" {
-				fmt.Fprintf(&f, "To proceed: %s\n", cliname.Command("cutover", "-e", m.environment, m.applyID))
+				fmt.Fprintf(&f, "To proceed: %s\n", templates.ControlCommand("cutover", m.applyID, m.environment))
 			} else {
 				fmt.Fprintf(&f, "To find the apply ID: %s\n", cliname.Command("status", "-d", m.database, "-e", m.environment))
 			}
@@ -331,6 +330,10 @@ func (m WatchModel) renderTables(b *strings.Builder, tables []templates.TablePro
 	}
 }
 
+// cutoverInProgressFooter replaces the keys a watcher offers while a cutover is
+// underway, since it ignores them until the cutover lands.
+const cutoverInProgressFooter = "Cutover in progress - please wait..."
+
 // formatFooter returns the standard footer.
 func (m WatchModel) formatFooter() string {
 	dimStyle := lipgloss.NewStyle().Faint(true)
@@ -342,6 +345,21 @@ func (m WatchModel) formatFooter() string {
 }
 
 // isPlanetScale returns true if the current apply is using the PlanetScale engine.
+// stopAwaitingConfirmation reports whether the operator pressed s and the
+// server has not yet reported the apply stopped or cancelled.
+func (m WatchModel) stopAwaitingConfirmation() bool {
+	return m.stopTriggered && !state.IsState(m.state, state.Apply.Stopped, state.Apply.Cancelled)
+}
+
+// stopPendingLabel names what the s key requested: PlanetScale cancels the
+// deploy request, every other engine stops the copy at its checkpoint.
+func (m WatchModel) stopPendingLabel() string {
+	if m.isPlanetScale() {
+		return "Cancelling..."
+	}
+	return "Stopping..."
+}
+
 func (m WatchModel) isPlanetScale() bool {
 	return strings.EqualFold(m.engine, "PlanetScale") || strings.EqualFold(m.engine, "planetscale")
 }
@@ -373,9 +391,9 @@ func (m WatchModel) detachedView() string {
 	if m.applyID != "" {
 		fmt.Fprintf(&b, "To reattach: %s\n", templates.ProgressCommand(m.applyID, m.environment))
 		if state.IsState(m.state, state.Apply.WaitingForDeploy) {
-			fmt.Fprintf(&b, "To deploy:   %s\n", cliname.Command("start", "-e", m.environment, m.applyID))
+			fmt.Fprintf(&b, "To deploy:   %s\n", templates.ControlCommand("start", m.applyID, m.environment))
 		}
-		fmt.Fprintf(&b, "To stop:     %s\n", cliname.Command("stop", "-e", m.environment, m.applyID))
+		fmt.Fprintf(&b, "To stop:     %s\n", templates.ControlCommand("stop", m.applyID, m.environment))
 	} else {
 		fmt.Fprintf(&b, "Find apply:  %s\n", cliname.Command("status", "-d", m.database, "-e", m.environment))
 	}

@@ -707,6 +707,14 @@ const (
 )
 
 func (s *Service) cutoverRequestReadiness(ctx context.Context, client tern.Client, apply *storage.Apply, ternApplyID string, multiOp bool) (cutoverRequestReadiness, error) {
+	// The stored state is authoritative over the remote data plane: a schema
+	// change SchemaBot has already ended cannot be cut over, whatever the remote
+	// still reports.
+	if state.IsTerminalApplyState(apply.State) {
+		s.logger.Info("cutover request rejected because the schema change has already ended",
+			apply.LogAttrs()...)
+		return cutoverRequestNotReady, nil
+	}
 	if state.IsState(apply.State, state.Apply.WaitingForCutover) {
 		return cutoverRequestReady, nil
 	}

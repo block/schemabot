@@ -318,6 +318,15 @@ type Check struct {
 	// aggregate rows and for rows recorded before this field existed.
 	ChangeSummary string
 
+	// RolloutTargets and RolloutTargetsWithWork count the targets of a rollout
+	// of several and how many of them the change summary's work is on, so the
+	// aggregate title can say how far the change has rolled out. They are
+	// written with ChangeSummary and kept with it: a write that keeps the stored
+	// summary keeps the stored counts too. Zero when the summary describes no
+	// rollout of several targets.
+	RolloutTargets         int
+	RolloutTargetsWithWork int
+
 	// CreatedAt is when the check was created.
 	CreatedAt time.Time
 
@@ -1071,11 +1080,20 @@ func (p *Plan) BlockedChanges() []TableChange {
 // a blocked change. Keeping this with the whole-plan verdict ensures every
 // admission path gives the same remedy.
 func (p *Plan) BlockedApplyError() error {
-	blocked := p.BlockedChanges()
-	if len(blocked) == 0 {
+	return BlockedChangeError(p.PlanIdentifier, p.BlockedChanges())
+}
+
+// BlockedChangeError returns the whole-plan refusal for the first blocked
+// change among changes of the named plan, or nil when none is blocked. An
+// admission path judging a subset of a plan's changes, such as a shard
+// dispatch's re-planned scope, refuses with it so it gives the same remedy as
+// BlockedApplyError.
+func BlockedChangeError(planIdentifier string, changes []TableChange) error {
+	i := slices.IndexFunc(changes, TableChange.EngineBlocked)
+	if i < 0 {
 		return nil
 	}
-	change := blocked[0]
+	change := changes[i]
 	reason := change.ModeReason
 	if reason == "" {
 		reason = "the engine refuses this statement"
@@ -1083,9 +1101,9 @@ func (p *Plan) BlockedApplyError() error {
 	// Independent causes are listed one per line so an operator fixing the
 	// first is not surprised by the second on the next attempt.
 	if causes := engine.BlockedCauses(reason); len(causes) > 1 {
-		return fmt.Errorf("stored plan %s contains a blocked change for table %q:\n- %s", p.PlanIdentifier, change.Table, strings.Join(causes, "\n- "))
+		return fmt.Errorf("stored plan %s contains a blocked change for table %q:\n- %s", planIdentifier, change.Table, strings.Join(causes, "\n- "))
 	}
-	return fmt.Errorf("stored plan %s contains a blocked change for table %q: %s", p.PlanIdentifier, change.Table, reason)
+	return fmt.Errorf("stored plan %s contains a blocked change for table %q: %s", planIdentifier, change.Table, reason)
 }
 
 // HasOriginalFilesCapture reports whether every stored namespace has an
@@ -1181,10 +1199,12 @@ type Apply struct {
 
 	// TakesOverApplyIDs names the stopped applies whose unfinished work this
 	// apply takes over, by row ID. It is read only when the apply is created
-	// through CreateWithTasksAndOperations or CreateWithGroupedOperations, which
-	// stamp each named apply's SupersededBy with this apply's identifier in the
-	// transaction that creates it, so the apply and the handoff become visible
-	// together or not at all. It is never stored on the new apply's own row.
+	// through CreateWithTasksAndOperations or CreateWithGroupedOperations, or
+	// when an operation is attached to it through AttachOperationWithTasks. Those
+	// paths stamp each named apply's SupersededBy with this apply's identifier in the
+	// transaction that creates the apply or attaches the operation, so the work
+	// and the handoff become visible together or not at all. It is never stored
+	// on this apply's own row.
 	TakesOverApplyIDs []int64
 
 	// Engine is the schema change engine: "spirit", "planetscale", etc.
@@ -2168,6 +2188,35 @@ type TaskFilter struct {
 	Since            time.Time // Only tasks started after this time (optional)
 }
 
+// SummaryRotatedPast is the SummarizedState of a summary marker a resume
+// rotation rotated past after the apply had already reached its next terminal
+// state, so the summary it records describes no state the apply is in. The
+// marker stays active, so the next resume still rotates on it, but it names no
+// terminal state: the publish of the state the apply reached reclaims it, and
+// summary reconciliation posts that summary when the publish already lost its
+// claim to the marker.
+const SummaryRotatedPast = "rotated_past"
+
+// ResumeSummarySettlement is what a resume rotation's write did to the summary
+// marker it rotated for.
+type ResumeSummarySettlement int
+
+const (
+	// ResumeSummaryLeftInPlace means the marker no longer records the summary
+	// the rotation rotated for: it was already consumed, or a later terminal
+	// publish has claimed or posted it. The write left it alone.
+	ResumeSummaryLeftInPlace ResumeSummarySettlement = iota
+	// ResumeSummaryConsumed means the apply was still active, so the write
+	// superseded the marker and the apply's next terminal publish claims a
+	// fresh summary.
+	ResumeSummaryConsumed
+	// ResumeSummaryRotatedPast means the apply had already reached its next
+	// terminal state, so the write marked the marker SummaryRotatedPast: it
+	// stays active for the next resume and no longer blocks that state's
+	// summary.
+	ResumeSummaryRotatedPast
+)
+
 // ApplyComment tracks a GitHub PR comment associated with an apply.
 type ApplyComment struct {
 	// ID is the unique identifier (BIGINT AUTO_INCREMENT).
@@ -2221,6 +2270,17 @@ type ApplyComment struct {
 	// the GitHub comment are kept; SchemaBot just no longer treats it as the active
 	// comment for its state. Nil means active.
 	SupersededAt *time.Time
+
+	// SummarizedState is, on the summary marker, the terminal apply state its
+	// posted summary describes. A stopped apply can be started and reach
+	// another terminal state, and the marker of the stop's summary can still
+	// be active when it does, so the state is what tells the summary the
+	// current terminal state is owed from one already posted for it.
+	// SummaryRotatedPast when a resume rotated past the summary after the
+	// apply had already reached its next terminal state. Nil on other comment
+	// states, on a claim sentinel, and on a marker recorded before the state
+	// was tracked.
+	SummarizedState *string
 
 	// CreatedAt is when the comment was first posted.
 	CreatedAt time.Time

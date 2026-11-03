@@ -1334,6 +1334,27 @@ func (s *applyOperationStore) driverCapClause(staleClaimCutoff string) (string, 
 	return clause, append(stringArgs(occupyingStates), s.maxDriversPerApply)
 }
 
+// deferredCutoverWorkExclusion returns the predicate FindNextApplyOperation
+// adds to each arm that starts, resumes, or recovers an operation when filter
+// skips deferred-cutover work, or "" when it does not. It matches operations
+// whose apply defers its cutover, read from the same applies.options key the
+// cutover claim reads. The arms that only deliver a stop or cancel request
+// leave it out, so a driver skipping deferred work can still end it.
+//
+// The fragment begins with AND and binds no arguments.
+func (s *applyOperationStore) deferredCutoverWorkExclusion(filter storage.OperationClaimFilter) string {
+	if !filter.SkipDeferredCutoverWork {
+		return ""
+	}
+	return `
+				AND NOT EXISTS (
+					SELECT 1
+					FROM applies AS deferred
+					WHERE deferred.id = apply_operations.apply_id
+						AND ` + s.dialect.JSONBooleanIsTrue("deferred.options", []string{"defer_cutover"}) + `
+				)`
+}
+
 // cutoverPhaseOperationStates lists the operation states a driver occupies
 // while it cuts an operation over. The cutover claim caps these on their own
 // lane (cutoverCapClause) rather than against every occupying state, so an
@@ -1485,7 +1506,7 @@ func releasedFailureExemptionArgs() []any {
 // lets one wide fan-out hold every driver on the plane for as long as its
 // slowest operation runs, so the pending arm is additionally capped at
 // maxDriversPerApply fresh leases per apply (see freshLeaseCountSQL).
-func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner string) (*storage.ApplyOperation, error) {
+func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner string, opts ...storage.OperationClaimOption) (*storage.ApplyOperation, error) {
 	if owner == "" {
 		return nil, fmt.Errorf("operator owner is required to claim apply_operation: %w", storage.ErrApplyLeaseLost)
 	}
@@ -1500,6 +1521,10 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 	parentClaimable := claimableParentSQL(placeholders(len(terminalApplyStates())))
 	staleClaimCutoff := s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime, LiteralIntervalAmount(uint64(storage.ApplyLeaseStaleAfter.Microseconds())), IntervalMicrosecond)
 	driverCap, driverCapArgs := s.driverCapClause(staleClaimCutoff)
+	// notDeferred is empty unless the claim skips deferred-cutover work. It
+	// binds no arguments, so adding it to an arm leaves every placeholder's
+	// position unchanged.
+	notDeferred := s.deferredCutoverWorkExclusion(storage.BuildOperationClaimFilter(opts...))
 
 	queryArgs := []any{state.ApplyOperation.Pending}
 	// Member-order gate for the pending claim (operationStartGateSQL): a work
@@ -1754,7 +1779,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 						AND cr.status = ?
 				)
 				AND `+parentClaimable+`
-				AND `+driverCap+`
+				AND `+driverCap+notDeferred+`
 			)
 			OR (
 				state IN (%s)
@@ -1768,7 +1793,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 						WHERE sibling.apply_id = apply_operations.apply_id
 							AND sibling.id <> apply_operations.id
 					)
-				)
+				)`+notDeferred+`
 			)
 			OR (
 				state = ?
@@ -1789,7 +1814,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 						AND `+parentClaimable+`
 					)
 				)
-				AND `+driverCap+`
+				AND `+driverCap+notDeferred+`
 			)
 			OR (
 				state = ?
@@ -1836,7 +1861,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 						AND cr.status = ?
 						AND `+deferredDeployGuard+`
 				)
-				AND `+driverCap+`
+				AND `+driverCap+notDeferred+`
 			)
 			OR (
 				state = ?
@@ -1864,7 +1889,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 								AND apply_operations.updated_at < %s
 							)
 						)
-				)
+				)`+notDeferred+`
 			)
 		)
 		ORDER BY created_at, id

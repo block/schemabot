@@ -11,7 +11,11 @@ def main():
     try:
         # Confirmation is buffered until the command reads it. Keep the master
         # open so the automatic watcher can use the same terminal afterward.
-        os.write(master, b"yes\n")
+        # A command that asks for no confirmation is given no input, since the
+        # watcher would read it as key presses.
+        answer = os.environ.get("CLI_DEMO_INPUT", "yes\n")
+        if answer:
+            os.write(master, answer.encode())
         result = subprocess.run(
             sys.argv[1:], stdin=slave, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, timeout=20, check=False,

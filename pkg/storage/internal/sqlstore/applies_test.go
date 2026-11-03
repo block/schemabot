@@ -3800,12 +3800,12 @@ func TestApplyStore_FindMissingSummaryComment_SummaryClaimSentinels(t *testing.T
 	store := NewMySQL(testDB)
 
 	freshClaim := seedApplyMissingSummary(t, store, "apply_claim_fresh", state.Apply.Completed, 710)
-	won, err := store.ApplyComments().ClaimSummaryComment(ctx, freshClaim.ID)
+	won, err := store.ApplyComments().ClaimSummaryComment(ctx, freshClaim.ID, state.Apply.Completed)
 	require.NoError(t, err)
 	require.True(t, won)
 
 	staleClaim := seedApplyMissingSummary(t, store, "apply_claim_stale", state.Apply.Completed, 711)
-	won, err = store.ApplyComments().ClaimSummaryComment(ctx, staleClaim.ID)
+	won, err = store.ApplyComments().ClaimSummaryComment(ctx, staleClaim.ID, state.Apply.Completed)
 	require.NoError(t, err)
 	require.True(t, won)
 	backdateSummaryClaim(t, staleClaim.ID)

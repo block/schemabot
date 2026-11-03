@@ -5011,27 +5011,10 @@ func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply
 				return stopErr
 			}
 		case <-ticker.C:
-			if standDown, err := c.processPendingCancelOrStopControlRequest(ctx, apply, scope); err != nil {
-				logger.WarnContext(ctx, "pending gRPC stop request processing failed; current apply owner will exit for operator retry",
-					append(apply.MutableLogAttrs(), "error", err)...)
+			if standDown, err := c.processPendingControlRequestsAtPoll(ctx, apply, scope); err != nil {
 				return err
 			} else if standDown {
 				return nil
-			}
-			if err := c.processPendingCutoverControlRequest(ctx, apply, scope); err != nil {
-				logger.WarnContext(ctx, "pending gRPC cutover request processing failed; current apply owner will exit for operator retry",
-					append(apply.MutableLogAttrs(), "error", err)...)
-				return err
-			}
-			if err := c.processPendingSkipRevertControlRequest(ctx, apply, scope.remoteApplyID(apply)); err != nil {
-				logger.WarnContext(ctx, "pending gRPC skip-revert request processing failed; current apply owner will exit for operator retry",
-					append(apply.MutableLogAttrs(), "error", err)...)
-				return err
-			}
-			if err := c.processPendingRevertControlRequest(ctx, apply, scope.remoteApplyID(apply)); err != nil {
-				logger.WarnContext(ctx, "pending gRPC revert request processing failed; current apply owner will exit for operator retry",
-					append(apply.MutableLogAttrs(), "error", err)...)
-				return err
 			}
 
 			// Poll progress from remote Tern
@@ -5180,6 +5163,56 @@ func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply
 			}
 		}
 	}
+}
+
+// processPendingControlRequestsAtPoll answers the control requests a remote
+// drive consumes on each progress poll: cancel or stop, then cutover,
+// skip-revert, and revert. The apply's pending requests are read once, and
+// only the processors for operations found pending run, each loading its own
+// request again before acting on it. standDown reports that a cancel or stop
+// is settling the apply and the drive should exit. An error means the drive
+// exits for the operator to retry, leaving the request pending.
+func (c *GRPCClient) processPendingControlRequestsAtPoll(ctx context.Context, apply *storage.Apply, scope applyTaskScope) (standDown bool, err error) {
+	logger := c.applyLogger(apply)
+	pending, err := loadPendingControlOperations(ctx, c.storage, apply)
+	if err != nil {
+		logger.WarnContext(ctx, "pending gRPC control request read failed; current apply owner will exit for operator retry",
+			append(apply.MutableLogAttrs(), "error", err)...)
+		return false, err
+	}
+	if pending.has(storage.ControlOperationCancel, storage.ControlOperationStop) {
+		standDown, err := c.processPendingCancelOrStopControlRequest(ctx, apply, scope)
+		if err != nil {
+			logger.WarnContext(ctx, "pending gRPC stop request processing failed; current apply owner will exit for operator retry",
+				append(apply.MutableLogAttrs(), "error", err)...)
+			return false, err
+		}
+		if standDown {
+			return true, nil
+		}
+	}
+	if pending.has(storage.ControlOperationCutover) {
+		if err := c.processPendingCutoverControlRequest(ctx, apply, scope); err != nil {
+			logger.WarnContext(ctx, "pending gRPC cutover request processing failed; current apply owner will exit for operator retry",
+				append(apply.MutableLogAttrs(), "error", err)...)
+			return false, err
+		}
+	}
+	if pending.has(storage.ControlOperationSkipRevert) {
+		if err := c.processPendingSkipRevertControlRequest(ctx, apply, scope.remoteApplyID(apply)); err != nil {
+			logger.WarnContext(ctx, "pending gRPC skip-revert request processing failed; current apply owner will exit for operator retry",
+				append(apply.MutableLogAttrs(), "error", err)...)
+			return false, err
+		}
+	}
+	if pending.has(storage.ControlOperationRevert) {
+		if err := c.processPendingRevertControlRequest(ctx, apply, scope.remoteApplyID(apply)); err != nil {
+			logger.WarnContext(ctx, "pending gRPC revert request processing failed; current apply owner will exit for operator retry",
+				append(apply.MutableLogAttrs(), "error", err)...)
+			return false, err
+		}
+	}
+	return false, nil
 }
 
 func terminalApplyStateFromRemoteTaskProgress(remoteTasks []*ternv1.TableProgress) (string, bool) {

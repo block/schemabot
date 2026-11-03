@@ -527,19 +527,10 @@ func (h *Handler) publishApplyAggregate(ctx context.Context, a *storage.Apply, f
 	return checkRecord, prInfo, true
 }
 
-// publishHeadCtx scopes the aggregate publish to the head the caller already
-// read, so the fold's own currency check is answered by that read instead of a
-// second one.
-//
-// Two independent reads of a mutable head can disagree, and the fold treats a
-// disagreement as a stale write: it skips the publish and arms a re-fold. That
-// re-fold only runs on an aggregate leader, so on every other repo a terminal
-// outcome caught in the gap is not published anywhere — it is dropped, with a
-// debug line as the only trace. One read closes the gap and costs one round
-// trip instead of two.
-//
-// A head GitHub did not report seeds nothing: an empty head cannot answer the
-// currency check, so the fold reads for itself as it otherwise would.
+// publishHeadCtx seeds the fold's initial currency check from the head the
+// terminal observer already read. The fold still re-verifies the head uncached
+// immediately before publication, and configured publishers retry a moving head.
+// An empty head seeds nothing, so the fold performs its own initial read.
 func publishHeadCtx(ctx context.Context, a *storage.Apply, prInfo *github.PullRequestInfo) context.Context {
 	if prInfo.HeadSHA == "" {
 		return ctx
@@ -883,7 +874,7 @@ func (h *Handler) ReconcileMissingSummaryComments(ctx context.Context) {
 // takeover path transfers it instead. Losing both means another writer posted
 // or is actively posting the summary, so the repair is skipped.
 func (h *Handler) claimSummaryForReconciliation(ctx context.Context, apply *storage.Apply) bool {
-	won, err := h.service.Storage().ApplyComments().ClaimSummaryComment(ctx, apply.ID)
+	won, err := h.service.Storage().ApplyComments().ClaimSummaryComment(ctx, apply.ID, apply.State)
 	if err != nil {
 		h.logger.Error("failed to claim summary comment for reconciliation; apply skipped until the next pass",
 			append(apply.LogAttrs(), "error", err)...)
@@ -930,10 +921,12 @@ func (h *Handler) postClaimedSummaryComment(ctx context.Context, apply *storage.
 
 	metrics.RecordSummaryCommentRepaired(ctx, apply.Repository, apply.State)
 
+	summarized := apply.State
 	marker := &storage.ApplyComment{
 		ApplyID:         apply.ID,
 		CommentState:    state.Comment.Summary,
 		GitHubCommentID: commentID,
+		SummarizedState: &summarized,
 	}
 	if err := h.service.Storage().ApplyComments().Upsert(ctx, marker); err != nil {
 		h.logger.Error("posted reconciled summary comment but failed to record its comment ID",

@@ -1015,7 +1015,10 @@ func (s *applyStore) CreateWithGroupedOperations(ctx context.Context, apply *sto
 // under an existing apply. The parent applies row is locked and re-read inside
 // the transaction so the attach cannot race a concurrent terminalization; the
 // apply's target reservation and idempotency key are untouched — the attach
-// adds work to the reservation the apply already holds.
+// adds work to the reservation the apply already holds. Each stopped apply
+// named in apply.TakesOverApplyIDs is stamped as taken over by this apply in the
+// same transaction (markTakenOver), after the target lock is held, so the
+// attached operation and the handoff become visible together or not at all.
 func (s *applyStore) AttachOperationWithTasks(ctx context.Context, apply *storage.Apply, operation *storage.ApplyOperation, tasks []*storage.Task) error {
 	if apply == nil {
 		return fmt.Errorf("attach operation: apply is nil")
@@ -1089,6 +1092,14 @@ func (s *applyStore) AttachOperationWithTasks(ctx context.Context, apply *storag
 			return fmt.Errorf("insert task %s for attached operation %s of apply %s: %w", task.TaskIdentifier, operation.OperationKey, apply.ApplyIdentifier, err)
 		}
 		task.ID = taskID
+	}
+	for _, holderID := range apply.TakesOverApplyIDs {
+		if holderID == apply.ID {
+			return fmt.Errorf("attach operation %s to apply %s: an apply cannot take over its own work", operation.OperationKey, apply.ApplyIdentifier)
+		}
+		if err := markTakenOver(ctx, writeTx.tx, holderID, apply.ApplyIdentifier); err != nil {
+			return err
+		}
 	}
 
 	if err := writeTx.commit(); err != nil {
@@ -1250,9 +1261,10 @@ func (s *applyStore) createWithRowsOnce(ctx context.Context, apply *storage.Appl
 }
 
 // markTakenOver records successor as the apply that took over a stopped apply's
-// unfinished work, in the transaction that creates the successor. It is the same
-// write-once superseded_by marker MarkSuperseded writes, so a failure here rolls
-// the successor's creation back and leaves no apply without its handoff.
+// unfinished work, in the transaction that creates the successor or attaches the
+// operation that takes the work over. It is the same write-once superseded_by
+// marker MarkSuperseded writes, so a failure here rolls the create or attach back
+// and leaves no takeover without its handoff.
 //
 // The first successor to record a handoff owns the marker. A holder already
 // stamped by an earlier successor is left alone and is not an error: the stopped
@@ -3435,10 +3447,12 @@ func (s *applyStore) GetByDatabase(ctx context.Context, database, dbType, enviro
 // terminal state recently but whose progress comment was never followed by a
 // summary comment. Used by summary reconciliation to post missing summaries.
 //
-// Three forms of "missing" qualify: no summary marker at all (the publisher
+// Four forms of "missing" qualify: no summary marker at all (the publisher
 // never ran); a superseded marker (a stop's summary consumed by a resume
 // rotation, so the summary for the current terminal state was never posted);
-// and a summary claim sentinel (github_comment_id = 0) stale for longer than
+// a posted marker whose summarized state is not the apply's state (a stop's
+// summary still active when the started apply reached its next terminal
+// state, or one a resume rotated past after it did); and a summary claim sentinel (github_comment_id = 0) stale for longer than
 // storage.SummaryClaimStaleAfter (the publisher claimed, then crashed before
 // posting). A fresh sentinel is an in-flight publish and is left alone.
 //
@@ -3476,6 +3490,7 @@ func (s *applyStore) FindMissingSummaryComment(ctx context.Context, settledFor t
 		  AND (
 			acs.id IS NULL
 			OR acs.superseded_at IS NOT NULL
+			OR (acs.github_comment_id != 0 AND acs.summarized_state IS NOT NULL AND acs.summarized_state != a.state)
 			OR (acs.github_comment_id = 0 AND acs.updated_at < `+s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime, ParameterIntervalAmount(), IntervalSecond)+`)
 		  )
 		  AND `+settled+`

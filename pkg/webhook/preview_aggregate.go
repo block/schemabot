@@ -1,6 +1,8 @@
 package webhook
 
 import (
+	"strings"
+
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/webhook/action"
@@ -70,6 +72,45 @@ func PreviewAggregateCheckStopped() string {
 	conclusion, _ := computeAggregate(checks, stopped)
 	title, summary := aggregateSummary(checks, conclusion, stopped)
 	return title + "\n\n" + summary
+}
+
+// PreviewAggregateCheckRollout renders the aggregate check of a production
+// environment rolled out to four targets, at three points of one rollout: an
+// apply narrowed to shop-002 has completed, a plan of the whole environment
+// then finds the change pending on the other three, and the apply of the rest
+// is running. The title and the row both say which targets the work is on, so
+// the merge box and the check answer how far the change has rolled out.
+func PreviewAggregateCheckRollout() string {
+	row := func(status, conclusion string, outcome reviewDriftOutcome) *storage.Check {
+		targets, withWork := outcome.work.rolloutCounts()
+		return &storage.Check{
+			DatabaseType: "mysql", DatabaseName: "orders", HasChanges: true,
+			Status: status, Conclusion: conclusion,
+			ChangeSummary: outcome.changeSummary("1 alter"), RolloutTargets: targets, RolloutTargetsWithWork: withWork,
+		}
+	}
+	rest := memberWork{pending: 3, members: 4, names: []string{"shop-001", "shop-003", "shop-004"}}
+	narrowed := &storage.Check{
+		DatabaseType: "mysql", DatabaseName: "orders", HasChanges: true,
+		Status: checkStatusCompleted, Conclusion: checkConclusionActionRequired,
+		BlockingReason: narrowedApplyBlock.blockingReason, ChangeSummary: narrowedApplyCompletedSummary("shop-002"),
+	}
+	scenarios := []struct {
+		heading string
+		check   *storage.Check
+	}{
+		{"After `schemabot apply -e production --target shop-002`", narrowed},
+		{"After `schemabot plan -e production`", row(checkStatusCompleted, checkConclusionActionRequired, reviewDriftOutcome{state: driftClean, work: rest})},
+		{"While `schemabot apply -e production` runs", row(checkStatusInProgress, "", reviewDriftOutcome{state: driftClean, work: rest, dispatchesApply: true})},
+	}
+	var sections []string
+	for _, sc := range scenarios {
+		checks := []*storage.Check{sc.check}
+		conclusion, _ := computeAggregate(checks, nil)
+		title, summary := aggregateSummary(checks, conclusion, nil)
+		sections = append(sections, "**"+sc.heading+"**\n\n"+title+"\n\n"+summary)
+	}
+	return strings.Join(sections, "\n\n")
 }
 
 // PreviewAggregateCheckFileCapBlocked renders the failing aggregate-check

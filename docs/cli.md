@@ -316,7 +316,14 @@ Next: open a normal PR with these files. SchemaBot will reconcile other configur
 `onboard` writes local files and verifies them with a plan; it does not apply
 DDL. It refuses to overwrite existing files by default. Keep the complete
 schema for the namespaces you manage: omitting an existing table can propose
-a drop. See [namespace scope](namespaces.md) for shared databases.
+a drop. See [namespace scope](namespaces.md) for shared databases. When the
+`-s` directory has an [environment schema root](namespaces.md#per-environment-schema-roots)
+for the source environment, `onboard` writes the namespace files there and
+keeps `schemabot.yaml` in the `-s` directory. `plan` and `apply` read that root
+for the environment too. Without one, `onboard` refuses a namespace named for
+the environment, because writing it would create the environment's root and
+hide the other namespaces. It also refuses namespaces whose directories are
+symlinks to one directory unless the pull returns the same schema for each.
 
 The command's PR hint is for GitHub automation. You can also use the generated
 files directly with the CLI, as shown below.
@@ -482,6 +489,8 @@ An environment can fan out to several targets, from a `targets:` list or a
 Pass `--target` to plan and apply one member only, for example to land a
 change on one target before the rest:
 
+![Plan and apply an index to one target of a multi-target environment](../assets/cli-target.gif)
+
 ```console
 $ schemabot apply -s ./schema -e production --target payments-002
 ...
@@ -515,7 +524,12 @@ In an environment with a single target, `--target` names the whole rollout,
 so the plan and apply are not narrowed.
 
 A plan of the whole rollout plans every target beside the first one and shows
-what applies where. It reports no changes only when every target is at the
+what applies where. Applying it fans the change out to every target and
+follows each target's copy in the same watcher:
+
+![Apply an index to four targets of one environment and follow their copies in parallel](../assets/cli-multi-target.gif)
+
+The plan reports no changes only when every target is at the
 desired schema, so a re-run of an `apply` that already landed, or the
 verification step of `onboard`, reads as up to date. When the first target is
 already at the desired schema, for example after an apply narrowed to it,
@@ -644,6 +658,13 @@ to resume from the checkpoint and reopen live progress.
 
 ![Press s, wait for Stopped, then run start and follow the change to completion](../assets/cli-stop.gif)
 
+On a [multi-target environment](mysql.md#multi-target-environments), stop
+and start act on the whole apply. Every target still copying stops at its
+checkpoint, a target that already finished stays finished, and `start`
+resumes each stopped target from its own checkpoint:
+
+![Press s to stop a four-target rollout, then start resumes each stopped target from its checkpoint](../assets/cli-multi-target-stop.gif)
+
 ### Choose when to cut over
 
 For engines that support deferred cutover, start the apply with
@@ -653,7 +674,7 @@ from the watch or with the cutover command. The CLI acknowledges the request
 and then watches progress. Initial output:
 
 ```console
-$ schemabot cutover -e staging apply-example-73
+$ schemabot cutover apply-example-73 -e staging
 ✓ Cutover requested successfully.
 🔄 Cutting over...
 ...
@@ -1000,18 +1021,31 @@ when findings remain; do not treat every nonzero exit as a transport error.
 This is an admin operation. See [PR recovery](pre-merge-workflow.md) for the
 workflow and automatic recovery behavior.
 
+An `--all-repos` sweep skips a declared repository the server's GitHub App is
+not installed on, names it, and keeps scanning the rest. The skip still makes
+the run exit nonzero, because that repository was never read. Any other scan
+failure stops the sweep.
+
+```console
+$ schemabot checks backfill --all-repos -e staging --last 2h --dry-run
+Scanned 6 open PRs updated in the last 2h in acme/ledger, acme/store for SchemaBot (staging).
+Skipped repositories the server's GitHub App is not installed on: acme/payroll. Install the App on each, or remove it from the server's repos config.
+No missing SchemaBot Check Runs found.
+Error: checks backfill left 1 repository without the GitHub App installed needing attention
+```
+
 A sweep that does find unfinished checks says what each one is waiting on, so
 the report can be triaged without opening every pull request in it:
 
 ```console
 $ schemabot checks backfill --all-repos --dry-run
-Scanned 148 open PRs in acme/store, acme/ledger for SchemaBot (staging), SchemaBot (production).
+Scanned 148 open PRs in acme/ledger, acme/store for SchemaBot (staging), SchemaBot (production).
 
 Stuck Check Runs — uncompleted for over 1h (backfill does not act on existing Check Runs; investigate the apply or plan that owns each):
 PR                                      CHECK                   STATUS       AGE      WAITING ON  REASON
-https://github.com/acme/store/pull/412  SchemaBot (staging)     in_progress  5h12m0s  schemabot   awaiting_replan_after_apply
 https://github.com/acme/ledger/pull/88  SchemaBot (production)  in_progress  31h0m0s  operator    reconciliation_owed
 https://github.com/acme/ledger/pull/91  SchemaBot (production)  queued       unknown  -           -
+https://github.com/acme/store/pull/412  SchemaBot (staging)     in_progress  5h12m0s  schemabot   awaiting_replan_after_apply
 
 A run waiting on an operator will not clear on its own. Read the stored rows behind one with `sq schemabot checks show <owner/repo> <pr>`.
 
@@ -1149,12 +1183,14 @@ The TUI shows a single status line above the table list. It varies by overall st
 |-------|-------------|
 | Starting | `⠋ Loading...` |
 | Pending | `⠋ Queued, starts automatically` |
-| Running | `⠋ 🔄 Copying rows... ETA 5m 30s` |
+| Running | `⠋ Running...` |
 | Stopping | `⠋ Stopping...` |
 | Waiting for cutover | *(cutover prompt shown in footer instead)* |
 | Cutting over | `⠋ Cutting over...` |
 | Completed | *(no status line — completion message shown after tables)* |
 | Stopped | *(no status line — stopped message shown after tables)* |
+
+A rollout of several targets uses the same status line and adds its counts to it, such as `⠋ Running... 1 completed · 3 running (4 targets)`, or `⠋ Running on all 4 targets...` while every target is in the same state. A stop that has not landed yet keeps the counts too, such as `⠋ Stopping on all 4 targets...`. A finished rollout has no status line either: its outcome follows the tables with the same counts, such as `⏹️ Apply stopped: 1 completed · 3 stopped (4 targets)`.
 
 The `⠋` is a Braille spinner (animated in the TUI, static here).
 
@@ -1164,9 +1200,11 @@ The `⠋` is a Braille spinner (animated in the TUI, static here).
 |-------|--------|
 | Running | `ESC detach • s stop` |
 | Waiting for cutover (with `--cutover`) | `Press Enter to proceed with cutover (or ESC to detach)` |
-| Waiting for cutover (no `--cutover`) | `To proceed: schemabot cutover -e <env> <id>` |
+| Waiting for cutover (no `--cutover`) | `To proceed: schemabot cutover <id> -e <env>` |
 | Cutting over | `Cutover in progress - please wait...` |
-| Stopped | `Use 'schemabot start -e <env> <id>' to resume.` |
+| Stopped | `To resume from where it stopped:` followed by `schemabot start <id> -e <env>` |
+
+A rollout of several targets offers the same keys: `s` stops every target still copying, and the footer reads `ESC detach • s stop` while it does. Above the keys, the rollout's own footer names its next step, such as the target SchemaBot cuts over next, and a stopped rollout ends on the same resume command as a single target.
 
 </details>
 
@@ -1210,8 +1248,10 @@ A watching `apply -o log` or `apply -o json` returns as soon as the apply
 reaches a final state. It exits 0 only when the apply completed, and non-zero
 when it was stopped, failed, was cancelled, or was reverted, because in each of
 those the schema change is not on the target. For a stopped apply the error
-names the `start` command that resumes it. A watcher that cannot reach the
-server retries with backoff, and exits non-zero once polls have kept failing
+names the `start` command that resumes it. The interactive watcher follows
+the same exit rule once the apply ends, and exits 0 when you detach with Esc
+while the apply is still running. A watcher that cannot reach the server
+retries with backoff, and exits non-zero once polls have kept failing
 for a few minutes in a row; the interactive watcher gives up on the same
 schedule. Giving up does not affect the apply. The error tells the operator to
 run `progress` with the apply ID to watch it again. That command names the

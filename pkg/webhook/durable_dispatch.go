@@ -2,12 +2,12 @@ package webhook
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"runtime/debug"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/block/schemabot/pkg/api"
@@ -357,9 +357,11 @@ func (h *Handler) driveClaimedDurableWebhook(ctx context.Context, driverID int, 
 		}
 		var markErr error
 		var outcome string
+		var failureReason metrics.WebhookFailureReason
 		var notifyTerminalCommand bool
 		switch {
 		case !retry:
+			failureReason = durableFailureReason(processErr)
 			// The processor proved this delivery can never succeed for its head
 			// (a deterministic failure such as GitHub's per-PR file-listing cap
 			// or an undecodable row), so it dead-letters immediately: the
@@ -371,10 +373,6 @@ func (h *Handler) driveClaimedDurableWebhook(ctx context.Context, driverID int, 
 			// synthesized delivery has no GitHub delivery to redeliver — its
 			// head moves forward only through a fresh delivery, from a new
 			// head push or a re-run of the failing SchemaBot check.
-			h.logger.Error("durable webhook delivery failed permanently and is dead-lettered; re-run it with GitHub Redeliver for an organic delivery, or a new head push / SchemaBot check re-run for a synthesized one",
-				"driver", driverID, "delivery_id", event.DeliveryID, "event", event.Event,
-				"action", event.Action, "repo", event.Repository, "pr", event.PullRequest,
-				"attempts", event.Attempts, "error", processErr)
 			markErr = store.MarkFailedPermanent(finishCtx, event.ID, event.LeaseToken, processErr.Error())
 			outcome = "failed_permanent"
 		case event.Attempts < maxDurableWebhookAttempts:
@@ -391,21 +389,37 @@ func (h *Handler) driveClaimedDurableWebhook(ctx context.Context, driverID int, 
 			notifyTerminalCommand = true
 		}
 		if markErr != nil {
+			failureAttrs := []any{
+				"driver", driverID, "delivery_id", event.DeliveryID, "event", event.Event,
+				"repo", event.Repository, "pr", event.PullRequest,
+				"error", markErr, "process_error", processErr,
+			}
+			if failureReason != "" {
+				failureAttrs = append(failureAttrs, "failure_reason", string(failureReason))
+			}
 			if errors.Is(markErr, storage.ErrWebhookEventLeaseLost) || errors.Is(markErr, storage.ErrWebhookEventNotFound) {
 				recordOutcome("lease_lost")
-				h.logger.Warn("durable webhook driver lost the delivery lease before recording failure; another driver owns the delivery or the row is gone",
-					"driver", driverID, "delivery_id", event.DeliveryID, "event", event.Event,
-					"repo", event.Repository, "pr", event.PullRequest)
+				h.logger.Warn("durable webhook driver lost the delivery lease before recording failure; another driver owns the delivery or the row is gone", failureAttrs...)
 				return
 			}
 			recordOutcome("finish_error")
-			h.logger.Error("durable webhook driver failed to record delivery failure",
-				"driver", driverID, "delivery_id", event.DeliveryID, "event", event.Event,
-				"repo", event.Repository, "pr", event.PullRequest, "error", markErr)
+			h.logger.Error("durable webhook driver failed to record delivery failure", failureAttrs...)
 			return
 		}
 		recordOutcome(outcome)
-		metrics.RecordWebhookEvent(finishCtx, appName, event.Event, event.Action, event.Repository, "durable_dispatch_"+outcome)
+		if outcome == "failed_permanent" {
+			metrics.RecordWebhookPermanentFailure(finishCtx, appName, event.Event, event.Action, event.Repository, failureReason)
+			origin := "organic"
+			if strings.HasPrefix(event.DeliveryID, storage.SynthesizedWebhookDeliveryIDPrefix) {
+				origin = "synthesized"
+			}
+			h.logger.Error("durable webhook delivery failed permanently and is dead-lettered; re-run it with GitHub Redeliver for an organic delivery, or a new head push / SchemaBot check re-run for a synthesized one",
+				"driver", driverID, "delivery_id", event.DeliveryID, "event", event.Event,
+				"action", event.Action, "repo", event.Repository, "pr", event.PullRequest,
+				"attempts", event.Attempts, "failure_reason", string(failureReason), "origin", origin, "error", processErr)
+		} else {
+			metrics.RecordWebhookEvent(finishCtx, appName, event.Event, event.Action, event.Repository, "durable_dispatch_"+outcome)
+		}
 		if notifyTerminalCommand {
 			h.postDurableCommandTerminalComment(event, processErr)
 		}
@@ -724,8 +738,8 @@ func (h *Handler) processDurableWebhookEvent(ctx context.Context, event *storage
 // never reach the wrong flow.
 func (h *Handler) processDurablePullRequest(ctx context.Context, event *storage.WebhookEvent) (retry bool, err error) {
 	var payload pullRequestPayload
-	if err := json.Unmarshal(event.Payload, &payload); err != nil {
-		return false, fmt.Errorf("decode durable pull_request delivery %s: %w", event.DeliveryID, err)
+	if err := decodeDurablePayload(event, &payload); err != nil {
+		return false, err
 	}
 
 	switch {
@@ -837,8 +851,8 @@ func autoPlanFailureIsPermanent(err error) bool {
 // future-producer row cannot wedge the queue.
 func (h *Handler) processDurableCheckRun(ctx context.Context, event *storage.WebhookEvent) (retry bool, err error) {
 	var payload checkRunPayload
-	if err := json.Unmarshal(event.Payload, &payload); err != nil {
-		return false, fmt.Errorf("decode durable check_run delivery %s: %w", event.DeliveryID, err)
+	if err := decodeDurablePayload(event, &payload); err != nil {
+		return false, err
 	}
 	switch payload.Action {
 	case "rerequested":
@@ -1111,17 +1125,17 @@ func (h *Handler) enqueueDurableWebhookEvent(ctx context.Context, event *storage
 // garbage.
 func durableInstallationID(event *storage.WebhookEvent) (int64, error) {
 	if event.TenantID == "" {
-		return 0, fmt.Errorf("durable %s delivery %s for %s is missing its stored tenant",
-			event.Event, event.DeliveryID, durableDeliveryLocation(event))
+		return 0, &durableRouteError{fmt.Errorf("durable %s delivery %s for %s is missing its stored tenant",
+			event.Event, event.DeliveryID, durableDeliveryLocation(event))}
 	}
 	installationID, err := strconv.ParseInt(event.TenantID, 10, 64)
 	if err != nil {
-		return 0, fmt.Errorf("durable %s delivery %s for %s has an unparseable tenant ID %q: %w",
-			event.Event, event.DeliveryID, durableDeliveryLocation(event), event.TenantID, err)
+		return 0, &durableRouteError{fmt.Errorf("durable %s delivery %s for %s has an unparseable tenant ID %q: %w",
+			event.Event, event.DeliveryID, durableDeliveryLocation(event), event.TenantID, err)}
 	}
 	if installationID <= 0 {
-		return 0, fmt.Errorf("durable %s delivery %s for %s has a non-positive installation ID %d in its tenant",
-			event.Event, event.DeliveryID, durableDeliveryLocation(event), installationID)
+		return 0, &durableRouteError{fmt.Errorf("durable %s delivery %s for %s has a non-positive installation ID %d in its tenant",
+			event.Event, event.DeliveryID, durableDeliveryLocation(event), installationID)}
 	}
 	return installationID, nil
 }

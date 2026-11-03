@@ -10,7 +10,7 @@
 #     schemabot
 
 # Build stage
-FROM golang:1.26-alpine AS builder
+FROM golang:1.26.10-alpine AS builder
 
 # The Alpine CDN intermittently answers "temporary error (try again later)" and a
 # single failed fetch fails the whole build, so every apk add in this repo's

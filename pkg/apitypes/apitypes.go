@@ -263,6 +263,12 @@ type ChecksScanRequest struct {
 	// annotated: a start time that cannot prove a run is young must not be
 	// read as deciding that it is.
 	StuckAfter string `json:"stuck_after,omitempty"`
+	// ReportAppNotInstalled declares that the caller understands
+	// ChecksScanResponse.AppNotInstalled. Only then does a repository whose
+	// GitHub App is not installed come back as that skip; any other caller
+	// gets an error, so a client that predates the field never reads an unread
+	// repository as one scanned clean.
+	ReportAppNotInstalled bool `json:"report_app_not_installed,omitempty"`
 }
 
 type ChecksScanResponse struct {
@@ -275,6 +281,15 @@ type ChecksScanResponse struct {
 	// PR would trivially be missing a check the server refuses to create.
 	// When set, no PRs were scanned and the other fields are zero.
 	ChecksDisabled bool `json:"checks_disabled,omitempty"`
+	// AppNotInstalled reports that GitHub has no installation of the
+	// repository's configured GitHub App (the installation lookup answered
+	// 404), so the scan was skipped: the App can neither read nor publish the
+	// repository's Check Runs. GitHubApp names the configured App. When set, no
+	// PRs were scanned and the other fields are zero. Any other lookup failure
+	// is an error response, never this flag, and so is this one unless the
+	// request set ReportAppNotInstalled.
+	AppNotInstalled bool   `json:"app_not_installed,omitempty"`
+	GitHubApp       string `json:"github_app,omitempty"`
 	// EstimatedOpenPRs is the repository's total open-PR count as GitHub
 	// reports it for this page's listing — an upper bound while more pages
 	// remain, exact on the final page. Recomputed every page so the caller
@@ -414,7 +429,9 @@ type IncompleteCheckRun struct {
 type ChecksInspectRequest struct {
 	Repo        string `json:"repo"`
 	PullRequest int    `json:"pull_request"`
-	// Environment, when set, narrows the response to that environment's rows.
+	// Environment, when set, selects that environment's rows and unresolved
+	// local prerequisites explaining its gate. Missing prerequisite results are
+	// represented as pending evidence.
 	Environment string `json:"environment,omitempty"`
 }
 
@@ -440,6 +457,10 @@ type ChecksInspectResponse struct {
 	// CheckRunsOnHead is every Check Run this deployment publishes that was
 	// found on the head, one per expected name.
 	CheckRunsOnHead []InspectedCheckRun `json:"check_runs_on_head,omitempty"`
+	// CoverageError explains why expected Check Run names could not be resolved.
+	// Rows remain available, but empty run lists make no claim about GitHub.
+	CoverageError string `json:"coverage_error,omitempty"`
+
 	// MissingCheckRunNames is every expected Check Run name GitHub was read
 	// for and reported no run on the head. Branch protection requires each
 	// name on its own, so one present run never says the gate is clear while

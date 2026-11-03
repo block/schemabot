@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"path"
+	"slices"
 	"sort"
 	"strings"
 
@@ -113,7 +114,7 @@ func (ic *InstallationClient) CreateSchemaRequestForConfig(ctx context.Context, 
 	// deletion evidence to the commit the declaration was read from: a vacated
 	// path survives only when that commit lacks it and the default branch holds
 	// it.
-	vacated, _, err := ic.PRFilesProposedAgainstDefaultBranch(ctx, repo, prInfo.HeadSHA, vacatedSchemaFiles(prFiles, schemaRoot))
+	vacated, _, err := ic.PRFilesProposedAgainstDefaultBranch(ctx, repo, prInfo.HeadSHA, ic.withoutEnvironmentLink(repo, pr, vacatedSchemaFiles(prFiles, schemaRoot), configDir, environment))
 	if err != nil {
 		return nil, fmt.Errorf("scope the schema files %s#%d removes to what it proposes: %w", repo, pr, err)
 	}
@@ -180,15 +181,18 @@ func (ic *InstallationClient) CreateSchemaRequestForConfig(ctx context.Context, 
 	}, nil
 }
 
-// vacatedSchemaFiles returns, as deletions, the schema files under schemaRoot
-// that the pull request left empty: a deleted file's own path and a renamed
-// file's previous one. Each is reported with the removed status so the caller
-// can ask the proposed-against-default-branch narrowing the one question that
-// matters for it — does the default branch still hold this path.
+// vacatedSchemaFiles returns, as deletions, the schema files and namespace
+// symlinks under schemaRoot that the pull request left empty: a deleted
+// file's own path and a renamed file's previous one. Each is reported with
+// the removed status so the caller can ask the proposed-against-default-branch
+// narrowing the one question that matters for it — does the default branch
+// still hold this path.
 //
-// Only files head discovery reads are kept: those directly under the root or
-// one namespace directory below it. A file nested deeper is never declared,
-// so removing it declares nothing either.
+// Only paths head discovery reads are kept: schema files directly under the
+// root or one namespace directory below it, and symlinks to directories
+// directly under the root, which name namespaces. Anything nested deeper, a
+// symlink inside a namespace, or a symlink to a file is never declared, so
+// removing it declares nothing either.
 func vacatedSchemaFiles(prFiles []PRFile, schemaRoot string) []PRFile {
 	prefix := path.Clean(schemaRoot) + "/"
 	var vacated []PRFile
@@ -198,12 +202,40 @@ func vacatedSchemaFiles(prFiles []PRFile, schemaRoot string) []PRFile {
 			continue
 		}
 		relativePath, ok := strings.CutPrefix(path.Clean(vacatedPath), prefix)
-		if !ok || strings.Count(relativePath, "/") > 1 {
+		if !ok {
 			continue
 		}
-		vacated = append(vacated, PRFile{Filename: path.Clean(vacatedPath), Status: "removed"})
+		depth := strings.Count(relativePath, "/")
+		switch {
+		case IsSchemaFile(vacatedPath):
+			if depth > 1 {
+				continue
+			}
+			vacated = append(vacated, PRFile{Filename: path.Clean(vacatedPath), Status: "removed"})
+		case depth == 0 && file.VacatedDirectoryLink:
+			vacated = append(vacated, PRFile{Filename: path.Clean(vacatedPath), Status: "removed", Symlink: true, VacatedDirectoryLink: true})
+		}
 	}
 	return vacated
+}
+
+// withoutEnvironmentLink drops the environment's own schema root symlink from
+// vacated. Removing it moves the environment's schema root back to the config
+// directory, where the link sat directly under the root, rather than emptying
+// a namespace.
+func (ic *InstallationClient) withoutEnvironmentLink(repo string, pr int, vacated []PRFile, configDir, environment string) []PRFile {
+	if environment == "" {
+		return vacated
+	}
+	environmentLink := path.Join(configDir, environment)
+	return slices.DeleteFunc(vacated, func(file PRFile) bool {
+		if !file.Symlink || file.Filename != environmentLink {
+			return false
+		}
+		ic.logger.Info("the pull request removes the environment's own schema root symlink, which names no namespace",
+			"repo", repo, "pr", pr, "environment", environment, "path", file.Filename)
+		return true
+	})
 }
 
 // emptiedPRNamespaces returns the namespaces the pull request emptied: those
@@ -226,7 +258,7 @@ func emptiedPRNamespaces(grouped map[string]*ternv1.SchemaFiles, ignored []strin
 		if !ok {
 			continue
 		}
-		namespace, namespaced := schema.NamespaceForRelativePath(relativePath, path.Base(schemaRoot), environment)
+		namespace, namespaced := vacatedNamespace(file, relativePath, schemaRoot, environment)
 		if !namespaced || grouped[namespace] != nil {
 			continue
 		}
@@ -267,66 +299,70 @@ func mergeNamespaces(a, b []string) []string {
 	return sortedNamespaces(set)
 }
 
-// vacatedSchemaPath reports the schema file path a pull request file left
-// empty: the path of a deleted file, or the previous path of a renamed one.
-func vacatedSchemaPath(file PRFile) (string, bool) {
-	var vacated string
-	switch {
-	case isRemovedPRFile(file.Status):
-		vacated = file.Filename
-	case isRenamedPRFile(file.Status):
-		vacated = file.PreviousFilename
-	default:
-		return "", false
+// vacatedNamespace returns the namespace a vacated path declared: the
+// namespace directory a schema file sits in, or the namespace a symlink
+// directly under the root names (see vacatedSchemaFiles).
+func vacatedNamespace(file PRFile, relativePath, schemaRoot, environment string) (string, bool) {
+	if file.Symlink && !IsSchemaFile(file.Filename) {
+		return schema.ResolveNamespaceEnvironment(relativePath, environment), true
 	}
-	if !IsSchemaFile(vacated) {
+	return schema.NamespaceForRelativePath(relativePath, path.Base(schemaRoot), environment)
+}
+
+// vacatedSchemaPath reports the schema input a pull request file left empty,
+// a schema file or a symlink: the path of a deleted file, or the previous
+// path of a renamed one.
+func vacatedSchemaPath(file PRFile) (string, bool) {
+	vacated, symlink, ok := vacatedSchemaInput(file)
+	if !ok || (!symlink && !IsSchemaFile(vacated)) {
 		return "", false
 	}
 	return vacated, true
 }
 
-func (ic *InstallationClient) resolveSchemaRootForEnvironment(ctx context.Context, repo, ref, configDir, environment string) (schemaRoot, schemaLinkPath string, err error) {
-	if environment == "" {
-		return configDir, "", nil
+// vacatedSchemaInput returns the path a removal or rename vacates and whether
+// it named a symlink at the base.
+func vacatedSchemaInput(file PRFile) (vacated string, symlink, ok bool) {
+	switch {
+	case isRemovedPRFile(file.Status):
+		return file.Filename, file.Symlink, true
+	case isRenamedPRFile(file.Status):
+		return file.PreviousFilename, file.PreviousSymlink, true
+	default:
+		return "", false, false
 	}
-	if err := validateEnvironmentPathSegment(environment); err != nil {
-		return "", "", err
-	}
-
-	candidate := path.Join(configDir, environment)
-	content, directoryContent, err := ic.fetchRepositoryContents(ctx, repo, candidate, ref)
-	if err != nil {
-		if IsNotFoundError(err) {
-			return configDir, "", nil
-		}
-		return "", "", fmt.Errorf("resolve schema root for environment %s at %s: %w", environment, candidate, err)
-	}
-	if directoryContent != nil {
-		return candidate, "", nil
-	}
-	if content == nil || content.GetType() != "symlink" {
-		return "", "", fmt.Errorf("environment schema root %s in repo %s ref %s is not a directory or symlink", candidate, repo, ref)
-	}
-
-	resolved, err := resolveSchemaRootSymlinkTarget(configDir, candidate, content.GetTarget())
-	if err != nil {
-		return "", "", err
-	}
-	resolvedContent, resolvedDirectoryContent, err := ic.fetchRepositoryContents(ctx, repo, resolved, ref)
-	if err != nil {
-		return "", "", fmt.Errorf("resolve environment schema root symlink %s target %s: %w", candidate, resolved, err)
-	}
-	if resolvedContent != nil || resolvedDirectoryContent == nil {
-		return "", "", fmt.Errorf("environment schema root symlink %s points to non-directory path %s", candidate, resolved)
-	}
-	return resolved, candidate, nil
 }
 
-func validateEnvironmentPathSegment(environment string) error {
-	if environment == "." || environment == ".." || strings.ContainsAny(environment, `/\`) {
-		return fmt.Errorf("environment %q must be a single path segment", environment)
+// resolveSchemaRootForEnvironment returns the directory holding environment's
+// schema files at ref, by the rules of schema.ResolveEnvironmentSchemaRoot.
+func (ic *InstallationClient) resolveSchemaRootForEnvironment(ctx context.Context, repo, ref, configDir, environment string) (schemaRoot, schemaLinkPath string, err error) {
+	schemaRoot, schemaLinkPath, err = schema.ResolveEnvironmentSchemaRoot(configDir, environment, func(entryPath string) (schema.Entry, error) {
+		return ic.repositoryEntry(ctx, repo, ref, entryPath)
+	})
+	if err != nil {
+		return "", "", fmt.Errorf("repo %s ref %s: %w", repo, ref, err)
 	}
-	return nil
+	return schemaRoot, schemaLinkPath, nil
+}
+
+// repositoryEntry reports what the repository holds at entryPath on ref,
+// without following a symlink there: the Contents API returns a symlink's own
+// object, with its target, when the symlink path is fetched directly.
+func (ic *InstallationClient) repositoryEntry(ctx context.Context, repo, ref, entryPath string) (schema.Entry, error) {
+	content, directoryContent, err := ic.fetchRepositoryContents(ctx, repo, entryPath, ref)
+	if err != nil {
+		if IsNotFoundError(err) {
+			return schema.Entry{Kind: schema.EntryMissing}, nil
+		}
+		return schema.Entry{}, err
+	}
+	if directoryContent != nil {
+		return schema.Entry{Kind: schema.EntryDirectory}, nil
+	}
+	if content != nil && content.GetType() == "symlink" {
+		return schema.Entry{Kind: schema.EntrySymlink, SymlinkTarget: content.GetTarget()}, nil
+	}
+	return schema.Entry{Kind: schema.EntryOther}, nil
 }
 
 func (ic *InstallationClient) fetchRepositoryContents(ctx context.Context, repo, filePath, ref string) (*gh.RepositoryContent, []*gh.RepositoryContent, error) {
@@ -335,32 +371,6 @@ func (ic *InstallationClient) fetchRepositoryContents(ctx context.Context, repo,
 		return nil, nil, err
 	}
 	return result.fileContent, result.directoryContent, nil
-}
-
-func resolveSchemaRootSymlinkTarget(configDir, symlinkPath, target string) (string, error) {
-	target = strings.TrimSpace(target)
-	if target == "" {
-		return "", fmt.Errorf("environment schema root symlink %s has empty target", symlinkPath)
-	}
-	if strings.HasPrefix(target, "/") {
-		return "", fmt.Errorf("environment schema root symlink %s points to absolute path %s", symlinkPath, target)
-	}
-
-	resolved := path.Clean(path.Join(path.Dir(symlinkPath), target))
-	cleanConfigDir := path.Clean(configDir)
-	if !schemaPathWithinDirectory(cleanConfigDir, resolved) {
-		return "", fmt.Errorf("environment schema root symlink %s points outside schema directory: %s", symlinkPath, target)
-	}
-	return resolved, nil
-}
-
-func schemaPathWithinDirectory(directory, candidate string) bool {
-	directory = path.Clean(directory)
-	candidate = path.Clean(candidate)
-	if directory == "." {
-		return candidate == "." || candidate != ".." && !strings.HasPrefix(candidate, "../") && !strings.HasPrefix(candidate, "/")
-	}
-	return candidate == directory || strings.HasPrefix(candidate, directory+"/")
 }
 
 // groupFilesByNamespace groups fetched files into the proto SchemaFiles format.

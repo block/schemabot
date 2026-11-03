@@ -259,6 +259,11 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (result *e
 	// and stops at the first sign of it ending rather than closing or deleting
 	// what a successor resumes against.
 	//
+	// A deploy whose outcome is unknown (engine.OutcomeUnknownError) is not
+	// retired either: the deploy call failed without a refusal, no read of the
+	// deploy request can show its deploy did not start, and recovery re-reads
+	// this same deploy request, so it and its branch are left in place.
+	//
 	// A drive whose context ends after the close has landed but before the
 	// failure is recorded hands the apply back with stored state naming a
 	// deploy request that is now closed and never deployed. A successor that
@@ -288,8 +293,7 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (result *e
 			return
 		}
 		if engine.IsOutcomeUnknown(retErr) {
-			e.applyLogger(req).Warn(deployOutcomeUnknownKeepsDeployRequestLog,
-				"organization", org, "planetscale_database", req.Database, "deploy_request", createdDeployRequest, "branch", branchName, "apply_error", retErr)
+			leaveDeployRequestOfUnknownDeployOutcome(e.applyLogger(req), org, req.Database, createdDeployRequest, branchName, retErr)
 			return
 		}
 		e.retireDeployRequestOfFailedApply(ctx, e.applyLogger(req), client, org, req.Database, createdDeployRequest, deployRequestBranch, retErr)
@@ -1085,10 +1089,13 @@ func (e *Engine) resumeApply(ctx context.Context, client psclient.PSClient, org 
 	// crash and recovery; only then does the resume start fresh. A cancelled
 	// drive or a wait that ran out says nothing about the branch, and starting
 	// fresh on either would create a branch the drive cannot finish preparing.
+	// The fresh drive keeps the apply's MigrationContext, as a first drive
+	// carries it, so the branch and deploy request it creates are saved for the
+	// next resume rather than left for no driver to find.
 	if err := e.waitForBranchReady(ctx, client, org, req.Database, meta.BranchName, emitEvent); err != nil {
 		if ctx.Err() == nil && isNotFound(err) {
 			e.logger.Warn("branch no longer exists on resume, starting fresh", "branch", meta.BranchName, "error", err)
-			req.ResumeState = nil
+			req.ResumeState = &engine.ResumeState{MigrationContext: req.ResumeState.MigrationContext}
 			return e.Apply(ctx, req)
 		}
 		return nil, fmt.Errorf("wait for branch %s on resume: %w", meta.BranchName, err)
@@ -1111,7 +1118,12 @@ func (e *Engine) resumeApply(ctx context.Context, client psclient.PSClient, org 
 	// request this resume created is retired; one recovered from stored state
 	// is reattached by resumeExistingDeployRequest, which returns before this
 	// point.
-	var createdDeployRequest uint64
+	//
+	// createdDeployRequest names the deploy request this resume created;
+	// recordedDeployRequest names the one the stored resume state carries,
+	// once a save naming it has landed. Only a recorded deploy request can be
+	// found by the driver or control operation that takes the apply over.
+	var createdDeployRequest, recordedDeployRequest uint64
 	defer func() {
 		if retErr == nil {
 			return
@@ -1121,13 +1133,17 @@ func (e *Engine) resumeApply(ctx context.Context, client psclient.PSClient, org 
 			return
 		}
 		if ctx.Err() != nil {
+			if recordedDeployRequest != createdDeployRequest {
+				e.applyLogger(req).Warn("resumed drive ended after its deploy request was created, but no save naming it landed; the driver that takes over cannot find this deploy request and will open another, so close it by hand",
+					"organization", org, "planetscale_database", req.Database, "deploy_request", createdDeployRequest, "branch", meta.BranchName, "apply_error", retErr)
+				return
+			}
 			e.applyLogger(req).Info("resumed drive ended after its deploy request was created; leaving the deploy request to the driver or control operation that takes over the apply",
 				"organization", org, "planetscale_database", req.Database, "deploy_request", createdDeployRequest, "branch", meta.BranchName, "apply_error", retErr)
 			return
 		}
 		if engine.IsOutcomeUnknown(retErr) {
-			e.applyLogger(req).Warn(deployOutcomeUnknownKeepsDeployRequestLog,
-				"organization", org, "planetscale_database", req.Database, "deploy_request", createdDeployRequest, "branch", meta.BranchName, "apply_error", retErr)
+			leaveDeployRequestOfUnknownDeployOutcome(e.applyLogger(req), org, req.Database, createdDeployRequest, meta.BranchName, retErr)
 			return
 		}
 		ownedBranch := ""
@@ -1208,6 +1224,21 @@ func (e *Engine) resumeApply(ctx context.Context, client psclient.PSClient, org 
 		return nil, fmt.Errorf("create deploy request on resume: %w", err)
 	}
 	createdDeployRequest = dr.Number
+	// Record the deploy request before waiting on it, as a fresh drive does,
+	// so a drive that ends during the wait leaves its successor resuming this
+	// deploy request rather than opening a second one on the same branch.
+	meta.DeployRequestID = dr.Number
+	meta.DeployRequestURL = dr.HtmlURL
+	createdMeta, err := encodePSMetadata(meta)
+	if err != nil {
+		return nil, fmt.Errorf("encode metadata for deploy request #%d on resume: %w", dr.Number, err)
+	}
+	if e.saveResumeState(req, &engine.ResumeState{
+		MigrationContext: req.ResumeState.MigrationContext,
+		Metadata:         createdMeta,
+	}, "deploy request opened on resume, before its diff is computed") {
+		recordedDeployRequest = dr.Number
+	}
 	dr, err = e.waitForDeployRequestPending(ctx, client, org, req.Database, dr, emitEvent)
 	if err != nil {
 		return nil, fmt.Errorf("wait for deploy request on resume: %w", err)
@@ -1216,8 +1247,6 @@ func (e *Engine) resumeApply(ctx context.Context, client psclient.PSClient, org 
 		return nil, fmt.Errorf("deploy request #%d failed on resume (state: %s)", dr.Number, dr.DeploymentState)
 	}
 	if dr.DeploymentState == deployState.NoChanges {
-		meta.DeployRequestID = dr.Number
-		meta.DeployRequestURL = dr.HtmlURL
 		return e.noChangesApplyResult(req, org, "no changes detected on resume", req.ResumeState.MigrationContext, meta)
 	}
 
@@ -1249,8 +1278,6 @@ func (e *Engine) resumeApply(ctx context.Context, client psclient.PSClient, org 
 		emitEvent(rowCopyDeclineEvent(unsafe, unsafeReason))
 	}
 
-	meta.DeployRequestID = dr.Number
-	meta.DeployRequestURL = dr.HtmlURL
 	meta.IsInstant = useInstant
 
 	// Deferred deploy on resume: don't start the deploy yet.
@@ -1282,16 +1309,22 @@ func (e *Engine) resumeApply(ctx context.Context, client psclient.PSClient, org 
 	if err != nil {
 		return nil, fmt.Errorf("encode metadata on resume: %w", err)
 	}
-	recorded := e.saveResumeState(req, &engine.ResumeState{
+	if e.saveResumeState(req, &engine.ResumeState{
 		MigrationContext: req.ResumeState.MigrationContext,
 		Metadata:         persistMeta,
-	}, "deploy request created on resume")
+	}, "deploy request created on resume") {
+		recordedDeployRequest = dr.Number
+	}
 
 	// Capture the migration_context baseline before deploying so the new Vitess
 	// context can be identified once Vitess creates migrations for this deploy.
 	existingContexts := e.captureExistingContexts(ctx, client, req.Database, req.Credentials)
 
+	// Either save naming the deploy request lets recovery re-read it, so a
+	// deploy whose outcome is unknown pauses when the first save landed even
+	// if the second did not.
 	deployNumber := dr.Number
+	recorded := recordedDeployRequest == deployNumber
 	dr, err = e.deployDeployRequest(ctx, client, org, req.Database, deployNumber, useInstant, emitEvent)
 	if err != nil {
 		return nil, fmt.Errorf("deploy on resume: %w", e.unknownDeployOutcomeNeedsRecord(err, recorded, req.Database, deployNumber))

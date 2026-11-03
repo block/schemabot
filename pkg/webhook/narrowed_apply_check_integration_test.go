@@ -142,7 +142,7 @@ func (f *narrowedApplyCheckFixture) runNarrowedApply(t *testing.T, identifier st
 	require.NoError(t, err)
 	apply.ID = applyID
 
-	require.NoError(t, f.h.updateCheckRecordForApplyStart(ctx, f.client, f.repo, f.pr, f.schema, f.env, apply),
+	require.NoError(t, f.h.updateCheckRecordForApplyStart(ctx, f.client, f.repo, f.pr, f.schema, f.env, apply, applyChangeSummary{}),
 		"a narrowed apply is not refused by a block it keeps")
 	started = f.check(t)
 
@@ -176,7 +176,8 @@ func TestNarrowedApplyBlocksCheckUntilWholeEnvironmentPlan(t *testing.T) {
 	dispatched := getCheck(t)
 	assert.Equal(t, checkConclusionFailure, dispatched.Conclusion, "a narrowed apply blocks the check before it dispatches")
 	assert.Equal(t, narrowedApplyBlock.blockingReason, dispatched.BlockingReason)
-	assert.Equal(t, narrowedApplyCheckSummary, dispatched.ChangeSummary)
+	assert.Equal(t, "rolling out `prod/payments-002` alone; apply the rest of the environment to finish", dispatched.ChangeSummary,
+		"the check names the target the narrowed apply rolls out to")
 
 	apply := &storage.Apply{
 		ApplyIdentifier: "apply-narrowed-terminal",
@@ -208,6 +209,8 @@ func TestNarrowedApplyBlocksCheckUntilWholeEnvironmentPlan(t *testing.T) {
 	assert.Equal(t, narrowedApplyBlock.blockingReason, completed.BlockingReason)
 	assert.True(t, completed.HasChanges, "nothing shows the other targets have the change")
 	assert.Zero(t, completed.ApplyID, "ownership is released so a plan of the whole environment can lift the block")
+	assert.Equal(t, "`prod/payments-002` applied; apply the rest of the environment to finish", completed.ChangeSummary,
+		"the check names the target the rollout last reached")
 
 	// A plan of the whole environment that finds every target at the desired
 	// schema replaces the block with its own result.
@@ -241,7 +244,7 @@ func TestWholeEnvironmentApplyReplacesNarrowedApplyBlock(t *testing.T) {
 
 	replaced := f.check(t)
 	assert.Empty(t, replaced.BlockingReason, "the whole-environment apply speaks for every target")
-	assert.NotEqual(t, narrowedApplyCheckSummary, replaced.ChangeSummary)
+	assert.Equal(t, "1 alter", replaced.ChangeSummary, "the whole-environment apply records its own plan summary")
 }
 
 // A commit removed the schema change after an earlier apply on production

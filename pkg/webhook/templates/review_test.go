@@ -58,7 +58,7 @@ func TestRenderReviewRequired_ChangedApprovers(t *testing.T) {
 // The comment names the schema files whose change differs since the earlier
 // approvals, so the author sees what needs a fresh review.
 func TestRenderReviewRequired_ChangedPaths(t *testing.T) {
-	result := RenderReviewRequired(ReviewGateData{
+	data := ReviewGateData{
 		Database:         "payments",
 		Environment:      "staging",
 		RequestedBy:      "alice",
@@ -66,10 +66,19 @@ func TestRenderReviewRequired_ChangedPaths(t *testing.T) {
 		PRAuthor:         "alice",
 		ChangedApprovers: []string{"bob"},
 		ChangedPaths:     []string{"schema/payments/overrides.sql", "schema/payments/votes.sql"},
-	})
+	}
 
-	assert.Contains(t, result, "\nApprovals on an earlier commit no longer count because this PR's schema change is different now: @bob. "+
+	assert.Contains(t, RenderReviewRequired(data), "\nApprovals on an earlier commit no longer count because this PR's schema change is different now: @bob. "+
 		"Changed since the approval: `schema/payments/overrides.sql`, `schema/payments/votes.sql`. Ask for an approval of the latest commit.\n")
+
+	// Reviewers can approve different commits, so the same file can have
+	// changed contents for one approval and only a changed base for another.
+	data.OtherReviewers = []string{"bob", "carol"}
+	data.ChangedApprovers = []string{"bob", "carol"}
+	data.ChangedBasePaths = []string{"schema/payments/overrides.sql"}
+	assert.Contains(t, RenderReviewRequired(data), "\nApprovals on an earlier commit no longer count because this PR's schema change is different now: @bob, @carol. "+
+		"Changed since the approval: `schema/payments/overrides.sql`, `schema/payments/votes.sql`. "+
+		"Compared with some earlier approvals, file contents are unchanged, but their merge-base versions differ: `schema/payments/overrides.sql`. Ask for an approval of the latest commit.\n")
 }
 
 // A PR targeting a branch other than the default has approvals carried only

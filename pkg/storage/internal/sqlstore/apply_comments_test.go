@@ -36,7 +36,7 @@ func TestApplyCommentStore_ReclaimStaleSummaryClaim(t *testing.T) {
 	require.NoError(t, err)
 	assert.False(t, reclaimed, "missing marker is not reclaimable")
 
-	won, err := store.ApplyComments().ClaimSummaryComment(ctx, apply.ID)
+	won, err := store.ApplyComments().ClaimSummaryComment(ctx, apply.ID, state.Apply.Stopped)
 	require.NoError(t, err)
 	require.True(t, won)
 
@@ -80,12 +80,12 @@ func TestApplyCommentStore_ReleaseSummaryClaim(t *testing.T) {
 
 	require.NoError(t, store.ApplyComments().ReleaseSummaryClaim(ctx, apply.ID), "releasing a missing claim is not an error")
 
-	won, err := store.ApplyComments().ClaimSummaryComment(ctx, apply.ID)
+	won, err := store.ApplyComments().ClaimSummaryComment(ctx, apply.ID, state.Apply.Stopped)
 	require.NoError(t, err)
 	require.True(t, won)
 	require.NoError(t, store.ApplyComments().ReleaseSummaryClaim(ctx, apply.ID))
 
-	won, err = store.ApplyComments().ClaimSummaryComment(ctx, apply.ID)
+	won, err = store.ApplyComments().ClaimSummaryComment(ctx, apply.ID, state.Apply.Stopped)
 	require.NoError(t, err)
 	assert.True(t, won, "a released claim must be re-winnable")
 
@@ -257,7 +257,7 @@ func TestApplyCommentStore_ClaimConversionRestartsStaleWindow(t *testing.T) {
 	require.NoError(t, store.ApplyComments().Supersede(ctx, apply.ID, state.Comment.Summary))
 	backdateSummaryClaim(t, apply.ID)
 
-	won, err := store.ApplyComments().ClaimSummaryComment(ctx, apply.ID)
+	won, err := store.ApplyComments().ClaimSummaryComment(ctx, apply.ID, state.Apply.Stopped)
 	require.NoError(t, err)
 	require.True(t, won, "the superseded posted marker converts back into a claim sentinel")
 

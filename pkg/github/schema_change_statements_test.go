@@ -11,8 +11,9 @@ import (
 )
 
 // A schema file whose content differs between the approved commit and the
-// head is handed to the dialect's statement comparison only when it is a
-// regular .sql file at all four commits, or one the PR adds (absent at both
+// head is handed to the dialect's statement comparison, with its path, only
+// when it is a schema file (a .sql file or a vschema.json) that is a regular
+// file at all four commits, or one the PR adds (absent at both
 // bases, passed to the dialect as ""), its bases are either the same or
 // trusted default branch content, and the comparison budget is not spent.
 // Every other case, and any comparison that does not prove the statements
@@ -64,7 +65,11 @@ func TestSameStatements(t *testing.T) {
 			baseContentReviewed: true, budgetSpent: true, compareSame: true,
 		},
 		{
-			name: "a file that is not a .sql file", path: "schema/db/vschema.json", sides: combined,
+			name: "a VSchema both sides edited", path: "schema/db/vschema.json", sides: combined,
+			baseContentReviewed: true, compareSame: true, wantCompared: true, wantSame: true,
+		},
+		{
+			name: "a file that is not a schema file", path: "schema/db/README.md", sides: combined,
 			baseContentReviewed: true, compareSame: true,
 		},
 		{
@@ -103,8 +108,10 @@ func TestSameStatements(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			var compared [][4]string
-			compareStatements := SchemaFileChangeComparer(func(_ context.Context, approvedBase, approved, headBase, head string) (bool, string, error) {
+			var comparedPaths []string
+			compareStatements := SchemaFileChangeComparer(func(_ context.Context, filePath, approvedBase, approved, headBase, head string) (bool, string, error) {
 				compared = append(compared, [4]string{approvedBase, approved, headBase, head})
+				comparedPaths = append(comparedPaths, filePath)
 				if tt.compareErr != nil {
 					return false, "", tt.compareErr
 				}
@@ -148,6 +155,7 @@ func TestSameStatements(t *testing.T) {
 				c.blobText[tt.sides[sideHeadBase].entry.SHA], c.blobText[tt.sides[sideHead].entry.SHA],
 			}
 			assert.Equal(t, want, compared[0], "the dialect gets each side's content in base, commit order")
+			assert.Equal(t, []string{tt.path}, comparedPaths, "the dialect gets the file's path")
 			if tt.wantSame {
 				assert.Equal(t, []string{tt.path}, c.statementComparedPaths, "a proved file uses up part of the budget")
 			} else {
@@ -171,7 +179,7 @@ func TestSameStatementsCancelledEvaluation(t *testing.T) {
 		repo:                "octocat/hello-world",
 		commits:             [4]string{"approved-sha", "approved-base-sha", "head-sha", "head-base-sha"},
 		baseContentReviewed: true,
-		compareStatements: func(ctx context.Context, _, _, _, _ string) (bool, string, error) {
+		compareStatements: func(ctx context.Context, _, _, _, _, _ string) (bool, string, error) {
 			cancel()
 			return false, "", ctx.Err()
 		},

@@ -414,13 +414,16 @@ func TestDeployDeployRequest_ApprovalRequirementFailsImmediately(t *testing.T) {
 // deployOutcomeUnknownClient fails every deploy call, the first ones with
 // earlierDeployErrs in order and the rest with deployErr, and serves a fixed
 // deploy request (or getErr) on the re-read, so tests can drive a deploy call
-// whose failure does or does not say whether PlanetScale started it.
+// whose failure does or does not say whether PlanetScale started it. When
+// endDrive is set, the drive's context ends while the deploy call is in
+// flight, before the call fails with deployErr.
 type deployOutcomeUnknownClient struct {
 	psclient.PSClient
 	earlierDeployErrs []error
 	deployErr         error
 	reread            *ps.DeployRequest
 	getErr            error
+	endDrive          context.CancelFunc
 	deployCalls       int
 	getCalls          int
 }
@@ -431,6 +434,9 @@ func (c *deployOutcomeUnknownClient) DeployDeployRequest(context.Context, *ps.Pe
 		err := c.earlierDeployErrs[0]
 		c.earlierDeployErrs = c.earlierDeployErrs[1:]
 		return nil, err
+	}
+	if c.endDrive != nil {
+		c.endDrive()
 	}
 	return nil, c.deployErr
 }
@@ -575,6 +581,33 @@ func TestDeployDeployRequest_FailedRereadReportsUnknownOutcome(t *testing.T) {
 		assert.True(t, engine.IsOutcomeUnknown(err), "an empty re-read leaves the deploy outcome unknown")
 		assert.True(t, engine.IsRetryable(err))
 	})
+}
+
+// A drive whose context ends while its deploy call is in flight is handing the
+// apply to the driver that resumes it from stored state, which re-reads the
+// deploy request itself. The connection drops as the drive ends, so the deploy
+// call fails without an answer from PlanetScale. The ended drive sends no
+// re-read and reports both the dropped call and the context's end, not an
+// unknown deploy outcome it never observed.
+func TestDeployDeployRequest_DriveEndedDuringTheDeployCallSendsNoReread(t *testing.T) {
+	e := New(slog.New(slog.NewTextHandler(os.Stdout, nil)))
+	ctx, endDrive := context.WithCancel(t.Context())
+	client := &deployOutcomeUnknownClient{
+		deployErr: io.ErrUnexpectedEOF,
+		endDrive:  endDrive,
+		reread:    &ps.DeployRequest{Number: 9, DeploymentState: deployState.Ready},
+	}
+
+	dr, err := e.deployDeployRequest(ctx, client, "org", "testdb", 9, false, nil)
+
+	require.Error(t, err)
+	assert.Nil(t, dr)
+	assert.ErrorIs(t, err, io.ErrUnexpectedEOF, "the dropped deploy call stays discoverable")
+	assert.ErrorIs(t, err, context.Canceled, "the drive's end stays discoverable")
+	assert.Contains(t, err.Error(), "drive ended before deploy request #9 could be re-read")
+	assert.False(t, engine.IsOutcomeUnknown(err), "a drive that ended observed no deploy outcome")
+	assert.Equal(t, 1, client.deployCalls)
+	assert.Zero(t, client.getCalls, "no request reaches PlanetScale once the drive has ended")
 }
 
 // A deploy call refused while the deploy request sits in a state that shows no
@@ -726,6 +759,32 @@ func TestResumeApply_UnknownDeployOutcomePausesOnlyWhenTheDeployRequestIsRecorde
 			assert.Contains(t, err.Error(), "deploy on resume")
 		})
 	}
+}
+
+// A resumed apply saves the deploy request twice: once as it opens it and
+// once with the deploy decisions. When only the first save lands, the stored
+// state still names the deploy request, so recovery can re-read it and an
+// unknown deploy outcome pauses rather than fails.
+func TestResumeApply_UnknownDeployOutcomePausesWhenOnlyTheLaterSaveFails(t *testing.T) {
+	shortenEngineWaits(t)
+	client := &unansweredDeployClient{}
+	req := resumeRequest(t, &psMetadata{BranchName: "schemabot-testdb-1a2b"}, "apply-1a2b3c4d5e6f7890")
+	var stored []*engine.ResumeState
+	req.OnStateChange = func(rs *engine.ResumeState) error {
+		if len(stored) > 0 {
+			return errors.New("apply apply-1a2b3c4d5e6f7890: storage unavailable")
+		}
+		stored = append(stored, rs)
+		return nil
+	}
+
+	_, err := conformanceEngine(client).resumeApply(t.Context(), client, "org", req)
+
+	assertUnknownDeployOutcome(t, err, true)
+	require.Len(t, stored, 1, "only the save made as the deploy request was opened landed")
+	meta, decodeErr := decodePSMetadata(stored[0].Metadata)
+	require.NoError(t, decodeErr)
+	assert.Equal(t, uint64(93), meta.DeployRequestID, "the stored resume state names the deploy request recovery re-reads")
 }
 
 // A deploy whose outcome is unknown pauses the apply for a recovery that

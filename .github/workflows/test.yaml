@@ -162,7 +162,11 @@ jobs:
     name: "Integration Tests (${{ matrix.shard }})"
     needs: changes
     if: needs.changes.outputs.code == 'true'
-    runs-on: ubuntu-latest
+    # ubuntu-26.04 ships Docker 29, which stops publishing a container's ports
+    # for good after a start fails on a taken port, so the sample database in
+    # TestSampleDatabaseLifecycle never comes back. Return to ubuntu-latest
+    # once a Docker release keeps the container's network after a failed start.
+    runs-on: ubuntu-24.04
     # Sized so setup (checkout, Go, cache restore, image prepull — about two
     # minutes) plus go test's own per-binary timeout below can land inside
     # the job budget: a hung binary that starts early in the shard then
@@ -683,7 +687,9 @@ jobs:
     # the Test step (8m for these shards, not the 10m the other e2e jobs use)
     # lands inside the job budget with room for the goroutine dump and the
     # log-capture step: a hung test panics with its dump instead of the runner
-    # cancelling the job first.
+    # cancelling the job first. The seed applies before the tests are bounded
+    # by E2E_SEED_APPLY_TIMEOUT in the Makefile, so a stalled one fails the
+    # setup inside this budget, where the log-capture steps still run.
     timeout-minutes: 14
     strategy:
       fail-fast: false

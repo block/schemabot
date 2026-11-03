@@ -42,46 +42,79 @@ import (
 // rules, and getting that wrong would refuse changes that work.
 const foreignKeyRefusalReason = "foreign key constraints are not supported"
 
-// verifyBranchMatchesDesiredWithRetry retries verifyBranchMatchesDesired up to
-// 90s to handle PlanetScale VSchema API staleness. DDL schema is fetched via
-// MySQL (real-time) and fails fast on mismatch. Only VSchema errors are
-// retried, since GetKeyspaceVSchema may return stale data after
-// UpdateKeyspaceVSchema.
+// branchValidationAttempts and branchValidationPollInterval bound how long
+// post-apply branch validation retries a VSchema difference or a transient
+// error before the apply fails. A schema snapshot is waited out separately,
+// for snapshotRetryWait.
+var (
+	branchValidationAttempts     = 18
+	branchValidationPollInterval = 5 * time.Second
+)
+
+// verifyBranchMatchesDesiredWithRetry retries verifyBranchMatchesDesired while
+// the PlanetScale API catches up after the branch was changed. A schema
+// snapshot, which PlanetScale takes after DDL and during which it answers
+// VSchema reads with "schema refreshing", is waited out for snapshotRetryWait
+// from its first answer, the same window the keyspace apply gives it. A
+// VSchema difference, since GetKeyspaceVSchema may return stale data after
+// UpdateKeyspaceVSchema, and any other transient error share a bound of
+// branchValidationAttempts reads. DDL schema is fetched via MySQL (real-time),
+// so a DDL mismatch is a genuine failure and fails fast.
 func (e *Engine) verifyBranchMatchesDesiredWithRetry(ctx context.Context, client psclient.PSClient, org, database, branch string, keyspaces []string, schemaFiles schema.SchemaFiles, ignored engine.IgnoredTables, password *ps.DatabaseBranchPassword) error {
-	const maxAttempts = 18
-	const pollInterval = 5 * time.Second
-
-	var lastErr error
-	for attempt := range maxAttempts {
-		if attempt > 0 {
-			e.logger.Info("retrying branch schema validation, waiting for VSchema API to converge",
-				"branch", branch, "attempt", attempt+1, "delay", pollInterval)
-			select {
-			case <-ctx.Done():
-				return fmt.Errorf("context cancelled waiting for schema validation: %w", ctx.Err())
-			case <-time.After(pollInterval):
-			}
-		}
-
-		lastErr = e.verifyBranchMatchesDesired(ctx, client, org, database, branch, keyspaces, schemaFiles, ignored, password)
-		if lastErr == nil {
-			if attempt > 0 {
+	var snapshotSince time.Time
+	boundedFailures := 0
+	for attempt := 1; ; attempt++ {
+		err := e.verifyBranchMatchesDesired(ctx, client, org, database, branch, keyspaces, schemaFiles, ignored, password)
+		if err == nil {
+			if attempt > 1 {
 				e.logger.Info("branch schema validated after retry",
-					"branch", branch, "attempts", attempt+1)
+					"branch", branch, "attempts", attempt)
 			}
 			return nil
 		}
 
-		// Only retry VSchema staleness errors. DDL validation uses MySQL
-		// (real-time) so DDL mismatches are genuine failures.
-		if !strings.Contains(lastErr.Error(), "unexpected VSchema difference") {
-			return lastErr
+		switch {
+		case isSnapshotInProgress(err):
+			if snapshotSince.IsZero() {
+				snapshotSince = time.Now()
+			}
+			if time.Since(snapshotSince)+branchValidationPollInterval > snapshotRetryWait {
+				return fmt.Errorf("PlanetScale was still taking a schema snapshot of branch %s after %s (%d validation attempts): %w",
+					branch, snapshotRetryWait, attempt, err)
+			}
+			e.logger.Info("PlanetScale is taking a schema snapshot of the branch; validating again once it finishes",
+				"database", database, "branch", branch, "attempt", attempt, "snapshot_wait_left", (snapshotRetryWait - time.Since(snapshotSince)).Round(time.Second))
+		case isVSchemaDifferenceError(err):
+			boundedFailures++
+			e.logger.Debug("VSchema validation attempt failed (API may be stale)",
+				"branch", branch, "attempt", attempt, "error", err)
+		case isRetryableEngineError(err):
+			boundedFailures++
+			e.logger.Warn("transient error validating the branch schema; validating again",
+				"database", database, "branch", branch, "attempt", attempt, "error", err)
+		default:
+			return err
 		}
-		e.logger.Debug("VSchema validation attempt failed (API may be stale)",
-			"branch", branch, "attempt", attempt+1, "error", lastErr)
+		if boundedFailures >= branchValidationAttempts {
+			return fmt.Errorf("branch schema still not validated after %d attempts (%s): %w",
+				branchValidationAttempts, time.Duration(branchValidationAttempts)*branchValidationPollInterval, err)
+		}
+
+		e.logger.Info("retrying branch schema validation, waiting for the PlanetScale API to converge",
+			"branch", branch, "attempt", attempt+1, "delay", branchValidationPollInterval)
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("context cancelled waiting for schema validation: %w", ctx.Err())
+		case <-time.After(branchValidationPollInterval):
+		}
 	}
-	return fmt.Errorf("VSchema still mismatched after %d attempts (%ds): %w",
-		maxAttempts, maxAttempts*int(pollInterval.Seconds()), lastErr)
+}
+
+// isVSchemaDifferenceError reports whether a validation failed because the
+// branch VSchema differs from the desired one, which a stale API read can
+// cause and a later read can clear.
+func isVSchemaDifferenceError(err error) bool {
+	return strings.Contains(err.Error(), "unexpected VSchema difference")
 }
 
 // verifyBranchMatchesDesired validates that the branch schema matches the
@@ -1085,20 +1118,25 @@ func deployRequestShowsDeployAccepted(dr *ps.DeployRequest) bool {
 // re-reads this same deploy request, deploying it only if it still reads ready,
 // instead of failing the apply or deploying another request. Any other state
 // shows no deploy to track and is not one recovery would deploy, so deployErr
-// is returned. A drive whose context already ended sends no re-read, and the
-// outcome is decided as for a re-read that failed.
+// is returned.
+//
+// A drive whose context has ended no longer owns the deploy request: it is
+// handing the apply to the driver that resumes it from stored state, which
+// re-reads the deploy request itself. So nothing is re-read, just as
+// deployDeployRequest's waits stop when ctx ends, and the context's error is
+// returned with deployErr rather than an unknown outcome the drive did not
+// observe.
 func (e *Engine) adoptDeployAfterError(ctx context.Context, client psclient.PSClient, org, database string, number uint64, deployErr error, refused bool) (*ps.DeployRequest, error) {
-	var dr *ps.DeployRequest
-	var getErr error
-	if ctxErr := ctx.Err(); ctxErr != nil {
-		getErr = fmt.Errorf("drive ended before the deploy request was re-read: %w", ctxErr)
-	} else {
-		dr, getErr = client.GetDeployRequest(ctx, &ps.GetDeployRequestRequest{
-			Organization: org,
-			Database:     database,
-			Number:       number,
-		})
+	if ctx.Err() != nil {
+		e.logger.Info("drive ended during the deploy call; not re-reading the deploy request and leaving it to the driver that takes over the apply",
+			"database", database, "deploy_request", number, "deploy_error", deployErr, "error", ctx.Err())
+		return nil, fmt.Errorf("%w (drive ended before deploy request #%d could be re-read: %w)", deployErr, number, ctx.Err())
 	}
+	dr, getErr := client.GetDeployRequest(ctx, &ps.GetDeployRequestRequest{
+		Organization: org,
+		Database:     database,
+		Number:       number,
+	})
 	if getErr != nil {
 		if refused {
 			e.logger.Warn("PlanetScale refused the deploy and re-reading the deploy request failed; failing the deploy with the refusal",

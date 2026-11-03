@@ -642,10 +642,9 @@ func (c *LocalClient) runEngineTaskAttempt(ctx context.Context, apply *storage.A
 		return c.abandonUnrecordedEngineWork(ctx, logger, apply, task, taskCreds, result.ResumeState, err)
 	}
 
-	// Mark task running
-	now := time.Now()
-	task.StartedAt = &now
-	c.transitionTaskState(ctx, task, 0, state.Task.Running, "")
+	if action, ok := c.recordSequentialTaskRunning(ctx, logger, apply, task); !ok {
+		return action
+	}
 	logger.Info("task running", "task_id", task.TaskIdentifier, "table", task.TableName)
 
 	// Poll to completion. Thread the engine's returned resume state into the
@@ -666,6 +665,39 @@ func (c *LocalClient) runEngineTaskAttempt(ctx context.Context, apply *storage.A
 	default:
 		return taskContinue
 	}
+}
+
+// recordSequentialTaskRunning stores that the engine accepted a task's work,
+// and reports whether the drive may poll it. A refused write ends the attempt:
+// the drive returns, and its exit halt brings the accepted work down with it
+// (OW-3). A cancelled drive hands the apply back, and a write refused because
+// the apply is no longer this driver's stands down without a verdict. Any
+// other failure records the task failed_retryable, so the apply pauses for an
+// operator retry rather than running work storage does not show as started.
+//
+// The exit halt reaches only engines that run their work in this process
+// (engine.OwnedWorkHalter). An engine that runs its work elsewhere is not
+// halted here; its resume state is already recorded, so an operator stop or
+// cancel still reaches that work.
+func (c *LocalClient) recordSequentialTaskRunning(ctx context.Context, logger *slog.Logger, apply *storage.Apply, task *storage.Task) (taskAction, bool) {
+	err := c.markTasksRunning(ctx, apply, []*storage.Task{task})
+	if err == nil {
+		return taskContinue, true
+	}
+	if c.driveCancelled(ctx, apply, "while recording that the engine started task "+task.TaskIdentifier) {
+		return taskHandover, false
+	}
+	// A task write can only be fenced by ErrApplyLeaseLost; the predicate's
+	// other causes come from the apply store and never reach this write.
+	if applyWriteEndsDrive(err) {
+		logger.Warn("task is no longer this driver's to run; drive will stand down and halt the engine work it started",
+			append(task.LogAttrs(), "error", err)...)
+		return taskAbort, false
+	}
+	logger.Warn("failed to record the accepted engine work as running; pausing the task for operator retry",
+		append(task.LogAttrs(), "error", err)...)
+	verdictErr := c.markTaskRetryable(ctx, task, fmt.Sprintf("failed to record task running: %v", err))
+	return c.failureVerdictAction(apply.ApplyIdentifier, task, verdictErr), false
 }
 
 // abandonUnrecordedEngineWork handles an accepted task whose resume state could
@@ -1090,18 +1122,28 @@ func (c *LocalClient) pollTaskToCompletion(ctx context.Context, apply *storage.A
 				"task_id", task.TaskIdentifier, "table", task.TableName)
 			return taskHandover
 		case <-ticker.C:
-			if standDown, err := c.processPendingCancelOrStopControlRequest(ctx, apply); err != nil {
-				logger.Warn("pending stop request processing failed; current apply owner will exit for operator retry",
+			pending, err := loadPendingControlOperations(ctx, c.storage, apply)
+			if err != nil {
+				logger.Warn("pending control request read failed; current apply owner will exit for operator retry",
 					"task_id", task.TaskIdentifier, "error", err)
 				return taskAbort
-			} else if standDown {
-				task.State = state.Task.Stopped
-				return taskStopped
 			}
-			if err := c.processPendingCutoverControlRequest(ctx, apply, []*storage.Task{task}); err != nil {
-				logger.Warn("pending cutover request processing failed; current apply owner will exit for operator retry",
-					"task_id", task.TaskIdentifier, "error", err)
-				return taskAbort
+			if pending.has(storage.ControlOperationCancel, storage.ControlOperationStop) {
+				if standDown, err := c.processPendingCancelOrStopControlRequest(ctx, apply); err != nil {
+					logger.Warn("pending stop request processing failed; current apply owner will exit for operator retry",
+						"task_id", task.TaskIdentifier, "error", err)
+					return taskAbort
+				} else if standDown {
+					task.State = state.Task.Stopped
+					return taskStopped
+				}
+			}
+			if pending.has(storage.ControlOperationCutover) {
+				if err := c.processPendingCutoverControlRequest(ctx, apply, []*storage.Task{task}); err != nil {
+					logger.Warn("pending cutover request processing failed; current apply owner will exit for operator retry",
+						"task_id", task.TaskIdentifier, "error", err)
+					return taskAbort
+				}
 			}
 			// Re-fetch task state from storage to detect external changes (e.g., Stop).
 			// This also guards against a race where a new apply starts and the engine's

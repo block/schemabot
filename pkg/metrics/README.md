@@ -2,6 +2,50 @@
 
 SchemaBot exposes metrics via OpenTelemetry. All metrics are available at `GET /metrics` (Prometheus format) and optionally pushed via OTLP when `OTEL_EXPORTER_OTLP_ENDPOINT` is set.
 
+## Process heartbeat and permanent webhook failures
+
+`schemabot.telemetry.heartbeat` is registered once during telemetry setup and
+observes `1` on every collection, without storage access or event traffic. Its
+Prometheus name is `schemabot_telemetry_heartbeat_ratio`: the exporter adds
+`_ratio` to gauges with unit `1`. Alert on its absence using
+deployment identity from infrastructure tags such as service, deployment `env`,
+tenant, and cluster. `environment="unknown"` remains a process metric attribute;
+apply and command `environment` labels continue to describe the schema target.
+The heartbeat proves metric collection for a live process, not storage, webhook
+processing, every replica, or log ingestion. Inbox snapshot failures retain their
+own counter. Verify the actual exporter names and infrastructure tags before
+activating monitors; do not sum OTLP and OpenMetrics aliases of the same data.
+
+Permanent dispatch failures use the existing `schemabot.webhook.events_total`
+counter with `status="durable_dispatch_failed_permanent"` and `failure_reason`:
+
+| Reason | Meaning |
+| --- | --- |
+| `pr_file_cap` | Typed incomplete PR-file listing; split the PR to make discovery complete |
+| `invalid_payload` | Stored delivery could not be decoded |
+| `unresolved_route` | Stored installation identity is permanently unresolvable |
+| `other` | Any unclassified permanent processing failure |
+
+The reason is emitted only after the lease-guarded permanent-failure write
+succeeds, replacing the prior event increment. Failed writes, lease loss, and
+retries emit no permanent event. Aggregate consumers retain the same metric and
+status; reason labels add no dimensions to the dispatch-duration histogram.
+Exclude only `pr_file_cap` from actionable alerts. Unknown and legacy unlabeled
+failures remain actionable during mixed-version rollout. Metrics are best-effort:
+a crash after persistence can miss a sample; stored deliveries remain authoritative.
+
+The built-in Prometheus exporter retains the counter name
+`schemabot_webhook_events_total`. It exposes the existing remote-command counters
+as `schemabot_remote_control_requests_rejected_total` and
+`schemabot_remote_control_requests_stale_resends_total`. These exceptional counters
+remain absent until an event occurs; absence is not a health signal. Confirm their
+Datadog names after collection mapping before activating alerts.
+
+The paired structured log carries `failure_reason`, delivery `origin`, and the
+existing delivery/repository/PR identifiers. For `origin="organic"`, fix the cause
+and use GitHub Redeliver. For `origin="synthesized"`, use a new head push or re-run
+the SchemaBot check to create fresh work. Origin stays out of the counter labels.
+
 ## Custom Metrics
 
 Every SchemaBot-owned metric emits a non-empty `environment` attribute. Metrics
@@ -11,6 +55,7 @@ available, such as `repository`, `github_app`, and `installation_id`.
 
 | Metric | Type | Attributes | Description |
 |---|---|---|---|
+| `schemabot.telemetry.heartbeat` | Observable gauge | environment | Constant `1` on every collection, including idle processes and storage outages; unit `1` |
 | `schemabot.plans.total` | Counter | repository, database, deployment, environment, status | Plan attempts, each counted once by the API; `success` only once the plan is stored |
 | `schemabot.plan.duration_seconds` | Histogram | repository, database, environment, status | Plan execution time |
 | `schemabot.applies.total` | Counter | repository, database, environment, status | Total apply operations |
@@ -25,7 +70,7 @@ available, such as `repository`, `github_app`, and `installation_id`.
 | `schemabot.check_ownership_misses_total` | Counter | operation, repository, database, database_type, environment | Guarded check updates skipped because ownership changed |
 | `schemabot.promotion.config_error_blocks_total` | Counter | repository, database, environment | Applies blocked because the target environment is absent from the configured promotion order |
 | `schemabot.status_check_operations_total` | Counter | operation, status, repository, database, database_type, environment | Status-check storage and GitHub operations |
-| `schemabot.webhook.events_total` | Counter | environment, app_name, event_type, action, repository, status | GitHub webhook events (`action` is omitted for events that carry none; `repository` is omitted for the `repo_not_configured` status — see [Webhook Ownership Rejections](#webhook-ownership-rejections)) |
+| `schemabot.webhook.events_total` | Counter | environment, app_name, event_type, action, repository, status, failure_reason | GitHub webhook events (`failure_reason` only on permanent dispatch failures) (`action` is omitted for events that carry none; `repository` is omitted for the `repo_not_configured` status — see [Webhook Ownership Rejections](#webhook-ownership-rejections)) |
 | `schemabot.webhook.unregistered_repository_ignored_total` | Counter | environment, app_name, event_type, action, repository | Webhook events ignored because the repository is not configured |
 | `schemabot.webhook.inbox_depth` | Gauge | environment, state | Durable webhook inbox rows by state |
 | `schemabot.webhook.inbox_oldest_claimable_age_seconds` | Gauge | environment | Age of the oldest ready-to-claim durable webhook inbox row |
@@ -343,7 +388,7 @@ operation, counted on `schemabot.remote_apply_attach_total`:
 | Outcome | Meaning | Operator action |
 |---|---|---|
 | `attached` | A sibling dispatch added its operation and tasks to the deployment's shared keyed apply. | None — this is the normal fan-out event; its rate tracks sharded dispatch volume. |
-| `attach_race` | A concurrent same-operation attach lost the unique-index insert and was resolved to the winner's row. | None in isolation — the dispatch replayed the winner. A sustained rate means a caller is double-dispatching the same operation; the paired info log carries the apply and operation key. |
+| `attach_race` | A concurrent same-operation attach won, found either at the unique-index insert or after this dispatch's drift check failed, and the dispatch was resolved to the winner's row. | None in isolation — the dispatch replayed the winner. A sustained rate means a caller is double-dispatching the same operation; the paired info log carries the apply and operation key. |
 | `terminal_refused` | The shared apply was already terminal, so the attach was refused fail-closed. | Investigate: the deployment's remaining operations cannot join a finished apply. The caller must re-dispatch under a fresh generation; the paired warn log names the apply, its state, and the refused operation key. |
 
 On the control plane, `schemabot.remote_apply_key_echo_mismatch_total` counts

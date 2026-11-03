@@ -468,6 +468,49 @@ func TestLocalClient_OperationStopAgainstCompletedEngineSettlesTasksNotParent(t 
 	f.requireParentUntouched(t)
 }
 
+// multiOpTargetDrainerEngine is multiOpResumeEngine for an engine that runs
+// each target as its own schema change, so the stop sweep sends a stop per task
+// with live work.
+type multiOpTargetDrainerEngine struct {
+	*multiOpResumeEngine
+}
+
+func (e *multiOpTargetDrainerEngine) DrainContext(context.Context) error { return nil }
+
+func (e *multiOpTargetDrainerEngine) DrainTargetContext(context.Context, engine.DrainTarget) error {
+	return nil
+}
+
+// On an operation-scoped drive of an engine that runs each target separately,
+// every target the stop reaches has already completed. Each task adopts the
+// engine's completed outcome and the stop is accepted; the parent completed
+// write stays the operator's projection to make, exactly as when a single
+// engine stop races completion.
+func TestLocalClient_OperationStopAgainstEveryCompletedTargetSettlesTasksNotParent(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+	f := newMultiOpResumeFixture(t, []string{state.Task.Running, state.Task.Running})
+	f.eng.stopErr = engine.NewAlreadyCompletedError("schema change already completed on the engine")
+	f.client.spiritEngine = &multiOpTargetDrainerEngine{multiOpResumeEngine: f.eng}
+
+	resp, err := f.client.stopOwnedApply(f.opCtx, &ternv1.StopRequest{
+		ApplyId:     f.apply.ApplyIdentifier,
+		Environment: f.apply.Environment,
+	}, "integration-test")
+	require.NoError(t, err,
+		"a stop that finds every target completed must settle, not error, under the operation lease")
+	require.NotNil(t, resp)
+	assert.True(t, resp.Accepted, "the settle resolves the stop as accepted")
+	assert.Equal(t, int64(2), resp.SkippedCount)
+
+	for _, task := range f.tasks {
+		assert.Equal(t, state.Task.Completed, f.taskState(t, task),
+			"task %s must adopt the engine's completed outcome", task.TaskIdentifier)
+	}
+	f.requireParentUntouched(t)
+}
+
 // When an operation-scoped drive finds a pending cancel but the engine's
 // authoritative backend already reports the change terminal, the drive adopts
 // the engine's outcome onto its own tasks and exits; the parent terminal write

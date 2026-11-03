@@ -8,6 +8,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/schemabot/pkg/checkstate"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 )
@@ -633,6 +634,88 @@ func TestChecks(t *testing.T, h Harness) {
 		assert.Empty(t, stored.ChangeSummary)
 	})
 
+	// The rollout target counts describe the change summary, so every write
+	// that replaces the summary replaces them and every write that keeps the
+	// summary keeps them, including a write that keeps a preserved block.
+	t.Run("RolloutTargetsTravelWithChangeSummary", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		get := func(database string) *storage.Check {
+			t.Helper()
+			stored, err := store.Checks().Get(ctx, "org/repo", 321, "production", storage.DatabaseTypeMySQL, database)
+			require.NoError(t, err)
+			require.NotNil(t, stored)
+			return stored
+		}
+
+		plan := &storage.Check{
+			Repository: "org/repo", PullRequest: 321, HeadSHA: "sha-1",
+			Environment: "production", DatabaseType: storage.DatabaseTypeMySQL, DatabaseName: "rollout_db",
+			HasChanges: true, Status: "completed", Conclusion: "action_required",
+			ChangeSummary: "1 alter · pending on all 4 targets", RolloutTargets: 4, RolloutTargetsWithWork: 4,
+		}
+		requirePlanResultStored(t, ctx, store, plan, storage.PlanDriftClean)
+		stored := get("rollout_db")
+		assert.Equal(t, 4, stored.RolloutTargets)
+		assert.Equal(t, 4, stored.RolloutTargetsWithWork)
+
+		replan := *plan
+		replan.HeadSHA = "sha-2"
+		replan.ChangeSummary = "1 alter · pending on 1 of 4 targets: `shop-004`"
+		replan.RolloutTargetsWithWork = 1
+		requirePlanResultStored(t, ctx, store, &replan, storage.PlanDriftClean)
+		stored = get("rollout_db")
+		assert.Equal(t, replan.ChangeSummary, stored.ChangeSummary)
+		assert.Equal(t, 4, stored.RolloutTargets)
+		assert.Equal(t, 1, stored.RolloutTargetsWithWork, "a plan's write replaces the counts with its summary")
+
+		transition := replan
+		transition.ChangeSummary = ""
+		transition.RolloutTargets, transition.RolloutTargetsWithWork = 0, 0
+		require.NoError(t, store.Checks().Upsert(ctx, &transition))
+		stored = get("rollout_db")
+		assert.Equal(t, replan.ChangeSummary, stored.ChangeSummary)
+		assert.Equal(t, 4, stored.RolloutTargets, "a write that keeps the summary keeps the counts")
+		assert.Equal(t, 1, stored.RolloutTargetsWithWork)
+
+		stale := transition
+		stale.HasChanges = false
+		stale.Conclusion = "success"
+		marked, err := store.Checks().MarkStalePlanSuccessful(ctx, &stale)
+		require.NoError(t, err)
+		require.True(t, marked)
+		stored = get("rollout_db")
+		assert.Equal(t, replan.ChangeSummary, stored.ChangeSummary)
+		assert.Equal(t, 4, stored.RolloutTargets, "an update that keeps the summary keeps the counts")
+		assert.Equal(t, 1, stored.RolloutTargetsWithWork)
+
+		single := replan
+		single.HeadSHA = "sha-3"
+		single.ChangeSummary = "1 alter"
+		single.RolloutTargets, single.RolloutTargetsWithWork = 0, 0
+		require.NoError(t, store.Checks().Upsert(ctx, &single))
+		stored = get("rollout_db")
+		assert.Equal(t, "1 alter", stored.ChangeSummary)
+		assert.Zero(t, stored.RolloutTargets, "a summary naming no rollout clears the counts")
+		assert.Zero(t, stored.RolloutTargetsWithWork)
+
+		blocked := &storage.Check{
+			Repository: "org/repo", PullRequest: 321, HeadSHA: "sha-1",
+			Environment: "production", DatabaseType: storage.DatabaseTypeMySQL, DatabaseName: "rollout_blocked_db",
+			HasChanges: true, Status: "completed", Conclusion: "failure",
+			BlockingReason: storage.ReviewTimeDeploymentDriftBlockingReason, ChangeSummary: "targets diverged at review time",
+		}
+		requirePlanResultStored(t, ctx, store, blocked, storage.PlanDriftBlocked)
+		notEvaluated := *plan
+		notEvaluated.DatabaseName = "rollout_blocked_db"
+		notEvaluated.HeadSHA = "sha-2"
+		requirePlanResultStored(t, ctx, store, &notEvaluated, storage.PlanDriftNotEvaluated)
+		stored = get("rollout_blocked_db")
+		assert.Equal(t, "targets diverged at review time", stored.ChangeSummary)
+		assert.Zero(t, stored.RolloutTargets, "a preserved block keeps its summary and the counts that go with it")
+		assert.Zero(t, stored.RolloutTargetsWithWork)
+	})
+
 	// A namespace placement refusal is a review-time block too: a write that did
 	// not re-evaluate the review keeps it, and one that did clears it.
 	t.Run("PlanPlacementBlockDisposition", func(t *testing.T) {
@@ -1062,6 +1145,57 @@ func TestChecks(t *testing.T, h Harness) {
 		assert.Equal(t, "action_required", stored.Conclusion)
 		assert.Equal(t, storage.SchemaRemovedAfterApplyStartedBlockingReason, stored.BlockingReason)
 		assert.Equal(t, "recorded by the completion", stored.ErrorMessage)
+	})
+
+	// Retrying a failed plan replaces old success with blocking evidence, while
+	// preserving both live and completed apply provenance and stronger blocks.
+	t.Run("MarkPlanPending", func(t *testing.T) {
+		for _, scenario := range []string{"missing", "success", "completed apply", "running apply", "guard block"} {
+			t.Run(scenario, func(t *testing.T) {
+				ctx := t.Context()
+				store := h.NewStorage(t)
+				lock := CreateLock(t, store, "pending_plan_db", storage.DatabaseTypeMySQL)
+				check := &storage.Check{Repository: lock.Repository, PullRequest: lock.PullRequest, HeadSHA: "same-head", Environment: "staging", DatabaseType: lock.DatabaseType, DatabaseName: lock.DatabaseName, Status: checkstate.StatusCompleted, Conclusion: checkstate.ConclusionSuccess}
+				if scenario == "completed apply" || scenario == "running apply" {
+					apply := CreateApplyWithStateAndEnv(t, store, lock, "pending-plan", 730, state.Apply.Running, "staging")
+					check.ApplyID = apply.ID
+					if scenario == "running apply" {
+						check.Status, check.Conclusion = checkstate.StatusInProgress, ""
+					}
+				}
+				if scenario == "guard block" {
+					check.Conclusion, check.BlockingReason = checkstate.ConclusionActionRequired, storage.SchemaRemovedAfterApplyStartedBlockingReason
+				}
+				if scenario != "missing" {
+					require.NoError(t, store.Checks().Upsert(ctx, check))
+				}
+				require.NoError(t, store.Checks().MarkPlanPending(ctx, check))
+				stored, err := store.Checks().Get(ctx, check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName)
+				require.NoError(t, err)
+				require.NotNil(t, stored)
+				assert.Equal(t, check.ApplyID, stored.ApplyID)
+				assert.Equal(t, check.BlockingReason, stored.BlockingReason)
+				if scenario == "running apply" {
+					assert.Equal(t, checkstate.StatusInProgress, stored.Status)
+					assert.Empty(t, stored.Conclusion)
+				} else {
+					assert.Equal(t, checkstate.StatusCompleted, stored.Status)
+					assert.Equal(t, checkstate.ConclusionActionRequired, stored.Conclusion)
+				}
+				if scenario == "success" || scenario == "missing" || scenario == "completed apply" {
+					assert.Equal(t, "Waiting for a fresh plan", stored.ChangeSummary)
+					assert.True(t, stored.HasChanges)
+					stored.Conclusion = checkstate.ConclusionSuccess
+					stored.HasChanges = false
+					written, err := store.Checks().UpsertPlanResult(ctx, stored, storage.PlanDriftClean)
+					require.NoError(t, err)
+					require.True(t, written)
+					refreshed, err := store.Checks().Get(ctx, check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName)
+					require.NoError(t, err)
+					assert.Equal(t, checkstate.ConclusionSuccess, refreshed.Conclusion)
+				}
+			})
+		}
 	})
 
 	t.Run("ClearAggregateBlock", func(t *testing.T) {

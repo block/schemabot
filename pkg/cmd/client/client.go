@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"net/url"
 	"os"
@@ -264,15 +265,19 @@ func callPlanAPI(ctx context.Context, endpoint, database, dbType, environment, s
 	if err := ctx.Err(); err != nil {
 		return nil, nil, err
 	}
-	schemaFiles, ignored, err := ReadSchemaFiles(schemaDir, environment, exclusions.Namespaces)
+	schemaRoot, err := ResolveEnvironmentSchemaRoot(schemaDir, environment)
+	if err != nil {
+		return nil, nil, err
+	}
+	schemaFiles, ignored, err := ReadSchemaFiles(schemaRoot, environment, exclusions.Namespaces)
 	if err != nil {
 		return nil, nil, fmt.Errorf("read schema files: %w", err)
 	}
 	if len(schemaFiles) == 0 {
 		if len(ignored) > 0 {
-			return nil, ignored, fmt.Errorf("no .sql files found in %s after excluding ignored namespaces %v", schemaDir, ignored)
+			return nil, ignored, fmt.Errorf("no .sql files found in %s after excluding ignored namespaces %v", schemaRoot, ignored)
 		}
-		return nil, nil, fmt.Errorf("no .sql files found in %s", schemaDir)
+		return nil, nil, fmt.Errorf("no .sql files found in %s", schemaRoot)
 	}
 	resp, err := postPlanRequestWithContext(ctx, endpoint, database, dbType, environment, schemaFiles, repo, pr, ignored, exclusions.Tables, groupedExecution, target, rendersRollout)
 	if err != nil {
@@ -524,6 +529,46 @@ func ReadSchemaFiles(dir string, environment string, ignoreNamespaces []string) 
 		result[ns] = &apitypes.SchemaFiles{Files: nsFiles.Files}
 	}
 	return result, ignored, nil
+}
+
+// ResolveEnvironmentSchemaRoot returns the directory on the local filesystem
+// holding environment's schema files for the schemabot.yaml in configDir: the
+// configDir/<environment> directory, or the directory inside configDir that a
+// configDir/<environment> symlink points to, or configDir itself when it has
+// no entry for the environment. These are the rules a pull request's plan
+// resolves the same tree by (schema.ResolveEnvironmentSchemaRoot), so a local
+// plan reads the schema the pull request plans.
+func ResolveEnvironmentSchemaRoot(configDir, environment string) (string, error) {
+	schemaRoot, _, err := schema.ResolveEnvironmentSchemaRoot(filepath.ToSlash(configDir), environment, localSchemaEntry)
+	if err != nil {
+		return "", err
+	}
+	return filepath.FromSlash(schemaRoot), nil
+}
+
+// localSchemaEntry reports what the local filesystem holds at a
+// slash-separated path, without following a symlink there.
+func localSchemaEntry(entryPath string) (schema.Entry, error) {
+	localPath := filepath.FromSlash(entryPath)
+	info, err := os.Lstat(localPath)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return schema.Entry{Kind: schema.EntryMissing}, nil
+		}
+		return schema.Entry{}, fmt.Errorf("inspect %s: %w", localPath, err)
+	}
+	switch {
+	case info.Mode()&fs.ModeSymlink != 0:
+		target, err := os.Readlink(localPath)
+		if err != nil {
+			return schema.Entry{}, fmt.Errorf("read symlink %s: %w", localPath, err)
+		}
+		return schema.Entry{Kind: schema.EntrySymlink, SymlinkTarget: filepath.ToSlash(target)}, nil
+	case info.IsDir():
+		return schema.Entry{Kind: schema.EntryDirectory}, nil
+	default:
+		return schema.Entry{Kind: schema.EntryOther}, nil
+	}
 }
 
 // ReadSchemaFilesByPath collects schema files from dir and one level of
