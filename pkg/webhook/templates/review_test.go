@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/schema"
 )
@@ -55,7 +56,7 @@ func TestRenderReviewRequired_ChangedApprovers(t *testing.T) {
 		"the reviewers who already know the change lead the next step")
 	assert.NotContains(t, result, "Schema changes require approval", "the explanation replaces the generic line")
 	assert.NotContains(t, result, "This PR targets", "a PR whose base branch is unknown is not told it targets another branch")
-	assert.Less(t, strings.Index(result, "approved earlier commits"), strings.Index(result, "**Operators of `payments`**"),
+	assertBefore(t, result, "approved earlier commits", "**Operators of `payments`**",
 		"the explanation precedes the reviewer lists")
 }
 
@@ -239,9 +240,9 @@ func TestRenderReviewRequired_ChangedStatements(t *testing.T) {
 	assert.Contains(t, result, "\n<details>\n<summary>How <code>schema/payments/refunds.sql</code> changed since the approval</summary>\n\n"+
 		"Approved at `1111111`:\n\n```sql\nALTER TABLE `refunds` ADD COLUMN `memo` text;\n```\n\n"+
 		"Latest commit `2222222` runs no DDL for this file.\n\n</details>\n")
-	assert.Less(t, strings.Index(result, "Ask for an approval of the latest commit."), strings.Index(result, "<details>"),
+	assertBefore(t, result, "That approval no longer counts, so the latest commit needs a new approval.", "<details>",
 		"the explanation precedes the collapsed DDL")
-	assert.Less(t, strings.Index(result, "</details>"), strings.Index(result, "**Operators of `payments`**"),
+	assertBefore(t, result, "</details>", "**Operators of `payments`**",
 		"the collapsed DDL precedes the reviewer lists")
 }
 
@@ -287,4 +288,14 @@ func TestRenderReviewGateError_ChangedStatements(t *testing.T) {
 
 	assert.Contains(t, result, "Approved at `1111111`:\n\n```sql\nALTER TABLE `refunds` ADD COLUMN `memo` text;\n```\n")
 	assert.Contains(t, result, "Latest commit `2222222`:\n\n```sql\nALTER TABLE `refunds` ADD COLUMN `note` text;\n```\n")
+}
+
+// assertBefore asserts that s contains both first and second, with first
+// appearing before second.
+func assertBefore(t *testing.T, s, first, second, msg string) {
+	t.Helper()
+	i, j := strings.Index(s, first), strings.Index(s, second)
+	require.GreaterOrEqual(t, i, 0, "%s: %q not found", msg, first)
+	require.GreaterOrEqual(t, j, 0, "%s: %q not found", msg, second)
+	assert.Less(t, i, j, msg)
 }

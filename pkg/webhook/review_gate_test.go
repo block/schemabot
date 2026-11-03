@@ -53,6 +53,18 @@ func TestReviewGateErrorDetailGeneric(t *testing.T) {
 	assert.NotContains(t, detail, "GitHub App can read organization members")
 }
 
+// changedDDLLookupFailedLog is the warning the review gate logs when it cannot
+// work out the DDL an approved commit runs for a changed schema file.
+const changedDDLLookupFailedLog = "cannot work out the DDL the approved commit runs"
+
+// unparseableApprovedOrders is a schema file the approved commit cannot be
+// parsed at, so the gate cannot show the DDL that commit runs.
+var unparseableApprovedOrders = map[string]map[string]string{
+	reviewGateOldBase:     {"schema/testdb/orders.sql": "CREATE TABLE `orders` (`id` bigint NOT NULL, PRIMARY KEY (`id`))"},
+	reviewGateApproved:    {"schema/testdb/orders.sql": "CREATE TABLE `orders` (`id` bigint NOT NULL,"},
+	reviewGateTestHeadSHA: {"schema/testdb/orders.sql": "CREATE TABLE `orders` (`id` bigint NOT NULL, `memo` text, PRIMARY KEY (`id`))"},
+}
+
 func setupReviewGateHandler(t *testing.T, config *api.ServerConfig) (*Handler, *http.ServeMux) {
 	t.Helper()
 	if config == nil {
@@ -2549,6 +2561,75 @@ func TestEnforceReviewGate(t *testing.T) {
 		case <-time.After(2 * time.Second):
 			require.Fail(t, "timed out waiting for review-required comment")
 		}
+	})
+
+	// Two operators approved a commit whose schema file SchemaBot cannot work
+	// out DDL for. The comment names the file without a DDL block, and the
+	// lookup runs once for the commit, not once per approval.
+	t.Run("approvals of one commit share a failed DDL lookup", func(t *testing.T) {
+		h, mux := setupReviewGateHandler(t, reviewGateTestConfig(func(cfg *api.ServerConfig) {
+			db := cfg.Databases["orders"]
+			db.OperatorUsers = []string{"bob", "carol"}
+			cfg.Databases["orders"] = db
+		}))
+		var logs syncBuffer
+		h.logger = slog.New(slog.NewJSONHandler(&logs, nil))
+		registerPREndpoint(mux, "alice")
+		registerReviewsEndpoint(mux, []*gh.PullRequestReview{
+			{User: &gh.User{Login: new("bob")}, State: new(ghclient.ReviewApproved), SubmittedAt: &gh.Timestamp{Time: time.Now()}, CommitID: new(reviewGateApproved)},
+			{User: &gh.User{Login: new("carol")}, State: new(ghclient.ReviewApproved), SubmittedAt: &gh.Timestamp{Time: time.Now()}, CommitID: new(reviewGateApproved)},
+		})
+		registerReviewGateBaseBranch(t, mux, map[string]string{reviewGateApproved: reviewGateOldBase, reviewGateTestHeadSHA: reviewGateOldBase})
+		registerReviewGateGitObjects(t, mux, unparseableApprovedOrders)
+		comments := registerCommentsCapture(mux)
+
+		client, err := h.clientForRepo("octocat/hello-world", 12345)
+		require.NoError(t, err)
+
+		mysqlSchema := *schemaResult
+		mysqlSchema.Type = "mysql"
+		blocked, err := h.enforceReviewGate(t.Context(), client, "octocat/hello-world", 1, 12345, &mysqlSchema, "staging", "alice", "apply", false)
+		require.NoError(t, err)
+		assert.True(t, blocked)
+
+		select {
+		case body := <-comments:
+			assert.Contains(t, body, "@bob and @carol approved earlier commits, but this PR's change to `schema/testdb/orders.sql` is different now. ")
+			assert.NotContains(t, body, "<details>")
+		case <-time.After(2 * time.Second):
+			require.Fail(t, "timed out waiting for review-required comment")
+		}
+		assert.Equal(t, 1, strings.Count(logs.String(), changedDDLLookupFailedLog), "the failed lookup runs once for both approvals")
+	})
+
+	// An operator approved an earlier commit, and another approved the latest
+	// one. The latest approval lets the apply through, so the gate never works
+	// out the earlier commit's DDL.
+	t.Run("approval of the latest commit skips the DDL lookup", func(t *testing.T) {
+		h, mux := setupReviewGateHandler(t, reviewGateTestConfig(func(cfg *api.ServerConfig) {
+			db := cfg.Databases["orders"]
+			db.OperatorUsers = []string{"bob", "carol"}
+			cfg.Databases["orders"] = db
+		}))
+		var logs syncBuffer
+		h.logger = slog.New(slog.NewJSONHandler(&logs, nil))
+		registerPREndpoint(mux, "alice")
+		registerReviewsEndpoint(mux, []*gh.PullRequestReview{
+			{User: &gh.User{Login: new("bob")}, State: new(ghclient.ReviewApproved), SubmittedAt: &gh.Timestamp{Time: time.Now()}, CommitID: new(reviewGateApproved)},
+			{User: &gh.User{Login: new("carol")}, State: new(ghclient.ReviewApproved), SubmittedAt: &gh.Timestamp{Time: time.Now()}, CommitID: new(reviewGateTestHeadSHA)},
+		})
+		registerReviewGateBaseBranch(t, mux, map[string]string{reviewGateApproved: reviewGateOldBase, reviewGateTestHeadSHA: reviewGateOldBase})
+		registerReviewGateGitObjects(t, mux, unparseableApprovedOrders)
+
+		client, err := h.clientForRepo("octocat/hello-world", 12345)
+		require.NoError(t, err)
+
+		mysqlSchema := *schemaResult
+		mysqlSchema.Type = "mysql"
+		blocked, err := h.enforceReviewGate(t.Context(), client, "octocat/hello-world", 1, 12345, &mysqlSchema, "staging", "alice", "apply", false)
+		require.NoError(t, err)
+		assert.False(t, blocked)
+		assert.NotContains(t, logs.String(), changedDDLLookupFailedLog)
 	})
 
 	t.Run("approved review passes without comment", func(t *testing.T) {
