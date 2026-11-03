@@ -2184,6 +2184,199 @@ func TestApplyOperations(t *testing.T, h Harness) {
 		assert.Zero(t, again)
 	})
 
+	// RequeueNeverStartedForStartByApply verifies that a pending start puts
+	// the rows a stop caught before they started back in the queue: stopped
+	// rows that never started return to pending without completed_at, while
+	// a stopped row that had started, a stopped row whose engine took up a
+	// task, a running row, and a completed row stay as they are. The write needs a pending start, and does nothing while a
+	// stop or a cancel is pending too, so a stop accepted after the start
+	// keeps every row it stopped. A displaced driver requeues nothing.
+	t.Run("RequeueNeverStartedForStartByApply", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "operation_requeue_start_db", storage.DatabaseTypeMySQL)
+		apply := CreateApply(t, store, lock, "apply_operation_requeue_start", 909)
+		ownerID := createOperation(t, store, apply.ID, "region-a", "owner")
+		neverStartedID := createOperation(t, store, apply.ID, "region-b", "never-started-stopped")
+		require.NoError(t, store.ApplyOperations().UpdateState(ctx, neverStartedID, state.ApplyOperation.Stopped))
+		startedStoppedID := createOperation(t, store, apply.ID, "region-c", "started-stopped")
+		require.NoError(t, store.ApplyOperations().MarkStarted(ctx, startedStoppedID))
+		require.NoError(t, store.ApplyOperations().UpdateState(ctx, startedStoppedID, state.ApplyOperation.Stopped))
+		completedID := createOperation(t, store, apply.ID, "region-d", "completed")
+		require.NoError(t, store.ApplyOperations().MarkCompleted(ctx, completedID))
+		// A start claims a stopped row without stamping started_at, so a row the
+		// engine took up after such a claim shows it only through its tasks.
+		engineTouchedID := createOperation(t, store, apply.ID, "region-e", "engine-touched-stopped")
+		require.NoError(t, store.ApplyOperations().UpdateState(ctx, engineTouchedID, state.ApplyOperation.Stopped))
+		addTask := func(operationID int64, name, taskState string) {
+			t.Helper()
+			task := newTask(apply, "task_requeue_"+name, name, time.Now().UTC().Truncate(time.Second))
+			task.ApplyOperationID = &operationID
+			task.State = taskState
+			_, err := store.Tasks().Create(ctx, task)
+			require.NoError(t, err)
+		}
+		addTask(neverStartedID, "never_started", state.Task.Pending)
+		addTask(engineTouchedID, "engine_touched", state.Task.Stopped)
+		// A row the data plane already holds a remote apply for was dispatched,
+		// whether or not a task mirrored the engine's work yet.
+		dispatchedID := createOperation(t, store, apply.ID, "region-f", "dispatched-stopped")
+		require.NoError(t, store.ApplyOperations().UpdateState(ctx, dispatchedID, state.ApplyOperation.Stopped))
+		require.NoError(t, store.ApplyOperations().SaveExternalID(ctx, apply.ID, dispatchedID, "remote-dispatched", "remote-operation-dispatched"))
+		addTask(dispatchedID, "dispatched", state.Task.Pending)
+
+		claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "current-driver")
+		require.NoError(t, err)
+		require.NotNil(t, claimed)
+		require.Equal(t, ownerID, claimed.ID)
+		lease := func(token string) storage.OperationLease {
+			return storage.OperationLease{ApplyID: apply.ID, OperationID: ownerID, Owner: claimed.LeaseOwner, Token: token}
+		}
+		ownedCtx := storage.WithOperationLease(ctx, lease(claimed.LeaseToken))
+		requireNeverStartedState := func(want, msg string) {
+			t.Helper()
+			operation, err := store.ApplyOperations().Get(ctx, neverStartedID)
+			require.NoError(t, err)
+			require.NotNil(t, operation)
+			assert.Equal(t, want, operation.State, msg)
+		}
+
+		changed, err := store.ApplyOperations().RequeueNeverStartedForStartByApply(ownedCtx, apply.ID)
+		require.NoError(t, err)
+		assert.Zero(t, changed, "without a pending start a stopped row stays stopped")
+		requireNeverStartedState(state.ApplyOperation.Stopped, "without a pending start a stopped row stays stopped")
+
+		requestControl(t, store, apply.ID, storage.ControlOperationStart)
+		for _, blocking := range []storage.ControlOperation{storage.ControlOperationStop, storage.ControlOperationCancel} {
+			requestControl(t, store, apply.ID, blocking)
+			changed, err := store.ApplyOperations().RequeueNeverStartedForStartByApply(ownedCtx, apply.ID)
+			require.NoError(t, err)
+			assert.Zero(t, changed, "a pending %s keeps the rows it reached", blocking)
+			requireNeverStartedState(state.ApplyOperation.Stopped, "a pending "+string(blocking)+" keeps the rows it reached")
+			require.NoError(t, store.ControlRequests().CompletePending(ctx, apply.ID, blocking))
+		}
+
+		_, err = store.ApplyOperations().RequeueNeverStartedForStartByApply(storage.WithOperationLease(ctx, lease("stale-token")), apply.ID)
+		require.ErrorIs(t, err, storage.ErrApplyLeaseLost)
+		requireNeverStartedState(state.ApplyOperation.Stopped, "a displaced driver requeues nothing")
+
+		changed, err = store.ApplyOperations().RequeueNeverStartedForStartByApply(ownedCtx, apply.ID)
+		require.NoError(t, err)
+		assert.Equal(t, int64(1), changed, "only the stopped row that never started")
+		again, err := store.ApplyOperations().RequeueNeverStartedForStartByApply(ownedCtx, apply.ID)
+		require.NoError(t, err)
+		assert.Zero(t, again)
+
+		neverStarted, err := store.ApplyOperations().Get(ctx, neverStartedID)
+		require.NoError(t, err)
+		require.NotNil(t, neverStarted)
+		assert.Equal(t, state.ApplyOperation.Pending, neverStarted.State, "queued work again once a start is pending")
+		assert.Nil(t, neverStarted.StartedAt)
+		assert.Nil(t, neverStarted.CompletedAt, "pending is not settled, so completed_at stays unset")
+		startedStopped, err := store.ApplyOperations().Get(ctx, startedStoppedID)
+		require.NoError(t, err)
+		require.NotNil(t, startedStopped)
+		assert.Equal(t, state.ApplyOperation.Stopped, startedStopped.State, "a stopped row that had started resumes through its own claim")
+		owner, err := store.ApplyOperations().Get(ctx, ownerID)
+		require.NoError(t, err)
+		require.NotNil(t, owner)
+		assert.Equal(t, state.ApplyOperation.Running, owner.State)
+		completed, err := store.ApplyOperations().Get(ctx, completedID)
+		require.NoError(t, err)
+		require.NotNil(t, completed)
+		assert.Equal(t, state.ApplyOperation.Completed, completed.State)
+		engineTouched, err := store.ApplyOperations().Get(ctx, engineTouchedID)
+		require.NoError(t, err)
+		require.NotNil(t, engineTouched)
+		assert.Nil(t, engineTouched.StartedAt)
+		assert.Equal(t, state.ApplyOperation.Stopped, engineTouched.State, "a row whose engine took up a task resumes from its checkpoint, not from the queue")
+		dispatched, err := store.ApplyOperations().Get(ctx, dispatchedID)
+		require.NoError(t, err)
+		require.NotNil(t, dispatched)
+		assert.Equal(t, state.ApplyOperation.Stopped, dispatched.State, "a row with a remote apply resumes it rather than dispatching again")
+
+		// A stop accepted after the requeue reaches the requeued row again:
+		// it is pending, never started, and the stop's sweep stops it.
+		require.NoError(t, store.ControlRequests().CompletePending(ctx, apply.ID, storage.ControlOperationStart))
+		requestControl(t, store, apply.ID, storage.ControlOperationStop)
+		restopped, err := store.ApplyOperations().MarkPendingStoppedByApply(ownedCtx, apply.ID)
+		require.NoError(t, err)
+		assert.Equal(t, int64(1), restopped, "only the requeued row is pending")
+		requireNeverStartedState(state.ApplyOperation.Stopped, "a stop accepted after the requeue stops the requeued row")
+	})
+
+	// MarkStoppedNeverStarted verifies that returning an undispatched
+	// operation to stopped clears the started_at its claim stamped, so the
+	// row still reads as never started to a later requeue or cancel sweep.
+	t.Run("MarkStoppedNeverStarted", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "operation_stopped_never_started_db", storage.DatabaseTypeMySQL)
+		apply := CreateApply(t, store, lock, "apply_operation_stopped_never_started", 910)
+		id := createOperation(t, store, apply.ID, "region-a", "undispatched")
+		require.NoError(t, store.ApplyOperations().MarkStarted(ctx, id))
+		started, err := store.ApplyOperations().Get(ctx, id)
+		require.NoError(t, err)
+		require.NotNil(t, started)
+		require.NotNil(t, started.StartedAt, "precondition: the claim stamped started_at")
+
+		require.NoError(t, store.ApplyOperations().MarkStoppedNeverStarted(ctx, id))
+		stopped, err := store.ApplyOperations().Get(ctx, id)
+		require.NoError(t, err)
+		require.NotNil(t, stopped)
+		assert.Equal(t, state.ApplyOperation.Stopped, stopped.State)
+		assert.Nil(t, stopped.StartedAt, "an operation that never dispatched reads as never started")
+	})
+
+	// MarkResumedRunning verifies the resumed operation's move to running is a
+	// compare-and-set on resuming under its own operation lease: it moves a
+	// resuming row once, leaves a row in any other state alone, and fails
+	// closed for a stale token or a lease on another operation.
+	t.Run("MarkResumedRunning", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "operation_resumed_running_db", storage.DatabaseTypeMySQL)
+		apply := CreateApply(t, store, lock, "apply_operation_resumed_running", 910)
+		opID := createOperation(t, store, apply.ID, "region-a", "schema")
+		claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "current-driver")
+		require.NoError(t, err)
+		require.NotNil(t, claimed)
+		require.Equal(t, opID, claimed.ID)
+		ownedCtx := storage.WithOperationLease(ctx, claimed.Lease())
+		require.NoError(t, store.ApplyOperations().UpdateState(ownedCtx, opID, state.ApplyOperation.Resuming))
+		requireState := func(want, msg string) {
+			t.Helper()
+			operation, err := store.ApplyOperations().Get(ctx, opID)
+			require.NoError(t, err)
+			require.NotNil(t, operation)
+			assert.Equal(t, want, operation.State, msg)
+		}
+
+		stale := claimed.Lease()
+		stale.Token = "stale-token"
+		_, err = store.ApplyOperations().MarkResumedRunning(storage.WithOperationLease(ctx, stale), opID)
+		require.ErrorIs(t, err, storage.ErrApplyLeaseLost)
+		otherOperation := claimed.Lease()
+		otherOperation.OperationID = opID + 1
+		_, err = store.ApplyOperations().MarkResumedRunning(storage.WithOperationLease(ctx, otherOperation), opID)
+		require.ErrorIs(t, err, storage.ErrApplyLeaseLost)
+		requireState(state.ApplyOperation.Resuming, "a lease that does not own the row moves nothing")
+
+		promoted, err := store.ApplyOperations().MarkResumedRunning(ownedCtx, opID)
+		require.NoError(t, err)
+		assert.True(t, promoted)
+		requireState(state.ApplyOperation.Running, "the owning driver moves a resuming row to running")
+		promoted, err = store.ApplyOperations().MarkResumedRunning(ownedCtx, opID)
+		require.NoError(t, err)
+		assert.False(t, promoted, "a row that is already running is left alone")
+
+		require.NoError(t, store.ApplyOperations().UpdateState(ownedCtx, opID, state.ApplyOperation.Stopped))
+		promoted, err = store.ApplyOperations().MarkResumedRunning(ownedCtx, opID)
+		require.NoError(t, err)
+		assert.False(t, promoted)
+		requireState(state.ApplyOperation.Stopped, "a row a drive settled after the resume is not reopened")
+	})
+
 	// SaveExternalID_EnforcesDeploymentInvariant verifies sibling operations
 	// in one deployment share one remote apply ID, a different deployment is
 	// independent, and a conflicting write fails without persisting its value.

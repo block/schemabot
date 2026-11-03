@@ -448,6 +448,123 @@ func TestE2EResumeRotatesProgressComment(t *testing.T) {
 	}
 }
 
+// An operator stopped a two-target rollout while region-a copied and region-b
+// waited its turn, then started it again. The start posts one fresh progress
+// comment at the bottom of the PR and freezes the stopped one. The rollout then
+// hands off from region-a to region-b, reading pending while region-b waits for
+// its claim; that is not a stop, so the observer edits the fresh comment in
+// place through the handoff and into region-b's copy, rotating nothing and
+// posting no summary.
+func TestE2ERolloutStartRotatesOnceAcrossTheTargetHandoff(t *testing.T) {
+	ctx := t.Context()
+
+	f := setupApplyCommentFixture(t, applyCommentFixtureParams{
+		repo:       "org/repo-rollout-start",
+		pr:         171,
+		database:   "e2e_rollout_start_db",
+		applyState: state.Apply.Resuming,
+	})
+	st, apply, taskA, capture, h := f.st, f.apply, f.task, f.capture, f.handler
+
+	insertTarget := func(target, opState string) int64 {
+		t.Helper()
+		id, err := st.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+			ApplyID: apply.ID, Deployment: "default", Target: target, OperationKey: target, State: opState,
+			CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt,
+		})
+		require.NoError(t, err)
+		return id
+	}
+	regionA := insertTarget("region-a", state.ApplyOperation.Resuming)
+	regionB := insertTarget("region-b", state.ApplyOperation.Pending)
+	taskA.ApplyOperationID = &regionA
+	require.NoError(t, st.Tasks().Update(ctx, taskA))
+	taskB := *taskA
+	taskB.TaskIdentifier = taskA.TaskIdentifier + "_b"
+	taskB.ApplyOperationID = &regionB
+	taskB.State = state.Task.Pending
+	taskB.RowsCopied = 0
+	taskB.ProgressPercent = 0
+	_, err := st.Tasks().Create(ctx, &taskB)
+	require.NoError(t, err)
+	setTargets := func(applyState, regionAState, regionBState string) {
+		t.Helper()
+		apply.State = applyState
+		require.NoError(t, st.ApplyOperations().UpdateState(ctx, regionA, regionAState))
+		require.NoError(t, st.ApplyOperations().UpdateState(ctx, regionB, regionBState))
+	}
+
+	h.postAndTrackComment(ctx, "org/repo-rollout-start", 171, 12345, apply, state.Comment.Progress, "Stopped at 21%")
+	stoppedProgressID := requireCommentCreate(t, capture)
+	h.postAndTrackComment(ctx, "org/repo-rollout-start", 171, 12345, apply, state.Comment.Summary, "Schema Change Stopped")
+	requireCommentCreate(t, capture)
+
+	fake := clock.NewFake(taskA.CreatedAt)
+	obs := f.newObserver(st, fake)
+
+	// The start's first tick posts the fresh comment and freezes the stopped one.
+	obs.OnProgress(apply, []*storage.Task{taskA, &taskB})
+	var freshID int64
+	select {
+	case created := <-capture.creates:
+		freshID = created.ID
+		assert.NotContains(t, created.Body, "Stopped")
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected the start to post a fresh progress comment")
+	}
+	select {
+	case edited := <-capture.edits:
+		assert.Equal(t, stoppedProgressID, edited.CommentID, "the freeze edit lands on the stopped comment")
+		assert.Contains(t, edited.Body, fmt.Sprintf("#issuecomment-%d", freshID))
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected the stopped progress comment to be frozen")
+	}
+
+	// requireInPlaceEdit advances past the edit interval, ticks, and requires
+	// the tick to edit the fresh comment rather than post another one.
+	requireInPlaceEdit := func(msg string, tasks ...*storage.Task) string {
+		t.Helper()
+		fake.Advance(activeInterval + time.Second)
+		obs.OnProgress(apply, tasks)
+		select {
+		case edited := <-capture.edits:
+			assert.Equal(t, freshID, edited.CommentID, msg)
+			return edited.Body
+		case created := <-capture.creates:
+			t.Fatalf("%s: a start rotates once; got another new comment %d:\n%s", msg, created.ID, created.Body)
+		case <-time.After(5 * time.Second):
+			t.Fatalf("%s: expected an in-place edit of the fresh comment", msg)
+		}
+		return ""
+	}
+
+	setTargets(state.Apply.Running, state.ApplyOperation.Running, state.ApplyOperation.Pending)
+	taskA.RowsCopied, taskA.ProgressPercent = 700, 70
+	requireInPlaceEdit("region-a copying", taskA, &taskB)
+
+	// The handoff: region-a is done and region-b is queued for its claim.
+	setTargets(state.Apply.Pending, state.ApplyOperation.Completed, state.ApplyOperation.Pending)
+	taskA.State, taskA.RowsCopied, taskA.ProgressPercent = state.Task.Completed, 1000, 100
+	handoff := requireInPlaceEdit("the handoff", taskA, &taskB)
+	assert.NotContains(t, handoff, "Stopped", "a rollout between targets is not stopped")
+	assert.Contains(t, handoff, "Rolling out: 1 of 2 targets done, 1 queued")
+	assert.Contains(t, handoff, "`region-b`: queued")
+
+	setTargets(state.Apply.Running, state.ApplyOperation.Completed, state.ApplyOperation.Running)
+	taskB.State, taskB.RowsCopied, taskB.ProgressPercent = state.Task.Running, 300, 30
+	requireInPlaceEdit("region-b copying", taskA, &taskB)
+
+	select {
+	case created := <-capture.creates:
+		t.Fatalf("no summary posts while the rollout is under way; got comment %d:\n%s", created.ID, created.Body)
+	default:
+	}
+	summary, err := st.ApplyComments().Get(ctx, apply.ID, state.Comment.Summary)
+	require.NoError(t, err)
+	require.NotNil(t, summary)
+	assert.NotNil(t, summary.SupersededAt, "the stop's summary is the one the start rotated on, and no other summary replaced it")
+}
+
 // A resume rotation whose fresh comment lands but whose summary-marker
 // consumption fails must not leave the marker active for the rest of the
 // drive: the marker is the durable signal that the next terminal summary needs
