@@ -3,7 +3,9 @@ package api
 import (
 	"errors"
 	"log/slog"
+	"maps"
 	"os"
+	"slices"
 	"sort"
 	"testing"
 
@@ -430,5 +432,35 @@ func TestExecutePullSchema_SelectingTargetComparedWithAnUnselectingPrimary(t *te
 	assert.Empty(t, resp.Targets[0].Namespaces)
 	assert.Equal(t, []apitypes.DivergedTable{
 		{Namespace: "testapp", Table: "users", Difference: apitypes.DivergenceDiffers},
+	}, resp.Targets[1].DivergedTables)
+}
+
+// An entry with no selection holds every namespace, so when it comes first it
+// supplies every namespace, including a shard a later entry selects. A cluster
+// that lacks that shard leaves it out of the pulled schema, and the later
+// target's tables in it read as extra: the configuration places the shard on
+// both, and a plan of the first target would create it there.
+func TestExecutePullSchema_UnselectingPrimaryMissingASelectedNamespace(t *testing.T) {
+	shard := pulledTables(map[string]string{"audits": pullAuditsDDL})
+	shard.Namespaces = map[string]*ternv1.PulledNamespace{"testapp_0": shard.Namespaces["testapp"]}
+	client := newPerTargetPullClient(map[string]*ternv1.PullSchemaResponse{
+		"testapp-001": pulledTables(map[string]string{"users": pullUsersDDL}),
+		"testapp-002": shard,
+	}, nil)
+	env := EnvironmentConfig{Deployment: "eu", Targets: []TargetEntry{
+		{Target: "testapp-001"},
+		{Target: "testapp-002", Namespaces: []string{"testapp_0"}},
+	}}
+	svc := pullTargetService(t, env, map[string]tern.Client{"eu/production": client})
+
+	resp, err := svc.ExecutePullSchema(t.Context(), pullRequest())
+	require.NoError(t, err)
+
+	assert.Equal(t, []string{"testapp"}, slices.Sorted(maps.Keys(resp.Namespaces)), "the first target supplies testapp_0 and holds none of it")
+	assertTableCountMatchesNamespaces(t, resp)
+	require.Len(t, resp.Targets, 2)
+	assert.Empty(t, resp.Targets[0].DivergedTables)
+	assert.Equal(t, []apitypes.DivergedTable{
+		{Namespace: "testapp_0", Table: "audits", Difference: apitypes.DivergenceOnlyOnTarget},
 	}, resp.Targets[1].DivergedTables)
 }

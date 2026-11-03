@@ -157,7 +157,7 @@ func (s *Service) memberPullNamespaces(req apitypes.PullSchemaRequest, target ro
 	}
 	selected := make([]string, 0, len(namespaces))
 	for _, namespace := range namespaces {
-		if !slices.Contains(target.Namespaces, namespace) {
+		if !target.Holds(namespace) {
 			s.logger.Info("pull skips a requested namespace the target's entry does not select",
 				"database", req.Database,
 				"environment", req.Environment,
@@ -183,23 +183,22 @@ func requireSelectablePullNamespaces(req apitypes.PullSchemaRequest, targets []r
 	if len(namespaces) == 1 && namespaces[0] == "" {
 		return nil
 	}
-	selectable := map[string]bool{}
-	for _, target := range targets {
-		if len(target.Namespaces) == 0 {
-			return nil
-		}
-		for _, namespace := range target.Namespaces {
-			selectable[namespace] = true
-		}
-	}
 	var unselected []string
 	for _, namespace := range namespaces {
-		if !selectable[namespace] {
+		if !slices.ContainsFunc(targets, func(target routing.ExecutionTarget) bool { return target.Holds(namespace) }) {
 			unselected = append(unselected, namespace)
 		}
 	}
 	if len(unselected) == 0 {
 		return nil
+	}
+	// Every entry selects namespaces once one is unheld, so their union is the
+	// whole set a pull can name.
+	selectable := map[string]bool{}
+	for _, target := range targets {
+		for _, namespace := range target.Namespaces {
+			selectable[namespace] = true
+		}
 	}
 	return &UnselectedPullNamespaceError{
 		Database:    req.Database,

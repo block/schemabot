@@ -141,3 +141,15 @@ func TestDisplayNames(t *testing.T) {
 		})
 	}
 }
+
+// An entry that selects namespaces holds exactly those; an entry that selects
+// none holds every namespace.
+func TestExecutionTargetHolds(t *testing.T) {
+	shard := ExecutionTarget{Deployment: "eu", Target: "shop-002", Namespaces: []string{"shop_0"}}
+	assert.True(t, shard.Holds("shop_0"))
+	assert.False(t, shard.Holds("shop"))
+
+	whole := ExecutionTarget{Deployment: "eu", Target: "shop-001"}
+	assert.True(t, whole.Holds("shop"))
+	assert.True(t, whole.Holds("shop_0"))
+}
