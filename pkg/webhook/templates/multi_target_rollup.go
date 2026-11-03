@@ -190,7 +190,8 @@ func lineTargets(data MultiDeploymentApplyData, g presentation.Group, line targe
 			continue
 		}
 		if includeUnreported && targetUnreported(data, i) {
-			cells = append(cells, TableProgressData{Status: presentation.UnreportedTargetStatus(data.Model.Deployments[i].State)})
+			status := presentation.UnreportedTargetStatus(data.Model.Deployments[i].State)
+			cells = append(cells, TableProgressData{Status: presentation.RolloutTableStatus(data.Model.State, status)})
 			targets = append(targets, memberTarget(data.Model.Deployments[i]))
 		}
 	}
@@ -213,6 +214,7 @@ func targetTableLines(data MultiDeploymentApplyData, g presentation.Group) []tar
 			continue
 		}
 		for _, t := range detail.Tables {
+			t.Status = presentation.RolloutTableStatus(data.Model.State, t.Status)
 			key := tableChangeKey(t)
 			li, seen := byKey[key]
 			if !seen {
@@ -421,6 +423,11 @@ func writeTargetTableLine(sb *strings.Builder, table string, cells []TableProgre
 		phrase, coverage = "⊘ Not started", ""
 	}
 	lists := listsTargets(strip)
+	if status == state.Task.Stopped && !anyTargetBegan(cells) {
+		// Every target would only repeat that it stopped, so the line says it
+		// once, the way the CLI's progress view does.
+		phrase, coverage, lists = "⏹️ Stopped (not started)", "", false
+	}
 	if status == state.Task.Cancelled {
 		phrase, coverage = cancelledTargetsLine(cancelledTargets{
 			done: done, cancelled: cancelled, unbegun: unbegun, pending: pending, targets: len(cells),
@@ -440,6 +447,14 @@ func writeTargetTableLine(sb *strings.Builder, table string, cells []TableProgre
 	if lists {
 		writeMemberList(sb, presentation.TargetNoun, strip, pendingWord, budget)
 	}
+}
+
+// anyTargetBegan reports whether any target completed a table or began
+// working on it, so a halt there leaves the change partly or wholly live.
+func anyTargetBegan(cells []TableProgressData) bool {
+	return slices.ContainsFunc(cells, func(c TableProgressData) bool {
+		return tableBegan(c) || state.IsState(c.Status, state.Task.Completed, state.Task.RevertWindow)
+	})
 }
 
 // cancelledTargets counts where a table stands on each of its targets when

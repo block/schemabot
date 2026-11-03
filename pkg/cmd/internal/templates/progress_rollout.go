@@ -378,7 +378,7 @@ func tableAcrossTargets(v RolloutView, byMember map[rolloutMemberKey][]TableProg
 			// A target that has not reported counts toward where the table
 			// stands, so a halt there is never hidden under its siblings'
 			// progress.
-			status := presentation.UnreportedTargetStatus(d.State)
+			status := presentation.RolloutTableStatus(v.Model.State, presentation.UnreportedTargetStatus(d.State))
 			statuses = append(statuses, status)
 			rolled.Shards = append(rolled.Shards, ShardProgress{Shard: memberTargetName(d), Status: status})
 			// Its plan's estimates are not known, so a sum of the rest would
@@ -390,7 +390,7 @@ func tableAcrossTargets(v RolloutView, byMember map[rolloutMemberKey][]TableProg
 			if t.Namespace != table.Namespace || t.TableName != table.TableName || t.DDL != table.DDL {
 				continue
 			}
-			status := state.NormalizeTaskStatus(t.Status)
+			status := presentation.RolloutTableStatus(v.Model.State, state.NormalizeTaskStatus(t.Status))
 			statuses = append(statuses, status)
 			var plannedRows *int64
 			if t.RowsTotal == 0 && presentation.CopyStillAhead(status) {

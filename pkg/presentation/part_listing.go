@@ -72,6 +72,18 @@ func UnreportedTargetStatus(memberState string) string {
 	}
 }
 
+// RolloutTableStatus is where a target stands on one table of a rollout in
+// applyState, given the table's own task status. A table still pending on a
+// target of a stopped apply is not waiting for its turn: nothing runs until
+// the apply is started again, so it reads as stopped, the way a single
+// deployment's stop records the tables it had not begun.
+func RolloutTableStatus(applyState, taskStatus string) string {
+	if state.IsState(applyState, state.Apply.Stopped) && state.IsState(taskStatus, state.Task.Pending) {
+		return state.Task.Stopped
+	}
+	return taskStatus
+}
+
 // partListInlineLimit is the most parts a listing names one per line. Past it,
 // the listing names only the parts that need attention or set the pace, and
 // the heading's counts cover the rest.
