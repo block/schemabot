@@ -95,7 +95,7 @@ func TestRevertControlsReportARequestNotAnEffect(t *testing.T) {
 	}{
 		{"revert", "revert", "", "Revert requested for " + target + " — SchemaBot will undo this schema change\n" + watch},
 		{"revert already requested", "revert", apitypes.ControlStatusAlreadyRequested, "Revert already requested for " + target + " — SchemaBot will finish the existing request\n" + watch},
-		{"skip-revert", "skip-revert", "", "Skip-revert requested for " + target + " — SchemaBot will close the revert window\n" + watch},
+		{"skip-revert", "skip-revert", "", "Skip-revert requested for " + target + " — SchemaBot will close the revert window and make this schema change permanent\n" + watch},
 		{"skip-revert already requested", "skip-revert", apitypes.ControlStatusAlreadyRequested, "Skip-revert already requested for " + target + " — SchemaBot will finish the existing request\n" + watch},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

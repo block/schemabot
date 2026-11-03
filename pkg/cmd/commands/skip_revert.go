@@ -58,7 +58,7 @@ func (cmd *SkipRevertCmd) Run(g *Globals) error {
 	if resp.Status == apitypes.ControlStatusAlreadyRequested {
 		fmt.Printf("Skip-revert already requested for %s — SchemaBot will finish the existing request\n", target)
 	} else {
-		fmt.Printf("Skip-revert requested for %s — SchemaBot will close the revert window\n", target)
+		fmt.Printf("Skip-revert requested for %s — SchemaBot will close the revert window and make this schema change permanent\n", target)
 	}
 	printWatchInstructions(cmd.ApplyID, cmd.Database, cmd.Environment)
 	return nil
