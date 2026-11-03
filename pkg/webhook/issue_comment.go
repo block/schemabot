@@ -634,8 +634,10 @@ func actionFansOutUnscoped(a string) bool {
 // participant should actually act on when fanning out, as opposed to an error
 // case it should stay silent on. Only fan-out actions qualify (see
 // actionFansOutUnscoped). A complete command (Found) fans out, and a plan
-// without -e fans out as a multi-env plan. A missing-env command other than
-// plan does NOT fan out: otherwise every participant on a shared repo would
+// without -e fans out as a multi-env plan. A control command without -e that
+// names an apply fans out so the participant storing that apply can answer
+// with its environment; the others defer to the leader. Any other missing-env
+// command does NOT fan out: otherwise every participant on a shared repo would
 // post its own duplicate "missing environment" comment. The leader (which
 // never hits the tenant gate) posts that error once.
 func unscopedCommandFansOut(result CommandResult) bool {
@@ -643,6 +645,11 @@ func unscopedCommandFansOut(result CommandResult) bool {
 		return false
 	}
 	if result.Found {
+		return true
+	}
+	if result.MissingEnv && controlCommandNamesApply(result) {
+		// The deployment storing the named apply answers the usage error with
+		// the apply's environment (answerMissingEnvForNamedApply).
 		return true
 	}
 	return result.MissingEnv && result.Action == action.Plan

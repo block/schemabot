@@ -50,8 +50,9 @@ func stagingApplyOfThisPR() *storage.Apply {
 // control command that names an apply but omits -e. Each deployment keeps
 // its own storage, so the deployment that stores the apply answers with the
 // exact command, including on an instance that otherwise ignores commands
-// without -e, and every other deployment on the repo stays silent so the PR
-// gets exactly one reply.
+// without -e. A deployment that does not store the apply keeps the usual
+// missing-environment policy, so a mistyped apply ID is still answered by the
+// deployment that answers usage errors.
 func TestControlCommandMissingEnvironmentNamesTheApplysEnvironment(t *testing.T) {
 	serve := func(t *testing.T, cfg *api.ServerConfig, apply *storage.Apply, comment string) (string, chan string) {
 		t.Helper()
@@ -88,29 +89,58 @@ func TestControlCommandMissingEnvironmentNamesTheApplysEnvironment(t *testing.T)
 		assert.Contains(t, body, "schemabot cutover apply-abc123 -e staging")
 	})
 
-	t.Run("an environment-scoped deployment without the apply stays silent", func(t *testing.T) {
-		cfg := nonAggregateConfig()
-		cfg.AllowedEnvironments = []string{"production"}
+	t.Run("a tenanted aggregate participant storing the apply replies", func(t *testing.T) {
+		cfg := aggregateParticipantConfig()
+		cfg.Tenant = "alpha"
+		resp, comments := serve(t, cfg, stagingApplyOfThisPR(), "schemabot stop apply-abc123")
+
+		assert.Contains(t, resp, "missing environment flag")
+		body := requireComment(t, comments, "missing environment comment")
+		assert.Contains(t, body, "schemabot stop apply-abc123 -e staging")
+	})
+
+	t.Run("a tenanted aggregate participant without the apply defers to the leader", func(t *testing.T) {
+		cfg := aggregateParticipantConfig()
+		cfg.Tenant = "alpha"
 		resp, comments := serve(t, cfg, nil, "schemabot stop apply-abc123")
 
-		assert.Contains(t, resp, "missing environment deferred to the apply's deployment")
-		assert.Empty(t, comments, "a deployment that does not store the apply must leave the reply to the one that does")
+		assert.Contains(t, resp, "usage error deferred to leader")
+		assert.Empty(t, comments, "a participant must defer the missing-environment reply to the leader")
 	})
 
-	t.Run("an aggregate leader without the apply stays silent", func(t *testing.T) {
+	t.Run("an aggregate leader without the apply posts the usual reply", func(t *testing.T) {
 		resp, comments := serve(t, aggregateLeaderConfig(), nil, "schemabot cancel apply-abc123")
 
-		assert.Contains(t, resp, "missing environment deferred to the apply's deployment")
-		assert.Empty(t, comments, "a deployment that does not store the apply must leave the reply to the one that does")
+		assert.Contains(t, resp, "missing environment flag")
+		body := requireComment(t, comments, "missing environment comment")
+		assert.Contains(t, body, "schemabot cancel -e <environment>")
 	})
 
-	t.Run("an apply in an environment this deployment does not serve is left to its deployment", func(t *testing.T) {
+	t.Run("a deployment serving every environment without the apply posts the usual reply", func(t *testing.T) {
+		cfg := nonAggregateConfig()
+		cfg.AllowedEnvironments = []string{"staging", "production"}
+		resp, comments := serve(t, cfg, nil, "schemabot stop apply-abc123")
+
+		assert.Contains(t, resp, "missing environment flag")
+		body := requireComment(t, comments, "missing environment comment")
+		assert.Contains(t, body, "schemabot stop -e <environment>")
+	})
+
+	t.Run("a deployment ignoring unscoped commands without the apply stays silent", func(t *testing.T) {
+		resp, comments := serve(t, silentOnUnscoped(nonAggregateConfig()), nil, "schemabot stop apply-abc123")
+
+		assert.Contains(t, resp, "unscoped command skipped")
+		assert.Empty(t, comments)
+	})
+
+	t.Run("an apply in an environment this deployment does not serve follows the usual policy", func(t *testing.T) {
 		cfg := nonAggregateConfig()
 		cfg.AllowedEnvironments = []string{"production"}
 		resp, comments := serve(t, cfg, stagingApplyOfThisPR(), "schemabot stop apply-abc123")
 
-		assert.Contains(t, resp, "missing environment deferred to the apply's deployment")
-		assert.Empty(t, comments)
+		assert.Contains(t, resp, "missing environment flag")
+		body := requireComment(t, comments, "missing environment comment")
+		assert.NotContains(t, body, "apply-abc123", "a deployment that does not serve staging must not answer for its apply")
 	})
 
 	t.Run("an apply of another PR is refused", func(t *testing.T) {
