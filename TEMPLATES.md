@@ -4024,6 +4024,22 @@ schemabot apply -e staging
 </details>
 
 <details>
+<summary><a name="apply-blocked-already-applying-the-latest-commit"></a><strong>Apply Blocked: Already Applying The Latest Commit</strong></summary>
+
+
+## ⚠️ Apply Already In Progress — Staging
+
+**Database**: `testapp`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+This PR's apply `apply-a1b2c3d4e5f6` is still running (state: `running`), so a second apply cannot start.
+
+It is applying this PR's latest commit, so there is nothing to apply again. Its progress comment shows when it is done.
+
+</details>
+
+<details>
 <summary><a name="apply-blocked-pr-closed"></a><strong>Apply Blocked: PR Closed</strong></summary>
 
 

@@ -1398,6 +1398,21 @@ func PreviewCommentApplyInProgress() string {
 	})
 }
 
+// PreviewCommentApplyInProgressLatestCommit renders a sample "apply already in
+// progress" comment where the running apply is applying the PR's latest commit.
+func PreviewCommentApplyInProgressLatestCommit() string {
+	return RenderApplyInProgress(ApplyLockConflictData{
+		Database:            "testapp",
+		DatabaseType:        "mysql",
+		Environment:         "staging",
+		RequestedBy:         previewRequestedBy,
+		ApplyID:             "apply-a1b2c3d4e5f6",
+		ApplyState:          "running",
+		ApplyAgainCommand:   ApplyCommand("staging", "", ApplyCommandOptions{}),
+		AppliesLatestCommit: true,
+	})
+}
+
 // PreviewCommentApplyBlockedClosedPR renders a sample apply rejection for a
 // closed-but-unmerged PR.
 func PreviewCommentApplyBlockedClosedPR() string {

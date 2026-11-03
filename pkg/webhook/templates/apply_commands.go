@@ -42,6 +42,11 @@ type ApplyLockConflictData struct {
 	// ApplyAgainConsent leads into ApplyAgainCommand: UnsafeReconsent's
 	// clause when the requester's command carried --allow-unsafe.
 	ApplyAgainConsent string
+	// AppliesLatestCommit is set when the active apply was planned from the
+	// PR's latest commit in the requested environment. It is applying this
+	// change already, so once it completes another apply has nothing to run,
+	// and the comment offers none.
+	AppliesLatestCommit bool
 
 	// CLIName is the tool name the comment's CLI command hints start with,
 	// the server's cli_name. Empty renders the CLI's own default.
@@ -486,18 +491,29 @@ func RenderApplyInProgress(data ApplyLockConflictData) string {
 		activeApply = "This PR's " + applyEnvironment + " apply"
 	}
 
+	// thenApplyAgain closes the comment with what to run once the active
+	// apply ends: the apply again, unless the active apply is already
+	// applying this PR's latest commit and leaves it nothing to run.
+	thenApplyAgain := func(lead string) {
+		if data.AppliesLatestCommit {
+			fmt.Fprintf(&sb, "It is applying this PR's latest commit, so there is nothing to apply again. Its progress comment shows when it is done.\n")
+			return
+		}
+		writeApplyAgain(&sb, lead, applyAgain, data.ApplyAgainConsent)
+	}
+
 	switch {
 	case activeApplyAwaitsCutover(data):
 		fmt.Fprintf(&sb, "%s `%s` is waiting for cutover, so a second apply cannot start.\n\n", activeApply, data.ApplyID)
 		fmt.Fprintf(&sb, "To cut over:\n```\n%s\n```\n\n", control("cutover"))
-		writeApplyAgain(&sb, "Once it completes, apply again", applyAgain, data.ApplyAgainConsent)
+		thenApplyAgain("Once it completes, apply again")
 	case state.IsState(data.ApplyState, state.Apply.RevertWindow):
 		fmt.Fprintf(&sb, "%s `%s` is in its revert window, so a second apply cannot start.\n\n", activeApply, data.ApplyID)
 		fmt.Fprintf(&sb, "To keep its changes and close the window:\n```\n%s\n```\n\n", control("skip-revert"))
-		writeApplyAgain(&sb, "Once it completes, apply again", applyAgain, data.ApplyAgainConsent)
+		thenApplyAgain("Once it completes, apply again")
 	default:
 		fmt.Fprintf(&sb, "%s `%s` is still running (state: `%s`), so a second apply cannot start.\n\n", activeApply, data.ApplyID, data.ApplyState)
-		writeApplyAgain(&sb, "Once it finishes, apply again", applyAgain, data.ApplyAgainConsent)
+		thenApplyAgain("Once it finishes, apply again")
 	}
 
 	return sb.String()

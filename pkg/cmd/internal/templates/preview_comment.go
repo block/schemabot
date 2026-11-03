@@ -293,6 +293,7 @@ func previewCommentApplyFlowAllOutput() {
 		{"APPLY BLOCKED BY OTHER PR", func() { fmt.Print(webhooktemplates.PreviewCommentApplyBlockedByOtherPR()) }},
 		{"APPLY BLOCKED BY CLI", func() { fmt.Print(webhooktemplates.PreviewCommentApplyBlockedByCLI()) }},
 		{"APPLY BLOCKED: ALREADY IN PROGRESS", func() { fmt.Print(webhooktemplates.PreviewCommentApplyInProgress()) }},
+		{"APPLY BLOCKED: ALREADY APPLYING THE LATEST COMMIT", func() { fmt.Print(webhooktemplates.PreviewCommentApplyInProgressLatestCommit()) }},
 		{"APPLY BLOCKED: PR CLOSED", func() { fmt.Print(webhooktemplates.PreviewCommentApplyBlockedClosedPR()) }},
 		{"APPLY BLOCKED: PR MERGED", func() { fmt.Print(webhooktemplates.PreviewCommentApplyBlockedMergedPR()) }},
 		{"APPLY BLOCKED: BASE SCHEMA CHANGED SINCE PR DIVERGED", func() { fmt.Print(webhooktemplates.PreviewCommentBaseSchemaFreshnessRejected()) }},
