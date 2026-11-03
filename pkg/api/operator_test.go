@@ -2762,6 +2762,54 @@ func TestDriveTick_ReservedDriverSkipsDeferredCutoverWork(t *testing.T) {
 	}
 }
 
+// The reserved driver listens on a wake channel of its own, so a pool wake
+// for an apply deferring its cutover always reaches a driver that claims it,
+// never the one driver that would skip it and leave the start to the next
+// poll tick. A pool that reserves nothing keeps every driver on one channel.
+func TestDriverWakeChannelKeepsPoolWakesOffTheReservedDriver(t *testing.T) {
+	pool := make(chan struct{}, 4)
+	reserved := make(chan struct{}, 1)
+
+	assert.Equal(t, reserved, driverWakeChannel(reservedDriverID, pool, reserved))
+	assert.Equal(t, pool, driverWakeChannel(reservedDriverID+1, pool, reserved))
+	assert.Equal(t, pool, driverWakeChannel(reservedDriverID, pool, nil), "a pool with no reserved driver shares one channel")
+}
+
+// A queued apply's wake and a started operation's wake both reach the pool and
+// the reserved driver, so whichever kind of work is waiting starts without a
+// poll tick. The reserved driver does not wake itself after its own start.
+func TestWakesReachThePoolAndTheReservedDriver(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	op := &storage.ApplyOperation{ApplyID: 1, Deployment: "default"}
+
+	newService := func() *Service {
+		svc := New(&mockStorageWithApplyStores{applies: &operationClaimApplyStore{}, operations: &claimLadderOperationStore{recoverOperationStore: &recoverOperationStore{}}}, testServerConfig(), nil, logger)
+		svc.stopRecovery = make(chan struct{})
+		svc.operatorWake = make(chan struct{}, 4)
+		svc.reservedDriverWake = make(chan struct{}, 1)
+		return svc
+	}
+
+	t.Run("queued apply", func(t *testing.T) {
+		svc := newService()
+		svc.wakeOperator("apply-1", "payments", "staging")
+		assert.Len(t, svc.operatorWake, 1)
+		assert.Len(t, svc.reservedDriverWake, 1)
+	})
+	t.Run("started by a pool driver", func(t *testing.T) {
+		svc := newService()
+		svc.wakeIdleDriver(reservedDriverID+1, op)
+		assert.Len(t, svc.operatorWake, 1)
+		assert.Len(t, svc.reservedDriverWake, 1)
+	})
+	t.Run("started by the reserved driver", func(t *testing.T) {
+		svc := newService()
+		svc.wakeIdleDriver(reservedDriverID, op)
+		assert.Len(t, svc.operatorWake, 1)
+		assert.Empty(t, svc.reservedDriverWake)
+	})
+}
+
 func TestDeferredCutoverDriversLeavesOneDriverPerPod(t *testing.T) {
 	assert.Equal(t, 0, deferredCutoverDrivers(0))
 	assert.Equal(t, 1, deferredCutoverDrivers(1), "a single driver is not reserved")

@@ -181,6 +181,11 @@ type Service struct {
 	stopRecovery   chan struct{}
 	cancelRecovery context.CancelFunc
 	operatorWake   chan struct{}
+	// reservedDriverWake is the reserved driver's own wake channel, set when
+	// the pool reserves one (see reservedDriverID). The reserved driver skips
+	// deferred-cutover work, so a wake for that work must never be spent on it:
+	// it listens here instead of on operatorWake, and every wake goes to both.
+	reservedDriverWake chan struct{}
 	// claimingStopped records that stopRecovery has been closed, so the claim
 	// gate can be closed ahead of StopOperator and closed at most once.
 	claimingStopped bool
