@@ -1887,7 +1887,9 @@ func (s *Service) recoverApplyOperationCutover(ctx context.Context, driverID int
 }
 
 // recoverApplyPendingStop drives stop reconciliation for an apply that has a
-// pending stop request but no claimable operation to carry it. Two cases reach
+// pending stop or cancel request but no claimable operation to carry it. A
+// cancel takes the same path as a stop, except that the pending operations it
+// reaches settle as cancelled rather than stopped. Two cases reach
 // here: an apply whose operation row is still pending while its task is already
 // running (a direct data-plane apply marks the task running before the operator
 // claims the operation), and an on_failure "continue" rollout where a failed
@@ -1929,6 +1931,18 @@ func (s *Service) recoverApplyPendingStop(ctx context.Context, driverID int, own
 	}
 	applyLeaseCtx := storage.WithApplyLease(ctx, lease)
 
+	// The drive consumes the request, so whether it was a cancel is read
+	// first: it decides whether the pending operations settle as cancelled or
+	// stopped once the drive lands. A cancel takes precedence over a stop, as
+	// it does in the drive.
+	cancelPending, err := s.storage.ControlRequests().GetPending(applyLeaseCtx, apply.ID, storage.ControlOperationCancel)
+	if err != nil {
+		s.logger.Error("operator: failed to load pending cancel request during stop reconciliation; apply left for the next tick",
+			append(apply.LogAttrs(),
+				"driver", driverID, "error", err)...)
+		return claimSpent
+	}
+
 	// Drive the pending stop through the data plane before terminalizing any
 	// rows. The data-plane drive (ResumeApply -> processPendingStopControlRequest
 	// -> stopOwnedApply) halts live engine work and sets the apply's tasks to
@@ -1949,14 +1963,21 @@ func (s *Service) recoverApplyPendingStop(ctx context.Context, driverID int, own
 		return claimSpent
 	}
 
-	// The data-plane drive stopped the tasks and completed the stop control
-	// request, but it does not touch apply_operations rows. Terminalize the
-	// still-pending operations so the derived parent state below stays stopped and
-	// the operation rows match the now-stopped tasks. The stop request is already
-	// completed, so this goes through the unguarded helper rather than
-	// stopPendingOperationsForPendingStop (which would no-op without a pending
-	// stop).
-	if err := s.markPendingOperationsStopped(applyLeaseCtx, driverID, apply); err != nil {
+	// The data-plane drive halted the tasks and completed the control request,
+	// but it does not touch apply_operations rows. Terminalize the still-pending
+	// operations, as cancelled under a cancel and stopped otherwise, so the
+	// derived parent state below matches the request and the operation rows match
+	// the halted tasks. The request is already completed, so this goes through
+	// the unguarded helpers rather than the post-drive sweeps, which would no-op
+	// without a pending request.
+	if cancelPending != nil {
+		if err := s.markPendingOperationsCancelled(applyLeaseCtx, driverID, apply); err != nil {
+			s.logger.Error("operator: failed to cancel pending sibling operations during stop reconciliation",
+				append(apply.LogAttrs(),
+					"driver", driverID, "error", err)...)
+			return claimSpent
+		}
+	} else if err := s.markPendingOperationsStopped(applyLeaseCtx, driverID, apply); err != nil {
 		s.logger.Error("operator: failed to stop pending sibling operations during stop reconciliation",
 			append(apply.LogAttrs(),
 				"driver", driverID, "error", err)...)
@@ -2250,6 +2271,13 @@ func (s *Service) cancelPendingOperationsForPendingCancel(ctx context.Context, d
 	if controlReq == nil {
 		return nil
 	}
+	return s.markPendingOperationsCancelled(ctx, driverID, apply)
+}
+
+// markPendingOperationsCancelled terminalizes every operation of the apply
+// that never started as cancelled, whether or not a cancel is still pending.
+// Stop reconciliation calls it after its drive has completed the cancel.
+func (s *Service) markPendingOperationsCancelled(ctx context.Context, driverID int, apply *storage.Apply) error {
 	cancelled, err := s.storage.ApplyOperations().MarkPendingCancelledByApply(ctx, apply.ID)
 	if err != nil {
 		return fmt.Errorf("cancel pending apply_operations for apply %s (%d): %w", apply.ApplyIdentifier, apply.ID, err)

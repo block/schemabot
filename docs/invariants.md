@@ -1247,9 +1247,13 @@ terminal resolution of a typed unsupported-operation
 decline (`failPendingRequestForUnsupportedOperation`, `pkg/tern/local_control.go`), reached from
 the stop and cancel paths in that file and from the revert and skip-revert paths in
 `pkg/tern/local_apply_grouped.go`, the claim arms that hand a pending cancel to a rollout's
-stopped and cutover-parked operations and a pending stop to its cutover-parked ones (`FindNextApplyOperation`,
-`pkg/storage/internal/sqlstore/apply_operations.go`) and the settling of its never-started
-operations on the spot (`cancelPendingOperationsForPendingCancel`, `pkg/api/operator.go`), the refusal paths of the pending control-request processors
+stopped and cutover-parked operations and a pending stop to its cutover-parked ones, and that keep
+its pending operations from starting while either pends (`FindNextApplyOperation`,
+`pkg/storage/internal/sqlstore/apply_operations.go`), the settling of its never-started
+operations on the spot (`cancelPendingOperationsForPendingCancel`, `pkg/api/operator.go`), and,
+when no active operation is left to carry the request, stop reconciliation
+(`recoverApplyPendingStop`, `pkg/api/operator.go`, claimed by `FindNextApplyForStopReconciliation`,
+`pkg/storage/internal/sqlstore/applies.go`), the refusal paths of the pending control-request processors
 on both clients (`pkg/tern/local_control.go`, `pkg/tern/grpc_client.go`), and the reaper's sweep
 of requests left pending on an apply that has settled and that no drive still holds
 (`pkg/api/reaper.go`, `ListStrandedPending` in `pkg/storage/internal/sqlstore/control_requests.go`),
