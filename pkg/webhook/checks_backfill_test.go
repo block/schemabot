@@ -119,11 +119,9 @@ func TestBackfillPRCheckRunsReplaysAutoPlanFlow(t *testing.T) {
 		}))
 	})
 	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1/files", func(w http.ResponseWriter, _ *http.Request) {
-		require.NoError(t, json.NewEncoder(w).Encode([]map[string]any{{
-			"filename":  "docs/readme.md",
-			"status":    "modified",
-			"additions": 4,
-			"deletions": 2,
+		require.NoError(t, json.NewEncoder(w).Encode([]map[string]string{{
+			"filename": "docs/readme.md",
+			"status":   "modified",
 		}}))
 	})
 	store := &appliesByStateStorage{applies: []*storage.Apply{

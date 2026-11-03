@@ -632,7 +632,7 @@ func IsSchemaFile(filename string) bool {
 // should refresh the visible SchemaBot plan.
 func HasSchemaInputFiles(files []PRFile) bool {
 	for _, file := range files {
-		if file.Symlink || file.PreviousSymlink || isSchemaInputFile(file.Filename) || isSchemaInputFile(file.PreviousFilename) {
+		if isSchemaInputFile(file.Filename) || isSchemaInputFile(file.PreviousFilename) {
 			return true
 		}
 	}
@@ -671,7 +671,7 @@ func renamedAwaySchemaPath(file PRFile) (string, bool) {
 // isDiscoveryInputPRFile reports whether a changed file can make a pull request
 // resolve a database, by its current path or by the schema path it vacated.
 func isDiscoveryInputPRFile(file PRFile) bool {
-	if file.Symlink || isDiscoveryInputFile(file.Filename) {
+	if isDiscoveryInputFile(file.Filename) {
 		return true
 	}
 	_, vacated := renamedAwaySchemaPath(file)
@@ -685,10 +685,6 @@ func HasDiscoveryInputFiles(files []PRFile) bool {
 	return slices.ContainsFunc(files, isDiscoveryInputPRFile)
 }
 
-func isAddedPRFile(status string) bool {
-	return strings.EqualFold(status, "added")
-}
-
 func isRemovedPRFile(status string) bool {
 	return strings.EqualFold(status, "removed")
 }
@@ -698,16 +694,14 @@ func isRenamedPRFile(status string) bool {
 }
 
 // DiscoverySchemaPaths returns the schema file paths discovery walks up from:
-// each changed file's current path when it is a schema file or a symlink, and
-// the schema path a rename vacated. Callers deciding whether a pull request needs config
+// each changed file's current path when it is a schema file, and the schema
+// path a rename vacated. Callers deciding whether a pull request needs config
 // discovery at all read the same paths, so a rename that vacates a schema
 // path is never read as "no schema files changed".
 func DiscoverySchemaPaths(files []PRFile) []string {
 	var result []string
 	for _, file := range files {
-		// A changed symlink, such as an environment link, sits inside the
-		// config directory it changes, so discovery walks up from it too.
-		if file.Symlink || IsSchemaFile(file.Filename) {
+		if IsSchemaFile(file.Filename) {
 			result = append(result, file.Filename)
 		}
 		if vacated, ok := renamedAwaySchemaPath(file); ok {

@@ -11,8 +11,8 @@ import (
 	"github.com/block/schemabot/pkg/metrics"
 )
 
-// unmanagedServerManagedSchemaChanges returns the changed schema files and
-// symlinks in the PR that live under a directory the server config manages
+// unmanagedServerManagedSchemaChanges returns the changed schema files in the PR
+// that live under a directory the server config manages
 // (databases.<db>.allowed_dirs) but are not covered by any discovered
 // schemabot.yaml. A non-empty result means the PR is changing server-owned
 // schema with no managing config — for example because it removed the config
@@ -30,9 +30,7 @@ func (h *Handler) unmanagedServerManagedSchemaChanges(repo string, files []ghcli
 
 	var unmanaged []string
 	for _, f := range files {
-		// A symlink, such as an environment or namespace link, changes
-		// which schema files the directory declares.
-		if !ghclient.IsSchemaFile(f.Filename) && !f.Symlink {
+		if !ghclient.IsSchemaFile(f.Filename) {
 			continue
 		}
 		// A schema file being deleted is not an unmanaged change; only files
