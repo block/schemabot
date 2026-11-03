@@ -2067,6 +2067,93 @@ func TestApplyOperations(t *testing.T, h Harness) {
 		assert.NotNil(t, operation.StartedAt)
 	})
 
+	// MarkFailedRetryable verifies the pause write records the failure reason
+	// on a resumable row, leaving completed_at unset because the row is not
+	// terminal, and that it takes the same lease fence as the other operation
+	// writes: a holder whose lease was rotated away changes nothing.
+	t.Run("MarkFailedRetryable", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "operation_failed_retryable_db", storage.DatabaseTypeMySQL)
+		apply := CreateApply(t, store, lock, "apply_operation_failed_retryable", 912)
+		opID := createOperation(t, store, apply.ID, "region-a", "commerce/group_finalizer")
+		claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "current-driver")
+		require.NoError(t, err)
+		require.NotNil(t, claimed)
+
+		staleCtx := storage.WithOperationLease(ctx, storage.OperationLease{
+			ApplyID: apply.ID, OperationID: opID, Owner: "old-driver", Token: "stale-token",
+		})
+		require.ErrorIs(t, store.ApplyOperations().MarkFailedRetryable(staleCtx, opID, "storage unavailable"), storage.ErrApplyLeaseLost)
+		operation, err := store.ApplyOperations().Get(ctx, opID)
+		require.NoError(t, err)
+		require.NotNil(t, operation)
+		assert.Equal(t, state.ApplyOperation.Running, operation.State, "a stale lease holder must not pause the row")
+		assert.Empty(t, operation.ErrorMessage)
+
+		ownedCtx := storage.WithOperationLease(ctx, storage.OperationLease{
+			ApplyID: apply.ID, OperationID: opID, Owner: claimed.LeaseOwner, Token: claimed.LeaseToken,
+		})
+		require.NoError(t, store.ApplyOperations().MarkFailedRetryable(ownedCtx, opID, "storage unavailable"))
+		operation, err = store.ApplyOperations().Get(ctx, opID)
+		require.NoError(t, err)
+		require.NotNil(t, operation)
+		assert.Equal(t, state.ApplyOperation.FailedRetryable, operation.State)
+		assert.Equal(t, "storage unavailable", operation.ErrorMessage)
+		assert.Nil(t, operation.CompletedAt, "a resumable row carries no completion time")
+		assert.False(t, state.IsApplyOperationTerminal(operation.State))
+
+		require.NoError(t, store.ApplyOperations().MarkFailedRetryable(ownedCtx, opID, "storage unavailable"),
+			"re-issuing the same pause is a no-op, not an error")
+
+		err = store.ApplyOperations().MarkFailedRetryable(ctx, 999999, "storage unavailable")
+		require.ErrorIs(t, err, storage.ErrApplyOperationNotFound)
+	})
+
+	// ClearEngineResumeState verifies the clear removes both the context and
+	// the metadata so a later read reports the state missing, takes the same
+	// lease fence as the other operation writes, and is a no-op on a row whose
+	// state is already absent.
+	t.Run("ClearEngineResumeState", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "operation_clear_resume_db", storage.DatabaseTypeMySQL)
+		apply := CreateApply(t, store, lock, "apply_operation_clear_resume", 913)
+		opID := createOperation(t, store, apply.ID, "region-a", "commerce/group_finalizer")
+		claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "current-driver")
+		require.NoError(t, err)
+		require.NotNil(t, claimed)
+		ownedCtx := storage.WithOperationLease(ctx, storage.OperationLease{
+			ApplyID: apply.ID, OperationID: opID, Owner: claimed.LeaseOwner, Token: claimed.LeaseToken,
+		})
+		require.NoError(t, store.ApplyOperations().SaveEngineResumeState(ownedCtx, opID, &storage.EngineResumeState{
+			ApplyOperationID: opID, MigrationContext: "deploy-ns-0", Metadata: `{"handoff":"true"}`,
+		}))
+
+		staleCtx := storage.WithOperationLease(ctx, storage.OperationLease{
+			ApplyID: apply.ID, OperationID: opID, Owner: "old-driver", Token: "stale-token",
+		})
+		require.ErrorIs(t, store.ApplyOperations().ClearEngineResumeState(staleCtx, opID), storage.ErrApplyLeaseLost)
+		stored, err := store.ApplyOperations().GetEngineResumeState(ctx, opID)
+		require.NoError(t, err, "a stale lease holder must not clear the state")
+		assert.Equal(t, "deploy-ns-0", stored.MigrationContext)
+		assert.JSONEq(t, `{"handoff":"true"}`, stored.Metadata)
+
+		require.NoError(t, store.ApplyOperations().ClearEngineResumeState(ownedCtx, opID))
+		_, err = store.ApplyOperations().GetEngineResumeState(ctx, opID)
+		require.ErrorIs(t, err, storage.ErrEngineResumeStateNotFound, "a cleared row reads as never handed to the engine")
+		operation, err := store.ApplyOperations().Get(ctx, opID)
+		require.NoError(t, err)
+		require.NotNil(t, operation)
+		assert.Equal(t, state.ApplyOperation.Running, operation.State, "the clear touches only the resume state")
+
+		require.NoError(t, store.ApplyOperations().ClearEngineResumeState(ownedCtx, opID),
+			"clearing an already-cleared row is a no-op, not an error")
+
+		err = store.ApplyOperations().ClearEngineResumeState(ctx, 999999)
+		require.ErrorIs(t, err, storage.ErrApplyOperationNotFound)
+	})
+
 	// An operation row carries no terminal-state guard: the lease fence alone
 	// decides who may write it. No peer can claim a terminal operation, so what
 	// refuses a late write is the drive's end handing its lease back: after

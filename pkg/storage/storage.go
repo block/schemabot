@@ -1575,6 +1575,16 @@ type ApplyOperationStore interface {
 	// MarkFailed sets state=failed, error_message, and completed_at on a child row.
 	MarkFailed(ctx context.Context, id int64, errMsg string) error
 
+	// MarkFailedRetryable pauses a child row for automatic retry: it sets
+	// state=failed_retryable and error_message and leaves completed_at unset,
+	// since the row is resumable rather than terminal. The claim re-leases the
+	// row only while its parent apply is failed_retryable and has retry budget
+	// left, so the pause is bounded by the parent's recovery budget. Use it for
+	// a drive that records its own outcome on a row with no tasks to derive one
+	// from, such as a group_finalizer; a row with tasks derives the state from
+	// them and writes it through UpdateState.
+	MarkFailedRetryable(ctx context.Context, id int64, errMsg string) error
+
 	// MarkTerminal sets a terminal state and stamps completed_at on a child row.
 	// Use for terminal states that record a reconciliation time (cancelled,
 	// reverted). Do not use for stopped: stopped is resumable, so it keeps
@@ -1618,6 +1628,15 @@ type ApplyOperationStore interface {
 
 	// GetEngineResumeState returns opaque engine resume state for the operation.
 	GetEngineResumeState(ctx context.Context, operationID int64) (*EngineResumeState, error)
+
+	// ClearEngineResumeState removes the operation's engine resume state, so a
+	// later GetEngineResumeState reports ErrEngineResumeStateNotFound and the
+	// next drive starts the engine work afresh. Use it only when the engine has
+	// proved it holds none of the work the state described; state naming work
+	// that may be live is never cleared. The write takes the same lease guard
+	// as the other operation writes. Returns ErrApplyOperationNotFound if no
+	// row matches the ID.
+	ClearEngineResumeState(ctx context.Context, operationID int64) error
 
 	// SaveProgressMetadata stores the latest engine progress display metadata.
 	// A new attempt can display the prior attempt's position until its first progress save.
