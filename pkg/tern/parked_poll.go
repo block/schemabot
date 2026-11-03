@@ -16,7 +16,7 @@ import (
 // seen within this interval. It must stay well inside
 // storage.ApplyDriveStallAfter, or the operator would read the quiet task rows
 // as a wedged drive and cancel it.
-const parkedFullPollInterval = 30 * time.Second
+const parkedFullPollInterval = 5 * time.Second
 
 // parkedPoll paces a drive's poll loop while it holds at a deferred cutover.
 // Until the drive reports that it holds there, every tick runs the full poll.
