@@ -40,7 +40,7 @@ type ApplyLockConflictData struct {
 	// environment's plain apply command.
 	ApplyAgainCommand string
 	// ApplyAgainConsent leads into ApplyAgainCommand: UnsafeReconsent's
-	// sentence when the requester's command carried --allow-unsafe.
+	// clause when the requester's command carried --allow-unsafe.
 	ApplyAgainConsent string
 
 	// CLIName is the tool name the comment's CLI command hints start with,
@@ -506,7 +506,7 @@ func RenderApplyInProgress(data ApplyLockConflictData) string {
 // writeApplyAgain writes the apply to run again in its own fenced block, led
 // into by consent when there is one.
 func writeApplyAgain(sb *strings.Builder, lead, command, consent string) {
-	writeRerunCommand(sb, lead, consent, command, "\n")
+	writeRerunCommand(sb, lead, ", and ", consent, command, "\n")
 }
 
 // ApplyLockIntentChangedData describes an apply or apply-confirm rejected
@@ -518,7 +518,7 @@ type ApplyLockIntentChangedData struct {
 	Environment string
 	RequestedBy string
 	// ApplyAgainCommand is the apply to re-run, scoped and optioned as the
-	// operator sent it, and ApplyAgainConsent the sentence that leads into it.
+	// operator sent it, and ApplyAgainConsent the clause that leads into it.
 	ApplyAgainCommand string
 	ApplyAgainConsent string
 }
@@ -528,7 +528,7 @@ type ApplyLockIntentChangedData struct {
 // set it; a retry finds it and reports which command holds the lock and how to
 // settle it, or plans afresh when the lock is free. The command to re-run is
 // rendered in full rather than as a clamped error detail, so a long database
-// name or option list never cuts it or its consent sentence short.
+// name or option list never cuts it or its consent clause short.
 func RenderApplyLockIntentChanged(data ApplyLockIntentChangedData) string {
 	var sb strings.Builder
 

@@ -3658,27 +3658,26 @@ func ApplyCommand(environment, database string, opts ApplyCommandOptions) string
 	return scopedApplyCommand("schemabot apply", environment, database, opts)
 }
 
-// UnsafeReconsent is the consent sentence that leads into an ApplyCommand
-// built from a command that carried --allow-unsafe, and empty for one that did
-// not. Like every unsafe-change rejection, it states the consent before the
-// command rather than putting the flag in it, so consenting again takes typing
-// it.
+// UnsafeReconsent is the consent clause that leads into an ApplyCommand built
+// from a command that carried --allow-unsafe, and empty for one that did not.
+// Like the plan comment's apply instruction, it states the consent in the
+// sentence that leads into the command rather than putting the flag in it, so
+// consenting again takes typing it.
 func UnsafeReconsent(opts ApplyCommandOptions) string {
 	if !opts.AllowUnsafe {
 		return ""
 	}
-	return "**" + glyph.Escalation + " To proceed with unsafe changes**, add `--allow-unsafe` to confirm them again"
+	return "add `--allow-unsafe` to confirm unsafe changes"
 }
 
 // writeRerunCommand writes lead and the apply to re-run in its own fenced
-// block. A consent sentence, when there is one, follows lead and leads into
-// the command. gap separates the lead-in from the fence.
-func writeRerunCommand(sb *strings.Builder, lead, consent, command, gap string) {
-	if consent == "" {
-		fmt.Fprintf(sb, "%s:%s", lead, gap)
-	} else {
-		fmt.Fprintf(sb, "%s.\n\n%s:%s", lead, consent, gap)
+// block. A consent clause, when there is one, joins lead with join and leads
+// into the command. gap separates the lead-in from the fence.
+func writeRerunCommand(sb *strings.Builder, lead, join, consent, command, gap string) {
+	if consent != "" {
+		lead += join + consent
 	}
+	fmt.Fprintf(sb, "%s:%s", lead, gap)
 	writeCommandBlock(sb, command)
 }
 
@@ -3808,7 +3807,7 @@ func writeCommandBlock(sb *strings.Builder, command string) {
 // writeApplyCommandBlock writes lead and an apply the operator is asked to run
 // again in its own fenced block, led into by UnsafeReconsent when there is one.
 func writeApplyCommandBlock(sb *strings.Builder, lead, environment, database string, opts ApplyCommandOptions) {
-	writeRerunCommand(sb, lead, UnsafeReconsent(opts), ApplyCommand(environment, database, opts), "\n\n")
+	writeRerunCommand(sb, lead, ", ", UnsafeReconsent(opts), ApplyCommand(environment, database, opts), "\n\n")
 }
 
 // allPlansIdentical returns true if all environments have identical changes.
