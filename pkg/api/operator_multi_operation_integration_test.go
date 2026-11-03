@@ -474,7 +474,75 @@ func TestOperatorMultiOperationMatrix(t *testing.T) {
 		assert.Equal(t, state.ApplyOperation.Cancelled, opState(t, ctx, stor, seed.opID("region-b")),
 			"a cancel accepted during the drive must settle the pending sibling cancelled, not stopped")
 		apply := getApply(t, ctx, stor, seed.applyID)
-		assert.NotEqual(t, state.Apply.Stopped, apply.State, "a cancelled rollout must not read as stopped")
+		assert.Equal(t, state.Apply.Failed, apply.State,
+			"region-a failed and region-b was cancelled, so the rollout reads failed rather than stopped")
+		assert.True(t, controlRequestCompleted(t, ctx, stor, seed.applyID, storage.ControlOperationCancel),
+			"the rollout reached a terminal state, so its cancel request is no longer pending")
+	})
+
+	t.Run("CancelOfSingleOperationApplyDrivesThroughDataPlane", func(t *testing.T) {
+		resetMatrixTables(t, ctx, db)
+		// A single-operation apply whose operation is still pending, with a
+		// queued cancel. Its pending operation can carry a task the data plane
+		// already started, so stop reconciliation drives the cancel through the
+		// data plane before it settles the operation cancelled.
+		seed := seedGroupedApply(t, ctx, stor, multiOpSeed{
+			applyIdentifier: "matrix-single-cancel",
+			parentState:     state.Apply.Pending,
+			cutoverPolicy:   storage.CutoverPolicyRolling,
+			onFailure:       storage.OnFailureHalt,
+			deployments:     []string{"region-a"},
+			opState:         state.ApplyOperation.Pending,
+			taskState:       state.Task.Pending,
+		})
+		requestPendingCancel(t, ctx, stor, seed.applyID)
+
+		rec := &driveRecorder{}
+		clients := matrixClients(stor, rec, map[string]matrixOutcome{
+			"region-a": {taskState: state.Task.Pending},
+		})
+		svc := newMatrixService(t, stor, clients)
+
+		svc.recoverApplies(ctx, 1, openClaimGate())
+
+		assert.Empty(t, rec.resumeOrder(), "a pending cancel must not start the operation")
+		assert.NotNil(t, clients["region-a/staging"].(*matrixTernClient).resumeApply,
+			"a single-operation apply is driven through the data plane before its operation settles")
+		assert.Equal(t, state.ApplyOperation.Cancelled, opState(t, ctx, stor, seed.opID("region-a")))
+		assert.Equal(t, state.Apply.Cancelled, getApply(t, ctx, stor, seed.applyID).State)
+		assert.True(t, controlRequestCompleted(t, ctx, stor, seed.applyID, storage.ControlOperationCancel),
+			"the apply settled cancelled, so its cancel request must be completed")
+	})
+
+	t.Run("RefusedCancelLeavesPendingOperationsToRun", func(t *testing.T) {
+		resetMatrixTables(t, ctx, db)
+		// A single-operation apply with a queued cancel that the data plane
+		// refuses during the drive. The cancel did not take effect and no stop
+		// is pending, so the operation stays pending for the operation claim
+		// instead of reading cancelled while its work goes on.
+		seed := seedGroupedApply(t, ctx, stor, multiOpSeed{
+			applyIdentifier: "matrix-refused-cancel",
+			parentState:     state.Apply.Pending,
+			cutoverPolicy:   storage.CutoverPolicyRolling,
+			onFailure:       storage.OnFailureHalt,
+			deployments:     []string{"region-a"},
+			opState:         state.ApplyOperation.Pending,
+			taskState:       state.Task.Pending,
+		})
+		requestPendingCancel(t, ctx, stor, seed.applyID)
+
+		rec := &driveRecorder{}
+		clients := matrixClients(stor, rec, map[string]matrixOutcome{
+			"region-a": {taskState: state.Task.Pending},
+		})
+		clients["region-a/staging"] = &refuseCancelDuringDriveClient{matrixTernClient: clients["region-a/staging"].(*matrixTernClient)}
+		svc := newMatrixService(t, stor, clients)
+
+		svc.recoverApplies(ctx, 1, openClaimGate())
+
+		assert.Equal(t, state.ApplyOperation.Pending, opState(t, ctx, stor, seed.opID("region-a")),
+			"a refused cancel must not settle the operation cancelled")
+		assert.NotEqual(t, state.Apply.Cancelled, getApply(t, ctx, stor, seed.applyID).State)
 	})
 
 	t.Run("ConcurrentSiblingCompletionsPublishOneSummary", func(t *testing.T) {
@@ -906,6 +974,27 @@ func (c *cancelDuringDriveClient) ResumeApply(ctx context.Context, apply *storag
 		return fmt.Errorf("matrix fake: request cancel during drive: %w", err)
 	}
 	return c.matrixTernClient.ResumeApply(ctx, apply)
+}
+
+// refuseCancelDuringDriveClient fails the pending cancel request when a
+// whole-apply drive runs, as the drive does when the data plane refuses the
+// cancel, and leaves the apply's own state untouched.
+type refuseCancelDuringDriveClient struct {
+	*matrixTernClient
+}
+
+func (c *refuseCancelDuringDriveClient) ResumeApply(ctx context.Context, apply *storage.Apply) error {
+	if err := c.stor.ControlRequests().FailPending(ctx, apply.ID, storage.ControlOperationCancel, "the data plane refused the cancel"); err != nil {
+		return fmt.Errorf("matrix fake: refuse cancel during drive: %w", err)
+	}
+	return c.matrixTernClient.ResumeApply(ctx, apply)
+}
+
+func controlRequestCompleted(t *testing.T, ctx context.Context, stor storage.Storage, applyID int64, operation storage.ControlOperation) bool {
+	t.Helper()
+	pending, err := stor.ControlRequests().GetPending(ctx, applyID, operation)
+	require.NoError(t, err)
+	return pending == nil
 }
 
 func stalenessBackdate(t *testing.T, ctx context.Context, db *sql.DB, applyID int64) {

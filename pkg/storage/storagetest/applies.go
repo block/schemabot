@@ -1224,6 +1224,45 @@ func TestApplies(t *testing.T, h Harness) {
 		assert.Nil(t, cutover, "the parked operation still does not cut over behind the failure")
 	})
 
+	// A cancel reaches a rollout between members: region-a has completed and
+	// region-b has not started. While the cancel pends, region-b is not
+	// claimed, so no engine work begins on a rollout the operator has asked to
+	// cancel, and stop reconciliation claims the apply to settle the cancel.
+	t.Run("FindNextApplyOperation_PendingCancelHoldsNextMember", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "apply_rollout_cancel_gate_db", storage.DatabaseTypeMySQL)
+		rollout := CreateApplyWithStateEnvDeployment(t, store, lock, "apply_rollout_cancel_gate", 9336, state.Apply.Running, "production", "region-a")
+		for _, member := range []struct{ deployment, state string }{
+			{"region-a", state.ApplyOperation.Completed},
+			{"region-b", state.ApplyOperation.Pending},
+		} {
+			_, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+				ApplyID: rollout.ID, Deployment: member.deployment, OperationKind: storage.ApplyOperationKindWork,
+				CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt, State: member.state,
+			})
+			require.NoError(t, err)
+		}
+
+		_, alreadyPending, err := store.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+			ApplyID:   rollout.ID,
+			Operation: storage.ControlOperationCancel,
+			Status:    storage.ControlRequestPending,
+			Metadata:  []byte(`{}`),
+		})
+		require.NoError(t, err)
+		require.False(t, alreadyPending)
+
+		claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-a")
+		require.NoError(t, err)
+		assert.Nil(t, claimed, "a pending cancel keeps the next member from starting")
+
+		reconciled, err := store.Applies().FindNextApplyForStopReconciliation(ctx, "driver-b")
+		require.NoError(t, err)
+		require.NotNil(t, reconciled, "with nothing active to carry it, the cancel is settled by stop reconciliation")
+		assert.Equal(t, rollout.ID, reconciled.ID)
+	})
+
 	// A stop reaches a barrier rollout while shard 1 is still copying and
 	// shard 2 has parked at the barrier. Shard 1's drive stops its own copy,
 	// but shard 2's copy drive already exited at the barrier, and a pending

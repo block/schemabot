@@ -1889,16 +1889,24 @@ func (s *Service) recoverApplyOperationCutover(ctx context.Context, driverID int
 // recoverApplyPendingStop drives stop reconciliation for an apply that has a
 // pending stop or cancel request but no claimable operation to carry it. A
 // cancel takes the same path as a stop, except that the pending operations it
-// reaches settle as cancelled rather than stopped. Two cases reach
-// here: an apply whose operation row is still pending while its task is already
-// running (a direct data-plane apply marks the task running before the operator
-// claims the operation), and an on_failure "continue" rollout where a failed
-// earlier sibling left only terminal and pending operations that the claim gate
-// keeps from starting. In both cases the normal operation-claim path never
-// drives the apply, so its stop would strand forever. This path claims the apply
-// directly, drives the data-plane stop so the engine halts and the tasks settle
-// to stopped, terminalizes the pending operation rows, re-derives the parent,
-// and completes the stop once the apply is terminal.
+// reaches settle as cancelled rather than stopped. These cases reach here:
+//   - an apply whose operation row is still pending while its task is already
+//     running (a direct data-plane apply marks the task running before the
+//     operator claims the operation);
+//   - an on_failure "continue" rollout where a failed earlier sibling left only
+//     terminal and pending operations;
+//   - a rollout between members, where one member finished and the next has
+//     not started;
+//   - an apply whose operations are all still pending.
+//
+// In each, the claim gate keeps the pending operations from starting while the
+// request pends, so the normal operation-claim path never drives the apply and
+// its request would strand forever. This path claims the apply directly. A
+// cancel whose rollout members never started settles them in storage; otherwise
+// the request is driven through the data plane so the engine halts and the
+// tasks settle, and the pending operation rows are then terminalized from what
+// the drive landed. Finally the parent is re-derived and the request is
+// completed once it has reached every operation.
 //
 // The pass is spent when an apply was claimed, whether the reconciliation that
 // followed succeeded, hit an error, or the claim returned an invalid lease, so
@@ -1934,6 +1942,13 @@ func (s *Service) recoverApplyPendingStop(ctx context.Context, driverID int, own
 	cancelPending, err := s.storage.ControlRequests().GetPending(applyLeaseCtx, apply.ID, storage.ControlOperationCancel)
 	if err != nil {
 		s.logger.Error("operator: failed to load pending cancel request during stop reconciliation; apply left for the next tick",
+			append(apply.LogAttrs(),
+				"driver", driverID, "error", err)...)
+		return claimSpent
+	}
+	stopPending, err := s.storage.ControlRequests().GetPending(applyLeaseCtx, apply.ID, storage.ControlOperationStop)
+	if err != nil {
+		s.logger.Error("operator: failed to load pending stop request during stop reconciliation; apply left for the next tick",
 			append(apply.LogAttrs(),
 				"driver", driverID, "error", err)...)
 		return claimSpent
@@ -1994,25 +2009,34 @@ func (s *Service) recoverApplyPendingStop(ctx context.Context, driverID int, own
 	// the halted tasks. The request is already completed, so this goes through
 	// the unguarded helpers rather than the post-drive sweeps, which would no-op
 	// without a pending request.
-	cancelled, err := s.stopReconciliationCancelled(applyLeaseCtx, apply, cancelPending != nil)
+	outcome, err := s.stopReconciliationOutcome(applyLeaseCtx, apply, stopPending != nil)
 	if err != nil {
-		s.logger.Error("operator: failed to read whether a cancel reached the apply during stop reconciliation; pending operations left for the next tick",
+		s.logger.Error("operator: failed to read what the stop reconciliation drive landed; pending operations left for the next tick",
 			append(apply.LogAttrs(),
 				"driver", driverID, "error", err)...)
 		return claimSpent
 	}
-	if cancelled {
+	switch outcome {
+	case stopReconciliationCancels:
 		if err := s.markPendingOperationsCancelled(applyLeaseCtx, driverID, apply); err != nil {
 			s.logger.Error("operator: failed to cancel pending sibling operations during stop reconciliation",
 				append(apply.LogAttrs(),
 					"driver", driverID, "error", err)...)
 			return claimSpent
 		}
-	} else if err := s.markPendingOperationsStopped(applyLeaseCtx, driverID, apply); err != nil {
-		s.logger.Error("operator: failed to stop pending sibling operations during stop reconciliation",
-			append(apply.LogAttrs(),
-				"driver", driverID, "error", err)...)
-		return claimSpent
+	case stopReconciliationStops:
+		if err := s.markPendingOperationsStopped(applyLeaseCtx, driverID, apply); err != nil {
+			s.logger.Error("operator: failed to stop pending sibling operations during stop reconciliation",
+				append(apply.LogAttrs(),
+					"driver", driverID, "error", err)...)
+			return claimSpent
+		}
+	default:
+		// The drive settled the cancel without cancelling the apply, as it
+		// does when the data plane refuses one, and no stop was pending, so
+		// the operator's latest intent leaves the pending operations to run.
+		s.logger.Info("operator: stop reconciliation drive landed neither a stop nor a cancel; pending operations left for the operation claim",
+			append(apply.LogAttrs(), "driver", driverID)...)
 	}
 
 	return s.settleStopReconciliation(applyLeaseCtx, driverID, apply)
@@ -2052,31 +2076,48 @@ func (s *Service) cancelSettlesWithoutEngine(ctx context.Context, apply *storage
 	return true, nil
 }
 
-// stopReconciliationCancelled reports whether the pending operations a stop
-// reconciliation drive leaves behind settle as cancelled. A cancel accepted
-// after the drive began is still the operator's latest intent: the drive may
-// have consumed it and cancelled the apply, or it may still be pending, and
-// in either case stopping the operations would turn a cancelled rollout back
-// into a resumable one.
-func (s *Service) stopReconciliationCancelled(ctx context.Context, apply *storage.Apply, cancelPendingBeforeDrive bool) (bool, error) {
-	if cancelPendingBeforeDrive {
-		return true, nil
-	}
+// stopReconciliationOutcome is how the pending operations a stop
+// reconciliation drive leaves behind settle.
+type stopReconciliationOutcome int
+
+const (
+	// stopReconciliationLeaves leaves them pending for the operation claim.
+	stopReconciliationLeaves stopReconciliationOutcome = iota
+	// stopReconciliationStops settles them stopped.
+	stopReconciliationStops
+	// stopReconciliationCancels settles them cancelled.
+	stopReconciliationCancels
+)
+
+// stopReconciliationOutcome decides, from what the drive left in storage, how
+// the pending operations settle. A cancel is the stronger intent, so they
+// settle cancelled when a cancel is still pending, including one accepted
+// while the drive ran, or when the drive cancelled the apply. A cancel the
+// drive settled without cancelling the apply, as it does when the data plane
+// refuses one, did not take effect, so they settle stopped only when a stop
+// was pending before the drive, and are otherwise left to run.
+func (s *Service) stopReconciliationOutcome(ctx context.Context, apply *storage.Apply, stopPendingBeforeDrive bool) (stopReconciliationOutcome, error) {
 	pending, err := s.storage.ControlRequests().GetPending(ctx, apply.ID, storage.ControlOperationCancel)
 	if err != nil {
-		return false, fmt.Errorf("load pending cancel request for apply %s: %w", apply.ApplyIdentifier, err)
+		return stopReconciliationLeaves, fmt.Errorf("load pending cancel request for apply %s: %w", apply.ApplyIdentifier, err)
 	}
 	if pending != nil {
-		return true, nil
+		return stopReconciliationCancels, nil
 	}
 	stored, err := s.storage.Applies().Get(ctx, apply.ID)
 	if err != nil {
-		return false, fmt.Errorf("reload apply %s: %w", apply.ApplyIdentifier, err)
+		return stopReconciliationLeaves, fmt.Errorf("reload apply %s: %w", apply.ApplyIdentifier, err)
 	}
 	if stored == nil {
-		return false, fmt.Errorf("reload apply %s: %w", apply.ApplyIdentifier, storage.ErrApplyNotFound)
+		return stopReconciliationLeaves, fmt.Errorf("reload apply %s: %w", apply.ApplyIdentifier, storage.ErrApplyNotFound)
 	}
-	return state.IsState(stored.State, state.Apply.Cancelled), nil
+	if state.IsState(stored.State, state.Apply.Cancelled) {
+		return stopReconciliationCancels, nil
+	}
+	if stopPendingBeforeDrive {
+		return stopReconciliationStops, nil
+	}
+	return stopReconciliationLeaves, nil
 }
 
 // settleStopReconciliation re-derives the apply from its operation rows once
