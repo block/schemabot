@@ -1685,6 +1685,9 @@ func (s *Service) driveClaimedMultiOperation(ctx context.Context, driverID int, 
 	// be re-leased forever. markOperationFromOwnResult derives the operation from
 	// its tasks: a still-running task set leaves it claimable (a benign no-op),
 	// while a terminal task set terminalizes it.
+	//
+	// An operation its remote apply settled before reaching arrives the same
+	// way: the drive failed its tasks with that reason.
 	marked, err := s.markOperationFromOwnResult(operationLeaseCtx, driverID, op)
 	if err != nil {
 		s.logger.Error("operator: failed to update apply_operation from its tasks; derived apply state not updated",
@@ -2910,6 +2913,21 @@ func (s *Service) resumeClaimedApplyWithOptions(ctx context.Context, driverID in
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil {
 			logger.Debug("operator: stopped while running claimed apply",
 				"error", err)
+			if retryableClaim {
+				metrics.AdjustActiveApplies(ctx, -1, apply.Database, deployment, apply.Environment)
+			}
+			return false, err
+		}
+		if errors.Is(err, tern.ErrRemoteOperationNeverStarts) {
+			// The data plane settled the apply this operation belongs to before
+			// the operation began, so it will never run there. The drive settled
+			// the operation's tasks the way the remote apply settled, with that
+			// reason, and the caller derives the operation and the rollout from
+			// them.
+			logger.Warn("operator: remote operation will never start because its remote apply settled first; deriving the operation from its settled tasks",
+				"apply_operation_id", applyOperationID,
+				"error", err)
+			metrics.RecordOperatorResumeFailure(ctx, apply.Database, deployment, apply.Environment, "remote_operation_never_starts")
 			if retryableClaim {
 				metrics.AdjustActiveApplies(ctx, -1, apply.Database, deployment, apply.Environment)
 			}

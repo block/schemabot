@@ -1508,6 +1508,13 @@ type ApplyOperationStore interface {
 	// Get returns a child row by ID, or nil if not found.
 	Get(ctx context.Context, id int64) (*ApplyOperation, error)
 
+	// GetLocked returns a child row by ID read under its row lock, or nil if
+	// not found. A claim holds that lock from the moment it selects the row
+	// until it commits, so the answer reflects any claim in flight on the row
+	// when GetLocked was called: it waits for that claim to commit or roll
+	// back. Use it to confirm a decision a claim racing the read would change.
+	GetLocked(ctx context.Context, id int64) (*ApplyOperation, error)
+
 	// GetByApplyAndDeployment returns the legacy unkeyed child row for
 	// (apply_id, deployment), or nil if not found.
 	GetByApplyAndDeployment(ctx context.Context, applyID int64, deployment string) (*ApplyOperation, error)
