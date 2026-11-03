@@ -391,3 +391,82 @@ func TestAtomicProgressTickHoldsUnlessTheCutoverTimesOut(t *testing.T) {
 		})
 	}
 }
+
+// A data-plane drive whose full poll consumes a stored cutover can find its
+// engine still waiting for the cutover on the polls that follow, since the
+// engine takes a poll or more to start its swap. The request is no longer
+// pending to wake the drive, so the drive must stay at full cadence on what its
+// own control reads found, or the swap would go unobserved until a refresh.
+// That holds whether the cutover was recorded before the poll began or while it
+// ran, between the poll's first control read and its second.
+func TestPollForCompletionAtomicStaysAtFullCadenceAfterConsumingACutover(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		// arriveAfterReads is how many control reads pass before the
+		// operator's cutover is recorded.
+		arriveAfterReads int
+	}{
+		{name: "recorded before the poll"},
+		{name: "recorded while the poll runs", arriveAfterReads: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newRevertWindowTickFixture(storage.ApplyOptions{DeferCutover: true})
+			f.tasks[0].State = state.Task.WaitingForCutover
+			f.eng.progressResult = &engine.ProgressResult{
+				State:  engine.StateWaitingForCutover,
+				Tables: []engine.TableProgress{{Namespace: "testdb", Table: "users", State: state.Task.WaitingForCutover, Progress: 100}},
+			}
+			controls := &arrivingControlRequestStore{
+				testControlRequestStore: f.controlRequests,
+				arriveAfterReads:        tc.arriveAfterReads,
+				arrive: func() {
+					f.recordControlRequest(storage.ControlOperationCutover, storage.ControlRequestPending)
+				},
+			}
+			stored := f.client.storage.(*exactProgressStorage)
+			stored.controlRequests = controls
+			stored.applyOperations = noResumeStateOperationStore{stored.applyOperations}
+			f.client.config = LocalConfig{Database: "testdb", Type: storage.DatabaseTypeVitess}
+			f.client.planetscaleEngine = f.eng
+			f.client.taskPollIntervalOverride = 5 * time.Millisecond
+
+			ctx, cancel := context.WithTimeout(t.Context(), 200*time.Millisecond)
+			defer cancel()
+			require.NoError(t, f.client.pollForCompletionAtomic(ctx, f.apply, f.tasks, &engine.Credentials{}, nil, f.apply.GetOptions().Map(), false))
+
+			require.Equal(t, 1, f.eng.cutoverCount, "the drive consumes the operator's cutover")
+			assert.NotEqual(t, storage.ControlRequestPending, f.controlRequestStatus(t, storage.ControlOperationCutover),
+				"nothing is left pending to wake the drive")
+			assert.GreaterOrEqual(t, f.eng.progressCalls, 5, "the drive keeps polling its engine every tick to see the swap")
+		})
+	}
+}
+
+// arrivingControlRequestStore records an operator's request once a set number
+// of pending-request reads have run, so a test can land the request partway
+// through a drive's poll.
+type arrivingControlRequestStore struct {
+	*testControlRequestStore
+	arriveAfterReads int
+	arrive           func()
+	reads            int
+}
+
+func (s *arrivingControlRequestStore) ListPending(ctx context.Context, applyID int64) ([]*storage.ApplyControlRequest, error) {
+	if s.reads == s.arriveAfterReads && s.arrive != nil {
+		s.arrive()
+		s.arrive = nil
+	}
+	s.reads++
+	return s.testControlRequestStore.ListPending(ctx, applyID)
+}
+
+// noResumeStateOperationStore answers every operation's engine resume state as
+// not yet recorded, so a cutover builds its request from the apply alone.
+type noResumeStateOperationStore struct {
+	storage.ApplyOperationStore
+}
+
+func (noResumeStateOperationStore) GetEngineResumeState(context.Context, int64) (*storage.EngineResumeState, error) {
+	return nil, storage.ErrEngineResumeStateNotFound
+}
