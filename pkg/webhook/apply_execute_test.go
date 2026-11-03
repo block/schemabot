@@ -436,40 +436,44 @@ func TestDDLMatchesStoredPlan(t *testing.T) {
 // and a confirmation whose plan cannot be loaded must count as no disclosure at
 // all rather than as consent.
 func TestDisclosureDescribesThisApply(t *testing.T) {
+	disclosed := []storage.DisclosedCopy{{Namespace: "app", Tables: []string{"events"}}}
 	tests := []struct {
 		name        string
 		lock        *storage.Lock
 		plan        *storage.Plan
 		environment string
-		want        bool
+		want        []storage.DisclosedCopy
 	}{
 		{
 			name:        "disclosure shown for this environment is consent",
-			lock:        &storage.Lock{DisclosedCopyDiscard: true, PendingPlanID: "plan-1"},
+			lock:        &storage.Lock{DisclosedCopies: disclosed, PendingPlanID: "plan-1"},
 			plan:        &storage.Plan{PlanIdentifier: "plan-1", Environment: "staging"},
 			environment: "staging",
-			want:        true,
+			want:        disclosed,
 		},
 		{
 			name:        "disclosure shown for another environment is not consent",
-			lock:        &storage.Lock{DisclosedCopyDiscard: true, PendingPlanID: "plan-1"},
+			lock:        &storage.Lock{DisclosedCopies: disclosed, PendingPlanID: "plan-1"},
 			plan:        &storage.Plan{PlanIdentifier: "plan-1", Environment: "staging"},
 			environment: "production",
-			want:        false,
 		},
 		{
 			name:        "no disclosure is not consent",
-			lock:        &storage.Lock{DisclosedCopyDiscard: false, PendingPlanID: "plan-1"},
+			lock:        &storage.Lock{PendingPlanID: "plan-1"},
 			plan:        &storage.Plan{PlanIdentifier: "plan-1", Environment: "staging"},
 			environment: "staging",
-			want:        false,
+		},
+		{
+			name:        "a flag without the copies it disclosed is not consent",
+			lock:        &storage.Lock{DisclosedCopyDiscard: true, PendingPlanID: "plan-1"},
+			plan:        &storage.Plan{PlanIdentifier: "plan-1", Environment: "staging"},
+			environment: "staging",
 		},
 		{
 			name:        "a disclosure whose plan did not load is not consent",
-			lock:        &storage.Lock{DisclosedCopyDiscard: true, PendingPlanID: "plan-1"},
+			lock:        &storage.Lock{DisclosedCopies: disclosed, PendingPlanID: "plan-1"},
 			plan:        nil,
 			environment: "staging",
-			want:        false,
 		},
 	}
 
@@ -478,6 +482,50 @@ func TestDisclosureDescribesThisApply(t *testing.T) {
 			assert.Equal(t, tt.want, disclosureDescribesThisApply(tt.lock, tt.plan, tt.environment))
 		})
 	}
+}
+
+// Consent to discard is consent to the copies the comment named, on the
+// targets it named them on. A copy the re-plan would discard that the comment
+// did not name stops the apply, even when the comment disclosed another copy,
+// while a re-reading of a disclosed copy that lists its tables in another order
+// is the same copy.
+func TestUndisclosedDiscards(t *testing.T) {
+	euEvents := storage.DisclosedCopy{Target: "eu", Namespace: "app", Tables: []string{"events"}, Statement: "ALTER TABLE `events` ADD INDEX `idx_actor_id` (`actor_id`)"}
+	usEvents := euEvents
+	usEvents.Target = "us"
+	primaryEvents := euEvents
+	primaryEvents.Target = ""
+
+	tests := []struct {
+		name       string
+		discarding []storage.DisclosedCopy
+		disclosed  []storage.DisclosedCopy
+		want       int
+	}{
+		{name: "nothing discarded", disclosed: []storage.DisclosedCopy{euEvents}},
+		{name: "the disclosed copy", discarding: []storage.DisclosedCopy{euEvents}, disclosed: []storage.DisclosedCopy{euEvents}},
+		{name: "the same copy on another target", discarding: []storage.DisclosedCopy{euEvents, usEvents}, disclosed: []storage.DisclosedCopy{euEvents}, want: 1},
+		{name: "a copy on the primary target when only another target's was disclosed", discarding: []storage.DisclosedCopy{primaryEvents}, disclosed: []storage.DisclosedCopy{euEvents}, want: 1},
+		{name: "a discard with no disclosure", discarding: []storage.DisclosedCopy{euEvents}, want: 1},
+		{
+			name:       "another statement's copy of the same table",
+			discarding: []storage.DisclosedCopy{{Target: "eu", Namespace: "app", Tables: []string{"events"}, Statement: "ALTER TABLE `events` ADD COLUMN `region` varchar(16)"}},
+			disclosed:  []storage.DisclosedCopy{euEvents},
+			want:       1,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, undisclosedDiscards(tt.discarding, tt.disclosed))
+		})
+	}
+
+	// The tables of a copy are sorted when it is named, so reading them in
+	// another order names the same copy.
+	a := disclosedCopyOf("eu", &apitypes.ExistingCopyResponse{Namespace: "app", Tables: []string{"orders", "events"}})
+	b := disclosedCopyOf("eu", &apitypes.ExistingCopyResponse{Namespace: "app", Tables: []string{"events", "orders"}})
+	assert.Equal(t, []string{"events", "orders"}, a.Tables)
+	assert.Zero(t, undisclosedDiscards([]storage.DisclosedCopy{a}, []storage.DisclosedCopy{b}))
 }
 
 // The drift disclosure names what moved, per table, so the operator can see it

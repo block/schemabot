@@ -143,29 +143,36 @@ type Lock struct {
 
 	// DisclosedCopyDiscard records that the comment this pending confirmation
 	// was posted with told the operator applying would throw away an unfinished
-	// row copy on a target the apply runs, the primary target or any other
-	// target whose plan the apply runs alongside it. It is a consent record,
-	// and its question is
-	// exactly "were they shown a discard at all?" — not which copy, or how
-	// many. An apply that finds a larger discard set than the one disclosed
-	// therefore still proceeds; narrowing that to the copies actually named
-	// needs the disclosed set persisted, not a flag.
-	//
-	// It travels with PendingPlanID and is written by the same statement, so the
-	// flag always describes the plan the confirm command loads. It is
-	// deliberately not the copy itself: a copy disposition is a reading of the
-	// target that is always re-read at apply time, and only this answer to "did
-	// they know?" has to be durable.
-	//
-	// The lock carries no environment dimension, so the flag alone does not say
-	// which environment the operator was shown. Readers pair it with the pinned
-	// plan's environment before treating it as consent for the apply at hand.
+	// row copy on a target the apply runs. It is true exactly when
+	// DisclosedCopies is non-empty, and it is kept for builds that read only the
+	// flag: consent is checked against DisclosedCopies.
 	//
 	// False for locks acquired outside the PR apply path (rollback, CLI) and for
-	// rows written before this column existed, which is the safe default — an
-	// unrecorded disclosure is treated as no disclosure, so the apply asks again
-	// rather than assuming consent.
+	// rows written before this column existed, which is the safe default.
 	DisclosedCopyDiscard bool
+
+	// DisclosedCopies are the unfinished copies the comment this pending
+	// confirmation was posted with told the operator applying throws away, each
+	// named by its target. It is a consent record: an apply proceeds over a
+	// discard only when every copy it would discard is one of these, so a copy
+	// that comes to be discarded after the operator was asked, on any target,
+	// stops the apply and asks again.
+	//
+	// It travels with PendingPlanID and is written by the same statement, so it
+	// always describes the plan the confirm command loads. It names the copies
+	// rather than recording their disposition: a disposition is a reading of the
+	// target that is always re-read at apply time, and only the answer to "were
+	// they shown this copy?" has to be durable.
+	//
+	// The lock carries no environment dimension, so readers pair it with the
+	// pinned plan's environment before treating it as consent for the apply at
+	// hand.
+	//
+	// Empty for locks acquired outside the PR apply path and for rows written by
+	// a build that recorded only DisclosedCopyDiscard. An unrecorded disclosure
+	// is treated as no disclosure, so the apply asks again rather than assuming
+	// consent.
+	DisclosedCopies []DisclosedCopy
 
 	// Acquirer records the verified caller that created this lock row, for
 	// deciding whose operator grant the lock falls under. Owner cannot answer
@@ -188,6 +195,18 @@ type Lock struct {
 
 	// UpdatedAt is when the lock was last updated.
 	UpdatedAt time.Time
+}
+
+// DisclosedCopy names one unfinished copy a confirmation comment disclosed as
+// discarded. Target is the rollout member the copy is on, named as the comment
+// names it, and is empty for a copy on the target the apply's own plan was
+// planned against. Tables are sorted, so two readings of the same copy compare
+// equal.
+type DisclosedCopy struct {
+	Target    string   `json:"target,omitempty"`
+	Namespace string   `json:"namespace,omitempty"`
+	Tables    []string `json:"tables,omitempty"`
+	Statement string   `json:"statement,omitempty"`
 }
 
 // LockAcquirer is the verified caller behind a lock acquire.

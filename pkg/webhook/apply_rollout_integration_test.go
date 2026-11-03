@@ -17,6 +17,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -1760,11 +1761,11 @@ func TestE2EApplyAsksBeforeDiscardingAnotherTargetsCopy(t *testing.T) {
 
 	apply := runRolloutCommand(t, svc, dbName, "schemabot apply -e "+driftEnv)
 	body := awaitCommentContaining(t, apply, "Confirmation required")
-	requireDisclosesUsersCopyOnUS(t, body)
+	requireDisclosesUsersCopyOn(t, body, "us")
 
 	requireNoApplies(t, svc, dbName)
 	requireUsersCopyIntact(t, dbName+"_us")
-	requireCopyDiscardConsent(t, svc, dbName)
+	requireCopyDiscardConsent(t, svc, dbName, "us")
 	check := rolloutCheck(t, svc, dbName)
 	assert.Equal(t, "action_required", check.Conclusion, "us still needs the change, so the check keeps blocking merge")
 
@@ -1802,12 +1803,12 @@ func TestE2EApplyAsksWhenAnotherTargetsChangedPlanDiscardsACopy(t *testing.T) {
 
 	apply := runRolloutCommand(t, svc, dbName, "schemabot apply -e "+driftEnv)
 	body := awaitCommentContaining(t, apply, "Confirmation required")
-	requireDisclosesUsersCopyOnUS(t, body)
+	requireDisclosesUsersCopyOn(t, body, "us")
 	assert.Contains(t, body, "schemabot apply-confirm -e "+driftEnv)
 
 	requireNoApplies(t, svc, dbName)
 	requireUsersCopyIntact(t, dbName+"_us")
-	requireCopyDiscardConsent(t, svc, dbName)
+	requireCopyDiscardConsent(t, svc, dbName, "us")
 }
 
 // The primary target (eu) already has the column and us does not, and a
@@ -1833,36 +1834,95 @@ func TestE2EApplyConfirmAsksAgainWhenACopyAppearsOnAnotherTarget(t *testing.T) {
 
 	confirm := runRolloutCommand(t, svc, dbName, "schemabot apply-confirm -e "+driftEnv)
 	body := awaitCommentContaining(t, confirm, "Confirmation required")
-	requireDisclosesUsersCopyOnUS(t, body)
+	requireDisclosesUsersCopyOn(t, body, "us")
 
 	requireNoApplies(t, svc, dbName)
 	requireUsersCopyIntact(t, dbName+"_us")
-	requireCopyDiscardConsent(t, svc, dbName)
+	requireCopyDiscardConsent(t, svc, dbName, "us")
 
 	again := runRolloutCommand(t, svc, dbName, "schemabot apply-confirm -e "+driftEnv)
 	created := awaitRolloutApply(t, svc, dbName, again)
 	requireTaskDDLByDeployment(t, svc, created, map[string][]string{"us": {"ADD COLUMN `email`"}})
 }
 
-// requireDisclosesUsersCopyOnUS asserts a comment names the unfinished copy
-// seedUsersCopy left on us, under us, as work applying destroys.
-func requireDisclosesUsersCopyOnUS(t *testing.T, body string) {
+// eu already has the column, and us and ap do not. us holds an unfinished copy
+// of `users` made for a different statement, so the apply pauses on a comment
+// that names that copy under us's plan. Before the operator confirms, the same
+// kind of copy appears on ap. The confirmation was given for us's copy alone,
+// so apply-confirm stops and asks again against a comment that names ap's copy
+// too, runs nothing, and leaves both copies in place. Confirming that comment
+// runs every target's plan.
+func TestE2EApplyConfirmAsksAgainWhenADisclosedRolloutGainsACopyOnAnotherTarget(t *testing.T) {
+	dbName := "webhook_rollout_second_copy"
+	svc := setupE2ERolloutService(t, dbName, []deploymentSpec{
+		{name: "eu", liveSchema: usersWithEmailSchema},
+		{name: "us", liveSchema: usersBaseSchema},
+		{name: "ap", liveSchema: usersBaseSchema},
+	}, api.PlanIndependent)
+	t.Cleanup(func() {
+		_ = svc.Storage().Locks().ForceRelease(context.WithoutCancel(t.Context()), dbName, "mysql")
+	})
+	seedUsersCopy(t, dbName+"_us")
+
+	apply := runRolloutCommand(t, svc, dbName, "schemabot apply -e "+driftEnv)
+	body := awaitCommentContaining(t, apply, "Confirmation required")
+	requireDisclosesUsersCopyOn(t, body, "us")
+	assert.NotContains(t, body, "On target `ap`:\n\n⚠️", "ap held no copy when the comment was posted")
+	requireCopyDiscardConsent(t, svc, dbName, "us")
+
+	seedUsersCopy(t, dbName+"_ap")
+
+	confirm := runRolloutCommand(t, svc, dbName, "schemabot apply-confirm -e "+driftEnv)
+	body = awaitCommentContaining(t, confirm, "Confirmation required")
+	requireDisclosesUsersCopyOn(t, body, "us")
+	requireDisclosesUsersCopyOn(t, body, "ap")
+
+	requireNoApplies(t, svc, dbName)
+	requireUsersCopyIntact(t, dbName+"_us")
+	requireUsersCopyIntact(t, dbName+"_ap")
+	requireCopyDiscardConsent(t, svc, dbName, "ap", "us")
+
+	again := runRolloutCommand(t, svc, dbName, "schemabot apply-confirm -e "+driftEnv)
+	created := awaitRolloutApply(t, svc, dbName, again)
+	requireTaskDDLByDeployment(t, svc, created, map[string][]string{
+		"us": {"ADD COLUMN `email`"},
+		"ap": {"ADD COLUMN `email`"},
+	})
+}
+
+// requireDisclosesUsersCopyOn asserts a comment names the unfinished copy
+// seedUsersCopy left on target, under that target, as work applying destroys.
+func requireDisclosesUsersCopyOn(t *testing.T, body, target string) {
 	t.Helper()
-	assert.Contains(t, body, "On target `us`:\n\n⚠️ **Applying destroys work in progress**: 1 unfinished copy on the target\n",
+	assert.Contains(t, body, "On target `"+target+"`:\n\n⚠️ **Applying destroys work in progress**: 1 unfinished copy on the target\n",
 		"the comment names the target whose copy applying destroys")
 	assert.Contains(t, body, "`users`", "the comment names the table whose copy is lost")
 	assert.NotContains(t, body, "nothing was applied", "a discarded copy is asked about, never refused")
 }
 
-// requireCopyDiscardConsent asserts the pending confirmation records that its
-// comment disclosed a discarded copy, so confirming it proceeds rather than
-// stopping on the same copy again.
-func requireCopyDiscardConsent(t *testing.T, svc *api.Service, dbName string) {
+// requireCopyDiscardConsent waits for the pending confirmation to record that
+// its comment disclosed the copy of `users` on each of targets and no other,
+// so confirming it proceeds rather than stopping on the same copies again. The
+// comment is posted before the consent is recorded, so the comment arriving
+// does not mean the record has landed yet.
+func requireCopyDiscardConsent(t *testing.T, svc *api.Service, dbName string, targets ...string) {
 	t.Helper()
-	lock, err := svc.Storage().Locks().Get(t.Context(), dbName, "mysql")
-	require.NoError(t, err)
-	require.NotNil(t, lock, "the pending confirmation holds the lock")
-	assert.True(t, lock.DisclosedCopyDiscard, "the comment the operator confirms disclosed the copy")
+	var disclosedOn []string
+	require.Eventually(t, func() bool {
+		lock, err := svc.Storage().Locks().Get(t.Context(), dbName, "mysql")
+		if err != nil || lock == nil {
+			return false
+		}
+		disclosedOn = nil
+		for _, c := range lock.DisclosedCopies {
+			if slices.Equal(c.Tables, []string{"users"}) {
+				disclosedOn = append(disclosedOn, c.Target)
+			}
+		}
+		slices.Sort(disclosedOn)
+		return slices.Equal(disclosedOn, targets) && len(lock.DisclosedCopies) == len(targets)
+	}, webhookIntegrationPollDeadline, 50*time.Millisecond,
+		"the comment the operator confirms disclosed the copy of users on %v", targets)
 }
 
 // requireUsersCopyIntact asserts the unfinished copy seeded by seedUsersCopy is

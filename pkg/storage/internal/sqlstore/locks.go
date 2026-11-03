@@ -15,7 +15,7 @@ import (
 
 // lockColumns lists all columns for SELECT queries.
 const lockColumns = `id, database_name, database_type, repository, pull_request, owner,
-	pending_plan_id, disclosed_copy_discard, acquired_by, acquired_by_operator_groups, created_at, updated_at`
+	pending_plan_id, disclosed_copy_discard, disclosed_copies, acquired_by, acquired_by_operator_groups, created_at, updated_at`
 
 // lockStore implements storage.LockStore using MySQL.
 type lockStore struct {
@@ -111,12 +111,16 @@ func (s *lockStore) acquireOnce(ctx context.Context, lock *storage.Lock, acquire
 	// constraint makes the INSERT the arbiter when two callers race past the
 	// Get above. The INSERT loser sees a duplicate-key error, not a held lock:
 	// re-read and treat a same-owner winner as success.
+	disclosed, err := encodeDisclosedCopies(lock)
+	if err != nil {
+		return err
+	}
 	id, err := s.identity.InsertID(ctx, s.db, `
 		INSERT INTO locks (database_name, database_type, repository, pull_request, owner, pending_plan_id, disclosed_copy_discard,
-			acquired_by, acquired_by_operator_groups)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, lock.DatabaseName, lock.DatabaseType, lock.Repository, lock.PullRequest, lock.Owner, lock.PendingPlanID, lock.DisclosedCopyDiscard,
-		acquirer.subject, acquirer.operatorGroups)
+			disclosed_copies, acquired_by, acquired_by_operator_groups)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, lock.DatabaseName, lock.DatabaseType, lock.Repository, lock.PullRequest, lock.Owner, lock.PendingPlanID, len(lock.DisclosedCopies) > 0,
+		disclosed, acquirer.subject, acquirer.operatorGroups)
 	if err == nil {
 		lock.ID = id
 		return nil
@@ -140,6 +144,20 @@ func (s *lockStore) acquireOnce(ctx context.Context, lock *storage.Lock, acquire
 		return storage.ErrLockHeld
 	}
 	return s.refreshPendingConfirmation(ctx, lock, winner, observedPendingPlanID)
+}
+
+// encodeDisclosedCopies renders the disclosed_copies column: NULL when the
+// confirmation disclosed no discard, else the copies as a JSON array.
+func encodeDisclosedCopies(lock *storage.Lock) (any, error) {
+	if len(lock.DisclosedCopies) == 0 {
+		return nil, nil
+	}
+	encoded, err := json.Marshal(lock.DisclosedCopies)
+	if err != nil {
+		return nil, fmt.Errorf("marshal disclosed copies for lock %s/%s owner=%s: %w",
+			lock.DatabaseName, lock.DatabaseType, lock.Owner, err)
+	}
+	return string(encoded), nil
 }
 
 // lockAcquirerColumns holds the insert values of the acquired_by and
@@ -179,7 +197,7 @@ func encodeLockAcquirer(lock *storage.Lock) (lockAcquirerColumns, error) {
 // plan (an apply re-run posts a new confirmation plan). Both move in one
 // statement so the flag can never describe a plan other than the one the confirm
 // command will load. A caller supplying the same plan has nothing to change:
-// DisclosedCopyDiscard is a property of that plan's comment, so re-deriving it
+// DisclosedCopies is a property of that plan's comment, so re-deriving it
 // cannot produce a different answer.
 //
 // The UPDATE is owner-scoped: it only changes the row while this owner still
@@ -202,11 +220,15 @@ func (s *lockStore) refreshPendingConfirmation(ctx context.Context, lock, existi
 	if lock.PendingPlanID == "" || lock.PendingPlanID == existing.PendingPlanID {
 		return nil
 	}
+	disclosed, err := encodeDisclosedCopies(lock)
+	if err != nil {
+		return err
+	}
 	query := `
 		UPDATE locks
-		SET pending_plan_id = ?, disclosed_copy_discard = ?, updated_at = NOW()
+		SET pending_plan_id = ?, disclosed_copy_discard = ?, disclosed_copies = ?, updated_at = NOW()
 		WHERE database_name = ? AND database_type = ? AND ` + s.dialect.BinaryEquals("owner")
-	args := []any{lock.PendingPlanID, lock.DisclosedCopyDiscard, lock.DatabaseName, lock.DatabaseType, lock.Owner}
+	args := []any{lock.PendingPlanID, len(lock.DisclosedCopies) > 0, disclosed, lock.DatabaseName, lock.DatabaseType, lock.Owner}
 	if observedPendingPlanID != nil {
 		query += ` AND pending_plan_id = ?`
 		args = append(args, *observedPendingPlanID)
@@ -365,7 +387,7 @@ func (s *lockStore) ClearPendingPlanID(ctx context.Context, database, dbType, ow
 	dbType = storage.CanonicalKey(dbType)
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE locks
-		SET pending_plan_id = '', disclosed_copy_discard = ?, updated_at = NOW()
+		SET pending_plan_id = '', disclosed_copy_discard = ?, disclosed_copies = NULL, updated_at = NOW()
 		WHERE database_name = ? AND database_type = ? AND `+s.dialect.BinaryEquals("owner")+` AND pending_plan_id = ?
 	`, false, database, dbType, owner, pendingPlanID)
 	if err != nil {
@@ -510,16 +532,24 @@ func scanLockInto(s scanner) (*storage.Lock, error) {
 	var lock storage.Lock
 	var acquiredBy sql.NullString
 	var acquiredByGroups []byte
+	var disclosedCopies []byte
 
 	err := s.Scan(
 		&lock.ID, &lock.DatabaseName, &lock.DatabaseType,
 		&lock.Repository, &lock.PullRequest, &lock.Owner,
-		&lock.PendingPlanID, &lock.DisclosedCopyDiscard,
+		&lock.PendingPlanID, &lock.DisclosedCopyDiscard, &disclosedCopies,
 		&acquiredBy, &acquiredByGroups,
 		&lock.CreatedAt, &lock.UpdatedAt,
 	)
 	if err != nil {
 		return nil, err
+	}
+
+	if len(disclosedCopies) > 0 {
+		if err := json.Unmarshal(disclosedCopies, &lock.DisclosedCopies); err != nil {
+			return nil, fmt.Errorf("unmarshal disclosed_copies for lock %s/%s owner=%s: %w",
+				lock.DatabaseName, lock.DatabaseType, lock.Owner, err)
+		}
 	}
 
 	acquirer, err := lockAcquirerFromColumns(&lock, acquiredBy, acquiredByGroups)

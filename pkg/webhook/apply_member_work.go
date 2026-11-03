@@ -45,11 +45,51 @@ func rolloutRunsMemberWork(outcome reviewDriftOutcome, preview *templates.Deploy
 // consent to discard is asked for and recorded over all of them (RV-3), never
 // over the primary target's alone.
 func rolloutDiscardedCopies(planResp *apitypes.PlanResponse, rollout reviewDriftOutcome, runsMemberWork bool) int {
-	n := len(planResp.DiscardedCopies())
+	return len(rolloutDisclosedCopies(planResp, rollout, runsMemberWork))
+}
+
+// rolloutDisclosedCopies names the copies rolloutDiscardedCopies counts, each
+// with the target it is on, as the comment rendering this plan discloses them.
+// It is what a pending confirmation records as consent, and what the re-plan
+// before an apply is checked against copy by copy.
+func rolloutDisclosedCopies(planResp *apitypes.PlanResponse, rollout reviewDriftOutcome, runsMemberWork bool) []storage.DisclosedCopy {
+	var copies []storage.DisclosedCopy
+	for _, c := range planResp.DiscardedCopies() {
+		copies = append(copies, disclosedCopyOf("", c))
+	}
 	if runsMemberWork {
-		n += len(rollout.work.discarded)
+		for _, d := range rollout.work.discarded {
+			copies = append(copies, disclosedCopyOf(d.target, d.copy))
+		}
+	}
+	return copies
+}
+
+// disclosedCopyOf names a copy on target, the empty target being the one the
+// apply's own plan was planned against. Its tables are sorted so two readings
+// of the same copy name it the same way.
+func disclosedCopyOf(target string, c *apitypes.ExistingCopyResponse) storage.DisclosedCopy {
+	tables := slices.Clone(c.Tables)
+	slices.Sort(tables)
+	return storage.DisclosedCopy{Target: target, Namespace: c.Namespace, Tables: tables, Statement: c.Statement}
+}
+
+// undisclosedDiscards counts the copies applying would discard that the
+// confirmation did not disclose. A copy that came to be discarded after the
+// operator was asked, on any target, is one they never agreed to lose, however
+// many others they were shown.
+func undisclosedDiscards(discarding, disclosed []storage.DisclosedCopy) int {
+	n := 0
+	for _, c := range discarding {
+		if !slices.ContainsFunc(disclosed, func(d storage.DisclosedCopy) bool { return sameDisclosedCopy(c, d) }) {
+			n++
+		}
 	}
 	return n
+}
+
+func sameDisclosedCopy(a, b storage.DisclosedCopy) bool {
+	return a.Target == b.Target && a.Namespace == b.Namespace && a.Statement == b.Statement && slices.Equal(a.Tables, b.Tables)
 }
 
 // refusePendingRollout answers an apply that cannot run what the rollout has
