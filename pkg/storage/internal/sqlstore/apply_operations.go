@@ -127,6 +127,30 @@ func (s *applyOperationStore) Get(ctx context.Context, id int64) (*storage.Apply
 	return scanApplyOperation(row)
 }
 
+// GetLocked returns a child row by ID read FOR UPDATE in its own
+// transaction, so the read waits for any claim transaction holding the row
+// and sees what that claim committed.
+func (s *applyOperationStore) GetLocked(ctx context.Context, id int64) (*storage.ApplyOperation, error) {
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	if err != nil {
+		return nil, fmt.Errorf("begin locked read transaction for apply_operation %d: %w", id, err)
+	}
+	defer rollbackTx(ctx, tx, "locked read of apply_operation")
+	op, err := scanApplyOperation(tx.QueryRowContext(ctx, `
+		SELECT `+applyOperationColumns+`
+		FROM apply_operations
+		WHERE id = ?
+		FOR UPDATE
+	`, id))
+	if err != nil {
+		return nil, fmt.Errorf("locked read of apply_operation %d: %w", id, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit locked read transaction for apply_operation %d: %w", id, err)
+	}
+	return op, nil
+}
+
 // GetByApplyAndDeployment returns the legacy unkeyed child row for
 // (apply_id, deployment), or nil if not found.
 func (s *applyOperationStore) GetByApplyAndDeployment(ctx context.Context, applyID int64, deployment string) (*storage.ApplyOperation, error) {

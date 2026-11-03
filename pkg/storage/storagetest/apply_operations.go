@@ -106,6 +106,39 @@ func TestApplyOperations(t *testing.T, h Harness) {
 		require.ErrorContains(t, err, "rollout step -1 is negative")
 	})
 
+	// GetLocked_ReadsWhatAClaimCommitted verifies the locked read answers with
+	// the row as the last claim on it committed it, and nil for a row that
+	// does not exist.
+	t.Run("GetLocked_ReadsWhatAClaimCommitted", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "operation_locked_read_db", storage.DatabaseTypeMySQL)
+		apply := CreateApply(t, store, lock, "apply_operation_locked_read", 933)
+		id := createOperation(t, store, apply.ID, "region-a", "")
+
+		unclaimed, err := store.ApplyOperations().GetLocked(ctx, id)
+		require.NoError(t, err)
+		require.NotNil(t, unclaimed)
+		assert.Equal(t, state.ApplyOperation.Pending, unclaimed.State)
+		assert.Empty(t, unclaimed.LeaseOwner)
+
+		claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-a")
+		require.NoError(t, err)
+		require.NotNil(t, claimed)
+		require.Equal(t, id, claimed.ID)
+
+		got, err := store.ApplyOperations().GetLocked(ctx, id)
+		require.NoError(t, err)
+		require.NotNil(t, got)
+		assert.Equal(t, state.ApplyOperation.Running, got.State)
+		assert.Equal(t, "driver-a", got.LeaseOwner)
+		assert.NotNil(t, got.StartedAt)
+
+		missing, err := store.ApplyOperations().GetLocked(ctx, id+1000)
+		require.NoError(t, err)
+		assert.Nil(t, missing)
+	})
+
 	// FindNextApplyOperation_ClaimsInDeploymentOrder verifies the operation
 	// ladder: a pending operation is claimed into running with a fresh lease,
 	// and a later deployment remains blocked until its earlier sibling

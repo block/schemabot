@@ -90,6 +90,67 @@ func TestGRPCClient_PollEndsForAMemberItsRemoteApplySettledBefore(t *testing.T) 
 	assert.Equal(t, storage.ControlRequestFailed, rejected.Status)
 }
 
+// A rollout on the data plane ended before reaching payments-003, and the
+// state it ended in carries over to the member. An operator cancelling or
+// reverting the rollout leaves payments-003's task cancelled or reverted, so
+// the control plane's rollout derives the verdict the data plane did, rather
+// than a failure nobody had. A failure fails it.
+func TestGRPCClient_MemberItsRemoteApplySettledBeforeSettlesTheSameWay(t *testing.T) {
+	for _, tc := range []struct {
+		remote    ternv1.State
+		taskState string
+	}{
+		{remote: ternv1.State_STATE_FAILED, taskState: state.Task.Failed},
+		{remote: ternv1.State_STATE_CANCELLED, taskState: state.Task.Cancelled},
+		{remote: ternv1.State_STATE_REVERTED, taskState: state.Task.Reverted},
+	} {
+		t.Run(tc.remote.String(), func(t *testing.T) {
+			server := &capturingTernServer{
+				progressState:       ternv1.State_STATE_PENDING,
+				progressStateSet:    true,
+				progressApplyState:  tc.remote,
+				progressNeverStarts: true,
+				progressTables:      []*ternv1.TableProgress{{Namespace: "payments", TableName: "users", Status: state.Task.Pending}},
+			}
+			client, cleanup := testCapturingGRPCClient(t, server)
+			defer cleanup()
+
+			apply := &storage.Apply{
+				ID: 7, ApplyIdentifier: "apply-ended-rollout", Database: "payments",
+				DatabaseType: storage.DatabaseTypeMySQL, Environment: "staging", State: state.Apply.Running,
+			}
+			operationID := int64(42)
+			task := &storage.Task{
+				ID: 11, TaskIdentifier: "task-users", ApplyID: apply.ID, ApplyOperationID: &operationID,
+				Namespace: "payments", TableName: "users", State: state.Task.Pending,
+			}
+			operation := &storage.ApplyOperation{
+				ID: operationID, ApplyID: apply.ID, Deployment: "default", Target: "payments-003",
+				State: state.ApplyOperation.Running, ExternalID: "remote-apply-shared", ExternalOperationID: "32",
+			}
+			storedApply := *apply
+			client.storage = &mockStorage{
+				applies:         &mockApplyStore{apply: &storedApply},
+				tasks:           &mockTaskStore{tasks: []*storage.Task{task}},
+				logs:            &mockApplyLogStore{},
+				controlRequests: &testControlRequestStore{},
+				operations:      &mockApplyOperationStore{ops: map[int64]*storage.ApplyOperation{operationID: operation}},
+			}
+			scope := applyTaskScope{applyOperationID: operationID, operation: operation, multiOperation: true, memberTarget: "payments-003", operationLeaseOnly: true}
+
+			ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+			defer cancel()
+			err := client.pollForCompletion(ctx, apply, false, scope, false)
+
+			require.ErrorIs(t, err, ErrRemoteOperationNeverStarts)
+			assert.Equal(t, tc.taskState, task.State)
+			assert.NotNil(t, task.CompletedAt, "the member's task is settled")
+			assert.Equal(t, "remote apply remote-apply-shared settled as "+ProtoStateToStorage(tc.remote)+" before this operation started, so the data plane will not run it", task.ErrorMessage)
+			assert.Equal(t, state.Apply.Running, storedApply.State, "an operation-scoped drive leaves the parent to the operator's projection")
+		})
+	}
+}
+
 // The data plane's verdict decides whether a member will never start. An
 // answer scoped to the operation that carries it ends the drive. One without
 // it keeps the drive polling, whatever the apply's state, since only the data

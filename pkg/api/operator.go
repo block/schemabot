@@ -2841,12 +2841,14 @@ func (s *Service) resumeClaimedApplyWithOptions(ctx context.Context, driverID in
 		}
 		if errors.Is(err, tern.ErrRemoteOperationNeverStarts) {
 			// The data plane settled the apply this operation belongs to before
-			// the operation began, so it will never run there. The drive failed
-			// the operation's tasks with that reason, and the caller derives the
-			// operation and the rollout from them.
-			logger.Warn("operator: remote operation will never start because its remote apply settled first; deriving the operation from its failed tasks",
+			// the operation began, so it will never run there. The drive settled
+			// the operation's tasks the way the remote apply settled, with that
+			// reason, and the caller derives the operation and the rollout from
+			// them.
+			logger.Warn("operator: remote operation will never start because its remote apply settled first; deriving the operation from its settled tasks",
 				"apply_operation_id", applyOperationID,
 				"error", err)
+			metrics.RecordOperatorResumeFailure(ctx, apply.Database, deployment, apply.Environment, "remote_operation_never_starts")
 			if retryableClaim {
 				metrics.AdjustActiveApplies(ctx, -1, apply.Database, deployment, apply.Environment)
 			}

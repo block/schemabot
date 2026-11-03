@@ -138,18 +138,22 @@ func TestLocalClient_ProgressScopedToOneRolloutMemberReportsOnlyThatMember(t *te
 // answer reports that it will never start, read from its operation row, and
 // names the apply's settled state. A member a driver has claimed, or one that
 // has started, may still be running with its tasks pending, and a stopped
-// apply starts its pending members again, so neither reports it.
+// apply starts its pending members again, so neither reports it. Nor does one
+// a claim that selected it before the apply settled went on to start: the
+// verdict is confirmed under the row's lock, which waits for that claim.
 func TestLocalClient_ProgressScopedToOneRolloutMemberReportsItWillNeverStart(t *testing.T) {
 	now := time.Now()
 	for _, tc := range []struct {
-		name        string
-		applyState  string
-		claim       func(op *storage.ApplyOperation)
-		neverStarts bool
+		name          string
+		applyState    string
+		claim         func(op *storage.ApplyOperation)
+		inFlightClaim bool
+		neverStarts   bool
 	}{
 		{name: "unclaimed in a failed apply", applyState: state.Apply.Failed, neverStarts: true},
 		{name: "claimed in a failed apply", applyState: state.Apply.Failed, claim: func(op *storage.ApplyOperation) { op.LeaseOwner = "driver-3" }},
 		{name: "started in a failed apply", applyState: state.Apply.Failed, claim: func(op *storage.ApplyOperation) { op.StartedAt = &now }},
+		{name: "started by a claim in flight when first read", applyState: state.Apply.Failed, inFlightClaim: true},
 		{name: "unclaimed in a stopped apply", applyState: state.Apply.Stopped},
 		{name: "unclaimed in a running apply", applyState: state.Apply.Running},
 	} {
@@ -158,6 +162,11 @@ func TestLocalClient_ProgressScopedToOneRolloutMemberReportsItWillNeverStart(t *
 			fx.apply.State = tc.applyState
 			if tc.claim != nil {
 				tc.claim(fx.second)
+			}
+			if tc.inFlightClaim {
+				started := *fx.second
+				started.State, started.StartedAt, started.LeaseOwner = state.ApplyOperation.Running, &now, "driver-3"
+				fx.client.storage.(*exactProgressStorage).applyOperations.(*perOperationResumeStore).claimedUnderLock = map[int64]*storage.ApplyOperation{fx.second.ID: &started}
 			}
 
 			scoped, err := fx.client.Progress(t.Context(), &ternv1.ProgressRequest{ApplyId: fx.apply.ApplyIdentifier, Environment: "staging", ApplyOperationId: "12"})
