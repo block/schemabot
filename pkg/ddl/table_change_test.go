@@ -9,9 +9,9 @@ import (
 )
 
 // A pull request approved on one base and rebased onto a newer one keeps its
-// approval only when its edit to the table generates the same statements on
-// both bases and leaves everything the base changed in between as the base
-// has it.
+// approval only when its edit to the table generates no statement on the
+// newer base that the reviewer did not approve, and leaves everything the
+// base changed in between as the base has it.
 func TestSameTableChange(t *testing.T) {
 	const (
 		base = "CREATE TABLE `variants` (\n" +
@@ -194,6 +194,81 @@ func TestSameTableChange(t *testing.T) {
 			headBase:     "CREATE TABLE `t` (`id` int NOT NULL, PRIMARY KEY (`id`))",
 			head:         "CREATE TABLE `t` (`id` int NOT NULL, `y` int, `x` int, PRIMARY KEY (`id`))",
 			wantReason:   []string{"table t: the head orders columns differently from the approved commit"},
+		},
+		{
+			// A stacked pull request below this one merged the column change,
+			// so the head runs only the index change, which was approved.
+			name:         "a column change the base now has from a pull request below this one",
+			approvedBase: base,
+			approved: "CREATE TABLE `variants` (`id` bigint NOT NULL AUTO_INCREMENT, `token` varchar(255) DEFAULT NULL, `amount` int DEFAULT NULL, " +
+				"PRIMARY KEY (`id`), UNIQUE KEY `u_token` (`token`) INVISIBLE) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+			headBase: "CREATE TABLE `variants` (`id` bigint NOT NULL AUTO_INCREMENT, `token` varchar(255) DEFAULT NULL, `amount` int DEFAULT NULL, " +
+				"PRIMARY KEY (`id`), UNIQUE KEY `u_token` (`token`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+			head: "CREATE TABLE `variants` (`id` bigint NOT NULL AUTO_INCREMENT, `token` varchar(255) DEFAULT NULL, `amount` int DEFAULT NULL, " +
+				"PRIMARY KEY (`id`), UNIQUE KEY `u_token` (`token`) INVISIBLE) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+			wantSame: true,
+		},
+		{
+			// The head runs nothing for the column: the base's own version
+			// stands, and the PR's version is no longer part of the change.
+			name:         "a column the PR adds that the base has since added with another definition",
+			approvedBase: base,
+			approved: "CREATE TABLE `variants` (`id` bigint NOT NULL AUTO_INCREMENT, `token` varchar(255) NOT NULL, `amount` int DEFAULT NULL, " +
+				"`sku` varchar(255) DEFAULT NULL, PRIMARY KEY (`id`), UNIQUE KEY `u_token` (`token`), KEY `i_amount` (`amount`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+			headBase: "CREATE TABLE `variants` (`id` bigint NOT NULL AUTO_INCREMENT, `token` varchar(255) NOT NULL, `amount` int DEFAULT NULL, " +
+				"`sku` varchar(64) DEFAULT NULL, PRIMARY KEY (`id`), UNIQUE KEY `u_token` (`token`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+			head: "CREATE TABLE `variants` (`id` bigint NOT NULL AUTO_INCREMENT, `token` varchar(255) NOT NULL, `amount` int DEFAULT NULL, " +
+				"`sku` varchar(64) DEFAULT NULL, PRIMARY KEY (`id`), UNIQUE KEY `u_token` (`token`), KEY `i_amount` (`amount`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+			wantSame: true,
+		},
+		{
+			// The base made the index INVISIBLE before the PR drops it; the
+			// head runs the same drop that was approved.
+			name:         "an index the PR drops that the base changed first",
+			approvedBase: base,
+			approved: "CREATE TABLE `variants` (`id` bigint NOT NULL AUTO_INCREMENT, `token` varchar(255) NOT NULL, `amount` int DEFAULT NULL, " +
+				"PRIMARY KEY (`id`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+			headBase: "CREATE TABLE `variants` (`id` bigint NOT NULL AUTO_INCREMENT, `token` varchar(255) NOT NULL, `amount` int DEFAULT NULL, " +
+				"PRIMARY KEY (`id`), UNIQUE KEY `u_token` (`token`) INVISIBLE) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+			head: "CREATE TABLE `variants` (`id` bigint NOT NULL AUTO_INCREMENT, `token` varchar(255) NOT NULL, `amount` int DEFAULT NULL, " +
+				"PRIMARY KEY (`id`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+			wantSame: true,
+		},
+		{
+			// Running less than was approved counts as a change when the base
+			// does not account for it: the PR itself dropped part of its edit.
+			name:         "a head that stops making a change the base does not have",
+			approvedBase: base,
+			approved: "CREATE TABLE `variants` (`id` bigint NOT NULL AUTO_INCREMENT, `token` varchar(255) NOT NULL, `amount` int DEFAULT NULL, " +
+				"`sku` varchar(255) DEFAULT NULL, PRIMARY KEY (`id`), UNIQUE KEY `u_token` (`token`), KEY `i_amount` (`amount`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+			headBase: newerBase,
+			head: "CREATE TABLE `variants` (`id` bigint NOT NULL AUTO_INCREMENT, `token` varchar(255) NOT NULL, `amount` int DEFAULT NULL, " +
+				"`bounty_amount` bigint DEFAULT NULL, `bounty_currency` varchar(3) DEFAULT NULL, " +
+				"PRIMARY KEY (`id`), UNIQUE KEY `u_token` (`token`), KEY `i_amount` (`amount`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+			wantReason: []string{"table variants: the head declares column sku differently from the approved commit"},
+		},
+		{
+			// The base added the column the PR adds, but the head declares a
+			// third version of it, which nobody approved.
+			name:         "a head that redefines a column the base has since added",
+			approvedBase: base,
+			approved: "CREATE TABLE `variants` (`id` bigint NOT NULL AUTO_INCREMENT, `token` varchar(255) NOT NULL, `amount` int DEFAULT NULL, " +
+				"`sku` varchar(255) DEFAULT NULL, PRIMARY KEY (`id`), UNIQUE KEY `u_token` (`token`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+			headBase: "CREATE TABLE `variants` (`id` bigint NOT NULL AUTO_INCREMENT, `token` varchar(255) NOT NULL, `amount` int DEFAULT NULL, " +
+				"`sku` varchar(64) DEFAULT NULL, PRIMARY KEY (`id`), UNIQUE KEY `u_token` (`token`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+			head: "CREATE TABLE `variants` (`id` bigint NOT NULL AUTO_INCREMENT, `token` varchar(255) NOT NULL, `amount` int DEFAULT NULL, " +
+				"`sku` varchar(128) DEFAULT NULL, PRIMARY KEY (`id`), UNIQUE KEY `u_token` (`token`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+			wantReason: []string{"table variants", "both the approved commit and the base changed column sku"},
+		},
+		{
+			// The base now has `x`, so the head runs only the approved clause
+			// that adds `y` after it.
+			name:         "a column the PR adds after one the base has since added",
+			approvedBase: "CREATE TABLE `t` (`id` int NOT NULL, `a` int, PRIMARY KEY (`id`))",
+			approved:     "CREATE TABLE `t` (`id` int NOT NULL, `a` int, `x` int, `y` int, PRIMARY KEY (`id`))",
+			headBase:     "CREATE TABLE `t` (`id` int NOT NULL, `a` int, `x` int, PRIMARY KEY (`id`))",
+			head:         "CREATE TABLE `t` (`id` int NOT NULL, `a` int, `x` int, `y` int, PRIMARY KEY (`id`))",
+			wantSame:     true,
 		},
 		{
 			name:         "a file that renames its table at the head",
@@ -465,6 +540,39 @@ func TestSameTableChange_ClausesOutsideSpiritsModel(t *testing.T) {
 			require.NoError(t, err)
 			assert.False(t, same)
 			assert.Equal(t, tt.wantReason, reason)
+		})
+	}
+}
+
+// The head's statements are covered only when each clause they run is one
+// the approved statements run, in the same order.
+func TestClausesCovered(t *testing.T) {
+	const (
+		addX = "ALTER TABLE `t` ADD COLUMN `x` int NULL DEFAULT NULL AFTER `a`"
+		addY = "ALTER TABLE `t` ADD COLUMN `y` int NULL DEFAULT NULL AFTER `x`"
+		both = "ALTER TABLE `t` ADD COLUMN `x` int NULL DEFAULT NULL AFTER `a`, ADD COLUMN `y` int NULL DEFAULT NULL AFTER `x`"
+	)
+	tests := []struct {
+		name           string
+		approved, head []string
+		want           bool
+	}{
+		{name: "the same statement", approved: []string{both}, head: []string{both}, want: true},
+		{name: "one approved clause", approved: []string{both}, head: []string{addY}, want: true},
+		{name: "no statement at the head", approved: []string{both}, want: true},
+		{name: "a clause nobody approved", approved: []string{addX}, head: []string{both}},
+		{name: "approved clauses in another order", approved: []string{both},
+			head: []string{"ALTER TABLE `t` ADD COLUMN `y` int NULL DEFAULT NULL AFTER `x`, ADD COLUMN `x` int NULL DEFAULT NULL AFTER `a`"}},
+		{name: "a clause the approved statement runs with another definition", approved: []string{both},
+			head: []string{"ALTER TABLE `t` ADD COLUMN `y` bigint NULL DEFAULT NULL AFTER `x`"}},
+		{name: "two statements regrouped into one", approved: []string{addX, addY}, head: []string{both}},
+		{name: "the same two statements", approved: []string{addX, addY}, head: []string{addX, addY}, want: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := clausesCovered(tt.approved, tt.head)
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, got)
 		})
 	}
 }

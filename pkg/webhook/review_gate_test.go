@@ -570,6 +570,15 @@ func TestCheckReviewGate_ApprovalCoverage(t *testing.T) {
 			want:       wantCovers,
 		},
 		{
+			// The stacked PR below this one merged the note column, so after
+			// the rebase the head runs only the approved flag column. Every
+			// statement the head runs was approved.
+			name:       "a rebase after the stacked PR below it merged part of the PR's table edit counts",
+			prChange:   setOrders("`id` bigint NOT NULL, `note` text, `flag` int"),
+			baseChange: setOrders("`id` bigint NOT NULL, `note` text"),
+			want:       wantCovers,
+		},
+		{
 			// The statements cannot be compared without the head's file, so
 			// a GitHub outage leaves the gate undecided and retryable.
 			name:           "a combined file GitHub cannot serve during an outage is a retryable evaluation failure",

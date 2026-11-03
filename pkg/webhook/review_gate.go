@@ -311,7 +311,8 @@ type approvalCoverage struct {
 	// the approved commit must match the head for the approval to count.
 	inputPaths []string
 	// compareStatements proves a schema file that both the PR and the base
-	// branch edited generates the same statements at both commits, or is nil
+	// branch edited generates no statement at the head that the approved
+	// commit did not, or is nil
 	// when the database's dialect has no such comparison.
 	compareStatements ghclient.SchemaFileChangeComparer
 	verdicts          map[string]approvalVerdict

@@ -12,32 +12,36 @@ import (
 )
 
 // SameTableChange reports whether a pull request's edit to a single-table
-// MySQL schema file generates the same schema change on two different bases.
+// MySQL schema file generates the same schema change on two different bases:
+// the head runs nothing the reviewer did not approve.
 //
 // approvedBase and approved are the file at the approved commit's merge base
 // and at the approved commit; headBase and head are the file at the head's
 // merge base and at the head. The change is the same when the head is the
-// newer base plus the approved edit and nothing else, which takes three
-// things:
+// newer base plus the approved edit and nothing else, less any part of the
+// edit the newer base already has, which takes three things:
 //
 //   - Every column, index, constraint, table option, and partitioning clause
-//     is the three-way merge of the approved commit and headBase: the head
-//     declares it as the approved commit does where the base left it alone,
-//     and as headBase does where the base changed it and the pull request
-//     did not. One both changed cannot be merged. Comparing elements, not
-//     only statements, matters because statements can hide an override: a
-//     column the base made NOT NULL and the pull request widened is modified
-//     the same way on both bases, yet on the newer one the statement also
-//     drops the NOT NULL.
+//     is the three-way merge of the approved commit and headBase (see
+//     UnmergedElement): the head declares it as the approved commit does
+//     where the base left it alone, and as headBase does where the base
+//     changed it. Comparing elements, not only statements, matters because
+//     statements can hide an override: a column the base made NOT NULL and
+//     the pull request widened is modified the same way on both bases, yet
+//     on the newer one the statement also drops the NOT NULL.
 //   - The columns keep their relative order: the bases order the columns
 //     they share the same way, and so do the approved commit and the head.
 //     An element's definition carries no position, so a reordering would
 //     otherwise go unseen wherever the statements happen to match.
-//   - Diffing each base against its commit yields the same statements, so the
-//     reviewer approved exactly the statements the head generates, including
-//     where each column goes. The diff ignores nothing (no AUTO_INCREMENT,
-//     engine, charset, partitioning, or row format exemptions), so any
-//     difference the planner could act on counts.
+//   - Every clause the head's diff from its base runs is one the approved
+//     commit's diff from its base runs, in the same order, so the reviewer
+//     approved each statement the head generates, including where each
+//     column goes. The head may run fewer clauses only where the base now
+//     has part of the approved edit, as when a stacked pull request below
+//     this one merges: the element merge refuses any other way of dropping
+//     one. The diff ignores nothing (no AUTO_INCREMENT, engine, charset,
+//     partitioning, or row format exemptions), so any difference the planner
+//     could act on counts.
 //
 // A file the pull request adds is absent at both bases, passed as "". Its
 // change is the CREATE TABLE itself, so it is the same when the approved
@@ -105,11 +109,73 @@ func SameTableChange(approvedBase, approved, headBase, head string) (same bool, 
 	if err != nil {
 		return false, "", fmt.Errorf("diff table %s at the head against its base: %w", aBase.TableName, err)
 	}
-	if !slices.Equal(approvedChange, headChange) {
+	covered, err := clausesCovered(approvedChange, headChange)
+	if err != nil {
+		return false, "", fmt.Errorf("read the clauses of table %s's statements: %w", aBase.TableName, err)
+	}
+	if !covered {
 		return false, fmt.Sprintf("table %s: the approved commit generates %q but the head generates %q",
 			aBase.TableName, approvedChange, headChange), nil
 	}
 	return true, "", nil
+}
+
+// clausesCovered reports whether every clause the head's statements run is
+// one the approved statements run, in the same order. A diff that takes more
+// than one statement (Spirit splits some column conversions in two) is
+// covered only by the same statements, since its clauses cannot be regrouped
+// without changing what each statement does.
+func clausesCovered(approved, head []string) (bool, error) {
+	if len(head) == 0 {
+		return true, nil
+	}
+	if len(approved) != 1 || len(head) != 1 {
+		return slices.Equal(approved, head), nil
+	}
+	approvedClauses, err := alterClauses(approved[0])
+	if err != nil {
+		return false, fmt.Errorf("the approved commit's statement: %w", err)
+	}
+	headClauses, err := alterClauses(head[0])
+	if err != nil {
+		return false, fmt.Errorf("the head's statement: %w", err)
+	}
+	next := 0
+	for _, clause := range headClauses {
+		for next < len(approvedClauses) && approvedClauses[next] != clause {
+			next++
+		}
+		if next == len(approvedClauses) {
+			return false, nil
+		}
+		next++
+	}
+	return true, nil
+}
+
+// alterClauses parses an ALTER TABLE statement and returns each of its
+// clauses in the parser's canonical form, in order.
+func alterClauses(stmt string) ([]string, error) {
+	parsed, err := statement.New(stmt)
+	if err != nil {
+		return nil, fmt.Errorf("parse %q: %w", stmt, err)
+	}
+	if len(parsed) != 1 {
+		return nil, fmt.Errorf("parse %q: expected one statement, got %d", stmt, len(parsed))
+	}
+	alter, ok := (*parsed[0].StmtNode).(*ast.AlterTableStmt)
+	if !ok {
+		return nil, fmt.Errorf("parse %q: %w", stmt, statement.ErrNotAlterTable)
+	}
+	clauses := make([]string, 0, len(alter.Specs))
+	for _, spec := range alter.Specs {
+		clause, err := restoreNode(spec)
+		if err != nil {
+			return nil, fmt.Errorf("restore a clause of %q: %w", stmt, err)
+		}
+		clauses = append(clauses, clause)
+	}
+	return clauses, nil
 }
 
 // sameAddedTable compares a table file the pull request adds at the approved
@@ -186,8 +252,22 @@ func strictTableDiff(source, target *statement.CreateTable) ([]string, error) {
 // element (in name order) that is not breaks it, or "" when every element
 // merges. Each map holds one table's elements, keyed by a name that says what
 // the element is and mapped to its definition. An element added or removed
-// counts as changed, and one that both approved and headBase changed never
-// merges. Every dialect's statement comparison applies this one rule.
+// counts as changed. Every dialect's statement comparison applies this one
+// rule.
+//
+// An element both approved and headBase changed merges in two cases only:
+//
+//   - The head declares it as headBase does. The pull request no longer
+//     changes it, because the base now carries its own version, as when a
+//     stacked pull request below this one merges the same edit. The head
+//     runs nothing for it.
+//   - The pull request drops it at both commits. A drop removes the element
+//     whatever the base did to it first, so the reviewer approved the same
+//     outcome.
+//
+// A head that keeps the pull request's version of an element the base
+// changed otherwise never merges: its statement can match the approved one
+// and still undo what the base changed.
 func UnmergedElement(approvedBase, approved, headBase, head map[string]string) string {
 	keys := make(map[string]bool)
 	for _, elements := range []map[string]string{approvedBase, approved, headBase, head} {
@@ -204,6 +284,8 @@ func UnmergedElement(approvedBase, approved, headBase, head map[string]string) s
 		baseChanged := !sameElement(approvedBase, headBase, k)
 		prChanged := !sameElement(approvedBase, approved, k)
 		switch {
+		case baseChanged && prChanged && (supersededElement(headBase, head, k) || droppedAtBoth(approved, head, k)):
+			continue
 		case baseChanged && prChanged:
 			return fmt.Sprintf("both the approved commit and the base changed %s", k)
 		case baseChanged && !sameElement(headBase, head, k):
@@ -213,6 +295,20 @@ func UnmergedElement(approvedBase, approved, headBase, head map[string]string) s
 		}
 	}
 	return ""
+}
+
+// supersededElement reports whether the head declares key as its base does,
+// so the pull request no longer changes it at the head.
+func supersededElement(headBase, head map[string]string, key string) bool {
+	return sameElement(headBase, head, key)
+}
+
+// droppedAtBoth reports whether the pull request removes key at both the
+// approved commit and the head.
+func droppedAtBoth(approved, head map[string]string, key string) bool {
+	_, inApproved := approved[key]
+	_, inHead := head[key]
+	return !inApproved && !inHead
 }
 
 // sameElement reports whether key is absent from both x and y or present in

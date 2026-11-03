@@ -1157,12 +1157,14 @@ const maxSchemaSymlinkReads = 64
 const maxSchemaStatementComparisons = 16
 
 // SchemaFileChangeComparer reports whether a pull request's edit to one
-// schema file generates the same schema change statements on two bases:
-// approvedBase to approved at the approved commit, and headBase to head at
-// the head. It is supplied by the database's dialect, since only the dialect
-// can understand the file, and it may run the files on the database's target
-// to do so. same is false, with reason saying why for operator logs, when the
-// statements differ or the head replaces something the base changed in
+// schema file generates the same schema change on two bases: approvedBase to
+// approved at the approved commit, and headBase to head at the head. The
+// change is the same when the head generates nothing the approved commit did
+// not, less any part of the edit the head's base already has. It is supplied
+// by the database's dialect, since only the dialect can understand the file,
+// and it may run the files on the database's target to do so. same is false,
+// with reason saying why for operator logs, when the head generates something
+// the approved commit did not or replaces something the base changed in
 // between. An error means the files could not be compared, which proves
 // nothing.
 type SchemaFileChangeComparer func(ctx context.Context, approvedBase, approved, headBase, head string) (same bool, reason string, err error)
@@ -1225,9 +1227,9 @@ type SchemaChangeComparison struct {
 // A schema file the pull request and the base branch both edited, as a
 // rebase that combines the two in one file produces, still differs by
 // content. When compareStatements is set, such a file is unchanged if the
-// dialect proves the pull request's edit generates the same schema change
-// statements at both commits without replacing anything the base branch
-// changed (see SchemaFileChangeComparer). The file must be a regular .sql
+// dialect proves the pull request's edit generates no statement at the head
+// that the approved commit did not, without replacing anything the base
+// branch changed (see SchemaFileChangeComparer). The file must be a regular .sql
 // file at all four commits, and when the two bases differ the same
 // default-branch rule applies, since the head's statements then rest on base
 // content. A nil compareStatements, an ineligible file, a comparer that

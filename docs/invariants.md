@@ -1927,7 +1927,7 @@ it: a change pushed to it without review is carried past an earlier approval as 
 content. *Enforced:* the review gate and actor
 authorization (`pkg/webhook/review_gate.go`, `pkg/webhook/actor_authorization.go`), with the
 comparison in `PRSchemaChangeUnchangedSince` (`pkg/github/client.go`), which proves a schema file
-both the change and the default branch edited generates the same statements: with
+both the change and the default branch edited generates no statement the approval did not cover: with
 `SameTableChange` (`pkg/ddl/table_change.go`) for MySQL-family files, and on the environment's
 primary target with `CompareSchemaFileChange` (`pkg/engine/postgres/table_change.go`) for
 PostgreSQL files.
