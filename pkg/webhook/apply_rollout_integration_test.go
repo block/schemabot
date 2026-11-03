@@ -442,6 +442,7 @@ func TestE2EApplyKeepsDeferCutoverForAnotherTargetsCutover(t *testing.T) {
 	t.Cleanup(func() {
 		_ = svc.Storage().Locks().ForceRelease(context.WithoutCancel(t.Context()), dbName, "mysql")
 	})
+	registerLiveOperatorServer(t, svc, dbName)
 	files := map[string]string{"users.sql": usersWithTenantIndexSchema}
 
 	plan := runRolloutCommandWithFiles(t, svc, dbName, "schemabot plan -e "+driftEnv, files)
@@ -1874,4 +1875,19 @@ func TestE2EPlanDisclosesAnotherTargetsUnsafeWork(t *testing.T) {
 
 	check := rolloutCheck(t, svc, dbName)
 	assert.Equal(t, "action_required", check.Conclusion)
+}
+
+// registerLiveOperatorServer records a running operator with drivers to spare
+// for the test's duration, as a deployed server does on startup, so apply
+// creation admits a deferred apply of several targets.
+func registerLiveOperatorServer(t *testing.T, svc *api.Service, serverID string) {
+	t.Helper()
+	require.NoError(t, svc.Storage().OperatorServers().Heartbeat(t.Context(), &storage.OperatorServer{
+		ServerID:               serverID,
+		Drivers:                5,
+		DeferredCutoverDrivers: 4,
+	}))
+	t.Cleanup(func() {
+		require.NoError(t, svc.Storage().OperatorServers().Deregister(context.WithoutCancel(t.Context()), serverID))
+	})
 }
