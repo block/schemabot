@@ -4035,7 +4035,7 @@ schemabot apply -e staging
 
 This PR's apply `apply-a1b2c3d4e5f6` is still running (state: `running`), so a second apply cannot start.
 
-It is applying this PR's latest commit, so there is nothing to apply again. Its progress comment shows when it is done.
+It is already applying this PR's latest commit. Follow its progress comment for the outcome and next steps.
 
 </details>
 

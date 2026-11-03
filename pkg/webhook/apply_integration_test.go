@@ -1066,13 +1066,13 @@ func TestE2EApplySamePRActiveApply(t *testing.T) {
 
 // An operator comments an apply again while this PR's apply of its latest
 // commit is still running, as when the first comment seemed slow to answer.
-// The running apply is already applying that change, so SchemaBot says there
-// is nothing to apply again rather than offering an apply that would plan
-// nothing once it finishes.
+// The running apply is already applying that change, so SchemaBot points at
+// its progress comment for the outcome rather than offering an apply that
+// would plan nothing once it finishes.
 func TestE2EApplyWhileThisPRAppliesItsLatestCommit(t *testing.T) {
 	body := commentApplyWhileThisPRApplies(t, "webhook_apply_active_latest", "abc123")
 	assert.Contains(t, body, "This PR's apply `apply-active-test-001` is still running (state: `running`), so a second apply cannot start.")
-	assert.Contains(t, body, "It is applying this PR's latest commit, so there is nothing to apply again. Its progress comment shows when it is done.\n")
+	assert.Contains(t, body, "It is already applying this PR's latest commit. Follow its progress comment for the outcome and next steps.\n")
 	assert.NotContains(t, body, "schemabot apply", "no apply is offered, since it would plan nothing")
 }
 
@@ -1086,7 +1086,7 @@ func TestE2EApplyWhileThisPRAppliesOneTargetOfItsLatestCommit(t *testing.T) {
 	})
 	assert.Contains(t, body, "This PR's apply `apply-active-test-001` is still running (state: `running`), so a second apply cannot start.")
 	assert.Contains(t, body, "schemabot apply -e staging", "the other targets still need an apply")
-	assert.NotContains(t, body, "nothing to apply again")
+	assert.NotContains(t, body, "already applying this PR's latest commit")
 }
 
 // commentApplyWhileThisPRApplies comments `schemabot apply -e staging

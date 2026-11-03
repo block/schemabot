@@ -493,10 +493,12 @@ func RenderApplyInProgress(data ApplyLockConflictData) string {
 
 	// thenApplyAgain closes the comment with what to run once the active
 	// apply ends: the apply again, unless the active apply is already
-	// applying this PR's latest commit and leaves it nothing to run.
+	// applying this PR's latest commit. That apply's own progress comment
+	// then says how it ended and what to do next, since it may still fail
+	// or be stopped.
 	thenApplyAgain := func(lead string) {
 		if data.AppliesLatestCommit {
-			fmt.Fprintf(&sb, "It is applying this PR's latest commit, so there is nothing to apply again. Its progress comment shows when it is done.\n")
+			fmt.Fprintf(&sb, "It is already applying this PR's latest commit. Follow its progress comment for the outcome and next steps.\n")
 			return
 		}
 		writeApplyAgain(&sb, lead, applyAgain, data.ApplyAgainConsent)
