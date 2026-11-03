@@ -2017,11 +2017,17 @@ func TestApplyOperations(t *testing.T, h Harness) {
 		widths, err := store.ApplyOperations().ListActiveDeferredCutoverWidths(ctx)
 		require.NoError(t, err)
 		assert.Equal(t, []storage.DeferredCutoverWidth{
-			{ApplyIdentifier: "apply_deferred_barrier", Database: barrier.Database, Environment: "staging", Operations: storage.DefaultMaxDriversPerApply},
-			{ApplyIdentifier: "apply_deferred_narrow", Database: narrow.Database, Environment: "staging", Operations: 1},
-			{ApplyIdentifier: "apply_deferred_rolling", Database: rolling.Database, Environment: "staging", Operations: 2},
-			{ApplyIdentifier: "apply_deferred_stopped", Database: paused.Database, Environment: "staging", Operations: 2},
-			{ApplyIdentifier: "apply_deferred_wide", Database: wide.Database, Environment: "staging", Operations: storage.DefaultMaxDriversPerApply},
+			{ApplyIdentifier: "apply_deferred_barrier", Database: barrier.Database, Environment: "staging", Operations: storage.DefaultMaxDriversPerApply,
+				ByDeployment: map[string]int{"region-a": 2, "region-b": 1}},
+			{ApplyIdentifier: "apply_deferred_narrow", Database: narrow.Database, Environment: "staging", Operations: 1,
+				ByDeployment: map[string]int{"region-a": 1}},
+			{ApplyIdentifier: "apply_deferred_rolling", Database: rolling.Database, Environment: "staging", Operations: 2,
+				ByDeployment: map[string]int{"region-a": 2, "region-b": 1}},
+			{ApplyIdentifier: "apply_deferred_stopped", Database: paused.Database, Environment: "staging", Operations: 2,
+				ByDeployment: map[string]int{"region-a": 2}},
+			// The three active operations run two at a time, so region-a holds two.
+			{ApplyIdentifier: "apply_deferred_wide", Database: wide.Database, Environment: "staging", Operations: storage.DefaultMaxDriversPerApply,
+				ByDeployment: map[string]int{"region-a": storage.DefaultMaxDriversPerApply}},
 		}, widths)
 	})
 
