@@ -83,38 +83,48 @@ func (e *DeferredCutoverCapacityError) Transient() bool {
 	return e.LiveServers == 0 || !e.ExceedsCapacity()
 }
 
-// operatorsText names whose operators a refusal counted.
-func (e *DeferredCutoverCapacityError) operatorsText() string {
+// capacityText says how many drivers the counted servers can keep waiting at
+// a cutover: SchemaBot's own servers, or the servers of the deployment the
+// apply runs on.
+func (e *DeferredCutoverCapacityError) capacityText() string {
 	if e.Deployment == "" {
-		return "SchemaBot"
+		return fmt.Sprintf("SchemaBot can keep %d drivers waiting across all its servers", e.Capacity)
 	}
-	return "the " + e.Deployment + " deployment"
+	return fmt.Sprintf("the %s deployment can keep %d drivers waiting across its servers", e.Deployment, e.Capacity)
 }
 
 func (e *DeferredCutoverCapacityError) Error() string {
 	switch {
 	case e.Unreported:
-		return fmt.Sprintf("%s/%s: --defer-cutover would hold %d operations on the %s deployment at their cutover at once, and that deployment does not report how many it can hold; upgrade SchemaBot there, or apply again without --defer-cutover",
+		return fmt.Sprintf("%s/%s: --defer-cutover would keep %d drivers on the %s deployment waiting at the cutover at once, and that deployment does not report how many it can keep waiting; upgrade SchemaBot there, or apply again without --defer-cutover",
 			e.Database, e.Environment, e.Operations, e.Deployment)
 	case e.ExceedsPerApplyCap() && e.Deployment != "":
-		return fmt.Sprintf("%s/%s: --defer-cutover would hold %d operations on the %s deployment at their cutover at once, and max_drivers_per_apply there runs at most %d operations of one apply at once; apply again without --defer-cutover, or raise max_drivers_per_apply on that deployment to at least %d",
+		return fmt.Sprintf("%s/%s: --defer-cutover would keep %d drivers on the %s deployment waiting at the cutover at once, and max_drivers_per_apply there gives one apply at most %d; apply again without --defer-cutover, or raise max_drivers_per_apply on that deployment to at least %d",
 			e.Database, e.Environment, e.Operations, e.Deployment, e.PerApplyCap, e.Operations)
 	case e.ExceedsPerApplyCap():
-		return fmt.Sprintf("%s/%s: --defer-cutover would hold %d operations at their cutover at once, and max_drivers_per_apply runs at most %d operations of one apply at once; apply again without --defer-cutover, or raise max_drivers_per_apply to at least %d",
+		return fmt.Sprintf("%s/%s: --defer-cutover would keep %d drivers waiting at the cutover at once, and max_drivers_per_apply gives one apply at most %d; apply again without --defer-cutover, or raise max_drivers_per_apply to at least %d",
 			e.Database, e.Environment, e.Operations, e.PerApplyCap, e.Operations)
 	case e.LiveServers == 0 && e.Deployment != "":
-		return fmt.Sprintf("%s/%s: --defer-cutover would hold %d operations on the %s deployment at their cutover at once, and no server of that deployment has reported its drivers in the last %s; apply again without --defer-cutover",
+		return fmt.Sprintf("%s/%s: --defer-cutover would keep %d drivers on the %s deployment waiting at the cutover at once, and no server of that deployment has reported its drivers in the last %s; apply again without --defer-cutover",
 			e.Database, e.Environment, e.Operations, e.Deployment, LiveWindowText())
 	case e.LiveServers == 0:
-		return fmt.Sprintf("%s/%s: --defer-cutover would hold %d operations at their cutover at once, and no SchemaBot server has reported its drivers in the last %s; apply again without --defer-cutover",
+		return fmt.Sprintf("%s/%s: --defer-cutover would keep %d drivers waiting at the cutover at once, and no SchemaBot server has reported its drivers in the last %s; apply again without --defer-cutover",
 			e.Database, e.Environment, e.Operations, LiveWindowText())
 	case e.ExceedsCapacity():
-		return fmt.Sprintf("%s/%s: --defer-cutover would hold %d operations at their cutover at once, and %s runs at most %d deferred operations; apply again without --defer-cutover",
-			e.Database, e.Environment, e.Operations, e.operatorsText(), e.Capacity)
+		return fmt.Sprintf("%s/%s: --defer-cutover would keep %d drivers waiting at the cutover at once, and %s; apply again without --defer-cutover",
+			e.Database, e.Environment, e.Operations, e.capacityText())
 	default:
-		return fmt.Sprintf("%s/%s: --defer-cutover would hold %d operations at their cutover at once, and other deferred applies (%s) hold %d of the %d deferred operations %s runs; apply again without --defer-cutover, or once those applies are cut over or cancelled",
-			e.Database, e.Environment, e.Operations, HoldingAppliesText(e.HoldingApplyIDs), e.Reserved, e.Capacity, e.operatorsText())
+		return fmt.Sprintf("%s/%s: --defer-cutover would keep %d drivers waiting at the cutover at once; %s, and %s, leaving %d; apply again without --defer-cutover, or once %s cut over or cancelled",
+			e.Database, e.Environment, e.Operations, e.capacityText(), HoldingAppliesKeepText(e.HoldingApplyIDs, e.Reserved), e.Free(), HoldingAppliesPronoun(e.HoldingApplyIDs))
 	}
+}
+
+// Free is how many of the drivers that can wait at a cutover no other
+// deferred apply keeps, never below zero: servers dropping out of the live
+// window can leave the holding applies keeping more than the live servers
+// have.
+func (e *DeferredCutoverCapacityError) Free() int {
+	return max(e.Capacity-e.Reserved, 0)
 }
 
 // deferredCutoverRefusalStatus is the HTTP status of a deferred cutover
@@ -139,6 +149,26 @@ func HoldingAppliesText(ids []string) string {
 		return strings.Join(ids, ", ")
 	}
 	return fmt.Sprintf("%s and %d more", strings.Join(ids[:maxHoldingAppliesNamed], ", "), len(ids)-maxHoldingAppliesNamed)
+}
+
+// HoldingAppliesKeepText says which deferred applies keep how many drivers
+// waiting at their cutover: "apply a already keeps 4 of them waiting" or
+// "applies a, b already keep 8 of them waiting". ids may be pre-formatted, as
+// the PR comment wraps each in code spans.
+func HoldingAppliesKeepText(ids []string, reserved int) string {
+	if len(ids) == 1 {
+		return fmt.Sprintf("apply %s already keeps %d of them waiting", ids[0], reserved)
+	}
+	return fmt.Sprintf("applies %s already keep %d of them waiting", HoldingAppliesText(ids), reserved)
+}
+
+// HoldingAppliesPronoun refers back to the holding applies: "it is" or
+// "they are".
+func HoldingAppliesPronoun(ids []string) string {
+	if len(ids) == 1 {
+		return "it is"
+	}
+	return "they are"
 }
 
 // LiveWindowText names storage.OperatorServerLiveWindow for a sentence ending
@@ -182,7 +212,7 @@ func (s *Service) deferredCutoverPerApplyCapRefusal(plan *storage.Plan, environm
 	if operations <= 1 || operations <= perApplyCap {
 		return nil
 	}
-	s.logger.Warn("apply rejected: deferred cutover would hold more operations at once than max_drivers_per_apply runs of one apply",
+	s.logger.Warn("apply rejected: deferred cutover would keep more drivers waiting at once than max_drivers_per_apply gives one apply",
 		"plan_id", plan.PlanIdentifier, "apply_id", applyIdentifier, "database", plan.Database,
 		"database_type", plan.DatabaseType, "environment", environment, "caller", caller,
 		"operations", operations, "max_drivers_per_apply", perApplyCap)

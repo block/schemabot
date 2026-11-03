@@ -231,9 +231,9 @@ change that the plan the caller reviewed never disclosed is refused as
 was not shown: review that member's own plan and apply it in an apply narrowed
 to that member.
 
-An apply started with `--defer-cutover` that would hold more drivers at its
-cutover than `max_drivers_per_apply` runs for one apply, or than are left for
-deferred work, is refused with `deferred_cutover_capacity`
+An apply started with `--defer-cutover` that would keep more drivers waiting
+at its cutover than `max_drivers_per_apply` gives one apply, or than the
+fleet's servers have left to wait at a cutover, is refused with `deferred_cutover_capacity`
 ([Deferred cutover capacity](configuration.md#deferred-cutover-capacity)).
 The check covers this server's operators and, for a deployment that runs its
 operations on a remote data plane, that data plane's, and the `error` names
