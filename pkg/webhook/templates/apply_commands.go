@@ -39,6 +39,9 @@ type ApplyLockConflictData struct {
 	// can be pasted once the active apply finishes. Empty renders the
 	// environment's plain apply command.
 	ApplyAgainCommand string
+	// ApplyAgainConsent leads into ApplyAgainCommand: UnsafeReconsent's
+	// clause when the requester's command carried --allow-unsafe.
+	ApplyAgainConsent string
 
 	// CLIName is the tool name the comment's CLI command hints start with,
 	// the server's cli_name. Empty renders the CLI's own default.
@@ -487,17 +490,59 @@ func RenderApplyInProgress(data ApplyLockConflictData) string {
 	case activeApplyAwaitsCutover(data):
 		fmt.Fprintf(&sb, "%s `%s` is waiting for cutover, so a second apply cannot start.\n\n", activeApply, data.ApplyID)
 		fmt.Fprintf(&sb, "To cut over:\n```\n%s\n```\n\n", control("cutover"))
-		fmt.Fprintf(&sb, "Once it completes, apply again:\n```\n%s\n```\n", applyAgain)
+		writeApplyAgain(&sb, "Once it completes, apply again", applyAgain, data.ApplyAgainConsent)
 	case state.IsState(data.ApplyState, state.Apply.RevertWindow):
 		fmt.Fprintf(&sb, "%s `%s` is in its revert window, so a second apply cannot start.\n\n", activeApply, data.ApplyID)
 		fmt.Fprintf(&sb, "To keep its changes and close the window:\n```\n%s\n```\n\n", control("skip-revert"))
-		fmt.Fprintf(&sb, "Once it completes, apply again:\n```\n%s\n```\n", applyAgain)
+		writeApplyAgain(&sb, "Once it completes, apply again", applyAgain, data.ApplyAgainConsent)
 	default:
 		fmt.Fprintf(&sb, "%s `%s` is still running (state: `%s`), so a second apply cannot start.\n\n", activeApply, data.ApplyID, data.ApplyState)
-		fmt.Fprintf(&sb, "Once it finishes, apply again:\n```\n%s\n```\n", applyAgain)
+		writeApplyAgain(&sb, "Once it finishes, apply again", applyAgain, data.ApplyAgainConsent)
 	}
 
 	return sb.String()
+}
+
+// writeApplyAgain writes the apply to run again in its own fenced block, led
+// into by consent when there is one.
+func writeApplyAgain(sb *strings.Builder, lead, command, consent string) {
+	writeRerunCommand(sb, lead, consent, command, "\n")
+}
+
+// ApplyLockIntentChangedData describes an apply or apply-confirm rejected
+// because another command pinned or released this PR's lock while the apply
+// was checking or planning against it.
+type ApplyLockIntentChangedData struct {
+	CommandName string
+	Database    string
+	Environment string
+	RequestedBy string
+	// ApplyAgainCommand is the apply to re-run, scoped and optioned as the
+	// operator sent it, and ApplyAgainConsent the clause that leads into it.
+	ApplyAgainCommand string
+	ApplyAgainConsent string
+}
+
+// RenderApplyLockIntentChanged renders the rejection of an apply whose lock
+// another command changed under it. The apply leaves the lock as that command
+// set it; a retry finds it and reports which command holds the lock and how to
+// settle it, or plans afresh when the lock is free. The command to re-run is
+// rendered in full rather than as a clamped error detail, so a long database
+// name or option list never cuts it or its consent clause short.
+func RenderApplyLockIntentChanged(data ApplyLockIntentChangedData) string {
+	var sb strings.Builder
+
+	writeEnvironmentTitle(&sb, glyph.Refused+" "+capitalizeFirst(data.CommandName)+" Refused", data.Environment)
+	writeDBLine(&sb, data.Database)
+	writeRequesterOrTimestamp(&sb, data.RequestedBy)
+	sb.WriteString("\n")
+
+	fmt.Fprintf(&sb, "Another SchemaBot command changed the lock on `%s` while this apply was running, "+
+		"so the apply was rejected to leave the lock as that command set it. "+
+		"If the lock belongs to a pending rollback, the retry will say how to confirm or cancel it.\n\n", data.Database)
+	writeApplyAgain(&sb, "Re-run the apply", data.ApplyAgainCommand, data.ApplyAgainConsent)
+
+	return offerSupportChannel(sb.String())
 }
 
 // activeApplyAwaitsCutover reports whether the active apply is parked until an

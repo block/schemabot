@@ -4120,7 +4120,7 @@ _Requested by @jackjackbits_
 
 The pending confirmation is for `staging`, not `production`; nothing was applied.
 
-To confirm the `staging` plan:
+To apply the `staging` plan:
 
 ```
 schemabot apply-confirm -e staging -d testapp --defer-cutover
