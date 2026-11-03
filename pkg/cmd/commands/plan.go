@@ -114,7 +114,10 @@ func (cmd *PlanCmd) Run(g *Globals) error {
 	}
 
 	if cmd.JSON {
-		return writeJSON(allResults)
+		if err := writeJSON(allResults); err != nil {
+			return err
+		}
+		return planErrorsExit(allResults)
 	}
 
 	// Disclose ignore_namespaces once per distinct resolution: entries resolve
@@ -136,6 +139,19 @@ func (cmd *PlanCmd) Run(g *Globals) error {
 	outputMultiEnvPlanResult(allResults, cfg.Database, cfg.SchemaDir)
 	if cmd.Target != "" {
 		writeNarrowedTo(allResults[cmd.Environment])
+	}
+	return planErrorsExit(allResults)
+}
+
+// planErrorsExit returns the error that fails the command when any
+// environment's plan reported errors, and nil otherwise. The plan output has
+// already said what the errors are, so the error is silent: only the exit
+// status is left to report, and stdout stays the plan alone.
+func planErrorsExit(results map[string]*apitypes.PlanResponse) error {
+	for _, env := range slices.Sorted(maps.Keys(results)) {
+		if result := results[env]; result != nil && len(result.Errors) > 0 {
+			return fmt.Errorf("plan for environment %s has errors: %w", env, ErrSilent)
+		}
 	}
 	return nil
 }

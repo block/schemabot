@@ -1239,6 +1239,11 @@ for the entire command, which also prints the plan and other messages.
 For fully structured writes, use the API. `progress` has no JSON output flag;
 use `status --json` for a structured snapshot.
 
+`plan` exits non-zero when any environment's plan reports errors. stdout still
+carries the whole plan, as text or as the single `--json` document with each
+error in its `errors` field, and nothing is added to it. A plan with no errors
+exits 0, including one that finds changes to apply.
+
 For agents and automated processes, `apply --no-watch` and `rollback --no-watch`
 return after submission without opening an interactive watcher. Retain the new
 apply ID and check its status; submission alone does not confirm completion.
