@@ -1782,20 +1782,88 @@ func CutoverRequestMetadata(applyOperationID int64) []byte {
 	return []byte(`{"` + cutoverRequestOperationMetadataKey + `":` + strconv.FormatInt(applyOperationID, 10) + `}`)
 }
 
-// CutoverOperationID returns the operation a cutover request is bound to, or 0
-// when the request names none. Metadata that does not parse is an error rather
-// than an unbound request, so a drive never takes a request it cannot read.
-func (r *ApplyControlRequest) CutoverOperationID() (int64, error) {
+// cutoverRequestOperationsMetadataKey binds a cutover request to every
+// operation free to cut over when the operator issued it. One command then cuts
+// over each of them, the way a deferred cutover releases every target that is
+// held at once, and still cannot pass on to an operation that became free
+// later.
+const cutoverRequestOperationsMetadataKey = "apply_operation_ids"
+
+// CutoverRequestSetMetadata returns the metadata that binds a cutover request
+// to the operations in ids. A single operation is bound exactly as
+// CutoverRequestMetadata binds it. A larger set also names its first operation
+// under the single-operation key, so a server that reads only that key takes
+// the request for that one operation rather than as an unbound request.
+func CutoverRequestSetMetadata(ids []int64) ([]byte, error) {
+	switch len(ids) {
+	case 0:
+		return nil, fmt.Errorf("a cutover request set needs at least one operation")
+	case 1:
+		return CutoverRequestMetadata(ids[0]), nil
+	}
+	sorted := slices.Clone(ids)
+	slices.Sort(sorted)
+	if len(slices.Compact(slices.Clone(sorted))) != len(sorted) {
+		return nil, fmt.Errorf("a cutover request set names an operation more than once: %v", ids)
+	}
+	payload := map[string]any{
+		cutoverRequestOperationMetadataKey:  sorted[0],
+		cutoverRequestOperationsMetadataKey: sorted,
+	}
+	metadata, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("encode cutover request set %v: %w", ids, err)
+	}
+	return metadata, nil
+}
+
+// cutoverRequestBinding is the decoded operation binding of a cutover request.
+type cutoverRequestBinding struct {
+	ApplyOperationID  int64   `json:"apply_operation_id"`
+	ApplyOperationIDs []int64 `json:"apply_operation_ids"`
+}
+
+func (r *ApplyControlRequest) cutoverBinding() (cutoverRequestBinding, error) {
+	var binding cutoverRequestBinding
 	if r == nil || len(r.Metadata) == 0 {
-		return 0, nil
+		return binding, nil
 	}
-	var payload struct {
-		ApplyOperationID int64 `json:"apply_operation_id"`
+	if err := json.Unmarshal(r.Metadata, &binding); err != nil {
+		return binding, fmt.Errorf("parse metadata of %s control request %d: %w", r.Operation, r.ID, err)
 	}
-	if err := json.Unmarshal(r.Metadata, &payload); err != nil {
-		return 0, fmt.Errorf("parse metadata of %s control request %d: %w", r.Operation, r.ID, err)
+	return binding, nil
+}
+
+// CutoverOperationID returns the operation a cutover request is bound to, or 0
+// when the request names none. A request bound to a set of operations names
+// its first one here; CutoverOperationIDs returns the whole set. Metadata that
+// does not parse is an error rather than an unbound request, so a drive never
+// takes a request it cannot read.
+func (r *ApplyControlRequest) CutoverOperationID() (int64, error) {
+	binding, err := r.cutoverBinding()
+	if err != nil {
+		return 0, err
 	}
-	return payload.ApplyOperationID, nil
+	return binding.ApplyOperationID, nil
+}
+
+// CutoverOperationIDs returns every operation a cutover request is bound to,
+// sorted: the set when it names one, the single bound operation otherwise, and
+// nil when the request names none.
+func (r *ApplyControlRequest) CutoverOperationIDs() ([]int64, error) {
+	binding, err := r.cutoverBinding()
+	if err != nil {
+		return nil, err
+	}
+	if len(binding.ApplyOperationIDs) > 0 {
+		ids := slices.Clone(binding.ApplyOperationIDs)
+		slices.Sort(ids)
+		return ids, nil
+	}
+	if binding.ApplyOperationID != 0 {
+		return []int64{binding.ApplyOperationID}, nil
+	}
+	return nil, nil
 }
 
 // ForwardingControlRequestCaller is the requester recorded for a control

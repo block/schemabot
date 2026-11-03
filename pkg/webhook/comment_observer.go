@@ -1378,7 +1378,9 @@ func (o *CommentObserver) operatorControlRotations(ctx context.Context, apply *s
 
 // deferredCutoverRequest reports whether the apply deferred its cutover and
 // carries a durable cutover control request, whatever its status, and the
-// rollout member that request is bound to (0 when it names none).
+// first rollout member that request is bound to (0 when it names none). A
+// command bound to several members at once keys on its first, so it rotates
+// the comment once.
 func (o *CommentObserver) deferredCutoverRequest(ctx context.Context, apply *storage.Apply) (cutoverOperationID int64, requested bool, err error) {
 	if !o.shouldDeferCutover(apply) {
 		return 0, false, nil
@@ -1409,8 +1411,9 @@ func (o *CommentObserver) controlRequestExists(ctx context.Context, operation st
 
 // cutoverMayRecurInPhase reports whether a later cutover can still owe a
 // rotation while the apply stays in this phase: on an apply that deferred its
-// cutover, each rollout member's cutover re-binds the one cutover request, so
-// the phases at and past a cutover recur once per member. The observer then
+// cutover, each cutover command re-binds the one cutover request, to one
+// member or to several at once, so the phases at and past a cutover recur once
+// per command. The observer then
 // re-reads the cutover request every tick instead of answering from memory by
 // phase alone.
 func (o *CommentObserver) cutoverMayRecurInPhase(apply *storage.Apply, phase string) bool {
@@ -1418,8 +1421,8 @@ func (o *CommentObserver) cutoverMayRecurInPhase(apply *storage.Apply, phase str
 }
 
 // cutoverOperationForPost returns the rollout member whose cutover a progress
-// comment posted now tracks: the member the apply's cutover request is bound
-// to, while the apply is at or past a deferred cutover, and 0 otherwise.
+// comment posted now tracks: the first member the apply's cutover request is
+// bound to, while the apply is at or past a deferred cutover, and 0 otherwise.
 func (o *CommentObserver) cutoverOperationForPost(ctx context.Context, apply *storage.Apply) (int64, error) {
 	if !o.cutoverMayRecurInPhase(apply, controlPhase(apply.State)) {
 		return 0, nil

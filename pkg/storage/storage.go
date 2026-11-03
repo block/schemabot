@@ -1924,6 +1924,14 @@ type ControlRequestStore interface {
 	// operator-visible reason.
 	FailPending(ctx context.Context, applyID int64, operation ControlOperation, errorMessage string) error
 
+	// SettlePendingRevision settles req as completed or failed only while its
+	// row is still pending at req's Revision. The row is re-armed in place for
+	// the next command of the same operation, so a writer that evaluated one
+	// command settles that command and never a later one recorded on the same
+	// row. settled is false when the row has moved on. errorMessage is stored
+	// only when status is failed.
+	SettlePendingRevision(ctx context.Context, req *ApplyControlRequest, status ControlRequestStatus, errorMessage string) (settled bool, err error)
+
 	// ListSettled returns every control request for an apply that has reached a
 	// terminal status, ordered by operation ascending, so the plane that
 	// accepted a control RPC can learn whether the operation took effect:
