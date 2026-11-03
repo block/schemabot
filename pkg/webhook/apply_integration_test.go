@@ -1076,11 +1076,24 @@ func TestE2EApplyWhileThisPRAppliesItsLatestCommit(t *testing.T) {
 	assert.NotContains(t, body, "schemabot apply", "no apply is offered, since it would plan nothing")
 }
 
+// This PR's apply of its latest commit was planned for one target of the
+// staging rollout, so the rest of the environment still needs the change. A
+// second apply is refused, and the comment keeps offering the apply for once
+// the narrowed one ends.
+func TestE2EApplyWhileThisPRAppliesOneTargetOfItsLatestCommit(t *testing.T) {
+	body := commentApplyWhileThisPRApplies(t, "webhook_apply_active_narrowed", "abc123", func(p *storage.Plan, _ *storage.Apply) {
+		p.NarrowedTo = "staging/us"
+	})
+	assert.Contains(t, body, "This PR's apply `apply-active-test-001` is still running (state: `running`), so a second apply cannot start.")
+	assert.Contains(t, body, "schemabot apply -e staging", "the other targets still need an apply")
+	assert.NotContains(t, body, "nothing to apply again")
+}
+
 // commentApplyWhileThisPRApplies comments `schemabot apply -e staging
 // --allow-unsafe` while this PR holds the lock and its apply, planned from
 // planHeadSHA, is running, and returns the comment SchemaBot answers with. The
 // PR's latest commit is abc123.
-func commentApplyWhileThisPRApplies(t *testing.T, dbName, planHeadSHA string) string {
+func commentApplyWhileThisPRApplies(t *testing.T, dbName, planHeadSHA string, shape ...func(*storage.Plan, *storage.Apply)) string {
 	t.Helper()
 	svc := setupE2EService(t, dbName)
 
@@ -1098,7 +1111,7 @@ func commentApplyWhileThisPRApplies(t *testing.T, dbName, planHeadSHA string) st
 	lock, err := svc.Storage().Locks().Get(t.Context(), dbName, "mysql")
 	require.NoError(t, err)
 
-	planID, err := svc.Storage().Plans().Create(t.Context(), &storage.Plan{
+	plan := &storage.Plan{
 		PlanIdentifier: "plan-active-" + dbName,
 		Database:       dbName,
 		DatabaseType:   "mysql",
@@ -1107,12 +1120,10 @@ func commentApplyWhileThisPRApplies(t *testing.T, dbName, planHeadSHA string) st
 		Environment:    "staging",
 		HeadSHA:        planHeadSHA,
 		CreatedAt:      time.Now(),
-	})
-	require.NoError(t, err)
-	_, err = svc.Storage().Applies().Create(t.Context(), &storage.Apply{
+	}
+	apply := &storage.Apply{
 		ApplyIdentifier: "apply-active-test-001",
 		LockID:          lock.ID,
-		PlanID:          planID,
 		Database:        dbName,
 		DatabaseType:    "mysql",
 		Repository:      "octocat/hello-world",
@@ -1120,7 +1131,14 @@ func commentApplyWhileThisPRApplies(t *testing.T, dbName, planHeadSHA string) st
 		Environment:     "staging",
 		Engine:          "spirit",
 		State:           "running",
-	})
+	}
+	for _, f := range shape {
+		f(plan, apply)
+	}
+	planID, err := svc.Storage().Plans().Create(t.Context(), plan)
+	require.NoError(t, err)
+	apply.PlanID = planID
+	_, err = svc.Storage().Applies().Create(t.Context(), apply)
 	require.NoError(t, err)
 
 	mux := http.NewServeMux()
