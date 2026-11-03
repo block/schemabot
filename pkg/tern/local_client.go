@@ -275,6 +275,13 @@ type LocalClient struct {
 	// defaultObserverPollInterval. Tests lower it to observe notifications
 	// without waiting out the production cadence.
 	observerPollIntervalOverride time.Duration
+
+	// cutoverSharesTaken records the cutover request sets this client's drives
+	// have already cut over their own operation on, so a drive whose engine
+	// has not yet reported the swap does not trigger it again on every tick.
+	// The durable request in storage stays the source of truth: losing this
+	// record on a restart costs at most one repeated trigger per operation.
+	cutoverSharesTaken sync.Map // cutoverShareKey -> struct{}
 }
 
 type applyCancelHandle struct {

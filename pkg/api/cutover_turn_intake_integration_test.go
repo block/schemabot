@@ -317,6 +317,36 @@ func TestCutoverIntakeFollowsDeploymentOrder(t *testing.T) {
 		require.NoError(t, requestCutover(t, applyID), "a shard still copying does not hold its parked sibling's cutover")
 		requirePending(t, applyID, true)
 	})
+
+	// Both shards of an apply started with --defer-cutover wait at their
+	// cutover. One command is bound to both, so each shard's drive cuts over
+	// its own shard, rather than the first shard taking the command alone.
+	t.Run("DeferredApplyBindsEveryHeldShard", func(t *testing.T) {
+		resetMatrixTables(t, ctx, db)
+		applyID := seedShardedCutoverApply(t, stor)
+		ops, err := stor.ApplyOperations().ListByApply(ctx, applyID)
+		require.NoError(t, err)
+		require.Len(t, ops, 2)
+		var opIDs []int64
+		for _, op := range ops {
+			opIDs = append(opIDs, op.ID)
+			require.NoError(t, stor.ApplyOperations().UpdateState(ctx, op.ID, state.ApplyOperation.WaitingForCutover))
+			tasks, err := stor.Tasks().GetByApplyOperationID(ctx, op.ID)
+			require.NoError(t, err)
+			for _, task := range tasks {
+				task.State = state.Task.WaitingForCutover
+				require.NoError(t, stor.Tasks().Update(ctx, task))
+			}
+		}
+
+		require.NoError(t, requestCutover(t, applyID))
+		req, err := stor.ControlRequests().GetPending(ctx, applyID, storage.ControlOperationCutover)
+		require.NoError(t, err)
+		require.NotNil(t, req, "an accepted cutover is recorded for the drives to take")
+		boundIDs, err := req.CutoverOperationIDs()
+		require.NoError(t, err)
+		assert.ElementsMatch(t, opIDs, boundIDs, "the one command is bound to both held shards")
+	})
 }
 
 // seedShardedCutoverApply stores a running barrier apply whose one deployment

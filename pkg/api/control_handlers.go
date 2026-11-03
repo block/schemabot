@@ -636,7 +636,7 @@ func (s *Service) executeCutoverForApply(ctx context.Context, client tern.Client
 			return nil, 0, err
 		}
 		switch {
-		case turn.taker != nil:
+		case len(turn.takers) > 0:
 			readiness = cutoverRequestReady
 		case turn.inProgress:
 			readiness = cutoverRequestAlreadyInProgress
@@ -670,10 +670,17 @@ func (s *Service) executeCutoverForApply(ctx context.Context, client tern.Client
 		Status:      storage.ControlRequestPending,
 		RequestedBy: caller,
 	}
-	if turn.taker != nil {
-		// Bind the request to the member that takes it, so this one command
-		// cuts over that member and cannot pass on to the next one.
-		cutoverReq.Metadata = storage.CutoverRequestMetadata(turn.taker.ID)
+	if len(turn.takers) > 0 {
+		// Bind the request to the members that take it, so this one command
+		// cuts over each member free to cut over now and cannot pass on to a
+		// member that becomes free later.
+		metadata, err := storage.CutoverRequestSetMetadata(operationIDs(turn.takers))
+		if err != nil {
+			err := fmt.Errorf("bind cutover request for apply %s to its members: %w", apply.ApplyIdentifier, err)
+			metrics.RecordControlOperation(ctx, "cutover", apply.Database, apply.Deployment, apply.Environment, "error")
+			return nil, 0, err
+		}
+		cutoverReq.Metadata = metadata
 	}
 	_, alreadyPending, err := controlStore.RequestPending(ctx, cutoverReq)
 	if err != nil {
@@ -816,16 +823,19 @@ func (h *cutoverTurnHold) message() string {
 }
 
 // cutoverTurn is the intake's answer for a cutover request on a
-// multi-operation apply. taker is the first parked operation whose cutover has
+// multi-operation apply. takers are the parked operations whose cutover has
 // not started and that no earlier member holds, which the request is bound
-// to; hold is set instead when an earlier member holds every such operation.
+// to: every such operation of an apply that deferred its cutover, so one
+// command cuts over each member free to cut over when it was issued, and the
+// first of them otherwise. hold is set instead when an earlier member holds
+// every such operation.
 // inProgress reports, under an ordered policy with no taker and no hold, that
 // a member's cutover has already started, so the request has nothing left to
 // start. All are unset when the apply's cutover is unordered, or when no
 // member is parked by task evidence, which leaves the decision to the
 // caller's readiness check.
 type cutoverTurn struct {
-	taker      *storage.ApplyOperation
+	takers     []*storage.ApplyOperation
 	hold       *cutoverTurnHold
 	inProgress bool
 }
@@ -860,6 +870,12 @@ func (s *Service) cutoverTurnForRequest(ctx context.Context, apply *storage.Appl
 		tasksByOp[*task.ApplyOperationID] = append(tasksByOp[*task.ApplyOperationID], task)
 	}
 	names := memberDisplayNames(ops)
+	// An apply started with --defer-cutover holds every member until the
+	// operator acts, so one command releases every member free to cut over,
+	// the way the automatic cutover would have released each of them. Without
+	// it a member waits only where the rollout parks it, and each command
+	// cuts over the next member in turn.
+	releasesEveryFreeMember := apply.GetOptions().DeferCutover
 	var turn cutoverTurn
 	cutoverStarted := false
 	for i, op := range ops {
@@ -878,7 +894,11 @@ func (s *Service) cutoverTurnForRequest(ctx context.Context, apply *storage.Appl
 			return cutoverTurn{}, fmt.Errorf("check cutover order for member %s of apply %s: %w", names[i], apply.ApplyIdentifier, err)
 		}
 		if blocker == nil {
-			return cutoverTurn{taker: op}, nil
+			turn.takers = append(turn.takers, op)
+			if !releasesEveryFreeMember {
+				return cutoverTurn{takers: turn.takers}, nil
+			}
+			continue
 		}
 		if turn.hold == nil {
 			turn.hold = &cutoverTurnHold{
@@ -889,10 +909,22 @@ func (s *Service) cutoverTurnForRequest(ctx context.Context, apply *storage.Appl
 			}
 		}
 	}
+	if len(turn.takers) > 0 {
+		return cutoverTurn{takers: turn.takers}, nil
+	}
 	if turn.hold == nil {
 		turn.inProgress = cutoverStarted
 	}
 	return turn, nil
+}
+
+// operationIDs returns the identifiers of ops, in order.
+func operationIDs(ops []*storage.ApplyOperation) []int64 {
+	ids := make([]int64, 0, len(ops))
+	for _, op := range ops {
+		ids = append(ids, op.ID)
+	}
+	return ids
 }
 
 // parkedOnTasks reports whether an operation's tasks are parked at the

@@ -349,14 +349,18 @@ func SettlePendingCutoverAfterStop(ctx context.Context, store storage.Storage, l
 	if controlReq == nil {
 		return nil
 	}
-	boundID, err := controlReq.CutoverOperationID()
+	boundIDs, err := controlReq.CutoverOperationIDs()
 	if err != nil {
-		return fmt.Errorf("read the operation the pending cutover of apply %s is for: %w", apply.ApplyIdentifier, err)
+		return fmt.Errorf("read the operations the pending cutover of apply %s is for: %w", apply.ApplyIdentifier, err)
 	}
-	if boundID != 0 {
-		return settleBoundPendingCutover(ctx, store, logger, apply, controlReq, boundID, func(*storage.ApplyOperation) string {
-			return cutoverSupersededByStopMessage
-		})
+	supersededByStop := func(*storage.ApplyOperation) string { return cutoverSupersededByStopMessage }
+	switch len(boundIDs) {
+	case 0:
+		// An unbound request is failed as superseded below.
+	case 1:
+		return settleBoundPendingCutover(ctx, store, logger, apply, controlReq, boundIDs[0], supersededByStop)
+	default:
+		return settleCutoverSet(ctx, store, logger, apply, controlReq, boundIDs, supersededByStop)
 	}
 	return failPendingCutover(ctx, store, logger, apply, controlReq, cutoverSupersededByStopMessage)
 }
@@ -379,14 +383,18 @@ func SettlePendingCutoverForResolvedApply(ctx context.Context, store storage.Sto
 	if controlReq == nil {
 		return nil
 	}
-	boundID, err := controlReq.CutoverOperationID()
+	boundIDs, err := controlReq.CutoverOperationIDs()
 	if err != nil {
-		return fmt.Errorf("read the operation the pending cutover of apply %s is for: %w", apply.ApplyIdentifier, err)
+		return fmt.Errorf("read the operations the pending cutover of apply %s is for: %w", apply.ApplyIdentifier, err)
 	}
-	if boundID != 0 {
-		return settleBoundPendingCutover(ctx, store, logger, apply, controlReq, boundID, func(op *storage.ApplyOperation) string {
-			return boundCutoverNotAppliedMessage(apply, op)
-		})
+	notApplied := func(op *storage.ApplyOperation) string { return boundCutoverNotAppliedMessage(apply, op) }
+	switch len(boundIDs) {
+	case 0:
+		// An unbound request is settled from the apply's own state below.
+	case 1:
+		return settleBoundPendingCutover(ctx, store, logger, apply, controlReq, boundIDs[0], notApplied)
+	default:
+		return settleCutoverSet(ctx, store, logger, apply, controlReq, boundIDs, notApplied)
 	}
 	switch {
 	case cutoverRequestResolvedByApplyState(apply.State):
