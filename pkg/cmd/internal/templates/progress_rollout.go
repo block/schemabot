@@ -708,6 +708,16 @@ func formatHaltedAcrossTargets(t TableProgress) string {
 		// The list counts the targets, so the line does not repeat them.
 		coverage = ""
 	}
+	if stoppedBeforeAnyTargetStarted(t) {
+		// Every target would only repeat that it stopped, so the line says it
+		// once, as the PR comment does.
+		writeTableLine(&b, t, "%s", haltedAcrossTargetsPhrase(t))
+		if t.DDL != "" {
+			b.WriteString(formatTableDDL(t))
+		}
+		b.WriteString("\n")
+		return b.String()
+	}
 	stopped, ok := stoppedAcrossTargets(t.Shards)
 	if !ok || !state.IsState(t.Status, state.Task.Stopped) || !anyTargetStarted(t.Shards) {
 		writeTableLine(&b, t, "%s%s", haltedAcrossTargetsPhrase(t), coverage)
@@ -804,6 +814,17 @@ func haltedAcrossTargetsPhrase(t TableProgress) string {
 	default:
 		return t.Status
 	}
+}
+
+// stoppedBeforeAnyTargetStarted reports whether a table across targets
+// stopped on every target before any of them started it
+// (presentation.EveryTargetStopped).
+func stoppedBeforeAnyTargetStarted(t TableProgress) bool {
+	statuses := make([]string, len(t.Shards))
+	for i, s := range t.Shards {
+		statuses[i] = s.Status
+	}
+	return presentation.EveryTargetStopped(statuses) && !anyTargetStarted(t.Shards)
 }
 
 // anyTargetStarted reports whether any target completed the change or copied

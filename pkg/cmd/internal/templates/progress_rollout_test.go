@@ -1062,6 +1062,10 @@ func TestWriteProgress_StoppedTableByTableRolloutTableNotBegunReadsStopped(t *te
 	out := renderRollout(t, data)
 
 	assert.Contains(t, out, "docks: ⏹️ Stopped (not started)\n", "%s", out)
+	_, docks, found := strings.Cut(out, "docks: ")
+	require.True(t, found, "%s", out)
+	assert.NotContains(t, docks, "Targets:", "each target would only repeat that it stopped: %s", out)
+	assert.NotContains(t, docks, "payments-00", "each target would only repeat that it stopped: %s", out)
 	assert.NotContains(t, out, "Queued", "%s", out)
 	assert.NotContains(t, out, "queued", "%s", out)
 }

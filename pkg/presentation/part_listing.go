@@ -72,6 +72,17 @@ func UnreportedTargetStatus(memberState string) string {
 	}
 }
 
+// EveryTargetStopped reports whether a table stopped on every one of its
+// targets. A table that stopped there before any target began it reads as
+// stopped once, with no target list, since each target would only repeat it;
+// a table with a target in any other state keeps its list, so that state is
+// never hidden.
+func EveryTargetStopped(statuses []string) bool {
+	return len(statuses) > 0 && !slices.ContainsFunc(statuses, func(status string) bool {
+		return !state.IsState(status, state.Task.Stopped)
+	})
+}
+
 // RolloutTableStatus is where a target stands on one table of a rollout in
 // applyState, given the table's own task status. A table still pending on a
 // target of a stopped apply is not waiting for its turn: nothing runs until

@@ -2229,6 +2229,32 @@ func TestRenderMultiDeploymentApplyComment_StoppedRolloutTableNotBegunReadsStopp
 	assert.NotContains(t, out, "queued", "%s", out)
 }
 
+// The same stopped rollout, but testapp-002's refunds was cancelled before it
+// began while testapp-001's was left to resume. The two targets ended in
+// different states, so the table keeps its target list rather than reading as
+// stopped everywhere.
+func TestRenderMultiDeploymentApplyComment_StoppedRolloutTableWithACancelledTargetKeepsItsList(t *testing.T) {
+	model := presentation.Derive([]presentation.Operation{
+		steppedTarget("testapp-001", so.Stopped, 1),
+		steppedTarget("testapp-002", so.Stopped, 1),
+		steppedTarget("testapp-001", so.Pending, 2),
+		steppedTarget("testapp-002", so.Cancelled, 2),
+	})
+	require.Equal(t, state.Apply.Stopped, model.State)
+	detail := func(database, refunds string) *ApplyStatusCommentData {
+		d := tablesDetail(database,
+			TableProgressData{TableName: "orders", Status: state.Task.Stopped, RowsCopied: 300, RowsTotal: 1000, PercentComplete: 30},
+			TableProgressData{TableName: "refunds", Status: refunds},
+		)
+		d.State = state.Apply.Stopped
+		return d
+	}
+	out := renderTargets(model, detail("testapp_001", state.Task.Pending), detail("testapp_002", state.Task.Cancelled))
+
+	assert.Contains(t, out, "**`refunds`**: ⏹️ Stopped\n", "%s", out)
+	assert.Contains(t, out, "- Targets: 2 (1 stopped, 1 cancelled)\n  - ○ `testapp-001`: stopped\n  - ○ `testapp-002`: cancelled\n", "%s", out)
+}
+
 // orders rolls out to four targets. testapp-002 fails, and the operator stops
 // the apply while testapp-003 and testapp-004 are 40% through their copies.
 // The failure makes the table read as failed, and its targets are still listed

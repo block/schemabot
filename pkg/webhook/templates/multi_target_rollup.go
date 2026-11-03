@@ -423,7 +423,7 @@ func writeTargetTableLine(sb *strings.Builder, table string, cells []TableProgre
 		phrase, coverage = "⊘ Not started", ""
 	}
 	lists := listsTargets(strip)
-	if status == state.Task.Stopped && !anyTargetBegan(cells) {
+	if status == state.Task.Stopped && stoppedBeforeAnyTargetBegan(cells) {
 		// Every target would only repeat that it stopped, so the line says it
 		// once, the way the CLI's progress view does.
 		phrase, coverage, lists = "⏹️ Stopped (not started)", "", false
@@ -447,6 +447,16 @@ func writeTargetTableLine(sb *strings.Builder, table string, cells []TableProgre
 	if lists {
 		writeMemberList(sb, presentation.TargetNoun, strip, pendingWord, budget)
 	}
+}
+
+// stoppedBeforeAnyTargetBegan reports whether a table stopped on every
+// target before any of them began it (presentation.EveryTargetStopped).
+func stoppedBeforeAnyTargetBegan(cells []TableProgressData) bool {
+	statuses := make([]string, len(cells))
+	for i, c := range cells {
+		statuses[i] = c.Status
+	}
+	return presentation.EveryTargetStopped(statuses) && !anyTargetBegan(cells)
 }
 
 // anyTargetBegan reports whether any target completed a table or began
