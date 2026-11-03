@@ -121,6 +121,22 @@ func TestUnmanagedServerManagedSchemaChanges(t *testing.T) {
 			want: []string{"db/orders/v2/users.sql"},
 		},
 		{
+			// Repointing an environment symlink changes the schema the
+			// environment plans, so it needs a managing config like a schema
+			// file does.
+			name:      "managed dir symlink, no config -> flagged",
+			databases: managed,
+			files:     []ghclient.PRFile{{Filename: "db/orders/schema/staging", Status: "modified", Symlink: true}},
+			want:      []string{"db/orders/schema/staging"},
+		},
+		{
+			name:      "managed dir symlink, covered by config -> not flagged",
+			databases: managed,
+			files:     []ghclient.PRFile{{Filename: "db/orders/schema/staging", Status: "modified", Symlink: true}},
+			configs:   coveringConfig,
+			want:      nil,
+		},
+		{
 			name:      "non-schema file -> not flagged",
 			databases: managed,
 			files:     []ghclient.PRFile{{Filename: "db/orders/schema/README.md", Status: "modified"}},

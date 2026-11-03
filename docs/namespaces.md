@@ -329,9 +329,9 @@ production plans `app_production`.
 - With flat files directly in an environment schema root, the namespace is that
   root's directory name after any symlink is resolved. In the first layout that
   is `base`.
-- A pull request that only adds, repoints, or removes an environment or
-  namespace symlink changes the schema an environment plans, so SchemaBot plans
-  it like any other schema change.
+- A pull request that only adds, repoints, renames, or removes an environment
+  or namespace symlink, or turns one into a regular file, changes the schema an
+  environment plans, so SchemaBot plans it like any other schema change.
 
 ## Ignoring Namespaces
 

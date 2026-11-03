@@ -632,7 +632,7 @@ func IsSchemaFile(filename string) bool {
 // should refresh the visible SchemaBot plan.
 func HasSchemaInputFiles(files []PRFile) bool {
 	for _, file := range files {
-		if file.Symlink || isSchemaInputFile(file.Filename) || isSchemaInputFile(file.PreviousFilename) {
+		if file.Symlink || file.PreviousSymlink || isSchemaInputFile(file.Filename) || isSchemaInputFile(file.PreviousFilename) {
 			return true
 		}
 	}
@@ -683,6 +683,10 @@ func isDiscoveryInputPRFile(file PRFile) bool {
 // them, in a repository of any size — that touch no schema at all.
 func HasDiscoveryInputFiles(files []PRFile) bool {
 	return slices.ContainsFunc(files, isDiscoveryInputPRFile)
+}
+
+func isAddedPRFile(status string) bool {
+	return strings.EqualFold(status, "added")
 }
 
 func isRemovedPRFile(status string) bool {
