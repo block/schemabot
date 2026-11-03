@@ -3761,7 +3761,10 @@ type CutoverRequest struct {
 	// on every send of it. A data plane that already settled the command
 	// answers a re-send with that outcome instead of recording the command
 	// again, so a re-send never retries a command the data plane failed. A
-	// new operator command carries a new id.
+	// new operator command carries a new id. An id of the form
+	// "<origin>.<sequence>" orders the commands of one origin: a data plane that
+	// settled a later command answers a send of an earlier one with that
+	// outcome too, since only a delayed re-send can carry it.
 	CommandId     string `protobuf:"bytes,6,opt,name=command_id,json=commandId,proto3" json:"command_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache

@@ -174,9 +174,11 @@ const (
 
 // remoteCutoverCommandID names the operator command a pending cutover request
 // carries: the request row and the revision it was armed at, the same on
-// every send of the command and different for the next command on the row.
+// every send of the command and ordered after every earlier command on the
+// row, so the data plane never takes a delayed send of an earlier command for
+// a new one.
 func remoteCutoverCommandID(controlReq *storage.ApplyControlRequest) string {
-	return fmt.Sprintf("%d.%d", controlReq.ID, controlReq.Revision)
+	return storage.NewControlCommandID(controlReq.ID, controlReq.Revision)
 }
 
 // failRemoteCutoverSetShare fails a pending cutover request set whose share

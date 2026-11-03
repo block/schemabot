@@ -1850,9 +1850,38 @@ func WithControlCommandID(metadata []byte, commandID string) ([]byte, error) {
 	return encoded, nil
 }
 
-// SettledByControlCommand reports whether r is a settled request that already
-// carries the operator command commandID, which a repeated send of that
-// command must leave settled (ControlRequestStore.RequestPendingCommand).
+// NewControlCommandID names an operator command sent from another plane by
+// where it was issued (origin) and its place in the commands issued there
+// (sequence). Commands from one origin are ordered by sequence, so a data plane
+// can tell a delayed send of an earlier command from a newer command.
+func NewControlCommandID(origin, sequence int64) string {
+	return fmt.Sprintf("%d.%d", origin, sequence)
+}
+
+// parseControlCommandID splits a NewControlCommandID id into its origin and
+// sequence. ok is false for any other id, which is compared only for equality.
+func parseControlCommandID(commandID string) (origin, sequence int64, ok bool) {
+	originPart, sequencePart, found := strings.Cut(commandID, ".")
+	if !found {
+		return 0, 0, false
+	}
+	origin, err := strconv.ParseInt(originPart, 10, 64)
+	if err != nil {
+		return 0, 0, false
+	}
+	sequence, err = strconv.ParseInt(sequencePart, 10, 64)
+	if err != nil {
+		return 0, 0, false
+	}
+	return origin, sequence, true
+}
+
+// SettledByControlCommand reports whether a send of the operator command
+// commandID must leave r settled (ControlRequestStore.RequestPendingCommand):
+// r is settled and carries that command, or carries a later command from the
+// same origin (NewControlCommandID). A send of an earlier command arrives only
+// as a delayed re-send, since its origin issued a newer one since, so it never
+// retries work the newer command already settled.
 func (r *ApplyControlRequest) SettledByControlCommand(commandID string) (bool, error) {
 	if r == nil || commandID == "" || r.Status == ControlRequestPending {
 		return false, nil
@@ -1861,7 +1890,25 @@ func (r *ApplyControlRequest) SettledByControlCommand(commandID string) (bool, e
 	if err != nil {
 		return false, err
 	}
-	return recorded == commandID, nil
+	if recorded == commandID {
+		return true, nil
+	}
+	return supersedesControlCommand(recorded, commandID), nil
+}
+
+// supersedesControlCommand reports whether the recorded command was issued
+// after commandID by the same origin. Ids that do not both parse as
+// NewControlCommandID ids, or come from different origins, have no order.
+func supersedesControlCommand(recorded, commandID string) bool {
+	recordedOrigin, recordedSequence, ok := parseControlCommandID(recorded)
+	if !ok {
+		return false
+	}
+	origin, sequence, ok := parseControlCommandID(commandID)
+	if !ok {
+		return false
+	}
+	return recordedOrigin == origin && recordedSequence > sequence
 }
 
 // ControlCommandID returns the operator command a control request carries

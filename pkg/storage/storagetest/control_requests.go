@@ -423,8 +423,9 @@ func TestControlRequests(t *testing.T, h Harness) {
 	// RequestPendingCommand_LeavesTheCommandsSettledRowSettled verifies a
 	// request that names its operator command is recorded once per command:
 	// a re-send while it is pending is the pending row, a re-send after it
-	// failed returns the failed row unchanged instead of re-arming it, and
-	// only a new command re-arms the row.
+	// failed returns the failed row unchanged instead of re-arming it, only a
+	// new command re-arms the row, and a delayed send of an earlier command
+	// after a newer one failed leaves the newer failure in place.
 	t.Run("RequestPendingCommand_LeavesTheCommandsSettledRowSettled", func(t *testing.T) {
 		ctx := t.Context()
 		store := h.NewStorage(t)
@@ -475,6 +476,22 @@ func TestControlRequests(t *testing.T, h Harness) {
 		commandID, err = next.ControlCommandID()
 		require.NoError(t, err)
 		assert.Equal(t, "7.1", commandID)
+
+		require.NoError(t, store.ControlRequests().FailPending(ctx, applyID, storage.ControlOperationCutover, "engine refused the second cutover"))
+
+		delayed, alreadyPending := send("7.0")
+		assert.False(t, alreadyPending)
+		assert.Equal(t, storage.ControlRequestFailed, delayed.Status, "a delayed send of the earlier command returns the newer command's failure")
+		assert.Equal(t, "engine refused the second cutover", delayed.ErrorMessage)
+		assert.Equal(t, next.Revision, delayed.Revision, "a delayed send of the earlier command does not re-arm the row")
+		commandID, err = delayed.ControlCommandID()
+		require.NoError(t, err)
+		assert.Equal(t, "7.1", commandID, "the row keeps the newer command")
+		stored, err = store.ControlRequests().GetByOperation(ctx, applyID, storage.ControlOperationCutover)
+		require.NoError(t, err)
+		require.NotNil(t, stored)
+		assert.Equal(t, storage.ControlRequestFailed, stored.Status)
+		assert.Equal(t, next.Revision, stored.Revision)
 	})
 
 	// CompletePending verifies the happy-path resolution: a pending request
