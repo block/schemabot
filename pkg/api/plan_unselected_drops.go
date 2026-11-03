@@ -65,7 +65,7 @@ func (s *Service) refuseDropsOfUnselectedTables(req PlanRequest, declared map[st
 	var judgedByName []string
 	for _, drop := range drops {
 		for _, namespace := range drop.namespaces {
-			if slices.Contains(member.Namespaces, namespace) {
+			if member.Holds(namespace) {
 				continue
 			}
 			placed[drop.table] = true
