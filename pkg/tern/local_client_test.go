@@ -1007,6 +1007,20 @@ func (s *testControlRequestStore) FailPending(_ context.Context, applyID int64, 
 	return nil
 }
 
+func (s *testControlRequestStore) SettlePendingRevision(_ context.Context, target *storage.ApplyControlRequest, status storage.ControlRequestStatus, errorMessage string) (bool, error) {
+	for _, req := range s.requests {
+		if req.ID != target.ID || req.Revision != target.Revision || req.Status != storage.ControlRequestPending {
+			continue
+		}
+		req.Status = status
+		if status == storage.ControlRequestFailed {
+			req.ErrorMessage = errorMessage
+		}
+		return true, nil
+	}
+	return false, nil
+}
+
 // RecordRemoteFailure mirrors the store's contract: a pending row is a live
 // request this plane has not forwarded yet, so a settled report describes a
 // superseded attempt and is ignored; anything else takes the remote reason.

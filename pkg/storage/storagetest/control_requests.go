@@ -1,6 +1,7 @@
 package storagetest
 
 import (
+	"context"
 	"fmt"
 	"sync"
 	"testing"
@@ -486,6 +487,72 @@ func TestControlRequests(t *testing.T, h Harness) {
 		assert.Equal(t, storage.ControlRequestFailed, failed.Status)
 		assert.Equal(t, "remote start failed", failed.ErrorMessage)
 		assert.NotNil(t, failed.CompletedAt)
+	})
+
+	// SettlePendingRevision_SettlesOnlyTheCommandItWasGiven verifies a writer
+	// that evaluated one command cannot settle a later command re-armed on the
+	// same row: the stale revision settles nothing, under a lease or without
+	// one, and the current revision settles as asked.
+	t.Run("SettlePendingRevision_SettlesOnlyTheCommandItWasGiven", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+
+		lock := CreateLock(t, store, "control_revision_db", storage.DatabaseTypeMySQL)
+		apply := CreateClaimedApply(t, store, lock, "apply_control_revision", 803, "current-driver")
+		ownedCtx := storage.WithApplyLease(ctx, storage.ApplyLease{
+			ApplyID: apply.ID, Owner: apply.LeaseOwner, Token: apply.LeaseToken,
+		})
+		request := func(requestedBy string) *storage.ApplyControlRequest {
+			t.Helper()
+			req, alreadyPending, err := store.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+				ApplyID:     apply.ID,
+				Operation:   storage.ControlOperationCutover,
+				Status:      storage.ControlRequestPending,
+				RequestedBy: requestedBy,
+				Metadata:    []byte(`{}`),
+			})
+			require.NoError(t, err)
+			require.False(t, alreadyPending)
+			return req
+		}
+
+		first := request("operator-a")
+		settled, err := store.ControlRequests().SettlePendingRevision(ownedCtx, first, storage.ControlRequestCompleted, "")
+		require.NoError(t, err)
+		assert.True(t, settled, "the current revision settles")
+
+		second := request("operator-b")
+		require.Equal(t, first.ID, second.ID)
+		require.Equal(t, first.Revision+1, second.Revision)
+
+		for name, writeCtx := range map[string]context.Context{"lease": ownedCtx, "no lease": ctx} {
+			settled, err = store.ControlRequests().SettlePendingRevision(writeCtx, first, storage.ControlRequestFailed, "stale outcome")
+			require.NoError(t, err, name)
+			assert.False(t, settled, "%s: an earlier revision settles nothing", name)
+		}
+		pending, err := store.ControlRequests().GetPending(ctx, apply.ID, storage.ControlOperationCutover)
+		require.NoError(t, err)
+		require.NotNil(t, pending, "the later command stays pending")
+		assert.Equal(t, second.Revision, pending.Revision)
+		assert.Equal(t, "operator-b", pending.RequestedBy)
+		assert.Empty(t, pending.ErrorMessage)
+
+		settled, err = store.ControlRequests().SettlePendingRevision(ownedCtx, second, storage.ControlRequestFailed, "cutover reached 1 of the 2 operations it was sent for")
+		require.NoError(t, err)
+		assert.True(t, settled)
+		failed, err := store.ControlRequests().GetByOperation(ctx, apply.ID, storage.ControlOperationCutover)
+		require.NoError(t, err)
+		require.NotNil(t, failed)
+		assert.Equal(t, storage.ControlRequestFailed, failed.Status)
+		assert.Equal(t, "cutover reached 1 of the 2 operations it was sent for", failed.ErrorMessage)
+		assert.NotNil(t, failed.CompletedAt)
+
+		staleCtx := storage.WithApplyLease(ctx, storage.ApplyLease{
+			ApplyID: apply.ID, Owner: "old-driver", Token: "stale-token",
+		})
+		third := request("operator-c")
+		_, err = store.ControlRequests().SettlePendingRevision(staleCtx, third, storage.ControlRequestCompleted, "")
+		require.ErrorIs(t, err, storage.ErrApplyLeaseLost, "a stale lease fails closed")
 	})
 
 	// LeaseGuardsPendingResolution verifies resolving a pending request is
