@@ -5015,7 +5015,7 @@ func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply
 			if !parked.runFullPoll(ctx, c.storage, apply, time.Now(), logger) {
 				continue
 			}
-			if standDown, err := c.processPendingControlRequestsAtPoll(ctx, apply, scope); err != nil {
+			if standDown, err := c.processPendingControlRequestsAtPoll(ctx, apply, scope, &parked); err != nil {
 				return err
 			} else if standDown {
 				return nil
@@ -5180,8 +5180,10 @@ func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply
 // only the processors for operations found pending run, each loading its own
 // request again before acting on it. standDown reports that a cancel or stop
 // is settling the apply and the drive should exit. An error means the drive
-// exits for the operator to retry, leaving the request pending.
-func (c *GRPCClient) processPendingControlRequestsAtPoll(ctx context.Context, apply *storage.Apply, scope applyTaskScope) (standDown bool, err error) {
+// exits for the operator to retry, leaving the request pending. parked, when
+// set, is told what the read found, so a drive held at a deferred cutover
+// stays at full cadence behind a request it consumes here.
+func (c *GRPCClient) processPendingControlRequestsAtPoll(ctx context.Context, apply *storage.Apply, scope applyTaskScope, parked *parkedPoll) (standDown bool, err error) {
 	logger := c.applyLogger(apply)
 	pending, err := loadPendingControlOperations(ctx, c.storage, apply)
 	if err != nil {
@@ -5189,6 +5191,7 @@ func (c *GRPCClient) processPendingControlRequestsAtPoll(ctx context.Context, ap
 			append(apply.MutableLogAttrs(), "error", err)...)
 		return false, err
 	}
+	parked.observe(pending)
 	if pending.has(storage.ControlOperationCancel, storage.ControlOperationStop) {
 		standDown, err := c.processPendingCancelOrStopControlRequest(ctx, apply, scope)
 		if err != nil {

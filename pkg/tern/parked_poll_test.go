@@ -94,6 +94,35 @@ func TestParkedPoll(t *testing.T) {
 		assert.Equal(t, reads, controls.reads, "a woken drive no longer checks for pending requests")
 	})
 
+	t.Run("a request the refresh poll consumes keeps the drive at full cadence", func(t *testing.T) {
+		controls := &hasPendingStore{testControlRequestStore: &testControlRequestStore{}}
+		store := newStore(controls)
+		p := newParkedPoll()
+		require.True(t, p.runFullPoll(t.Context(), store, apply, start, slog.Default()))
+		p.hold()
+
+		// The refresh runs the full poll without a check, so the request it
+		// consumes is seen only by the poll's own control read.
+		require.True(t, p.runFullPoll(t.Context(), store, apply, start.Add(parkedFullPollInterval), slog.Default()))
+		p.observe(pendingControlOperations{storage.ControlOperationCutover: {}})
+		p.hold()
+
+		reads := controls.reads
+		assert.True(t, p.runFullPoll(t.Context(), store, apply, start.Add(parkedFullPollInterval+time.Second), slog.Default()),
+			"the drive polls the next tick to see the swap the consumed request started")
+		assert.Equal(t, reads, controls.reads, "a woken drive no longer checks for pending requests")
+	})
+
+	t.Run("a control read that finds nothing leaves the drive held", func(t *testing.T) {
+		controls := &hasPendingStore{testControlRequestStore: &testControlRequestStore{}}
+		store := newStore(controls)
+		p := newParkedPoll()
+		require.True(t, p.runFullPoll(t.Context(), store, apply, start, slog.Default()))
+		p.observe(pendingControlOperations{})
+		p.hold()
+		assert.False(t, p.runFullPoll(t.Context(), store, apply, start.Add(time.Second), slog.Default()))
+	})
+
 	t.Run("a failed check runs the full poll", func(t *testing.T) {
 		controls := &hasPendingStore{testControlRequestStore: &testControlRequestStore{}, err: assert.AnError}
 		p := newParkedPoll()

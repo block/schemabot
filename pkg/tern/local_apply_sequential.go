@@ -1137,6 +1137,7 @@ func (c *LocalClient) pollTaskToCompletion(ctx context.Context, apply *storage.A
 					"task_id", task.TaskIdentifier, "error", err)
 				return taskAbort
 			}
+			parked.observe(pending)
 			if pending.has(storage.ControlOperationCancel, storage.ControlOperationStop) {
 				if standDown, err := c.processPendingCancelOrStopControlRequest(ctx, apply); err != nil {
 					logger.Warn("pending stop request processing failed; current apply owner will exit for operator retry",
