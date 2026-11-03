@@ -464,28 +464,21 @@ func TestPlanIDForTasks(t *testing.T) {
 	assert.Contains(t, err.Error(), "neither the tasks nor apply apply-without-plan name a plan")
 }
 
-// An apply started with --defer-cutover cuts every operation over together.
-// A cutover that names payments-001, parked at its cutover, is refused while
-// payments-002 is still copying, and nothing is queued; once payments-002
-// parks too, the same cutover is queued.
-func TestLocalClient_DeferredCutoverNamingOneOperationWaitsForEveryOperation(t *testing.T) {
+// A control plane that orders a rollout's cutovers defers each operation's
+// cutover on the data plane, so the data plane's apply carries the deferral,
+// and then sends one operation's cutover at a time. The data plane queues that
+// cutover for the operation it names while a sibling is still copying, rather
+// than waiting for every operation as an operator's --defer-cutover would.
+func TestLocalClient_CutoverNamingOneOperationIsQueuedWhileASiblingCopies(t *testing.T) {
 	fx := newSharedApplyFixture(state.ApplyOperation.WaitingForCutover, state.ApplyOperation.Running, state.Task.WaitingForCutover, state.Task.Running)
 	fx.apply.Options = storage.MarshalApplyOptions(storage.ApplyOptions{DeferCutover: true})
-	cutover := func() (*ternv1.CutoverResponse, error) {
-		return fx.client.Cutover(t.Context(), &ternv1.CutoverRequest{ApplyId: fx.apply.ApplyIdentifier, Environment: "staging", Caller: "cli:alice", ApplyOperationId: "11"})
-	}
 
-	resp, err := cutover()
+	resp, err := fx.client.Cutover(t.Context(), &ternv1.CutoverRequest{ApplyId: fx.apply.ApplyIdentifier, Environment: "staging", Caller: "cli:alice", ApplyOperationId: "11"})
 	require.NoError(t, err)
-	assert.False(t, resp.Accepted)
-	assert.Equal(t, "cutover is not ready: payments-002 has not reached cutover (1 of 2 wait for it); --defer-cutover cuts them all over together, so run cutover again once all 2 wait", resp.ErrorMessage)
-	assert.Empty(t, fx.controlRequests.requests, "a refused cutover queues nothing")
-
-	fx.second.State = state.ApplyOperation.WaitingForCutover
-	fx.secondTask.State = state.Task.WaitingForCutover
-	resp, err = cutover()
-	require.NoError(t, err)
-	assert.True(t, resp.Accepted)
+	assert.True(t, resp.Accepted, resp.GetErrorMessage())
 	require.Len(t, fx.controlRequests.requests, 1)
 	assert.Equal(t, storage.ControlRequestPending, fx.controlRequests.requests[0].Status)
+	boundIDs, err := fx.controlRequests.requests[0].CutoverOperationIDs()
+	require.NoError(t, err)
+	assert.Equal(t, []int64{11}, boundIDs, "the cutover is bound to the operation it names")
 }
