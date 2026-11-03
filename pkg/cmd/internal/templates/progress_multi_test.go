@@ -86,6 +86,55 @@ func TestWriteProgressMultiDeploymentResumingOffersNoStart(t *testing.T) {
 	assert.NotContains(t, output, "schemabot start")
 }
 
+// A rollout whose deployments each address one target renders a section per
+// target. While the apply resumes, each section reads its stopped table as
+// resuming, as the rollup does, rather than as stopped at its old percent.
+func TestWriteProgressMultiDeploymentResumingSingleTargetSections(t *testing.T) {
+	output := captureStdout(t, func() {
+		WriteProgress(ProgressData{
+			ApplyID:     "apply-resuming",
+			Environment: "staging",
+			State:       state.Apply.Resuming,
+			Operations: []ProgressOperation{
+				{Deployment: "us", Target: "orders-a", State: state.ApplyOperation.Stopped, StartedAt: "2026-06-16T10:00:00Z", CutoverPolicy: storage.CutoverPolicyParallel, OnFailure: storage.OnFailureHalt},
+				{Deployment: "eu", Target: "orders-b", State: state.ApplyOperation.Stopped, StartedAt: "2026-06-16T10:00:00Z", CutoverPolicy: storage.CutoverPolicyParallel, OnFailure: storage.OnFailureHalt},
+			},
+			Tables: []TableProgress{
+				{Deployment: "us", Target: "orders-a", TableName: "users", ChangeType: "alter", DDL: "ALTER TABLE `users` ADD COLUMN `region` varchar(20)", Status: state.Task.Stopped, PercentComplete: 57, RowsCopied: 57, RowsTotal: 100},
+				{Deployment: "eu", Target: "orders-b", TableName: "users", ChangeType: "alter", DDL: "ALTER TABLE `users` ADD COLUMN `region` varchar(20)", Status: state.Task.Stopped, PercentComplete: 40, RowsCopied: 40, RowsTotal: 100},
+			},
+		})
+	})
+
+	assert.Equal(t, 2, strings.Count(output, "~ users: "+ANSICyan+"🔄 Resuming..."+ANSIReset+"\n"), output)
+	assert.NotContains(t, output, "Stopped at")
+	assert.NotContains(t, output, "57 / 100")
+	assert.NotContains(t, output, "schemabot start")
+}
+
+// A target that finished the table before the stop keeps its outcome beside
+// the resuming line.
+func TestWriteProgressMultiDeploymentResumingKeepsFinishedTargets(t *testing.T) {
+	output := captureStdout(t, func() {
+		WriteProgress(ProgressData{
+			ApplyID:     "apply-resuming",
+			Environment: "staging",
+			State:       state.Apply.Resuming,
+			Operations: []ProgressOperation{
+				{Deployment: "staging", Target: "orders-a", State: state.ApplyOperation.Stopped, StartedAt: "2026-06-16T10:00:00Z", CutoverPolicy: storage.CutoverPolicyParallel, OnFailure: storage.OnFailureHalt},
+				{Deployment: "staging", Target: "orders-b", State: state.ApplyOperation.Stopped, StartedAt: "2026-06-16T10:00:00Z", CutoverPolicy: storage.CutoverPolicyParallel, OnFailure: storage.OnFailureHalt},
+			},
+			Tables: []TableProgress{
+				{Deployment: "staging", Target: "orders-a", TableName: "users", ChangeType: "alter", DDL: "ALTER TABLE `users` ADD COLUMN `region` varchar(20)", Status: state.Task.Completed, PercentComplete: 100, RowsCopied: 100, RowsTotal: 100},
+				{Deployment: "staging", Target: "orders-b", TableName: "users", ChangeType: "alter", DDL: "ALTER TABLE `users` ADD COLUMN `region` varchar(20)", Status: state.Task.Stopped, PercentComplete: 40, RowsCopied: 40, RowsTotal: 100},
+			},
+		})
+	})
+
+	assert.Contains(t, output, "~ users: "+ANSICyan+"🔄 Resuming..."+ANSIReset+" · 1 complete\n")
+	assert.NotContains(t, output, "40 / 100")
+}
+
 // A keyed apply runs many operations on one deployment, distinguished only by
 // operation key. Each section must render its own operation's key and external
 // operation ID — never a sibling's — so an operator can correlate every section

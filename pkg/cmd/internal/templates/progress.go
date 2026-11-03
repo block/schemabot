@@ -487,18 +487,29 @@ func writeTableLine(b *strings.Builder, t TableProgress, format string, args ...
 	b.WriteString("\n")
 }
 
-// awaitsResume reports whether a table is one a claimed start has yet to pick
-// back up: the apply is resuming and the table is still stopped. A table that
-// never started stays queued, since the start does not resume it.
-func awaitsResume(t TableProgress) bool {
-	return t.Resuming && state.IsState(t.Status, state.Task.Stopped)
+// awaitsResume reports whether a table of a resuming apply is one the start
+// has yet to pick back up on any of its targets (presentation.AwaitingResume),
+// and the coverage its line keeps for the targets that finished or are still
+// queued. A rolled-up table reads its targets; any other its own status.
+func awaitsResume(t TableProgress) (string, bool) {
+	if !t.Resuming {
+		return "", false
+	}
+	statuses := []string{t.Status}
+	if len(t.Shards) > 0 {
+		statuses = make([]string, len(t.Shards))
+		for i, s := range t.Shards {
+			statuses[i] = s.Status
+		}
+	}
+	return presentation.AwaitingResume(statuses)
 }
 
 // formatResumingTable renders a table awaiting its resume as its state and
 // DDL, as the PR comment does, until its targets report how the copy goes on.
-func formatResumingTable(t TableProgress) string {
+func formatResumingTable(t TableProgress, coverage string) string {
 	var b strings.Builder
-	writeTableLine(&b, t, ANSICyan+"🔄 Resuming..."+ANSIReset)
+	writeTableLine(&b, t, "%s%s", ANSICyan+"🔄 Resuming..."+ANSIReset, coverage)
 	if t.DDL != "" {
 		b.WriteString(formatTableDDL(t))
 	}
@@ -510,8 +521,8 @@ func formatResumingTable(t TableProgress) string {
 // provided activity bar and label when row-copy progress has exceeded its
 // estimate.
 func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel string) string {
-	if awaitsResume(t) {
-		return formatResumingTable(t)
+	if coverage, ok := awaitsResume(t); ok {
+		return formatResumingTable(t, coverage)
 	}
 	if keepsAcrossTargetsBar(t) {
 		if out, ok := formatAcrossTargetsProgress(t); ok {

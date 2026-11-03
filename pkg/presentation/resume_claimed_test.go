@@ -32,3 +32,30 @@ func TestResumeClaimed(t *testing.T) {
 	assert.Equal(t, state.Apply.Stopped, stopped.State)
 	assert.Equal(t, NextActionResume, stopped.NextAction.Kind)
 }
+
+// A table of a resuming apply reads as resuming only while it stands where the
+// stop left it on every part: stopped on some, finished or not yet begun on
+// the rest, which its line keeps as counts. Once a part moves it on, its own
+// progress speaks for it.
+func TestAwaitingResume(t *testing.T) {
+	ts := state.Task
+	for _, tc := range []struct {
+		name     string
+		statuses []string
+		coverage string
+		ok       bool
+	}{
+		{"every part stopped", []string{ts.Stopped, ts.Stopped}, "", true},
+		{"finished on one", []string{ts.Completed, ts.Stopped}, " · 1 complete", true},
+		{"queued on one", []string{ts.Stopped, ts.Pending}, " · 1 queued", true},
+		{"copying again on one", []string{ts.Running, ts.Stopped}, "", false},
+		{"failed on one", []string{ts.Failed, ts.Stopped}, "", false},
+		{"none stopped", []string{ts.Completed, ts.Pending}, "", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			coverage, ok := AwaitingResume(tc.statuses)
+			assert.Equal(t, tc.ok, ok)
+			assert.Equal(t, tc.coverage, coverage)
+		})
+	}
+}

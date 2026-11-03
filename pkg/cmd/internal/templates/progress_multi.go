@@ -165,6 +165,7 @@ func writeDeploymentProgressSection(deployment presentation.Deployment, op Progr
 	// header shows: a table row carries whatever its own operation carried, so
 	// matching an inherited value would look for a target the rows do not have.
 	tables := activeTablesForMember(data.Tables, deployment.Deployment, deployment.Target)
+	MarkResuming(tables, deployment.State)
 	if len(tables) > 0 && !state.IsSetupPhase(data.State) {
 		sortActiveTables(tables)
 		if hasTableNamespaces(tables) {
@@ -252,6 +253,17 @@ func activeTablesForMember(tables []TableProgress, deployment, target string) []
 		}
 	}
 	return activeTables
+}
+
+// MarkResuming marks a member's tables as those of a resuming member
+// (TableProgress.Resuming) when its state, as the rollout reads it
+// (presentation.ResumeClaimed), is resuming, so a section of its own reads
+// the same as the member does in a rollup.
+func MarkResuming(tables []TableProgress, memberState string) {
+	resuming := state.IsState(memberState, state.Apply.Resuming)
+	for i := range tables {
+		tables[i].Resuming = resuming
+	}
 }
 
 func sortActiveTables(tables []TableProgress) {

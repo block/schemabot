@@ -493,6 +493,33 @@ func Derive(ops []Operation) Apply {
 	}
 }
 
+// AwaitingResume reports whether a table of a resuming apply still stands
+// where the stop left it on every part that runs it, each in the status at the
+// same index of statuses: stopped on at least one, and every other one either
+// finished it before the stop or has not begun it. Its stopped progress is from
+// before the stop, so the table reads as resuming, and coverage counts the
+// parts that finished or are still queued so the line keeps them. Once any
+// part moves the table on, its own progress speaks for the table instead.
+func AwaitingResume(statuses []string) (coverage string, ok bool) {
+	var stopped, done, queued int
+	for _, s := range statuses {
+		switch state.NormalizeTaskStatus(s) {
+		case state.Task.Stopped:
+			stopped++
+		case state.Task.Completed:
+			done++
+		case state.Task.Pending:
+			queued++
+		default:
+			return "", false
+		}
+	}
+	if stopped == 0 {
+		return "", false
+	}
+	return TargetCoverage(done, 0, queued, 0, 0, PendingQueued), true
+}
+
 // ResumeClaimed reads the operations of an apply in applyState. A start moves
 // a stopped apply to resuming before its operations leave stopped: a drive
 // claims them one at a time, and a remote data plane can report them stopped

@@ -171,6 +171,37 @@ func TestFormatApplyStatusComment_ResumingRolloutReadsAsResuming(t *testing.T) {
 	}
 }
 
+// A start reaches a rollout's targets one claim at a time. A target that
+// finished the table before the stop keeps its outcome beside the resuming
+// line, and once one target is copying again the table shows its live
+// progress rather than hiding it behind the resuming line.
+func TestFormatApplyStatusComment_ResumingRolloutKeepsTargetsThatMovedOn(t *testing.T) {
+	render := func(first *storage.Task) string {
+		apply := runningApply()
+		apply.State = state.Apply.Resuming
+		ops := []*storage.ApplyOperation{
+			{ID: 1, Deployment: "eu", Target: "orders-001", OperationKind: storage.ApplyOperationKindWork, State: state.ApplyOperation.Stopped},
+			{ID: 2, Deployment: "eu", Target: "orders-002", OperationKind: storage.ApplyOperationKindWork, State: state.ApplyOperation.Stopped},
+		}
+		first.ApplyOperationID = new(int64(1))
+		tasks := []*storage.Task{
+			first,
+			{ApplyOperationID: new(int64(2)), TableName: "bikes", DDL: bikesDDL, State: state.Task.Stopped, RowsCopied: 57, RowsTotal: 100},
+		}
+		return formatApplyStatusComment(apply, ops, false, tasks, nil, nil, nil, "", "")
+	}
+
+	finished := render(&storage.Task{TableName: "bikes", DDL: bikesDDL, State: state.Task.Completed, RowsCopied: 100, RowsTotal: 100})
+	assert.Contains(t, finished, "**`bikes`**: 🔄 Resuming… · 1 complete\n")
+	assert.NotContains(t, finished, "57 / 100")
+
+	copying := render(&storage.Task{TableName: "bikes", DDL: bikesDDL, State: state.Task.Running, RowsCopied: 70, RowsTotal: 100})
+	assert.NotContains(t, copying, "Resuming…")
+	assert.Contains(t, copying, "70 / 100 rows", "the target copying again shows its live progress")
+}
+
+const bikesDDL = "ALTER TABLE `bikes` ADD INDEX `idx_status`(`status`)"
+
 func TestBuildMultiApplyData_RoutesTasksByOperation(t *testing.T) {
 	ops := []*storage.ApplyOperation{
 		{ID: 1, Deployment: "eu", State: state.ApplyOperation.Running},

@@ -155,6 +155,7 @@ func (m WatchModel) writeDeploymentSection(b *strings.Builder, deployment presen
 	// header shows: a table row carries whatever its own operation carried, so
 	// matching an inherited value would look for a target the rows do not have.
 	tables := tablesForMember(m.tables, deployment.Deployment, deployment.Target)
+	templates.MarkResuming(tables, deployment.State)
 	if len(tables) > 0 && !state.IsSetupPhase(m.state) {
 		sortTablesByProgress(tables)
 		m.renderTables(b, tables)
