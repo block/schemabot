@@ -143,7 +143,17 @@ func (ic *InstallationClient) FetchCodeownersRuleset(ctx context.Context, repo, 
 // MatchCodeownersPath finds the owners for a specific file path using CODEOWNERS rules.
 // Last matching rule wins (standard CODEOWNERS semantics).
 // Returns nil, nil if no rule matches. Returns an error if pattern matching fails.
-func MatchCodeownersPath(ruleset codeowners.Ruleset, filePath string) ([]codeowners.Owner, error) {
+//
+// The parser panics on some rules it accepts, such as a bare `/ @owner`, and
+// CODEOWNERS is repository content, so a panic is returned as an error: the
+// review gate then fails closed with a reason instead of never answering.
+func MatchCodeownersPath(ruleset codeowners.Ruleset, filePath string) (owners []codeowners.Owner, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			owners = nil
+			err = fmt.Errorf("match CODEOWNERS path %s: the CODEOWNERS file holds a rule the parser cannot match (%v); fix the rule on the base branch", filePath, r)
+		}
+	}()
 	rule, err := ruleset.Match(filePath)
 	if err != nil {
 		return nil, fmt.Errorf("match CODEOWNERS path %s: %w", filePath, err)
