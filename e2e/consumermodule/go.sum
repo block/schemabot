@@ -54,8 +54,8 @@ github.com/block/pg-sprite v0.3.4-0.20261016150733-a9a7ad9dcc9b h1:bllw4pWOlp6kd
 github.com/block/pg-sprite v0.3.4-0.20261016150733-a9a7ad9dcc9b/go.mod h1:SYaMJUORf/jaAp3qZX5X4wa2isu8++KVXuCJwZqPBQc=
 github.com/block/spirit v0.19.0 h1:7GzjA2WtJLn6ZW8pm76sSTDGkXcbR8hEbyU751S7ZCc=
 github.com/block/spirit v0.19.0/go.mod h1:aRzk9cDvt6UWq0kI90UCtjto8gpH/xpeKIv5eLi2uTM=
-github.com/block/vitess v0.0.0-20260925015115-736e47fe71a6 h1:XDK3Zeob/5WMIv+UiH5TaPYLUVc1ICZAO5+VKQRdRRw=
-github.com/block/vitess v0.0.0-20260925015115-736e47fe71a6/go.mod h1:kY1CrgkXpUkXdZ8ott1eNfViVY7WDPG5FjL1aoc/NxQ=
+github.com/block/vitess v0.0.0-20261103173808-12cc16cbb567 h1:CxRRbs7Ug0IhxEEEiwXJDzBfSPsxkqD0Ut9YBjbtCs8=
+github.com/block/vitess v0.0.0-20261103173808-12cc16cbb567/go.mod h1:8Ms/9bU2cVbNBamvZ7H7t5ZKgSpD+mtYeK5DpKcp1so=
 github.com/bradleyfalzon/ghinstallation/v2 v2.18.0 h1:WPqnN6NS9XvYlOgZQAIseN7Z1uAiE+UxgDKlW7FvFuU=
 github.com/bradleyfalzon/ghinstallation/v2 v2.18.0/go.mod h1:gpoSwwWc4biE49F7n+roCcpkEkZ1Qr9soZ2ESvMiouU=
 github.com/cenkalti/backoff/v4 v4.3.0 h1:MyRJ/UdXutAwSAT+s3wNd7MfTIcy71VQueUuFK343L8=
