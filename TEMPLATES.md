@@ -9138,9 +9138,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 *Applied by @aparajon at 2026-01-01 00:00:00 UTC*
 
-✅ Rolled out to 3 targets
-
-<details><summary>Apply details (1 table)</summary>
+<details><summary>Apply details (1 table done on 3 targets)</summary>
 
 **`orders`**: ✅ Complete (3 targets)
 
