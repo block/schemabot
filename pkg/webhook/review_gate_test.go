@@ -627,6 +627,26 @@ func TestCheckReviewGate_ApprovalCoverage(t *testing.T) {
 			want:       wantCovers,
 		},
 		{
+			// The author drops the approved note column without a rebase, so
+			// the head runs only part of what the reviewer approved.
+			name:          "a push on the same base that dropped part of the PR's table edit does not count",
+			prChange:      setOrders("`id` bigint NOT NULL, `note` text, `flag` int"),
+			headChange:    setOrders("`id` bigint NOT NULL, `flag` int"),
+			headOnOldBase: true,
+			want:          wantChanged,
+		},
+		{
+			// The reviewer approved widening idx_ab, which runs as DROP INDEX
+			// and ADD INDEX. The author then deletes the index without a
+			// rebase, so the head runs only the DROP INDEX.
+			name:          "a push on the same base that kept only the DROP INDEX of an approved index redefinition does not count",
+			base:          map[string]string{"schema/testdb/schemabot.yaml": "database: orders\n", "schema/testdb/orders/orders.sql": ordersWith("`id` bigint NOT NULL, `a` int, `b` int, KEY `idx_ab` (`a`)")},
+			prChange:      setOrders("`id` bigint NOT NULL, `a` int, `b` int, KEY `idx_ab` (`a`, `b`)"),
+			headChange:    setOrders("`id` bigint NOT NULL, `a` int, `b` int"),
+			headOnOldBase: true,
+			want:          wantChanged,
+		},
+		{
 			// The statements cannot be compared without the head's file, so
 			// a GitHub outage leaves the gate undecided and retryable.
 			name:           "a combined file GitHub cannot serve during an outage is a retryable evaluation failure",

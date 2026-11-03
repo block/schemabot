@@ -9,6 +9,7 @@ import (
 
 	"github.com/block/pg-sprite/pkg/schemadiff"
 	"github.com/block/pg-sprite/pkg/statement"
+	pganalyze "github.com/pganalyze/pg_query_go/v6"
 	pgquery "github.com/wasilibs/go-pgquery"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
@@ -27,10 +28,13 @@ const comparisonSchema = "public"
 // bases: the head runs no DDL the reviewer did not approve. It is the
 // PostgreSQL counterpart of ddl.SameTableChange.
 //
-// The DDL each commit runs is its diff from its base, and the change is the
-// same when every statement the head's DDL runs is one the approved DDL runs,
-// in the same order. The head may run fewer, as when a stacked pull request
-// below this one merges part of the edit. The diff runs on the target,
+// The DDL each commit runs is its diff from its base. The change is the same
+// when every statement the head's DDL runs is one the approved DDL runs, in
+// the same order, and every approved statement the head skips is one the diff
+// from the approved commit's base to the head's base runs, as when a stacked
+// pull request below this one merged part of the edit (see
+// ddl.CoveredByApproval). On the same base the head must run every approved
+// statement. The diff runs on the target,
 // because pg-sprite understands a file only by running it: each version is
 // introspected on a scratch schema inside a transaction that is always
 // rolled back (schemadiff.IntrospectDesired), so nothing persists.
@@ -183,8 +187,8 @@ func comparableSchema(content string) (statement.DesiredSchema, error) {
 }
 
 // statementDifference returns why the statements the head runs, its diff from
-// its base, are not ones the approved commit runs in the same order, or ""
-// when every statement the head runs was approved. models holds the table at
+// its base, are not the approved commit's statements less those the head's
+// base already ran, or "" when they are. models holds the table at
 // the approved commit's base, the approved commit, the head's base, and the
 // head, in that order.
 func statementDifference(models [4]schemadiff.Model) (string, error) {
@@ -196,8 +200,17 @@ func statementDifference(models [4]schemadiff.Model) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("diff the head against its base: %w", err)
 	}
-	if !ddl.InOrderSubset(changeSQL(approvedChange), changeSQL(headChange)) {
-		return fmt.Sprintf("the approved commit generates %q but the head generates %q", changeSQL(approvedChange), changeSQL(headChange)), nil
+	baseMove, err := schemadiff.Diff(comparisonSchema, models[0], models[2])
+	if err != nil {
+		return "", fmt.Errorf("diff the head's base against the approved commit's base: %w", err)
+	}
+	covered, err := changesCovered(approvedChange, headChange, baseMove)
+	if err != nil {
+		return "", err
+	}
+	if !covered {
+		return fmt.Sprintf("the approved commit generates %q but the head generates %q, and the head's base already runs %q",
+			changeSQL(approvedChange), changeSQL(headChange), changeSQL(baseMove)), nil
 	}
 	return "", nil
 }
@@ -234,6 +247,85 @@ func withoutLocations(value any) any {
 		}
 	}
 	return value
+}
+
+// changesCovered reports whether the head's statements are covered by the
+// approved ones given the base move (see ddl.CoveredByApproval).
+func changesCovered(approved, head, baseMove []schemadiff.Change) (bool, error) {
+	var items [3][]ddl.ChangeItem
+	for i, changes := range [...][]schemadiff.Change{approved, head, baseMove} {
+		for _, c := range changes {
+			elements, err := statementElements(c.SQL)
+			if err != nil {
+				return false, fmt.Errorf("read the elements of statement %q: %w", c.SQL, err)
+			}
+			items[i] = append(items[i], ddl.ChangeItem{SQL: c.SQL, Elements: elements})
+		}
+	}
+	return ddl.CoveredByApproval(items[0], items[1], items[2]), nil
+}
+
+// statementElements keys the columns, constraints, and indexes a statement
+// the diff emits changes, or returns none for a statement whose elements it
+// does not know.
+func statementElements(sql string) ([]string, error) {
+	tree, err := pgquery.Parse(sql)
+	if err != nil {
+		return nil, fmt.Errorf("parse: %w", err)
+	}
+	if len(tree.GetStmts()) != 1 {
+		return nil, fmt.Errorf("expected one statement, got %d", len(tree.GetStmts()))
+	}
+	stmt := tree.GetStmts()[0].GetStmt()
+	switch {
+	case stmt.GetAlterTableStmt() != nil:
+		var elements []string
+		for _, node := range stmt.GetAlterTableStmt().GetCmds() {
+			key := alterTableCmdElement(node.GetAlterTableCmd())
+			if key == "" {
+				return nil, nil
+			}
+			elements = append(elements, key)
+		}
+		return elements, nil
+	case stmt.GetIndexStmt() != nil && stmt.GetIndexStmt().GetIdxname() != "":
+		return []string{"index " + stmt.GetIndexStmt().GetIdxname()}, nil
+	case stmt.GetDropStmt() != nil && stmt.GetDropStmt().GetRemoveType() == pganalyze.ObjectType_OBJECT_INDEX:
+		var elements []string
+		for _, object := range stmt.GetDropStmt().GetObjects() {
+			names := object.GetList().GetItems()
+			if len(names) == 0 {
+				return nil, nil
+			}
+			elements = append(elements, "index "+names[len(names)-1].GetString_().GetSval())
+		}
+		return elements, nil
+	default:
+		return nil, nil
+	}
+}
+
+// alterTableCmdElement keys the column or constraint an ALTER TABLE command
+// changes, or returns "" for a command whose element it does not know.
+func alterTableCmdElement(cmd *pganalyze.AlterTableCmd) string {
+	switch cmd.GetSubtype() {
+	case pganalyze.AlterTableType_AT_AddColumn:
+		return "column " + cmd.GetDef().GetColumnDef().GetColname()
+	case pganalyze.AlterTableType_AT_DropColumn, pganalyze.AlterTableType_AT_AlterColumnType,
+		pganalyze.AlterTableType_AT_ColumnDefault, pganalyze.AlterTableType_AT_SetNotNull,
+		pganalyze.AlterTableType_AT_DropNotNull, pganalyze.AlterTableType_AT_SetExpression,
+		pganalyze.AlterTableType_AT_DropExpression:
+		return "column " + cmd.GetName()
+	case pganalyze.AlterTableType_AT_AddConstraint:
+		if name := cmd.GetDef().GetConstraint().GetConname(); name != "" {
+			return "constraint " + name
+		}
+		return ""
+	case pganalyze.AlterTableType_AT_DropConstraint:
+		return "constraint " + cmd.GetName()
+	default:
+		return ""
+	}
 }
 
 // changeSQL lists the statements of changes, for a reason string.

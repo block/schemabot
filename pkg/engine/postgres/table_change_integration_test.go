@@ -151,6 +151,26 @@ func TestEngineCompareSchemaFileChange(t *testing.T) {
 			wantReason:   "table orders: the approved commit generates",
 		},
 		{
+			// The author drops the approved index without a rebase, so the
+			// head runs only part of what the reviewer approved.
+			name:         "a head on the same base that drops the approved index",
+			approvedBase: orders("id bigint PRIMARY KEY"),
+			approved:     orders("id bigint PRIMARY KEY, note text") + "\nCREATE INDEX orders_note_idx ON orders (note);",
+			headBase:     orders("id bigint PRIMARY KEY"),
+			head:         orders("id bigint PRIMARY KEY, note text"),
+			wantReason:   "and the head's base already runs []",
+		},
+		{
+			// A stacked PR below this one merged the note column with another
+			// type, so the head runs only the approved index.
+			name:         "a head whose base already added the PR's column with another type",
+			approvedBase: orders("id bigint PRIMARY KEY"),
+			approved:     orders("id bigint PRIMARY KEY, note text") + "\nCREATE INDEX orders_note_idx ON orders (note);",
+			headBase:     orders("id bigint PRIMARY KEY, note varchar(10)"),
+			head:         orders("id bigint PRIMARY KEY, note varchar(10)") + "\nCREATE INDEX orders_note_idx ON orders (note);",
+			wantSame:     true,
+		},
+		{
 			name:         "a file that declares another table at the head",
 			approvedBase: orders("id bigint PRIMARY KEY"),
 			approved:     orders("id bigint PRIMARY KEY, note text"),

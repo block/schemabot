@@ -13,25 +13,25 @@ import (
 
 // SameTableChange reports whether a pull request's edit to a single-table
 // MySQL schema file generates the same schema change on two different bases:
-// the head runs no DDL the reviewer did not approve.
+// the head runs no DDL the reviewer did not approve, and skips none the
+// head's base has not already run.
 //
 // approvedBase and approved are the file at the approved commit's merge base
 // and at the approved commit; headBase and head are the file at the head's
 // merge base and at the head. The DDL each commit runs is its diff from its
-// base, and the change is the same when every clause the head's DDL runs is
-// one the approved DDL runs, in the same order (see clausesCovered). The head
-// may run fewer clauses, as when a stacked pull request below this one
-// merges part of the edit. The diff ignores nothing (no AUTO_INCREMENT,
+// base. The change is the same when every clause the head's DDL runs is one
+// the approved DDL runs, in the same order, and every approved clause the
+// head skips is one the diff from the approved commit's base to the head's
+// base runs, as when a stacked pull request below this one merged part of the
+// edit (see clausesCovered). On the same base that diff is empty, so the head
+// must run every approved clause. The diff ignores nothing (no AUTO_INCREMENT,
 // engine, charset, partitioning, or row format exemptions), so any
 // difference the planner could act on counts.
 //
 // A file the pull request adds is absent at both bases, passed as "". Its
 // DDL is the CREATE TABLE itself, so it is the same when the head's CREATE
-// TABLE is the approved one, compared in the parser's canonical form. When
-// only the
-// head's base has the file, as when a stacked pull request below this one
-// merged part of the table first, the change is the same when the head ends
-// at exactly the table the reviewer approved.
+// TABLE is the approved one, compared in the parser's canonical form. A file
+// absent at one base but not the other is an error.
 //
 // When the change is not the same, reason says why, for operator logs. Each
 // file must hold exactly one CREATE TABLE, all four naming the same table,
@@ -41,10 +41,8 @@ func SameTableChange(approvedBase, approved, headBase, head string) (same bool, 
 	switch {
 	case approvedBase == "" && headBase == "":
 		return sameCreateTable(approved, head)
-	case approvedBase == "" && headBase != "":
-		return endsAtApprovedTable(approved, head)
-	case headBase == "":
-		return false, "", fmt.Errorf("the file is absent at the head's base but not at the approved commit's")
+	case approvedBase == "" || headBase == "":
+		return false, "", fmt.Errorf("the file is absent at one base but not the other")
 	}
 	files := [...]struct {
 		name    string
@@ -79,13 +77,17 @@ func SameTableChange(approvedBase, approved, headBase, head string) (same bool, 
 	if err != nil {
 		return false, "", fmt.Errorf("diff table %s at the head against its base: %w", aBase.TableName, err)
 	}
-	covered, err := clausesCovered(approvedChange, headChange)
+	baseMove, err := strictTableDiff(aBase, hBase)
+	if err != nil {
+		return false, "", fmt.Errorf("diff table %s at the head's base against the approved commit's base: %w", aBase.TableName, err)
+	}
+	covered, err := clausesCovered(approvedChange, headChange, baseMove)
 	if err != nil {
 		return false, "", fmt.Errorf("read the clauses of table %s's statements: %w", aBase.TableName, err)
 	}
 	if !covered {
-		return false, fmt.Sprintf("table %s: the approved commit generates %q but the head generates %q",
-			aBase.TableName, approvedChange, headChange), nil
+		return false, fmt.Sprintf("table %s: the approved commit generates %q but the head generates %q, and the head's base already runs %q",
+			aBase.TableName, approvedChange, headChange, baseMove), nil
 	}
 	return true, "", nil
 }
@@ -108,27 +110,6 @@ func sameCreateTable(approved, head string) (same bool, reason string, err error
 	}
 	if approvedCreate != headCreate {
 		return false, fmt.Sprintf("table %s: the approved commit runs %q but the head runs %q", a.TableName, approvedCreate, headCreate), nil
-	}
-	return true, "", nil
-}
-
-// endsAtApprovedTable reports whether the head ends at the table the approved
-// commit adds, when the head's base already has part of it: everything the
-// head runs moves the table toward the one the reviewer approved.
-func endsAtApprovedTable(approved, head string) (same bool, reason string, err error) {
-	a, h, err := parseApprovedAndHead(approved, head)
-	if err != nil {
-		return false, "", err
-	}
-	if a.TableName != h.TableName {
-		return false, fmt.Sprintf("the file declares table %s at the approved commit but %s at the head", a.TableName, h.TableName), nil
-	}
-	difference, err := strictTableDiff(a, h)
-	if err != nil {
-		return false, "", fmt.Errorf("diff table %s at the head against the approved commit: %w", a.TableName, err)
-	}
-	if len(difference) > 0 {
-		return false, fmt.Sprintf("table %s: the head differs from the approved table by %q", a.TableName, difference), nil
 	}
 	return true, "", nil
 }
@@ -160,36 +141,86 @@ func parseComparableTable(name, content string) (*statement.CreateTable, error) 
 	return ct, nil
 }
 
-// clausesCovered reports whether every clause the head's statements run is
-// one the approved statements run, in the same order. A diff that takes more
-// than one statement (Spirit splits some column conversions in two) is
-// covered only by the same statements, since its clauses cannot be regrouped
-// without changing what each statement does.
-func clausesCovered(approved, head []string) (bool, error) {
-	if len(head) == 0 {
-		return true, nil
-	}
-	if len(approved) != 1 || len(head) != 1 {
+// clausesCovered reports whether the head's statements are covered by the
+// approved ones given the base move (see CoveredByApproval), compared clause
+// by clause. A diff that takes more than one statement (Spirit splits some
+// column conversions in two) is covered only by the same statements, since
+// its clauses cannot be regrouped without changing what each statement does,
+// unless the head runs nothing at all.
+func clausesCovered(approved, head, baseMove []string) (bool, error) {
+	if len(head) > 1 || (len(head) == 1 && len(approved) > 1) {
 		return slices.Equal(approved, head), nil
 	}
-	approvedClauses, err := alterClauses(approved[0])
+	approvedClauses, err := statementClauses(approved)
 	if err != nil {
 		return false, fmt.Errorf("the approved commit's statement: %w", err)
 	}
-	headClauses, err := alterClauses(head[0])
+	headClauses, err := statementClauses(head)
 	if err != nil {
 		return false, fmt.Errorf("the head's statement: %w", err)
 	}
-	return InOrderSubset(approvedClauses, headClauses), nil
+	baseClauses, err := statementClauses(baseMove)
+	if err != nil {
+		return false, fmt.Errorf("the base move's statement: %w", err)
+	}
+	return CoveredByApproval(approvedClauses, headClauses, baseClauses), nil
 }
 
-// InOrderSubset reports whether every item of head is an item of approved,
-// with head's items in the order approved lists them: head runs nothing
-// approved does not, and nothing in another order.
-func InOrderSubset(approved, head []string) bool {
+// A ChangeItem is one clause or statement of a schema change: its SQL in the
+// parser's canonical form and the elements (columns, indexes, constraints,
+// table options) it changes, keyed so the same element gets the same key in
+// every diff. Elements is empty when the item's elements are not known; such
+// an item stands only for itself.
+type ChangeItem struct {
+	SQL      string
+	Elements []string
+}
+
+// touches lists the keys of what item changes: its elements, or the item
+// itself when those are not known.
+func (item ChangeItem) touches() []string {
+	if len(item.Elements) == 0 {
+		return []string{"the item " + item.SQL}
+	}
+	return item.Elements
+}
+
+// CoveredByApproval reports whether the head's change is the approved one on
+// the head's base. head must run only items approved runs, in the order
+// approved lists them. An approved item head skips must be one the base move,
+// the diff from the approved commit's base to the head's base, already made:
+// the base move runs the item itself, or changes every element the item
+// changes, as when a stacked pull request below this one merged the element
+// first, possibly with another definition. Either way head must run nothing
+// on those elements, so a head that drops half of an approved redefinition
+// is never covered. On the same base the base move is empty, so head must
+// run every approved item: dropping part of an approved change is a
+// different change.
+func CoveredByApproval(approved, head, baseMove []ChangeItem) bool {
+	headTouches := touchedKeys(head)
+	baseTouches := touchedKeys(baseMove)
+	madeByBase := func(skipped ChangeItem) bool {
+		for _, key := range skipped.touches() {
+			if headTouches[key] {
+				return false
+			}
+		}
+		if slices.ContainsFunc(baseMove, func(b ChangeItem) bool { return b.SQL == skipped.SQL }) {
+			return true
+		}
+		for _, key := range skipped.touches() {
+			if !baseTouches[key] {
+				return false
+			}
+		}
+		return true
+	}
 	next := 0
 	for _, item := range head {
-		for next < len(approved) && approved[next] != item {
+		for next < len(approved) && approved[next].SQL != item.SQL {
+			if !madeByBase(approved[next]) {
+				return false
+			}
 			next++
 		}
 		if next == len(approved) {
@@ -197,12 +228,43 @@ func InOrderSubset(approved, head []string) bool {
 		}
 		next++
 	}
+	for _, skipped := range approved[next:] {
+		if !madeByBase(skipped) {
+			return false
+		}
+	}
 	return true
 }
 
+// touchedKeys collects every key items touch.
+func touchedKeys(items []ChangeItem) map[string]bool {
+	keys := make(map[string]bool)
+	for _, item := range items {
+		for _, key := range item.touches() {
+			keys[key] = true
+		}
+	}
+	return keys
+}
+
+// statementClauses returns the clauses of every ALTER TABLE statement in
+// stmts, in order.
+func statementClauses(stmts []string) ([]ChangeItem, error) {
+	var clauses []ChangeItem
+	for _, stmt := range stmts {
+		c, err := alterClauses(stmt)
+		if err != nil {
+			return nil, err
+		}
+		clauses = append(clauses, c...)
+	}
+	return clauses, nil
+}
+
 // alterClauses parses an ALTER TABLE statement and returns each of its
-// clauses in the parser's canonical form, in order.
-func alterClauses(stmt string) ([]string, error) {
+// clauses in the parser's canonical form, with the elements it changes, in
+// order.
+func alterClauses(stmt string) ([]ChangeItem, error) {
 	parsed, err := statement.New(stmt)
 	if err != nil {
 		return nil, fmt.Errorf("parse %q: %w", stmt, err)
@@ -214,15 +276,70 @@ func alterClauses(stmt string) ([]string, error) {
 	if !ok {
 		return nil, fmt.Errorf("parse %q: %w", stmt, statement.ErrNotAlterTable)
 	}
-	clauses := make([]string, 0, len(alter.Specs))
+	clauses := make([]ChangeItem, 0, len(alter.Specs))
 	for _, spec := range alter.Specs {
 		clause, err := restoreNode(spec)
 		if err != nil {
 			return nil, fmt.Errorf("restore a clause of %q: %w", stmt, err)
 		}
-		clauses = append(clauses, clause)
+		elements, err := specElements(spec)
+		if err != nil {
+			return nil, fmt.Errorf("read the elements of clause %q: %w", clause, err)
+		}
+		clauses = append(clauses, ChangeItem{SQL: clause, Elements: elements})
 	}
 	return clauses, nil
+}
+
+// specElements keys the elements an ALTER TABLE clause changes the way
+// tableElements keys them, or returns none for a clause whose elements it
+// does not know.
+func specElements(spec *ast.AlterTableSpec) ([]string, error) {
+	column := func(name string) string { return "column " + strings.ToLower(name) }
+	index := func(name string) string { return "index " + strings.ToLower(name) }
+	switch spec.Tp {
+	case ast.AlterTableAddColumns, ast.AlterTableModifyColumn, ast.AlterTableAlterColumn:
+		elements := make([]string, 0, len(spec.NewColumns))
+		for _, col := range spec.NewColumns {
+			elements = append(elements, column(col.Name.Name.O))
+		}
+		return elements, nil
+	case ast.AlterTableChangeColumn:
+		return []string{column(spec.OldColumnName.Name.O), column(spec.NewColumns[0].Name.Name.O)}, nil
+	case ast.AlterTableRenameColumn:
+		return []string{column(spec.OldColumnName.Name.O), column(spec.NewColumnName.Name.O)}, nil
+	case ast.AlterTableDropColumn, ast.AlterTableAlterColumnVisibility:
+		return []string{column(spec.OldColumnName.Name.O)}, nil
+	case ast.AlterTableAddConstraint:
+		if key := constraintKey(spec.Constraint); key != "" {
+			return []string{key}, nil
+		}
+		return nil, nil
+	case ast.AlterTableDropPrimaryKey:
+		return []string{"the primary key"}, nil
+	case ast.AlterTableDropIndex:
+		return []string{index(spec.Name)}, nil
+	case ast.AlterTableDropForeignKey:
+		return []string{"foreign key " + strings.ToLower(spec.Name)}, nil
+	case ast.AlterTableDropCheck, ast.AlterTableAlterCheck:
+		return []string{"check constraint " + strings.ToLower(spec.Constraint.Name)}, nil
+	case ast.AlterTableRenameIndex:
+		return []string{index(spec.FromKey.O), index(spec.ToKey.O)}, nil
+	case ast.AlterTableIndexInvisible:
+		return []string{index(spec.IndexName.O)}, nil
+	case ast.AlterTableOption:
+		elements := make([]string, 0, len(spec.Options))
+		for _, opt := range spec.Options {
+			key, err := tableOptionKey(opt)
+			if err != nil {
+				return nil, err
+			}
+			elements = append(elements, key)
+		}
+		return elements, nil
+	default:
+		return nil, nil
+	}
 }
 
 // parseSingleCreateTable parses a schema file that must hold exactly one
@@ -256,16 +373,19 @@ func strictTableDiff(source, target *statement.CreateTable) ([]string, error) {
 	return stmts, nil
 }
 
-// UncoveredElementChange returns why the first element (in name order) the
-// head changes from its base is not a change the approved commit makes from
-// its base, or "" when every change the head makes was approved. Each map
-// holds one schema file's elements, keyed by a name that says what the
-// element is and mapped to its definition; an element added, removed, or
-// redefined counts as changed. The head may change fewer elements than the
-// approved commit, as when its base already carries part of the change.
+// UncoveredElementChange returns why the head's change differs from the
+// approved one, or "" when it is the same: every element (in name order) the
+// head changes from its base is one the approved commit changes from its base
+// to the same definition, and every element the approved commit changes that
+// the head does not is one the base changed since the approved commit's base,
+// as when a stacked pull request below this one merged it first. On the same
+// base the head must change every element the approved commit changes. Each
+// map holds one schema file's elements, keyed by a name that
+// says what the element is and mapped to its definition; an element added,
+// removed, or redefined counts as changed.
 func UncoveredElementChange(approvedBase, approved, headBase, head map[string]string) string {
 	keys := make(map[string]bool)
-	for _, elements := range []map[string]string{headBase, head} {
+	for _, elements := range []map[string]string{approvedBase, approved, headBase, head} {
 		for k := range elements {
 			keys[k] = true
 		}
@@ -276,10 +396,14 @@ func UncoveredElementChange(approvedBase, approved, headBase, head map[string]st
 	}
 	sort.Strings(sorted)
 	for _, k := range sorted {
+		approvedChanges := !sameElement(approvedBase, approved, k)
 		if sameElement(headBase, head, k) {
+			if approvedChanges && sameElement(approvedBase, headBase, k) {
+				return fmt.Sprintf("the head no longer changes %s, which the approved commit changes and the base did not", k)
+			}
 			continue
 		}
-		if sameElement(approvedBase, approved, k) {
+		if !approvedChanges {
 			return fmt.Sprintf("the head changes %s, which the approved commit does not", k)
 		}
 		if !sameElement(approved, head, k) {

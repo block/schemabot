@@ -235,8 +235,8 @@ func TestSameTableChange(t *testing.T) {
 			wantSame: true,
 		},
 		{
-			// The head no longer adds `sku`, and every clause it still runs
-			// is one the reviewer approved.
+			// The head no longer adds `sku`, and the base never added it, so
+			// the head drops part of the approved change.
 			name:         "a head that stops making a change the base does not have",
 			approvedBase: base,
 			approved: "CREATE TABLE `variants` (`id` bigint NOT NULL AUTO_INCREMENT, `token` varchar(255) NOT NULL, `amount` int DEFAULT NULL, " +
@@ -245,7 +245,7 @@ func TestSameTableChange(t *testing.T) {
 			head: "CREATE TABLE `variants` (`id` bigint NOT NULL AUTO_INCREMENT, `token` varchar(255) NOT NULL, `amount` int DEFAULT NULL, " +
 				"`bounty_amount` bigint DEFAULT NULL, `bounty_currency` varchar(3) DEFAULT NULL, " +
 				"PRIMARY KEY (`id`), UNIQUE KEY `u_token` (`token`), KEY `i_amount` (`amount`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
-			wantSame: true,
+			wantReason: []string{"table variants", "but the head generates", "and the head's base already runs", "ADD COLUMN `bounty_amount`"},
 		},
 		{
 			// The base added the column the PR adds, but the head declares a
@@ -481,7 +481,8 @@ func TestSameTableChange_AddedTableCannotCompare(t *testing.T) {
 		approvedBase, approved, headBase, head string
 		wantErr                                string
 	}{
-		{name: "absent at the head's base only", approvedBase: table, approved: table, head: table, wantErr: "the file is absent at the head's base but not at the approved commit's"},
+		{name: "absent at the head's base only", approvedBase: table, approved: table, head: table, wantErr: "the file is absent at one base but not the other"},
+		{name: "absent at the approved commit's base only", approved: table, headBase: table, head: table, wantErr: "the file is absent at one base but not the other"},
 		{name: "two statements at the head", approved: table, head: table + ";\nCREATE TABLE `u` (`id` bigint NOT NULL, PRIMARY KEY (`id`));", wantErr: "parse the schema file at the head: the file holds 2 statements"},
 		{name: "a column declared twice at the approved commit", approved: "CREATE TABLE `t` (`id` bigint NOT NULL, `x` int, `X` int, PRIMARY KEY (`id`))", head: table, wantErr: "read table t at the approved commit: column x is declared more than once"},
 	}
@@ -496,25 +497,44 @@ func TestSameTableChange_AddedTableCannotCompare(t *testing.T) {
 	}
 }
 
-// A stacked pull request below this one can merge part of a table the pull
-// request adds, so the file is absent at the approved commit's base but not
-// at the head's. The head keeps the approval when it ends at the table the
-// reviewer approved.
-func TestSameTableChange_HeadBaseHasPartOfAddedTable(t *testing.T) {
+// A head on the same base as the approved commit runs every clause the
+// reviewer approved or loses the approval: dropping half of an approved
+// redefinition runs a statement nobody reviewed on its own. On a base that
+// already made part of the change, the head may skip that part, but never by
+// touching the same element itself.
+func TestSameTableChange_HeadDropsPartOfApprovedChange(t *testing.T) {
 	const (
-		partial  = "CREATE TABLE `t` (`id` bigint NOT NULL, PRIMARY KEY (`id`))"
-		approved = "CREATE TABLE `t` (`id` bigint NOT NULL, `x` int, PRIMARY KEY (`id`))"
+		base = "CREATE TABLE `t` (`id` bigint NOT NULL, `a` int, `b` int, `email` varchar(255), PRIMARY KEY (`id`), KEY `idx_ab` (`a`)) ENGINE=InnoDB"
+		// The approved commit widens idx_ab to (a, b), which Spirit runs as a
+		// DROP INDEX and an ADD INDEX of the same name.
+		widened = "CREATE TABLE `t` (`id` bigint NOT NULL, `a` int, `b` int, `email` varchar(255), PRIMARY KEY (`id`), KEY `idx_ab` (`a`,`b`)) ENGINE=InnoDB"
+		noIndex = "CREATE TABLE `t` (`id` bigint NOT NULL, `a` int, `b` int, `email` varchar(255), PRIMARY KEY (`id`)) ENGINE=InnoDB"
+		// The approved commit replaces email with email_v2.
+		replaced = "CREATE TABLE `t` (`id` bigint NOT NULL, `a` int, `b` int, `email_v2` varchar(255), PRIMARY KEY (`id`), KEY `idx_ab` (`a`)) ENGINE=InnoDB"
+		dropped  = "CREATE TABLE `t` (`id` bigint NOT NULL, `a` int, `b` int, PRIMARY KEY (`id`), KEY `idx_ab` (`a`)) ENGINE=InnoDB"
+		// A base that has since added an unrelated column.
+		movedBase    = "CREATE TABLE `t` (`id` bigint NOT NULL, `a` int, `b` int, `email` varchar(255), `c` int, PRIMARY KEY (`id`), KEY `idx_ab` (`a`)) ENGINE=InnoDB"
+		movedNoIndex = "CREATE TABLE `t` (`id` bigint NOT NULL, `a` int, `b` int, `email` varchar(255), `c` int, PRIMARY KEY (`id`)) ENGINE=InnoDB"
 	)
-	same, reason, err := SameTableChange("", approved, partial, approved)
-	require.NoError(t, err)
-	assert.True(t, same)
-	assert.Empty(t, reason)
-
-	same, reason, err = SameTableChange("", approved, partial, "CREATE TABLE `t` (`id` bigint NOT NULL, `x` bigint, PRIMARY KEY (`id`))")
-	require.NoError(t, err)
-	assert.False(t, same)
-	assert.Contains(t, reason, "table t: the head differs from the approved table by")
-	assert.Contains(t, reason, "MODIFY COLUMN `x` bigint NULL")
+	tests := []struct {
+		name                                   string
+		approvedBase, approved, headBase, head string
+		wantSame                               bool
+	}{
+		{name: "the head deletes the index on the same base", approvedBase: base, approved: widened, headBase: base, head: noIndex},
+		{name: "the head deletes the replacement column on the same base", approvedBase: base, approved: replaced, headBase: base, head: dropped},
+		{name: "the head deletes the index on a base that moved elsewhere", approvedBase: base, approved: widened, headBase: movedBase, head: movedNoIndex},
+		{name: "the head deletes the index on a base that already widened it", approvedBase: base, approved: widened, headBase: widened, head: noIndex},
+		{name: "the head runs the approved change on the same base", approvedBase: base, approved: widened, headBase: base, head: widened, wantSame: true},
+		{name: "the head runs nothing on a base that already widened the index", approvedBase: base, approved: widened, headBase: widened, head: widened, wantSame: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			same, reason, err := SameTableChange(tt.approvedBase, tt.approved, tt.headBase, tt.head)
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantSame, same, reason)
+		})
+	}
 }
 
 // The DDL is what the planner runs. On a file both commits edit, it is the
@@ -573,32 +593,40 @@ func TestSameTableChange_ClausesOutsideTheDiff(t *testing.T) {
 }
 
 // The head's statements are covered only when each clause they run is one
-// the approved statements run, in the same order.
+// the approved statements run, in the same order, and each approved clause
+// they skip is one the head's base already ran.
 func TestClausesCovered(t *testing.T) {
 	const (
 		addX = "ALTER TABLE `t` ADD COLUMN `x` int NULL DEFAULT NULL AFTER `a`"
 		addY = "ALTER TABLE `t` ADD COLUMN `y` int NULL DEFAULT NULL AFTER `x`"
 		both = "ALTER TABLE `t` ADD COLUMN `x` int NULL DEFAULT NULL AFTER `a`, ADD COLUMN `y` int NULL DEFAULT NULL AFTER `x`"
+		addZ = "ALTER TABLE `t` ADD COLUMN `z` int NULL DEFAULT NULL"
 	)
 	tests := []struct {
-		name           string
-		approved, head []string
-		want           bool
+		name                     string
+		approved, head, baseMove []string
+		want                     bool
 	}{
 		{name: "the same statement", approved: []string{both}, head: []string{both}, want: true},
-		{name: "one approved clause", approved: []string{both}, head: []string{addY}, want: true},
-		{name: "no statement at the head", approved: []string{both}, want: true},
+		{name: "one approved clause, the other already on the head's base", approved: []string{both}, head: []string{addY}, baseMove: []string{addX}, want: true},
+		{name: "one approved clause on the same base", approved: []string{both}, head: []string{addY}},
+		{name: "one approved clause, the base moved by another clause", approved: []string{both}, head: []string{addY}, baseMove: []string{addZ}},
+		{name: "one approved clause, the other column already on the head's base with another definition", approved: []string{both}, head: []string{addY},
+			baseMove: []string{"ALTER TABLE `t` ADD COLUMN `x` bigint NULL DEFAULT NULL"}, want: true},
+		{name: "no statement at the head, all of it already on the head's base", approved: []string{both}, baseMove: []string{both}, want: true},
+		{name: "no statement at the head on the same base", approved: []string{both}},
 		{name: "a clause nobody approved", approved: []string{addX}, head: []string{both}},
 		{name: "approved clauses in another order", approved: []string{both},
 			head: []string{"ALTER TABLE `t` ADD COLUMN `y` int NULL DEFAULT NULL AFTER `x`, ADD COLUMN `x` int NULL DEFAULT NULL AFTER `a`"}},
 		{name: "a clause the approved statement runs with another definition", approved: []string{both},
-			head: []string{"ALTER TABLE `t` ADD COLUMN `y` bigint NULL DEFAULT NULL AFTER `x`"}},
+			head: []string{"ALTER TABLE `t` ADD COLUMN `y` bigint NULL DEFAULT NULL AFTER `x`"}, baseMove: []string{addX}},
 		{name: "two statements regrouped into one", approved: []string{addX, addY}, head: []string{both}},
 		{name: "the same two statements", approved: []string{addX, addY}, head: []string{addX, addY}, want: true},
+		{name: "no statement at the head, two approved statements already on the head's base", approved: []string{addX, addY}, baseMove: []string{both}, want: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := clausesCovered(tt.approved, tt.head)
+			got, err := clausesCovered(tt.approved, tt.head, tt.baseMove)
 			require.NoError(t, err)
 			assert.Equal(t, tt.want, got)
 		})

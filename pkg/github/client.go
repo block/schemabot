@@ -1160,14 +1160,13 @@ const maxSchemaStatementComparisons = 16
 // schema file at filePath generates the same schema change on two bases:
 // approvedBase to approved at the approved commit, and headBase to head at
 // the head. The
-// change is the same when the head generates nothing the approved commit did
-// not, less any part of the edit the head's base already has. It is supplied
+// change is the same when the head generates only DDL the approved commit
+// generates, and skips only DDL the head's base already made. It is supplied
 // by the database's dialect, since only the dialect can understand the file,
 // and it may run the files on the database's target to do so. same is false,
-// with reason saying why for operator logs, when the head generates something
-// the approved commit did not or replaces something the base changed in
-// between. An error means the files could not be compared, which proves
-// nothing.
+// with reason saying why for operator logs, when the head generates DDL the
+// approved commit does not, or skips approved DDL its base has not made. An
+// error means the files could not be compared, which proves nothing.
 type SchemaFileChangeComparer func(ctx context.Context, filePath, approvedBase, approved, headBase, head string) (same bool, reason string, err error)
 
 // SchemaChangeComparison is the outcome of PRSchemaChangeUnchangedSince.
@@ -1228,12 +1227,13 @@ type SchemaChangeComparison struct {
 // A schema file the pull request and the base branch both edited, as a
 // rebase that combines the two in one file produces, still differs by
 // content. When compareStatements is set, such a file is unchanged if the
-// dialect proves the pull request's edit generates no statement at the head
-// that the approved commit did not, without replacing anything the base
-// branch changed (see SchemaFileChangeComparer). The file must be a schema
-// file (a .sql file or a vschema.json) that is a regular file at all four
-// commits, and when the two bases differ the same default-branch rule
-// applies, since the head's statements then rest on base content. A nil compareStatements, an ineligible file, a comparer that
+// dialect proves the head generates only DDL the approved commit generates,
+// and skips only DDL the head's base already made (see
+// SchemaFileChangeComparer). The file must be a schema file (a .sql file or a
+// vschema.json) that is a regular file at all four commits, or one the pull
+// request adds, absent at both bases. When the two bases differ the same
+// default-branch rule applies, since the head's DDL then rests on base
+// content. A nil compareStatements, an ineligible file, a comparer that
 // cannot prove the change is the same, or more such files than
 // maxSchemaStatementComparisons all leave the file changed.
 //

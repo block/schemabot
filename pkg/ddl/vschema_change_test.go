@@ -149,6 +149,37 @@ func TestSameVSchemaChange(t *testing.T) {
 			head:     approved,
 			wantSame: true,
 		},
+		{
+			// The head no longer adds items on the same base, so it drops
+			// part of what the reviewer approved.
+			name:         "a head that stops adding the PR's table on the same base",
+			approvedBase: newerBase, approved: combined,
+			headBase: newerBase, head: newerBase,
+			wantReason: "vschema: the head no longer changes table items, which the approved commit changes and the base did not",
+		},
+		{
+			// A pull request below this one merged items with another
+			// routing, and the head leaves it as the base has it.
+			name:         "a head that leaves the PR's table to the base's own version",
+			approvedBase: base, approved: approved,
+			headBase: `{
+  "sharded": true,
+  "vindexes": {"hash": {"type": "hash"}},
+  "tables": {
+    "orders": {"column_vindexes": [{"column": "customer_id", "name": "hash"}]},
+    "items": {"column_vindexes": [{"column": "id", "name": "hash"}]}
+  }
+}`,
+			head: `{
+  "sharded": true,
+  "vindexes": {"hash": {"type": "hash"}},
+  "tables": {
+    "orders": {"column_vindexes": [{"column": "customer_id", "name": "hash"}]},
+    "items": {"column_vindexes": [{"column": "id", "name": "hash"}]}
+  }
+}`,
+			wantSame: true,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
