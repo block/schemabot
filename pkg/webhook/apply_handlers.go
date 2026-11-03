@@ -230,7 +230,7 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 					DeferCutover:      a.GetOptions().DeferCutover,
 					Tenant:            h.deploymentTenant(),
 					ApplyAgainCommand: templates.ApplyCommand(environment, databaseName, applyCommandOptionsOf(result)),
-					ApplyAgainNote:    templates.UnsafeFlagLeftOut(applyCommandOptionsOf(result)),
+					ApplyAgainConsent: templates.UnsafeReconsent(applyCommandOptionsOf(result)),
 				}))
 				return false, nil
 			}
@@ -1127,7 +1127,7 @@ func applyLockIntentChangedRefusal(commandName, database, environment, requested
 		Environment:       environment,
 		RequestedBy:       requestedBy,
 		ApplyAgainCommand: templates.ApplyCommand(environment, scopedDatabase, opts),
-		ApplyAgainNote:    templates.UnsafeFlagLeftOut(opts),
+		ApplyAgainConsent: templates.UnsafeReconsent(opts),
 	}
 }
 

@@ -773,7 +773,7 @@ func TestRepinPendingConfirmationRefusesWhenTheLockIsGone(t *testing.T) {
 			require.True(t, f.handler.reportRepinRefused(repinErr, repo, pr, 1, refusal),
 				"a gone lock is answered as a lock that changed under the apply")
 			reply := awaitCommentContaining(t, f.result, "changed the lock on")
-			assert.Contains(t, reply, "Re-run:\n```\nschemabot apply -e staging -d "+dbName+" --defer-cutover\n```")
+			assert.Contains(t, reply, "Re-run the apply:\n```\nschemabot apply -e staging -d "+dbName+" --defer-cutover\n```")
 		})
 	}
 
@@ -835,7 +835,7 @@ func TestE2EApplyConfirmStopKeepsRollbackPinnedAfterItsRead(t *testing.T) {
 
 	refusal := awaitCommentContaining(t, f.result, "changed the lock on")
 	assert.Contains(t, refusal, "`"+dbName+"`")
-	assert.Contains(t, refusal, "Re-run:\n```\nschemabot apply -e staging\n```")
+	assert.Contains(t, refusal, "Re-run the apply:\n```\nschemabot apply -e staging\n```")
 	require.NoError(t, locks.pinErr, "the concurrent rollback must have pinned the lock")
 
 	lock, err := f.svc.Storage().Locks().Get(t.Context(), dbName, "mysql")

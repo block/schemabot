@@ -1600,7 +1600,7 @@ func TestE2EApplyRolloutStopKeepsRollbackPinnedAfterItsRead(t *testing.T) {
 	awaitCommentContaining(t, apply, "The plan for target `us` changed before this apply could start")
 	refusal := awaitCommentContaining(t, apply, "changed the lock on")
 	assert.Contains(t, refusal, "`"+dbName+"`")
-	assert.Contains(t, refusal, "Re-run:\n```\nschemabot apply -e production\n```")
+	assert.Contains(t, refusal, "Re-run the apply:\n```\nschemabot apply -e production\n```")
 	require.NoError(t, locks.pinErr, "the concurrent rollback must have pinned the lock")
 
 	lock, err := svc.Storage().Locks().Get(t.Context(), dbName, "mysql")

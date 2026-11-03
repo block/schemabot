@@ -413,8 +413,7 @@ func TestE2EApplyConfirmNewlyDirectStopKeepsRollbackPinnedAfterItsRead(t *testin
 	requireNewlyDirectDisclosure(t, f.awaitComment(t, "Changes run differently"))
 	refusal := f.awaitComment(t, "changed the lock on")
 	assert.Contains(t, refusal, "`"+dbName+"`")
-	assert.Contains(t, refusal, "Re-run:\n```\nschemabot apply -e staging\n```")
-	assert.Contains(t, refusal, "`--allow-unsafe` is left out: type it yourself to confirm unsafe changes again.")
+	assert.Contains(t, refusal, "Re-run the apply.\n\n**🚨 To proceed with unsafe changes**, add `--allow-unsafe` to confirm them again:\n```\nschemabot apply -e staging\n```")
 	require.NoError(t, locks.pinErr, "the concurrent rollback must have pinned the lock")
 
 	assert.Equal(t, locks.pin.PendingPlanID, f.pendingPlanID(t), "the concurrent rollback's pin must survive the stop")

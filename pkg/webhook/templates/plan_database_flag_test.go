@@ -162,6 +162,7 @@ func TestRenderConfirmationPlanForOtherEnvironmentScopesRecoveryCommands(t *test
 // environment ordering gate, and pauses for apply-confirm only when its plan
 // needs one.
 func TestRenderConfirmationPlanUnavailableScopesRecoveryCommand(t *testing.T) {
+	const reconsent = "**🚨 To proceed with unsafe changes**, add `--allow-unsafe` to confirm them again:"
 	const applyConsequences = "To replace that confirmation with a fresh plan and apply it in one step, subject to the environment ordering gate and pausing for `apply-confirm` only if its plan needs it:\n\n"
 
 	scoped := RenderConfirmationPlanUnavailable(ConfirmationRefusalData{
@@ -172,7 +173,7 @@ func TestRenderConfirmationPlanUnavailableScopesRecoveryCommand(t *testing.T) {
 	})
 	assert.True(t, strings.HasPrefix(scoped, "## "+glyph.Refused+" Apply-confirm Refused — Production\n\n**Database**: `orders`\n\n"), scoped)
 	assert.Contains(t, scoped, "The pending confirmation is not backed by a plan SchemaBot can load, so it could not verify which environment was reviewed; nothing was applied.\n\n")
-	assert.Contains(t, scoped, applyConsequences+"```\nschemabot apply -e production -d orders --tenant acme\n```\n\n`--allow-unsafe` is left out: type it yourself to confirm unsafe changes again.\n",
+	assert.Contains(t, scoped, strings.TrimSuffix(applyConsequences, ":\n\n")+".\n\n"+reconsent+"\n\n```\nschemabot apply -e production -d orders --tenant acme\n```\n",
 		"the fresh plan's unsafe changes are confirmed by typing the flag, not by pasting it")
 	assert.Contains(t, scoped, "\n_Requested by @hubot_\n")
 
@@ -194,7 +195,7 @@ func TestConfirmationRefusalsCarryLongCommandsIntact(t *testing.T) {
 	everyFlag := ApplyCommandOptions{Tenant: "acme-holdings-eu", AllowUnsafe: true, DeferCutover: true, SkipRevert: true}
 	confirmFlags := " -d " + longDatabase + " --tenant acme-holdings-eu --allow-unsafe --defer-cutover --skip-revert"
 	applyFlags := " -d " + longDatabase + " --tenant acme-holdings-eu --defer-cutover --skip-revert"
-	unsafeLeftOut := "\n`--allow-unsafe` is left out: type it yourself to confirm unsafe changes again.\n"
+	reconsent := ".\n\n**🚨 To proceed with unsafe changes**, add `--allow-unsafe` to confirm them again:\n\n"
 
 	otherEnvironment := RenderConfirmationPlanForOtherEnvironment(ConfirmationRefusalData{
 		RequestedBy:          "hubot",
@@ -205,7 +206,7 @@ func TestConfirmationRefusalsCarryLongCommandsIntact(t *testing.T) {
 	})
 	assert.Greater(t, len([]rune(otherEnvironment)), maxCommentErrorLen, "the scenario must be one the generic error clamp would have cut")
 	assert.Contains(t, otherEnvironment, "```\nschemabot apply-confirm -e staging"+confirmFlags+"\n```\n", "the confirmation keeps the consent given to the plan it confirms")
-	assert.Contains(t, otherEnvironment, "pausing for `apply-confirm` only if its plan needs it:\n\n```\nschemabot apply -e production"+applyFlags+"\n```\n"+unsafeLeftOut+"\n_Requested by @hubot_\n")
+	assert.Contains(t, otherEnvironment, "pausing for `apply-confirm` only if its plan needs it"+reconsent+"```\nschemabot apply -e production"+applyFlags+"\n```\n\n_Requested by @hubot_\n")
 	assert.NotContains(t, otherEnvironment, "…")
 
 	unavailable := RenderConfirmationPlanUnavailable(ConfirmationRefusalData{
@@ -215,7 +216,7 @@ func TestConfirmationRefusalsCarryLongCommandsIntact(t *testing.T) {
 		Options:              everyFlag,
 	})
 	assert.Greater(t, len([]rune(unavailable)), maxCommentErrorLen, "the scenario must be one the generic error clamp would have cut")
-	assert.Contains(t, unavailable, "pausing for `apply-confirm` only if its plan needs it:\n\n```\nschemabot apply -e production"+applyFlags+"\n```\n"+unsafeLeftOut+"\n_Requested by @hubot_\n")
+	assert.Contains(t, unavailable, "pausing for `apply-confirm` only if its plan needs it"+reconsent+"```\nschemabot apply -e production"+applyFlags+"\n```\n\n_Requested by @hubot_\n")
 	assert.NotContains(t, unavailable, "…")
 }
 
@@ -235,13 +236,14 @@ func TestApplyCommandCarriesTargetInPlanCommentOrder(t *testing.T) {
 
 // A re-run hint never carries --allow-unsafe, even when the command it repeats
 // did: the apply it runs plans again, so its unsafe changes are confirmed by
-// typing the flag against that plan. The line beside the command says so, and
-// only for a command that carried the flag.
+// typing the flag against that plan. The consent sentence that leads into the
+// command says so, as on every unsafe-change rejection, and only for a command
+// that carried the flag.
 func TestApplyCommandLeavesOutAllowUnsafe(t *testing.T) {
 	opts := ApplyCommandOptions{Tenant: "acme", AllowUnsafe: true, DeferCutover: true}
 	assert.Equal(t, "schemabot apply -e staging -d orders --tenant acme --defer-cutover", ApplyCommand("staging", "orders", opts))
-	assert.Equal(t, "`--allow-unsafe` is left out: type it yourself to confirm unsafe changes again.", UnsafeFlagLeftOut(opts))
-	assert.Empty(t, UnsafeFlagLeftOut(ApplyCommandOptions{Tenant: "acme", DeferCutover: true}))
+	assert.Equal(t, "**"+glyph.Escalation+" To proceed with unsafe changes**, add `--allow-unsafe` to confirm them again", UnsafeReconsent(opts))
+	assert.Empty(t, UnsafeReconsent(ApplyCommandOptions{Tenant: "acme", DeferCutover: true}))
 
 	inProgress := RenderApplyInProgress(ApplyLockConflictData{
 		Database:          "orders",
@@ -249,21 +251,20 @@ func TestApplyCommandLeavesOutAllowUnsafe(t *testing.T) {
 		ApplyID:           "apply-abc123",
 		ApplyState:        "running",
 		ApplyAgainCommand: ApplyCommand("staging", "orders", opts),
-		ApplyAgainNote:    UnsafeFlagLeftOut(opts),
+		ApplyAgainConsent: UnsafeReconsent(opts),
 	})
-	assert.Contains(t, inProgress, "Once it finishes, apply again:\n```\nschemabot apply -e staging -d orders --tenant acme --defer-cutover\n```\n\n`--allow-unsafe` is left out: type it yourself to confirm unsafe changes again.\n")
+	assert.Contains(t, inProgress, "Once it finishes, apply again.\n\n**🚨 To proceed with unsafe changes**, add `--allow-unsafe` to confirm them again:\n```\nschemabot apply -e staging -d orders --tenant acme --defer-cutover\n```\n")
 	assert.NotContains(t, inProgress, "--allow-unsafe\n")
 }
 
 // An apply rejected because another command changed its lock answers with the
 // apply to re-run in full, however long the database name and options are, so
-// neither the command nor the note asking the operator to type --allow-unsafe
-// again is ever cut short.
+// neither the command nor the sentence asking the operator to type
+// --allow-unsafe again is ever cut short.
 func TestRenderApplyLockIntentChangedKeepsLongCommandWhole(t *testing.T) {
 	database := strings.Repeat("d", 64)
 	opts := ApplyCommandOptions{Tenant: "acme-holdings-eu", AllowUnsafe: true, DeferCutover: true, SkipRevert: true}
 	command := ApplyCommand("staging", database, opts)
-	note := UnsafeFlagLeftOut(opts)
 
 	rendered := RenderApplyLockIntentChanged(ApplyLockIntentChangedData{
 		CommandName:       "apply-confirm",
@@ -271,12 +272,12 @@ func TestRenderApplyLockIntentChangedKeepsLongCommandWhole(t *testing.T) {
 		Environment:       "staging",
 		RequestedBy:       "octocat",
 		ApplyAgainCommand: command,
-		ApplyAgainNote:    note,
+		ApplyAgainConsent: UnsafeReconsent(opts),
 	})
 
 	assert.Contains(t, rendered, "## "+glyph.Failed+" Apply-confirm Rejected — Staging\n")
 	assert.Contains(t, rendered, "changed the lock on `"+database+"`")
-	assert.Contains(t, rendered, "Re-run:\n```\nschemabot apply -e staging -d "+database+" --tenant acme-holdings-eu --defer-cutover --skip-revert\n```\n\n"+note+"\n")
+	assert.Contains(t, rendered, "Re-run the apply.\n\n**🚨 To proceed with unsafe changes**, add `--allow-unsafe` to confirm them again:\n```\nschemabot apply -e staging -d "+database+" --tenant acme-holdings-eu --defer-cutover --skip-revert\n```\n")
 	assert.NotContains(t, rendered, "…")
 }
 

@@ -1126,7 +1126,7 @@ func TestE2EApplySamePRActiveApply(t *testing.T) {
 	case body := <-result.comments:
 		assert.Contains(t, body, "Apply Already In Progress")
 		assert.Contains(t, body, "This PR's apply `apply-active-test-001` is still running (state: `running`)")
-		assert.Contains(t, body, "Once it finishes, apply again:\n```\nschemabot apply -e staging\n```\n\n`--allow-unsafe` is left out: type it yourself to confirm unsafe changes again.\n")
+		assert.Contains(t, body, "Once it finishes, apply again.\n\n**🚨 To proceed with unsafe changes**, add `--allow-unsafe` to confirm them again:\n```\nschemabot apply -e staging\n```\n")
 		assert.NotContains(t, body, "schemabot apply -e staging --allow-unsafe")
 	case <-time.After(30 * time.Second):
 		t.Fatal("timed out waiting for active-apply comment")
