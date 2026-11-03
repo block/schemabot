@@ -1677,15 +1677,19 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 	// sibling no longer blocks later ones under "continue", or under "pause"
 	// once a release latches the rollout open.
 	queryArgs = append(queryArgs, operationStartGateArgs()...)
-	// Pending stop gate: a pending operation is not claimable for start while
-	// its apply has a pending stop control request. This is what makes `stop`
-	// halt remaining siblings under on_failure "continue" — without it, a
-	// continue-exempted pending sibling would still be claimed and started even
-	// though the user asked to stop the rollout. The gate covers only pending
-	// (not-yet-started) rows; an already-active row re-leasing a stale heartbeat
-	// is recovering work it started and is handled by the staleness clause below.
+	// Pending stop and cancel gate: a pending operation is not claimable for
+	// start while its apply has a pending stop or cancel control request. This
+	// is what makes `stop` halt remaining siblings under on_failure "continue"
+	// — without it, a continue-exempted pending sibling would still be claimed
+	// and started even though the user asked to stop the rollout — and what
+	// keeps a cancel from starting engine work on a target it is about to
+	// settle. The gate covers only pending (not-yet-started) rows; an
+	// already-active row re-leasing a stale heartbeat is recovering work it
+	// started and is handled by the staleness clause below. A rollout with
+	// nothing active left to carry the request is settled by stop
+	// reconciliation instead.
 	queryArgs = append(queryArgs,
-		storage.ControlOperationStop, storage.ControlRequestPending)
+		storage.ControlOperationStop, storage.ControlOperationCancel, storage.ControlRequestPending)
 	// Claimable-parent gate: a pending operation is claimable exactly while its
 	// parent apply is itself claimable. Starting a deployment belongs to a
 	// rollout a driver can still take somewhere; a terminal parent means the
@@ -1916,7 +1920,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 					SELECT 1
 					FROM apply_control_requests cr
 					WHERE cr.apply_id = apply_operations.apply_id
-						AND cr.operation = ?
+						AND cr.operation IN (?, ?)
 						AND cr.status = ?
 				)
 				AND `+parentClaimable+`
@@ -2058,9 +2062,9 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 		// heartbeat in the same write. WHERE state = ? guards against a concurrent
 		// transition landing between the SELECT and this UPDATE; RowsAffected == 0
 		// means another writer already moved the row, so we back off cleanly. The
-		// NOT EXISTS stop guard mirrors the SELECT's pending-stop gate so a stop
-		// request committed between the SELECT and this UPDATE still wins — the
-		// pending sibling is not started once a stop is pending.
+		// NOT EXISTS guard mirrors the SELECT's pending stop and cancel gate so a
+		// stop or cancel committed between the SELECT and this UPDATE still wins:
+		// the pending sibling is not started once either is pending.
 		result, err := tx.ExecContext(ctx, `
 			UPDATE apply_operations
 			SET state = ?, started_at = COALESCE(started_at, NOW()), updated_at = NOW(),
@@ -2069,10 +2073,10 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 				AND NOT EXISTS (
 					SELECT 1
 					FROM apply_control_requests cr
-					WHERE cr.apply_id = ? AND cr.operation = ? AND cr.status = ?
+					WHERE cr.apply_id = ? AND cr.operation IN (?, ?) AND cr.status = ?
 				)
 		`, state.ApplyOperation.Running, owner, leaseToken, ad.ID, state.ApplyOperation.Pending,
-			ad.ApplyID, storage.ControlOperationStop, storage.ControlRequestPending)
+			ad.ApplyID, storage.ControlOperationStop, storage.ControlOperationCancel, storage.ControlRequestPending)
 		if err != nil {
 			return nil, fmt.Errorf("claim pending apply_operation %d: %w", ad.ID, err)
 		}

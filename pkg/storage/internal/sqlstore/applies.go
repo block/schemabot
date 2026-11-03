@@ -2306,12 +2306,12 @@ func (s *applyStore) FindNextApplyForStopReconciliation(ctx context.Context, own
 	activeOpStatePlaceholders := placeholders(len(activeOpStates))
 
 	queryArgs := stringArgs(parentStates)
-	queryArgs = append(queryArgs, storage.ControlOperationStop, storage.ControlRequestPending)
+	queryArgs = append(queryArgs, storage.ControlOperationStop, storage.ControlOperationCancel, storage.ControlRequestPending)
 	queryArgs = append(queryArgs, state.ApplyOperation.Pending)
 	queryArgs = append(queryArgs, stringArgs(activeOpStates)...)
 
 	// The claim itself rotates the lease (persistApplyClaim stamps
-	// lease_acquired_at), so a lease newer than the stop request's last write
+	// lease_acquired_at), so a lease newer than the request's last write
 	// means this request was already claimed for reconciliation — re-matching
 	// it every poll would consume the driver's tick before the operation claim
 	// runs and starve the rest of the ladder whenever the reconciliation that
@@ -2327,7 +2327,7 @@ func (s *applyStore) FindNextApplyForStopReconciliation(ctx context.Context, own
 			AND EXISTS (
 				SELECT 1
 				FROM apply_control_requests cr
-				WHERE cr.apply_id = a.id AND cr.operation = ? AND cr.status = ?
+				WHERE cr.apply_id = a.id AND cr.operation IN (?, ?) AND cr.status = ?
 					AND (
 						a.lease_acquired_at IS NULL
 						OR a.lease_acquired_at < cr.updated_at

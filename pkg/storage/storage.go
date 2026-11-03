@@ -851,16 +851,17 @@ type ApplyStore interface {
 	// stop reconciliation — pending or one of the active recovery-claimable states
 	// (the claimableApplyStates set); the resumable non-terminal states
 	// failed_retryable and stopped are excluded because they have their own resume
-	// paths — that has a pending stop control request, at least one
+	// paths — that has a pending stop or cancel control request, at least one
 	// pending operation, and no active operation (none being driven and none
 	// awaiting stale recovery), rotating the lease onto it like ClaimApplyByID. It
 	// is the trigger for stop reconciliation when no operation is claimable to
-	// carry it: under on_failure "continue" a failed earlier sibling can leave the
-	// apply with only terminal and pending operations, and the claim gate keeps
-	// the pending ones from starting, so without this path the apply would strand
-	// non-terminal with its stop request pending forever. Skipping applies with
-	// any active operation leaves in-flight (and crash-recovered) drives to settle
-	// the stop themselves. Returns nil when no such apply exists or it is locked
+	// carry the request: the claim gate keeps pending operations from starting
+	// while a stop or cancel is pending, so an apply left with only terminal and
+	// pending operations (a failed earlier sibling under on_failure "continue",
+	// or a handoff between rollout members) would otherwise strand non-terminal
+	// with its request pending forever. Skipping applies with any active
+	// operation leaves in-flight (and crash-recovered) drives to deliver the
+	// request themselves. Returns nil when no such apply exists or it is locked
 	// by a peer.
 	FindNextApplyForStopReconciliation(ctx context.Context, owner string) (*Apply, error)
 
