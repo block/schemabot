@@ -773,6 +773,16 @@ $ schemabot status apply-example-73
        ALTER TABLE `orders` ADD INDEX `idx_status`(`status`);
 ```
 
+`revert` and `skip-revert` report the operation as requested, not done, and
+print the `progress` command that follows it. Repeating a request that is
+already pending reports it as already requested:
+
+```console
+$ schemabot revert -e staging apply-example-73
+Revert requested for shop/staging (apply apply-example-73) — SchemaBot will undo this schema change
+To watch and manage: schemabot progress apply-example-73 -e staging
+```
+
 ### Review a rollback before running it
 
 The preview and live progress format SQL using the target database dialect,

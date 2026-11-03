@@ -54,6 +54,12 @@ func (cmd *SkipRevertCmd) Run(g *Globals) error {
 	if err := checkAccepted(controlResponseWrapper{resp}, "skip-revert"); err != nil {
 		return err
 	}
-	fmt.Printf("Revert window skipped for %s — schema change finalized\n", formatControlTarget(cmd.ApplyID, cmd.Database, cmd.Environment))
+	target := formatControlTarget(cmd.ApplyID, cmd.Database, cmd.Environment)
+	if resp.Status == apitypes.ControlStatusAlreadyRequested {
+		fmt.Printf("Skip-revert already requested for %s — SchemaBot will finish the existing request\n", target)
+	} else {
+		fmt.Printf("Skip-revert requested for %s — SchemaBot will close the revert window\n", target)
+	}
+	printWatchInstructions(cmd.ApplyID, cmd.Database, cmd.Environment)
 	return nil
 }

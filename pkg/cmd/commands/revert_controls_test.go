@@ -80,17 +80,26 @@ func TestRevertControlsReturnARefusalAsAnError(t *testing.T) {
 	}
 }
 
-// An accepted revert or skip-revert reports success and exits zero.
-func TestRevertControlsReportAnAcceptedRequest(t *testing.T) {
+// An accepted revert or skip-revert has only recorded a request the driver
+// consumes later, so the CLI says the operation was requested, names the
+// command that follows its effect, and exits zero. A request the server already
+// held pending is reported as already requested.
+func TestRevertControlsReportARequestNotAnEffect(t *testing.T) {
+	watch := "To watch and manage: schemabot progress " + revertControlTestApplyID + " -e staging\n"
+	target := "orders/staging (apply " + revertControlTestApplyID + ")"
 	for _, tc := range []struct {
+		name      string
 		operation string
+		status    string
 		want      string
 	}{
-		{"revert", "Revert initiated for orders/staging (apply " + revertControlTestApplyID + ")\n"},
-		{"skip-revert", "Revert window skipped for orders/staging (apply " + revertControlTestApplyID + ") — schema change finalized\n"},
+		{"revert", "revert", "", "Revert requested for " + target + " — SchemaBot will undo this schema change\n" + watch},
+		{"revert already requested", "revert", apitypes.ControlStatusAlreadyRequested, "Revert already requested for " + target + " — SchemaBot will finish the existing request\n" + watch},
+		{"skip-revert", "skip-revert", "", "Skip-revert requested for " + target + " — SchemaBot will close the revert window\n" + watch},
+		{"skip-revert already requested", "skip-revert", apitypes.ControlStatusAlreadyRequested, "Skip-revert already requested for " + target + " — SchemaBot will finish the existing request\n" + watch},
 	} {
-		t.Run(tc.operation, func(t *testing.T) {
-			server := revertControlTestServer(t, tc.operation, apitypes.ControlResponse{Accepted: true})
+		t.Run(tc.name, func(t *testing.T) {
+			server := revertControlTestServer(t, tc.operation, apitypes.ControlResponse{Accepted: true, Status: tc.status})
 
 			out, err := runRevertControl(t, tc.operation, server.URL)
 
