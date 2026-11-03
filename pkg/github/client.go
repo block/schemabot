@@ -1404,6 +1404,10 @@ func (c *schemaChangeComparer) compare(ctx context.Context, paths []string) (str
 				return "", err
 			}
 			if ok {
+				// The followed sides are already resolved: re-resolving the
+				// path would read the symlinks again, and a top-level path is
+				// already visited, so it would be skipped uncompared.
+				followed.resolved = true
 				pending = append(pending, followed)
 				continue
 			}

@@ -425,6 +425,22 @@ func TestCheckReviewGate_ApprovalCoverage(t *testing.T) {
 			want: wantCovers,
 		},
 		{
+			name: "the PR repointing a config symlink outside the schema directory at another config after the approval does not count",
+			base: func() map[string]string {
+				files := maps.Clone(baseFiles)
+				files["schemabot.yaml"] = reviewGateSymlink + "config/orders.yaml"
+				files["config/orders.yaml"] = "database: orders\n"
+				files["config/orders_strict.yaml"] = "database: orders\nignore_tables:\n  - legacy_old\n"
+				return files
+			}(),
+			prChange: addVotes,
+			headChange: addVotesAnd(func(files map[string]string) {
+				files["schemabot.yaml"] = reviewGateSymlink + "config/orders_strict.yaml"
+			}),
+			configPath: "schemabot.yaml",
+			want:       wantChanged,
+		},
+		{
 			name: "a head rebuilt on an older default branch that restores a config outside the schema directory does not count",
 			base: func() map[string]string {
 				files := maps.Clone(baseFiles)
