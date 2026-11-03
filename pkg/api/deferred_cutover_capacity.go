@@ -87,23 +87,79 @@ func (c *ServerConfig) resolvedDrivers() int {
 	return DefaultDrivers
 }
 
-// deferredCutoverWidth counts the operations an apply's groups would hold at a
-// deferred cutover: its work operations that are not already settled. A
-// finalizer runs after the work it finalizes and never waits at a cutover.
+// deferredCutoverWidth counts the most operations an apply's groups would hold
+// at a deferred cutover at once: its work operations that are not already
+// settled, taken in the order the claim starts them (ST-10). Under `rolling`, and
+// any policy the claim does not order as barrier or parallel, a member starts
+// only once every earlier member has completed, and a held member completes
+// only once an operator cuts it over, so one member holds at a time. Under
+// `barrier` and `parallel` every deployment's members hold together. Within a
+// deployment, a table step starts only once the step before it completed, so
+// one step of each holds at a time, beside the operations that run a member's
+// whole change. A finalizer runs after the work it finalizes and never waits
+// at a cutover.
 func deferredCutoverWidth(groups []*storage.ApplyOperationWithTasks) int {
-	width := 0
+	type rolloutMember struct{ deployment, target string }
+	ordered := false
+	byMember := make(map[rolloutMember]*heldAtOnce)
+	byDeployment := make(map[string]*heldAtOnce)
 	for _, group := range groups {
 		op := group.Operation
 		if op.OperationKind != storage.ApplyOperationKindWork || state.IsApplyOperationTerminal(op.State) {
 			continue
 		}
-		width++
+		if storage.IsOrderedCutoverPolicy(op.CutoverPolicy) {
+			ordered = true
+		}
+		member := rolloutMember{deployment: op.Deployment, target: op.Target}
+		if byMember[member] == nil {
+			byMember[member] = &heldAtOnce{steps: make(map[int]int)}
+		}
+		byMember[member].add(op.RolloutStep)
+		if byDeployment[op.Deployment] == nil {
+			byDeployment[op.Deployment] = &heldAtOnce{steps: make(map[int]int)}
+		}
+		byDeployment[op.Deployment].add(op.RolloutStep)
+	}
+	width := 0
+	if ordered {
+		for _, deployment := range byDeployment {
+			width += deployment.width()
+		}
+		return width
+	}
+	for _, member := range byMember {
+		width = max(width, member.width())
 	}
 	return width
 }
 
-// deferredCutoverPerApplyCapRefusal refuses a deferred apply of two or more
-// operations that has more of them than max_drivers_per_apply. Each waiting
+// heldAtOnce counts the operations of one rollout member or deployment that
+// can hold at a cutover together: every operation that runs a member's whole
+// change, and the operations of its widest table step.
+type heldAtOnce struct {
+	wholeChange int
+	steps       map[int]int
+}
+
+func (h *heldAtOnce) add(rolloutStep int) {
+	if rolloutStep == 0 {
+		h.wholeChange++
+		return
+	}
+	h.steps[rolloutStep]++
+}
+
+func (h *heldAtOnce) width() int {
+	widest := 0
+	for _, operations := range h.steps {
+		widest = max(widest, operations)
+	}
+	return h.wholeChange + widest
+}
+
+// deferredCutoverPerApplyCapRefusal refuses a deferred apply that would hold two
+// or more operations at once, and more of them than max_drivers_per_apply. Each waiting
 // operation keeps counting against the cap, so once the first capped batch
 // waits at its cutover the rest can never start, and the apply is never ready
 // to cut over. It returns nil when the apply fits. The cap is this server's

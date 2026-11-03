@@ -102,6 +102,67 @@ func TestDeferredCutoverWidthCountsOnlyWorkStillToDrive(t *testing.T) {
 	assert.Equal(t, 2, deferredCutoverWidth(groups))
 }
 
+// A deferred apply holds at its cutover only the operations the claim lets run
+// together (ST-10): one member at a time under rolling, every deployment at
+// once under barrier and parallel, and one table step of each deployment at a
+// time.
+func TestDeferredCutoverWidthCountsOperationsHeldAtOnce(t *testing.T) {
+	op := func(policy, deployment string, rolloutStep int) *storage.ApplyOperationWithTasks {
+		return &storage.ApplyOperationWithTasks{Operation: &storage.ApplyOperation{
+			OperationKind: storage.ApplyOperationKindWork, State: state.ApplyOperation.Pending,
+			CutoverPolicy: policy, Deployment: deployment, Target: deployment, RolloutStep: rolloutStep,
+		}}
+	}
+	shards := func(policy, deployment string, count int) []*storage.ApplyOperationWithTasks {
+		groups := make([]*storage.ApplyOperationWithTasks, 0, count)
+		for range count {
+			groups = append(groups, op(policy, deployment, 0))
+		}
+		return groups
+	}
+	for _, tc := range []struct {
+		name   string
+		groups []*storage.ApplyOperationWithTasks
+		want   int
+	}{
+		{
+			name:   "rolling holds one deployment at a time",
+			groups: append(append(shards(storage.CutoverPolicyRolling, "eu", 4), shards(storage.CutoverPolicyRolling, "us", 2)...), shards(storage.CutoverPolicyRolling, "ap", 3)...),
+			want:   4,
+		},
+		{
+			name:   "barrier holds every deployment together",
+			groups: append(shards(storage.CutoverPolicyBarrier, "eu", 4), shards(storage.CutoverPolicyBarrier, "us", 2)...),
+			want:   6,
+		},
+		{
+			name:   "parallel holds every deployment together",
+			groups: append(shards(storage.CutoverPolicyParallel, "eu", 4), shards(storage.CutoverPolicyParallel, "us", 2)...),
+			want:   6,
+		},
+		{
+			name: "rolling table steps hold one step of one deployment",
+			groups: []*storage.ApplyOperationWithTasks{
+				op(storage.CutoverPolicyRolling, "eu", 1), op(storage.CutoverPolicyRolling, "eu", 2),
+				op(storage.CutoverPolicyRolling, "us", 1), op(storage.CutoverPolicyRolling, "us", 2),
+			},
+			want: 1,
+		},
+		{
+			name: "barrier table steps hold one step of each deployment",
+			groups: []*storage.ApplyOperationWithTasks{
+				op(storage.CutoverPolicyBarrier, "eu", 1), op(storage.CutoverPolicyBarrier, "eu", 2),
+				op(storage.CutoverPolicyBarrier, "us", 1), op(storage.CutoverPolicyBarrier, "us", 2),
+			},
+			want: 2,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, deferredCutoverWidth(tc.groups))
+		})
+	}
+}
+
 // A running operator records its drivers in the registry before any driver
 // claims, keeping one driver off deferred work, and removes its row when it
 // stops, so deferred cutover admission counts exactly the servers running
