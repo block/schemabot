@@ -151,19 +151,24 @@ func (m *mockStorageWithApplyStores) ApplyOperations() storage.ApplyOperationSto
 // the bare interface. Embedding the interface alone leaves every method a double
 // does not implement as a nil call, which is the behavior wanted for a method
 // the scenario never reaches — it fails loudly. The handback a drive performs on
-// its way out is the exception: every drive makes that call, so with a bare
-// interface every double would have to implement it, and any that did not would
-// panic inside the drive's own recovery rather than fail its test.
+// its way out, and the requeue for a pending start it performs on its way in,
+// are the exceptions: every drive makes those calls, so with a bare interface
+// every double would have to implement them, and any that did not would panic
+// inside the drive rather than fail its test.
 //
-// The default reports nothing cleared, which is what a real store returns when
-// no row is in an ended state under the drive's lease. A double whose scenario
-// turns on the handback overrides it.
+// The defaults report nothing cleared and nothing requeued, which is what a
+// real store returns when no row is in an ended state under the drive's lease
+// and no start is pending. A double whose scenario turns on either overrides it.
 type stubApplyOperationStore struct {
 	storage.ApplyOperationStore
 }
 
 func (stubApplyOperationStore) ReleaseFinishedClaim(context.Context, storage.OperationLease) (bool, error) {
 	return false, nil
+}
+
+func (stubApplyOperationStore) RequeueNeverStartedForStartByApply(context.Context, int64) (int64, error) {
+	return 0, nil
 }
 
 type staticApplyOperationStore struct {
@@ -714,7 +719,7 @@ func (s *queuedOperationClaimStore) FindNextApplyOperationCutover(context.Contex
 	return nil, nil
 }
 
-func (s *queuedOperationClaimStore) FindNextApplyOperation(_ context.Context, owner string) (*storage.ApplyOperation, error) {
+func (s *queuedOperationClaimStore) FindNextApplyOperation(_ context.Context, owner string, _ ...storage.OperationClaimOption) (*storage.ApplyOperation, error) {
 	s.applies.mu.Lock()
 	findCh := s.applies.findCh
 	s.applies.mu.Unlock()

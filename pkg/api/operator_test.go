@@ -2612,20 +2612,23 @@ func TestReconcileUnclaimableParent_RetainsLeaseWhenParentUnknown(t *testing.T) 
 // claim leases the row while it is claimable — or fails, when a configured
 // storage error or the caller's own cancelled context says so, or panics, to
 // model a fault in the claim machinery itself. It counts its calls so a test
-// can tell whether a tick reached the ladder at all.
+// can tell whether a tick reached the ladder at all, and records the filter
+// each claim ran under.
 type claimLadderOperationStore struct {
 	*recoverOperationStore
-	claims     int
-	claimErr   error
-	claimPanic string
+	claims       int
+	claimFilters []storage.OperationClaimFilter
+	claimErr     error
+	claimPanic   string
 }
 
 func (s *claimLadderOperationStore) FindNextApplyOperationCutover(context.Context, string) (*storage.ApplyOperation, error) {
 	return nil, nil
 }
 
-func (s *claimLadderOperationStore) FindNextApplyOperation(ctx context.Context, owner string) (*storage.ApplyOperation, error) {
+func (s *claimLadderOperationStore) FindNextApplyOperation(ctx context.Context, owner string, opts ...storage.OperationClaimOption) (*storage.ApplyOperation, error) {
 	s.claims++
+	s.claimFilters = append(s.claimFilters, storage.BuildOperationClaimFilter(opts...))
 	if s.claimPanic != "" {
 		panic(s.claimPanic)
 	}
@@ -2727,6 +2730,91 @@ func TestDriveTick_ContainsOperationClaimPanic(t *testing.T) {
 	require.NotPanics(t, func() { svc.driveTick(t.Context(), 0, openClaimGate()) })
 	require.NotPanics(t, func() { svc.driveTick(t.Context(), 0, openClaimGate()) })
 	assert.Equal(t, 2, ops.claims, "the driver must keep polling after each contained panic")
+}
+
+// One driver on each pod is reserved: its operation claims skip work for an
+// apply deferring its cutover, so a pod whose other drivers are all waiting on
+// an operator still has a driver for everything else. Every other driver claims
+// that work, and a pod with a single driver reserves nothing, so a deferred
+// apply can always run somewhere.
+func TestDriveTick_ReservedDriverSkipsDeferredCutoverWork(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		drivers  int
+		driverID int
+		skips    bool
+	}{
+		{name: "reserved driver of a pool", drivers: 4, driverID: reservedDriverID, skips: true},
+		{name: "other driver of a pool", drivers: 4, driverID: reservedDriverID + 1, skips: false},
+		{name: "only driver", drivers: 1, driverID: reservedDriverID, skips: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ops := &claimLadderOperationStore{recoverOperationStore: &recoverOperationStore{}}
+			logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+			svc := New(&mockStorageWithApplyStores{applies: &operationClaimApplyStore{}, operations: ops}, testServerConfig(), nil, logger)
+			svc.operatorDrivers.Store(int64(tc.drivers))
+
+			svc.driveTick(t.Context(), tc.driverID, openClaimGate())
+
+			require.Len(t, ops.claimFilters, 1, "the tick reaches the operation claim once")
+			assert.Equal(t, tc.skips, ops.claimFilters[0].SkipDeferredCutoverWork)
+		})
+	}
+}
+
+// The reserved driver listens on a wake channel of its own, so a pool wake
+// for an apply deferring its cutover always reaches a driver that claims it,
+// never the one driver that would skip it and leave the start to the next
+// poll tick. A pool that reserves nothing keeps every driver on one channel.
+func TestDriverWakeChannelKeepsPoolWakesOffTheReservedDriver(t *testing.T) {
+	pool := make(chan struct{}, 4)
+	reserved := make(chan struct{}, 1)
+
+	assert.Equal(t, reserved, driverWakeChannel(reservedDriverID, pool, reserved))
+	assert.Equal(t, pool, driverWakeChannel(reservedDriverID+1, pool, reserved))
+	assert.Equal(t, pool, driverWakeChannel(reservedDriverID, pool, nil), "a pool with no reserved driver shares one channel")
+}
+
+// A queued apply's wake and a started operation's wake both reach the pool and
+// the reserved driver, so whichever kind of work is waiting starts without a
+// poll tick. The reserved driver does not wake itself after its own start.
+func TestWakesReachThePoolAndTheReservedDriver(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	op := &storage.ApplyOperation{ApplyID: 1, Deployment: "default"}
+
+	newService := func() *Service {
+		svc := New(&mockStorageWithApplyStores{applies: &operationClaimApplyStore{}, operations: &claimLadderOperationStore{recoverOperationStore: &recoverOperationStore{}}}, testServerConfig(), nil, logger)
+		svc.stopRecovery = make(chan struct{})
+		svc.operatorWake = make(chan struct{}, 4)
+		svc.reservedDriverWake = make(chan struct{}, 1)
+		return svc
+	}
+
+	t.Run("queued apply", func(t *testing.T) {
+		svc := newService()
+		svc.wakeOperator("apply-1", "payments", "staging")
+		assert.Len(t, svc.operatorWake, 1)
+		assert.Len(t, svc.reservedDriverWake, 1)
+	})
+	t.Run("started by a pool driver", func(t *testing.T) {
+		svc := newService()
+		svc.wakeIdleDriver(reservedDriverID+1, op)
+		assert.Len(t, svc.operatorWake, 1)
+		assert.Len(t, svc.reservedDriverWake, 1)
+	})
+	t.Run("started by the reserved driver", func(t *testing.T) {
+		svc := newService()
+		svc.wakeIdleDriver(reservedDriverID, op)
+		assert.Len(t, svc.operatorWake, 1)
+		assert.Empty(t, svc.reservedDriverWake)
+	})
+}
+
+func TestDeferredCutoverDriversLeavesOneDriverPerPod(t *testing.T) {
+	assert.Equal(t, 0, deferredCutoverDrivers(0))
+	assert.Equal(t, 1, deferredCutoverDrivers(1), "a single driver is not reserved")
+	assert.Equal(t, 1, deferredCutoverDrivers(2))
+	assert.Equal(t, 3, deferredCutoverDrivers(4))
 }
 
 // A panic in the pre-claim stop-reconciliation probe is contained the same

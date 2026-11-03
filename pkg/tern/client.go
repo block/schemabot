@@ -18,6 +18,13 @@ import (
 // callers can match it with errors.Is regardless of the transport.
 var ErrNoTasksForApplyOperation = errors.New("no tasks found for apply operation")
 
+// ErrRemoteOperationNeverStarts is returned by an operation-scoped remote drive
+// when the data plane reports the operation will never start: no driver there
+// claimed it before its apply settled. The drive has already failed the
+// operation's tasks with that reason, so the operator derives the operation
+// from them like any other failure instead of polling it forever.
+var ErrRemoteOperationNeverStarts = errors.New("remote operation will never start: its apply settled before it began")
+
 // ErrApplyLeasePresumedLost is returned by a drive whose lease heartbeat
 // writes have been failing for the full storage.ApplyLeaseStaleAfter window.
 // The lease was never definitively reported lost — storage was unreachable —
