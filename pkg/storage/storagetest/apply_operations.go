@@ -2912,6 +2912,56 @@ func TestApplyOperations(t *testing.T, h Harness) {
 		assert.Equal(t, state.ApplyOperation.FailedRetryable, held.State)
 		assert.Equal(t, 1, held.Attempt)
 	})
+
+	// An operator stops or cancels an apply while its shards wait out their
+	// redispatch backoff. Only the drive a redispatch starts delivers the
+	// request to a failed shard, so the request claims one at once rather than
+	// after the backoff, as the same redispatch: the lease rotates and the
+	// attempt is spent.
+	for _, request := range []storage.ControlOperation{storage.ControlOperationStop, storage.ControlOperationCancel} {
+		t.Run("FailedRetryableRedispatch_"+string(request)+"SkipsTheBackoff", func(t *testing.T) {
+			ctx := t.Context()
+			store := h.NewStorage(t)
+			lock := CreateLock(t, store, "operation_redispatch_"+string(request)+"_db", storage.DatabaseTypeMySQL)
+			apply := CreateApplyWithStateAndEnv(t, store, lock, "apply_operation_redispatch_"+string(request), 915, state.Apply.FailedRetryable, "staging")
+			shardIDs := map[int64]bool{}
+			for _, shard := range []string{"-80", "80-"} {
+				id, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+					ApplyID: apply.ID, Deployment: "region-a", OperationKey: shard, Target: shard,
+					State: state.ApplyOperation.FailedRetryable, ErrorMessage: "data plane unavailable",
+				})
+				require.NoError(t, err)
+				shardIDs[id] = true
+			}
+			// Both shards spend their immediate first redispatch and fail
+			// again, so each now waits out a backoff.
+			tokens := map[int64]string{}
+			for range shardIDs {
+				claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-a")
+				require.NoError(t, err)
+				require.NotNil(t, claimed)
+				tokens[claimed.ID] = claimed.LeaseToken
+				ownedCtx := storage.WithOperationLease(ctx, claimed.Lease())
+				require.NoError(t, store.ApplyOperations().MarkFailedRetryable(ownedCtx, claimed.ID, "data plane unavailable"))
+				released, err := store.ApplyOperations().ReleaseFinishedClaim(ctx, claimed.Lease())
+				require.NoError(t, err)
+				require.True(t, released)
+			}
+			backedOff, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-b")
+			require.NoError(t, err)
+			require.Nil(t, backedOff, "both shards are inside their backoff")
+
+			requestControl(t, store, apply.ID, request)
+			claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-b")
+			require.NoError(t, err)
+			require.NotNil(t, claimed, "a pending %s claims a shard without waiting out the backoff", request)
+			assert.True(t, shardIDs[claimed.ID])
+			assert.Equal(t, state.ApplyOperation.Running, claimed.State)
+			assert.Equal(t, 2, claimed.Attempt, "the claim spends an attempt like any redispatch")
+			assert.Equal(t, "driver-b", claimed.LeaseOwner)
+			assert.NotEqual(t, tokens[claimed.ID], claimed.LeaseToken, "the claim rotates the lease")
+		})
+	}
 }
 
 // testOneTargetsShardsCutOverWhenReady seeds one target with two shards of

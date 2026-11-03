@@ -191,6 +191,10 @@ measured from when the operation failed. An outage of a few minutes therefore
 costs a handful of attempts instead of the whole budget, and the 10 attempts
 together span about 20 minutes.
 
+A pending `stop` or `cancel` does not wait out the backoff. The operation is
+picked up at once so the command takes effect, and that pickup spends an
+attempt like any other.
+
 ```
  running --(recoverable failure)--> failed_retryable
     ^                                     |

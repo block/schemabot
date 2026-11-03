@@ -1815,6 +1815,13 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 	queryArgs = append(queryArgs, driverCapArgs...)
 	queryArgs = append(queryArgs, state.ApplyOperation.FailedRetryable)
 	queryArgs = append(queryArgs, state.Apply.FailedRetryable, maxRecoveryAttempts, retryableRecoveryFreshnessDays)
+	// Backoff bypass: an accepted stop or cancel reaches a failed_retryable
+	// operation only through the drive a redispatch starts, so the request
+	// claims it at once rather than after the backoff (CO-2). The claim is
+	// otherwise the same redispatch: it rotates the lease, spends an attempt,
+	// and stays under the fan-out cap.
+	queryArgs = append(queryArgs,
+		storage.ControlOperationStop, storage.ControlOperationCancel, storage.ControlRequestPending)
 	queryArgs = append(queryArgs, driverCapArgs...)
 	queryArgs = append(queryArgs, stringArgs(activeStates)...)
 	queryArgs = append(queryArgs, notDeferredRecoveryArgs...)
@@ -2023,8 +2030,19 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 								-- Names no column of a, but belongs to this arm
 								-- alone: the backoff spaces deliberate
 								-- redispatches, which crash recovery below must
-								-- not wait on.
-								AND `+redispatchBackoff+`
+								-- not wait on. A pending stop or cancel is
+								-- delivered by the drive this claim starts, so it
+								-- does not wait either.
+								AND (
+									`+redispatchBackoff+`
+									OR EXISTS (
+										SELECT 1
+										FROM apply_control_requests cr
+										WHERE cr.apply_id = apply_operations.apply_id
+											AND cr.operation IN (?, ?)
+											AND cr.status = ?
+									)
+								)
 								-- Likewise: a deliberate redispatch starts work,
 								-- so it is capped; crash recovery below is not.
 								AND `+driverCap+notDeferred+`
