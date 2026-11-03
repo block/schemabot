@@ -259,6 +259,13 @@ func (c *LocalClient) cutover(ctx context.Context, req *ternv1.CutoverRequest, c
 	c.logApplyEvent(ctx, task.ApplyID, nil, storage.LogLevelInfo, storage.LogEventCutoverTriggered, storage.LogSourceSchemaBot,
 		logMessage, "", "")
 
+	if engine.IsOutcomeUnknown(err) {
+		// The backend may have taken the cutover, so the timeline must not
+		// report it failed; the caller keeps the request pending and resends it.
+		c.logApplyEvent(ctx, task.ApplyID, nil, storage.LogLevelWarn, storage.LogEventInfo, storage.LogSourceSchemaBot,
+			fmt.Sprintf("Cutover outcome unknown, SchemaBot will send it again: %v", err), "", "")
+		return nil, fmt.Errorf("cutover outcome unknown: %w", err)
+	}
 	if err != nil {
 		c.logApplyEvent(ctx, task.ApplyID, nil, storage.LogLevelError, storage.LogEventError, storage.LogSourceSchemaBot,
 			fmt.Sprintf("Cutover failed: %v", err), "", "")
@@ -426,6 +433,15 @@ func (c *LocalClient) processPendingCutoverControlRequest(ctx context.Context, a
 		// progress tick retries it — terminally failing it would strand a
 		// deferred cutover until an operator notices and re-issues the command.
 		logger.Info("pending cutover request not accepted yet by engine backend; retrying at the next progress tick",
+			append(apply.MutableLogAttrs(), "requested_by", controlRequestCaller(controlReq), "error", err)...)
+		return nil
+	}
+	if engine.IsOutcomeUnknown(err) {
+		// The engine cannot tell whether its backend took the cutover. Failing
+		// the request would tell the operator the cutover failed while it may be
+		// completing; the request stays pending, the next progress tick sends it
+		// again, and progress reports the cutover if it already took.
+		logger.Warn("pending cutover request has an unknown outcome; the request stays pending and is sent again at the next progress tick",
 			append(apply.MutableLogAttrs(), "requested_by", controlRequestCaller(controlReq), "error", err)...)
 		return nil
 	}
@@ -2808,8 +2824,9 @@ func (c *LocalClient) takeBoundCutoverRequest(ctx context.Context, apply *storag
 
 // cutOverBoundOperation triggers the cutover of one operation for a pending
 // request, from that operation's own drive. accepted reports that the engine
-// took the cutover. A recovering apply and an engine that is not ready yet
-// leave the request pending for the next tick; a pending stop blocks it; any
+// took the cutover. A recovering apply, an engine that is not ready yet, and a
+// cutover whose outcome is unknown leave the request pending for the next
+// tick; a pending stop blocks it; any
 // other refusal or failure fails the request through failRequest, since the
 // command can no longer take effect as accepted.
 func (c *LocalClient) cutOverBoundOperation(ctx context.Context, apply *storage.Apply, controlReq *storage.ApplyControlRequest, operationID int64, logger *slog.Logger, failRequest func(reason string) error) (accepted bool, err error) {
@@ -2833,6 +2850,11 @@ func (c *LocalClient) cutOverBoundOperation(ctx context.Context, apply *storage.
 	}, controlRequestCaller(controlReq))
 	if engine.IsNotReady(err) {
 		logger.Info("pending cutover request not accepted yet by engine backend; retrying at the next progress tick",
+			"requested_by", controlRequestCaller(controlReq), "bound_operation_id", operationID, "error", err)
+		return false, nil
+	}
+	if engine.IsOutcomeUnknown(err) {
+		logger.Warn("pending cutover request has an unknown outcome; the request stays pending and is sent again at the next progress tick",
 			"requested_by", controlRequestCaller(controlReq), "bound_operation_id", operationID, "error", err)
 		return false, nil
 	}
