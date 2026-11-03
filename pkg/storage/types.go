@@ -20,7 +20,41 @@ import (
 // is terminalized as failed. The original apply attempt is separate. Surfaced
 // in operator-facing progress (the PR comment's retry counter) and enforced by
 // the storage claim/expiry paths.
+//
+// The budget is per operation. Each operation of an apply counts its own
+// redispatches, and the apply's attempt records the highest of them, so the
+// apply is terminalized once any one operation has spent its budget. One
+// interruption that reaches every operation at once costs each of them one
+// attempt, rather than costing the apply one attempt per operation.
 const MaxRecoveryAttempts = 10
+
+const (
+	// RecoveryBackoffBase is the wait before an operation's second automatic
+	// redispatch. See RecoveryBackoff.
+	RecoveryBackoffBase = 5 * time.Second
+	// MaxRecoveryBackoff caps the wait between automatic redispatches.
+	MaxRecoveryBackoff = 5 * time.Minute
+)
+
+// RecoveryBackoff is how long a failed_retryable operation waits, from the
+// moment it failed, before its next automatic redispatch, given how many
+// redispatches it has already had. The first is immediate, so a one-off
+// interruption costs no time. Each one after that waits twice as long as the
+// one before, up to MaxRecoveryBackoff, so the budget is spread over an outage
+// of several minutes instead of being spent while the outage lasts.
+func RecoveryBackoff(attempt int) time.Duration {
+	if attempt <= 0 {
+		return 0
+	}
+	backoff := RecoveryBackoffBase
+	for range attempt - 1 {
+		backoff *= 2
+		if backoff >= MaxRecoveryBackoff {
+			return MaxRecoveryBackoff
+		}
+	}
+	return backoff
+}
 
 // ApplyTargetLockWait is how long a claim blocks waiting for another instance
 // to release an apply target's advisory lock. It is the longest a statement on

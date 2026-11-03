@@ -177,28 +177,41 @@ hands its claims back and leaves the apply active, so a peer driver resumes it
 without the apply ever passing through `failed_retryable` or spending budget.
 
 Each automatic pickup consumes one **recovery attempt** from a fixed budget —
-currently **10 attempts**, on top of the original run. The attempt counter is
-visible in the PR progress comment, so you can watch how much budget an apply
-has burned.
+currently **10 attempts**, on top of the original run. The budget belongs to
+each operation, not to the apply as a whole: every shard or deployment of an
+apply gets its own 10. When one interruption reaches all of them at once (the
+data plane restarting, say), each spends one attempt, rather than the apply
+spending one per shard. The apply's attempt counter is the highest any of its
+operations has reached, and it is visible in the PR progress comment, so you
+can watch how much budget the worst-hit operation has burned.
+
+The first pickup after a failure is immediate. Each one after that waits
+twice as long as the one before, starting at 5 seconds and capped at 5 minutes,
+measured from when the operation failed. An outage of a few minutes therefore
+costs a handful of attempts instead of the whole budget, and the 10 attempts
+together span about 20 minutes.
 
 ```
  running --(recoverable failure)--> failed_retryable
     ^                                     |
-    |     recovery driver reclaims,       |
-    +---- attempt counter +1, resume <----+
-          from checkpoints                |
-                                          |  budget spent (10 attempts),
-                                          |  or the failure is older than
-                                          |  the recovery window (1 day)
+    |     backoff passes, recovery        |
+    |     driver reclaims, operation's    |
+    +---- attempt +1, resume from    <----+
+          checkpoints                     |
+                                          |  an operation's budget spent
+                                          |  (10 attempts), or the failure
+                                          |  is older than the recovery
+                                          |  window (1 day)
                                           v
                                    failed  (permanent)
 ```
 
 Two things end the loop:
 
-- **The budget runs out.** Ten consecutive recoveries that each failed again
-  is a strong signal the problem is not transient — retrying an eleventh time
-  would just burn resources on the same wall.
+- **The budget runs out.** Ten consecutive recoveries of one operation that
+  each failed again, spread over about 20 minutes, is a strong signal the
+  problem is not transient — retrying an eleventh time would just burn
+  resources on the same wall.
 - **The recovery window closes.** A `failed_retryable` apply that has been
   sitting for more than a day is no longer picked up automatically, even with
   budget to spare. This prevents a surprise: an old paused failure silently
@@ -207,8 +220,8 @@ Two things end the loop:
   automatic redispatch.
 
 Either way, the apply is then terminalized as permanent `failed`, and the
-normal recovery path applies: fix the cause, fresh plan, fresh apply. The
-budget and window are per-apply — a new apply starts with a full budget.
+normal recovery path applies: fix the cause, fresh plan, fresh apply. A new
+apply starts every operation with a full budget.
 
 ## Refused before an apply exists
 
