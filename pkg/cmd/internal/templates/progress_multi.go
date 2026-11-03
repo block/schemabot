@@ -13,7 +13,7 @@ import (
 )
 
 func writeMultiDeploymentProgress(data ProgressData) {
-	model := presentation.Derive(ProgressOperationsForPresentation(data.Operations, data.Tables, data.Released))
+	model := presentation.Derive(presentation.ResumeClaimed(data.State, ProgressOperationsForPresentation(data.Operations, data.Tables, data.Released)))
 	groups := model.Groups()
 	view := RolloutView{
 		ApplyID:      data.ApplyID,

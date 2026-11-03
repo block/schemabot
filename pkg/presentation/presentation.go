@@ -493,6 +493,26 @@ func Derive(ops []Operation) Apply {
 	}
 }
 
+// ResumeClaimed reads the operations of an apply in applyState. A start moves
+// a stopped apply to resuming before its operations leave stopped: a drive
+// claims them one at a time, and a remote data plane can report them stopped
+// until it acts on the start. Every stopped operation of a resuming apply is
+// one that start resumes, so it reads as resuming; rendered stopped, it would
+// ask the operator for the start they already sent. Operations of an apply in
+// any other state are returned as they are.
+func ResumeClaimed(applyState string, ops []Operation) []Operation {
+	if !state.IsState(applyState, state.Apply.Resuming) {
+		return ops
+	}
+	claimed := slices.Clone(ops)
+	for i := range claimed {
+		if claimed[i].State == state.ApplyOperation.Stopped {
+			claimed[i].State = state.ApplyOperation.Resuming
+		}
+	}
+	return claimed
+}
+
 // firstFailure returns the deployment of the first row, in resolved order,
 // whose raw operation state is terminally failed, or nil when none failed. A
 // folded member's failure is placed by its failed row, so a target that

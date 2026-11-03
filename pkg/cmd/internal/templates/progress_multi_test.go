@@ -54,6 +54,34 @@ func TestWriteProgressMultiDeploymentRendersAggregateAndSections(t *testing.T) {
 	assert.Contains(t, output, "users_c")
 }
 
+// A resuming rollout's progress output reads as the start under way, even
+// while its targets still report stopped: the state and target counts say
+// resuming, each table reads as resuming, and no start command is offered.
+func TestWriteProgressMultiDeploymentResumingOffersNoStart(t *testing.T) {
+	output := captureStdout(t, func() {
+		WriteProgress(ProgressData{
+			ApplyID:     "apply-resuming",
+			Environment: "staging",
+			State:       state.Apply.Resuming,
+			Operations: []ProgressOperation{
+				{Deployment: "staging", Target: "orders-a", State: state.ApplyOperation.Stopped, StartedAt: "2026-06-16T10:00:00Z", CutoverPolicy: storage.CutoverPolicyParallel, OnFailure: storage.OnFailureHalt},
+				{Deployment: "staging", Target: "orders-b", State: state.ApplyOperation.Stopped, StartedAt: "2026-06-16T10:00:00Z", CutoverPolicy: storage.CutoverPolicyParallel, OnFailure: storage.OnFailureHalt},
+			},
+			Tables: []TableProgress{
+				{Deployment: "staging", Target: "orders-a", TableName: "users", ChangeType: "alter", DDL: "ALTER TABLE `users` ADD COLUMN `region` varchar(20)", Status: state.Task.Stopped, PercentComplete: 57, RowsCopied: 57, RowsTotal: 100},
+				{Deployment: "staging", Target: "orders-b", TableName: "users", ChangeType: "alter", DDL: "ALTER TABLE `users` ADD COLUMN `region` varchar(20)", Status: state.Task.Stopped, PercentComplete: 40, RowsCopied: 40, RowsTotal: 100},
+			},
+		})
+	})
+
+	assert.Contains(t, output, "State:        "+ANSICyan+"resuming")
+	assert.Contains(t, output, "Targets:      2 resuming")
+	assert.Contains(t, output, "~ users: "+ANSICyan+"🔄 Resuming..."+ANSIReset+"\n")
+	assert.Contains(t, output, "COLUMN `region`", "the table keeps its DDL")
+	assert.NotContains(t, output, "stopped")
+	assert.NotContains(t, output, "schemabot start")
+}
+
 // A keyed apply runs many operations on one deployment, distinguished only by
 // operation key. Each section must render its own operation's key and external
 // operation ID — never a sibling's — so an operator can correlate every section

@@ -17,7 +17,7 @@ import (
 // and each deployment's section) and its footer (the rollout's next command
 // and the keys the operator can press).
 func (m WatchModel) multiDeploymentProgressSections() (string, string) {
-	model := presentation.Derive(templates.ProgressOperationsForPresentation(m.operations, m.tables, m.released))
+	model := presentation.Derive(presentation.ResumeClaimed(m.state, templates.ProgressOperationsForPresentation(m.operations, m.tables, m.released)))
 	groups := model.Groups()
 	view := templates.RolloutView{
 		ApplyID:      m.applyID,
@@ -101,7 +101,7 @@ func (m WatchModel) writeMultiDeploymentHeader(b *strings.Builder, model present
 // rolloutStateIsActive reports whether the rollout is still working toward its
 // outcome, so its state line carries the spinner.
 func rolloutStateIsActive(s string) bool {
-	return state.IsRunningApplyState(s) || state.IsState(s, state.Apply.Pending, state.Apply.WaitingForCutover, state.Apply.CuttingOver, state.Apply.Recovering)
+	return state.IsRunningApplyState(s) || state.IsState(s, state.Apply.Pending, state.Apply.Resuming, state.Apply.WaitingForCutover, state.Apply.CuttingOver, state.Apply.Recovering)
 }
 
 // rolloutStateLine is the rollout's state, capitalized as the single-target

@@ -487,10 +487,31 @@ func writeTableLine(b *strings.Builder, t TableProgress, format string, args ...
 	b.WriteString("\n")
 }
 
+// awaitsResume reports whether a table is one a claimed start has yet to pick
+// back up: the apply is resuming and the table has not reached an outcome.
+func awaitsResume(t TableProgress) bool {
+	return t.Resuming && !state.IsTerminalTaskState(state.NormalizeTaskStatus(t.Status))
+}
+
+// formatResumingTable renders a table awaiting its resume as its state and
+// DDL, as the PR comment does, until its targets report how the copy goes on.
+func formatResumingTable(t TableProgress) string {
+	var b strings.Builder
+	writeTableLine(&b, t, ANSICyan+"🔄 Resuming..."+ANSIReset)
+	if t.DDL != "" {
+		b.WriteString(formatTableDDL(t))
+	}
+	b.WriteString("\n")
+	return b.String()
+}
+
 // FormatTableProgressWithActivity returns progress for a single table using the
 // provided activity bar and label when row-copy progress has exceeded its
 // estimate.
 func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel string) string {
+	if awaitsResume(t) {
+		return formatResumingTable(t)
+	}
 	if keepsAcrossTargetsBar(t) {
 		if out, ok := formatAcrossTargetsProgress(t); ok {
 			return out
