@@ -262,11 +262,6 @@ func writeMentionList(sb *strings.Builder, logins []string) {
 	}
 }
 
-// mentionList renders logins as comma-separated @-mentions.
-func mentionList(logins []string) string {
-	return strings.Join(mentions(logins), ", ")
-}
-
 // mentions renders each login as an @-mention.
 func mentions(logins []string) []string {
 	out := make([]string, 0, len(logins))
