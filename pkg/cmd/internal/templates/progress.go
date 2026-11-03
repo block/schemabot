@@ -105,7 +105,7 @@ func WriteProgress(data ProgressData) {
 	}
 	rows = append(rows, BoxRow{"State", displayState})
 	if data.Sharded {
-		if counts := ShardCounts(data.Operations, data.Tables, data.Released); counts != "" {
+		if counts := ShardCounts(data.State, data.Operations, data.Tables, data.Released); counts != "" {
 			rows = append(rows, BoxRow{"Shards", counts})
 		}
 	}
@@ -424,6 +424,10 @@ func FormatProgressState(s string) string {
 		return ANSIYellow + "🟨 Waiting for cutover" + ANSIReset
 	case state.Apply.Recovering:
 		return ANSIYellow + "🟨 Recovering" + ANSIReset
+	case state.Apply.Paused:
+		return ANSIYellow + "⏸️  Paused" + ANSIReset
+	case state.Apply.Resuming:
+		return ANSICyan + "🔄 Resuming..." + ANSIReset
 	case state.Apply.CuttingOver:
 		return ANSICyan + "🔄 Cutting over..." + ANSIReset
 	case state.Apply.Completed:
@@ -483,10 +487,43 @@ func writeTableLine(b *strings.Builder, t TableProgress, format string, args ...
 	b.WriteString("\n")
 }
 
+// awaitsResume reports whether a table of a resuming apply is one the start
+// has yet to pick back up on any of its targets (presentation.AwaitingResume),
+// and the coverage its line keeps for the targets that finished or are still
+// queued. A rolled-up table reads its targets; any other its own status.
+func awaitsResume(t TableProgress) (string, bool) {
+	if !t.Resuming {
+		return "", false
+	}
+	statuses := []string{t.Status}
+	if len(t.Shards) > 0 {
+		statuses = make([]string, len(t.Shards))
+		for i, s := range t.Shards {
+			statuses[i] = s.Status
+		}
+	}
+	return presentation.AwaitingResume(statuses)
+}
+
+// formatResumingTable renders a table awaiting its resume as its state and
+// DDL, as the PR comment does, until its targets report how the copy goes on.
+func formatResumingTable(t TableProgress, coverage string) string {
+	var b strings.Builder
+	writeTableLine(&b, t, "%s%s", ANSICyan+"🔄 Resuming..."+ANSIReset, coverage)
+	if t.DDL != "" {
+		b.WriteString(formatTableDDL(t))
+	}
+	b.WriteString("\n")
+	return b.String()
+}
+
 // FormatTableProgressWithActivity returns progress for a single table using the
 // provided activity bar and label when row-copy progress has exceeded its
 // estimate.
 func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel string) string {
+	if coverage, ok := awaitsResume(t); ok {
+		return formatResumingTable(t, coverage)
+	}
 	if keepsAcrossTargetsBar(t) {
 		if out, ok := formatAcrossTargetsProgress(t); ok {
 			return out
@@ -1600,6 +1637,10 @@ func stateColorFunc(s string) func(string) string {
 		return colorWrap(ANSICyan)
 	case state.Apply.WaitingForDeploy, state.Apply.WaitingForCutover, state.Apply.Recovering:
 		return colorWrap(ANSIYellow)
+	case state.Apply.Paused:
+		return colorWrap(ANSIYellow) // the rollout holds until an operator releases it
+	case state.Apply.Resuming:
+		return colorWrap(ANSICyan) // a start is being processed
 	case state.Apply.CuttingOver:
 		return colorWrap(ANSICyan) // active work, matches the blue "Cutting over..." table bar
 	case state.Apply.Stopped:

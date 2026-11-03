@@ -863,7 +863,7 @@ func writeTableProgressSection(sb *strings.Builder, data ApplyStatusCommentData,
 			// the schema change continues from its checkpoint or restarts from scratch,
 			// so the row-copy percent is indeterminate. Render state-only until the
 			// apply transitions to running and real progress is known.
-			if data.State == state.Apply.Resuming && !state.IsTerminalTaskState(state.NormalizeTaskStatus(table.Status)) {
+			if resumesTable(data.State, table) {
 				renderResumingTable(sb, dialect, table, budget)
 				continue
 			}
@@ -924,6 +924,18 @@ func namespaceLabel(engine string) string {
 		return "Keyspace"
 	}
 	return "Schema"
+}
+
+// resumesTable reports whether a table of an apply in applyState is one the
+// start picks back up: the apply is resuming and the table is neither finished
+// nor still to begin. A table that never started has nothing to resume, so it
+// stays queued, as a rollout reads it.
+func resumesTable(applyState string, table TableProgressData) bool {
+	if !state.IsState(applyState, state.Apply.Resuming) {
+		return false
+	}
+	status := state.NormalizeTaskStatus(table.Status)
+	return !state.IsTerminalTaskState(status) && status != state.Task.Pending
 }
 
 // renderResumingTable renders a table while the apply is resuming, before the

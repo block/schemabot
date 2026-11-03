@@ -3,6 +3,7 @@ package templates
 import (
 	"io"
 	"os"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -1088,34 +1089,36 @@ func TestStateColorFunc_PlanetScalePhases(t *testing.T) {
 	}
 }
 
+// Every apply state renders in a color in the status table and has its own
+// progress state line, so no state an operator can see reads as plain text
+// beside the colored ones or falls through to its raw stored name.
+func TestEveryApplyStateHasAColor(t *testing.T) {
+	for _, s := range everyApplyState(t) {
+		assert.NotNilf(t, stateColorFunc(s), "state %q has no status table color", s)
+		assert.NotEqualf(t, s, FormatProgressState(s), "state %q renders its progress line as the raw state", s)
+	}
+}
+
+// everyApplyState returns the value of every state.Apply field, so a state
+// added to the registry is covered without editing a list.
+func everyApplyState(t *testing.T) []string {
+	t.Helper()
+	v := reflect.ValueOf(state.Apply)
+	states := make([]string, 0, v.NumField())
+	for i := range v.NumField() {
+		s := v.Field(i).String()
+		require.NotEmptyf(t, s, "state.Apply.%s is empty", v.Type().Field(i).Name)
+		states = append(states, s)
+	}
+	return states
+}
+
 // Red means "something broke, go fix it" — an operator scanning a status list
 // should be able to trust that red marks a real failure. Operator-initiated
 // terminal states (stopped, cancelled, reverted) are deliberate outcomes and
 // render orange instead, so a routine revert never reads as a failure.
 func TestStateColorsReserveRedForFailure(t *testing.T) {
-	allStates := []string{
-		state.Apply.Pending,
-		state.Apply.Running,
-		state.Apply.RunningDegraded,
-		state.Apply.WaitingForDeploy,
-		state.Apply.WaitingForCutover,
-		state.Apply.Recovering,
-		state.Apply.CuttingOver,
-		state.Apply.RevertWindow,
-		state.Apply.SkippingRevert,
-		state.Apply.Reverting,
-		state.Apply.Completed,
-		state.Apply.Failed,
-		state.Apply.FailedRetryable,
-		state.Apply.Stopped,
-		state.Apply.Cancelled,
-		state.Apply.Reverted,
-		state.Apply.PreparingBranch,
-		state.Apply.ApplyingBranchChanges,
-		state.Apply.ValidatingBranch,
-		state.Apply.CreatingDeployRequest,
-		state.Apply.ValidatingDeployRequest,
-	}
+	allStates := everyApplyState(t)
 	for _, s := range allStates {
 		if fn := stateColorFunc(s); fn != nil {
 			colored := fn(state.Label(s))
