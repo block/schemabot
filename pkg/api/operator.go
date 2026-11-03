@@ -1000,9 +1000,9 @@ func (s *Service) recoverApplies(ctx context.Context, driverID int, stop <-chan 
 // recovers an operation of an apply deferring its cutover.
 //
 // A deferred drive holds its driver until an operator cuts over, which can
-// take days. Held operations stop counting against the per-apply cap, so the
-// rest of a wide deferred apply keeps starting and every driver can end up
-// waiting on a person. The reserved driver keeps one driver per pod for
+// take days. Each apply holds at most the per-apply cap, but enough deferred
+// applies together can leave every driver waiting on a person. The reserved
+// driver keeps one driver per pod for
 // everything else: other databases' applies, recoveries, finalizers, and stops
 // on applies that have not started. It still delivers stop and cancel requests
 // to a deferred apply, since those end its work.

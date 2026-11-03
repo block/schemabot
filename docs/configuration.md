@@ -906,7 +906,7 @@ The cap applies only to *starting* new operations — a first start, a resume af
 
 **The cap is a steady-state bound, not a hard admission limit.** Each claim evaluates the count independently, so drivers polling in the same instant can all read the same pre-claim value and admit together — a pod restart or rolling deploy, where every driver's first poll lands at once, is the shape that produces it. The transient ceiling is the number of drivers claiming in that window; once those leases commit, the next claim counts them and the cap binds again. Size against the steady-state number, and do not treat the cap as a guarantee that an apply can never briefly exceed it.
 
-An operation of an apply started with `--defer-cutover` keeps its driver while it waits for the cutover, holding its claim and heartbeating, but once it has nothing left to copy it no longer counts against the cap: the cap bounds how many operations copy against their targets at once, and a held operation has finished copying. The rest of a sharded apply therefore keeps starting while earlier shards wait, up to the drivers available for deferred work. An operation that will copy again after its cutover lands, because it has a later table still to copy, stays counted.
+A multi-shard apply started with a manual `--defer-cutover` keeps its drivers while it waits: unlike the automatic barrier park, a manually deferred operation holds its claim and keeps heartbeating, so it stays counted. Cutting over such an apply therefore takes one `cutover` per capped batch rather than one for the whole fan-out, and shards that have not yet advanced are still subject to the manual-inaction timeout.
 
 ## Rate Limits
 
