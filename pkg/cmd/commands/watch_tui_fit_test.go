@@ -52,8 +52,8 @@ func TestWatchViewFitsTheWindow(t *testing.T) {
 
 	assert.Equal(t, 20, frameRows(fitted))
 	assert.Equal(t, strings.SplitN(stripANSI(full), "\n", 2)[0], strings.SplitN(plain, "\n", 2)[0], "the status line stays on top")
-	assert.Contains(t, plain, "Apply ID: apply-abc123")
-	assert.True(t, strings.HasSuffix(plain, "ESC to detach\n"), plain)
+	assert.Contains(t, plain, "shard_00", "the first section stays below the status line")
+	assert.True(t, strings.HasSuffix(plain, "ESC detach • s stop\n"), plain)
 
 	_, footer := m.multiDeploymentProgressSections()
 	assert.True(t, strings.HasSuffix(fitted, footer), "the footer stays whole")
@@ -144,20 +144,20 @@ func TestFitToWindowWithoutAFooter(t *testing.T) {
 }
 
 // An operator who presses s on a rollout sees the status line acknowledge the
-// stop while every target still reads as copying, and the targets' stopped
-// state once the server reports it.
+// stop, with how the members stand, while every target still reads as
+// copying, and the targets' stopped state once the server reports it.
 func TestRolloutViewAcknowledgesAPendingStop(t *testing.T) {
 	m := tallRollout(4)
 	m.stopTriggered = true
 	lines := strings.Split(m.View(), "\n")
 	require.GreaterOrEqual(t, len(lines), 2)
-	assert.True(t, strings.HasSuffix(lines[0], "Stopping..."), "status line acknowledges the stop: %q", lines[0])
-	assert.Equal(t, "Deployments: 4 running", lines[1], "the targets keep their reported state until the stop lands")
+	assert.True(t, strings.HasSuffix(stripANSI(lines[0]), "Stopping on all 4 deployments..."), "status line acknowledges the stop and keeps the targets' counts: %q", lines[0])
+	assert.Contains(t, m.View(), "running table copy", "the targets keep their reported state until the stop lands")
 
 	m.state = state.Apply.Stopped
 	for i := range m.operations {
 		m.operations[i].State = state.ApplyOperation.Stopped
 		m.tables[i].Status = state.Task.Stopped
 	}
-	assert.NotContains(t, m.View(), "Stopping...")
+	assert.NotContains(t, m.View(), "Stopping")
 }

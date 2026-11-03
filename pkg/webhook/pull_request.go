@@ -583,7 +583,7 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 	if config := h.service.Config(); config != nil {
 		tenant = config.Tenant
 	}
-	commandScopeDatabases := h.autoPlanCommandScopeDatabases(ctx, client, repo, pr, headSHA, changedFiles)
+	commandScopeDatabases := h.autoPlanCommandScopeDatabases(ctx, client, repo, pr, headSHA, changedFiles, files, discovered)
 	for _, cfg := range configs {
 		database := cfg.Config.Database
 		h.goSafe(repo, pr, installationID, deliveryID, func() {
@@ -607,21 +607,50 @@ const severalDatabases = 2
 // bare command it would then offer comes back rejected as ambiguous, or starts
 // a database its comment is not about.
 //
+// Discovery resolves each file's config on its own, so the raw files reach what
+// auto-plan discovered over the proposed files plus what the files narrowing
+// set aside reach. Only those are walked again: the count shares the delivery's
+// deadline with discovery, and a second walk over every file can find that
+// deadline already spent on a large PR.
+//
 // A discovery failure counts as several: naming the database always yields a
 // command that resolves, so an unanswerable question degrades to the scoped
 // rendering rather than to a command that may not work.
-func (h *Handler) autoPlanCommandScopeDatabases(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA string, changedFiles []ghclient.PRFile) int {
-	configs, err := client.FindConfigsForPRFiles(ctx, repo, headSHA, changedFiles)
-	if err != nil {
-		h.logger.Warn("failed to resolve which databases a bare command would reach; auto-plan comments will name their database",
-			"repo", repo, "pr", pr, "head_sha", headSHA, "error", err)
-		return severalDatabases
+func (h *Handler) autoPlanCommandScopeDatabases(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA string, changedFiles, proposedFiles []ghclient.PRFile, discovered []ghclient.DiscoveredConfig) int {
+	configs := slices.Clone(discovered)
+	if narrowed := filesNarrowedAway(changedFiles, proposedFiles); len(narrowed) > 0 {
+		narrowedConfigs, err := client.FindConfigsForPRFiles(ctx, repo, headSHA, narrowed)
+		if err != nil {
+			h.logger.Warn("failed to resolve which databases a bare command would reach; auto-plan comments will name their database",
+				"repo", repo, "pr", pr, "head_sha", headSHA, "narrowed_files", len(narrowed), "error", err)
+			return severalDatabases
+		}
+		configs = append(configs, narrowedConfigs...)
 	}
 	databases := make(map[string]struct{}, len(configs))
 	for _, cfg := range configs {
 		databases[cfg.Config.Database] = struct{}{}
 	}
 	return len(databases)
+}
+
+// filesNarrowedAway returns the changed files the proposed list does not carry
+// as they are: the files narrowing dropped as inherited, and the renames it kept
+// with their vacated path cleared. Each is returned as it was changed, so
+// discovery over it sees what a bare command sees.
+func filesNarrowedAway(changed, proposed []ghclient.PRFile) []ghclient.PRFile {
+	type fileKey struct{ filename, previous string }
+	kept := make(map[fileKey]struct{}, len(proposed))
+	for _, file := range proposed {
+		kept[fileKey{file.Filename, file.PreviousFilename}] = struct{}{}
+	}
+	var narrowed []ghclient.PRFile
+	for _, file := range changed {
+		if _, ok := kept[fileKey{file.Filename, file.PreviousFilename}]; !ok {
+			narrowed = append(narrowed, file)
+		}
+	}
+	return narrowed
 }
 
 // autoPlanInputsMoved reports whether the PR changed underneath a plan that is
