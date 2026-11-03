@@ -270,32 +270,45 @@ func (s *applyOperationStore) ListRecentTargets(ctx context.Context, databaseTyp
 }
 
 // ListActiveDeferredCutoverWidths returns, for each unsettled apply started
-// with --defer-cutover, the most of its work operations still to drive that
-// would hold at its cutover at once (storage.DeferredCutoverHeldAtOnce), read
-// from the same applies.options key the deferred-work claim filter reads. A
-// stopped apply keeps its count: its drives have ended, but starting it again
-// resumes them without passing admission, so its drivers stay reserved until
-// it settles.
+// with --defer-cutover that no other apply took over, the most of its work
+// operations still to drive that would hold at its cutover at once under
+// max_drivers_per_apply (storage.DeferredCutoverHeldAtOnce), read from the
+// same applies.options key the deferred-work claim filter reads. A stopped
+// apply keeps its count: its drives have ended, but starting it again resumes
+// them without passing admission, so its drivers stay reserved until it
+// settles. A stopped apply another apply took over can never be started
+// again, so it holds nothing.
 func (s *applyOperationStore) ListActiveDeferredCutoverWidths(ctx context.Context) ([]storage.DeferredCutoverWidth, error) {
-	return listActiveDeferredCutoverWidths(ctx, s.db, s.dialect)
+	return listActiveDeferredCutoverWidths(ctx, s.db, s.dialect, s.maxDriversPerApply)
 }
 
 // listActiveDeferredCutoverWidths runs ListActiveDeferredCutoverWidths on q, so
-// deferred cutover admission can read it inside the create transaction.
-func listActiveDeferredCutoverWidths(ctx context.Context, q rowsQueryer, dialect Dialect) ([]storage.DeferredCutoverWidth, error) {
+// deferred cutover admission can read it inside the create transaction,
+// leaving out the stopped applies whose work the apply being admitted takes
+// over, by row ID.
+func listActiveDeferredCutoverWidths(ctx context.Context, q rowsQueryer, dialect Dialect, maxDriversPerApply int, takenOverApplyIDs ...int64) ([]storage.DeferredCutoverWidth, error) {
 	settled := settledApplyStates()
 	args := stringArgs(settled)
 	args = append(args, stringArgs(settled)...)
 	args = append(args, storage.ApplyOperationKindWork)
+	takenOver := ""
+	if len(takenOverApplyIDs) > 0 {
+		takenOver = `
+			AND a.id NOT IN (` + placeholders(len(takenOverApplyIDs)) + `)`
+		for _, id := range takenOverApplyIDs {
+			args = append(args, id)
+		}
+	}
 	rows, err := q.QueryContext(ctx, `
 		SELECT a.apply_identifier, a.database_name, a.environment,
-			ao.deployment, ao.target, ao.rollout_step, ao.cutover_policy, ao.state, ao.operation_kind
+			ao.deployment, ao.target, ao.cutover_policy, ao.state, ao.operation_kind
 		FROM apply_operations ao
 		JOIN applies a ON a.id = ao.apply_id
 		WHERE `+dialect.JSONBooleanIsTrue("a.options", []string{"defer_cutover"})+`
 			AND a.state NOT IN (`+placeholders(len(settled))+`)
+			AND a.superseded_by = ''
 			AND ao.state NOT IN (`+placeholders(len(settled))+`)
-			AND ao.operation_kind = ?
+			AND ao.operation_kind = ?`+takenOver+`
 		ORDER BY a.apply_identifier, ao.id`, args...)
 	if err != nil {
 		return nil, fmt.Errorf("query active deferred cutover operations: %w", err)
@@ -306,7 +319,7 @@ func listActiveDeferredCutoverWidths(ctx context.Context, q rowsQueryer, dialect
 	var ops []*storage.ApplyOperation
 	flush := func() {
 		if len(widths) > 0 {
-			widths[len(widths)-1].Operations = storage.DeferredCutoverHeldAtOnce(ops)
+			widths[len(widths)-1].Operations = storage.DeferredCutoverHeldAtOnce(ops, maxDriversPerApply)
 		}
 		ops = nil
 	}
@@ -314,7 +327,7 @@ func listActiveDeferredCutoverWidths(ctx context.Context, q rowsQueryer, dialect
 		var width storage.DeferredCutoverWidth
 		op := &storage.ApplyOperation{}
 		if err := rows.Scan(&width.ApplyIdentifier, &width.Database, &width.Environment,
-			&op.Deployment, &op.Target, &op.RolloutStep, &op.CutoverPolicy, &op.State, &op.OperationKind); err != nil {
+			&op.Deployment, &op.Target, &op.CutoverPolicy, &op.State, &op.OperationKind); err != nil {
 			return nil, fmt.Errorf("scan active deferred cutover operation: %w", err)
 		}
 		if len(widths) == 0 || widths[len(widths)-1].ApplyIdentifier != width.ApplyIdentifier {

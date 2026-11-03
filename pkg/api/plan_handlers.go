@@ -1516,8 +1516,8 @@ func (s *Service) handleApply(w http.ResponseWriter, r *http.Request) {
 			s.writeErrorCode(w, http.StatusBadRequest, apitypes.ErrCodeInvalidRequest, "apply rejected: "+err.Error())
 			return
 		}
-		if _, ok := errors.AsType[*DeferredCutoverCapacityError](err); ok {
-			s.writeErrorCode(w, http.StatusConflict, apitypes.ErrCodeInvalidRequest, "apply rejected: "+err.Error())
+		if refused, ok := errors.AsType[*DeferredCutoverCapacityError](err); ok {
+			s.writeErrorCode(w, deferredCutoverRefusalStatus(refused), apitypes.ErrCodeDeferredCutoverCapacity, "apply rejected: "+err.Error())
 			return
 		}
 		if storageErr, ok := errors.AsType[*applyStorageError](err); ok {
@@ -2186,10 +2186,7 @@ func (s *Service) createStoredApply(
 	}
 	logRolloutShape(s.logger, plan, req.Environment, members, groups, shardedFanout)
 	if applyOpts.DeferCutover {
-		apply.DeferredCutoverOperations = deferredCutoverWidth(groups)
-		if refused := s.deferredCutoverPerApplyCapRefusal(plan, req.Environment, applyIdentifier, caller, apply.DeferredCutoverOperations); refused != nil {
-			return nil, 0, refused
-		}
+		apply.DeferredCutoverOperations = s.deferredCutoverWidth(groups)
 	}
 
 	storedApplyID, err := s.storage.Applies().CreateWithGroupedOperations(ctx, apply, groups)

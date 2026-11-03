@@ -231,6 +231,18 @@ change that the plan the caller reviewed never disclosed is refused as
 was not shown: review that member's own plan and apply it in an apply narrowed
 to that member.
 
+An apply started with `--defer-cutover` that would hold more drivers at its
+cutover than are left for deferred work is refused with
+`deferred_cutover_capacity` ([Deferred cutover capacity](configuration.md#deferred-cutover-capacity)).
+Its status says whether waiting can help:
+
+- `409 deferred_cutover_capacity` means other deferred applies hold the rest
+  of the capacity, or no server has reported its drivers yet. The `error`
+  names the holding applies. Retry once they are cut over or cancelled, or
+  apply without `--defer-cutover`.
+- `422 deferred_cutover_capacity` means the apply is wider than every live
+  deferred driver together. Apply without `--defer-cutover`.
+
 No apply record is created for any of these refusals. Match `error_code`
 rather than parsing the human-readable `error` field.
 

@@ -1208,14 +1208,15 @@ type Apply struct {
 	TakesOverApplyIDs []int64
 
 	// DeferredCutoverOperations is how many operations this apply would hold
-	// at a deferred cutover at once. When it is two or more, the apply store's
-	// create methods admit the apply only if those operations
-	// fit, beside every other admitted deferred apply of two or more, in the
-	// deferred cutover drivers of the live operator servers, and refuse it
-	// with a *DeferredCutoverCapacityError otherwise. Admission is serialized
-	// across every server and read in the transaction that stores the apply,
-	// so two applies admitted at once cannot together exceed the drivers. It
-	// is not persisted.
+	// at a deferred cutover at once (DeferredCutoverHeldAtOnce). When it is
+	// two or more, the apply store's create methods that store operations
+	// admit the apply only if those operations fit, beside every other
+	// admitted deferred apply, in the deferred cutover drivers of the live
+	// operator servers, and refuse it with a *DeferredCutoverCapacityError
+	// otherwise; Create, which stores none, refuses it. Admission is
+	// serialized across every server and read in the transaction that stores
+	// the apply, so two applies admitted at once cannot together exceed the
+	// drivers. It is not persisted.
 	DeferredCutoverOperations int
 
 	// Engine is the schema change engine: "spirit", "planetscale", etc.
@@ -1387,10 +1388,10 @@ type OperatorServer struct {
 }
 
 // DeferredCutoverCapacityError is apply creation refusing an apply deferring
-// its cutover whose operations could not all wait at the cutover at once. Each
-// waiting operation keeps its driver and the apply is ready only when every
-// one waits, so an apply wider than the drivers left for it would hold part of
-// them, with nothing ever cut over, until it timed out.
+// its cutover that would keep more drivers waiting there than the live
+// operator servers have left for deferred work. Each waiting operation keeps
+// its driver until an operator cuts it over, so admitting past that capacity
+// would leave every deferred driver waiting on a person.
 type DeferredCutoverCapacityError struct {
 	// Operations is how many operations the refused apply would hold.
 	Operations int

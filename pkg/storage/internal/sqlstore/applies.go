@@ -59,6 +59,9 @@ type applyStore struct {
 	// session-scoped advisory lock held on the pinned apply connection. It must
 	// match the storage database's family.
 	locker namedlock.Locker
+	// maxDriversPerApply caps how many operations one apply runs at once, and
+	// so how many it can keep waiting at a deferred cutover.
+	maxDriversPerApply int
 }
 
 type applyWriteTx struct {
@@ -971,6 +974,9 @@ func (s *applyStore) Create(ctx context.Context, apply *storage.Apply) (int64, e
 	if len(apply.TakesOverApplyIDs) > 0 {
 		return 0, fmt.Errorf("create apply %s: taking over stopped applies is recorded only by the create paths that write rows in one transaction", apply.ApplyIdentifier)
 	}
+	if apply.DeferredCutoverOperations > 1 {
+		return 0, fmt.Errorf("create apply %s: deferred cutover admission counts the operations an apply stores, so it runs only on the create paths that store them", apply.ApplyIdentifier)
+	}
 	canonicalizeApplyIdentity(apply)
 	canonicalizeApplyState(apply)
 
@@ -981,14 +987,10 @@ func (s *applyStore) Create(ctx context.Context, apply *storage.Apply) (int64, e
 	}
 
 	lockTarget := isActiveApplyState(apply.State)
-	admitDeferred := apply.DeferredCutoverOperations > 1
-	if admitDeferred && !lockTarget {
-		return 0, fmt.Errorf("create apply %s: deferred cutover admission requires an active apply, got state %s", apply.ApplyIdentifier, apply.State)
-	}
 	var writeTx *applyWriteTx
 	var err error
 	if lockTarget {
-		writeTx, err = beginApplyTargetWriteTxLocking(ctx, s.db, s.locker, "create apply", apply.Database, apply.DatabaseType, apply.Environment, admitDeferred)
+		writeTx, err = beginApplyTargetWriteTxLocking(ctx, s.db, s.locker, "create apply", apply.Database, apply.DatabaseType, apply.Environment, false)
 		if err != nil {
 			return 0, err
 		}
@@ -1007,10 +1009,6 @@ func (s *applyStore) Create(ctx context.Context, apply *storage.Apply) (int64, e
 		if err := checkNoActiveApplyForTargets(ctx, writeTx.tx, s.dialect, apply.Database, apply.DatabaseType, apply.Environment, []string{apply.Deployment}, 0); err != nil {
 			return 0, err
 		}
-	}
-
-	if err := admitDeferredCutover(ctx, writeTx.tx, s.dialect, apply); err != nil {
-		return 0, err
 	}
 
 	expectedOperationKeys, err := expectedOperationKeysValue(apply)
@@ -1303,7 +1301,7 @@ func (s *applyStore) createWithRowsOnce(ctx context.Context, apply *storage.Appl
 		}
 	}
 
-	if err := admitDeferredCutover(ctx, writeTx.tx, s.dialect, apply); err != nil {
+	if err := admitDeferredCutover(ctx, writeTx.tx, s.dialect, apply, s.maxDriversPerApply); err != nil {
 		return 0, err
 	}
 

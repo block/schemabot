@@ -54,34 +54,51 @@ func TestOperatorServers(t *testing.T, h Harness) {
 
 	// AdmitsDeferredCutoverWithinLiveDrivers verifies apply creation counts
 	// a wide deferred apply against the deferred cutover drivers of the live
-	// operator servers and the wide deferred applies already admitted: two
-	// servers leave 6 drivers for deferred work, a 4-operation apply is
-	// admitted, and a second 4-operation apply is refused with nothing
-	// stored, naming the apply that holds the rest.
+	// operator servers and the deferred applies already admitted: two servers
+	// leave 4 drivers for deferred work, two 2-operation applies fill them,
+	// and a third is refused with nothing stored, naming the applies that
+	// hold the rest.
 	t.Run("AdmitsDeferredCutoverWithinLiveDrivers", func(t *testing.T) {
 		ctx := t.Context()
 		store := h.NewStorage(t)
-		heartbeat(t, store, "host-a/1/operator", 4, 3)
-		heartbeat(t, store, "host-b/1/operator", 4, 3)
+		heartbeat(t, store, "host-a/1/operator", 3, 2)
+		heartbeat(t, store, "host-b/1/operator", 3, 2)
 
-		_, err := createDeferredApply(t, store, "apply_deferred_first", "orders", 4)
+		_, err := createDeferredApply(t, store, "apply_deferred_first", "orders", 2)
 		require.NoError(t, err)
+		_, err = createDeferredApply(t, store, "apply_deferred_second", "inventory", 2)
+		require.NoError(t, err, "2 more operations fill the 4 drivers exactly")
 
-		_, err = createDeferredApply(t, store, "apply_deferred_second", "payments", 4)
+		_, err = createDeferredApply(t, store, "apply_deferred_third", "payments", 2)
 		refused, ok := errors.AsType[*storage.DeferredCutoverCapacityError](err)
 		require.True(t, ok, "got %v", err)
 		assert.Equal(t, storage.DeferredCutoverCapacityError{
-			Operations: 4, Reserved: 4, Capacity: 6, LiveServers: 2,
-			HoldingApplyIDs: []string{"apply_deferred_first"},
+			Operations: 2, Reserved: 4, Capacity: 4, LiveServers: 2,
+			HoldingApplyIDs: []string{"apply_deferred_first", "apply_deferred_second"},
 		}, *refused)
 		assert.False(t, refused.ExceedsCapacity())
 
-		stored, err := store.Applies().GetByApplyIdentifier(ctx, "apply_deferred_second")
+		stored, err := store.Applies().GetByApplyIdentifier(ctx, "apply_deferred_third")
 		require.NoError(t, err)
 		assert.Nil(t, stored, "a refused apply is not stored")
+	})
 
-		_, err = createDeferredApply(t, store, "apply_deferred_fits", "inventory", 2)
-		require.NoError(t, err, "2 more operations fill the 6 drivers exactly")
+	// AdmitsAtMostMaxDriversPerApplyOfAnApply verifies an admitted apply wider
+	// than max_drivers_per_apply counts only the cap against later applies:
+	// its waiting operations keep counting against the cap, so it never holds
+	// more drivers than that at its cutover.
+	t.Run("AdmitsAtMostMaxDriversPerApplyOfAnApply", func(t *testing.T) {
+		store := h.NewStorage(t)
+		heartbeat(t, store, "host-a/1/operator", 4, 3)
+
+		_, err := createDeferredApply(t, store, "apply_deferred_fanout", "orders", 8)
+		require.NoError(t, err)
+
+		_, err = createDeferredApply(t, store, "apply_deferred_after_fanout", "payments", 3)
+		refused, ok := errors.AsType[*storage.DeferredCutoverCapacityError](err)
+		require.True(t, ok, "got %v", err)
+		assert.Equal(t, storage.DefaultMaxDriversPerApply, refused.Reserved, "the 8-operation apply holds the cap")
+		assert.Equal(t, storage.DefaultMaxDriversPerApply, refused.Operations, "the refused apply asks for the cap")
 	})
 
 	// RefusesDeferredCutoverWiderThanLiveDrivers verifies an apply wider than
@@ -97,19 +114,19 @@ func TestOperatorServers(t *testing.T, h Harness) {
 		assert.Equal(t, 0, refused.LiveServers)
 		assert.True(t, refused.ExceedsCapacity())
 
-		heartbeat(t, store, "host-a/1/operator", 4, 3)
-		_, err = createDeferredApply(t, store, "apply_too_wide", "orders", 4)
+		heartbeat(t, store, "host-a/1/operator", 2, 1)
+		_, err = createDeferredApply(t, store, "apply_too_wide", "orders", 2)
 		refused, ok = errors.AsType[*storage.DeferredCutoverCapacityError](err)
 		require.True(t, ok, "got %v", err)
-		assert.Equal(t, storage.DeferredCutoverCapacityError{Operations: 4, Capacity: 3, LiveServers: 1}, *refused)
+		assert.Equal(t, storage.DeferredCutoverCapacityError{Operations: 2, Capacity: 1, LiveServers: 1}, *refused)
 		assert.True(t, refused.ExceedsCapacity())
 	})
 
-	// SingleOperationDeferredCutoverIsNotCounted verifies a deferred apply of
-	// one operation is admitted with no live server and is not counted
-	// against later wide applies: it is ready to cut over as soon as its own
-	// operation waits, so it never holds a driver waiting on another.
-	t.Run("SingleOperationDeferredCutoverIsNotCounted", func(t *testing.T) {
+	// SingleOperationDeferredCutoverIsAdmittedAndCounted verifies a deferred
+	// apply of one operation is admitted with no live server, since its one
+	// cutover command reaches all of it, and that its waiting operation
+	// still counts against later wide applies.
+	t.Run("SingleOperationDeferredCutoverIsAdmittedAndCounted", func(t *testing.T) {
 		store := h.NewStorage(t)
 
 		_, err := createDeferredApply(t, store, "apply_single", "orders", 1)
@@ -117,19 +134,30 @@ func TestOperatorServers(t *testing.T, h Harness) {
 
 		heartbeat(t, store, "host-a/1/operator", 3, 2)
 		_, err = createDeferredApply(t, store, "apply_wide", "payments", 2)
-		require.NoError(t, err)
+		refused, ok := errors.AsType[*storage.DeferredCutoverCapacityError](err)
+		require.True(t, ok, "got %v", err)
+		assert.Equal(t, storage.DeferredCutoverCapacityError{
+			Operations: 2, Reserved: 1, Capacity: 2, LiveServers: 1,
+			HoldingApplyIDs: []string{"apply_single"},
+		}, *refused)
+
+		heartbeat(t, store, "host-b/1/operator", 2, 1)
+		_, err = createDeferredApply(t, store, "apply_wide", "payments", 2)
+		require.NoError(t, err, "a second server's driver makes room beside the single apply")
 	})
 
 	// StoppedDeferredApplyKeepsItsReservation verifies a stopped wide deferred
 	// apply still counts against the live drivers: starting it again resumes
 	// its operations without passing admission, so another wide deferred
-	// apply admitted into its drivers would leave both short.
+	// apply admitted into its drivers would leave both short. Once an apply
+	// takes over its work it can never be started again, so it stops counting,
+	// including for the apply that takes it over.
 	t.Run("StoppedDeferredApplyKeepsItsReservation", func(t *testing.T) {
 		ctx := t.Context()
 		store := h.NewStorage(t)
 		heartbeat(t, store, "host-a/1/operator", 4, 3)
 
-		id, err := createDeferredApply(t, store, "apply_deferred_stopped", "orders", 3)
+		id, err := createDeferredApply(t, store, "apply_deferred_stopped", "orders", 2)
 		require.NoError(t, err)
 		stopped, err := store.Applies().Get(ctx, id)
 		require.NoError(t, err)
@@ -143,15 +171,23 @@ func TestOperatorServers(t *testing.T, h Harness) {
 		refused, ok := errors.AsType[*storage.DeferredCutoverCapacityError](err)
 		require.True(t, ok, "got %v", err)
 		assert.Equal(t, storage.DeferredCutoverCapacityError{
-			Operations: 2, Reserved: 3, Capacity: 3, LiveServers: 1,
+			Operations: 2, Reserved: 2, Capacity: 3, LiveServers: 1,
 			HoldingApplyIDs: []string{"apply_deferred_stopped"},
 		}, *refused)
+
+		_, err = createDeferredApply(t, store, "apply_deferred_takeover", "orders", 2, id)
+		require.NoError(t, err, "the apply taking over the stopped one does not count it")
+
+		_, err = createDeferredApply(t, store, "apply_deferred_after_takeover", "payments", 2)
+		refused, ok = errors.AsType[*storage.DeferredCutoverCapacityError](err)
+		require.True(t, ok, "got %v", err)
+		assert.Equal(t, []string{"apply_deferred_takeover"}, refused.HoldingApplyIDs, "the superseded apply holds nothing")
 	})
 
 	// ConcurrentDeferredCutoverAdmissionsAdmitOne verifies admission is
 	// serialized across creators: several wide deferred applies on different
-	// databases, any one of which fills the live drivers, race to be created,
-	// and exactly one is admitted.
+	// databases, any one of which leaves too few live drivers for another,
+	// race to be created, and exactly one is admitted.
 	t.Run("ConcurrentDeferredCutoverAdmissionsAdmitOne", func(t *testing.T) {
 		store := h.NewStorage(t)
 		heartbeat(t, store, "host-a/1/operator", 4, 3)
@@ -161,7 +197,7 @@ func TestOperatorServers(t *testing.T, h Harness) {
 		var wg sync.WaitGroup
 		for i := range creators {
 			wg.Go(func() {
-				_, results[i] = createDeferredApply(t, store, fmt.Sprintf("apply_race_%d", i), fmt.Sprintf("race_%d", i), 3)
+				_, results[i] = createDeferredApply(t, store, fmt.Sprintf("apply_race_%d", i), fmt.Sprintf("race_%d", i), 2)
 			})
 		}
 		wg.Wait()
@@ -188,9 +224,10 @@ func heartbeat(t *testing.T, store storage.Storage, serverID string, drivers, de
 }
 
 // createDeferredApply creates a pending apply deferring its cutover on
-// database, with one work operation per shard, asking admission for all of
-// them.
-func createDeferredApply(t *testing.T, store storage.Storage, applyID, database string, shards int) (int64, error) {
+// database, with one work operation per shard, asking admission for as many
+// of them as max_drivers_per_apply lets it hold at once, as apply creation
+// does. It takes over the stopped applies takesOver names.
+func createDeferredApply(t *testing.T, store storage.Storage, applyID, database string, shards int, takesOver ...int64) (int64, error) {
 	t.Helper()
 	now := time.Now()
 	apply := &storage.Apply{
@@ -203,7 +240,8 @@ func createDeferredApply(t *testing.T, store storage.Storage, applyID, database 
 		Engine:                    storage.EngineSpirit,
 		State:                     state.Apply.Pending,
 		Options:                   []byte(`{"defer_cutover":true}`),
-		DeferredCutoverOperations: shards,
+		DeferredCutoverOperations: min(shards, storage.DefaultMaxDriversPerApply),
+		TakesOverApplyIDs:         takesOver,
 		CreatedAt:                 now,
 		UpdatedAt:                 now,
 	}

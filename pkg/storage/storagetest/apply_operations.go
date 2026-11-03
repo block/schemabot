@@ -1948,7 +1948,8 @@ func TestApplyOperations(t *testing.T, h Harness) {
 
 	// ListActiveDeferredCutoverWidths verifies the count apply admission sizes
 	// a deferred cutover against: per active apply started with
-	// --defer-cutover, the work operations still to drive. Settled work and
+	// --defer-cutover, the work operations still to drive that it holds at
+	// once, never more than max_drivers_per_apply. Settled work and
 	// finalizers are not counted, and neither are applies that do not defer
 	// their cutover or have settled. A stopped apply and its stopped
 	// operations are counted, since starting it again resumes them.
@@ -2016,11 +2017,11 @@ func TestApplyOperations(t *testing.T, h Harness) {
 		widths, err := store.ApplyOperations().ListActiveDeferredCutoverWidths(ctx)
 		require.NoError(t, err)
 		assert.Equal(t, []storage.DeferredCutoverWidth{
-			{ApplyIdentifier: "apply_deferred_barrier", Database: barrier.Database, Environment: "staging", Operations: 3},
+			{ApplyIdentifier: "apply_deferred_barrier", Database: barrier.Database, Environment: "staging", Operations: storage.DefaultMaxDriversPerApply},
 			{ApplyIdentifier: "apply_deferred_narrow", Database: narrow.Database, Environment: "staging", Operations: 1},
 			{ApplyIdentifier: "apply_deferred_rolling", Database: rolling.Database, Environment: "staging", Operations: 2},
 			{ApplyIdentifier: "apply_deferred_stopped", Database: paused.Database, Environment: "staging", Operations: 2},
-			{ApplyIdentifier: "apply_deferred_wide", Database: wide.Database, Environment: "staging", Operations: 3},
+			{ApplyIdentifier: "apply_deferred_wide", Database: wide.Database, Environment: "staging", Operations: storage.DefaultMaxDriversPerApply},
 		}, widths)
 	})
 

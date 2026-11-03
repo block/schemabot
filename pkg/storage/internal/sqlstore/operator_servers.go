@@ -18,8 +18,7 @@ type operatorServerStore struct {
 }
 
 // Heartbeat upserts the server's row, stamping updated_at, the row's
-// heartbeat, at the database's clock, then removes
-// rows not heard from within storage.OperatorServerRetention.
+// heartbeat, at the database's clock.
 func (s *operatorServerStore) Heartbeat(ctx context.Context, server *storage.OperatorServer) error {
 	if server == nil || server.ServerID == "" {
 		return fmt.Errorf("heartbeat operator server: server ID is required")
@@ -39,6 +38,12 @@ func (s *operatorServerStore) Heartbeat(ctx context.Context, server *storage.Ope
 		`+upsert, server.ServerID, server.Drivers, server.DeferredCutoverDrivers); err != nil {
 		return fmt.Errorf("heartbeat operator server %s: %w", server.ServerID, err)
 	}
+	return nil
+}
+
+// PruneStale deletes the rows not heard from within
+// storage.OperatorServerRetention, at the database's clock.
+func (s *operatorServerStore) PruneStale(ctx context.Context) error {
 	if _, err := s.db.ExecContext(ctx, `
 		DELETE FROM operator_servers
 		WHERE updated_at < `+operatorServerCutoff(s.dialect, storage.OperatorServerRetention.Microseconds()),
@@ -102,13 +107,17 @@ type rowsQueryer interface {
 }
 
 // admitDeferredCutover refuses apply with a *storage.DeferredCutoverCapacityError
-// when its deferred cutover operations, added to those of the other admitted
-// deferred applies of two or more operations, exceed the deferred cutover
-// drivers of the live operator servers. An apply of one operation is ready to
-// cut over as soon as its own operation waits, so it never holds a driver
-// while waiting on another and is neither checked nor counted. The caller
-// holds deferredCutoverAdmissionLockName.
-func admitDeferredCutover(ctx context.Context, tx rowsQueryer, dialect Dialect, apply *storage.Apply) error {
+// when its deferred cutover operations, added to those of every other
+// admitted deferred apply, exceed the deferred cutover drivers of the live
+// operator servers. Each waiting operation keeps its driver until an operator
+// cuts it over, so the count is of drivers deferred work keeps waiting on a
+// person. An apply of one operation is admitted without the check: it holds
+// one driver and is ready as soon as that operation waits, so its one cutover
+// command reaches all of it. It still counts toward what the applies after it
+// see as held. A stopped apply whose work apply takes over is not counted,
+// since apply holds that work from now on. The caller holds
+// deferredCutoverAdmissionLockName.
+func admitDeferredCutover(ctx context.Context, tx rowsQueryer, dialect Dialect, apply *storage.Apply, maxDriversPerApply int) error {
 	if apply.DeferredCutoverOperations <= 1 {
 		return nil
 	}
@@ -126,14 +135,11 @@ func admitDeferredCutover(ctx context.Context, tx rowsQueryer, dialect Dialect, 
 		return refused
 	}
 
-	widths, err := listActiveDeferredCutoverWidths(ctx, tx, dialect)
+	widths, err := listActiveDeferredCutoverWidths(ctx, tx, dialect, maxDriversPerApply, apply.TakesOverApplyIDs...)
 	if err != nil {
 		return fmt.Errorf("admit deferred cutover of apply %s: %w", apply.ApplyIdentifier, err)
 	}
 	for _, width := range widths {
-		if width.Operations <= 1 {
-			continue
-		}
 		refused.Reserved += width.Operations
 		refused.HoldingApplyIDs = append(refused.HoldingApplyIDs, width.ApplyIdentifier)
 	}

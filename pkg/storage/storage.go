@@ -398,9 +398,13 @@ type OperatorServerStore interface {
 	// Heartbeat records that server's operator is running now, with its
 	// driver counts, creating its row on the first beat. The time recorded is
 	// the database's clock, so servers whose clocks disagree are still
-	// compared on one. It also removes rows not heard from within
-	// OperatorServerRetention.
+	// compared on one.
 	Heartbeat(ctx context.Context, server *OperatorServer) error
+
+	// PruneStale removes the rows not heard from within
+	// OperatorServerRetention. A stale row already stops counting once it
+	// leaves OperatorServerLiveWindow, so pruning only keeps the table small.
+	PruneStale(ctx context.Context) error
 
 	// Deregister removes server's row. Removing a row that does not exist is
 	// not an error.
