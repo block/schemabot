@@ -143,7 +143,9 @@ type Lock struct {
 
 	// DisclosedCopyDiscard records that the comment this pending confirmation
 	// was posted with told the operator applying would throw away an unfinished
-	// row copy on the target. It is a consent record, and its question is
+	// row copy on a target the apply runs, the primary target or any other
+	// target whose plan the apply runs alongside it. It is a consent record,
+	// and its question is
 	// exactly "were they shown a discard at all?" — not which copy, or how
 	// many. An apply that finds a larger discard set than the one disclosed
 	// therefore still proceeds; narrowing that to the copies actually named

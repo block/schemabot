@@ -203,3 +203,57 @@ func TestRenderPlanComment_PrimaryTargetCreationNeverCarriesAnotherTargetsAttrib
 	assert.NotContains(t, body, "(changed by open PR", "no finding carries the attribution")
 	assert.Contains(t, body, "**Check before applying**: 1 destructive change SchemaBot cannot attribute to this PR")
 }
+
+// withCopyOnOrdersC adds orders_c, as withDistinctPlan does, holding an
+// unfinished copy of orders that applying its own plan discards.
+func withCopyOnOrdersC(data PlanCommentData) PlanCommentData {
+	data = withDistinctPlan(data)
+	drift := *data.DeploymentDrift
+	drift.DiscardedCopies = []TargetExistingCopy{{
+		Target: "shop/orders_c",
+		Copy: ExistingCopyData{
+			Namespace: "orders", Tables: []string{"orders"}, Reason: engine.DiscardStatementDiffers, Age: "40m",
+			Statement: "ALTER TABLE `orders` ADD COLUMN `memo` text",
+		}},
+	}
+	data.DeploymentDrift = &drift
+	return data
+}
+
+// A copy on a target other than the primary is written under that target's
+// own plan, beside the primary's under the primary's, so the comment the
+// operator confirms names every copy the apply destroys and where it is. The
+// refusal of an unsafe change discloses no copies, the other target's
+// included, as a single target's refusal discloses none.
+func TestRenderPlanComment_RolloutDisclosesAnotherTargetsDiscardedCopyUnderItsPlan(t *testing.T) {
+	data := withCopyOnOrdersC(primaryDropsLegacyPlan("production"))
+	body := RenderPlanComment(data)
+
+	section := sectionOf(t, body, "### Target `shop/orders_c`")
+	assert.Contains(t, section, "ADD COLUMN `note`", "the copy follows the plan of the target it is on")
+	assert.Contains(t, section, "⚠️ **Applying destroys work in progress**: 1 unfinished copy on the target\n")
+	assert.Contains(t, section, "`orders` in `orders` (last progress 40m ago)")
+	assert.NotContains(t, section, "On target", "the heading already names the one target the copy is on")
+	assert.Equal(t, 2, strings.Count(body, "**Applying destroys work in progress**"), "the primary's copy and orders_c's each render once")
+
+	blocked := RenderUnsafeChangesBlocked(data)
+	assert.NotContains(t, blocked, "destroys work in progress", "a refusal discloses no existing copies")
+}
+
+// When every target with work runs one plan, that plan renders with no target
+// heading, so a copy on a target other than the primary names the target it
+// is on.
+func TestRenderPlanComment_SharedRolloutPlanNamesTheTargetHoldingACopy(t *testing.T) {
+	data := primaryDropsLegacyPlan("production")
+	drift := *data.DeploymentDrift
+	drift.Plans = []DeploymentPlanGroup{{Members: []string{"shop/orders_a", "shop/orders_b"}, Primary: true, Changes: data.Changes}}
+	drift.DiscardedCopies = []TargetExistingCopy{{
+		Target: "shop/orders_b",
+		Copy:   ExistingCopyData{Namespace: "orders", Tables: []string{"legacy"}, Reason: engine.DiscardStatementDiffers},
+	}}
+	data.DeploymentDrift = &drift
+
+	body := RenderPlanComment(data)
+	assert.Contains(t, body, "On target `shop/orders_a`:\n\n⚠️ **Applying destroys work in progress**")
+	assert.Contains(t, body, "On target `shop/orders_b`:\n\n⚠️ **Applying destroys work in progress**: 1 unfinished copy on the target\n- `legacy` in `orders`")
+}

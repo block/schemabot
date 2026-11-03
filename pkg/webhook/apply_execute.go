@@ -261,7 +261,7 @@ func (h *Handler) executeApply(
 					"environment", environment, "plan_id", planResp.PlanID, "error", err)
 				return
 			}
-			disclosesDiscard := len(planResp.DiscardedCopies()) > 0
+			disclosesDiscard := rolloutDiscardedCopies(planResp, rollout, runsMemberWork) > 0
 			if err := h.repinPendingConfirmation(ctx, repo, pr, database, dbType, environment, actionName, expectedPendingPlanID, planResp.PlanID, disclosesDiscard); err != nil {
 				if h.reportRepinRefused(err, repo, pr, installationID, repinRefusal) {
 					return
@@ -396,7 +396,7 @@ func (h *Handler) executeApply(
 			}
 			// The comment just posted renders this re-plan, so it discloses
 			// whatever unfinished copy the re-plan would discard.
-			disclosesDiscard := len(planResp.DiscardedCopies()) > 0
+			disclosesDiscard := rolloutDiscardedCopies(planResp, rollout, runsMemberWork) > 0
 			if err := h.repinPendingConfirmation(ctx, repo, pr, database, dbType, environment, actionName, expectedPendingPlanID, planResp.PlanID, disclosesDiscard); err != nil {
 				if h.reportRepinRefused(err, repo, pr, installationID, repinRefusal) {
 					return
@@ -421,11 +421,11 @@ func (h *Handler) executeApply(
 	//
 	// A discard the operator was already shown proceeds. They agreed to that
 	// cost, and asking again on every confirm would make the stop unpassable.
-	if discarded := planResp.DiscardedCopies(); len(discarded) > 0 && !disclosedCopyDiscard {
+	if discarded := rolloutDiscardedCopies(planResp, rollout, runsMemberWork); discarded > 0 && !disclosedCopyDiscard {
 		h.logger.Info("apply stopped for confirmation: re-plan discards an existing copy the disclosure did not show",
 			"repo", repo, "pr", pr, "database", database, "database_type", dbType,
 			"environment", environment, "action", actionName,
-			"plan_id", planResp.PlanID, "discarded_copies", len(discarded))
+			"plan_id", planResp.PlanID, "discarded_copies", discarded)
 		// The disclosure is posted before it is recorded. The record's whole
 		// claim is that the operator was shown the copy, so a post that never
 		// lands must leave no consent behind: the next attempt stops and asks

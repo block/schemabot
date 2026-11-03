@@ -531,7 +531,7 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 		Repository:           repo,
 		PullRequest:          pr,
 		PendingPlanID:        planResp.PlanID,
-		DisclosedCopyDiscard: len(planResp.DiscardedCopies()) > 0,
+		DisclosedCopyDiscard: rolloutDiscardedCopies(planResp, rollout, runsMemberWork) > 0,
 	}
 	if err := h.service.Storage().Locks().AcquireIfPendingPlanID(ctx, lock, ""); err != nil {
 		if errors.Is(err, storage.ErrLockHeld) {
@@ -605,10 +605,10 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	// two-step confirm against the locked comment that discloses what is being
 	// thrown away: the operator spends the hours, so the operator decides, and
 	// there is no flag that converts an automatic apply into that consent.
-	if discarded := planResp.DiscardedCopies(); len(discarded) > 0 {
+	if discarded := rolloutDiscardedCopies(planResp, rollout, runsMemberWork); discarded > 0 {
 		h.logger.Info("automatic apply downgraded: applying discards an existing copy",
 			"repo", repo, "pr", pr, "database", database, "environment", environment,
-			"discarded_copies", len(discarded))
+			"discarded_copies", discarded)
 		// Store the check record before posting the paused comment: the pause
 		// is acknowledged only once the stored check state blocks the merge
 		// gate on the pending changes. A storage failure releases the lock

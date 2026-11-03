@@ -1033,8 +1033,7 @@ The apply is refused instead, with nothing run and the record left
 `action_required` (or `failure` for drift), when a target could not be
 confirmed, when the comment cannot render every target's plan, or when a
 target's plan carries work the apply cannot run as planned. That is a change
-its engine refuses, an unfinished copy it would discard, or work the apply's
-operation shape has no place for. When the primary target is already at the
+its engine refuses, or work the apply's operation shape has no place for. When the primary target is already at the
 desired schema, that includes any per-shard or finalizer change on another
 target. These refusals come before the pause for a fresh confirmation, so an
 apply never asks for a confirmation that could not run. An unsafe change on
@@ -1046,9 +1045,13 @@ there as native DDL that blocks writes to the table until it finishes. An
 apply created any other way, such as a
 `POST /api/apply` of the primary target's plan, refuses another target's
 direct-execution change, and its unsafe changes unless the primary target's
-plan carries the same statement up to its schema qualifier. A target whose data plane
-could not say whether it holds an unfinished copy, because it does not look or
-its lookup failed, is refused the same way. The plan comment offers no apply
+plan carries the same statement up to its schema qualifier. An unfinished copy
+another target's plan would discard is not refused either: the comment names it
+under that target, and the apply pauses for apply-confirm as it does for a copy
+on the primary target, then runs every target's plan once confirmed. A target
+whose data plane could not say whether it holds an unfinished copy, because it
+does not look or its lookup failed, is refused, since the comment cannot
+disclose what the target did not report. The plan comment offers no apply
 for a rollout it knows would be refused, and says why in its place.
 
 Apply-confirm asks all of this again against the rollout as it is at confirm,
@@ -1135,7 +1138,7 @@ PR/environment/database.
 
 An automatic apply verifies that the stored plan is still current before it
 runs. If the PR head changed, the re-plan DDL differs from the stored plan, or
-the plan would discard an unfinished copy on the target, SchemaBot downgrades to
+the plan would discard an unfinished copy on any target the apply runs, SchemaBot downgrades to
 manual confirmation and leaves the check in `action_required`. There is no
 comment flag that skips this: `-y` belongs to the CLI, where it skips an
 interactive prompt.
