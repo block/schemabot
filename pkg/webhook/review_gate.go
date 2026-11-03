@@ -13,6 +13,7 @@ import (
 	"github.com/block/schemabot/pkg/ddl"
 	ghclient "github.com/block/schemabot/pkg/github"
 	schemadialect "github.com/block/schemabot/pkg/schema"
+	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/webhook/templates"
 )
 
@@ -312,8 +313,8 @@ type approvalCoverage struct {
 	inputPaths []string
 	// compareStatements proves a schema file that both the PR and the base
 	// branch edited generates no statement at the head that the approved
-	// commit did not, or is nil
-	// when the database's dialect has no such comparison.
+	// commit did not, or is nil when the database's dialect has no such
+	// comparison.
 	compareStatements ghclient.SchemaFileChangeComparer
 	verdicts          map[string]approvalVerdict
 }
@@ -323,16 +324,25 @@ type approvalCoverage struct {
 // compared by content alone and a file both the PR and the base branch edited
 // always counts as changed.
 //
-// MySQL-family files hold one CREATE TABLE each, which ddl.SameTableChange
-// compares from the files alone. PostgreSQL has no offline model of a schema
-// file, so the environment's primary target runs each version on a scratch
-// schema and compares what it built (see targetStatementComparer); a target
-// that cannot answer within the evaluation's budget leaves the file changed.
+// MySQL-family .sql files hold one CREATE TABLE each, which
+// ddl.SameTableChange compares from the files alone, and a Vitess keyspace's
+// vschema.json is compared from the files alone by ddl.SameVSchemaChange.
+// PostgreSQL has no offline model of a schema file, so the environment's
+// primary target runs each version on a scratch schema and compares what it
+// built (see targetStatementComparer); a target that cannot answer within the
+// evaluation's budget leaves the file changed.
 func (h *Handler) statementComparerFor(repo string, pr int, database, environment, databaseType string) ghclient.SchemaFileChangeComparer {
 	switch schemadialect.DialectForDatabaseType(databaseType) {
 	case schemadialect.DialectMySQL:
-		return func(_ context.Context, approvedBase, approved, headBase, head string) (bool, string, error) {
-			return ddl.SameTableChange(approvedBase, approved, headBase, head)
+		hasVSchema := strings.EqualFold(databaseType, storage.DatabaseTypeVitess)
+		return func(_ context.Context, filePath, approvedBase, approved, headBase, head string) (bool, string, error) {
+			if path.Base(filePath) != storage.VSchemaArtifactName {
+				return ddl.SameTableChange(approvedBase, approved, headBase, head)
+			}
+			if !hasVSchema {
+				return false, fmt.Sprintf("a %s database applies no VSchema, so its %s is not compared", databaseType, storage.VSchemaArtifactName), nil
+			}
+			return ddl.SameVSchemaChange(approvedBase, approved, headBase, head)
 		}
 	case schemadialect.DialectPostgres:
 		if h.service == nil {

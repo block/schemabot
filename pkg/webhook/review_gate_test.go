@@ -240,8 +240,9 @@ const (
 // branch moved underneath it. On a MySQL-family database that includes a
 // rebase that combined the PR's edit with a default branch edit to the same
 // table's file, as long as the PR's edit generates the same statements on
-// both bases and does not replace what the default branch changed. On
-// PostgreSQL the environment's target decides the same thing, and a file it
+// both bases and does not replace what the default branch changed, and, on
+// Vitess, a VSchema that routes every table as the approved commit and the
+// default branch do. On PostgreSQL the environment's target decides the same thing, and a file it
 // cannot compare is a change. When the PR's change differs
 // at the head, the PR is blocked until someone approves the head and the
 // comment says why. When the approved commit cannot be compared with the
@@ -284,6 +285,18 @@ func TestCheckReviewGate_ApprovalCoverage(t *testing.T) {
 	setPostgresOrders := func(columns string) func(map[string]string) {
 		return func(files map[string]string) {
 			files["schema/testdb/orders/orders.sql"] = "CREATE TABLE orders (" + columns + ");"
+		}
+	}
+	// setVSchema replaces the orders keyspace's VSchema with a sharded one
+	// routing each named table by the column given for it.
+	setVSchema := func(routing ...string) func(map[string]string) {
+		return func(files map[string]string) {
+			var tables []string
+			for i := 0; i+1 < len(routing); i += 2 {
+				tables = append(tables, fmt.Sprintf(`"%s": {"column_vindexes": [{"column": "%s", "name": "hash"}]}`, routing[i], routing[i+1]))
+			}
+			files["schema/testdb/orders/vschema.json"] = `{"sharded": true, "vindexes": {"hash": {"type": "hash"}}, "tables": {` +
+				strings.Join(tables, ", ") + `}}`
 		}
 	}
 	addVotesAnd := func(more func(map[string]string)) func(map[string]string) {
@@ -603,6 +616,31 @@ func TestCheckReviewGate_ApprovalCoverage(t *testing.T) {
 			baseChange:   setOrders("`id` bigint NOT NULL, `total` bigint"),
 			headChange:   setOrders("`id` bigint NOT NULL, `total` bigint, `note` text"),
 			want:         wantCovers,
+		},
+		{
+			name:         "a rebase that combined the PR's table with the default branch's in a Vitess keyspace's VSchema counts",
+			databaseType: "vitess",
+			prChange:     setVSchema("orders", "customer_id", "votes", "order_id"),
+			baseChange:   setVSchema("orders", "customer_id", "customers", "id"),
+			headChange:   setVSchema("orders", "customer_id", "customers", "id", "votes", "order_id"),
+			want:         wantCovers,
+		},
+		{
+			name:            "a rebase that routes the PR's table by another column in a Vitess keyspace's VSchema is a change",
+			databaseType:    "vitess",
+			prChange:        setVSchema("orders", "customer_id", "votes", "order_id"),
+			baseChange:      setVSchema("orders", "customer_id", "customers", "id"),
+			headChange:      setVSchema("orders", "customer_id", "customers", "id", "votes", "id"),
+			want:            wantChanged,
+			wantChangedPath: "schema/testdb/orders/vschema.json",
+		},
+		{
+			name:            "a VSchema both the PR and the default branch edited is a change on a MySQL database, which applies none",
+			prChange:        setVSchema("orders", "customer_id", "votes", "order_id"),
+			baseChange:      setVSchema("orders", "customer_id", "customers", "id"),
+			headChange:      setVSchema("orders", "customer_id", "customers", "id", "votes", "order_id"),
+			want:            wantChanged,
+			wantChangedPath: "schema/testdb/orders/vschema.json",
 		},
 		{
 			name:           "a rebase that combined the PR's column with the default branch's in a PostgreSQL schema file counts when the target finds the same change",
@@ -2387,11 +2425,11 @@ func TestTargetStatementComparer(t *testing.T) {
 		target := &schemaFileCompareTernClient{hang: true}
 		c := newComparer(t, target, 50*time.Millisecond)
 
-		same, _, err := c.compare(t.Context(), "orders base", "orders", "orders head base", "orders head")
+		same, _, err := c.compare(t.Context(), "schema/app/orders.sql", "orders base", "orders", "orders head base", "orders head")
 		require.ErrorIs(t, err, context.DeadlineExceeded)
 		assert.False(t, same)
 
-		same, _, err = c.compare(t.Context(), "items base", "items", "items head base", "items head")
+		same, _, err = c.compare(t.Context(), "schema/app/items.sql", "items base", "items", "items head base", "items head")
 		require.ErrorIs(t, err, errTargetComparisonBudgetSpent)
 		assert.False(t, same)
 		assert.Len(t, target.requests(), 1, "a file past the budget is never sent to the target")
@@ -2401,7 +2439,7 @@ func TestTargetStatementComparer(t *testing.T) {
 		target := &schemaFileCompareTernClient{resp: &ternv1.CompareSchemaFileChangeResponse{Reason: "the head declares column note differently from the approved commit"}}
 		c := newComparer(t, target, time.Minute)
 		for range 2 {
-			same, reason, err := c.compare(t.Context(), "orders base", "orders", "orders head base", "orders head")
+			same, reason, err := c.compare(t.Context(), "schema/app/orders.sql", "orders base", "orders", "orders head base", "orders head")
 			require.NoError(t, err)
 			assert.False(t, same)
 			assert.Equal(t, "the head declares column note differently from the approved commit", reason)
@@ -2409,11 +2447,21 @@ func TestTargetStatementComparer(t *testing.T) {
 		assert.Len(t, target.requests(), 1)
 	})
 
+	t.Run("a file other than .sql is changed without asking the target", func(t *testing.T) {
+		target := &schemaFileCompareTernClient{resp: &ternv1.CompareSchemaFileChangeResponse{Same: true}}
+		c := newComparer(t, target, time.Minute)
+		same, reason, err := c.compare(t.Context(), "schema/app/vschema.json", "{}", `{"sharded": true}`, "{}", `{"sharded": true}`)
+		require.NoError(t, err)
+		assert.False(t, same)
+		assert.Equal(t, "a PostgreSQL database applies only .sql files, so vschema.json is not compared", reason)
+		assert.Empty(t, target.requests())
+	})
+
 	t.Run("a failed comparison is asked again", func(t *testing.T) {
 		target := &schemaFileCompareTernClient{err: errors.New("connection refused")}
 		c := newComparer(t, target, time.Minute)
 		for range 2 {
-			_, _, err := c.compare(t.Context(), "orders base", "orders", "orders head base", "orders head")
+			_, _, err := c.compare(t.Context(), "schema/app/orders.sql", "orders base", "orders", "orders head base", "orders head")
 			require.ErrorContains(t, err, "connection refused")
 		}
 		assert.Len(t, target.requests(), 2, "only an answer is remembered")

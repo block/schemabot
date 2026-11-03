@@ -1156,9 +1156,10 @@ const maxSchemaSymlinkReads = 64
 // so the value leaves wide headroom. Past it, a file counts as changed.
 const maxSchemaStatementComparisons = 16
 
-// SchemaFileChangeComparer reports whether a pull request's edit to one
-// schema file generates the same schema change on two bases: approvedBase to
-// approved at the approved commit, and headBase to head at the head. The
+// SchemaFileChangeComparer reports whether a pull request's edit to the
+// schema file at filePath generates the same schema change on two bases:
+// approvedBase to approved at the approved commit, and headBase to head at
+// the head. The
 // change is the same when the head generates nothing the approved commit did
 // not, less any part of the edit the head's base already has. It is supplied
 // by the database's dialect, since only the dialect can understand the file,
@@ -1167,7 +1168,7 @@ const maxSchemaStatementComparisons = 16
 // the approved commit did not or replaces something the base changed in
 // between. An error means the files could not be compared, which proves
 // nothing.
-type SchemaFileChangeComparer func(ctx context.Context, approvedBase, approved, headBase, head string) (same bool, reason string, err error)
+type SchemaFileChangeComparer func(ctx context.Context, filePath, approvedBase, approved, headBase, head string) (same bool, reason string, err error)
 
 // SchemaChangeComparison is the outcome of PRSchemaChangeUnchangedSince.
 type SchemaChangeComparison struct {
@@ -1229,10 +1230,10 @@ type SchemaChangeComparison struct {
 // content. When compareStatements is set, such a file is unchanged if the
 // dialect proves the pull request's edit generates no statement at the head
 // that the approved commit did not, without replacing anything the base
-// branch changed (see SchemaFileChangeComparer). The file must be a regular .sql
-// file at all four commits, and when the two bases differ the same
-// default-branch rule applies, since the head's statements then rest on base
-// content. A nil compareStatements, an ineligible file, a comparer that
+// branch changed (see SchemaFileChangeComparer). The file must be a schema
+// file (a .sql file or a vschema.json) that is a regular file at all four
+// commits, and when the two bases differ the same default-branch rule
+// applies, since the head's statements then rest on base content. A nil compareStatements, an ineligible file, a comparer that
 // cannot prove the change is the same, or more such files than
 // maxSchemaStatementComparisons all leave the file changed.
 //
@@ -1422,7 +1423,7 @@ func (c *schemaChangeComparer) sameStatements(ctx context.Context, item schemaCh
 		return false, nil
 	}
 	if !statementComparable(item) {
-		c.ic.logger.Debug("review gate comparison: schema path differs and is not a regular .sql file at every commit, so its statements are not compared", logAttrs...)
+		c.ic.logger.Debug("review gate comparison: schema path differs and is not a regular schema file at every commit, so its statements are not compared", logAttrs...)
 		return false, nil
 	}
 	if !sameGitObject(item.sides[sideApprovedBase], item.sides[sideHeadBase]) && !c.baseContentReviewed {
@@ -1452,7 +1453,7 @@ func (c *schemaChangeComparer) sameStatements(ctx context.Context, item schemaCh
 		}
 		contents[i] = text
 	}
-	same, reason, err := c.compareStatements(ctx, contents[sideApprovedBase], contents[sideApproved], contents[sideHeadBase], contents[sideHead])
+	same, reason, err := c.compareStatements(ctx, item.path, contents[sideApprovedBase], contents[sideApproved], contents[sideHeadBase], contents[sideHead])
 	if err != nil {
 		// A comparison cut short by the evaluation's own cancellation proves
 		// nothing about the file, so the evaluation fails instead of
@@ -1475,12 +1476,12 @@ func (c *schemaChangeComparer) sameStatements(ctx context.Context, item schemaCh
 	return true, nil
 }
 
-// statementComparable reports whether item is a .sql file whose content at
-// each commit is a schema file the dialect can parse: a regular file at all
+// statementComparable reports whether item is a schema file whose content at
+// each commit is one the dialect can parse: a regular file at all
 // four commits, or a file the pull request adds, absent at both bases and a
 // regular file at the approved commit and the head.
 func statementComparable(item schemaChangeItem) bool {
-	if path.Ext(item.path) != ".sql" {
+	if !isManagedSchemaFile(item.path) {
 		return false
 	}
 	added := !item.sides[sideApprovedBase].found && !item.sides[sideHeadBase].found

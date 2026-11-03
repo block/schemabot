@@ -250,8 +250,9 @@ func strictTableDiff(source, target *statement.CreateTable) ([]string, error) {
 // UnmergedElement checks that head is the element-by-element three-way merge
 // of approved and headBase over approvedBase, and returns why the first
 // element (in name order) that is not breaks it, or "" when every element
-// merges. Each map holds one table's elements, keyed by a name that says what
-// the element is and mapped to its definition. An element added or removed
+// merges. Each map holds one schema file's elements, such as a table's
+// columns and indexes or a VSchema's tables and vindexes, keyed by a name
+// that says what the element is and mapped to its definition. An element added or removed
 // counts as changed. Every dialect's statement comparison applies this one
 // rule.
 //
