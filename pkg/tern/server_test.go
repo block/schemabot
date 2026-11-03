@@ -380,30 +380,30 @@ func (s liveOperatorServers) ListLive(context.Context) ([]*storage.OperatorServe
 	return s.servers, s.err
 }
 
-// A control plane admits a deferred apply against what the deployment reports
-// over gRPC: the deferred cutover drivers of its live servers together, and
-// the max_drivers_per_apply it runs one apply under.
-func TestDeferredCutoverCapacitySumsTheLiveServersDrivers(t *testing.T) {
+// A control plane books work against what the deployment reports over gRPC:
+// the drivers of its live servers together, the ones of them that may hold a
+// deferred cutover, and the max_drivers_per_apply it runs one apply under.
+func TestDriverCapacitySumsTheLiveServersDrivers(t *testing.T) {
 	servers := liveOperatorServers{servers: []*storage.OperatorServer{
 		{ServerID: "host-a/1/operator", Drivers: 4, DeferredCutoverDrivers: 3},
 		{ServerID: "host-b/1/operator", Drivers: 6, DeferredCutoverDrivers: 5},
 	}}
-	client := newRetryTestClient(t, NewServer(noopControlClient{}, slog.Default(), WithDeferredCutoverCapacity(servers, 16)))
+	client := newRetryTestClient(t, NewServer(noopControlClient{}, slog.Default(), WithDriverCapacity(servers, 16)))
 
-	capacity, err := client.DeferredCutoverCapacity(t.Context())
+	capacity, err := client.DriverCapacity(t.Context())
 
 	require.NoError(t, err)
-	assert.Equal(t, &DeferredCutoverCapacity{LiveServers: 2, Drivers: 8, MaxDriversPerApply: 16}, capacity)
+	assert.Equal(t, &DriverCapacity{LiveServers: 2, Drivers: 10, DeferredCutoverDrivers: 8, MaxDriversPerApply: 16}, capacity)
 }
 
-// A deployment that does not report its deferred cutover capacity answers
+// A deployment that does not report its driver capacity answers
 // Unimplemented, as one running an older SchemaBot does, and the client reads
 // that as no capacity rather than as a failure, so apply creation refuses to
 // defer the cutover of operations sent there instead of erroring.
-func TestDeferredCutoverCapacityIsNilWhenTheDeploymentDoesNotReportIt(t *testing.T) {
+func TestDriverCapacityIsNilWhenTheDeploymentDoesNotReportIt(t *testing.T) {
 	client := newRetryTestClient(t, NewServer(noopControlClient{}, slog.Default()))
 
-	capacity, err := client.DeferredCutoverCapacity(t.Context())
+	capacity, err := client.DriverCapacity(t.Context())
 
 	require.NoError(t, err)
 	assert.Nil(t, capacity)
@@ -411,15 +411,15 @@ func TestDeferredCutoverCapacityIsNilWhenTheDeploymentDoesNotReportIt(t *testing
 
 // A deployment that cannot read its own operator servers registry answers
 // Unavailable, which the client returns as an error, so apply creation refuses
-// the deferred apply with that error rather than admitting it against an
+// a deferred apply with that error rather than admitting it against an
 // unknown capacity. Health is unaffected, so the deployment keeps serving
 // every apply that does not defer its cutover.
-func TestDeferredCutoverCapacityFailsWhenTheRegistryCannotBeRead(t *testing.T) {
+func TestDriverCapacityFailsWhenTheRegistryCannotBeRead(t *testing.T) {
 	servers := liveOperatorServers{err: errors.New("read operator servers: connection refused")}
-	server := NewServer(healthErrorClient{}, slog.Default(), WithDeferredCutoverCapacity(servers, 2))
+	server := NewServer(healthErrorClient{}, slog.Default(), WithDriverCapacity(servers, 2))
 	client := newRetryTestClient(t, server)
 
-	capacity, err := client.DeferredCutoverCapacity(t.Context())
+	capacity, err := client.DriverCapacity(t.Context())
 
 	require.Error(t, err)
 	assert.Equal(t, codes.Unavailable, status.Code(errors.Unwrap(err)))

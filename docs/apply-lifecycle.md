@@ -246,7 +246,7 @@ can help:
   apply without `--defer-cutover`.
 - `422 deferred_cutover_capacity` means the apply is wider than
   `max_drivers_per_apply`, or than every live deferred driver together, or a
-  deployment it runs on does not report its deferred cutover capacity because
+  deployment it runs on does not report its driver capacity because
   it runs an older SchemaBot. Apply without `--defer-cutover`, or, when the
   `error` names `max_drivers_per_apply`, raise it on the named deployment to
   at least the apply's width there, or upgrade the named deployment.

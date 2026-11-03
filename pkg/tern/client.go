@@ -303,26 +303,28 @@ type ShutdownHalter interface {
 	HaltForShutdown(ctx context.Context) error
 }
 
-// DeferredCutoverCapacity is how many operations a deployment's operators can
-// hold at a deferred cutover at once.
-type DeferredCutoverCapacity struct {
+// DriverCapacity is the drivers a deployment's live operator servers run. It
+// is the deployment's pool: what is available is that less the work the
+// caller has already booked on it.
+type DriverCapacity struct {
 	// LiveServers is how many of the deployment's servers reported their
 	// drivers within its live window.
 	LiveServers int
-	// Drivers is how many drivers those servers leave for deferred work,
-	// together.
+	// Drivers is how many drivers those servers run, together.
 	Drivers int
+	// DeferredCutoverDrivers is how many of those drivers may hold an
+	// operation waiting at a deferred cutover.
+	DeferredCutoverDrivers int
 	// MaxDriversPerApply is how many operations of one apply the deployment
 	// runs at once.
 	MaxDriversPerApply int
 }
 
-// DeferredCutoverCapacityReader is a client for a deployment whose operators
-// run its operations on another plane. Each operation waiting at a deferred
-// cutover keeps one of that plane's drivers, so apply creation reads how many
-// it can hold before admitting an apply started with --defer-cutover. A nil
-// capacity with no error is a deployment that does not report it, and apply
-// creation refuses to defer the cutover of operations sent to it.
-type DeferredCutoverCapacityReader interface {
-	DeferredCutoverCapacity(ctx context.Context) (*DeferredCutoverCapacity, error)
+// DriverCapacityReader is a client for a deployment whose operators run its
+// operations on another plane. Every operation sent there runs on one of that
+// plane's drivers, so apply creation reads the plane's pool to refuse or queue
+// work that would not fit. A nil capacity with no error is a deployment that
+// does not report it, and work that needs it is refused there.
+type DriverCapacityReader interface {
+	DriverCapacity(ctx context.Context) (*DriverCapacity, error)
 }

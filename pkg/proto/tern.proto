@@ -189,18 +189,19 @@ service Tern {
     };
   }
 
-  // DeferredCutoverCapacity reports how many operations this deployment's
-  // operators can hold at a deferred cutover at once. A caller reads it before
-  // admitting an apply started with defer_cutover, since each operation that
-  // apply sends here keeps one of this deployment's drivers while it waits.
+  // DriverCapacity reports the drivers this deployment's operators run, so a
+  // caller can work out how many are available for the work it sends here and
+  // refuse or queue that work up front instead of starting what cannot fit.
+  // The caller counts what it has already booked against the answer; this
+  // deployment reports only its pool.
   //
   // A deployment that answers also cuts over every operation a CutoverRequest
   // names in apply_operation_ids, and records each command_id once. A caller
   // must not send an apply started with defer_cutover to a deployment that
   // answers Unimplemented.
-  rpc DeferredCutoverCapacity(DeferredCutoverCapacityRequest) returns (DeferredCutoverCapacityResponse) {
+  rpc DriverCapacity(DriverCapacityRequest) returns (DriverCapacityResponse) {
     option (google.api.http) = {
-      get: "/v1/deferred-cutover-capacity"
+      get: "/v1/driver-capacity"
     };
   }
 
@@ -1109,25 +1110,27 @@ message HealthResponse {
   string status = 1;
 }
 
-// DeferredCutoverCapacityRequest asks a deployment how many operations it can
-// hold at a deferred cutover.
-message DeferredCutoverCapacityRequest {}
+// DriverCapacityRequest asks a deployment for the drivers its operators run.
+message DriverCapacityRequest {}
 
-// DeferredCutoverCapacityResponse is how many operations a deployment's
-// operators can hold at a deferred cutover. Each operation waiting at a
-// deferred cutover keeps one of the deployment's drivers until it is cut over.
-message DeferredCutoverCapacityResponse {
+// DriverCapacityResponse is the drivers a deployment's live operator servers
+// run, counted from the servers that reported within the live window.
+message DriverCapacityResponse {
   // live_servers is how many of the deployment's servers reported their
   // drivers within the live window.
   int32 live_servers = 1;
-  // drivers is how many drivers those servers leave for deferred work,
-  // together.
+  // drivers is how many drivers those servers run, together.
   int32 drivers = 2;
+  // deferred_cutover_drivers is how many of those drivers may hold an
+  // operation waiting at a deferred cutover: each server's drivers less the
+  // one it keeps for other work. A waiting operation keeps its driver until
+  // it is cut over.
+  int32 deferred_cutover_drivers = 3;
   // max_drivers_per_apply is how many operations of one apply the deployment
   // runs at once. An operation waiting at its cutover keeps counting, so an
   // apply that sends the deployment more operations than this can never have
   // all of them waiting together.
-  int32 max_drivers_per_apply = 3;
+  int32 max_drivers_per_apply = 4;
 }
 
 // StopRequest pauses an in-progress schema change by apply ID.

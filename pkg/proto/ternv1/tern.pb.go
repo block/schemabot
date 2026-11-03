@@ -4164,28 +4164,27 @@ func (x *HealthResponse) GetStatus() string {
 	return ""
 }
 
-// DeferredCutoverCapacityRequest asks a deployment how many operations it can
-// hold at a deferred cutover.
-type DeferredCutoverCapacityRequest struct {
+// DriverCapacityRequest asks a deployment for the drivers its operators run.
+type DriverCapacityRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
-func (x *DeferredCutoverCapacityRequest) Reset() {
-	*x = DeferredCutoverCapacityRequest{}
+func (x *DriverCapacityRequest) Reset() {
+	*x = DriverCapacityRequest{}
 	mi := &file_tern_proto_msgTypes[41]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
 
-func (x *DeferredCutoverCapacityRequest) String() string {
+func (x *DriverCapacityRequest) String() string {
 	return protoimpl.X.MessageStringOf(x)
 }
 
-func (*DeferredCutoverCapacityRequest) ProtoMessage() {}
+func (*DriverCapacityRequest) ProtoMessage() {}
 
-func (x *DeferredCutoverCapacityRequest) ProtoReflect() protoreflect.Message {
+func (x *DriverCapacityRequest) ProtoReflect() protoreflect.Message {
 	mi := &file_tern_proto_msgTypes[41]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
@@ -4197,45 +4196,48 @@ func (x *DeferredCutoverCapacityRequest) ProtoReflect() protoreflect.Message {
 	return mi.MessageOf(x)
 }
 
-// Deprecated: Use DeferredCutoverCapacityRequest.ProtoReflect.Descriptor instead.
-func (*DeferredCutoverCapacityRequest) Descriptor() ([]byte, []int) {
+// Deprecated: Use DriverCapacityRequest.ProtoReflect.Descriptor instead.
+func (*DriverCapacityRequest) Descriptor() ([]byte, []int) {
 	return file_tern_proto_rawDescGZIP(), []int{41}
 }
 
-// DeferredCutoverCapacityResponse is how many operations a deployment's
-// operators can hold at a deferred cutover. Each operation waiting at a
-// deferred cutover keeps one of the deployment's drivers until it is cut over.
-type DeferredCutoverCapacityResponse struct {
+// DriverCapacityResponse is the drivers a deployment's live operator servers
+// run, counted from the servers that reported within the live window.
+type DriverCapacityResponse struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// live_servers is how many of the deployment's servers reported their
 	// drivers within the live window.
 	LiveServers int32 `protobuf:"varint,1,opt,name=live_servers,json=liveServers,proto3" json:"live_servers,omitempty"`
-	// drivers is how many drivers those servers leave for deferred work,
-	// together.
+	// drivers is how many drivers those servers run, together.
 	Drivers int32 `protobuf:"varint,2,opt,name=drivers,proto3" json:"drivers,omitempty"`
+	// deferred_cutover_drivers is how many of those drivers may hold an
+	// operation waiting at a deferred cutover: each server's drivers less the
+	// one it keeps for other work. A waiting operation keeps its driver until
+	// it is cut over.
+	DeferredCutoverDrivers int32 `protobuf:"varint,3,opt,name=deferred_cutover_drivers,json=deferredCutoverDrivers,proto3" json:"deferred_cutover_drivers,omitempty"`
 	// max_drivers_per_apply is how many operations of one apply the deployment
 	// runs at once. An operation waiting at its cutover keeps counting, so an
 	// apply that sends the deployment more operations than this can never have
 	// all of them waiting together.
-	MaxDriversPerApply int32 `protobuf:"varint,3,opt,name=max_drivers_per_apply,json=maxDriversPerApply,proto3" json:"max_drivers_per_apply,omitempty"`
+	MaxDriversPerApply int32 `protobuf:"varint,4,opt,name=max_drivers_per_apply,json=maxDriversPerApply,proto3" json:"max_drivers_per_apply,omitempty"`
 	unknownFields      protoimpl.UnknownFields
 	sizeCache          protoimpl.SizeCache
 }
 
-func (x *DeferredCutoverCapacityResponse) Reset() {
-	*x = DeferredCutoverCapacityResponse{}
+func (x *DriverCapacityResponse) Reset() {
+	*x = DriverCapacityResponse{}
 	mi := &file_tern_proto_msgTypes[42]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
 
-func (x *DeferredCutoverCapacityResponse) String() string {
+func (x *DriverCapacityResponse) String() string {
 	return protoimpl.X.MessageStringOf(x)
 }
 
-func (*DeferredCutoverCapacityResponse) ProtoMessage() {}
+func (*DriverCapacityResponse) ProtoMessage() {}
 
-func (x *DeferredCutoverCapacityResponse) ProtoReflect() protoreflect.Message {
+func (x *DriverCapacityResponse) ProtoReflect() protoreflect.Message {
 	mi := &file_tern_proto_msgTypes[42]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
@@ -4247,26 +4249,33 @@ func (x *DeferredCutoverCapacityResponse) ProtoReflect() protoreflect.Message {
 	return mi.MessageOf(x)
 }
 
-// Deprecated: Use DeferredCutoverCapacityResponse.ProtoReflect.Descriptor instead.
-func (*DeferredCutoverCapacityResponse) Descriptor() ([]byte, []int) {
+// Deprecated: Use DriverCapacityResponse.ProtoReflect.Descriptor instead.
+func (*DriverCapacityResponse) Descriptor() ([]byte, []int) {
 	return file_tern_proto_rawDescGZIP(), []int{42}
 }
 
-func (x *DeferredCutoverCapacityResponse) GetLiveServers() int32 {
+func (x *DriverCapacityResponse) GetLiveServers() int32 {
 	if x != nil {
 		return x.LiveServers
 	}
 	return 0
 }
 
-func (x *DeferredCutoverCapacityResponse) GetDrivers() int32 {
+func (x *DriverCapacityResponse) GetDrivers() int32 {
 	if x != nil {
 		return x.Drivers
 	}
 	return 0
 }
 
-func (x *DeferredCutoverCapacityResponse) GetMaxDriversPerApply() int32 {
+func (x *DriverCapacityResponse) GetDeferredCutoverDrivers() int32 {
+	if x != nil {
+		return x.DeferredCutoverDrivers
+	}
+	return 0
+}
+
+func (x *DriverCapacityResponse) GetMaxDriversPerApply() int32 {
 	if x != nil {
 		return x.MaxDriversPerApply
 	}
@@ -5613,12 +5622,13 @@ const file_tern_proto_rawDesc = "" +
 	"\rerror_message\x18\x02 \x01(\tR\ferrorMessage\"\x0f\n" +
 	"\rHealthRequest\"(\n" +
 	"\x0eHealthResponse\x12\x16\n" +
-	"\x06status\x18\x01 \x01(\tR\x06status\" \n" +
-	"\x1eDeferredCutoverCapacityRequest\"\x91\x01\n" +
-	"\x1fDeferredCutoverCapacityResponse\x12!\n" +
+	"\x06status\x18\x01 \x01(\tR\x06status\"\x17\n" +
+	"\x15DriverCapacityRequest\"\xc2\x01\n" +
+	"\x16DriverCapacityResponse\x12!\n" +
 	"\flive_servers\x18\x01 \x01(\x05R\vliveServers\x12\x18\n" +
-	"\adrivers\x18\x02 \x01(\x05R\adrivers\x121\n" +
-	"\x15max_drivers_per_apply\x18\x03 \x01(\x05R\x12maxDriversPerApply\"b\n" +
+	"\adrivers\x18\x02 \x01(\x05R\adrivers\x128\n" +
+	"\x18deferred_cutover_drivers\x18\x03 \x01(\x05R\x16deferredCutoverDrivers\x121\n" +
+	"\x15max_drivers_per_apply\x18\x04 \x01(\x05R\x12maxDriversPerApply\"b\n" +
 	"\vStopRequest\x12\x19\n" +
 	"\bapply_id\x18\x01 \x01(\tR\aapplyId\x12 \n" +
 	"\venvironment\x18\x02 \x01(\tR\venvironment\x12\x16\n" +
@@ -5734,7 +5744,7 @@ const file_tern_proto_rawDesc = "" +
 	"\x11BootRemovalPolicy\x12#\n" +
 	"\x1fBOOT_REMOVAL_POLICY_UNSPECIFIED\x10\x00\x12!\n" +
 	"\x1dBOOT_REMOVAL_POLICY_PRESERVES\x10\x01\x12\x1f\n" +
-	"\x1bBOOT_REMOVAL_POLICY_REMOVES\x10\x022\xf5\f\n" +
+	"\x1bBOOT_REMOVAL_POLICY_REMOVES\x10\x022\xcf\f\n" +
 	"\x04Tern\x12a\n" +
 	"\n" +
 	"PullSchema\x12\x1a.tern.v1.PullSchemaRequest\x1a\x1b.tern.v1.PullSchemaResponse\"\x1a\x82\xd3\xe4\x93\x02\x14:\x01*\"\x0f/v1/pull-schema\x12H\n" +
@@ -5750,8 +5760,8 @@ const file_tern_proto_rawDesc = "" +
 	"\n" +
 	"SkipRevert\x12\x1a.tern.v1.SkipRevertRequest\x1a\x1b.tern.v1.SkipRevertResponse\"\x1a\x82\xd3\xe4\x93\x02\x14:\x01*\"\x0f/v1/skip-revert\x12M\n" +
 	"\x06Health\x12\x16.tern.v1.HealthRequest\x1a\x17.tern.v1.HealthResponse\"\x12\x82\xd3\xe4\x93\x02\f\x12\n" +
-	"/v1/health\x12\x93\x01\n" +
-	"\x17DeferredCutoverCapacity\x12'.tern.v1.DeferredCutoverCapacityRequest\x1a(.tern.v1.DeferredCutoverCapacityResponse\"%\x82\xd3\xe4\x93\x02\x1f\x12\x1d/v1/deferred-cutover-capacity\x12H\n" +
+	"/v1/health\x12n\n" +
+	"\x0eDriverCapacity\x12\x1e.tern.v1.DriverCapacityRequest\x1a\x1f.tern.v1.DriverCapacityResponse\"\x1b\x82\xd3\xe4\x93\x02\x15\x12\x13/v1/driver-capacity\x12H\n" +
 	"\x04Stop\x12\x14.tern.v1.StopRequest\x1a\x15.tern.v1.StopResponse\"\x13\x82\xd3\xe4\x93\x02\r:\x01*\"\b/v1/stop\x12P\n" +
 	"\x06Cancel\x12\x16.tern.v1.CancelRequest\x1a\x17.tern.v1.CancelResponse\"\x15\x82\xd3\xe4\x93\x02\x0f:\x01*\"\n" +
 	"/v1/cancel\x12L\n" +
@@ -5820,8 +5830,8 @@ var file_tern_proto_goTypes = []any{
 	(*SkipRevertResponse)(nil),              // 43: tern.v1.SkipRevertResponse
 	(*HealthRequest)(nil),                   // 44: tern.v1.HealthRequest
 	(*HealthResponse)(nil),                  // 45: tern.v1.HealthResponse
-	(*DeferredCutoverCapacityRequest)(nil),  // 46: tern.v1.DeferredCutoverCapacityRequest
-	(*DeferredCutoverCapacityResponse)(nil), // 47: tern.v1.DeferredCutoverCapacityResponse
+	(*DriverCapacityRequest)(nil),           // 46: tern.v1.DriverCapacityRequest
+	(*DriverCapacityResponse)(nil),          // 47: tern.v1.DriverCapacityResponse
 	(*StopRequest)(nil),                     // 48: tern.v1.StopRequest
 	(*StopResponse)(nil),                    // 49: tern.v1.StopResponse
 	(*CancelRequest)(nil),                   // 50: tern.v1.CancelRequest
@@ -5919,7 +5929,7 @@ var file_tern_proto_depIdxs = []int32{
 	40, // 66: tern.v1.Tern.Revert:input_type -> tern.v1.RevertRequest
 	42, // 67: tern.v1.Tern.SkipRevert:input_type -> tern.v1.SkipRevertRequest
 	44, // 68: tern.v1.Tern.Health:input_type -> tern.v1.HealthRequest
-	46, // 69: tern.v1.Tern.DeferredCutoverCapacity:input_type -> tern.v1.DeferredCutoverCapacityRequest
+	46, // 69: tern.v1.Tern.DriverCapacity:input_type -> tern.v1.DriverCapacityRequest
 	48, // 70: tern.v1.Tern.Stop:input_type -> tern.v1.StopRequest
 	50, // 71: tern.v1.Tern.Cancel:input_type -> tern.v1.CancelRequest
 	52, // 72: tern.v1.Tern.Start:input_type -> tern.v1.StartRequest
@@ -5936,7 +5946,7 @@ var file_tern_proto_depIdxs = []int32{
 	41, // 83: tern.v1.Tern.Revert:output_type -> tern.v1.RevertResponse
 	43, // 84: tern.v1.Tern.SkipRevert:output_type -> tern.v1.SkipRevertResponse
 	45, // 85: tern.v1.Tern.Health:output_type -> tern.v1.HealthResponse
-	47, // 86: tern.v1.Tern.DeferredCutoverCapacity:output_type -> tern.v1.DeferredCutoverCapacityResponse
+	47, // 86: tern.v1.Tern.DriverCapacity:output_type -> tern.v1.DriverCapacityResponse
 	49, // 87: tern.v1.Tern.Stop:output_type -> tern.v1.StopResponse
 	51, // 88: tern.v1.Tern.Cancel:output_type -> tern.v1.CancelResponse
 	53, // 89: tern.v1.Tern.Start:output_type -> tern.v1.StartResponse

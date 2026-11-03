@@ -224,11 +224,11 @@ const DefaultMaxRecvMsgBytes = 16 << 20 // 16 MiB
 // stays within its command timeout only for a handful of environments — the
 // exhausted calls fail closed either way.
 //
-// Fast polls (Progress, Health, DeferredCutoverCapacity) keep a sub-second
-// budget: Progress is called on tight drive loops that own their own failure
+// Fast polls (Progress, Health, DriverCapacity) keep a sub-second budget:
+// Progress is called on tight drive loops that own their own failure
 // handling, Health feeds the remote-deployment outage monitor, which must
-// observe an outage promptly rather than ride it out, and
-// DeferredCutoverCapacity is read while apply creation waits on it.
+// observe an outage promptly rather than ride it out, and DriverCapacity is
+// read while apply creation waits on it.
 //
 // State-changing RPCs (Apply, Cutover, Stop, Cancel, Start, Revert,
 // SkipRevert) are intentionally not retried here: re-sending them could
@@ -253,7 +253,7 @@ const retryServiceConfig = `{
 		"name": [
 			{"service": "tern.v1.Tern", "method": "Progress"},
 			{"service": "tern.v1.Tern", "method": "Health"},
-			{"service": "tern.v1.Tern", "method": "DeferredCutoverCapacity"}
+			{"service": "tern.v1.Tern", "method": "DriverCapacity"}
 		],
 		"retryPolicy": {
 			"maxAttempts": 3,
@@ -1745,23 +1745,23 @@ func (c *GRPCClient) Health(ctx context.Context) error {
 	return err
 }
 
-// DeferredCutoverCapacity reads how many operations the deployment's operators
-// can hold at a deferred cutover at once. It returns nil without an error when
-// the deployment answers Unimplemented, which a deployment running an older
-// SchemaBot does.
-func (c *GRPCClient) DeferredCutoverCapacity(ctx context.Context) (*DeferredCutoverCapacity, error) {
-	resp, err := c.client.DeferredCutoverCapacity(ctx, &ternv1.DeferredCutoverCapacityRequest{})
+// DriverCapacity reads the drivers the deployment's live operator servers run.
+// It returns nil without an error when the deployment answers Unimplemented,
+// which a deployment running an older SchemaBot does.
+func (c *GRPCClient) DriverCapacity(ctx context.Context) (*DriverCapacity, error) {
+	resp, err := c.client.DriverCapacity(ctx, &ternv1.DriverCapacityRequest{})
 	if status.Code(err) == codes.Unimplemented {
-		c.baseLogger().DebugContext(ctx, "deployment does not report deferred cutover capacity", "address", c.address)
+		c.baseLogger().DebugContext(ctx, "deployment does not report its driver capacity", "address", c.address)
 		return nil, nil
 	}
 	if err != nil {
-		return nil, fmt.Errorf("read deferred cutover capacity: %w", err)
+		return nil, fmt.Errorf("read driver capacity: %w", err)
 	}
-	return &DeferredCutoverCapacity{
-		LiveServers:        int(resp.GetLiveServers()),
-		Drivers:            int(resp.GetDrivers()),
-		MaxDriversPerApply: int(resp.GetMaxDriversPerApply()),
+	return &DriverCapacity{
+		LiveServers:            int(resp.GetLiveServers()),
+		Drivers:                int(resp.GetDrivers()),
+		DeferredCutoverDrivers: int(resp.GetDeferredCutoverDrivers()),
+		MaxDriversPerApply:     int(resp.GetMaxDriversPerApply()),
 	}, nil
 }
 

@@ -223,9 +223,9 @@ func (s *Service) deferredCutoverDataPlanes(ctx context.Context, plan *storage.P
 				"apply_id", applyIdentifier, "database", plan.Database, "environment", environment, "deployment", deployment)
 			continue
 		}
-		capacity, err := s.readDeferredCutoverCapacity(ctx, client)
+		capacity, err := s.readDriverCapacity(ctx, client)
 		if err != nil {
-			return nil, fmt.Errorf("read deferred cutover capacity of deployment %s/%s for apply %s: %w", deployment, environment, applyIdentifier, err)
+			return nil, fmt.Errorf("read driver capacity of deployment %s/%s for apply %s: %w", deployment, environment, applyIdentifier, err)
 		}
 		refused := &DeferredCutoverCapacityError{
 			Database:    plan.Database,
@@ -235,7 +235,7 @@ func (s *Service) deferredCutoverDataPlanes(ctx context.Context, plan *storage.P
 		}
 		switch {
 		case capacity == nil:
-			s.logger.Warn("apply rejected: deferred cutover needs a deployment that reports how many operations it can hold at a deferred cutover, and this one does not",
+			s.logger.Warn("apply rejected: deferred cutover needs a deployment that reports its driver capacity, and this one does not",
 				"plan_id", plan.PlanIdentifier, "apply_id", applyIdentifier, "database", plan.Database,
 				"database_type", plan.DatabaseType, "environment", environment, "caller", caller,
 				"deployment", deployment, "operations", widths[deployment])
@@ -244,7 +244,7 @@ func (s *Service) deferredCutoverDataPlanes(ctx context.Context, plan *storage.P
 		case capacity.MaxDriversPerApply <= 0:
 			// A SchemaBot data plane always reports its resolved cap, so a
 			// missing one is a deployment this admission cannot reason about.
-			s.logger.Warn("apply rejected: deployment reported deferred cutover capacity without its max_drivers_per_apply, so it is treated as not reporting one",
+			s.logger.Warn("apply rejected: deployment reported its driver capacity without its max_drivers_per_apply, so it is treated as not reporting one",
 				"plan_id", plan.PlanIdentifier, "apply_id", applyIdentifier, "database", plan.Database,
 				"database_type", plan.DatabaseType, "environment", environment, "caller", caller,
 				"deployment", deployment, "operations", widths[deployment])
@@ -262,25 +262,25 @@ func (s *Service) deferredCutoverDataPlanes(ctx context.Context, plan *storage.P
 			Deployment:  deployment,
 			Operations:  widths[deployment],
 			LiveServers: capacity.LiveServers,
-			Capacity:    capacity.Drivers,
+			Capacity:    capacity.DeferredCutoverDrivers,
 		})
 	}
 	return planes, nil
 }
 
-// readDeferredCutoverCapacity asks a remote deployment how many operations it
-// can hold at a deferred cutover, bounded like a health check. A client that
-// cannot ask reports nothing, as an older deployment does.
-func (s *Service) readDeferredCutoverCapacity(ctx context.Context, client tern.Client) (*tern.DeferredCutoverCapacity, error) {
-	reader, ok := client.(tern.DeferredCutoverCapacityReader)
+// readDriverCapacity asks a remote deployment for the drivers its operators
+// run, bounded like a health check. A client that cannot ask reports nothing,
+// as an older deployment does.
+func (s *Service) readDriverCapacity(ctx context.Context, client tern.Client) (*tern.DriverCapacity, error) {
+	reader, ok := client.(tern.DriverCapacityReader)
 	if !ok {
-		s.logger.Warn("deferred cutover admission: the remote deployment's client cannot read its deferred cutover capacity, so it is treated as not reporting one",
+		s.logger.Warn("deferred cutover admission: the remote deployment's client cannot read its driver capacity, so it is treated as not reporting one",
 			"client_type", fmt.Sprintf("%T", client))
 		return nil, nil
 	}
 	ctx, cancel := context.WithTimeout(ctx, RemoteDeploymentHealthCheckTimeout)
 	defer cancel()
-	return reader.DeferredCutoverCapacity(ctx)
+	return reader.DriverCapacity(ctx)
 }
 
 // deferredCutoverRefusal turns storage refusing a deferred apply's admission

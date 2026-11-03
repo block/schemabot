@@ -30,7 +30,7 @@ const (
 	Tern_Revert_FullMethodName                  = "/tern.v1.Tern/Revert"
 	Tern_SkipRevert_FullMethodName              = "/tern.v1.Tern/SkipRevert"
 	Tern_Health_FullMethodName                  = "/tern.v1.Tern/Health"
-	Tern_DeferredCutoverCapacity_FullMethodName = "/tern.v1.Tern/DeferredCutoverCapacity"
+	Tern_DriverCapacity_FullMethodName          = "/tern.v1.Tern/DriverCapacity"
 	Tern_Stop_FullMethodName                    = "/tern.v1.Tern/Stop"
 	Tern_Cancel_FullMethodName                  = "/tern.v1.Tern/Cancel"
 	Tern_Start_FullMethodName                   = "/tern.v1.Tern/Start"
@@ -162,16 +162,17 @@ type TernClient interface {
 	SkipRevert(ctx context.Context, in *SkipRevertRequest, opts ...grpc.CallOption) (*SkipRevertResponse, error)
 	// Health checks service health by verifying storage connectivity.
 	Health(ctx context.Context, in *HealthRequest, opts ...grpc.CallOption) (*HealthResponse, error)
-	// DeferredCutoverCapacity reports how many operations this deployment's
-	// operators can hold at a deferred cutover at once. A caller reads it before
-	// admitting an apply started with defer_cutover, since each operation that
-	// apply sends here keeps one of this deployment's drivers while it waits.
+	// DriverCapacity reports the drivers this deployment's operators run, so a
+	// caller can work out how many are available for the work it sends here and
+	// refuse or queue that work up front instead of starting what cannot fit.
+	// The caller counts what it has already booked against the answer; this
+	// deployment reports only its pool.
 	//
 	// A deployment that answers also cuts over every operation a CutoverRequest
 	// names in apply_operation_ids, and records each command_id once. A caller
 	// must not send an apply started with defer_cutover to a deployment that
 	// answers Unimplemented.
-	DeferredCutoverCapacity(ctx context.Context, in *DeferredCutoverCapacityRequest, opts ...grpc.CallOption) (*DeferredCutoverCapacityResponse, error)
+	DriverCapacity(ctx context.Context, in *DriverCapacityRequest, opts ...grpc.CallOption) (*DriverCapacityResponse, error)
 	// Stop pauses all non-terminal tasks for a schema change.
 	//
 	// Transitions: any non-terminal state -> stopped.
@@ -346,10 +347,10 @@ func (c *ternClient) Health(ctx context.Context, in *HealthRequest, opts ...grpc
 	return out, nil
 }
 
-func (c *ternClient) DeferredCutoverCapacity(ctx context.Context, in *DeferredCutoverCapacityRequest, opts ...grpc.CallOption) (*DeferredCutoverCapacityResponse, error) {
+func (c *ternClient) DriverCapacity(ctx context.Context, in *DriverCapacityRequest, opts ...grpc.CallOption) (*DriverCapacityResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(DeferredCutoverCapacityResponse)
-	err := c.cc.Invoke(ctx, Tern_DeferredCutoverCapacity_FullMethodName, in, out, cOpts...)
+	out := new(DriverCapacityResponse)
+	err := c.cc.Invoke(ctx, Tern_DriverCapacity_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -530,16 +531,17 @@ type TernServer interface {
 	SkipRevert(context.Context, *SkipRevertRequest) (*SkipRevertResponse, error)
 	// Health checks service health by verifying storage connectivity.
 	Health(context.Context, *HealthRequest) (*HealthResponse, error)
-	// DeferredCutoverCapacity reports how many operations this deployment's
-	// operators can hold at a deferred cutover at once. A caller reads it before
-	// admitting an apply started with defer_cutover, since each operation that
-	// apply sends here keeps one of this deployment's drivers while it waits.
+	// DriverCapacity reports the drivers this deployment's operators run, so a
+	// caller can work out how many are available for the work it sends here and
+	// refuse or queue that work up front instead of starting what cannot fit.
+	// The caller counts what it has already booked against the answer; this
+	// deployment reports only its pool.
 	//
 	// A deployment that answers also cuts over every operation a CutoverRequest
 	// names in apply_operation_ids, and records each command_id once. A caller
 	// must not send an apply started with defer_cutover to a deployment that
 	// answers Unimplemented.
-	DeferredCutoverCapacity(context.Context, *DeferredCutoverCapacityRequest) (*DeferredCutoverCapacityResponse, error)
+	DriverCapacity(context.Context, *DriverCapacityRequest) (*DriverCapacityResponse, error)
 	// Stop pauses all non-terminal tasks for a schema change.
 	//
 	// Transitions: any non-terminal state -> stopped.
@@ -636,8 +638,8 @@ func (UnimplementedTernServer) SkipRevert(context.Context, *SkipRevertRequest) (
 func (UnimplementedTernServer) Health(context.Context, *HealthRequest) (*HealthResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Health not implemented")
 }
-func (UnimplementedTernServer) DeferredCutoverCapacity(context.Context, *DeferredCutoverCapacityRequest) (*DeferredCutoverCapacityResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "method DeferredCutoverCapacity not implemented")
+func (UnimplementedTernServer) DriverCapacity(context.Context, *DriverCapacityRequest) (*DriverCapacityResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method DriverCapacity not implemented")
 }
 func (UnimplementedTernServer) Stop(context.Context, *StopRequest) (*StopResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Stop not implemented")
@@ -872,20 +874,20 @@ func _Tern_Health_Handler(srv interface{}, ctx context.Context, dec func(interfa
 	return interceptor(ctx, in, info, handler)
 }
 
-func _Tern_DeferredCutoverCapacity_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(DeferredCutoverCapacityRequest)
+func _Tern_DriverCapacity_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DriverCapacityRequest)
 	if err := dec(in); err != nil {
 		return nil, err
 	}
 	if interceptor == nil {
-		return srv.(TernServer).DeferredCutoverCapacity(ctx, in)
+		return srv.(TernServer).DriverCapacity(ctx, in)
 	}
 	info := &grpc.UnaryServerInfo{
 		Server:     srv,
-		FullMethod: Tern_DeferredCutoverCapacity_FullMethodName,
+		FullMethod: Tern_DriverCapacity_FullMethodName,
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(TernServer).DeferredCutoverCapacity(ctx, req.(*DeferredCutoverCapacityRequest))
+		return srv.(TernServer).DriverCapacity(ctx, req.(*DriverCapacityRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -1032,8 +1034,8 @@ var Tern_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _Tern_Health_Handler,
 		},
 		{
-			MethodName: "DeferredCutoverCapacity",
-			Handler:    _Tern_DeferredCutoverCapacity_Handler,
+			MethodName: "DriverCapacity",
+			Handler:    _Tern_DriverCapacity_Handler,
 		},
 		{
 			MethodName: "Stop",

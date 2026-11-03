@@ -460,11 +460,11 @@ func (s liveOperatorServers) ListLive(context.Context) ([]*storage.OperatorServe
 	return s.servers, nil
 }
 
-// A control plane admits a deferred apply against what this instance reports
-// over gRPC, so the registration an embedder gets reports the live operator
-// servers of its own storage and the max_drivers_per_apply its own drivers run
-// one apply under, the default when the config leaves it unset.
-func TestServerRegisterGRPCReportsDeferredCutoverCapacity(t *testing.T) {
+// A control plane books work against what this instance reports over gRPC,
+// so the registration an embedder gets reports the live operator servers of
+// its own storage and the max_drivers_per_apply its own drivers run one apply
+// under, the default when the config leaves it unset.
+func TestServerRegisterGRPCReportsDriverCapacity(t *testing.T) {
 	for _, tc := range []struct {
 		name               string
 		maxDriversPerApply int
@@ -487,11 +487,12 @@ func TestServerRegisterGRPCReportsDeferredCutoverCapacity(t *testing.T) {
 				logger:          logger,
 			}
 
-			resp, err := dialRegisteredTernServer(t, srv).DeferredCutoverCapacity(t.Context(), &ternv1.DeferredCutoverCapacityRequest{})
+			resp, err := dialRegisteredTernServer(t, srv).DriverCapacity(t.Context(), &ternv1.DriverCapacityRequest{})
 
 			require.NoError(t, err)
 			assert.Equal(t, int32(1), resp.GetLiveServers())
-			assert.Equal(t, int32(3), resp.GetDrivers())
+			assert.Equal(t, int32(4), resp.GetDrivers())
+			assert.Equal(t, int32(3), resp.GetDeferredCutoverDrivers())
 			assert.Equal(t, tc.want, resp.GetMaxDriversPerApply())
 		})
 	}
