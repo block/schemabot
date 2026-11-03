@@ -2054,7 +2054,7 @@ func TestE2EAutoPlanUsesRepositoryEnvironmentCoverage(t *testing.T) {
 	client, mux := setupGitHubServer(t)
 	result := setupFakeGitHubForPlanWithPRFiles(t, mux, map[string]string{
 		"users.sql": "CREATE TABLE users (id BIGINT PRIMARY KEY)",
-	}, fmt.Sprintf("database: %s\ntype: mysql\n", dbName), dbName, []*gh.CommitFile{{Filename: new("README.md"), Status: new("modified")}})
+	}, fmt.Sprintf("database: %s\ntype: mysql\n", dbName), dbName, []*gh.CommitFile{{Filename: new("README.md"), Status: new("modified"), Additions: new(3), Deletions: new(2)}})
 	h := newE2EHandler(t, svc, client)
 	drainWebhookWorkOnCleanup(t, h)
 	req := buildPRWebhookRequest(t, prWebhookPayloadOpts{action: "opened", headSHA: "abc123", headRef: "feature-branch"}, nil)

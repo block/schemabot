@@ -563,7 +563,7 @@ func TestE2EPassingAggregateOnNonSchemaPR(t *testing.T) {
 	// PR changed files — no schema files
 	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1/files", func(w http.ResponseWriter, _ *http.Request) {
 		_ = json.NewEncoder(w).Encode([]*gh.CommitFile{
-			{Filename: new("README.md"), Status: new("modified")},
+			{Filename: new("README.md"), Status: new("modified"), Additions: new(3), Deletions: new(2)},
 		})
 	})
 
@@ -653,7 +653,7 @@ func TestE2EParticipantSilentOnNonSchemaPR(t *testing.T) {
 	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1/files", func(w http.ResponseWriter, _ *http.Request) {
 		filesFetchedOnce.Do(func() { close(filesFetched) })
 		_ = json.NewEncoder(w).Encode([]*gh.CommitFile{
-			{Filename: new("README.md"), Status: new("modified")},
+			{Filename: new("README.md"), Status: new("modified"), Additions: new(3), Deletions: new(2)},
 		})
 	})
 
@@ -726,7 +726,7 @@ func TestE2ECheckRunRerequestReplansCurrentPR(t *testing.T) {
 	})
 	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1/files", func(w http.ResponseWriter, _ *http.Request) {
 		_ = json.NewEncoder(w).Encode([]*gh.CommitFile{
-			{Filename: new("README.md"), Status: new("modified")},
+			{Filename: new("README.md"), Status: new("modified"), Additions: new(3), Deletions: new(2)},
 		})
 	})
 	mux.HandleFunc("GET /repos/octocat/hello-world/git/trees/abc123", func(w http.ResponseWriter, _ *http.Request) {
@@ -793,7 +793,7 @@ func TestE2ECheckRunRerequestIgnoresStaleHeadSHA(t *testing.T) {
 	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1/files", func(w http.ResponseWriter, _ *http.Request) {
 		fileListCalls.Add(1)
 		_ = json.NewEncoder(w).Encode([]*gh.CommitFile{
-			{Filename: new("README.md"), Status: new("modified")},
+			{Filename: new("README.md"), Status: new("modified"), Additions: new(3), Deletions: new(2)},
 		})
 	})
 
@@ -856,7 +856,7 @@ func TestE2EPassingAggregateSynchronizeUpdatesNewSHA(t *testing.T) {
 	// PR changed files — no schema files
 	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1/files", func(w http.ResponseWriter, _ *http.Request) {
 		_ = json.NewEncoder(w).Encode([]*gh.CommitFile{
-			{Filename: new("README.md"), Status: new("modified")},
+			{Filename: new("README.md"), Status: new("modified"), Additions: new(3), Deletions: new(2)},
 		})
 	})
 
@@ -1208,7 +1208,7 @@ func TestE2EPassingAggregateWithoutAllowedEnvs(t *testing.T) {
 	// PR changed files — no schema files
 	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1/files", func(w http.ResponseWriter, _ *http.Request) {
 		_ = json.NewEncoder(w).Encode([]*gh.CommitFile{
-			{Filename: new("README.md"), Status: new("modified")},
+			{Filename: new("README.md"), Status: new("modified"), Additions: new(3), Deletions: new(2)},
 		})
 	})
 
