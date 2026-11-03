@@ -56,7 +56,8 @@ func TestWriteProgressMultiDeploymentRendersAggregateAndSections(t *testing.T) {
 
 // A resuming rollout's progress output reads as the start under way, even
 // while its targets still report stopped: the state and target counts say
-// resuming, each table reads as resuming, and no start command is offered.
+// resuming, a stopped table reads as resuming, a table that never started
+// stays queued, and no start command is offered.
 func TestWriteProgressMultiDeploymentResumingOffersNoStart(t *testing.T) {
 	output := captureStdout(t, func() {
 		WriteProgress(ProgressData{
@@ -70,6 +71,8 @@ func TestWriteProgressMultiDeploymentResumingOffersNoStart(t *testing.T) {
 			Tables: []TableProgress{
 				{Deployment: "staging", Target: "orders-a", TableName: "users", ChangeType: "alter", DDL: "ALTER TABLE `users` ADD COLUMN `region` varchar(20)", Status: state.Task.Stopped, PercentComplete: 57, RowsCopied: 57, RowsTotal: 100},
 				{Deployment: "staging", Target: "orders-b", TableName: "users", ChangeType: "alter", DDL: "ALTER TABLE `users` ADD COLUMN `region` varchar(20)", Status: state.Task.Stopped, PercentComplete: 40, RowsCopied: 40, RowsTotal: 100},
+				{Deployment: "staging", Target: "orders-a", TableName: "accounts", ChangeType: "alter", DDL: "ALTER TABLE `accounts` ADD COLUMN `region` varchar(20)", Status: state.Task.Pending},
+				{Deployment: "staging", Target: "orders-b", TableName: "accounts", ChangeType: "alter", DDL: "ALTER TABLE `accounts` ADD COLUMN `region` varchar(20)", Status: state.Task.Pending},
 			},
 		})
 	})
@@ -78,6 +81,7 @@ func TestWriteProgressMultiDeploymentResumingOffersNoStart(t *testing.T) {
 	assert.Contains(t, output, "Targets:      2 resuming")
 	assert.Contains(t, output, "~ users: "+ANSICyan+"🔄 Resuming..."+ANSIReset+"\n")
 	assert.Contains(t, output, "COLUMN `region`", "the table keeps its DDL")
+	assert.Contains(t, output, "~ accounts: ⏳ Queued\n", "a table that never started is not resumed, so it stays queued")
 	assert.NotContains(t, output, "stopped")
 	assert.NotContains(t, output, "schemabot start")
 }

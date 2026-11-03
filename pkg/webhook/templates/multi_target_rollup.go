@@ -58,6 +58,7 @@ func writeTargetRollup(sb *strings.Builder, data MultiDeploymentApplyData, g pre
 	}
 	changing := changingMembers(data.Model, g)
 	settled := data.Model.RolloutSettled(g)
+	resuming := state.IsState(data.Model.State, state.Apply.Resuming)
 	rankTargetTableLines(lines)
 	for _, line := range lines {
 		first := memberDetail(data.Details, line.members[0])
@@ -69,10 +70,18 @@ func writeTargetRollup(sb *strings.Builder, data MultiDeploymentApplyData, g pre
 		// target's stored plan and says which other targets run the same.
 		restoreScope := planScopeForLine(budget, line.targets, subset, silent)
 		restorePlan := budget.pointAt(first.storedPlan())
-		strip := targetStrip(line.listed, line.listedTargets)
-		writeTargetTableLine(sb, line.table.TableName, line.listed, strip, settled, budget, func() {
-			writeTargetLineDDL(sb, dialect, line, subset, changing, budget)
-		})
+		writeDDL := func() { writeTargetLineDDL(sb, dialect, line, subset, changing, budget) }
+		if resuming && rollupTaskStatus(line.listed) == state.Task.Stopped {
+			// The stopped progress is from before the stop, and whether the
+			// copy continues from its checkpoint is not known until a target
+			// reports it, so the line says the start is under way, as the
+			// single-deployment comment does (renderResumingTable).
+			fmt.Fprintf(sb, "**%s**: \U0001f504 Resuming…\n", inlineCode(line.table.TableName))
+			writeDDL()
+		} else {
+			strip := targetStrip(line.listed, line.listedTargets)
+			writeTargetTableLine(sb, line.table.TableName, line.listed, strip, settled, budget, writeDDL)
+		}
 		sb.WriteString("\n")
 		restorePlan()
 		restoreScope()

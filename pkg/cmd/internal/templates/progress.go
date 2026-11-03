@@ -488,9 +488,10 @@ func writeTableLine(b *strings.Builder, t TableProgress, format string, args ...
 }
 
 // awaitsResume reports whether a table is one a claimed start has yet to pick
-// back up: the apply is resuming and the table has not reached an outcome.
+// back up: the apply is resuming and the table is still stopped. A table that
+// never started stays queued, since the start does not resume it.
 func awaitsResume(t TableProgress) bool {
-	return t.Resuming && !state.IsTerminalTaskState(state.NormalizeTaskStatus(t.Status))
+	return t.Resuming && state.IsState(t.Status, state.Task.Stopped)
 }
 
 // formatResumingTable renders a table awaiting its resume as its state and
