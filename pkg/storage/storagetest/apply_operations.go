@@ -1839,6 +1839,71 @@ func TestApplyOperations(t *testing.T, h Harness) {
 		assert.Equal(t, storage.DefaultMaxDriversPerApply, claimed, "a wide apply occupies exactly the cap's worth of drivers, not every claimable shard")
 	})
 
+	// FindNextApplyOperation_SkipDeferredCutoverWork verifies the claim a
+	// driver reserved for everything but deferred-cutover work makes. It never
+	// starts or recovers an operation of an apply deferring its cutover, so it
+	// takes the regular apply's operation even though the deferred one queued
+	// first, and leaves the deferred one to the other drivers. It still claims
+	// a deferred operation to deliver a cancel, since that ends the work.
+	t.Run("FindNextApplyOperation_SkipDeferredCutoverWork", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+
+		deferredApply := CreateApply(t, store, CreateLock(t, store, "operation_skip_deferred_db", storage.DatabaseTypeMySQL), "apply_operation_skip_deferred", 931)
+		deferredApply.Options = []byte(`{"defer_cutover":true}`)
+		require.NoError(t, store.Applies().Update(ctx, deferredApply))
+		regularApply := CreateApply(t, store, CreateLock(t, store, "operation_skip_regular_db", storage.DatabaseTypeMySQL), "apply_operation_skip_regular", 932)
+
+		insert := func(apply *storage.Apply) int64 {
+			t.Helper()
+			id, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+				ApplyID: apply.ID, Deployment: "region-a",
+				OperationKey:  "commerce/-80/users",
+				OperationKind: storage.ApplyOperationKindWork,
+			})
+			require.NoError(t, err)
+			return id
+		}
+		deferredOp := insert(deferredApply)
+		regularOp := insert(regularApply)
+
+		claimSkipping := func() *storage.ApplyOperation {
+			t.Helper()
+			got, err := store.ApplyOperations().FindNextApplyOperation(ctx, "reserved-driver", storage.SkipDeferredCutoverWork())
+			require.NoError(t, err)
+			return got
+		}
+		claim := func() *storage.ApplyOperation {
+			t.Helper()
+			got, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-a")
+			require.NoError(t, err)
+			return got
+		}
+
+		got := claimSkipping()
+		require.NotNil(t, got, "the reserved driver takes the regular apply's operation")
+		assert.Equal(t, regularOp, got.ID)
+		assert.Nil(t, claimSkipping(), "the reserved driver does not start the deferred apply's operation")
+
+		got = claim()
+		require.NotNil(t, got, "any other driver starts the deferred apply's operation")
+		assert.Equal(t, deferredOp, got.ID)
+
+		released, err := store.ApplyOperations().ReleaseClaim(ctx, got.Lease())
+		require.NoError(t, err)
+		require.True(t, released)
+		assert.Nil(t, claimSkipping(), "the reserved driver does not recover the deferred apply's stale operation")
+		got = claim()
+		require.NotNil(t, got, "any other driver recovers the deferred apply's stale operation")
+		assert.Equal(t, deferredOp, got.ID)
+
+		require.NoError(t, store.ApplyOperations().UpdateState(ctx, deferredOp, state.ApplyOperation.Stopped))
+		requestControl(t, store, deferredApply.ID, storage.ControlOperationCancel)
+		got = claimSkipping()
+		require.NotNil(t, got, "the reserved driver still delivers a cancel to the deferred apply")
+		assert.Equal(t, deferredOp, got.ID)
+	})
+
 	// LeaseGuardsSingleAndJoinedWrites verifies both guarded DML shapes. An
 	// operation lease fences a single-row write on the child token, while an
 	// apply lease fences a joined child/parent write; stale holders lose
@@ -1893,6 +1958,33 @@ func TestApplyOperations(t *testing.T, h Harness) {
 		require.NotNil(t, operation)
 		assert.Equal(t, state.ApplyOperation.Running, operation.State)
 		assert.NotNil(t, operation.StartedAt)
+	})
+
+	// An operation row carries no terminal-state guard: the lease fence alone
+	// decides who may write it. No peer can claim a terminal operation, so what
+	// refuses a late write is the drive's end handing its lease back: after
+	// that, a write under the old lease fails and the row stays terminal.
+	t.Run("UpdateState_EndedDriveCannotWriteOverTerminalOperation", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "operation_displaced_db", storage.DatabaseTypeMySQL)
+		apply := CreateApply(t, store, lock, "apply_operation_displaced", 908)
+		opID := createOperation(t, store, apply.ID, "region-a", "schema")
+		claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-a")
+		require.NoError(t, err)
+		require.NotNil(t, claimed)
+		ownedCtx := storage.WithOperationLease(ctx, claimed.Lease())
+
+		require.NoError(t, store.ApplyOperations().MarkFailed(ownedCtx, opID, "engine failed"))
+		released, err := store.ApplyOperations().ReleaseFinishedClaim(ctx, claimed.Lease())
+		require.NoError(t, err)
+		require.True(t, released)
+
+		require.ErrorIs(t, store.ApplyOperations().UpdateState(ownedCtx, opID, state.ApplyOperation.Running), storage.ErrApplyLeaseLost)
+		operation, err := store.ApplyOperations().Get(ctx, opID)
+		require.NoError(t, err)
+		require.NotNil(t, operation)
+		assert.Equal(t, state.ApplyOperation.Failed, operation.State, "a drive that has ended must not reopen a terminal operation")
 	})
 
 	// MarkPendingStoppedByApply verifies the bulk transition changes only

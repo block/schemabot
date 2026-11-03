@@ -467,7 +467,7 @@ func testPostgresApplyCommentReclaimStaleSummaryClaim(t *testing.T, h postgresHa
 	require.NoError(t, err)
 	assert.False(t, reclaimed, "missing marker is not reclaimable")
 
-	won, err := store.ApplyComments().ClaimSummaryComment(ctx, apply.ID)
+	won, err := store.ApplyComments().ClaimSummaryComment(ctx, apply.ID, state.Apply.Stopped)
 	require.NoError(t, err)
 	require.True(t, won)
 
@@ -591,7 +591,7 @@ func testPostgresApplyCommentClaimConversionRestartsStaleWindow(t *testing.T, h 
 	require.NoError(t, store.ApplyComments().Supersede(ctx, apply.ID, state.Comment.Summary))
 	backdatePostgresSummaryClaim(t, h.db, apply.ID)
 
-	won, err := store.ApplyComments().ClaimSummaryComment(ctx, apply.ID)
+	won, err := store.ApplyComments().ClaimSummaryComment(ctx, apply.ID, state.Apply.Stopped)
 	require.NoError(t, err)
 	require.True(t, won, "the superseded posted marker converts back into a claim sentinel")
 
