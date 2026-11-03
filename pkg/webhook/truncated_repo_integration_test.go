@@ -79,10 +79,8 @@ func setupFakeGitHubForPlanOnTruncatedRepoWithPRState(t *testing.T, mux *http.Se
 	})
 	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1/files", func(w http.ResponseWriter, _ *http.Request) {
 		_ = json.NewEncoder(w).Encode([]*gh.CommitFile{{
-			Filename:  new("docs/readme.md"),
-			Status:    new("modified"),
-			Additions: new(4),
-			Deletions: new(2),
+			Filename: new("docs/readme.md"),
+			Status:   new("modified"),
 		}})
 	})
 

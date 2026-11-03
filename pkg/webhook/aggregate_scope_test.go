@@ -31,9 +31,6 @@ func serveAggregateScopeInputs(t *testing.T, mux *http.ServeMux, paths []string,
 	mux.HandleFunc("GET /repos/octocat/hello-world/git/ref/heads/main", func(w http.ResponseWriter, _ *http.Request) {
 		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{"object": map[string]string{"sha": "base"}}))
 	})
-	mux.HandleFunc("GET /repos/octocat/hello-world/compare/{range}", func(w http.ResponseWriter, _ *http.Request) {
-		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{"merge_base_commit": map[string]string{"sha": "base"}}))
-	})
 	mux.HandleFunc("GET /repos/octocat/hello-world/git/trees/", func(w http.ResponseWriter, req *http.Request) {
 		entries := []map[string]string{}
 		if strings.HasSuffix(req.URL.Path, "/abc123") {
