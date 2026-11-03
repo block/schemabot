@@ -161,3 +161,76 @@ func TestExecuteApplySequential_TaskStartWriteLeaseLostStandsDown(t *testing.T) 
 	assert.Nil(t, eng.progressReq, "a displaced drive never polls the engine")
 	assert.Equal(t, []string{driveWorkOwner(drive)}, eng.haltOwners, "the accepted work is halted under the drive's own owner")
 }
+
+// startCancellingTaskStore cancels the drive as storage refuses the running write,
+// the way a shutdown or handover arriving mid-write does.
+type startCancellingTaskStore struct {
+	*runningRefusingTaskStore
+	cancel context.CancelFunc
+}
+
+func (s *startCancellingTaskStore) Update(ctx context.Context, task *storage.Task) error {
+	if state.IsState(task.State, state.Task.Running) {
+		s.cancel()
+	}
+	return s.runningRefusingTaskStore.Update(ctx, task)
+}
+
+// A start write refused because the drive was cancelled is the cancellation,
+// not a storage failure: the drive hands the apply back with no verdict, so the
+// task is not rested failed_retryable over an error that only describes the
+// cancellation.
+func TestExecuteApplySequential_TaskStartWriteRefusedByCancelledDriveHandsApplyBack(t *testing.T) {
+	client, apply, tasks, applies, taskStore, eng := sequentialStartFixture(context.Canceled)
+	drive, cancel := context.WithCancel(driveContext(t.Context(), "token-a"))
+	defer cancel()
+	client.storage.(*exactProgressStorage).tasks = &startCancellingTaskStore{runningRefusingTaskStore: taskStore, cancel: cancel}
+
+	require.NoError(t, client.executeApplySequential(drive, apply, tasks, &storage.Plan{}, nil))
+
+	storedApply, err := applies.Get(t.Context(), apply.ID)
+	require.NoError(t, err)
+	stored, err := taskStore.Get(t.Context(), tasks[0].TaskIdentifier)
+	require.NoError(t, err)
+	assert.True(t, state.IsState(stored.State, state.Task.Pending), "the task carries no verdict, got %s", stored.State)
+	assert.Empty(t, stored.ErrorMessage)
+	assert.False(t, state.IsState(storedApply.State, state.Apply.FailedRetryable), "the apply is handed back, not paused, got %s", storedApply.State)
+	assert.Equal(t, 1, eng.applyCalls, "a cancelled drive starts no further table")
+	assert.Nil(t, eng.progressReq, "a cancelled drive never polls the engine")
+	assert.Equal(t, []string{driveWorkOwner(drive)}, eng.haltOwners, "the accepted work is halted under the drive's own owner")
+}
+
+// startAndVerdictRefusingTaskStore refuses the failed_retryable verdict as well as the
+// running write.
+type startAndVerdictRefusingTaskStore struct {
+	*runningRefusingTaskStore
+}
+
+func (s *startAndVerdictRefusingTaskStore) Update(ctx context.Context, task *storage.Task) error {
+	if state.IsState(task.State, state.Task.FailedRetryable) {
+		return s.err
+	}
+	return s.runningRefusingTaskStore.Update(ctx, task)
+}
+
+// When storage refuses the retry verdict too, the drive must not finalize the
+// apply from a task row storage never took: the apply stays active for the next
+// claim to settle.
+func TestExecuteApplySequential_TaskStartWriteAndRetryVerdictRefusedLeaveApplyActive(t *testing.T) {
+	client, apply, tasks, applies, taskStore, eng := sequentialStartFixture(errors.New("storage unavailable"))
+	drive := driveContext(t.Context(), "token-a")
+	client.storage.(*exactProgressStorage).tasks = &startAndVerdictRefusingTaskStore{runningRefusingTaskStore: taskStore}
+
+	require.NoError(t, client.executeApplySequential(drive, apply, tasks, &storage.Plan{}, nil))
+
+	storedApply, err := applies.Get(t.Context(), apply.ID)
+	require.NoError(t, err)
+	stored, err := taskStore.Get(t.Context(), tasks[0].TaskIdentifier)
+	require.NoError(t, err)
+	assert.True(t, state.IsState(stored.State, state.Task.Pending), "got %s", stored.State)
+	assert.False(t, state.IsTerminalApplyState(storedApply.State), "the apply stays active, got %s", storedApply.State)
+	assert.False(t, state.IsState(storedApply.State, state.Apply.FailedRetryable), "the apply is not paused on a verdict storage refused, got %s", storedApply.State)
+	assert.Equal(t, 1, eng.applyCalls)
+	assert.Nil(t, eng.progressReq)
+	assert.Equal(t, []string{driveWorkOwner(drive)}, eng.haltOwners)
+}

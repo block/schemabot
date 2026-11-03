@@ -674,6 +674,11 @@ func (c *LocalClient) runEngineTaskAttempt(ctx context.Context, apply *storage.A
 // the apply is no longer this driver's stands down without a verdict. Any
 // other failure records the task failed_retryable, so the apply pauses for an
 // operator retry rather than running work storage does not show as started.
+//
+// The exit halt reaches only engines that run their work in this process
+// (engine.OwnedWorkHalter). An engine that runs its work elsewhere is not
+// halted here; its resume state is already recorded, so an operator stop or
+// cancel still reaches that work.
 func (c *LocalClient) recordSequentialTaskRunning(ctx context.Context, logger *slog.Logger, apply *storage.Apply, task *storage.Task) (taskAction, bool) {
 	err := c.markTasksRunning(ctx, apply, []*storage.Task{task})
 	if err == nil {
@@ -682,6 +687,8 @@ func (c *LocalClient) recordSequentialTaskRunning(ctx context.Context, logger *s
 	if c.driveCancelled(ctx, apply, "while recording that the engine started task "+task.TaskIdentifier) {
 		return taskHandover, false
 	}
+	// A task write can only be fenced by ErrApplyLeaseLost; the predicate's
+	// other causes come from the apply store and never reach this write.
 	if applyWriteEndsDrive(err) {
 		logger.Warn("task is no longer this driver's to run; drive will stand down and halt the engine work it started",
 			append(task.LogAttrs(), "error", err)...)
