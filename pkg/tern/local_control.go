@@ -46,7 +46,7 @@ func (c *LocalClient) requestCutover(ctx context.Context, req *ternv1.CutoverReq
 			append(apply.LogAttrs(), "apply_operation_id", req.GetApplyOperationId(), "apply_operation_ids", req.GetApplyOperationIds(), "reason", refusal)...)
 		return &ternv1.CutoverResponse{Accepted: false, ErrorMessage: refusal}, nil
 	}
-	return c.queueCutoverRequest(ctx, apply, caller, boundIDs)
+	return c.queueCutoverRequest(ctx, apply, caller, req.GetCommandId(), boundIDs)
 }
 
 // cutoverRequestBinding resolves the operations a cutover request binds: every
@@ -335,7 +335,7 @@ func (c *LocalClient) cutover(ctx context.Context, req *ternv1.CutoverRequest, c
 // stop and start are routed to the owner. A cutover RPC can land on any instance
 // sharing the route's storage, so it must never act on a local engine that may
 // not be running this schema change.
-func (c *LocalClient) queueCutoverRequest(ctx context.Context, apply *storage.Apply, caller string, boundIDs []int64) (*ternv1.CutoverResponse, error) {
+func (c *LocalClient) queueCutoverRequest(ctx context.Context, apply *storage.Apply, caller, commandID string, boundIDs []int64) (*ternv1.CutoverResponse, error) {
 	controlStore := c.storage.ControlRequests()
 	if controlStore == nil {
 		return nil, fmt.Errorf("control request store is not available")
@@ -354,9 +354,12 @@ func (c *LocalClient) queueCutoverRequest(ctx context.Context, apply *storage.Ap
 		}
 		request.Metadata = metadata
 	}
-	existing, alreadyPending, err := controlStore.RequestPending(ctx, request)
+	existing, alreadyPending, err := recordCutoverRequest(ctx, controlStore, request, commandID)
 	if err != nil {
 		return nil, fmt.Errorf("record cutover control request for apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	if existing != nil && existing.Status != storage.ControlRequestPending {
+		return c.settledCutoverCommandResponse(apply, existing, commandID), nil
 	}
 	if alreadyPending {
 		pendingFor, err := existing.CutoverOperationIDs()
@@ -371,16 +374,22 @@ func (c *LocalClient) queueCutoverRequest(ctx context.Context, apply *storage.Ap
 			message := pendingCutoverForOtherOperationsMessage(apply.ApplyIdentifier, pendingFor, boundIDs)
 			c.logger.Warn("cutover refused: a cutover for another operation of the apply is still pending",
 				append(apply.LogAttrs(), "pending_for_operations", pendingFor, "requested_for_operations", boundIDs)...)
-			return &ternv1.CutoverResponse{Accepted: false, ErrorMessage: message}, nil
+			return &ternv1.CutoverResponse{Accepted: false, ErrorMessage: message, CommandId: commandID}, nil
 		}
 	}
-	if alreadyPending {
+	switch {
+	case alreadyPending && commandID != "":
+		// A caller that sends a command id re-sends the command on every
+		// drive tick until the apply settles it.
+		c.logger.Debug("cutover command re-sent while its request is pending",
+			append(apply.LogAttrs(), "command_id", commandID, "requested_by", requestedBy)...)
+	case alreadyPending:
 		c.logger.Info("cutover request already pending for apply owner",
 			"apply_id", apply.ApplyIdentifier,
 			"database", apply.Database,
 			"environment", apply.Environment,
 			"requested_by", requestedBy)
-	} else {
+	default:
 		c.logger.Info("cutover request queued for apply owner",
 			"apply_id", apply.ApplyIdentifier,
 			"database", apply.Database,
@@ -390,7 +399,38 @@ func (c *LocalClient) queueCutoverRequest(ctx context.Context, apply *storage.Ap
 			fmt.Sprintf("Cutover request queued for apply owner%s", callerApplyLogSuffix(requestedBy)), "", "")
 	}
 	c.wakeOperator(apply)
-	return &ternv1.CutoverResponse{Accepted: true}, nil
+	return &ternv1.CutoverResponse{Accepted: true, CommandId: commandID}, nil
+}
+
+// recordCutoverRequest records a cutover request for the operator command
+// commandID. A request that names its command is recorded once per command,
+// so a re-send of a command the apply already settled returns the settled
+// row; one that names none is recorded as a new command on every send.
+func recordCutoverRequest(ctx context.Context, controlStore storage.ControlRequestStore, request *storage.ApplyControlRequest, commandID string) (*storage.ApplyControlRequest, bool, error) {
+	if commandID == "" {
+		return controlStore.RequestPending(ctx, request)
+	}
+	metadata, err := storage.WithControlCommandID(request.Metadata, commandID)
+	if err != nil {
+		return nil, false, err
+	}
+	request.Metadata = metadata
+	return controlStore.RequestPendingCommand(ctx, request)
+}
+
+// settledCutoverCommandResponse answers a re-send of a cutover command the
+// apply's drives already settled with that outcome. Recording it again would
+// retry a cutover that failed, or run a second one, without the operator
+// asking.
+func (c *LocalClient) settledCutoverCommandResponse(apply *storage.Apply, settled *storage.ApplyControlRequest, commandID string) *ternv1.CutoverResponse {
+	if settled.Status == storage.ControlRequestFailed {
+		c.logger.Info("cutover command already failed; answering the re-send with its failure",
+			append(apply.LogAttrs(), "command_id", commandID, "error_message", settled.ErrorMessage)...)
+		return &ternv1.CutoverResponse{Accepted: false, ErrorMessage: settled.ErrorMessage, CommandId: commandID}
+	}
+	c.logger.Debug("cutover command already completed; answering the re-send as accepted",
+		append(apply.LogAttrs(), "command_id", commandID)...)
+	return &ternv1.CutoverResponse{Accepted: true, CommandId: commandID}
 }
 
 // pendingCutoverForOtherOperationsMessage refuses a cutover while another

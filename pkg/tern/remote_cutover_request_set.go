@@ -35,13 +35,21 @@ func (c *GRPCClient) processPendingRemoteCutoverSet(ctx context.Context, apply *
 }
 
 // sendRemoteCutoverSetShare sends a cutover request set to this drive's
-// remote apply, once. The drive sends only while its own operation waits at
-// the cutover and no earlier member holds it. An operation already cutting
-// over was reached by a sibling's send of the same set, so it sends nothing.
+// remote apply. The drive sends only while its own operation waits at the
+// cutover and no earlier member holds it. An operation already cutting over
+// was reached by a sibling's send of the same set, so it sends nothing.
+//
+// Every send carries the command's id (remoteCutoverCommandID). A data plane
+// that echoes it answers a re-send of a command it already settled with that
+// outcome, so the drive re-sends on every tick until the set resolves, and a
+// cutover the data plane failed after accepting it fails the command here. A
+// data plane that does not echo it records every send as a new command, so
+// the drive sends it each command only once.
 func (c *GRPCClient) sendRemoteCutoverSetShare(ctx context.Context, apply *storage.Apply, scope applyTaskScope, controlReq *storage.ApplyControlRequest, ids []int64, logger *slog.Logger) error {
 	operationID := scope.applyOperationID
 	key := newCutoverShareKey(controlReq, operationID)
-	if _, taken := c.cutoverSharesTaken.Load(key); taken {
+	sent, alreadySent := c.cutoverSharesTaken.Load(key)
+	if alreadySent && sent == remoteCutoverSentOnce {
 		logger.DebugContext(ctx, "this drive already sent the pending gRPC cutover request to its remote apply; waiting for the rest of the set",
 			"requested_by", controlRequestCaller(controlReq), "drive_operation_id", operationID)
 		return nil
@@ -89,18 +97,11 @@ func (c *GRPCClient) sendRemoteCutoverSetShare(ctx context.Context, apply *stora
 	}
 	remoteID := scope.remoteApplyID(apply)
 	if remoteID == "" {
-		message := "remote apply id is not available"
-		if err := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCutover, message); err != nil {
-			return err
-		}
-		return fmt.Errorf("process pending gRPC cutover for apply %s: %s", apply.ApplyIdentifier, message)
+		return c.failRemoteCutoverSetShare(ctx, apply, controlReq, logger, ids, operationID, "", "remote apply id is not available")
 	}
 	remoteOperationID, err := scope.remoteOperationScope()
 	if err != nil {
-		if failErr := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCutover, err.Error(), remoteID); failErr != nil {
-			return failErr
-		}
-		return fmt.Errorf("process pending gRPC cutover for apply %s: %w", apply.ApplyIdentifier, err)
+		return c.failRemoteCutoverSetShare(ctx, apply, controlReq, logger, ids, operationID, remoteID, err.Error())
 	}
 	var remoteOperationIDs []string
 	if remoteOperationID != "" {
@@ -114,6 +115,7 @@ func (c *GRPCClient) sendRemoteCutoverSetShare(ctx context.Context, apply *stora
 		Environment:      apply.Environment,
 		Caller:           controlReq.RequestedBy,
 		ApplyOperationId: remoteOperationID,
+		CommandId:        remoteCutoverCommandID(controlReq),
 	}
 	if len(remoteOperationIDs) > 1 {
 		req.ApplyOperationIds = remoteOperationIDs
@@ -122,22 +124,33 @@ func (c *GRPCClient) sendRemoteCutoverSetShare(ctx context.Context, apply *stora
 	if err != nil {
 		if isAmbiguousRemoteCallError(err) {
 			// The data plane records a cutover durably on receipt and answers
-			// a re-sent set as the request it already holds, so a call that
-			// ended without an answer leaves the request pending for the next
-			// drive tick to re-send.
+			// a re-send of the command with the request it already holds or
+			// the outcome it settled, so a call that ended without an answer
+			// leaves the request pending for the next drive tick to re-send.
 			logger.WarnContext(ctx, "remote cutover call ended without an answer; the cutover request stays pending and the next drive re-sends it",
 				"requested_by", controlRequestCaller(controlReq), "drive_operation_id", operationID, "remote_apply_id", remoteID, "error", err)
 			return fmt.Errorf("request remote gRPC cutover for apply %s remote %s: outcome unknown, request left pending: %w", apply.ApplyIdentifier, remoteID, err)
 		}
-		return c.failRemoteCutoverSetShare(ctx, apply, controlReq, logger, operationID, remoteID, fmt.Sprintf("remote cutover failed: %v", err))
+		return c.failRemoteCutoverSetShare(ctx, apply, controlReq, logger, ids, operationID, remoteID, fmt.Sprintf("remote cutover failed: %v", err))
 	}
 	if resp == nil {
-		return c.failRemoteCutoverSetShare(ctx, apply, controlReq, logger, operationID, remoteID, "the data plane returned neither a response nor an error")
+		return c.failRemoteCutoverSetShare(ctx, apply, controlReq, logger, ids, operationID, remoteID, "the data plane returned neither a response nor an error")
 	}
 	if !resp.Accepted {
-		return c.failRemoteCutoverSetShare(ctx, apply, controlReq, logger, operationID, remoteID, controlRefusalMessage(storage.ControlOperationCutover, resp.ErrorMessage))
+		return c.failRemoteCutoverSetShare(ctx, apply, controlReq, logger, ids, operationID, remoteID, controlRefusalMessage(storage.ControlOperationCutover, resp.ErrorMessage))
 	}
-	c.cutoverSharesTaken.Store(key, struct{}{})
+	if alreadySent {
+		logger.DebugContext(ctx, "the remote apply still holds this drive's share of the pending gRPC cutover request; waiting for the rest of the set",
+			"requested_by", controlRequestCaller(controlReq), "drive_operation_id", operationID, "remote_apply_id", remoteID)
+		return nil
+	}
+	if resp.GetCommandId() == req.GetCommandId() {
+		c.cutoverSharesTaken.Store(key, remoteCutoverResent)
+	} else {
+		logger.InfoContext(ctx, "the data plane did not echo the cutover command id, so this drive sends its share of the command only once",
+			"requested_by", controlRequestCaller(controlReq), "drive_operation_id", operationID, "remote_apply_id", remoteID)
+		c.cutoverSharesTaken.Store(key, remoteCutoverSentOnce)
+	}
 	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventCutoverTriggered,
 		fmt.Sprintf("Remote cutover accepted for apply %s (remote %s)%s", apply.ApplyIdentifier, remoteID, callerApplyLogSuffix(controlRequestCaller(controlReq))), "", "")
 	logger.InfoContext(ctx, "sent this drive's share of the pending gRPC cutover request to its remote apply; the request settles once the whole set has",
@@ -146,13 +159,39 @@ func (c *GRPCClient) sendRemoteCutoverSetShare(ctx context.Context, apply *stora
 	return nil
 }
 
-// failRemoteCutoverSetShare fails a pending cutover request set whose send
-// the data plane did not take. The whole command fails, as it does when the
-// local cutover path refuses one operation of a set: the operator sees the
-// refusal and issues the cutover again. Only the command this drive sent is
-// failed; a newer one re-armed on the same row is left to its own drive.
-func (c *GRPCClient) failRemoteCutoverSetShare(ctx context.Context, apply *storage.Apply, controlReq *storage.ApplyControlRequest, logger *slog.Logger, operationID int64, remoteID, message string) error {
-	if err := settlePendingControlRequestRevision(ctx, c.storage, logger, apply, controlReq, storage.ControlRequestFailed, message, remoteID); err != nil {
+// remoteCutoverShareSend is how a drive sends its share of one cutover
+// command (cutoverShareKey) after the data plane accepted it.
+type remoteCutoverShareSend int
+
+const (
+	// remoteCutoverResent: the data plane echoed the command id, so the drive
+	// re-sends on every tick and learns the outcome the data plane settled.
+	remoteCutoverResent remoteCutoverShareSend = iota + 1
+	// remoteCutoverSentOnce: the data plane did not echo the command id and
+	// would record a re-send as a new command, so the drive does not re-send.
+	remoteCutoverSentOnce
+)
+
+// remoteCutoverCommandID names the operator command a pending cutover request
+// carries: the request row and the revision it was armed at, the same on
+// every send of the command and different for the next command on the row.
+func remoteCutoverCommandID(controlReq *storage.ApplyControlRequest) string {
+	return fmt.Sprintf("%d.%d", controlReq.ID, controlReq.Revision)
+}
+
+// failRemoteCutoverSetShare fails a pending cutover request set whose share
+// this drive could not send, or the data plane did not take. The whole
+// command fails, as it does when the local cutover path refuses one operation
+// of a set: the operator sees the refusal, with how many of the set's
+// operations cut over, and issues the cutover again. Only the command this
+// drive sent is failed; a newer one re-armed on the same row is left to its
+// own drive.
+func (c *GRPCClient) failRemoteCutoverSetShare(ctx context.Context, apply *storage.Apply, controlReq *storage.ApplyControlRequest, logger *slog.Logger, ids []int64, operationID int64, remoteID, message string) error {
+	var remoteIDs []string
+	if remoteID != "" {
+		remoteIDs = append(remoteIDs, remoteID)
+	}
+	if err := failCutoverSet(ctx, c.storage, logger, apply, controlReq, ids, operationID, message, remoteIDs...); err != nil {
 		return fmt.Errorf("request remote gRPC cutover for apply %s operation %d remote %s: %s: %w", apply.ApplyIdentifier, operationID, remoteID, message, err)
 	}
 	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelError, storage.LogEventError,

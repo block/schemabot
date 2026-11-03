@@ -279,6 +279,61 @@ func TestLocalClient_CutoverListingSeveralOperationsIsOneRequestForThemAll(t *te
 	assert.Empty(t, fx.engine.cutoverContexts, "queueing a cutover never swaps anything")
 }
 
+// A control plane re-sends its cutover command to the data plane on every
+// drive tick, carrying the same command id, until the set resolves. The data
+// plane records the command once and echoes the id: a re-send while it is
+// pending is the same request, a re-send after the engine failed the cutover
+// is answered with that failure rather than re-arming the request, and a
+// re-send after it completed is accepted without recording anything. Only a
+// new command id records a new request.
+func TestLocalClient_CutoverCommandIsRecordedOncePerCommandID(t *testing.T) {
+	fx := newSharedApplyFixture(state.ApplyOperation.WaitingForCutover, state.ApplyOperation.WaitingForCutover, state.Task.WaitingForCutover, state.Task.WaitingForCutover)
+	cutover := func(commandID string) *ternv1.CutoverResponse {
+		resp, err := fx.client.Cutover(t.Context(), &ternv1.CutoverRequest{
+			ApplyId: fx.apply.ApplyIdentifier, Environment: "staging", Caller: "tern-grpc",
+			ApplyOperationId: "11", ApplyOperationIds: []string{"11", "12"}, CommandId: commandID,
+		})
+		require.NoError(t, err)
+		require.NotNil(t, resp)
+		return resp
+	}
+
+	first := cutover("9.0")
+	require.True(t, first.Accepted)
+	assert.Equal(t, "9.0", first.CommandId, "the data plane echoes the command id it recorded")
+	require.Len(t, fx.controlRequests.requests, 1)
+	recorded := fx.controlRequests.requests[0]
+	commandID, err := recorded.ControlCommandID()
+	require.NoError(t, err)
+	assert.Equal(t, "9.0", commandID)
+	boundTo, err := recorded.CutoverOperationIDs()
+	require.NoError(t, err)
+	assert.Equal(t, []int64{11, 12}, boundTo, "recording the command keeps the operations the request is bound to")
+
+	assert.True(t, cutover("9.0").Accepted, "a re-send while the command is pending is the same request")
+	assert.Equal(t, int64(0), recorded.Revision)
+
+	recorded.Status = storage.ControlRequestFailed
+	recorded.ErrorMessage = "cutover reached 1 of the 2 operations it was sent for; engine refused the cutover"
+	afterFailure := cutover("9.0")
+	assert.False(t, afterFailure.Accepted, "a re-send of a failed command is answered with the failure")
+	assert.Equal(t, "cutover reached 1 of the 2 operations it was sent for; engine refused the cutover", afterFailure.ErrorMessage)
+	assert.Equal(t, "9.0", afterFailure.CommandId)
+	assert.Equal(t, storage.ControlRequestFailed, recorded.Status, "the failed command is not re-armed")
+	assert.Equal(t, int64(0), recorded.Revision)
+
+	recorded.Status = storage.ControlRequestCompleted
+	recorded.ErrorMessage = ""
+	assert.True(t, cutover("9.0").Accepted, "a re-send of a completed command is accepted")
+	assert.Equal(t, storage.ControlRequestCompleted, recorded.Status, "the completed command is not re-armed")
+
+	next := cutover("9.1")
+	assert.True(t, next.Accepted)
+	assert.Equal(t, storage.ControlRequestPending, recorded.Status, "a new command records a new request")
+	assert.Equal(t, int64(1), recorded.Revision)
+	assert.Empty(t, fx.engine.cutoverContexts, "queueing a cutover never swaps anything")
+}
+
 // A cutover list is refused before anything is recorded when it names an
 // operation the apply does not have, names one twice, or names a single
 // operation outside the list, which a server reading only that field would cut

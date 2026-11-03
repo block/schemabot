@@ -1873,6 +1873,15 @@ type ControlRequestStore interface {
 	// returned with alreadyPending=true.
 	RequestPending(ctx context.Context, req *ApplyControlRequest) (*ApplyControlRequest, bool, error)
 
+	// RequestPendingCommand records req as RequestPending does, for the
+	// operator command req carries (ApplyControlRequest.ControlCommandID). A
+	// settled row that already carries that command is returned unchanged,
+	// with alreadyPending false: the command has run, and re-arming the row
+	// would retry it without the operator asking again. The caller tells that
+	// answer apart by the returned row's status. A req that carries no command
+	// is recorded as RequestPending records it.
+	RequestPendingCommand(ctx context.Context, req *ApplyControlRequest) (*ApplyControlRequest, bool, error)
+
 	// RequestPendingSuperseding records req as RequestPending does and, in the
 	// same transaction, completes the apply's pending request for superseded,
 	// whose effect req replaces. Either both writes land or neither does, so a

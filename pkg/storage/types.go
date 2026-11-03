@@ -1823,6 +1823,64 @@ type cutoverRequestBinding struct {
 	ApplyOperationIDs []int64 `json:"apply_operation_ids"`
 }
 
+// controlCommandMetadataKey records the operator command a control request
+// carries when it arrived from another plane, which sends the same command
+// more than once. A request that carries one is recorded once per command:
+// see ControlRequestStore.RequestPendingCommand.
+const controlCommandMetadataKey = "command_id"
+
+// WithControlCommandID returns metadata with commandID recorded as the
+// operator command the request carries. An empty commandID leaves metadata as
+// it is.
+func WithControlCommandID(metadata []byte, commandID string) ([]byte, error) {
+	if commandID == "" {
+		return metadata, nil
+	}
+	payload := map[string]any{}
+	if len(metadata) > 0 {
+		if err := json.Unmarshal(metadata, &payload); err != nil {
+			return nil, fmt.Errorf("parse control request metadata to record command %s: %w", commandID, err)
+		}
+	}
+	payload[controlCommandMetadataKey] = commandID
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("encode control request metadata with command %s: %w", commandID, err)
+	}
+	return encoded, nil
+}
+
+// SettledByControlCommand reports whether r is a settled request that already
+// carries the operator command commandID, which a repeated send of that
+// command must leave settled (ControlRequestStore.RequestPendingCommand).
+func (r *ApplyControlRequest) SettledByControlCommand(commandID string) (bool, error) {
+	if r == nil || commandID == "" || r.Status == ControlRequestPending {
+		return false, nil
+	}
+	recorded, err := r.ControlCommandID()
+	if err != nil {
+		return false, err
+	}
+	return recorded == commandID, nil
+}
+
+// ControlCommandID returns the operator command a control request carries
+// (WithControlCommandID), or "" when it records none. Metadata that does not
+// parse is an error, so a request is never taken for a command it may not
+// carry.
+func (r *ApplyControlRequest) ControlCommandID() (string, error) {
+	if r == nil || len(r.Metadata) == 0 {
+		return "", nil
+	}
+	var command struct {
+		CommandID string `json:"command_id"`
+	}
+	if err := json.Unmarshal(r.Metadata, &command); err != nil {
+		return "", fmt.Errorf("parse metadata of %s control request %d: %w", r.Operation, r.ID, err)
+	}
+	return command.CommandID, nil
+}
+
 func (r *ApplyControlRequest) cutoverBinding() (cutoverRequestBinding, error) {
 	var binding cutoverRequestBinding
 	if r == nil || len(r.Metadata) == 0 {

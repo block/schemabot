@@ -1056,12 +1056,23 @@ message CutoverRequest {
   // names one of them, so a data plane that reads only that field cuts over
   // that operation alone.
   repeated string apply_operation_ids = 5;
+  // When set, identifies the operator command this request carries, the same
+  // on every send of it. A data plane that already settled the command
+  // answers a re-send with that outcome instead of recording the command
+  // again, so a re-send never retries a command the data plane failed. A
+  // new operator command carries a new id.
+  string command_id = 6;
 }
 
 // CutoverResponse indicates whether the cutover was accepted.
 message CutoverResponse {
   bool accepted = 1;
   string error_message = 2;
+  // The command_id the data plane recorded the request under, echoed back.
+  // Empty from a data plane that predates command ids, which records every
+  // send as a new command, so a caller sends such a data plane each command
+  // only once.
+  string command_id = 3;
 }
 
 // RevertRequest reverts a completed schema change.

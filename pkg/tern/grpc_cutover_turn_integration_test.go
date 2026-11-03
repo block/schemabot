@@ -3,6 +3,7 @@
 package tern
 
 import (
+	"fmt"
 	"testing"
 	"time"
 
@@ -509,7 +510,7 @@ func TestGRPCClient_DeferredCutoverSetIsSentToTheRemoteApplyForEveryShard(t *tes
 	requireCutoverRequestPending(t, stor, apply.ID, true, "the request waits for both shards to cut over")
 
 	driveCutoverRequestAs(t, client, apply, first)
-	assert.Equal(t, 1, server.getCutoverCalls(), "a drive sends its share of the command once")
+	assert.Equal(t, 1, server.getCutoverCalls(), "a drive sends its share once to a data plane that does not echo the command id")
 
 	driveCutoverRequestAs(t, client, apply, second)
 	assert.Equal(t, 2, server.getCutoverCalls())
@@ -529,6 +530,62 @@ func TestGRPCClient_DeferredCutoverSetIsSentToTheRemoteApplyForEveryShard(t *tes
 	require.NotNil(t, settled)
 	assert.Equal(t, storage.ControlRequestCompleted, settled.Status)
 	assert.Equal(t, 2, server.getCutoverCalls(), "settling sends nothing more")
+}
+
+// The eu data plane accepts the operator's cutover for both shards, then its
+// engine fails the swap. The control plane re-sends the command on every drive
+// tick with the same command id, so the data plane answers the re-send with
+// the failure it settled instead of recording the cutover again, and the
+// operator's command fails with how many shards cut over. The re-send never
+// retries the cutover the data plane failed.
+func TestGRPCClient_DeferredCutoverSetFailedByTheDataPlaneAfterAcceptingFails(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+	_, dsn := setupMySQLContainer(t)
+	stor := createControlPlaneStorage(t, dsn)
+	server := &capturingTernServer{cutoverAccepted: true, cutoverEchoesCommandID: true}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+	client.storage = stor
+
+	apply, ops := seedCutoverTurnApply(t, stor, "apply-cutover-set-failed-remotely", storage.CutoverPolicyBarrier, []cutoverTurnMember{
+		{deployment: "eu", operationKey: "commerce/-80/widgets", remoteID: "remote-eu", remoteOperationID: "41", opState: state.ApplyOperation.WaitingForCutover, taskState: state.Task.WaitingForCutover},
+		{deployment: "eu", operationKey: "commerce/80-/widgets", remoteID: "remote-eu", remoteOperationID: "42", opState: state.ApplyOperation.WaitingForCutover, taskState: state.Task.WaitingForCutover},
+	})
+	first := ops[0]
+	require.NoError(t, stor.ControlRequests().CompletePending(t.Context(), apply.ID, storage.ControlOperationCutover))
+	requestCutoverSet(t, stor, apply.ID, ops[0].ID, ops[1].ID)
+	pending, err := stor.ControlRequests().GetByOperation(t.Context(), apply.ID, storage.ControlOperationCutover)
+	require.NoError(t, err)
+	require.NotNil(t, pending)
+
+	driveCutoverRequestAs(t, client, apply, first)
+	sent := server.getCutoverRequest()
+	require.NotNil(t, sent)
+	assert.Equal(t, fmt.Sprintf("%d.%d", pending.ID, pending.Revision), sent.GetCommandId(), "the send names the operator's command")
+	requireCutoverRequestPending(t, stor, apply.ID, true, "the data plane took the command")
+
+	driveCutoverRequestAs(t, client, apply, first)
+	assert.Equal(t, 2, server.getCutoverCalls(), "a drive re-sends its share to a data plane that echoes the command id")
+	assert.Equal(t, sent.GetCommandId(), server.getCutoverRequest().GetCommandId(), "a re-send carries the same command id")
+	requireCutoverRequestPending(t, stor, apply.ID, true, "the data plane still holds the command")
+
+	server.answerCutover(false, "engine refused the cutover")
+	driveApply := *apply
+	driveApply.Deployment = first.Deployment
+	scope, err := client.loadOperationApplyTaskScope(t.Context(), &driveApply, first.ID)
+	require.NoError(t, err)
+	err = client.processPendingCutoverControlRequest(t.Context(), &driveApply, scope)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "engine refused the cutover")
+
+	settled, err := stor.ControlRequests().GetByOperation(t.Context(), apply.ID, storage.ControlOperationCutover)
+	require.NoError(t, err)
+	require.NotNil(t, settled)
+	assert.Equal(t, storage.ControlRequestFailed, settled.Status)
+	assert.Equal(t, "cutover reached 0 of the 2 operations it was sent for; engine refused the cutover", settled.ErrorMessage)
+	assert.Equal(t, pending.Revision, settled.Revision, "the failure settles the command that was sent")
 }
 
 // A data plane that refuses the set, as one that predates sets does for the
@@ -567,4 +624,12 @@ func TestGRPCClient_DeferredCutoverSetRefusedByTheDataPlaneFails(t *testing.T) {
 	require.NotNil(t, settled)
 	assert.Equal(t, storage.ControlRequestFailed, settled.Status)
 	assert.Contains(t, settled.ErrorMessage, "for operation 42 was not queued")
+}
+
+// answerCutover sets how later Cutover calls are answered.
+func (s *capturingTernServer) answerCutover(accepted bool, message string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.cutoverAccepted = accepted
+	s.cutoverMessage = message
 }

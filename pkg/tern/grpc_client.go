@@ -161,12 +161,12 @@ type GRPCClient struct {
 	unrecognizedStatuses unrecognizedStatusReporter
 
 	// cutoverSharesTaken records the cutover request sets this client's drives
-	// have already sent to their remote apply, so a drive whose remote
-	// operation has not yet reported the swap does not send it again on every
-	// tick. The durable request in storage stays the source of truth: losing
-	// this record on a restart costs at most one repeated send per operation,
-	// which the data plane answers as the request it already holds.
-	cutoverSharesTaken sync.Map // cutoverShareKey -> struct{}
+	// have sent to their remote apply and how each is sent from then on
+	// (remoteCutoverShareSend). The durable request in storage stays the
+	// source of truth: after a restart the drive sends its share again, which
+	// a data plane that echoes the command id answers with the request it
+	// holds or the outcome it settled.
+	cutoverSharesTaken sync.Map // cutoverShareKey -> remoteCutoverShareSend
 }
 
 // Compile-time check that GRPCClient implements Client.
