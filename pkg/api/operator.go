@@ -2050,9 +2050,9 @@ func (s *Service) recoverApplyPendingStop(ctx context.Context, driverID int, own
 
 // rolloutPendingMembersNeverStarted reports whether a pending stop or cancel
 // can settle a rollout's pending members in storage alone: the apply is a
-// rollout of more than one operation, and every pending operation is one no
-// engine ever took up, never claimed, holding no remote apply, and with every
-// task still pending. A single-operation apply is always driven, because its
+// rollout of more than one operation, at least one operation is pending, and
+// every pending operation is one no engine ever took up, never claimed,
+// holding no remote apply, and with every task still pending. A single-operation apply is always driven, because its
 // pending operation can carry a task the data plane already started.
 func (s *Service) rolloutPendingMembersNeverStarted(ctx context.Context, apply *storage.Apply) (bool, error) {
 	ops, err := s.storage.ApplyOperations().ListByApply(ctx, apply.ID)
@@ -2062,10 +2062,12 @@ func (s *Service) rolloutPendingMembersNeverStarted(ctx context.Context, apply *
 	if len(ops) < 2 {
 		return false, nil
 	}
+	sawPending := false
 	for _, op := range ops {
 		if !state.IsState(op.State, state.ApplyOperation.Pending) {
 			continue
 		}
+		sawPending = true
 		if op.StartedAt != nil || op.ExternalID != "" {
 			return false, nil
 		}
@@ -2079,7 +2081,7 @@ func (s *Service) rolloutPendingMembersNeverStarted(ctx context.Context, apply *
 			}
 		}
 	}
-	return true, nil
+	return sawPending, nil
 }
 
 // stopReconciliationOutcome is how the pending operations a stop

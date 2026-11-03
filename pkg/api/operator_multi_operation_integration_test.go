@@ -341,9 +341,9 @@ func TestOperatorMultiOperationMatrix(t *testing.T) {
 		// pending sibling, with a queued stop: the stop must halt the pending
 		// sibling rather than starting more deployments. The stopped sibling
 		// still holds its deployment, so the rollout holds running_degraded
-		// instead of settling, and the stop request completes anyway — the
-		// operator's next start is what resumes that sibling, and a stop left
-		// pending would refuse it.
+		// instead of settling, and the stop request completes anyway. The
+		// operator's next start is accepted and runs that sibling, and the
+		// rollout then settles from both members' outcomes.
 		seed := seedGroupedApply(t, ctx, stor, multiOpSeed{
 			applyIdentifier: "matrix-pending-stop",
 			parentState:     state.Apply.RunningDegraded,
@@ -387,6 +387,24 @@ func TestOperatorMultiOperationMatrix(t *testing.T) {
 		assert.True(t, stopRequestCompleted(t, ctx, stor, seed.applyID),
 			"the stop reached every operation, so its request must be completed rather than left to refuse the resuming start")
 		assert.Equal(t, 0, svc.matrixSummary.count(), "a rollout that has not settled owes no terminal summary")
+
+		clients["region-b/staging"].(*matrixTernClient).outcome.taskState = state.Task.Completed
+		resp, _, err := svc.executeStartForApply(ctx, clients["region-b/staging"], apply, "cli:alice")
+		require.NoError(t, err, "the stopped member never started, so its work is what the start resumes")
+		require.NotNil(t, resp)
+		assert.True(t, resp.Accepted)
+
+		driveNextOperation(t, ctx, svc, 2)
+
+		assert.Equal(t, []string{"region-b"}, rec.resumeOrder(), "the start runs the member the stop caught before it began")
+		assert.Equal(t, state.ApplyOperation.Completed, opState(t, ctx, stor, seed.opID("region-b")))
+		assert.Equal(t, state.Apply.Failed, getApply(t, ctx, stor, seed.applyID).State,
+			"with region-a failed and region-b completed, the continue rollout settles failed")
+		start, err := stor.ControlRequests().GetByOperation(ctx, seed.applyID, storage.ControlOperationStart)
+		require.NoError(t, err)
+		require.NotNil(t, start)
+		assert.Equal(t, storage.ControlRequestFailed, start.Status,
+			"the rollout settled failed rather than completed, so the start did not reach the outcome it asked for")
 	})
 
 	t.Run("PendingCancelAtMemberHandoffCancelsPendingSiblings", func(t *testing.T) {
