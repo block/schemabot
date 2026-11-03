@@ -367,3 +367,62 @@ func TestServerHealthDoesNotLogWhenHealthy(t *testing.T) {
 	assert.Equal(t, "ok", resp.GetStatus())
 	assert.Empty(t, logs.String())
 }
+
+// liveOperatorServers is an operator servers registry that answers ListLive
+// with fixed servers, or with err.
+type liveOperatorServers struct {
+	storage.OperatorServerStore
+	servers []*storage.OperatorServer
+	err     error
+}
+
+func (s liveOperatorServers) ListLive(context.Context) ([]*storage.OperatorServer, error) {
+	return s.servers, s.err
+}
+
+// A control plane admits a deferred apply against what the deployment reports
+// over gRPC: the deferred cutover drivers of its live servers together, and
+// the max_drivers_per_apply it runs one apply under.
+func TestDeferredCutoverCapacitySumsTheLiveServersDrivers(t *testing.T) {
+	servers := liveOperatorServers{servers: []*storage.OperatorServer{
+		{ServerID: "host-a/1/operator", Drivers: 4, DeferredCutoverDrivers: 3},
+		{ServerID: "host-b/1/operator", Drivers: 6, DeferredCutoverDrivers: 5},
+	}}
+	client := newRetryTestClient(t, NewServer(noopControlClient{}, slog.Default(), WithDeferredCutoverCapacity(servers, 16)))
+
+	capacity, err := client.DeferredCutoverCapacity(t.Context())
+
+	require.NoError(t, err)
+	assert.Equal(t, &DeferredCutoverCapacity{LiveServers: 2, Drivers: 8, MaxDriversPerApply: 16}, capacity)
+}
+
+// A deployment that does not report its deferred cutover capacity answers
+// Unimplemented, as one running an older SchemaBot does, and the client reads
+// that as no capacity rather than as a failure, so apply creation refuses to
+// defer the cutover of operations sent there instead of erroring.
+func TestDeferredCutoverCapacityIsNilWhenTheDeploymentDoesNotReportIt(t *testing.T) {
+	client := newRetryTestClient(t, NewServer(noopControlClient{}, slog.Default()))
+
+	capacity, err := client.DeferredCutoverCapacity(t.Context())
+
+	require.NoError(t, err)
+	assert.Nil(t, capacity)
+}
+
+// A deployment that cannot read its own operator servers registry answers
+// Unavailable, which the client returns as an error, so apply creation refuses
+// the deferred apply with that error rather than admitting it against an
+// unknown capacity. Health is unaffected, so the deployment keeps serving
+// every apply that does not defer its cutover.
+func TestDeferredCutoverCapacityFailsWhenTheRegistryCannotBeRead(t *testing.T) {
+	servers := liveOperatorServers{err: errors.New("read operator servers: connection refused")}
+	server := NewServer(healthErrorClient{}, slog.Default(), WithDeferredCutoverCapacity(servers, 2))
+	client := newRetryTestClient(t, server)
+
+	capacity, err := client.DeferredCutoverCapacity(t.Context())
+
+	require.Error(t, err)
+	assert.Equal(t, codes.Unavailable, status.Code(errors.Unwrap(err)))
+	assert.Nil(t, capacity)
+	require.NoError(t, client.Health(t.Context()))
+}

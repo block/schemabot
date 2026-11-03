@@ -312,6 +312,9 @@ type DeferredCutoverCapacity struct {
 	// Drivers is how many drivers those servers leave for deferred work,
 	// together.
 	Drivers int
+	// MaxDriversPerApply is how many operations of one apply the deployment
+	// runs at once.
+	MaxDriversPerApply int
 }
 
 // DeferredCutoverCapacityReader is a client for a deployment whose operators

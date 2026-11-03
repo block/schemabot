@@ -189,6 +189,21 @@ service Tern {
     };
   }
 
+  // DeferredCutoverCapacity reports how many operations this deployment's
+  // operators can hold at a deferred cutover at once. A caller reads it before
+  // admitting an apply started with defer_cutover, since each operation that
+  // apply sends here keeps one of this deployment's drivers while it waits.
+  //
+  // A deployment that answers also cuts over every operation a CutoverRequest
+  // names in apply_operation_ids, and records each command_id once. A caller
+  // must not send an apply started with defer_cutover to a deployment that
+  // answers Unimplemented.
+  rpc DeferredCutoverCapacity(DeferredCutoverCapacityRequest) returns (DeferredCutoverCapacityResponse) {
+    option (google.api.http) = {
+      get: "/v1/deferred-cutover-capacity"
+    };
+  }
+
   // Stop pauses all non-terminal tasks for a schema change.
   //
   // Transitions: any non-terminal state -> stopped.
@@ -1092,24 +1107,27 @@ message HealthRequest {}
 // HealthResponse is the health check response.
 message HealthResponse {
   string status = 1;
-  // deferred_cutover is how many operations this deployment can hold at a
-  // deferred cutover at once. A deployment that reports it also cuts over
-  // every operation a CutoverRequest names in apply_operation_ids. A caller
-  // must not send an apply started with defer_cutover to a deployment that
-  // leaves it unset.
-  DeferredCutoverCapacity deferred_cutover = 2;
 }
 
-// DeferredCutoverCapacity is how many operations a deployment's operators can
-// hold at a deferred cutover at once. Each operation waiting at a deferred
-// cutover keeps one of the deployment's drivers until it is cut over.
-message DeferredCutoverCapacity {
+// DeferredCutoverCapacityRequest asks a deployment how many operations it can
+// hold at a deferred cutover.
+message DeferredCutoverCapacityRequest {}
+
+// DeferredCutoverCapacityResponse is how many operations a deployment's
+// operators can hold at a deferred cutover. Each operation waiting at a
+// deferred cutover keeps one of the deployment's drivers until it is cut over.
+message DeferredCutoverCapacityResponse {
   // live_servers is how many of the deployment's servers reported their
   // drivers within the live window.
   int32 live_servers = 1;
   // drivers is how many drivers those servers leave for deferred work,
   // together.
   int32 drivers = 2;
+  // max_drivers_per_apply is how many operations of one apply the deployment
+  // runs at once. An operation waiting at its cutover keeps counting, so an
+  // apply that sends the deployment more operations than this can never have
+  // all of them waiting together.
+  int32 max_drivers_per_apply = 3;
 }
 
 // StopRequest pauses an in-progress schema change by apply ID.

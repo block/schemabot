@@ -326,6 +326,27 @@ func local_request_Tern_Health_0(ctx context.Context, marshaler runtime.Marshale
 	return msg, metadata, err
 }
 
+func request_Tern_DeferredCutoverCapacity_0(ctx context.Context, marshaler runtime.Marshaler, client TernClient, req *http.Request, pathParams map[string]string) (proto.Message, runtime.ServerMetadata, error) {
+	var (
+		protoReq DeferredCutoverCapacityRequest
+		metadata runtime.ServerMetadata
+	)
+	if req.Body != nil {
+		_, _ = io.Copy(io.Discard, req.Body)
+	}
+	msg, err := client.DeferredCutoverCapacity(ctx, &protoReq, grpc.Header(&metadata.HeaderMD), grpc.Trailer(&metadata.TrailerMD))
+	return msg, metadata, err
+}
+
+func local_request_Tern_DeferredCutoverCapacity_0(ctx context.Context, marshaler runtime.Marshaler, server TernServer, req *http.Request, pathParams map[string]string) (proto.Message, runtime.ServerMetadata, error) {
+	var (
+		protoReq DeferredCutoverCapacityRequest
+		metadata runtime.ServerMetadata
+	)
+	msg, err := server.DeferredCutoverCapacity(ctx, &protoReq)
+	return msg, metadata, err
+}
+
 func request_Tern_Stop_0(ctx context.Context, marshaler runtime.Marshaler, client TernClient, req *http.Request, pathParams map[string]string) (proto.Message, runtime.ServerMetadata, error) {
 	var (
 		protoReq StopRequest
@@ -687,6 +708,26 @@ func RegisterTernHandlerServer(ctx context.Context, mux *runtime.ServeMux, serve
 		}
 		forward_Tern_Health_0(annotatedContext, mux, outboundMarshaler, w, req, resp, mux.GetForwardResponseOptions()...)
 	})
+	mux.Handle(http.MethodGet, pattern_Tern_DeferredCutoverCapacity_0, func(w http.ResponseWriter, req *http.Request, pathParams map[string]string) {
+		ctx, cancel := context.WithCancel(req.Context())
+		defer cancel()
+		var stream runtime.ServerTransportStream
+		ctx = grpc.NewContextWithServerTransportStream(ctx, &stream)
+		inboundMarshaler, outboundMarshaler := runtime.MarshalerForRequest(mux, req)
+		annotatedContext, err := runtime.AnnotateIncomingContext(ctx, mux, req, "/tern.v1.Tern/DeferredCutoverCapacity", runtime.WithHTTPPathPattern("/v1/deferred-cutover-capacity"))
+		if err != nil {
+			runtime.HTTPError(ctx, mux, outboundMarshaler, w, req, err)
+			return
+		}
+		resp, md, err := local_request_Tern_DeferredCutoverCapacity_0(annotatedContext, inboundMarshaler, server, req, pathParams)
+		md.HeaderMD, md.TrailerMD = metadata.Join(md.HeaderMD, stream.Header()), metadata.Join(md.TrailerMD, stream.Trailer())
+		annotatedContext = runtime.NewServerMetadataContext(annotatedContext, md)
+		if err != nil {
+			runtime.HTTPError(annotatedContext, mux, outboundMarshaler, w, req, err)
+			return
+		}
+		forward_Tern_DeferredCutoverCapacity_0(annotatedContext, mux, outboundMarshaler, w, req, resp, mux.GetForwardResponseOptions()...)
+	})
 	mux.Handle(http.MethodPost, pattern_Tern_Stop_0, func(w http.ResponseWriter, req *http.Request, pathParams map[string]string) {
 		ctx, cancel := context.WithCancel(req.Context())
 		defer cancel()
@@ -1014,6 +1055,23 @@ func RegisterTernHandlerClient(ctx context.Context, mux *runtime.ServeMux, clien
 		}
 		forward_Tern_Health_0(annotatedContext, mux, outboundMarshaler, w, req, resp, mux.GetForwardResponseOptions()...)
 	})
+	mux.Handle(http.MethodGet, pattern_Tern_DeferredCutoverCapacity_0, func(w http.ResponseWriter, req *http.Request, pathParams map[string]string) {
+		ctx, cancel := context.WithCancel(req.Context())
+		defer cancel()
+		inboundMarshaler, outboundMarshaler := runtime.MarshalerForRequest(mux, req)
+		annotatedContext, err := runtime.AnnotateContext(ctx, mux, req, "/tern.v1.Tern/DeferredCutoverCapacity", runtime.WithHTTPPathPattern("/v1/deferred-cutover-capacity"))
+		if err != nil {
+			runtime.HTTPError(ctx, mux, outboundMarshaler, w, req, err)
+			return
+		}
+		resp, md, err := request_Tern_DeferredCutoverCapacity_0(annotatedContext, inboundMarshaler, client, req, pathParams)
+		annotatedContext = runtime.NewServerMetadataContext(annotatedContext, md)
+		if err != nil {
+			runtime.HTTPError(annotatedContext, mux, outboundMarshaler, w, req, err)
+			return
+		}
+		forward_Tern_DeferredCutoverCapacity_0(annotatedContext, mux, outboundMarshaler, w, req, resp, mux.GetForwardResponseOptions()...)
+	})
 	mux.Handle(http.MethodPost, pattern_Tern_Stop_0, func(w http.ResponseWriter, req *http.Request, pathParams map[string]string) {
 		ctx, cancel := context.WithCancel(req.Context())
 		defer cancel()
@@ -1114,6 +1172,7 @@ var (
 	pattern_Tern_Revert_0                  = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0, 2, 1}, []string{"v1", "revert"}, ""))
 	pattern_Tern_SkipRevert_0              = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0, 2, 1}, []string{"v1", "skip-revert"}, ""))
 	pattern_Tern_Health_0                  = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0, 2, 1}, []string{"v1", "health"}, ""))
+	pattern_Tern_DeferredCutoverCapacity_0 = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0, 2, 1}, []string{"v1", "deferred-cutover-capacity"}, ""))
 	pattern_Tern_Stop_0                    = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0, 2, 1}, []string{"v1", "stop"}, ""))
 	pattern_Tern_Cancel_0                  = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0, 2, 1}, []string{"v1", "cancel"}, ""))
 	pattern_Tern_Start_0                   = runtime.MustPattern(runtime.NewPattern(1, []int{2, 0, 2, 1}, []string{"v1", "start"}, ""))
@@ -1133,6 +1192,7 @@ var (
 	forward_Tern_Revert_0                  = runtime.ForwardResponseMessage
 	forward_Tern_SkipRevert_0              = runtime.ForwardResponseMessage
 	forward_Tern_Health_0                  = runtime.ForwardResponseMessage
+	forward_Tern_DeferredCutoverCapacity_0 = runtime.ForwardResponseMessage
 	forward_Tern_Stop_0                    = runtime.ForwardResponseMessage
 	forward_Tern_Cancel_0                  = runtime.ForwardResponseMessage
 	forward_Tern_Start_0                   = runtime.ForwardResponseMessage

@@ -1040,14 +1040,15 @@ func (s *Server) RegisterGRPC(ctx context.Context, gs *grpc.Server) error {
 		s.svc.SetDefaultTernClient(built)
 		client = built
 	}
+	// The deferred cutover capacity is that of the operators sharing this
+	// instance's storage, since those are the operators that run what a
+	// control plane sends here, and they share this instance's per-apply cap.
+	maxDriversPerApply := storage.BuildOptions(storage.WithMaxDriversPerApply(s.cfg.MaxDriversPerApply)).MaxDriversPerApply
+	opts := []tern.ServerOption{tern.WithDeferredCutoverCapacity(s.storage.OperatorServers(), maxDriversPerApply)}
 	// The storage-schema service answers for this instance's own storage
 	// database, which is the only way a control plane can read it: a data
 	// plane's storage is reachable from the data plane, and the gRPC endpoint
 	// is the connection that already exists between the two.
-	// Health reports the deferred cutover drivers of the operators sharing
-	// this instance's storage, since those are the operators that run what a
-	// control plane sends here.
-	opts := []tern.ServerOption{tern.WithDeferredCutoverCapacity(s.storage.OperatorServers())}
 	if s.storageSchema != nil {
 		opts = append(opts, tern.WithStorageSchemaService(s.storageSchema))
 	}

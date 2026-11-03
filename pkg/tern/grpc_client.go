@@ -224,10 +224,11 @@ const DefaultMaxRecvMsgBytes = 16 << 20 // 16 MiB
 // stays within its command timeout only for a handful of environments — the
 // exhausted calls fail closed either way.
 //
-// Fast polls (Progress, Health) keep a sub-second budget: Progress is called
-// on tight drive loops that own their own failure handling, and Health feeds
-// the remote-deployment outage monitor, which must observe an outage promptly
-// rather than ride it out.
+// Fast polls (Progress, Health, DeferredCutoverCapacity) keep a sub-second
+// budget: Progress is called on tight drive loops that own their own failure
+// handling, Health feeds the remote-deployment outage monitor, which must
+// observe an outage promptly rather than ride it out, and
+// DeferredCutoverCapacity is read while apply creation waits on it.
 //
 // State-changing RPCs (Apply, Cutover, Stop, Cancel, Start, Revert,
 // SkipRevert) are intentionally not retried here: re-sending them could
@@ -251,7 +252,8 @@ const retryServiceConfig = `{
 	}, {
 		"name": [
 			{"service": "tern.v1.Tern", "method": "Progress"},
-			{"service": "tern.v1.Tern", "method": "Health"}
+			{"service": "tern.v1.Tern", "method": "Health"},
+			{"service": "tern.v1.Tern", "method": "DeferredCutoverCapacity"}
 		],
 		"retryPolicy": {
 			"maxAttempts": 3,
@@ -1743,20 +1745,24 @@ func (c *GRPCClient) Health(ctx context.Context) error {
 	return err
 }
 
-// DeferredCutoverCapacity reads, from the deployment's health check, how many
-// operations its operators can hold at a deferred cutover at once. It returns
-// nil without an error when the deployment does not report it, which a
-// deployment running an older SchemaBot does not.
+// DeferredCutoverCapacity reads how many operations the deployment's operators
+// can hold at a deferred cutover at once. It returns nil without an error when
+// the deployment answers Unimplemented, which a deployment running an older
+// SchemaBot does.
 func (c *GRPCClient) DeferredCutoverCapacity(ctx context.Context) (*DeferredCutoverCapacity, error) {
-	resp, err := c.client.Health(ctx, &ternv1.HealthRequest{})
-	if err != nil {
-		return nil, fmt.Errorf("read deferred cutover capacity from health check: %w", err)
-	}
-	reported := resp.GetDeferredCutover()
-	if reported == nil {
+	resp, err := c.client.DeferredCutoverCapacity(ctx, &ternv1.DeferredCutoverCapacityRequest{})
+	if status.Code(err) == codes.Unimplemented {
+		c.baseLogger().DebugContext(ctx, "deployment does not report deferred cutover capacity", "address", c.address)
 		return nil, nil
 	}
-	return &DeferredCutoverCapacity{LiveServers: int(reported.GetLiveServers()), Drivers: int(reported.GetDrivers())}, nil
+	if err != nil {
+		return nil, fmt.Errorf("read deferred cutover capacity: %w", err)
+	}
+	return &DeferredCutoverCapacity{
+		LiveServers:        int(resp.GetLiveServers()),
+		Drivers:            int(resp.GetDrivers()),
+		MaxDriversPerApply: int(resp.GetMaxDriversPerApply()),
+	}, nil
 }
 
 // applyTaskScope selects which task rows the remote drive re-queries and where

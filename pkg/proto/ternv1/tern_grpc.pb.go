@@ -30,6 +30,7 @@ const (
 	Tern_Revert_FullMethodName                  = "/tern.v1.Tern/Revert"
 	Tern_SkipRevert_FullMethodName              = "/tern.v1.Tern/SkipRevert"
 	Tern_Health_FullMethodName                  = "/tern.v1.Tern/Health"
+	Tern_DeferredCutoverCapacity_FullMethodName = "/tern.v1.Tern/DeferredCutoverCapacity"
 	Tern_Stop_FullMethodName                    = "/tern.v1.Tern/Stop"
 	Tern_Cancel_FullMethodName                  = "/tern.v1.Tern/Cancel"
 	Tern_Start_FullMethodName                   = "/tern.v1.Tern/Start"
@@ -161,6 +162,16 @@ type TernClient interface {
 	SkipRevert(ctx context.Context, in *SkipRevertRequest, opts ...grpc.CallOption) (*SkipRevertResponse, error)
 	// Health checks service health by verifying storage connectivity.
 	Health(ctx context.Context, in *HealthRequest, opts ...grpc.CallOption) (*HealthResponse, error)
+	// DeferredCutoverCapacity reports how many operations this deployment's
+	// operators can hold at a deferred cutover at once. A caller reads it before
+	// admitting an apply started with defer_cutover, since each operation that
+	// apply sends here keeps one of this deployment's drivers while it waits.
+	//
+	// A deployment that answers also cuts over every operation a CutoverRequest
+	// names in apply_operation_ids, and records each command_id once. A caller
+	// must not send an apply started with defer_cutover to a deployment that
+	// answers Unimplemented.
+	DeferredCutoverCapacity(ctx context.Context, in *DeferredCutoverCapacityRequest, opts ...grpc.CallOption) (*DeferredCutoverCapacityResponse, error)
 	// Stop pauses all non-terminal tasks for a schema change.
 	//
 	// Transitions: any non-terminal state -> stopped.
@@ -329,6 +340,16 @@ func (c *ternClient) Health(ctx context.Context, in *HealthRequest, opts ...grpc
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(HealthResponse)
 	err := c.cc.Invoke(ctx, Tern_Health_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *ternClient) DeferredCutoverCapacity(ctx context.Context, in *DeferredCutoverCapacityRequest, opts ...grpc.CallOption) (*DeferredCutoverCapacityResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(DeferredCutoverCapacityResponse)
+	err := c.cc.Invoke(ctx, Tern_DeferredCutoverCapacity_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -509,6 +530,16 @@ type TernServer interface {
 	SkipRevert(context.Context, *SkipRevertRequest) (*SkipRevertResponse, error)
 	// Health checks service health by verifying storage connectivity.
 	Health(context.Context, *HealthRequest) (*HealthResponse, error)
+	// DeferredCutoverCapacity reports how many operations this deployment's
+	// operators can hold at a deferred cutover at once. A caller reads it before
+	// admitting an apply started with defer_cutover, since each operation that
+	// apply sends here keeps one of this deployment's drivers while it waits.
+	//
+	// A deployment that answers also cuts over every operation a CutoverRequest
+	// names in apply_operation_ids, and records each command_id once. A caller
+	// must not send an apply started with defer_cutover to a deployment that
+	// answers Unimplemented.
+	DeferredCutoverCapacity(context.Context, *DeferredCutoverCapacityRequest) (*DeferredCutoverCapacityResponse, error)
 	// Stop pauses all non-terminal tasks for a schema change.
 	//
 	// Transitions: any non-terminal state -> stopped.
@@ -604,6 +635,9 @@ func (UnimplementedTernServer) SkipRevert(context.Context, *SkipRevertRequest) (
 }
 func (UnimplementedTernServer) Health(context.Context, *HealthRequest) (*HealthResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Health not implemented")
+}
+func (UnimplementedTernServer) DeferredCutoverCapacity(context.Context, *DeferredCutoverCapacityRequest) (*DeferredCutoverCapacityResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method DeferredCutoverCapacity not implemented")
 }
 func (UnimplementedTernServer) Stop(context.Context, *StopRequest) (*StopResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Stop not implemented")
@@ -838,6 +872,24 @@ func _Tern_Health_Handler(srv interface{}, ctx context.Context, dec func(interfa
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Tern_DeferredCutoverCapacity_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DeferredCutoverCapacityRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(TernServer).DeferredCutoverCapacity(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Tern_DeferredCutoverCapacity_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(TernServer).DeferredCutoverCapacity(ctx, req.(*DeferredCutoverCapacityRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _Tern_Stop_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(StopRequest)
 	if err := dec(in); err != nil {
@@ -978,6 +1030,10 @@ var Tern_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "Health",
 			Handler:    _Tern_Health_Handler,
+		},
+		{
+			MethodName: "DeferredCutoverCapacity",
+			Handler:    _Tern_DeferredCutoverCapacity_Handler,
 		},
 		{
 			MethodName: "Stop",

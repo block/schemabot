@@ -199,15 +199,19 @@ func (s *Service) deferredCutoverPerApplyCapRefusal(plan *storage.Plan, environm
 // hold at a deferred cutover at once and how many that plane reports it can
 // hold, for apply creation to admit against (storage.Apply's
 // DeferredCutoverDataPlanes). A deployment that does not report its capacity
-// cannot hold a deferred apply's operations, so the apply is refused here, and
-// a deployment whose report cannot be read refuses it with that error: either
-// way nothing is stored.
+// cannot hold a deferred apply's operations, and one whose max_drivers_per_apply
+// is below the operations the apply sends it would never have all of them
+// waiting, so the apply is refused here in both cases. A deployment whose
+// report cannot be read refuses it with that error. Either way nothing is
+// stored.
 func (s *Service) deferredCutoverDataPlanes(ctx context.Context, plan *storage.Plan, environment, applyIdentifier, caller string, groups []*storage.ApplyOperationWithTasks) ([]storage.DeferredCutoverDataPlane, error) {
 	ops := make([]*storage.ApplyOperation, 0, len(groups))
 	for _, group := range groups {
 		ops = append(ops, group.Operation)
 	}
-	widths := storage.DeferredCutoverHeldAtOnceByDeployment(ops, storage.BuildOptions(storage.WithMaxDriversPerApply(s.config.MaxDriversPerApply)).MaxDriversPerApply)
+	// Uncapped: each deployment's operations are compared against that
+	// deployment's own max_drivers_per_apply below, not this plane's.
+	widths := storage.DeferredCutoverHeldAtOnceByDeployment(ops, 0)
 	var planes []storage.DeferredCutoverDataPlane
 	for _, deployment := range slices.Sorted(maps.Keys(widths)) {
 		client, err := s.TernClient(deployment, environment)
@@ -223,18 +227,36 @@ func (s *Service) deferredCutoverDataPlanes(ctx context.Context, plan *storage.P
 		if err != nil {
 			return nil, fmt.Errorf("read deferred cutover capacity of deployment %s/%s for apply %s: %w", deployment, environment, applyIdentifier, err)
 		}
-		if capacity == nil {
+		refused := &DeferredCutoverCapacityError{
+			Database:    plan.Database,
+			Environment: environment,
+			Deployment:  deployment,
+			Operations:  widths[deployment],
+		}
+		switch {
+		case capacity == nil:
 			s.logger.Warn("apply rejected: deferred cutover needs a deployment that reports how many operations it can hold at a deferred cutover, and this one does not",
 				"plan_id", plan.PlanIdentifier, "apply_id", applyIdentifier, "database", plan.Database,
 				"database_type", plan.DatabaseType, "environment", environment, "caller", caller,
 				"deployment", deployment, "operations", widths[deployment])
-			return nil, &DeferredCutoverCapacityError{
-				Database:    plan.Database,
-				Environment: environment,
-				Deployment:  deployment,
-				Unreported:  true,
-				Operations:  widths[deployment],
-			}
+			refused.Unreported = true
+			return nil, refused
+		case capacity.MaxDriversPerApply <= 0:
+			// A SchemaBot data plane always reports its resolved cap, so a
+			// missing one is a deployment this admission cannot reason about.
+			s.logger.Warn("apply rejected: deployment reported deferred cutover capacity without its max_drivers_per_apply, so it is treated as not reporting one",
+				"plan_id", plan.PlanIdentifier, "apply_id", applyIdentifier, "database", plan.Database,
+				"database_type", plan.DatabaseType, "environment", environment, "caller", caller,
+				"deployment", deployment, "operations", widths[deployment])
+			refused.Unreported = true
+			return nil, refused
+		case widths[deployment] > capacity.MaxDriversPerApply:
+			s.logger.Warn("apply rejected: deferred cutover would hold more operations on a deployment at once than that deployment's max_drivers_per_apply runs of one apply",
+				"plan_id", plan.PlanIdentifier, "apply_id", applyIdentifier, "database", plan.Database,
+				"database_type", plan.DatabaseType, "environment", environment, "caller", caller,
+				"deployment", deployment, "operations", widths[deployment], "max_drivers_per_apply", capacity.MaxDriversPerApply)
+			refused.PerApplyCap = capacity.MaxDriversPerApply
+			return nil, refused
 		}
 		planes = append(planes, storage.DeferredCutoverDataPlane{
 			Deployment:  deployment,

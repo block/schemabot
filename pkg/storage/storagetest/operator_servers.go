@@ -213,6 +213,41 @@ func TestOperatorServers(t *testing.T, h Harness) {
 		}
 		assert.Equal(t, 1, admitted)
 	})
+
+	// RefusesDeferredCutoverPastADataPlanesDrivers verifies a deferred apply
+	// whose operations run on a deployment's own data plane is counted against
+	// the drivers that plane reported, beside the other deferred applies on
+	// that deployment, even when this plane's own operators have room. Applies
+	// on another deployment hold none of that plane's drivers, and a plane
+	// with no live server refuses every wide deferred apply.
+	t.Run("RefusesDeferredCutoverPastADataPlanesDrivers", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		heartbeat(t, store, "host-a/1/operator", 12, 11)
+		east := storage.DeferredCutoverDataPlane{LiveServers: 1, Capacity: 3}
+
+		_, err := createDataPlaneDeferredApply(t, store, "apply_east_first", "orders", "east", 2, east)
+		require.NoError(t, err)
+
+		_, err = createDataPlaneDeferredApply(t, store, "apply_east_second", "payments", "east", 2, east)
+		refused, ok := errors.AsType[*storage.DeferredCutoverCapacityError](err)
+		require.True(t, ok, "got %v", err)
+		assert.Equal(t, storage.DeferredCutoverCapacityError{
+			Deployment: "east", Operations: 2, Reserved: 2, Capacity: 3, LiveServers: 1,
+			HoldingApplyIDs: []string{"apply_east_first"},
+		}, *refused)
+		stored, err := store.Applies().GetByApplyIdentifier(ctx, "apply_east_second")
+		require.NoError(t, err)
+		assert.Nil(t, stored, "a refused apply is not stored")
+
+		_, err = createDataPlaneDeferredApply(t, store, "apply_west", "payments", "west", 3, storage.DeferredCutoverDataPlane{LiveServers: 1, Capacity: 3})
+		require.NoError(t, err, "the east apply holds none of west's drivers")
+
+		_, err = createDataPlaneDeferredApply(t, store, "apply_north", "inventory", "north", 2, storage.DeferredCutoverDataPlane{Capacity: 8})
+		refused, ok = errors.AsType[*storage.DeferredCutoverCapacityError](err)
+		require.True(t, ok, "got %v", err)
+		assert.Equal(t, storage.DeferredCutoverCapacityError{Deployment: "north", Operations: 2, Capacity: 8}, *refused)
+	})
 }
 
 // heartbeat registers a live operator server.
@@ -229,6 +264,27 @@ func heartbeat(t *testing.T, store storage.Storage, serverID string, drivers, de
 // does. It takes over the stopped applies takesOver names.
 func createDeferredApply(t *testing.T, store storage.Storage, applyID, database string, shards int, takesOver ...int64) (int64, error) {
 	t.Helper()
+	apply, groups := newDeferredApply(applyID, database, "region-a", shards)
+	apply.TakesOverApplyIDs = takesOver
+	return store.Applies().CreateWithGroupedOperations(t.Context(), apply, groups)
+}
+
+// createDataPlaneDeferredApply creates a pending apply deferring its cutover
+// on database whose shards run on deployment's own data plane, which reported
+// the deferred cutover drivers in plane, as apply creation does for a
+// deployment that runs its operations on another plane's operators.
+func createDataPlaneDeferredApply(t *testing.T, store storage.Storage, applyID, database, deployment string, shards int, plane storage.DeferredCutoverDataPlane) (int64, error) {
+	t.Helper()
+	apply, groups := newDeferredApply(applyID, database, deployment, shards)
+	plane.Deployment = deployment
+	plane.Operations = shards
+	apply.DeferredCutoverDataPlanes = []storage.DeferredCutoverDataPlane{plane}
+	return store.Applies().CreateWithGroupedOperations(t.Context(), apply, groups)
+}
+
+// newDeferredApply builds a pending apply deferring its cutover on database,
+// with one work operation per shard on deployment.
+func newDeferredApply(applyID, database, deployment string, shards int) (*storage.Apply, []*storage.ApplyOperationWithTasks) {
 	now := time.Now()
 	apply := &storage.Apply{
 		ApplyIdentifier:           applyID,
@@ -236,12 +292,11 @@ func createDeferredApply(t *testing.T, store storage.Storage, applyID, database 
 		Database:                  database,
 		DatabaseType:              storage.DatabaseTypeMySQL,
 		Environment:               "production",
-		Deployment:                "region-a",
+		Deployment:                deployment,
 		Engine:                    storage.EngineSpirit,
 		State:                     state.Apply.Pending,
 		Options:                   []byte(`{"defer_cutover":true}`),
 		DeferredCutoverOperations: min(shards, storage.DefaultMaxDriversPerApply),
-		TakesOverApplyIDs:         takesOver,
 		CreatedAt:                 now,
 		UpdatedAt:                 now,
 	}
@@ -250,7 +305,7 @@ func createDeferredApply(t *testing.T, store storage.Storage, applyID, database 
 		key := fmt.Sprintf("%s/%d/users", database, shard)
 		groups = append(groups, &storage.ApplyOperationWithTasks{
 			Operation: &storage.ApplyOperation{
-				Deployment: "region-a", OperationKey: key, OperationKind: storage.ApplyOperationKindWork,
+				Deployment: deployment, OperationKey: key, OperationKind: storage.ApplyOperationKindWork,
 				State: state.ApplyOperation.Pending, CreatedAt: now, UpdatedAt: now,
 			},
 			Tasks: []*storage.Task{{
@@ -270,5 +325,5 @@ func createDeferredApply(t *testing.T, store storage.Storage, applyID, database 
 			}},
 		})
 	}
-	return store.Applies().CreateWithGroupedOperations(t.Context(), apply, groups)
+	return apply, groups
 }

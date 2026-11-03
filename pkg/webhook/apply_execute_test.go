@@ -796,3 +796,34 @@ func TestDispatchErrorMessageNamesDeferredCutoverCapacity(t *testing.T) {
 		"`--defer-cutover` would hold 4 operations at their cutover at once, and no SchemaBot server has reported its drivers in the last minute. Run `schemabot apply-confirm -e production` again without `--defer-cutover`.",
 		deferredCutoverCapacityMessage(unreported, action.ApplyConfirm, "production", ""))
 }
+
+// A deferred apply refused by a deployment that runs its operations on another
+// plane names that deployment, so the operator knows whose capacity or
+// setting to look at. A deployment that does not report its capacity is told
+// apart from one with no live servers, since upgrading it is the remedy.
+func TestDispatchErrorMessageNamesTheRefusingDeployment(t *testing.T) {
+	unreported := &api.DeferredCutoverCapacityError{Database: "commerce", Environment: "production", Deployment: "east", Unreported: true, Operations: 4}
+	assert.Equal(t,
+		"`--defer-cutover` would hold 4 operations on the `east` deployment at their cutover at once, and that deployment does not report how many it can hold. Run `schemabot apply-confirm -e production` again without `--defer-cutover`, or once SchemaBot there is upgraded.",
+		deferredCutoverCapacityMessage(unreported, action.ApplyConfirm, "production", ""))
+
+	overCap := &api.DeferredCutoverCapacityError{Database: "commerce", Environment: "production", Deployment: "east", Operations: 16, PerApplyCap: 8}
+	assert.Equal(t,
+		"`--defer-cutover` would hold 16 operations on the `east` deployment at their cutover at once, and that deployment runs at most 8 operations of one apply at once (`max_drivers_per_apply`). Run `schemabot apply-confirm -e production` again without `--defer-cutover`, or raise `max_drivers_per_apply` on that deployment to at least 16.",
+		deferredCutoverCapacityMessage(overCap, action.ApplyConfirm, "production", ""))
+
+	noServers := &api.DeferredCutoverCapacityError{Database: "commerce", Environment: "production", Deployment: "east", Operations: 4}
+	assert.Equal(t,
+		"`--defer-cutover` would hold 4 operations on the `east` deployment at their cutover at once, and no server of that deployment has reported its drivers in the last minute. Run `schemabot apply-confirm -e production` again without `--defer-cutover`.",
+		deferredCutoverCapacityMessage(noServers, action.ApplyConfirm, "production", ""))
+
+	tooWide := &api.DeferredCutoverCapacityError{Database: "commerce", Environment: "production", Deployment: "east", Operations: 40, Capacity: 32, LiveServers: 8}
+	assert.Equal(t,
+		"`--defer-cutover` would hold 40 operations on the `east` deployment at their cutover at once, and that deployment runs at most 32 deferred operations. Run `schemabot apply-confirm -e production` again without `--defer-cutover`.",
+		deferredCutoverCapacityMessage(tooWide, action.ApplyConfirm, "production", ""))
+
+	crowded := &api.DeferredCutoverCapacityError{Database: "commerce", Environment: "production", Deployment: "east", Operations: 16, Reserved: 24, Capacity: 32, LiveServers: 8, HoldingApplyIDs: []string{"apply-a1b2c3"}}
+	assert.Equal(t,
+		"`--defer-cutover` would hold 16 operations on the `east` deployment at their cutover at once, and other deferred applies (`apply-a1b2c3`) hold 24 of the 32 deferred operations that deployment runs. Run `schemabot apply-confirm -e production` again without `--defer-cutover`, or once those applies are cut over or cancelled.",
+		deferredCutoverCapacityMessage(crowded, action.ApplyConfirm, "production", ""))
+}

@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"strings"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/storage"
+	"github.com/block/schemabot/pkg/tern"
 )
 
 // An apply started with --defer-cutover asks storage to admit every operation
@@ -187,7 +189,7 @@ func TestOperatorStartupHeartbeatGivesUpAtItsDeadline(t *testing.T) {
 func TestDeferredCutoverWiderThanThePerApplyCapIsRefused(t *testing.T) {
 	plan := threeShardQueueApplyTestPlan()
 	applies := &capturingApplyStore{}
-	svc, _ := newQueueApplyTestService(plan, &mockTernClient{isRemote: true}, applies)
+	svc, _ := newQueueApplyTestService(plan, ampleDataPlane(), applies)
 	deferred := ApplyRequest{PlanID: "plan-1", Environment: "staging", Options: map[string]string{"defer_cutover": "true"}}
 
 	_, _, err := svc.EnqueueAuthorizedApply(t.Context(), deferred)
@@ -291,4 +293,117 @@ func TestOperatorHeartbeatSurvivesAFailedPrune(t *testing.T) {
 	require.Len(t, live, 1)
 	assert.Equal(t, 3, live[0].DeferredCutoverDrivers)
 	assert.Equal(t, 1, registry.prunes)
+}
+
+// capacityReportingTernClient is a remote deployment that reports its
+// deferred cutover capacity, or fails to read it with err.
+type capacityReportingTernClient struct {
+	*mockTernClient
+	capacity *tern.DeferredCutoverCapacity
+	err      error
+}
+
+func (c *capacityReportingTernClient) DeferredCutoverCapacity(context.Context) (*tern.DeferredCutoverCapacity, error) {
+	return c.capacity, c.err
+}
+
+// ampleDataPlane is a remote deployment with room for any test apply.
+func ampleDataPlane() *capacityReportingTernClient {
+	return &capacityReportingTernClient{
+		mockTernClient: &mockTernClient{isRemote: true},
+		capacity:       &tern.DeferredCutoverCapacity{LiveServers: 4, Drivers: 32, MaxDriversPerApply: 16},
+	}
+}
+
+// A deferred apply whose operations run on a deployment's own data plane is
+// admitted against what that plane reports: apply creation hands storage the
+// plane's live servers and drivers beside the operations the apply sends it,
+// so storage counts the apply against that plane as well as this one.
+func TestDeferredCutoverApplyCarriesItsDataPlanesCapacity(t *testing.T) {
+	applies := &capturingApplyStore{}
+	svc, _ := newQueueApplyTestService(threeShardQueueApplyTestPlan(), ampleDataPlane(), applies)
+	svc.config.MaxDriversPerApply = 3
+
+	_, _, err := svc.EnqueueAuthorizedApply(t.Context(), ApplyRequest{PlanID: "plan-1", Environment: "staging", Options: map[string]string{"defer_cutover": "true"}})
+
+	require.NoError(t, err)
+	require.NotNil(t, applies.apply)
+	assert.Equal(t, []storage.DeferredCutoverDataPlane{{Deployment: "default", Operations: 3, LiveServers: 4, Capacity: 32}}, applies.apply.DeferredCutoverDataPlanes)
+}
+
+// A data plane runs at most its own max_drivers_per_apply operations of one
+// apply at once, and a waiting operation keeps counting, so a deferred apply
+// sending it more operations than that would never have them all waiting.
+// Apply creation refuses it before storing anything, naming the deployment
+// and its cap, with 422 since a retry of the same request is refused again.
+// A deployment that does not report its capacity, as one running an older
+// SchemaBot does not, is refused the same way.
+func TestDeferredCutoverIsRefusedByTheDataPlane(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		client  tern.Client
+		refused DeferredCutoverCapacityError
+		message string
+	}{
+		{
+			name: "wider than the data plane's max_drivers_per_apply",
+			client: &capacityReportingTernClient{
+				mockTernClient: &mockTernClient{isRemote: true},
+				capacity:       &tern.DeferredCutoverCapacity{LiveServers: 4, Drivers: 32, MaxDriversPerApply: 2},
+			},
+			refused: DeferredCutoverCapacityError{Database: "testdb", Environment: "staging", Deployment: "default", Operations: 3, PerApplyCap: 2},
+			message: "apply rejected: testdb/staging: --defer-cutover would hold 3 operations on the default deployment at their cutover at once, and max_drivers_per_apply there runs at most 2 operations of one apply at once; apply again without --defer-cutover, or raise max_drivers_per_apply on that deployment to at least 3",
+		},
+		{
+			name:    "deployment does not report its capacity",
+			client:  &mockTernClient{isRemote: true},
+			refused: DeferredCutoverCapacityError{Database: "testdb", Environment: "staging", Deployment: "default", Unreported: true, Operations: 3},
+			message: "apply rejected: testdb/staging: --defer-cutover would hold 3 operations on the default deployment at their cutover at once, and that deployment does not report how many it can hold; upgrade SchemaBot there, or apply again without --defer-cutover",
+		},
+		{
+			name: "deployment reports its capacity without its max_drivers_per_apply",
+			client: &capacityReportingTernClient{
+				mockTernClient: &mockTernClient{isRemote: true},
+				capacity:       &tern.DeferredCutoverCapacity{LiveServers: 4, Drivers: 32},
+			},
+			refused: DeferredCutoverCapacityError{Database: "testdb", Environment: "staging", Deployment: "default", Unreported: true, Operations: 3},
+			message: "apply rejected: testdb/staging: --defer-cutover would hold 3 operations on the default deployment at their cutover at once, and that deployment does not report how many it can hold; upgrade SchemaBot there, or apply again without --defer-cutover",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			applies := &capturingApplyStore{}
+			svc, _ := newQueueApplyTestService(threeShardQueueApplyTestPlan(), tc.client, applies)
+			svc.config.MaxDriversPerApply = 3
+
+			_, _, err := svc.EnqueueAuthorizedApply(t.Context(), ApplyRequest{PlanID: "plan-1", Environment: "staging", Options: map[string]string{"defer_cutover": "true"}})
+			refused, ok := errors.AsType[*DeferredCutoverCapacityError](err)
+			require.True(t, ok, "got %v", err)
+			assert.Equal(t, tc.refused, *refused)
+			assert.Nil(t, applies.apply, "a refused apply stores nothing")
+
+			status, resp := postApplyForRefusal(t, svc, `{"plan_id":"plan-1","environment":"staging","options":{"defer_cutover":"true"}}`)
+			assert.Equal(t, http.StatusUnprocessableEntity, status)
+			assert.Equal(t, apitypes.ErrCodeDeferredCutoverCapacity, resp.ErrorCode)
+			assert.Equal(t, tc.message, resp.Error)
+		})
+	}
+}
+
+// A data plane whose capacity cannot be read refuses the deferred apply with
+// that error rather than admitting it against an unknown capacity, and stores
+// nothing.
+func TestDeferredCutoverIsRefusedWhenTheDataPlaneCannotBeRead(t *testing.T) {
+	applies := &capturingApplyStore{}
+	client := &capacityReportingTernClient{
+		mockTernClient: &mockTernClient{isRemote: true},
+		err:            errors.New("read deferred cutover capacity: rpc error: code = Unavailable"),
+	}
+	svc, _ := newQueueApplyTestService(threeShardQueueApplyTestPlan(), client, applies)
+	svc.config.MaxDriversPerApply = 3
+
+	_, _, err := svc.EnqueueAuthorizedApply(t.Context(), ApplyRequest{PlanID: "plan-1", Environment: "staging", Options: map[string]string{"defer_cutover": "true"}})
+
+	require.ErrorIs(t, err, client.err)
+	assert.ErrorContains(t, err, "read deferred cutover capacity of deployment default/staging")
+	assert.Nil(t, applies.apply, "nothing is stored")
 }

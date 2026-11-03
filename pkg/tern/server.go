@@ -24,11 +24,19 @@ type Server struct {
 	// WithStorageSchemaService, and while it is nil those RPCs are refused
 	// rather than answered against something else.
 	storageSchema StorageSchemaService
-	// operatorServers is the registry of this instance's own operator
-	// servers, which Health reads to report how many operations they can hold
-	// at a deferred cutover. It is nil unless the embedder supplies it with
-	// WithDeferredCutoverCapacity, and while it is nil Health reports none.
-	operatorServers storage.OperatorServerStore
+	// deferredCutover answers DeferredCutoverCapacity from this instance's
+	// own operator servers registry. It is nil unless the embedder supplies it
+	// with WithDeferredCutoverCapacity, and while it is nil the RPC answers
+	// Unimplemented, which tells a caller not to defer the cutover of
+	// operations it sends here.
+	deferredCutover *deferredCutoverCapacitySource
+}
+
+// deferredCutoverCapacitySource is what DeferredCutoverCapacity reads: the
+// live operator servers and this instance's per-apply driver cap.
+type deferredCutoverCapacitySource struct {
+	servers            storage.OperatorServerStore
+	maxDriversPerApply int
 }
 
 var _ ternv1.TernServer = (*Server)(nil)
@@ -45,15 +53,17 @@ func WithStorageSchemaService(service StorageSchemaService) ServerOption {
 	return func(s *Server) { s.storageSchema = service }
 }
 
-// WithDeferredCutoverCapacity lets this endpoint's health check report how
-// many operations its operators can hold at a deferred cutover at once, read
-// from the operator servers registry in this instance's own storage. Each
-// operation a control plane sends here keeps one of these operators' drivers
-// while it waits at its cutover, so a control plane refuses an apply started
-// with --defer-cutover that would not fit, and refuses it outright when this
-// endpoint does not report the capacity.
-func WithDeferredCutoverCapacity(servers storage.OperatorServerStore) ServerOption {
-	return func(s *Server) { s.operatorServers = servers }
+// WithDeferredCutoverCapacity lets this endpoint report how many operations
+// its operators can hold at a deferred cutover at once, read from the operator
+// servers registry in this instance's own storage, and how many operations of
+// one apply they run at once. Each operation a control plane sends here keeps
+// one of these operators' drivers while it waits at its cutover, so a control
+// plane refuses an apply started with --defer-cutover that would not fit, and
+// refuses it outright when this endpoint does not report the capacity.
+func WithDeferredCutoverCapacity(servers storage.OperatorServerStore, maxDriversPerApply int) ServerOption {
+	return func(s *Server) {
+		s.deferredCutover = &deferredCutoverCapacitySource{servers: servers, maxDriversPerApply: maxDriversPerApply}
+	}
 }
 
 // NewServer creates a gRPC server wrapping a Client. The logger carries the
@@ -160,27 +170,30 @@ func (s *Server) Health(ctx context.Context, req *ternv1.HealthRequest) (*ternv1
 		}
 		return nil, status.Error(codes.Unavailable, "service unavailable")
 	}
-	resp := &ternv1.HealthResponse{Status: "ok"}
-	if s.operatorServers == nil {
-		return resp, nil
-	}
-	servers, err := s.operatorServers.ListLive(ctx)
-	if err != nil {
-		s.logger.WarnContext(ctx, "tern health check could not read the live operator servers; reporting deployment unavailable to caller", "error", err)
-		return nil, status.Error(codes.Unavailable, "service unavailable")
-	}
-	resp.DeferredCutover = deferredCutoverCapacity(servers)
-	return resp, nil
+	return &ternv1.HealthResponse{Status: "ok"}, nil
 }
 
-// deferredCutoverCapacity sums the deferred cutover drivers of the live
-// operator servers.
-func deferredCutoverCapacity(servers []*storage.OperatorServer) *ternv1.DeferredCutoverCapacity {
-	capacity := &ternv1.DeferredCutoverCapacity{LiveServers: int32(len(servers))}
-	for _, server := range servers {
-		capacity.Drivers += int32(server.DeferredCutoverDrivers)
+// DeferredCutoverCapacity reports how many operations this instance's live
+// operator servers can hold at a deferred cutover, and how many operations of
+// one apply they run at once.
+func (s *Server) DeferredCutoverCapacity(ctx context.Context, req *ternv1.DeferredCutoverCapacityRequest) (*ternv1.DeferredCutoverCapacityResponse, error) {
+	if s.deferredCutover == nil {
+		s.logger.DebugContext(ctx, "deferred cutover capacity requested from an endpoint that does not report it")
+		return nil, status.Error(codes.Unimplemented, "this endpoint does not report deferred cutover capacity")
 	}
-	return capacity
+	servers, err := s.deferredCutover.servers.ListLive(ctx)
+	if err != nil {
+		s.logger.WarnContext(ctx, "could not read the live operator servers; deferred applies to this deployment will be refused until it answers", "error", err)
+		return nil, status.Error(codes.Unavailable, "deferred cutover capacity unavailable")
+	}
+	resp := &ternv1.DeferredCutoverCapacityResponse{
+		LiveServers:        int32(len(servers)),
+		MaxDriversPerApply: int32(s.deferredCutover.maxDriversPerApply),
+	}
+	for _, server := range servers {
+		resp.Drivers += int32(server.DeferredCutoverDrivers)
+	}
+	return resp, nil
 }
 
 // callerAbandonedHealthCheck reports whether a failed health check ended because
