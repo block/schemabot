@@ -2138,8 +2138,9 @@ func (s *Service) markPendingOperationsStopped(ctx context.Context, driverID int
 // requeueNeverStartedOperationsForPendingStart moves the operations a stop
 // caught before they started back to pending while the apply has a pending
 // start and neither a pending stop nor a pending cancel. Storage checks the
-// requests in the same write, so a stop accepted after the start keeps every
-// operation it stopped. No-op when no start is pending.
+// requests in the same transaction as the write, so a stop or cancel accepted
+// after the start keeps every operation it reached. No-op when no start is
+// pending.
 func (s *Service) requeueNeverStartedOperationsForPendingStart(ctx context.Context, driverID int, apply *storage.Apply) error {
 	requeued, err := s.storage.ApplyOperations().RequeueNeverStartedForStartByApply(ctx, apply.ID)
 	if err != nil {

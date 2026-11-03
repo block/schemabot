@@ -278,6 +278,14 @@ func (s *applyOperationStore) UpdateState(ctx context.Context, id int64, newStat
 		[]JoinedUpdateAssignment{{Column: "state", Expr: "?"}}, newState)
 }
 
+// MarkStoppedNeverStarted returns an operation claimed out of pending to
+// stopped before its first dispatch, clearing the started_at its claim
+// stamped. See storage.ApplyOperationStore.
+func (s *applyOperationStore) MarkStoppedNeverStarted(ctx context.Context, id int64) error {
+	return s.execStateUpdate(ctx, id, "return never-started apply_operations row to stopped",
+		[]JoinedUpdateAssignment{{Column: "state", Expr: "?"}, {Column: "started_at", Expr: "NULL"}}, state.ApplyOperation.Stopped)
+}
+
 // MarkResumedRunning moves a resumed operation from resuming to running. The
 // start claim leaves the row resuming while its drive asks the engine to pick
 // the work up again; once the engine is working, running is what the row is.
@@ -2644,19 +2652,34 @@ func (s *applyOperationStore) MarkPendingCancelledByApply(ctx context.Context, a
 // queued rather than stopped while the start works through the members ahead
 // of it.
 //
-// Only a row whose tasks are all still pending is requeued: a row a start
-// claimed out of stopped carries no started_at, so its tasks are what show
-// whether an engine ever took up its work, and work an engine took up resumes
-// from its checkpoint rather than starting again.
+// Only a row whose tasks are all still pending and that holds no engine
+// handle is requeued: a row a start claimed out of stopped carries no
+// started_at, so its tasks and its external_id are what show whether an
+// engine ever took up its work, and work an engine took up resumes from its
+// checkpoint rather than starting again.
 //
 // The requests are read in a transaction that takes its locks in the order
 // stopQueuedStart takes them, the apply row first, so a stop that withdraws the
 // start either commits before these reads, which then see the start completed,
-// or waits for the requeue and then finds the rows it stops pending. Writes are
-// lease guarded the same way as MarkPendingStoppedByApply's.
+// or waits for the requeue and then finds the rows it stops pending. A cancel
+// intake share-locks the apply row too, so a first cancel serializes the same
+// way. The caller's lease is checked inside the same transaction, after the
+// apply row is locked.
 func (s *applyOperationStore) RequeueNeverStartedForStartByApply(ctx context.Context, applyID int64) (int64, error) {
+	// Every operation claim calls this, and almost none has a start pending,
+	// so a plain read settles the common case without locking the apply row
+	// its sibling claims also lock. A start recorded after this read is no
+	// different from one recorded after the transaction: the next claim
+	// requeues for it.
+	startPending, err := s.startRequestPending(ctx, applyID)
+	if err != nil {
+		return 0, err
+	}
+	if !startPending {
+		return 0, nil
+	}
 	var requeued int64
-	err := withLockRetry(ctx, s.classifier, fmt.Sprintf("requeue never-started operations of apply %d for its start", applyID), func() error {
+	err = withLockRetry(ctx, s.classifier, fmt.Sprintf("requeue never-started operations of apply %d for its start", applyID), func() error {
 		var attemptErr error
 		requeued, attemptErr = s.requeueNeverStartedForStart(ctx, applyID)
 		return attemptErr
@@ -2665,6 +2688,24 @@ func (s *applyOperationStore) RequeueNeverStartedForStartByApply(ctx context.Con
 		return 0, err
 	}
 	return requeued, nil
+}
+
+// startRequestPending reports, without taking a lock, whether an apply has a
+// pending start request.
+func (s *applyOperationStore) startRequestPending(ctx context.Context, applyID int64) (bool, error) {
+	var one int
+	err := s.db.QueryRowContext(ctx, `
+		SELECT 1 FROM apply_control_requests
+		WHERE apply_id = ? AND operation = ? AND status = ?
+		LIMIT 1
+	`, applyID, storage.ControlOperationStart, storage.ControlRequestPending).Scan(&one)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("read pending start request of apply %d: %w", applyID, err)
+	}
+	return true, nil
 }
 
 func (s *applyOperationStore) requeueNeverStartedForStart(ctx context.Context, applyID int64) (int64, error) {
@@ -2691,7 +2732,7 @@ func (s *applyOperationStore) requeueNeverStartedForStart(ctx context.Context, a
 	result, err := tx.ExecContext(ctx, `
 		UPDATE apply_operations
 		SET state = ?, updated_at = NOW()
-		WHERE apply_id = ? AND state = ? AND started_at IS NULL
+		WHERE apply_id = ? AND state = ? AND started_at IS NULL AND external_id IS NULL
 		  AND NOT EXISTS (
 		    SELECT 1 FROM tasks t
 		    WHERE t.apply_operation_id = apply_operations.id AND t.state <> ?

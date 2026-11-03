@@ -1542,6 +1542,13 @@ type ApplyOperationStore interface {
 	// completed_at, use MarkStarted / MarkCompleted / MarkFailed instead.
 	UpdateState(ctx context.Context, id int64, newState string) error
 
+	// MarkStoppedNeverStarted returns an operation claimed out of pending to
+	// stopped before its first dispatch, clearing the started_at its claim
+	// stamped, so the row still reads as never started: a later start requeues
+	// it and a cancel settles it as never started. It is fenced like
+	// UpdateState.
+	MarkStoppedNeverStarted(ctx context.Context, id int64) error
+
 	// MarkResumedRunning moves an operation a start resumed from resuming to
 	// running once its engine is working again, and reports whether it did. It
 	// changes nothing when the row has moved on from resuming. It requires the
@@ -1755,9 +1762,9 @@ type ApplyOperationStore interface {
 	// written nothing to its target; once a start is pending it is queued
 	// work again, and pending is what it is. The write happens only while a
 	// start request is pending and neither a stop nor a cancel request is,
-	// checked in the same statement, so a stop accepted after the start keeps
-	// every row it stopped. Writes are lease guarded the same way as
-	// MarkPendingStoppedByApply.
+	// checked in the same transaction under the apply row's lock, so a stop
+	// or cancel accepted after the start keeps every row it reached. The
+	// caller's lease is checked in that transaction too.
 	RequeueNeverStartedForStartByApply(ctx context.Context, applyID int64) (int64, error)
 
 	// ReapStranded mirrors the parent's outcome onto pending, unleased operation

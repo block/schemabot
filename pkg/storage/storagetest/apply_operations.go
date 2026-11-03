@@ -2120,6 +2120,12 @@ func TestApplyOperations(t *testing.T, h Harness) {
 		}
 		addTask(neverStartedID, "never_started", state.Task.Pending)
 		addTask(engineTouchedID, "engine_touched", state.Task.Stopped)
+		// A row the data plane already holds a remote apply for was dispatched,
+		// whether or not a task mirrored the engine's work yet.
+		dispatchedID := createOperation(t, store, apply.ID, "region-f", "dispatched-stopped")
+		require.NoError(t, store.ApplyOperations().UpdateState(ctx, dispatchedID, state.ApplyOperation.Stopped))
+		require.NoError(t, store.ApplyOperations().SaveExternalID(ctx, apply.ID, dispatchedID, "remote-dispatched", "remote-operation-dispatched"))
+		addTask(dispatchedID, "dispatched", state.Task.Pending)
 
 		claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "current-driver")
 		require.NoError(t, err)
@@ -2186,6 +2192,42 @@ func TestApplyOperations(t *testing.T, h Harness) {
 		require.NotNil(t, engineTouched)
 		assert.Nil(t, engineTouched.StartedAt)
 		assert.Equal(t, state.ApplyOperation.Stopped, engineTouched.State, "a row whose engine took up a task resumes from its checkpoint, not from the queue")
+		dispatched, err := store.ApplyOperations().Get(ctx, dispatchedID)
+		require.NoError(t, err)
+		require.NotNil(t, dispatched)
+		assert.Equal(t, state.ApplyOperation.Stopped, dispatched.State, "a row with a remote apply resumes it rather than dispatching again")
+
+		// A stop accepted after the requeue reaches the requeued row again:
+		// it is pending, never started, and the stop's sweep stops it.
+		require.NoError(t, store.ControlRequests().CompletePending(ctx, apply.ID, storage.ControlOperationStart))
+		requestControl(t, store, apply.ID, storage.ControlOperationStop)
+		restopped, err := store.ApplyOperations().MarkPendingStoppedByApply(ownedCtx, apply.ID)
+		require.NoError(t, err)
+		assert.Equal(t, int64(1), restopped, "only the requeued row is pending")
+		requireNeverStartedState(state.ApplyOperation.Stopped, "a stop accepted after the requeue stops the requeued row")
+	})
+
+	// MarkStoppedNeverStarted verifies that returning an undispatched
+	// operation to stopped clears the started_at its claim stamped, so the
+	// row still reads as never started to a later requeue or cancel sweep.
+	t.Run("MarkStoppedNeverStarted", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "operation_stopped_never_started_db", storage.DatabaseTypeMySQL)
+		apply := CreateApply(t, store, lock, "apply_operation_stopped_never_started", 910)
+		id := createOperation(t, store, apply.ID, "region-a", "undispatched")
+		require.NoError(t, store.ApplyOperations().MarkStarted(ctx, id))
+		started, err := store.ApplyOperations().Get(ctx, id)
+		require.NoError(t, err)
+		require.NotNil(t, started)
+		require.NotNil(t, started.StartedAt, "precondition: the claim stamped started_at")
+
+		require.NoError(t, store.ApplyOperations().MarkStoppedNeverStarted(ctx, id))
+		stopped, err := store.ApplyOperations().Get(ctx, id)
+		require.NoError(t, err)
+		require.NotNil(t, stopped)
+		assert.Equal(t, state.ApplyOperation.Stopped, stopped.State)
+		assert.Nil(t, stopped.StartedAt, "an operation that never dispatched reads as never started")
 	})
 
 	// MarkResumedRunning verifies the resumed operation's move to running is a
