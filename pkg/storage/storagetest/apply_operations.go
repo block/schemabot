@@ -1896,10 +1896,10 @@ func TestApplyOperations(t *testing.T, h Harness) {
 	})
 
 	// An operation row carries no terminal-state guard: the lease fence alone
-	// decides who may write it. A driver whose drive has ended and handed its
-	// lease back cannot write over the terminal row with its old lease; the row
-	// stays terminal.
-	t.Run("UpdateState_DisplacedLeaseCannotWriteOverTerminalOperation", func(t *testing.T) {
+	// decides who may write it. No peer can claim a terminal operation, so what
+	// refuses a late write is the drive's end handing its lease back: after
+	// that, a write under the old lease fails and the row stays terminal.
+	t.Run("UpdateState_EndedDriveCannotWriteOverTerminalOperation", func(t *testing.T) {
 		ctx := t.Context()
 		store := h.NewStorage(t)
 		lock := CreateLock(t, store, "operation_displaced_db", storage.DatabaseTypeMySQL)
@@ -1919,7 +1919,7 @@ func TestApplyOperations(t *testing.T, h Harness) {
 		operation, err := store.ApplyOperations().Get(ctx, opID)
 		require.NoError(t, err)
 		require.NotNil(t, operation)
-		assert.Equal(t, state.ApplyOperation.Failed, operation.State, "a displaced driver must not reopen a terminal operation")
+		assert.Equal(t, state.ApplyOperation.Failed, operation.State, "a drive that has ended must not reopen a terminal operation")
 	})
 
 	// MarkPendingStoppedByApply verifies the bulk transition changes only

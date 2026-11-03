@@ -386,6 +386,47 @@ func TestTasks(t *testing.T, h Harness) {
 		assert.Equal(t, state.Task.Failed, reloaded.State, "the current lease holder's write lands: the fence, not the row state, decides")
 	})
 
+	// A task an operation drive writes is fenced by the operation's lease. Once
+	// that drive has ended and handed the operation's lease back, a late write
+	// under the old lease is refused and the terminal task stays as it was.
+	t.Run("Update_EndedOperationLeaseCannotWriteOverTerminalTask", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "task_ended_operation_db", storage.DatabaseTypeMySQL)
+		apply := CreateApply(t, store, lock, "apply_task_ended_operation", 909)
+		opID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+			ApplyID: apply.ID, Deployment: "region-a", OperationKey: "schema",
+		})
+		require.NoError(t, err)
+		task := newTask(apply, "task_ended_operation_users", "users", time.Now().UTC().Truncate(time.Second))
+		task.ApplyOperationID = &opID
+		_, err = store.Tasks().Create(ctx, task)
+		require.NoError(t, err)
+		task, err = store.Tasks().Get(ctx, "task_ended_operation_users")
+		require.NoError(t, err)
+		require.NotNil(t, task)
+
+		claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-a")
+		require.NoError(t, err)
+		require.NotNil(t, claimed)
+		require.Equal(t, opID, claimed.ID)
+		opCtx := storage.WithOperationLease(ctx, claimed.Lease())
+
+		task.State = state.Task.Completed
+		require.NoError(t, store.Tasks().Update(opCtx, task))
+		require.NoError(t, store.ApplyOperations().MarkCompleted(opCtx, opID))
+		released, err := store.ApplyOperations().ReleaseFinishedClaim(ctx, claimed.Lease())
+		require.NoError(t, err)
+		require.True(t, released)
+
+		task.State = state.Task.Running
+		require.ErrorIs(t, store.Tasks().Update(opCtx, task), storage.ErrApplyLeaseLost)
+		reloaded, err := store.Tasks().Get(ctx, task.TaskIdentifier)
+		require.NoError(t, err)
+		require.NotNil(t, reloaded)
+		assert.Equal(t, state.Task.Completed, reloaded.State, "a drive that has ended must not reopen a terminal task")
+	})
+
 	t.Run("ExpireRetryable_TerminalizesUnfinishedTasks", func(t *testing.T) {
 		ctx := t.Context()
 		store := h.NewStorage(t)
