@@ -982,7 +982,8 @@ func WriteStopSuccess(data StopData) {
 	}
 	fmt.Println()
 	if data.ApplyID != "" {
-		fmt.Printf("%sCheckpoint saved. Use '%s' to resume.%s\n", ANSIDim, cliname.Command("start", "-e", data.Environment, data.ApplyID), ANSIReset)
+		fmt.Printf("%sCheckpoint saved.%s\n", ANSIDim, ANSIReset)
+		fmt.Print(FormatNextCommand(ResumeLabel, ControlCommand("start", data.ApplyID, data.Environment)))
 	} else {
 		fmt.Printf("%sCheckpoint saved. Use '%s' to resume from where you left off.%s\n", ANSIDim, cliname.Command("start"), ANSIReset)
 	}
