@@ -1290,65 +1290,17 @@ func claimableParentArgs() []any {
 // capped apply's rows to the next apply's oldest claimable row, which is the
 // fairness the cap is for.
 //
-// It takes three format arguments in order: the occupying-state placeholder
-// list, the dialect's staleness cutoff expression, and any further predicate on
-// the busy row (empty, or beginning with AND), and one positional argument per
-// occupying state followed by the further predicate's own.
+// It takes two format arguments in order: the occupying-state placeholder list
+// and the dialect's staleness cutoff expression, and one positional argument per
+// occupying state.
 const freshLeaseCountSQL = `(
 			SELECT COUNT(*)
 			FROM apply_operations AS busy
 			WHERE busy.apply_id = apply_operations.apply_id
 				AND busy.lease_owner <> ''
 				AND busy.state IN (%s)
-				AND busy.updated_at >= %s%s
+				AND busy.updated_at >= %s
 		)`
-
-// heldAtCutoverSQL matches a busy operation whose drive is holding at a
-// deferred cutover with nothing left to copy: at least one of its tasks waits
-// for its cutover, and every other one has completed. The operation row itself
-// does not say so, because a drive holding at a manual cutover keeps its row in
-// the active state it started in and rewrites the row only when the drive
-// ends; the task rows are what the drive persists on every poll.
-//
-// The copy cap leaves these out of its count. The cap bounds how many of an
-// apply's operations copy against its targets at once, and a held operation is
-// not copying: its engine has finished and waits for an operator. Counting it
-// would let held operations use up the cap, and the operations still to start
-// would then wait behind them for as long as the operator does. An operator
-// who cuts over once every operation is ready would wait for operations that
-// cannot start until the cutover lands. An operation with a task still to
-// copy is counted, because its drive copies again once the cutover it holds
-// at lands.
-//
-// Only the operation's drive tasks are judged (see driveTaskPredicate). The
-// per-shard progress rows an operation also reflects are best-effort display
-// writes that can lag the drive's own rows, and a stale one would keep a held
-// operation counted.
-//
-// The fragment references the busy alias; heldAtCutoverArgs binds it.
-var heldAtCutoverSQL = `EXISTS (
-					SELECT 1
-					FROM tasks AS held
-					WHERE held.apply_operation_id = busy.id
-						AND ` + driveTaskPredicate("held", "busy") + `
-						AND held.state = ?
-				)
-				AND NOT EXISTS (
-					SELECT 1
-					FROM tasks AS moving
-					WHERE moving.apply_operation_id = busy.id
-						AND ` + driveTaskPredicate("moving", "busy") + `
-						AND moving.state NOT IN (?, ?)
-				)`
-
-// heldAtCutoverArgs returns the positional arguments for heldAtCutoverSQL, in
-// placeholder order.
-func heldAtCutoverArgs() []any {
-	return []any{
-		storage.ApplyOperationKindWork, state.Task.WaitingForCutover,
-		storage.ApplyOperationKindWork, state.Task.WaitingForCutover, state.Task.Completed,
-	}
-}
 
 // driverOccupyingOperationStates lists the operation states in which a driver
 // is holding the row and doing work on it. It is the question the fan-out cap
@@ -1376,14 +1328,10 @@ func driverOccupyingOperationStates() []string {
 // would put them in the middle of it, where one misplaced entry shifts every
 // later binding and silently corrupts eligibility for unrelated arms. Rendering
 // the count up front keeps each site's arguments to one named unit.
-//
-// An operation held at a deferred cutover is not counted; see heldAtCutoverSQL.
 func (s *applyOperationStore) driverCapClause(staleClaimCutoff string) (string, []any) {
 	occupyingStates := driverOccupyingOperationStates()
-	notHeld := "\n\t\t\t\tAND NOT (" + heldAtCutoverSQL + ")"
-	clause := fmt.Sprintf(freshLeaseCountSQL, placeholders(len(occupyingStates)), staleClaimCutoff, notHeld) + " < ?"
-	args := append(stringArgs(occupyingStates), heldAtCutoverArgs()...)
-	return clause, append(args, s.maxDriversPerApply)
+	clause := fmt.Sprintf(freshLeaseCountSQL, placeholders(len(occupyingStates)), staleClaimCutoff) + " < ?"
+	return clause, append(stringArgs(occupyingStates), s.maxDriversPerApply)
 }
 
 // deferredCutoverWorkExclusion returns the predicate FindNextApplyOperation
@@ -1422,7 +1370,7 @@ func cutoverPhaseOperationStates() []string {
 // so the drivers one apply holds stay bounded at twice the cap.
 func (s *applyOperationStore) cutoverCapClause(staleClaimCutoff string) (string, []any) {
 	cutoverStates := cutoverPhaseOperationStates()
-	clause := fmt.Sprintf(freshLeaseCountSQL, placeholders(len(cutoverStates)), staleClaimCutoff, "") + " < ?"
+	clause := fmt.Sprintf(freshLeaseCountSQL, placeholders(len(cutoverStates)), staleClaimCutoff) + " < ?"
 	return clause, append(stringArgs(cutoverStates), s.maxDriversPerApply)
 }
 
