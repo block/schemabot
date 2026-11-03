@@ -424,6 +424,10 @@ func FormatProgressState(s string) string {
 		return ANSIYellow + "🟨 Waiting for cutover" + ANSIReset
 	case state.Apply.Recovering:
 		return ANSIYellow + "🟨 Recovering" + ANSIReset
+	case state.Apply.Paused:
+		return ANSIYellow + "⏸️  Paused" + ANSIReset
+	case state.Apply.Resuming:
+		return ANSICyan + "🔄 Resuming..." + ANSIReset
 	case state.Apply.CuttingOver:
 		return ANSICyan + "🔄 Cutting over..." + ANSIReset
 	case state.Apply.Completed:
@@ -1600,6 +1604,10 @@ func stateColorFunc(s string) func(string) string {
 		return colorWrap(ANSICyan)
 	case state.Apply.WaitingForDeploy, state.Apply.WaitingForCutover, state.Apply.Recovering:
 		return colorWrap(ANSIYellow)
+	case state.Apply.Paused:
+		return colorWrap(ANSIYellow) // the rollout holds until an operator releases it
+	case state.Apply.Resuming:
+		return colorWrap(ANSICyan) // a start is being processed
 	case state.Apply.CuttingOver:
 		return colorWrap(ANSICyan) // active work, matches the blue "Cutting over..." table bar
 	case state.Apply.Stopped:
