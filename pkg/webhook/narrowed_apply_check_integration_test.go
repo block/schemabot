@@ -208,7 +208,7 @@ func TestNarrowedApplyBlocksCheckUntilWholeEnvironmentPlan(t *testing.T) {
 	assert.Equal(t, checkConclusionActionRequired, completed.Conclusion, "a completed narrowed apply must not pass the check")
 	assert.Equal(t, narrowedApplyBlock.blockingReason, completed.BlockingReason)
 	assert.True(t, completed.HasChanges, "nothing shows the other targets have the change")
-	assert.Zero(t, completed.ApplyID, "ownership is released so a plan of the whole environment can lift the block")
+	assert.Equal(t, applyID, completed.ApplyID, "the apply keeps ownership, so a later commit's cleanup cannot pass the check (MG-6)")
 	assert.Equal(t, "`prod/payments-002` applied; apply the rest of the environment to finish", completed.ChangeSummary,
 		"the check names the target the rollout last reached")
 
@@ -345,14 +345,62 @@ func TestNarrowedApplyKeepsRollupBlock(t *testing.T) {
 // An operator applies production while one of its targets, payments-002,
 // holds an unfinished copy its plan would discard. The apply holds that target
 // back and runs the rest. Once it completes, the check must keep blocking
-// merge, name the held target, and release ownership so the apply of the whole
-// environment that brings payments-002 along can record its own result (MG-12).
+// merge and name the held target (MG-12), and the apply of the whole
+// environment that brings payments-002 along records its own result.
 func TestApplyThatHeldTargetsBackCompletesWithoutPassingTheCheck(t *testing.T) {
 	ctx := t.Context()
 	f := newNarrowedApplyCheckFixture(t, "octocat/held-targets-check", 12, "held_targets_check_db")
+	applyID := f.completeApplyHoldingTargets(t, "apply-held-targets-terminal")
+
+	completed := f.check(t)
+	assert.Equal(t, checkStatusCompleted, completed.Status)
+	assert.Equal(t, checkConclusionActionRequired, completed.Conclusion, "an apply that held a target back must not pass the check")
+	assert.Equal(t, heldTargetsBlock.blockingReason, completed.BlockingReason)
+	assert.Equal(t, heldTargetsBlock.message, completed.ErrorMessage)
+	assert.True(t, completed.HasChanges, "the held target still needs the change")
+	assert.Equal(t, applyID, completed.ApplyID, "the apply keeps ownership of the check")
+	assert.Equal(t, 1, completed.RolloutTargetsWithWork, "the held target is the one still waiting for the change")
+	assert.Equal(t, "held back `prod/payments-002`; apply the environment again to finish", completed.ChangeSummary)
+
+	wholePlan := &apitypes.PlanResponse{
+		PlanID: "plan-held-target",
+		Changes: []*apitypes.SchemaChangeResponse{{
+			Namespace:    f.schema.Database,
+			TableChanges: []*apitypes.TableChangeResponse{{TableName: "users", DDL: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)", ChangeType: "alter"}},
+		}},
+	}
+	_, err := f.h.storeApplyCheckRecord(ctx, f.client, f.repo, f.pr, f.schema, wholePlan, f.env, reviewDriftOutcome{state: driftClean}, false)
+	require.NoError(t, err)
+	assert.Empty(t, f.check(t).BlockingReason, "the next apply of the whole environment records its own check state")
+}
+
+// An apply holds payments-002 back and completes. A later commit then removes
+// the schema change from the PR. The targets the apply ran already have the
+// change, so the cleanup of that commit must keep blocking merge until an
+// operator reconciles the environment, rather than pass the check as plan-only
+// state (MG-6).
+func TestApplyThatHeldTargetsBackStaysAuthoritativeAfterALaterCommit(t *testing.T) {
+	ctx := t.Context()
+	f := newNarrowedApplyCheckFixture(t, "octocat/held-targets-later-commit", 13, "held_targets_later_commit_db")
+	applyID := f.completeApplyHoldingTargets(t, "apply-held-targets-later-commit")
+
+	assert.True(t, f.h.settleStaleCheckState(ctx, f.repo, f.pr, "later-commit-sha", f.check(t)), "the cleanup writes the row")
+
+	settled := f.check(t)
+	assert.Equal(t, "later-commit-sha", settled.HeadSHA)
+	assert.Equal(t, checkConclusionActionRequired, settled.Conclusion, "a later commit must not pass the check of a started apply")
+	assert.Equal(t, schemaRemovedAfterApplyBlock.blockingReason, settled.BlockingReason)
+	assert.Equal(t, applyID, settled.ApplyID)
+}
+
+// completeApplyHoldingTargets records an apply of the whole environment that
+// held payments-002 back, claims the check for it, and completes it.
+func (f *narrowedApplyCheckFixture) completeApplyHoldingTargets(t *testing.T, identifier string) int64 {
+	t.Helper()
+	ctx := t.Context()
 
 	apply := &storage.Apply{
-		ApplyIdentifier: "apply-held-targets-terminal",
+		ApplyIdentifier: identifier,
 		Database:        f.schema.Database,
 		DatabaseType:    "mysql",
 		Repository:      f.repo,
@@ -361,7 +409,9 @@ func TestApplyThatHeldTargetsBackCompletesWithoutPassingTheCheck(t *testing.T) {
 		Engine:          storage.EngineSpirit,
 		InstallationID:  4242,
 		State:           state.Apply.Completed,
-		Options:         storage.MarshalApplyOptions(storage.ApplyOptions{HeldBack: []string{"prod/payments-002"}}),
+		Options: storage.MarshalApplyOptions(storage.ApplyOptions{HeldBack: []storage.HeldMember{
+			{Member: "prod/payments-002", Reason: "applying its plan discards the unfinished copy of users"},
+		}}),
 	}
 	applyID, err := f.st.Applies().Create(ctx, apply)
 	require.NoError(t, err)
@@ -373,24 +423,5 @@ func TestApplyThatHeldTargetsBackCompletesWithoutPassingTheCheck(t *testing.T) {
 	}))
 
 	f.h.refreshChecksForTerminalApply(ctx, apply, "test held targets apply terminal")
-
-	completed := f.check(t)
-	assert.Equal(t, checkStatusCompleted, completed.Status)
-	assert.Equal(t, checkConclusionActionRequired, completed.Conclusion, "an apply that held a target back must not pass the check")
-	assert.Equal(t, heldTargetsBlock.blockingReason, completed.BlockingReason)
-	assert.Equal(t, heldTargetsBlock.message, completed.ErrorMessage)
-	assert.True(t, completed.HasChanges, "the held target still needs the change")
-	assert.Zero(t, completed.ApplyID, "ownership is released so the next apply of the whole environment can lift the block")
-	assert.Equal(t, "held back `prod/payments-002`; apply the environment again to finish", completed.ChangeSummary)
-
-	wholePlan := &apitypes.PlanResponse{
-		PlanID: "plan-held-target",
-		Changes: []*apitypes.SchemaChangeResponse{{
-			Namespace:    f.schema.Database,
-			TableChanges: []*apitypes.TableChangeResponse{{TableName: "users", DDL: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)", ChangeType: "alter"}},
-		}},
-	}
-	_, err = f.h.storeApplyCheckRecord(ctx, f.client, f.repo, f.pr, f.schema, wholePlan, f.env, reviewDriftOutcome{state: driftClean}, false)
-	require.NoError(t, err)
-	assert.Empty(t, f.check(t).BlockingReason, "the next apply of the whole environment records its own check state")
+	return applyID
 }

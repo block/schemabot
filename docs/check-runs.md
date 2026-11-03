@@ -989,7 +989,9 @@ environment's check the same way a plan of every target does.
 An apply narrowed the same way stores `narrowed_apply` on the
 environment's record before it dispatches and keeps it there when it completes,
 so the check blocks until an apply or plan of the whole environment records
-its own result (MG-12). A record already blocked for reconciliation, review-time
+its own result (MG-12). The completed record stays owned by the apply, as any
+completed apply's does, so a later commit that removes the schema change keeps
+the check blocked rather than passing it (MG-6). A record already blocked for reconciliation, review-time
 drift, or namespace placement keeps that block, with its own reason, from
 dispatch through completion. A narrowed apply is not refused on drift or
 placement, since applying one target at a time is how diverged targets are
@@ -1039,18 +1041,23 @@ refuses, an unfinished copy it would discard, or work the apply's operation
 shape has no place for. When the primary target is already at the desired
 schema, that includes any per-shard or finalizer change on another target. The
 primary target is never held back, since the apply is laid out from its plan.
-The comment names each held target and why, the held target's work and copies
-are left untouched, and the apply records the targets it held. When it
-completes, the record ends `action_required` with `held_targets` rather than
-passing, since the held targets still need the change (MG-12); applying the
-environment again once they can run finishes the rollout. Only when the
+The plan comment and each of the apply's own comments name every held target
+and why, so a target held only since the plan comment was posted is disclosed
+before anything runs. The held target's work and copies are left untouched,
+and the apply records the targets it held. When it completes, the record ends
+`action_required` with `held_targets` rather than passing, counting only the
+held targets as still pending, since they still need the change (MG-12). The
+record stays owned by the apply, so a later commit that removes the schema
+change keeps it blocked (MG-6). Applying the environment again once the held
+targets can run finishes the rollout. Only when the
 primary target has no work and every other target with work is held does the
 apply refuse, since it would run nothing. These decisions come before the
 pause for a fresh confirmation, so an apply never asks for a confirmation that
 could not run. An unsafe change on another target is not held back: the
 comment discloses it under that target, and it runs under `--allow-unsafe`
 like the primary target's own, whether or not the
-primary target has work. A target's direct-execution change is not held back
+primary target has work. A held target runs nothing, so its unsafe changes
+need no `--allow-unsafe`. A target's direct-execution change is not held back
 either: the comment discloses it under that target, and the apply runs it
 there as native DDL that blocks writes to the table until it finishes. An
 apply created any other way, such as a
@@ -1064,7 +1071,8 @@ no target that needs the change can apply, saying why in its place.
 
 Apply-confirm asks all of this again against the rollout as it is at confirm,
 and also refuses when a target's work differs from what the confirmed comment
-showed, the primary target's included, or when a primary target confirmed as
+showed, the primary target's included, unless the apply holds that target
+back, since a held target runs nothing, or when a primary target confirmed as
 already converged has since gained changes of its own. A target's work is its
 whole plan: its table statements, how each runs and whether each is unsafe and why, each shard's own changes,
 which namespaces end with a finalizer, and the VSchema each of those writes.

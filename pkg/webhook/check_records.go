@@ -851,11 +851,10 @@ func completedApplyHoldingTargets(a *storage.Apply, check *storage.Check) bool {
 
 // heldTargetsCompletedSummary is the stored Change column once an apply that
 // held targets back completes, naming the targets still waiting.
-func (h *Handler) heldTargetsCompletedSummary(apply *storage.Apply) string {
-	held := storage.ParseApplyOptions(apply.Options).HeldBack
+func (h *Handler) heldTargetsCompletedSummary(apply *storage.Apply, held []storage.HeldMember) string {
 	names := make([]string, 0, len(held))
 	for _, member := range held {
-		names = append(names, h.narrowedTargetName(member, apply.Database, apply.Environment))
+		names = append(names, h.narrowedTargetName(member.Member, apply.Database, apply.Environment))
 	}
 	return clampDriftSummary(fmt.Sprintf("held back `%s`; apply the environment again to finish", strings.Join(names, "`, `")))
 }
@@ -1031,9 +1030,11 @@ func (h *Handler) updateCheckRecordForApplyResult(ctx context.Context, repo stri
 			// row carries no counts of them.
 			check.RolloutTargets, check.RolloutTargetsWithWork = 0, 0
 		}
-		// MarkActionRequiredForApply releases check ownership, so the plan of
-		// the whole environment that lifts this block can write its result.
-		updated, err = h.service.Storage().Checks().MarkActionRequiredForApply(ctx, check, apply)
+		// The apply keeps check ownership, as any completed apply does: the
+		// other targets can change after it, so the block must survive a later
+		// commit's cleanup (MG-6). The plan of the whole environment that lifts
+		// it can still write its result over a completed apply's row.
+		updated, err = h.service.Storage().Checks().CompleteForApply(ctx, check, apply)
 		if err != nil {
 			recordOutcome("error")
 			return false, fmt.Errorf("mark stored check state action_required after apply narrowed to one target repo %s pr %d environment %s database_type %s database %s: %w",
@@ -1045,11 +1046,17 @@ func (h *Handler) updateCheckRecordForApplyResult(ctx context.Context, repo stri
 		check.HasChanges = true
 		check.BlockingReason = heldTargetsBlock.blockingReason
 		check.ErrorMessage = heldTargetsBlock.message
-		check.ChangeSummary = h.heldTargetsCompletedSummary(apply)
-		// MarkActionRequiredForApply releases check ownership, so the plan or
-		// apply of the whole environment that lifts this block can write its
-		// result.
-		updated, err = h.service.Storage().Checks().MarkActionRequiredForApply(ctx, check, apply)
+		held := storage.ParseApplyOptions(apply.Options).HeldBack
+		check.ChangeSummary = h.heldTargetsCompletedSummary(apply, held)
+		// The held targets are the ones still waiting for the change, which
+		// the summary names.
+		check.RolloutTargetsWithWork = len(held)
+		// The apply keeps check ownership, as any completed apply does: the
+		// held targets can change after it, so the block must survive a later
+		// commit's cleanup (MG-6). The plan or apply of the whole environment
+		// that lifts it can still write its result over a completed apply's
+		// row.
+		updated, err = h.service.Storage().Checks().CompleteForApply(ctx, check, apply)
 		if err != nil {
 			recordOutcome("error")
 			return false, fmt.Errorf("mark stored check state action_required after apply that held targets back repo %s pr %d environment %s database_type %s database %s: %w",
@@ -1094,10 +1101,6 @@ func (h *Handler) updateCheckRecordForApplyResult(ctx context.Context, repo stri
 			msg = "skipping rollback action_required update because a newer apply supersedes the rollback"
 		case cancelledForwardApply:
 			msg = "skipping cancelled apply action_required update because a newer apply supersedes the cancellation"
-		case completedNarrowedApply(apply, check):
-			msg = "skipping narrowed apply action_required update because a newer apply supersedes it"
-		case completedApplyHoldingTargets(apply, check):
-			msg = "skipping held-targets apply action_required update because a newer apply supersedes it"
 		}
 		h.logger.Warn(msg,
 			"repo", repo, "pr", pr, "database", apply.Database,

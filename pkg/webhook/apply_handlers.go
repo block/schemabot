@@ -381,6 +381,7 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	// heldTargets are the other targets the apply holds back because their own
 	// plans cannot run from it; the comment the apply posts names them.
 	var heldTargets []templates.HeldTarget
+	var heldNames []string
 	switch {
 	case runsMemberWork:
 		// Record the pending work on the check before anything else can end
@@ -413,7 +414,7 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 			h.postRolloutRefusal(repo, pr, installationID, schemaResult, planResp, environment, requestedBy, action.Apply, rollout, primaryTargetConverged, noTargetCanApplyMessage(hold))
 			return false, nil
 		}
-		heldTargets = hold.templateTargets()
+		heldTargets, heldNames = hold.templateTargets(), hold.names()
 		h.logger.Info("apply: other targets have plans of their own; the apply runs each of them",
 			"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
 			"plan_id", planResp.PlanID, "primary_target_converged", primaryTargetConverged,
@@ -512,7 +513,7 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 
 	// Block unsafe changes unless --allow-unsafe was specified, on every target
 	// the apply runs: one opt-in consents for all of them, as it does for one.
-	if blocked := h.blockUnsafeWithoutOptIn(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, requestedBy, result, runsMemberWork, rolloutPreview); blocked {
+	if blocked := h.blockUnsafeWithoutOptIn(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, requestedBy, result, runsMemberWork, rolloutPreview, heldNames); blocked {
 		return false, nil
 	}
 

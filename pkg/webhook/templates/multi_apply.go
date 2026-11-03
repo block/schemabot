@@ -61,6 +61,10 @@ type MultiDeploymentApplyData struct {
 	// headline vocabulary from "apply" to "rollback", matching the
 	// single-deployment comment.
 	Rollback bool
+
+	// HeldTargets are the targets a PR apply of the whole rollout held back
+	// because their own plans could not run from it, each with why.
+	HeldTargets []HeldTarget
 }
 
 // RenderMultiDeploymentApplyComment renders the PR comment for an apply that
@@ -116,6 +120,7 @@ func renderMultiDeploymentApplyComment(data MultiDeploymentApplyData, renderedAt
 		options := rolloutOptions(data.Details)
 		writeApplyOptions(&sb, options.DeferCutover, options.SkipRevert, data.Model.State)
 	}
+	writeApplyHeldTargets(&sb, data.HeldTargets)
 	groups := groupsWithChanges(data.Model, data.Model.Groups())
 	if g, ok := presentation.SoleTargetRollout(groups); ok {
 		writeTargetRolloutBody(&sb, data, g, budget)
@@ -166,6 +171,7 @@ func renderMultiDeploymentApplySummaryComment(data MultiDeploymentApplyData, bud
 	if g, ok := presentation.SoleTargetRollout(groups); ok {
 		writeTargetRolloutStatus(&sb, data, g)
 		writeTargetRolloutSummaryDetails(&sb, data, g, budget)
+		writeApplyHeldTargets(&sb, data.HeldTargets)
 		writeRolloutFooter(&sb, data)
 		return sb.String()
 	}
@@ -176,6 +182,7 @@ func renderMultiDeploymentApplySummaryComment(data MultiDeploymentApplyData, bud
 
 	// Expandable per-deployment terminal summary, in resolved order.
 	writeDeploymentSummarySections(&sb, data, groups, budget)
+	writeApplyHeldTargets(&sb, data.HeldTargets)
 	writeRolloutFooter(&sb, data)
 
 	return sb.String()

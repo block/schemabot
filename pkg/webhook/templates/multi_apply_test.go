@@ -2562,3 +2562,51 @@ func TestRenderMultiDeploymentApplyComment_UnreportedTargetCountsAtItsOperationS
 		assert.Contains(t, out, "- Rows: 500 / 1,000 across 1 of 2 targets")
 	})
 }
+
+// An apply of the whole rollout that held a target back says so on every
+// comment it posts, from the first one to the terminal summary, so a target
+// held only since the plan comment is disclosed before anything runs, and
+// the held target never reads as forgotten. A member's own section does not
+// repeat it.
+func TestApplyCommentsNameTheTargetsTheApplyHeldBack(t *testing.T) {
+	held := []HeldTarget{{Target: "us", Reason: "applying its plan discards the unfinished copy of users"}}
+	const notice = "⚠️ **Held back target `us`**: applying its plan discards the unfinished copy of users.\n\n" +
+		"The schema check keeps blocking merge until every target has the change, so apply again once it can run.\n"
+
+	started := RenderApplyStarted(ApplyStatusCommentData{
+		ApplyID: "apply-1", Database: "orders", Environment: "production", State: state.Apply.Pending, HeldTargets: held,
+	})
+	assert.Contains(t, started, notice)
+
+	model := presentation.Derive([]presentation.Operation{
+		rollingOp("eu", so.Completed),
+		rollingOp("ap", so.Completed),
+	})
+	detail := func(db string) *ApplyStatusCommentData {
+		return &ApplyStatusCommentData{
+			Database: db, Environment: "production", State: state.Apply.Completed, HeldTargets: held,
+			Tables: []TableProgressData{{TableName: "users", Status: state.Task.Completed}},
+		}
+	}
+	data := MultiDeploymentApplyData{
+		Model: model, ApplyID: "apply-1", Environment: "production",
+		Details:     []*ApplyStatusCommentData{detail("orders_eu"), detail("orders_ap")},
+		HeldTargets: held,
+	}
+	for name, out := range map[string]string{
+		"status":  RenderMultiDeploymentApplyComment(data),
+		"summary": RenderMultiDeploymentApplySummaryComment(data),
+	} {
+		assert.Equal(t, 1, strings.Count(out, notice), "%s: the notice appears once, not in each member's section", name)
+	}
+
+	two := []HeldTarget{held[0], {Target: "ap", Reason: "the engine refuses its change"}}
+	single := RenderApplySummaryComment(ApplyStatusCommentData{
+		ApplyID: "apply-1", Database: "orders", Environment: "production", State: state.Apply.Completed, HeldTargets: two,
+		Tables: []TableProgressData{{TableName: "users", Status: state.Task.Completed}},
+	})
+	assert.Contains(t, single, "⚠️ **Held back 2 targets**:\n"+
+		"- `us`: applying its plan discards the unfinished copy of users\n"+
+		"- `ap`: the engine refuses its change\n\n"+
+		"The schema check keeps blocking merge until every target has the change, so apply again once they can run.\n")
+}

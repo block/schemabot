@@ -232,6 +232,10 @@ type ApplyStatusCommentData struct {
 	// applied it, and the one command that acts on the whole rollout, so the
 	// section leaves out all three.
 	InRolloutSection bool
+
+	// HeldTargets are the targets a PR apply of the whole rollout held back
+	// because their own plans could not run from it, each with why.
+	HeldTargets []HeldTarget
 }
 
 // RenderApplyStatusComment renders a PR comment for the current apply status.
@@ -270,6 +274,7 @@ func renderApplyStatusCommentBody(data ApplyStatusCommentData, includeLastUpdate
 	// while the status changes on every update.
 	if !data.InRolloutSection {
 		writeApplyOptions(&sb, data.DeferCutover, data.SkipRevert, data.State)
+		writeApplyHeldTargets(&sb, data.HeldTargets)
 	}
 
 	// Status line. For the revert window it carries the countdown to permanence
@@ -1540,8 +1545,33 @@ func renderApplySummaryComment(data ApplyStatusCommentData, budget *ddlBlockBudg
 		writeEnvironmentTitle(&sb, fmt.Sprintf("Schema Change: %s", humanizeState(data.State)), data.Environment)
 		writeSummaryMetadata(&sb, data)
 	}
+	if !data.InRolloutSection {
+		writeApplyHeldTargets(&sb, data.HeldTargets)
+	}
 
 	return sb.String()
+}
+
+// writeApplyHeldTargets writes which targets an apply held back and why, so
+// the apply's own comments say what it left out, including a target held only
+// since the plan comment was posted.
+func writeApplyHeldTargets(sb *strings.Builder, held []HeldTarget) {
+	if len(held) == 0 {
+		return
+	}
+	reason := func(target HeldTarget) string {
+		return escapeInlineMarkdown(strings.Join(strings.Fields(target.Reason), " "))
+	}
+	if len(held) == 1 {
+		fmt.Fprintf(sb, "\n"+glyph.Attention+" **Held back target %s**: %s.\n\n", inlineCode(held[0].Target), reason(held[0]))
+		sb.WriteString("The schema check keeps blocking merge until every target has the change, so apply again once it can run.\n")
+		return
+	}
+	fmt.Fprintf(sb, "\n"+glyph.Attention+" **Held back %d targets**:\n", len(held))
+	for _, target := range held {
+		fmt.Fprintf(sb, "- %s: %s\n", inlineCode(target.Target), reason(target))
+	}
+	sb.WriteString("\nThe schema check keeps blocking merge until every target has the change, so apply again once they can run.\n")
 }
 
 // countTableOutcomes counts completed and failed tables.

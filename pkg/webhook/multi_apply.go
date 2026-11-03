@@ -128,6 +128,7 @@ func buildMultiApplyData(apply *storage.Apply, ops []*storage.ApplyOperation, re
 		Details:     details,
 		Tenant:      tenant,
 		Rollback:    apply.IsRollback(),
+		HeldTargets: heldTargetsOf(apply),
 	}
 	if apply.StartedAt != nil {
 		data.StartedAt = apply.StartedAt.Format(time.RFC3339)

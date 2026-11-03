@@ -1869,7 +1869,10 @@ func TestE2EApplyHoldsBackTheTargetWhoseCopyItWouldDiscardAndRunsTheRest(t *test
 	})
 	held := storage.ParseApplyOptions(created.Options).HeldBack
 	require.Len(t, held, 1, "the apply records the one target it held back")
-	assert.True(t, strings.HasPrefix(held[0], "us/"), "the held member is us, got %s", held[0])
+	assert.True(t, strings.HasPrefix(held[0].Member, "us/"), "the held member is us, got %s", held[0].Member)
+	assert.Equal(t, "us", held[0].Target, "the apply records the name its comments give the held target")
+	assert.Contains(t, held[0].Reason, "applying its plan discards the unfinished copy of users")
+	awaitCommentContaining(t, apply, "Held back target `us`")
 	requireUsersCopyIntact(t, dbName+"_us")
 }
 

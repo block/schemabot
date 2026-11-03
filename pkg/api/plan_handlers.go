@@ -609,13 +609,13 @@ type ApplyRequest struct {
 	// change the primary plan does not carry: no other caller confirms them.
 	// Direct API callers cannot assert it through JSON.
 	ConfirmedMemberWork bool `json:"-"`
-	// HeldMembers is an internal webhook guard: the MemberIDs of the rollout
-	// members a pull request apply of the whole rollout holds back, because
-	// their own plans cannot run from this apply. The apply runs every other
+	// HeldMembers is an internal webhook guard: the rollout members a pull
+	// request apply of the whole rollout holds back, because their own plans
+	// cannot run from this apply, each with its reason. The apply runs every other
 	// member and records the held ones, so the check keeps blocking until they
 	// have the change (MG-12). The primary is never held: the apply is laid out
 	// from its plan. Direct API callers cannot assert it through JSON.
-	HeldMembers []string `json:"-"`
+	HeldMembers []storage.HeldMember `json:"-"`
 }
 
 // handlePlan handles POST /api/plan requests.
@@ -2076,7 +2076,7 @@ func (s *Service) createStoredApply(
 		s.logger.Info("apply holds back rollout members whose own plans cannot run from it; it runs the rest",
 			"plan_id", plan.PlanIdentifier, "database", plan.Database, "environment", req.Environment,
 			"repository", plan.Repository, "pull_request", plan.PullRequest,
-			"held_members", req.HeldMembers, "targets", len(targets))
+			"held_members", storage.HeldMemberIDs(req.HeldMembers), "targets", len(targets))
 		applyOpts.HeldBack = req.HeldMembers
 	}
 
@@ -2475,11 +2475,11 @@ func withoutHeldMembers(plan *storage.Plan, req ApplyRequest, targets []routing.
 	}
 	if narrowedTo != "" {
 		return nil, fmt.Errorf("apply for %s/%s is narrowed to %s but holds back members %v; a narrowed apply runs one member and holds back nothing",
-			plan.Database, req.Environment, narrowedTo, req.HeldMembers)
+			plan.Database, req.Environment, narrowedTo, storage.HeldMemberIDs(req.HeldMembers))
 	}
 	held := make(map[string]bool, len(req.HeldMembers))
 	for _, member := range req.HeldMembers {
-		held[member] = true
+		held[member.Member] = true
 	}
 	if held[targets[0].MemberID()] {
 		return nil, fmt.Errorf("apply for %s/%s holds back its primary target %s, which the apply is laid out from",

@@ -390,7 +390,7 @@ func TestConfirmationRequiresTheReviewedPrimaryMember(t *testing.T) {
 				logger:  slog.New(slog.NewTextHandler(&logs, nil)),
 			}
 
-			covered, reason, err := h.confirmationCoversMemberWork(t.Context(), pinned.PlanIdentifier, current.PlanIdentifier, "production", staticName(tc.deployment))
+			covered, reason, err := h.confirmationCoversMemberWork(t.Context(), pinned.PlanIdentifier, current.PlanIdentifier, "production", nil, staticName(tc.deployment))
 			require.NoError(t, err)
 			assert.Equal(t, !tc.changed, covered)
 			wantDifference := workUnchanged
@@ -410,6 +410,53 @@ func TestConfirmationRequiresTheReviewedPrimaryMember(t *testing.T) {
 			}
 		})
 	}
+}
+
+// A target the apply holds back runs nothing, so work it gained since the
+// confirmed round does not stop the confirmation of the targets that run. The
+// same work on a target that runs is refused.
+func TestConfirmationLeavesHeldTargetsOutOfTheComparison(t *testing.T) {
+	pinned := storedPlan(1, "plan_reviewed", addEmail)
+	pinned.Deployment, pinned.Target = "eu", "payments"
+	current := storedPlan(2, "plan_current", addEmail)
+	current.Deployment, current.Target = "eu", "payments"
+	gained := storedPlan(3, "plan_us", addEmail)
+	gained.Deployment, gained.Target = "us", "payments"
+	gained.PrimaryPlanIdentifier = current.PlanIdentifier
+	store := &primaryConfirmationPlanStore{rollbackConfirmTestPlanStore: rollbackConfirmTestPlanStore{
+		plans: map[string]*storage.Plan{pinned.PlanIdentifier: pinned, current.PlanIdentifier: current, gained.PlanIdentifier: gained},
+	}}
+	h := &Handler{
+		service: api.New(&rollbackConfirmTestStorage{plans: store}, &api.ServerConfig{}, nil, testLogger()),
+		logger:  testLogger(),
+	}
+
+	covered, reason, err := h.confirmationCoversMemberWork(t.Context(), pinned.PlanIdentifier, current.PlanIdentifier, "production", nil, staticName("eu"))
+	require.NoError(t, err)
+	assert.False(t, covered, "work the confirmed round did not plan, on a target that runs, needs fresh review")
+	assert.Equal(t, "target `us/payments` has work the confirmed round did not plan", reason)
+
+	covered, reason, err = h.confirmationCoversMemberWork(t.Context(), pinned.PlanIdentifier, current.PlanIdentifier, "production", []string{"us/payments"}, staticName("eu"))
+	require.NoError(t, err)
+	assert.True(t, covered, "a held target's work never runs, so it is not compared: %s", reason)
+}
+
+// The unsafe opt-in covers only the targets an apply runs: a held target is
+// dropped from each unsafe change, and a change only held targets carry needs
+// no opt-in.
+func TestUnsafeChangesOnRunningTargets(t *testing.T) {
+	changes := []templates.UnsafeChangeData{
+		{Table: "users", Targets: []string{"us", "ap"}, TotalTargets: 3},
+		{Table: "orders", Targets: []string{"us"}, TotalTargets: 3},
+		{Table: "events", Targets: []string{"ap"}, TotalTargets: 3},
+	}
+
+	assert.Equal(t, changes, unsafeChangesOnRunningTargets(changes, nil), "an apply that holds nothing back keeps every change")
+	assert.Equal(t, []templates.UnsafeChangeData{
+		{Table: "users", Targets: []string{"ap"}, TotalTargets: 3},
+		{Table: "events", Targets: []string{"ap"}, TotalTargets: 3},
+	}, unsafeChangesOnRunningTargets(changes, []string{"us"}))
+	assert.Equal(t, []string{"us", "ap"}, changes[0].Targets, "the caller's changes are left as they were")
 }
 
 type failingMemberListPlanStore struct {
@@ -438,7 +485,7 @@ func TestChangedPrimaryIsRefusedBeforeMemberPlansAreRead(t *testing.T) {
 		logger:  slog.New(slog.NewTextHandler(&logs, nil)),
 	}
 
-	covered, reason, err := h.confirmationCoversMemberWork(t.Context(), pinned.PlanIdentifier, current.PlanIdentifier, "production", staticName("us"))
+	covered, reason, err := h.confirmationCoversMemberWork(t.Context(), pinned.PlanIdentifier, current.PlanIdentifier, "production", nil, staticName("us"))
 	require.NoError(t, err)
 	assert.False(t, covered)
 	assert.Equal(t, "target `us` is not the target the confirmed plan reviewed", reason)
@@ -446,7 +493,7 @@ func TestChangedPrimaryIsRefusedBeforeMemberPlansAreRead(t *testing.T) {
 	assert.Contains(t, logs.String(), "current_deployment=us current_target=payments")
 
 	current.Deployment = "eu"
-	_, _, err = h.confirmationCoversMemberWork(t.Context(), pinned.PlanIdentifier, current.PlanIdentifier, "production", staticName("eu"))
+	_, _, err = h.confirmationCoversMemberWork(t.Context(), pinned.PlanIdentifier, current.PlanIdentifier, "production", nil, staticName("eu"))
 	require.ErrorContains(t, err, "member plan listing unavailable", "an unchanged primary still needs the member plans to decide")
 }
 

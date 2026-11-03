@@ -112,7 +112,11 @@ func TestWithoutHeldMembers(t *testing.T) {
 		{Deployment: "ap", Target: "orders-003"},
 	}
 	held := func(members ...string) ApplyRequest {
-		return ApplyRequest{Environment: "production", HeldMembers: members}
+		req := ApplyRequest{Environment: "production"}
+		for _, member := range members {
+			req.HeldMembers = append(req.HeldMembers, storage.HeldMember{Member: member, Reason: "its plan cannot run"})
+		}
+		return req
 	}
 
 	kept, err := withoutHeldMembers(plan, held(), targets, "")

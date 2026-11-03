@@ -196,20 +196,11 @@ func (h *Handler) executeApply(
 	// other target's work on the comment behind it, so apply creation may run
 	// the direct changes that comment disclosed under those targets.
 	confirmedMemberWork := false
-	// heldMembers are the other targets this apply holds back because their
-	// own plans cannot run from it. The apply runs the rest.
-	var heldMembers, heldNames []string
+	// hold names the other targets this apply holds back because their own
+	// plans cannot run from it. The apply runs the rest.
+	var hold rolloutHold
 	switch {
 	case runsMemberWork:
-		covered, reason, coverErr := h.confirmationCoversMemberWork(ctx, expectedPendingPlanID, planResp.PlanID, environment, func() string {
-			return h.primaryTargetName(rollout.work, planResp, schemaResult.Database, environment)
-		})
-		if coverErr != nil {
-			h.rejectUnverifiedMemberWork(ctx, repo, pr, installationID, schemaResult, environment, requestedBy, actionName, storedPlan != nil, expectedPendingPlanID, planResp.PlanID,
-				"could not verify that the reviewed plans cover the other targets' work", coverErr,
-				"the plans this apply covers")
-			return
-		}
 		// Targets whose work the apply cannot run are held back, and the rest
 		// run, whether or not the comment showed them: a copy can appear on a
 		// target after the comment was posted, and apply creation would refuse
@@ -219,7 +210,8 @@ func (h *Handler) executeApply(
 		// operator is told: it is the one that blocks any confirmation, where
 		// a stale one would only send them to confirm again into the same
 		// refusal.
-		hold, holdErr := h.heldMembers(ctx, planResp.PlanID, environment, rollout, primaryTargetConverged)
+		var holdErr error
+		hold, holdErr = h.heldMembers(ctx, planResp.PlanID, environment, rollout, primaryTargetConverged)
 		if holdErr != nil {
 			h.rejectUnverifiedMemberWork(ctx, repo, pr, installationID, schemaResult, environment, requestedBy, actionName, storedPlan != nil, expectedPendingPlanID, planResp.PlanID,
 				"could not verify that the other targets' plans can run from this apply", holdErr,
@@ -234,7 +226,18 @@ func (h *Handler) executeApply(
 			h.refuseRollout(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, requestedBy, actionName, rollout, primaryTargetConverged, noTargetCanApplyMessage(hold))
 			return
 		}
-		heldMembers, heldNames = hold.memberIDs(), hold.names()
+		// A held target runs nothing, so its work is not compared: only the
+		// work this apply runs has to be what the comment behind it showed.
+		// The primary target is never held, so it is always compared.
+		covered, reason, coverErr := h.confirmationCoversMemberWork(ctx, expectedPendingPlanID, planResp.PlanID, environment, hold.memberIDs(), func() string {
+			return h.primaryTargetName(rollout.work, planResp, schemaResult.Database, environment)
+		})
+		if coverErr != nil {
+			h.rejectUnverifiedMemberWork(ctx, repo, pr, installationID, schemaResult, environment, requestedBy, actionName, storedPlan != nil, expectedPendingPlanID, planResp.PlanID,
+				"could not verify that the reviewed plans cover the other targets' work", coverErr,
+				"the plans this apply covers")
+			return
+		}
 		// A primary plan the engine now blocks cannot run from any
 		// confirmation, so an automatic apply rejects it here rather than
 		// pausing on a confirmation that would only be rejected in turn.
@@ -259,7 +262,7 @@ func (h *Handler) executeApply(
 				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
 				"posted_plan_id", expectedPendingPlanID, "plan_id", planResp.PlanID, "reason", reason)
 			if err := h.postAutoConfirmDowngrade(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, result, requestedBy,
-				cause, rolloutPreview, runsMemberWork); err != nil {
+				cause, rolloutPreview, runsMemberWork, hold.templateTargets()); err != nil {
 				h.logger.Error("failed to post the comment showing the targets' changed plans, so the pending confirmation was not moved",
 					"repo", repo, "pr", pr, "database", database, "database_type", dbType,
 					"environment", environment, "plan_id", planResp.PlanID, "error", err)
@@ -364,7 +367,7 @@ func (h *Handler) executeApply(
 		h.logger.Info("automatic apply downgraded: DDL drift detected",
 			"repo", repo, "pr", pr, "database", database, "environment", environment)
 		if err := h.postAutoConfirmDowngrade(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, result, requestedBy,
-			planDriftCause(planResp, storedPlan), rolloutPreview, runsMemberWork); err != nil {
+			planDriftCause(planResp, storedPlan), rolloutPreview, runsMemberWork, hold.templateTargets()); err != nil {
 			h.logger.Error("failed to post the DDL-drift downgrade comment",
 				"repo", repo, "pr", pr, "database", database, "database_type", dbType,
 				"environment", environment, "error", err)
@@ -393,7 +396,7 @@ func (h *Handler) executeApply(
 				"environment", environment, "action", actionName,
 				"plan_id", planResp.PlanID, "disclosed_plan_id", disclosedPlan.PlanIdentifier, "newly_direct", len(newlyDirect))
 			if err := h.postAutoConfirmDowngrade(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, result, requestedBy,
-				newlyDirectCause(newlyDirect), rolloutPreview, runsMemberWork); err != nil {
+				newlyDirectCause(newlyDirect), rolloutPreview, runsMemberWork, hold.templateTargets()); err != nil {
 				h.logger.Error("failed to post the comment disclosing the newly-direct changes, so the pending confirmation was not moved",
 					"repo", repo, "pr", pr, "database", database, "database_type", dbType,
 					"environment", environment, "plan_id", planResp.PlanID, "error", err)
@@ -436,7 +439,7 @@ func (h *Handler) executeApply(
 		// lands must leave no consent behind: the next attempt stops and asks
 		// again rather than dispatching over a disclosure nobody read.
 		if err := h.postAutoConfirmDowngrade(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, result, requestedBy,
-			nil, rolloutPreview, runsMemberWork); err != nil {
+			nil, rolloutPreview, runsMemberWork, hold.templateTargets()); err != nil {
 			h.logger.Error("failed to post the comment disclosing the discard, so no consent was recorded",
 				"repo", repo, "pr", pr, "database", database, "database_type", dbType,
 				"environment", environment, "plan_id", planResp.PlanID, "error", err)
@@ -496,7 +499,7 @@ func (h *Handler) executeApply(
 
 	// Block unsafe changes on confirm (re-plan may have detected new unsafe
 	// changes), on every target the apply runs.
-	if blocked := h.blockUnsafeWithoutOptIn(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, requestedBy, result, runsMemberWork, rolloutPreview); blocked {
+	if blocked := h.blockUnsafeWithoutOptIn(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, requestedBy, result, runsMemberWork, rolloutPreview, hold.names()); blocked {
 		return
 	}
 
@@ -549,7 +552,7 @@ func (h *Handler) executeApply(
 		ExpectedLockOwner:     fmt.Sprintf("%s#%d", repo, pr),
 		ExpectedPendingPlanID: expectedPendingPlanID,
 		ConfirmedMemberWork:   confirmedMemberWork,
-		HeldMembers:           heldMembers,
+		HeldMembers:           hold.members(),
 		Target:                result.Target,
 	}
 
@@ -609,12 +612,13 @@ func (h *Handler) executeApply(
 		Engine:       schemaResult.Type,
 		DeferCutover: apply.GetOptions().DeferCutover,
 		SkipRevert:   apply.GetOptions().SkipRevert,
+		HeldTargets:  hold.templateTargets(),
 	})
 	h.postInitialProgressComment(ctx, repo, pr, installationID, apply, progressBody)
 
 	// Update stored check state to in_progress (transitions action_required to in_progress).
 	if err := h.updateCheckRecordForApplyStart(ctx, client, repo, pr, schemaResult, environment, apply,
-		h.rolloutApplyChangeSummary(schemaResult, planResp, environment, rollout.work.withoutTargets(heldNames))); err != nil {
+		h.rolloutApplyChangeSummary(schemaResult, planResp, environment, rollout.work.withoutTargets(hold.names()))); err != nil {
 		h.logger.Error("failed to mark check in_progress for apply",
 			append(apply.LogAttrs(), "error", err)...)
 		h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy, "Apply was accepted, but SchemaBot could not update the required status check: "+err.Error())
@@ -953,6 +957,7 @@ func (h *Handler) postAutoConfirmDowngrade(
 	repo string, pr int, installationID int64, schemaResult *ghclient.SchemaRequestResult,
 	planResp *apitypes.PlanResponse, environment string, result CommandResult, requestedBy string,
 	cause *templates.PausedApplyCauseData, rolloutPreview *templates.DeploymentDriftData, runsMemberWork bool,
+	held []templates.HeldTarget,
 ) error {
 	commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy, h.agentHint(), h.cliName())
 	commentData.ScopedDatabase = result.Database
@@ -971,6 +976,9 @@ func (h *Handler) postAutoConfirmDowngrade(
 	// A confirmation of this comment covers the other targets' work only if
 	// the comment renders their plans.
 	commentData.DeploymentDrift = rolloutPreview
+	// The targets the confirmation will hold back are named on the comment it
+	// acts on, so a target held only since the plan comment is disclosed too.
+	commentData.HeldTargets = held
 	return h.postCommentReportingError(repo, pr, installationID, templates.RenderPlanComment(commentData))
 }
 

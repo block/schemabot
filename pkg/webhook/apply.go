@@ -25,6 +25,20 @@ import (
 // the per-shard detail rows grouped by table (nil for unsharded engines); it is
 // attached to each table's progress for the compact per-shard summary. tenant is
 // the deployment's tenant identity, carried into every pasteable command hint.
+// heldTargetsOf returns the targets the apply held back, as its comments name
+// them, from the apply's durable options.
+func heldTargetsOf(apply *storage.Apply) []templates.HeldTarget {
+	held := apply.GetOptions().HeldBack
+	if len(held) == 0 {
+		return nil
+	}
+	targets := make([]templates.HeldTarget, 0, len(held))
+	for _, member := range held {
+		targets = append(targets, templates.HeldTarget{Target: member.Target, Reason: member.Reason})
+	}
+	return targets
+}
+
 func buildApplyCommentData(apply *storage.Apply, tasks []*storage.Task, display operationDisplay, shardsByTable map[string][]*storage.Task, tenant string) templates.ApplyStatusCommentData {
 	data := templates.ApplyStatusCommentData{
 		ApplyID:          apply.ApplyIdentifier,
@@ -45,6 +59,7 @@ func buildApplyCommentData(apply *storage.Apply, tasks []*storage.Task, display 
 		Rollback:         apply.IsRollback(),
 		DeferCutover:     apply.GetOptions().DeferCutover,
 		SkipRevert:       apply.GetOptions().SkipRevert,
+		HeldTargets:      heldTargetsOf(apply),
 	}
 	if apply.StartedAt != nil {
 		data.StartedAt = apply.StartedAt.Format(time.RFC3339)

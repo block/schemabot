@@ -203,13 +203,19 @@ func (h rolloutHold) leavesNothingToRun() bool {
 	return h.runsNothing && h.holds() && len(h.held) >= h.othersWithWork
 }
 
-// memberIDs returns the held targets' MemberIDs, for the apply request.
-func (h rolloutHold) memberIDs() []string {
-	ids := make([]string, 0, len(h.held))
+// members returns the held targets for the apply request, each by MemberID
+// and name with the reason its comments give.
+func (h rolloutHold) members() []storage.HeldMember {
+	members := make([]storage.HeldMember, 0, len(h.held))
 	for _, held := range h.held {
-		ids = append(ids, held.member)
+		members = append(members, storage.HeldMember{Member: held.member, Target: held.target, Reason: held.reason})
 	}
-	return ids
+	return members
+}
+
+// memberIDs returns the held targets' MemberIDs.
+func (h rolloutHold) memberIDs() []string {
+	return storage.HeldMemberIDs(h.members())
 }
 
 // names returns the held targets' names, for logs.
@@ -359,13 +365,15 @@ func (h *Handler) annotateHeldTargets(ctx context.Context, data *templates.PlanC
 // when the apply carries an unsafe change and was not given --allow-unsafe.
 // The unsafe changes are the primary plan's and, when the apply runs other
 // targets' own plans, theirs too, each named with the targets that carry it.
-func (h *Handler) blockUnsafeWithoutOptIn(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, installationID int64, schemaResult *ghclient.SchemaRequestResult, planResp *apitypes.PlanResponse, environment, requestedBy string, result CommandResult, runsMemberWork bool, rolloutPreview *templates.DeploymentDriftData) bool {
+// A held target runs nothing, so its unsafe changes need no opt-in: held names
+// the targets the apply holds back.
+func (h *Handler) blockUnsafeWithoutOptIn(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, installationID int64, schemaResult *ghclient.SchemaRequestResult, planResp *apitypes.PlanResponse, environment, requestedBy string, result CommandResult, runsMemberWork bool, rolloutPreview *templates.DeploymentDriftData, held []string) bool {
 	if result.AllowUnsafe {
 		return false
 	}
 	var memberUnsafe []templates.UnsafeChangeData
 	if runsMemberWork {
-		memberUnsafe = templates.TargetPlanUnsafeChanges(rolloutPreview)
+		memberUnsafe = unsafeChangesOnRunningTargets(templates.TargetPlanUnsafeChanges(rolloutPreview), held)
 	}
 	if len(planResp.UnsafeChanges()) == 0 && len(memberUnsafe) == 0 {
 		return false
@@ -386,6 +394,29 @@ func (h *Handler) blockUnsafeWithoutOptIn(ctx context.Context, client *ghclient.
 		"plan_id", planResp.PlanID, "primary_unsafe", len(planResp.UnsafeChanges()), "other_targets_unsafe", len(memberUnsafe))
 	h.postComment(repo, pr, installationID, templates.RenderUnsafeChangesBlocked(commentData))
 	return true
+}
+
+// unsafeChangesOnRunningTargets drops the held targets from each unsafe
+// change, and every change only held targets carry, so the opt-in covers only
+// what the apply runs.
+func unsafeChangesOnRunningTargets(changes []templates.UnsafeChangeData, held []string) []templates.UnsafeChangeData {
+	if len(held) == 0 {
+		return changes
+	}
+	out := make([]templates.UnsafeChangeData, 0, len(changes))
+	for _, c := range changes {
+		running := slices.DeleteFunc(slices.Clone(c.Targets), func(target string) bool {
+			return slices.Contains(held, target)
+		})
+		if len(running) == 0 {
+			continue
+		}
+		if len(running) < len(c.Targets) {
+			c.Targets = running
+		}
+		out = append(out, c)
+	}
+	return out
 }
 
 // narrowedTarget returns the --target selector a comment about this plan names,
@@ -477,10 +508,13 @@ func unconfirmedWorkMessage(work memberWork, reason string) string {
 // and work the confirmed comment did not show never runs on the strength of
 // that confirmation.
 //
+// held lists the MemberIDs of the targets the apply holds back. A held target
+// runs nothing, so its work is left out of the comparison.
+//
 // primary names the target current was planned against. It is called only to
 // build a refusal, so naming the target costs nothing on a confirmation that
 // covers the work.
-func (h *Handler) confirmationCoversMemberWork(ctx context.Context, pinnedPlanID, currentPlanID, environment string, primary func() string) (bool, string, error) {
+func (h *Handler) confirmationCoversMemberWork(ctx context.Context, pinnedPlanID, currentPlanID, environment string, held []string, primary func() string) (bool, string, error) {
 	plans := h.service.Storage().Plans()
 	pinned, err := plans.Get(ctx, pinnedPlanID)
 	if err != nil {
@@ -510,6 +544,9 @@ func (h *Handler) confirmationCoversMemberWork(ctx context.Context, pinnedPlanID
 	now, err := h.service.MemberPlansForReviewRound(ctx, current, environment)
 	if err != nil {
 		return false, "", fmt.Errorf("load member plans of the confirm-time round: %w", err)
+	}
+	for _, member := range held {
+		delete(now, member)
 	}
 	covered, reason := roundCoversWork(primary, pinned, current, confirmed, now)
 	return covered, reason, nil

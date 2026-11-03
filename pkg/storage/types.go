@@ -1584,6 +1584,27 @@ func (op *ApplyOperation) Lease() OperationLease {
 	}
 }
 
+// HeldMember is a rollout member a pull request apply held back, and why.
+type HeldMember struct {
+	// Member is the MemberID (deployment/target).
+	Member string `json:"member"`
+	// Target is the name an operator addresses the member by, as the apply's
+	// comments name it.
+	Target string `json:"target"`
+	// Reason says why the member's own plan could not run from the apply, in
+	// the words the apply's comments show the operator.
+	Reason string `json:"reason"`
+}
+
+// HeldMemberIDs returns the MemberIDs of the held members, in order.
+func HeldMemberIDs(held []HeldMember) []string {
+	ids := make([]string, 0, len(held))
+	for _, h := range held {
+		ids = append(ids, h.Member)
+	}
+	return ids
+}
+
 // ApplyOptions contains durable user and engine options for an apply.
 // Stored as JSON in the database for flexibility across engine types.
 type ApplyOptions struct {
@@ -1635,12 +1656,12 @@ type ApplyOptions struct {
 	// can tell an apply that changed one member from one that changed them all.
 	NarrowedTo string `json:"narrowed_to,omitempty"`
 
-	// HeldBack lists the MemberIDs (deployment/target) of the rollout members
-	// a pull request apply of the whole rollout held back, because their own
-	// plans could not run from it, in rollout order. The apply has no
+	// HeldBack lists the rollout members a pull request apply of the whole
+	// rollout held back, because their own plans could not run from it, in
+	// rollout order, each with the reason its comments give. The apply has no
 	// operations for them, so it cannot show that the environment has the
 	// change. It is recorded at creation and never read from caller options.
-	HeldBack []string `json:"held_back,omitempty"`
+	HeldBack []HeldMember `json:"held_back,omitempty"`
 
 	// OperationKeysLeadWithTarget marks an apply whose operations are each
 	// keyed behind their own target (storage.TargetOperationKey): a data-plane
