@@ -1844,7 +1844,8 @@ func TestApplyOperations(t *testing.T, h Harness) {
 	// starts or recovers an operation of an apply deferring its cutover, so it
 	// takes the regular apply's operation even though the deferred one queued
 	// first, and leaves the deferred one to the other drivers. It still claims
-	// a deferred operation to deliver a cancel, since that ends the work.
+	// a deferred operation to deliver a stop or cancel, since that ends the
+	// work, including recovering a crashed drive of one with a stop pending.
 	t.Run("FindNextApplyOperation_SkipDeferredCutoverWork", func(t *testing.T) {
 		ctx := t.Context()
 		store := h.NewStorage(t)
@@ -1895,6 +1896,14 @@ func TestApplyOperations(t *testing.T, h Harness) {
 		assert.Nil(t, claimSkipping(), "the reserved driver does not recover the deferred apply's stale operation")
 		got = claim()
 		require.NotNil(t, got, "any other driver recovers the deferred apply's stale operation")
+		assert.Equal(t, deferredOp, got.ID)
+
+		released, err = store.ApplyOperations().ReleaseClaim(ctx, got.Lease())
+		require.NoError(t, err)
+		require.True(t, released)
+		requestControl(t, store, deferredApply.ID, storage.ControlOperationStop)
+		got = claimSkipping()
+		require.NotNil(t, got, "the reserved driver recovers the deferred apply's stale operation to deliver its pending stop")
 		assert.Equal(t, deferredOp, got.ID)
 
 		require.NoError(t, store.ApplyOperations().UpdateState(ctx, deferredOp, state.ApplyOperation.Stopped))
