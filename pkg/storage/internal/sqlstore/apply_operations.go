@@ -1556,8 +1556,9 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 	driverCap, driverCapArgs := s.driverCapClause(staleClaimCutoff)
 	// notDeferred is empty unless the claim skips deferred-cutover work. It
 	// binds no arguments, so adding it to an arm leaves every placeholder's
-	// position unchanged. notDeferredRecovery, its stale-active form, binds
-	// arguments that follow that arm's own.
+	// position unchanged. notDeferredRecovery, its crash-recovery form, binds
+	// arguments that follow that arm's own; the stale-active arm and the
+	// failed_retryable arm's crash-recovery branch take it.
 	claimFilter := storage.BuildOperationClaimFilter(opts...)
 	notDeferred := s.deferredCutoverWorkExclusion(claimFilter)
 	notDeferredRecovery, notDeferredRecoveryArgs := s.deferredCutoverRecoveryExclusion(claimFilter)
@@ -1710,6 +1711,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 	queryArgs = append(queryArgs, state.Apply.FailedRetryable, maxRecoveryAttempts, retryableRecoveryFreshnessDays)
 	queryArgs = append(queryArgs, driverCapArgs...)
 	queryArgs = append(queryArgs, stringArgs(activeStates)...)
+	queryArgs = append(queryArgs, notDeferredRecoveryArgs...)
 
 	// The stopped-row and failed_retryable clauses mirror ApplyStore.ClaimApplyByID.
 	// The failed_retryable clause carries no deployment-order gate, because
@@ -1914,7 +1916,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 								-- Names no column of a, but belongs to this arm
 								-- alone: a deliberate redispatch starts work, so
 								-- it is capped; crash recovery below is not.
-								AND `+driverCap+`
+								AND `+driverCap+notDeferred+`
 							)
 							OR (
 								a.state IN (%s)
@@ -1923,10 +1925,10 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 								-- alone: hoisted out of the EXISTS it would gate
 								-- deliberate redispatch too and stall every retry
 								-- for a staleness window.
-								AND apply_operations.updated_at < %s
+								AND apply_operations.updated_at < %s`+notDeferredRecovery+`
 							)
 						)
-				)`+notDeferred+`
+				)
 			)
 		)
 		ORDER BY created_at, id
