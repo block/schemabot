@@ -29,7 +29,11 @@ const parkedFullPollInterval = 30 * time.Second
 // poll that consumes a cutover can still find the engine holding, since the
 // engine takes a poll or more to start its swap, and the request it consumed
 // is no longer pending to wake the drive again. Slowing down there would leave
-// the cutover's outcome unobserved until the next refresh.
+// the cutover's outcome unobserved until the next refresh. So every control
+// read the full poll makes reports what it found through observe, which wakes
+// the drive just as a pending request found between full polls does: a request
+// the full poll consumes on a refresh, or one recorded while it runs, never
+// leaves the drive slowed behind it.
 type parkedPoll struct {
 	interval time.Duration
 	held     bool
@@ -74,6 +78,16 @@ func (p *parkedPoll) runFullPoll(ctx context.Context, store storage.Storage, app
 		return true
 	}
 	return false
+}
+
+// observe records what a control read made during the full poll found. Any
+// pending request wakes the drive, so the hold that follows the poll leaves it
+// at full cadence. A nil pacer, as in a call that paces nothing, ignores it.
+func (p *parkedPoll) observe(pending pendingControlOperations) {
+	if p == nil || len(pending) == 0 {
+		return
+	}
+	p.woken = true
 }
 
 func (p *parkedPoll) beginFullPoll(now time.Time) {
