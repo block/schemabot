@@ -230,6 +230,7 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 					DeferCutover:      a.GetOptions().DeferCutover,
 					Tenant:            h.deploymentTenant(),
 					ApplyAgainCommand: templates.ApplyCommand(environment, databaseName, applyCommandOptionsOf(result)),
+					ApplyAgainConsent: templates.UnsafeReconsent(applyCommandOptionsOf(result)),
 				}))
 				return false, nil
 			}
@@ -284,8 +285,8 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 			h.logger.Info("apply rejected: stale lock intent changed before release; keeping the current lock",
 				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
 				"observed_pending_plan_id", existingLock.PendingPlanID)
-			h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy,
-				applyLockIntentChangedRefusal(database, templates.ApplyCommand(environment, databaseName, applyCommandOptionsOf(result))))
+			h.postComment(repo, pr, installationID, templates.RenderApplyLockIntentChanged(
+				applyLockIntentChangedRefusal(action.Apply, database, environment, requestedBy, databaseName, applyCommandOptionsOf(result))))
 			return false, nil
 		}
 	}
@@ -547,8 +548,8 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 			h.logger.Info("apply rejected: this PR's lock was pinned to another plan while the apply was planning",
 				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
 				"plan_id", planResp.PlanID)
-			h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy,
-				applyLockIntentChangedRefusal(database, templates.ApplyCommand(environment, databaseName, applyCommandOptionsOf(result))))
+			h.postComment(repo, pr, installationID, templates.RenderApplyLockIntentChanged(
+				applyLockIntentChangedRefusal(action.Apply, database, environment, requestedBy, databaseName, applyCommandOptionsOf(result))))
 			return false, nil
 		}
 		h.logger.Error("failed to acquire lock", "error", err)
@@ -1117,15 +1118,17 @@ func pendingRollbackApplyRefusal(database string, rollbackPlan *storage.Plan) st
 }
 
 // applyLockIntentChangedRefusal tells the operator that another command pinned
-// or released the lock while this apply was checking or planning against it.
-// The apply leaves the lock as that command set it; a retry finds it and
-// reports which command holds the lock and how to settle it, or plans afresh
-// when the lock is free. command is the apply to re-run, scoped and optioned
-// as the operator sent it.
-func applyLockIntentChangedRefusal(database, command string) string {
-	return fmt.Sprintf("Another SchemaBot command changed the lock on `%s` while this apply was running, "+
-		"so the apply was rejected to leave the lock as that command set it. Re-run `%s`; "+
-		"if the lock belongs to a pending rollback, the retry will say how to confirm or cancel it.", database, command)
+// or released the lock while this apply was checking or planning against it,
+// with the apply to re-run, scoped and optioned as the operator sent it.
+func applyLockIntentChangedRefusal(commandName, database, environment, requestedBy, scopedDatabase string, opts templates.ApplyCommandOptions) templates.ApplyLockIntentChangedData {
+	return templates.ApplyLockIntentChangedData{
+		CommandName:       commandName,
+		Database:          database,
+		Environment:       environment,
+		RequestedBy:       requestedBy,
+		ApplyAgainCommand: templates.ApplyCommand(environment, scopedDatabase, opts),
+		ApplyAgainConsent: templates.UnsafeReconsent(opts),
+	}
 }
 
 // applyCommandOptionsOf carries the target and option flags the operator typed

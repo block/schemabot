@@ -149,3 +149,110 @@ func TestOperationDriveStalled(t *testing.T) {
 		assert.False(t, svc.operationDriveStalled(t.Context(), 1, op, apply, stalledStart))
 	})
 }
+
+// resumePromotionOperationStore answers MarkResumedRunning with a fixed result
+// and counts the calls.
+type resumePromotionOperationStore struct {
+	storage.ApplyOperationStore
+	promoted bool
+	err      error
+	marks    int
+}
+
+func (s *resumePromotionOperationStore) MarkResumedRunning(context.Context, int64) (bool, error) {
+	s.marks++
+	return s.promoted, s.err
+}
+
+// parentReloadStore fails every parent reload and counts the attempts.
+type parentReloadStore struct {
+	storage.ApplyStore
+	gets int
+}
+
+func (s *parentReloadStore) Get(context.Context, int64) (*storage.Apply, error) {
+	s.gets++
+	return nil, errors.New("connection refused")
+}
+
+type resumePromotionStorage struct {
+	mockStorage
+	tasks    storage.TaskStore
+	applyOps storage.ApplyOperationStore
+	applies  storage.ApplyStore
+}
+
+func (m *resumePromotionStorage) Tasks() storage.TaskStore                     { return m.tasks }
+func (m *resumePromotionStorage) ApplyOperations() storage.ApplyOperationStore { return m.applyOps }
+func (m *resumePromotionStorage) Applies() storage.ApplyStore                  { return m.applies }
+
+// TestAdvanceResumePromotion verifies what the operation heartbeat does for an
+// operation a start resumed. It waits while no task is in flight. A lost lease
+// stops the drive like any other displaced driver. A drive that holds the
+// parent apply lease marks the row running but leaves the parent to its
+// engine. A parent projection that fails is retried on the next tick without
+// marking the row again.
+func TestAdvanceResumePromotion(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	op := &storage.ApplyOperation{
+		ID:            7,
+		ApplyID:       41,
+		Deployment:    "default",
+		OperationKind: storage.ApplyOperationKindWork,
+		State:         state.ApplyOperation.Resuming,
+	}
+	apply := &storage.Apply{
+		ID:              41,
+		ApplyIdentifier: "apply-resume-promotion",
+		Database:        "widgets",
+		Deployment:      "default",
+		Environment:     "staging",
+		State:           state.Apply.Resuming,
+	}
+	inFlight := &stubTaskStore{tasks: []*storage.Task{{State: state.Task.Running}}}
+	newPromotionService := func(tasks storage.TaskStore, ops *resumePromotionOperationStore, applies *parentReloadStore) *Service {
+		return New(&resumePromotionStorage{tasks: tasks, applyOps: ops, applies: applies}, testServerConfig(), nil, logger)
+	}
+
+	t.Run("waits while no task is in flight", func(t *testing.T) {
+		ops := &resumePromotionOperationStore{promoted: true}
+		svc := newPromotionService(&stubTaskStore{tasks: []*storage.Task{{State: state.Task.Stopped}}}, ops, &parentReloadStore{})
+		resume := newResumePromotion(op)
+		assert.Equal(t, resumeContinue, svc.advanceResumePromotion(t.Context(), 1, op, apply, &resume))
+		assert.Zero(t, ops.marks)
+		assert.True(t, resume.awaitingRunning)
+	})
+
+	t.Run("a lost lease stops the drive", func(t *testing.T) {
+		ops := &resumePromotionOperationStore{err: fmt.Errorf("mark resumed: %w", storage.ErrApplyLeaseLost)}
+		applies := &parentReloadStore{}
+		svc := newPromotionService(inFlight, ops, applies)
+		resume := newResumePromotion(op)
+		assert.Equal(t, resumeLeaseLost, svc.advanceResumePromotion(t.Context(), 1, op, apply, &resume))
+		assert.Zero(t, applies.gets, "a displaced driver does not project the parent")
+	})
+
+	t.Run("under the apply lease the parent is left to the engine", func(t *testing.T) {
+		ops := &resumePromotionOperationStore{promoted: true}
+		applies := &parentReloadStore{}
+		svc := newPromotionService(inFlight, ops, applies)
+		resume := newResumePromotion(op)
+		ctx := storage.WithApplyLease(t.Context(), storage.ApplyLease{ApplyID: apply.ID, Owner: "driver", Token: "token"})
+		assert.Equal(t, resumeContinue, svc.advanceResumePromotion(ctx, 1, op, apply, &resume))
+		assert.Equal(t, 1, ops.marks)
+		assert.Zero(t, applies.gets)
+		assert.Equal(t, resumePromotion{}, resume, "nothing is left to do")
+	})
+
+	t.Run("a failed projection is retried without marking the row again", func(t *testing.T) {
+		ops := &resumePromotionOperationStore{promoted: true}
+		applies := &parentReloadStore{}
+		svc := newPromotionService(inFlight, ops, applies)
+		resume := newResumePromotion(op)
+		assert.Equal(t, resumeContinue, svc.advanceResumePromotion(t.Context(), 1, op, apply, &resume))
+		assert.Equal(t, resumeContinue, svc.advanceResumePromotion(t.Context(), 1, op, apply, &resume))
+		assert.Equal(t, 1, ops.marks)
+		assert.Equal(t, 2, applies.gets)
+		assert.Equal(t, resumePromotion{parentStale: true}, resume)
+	})
+}

@@ -147,18 +147,39 @@ func TestGRPCClient_DispatchAfterStopWithNoDispatchedSiblingCreatesTheDeployment
 	assert.False(t, server.startWasCalled())
 }
 
-// Only a dispatch the start claim moved to resuming reads the shared apply. A
-// first dispatch that no stop interrupted goes straight to the attach.
+// Only a dispatch that follows a start reads the shared apply. A first
+// dispatch that no stop interrupted goes straight to the attach.
 func TestGRPCClient_FirstDispatchWithoutAStopSkipsTheDeploymentApplyCheck(t *testing.T) {
 	server := &capturingTernServer{progressState: ternv1.State_STATE_STOPPED, progressStateSet: true}
 	f := stoppedBeforeDispatchFixture(t, server, "remote-shared")
 	f.undispatched.State = state.Apply.Running
+	f.controls.requests = nil
 
 	standDown, err := f.wait(t)
 	require.NoError(t, err)
 	assert.False(t, standDown)
 	assert.Empty(t, server.getProgressApplyID())
 	assert.False(t, server.startWasCalled())
+}
+
+// The start put a shard's operation that a stop caught before its first
+// dispatch back in the queue, so it is claimed as a fresh dispatch rather than
+// out of stopped, while the deployment's shared data-plane apply still reads
+// stopped. The pending start is what this dispatch follows, so it asks for the
+// start and waits for the shared apply to leave stopped before attaching.
+func TestGRPCClient_RequeuedDispatchAfterStopStartsTheStoppedDeploymentApplyBeforeAttaching(t *testing.T) {
+	server := &capturingTernServer{progressStates: []ternv1.State{
+		ternv1.State_STATE_STOPPED,
+		ternv1.State_STATE_RUNNING,
+	}}
+	f := stoppedBeforeDispatchFixture(t, server, "remote-shared")
+	f.undispatched.State = state.Apply.Running
+
+	standDown, err := f.wait(t)
+	require.NoError(t, err)
+	assert.False(t, standDown)
+	assert.Equal(t, "remote-shared", server.getStartApplyID(), "the deployment's shared data-plane apply is started")
+	assert.Equal(t, 1, server.startCalls)
 }
 
 // A stop lands while the dispatch waits for the shared apply to leave stopped.

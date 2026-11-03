@@ -20,6 +20,7 @@ import (
 	"github.com/block/schemabot/pkg/glyph"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/webhook/action"
+	"github.com/block/schemabot/pkg/webhook/templates"
 	"github.com/block/spirit/pkg/checkpoint"
 	"github.com/block/spirit/pkg/utils"
 	gh "github.com/google/go-github/v86/github"
@@ -768,11 +769,11 @@ func TestRepinPendingConfirmationRefusesWhenTheLockIsGone(t *testing.T) {
 			require.NoError(t, err)
 			assert.Nil(t, lock, "the stop must not re-create a released lock")
 
-			recoveryCommand := "schemabot apply -e staging -d " + dbName + " --defer-cutover"
-			require.True(t, f.handler.reportRepinRefused(repinErr, repo, pr, 1, action.ApplyConfirm, dbName, "staging", "testuser", recoveryCommand),
+			refusal := applyLockIntentChangedRefusal(action.ApplyConfirm, dbName, "staging", "testuser", dbName, templates.ApplyCommandOptions{DeferCutover: true})
+			require.True(t, f.handler.reportRepinRefused(repinErr, repo, pr, 1, refusal),
 				"a gone lock is answered as a lock that changed under the apply")
 			reply := awaitCommentContaining(t, f.result, "changed the lock on")
-			assert.Contains(t, reply, applyLockIntentChangedRefusal(dbName, recoveryCommand))
+			assert.Contains(t, reply, "Re-run the apply:\n```\nschemabot apply -e staging -d "+dbName+" --defer-cutover\n```")
 		})
 	}
 
@@ -834,7 +835,7 @@ func TestE2EApplyConfirmStopKeepsRollbackPinnedAfterItsRead(t *testing.T) {
 
 	refusal := awaitCommentContaining(t, f.result, "changed the lock on")
 	assert.Contains(t, refusal, "`"+dbName+"`")
-	assert.Contains(t, refusal, "Re-run `schemabot apply -e staging`")
+	assert.Contains(t, refusal, "Re-run the apply:\n```\nschemabot apply -e staging\n```")
 	require.NoError(t, locks.pinErr, "the concurrent rollback must have pinned the lock")
 
 	lock, err := f.svc.Storage().Locks().Get(t.Context(), dbName, "mysql")

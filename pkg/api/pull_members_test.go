@@ -3,7 +3,9 @@ package api
 import (
 	"errors"
 	"log/slog"
+	"maps"
 	"os"
+	"slices"
 	"sort"
 	"testing"
 
@@ -12,7 +14,6 @@ import (
 
 	"github.com/block/schemabot/pkg/apitypes"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
-	"github.com/block/schemabot/pkg/routing"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/tern"
 )
@@ -247,66 +248,6 @@ func TestExecutePullSchema_ClauseOrderReadsAsDivergence(t *testing.T) {
 	assert.Equal(t, "differs", resp.Targets[1].DivergedTables[0].Difference)
 }
 
-// The primary is resolved by the caller and the member set is resolved again
-// here, so a config reloaded between the two reads could drop the primary out
-// of the environment. Reporting the members anyway would return a set with
-// nothing marked primary, describing an environment that exists in neither
-// config, so the pull fails instead.
-// Exercised against pullMemberDivergence directly: the mismatch it guards
-// against needs the config to move between the caller's resolution and this
-// one, which a single call through ExecutePullSchema cannot stage, since both
-// reads would see the same moved config and agree with each other.
-func TestPullMemberDivergence_PrimaryMissingFromMembersFailsThePull(t *testing.T) {
-	client := newPerTargetPullClient(map[string]*ternv1.PullSchemaResponse{
-		"testapp-001": pulledTables(map[string]string{"users": pullUsersDDL}),
-		"testapp-002": pulledTables(map[string]string{"users": pullUsersDDL}),
-	}, nil)
-	svc := pullTargetService(t, multiTargetPullEnv(), map[string]tern.Client{"eu/production": client})
-
-	// The primary the schema was pulled from is not among the members this call
-	// resolves, the shape a config reloaded mid-pull would leave behind.
-	stalePrimary := routing.ExecutionTarget{
-		Deployment:   "eu",
-		Target:       "testapp-retired",
-		DatabaseType: storage.DatabaseTypeMySQL,
-	}
-
-	_, err := svc.pullMemberDivergence(t.Context(), pullRequest(), stalePrimary,
-		pulledTables(map[string]string{"users": pullUsersDDL}), []string{"testapp"},
-		ternv1.PullCatalogDetail_PULL_CATALOG_DETAIL_BASIC)
-
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "do not include the primary eu/testapp-retired")
-	assert.Contains(t, err.Error(), "eu/testapp-001, eu/testapp-002", "the error names the members it did resolve")
-}
-
-// The primary was pulled for the namespaces its entry selected in the caller's
-// read. A reload that keeps the target but re-places its namespaces would
-// compare that schema with members pulled under the new placement, so the pull
-// fails instead of reporting the comparison.
-func TestPullMemberDivergence_PrimarySelectionChangedFailsThePull(t *testing.T) {
-	client := newPerTargetPullClient(map[string]*ternv1.PullSchemaResponse{
-		"testapp-001": pulledTables(map[string]string{"users": pullUsersDDL}),
-		"testapp-002": pulledTables(map[string]string{"users": pullUsersDDL}),
-	}, nil)
-	svc := pullTargetService(t, multiTargetPullEnv(), map[string]tern.Client{"eu/production": client})
-
-	pulledUnder := routing.ExecutionTarget{
-		Deployment:   "eu",
-		Target:       "testapp-001",
-		DatabaseType: storage.DatabaseTypeMySQL,
-		Namespaces:   []string{"testapp"},
-	}
-
-	_, err := svc.pullMemberDivergence(t.Context(), pullRequest(), pulledUnder,
-		pulledTables(map[string]string{"users": pullUsersDDL}), []string{"testapp"},
-		ternv1.PullCatalogDetail_PULL_CATALOG_DETAIL_BASIC)
-
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "pulled the primary eu/testapp-001 for namespaces [testapp], but it now selects []")
-	assert.Empty(t, client.pulledTargets(), "no member is pulled once the placement is known to have moved")
-}
-
 // A target that cannot be pulled fails the request. Returning the primary's
 // schema with that target simply absent would report the environment as
 // converged on the strength of a comparison that never happened.
@@ -357,4 +298,169 @@ func TestExecutePullSchema_MirroredDeploymentsAreNotPulledOrCompared(t *testing.
 	assert.Empty(t, resp.Targets, "an environment whose deployments should match reports no per-target divergence")
 	assert.Equal(t, []string{"testapp"}, eu.pulledTargets(), "only the primary deployment is pulled")
 	assert.Empty(t, us.pulledTargets())
+}
+
+// namespacePullClient answers each target with its own tables per namespace, and
+// only for the namespace it was asked for, so a pull that asked a target for a
+// namespace its entry does not place there fails instead of borrowing another
+// target's schema.
+func namespacePullClient(byTarget map[string]map[string]map[string]string) *perTargetPullClient {
+	c := &perTargetPullClient{}
+	c.pullSchemaHook = func(req *ternv1.PullSchemaRequest) (*ternv1.PullSchemaResponse, error) {
+		held, ok := byTarget[req.Target][req.Namespace]
+		if !ok {
+			return nil, errors.New("target " + req.Target + " holds no namespace " + req.Namespace)
+		}
+		return &ternv1.PullSchemaResponse{
+			Database:    "testapp",
+			Type:        storage.DatabaseTypeMySQL,
+			Environment: "production",
+			Namespaces:  map[string]*ternv1.PulledNamespace{req.Namespace: {Tables: held}},
+			TableCount:  int32(len(held)),
+		}, nil
+	}
+	return c
+}
+
+// partitionedPullEnv places the unsharded namespace on the primary and one
+// shard namespace on each of two further targets, with a third shard target
+// holding a second copy of the first shard's namespace.
+func partitionedPullEnv() EnvironmentConfig {
+	return EnvironmentConfig{Deployment: "eu", Targets: []TargetEntry{
+		{Target: "testapp-001", Namespaces: []string{"testapp"}},
+		{Target: "testapp-002", Namespaces: []string{"testapp_0"}},
+		{Target: "testapp-003", Namespaces: []string{"testapp_1"}},
+		{Target: "testapp-004", Namespaces: []string{"testapp_0"}},
+	}}
+}
+
+func partitionedPullClient() *perTargetPullClient {
+	return namespacePullClient(map[string]map[string]map[string]string{
+		"testapp-001": {"testapp": {"users": pullUsersDDL}},
+		"testapp-002": {"testapp_0": {"audits": pullAuditsDDL}},
+		"testapp-003": {"testapp_1": {"audits": pullAuditsDDL}},
+		"testapp-004": {"testapp_0": {"audits": pullAuditsDDL, "users": pullUsersDDL}},
+	})
+}
+
+// assertTableCountMatchesNamespaces checks that a pull's table_count counts
+// exactly the tables it returns. Service callers that catalog a pull treat a
+// mismatch as a corrupt response and reject it, so a schema assembled from
+// several targets must keep the two in step.
+func assertTableCountMatchesNamespaces(t *testing.T, resp *apitypes.PullSchemaResponse) {
+	t.Helper()
+	tables := 0
+	for _, namespace := range resp.Namespaces {
+		tables += len(namespace.Tables)
+	}
+	assert.Equal(t, int32(tables), resp.TableCount, "table_count counts the tables the response carries")
+}
+
+// An environment whose targets each hold different namespaces, such as an
+// unsharded schema on one cluster and one shard schema on each of the others,
+// pulls every namespace from the first target holding it. Each target is
+// compared only on the namespaces it holds, so a shard target is not reported
+// as missing the unsharded schema, and a second copy of a shard is compared
+// with the first.
+func TestExecutePullSchema_NamespacePartitionedTargets(t *testing.T) {
+	client := partitionedPullClient()
+	svc := pullTargetService(t, partitionedPullEnv(), map[string]tern.Client{"eu/production": client})
+
+	resp, err := svc.ExecutePullSchema(t.Context(), pullRequest())
+	require.NoError(t, err)
+
+	require.Len(t, resp.Namespaces, 3, "the schema holds every namespace the environment places")
+	assert.Equal(t, map[string]string{"users": pullUsersDDL}, resp.Namespaces["testapp"].Tables)
+	assert.Equal(t, map[string]string{"audits": pullAuditsDDL}, resp.Namespaces["testapp_0"].Tables, "a namespace comes from the first target holding it")
+	assert.Equal(t, map[string]string{"audits": pullAuditsDDL}, resp.Namespaces["testapp_1"].Tables)
+	assert.Equal(t, int32(3), resp.TableCount)
+	assertTableCountMatchesNamespaces(t, resp)
+
+	require.Len(t, resp.Targets, 4)
+	assert.Equal(t, &apitypes.TargetDivergence{Deployment: "eu", Target: "testapp-001", TableCount: 1, Primary: true, Namespaces: []string{"testapp"}}, resp.Targets[0])
+	assert.Equal(t, &apitypes.TargetDivergence{Deployment: "eu", Target: "testapp-002", TableCount: 1, Namespaces: []string{"testapp_0"}}, resp.Targets[1],
+		"a target holding only its own namespace has nothing to differ from")
+	assert.Equal(t, &apitypes.TargetDivergence{Deployment: "eu", Target: "testapp-003", TableCount: 1, Namespaces: []string{"testapp_1"}}, resp.Targets[2])
+	assert.Equal(t, &apitypes.TargetDivergence{Deployment: "eu", Target: "testapp-004", TableCount: 2, Namespaces: []string{"testapp_0"},
+		DivergedTables: []apitypes.DivergedTable{{Namespace: "testapp_0", Table: "users", Difference: apitypes.DivergenceOnlyOnTarget}}}, resp.Targets[3],
+		"a second target holding a namespace is compared with the first")
+}
+
+// A pull naming one namespace returns that namespace's schema from the target
+// whose entry places it, even when that is not the primary.
+func TestExecutePullSchema_RequestedNamespaceComesFromTheTargetHoldingIt(t *testing.T) {
+	client := partitionedPullClient()
+	svc := pullTargetService(t, partitionedPullEnv(), map[string]tern.Client{"eu/production": client})
+
+	req := pullRequest()
+	req.Namespaces = []string{"testapp_1"}
+	resp, err := svc.ExecutePullSchema(t.Context(), req)
+	require.NoError(t, err)
+
+	assert.Equal(t, []string{"testapp-003"}, client.pulledTargets(), "only the target holding the namespace is asked for it")
+	require.Len(t, resp.Namespaces, 1)
+	assert.Equal(t, map[string]string{"audits": pullAuditsDDL}, resp.Namespaces["testapp_1"].Tables)
+	assert.Equal(t, int32(1), resp.TableCount)
+	assertTableCountMatchesNamespaces(t, resp)
+	require.Len(t, resp.Targets, 4)
+	assert.Equal(t, int32(0), resp.Targets[0].TableCount, "the primary holds none of the requested namespaces")
+	assert.Equal(t, int32(1), resp.Targets[2].TableCount)
+	for _, target := range resp.Targets {
+		assert.Empty(t, target.DivergedTables, target.Target)
+	}
+}
+
+// A target whose entry selects nothing holds every namespace, so when it is the
+// primary it is the baseline for all of them and a selecting target is compared
+// with it on the namespace it selects.
+func TestExecutePullSchema_SelectingTargetComparedWithAnUnselectingPrimary(t *testing.T) {
+	client := newPerTargetPullClient(map[string]*ternv1.PullSchemaResponse{
+		"testapp-001": pulledTables(map[string]string{"users": pullUsersDDL}),
+		"testapp-002": pulledTables(map[string]string{"users": pullUsersEmailDDL}),
+	}, nil)
+	env := EnvironmentConfig{Deployment: "eu", Targets: []TargetEntry{
+		{Target: "testapp-001"},
+		{Target: "testapp-002", Namespaces: []string{"testapp"}},
+	}}
+	svc := pullTargetService(t, env, map[string]tern.Client{"eu/production": client})
+
+	resp, err := svc.ExecutePullSchema(t.Context(), pullRequest())
+	require.NoError(t, err)
+
+	assert.Equal(t, pullUsersDDL, resp.Namespaces["testapp"].Tables["users"])
+	require.Len(t, resp.Targets, 2)
+	assert.Empty(t, resp.Targets[0].Namespaces)
+	assert.Equal(t, []apitypes.DivergedTable{
+		{Namespace: "testapp", Table: "users", Difference: apitypes.DivergenceDiffers},
+	}, resp.Targets[1].DivergedTables)
+}
+
+// An entry with no selection holds every namespace, so when it comes first it
+// supplies every namespace, including a shard a later entry selects. A cluster
+// that lacks that shard leaves it out of the pulled schema, and the later
+// target's tables in it read as extra: the configuration places the shard on
+// both, and a plan of the first target would create it there.
+func TestExecutePullSchema_UnselectingPrimaryMissingASelectedNamespace(t *testing.T) {
+	shard := pulledTables(map[string]string{"audits": pullAuditsDDL})
+	shard.Namespaces = map[string]*ternv1.PulledNamespace{"testapp_0": shard.Namespaces["testapp"]}
+	client := newPerTargetPullClient(map[string]*ternv1.PullSchemaResponse{
+		"testapp-001": pulledTables(map[string]string{"users": pullUsersDDL}),
+		"testapp-002": shard,
+	}, nil)
+	env := EnvironmentConfig{Deployment: "eu", Targets: []TargetEntry{
+		{Target: "testapp-001"},
+		{Target: "testapp-002", Namespaces: []string{"testapp_0"}},
+	}}
+	svc := pullTargetService(t, env, map[string]tern.Client{"eu/production": client})
+
+	resp, err := svc.ExecutePullSchema(t.Context(), pullRequest())
+	require.NoError(t, err)
+
+	assert.Equal(t, []string{"testapp"}, slices.Sorted(maps.Keys(resp.Namespaces)), "the first target supplies testapp_0 and holds none of it")
+	assertTableCountMatchesNamespaces(t, resp)
+	require.Len(t, resp.Targets, 2)
+	assert.Empty(t, resp.Targets[0].DivergedTables)
+	assert.Equal(t, []apitypes.DivergedTable{
+		{Namespace: "testapp_0", Table: "audits", Difference: apitypes.DivergenceOnlyOnTarget},
+	}, resp.Targets[1].DivergedTables)
 }

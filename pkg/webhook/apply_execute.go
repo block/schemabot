@@ -58,10 +58,6 @@ func (h *Handler) executeApply(
 			"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
 			"plan_id", disclosedPlan.PlanIdentifier, "narrowed_to", disclosedPlan.NarrowedTo)
 	}
-	// The apply a refusal asks the operator to re-run: the one they sent,
-	// narrowed as its confirmed plan was, with the options they typed.
-	recoveryCommand := templates.ApplyCommand(environment, result.Database, applyCommandOptionsOf(result))
-
 	// Re-plan for drift detection
 	prNumber := int32(pr)
 	planReq := api.PlanRequest{
@@ -100,6 +96,11 @@ func (h *Handler) executeApply(
 	if storedPlan != nil {
 		actionName = action.Apply
 	}
+	// What a refusal tells the operator when the lock changed under the apply:
+	// re-run the apply they sent, narrowed as its confirmed plan was, with the
+	// options they typed.
+	repinRefusal := applyLockIntentChangedRefusal(actionName, database, environment, requestedBy, result.Database, applyCommandOptionsOf(result))
+
 	freshPRInfo, err := client.FetchPullRequestNoCache(ctx, repo, pr)
 	if err != nil {
 		h.logger.Error("apply rejected: failed final PR freshness fetch",
@@ -262,7 +263,7 @@ func (h *Handler) executeApply(
 			}
 			disclosesDiscard := len(planResp.DiscardedCopies()) > 0
 			if err := h.repinPendingConfirmation(ctx, repo, pr, database, dbType, environment, actionName, expectedPendingPlanID, planResp.PlanID, disclosesDiscard); err != nil {
-				if h.reportRepinRefused(err, repo, pr, installationID, actionName, database, environment, requestedBy, recoveryCommand) {
+				if h.reportRepinRefused(err, repo, pr, installationID, repinRefusal) {
 					return
 				}
 				h.logger.Error("failed to re-pin the pending confirmation onto the plan whose comment shows the targets' changed plans",
@@ -397,7 +398,7 @@ func (h *Handler) executeApply(
 			// whatever unfinished copy the re-plan would discard.
 			disclosesDiscard := len(planResp.DiscardedCopies()) > 0
 			if err := h.repinPendingConfirmation(ctx, repo, pr, database, dbType, environment, actionName, expectedPendingPlanID, planResp.PlanID, disclosesDiscard); err != nil {
-				if h.reportRepinRefused(err, repo, pr, installationID, actionName, database, environment, requestedBy, recoveryCommand) {
+				if h.reportRepinRefused(err, repo, pr, installationID, repinRefusal) {
 					return
 				}
 				h.logger.Error("failed to re-pin pending confirmation onto the plan that discloses the newly-direct changes",
@@ -437,7 +438,7 @@ func (h *Handler) executeApply(
 			return
 		}
 		if err := h.repinPendingConfirmation(ctx, repo, pr, database, dbType, environment, actionName, expectedPendingPlanID, planResp.PlanID, true); err != nil {
-			if h.reportRepinRefused(err, repo, pr, installationID, actionName, database, environment, requestedBy, recoveryCommand) {
+			if h.reportRepinRefused(err, repo, pr, installationID, repinRefusal) {
 				return
 			}
 			// Without the re-pin the confirm command would load the disclosure
@@ -1067,16 +1068,16 @@ func (h *Handler) logPreservedLockIntent(ctx context.Context, repo string, pr in
 // reportRepinRefused answers an apply whose pending confirmation could not be
 // re-pinned because another command pinned or released the lock meanwhile. The
 // stop comment just posted coaches a confirmation the lock no longer carries,
-// so the operator is told the lock changed, given recoveryCommand to re-run,
-// and told that a retry names the command holding the lock, if any. It reports
+// so the operator is given refusal, which says the lock changed, names the
+// apply to re-run, and says a retry names the command holding the lock. It reports
 // whether err was that refusal; any other error is left for the caller to
 // report. repinPendingConfirmation has already logged the refusal with the
 // lock's state, so it is not logged again here.
-func (h *Handler) reportRepinRefused(err error, repo string, pr int, installationID int64, actionName, database, environment, requestedBy, recoveryCommand string) bool {
+func (h *Handler) reportRepinRefused(err error, repo string, pr int, installationID int64, refusal templates.ApplyLockIntentChangedData) bool {
 	if !errors.Is(err, storage.ErrLockIntentChanged) {
 		return false
 	}
-	h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy, applyLockIntentChangedRefusal(database, recoveryCommand))
+	h.postComment(repo, pr, installationID, templates.RenderApplyLockIntentChanged(refusal))
 	return true
 }
 
