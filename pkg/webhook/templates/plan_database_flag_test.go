@@ -142,7 +142,7 @@ func TestRenderConfirmationPlanForOtherEnvironmentScopesRecoveryCommands(t *test
 	})
 	assert.True(t, strings.HasPrefix(scoped, "## "+glyph.Refused+" Apply-confirm Refused — Production\n\n**Database**: `orders`\n\n"), scoped)
 	assert.Contains(t, scoped, "The pending confirmation is for `staging`, not `production`; nothing was applied.\n\n")
-	assert.Contains(t, scoped, "To confirm the `staging` plan:\n\n```\nschemabot apply-confirm -e staging -d orders --tenant acme --defer-cutover\n```\n")
+	assert.Contains(t, scoped, "To apply the `staging` plan:\n\n```\nschemabot apply-confirm -e staging -d orders --tenant acme --defer-cutover\n```\n")
 	assert.Contains(t, scoped, applyConsequences+"```\nschemabot apply -e production -d orders --tenant acme --defer-cutover\n```\n")
 	assert.Contains(t, scoped, "\n_Requested by @hubot_\n")
 
@@ -193,7 +193,6 @@ func TestConfirmationRefusalsCarryLongCommandsIntact(t *testing.T) {
 	longDatabase := strings.Repeat("orders_ledger_v2", 4)
 	require.Len(t, longDatabase, 64)
 	everyFlag := ApplyCommandOptions{Tenant: "acme-holdings-eu", AllowUnsafe: true, DeferCutover: true, SkipRevert: true}
-	confirmFlags := " -d " + longDatabase + " --tenant acme-holdings-eu --allow-unsafe --defer-cutover --skip-revert"
 	applyFlags := " -d " + longDatabase + " --tenant acme-holdings-eu --defer-cutover --skip-revert"
 	reconsent := " with `--allow-unsafe` to confirm unsafe changes:\n\n"
 
@@ -205,7 +204,8 @@ func TestConfirmationRefusalsCarryLongCommandsIntact(t *testing.T) {
 		Options:              everyFlag,
 	})
 	assert.Greater(t, len([]rune(otherEnvironment)), maxCommentErrorLen, "the scenario must be one the generic error clamp would have cut")
-	assert.Contains(t, otherEnvironment, "```\nschemabot apply-confirm -e staging"+confirmFlags+"\n```\n", "the confirmation keeps the consent given to the plan it confirms")
+	assert.Contains(t, otherEnvironment, "To apply the `staging` plan"+reconsent+"```\nschemabot apply-confirm -e staging"+applyFlags+"\n```\n",
+		"consent aimed at another environment is typed again for the pending plan, not pasted")
 	assert.Contains(t, otherEnvironment, "pausing for `apply-confirm` only if its plan needs it"+reconsent+"```\nschemabot apply -e production"+applyFlags+"\n```\n\n_Requested by @hubot_\n")
 	assert.NotContains(t, otherEnvironment, "…")
 
@@ -254,7 +254,7 @@ func TestApplyCommandLeavesOutAllowUnsafe(t *testing.T) {
 		ApplyAgainConsent: UnsafeReconsent(opts),
 	})
 	assert.Contains(t, inProgress, "Once it finishes, apply again with `--allow-unsafe` to confirm unsafe changes:\n```\nschemabot apply -e staging -d orders --tenant acme --defer-cutover\n```\n")
-	assert.NotContains(t, inProgress, "--allow-unsafe\n")
+	assert.NotRegexp(t, "schemabot apply [^\n]*--allow-unsafe", inProgress)
 }
 
 // An apply rejected because another command changed its lock answers with the
@@ -275,7 +275,7 @@ func TestRenderApplyLockIntentChangedKeepsLongCommandWhole(t *testing.T) {
 		ApplyAgainConsent: UnsafeReconsent(opts),
 	})
 
-	assert.Contains(t, rendered, "## "+glyph.Failed+" Apply-confirm Rejected — Staging\n")
+	assert.Contains(t, rendered, "## "+glyph.Refused+" Apply-confirm Refused — Staging\n")
 	assert.Contains(t, rendered, "changed the lock on `"+database+"`")
 	assert.Contains(t, rendered, "Re-run the apply with `--allow-unsafe` to confirm unsafe changes:\n```\nschemabot apply -e staging -d "+database+" --tenant acme-holdings-eu --defer-cutover --skip-revert\n```\n")
 	assert.NotContains(t, rendered, "…")

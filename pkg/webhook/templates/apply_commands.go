@@ -532,7 +532,7 @@ type ApplyLockIntentChangedData struct {
 func RenderApplyLockIntentChanged(data ApplyLockIntentChangedData) string {
 	var sb strings.Builder
 
-	writeEnvironmentTitle(&sb, glyph.Failed+" "+capitalizeFirst(data.CommandName)+" Rejected", data.Environment)
+	writeEnvironmentTitle(&sb, glyph.Refused+" "+capitalizeFirst(data.CommandName)+" Refused", data.Environment)
 	writeDBLine(&sb, data.Database)
 	writeRequesterOrTimestamp(&sb, data.RequestedBy)
 	sb.WriteString("\n")

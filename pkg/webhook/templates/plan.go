@@ -3634,10 +3634,12 @@ func scopedCommand(baseCommand, environment, database, tenant string) string {
 // beyond its environment and database. A pasteable hint for either command has
 // to repeat them, because the command reads its options from the comment that
 // carries it and nothing else: a hint that drops --defer-cutover runs the
-// cutover the operator chose to defer, one that drops --allow-unsafe is blocked
-// again, and one that drops --target applies to every rollout member instead of
-// the one the operator narrowed to. Target is set only for apply hints:
-// apply-confirm takes its target from the plan it confirms.
+// cutover the operator chose to defer, and one that drops --target applies to
+// every rollout member instead of the one the operator narrowed to.
+// --allow-unsafe is the exception: it is repeated only in an apply-confirm
+// hint for the plan the operator consented to, and every other hint leaves it
+// out and asks for it with UnsafeReconsent. Target is set only for apply
+// hints: apply-confirm takes its target from the plan it confirms.
 type ApplyCommandOptions struct {
 	Target       string
 	Tenant       string
@@ -3741,7 +3743,10 @@ type ConfirmationRefusalData struct {
 
 // RenderConfirmationPlanForOtherEnvironment refuses an apply-confirm whose -e
 // names a different environment than the pending confirmation was planned for.
-// The confirm command it offers keeps the pending confirmation. The apply
+// The confirm command it offers keeps the pending confirmation, but not the
+// --allow-unsafe the operator typed: that consent was aimed at the requested
+// environment, so the pending plan's unsafe changes are confirmed by typing it
+// again, led in by UnsafeReconsent. The apply
 // command it offers for the requested environment does not: it answers to the
 // environment ordering gate like any apply, and once through it releases this
 // pull request's lock, so the pinned plan is gone and the requested
@@ -3755,8 +3760,10 @@ func RenderConfirmationPlanForOtherEnvironment(data ConfirmationRefusalData) str
 
 	writeConfirmationRefusalHeader(&sb, data)
 	fmt.Fprintf(&sb, "The pending confirmation is for `%s`, not `%s`; nothing was applied.\n\n", data.PlanEnvironment, data.RequestedEnvironment)
-	fmt.Fprintf(&sb, "To confirm the `%s` plan:\n\n", data.PlanEnvironment)
-	writeCommandBlock(&sb, scopedApplyCommand("schemabot apply-confirm", data.PlanEnvironment, data.Database, data.Options))
+	confirmOptions := data.Options
+	confirmOptions.AllowUnsafe = false
+	writeRerunCommand(&sb, fmt.Sprintf("To apply the `%s` plan", data.PlanEnvironment), UnsafeReconsent(data.Options),
+		scopedApplyCommand("schemabot apply-confirm", data.PlanEnvironment, data.Database, confirmOptions), "\n\n")
 	writeApplyCommandBlock(&sb, fmt.Sprintf("\nTo apply `%s` instead, dropping the pending `%s` confirmation and planning and applying `%s` in one step, subject to the environment ordering gate and pausing for `apply-confirm` only if its plan needs it",
 		data.RequestedEnvironment, data.PlanEnvironment, data.RequestedEnvironment), data.RequestedEnvironment, data.Database, data.Options)
 	writeConfirmationRefusalFooter(&sb, data)
