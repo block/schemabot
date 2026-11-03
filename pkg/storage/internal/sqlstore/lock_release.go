@@ -13,7 +13,14 @@ import (
 // lockReleaseTimeout bounds how long a pinned session may spend releasing its
 // advisory lock. A release stuck on a half-open connection would otherwise
 // never return, and ConnMaxLifetime cannot retire a connection that is in use.
-const lockReleaseTimeout = 5 * time.Second
+//
+// The bound ends this instance's wait, not the lock. The client drops the
+// session when the release gives up, but a server that never sees the close
+// keeps the lock with its old session until it notices the session is gone,
+// and every other holder waits for that, however short this bound is.
+//
+// A variable so tests can shorten it.
+var lockReleaseTimeout = 5 * time.Second
 
 // releaseLockConn releases the advisory lock held on conn's session within
 // lockReleaseTimeout and hands the session back. A session whose release
