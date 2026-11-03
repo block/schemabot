@@ -16,9 +16,9 @@ import (
 // A pull request edits orders.sql and is approved; the default branch then
 // edits the same file and the PR is rebased, so the head's file combines both
 // edits. The target runs all four versions and keeps the approval only when
-// the PR's edit is the same schema change on the newer base and the head does
-// not override what the default branch changed. Running the files leaves
-// nothing behind on the target.
+// every statement the head runs from its base is one the approved commit runs
+// from its own, in the same order. Running the files leaves nothing behind on
+// the target.
 func TestEngineCompareSchemaFileChange(t *testing.T) {
 	dsn, db := testutil.StartPostgres(t, "compare_test")
 	eng := NewForTarget(0, 0, "compare_test", &engine.Credentials{DSN: dsn})
@@ -60,7 +60,7 @@ func TestEngineCompareSchemaFileChange(t *testing.T) {
 			approved:     orders("id bigint PRIMARY KEY, total bigint"),
 			headBase:     orders("id bigint PRIMARY KEY, total integer NOT NULL"),
 			head:         orders("id bigint PRIMARY KEY, total bigint NOT NULL"),
-			wantReason:   "both the approved commit and the base changed column total",
+			wantSame:     true,
 		},
 		{
 			name:         "a head that drops the column the default branch added",
@@ -68,7 +68,7 @@ func TestEngineCompareSchemaFileChange(t *testing.T) {
 			approved:     orders("id bigint PRIMARY KEY, note text"),
 			headBase:     orders("id bigint PRIMARY KEY, total bigint"),
 			head:         orders("id bigint PRIMARY KEY, note text"),
-			wantReason:   "the base changed column total since the approved commit, and the head replaces it with another version",
+			wantReason:   "DROP COLUMN \\\"total\\\"",
 		},
 		{
 			name:         "a head that declares the PR's column differently",
@@ -76,15 +76,7 @@ func TestEngineCompareSchemaFileChange(t *testing.T) {
 			approved:     orders("id bigint PRIMARY KEY, note text"),
 			headBase:     orders("id bigint PRIMARY KEY, total bigint"),
 			head:         orders("id bigint PRIMARY KEY, total bigint, note varchar(10)"),
-			wantReason:   "the head declares column note differently from the approved commit",
-		},
-		{
-			name:         "a table property the head changes beyond the PR's edit",
-			approvedBase: orders("id bigint PRIMARY KEY"),
-			approved:     orders("id bigint PRIMARY KEY, note text"),
-			headBase:     orders("id bigint PRIMARY KEY, total bigint"),
-			head:         "CREATE UNLOGGED TABLE orders (id bigint PRIMARY KEY, total bigint, note text);",
-			wantReason:   "the head declares table clause relation differently from the approved commit",
+			wantReason:   "ADD COLUMN \\\"note\\\" character varying(10)",
 		},
 		{
 			name:         "a storage parameter the default branch added beside the PR's column",
@@ -95,36 +87,44 @@ func TestEngineCompareSchemaFileChange(t *testing.T) {
 			wantSame:     true,
 		},
 		{
+			// The diff does not act on this clause, so the head runs only the
+			// approved ADD COLUMN.
 			name:         "a storage parameter the head adds beyond the PR's edit",
 			approvedBase: orders("id bigint PRIMARY KEY"),
 			approved:     orders("id bigint PRIMARY KEY, note text"),
 			headBase:     orders("id bigint PRIMARY KEY, total bigint"),
 			head:         "CREATE TABLE orders (id bigint PRIMARY KEY, total bigint, note text) WITH (autovacuum_enabled = false);",
-			wantReason:   "the head declares table clause options differently from the approved commit",
+			wantSame:     true,
 		},
 		{
+			// The diff does not act on this clause, so the head runs only the
+			// approved ADD COLUMN.
 			name:         "a tablespace the head adds beyond the PR's edit",
 			approvedBase: orders("id bigint PRIMARY KEY"),
 			approved:     orders("id bigint PRIMARY KEY, note text"),
 			headBase:     orders("id bigint PRIMARY KEY, total bigint"),
 			head:         "CREATE TABLE orders (id bigint PRIMARY KEY, total bigint, note text) TABLESPACE pg_default;",
-			wantReason:   "the head declares table clause tablespacename differently from the approved commit",
+			wantSame:     true,
 		},
 		{
+			// The diff does not act on this clause, so the head runs only the
+			// approved ADD COLUMN.
 			name:         "identity sequence options the head changes beyond the PR's edit",
 			approvedBase: orders("id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY"),
 			approved:     orders("id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, note text"),
 			headBase:     orders("id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, total bigint"),
 			head:         orders("id bigint GENERATED ALWAYS AS IDENTITY (START WITH 1000) PRIMARY KEY, total bigint, note text"),
-			wantReason:   "the head declares column id differently from the approved commit",
+			wantSame:     true,
 		},
 		{
+			// The diff does not act on this clause, so the head runs only the
+			// approved ADD COLUMN.
 			name:         "a column storage mode the head adds to the PR's column",
 			approvedBase: orders("id bigint PRIMARY KEY"),
 			approved:     orders("id bigint PRIMARY KEY, note text"),
 			headBase:     orders("id bigint PRIMARY KEY, total bigint"),
 			head:         orders("id bigint PRIMARY KEY, total bigint, note text STORAGE EXTERNAL"),
-			wantReason:   "the head declares column note differently from the approved commit",
+			wantSame:     true,
 		},
 		{
 			name:         "index storage parameters the head changes on the default branch's index",
@@ -132,7 +132,7 @@ func TestEngineCompareSchemaFileChange(t *testing.T) {
 			approved:     orders("id bigint PRIMARY KEY, total bigint, note text"),
 			headBase:     orders("id bigint PRIMARY KEY, total bigint") + "\nCREATE INDEX orders_total_idx ON orders (total);",
 			head:         orders("id bigint PRIMARY KEY, total bigint, note text") + "\nCREATE INDEX orders_total_idx ON orders (total) WITH (fillfactor = 50);",
-			wantReason:   "the base changed index orders_total_idx since the approved commit, and the head replaces it with another version",
+			wantReason:   "DROP INDEX \\\"public\\\".\\\"orders_total_idx\\\"",
 		},
 		{
 			name:         "unnamed checks the PR and the default branch both add, which PostgreSQL names by position",
@@ -192,9 +192,8 @@ func TestEngineCompareSchemaFileChangeRejectsFilesItCannotRun(t *testing.T) {
 
 	tests := []struct {
 		name string
-		// approved defaults to the file with the PR's column; a case whose
-		// files merge sets it to its head so the comparison reaches the
-		// target.
+		// approved defaults to the file with the PR's column; a case that
+		// must reach the target with matching files sets it to its head.
 		approved string
 		head     string
 		wantErr  string
@@ -213,6 +212,11 @@ func TestEngineCompareSchemaFileChangeRejectsFilesItCannotRun(t *testing.T) {
 			name:    "a file with a foreign key",
 			head:    "CREATE TABLE orders (id bigint PRIMARY KEY, note text, customer_id bigint REFERENCES customers (id));",
 			wantErr: "table orders declares foreign keys to customers, which the comparison does not cover",
+		},
+		{
+			name:    "a table property the diff cannot change",
+			head:    "CREATE UNLOGGED TABLE orders (id bigint PRIMARY KEY, note text);",
+			wantErr: "diff the head against its base: table persistence (unlogged) differs",
 		},
 		{
 			name:     "a file the target rejects",
