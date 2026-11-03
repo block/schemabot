@@ -253,11 +253,9 @@ func TestGRPCClient_CopyingDeploymentLeavesCutoverRequestForParkedDeployment(t *
 }
 
 // The shard work operations of one deployment share its remote apply and cut
-// over together as whichever batch is parked: a multi-shard apply started with
-// --defer-cutover takes one cutover per batch. A shard still copying ahead of
-// a parked one in the same deployment therefore does not hold the parked
-// shard's turn, and the parked shard's drive cuts over the deployment's remote
-// apply.
+// over together. A shard still copying ahead of a parked one in the same
+// deployment therefore does not hold the parked shard's turn, and the parked
+// shard's drive cuts over the deployment's remote apply.
 func TestGRPCClient_ShardSiblingDoesNotHoldCutoverRequest(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping integration test in short mode")

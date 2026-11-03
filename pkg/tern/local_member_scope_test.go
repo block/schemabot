@@ -463,3 +463,22 @@ func TestPlanIDForTasks(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "neither the tasks nor apply apply-without-plan name a plan")
 }
+
+// A control plane that orders a rollout's cutovers defers each operation's
+// cutover on the data plane, so the data plane's apply carries the deferral,
+// and then sends one operation's cutover at a time. The data plane queues that
+// cutover for the operation it names while a sibling is still copying, rather
+// than waiting for every operation as an operator's --defer-cutover would.
+func TestLocalClient_CutoverNamingOneOperationIsQueuedWhileASiblingCopies(t *testing.T) {
+	fx := newSharedApplyFixture(state.ApplyOperation.WaitingForCutover, state.ApplyOperation.Running, state.Task.WaitingForCutover, state.Task.Running)
+	fx.apply.Options = storage.MarshalApplyOptions(storage.ApplyOptions{DeferCutover: true})
+
+	resp, err := fx.client.Cutover(t.Context(), &ternv1.CutoverRequest{ApplyId: fx.apply.ApplyIdentifier, Environment: "staging", Caller: "cli:alice", ApplyOperationId: "11"})
+	require.NoError(t, err)
+	assert.True(t, resp.Accepted, resp.GetErrorMessage())
+	require.Len(t, fx.controlRequests.requests, 1)
+	assert.Equal(t, storage.ControlRequestPending, fx.controlRequests.requests[0].Status)
+	boundIDs, err := fx.controlRequests.requests[0].CutoverOperationIDs()
+	require.NoError(t, err)
+	assert.Equal(t, []int64{11}, boundIDs, "the cutover is bound to the operation it names")
+}

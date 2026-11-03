@@ -4516,6 +4516,43 @@ func TestApplyStore_FindNextApplyForStopReconciliation_ClaimsPendingApplyWithSto
 	assert.Equal(t, "test-operator", claimed.LeaseOwner)
 }
 
+// TestApplyStore_FindNextApplyForStopReconciliation_ClaimsMemberHandoffWithCancel
+// verifies a cancel that lands while a rollout hands off between members is
+// not stranded: the finished member is terminal and the claim gate holds the
+// next one, so nothing is active to carry the cancel, and reconciliation claims
+// the apply so the operator can cancel the pending member and settle it.
+func TestApplyStore_FindNextApplyForStopReconciliation_ClaimsMemberHandoffWithCancel(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql")
+	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_cancel_recon_handoff", 1, state.Apply.Running, "staging")
+
+	_, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a", State: state.ApplyOperation.Completed, OnFailure: storage.OnFailureHalt,
+	})
+	require.NoError(t, err)
+	_, err = store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-b", OnFailure: storage.OnFailureHalt,
+	})
+	require.NoError(t, err)
+
+	_, _, err = store.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationCancel,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "operator",
+	})
+	require.NoError(t, err)
+
+	claimed, err := store.Applies().FindNextApplyForStopReconciliation(ctx, "test-operator")
+	require.NoError(t, err)
+	require.NotNil(t, claimed, "a rollout with a pending cancel and nothing active must be claimable so the cancel is not stranded")
+	assert.Equal(t, apply.ID, claimed.ID)
+	assert.Equal(t, "test-operator", claimed.LeaseOwner)
+}
+
 // TestApplyStore_FindNextApplyForStopReconciliation_SkipsApplyWithoutPendingStop
 // verifies the trigger is scoped to applies that actually have a pending stop:
 // pending siblings alone (no stop) are normal rollout work, not reconciliation
