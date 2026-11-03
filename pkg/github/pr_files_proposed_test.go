@@ -18,12 +18,12 @@ import (
 // proposedFilesRepo lays out a repository at two commits for the narrowing
 // comparison: a head and the default branch tip. Each commit is described as a
 // flat map of path to blob SHA; a path absent from the map does not exist at
-// that commit. A path symlinks lists under a commit is a symlink at that
-// commit; any other path is a regular file.
+// that commit. modes gives a path's file mode at a commit; any other path is
+// a regular file.
 type proposedFilesRepo struct {
 	head       map[string]string
 	defaultTip map[string]string
-	symlinks   map[string]map[string]bool
+	modes      map[string]map[string]string
 }
 
 // serve registers the default branch lookup, the ref resolution, and the tree
@@ -53,7 +53,7 @@ func (r proposedFilesRepo) serve(t *testing.T, mux *http.ServeMux) *atomic.Int64
 		commit, dir := splitSyntheticTreeSHA(req.PathValue("sha"))
 		paths, ok := commits[commit]
 		require.True(t, ok, "tree read for unknown commit %q", commit)
-		require.NoError(t, json.NewEncoder(w).Encode(gh.Tree{Entries: treeLevel(commit, dir, paths, r.symlinks[commit])}))
+		require.NoError(t, json.NewEncoder(w).Encode(gh.Tree{Entries: treeLevel(commit, dir, paths, r.modes[commit])}))
 	})
 	return &treeReads
 }
@@ -73,7 +73,7 @@ func splitSyntheticTreeSHA(treeSHA string) (commit, dir string) {
 // path-to-blob map describing that commit. Subtree SHAs are synthesized from
 // the commit and directory so each commit's directories resolve independently,
 // which is what the comparison assumes when it caches by tree SHA.
-func treeLevel(commit, dir string, paths map[string]string, symlinks map[string]bool) []*gh.TreeEntry {
+func treeLevel(commit, dir string, paths map[string]string, modes map[string]string) []*gh.TreeEntry {
 	prefix := ""
 	if dir != "" {
 		prefix = dir + "/"
@@ -98,14 +98,18 @@ func treeLevel(commit, dir string, paths map[string]string, symlinks map[string]
 			})
 			continue
 		}
-		mode := "100644"
-		if symlinks[full] {
-			mode = gitSymlinkMode
-		}
-		entries = append(entries, &gh.TreeEntry{Path: new(segment), Mode: new(mode), Type: new("blob"), SHA: new(blobSHA)})
+		entries = append(entries, &gh.TreeEntry{Path: new(segment), Mode: new(fileMode(modes, full)), Type: new("blob"), SHA: new(blobSHA)})
 	}
 	sort.Slice(entries, func(i, j int) bool { return entries[i].GetPath() < entries[j].GetPath() })
 	return entries
+}
+
+// fileMode returns the mode modes gives filePath, or a regular file's mode.
+func fileMode(modes map[string]string, filePath string) string {
+	if mode, ok := modes[filePath]; ok {
+		return mode
+	}
+	return "100644"
 }
 
 func newProposedFilesClient(t *testing.T, repo proposedFilesRepo) (*InstallationClient, *atomic.Int64) {
@@ -312,14 +316,16 @@ func TestPRFilesProposedAgainstDefaultBranchFailsWhenDefaultBranchUnresolved(t *
 // A symlink and a regular file holding the same bytes share a blob SHA, so a
 // pull request that turns an environment's regular file into a symlink with
 // the same bytes changes only the file mode. That still changes what the
-// environment plans, so the path is proposed.
-func TestPRFilesProposedAgainstDefaultBranchKeepsModeOnlyChanges(t *testing.T) {
+// environment plans, so the path is proposed. Making a schema file executable
+// changes nothing a plan reads, so that file is inherited like an unchanged
+// one.
+func TestPRFilesProposedAgainstDefaultBranchKeepsSymlinkModeChanges(t *testing.T) {
 	repo := proposedFilesRepo{
-		head:       map[string]string{"schema/staging": "target-blob", "schema/production": "target-blob"},
-		defaultTip: map[string]string{"schema/staging": "target-blob", "schema/production": "target-blob"},
-		symlinks: map[string]map[string]bool{
-			"head-sha":        {"schema/staging": true, "schema/production": true},
-			"default-tip-sha": {"schema/production": true},
+		head:       map[string]string{"schema/staging": "target-blob", "schema/production": "target-blob", "schema/users.sql": "users-blob"},
+		defaultTip: map[string]string{"schema/staging": "target-blob", "schema/production": "target-blob", "schema/users.sql": "users-blob"},
+		modes: map[string]map[string]string{
+			"head-sha":        {"schema/staging": gitSymlinkMode, "schema/production": gitSymlinkMode, "schema/users.sql": "100755"},
+			"default-tip-sha": {"schema/production": gitSymlinkMode},
 		},
 	}
 	ic, _ := newProposedFilesClient(t, repo)
@@ -327,9 +333,10 @@ func TestPRFilesProposedAgainstDefaultBranchKeepsModeOnlyChanges(t *testing.T) {
 	proposed, _, err := ic.PRFilesProposedAgainstDefaultBranch(t.Context(), "octocat/hello-world", "head-sha", []PRFile{
 		{Filename: "schema/staging", Status: "changed", Symlink: true},
 		{Filename: "schema/production", Status: "modified", Additions: 1, Deletions: 1, Symlink: true},
+		{Filename: "schema/users.sql", Status: "changed"},
 	})
 
 	require.NoError(t, err)
 	assert.Equal(t, []string{"schema/staging"}, filenames(proposed),
-		"the mode-only change is proposed; the symlink the default branch already holds is inherited")
+		"the file turned into a symlink is proposed; the symlink the default branch already holds and the executable schema file are inherited")
 }

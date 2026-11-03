@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"path"
+	"slices"
 	"sort"
 	"strings"
 
@@ -127,7 +128,7 @@ func (ic *InstallationClient) CreateSchemaRequestForConfig(ctx context.Context, 
 	// deletion evidence to the commit the declaration was read from: a vacated
 	// path survives only when that commit lacks it and the default branch holds
 	// it.
-	vacated, _, err := ic.PRFilesProposedAgainstDefaultBranch(ctx, repo, prInfo.HeadSHA, vacatedSchemaFiles(prFiles, schemaRoot))
+	vacated, _, err := ic.PRFilesProposedAgainstDefaultBranch(ctx, repo, prInfo.HeadSHA, ic.withoutEnvironmentLink(repo, pr, vacatedSchemaFiles(prFiles, schemaRoot), configDir, environment))
 	if err != nil {
 		return nil, fmt.Errorf("scope the schema files %s#%d removes to what it proposes: %w", repo, pr, err)
 	}
@@ -175,10 +176,10 @@ func (ic *InstallationClient) CreateSchemaRequestForConfig(ctx context.Context, 
 // still hold this path.
 //
 // Only paths head discovery reads are kept: schema files directly under the
-// root or one namespace directory below it, and symlinks directly under the
-// root, which name namespace directories. Anything nested deeper, or a
-// symlink inside a namespace, is never declared, so removing it declares
-// nothing either.
+// root or one namespace directory below it, and symlinks to directories
+// directly under the root, which name namespaces. Anything nested deeper, a
+// symlink inside a namespace, or a symlink to a file is never declared, so
+// removing it declares nothing either.
 func vacatedSchemaFiles(prFiles []PRFile, schemaRoot string) []PRFile {
 	prefix := path.Clean(schemaRoot) + "/"
 	var vacated []PRFile
@@ -198,11 +199,30 @@ func vacatedSchemaFiles(prFiles []PRFile, schemaRoot string) []PRFile {
 				continue
 			}
 			vacated = append(vacated, PRFile{Filename: path.Clean(vacatedPath), Status: "removed"})
-		case depth == 0:
-			vacated = append(vacated, PRFile{Filename: path.Clean(vacatedPath), Status: "removed", Symlink: true})
+		case depth == 0 && file.VacatedDirectoryLink:
+			vacated = append(vacated, PRFile{Filename: path.Clean(vacatedPath), Status: "removed", Symlink: true, VacatedDirectoryLink: true})
 		}
 	}
 	return vacated
+}
+
+// withoutEnvironmentLink drops the environment's own schema root symlink from
+// vacated. Removing it moves the environment's schema root back to the config
+// directory, where the link sat directly under the root, rather than emptying
+// a namespace.
+func (ic *InstallationClient) withoutEnvironmentLink(repo string, pr int, vacated []PRFile, configDir, environment string) []PRFile {
+	if environment == "" {
+		return vacated
+	}
+	environmentLink := path.Join(configDir, environment)
+	return slices.DeleteFunc(vacated, func(file PRFile) bool {
+		if !file.Symlink || file.Filename != environmentLink {
+			return false
+		}
+		ic.logger.Info("the pull request removes the environment's own schema root symlink, which names no namespace",
+			"repo", repo, "pr", pr, "environment", environment, "path", file.Filename)
+		return true
+	})
 }
 
 // emptiedPRNamespaces returns the namespaces the pull request emptied: those
