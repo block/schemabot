@@ -71,6 +71,10 @@ func (s *Service) StartOperator(ctx context.Context) {
 
 	stop := make(chan struct{})
 	wake := make(chan struct{}, driverCount)
+	var reservedWake chan struct{}
+	if deferredCutoverDrivers(driverCount) < driverCount {
+		reservedWake = make(chan struct{}, 1)
+	}
 	driverCtx, cancel := tern.NewOperatorContext(ctx)
 	reaperEvery := s.strandedReaperEvery
 	if reaperEvery <= 0 {
@@ -83,7 +87,9 @@ func (s *Service) StartOperator(ctx context.Context) {
 	s.stopRecovery = stop
 	s.cancelRecovery = cancel
 	s.operatorWake = wake
+	s.reservedDriverWake = reservedWake
 	s.claimingStopped = false
+	s.operatorDrivers.Store(int64(driverCount))
 	s.operatorMu.Unlock()
 
 	// Seed both occupancy gauges before any driver claims so the pool's
@@ -94,8 +100,9 @@ func (s *Service) StartOperator(ctx context.Context) {
 
 	for i := range driverCount {
 		driverID := i
+		driverWake := driverWakeChannel(driverID, wake, reservedWake)
 		s.recoveryWg.Go(func() {
-			s.operatorDriver(driverCtx, driverID, stop, wake)
+			s.operatorDriver(driverCtx, driverID, stop, driverWake)
 		})
 	}
 
@@ -120,6 +127,7 @@ func (s *Service) StartOperator(ctx context.Context) {
 	// to the default in storage. Log the resolved cap beside the pool size.
 	s.logger.Info("operator started",
 		"drivers", driverCount,
+		"deferred_cutover_drivers", deferredCutoverDrivers(driverCount),
 		"max_drivers_per_apply", storage.BuildOptions(storage.WithMaxDriversPerApply(s.config.MaxDriversPerApply)).MaxDriversPerApply,
 		"interval", s.operatorPollInterval,
 		"stranded_reaper_interval", reaperEvery,
@@ -215,6 +223,7 @@ func (s *Service) StopOperator() {
 	s.stopRecovery = nil
 	s.cancelRecovery = nil
 	s.operatorWake = nil
+	s.reservedDriverWake = nil
 	s.operatorMu.Unlock()
 
 	// From here on a drive that returns leaves its claim registered. A drive
@@ -593,6 +602,7 @@ func deploymentFromTernClientKey(key string) string {
 func (s *Service) wakeOperator(applyIdentifier, database, environment string) {
 	s.operatorMu.Lock()
 	wake := s.operatorWake
+	reservedWake := s.reservedDriverWake
 	running := s.stopRecovery != nil
 	s.operatorMu.Unlock()
 
@@ -609,6 +619,9 @@ func (s *Service) wakeOperator(applyIdentifier, database, environment string) {
 		return
 	}
 
+	// The reserved driver gets the wake as well as the pool, so queued work it
+	// may claim starts as soon as the work it skips does.
+	offerWake(reservedWake)
 	select {
 	case wake <- struct{}{}:
 		s.logger.Debug("operator wake queued",
@@ -620,6 +633,31 @@ func (s *Service) wakeOperator(applyIdentifier, database, environment string) {
 			"apply_id", applyIdentifier,
 			"database", database,
 			"environment", environment)
+	}
+}
+
+// driverWakeChannel returns the wake channel driverID listens on: the reserved
+// driver's own channel when the pool reserves one, otherwise the pool's. A wake
+// token on the pool channel therefore always reaches a driver that claims every
+// kind of work, so the reserved driver can never take the one wake a deferred
+// apply's start was waiting on and leave it for the next poll tick.
+func driverWakeChannel(driverID int, pool, reserved chan struct{}) chan struct{} {
+	if driverID == reservedDriverID && reserved != nil {
+		return reserved
+	}
+	return pool
+}
+
+// offerWake queues a wake token on ch without blocking. A nil channel, a pool
+// that reserves no driver, and a token already pending all leave nothing more
+// to do.
+func offerWake(ch chan struct{}) {
+	if ch == nil {
+		return
+	}
+	select {
+	case ch <- struct{}{}:
+	default:
 	}
 }
 
@@ -890,12 +928,16 @@ func claimStartsOperation(op *storage.ApplyOperation) bool {
 func (s *Service) wakeIdleDriver(driverID int, op *storage.ApplyOperation) {
 	s.operatorMu.Lock()
 	wake := s.operatorWake
+	reservedWake := s.reservedDriverWake
 	s.operatorMu.Unlock()
 
 	if wake == nil {
 		s.logger.Debug("operator: no running driver pool to wake beside a started operation; peers claim the work beside it on their next pass",
 			append(op.LogAttrs(), "driver", driverID)...)
 		return
+	}
+	if driverID != reservedDriverID {
+		offerWake(reservedWake)
 	}
 	select {
 	case wake <- struct{}{}:
@@ -954,6 +996,43 @@ func (s *Service) recoverApplies(ctx context.Context, driverID int, stop <-chan 
 	return s.recoverApplyOperation(ctx, driverID, owner)
 }
 
+// reservedDriverID is the driver on each pod that never starts, resumes, or
+// recovers an operation of an apply deferring its cutover.
+//
+// A deferred drive holds its driver until an operator cuts over, which can
+// take days. Each apply holds at most the per-apply cap, but enough deferred
+// applies together can leave every driver waiting on a person. The reserved
+// driver keeps one driver per pod for
+// everything else: other databases' applies, recoveries, finalizers, and stops
+// on applies that have not started. It still delivers stop and cancel requests
+// to a deferred apply, since those end its work.
+//
+// It listens on a wake channel of its own (see driverWakeChannel), so the
+// wake that queued a deferred apply's work is never spent on the one driver
+// that skips it.
+//
+// A pod with a single driver reserves nothing, so its only driver can still
+// run a deferred apply.
+const reservedDriverID = 0
+
+// deferredCutoverDrivers reports how many of a pool of drivers may run work
+// for an apply deferring its cutover.
+func deferredCutoverDrivers(drivers int) int {
+	if drivers < 2 {
+		return drivers
+	}
+	return drivers - 1
+}
+
+// operationClaimOptions returns the filter driverID's operation claims run
+// under: the reserved driver skips deferred-cutover work (see reservedDriverID).
+func (s *Service) operationClaimOptions(driverID int) []storage.OperationClaimOption {
+	if driverID != reservedDriverID || s.operatorDrivers.Load() < 2 {
+		return nil
+	}
+	return []storage.OperationClaimOption{storage.SkipDeferredCutoverWork()}
+}
+
 // claimGateClosedBeforeRung reports whether StopClaiming closed the claim gate
 // while an earlier rung of the ladder was running, logging the rung the pass
 // stops short of so a shutdown trace shows where claiming ceased.
@@ -976,7 +1055,7 @@ func (s *Service) claimGateClosedBeforeRung(stop <-chan struct{}, driverID int, 
 // the same tasks as the whole apply. It reports claimSettled only when the
 // drive succeeded and settled the operation it claimed.
 func (s *Service) recoverApplyOperation(ctx context.Context, driverID int, owner string) claimOutcome {
-	op, err := s.storage.ApplyOperations().FindNextApplyOperation(ctx, owner)
+	op, err := s.storage.ApplyOperations().FindNextApplyOperation(ctx, owner, s.operationClaimOptions(driverID)...)
 	if err != nil {
 		s.logClaimFailure(ctx, "operator: failed to claim apply_operation", "operation_storage_error",
 			"driver", driverID, "lease_owner", owner, "error", err)

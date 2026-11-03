@@ -714,7 +714,7 @@ func (s *queuedOperationClaimStore) FindNextApplyOperationCutover(context.Contex
 	return nil, nil
 }
 
-func (s *queuedOperationClaimStore) FindNextApplyOperation(_ context.Context, owner string) (*storage.ApplyOperation, error) {
+func (s *queuedOperationClaimStore) FindNextApplyOperation(_ context.Context, owner string, _ ...storage.OperationClaimOption) (*storage.ApplyOperation, error) {
 	s.applies.mu.Lock()
 	findCh := s.applies.findCh
 	s.applies.mu.Unlock()

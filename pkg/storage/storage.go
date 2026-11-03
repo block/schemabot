@@ -1629,7 +1629,9 @@ type ApplyOperationStore interface {
 	// needs work. A row claimed from pending or stopped is returned with the
 	// state it was claimed from, which is how the caller tells a claim that
 	// starts an operation from a retry or a recovery.
-	FindNextApplyOperation(ctx context.Context, owner string) (*ApplyOperation, error)
+	//
+	// opts narrow what the claim may match; see OperationClaimFilter.
+	FindNextApplyOperation(ctx context.Context, owner string, opts ...OperationClaimOption) (*ApplyOperation, error)
 
 	// FindNextApplyOperationCutover atomically claims the next operation parked
 	// at the cutover barrier that no earlier sibling holds, and rotates a fresh
