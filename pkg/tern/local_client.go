@@ -3749,6 +3749,7 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 				SettledControlRequests: settled,
 				ApplyOperationId:       req.GetApplyOperationId(),
 				ApplyState:             storageStateToProto(apply.State),
+				OperationNeverStarts:   operationNeverStarts(scopedOp, apply),
 			}, nil
 		}
 	}
@@ -3991,6 +3992,7 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 	if scopedOp != nil {
 		resp.ApplyOperationId = req.GetApplyOperationId()
 		resp.ApplyState = storageStateToProto(apply.State)
+		resp.OperationNeverStarts = operationNeverStarts(scopedOp, apply)
 	}
 
 	// Surface the engine's display metadata (e.g. PlanetScale branch_name,
@@ -4386,4 +4388,18 @@ func dsnLogAttrs(dsn string) []any {
 // forever, so an embedder that never states the intent must not inherit it.
 func pendingDropsDisabled(metadata map[string]string) bool {
 	return metadata["pending_drops"] != "true"
+}
+
+// operationNeverStarts reports whether op will never run: no driver has ever
+// claimed it, and its apply has settled, so no driver will claim it now. A
+// halted rollout settles with the members it never reached left pending. The
+// answer reads the operation row rather than its tasks, since a claimed
+// operation whose drive has not yet advanced a task still has pending tasks.
+// A stopped apply has not settled: starting it again starts its pending
+// members.
+func operationNeverStarts(op *storage.ApplyOperation, apply *storage.Apply) bool {
+	if !state.IsState(op.State, state.ApplyOperation.Pending) || op.StartedAt != nil || op.LeaseOwner != "" {
+		return false
+	}
+	return state.IsState(apply.State, state.SettledApplyStates...)
 }

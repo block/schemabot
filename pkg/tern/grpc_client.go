@@ -1987,19 +1987,24 @@ func (s applyTaskScope) progressReadFromWholeApply(resp *ternv1.ProgressResponse
 }
 
 // remoteOperationNeverStarts reports whether a progress answer scoped to one
-// operation says that operation will never start: it is still pending, and the
-// apply it belongs to has settled. A halted rollout settles with the members it
-// never reached still pending, and the data plane claims nothing more for an
-// apply that has settled. A stopped apply is left out, since starting it again
-// starts its pending members. A data plane that does not report the apply's
-// state leaves the field at its zero value, which is not a settled state, so
-// the drive keeps polling as before.
+// operation says that operation will never start. The data plane decides it
+// from its own operation row: no driver has claimed the operation and its
+// apply has settled, which is how a halted rollout leaves the members it never
+// reached. A data plane that does not report it leaves the field false, so the
+// drive keeps polling as before.
 func remoteOperationNeverStarts(resp *ternv1.ProgressResponse) bool {
-	if resp.GetApplyOperationId() == "" || resp.GetState() != ternv1.State_STATE_PENDING {
-		return false
+	return resp.GetApplyOperationId() != "" && resp.GetOperationNeverStarts()
+}
+
+// remoteOperationNeverStartsMessage is the failure recorded on the tasks of an
+// operation its remote apply settled before reaching. It names only the remote
+// apply and the state the data plane reported, both SchemaBot's own values.
+func remoteOperationNeverStartsMessage(remoteID string, applyState ternv1.State) string {
+	settled := ProtoStateToStorage(applyState)
+	if settled == "" {
+		return fmt.Sprintf("remote apply %s settled before this operation started, so the data plane will not run it", remoteID)
 	}
-	applyState := resp.GetApplyState()
-	return isTerminalProtoState(applyState) && applyState != ternv1.State_STATE_STOPPED
+	return fmt.Sprintf("remote apply %s settled as %s before this operation started, so the data plane will not run it", remoteID, settled)
 }
 
 // logProgressReadFromWholeApply warns that this drive's progress covers its
@@ -5074,12 +5079,19 @@ func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply
 				return c.failMissingRemoteApply(ctx, apply, message, nil, scope)
 			}
 			if remoteOperationNeverStarts(resp) {
-				logger.WarnContext(ctx, "remote operation is still pending in a remote apply that has settled; it will never start, so the drive ends and the operation returns to pending",
+				// The answer can carry control requests the data plane settled on
+				// this poll, and this drive may be the last to read them.
+				c.mirrorRemoteControlRejections(ctx, apply, remoteID, resp.SettledControlRequests)
+				message := remoteOperationNeverStartsMessage(remoteID, resp.GetApplyState())
+				logger.WarnContext(ctx, "remote operation will never start because its remote apply settled before reaching it; failing the operation's tasks and ending the drive",
 					append(apply.MutableLogAttrs(),
 						"apply_operation_id", scope.applyOperationID,
 						"remote_apply_id", remoteID,
 						"remote_apply_operation_id", resp.GetApplyOperationId(),
 						"remote_apply_state", resp.GetApplyState().String())...)
+				if err := c.markRemoteApplyFailed(ctx, apply, nil, message, false, scope); err != nil {
+					return fmt.Errorf("fail tasks of operation %d its remote apply %s settled before: %w", scope.applyOperationID, remoteID, err)
+				}
 				return fmt.Errorf("poll remote apply %s for operation %d: %w", remoteID, scope.applyOperationID, ErrRemoteOperationNeverStarts)
 			}
 

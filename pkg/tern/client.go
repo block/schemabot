@@ -19,11 +19,10 @@ import (
 var ErrNoTasksForApplyOperation = errors.New("no tasks found for apply operation")
 
 // ErrRemoteOperationNeverStarts is returned by an operation-scoped remote drive
-// when the data plane reports the operation still pending inside an apply that
-// has already settled. The data plane will never start it, so the drive ends
-// instead of polling it forever, and the operator puts the operation back to
-// pending so the rollout derives its verdict from it as an operation that never
-// ran.
+// when the data plane reports the operation will never start: no driver there
+// claimed it before its apply settled. The drive has already failed the
+// operation's tasks with that reason, so the operator derives the operation
+// from them like any other failure instead of polling it forever.
 var ErrRemoteOperationNeverStarts = errors.New("remote operation will never start: its apply settled before it began")
 
 // ErrApplyLeasePresumedLost is returned by a drive whose lease heartbeat

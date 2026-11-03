@@ -3604,11 +3604,13 @@ type ProgressResponse struct {
 	// reading that as one member's state reports its siblings' work as its own.
 	ApplyOperationId string `protobuf:"bytes,12,opt,name=apply_operation_id,json=applyOperationId,proto3" json:"apply_operation_id,omitempty"`
 	// The state of the whole apply, set on an answer scoped to one operation.
-	// An operation still pending in an apply that has settled will never start,
-	// so the caller can settle it rather than wait on it.
-	ApplyState    State `protobuf:"varint,13,opt,name=apply_state,json=applyState,proto3,enum=tern.v1.State" json:"apply_state,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	ApplyState State `protobuf:"varint,13,opt,name=apply_state,json=applyState,proto3,enum=tern.v1.State" json:"apply_state,omitempty"`
+	// Set on an answer scoped to one operation when that operation will never
+	// run: no driver has claimed it and its apply has settled, so nothing will
+	// claim it again. The caller settles the operation rather than wait on it.
+	OperationNeverStarts bool `protobuf:"varint,14,opt,name=operation_never_starts,json=operationNeverStarts,proto3" json:"operation_never_starts,omitempty"`
+	unknownFields        protoimpl.UnknownFields
+	sizeCache            protoimpl.SizeCache
 }
 
 func (x *ProgressResponse) Reset() {
@@ -3723,6 +3725,13 @@ func (x *ProgressResponse) GetApplyState() State {
 		return x.ApplyState
 	}
 	return State_STATE_NO_ACTIVE_CHANGE
+}
+
+func (x *ProgressResponse) GetOperationNeverStarts() bool {
+	if x != nil {
+		return x.OperationNeverStarts
+	}
+	return false
 }
 
 // CutoverRequest triggers the cutover phase.
@@ -5451,7 +5460,7 @@ const file_tern_proto_rawDesc = "" +
 	"\rerror_message\x18\x03 \x01(\tR\ferrorMessage\x12\x1d\n" +
 	"\n" +
 	"settled_at\x18\x04 \x01(\tR\tsettledAt\x12!\n" +
-	"\frequested_by\x18\x05 \x01(\tR\vrequestedBy\"\xf6\x04\n" +
+	"\frequested_by\x18\x05 \x01(\tR\vrequestedBy\"\xac\x05\n" +
 	"\x10ProgressResponse\x12\x19\n" +
 	"\bapply_id\x18\x01 \x01(\tR\aapplyId\x12$\n" +
 	"\x05state\x18\x02 \x01(\x0e2\x0e.tern.v1.StateR\x05state\x12'\n" +
@@ -5467,7 +5476,8 @@ const file_tern_proto_rawDesc = "" +
 	"\x18settled_control_requests\x18\v \x03(\v2\x1e.tern.v1.SettledControlRequestR\x16settledControlRequests\x12,\n" +
 	"\x12apply_operation_id\x18\f \x01(\tR\x10applyOperationId\x12/\n" +
 	"\vapply_state\x18\r \x01(\x0e2\x0e.tern.v1.StateR\n" +
-	"applyState\x1a;\n" +
+	"applyState\x124\n" +
+	"\x16operation_never_starts\x18\x0e \x01(\bR\x14operationNeverStarts\x1a;\n" +
 	"\rMetadataEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01J\x04\b\t\x10\n" +

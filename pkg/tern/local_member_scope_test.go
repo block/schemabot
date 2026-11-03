@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -133,23 +134,46 @@ func TestLocalClient_ProgressScopedToOneRolloutMemberReportsOnlyThatMember(t *te
 
 // Two member targets of one deployment share its data-plane apply, which halts
 // on failure. payments-001 failed before payments-002 started, so the apply
-// settled as failed with payments-002 still pending. payments-002's scoped
-// answer reports it pending and names the apply's settled state beside it,
-// which is how the control plane learns the member will never start rather
-// than polling a pending member forever.
-func TestLocalClient_ProgressScopedToOneRolloutMemberReportsTheApplyState(t *testing.T) {
+// settled as failed with payments-002 still pending and unclaimed. Its scoped
+// answer reports that it will never start, read from its operation row, and
+// names the apply's settled state. A member a driver has claimed, or one that
+// has started, may still be running with its tasks pending, and a stopped
+// apply starts its pending members again, so neither reports it.
+func TestLocalClient_ProgressScopedToOneRolloutMemberReportsItWillNeverStart(t *testing.T) {
+	now := time.Now()
+	for _, tc := range []struct {
+		name        string
+		applyState  string
+		claim       func(op *storage.ApplyOperation)
+		neverStarts bool
+	}{
+		{name: "unclaimed in a failed apply", applyState: state.Apply.Failed, neverStarts: true},
+		{name: "claimed in a failed apply", applyState: state.Apply.Failed, claim: func(op *storage.ApplyOperation) { op.LeaseOwner = "driver-3" }},
+		{name: "started in a failed apply", applyState: state.Apply.Failed, claim: func(op *storage.ApplyOperation) { op.StartedAt = &now }},
+		{name: "unclaimed in a stopped apply", applyState: state.Apply.Stopped},
+		{name: "unclaimed in a running apply", applyState: state.Apply.Running},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fx := newSharedApplyFixture(state.ApplyOperation.Failed, state.ApplyOperation.Pending, state.Task.Failed, state.Task.Pending)
+			fx.apply.State = tc.applyState
+			if tc.claim != nil {
+				tc.claim(fx.second)
+			}
+
+			scoped, err := fx.client.Progress(t.Context(), &ternv1.ProgressRequest{ApplyId: fx.apply.ApplyIdentifier, Environment: "staging", ApplyOperationId: "12"})
+			require.NoError(t, err)
+			assert.Equal(t, "12", scoped.ApplyOperationId)
+			assert.Equal(t, ternv1.State_STATE_PENDING, scoped.State)
+			assert.Equal(t, storageStateToProto(tc.applyState), scoped.ApplyState, "the answer names the state of the apply the member belongs to")
+			assert.Equal(t, tc.neverStarts, scoped.OperationNeverStarts)
+		})
+	}
+
 	fx := newSharedApplyFixture(state.ApplyOperation.Failed, state.ApplyOperation.Pending, state.Task.Failed, state.Task.Pending)
 	fx.apply.State = state.Apply.Failed
-
-	scoped, err := fx.client.Progress(t.Context(), &ternv1.ProgressRequest{ApplyId: fx.apply.ApplyIdentifier, Environment: "staging", ApplyOperationId: "12"})
-	require.NoError(t, err)
-	assert.Equal(t, ternv1.State_STATE_PENDING, scoped.State, "the member never started")
-	assert.Equal(t, ternv1.State_STATE_FAILED, scoped.ApplyState, "the answer names the state of the apply the member belongs to")
-	assert.Equal(t, "12", scoped.ApplyOperationId)
-
 	whole, err := fx.client.Progress(t.Context(), &ternv1.ProgressRequest{ApplyId: fx.apply.ApplyIdentifier, Environment: "staging"})
 	require.NoError(t, err)
-	assert.Equal(t, ternv1.State_STATE_NO_ACTIVE_CHANGE, whole.ApplyState, "an answer for the whole apply already carries the apply's state as its own")
+	assert.False(t, whole.OperationNeverStarts, "an answer for the whole apply speaks for no one operation")
 }
 
 // A progress request that names an operation this apply does not have is

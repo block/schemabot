@@ -1598,34 +1598,27 @@ func (s *Service) driveClaimedMultiOperation(ctx context.Context, driverID int, 
 		return claimSpent
 	}
 
-	if !resumed && errors.Is(resumeErr, tern.ErrRemoteOperationNeverStarts) {
-		// The remote apply settled before this operation began, so its tasks
-		// are still pending and deriving from them would leave the operation
-		// running and re-leased forever. It goes back to pending, and the
-		// parent is derived from it below as an operation that never ran.
-		if err := s.returnNeverStartedOperationToPending(operationLeaseCtx, driverID, op, apply); err != nil {
-			return claimSpent
-		}
-	} else {
-		// Persist the operation row from its OWN tasks — even when the drive
-		// returned an error. Unlike the single-op path, a multi-op drive has no
-		// reconcileUnclaimableParent fallback (it never claims the parent), so a
-		// remote rejection that durably failed this operation's tasks must be
-		// promoted to the operation row here or the operation would stay running
-		// and be re-leased forever. markOperationFromOwnResult derives the
-		// operation from its tasks: a still-running task set leaves it claimable
-		// (a benign no-op), while a terminal task set terminalizes it.
-		marked, err := s.markOperationFromOwnResult(operationLeaseCtx, driverID, op)
-		if err != nil {
-			s.logger.Error("operator: failed to update apply_operation from its tasks; derived apply state not updated",
-				append(apply.LogAttrs(),
-					"driver", driverID, "apply_operation_id", op.ID,
-					"operation_deployment", op.Deployment, "error", err)...)
-			return claimSpent
-		}
-		if !marked {
-			return claimSpent
-		}
+	// Persist the operation row from its OWN tasks — even when the drive returned
+	// an error. Unlike the single-op path, a multi-op drive has no
+	// reconcileUnclaimableParent fallback (it never claims the parent), so a
+	// remote rejection that durably failed this operation's tasks must be
+	// promoted to the operation row here or the operation would stay running and
+	// be re-leased forever. markOperationFromOwnResult derives the operation from
+	// its tasks: a still-running task set leaves it claimable (a benign no-op),
+	// while a terminal task set terminalizes it.
+	//
+	// An operation its remote apply settled before reaching arrives the same
+	// way: the drive failed its tasks with that reason.
+	marked, err := s.markOperationFromOwnResult(operationLeaseCtx, driverID, op)
+	if err != nil {
+		s.logger.Error("operator: failed to update apply_operation from its tasks; derived apply state not updated",
+			append(apply.LogAttrs(),
+				"driver", driverID, "apply_operation_id", op.ID,
+				"operation_deployment", op.Deployment, "error", err)...)
+		return claimSpent
+	}
+	if !marked {
+		return claimSpent
 	}
 
 	// If a stop is pending, terminalize any still-pending sibling operations to
@@ -2586,24 +2579,6 @@ func (s *Service) failOperationWithoutTasks(opCtx, applyCtx context.Context, dri
 	s.publishTerminalSummaryIfWon(applyCtx, driverID, apply, result)
 }
 
-// returnNeverStartedOperationToPending records that a claimed operation never
-// started: its remote apply settled before reaching it, so the data plane will
-// never run it. The operation goes back to pending, the state a rollout's
-// derivation reads as work that never began, so a halted rollout settles
-// rather than holding the operation running while its drive polls forever.
-func (s *Service) returnNeverStartedOperationToPending(ctx context.Context, driverID int, op *storage.ApplyOperation, apply *storage.Apply) error {
-	if err := s.storage.ApplyOperations().UpdateState(ctx, op.ID, state.ApplyOperation.Pending); err != nil {
-		s.logger.Error("operator: failed to return a never-started apply_operation to pending; derived apply state not updated and the operation will be claimed again",
-			append(apply.LogAttrs(),
-				"driver", driverID, "apply_operation_id", op.ID, "operation_deployment", op.Deployment, "error", err)...)
-		return fmt.Errorf("return never-started apply_operation %d to pending (deployment %q): %w", op.ID, op.Deployment, err)
-	}
-	s.logger.Info("operator: returned a never-started apply_operation to pending; deriving the rollout from it",
-		append(apply.LogAttrs(),
-			"driver", driverID, "apply_operation_id", op.ID, "operation_deployment", op.Deployment)...)
-	return nil
-}
-
 // postTerminalReconcileSettlesHere reports whether a failed drive is one whose
 // caller settles the apply in place: the drive stored the apply's terminal
 // outcome and only an answer owed after it did not land, so the caller persists
@@ -2866,9 +2841,10 @@ func (s *Service) resumeClaimedApplyWithOptions(ctx context.Context, driverID in
 		}
 		if errors.Is(err, tern.ErrRemoteOperationNeverStarts) {
 			// The data plane settled the apply this operation belongs to before
-			// the operation began, so it will never run there. The caller returns
-			// the operation to pending and derives the rollout from it.
-			logger.Warn("operator: remote operation will never start because its remote apply settled first; returning it to pending and deriving the rollout",
+			// the operation began, so it will never run there. The drive failed
+			// the operation's tasks with that reason, and the caller derives the
+			// operation and the rollout from them.
+			logger.Warn("operator: remote operation will never start because its remote apply settled first; deriving the operation from its failed tasks",
 				"apply_operation_id", applyOperationID,
 				"error", err)
 			if retryableClaim {
