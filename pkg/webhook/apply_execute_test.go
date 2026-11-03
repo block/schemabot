@@ -776,23 +776,23 @@ func TestRolloutShapeRefusalMessage(t *testing.T) {
 func TestDispatchErrorMessageNamesDeferredCutoverCapacity(t *testing.T) {
 	crowded := &api.DeferredCutoverCapacityError{Database: "commerce", Environment: "production", Operations: 128, Reserved: 128, Capacity: 192, LiveServers: 64, HoldingApplyIDs: []string{"apply-a1b2c3"}}
 	assert.Equal(t,
-		"`--defer-cutover` would hold 128 operations at their cutover at once, and other deferred applies (`apply-a1b2c3`) hold 128 of the 192 deferred operations SchemaBot runs. Run `schemabot apply-confirm -e production --tenant acme` again without `--defer-cutover`, or once those applies are cut over or cancelled.",
+		"`--defer-cutover` would keep 128 drivers waiting at the cutover at once. SchemaBot can keep 192 drivers waiting across all its servers, and apply `apply-a1b2c3` already keeps 128 of them waiting, leaving 64. Run `schemabot apply-confirm -e production --tenant acme` again without `--defer-cutover`, or once it is cut over or cancelled.",
 		deferredCutoverCapacityMessage(crowded, action.ApplyConfirm, "production", "acme"))
 
 	tooWide := &api.DeferredCutoverCapacityError{Database: "commerce", Environment: "production", Operations: 100, Capacity: 96, LiveServers: 32}
 	msg := applyExecutionErrorMessage(action.ApplyConfirm, "production", "", tooWide)
 	assert.Contains(t, msg,
-		"`--defer-cutover` would hold 100 operations at their cutover at once, and SchemaBot runs at most 96 deferred operations. Run `schemabot apply-confirm -e production` again without `--defer-cutover`.")
+		"`--defer-cutover` would keep 100 drivers waiting at the cutover at once, and SchemaBot can keep 96 drivers waiting across all its servers. Run `schemabot apply-confirm -e production` again without `--defer-cutover`.")
 	assert.NotContains(t, msg, "once those applies")
 
 	overCap := &api.DeferredCutoverCapacityError{Database: "commerce", Environment: "production", Operations: 16, PerApplyCap: 2}
 	msg = applyExecutionErrorMessage(action.ApplyConfirm, "production", "", overCap)
 	assert.Contains(t, msg,
-		"`--defer-cutover` would hold 16 operations at their cutover at once, and SchemaBot runs at most 2 operations of one apply at once (`max_drivers_per_apply`). Run `schemabot apply-confirm -e production` again without `--defer-cutover`, or raise `max_drivers_per_apply` to at least 16.")
+		"`--defer-cutover` would keep 16 drivers waiting at the cutover at once, and `max_drivers_per_apply` gives one apply at most 2. Run `schemabot apply-confirm -e production` again without `--defer-cutover`, or raise `max_drivers_per_apply` to at least 16.")
 	assert.NotContains(t, msg, "once those applies")
 
 	unreported := &api.DeferredCutoverCapacityError{Database: "commerce", Environment: "production", Operations: 4}
 	assert.Equal(t,
-		"`--defer-cutover` would hold 4 operations at their cutover at once, and no SchemaBot server has reported its drivers in the last minute. Run `schemabot apply-confirm -e production` again without `--defer-cutover`.",
+		"`--defer-cutover` would keep 4 drivers waiting at the cutover at once, and no SchemaBot server has reported its drivers in the last minute. Run `schemabot apply-confirm -e production` again without `--defer-cutover`.",
 		deferredCutoverCapacityMessage(unreported, action.ApplyConfirm, "production", ""))
 }

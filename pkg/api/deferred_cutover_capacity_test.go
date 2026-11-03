@@ -68,29 +68,29 @@ func TestDeferredCutoverCapacityErrorMessages(t *testing.T) {
 		{
 			name:    "alongside other deferred applies",
 			refused: DeferredCutoverCapacityError{Database: "commerce", Environment: "production", Operations: 128, Reserved: 128, Capacity: 192, LiveServers: 64, HoldingApplyIDs: []string{"apply-first"}},
-			want:    "commerce/production: --defer-cutover would hold 128 operations at their cutover at once, and other deferred applies (apply-first) hold 128 of the 192 deferred operations SchemaBot runs; apply again without --defer-cutover, or once those applies are cut over or cancelled",
+			want:    "commerce/production: --defer-cutover would keep 128 drivers waiting at the cutover at once; SchemaBot can keep 192 drivers waiting across all its servers, and apply apply-first already keeps 128 of them waiting, leaving 64; apply again without --defer-cutover, or once it is cut over or cancelled",
 		},
 		{
 			name: "alongside many deferred applies",
 			refused: DeferredCutoverCapacityError{Database: "commerce", Environment: "production", Operations: 2, Reserved: 14, Capacity: 15, LiveServers: 5, HoldingApplyIDs: []string{
 				"apply-1", "apply-2", "apply-3", "apply-4", "apply-5", "apply-6", "apply-7",
 			}},
-			want: "commerce/production: --defer-cutover would hold 2 operations at their cutover at once, and other deferred applies (apply-1, apply-2, apply-3, apply-4, apply-5 and 2 more) hold 14 of the 15 deferred operations SchemaBot runs; apply again without --defer-cutover, or once those applies are cut over or cancelled",
+			want: "commerce/production: --defer-cutover would keep 2 drivers waiting at the cutover at once; SchemaBot can keep 15 drivers waiting across all its servers, and applies apply-1, apply-2, apply-3, apply-4, apply-5 and 2 more already keep 14 of them waiting, leaving 1; apply again without --defer-cutover, or once they are cut over or cancelled",
 		},
 		{
 			name:    "wider than the whole capacity",
 			refused: DeferredCutoverCapacityError{Database: "commerce", Environment: "production", Operations: 100, Capacity: 96, LiveServers: 32},
-			want:    "commerce/production: --defer-cutover would hold 100 operations at their cutover at once, and SchemaBot runs at most 96 deferred operations; apply again without --defer-cutover",
+			want:    "commerce/production: --defer-cutover would keep 100 drivers waiting at the cutover at once, and SchemaBot can keep 96 drivers waiting across all its servers; apply again without --defer-cutover",
 		},
 		{
 			name:    "wider than max_drivers_per_apply",
 			refused: DeferredCutoverCapacityError{Database: "commerce", Environment: "production", Operations: 16, PerApplyCap: 2},
-			want:    "commerce/production: --defer-cutover would hold 16 operations at their cutover at once, and max_drivers_per_apply runs at most 2 operations of one apply at once; apply again without --defer-cutover, or raise max_drivers_per_apply to at least 16",
+			want:    "commerce/production: --defer-cutover would keep 16 drivers waiting at the cutover at once, and max_drivers_per_apply gives one apply at most 2; apply again without --defer-cutover, or raise max_drivers_per_apply to at least 16",
 		},
 		{
 			name:    "no live server",
 			refused: DeferredCutoverCapacityError{Database: "commerce", Environment: "production", Operations: 4},
-			want:    "commerce/production: --defer-cutover would hold 4 operations at their cutover at once, and no SchemaBot server has reported its drivers in the last minute; apply again without --defer-cutover",
+			want:    "commerce/production: --defer-cutover would keep 4 drivers waiting at the cutover at once, and no SchemaBot server has reported its drivers in the last minute; apply again without --defer-cutover",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -252,7 +252,7 @@ func TestDeferredCutoverRefusalStatusAndCode(t *testing.T) {
 
 			assert.Equal(t, tc.status, status)
 			assert.Equal(t, apitypes.ErrCodeDeferredCutoverCapacity, resp.ErrorCode)
-			assert.True(t, strings.HasPrefix(resp.Error, "apply rejected: testdb/staging: --defer-cutover would hold"), resp.Error)
+			assert.True(t, strings.HasPrefix(resp.Error, "apply rejected: testdb/staging: --defer-cutover would keep"), resp.Error)
 			assert.False(t, apitypes.IsRetryableErrorCode(resp.ErrorCode), "a retry without a change to the request or the plane is refused again")
 
 			_, _, err := svc.EnqueueAuthorizedApply(t.Context(), ApplyRequest{PlanID: "plan-1", Environment: "staging", Options: map[string]string{"defer_cutover": "true"}})
@@ -273,7 +273,7 @@ func TestDeferredCutoverWiderThanThePerApplyCapAnswers422(t *testing.T) {
 
 	assert.Equal(t, http.StatusUnprocessableEntity, status)
 	assert.Equal(t, apitypes.ErrCodeDeferredCutoverCapacity, resp.ErrorCode)
-	assert.Equal(t, "apply rejected: testdb/staging: --defer-cutover would hold 3 operations at their cutover at once, and max_drivers_per_apply runs at most 2 operations of one apply at once; apply again without --defer-cutover, or raise max_drivers_per_apply to at least 3", resp.Error)
+	assert.Equal(t, "apply rejected: testdb/staging: --defer-cutover would keep 3 drivers waiting at the cutover at once, and max_drivers_per_apply gives one apply at most 2; apply again without --defer-cutover, or raise max_drivers_per_apply to at least 3", resp.Error)
 	assert.Nil(t, applies.apply, "a refused apply stores nothing")
 }
 
