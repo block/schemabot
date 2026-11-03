@@ -318,7 +318,12 @@ jobs:
       mode: ${{ steps.gen.outputs.mode }}
       shard_count: ${{ steps.gen.outputs.shard_count }}
     steps:
+      # The matrix is read from one directory, so fetch only that. A full
+      # checkout can take most of this job's budget on its own, and when
+      # it runs over, the runner cancels the job after its steps passed.
       - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # actions/checkout@v6
+        with:
+          sparse-checkout: pkg/localscale
       - name: "Generate shard matrix"
         id: gen
         env:
@@ -629,7 +634,12 @@ jobs:
       mode: ${{ steps.gen.outputs.mode }}
       shard_count: ${{ steps.gen.outputs.shard_count }}
     steps:
+      # The matrix is read from one directory, so fetch only that. A full
+      # checkout can take most of this job's budget on its own, and when
+      # it runs over, the runner cancels the job after its steps passed.
       - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # actions/checkout@v6
+        with:
+          sparse-checkout: e2e/local
       - name: "Generate shard matrix"
         id: gen
         env:
@@ -929,7 +939,12 @@ jobs:
     outputs:
       shards: ${{ steps.gen.outputs.shards }}
     steps:
+      # The matrix is read from one directory, so fetch only that. A full
+      # checkout can take most of this job's budget on its own, and when
+      # it runs over, the runner cancels the job after its steps passed.
       - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # actions/checkout@v6
+        with:
+          sparse-checkout: e2e/k8s
       - name: "Generate shard matrix"
         id: gen
         run: |
