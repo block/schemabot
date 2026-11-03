@@ -255,6 +255,31 @@ func TestApplyCommandLeavesOutAllowUnsafe(t *testing.T) {
 	assert.NotContains(t, inProgress, "--allow-unsafe\n")
 }
 
+// An apply rejected because another command changed its lock answers with the
+// apply to re-run in full, however long the database name and options are, so
+// neither the command nor the note asking the operator to type --allow-unsafe
+// again is ever cut short.
+func TestRenderApplyLockIntentChangedKeepsLongCommandWhole(t *testing.T) {
+	database := strings.Repeat("d", 64)
+	opts := ApplyCommandOptions{Tenant: "acme-holdings-eu", AllowUnsafe: true, DeferCutover: true, SkipRevert: true}
+	command := ApplyCommand("staging", database, opts)
+	note := UnsafeFlagLeftOut(opts)
+
+	rendered := RenderApplyLockIntentChanged(ApplyLockIntentChangedData{
+		CommandName:       "apply-confirm",
+		Database:          database,
+		Environment:       "staging",
+		RequestedBy:       "octocat",
+		ApplyAgainCommand: command,
+		ApplyAgainNote:    note,
+	})
+
+	assert.Contains(t, rendered, "## "+glyph.Failed+" Apply-confirm Rejected — Staging\n")
+	assert.Contains(t, rendered, "changed the lock on `"+database+"`")
+	assert.Contains(t, rendered, "Re-run:\n```\nschemabot apply -e staging -d "+database+" --tenant acme-holdings-eu --defer-cutover --skip-revert\n```\n\n"+note+"\n")
+	assert.NotContains(t, rendered, "…")
+}
+
 // A plan run without -e answers with one comment covering every environment,
 // and each of its commands carries the operator's -d the same way the
 // single-environment comment does.

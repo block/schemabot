@@ -512,6 +512,42 @@ func writeApplyAgain(sb *strings.Builder, lead, command, note string) {
 	}
 }
 
+// ApplyLockIntentChangedData describes an apply or apply-confirm rejected
+// because another command pinned or released this PR's lock while the apply
+// was checking or planning against it.
+type ApplyLockIntentChangedData struct {
+	CommandName string
+	Database    string
+	Environment string
+	RequestedBy string
+	// ApplyAgainCommand is the apply to re-run, scoped and optioned as the
+	// operator sent it, and ApplyAgainNote the line that goes beside it.
+	ApplyAgainCommand string
+	ApplyAgainNote    string
+}
+
+// RenderApplyLockIntentChanged renders the rejection of an apply whose lock
+// another command changed under it. The apply leaves the lock as that command
+// set it; a retry finds it and reports which command holds the lock and how to
+// settle it, or plans afresh when the lock is free. The command to re-run is
+// rendered in full rather than as a clamped error detail, so a long database
+// name or option list never cuts it or its note short.
+func RenderApplyLockIntentChanged(data ApplyLockIntentChangedData) string {
+	var sb strings.Builder
+
+	writeEnvironmentTitle(&sb, glyph.Failed+" "+capitalizeFirst(data.CommandName)+" Rejected", data.Environment)
+	writeDBLine(&sb, data.Database)
+	writeRequesterOrTimestamp(&sb, data.RequestedBy)
+	sb.WriteString("\n")
+
+	fmt.Fprintf(&sb, "Another SchemaBot command changed the lock on `%s` while this apply was running, "+
+		"so the apply was rejected to leave the lock as that command set it. "+
+		"If the lock belongs to a pending rollback, the retry will say how to confirm or cancel it.\n\n", data.Database)
+	writeApplyAgain(&sb, "Re-run", data.ApplyAgainCommand, data.ApplyAgainNote)
+
+	return offerSupportChannel(sb.String())
+}
+
 // activeApplyAwaitsCutover reports whether the active apply is parked until an
 // operator triggers its cutover: a deploy request waiting to be deployed always
 // is, and a waiting_for_cutover apply is only when it was started with deferred

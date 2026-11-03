@@ -769,12 +769,11 @@ func TestRepinPendingConfirmationRefusesWhenTheLockIsGone(t *testing.T) {
 			require.NoError(t, err)
 			assert.Nil(t, lock, "the stop must not re-create a released lock")
 
-			refusal := applyLockIntentChangedRefusal(dbName, "staging", dbName, templates.ApplyCommandOptions{DeferCutover: true})
-			require.Contains(t, refusal, "Re-run `schemabot apply -e staging -d "+dbName+" --defer-cutover`;")
-			require.True(t, f.handler.reportRepinRefused(repinErr, repo, pr, 1, action.ApplyConfirm, "staging", "testuser", refusal),
+			refusal := applyLockIntentChangedRefusal(action.ApplyConfirm, dbName, "staging", "testuser", dbName, templates.ApplyCommandOptions{DeferCutover: true})
+			require.True(t, f.handler.reportRepinRefused(repinErr, repo, pr, 1, refusal),
 				"a gone lock is answered as a lock that changed under the apply")
 			reply := awaitCommentContaining(t, f.result, "changed the lock on")
-			assert.Contains(t, reply, refusal)
+			assert.Contains(t, reply, "Re-run:\n```\nschemabot apply -e staging -d "+dbName+" --defer-cutover\n```")
 		})
 	}
 
@@ -836,7 +835,7 @@ func TestE2EApplyConfirmStopKeepsRollbackPinnedAfterItsRead(t *testing.T) {
 
 	refusal := awaitCommentContaining(t, f.result, "changed the lock on")
 	assert.Contains(t, refusal, "`"+dbName+"`")
-	assert.Contains(t, refusal, "Re-run `schemabot apply -e staging`")
+	assert.Contains(t, refusal, "Re-run:\n```\nschemabot apply -e staging\n```")
 	require.NoError(t, locks.pinErr, "the concurrent rollback must have pinned the lock")
 
 	lock, err := f.svc.Storage().Locks().Get(t.Context(), dbName, "mysql")
