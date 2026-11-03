@@ -32,6 +32,17 @@ type DeferredCutoverCapacityError struct {
 	// LiveServers is how many servers' operators reported their drivers
 	// within the live window.
 	LiveServers int
+	// PerApplyCap is the server's max_drivers_per_apply, set only when the
+	// apply has more operations than it. The cap keeps the apply's remaining
+	// operations from starting while the first ones wait, so they could never
+	// all wait at once however many drivers are free.
+	PerApplyCap int
+}
+
+// ExceedsPerApplyCap reports whether the apply has more operations than
+// max_drivers_per_apply lets one apply run at once.
+func (e *DeferredCutoverCapacityError) ExceedsPerApplyCap() bool {
+	return e.PerApplyCap > 0 && e.Operations > e.PerApplyCap
 }
 
 // ExceedsCapacity reports whether the apply is wider than the running
@@ -43,6 +54,9 @@ func (e *DeferredCutoverCapacityError) ExceedsCapacity() bool {
 
 func (e *DeferredCutoverCapacityError) Error() string {
 	switch {
+	case e.ExceedsPerApplyCap():
+		return fmt.Sprintf("%s/%s: --defer-cutover would hold %d operations at their cutover at once, and max_drivers_per_apply runs at most %d operations of one apply at once; apply again without --defer-cutover, or raise max_drivers_per_apply to at least %d",
+			e.Database, e.Environment, e.Operations, e.PerApplyCap, e.Operations)
 	case e.LiveServers == 0:
 		return fmt.Sprintf("%s/%s: --defer-cutover would hold %d operations at their cutover at once, and no SchemaBot server has reported its drivers in the last %s; apply again without --defer-cutover",
 			e.Database, e.Environment, e.Operations, LiveWindowText())
@@ -86,6 +100,29 @@ func deferredCutoverWidth(groups []*storage.ApplyOperationWithTasks) int {
 		width++
 	}
 	return width
+}
+
+// deferredCutoverPerApplyCapRefusal refuses a deferred apply of two or more
+// operations that has more of them than max_drivers_per_apply. Each waiting
+// operation keeps counting against the cap, so once the first capped batch
+// waits at its cutover the rest can never start, and the apply is never ready
+// to cut over. It returns nil when the apply fits. The cap is this server's
+// configuration, so the check needs no storage read.
+func (s *Service) deferredCutoverPerApplyCapRefusal(plan *storage.Plan, environment, applyIdentifier, caller string, operations int) *DeferredCutoverCapacityError {
+	perApplyCap := storage.BuildOptions(storage.WithMaxDriversPerApply(s.config.MaxDriversPerApply)).MaxDriversPerApply
+	if operations <= 1 || operations <= perApplyCap {
+		return nil
+	}
+	s.logger.Warn("apply rejected: deferred cutover has more operations than max_drivers_per_apply runs of one apply at once",
+		"plan_id", plan.PlanIdentifier, "apply_id", applyIdentifier, "database", plan.Database,
+		"database_type", plan.DatabaseType, "environment", environment, "caller", caller,
+		"operations", operations, "max_drivers_per_apply", perApplyCap)
+	return &DeferredCutoverCapacityError{
+		Database:    plan.Database,
+		Environment: environment,
+		Operations:  operations,
+		PerApplyCap: perApplyCap,
+	}
 }
 
 // deferredCutoverRefusal turns storage refusing a deferred apply's admission

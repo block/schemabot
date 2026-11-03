@@ -71,6 +71,11 @@ func TestDeferredCutoverCapacityErrorMessages(t *testing.T) {
 			want:    "commerce/production: --defer-cutover would hold 100 operations at their cutover at once, and SchemaBot runs at most 96 deferred operations; apply again without --defer-cutover",
 		},
 		{
+			name:    "wider than max_drivers_per_apply",
+			refused: DeferredCutoverCapacityError{Database: "commerce", Environment: "production", Operations: 16, PerApplyCap: 2},
+			want:    "commerce/production: --defer-cutover would hold 16 operations at their cutover at once, and max_drivers_per_apply runs at most 2 operations of one apply at once; apply again without --defer-cutover, or raise max_drivers_per_apply to at least 16",
+		},
+		{
 			name:    "no live server",
 			refused: DeferredCutoverCapacityError{Database: "commerce", Environment: "production", Operations: 4},
 			want:    "commerce/production: --defer-cutover would hold 4 operations at their cutover at once, and no SchemaBot server has reported its drivers in the last minute; apply again without --defer-cutover",
@@ -174,4 +179,34 @@ func TestOperatorStartupHeartbeatGivesUpAtItsDeadline(t *testing.T) {
 	live, err := registry.ListLive(t.Context())
 	require.NoError(t, err)
 	assert.Empty(t, live, "a heartbeat that timed out records no row")
+}
+
+// A deferred apply's waiting operations keep counting against
+// max_drivers_per_apply, so an apply with more operations than the cap could
+// never have them all waiting at once. Apply creation refuses it before
+// storing anything, naming the cap, and admits the same apply once the cap
+// covers every operation.
+func TestDeferredCutoverWiderThanThePerApplyCapIsRefused(t *testing.T) {
+	change := storage.TableChange{Namespace: "commerce", Table: "orders", DDL: "ALTER TABLE `orders` ADD INDEX (`created_at`)", Operation: "alter"}
+	plan := trustedQueueApplyTestPlan()
+	plan.Namespaces = map[string]*storage.NamespacePlanData{"commerce": {Tables: []storage.TableChange{change}}}
+	for _, shard := range []string{"-40", "40-80", "80-"} {
+		plan.Shards = append(plan.Shards, storage.ShardPlan{Namespace: "commerce", Shard: shard, Changes: []storage.TableChange{change}})
+	}
+	applies := &capturingApplyStore{}
+	svc, _ := newQueueApplyTestService(plan, &mockTernClient{isRemote: true}, applies)
+	deferred := ApplyRequest{PlanID: "plan-1", Environment: "staging", Options: map[string]string{"defer_cutover": "true"}}
+
+	_, _, err := svc.EnqueueAuthorizedApply(t.Context(), deferred)
+
+	refused, ok := errors.AsType[*DeferredCutoverCapacityError](err)
+	require.True(t, ok, "got %v", err)
+	assert.Equal(t, DeferredCutoverCapacityError{Database: "testdb", Environment: "staging", Operations: 3, PerApplyCap: storage.DefaultMaxDriversPerApply}, *refused)
+	assert.Nil(t, applies.apply, "a refused apply stores nothing")
+
+	svc.config.MaxDriversPerApply = 3
+	_, _, err = svc.EnqueueAuthorizedApply(t.Context(), deferred)
+	require.NoError(t, err)
+	require.NotNil(t, applies.apply)
+	assert.Equal(t, 3, applies.apply.DeferredCutoverOperations)
 }
