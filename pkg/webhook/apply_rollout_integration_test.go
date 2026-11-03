@@ -1876,6 +1876,49 @@ func TestE2EApplyHoldsBackTheTargetWhoseCopyItWouldDiscardAndRunsTheRest(t *test
 	requireUsersCopyIntact(t, dbName+"_us")
 }
 
+// Three targets still need the column, and a pending confirmation pins a
+// round in which every target could run. Before the operator confirms, an
+// unfinished copy of `users` made for a different statement appears on us.
+// apply-confirm re-plans, holds us back, and runs the rest: the apply runs eu
+// and ap only, records us as held back, leaves us's copy in place, and its
+// comment names us, which the confirmed comment never showed as held. The
+// check that apply leaves on completion is covered by
+// TestApplyThatHeldTargetsBackCompletesWithoutPassingTheCheck.
+func TestE2EApplyConfirmHoldsBackATargetWhoseCopyAppearedAfterThePlan(t *testing.T) {
+	dbName := "webhook_rollout_hold_copy_confirm"
+	svc := setupE2ERolloutService(t, dbName, []deploymentSpec{
+		{name: "eu", liveSchema: usersBaseSchema},
+		{name: "us", liveSchema: usersBaseSchema},
+		{name: "ap", liveSchema: usersBaseSchema},
+	}, api.PlanIndependent)
+	t.Cleanup(func() {
+		_ = svc.Storage().Locks().ForceRelease(context.WithoutCancel(t.Context()), dbName, "mysql")
+	})
+
+	plan := pinRolloutConfirmation(t, svc, dbName, nil)
+	planned := awaitCommentContaining(t, plan, "ADD COLUMN `email`")
+	assert.NotContains(t, planned, "Holding back", "every target could run when the plan was made")
+
+	seedUsersCopy(t, dbName+"_us")
+
+	confirm := runRolloutCommand(t, svc, dbName, "schemabot apply-confirm -e "+driftEnv)
+	created := awaitRolloutApply(t, svc, dbName, confirm)
+	requireTaskDDLByDeployment(t, svc, created, map[string][]string{
+		"eu": {"ADD COLUMN `email`"},
+		"ap": {"ADD COLUMN `email`"},
+	})
+	held := storage.ParseApplyOptions(created.Options).HeldBack
+	require.Len(t, held, 1, "the apply records the one target it held back")
+	assert.Equal(t, "us", held[0].Target)
+	assert.Contains(t, held[0].Reason, "applying its plan discards the unfinished copy of users")
+	body := awaitCommentContaining(t, confirm, "Held back target `us`")
+	assert.Contains(t, body, "applying its plan discards the unfinished copy of users", "the apply comment says why us was held back")
+	requireUsersCopyIntact(t, dbName+"_us")
+	check := rolloutCheck(t, svc, dbName)
+	assert.Equal(t, created.ID, check.ApplyID, "the apply owns the check")
+	assert.NotEqual(t, "success", check.Conclusion, "us still needs the change, so the check never passes while the apply runs")
+}
+
 // requireUsersCopyIntact asserts the unfinished copy seeded by seedUsersCopy is
 // still on the target, so a refused apply provably discarded nothing.
 func requireUsersCopyIntact(t *testing.T, physicalDB string) {
