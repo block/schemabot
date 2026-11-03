@@ -133,9 +133,6 @@ func (m WatchModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.KeyMsg:
-		// During cutover, ignore all keyboard input except q to force quit
-		isCuttingOver := state.IsState(m.state, state.Apply.CuttingOver) || m.cutoverTriggered
-
 		if isEnterKey(msg) {
 			return m.handleEnterKey()
 		}
@@ -143,7 +140,7 @@ func (m WatchModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch msg.String() {
 		case "esc", "ctrl+c":
 			// Don't allow detach during cutover
-			if isCuttingOver {
+			if m.cuttingOver() {
 				return m, nil
 			}
 			m.detached = true
@@ -152,12 +149,8 @@ func (m WatchModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.quitting = true
 			return m, tea.Quit
 		case "s", "c":
-			// Don't allow stop/cancel during cutover
-			if isCuttingOver {
-				return m, nil
-			}
 			// Stop (Spirit) or cancel (PlanetScale) the schema change
-			if (state.IsRunningApplyState(m.state) || state.IsState(m.state, state.Apply.WaitingForDeploy, state.Apply.WaitingForCutover)) && !m.stopTriggered {
+			if m.stopKeyAvailable() && !m.stopTriggered {
 				m.stopTriggered = true
 				return m, m.triggerStop()
 			}
@@ -278,6 +271,21 @@ func (m WatchModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 
 	return m, nil
+}
+
+// cuttingOver reports whether a cutover is underway or was requested from this
+// watcher. During cutover the watcher ignores every key but q.
+func (m WatchModel) cuttingOver() bool {
+	return state.IsState(m.state, state.Apply.CuttingOver) || m.cutoverTriggered
+}
+
+// stopKeyAvailable reports whether the apply is in a state the s (or c) key
+// stops, so a footer advertises the key exactly where pressing it acts.
+func (m WatchModel) stopKeyAvailable() bool {
+	if m.cuttingOver() {
+		return false
+	}
+	return state.IsRunningApplyState(m.state) || state.IsState(m.state, state.Apply.WaitingForDeploy, state.Apply.WaitingForCutover)
 }
 
 func isEnterKey(msg tea.KeyMsg) bool {

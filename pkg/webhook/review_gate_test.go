@@ -240,8 +240,9 @@ const (
 // branch moved underneath it. On a MySQL-family database that includes a
 // rebase that combined the PR's edit with a default branch edit to the same
 // table's file, as long as the PR's edit generates the same statements on
-// both bases and does not replace what the default branch changed. On
-// PostgreSQL the environment's target decides the same thing, and a file it
+// both bases and does not replace what the default branch changed, and, on
+// Vitess, a VSchema that routes every table as the approved commit and the
+// default branch do. On PostgreSQL the environment's target decides the same thing, and a file it
 // cannot compare is a change. When the PR's change differs
 // at the head, the PR is blocked until someone approves the head and the
 // comment says why. When the approved commit cannot be compared with the
@@ -284,6 +285,37 @@ func TestCheckReviewGate_ApprovalCoverage(t *testing.T) {
 	setPostgresOrders := func(columns string) func(map[string]string) {
 		return func(files map[string]string) {
 			files["schema/testdb/orders/orders.sql"] = "CREATE TABLE orders (" + columns + ");"
+		}
+	}
+	// setVSchema replaces the orders keyspace's VSchema with a sharded one
+	// routing each named table by the column given for it.
+	setVSchema := func(routing ...string) func(map[string]string) {
+		return func(files map[string]string) {
+			var tables []string
+			for i := 0; i+1 < len(routing); i += 2 {
+				tables = append(tables, fmt.Sprintf(`"%s": {"column_vindexes": [{"column": "%s", "name": "hash"}]}`, routing[i], routing[i+1]))
+			}
+			files["schema/testdb/orders/vschema.json"] = `{"sharded": true, "vindexes": {"hash": {"type": "hash"}}, "tables": {` +
+				strings.Join(tables, ", ") + `}}`
+		}
+	}
+	// sharedTableBase adds a table another database's schema keeps under
+	// schema/other/v1; linkBackground makes the PR add a symlink to it from
+	// the orders namespace, through the given directory, and
+	// renameSharedTables makes the default branch move it to schema/other/v2
+	// with the given definition.
+	backgroundTable := "CREATE TABLE `background` (`id` bigint NOT NULL, PRIMARY KEY (`id`))"
+	sharedTableBase := maps.Clone(baseFiles)
+	sharedTableBase["schema/other/v1/background.sql"] = backgroundTable
+	linkBackground := func(dir string) func(map[string]string) {
+		return func(files map[string]string) {
+			files["schema/testdb/orders/background.sql"] = reviewGateSymlink + "../../other/" + dir + "/background.sql"
+		}
+	}
+	renameSharedTables := func(table string) func(map[string]string) {
+		return func(files map[string]string) {
+			delete(files, "schema/other/v1/background.sql")
+			files["schema/other/v2/background.sql"] = table
 		}
 	}
 	addVotesAnd := func(more func(map[string]string)) func(map[string]string) {
@@ -391,6 +423,22 @@ func TestCheckReviewGate_ApprovalCoverage(t *testing.T) {
 				files["schema/shared/orders.yaml"] = "database: orders\nignore_tables:\n  - legacy_old\n"
 			},
 			want: wantCovers,
+		},
+		{
+			name: "the PR repointing a config symlink outside the schema directory at another config after the approval does not count",
+			base: func() map[string]string {
+				files := maps.Clone(baseFiles)
+				files["schemabot.yaml"] = reviewGateSymlink + "config/orders.yaml"
+				files["config/orders.yaml"] = "database: orders\n"
+				files["config/orders_strict.yaml"] = "database: orders\nignore_tables:\n  - legacy_old\n"
+				return files
+			}(),
+			prChange: addVotes,
+			headChange: addVotesAnd(func(files map[string]string) {
+				files["schemabot.yaml"] = reviewGateSymlink + "config/orders_strict.yaml"
+			}),
+			configPath: "schemabot.yaml",
+			want:       wantChanged,
 		},
 		{
 			name: "a head rebuilt on an older default branch that restores a config outside the schema directory does not count",
@@ -570,6 +618,35 @@ func TestCheckReviewGate_ApprovalCoverage(t *testing.T) {
 			want:       wantCovers,
 		},
 		{
+			// The stacked PR below this one merged the note column, so after
+			// the rebase the head runs only the approved flag column. Every
+			// statement the head runs was approved.
+			name:       "a rebase after the stacked PR below it merged part of the PR's table edit counts",
+			prChange:   setOrders("`id` bigint NOT NULL, `note` text, `flag` int"),
+			baseChange: setOrders("`id` bigint NOT NULL, `note` text"),
+			want:       wantCovers,
+		},
+		{
+			// The author drops the approved note column without a rebase, so
+			// the head runs only part of what the reviewer approved.
+			name:          "a push on the same base that dropped part of the PR's table edit does not count",
+			prChange:      setOrders("`id` bigint NOT NULL, `note` text, `flag` int"),
+			headChange:    setOrders("`id` bigint NOT NULL, `flag` int"),
+			headOnOldBase: true,
+			want:          wantChanged,
+		},
+		{
+			// The reviewer approved widening idx_ab, which runs as DROP INDEX
+			// and ADD INDEX. The author then deletes the index without a
+			// rebase, so the head runs only the DROP INDEX.
+			name:          "a push on the same base that kept only the DROP INDEX of an approved index redefinition does not count",
+			base:          map[string]string{"schema/testdb/schemabot.yaml": "database: orders\n", "schema/testdb/orders/orders.sql": ordersWith("`id` bigint NOT NULL, `a` int, `b` int, KEY `idx_ab` (`a`)")},
+			prChange:      setOrders("`id` bigint NOT NULL, `a` int, `b` int, KEY `idx_ab` (`a`, `b`)"),
+			headChange:    setOrders("`id` bigint NOT NULL, `a` int, `b` int"),
+			headOnOldBase: true,
+			want:          wantChanged,
+		},
+		{
 			// The statements cannot be compared without the head's file, so
 			// a GitHub outage leaves the gate undecided and retryable.
 			name:           "a combined file GitHub cannot serve during an outage is a retryable evaluation failure",
@@ -594,6 +671,31 @@ func TestCheckReviewGate_ApprovalCoverage(t *testing.T) {
 			baseChange:   setOrders("`id` bigint NOT NULL, `total` bigint"),
 			headChange:   setOrders("`id` bigint NOT NULL, `total` bigint, `note` text"),
 			want:         wantCovers,
+		},
+		{
+			name:         "a rebase that combined the PR's table with the default branch's in a Vitess keyspace's VSchema counts",
+			databaseType: "vitess",
+			prChange:     setVSchema("orders", "customer_id", "votes", "order_id"),
+			baseChange:   setVSchema("orders", "customer_id", "customers", "id"),
+			headChange:   setVSchema("orders", "customer_id", "customers", "id", "votes", "order_id"),
+			want:         wantCovers,
+		},
+		{
+			name:            "a rebase that routes the PR's table by another column in a Vitess keyspace's VSchema is a change",
+			databaseType:    "vitess",
+			prChange:        setVSchema("orders", "customer_id", "votes", "order_id"),
+			baseChange:      setVSchema("orders", "customer_id", "customers", "id"),
+			headChange:      setVSchema("orders", "customer_id", "customers", "id", "votes", "id"),
+			want:            wantChanged,
+			wantChangedPath: "schema/testdb/orders/vschema.json",
+		},
+		{
+			name:            "a VSchema both the PR and the default branch edited is a change on a MySQL database, which applies none",
+			prChange:        setVSchema("orders", "customer_id", "votes", "order_id"),
+			baseChange:      setVSchema("orders", "customer_id", "customers", "id"),
+			headChange:      setVSchema("orders", "customer_id", "customers", "id", "votes", "order_id"),
+			want:            wantChanged,
+			wantChangedPath: "schema/testdb/orders/vschema.json",
 		},
 		{
 			name:           "a rebase that combined the PR's column with the default branch's in a PostgreSQL schema file counts when the target finds the same change",
@@ -659,15 +761,14 @@ func TestCheckReviewGate_ApprovalCoverage(t *testing.T) {
 			want:       wantChanged,
 		},
 		{
-			// Both commits modify amount with the same statement, but on the
-			// newer default branch that statement also drops its NOT NULL.
-			name:         "a rebase that kept the PR's version of a column the default branch changed does not count",
-			base:         map[string]string{"schema/testdb/schemabot.yaml": "database: orders\n", "schema/testdb/orders/orders.sql": ordersWith("`id` bigint NOT NULL, `amount` int")},
-			prChange:     setOrders("`id` bigint NOT NULL, `amount` bigint"),
-			baseChange:   setOrders("`id` bigint NOT NULL, `amount` int NOT NULL"),
-			headChange:   setOrders("`id` bigint NOT NULL, `amount` bigint"),
-			want:         wantChanged,
-			wantBaseOnly: true,
+			// Both commits modify amount with the same statement, so the head
+			// runs only the DDL the reviewer approved.
+			name:       "a rebase that kept the PR's version of a column the default branch changed counts",
+			base:       map[string]string{"schema/testdb/schemabot.yaml": "database: orders\n", "schema/testdb/orders/orders.sql": ordersWith("`id` bigint NOT NULL, `amount` int")},
+			prChange:   setOrders("`id` bigint NOT NULL, `amount` bigint"),
+			baseChange: setOrders("`id` bigint NOT NULL, `amount` int NOT NULL"),
+			headChange: setOrders("`id` bigint NOT NULL, `amount` bigint"),
+			want:       wantCovers,
 		},
 		{
 			name:               "a rebase onto a target branch other than the default that combined the PR's column with the branch's does not count",
@@ -744,6 +845,32 @@ func TestCheckReviewGate_ApprovalCoverage(t *testing.T) {
 				files["db/stray.sql"] = "DROP TABLE `orders`"
 			}),
 			want: wantCovers,
+		},
+		{
+			name:       "a rebase that repointed the PR's table symlink at the directory the default branch renamed counts",
+			base:       sharedTableBase,
+			prChange:   linkBackground("v1"),
+			baseChange: renameSharedTables(backgroundTable),
+			headChange: linkBackground("v2"),
+			want:       wantCovers,
+		},
+		{
+			name:            "a rebase that repointed the PR's table symlink at another table definition is a change",
+			base:            sharedTableBase,
+			prChange:        linkBackground("v1"),
+			baseChange:      renameSharedTables("CREATE TABLE `background` (`id` bigint NOT NULL, `note` text, PRIMARY KEY (`id`))"),
+			headChange:      linkBackground("v2"),
+			want:            wantChanged,
+			wantChangedPath: "schema/testdb/orders/background.sql",
+		},
+		{
+			name:            "a rebase that repointed the PR's table symlink at a file that does not exist is a change",
+			base:            sharedTableBase,
+			prChange:        linkBackground("v1"),
+			baseChange:      renameSharedTables(backgroundTable),
+			headChange:      linkBackground("v3"),
+			want:            wantChanged,
+			wantChangedPath: "schema/testdb/orders/background.sql",
 		},
 		{
 			name:     "the PR changing a symlinked namespace's target after the approval does not count",
@@ -2378,11 +2505,11 @@ func TestTargetStatementComparer(t *testing.T) {
 		target := &schemaFileCompareTernClient{hang: true}
 		c := newComparer(t, target, 50*time.Millisecond)
 
-		same, _, err := c.compare(t.Context(), "orders base", "orders", "orders head base", "orders head")
+		same, _, err := c.compare(t.Context(), "schema/app/orders.sql", "orders base", "orders", "orders head base", "orders head")
 		require.ErrorIs(t, err, context.DeadlineExceeded)
 		assert.False(t, same)
 
-		same, _, err = c.compare(t.Context(), "items base", "items", "items head base", "items head")
+		same, _, err = c.compare(t.Context(), "schema/app/items.sql", "items base", "items", "items head base", "items head")
 		require.ErrorIs(t, err, errTargetComparisonBudgetSpent)
 		assert.False(t, same)
 		assert.Len(t, target.requests(), 1, "a file past the budget is never sent to the target")
@@ -2392,7 +2519,7 @@ func TestTargetStatementComparer(t *testing.T) {
 		target := &schemaFileCompareTernClient{resp: &ternv1.CompareSchemaFileChangeResponse{Reason: "the head declares column note differently from the approved commit"}}
 		c := newComparer(t, target, time.Minute)
 		for range 2 {
-			same, reason, err := c.compare(t.Context(), "orders base", "orders", "orders head base", "orders head")
+			same, reason, err := c.compare(t.Context(), "schema/app/orders.sql", "orders base", "orders", "orders head base", "orders head")
 			require.NoError(t, err)
 			assert.False(t, same)
 			assert.Equal(t, "the head declares column note differently from the approved commit", reason)
@@ -2400,11 +2527,21 @@ func TestTargetStatementComparer(t *testing.T) {
 		assert.Len(t, target.requests(), 1)
 	})
 
+	t.Run("a file other than .sql is changed without asking the target", func(t *testing.T) {
+		target := &schemaFileCompareTernClient{resp: &ternv1.CompareSchemaFileChangeResponse{Same: true}}
+		c := newComparer(t, target, time.Minute)
+		same, reason, err := c.compare(t.Context(), "schema/app/vschema.json", "{}", `{"sharded": true}`, "{}", `{"sharded": true}`)
+		require.NoError(t, err)
+		assert.False(t, same)
+		assert.Equal(t, "a PostgreSQL database applies only .sql files, so vschema.json is not compared", reason)
+		assert.Empty(t, target.requests())
+	})
+
 	t.Run("a failed comparison is asked again", func(t *testing.T) {
 		target := &schemaFileCompareTernClient{err: errors.New("connection refused")}
 		c := newComparer(t, target, time.Minute)
 		for range 2 {
-			_, _, err := c.compare(t.Context(), "orders base", "orders", "orders head base", "orders head")
+			_, _, err := c.compare(t.Context(), "schema/app/orders.sql", "orders base", "orders", "orders head base", "orders head")
 			require.ErrorContains(t, err, "connection refused")
 		}
 		assert.Len(t, target.requests(), 2, "only an answer is remembered")
