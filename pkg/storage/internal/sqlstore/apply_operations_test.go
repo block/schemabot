@@ -5286,6 +5286,55 @@ func TestApplyOperationStore_FindNextApplyOperation_PendingStopGateHaltsSibling(
 	assert.Nil(t, claimed, "a pending stop must halt the next sibling even under on_failure continue")
 }
 
+// TestApplyOperationStore_FindNextApplyOperation_PendingCancelGateHoldsSibling
+// verifies that a pending cancel keeps the next member of a rollout from
+// starting: when one deployment completes and hands off to the next while a
+// cancel is pending, the pending sibling is not claimed, so no engine work
+// begins on a rollout the operator has asked to cancel.
+func TestApplyOperationStore_FindNextApplyOperation_PendingCancelGateHoldsSibling(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql")
+	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_op_cancel_gate", 1, state.Apply.Running, "staging")
+
+	completed, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a", State: state.ApplyOperation.Completed, OnFailure: storage.OnFailureHalt,
+	})
+	require.NoError(t, err)
+	_, err = store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-b", OnFailure: storage.OnFailureHalt,
+	})
+	require.NoError(t, err)
+	// Backdate the completed row so staleness can't be the reason region-b is held.
+	_, err = testDB.ExecContext(ctx, `
+		UPDATE apply_operations SET updated_at = NOW() - INTERVAL 1 HOUR WHERE id = ?
+	`, completed)
+	require.NoError(t, err)
+
+	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
+	require.NoError(t, err)
+	require.NotNil(t, claimed, "without a cancel, region-b is the next member to claim")
+	require.Equal(t, "region-b", claimed.Deployment)
+	_, err = testDB.ExecContext(ctx, `
+		UPDATE apply_operations SET state = ?, lease_owner = '', lease_token = '', started_at = NULL WHERE id = ?
+	`, state.ApplyOperation.Pending, claimed.ID)
+	require.NoError(t, err)
+
+	_, _, err = store.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationCancel,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "operator",
+	})
+	require.NoError(t, err)
+
+	claimed, err = store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
+	require.NoError(t, err)
+	assert.Nil(t, claimed, "a pending cancel must keep the next member from starting")
+}
+
 // TestApplyOperationStore_FindNextApplyOperation_PendingStopDoesNotBlockStaleRecovery
 // verifies the stop gate covers only pending (not-yet-started) rows: a row that
 // already started and went stale is recovering work it began, so it is still
