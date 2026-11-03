@@ -24,8 +24,11 @@ const ApplyLeaseStaleAfter = time.Minute
 // ApplyDriveStallAfter bounds how long a drive may go without mirroring any
 // task progress to storage before its driver presumes the drive goroutine is
 // wedged and cancels the run. A healthy drive's poll loop writes every task row
-// on every poll tick, so legitimate silence is far shorter than this window;
-// the window is kept generous so slow pre-poll phases (target schema pulls,
+// on every full poll: every tick, except that a drive held at a deferred
+// cutover runs its full poll only on a slower refresh interval
+// (tern.parkedFullPollInterval). Legitimate silence is therefore far shorter
+// than this window, and tightening the window must keep it well above that
+// refresh interval. The window is kept generous so slow pre-poll phases (target schema pulls,
 // re-planning, engine acceptance) have the full window before their first
 // mirror write.
 //

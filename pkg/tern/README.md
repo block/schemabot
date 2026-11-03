@@ -46,7 +46,7 @@ The CLI or API calls `Plan()` with the desired schema files. The Tern client pas
 
 ### 3. Poll
 
-Background goroutines poll the engine for progress every 500ms and update task state in storage (rows copied, ETA, progress %). A heartbeat updates the apply's `updated_at` every 10 seconds to signal the driver is alive.
+Background goroutines poll the engine for progress every 500ms and update task state in storage (rows copied, ETA, progress %). A drive held at a deferred cutover polls on a 30s refresh instead, and goes back to every 500ms as soon as a cutover, stop, or cancel is pending. A heartbeat updates the apply's `updated_at` every 10 seconds to signal the driver is alive.
 
 ### 4. Cutover
 

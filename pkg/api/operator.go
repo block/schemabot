@@ -3235,8 +3235,10 @@ func (s *Service) operationHeartbeatFailureStopsDrive(ctx context.Context, drive
 
 // operationDriveStalled reports whether the drive holding this operation has
 // stopped making observable progress while its heartbeat stays fresh. The
-// drive's poll loop mirrors every task row to storage on every poll tick, so
-// task updated_at advances continuously while the drive goroutine is alive. A
+// drive's poll loop mirrors every task row to storage on every full poll, which
+// runs every tick except while the drive holds at a deferred cutover, when it
+// runs on a slower refresh interval well inside the window. Task updated_at
+// therefore keeps advancing while the drive goroutine is alive. A
 // drive that has mirrored nothing for the full storage.ApplyDriveStallAfter window is
 // wedged — for example blocked in a target-database read that outlives its
 // cancelled context — and will never finish on its own, yet its heartbeat
