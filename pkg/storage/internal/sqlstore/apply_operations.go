@@ -2639,15 +2639,122 @@ func (s *applyOperationStore) MarkPendingCancelledByApply(ctx context.Context, a
 // that never started back to pending while a start request is pending and
 // neither a stop nor a cancel request is. A stop moved such a row from
 // pending to stopped before any driver claimed it, so it wrote nothing; the
-// pending start makes it queued work again. Back at pending, it starts through the same claim gates it
-// would have resumed through, and the rollout reads as queued rather than
-// stopped while the start works through the members ahead of it. Checking
-// both requests in the update itself means a stop accepted after the start,
-// which completes the start, keeps every row it stopped, and a pending cancel
-// settles the rows where they are. Writes are lease guarded exactly as
-// MarkPendingStoppedByApply's.
+// pending start makes it queued work again. Back at pending, it starts through
+// the same claim gates it would have resumed through, and the rollout reads as
+// queued rather than stopped while the start works through the members ahead
+// of it.
+//
+// Only a row whose tasks are all still pending is requeued: a row a start
+// claimed out of stopped carries no started_at, so its tasks are what show
+// whether an engine ever took up its work, and work an engine took up resumes
+// from its checkpoint rather than starting again.
+//
+// The requests are read in a transaction that takes its locks in the order
+// stopQueuedStart takes them, the apply row first, so a stop that withdraws the
+// start either commits before these reads, which then see the start completed,
+// or waits for the requeue and then finds the rows it stops pending. Writes are
+// lease guarded the same way as MarkPendingStoppedByApply's.
 func (s *applyOperationStore) RequeueNeverStartedForStartByApply(ctx context.Context, applyID int64) (int64, error) {
-	return s.markPendingByApply(ctx, applyID, state.ApplyOperation.Pending, "requeue for start", neverStartedStoppedForStartRows)
+	var requeued int64
+	err := withLockRetry(ctx, s.classifier, fmt.Sprintf("requeue never-started operations of apply %d for its start", applyID), func() error {
+		var attemptErr error
+		requeued, attemptErr = s.requeueNeverStartedForStart(ctx, applyID)
+		return attemptErr
+	})
+	if err != nil {
+		return 0, err
+	}
+	return requeued, nil
+}
+
+func (s *applyOperationStore) requeueNeverStartedForStart(ctx context.Context, applyID int64) (int64, error) {
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	if err != nil {
+		return 0, fmt.Errorf("begin requeue of never-started operations for apply %d: %w", applyID, err)
+	}
+	defer rollbackTx(ctx, tx, "requeue never-started operations for start")
+
+	var applyLeaseToken sql.NullString
+	if err := tx.QueryRowContext(ctx, `SELECT lease_token FROM applies WHERE id = ? FOR UPDATE`, applyID).Scan(&applyLeaseToken); err != nil {
+		return 0, fmt.Errorf("lock apply %d to requeue its never-started operations: %w", applyID, err)
+	}
+	if err := requeueLeaseStillOwned(ctx, tx, applyID, applyLeaseToken); err != nil {
+		return 0, err
+	}
+	pending, err := pendingControlOperationsForUpdate(ctx, tx, applyID)
+	if err != nil {
+		return 0, err
+	}
+	if !pending[storage.ControlOperationStart] || pending[storage.ControlOperationStop] || pending[storage.ControlOperationCancel] {
+		return 0, nil
+	}
+	result, err := tx.ExecContext(ctx, `
+		UPDATE apply_operations
+		SET state = ?, updated_at = NOW()
+		WHERE apply_id = ? AND state = ? AND started_at IS NULL
+		  AND NOT EXISTS (
+		    SELECT 1 FROM tasks t
+		    WHERE t.apply_operation_id = apply_operations.id AND t.state <> ?
+		  )
+	`, state.ApplyOperation.Pending, applyID, state.ApplyOperation.Stopped, state.Task.Pending)
+	if err != nil {
+		return 0, fmt.Errorf("requeue never-started stopped operations of apply %d: %w", applyID, err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("read requeued operation rows of apply %d: %w", applyID, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("commit requeue of never-started operations for apply %d: %w", applyID, err)
+	}
+	return rows, nil
+}
+
+// requeueLeaseStillOwned fences a requeue on the caller's lease: the operation
+// lease when ctx carries one, otherwise the apply lease, whose current token is
+// read from the locked apply row.
+func requeueLeaseStillOwned(ctx context.Context, tx *rebindTx, applyID int64, applyLeaseToken sql.NullString) error {
+	if opLease, ok := storage.OperationLeaseFromContext(ctx); ok {
+		if !opLease.Valid() {
+			return fmt.Errorf("invalid operation lease to requeue never-started operations of apply %d: %w", applyID, storage.ErrApplyLeaseLost)
+		}
+		if opLease.ApplyID != applyID {
+			return fmt.Errorf("operation lease for apply %d does not authorize requeuing operations of apply %d: %w", opLease.ApplyID, applyID, storage.ErrApplyLeaseLost)
+		}
+		return ensureOperationLeaseStillOwned(ctx, tx, opLease)
+	}
+	lease, hasLease, err := applyLeaseFromContext(ctx, applyID)
+	if err != nil {
+		return err
+	}
+	if hasLease && (!applyLeaseToken.Valid || applyLeaseToken.String != lease.Token) {
+		return fmt.Errorf("apply lease for apply %d is no longer current to requeue its never-started operations: %w", applyID, storage.ErrApplyLeaseLost)
+	}
+	return nil
+}
+
+// pendingControlOperationsForUpdate locks an apply's control requests and
+// reports which operations are pending.
+func pendingControlOperationsForUpdate(ctx context.Context, tx *rebindTx, applyID int64) (map[storage.ControlOperation]bool, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT operation, status FROM apply_control_requests WHERE apply_id = ? FOR UPDATE`, applyID)
+	if err != nil {
+		return nil, fmt.Errorf("lock control requests of apply %d: %w", applyID, err)
+	}
+	defer utils.CloseAndLog(rows)
+	pending := make(map[storage.ControlOperation]bool)
+	for rows.Next() {
+		var operation, status string
+		if err := rows.Scan(&operation, &status); err != nil {
+			return nil, fmt.Errorf("scan control request of apply %d: %w", applyID, err)
+		}
+		if storage.ControlRequestStatus(status) == storage.ControlRequestPending {
+			pending[storage.ControlOperation(operation)] = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("read control requests of apply %d: %w", applyID, err)
+	}
+	return pending, nil
 }
 
 // sweptRows selects the operation rows a bulk sweep of an apply settles. The
@@ -2673,38 +2780,15 @@ var neverStartedRows = sweptRows{
 	args: []any{state.ApplyOperation.Pending, state.ApplyOperation.Stopped},
 }
 
-// neverStartedStoppedForStartRows are the stopped operations that never
-// started, while the apply has a pending start request and neither a pending
-// stop nor a pending cancel.
-var neverStartedStoppedForStartRows = sweptRows{
-	predicate: func(prefix string) string {
-		// The control request subqueries correlate on the operation's apply,
-		// which needs a qualifier even when the sweep names no alias.
-		qualifier := prefix
-		if qualifier == "" {
-			qualifier = "apply_operations."
-		}
-		pendingRequest := "EXISTS (SELECT 1 FROM apply_control_requests cr WHERE cr.apply_id = " + qualifier + "apply_id AND cr.operation = ? AND cr.status = ?)"
-		return "(" + prefix + "state = ? AND " + prefix + "started_at IS NULL AND " +
-			pendingRequest + " AND NOT " + pendingRequest + " AND NOT " + pendingRequest + ")"
-	},
-	args: []any{
-		state.ApplyOperation.Stopped,
-		storage.ControlOperationStart, storage.ControlRequestPending,
-		storage.ControlOperationStop, storage.ControlRequestPending,
-		storage.ControlOperationCancel, storage.ControlRequestPending,
-	},
-}
-
 // markPendingByApply moves the swept operations of an apply to newState,
-// stamping completed_at when newState is settled: terminal and not resumable.
+// stamping completed_at when newState is terminal and not resumable.
 func (s *applyOperationStore) markPendingByApply(ctx context.Context, applyID int64, newState, verb string, swept sweptRows) (int64, error) {
 	assignments := []JoinedUpdateAssignment{
 		{Column: "state", Expr: "?"},
 		{Column: "updated_at", Expr: "NOW()"},
 	}
 	plainSet := "state = ?, updated_at = NOW()"
-	if state.IsState(newState, state.SettledApplyStates...) {
+	if newState != state.ApplyOperation.Stopped {
 		assignments = append(assignments, JoinedUpdateAssignment{Column: "completed_at", Expr: "NOW()"})
 		plainSet += ", completed_at = NOW()"
 	}

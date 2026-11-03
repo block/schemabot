@@ -632,11 +632,12 @@ func (c *resumedWorkClient) ResumeApplyOperation(ctx context.Context, apply *sto
 	return c.matrixTernClient.ResumeApplyOperation(ctx, apply, applyOperationID)
 }
 
-// An operator stopped a rollout mid-copy and started it again. The start's
-// claim marks the operation resuming while its drive asks the engine to pick
-// the copy up again. Once the engine is copying, the operation and the rollout
-// read running for the rest of the copy, so the PR comment and the CLI show the
-// copy running rather than resuming until it finishes.
+// An operator stopped a two-target rollout while region-a copied, after
+// region-b had finished, and started it again. The start's claim marks
+// region-a resuming while its drive asks the engine to pick the copy up again.
+// Once the engine is copying, region-a and the rollout read running for the
+// rest of the copy, so the PR comment and the CLI show the copy running rather
+// than resuming until it finishes.
 func TestOperator_ResumedOperationReadsRunningOnceItsEngineWorks(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping integration test in short mode")
@@ -652,11 +653,17 @@ func TestOperator_ResumedOperationReadsRunningOnceItsEngineWorks(t *testing.T) {
 		parentState:     state.Apply.Stopped,
 		cutoverPolicy:   storage.CutoverPolicyRolling,
 		onFailure:       storage.OnFailureHalt,
-		deployments:     []string{"region-a"},
+		deployments:     []string{"region-a", "region-b"},
 		opState:         state.ApplyOperation.Stopped,
 		taskState:       state.Task.Stopped,
 	})
 	_, err := db.ExecContext(ctx, "UPDATE apply_operations SET started_at = NOW() WHERE apply_id = ?", seed.applyID)
+	require.NoError(t, err)
+	_, err = db.ExecContext(ctx, "UPDATE apply_operations SET state = ?, completed_at = NOW() WHERE id = ?",
+		state.ApplyOperation.Completed, seed.opID("region-b"))
+	require.NoError(t, err)
+	_, err = db.ExecContext(ctx, "UPDATE tasks SET state = ?, completed_at = NOW() WHERE apply_operation_id = ?",
+		state.Task.Completed, seed.opID("region-b"))
 	require.NoError(t, err)
 	_, _, err = stor.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
 		ApplyID:     seed.applyID,

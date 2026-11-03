@@ -2089,8 +2089,8 @@ func TestApplyOperations(t *testing.T, h Harness) {
 	// RequeueNeverStartedForStartByApply verifies that a pending start puts
 	// the rows a stop caught before they started back in the queue: stopped
 	// rows that never started return to pending without completed_at, while
-	// a stopped row that had started, a running row, and a completed row stay
-	// as they are. The write needs a pending start, and does nothing while a
+	// a stopped row that had started, a stopped row whose engine took up a
+	// task, a running row, and a completed row stay as they are. The write needs a pending start, and does nothing while a
 	// stop or a cancel is pending too, so a stop accepted after the start
 	// keeps every row it stopped. A displaced driver requeues nothing.
 	t.Run("RequeueNeverStartedForStartByApply", func(t *testing.T) {
@@ -2106,6 +2106,20 @@ func TestApplyOperations(t *testing.T, h Harness) {
 		require.NoError(t, store.ApplyOperations().UpdateState(ctx, startedStoppedID, state.ApplyOperation.Stopped))
 		completedID := createOperation(t, store, apply.ID, "region-d", "completed")
 		require.NoError(t, store.ApplyOperations().MarkCompleted(ctx, completedID))
+		// A start claims a stopped row without stamping started_at, so a row the
+		// engine took up after such a claim shows it only through its tasks.
+		engineTouchedID := createOperation(t, store, apply.ID, "region-e", "engine-touched-stopped")
+		require.NoError(t, store.ApplyOperations().UpdateState(ctx, engineTouchedID, state.ApplyOperation.Stopped))
+		addTask := func(operationID int64, name, taskState string) {
+			t.Helper()
+			task := newTask(apply, "task_requeue_"+name, name, time.Now().UTC().Truncate(time.Second))
+			task.ApplyOperationID = &operationID
+			task.State = taskState
+			_, err := store.Tasks().Create(ctx, task)
+			require.NoError(t, err)
+		}
+		addTask(neverStartedID, "never_started", state.Task.Pending)
+		addTask(engineTouchedID, "engine_touched", state.Task.Stopped)
 
 		claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "current-driver")
 		require.NoError(t, err)
@@ -2167,6 +2181,11 @@ func TestApplyOperations(t *testing.T, h Harness) {
 		require.NoError(t, err)
 		require.NotNil(t, completed)
 		assert.Equal(t, state.ApplyOperation.Completed, completed.State)
+		engineTouched, err := store.ApplyOperations().Get(ctx, engineTouchedID)
+		require.NoError(t, err)
+		require.NotNil(t, engineTouched)
+		assert.Nil(t, engineTouched.StartedAt)
+		assert.Equal(t, state.ApplyOperation.Stopped, engineTouched.State, "a row whose engine took up a task resumes from its checkpoint, not from the queue")
 	})
 
 	// MarkResumedRunning verifies the resumed operation's move to running is a

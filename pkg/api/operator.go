@@ -3100,13 +3100,17 @@ func (s *Service) logApplyDrivePanicFailure(ctx context.Context, driverID int, a
 // cancels the run when they stop for the full stall window.
 //
 // A resumed operation is also marked running from here once its engine works
-// again (promoteResumedOperation), which re-derives the parent.
+// again, and the parent re-derived from it (advanceResumePromotion).
+//
 // Returns a stop func that is safe to call more than once. It returns only
 // once the heartbeat has exited, so no parent projection from a tick can land
 // after the drive reloads the parent for its own.
 func (s *Service) startApplyOperationHeartbeat(ctx context.Context, driverID int, op *storage.ApplyOperation, apply *storage.Apply, cancelRun context.CancelFunc) func() {
 	hbCtx, stop := context.WithCancel(ctx)
 	interval := min(s.operatorPollInterval, ApplyOperationHeartbeatInterval)
+	// The drive goes on mutating its apply while the heartbeat runs, so the
+	// heartbeat reads its own copy.
+	applySnapshot := *apply
 	exited := make(chan struct{})
 	s.recoveryWg.Go(func() {
 		defer close(exited)
@@ -3116,7 +3120,7 @@ func (s *Service) startApplyOperationHeartbeat(ctx context.Context, driverID int
 		lastSuccess := driveStart
 		// The claim returns the row's pre-claim state: a stopped or resuming row
 		// was claimed to resume, and it reads resuming until its engine works.
-		awaitingResume := state.IsState(op.State, state.ApplyOperation.Stopped, state.ApplyOperation.Resuming)
+		resume := newResumePromotion(op)
 		for {
 			select {
 			case <-hbCtx.Done():
@@ -3125,12 +3129,13 @@ func (s *Service) startApplyOperationHeartbeat(ctx context.Context, driverID int
 				err := s.storage.ApplyOperations().Heartbeat(hbCtx, op.ID)
 				if err == nil {
 					lastSuccess = s.clock.Now()
-					if s.operationDriveStalled(hbCtx, driverID, op, apply, driveStart) {
+					if s.operationDriveStalled(hbCtx, driverID, op, &applySnapshot, driveStart) {
 						cancelRun()
 						return
 					}
-					if awaitingResume {
-						awaitingResume = !s.promoteResumedOperation(hbCtx, driverID, op, apply)
+					if s.advanceResumePromotion(hbCtx, driverID, op, &applySnapshot, &resume) == resumeLeaseLost {
+						cancelRun()
+						return
 					}
 					continue
 				}
@@ -3139,7 +3144,7 @@ func (s *Service) startApplyOperationHeartbeat(ctx context.Context, driverID int
 					// cancellation fallout, not lease trouble.
 					return
 				}
-				if s.operationHeartbeatFailureStopsDrive(hbCtx, driverID, op, apply, err, lastSuccess) {
+				if s.operationHeartbeatFailureStopsDrive(hbCtx, driverID, op, &applySnapshot, err, lastSuccess) {
 					cancelRun()
 					return
 				}
@@ -3152,60 +3157,121 @@ func (s *Service) startApplyOperationHeartbeat(ctx context.Context, driverID int
 	}
 }
 
-// promoteResumedOperation moves an operation a start resumed from resuming to
-// running once its tasks show the engine working again, then re-derives the
+// resumePromotion is what the heartbeat still owes a resumed operation: marking
+// its row running once the engine works again, and then re-deriving the parent
+// from it. The two are tracked apart so a projection that fails is retried on
+// later ticks without promoting the row again.
+type resumePromotion struct {
+	awaitingRunning bool
+	parentStale     bool
+}
+
+// newResumePromotion starts tracking a claimed operation. Only a row claimed out
+// of stopped or resuming is awaiting the move to running.
+func newResumePromotion(op *storage.ApplyOperation) resumePromotion {
+	return resumePromotion{
+		awaitingRunning: state.IsState(op.State, state.ApplyOperation.Stopped, state.ApplyOperation.Resuming),
+	}
+}
+
+// resumeStep is the outcome of one heartbeat's turn at a resumed operation.
+type resumeStep int
+
+const (
+	// resumeContinue: keep heartbeating; anything still owed is retried on the
+	// next tick.
+	resumeContinue resumeStep = iota
+	// resumeLeaseLost: this drive no longer holds the operation's lease, so it
+	// must stop like any other displaced driver.
+	resumeLeaseLost
+)
+
+// advanceResumePromotion takes the next step for a resumed operation: mark it
+// running once its tasks show the engine working again, then re-derive the
 // parent so the rollout reads running for the rest of the drive rather than
-// resuming until the drive returns. It reports whether there is nothing left
-// to promote: the row was promoted, has moved on from resuming, has no tasks
-// to judge by, or this drive no longer holds its lease. A failed read or write
-// is logged and retried on the next tick.
-func (s *Service) promoteResumedOperation(ctx context.Context, driverID int, op *storage.ApplyOperation, apply *storage.Apply) bool {
+// resuming until the drive returns. A failed read or write is logged and
+// retried on the next tick.
+func (s *Service) advanceResumePromotion(ctx context.Context, driverID int, op *storage.ApplyOperation, apply *storage.Apply, resume *resumePromotion) resumeStep {
+	if resume.awaitingRunning {
+		promoted, step, done := s.promoteResumedOperation(ctx, driverID, op, apply)
+		if step == resumeLeaseLost {
+			return resumeLeaseLost
+		}
+		resume.awaitingRunning = !done
+		resume.parentStale = promoted
+	}
+	if resume.parentStale {
+		resume.parentStale = !s.projectResumedParent(ctx, driverID, op, apply)
+	}
+	return resumeContinue
+}
+
+// promoteResumedOperation moves an operation a start resumed from resuming to
+// running once its tasks show the engine working again. It reports whether the
+// row was promoted by this call, and whether there is nothing left to promote:
+// the row was promoted, has moved on from resuming, or has no tasks to judge
+// by.
+func (s *Service) promoteResumedOperation(ctx context.Context, driverID int, op *storage.ApplyOperation, apply *storage.Apply) (promoted bool, step resumeStep, done bool) {
 	logAttrs := append(append(op.LogAttrs(), apply.IdentityLogAttrs()...), "driver", driverID)
 	tasks, err := s.storage.Tasks().GetByApplyOperationID(ctx, op.ID)
 	if err != nil {
 		s.logger.Warn("operator: could not load tasks to tell whether a resumed operation is running again; will retry on the next heartbeat",
 			append(logAttrs, "error", err)...)
-		return false
+		return false, resumeContinue, false
 	}
 	if len(tasks) == 0 {
 		s.logger.Debug("operator: resumed operation has no tasks to judge by; its drive moves the row itself", logAttrs...)
-		return true
+		return false, resumeContinue, true
 	}
 	if !tasksShowResumedWork(tasks) {
-		return false
+		return false, resumeContinue, false
 	}
-	promoted, err := s.storage.ApplyOperations().MarkResumedRunning(ctx, op.ID)
+	promoted, err = s.storage.ApplyOperations().MarkResumedRunning(ctx, op.ID)
 	if errors.Is(err, storage.ErrApplyLeaseLost) {
-		s.logger.Warn("operator: resumed operation lease lost before it could be marked running; the heartbeat stops this drive",
+		s.logger.Warn("operator: resumed operation lease lost before it could be marked running; stopping this drive",
 			append(logAttrs, "error", err)...)
-		return true
+		return false, resumeLeaseLost, true
 	}
 	if err != nil {
 		s.logger.Warn("operator: failed to mark resumed operation running; will retry on the next heartbeat",
 			append(logAttrs, "error", err)...)
-		return false
+		return false, resumeContinue, false
 	}
 	if !promoted {
 		s.logger.Debug("operator: resumed operation has already moved on from resuming", logAttrs...)
-		return true
+		return false, resumeContinue, true
 	}
 	s.logger.Info("operator: resumed operation is running again", logAttrs...)
+	return true, resumeContinue, true
+}
 
-	parent, err := s.storage.Applies().Get(ctx, apply.ID)
-	if err != nil {
-		s.logger.Warn("operator: failed to reload parent apply after marking resumed operation running; the drive's next projection updates it",
-			append(logAttrs, "error", err)...)
+// projectResumedParent re-derives the parent of an operation the heartbeat just
+// marked running. It reports whether nothing is left to project: the
+// projection ran, or this drive does not own the parent's derived state. A
+// drive holding the parent apply lease runs an engine that writes the parent
+// itself, so the operation row is the heartbeat's to move and the parent is
+// not.
+func (s *Service) projectResumedParent(ctx context.Context, driverID int, op *storage.ApplyOperation, apply *storage.Apply) bool {
+	logAttrs := append(append(op.LogAttrs(), apply.IdentityLogAttrs()...), "driver", driverID)
+	if _, hasApplyLease := storage.ApplyLeaseFromContext(ctx); hasApplyLease {
+		s.logger.Debug("operator: resumed operation's engine writes the parent apply under the apply lease; skipping the rollout projection", logAttrs...)
 		return true
 	}
+	parent, err := s.storage.Applies().Get(ctx, apply.ID)
+	if err != nil {
+		s.logger.Warn("operator: failed to reload parent apply after marking resumed operation running; will retry on the next heartbeat",
+			append(logAttrs, "error", err)...)
+		return false
+	}
 	if parent == nil {
-		s.logger.Warn("operator: parent apply not found after marking resumed operation running", logAttrs...)
+		s.logger.Warn("operator: parent apply not found after marking resumed operation running; no projection to run", logAttrs...)
 		return true
 	}
 	result, err := s.updateApplyStateFromOperations(ctx, driverID, parent, allowLeaseScopedFailedReopen)
 	if err != nil {
-		s.logger.Warn("operator: failed to update derived apply state after marking resumed operation running; the drive's next projection updates it",
+		s.logger.Warn("operator: failed to update derived apply state after marking resumed operation running; will retry on the next heartbeat",
 			append(logAttrs, "error", err)...)
-		return true
+		return false
 	}
 	// A running operation keeps the rollout active, so this projection does not
 	// settle the apply; publishing here keeps any terminal swap it did win from
