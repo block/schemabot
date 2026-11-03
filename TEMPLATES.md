@@ -4387,9 +4387,7 @@ Schema changes require approval from an authorized reviewer before applying.
 
 *Requested by @jackjackbits at 2026-01-01 00:00:00 UTC*
 
-Schema changes require approval from an authorized reviewer before applying.
-
-Approvals on an earlier commit no longer count because this PR's schema change is different now: @jdoe. Changed since the approval: `schema/testapp/orders.sql`. Ask for an approval of the latest commit.
+@jdoe approved an earlier commit, but this PR's change to `schema/testapp/orders.sql` is different now. That approval no longer counts, so the latest commit needs a new approval.
 
 <details>
 <summary>How <code>schema/testapp/orders.sql</code> changed since the approval</summary>
@@ -4416,7 +4414,7 @@ ALTER TABLE `orders` MODIFY COLUMN `coupon_code` varchar(64) NULL DEFAULT NULL;
 - @jdoe
 
 ### Next steps
-1. Request a review from anyone listed above
+1. Ask @jdoe or anyone listed above to approve the latest commit
 2. Once approved, run `schemabot apply -e staging` again
 
 </details>
@@ -4431,9 +4429,7 @@ ALTER TABLE `orders` MODIFY COLUMN `coupon_code` varchar(64) NULL DEFAULT NULL;
 
 *Requested by @jackjackbits at 2026-01-01 00:00:00 UTC*
 
-Schema changes require approval from an authorized reviewer before applying.
-
-Approvals on an earlier commit no longer count because this PR's schema change is different now: @jdoe. Changed since the approval: `schema/testapp/orders.sql`. This PR targets `release-1.2`, not `main`, so changes that reach `release-1.2` count as a change too. Ask for an approval of the latest commit.
+@jdoe approved an earlier commit, but this PR's change to `schema/testapp/orders.sql` is different now. This PR targets `release-1.2`, not `main`, so changes that reach `release-1.2` also count as changes to this PR. That approval no longer counts, so the latest commit needs a new approval.
 
 **Operators of `testapp`**:
 - @acme/testapp-operators
@@ -4443,7 +4439,7 @@ Approvals on an earlier commit no longer count because this PR's schema change i
 - @jdoe
 
 ### Next steps
-1. Request a review from anyone listed above
+1. Ask @jdoe or anyone listed above to approve the latest commit
 2. Once approved, run `schemabot apply -e staging` again
 
 </details>
@@ -4458,9 +4454,7 @@ Approvals on an earlier commit no longer count because this PR's schema change i
 
 *Requested by @jackjackbits at 2026-01-01 00:00:00 UTC*
 
-Schema changes require approval from an authorized reviewer before applying.
-
-Approvals on an earlier commit no longer count because this PR's schema change is different now: @jdoe. Compared with some earlier approvals, file contents are unchanged, but their merge-base versions differ: `schema/testapp/orders.sql`. Ask for an approval of the latest commit.
+@jdoe approved an earlier commit. `schema/testapp/orders.sql` has not changed since then, but the base branch it builds on has, so applying it now would run different DDL. That approval no longer counts, so the latest commit needs a new approval.
 
 **Operators of `testapp`**:
 - @acme/testapp-operators
@@ -4470,7 +4464,7 @@ Approvals on an earlier commit no longer count because this PR's schema change i
 - @jdoe
 
 ### Next steps
-1. Request a review from anyone listed above
+1. Ask @jdoe or anyone listed above to approve the latest commit
 2. Once approved, run `schemabot apply -e staging` again
 
 </details>
@@ -4502,7 +4496,7 @@ Approvals on an earlier commit no longer count because this PR's schema change i
 
 *Requested by @jackjackbits at 2026-01-01 00:00:00 UTC*
 
-**This apply needs an approval of the latest commit.** @jdoe approved an earlier commit. An earlier approval normally still counts when the PR's schema change has not changed since, but SchemaBot hit an error checking that for this PR, so that approval does not count. Operators can find the error in the server logs.
+**This apply needs an approval of the latest commit.** @jdoe approved an earlier commit. An earlier approval still counts when the PR's schema change is the same at the latest commit, but SchemaBot hit an error checking that, so that approval does not count. Operators can find the error in the server logs.
 
 **Operators of `testapp`**:
 - @acme/testapp-operators
@@ -4512,7 +4506,7 @@ Approvals on an earlier commit no longer count because this PR's schema change i
 - @jdoe
 
 ### Next steps
-1. Ask anyone listed above to approve the latest commit
+1. Ask @jdoe or anyone listed above to approve the latest commit
 2. Once approved, run `schemabot apply -e staging` again
 
 </details>

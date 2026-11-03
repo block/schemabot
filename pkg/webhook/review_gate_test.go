@@ -2335,7 +2335,7 @@ func TestEnforceReviewGate(t *testing.T) {
 		case body := <-comments:
 			assert.Contains(t, body, "Review Gate Error")
 			assert.Contains(t, body, "**This apply needs an approval of the latest commit.** @bob approved an earlier commit.")
-			assert.Contains(t, body, "1. Ask anyone listed above to approve the latest commit\n2. Once approved, run `schemabot apply -e staging` again\n")
+			assert.Contains(t, body, "1. Ask @bob or anyone listed above to approve the latest commit\n2. Once approved, run `schemabot apply -e staging` again\n")
 			assert.Contains(t, body, "- @bob\n")
 			assert.NotContains(t, body, "Review Required")
 			assert.NotContains(t, body, reviewGateApproved, "raw comparison errors must never render in PR markdown")
@@ -2406,13 +2406,13 @@ func TestEnforceReviewGate(t *testing.T) {
 			name:        "approval on an earlier commit is named in the review-required comment",
 			headBase:    reviewGateOldBase,
 			headColumns: "`memo` text",
-			wantDetail:  "Changed since the approval: `schema/testdb/orders.sql`.",
+			wantDetail:  "@bob approved an earlier commit, but this PR's change to `schema/testdb/orders.sql` is different now. ",
 		},
 		{
 			name:        "identical files on different bases name the base difference",
 			headBase:    reviewGateBaseTip,
 			headColumns: "`note` text",
-			wantDetail:  "Compared with some earlier approvals, file contents are unchanged, but their merge-base versions differ: `schema/testdb/orders.sql`.",
+			wantDetail:  "@bob approved an earlier commit. `schema/testdb/orders.sql` has not changed since then, but the base branch it builds on has, so applying it now would run different DDL. ",
 		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
@@ -2444,11 +2444,7 @@ func TestEnforceReviewGate(t *testing.T) {
 			select {
 			case body := <-comments:
 				assert.Contains(t, body, "Review Required")
-				assert.Contains(t, body, "Approvals on an earlier commit no longer count because this PR's schema change is different now: @bob. "+
-					tt.wantDetail)
-				if tt.headBase == reviewGateBaseTip {
-					assert.NotContains(t, body, "Changed since the approval:")
-				}
+				assert.Contains(t, body, tt.wantDetail+"That approval no longer counts, so the latest commit needs a new approval.\n")
 				assert.NotContains(t, body, "<details>", "a database type with no offline diff names the file without its DDL")
 			case <-time.After(2 * time.Second):
 				require.Fail(t, "timed out waiting for review-required comment")
@@ -2489,7 +2485,7 @@ func TestEnforceReviewGate(t *testing.T) {
 
 		select {
 		case body := <-comments:
-			assert.Contains(t, body, "Changed since the approval: `schema/testdb/orders.sql`.")
+			assert.Contains(t, body, "@bob approved an earlier commit, but this PR's change to `schema/testdb/orders.sql` is different now. ")
 			assert.Contains(t, body, "<details>\n<summary>How <code>schema/testdb/orders.sql</code> changed since the approval</summary>\n\n"+
 				"Approved at `"+reviewGateApproved+"`:\n\n"+
 				"```sql\nALTER TABLE `orders` MODIFY COLUMN `label` binary(32) NULL DEFAULT NULL COMMENT 'NULL until printed';\n```\n\n"+

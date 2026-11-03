@@ -50,10 +50,12 @@ func TestRenderReviewRequired_ChangedApprovers(t *testing.T) {
 		ChangedApprovers:  []string{"bob", "carol"},
 	})
 
-	assert.Contains(t, result, "\nApprovals on an earlier commit no longer count because this PR's schema change is different now: @bob, @carol. Ask for an approval of the latest commit.\n")
+	assert.Contains(t, result, "\n@bob and @carol approved earlier commits, but this PR's schema change is different now. Those approvals no longer count, so the latest commit needs a new approval.\n")
+	assert.Contains(t, result, "\n1. Ask @bob, @carol or anyone listed above to approve the latest commit\n",
+		"the reviewers who already know the change lead the next step")
+	assert.NotContains(t, result, "Schema changes require approval", "the explanation replaces the generic line")
 	assert.NotContains(t, result, "This PR targets", "a PR whose base branch is unknown is not told it targets another branch")
-	assert.NotContains(t, result, "Changed since the approval", "no file is named when the gate reports none")
-	assert.Less(t, strings.Index(result, "Approvals on an earlier commit"), strings.Index(result, "**Operators of `payments`**"),
+	assert.Less(t, strings.Index(result, "approved earlier commits"), strings.Index(result, "**Operators of `payments`**"),
 		"the explanation precedes the reviewer lists")
 }
 
@@ -70,17 +72,26 @@ func TestRenderReviewRequired_ChangedPaths(t *testing.T) {
 		ChangedPaths:     []string{"schema/payments/overrides.sql", "schema/payments/votes.sql"},
 	}
 
-	assert.Contains(t, RenderReviewRequired(data), "\nApprovals on an earlier commit no longer count because this PR's schema change is different now: @bob. "+
-		"Changed since the approval: `schema/payments/overrides.sql`, `schema/payments/votes.sql`. Ask for an approval of the latest commit.\n")
+	assert.Contains(t, RenderReviewRequired(data), "\n@bob approved an earlier commit, but this PR's changes to `schema/payments/overrides.sql` and `schema/payments/votes.sql` are different now. "+
+		"That approval no longer counts, so the latest commit needs a new approval.\n")
+
+	data.ChangedPaths = []string{"schema/payments/votes.sql"}
+	assert.Contains(t, RenderReviewRequired(data), "\n@bob approved an earlier commit, but this PR's change to `schema/payments/votes.sql` is different now. ")
+
+	data.ChangedPaths = nil
+	data.ChangedBasePaths = []string{"schema/payments/overrides.sql", "schema/payments/votes.sql"}
+	assert.Contains(t, RenderReviewRequired(data), "\n@bob approved an earlier commit. `schema/payments/overrides.sql` and `schema/payments/votes.sql` have not changed since then, "+
+		"but the base branch they build on has, so applying them now would run different DDL. That approval no longer counts, so the latest commit needs a new approval.\n")
+	data.ChangedPaths = []string{"schema/payments/overrides.sql", "schema/payments/votes.sql"}
 
 	// Reviewers can approve different commits, so the same file can have
 	// changed contents for one approval and only a changed base for another.
 	data.OtherReviewers = []string{"bob", "carol"}
 	data.ChangedApprovers = []string{"bob", "carol"}
 	data.ChangedBasePaths = []string{"schema/payments/overrides.sql"}
-	assert.Contains(t, RenderReviewRequired(data), "\nApprovals on an earlier commit no longer count because this PR's schema change is different now: @bob, @carol. "+
-		"Changed since the approval: `schema/payments/overrides.sql`, `schema/payments/votes.sql`. "+
-		"Compared with some earlier approvals, file contents are unchanged, but their merge-base versions differ: `schema/payments/overrides.sql`. Ask for an approval of the latest commit.\n")
+	assert.Contains(t, RenderReviewRequired(data), "\n@bob and @carol approved earlier commits, but this PR's changes to `schema/payments/overrides.sql` and `schema/payments/votes.sql` are different now. "+
+		"`schema/payments/overrides.sql` has not changed since then, but the base branch it builds on has, so applying it now would run different DDL. "+
+		"Those approvals no longer count, so the latest commit needs a new approval.\n")
 }
 
 // A PR targeting a branch other than the default has approvals carried only
@@ -99,7 +110,7 @@ func TestRenderReviewRequired_ChangedApproversOnOtherBranch(t *testing.T) {
 	}
 
 	result := RenderReviewRequired(data)
-	assert.Contains(t, result, "\nApprovals on an earlier commit no longer count because this PR's schema change is different now: @bob. This PR targets `release-1.2`, not `main`, so changes that reach `release-1.2` count as a change too. Ask for an approval of the latest commit.\n")
+	assert.Contains(t, result, "\n@bob approved an earlier commit, but this PR's schema change is different now. This PR targets `release-1.2`, not `main`, so changes that reach `release-1.2` also count as changes to this PR. That approval no longer counts, so the latest commit needs a new approval.\n")
 
 	data.BaseRef = "main"
 	assert.NotContains(t, RenderReviewRequired(data), "This PR targets", "a PR targeting the default branch gets no branch sentence")
@@ -122,9 +133,18 @@ func TestRenderReviewGateError_UncomparedApprovers(t *testing.T) {
 	})
 
 	assert.True(t, strings.HasPrefix(result, "## ❌ Review Gate Error\n\n**Database**: `payments` | **Environment**: `staging`\n"))
-	assert.Contains(t, result, "\n**This apply needs an approval of the latest commit.** @bob approved an earlier commit. An earlier approval normally still counts when the PR's schema change has not changed since, but SchemaBot hit an error checking that for this PR, so that approval does not count. Operators can find the error in the server logs.\n")
-	assert.Contains(t, result, "\nApprovals on an earlier commit no longer count because this PR's schema change is different now: @dave.")
-	assert.True(t, strings.HasSuffix(result, "**Operators of `payments`**:\n- @org/payments-operators\n\n**Other authorized reviewers**:\n- @carol\n\n### Next steps\n1. Ask anyone listed above to approve the latest commit\n2. Once approved, run `schemabot apply -e staging` again\n"), result)
+	assert.Contains(t, result, "\n**This apply needs an approval of the latest commit.** @bob approved an earlier commit. An earlier approval still counts when the PR's schema change is the same at the latest commit, but SchemaBot hit an error checking that, so that approval does not count. Operators can find the error in the server logs.\n")
+	assert.Contains(t, result, "\n@dave approved an earlier commit, but this PR's schema change is different now. That approval no longer counts, so the latest commit needs a new approval.\n")
+	assert.True(t, strings.HasSuffix(result, "**Operators of `payments`**:\n- @org/payments-operators\n\n**Other authorized reviewers**:\n- @carol\n\n### Next steps\n1. Ask @bob, @dave or anyone listed above to approve the latest commit\n2. Once approved, run `schemabot apply -e staging` again\n"), result)
+
+	result = RenderReviewGateError(ReviewGateData{
+		Database:            "payments",
+		Environment:         "staging",
+		UncomparedApprovers: []string{"bob", "erin"},
+	})
+	assert.Contains(t, result, "@bob and @erin approved earlier commits. ")
+	assert.Contains(t, result, ", so those approvals do not count. ")
+	assert.Contains(t, result, "\n1. Ask @bob, @erin or another authorized reviewer to approve the latest commit\n")
 }
 
 // A database with no operator principals falls back to a single flat list —

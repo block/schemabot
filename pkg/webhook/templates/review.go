@@ -3,6 +3,7 @@ package templates
 import (
 	"fmt"
 	"html"
+	"slices"
 	"strings"
 
 	"github.com/block/schemabot/pkg/ddl"
@@ -68,7 +69,9 @@ func RenderReviewRequired(data ReviewGateData) string {
 		writeDBEnvLine(&sb, data.Database, data.Environment)
 		writeRequesterOrTimestamp(&sb, data.RequestedBy)
 
-		sb.WriteString("\nSchema changes require approval from an authorized reviewer before applying.\n")
+		if len(data.ChangedApprovers) == 0 {
+			sb.WriteString("\nSchema changes require approval from an authorized reviewer before applying.\n")
+		}
 		writeChangedApprovers(&sb, data)
 		writeChangedStatements(&sb, data.ChangedStatements, budget)
 		writeReviewersAndNextSteps(&sb, data)
@@ -90,8 +93,7 @@ func RenderReviewGateError(data ReviewGateData) string {
 		writeDBEnvLine(&sb, data.Database, data.Environment)
 		writeRequesterOrTimestamp(&sb, data.RequestedBy)
 
-		fmt.Fprintf(&sb, "\n**This apply needs an approval of the latest commit.** %s approved an earlier commit. An earlier approval normally still counts when the PR's schema change has not changed since, but SchemaBot hit an error checking that for this PR, so that approval does not count. Operators can find the error in the server logs.\n",
-			mentionList(data.UncomparedApprovers))
+		writeUncomparedApprovers(&sb, data.UncomparedApprovers)
 		writeChangedApprovers(&sb, data)
 		writeChangedStatements(&sb, data.ChangedStatements, budget)
 		writeReviewersAndNextSteps(&sb, data)
@@ -100,27 +102,69 @@ func RenderReviewGateError(data ReviewGateData) string {
 	})
 }
 
-// writeChangedApprovers says which approvals no longer count. A PR that
-// targets a branch other than the default also learns that changes reaching
-// its base branch count as a change, since only default branch content is
-// trusted to have had its own review.
+// writeUncomparedApprovers says who approved an earlier commit the gate could
+// not compare with the head, and why that approval does not count.
+func writeUncomparedApprovers(sb *strings.Builder, approvers []string) {
+	commits, approvals := "an earlier commit", "that approval does"
+	if len(approvers) > 1 {
+		commits, approvals = "earlier commits", "those approvals do"
+	}
+	fmt.Fprintf(sb, "\n**This apply needs an approval of the latest commit.** %s approved %s. An earlier approval still counts when the PR's schema change is the same at the latest commit, but SchemaBot hit an error checking that, so %s not count. Operators can find the error in the server logs.\n",
+		joinWithAnd(mentions(approvers)), commits, approvals)
+}
+
+// writeChangedApprovers says who approved an earlier commit, what changed
+// since, and that those approvals no longer count. A PR that targets a branch
+// other than the default also learns that changes reaching its base branch
+// count as a change, since only default branch content is trusted to have had
+// its own review.
 func writeChangedApprovers(sb *strings.Builder, data ReviewGateData) {
 	if len(data.ChangedApprovers) == 0 {
 		return
 	}
-	fmt.Fprintf(sb, "\nApprovals on an earlier commit no longer count because this PR's schema change is different now: %s.",
-		mentionList(data.ChangedApprovers))
-	if len(data.ChangedPaths) > 0 {
-		fmt.Fprintf(sb, " Changed since the approval: %s.", strings.Join(inlineCodeList(data.ChangedPaths), ", "))
+	plural := len(data.ChangedApprovers) > 1
+	commits, approvals, count := "an earlier commit", "That approval", "counts"
+	if plural {
+		commits, approvals, count = "earlier commits", "Those approvals", "count"
+	}
+	who := joinWithAnd(mentions(data.ChangedApprovers))
+
+	fmt.Fprintf(sb, "\n%s approved %s", who, commits)
+	switch {
+	case len(data.ChangedPaths) > 0:
+		fmt.Fprintf(sb, ", but %s.", changedPathsClause(data.ChangedPaths))
+	case len(data.ChangedBasePaths) == 0:
+		sb.WriteString(", but this PR's schema change is different now.")
+	default:
+		sb.WriteString(".")
 	}
 	if len(data.ChangedBasePaths) > 0 {
-		fmt.Fprintf(sb, " Compared with some earlier approvals, file contents are unchanged, but their merge-base versions differ: %s.", strings.Join(inlineCodeList(data.ChangedBasePaths), ", "))
+		fmt.Fprintf(sb, " %s", changedBaseClause(data.ChangedBasePaths))
 	}
 	if targetsOtherThanDefaultBranch(data) {
-		fmt.Fprintf(sb, " This PR targets `%s`, not `%s`, so changes that reach `%s` count as a change too.",
+		fmt.Fprintf(sb, " This PR targets `%s`, not `%s`, so changes that reach `%s` also count as changes to this PR.",
 			data.BaseRef, data.DefaultBranch, data.BaseRef)
 	}
-	sb.WriteString(" Ask for an approval of the latest commit.\n")
+	fmt.Fprintf(sb, " %s no longer %s, so the latest commit needs a new approval.\n", approvals, count)
+}
+
+// changedPathsClause says the PR changes paths differently than it did when
+// it was approved.
+func changedPathsClause(paths []string) string {
+	if len(paths) == 1 {
+		return "this PR's change to " + inlineCodeList(paths)[0] + " is different now"
+	}
+	return "this PR's changes to " + joinWithAnd(inlineCodeList(paths)) + " are different now"
+}
+
+// changedBaseClause says paths are unchanged since the approval but now build
+// on a different version of the base branch, so they run different DDL.
+func changedBaseClause(paths []string) string {
+	names := joinWithAnd(inlineCodeList(paths))
+	if len(paths) == 1 {
+		return names + " has not changed since then, but the base branch it builds on has, so applying it now would run different DDL."
+	}
+	return names + " have not changed since then, but the base branch they build on has, so applying them now would run different DDL."
 }
 
 // changedStatementBlocks counts the DDL blocks writeChangedStatements takes
@@ -193,11 +237,14 @@ func writeReviewersAndNextSteps(sb *strings.Builder, data ReviewGateData) {
 	}
 
 	sb.WriteString("\n### Next steps\n")
+	earlierApprovers := slices.Concat(data.UncomparedApprovers, data.ChangedApprovers)
 	switch {
-	case len(data.UncomparedApprovers) > 0 && (hasOperators || hasOthers):
-		sb.WriteString("1. Ask anyone listed above to approve the latest commit\n")
-	case len(data.UncomparedApprovers) > 0:
-		sb.WriteString("1. Ask a database operator or admin to approve the latest commit\n")
+	case len(earlierApprovers) > 0 && (hasOperators || hasOthers):
+		// Whoever approved an earlier commit already knows the change, so
+		// they lead.
+		fmt.Fprintf(sb, "1. Ask %s to approve the latest commit\n", joinWithOr(append(mentions(earlierApprovers), "anyone listed above")))
+	case len(earlierApprovers) > 0:
+		fmt.Fprintf(sb, "1. Ask %s to approve the latest commit\n", joinWithOr(append(mentions(earlierApprovers), "another authorized reviewer")))
 	case hasOperators || hasOthers:
 		sb.WriteString("1. Request a review from anyone listed above\n")
 	default:
@@ -217,9 +264,22 @@ func writeMentionList(sb *strings.Builder, logins []string) {
 
 // mentionList renders logins as comma-separated @-mentions.
 func mentionList(logins []string) string {
-	mentions := make([]string, 0, len(logins))
+	return strings.Join(mentions(logins), ", ")
+}
+
+// mentions renders each login as an @-mention.
+func mentions(logins []string) []string {
+	out := make([]string, 0, len(logins))
 	for _, login := range logins {
-		mentions = append(mentions, "@"+login)
+		out = append(out, "@"+login)
 	}
-	return strings.Join(mentions, ", ")
+	return out
+}
+
+// joinWithOr joins items as prose: "a", "a or b", "a, b or c".
+func joinWithOr(items []string) string {
+	if len(items) <= 1 {
+		return strings.Join(items, "")
+	}
+	return strings.Join(items[:len(items)-1], ", ") + " or " + items[len(items)-1]
 }
