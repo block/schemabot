@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/block/schemabot/pkg/api"
@@ -104,10 +105,14 @@ type memberWork struct {
 	// against, the first in rollout order, whether or not it has work. Empty
 	// when no rollup was run.
 	primary string
-	// copyAtStake names a member other than the primary whose apply would
-	// discard an unfinished copy, or could not say whether it would, and why.
-	// Zero when no member with work puts a copy at stake.
-	copyAtStake memberRefusal
+	// copiesAtStake names, in rollout order, the members other than the
+	// primary whose apply would discard an unfinished copy, or could not say
+	// whether it would, and why. Empty when no member with work puts a copy at
+	// stake.
+	copiesAtStake []memberRefusal
+	// displayNames maps each member's MemberID to the name an operator
+	// addresses it by.
+	displayNames map[string]string
 	// others counts the members with work other than the primary target,
 	// whose work runs from plans of their own rather than the primary plan.
 	others int
@@ -126,12 +131,14 @@ func memberWorkOf(rollup *api.PlanRollup) memberWork {
 	// Names are rendered over the whole rollout so a target is qualified exactly
 	// where the rest of the comment qualifies it.
 	names := rollupMemberNames(*rollup)
-	work := memberWork{members: len(rollup.Entries)}
+	work := memberWork{members: len(rollup.Entries), displayNames: make(map[string]string, len(names))}
 	if len(names) > 0 {
 		work.primary = names[0]
 	}
 	for i, entry := range rollup.Entries {
-		if withWork[routing.ExecutionTarget{Deployment: entry.Deployment, Target: entry.Target}.MemberID()] {
+		memberID := routing.ExecutionTarget{Deployment: entry.Deployment, Target: entry.Target}.MemberID()
+		work.displayNames[memberID] = names[i]
+		if withWork[memberID] {
 			work.names = append(work.names, names[i])
 			if i > 0 {
 				work.others++
@@ -139,10 +146,42 @@ func memberWorkOf(rollup *api.PlanRollup) memberWork {
 		}
 	}
 	work.pending = len(work.names)
-	if at, reason := rollup.MemberCopyAtStake(); at >= 0 {
-		work.copyAtStake = memberRefusal{target: names[at], reason: reason}
+	for _, atStake := range rollup.MembersCopyAtStake() {
+		entry := rollup.Entries[atStake.Index]
+		work.copiesAtStake = append(work.copiesAtStake, memberRefusal{
+			member: routing.ExecutionTarget{Deployment: entry.Deployment, Target: entry.Target}.MemberID(),
+			target: names[atStake.Index],
+			reason: atStake.Reason,
+		})
 	}
 	return work
+}
+
+// withoutTargets is the work left once the named targets are held back from
+// an apply, so the apply's row names only the targets it runs on.
+func (w memberWork) withoutTargets(held []string) memberWork {
+	if len(held) == 0 {
+		return w
+	}
+	kept := make([]string, 0, len(w.names))
+	for _, name := range w.names {
+		if !slices.Contains(held, name) {
+			kept = append(kept, name)
+		}
+	}
+	w.others -= len(w.names) - len(kept)
+	w.names = kept
+	w.pending = len(kept)
+	return w
+}
+
+// displayName names a member the way an operator addresses it, or by its
+// MemberID when the rollup did not name it.
+func (w memberWork) displayName(memberID string) string {
+	if name, ok := w.displayNames[memberID]; ok {
+		return name
+	}
+	return memberID
 }
 
 // maxNamedPendingTargets bounds how many targets a check's Change column names
@@ -795,6 +834,32 @@ func completedNarrowedApply(a *storage.Apply, check *storage.Check) bool {
 	return !checkBlockedByRemovedSchemaAfterApply(check)
 }
 
+// completedApplyHoldingTargets reports whether a forward apply of the whole
+// rollout that held targets back completed. It changed every target but those,
+// so its success cannot pass the environment's check (MG-12). A check already
+// blocked because the PR removed the schema change keeps that reason, which
+// names the reconciliation the operator owes.
+func completedApplyHoldingTargets(a *storage.Apply, check *storage.Check) bool {
+	if !state.IsState(a.State, state.Apply.Completed) || a.IsRollback() {
+		return false
+	}
+	if len(storage.ParseApplyOptions(a.Options).HeldBack) == 0 {
+		return false
+	}
+	return !checkBlockedByRemovedSchemaAfterApply(check)
+}
+
+// heldTargetsCompletedSummary is the stored Change column once an apply that
+// held targets back completes, naming the targets still waiting.
+func (h *Handler) heldTargetsCompletedSummary(apply *storage.Apply) string {
+	held := storage.ParseApplyOptions(apply.Options).HeldBack
+	names := make([]string, 0, len(held))
+	for _, member := range held {
+		names = append(names, h.narrowedTargetName(member, apply.Database, apply.Environment))
+	}
+	return clampDriftSummary(fmt.Sprintf("held back `%s`; apply the environment again to finish", strings.Join(names, "`, `")))
+}
+
 // completedForwardTaskBeforeCancellation returns durable evidence that the
 // cancelled apply or an earlier forward apply changed the same target. Apply
 // rows cannot provide this proof because an apply may be cancelled or failed
@@ -974,6 +1039,22 @@ func (h *Handler) updateCheckRecordForApplyResult(ctx context.Context, repo stri
 			return false, fmt.Errorf("mark stored check state action_required after apply narrowed to one target repo %s pr %d environment %s database_type %s database %s: %w",
 				repo, pr, apply.Environment, apply.DatabaseType, apply.Database, err)
 		}
+	case completedApplyHoldingTargets(apply, check):
+		check.Status = checkStatusCompleted
+		check.Conclusion = checkConclusionActionRequired
+		check.HasChanges = true
+		check.BlockingReason = heldTargetsBlock.blockingReason
+		check.ErrorMessage = heldTargetsBlock.message
+		check.ChangeSummary = h.heldTargetsCompletedSummary(apply)
+		// MarkActionRequiredForApply releases check ownership, so the plan or
+		// apply of the whole environment that lifts this block can write its
+		// result.
+		updated, err = h.service.Storage().Checks().MarkActionRequiredForApply(ctx, check, apply)
+		if err != nil {
+			recordOutcome("error")
+			return false, fmt.Errorf("mark stored check state action_required after apply that held targets back repo %s pr %d environment %s database_type %s database %s: %w",
+				repo, pr, apply.Environment, apply.DatabaseType, apply.Database, err)
+		}
 	default:
 		var conclusion string
 		switch {
@@ -1015,6 +1096,8 @@ func (h *Handler) updateCheckRecordForApplyResult(ctx context.Context, repo stri
 			msg = "skipping cancelled apply action_required update because a newer apply supersedes the cancellation"
 		case completedNarrowedApply(apply, check):
 			msg = "skipping narrowed apply action_required update because a newer apply supersedes it"
+		case completedApplyHoldingTargets(apply, check):
+			msg = "skipping held-targets apply action_required update because a newer apply supersedes it"
 		}
 		h.logger.Warn(msg,
 			"repo", repo, "pr", pr, "database", apply.Database,

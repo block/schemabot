@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"maps"
 	"slices"
+	"strings"
 
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/apitypes"
@@ -128,58 +129,117 @@ func (h *Handler) recordPendingRollout(ctx context.Context, client *ghclient.Ins
 	return nil
 }
 
-// memberWorkRefusal returns why the other targets' work in a rollout cannot run
-// from a PR apply, or "" when it can. planID names the round's primary plan,
-// and primaryTargetConverged says whether that plan is empty.
+// heldMembers returns the other targets a PR apply holds back, because their
+// own plans cannot run from it, each with why. planID names the round's primary
+// plan, and primaryTargetConverged says whether that plan is empty. The apply
+// runs every other target: one target that cannot run never stops the rest.
 //
 // The apply runs each member's stored plan, and the comment behind the apply
 // renders those plans' statements with each target's direct and unsafe changes
-// under it. So work the apply cannot run as planned, and
-// anything whose consent rests on a disclosure that comment does not carry,
-// refuses here: an unfinished copy the apply would discard. A direct-execution
-// or unsafe change is not refused: the comment discloses it under the target
-// that runs it, and an unsafe one needs --allow-unsafe as the primary plan's
-// own does. It is asked before the apply takes its lock, so a refusal never
-// pins a confirmation that could not succeed, and again against the re-plan the
-// apply runs from.
+// under it. So a target is held back when the apply cannot run its work as
+// planned, or when that work's consent rests on a disclosure the comment does
+// not carry: an unfinished copy the apply would discard. A direct-execution or
+// unsafe change does not hold a target back: the comment discloses it under
+// the target that runs it, and an unsafe one needs --allow-unsafe as the
+// primary plan's own does. It is asked before the apply takes its lock, so the
+// comment names what the apply will hold back, and again against the re-plan
+// the apply runs from, which is the answer the apply is created with.
 //
-// A copy at stake refuses whether or not the primary target has work, since
-// the comment discloses only the primary plan's discarded copies. The rest is
-// what apply creation asks of each member, which depends on the primary plan:
-// an empty one can carry only per-member table work
+// A copy at stake holds its target back whether or not the primary target has
+// work, since the comment discloses only the primary plan's discarded copies,
+// and a held target's copy is left where it is (RV-3). The rest is what apply
+// creation asks of each member, which depends on the primary plan: an empty
+// one can carry only per-member table work
 // (api.MemberWorkAConvergedPrimaryPlanCannotRun), and one with work holds each
-// member to its shape (api.MemberWorkThePrimaryPlanCannotRun). Neither refuses
-// a blocked change any less.
-func (h *Handler) memberWorkRefusal(ctx context.Context, planID, environment string, rollout reviewDriftOutcome, primaryTargetConverged bool) (memberRefusal, error) {
-	if rollout.work.copyAtStake.refuses() {
-		return rollout.work.copyAtStake, nil
+// member to its shape (api.MemberWorkThePrimaryPlanCannotRun). Neither runs a
+// blocked change.
+func (h *Handler) heldMembers(ctx context.Context, planID, environment string, rollout reviewDriftOutcome, primaryTargetConverged bool) (rolloutHold, error) {
+	hold := rolloutHold{runsNothing: primaryTargetConverged, othersWithWork: rollout.work.others}
+	held := map[string]bool{}
+	for _, atStake := range rollout.work.copiesAtStake {
+		hold.held = append(hold.held, atStake)
+		held[atStake.member] = true
+	}
+	if len(hold.held) >= hold.othersWithWork {
+		h.logger.Debug("every other target with work puts a copy at stake; the round's plans are not read",
+			"plan_id", planID, "environment", environment, "held_targets", hold.names())
+		return hold, nil
 	}
 	plan, members, err := h.reviewRoundPlans(ctx, planID, environment)
 	if err != nil {
-		return memberRefusal{}, err
+		return rolloutHold{}, err
 	}
 	for _, member := range slices.Sorted(maps.Keys(members)) {
 		memberPlan := members[member]
-		if !memberPlan.HasWork() {
+		if held[member] || !memberPlan.HasWork() {
 			continue
 		}
 		if reason := memberWorkPrimaryPlanCannotRun(plan, memberPlan, primaryTargetConverged); reason != "" {
-			return memberRefusal{target: member, reason: "its plan " + reason}, nil
+			hold.held = append(hold.held, memberRefusal{member: member, target: rollout.work.displayName(member), reason: "its plan " + reason})
 		}
 	}
-	return memberRefusal{}, nil
+	return hold, nil
+}
+
+// rolloutHold is what a PR apply of the whole rollout holds back: the targets
+// whose own plans cannot run from it.
+type rolloutHold struct {
+	held []memberRefusal
+	// runsNothing is set when the primary target is already at the desired
+	// schema, so the apply runs only the other targets' work.
+	runsNothing bool
+	// othersWithWork counts the targets other than the primary with work.
+	othersWithWork int
+}
+
+// holds reports whether the apply holds any target back.
+func (h rolloutHold) holds() bool { return len(h.held) > 0 }
+
+// leavesNothingToRun reports whether holding back the targets that cannot run
+// leaves the apply with nothing to run: the primary target is already at the
+// desired schema and every other target with work is held back. Only then is
+// the apply refused; any target that can run, runs.
+func (h rolloutHold) leavesNothingToRun() bool {
+	return h.runsNothing && h.holds() && len(h.held) >= h.othersWithWork
+}
+
+// memberIDs returns the held targets' MemberIDs, for the apply request.
+func (h rolloutHold) memberIDs() []string {
+	ids := make([]string, 0, len(h.held))
+	for _, held := range h.held {
+		ids = append(ids, held.member)
+	}
+	return ids
+}
+
+// names returns the held targets' names, for logs.
+func (h rolloutHold) names() []string {
+	names := make([]string, 0, len(h.held))
+	for _, held := range h.held {
+		names = append(names, held.target)
+	}
+	return names
+}
+
+// templateTargets returns the held targets for a comment.
+func (h rolloutHold) templateTargets() []templates.HeldTarget {
+	targets := make([]templates.HeldTarget, 0, len(h.held))
+	for _, held := range h.held {
+		targets = append(targets, templates.HeldTarget{Target: held.target, Reason: held.reason})
+	}
+	return targets
 }
 
 // memberRefusal says which target's plan a PR apply cannot run, and why. The
 // target is kept apart from the reason so a plan comment can render the name
 // as code while escaping the reason, which can carry engine-influenced text.
 type memberRefusal struct {
+	// member is the target's MemberID, which the apply request names.
+	member string
+	// target is the name an operator addresses the target by.
 	target string
 	reason string
 }
-
-// refuses reports whether a target's plan stops the apply.
-func (r memberRefusal) refuses() bool { return r.reason != "" }
 
 // String is the refusal as one clause, for command errors and logs.
 func (r memberRefusal) String() string {
@@ -272,26 +332,27 @@ func memberWorkPrimaryPlanCannotRun(primary, member *storage.Plan, primaryTarget
 	return api.MemberWorkThePrimaryPlanCannotRun(primary, member)
 }
 
-// annotateMemberApplyRefusal records on a plan comment why a PR apply cannot
-// run the other targets' plans it renders, whether or not the primary target
-// has work of its own. Such an apply is refused whatever its flags, so the
-// comment must not offer it. A refusal that cannot be computed leaves the apply
-// offered: the apply asks again before it takes its lock and refuses on the
-// same grounds, so the comment only ever misses a shortcut, never a gate.
-func (h *Handler) annotateMemberApplyRefusal(ctx context.Context, data *templates.PlanCommentData, planResp *apitypes.PlanResponse, environment string, rollout reviewDriftOutcome, repo string, pr int) {
+// annotateHeldTargets records on a plan comment which targets whose plans it
+// renders a PR apply would hold back, and why, whether or not the primary
+// target has work of its own. When holding them back leaves nothing to run,
+// the comment offers no apply. A hold that cannot be computed is left off: the
+// apply asks again before it takes its lock and holds back on the same
+// grounds, so the comment only ever misses a disclosure of what the apply
+// leaves out, never a gate.
+func (h *Handler) annotateHeldTargets(ctx context.Context, data *templates.PlanCommentData, planResp *apitypes.PlanResponse, environment string, rollout reviewDriftOutcome, repo string, pr int) {
 	if !rolloutRunsMemberWork(rollout, data.DeploymentDrift) {
-		h.logger.Debug("plan comment renders no other targets' plans a PR apply would run; no member-work refusal to disclose",
+		h.logger.Debug("plan comment renders no other targets' plans a PR apply would run; no held targets to disclose",
 			"repo", repo, "pr", pr, "database", planResp.Database, "environment", environment, "plan_id", planResp.PlanID)
 		return
 	}
-	refusal, err := h.memberWorkRefusal(ctx, planResp.PlanID, environment, rollout, !planResp.HasChanges())
+	hold, err := h.heldMembers(ctx, planResp.PlanID, environment, rollout, !planResp.HasChanges())
 	if err != nil {
-		h.logger.Warn("could not tell whether a PR apply can run the other targets' plans; the plan comment offers the apply, which re-checks before it takes its lock",
+		h.logger.Warn("could not tell which targets a PR apply would hold back; the plan comment offers the apply, which re-checks before it takes its lock",
 			"repo", repo, "pr", pr, "database", planResp.Database, "environment", environment, "plan_id", planResp.PlanID, "error", err)
 		return
 	}
-	data.MemberApplyRefusalTarget = refusal.target
-	data.MemberApplyRefusal = refusal.reason
+	data.HeldTargets = hold.templateTargets()
+	data.NoTargetCanApply = hold.leavesNothingToRun()
 }
 
 // blockUnsafeWithoutOptIn posts the unsafe-changes refusal and reports true
@@ -337,10 +398,15 @@ func narrowedTarget(planResp *apitypes.PlanResponse, target string) string {
 	return target
 }
 
-// memberWorkRefusalMessage tells the operator why the other targets' work was
-// not run. The refusal names only targets, tables, and namespaces.
-func memberWorkRefusalMessage(refusal memberRefusal) string {
-	return fmt.Sprintf("This PR cannot apply every target's plan: %s, so nothing was applied. An apply runs every target or none. The schema check keeps blocking merge until every target has the change.", refusal)
+// noTargetCanApplyMessage tells the operator why nothing was applied: the
+// primary target already has the change and every other target that needs it
+// was held back. The refusals name only targets, tables, and namespaces.
+func noTargetCanApplyMessage(hold rolloutHold) string {
+	clauses := make([]string, 0, len(hold.held))
+	for _, held := range hold.held {
+		clauses = append(clauses, held.String())
+	}
+	return fmt.Sprintf("No target that needs this change can apply yet: %s. Nothing was applied, and the schema check keeps blocking merge until every target has the change.", strings.Join(clauses, "; "))
 }
 
 // failClosedOnUnstoredRollout publishes a failing aggregate for an environment

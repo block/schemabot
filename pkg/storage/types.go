@@ -1635,6 +1635,13 @@ type ApplyOptions struct {
 	// can tell an apply that changed one member from one that changed them all.
 	NarrowedTo string `json:"narrowed_to,omitempty"`
 
+	// HeldBack lists the MemberIDs (deployment/target) of the rollout members
+	// a pull request apply of the whole rollout held back, because their own
+	// plans could not run from it, in rollout order. The apply has no
+	// operations for them, so it cannot show that the environment has the
+	// change. It is recorded at creation and never read from caller options.
+	HeldBack []string `json:"held_back,omitempty"`
+
 	// OperationKeysLeadWithTarget marks an apply whose operations are each
 	// keyed behind their own target (storage.TargetOperationKey): a data-plane
 	// apply that the targets of one deployment share, one operation each. It is

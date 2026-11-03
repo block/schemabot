@@ -683,42 +683,43 @@ func TestRenderMultiEnvPlanComment_OffersApplyForPendingTargets(t *testing.T) {
 	assert.NotContains(t, out, "schemabot apply -e staging")
 }
 
-// When a PR apply cannot run another target's plan, because that target's
-// engine refuses one of its changes, the comment says so in place of the apply
-// command: offering it would coach an apply that is refused whatever its flags.
-func TestRenderPlanComment_ConvergedPrimaryWithRefusedMemberWorkOffersNoApply(t *testing.T) {
+// When a PR apply holds back the only other target with work, because that
+// target's engine refuses one of its changes, and the primary target already
+// has the schema, the apply has nothing to run. The comment says so in place
+// of the apply command: offering it would coach an apply that runs nothing.
+func TestRenderPlanComment_ConvergedPrimaryWithEveryTargetHeldOffersNoApply(t *testing.T) {
 	data := convergedPrimaryPlanData()
-	data.MemberApplyRefusalTarget = "primary/testapp_2"
-	data.MemberApplyRefusal = `its plan carries changes its target's engine refuses`
+	data.HeldTargets = []HeldTarget{{Target: "primary/testapp_2", Reason: `its plan carries changes its target's engine refuses`}}
+	data.NoTargetCanApply = true
 
 	out := RenderPlanComment(data)
 	assert.Contains(t, out, "```sql\nALTER TABLE `users` ADD COLUMN `email` varchar(255)",
 		"the other targets' plans are still shown")
-	assert.Contains(t, out, "⚠️ **This PR cannot apply every target's plan**: target `primary/testapp_2`: its plan carries changes its target's engine refuses.")
+	assert.Contains(t, out, "⚠️ **No target that needs this change can apply yet**: target `primary/testapp_2`: its plan carries changes its target's engine refuses.")
 	assert.Contains(t, out, "The schema check keeps blocking merge until every target has the change.")
-	assert.NotContains(t, out, "schemabot apply", "an apply that is refused whatever its flags is never offered")
+	assert.NotContains(t, out, "schemabot apply", "an apply that runs nothing is never offered")
 }
 
-// A multi-environment plan offers no apply for an environment whose other
-// targets' work a PR apply cannot run, says why in that environment's section,
+// A multi-environment plan offers no apply for an environment where no target
+// that needs the change can apply, says why in that environment's section,
 // and does not call the PR done.
-func TestRenderMultiEnvPlanComment_RefusedMemberWorkOffersNoApply(t *testing.T) {
+func TestRenderMultiEnvPlanComment_EveryTargetHeldOffersNoApply(t *testing.T) {
 	converged := &PlanCommentData{Environment: "staging", IsMySQL: true}
 	refused := convergedPrimaryPlanData()
-	refused.MemberApplyRefusalTarget = "primary/testapp_2"
-	refused.MemberApplyRefusal = `its plan carries changes its target's engine refuses`
+	refused.HeldTargets = []HeldTarget{{Target: "primary/testapp_2", Reason: `its plan carries changes its target's engine refuses`}}
+	refused.NoTargetCanApply = true
 
 	out := RenderMultiEnvPlanComment(MultiEnvPlanCommentData{
 		Database: "testapp", DatabaseType: "mysql", IsMySQL: true,
 		Environments: []string{"staging", "production"},
 		Plans:        map[string]*PlanCommentData{"staging": converged, "production": &refused},
 	})
-	assert.Contains(t, out, "⚠️ **This PR cannot apply every target's plan**")
+	assert.Contains(t, out, "⚠️ **No target that needs this change can apply yet**")
 	assert.NotContains(t, out, "schemabot apply")
 	assert.NotContains(t, out, "No changes to apply", "a target still needs the change")
 }
 
-// An environment whose other targets' work a PR apply cannot run holds back
+// An environment where no target that needs the change can apply holds back
 // every environment after it: the promotion order refuses a later
 // environment's apply until the earlier one succeeds, so the comment offers
 // none and says what production waits on. An environment before the refused
@@ -733,8 +734,8 @@ func TestRenderMultiEnvPlanComment_RefusedEnvironmentHoldsBackLaterOnes(t *testi
 	refused := func(env string) *PlanCommentData {
 		data := convergedPrimaryPlanData()
 		data.Environment = env
-		data.MemberApplyRefusalTarget = "primary/testapp_2"
-		data.MemberApplyRefusal = `its plan carries changes its target's engine refuses`
+		data.HeldTargets = []HeldTarget{{Target: "primary/testapp_2", Reason: `its plan carries changes its target's engine refuses`}}
+		data.NoTargetCanApply = true
 		return &data
 	}
 	render := func(staging, production *PlanCommentData) string {
@@ -747,7 +748,7 @@ func TestRenderMultiEnvPlanComment_RefusedEnvironmentHoldsBackLaterOnes(t *testi
 
 	out := render(refused("staging"), withChanges("production"))
 	assert.NotContains(t, out, "schemabot apply", "production's apply would be refused until staging succeeds")
-	assert.Contains(t, out, "⚠️ **Production** applies only after staging, and this PR cannot apply staging's other targets' plans (see above).")
+	assert.Contains(t, out, "⚠️ **Production** applies only after staging, and no target of staging that needs this change can apply yet (see above).")
 
 	out = render(withChanges("staging"), refused("production"))
 	assert.Contains(t, out, "▶️ **To apply** these changes, comment:\n```\nschemabot apply -e staging\n```\n")
@@ -756,37 +757,51 @@ func TestRenderMultiEnvPlanComment_RefusedEnvironmentHoldsBackLaterOnes(t *testi
 }
 
 // The primary target has work of its own too, and another target's engine
-// refuses one of its plan's changes. The PR apply is refused whatever its
-// flags, so the comment says why in place of the apply command, without
-// claiming the primary target is already done.
-func TestRenderPlanComment_PrimaryTargetWithWorkAndRefusedMemberWorkOffersNoApply(t *testing.T) {
+// refuses one of its plan's changes. The PR apply holds that target back and
+// runs the primary, so the comment offers the apply and names the held target
+// and why just above it, without claiming the primary target is already done.
+func TestRenderPlanComment_PrimaryTargetWithWorkHoldsBackTheTargetThatCannotRun(t *testing.T) {
 	data := primaryTargetWithWorkPlanData()
-	data.MemberApplyRefusalTarget = "primary/testapp_2"
-	data.MemberApplyRefusal = `its plan carries changes its target's engine refuses`
+	data.HeldTargets = []HeldTarget{{Target: "primary/testapp_2", Reason: `its plan carries changes its target's engine refuses`}}
 
 	out := RenderPlanComment(data)
-	assert.Contains(t, out, "⚠️ **This PR cannot apply every target's plan**: target `primary/testapp_2`: its plan carries changes its target's engine refuses.")
-	assert.Contains(t, out, "The schema check keeps blocking merge until every target has the change.")
+	assert.Contains(t, out, "⚠️ **Holding back target `primary/testapp_2`**: its plan carries changes its target's engine refuses.\n\n"+
+		"The apply runs every other target. The schema check keeps blocking merge until every target has the change, so apply again once the held targets can run.\n\n"+
+		"▶️ **To apply**, comment:\n```\nschemabot apply -e production\n```\n")
 	assert.NotContains(t, out, "the primary target already has this schema", "the primary target still has work")
-	assert.NotContains(t, out, "schemabot apply", "an apply that is refused whatever its flags is never offered")
+	assert.NotContains(t, out, "every target or none")
 }
 
-// The same refusal in a multi-environment comment: the environment's section
-// says why, and the footer neither offers its apply nor calls the PR done.
-func TestRenderMultiEnvPlanComment_PrimaryTargetWithWorkAndRefusedMemberWorkOffersNoApply(t *testing.T) {
+// Several held targets are listed one per line, each with its reason.
+func TestRenderPlanComment_ListsEveryHeldTarget(t *testing.T) {
+	data := primaryTargetWithWorkPlanData()
+	data.HeldTargets = []HeldTarget{
+		{Target: "primary/testapp_2", Reason: `its plan carries changes its target's engine refuses`},
+		{Target: "primary/testapp_3", Reason: `applying its plan discards the unfinished copy of users in namespace "testapp"`},
+	}
+
+	out := RenderPlanComment(data)
+	assert.Contains(t, out, "⚠️ **Holding back 2 targets**:\n"+
+		"- `primary/testapp_2`: its plan carries changes its target's engine refuses\n"+
+		"- `primary/testapp_3`: applying its plan discards the unfinished copy of users in namespace \"testapp\"\n\n"+
+		"The apply runs every other target.")
+	assert.Contains(t, out, "schemabot apply -e production")
+}
+
+// The same hold in a multi-environment comment: the environment's section
+// names the held target, and the footer still offers the environment's apply.
+func TestRenderMultiEnvPlanComment_PrimaryTargetWithWorkHoldsBackTheTargetThatCannotRun(t *testing.T) {
 	converged := &PlanCommentData{Environment: "staging", IsMySQL: true}
-	refused := primaryTargetWithWorkPlanData()
-	refused.MemberApplyRefusalTarget = "primary/testapp_2"
-	refused.MemberApplyRefusal = `its plan carries changes its target's engine refuses`
+	held := primaryTargetWithWorkPlanData()
+	held.HeldTargets = []HeldTarget{{Target: "primary/testapp_2", Reason: `its plan carries changes its target's engine refuses`}}
 
 	out := RenderMultiEnvPlanComment(MultiEnvPlanCommentData{
 		Database: "testapp", DatabaseType: "mysql", IsMySQL: true,
 		Environments: []string{"staging", "production"},
-		Plans:        map[string]*PlanCommentData{"staging": converged, "production": &refused},
+		Plans:        map[string]*PlanCommentData{"staging": converged, "production": &held},
 	})
-	assert.Contains(t, out, "⚠️ **This PR cannot apply every target's plan**")
-	assert.NotContains(t, out, "schemabot apply")
-	assert.NotContains(t, out, "No changes to apply", "every target still needs the change")
+	assert.Contains(t, out, "⚠️ **Holding back target `primary/testapp_2`**: its plan carries changes its target's engine refuses.")
+	assert.Contains(t, out, "schemabot apply -e production")
 }
 
 // primaryTargetWithWorkPlanData is convergedPrimaryPlanData with the reviewed

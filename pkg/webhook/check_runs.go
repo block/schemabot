@@ -175,6 +175,15 @@ var narrowedApplyBlock = checkBlockReason{
 	message:        "Rolling out one target at a time. Apply the rest of the environment to finish.",
 }
 
+// heldTargetsBlock is used once a PR apply of the whole rollout that held
+// targets back completes. It changed every target but those, so it cannot
+// show that the environment has the change, and the check stays blocked until
+// a plan or apply of every target does (MG-12).
+var heldTargetsBlock = checkBlockReason{
+	blockingReason: checkstate.BlockHeldTargets,
+	message:        "The apply held back targets whose plans could not run. Apply the environment again once they can to finish.",
+}
+
 // planFailedUnrecordedBlock is carried by the failing aggregate posted for an
 // environment that could not plan while another environment of the same plan
 // did, when the failing check row recording that could not be stored either.
@@ -217,6 +226,7 @@ var allCheckBlockReasons = []checkBlockReason{
 	namespacePlacementRefusedBlock,
 	noAllowedConfiguredEnvironmentsBlock,
 	narrowedApplyBlock,
+	heldTargetsBlock,
 	planFailedUnrecordedBlock,
 	{blockingReason: participantUnresolvedBlockingReason},
 }

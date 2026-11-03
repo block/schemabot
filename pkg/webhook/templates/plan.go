@@ -260,17 +260,16 @@ type PlanCommentData struct {
 	// database (nothing to compare) or when drift was not evaluated.
 	DeploymentDrift *DeploymentDriftData
 
-	// MemberApplyRefusal says why a PR apply cannot run the plan of
-	// MemberApplyRefusalTarget, one of the targets' plans this comment
-	// renders, whether or not the primary target has work of its own, naming
-	// only tables and namespaces. Such an apply is
-	// refused whatever its flags, so the comment offers no apply command in its
-	// place. Empty when the apply can run them, or when the comment renders the
-	// primary plan alone.
-	MemberApplyRefusal string
-	// MemberApplyRefusalTarget names the target whose plan MemberApplyRefusal
-	// is about.
-	MemberApplyRefusalTarget string
+	// HeldTargets are the targets whose plans this comment renders that a PR
+	// apply holds back, because their own plans cannot run from it, naming
+	// only tables and namespaces. The apply runs every other target. Empty
+	// when the apply runs every target with work, or when the comment renders
+	// the primary plan alone.
+	HeldTargets []HeldTarget
+	// NoTargetCanApply is set when holding back HeldTargets leaves the apply
+	// nothing to run: the primary target is already at the desired schema.
+	// The comment then offers no apply command.
+	NoTargetCanApply bool
 
 	// summaryRollout is the rollout a summary of several targets' plans
 	// covers. The summary then says which targets the diff rolls out to, so a
@@ -695,6 +694,9 @@ func renderPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 	// Footer
 	sb.WriteString("\n---\n\n")
 
+	if !data.NoTargetCanApply {
+		writeHeldTargets(&sb, data.HeldTargets, false)
+	}
 	switch {
 	case data.IsLocked:
 		applyConfirmCmd := scopedApplyCommand("schemabot apply-confirm", data.Environment, data.ScopedDatabase, ApplyCommandOptions{
@@ -719,8 +721,8 @@ func renderPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 			// happy path; the operator can still unlock from the CLI if needed.
 			sb.WriteString("**Applying automatically**\n")
 		}
-	case data.MemberApplyRefusal != "":
-		writeMemberApplyRefusal(&sb, data.MemberApplyRefusalTarget, data.MemberApplyRefusal)
+	case data.NoTargetCanApply:
+		writeHeldTargets(&sb, data.HeldTargets, true)
 	case data.applyFailsOnRefusedChange():
 		writeRefusedChangeReplan(&sb, "this plan", appendTenantFlag(appendTargetFlag(appendDatabaseFlag(fmt.Sprintf("schemabot plan -e %s", data.Environment), data.ScopedDatabase), data.Target), data.Tenant))
 	default:
@@ -734,13 +736,48 @@ func renderPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 	return appendAgentHint(sb.String(), data.AgentHint)
 }
 
-// writeMemberApplyRefusal writes, in place of the apply instruction, why a PR
-// apply cannot run every target's plan the comment renders. Offering the
-// command there would coach an apply that is refused whatever its flags.
-func writeMemberApplyRefusal(sb *strings.Builder, target, reason string) {
-	reason = escapeInlineMarkdown(strings.Join(strings.Fields(reason), " "))
-	fmt.Fprintf(sb, glyph.Attention+" **This PR cannot apply every target's plan**: target %s: %s.\n\n", inlineCode(target), reason)
-	sb.WriteString("An apply runs every target or none, so nothing runs until that plan can. The schema check keeps blocking merge until every target has the change.\n")
+// HeldTarget is a target a PR apply holds back, and why.
+type HeldTarget struct {
+	Target string
+	Reason string
+}
+
+// writeHeldTargets writes which targets a PR apply holds back and why. When
+// holding them back leaves nothing to run, it stands in place of the apply
+// instruction, since offering the command would coach an apply that runs
+// nothing. Otherwise it leads into the instruction: the apply runs every other
+// target, and the held ones keep the check blocking until they have the change.
+func writeHeldTargets(sb *strings.Builder, held []HeldTarget, nothingRuns bool) {
+	if len(held) == 0 {
+		return
+	}
+	heading := fmt.Sprintf("Holding back target %s", inlineCode(held[0].Target))
+	if len(held) > 1 {
+		heading = fmt.Sprintf("Holding back %d targets", len(held))
+	}
+	if nothingRuns {
+		heading = "No target that needs this change can apply yet"
+	}
+	reason := func(target HeldTarget) string {
+		return escapeInlineMarkdown(strings.Join(strings.Fields(target.Reason), " "))
+	}
+	switch {
+	case len(held) == 1 && nothingRuns:
+		fmt.Fprintf(sb, glyph.Attention+" **%s**: target %s: %s.\n\n", heading, inlineCode(held[0].Target), reason(held[0]))
+	case len(held) == 1:
+		fmt.Fprintf(sb, glyph.Attention+" **%s**: %s.\n\n", heading, reason(held[0]))
+	default:
+		fmt.Fprintf(sb, glyph.Attention+" **%s**:\n", heading)
+		for _, target := range held {
+			fmt.Fprintf(sb, "- %s: %s\n", inlineCode(target.Target), reason(target))
+		}
+		sb.WriteString("\n")
+	}
+	if nothingRuns {
+		sb.WriteString("The schema check keeps blocking merge until every target has the change.\n")
+		return
+	}
+	sb.WriteString("The apply runs every other target. The schema check keeps blocking merge until every target has the change, so apply again once the held targets can run.\n\n")
 }
 
 // applyFailsOnRefusedChange reports whether the plan carries a change the
@@ -3426,8 +3463,8 @@ func writeEnvironmentPlanSection(sb *strings.Builder, plan *PlanCommentData, bud
 		if targetPlans {
 			writeTableSizesSection(sb, summary)
 			writePlanSummary(sb, summary, summaryStatements, summaryKeyspaceUpdates)
-			if plan.MemberApplyRefusal != "" {
-				writeMemberApplyRefusal(sb, plan.MemberApplyRefusalTarget, plan.MemberApplyRefusal)
+			if len(plan.HeldTargets) > 0 {
+				writeHeldTargets(sb, plan.HeldTargets, plan.NoTargetCanApply)
 				sb.WriteString("\n")
 			}
 			return
@@ -3496,10 +3533,10 @@ func writeEnvironmentPlanSection(sb *strings.Builder, plan *PlanCommentData, bud
 	// together, as a sharded keyspace's shards are.
 	writePlanSummary(sb, summary, summaryStatements, summaryKeyspaceUpdates)
 
-	// An apply this section's other targets' plans would refuse is not offered
-	// in the footer, so the section says why.
-	if plan.MemberApplyRefusal != "" {
-		writeMemberApplyRefusal(sb, plan.MemberApplyRefusalTarget, plan.MemberApplyRefusal)
+	// The footer offers this section's apply, so the section says which of
+	// its other targets that apply holds back.
+	if len(plan.HeldTargets) > 0 {
+		writeHeldTargets(sb, plan.HeldTargets, plan.NoTargetCanApply)
 		sb.WriteString("\n")
 	}
 }
@@ -3545,7 +3582,7 @@ func writeMultiEnvFooter(sb *strings.Builder, data MultiEnvPlanCommentData) {
 				envsFailOnRefusedChange = append(envsFailOnRefusedChange, env)
 			case environmentHasWork(plan):
 				envsWithChanges = append(envsWithChanges, env)
-			case plan.MemberApplyRefusal != "":
+			case plan.NoTargetCanApply:
 				envsRefused = append(envsRefused, env)
 			}
 		}
@@ -3586,7 +3623,7 @@ func writeMultiEnvFooter(sb *strings.Builder, data MultiEnvPlanCommentData) {
 				capitalizeFirst(env), envsRefused[0], envsRefused[0])
 			continue
 		}
-		fmt.Fprintf(sb, "\n"+glyph.Attention+" **%s** applies only after %s, and this PR cannot apply %s's other targets' plans (see above).\n",
+		fmt.Fprintf(sb, "\n"+glyph.Attention+" **%s** applies only after %s, and no target of %s that needs this change can apply yet (see above).\n",
 			capitalizeFirst(env), envsRefused[0], envsRefused[0])
 	}
 
@@ -3902,7 +3939,7 @@ func capitalizeEnvNames(envs []string) string {
 // desired schema while those other targets' plans do. A section whose apply
 // would be refused says why in the section itself.
 func environmentHasWork(plan *PlanCommentData) bool {
-	if plan.MemberApplyRefusal != "" {
+	if plan.NoTargetCanApply {
 		return false
 	}
 	if hasChanges(plan.Changes) {

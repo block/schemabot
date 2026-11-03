@@ -1759,7 +1759,7 @@ func TestE2EConvergedPrimaryRefusesToDiscardAnotherTargetsCopy(t *testing.T) {
 	seedUsersCopy(t, dbName+"_us")
 
 	apply := runRolloutCommand(t, svc, dbName, "schemabot apply -e "+driftEnv)
-	body := awaitCommentContaining(t, apply, "nothing was applied")
+	body := awaitCommentContaining(t, apply, "Nothing was applied")
 	assert.Contains(t, body, "target `us`: applying its plan discards the unfinished copy of users",
 		"the refusal names the target and the table whose copy would be lost")
 	assert.NotContains(t, body, "schemabot apply-confirm", "a refused apply offers no confirmation")
@@ -1800,7 +1800,7 @@ func TestE2EApplyRefusesRatherThanAskingWhenAnotherTargetsChangedPlanCannotRun(t
 	}
 
 	apply := runRolloutCommand(t, svc, dbName, "schemabot apply -e "+driftEnv)
-	body := awaitCommentContaining(t, apply, "nothing was applied")
+	body := awaitCommentContaining(t, apply, "Nothing was applied")
 	assert.Contains(t, body, "target `us`: applying its plan discards the unfinished copy of users")
 	assert.NotContains(t, body, "Confirmation required")
 	assert.NotContains(t, body, "schemabot apply-confirm", "a refused apply offers no confirmation")
@@ -1832,11 +1832,44 @@ func TestE2EApplyConfirmRefusesToDiscardACopyThatAppearedOnAnotherTarget(t *test
 	seedUsersCopy(t, dbName+"_us")
 
 	confirm := runRolloutCommand(t, svc, dbName, "schemabot apply-confirm -e "+driftEnv)
-	body := awaitCommentContaining(t, confirm, "nothing was applied")
+	body := awaitCommentContaining(t, confirm, "Nothing was applied")
 	assert.Contains(t, body, "target `us`: applying its plan discards the unfinished copy of users")
 
 	requireNoApplies(t, svc, dbName)
 	requireNoApplyLock(t, svc, dbName)
+	requireUsersCopyIntact(t, dbName+"_us")
+}
+
+// Three targets still need the column, and us holds an unfinished copy of
+// `users` made for a different statement, so applying us's plan would throw
+// that copy away. The apply holds us back and runs the rest: it creates one
+// apply over eu and ap, records us as held back, leaves us's copy in place,
+// and the comment names us and why it was held.
+func TestE2EApplyHoldsBackTheTargetWhoseCopyItWouldDiscardAndRunsTheRest(t *testing.T) {
+	dbName := "webhook_rollout_hold_copy"
+	svc := setupE2ERolloutService(t, dbName, []deploymentSpec{
+		{name: "eu", liveSchema: usersBaseSchema},
+		{name: "us", liveSchema: usersBaseSchema},
+		{name: "ap", liveSchema: usersBaseSchema},
+	}, api.PlanIndependent)
+	t.Cleanup(func() {
+		_ = svc.Storage().Locks().ForceRelease(context.WithoutCancel(t.Context()), dbName, "mysql")
+	})
+	seedUsersCopy(t, dbName+"_us")
+
+	apply := runRolloutCommand(t, svc, dbName, "schemabot apply -e "+driftEnv)
+	body := awaitCommentContaining(t, apply, "Holding back target `us`")
+	assert.Contains(t, body, "applying its plan discards the unfinished copy of users", "the comment says why us was held back")
+	assert.Contains(t, body, "The apply runs every other target.")
+
+	created := awaitRolloutApply(t, svc, dbName, apply)
+	requireTaskDDLByDeployment(t, svc, created, map[string][]string{
+		"eu": {"ADD COLUMN `email`"},
+		"ap": {"ADD COLUMN `email`"},
+	})
+	held := storage.ParseApplyOptions(created.Options).HeldBack
+	require.Len(t, held, 1, "the apply records the one target it held back")
+	assert.True(t, strings.HasPrefix(held[0], "us/"), "the held member is us, got %s", held[0])
 	requireUsersCopyIntact(t, dbName+"_us")
 }
 

@@ -162,8 +162,9 @@ func TestMemberWorkDifference(t *testing.T) {
 }
 
 // A rollout member whose apply would discard an unfinished copy is named on the
-// work the PR apply reads, so the refusal tells the operator which target holds
-// the copy at stake.
+// work the PR apply reads, by the name the operator addresses it and by the
+// member the apply request holds back, so the comment tells the operator which
+// target holds the copy at stake and the apply leaves it alone.
 func TestMemberWorkOfNamesTheCopyAtStake(t *testing.T) {
 	work := tern.ChangeSet{Changes: []*ternv1.SchemaChange{{
 		Namespace: "payments",
@@ -184,20 +185,24 @@ func TestMemberWorkOfNamesTheCopyAtStake(t *testing.T) {
 	}}
 
 	got := memberWorkOf(&rollup)
-	assert.Equal(t, memberRefusal{target: "primary/payments-002", reason: `applying its plan discards the unfinished copy of orders in namespace "payments"`}, got.copyAtStake)
+	assert.Equal(t, []memberRefusal{{
+		member: "primary/payments-002",
+		target: "primary/payments-002",
+		reason: `applying its plan discards the unfinished copy of orders in namespace "payments"`,
+	}}, got.copiesAtStake)
 	assert.Equal(t, []string{"primary/payments-002"}, got.names)
 
 	rollup.Entries[1].ExistingCopies = nil
-	assert.Empty(t, memberWorkOf(&rollup).copyAtStake, "a member that reported a clean target puts nothing at stake")
+	assert.Empty(t, memberWorkOf(&rollup).copiesAtStake, "a member that reported a clean target puts nothing at stake")
 }
 
 // A PostgreSQL targets rollout whose primary target already has the schema
 // while another target still needs a column. The engine does not read a target
 // for unfinished copies, so the member's plan comes back without that
-// disclosure, and a PR apply refuses its work whatever its flags. The plan
-// comment still shows that target's plan, says why it cannot be applied from
-// the PR, and offers no apply command, in the single- and the
-// multi-environment comment alike.
+// disclosure, and a PR apply holds that target back. With the primary already
+// at the schema, that leaves nothing to run, so the plan comment still shows
+// that target's plan, says why no target can apply, and offers no apply
+// command, in the single- and the multi-environment comment alike.
 func TestPlanCommentOffersNoApplyWhenAMembersCopiesWereNotRead(t *testing.T) {
 	alter := &ternv1.SchemaChange{Namespace: "public", TableChanges: []*ternv1.TableChange{{
 		Namespace:  "public",
@@ -222,13 +227,17 @@ func TestPlanCommentOffersNoApplyWhenAMembersCopiesWereNotRead(t *testing.T) {
 		DeploymentDrift: deploymentDriftPreview(rollup),
 	}
 	h := &Handler{logger: testLogger()}
-	h.annotateMemberApplyRefusal(t.Context(), &data, &apitypes.PlanResponse{PlanID: "plan-reviewed", Database: "payments"}, "production", outcome, "octocat/payments", 7)
-	assert.Equal(t, "primary/payments-002", data.MemberApplyRefusalTarget)
-	assert.Equal(t, "its data plane did not report whether applying its plan discards an unfinished copy", data.MemberApplyRefusal)
+	h.annotateHeldTargets(t.Context(), &data, &apitypes.PlanResponse{PlanID: "plan-reviewed", Database: "payments"}, "production", outcome, "octocat/payments", 7)
+	assert.Equal(t, []templates.HeldTarget{{
+		Target: "primary/payments-002",
+		Reason: "its data plane did not report whether applying its plan discards an unfinished copy",
+	}}, data.HeldTargets)
+	assert.True(t, data.NoTargetCanApply, "the primary is already at the schema, so holding the other target back leaves nothing to run")
 
 	single := templates.RenderPlanComment(data)
 	assert.Contains(t, single, "ALTER TABLE orders ADD COLUMN region varchar(16)", "the other target's plan is still shown")
-	assert.Contains(t, single, "**This PR cannot apply every target's plan**: target `primary/payments-002`: its data plane did not report")
+	assert.Contains(t, single, "**No target that needs this change can apply yet**: target `primary/payments-002`: its data plane did not report")
+	assert.NotContains(t, single, "every target or none")
 	assert.NotContains(t, single, "schemabot apply", "an apply that is refused whatever its flags is never offered")
 
 	staging := &templates.PlanCommentData{Database: "payments", DatabaseType: "postgres", Environment: "staging"}
@@ -237,7 +246,7 @@ func TestPlanCommentOffersNoApplyWhenAMembersCopiesWereNotRead(t *testing.T) {
 		Environments: []string{"staging", "production"},
 		Plans:        map[string]*templates.PlanCommentData{"staging": staging, "production": &data},
 	})
-	assert.Contains(t, multi, "**This PR cannot apply every target's plan**")
+	assert.Contains(t, multi, "**No target that needs this change can apply yet**")
 	assert.NotContains(t, multi, "schemabot apply")
 	assert.NotContains(t, multi, "No changes to apply", "a target still needs the change")
 }

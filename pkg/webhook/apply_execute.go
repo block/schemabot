@@ -196,6 +196,9 @@ func (h *Handler) executeApply(
 	// other target's work on the comment behind it, so apply creation may run
 	// the direct changes that comment disclosed under those targets.
 	confirmedMemberWork := false
+	// heldMembers are the other targets this apply holds back because their
+	// own plans cannot run from it. The apply runs the rest.
+	var heldMembers, heldNames []string
 	switch {
 	case runsMemberWork:
 		covered, reason, coverErr := h.confirmationCoversMemberWork(ctx, expectedPendingPlanID, planResp.PlanID, environment, func() string {
@@ -207,30 +210,31 @@ func (h *Handler) executeApply(
 				"the plans this apply covers")
 			return
 		}
-		// Work the apply cannot run is refused before anything else, releasing
-		// the lock, whether or not the comment showed it: a copy can appear on
-		// a target after the comment was posted, a fresh confirmation could
-		// never run it, and apply creation would refuse it with the lock still
-		// pinned.
-		// When the confirmation is also stale, the refusal is the reason the
+		// Targets whose work the apply cannot run are held back, and the rest
+		// run, whether or not the comment showed them: a copy can appear on a
+		// target after the comment was posted, and apply creation would refuse
+		// a target it cannot run. Only when that leaves nothing to run is the
+		// apply refused, before anything else, releasing the lock.
+		// When the confirmation is also stale, that refusal is the reason the
 		// operator is told: it is the one that blocks any confirmation, where
 		// a stale one would only send them to confirm again into the same
 		// refusal.
-		refusal, refusalErr := h.memberWorkRefusal(ctx, planResp.PlanID, environment, rollout, primaryTargetConverged)
-		if refusalErr != nil {
+		hold, holdErr := h.heldMembers(ctx, planResp.PlanID, environment, rollout, primaryTargetConverged)
+		if holdErr != nil {
 			h.rejectUnverifiedMemberWork(ctx, repo, pr, installationID, schemaResult, environment, requestedBy, actionName, storedPlan != nil, expectedPendingPlanID, planResp.PlanID,
-				"could not verify that the other targets' plans can run from this apply", refusalErr,
+				"could not verify that the other targets' plans can run from this apply", holdErr,
 				"the other targets' plans")
 			return
 		}
-		if refusal.refuses() {
-			h.logger.Info("apply refused: the other targets' work cannot run from this apply",
+		if hold.leavesNothingToRun() {
+			h.logger.Info("apply refused: every other target with work is held back and the primary target has none",
 				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
-				"pending_plan_id", expectedPendingPlanID, "plan_id", planResp.PlanID, "reason", refusal.String())
-			h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, expectedPendingPlanID, "the other targets' work cannot run from this apply")
-			h.refuseRollout(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, requestedBy, actionName, rollout, primaryTargetConverged, memberWorkRefusalMessage(refusal))
+				"pending_plan_id", expectedPendingPlanID, "plan_id", planResp.PlanID, "held_targets", hold.names())
+			h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, expectedPendingPlanID, "no target that needs the change can apply yet")
+			h.refuseRollout(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, requestedBy, actionName, rollout, primaryTargetConverged, noTargetCanApplyMessage(hold))
 			return
 		}
+		heldMembers, heldNames = hold.memberIDs(), hold.names()
 		// A primary plan the engine now blocks cannot run from any
 		// confirmation, so an automatic apply rejects it here rather than
 		// pausing on a confirmation that would only be rejected in turn.
@@ -285,7 +289,8 @@ func (h *Handler) executeApply(
 		confirmedMemberWork = true
 		h.logger.Info("apply: running the reviewed plans of the other targets that still need the change",
 			"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
-			"action", actionName, "plan_id", planResp.PlanID, "primary_target_converged", primaryTargetConverged, "pending_targets", rollout.work.names)
+			"action", actionName, "plan_id", planResp.PlanID, "primary_target_converged", primaryTargetConverged, "pending_targets", rollout.work.names,
+			"held_targets", hold.names())
 	case rollout.blocks():
 		refuseRollout("the rollout round could not confirm every target's plan")
 		return
@@ -544,6 +549,7 @@ func (h *Handler) executeApply(
 		ExpectedLockOwner:     fmt.Sprintf("%s#%d", repo, pr),
 		ExpectedPendingPlanID: expectedPendingPlanID,
 		ConfirmedMemberWork:   confirmedMemberWork,
+		HeldMembers:           heldMembers,
 		Target:                result.Target,
 	}
 
@@ -608,7 +614,7 @@ func (h *Handler) executeApply(
 
 	// Update stored check state to in_progress (transitions action_required to in_progress).
 	if err := h.updateCheckRecordForApplyStart(ctx, client, repo, pr, schemaResult, environment, apply,
-		h.rolloutApplyChangeSummary(schemaResult, planResp, environment, rollout.work)); err != nil {
+		h.rolloutApplyChangeSummary(schemaResult, planResp, environment, rollout.work.withoutTargets(heldNames))); err != nil {
 		h.logger.Error("failed to mark check in_progress for apply",
 			append(apply.LogAttrs(), "error", err)...)
 		h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy, "Apply was accepted, but SchemaBot could not update the required status check: "+err.Error())

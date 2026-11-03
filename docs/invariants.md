@@ -715,6 +715,8 @@ aggregate published from that round when the stored check state cannot be writte
 the refusal to record a plan narrowed to one member (`upsertPlanCheckRecord`); an apply narrowed to
 one member blocking the check before it dispatches (`storeNarrowedApplyCheck` in
 `pkg/webhook/apply_check_records.go`) and when it completes (`completedNarrowedApply` in
+`updateCheckRecordForApplyResult`, `pkg/webhook/check_records.go`); an apply that held members back
+completing without passing the check (`completedApplyHoldingTargets` in
 `updateCheckRecordForApplyResult`, `pkg/webhook/check_records.go`); an environment whose
 namespace placement refuses its plan stored as a failing check on every plan command
 (`storeNamespacePlacementCheck` in `pkg/webhook/check_records.go`, called by the single- and
@@ -1723,8 +1725,8 @@ them. The re-plan that runs just before execution re-checks that verdict, so a p
 after the confirmation stops rather than running something the operator never saw. *Enforced:* lint gates and the pull request apply flow, for both `apply` and `apply-confirm`
 (`pkg/api/plan_handlers.go`, `pkg/webhook/apply_gating.go`, `pkg/webhook/apply_execute.go`), including the re-check that the work of every rollout member, the
 primary target's included, is what the confirmation, or the comment an automatic apply posted,
-was given against and carries no consequence it did not disclose (`confirmedConvergedTargetRound`, `confirmationCoversPrimaryTarget`, `confirmationCoversMemberWork` and `memberWorkRefusal` in
-`pkg/webhook/apply_member_work.go`), with an automatic apply running other members' work only once that comment has landed (`applyCommandCore` in `pkg/webhook/apply_handlers.go`), where a member counts as disclosing its copies only when its engine read the target for every one (`MemberCopyAtStake` in `pkg/api/plan_rollup_work.go`, fed by `engine.PlanResult.ExistingCopiesChecked`); every rollout
+was given against and carries no consequence it did not disclose (`confirmedConvergedTargetRound`, `confirmationCoversPrimaryTarget`, `confirmationCoversMemberWork` and `heldMembers` in
+`pkg/webhook/apply_member_work.go`), with an automatic apply running other members' work only once that comment has landed (`applyCommandCore` in `pkg/webhook/apply_handlers.go`), where a member counts as disclosing its copies only when its engine read the target for every one (`MembersCopyAtStake` in `pkg/api/plan_rollup_work.go`, fed by `engine.PlanResult.ExistingCopiesChecked`); every rollout
 member's unsafe change requiring the same opt-in as the primary plan's, both at the PR gate
 (`blockUnsafeWithoutOptIn` in `pkg/webhook/apply_member_work.go`, over the per-target disclosure
 `TargetPlanUnsafeChanges` in `pkg/webhook/templates/plan.go`) and at apply creation

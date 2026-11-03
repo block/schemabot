@@ -568,6 +568,7 @@ Run output remains human-readable and may change.
 | `no_allowed_configured_environments` | Aggregate row | The database has no configured environments from which scope can be established. |
 | `plan_failed_unrecorded` | Aggregate row | One environment of a multi-environment plan could not plan, and its failing per-database row could not be stored, so stored check state holds nothing of the failure. No plan command releases it; a re-run of the check or a new commit re-plans every environment and does. |
 | `narrowed_apply` | Per-database row | The rollout is going one target at a time (`--target`), so nothing yet shows the other targets have the change. It does not replace a reconciliation, review-time drift, or namespace placement block already on the row: the narrowed apply evaluated none of them. An apply or plan of the whole environment (`schemabot apply -e <environment>`) replaces it with its own result. |
+| `held_targets` | Per-database row | An apply of the whole environment completed after holding back targets whose own plans could not run, so those targets still need the change. It does not replace a reconciliation block already on the row. The next apply or plan of the whole environment replaces it with its own result. |
 
 Generic plan and apply errors can still publish `completed` / `failure` without
 a stable `blocking_reason` when the error is not one of the explicit classes
@@ -1031,16 +1032,25 @@ shows each target's plan as it is now.
 
 The apply is refused instead, with nothing run and the record left
 `action_required` (or `failure` for drift), when a target could not be
-confirmed, when the comment cannot render every target's plan, or when a
-target's plan carries work the apply cannot run as planned. That is a change
-its engine refuses, an unfinished copy it would discard, or work the apply's
-operation shape has no place for. When the primary target is already at the
-desired schema, that includes any per-shard or finalizer change on another
-target. These refusals come before the pause for a fresh confirmation, so an
-apply never asks for a confirmation that could not run. An unsafe change on
-another target is not refused: the comment discloses it under that target, and
-it runs under `--allow-unsafe` like the primary target's own, whether or not the
-primary target has work. A target's direct-execution change is not refused
+confirmed or when the comment cannot render every target's plan. A target
+whose own plan carries work the apply cannot run as planned is held back
+instead, and the apply runs every other target. That is a change its engine
+refuses, an unfinished copy it would discard, or work the apply's operation
+shape has no place for. When the primary target is already at the desired
+schema, that includes any per-shard or finalizer change on another target. The
+primary target is never held back, since the apply is laid out from its plan.
+The comment names each held target and why, the held target's work and copies
+are left untouched, and the apply records the targets it held. When it
+completes, the record ends `action_required` with `held_targets` rather than
+passing, since the held targets still need the change (MG-12); applying the
+environment again once they can run finishes the rollout. Only when the
+primary target has no work and every other target with work is held does the
+apply refuse, since it would run nothing. These decisions come before the
+pause for a fresh confirmation, so an apply never asks for a confirmation that
+could not run. An unsafe change on another target is not held back: the
+comment discloses it under that target, and it runs under `--allow-unsafe`
+like the primary target's own, whether or not the
+primary target has work. A target's direct-execution change is not held back
 either: the comment discloses it under that target, and the apply runs it
 there as native DDL that blocks writes to the table until it finishes. An
 apply created any other way, such as a
@@ -1048,8 +1058,9 @@ apply created any other way, such as a
 direct-execution change, and its unsafe changes unless the primary target's
 plan carries the same statement up to its schema qualifier. A target whose data plane
 could not say whether it holds an unfinished copy, because it does not look or
-its lookup failed, is refused the same way. The plan comment offers no apply
-for a rollout it knows would be refused, and says why in its place.
+its lookup failed, is held back the same way. The plan comment names the
+targets an apply would hold back, and offers no apply for a rollout in which
+no target that needs the change can apply, saying why in its place.
 
 Apply-confirm asks all of this again against the rollout as it is at confirm,
 and also refuses when a target's work differs from what the confirmed comment

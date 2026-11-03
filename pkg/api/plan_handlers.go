@@ -609,6 +609,13 @@ type ApplyRequest struct {
 	// change the primary plan does not carry: no other caller confirms them.
 	// Direct API callers cannot assert it through JSON.
 	ConfirmedMemberWork bool `json:"-"`
+	// HeldMembers is an internal webhook guard: the MemberIDs of the rollout
+	// members a pull request apply of the whole rollout holds back, because
+	// their own plans cannot run from this apply. The apply runs every other
+	// member and records the held ones, so the check keeps blocking until they
+	// have the change (MG-12). The primary is never held: the apply is laid out
+	// from its plan. Direct API callers cannot assert it through JSON.
+	HeldMembers []string `json:"-"`
 }
 
 // handlePlan handles POST /api/plan requests.
@@ -2061,6 +2068,17 @@ func (s *Service) createStoredApply(
 	// A narrowed apply records the member it ran on, so a later rollback can
 	// tell it changed that member alone and not the whole rollout.
 	applyOpts.NarrowedTo = narrowedTo
+	targets, err = withoutHeldMembers(plan, req, targets, narrowedTo)
+	if err != nil {
+		return nil, 0, err
+	}
+	if len(req.HeldMembers) > 0 {
+		s.logger.Info("apply holds back rollout members whose own plans cannot run from it; it runs the rest",
+			"plan_id", plan.PlanIdentifier, "database", plan.Database, "environment", req.Environment,
+			"repository", plan.Repository, "pull_request", plan.PullRequest,
+			"held_members", req.HeldMembers, "targets", len(targets))
+		applyOpts.HeldBack = req.HeldMembers
+	}
 
 	// Attribute the apply to the authenticated caller when the request carried a
 	// real identity (API auth enabled); see resolveCaller.
@@ -2444,6 +2462,42 @@ func (e *PlanMemberMismatchError) Error() string {
 	}
 	return fmt.Sprintf("apply for %s/%s runs the whole rollout, but plan %s was made for rollout member %s, not the rollout primary %s; apply it with target %s, or plan the whole environment",
 		e.Database, e.Environment, e.PlanID, e.PlanMember, e.ApplyMember, e.PlanMember)
+}
+
+// withoutHeldMembers drops the members a pull request apply holds back from
+// the targets it runs on. Each held member must be one of the rollout's members
+// other than the primary, which the apply is laid out from, and an apply
+// narrowed to one member holds nothing back: an apply that cannot name exactly
+// what it leaves out is refused rather than run on a guess.
+func withoutHeldMembers(plan *storage.Plan, req ApplyRequest, targets []routing.ExecutionTarget, narrowedTo string) ([]routing.ExecutionTarget, error) {
+	if len(req.HeldMembers) == 0 {
+		return targets, nil
+	}
+	if narrowedTo != "" {
+		return nil, fmt.Errorf("apply for %s/%s is narrowed to %s but holds back members %v; a narrowed apply runs one member and holds back nothing",
+			plan.Database, req.Environment, narrowedTo, req.HeldMembers)
+	}
+	held := make(map[string]bool, len(req.HeldMembers))
+	for _, member := range req.HeldMembers {
+		held[member] = true
+	}
+	if held[targets[0].MemberID()] {
+		return nil, fmt.Errorf("apply for %s/%s holds back its primary target %s, which the apply is laid out from",
+			plan.Database, req.Environment, targets[0].MemberID())
+	}
+	kept := make([]routing.ExecutionTarget, 0, len(targets))
+	for _, target := range targets {
+		if held[target.MemberID()] {
+			delete(held, target.MemberID())
+			continue
+		}
+		kept = append(kept, target)
+	}
+	if len(held) > 0 {
+		return nil, fmt.Errorf("apply for %s/%s holds back %v, which are not members of its rollout",
+			plan.Database, req.Environment, slices.Sorted(maps.Keys(held)))
+	}
+	return kept, nil
 }
 
 // planIsForMember reports whether a plan was made against the given member.

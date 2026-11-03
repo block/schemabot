@@ -378,6 +378,9 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	rollout, rolloutPreview := h.reviewTimeDrift(ctx, planReq, planProto, planResp, repo, pr)
 	primaryTargetConverged := !planResp.HasChanges()
 	runsMemberWork := rolloutRunsMemberWork(rollout, rolloutPreview)
+	// heldTargets are the other targets the apply holds back because their own
+	// plans cannot run from it; the comment the apply posts names them.
+	var heldTargets []templates.HeldTarget
 	switch {
 	case runsMemberWork:
 		// Record the pending work on the check before anything else can end
@@ -395,26 +398,27 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 			}
 			return true, fmt.Errorf("apply command member-work check record %s#%d: %w", repo, pr, recordErr)
 		}
-		refusal, refusalErr := h.memberWorkRefusal(ctx, planResp.PlanID, environment, rollout, primaryTargetConverged)
-		if refusalErr != nil {
+		hold, holdErr := h.heldMembers(ctx, planResp.PlanID, environment, rollout, primaryTargetConverged)
+		if holdErr != nil {
 			h.logger.Error("apply rejected: could not verify that the other targets' plans can run from this apply",
 				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
-				"plan_id", planResp.PlanID, "error", refusalErr)
+				"plan_id", planResp.PlanID, "error", holdErr)
 			if !result.SuppressRetryComments {
 				h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy,
 					msgOtherTargetPlansUnverified)
 			}
-			return true, fmt.Errorf("apply command member-work preflight %s#%d: %w", repo, pr, refusalErr)
+			return true, fmt.Errorf("apply command member-work preflight %s#%d: %w", repo, pr, holdErr)
 		}
-		if refusal.refuses() {
-			h.postRolloutRefusal(repo, pr, installationID, schemaResult, planResp, environment, requestedBy, action.Apply, rollout, primaryTargetConverged, memberWorkRefusalMessage(refusal))
+		if hold.leavesNothingToRun() {
+			h.postRolloutRefusal(repo, pr, installationID, schemaResult, planResp, environment, requestedBy, action.Apply, rollout, primaryTargetConverged, noTargetCanApplyMessage(hold))
 			return false, nil
 		}
+		heldTargets = hold.templateTargets()
 		h.logger.Info("apply: other targets have plans of their own; the apply runs each of them",
 			"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
 			"plan_id", planResp.PlanID, "primary_target_converged", primaryTargetConverged,
 			"targets_pending", rollout.work.pending, "targets", rollout.work.members,
-			"pending_targets", rollout.work.names)
+			"pending_targets", rollout.work.names, "held_targets", hold.names())
 	case rollout.blocks():
 		// A target that diverged or could not be planned has no plan the apply
 		// could run for it.
@@ -578,6 +582,7 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	commentData.SkipRevert = result.SkipRevert
 	commentData.AllowUnsafe = result.AllowUnsafe
 	commentData.DeploymentDrift = rolloutPreview
+	commentData.HeldTargets = heldTargets
 
 	// Re-evaluate the checks gate against the freshness-checked HEAD before
 	// executing. The early gate at the top of applyCommandCore ran against

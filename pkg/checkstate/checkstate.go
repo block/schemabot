@@ -81,6 +81,7 @@ const (
 	BlockNoAllowedConfiguredEnvironments  = "no_allowed_configured_environments"
 	BlockParticipantUnresolved            = "participant_unresolved"
 	BlockNarrowedApply                    = "narrowed_apply"
+	BlockHeldTargets                      = "held_targets"
 	BlockPlanFailedUnrecorded             = "plan_failed_unrecorded"
 	BlockReviewTimeDeploymentDrift        = storage.ReviewTimeDeploymentDriftBlockingReason
 	BlockNamespacePlacementRefused        = storage.NamespacePlacementRefusedBlockingReason
@@ -112,7 +113,8 @@ const (
 //
 // A narrowed apply is a guard for the same reason: it changed one target of
 // the rollout, and a plan of the whole environment lifts the block once every
-// target has the change.
+// target has the change. So is an apply that held targets back, which changed
+// every target but those.
 //
 // An unlisted reason is read as blockGuard: the column is a plain string, so a
 // value this table does not know about is one whose remedy cannot be asserted,
@@ -133,6 +135,7 @@ var blockClasses = map[string]blockClass{
 	BlockManagedDirMissingConfig:          blockGuard,
 	BlockNoAllowedConfiguredEnvironments:  blockGuard,
 	BlockNarrowedApply:                    blockGuard,
+	BlockHeldTargets:                      blockGuard,
 	BlockPlanFailedUnrecorded:             blockGuard,
 	BlockParticipantUnresolved:            blockAwaitingReport,
 }

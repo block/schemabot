@@ -7,6 +7,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/schemabot/pkg/routing"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/storage"
 )
@@ -96,4 +97,38 @@ func TestPullNamespaces(t *testing.T) {
 			assert.Equal(t, tc.want, got)
 		})
 	}
+}
+
+// A pull request apply of the whole rollout holds back the members whose own
+// plans cannot run and runs every other one, in rollout order. It never holds
+// back the primary, which the apply is laid out from, never holds back a
+// member outside the rollout, and an apply narrowed to one member holds back
+// nothing.
+func TestWithoutHeldMembers(t *testing.T) {
+	plan := &storage.Plan{Database: "orders"}
+	targets := []routing.ExecutionTarget{
+		{Deployment: "eu", Target: "orders-001"},
+		{Deployment: "us", Target: "orders-002"},
+		{Deployment: "ap", Target: "orders-003"},
+	}
+	held := func(members ...string) ApplyRequest {
+		return ApplyRequest{Environment: "production", HeldMembers: members}
+	}
+
+	kept, err := withoutHeldMembers(plan, held(), targets, "")
+	require.NoError(t, err)
+	assert.Equal(t, targets, kept, "an apply holding nothing back runs every member")
+
+	kept, err = withoutHeldMembers(plan, held("us/orders-002"), targets, "")
+	require.NoError(t, err)
+	assert.Equal(t, []routing.ExecutionTarget{targets[0], targets[2]}, kept)
+
+	_, err = withoutHeldMembers(plan, held("eu/orders-001"), targets, "")
+	require.ErrorContains(t, err, "holds back its primary target eu/orders-001")
+
+	_, err = withoutHeldMembers(plan, held("us/orders-009"), targets, "")
+	require.ErrorContains(t, err, "holds back [us/orders-009], which are not members of its rollout")
+
+	_, err = withoutHeldMembers(plan, held("us/orders-002"), targets[1:2], "us/orders-002")
+	require.ErrorContains(t, err, "a narrowed apply runs one member and holds back nothing")
 }

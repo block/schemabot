@@ -90,6 +90,7 @@ func declaredCheckBlockReasonVars(t *testing.T) map[string]string {
 		"BlockReviewTimeDeploymentDrift":        checkstate.BlockReviewTimeDeploymentDrift,
 		"BlockNamespacePlacementRefused":        checkstate.BlockNamespacePlacementRefused,
 		"BlockNarrowedApply":                    checkstate.BlockNarrowedApply,
+		"BlockHeldTargets":                      checkstate.BlockHeldTargets,
 		"BlockPlanFailedUnrecorded":             checkstate.BlockPlanFailedUnrecorded,
 	}
 

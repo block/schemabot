@@ -182,7 +182,7 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 	commentData := buildPlanCommentData(schemaResult, planResp, environment, tenant, requestedBy, h.agentHint(), h.cliName())
 	commentData.ScopedDatabase = databaseName
 	commentData.DeploymentDrift = driftPreview
-	h.annotateMemberApplyRefusal(ctx, &commentData, planResp, environment, drift, repo, pr)
+	h.annotateHeldTargets(ctx, &commentData, planResp, environment, drift, repo, pr)
 	h.annotateAttributedChanges(ctx, client, &commentData, planResp, driftPreview, repo, pr, environment)
 
 	// Store per-database check record and update aggregate
@@ -642,7 +642,7 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 		h.annotateAttributedChanges(ctx, client, &commentData, planResp, driftPreview, repo, pr, env)
 		commentData.RecoveredApplyOwnedCheckState = recoveredApplyOwnedCheckState
 		commentData.DeploymentDrift = driftPreview
-		h.annotateMemberApplyRefusal(ctx, &commentData, planResp, env, drift, repo, pr)
+		h.annotateHeldTargets(ctx, &commentData, planResp, env, drift, repo, pr)
 		multiEnvData.Plans[env] = &commentData
 	}
 

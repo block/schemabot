@@ -341,3 +341,56 @@ func TestNarrowedApplyKeepsRollupBlock(t *testing.T) {
 		})
 	}
 }
+
+// An operator applies production while one of its targets, payments-002,
+// holds an unfinished copy its plan would discard. The apply holds that target
+// back and runs the rest. Once it completes, the check must keep blocking
+// merge, name the held target, and release ownership so the apply of the whole
+// environment that brings payments-002 along can record its own result (MG-12).
+func TestApplyThatHeldTargetsBackCompletesWithoutPassingTheCheck(t *testing.T) {
+	ctx := t.Context()
+	f := newNarrowedApplyCheckFixture(t, "octocat/held-targets-check", 12, "held_targets_check_db")
+
+	apply := &storage.Apply{
+		ApplyIdentifier: "apply-held-targets-terminal",
+		Database:        f.schema.Database,
+		DatabaseType:    "mysql",
+		Repository:      f.repo,
+		PullRequest:     f.pr,
+		Environment:     f.env,
+		Engine:          storage.EngineSpirit,
+		InstallationID:  4242,
+		State:           state.Apply.Completed,
+		Options:         storage.MarshalApplyOptions(storage.ApplyOptions{HeldBack: []string{"prod/payments-002"}}),
+	}
+	applyID, err := f.st.Applies().Create(ctx, apply)
+	require.NoError(t, err)
+	apply.ID = applyID
+	require.NoError(t, f.st.Checks().Upsert(ctx, &storage.Check{
+		Repository: f.repo, PullRequest: f.pr, HeadSHA: f.headSHA, Environment: f.env,
+		DatabaseType: "mysql", DatabaseName: f.schema.Database, CheckRunID: 1,
+		ApplyID: applyID, HasChanges: true, Status: checkStatusInProgress,
+	}))
+
+	f.h.refreshChecksForTerminalApply(ctx, apply, "test held targets apply terminal")
+
+	completed := f.check(t)
+	assert.Equal(t, checkStatusCompleted, completed.Status)
+	assert.Equal(t, checkConclusionActionRequired, completed.Conclusion, "an apply that held a target back must not pass the check")
+	assert.Equal(t, heldTargetsBlock.blockingReason, completed.BlockingReason)
+	assert.Equal(t, heldTargetsBlock.message, completed.ErrorMessage)
+	assert.True(t, completed.HasChanges, "the held target still needs the change")
+	assert.Zero(t, completed.ApplyID, "ownership is released so the next apply of the whole environment can lift the block")
+	assert.Equal(t, "held back `prod/payments-002`; apply the environment again to finish", completed.ChangeSummary)
+
+	wholePlan := &apitypes.PlanResponse{
+		PlanID: "plan-held-target",
+		Changes: []*apitypes.SchemaChangeResponse{{
+			Namespace:    f.schema.Database,
+			TableChanges: []*apitypes.TableChangeResponse{{TableName: "users", DDL: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)", ChangeType: "alter"}},
+		}},
+	}
+	_, err = f.h.storeApplyCheckRecord(ctx, f.client, f.repo, f.pr, f.schema, wholePlan, f.env, reviewDriftOutcome{state: driftClean}, false)
+	require.NoError(t, err)
+	assert.Empty(t, f.check(t).BlockingReason, "the next apply of the whole environment records its own check state")
+}
