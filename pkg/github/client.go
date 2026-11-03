@@ -1473,9 +1473,11 @@ type SchemaChangeComparison struct {
 
 // SchemaFileBlobs names a schema file's blob at the approved commit, the
 // head, and the merge base of each. An empty SHA means the file is absent
-// there.
+// there. Content holds the text of the blobs the comparison already read,
+// keyed by blob SHA, so a caller reads only the rest.
 type SchemaFileBlobs struct {
 	ApprovedBase, Approved, HeadBase, Head string
+	Content                                map[string]string
 }
 
 // PRSchemaChangeUnchangedSince reports whether the change a pull request
@@ -1627,6 +1629,9 @@ type schemaChangeItem struct {
 	// resolved is false for a top-level path or symlink target, whose sides
 	// are resolved from the commits when the item is processed.
 	resolved bool
+	// throughSymlink is true when a symlink at path was replaced by its
+	// target on at least one side, so the sides are not the path's own.
+	throughSymlink bool
 }
 
 // compare walks paths and returns the first one where the pull request's
@@ -1690,6 +1695,7 @@ func (c *schemaChangeComparer) compare(ctx context.Context, paths []string) (str
 				// path would read the symlinks again, and a top-level path is
 				// already visited, so it would be skipped uncompared.
 				followed.resolved = true
+				followed.throughSymlink = true
 				pending = append(pending, followed)
 				continue
 			}
@@ -1700,7 +1706,7 @@ func (c *schemaChangeComparer) compare(ctx context.Context, paths []string) (str
 			if !same {
 				// Equal objects on equal bases already passed pathUnchanged.
 				c.differingPathBaseOnly = identical
-				c.differingFile = fileBlobs(item.sides)
+				c.differingFile = c.fileBlobs(item)
 				return item.path, nil
 			}
 		}
@@ -1802,11 +1808,16 @@ func regularFile(side gitSide) bool {
 }
 
 // fileBlobs names the blob at each side of a path that is a regular file or
-// absent at every side, or returns nil when it is a directory or a symlink at
-// any of them.
-func fileBlobs(sides [4]gitSide) *SchemaFileBlobs {
+// absent at every side, with the text of those the comparison already read.
+// It returns nil when the path is a directory or a symlink at any side,
+// including a symlink whose sides were replaced by its target's.
+func (c *schemaChangeComparer) fileBlobs(item schemaChangeItem) *SchemaFileBlobs {
+	if item.throughSymlink {
+		return nil
+	}
 	var shas [4]string
-	for i, side := range sides {
+	content := make(map[string]string)
+	for i, side := range item.sides {
 		if !side.found {
 			continue
 		}
@@ -1814,12 +1825,16 @@ func fileBlobs(sides [4]gitSide) *SchemaFileBlobs {
 			return nil
 		}
 		shas[i] = side.entry.SHA
+		if text, ok := c.blobText[side.entry.SHA]; ok {
+			content[side.entry.SHA] = text
+		}
 	}
 	return &SchemaFileBlobs{
 		ApprovedBase: shas[sideApprovedBase],
 		Approved:     shas[sideApproved],
 		HeadBase:     shas[sideHeadBase],
 		Head:         shas[sideHead],
+		Content:      content,
 	}
 }
 

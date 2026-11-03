@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"path"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/hmarr/codeowners"
 
@@ -222,7 +224,7 @@ func (h *Handler) checkReviewGate(ctx context.Context, client *ghclient.Installa
 		verdicts:          make(map[string]approvalVerdict),
 	}
 	var changedApprovers, changedPaths, changedBasePaths, uncomparedApprovers []string
-	var changedStatements []templates.ChangedStatements
+	var staleApprovals []staleApproval
 	for _, approval := range validApprovals {
 		reviewer := approval.User
 		matched, principal, err := policy.Matches(ctx, client, reviewer)
@@ -252,7 +254,7 @@ func (h *Handler) checkReviewGate(ctx context.Context, client *ghclient.Installa
 				changedBasePaths = appendUniqueString(changedBasePaths, verdict.differingPath)
 			} else if verdict.differingPath != "" {
 				changedPaths = appendUniqueString(changedPaths, verdict.differingPath)
-				changedStatements = h.appendChangedStatements(ctx, client, &coverage, approval, verdict, changedStatements)
+				staleApprovals = append(staleApprovals, staleApproval{approval: approval, verdict: verdict})
 			}
 			continue
 		}
@@ -285,7 +287,7 @@ func (h *Handler) checkReviewGate(ctx context.Context, client *ghclient.Installa
 		ChangedApprovers:    changedApprovers,
 		ChangedPaths:        changedPaths,
 		ChangedBasePaths:    changedBasePaths,
-		ChangedStatements:   changedStatements,
+		ChangedStatements:   h.changedStatements(ctx, client, &coverage, staleApprovals),
 		UncomparedApprovers: uncomparedApprovers,
 		BaseRef:             prInfo.BaseRef,
 		DefaultBranch:       prInfo.DefaultBranch,
@@ -472,75 +474,122 @@ func (h *Handler) schemaChangeUnchangedSince(ctx context.Context, client *ghclie
 // commits cannot crowd out the rest of the comment.
 const maxChangedStatementFiles = 3
 
-// appendChangedStatements adds the DDL the approved commit and the head run
-// for the schema file whose change no longer matches an approval, when the
-// gate can work it out from the files alone. Today that is a MySQL-family
-// .sql file. The block it feeds only shows the reader what changed: the
-// approval already does not count, so a file whose DDL cannot be read or
-// worked out is logged and left out, and the comment still names the file.
-func (h *Handler) appendChangedStatements(ctx context.Context, client *ghclient.InstallationClient, c *approvalCoverage, approval *ghclient.ReviewInfo, verdict approvalVerdict, changes []templates.ChangedStatements) []templates.ChangedStatements {
-	logAttrs := []any{"repo", c.repo, "pr", c.pr, "database", c.database,
-		"approved_sha", approval.CommitID, "head_sha", c.headSHA, "path", verdict.differingPath}
-	for _, change := range changes {
-		if change.Path == verdict.differingPath && change.ApprovedSHA == approval.CommitID {
-			return changes
+// changedStatementsTimeout bounds the reads that show a blocked comment's
+// changed DDL. The DDL only explains the block, so running out of time drops
+// it rather than holding up the comment.
+const changedStatementsTimeout = 10 * time.Second
+
+// staleApproval is an approval on an earlier commit whose schema change
+// differs at the head, kept so the comment can show the DDL that changed once
+// the gate has decided to block.
+type staleApproval struct {
+	approval *ghclient.ReviewInfo
+	verdict  approvalVerdict
+}
+
+// changedStatements works out, for a blocked gate, the DDL the approved commit
+// and the head run for each schema file whose change no longer matches an
+// approval. It runs only after every approval has been checked, so it can never
+// hold up or fail an approval that would have let the apply through, and its
+// reads share one short deadline. Each (file, approved commit) is attempted
+// once, whether or not its DDL can be shown.
+func (h *Handler) changedStatements(ctx context.Context, client *ghclient.InstallationClient, c *approvalCoverage, stale []staleApproval) []templates.ChangedStatements {
+	if len(stale) == 0 {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(ctx, changedStatementsTimeout)
+	defer cancel()
+
+	type attempt struct{ path, approvedSHA string }
+	attempted := make(map[attempt]bool)
+	var changes []templates.ChangedStatements
+	for _, s := range stale {
+		key := attempt{s.verdict.differingPath, s.approval.CommitID}
+		if attempted[key] {
+			continue
+		}
+		attempted[key] = true
+		if len(changes) >= maxChangedStatementFiles {
+			h.logger.Debug("review gate: comment already shows the DDL of as many changed files as it holds",
+				"repo", c.repo, "pr", c.pr, "database", c.database, "approved_sha", s.approval.CommitID,
+				"head_sha", c.headSHA, "path", s.verdict.differingPath)
+			break
+		}
+		if change, ok := h.changedStatementsFor(ctx, client, c, s); ok {
+			changes = append(changes, change)
 		}
 	}
+	return changes
+}
+
+// changedStatementsFor works out the DDL the approved commit and the head run
+// for the schema file a stale approval no longer matches, when the gate can
+// work it out from the files alone. Today that is a MySQL-family .sql file.
+// The block it feeds only shows the reader what changed: the approval already
+// does not count, so a file whose DDL cannot be read or worked out is logged
+// and left out, and the comment still names the file.
+func (h *Handler) changedStatementsFor(ctx context.Context, client *ghclient.InstallationClient, c *approvalCoverage, s staleApproval) (templates.ChangedStatements, bool) {
+	verdict := s.verdict
+	logAttrs := []any{"repo", c.repo, "pr", c.pr, "database", c.database,
+		"approved_sha", s.approval.CommitID, "head_sha", c.headSHA, "path", verdict.differingPath}
 	switch {
-	case len(changes) >= maxChangedStatementFiles:
-		h.logger.Debug("review gate: comment already shows the DDL of as many changed files as it holds", logAttrs...)
-		return changes
 	case c.dialect != schemadialect.DialectMySQL:
 		h.logger.Debug("review gate: changed file's DDL is not shown because its dialect has no offline diff", append(logAttrs, "dialect", c.dialect)...)
-		return changes
+		return templates.ChangedStatements{}, false
 	case path.Ext(verdict.differingPath) != ".sql":
 		h.logger.Debug("review gate: changed path is not a .sql schema file, so its DDL is not shown", logAttrs...)
-		return changes
+		return templates.ChangedStatements{}, false
 	case verdict.differingFile == nil:
 		h.logger.Debug("review gate: changed path is a directory or symlink at some commit, so its DDL is not shown", logAttrs...)
-		return changes
+		return templates.ChangedStatements{}, false
 	}
 
 	blobs := verdict.differingFile
+	text := make(map[string]string, len(blobs.Content))
+	maps.Copy(text, blobs.Content)
+	shas := [4]string{blobs.ApprovedBase, blobs.Approved, blobs.HeadBase, blobs.Head}
 	var contents [4]string
-	for i, sha := range []string{blobs.ApprovedBase, blobs.Approved, blobs.HeadBase, blobs.Head} {
+	for i, sha := range shas {
 		if sha == "" {
 			continue
 		}
-		text, err := client.FetchBlobContent(ctx, c.repo, sha)
-		if err != nil {
-			h.logger.Warn("review gate: cannot read a changed schema file, so the review-required comment names it without its DDL",
-				append(logAttrs, "blob_sha", sha, "error", err)...)
-			return changes
+		if _, ok := text[sha]; !ok {
+			read, err := client.FetchBlobContent(ctx, c.repo, sha)
+			if err != nil {
+				h.logger.Warn("review gate: cannot read a changed schema file, so the review-required comment names it without its DDL",
+					append(logAttrs, "blob_sha", sha, "error", err)...)
+				return templates.ChangedStatements{}, false
+			}
+			text[sha] = read
 		}
-		contents[i] = text
+		contents[i] = text[sha]
 	}
 	approvedDDL, err := ddl.TableChangeStatements(contents[0], contents[1])
 	if err != nil {
 		h.logger.Warn("review gate: cannot work out the DDL the approved commit runs for a changed schema file, so the review-required comment names it without its DDL",
 			append(logAttrs, "error", err)...)
-		return changes
+		return templates.ChangedStatements{}, false
 	}
 	headDDL, err := ddl.TableChangeStatements(contents[2], contents[3])
 	if err != nil {
 		h.logger.Warn("review gate: cannot work out the DDL the head runs for a changed schema file, so the review-required comment names it without its DDL",
 			append(logAttrs, "error", err)...)
-		return changes
+		return templates.ChangedStatements{}, false
 	}
 	if slices.Equal(approvedDDL, headDDL) {
 		// The same DDL on different bases: the difference is in what the base
 		// already runs, which two identical blocks would not show.
 		h.logger.Debug("review gate: changed file runs the same DDL at the approved commit and the head, so its DDL is not shown", logAttrs...)
-		return changes
+		return templates.ChangedStatements{}, false
 	}
-	return append(changes, templates.ChangedStatements{
+	return templates.ChangedStatements{
 		Path:        verdict.differingPath,
 		Dialect:     c.dialect,
-		ApprovedSHA: approval.CommitID,
+		ApprovedSHA: s.approval.CommitID,
 		HeadSHA:     c.headSHA,
 		Approved:    approvedDDL,
 		Head:        headDDL,
-	})
+	}, true
 }
 
 // reviewGateInputPaths lists the database's schema inputs the gate protects:
