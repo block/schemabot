@@ -1370,17 +1370,38 @@ type ApplyCommentStore interface {
 	ClearPendingFreeze(ctx context.Context, applyID int64, commentState string) error
 
 	// ClaimSummaryComment atomically claims the right to publish the terminal
-	// summary comment for an apply by inserting the summary marker as a claim
-	// sentinel (github_comment_id = 0). A superseded marker — a stop's summary
-	// consumed by a resume rotation — does not block the claim: it is converted
-	// back into a claim sentinel, since the summary it recorded belongs to an
-	// earlier terminal state. Exactly one caller wins per terminal state: the
-	// winner posts the summary and records the real comment ID via Upsert; every
-	// loser skips. The claim — not the apply lease — is the exactly-once
-	// authority for the summary, so a writer whose lease was re-claimed (stop
-	// reconciliation, resume) can still be beaten to the post without a
-	// duplicate. Returns true when this caller won the claim.
-	ClaimSummaryComment(ctx context.Context, applyID int64) (bool, error)
+	// summary comment for an apply in terminalState by inserting the summary
+	// marker as a claim sentinel (github_comment_id = 0). A marker that records
+	// a summary posted for an earlier terminal state does not block the claim:
+	// it is converted back into a claim sentinel. That is a marker a resume
+	// rotation superseded, or an active marker whose SummarizedState names a
+	// different terminal state, such as a stop's summary when the started apply
+	// completes before any rotation consumed it. Exactly one caller wins per
+	// terminal state: the winner posts the summary and records the real comment
+	// ID and the state it describes via Upsert; every loser skips. The claim —
+	// not the apply lease — is the exactly-once authority for the summary, so a
+	// writer whose lease was re-claimed (stop reconciliation, resume) can still
+	// be beaten to the post without a duplicate. Returns true when this caller
+	// won the claim.
+	ClaimSummaryComment(ctx context.Context, applyID int64, terminalState string) (bool, error)
+
+	// SupersedeSummaryForResume consumes the summary marker a resume rotation
+	// rotated for, so the apply's next terminal publish claims a fresh summary.
+	// It supersedes the marker only while the marker still records
+	// githubCommentID and the apply is still active, and reports whether it
+	// did. A terminal publish that came after the summary the rotation saw owns
+	// the marker from then on, and consuming it would cost that publish its
+	// summary or the apply's next resume its rotation.
+	SupersedeSummaryForResume(ctx context.Context, applyID int64, githubCommentID int64) (bool, error)
+
+	// MarkSummaryRotatedPast records that a resume rotation rotated past the
+	// summary marker while the apply had already reached its next terminal
+	// state: it sets the marker's SummarizedState to SummaryRotatedPast, only
+	// while the marker is active, still records githubCommentID, and the apply
+	// is terminal, and reports whether it did. The marker stays active for the
+	// next resume to rotate on, and the terminal state the apply reached is
+	// still owed its own summary, which the marker no longer blocks.
+	MarkSummaryRotatedPast(ctx context.Context, applyID int64, githubCommentID int64) (bool, error)
 
 	// ReclaimStaleSummaryClaim takes over a summary claim sentinel whose holder
 	// crashed between claiming and posting: a sentinel (github_comment_id = 0)

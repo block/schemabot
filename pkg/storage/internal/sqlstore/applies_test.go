@@ -3800,12 +3800,12 @@ func TestApplyStore_FindMissingSummaryComment_SummaryClaimSentinels(t *testing.T
 	store := NewMySQL(testDB)
 
 	freshClaim := seedApplyMissingSummary(t, store, "apply_claim_fresh", state.Apply.Completed, 710)
-	won, err := store.ApplyComments().ClaimSummaryComment(ctx, freshClaim.ID)
+	won, err := store.ApplyComments().ClaimSummaryComment(ctx, freshClaim.ID, state.Apply.Completed)
 	require.NoError(t, err)
 	require.True(t, won)
 
 	staleClaim := seedApplyMissingSummary(t, store, "apply_claim_stale", state.Apply.Completed, 711)
-	won, err = store.ApplyComments().ClaimSummaryComment(ctx, staleClaim.ID)
+	won, err = store.ApplyComments().ClaimSummaryComment(ctx, staleClaim.ID, state.Apply.Completed)
 	require.NoError(t, err)
 	require.True(t, won)
 	backdateSummaryClaim(t, staleClaim.ID)
@@ -3852,6 +3852,62 @@ func TestApplyStore_FindMissingSummaryComment_SupersededSummaryMarker(t *testing
 	require.NoError(t, err)
 	require.Len(t, applies, 1)
 	assert.Equal(t, superseded.ApplyIdentifier, applies[0].ApplyIdentifier)
+}
+
+// TestApplyStore_FindMissingSummaryComment_SummaryForEarlierTerminalState
+// verifies an active posted summary marker counts as missing when it describes
+// a terminal state the apply has since left: a stopped apply that was started
+// and completed is owed its completion summary even though the stop's summary
+// is still recorded and posted, and a stopped apply whose marker a resume
+// rotated past is owed its stop summary. A marker for the apply's current
+// state, and a marker recorded before the summarized state was tracked, still
+// count as posted.
+func TestApplyStore_FindMissingSummaryComment_SummaryForEarlierTerminalState(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+	stopped := state.Apply.Stopped
+	completed := state.Apply.Completed
+
+	earlier := seedApplyMissingSummary(t, store, "apply_summary_for_stop", state.Apply.Completed, 730)
+	require.NoError(t, store.ApplyComments().Upsert(ctx, &storage.ApplyComment{
+		ApplyID:         earlier.ID,
+		CommentState:    state.Comment.Summary,
+		GitHubCommentID: 2005,
+		SummarizedState: &stopped,
+	}))
+
+	current := seedApplyMissingSummary(t, store, "apply_summary_for_completion", state.Apply.Completed, 731)
+	require.NoError(t, store.ApplyComments().Upsert(ctx, &storage.ApplyComment{
+		ApplyID:         current.ID,
+		CommentState:    state.Comment.Summary,
+		GitHubCommentID: 2006,
+		SummarizedState: &completed,
+	}))
+
+	untracked := seedApplyMissingSummary(t, store, "apply_summary_untracked", state.Apply.Completed, 732)
+	require.NoError(t, store.ApplyComments().Upsert(ctx, &storage.ApplyComment{
+		ApplyID:         untracked.ID,
+		CommentState:    state.Comment.Summary,
+		GitHubCommentID: 2007,
+	}))
+
+	rotatedPast := storage.SummaryRotatedPast
+	stoppedAgain := seedApplyMissingSummary(t, store, "apply_summary_rotated_past", state.Apply.Stopped, 733)
+	require.NoError(t, store.ApplyComments().Upsert(ctx, &storage.ApplyComment{
+		ApplyID:         stoppedAgain.ID,
+		CommentState:    state.Comment.Summary,
+		GitHubCommentID: 2008,
+		SummarizedState: &rotatedPast,
+	}))
+
+	applies, err := store.Applies().FindMissingSummaryComment(ctx, 0, 100)
+	require.NoError(t, err)
+	identifiers := make([]string, 0, len(applies))
+	for _, apply := range applies {
+		identifiers = append(identifiers, apply.ApplyIdentifier)
+	}
+	assert.ElementsMatch(t, []string{earlier.ApplyIdentifier, stoppedAgain.ApplyIdentifier}, identifiers)
 }
 
 func TestApplyStore_GetByPR(t *testing.T) {

@@ -105,6 +105,11 @@ type CommentObserver struct {
 	// lands.
 	resumeSupersedePending bool
 
+	// resumeSummaryCommentID is the GitHub comment ID of the summary this
+	// observer's resume rotation rotated for: the only summary marker the
+	// rotation may consume.
+	resumeSummaryCommentID int64
+
 	// settledControlRotations records the control-phase rotations this
 	// observer already rotated for (or confirmed the tracked comment
 	// covers), so later ticks skip the storage re-read. Guarded by mu like
@@ -1156,6 +1161,7 @@ func (o *CommentObserver) rotateProgressCommentForResume(apply *storage.Apply, t
 		o.logInfo(apply, "observer: summary claim sentinel is live; deferring resume rotation until the summary posts")
 		return false
 	}
+	o.resumeSummaryCommentID = summary.GitHubCommentID
 
 	tracked, err := o.stor.ApplyComments().Get(ctx, o.applyID, state.Comment.Progress)
 	if err != nil {
@@ -1207,22 +1213,54 @@ func (o *CommentObserver) rotateProgressCommentForResume(apply *storage.Apply, t
 	return true
 }
 
-// supersedeResumeSummaryMarker consumes the summary marker after a resume
-// rotation under its own deadline: the rotation's GitHub round-trips can spend
-// most of the tick's context budget, and this write is the durable record that
-// the rotation happened — left unconsumed, the marker keeps advertising a
-// summary that was already rotated away, and the next terminal publish would
-// lose both claim legs and never post its summary. On failure the pending flag
-// keeps later ticks retrying just this write until it lands.
+// supersedeResumeSummaryMarker consumes the summary marker a resume rotation
+// rotated for, under its own deadline: the rotation's GitHub round-trips can
+// spend most of the tick's context budget, and this write is the durable
+// record that the rotation happened — left unconsumed, the marker keeps
+// advertising a summary that was already rotated away, and the next terminal
+// publish of the same state would lose its claim and never post its summary.
+// On failure the pending flag keeps later ticks retrying just this write until
+// it lands.
+//
+// The write consumes only the summary the rotation saw, and only while the
+// apply is still active. The apply can reach its next terminal state while the
+// rotation posts its fresh comment, and that terminal publish then owns the
+// marker: when it claimed the marker first, the marker records the summary it
+// is posting, which the rotation leaves alone. When the marker still records
+// the summary the rotation saw, consuming it would leave the apply's next
+// resume nothing to rotate on, so the rotation instead marks it rotated past:
+// it stays active for that resume, and no longer blocks the summary the
+// terminal state is owed.
 func (o *CommentObserver) supersedeResumeSummaryMarker(apply *storage.Apply) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if err := o.stor.ApplyComments().Supersede(o.contextWithApplyLease(ctx, apply), o.applyID, state.Comment.Summary); err != nil {
+	leaseCtx := o.contextWithApplyLease(ctx, apply)
+	consumed, err := o.stor.ApplyComments().SupersedeSummaryForResume(leaseCtx, o.applyID, o.resumeSummaryCommentID)
+	if err != nil {
 		o.resumeSupersedePending = true
-		o.logError(apply, "observer: failed to consume summary marker after resume rotation; retrying on the next tick", "error", err)
+		o.logError(apply, "observer: failed to consume summary marker after resume rotation; retrying on the next tick",
+			"error", err, "summary_comment_id", o.resumeSummaryCommentID)
+		return
+	}
+	if consumed {
+		o.resumeSupersedePending = false
+		return
+	}
+	rotatedPast, err := o.stor.ApplyComments().MarkSummaryRotatedPast(leaseCtx, o.applyID, o.resumeSummaryCommentID)
+	if err != nil {
+		o.resumeSupersedePending = true
+		o.logError(apply, "observer: failed to mark summary marker rotated past after resume rotation; retrying on the next tick",
+			"error", err, "summary_comment_id", o.resumeSummaryCommentID)
 		return
 	}
 	o.resumeSupersedePending = false
+	if rotatedPast {
+		o.logInfo(apply, "observer: apply reached another terminal state during resume rotation; summary marker kept for the next resume and marked rotated past so that state's summary posts",
+			"summary_comment_id", o.resumeSummaryCommentID)
+		return
+	}
+	o.logInfo(apply, "observer: summary marker left in place after resume rotation; it records a later terminal summary, or the apply resumed again and its next rotation consumes it",
+		"summary_comment_id", o.resumeSummaryCommentID)
 }
 
 // Control-operation phases recorded on tracked progress comments
@@ -1911,7 +1949,7 @@ func (o *CommentObserver) publishClaimedSummary(apply *storage.Apply, body strin
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	won, err := o.stor.ApplyComments().ClaimSummaryComment(ctx, o.applyID)
+	won, err := o.stor.ApplyComments().ClaimSummaryComment(ctx, o.applyID, apply.State)
 	if err != nil {
 		o.logError(apply, "observer: failed to claim terminal summary; summary not posted, left for reconciliation",
 			"error", err)
@@ -1937,10 +1975,12 @@ func (o *CommentObserver) publishClaimedSummary(apply *storage.Apply, body strin
 		return
 	}
 
+	summarized := apply.State
 	marker := &storage.ApplyComment{
 		ApplyID:         o.applyID,
 		CommentState:    state.Comment.Summary,
 		GitHubCommentID: commentID,
+		SummarizedState: &summarized,
 	}
 	if err := o.stor.ApplyComments().Upsert(ctx, marker); err != nil {
 		// The comment is live on the PR but the marker still looks like a claim
@@ -1986,10 +2026,12 @@ func (o *CommentObserver) markSummaryPosted(apply *storage.Apply, editedCommentS
 		return
 	}
 
+	summarized := apply.State
 	marker := &storage.ApplyComment{
 		ApplyID:         o.applyID,
 		CommentState:    state.Comment.Summary,
 		GitHubCommentID: edited.GitHubCommentID,
+		SummarizedState: &summarized,
 	}
 	if !o.leaseStillOwnsObserver(apply, "record summary marker") {
 		return
