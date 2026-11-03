@@ -2565,13 +2565,13 @@ func TestRenderMultiDeploymentApplyComment_UnreportedTargetCountsAtItsOperationS
 
 // An apply of the whole rollout that held a target back says so on every
 // comment it posts, from the first one to the terminal summary, so a target
-// held only since the plan comment is disclosed before anything runs, and
-// the held target never reads as forgotten. A member's own section does not
+// held only since the plan comment is disclosed, and the held target never
+// reads as forgotten. A member's own section does not
 // repeat it.
 func TestApplyCommentsNameTheTargetsTheApplyHeldBack(t *testing.T) {
 	held := []HeldTarget{{Target: "us", Reason: "applying its plan discards the unfinished copy of users"}}
 	const notice = "⚠️ **Held back target `us`**: applying its plan discards the unfinished copy of users.\n\n" +
-		"The schema check keeps blocking merge until every target has the change, so apply again once it can run.\n"
+		"The schema check keeps blocking merge until every target has the change, so apply again once it can run, or apply it with `--target`.\n"
 
 	started := RenderApplyStarted(ApplyStatusCommentData{
 		ApplyID: "apply-1", Database: "orders", Environment: "production", State: state.Apply.Pending, HeldTargets: held,

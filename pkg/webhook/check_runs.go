@@ -181,7 +181,7 @@ var narrowedApplyBlock = checkBlockReason{
 // a plan or apply of every target does (MG-12).
 var heldTargetsBlock = checkBlockReason{
 	blockingReason: checkstate.BlockHeldTargets,
-	message:        "The apply held back targets whose plans could not run. Apply the environment again once they can to finish.",
+	message:        "The apply held back targets whose plans could not run. To finish, apply the environment again once they can, or apply each one with `--target`.",
 }
 
 // planFailedUnrecordedBlock is carried by the failing aggregate posted for an

@@ -856,7 +856,7 @@ func (h *Handler) heldTargetsCompletedSummary(apply *storage.Apply, held []stora
 	for _, member := range held {
 		names = append(names, h.narrowedTargetName(member.Member, apply.Database, apply.Environment))
 	}
-	return clampDriftSummary(fmt.Sprintf("held back `%s`; apply the environment again to finish", strings.Join(names, "`, `")))
+	return clampDriftSummary(fmt.Sprintf("held back `%s`; apply again, or apply each with `--target`", strings.Join(names, "`, `")))
 }
 
 // completedForwardTaskBeforeCancellation returns durable evidence that the

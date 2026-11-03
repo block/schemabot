@@ -766,7 +766,7 @@ func TestRenderPlanComment_PrimaryTargetWithWorkHoldsBackTheTargetThatCannotRun(
 
 	out := RenderPlanComment(data)
 	assert.Contains(t, out, "⚠️ **Holding back target `primary/testapp_2`**: its plan carries changes its target's engine refuses.\n\n"+
-		"The apply runs every other target. The schema check keeps blocking merge until every target has the change, so apply again once the held targets can run.\n\n"+
+		"The apply runs every other target, and a held target too if it can run by the time the apply starts. The schema check keeps blocking merge until every target has the change, so apply again once the held targets can run, or apply each one with `--target`.\n\n"+
 		"▶️ **To apply**, comment:\n```\nschemabot apply -e production\n```\n")
 	assert.NotContains(t, out, "the primary target already has this schema", "the primary target still has work")
 	assert.NotContains(t, out, "every target or none")
@@ -784,7 +784,7 @@ func TestRenderPlanComment_ListsEveryHeldTarget(t *testing.T) {
 	assert.Contains(t, out, "⚠️ **Holding back 2 targets**:\n"+
 		"- `primary/testapp_2`: its plan carries changes its target's engine refuses\n"+
 		"- `primary/testapp_3`: applying its plan discards the unfinished copy of users in namespace \"testapp\"\n\n"+
-		"The apply runs every other target.")
+		"The apply runs every other target, and a held target too if it can run by the time the apply starts.")
 	assert.Contains(t, out, "schemabot apply -e production")
 }
 

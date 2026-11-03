@@ -777,7 +777,7 @@ func writeHeldTargets(sb *strings.Builder, held []HeldTarget, nothingRuns bool) 
 		sb.WriteString("The schema check keeps blocking merge until every target has the change.\n")
 		return
 	}
-	sb.WriteString("The apply runs every other target. The schema check keeps blocking merge until every target has the change, so apply again once the held targets can run.\n\n")
+	sb.WriteString("The apply runs every other target, and a held target too if it can run by the time the apply starts. The schema check keeps blocking merge until every target has the change, so apply again once the held targets can run, or apply each one with `--target`.\n\n")
 }
 
 // applyFailsOnRefusedChange reports whether the plan carries a change the

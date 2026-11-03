@@ -360,7 +360,7 @@ func TestApplyThatHeldTargetsBackCompletesWithoutPassingTheCheck(t *testing.T) {
 	assert.True(t, completed.HasChanges, "the held target still needs the change")
 	assert.Equal(t, applyID, completed.ApplyID, "the apply keeps ownership of the check")
 	assert.Equal(t, 1, completed.RolloutTargetsWithWork, "the held target is the one still waiting for the change")
-	assert.Equal(t, "held back `prod/payments-002`; apply the environment again to finish", completed.ChangeSummary)
+	assert.Equal(t, "held back `prod/payments-002`; apply again, or apply each with `--target`", completed.ChangeSummary)
 
 	wholePlan := &apitypes.PlanResponse{
 		PlanID: "plan-held-target",

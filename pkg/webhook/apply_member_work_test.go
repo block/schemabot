@@ -695,3 +695,45 @@ func TestUnverifiedMemberWorkMessage(t *testing.T) {
 func staticName(name string) func() string {
 	return func() string { return name }
 }
+
+// A rollout can hold targets back for different reasons at once: a target whose
+// apply would discard an unfinished copy is held without its plan being read,
+// and a target whose plan its engine refuses is held from its plan. Every other
+// target with work runs.
+func TestHeldMembersHoldsEachTargetForItsOwnReason(t *testing.T) {
+	primary := storedPlan(1, "plan_round", addEmail)
+	primary.Deployment, primary.Target = "eu", "payments"
+	atStake := storedPlan(2, "plan_us", addEmail)
+	atStake.Deployment, atStake.Target = "us", "payments"
+	refused := storedPlan(3, "plan_ap", addEmail)
+	refused.Deployment, refused.Target = "ap", "payments"
+	refused.Namespaces["shop"].Tables[0].ExecutionMode = "blocked"
+	runs := storedPlan(4, "plan_sg", addEmail)
+	runs.Deployment, runs.Target = "sg", "payments"
+	store := &primaryConfirmationPlanStore{rollbackConfirmTestPlanStore: rollbackConfirmTestPlanStore{
+		plans: map[string]*storage.Plan{primary.PlanIdentifier: primary},
+	}}
+	for _, member := range []*storage.Plan{atStake, refused, runs} {
+		member.PrimaryPlanIdentifier = primary.PlanIdentifier
+		store.plans[member.PlanIdentifier] = member
+	}
+	h := &Handler{
+		service: api.New(&rollbackConfirmTestStorage{plans: store}, &api.ServerConfig{}, nil, testLogger()),
+		logger:  testLogger(),
+	}
+	copyReason := `applying its plan discards the unfinished copy of customers in namespace "shop"`
+	rollout := reviewDriftOutcome{state: driftClean, work: memberWork{
+		pending: 4, members: 4, others: 3,
+		names:         []string{"eu", "us", "ap", "sg"},
+		copiesAtStake: []memberRefusal{{member: "us/payments", target: "us", reason: copyReason}},
+		displayNames:  map[string]string{"eu/payments": "eu", "us/payments": "us", "ap/payments": "ap", "sg/payments": "sg"},
+	}}
+
+	hold, err := h.heldMembers(t.Context(), primary.PlanIdentifier, "production", rollout, false)
+	require.NoError(t, err)
+	assert.Equal(t, []storage.HeldMember{
+		{Member: "us/payments", Target: "us", Reason: copyReason},
+		{Member: "ap/payments", Target: "ap", Reason: "its plan carries changes its target's engine refuses"},
+	}, hold.members())
+	assert.False(t, hold.leavesNothingToRun(), "sg and the primary target still run")
+}

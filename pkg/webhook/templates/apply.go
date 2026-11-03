@@ -1564,7 +1564,7 @@ func writeApplyHeldTargets(sb *strings.Builder, held []HeldTarget) {
 	}
 	if len(held) == 1 {
 		fmt.Fprintf(sb, "\n"+glyph.Attention+" **Held back target %s**: %s.\n\n", inlineCode(held[0].Target), reason(held[0]))
-		sb.WriteString("The schema check keeps blocking merge until every target has the change, so apply again once it can run.\n")
+		sb.WriteString("The schema check keeps blocking merge until every target has the change, so apply again once it can run, or apply it with `--target`.\n")
 		return
 	}
 	fmt.Fprintf(sb, "\n"+glyph.Attention+" **Held back %d targets**:\n", len(held))

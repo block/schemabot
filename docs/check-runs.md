@@ -1041,15 +1041,19 @@ refuses, an unfinished copy it would discard, or work the apply's operation
 shape has no place for. When the primary target is already at the desired
 schema, that includes any per-shard or finalizer change on another target. The
 primary target is never held back, since the apply is laid out from its plan.
-The plan comment and each of the apply's own comments name every held target
-and why, so a target held only since the plan comment was posted is disclosed
-before anything runs. The held target's work and copies are left untouched,
+The plan comment names every held target and why, and says that a held target
+runs too if it can by the time the apply starts. Each of the apply's own
+comments, from its first progress comment through its terminal summary, names
+the targets the apply held, so a target held only since the plan comment was
+posted is disclosed there. The held target's work and copies are left untouched,
 and the apply records the targets it held. When it completes, the record ends
 `action_required` with `held_targets` rather than passing, counting only the
 held targets as still pending, since they still need the change (MG-12). The
 record stays owned by the apply, so a later commit that removes the schema
 change keeps it blocked (MG-6). Applying the environment again once the held
-targets can run finishes the rollout. Only when the
+targets can run, or applying each one with `--target`, finishes the rollout. A
+target whose data plane does not report unfinished copies is held on every
+apply of the whole environment, so it finishes with `--target`. Only when the
 primary target has no work and every other target with work is held does the
 apply refuse, since it would run nothing. These decisions come before the
 pause for a fresh confirmation, so an apply never asks for a confirmation that
