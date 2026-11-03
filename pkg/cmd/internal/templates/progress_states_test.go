@@ -3,6 +3,7 @@ package templates
 import (
 	"io"
 	"os"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -1176,6 +1177,57 @@ func TestFormatTableProgressOperatorHaltedBars(t *testing.T) {
 	})
 	assert.Contains(t, failed, "❌ Failed")
 	assert.Contains(t, failed, ui.ColorRed)
+}
+
+// Every task state other than running renders its own table row. A state that
+// fell through to the running row would show a table as "Running..." when it
+// is waiting on an operator, reverted, or otherwise not moving at all.
+func TestFormatTableProgress_EveryStateHasItsOwnRow(t *testing.T) {
+	table := TableProgress{TableName: "users", ChangeType: "alter"}
+	table.Status = state.Task.Running
+	running := FormatTableProgress(table)
+	require.Contains(t, running, "Running...")
+
+	v := reflect.ValueOf(state.Task)
+	for i := range v.NumField() {
+		status := v.Field(i).String()
+		require.NotEmpty(t, status, "state.Task.%s is empty", v.Type().Field(i).Name)
+		if status == state.Task.Running {
+			continue
+		}
+		t.Run(status, func(t *testing.T) {
+			table.Status = status
+			assert.NotContainsf(t, FormatTableProgress(table), "Running...",
+				"state.Task.%s renders as a running table", v.Type().Field(i).Name)
+		})
+	}
+}
+
+// A table whose deploy is deferred reads as waiting for the deploy, the same
+// words the PR comment uses, rather than as a copy that is still running.
+// Row counters the table carries from before it settled do not bring back a
+// copy bar, the table keeps its DDL, and it still lists its shards.
+func TestFormatTableProgress_WaitingForDeploy(t *testing.T) {
+	output := ansiEscape.ReplaceAllString(FormatTableProgress(TableProgress{
+		TableName:       "users",
+		ChangeType:      "alter",
+		Status:          state.Task.WaitingForDeploy,
+		DDL:             "ALTER TABLE `users` ADD COLUMN `nickname` varchar(64)",
+		RowsCopied:      400,
+		RowsTotal:       1000,
+		PercentComplete: 40,
+		Shards: []ShardProgress{
+			{Shard: "-80", Status: state.Task.WaitingForDeploy},
+			{Shard: "80-", Status: state.Task.WaitingForDeploy},
+		},
+	}), "")
+
+	assert.Contains(t, output, "users: ⏸️ Waiting for deploy\n")
+	assert.NotContains(t, output, "Running...")
+	assert.NotContains(t, output, "🟦", "the stale counters do not render a copy bar")
+	assert.NotContains(t, output, "Rows: 400", "the stale counters do not render copy progress")
+	assert.Contains(t, output, "ADD COLUMN `nickname`")
+	assert.Contains(t, output, "Shards: 2")
 }
 
 func TestThrottleReferenceRequiresActiveRecognizedSignal(t *testing.T) {
