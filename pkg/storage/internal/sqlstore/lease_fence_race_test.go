@@ -484,6 +484,78 @@ func testLeaseFencedWritesFailClosedAgainstConcurrentSteal(t *testing.T, newStor
 		assert.Equal(t, "failure", stored.Conclusion)
 		assert.Equal(t, apply.ID, stored.ApplyID)
 	})
+
+	// A resume rotation's write to the summary marker it rotated for reads
+	// the apply's lease and state under a lock, so a displaced driver's write
+	// waits on the apply row and fails closed once the steal commits.
+	t.Run("resume summary supersede under an apply lease", func(t *testing.T) {
+		ctx := t.Context()
+		store := newStore(t)
+		lock := storagetest.CreateLock(t, store, "fence_resume_summary_db", storage.DatabaseTypeMySQL)
+		apply := storagetest.CreateClaimedApply(t, store, lock, "apply_fence_resume_summary", 943, "driver-a")
+		stopped := state.Apply.Stopped
+		require.NoError(t, store.ApplyComments().Upsert(ctx, &storage.ApplyComment{
+			ApplyID: apply.ID, CommentState: state.Comment.Summary, GitHubCommentID: 9301, SummarizedState: &stopped,
+		}))
+
+		displacedCtx := storage.WithApplyLease(ctx, storage.ApplyLease{ApplyID: apply.ID, Owner: apply.LeaseOwner, Token: apply.LeaseToken})
+		err := writeDuringUncommittedSteal(t, store, waiting, "lease_token FROM applies",
+			func() error {
+				_, err := store.ApplyComments().SupersedeSummaryForResume(displacedCtx, apply.ID, 9301)
+				return err
+			},
+			`UPDATE applies SET lease_owner = ?, lease_token = ? WHERE id = ?`, "driver-b", "tok-b", apply.ID)
+		require.ErrorIs(t, err, storage.ErrApplyLeaseLost)
+		marker, err := store.ApplyComments().Get(ctx, apply.ID, state.Comment.Summary)
+		require.NoError(t, err)
+		require.NotNil(t, marker)
+		assert.Nil(t, marker.SupersededAt, "a displaced driver must not consume the summary marker")
+
+		ownerCtx := storage.WithApplyLease(ctx, storage.ApplyLease{ApplyID: apply.ID, Owner: "driver-b", Token: "tok-b"})
+		consumed, err := store.ApplyComments().SupersedeSummaryForResume(ownerCtx, apply.ID, 9301)
+		require.NoError(t, err)
+		assert.True(t, consumed)
+	})
+
+	// The rotation decides whether to consume the marker from the apply's
+	// state, so a terminal transition that is in flight when the rotation
+	// writes must be seen, not the state the transition is replacing.
+	// Otherwise the rotation consumes the marker the terminal state's own
+	// summary claim needs to find in place, and that summary is lost. The
+	// transition is left uncommitted while the rotation writes; the write
+	// waits on the apply row and, once the transition commits, leaves the
+	// marker active.
+	t.Run("resume summary supersede during a terminal transition", func(t *testing.T) {
+		ctx := t.Context()
+		store := newStore(t)
+		lock := storagetest.CreateLock(t, store, "fence_resume_terminal_db", storage.DatabaseTypeMySQL)
+		apply := storagetest.CreateClaimedApply(t, store, lock, "apply_fence_resume_terminal", 944, "driver-a")
+		stopped := state.Apply.Stopped
+		require.NoError(t, store.ApplyComments().Upsert(ctx, &storage.ApplyComment{
+			ApplyID: apply.ID, CommentState: state.Comment.Summary, GitHubCommentID: 9401, SummarizedState: &stopped,
+		}))
+
+		ownerCtx := storage.WithApplyLease(ctx, storage.ApplyLease{ApplyID: apply.ID, Owner: apply.LeaseOwner, Token: apply.LeaseToken})
+		var consumed bool
+		err := writeDuringUncommittedSteal(t, store, waiting, "lease_token FROM applies",
+			func() error {
+				var err error
+				consumed, err = store.ApplyComments().SupersedeSummaryForResume(ownerCtx, apply.ID, 9401)
+				return err
+			},
+			`UPDATE applies SET state = ? WHERE id = ?`, state.Apply.Completed, apply.ID)
+		require.NoError(t, err)
+		assert.False(t, consumed, "a rotation must not consume the marker once the apply is terminal again")
+		marker, err := store.ApplyComments().Get(ctx, apply.ID, state.Comment.Summary)
+		require.NoError(t, err)
+		require.NotNil(t, marker)
+		assert.Nil(t, marker.SupersededAt, "the marker stays active for the terminal state's summary claim")
+		assert.Equal(t, int64(9401), marker.GitHubCommentID)
+
+		marked, err := store.ApplyComments().MarkSummaryRotatedPast(ownerCtx, apply.ID, 9401)
+		require.NoError(t, err)
+		assert.True(t, marked, "the rotation marks the marker rotated past instead")
+	})
 }
 
 // loadCheck reads the stored check state for check's target, failing the test

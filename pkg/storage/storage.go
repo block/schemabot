@@ -1375,14 +1375,16 @@ type ApplyCommentStore interface {
 	// a summary posted for an earlier terminal state does not block the claim:
 	// it is converted back into a claim sentinel. That is a marker a resume
 	// rotation superseded, or an active marker whose SummarizedState names a
-	// different terminal state, such as a stop's summary when the started apply
-	// completes before any rotation consumed it. Exactly one caller wins per
-	// terminal state: the winner posts the summary and records the real comment
-	// ID and the state it describes via Upsert; every loser skips. The claim —
-	// not the apply lease — is the exactly-once authority for the summary, so a
-	// writer whose lease was re-claimed (stop reconciliation, resume) can still
-	// be beaten to the post without a duplicate. Returns true when this caller
-	// won the claim.
+	// different terminal state the apply can leave, such as a stop's summary
+	// when the started apply completes before any rotation consumed it. A
+	// marker for a settled state blocks every claim, since that outcome is
+	// final and a claim for another state comes from a stale read. Exactly one
+	// caller wins per terminal state: the winner posts the summary and records
+	// the real comment ID and the state it describes via Upsert; every loser
+	// skips. The claim — not the apply lease — is the exactly-once authority
+	// for the summary, so a writer whose lease was re-claimed (stop
+	// reconciliation, resume) can still be beaten to the post without a
+	// duplicate. Returns true when this caller won the claim.
 	ClaimSummaryComment(ctx context.Context, applyID int64, terminalState string) (bool, error)
 
 	// SupersedeSummaryForResume consumes the summary marker a resume rotation

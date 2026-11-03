@@ -382,8 +382,9 @@ func TestApplyComments(t *testing.T, h Harness) {
 	// consumes the stop's summary is owed the completion summary: the
 	// completion claim converts the stop's marker back into a claim sentinel
 	// exactly once. A claim for the state the marker already describes loses,
-	// and a marker recorded without its state blocks every claim, as it did
-	// before the state was tracked.
+	// a marker for a settled state blocks every claim because a settled
+	// outcome is final, and a marker recorded without its state blocks every
+	// claim, as it did before the state was tracked.
 	t.Run("ClaimSummaryCommentForAnotherTerminalState", func(t *testing.T) {
 		ctx := t.Context()
 		store := h.NewStorage(t)
@@ -426,6 +427,15 @@ func TestApplyComments(t *testing.T, h Harness) {
 		won, err = store.ApplyComments().ClaimSummaryComment(ctx, apply.ID, state.Apply.Completed)
 		require.NoError(t, err)
 		assert.False(t, won, "a summary recorded without its state must block the claim")
+
+		for i, settled := range state.SettledApplyStates {
+			require.NoError(t, store.ApplyComments().Upsert(ctx, &storage.ApplyComment{
+				ApplyID: apply.ID, CommentState: state.Comment.Summary, GitHubCommentID: int64(9110 + i), SummarizedState: &settled,
+			}))
+			won, err = store.ApplyComments().ClaimSummaryComment(ctx, apply.ID, state.Apply.Stopped)
+			require.NoError(t, err)
+			assert.False(t, won, "a %s summary must block a claim from a stale stopped read, since a settled outcome is final", settled)
+		}
 	})
 
 	// SupersedeSummaryForResume verifies a resume rotation consumes only the

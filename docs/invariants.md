@@ -1634,7 +1634,8 @@ original, so the failure has to recur to recur.
 Single-posting is also scoped to a terminal state, not to the apply's whole life. The marker
 records the terminal state its summary describes, so an apply that stops, posts its summary, and
 later resumes gets its own summary for the next terminal state it reaches: the claim for that state
-re-arms on a marker that a resume superseded or that names another state. Recovery is likewise separated by case: a claim
+re-arms on a marker that a resume superseded or that names another state the apply can leave,
+while a marker for a settled outcome blocks every later claim. Recovery is likewise separated by case: a claim
 sentinel abandoned by a crashed publisher is recovered by its own stale-claim path, while the
 ordinary claim path will only reclaim a marker that records an already-posted comment. Stealing an
 in-flight sentinel would hand two writers the same claim, which is the unbounded duplication this
