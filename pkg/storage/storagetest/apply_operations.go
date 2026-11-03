@@ -1895,6 +1895,33 @@ func TestApplyOperations(t *testing.T, h Harness) {
 		assert.NotNil(t, operation.StartedAt)
 	})
 
+	// An operation row carries no terminal-state guard: the lease fence alone
+	// decides who may write it. No peer can claim a terminal operation, so what
+	// refuses a late write is the drive's end handing its lease back: after
+	// that, a write under the old lease fails and the row stays terminal.
+	t.Run("UpdateState_EndedDriveCannotWriteOverTerminalOperation", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "operation_displaced_db", storage.DatabaseTypeMySQL)
+		apply := CreateApply(t, store, lock, "apply_operation_displaced", 908)
+		opID := createOperation(t, store, apply.ID, "region-a", "schema")
+		claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-a")
+		require.NoError(t, err)
+		require.NotNil(t, claimed)
+		ownedCtx := storage.WithOperationLease(ctx, claimed.Lease())
+
+		require.NoError(t, store.ApplyOperations().MarkFailed(ownedCtx, opID, "engine failed"))
+		released, err := store.ApplyOperations().ReleaseFinishedClaim(ctx, claimed.Lease())
+		require.NoError(t, err)
+		require.True(t, released)
+
+		require.ErrorIs(t, store.ApplyOperations().UpdateState(ownedCtx, opID, state.ApplyOperation.Running), storage.ErrApplyLeaseLost)
+		operation, err := store.ApplyOperations().Get(ctx, opID)
+		require.NoError(t, err)
+		require.NotNil(t, operation)
+		assert.Equal(t, state.ApplyOperation.Failed, operation.State, "a drive that has ended must not reopen a terminal operation")
+	})
+
 	// MarkPendingStoppedByApply verifies the bulk transition changes only
 	// pending siblings, leaves running and terminal rows intact, preserves the
 	// resumable stopped timestamp contract, and enforces the caller's lease.
