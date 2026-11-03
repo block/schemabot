@@ -278,6 +278,41 @@ func (s *applyOperationStore) UpdateState(ctx context.Context, id int64, newStat
 		[]JoinedUpdateAssignment{{Column: "state", Expr: "?"}}, newState)
 }
 
+// MarkResumedRunning moves a resumed operation from resuming to running. The
+// start claim leaves the row resuming while its drive asks the engine to pick
+// the work up again; once the engine is working, running is what the row is.
+// The update is a compare-and-set on resuming, so a row a drive has since
+// settled, or a peer's state written over it, is left alone. It is fenced on
+// the operation lease for this row.
+func (s *applyOperationStore) MarkResumedRunning(ctx context.Context, id int64) (bool, error) {
+	lease, ok := storage.OperationLeaseFromContext(ctx)
+	if !ok {
+		return false, fmt.Errorf("mark resumed apply_operation %d running: no operation lease in context", id)
+	}
+	if !lease.Valid() || lease.OperationID != id {
+		return false, fmt.Errorf("operation lease for apply_operation %d does not authorize marking apply_operation %d running: %w", lease.OperationID, id, storage.ErrApplyLeaseLost)
+	}
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE apply_operations
+		SET state = ?, updated_at = NOW()
+		WHERE id = ? AND state = ? AND lease_token = ?
+	`, state.ApplyOperation.Running, id, state.ApplyOperation.Resuming, lease.Token)
+	if err != nil {
+		return false, fmt.Errorf("mark resumed apply_operation %d running: %w", id, err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("read rows affected marking resumed apply_operation %d running: %w", id, err)
+	}
+	if rows == 1 {
+		return true, nil
+	}
+	if err := ensureOperationLeaseStillOwned(ctx, s.db, lease); err != nil {
+		return false, err
+	}
+	return false, nil
+}
+
 // MarkStarted sets state=running and stamps started_at=NOW().
 // Returns storage.ErrApplyOperationNotFound if no row matches the ID.
 //
@@ -2600,6 +2635,21 @@ func (s *applyOperationStore) MarkPendingCancelledByApply(ctx context.Context, a
 	return s.markPendingByApply(ctx, applyID, state.ApplyOperation.Cancelled, "cancel", neverStartedRows)
 }
 
+// RequeueNeverStartedForStartByApply moves every stopped operation of an apply
+// that never started back to pending while a start request is pending and
+// neither a stop nor a cancel request is. A stop moved such a row from
+// pending to stopped before any driver claimed it, so it wrote nothing; the
+// pending start makes it queued work again. Back at pending, it starts through the same claim gates it
+// would have resumed through, and the rollout reads as queued rather than
+// stopped while the start works through the members ahead of it. Checking
+// both requests in the update itself means a stop accepted after the start,
+// which completes the start, keeps every row it stopped, and a pending cancel
+// settles the rows where they are. Writes are lease guarded exactly as
+// MarkPendingStoppedByApply's.
+func (s *applyOperationStore) RequeueNeverStartedForStartByApply(ctx context.Context, applyID int64) (int64, error) {
+	return s.markPendingByApply(ctx, applyID, state.ApplyOperation.Pending, "requeue for start", neverStartedStoppedForStartRows)
+}
+
 // sweptRows selects the operation rows a bulk sweep of an apply settles. The
 // predicate names its columns through the given prefix, "" or a table alias
 // with its trailing dot.
@@ -2623,15 +2673,38 @@ var neverStartedRows = sweptRows{
 	args: []any{state.ApplyOperation.Pending, state.ApplyOperation.Stopped},
 }
 
+// neverStartedStoppedForStartRows are the stopped operations that never
+// started, while the apply has a pending start request and neither a pending
+// stop nor a pending cancel.
+var neverStartedStoppedForStartRows = sweptRows{
+	predicate: func(prefix string) string {
+		// The control request subqueries correlate on the operation's apply,
+		// which needs a qualifier even when the sweep names no alias.
+		qualifier := prefix
+		if qualifier == "" {
+			qualifier = "apply_operations."
+		}
+		pendingRequest := "EXISTS (SELECT 1 FROM apply_control_requests cr WHERE cr.apply_id = " + qualifier + "apply_id AND cr.operation = ? AND cr.status = ?)"
+		return "(" + prefix + "state = ? AND " + prefix + "started_at IS NULL AND " +
+			pendingRequest + " AND NOT " + pendingRequest + " AND NOT " + pendingRequest + ")"
+	},
+	args: []any{
+		state.ApplyOperation.Stopped,
+		storage.ControlOperationStart, storage.ControlRequestPending,
+		storage.ControlOperationStop, storage.ControlRequestPending,
+		storage.ControlOperationCancel, storage.ControlRequestPending,
+	},
+}
+
 // markPendingByApply moves the swept operations of an apply to newState,
-// stamping completed_at when newState is terminal and not resumable.
+// stamping completed_at when newState is settled: terminal and not resumable.
 func (s *applyOperationStore) markPendingByApply(ctx context.Context, applyID int64, newState, verb string, swept sweptRows) (int64, error) {
 	assignments := []JoinedUpdateAssignment{
 		{Column: "state", Expr: "?"},
 		{Column: "updated_at", Expr: "NOW()"},
 	}
 	plainSet := "state = ?, updated_at = NOW()"
-	if newState != state.ApplyOperation.Stopped {
+	if state.IsState(newState, state.SettledApplyStates...) {
 		assignments = append(assignments, JoinedUpdateAssignment{Column: "completed_at", Expr: "NOW()"})
 		plainSet += ", completed_at = NOW()"
 	}
