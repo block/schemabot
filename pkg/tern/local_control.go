@@ -46,20 +46,6 @@ func (c *LocalClient) requestCutover(ctx context.Context, req *ternv1.CutoverReq
 			append(apply.LogAttrs(), "apply_operation_id", req.GetApplyOperationId(), "apply_operation_ids", req.GetApplyOperationIds(), "reason", refusal)...)
 		return &ternv1.CutoverResponse{Accepted: false, ErrorMessage: refusal}, nil
 	}
-	if apply.GetOptions().DeferCutover {
-		// Checked for a cutover that names one operation too: the apply cuts
-		// every operation over together, so one operation's cutover is not
-		// ready while another has not reached its own.
-		refusal, err := c.deferredCutoverNotReady(ctx, apply)
-		if err != nil {
-			return nil, err
-		}
-		if refusal != "" {
-			c.logger.Info("deferred cutover refused: not every operation waits at its cutover",
-				append(apply.LogAttrs(), "apply_operation_id", req.GetApplyOperationId(), "apply_operation_ids", req.GetApplyOperationIds(), "caller", caller, "reason", refusal)...)
-			return &ternv1.CutoverResponse{Accepted: false, ErrorMessage: refusal}, nil
-		}
-	}
 	return c.queueCutoverRequest(ctx, apply, caller, boundIDs)
 }
 

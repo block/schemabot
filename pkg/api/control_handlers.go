@@ -756,7 +756,7 @@ func (s *Service) rejectPendingCutoverMissingMembers(ctx context.Context, apply 
 	var missing []string
 	for _, op := range turn.takers {
 		if !slices.Contains(boundIDs, op.ID) {
-			missing = append(missing, tern.CutoverOperationName(op))
+			missing = append(missing, cutoverOperationName(op))
 		}
 	}
 	if len(missing) == 0 {
@@ -981,12 +981,12 @@ func (s *Service) cutoverTurnForRequest(ctx context.Context, apply *storage.Appl
 		}
 	}
 	if releasesEveryFreeMember {
-		waiting, notReached, err := tern.DeferredCutoverReadiness(ctx, opStore, ops, tasksByOp)
+		waiting, notReached, err := deferredCutoverReadiness(ctx, opStore, ops, tasksByOp)
 		if err != nil {
 			return cutoverTurn{}, fmt.Errorf("check every member of apply %s waits at its cutover: %w", apply.ApplyIdentifier, err)
 		}
 		if len(notReached) > 0 {
-			return cutoverTurn{notReady: tern.DeferredCutoverNotReadyMessage(waiting, notReached)}, nil
+			return cutoverTurn{notReady: deferredCutoverNotReadyMessage(waiting, notReached)}, nil
 		}
 	}
 	if len(turn.takers) > 0 {
