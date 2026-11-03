@@ -1922,7 +1922,11 @@ func (s *Service) queueStoppedApplyForOperator(ctx context.Context, apply *stora
 	neverStarted := neverStartedStoppedOperationIDs(ops)
 	var startedCount int64
 	var skippedCount int64
+	operationsWithTasks := make(map[int64]bool)
 	for _, task := range tasks {
+		if task.ApplyOperationID != nil {
+			operationsWithTasks[*task.ApplyOperationID] = true
+		}
 		switch {
 		case state.IsState(task.State, state.Task.Stopped):
 			startedCount++
@@ -1930,6 +1934,14 @@ func (s *Service) queueStoppedApplyForOperator(ctx context.Context, apply *stora
 			startedCount++
 		case state.IsTerminalTaskState(task.State):
 			skippedCount++
+		}
+	}
+	// An operation with no tasks, such as a finalizer that publishes the
+	// change once its shards complete, is resumable work of its own when a
+	// stop caught it before it began.
+	for id := range neverStarted {
+		if !operationsWithTasks[id] {
+			startedCount++
 		}
 	}
 	if startedCount == 0 {
@@ -1951,9 +1963,9 @@ func (s *Service) queueStoppedApplyForOperator(ctx context.Context, apply *stora
 
 // neverStartedStoppedOperationIDs returns the operations a stop caught before
 // any engine took them up: stopped, never claimed, and holding no remote
-// apply. Their tasks are still pending, because nothing ran them, and a start
-// queues them again (RequeueNeverStartedForStartByApply), so their work is
-// stopped work the start resumes.
+// apply. Their tasks, if they have any, are still pending, because nothing ran
+// them, and a start queues them again (RequeueNeverStartedForStartByApply), so
+// their work is stopped work the start resumes.
 func neverStartedStoppedOperationIDs(ops []*storage.ApplyOperation) map[int64]bool {
 	ids := make(map[int64]bool)
 	for _, op := range ops {

@@ -1970,7 +1970,9 @@ func (s *Service) recoverApplyPendingStop(ctx context.Context, driverID int, own
 	}
 	// A rollout's pending members that no engine ever took up have nothing on
 	// any target to halt, so the request settles them in storage alone, as
-	// cancelled under a cancel and stopped under a stop. The whole-apply drive
+	// cancelled under a cancel and stopped under a stop. A stop stored for an
+	// engine that cannot pause settles them cancelled too, so the members are
+	// never reported resumable on an engine where a stop is permanent (CO-8). The whole-apply drive
 	// is not used for them: a rollout's remote applies belong to its
 	// operations, not to the parent, so that drive would read the parent's
 	// missing remote apply as an ambiguous dispatch and fail the rollout
@@ -1983,9 +1985,10 @@ func (s *Service) recoverApplyPendingStop(ctx context.Context, driverID int, own
 		return claimSpent
 	}
 	if neverStarted {
+		settlesCancelled := cancelPending != nil || tern.StopTerminatesChange(apply.DatabaseType)
 		s.logger.Info("operator: settling never-started rollout members in storage; no engine work exists to halt",
-			append(apply.LogAttrs(), "driver", driverID, "cancel", cancelPending != nil)...)
-		if cancelPending != nil {
+			append(apply.LogAttrs(), "driver", driverID, "cancel", cancelPending != nil, "settles_cancelled", settlesCancelled)...)
+		if settlesCancelled {
 			if err := s.markPendingOperationsCancelled(applyLeaseCtx, driverID, apply); err != nil {
 				s.logger.Error("operator: failed to cancel never-started rollout members during stop reconciliation",
 					append(apply.LogAttrs(),
@@ -2114,20 +2117,15 @@ const (
 )
 
 // stopReconciliationOutcome decides, from what the drive left in storage, how
-// the pending operations settle. A cancel is the stronger intent, so they
-// settle cancelled when a cancel is still pending, including one accepted
-// while the drive ran, or when the drive cancelled the apply. A cancel the
-// drive settled without cancelling the apply, as it does when the data plane
-// refuses one, did not take effect, so they settle stopped only when a stop
-// was pending before the drive, and are otherwise left to run.
+// the pending operations settle. They settle cancelled only when the drive
+// cancelled the apply: a cancel still pending after the drive has not reached
+// the data plane, whether it arrived while the drive ran or the data plane
+// refused it, so recording it applied would leave stopped engine work behind
+// that nothing cancels. That cancel stays pending for the next drive to
+// deliver. Otherwise they settle stopped when a stop was pending before the
+// drive, or cancelled when the engine cannot pause (CO-8), and are left to run
+// when it was not.
 func (s *Service) stopReconciliationOutcome(ctx context.Context, apply *storage.Apply, stopPendingBeforeDrive bool) (stopReconciliationOutcome, error) {
-	pending, err := s.storage.ControlRequests().GetPending(ctx, apply.ID, storage.ControlOperationCancel)
-	if err != nil {
-		return stopReconciliationLeaves, fmt.Errorf("load pending cancel request for apply %s: %w", apply.ApplyIdentifier, err)
-	}
-	if pending != nil {
-		return stopReconciliationCancels, nil
-	}
 	stored, err := s.storage.Applies().Get(ctx, apply.ID)
 	if err != nil {
 		return stopReconciliationLeaves, fmt.Errorf("reload apply %s: %w", apply.ApplyIdentifier, err)
@@ -2138,10 +2136,13 @@ func (s *Service) stopReconciliationOutcome(ctx context.Context, apply *storage.
 	if state.IsState(stored.State, state.Apply.Cancelled) {
 		return stopReconciliationCancels, nil
 	}
-	if stopPendingBeforeDrive {
-		return stopReconciliationStops, nil
+	if !stopPendingBeforeDrive {
+		return stopReconciliationLeaves, nil
 	}
-	return stopReconciliationLeaves, nil
+	if tern.StopTerminatesChange(apply.DatabaseType) {
+		return stopReconciliationCancels, nil
+	}
+	return stopReconciliationStops, nil
 }
 
 // settleStopReconciliation re-derives the apply from its operation rows once
