@@ -8,6 +8,7 @@ import (
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/mysqlerr"
 	"github.com/block/schemabot/pkg/presentation"
+	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/webhook/action"
 )
@@ -1479,7 +1480,9 @@ func PreviewCommentReviewRequiredNoOperators() string {
 
 // PreviewCommentReviewRequiredStaleApproval renders the "review required"
 // comment when an authorized reviewer approved an earlier commit and the PR's
-// schema change differs at the head, so that approval no longer counts.
+// schema change differs at the head, so that approval no longer counts. The
+// author dropped a column comment after the review, and the collapsed block
+// shows the DDL each commit runs.
 func PreviewCommentReviewRequiredStaleApproval() string {
 	return RenderReviewRequired(ReviewGateData{
 		Database:          "testapp",
@@ -1490,6 +1493,14 @@ func PreviewCommentReviewRequiredStaleApproval() string {
 		PRAuthor:          previewRequestedBy,
 		ChangedApprovers:  []string{"jdoe"},
 		ChangedPaths:      []string{"schema/testapp/orders.sql"},
+		ChangedStatements: []ChangedStatements{{
+			Path:        "schema/testapp/orders.sql",
+			Dialect:     schema.DialectMySQL,
+			ApprovedSHA: "4f1c2d9e8b7a",
+			HeadSHA:     "9a3b5c7d1e2f",
+			Approved:    []string{"ALTER TABLE `orders` MODIFY COLUMN `coupon_code` varchar(64) NULL DEFAULT NULL COMMENT 'NULL until a coupon is applied'"},
+			Head:        []string{"ALTER TABLE `orders` MODIFY COLUMN `coupon_code` varchar(64) NULL DEFAULT NULL"},
+		}},
 	})
 }
 

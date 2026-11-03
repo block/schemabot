@@ -4391,6 +4391,23 @@ Schema changes require approval from an authorized reviewer before applying.
 
 Approvals on an earlier commit no longer count because this PR's schema change is different now: @jdoe. Changed since the approval: `schema/testapp/orders.sql`. Ask for an approval of the latest commit.
 
+<details>
+<summary>How <code>schema/testapp/orders.sql</code> changed since the approval</summary>
+
+Approved at `4f1c2d9`:
+
+```sql
+ALTER TABLE `orders` MODIFY COLUMN `coupon_code` varchar(64) NULL DEFAULT NULL COMMENT 'NULL until a coupon is applied';
+```
+
+Latest commit `9a3b5c7`:
+
+```sql
+ALTER TABLE `orders` MODIFY COLUMN `coupon_code` varchar(64) NULL DEFAULT NULL;
+```
+
+</details>
+
 **Operators of `testapp`**:
 - @acme/testapp-operators
 

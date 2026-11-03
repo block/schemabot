@@ -5,6 +5,8 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+
+	"github.com/block/schemabot/pkg/schema"
 )
 
 // The review-required comment leads with the database's own operators in
@@ -190,4 +192,79 @@ func TestRenderReviewRequired_NoAuthor(t *testing.T) {
 	result := RenderReviewRequired(data)
 
 	assert.Contains(t, result, "@bob")
+}
+
+// The DDL each commit runs for a changed schema file is folded into a
+// collapsed block below the explanation, so the reader can expand it to see
+// what changed. A commit that runs no DDL for the file says so instead of
+// rendering an empty block.
+func TestRenderReviewRequired_ChangedStatements(t *testing.T) {
+	result := RenderReviewRequired(ReviewGateData{
+		Database:          "payments",
+		Environment:       "staging",
+		RequestedBy:       "alice",
+		OperatorReviewers: []string{"org/payments-operators"},
+		PRAuthor:          "alice",
+		ChangedApprovers:  []string{"bob"},
+		ChangedPaths:      []string{"schema/payments/refunds.sql"},
+		ChangedStatements: []ChangedStatements{{
+			Path:        "schema/payments/refunds.sql",
+			Dialect:     schema.DialectMySQL,
+			ApprovedSHA: "1111111aaaaaaa",
+			HeadSHA:     "2222222bbbbbbb",
+			Approved:    []string{"ALTER TABLE `refunds` ADD COLUMN `memo` text"},
+		}},
+	})
+
+	assert.Contains(t, result, "\n<details>\n<summary>How <code>schema/payments/refunds.sql</code> changed since the approval</summary>\n\n"+
+		"Approved at `1111111`:\n\n```sql\nALTER TABLE `refunds` ADD COLUMN `memo` text;\n```\n\n"+
+		"Latest commit `2222222` runs no DDL for this file.\n\n</details>\n")
+	assert.Less(t, strings.Index(result, "Ask for an approval of the latest commit."), strings.Index(result, "<details>"),
+		"the explanation precedes the collapsed DDL")
+	assert.Less(t, strings.Index(result, "</details>"), strings.Index(result, "**Operators of `payments`**"),
+		"the collapsed DDL precedes the reviewer lists")
+}
+
+// A path and DDL taken from the repository cannot break out of the collapsed
+// block: the path is HTML-escaped inside <summary>, and the fence is longer
+// than any backtick run in the DDL.
+func TestRenderReviewRequired_ChangedStatementsHostileText(t *testing.T) {
+	result := RenderReviewRequired(ReviewGateData{
+		Database:         "payments",
+		Environment:      "staging",
+		ChangedApprovers: []string{"bob"},
+		ChangedStatements: []ChangedStatements{{
+			Path:        "schema/</summary><b>x</b>.sql",
+			Dialect:     schema.DialectMySQL,
+			ApprovedSHA: "1111111",
+			HeadSHA:     "2222222",
+			Approved:    []string{"ALTER TABLE `t` ADD COLUMN `c` int COMMENT '```'"},
+			Head:        []string{"ALTER TABLE `t` ADD COLUMN `c` bigint"},
+		}},
+	})
+
+	assert.Contains(t, result, "<summary>How <code>schema/&lt;/summary&gt;&lt;b&gt;x&lt;/b&gt;.sql</code> changed since the approval</summary>")
+	assert.Contains(t, result, "````sql\nALTER TABLE `t` ADD COLUMN `c` int COMMENT '```';\n````\n")
+}
+
+// The review gate error comment folds the DDL the same way, for an approval
+// that could be compared and no longer matches.
+func TestRenderReviewGateError_ChangedStatements(t *testing.T) {
+	result := RenderReviewGateError(ReviewGateData{
+		Database:            "payments",
+		Environment:         "staging",
+		ChangedApprovers:    []string{"bob"},
+		UncomparedApprovers: []string{"carol"},
+		ChangedStatements: []ChangedStatements{{
+			Path:        "schema/payments/refunds.sql",
+			Dialect:     schema.DialectMySQL,
+			ApprovedSHA: "1111111",
+			HeadSHA:     "2222222",
+			Approved:    []string{"ALTER TABLE `refunds` ADD COLUMN `memo` text"},
+			Head:        []string{"ALTER TABLE `refunds` ADD COLUMN `note` text"},
+		}},
+	})
+
+	assert.Contains(t, result, "Approved at `1111111`:\n\n```sql\nALTER TABLE `refunds` ADD COLUMN `memo` text;\n```\n")
+	assert.Contains(t, result, "Latest commit `2222222`:\n\n```sql\nALTER TABLE `refunds` ADD COLUMN `note` text;\n```\n")
 }

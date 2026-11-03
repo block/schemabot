@@ -1465,6 +1465,17 @@ type SchemaChangeComparison struct {
 	// between the approved commit and the head but whose statements were
 	// proved the same, for operator logs.
 	StatementComparedPaths []string
+	// DifferingFile names the differing path's blob at each side, so a
+	// caller can show how the pull request's change to it differs. It is nil
+	// when the path is a directory or a symlink at any side.
+	DifferingFile *SchemaFileBlobs
+}
+
+// SchemaFileBlobs names a schema file's blob at the approved commit, the
+// head, and the merge base of each. An empty SHA means the file is absent
+// there.
+type SchemaFileBlobs struct {
+	ApprovedBase, Approved, HeadBase, Head string
 }
 
 // PRSchemaChangeUnchangedSince reports whether the change a pull request
@@ -1554,6 +1565,7 @@ func (ic *InstallationClient) PRSchemaChangeUnchangedSince(ctx context.Context, 
 	}
 	result.DifferingPath = differingPath
 	result.DifferingPathBaseOnly = comparer.differingPathBaseOnly
+	result.DifferingFile = comparer.differingFile
 	result.Unchanged = differingPath == ""
 	return result, nil
 }
@@ -1606,6 +1618,7 @@ type schemaChangeComparer struct {
 	// statements; each one used up part of maxSchemaStatementComparisons.
 	statementComparedPaths []string
 	differingPathBaseOnly  bool
+	differingFile          *SchemaFileBlobs
 }
 
 type schemaChangeItem struct {
@@ -1687,6 +1700,7 @@ func (c *schemaChangeComparer) compare(ctx context.Context, paths []string) (str
 			if !same {
 				// Equal objects on equal bases already passed pathUnchanged.
 				c.differingPathBaseOnly = identical
+				c.differingFile = fileBlobs(item.sides)
 				return item.path, nil
 			}
 		}
@@ -1785,6 +1799,28 @@ func statementComparable(item schemaChangeItem) bool {
 // symlink, or absent.
 func regularFile(side gitSide) bool {
 	return side.found && side.entry.Type == "blob" && side.entry.Mode != gitSymlinkMode
+}
+
+// fileBlobs names the blob at each side of a path that is a regular file or
+// absent at every side, or returns nil when it is a directory or a symlink at
+// any of them.
+func fileBlobs(sides [4]gitSide) *SchemaFileBlobs {
+	var shas [4]string
+	for i, side := range sides {
+		if !side.found {
+			continue
+		}
+		if !regularFile(side) {
+			return nil
+		}
+		shas[i] = side.entry.SHA
+	}
+	return &SchemaFileBlobs{
+		ApprovedBase: shas[sideApprovedBase],
+		Approved:     shas[sideApproved],
+		HeadBase:     shas[sideHeadBase],
+		Head:         shas[sideHead],
+	}
 }
 
 // pathUnchanged reports whether the pull request's change to a path is the

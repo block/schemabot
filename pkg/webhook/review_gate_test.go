@@ -2449,11 +2449,56 @@ func TestEnforceReviewGate(t *testing.T) {
 				if tt.headBase == reviewGateBaseTip {
 					assert.NotContains(t, body, "Changed since the approval:")
 				}
+				assert.NotContains(t, body, "<details>", "a database type with no offline diff names the file without its DDL")
 			case <-time.After(2 * time.Second):
 				require.Fail(t, "timed out waiting for review-required comment")
 			}
 		})
 	}
+
+	// The author drops a column comment after the review, on the same base.
+	// The approval no longer counts, and the comment folds the DDL each commit
+	// runs into a collapsed block, so the reader can see the dropped COMMENT
+	// without opening either commit.
+	t.Run("approval on an earlier commit shows the DDL each commit runs", func(t *testing.T) {
+		h, mux := setupReviewGateHandler(t, reviewGateTestConfig(func(cfg *api.ServerConfig) {
+			db := cfg.Databases["orders"]
+			db.OperatorUsers = []string{"bob"}
+			cfg.Databases["orders"] = db
+		}))
+		registerPREndpoint(mux, "alice")
+		registerReviewsEndpoint(mux, []*gh.PullRequestReview{
+			{User: &gh.User{Login: new("bob")}, State: new(ghclient.ReviewApproved), SubmittedAt: &gh.Timestamp{Time: time.Now()}, CommitID: new(reviewGateApproved)},
+		})
+		registerReviewGateBaseBranch(t, mux, map[string]string{reviewGateApproved: reviewGateOldBase, reviewGateTestHeadSHA: reviewGateOldBase})
+		registerReviewGateGitObjects(t, mux, map[string]map[string]string{
+			reviewGateOldBase:     {"schema/testdb/orders.sql": "CREATE TABLE `orders` (`id` bigint NOT NULL, `label` binary(32) NOT NULL, PRIMARY KEY (`id`))"},
+			reviewGateApproved:    {"schema/testdb/orders.sql": "CREATE TABLE `orders` (`id` bigint NOT NULL, `label` binary(32) DEFAULT NULL COMMENT 'NULL until printed', PRIMARY KEY (`id`))"},
+			reviewGateTestHeadSHA: {"schema/testdb/orders.sql": "CREATE TABLE `orders` (`id` bigint NOT NULL, `label` binary(32) DEFAULT NULL, PRIMARY KEY (`id`))"},
+		})
+		comments := registerCommentsCapture(mux)
+
+		client, err := h.clientForRepo("octocat/hello-world", 12345)
+		require.NoError(t, err)
+
+		mysqlSchema := *schemaResult
+		mysqlSchema.Type = "mysql"
+		blocked, err := h.enforceReviewGate(t.Context(), client, "octocat/hello-world", 1, 12345, &mysqlSchema, "staging", "alice", "apply", false)
+		require.NoError(t, err)
+		assert.True(t, blocked)
+
+		select {
+		case body := <-comments:
+			assert.Contains(t, body, "Changed since the approval: `schema/testdb/orders.sql`.")
+			assert.Contains(t, body, "<details>\n<summary>How <code>schema/testdb/orders.sql</code> changed since the approval</summary>\n\n"+
+				"Approved at `"+reviewGateApproved+"`:\n\n"+
+				"```sql\nALTER TABLE `orders` MODIFY COLUMN `label` binary(32) NULL DEFAULT NULL COMMENT 'NULL until printed';\n```\n\n"+
+				"Latest commit `"+reviewGateTestHeadSHA+"`:\n\n"+
+				"```sql\nALTER TABLE `orders` MODIFY COLUMN `label` binary(32) NULL DEFAULT NULL;\n```\n\n</details>\n")
+		case <-time.After(2 * time.Second):
+			require.Fail(t, "timed out waiting for review-required comment")
+		}
+	})
 
 	t.Run("approved review passes without comment", func(t *testing.T) {
 		h, mux := setupReviewGateHandler(t, reviewGateTestConfig(func(cfg *api.ServerConfig) {
