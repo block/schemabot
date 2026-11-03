@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"path"
 	"sync"
 	"time"
 
@@ -56,9 +57,12 @@ func (h *Handler) newTargetStatementComparer(repo string, pr int, database, envi
 // compare is a ghclient.SchemaFileChangeComparer. An error proves nothing,
 // so the file counts as changed; when ctx itself was cancelled, the caller
 // reports the evaluation as cancelled instead.
-func (c *targetStatementComparer) compare(ctx context.Context, approvedBase, approved, headBase, head string) (bool, string, error) {
+func (c *targetStatementComparer) compare(ctx context.Context, filePath, approvedBase, approved, headBase, head string) (bool, string, error) {
 	key := [4]string{approvedBase, approved, headBase, head}
-	logAttrs := []any{"repo", c.repo, "pr", c.pr, "database", c.database, "environment", c.environment}
+	logAttrs := []any{"repo", c.repo, "pr", c.pr, "database", c.database, "environment", c.environment, "path", filePath}
+	if path.Ext(filePath) != ".sql" {
+		return false, fmt.Sprintf("a PostgreSQL database applies only .sql files, so %s is not compared", path.Base(filePath)), nil
+	}
 
 	// The gate checks approvals one at a time, so holding the lock across
 	// the call costs nothing and keeps the deadline and answers consistent.

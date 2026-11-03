@@ -3,6 +3,7 @@ package postgres
 import (
 	"testing"
 
+	"github.com/block/pg-sprite/pkg/schemadiff"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -101,6 +102,49 @@ func TestEngineCompareSchemaFileChangeAddedFileCannotCompare(t *testing.T) {
 			require.Error(t, err)
 			assert.Contains(t, err.Error(), tt.wantErr)
 			assert.Nil(t, resp)
+		})
+	}
+}
+
+// The head may skip an approved statement only when the base already changed
+// what that statement changes and the head runs nothing on it. On the same
+// base the head runs every approved statement or loses the approval, so a
+// head that drops half of an approved index redefinition does not count.
+func TestChangesCovered(t *testing.T) {
+	const (
+		dropIdx   = `DROP INDEX "public"."orders_ab_idx"`
+		createIdx = `CREATE INDEX "orders_ab_idx" ON "public"."orders" USING btree (a, b)`
+		otherIdx  = `CREATE INDEX "orders_ab_idx" ON "public"."orders" USING btree (a)`
+		addNote   = `ALTER TABLE "public"."orders" ADD COLUMN "note" text`
+		addNote2  = `ALTER TABLE "public"."orders" ADD COLUMN "note" character varying(10)`
+		addTotal  = `ALTER TABLE "public"."orders" ADD COLUMN "total" bigint`
+	)
+	changes := func(sqls ...string) []schemadiff.Change {
+		out := make([]schemadiff.Change, 0, len(sqls))
+		for _, sql := range sqls {
+			out = append(out, schemadiff.Change{SQL: sql})
+		}
+		return out
+	}
+	tests := []struct {
+		name                     string
+		approved, head, baseMove []string
+		want                     bool
+	}{
+		{name: "the approved statements", approved: []string{dropIdx, createIdx}, head: []string{dropIdx, createIdx}, want: true},
+		{name: "half of an approved redefinition on the same base", approved: []string{dropIdx, createIdx}, head: []string{dropIdx}},
+		{name: "half of an approved redefinition on a base that moved elsewhere", approved: []string{dropIdx, createIdx}, head: []string{dropIdx}, baseMove: []string{addTotal}},
+		{name: "half of an approved redefinition on a base that redefined the index", approved: []string{dropIdx, createIdx}, head: []string{dropIdx}, baseMove: []string{dropIdx, otherIdx}},
+		{name: "nothing on a base that redefined the index", approved: []string{dropIdx, createIdx}, baseMove: []string{dropIdx, otherIdx}, want: true},
+		{name: "one approved statement, the other already on the base", approved: []string{addNote, createIdx}, head: []string{createIdx}, baseMove: []string{addNote}, want: true},
+		{name: "one approved statement, the other column on the base with another type", approved: []string{addNote, createIdx}, head: []string{createIdx}, baseMove: []string{addNote2}, want: true},
+		{name: "a statement nobody approved", approved: []string{addNote}, head: []string{addNote, addTotal}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := changesCovered(changes(tt.approved...), changes(tt.head...), changes(tt.baseMove...))
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, got)
 		})
 	}
 }
