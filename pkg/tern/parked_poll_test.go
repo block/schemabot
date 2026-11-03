@@ -22,8 +22,10 @@ import (
 type hasPendingStore struct {
 	*testControlRequestStore
 	pending bool
-	err     error
-	reads   int
+	// operation is the pending request's operation, a cutover when unset.
+	operation storage.ControlOperation
+	err       error
+	reads     int
 }
 
 func (s *hasPendingStore) ListPending(_ context.Context, applyID int64) ([]*storage.ApplyControlRequest, error) {
@@ -34,7 +36,11 @@ func (s *hasPendingStore) ListPending(_ context.Context, applyID int64) ([]*stor
 	if !s.pending {
 		return nil, nil
 	}
-	return []*storage.ApplyControlRequest{{ApplyID: applyID, Operation: storage.ControlOperationCutover, Status: storage.ControlRequestPending}}, nil
+	operation := s.operation
+	if operation == "" {
+		operation = storage.ControlOperationCutover
+	}
+	return []*storage.ApplyControlRequest{{ApplyID: applyID, Operation: operation, Status: storage.ControlRequestPending}}, nil
 }
 
 // A drive held at a deferred cutover runs its full poll only when the refresh
@@ -121,6 +127,43 @@ func TestParkedPoll(t *testing.T) {
 		p.observe(pendingControlOperations{})
 		p.hold()
 		assert.False(t, p.runFullPoll(t.Context(), store, apply, start.Add(time.Second), slog.Default()))
+	})
+
+	for _, operation := range []storage.ControlOperation{storage.ControlOperationStop, storage.ControlOperationCancel} {
+		t.Run("a pending "+string(operation)+" wakes a held drive", func(t *testing.T) {
+			controls := &hasPendingStore{testControlRequestStore: &testControlRequestStore{}, pending: true, operation: operation}
+			p := newParkedPoll()
+			require.True(t, p.runFullPoll(t.Context(), newStore(controls), apply, start, slog.Default()))
+			p.hold()
+			assert.True(t, p.runFullPoll(t.Context(), newStore(controls), apply, start.Add(time.Second), slog.Default()))
+		})
+	}
+
+	// A request that does not end a hold, such as a skip-revert queued for
+	// the revert window, stays pending for the whole hold. It neither wakes
+	// the drive between refreshes nor keeps it at full cadence after one.
+	t.Run("a request that does not end the hold leaves the drive held", func(t *testing.T) {
+		controls := &hasPendingStore{testControlRequestStore: &testControlRequestStore{}, pending: true, operation: storage.ControlOperationSkipRevert}
+		store := newStore(controls)
+		p := newParkedPoll()
+		require.True(t, p.runFullPoll(t.Context(), store, apply, start, slog.Default()))
+		p.observe(pendingControlOperations{storage.ControlOperationSkipRevert: {}})
+		p.hold()
+		assert.False(t, p.runFullPoll(t.Context(), store, apply, start.Add(time.Second), slog.Default()))
+		assert.Equal(t, 1, controls.reads)
+		assert.True(t, p.runFullPoll(t.Context(), store, apply, start.Add(parkedFullPollInterval), slog.Default()),
+			"the refresh still runs, and resolves the request as a full-cadence poll would")
+	})
+
+	t.Run("a held drive whose context ended skips the check", func(t *testing.T) {
+		controls := &hasPendingStore{testControlRequestStore: &testControlRequestStore{}, err: assert.AnError}
+		p := newParkedPoll()
+		require.True(t, p.runFullPoll(t.Context(), newStore(controls), apply, start, slog.Default()))
+		p.hold()
+		ctx, cancel := context.WithCancel(t.Context())
+		cancel()
+		assert.False(t, p.runFullPoll(ctx, newStore(controls), apply, start.Add(time.Second), slog.Default()))
+		assert.Zero(t, controls.reads, "no storage read runs on an ended context")
 	})
 
 	t.Run("a failed check runs the full poll", func(t *testing.T) {
@@ -244,6 +287,107 @@ func TestPollForCompletionAtomicSlowsWhileHeldAtDeferredCutover(t *testing.T) {
 				assert.Positive(t, controls.reads, "a held drive checks storage for a request on every other tick")
 			}
 			assert.Zero(t, f.eng.cutoverCount, "a deferred cutover waits for the operator")
+		})
+	}
+}
+
+// A sequential drive whose stored task row waits for a deferred cutover stops
+// polling its engine between refreshes and checks storage for an operator's
+// request instead. A pending request puts it back on every tick.
+func TestPollTaskToCompletionSlowsWhileHeldAtDeferredCutover(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		pending      bool
+		wantMaxPolls int
+		wantMinPolls int
+	}{
+		{name: "nothing pending", wantMinPolls: 1, wantMaxPolls: 1},
+		{name: "a request pending", pending: true, wantMinPolls: 5},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			task := &storage.Task{
+				ID: 1, ApplyID: 1, TaskIdentifier: "task-held",
+				Database: "appdb", DatabaseType: storage.DatabaseTypeMySQL,
+				Namespace: "appdb", TableName: "users", State: state.Task.Running,
+			}
+			apply := &storage.Apply{
+				ID: 1, ApplyIdentifier: "apply-held", Database: "appdb",
+				DatabaseType: storage.DatabaseTypeMySQL, Environment: "staging",
+			}
+			apply.SetOptions(storage.ApplyOptions{DeferCutover: true})
+			eng := &fakeControlEngine{progressResult: &engine.ProgressResult{
+				State:  engine.StateWaitingForCutover,
+				Tables: []engine.TableProgress{{Namespace: "appdb", Table: "users", State: state.Task.WaitingForCutover, Progress: 100}},
+			}}
+			controls := &hasPendingStore{testControlRequestStore: &testControlRequestStore{}, pending: tc.pending}
+			client := &LocalClient{
+				config:       LocalConfig{Database: "appdb", Type: storage.DatabaseTypeMySQL},
+				spiritEngine: eng,
+				storage: &exactProgressStorage{
+					tasks:           &exactProgressTaskStore{tasks: []*storage.Task{task}},
+					controlRequests: controls,
+					logs:            &mockApplyLogStore{},
+				},
+				logger:                   slog.Default(),
+				taskPollIntervalOverride: 5 * time.Millisecond,
+			}
+
+			ctx, cancel := context.WithTimeout(t.Context(), 200*time.Millisecond)
+			defer cancel()
+			assert.Equal(t, taskHandover, client.pollTaskToCompletion(ctx, apply, task, nil, nil))
+
+			assert.Equal(t, state.Task.WaitingForCutover, task.State)
+			assert.GreaterOrEqual(t, eng.progressCalls, tc.wantMinPolls)
+			if tc.wantMaxPolls > 0 {
+				assert.LessOrEqual(t, eng.progressCalls, tc.wantMaxPolls, "a held drive polls its engine only to refresh")
+				assert.Positive(t, controls.reads, "a held drive checks storage for a request on every other tick")
+			}
+			assert.Zero(t, eng.cutoverCount, "a deferred cutover waits for the operator")
+		})
+	}
+}
+
+// A grouped drive holding several tables at a deferred cutover slows its poll,
+// unless the tick is the one on which the hold times out: that tick stops the
+// engine, and the drive stays at full cadence to see the stop land rather than
+// learning of it on the next refresh.
+func TestAtomicProgressTickHoldsUnlessTheCutoverTimesOut(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		heldFor   time.Duration
+		wantHeld  bool
+		wantStops int
+	}{
+		{name: "within the timeout", heldFor: time.Minute, wantHeld: true},
+		{name: "past the timeout", heldFor: waitingForManualActionTimeout + time.Minute, wantStops: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newRevertWindowTickFixture(storage.ApplyOptions{DeferCutover: true})
+			opID := *f.tasks[0].ApplyOperationID
+			f.tasks = []*storage.Task{
+				{TaskIdentifier: "task-users", ApplyID: f.apply.ID, ApplyOperationID: &opID, State: state.Task.WaitingForCutover, TableName: "users", Namespace: "testdb"},
+				{TaskIdentifier: "task-orders", ApplyID: f.apply.ID, ApplyOperationID: &opID, State: state.Task.WaitingForCutover, TableName: "orders", Namespace: "testdb"},
+			}
+			f.client.storage.(*exactProgressStorage).tasks = &exactProgressTaskStore{tasks: f.tasks}
+			progress := &engine.ProgressResult{
+				State: engine.StateWaitingForCutover,
+				Tables: []engine.TableProgress{
+					{Namespace: "testdb", Table: "users", State: state.Task.WaitingForCutover, Progress: 100},
+					{Namespace: "testdb", Table: "orders", State: state.Task.WaitingForCutover, Progress: 100},
+				},
+			}
+			f.eng.progressResult = progress
+			f.ps.lastTaskState = taskStateFromProgressResult(progress)
+			f.ps.stateEnteredAt = time.Now().Add(-tc.heldFor)
+			f.ps.parked = newParkedPoll()
+
+			f.tick(t)
+
+			assert.Equal(t, tc.wantHeld, f.ps.parked.held)
+			assert.Equal(t, tc.wantStops, f.eng.stopCount)
+			for _, task := range f.tasks {
+				assert.Equal(t, state.Task.WaitingForCutover, task.State, "task %s", task.TableName)
+			}
 		})
 	}
 }
