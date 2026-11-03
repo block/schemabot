@@ -1240,7 +1240,11 @@ type SchemaChangeComparison struct {
 // Git objects are content-addressed, so content is compared by object SHA,
 // type, and mode, and a path absent at a commit is compared as absent. A
 // symlink's object holds only its target, so every symlink at or inside a
-// path is followed and its target compared by the same rule.
+// path is followed and its target compared by the same rule. A symlink whose
+// target differs between the commits is compared by the regular file it
+// resolves to at each commit instead, so one a rebase repointed at a renamed
+// directory keeps the approval when it still resolves to the same change; a
+// target that is not a regular file leaves the symlink changed.
 //
 // An error means the comparison could not be completed and proves nothing:
 // GitHub was unavailable, a commit or tree could not be read, a directory was
@@ -1395,6 +1399,14 @@ func (c *schemaChangeComparer) compare(ctx context.Context, paths []string) (str
 			}
 			pending = append(pending, children...)
 		default:
+			followed, ok, err := c.followSymlinkSides(ctx, item)
+			if err != nil {
+				return "", err
+			}
+			if ok {
+				pending = append(pending, followed)
+				continue
+			}
 			same, err := c.sameStatements(ctx, item)
 			if err != nil {
 				return "", err
@@ -1595,6 +1607,46 @@ func (c *schemaChangeComparer) children(ctx context.Context, dir string, sides [
 		items = append(items, *byName[name])
 	}
 	return items, nil
+}
+
+// followSymlinkSides returns item with every symlink side replaced by the
+// regular file its target names at that side's commit, so a symlink the pull
+// request repointed is compared by the file it resolves to, as when a rebase
+// moves the target to a directory the base branch renamed. ok is false, and
+// the item is compared as it is, when no side is a symlink or a target is not
+// a regular file at its commit: absent, a directory, another symlink, or a
+// path that runs through one.
+func (c *schemaChangeComparer) followSymlinkSides(ctx context.Context, item schemaChangeItem) (schemaChangeItem, bool, error) {
+	followed := item
+	hasSymlink := false
+	for i, side := range item.sides {
+		if !side.found || side.entry.Mode != gitSymlinkMode {
+			continue
+		}
+		hasSymlink = true
+		targets, err := c.resolveSymlinks(ctx, []TreeEntry{{Path: item.path, Mode: side.entry.Mode, Type: side.entry.Type, SHA: side.entry.SHA}})
+		if err != nil {
+			return item, false, err
+		}
+		logAttrs := []any{"repo", c.repo, "path", item.path, "target", targets[0], "commit", c.commits[i],
+			"approved_sha", c.commits[sideApproved], "head_sha", c.commits[sideHead]}
+		entry, found, err := c.ic.resolveGitTreeEntry(ctx, c.repo, c.commits[i], targets[0], c.levelCache)
+		if errors.Is(err, errGitPathThroughNonTree) {
+			c.ic.logger.Debug("review gate comparison: schema symlink's target runs through another symlink, so the symlink is compared as it is", logAttrs...)
+			return item, false, nil
+		}
+		if err != nil {
+			return item, false, fmt.Errorf("resolve symlink %s target %s at %s in repo %s: %w", item.path, targets[0], c.commits[i], c.repo, err)
+		}
+		target := gitSide{entry: entry, found: found}
+		if !regularFile(target) {
+			c.ic.logger.Debug("review gate comparison: schema symlink's target is not a regular file, so the symlink is compared as it is",
+				append(logAttrs, "target_found", found, "target_type", entry.Type, "target_mode", entry.Mode)...)
+			return item, false, nil
+		}
+		followed.sides[i] = target
+	}
+	return followed, hasSymlink, nil
 }
 
 // symlinkTargets returns the repo-relative target of the symlink at p, or of

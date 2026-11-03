@@ -299,6 +299,25 @@ func TestCheckReviewGate_ApprovalCoverage(t *testing.T) {
 				strings.Join(tables, ", ") + `}}`
 		}
 	}
+	// sharedTableBase adds a table another database's schema keeps under
+	// schema/other/v1; linkBackground makes the PR add a symlink to it from
+	// the orders namespace, through the given directory, and
+	// renameSharedTables makes the default branch move it to schema/other/v2
+	// with the given definition.
+	backgroundTable := "CREATE TABLE `background` (`id` bigint NOT NULL, PRIMARY KEY (`id`))"
+	sharedTableBase := maps.Clone(baseFiles)
+	sharedTableBase["schema/other/v1/background.sql"] = backgroundTable
+	linkBackground := func(dir string) func(map[string]string) {
+		return func(files map[string]string) {
+			files["schema/testdb/orders/background.sql"] = reviewGateSymlink + "../../other/" + dir + "/background.sql"
+		}
+	}
+	renameSharedTables := func(table string) func(map[string]string) {
+		return func(files map[string]string) {
+			delete(files, "schema/other/v1/background.sql")
+			files["schema/other/v2/background.sql"] = table
+		}
+	}
 	addVotesAnd := func(more func(map[string]string)) func(map[string]string) {
 		return func(files map[string]string) {
 			addVotes(files)
@@ -791,6 +810,32 @@ func TestCheckReviewGate_ApprovalCoverage(t *testing.T) {
 				files["db/stray.sql"] = "DROP TABLE `orders`"
 			}),
 			want: wantCovers,
+		},
+		{
+			name:       "a rebase that repointed the PR's table symlink at the directory the default branch renamed counts",
+			base:       sharedTableBase,
+			prChange:   linkBackground("v1"),
+			baseChange: renameSharedTables(backgroundTable),
+			headChange: linkBackground("v2"),
+			want:       wantCovers,
+		},
+		{
+			name:            "a rebase that repointed the PR's table symlink at another table definition is a change",
+			base:            sharedTableBase,
+			prChange:        linkBackground("v1"),
+			baseChange:      renameSharedTables("CREATE TABLE `background` (`id` bigint NOT NULL, `note` text, PRIMARY KEY (`id`))"),
+			headChange:      linkBackground("v2"),
+			want:            wantChanged,
+			wantChangedPath: "schema/testdb/orders/background.sql",
+		},
+		{
+			name:            "a rebase that repointed the PR's table symlink at a file that does not exist is a change",
+			base:            sharedTableBase,
+			prChange:        linkBackground("v1"),
+			baseChange:      renameSharedTables(backgroundTable),
+			headChange:      linkBackground("v3"),
+			want:            wantChanged,
+			wantChangedPath: "schema/testdb/orders/background.sql",
 		},
 		{
 			name:     "the PR changing a symlinked namespace's target after the approval does not count",
