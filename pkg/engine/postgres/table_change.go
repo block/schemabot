@@ -9,7 +9,6 @@ import (
 
 	"github.com/block/pg-sprite/pkg/schemadiff"
 	"github.com/block/pg-sprite/pkg/statement"
-	pganalyze "github.com/pganalyze/pg_query_go/v6"
 	pgquery "github.com/wasilibs/go-pgquery"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
@@ -25,39 +24,27 @@ const comparisonSchema = "public"
 
 // CompareSchemaFileChange reports whether a pull request's edit to one
 // PostgreSQL schema file generates the same schema change on two different
-// bases. It is the PostgreSQL counterpart of ddl.SameTableChange.
+// bases: the head runs no DDL the reviewer did not approve. It is the
+// PostgreSQL counterpart of ddl.SameTableChange.
 //
-// The change is the same when two things hold:
-//
-//   - Every column, constraint, index, and CREATE TABLE clause the head
-//     declares is the three-way merge of the approved commit and the head's
-//     base (ddl.UnmergedElement). Elements are read from PostgreSQL's own
-//     parse tree, so every clause the file declares takes part, including
-//     ones pg-sprite's model does not carry (storage parameters, tablespaces,
-//     identity sequence options): a clause neither side declared cannot
-//     reach the head unseen.
-//   - Diffing each base against its commit yields the same statements. The
-//     diff runs on the target, because pg-sprite understands a file only by
-//     running it: each version is introspected on a scratch schema inside a
-//     transaction that is always rolled back (schemadiff.IntrospectDesired),
-//     so nothing persists.
-//
-// Column order gets no check of its own, as it does on MySQL: PostgreSQL
-// appends every added column, and pg-sprite does not manage attribute order.
-// The statements still list changes in the order the file declares them,
-// and that order can matter (it is the order added columns land in), so a
-// head that reorders columns the pull request changed generates a
-// different change and keeps no approval.
+// The DDL each commit runs is its diff from its base, and the change is the
+// same when every statement the head's DDL runs is one the approved DDL runs,
+// in the same order. The head may run fewer, as when a stacked pull request
+// below this one merges part of the edit. The diff runs on the target,
+// because pg-sprite understands a file only by running it: each version is
+// introspected on a scratch schema inside a transaction that is always
+// rolled back (schemadiff.IntrospectDesired), so nothing persists.
 //
 // A file the pull request adds is absent at both bases, passed as "". Its
-// change is the file's own statements, so it is the same when the approved
+// DDL is the file's own statements, so it is the same when the approved
 // commit and the head parse to the same statements in the same order:
 // formatting and comments may differ, nothing the statements build may. That
 // needs only the parse tree, so the target is not dialed.
 //
 // Each file must declare one table, the same one at all four commits, and no
-// row security or foreign key. A file that does not, or that the target cannot run, is an
-// error: it proves nothing, and the caller treats the file as changed.
+// row security or foreign key. A file that does not, or that the target cannot
+// run, is an error: it proves nothing, and the caller treats the file as
+// changed.
 func (e *Engine) CompareSchemaFileChange(ctx context.Context, req *ternv1.CompareSchemaFileChangeRequest) (*ternv1.CompareSchemaFileChangeResponse, error) {
 	if req == nil {
 		return nil, fmt.Errorf("compare PostgreSQL schema file change: request is required")
@@ -84,21 +71,15 @@ func (e *Engine) CompareSchemaFileChange(ctx context.Context, req *ternv1.Compar
 		{"head's base", req.GetHeadBase()},
 		{"head", req.GetHead()},
 	}
-	// Every file is parsed and merged before the target is dialed, so a file
-	// that cannot be compared, or a head that is not the merge, never costs a
-	// connection.
+	// Every file is parsed before the target is dialed, so a file that
+	// cannot be compared never costs a connection.
 	var desired [len(files)]statement.DesiredSchema
-	var elements [len(files)]map[string]string
 	for i, f := range files {
 		schema, err := comparableSchema(f.content)
 		if err != nil {
 			return nil, fmt.Errorf("compare PostgreSQL schema file for database %q: read the file at the %s: %w", e.pullDatabase, f.name, err)
 		}
-		declared, err := declaredElements(f.content)
-		if err != nil {
-			return nil, fmt.Errorf("compare PostgreSQL schema file for database %q: read table %s at the %s: %w", e.pullDatabase, schema.Table(), f.name, err)
-		}
-		desired[i], elements[i] = schema, declared
+		desired[i] = schema
 	}
 	table := desired[0].Table()
 	for i, d := range desired {
@@ -107,10 +88,6 @@ func (e *Engine) CompareSchemaFileChange(ctx context.Context, req *ternv1.Compar
 				table, files[0].name, d.Table(), files[i].name)}, nil
 		}
 	}
-	if why := ddl.UnmergedElement(elements[0], elements[1], elements[2], elements[3]); why != "" {
-		return &ternv1.CompareSchemaFileChangeResponse{Reason: fmt.Sprintf("table %s: %s", table, why)}, nil
-	}
-
 	pool, closePool, err := openTargetPool(ctx, e.pullCredentials)
 	if err != nil {
 		return nil, fmt.Errorf("compare PostgreSQL schema file for database %q: %w", e.pullDatabase, err)
@@ -205,11 +182,11 @@ func comparableSchema(content string) (statement.DesiredSchema, error) {
 	return schema, nil
 }
 
-// statementDifference returns why diffing the approved commit's base against
-// the approved commit yields different statements from diffing the head's
-// base against the head, or "" when they are the same. models holds the
-// table at the approved commit's base, the approved commit, the head's base,
-// and the head, in that order.
+// statementDifference returns why the statements the head runs, its diff from
+// its base, are not ones the approved commit runs in the same order, or ""
+// when every statement the head runs was approved. models holds the table at
+// the approved commit's base, the approved commit, the head's base, and the
+// head, in that order.
 func statementDifference(models [4]schemadiff.Model) (string, error) {
 	approvedChange, err := schemadiff.Diff(comparisonSchema, models[0], models[1])
 	if err != nil {
@@ -219,90 +196,10 @@ func statementDifference(models [4]schemadiff.Model) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("diff the head against its base: %w", err)
 	}
-	if !slices.Equal(approvedChange, headChange) {
+	if !ddl.InOrderSubset(changeSQL(approvedChange), changeSQL(headChange)) {
 		return fmt.Sprintf("the approved commit generates %q but the head generates %q", changeSQL(approvedChange), changeSQL(headChange)), nil
 	}
 	return "", nil
-}
-
-// declaredElements keys everything a schema file declares, read from
-// PostgreSQL's parse tree, and maps each to its parsed definition: every
-// column and constraint of the CREATE TABLE by name, every clause of the
-// CREATE TABLE outside its element list by field name, and every index by
-// name. A column's definition carries its inline constraints and identity
-// options; an unnamed constraint or index is keyed by its definition, so
-// changing one removes it and adds another. Source positions are dropped, so
-// whitespace and keyword case do not count. comparableSchema has admitted
-// the file, so it holds one CREATE TABLE and only CREATE INDEX otherwise.
-func declaredElements(content string) (map[string]string, error) {
-	tree, err := pgquery.Parse(content)
-	if err != nil {
-		return nil, fmt.Errorf("parse: %w", err)
-	}
-	elements := make(map[string]string)
-	add := func(key, definition string) error {
-		if _, dup := elements[key]; dup {
-			return fmt.Errorf("%s is declared more than once", key)
-		}
-		elements[key] = definition
-		return nil
-	}
-	addNode := func(key string, node proto.Message) error {
-		definition, err := encodeParseNode(node)
-		if err != nil {
-			return fmt.Errorf("encode %s: %w", key, err)
-		}
-		if key == "" {
-			key = definition
-		}
-		return add(key, definition)
-	}
-	for _, raw := range tree.GetStmts() {
-		switch {
-		case raw.GetStmt().GetCreateStmt() != nil:
-			create := proto.Clone(raw.GetStmt().GetCreateStmt()).(*pganalyze.CreateStmt)
-			for _, elt := range create.GetTableElts() {
-				var err error
-				switch {
-				case elt.GetColumnDef() != nil:
-					err = addNode("column "+elt.GetColumnDef().GetColname(), elt.GetColumnDef())
-				case elt.GetConstraint().GetConname() != "":
-					err = addNode("constraint "+elt.GetConstraint().GetConname(), elt.GetConstraint())
-				default:
-					err = addNode("", elt)
-				}
-				if err != nil {
-					return nil, err
-				}
-			}
-			create.TableElts = nil
-			encoded, err := encodeParseNode(create)
-			if err != nil {
-				return nil, fmt.Errorf("encode the CREATE TABLE clauses: %w", err)
-			}
-			var clauses map[string]json.RawMessage
-			if err := json.Unmarshal([]byte(encoded), &clauses); err != nil {
-				return nil, fmt.Errorf("decode the CREATE TABLE clauses: %w", err)
-			}
-			for field, value := range clauses {
-				if err := add("table clause "+field, string(value)); err != nil {
-					return nil, err
-				}
-			}
-		case raw.GetStmt().GetIndexStmt() != nil:
-			index := raw.GetStmt().GetIndexStmt()
-			key := ""
-			if index.GetIdxname() != "" {
-				key = "index " + index.GetIdxname()
-			}
-			if err := addNode(key, index); err != nil {
-				return nil, err
-			}
-		default:
-			return nil, fmt.Errorf("the file holds a statement other than CREATE TABLE and CREATE INDEX")
-		}
-	}
-	return elements, nil
 }
 
 // encodeParseNode encodes a parse tree node as canonical JSON with every

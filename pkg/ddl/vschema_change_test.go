@@ -91,7 +91,7 @@ func TestSameVSchemaChange(t *testing.T) {
     "items": {"column_vindexes": [{"column": "id", "name": "hash"}]}
   }
 }`,
-			wantReason: "vschema: the head declares table items differently from the approved commit",
+			wantReason: "vschema: the head changes table items differently from the approved commit",
 		},
 		{
 			name:         "a head that adds a table the reviewer did not approve",
@@ -105,7 +105,7 @@ func TestSameVSchemaChange(t *testing.T) {
     "payments": {"column_vindexes": [{"column": "order_id", "name": "hash"}]}
   }
 }`,
-			wantReason: "vschema: the head declares table payments differently from the approved commit",
+			wantReason: "vschema: the head changes table payments, which the approved commit does not",
 		},
 		{
 			name:         "a head that changes the keyspace settings",
@@ -119,7 +119,7 @@ func TestSameVSchemaChange(t *testing.T) {
     "items": {"column_vindexes": [{"column": "order_id", "name": "hash"}]}
   }
 }`,
-			wantReason: "vschema: the head declares the keyspace settings differently from the approved commit",
+			wantReason: "vschema: the head changes the keyspace settings, which the approved commit does not",
 		},
 		{
 			name:         "a head that restores a table's routing the base changed",
@@ -132,9 +132,10 @@ func TestSameVSchemaChange(t *testing.T) {
   }
 }`,
 			head:       approved,
-			wantReason: "vschema: the base changed table orders since the approved commit, and the head replaces it with another version",
+			wantReason: "vschema: the head changes table orders, which the approved commit does not",
 		},
 		{
+			// The head sets table items to the definition the reviewer approved.
 			name:         "a table the PR and the base both define differently",
 			approvedBase: base, approved: approved,
 			headBase: `{
@@ -145,8 +146,8 @@ func TestSameVSchemaChange(t *testing.T) {
     "items": {"column_vindexes": [{"column": "id", "name": "hash"}]}
   }
 }`,
-			head:       approved,
-			wantReason: "vschema: both the approved commit and the base changed table items",
+			head:     approved,
+			wantSame: true,
 		},
 	}
 	for _, tt := range tests {

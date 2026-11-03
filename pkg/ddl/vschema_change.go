@@ -16,14 +16,12 @@ import (
 // absent at both bases, passed as "".
 //
 // Each table, each vindex, and the keyspace's own settings is one element
-// (see vschema.Elements), and the change is the same when every element is
-// the three-way merge of the approved commit and headBase (see
-// UnmergedElement). That is the whole check: Vitess applies a VSchema as a
-// document, with no statements or order of its own, so the merge alone
-// proves the head changes only elements the reviewer approved, less those
-// the base now carries itself. A rebase that combines the pull request's
-// table with tables the base added keeps the approval; a head that routes
-// any table differently from the approved commit does not.
+// (see vschema.Elements), and the change is the same when every element the
+// head changes from its base is one the approved commit changes from its
+// base to the same definition (see UncoveredElementChange). A rebase that
+// combines the pull request's table with tables the base added keeps the
+// approval; a head that routes any table differently from the approved
+// commit does not.
 //
 // When the change is not the same, reason says why, for operator logs. A
 // document the vendored VSchema definition cannot read is an error: it
@@ -46,7 +44,7 @@ func SameVSchemaChange(approvedBase, approved, headBase, head string) (same bool
 		}
 		elements[i] = e
 	}
-	if why := UnmergedElement(elements[0], elements[1], elements[2], elements[3]); why != "" {
+	if why := UncoveredElementChange(elements[0], elements[1], elements[2], elements[3]); why != "" {
 		return false, "vschema: " + why, nil
 	}
 	return true, "", nil

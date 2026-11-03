@@ -13,51 +13,38 @@ import (
 
 // SameTableChange reports whether a pull request's edit to a single-table
 // MySQL schema file generates the same schema change on two different bases:
-// the head runs nothing the reviewer did not approve.
+// the head runs no DDL the reviewer did not approve.
 //
 // approvedBase and approved are the file at the approved commit's merge base
 // and at the approved commit; headBase and head are the file at the head's
-// merge base and at the head. The change is the same when the head is the
-// newer base plus the approved edit and nothing else, less any part of the
-// edit the newer base already has, which takes three things:
-//
-//   - Every column, index, constraint, table option, and partitioning clause
-//     is the three-way merge of the approved commit and headBase (see
-//     UnmergedElement): the head declares it as the approved commit does
-//     where the base left it alone, and as headBase does where the base
-//     changed it. Comparing elements, not only statements, matters because
-//     statements can hide an override: a column the base made NOT NULL and
-//     the pull request widened is modified the same way on both bases, yet
-//     on the newer one the statement also drops the NOT NULL.
-//   - The columns keep their relative order: the bases order the columns
-//     they share the same way, and so do the approved commit and the head.
-//     An element's definition carries no position, so a reordering would
-//     otherwise go unseen wherever the statements happen to match.
-//   - Every clause the head's diff from its base runs is one the approved
-//     commit's diff from its base runs, in the same order, so the reviewer
-//     approved each statement the head generates, including where each
-//     column goes. The head may run fewer clauses only where the base now
-//     has part of the approved edit, as when a stacked pull request below
-//     this one merges: the element merge refuses any other way of dropping
-//     one. The diff ignores nothing (no AUTO_INCREMENT, engine, charset,
-//     partitioning, or row format exemptions), so any difference the planner
-//     could act on counts.
+// merge base and at the head. The DDL each commit runs is its diff from its
+// base, and the change is the same when every clause the head's DDL runs is
+// one the approved DDL runs, in the same order (see clausesCovered). The head
+// may run fewer clauses, as when a stacked pull request below this one
+// merges part of the edit. The diff ignores nothing (no AUTO_INCREMENT,
+// engine, charset, partitioning, or row format exemptions), so any
+// difference the planner could act on counts.
 //
 // A file the pull request adds is absent at both bases, passed as "". Its
-// change is the CREATE TABLE itself, so it is the same when the approved
-// commit and the head declare the same elements in the same column order:
-// formatting and comments may differ, nothing the table is built from may.
+// DDL is the CREATE TABLE itself, so it is the same when the head's CREATE
+// TABLE is the approved one, compared in the parser's canonical form. When
+// only the
+// head's base has the file, as when a stacked pull request below this one
+// merged part of the table first, the change is the same when the head ends
+// at exactly the table the reviewer approved.
 //
 // When the change is not the same, reason says why, for operator logs. Each
 // file must hold exactly one CREATE TABLE, all four naming the same table,
 // and an element may be declared only once per file; an error means the files
 // could not be compared and proves nothing.
 func SameTableChange(approvedBase, approved, headBase, head string) (same bool, reason string, err error) {
-	if approvedBase == "" && headBase == "" {
-		return sameAddedTable(approved, head)
-	}
-	if approvedBase == "" || headBase == "" {
-		return false, "", fmt.Errorf("the file is absent at one base but not the other")
+	switch {
+	case approvedBase == "" && headBase == "":
+		return sameCreateTable(approved, head)
+	case approvedBase == "" && headBase != "":
+		return endsAtApprovedTable(approved, head)
+	case headBase == "":
+		return false, "", fmt.Errorf("the file is absent at the head's base but not at the approved commit's")
 	}
 	files := [...]struct {
 		name    string
@@ -69,19 +56,12 @@ func SameTableChange(approvedBase, approved, headBase, head string) (same bool, 
 		{"head", head},
 	}
 	var tables [len(files)]*statement.CreateTable
-	var elements [len(files)]map[string]string
 	for i, f := range files {
-		ct, err := parseSingleCreateTable(f.content)
+		ct, err := parseComparableTable(f.name, f.content)
 		if err != nil {
-			return false, "", fmt.Errorf("parse the schema file at the %s: %w", f.name, err)
+			return false, "", err
 		}
-		// Every file is checked for duplicate declarations before any is
-		// diffed: the diff assumes each element is declared once.
-		e, err := tableElements(ct)
-		if err != nil {
-			return false, "", fmt.Errorf("read table %s at the %s: %w", ct.TableName, f.name, err)
-		}
-		tables[i], elements[i] = ct, e
+		tables[i] = ct
 	}
 	aBase, a, hBase, h := tables[0], tables[1], tables[2], tables[3]
 	for i, ct := range tables {
@@ -89,16 +69,6 @@ func SameTableChange(approvedBase, approved, headBase, head string) (same bool, 
 			return false, fmt.Sprintf("the file declares table %s at the %s but %s at the %s",
 				aBase.TableName, files[0].name, ct.TableName, files[i].name), nil
 		}
-	}
-
-	if why := UnmergedElement(elements[0], elements[1], elements[2], elements[3]); why != "" {
-		return false, fmt.Sprintf("table %s: %s", aBase.TableName, why), nil
-	}
-	if !sameColumnOrder(aBase, hBase) {
-		return false, fmt.Sprintf("table %s: the base reordered columns since the approved commit", aBase.TableName), nil
-	}
-	if !sameColumnOrder(a, h) {
-		return false, fmt.Sprintf("table %s: the head orders columns differently from the approved commit", aBase.TableName), nil
 	}
 
 	approvedChange, err := strictTableDiff(aBase, a)
@@ -118,6 +88,76 @@ func SameTableChange(approvedBase, approved, headBase, head string) (same bool, 
 			aBase.TableName, approvedChange, headChange), nil
 	}
 	return true, "", nil
+}
+
+// sameCreateTable reports whether the head adds the table with the same
+// CREATE TABLE the approved commit adds. The statement runs as written, so
+// every clause counts, including any the diff does not model.
+func sameCreateTable(approved, head string) (same bool, reason string, err error) {
+	a, h, err := parseApprovedAndHead(approved, head)
+	if err != nil {
+		return false, "", err
+	}
+	approvedCreate, err := restoreNode(a.Raw)
+	if err != nil {
+		return false, "", fmt.Errorf("restore table %s at the approved commit: %w", a.TableName, err)
+	}
+	headCreate, err := restoreNode(h.Raw)
+	if err != nil {
+		return false, "", fmt.Errorf("restore table %s at the head: %w", h.TableName, err)
+	}
+	if approvedCreate != headCreate {
+		return false, fmt.Sprintf("table %s: the approved commit runs %q but the head runs %q", a.TableName, approvedCreate, headCreate), nil
+	}
+	return true, "", nil
+}
+
+// endsAtApprovedTable reports whether the head ends at the table the approved
+// commit adds, when the head's base already has part of it: everything the
+// head runs moves the table toward the one the reviewer approved.
+func endsAtApprovedTable(approved, head string) (same bool, reason string, err error) {
+	a, h, err := parseApprovedAndHead(approved, head)
+	if err != nil {
+		return false, "", err
+	}
+	if a.TableName != h.TableName {
+		return false, fmt.Sprintf("the file declares table %s at the approved commit but %s at the head", a.TableName, h.TableName), nil
+	}
+	difference, err := strictTableDiff(a, h)
+	if err != nil {
+		return false, "", fmt.Errorf("diff table %s at the head against the approved commit: %w", a.TableName, err)
+	}
+	if len(difference) > 0 {
+		return false, fmt.Sprintf("table %s: the head differs from the approved table by %q", a.TableName, difference), nil
+	}
+	return true, "", nil
+}
+
+// parseApprovedAndHead parses the schema file at the approved commit and at
+// the head.
+func parseApprovedAndHead(approved, head string) (a, h *statement.CreateTable, err error) {
+	a, err = parseComparableTable("approved commit", approved)
+	if err != nil {
+		return nil, nil, err
+	}
+	h, err = parseComparableTable("head", head)
+	if err != nil {
+		return nil, nil, err
+	}
+	return a, h, nil
+}
+
+// parseComparableTable parses the schema file at the named commit, which must
+// hold one CREATE TABLE that declares each element once: the diff assumes it.
+func parseComparableTable(name, content string) (*statement.CreateTable, error) {
+	ct, err := parseSingleCreateTable(content)
+	if err != nil {
+		return nil, fmt.Errorf("parse the schema file at the %s: %w", name, err)
+	}
+	if _, err := tableElements(ct); err != nil {
+		return nil, fmt.Errorf("read table %s at the %s: %w", ct.TableName, name, err)
+	}
+	return ct, nil
 }
 
 // clausesCovered reports whether every clause the head's statements run is
@@ -140,17 +180,24 @@ func clausesCovered(approved, head []string) (bool, error) {
 	if err != nil {
 		return false, fmt.Errorf("the head's statement: %w", err)
 	}
+	return InOrderSubset(approvedClauses, headClauses), nil
+}
+
+// InOrderSubset reports whether every item of head is an item of approved,
+// with head's items in the order approved lists them: head runs nothing
+// approved does not, and nothing in another order.
+func InOrderSubset(approved, head []string) bool {
 	next := 0
-	for _, clause := range headClauses {
-		for next < len(approvedClauses) && approvedClauses[next] != clause {
+	for _, item := range head {
+		for next < len(approved) && approved[next] != item {
 			next++
 		}
-		if next == len(approvedClauses) {
-			return false, nil
+		if next == len(approved) {
+			return false
 		}
 		next++
 	}
-	return true, nil
+	return true
 }
 
 // alterClauses parses an ALTER TABLE statement and returns each of its
@@ -176,44 +223,6 @@ func alterClauses(stmt string) ([]string, error) {
 		clauses = append(clauses, clause)
 	}
 	return clauses, nil
-}
-
-// sameAddedTable compares a table file the pull request adds at the approved
-// commit and at the head.
-func sameAddedTable(approved, head string) (same bool, reason string, err error) {
-	files := [...]struct {
-		name    string
-		content string
-	}{
-		{"approved commit", approved},
-		{"head", head},
-	}
-	var tables [len(files)]*statement.CreateTable
-	var elements [len(files)]map[string]string
-	for i, f := range files {
-		ct, err := parseSingleCreateTable(f.content)
-		if err != nil {
-			return false, "", fmt.Errorf("parse the schema file at the %s: %w", f.name, err)
-		}
-		e, err := tableElements(ct)
-		if err != nil {
-			return false, "", fmt.Errorf("read table %s at the %s: %w", ct.TableName, f.name, err)
-		}
-		tables[i], elements[i] = ct, e
-	}
-	a, h := tables[0], tables[1]
-	if a.TableName != h.TableName {
-		return false, fmt.Sprintf("the file declares table %s at the approved commit but %s at the head", a.TableName, h.TableName), nil
-	}
-	// With no base, every element is the pull request's own, so the merge
-	// holds exactly when the head declares each one as approved.
-	if why := UnmergedElement(nil, elements[0], nil, elements[1]); why != "" {
-		return false, fmt.Sprintf("table %s: %s", a.TableName, why), nil
-	}
-	if !sameColumnOrder(a, h) {
-		return false, fmt.Sprintf("table %s: the head orders columns differently from the approved commit", a.TableName), nil
-	}
-	return true, "", nil
 }
 
 // parseSingleCreateTable parses a schema file that must hold exactly one
@@ -247,31 +256,16 @@ func strictTableDiff(source, target *statement.CreateTable) ([]string, error) {
 	return stmts, nil
 }
 
-// UnmergedElement checks that head is the element-by-element three-way merge
-// of approved and headBase over approvedBase, and returns why the first
-// element (in name order) that is not breaks it, or "" when every element
-// merges. Each map holds one schema file's elements, such as a table's
-// columns and indexes or a VSchema's tables and vindexes, keyed by a name
-// that says what the element is and mapped to its definition. An element added or removed
-// counts as changed. Every dialect's statement comparison applies this one
-// rule.
-//
-// An element both approved and headBase changed merges in two cases only:
-//
-//   - The head declares it as headBase does. The pull request no longer
-//     changes it, because the base now carries its own version, as when a
-//     stacked pull request below this one merges the same edit. The head
-//     runs nothing for it.
-//   - The pull request drops it at both commits. A drop removes the element
-//     whatever the base did to it first, so the reviewer approved the same
-//     outcome.
-//
-// A head that keeps the pull request's version of an element the base
-// changed otherwise never merges: its statement can match the approved one
-// and still undo what the base changed.
-func UnmergedElement(approvedBase, approved, headBase, head map[string]string) string {
+// UncoveredElementChange returns why the first element (in name order) the
+// head changes from its base is not a change the approved commit makes from
+// its base, or "" when every change the head makes was approved. Each map
+// holds one schema file's elements, keyed by a name that says what the
+// element is and mapped to its definition; an element added, removed, or
+// redefined counts as changed. The head may change fewer elements than the
+// approved commit, as when its base already carries part of the change.
+func UncoveredElementChange(approvedBase, approved, headBase, head map[string]string) string {
 	keys := make(map[string]bool)
-	for _, elements := range []map[string]string{approvedBase, approved, headBase, head} {
+	for _, elements := range []map[string]string{headBase, head} {
 		for k := range elements {
 			keys[k] = true
 		}
@@ -282,34 +276,17 @@ func UnmergedElement(approvedBase, approved, headBase, head map[string]string) s
 	}
 	sort.Strings(sorted)
 	for _, k := range sorted {
-		baseChanged := !sameElement(approvedBase, headBase, k)
-		prChanged := !sameElement(approvedBase, approved, k)
-		switch {
-		case baseChanged && prChanged && (supersededElement(headBase, head, k) || droppedAtBoth(approved, head, k)):
+		if sameElement(headBase, head, k) {
 			continue
-		case baseChanged && prChanged:
-			return fmt.Sprintf("both the approved commit and the base changed %s", k)
-		case baseChanged && !sameElement(headBase, head, k):
-			return fmt.Sprintf("the base changed %s since the approved commit, and the head replaces it with another version", k)
-		case !baseChanged && !sameElement(approved, head, k):
-			return fmt.Sprintf("the head declares %s differently from the approved commit", k)
+		}
+		if sameElement(approvedBase, approved, k) {
+			return fmt.Sprintf("the head changes %s, which the approved commit does not", k)
+		}
+		if !sameElement(approved, head, k) {
+			return fmt.Sprintf("the head changes %s differently from the approved commit", k)
 		}
 	}
 	return ""
-}
-
-// supersededElement reports whether the head declares key as its base does,
-// so the pull request no longer changes it at the head.
-func supersededElement(headBase, head map[string]string, key string) bool {
-	return sameElement(headBase, head, key)
-}
-
-// droppedAtBoth reports whether the pull request removes key at both the
-// approved commit and the head.
-func droppedAtBoth(approved, head map[string]string, key string) bool {
-	_, inApproved := approved[key]
-	_, inHead := head[key]
-	return !inApproved && !inHead
 }
 
 // sameElement reports whether key is absent from both x and y or present in
@@ -320,44 +297,11 @@ func sameElement(x, y map[string]string, key string) bool {
 	return xok == yok && xv == yv
 }
 
-// sameColumnOrder reports whether x and y order the columns they both declare
-// the same way. Columns only one of them declares are ignored.
-func sameColumnOrder(x, y *statement.CreateTable) bool {
-	inY := make(map[string]bool, len(y.Columns))
-	for _, col := range y.Columns {
-		inY[strings.ToLower(col.Name)] = true
-	}
-	var shared []string
-	for _, col := range x.Columns {
-		if name := strings.ToLower(col.Name); inY[name] {
-			shared = append(shared, name)
-		}
-	}
-	i := 0
-	for _, col := range y.Columns {
-		name := strings.ToLower(col.Name)
-		if !slices.Contains(shared, name) {
-			continue
-		}
-		if shared[i] != name {
-			return false
-		}
-		i++
-	}
-	return true
-}
-
 // tableElements keys every column, index, and constraint of ct by kind and
 // lowercased name (MySQL matches them case-insensitively), every table option
-// by name, and everything else the statement declares (its modifiers,
-// partitioning, and any LIKE or AS SELECT clause) as one element, and maps
-// each to its definition as the parser read it. Elements come from the parse
-// tree rather than Spirit's model of the table, so a clause the model does
-// not carry (an ENCRYPTION option, a LIKE source) still takes part. Each
-// option is its own element, so the pull request and the base can change
-// different options of the same table. Column position is not part of a
-// column's definition; sameColumnOrder checks it. An element declared twice
-// cannot be told apart from the other, so it is an error.
+// by name, and everything else the statement declares as one element, and
+// maps each to its definition as the parser read it. An element declared
+// twice is an error: the diff would see only one of the two.
 func tableElements(ct *statement.CreateTable) (map[string]string, error) {
 	if ct.Raw == nil {
 		return nil, fmt.Errorf("table %s has no parse tree", ct.TableName)

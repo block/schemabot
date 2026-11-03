@@ -725,15 +725,14 @@ func TestCheckReviewGate_ApprovalCoverage(t *testing.T) {
 			want:       wantChanged,
 		},
 		{
-			// Both commits modify amount with the same statement, but on the
-			// newer default branch that statement also drops its NOT NULL.
-			name:         "a rebase that kept the PR's version of a column the default branch changed does not count",
-			base:         map[string]string{"schema/testdb/schemabot.yaml": "database: orders\n", "schema/testdb/orders/orders.sql": ordersWith("`id` bigint NOT NULL, `amount` int")},
-			prChange:     setOrders("`id` bigint NOT NULL, `amount` bigint"),
-			baseChange:   setOrders("`id` bigint NOT NULL, `amount` int NOT NULL"),
-			headChange:   setOrders("`id` bigint NOT NULL, `amount` bigint"),
-			want:         wantChanged,
-			wantBaseOnly: true,
+			// Both commits modify amount with the same statement, so the head
+			// runs only the DDL the reviewer approved.
+			name:       "a rebase that kept the PR's version of a column the default branch changed counts",
+			base:       map[string]string{"schema/testdb/schemabot.yaml": "database: orders\n", "schema/testdb/orders/orders.sql": ordersWith("`id` bigint NOT NULL, `amount` int")},
+			prChange:   setOrders("`id` bigint NOT NULL, `amount` bigint"),
+			baseChange: setOrders("`id` bigint NOT NULL, `amount` int NOT NULL"),
+			headChange: setOrders("`id` bigint NOT NULL, `amount` bigint"),
+			want:       wantCovers,
 		},
 		{
 			name:               "a rebase onto a target branch other than the default that combined the PR's column with the branch's does not count",
