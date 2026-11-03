@@ -796,6 +796,7 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 			"error", err)
 		return true
 	}
+	ps.parked.observe(pendingBeforeProgress)
 	if pendingBeforeProgress.has(storage.ControlOperationCancel, storage.ControlOperationStop) {
 		if standDown, err := c.processPendingCancelOrStopControlRequest(ctx, apply); err != nil {
 			logger.Warn("pending stop request processing failed; current apply owner will exit for operator retry",
@@ -1010,6 +1011,7 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 			"error", err)
 		return true
 	}
+	ps.parked.observe(pendingAfterProgress)
 	if pendingAfterProgress.has(storage.ControlOperationCancel, storage.ControlOperationStop) {
 		if standDown, err := c.processPendingCancelOrStopControlRequest(ctx, apply); err != nil {
 			logger.Warn("pending stop request processing failed after progress sync; current apply owner will exit for operator retry",
