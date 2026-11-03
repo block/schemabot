@@ -7,8 +7,9 @@ import "github.com/block/schemabot/pkg/state"
 // already settled, counting a stopped one since starting its apply again
 // resumes it, taken in the order the claim starts them (ST-10), and capped at
 // maxDriversPerApply. A waiting operation keeps counting against that cap, so
-// an apply wider than it holds the first operations to wait and starts the
-// rest only as those are cut over. Under `rolling`, and any policy the claim
+// an apply wider than it holds no more drivers than the cap; apply creation
+// refuses such an apply, so only one admitted under a larger cap is counted
+// this way. Under `rolling`, and any policy the claim
 // does not order as barrier or parallel, a member starts only once every
 // earlier member has completed, and a held member completes only once an
 // operator cuts it over, so one member holds at a time. Under `barrier` and

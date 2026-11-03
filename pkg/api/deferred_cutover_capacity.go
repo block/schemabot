@@ -40,6 +40,18 @@ type DeferredCutoverCapacityError struct {
 	// HoldingApplyIDs names the deferred applies counted in Reserved, so an
 	// operator knows which to cut over or cancel to make room.
 	HoldingApplyIDs []string
+	// PerApplyCap is the server's max_drivers_per_apply, set only when the
+	// apply would hold more operations at once than it. A waiting operation
+	// keeps counting against the cap, so the operations past it could never
+	// start while the first ones wait, and the apply would never have every
+	// operation waiting, which its cutover needs.
+	PerApplyCap int
+}
+
+// ExceedsPerApplyCap reports whether the apply would hold more operations at
+// once than max_drivers_per_apply lets one apply run.
+func (e *DeferredCutoverCapacityError) ExceedsPerApplyCap() bool {
+	return e.PerApplyCap > 0 && e.Operations > e.PerApplyCap
 }
 
 // ExceedsCapacity reports whether the apply is wider than the running
@@ -51,14 +63,20 @@ func (e *DeferredCutoverCapacityError) ExceedsCapacity() bool {
 
 // Transient reports whether the refusal can clear without changing the
 // request: other deferred applies finishing, or a server reporting its
-// drivers. An apply wider than every live deferred driver together is refused
-// again on every retry.
+// drivers. An apply wider than max_drivers_per_apply, or than every live
+// deferred driver together, is refused again on every retry.
 func (e *DeferredCutoverCapacityError) Transient() bool {
+	if e.ExceedsPerApplyCap() {
+		return false
+	}
 	return e.LiveServers == 0 || !e.ExceedsCapacity()
 }
 
 func (e *DeferredCutoverCapacityError) Error() string {
 	switch {
+	case e.ExceedsPerApplyCap():
+		return fmt.Sprintf("%s/%s: --defer-cutover would hold %d operations at their cutover at once, and max_drivers_per_apply runs at most %d operations of one apply at once; apply again without --defer-cutover, or raise max_drivers_per_apply to at least %d",
+			e.Database, e.Environment, e.Operations, e.PerApplyCap, e.Operations)
 	case e.LiveServers == 0:
 		return fmt.Sprintf("%s/%s: --defer-cutover would hold %d operations at their cutover at once, and no SchemaBot server has reported its drivers in the last %s; apply again without --defer-cutover",
 			e.Database, e.Environment, e.Operations, LiveWindowText())
@@ -114,14 +132,38 @@ func (c *ServerConfig) resolvedDrivers() int {
 }
 
 // deferredCutoverWidth counts the most operations an apply's groups would
-// hold at a deferred cutover at once under this server's max_drivers_per_apply
+// hold at a deferred cutover at once, before any max_drivers_per_apply cap
 // (storage.DeferredCutoverHeldAtOnce).
-func (s *Service) deferredCutoverWidth(groups []*storage.ApplyOperationWithTasks) int {
+func deferredCutoverWidth(groups []*storage.ApplyOperationWithTasks) int {
 	ops := make([]*storage.ApplyOperation, 0, len(groups))
 	for _, group := range groups {
 		ops = append(ops, group.Operation)
 	}
-	return storage.DeferredCutoverHeldAtOnce(ops, storage.BuildOptions(storage.WithMaxDriversPerApply(s.config.MaxDriversPerApply)).MaxDriversPerApply)
+	return storage.DeferredCutoverHeldAtOnce(ops, 0)
+}
+
+// deferredCutoverPerApplyCapRefusal refuses a deferred apply that would hold
+// two or more operations at once, and more of them than max_drivers_per_apply.
+// Each waiting operation keeps counting against the cap, so once the first
+// operations wait at their cutover the rest can never start, and a cutover
+// command, which needs every operation waiting, is refused until the apply
+// times out. It returns nil when the apply fits. The cap is this server's
+// configuration, so the check needs no storage read.
+func (s *Service) deferredCutoverPerApplyCapRefusal(plan *storage.Plan, environment, applyIdentifier, caller string, operations int) *DeferredCutoverCapacityError {
+	perApplyCap := storage.BuildOptions(storage.WithMaxDriversPerApply(s.config.MaxDriversPerApply)).MaxDriversPerApply
+	if operations <= 1 || operations <= perApplyCap {
+		return nil
+	}
+	s.logger.Warn("apply rejected: deferred cutover would hold more operations at once than max_drivers_per_apply runs of one apply",
+		"plan_id", plan.PlanIdentifier, "apply_id", applyIdentifier, "database", plan.Database,
+		"database_type", plan.DatabaseType, "environment", environment, "caller", caller,
+		"operations", operations, "max_drivers_per_apply", perApplyCap)
+	return &DeferredCutoverCapacityError{
+		Database:    plan.Database,
+		Environment: environment,
+		Operations:  operations,
+		PerApplyCap: perApplyCap,
+	}
 }
 
 // deferredCutoverRefusal turns storage refusing a deferred apply's admission

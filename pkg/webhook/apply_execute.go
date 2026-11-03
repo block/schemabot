@@ -938,13 +938,17 @@ func rolloutShapeRefusalMessage(refused *api.RolloutShapeRefusedError, command, 
 
 // deferredCutoverCapacityMessage is the PR comment line for an apply started
 // with --defer-cutover that would keep more drivers waiting at its cutover
-// than are left for deferred work. It reads only the refusal's counts and
+// than max_drivers_per_apply runs for one apply, or than are left for deferred
+// work. It reads only the refusal's counts and
 // SchemaBot's own apply identifiers, so no error text reaches the comment.
 // Re-issuing without the flag always runs; waiting helps only when other
 // deferred applies hold part of the capacity, so that case names them.
 func deferredCutoverCapacityMessage(refused *api.DeferredCutoverCapacityError, command, environment, tenant string) string {
 	rerun := fmt.Sprintf("Run `%s` again without `--defer-cutover`", templates.TenantCommand("schemabot "+command, environment, tenant))
 	switch {
+	case refused.ExceedsPerApplyCap():
+		return fmt.Sprintf("`--defer-cutover` would hold %d operations at their cutover at once, and SchemaBot runs at most %d operations of one apply at once (`max_drivers_per_apply`). %s, or raise `max_drivers_per_apply` to at least %d.",
+			refused.Operations, refused.PerApplyCap, rerun, refused.Operations)
 	case refused.LiveServers == 0:
 		return fmt.Sprintf("`--defer-cutover` would hold %d operations at their cutover at once, and no SchemaBot server has reported its drivers in the last %s. %s.",
 			refused.Operations, api.LiveWindowText(), rerun)
