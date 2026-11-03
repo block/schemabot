@@ -562,7 +562,10 @@ type capturingTernServer struct {
 	// progressScopeEcho, when set, is echoed as the scope of every progress
 	// answer, emulating a data plane that answers for a different operation.
 	progressScopeEcho string
-	cutoverReq        *ternv1.CutoverRequest
+	// progressApplyState is reported as the apply's state beside every scoped
+	// progress answer.
+	progressApplyState ternv1.State
+	cutoverReq         *ternv1.CutoverRequest
 }
 
 // dispatchOperationKeyEcho mirrors the data plane's operation key derivation
@@ -742,6 +745,7 @@ func (s *capturingTernServer) Progress(_ context.Context, req *ternv1.ProgressRe
 	}
 	errorMessage := s.progressError
 	settled := s.progressSettled
+	applyState := s.progressApplyState
 	err := s.progressErr
 	s.mu.Unlock()
 	if err != nil {
@@ -756,6 +760,7 @@ func (s *capturingTernServer) Progress(_ context.Context, req *ternv1.ProgressRe
 		ErrorMessage:           errorMessage,
 		SettledControlRequests: settled,
 		ApplyOperationId:       scopedTo,
+		ApplyState:             applyState,
 	}, nil
 }
 func (s *capturingTernServer) Logs(context.Context, *ternv1.LogsRequest) (*ternv1.LogsResponse, error) {

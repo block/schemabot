@@ -1986,6 +1986,22 @@ func (s applyTaskScope) progressReadFromWholeApply(resp *ternv1.ProgressResponse
 	return s.sharesRemoteApplyWithSiblings() && s.acceptsUnscopedProgressAnswer(resp.GetApplyOperationId())
 }
 
+// remoteOperationNeverStarts reports whether a progress answer scoped to one
+// operation says that operation will never start: it is still pending, and the
+// apply it belongs to has settled. A halted rollout settles with the members it
+// never reached still pending, and the data plane claims nothing more for an
+// apply that has settled. A stopped apply is left out, since starting it again
+// starts its pending members. A data plane that does not report the apply's
+// state leaves the field at its zero value, which is not a settled state, so
+// the drive keeps polling as before.
+func remoteOperationNeverStarts(resp *ternv1.ProgressResponse) bool {
+	if resp.GetApplyOperationId() == "" || resp.GetState() != ternv1.State_STATE_PENDING {
+		return false
+	}
+	applyState := resp.GetApplyState()
+	return isTerminalProtoState(applyState) && applyState != ternv1.State_STATE_STOPPED
+}
+
 // logProgressReadFromWholeApply warns that this drive's progress covers its
 // sibling operations' tasks alongside its own. The drive calls it once, not
 // on every poll, since the cause holds for as long as the drive runs.
@@ -5056,6 +5072,15 @@ func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply
 			if resp.State == ternv1.State_STATE_NO_ACTIVE_CHANGE {
 				message := fmt.Sprintf("remote apply %s returned no active schema change for exact apply_id", apply.ExternalID)
 				return c.failMissingRemoteApply(ctx, apply, message, nil, scope)
+			}
+			if remoteOperationNeverStarts(resp) {
+				logger.WarnContext(ctx, "remote operation is still pending in a remote apply that has settled; it will never start, so the drive ends and the operation returns to pending",
+					append(apply.MutableLogAttrs(),
+						"apply_operation_id", scope.applyOperationID,
+						"remote_apply_id", remoteID,
+						"remote_apply_operation_id", resp.GetApplyOperationId(),
+						"remote_apply_state", resp.GetApplyState().String())...)
+				return fmt.Errorf("poll remote apply %s for operation %d: %w", remoteID, scope.applyOperationID, ErrRemoteOperationNeverStarts)
 			}
 
 			// Mirror the data-plane display metadata (deploy-request URL, VSchema

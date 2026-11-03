@@ -3748,6 +3748,7 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 				Engine:                 c.protoEngine(),
 				SettledControlRequests: settled,
 				ApplyOperationId:       req.GetApplyOperationId(),
+				ApplyState:             storageStateToProto(apply.State),
 			}, nil
 		}
 	}
@@ -3989,6 +3990,7 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 	}
 	if scopedOp != nil {
 		resp.ApplyOperationId = req.GetApplyOperationId()
+		resp.ApplyState = storageStateToProto(apply.State)
 	}
 
 	// Surface the engine's display metadata (e.g. PlanetScale branch_name,

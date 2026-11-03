@@ -131,6 +131,27 @@ func TestLocalClient_ProgressScopedToOneRolloutMemberReportsOnlyThatMember(t *te
 	assert.Len(t, whole.Tables, 2)
 }
 
+// Two member targets of one deployment share its data-plane apply, which halts
+// on failure. payments-001 failed before payments-002 started, so the apply
+// settled as failed with payments-002 still pending. payments-002's scoped
+// answer reports it pending and names the apply's settled state beside it,
+// which is how the control plane learns the member will never start rather
+// than polling a pending member forever.
+func TestLocalClient_ProgressScopedToOneRolloutMemberReportsTheApplyState(t *testing.T) {
+	fx := newSharedApplyFixture(state.ApplyOperation.Failed, state.ApplyOperation.Pending, state.Task.Failed, state.Task.Pending)
+	fx.apply.State = state.Apply.Failed
+
+	scoped, err := fx.client.Progress(t.Context(), &ternv1.ProgressRequest{ApplyId: fx.apply.ApplyIdentifier, Environment: "staging", ApplyOperationId: "12"})
+	require.NoError(t, err)
+	assert.Equal(t, ternv1.State_STATE_PENDING, scoped.State, "the member never started")
+	assert.Equal(t, ternv1.State_STATE_FAILED, scoped.ApplyState, "the answer names the state of the apply the member belongs to")
+	assert.Equal(t, "12", scoped.ApplyOperationId)
+
+	whole, err := fx.client.Progress(t.Context(), &ternv1.ProgressRequest{ApplyId: fx.apply.ApplyIdentifier, Environment: "staging"})
+	require.NoError(t, err)
+	assert.Equal(t, ternv1.State_STATE_NO_ACTIVE_CHANGE, whole.ApplyState, "an answer for the whole apply already carries the apply's state as its own")
+}
+
 // A progress request that names an operation this apply does not have is
 // refused rather than answered for the whole apply, which would report the
 // member's siblings' work as its own.
