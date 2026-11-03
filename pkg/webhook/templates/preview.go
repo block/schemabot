@@ -1332,6 +1332,12 @@ func PreviewCommentMissingEnv() string {
 	return RenderMissingEnv(action.Plan)
 }
 
+// PreviewCommentControlMissingEnv renders the reply to a control command that
+// names an apply but omits -e.
+func PreviewCommentControlMissingEnv() string {
+	return RenderControlMissingEnv(action.Stop, "apply-a1b2c3d4e5f6", "staging")
+}
+
 // PreviewCommentInvalidCmd renders the "invalid command" error comment.
 func PreviewCommentInvalidCmd() string {
 	return RenderInvalidCommand()

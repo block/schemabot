@@ -306,6 +306,9 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 			h.writeJSON(w, http.StatusOK, map[string]string{"message": "multi-env plan started"})
 			return
 		}
+		if controlCommandNamesApply(result) && h.answerMissingEnvForNamedApply(ctx, w, repo, pr, installationID, deliveryID, requestedBy, result) {
+			return
+		}
 		if h.silentUsageErrorOnUnscopedFanOut(repo, result.Tenant) {
 			h.logger.Info("skipping missing environment reply for unscoped fan-out; the leader posts it once",
 				"repo", repo, "pr", pr, "action", result.Action)

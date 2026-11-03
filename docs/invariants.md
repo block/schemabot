@@ -1963,8 +1963,9 @@ corrected into something executable, especially one carrying `--allow-unsafe`. E
 receives a response, and silence only ever means another instance owns the reply or the comment
 issues no command: a line that opens with the product name but reads as a sentence about it, not a
 command attempt, is prose. *Enforced:* command discovery, the prose-mention rule, and the
-unowned-command policy (`pkg/webhook/commands.go`), and the fan-out silence predicates
-(`pkg/webhook/schema_source_policy.go`), under which one aggregate leader answers for a database
+unowned-command policy (`pkg/webhook/commands.go`), the stored-apply answer to a control command
+that omits its environment (`pkg/webhook/control_missing_env.go`), and the fan-out silence
+predicates (`pkg/webhook/schema_source_policy.go`), under which one aggregate leader answers for a database
 its own registry lacks under no expected participant's path: the leader serving the command's
 environment, or the first environment in the promotion order when the command names none.
 
