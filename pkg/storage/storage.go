@@ -1549,9 +1549,10 @@ type ApplyOperationStore interface {
 	ListRecentTargets(ctx context.Context, databaseType string, lookback time.Duration) ([]AppliedTarget, error)
 
 	// ListActiveDeferredCutoverWidths returns, for each apply started with
-	// --defer-cutover that is not in a terminal state, how many of its work
-	// operations are not terminal, ordered by apply identifier. Applies with
-	// no such operation are left out.
+	// --defer-cutover that has not settled, how many of its work operations
+	// have not settled, ordered by apply identifier. A stopped apply and its
+	// stopped operations are counted, since starting it again resumes them.
+	// Applies with no such operation are left out.
 	ListActiveDeferredCutoverWidths(ctx context.Context) ([]DeferredCutoverWidth, error)
 
 	// UpdateState transitions a child row to a new state. Updates the state

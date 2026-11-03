@@ -246,10 +246,11 @@ func (s *applyOperationStore) ListRecentTargets(ctx context.Context, databaseTyp
 }
 
 // ListActiveDeferredCutoverWidths returns how many work operations each
-// non-terminal apply started with --defer-cutover still has to drive, read
-// from the same applies.options key the deferred-work claim filter reads.
-// Stopped counts as terminal here, as it does for claiming: a stopped apply's
-// drives have ended and hold no driver.
+// unsettled apply started with --defer-cutover still has to drive, read from
+// the same applies.options key the deferred-work claim filter reads. A stopped
+// apply keeps its count: its drives have ended, but starting it again resumes
+// them without passing admission, so its drivers stay reserved until it
+// settles.
 func (s *applyOperationStore) ListActiveDeferredCutoverWidths(ctx context.Context) ([]storage.DeferredCutoverWidth, error) {
 	return listActiveDeferredCutoverWidths(ctx, s.db, s.dialect)
 }
@@ -257,17 +258,17 @@ func (s *applyOperationStore) ListActiveDeferredCutoverWidths(ctx context.Contex
 // listActiveDeferredCutoverWidths runs ListActiveDeferredCutoverWidths on q, so
 // deferred cutover admission can read it inside the create transaction.
 func listActiveDeferredCutoverWidths(ctx context.Context, q rowsQueryer, dialect Dialect) ([]storage.DeferredCutoverWidth, error) {
-	terminal := terminalApplyStates()
-	args := stringArgs(terminal)
-	args = append(args, stringArgs(terminal)...)
+	settled := settledApplyStates()
+	args := stringArgs(settled)
+	args = append(args, stringArgs(settled)...)
 	args = append(args, storage.ApplyOperationKindWork)
 	rows, err := q.QueryContext(ctx, `
 		SELECT a.apply_identifier, a.database_name, a.environment, COUNT(*)
 		FROM apply_operations ao
 		JOIN applies a ON a.id = ao.apply_id
 		WHERE `+dialect.JSONBooleanIsTrue("a.options", []string{"defer_cutover"})+`
-			AND a.state NOT IN (`+placeholders(len(terminal))+`)
-			AND ao.state NOT IN (`+placeholders(len(terminal))+`)
+			AND a.state NOT IN (`+placeholders(len(settled))+`)
+			AND ao.state NOT IN (`+placeholders(len(settled))+`)
 			AND ao.operation_kind = ?
 		GROUP BY a.apply_identifier, a.database_name, a.environment
 		ORDER BY a.apply_identifier`, args...)

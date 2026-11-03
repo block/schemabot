@@ -55,14 +55,23 @@ func (m *mockStorage) Ping(ctx context.Context) error { return m.pingErr }
 func (m *mockStorage) Close() error                   { return nil }
 
 // memoryOperatorServers is an in-memory operator server registry whose
-// heartbeats are always live.
+// heartbeats are always live. With hang set, a heartbeat answers only when its
+// context ends, as a storage call that stops responding would.
 type memoryOperatorServers struct {
 	mu      sync.Mutex
 	servers map[string]storage.OperatorServer
 	beats   int
+	hang    bool
 }
 
-func (m *memoryOperatorServers) Heartbeat(_ context.Context, server *storage.OperatorServer) error {
+func (m *memoryOperatorServers) Heartbeat(ctx context.Context, server *storage.OperatorServer) error {
+	m.mu.Lock()
+	hang := m.hang
+	m.mu.Unlock()
+	if hang {
+		<-ctx.Done()
+		return fmt.Errorf("heartbeat %s: %w", server.ServerID, ctx.Err())
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.servers == nil {

@@ -147,3 +147,31 @@ func TestOperatorHeartbeatsOnItsInterval(t *testing.T) {
 		return registry.beats >= 3
 	}, drivePassesDeadline, 5*time.Millisecond)
 }
+
+// A registry that stops answering does not hold the operator's startup: the
+// first heartbeat gives up at its own deadline, StartOperator returns, and
+// the drivers start without the server's row.
+func TestOperatorStartupHeartbeatGivesUpAtItsDeadline(t *testing.T) {
+	svc, _ := newQueueApplyTestService(trustedQueueApplyTestPlan(), &mockTernClient{}, &capturingApplyStore{})
+	svc.config.Drivers = 2
+	svc.operatorHeartbeatDeadline = 10 * time.Millisecond
+	require.NoError(t, svc.SetOperatorPollInterval(time.Hour))
+	registry := &svc.storage.(*mockStorageWithApplyStores).operatorServers
+	registry.hang = true
+
+	started := make(chan struct{})
+	go func() {
+		svc.StartOperator(t.Context())
+		close(started)
+	}()
+	select {
+	case <-started:
+	case <-time.After(drivePassesDeadline):
+		require.FailNow(t, "StartOperator did not return while the registry stopped answering")
+	}
+	t.Cleanup(svc.StopOperator)
+
+	live, err := registry.ListLive(t.Context())
+	require.NoError(t, err)
+	assert.Empty(t, live, "a heartbeat that timed out records no row")
+}

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -119,6 +120,34 @@ func TestOperatorServers(t *testing.T, h Harness) {
 		require.NoError(t, err)
 	})
 
+	// StoppedDeferredApplyKeepsItsReservation verifies a stopped wide deferred
+	// apply still counts against the live drivers: starting it again resumes
+	// its operations without passing admission, so another wide deferred
+	// apply admitted into its drivers would leave both short.
+	t.Run("StoppedDeferredApplyKeepsItsReservation", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		heartbeat(t, store, "host-a/1/operator", 4, 3)
+
+		id, err := createDeferredApply(t, store, "apply_deferred_stopped", "orders", 3)
+		require.NoError(t, err)
+		stopped, err := store.Applies().Get(ctx, id)
+		require.NoError(t, err)
+		require.NotNil(t, stopped)
+		stopped.State = state.Apply.Stopped
+		require.NoError(t, store.Applies().Update(ctx, stopped))
+		_, err = store.ApplyOperations().MarkPendingStoppedByApply(ctx, id)
+		require.NoError(t, err)
+
+		_, err = createDeferredApply(t, store, "apply_deferred_after_stop", "payments", 2)
+		refused, ok := errors.AsType[*storage.DeferredCutoverCapacityError](err)
+		require.True(t, ok, "got %v", err)
+		assert.Equal(t, storage.DeferredCutoverCapacityError{
+			Operations: 2, Reserved: 3, Capacity: 3, LiveServers: 1,
+			HoldingApplyIDs: []string{"apply_deferred_stopped"},
+		}, *refused)
+	})
+
 	// ConcurrentDeferredCutoverAdmissionsAdmitOne verifies admission is
 	// serialized across creators: several wide deferred applies on different
 	// databases, any one of which fills the live drivers, race to be created,
@@ -163,6 +192,7 @@ func heartbeat(t *testing.T, store storage.Storage, serverID string, drivers, de
 // them.
 func createDeferredApply(t *testing.T, store storage.Storage, applyID, database string, shards int) (int64, error) {
 	t.Helper()
+	now := time.Now()
 	apply := &storage.Apply{
 		ApplyIdentifier:           applyID,
 		PlanID:                    1,
@@ -174,6 +204,8 @@ func createDeferredApply(t *testing.T, store storage.Storage, applyID, database 
 		State:                     state.Apply.Pending,
 		Options:                   []byte(`{"defer_cutover":true}`),
 		DeferredCutoverOperations: shards,
+		CreatedAt:                 now,
+		UpdatedAt:                 now,
 	}
 	groups := make([]*storage.ApplyOperationWithTasks, 0, shards)
 	for shard := range shards {
@@ -181,7 +213,7 @@ func createDeferredApply(t *testing.T, store storage.Storage, applyID, database 
 		groups = append(groups, &storage.ApplyOperationWithTasks{
 			Operation: &storage.ApplyOperation{
 				Deployment: "region-a", OperationKey: key, OperationKind: storage.ApplyOperationKindWork,
-				State: state.ApplyOperation.Pending,
+				State: state.ApplyOperation.Pending, CreatedAt: now, UpdatedAt: now,
 			},
 			Tasks: []*storage.Task{{
 				TaskIdentifier: fmt.Sprintf("task_%s_%d", applyID, shard),
@@ -195,6 +227,8 @@ func createDeferredApply(t *testing.T, store storage.Storage, applyID, database 
 				DDL:            "ALTER TABLE users ADD COLUMN email VARCHAR(255)",
 				DDLAction:      "alter",
 				Options:        []byte("{}"),
+				CreatedAt:      now,
+				UpdatedAt:      now,
 			}},
 		})
 	}

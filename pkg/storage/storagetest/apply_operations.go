@@ -1989,7 +1989,8 @@ func TestApplyOperations(t *testing.T, h Harness) {
 	// a deferred cutover against: per active apply started with
 	// --defer-cutover, the work operations still to drive. Settled work and
 	// finalizers are not counted, and neither are applies that do not defer
-	// their cutover or have reached a terminal state.
+	// their cutover or have settled. A stopped apply and its stopped
+	// operations are counted, since starting it again resumes them.
 	t.Run("ListActiveDeferredCutoverWidths", func(t *testing.T) {
 		ctx := t.Context()
 		store := h.NewStorage(t)
@@ -2020,6 +2021,10 @@ func TestApplyOperations(t *testing.T, h Harness) {
 		narrow := deferred("apply_deferred_narrow", 962, state.Apply.Pending)
 		insert(narrow, "schema", storage.ApplyOperationKindWork, state.ApplyOperation.Pending)
 
+		paused := deferred("apply_deferred_stopped", 965, state.Apply.Stopped)
+		insert(paused, "commerce/-80/carts", storage.ApplyOperationKindWork, state.ApplyOperation.Stopped)
+		insert(paused, "commerce/80-/carts", storage.ApplyOperationKindWork, state.ApplyOperation.Pending)
+
 		finished := deferred("apply_deferred_cancelled", 963, state.Apply.Cancelled)
 		insert(finished, "commerce/-80/orders", storage.ApplyOperationKindWork, state.ApplyOperation.Cancelled)
 		insert(finished, "commerce/80-/orders", storage.ApplyOperationKindWork, state.ApplyOperation.Cancelled)
@@ -2032,6 +2037,7 @@ func TestApplyOperations(t *testing.T, h Harness) {
 		require.NoError(t, err)
 		assert.Equal(t, []storage.DeferredCutoverWidth{
 			{ApplyIdentifier: "apply_deferred_narrow", Database: narrow.Database, Environment: "staging", Operations: 1},
+			{ApplyIdentifier: "apply_deferred_stopped", Database: paused.Database, Environment: "staging", Operations: 2},
 			{ApplyIdentifier: "apply_deferred_wide", Database: wide.Database, Environment: "staging", Operations: 3},
 		}, widths)
 	})

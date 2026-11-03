@@ -202,7 +202,9 @@ type Service struct {
 	strandedReaperEvery  time.Duration
 	// operatorHeartbeatEvery overrides OperatorHeartbeatInterval in tests.
 	operatorHeartbeatEvery time.Duration
-	retryableExpiryEvery   time.Duration
+	// operatorHeartbeatDeadline overrides operatorHeartbeatTimeout in tests.
+	operatorHeartbeatDeadline time.Duration
+	retryableExpiryEvery      time.Duration
 	// driversBusy counts this process's operator drivers that currently hold
 	// claimed work; it backs the drivers-busy gauge.
 	driversBusy atomic.Int64

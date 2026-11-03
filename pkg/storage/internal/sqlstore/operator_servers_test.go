@@ -43,7 +43,8 @@ func TestOperatorServersIgnoreAndPruneStaleHeartbeats(t *testing.T) {
 	apply := newGroupedCreateApply(time.Now(), "apply_deferred_stale_capacity")
 	apply.Options = []byte(`{"defer_cutover":true}`)
 	apply.DeferredCutoverOperations = 4
-	_, err = store.Applies().CreateWithGroupedOperations(ctx, apply, nil)
+	groups := []*storage.ApplyOperationWithTasks{newGroupedCreateGroup(time.Now(), "payments-a", "", "users")}
+	_, err = store.Applies().CreateWithGroupedOperations(ctx, apply, groups)
 	refused, ok := errors.AsType[*storage.DeferredCutoverCapacityError](err)
 	require.True(t, ok, "got %v", err)
 	assert.Equal(t, 3, refused.Capacity, "only the live server's drivers count")

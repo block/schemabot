@@ -981,10 +981,14 @@ func (s *applyStore) Create(ctx context.Context, apply *storage.Apply) (int64, e
 	}
 
 	lockTarget := isActiveApplyState(apply.State)
+	admitDeferred := apply.DeferredCutoverOperations > 1
+	if admitDeferred && !lockTarget {
+		return 0, fmt.Errorf("create apply %s: deferred cutover admission requires an active apply, got state %s", apply.ApplyIdentifier, apply.State)
+	}
 	var writeTx *applyWriteTx
 	var err error
 	if lockTarget {
-		writeTx, err = beginApplyTargetWriteTx(ctx, s.db, s.locker, "create apply", apply.Database, apply.DatabaseType, apply.Environment)
+		writeTx, err = beginApplyTargetWriteTxLocking(ctx, s.db, s.locker, "create apply", apply.Database, apply.DatabaseType, apply.Environment, admitDeferred)
 		if err != nil {
 			return 0, err
 		}
@@ -1297,6 +1301,10 @@ func (s *applyStore) createWithRowsOnce(ctx context.Context, apply *storage.Appl
 		if err != nil {
 			return 0, err
 		}
+	}
+
+	if err := admitDeferredCutover(ctx, writeTx.tx, s.dialect, apply); err != nil {
+		return 0, err
 	}
 
 	expectedOperationKeys, err := expectedOperationKeysValue(apply)

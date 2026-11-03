@@ -113,6 +113,12 @@ func (s *Service) deferredCutoverRefusal(plan *storage.Plan, environment, applyI
 // before the server's drivers stop counting toward deferred cutover admission.
 const OperatorHeartbeatInterval = storage.OperatorServerLiveWindow / 4
 
+// operatorHeartbeatTimeout bounds one registry heartbeat. The first one runs
+// on the startup path, so a storage call that stops answering must not hold
+// startup short of its shutdown handling; a heartbeat that times out is
+// logged and retried on the next tick like any other failure.
+const operatorHeartbeatTimeout = 5 * time.Second
+
 // operatorDeregisterTimeout bounds the registry removal at operator shutdown.
 // A removal that does not finish leaves the row to drop out of the live
 // window on its own.
@@ -130,11 +136,17 @@ func newOperatorServerID() string {
 // server's drivers may drop out of the live count, which refuses wide
 // deferred applies sooner rather than admitting more than run.
 func (s *Service) heartbeatOperatorServer(ctx context.Context, server *storage.OperatorServer) {
+	timeout := s.operatorHeartbeatDeadline
+	if timeout <= 0 {
+		timeout = operatorHeartbeatTimeout
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
 	if err := s.storage.OperatorServers().Heartbeat(ctx, server); err != nil {
 		s.logger.Warn("operator heartbeat failed; deferred cutover admission will not count this server's drivers once its last heartbeat leaves the live window",
 			"server_id", server.ServerID, "drivers", server.Drivers,
 			"deferred_cutover_drivers", server.DeferredCutoverDrivers,
-			"live_window", storage.OperatorServerLiveWindow, "error", err)
+			"live_window", storage.OperatorServerLiveWindow, "timeout", timeout, "error", err)
 	}
 }
 
