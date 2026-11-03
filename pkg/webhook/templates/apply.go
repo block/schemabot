@@ -1067,6 +1067,13 @@ func renderTableProgress(sb *strings.Builder, dialect schema.Dialect, table Tabl
 		fmt.Fprintf(sb, "**%s**: %s Waiting for cutover\n", inlineCode(table.TableName), ui.ProgressBarWaitingCutover())
 		writeDDLLine(sb, dialect, table.DDL, budget)
 
+	case state.Task.WaitingForDeploy:
+		// The deploy request is staged and waits for the operator to deploy it.
+		// Nothing has run on the target yet, so no bar: a bar would read as a
+		// copy underway.
+		fmt.Fprintf(sb, "**%s**: ⏸️ Waiting for deploy\n", inlineCode(table.TableName))
+		writeDDLLine(sb, dialect, table.DDL, budget)
+
 	case state.Task.Recovering:
 		if recoveringIsCopyingRows(table) {
 			pct := ui.RowCopyDisplayPercent(table.PercentComplete, table.RowsCopied)
@@ -1141,6 +1148,12 @@ func renderTableProgress(sb *strings.Builder, dialect schema.Dialect, table Tabl
 	case state.Task.Reverting:
 		bar := ui.ProgressBarWaitingCutover()
 		fmt.Fprintf(sb, "**%s**: %s \u21a9\ufe0f Reverting\n", inlineCode(table.TableName), bar)
+		writeDDLLine(sb, dialect, table.DDL, budget)
+
+	case state.Task.Reverted:
+		// The change was applied, then undone at an operator's request. A full
+		// orange bar: settled, and the change is no longer in effect.
+		fmt.Fprintf(sb, "**%s**: %s \u21a9\ufe0f Reverted\n", inlineCode(table.TableName), ui.ProgressBar(100, ui.ColorOrange))
 		writeDDLLine(sb, dialect, table.DDL, budget)
 
 	case state.Task.Stopped:
@@ -1901,7 +1914,7 @@ func groupStateEmoji(tables []TableProgressData) string {
 	if states[state.Task.Failed] {
 		return glyph.Failed
 	}
-	if states["reverted"] {
+	if states[state.Task.Reverted] {
 		return "↩️"
 	}
 	if states[state.Task.Stopped] {
@@ -1941,7 +1954,7 @@ func writeSummaryTableEntry(sb *strings.Builder, dialect schema.Dialect, t Table
 			label = fmt.Sprintf("Stopped at %s", ui.FormatRowCopyPercent(t.PercentComplete, t.RowsCopied, t.RowsTotal))
 		}
 		fmt.Fprintf(sb, "**%s** — %s\n", inlineCode(t.TableName), label)
-	case "reverted":
+	case state.Task.Reverted:
 		fmt.Fprintf(sb, "**%s** — Reverted\n", inlineCode(t.TableName))
 	case state.Task.Cancelled:
 		label := "Cancelled"

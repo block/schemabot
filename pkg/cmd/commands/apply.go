@@ -599,7 +599,7 @@ func (cmd *ApplyCmd) refuseActiveSchemaChange(database string, check func() (*cl
 	fmt.Println(stateMsg)
 	fmt.Println()
 	if state.IsState(active.State, state.Apply.WaitingForDeploy, state.Apply.WaitingForCutover) {
-		fmt.Printf("To trigger cutover:  %s\n", cliname.Command("cutover", "-e", cmd.Environment, active.ApplyID))
+		fmt.Printf("To trigger cutover:  %s\n", templates.ControlCommand("cutover", active.ApplyID, cmd.Environment))
 	}
 	fmt.Printf("To watch and manage: %s\n", cliname.Command("status", active.ApplyID))
 	return fmt.Errorf("schema change already in progress")

@@ -4432,6 +4432,33 @@ Approvals on an earlier commit no longer count because this PR's schema change i
 </details>
 
 <details>
+<summary><a name="apply-blocked-review-required-unchanged-file-changed-base"></a><strong>Apply Blocked: Review Required (Unchanged File, Changed Base)</strong></summary>
+
+
+## Review Required
+
+**Database**: `testapp` | **Environment**: `staging`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+Schema changes require approval from an authorized reviewer before applying.
+
+Approvals on an earlier commit no longer count because this PR's schema change is different now: @jdoe. Compared with some earlier approvals, file contents are unchanged, but their merge-base versions differ: `schema/testapp/orders.sql`. Ask for an approval of the latest commit.
+
+**Operators of `testapp`**:
+- @acme/testapp-operators
+
+**Other authorized reviewers**:
+- @acme/schema-reviewers
+- @jdoe
+
+### Next steps
+1. Request a review from anyone listed above
+2. Once approved, run `schemabot apply -e staging` again
+
+</details>
+
+<details>
 <summary><a name="apply-blocked-review-gate-error-failclosed"></a><strong>Apply Blocked: Review Gate Error (Fail-closed)</strong></summary>
 
 
@@ -7236,7 +7263,9 @@ The new apply will only process tables that haven't completed.
        ALTER TABLE `orders` ADD INDEX `idx_total_cents`(`total_cents`);
 
 
-Stopped. Use 'schemabot start -e staging <apply_id>' to resume from checkpoint.
+⏹️ Apply stopped
+To resume from where it stopped:
+  schemabot start <apply_id> -e staging
 
 ```
 </details>
@@ -7278,7 +7307,7 @@ Press Enter to proceed with cutover (or Ctrl+C to detach): _
 Row copy complete. All data has been copied and new writes
 continue to be replicated to keep the shadow table in sync.
 
-To proceed: schemabot cutover -e staging <apply_id>
+To proceed: schemabot cutover <apply_id> -e staging
 Watching for cutover... (Ctrl+C to detach)
 
 ```
@@ -7653,7 +7682,8 @@ Sequential mode: User stopped mid-apply
      ~ users: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
        ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
 
-Use 'schemabot start' to resume from checkpoint.
+To resume from where it stopped:
+  schemabot start <apply_id> -e staging
 
 ```
 </details>
@@ -8540,7 +8570,7 @@ ESC detach • s stop
 
 ```
 
-Stop command: User runs 'schemabot stop -e staging <apply_id>'
+Stop command: User runs 'schemabot stop <apply_id> -e staging'
 
 ⏹️  Schema change stopped
 
@@ -8549,7 +8579,9 @@ Environment: staging
 Stopped:     2 table(s)
 Skipped:     1 table(s) (already complete)
 
-Checkpoint saved. Use 'schemabot start -e staging apply-a1b2c3d4e5f67890' to resume.
+Checkpoint saved.
+To resume from where it stopped:
+  schemabot start apply-a1b2c3d4e5f67890 -e staging
 
 ```
 </details>
@@ -8588,7 +8620,7 @@ Checkpoint saved. Use 'schemabot start -e staging apply-a1b2c3d4e5f67890' to res
 
 ```
 
-Start command: User runs 'schemabot start -e staging <apply_id>'
+Start command: User runs 'schemabot start <apply_id> -e staging'
 
 ▶️  Schema change resumed
 
@@ -10424,7 +10456,6 @@ A new apply can retry the failure once this one finishes or is stopped; it repro
 
   ❌ First failure: prod/payments-041 — duplicate key name 'idx_orders_source'
 
-❌ 40 completed · 19 running · 4 queued · 1 failed (64 targets)
 
      ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜ 79%
        ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL;
@@ -10462,7 +10493,6 @@ To stop this schema change:
 │  Targets:      3 ready for cutover                    │
 └───────────────────────────────────────────────────────┘
 
-🟢 3 ready for cutover (3 targets)
 
      ~ orders: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 Waiting for cutover
        targets payments-001, payments-002
@@ -10501,11 +10531,10 @@ To cut over prod/payments-001:
 │  Targets:      1 completed · 2 stopped                │
 └───────────────────────────────────────────────────────┘
 
-⏹️ 1 completed · 2 stopped (3 targets)
 
-     ~ orders: ⏹️ Stopped
+     ~ orders: 🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧⬜⬜⬜⬜⬜⬜⬜⬜⬜ ⏹️ Stopped at 55.00%
        ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL;
-
+       • Rows: 132,000 / 240,000
        • Targets: 3 (2 stopped, 1 complete)
            ✓ payments-001: 80,000 rows
            ○ payments-002: stopped at 40.00% · 32,000 / 80,000 rows
@@ -10853,7 +10882,8 @@ Sequential mode: User stopped mid-apply
      ~ users: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
        ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
 
-Use 'schemabot start' to resume from checkpoint.
+To resume from where it stopped:
+  schemabot start <apply_id> -e staging
 ```
 </details>
 
@@ -11011,7 +11041,8 @@ Defer cutover: Stopped by user (s)
        ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
        • Rows: 6,400,000 / 7,200,000
 
-Use 'schemabot start -e staging <apply_id>' to resume.
+To resume from where it stopped:
+  schemabot start <apply_id> -e staging
 
 ```
 </details>
@@ -11032,10 +11063,10 @@ To check status:
   schemabot status <apply_id>
 
 To proceed with cutover:
-  schemabot cutover -e staging <apply_id>
+  schemabot cutover <apply_id> -e staging
 
 To abort the schema change:
-  schemabot stop -e staging <apply_id>
+  schemabot stop <apply_id> -e staging
 
 ```
 </details>
@@ -11214,10 +11245,7 @@ ESC detach • s stop
 ## Multi-Deployment Apply TUI (CLI)
 
 ```
-⣾ running
-Deployments: 1 ready for cutover · 1 running · 1 waiting
-Apply ID: apply-multi-a1b2c3d4
-Environment: production
+⣾ Running... 1 ready for cutover · 1 running · 1 waiting (3 deployments)
 
 🟢 us-east — ready for cutover (orders-us-east)
   External operation ID: remote-op-us-east-001
@@ -11243,10 +11271,8 @@ Environment: production
 
 
 SchemaBot will cut over us-east next — no action needed.
-To stop this schema change:
-  schemabot stop apply-multi-a1b2c3d4 -e production
 
-ESC to detach
+ESC detach • s stop
 ```
 
 
