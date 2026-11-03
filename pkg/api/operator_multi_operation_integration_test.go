@@ -875,6 +875,9 @@ type matrixOutcome struct {
 	errMsg           string
 	gate             *driveGate
 	probeParentWrite bool
+	// returnErr, when set, is what the drive returns after it writes the task
+	// rows, as a real drive returns the reason it ended.
+	returnErr error
 }
 
 // matrixTernClient is a deterministic tern.Client that simulates one
@@ -962,7 +965,7 @@ func (m *matrixTernClient) ResumeApplyOperation(ctx context.Context, apply *stor
 			return fmt.Errorf("matrix fake: update task %d for deployment %s: %w", task.ID, m.deployment, err)
 		}
 	}
-	return nil
+	return outcome.returnErr
 }
 
 // --- recorders ----------------------------------------------------------

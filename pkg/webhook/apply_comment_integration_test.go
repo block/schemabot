@@ -448,6 +448,123 @@ func TestE2EResumeRotatesProgressComment(t *testing.T) {
 	}
 }
 
+// An operator stopped a two-target rollout while region-a copied and region-b
+// waited its turn, then started it again. The start posts one fresh progress
+// comment at the bottom of the PR and freezes the stopped one. The rollout then
+// hands off from region-a to region-b, reading pending while region-b waits for
+// its claim; that is not a stop, so the observer edits the fresh comment in
+// place through the handoff and into region-b's copy, rotating nothing and
+// posting no summary.
+func TestE2ERolloutStartRotatesOnceAcrossTheTargetHandoff(t *testing.T) {
+	ctx := t.Context()
+
+	f := setupApplyCommentFixture(t, applyCommentFixtureParams{
+		repo:       "org/repo-rollout-start",
+		pr:         171,
+		database:   "e2e_rollout_start_db",
+		applyState: state.Apply.Resuming,
+	})
+	st, apply, taskA, capture, h := f.st, f.apply, f.task, f.capture, f.handler
+
+	insertTarget := func(target, opState string) int64 {
+		t.Helper()
+		id, err := st.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+			ApplyID: apply.ID, Deployment: "default", Target: target, OperationKey: target, State: opState,
+			CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt,
+		})
+		require.NoError(t, err)
+		return id
+	}
+	regionA := insertTarget("region-a", state.ApplyOperation.Resuming)
+	regionB := insertTarget("region-b", state.ApplyOperation.Pending)
+	taskA.ApplyOperationID = &regionA
+	require.NoError(t, st.Tasks().Update(ctx, taskA))
+	taskB := *taskA
+	taskB.TaskIdentifier = taskA.TaskIdentifier + "_b"
+	taskB.ApplyOperationID = &regionB
+	taskB.State = state.Task.Pending
+	taskB.RowsCopied = 0
+	taskB.ProgressPercent = 0
+	_, err := st.Tasks().Create(ctx, &taskB)
+	require.NoError(t, err)
+	setTargets := func(applyState, regionAState, regionBState string) {
+		t.Helper()
+		apply.State = applyState
+		require.NoError(t, st.ApplyOperations().UpdateState(ctx, regionA, regionAState))
+		require.NoError(t, st.ApplyOperations().UpdateState(ctx, regionB, regionBState))
+	}
+
+	h.postAndTrackComment(ctx, "org/repo-rollout-start", 171, 12345, apply, state.Comment.Progress, "Stopped at 21%")
+	stoppedProgressID := requireCommentCreate(t, capture)
+	h.postAndTrackComment(ctx, "org/repo-rollout-start", 171, 12345, apply, state.Comment.Summary, "Schema Change Stopped")
+	requireCommentCreate(t, capture)
+
+	fake := clock.NewFake(taskA.CreatedAt)
+	obs := f.newObserver(st, fake)
+
+	// The start's first tick posts the fresh comment and freezes the stopped one.
+	obs.OnProgress(apply, []*storage.Task{taskA, &taskB})
+	var freshID int64
+	select {
+	case created := <-capture.creates:
+		freshID = created.ID
+		assert.NotContains(t, created.Body, "Stopped")
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected the start to post a fresh progress comment")
+	}
+	select {
+	case edited := <-capture.edits:
+		assert.Equal(t, stoppedProgressID, edited.CommentID, "the freeze edit lands on the stopped comment")
+		assert.Contains(t, edited.Body, fmt.Sprintf("#issuecomment-%d", freshID))
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected the stopped progress comment to be frozen")
+	}
+
+	// requireInPlaceEdit advances past the edit interval, ticks, and requires
+	// the tick to edit the fresh comment rather than post another one.
+	requireInPlaceEdit := func(msg string, tasks ...*storage.Task) string {
+		t.Helper()
+		fake.Advance(activeInterval + time.Second)
+		obs.OnProgress(apply, tasks)
+		select {
+		case edited := <-capture.edits:
+			assert.Equal(t, freshID, edited.CommentID, msg)
+			return edited.Body
+		case created := <-capture.creates:
+			t.Fatalf("%s: a start rotates once; got another new comment %d:\n%s", msg, created.ID, created.Body)
+		case <-time.After(5 * time.Second):
+			t.Fatalf("%s: expected an in-place edit of the fresh comment", msg)
+		}
+		return ""
+	}
+
+	setTargets(state.Apply.Running, state.ApplyOperation.Running, state.ApplyOperation.Pending)
+	taskA.RowsCopied, taskA.ProgressPercent = 700, 70
+	requireInPlaceEdit("region-a copying", taskA, &taskB)
+
+	// The handoff: region-a is done and region-b is queued for its claim.
+	setTargets(state.Apply.Pending, state.ApplyOperation.Completed, state.ApplyOperation.Pending)
+	taskA.State, taskA.RowsCopied, taskA.ProgressPercent = state.Task.Completed, 1000, 100
+	handoff := requireInPlaceEdit("the handoff", taskA, &taskB)
+	assert.NotContains(t, handoff, "Stopped", "a rollout between targets is not stopped")
+	assert.Contains(t, handoff, "Rolling out: 1 of 2 targets done, 1 queued")
+	assert.Contains(t, handoff, "`region-b`: queued")
+
+	setTargets(state.Apply.Running, state.ApplyOperation.Completed, state.ApplyOperation.Running)
+	taskB.State, taskB.RowsCopied, taskB.ProgressPercent = state.Task.Running, 300, 30
+	requireInPlaceEdit("region-b copying", taskA, &taskB)
+
+	select {
+	case created := <-capture.creates:
+		t.Fatalf("no summary posts while the rollout is under way; got comment %d:\n%s", created.ID, created.Body)
+	default:
+	}
+	summary, err := st.ApplyComments().Get(ctx, apply.ID, state.Comment.Summary)
+	require.NoError(t, err)
+	require.NotNil(t, summary)
+	assert.NotNil(t, summary.SupersededAt, "the stop's summary is the one the start rotated on, and no other summary replaced it")
+}
+
 // A resume rotation whose fresh comment lands but whose summary-marker
 // consumption fails must not leave the marker active for the rest of the
 // drive: the marker is the durable signal that the next terminal summary needs
@@ -566,7 +683,7 @@ func TestE2EResumeRotationWaitsForSummaryClaimSentinel(t *testing.T) {
 
 	// A stop-side publisher has claimed the summary but not yet posted it: the
 	// marker row is a claim sentinel with no comment ID.
-	won, err := st.ApplyComments().ClaimSummaryComment(ctx, apply.ID)
+	won, err := st.ApplyComments().ClaimSummaryComment(ctx, apply.ID, state.Apply.Stopped)
 	require.NoError(t, err)
 	require.True(t, won, "the claim sentinel is created for the in-flight publish")
 
@@ -679,6 +796,259 @@ func TestE2EStopResumeCompleteStillPostsTerminalSummary(t *testing.T) {
 	require.NotNil(t, summary)
 	assert.Equal(t, terminalSummaryID, summary.GitHubCommentID)
 	assert.Nil(t, summary.SupersededAt)
+}
+
+// A started apply that reaches its next terminal state before any progress
+// tick rotated its comment still gets the summary of that state: the stop's
+// summary is still recorded when the apply completes, and it describes the
+// stop, not the completion, so the completion's publish claims the marker and
+// posts the result at the bottom of the PR.
+func TestE2EStartedApplyCompletingBeforeRotationPostsItsSummary(t *testing.T) {
+	ctx := t.Context()
+
+	f := setupApplyCommentFixture(t, applyCommentFixtureParams{
+		repo:       "org/repo-complete-before-rotation",
+		pr:         159,
+		database:   "e2e_complete_before_rotation_db",
+		applyState: state.Apply.Resuming,
+	})
+	st, apply, task, capture := f.st, f.apply, f.task, f.capture
+
+	f.handler.postAndTrackComment(ctx, apply.Repository, apply.PullRequest, 12345, apply, state.Comment.Progress, "Stopped at 50%")
+	requireCommentCreate(t, capture)
+	stoppedSummaryID := seedStoppedSummary(t, f)
+
+	// The started copy finishes before the first progress tick: the observer's
+	// first callback is the terminal one.
+	obs := f.newObserver(st, clock.NewFake(task.CreatedAt))
+	setStoredApplyState(t, f, state.Apply.Completed)
+	apply.State = state.Apply.Completed
+	task.State = state.Task.Completed
+	task.RowsCopied = 1000
+	task.ProgressPercent = 100
+	obs.OnTerminal(apply, []*storage.Task{task})
+
+	var completionSummaryID int64
+	select {
+	case created := <-capture.creates:
+		completionSummaryID = created.ID
+		assert.Contains(t, created.Body, "Schema Change Applied")
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected the completion summary while the stop's summary is still recorded")
+	}
+	assert.NotEqual(t, stoppedSummaryID, completionSummaryID)
+
+	summary, err := st.ApplyComments().Get(ctx, apply.ID, state.Comment.Summary)
+	require.NoError(t, err)
+	require.NotNil(t, summary)
+	assert.Equal(t, completionSummaryID, summary.GitHubCommentID)
+	require.NotNil(t, summary.SummarizedState)
+	assert.Equal(t, state.Apply.Completed, *summary.SummarizedState)
+	assert.Nil(t, summary.SupersededAt)
+}
+
+// An operator can stop a started apply again while the first progress tick
+// after the start is still rotating its comment. The second stop's publish
+// finds the first stop's summary still recorded and loses its claim to it. The
+// rotation must not consume that summary, because it is what the next start
+// rotates on; it marks it rotated past instead. Reconciliation then posts the
+// second stop's summary, and the next start still posts a fresh progress
+// comment at the bottom of the PR.
+func TestE2EStopDuringResumeRotationKeepsStopSummaryAndNextRotation(t *testing.T) {
+	ctx := t.Context()
+
+	f := setupApplyCommentFixture(t, applyCommentFixtureParams{
+		repo:       "org/repo-stop-during-rotation",
+		pr:         158,
+		database:   "e2e_stop_during_rotation_db",
+		applyState: state.Apply.Resuming,
+	})
+	st, apply, task, capture, h := f.st, f.apply, f.task, f.capture, f.handler
+
+	h.postAndTrackComment(ctx, apply.Repository, apply.PullRequest, 12345, apply, state.Comment.Progress, "Stopped at 21%")
+	requireCommentCreate(t, capture)
+	firstStopSummaryID := seedStoppedSummary(t, f)
+
+	// The second stop lands while the rotation posts its fresh comment: by
+	// the time the rotation consumes the summary marker, the apply is stopped
+	// again and the stop's terminal publish has already run.
+	fake := clock.NewFake(task.CreatedAt)
+	secondStop := *apply
+	secondStop.State = state.Apply.Stopped
+	stoppedTask := *task
+	stoppedTask.State = state.Task.Stopped
+	stopObserver := f.newObserver(st, fake)
+	racing := &summaryConsumeHookStorage{Storage: st, beforeConsume: func() {
+		setStoredApplyState(t, f, state.Apply.Stopped)
+		stopObserver.OnTerminal(&secondStop, []*storage.Task{&stoppedTask})
+	}}
+	obs := f.newObserver(racing, fake)
+	obs.OnProgress(apply, []*storage.Task{task})
+
+	var firstRotationID int64
+	select {
+	case created := <-capture.creates:
+		firstRotationID = created.ID
+		assert.Contains(t, created.Body, "**Status**: Resuming")
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected the first start's rotation to post a fresh progress comment")
+	}
+	select {
+	case created := <-capture.creates:
+		t.Fatalf("the second stop's publish must lose its claim to the recorded summary; got comment %d: %s", created.ID, created.Body)
+	default:
+	}
+
+	summary, err := st.ApplyComments().Get(ctx, apply.ID, state.Comment.Summary)
+	require.NoError(t, err)
+	require.NotNil(t, summary)
+	assert.Equal(t, firstStopSummaryID, summary.GitHubCommentID)
+	assert.Nil(t, summary.SupersededAt, "the summary stays active for the next start's rotation")
+	require.NotNil(t, summary.SummarizedState)
+	assert.Equal(t, storage.SummaryRotatedPast, *summary.SummarizedState)
+
+	// Reconciliation finds the second stop owed its summary once the stop has
+	// settled, and posts it.
+	db, err := sql.Open("block-mysql", e2eSchemabotDSN)
+	require.NoError(t, err)
+	t.Cleanup(func() { utils.CloseAndLog(db) })
+	require.NoError(t, db.PingContext(ctx))
+	_, err = db.ExecContext(ctx, "UPDATE applies SET updated_at = NOW() - INTERVAL ? SECOND WHERE id = ?",
+		int(storage.SummaryClaimStaleAfter.Seconds())+60, apply.ID)
+	require.NoError(t, err)
+	h.ReconcileMissingSummaryComments(ctx)
+
+	var secondStopSummaryID int64
+	select {
+	case created := <-capture.creates:
+		secondStopSummaryID = created.ID
+		assert.Contains(t, created.Body, "Schema Change Stopped")
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected reconciliation to post the second stop's summary")
+	}
+	summary, err = st.ApplyComments().Get(ctx, apply.ID, state.Comment.Summary)
+	require.NoError(t, err)
+	require.NotNil(t, summary)
+	assert.Equal(t, secondStopSummaryID, summary.GitHubCommentID)
+	require.NotNil(t, summary.SummarizedState)
+	assert.Equal(t, state.Apply.Stopped, *summary.SummarizedState)
+
+	// The second start: a fresh drive's observer rotates on the second stop's
+	// summary and consumes it.
+	setStoredApplyState(t, f, state.Apply.Resuming)
+	nextStart := f.newObserver(st, fake)
+	nextStart.OnProgress(apply, []*storage.Task{task})
+
+	select {
+	case created := <-capture.creates:
+		assert.Contains(t, created.Body, "**Status**: Resuming")
+		assert.NotEqual(t, firstRotationID, created.ID)
+		tracked, err := st.ApplyComments().Get(ctx, apply.ID, state.Comment.Progress)
+		require.NoError(t, err)
+		require.NotNil(t, tracked)
+		assert.Equal(t, created.ID, tracked.GitHubCommentID, "the second start's comment is the tracked progress comment")
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected the second start to post a fresh progress comment")
+	}
+	summary, err = st.ApplyComments().Get(ctx, apply.ID, state.Comment.Summary)
+	require.NoError(t, err)
+	require.NotNil(t, summary)
+	assert.NotNil(t, summary.SupersededAt, "the second start's rotation consumes the second stop's summary")
+}
+
+// A start's rotation can post its fresh progress comment and then fail to
+// settle the stop's summary, and the apply can be stopped again before any
+// later tick retries. The terminal publish settles the owed summary first, so
+// the second stop's summary claim is not blocked by the summary the rotation
+// already rotated away, and the second stop's summary posts at the bottom of
+// the PR.
+func TestE2EResumeSummarySettleFlushedAtTerminalPublish(t *testing.T) {
+	ctx := t.Context()
+
+	f := setupApplyCommentFixture(t, applyCommentFixtureParams{
+		repo:       "org/repo-resume-settle-flush",
+		pr:         160,
+		database:   "e2e_resume_settle_flush_db",
+		applyState: state.Apply.Resuming,
+	})
+	st, apply, task, capture, h := f.st, f.apply, f.task, f.capture, f.handler
+
+	h.postAndTrackComment(ctx, apply.Repository, apply.PullRequest, 12345, apply, state.Comment.Progress, "Stopped at 21%")
+	requireCommentCreate(t, capture)
+	firstStopSummaryID := seedStoppedSummary(t, f)
+
+	// The rotation posts its fresh comment, but settling the stop's summary
+	// fails at storage.
+	failingStorage := &failingCommentSupersedeStorage{Storage: st}
+	obs := f.newObserver(failingStorage, clock.NewFake(task.CreatedAt))
+	obs.OnProgress(apply, []*storage.Task{task})
+
+	select {
+	case created := <-capture.creates:
+		assert.Contains(t, created.Body, "**Status**: Resuming")
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected the start's rotation to post a fresh progress comment")
+	}
+	summary, err := st.ApplyComments().Get(ctx, apply.ID, state.Comment.Summary)
+	require.NoError(t, err)
+	require.NotNil(t, summary)
+	assert.Nil(t, summary.SupersededAt, "the failed settle leaves the stop's summary active")
+	require.NotNil(t, summary.SummarizedState)
+	assert.Equal(t, state.Apply.Stopped, *summary.SummarizedState, "the failed settle leaves the stop's summary unchanged")
+
+	// The apply is stopped again before the next tick, and storage heals.
+	setStoredApplyState(t, f, state.Apply.Stopped)
+	failingStorage.heal()
+	apply.State = state.Apply.Stopped
+	task.State = state.Task.Stopped
+	obs.OnTerminal(apply, []*storage.Task{task})
+
+	var secondStopSummaryID int64
+	select {
+	case created := <-capture.creates:
+		secondStopSummaryID = created.ID
+		assert.Contains(t, created.Body, "Schema Change Stopped")
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected the second stop's summary once the terminal publish settles the owed summary")
+	}
+	assert.NotEqual(t, firstStopSummaryID, secondStopSummaryID)
+
+	summary, err = st.ApplyComments().Get(ctx, apply.ID, state.Comment.Summary)
+	require.NoError(t, err)
+	require.NotNil(t, summary)
+	assert.Equal(t, secondStopSummaryID, summary.GitHubCommentID, "the second stop's summary is the recorded summary")
+	require.NotNil(t, summary.SummarizedState)
+	assert.Equal(t, state.Apply.Stopped, *summary.SummarizedState)
+	assert.Nil(t, summary.SupersededAt, "the second stop's summary stays active for the next start's rotation")
+}
+
+// setStoredApplyState writes applyState to the fixture apply's stored row
+// only, the way a driver's terminal write lands before its observer publishes.
+func setStoredApplyState(t *testing.T, f *applyCommentFixture, applyState string) {
+	t.Helper()
+	db, err := sql.Open("block-mysql", e2eSchemabotDSN)
+	require.NoError(t, err)
+	defer utils.CloseAndLog(db)
+	require.NoError(t, db.PingContext(t.Context()))
+	_, err = db.ExecContext(t.Context(), "UPDATE applies SET state = ? WHERE id = ?", applyState, f.apply.ID)
+	require.NoError(t, err)
+}
+
+// seedStoppedSummary posts the summary a stop leaves behind and records it as
+// the summary of the stopped state. Returns the posted comment ID.
+func seedStoppedSummary(t *testing.T, f *applyCommentFixture) int64 {
+	t.Helper()
+	ctx := t.Context()
+	f.handler.postAndTrackComment(ctx, f.apply.Repository, f.apply.PullRequest, 12345, f.apply, state.Comment.Summary, "Schema Change Stopped")
+	summaryID := requireCommentCreate(t, f.capture)
+	stopped := state.Apply.Stopped
+	require.NoError(t, f.st.ApplyComments().Upsert(ctx, &storage.ApplyComment{
+		ApplyID:         f.apply.ID,
+		CommentState:    state.Comment.Summary,
+		GitHubCommentID: summaryID,
+		SummarizedState: &stopped,
+	}))
+	return summaryID
 }
 
 // Across repeated stop/start iterations, each resume folds the progress
@@ -2720,10 +3090,11 @@ func (s *failingCommentUpsertStorage) ApplyComments() storage.ApplyCommentStore 
 
 func (s *failingCommentUpsertStorage) heal() { s.healed.Store(true) }
 
-// failingCommentSupersedeStore wraps an ApplyCommentStore so every Supersede
+// failingCommentSupersedeStore wraps an ApplyCommentStore so every supersede
 // fails until the outage is healed, modeling a storage outage between posting
-// the post-cutover rotation comment and consuming the cutover row. Reads and
-// every other write pass through.
+// a rotation comment and consuming the row it rotated away: the cutover row
+// after a post-cutover rotation, or the summary marker after a resume
+// rotation. Reads and every other write pass through.
 type failingCommentSupersedeStore struct {
 	storage.ApplyCommentStore
 	healed *atomic.Bool
@@ -2734,6 +3105,37 @@ func (s *failingCommentSupersedeStore) Supersede(ctx context.Context, applyID in
 		return s.ApplyCommentStore.Supersede(ctx, applyID, commentState)
 	}
 	return errors.New("injected comment supersede failure")
+}
+
+func (s *failingCommentSupersedeStore) SettleSummaryForResume(ctx context.Context, applyID int64, githubCommentID int64) (storage.ResumeSummarySettlement, error) {
+	if s.healed.Load() {
+		return s.ApplyCommentStore.SettleSummaryForResume(ctx, applyID, githubCommentID)
+	}
+	return storage.ResumeSummaryLeftInPlace, errors.New("injected summary settle failure")
+}
+
+// summaryConsumeHookStorage runs beforeConsume once, just before the first
+// resume rotation consumes its summary marker, modeling a control operation
+// that lands while the rotation is posting its fresh comment. Every store
+// passes through to the real storage.
+type summaryConsumeHookStorage struct {
+	storage.Storage
+	beforeConsume func()
+	once          sync.Once
+}
+
+func (s *summaryConsumeHookStorage) ApplyComments() storage.ApplyCommentStore {
+	return &summaryConsumeHookStore{ApplyCommentStore: s.Storage.ApplyComments(), hook: s}
+}
+
+type summaryConsumeHookStore struct {
+	storage.ApplyCommentStore
+	hook *summaryConsumeHookStorage
+}
+
+func (s *summaryConsumeHookStore) SettleSummaryForResume(ctx context.Context, applyID int64, githubCommentID int64) (storage.ResumeSummarySettlement, error) {
+	s.hook.once.Do(s.hook.beforeConsume)
+	return s.ApplyCommentStore.SettleSummaryForResume(ctx, applyID, githubCommentID)
 }
 
 // failingCommentSupersedeStorage serves the failing comment store while
@@ -3039,7 +3441,7 @@ func TestE2EReconcileMissingSummaryCommentsRespectsFreshClaim(t *testing.T) {
 
 	apply := seedReconcileScenario(t, st, schemabotDB, "org/reconcile-claimed", "e2e_reconcile_claimed_db", state.Apply.Completed, state.Task.Completed)
 
-	won, err := st.ApplyComments().ClaimSummaryComment(ctx, apply.ID)
+	won, err := st.ApplyComments().ClaimSummaryComment(ctx, apply.ID, state.Apply.Completed)
 	require.NoError(t, err)
 	require.True(t, won)
 

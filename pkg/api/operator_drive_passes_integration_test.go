@@ -287,8 +287,8 @@ type claimMissCountingOperations struct {
 	parent *claimMissCountingStorage
 }
 
-func (o claimMissCountingOperations) FindNextApplyOperation(ctx context.Context, owner string) (*storage.ApplyOperation, error) {
-	op, err := o.ApplyOperationStore.FindNextApplyOperation(ctx, owner)
+func (o claimMissCountingOperations) FindNextApplyOperation(ctx context.Context, owner string, opts ...storage.OperationClaimOption) (*storage.ApplyOperation, error) {
+	op, err := o.ApplyOperationStore.FindNextApplyOperation(ctx, owner, opts...)
 	if err == nil && op == nil {
 		o.parent.count.Add(1)
 	}

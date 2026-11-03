@@ -182,6 +182,20 @@ func (s *controlRequestStore) requestPending(ctx context.Context, req *storage.A
 	}
 	defer rollbackTx(ctx, tx, "request pending")
 
+	// Share-lock the apply row before touching its requests, the order every
+	// transaction that reads them under a lock takes. A row lock on the
+	// existing requests cannot hold off the insert of a first request, so the
+	// apply row is what serializes this intake with the start requeue, which
+	// locks it for update: a cancel either commits before the requeue reads
+	// the requests, which then see it pending and requeue nothing, or commits
+	// after the requeue, which finds the rows pending for the cancel's sweep
+	// to settle. An apply with no row has nothing to requeue, so its intake
+	// proceeds as before.
+	var lockedApplyID int64
+	if err := tx.QueryRowContext(ctx, `SELECT id FROM applies WHERE id = ? FOR SHARE`, req.ApplyID).Scan(&lockedApplyID); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return nil, false, fmt.Errorf("lock apply %d to record %s control request: %w", req.ApplyID, req.Operation, err)
+	}
+
 	if superseded != "" {
 		if _, err := tx.ExecContext(ctx, `
 			UPDATE apply_control_requests

@@ -7,8 +7,9 @@ import (
 
 // ShardCounts is a sharded apply's per-status shard count, as the PR comment's
 // Shards line reads it ("1 running table copy, 3 waiting for -40"), or "" when
-// every keyspace runs on its only shard, which needs no count.
-func ShardCounts(ops []ProgressOperation, tables []TableProgress, released bool) string {
+// every keyspace runs on its only shard, which needs no count. The shards of
+// an apply in applyState read as presentation.DeriveShards reads them.
+func ShardCounts(applyState string, ops []ProgressOperation, tables []TableProgress, released bool) string {
 	type keyspaceShard struct{ keyspace, shard string }
 	index := make(map[keyspaceShard]int)
 	var work []presentation.ShardWork
@@ -33,7 +34,7 @@ func ShardCounts(ops []ProgressOperation, tables []TableProgress, released bool)
 	if !sharded {
 		return ""
 	}
-	statuses := presentation.DeriveShards(work)
+	statuses := presentation.DeriveShards(applyState, work)
 	labels := make([]string, 0, len(statuses))
 	for _, s := range statuses {
 		labels = append(labels, s.Label)

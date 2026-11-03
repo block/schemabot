@@ -467,7 +467,9 @@ func testRetryableExpiryOperationFence(t *testing.T, newStore func(*testing.T) *
 					"renewed lease must exclude expiry even though selection saw it stale")
 			case "expiry wins", "expiry blocks cutover":
 				require.True(t, lockUndrivenApply(ctx, t, expiryStore, tx, apply.ID))
-				claim := store.ApplyOperations().FindNextApplyOperation
+				claim := func(ctx context.Context, owner string) (*storage.ApplyOperation, error) {
+					return store.ApplyOperations().FindNextApplyOperation(ctx, owner)
+				}
 				if scenario == "expiry blocks cutover" {
 					claim = store.ApplyOperations().FindNextApplyOperationCutover
 				}

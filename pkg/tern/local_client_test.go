@@ -696,13 +696,26 @@ func (s *exactProgressStorage) ApplyOperations() storage.ApplyOperationStore {
 
 type exactProgressApplyOperationStore struct {
 	storage.ApplyOperationStore
-	data            *storage.EngineResumeState
-	ops             []*storage.ApplyOperation
-	err             error
-	saveErr         error
-	progressSaveErr error
-	saved           *storage.EngineResumeState
-	progressWrites  int
+	data *storage.EngineResumeState
+	ops  []*storage.ApplyOperation
+	// claimedUnderLock is what GetLocked reads for an operation a claim was
+	// holding when the locked read began.
+	claimedUnderLock map[int64]*storage.ApplyOperation
+	err              error
+	saveErr          error
+	progressSaveErr  error
+	saved            *storage.EngineResumeState
+	progressWrites   int
+}
+
+// GetLocked answers from claimedUnderLock when it holds the row, standing in
+// for a claim that selected the row before the plain read and committed
+// before the locked read returned. Otherwise it answers like Get.
+func (s *exactProgressApplyOperationStore) GetLocked(ctx context.Context, operationID int64) (*storage.ApplyOperation, error) {
+	if op, ok := s.claimedUnderLock[operationID]; ok {
+		return op, nil
+	}
+	return s.Get(ctx, operationID)
 }
 
 func (s *exactProgressApplyOperationStore) Get(_ context.Context, operationID int64) (*storage.ApplyOperation, error) {
