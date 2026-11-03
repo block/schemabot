@@ -626,13 +626,46 @@ func TestDeferCutoverHasNothingToDefer_PrimaryPlanDecidesWhenNoOtherTargetRuns(t
 		Namespace: "orders", TableChanges: []*apitypes.TableChangeResponse{{TableName: "orders"}},
 	}}}
 
-	nothingToDefer, err := h.deferCutoverHasNothingToDefer(t.Context(), direct, "staging", false)
+	nothingToDefer, err := h.deferCutoverHasNothingToDefer(t.Context(), direct, "staging", false, nil)
 	require.NoError(t, err)
 	assert.True(t, nothingToDefer, "a primary plan of direct changes has no cutover to defer")
 
-	nothingToDefer, err = h.deferCutoverHasNothingToDefer(t.Context(), engine, "staging", false)
+	nothingToDefer, err = h.deferCutoverHasNothingToDefer(t.Context(), engine, "staging", false, nil)
 	require.NoError(t, err)
 	assert.False(t, nothingToDefer, "a primary plan with an engine-driven change has a cutover to defer")
+}
+
+// A target the apply holds back runs nothing, so its engine-driven change is
+// not a cutover the apply can defer: when every target that runs carries only
+// direct changes, --defer-cutover has nothing to defer.
+func TestDeferCutoverHasNothingToDefer_HeldTargetsDecideNothing(t *testing.T) {
+	primary := storedPlan(1, "plan_round", addEmail)
+	primary.Deployment, primary.Target = "eu", "payments"
+	runs := storedPlan(2, "plan_ap", addEmail)
+	runs.Deployment, runs.Target = "ap", "payments"
+	runs.Namespaces["shop"].Tables[0].ExecutionMode = "direct"
+	held := storedPlan(3, "plan_us", addEmail)
+	held.Deployment, held.Target = "us", "payments"
+	store := &primaryConfirmationPlanStore{rollbackConfirmTestPlanStore: rollbackConfirmTestPlanStore{
+		plans: map[string]*storage.Plan{primary.PlanIdentifier: primary},
+	}}
+	for _, member := range []*storage.Plan{runs, held} {
+		member.PrimaryPlanIdentifier = primary.PlanIdentifier
+		store.plans[member.PlanIdentifier] = member
+	}
+	h := &Handler{
+		service: api.New(&rollbackConfirmTestStorage{plans: store}, &api.ServerConfig{}, nil, testLogger()),
+		logger:  testLogger(),
+	}
+	converged := &apitypes.PlanResponse{PlanID: primary.PlanIdentifier}
+
+	nothingToDefer, err := h.deferCutoverHasNothingToDefer(t.Context(), converged, "production", true, nil)
+	require.NoError(t, err)
+	assert.False(t, nothingToDefer, "us runs an engine-driven change with a cutover to defer")
+
+	nothingToDefer, err = h.deferCutoverHasNothingToDefer(t.Context(), converged, "production", true, []string{"us/payments"})
+	require.NoError(t, err)
+	assert.True(t, nothingToDefer, "with us held back, ap runs only a direct change")
 }
 
 // --defer-cutover has a cutover to defer when any target the apply runs

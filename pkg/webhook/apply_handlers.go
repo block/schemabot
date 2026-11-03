@@ -381,7 +381,7 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	// heldTargets are the other targets the apply holds back because their own
 	// plans cannot run from it; the comment the apply posts names them.
 	var heldTargets []templates.HeldTarget
-	var heldNames []string
+	var heldNames, heldIDs []string
 	switch {
 	case runsMemberWork:
 		// Record the pending work on the check before anything else can end
@@ -414,7 +414,7 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 			h.postRolloutRefusal(repo, pr, installationID, schemaResult, planResp, environment, requestedBy, action.Apply, rollout, primaryTargetConverged, noTargetCanApplyMessage(hold))
 			return false, nil
 		}
-		heldTargets, heldNames = hold.templateTargets(), hold.names()
+		heldTargets, heldNames, heldIDs = hold.templateTargets(), hold.names(), hold.memberIDs()
 		h.logger.Info("apply: other targets have plans of their own; the apply runs each of them",
 			"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
 			"plan_id", planResp.PlanID, "primary_target_converged", primaryTargetConverged,
@@ -490,7 +490,7 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	// reject the flag instead of silently ignoring it. No lock is held yet, so
 	// a plan that cannot be read leaves the command retryable.
 	if result.DeferCutover {
-		nothingToDefer, deferErr := h.deferCutoverHasNothingToDefer(ctx, planResp, environment, runsMemberWork)
+		nothingToDefer, deferErr := h.deferCutoverHasNothingToDefer(ctx, planResp, environment, runsMemberWork, heldIDs)
 		if deferErr != nil {
 			h.logger.Error("apply rejected: could not read every target's plan to tell whether --defer-cutover has a cutover to defer",
 				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,

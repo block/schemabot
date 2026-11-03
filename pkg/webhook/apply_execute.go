@@ -262,7 +262,7 @@ func (h *Handler) executeApply(
 				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
 				"posted_plan_id", expectedPendingPlanID, "plan_id", planResp.PlanID, "reason", reason)
 			if err := h.postAutoConfirmDowngrade(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, result, requestedBy,
-				cause, rolloutPreview, runsMemberWork, hold.templateTargets()); err != nil {
+				cause, rolloutPreview, runsMemberWork, hold); err != nil {
 				h.logger.Error("failed to post the comment showing the targets' changed plans, so the pending confirmation was not moved",
 					"repo", repo, "pr", pr, "database", database, "database_type", dbType,
 					"environment", environment, "plan_id", planResp.PlanID, "error", err)
@@ -367,7 +367,7 @@ func (h *Handler) executeApply(
 		h.logger.Info("automatic apply downgraded: DDL drift detected",
 			"repo", repo, "pr", pr, "database", database, "environment", environment)
 		if err := h.postAutoConfirmDowngrade(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, result, requestedBy,
-			planDriftCause(planResp, storedPlan), rolloutPreview, runsMemberWork, hold.templateTargets()); err != nil {
+			planDriftCause(planResp, storedPlan), rolloutPreview, runsMemberWork, hold); err != nil {
 			h.logger.Error("failed to post the DDL-drift downgrade comment",
 				"repo", repo, "pr", pr, "database", database, "database_type", dbType,
 				"environment", environment, "error", err)
@@ -396,7 +396,7 @@ func (h *Handler) executeApply(
 				"environment", environment, "action", actionName,
 				"plan_id", planResp.PlanID, "disclosed_plan_id", disclosedPlan.PlanIdentifier, "newly_direct", len(newlyDirect))
 			if err := h.postAutoConfirmDowngrade(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, result, requestedBy,
-				newlyDirectCause(newlyDirect), rolloutPreview, runsMemberWork, hold.templateTargets()); err != nil {
+				newlyDirectCause(newlyDirect), rolloutPreview, runsMemberWork, hold); err != nil {
 				h.logger.Error("failed to post the comment disclosing the newly-direct changes, so the pending confirmation was not moved",
 					"repo", repo, "pr", pr, "database", database, "database_type", dbType,
 					"environment", environment, "plan_id", planResp.PlanID, "error", err)
@@ -439,7 +439,7 @@ func (h *Handler) executeApply(
 		// lands must leave no consent behind: the next attempt stops and asks
 		// again rather than dispatching over a disclosure nobody read.
 		if err := h.postAutoConfirmDowngrade(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, result, requestedBy,
-			nil, rolloutPreview, runsMemberWork, hold.templateTargets()); err != nil {
+			nil, rolloutPreview, runsMemberWork, hold); err != nil {
 			h.logger.Error("failed to post the comment disclosing the discard, so no consent was recorded",
 				"repo", repo, "pr", pr, "database", database, "database_type", dbType,
 				"environment", environment, "plan_id", planResp.PlanID, "error", err)
@@ -472,7 +472,7 @@ func (h *Handler) executeApply(
 	// here only when reading the targets' plans fails.
 	if result.DeferCutover {
 		automatic := storedPlan != nil
-		nothingToDefer, deferErr := h.deferCutoverHasNothingToDefer(ctx, planResp, environment, runsMemberWork)
+		nothingToDefer, deferErr := h.deferCutoverHasNothingToDefer(ctx, planResp, environment, runsMemberWork, hold.memberIDs())
 		if deferErr != nil {
 			h.rejectUnverifiedMemberWork(ctx, repo, pr, installationID, schemaResult, environment, requestedBy, actionName, automatic, expectedPendingPlanID, planResp.PlanID,
 				"could not read every target's plan to tell whether --defer-cutover has a cutover to defer", deferErr,
@@ -957,7 +957,7 @@ func (h *Handler) postAutoConfirmDowngrade(
 	repo string, pr int, installationID int64, schemaResult *ghclient.SchemaRequestResult,
 	planResp *apitypes.PlanResponse, environment string, result CommandResult, requestedBy string,
 	cause *templates.PausedApplyCauseData, rolloutPreview *templates.DeploymentDriftData, runsMemberWork bool,
-	held []templates.HeldTarget,
+	hold rolloutHold,
 ) error {
 	commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy, h.agentHint(), h.cliName())
 	commentData.ScopedDatabase = result.Database
@@ -968,7 +968,7 @@ func (h *Handler) postAutoConfirmDowngrade(
 	commentData.AllowUnsafe = result.AllowUnsafe
 	commentData.DeferCutover = result.DeferCutover
 	if result.DeferCutover {
-		commentData.NoCutoverToDefer = h.confirmCommandHasNoCutoverToDefer(ctx, repo, pr, planResp, environment, runsMemberWork)
+		commentData.NoCutoverToDefer = h.confirmCommandHasNoCutoverToDefer(ctx, repo, pr, planResp, environment, runsMemberWork, hold.memberIDs())
 	}
 	commentData.SkipRevert = result.SkipRevert
 	commentData.PendingManualConfirmation = true
@@ -978,7 +978,7 @@ func (h *Handler) postAutoConfirmDowngrade(
 	commentData.DeploymentDrift = rolloutPreview
 	// The targets the confirmation will hold back are named on the comment it
 	// acts on, so a target held only since the plan comment is disclosed too.
-	commentData.HeldTargets = held
+	commentData.HeldTargets = hold.templateTargets()
 	return h.postCommentReportingError(repo, pr, installationID, templates.RenderPlanComment(commentData))
 }
 
