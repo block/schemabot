@@ -2,6 +2,7 @@ package webhook
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"testing"
 
@@ -13,22 +14,27 @@ import (
 )
 
 // storedApplyStorage serves one stored apply to the missing-environment
-// lookup, and empty answers to every other read.
+// lookup, or fails it with err, and empty answers to every other read.
 type storedApplyStorage struct {
 	emptyStorage
 	apply *storage.Apply
+	err   error
 }
 
 func (s *storedApplyStorage) Applies() storage.ApplyStore {
-	return storedApplies{ApplyStore: &emptyApplyStore{}, apply: s.apply}
+	return storedApplies{ApplyStore: &emptyApplyStore{}, apply: s.apply, err: s.err}
 }
 
 type storedApplies struct {
 	storage.ApplyStore
 	apply *storage.Apply
+	err   error
 }
 
 func (a storedApplies) GetByApplyIdentifier(_ context.Context, identifier string) (*storage.Apply, error) {
+	if a.err != nil {
+		return nil, a.err
+	}
 	if a.apply == nil || identifier != a.apply.ApplyIdentifier {
 		return nil, nil
 	}
@@ -54,16 +60,20 @@ func stagingApplyOfThisPR() *storage.Apply {
 // missing-environment policy, so a mistyped apply ID is still answered by the
 // deployment that answers usage errors.
 func TestControlCommandMissingEnvironmentNamesTheApplysEnvironment(t *testing.T) {
-	serve := func(t *testing.T, cfg *api.ServerConfig, apply *storage.Apply, comment string) (string, chan string) {
+	serveWith := func(t *testing.T, cfg *api.ServerConfig, store *storedApplyStorage, comment string) (string, chan string) {
 		t.Helper()
 		h, _, comments := newFanOutSkipHandler(t, cfg)
-		h.service = api.New(&storedApplyStorage{apply: apply}, cfg, nil, testLogger())
+		h.service = api.New(store, cfg, nil, testLogger())
 
 		req := buildWebhookRequest(t, webhookPayloadOpts{comment: comment, isPR: true}, nil)
 		rr := httpResponseRecorder()
 		h.ServeHTTP(rr, req)
 		require.Equal(t, http.StatusOK, rr.Code)
 		return rr.Body.String(), comments
+	}
+	serve := func(t *testing.T, cfg *api.ServerConfig, apply *storage.Apply, comment string) (string, chan string) {
+		t.Helper()
+		return serveWith(t, cfg, &storedApplyStorage{apply: apply}, comment)
 	}
 	silentOnUnscoped := func(cfg *api.ServerConfig) *api.ServerConfig {
 		respond := false
@@ -141,6 +151,22 @@ func TestControlCommandMissingEnvironmentNamesTheApplysEnvironment(t *testing.T)
 		assert.Contains(t, resp, "missing environment flag")
 		body := requireComment(t, comments, "missing environment comment")
 		assert.NotContains(t, body, "apply-abc123", "a deployment that does not serve staging must not answer for its apply")
+	})
+
+	t.Run("a failed lookup on a deployment answering unscoped commands posts the usual reply", func(t *testing.T) {
+		resp, comments := serveWith(t, nonAggregateConfig(), &storedApplyStorage{err: errors.New("connection refused")}, "schemabot stop apply-abc123")
+
+		assert.Contains(t, resp, "missing environment flag")
+		body := requireComment(t, comments, "missing environment comment")
+		assert.Contains(t, body, "schemabot stop -e <environment>")
+		assert.NotContains(t, body, "apply-abc123", "an unread apply has no environment to suggest")
+	})
+
+	t.Run("a failed lookup on a deployment ignoring unscoped commands stays silent", func(t *testing.T) {
+		resp, comments := serveWith(t, silentOnUnscoped(nonAggregateConfig()), &storedApplyStorage{err: errors.New("connection refused")}, "schemabot stop apply-abc123")
+
+		assert.Contains(t, resp, "unscoped command skipped")
+		assert.Empty(t, comments)
 	})
 
 	t.Run("an apply of another PR is refused", func(t *testing.T) {
