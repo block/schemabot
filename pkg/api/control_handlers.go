@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"slices"
+	"strings"
 	"time"
 
 	"github.com/block/schemabot/pkg/apitypes"
@@ -590,6 +592,9 @@ func (s *Service) executeCutoverForApply(ctx context.Context, client tern.Client
 		return nil, 0, err
 	}
 	if controlReq != nil {
+		if err := s.rejectPendingCutoverMissingMembers(ctx, apply, controlReq, caller); err != nil {
+			return nil, 0, err
+		}
 		metrics.RecordControlOperation(ctx, "cutover", apply.Database, apply.Deployment, apply.Environment, "success")
 		s.logControlOperationForApply(ctx, apply, caller, storage.LogEventCutoverTriggered,
 			"Cutover requested by user while cutover request already pending")
@@ -632,6 +637,13 @@ func (s *Service) executeCutoverForApply(ctx context.Context, client tern.Client
 					"blocking_member", hold.blocker,
 					"blocking_state", hold.blockerState)...)
 			err := controlConflictf("%s", hold.message())
+			metrics.RecordControlOperation(ctx, "cutover", apply.Database, apply.Deployment, apply.Environment, "rejected")
+			return nil, 0, err
+		}
+		if turn.notReady != "" {
+			s.logger.Info("cutover request rejected because not every member of a deferred apply waits at its cutover",
+				append(apply.LogAttrs(), "requested_by", caller, "reason", turn.notReady)...)
+			err := controlConflictf("%s", turn.notReady)
 			metrics.RecordControlOperation(ctx, "cutover", apply.Database, apply.Deployment, apply.Environment, "rejected")
 			return nil, 0, err
 		}
@@ -682,11 +694,19 @@ func (s *Service) executeCutoverForApply(ctx context.Context, client tern.Client
 		}
 		cutoverReq.Metadata = metadata
 	}
-	_, alreadyPending, err := controlStore.RequestPending(ctx, cutoverReq)
+	recorded, alreadyPending, err := controlStore.RequestPending(ctx, cutoverReq)
 	if err != nil {
 		err := fmt.Errorf("record cutover control request for apply %s: %w", apply.ApplyIdentifier, err)
 		metrics.RecordControlOperation(ctx, "cutover", apply.Database, apply.Deployment, apply.Environment, "error")
 		return nil, 0, err
+	}
+	if alreadyPending {
+		// Another command was recorded first, bound to the members free when
+		// it was issued. This one is acknowledged by it only if it covers
+		// every member free now.
+		if err := s.rejectPendingCutoverMissingMembers(ctx, apply, recorded, caller); err != nil {
+			return nil, 0, err
+		}
 	}
 	metrics.RecordControlOperation(ctx, "cutover", apply.Database, apply.Deployment, apply.Environment, "success")
 	message := "Cutover requested by user"
@@ -702,6 +722,51 @@ func (s *Service) executeCutoverForApply(ctx context.Context, client tern.Client
 		return &apitypes.ControlResponse{Accepted: true}, http.StatusAccepted, nil
 	}
 	return &apitypes.ControlResponse{Accepted: true}, http.StatusOK, nil
+}
+
+// rejectPendingCutoverMissingMembers refuses a cutover that a pending cutover
+// would acknowledge without carrying: the pending request is bound to the
+// members that were free when it was issued, and a member free now that it
+// does not name would never be cut over by it. A pending request bound to no
+// member is taken by whichever member's drive reaches it, as it always was. A
+// deferred apply with a member that has not reached its cutover is refused as
+// a first cutover would be.
+func (s *Service) rejectPendingCutoverMissingMembers(ctx context.Context, apply *storage.Apply, pending *storage.ApplyControlRequest, caller string) error {
+	boundIDs, err := pending.CutoverOperationIDs()
+	if err != nil {
+		err := fmt.Errorf("read the members the pending cutover of apply %s is bound to: %w", apply.ApplyIdentifier, err)
+		metrics.RecordControlOperation(ctx, "cutover", apply.Database, apply.Deployment, apply.Environment, "error")
+		return err
+	}
+	if len(boundIDs) == 0 {
+		return nil
+	}
+	turn, err := s.cutoverTurnForRequest(ctx, apply)
+	if err != nil {
+		err := fmt.Errorf("check cutover order for apply %s: %w", apply.ApplyIdentifier, err)
+		metrics.RecordControlOperation(ctx, "cutover", apply.Database, apply.Deployment, apply.Environment, "error")
+		return err
+	}
+	if turn.notReady != "" {
+		s.logger.Info("cutover request rejected because not every member of a deferred apply waits at its cutover",
+			append(apply.LogAttrs(), "requested_by", caller, "original_requested_by", pending.RequestedBy, "reason", turn.notReady)...)
+		metrics.RecordControlOperation(ctx, "cutover", apply.Database, apply.Deployment, apply.Environment, "rejected")
+		return controlConflictf("%s", turn.notReady)
+	}
+	var missing []string
+	for _, op := range turn.takers {
+		if !slices.Contains(boundIDs, op.ID) {
+			missing = append(missing, tern.CutoverOperationName(op))
+		}
+	}
+	if len(missing) == 0 {
+		return nil
+	}
+	s.logger.Info("cutover request rejected because the pending cutover does not include every member free to cut over",
+		append(apply.LogAttrs(), "requested_by", caller, "original_requested_by", pending.RequestedBy,
+			"cutover_operation_ids", boundIDs, "not_included", missing)...)
+	metrics.RecordControlOperation(ctx, "cutover", apply.Database, apply.Deployment, apply.Environment, "rejected")
+	return controlConflictf("a cutover sent earlier is still pending and does not include %s; run cutover again once it settles", strings.Join(missing, ", "))
 }
 
 type cutoverRequestReadiness int
@@ -831,13 +896,16 @@ func (h *cutoverTurnHold) message() string {
 // every such operation.
 // inProgress reports, under an ordered policy with no taker and no hold, that
 // a member's cutover has already started, so the request has nothing left to
-// start. All are unset when the apply's cutover is unordered, or when no
-// member is parked by task evidence, which leaves the decision to the
-// caller's readiness check.
+// start. All are unset when the cutover of an apply that did not defer it is
+// unordered, or when no member is parked by task evidence, which leaves the
+// decision to the caller's readiness check.
 type cutoverTurn struct {
 	takers     []*storage.ApplyOperation
 	hold       *cutoverTurnHold
 	inProgress bool
+	// notReady refuses the request on an apply that deferred its cutover
+	// while an operation free to cut over has not reached it.
+	notReady string
 }
 
 // cutoverTurnForRequest decides which member of a multi-operation apply that
@@ -845,9 +913,12 @@ type cutoverTurn struct {
 // apply-level and only a parked member no earlier member holds may take it
 // (the drive's own gate, operationCutoverRequestTurn in pkg/tern), so
 // accepting one while an earlier member holds every parked member would queue
-// it for a consumer that is not there yet. A parked member under an unordered cutover
-// policy takes the request as it always has. The turn is decided by storage
-// CutoverBlocker, the rule the automatic cutover claim follows.
+// it for a consumer that is not there yet. A parked member under an unordered
+// cutover policy takes an unbound request as it always has, unless the apply
+// deferred its cutover: the shards of one member drive in parallel under every
+// policy, so they all park, and the request is bound to each of them. The turn
+// is decided by storage CutoverBlocker, the rule the automatic cutover claim
+// follows.
 func (s *Service) cutoverTurnForRequest(ctx context.Context, apply *storage.Apply) (cutoverTurn, error) {
 	opStore := s.storage.ApplyOperations()
 	ops, err := opStore.ListByApply(ctx, apply.ID)
@@ -886,7 +957,7 @@ func (s *Service) cutoverTurnForRequest(ctx context.Context, apply *storage.Appl
 		if !parkedOnTasks(tasksByOp[op.ID]) {
 			continue
 		}
-		if !storage.IsOrderedCutoverPolicy(op.CutoverPolicy) {
+		if !storage.IsOrderedCutoverPolicy(op.CutoverPolicy) && !releasesEveryFreeMember {
 			return cutoverTurn{}, nil
 		}
 		blocker, err := opStore.CutoverBlocker(ctx, op.ID)
@@ -907,6 +978,15 @@ func (s *Service) cutoverTurnForRequest(ctx context.Context, apply *storage.Appl
 				blockerState:     blocker.CutoverHoldState(tasksByOp[blocker.ID]),
 				blockerOnFailure: blocker.OnFailure,
 			}
+		}
+	}
+	if releasesEveryFreeMember {
+		waiting, notReached, err := tern.DeferredCutoverReadiness(ctx, opStore, ops, tasksByOp)
+		if err != nil {
+			return cutoverTurn{}, fmt.Errorf("check every member of apply %s waits at its cutover: %w", apply.ApplyIdentifier, err)
+		}
+		if len(notReached) > 0 {
+			return cutoverTurn{notReady: tern.DeferredCutoverNotReadyMessage(waiting, notReached)}, nil
 		}
 	}
 	if len(turn.takers) > 0 {

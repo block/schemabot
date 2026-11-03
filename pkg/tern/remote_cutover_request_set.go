@@ -129,13 +129,13 @@ func (c *GRPCClient) sendRemoteCutoverSetShare(ctx context.Context, apply *stora
 				"requested_by", controlRequestCaller(controlReq), "drive_operation_id", operationID, "remote_apply_id", remoteID, "error", err)
 			return fmt.Errorf("request remote gRPC cutover for apply %s remote %s: outcome unknown, request left pending: %w", apply.ApplyIdentifier, remoteID, err)
 		}
-		return c.failRemoteCutoverSetShare(ctx, apply, operationID, remoteID, fmt.Sprintf("remote cutover failed: %v", err))
+		return c.failRemoteCutoverSetShare(ctx, apply, controlReq, logger, operationID, remoteID, fmt.Sprintf("remote cutover failed: %v", err))
 	}
 	if resp == nil {
-		return c.failRemoteCutoverSetShare(ctx, apply, operationID, remoteID, "the data plane returned neither a response nor an error")
+		return c.failRemoteCutoverSetShare(ctx, apply, controlReq, logger, operationID, remoteID, "the data plane returned neither a response nor an error")
 	}
 	if !resp.Accepted {
-		return c.failRemoteCutoverSetShare(ctx, apply, operationID, remoteID, controlRefusalMessage(storage.ControlOperationCutover, resp.ErrorMessage))
+		return c.failRemoteCutoverSetShare(ctx, apply, controlReq, logger, operationID, remoteID, controlRefusalMessage(storage.ControlOperationCutover, resp.ErrorMessage))
 	}
 	c.cutoverSharesTaken.Store(key, struct{}{})
 	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventCutoverTriggered,
@@ -149,9 +149,10 @@ func (c *GRPCClient) sendRemoteCutoverSetShare(ctx context.Context, apply *stora
 // failRemoteCutoverSetShare fails a pending cutover request set whose send
 // the data plane did not take. The whole command fails, as it does when the
 // local cutover path refuses one operation of a set: the operator sees the
-// refusal and issues the cutover again.
-func (c *GRPCClient) failRemoteCutoverSetShare(ctx context.Context, apply *storage.Apply, operationID int64, remoteID, message string) error {
-	if err := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCutover, message, remoteID); err != nil {
+// refusal and issues the cutover again. Only the command this drive sent is
+// failed; a newer one re-armed on the same row is left to its own drive.
+func (c *GRPCClient) failRemoteCutoverSetShare(ctx context.Context, apply *storage.Apply, controlReq *storage.ApplyControlRequest, logger *slog.Logger, operationID int64, remoteID, message string) error {
+	if err := settlePendingControlRequestRevision(ctx, c.storage, logger, apply, controlReq, storage.ControlRequestFailed, message, remoteID); err != nil {
 		return fmt.Errorf("request remote gRPC cutover for apply %s operation %d remote %s: %s: %w", apply.ApplyIdentifier, operationID, remoteID, message, err)
 	}
 	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelError, storage.LogEventError,

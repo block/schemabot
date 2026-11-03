@@ -312,18 +312,16 @@ func TestCutoverIntakeFollowsDeploymentOrder(t *testing.T) {
 
 	t.Run("ShardsOfOneDeploymentAcceptAsBefore", func(t *testing.T) {
 		resetMatrixTables(t, ctx, db)
-		applyID := seedShardedCutoverApply(t, stor)
+		applyID := seedShardedCutoverApply(t, stor, storage.CutoverPolicyBarrier, false)
 
 		require.NoError(t, requestCutover(t, applyID), "a shard still copying does not hold its parked sibling's cutover")
 		requirePending(t, applyID, true)
 	})
 
-	// Both shards of an apply started with --defer-cutover wait at their
-	// cutover. One command is bound to both, so each shard's drive cuts over
-	// its own shard, rather than the first shard taking the command alone.
-	t.Run("DeferredApplyBindsEveryHeldShard", func(t *testing.T) {
-		resetMatrixTables(t, ctx, db)
-		applyID := seedShardedCutoverApply(t, stor)
+	// parkEveryShard parks every shard of a seeded sharded apply at its
+	// cutover and returns their operation IDs.
+	parkEveryShard := func(t *testing.T, applyID int64) []int64 {
+		t.Helper()
 		ops, err := stor.ApplyOperations().ListByApply(ctx, applyID)
 		require.NoError(t, err)
 		require.Len(t, ops, 2)
@@ -338,23 +336,90 @@ func TestCutoverIntakeFollowsDeploymentOrder(t *testing.T) {
 				require.NoError(t, stor.Tasks().Update(ctx, task))
 			}
 		}
-
-		require.NoError(t, requestCutover(t, applyID))
+		return opIDs
+	}
+	pendingBinding := func(t *testing.T, applyID int64) []int64 {
+		t.Helper()
 		req, err := stor.ControlRequests().GetPending(ctx, applyID, storage.ControlOperationCutover)
 		require.NoError(t, err)
 		require.NotNil(t, req, "an accepted cutover is recorded for the drives to take")
 		boundIDs, err := req.CutoverOperationIDs()
 		require.NoError(t, err)
-		assert.ElementsMatch(t, opIDs, boundIDs, "the one command is bound to both held shards")
+		return boundIDs
+	}
+
+	// Both shards of an apply started with --defer-cutover wait at their
+	// cutover. One command is bound to both, so each shard's drive cuts over
+	// its own shard, rather than the first shard taking the command alone.
+	// The shards of one member drive in parallel under every cutover policy,
+	// rolling included, so the binding holds under each.
+	for _, policy := range []string{storage.CutoverPolicyBarrier, storage.CutoverPolicyParallel, storage.CutoverPolicyRolling} {
+		t.Run("DeferredApplyBindsEveryHeldShard/"+policy, func(t *testing.T) {
+			resetMatrixTables(t, ctx, db)
+			applyID := seedShardedCutoverApply(t, stor, policy, true)
+			opIDs := parkEveryShard(t, applyID)
+
+			require.NoError(t, requestCutover(t, applyID))
+			assert.ElementsMatch(t, opIDs, pendingBinding(t, applyID), "the one command is bound to both held shards")
+		})
+	}
+
+	// An apply started with --defer-cutover cuts every shard over together, so
+	// a cutover while one shard is still copying is refused and names it,
+	// rather than cutting over the shard that is ready on its own.
+	t.Run("DeferredApplyRefusesWhileAShardIsStillCopying", func(t *testing.T) {
+		resetMatrixTables(t, ctx, db)
+		applyID := seedShardedCutoverApply(t, stor, storage.CutoverPolicyBarrier, true)
+
+		err := requestCutover(t, applyID)
+		require.Error(t, err)
+		assert.Equal(t, http.StatusConflict, controlOperationHTTPStatus(err))
+		assert.Equal(t, "cutover is not ready: commerce/-80/widgets has not reached cutover (1 of 2 wait for it); --defer-cutover cuts them all over together, so run cutover again once all 2 wait", err.Error())
+		requirePending(t, applyID, false)
+	})
+
+	// A cutover recorded for both shards of a deferred apply is still pending
+	// when a third shard reaches its cutover. A second command is refused
+	// instead of being acknowledged by the pending one, which would never cut
+	// over the third shard.
+	t.Run("DeferredApplyRefusesACommandThePendingCutoverDoesNotCarry", func(t *testing.T) {
+		resetMatrixTables(t, ctx, db)
+		applyID := seedShardedCutoverApply(t, stor, storage.CutoverPolicyBarrier, true)
+		opIDs := parkEveryShard(t, applyID)
+		require.NoError(t, requestCutover(t, applyID))
+
+		ops, err := stor.ApplyOperations().ListByApply(ctx, applyID)
+		require.NoError(t, err)
+		third := *ops[1]
+		third.ID = 0
+		third.OperationKey = "commerce/c0-/widgets"
+		third.State = state.ApplyOperation.WaitingForCutover
+		thirdID, err := stor.ApplyOperations().Insert(ctx, &third)
+		require.NoError(t, err)
+		_, err = stor.Tasks().Create(ctx, &storage.Task{
+			TaskIdentifier: "cutover-intake-shards-third", ApplyID: applyID, ApplyOperationID: &thirdID,
+			Database: "payments", DatabaseType: storage.DatabaseTypeMySQL, Engine: storage.EngineForType(storage.DatabaseTypeMySQL),
+			Environment: "staging", State: state.Task.WaitingForCutover, Namespace: "commerce", TableName: "widgets",
+			DDL: "ALTER TABLE widgets ADD COLUMN c int", DDLAction: "alter", CreatedAt: time.Now(), UpdatedAt: time.Now(),
+		})
+		require.NoError(t, err)
+
+		err = requestCutover(t, applyID)
+		require.Error(t, err)
+		assert.Equal(t, http.StatusConflict, controlOperationHTTPStatus(err))
+		assert.Equal(t, "a cutover sent earlier is still pending and does not include commerce/c0-/widgets; run cutover again once it settles", err.Error())
+		assert.ElementsMatch(t, opIDs, pendingBinding(t, applyID), "the pending command keeps its binding")
 	})
 }
 
-// seedShardedCutoverApply stores a running barrier apply whose one deployment
-// fans out into two shard work operations: the first still copying, the second
-// parked at cutover.
-func seedShardedCutoverApply(t *testing.T, stor storage.Storage) int64 {
+// seedShardedCutoverApply stores a running apply under cutoverPolicy whose one
+// deployment fans out into two shard work operations: the first still
+// copying, the second parked at cutover. deferCutover records whether the
+// apply was started with --defer-cutover.
+func seedShardedCutoverApply(t *testing.T, stor storage.Storage, cutoverPolicy string, deferCutover bool) int64 {
 	t.Helper()
 	now := time.Now()
+	options := storage.MarshalApplyOptions(storage.ApplyOptions{DeferCutover: deferCutover})
 	apply := &storage.Apply{
 		ApplyIdentifier: "cutover-intake-shards",
 		Database:        "payments",
@@ -366,7 +431,7 @@ func seedShardedCutoverApply(t *testing.T, stor storage.Storage) int64 {
 		Caller:          "matrix-test",
 		Engine:          storage.EngineForType(storage.DatabaseTypeMySQL),
 		State:           state.Apply.Running,
-		Options:         storage.MarshalApplyOptions(storage.ApplyOptions{DeferCutover: true}),
+		Options:         options,
 		CreatedAt:       now,
 		UpdatedAt:       now,
 	}
@@ -378,7 +443,7 @@ func seedShardedCutoverApply(t *testing.T, stor storage.Storage) int64 {
 				OperationKind: storage.ApplyOperationKindWork,
 				Target:        "payments-eu",
 				State:         opState,
-				CutoverPolicy: storage.CutoverPolicyBarrier,
+				CutoverPolicy: cutoverPolicy,
 				OnFailure:     storage.OnFailureHalt,
 				CreatedAt:     now,
 				UpdatedAt:     now,
@@ -392,7 +457,7 @@ func seedShardedCutoverApply(t *testing.T, stor storage.Storage) int64 {
 				PullRequest:    1,
 				Environment:    "staging",
 				State:          taskState,
-				Options:        storage.MarshalApplyOptions(storage.ApplyOptions{DeferCutover: true}),
+				Options:        options,
 				Namespace:      "commerce",
 				TableName:      "widgets",
 				DDL:            "ALTER TABLE widgets ADD COLUMN c int",
