@@ -698,7 +698,7 @@ func TestE2ELeaderNonSchemaPROutsideParticipantPathsPasses(t *testing.T) {
 	mockLeaderPRHead(mux, headSHA)
 	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1/files", func(w http.ResponseWriter, _ *http.Request) {
 		_ = json.NewEncoder(w).Encode([]*gh.CommitFile{
-			{Filename: new("README.md"), Status: new("modified")},
+			{Filename: new("README.md"), Status: new("modified"), Additions: new(3), Deletions: new(2)},
 		})
 	})
 	mockLeaderRepositoryWithoutConfig(t, mux, headSHA)
