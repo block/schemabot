@@ -230,6 +230,7 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 					DeferCutover:      a.GetOptions().DeferCutover,
 					Tenant:            h.deploymentTenant(),
 					ApplyAgainCommand: templates.ApplyCommand(environment, databaseName, applyCommandOptionsOf(result)),
+					ApplyAgainNote:    templates.UnsafeFlagLeftOut(applyCommandOptionsOf(result)),
 				}))
 				return false, nil
 			}
@@ -285,7 +286,7 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
 				"observed_pending_plan_id", existingLock.PendingPlanID)
 			h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy,
-				applyLockIntentChangedRefusal(database, templates.ApplyCommand(environment, databaseName, applyCommandOptionsOf(result))))
+				applyLockIntentChangedRefusal(database, environment, databaseName, applyCommandOptionsOf(result)))
 			return false, nil
 		}
 	}
@@ -548,7 +549,7 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
 				"plan_id", planResp.PlanID)
 			h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy,
-				applyLockIntentChangedRefusal(database, templates.ApplyCommand(environment, databaseName, applyCommandOptionsOf(result))))
+				applyLockIntentChangedRefusal(database, environment, databaseName, applyCommandOptionsOf(result)))
 			return false, nil
 		}
 		h.logger.Error("failed to acquire lock", "error", err)
@@ -1122,10 +1123,15 @@ func pendingRollbackApplyRefusal(database string, rollbackPlan *storage.Plan) st
 // reports which command holds the lock and how to settle it, or plans afresh
 // when the lock is free. command is the apply to re-run, scoped and optioned
 // as the operator sent it.
-func applyLockIntentChangedRefusal(database, command string) string {
-	return fmt.Sprintf("Another SchemaBot command changed the lock on `%s` while this apply was running, "+
+func applyLockIntentChangedRefusal(database, environment, scopedDatabase string, opts templates.ApplyCommandOptions) string {
+	refusal := fmt.Sprintf("Another SchemaBot command changed the lock on `%s` while this apply was running, "+
 		"so the apply was rejected to leave the lock as that command set it. Re-run `%s`; "+
-		"if the lock belongs to a pending rollback, the retry will say how to confirm or cancel it.", database, command)
+		"if the lock belongs to a pending rollback, the retry will say how to confirm or cancel it.",
+		database, templates.ApplyCommand(environment, scopedDatabase, opts))
+	if note := templates.UnsafeFlagLeftOut(opts); note != "" {
+		refusal += " " + note
+	}
+	return refusal
 }
 
 // applyCommandOptionsOf carries the target and option flags the operator typed

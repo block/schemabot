@@ -3649,9 +3649,22 @@ type ApplyCommandOptions struct {
 // ApplyCommand renders a pasteable apply command for one environment, carrying
 // the database the operator named with -d and the options they typed, so a
 // refusal that asks the operator to re-run their apply names the apply they
-// asked for.
+// asked for. It leaves out --allow-unsafe: the apply plans again, and consent
+// to unsafe changes is typed against a plan the operator has seen, never
+// pasted from an earlier command. UnsafeFlagLeftOut is the line that says so
+// beside the command.
 func ApplyCommand(environment, database string, opts ApplyCommandOptions) string {
+	opts.AllowUnsafe = false
 	return scopedApplyCommand("schemabot apply", environment, database, opts)
+}
+
+// UnsafeFlagLeftOut is the line that goes beside an ApplyCommand built from a
+// command that carried --allow-unsafe, and empty for one that did not.
+func UnsafeFlagLeftOut(opts ApplyCommandOptions) string {
+	if !opts.AllowUnsafe {
+		return ""
+	}
+	return "`--allow-unsafe` is left out: type it yourself to confirm unsafe changes again."
 }
 
 // scopedApplyCommand renders a pasteable apply or apply-confirm command for one
@@ -3732,7 +3745,7 @@ func RenderConfirmationPlanForOtherEnvironment(data ConfirmationRefusalData) str
 	writeCommandBlock(&sb, scopedApplyCommand("schemabot apply-confirm", data.PlanEnvironment, data.Database, data.Options))
 	fmt.Fprintf(&sb, "\nTo apply `%s` instead, dropping the pending `%s` confirmation and planning and applying `%s` in one step, subject to the environment ordering gate and pausing for `apply-confirm` only if its plan needs it:\n\n",
 		data.RequestedEnvironment, data.PlanEnvironment, data.RequestedEnvironment)
-	writeCommandBlock(&sb, scopedApplyCommand("schemabot apply", data.RequestedEnvironment, data.Database, data.Options))
+	writeApplyCommandBlock(&sb, data.RequestedEnvironment, data.Database, data.Options)
 	writeConfirmationRefusalFooter(&sb, data)
 
 	return offerSupportChannel(sb.String())
@@ -3753,7 +3766,7 @@ func RenderConfirmationPlanUnavailable(data ConfirmationRefusalData) string {
 	writeConfirmationRefusalHeader(&sb, data)
 	sb.WriteString("The pending confirmation is not backed by a plan SchemaBot can load, so it could not verify which environment was reviewed; nothing was applied.\n\n")
 	fmt.Fprintf(&sb, "To replace that confirmation with a fresh plan and apply it in one step, subject to the environment ordering gate and pausing for `apply-confirm` only if its plan needs it:\n\n")
-	writeCommandBlock(&sb, scopedApplyCommand("schemabot apply", data.RequestedEnvironment, data.Database, data.Options))
+	writeApplyCommandBlock(&sb, data.RequestedEnvironment, data.Database, data.Options)
 	writeConfirmationRefusalFooter(&sb, data)
 
 	return offerSupportChannel(sb.String())
@@ -3776,6 +3789,15 @@ func writeConfirmationRefusalFooter(sb *strings.Builder, data ConfirmationRefusa
 // writeCommandBlock writes one pasteable command in its own fenced block.
 func writeCommandBlock(sb *strings.Builder, command string) {
 	fmt.Fprintf(sb, "```\n%s\n```\n", command)
+}
+
+// writeApplyCommandBlock writes an apply the operator is asked to run again in
+// its own fenced block, followed by UnsafeFlagLeftOut's line when there is one.
+func writeApplyCommandBlock(sb *strings.Builder, environment, database string, opts ApplyCommandOptions) {
+	writeCommandBlock(sb, ApplyCommand(environment, database, opts))
+	if note := UnsafeFlagLeftOut(opts); note != "" {
+		fmt.Fprintf(sb, "\n%s\n", note)
+	}
 }
 
 // allPlansIdentical returns true if all environments have identical changes.

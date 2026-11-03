@@ -39,6 +39,9 @@ type ApplyLockConflictData struct {
 	// can be pasted once the active apply finishes. Empty renders the
 	// environment's plain apply command.
 	ApplyAgainCommand string
+	// ApplyAgainNote goes beside ApplyAgainCommand: UnsafeFlagLeftOut's line
+	// when the requester's command carried --allow-unsafe.
+	ApplyAgainNote string
 
 	// CLIName is the tool name the comment's CLI command hints start with,
 	// the server's cli_name. Empty renders the CLI's own default.
@@ -487,17 +490,26 @@ func RenderApplyInProgress(data ApplyLockConflictData) string {
 	case activeApplyAwaitsCutover(data):
 		fmt.Fprintf(&sb, "%s `%s` is waiting for cutover, so a second apply cannot start.\n\n", activeApply, data.ApplyID)
 		fmt.Fprintf(&sb, "To cut over:\n```\n%s\n```\n\n", control("cutover"))
-		fmt.Fprintf(&sb, "Once it completes, apply again:\n```\n%s\n```\n", applyAgain)
+		writeApplyAgain(&sb, "Once it completes, apply again", applyAgain, data.ApplyAgainNote)
 	case state.IsState(data.ApplyState, state.Apply.RevertWindow):
 		fmt.Fprintf(&sb, "%s `%s` is in its revert window, so a second apply cannot start.\n\n", activeApply, data.ApplyID)
 		fmt.Fprintf(&sb, "To keep its changes and close the window:\n```\n%s\n```\n\n", control("skip-revert"))
-		fmt.Fprintf(&sb, "Once it completes, apply again:\n```\n%s\n```\n", applyAgain)
+		writeApplyAgain(&sb, "Once it completes, apply again", applyAgain, data.ApplyAgainNote)
 	default:
 		fmt.Fprintf(&sb, "%s `%s` is still running (state: `%s`), so a second apply cannot start.\n\n", activeApply, data.ApplyID, data.ApplyState)
-		fmt.Fprintf(&sb, "Once it finishes, apply again:\n```\n%s\n```\n", applyAgain)
+		writeApplyAgain(&sb, "Once it finishes, apply again", applyAgain, data.ApplyAgainNote)
 	}
 
 	return sb.String()
+}
+
+// writeApplyAgain writes the apply to run once the active one is done, in its
+// own fenced block, followed by note when there is one.
+func writeApplyAgain(sb *strings.Builder, lead, command, note string) {
+	fmt.Fprintf(sb, "%s:\n```\n%s\n```\n", lead, command)
+	if note != "" {
+		fmt.Fprintf(sb, "\n%s\n", note)
+	}
 }
 
 // activeApplyAwaitsCutover reports whether the active apply is parked until an

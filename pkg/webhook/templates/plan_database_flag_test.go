@@ -155,8 +155,8 @@ func TestRenderConfirmationPlanForOtherEnvironmentScopesRecoveryCommands(t *test
 }
 
 // The missing-plan refusal's recovery command carries the rejected command's
-// database scope, tenant, and option flags, so it can be pasted as-is on a PR
-// that manages several databases. An unscoped command is answered unscoped.
+// database scope, tenant, and option flags other than --allow-unsafe, so it
+// can be pasted as-is on a PR that manages several databases. An unscoped command is answered unscoped.
 // The command's consequences are pinned in full: it replaces the pending
 // confirmation with a fresh plan and applies it in one step, answers to the
 // environment ordering gate, and pauses for apply-confirm only when its plan
@@ -172,7 +172,8 @@ func TestRenderConfirmationPlanUnavailableScopesRecoveryCommand(t *testing.T) {
 	})
 	assert.True(t, strings.HasPrefix(scoped, "## "+glyph.Refused+" Apply-confirm Refused — Production\n\n**Database**: `orders`\n\n"), scoped)
 	assert.Contains(t, scoped, "The pending confirmation is not backed by a plan SchemaBot can load, so it could not verify which environment was reviewed; nothing was applied.\n\n")
-	assert.Contains(t, scoped, applyConsequences+"```\nschemabot apply -e production -d orders --tenant acme --allow-unsafe\n```\n")
+	assert.Contains(t, scoped, applyConsequences+"```\nschemabot apply -e production -d orders --tenant acme\n```\n\n`--allow-unsafe` is left out: type it yourself to confirm unsafe changes again.\n",
+		"the fresh plan's unsafe changes are confirmed by typing the flag, not by pasting it")
 	assert.Contains(t, scoped, "\n_Requested by @hubot_\n")
 
 	unscoped := RenderConfirmationPlanUnavailable(ConfirmationRefusalData{RequestedEnvironment: "production"})
@@ -191,7 +192,9 @@ func TestConfirmationRefusalsCarryLongCommandsIntact(t *testing.T) {
 	longDatabase := strings.Repeat("orders_ledger_v2", 4)
 	require.Len(t, longDatabase, 64)
 	everyFlag := ApplyCommandOptions{Tenant: "acme-holdings-eu", AllowUnsafe: true, DeferCutover: true, SkipRevert: true}
-	flags := " -d " + longDatabase + " --tenant acme-holdings-eu --allow-unsafe --defer-cutover --skip-revert"
+	confirmFlags := " -d " + longDatabase + " --tenant acme-holdings-eu --allow-unsafe --defer-cutover --skip-revert"
+	applyFlags := " -d " + longDatabase + " --tenant acme-holdings-eu --defer-cutover --skip-revert"
+	unsafeLeftOut := "\n`--allow-unsafe` is left out: type it yourself to confirm unsafe changes again.\n"
 
 	otherEnvironment := RenderConfirmationPlanForOtherEnvironment(ConfirmationRefusalData{
 		RequestedBy:          "hubot",
@@ -201,8 +204,8 @@ func TestConfirmationRefusalsCarryLongCommandsIntact(t *testing.T) {
 		Options:              everyFlag,
 	})
 	assert.Greater(t, len([]rune(otherEnvironment)), maxCommentErrorLen, "the scenario must be one the generic error clamp would have cut")
-	assert.Contains(t, otherEnvironment, "```\nschemabot apply-confirm -e staging"+flags+"\n```\n")
-	assert.Contains(t, otherEnvironment, "pausing for `apply-confirm` only if its plan needs it:\n\n```\nschemabot apply -e production"+flags+"\n```\n\n_Requested by @hubot_\n")
+	assert.Contains(t, otherEnvironment, "```\nschemabot apply-confirm -e staging"+confirmFlags+"\n```\n", "the confirmation keeps the consent given to the plan it confirms")
+	assert.Contains(t, otherEnvironment, "pausing for `apply-confirm` only if its plan needs it:\n\n```\nschemabot apply -e production"+applyFlags+"\n```\n"+unsafeLeftOut+"\n_Requested by @hubot_\n")
 	assert.NotContains(t, otherEnvironment, "…")
 
 	unavailable := RenderConfirmationPlanUnavailable(ConfirmationRefusalData{
@@ -212,7 +215,7 @@ func TestConfirmationRefusalsCarryLongCommandsIntact(t *testing.T) {
 		Options:              everyFlag,
 	})
 	assert.Greater(t, len([]rune(unavailable)), maxCommentErrorLen, "the scenario must be one the generic error clamp would have cut")
-	assert.Contains(t, unavailable, "pausing for `apply-confirm` only if its plan needs it:\n\n```\nschemabot apply -e production"+flags+"\n```\n\n_Requested by @hubot_\n")
+	assert.Contains(t, unavailable, "pausing for `apply-confirm` only if its plan needs it:\n\n```\nschemabot apply -e production"+applyFlags+"\n```\n"+unsafeLeftOut+"\n_Requested by @hubot_\n")
 	assert.NotContains(t, unavailable, "…")
 }
 
@@ -221,13 +224,35 @@ func TestConfirmationRefusalsCarryLongCommandsIntact(t *testing.T) {
 // apply hint in a plan comment uses, so a command lifted from a refusal reads
 // the same as one lifted from the plan. Each flag appears only when set.
 func TestApplyCommandCarriesTargetInPlanCommentOrder(t *testing.T) {
-	assert.Equal(t, "schemabot apply -e production -d orders --target replica-eu --tenant acme --allow-unsafe --defer-cutover --skip-revert",
+	assert.Equal(t, "schemabot apply -e production -d orders --target replica-eu --tenant acme --defer-cutover --skip-revert",
 		ApplyCommand("production", "orders", ApplyCommandOptions{
-			Target: "replica-eu", Tenant: "acme", AllowUnsafe: true, DeferCutover: true, SkipRevert: true,
+			Target: "replica-eu", Tenant: "acme", DeferCutover: true, SkipRevert: true,
 		}))
 	assert.Equal(t, "schemabot apply -e production --target replica-eu",
 		ApplyCommand("production", "", ApplyCommandOptions{Target: "replica-eu"}))
 	assert.Equal(t, "schemabot apply -e production", ApplyCommand("production", "", ApplyCommandOptions{}))
+}
+
+// A re-run hint never carries --allow-unsafe, even when the command it repeats
+// did: the apply it runs plans again, so its unsafe changes are confirmed by
+// typing the flag against that plan. The line beside the command says so, and
+// only for a command that carried the flag.
+func TestApplyCommandLeavesOutAllowUnsafe(t *testing.T) {
+	opts := ApplyCommandOptions{Tenant: "acme", AllowUnsafe: true, DeferCutover: true}
+	assert.Equal(t, "schemabot apply -e staging -d orders --tenant acme --defer-cutover", ApplyCommand("staging", "orders", opts))
+	assert.Equal(t, "`--allow-unsafe` is left out: type it yourself to confirm unsafe changes again.", UnsafeFlagLeftOut(opts))
+	assert.Empty(t, UnsafeFlagLeftOut(ApplyCommandOptions{Tenant: "acme", DeferCutover: true}))
+
+	inProgress := RenderApplyInProgress(ApplyLockConflictData{
+		Database:          "orders",
+		Environment:       "staging",
+		ApplyID:           "apply-abc123",
+		ApplyState:        "running",
+		ApplyAgainCommand: ApplyCommand("staging", "orders", opts),
+		ApplyAgainNote:    UnsafeFlagLeftOut(opts),
+	})
+	assert.Contains(t, inProgress, "Once it finishes, apply again:\n```\nschemabot apply -e staging -d orders --tenant acme --defer-cutover\n```\n\n`--allow-unsafe` is left out: type it yourself to confirm unsafe changes again.\n")
+	assert.NotContains(t, inProgress, "--allow-unsafe\n")
 }
 
 // A plan run without -e answers with one comment covering every environment,
