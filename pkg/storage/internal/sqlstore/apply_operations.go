@@ -245,12 +245,13 @@ func (s *applyOperationStore) ListRecentTargets(ctx context.Context, databaseTyp
 	return targets, nil
 }
 
-// ListActiveDeferredCutoverWidths returns how many work operations each
-// unsettled apply started with --defer-cutover still has to drive, read from
-// the same applies.options key the deferred-work claim filter reads. A stopped
-// apply keeps its count: its drives have ended, but starting it again resumes
-// them without passing admission, so its drivers stay reserved until it
-// settles.
+// ListActiveDeferredCutoverWidths returns, for each unsettled apply started
+// with --defer-cutover, the most of its work operations still to drive that
+// would hold at its cutover at once (storage.DeferredCutoverHeldAtOnce), read
+// from the same applies.options key the deferred-work claim filter reads. A
+// stopped apply keeps its count: its drives have ended, but starting it again
+// resumes them without passing admission, so its drivers stay reserved until
+// it settles.
 func (s *applyOperationStore) ListActiveDeferredCutoverWidths(ctx context.Context) ([]storage.DeferredCutoverWidth, error) {
 	return listActiveDeferredCutoverWidths(ctx, s.db, s.dialect)
 }
@@ -263,31 +264,45 @@ func listActiveDeferredCutoverWidths(ctx context.Context, q rowsQueryer, dialect
 	args = append(args, stringArgs(settled)...)
 	args = append(args, storage.ApplyOperationKindWork)
 	rows, err := q.QueryContext(ctx, `
-		SELECT a.apply_identifier, a.database_name, a.environment, COUNT(*)
+		SELECT a.apply_identifier, a.database_name, a.environment,
+			ao.deployment, ao.target, ao.rollout_step, ao.cutover_policy, ao.state, ao.operation_kind
 		FROM apply_operations ao
 		JOIN applies a ON a.id = ao.apply_id
 		WHERE `+dialect.JSONBooleanIsTrue("a.options", []string{"defer_cutover"})+`
 			AND a.state NOT IN (`+placeholders(len(settled))+`)
 			AND ao.state NOT IN (`+placeholders(len(settled))+`)
 			AND ao.operation_kind = ?
-		GROUP BY a.apply_identifier, a.database_name, a.environment
-		ORDER BY a.apply_identifier`, args...)
+		ORDER BY a.apply_identifier, ao.id`, args...)
 	if err != nil {
-		return nil, fmt.Errorf("query active deferred cutover widths: %w", err)
+		return nil, fmt.Errorf("query active deferred cutover operations: %w", err)
 	}
 	defer utils.CloseAndLog(rows)
 
 	var widths []storage.DeferredCutoverWidth
+	var ops []*storage.ApplyOperation
+	flush := func() {
+		if len(widths) > 0 {
+			widths[len(widths)-1].Operations = storage.DeferredCutoverHeldAtOnce(ops)
+		}
+		ops = nil
+	}
 	for rows.Next() {
 		var width storage.DeferredCutoverWidth
-		if err := rows.Scan(&width.ApplyIdentifier, &width.Database, &width.Environment, &width.Operations); err != nil {
-			return nil, fmt.Errorf("scan active deferred cutover width: %w", err)
+		op := &storage.ApplyOperation{}
+		if err := rows.Scan(&width.ApplyIdentifier, &width.Database, &width.Environment,
+			&op.Deployment, &op.Target, &op.RolloutStep, &op.CutoverPolicy, &op.State, &op.OperationKind); err != nil {
+			return nil, fmt.Errorf("scan active deferred cutover operation: %w", err)
 		}
-		widths = append(widths, width)
+		if len(widths) == 0 || widths[len(widths)-1].ApplyIdentifier != width.ApplyIdentifier {
+			flush()
+			widths = append(widths, width)
+		}
+		ops = append(ops, op)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("read active deferred cutover widths: %w", err)
+		return nil, fmt.Errorf("read active deferred cutover operations: %w", err)
 	}
+	flush()
 	return widths, nil
 }
 

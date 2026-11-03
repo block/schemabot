@@ -1952,10 +1952,31 @@ func TestApplyOperations(t *testing.T, h Harness) {
 		insert(regular, "commerce/-80/items", storage.ApplyOperationKindWork, state.ApplyOperation.Running)
 		insert(regular, "commerce/80-/items", storage.ApplyOperationKindWork, state.ApplyOperation.Running)
 
+		// A rolling rollout holds one deployment at a time, and a barrier
+		// rollout holds every deployment together.
+		insertIn := func(apply *storage.Apply, deployment, key, policy string) {
+			t.Helper()
+			_, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+				ApplyID: apply.ID, Deployment: deployment, Target: deployment, CutoverPolicy: policy,
+				OperationKey: key, OperationKind: storage.ApplyOperationKindWork, State: state.ApplyOperation.Pending,
+			})
+			require.NoError(t, err)
+		}
+		rolling := deferred("apply_deferred_rolling", 966, state.Apply.Running)
+		insertIn(rolling, "region-a", "commerce/-80/users", storage.CutoverPolicyRolling)
+		insertIn(rolling, "region-a", "commerce/80-/users", storage.CutoverPolicyRolling)
+		insertIn(rolling, "region-b", "commerce/-80/users", storage.CutoverPolicyRolling)
+		barrier := deferred("apply_deferred_barrier", 967, state.Apply.Running)
+		insertIn(barrier, "region-a", "commerce/-80/users", storage.CutoverPolicyBarrier)
+		insertIn(barrier, "region-a", "commerce/80-/users", storage.CutoverPolicyBarrier)
+		insertIn(barrier, "region-b", "commerce/-80/users", storage.CutoverPolicyBarrier)
+
 		widths, err := store.ApplyOperations().ListActiveDeferredCutoverWidths(ctx)
 		require.NoError(t, err)
 		assert.Equal(t, []storage.DeferredCutoverWidth{
+			{ApplyIdentifier: "apply_deferred_barrier", Database: barrier.Database, Environment: "staging", Operations: 3},
 			{ApplyIdentifier: "apply_deferred_narrow", Database: narrow.Database, Environment: "staging", Operations: 1},
+			{ApplyIdentifier: "apply_deferred_rolling", Database: rolling.Database, Environment: "staging", Operations: 2},
 			{ApplyIdentifier: "apply_deferred_stopped", Database: paused.Database, Environment: "staging", Operations: 2},
 			{ApplyIdentifier: "apply_deferred_wide", Database: wide.Database, Environment: "staging", Operations: 3},
 		}, widths)

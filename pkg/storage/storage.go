@@ -1576,8 +1576,9 @@ type ApplyOperationStore interface {
 	ListRecentTargets(ctx context.Context, databaseType string, lookback time.Duration) ([]AppliedTarget, error)
 
 	// ListActiveDeferredCutoverWidths returns, for each apply started with
-	// --defer-cutover that has not settled, how many of its work operations
-	// have not settled, ordered by apply identifier. A stopped apply and its
+	// --defer-cutover that has not settled, the most of its unsettled work
+	// operations that would hold at its cutover at once
+	// (DeferredCutoverHeldAtOnce), ordered by apply identifier. A stopped apply and its
 	// stopped operations are counted, since starting it again resumes them.
 	// Applies with no such operation are left out.
 	ListActiveDeferredCutoverWidths(ctx context.Context) ([]DeferredCutoverWidth, error)
