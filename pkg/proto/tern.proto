@@ -1050,6 +1050,12 @@ message CutoverRequest {
   // members of one deployment share its apply, and one member's turn to cut
   // over is not its siblings' turn. Empty cuts over the apply's parked work.
   string apply_operation_id = 4;
+  // When set, one cutover command for every operation listed: each is cut
+  // over by its own drive once it waits at its cutover, and the request
+  // settles once none of them can still cut over on it. apply_operation_id
+  // names one of them, so a data plane that reads only that field cuts over
+  // that operation alone.
+  repeated string apply_operation_ids = 5;
 }
 
 // CutoverResponse indicates whether the cutover was accepted.

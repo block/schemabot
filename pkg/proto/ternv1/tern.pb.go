@@ -3751,8 +3751,14 @@ type CutoverRequest struct {
 	// members of one deployment share its apply, and one member's turn to cut
 	// over is not its siblings' turn. Empty cuts over the apply's parked work.
 	ApplyOperationId string `protobuf:"bytes,4,opt,name=apply_operation_id,json=applyOperationId,proto3" json:"apply_operation_id,omitempty"`
-	unknownFields    protoimpl.UnknownFields
-	sizeCache        protoimpl.SizeCache
+	// When set, one cutover command for every operation listed: each is cut
+	// over by its own drive once it waits at its cutover, and the request
+	// settles once none of them can still cut over on it. apply_operation_id
+	// names one of them, so a data plane that reads only that field cuts over
+	// that operation alone.
+	ApplyOperationIds []string `protobuf:"bytes,5,rep,name=apply_operation_ids,json=applyOperationIds,proto3" json:"apply_operation_ids,omitempty"`
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
 }
 
 func (x *CutoverRequest) Reset() {
@@ -3811,6 +3817,13 @@ func (x *CutoverRequest) GetApplyOperationId() string {
 		return x.ApplyOperationId
 	}
 	return ""
+}
+
+func (x *CutoverRequest) GetApplyOperationIds() []string {
+	if x != nil {
+		return x.ApplyOperationIds
+	}
+	return nil
 }
 
 // CutoverResponse indicates whether the cutover was accepted.
@@ -5481,12 +5494,13 @@ const file_tern_proto_rawDesc = "" +
 	"\rMetadataEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01J\x04\b\t\x10\n" +
-	"R\x06volume\"\x93\x01\n" +
+	"R\x06volume\"\xc3\x01\n" +
 	"\x0eCutoverRequest\x12\x19\n" +
 	"\bapply_id\x18\x01 \x01(\tR\aapplyId\x12 \n" +
 	"\venvironment\x18\x02 \x01(\tR\venvironment\x12\x16\n" +
 	"\x06caller\x18\x03 \x01(\tR\x06caller\x12,\n" +
-	"\x12apply_operation_id\x18\x04 \x01(\tR\x10applyOperationId\"R\n" +
+	"\x12apply_operation_id\x18\x04 \x01(\tR\x10applyOperationId\x12.\n" +
+	"\x13apply_operation_ids\x18\x05 \x03(\tR\x11applyOperationIds\"R\n" +
 	"\x0fCutoverResponse\x12\x1a\n" +
 	"\baccepted\x18\x01 \x01(\bR\baccepted\x12#\n" +
 	"\rerror_message\x18\x02 \x01(\tR\ferrorMessage\"L\n" +

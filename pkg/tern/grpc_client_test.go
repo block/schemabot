@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -570,6 +571,7 @@ type capturingTernServer struct {
 	// data plane's verdict that the operation will never start.
 	progressNeverStarts bool
 	cutoverReq          *ternv1.CutoverRequest
+	cutoverCalls        int
 }
 
 // dispatchOperationKeyEcho mirrors the data plane's operation key derivation
@@ -695,7 +697,8 @@ func (s *capturingTernServer) Cutover(_ context.Context, req *ternv1.CutoverRequ
 	s.mu.Lock()
 	s.cutoverApplyID = req.ApplyId
 	s.cutoverCaller = req.Caller
-	s.cutoverReq = &ternv1.CutoverRequest{ApplyId: req.ApplyId, Environment: req.Environment, Caller: req.Caller, ApplyOperationId: req.ApplyOperationId}
+	s.cutoverReq = &ternv1.CutoverRequest{ApplyId: req.ApplyId, Environment: req.Environment, Caller: req.Caller, ApplyOperationId: req.ApplyOperationId, ApplyOperationIds: slices.Clone(req.ApplyOperationIds)}
+	s.cutoverCalls++
 	err := s.cutoverErr
 	accepted := s.cutoverAccepted
 	message := s.cutoverMessage

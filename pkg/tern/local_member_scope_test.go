@@ -241,6 +241,74 @@ func TestLocalClient_CutoverOfASharedApplyIsBoundToTheNamedMember(t *testing.T) 
 	assert.Empty(t, fx.engine.cutoverContexts, "queueing a cutover never swaps anything")
 }
 
+// A control plane cuts over both members of a shared data-plane apply with
+// one command by listing both operations. The data plane records one request
+// for the set, which each member's drive then takes for its own operation, so
+// both members swap on one operator command. Every member's drive on the
+// control plane sends the same list, so a resend naming the other member is
+// the same request, while a cutover for one member alone is refused until the
+// set settles rather than being folded into it.
+func TestLocalClient_CutoverListingSeveralOperationsIsOneRequestForThemAll(t *testing.T) {
+	fx := newSharedApplyFixture(state.ApplyOperation.WaitingForCutover, state.ApplyOperation.WaitingForCutover, state.Task.WaitingForCutover, state.Task.WaitingForCutover)
+	cutover := func(operationID string, operationIDs ...string) *ternv1.CutoverResponse {
+		resp, err := fx.client.Cutover(t.Context(), &ternv1.CutoverRequest{
+			ApplyId: fx.apply.ApplyIdentifier, Environment: "staging", Caller: "cli:alice",
+			ApplyOperationId: operationID, ApplyOperationIds: operationIDs,
+		})
+		require.NoError(t, err)
+		require.NotNil(t, resp)
+		return resp
+	}
+
+	require.True(t, cutover("12", "12", "11").Accepted)
+	require.Len(t, fx.controlRequests.requests, 1)
+	boundTo, err := fx.controlRequests.requests[0].CutoverOperationIDs()
+	require.NoError(t, err)
+	assert.Equal(t, []int64{11, 12}, boundTo, "the recorded request is bound to every operation listed")
+	first, err := fx.controlRequests.requests[0].CutoverOperationID()
+	require.NoError(t, err)
+	assert.Equal(t, int64(11), first, "a server that reads only the single-operation key takes the request for one listed operation")
+
+	assert.True(t, cutover("11", "11", "12").Accepted, "another member's drive sending the same list is the same request")
+	assert.Len(t, fx.controlRequests.requests, 1)
+
+	alone := cutover("11")
+	assert.False(t, alone.Accepted)
+	assert.Equal(t, "a cutover of apply apply-shared-deployment for operations 11, 12 is still pending; this cutover for operation 11 was not queued", alone.ErrorMessage)
+	assert.Len(t, fx.controlRequests.requests, 1)
+	assert.Empty(t, fx.engine.cutoverContexts, "queueing a cutover never swaps anything")
+}
+
+// A cutover list is refused before anything is recorded when it names an
+// operation the apply does not have, names one twice, or names a single
+// operation outside the list, which a server reading only that field would cut
+// over in place of the listed ones.
+func TestLocalClient_CutoverListIsRefusedWhenItDoesNotNameTheApplysOperations(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		operationID  string
+		operationIDs []string
+		want         string
+	}{
+		{name: "operation the apply does not have", operationID: "11", operationIDs: []string{"11", "77"}, want: "cutover names an operation this apply does not have: apply_operation 77 does not exist"},
+		{name: "operation listed twice", operationID: "11", operationIDs: []string{"11", "11"}, want: "cutover names operation 11 more than once"},
+		{name: "single operation outside the list", operationID: "12", operationIDs: []string{"11"}, want: "cutover names operation 12 apart from the operations it lists"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fx := newSharedApplyFixture(state.ApplyOperation.WaitingForCutover, state.ApplyOperation.WaitingForCutover, state.Task.WaitingForCutover, state.Task.WaitingForCutover)
+			resp, err := fx.client.Cutover(t.Context(), &ternv1.CutoverRequest{
+				ApplyId: fx.apply.ApplyIdentifier, Environment: "staging",
+				ApplyOperationId: tc.operationID, ApplyOperationIds: tc.operationIDs,
+			})
+			require.NoError(t, err)
+			require.NotNil(t, resp)
+			assert.False(t, resp.Accepted)
+			assert.Equal(t, tc.want, resp.ErrorMessage)
+			assert.Empty(t, fx.controlRequests.requests, "a refused cutover records no request")
+		})
+	}
+}
+
 // A pending cutover bound to payments-002 is left alone by payments-001's
 // drive even though payments-001 is parked at its own cutover too, and is
 // taken by payments-002's drive, which swaps payments-002 alone: the engine

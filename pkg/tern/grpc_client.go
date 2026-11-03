@@ -159,6 +159,14 @@ type GRPCClient struct {
 	// unrecognizedStatuses reports remote-reported statuses with no task-state
 	// mapping at the drive's ingest points. Zero value is ready.
 	unrecognizedStatuses unrecognizedStatusReporter
+
+	// cutoverSharesTaken records the cutover request sets this client's drives
+	// have already sent to their remote apply, so a drive whose remote
+	// operation has not yet reported the swap does not send it again on every
+	// tick. The durable request in storage stays the source of truth: losing
+	// this record on a restart costs at most one repeated send per operation,
+	// which the data plane answers as the request it already holds.
+	cutoverSharesTaken sync.Map // cutoverShareKey -> struct{}
 }
 
 // Compile-time check that GRPCClient implements Client.
@@ -714,6 +722,13 @@ func (c *GRPCClient) processPendingCutoverControlRequest(ctx context.Context, ap
 		return nil
 	}
 	logger := c.applyLogger(apply)
+	boundIDs, err := controlReq.CutoverOperationIDs()
+	if err != nil {
+		return fmt.Errorf("process pending gRPC cutover for apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	if len(boundIDs) > 1 {
+		return c.processPendingRemoteCutoverSet(ctx, apply, scope, controlReq, boundIDs, logger)
+	}
 	if cutoverRequestResolvedByApplyState(apply.State) {
 		logger.InfoContext(ctx, "completing pending gRPC cutover request for resolved apply",
 			append(apply.MutableLogAttrs(), "requested_by", controlRequestCaller(controlReq))...)
