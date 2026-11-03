@@ -1860,7 +1860,7 @@ func TestE2EApplyHoldsBackTheTargetWhoseCopyItWouldDiscardAndRunsTheRest(t *test
 	apply := runRolloutCommand(t, svc, dbName, "schemabot apply -e "+driftEnv)
 	body := awaitCommentContaining(t, apply, "Holding back target `us`")
 	assert.Contains(t, body, "applying its plan discards the unfinished copy of users", "the comment says why us was held back")
-	assert.Contains(t, body, "The apply runs every other target.")
+	assert.Contains(t, body, "The apply runs every other target, and a held target too if it can run by the time the apply starts.")
 
 	created := awaitRolloutApply(t, svc, dbName, apply)
 	requireTaskDDLByDeployment(t, svc, created, map[string][]string{
