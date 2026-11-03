@@ -150,6 +150,11 @@ func newFinalizerControlFixtureWith(t *testing.T, finalizerState string, opts fi
 	}, clientStor, logger)
 	require.NoError(t, err)
 	t.Cleanup(func() { utils.CloseAndLog(client) })
+	// Vitess drives through the built-in PlanetScale engine rather than a
+	// registered factory, so the recording engine replaces it directly.
+	if databaseType == storage.DatabaseTypeVitess {
+		client.planetscaleEngine = eng
+	}
 
 	now := time.Now()
 	namespace := func(ns string) *storage.NamespacePlanData {
@@ -762,6 +767,8 @@ func TestLocalClient_FinalizerEngineErrorDispositionFollowsDatabaseType(t *testi
 		{"retryable error fails a type that could duplicate work", embeddedEngineType, fmt.Errorf("deploy endpoint unreachable"), state.ApplyOperation.Failed},
 		{"unknown outcome pauses every type", embeddedEngineType, engine.NewOutcomeUnknownError("deploy request may have been created"), state.ApplyOperation.FailedRetryable},
 		{"permanent error fails every type", storage.DatabaseTypeStrata, engine.NewPermanentError("vschema rejected"), state.ApplyOperation.Failed},
+		{"retryable error starting work fails a reattaching type", storage.DatabaseTypeVitess, fmt.Errorf("deploy endpoint unreachable"), state.ApplyOperation.Failed},
+		{"retryable error reattaching to accepted work pauses a reattaching type", storage.DatabaseTypeVitess, fmt.Errorf("%w: %w", engine.ErrReattachFailed, fmt.Errorf("read deploy request: connection reset")), state.ApplyOperation.FailedRetryable},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

@@ -2148,8 +2148,17 @@ func (c *LocalClient) driveGroupFinalizer(ctx context.Context, apply *storage.Ap
 	failClosed := func(cause error) error { return settleFailure(cause, false) }
 	pauseForRetry := func(cause error) error { return settleFailure(cause, true) }
 	// settleByClass pauses a cause an engine error classifies as retryable and
-	// fails any other, the same split the apply's other engine drives make.
-	settleByClass := func(cause error) error { return settleFailure(cause, c.shouldRetryEngineError(cause)) }
+	// fails any other, the same split the apply's other engine drives make. A
+	// failure reattaching to work the engine already accepted
+	// (engine.ErrReattachFailed) takes the accepted-work policy, since that work
+	// keeps running whatever this drive concludes and a re-drive reattaches to it
+	// again; any other cause takes the policy for starting engine work.
+	settleByClass := func(cause error) error {
+		if errors.Is(cause, engine.ErrReattachFailed) {
+			return settleFailure(cause, c.shouldRetryAcceptedWorkError(cause))
+		}
+		return settleFailure(cause, c.shouldRetryEngineError(cause))
+	}
 	// saveResume reports whether the finalizer's resume state landed, which is
 	// what the engine's OnStateChange needs; persistResume is the log-only form
 	// for the polls that save the latest state as they go.
