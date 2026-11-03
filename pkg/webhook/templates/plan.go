@@ -831,9 +831,9 @@ func (c unsafeConsent) instruction() string {
 		noun = "unsafe changes"
 	}
 	if c.primaryOnly {
-		return fmt.Sprintf("add `--allow-unsafe` to confirm %d %s on %s, and any the other targets carry", c.findings, noun, c.tables)
+		return fmt.Sprintf("with `--allow-unsafe` to confirm %d %s on %s, and any the other targets carry", c.findings, noun, c.tables)
 	}
-	return fmt.Sprintf("add `--allow-unsafe` to confirm %d %s on %s", c.findings, noun, c.tables)
+	return fmt.Sprintf("with `--allow-unsafe` to confirm %d %s on %s", c.findings, noun, c.tables)
 }
 
 // unsafeConsentTablesShown caps how many names the consent sentence lists.
@@ -3667,15 +3667,15 @@ func UnsafeReconsent(opts ApplyCommandOptions) string {
 	if !opts.AllowUnsafe {
 		return ""
 	}
-	return "add `--allow-unsafe` to confirm unsafe changes"
+	return "with `--allow-unsafe` to confirm unsafe changes"
 }
 
 // writeRerunCommand writes lead and the apply to re-run in its own fenced
-// block. A consent clause, when there is one, joins lead with join and leads
-// into the command. gap separates the lead-in from the fence.
-func writeRerunCommand(sb *strings.Builder, lead, join, consent, command, gap string) {
+// block. A consent clause, when there is one, follows lead and leads into the
+// command. gap separates the lead-in from the fence.
+func writeRerunCommand(sb *strings.Builder, lead, consent, command, gap string) {
 	if consent != "" {
-		lead += join + consent
+		lead += " " + consent
 	}
 	fmt.Fprintf(sb, "%s:%s", lead, gap)
 	writeCommandBlock(sb, command)
@@ -3807,7 +3807,7 @@ func writeCommandBlock(sb *strings.Builder, command string) {
 // writeApplyCommandBlock writes lead and an apply the operator is asked to run
 // again in its own fenced block, led into by UnsafeReconsent when there is one.
 func writeApplyCommandBlock(sb *strings.Builder, lead, environment, database string, opts ApplyCommandOptions) {
-	writeRerunCommand(sb, lead, ", ", UnsafeReconsent(opts), ApplyCommand(environment, database, opts), "\n\n")
+	writeRerunCommand(sb, lead, UnsafeReconsent(opts), ApplyCommand(environment, database, opts), "\n\n")
 }
 
 // allPlansIdentical returns true if all environments have identical changes.

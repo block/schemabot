@@ -506,7 +506,7 @@ func RenderApplyInProgress(data ApplyLockConflictData) string {
 // writeApplyAgain writes the apply to run again in its own fenced block, led
 // into by consent when there is one.
 func writeApplyAgain(sb *strings.Builder, lead, command, consent string) {
-	writeRerunCommand(sb, lead, ", and ", consent, command, "\n")
+	writeRerunCommand(sb, lead, consent, command, "\n")
 }
 
 // ApplyLockIntentChangedData describes an apply or apply-confirm rejected

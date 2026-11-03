@@ -162,7 +162,7 @@ func TestRenderConfirmationPlanForOtherEnvironmentScopesRecoveryCommands(t *test
 // environment ordering gate, and pauses for apply-confirm only when its plan
 // needs one.
 func TestRenderConfirmationPlanUnavailableScopesRecoveryCommand(t *testing.T) {
-	const reconsent = ", add `--allow-unsafe` to confirm unsafe changes:"
+	const reconsent = " with `--allow-unsafe` to confirm unsafe changes:"
 	const applyConsequences = "To replace that confirmation with a fresh plan and apply it in one step, subject to the environment ordering gate and pausing for `apply-confirm` only if its plan needs it:\n\n"
 
 	scoped := RenderConfirmationPlanUnavailable(ConfirmationRefusalData{
@@ -195,7 +195,7 @@ func TestConfirmationRefusalsCarryLongCommandsIntact(t *testing.T) {
 	everyFlag := ApplyCommandOptions{Tenant: "acme-holdings-eu", AllowUnsafe: true, DeferCutover: true, SkipRevert: true}
 	confirmFlags := " -d " + longDatabase + " --tenant acme-holdings-eu --allow-unsafe --defer-cutover --skip-revert"
 	applyFlags := " -d " + longDatabase + " --tenant acme-holdings-eu --defer-cutover --skip-revert"
-	reconsent := ", add `--allow-unsafe` to confirm unsafe changes:\n\n"
+	reconsent := " with `--allow-unsafe` to confirm unsafe changes:\n\n"
 
 	otherEnvironment := RenderConfirmationPlanForOtherEnvironment(ConfirmationRefusalData{
 		RequestedBy:          "hubot",
@@ -242,7 +242,7 @@ func TestApplyCommandCarriesTargetInPlanCommentOrder(t *testing.T) {
 func TestApplyCommandLeavesOutAllowUnsafe(t *testing.T) {
 	opts := ApplyCommandOptions{Tenant: "acme", AllowUnsafe: true, DeferCutover: true}
 	assert.Equal(t, "schemabot apply -e staging -d orders --tenant acme --defer-cutover", ApplyCommand("staging", "orders", opts))
-	assert.Equal(t, "add `--allow-unsafe` to confirm unsafe changes", UnsafeReconsent(opts))
+	assert.Equal(t, "with `--allow-unsafe` to confirm unsafe changes", UnsafeReconsent(opts))
 	assert.Empty(t, UnsafeReconsent(ApplyCommandOptions{Tenant: "acme", DeferCutover: true}))
 
 	inProgress := RenderApplyInProgress(ApplyLockConflictData{
@@ -253,7 +253,7 @@ func TestApplyCommandLeavesOutAllowUnsafe(t *testing.T) {
 		ApplyAgainCommand: ApplyCommand("staging", "orders", opts),
 		ApplyAgainConsent: UnsafeReconsent(opts),
 	})
-	assert.Contains(t, inProgress, "Once it finishes, apply again, and add `--allow-unsafe` to confirm unsafe changes:\n```\nschemabot apply -e staging -d orders --tenant acme --defer-cutover\n```\n")
+	assert.Contains(t, inProgress, "Once it finishes, apply again with `--allow-unsafe` to confirm unsafe changes:\n```\nschemabot apply -e staging -d orders --tenant acme --defer-cutover\n```\n")
 	assert.NotContains(t, inProgress, "--allow-unsafe\n")
 }
 
@@ -277,7 +277,7 @@ func TestRenderApplyLockIntentChangedKeepsLongCommandWhole(t *testing.T) {
 
 	assert.Contains(t, rendered, "## "+glyph.Failed+" Apply-confirm Rejected — Staging\n")
 	assert.Contains(t, rendered, "changed the lock on `"+database+"`")
-	assert.Contains(t, rendered, "Re-run the apply, and add `--allow-unsafe` to confirm unsafe changes:\n```\nschemabot apply -e staging -d "+database+" --tenant acme-holdings-eu --defer-cutover --skip-revert\n```\n")
+	assert.Contains(t, rendered, "Re-run the apply with `--allow-unsafe` to confirm unsafe changes:\n```\nschemabot apply -e staging -d "+database+" --tenant acme-holdings-eu --defer-cutover --skip-revert\n```\n")
 	assert.NotContains(t, rendered, "…")
 }
 
