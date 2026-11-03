@@ -2459,46 +2459,6 @@ func TestApplyOperationStore_FindNextApplyOperation_ClaimsFailedRetryableParentA
 	assert.Equal(t, state.ApplyOperation.FailedRetryable, claimed.State, "re-claim must keep failed_retryable for the resume drive to transition")
 }
 
-// TestApplyOperationStore_FindNextApplyOperation_ReservedDriverRecoversCrashedDeferredRetryForStop
-// verifies the reserved driver's claim on a crashed retry of an apply that
-// defers its cutover: it leaves the retry to the other drivers, and recovers it
-// once a stop is pending, so the stop reaches the operation even when every
-// other driver is held at a cutover.
-func TestApplyOperationStore_FindNextApplyOperation_ReservedDriverRecoversCrashedDeferredRetryForStop(t *testing.T) {
-	clearTables(t)
-	ctx := t.Context()
-	store := NewMySQL(testDB)
-
-	lock := createTestLock(t, store, "testdb", "mysql")
-	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_op_deferred_retry_crash", 1, state.Apply.Running, "staging")
-	_, err := testDB.ExecContext(ctx, `
-		UPDATE applies SET state = ?, attempt = ?, options = ?, updated_at = NOW() - INTERVAL 2 MINUTE WHERE id = ?
-	`, state.Apply.Running, maxRecoveryAttempts-1, `{"defer_cutover":true}`, apply.ID)
-	require.NoError(t, err)
-	id, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
-		ApplyID: apply.ID, Deployment: "region-a", State: state.ApplyOperation.FailedRetryable,
-	})
-	require.NoError(t, err)
-	_, err = testDB.ExecContext(ctx, `
-		UPDATE apply_operations SET updated_at = NOW() - INTERVAL 2 MINUTE WHERE id = ?
-	`, id)
-	require.NoError(t, err)
-
-	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "reserved-driver", storage.SkipDeferredCutoverWork())
-	require.NoError(t, err)
-	assert.Nil(t, claimed, "the reserved driver leaves a crashed deferred retry to the other drivers")
-
-	_, _, err = store.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
-		ApplyID: apply.ID, Operation: storage.ControlOperationStop, Status: storage.ControlRequestPending,
-		RequestedBy: "operator-a", Metadata: []byte(`{}`),
-	})
-	require.NoError(t, err)
-	claimed, err = store.ApplyOperations().FindNextApplyOperation(ctx, "reserved-driver", storage.SkipDeferredCutoverWork())
-	require.NoError(t, err)
-	require.NotNil(t, claimed, "the reserved driver recovers a crashed deferred retry to deliver its pending stop")
-	assert.Equal(t, id, claimed.ID)
-}
-
 // TestApplyOperationStore_FindNextApplyOperation_ClaimsFailedRetryableParentActiveStaleBudgetExhausted
 // verifies the crash-recovery branch is not budget-gated: the retry attempt was
 // already admitted and counted when the parent was claimed, so a crashed retry

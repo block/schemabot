@@ -44,7 +44,9 @@ type OperationClaimFilter struct {
 	// Claims that deliver a stop or cancel request to such an operation still
 	// match, because they end its work rather than start it, and so does
 	// recovering a crashed drive of one while its apply has a stop or cancel
-	// pending, since that recovery is what delivers the request.
+	// pending, since that recovery is what delivers the request. The driver's
+	// drive hands such an apply back once the request is delivered
+	// (tern.ErrDeferredCutoverDriveHandedBack).
 	SkipDeferredCutoverWork bool
 }
 

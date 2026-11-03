@@ -1055,7 +1055,8 @@ func (s *Service) claimGateClosedBeforeRung(stop <-chan struct{}, driverID int, 
 // the same tasks as the whole apply. It reports claimSettled only when the
 // drive succeeded and settled the operation it claimed.
 func (s *Service) recoverApplyOperation(ctx context.Context, driverID int, owner string) claimOutcome {
-	op, err := s.storage.ApplyOperations().FindNextApplyOperation(ctx, owner, s.operationClaimOptions(driverID)...)
+	claimOptions := s.operationClaimOptions(driverID)
+	op, err := s.storage.ApplyOperations().FindNextApplyOperation(ctx, owner, claimOptions...)
 	if err != nil {
 		s.logClaimFailure(ctx, "operator: failed to claim apply_operation", "operation_storage_error",
 			"driver", driverID, "lease_owner", owner, "error", err)
@@ -1068,6 +1069,12 @@ func (s *Service) recoverApplyOperation(ctx context.Context, driverID int, owner
 	defer s.markDriverBusy(ctx)()
 	if claimStartsOperation(op) {
 		s.wakeIdleDriver(driverID, op)
+	}
+	if len(claimOptions) > 0 {
+		// A driver skipping deferred-cutover work claims a deferred apply's
+		// operation only to deliver its pending stop or cancel, so its drive
+		// hands the apply back once that is done (handBackDeferredCutoverDrive).
+		ctx = tern.WithControlDeliveryOnlyForDeferredCutover(ctx)
 	}
 
 	// The claim rotated a fresh operation lease onto the row. It is the
@@ -1296,6 +1303,10 @@ func (s *Service) recoverSingleApplyOperation(ctx context.Context, driverID int,
 
 	resumed, resumeErr := s.resumeClaimedApply(runCtx, driverID, apply, op.ID, op.Deployment)
 	stopHeartbeat()
+	if errors.Is(resumeErr, tern.ErrDeferredCutoverDriveHandedBack) {
+		s.handBackDeferredCutoverDrive(ctx, driverID, apply, op, opLease, true)
+		return claimSpent
+	}
 	if !resumed {
 		if errors.Is(resumeErr, tern.ErrNoTasksForApplyOperation) {
 			// The drive failed closed: the operation has no tasks, so it can
@@ -1638,6 +1649,10 @@ func (s *Service) driveClaimedMultiOperation(ctx context.Context, driverID int, 
 	resumed, resumeErr := s.resumeClaimedApplyWithOptions(runCtx, driverID, apply, op.ID, op.Deployment,
 		resumeClaimedApplyOptions{suppressRecoveredObserver: true, cutover: cutover, projectionOwnsGauge: preDrive.OwnsActiveAppliesGauge})
 	stopHeartbeat()
+	if errors.Is(resumeErr, tern.ErrDeferredCutoverDriveHandedBack) {
+		s.handBackDeferredCutoverDrive(ctx, driverID, apply, op, opLease, false)
+		return claimSpent
+	}
 	if !resumed && errors.Is(resumeErr, tern.ErrNoTasksForApplyOperation) {
 		// The drive failed closed: the operation has no tasks, so it can never
 		// make progress. Terminalize it now rather than leaving it to be
@@ -2438,6 +2453,27 @@ func (s *Service) releaseOperationClaimBeforeDrive(ctx context.Context, driverID
 		append(op.LogAttrs(), "driver", driverID)...)
 }
 
+// handBackDeferredCutoverDrive releases the claims of a drive that delivered
+// a deferred apply's pending stop or cancel and stopped there
+// (tern.ErrDeferredCutoverDriveHandedBack), so a driver that runs deferred work
+// claims the operation on its next poll instead of after a staleness window.
+// The parent goes back first when this drive holds it, for the reason
+// recoverApplyOperation's lease recheck gives: released second, the operation
+// is never claimable while this driver still holds a fresh parent lease.
+func (s *Service) handBackDeferredCutoverDrive(ctx context.Context, driverID int, apply *storage.Apply, op *storage.ApplyOperation, opLease storage.OperationLease, holdsParent bool) {
+	if s.claimDrainInProgress() {
+		s.logger.Debug("operator: leaving a handed-back deferred apply's claim registered for shutdown to hand back",
+			append(op.LogAttrs(), "driver", driverID)...)
+		return
+	}
+	releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), finishedClaimReleaseTimeout)
+	defer cancel()
+	if holdsParent {
+		s.releaseParentApplyClaim(releaseCtx, driverID, apply, op)
+	}
+	s.releaseOperationClaimBeforeDrive(releaseCtx, driverID, op, opLease)
+}
+
 // releaseFinishedOperationClaim clears the operation lease a drive leaves
 // behind when it ends.
 //
@@ -2814,6 +2850,17 @@ func (s *Service) resumeClaimedApplyWithOptions(ctx context.Context, driverID in
 			// the retryable-claim decrement the other failure branches perform is
 			// intentionally omitted here.
 			s.failClaimedApplyAfterDrivePanic(ctx, driverID, apply, applyOperationID, deployment, drivePanic)
+			return false, err
+		}
+		if errors.Is(err, tern.ErrDeferredCutoverDriveHandedBack) {
+			// Not a failure: this driver skips deferred-cutover work and was
+			// admitted only to deliver the pending stop or cancel, which did
+			// not end the drive. The caller hands the claim back at once.
+			logger.Info("operator: drive delivered its pending control request and is handing the apply back; a driver that runs deferred work resumes it",
+				"apply_operation_id", applyOperationID)
+			if retryableClaim {
+				metrics.AdjustActiveApplies(ctx, -1, apply.Database, deployment, apply.Environment)
+			}
 			return false, err
 		}
 		if errors.Is(err, tern.ErrApplyLeasePresumedLost) {

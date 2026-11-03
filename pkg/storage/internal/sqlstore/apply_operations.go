@@ -1335,12 +1335,14 @@ func (s *applyOperationStore) driverCapClause(staleClaimCutoff string) (string, 
 }
 
 // deferredCutoverRecoveryExclusion is deferredCutoverWorkExclusion for the
-// stale-active arm, which recovers a crashed drive and is also the only arm
-// that reaches a crashed drive's operation when a stop or cancel is pending
-// for it: stop reconciliation leaves an apply with an active operation to this
-// arm. A driver skipping deferred work therefore still claims a deferred
-// operation here while its apply has a pending stop or cancel, so the request
-// is delivered even when every other driver is waiting on a cutover.
+// branches that recover a crashed drive: the stale-active arm and the
+// failed_retryable arm's crash-recovery branch. They are the only branches
+// that reach a crashed drive's operation when a stop or cancel is pending for
+// it: stop reconciliation leaves an apply with an active operation to them. A
+// driver skipping deferred work therefore still claims a deferred operation
+// here while its apply has a pending stop or cancel, so the request is
+// delivered even when every other driver is waiting on a cutover. Its drive
+// delivers the request and hands the apply back without driving it on.
 //
 // The fragment begins with AND and binds the arguments it returns.
 func (s *applyOperationStore) deferredCutoverRecoveryExclusion(filter storage.OperationClaimFilter) (string, []any) {
@@ -1362,8 +1364,9 @@ func (s *applyOperationStore) deferredCutoverRecoveryExclusion(filter storage.Op
 }
 
 // deferredCutoverWorkExclusion returns the predicate FindNextApplyOperation
-// adds to each arm that starts, resumes, or recovers an operation when filter
-// skips deferred-cutover work, or "" when it does not. It matches operations
+// adds to each arm that starts, resumes, or redispatches an operation when
+// filter skips deferred-cutover work, or "" when it does not. The branches that
+// recover a crashed drive take deferredCutoverRecoveryExclusion instead. It matches operations
 // whose apply defers its cutover, read from the same applies.options key the
 // cutover claim reads. The arms that only deliver a stop or cancel request
 // leave it out, so a driver skipping deferred work can still end it.
