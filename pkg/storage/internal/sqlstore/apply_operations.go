@@ -1334,6 +1334,33 @@ func (s *applyOperationStore) driverCapClause(staleClaimCutoff string) (string, 
 	return clause, append(stringArgs(occupyingStates), s.maxDriversPerApply)
 }
 
+// deferredCutoverRecoveryExclusion is deferredCutoverWorkExclusion for the
+// stale-active arm, which recovers a crashed drive and is also the only arm
+// that reaches a crashed drive's operation when a stop or cancel is pending
+// for it: stop reconciliation leaves an apply with an active operation to this
+// arm. A driver skipping deferred work therefore still claims a deferred
+// operation here while its apply has a pending stop or cancel, so the request
+// is delivered even when every other driver is waiting on a cutover.
+//
+// The fragment begins with AND and binds the arguments it returns.
+func (s *applyOperationStore) deferredCutoverRecoveryExclusion(filter storage.OperationClaimFilter) (string, []any) {
+	if !filter.SkipDeferredCutoverWork {
+		return "", nil
+	}
+	fragment := `
+				AND (
+					NOT ` + s.deferredCutoverApplySQL() + `
+					OR EXISTS (
+						SELECT 1
+						FROM apply_control_requests ending
+						WHERE ending.apply_id = apply_operations.apply_id
+							AND ending.operation IN (?, ?)
+							AND ending.status = ?
+					)
+				)`
+	return fragment, []any{storage.ControlOperationStop, storage.ControlOperationCancel, storage.ControlRequestPending}
+}
+
 // deferredCutoverWorkExclusion returns the predicate FindNextApplyOperation
 // adds to each arm that starts, resumes, or recovers an operation when filter
 // skips deferred-cutover work, or "" when it does not. It matches operations
@@ -1347,7 +1374,13 @@ func (s *applyOperationStore) deferredCutoverWorkExclusion(filter storage.Operat
 		return ""
 	}
 	return `
-				AND NOT EXISTS (
+				AND NOT ` + s.deferredCutoverApplySQL()
+}
+
+// deferredCutoverApplySQL matches an operation whose apply defers its cutover.
+// It binds no arguments.
+func (s *applyOperationStore) deferredCutoverApplySQL() string {
+	return `EXISTS (
 					SELECT 1
 					FROM applies AS deferred
 					WHERE deferred.id = apply_operations.apply_id
@@ -1523,8 +1556,11 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 	driverCap, driverCapArgs := s.driverCapClause(staleClaimCutoff)
 	// notDeferred is empty unless the claim skips deferred-cutover work. It
 	// binds no arguments, so adding it to an arm leaves every placeholder's
-	// position unchanged.
-	notDeferred := s.deferredCutoverWorkExclusion(storage.BuildOperationClaimFilter(opts...))
+	// position unchanged. notDeferredRecovery, its stale-active form, binds
+	// arguments that follow that arm's own.
+	claimFilter := storage.BuildOperationClaimFilter(opts...)
+	notDeferred := s.deferredCutoverWorkExclusion(claimFilter)
+	notDeferredRecovery, notDeferredRecoveryArgs := s.deferredCutoverRecoveryExclusion(claimFilter)
 
 	queryArgs := []any{state.ApplyOperation.Pending}
 	// Member-order gate for the pending claim (operationStartGateSQL): a work
@@ -1609,6 +1645,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 	queryArgs = append(queryArgs,
 		state.ApplyOperation.WaitingForCutover,
 		storage.CutoverPolicyBarrier, storage.CutoverPolicyParallel)
+	queryArgs = append(queryArgs, notDeferredRecoveryArgs...)
 	// A stopped operation is reclaimable for start and for cancel, but the two
 	// arms are separate because only one of them terminates itself. The start
 	// claim always resolves — it either moves the row to resuming or the parent
@@ -1793,7 +1830,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 						WHERE sibling.apply_id = apply_operations.apply_id
 							AND sibling.id <> apply_operations.id
 					)
-				)`+notDeferred+`
+				)`+notDeferredRecovery+`
 			)
 			OR (
 				state = ?

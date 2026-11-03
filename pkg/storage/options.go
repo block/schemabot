@@ -42,7 +42,9 @@ type OperationClaimFilter struct {
 	// recovers an operation of an apply deferring its cutover, so the claiming
 	// driver cannot end up holding at a cutover only an operator can release.
 	// Claims that deliver a stop or cancel request to such an operation still
-	// match, because they end its work rather than start it.
+	// match, because they end its work rather than start it, and so does
+	// recovering a crashed drive of one while its apply has a stop or cancel
+	// pending, since that recovery is what delivers the request.
 	SkipDeferredCutoverWork bool
 }
 
