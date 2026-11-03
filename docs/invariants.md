@@ -1425,7 +1425,7 @@ chosen upfront. Neither is a command whose effect anyone is waiting to see, so t
 only when a durable skip-revert control request exists for the apply, and otherwise the comment
 transitions in place. Cutting over likewise happens on its own unless the apply deferred its
 cutover, so the phases past the cutover gate rotate only for an apply that deferred it and carries a
-durable cutover control request, once for each member that request is bound to in turn. Operations that resolve straight to a terminal state, cancel among them, do
+durable cutover control request, once for each cutover command, whether the command is bound to one member or to several at once. Operations that resolve straight to a terminal state, cancel among them, do
 not rotate at all, because the terminal summary already lands at the bottom. The phase is derived
 from engine-agnostic apply state, so every engine gets the same PR timeline. *Enforced:* the phase
 and rollout member recorded on the tracked comment row and the rotation predicates
