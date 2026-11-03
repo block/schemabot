@@ -567,6 +567,57 @@ func (s *controlRequestStore) FailPending(ctx context.Context, applyID int64, op
 	return nil
 }
 
+func (s *controlRequestStore) SettlePendingRevision(ctx context.Context, req *storage.ApplyControlRequest, status storage.ControlRequestStatus, errorMessage string) (bool, error) {
+	if req == nil {
+		return false, fmt.Errorf("settle pending control request: no request given")
+	}
+	if status != storage.ControlRequestCompleted && status != storage.ControlRequestFailed {
+		return false, fmt.Errorf("settle pending %s control request %d for apply %d as %q: only completed or failed settles a request", req.Operation, req.ID, req.ApplyID, status)
+	}
+	if status != storage.ControlRequestFailed {
+		errorMessage = ""
+	}
+	target := fmt.Sprintf("apply %d operation %s request %d revision %d", req.ApplyID, req.Operation, req.ID, req.Revision)
+	lease, hasLease, err := applyLeaseFromContext(ctx, req.ApplyID)
+	if err != nil {
+		return false, err
+	}
+	if !hasLease {
+		result, err := s.db.ExecContext(ctx, `
+			UPDATE apply_control_requests
+			SET status = ?, error_message = ?, completed_at = COALESCE(completed_at, NOW()), updated_at = NOW()
+			WHERE id = ? AND apply_id = ? AND revision = ? AND status = ?
+		`, status, nullString(errorMessage), req.ID, req.ApplyID, req.Revision, storage.ControlRequestPending)
+		if err != nil {
+			return false, fmt.Errorf("settle pending control request for %s as %s: %w", target, status, err)
+		}
+		rows, err := result.RowsAffected()
+		if err != nil {
+			return false, fmt.Errorf("read settled control request rows for %s: %w", target, err)
+		}
+		return rows > 0, nil
+	}
+	query := s.dialect.JoinedUpdate(
+		"apply_control_requests", "cr", "applies", "a", "a.id = cr.apply_id",
+		[]JoinedUpdateAssignment{
+			{Column: "status", Expr: "?"},
+			{Column: "error_message", Expr: "?"},
+			{Column: "completed_at", Expr: "COALESCE(cr.completed_at, NOW())"},
+			{Column: "updated_at", Expr: "NOW()"},
+		},
+		"cr.id = ? AND cr.apply_id = ? AND cr.revision = ? AND cr.status = ? AND "+s.dialect.LeaseTokenFence("applies", "a", "id", "lease_token"),
+	)
+	result, err := s.db.ExecContext(ctx, query, status, nullString(errorMessage), req.ID, req.ApplyID, req.Revision, storage.ControlRequestPending, lease.Token)
+	if err != nil {
+		return false, fmt.Errorf("settle pending control request for %s as %s: %w", target, status, err)
+	}
+	rows, err := confirmLeaseOnZeroRows(ctx, s.db, result, lease, "settled control request", target)
+	if err != nil {
+		return false, err
+	}
+	return rows > 0, nil
+}
+
 func (s *controlRequestStore) ListSettled(ctx context.Context, applyID int64) ([]*storage.ApplyControlRequest, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT `+controlRequestColumns+`

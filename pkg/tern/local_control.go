@@ -45,6 +45,20 @@ func (c *LocalClient) requestCutover(ctx context.Context, req *ternv1.CutoverReq
 			append(apply.LogAttrs(), "apply_operation_id", req.GetApplyOperationId(), "reason", refusal)...)
 		return &ternv1.CutoverResponse{Accepted: false, ErrorMessage: refusal}, nil
 	}
+	if apply.GetOptions().DeferCutover {
+		// Checked for a cutover that names one operation too: the apply cuts
+		// every operation over together, so one operation's cutover is not
+		// ready while another has not reached its own.
+		refusal, err := c.deferredCutoverNotReady(ctx, apply)
+		if err != nil {
+			return nil, err
+		}
+		if refusal != "" {
+			c.logger.Info("deferred cutover refused: not every operation waits at its cutover",
+				append(apply.LogAttrs(), "apply_operation_id", req.GetApplyOperationId(), "caller", caller, "reason", refusal)...)
+			return &ternv1.CutoverResponse{Accepted: false, ErrorMessage: refusal}, nil
+		}
+	}
 	return c.queueCutoverRequest(ctx, apply, caller, bound)
 }
 
@@ -2791,7 +2805,10 @@ func (c *LocalClient) boundCutoverRequestTurn(ctx context.Context, apply *storag
 // so the bound operation's own state (see boundCutoverRequestTurn) decides
 // whether the request can still apply.
 func (c *LocalClient) takeBoundCutoverRequest(ctx context.Context, apply *storage.Apply, controlReq *storage.ApplyControlRequest, boundID int64, logger *slog.Logger) error {
-	accepted, err := c.cutOverBoundOperation(ctx, apply, controlReq, boundID, logger)
+	failRequest := func(reason string) error {
+		return failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCutover, reason)
+	}
+	accepted, err := c.cutOverBoundOperation(ctx, apply, controlReq, boundID, logger, failRequest)
 	if err != nil || !accepted {
 		return err
 	}
@@ -2807,9 +2824,9 @@ func (c *LocalClient) takeBoundCutoverRequest(ctx context.Context, apply *storag
 // request, from that operation's own drive. accepted reports that the engine
 // took the cutover. A recovering apply and an engine that is not ready yet
 // leave the request pending for the next tick; a pending stop blocks it; any
-// other refusal or failure fails the request, since the command can no longer
-// take effect as accepted.
-func (c *LocalClient) cutOverBoundOperation(ctx context.Context, apply *storage.Apply, controlReq *storage.ApplyControlRequest, operationID int64, logger *slog.Logger) (accepted bool, err error) {
+// other refusal or failure fails the request through failRequest, since the
+// command can no longer take effect as accepted.
+func (c *LocalClient) cutOverBoundOperation(ctx context.Context, apply *storage.Apply, controlReq *storage.ApplyControlRequest, operationID int64, logger *slog.Logger, failRequest func(reason string) error) (accepted bool, err error) {
 	if state.IsState(apply.State, state.Apply.Recovering) {
 		// The cutover path refuses a recovering apply, and settling the
 		// request on that refusal would fail an acknowledged cutover the
@@ -2834,21 +2851,21 @@ func (c *LocalClient) cutOverBoundOperation(ctx context.Context, apply *storage.
 		return false, nil
 	}
 	if err != nil {
-		if failErr := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCutover, err.Error()); failErr != nil {
+		if failErr := failRequest(err.Error()); failErr != nil {
 			return false, fmt.Errorf("process pending cutover for apply %s operation %d: %w; fail pending cutover request: %w", apply.ApplyIdentifier, operationID, err, failErr)
 		}
 		return false, fmt.Errorf("process pending cutover for apply %s operation %d: %w", apply.ApplyIdentifier, operationID, err)
 	}
 	if resp == nil {
 		errorMessage := "the cutover path returned neither a response nor an error"
-		if err := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCutover, errorMessage); err != nil {
+		if err := failRequest(errorMessage); err != nil {
 			return false, err
 		}
 		return false, fmt.Errorf("process pending cutover for apply %s operation %d: %s", apply.ApplyIdentifier, operationID, errorMessage)
 	}
 	if !resp.Accepted {
 		errorMessage := controlRefusalMessage(storage.ControlOperationCutover, resp.ErrorMessage)
-		if err := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCutover, errorMessage); err != nil {
+		if err := failRequest(errorMessage); err != nil {
 			return false, err
 		}
 		return false, fmt.Errorf("process pending cutover for apply %s operation %d: %s", apply.ApplyIdentifier, operationID, errorMessage)

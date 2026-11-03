@@ -44,7 +44,7 @@ func (c *LocalClient) processPendingCutoverSet(ctx context.Context, apply *stora
 		logger.Debug("pending cutover request does not name this drive's operation; only settling it",
 			"requested_by", controlRequestCaller(controlReq), "cutover_operation_ids", ids, "drive_operation_id", driveOperationID)
 	default:
-		if err := c.takeCutoverSetShare(ctx, apply, tasks, controlReq, driveOperationID, logger); err != nil {
+		if err := c.takeCutoverSetShare(ctx, apply, tasks, controlReq, ids, driveOperationID, logger); err != nil {
 			return err
 		}
 	}
@@ -52,8 +52,12 @@ func (c *LocalClient) processPendingCutoverSet(ctx context.Context, apply *stora
 }
 
 // takeCutoverSetShare cuts over the drive's own operation for a cutover
-// request set, once.
-func (c *LocalClient) takeCutoverSetShare(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, controlReq *storage.ApplyControlRequest, operationID int64, logger *slog.Logger) error {
+// request set, once. An engine that fails or refuses the cutover fails the
+// whole request with how far the set got: that member stays parked, so the
+// set could otherwise never settle, and the members that had not acted yet
+// wait for the operator's next cutover, which is bound to every member still
+// free to take it.
+func (c *LocalClient) takeCutoverSetShare(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, controlReq *storage.ApplyControlRequest, ids []int64, operationID int64, logger *slog.Logger) error {
 	key := newCutoverShareKey(controlReq, operationID)
 	if _, taken := c.cutoverSharesTaken.Load(key); taken {
 		logger.Debug("this drive already cut over its operation for the pending cutover request; waiting for the rest of the set",
@@ -80,7 +84,10 @@ func (c *LocalClient) takeCutoverSetShare(ctx context.Context, apply *storage.Ap
 			"blocking_target", blocker.Target, "blocking_state", blocker.State)
 		return nil
 	}
-	accepted, err := c.cutOverBoundOperation(ctx, apply, controlReq, operationID, logger)
+	failRequest := func(reason string) error {
+		return failCutoverSet(ctx, c.storage, logger, apply, controlReq, ids, operationID, reason)
+	}
+	accepted, err := c.cutOverBoundOperation(ctx, apply, controlReq, operationID, logger, failRequest)
 	if err != nil || !accepted {
 		return err
 	}
@@ -150,13 +157,38 @@ func settleCutoverSet(ctx context.Context, store storage.Storage, logger *slog.L
 	if cutOver == len(ids) {
 		logger.InfoContext(ctx, "completing pending cutover request: every operation it was sent for cut over",
 			append(apply.LogAttrs(), "requested_by", controlRequestCaller(controlReq), "cutover_operation_ids", ids)...)
-		return completePendingControlRequests(ctx, store, apply, storage.ControlOperationCutover)
+		return settlePendingControlRequestRevision(ctx, store, logger, apply, controlReq, storage.ControlRequestCompleted, "")
 	}
 	reason := cutoverSetNotAppliedMessage(cutOver, len(ids), firstReason)
 	logger.InfoContext(ctx, "failing pending cutover request: not every operation it was sent for cut over",
 		append(apply.LogAttrs(), "requested_by", controlRequestCaller(controlReq), "cutover_operation_ids", ids,
 			"cut_over", cutOver, "reason", reason)...)
-	return failPendingControlRequests(ctx, store, apply, storage.ControlOperationCutover, reason)
+	return settlePendingControlRequestRevision(ctx, store, logger, apply, controlReq, storage.ControlRequestFailed, reason)
+}
+
+// failCutoverSet fails a pending cutover request set because the engine
+// failed or refused the cutover of operationID, naming how many members of
+// the set had cut over by then.
+func failCutoverSet(ctx context.Context, store storage.Storage, logger *slog.Logger, apply *storage.Apply, controlReq *storage.ApplyControlRequest, ids []int64, operationID int64, refusal string) error {
+	opStore := store.ApplyOperations()
+	if opStore == nil {
+		return fmt.Errorf("fail pending cutover of apply %s: apply operation store is not available", apply.ApplyIdentifier)
+	}
+	ops, err := opStore.ListByApply(ctx, apply.ID)
+	if err != nil {
+		return fmt.Errorf("list the operations the pending cutover of apply %s is for: %w", apply.ApplyIdentifier, err)
+	}
+	cutOver := 0
+	for _, op := range ops {
+		if slices.Contains(ids, op.ID) && cutoverRequestResolvedByApplyState(op.State) {
+			cutOver++
+		}
+	}
+	reason := cutoverSetNotAppliedMessage(cutOver, len(ids), refusal)
+	logger.InfoContext(ctx, "failing pending cutover request: the engine did not take the cutover of one of its operations",
+		append(apply.LogAttrs(), "requested_by", controlRequestCaller(controlReq), "cutover_operation_ids", ids,
+			"refused_operation_id", operationID, "cut_over", cutOver, "reason", reason)...)
+	return settlePendingControlRequestRevision(ctx, store, logger, apply, controlReq, storage.ControlRequestFailed, reason)
 }
 
 // cutoverSetNotAppliedMessage answers a cutover request set that not every

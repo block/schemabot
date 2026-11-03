@@ -700,6 +700,37 @@ func failPendingControlRequests(ctx context.Context, store storage.Storage, appl
 	return nil
 }
 
+// settlePendingControlRequestRevision settles controlReq as completed or failed
+// only while its row still carries the revision the caller evaluated, so a
+// drive that decided on one command never settles a later command re-armed on
+// the same row. A row that has moved on is left to the drive evaluating the
+// command it now carries.
+func settlePendingControlRequestRevision(ctx context.Context, store storage.Storage, logger *slog.Logger, apply *storage.Apply, controlReq *storage.ApplyControlRequest, status storage.ControlRequestStatus, errorMessage string) error {
+	if store == nil {
+		return fmt.Errorf("storage is not available")
+	}
+	if err := ensureApplyLeaseForControlRequest(ctx, store, apply, controlReq.Operation); err != nil {
+		return err
+	}
+	controlStore := store.ControlRequests()
+	if controlStore == nil {
+		return fmt.Errorf("control request store is not available")
+	}
+	if status == storage.ControlRequestFailed {
+		errorMessage = apply.OperatorFacingMessage(errorMessage)
+	}
+	settled, err := controlStore.SettlePendingRevision(ctx, controlReq, status, errorMessage)
+	if err != nil {
+		return fmt.Errorf("settle pending %s control request for apply %s as %s: %w", controlReq.Operation, apply.ApplyIdentifier, status, err)
+	}
+	if !settled {
+		logger.InfoContext(ctx, "pending control request was not settled: the request this drive evaluated has already been settled or replaced by a newer command",
+			append(apply.LogAttrs(), "operation", controlReq.Operation, "requested_by", controlRequestCaller(controlReq),
+				"request_revision", controlReq.Revision, "status", status)...)
+	}
+	return nil
+}
+
 // controlRefusalMessage renders the reason the executing side gave for refusing
 // a control request. A refusal that arrives without a reason still has to read
 // as an answer to the operator's command rather than a bare "not accepted", so

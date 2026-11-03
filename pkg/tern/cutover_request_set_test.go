@@ -7,6 +7,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 )
@@ -108,4 +109,35 @@ func TestSettlePendingCutoverAfterStopSettlesACutoverSet(t *testing.T) {
 	require.NoError(t, SettlePendingCutoverAfterStop(t.Context(), fx.client.storage, slog.Default(), fx.apply))
 	assert.Equal(t, storage.ControlRequestFailed, req.Status)
 	assert.Equal(t, "cutover reached 1 of the 2 operations it was sent for; "+cutoverSupersededByStopMessage, req.ErrorMessage)
+}
+
+// payments-001 cut over on the command, then the engine refuses payments-002's
+// cutover. payments-002 stays parked, so the request fails at once and says
+// how far it got, instead of waiting on a member that cannot take it.
+func TestLocalClient_CutoverSetRefusedByTheEngineFailsNamingHowFarItGot(t *testing.T) {
+	fx := newSharedApplyFixture(state.ApplyOperation.Completed, state.ApplyOperation.WaitingForCutover, state.Task.Completed, state.Task.WaitingForCutover)
+	req := pendingCutoverSet(t, fx)
+	fx.engine.cutoverResult = &engine.ControlResult{Accepted: false, Message: "table is locked by another session"}
+
+	err := fx.client.processPendingCutoverControlRequest(t.Context(), fx.apply, []*storage.Task{fx.secondTask})
+	require.Error(t, err)
+	assert.Equal(t, []string{"ctx-op-12"}, fx.engine.cutoverContexts)
+	assert.Equal(t, storage.ControlRequestFailed, req.Status)
+	assert.Equal(t, "cutover reached 1 of the 2 operations it was sent for; table is locked by another session", req.ErrorMessage)
+}
+
+// A drive evaluates the pending cutover set, and before its settle lands the
+// request is settled and re-armed for the operator's next command. The stale
+// settle leaves the new command pending for the drives that will carry it.
+func TestSettleCutoverSetLeavesANewerCommandPending(t *testing.T) {
+	fx := newSharedApplyFixture(state.ApplyOperation.Completed, state.ApplyOperation.Completed, state.Task.Completed, state.Task.Completed)
+	req := pendingCutoverSet(t, fx)
+	evaluated := *req
+	req.Revision++
+
+	require.NoError(t, settleCutoverSet(t.Context(), fx.client.storage, slog.Default(), fx.apply, &evaluated, []int64{fx.first.ID, fx.second.ID}, nil))
+	assert.Equal(t, storage.ControlRequestPending, req.Status)
+
+	require.NoError(t, settleCutoverSet(t.Context(), fx.client.storage, slog.Default(), fx.apply, req, []int64{fx.first.ID, fx.second.ID}, nil))
+	assert.Equal(t, storage.ControlRequestCompleted, req.Status)
 }

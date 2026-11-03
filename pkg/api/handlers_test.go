@@ -452,6 +452,7 @@ func (s *memoryControlRequestStore) RequestPending(_ context.Context, req *stora
 			existing.ErrorMessage = ""
 			existing.Metadata = append(existing.Metadata[:0], req.Metadata...)
 			existing.CompletedAt = nil
+			existing.Revision++
 			return cloneControlRequest(existing), false, nil
 		}
 	}
@@ -518,6 +519,22 @@ func (s *memoryControlRequestStore) FailPending(_ context.Context, applyID int64
 		}
 	}
 	return nil
+}
+
+func (s *memoryControlRequestStore) SettlePendingRevision(_ context.Context, target *storage.ApplyControlRequest, status storage.ControlRequestStatus, errorMessage string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, req := range s.requests {
+		if req.ID != target.ID || req.Revision != target.Revision || req.Status != storage.ControlRequestPending {
+			continue
+		}
+		req.Status = status
+		if status == storage.ControlRequestFailed {
+			req.ErrorMessage = errorMessage
+		}
+		return true, nil
+	}
+	return false, nil
 }
 
 func cloneControlRequest(req *storage.ApplyControlRequest) *storage.ApplyControlRequest {
