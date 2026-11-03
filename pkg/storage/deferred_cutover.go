@@ -45,3 +45,21 @@ func DeferredCutoverHeldAtOnce(ops []*ApplyOperation, maxDriversPerApply int) in
 	}
 	return width
 }
+
+// DeferredCutoverHeldAtOnceByDeployment counts, for each deployment, the most
+// drivers of that deployment one apply deferring its cutover would keep waiting
+// there at once (DeferredCutoverHeldAtOnce over the apply's operations on that
+// deployment). A deployment none of whose work is still to settle is left out.
+func DeferredCutoverHeldAtOnceByDeployment(ops []*ApplyOperation, maxDriversPerApply int) map[string]int {
+	byDeployment := make(map[string][]*ApplyOperation)
+	for _, op := range ops {
+		byDeployment[op.Deployment] = append(byDeployment[op.Deployment], op)
+	}
+	widths := make(map[string]int, len(byDeployment))
+	for deployment, deploymentOps := range byDeployment {
+		if width := DeferredCutoverHeldAtOnce(deploymentOps, maxDriversPerApply); width > 0 {
+			widths[deployment] = width
+		}
+	}
+	return widths
+}

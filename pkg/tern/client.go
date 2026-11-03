@@ -302,3 +302,24 @@ type ShutdownHalter interface {
 	// halts stay active for reclaim.
 	HaltForShutdown(ctx context.Context) error
 }
+
+// DeferredCutoverCapacity is how many operations a deployment's operators can
+// hold at a deferred cutover at once.
+type DeferredCutoverCapacity struct {
+	// LiveServers is how many of the deployment's servers reported their
+	// drivers within its live window.
+	LiveServers int
+	// Drivers is how many drivers those servers leave for deferred work,
+	// together.
+	Drivers int
+}
+
+// DeferredCutoverCapacityReader is a client for a deployment whose operators
+// run its operations on another plane. Each operation waiting at a deferred
+// cutover keeps one of that plane's drivers, so apply creation reads how many
+// it can hold before admitting an apply started with --defer-cutover. A nil
+// capacity with no error is a deployment that does not report it, and apply
+// creation refuses to defer the cutover of operations sent to it.
+type DeferredCutoverCapacityReader interface {
+	DeferredCutoverCapacity(ctx context.Context) (*DeferredCutoverCapacity, error)
+}

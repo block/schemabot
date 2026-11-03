@@ -146,5 +146,38 @@ func admitDeferredCutover(ctx context.Context, tx rowsQueryer, dialect Dialect, 
 	if refused.Operations+refused.Reserved > refused.Capacity {
 		return refused
 	}
+	for _, plane := range apply.DeferredCutoverDataPlanes {
+		if refused := dataPlaneDeferredCutoverRefusal(apply.Environment, plane, widths); refused != nil {
+			return refused
+		}
+	}
+	return nil
+}
+
+// dataPlaneDeferredCutoverRefusal refuses an apply's operations on a
+// deployment that runs them on another plane's operators when they do not fit,
+// beside the other admitted deferred applies' operations on that deployment
+// and environment, in the deferred cutover drivers that plane reported. A
+// plane serves one control plane, so widths, every deferred apply this store
+// holds, is every deferred apply the plane runs.
+func dataPlaneDeferredCutoverRefusal(environment string, plane storage.DeferredCutoverDataPlane, widths []storage.DeferredCutoverWidth) *storage.DeferredCutoverCapacityError {
+	refused := &storage.DeferredCutoverCapacityError{
+		Deployment:  plane.Deployment,
+		Operations:  plane.Operations,
+		Capacity:    plane.Capacity,
+		LiveServers: plane.LiveServers,
+	}
+	if refused.LiveServers == 0 || refused.ExceedsCapacity() {
+		return refused
+	}
+	for _, width := range widths {
+		if held := width.ByDeployment[plane.Deployment]; width.Environment == environment && held > 0 {
+			refused.Reserved += held
+			refused.HoldingApplyIDs = append(refused.HoldingApplyIDs, width.ApplyIdentifier)
+		}
+	}
+	if refused.Operations+refused.Reserved > refused.Capacity {
+		return refused
+	}
 	return nil
 }

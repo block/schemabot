@@ -1219,6 +1219,19 @@ type Apply struct {
 	// drivers. It is not persisted.
 	DeferredCutoverOperations int
 
+	// DeferredCutoverDataPlanes is, for each deployment whose operations run
+	// on another plane's operators, how many of that plane's drivers this
+	// apply would hold at a deferred cutover at once and how many that plane
+	// reported it can hold. Each operation waiting at a deferred cutover keeps
+	// a driver on the plane that runs it, so admission also refuses the apply
+	// when its operations on a deployment, beside those of the other admitted
+	// deferred applies on that deployment and environment, exceed what the
+	// deployment reported. Each plane serves one control plane, so the
+	// applies this store holds are every deferred apply that plane runs. It
+	// is read only when DeferredCutoverOperations is two or more, and it is
+	// not persisted.
+	DeferredCutoverDataPlanes []DeferredCutoverDataPlane
+
 	// Engine is the schema change engine: "spirit", "planetscale", etc.
 	Engine string
 
@@ -1387,12 +1400,32 @@ type OperatorServer struct {
 	UpdatedAt time.Time
 }
 
+// DeferredCutoverDataPlane is what deferred cutover admission checks for one
+// deployment whose operations run on another plane's operators.
+type DeferredCutoverDataPlane struct {
+	// Deployment names the deployment.
+	Deployment string
+	// Operations is how many of the deployment's drivers the apply would hold
+	// at a deferred cutover at once.
+	Operations int
+	// LiveServers is how many of the deployment's servers reported their
+	// drivers within its live window.
+	LiveServers int
+	// Capacity is how many drivers those servers leave for deferred work,
+	// together.
+	Capacity int
+}
+
 // DeferredCutoverCapacityError is apply creation refusing an apply deferring
 // its cutover that would keep more drivers waiting there than the live
 // operator servers have left for deferred work. Each waiting operation keeps
 // its driver until an operator cuts it over, so admitting past that capacity
 // would leave every deferred driver waiting on a person.
 type DeferredCutoverCapacityError struct {
+	// Deployment names the deployment whose operators the refusal counted
+	// when they run on another plane, and is empty when it counted this
+	// plane's own.
+	Deployment string
 	// Operations is how many operations the refused apply would hold.
 	Operations int
 	// Reserved is how many operations other admitted deferred applies hold or
@@ -1416,6 +1449,10 @@ func (e *DeferredCutoverCapacityError) ExceedsCapacity() bool {
 }
 
 func (e *DeferredCutoverCapacityError) Error() string {
+	if e.Deployment != "" {
+		return fmt.Sprintf("deferred cutover of %d operations on deployment %s refused: %d of %d deferred cutover drivers on its %d live operator servers are reserved by %v",
+			e.Operations, e.Deployment, e.Reserved, e.Capacity, e.LiveServers, e.HoldingApplyIDs)
+	}
 	return fmt.Sprintf("deferred cutover of %d operations refused: %d of %d deferred cutover drivers on %d live operator servers are reserved by %v",
 		e.Operations, e.Reserved, e.Capacity, e.LiveServers, e.HoldingApplyIDs)
 }
@@ -1430,6 +1467,9 @@ type DeferredCutoverWidth struct {
 	Database        string
 	Environment     string
 	Operations      int
+	// ByDeployment is how many drivers of each deployment the apply holds at
+	// once (DeferredCutoverHeldAtOnceByDeployment).
+	ByDeployment map[string]int
 }
 
 // ApplyOperation represents one child row in the apply_operations table:

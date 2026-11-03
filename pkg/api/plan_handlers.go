@@ -2187,6 +2187,12 @@ func (s *Service) createStoredApply(
 	logRolloutShape(s.logger, plan, req.Environment, members, groups, shardedFanout)
 	if applyOpts.DeferCutover {
 		apply.DeferredCutoverOperations = s.deferredCutoverWidth(groups)
+		if apply.DeferredCutoverOperations > 1 {
+			apply.DeferredCutoverDataPlanes, err = s.deferredCutoverDataPlanes(ctx, plan, req.Environment, applyIdentifier, caller, groups)
+			if err != nil {
+				return nil, 0, err
+			}
+		}
 	}
 
 	storedApplyID, err := s.storage.Applies().CreateWithGroupedOperations(ctx, apply, groups)

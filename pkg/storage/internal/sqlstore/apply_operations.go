@@ -320,6 +320,7 @@ func listActiveDeferredCutoverWidths(ctx context.Context, q rowsQueryer, dialect
 	flush := func() {
 		if len(widths) > 0 {
 			widths[len(widths)-1].Operations = storage.DeferredCutoverHeldAtOnce(ops, maxDriversPerApply)
+			widths[len(widths)-1].ByDeployment = storage.DeferredCutoverHeldAtOnceByDeployment(ops, maxDriversPerApply)
 		}
 		ops = nil
 	}

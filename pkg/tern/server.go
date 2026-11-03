@@ -24,6 +24,11 @@ type Server struct {
 	// WithStorageSchemaService, and while it is nil those RPCs are refused
 	// rather than answered against something else.
 	storageSchema StorageSchemaService
+	// operatorServers is the registry of this instance's own operator
+	// servers, which Health reads to report how many operations they can hold
+	// at a deferred cutover. It is nil unless the embedder supplies it with
+	// WithDeferredCutoverCapacity, and while it is nil Health reports none.
+	operatorServers storage.OperatorServerStore
 }
 
 var _ ternv1.TernServer = (*Server)(nil)
@@ -38,6 +43,17 @@ type ServerOption func(*Server)
 // plane rather than leaving it to read some other database's schema.
 func WithStorageSchemaService(service StorageSchemaService) ServerOption {
 	return func(s *Server) { s.storageSchema = service }
+}
+
+// WithDeferredCutoverCapacity lets this endpoint's health check report how
+// many operations its operators can hold at a deferred cutover at once, read
+// from the operator servers registry in this instance's own storage. Each
+// operation a control plane sends here keeps one of these operators' drivers
+// while it waits at its cutover, so a control plane refuses an apply started
+// with --defer-cutover that would not fit, and refuses it outright when this
+// endpoint does not report the capacity.
+func WithDeferredCutoverCapacity(servers storage.OperatorServerStore) ServerOption {
+	return func(s *Server) { s.operatorServers = servers }
 }
 
 // NewServer creates a gRPC server wrapping a Client. The logger carries the
@@ -144,7 +160,27 @@ func (s *Server) Health(ctx context.Context, req *ternv1.HealthRequest) (*ternv1
 		}
 		return nil, status.Error(codes.Unavailable, "service unavailable")
 	}
-	return &ternv1.HealthResponse{Status: "ok"}, nil
+	resp := &ternv1.HealthResponse{Status: "ok"}
+	if s.operatorServers == nil {
+		return resp, nil
+	}
+	servers, err := s.operatorServers.ListLive(ctx)
+	if err != nil {
+		s.logger.WarnContext(ctx, "tern health check could not read the live operator servers; reporting deployment unavailable to caller", "error", err)
+		return nil, status.Error(codes.Unavailable, "service unavailable")
+	}
+	resp.DeferredCutover = deferredCutoverCapacity(servers)
+	return resp, nil
+}
+
+// deferredCutoverCapacity sums the deferred cutover drivers of the live
+// operator servers.
+func deferredCutoverCapacity(servers []*storage.OperatorServer) *ternv1.DeferredCutoverCapacity {
+	capacity := &ternv1.DeferredCutoverCapacity{LiveServers: int32(len(servers))}
+	for _, server := range servers {
+		capacity.Drivers += int32(server.DeferredCutoverDrivers)
+	}
+	return capacity
 }
 
 // callerAbandonedHealthCheck reports whether a failed health check ended because

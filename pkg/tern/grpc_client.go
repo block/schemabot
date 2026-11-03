@@ -1743,6 +1743,22 @@ func (c *GRPCClient) Health(ctx context.Context) error {
 	return err
 }
 
+// DeferredCutoverCapacity reads, from the deployment's health check, how many
+// operations its operators can hold at a deferred cutover at once. It returns
+// nil without an error when the deployment does not report it, which a
+// deployment running an older SchemaBot does not.
+func (c *GRPCClient) DeferredCutoverCapacity(ctx context.Context) (*DeferredCutoverCapacity, error) {
+	resp, err := c.client.Health(ctx, &ternv1.HealthRequest{})
+	if err != nil {
+		return nil, fmt.Errorf("read deferred cutover capacity from health check: %w", err)
+	}
+	reported := resp.GetDeferredCutover()
+	if reported == nil {
+		return nil, nil
+	}
+	return &DeferredCutoverCapacity{LiveServers: int(reported.GetLiveServers()), Drivers: int(reported.GetDrivers())}, nil
+}
+
 // applyTaskScope selects which task rows the remote drive re-queries and where
 // the remote Tern apply id for the drive is read and written. The zero value
 // scopes to the whole apply (all its operations) and uses the parent
