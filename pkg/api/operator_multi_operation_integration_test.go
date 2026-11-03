@@ -362,21 +362,23 @@ func TestOperatorMultiOperationMatrix(t *testing.T) {
 		requestPendingStop(t, ctx, stor, seed.applyID)
 
 		rec := &driveRecorder{}
-		// Stop reconciliation drives the data-plane stop through the apply's
-		// deployment client before terminalizing the pending siblings, so every
-		// deployment must resolve to a client — as it always does in production,
-		// where Config.Validate ties each deployment to a configured tern
-		// deployment. No operation is driven under a pending stop (the claim gate
-		// blocks the pending sibling and the stop path uses the whole-apply drive),
-		// so these outcomes are never reached via ResumeApplyOperation.
-		svc := newMatrixService(t, stor, matrixClients(stor, rec, map[string]matrixOutcome{
+		// The pending sibling never started, so stop reconciliation stops it in
+		// storage without any drive: no operation is driven under a pending
+		// stop, and the whole-apply drive, which would read the rollout's
+		// missing parent remote apply as an ambiguous dispatch, never runs.
+		clients := matrixClients(stor, rec, map[string]matrixOutcome{
 			"region-a": {taskState: state.Task.Failed},
 			"region-b": {taskState: state.Task.Pending},
-		}))
+		})
+		svc := newMatrixService(t, stor, clients)
 
 		svc.recoverApplies(ctx, 1, openClaimGate())
 
 		assert.Empty(t, rec.resumeOrder(), "stop reconciliation must not drive any operation")
+		for deployment, client := range clients {
+			assert.Nil(t, client.(*matrixTernClient).resumeApply,
+				"%s: a never-started member is stopped in storage, without a whole-apply drive", deployment)
+		}
 		assert.Equal(t, state.ApplyOperation.Stopped, opState(t, ctx, stor, seed.opID("region-b")),
 			"the pending sibling must be stopped, not started, under a pending stop")
 		apply := getApply(t, ctx, stor, seed.applyID)
@@ -437,10 +439,12 @@ func TestOperatorMultiOperationMatrix(t *testing.T) {
 
 	t.Run("CancelDuringStopReconciliationCancelsPendingSiblings", func(t *testing.T) {
 		resetMatrixTables(t, ctx, db)
-		// Stop reconciliation picks up a continue rollout with a queued stop,
-		// and the operator escalates to cancel while its drive is running. The
-		// cancel is the latest intent, so the pending sibling settles cancelled
-		// rather than stopped, and the rollout cannot be resumed by a start.
+		// Stop reconciliation picks up a continue rollout with a queued stop
+		// whose pending sibling's task the data plane has already started, so
+		// it drives the stop through the data plane, and the operator escalates
+		// to cancel while that drive is running. The cancel is the latest
+		// intent, so the pending sibling settles cancelled rather than stopped,
+		// and the rollout cannot be resumed by a start.
 		seed := seedGroupedApply(t, ctx, stor, multiOpSeed{
 			applyIdentifier: "matrix-stop-then-cancel",
 			parentState:     state.Apply.RunningDegraded,
@@ -453,7 +457,7 @@ func TestOperatorMultiOperationMatrix(t *testing.T) {
 			},
 			perTaskState: map[string]string{
 				"region-a": state.Task.Failed,
-				"region-b": state.Task.Pending,
+				"region-b": state.Task.Running,
 			},
 		})
 		requestPendingStop(t, ctx, stor, seed.applyID)
@@ -461,7 +465,7 @@ func TestOperatorMultiOperationMatrix(t *testing.T) {
 		rec := &driveRecorder{}
 		clients := matrixClients(stor, rec, map[string]matrixOutcome{
 			"region-a": {taskState: state.Task.Failed},
-			"region-b": {taskState: state.Task.Pending},
+			"region-b": {taskState: state.Task.Running},
 		})
 		for deployment, client := range clients {
 			clients[deployment] = &cancelDuringDriveClient{matrixTernClient: client.(*matrixTernClient)}

@@ -1902,10 +1902,10 @@ func (s *Service) recoverApplyOperationCutover(ctx context.Context, driverID int
 // In each, the claim gate keeps the pending operations from starting while the
 // request pends, so the normal operation-claim path never drives the apply and
 // its request would strand forever. This path claims the apply directly. A
-// cancel whose rollout members never started settles them in storage; otherwise
-// the request is driven through the data plane so the engine halts and the
-// tasks settle, and the pending operation rows are then terminalized from what
-// the drive landed. Finally the parent is re-derived and the request is
+// request whose rollout members never started settles them in storage;
+// otherwise the request is driven through the data plane so the engine halts
+// and the tasks settle, and the pending operation rows are then terminalized
+// from what the drive landed. Finally the parent is re-derived and the request is
 // completed once it has reached every operation.
 //
 // The pass is spent when an apply was claimed, whether the reconciliation that
@@ -1953,34 +1953,40 @@ func (s *Service) recoverApplyPendingStop(ctx context.Context, driverID int, own
 				"driver", driverID, "error", err)...)
 		return claimSpent
 	}
-	if cancelPending != nil {
-		// A rollout's pending members that no engine ever took up have nothing
-		// on any target to halt, so the cancel settles them in storage alone.
-		// The whole-apply drive is not used for them: a rollout's remote
-		// applies belong to its operations, not to the parent, so that drive
-		// would read the parent's missing remote apply as an ambiguous
-		// dispatch and fail the rollout instead of cancelling it.
-		settles, err := s.cancelSettlesWithoutEngine(applyLeaseCtx, apply)
-		if err != nil {
-			s.logger.Error("operator: failed to inspect pending operations during stop reconciliation; apply left for the next tick",
-				append(apply.LogAttrs(),
-					"driver", driverID, "error", err)...)
-			return claimSpent
-		}
-		if settles {
-			s.logger.Info("operator: cancelling never-started rollout members in storage; no engine work exists to halt",
-				append(apply.LogAttrs(), "driver", driverID)...)
+	// A rollout's pending members that no engine ever took up have nothing on
+	// any target to halt, so the request settles them in storage alone, as
+	// cancelled under a cancel and stopped under a stop. The whole-apply drive
+	// is not used for them: a rollout's remote applies belong to its
+	// operations, not to the parent, so that drive would read the parent's
+	// missing remote apply as an ambiguous dispatch and fail the rollout
+	// instead of stopping or cancelling it.
+	neverStarted, err := s.rolloutPendingMembersNeverStarted(applyLeaseCtx, apply)
+	if err != nil {
+		s.logger.Error("operator: failed to inspect pending operations during stop reconciliation; apply left for the next tick",
+			append(apply.LogAttrs(),
+				"driver", driverID, "error", err)...)
+		return claimSpent
+	}
+	if neverStarted {
+		s.logger.Info("operator: settling never-started rollout members in storage; no engine work exists to halt",
+			append(apply.LogAttrs(), "driver", driverID, "cancel", cancelPending != nil)...)
+		if cancelPending != nil {
 			if err := s.markPendingOperationsCancelled(applyLeaseCtx, driverID, apply); err != nil {
 				s.logger.Error("operator: failed to cancel never-started rollout members during stop reconciliation",
 					append(apply.LogAttrs(),
 						"driver", driverID, "error", err)...)
 				return claimSpent
 			}
-			return s.settleStopReconciliation(applyLeaseCtx, driverID, apply)
+		} else if err := s.markPendingOperationsStopped(applyLeaseCtx, driverID, apply); err != nil {
+			s.logger.Error("operator: failed to stop never-started rollout members during stop reconciliation",
+				append(apply.LogAttrs(),
+					"driver", driverID, "error", err)...)
+			return claimSpent
 		}
-		s.logger.Info("operator: a pending operation may hold engine work; driving the cancel through the data plane",
-			append(apply.LogAttrs(), "driver", driverID)...)
+		return s.settleStopReconciliation(applyLeaseCtx, driverID, apply)
 	}
+	s.logger.Info("operator: a pending operation may hold engine work; driving the request through the data plane",
+		append(apply.LogAttrs(), "driver", driverID, "cancel", cancelPending != nil)...)
 
 	// Drive the pending stop through the data plane before terminalizing any
 	// rows. The data-plane drive (ResumeApply -> processPendingStopControlRequest
@@ -2042,13 +2048,13 @@ func (s *Service) recoverApplyPendingStop(ctx context.Context, driverID int, own
 	return s.settleStopReconciliation(applyLeaseCtx, driverID, apply)
 }
 
-// cancelSettlesWithoutEngine reports whether a pending cancel can settle a
-// rollout's pending members in storage alone: the apply is a rollout of more
-// than one operation, and every pending operation is one no engine ever took
-// up, never claimed, holding no remote apply, and with every task still
-// pending. A single-operation apply is always driven, because its pending
-// operation can carry a task the data plane already started.
-func (s *Service) cancelSettlesWithoutEngine(ctx context.Context, apply *storage.Apply) (bool, error) {
+// rolloutPendingMembersNeverStarted reports whether a pending stop or cancel
+// can settle a rollout's pending members in storage alone: the apply is a
+// rollout of more than one operation, and every pending operation is one no
+// engine ever took up, never claimed, holding no remote apply, and with every
+// task still pending. A single-operation apply is always driven, because its
+// pending operation can carry a task the data plane already started.
+func (s *Service) rolloutPendingMembersNeverStarted(ctx context.Context, apply *storage.Apply) (bool, error) {
 	ops, err := s.storage.ApplyOperations().ListByApply(ctx, apply.ID)
 	if err != nil {
 		return false, fmt.Errorf("list apply_operations for apply %s: %w", apply.ApplyIdentifier, err)
