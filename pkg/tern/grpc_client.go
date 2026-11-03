@@ -3231,6 +3231,9 @@ func (c *GRPCClient) resumeApply(ctx context.Context, apply *storage.Apply, scop
 	if standDown, err := c.processPendingCancelOrStopControlRequest(ctx, apply, scope); standDown || err != nil {
 		return err
 	}
+	if handBackAfterControlDelivery(ctx, apply, logger) {
+		return ErrDeferredCutoverDriveHandedBack
+	}
 	if err := c.processPendingCutoverControlRequest(ctx, apply, scope); err != nil {
 		return err
 	}

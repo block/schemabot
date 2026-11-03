@@ -1877,7 +1877,8 @@ func TestApplyOperations(t *testing.T, h Harness) {
 	// starts or recovers an operation of an apply deferring its cutover, so it
 	// takes the regular apply's operation even though the deferred one queued
 	// first, and leaves the deferred one to the other drivers. It still claims
-	// a deferred operation to deliver a cancel, since that ends the work.
+	// a deferred operation to deliver a stop or cancel, since that ends the
+	// work, including recovering a crashed drive of one with a stop pending.
 	t.Run("FindNextApplyOperation_SkipDeferredCutoverWork", func(t *testing.T) {
 		ctx := t.Context()
 		store := h.NewStorage(t)
@@ -1930,11 +1931,84 @@ func TestApplyOperations(t *testing.T, h Harness) {
 		require.NotNil(t, got, "any other driver recovers the deferred apply's stale operation")
 		assert.Equal(t, deferredOp, got.ID)
 
+		released, err = store.ApplyOperations().ReleaseClaim(ctx, got.Lease())
+		require.NoError(t, err)
+		require.True(t, released)
+		requestControl(t, store, deferredApply.ID, storage.ControlOperationStop)
+		got = claimSkipping()
+		require.NotNil(t, got, "the reserved driver recovers the deferred apply's stale operation to deliver its pending stop")
+		assert.Equal(t, deferredOp, got.ID)
+
 		require.NoError(t, store.ApplyOperations().UpdateState(ctx, deferredOp, state.ApplyOperation.Stopped))
 		requestControl(t, store, deferredApply.ID, storage.ControlOperationCancel)
 		got = claimSkipping()
 		require.NotNil(t, got, "the reserved driver still delivers a cancel to the deferred apply")
 		assert.Equal(t, deferredOp, got.ID)
+	})
+
+	// FindNextApplyOperation_SkipDeferredCutoverWorkRecoversForStopOrCancel
+	// verifies both arms that recover a crashed drive of an apply deferring its
+	// cutover: the stale-active arm, and the failed_retryable arm's
+	// crash-recovery branch. The reserved driver leaves each to the other
+	// drivers until a stop or cancel is pending, then recovers it so the
+	// request is delivered, for either request.
+	t.Run("FindNextApplyOperation_SkipDeferredCutoverWorkRecoversForStopOrCancel", func(t *testing.T) {
+		for _, arm := range []struct {
+			name    string
+			opState string
+		}{
+			{"stale active", state.ApplyOperation.Running},
+			{"crashed retry", state.ApplyOperation.FailedRetryable},
+		} {
+			for _, request := range []storage.ControlOperation{storage.ControlOperationStop, storage.ControlOperationCancel} {
+				t.Run(arm.name+" "+string(request), func(t *testing.T) {
+					ctx := t.Context()
+					store := h.NewStorage(t)
+
+					// A running parent whose driver crashed: claimed, then
+					// released, which backdates its heartbeat past the
+					// staleness window.
+					apply := CreateClaimedApply(t, store, CreateLock(t, store, "operation_deferred_recovery_db", storage.DatabaseTypeMySQL), "apply_operation_deferred_recovery", 941, "crashed-driver")
+					apply.State = state.Apply.Running
+					apply.Options = []byte(`{"defer_cutover":true}`)
+					require.NoError(t, store.Applies().Update(ctx, apply))
+					released, err := store.Applies().ReleaseClaim(ctx, apply.Lease())
+					require.NoError(t, err)
+					require.True(t, released)
+
+					// Its operation, left in the arm's state by the crashed
+					// drive and released the same way.
+					opID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+						ApplyID: apply.ID, Deployment: "region-a",
+						OperationKey:  "commerce/-80/users",
+						OperationKind: storage.ApplyOperationKindWork,
+					})
+					require.NoError(t, err)
+					crashed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "crashed-driver")
+					require.NoError(t, err)
+					require.NotNil(t, crashed, "the crashed driver had claimed the operation")
+					require.Equal(t, opID, crashed.ID)
+					require.NoError(t, store.ApplyOperations().UpdateState(ctx, opID, arm.opState))
+					released, err = store.ApplyOperations().ReleaseClaim(ctx, crashed.Lease())
+					require.NoError(t, err)
+					require.True(t, released)
+
+					claimSkipping := func() *storage.ApplyOperation {
+						t.Helper()
+						got, err := store.ApplyOperations().FindNextApplyOperation(ctx, "reserved-driver", storage.SkipDeferredCutoverWork())
+						require.NoError(t, err)
+						return got
+					}
+					assert.Nil(t, claimSkipping(), "the reserved driver leaves the crashed deferred drive to the other drivers")
+
+					requestControl(t, store, apply.ID, request)
+					got := claimSkipping()
+					require.NotNil(t, got, "the reserved driver recovers the crashed deferred drive to deliver its pending %s", request)
+					assert.Equal(t, opID, got.ID)
+					assert.Equal(t, arm.opState, got.State, "recovery keeps the state the crashed drive left")
+				})
+			}
+		}
 	})
 
 	// LeaseGuardsSingleAndJoinedWrites verifies both guarded DML shapes. An
