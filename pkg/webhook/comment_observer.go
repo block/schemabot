@@ -520,6 +520,14 @@ func (o *CommentObserver) OnTerminal(apply *storage.Apply, tasks []*storage.Task
 	if !o.leaseStillOwnsObserver(apply, "terminal") {
 		return
 	}
+	// A resume rotation whose marker write failed still owes it. Settling it
+	// now, with the apply terminal, marks the marker rotated past, so the
+	// summary claim below is not blocked by the summary the rotation already
+	// rotated away. A failure here leaves the marker as it was: the claim then
+	// loses to it, and summary reconciliation cannot tell that summary is owed.
+	if o.resumeSupersedePending {
+		o.supersedeResumeSummaryMarker(apply)
+	}
 	// A rotation's fresh comment may be live on the PR but still untracked —
 	// the tracking write failed and no later progress tick landed the
 	// adoption. This is the last chance to adopt it: on success the terminal
@@ -1219,8 +1227,8 @@ func (o *CommentObserver) rotateProgressCommentForResume(apply *storage.Apply, t
 // record that the rotation happened — left unconsumed, the marker keeps
 // advertising a summary that was already rotated away, and the next terminal
 // publish of the same state would lose its claim and never post its summary.
-// On failure the pending flag keeps later ticks retrying just this write until
-// it lands.
+// On failure the pending flag keeps later ticks, and the terminal publish,
+// retrying just this write until it lands.
 //
 // The write consumes only the summary the rotation saw, and only while the
 // apply is still active. The apply can reach its next terminal state while the
@@ -1230,37 +1238,32 @@ func (o *CommentObserver) rotateProgressCommentForResume(apply *storage.Apply, t
 // the summary the rotation saw, consuming it would leave the apply's next
 // resume nothing to rotate on, so the rotation instead marks it rotated past:
 // it stays active for that resume, and no longer blocks the summary the
-// terminal state is owed.
+// terminal state is owed. Storage picks between the two in one write, under a
+// lock on the apply row, so a stop and a start landing in quick succession
+// cannot slip between a consume that saw the apply terminal and a mark that
+// saw it active again.
 func (o *CommentObserver) supersedeResumeSummaryMarker(apply *storage.Apply) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	leaseCtx := o.contextWithApplyLease(ctx, apply)
-	consumed, err := o.stor.ApplyComments().SupersedeSummaryForResume(leaseCtx, o.applyID, o.resumeSummaryCommentID)
+	settled, err := o.stor.ApplyComments().SettleSummaryForResume(o.contextWithApplyLease(ctx, apply), o.applyID, o.resumeSummaryCommentID)
 	if err != nil {
 		o.resumeSupersedePending = true
-		o.logError(apply, "observer: failed to consume summary marker after resume rotation; retrying on the next tick",
-			"error", err, "summary_comment_id", o.resumeSummaryCommentID)
-		return
-	}
-	if consumed {
-		o.resumeSupersedePending = false
-		return
-	}
-	rotatedPast, err := o.stor.ApplyComments().MarkSummaryRotatedPast(leaseCtx, o.applyID, o.resumeSummaryCommentID)
-	if err != nil {
-		o.resumeSupersedePending = true
-		o.logError(apply, "observer: failed to mark summary marker rotated past after resume rotation; retrying on the next tick",
+		o.logError(apply, "observer: failed to settle summary marker after resume rotation; retrying on the next tick or at the terminal publish",
 			"error", err, "summary_comment_id", o.resumeSummaryCommentID)
 		return
 	}
 	o.resumeSupersedePending = false
-	if rotatedPast {
+	switch settled {
+	case storage.ResumeSummaryConsumed:
+		o.logDebug(apply, "observer: consumed the summary marker the resume rotation rotated for",
+			"summary_comment_id", o.resumeSummaryCommentID)
+	case storage.ResumeSummaryRotatedPast:
 		o.logInfo(apply, "observer: apply reached another terminal state during resume rotation; summary marker kept for the next resume and marked rotated past so that state's summary posts",
 			"summary_comment_id", o.resumeSummaryCommentID)
-		return
+	default:
+		o.logInfo(apply, "observer: summary marker left in place after resume rotation; it records a later terminal summary, or the rotation already consumed it",
+			"summary_comment_id", o.resumeSummaryCommentID)
 	}
-	o.logInfo(apply, "observer: summary marker left in place after resume rotation; it records a later terminal summary, or the apply resumed again and its next rotation consumes it",
-		"summary_comment_id", o.resumeSummaryCommentID)
 }
 
 // Control-operation phases recorded on tracked progress comments

@@ -2197,6 +2197,26 @@ type TaskFilter struct {
 // claim to the marker.
 const SummaryRotatedPast = "rotated_past"
 
+// ResumeSummarySettlement is what a resume rotation's write did to the summary
+// marker it rotated for.
+type ResumeSummarySettlement int
+
+const (
+	// ResumeSummaryLeftInPlace means the marker no longer records the summary
+	// the rotation rotated for: it was already consumed, or a later terminal
+	// publish has claimed or posted it. The write left it alone.
+	ResumeSummaryLeftInPlace ResumeSummarySettlement = iota
+	// ResumeSummaryConsumed means the apply was still active, so the write
+	// superseded the marker and the apply's next terminal publish claims a
+	// fresh summary.
+	ResumeSummaryConsumed
+	// ResumeSummaryRotatedPast means the apply had already reached its next
+	// terminal state, so the write marked the marker SummaryRotatedPast: it
+	// stays active for the next resume and no longer blocks that state's
+	// summary.
+	ResumeSummaryRotatedPast
+)
+
 // ApplyComment tracks a GitHub PR comment associated with an apply.
 type ApplyComment struct {
 	// ID is the unique identifier (BIGINT AUTO_INCREMENT).

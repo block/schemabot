@@ -1029,7 +1029,9 @@ type ApplyStore interface {
 	// resumable stop keeps completed_at NULL) but whose progress comment was
 	// never followed by a summary comment — no summary marker exists, the
 	// marker is superseded (a stop's summary consumed by a resume rotation, so
-	// the current terminal state's summary was never posted), or only a claim
+	// the current terminal state's summary was never posted), the posted
+	// marker records a state other than the apply's current one (a summary of
+	// an earlier terminal state, or one a resume rotated past), or only a claim
 	// sentinel stale for longer than SummaryClaimStaleAfter remains from a
 	// publisher that crashed before posting. "Recently" is MissingSummaryLookback.
 	// An apply qualifies only once it has been terminal for at least settledFor,
@@ -1378,8 +1380,11 @@ type ApplyCommentStore interface {
 	// different terminal state the apply can leave, such as a stop's summary
 	// when the started apply completes before any rotation consumed it. A
 	// marker for a settled state blocks every claim, since that outcome is
-	// final and a claim for another state comes from a stale read. Exactly one
-	// caller wins per terminal state: the winner posts the summary and records
+	// final and a claim for another state comes from a stale read. An active
+	// marker for a different state converts only while the apply is still in
+	// terminalState, so a claim read before the apply was started again cannot
+	// record a summary of a state the apply has left. Exactly one caller wins
+	// per terminal state: the winner posts the summary and records
 	// the real comment ID and the state it describes via Upsert; every loser
 	// skips. The claim — not the apply lease — is the exactly-once authority
 	// for the summary, so a writer whose lease was re-claimed (stop
@@ -1387,23 +1392,19 @@ type ApplyCommentStore interface {
 	// duplicate. Returns true when this caller won the claim.
 	ClaimSummaryComment(ctx context.Context, applyID int64, terminalState string) (bool, error)
 
-	// SupersedeSummaryForResume consumes the summary marker a resume rotation
-	// rotated for, so the apply's next terminal publish claims a fresh summary.
-	// It supersedes the marker only while the marker still records
-	// githubCommentID and the apply is still active, and reports whether it
-	// did. A terminal publish that came after the summary the rotation saw owns
-	// the marker from then on, and consuming it would cost that publish its
-	// summary or the apply's next resume its rotation.
-	SupersedeSummaryForResume(ctx context.Context, applyID int64, githubCommentID int64) (bool, error)
-
-	// MarkSummaryRotatedPast records that a resume rotation rotated past the
-	// summary marker while the apply had already reached its next terminal
-	// state: it sets the marker's SummarizedState to SummaryRotatedPast, only
-	// while the marker is active, still records githubCommentID, and the apply
-	// is terminal, and reports whether it did. The marker stays active for the
-	// next resume to rotate on, and the terminal state the apply reached is
-	// still owed its own summary, which the marker no longer blocks.
-	MarkSummaryRotatedPast(ctx context.Context, applyID int64, githubCommentID int64) (bool, error)
+	// SettleSummaryForResume settles the summary marker a resume rotation
+	// rotated for, in one write decided under a lock on the apply row, and
+	// reports what it did. It touches the marker only while the marker is
+	// active and still records githubCommentID: a terminal publish that came
+	// after the summary the rotation saw owns the marker from then on. While
+	// the apply is active it consumes the marker, so the apply's next terminal
+	// publish claims a fresh summary. Once the apply has reached its next
+	// terminal state it marks the marker SummaryRotatedPast instead: consuming
+	// it would leave the next resume nothing to rotate on, and leaving it
+	// as it was would block the summary that state is owed. With a lease in
+	// context the write requires it, and a lost lease surfaces as
+	// ErrApplyLeaseLost.
+	SettleSummaryForResume(ctx context.Context, applyID int64, githubCommentID int64) (ResumeSummarySettlement, error)
 
 	// ReclaimStaleSummaryClaim takes over a summary claim sentinel whose holder
 	// crashed between claiming and posting: a sentinel (github_comment_id = 0)

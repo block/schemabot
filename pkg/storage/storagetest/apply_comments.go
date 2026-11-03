@@ -2,6 +2,7 @@ package storagetest
 
 import (
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -384,14 +385,16 @@ func TestApplyComments(t *testing.T, h Harness) {
 	// exactly once. A claim for the state the marker already describes loses,
 	// a marker for a settled state blocks every claim because a settled
 	// outcome is final, and a marker recorded without its state blocks every
-	// claim, as it did before the state was tracked.
+	// claim, as it did before the state was tracked. A claim for a state the
+	// apply has already left, such as a reconciliation pass that read a
+	// stopped apply before it was started again, never converts the marker.
 	t.Run("ClaimSummaryCommentForAnotherTerminalState", func(t *testing.T) {
 		ctx := t.Context()
 		store := h.NewStorage(t)
 		stopped := state.Apply.Stopped
 
 		lock := CreateLock(t, store, "comment_claim_state_db", storage.DatabaseTypeMySQL)
-		apply := CreateApply(t, store, lock, "apply_comment_claim_state", 715)
+		apply := CreateApplyWithStateAndEnv(t, store, lock, "apply_comment_claim_state", 715, state.Apply.Completed, "staging")
 
 		require.NoError(t, store.ApplyComments().Upsert(ctx, &storage.ApplyComment{
 			ApplyID: apply.ID, CommentState: state.Comment.Summary, GitHubCommentID: 9101, SummarizedState: &stopped,
@@ -436,16 +439,38 @@ func TestApplyComments(t *testing.T, h Harness) {
 			require.NoError(t, err)
 			assert.False(t, won, "a %s summary must block a claim from a stale stopped read, since a settled outcome is final", settled)
 		}
+
+		rotatedPast := storage.SummaryRotatedPast
+		startedLock := CreateLock(t, store, "comment_claim_started_db", storage.DatabaseTypeMySQL)
+		started := CreateApplyWithStateAndEnv(t, store, startedLock, "apply_comment_claim_started", 718, state.Apply.Running, "staging")
+		for _, marker := range []*string{&rotatedPast, &stopped} {
+			require.NoError(t, store.ApplyComments().Upsert(ctx, &storage.ApplyComment{
+				ApplyID: started.ID, CommentState: state.Comment.Summary, GitHubCommentID: 9120, SummarizedState: marker,
+			}))
+			won, err = store.ApplyComments().ClaimSummaryComment(ctx, started.ID, state.Apply.Stopped)
+			require.NoError(t, err)
+			assert.False(t, won, "a stopped claim must not convert a %s marker once the apply has been started again", *marker)
+			won, err = store.ApplyComments().ClaimSummaryComment(ctx, started.ID, state.Apply.Completed)
+			require.NoError(t, err)
+			assert.False(t, won, "a completed claim must not convert a %s marker while the apply is still running", *marker)
+
+			kept, err := store.ApplyComments().Get(ctx, started.ID, state.Comment.Summary)
+			require.NoError(t, err)
+			require.NotNil(t, kept)
+			assert.Equal(t, int64(9120), kept.GitHubCommentID, "a losing claim leaves the posted summary in place")
+			require.NotNil(t, kept.SummarizedState)
+			assert.Equal(t, *marker, *kept.SummarizedState)
+		}
 	})
 
-	// SupersedeSummaryForResume verifies a resume rotation consumes only the
-	// summary it rotated for, and only while the apply is active: a marker
-	// that records another comment or has become a claim sentinel belongs to a
-	// later terminal publish, and an apply that is terminal again keeps the
-	// marker for its next resume. The rotation marks that marker rotated past
-	// instead, which keeps it active but lets the terminal state's own summary
-	// claim it. Both writes are fenced on the drive's lease.
-	t.Run("SupersedeSummaryForResume", func(t *testing.T) {
+	// SettleSummaryForResume verifies a resume rotation settles only the
+	// summary it rotated for. While the apply is active it consumes the
+	// marker; once the apply is terminal again it marks the marker rotated
+	// past, which keeps it active for the next resume but lets the terminal
+	// state's own summary claim it. A marker that records another comment or
+	// has become a claim sentinel belongs to a later terminal publish and is
+	// left in place. The write is fenced on the drive's lease.
+	t.Run("SettleSummaryForResume", func(t *testing.T) {
 		ctx := t.Context()
 		store := h.NewStorage(t)
 
@@ -458,81 +483,67 @@ func TestApplyComments(t *testing.T, h Harness) {
 			ApplyID: apply.ID, Owner: "old-driver", Token: "stale-token",
 		})
 
-		_, err := store.ApplyComments().SupersedeSummaryForResume(ctx, apply.ID, 0)
-		require.Error(t, err, "a claim sentinel is never consumed by a resume")
+		_, err := store.ApplyComments().SettleSummaryForResume(ctx, apply.ID, 0)
+		require.Error(t, err, "a claim sentinel is never settled by a resume")
 
-		consumed, err := store.ApplyComments().SupersedeSummaryForResume(ctx, apply.ID, 9201)
+		settled, err := store.ApplyComments().SettleSummaryForResume(ctx, apply.ID, 9201)
 		require.NoError(t, err)
-		assert.False(t, consumed, "no summary marker means nothing to consume")
+		assert.Equal(t, storage.ResumeSummaryLeftInPlace, settled, "no summary marker means nothing to settle")
 
 		// A claim sentinel belongs to a terminal publish in flight.
 		won, err := store.ApplyComments().ClaimSummaryComment(ctx, apply.ID, state.Apply.Stopped)
 		require.NoError(t, err)
 		require.True(t, won)
-		consumed, err = store.ApplyComments().SupersedeSummaryForResume(ctx, apply.ID, 9201)
+		settled, err = store.ApplyComments().SettleSummaryForResume(ctx, apply.ID, 9201)
 		require.NoError(t, err)
-		assert.False(t, consumed, "a claim sentinel must be left to its publisher")
+		assert.Equal(t, storage.ResumeSummaryLeftInPlace, settled, "a claim sentinel must be left to its publisher")
 
 		// A marker recording another comment is a later terminal summary.
 		require.NoError(t, store.ApplyComments().Upsert(ctx, &storage.ApplyComment{
 			ApplyID: apply.ID, CommentState: state.Comment.Summary, GitHubCommentID: 9202,
 		}))
-		consumed, err = store.ApplyComments().SupersedeSummaryForResume(ctx, apply.ID, 9201)
+		settled, err = store.ApplyComments().SettleSummaryForResume(ctx, apply.ID, 9201)
 		require.NoError(t, err)
-		assert.False(t, consumed, "a marker recording another summary must be left in place")
+		assert.Equal(t, storage.ResumeSummaryLeftInPlace, settled, "a marker recording another summary must be left in place")
 
 		summary, err := store.ApplyComments().Get(ctx, apply.ID, state.Comment.Summary)
 		require.NoError(t, err)
 		require.NotNil(t, summary)
 		assert.Nil(t, summary.SupersededAt)
 
-		_, err = store.ApplyComments().SupersedeSummaryForResume(staleCtx, apply.ID, 9202)
+		_, err = store.ApplyComments().SettleSummaryForResume(staleCtx, apply.ID, 9202)
 		require.ErrorIs(t, err, storage.ErrApplyLeaseLost)
 		summary, err = store.ApplyComments().Get(ctx, apply.ID, state.Comment.Summary)
 		require.NoError(t, err)
 		require.NotNil(t, summary)
-		assert.Nil(t, summary.SupersededAt, "a stale lease must not consume the summary")
+		assert.Nil(t, summary.SupersededAt, "a stale lease must not settle the summary")
 
-		consumed, err = store.ApplyComments().SupersedeSummaryForResume(ownedCtx, apply.ID, 9202)
+		settled, err = store.ApplyComments().SettleSummaryForResume(ownedCtx, apply.ID, 9202)
 		require.NoError(t, err)
-		assert.True(t, consumed, "the rotated-for summary of an active apply is consumed")
+		assert.Equal(t, storage.ResumeSummaryConsumed, settled, "the rotated-for summary of an active apply is consumed")
 		summary, err = store.ApplyComments().Get(ctx, apply.ID, state.Comment.Summary)
 		require.NoError(t, err)
 		require.NotNil(t, summary)
 		assert.NotNil(t, summary.SupersededAt)
 
-		consumed, err = store.ApplyComments().SupersedeSummaryForResume(ownedCtx, apply.ID, 9202)
+		settled, err = store.ApplyComments().SettleSummaryForResume(ownedCtx, apply.ID, 9202)
 		require.NoError(t, err)
-		assert.False(t, consumed, "an already consumed summary is not consumed again")
+		assert.Equal(t, storage.ResumeSummaryLeftInPlace, settled, "an already consumed summary is not settled again")
 
-		// An apply that is terminal again keeps its summary marker.
+		// An apply that is terminal again keeps its summary marker, marked
+		// rotated past.
 		terminalLock := CreateLock(t, store, "comment_resume_terminal_db", storage.DatabaseTypeMySQL)
 		terminal := CreateApplyWithStateAndEnv(t, store, terminalLock, "apply_comment_resume_terminal", 717, state.Apply.Stopped, "staging")
 		require.NoError(t, store.ApplyComments().Upsert(ctx, &storage.ApplyComment{
 			ApplyID: terminal.ID, CommentState: state.Comment.Summary, GitHubCommentID: 9203,
 		}))
-		consumed, err = store.ApplyComments().SupersedeSummaryForResume(ctx, terminal.ID, 9203)
+		settled, err = store.ApplyComments().SettleSummaryForResume(ctx, terminal.ID, 9299)
 		require.NoError(t, err)
-		assert.False(t, consumed, "a terminal apply's summary must be left in place")
-		summary, err = store.ApplyComments().Get(ctx, terminal.ID, state.Comment.Summary)
-		require.NoError(t, err)
-		require.NotNil(t, summary)
-		assert.Nil(t, summary.SupersededAt)
+		assert.Equal(t, storage.ResumeSummaryLeftInPlace, settled, "a marker recording another summary is not marked rotated past")
 
-		// Marking rotated past applies only to a terminal apply's marker that
-		// still records the rotated-for summary.
-		_, err = store.ApplyComments().MarkSummaryRotatedPast(ctx, terminal.ID, 0)
-		require.Error(t, err, "a claim sentinel is never the rotation's marker")
-		marked, err := store.ApplyComments().MarkSummaryRotatedPast(ctx, apply.ID, 9202)
+		settled, err = store.ApplyComments().SettleSummaryForResume(ctx, terminal.ID, 9203)
 		require.NoError(t, err)
-		assert.False(t, marked, "a consumed marker is not marked rotated past")
-		marked, err = store.ApplyComments().MarkSummaryRotatedPast(ctx, terminal.ID, 9299)
-		require.NoError(t, err)
-		assert.False(t, marked, "a marker recording another summary is not marked rotated past")
-
-		marked, err = store.ApplyComments().MarkSummaryRotatedPast(ctx, terminal.ID, 9203)
-		require.NoError(t, err)
-		assert.True(t, marked)
+		assert.Equal(t, storage.ResumeSummaryRotatedPast, settled)
 		summary, err = store.ApplyComments().Get(ctx, terminal.ID, state.Comment.Summary)
 		require.NoError(t, err)
 		require.NotNil(t, summary)
@@ -544,16 +555,68 @@ func TestApplyComments(t *testing.T, h Harness) {
 		won, err = store.ApplyComments().ClaimSummaryComment(ctx, terminal.ID, state.Apply.Stopped)
 		require.NoError(t, err)
 		assert.True(t, won, "a marker rotated past must not block the summary of the state the apply reached")
+	})
 
-		// Marking an active apply's marker is refused: its rotation consumes it.
-		activeLock := CreateLock(t, store, "comment_resume_active_db", storage.DatabaseTypeMySQL)
-		active := CreateApplyWithStateAndEnv(t, store, activeLock, "apply_comment_resume_active", 718, state.Apply.Running, "staging")
-		require.NoError(t, store.ApplyComments().Upsert(ctx, &storage.ApplyComment{
-			ApplyID: active.ID, CommentState: state.Comment.Summary, GitHubCommentID: 9204,
-		}))
-		marked, err = store.ApplyComments().MarkSummaryRotatedPast(ctx, active.ID, 9204)
+	// FindMissingSummaryCommentForEarlierTerminalState verifies an active
+	// posted summary marker counts as missing when it describes a terminal
+	// state the apply has since left: a stopped apply that was started and
+	// completed is owed its completion summary even though the stop's summary
+	// is still recorded and posted, and a stopped apply whose marker a resume
+	// rotated past is owed its stop summary. A marker for the apply's current
+	// state, and a marker recorded before the summarized state was tracked,
+	// still count as posted.
+	t.Run("FindMissingSummaryCommentForEarlierTerminalState", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		stopped := state.Apply.Stopped
+		completed := state.Apply.Completed
+		rotatedPast := storage.SummaryRotatedPast
+
+		seed := func(name, applyState string, planID int64, summarized *string) *storage.Apply {
+			t.Helper()
+			lock := CreateLock(t, store, name+"_db", storage.DatabaseTypeMySQL)
+			apply := &storage.Apply{
+				ApplyIdentifier: name,
+				LockID:          lock.ID,
+				PlanID:          planID,
+				Database:        lock.DatabaseName,
+				DatabaseType:    lock.DatabaseType,
+				Repository:      lock.Repository,
+				PullRequest:     lock.PullRequest,
+				Environment:     "staging",
+				InstallationID:  12345,
+				Engine:          storage.EngineForType(lock.DatabaseType),
+				State:           applyState,
+			}
+			id, err := store.Applies().Create(ctx, apply)
+			require.NoError(t, err)
+			apply.ID = id
+			if applyState != state.Apply.Stopped {
+				now := time.Now()
+				apply.CompletedAt = &now
+				require.NoError(t, store.Applies().Update(ctx, apply))
+			}
+			require.NoError(t, store.ApplyComments().Upsert(ctx, &storage.ApplyComment{
+				ApplyID: apply.ID, CommentState: state.Comment.Progress, GitHubCommentID: planID * 10,
+			}))
+			require.NoError(t, store.ApplyComments().Upsert(ctx, &storage.ApplyComment{
+				ApplyID: apply.ID, CommentState: state.Comment.Summary, GitHubCommentID: planID*10 + 1, SummarizedState: summarized,
+			}))
+			return apply
+		}
+
+		earlier := seed("apply_summary_for_stop", state.Apply.Completed, 730, &stopped)
+		seed("apply_summary_for_completion", state.Apply.Completed, 731, &completed)
+		seed("apply_summary_untracked", state.Apply.Completed, 732, nil)
+		stoppedAgain := seed("apply_summary_rotated_past", state.Apply.Stopped, 733, &rotatedPast)
+
+		applies, err := store.Applies().FindMissingSummaryComment(ctx, 0, 100)
 		require.NoError(t, err)
-		assert.False(t, marked, "an active apply's marker is consumed, never marked rotated past")
+		identifiers := make([]string, 0, len(applies))
+		for _, apply := range applies {
+			identifiers = append(identifiers, apply.ApplyIdentifier)
+		}
+		assert.ElementsMatch(t, []string{earlier.ApplyIdentifier, stoppedAgain.ApplyIdentifier}, identifiers)
 	})
 
 	// ClaimProgressCommentAuthority verifies the durable progress-comment edit
