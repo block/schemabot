@@ -2258,6 +2258,35 @@ type TaskFilter struct {
 	Since            time.Time // Only tasks started after this time (optional)
 }
 
+// SummaryRotatedPast is the SummarizedState of a summary marker a resume
+// rotation rotated past after the apply had already reached its next terminal
+// state, so the summary it records describes no state the apply is in. The
+// marker stays active, so the next resume still rotates on it, but it names no
+// terminal state: the publish of the state the apply reached reclaims it, and
+// summary reconciliation posts that summary when the publish already lost its
+// claim to the marker.
+const SummaryRotatedPast = "rotated_past"
+
+// ResumeSummarySettlement is what a resume rotation's write did to the summary
+// marker it rotated for.
+type ResumeSummarySettlement int
+
+const (
+	// ResumeSummaryLeftInPlace means the marker no longer records the summary
+	// the rotation rotated for: it was already consumed, or a later terminal
+	// publish has claimed or posted it. The write left it alone.
+	ResumeSummaryLeftInPlace ResumeSummarySettlement = iota
+	// ResumeSummaryConsumed means the apply was still active, so the write
+	// superseded the marker and the apply's next terminal publish claims a
+	// fresh summary.
+	ResumeSummaryConsumed
+	// ResumeSummaryRotatedPast means the apply had already reached its next
+	// terminal state, so the write marked the marker SummaryRotatedPast: it
+	// stays active for the next resume and no longer blocks that state's
+	// summary.
+	ResumeSummaryRotatedPast
+)
+
 // ApplyComment tracks a GitHub PR comment associated with an apply.
 type ApplyComment struct {
 	// ID is the unique identifier (BIGINT AUTO_INCREMENT).
@@ -2311,6 +2340,17 @@ type ApplyComment struct {
 	// the GitHub comment are kept; SchemaBot just no longer treats it as the active
 	// comment for its state. Nil means active.
 	SupersededAt *time.Time
+
+	// SummarizedState is, on the summary marker, the terminal apply state its
+	// posted summary describes. A stopped apply can be started and reach
+	// another terminal state, and the marker of the stop's summary can still
+	// be active when it does, so the state is what tells the summary the
+	// current terminal state is owed from one already posted for it.
+	// SummaryRotatedPast when a resume rotated past the summary after the
+	// apply had already reached its next terminal state. Nil on other comment
+	// states, on a claim sentinel, and on a marker recorded before the state
+	// was tracked.
+	SummarizedState *string
 
 	// CreatedAt is when the comment was first posted.
 	CreatedAt time.Time

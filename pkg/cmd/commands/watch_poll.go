@@ -12,7 +12,6 @@ import (
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/cmd/client"
-	"github.com/block/schemabot/pkg/cmd/cliname"
 	"github.com/block/schemabot/pkg/cmd/internal/templates"
 	"github.com/block/schemabot/pkg/state"
 )
@@ -235,7 +234,7 @@ func terminalWatchExit(result *apitypes.ProgressResponse) error {
 	case state.IsState(result.State, state.Apply.Completed):
 		return nil
 	case state.IsState(result.State, state.Apply.Stopped):
-		return fmt.Errorf("apply %s was stopped, so the schema change is not on the target; use '%s' to resume it",
+		return fmt.Errorf("apply %s was stopped, so the schema change is not on the target; to resume from where it stopped, run '%s'",
 			result.ApplyID, startCommand(result.ApplyID, result.Environment))
 	default:
 		return ErrSilent
@@ -248,7 +247,7 @@ func startCommand(applyID, environment string) string {
 	if environment == "" {
 		environment = "<environment>"
 	}
-	return cliname.Command("start", "-e", environment, applyID)
+	return templates.ControlCommand("start", applyID, environment)
 }
 
 // noActiveChangeError ends a watch whose apply the server reports no active

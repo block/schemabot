@@ -801,7 +801,13 @@ is not revived: its failed operation stays failed and is never run again. *Enfor
 and by one refusal. No write re-runs a failed operation, and the rollout projection is the only
 write that moves a failed apply to an active state (ST-1); a start on a stopped apply whose
 operation holds a failed task is refused with that failure (`failedTaskRefusingStart`,
-`pkg/tern/local_control_resume.go`).
+`pkg/tern/local_control_resume.go`). An operation row carries no terminal-state guard in storage:
+the lease fence of OW-2, not a state predicate, stops a drive that has ended or lost its lease from
+writing over a terminal operation (`operationWriteGuard`,
+`pkg/storage/internal/sqlstore/apply_operations.go`). For a drive that ended, the fence holds once
+its end has handed the lease back (`ReleaseFinishedClaim`, called by
+`releaseFinishedOperationClaim` in `pkg/api/operator.go`), pinned by
+`UpdateState_EndedDriveCannotWriteOverTerminalOperation` (`pkg/storage/storagetest/apply_operations.go`).
 
 ### ST-3: Apply state flows upward, never downward
 
@@ -830,7 +836,12 @@ the drive loop reconciles through (`taskStateWithNoBackwardProgress`,
 `pkg/tern/local_client.go`), and the resume's reading of a settled failed task as the apply's
 outcome rather than as work to re-plan (`failedTaskDecidingOutcome` and `replanAndFilterTasks`,
 `pkg/tern/local_control_resume.go`; `checkTaskReady`, `pkg/tern/local_apply_sequential.go`, where
-the sequential drive reads the kept failed row as the verdict).
+the sequential drive reads the kept failed row as the verdict). A task row carries no terminal-state
+guard in storage: the lease fence of OW-2, not a state predicate, stops a drive that has ended or
+lost its lease from writing over a terminal task, under an apply lease and an operation lease alike
+(`taskUpdateStatement`, `pkg/storage/internal/sqlstore/tasks.go`), pinned by
+`Update_DisplacedLeaseCannotWriteOverTerminalTask` and
+`Update_EndedOperationLeaseCannotWriteOverTerminalTask` (`pkg/storage/storagetest/tasks.go`).
 
 ### ST-5: Unknown engine states are visible and blocking
 
@@ -1631,9 +1642,14 @@ noise an operator can read past; a missing one is an apply that finished with no
 The duplicate is bounded to one because the reclaim posts and records in the same shape as the
 original, so the failure has to recur to recur.
 
-Single-posting is also scoped to a terminal state, not to the apply's whole life. An apply that
-stops, posts its summary, and later resumes has that marker superseded, which re-arms the claim so
-the next terminal state gets its own summary. Recovery is likewise separated by case: a claim
+Single-posting is also scoped to a terminal state, not to the apply's whole life. The marker
+records the terminal state its summary describes, so an apply that stops, posts its summary, and
+later resumes gets its own summary for the next terminal state it reaches: the claim for that state
+re-arms on a marker that a resume superseded or that names another state the apply can leave,
+while a marker for a settled outcome blocks every later claim. A resume that rotates on a summary
+consumes only that summary, and only while the apply is still active; once the apply is terminal
+again, the summary stays in place for the next resume without blocking the claim of the state the
+apply reached. Recovery is likewise separated by case: a claim
 sentinel abandoned by a crashed publisher is recovered by its own stale-claim path, while the
 ordinary claim path will only reclaim a marker that records an already-posted comment. Stealing an
 in-flight sentinel would hand two writers the same claim, which is the unbounded duplication this
@@ -1924,13 +1940,14 @@ repository's default branch; when that cannot be proved, the approval does not c
 targeting any other branch keeps an approval only where its own effect and its base content are
 both the same. This relies on the default branch requiring review for every change that reaches
 it: a change pushed to it without review is carried past an earlier approval as default branch
-content. *Enforced:* the review gate and actor
-authorization (`pkg/webhook/review_gate.go`, `pkg/webhook/actor_authorization.go`), with the
-comparison in `PRSchemaChangeUnchangedSince` (`pkg/github/client.go`), which proves a schema file
-both the change and the default branch edited generates the same statements: with
-`SameTableChange` (`pkg/ddl/table_change.go`) for MySQL-family files, and on the environment's
-primary target with `CompareSchemaFileChange` (`pkg/engine/postgres/table_change.go`) for
-PostgreSQL files.
+content. *Enforced:* the review gate and actor authorization (`pkg/webhook/review_gate.go`,
+`pkg/webhook/actor_authorization.go`), with the comparison in `PRSchemaChangeUnchangedSince`
+(`pkg/github/client.go`), which proves a schema file both the change and the default branch edited
+generates no statement the approval did not cover: with `SameTableChange`
+(`pkg/ddl/table_change.go`) for MySQL-family table files, `SameVSchemaChange`
+(`pkg/ddl/vschema_change.go`) for a Vitess keyspace's VSchema, and on the environment's primary
+target with `CompareSchemaFileChange` (`pkg/engine/postgres/table_change.go`) for PostgreSQL
+files.
 
 ### AZ-5: Commands never guess
 
