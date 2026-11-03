@@ -208,8 +208,10 @@ func writeTargetTables(b *strings.Builder, v RolloutView, g presentation.Group) 
 	}
 	rolled := rolledTargetTables(v, byMember, listed)
 	settled := v.Model.RolloutSettled(g)
+	resuming := state.IsState(v.Model.State, state.Apply.Resuming)
 	for i := range rolled {
 		rolled[i].RolloutSettled = settled
+		rolled[i].Resuming = resuming
 		if len(rolled[i].Shards) < len(g.Members)-converged {
 			rolled[i].OnTargets = targetSubsetLabel(rolled[i].Shards, len(g.Members)-converged)
 		}

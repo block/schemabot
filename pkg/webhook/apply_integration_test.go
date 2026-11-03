@@ -1051,6 +1051,11 @@ func TestE2EUnlockNoLocks(t *testing.T) {
 	}
 }
 
+// An operator comments an apply with --allow-unsafe while this PR's own apply
+// is still running. SchemaBot answers that the apply is in progress and offers
+// the apply to run once it finishes, without --allow-unsafe: that apply plans
+// again, so its unsafe changes are confirmed by typing the flag, not by pasting
+// it from the earlier command.
 func TestE2EApplySamePRActiveApply(t *testing.T) {
 	dbName := "webhook_apply_active"
 	svc := setupE2EService(t, dbName)
@@ -1108,7 +1113,7 @@ func TestE2EApplySamePRActiveApply(t *testing.T) {
 	h := NewHandler(svc, factory, nil, logger)
 
 	req := buildWebhookRequest(t, webhookPayloadOpts{
-		comment: "schemabot apply -e staging",
+		comment: "schemabot apply -e staging --allow-unsafe",
 		isPR:    true,
 	}, nil)
 
@@ -1121,7 +1126,8 @@ func TestE2EApplySamePRActiveApply(t *testing.T) {
 	case body := <-result.comments:
 		assert.Contains(t, body, "Apply Already In Progress")
 		assert.Contains(t, body, "This PR's apply `apply-active-test-001` is still running (state: `running`)")
-		assert.Contains(t, body, "Once it finishes, apply again:\n```\nschemabot apply -e staging\n```\n")
+		assert.Contains(t, body, "Once it finishes, apply again with `--allow-unsafe` to confirm unsafe changes:\n```\nschemabot apply -e staging\n```\n")
+		assert.NotContains(t, body, "schemabot apply -e staging --allow-unsafe")
 	case <-time.After(30 * time.Second):
 		t.Fatal("timed out waiting for active-apply comment")
 	}

@@ -484,6 +484,35 @@ func TestWatchModel_MultiTargetRolloutEndsOnItsRecoveryCommand(t *testing.T) {
 	assert.Equal(t, 1, strings.Count(stopped, "Apply stopped"), "the outcome is said once:\n%s", stopped)
 }
 
+// A start moves a stopped rollout to resuming before its targets report
+// leaving stopped. Through that window the watcher keeps following the start
+// the operator sent: a spinner on the resuming state, each table resuming
+// without its pre-stop percent, and the detach key, never the stopped outcome
+// and the start command that would ask for the start again.
+func TestWatchModel_MultiTargetRolloutResumingAwaitsItsTargets(t *testing.T) {
+	m := NewWatchModel("http://localhost:8080", "orders", "staging", true)
+	m.applyID = "apply-rollout-resuming"
+	m.state = state.Apply.Resuming
+	m.initialized = true
+	m.operations = []templates.ProgressOperation{
+		{Deployment: "staging", Target: "payments-001", State: state.ApplyOperation.Stopped, StartedAt: "2026-09-30T12:00:00Z", CutoverPolicy: storage.CutoverPolicyParallel, OnFailure: storage.OnFailureHalt},
+		{Deployment: "staging", Target: "payments-002", State: state.ApplyOperation.Stopped, StartedAt: "2026-09-30T12:00:00Z", CutoverPolicy: storage.CutoverPolicyParallel, OnFailure: storage.OnFailureHalt},
+	}
+	m.tables = []templates.TableProgress{
+		{Deployment: "staging", Target: "payments-001", TableName: "orders", ChangeType: "alter", Status: state.Task.Stopped, PercentComplete: 57, RowsCopied: 57, RowsTotal: 100},
+		{Deployment: "staging", Target: "payments-002", TableName: "orders", ChangeType: "alter", Status: state.Task.Stopped, PercentComplete: 40, RowsCopied: 40, RowsTotal: 100},
+	}
+
+	view := m.View()
+	assert.True(t, strings.HasPrefix(view, m.spinner.View()+"Resuming on all 2 targets...\n"), "the state line spins while the start lands:\n%s", view)
+	assert.Contains(t, view, "~ orders: "+templates.ANSICyan+"🔄 Resuming..."+templates.ANSIReset+"\n")
+	assert.Contains(t, view, "ESC to detach")
+	assert.NotContains(t, view, "Apply stopped")
+	assert.NotContains(t, view, "schemabot start")
+	assert.NotContains(t, view, "57", "the pre-stop percent is not shown while the copy's continuation is unknown")
+	assert.False(t, m.watchHasEnded(), "the watch keeps following a resuming apply")
+}
+
 func TestWatchModel_SingleDeploymentOutputDoesNotUseMultiView(t *testing.T) {
 	m := NewWatchModel("http://localhost:8080", "orders", "production", false)
 	m.applyID = "apply-single-test"

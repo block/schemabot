@@ -521,3 +521,173 @@ func TestOperator_ResumedRolloutObserverReattachesAfterALaterStop(t *testing.T) 
 	assert.Equal(t, 2, survivor.matrixSummary.recoveredCount(),
 		"a later claim of the second resume in the same process does not attach another observer")
 }
+
+// An operator stopped a rolling rollout while region-a was copying, before
+// region-b had started, and then started it again. The start resumes region-a,
+// and region-b, which the stop caught before it began, goes back to the queue
+// rather than staying stopped. When region-a finishes, the rollout reads as
+// one never stopped does between members, with region-b queued: nothing
+// reports the rollout stopped at the handoff, so no stopped summary posts
+// while the start is still working through the rollout. Region-b then starts like any queued member, and the
+// rollout completes with one summary that answers the start.
+func TestOperator_StartQueuesTheMembersAStopCaughtBeforeTheyStarted(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	ctx := t.Context()
+	db := openMatrixStorage(t)
+	stor := mysqlstore.New(db)
+	resetMatrixTables(t, ctx, db)
+
+	seed := seedGroupedApply(t, ctx, stor, multiOpSeed{
+		applyIdentifier: "start-queues-never-started",
+		parentState:     state.Apply.Stopped,
+		cutoverPolicy:   storage.CutoverPolicyRolling,
+		onFailure:       storage.OnFailureHalt,
+		deployments:     []string{"region-a", "region-b"},
+		opState:         state.ApplyOperation.Stopped,
+		perTaskState:    map[string]string{"region-a": state.Task.Stopped, "region-b": state.Task.Pending},
+	})
+	_, err := db.ExecContext(ctx, "UPDATE apply_operations SET started_at = NOW() WHERE id = ?", seed.opID("region-a"))
+	require.NoError(t, err, "region-a was copying when the stop landed")
+	_, _, err = stor.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+		ApplyID:     seed.applyID,
+		Operation:   storage.ControlOperationStart,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "matrix-test",
+	})
+	require.NoError(t, err, "request pending start")
+
+	rec := &driveRecorder{}
+	svc := newMatrixService(t, stor, matrixClients(stor, rec, map[string]matrixOutcome{
+		"region-a": {taskState: state.Task.Completed},
+		"region-b": {taskState: state.Task.Completed},
+	}))
+
+	driveNextOperation(t, ctx, svc, 1)
+
+	require.Equal(t, []string{"region-a"}, rec.resumeOrder())
+	regionB, err := stor.ApplyOperations().Get(ctx, seed.opID("region-b"))
+	require.NoError(t, err)
+	require.NotNil(t, regionB)
+	assert.Equal(t, state.ApplyOperation.Pending, regionB.State, "the start puts the member the stop caught before it began back in the queue")
+	assert.Nil(t, regionB.StartedAt)
+	apply := getApply(t, ctx, stor, seed.applyID)
+	assert.Equal(t, state.Apply.Pending, apply.State,
+		"with region-a done and region-b queued, the rollout reads as one that was never stopped does between members")
+	assert.Zero(t, svc.matrixSummary.count(), "no stopped summary posts while the start works through the rollout")
+	start, err := stor.ControlRequests().GetByOperation(ctx, seed.applyID, storage.ControlOperationStart)
+	require.NoError(t, err)
+	require.NotNil(t, start)
+	assert.Equal(t, storage.ControlRequestPending, start.Status, "the start stays pending while a member is still to run")
+
+	driveNextOperation(t, ctx, svc, 2)
+
+	require.Equal(t, []string{"region-a", "region-b"}, rec.resumeOrder())
+	assert.Equal(t, state.Apply.Completed, getApply(t, ctx, stor, seed.applyID).State)
+	start, err = stor.ControlRequests().GetByOperation(ctx, seed.applyID, storage.ControlOperationStart)
+	require.NoError(t, err)
+	require.NotNil(t, start)
+	assert.Equal(t, storage.ControlRequestCompleted, start.Status)
+	assert.Equal(t, 1, svc.matrixSummary.count(), "the rollout posts one summary, when it completes")
+}
+
+// resumedWorkClient reports the resumed operation's work as running again, then
+// waits for the drive's heartbeat to record that before it finishes the work,
+// the way a resumed copy keeps running for many heartbeats before it completes.
+type resumedWorkClient struct {
+	*matrixTernClient
+	operationState string
+	applyState     string
+}
+
+func (c *resumedWorkClient) ResumeApplyOperation(ctx context.Context, apply *storage.Apply, applyOperationID int64) error {
+	tasks, err := c.stor.Tasks().GetByApplyOperationID(ctx, applyOperationID)
+	if err != nil {
+		return fmt.Errorf("resumed work fake: load tasks for operation %d: %w", applyOperationID, err)
+	}
+	for _, task := range tasks {
+		task.State = state.Task.Running
+		if err := c.stor.Tasks().Update(ctx, task); err != nil {
+			return fmt.Errorf("resumed work fake: mark task %d running: %w", task.ID, err)
+		}
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		op, err := c.stor.ApplyOperations().Get(ctx, applyOperationID)
+		if err != nil {
+			return fmt.Errorf("resumed work fake: load operation %d: %w", applyOperationID, err)
+		}
+		parent, err := c.stor.Applies().Get(ctx, apply.ID)
+		if err != nil {
+			return fmt.Errorf("resumed work fake: load apply %s: %w", apply.ApplyIdentifier, err)
+		}
+		c.operationState, c.applyState = op.State, parent.State
+		if !state.IsState(op.State, state.ApplyOperation.Resuming) && !state.IsState(parent.State, state.Apply.Stopped, state.Apply.Resuming) {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	return c.matrixTernClient.ResumeApplyOperation(ctx, apply, applyOperationID)
+}
+
+// An operator stopped a two-target rollout while region-a copied, after
+// region-b had finished, and started it again. The start's claim marks
+// region-a resuming while its drive asks the engine to pick the copy up again.
+// Once the engine is copying, region-a and the rollout read running for the
+// rest of the copy, so the PR comment and the CLI show the copy running rather
+// than resuming until it finishes.
+func TestOperator_ResumedOperationReadsRunningOnceItsEngineWorks(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	ctx := t.Context()
+	db := openMatrixStorage(t)
+	stor := mysqlstore.New(db)
+	resetMatrixTables(t, ctx, db)
+
+	seed := seedGroupedApply(t, ctx, stor, multiOpSeed{
+		applyIdentifier: "resumed-reads-running",
+		parentState:     state.Apply.Stopped,
+		cutoverPolicy:   storage.CutoverPolicyRolling,
+		onFailure:       storage.OnFailureHalt,
+		deployments:     []string{"region-a", "region-b"},
+		opState:         state.ApplyOperation.Stopped,
+		taskState:       state.Task.Stopped,
+	})
+	_, err := db.ExecContext(ctx, "UPDATE apply_operations SET started_at = NOW() WHERE apply_id = ?", seed.applyID)
+	require.NoError(t, err)
+	_, err = db.ExecContext(ctx, "UPDATE apply_operations SET state = ?, completed_at = NOW() WHERE id = ?",
+		state.ApplyOperation.Completed, seed.opID("region-b"))
+	require.NoError(t, err)
+	_, err = db.ExecContext(ctx, "UPDATE tasks SET state = ?, completed_at = NOW() WHERE apply_operation_id = ?",
+		state.Task.Completed, seed.opID("region-b"))
+	require.NoError(t, err)
+	_, _, err = stor.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+		ApplyID:     seed.applyID,
+		Operation:   storage.ControlOperationStart,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "matrix-test",
+	})
+	require.NoError(t, err, "request pending start")
+
+	rec := &driveRecorder{}
+	client := &resumedWorkClient{matrixTernClient: &matrixTernClient{
+		mockTernClient: &mockTernClient{},
+		stor:           stor,
+		deployment:     "region-a",
+		rec:            rec,
+		outcome:        matrixOutcome{taskState: state.Task.Completed},
+	}}
+	svc := newMatrixService(t, stor, map[string]tern.Client{"region-a/staging": client})
+	require.NoError(t, svc.SetOperatorPollInterval(10*time.Millisecond))
+
+	driveNextOperation(t, ctx, svc, 1)
+
+	require.Equal(t, []string{"region-a"}, rec.resumeOrder())
+	assert.Equal(t, state.ApplyOperation.Running, client.operationState, "the operation reads running once its engine is copying again")
+	assert.Equal(t, state.Apply.Running, client.applyState, "the rollout reads running with it")
+	assert.Equal(t, state.Apply.Completed, getApply(t, ctx, stor, seed.applyID).State)
+}

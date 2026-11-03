@@ -2693,6 +2693,11 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 	if standDown, err := c.processPendingCancelOrStopControlRequest(ctx, apply); standDown || err != nil {
 		return err
 	}
+	// A cutover drive carries the swap the operator asked for, so it is never
+	// handed back; every other drive of a deferred apply is.
+	if !forceCutoverResume && handBackAfterControlDelivery(ctx, apply, logger) {
+		return ErrDeferredCutoverDriveHandedBack
+	}
 	// A stopped apply is claimed only to deliver a pending control request. A
 	// pending start means the operator asked to resume, and the drive below
 	// consumes it (completing it once the engine accepts). No pending start

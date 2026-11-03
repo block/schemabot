@@ -384,3 +384,74 @@ func TestWritePullSchema_NoDivergenceSectionWithoutTargets(t *testing.T) {
 
 	assert.NotContains(t, out, "-- Target ")
 }
+
+// An environment whose targets hold different namespaces, an unsharded schema on
+// one cluster and a shard schema on each of the others, prints a schema
+// assembled from several targets. Each target that supplied part of it names
+// the namespaces it supplied, a second copy of a shard reads its difference
+// against the schema below, and a target is never described as matching or
+// missing a namespace its entry does not place on it.
+func TestWritePullSchema_RendersNamespacePartitionedTargets(t *testing.T) {
+	setColors(t, false)
+	out := captureStdout(t, func() {
+		WritePullSchema(&apitypes.PullSchemaResponse{
+			Database:    "orders-db",
+			Type:        "mysql",
+			Environment: "production",
+			TableCount:  3,
+			Namespaces: map[string]*apitypes.PulledNamespace{
+				"orders":   {Tables: map[string]string{"sequences": "CREATE TABLE `sequences` (`id` bigint NOT NULL);\n"}},
+				"orders_0": {Tables: map[string]string{"line_items": "CREATE TABLE `line_items` (`id` bigint NOT NULL);\n"}},
+				"orders_1": {Tables: map[string]string{"line_items": "CREATE TABLE `line_items` (`id` bigint NOT NULL);\n"}},
+			},
+			Targets: []*apitypes.TargetDivergence{
+				{Deployment: "eu", Target: "orders-001", TableCount: 1, Primary: true, Namespaces: []string{"orders"}},
+				{Deployment: "eu", Target: "orders-002", TableCount: 1, Namespaces: []string{"orders_0"}},
+				{Deployment: "eu", Target: "orders-003", TableCount: 1, Namespaces: []string{"orders_1"}},
+				{Deployment: "eu", Target: "orders-004", TableCount: 1, Namespaces: []string{"orders_0"}, DivergedTables: []apitypes.DivergedTable{
+					{Namespace: "orders_0", Table: "line_items", Difference: apitypes.DivergenceDiffers},
+				}},
+				{Deployment: "eu", Target: "orders-005", TableCount: 0, Namespaces: []string{"orders_2"}},
+			},
+		})
+	})
+
+	assert.Contains(t, out, "-- Target `orders-001` — primary target, schema below for `orders`\n")
+	assert.Contains(t, out, "-- Target `orders-002` — schema below for `orders_0`\n")
+	assert.Contains(t, out, "-- Target `orders-003` — schema below for `orders_1`\n")
+	assert.Contains(t, out, "-- Target `orders-004` — 1 table differs from the schema below\n")
+	assert.Contains(t, out, "--   orders_0.line_items: differs\n")
+	assert.Contains(t, out, "-- Target `orders-005` — holds none of the namespaces below\n")
+	assert.NotContains(t, out, "primary target, whose schema is below", "the schema below is not one target's")
+}
+
+// A table filter can drop a shard namespace from the schema below while keeping
+// a difference inside it. That difference is from the shard's baseline target,
+// not from the primary, so it must not be described as differing from the
+// primary target.
+func TestWritePullSchema_FilteredDifferenceKeepsItsNonPrimaryBaseline(t *testing.T) {
+	setColors(t, false)
+	out := captureStdout(t, func() {
+		WritePullSchema(&apitypes.PullSchemaResponse{
+			Database:    "shop-db",
+			Type:        "mysql",
+			Environment: "production",
+			TableCount:  1,
+			Namespaces: map[string]*apitypes.PulledNamespace{
+				"shop": {Tables: map[string]string{"orders": "CREATE TABLE `orders` (`id` bigint NOT NULL);\n"}},
+			},
+			Targets: []*apitypes.TargetDivergence{
+				{Deployment: "eu", Target: "shop-001", TableCount: 1, Primary: true, Namespaces: []string{"shop"}},
+				{Deployment: "eu", Target: "shop-002", TableCount: 1, Namespaces: []string{"shop_0"}},
+				{Deployment: "eu", Target: "shop-003", TableCount: 2, Namespaces: []string{"shop_0"}, DivergedTables: []apitypes.DivergedTable{
+					{Namespace: "shop_0", Table: "orders", Difference: apitypes.DivergenceOnlyOnTarget},
+				}},
+			},
+		})
+	})
+
+	assert.Contains(t, out, "-- Target `shop-001` — primary target, schema below for `shop`\n")
+	assert.Contains(t, out, "-- Target `shop-003` — 1 table differs from the schema below\n")
+	assert.Contains(t, out, "--   shop_0.orders: extra\n")
+	assert.NotContains(t, out, "from the primary target", "the difference is from shop-002's shop_0, not the primary")
+}

@@ -1986,6 +1986,98 @@ func (s applyTaskScope) progressReadFromWholeApply(resp *ternv1.ProgressResponse
 	return s.sharesRemoteApplyWithSiblings() && s.acceptsUnscopedProgressAnswer(resp.GetApplyOperationId())
 }
 
+// remoteOperationNeverStarts reports whether a progress answer scoped to one
+// operation says that operation will never start. The data plane decides it
+// from its own operation row: no driver has claimed the operation and its
+// apply has settled, which is how a halted rollout leaves the members it never
+// reached. A data plane that does not report it leaves the field false, so the
+// drive keeps polling as before.
+func remoteOperationNeverStarts(resp *ternv1.ProgressResponse) bool {
+	return resp.GetApplyOperationId() != "" && resp.GetOperationNeverStarts()
+}
+
+// remoteOperationNeverStartsMessage is the failure recorded on the tasks of an
+// operation its remote apply settled before reaching. It names only the remote
+// apply and the state the data plane reported, both SchemaBot's own values.
+func remoteOperationNeverStartsMessage(remoteID string, applyState ternv1.State) string {
+	settled := ProtoStateToStorage(applyState)
+	if settled == "" {
+		return fmt.Sprintf("remote apply %s settled before this operation started, so the data plane will not run it", remoteID)
+	}
+	return fmt.Sprintf("remote apply %s settled as %s before this operation started, so the data plane will not run it", remoteID, settled)
+}
+
+// neverStartedTaskState is the terminal state an operation's tasks take when
+// its remote apply settled in remoteState before reaching it. A cancelled or
+// reverted remote apply was ended by an operator, so its unreached members
+// settle the same way and the rollout derives the verdict the data plane did.
+// Any other settled state, a failure included, fails them.
+func neverStartedTaskState(remoteState ternv1.State) string {
+	switch ProtoStateToStorage(remoteState) {
+	case state.Apply.Cancelled:
+		return state.Task.Cancelled
+	case state.Apply.Reverted:
+		return state.Task.Reverted
+	default:
+		return state.Task.Failed
+	}
+}
+
+// settleNeverStartedOperation records the outcome of an operation its remote
+// apply settled in remoteState before reaching it: its tasks take
+// neverStartedTaskState with message as the reason. Only the operation's own
+// rows are written; the operator derives the operation and the parent from
+// them. A failure goes through markRemoteApplyFailed like every other remote
+// failure. A drive that is not operation-scoped writes its parent directly,
+// which only markRemoteApplyFailed knows how to do, so it fails closed there.
+func (c *GRPCClient) settleNeverStartedOperation(ctx context.Context, apply *storage.Apply, scope applyTaskScope, remoteState ternv1.State, message string) error {
+	taskState := neverStartedTaskState(remoteState)
+	if taskState == state.Task.Failed {
+		return c.markRemoteApplyFailed(ctx, apply, nil, message, false, scope)
+	}
+	logger := c.applyLogger(apply)
+	if !scope.suppressesDirectParentApplyWrites() {
+		logger.WarnContext(ctx, "never-started remote operation is settled as failed because this drive is not operation-scoped and writes its parent directly",
+			append(apply.MutableLogAttrs(), "remote_apply_state", remoteState.String())...)
+		return c.markRemoteApplyFailed(ctx, apply, nil, message, false, scope)
+	}
+	storedApply, transitionStatus, err := c.reloadStoredApplyForRemoteTransition(ctx, apply, false)
+	if transitionStatus != storedApplyTransitionReady {
+		logSkippedRemoteApplyTransition(ctx, logger, "settle never-started remote operation", apply, storedApply, transitionStatus, err)
+		return err
+	}
+	tasks, err := c.loadApplyTasks(ctx, storedApply, scope)
+	if err != nil {
+		return fmt.Errorf("load tasks of operation %d to settle as %s: %w", scope.applyOperationID, taskState, err)
+	}
+	now := time.Now()
+	for _, task := range tasks {
+		if state.IsTerminalTaskState(task.State) {
+			logger.InfoContext(ctx, "leaving terminal gRPC task unchanged while settling a never-started remote operation",
+				"task_id", task.TaskIdentifier,
+				"table", task.TableName,
+				"task_state", task.State,
+				"settled_task_state", taskState)
+			continue
+		}
+		task.State = taskState
+		task.ErrorMessage = message
+		task.CompletedAt = &now
+		task.UpdatedAt = now
+		if err := c.storage.Tasks().Update(ctx, task); err != nil {
+			return fmt.Errorf("settle task %s of operation %d as %s: %w", task.TaskIdentifier, scope.applyOperationID, taskState, err)
+		}
+	}
+	// A task-less operation has no task rows to carry the outcome, so the
+	// operator could never derive it; the drive settles the row itself.
+	if scope.tasklessOperationScope() {
+		if err := c.storage.ApplyOperations().MarkTerminal(ctx, scope.applyOperationID, taskState); err != nil {
+			return fmt.Errorf("mark task-less apply_operation %d %s after its remote apply settled: %w", scope.applyOperationID, taskState, err)
+		}
+	}
+	return nil
+}
+
 // logProgressReadFromWholeApply warns that this drive's progress covers its
 // sibling operations' tasks alongside its own. The drive calls it once, not
 // on every poll, since the cause holds for as long as the drive runs.
@@ -3138,6 +3230,9 @@ func (c *GRPCClient) resumeApply(ctx context.Context, apply *storage.Apply, scop
 	logger := c.applyLogger(apply)
 	if standDown, err := c.processPendingCancelOrStopControlRequest(ctx, apply, scope); standDown || err != nil {
 		return err
+	}
+	if handBackAfterControlDelivery(ctx, apply, logger) {
+		return ErrDeferredCutoverDriveHandedBack
 	}
 	if err := c.processPendingCutoverControlRequest(ctx, apply, scope); err != nil {
 		return err
@@ -5060,6 +5155,22 @@ func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply
 			if resp.State == ternv1.State_STATE_NO_ACTIVE_CHANGE {
 				message := fmt.Sprintf("remote apply %s returned no active schema change for exact apply_id", apply.ExternalID)
 				return c.failMissingRemoteApply(ctx, apply, message, nil, scope)
+			}
+			if remoteOperationNeverStarts(resp) {
+				// The answer can carry control requests the data plane settled on
+				// this poll, and this drive may be the last to read them.
+				c.mirrorRemoteControlRejections(ctx, apply, remoteID, resp.SettledControlRequests)
+				message := remoteOperationNeverStartsMessage(remoteID, resp.GetApplyState())
+				logger.WarnContext(ctx, "remote operation will never start because its remote apply settled before reaching it; settling the operation's tasks the way the remote apply settled and ending the drive",
+					append(apply.MutableLogAttrs(),
+						"apply_operation_id", scope.applyOperationID,
+						"remote_apply_id", remoteID,
+						"remote_apply_operation_id", resp.GetApplyOperationId(),
+						"remote_apply_state", resp.GetApplyState().String())...)
+				if err := c.settleNeverStartedOperation(ctx, apply, scope, resp.GetApplyState(), message); err != nil {
+					return fmt.Errorf("settle tasks of operation %d its remote apply %s settled before: %w", scope.applyOperationID, remoteID, err)
+				}
+				return fmt.Errorf("poll remote apply %s for operation %d: %w", remoteID, scope.applyOperationID, ErrRemoteOperationNeverStarts)
 			}
 
 			// Mirror the data-plane display metadata (deploy-request URL, VSchema

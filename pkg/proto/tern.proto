@@ -1026,6 +1026,12 @@ message ProgressResponse {
   // id: a data plane that ignores the scope answers for the whole apply, and
   // reading that as one member's state reports its siblings' work as its own.
   string apply_operation_id = 12;
+  // The state of the whole apply, set on an answer scoped to one operation.
+  State apply_state = 13;
+  // Set on an answer scoped to one operation when that operation will never
+  // run: no driver has claimed it and its apply has settled, so nothing will
+  // claim it again. The caller settles the operation rather than wait on it.
+  bool operation_never_starts = 14;
 }
 
 // CutoverRequest triggers the cutover phase.
