@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -380,20 +381,65 @@ func (s liveOperatorServers) ListLive(context.Context) ([]*storage.OperatorServe
 	return s.servers, s.err
 }
 
+// memorySettings is a settings store holding its settings in memory, enough
+// for the driver pool's identity.
+type memorySettings struct {
+	storage.SettingsStore
+	mu     sync.Mutex
+	values map[string]string
+}
+
+func (s *memorySettings) Get(_ context.Context, key string) (*storage.Setting, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	value, ok := s.values[key]
+	if !ok {
+		return nil, nil
+	}
+	return &storage.Setting{Key: key, Value: value}, nil
+}
+
+func (s *memorySettings) CompareAndSet(_ context.Context, key string, previous *storage.Setting, value string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	current, ok := s.values[key]
+	if (previous == nil) == ok || (previous != nil && previous.Value != current) {
+		return false, nil
+	}
+	if s.values == nil {
+		s.values = make(map[string]string)
+	}
+	s.values[key] = value
+	return true, nil
+}
+
 // A control plane books work against what the deployment reports over gRPC:
 // the drivers of its live servers together, the ones of them that may hold a
-// deferred cutover, and the max_drivers_per_apply it runs one apply under.
+// deferred cutover, the max_drivers_per_apply it runs one apply under, and
+// the identity of that pool. Every endpoint reading the same storage reports
+// the same pool, on every call, so a control plane reaching it under two
+// routes counts one pool.
 func TestDriverCapacitySumsTheLiveServersDrivers(t *testing.T) {
 	servers := liveOperatorServers{servers: []*storage.OperatorServer{
 		{ServerID: "host-a/1/operator", Drivers: 4, DeferredCutoverDrivers: 3},
 		{ServerID: "host-b/1/operator", Drivers: 6, DeferredCutoverDrivers: 5},
 	}}
-	client := newRetryTestClient(t, NewServer(noopControlClient{}, slog.Default(), WithDriverCapacity(servers, 16)))
+	settings := &memorySettings{}
+	client := newRetryTestClient(t, NewServer(noopControlClient{}, slog.Default(), WithDriverCapacity(servers, settings, 16)))
+	otherEndpoint := newRetryTestClient(t, NewServer(noopControlClient{}, slog.Default(), WithDriverCapacity(servers, settings, 16)))
 
 	capacity, err := client.DriverCapacity(t.Context())
-
 	require.NoError(t, err)
-	assert.Equal(t, &DriverCapacity{LiveServers: 2, Drivers: 10, DeferredCutoverDrivers: 8, MaxDriversPerApply: 16}, capacity)
+	require.NotEmpty(t, capacity.PoolID)
+	assert.Equal(t, &DriverCapacity{LiveServers: 2, Drivers: 10, DeferredCutoverDrivers: 8, MaxDriversPerApply: 16, PoolID: capacity.PoolID}, capacity)
+
+	again, err := client.DriverCapacity(t.Context())
+	require.NoError(t, err)
+	assert.Equal(t, capacity.PoolID, again.PoolID, "the pool keeps its identity")
+	fromOther, err := otherEndpoint.DriverCapacity(t.Context())
+	require.NoError(t, err)
+	assert.Equal(t, capacity.PoolID, fromOther.PoolID, "an endpoint on the same storage reports the same pool")
+	assert.Equal(t, map[string]string{driverPoolIDSettingKey: capacity.PoolID}, settings.values)
 }
 
 // A deployment that does not report its driver capacity answers
@@ -416,7 +462,7 @@ func TestDriverCapacityIsNilWhenTheDeploymentDoesNotReportIt(t *testing.T) {
 // every apply that does not defer its cutover.
 func TestDriverCapacityFailsWhenTheRegistryCannotBeRead(t *testing.T) {
 	servers := liveOperatorServers{err: errors.New("read operator servers: connection refused")}
-	server := NewServer(healthErrorClient{}, slog.Default(), WithDriverCapacity(servers, 2))
+	server := NewServer(healthErrorClient{}, slog.Default(), WithDriverCapacity(servers, &memorySettings{}, 2))
 	client := newRetryTestClient(t, server)
 
 	capacity, err := client.DriverCapacity(t.Context())

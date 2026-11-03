@@ -300,7 +300,7 @@ func listActiveDeferredCutoverWidths(ctx context.Context, q rowsQueryer, dialect
 		}
 	}
 	rows, err := q.QueryContext(ctx, `
-		SELECT a.apply_identifier, a.database_name, a.environment,
+		SELECT a.apply_identifier, a.database_name, a.environment, a.options,
 			ao.deployment, ao.target, ao.cutover_policy, ao.state, ao.operation_kind
 		FROM apply_operations ao
 		JOIN applies a ON a.id = ao.apply_id
@@ -317,23 +317,26 @@ func listActiveDeferredCutoverWidths(ctx context.Context, q rowsQueryer, dialect
 
 	var widths []storage.DeferredCutoverWidth
 	var ops []*storage.ApplyOperation
+	var pools map[string]string
 	flush := func() {
 		if len(widths) > 0 {
 			widths[len(widths)-1].Operations = storage.DeferredCutoverHeldAtOnce(ops, maxDriversPerApply)
-			widths[len(widths)-1].ByDeployment = storage.DeferredCutoverHeldAtOnceByDeployment(ops, maxDriversPerApply)
+			widths[len(widths)-1].ByPool = storage.DeferredCutoverHeldAtOnceByPool(ops, pools)
 		}
 		ops = nil
 	}
 	for rows.Next() {
 		var width storage.DeferredCutoverWidth
+		var options []byte
 		op := &storage.ApplyOperation{}
-		if err := rows.Scan(&width.ApplyIdentifier, &width.Database, &width.Environment,
+		if err := rows.Scan(&width.ApplyIdentifier, &width.Database, &width.Environment, &options,
 			&op.Deployment, &op.Target, &op.CutoverPolicy, &op.State, &op.OperationKind); err != nil {
 			return nil, fmt.Errorf("scan active deferred cutover operation: %w", err)
 		}
 		if len(widths) == 0 || widths[len(widths)-1].ApplyIdentifier != width.ApplyIdentifier {
 			flush()
 			widths = append(widths, width)
+			pools = storage.ParseApplyOptions(options).DeferredCutoverPools
 		}
 		ops = append(ops, op)
 	}

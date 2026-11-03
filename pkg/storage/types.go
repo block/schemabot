@@ -1219,17 +1219,17 @@ type Apply struct {
 	// drivers. It is not persisted.
 	DeferredCutoverOperations int
 
-	// DeferredCutoverDataPlanes is, for each deployment whose operations run
-	// on another plane's operators, how many of that plane's drivers this
-	// apply would hold at a deferred cutover at once and how many that plane
-	// reported it can hold. Each operation waiting at a deferred cutover keeps
-	// a driver on the plane that runs it, so admission also refuses the apply
-	// when its operations on a deployment, beside those of the other admitted
-	// deferred applies on that deployment and environment, exceed what the
-	// deployment reported. Each plane serves one control plane, so the
-	// applies this store holds are every deferred apply that plane runs. It
-	// is read only when DeferredCutoverOperations is two or more, and it is
-	// not persisted.
+	// DeferredCutoverDataPlanes is, for each driver pool on another plane
+	// that runs some of this apply's operations, how many of that pool's
+	// drivers this apply would hold at a deferred cutover at once and how many
+	// the pool reported it can hold. Each operation waiting at a deferred
+	// cutover keeps a driver on the plane that runs it, so admission also
+	// refuses the apply when its operations on a pool, beside those of the
+	// other admitted deferred applies on that pool under any route
+	// (ApplyOptions.DeferredCutoverPools), exceed what the pool reported. Each
+	// plane serves one control plane, so the applies this store holds are
+	// every deferred apply that plane runs. It is read only when
+	// DeferredCutoverOperations is two or more, and it is not persisted.
 	DeferredCutoverDataPlanes []DeferredCutoverDataPlane
 
 	// Engine is the schema change engine: "spirit", "planetscale", etc.
@@ -1401,15 +1401,19 @@ type OperatorServer struct {
 }
 
 // DeferredCutoverDataPlane is what deferred cutover admission checks for one
-// deployment whose operations run on another plane's operators.
+// driver pool on another plane that runs some of the apply's operations.
 type DeferredCutoverDataPlane struct {
-	// Deployment names the deployment.
+	// Pool is the identity the pool reported. Every route that reported it
+	// reaches the same drivers.
+	Pool string
+	// Deployment names the apply's deployments that run on the pool, joined
+	// with ", " when more than one does.
 	Deployment string
-	// Operations is how many of the deployment's drivers the apply would hold
-	// at a deferred cutover at once.
+	// Operations is how many of the pool's drivers the apply would hold at a
+	// deferred cutover at once.
 	Operations int
-	// LiveServers is how many of the deployment's servers reported their
-	// drivers within its live window.
+	// LiveServers is how many of the pool's servers reported their drivers
+	// within its live window.
 	LiveServers int
 	// Capacity is how many drivers those servers leave for deferred work,
 	// together.
@@ -1467,9 +1471,12 @@ type DeferredCutoverWidth struct {
 	Database        string
 	Environment     string
 	Operations      int
-	// ByDeployment is how many drivers of each deployment the apply holds at
-	// once (DeferredCutoverHeldAtOnceByDeployment).
-	ByDeployment map[string]int
+	// ByPool is how many drivers of each data-plane pool the apply holds at
+	// once (DeferredCutoverHeldAtOnceByPool over the pools its admission
+	// recorded in ApplyOptions.DeferredCutoverPools), uncapped: a waiting
+	// operation keeps its driver whatever this plane's max_drivers_per_apply
+	// is now.
+	ByPool map[string]int
 }
 
 // ApplyOperation represents one child row in the apply_operations table:
@@ -1755,6 +1762,14 @@ type ApplyOptions struct {
 	// deployment-scoped finalizer or namespace orders' finalizer until a sibling
 	// target's operation had attached.
 	OperationKeysLeadWithTarget bool `json:"operation_keys_lead_with_target,omitempty"`
+
+	// DeferredCutoverPools maps each deployment that runs this deferred
+	// apply's operations on another plane to the driver pool that plane
+	// reported when the apply was admitted. Admission of a later deferred
+	// apply counts this apply's waiting operations against those pools, under
+	// whatever route reaches them. It is recorded at admission and never read
+	// from caller options.
+	DeferredCutoverPools map[string]string `json:"deferred_cutover_pools,omitempty"`
 }
 
 // DirectExecutionPolicy is an apply's durable record of the direct execution

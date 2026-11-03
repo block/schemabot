@@ -2191,9 +2191,14 @@ func (s *Service) createStoredApply(
 			return nil, 0, refused
 		}
 		if apply.DeferredCutoverOperations > 1 {
-			apply.DeferredCutoverDataPlanes, err = s.deferredCutoverDataPlanes(ctx, plan, req.Environment, applyIdentifier, caller, groups)
+			var pools map[string]string
+			apply.DeferredCutoverDataPlanes, pools, err = s.deferredCutoverDataPlanes(ctx, plan, req.Environment, applyIdentifier, caller, groups)
 			if err != nil {
 				return nil, 0, err
+			}
+			if len(pools) > 0 {
+				applyOpts.DeferredCutoverPools = pools
+				apply.Options = storage.MarshalApplyOptions(applyOpts)
 			}
 		}
 	}

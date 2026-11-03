@@ -949,9 +949,15 @@ func deferredCutoverCapacityMessage(refused *api.DeferredCutoverCapacityError, c
 	rerun := fmt.Sprintf("Run `%s` again without `--defer-cutover`", templates.TenantCommand("schemabot "+command, environment, tenant))
 	waiting := fmt.Sprintf("`--defer-cutover` would keep %d drivers waiting at the cutover at once", refused.Operations)
 	servers := "SchemaBot can keep %d drivers waiting across all its servers"
-	if refused.Deployment != "" {
+	that := "that deployment"
+	if refused.SharesPool() {
+		// Several deployments reach one pool of drivers, counted together.
+		that = "those deployments"
+		waiting = fmt.Sprintf("`--defer-cutover` would keep %d drivers on the `%s` deployments waiting at the cutover at once", refused.Operations, refused.Deployment)
+		servers = that + " can keep %d drivers waiting across their shared servers"
+	} else if refused.Deployment != "" {
 		waiting = fmt.Sprintf("`--defer-cutover` would keep %d drivers on the `%s` deployment waiting at the cutover at once", refused.Operations, refused.Deployment)
-		servers = "that deployment can keep %d drivers waiting across its servers"
+		servers = that + " can keep %d drivers waiting across its servers"
 	}
 	capacity := fmt.Sprintf(servers, refused.Capacity)
 	switch {
@@ -964,8 +970,8 @@ func deferredCutoverCapacityMessage(refused *api.DeferredCutoverCapacityError, c
 		return fmt.Sprintf("%s, and `max_drivers_per_apply` gives one apply at most %d. %s, or raise `max_drivers_per_apply` to at least %d.",
 			waiting, refused.PerApplyCap, rerun, refused.Operations)
 	case refused.LiveServers == 0 && refused.Deployment != "":
-		return fmt.Sprintf("%s, and no server of that deployment has reported its drivers in the last %s. %s.",
-			waiting, api.LiveWindowText(), rerun)
+		return fmt.Sprintf("%s, and no server of %s has reported its drivers in the last %s. %s.",
+			waiting, that, api.LiveWindowText(), rerun)
 	case refused.LiveServers == 0:
 		return fmt.Sprintf("%s, and no SchemaBot server has reported its drivers in the last %s. %s.",
 			waiting, api.LiveWindowText(), rerun)

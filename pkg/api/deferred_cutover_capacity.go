@@ -30,7 +30,8 @@ type DeferredCutoverCapacityError struct {
 	Environment string
 	// Deployment names the deployment whose operators the refusal counted
 	// when they run on another plane, and is empty when it counted this
-	// plane's own.
+	// plane's own. When several of the apply's deployments reach the same
+	// pool of drivers it names them all, joined with ", ".
 	Deployment string
 	// Unreported is a refusal because Deployment does not report how many
 	// operations it can hold at a deferred cutover, which a deployment
@@ -90,7 +91,29 @@ func (e *DeferredCutoverCapacityError) capacityText() string {
 	if e.Deployment == "" {
 		return fmt.Sprintf("SchemaBot can keep %d drivers waiting across all its servers", e.Capacity)
 	}
-	return fmt.Sprintf("the %s deployment can keep %d drivers waiting across its servers", e.Deployment, e.Capacity)
+	return fmt.Sprintf("%s can keep %d drivers waiting across %s servers", e.deploymentText(), e.Capacity, e.deploymentPossessive())
+}
+
+// deploymentText names the counted deployment, or the deployments that share
+// one pool of drivers.
+func (e *DeferredCutoverCapacityError) deploymentText() string {
+	if e.SharesPool() {
+		return fmt.Sprintf("the %s deployments", e.Deployment)
+	}
+	return fmt.Sprintf("the %s deployment", e.Deployment)
+}
+
+func (e *DeferredCutoverCapacityError) deploymentPossessive() string {
+	if e.SharesPool() {
+		return "their shared"
+	}
+	return "its"
+}
+
+// SharesPool reports whether the refusal counted one pool of drivers that
+// several of the apply's deployments reach, all of which Deployment names.
+func (e *DeferredCutoverCapacityError) SharesPool() bool {
+	return strings.Contains(e.Deployment, ", ")
 }
 
 func (e *DeferredCutoverCapacityError) Error() string {
@@ -105,8 +128,8 @@ func (e *DeferredCutoverCapacityError) Error() string {
 		return fmt.Sprintf("%s/%s: --defer-cutover would keep %d drivers waiting at the cutover at once, and max_drivers_per_apply gives one apply at most %d; apply again without --defer-cutover, or raise max_drivers_per_apply to at least %d",
 			e.Database, e.Environment, e.Operations, e.PerApplyCap, e.Operations)
 	case e.LiveServers == 0 && e.Deployment != "":
-		return fmt.Sprintf("%s/%s: --defer-cutover would keep %d drivers on the %s deployment waiting at the cutover at once, and no server of that deployment has reported its drivers in the last %s; apply again without --defer-cutover",
-			e.Database, e.Environment, e.Operations, e.Deployment, LiveWindowText())
+		return fmt.Sprintf("%s/%s: --defer-cutover would keep %d drivers on %s waiting at the cutover at once, and no server there has reported its drivers in the last %s; apply again without --defer-cutover",
+			e.Database, e.Environment, e.Operations, e.deploymentText(), LiveWindowText())
 	case e.LiveServers == 0:
 		return fmt.Sprintf("%s/%s: --defer-cutover would keep %d drivers waiting at the cutover at once, and no SchemaBot server has reported its drivers in the last %s; apply again without --defer-cutover",
 			e.Database, e.Environment, e.Operations, LiveWindowText())
@@ -225,16 +248,20 @@ func (s *Service) deferredCutoverPerApplyCapRefusal(plan *storage.Plan, environm
 }
 
 // deferredCutoverDataPlanes reads, for each deployment that runs the apply's
-// operations on another plane's operators, how many of them the apply would
-// hold at a deferred cutover at once and how many that plane reports it can
-// hold, for apply creation to admit against (storage.Apply's
-// DeferredCutoverDataPlanes). A deployment that does not report its capacity
-// cannot hold a deferred apply's operations, and one whose max_drivers_per_apply
-// is below the operations the apply sends it would never have all of them
-// waiting, so the apply is refused here in both cases. A deployment whose
-// report cannot be read refuses it with that error. Either way nothing is
-// stored.
-func (s *Service) deferredCutoverDataPlanes(ctx context.Context, plan *storage.Plan, environment, applyIdentifier, caller string, groups []*storage.ApplyOperationWithTasks) ([]storage.DeferredCutoverDataPlane, error) {
+// operations on another plane's operators, the capacity that plane reports,
+// and returns one entry per pool of drivers those reports identify: how many
+// of the pool's drivers the apply would hold at a deferred cutover at once and
+// how many the pool can hold, for apply creation to admit against
+// (storage.Apply's DeferredCutoverDataPlanes), with the pool each deployment
+// reached, for apply creation to record. Several deployments, or one
+// deployment under several environments, can reach the same pool, so a pool
+// is counted by the identity it reports rather than by route. A deployment
+// that does not report its capacity or its pool cannot hold a deferred apply's
+// operations, and one whose max_drivers_per_apply is below the operations the
+// apply sends it would never have all of them waiting, so the apply is refused
+// here in both cases. A deployment whose report cannot be read refuses it with
+// that error. Either way nothing is stored.
+func (s *Service) deferredCutoverDataPlanes(ctx context.Context, plan *storage.Plan, environment, applyIdentifier, caller string, groups []*storage.ApplyOperationWithTasks) ([]storage.DeferredCutoverDataPlane, map[string]string, error) {
 	ops := make([]*storage.ApplyOperation, 0, len(groups))
 	for _, group := range groups {
 		ops = append(ops, group.Operation)
@@ -242,11 +269,12 @@ func (s *Service) deferredCutoverDataPlanes(ctx context.Context, plan *storage.P
 	// Uncapped: each deployment's operations are compared against that
 	// deployment's own max_drivers_per_apply below, not this plane's.
 	widths := storage.DeferredCutoverHeldAtOnceByDeployment(ops, 0)
-	var planes []storage.DeferredCutoverDataPlane
+	poolOf := make(map[string]string)
+	capacities := make(map[string]*tern.DriverCapacity)
 	for _, deployment := range slices.Sorted(maps.Keys(widths)) {
 		client, err := s.TernClient(deployment, environment)
 		if err != nil {
-			return nil, fmt.Errorf("resolve deployment %s/%s to admit the deferred cutover of apply %s: %w", deployment, environment, applyIdentifier, err)
+			return nil, nil, fmt.Errorf("resolve deployment %s/%s to admit the deferred cutover of apply %s: %w", deployment, environment, applyIdentifier, err)
 		}
 		if !client.IsRemote() {
 			s.logger.Debug("deferred cutover admission: deployment runs on this plane's operators, which admission counts already",
@@ -255,7 +283,7 @@ func (s *Service) deferredCutoverDataPlanes(ctx context.Context, plan *storage.P
 		}
 		capacity, err := s.readDriverCapacity(ctx, client)
 		if err != nil {
-			return nil, fmt.Errorf("read driver capacity of deployment %s/%s for apply %s: %w", deployment, environment, applyIdentifier, err)
+			return nil, nil, fmt.Errorf("read driver capacity of deployment %s/%s for apply %s: %w", deployment, environment, applyIdentifier, err)
 		}
 		refused := &DeferredCutoverCapacityError{
 			Database:    plan.Database,
@@ -270,7 +298,7 @@ func (s *Service) deferredCutoverDataPlanes(ctx context.Context, plan *storage.P
 				"database_type", plan.DatabaseType, "environment", environment, "caller", caller,
 				"deployment", deployment, "operations", widths[deployment])
 			refused.Unreported = true
-			return nil, refused
+			return nil, nil, refused
 		case capacity.MaxDriversPerApply <= 0:
 			// A SchemaBot data plane always reports its resolved cap, so a
 			// missing one is a deployment this admission cannot reason about.
@@ -279,23 +307,61 @@ func (s *Service) deferredCutoverDataPlanes(ctx context.Context, plan *storage.P
 				"database_type", plan.DatabaseType, "environment", environment, "caller", caller,
 				"deployment", deployment, "operations", widths[deployment])
 			refused.Unreported = true
-			return nil, refused
+			return nil, nil, refused
+		case capacity.PoolID == "":
+			// Without the pool's identity, admission cannot tell which other
+			// routes reach the same drivers, so it could book them twice.
+			s.logger.Warn("apply rejected: deployment reported its driver capacity without the identity of its driver pool, so it is treated as not reporting one",
+				"plan_id", plan.PlanIdentifier, "apply_id", applyIdentifier, "database", plan.Database,
+				"database_type", plan.DatabaseType, "environment", environment, "caller", caller,
+				"deployment", deployment, "operations", widths[deployment])
+			refused.Unreported = true
+			return nil, nil, refused
 		case widths[deployment] > capacity.MaxDriversPerApply:
 			s.logger.Warn("apply rejected: deferred cutover would hold more operations on a deployment at once than that deployment's max_drivers_per_apply runs of one apply",
 				"plan_id", plan.PlanIdentifier, "apply_id", applyIdentifier, "database", plan.Database,
 				"database_type", plan.DatabaseType, "environment", environment, "caller", caller,
 				"deployment", deployment, "operations", widths[deployment], "max_drivers_per_apply", capacity.MaxDriversPerApply)
 			refused.PerApplyCap = capacity.MaxDriversPerApply
-			return nil, refused
+			return nil, nil, refused
 		}
-		planes = append(planes, storage.DeferredCutoverDataPlane{
-			Deployment:  deployment,
-			Operations:  widths[deployment],
-			LiveServers: capacity.LiveServers,
-			Capacity:    capacity.DeferredCutoverDrivers,
-		})
+		poolOf[deployment] = capacity.PoolID
+		capacities[deployment] = capacity
 	}
-	return planes, nil
+	return deferredCutoverPools(ops, poolOf, capacities), poolOf, nil
+}
+
+// deferredCutoverPools turns each deployment's capacity report into one entry
+// per pool of drivers. The deployments that reach one pool read their reports
+// moments apart, so the entry keeps the smallest capacity any of them saw.
+func deferredCutoverPools(ops []*storage.ApplyOperation, poolOf map[string]string, capacities map[string]*tern.DriverCapacity) []storage.DeferredCutoverDataPlane {
+	widths := storage.DeferredCutoverHeldAtOnceByPool(ops, poolOf)
+	byPool := make(map[string]*storage.DeferredCutoverDataPlane)
+	deployments := make(map[string][]string)
+	for _, deployment := range slices.Sorted(maps.Keys(poolOf)) {
+		pool := poolOf[deployment]
+		capacity := capacities[deployment]
+		deployments[pool] = append(deployments[pool], deployment)
+		plane, ok := byPool[pool]
+		if !ok {
+			byPool[pool] = &storage.DeferredCutoverDataPlane{
+				Pool:        pool,
+				Operations:  widths[pool],
+				LiveServers: capacity.LiveServers,
+				Capacity:    capacity.DeferredCutoverDrivers,
+			}
+			continue
+		}
+		plane.LiveServers = min(plane.LiveServers, capacity.LiveServers)
+		plane.Capacity = min(plane.Capacity, capacity.DeferredCutoverDrivers)
+	}
+	planes := make([]storage.DeferredCutoverDataPlane, 0, len(byPool))
+	for _, pool := range slices.Sorted(maps.Keys(byPool)) {
+		plane := byPool[pool]
+		plane.Deployment = strings.Join(deployments[pool], ", ")
+		planes = append(planes, *plane)
+	}
+	return planes
 }
 
 // readDriverCapacity asks a remote deployment for the drivers its operators

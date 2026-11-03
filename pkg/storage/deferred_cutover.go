@@ -64,3 +64,27 @@ func DeferredCutoverHeldAtOnceByDeployment(ops []*ApplyOperation, maxDriversPerA
 	}
 	return widths
 }
+
+// DeferredCutoverHeldAtOnceByPool counts, for each driver pool, the most
+// drivers of that pool one apply deferring its cutover would keep waiting there
+// at once (DeferredCutoverHeldAtOnce over the apply's operations on the
+// deployments poolOf maps to it, uncapped). Several deployments, or one
+// deployment under several environments, can reach the same pool, and an
+// operation holds a driver of the pool whichever route sent it. An operation on
+// a deployment poolOf does not name is left out, as is a pool none of whose
+// work is still to settle.
+func DeferredCutoverHeldAtOnceByPool(ops []*ApplyOperation, poolOf map[string]string) map[string]int {
+	byPool := make(map[string][]*ApplyOperation)
+	for _, op := range ops {
+		if pool, ok := poolOf[op.Deployment]; ok {
+			byPool[pool] = append(byPool[pool], op)
+		}
+	}
+	widths := make(map[string]int, len(byPool))
+	for pool, poolOps := range byPool {
+		if width := DeferredCutoverHeldAtOnce(poolOps, 0); width > 0 {
+			widths[pool] = width
+		}
+	}
+	return widths
+}

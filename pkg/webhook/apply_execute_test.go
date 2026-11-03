@@ -826,4 +826,9 @@ func TestDispatchErrorMessageNamesTheRefusingDeployment(t *testing.T) {
 	assert.Equal(t,
 		"`--defer-cutover` would keep 16 drivers on the `east` deployment waiting at the cutover at once. That deployment can keep 32 drivers waiting across its servers, and apply `apply-a1b2c3` already keeps 24 of them waiting, leaving 8. Run `schemabot apply-confirm -e production` again without `--defer-cutover`, or once it is cut over or cancelled.",
 		deferredCutoverCapacityMessage(crowded, action.ApplyConfirm, "production", ""))
+
+	sharedPool := &api.DeferredCutoverCapacityError{Database: "commerce", Environment: "production", Deployment: "east, east-alias", Operations: 3, Reserved: 2, Capacity: 3, LiveServers: 1, HoldingApplyIDs: []string{"apply-a1b2c3"}}
+	assert.Equal(t,
+		"`--defer-cutover` would keep 3 drivers on the `east, east-alias` deployments waiting at the cutover at once. Those deployments can keep 3 drivers waiting across their shared servers, and apply `apply-a1b2c3` already keeps 2 of them waiting, leaving 1. Run `schemabot apply-confirm -e production` again without `--defer-cutover`, or once it is cut over or cancelled.",
+		deferredCutoverCapacityMessage(sharedPool, action.ApplyConfirm, "production", ""))
 }

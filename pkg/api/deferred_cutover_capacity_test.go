@@ -12,6 +12,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/tern"
 )
@@ -93,6 +94,16 @@ func TestDeferredCutoverCapacityErrorMessages(t *testing.T) {
 			name:    "no live server",
 			refused: DeferredCutoverCapacityError{Database: "commerce", Environment: "production", Operations: 4},
 			want:    "commerce/production: --defer-cutover would keep 4 drivers waiting at the cutover at once, and no SchemaBot server has reported its drivers in the last minute; apply again without --defer-cutover",
+		},
+		{
+			name:    "alongside other deferred applies on a pool two deployments share",
+			refused: DeferredCutoverCapacityError{Database: "commerce", Environment: "production", Deployment: "east, east-alias", Operations: 3, Reserved: 2, Capacity: 3, LiveServers: 1, HoldingApplyIDs: []string{"apply-first"}},
+			want:    "commerce/production: --defer-cutover would keep 3 drivers waiting at the cutover at once; the east, east-alias deployments can keep 3 drivers waiting across their shared servers, and apply apply-first already keeps 2 of them waiting, leaving 1; apply again without --defer-cutover, or once it is cut over or cancelled",
+		},
+		{
+			name:    "no live server of a data plane",
+			refused: DeferredCutoverCapacityError{Database: "commerce", Environment: "production", Deployment: "east", Operations: 4},
+			want:    "commerce/production: --defer-cutover would keep 4 drivers on the east deployment waiting at the cutover at once, and no server there has reported its drivers in the last minute; apply again without --defer-cutover",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -311,14 +322,16 @@ func (c *capacityReportingTernClient) DriverCapacity(context.Context) (*tern.Dri
 func ampleDataPlane() *capacityReportingTernClient {
 	return &capacityReportingTernClient{
 		mockTernClient: &mockTernClient{isRemote: true},
-		capacity:       &tern.DriverCapacity{LiveServers: 4, Drivers: 40, DeferredCutoverDrivers: 32, MaxDriversPerApply: 16},
+		capacity:       &tern.DriverCapacity{LiveServers: 4, Drivers: 40, DeferredCutoverDrivers: 32, MaxDriversPerApply: 16, PoolID: "pool-default"},
 	}
 }
 
 // A deferred apply whose operations run on a deployment's own data plane is
 // admitted against what that plane reports: apply creation hands storage the
 // plane's live servers and drivers beside the operations the apply sends it,
-// so storage counts the apply against that plane as well as this one.
+// so storage counts the apply against that plane as well as this one. It
+// records the pool the plane reported for the deployment, so later deferred
+// applies reaching that pool under any route count this one against it.
 func TestDeferredCutoverApplyCarriesItsDataPlanesCapacity(t *testing.T) {
 	applies := &capturingApplyStore{}
 	svc, _ := newQueueApplyTestService(threeShardQueueApplyTestPlan(), ampleDataPlane(), applies)
@@ -328,7 +341,35 @@ func TestDeferredCutoverApplyCarriesItsDataPlanesCapacity(t *testing.T) {
 
 	require.NoError(t, err)
 	require.NotNil(t, applies.apply)
-	assert.Equal(t, []storage.DeferredCutoverDataPlane{{Deployment: "default", Operations: 3, LiveServers: 4, Capacity: 32}}, applies.apply.DeferredCutoverDataPlanes)
+	assert.Equal(t, []storage.DeferredCutoverDataPlane{{Pool: "pool-default", Deployment: "default", Operations: 3, LiveServers: 4, Capacity: 32}}, applies.apply.DeferredCutoverDataPlanes)
+	opts := storage.ParseApplyOptions(applies.apply.Options)
+	assert.True(t, opts.DeferCutover)
+	assert.Equal(t, map[string]string{"default": "pool-default"}, opts.DeferredCutoverPools)
+}
+
+// Two deployments of one apply that reach the same pool of drivers are
+// admitted as one entry for that pool: the operations the apply holds there
+// at once across both, against the smaller capacity either report showed. A
+// deployment on another pool keeps its own entry.
+func TestDeferredCutoverPoolsCountDeploymentsSharingAPoolTogether(t *testing.T) {
+	op := func(deployment string) *storage.ApplyOperation {
+		return &storage.ApplyOperation{
+			Deployment: deployment, Target: deployment, CutoverPolicy: storage.CutoverPolicyBarrier,
+			OperationKind: storage.ApplyOperationKindWork, State: state.ApplyOperation.Pending,
+		}
+	}
+	ops := []*storage.ApplyOperation{op("east"), op("east"), op("east-alias"), op("west")}
+	poolOf := map[string]string{"east": "pool-east", "east-alias": "pool-east", "west": "pool-west"}
+	capacities := map[string]*tern.DriverCapacity{
+		"east":       {LiveServers: 2, DeferredCutoverDrivers: 6, MaxDriversPerApply: 8, PoolID: "pool-east"},
+		"east-alias": {LiveServers: 1, DeferredCutoverDrivers: 3, MaxDriversPerApply: 8, PoolID: "pool-east"},
+		"west":       {LiveServers: 1, DeferredCutoverDrivers: 4, MaxDriversPerApply: 8, PoolID: "pool-west"},
+	}
+
+	assert.Equal(t, []storage.DeferredCutoverDataPlane{
+		{Pool: "pool-east", Deployment: "east, east-alias", Operations: 3, LiveServers: 1, Capacity: 3},
+		{Pool: "pool-west", Deployment: "west", Operations: 1, LiveServers: 1, Capacity: 4},
+	}, deferredCutoverPools(ops, poolOf, capacities))
 }
 
 // A data plane runs at most its own max_drivers_per_apply operations of one
@@ -349,7 +390,7 @@ func TestDeferredCutoverIsRefusedByTheDataPlane(t *testing.T) {
 			name: "wider than the data plane's max_drivers_per_apply",
 			client: &capacityReportingTernClient{
 				mockTernClient: &mockTernClient{isRemote: true},
-				capacity:       &tern.DriverCapacity{LiveServers: 4, Drivers: 40, DeferredCutoverDrivers: 32, MaxDriversPerApply: 2},
+				capacity:       &tern.DriverCapacity{LiveServers: 4, Drivers: 40, DeferredCutoverDrivers: 32, MaxDriversPerApply: 2, PoolID: "pool-default"},
 			},
 			refused: DeferredCutoverCapacityError{Database: "testdb", Environment: "staging", Deployment: "default", Operations: 3, PerApplyCap: 2},
 			message: "apply rejected: testdb/staging: --defer-cutover would keep 3 drivers on the default deployment waiting at the cutover at once, and max_drivers_per_apply there gives one apply at most 2; apply again without --defer-cutover, or raise max_drivers_per_apply on that deployment to at least 3",
@@ -364,7 +405,18 @@ func TestDeferredCutoverIsRefusedByTheDataPlane(t *testing.T) {
 			name: "deployment reports its capacity without its max_drivers_per_apply",
 			client: &capacityReportingTernClient{
 				mockTernClient: &mockTernClient{isRemote: true},
-				capacity:       &tern.DriverCapacity{LiveServers: 4, Drivers: 40, DeferredCutoverDrivers: 32},
+				capacity:       &tern.DriverCapacity{LiveServers: 4, Drivers: 40, DeferredCutoverDrivers: 32, PoolID: "pool-default"},
+			},
+			refused: DeferredCutoverCapacityError{Database: "testdb", Environment: "staging", Deployment: "default", Unreported: true, Operations: 3},
+			message: "apply rejected: testdb/staging: --defer-cutover would keep 3 drivers on the default deployment waiting at the cutover at once, and that deployment does not report how many it can keep waiting; upgrade SchemaBot there, or apply again without --defer-cutover",
+		},
+		{
+			// Without the pool's identity, admission could not count the
+			// deferred applies other routes to the same drivers hold.
+			name: "deployment reports its capacity without its pool",
+			client: &capacityReportingTernClient{
+				mockTernClient: &mockTernClient{isRemote: true},
+				capacity:       &tern.DriverCapacity{LiveServers: 4, Drivers: 40, DeferredCutoverDrivers: 32, MaxDriversPerApply: 16},
 			},
 			refused: DeferredCutoverCapacityError{Database: "testdb", Environment: "staging", Deployment: "default", Unreported: true, Operations: 3},
 			message: "apply rejected: testdb/staging: --defer-cutover would keep 3 drivers on the default deployment waiting at the cutover at once, and that deployment does not report how many it can keep waiting; upgrade SchemaBot there, or apply again without --defer-cutover",

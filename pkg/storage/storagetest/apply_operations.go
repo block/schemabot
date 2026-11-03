@@ -1957,10 +1957,12 @@ func TestApplyOperations(t *testing.T, h Harness) {
 		ctx := t.Context()
 		store := h.NewStorage(t)
 
-		deferred := func(applyID string, planID int64, applyState string) *storage.Apply {
+		// pools is the data-plane pool admission recorded for each
+		// deployment; a deployment it leaves out ran on this plane.
+		deferred := func(applyID string, planID int64, applyState string, pools map[string]string) *storage.Apply {
 			t.Helper()
 			apply := CreateApplyWithStateAndEnv(t, store, CreateLock(t, store, applyID+"_db", storage.DatabaseTypeMySQL), applyID, planID, applyState, "staging")
-			apply.Options = []byte(`{"defer_cutover":true}`)
+			apply.SetOptions(storage.ApplyOptions{DeferCutover: true, DeferredCutoverPools: pools})
 			require.NoError(t, store.Applies().Update(ctx, apply))
 			return apply
 		}
@@ -1973,21 +1975,21 @@ func TestApplyOperations(t *testing.T, h Harness) {
 			require.NoError(t, err)
 		}
 
-		wide := deferred("apply_deferred_wide", 961, state.Apply.Running)
+		wide := deferred("apply_deferred_wide", 961, state.Apply.Running, map[string]string{"region-a": "pool-a"})
 		insert(wide, "commerce/-80/users", storage.ApplyOperationKindWork, state.ApplyOperation.Running)
 		insert(wide, "commerce/80-/users", storage.ApplyOperationKindWork, state.ApplyOperation.Pending)
 		insert(wide, "commerce/c0-/users", storage.ApplyOperationKindWork, state.ApplyOperation.WaitingForCutover)
 		insert(wide, "commerce/40-80/users", storage.ApplyOperationKindWork, state.ApplyOperation.Completed)
 		insert(wide, "commerce/finalize", storage.ApplyOperationKindGroupFinalizer, state.ApplyOperation.Pending)
 
-		narrow := deferred("apply_deferred_narrow", 962, state.Apply.Pending)
+		narrow := deferred("apply_deferred_narrow", 962, state.Apply.Pending, nil)
 		insert(narrow, "schema", storage.ApplyOperationKindWork, state.ApplyOperation.Pending)
 
-		paused := deferred("apply_deferred_stopped", 965, state.Apply.Stopped)
+		paused := deferred("apply_deferred_stopped", 965, state.Apply.Stopped, map[string]string{"region-a": "pool-a"})
 		insert(paused, "commerce/-80/carts", storage.ApplyOperationKindWork, state.ApplyOperation.Stopped)
 		insert(paused, "commerce/80-/carts", storage.ApplyOperationKindWork, state.ApplyOperation.Pending)
 
-		finished := deferred("apply_deferred_cancelled", 963, state.Apply.Cancelled)
+		finished := deferred("apply_deferred_cancelled", 963, state.Apply.Cancelled, map[string]string{"region-a": "pool-a"})
 		insert(finished, "commerce/-80/orders", storage.ApplyOperationKindWork, state.ApplyOperation.Cancelled)
 		insert(finished, "commerce/80-/orders", storage.ApplyOperationKindWork, state.ApplyOperation.Cancelled)
 
@@ -2005,11 +2007,11 @@ func TestApplyOperations(t *testing.T, h Harness) {
 			})
 			require.NoError(t, err)
 		}
-		rolling := deferred("apply_deferred_rolling", 966, state.Apply.Running)
+		rolling := deferred("apply_deferred_rolling", 966, state.Apply.Running, map[string]string{"region-a": "pool-a", "region-b": "pool-b"})
 		insertIn(rolling, "region-a", "commerce/-80/users", storage.CutoverPolicyRolling)
 		insertIn(rolling, "region-a", "commerce/80-/users", storage.CutoverPolicyRolling)
 		insertIn(rolling, "region-b", "commerce/-80/users", storage.CutoverPolicyRolling)
-		barrier := deferred("apply_deferred_barrier", 967, state.Apply.Running)
+		barrier := deferred("apply_deferred_barrier", 967, state.Apply.Running, map[string]string{"region-a": "pool-a", "region-b": "pool-a"})
 		insertIn(barrier, "region-a", "commerce/-80/users", storage.CutoverPolicyBarrier)
 		insertIn(barrier, "region-a", "commerce/80-/users", storage.CutoverPolicyBarrier)
 		insertIn(barrier, "region-b", "commerce/-80/users", storage.CutoverPolicyBarrier)
@@ -2017,17 +2019,20 @@ func TestApplyOperations(t *testing.T, h Harness) {
 		widths, err := store.ApplyOperations().ListActiveDeferredCutoverWidths(ctx)
 		require.NoError(t, err)
 		assert.Equal(t, []storage.DeferredCutoverWidth{
+			// region-a and region-b reach one pool, which holds all three.
 			{ApplyIdentifier: "apply_deferred_barrier", Database: barrier.Database, Environment: "staging", Operations: storage.DefaultMaxDriversPerApply,
-				ByDeployment: map[string]int{"region-a": 2, "region-b": 1}},
+				ByPool: map[string]int{"pool-a": 3}},
 			{ApplyIdentifier: "apply_deferred_narrow", Database: narrow.Database, Environment: "staging", Operations: 1,
-				ByDeployment: map[string]int{"region-a": 1}},
+				ByPool: map[string]int{}},
 			{ApplyIdentifier: "apply_deferred_rolling", Database: rolling.Database, Environment: "staging", Operations: 2,
-				ByDeployment: map[string]int{"region-a": 2, "region-b": 1}},
+				ByPool: map[string]int{"pool-a": 2, "pool-b": 1}},
 			{ApplyIdentifier: "apply_deferred_stopped", Database: paused.Database, Environment: "staging", Operations: 2,
-				ByDeployment: map[string]int{"region-a": 2}},
-			// The three active operations run two at a time, so region-a holds two.
+				ByPool: map[string]int{"pool-a": 2}},
+			// The three active operations run two at a time on this plane, but
+			// on the data plane all three keep a driver, whatever this plane's
+			// max_drivers_per_apply is.
 			{ApplyIdentifier: "apply_deferred_wide", Database: wide.Database, Environment: "staging", Operations: storage.DefaultMaxDriversPerApply,
-				ByDeployment: map[string]int{"region-a": storage.DefaultMaxDriversPerApply}},
+				ByPool: map[string]int{"pool-a": 3}},
 		}, widths)
 	})
 

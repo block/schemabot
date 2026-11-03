@@ -441,14 +441,30 @@ func TestServerRegisterGRPCThreadsStorageSchemaService(t *testing.T) {
 }
 
 // operatorServersStorage is storage whose operator servers registry answers
-// ListLive with fixed servers.
+// ListLive with fixed servers, and whose settings already name the driver
+// pool.
 type operatorServersStorage struct {
 	storage.Storage
 	servers []*storage.OperatorServer
+	poolID  string
 }
 
 func (s operatorServersStorage) OperatorServers() storage.OperatorServerStore {
 	return liveOperatorServers{servers: s.servers}
+}
+
+func (s operatorServersStorage) Settings() storage.SettingsStore {
+	return poolSettings{poolID: s.poolID}
+}
+
+// poolSettings is a settings store holding only the driver pool's identity.
+type poolSettings struct {
+	storage.SettingsStore
+	poolID string
+}
+
+func (s poolSettings) Get(_ context.Context, key string) (*storage.Setting, error) {
+	return &storage.Setting{Key: key, Value: s.poolID}, nil
 }
 
 type liveOperatorServers struct {
@@ -478,7 +494,7 @@ func TestServerRegisterGRPCReportsDriverCapacity(t *testing.T) {
 			cfg := &api.ServerConfig{MaxDriversPerApply: tc.maxDriversPerApply}
 			store := operatorServersStorage{servers: []*storage.OperatorServer{
 				{ServerID: "host-a/1/operator", Drivers: 4, DeferredCutoverDrivers: 3},
-			}}
+			}, poolID: "pool-east"}
 			srv := &Server{
 				cfg:             cfg,
 				dataPlaneClient: stubTernClient{},
@@ -494,6 +510,7 @@ func TestServerRegisterGRPCReportsDriverCapacity(t *testing.T) {
 			assert.Equal(t, int32(4), resp.GetDrivers())
 			assert.Equal(t, int32(3), resp.GetDeferredCutoverDrivers())
 			assert.Equal(t, tc.want, resp.GetMaxDriversPerApply())
+			assert.Equal(t, "pool-east", resp.GetPoolId())
 		})
 	}
 }

@@ -1762,6 +1762,7 @@ func (c *GRPCClient) DriverCapacity(ctx context.Context) (*DriverCapacity, error
 		Drivers:                int(resp.GetDrivers()),
 		DeferredCutoverDrivers: int(resp.GetDeferredCutoverDrivers()),
 		MaxDriversPerApply:     int(resp.GetMaxDriversPerApply()),
+		PoolID:                 resp.GetPoolId(),
 	}, nil
 }
 

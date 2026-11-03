@@ -4220,8 +4220,14 @@ type DriverCapacityResponse struct {
 	// apply that sends the deployment more operations than this can never have
 	// all of them waiting together.
 	MaxDriversPerApply int32 `protobuf:"varint,4,opt,name=max_drivers_per_apply,json=maxDriversPerApply,proto3" json:"max_drivers_per_apply,omitempty"`
-	unknownFields      protoimpl.UnknownFields
-	sizeCache          protoimpl.SizeCache
+	// pool_id identifies the pool these drivers are: every endpoint that answers
+	// with the same pool_id reports the same drivers, whichever deployment or
+	// environment a caller reached it under. A caller counts what it has booked
+	// under any of those routes against the one pool. It is stable for as long
+	// as the deployment keeps its storage.
+	PoolId        string `protobuf:"bytes,5,opt,name=pool_id,json=poolId,proto3" json:"pool_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *DriverCapacityResponse) Reset() {
@@ -4280,6 +4286,13 @@ func (x *DriverCapacityResponse) GetMaxDriversPerApply() int32 {
 		return x.MaxDriversPerApply
 	}
 	return 0
+}
+
+func (x *DriverCapacityResponse) GetPoolId() string {
+	if x != nil {
+		return x.PoolId
+	}
+	return ""
 }
 
 // StopRequest pauses an in-progress schema change by apply ID.
@@ -5623,12 +5636,13 @@ const file_tern_proto_rawDesc = "" +
 	"\rHealthRequest\"(\n" +
 	"\x0eHealthResponse\x12\x16\n" +
 	"\x06status\x18\x01 \x01(\tR\x06status\"\x17\n" +
-	"\x15DriverCapacityRequest\"\xc2\x01\n" +
+	"\x15DriverCapacityRequest\"\xdb\x01\n" +
 	"\x16DriverCapacityResponse\x12!\n" +
 	"\flive_servers\x18\x01 \x01(\x05R\vliveServers\x12\x18\n" +
 	"\adrivers\x18\x02 \x01(\x05R\adrivers\x128\n" +
 	"\x18deferred_cutover_drivers\x18\x03 \x01(\x05R\x16deferredCutoverDrivers\x121\n" +
-	"\x15max_drivers_per_apply\x18\x04 \x01(\x05R\x12maxDriversPerApply\"b\n" +
+	"\x15max_drivers_per_apply\x18\x04 \x01(\x05R\x12maxDriversPerApply\x12\x17\n" +
+	"\apool_id\x18\x05 \x01(\tR\x06poolId\"b\n" +
 	"\vStopRequest\x12\x19\n" +
 	"\bapply_id\x18\x01 \x01(\tR\aapplyId\x12 \n" +
 	"\venvironment\x18\x02 \x01(\tR\venvironment\x12\x16\n" +

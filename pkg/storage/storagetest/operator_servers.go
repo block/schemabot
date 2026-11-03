@@ -248,6 +248,38 @@ func TestOperatorServers(t *testing.T, h Harness) {
 		require.True(t, ok, "got %v", err)
 		assert.Equal(t, storage.DeferredCutoverCapacityError{Deployment: "north", Operations: 2, Capacity: 8}, *refused)
 	})
+
+	// CountsADataPlanePoolAcrossEveryRouteToIt verifies deferred applies sent
+	// to one data-plane pool under different routes, another environment and
+	// another deployment name, count against the pool's drivers together:
+	// with three drivers shared, a staging apply holding two leaves one for
+	// production, whichever route reaches the pool. A route to another pool
+	// is not counted against it.
+	t.Run("CountsADataPlanePoolAcrossEveryRouteToIt", func(t *testing.T) {
+		store := h.NewStorage(t)
+		heartbeat(t, store, "host-a/1/operator", 12, 11)
+		shared := storage.DeferredCutoverDataPlane{Pool: "pool-shared", LiveServers: 1, Capacity: 3}
+
+		_, err := createDataPlaneDeferredApplyIn(t, store, "apply_staging", "orders", "staging", "east", 2, shared)
+		require.NoError(t, err)
+
+		_, err = createDataPlaneDeferredApplyIn(t, store, "apply_production", "orders", "production", "east", 2, shared)
+		refused, ok := errors.AsType[*storage.DeferredCutoverCapacityError](err)
+		require.True(t, ok, "the production route reaches the staging apply's pool, got %v", err)
+		assert.Equal(t, storage.DeferredCutoverCapacityError{
+			Deployment: "east", Operations: 2, Reserved: 2, Capacity: 3, LiveServers: 1,
+			HoldingApplyIDs: []string{"apply_staging"},
+		}, *refused)
+
+		_, err = createDataPlaneDeferredApplyIn(t, store, "apply_alias", "payments", "staging", "east-alias", 2, shared)
+		refused, ok = errors.AsType[*storage.DeferredCutoverCapacityError](err)
+		require.True(t, ok, "another deployment name for the pool counts it too, got %v", err)
+		assert.Equal(t, []string{"apply_staging"}, refused.HoldingApplyIDs)
+
+		_, err = createDataPlaneDeferredApplyIn(t, store, "apply_elsewhere", "payments", "staging", "east", 3,
+			storage.DeferredCutoverDataPlane{Pool: "pool-other", LiveServers: 1, Capacity: 3})
+		require.NoError(t, err, "the staging apply holds none of another pool's drivers")
+	})
 }
 
 // heartbeat registers a live operator server.
@@ -269,16 +301,29 @@ func createDeferredApply(t *testing.T, store storage.Storage, applyID, database 
 	return store.Applies().CreateWithGroupedOperations(t.Context(), apply, groups)
 }
 
-// createDataPlaneDeferredApply creates a pending apply deferring its cutover
-// on database whose shards run on deployment's own data plane, which reported
-// the deferred cutover drivers in plane, as apply creation does for a
-// deployment that runs its operations on another plane's operators.
+// createDataPlaneDeferredApply creates a pending production apply deferring
+// its cutover on database whose shards run on deployment's own data plane,
+// which reported the deferred cutover drivers in plane and the pool it names
+// (the deployment's own name when plane names none), as apply creation does
+// for a deployment that runs its operations on another plane's operators.
 func createDataPlaneDeferredApply(t *testing.T, store storage.Storage, applyID, database, deployment string, shards int, plane storage.DeferredCutoverDataPlane) (int64, error) {
 	t.Helper()
+	return createDataPlaneDeferredApplyIn(t, store, applyID, database, "production", deployment, shards, plane)
+}
+
+// createDataPlaneDeferredApplyIn is createDataPlaneDeferredApply for an apply
+// in environment.
+func createDataPlaneDeferredApplyIn(t *testing.T, store storage.Storage, applyID, database, environment, deployment string, shards int, plane storage.DeferredCutoverDataPlane) (int64, error) {
+	t.Helper()
 	apply, groups := newDeferredApply(applyID, database, deployment, shards)
+	apply.Environment = environment
+	if plane.Pool == "" {
+		plane.Pool = deployment
+	}
 	plane.Deployment = deployment
 	plane.Operations = shards
 	apply.DeferredCutoverDataPlanes = []storage.DeferredCutoverDataPlane{plane}
+	apply.SetOptions(storage.ApplyOptions{DeferCutover: true, DeferredCutoverPools: map[string]string{deployment: plane.Pool}})
 	return store.Applies().CreateWithGroupedOperations(t.Context(), apply, groups)
 }
 

@@ -318,6 +318,10 @@ type DriverCapacity struct {
 	// MaxDriversPerApply is how many operations of one apply the deployment
 	// runs at once.
 	MaxDriversPerApply int
+	// PoolID identifies the pool these drivers are. Every route that answers
+	// with the same PoolID reports the same drivers, so what the caller has
+	// booked under any of them counts against the one pool.
+	PoolID string
 }
 
 // DriverCapacityReader is a client for a deployment whose operators run its

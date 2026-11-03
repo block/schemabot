@@ -147,20 +147,22 @@ func admitDeferredCutover(ctx context.Context, tx rowsQueryer, dialect Dialect, 
 		return refused
 	}
 	for _, plane := range apply.DeferredCutoverDataPlanes {
-		if refused := dataPlaneDeferredCutoverRefusal(apply.Environment, plane, widths); refused != nil {
+		if refused := dataPlaneDeferredCutoverRefusal(plane, widths); refused != nil {
 			return refused
 		}
 	}
 	return nil
 }
 
-// dataPlaneDeferredCutoverRefusal refuses an apply's operations on a
-// deployment that runs them on another plane's operators when they do not fit,
-// beside the other admitted deferred applies' operations on that deployment
-// and environment, in the deferred cutover drivers that plane reported. A
-// plane serves one control plane, so widths, every deferred apply this store
-// holds, is every deferred apply the plane runs.
-func dataPlaneDeferredCutoverRefusal(environment string, plane storage.DeferredCutoverDataPlane, widths []storage.DeferredCutoverWidth) *storage.DeferredCutoverCapacityError {
+// dataPlaneDeferredCutoverRefusal refuses an apply's operations on another
+// plane's driver pool when they do not fit, beside the other admitted deferred
+// applies' operations on that pool, in the deferred cutover drivers the pool
+// reported. The pool is matched by the identity it reported, not by route, so
+// operations sent under any deployment or environment that reaches the same
+// pool count against it together. A plane serves one control plane, so widths,
+// every deferred apply this store holds, is every deferred apply the pool
+// runs.
+func dataPlaneDeferredCutoverRefusal(plane storage.DeferredCutoverDataPlane, widths []storage.DeferredCutoverWidth) *storage.DeferredCutoverCapacityError {
 	refused := &storage.DeferredCutoverCapacityError{
 		Deployment:  plane.Deployment,
 		Operations:  plane.Operations,
@@ -171,7 +173,7 @@ func dataPlaneDeferredCutoverRefusal(environment string, plane storage.DeferredC
 		return refused
 	}
 	for _, width := range widths {
-		if held := width.ByDeployment[plane.Deployment]; width.Environment == environment && held > 0 {
+		if held := width.ByPool[plane.Pool]; held > 0 {
 			refused.Reserved += held
 			refused.HoldingApplyIDs = append(refused.HoldingApplyIDs, width.ApplyIdentifier)
 		}
