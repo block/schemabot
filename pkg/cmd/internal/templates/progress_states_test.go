@@ -1181,6 +1181,68 @@ func TestFormatTableProgressOperatorHaltedBars(t *testing.T) {
 	assert.Contains(t, failed, ui.ColorRed)
 }
 
+// Every task state other than running renders its own table row. A state that
+// fell through to the running row would show a table as "Running..." when it
+// is waiting on an operator, reverted, or otherwise not moving at all. The
+// running row has two shapes, so each state is rendered both ways: with no
+// counters it says "Running...", and with row counters it draws a copy bar
+// and names the state on a "Status:" line that no other row prints.
+func TestFormatTableProgress_EveryStateHasItsOwnRow(t *testing.T) {
+	bare := TableProgress{TableName: "users", ChangeType: "alter"}
+	counted := TableProgress{TableName: "users", ChangeType: "alter", RowsCopied: 400, RowsTotal: 1000, PercentComplete: 40}
+
+	bare.Status = state.Task.Running
+	require.Contains(t, FormatTableProgress(bare), "Running...")
+	counted.Status = state.Task.Running
+	require.Contains(t, FormatTableProgress(counted), "40.00%")
+
+	v := reflect.ValueOf(state.Task)
+	for i := range v.NumField() {
+		status := v.Field(i).String()
+		require.NotEmpty(t, status, "state.Task.%s is empty", v.Type().Field(i).Name)
+		if status == state.Task.Running {
+			continue
+		}
+		t.Run(status, func(t *testing.T) {
+			bare.Status = status
+			assert.NotContainsf(t, FormatTableProgress(bare), "Running...",
+				"state.Task.%s renders as a running table", v.Type().Field(i).Name)
+
+			counted.Status = status
+			assert.NotContainsf(t, FormatTableProgress(counted), "Status: ",
+				"state.Task.%s with row counters renders as a running copy", v.Type().Field(i).Name)
+		})
+	}
+}
+
+// A table whose deploy is deferred reads as waiting for the deploy, the same
+// words the PR comment uses, rather than as a copy that is still running. The
+// row keeps the layout every phase row shares: the DDL, a blank line, then
+// the shard list. Should a table in this state carry row counters, they do
+// not bring back a copy bar or a rows line.
+func TestFormatTableProgress_WaitingForDeploy(t *testing.T) {
+	output := ansiEscape.ReplaceAllString(FormatTableProgress(TableProgress{
+		TableName:       "users",
+		ChangeType:      "alter",
+		Status:          state.Task.WaitingForDeploy,
+		DDL:             "ALTER TABLE `users` ADD COLUMN `nickname` varchar(64)",
+		RowsCopied:      400,
+		RowsTotal:       1000,
+		PercentComplete: 40,
+		Shards: []ShardProgress{
+			{Shard: "-80", Status: state.Task.WaitingForDeploy},
+			{Shard: "80-", Status: state.Task.WaitingForDeploy},
+		},
+	}), "")
+
+	assert.Contains(t, output, "users: ⏸️ Waiting for deploy\n")
+	assert.NotContains(t, output, "Running...")
+	assert.NotContains(t, output, "🟦", "the counters do not render a copy bar")
+	assert.NotContains(t, output, "Rows: 400", "the counters do not render copy progress")
+	assert.Contains(t, output, "ADD COLUMN `nickname` varchar(64);\n\n"+indentDetail+"Shards: 2",
+		"the DDL, a blank line, then the shard list, as every phase row lays them out")
+}
+
 func TestThrottleReferenceRequiresActiveRecognizedSignal(t *testing.T) {
 	for _, status := range []string{state.Task.Running, state.Task.Checksumming} {
 		t.Run(status, func(t *testing.T) {
