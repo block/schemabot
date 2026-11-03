@@ -395,12 +395,9 @@ func NamespacePlacementRefused(err error) bool {
 // narrowed schema files, so an engine that diffs the whole target as one unit
 // can refuse rather than read the omission as intent to drop.
 func unselectedNamespaces(schemaFiles map[string]*ternv1.SchemaFiles, member routing.ExecutionTarget) []string {
-	if len(member.Namespaces) == 0 {
-		return nil
-	}
 	var unselected []string
 	for _, namespace := range slices.Sorted(maps.Keys(schemaFiles)) {
-		if !slices.Contains(member.Namespaces, namespace) {
+		if !member.Holds(namespace) {
 			unselected = append(unselected, namespace)
 		}
 	}
@@ -444,18 +441,9 @@ func (e *NamespaceCoverageError) Error() string {
 // plan read clean. A namespace deliberately kept out of the rollout belongs in
 // ignore_namespaces, which removes it from the declared set before this runs.
 func uncoveredNamespaces(req PlanRequest, targets []routing.ExecutionTarget) []string {
-	covered := make(map[string]bool)
-	for _, target := range targets {
-		if len(target.Namespaces) == 0 {
-			return nil
-		}
-		for _, namespace := range target.Namespaces {
-			covered[namespace] = true
-		}
-	}
 	var uncovered []string
 	for _, namespace := range slices.Sorted(maps.Keys(req.SchemaFiles)) {
-		if !covered[namespace] {
+		if !slices.ContainsFunc(targets, func(target routing.ExecutionTarget) bool { return target.Holds(namespace) }) {
 			uncovered = append(uncovered, namespace)
 		}
 	}

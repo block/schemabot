@@ -882,7 +882,9 @@ settles to permanent `failed` when the attempt budget is spent or the recovery w
 *Enforced:* retry preparation in the drive loop (`pkg/api/operator.go`), the re-plan before a drive
 starts again a task another run held the table from (`pkg/tern/local_apply_sequential.go`), the
 resume re-plan that settles a task whose change already landed (`pkg/tern/local_control_resume.go`),
-and the expiry sweep (`pkg/api/reaper.go`, `pkg/storage/internal/sqlstore/applies.go`); budget semantics in
+the group_finalizer drive, which pauses its task-less operation as `failed_retryable` on an error
+retrying can cure instead of failing it (`driveGroupFinalizer`, same file), and the expiry sweep
+(`pkg/api/reaper.go`, `pkg/storage/internal/sqlstore/applies.go`); budget semantics in
 [apply-lifecycle.md](apply-lifecycle.md).
 
 ### ST-10: Rollouts respect order and fail closed on policy
@@ -1457,7 +1459,7 @@ happen that should not. *Enforced:* the acknowledgment points in the comment-com
 
 Every progress surface renders from stored state. No reader polls an engine: the lease-holding
 driver is the only engine poller in the system, advancing task and apply state, persisting
-per-shard rows and engine resume metadata on every tick, and terminalizing the apply. Readers
+per-shard rows and engine resume metadata on every full poll, and terminalizing the apply. Readers
 derive from what it wrote, computing the rollups that are not stored, such as a table's headline
 across its shards, at read time.
 
@@ -1594,7 +1596,7 @@ What does detect it is the lease that sibling drive holds. For task rows the swe
 whose operation carries no heartbeated lease, read the way the claim path reads a lease it may take
 from a peer, so the reaper may write a row only where a driver would be allowed to take it (OW-8).
 That is a mechanism rather than a timing argument, which matters because the alternative signal
-cannot be made sound at any window length: a drive mirrors its task rows every tick, but a remote
+cannot be made sound at any window length: a drive mirrors its task rows on every full poll, but a remote
 sync skips a stored task the remote stopped reporting, so a row can go quiet while its drive is
 alive. The lease is read per operation, so a live deployment holds its own rows without shielding
 an abandoned sibling's.

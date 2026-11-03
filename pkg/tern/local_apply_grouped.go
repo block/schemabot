@@ -725,6 +725,7 @@ func (c *LocalClient) pollForCompletionAtomic(ctx context.Context, apply *storag
 		lastProgressLog: time.Now(),
 		revertSkipped:   apply.RevertSkippedAt != nil,
 		lostWork:        lostEngineWorkTracker{budget: c.lostEngineWorkPendingBudget(eng)},
+		parked:          newParkedPoll(),
 	}
 
 	// Every exit but the cutover barrier's leaves no engine work running behind
@@ -743,6 +744,9 @@ func (c *LocalClient) pollForCompletionAtomic(ctx context.Context, apply *storag
 				apply.IdentityLogAttrs()...)
 			return nil
 		case <-ticker.C:
+			if !ps.parked.runFullPoll(ctx, c.storage, apply, time.Now(), c.logger.With(apply.IdentityLogAttrs()...)) {
+				continue
+			}
 			if done := c.handleAtomicProgressTick(ctx, eng, apply, tasks, creds, resumeState, ps, options, releaseAtCutoverBarrier); done {
 				return ps.terminalErr
 			}
@@ -792,6 +796,7 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 			"error", err)
 		return true
 	}
+	ps.parked.observe(pendingBeforeProgress)
 	if pendingBeforeProgress.has(storage.ControlOperationCancel, storage.ControlOperationStop) {
 		if standDown, err := c.processPendingCancelOrStopControlRequest(ctx, apply); err != nil {
 			logger.Warn("pending stop request processing failed; current apply owner will exit for operator retry",
@@ -1006,6 +1011,7 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 			"error", err)
 		return true
 	}
+	ps.parked.observe(pendingAfterProgress)
 	if pendingAfterProgress.has(storage.ControlOperationCancel, storage.ControlOperationStop) {
 		if standDown, err := c.processPendingCancelOrStopControlRequest(ctx, apply); err != nil {
 			logger.Warn("pending stop request processing failed after progress sync; current apply owner will exit for operator retry",
@@ -1062,8 +1068,19 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 	// operation parking at the barrier under an ordered-cutover policy is exempt:
 	// it releases the copy drive below for the deployment-ordered cutover claim
 	// to pick up later, so it must not be cancelled for "inaction".
-	if result.State == engine.StateWaitingForCutover && opts.DeferCutover && !releaseAtCutoverBarrier &&
-		!ps.stateEnteredAt.IsZero() && time.Since(ps.stateEnteredAt) > waitingForManualActionTimeout {
+	heldForCutover := result.State == engine.StateWaitingForCutover && opts.DeferCutover && !releaseAtCutoverBarrier
+	cutoverTimedOut := heldForCutover && !ps.stateEnteredAt.IsZero() && time.Since(ps.stateEnteredAt) > waitingForManualActionTimeout
+
+	// The progress sync above recorded every task waiting for its cutover, so
+	// a deferred cutover slows its poll until an operator acts. A barrier park
+	// releases its claim below instead, and a sync that did not land keeps the
+	// full cadence until a write does. A tick that times the cutover out stops
+	// the engine below, and the drive keeps the full cadence to see it stop.
+	if heldForCutover && !cutoverTimedOut && ps.progressWriteFailures == 0 {
+		ps.parked.hold()
+	}
+
+	if cutoverTimedOut {
 		logger.Info("waiting-for-cutover timed out, cancelling apply",
 			"timeout", waitingForManualActionTimeout)
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelWarn, storage.LogEventStateTransition, storage.LogSourceSchemaBot,

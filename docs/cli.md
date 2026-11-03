@@ -754,8 +754,27 @@ Pick the operation for the current state and engine:
 | `rollback` | Plan a new change toward the schema stored before an earlier apply |
 
 Support and timing differ by engine; see the [engine capability matrix](engines.md).
-A request being accepted does not mean its effect has landed. Check progress
-until you see the resulting state. For example, a completed apply returns:
+A request being accepted does not mean its effect has landed. `revert` and
+`skip-revert` say so directly: each reports the operation as requested, not
+done, and prints the `progress` command that follows it. Repeating a request
+that is already pending reports it as already requested:
+
+```console
+$ schemabot revert -e staging apply-example-73
+Revert requested for shop/staging (apply apply-example-73) — SchemaBot will undo this schema change
+To watch and manage: schemabot progress apply-example-73 -e staging
+
+$ schemabot skip-revert -e staging apply-example-73
+Skip-revert requested for shop/staging (apply apply-example-73) — SchemaBot will close the revert window and make this schema change permanent
+To watch and manage: schemabot progress apply-example-73 -e staging
+
+$ schemabot skip-revert -e staging apply-example-73
+Skip-revert already requested for shop/staging (apply apply-example-73) — SchemaBot will finish the existing request
+To watch and manage: schemabot progress apply-example-73 -e staging
+```
+
+Check progress until you see the resulting state. For example, a completed
+apply returns:
 
 ```console
 $ schemabot status apply-example-73

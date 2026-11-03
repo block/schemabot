@@ -1877,7 +1877,8 @@ func TestApplyOperations(t *testing.T, h Harness) {
 	// starts or recovers an operation of an apply deferring its cutover, so it
 	// takes the regular apply's operation even though the deferred one queued
 	// first, and leaves the deferred one to the other drivers. It still claims
-	// a deferred operation to deliver a cancel, since that ends the work.
+	// a deferred operation to deliver a stop or cancel, since that ends the
+	// work, including recovering a crashed drive of one with a stop pending.
 	t.Run("FindNextApplyOperation_SkipDeferredCutoverWork", func(t *testing.T) {
 		ctx := t.Context()
 		store := h.NewStorage(t)
@@ -1930,11 +1931,84 @@ func TestApplyOperations(t *testing.T, h Harness) {
 		require.NotNil(t, got, "any other driver recovers the deferred apply's stale operation")
 		assert.Equal(t, deferredOp, got.ID)
 
+		released, err = store.ApplyOperations().ReleaseClaim(ctx, got.Lease())
+		require.NoError(t, err)
+		require.True(t, released)
+		requestControl(t, store, deferredApply.ID, storage.ControlOperationStop)
+		got = claimSkipping()
+		require.NotNil(t, got, "the reserved driver recovers the deferred apply's stale operation to deliver its pending stop")
+		assert.Equal(t, deferredOp, got.ID)
+
 		require.NoError(t, store.ApplyOperations().UpdateState(ctx, deferredOp, state.ApplyOperation.Stopped))
 		requestControl(t, store, deferredApply.ID, storage.ControlOperationCancel)
 		got = claimSkipping()
 		require.NotNil(t, got, "the reserved driver still delivers a cancel to the deferred apply")
 		assert.Equal(t, deferredOp, got.ID)
+	})
+
+	// FindNextApplyOperation_SkipDeferredCutoverWorkRecoversForStopOrCancel
+	// verifies both arms that recover a crashed drive of an apply deferring its
+	// cutover: the stale-active arm, and the failed_retryable arm's
+	// crash-recovery branch. The reserved driver leaves each to the other
+	// drivers until a stop or cancel is pending, then recovers it so the
+	// request is delivered, for either request.
+	t.Run("FindNextApplyOperation_SkipDeferredCutoverWorkRecoversForStopOrCancel", func(t *testing.T) {
+		for _, arm := range []struct {
+			name    string
+			opState string
+		}{
+			{"stale active", state.ApplyOperation.Running},
+			{"crashed retry", state.ApplyOperation.FailedRetryable},
+		} {
+			for _, request := range []storage.ControlOperation{storage.ControlOperationStop, storage.ControlOperationCancel} {
+				t.Run(arm.name+" "+string(request), func(t *testing.T) {
+					ctx := t.Context()
+					store := h.NewStorage(t)
+
+					// A running parent whose driver crashed: claimed, then
+					// released, which backdates its heartbeat past the
+					// staleness window.
+					apply := CreateClaimedApply(t, store, CreateLock(t, store, "operation_deferred_recovery_db", storage.DatabaseTypeMySQL), "apply_operation_deferred_recovery", 941, "crashed-driver")
+					apply.State = state.Apply.Running
+					apply.Options = []byte(`{"defer_cutover":true}`)
+					require.NoError(t, store.Applies().Update(ctx, apply))
+					released, err := store.Applies().ReleaseClaim(ctx, apply.Lease())
+					require.NoError(t, err)
+					require.True(t, released)
+
+					// Its operation, left in the arm's state by the crashed
+					// drive and released the same way.
+					opID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+						ApplyID: apply.ID, Deployment: "region-a",
+						OperationKey:  "commerce/-80/users",
+						OperationKind: storage.ApplyOperationKindWork,
+					})
+					require.NoError(t, err)
+					crashed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "crashed-driver")
+					require.NoError(t, err)
+					require.NotNil(t, crashed, "the crashed driver had claimed the operation")
+					require.Equal(t, opID, crashed.ID)
+					require.NoError(t, store.ApplyOperations().UpdateState(ctx, opID, arm.opState))
+					released, err = store.ApplyOperations().ReleaseClaim(ctx, crashed.Lease())
+					require.NoError(t, err)
+					require.True(t, released)
+
+					claimSkipping := func() *storage.ApplyOperation {
+						t.Helper()
+						got, err := store.ApplyOperations().FindNextApplyOperation(ctx, "reserved-driver", storage.SkipDeferredCutoverWork())
+						require.NoError(t, err)
+						return got
+					}
+					assert.Nil(t, claimSkipping(), "the reserved driver leaves the crashed deferred drive to the other drivers")
+
+					requestControl(t, store, apply.ID, request)
+					got := claimSkipping()
+					require.NotNil(t, got, "the reserved driver recovers the crashed deferred drive to deliver its pending %s", request)
+					assert.Equal(t, opID, got.ID)
+					assert.Equal(t, arm.opState, got.State, "recovery keeps the state the crashed drive left")
+				})
+			}
+		}
 	})
 
 	// LeaseGuardsSingleAndJoinedWrites verifies both guarded DML shapes. An
@@ -1991,6 +2065,93 @@ func TestApplyOperations(t *testing.T, h Harness) {
 		require.NotNil(t, operation)
 		assert.Equal(t, state.ApplyOperation.Running, operation.State)
 		assert.NotNil(t, operation.StartedAt)
+	})
+
+	// MarkFailedRetryable verifies the pause write records the failure reason
+	// on a resumable row, leaving completed_at unset because the row is not
+	// terminal, and that it takes the same lease fence as the other operation
+	// writes: a holder whose lease was rotated away changes nothing.
+	t.Run("MarkFailedRetryable", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "operation_failed_retryable_db", storage.DatabaseTypeMySQL)
+		apply := CreateApply(t, store, lock, "apply_operation_failed_retryable", 912)
+		opID := createOperation(t, store, apply.ID, "region-a", "commerce/group_finalizer")
+		claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "current-driver")
+		require.NoError(t, err)
+		require.NotNil(t, claimed)
+
+		staleCtx := storage.WithOperationLease(ctx, storage.OperationLease{
+			ApplyID: apply.ID, OperationID: opID, Owner: "old-driver", Token: "stale-token",
+		})
+		require.ErrorIs(t, store.ApplyOperations().MarkFailedRetryable(staleCtx, opID, "storage unavailable"), storage.ErrApplyLeaseLost)
+		operation, err := store.ApplyOperations().Get(ctx, opID)
+		require.NoError(t, err)
+		require.NotNil(t, operation)
+		assert.Equal(t, state.ApplyOperation.Running, operation.State, "a stale lease holder must not pause the row")
+		assert.Empty(t, operation.ErrorMessage)
+
+		ownedCtx := storage.WithOperationLease(ctx, storage.OperationLease{
+			ApplyID: apply.ID, OperationID: opID, Owner: claimed.LeaseOwner, Token: claimed.LeaseToken,
+		})
+		require.NoError(t, store.ApplyOperations().MarkFailedRetryable(ownedCtx, opID, "storage unavailable"))
+		operation, err = store.ApplyOperations().Get(ctx, opID)
+		require.NoError(t, err)
+		require.NotNil(t, operation)
+		assert.Equal(t, state.ApplyOperation.FailedRetryable, operation.State)
+		assert.Equal(t, "storage unavailable", operation.ErrorMessage)
+		assert.Nil(t, operation.CompletedAt, "a resumable row carries no completion time")
+		assert.False(t, state.IsApplyOperationTerminal(operation.State))
+
+		require.NoError(t, store.ApplyOperations().MarkFailedRetryable(ownedCtx, opID, "storage unavailable"),
+			"re-issuing the same pause is a no-op, not an error")
+
+		err = store.ApplyOperations().MarkFailedRetryable(ctx, 999999, "storage unavailable")
+		require.ErrorIs(t, err, storage.ErrApplyOperationNotFound)
+	})
+
+	// ClearEngineResumeState verifies the clear removes both the context and
+	// the metadata so a later read reports the state missing, takes the same
+	// lease fence as the other operation writes, and is a no-op on a row whose
+	// state is already absent.
+	t.Run("ClearEngineResumeState", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "operation_clear_resume_db", storage.DatabaseTypeMySQL)
+		apply := CreateApply(t, store, lock, "apply_operation_clear_resume", 913)
+		opID := createOperation(t, store, apply.ID, "region-a", "commerce/group_finalizer")
+		claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "current-driver")
+		require.NoError(t, err)
+		require.NotNil(t, claimed)
+		ownedCtx := storage.WithOperationLease(ctx, storage.OperationLease{
+			ApplyID: apply.ID, OperationID: opID, Owner: claimed.LeaseOwner, Token: claimed.LeaseToken,
+		})
+		require.NoError(t, store.ApplyOperations().SaveEngineResumeState(ownedCtx, opID, &storage.EngineResumeState{
+			ApplyOperationID: opID, MigrationContext: "deploy-ns-0", Metadata: `{"handoff":"true"}`,
+		}))
+
+		staleCtx := storage.WithOperationLease(ctx, storage.OperationLease{
+			ApplyID: apply.ID, OperationID: opID, Owner: "old-driver", Token: "stale-token",
+		})
+		require.ErrorIs(t, store.ApplyOperations().ClearEngineResumeState(staleCtx, opID), storage.ErrApplyLeaseLost)
+		stored, err := store.ApplyOperations().GetEngineResumeState(ctx, opID)
+		require.NoError(t, err, "a stale lease holder must not clear the state")
+		assert.Equal(t, "deploy-ns-0", stored.MigrationContext)
+		assert.JSONEq(t, `{"handoff":"true"}`, stored.Metadata)
+
+		require.NoError(t, store.ApplyOperations().ClearEngineResumeState(ownedCtx, opID))
+		_, err = store.ApplyOperations().GetEngineResumeState(ctx, opID)
+		require.ErrorIs(t, err, storage.ErrEngineResumeStateNotFound, "a cleared row reads as never handed to the engine")
+		operation, err := store.ApplyOperations().Get(ctx, opID)
+		require.NoError(t, err)
+		require.NotNil(t, operation)
+		assert.Equal(t, state.ApplyOperation.Running, operation.State, "the clear touches only the resume state")
+
+		require.NoError(t, store.ApplyOperations().ClearEngineResumeState(ownedCtx, opID),
+			"clearing an already-cleared row is a no-op, not an error")
+
+		err = store.ApplyOperations().ClearEngineResumeState(ctx, 999999)
+		require.ErrorIs(t, err, storage.ErrApplyOperationNotFound)
 	})
 
 	// An operation row carries no terminal-state guard: the lease fence alone

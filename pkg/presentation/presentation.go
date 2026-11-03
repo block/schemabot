@@ -493,6 +493,60 @@ func Derive(ops []Operation) Apply {
 	}
 }
 
+// AwaitingResume reports whether a table of a resuming apply still stands
+// where the stop left it on every part that runs it, each in the status at the
+// same index of statuses: stopped on at least one, and every other one either
+// finished it before the stop or has not begun it. Its stopped progress is from
+// before the stop, so the table reads as resuming, and coverage counts the
+// parts that finished or are still queued so the line keeps them. Once any
+// part moves the table on, its own progress speaks for the table instead.
+func AwaitingResume(statuses []string) (coverage string, ok bool) {
+	var stopped, done, queued int
+	for _, s := range statuses {
+		switch state.NormalizeTaskStatus(s) {
+		case state.Task.Stopped:
+			stopped++
+		case state.Task.Completed:
+			done++
+		case state.Task.Pending:
+			queued++
+		default:
+			return "", false
+		}
+	}
+	if stopped == 0 {
+		return "", false
+	}
+	return TargetCoverage(done, 0, queued, 0, 0, PendingQueued), true
+}
+
+// ResumeClaimed reads the operations of an apply in applyState. A start moves
+// a stopped apply to resuming before its operations leave stopped: a drive
+// claims them one at a time, and a remote data plane can report them stopped
+// until it acts on the start. Every stopped operation of a resuming apply is
+// one that start resumes, so it reads as resuming; rendered stopped, it would
+// ask the operator for the start they already sent. One the stop reached
+// before it began has nothing to resume: the start runs it in its turn, so it
+// reads as still to run, behind the members ahead of it. Operations of an
+// apply in any other state are returned as they are.
+func ResumeClaimed(applyState string, ops []Operation) []Operation {
+	if !state.IsState(applyState, state.Apply.Resuming) {
+		return ops
+	}
+	claimed := slices.Clone(ops)
+	for i := range claimed {
+		if claimed[i].State != state.ApplyOperation.Stopped {
+			continue
+		}
+		if claimed[i].NeverStarted {
+			claimed[i].State = state.ApplyOperation.Pending
+			continue
+		}
+		claimed[i].State = state.ApplyOperation.Resuming
+	}
+	return claimed
+}
+
 // firstFailure returns the deployment of the first row, in resolved order,
 // whose raw operation state is terminally failed, or nil when none failed. A
 // folded member's failure is placed by its failed row, so a target that

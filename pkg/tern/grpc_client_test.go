@@ -529,6 +529,7 @@ type capturingTernServer struct {
 	skipRevertApplyID string
 	revertApplyID     string
 	progressApplyID   string
+	progressCalls     int
 	progressReq       *ternv1.ProgressRequest
 	progressState     ternv1.State // state returned by Progress; 0 = STATE_COMPLETED
 	progressStateSet  bool
@@ -721,6 +722,7 @@ func (s *capturingTernServer) Revert(_ context.Context, req *ternv1.RevertReques
 
 func (s *capturingTernServer) Progress(_ context.Context, req *ternv1.ProgressRequest) (*ternv1.ProgressResponse, error) {
 	s.mu.Lock()
+	s.progressCalls++
 	s.progressReq = &ternv1.ProgressRequest{
 		ApplyId:          req.ApplyId,
 		Environment:      req.Environment,
@@ -1124,6 +1126,16 @@ func (m *mockApplyOperationStore) MarkFailed(_ context.Context, id int64, errMsg
 	op.State = state.ApplyOperation.Failed
 	op.ErrorMessage = errMsg
 	op.CompletedAt = &now
+	return nil
+}
+
+func (m *mockApplyOperationStore) MarkFailedRetryable(_ context.Context, id int64, errMsg string) error {
+	op, ok := m.ops[id]
+	if !ok {
+		return storage.ErrApplyOperationNotFound
+	}
+	op.State = state.ApplyOperation.FailedRetryable
+	op.ErrorMessage = errMsg
 	return nil
 }
 

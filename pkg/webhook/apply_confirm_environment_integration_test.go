@@ -129,7 +129,7 @@ func TestE2EApplyConfirmRejectsPendingConfirmationForOtherEnvironment(t *testing
 		assert.Contains(t, body, "Apply-confirm Refused — Production")
 		assert.Contains(t, body, "**Database**: `"+dbName+"`")
 		assert.Contains(t, body, "The pending confirmation is for `staging`, not `production`; nothing was applied.")
-		assert.Contains(t, body, "To confirm the `staging` plan:\n\n```\nschemabot apply-confirm -e staging -d "+dbName+" --defer-cutover\n```")
+		assert.Contains(t, body, "To apply the `staging` plan:\n\n```\nschemabot apply-confirm -e staging -d "+dbName+" --defer-cutover\n```")
 		assert.Contains(t, body, "To apply `production` instead, dropping the pending `staging` confirmation and planning and applying `production` in one step, subject to the environment ordering gate and pausing for `apply-confirm` only if its plan needs it:\n\n```\nschemabot apply -e production -d "+dbName+" --defer-cutover\n```")
 		assert.NotContains(t, body, "Schema Change Status", "apply must not have started")
 	case <-time.After(webhookIntegrationPollDeadline):

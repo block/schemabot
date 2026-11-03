@@ -2079,10 +2079,18 @@ func finalizerNamespaceFromKey(operationKey, target string, targetQualified bool
 // Progress reports terminal on the first poll; for an externally-authoritative
 // engine (whose Apply starts an asynchronous deploy) Progress tracks the deploy
 // to completion. Either way the operation is marked completed only once the
-// engine reports the VSchema applied, and fails closed on any error (missing
-// plan/engine, a rejected apply, a permanent progress error, or a failed
-// terminal state), so the operator never advances the parent's aggregate as if
-// the VSchema applied when it did not.
+// engine reports the VSchema applied, so the operator never advances the
+// parent's aggregate as if the VSchema applied when it did not.
+//
+// A failure ends the operation one of two ways. A permanent engine error, a
+// rejected apply, a permanent progress poll failure, or a non-success terminal
+// state fails it for good. An error retrying can cure, whether a storage read
+// or a retryable engine error, pauses it as failed_retryable with the error
+// recorded: the claim re-drives it under the parent apply's retry budget, and
+// the re-drive is safe because the VSchema apply is idempotent and a stored
+// handoff makes it reattach to work already in flight. When the engine refused
+// the work outright, the drive withdraws the handoff it wrote, so the re-drive
+// starts fresh and honors a cancel or stop the operator issued in between.
 func (c *LocalClient) driveGroupFinalizer(ctx context.Context, apply *storage.Apply, op *storage.ApplyOperation) error {
 	planID, err := storage.PlanIDForOperation(apply, op)
 	if err != nil {
@@ -2113,12 +2121,75 @@ func (c *LocalClient) driveGroupFinalizer(ctx context.Context, apply *storage.Ap
 	}
 
 	work := finalizerWork(changes)
-	failClosed := func(cause error) error {
+	// handedToEngine reports that an earlier drive recorded handing this
+	// finalizer's work to the engine; engineReportedState reports that the
+	// engine handed this drive resume state of its own, which it does only for
+	// work it accepted. Both are read when a failed drive settles.
+	var resumeState *engine.ResumeState
+	handedToEngine := false
+	engineReportedState := false
+	// settleFailure records how a failed drive ends the finalizer. A cause that
+	// retrying can cure pauses the row as failed_retryable with the cause
+	// recorded, and the parent's retry budget bounds the re-claims; any other
+	// cause fails the row permanently, which nothing revives (ST-2). A drive
+	// that was cancelled records neither: its error describes the driver, not
+	// the VSchema work, and the driver that reclaims the row decides its outcome.
+	//
+	// withdrawHandoff withdraws this drive's own handoff record alongside the
+	// pause, for a cause that proves the engine refused the work: nothing is
+	// live, so the re-drive must read the row as never handed to the engine and
+	// consume a cancel or stop the operator issued meanwhile (CO-4) instead of
+	// following a handoff that no longer describes anything. A handoff an
+	// earlier drive wrote is never withdrawn here, since that drive's work may
+	// be live. A refused withdrawal still pauses the row: the re-drive then
+	// re-applies the idempotent VSchema, which is safe, only less responsive to
+	// a pending command, and the error names both so the drive log shows why.
+	settleFailure := func(cause error, retryable, withdrawHandoff bool) error {
+		if c.driveCancelled(ctx, apply, "while settling a failed group_finalizer") {
+			return cause
+		}
+		if retryable {
+			if withdrawHandoff {
+				if clearErr := c.storage.ApplyOperations().ClearEngineResumeState(ctx, op.ID); clearErr != nil {
+					c.logger.Warn("group_finalizer: failed to withdraw the engine handoff record of refused work; the re-drive re-applies the VSchema before it consumes a pending command",
+						append(append(op.LogAttrs(), apply.IdentityLogAttrs()...), "error", clearErr)...)
+					cause = errors.Join(cause, fmt.Errorf("withdraw engine handoff for group_finalizer apply_operation %d (apply %s): %w", op.ID, apply.ApplyIdentifier, clearErr))
+				}
+			}
+			if markErr := c.storage.ApplyOperations().MarkFailedRetryable(ctx, op.ID, cause.Error()); markErr != nil {
+				c.logger.Error("group_finalizer: failed to pause operation for retry; the row stays as it is for a later drive",
+					append(append(op.LogAttrs(), apply.IdentityLogAttrs()...), "error", markErr)...)
+				return errors.Join(cause, fmt.Errorf("pause group_finalizer apply_operation %d (apply %s) for retry: %w", op.ID, apply.ApplyIdentifier, markErr))
+			}
+			c.logger.Warn("group_finalizer paused for retry; the parent apply's retry budget bounds the re-claims",
+				append(append(op.LogAttrs(), apply.IdentityLogAttrs()...), "error", cause)...)
+			return cause
+		}
 		if markErr := c.storage.ApplyOperations().MarkFailed(ctx, op.ID, cause.Error()); markErr != nil {
 			c.logger.Error("group_finalizer: failed to mark operation failed",
 				"apply_id", apply.ApplyIdentifier, "apply_operation_id", op.ID, "error", markErr)
 		}
 		return cause
+	}
+	failClosed := func(cause error) error { return settleFailure(cause, false, false) }
+	pauseForRetry := func(cause error) error { return settleFailure(cause, true, false) }
+	// settleApplyError settles an error from the engine's Apply: it pauses a
+	// cause the engine classifies as retryable and fails any other, the same
+	// split the apply's other engine drives make. A failure reattaching to work
+	// the engine already accepted (engine.ErrReattachFailed) takes the
+	// accepted-work policy, since that work keeps running whatever this drive
+	// concludes and a re-drive reattaches to it again; any other cause takes the
+	// policy for starting engine work. The handoff record is withdrawn only when
+	// this drive wrote it, the engine reported no state of its own, and the
+	// cause proves a refusal: an unknown outcome means the work may be running,
+	// so its handoff stays for the re-drive to re-observe it.
+	settleApplyError := func(cause error) error {
+		if errors.Is(cause, engine.ErrReattachFailed) {
+			return settleFailure(cause, c.shouldRetryAcceptedWorkError(cause), false)
+		}
+		retryable := c.shouldRetryEngineError(cause)
+		withdraw := retryable && !handedToEngine && !engineReportedState && !engine.IsOutcomeUnknown(cause)
+		return settleFailure(cause, retryable, withdraw)
 	}
 	// saveResume reports whether the finalizer's resume state landed, which is
 	// what the engine's OnStateChange needs; persistResume is the log-only form
@@ -2127,6 +2198,7 @@ func (c *LocalClient) driveGroupFinalizer(ctx context.Context, apply *storage.Ap
 		if rs == nil {
 			return nil
 		}
+		engineReportedState = true
 		if saveErr := c.storage.ApplyOperations().SaveEngineResumeState(ctx, op.ID, &storage.EngineResumeState{
 			ApplyOperationID: op.ID,
 			MigrationContext: rs.MigrationContext,
@@ -2145,8 +2217,6 @@ func (c *LocalClient) driveGroupFinalizer(ctx context.Context, apply *storage.Ap
 		}
 	}
 
-	var resumeState *engine.ResumeState
-	handedToEngine := false
 	stored, getErr := c.storage.ApplyOperations().GetEngineResumeState(ctx, op.ID)
 	switch {
 	case errors.Is(getErr, storage.ErrEngineResumeStateNotFound):
@@ -2155,8 +2225,9 @@ func (c *LocalClient) driveGroupFinalizer(ctx context.Context, apply *storage.Ap
 	case getErr != nil:
 		// A storage read failure must not be treated as "fresh": proceeding would
 		// risk the engine restarting or duplicating in-flight VSchema work after a
-		// transient DB error. Fail closed for the operator to retry.
-		return failClosed(fmt.Errorf("load engine resume state for group_finalizer apply_operation %d (apply %s): %w", op.ID, apply.ApplyIdentifier, getErr))
+		// transient DB error. Pause the row as failed_retryable so the claim
+		// re-drives it once storage answers, rather than failing it for good.
+		return pauseForRetry(fmt.Errorf("load engine resume state for group_finalizer apply_operation %d (apply %s): %w", op.ID, apply.ApplyIdentifier, getErr))
 	case stored != nil:
 		handedToEngine = true
 		resumeState = finalizerEngineResumeState(stored)
@@ -2217,7 +2288,7 @@ func (c *LocalClient) driveGroupFinalizer(ctx context.Context, apply *storage.Ap
 		OnStateChange:   saveResume,
 	})
 	if err != nil {
-		return failClosed(fmt.Errorf("group_finalizer %s (apply %s): %w", work, apply.ApplyIdentifier, err))
+		return settleApplyError(fmt.Errorf("group_finalizer %s (apply %s): %w", work, apply.ApplyIdentifier, err))
 	}
 	if result == nil || !result.Accepted {
 		return failClosed(fmt.Errorf("group_finalizer %s for apply %s was not accepted", work, apply.ApplyIdentifier))
@@ -2230,6 +2301,9 @@ func (c *LocalClient) driveGroupFinalizer(ctx context.Context, apply *storage.Ap
 	// in-flight deploy (a returned resume state) is polled to completion.
 	if result.ResumeState != nil {
 		persistResume(result.ResumeState)
+		// The await retries transient progress errors itself, so what it returns
+		// is a permanent poll failure or a cancelled drive: the first fails the
+		// row for good and the second records nothing, as settleFailure decides.
 		finalState, err := c.driveFinalizerToTerminal(ctx, eng, apply, creds, result.ResumeState, persistResume)
 		if err != nil {
 			return failClosed(fmt.Errorf("await group_finalizer %s (apply %s): %w", work, apply.ApplyIdentifier, err))
@@ -2692,6 +2766,11 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 	}
 	if standDown, err := c.processPendingCancelOrStopControlRequest(ctx, apply); standDown || err != nil {
 		return err
+	}
+	// A cutover drive carries the swap the operator asked for, so it is never
+	// handed back; every other drive of a deferred apply is.
+	if !forceCutoverResume && handBackAfterControlDelivery(ctx, apply, logger) {
+		return ErrDeferredCutoverDriveHandedBack
 	}
 	// A stopped apply is claimed only to deliver a pending control request. A
 	// pending start means the operator asked to resume, and the drive below

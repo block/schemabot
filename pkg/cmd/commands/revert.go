@@ -54,6 +54,12 @@ func (cmd *RevertCmd) Run(g *Globals) error {
 	if err := checkAccepted(controlResponseWrapper{resp}, "revert"); err != nil {
 		return err
 	}
-	fmt.Printf("Revert initiated for %s\n", formatControlTarget(cmd.ApplyID, cmd.Database, cmd.Environment))
+	target := formatControlTarget(cmd.ApplyID, cmd.Database, cmd.Environment)
+	if resp.Status == apitypes.ControlStatusAlreadyRequested {
+		fmt.Printf("Revert already requested for %s — SchemaBot will finish the existing request\n", target)
+	} else {
+		fmt.Printf("Revert requested for %s — SchemaBot will undo this schema change\n", target)
+	}
+	printWatchInstructions(cmd.ApplyID, cmd.Database, cmd.Environment)
 	return nil
 }
