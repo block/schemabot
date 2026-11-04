@@ -632,6 +632,15 @@ func (h *Handler) matchReviewGateCodeowners(ctx context.Context, client *ghclien
 
 	matchPath := path.Join(schemaPath, ".schema")
 	owners, err := ghclient.MatchCodeownersPath(ruleset, matchPath)
+	var unmatchable *ghclient.UnmatchableCodeownersRuleError
+	if errors.As(err, &unmatchable) {
+		// The panic value and stack identify the rule; they stay in the log,
+		// where the triage identifiers are, and never reach the PR.
+		h.logger.Error("review gate: CODEOWNERS holds a rule the parser cannot match; the gate fails closed until the rule is fixed",
+			"repo", repo, "pr", pr, "head_sha", headSHA, "database", database, "base_ref", baseRef, "schema_path", schemaPath,
+			"panic", unmatchable.Panic.Value, "stack", string(unmatchable.Panic.Stack))
+		return nil, fmt.Errorf("match CODEOWNERS for %s: the CODEOWNERS file on base branch %q holds a rule that cannot be matched; fix the rule on the base branch", schemaPath, baseRef)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("match CODEOWNERS for %s: %w", schemaPath, err)
 	}

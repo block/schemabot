@@ -2,6 +2,7 @@ package github
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -16,7 +17,9 @@ import (
 
 // A CODEOWNERS rule the parser accepts but cannot match, such as a bare
 // `/ @owner`, yields an error rather than a panic, so the review gate can fail
-// closed with a reason. Rules the parser handles still match normally.
+// closed with a reason. The error text names the path and the fix but not the
+// panic, which travels separately with its stack for server-side logging.
+// Rules the parser handles still match normally.
 func TestMatchCodeownersPathReturnsAnErrorForAnUnmatchableRule(t *testing.T) {
 	broken, err := codeowners.ParseFile(strings.NewReader("/ @platform-admins\n"))
 	require.NoError(t, err)
@@ -24,7 +27,15 @@ func TestMatchCodeownersPathReturnsAnErrorForAnUnmatchableRule(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "schema/orders/.schema")
 	assert.Contains(t, err.Error(), "fix the rule on the base branch")
+	assert.NotContains(t, err.Error(), "index out of range")
 	assert.Nil(t, owners)
+
+	var unmatchable *UnmatchableCodeownersRuleError
+	require.ErrorAs(t, err, &unmatchable)
+	assert.Equal(t, "schema/orders/.schema", unmatchable.Path)
+	require.NotNil(t, unmatchable.Panic)
+	assert.Contains(t, fmt.Sprint(unmatchable.Panic.Value), "index out of range")
+	assert.NotEmpty(t, unmatchable.Panic.Stack)
 
 	working, err := codeowners.ParseFile(strings.NewReader("/schema/orders/ @orders-team\n"))
 	require.NoError(t, err)

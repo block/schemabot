@@ -11,6 +11,8 @@ import (
 
 	gh "github.com/google/go-github/v86/github"
 	"github.com/hmarr/codeowners"
+
+	"github.com/block/schemabot/pkg/panicsafe"
 )
 
 // Review states returned by the GitHub API.
@@ -140,21 +142,41 @@ func (ic *InstallationClient) FetchCodeownersRuleset(ctx context.Context, repo, 
 	return nil, nil
 }
 
+// UnmatchableCodeownersRuleError reports a CODEOWNERS rule the parser accepts
+// but cannot match. Error() names only the path being matched, so it can reach
+// a PR comment; Panic carries the recovered value and stack for server-side
+// logs, where the identifiers needed to triage it live.
+type UnmatchableCodeownersRuleError struct {
+	Path  string
+	Panic *panicsafe.Error
+}
+
+func (e *UnmatchableCodeownersRuleError) Error() string {
+	return fmt.Sprintf("match CODEOWNERS path %s: the CODEOWNERS file holds a rule that cannot be matched; fix the rule on the base branch", e.Path)
+}
+
+func (e *UnmatchableCodeownersRuleError) Unwrap() error {
+	return e.Panic
+}
+
 // MatchCodeownersPath finds the owners for a specific file path using CODEOWNERS rules.
 // Last matching rule wins (standard CODEOWNERS semantics).
 // Returns nil, nil if no rule matches. Returns an error if pattern matching fails.
 //
 // The parser panics on some rules it accepts, such as a bare `/ @owner`, and
-// CODEOWNERS is repository content, so a panic is returned as an error: the
-// review gate then fails closed with a reason instead of never answering.
-func MatchCodeownersPath(ruleset codeowners.Ruleset, filePath string) (owners []codeowners.Owner, err error) {
-	defer func() {
-		if r := recover(); r != nil {
-			owners = nil
-			err = fmt.Errorf("match CODEOWNERS path %s: the CODEOWNERS file holds a rule the parser cannot match (%v); fix the rule on the base branch", filePath, r)
-		}
-	}()
-	rule, err := ruleset.Match(filePath)
+// CODEOWNERS is repository content, so a panic is returned as an
+// *UnmatchableCodeownersRuleError: the review gate then fails closed with a
+// reason instead of never answering.
+func MatchCodeownersPath(ruleset codeowners.Ruleset, filePath string) ([]codeowners.Owner, error) {
+	var rule *codeowners.Rule
+	recovered, err := panicsafe.Catch(func() error {
+		var matchErr error
+		rule, matchErr = ruleset.Match(filePath)
+		return matchErr
+	})
+	if recovered != nil {
+		return nil, &UnmatchableCodeownersRuleError{Path: filePath, Panic: recovered}
+	}
 	if err != nil {
 		return nil, fmt.Errorf("match CODEOWNERS path %s: %w", filePath, err)
 	}
