@@ -12,6 +12,7 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 
+	"github.com/block/schemabot/pkg/inventory"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
@@ -204,6 +205,34 @@ func TestServer_BatchProgressReportsAnUnknownApplyNotFound(t *testing.T) {
 	require.Error(t, err)
 	assert.Equal(t, codes.NotFound, status.Code(err))
 	assert.Contains(t, err.Error(), storage.ErrApplyNotFound.Error())
+}
+
+// A data plane that routes each apply to its target client reports an apply
+// its storage does not hold as NotFound too, for BatchProgress and for
+// Progress, so a drive polling it takes the missing remote apply path rather
+// than counting the answer as a failed poll.
+func TestServer_RoutedProgressReportsAnUnknownApplyNotFound(t *testing.T) {
+	fx := newSharedApplyFixture(state.ApplyOperation.Running, state.ApplyOperation.Running, state.Task.Running, state.Task.Running)
+	st := fx.client.storage.(*exactProgressStorage)
+	st.applies = &exactProgressApplyStore{}
+	router, err := NewTargetRouter(TargetRouterConfig{
+		Resolver: targetRouterResolverFunc(func(_ context.Context, req inventory.Request) (*inventory.Target, error) {
+			return nil, fmt.Errorf("look up target %q: an unknown apply is never routed", req.Target)
+		}),
+		Storage: st,
+		Logger:  slog.New(slog.DiscardHandler),
+	})
+	require.NoError(t, err)
+	server := NewServer(router, slog.Default())
+
+	_, err = server.BatchProgress(t.Context(), batchProgressRequest(fx, "11", "12"))
+	require.Error(t, err)
+	assert.Equal(t, codes.NotFound, status.Code(err))
+	assert.Contains(t, err.Error(), `apply "apply-shared-deployment" for batch progress routing`)
+
+	_, err = server.Progress(t.Context(), &ternv1.ProgressRequest{ApplyId: fx.apply.ApplyIdentifier, Environment: "staging", ApplyOperationId: "11"})
+	require.Error(t, err)
+	assert.Equal(t, codes.NotFound, status.Code(err))
 }
 
 // batchUnsupportedClient routes BatchProgress to a target client that cannot

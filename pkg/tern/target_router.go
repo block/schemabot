@@ -970,7 +970,7 @@ func (r *TargetRouter) clientForApplyIdentifier(ctx context.Context, applyIdenti
 		return nil, nil, fmt.Errorf("load apply %q for %s routing: %w", applyIdentifier, operation, err)
 	}
 	if apply == nil {
-		return nil, nil, fmt.Errorf("apply %q not found for %s routing", applyIdentifier, operation)
+		return nil, nil, fmt.Errorf("apply %q for %s routing: %w", applyIdentifier, operation, storage.ErrApplyNotFound)
 	}
 	if requestEnvironment != "" && requestEnvironment != apply.Environment {
 		return nil, nil, fmt.Errorf("apply %q is stored for environment %q, not %q; cannot route %s", applyIdentifier, apply.Environment, requestEnvironment, operation)
