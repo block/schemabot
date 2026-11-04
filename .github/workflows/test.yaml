@@ -318,7 +318,13 @@ jobs:
       mode: ${{ steps.gen.outputs.mode }}
       shard_count: ${{ steps.gen.outputs.shard_count }}
     steps:
+      # Only the tree the discovery below reads. A full checkout of this
+      # repository takes most of the job's one-minute budget on a slow runner
+      # and cancels the job; a sparse, blobless one takes seconds.
       - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # actions/checkout@v6
+        with:
+          sparse-checkout: pkg/localscale
+          filter: blob:none
       - name: "Generate shard matrix"
         id: gen
         env:
@@ -629,7 +635,11 @@ jobs:
       mode: ${{ steps.gen.outputs.mode }}
       shard_count: ${{ steps.gen.outputs.shard_count }}
     steps:
+      # Sparse and blobless for the reason given on the LocalScale Matrix job.
       - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # actions/checkout@v6
+        with:
+          sparse-checkout: e2e/local
+          filter: blob:none
       - name: "Generate shard matrix"
         id: gen
         env:
@@ -929,7 +939,11 @@ jobs:
     outputs:
       shards: ${{ steps.gen.outputs.shards }}
     steps:
+      # Sparse and blobless for the reason given on the LocalScale Matrix job.
       - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # actions/checkout@v6
+        with:
+          sparse-checkout: e2e/k8s
+          filter: blob:none
       - name: "Generate shard matrix"
         id: gen
         run: |
