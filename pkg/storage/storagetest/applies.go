@@ -425,9 +425,52 @@ func TestApplies(t *testing.T, h Harness) {
 		assert.Empty(t, persisted.ErrorMessage)
 	})
 
+	// Every row here has no lease owner, so only the state guard moves it.
+	// These are the states a retry restarts from running: the apply is copying,
+	// or staging the change before any rows move.
+	t.Run("MarkStaleApplyRetryable_MovesEveryRestartableState", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		for i, applyState := range []string{
+			state.Apply.Running,
+			state.Apply.RunningDegraded,
+			state.Apply.CatchingUp,
+			state.Apply.Checksumming,
+			state.Apply.PostChecksum,
+			state.Apply.Resuming,
+			state.Apply.Recovering,
+			state.Apply.PreparingBranch,
+			state.Apply.ApplyingBranchChanges,
+			state.Apply.ValidatingBranch,
+			state.Apply.CreatingDeployRequest,
+			state.Apply.ValidatingDeployRequest,
+		} {
+			t.Run(applyState, func(t *testing.T) {
+				lock := CreateLock(t, store, "apply_stale_restartable_"+applyState+"_db", storage.DatabaseTypeMySQL)
+				apply := CreateApplyWithStateAndEnv(t, store, lock, "apply_stale_restartable_"+applyState, int64(9430+i), applyState, "production")
+
+				moved, err := store.Applies().MarkStaleApplyRetryable(ctx, storage.StaleRetryableRequest{
+					ApplyID:      apply.ID,
+					ErrorMessage: "driver gone during the copy",
+				})
+				require.NoError(t, err)
+				assert.True(t, moved)
+
+				persisted, err := store.Applies().Get(ctx, apply.ID)
+				require.NoError(t, err)
+				require.NotNil(t, persisted)
+				assert.Equal(t, state.Apply.FailedRetryable, persisted.State)
+				assert.Equal(t, "driver gone during the copy", persisted.ErrorMessage)
+			})
+		}
+	})
+
 	// Every row here has no lease owner, so only the state guard keeps it
-	// where it is.
-	t.Run("MarkStaleApplyRetryable_NeverMovesAnApplyOutsideTheActiveStates", func(t *testing.T) {
+	// where it is. Resting and terminal applies are never reopened; an apply
+	// waiting for a deploy, at or past its cutover, or in its revert window
+	// has work behind it that a retry's running would misdescribe, so it is
+	// left to the stale-active claim.
+	t.Run("MarkStaleApplyRetryable_NeverMovesAnApplyOutsideTheRestartableStates", func(t *testing.T) {
 		ctx := t.Context()
 		store := h.NewStorage(t)
 		for i, applyState := range []string{
@@ -437,6 +480,12 @@ func TestApplies(t *testing.T, h Harness) {
 			state.Apply.Completed,
 			state.Apply.Failed,
 			state.Apply.Cancelled,
+			state.Apply.WaitingForDeploy,
+			state.Apply.WaitingForCutover,
+			state.Apply.CuttingOver,
+			state.Apply.RevertWindow,
+			state.Apply.Reverting,
+			state.Apply.SkippingRevert,
 		} {
 			t.Run(applyState, func(t *testing.T) {
 				lock := CreateLock(t, store, "apply_stale_retryable_"+applyState+"_db", storage.DatabaseTypeMySQL)

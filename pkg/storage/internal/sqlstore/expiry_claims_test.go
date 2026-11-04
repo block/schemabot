@@ -579,7 +579,7 @@ func testRetryableExpiryDecidesEachCandidateAlone(t *testing.T, newStore func(*t
 		require.NoError(t, err)
 		require.NotNil(t, claimed, "a stale lease is claimable right up until expiry locks the operation")
 
-		undriven, err := expiryStore.lockUndrivenApplies(ctx, tx, []int64{first.ID, second.ID})
+		undriven, err := expiryStore.lockUndrivenApplies(ctx, tx, "retryable expiry", []int64{first.ID, second.ID})
 		require.NoError(t, err)
 		other := first.ID
 		if claimed.ApplyID == first.ID {
@@ -633,7 +633,7 @@ func testRetryableExpiryDecidesEachCandidateAlone(t *testing.T, newStore func(*t
 // and expiry race for it, so they read the batch's verdict for that one row.
 func lockUndrivenApply(ctx context.Context, t *testing.T, store *applyStore, tx *rebindTx, applyID int64) bool {
 	t.Helper()
-	undriven, err := store.lockUndrivenApplies(ctx, tx, []int64{applyID})
+	undriven, err := store.lockUndrivenApplies(ctx, tx, "retryable expiry", []int64{applyID})
 	require.NoError(t, err)
 	return undriven[applyID]
 }
