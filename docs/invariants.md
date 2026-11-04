@@ -976,7 +976,7 @@ arm gates on the hold rule `earlierSiblingHoldsCutoverSQL` that `CutoverBlocker`
 storage parity suite (`pkg/storage/storagetest/apply_operations.go`); on a data plane, an apply a
 dispatcher created leaves member order to the dispatcher's claim (`rolloutMembersOrderedHereSQL`,
 `pkg/storage/internal/sqlstore/apply_operations.go`), and each member's progress and cutover are scoped to its own operation
-(`progressScopeOperation` in `pkg/tern/local_client.go`, `boundCutoverRequestTurn` in
+(`progressReads.scopeOperation` in `pkg/tern/local_progress_reads.go`, `boundCutoverRequestTurn` in
 `pkg/tern/local_control.go`); for a manually deferred cutover, the turn
 check `CutoverBlocker` (`pkg/storage/internal/sqlstore/apply_operations.go`, sharing the automatic cutover claim's
 `earlierSiblingHoldsCutoverSQL`), applied when a drive takes the request

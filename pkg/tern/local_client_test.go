@@ -853,7 +853,7 @@ func TestLoadStoredProgressMetadataMergesVitessResumeFieldsLast(t *testing.T) {
 	}
 	task := &storage.Task{TaskIdentifier: "task-read-progress", ApplyOperationID: &operationID}
 
-	metadata := client.loadStoredProgressMetadata(t.Context(), task)
+	metadata := client.loadStoredProgressMetadata(t.Context(), &progressReads{}, task)
 	assert.Equal(t, "copying", metadata["phase"])
 	assert.Equal(t, "resume-branch", metadata["branch_name"])
 	assert.Equal(t, "https://example.com/request", metadata["deploy_request_url"])
@@ -871,7 +871,7 @@ func TestLoadStoredProgressMetadataReturnsEmptyMapForNull(t *testing.T) {
 	}
 	task := &storage.Task{TaskIdentifier: "task-read-null-progress", ApplyOperationID: &operationID}
 
-	metadata := client.loadStoredProgressMetadata(t.Context(), task)
+	metadata := client.loadStoredProgressMetadata(t.Context(), &progressReads{}, task)
 	assert.NotNil(t, metadata)
 	assert.Empty(t, metadata)
 }

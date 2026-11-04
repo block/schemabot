@@ -626,6 +626,19 @@ func (r *TargetRouter) Progress(ctx context.Context, req *ternv1.ProgressRequest
 	return routeStoredApply(ctx, r, req, "progress", Client.Progress)
 }
 
+// BatchProgress returns progress for several operations of a stored apply by
+// routing through its target. A target client that cannot batch answers
+// ErrBatchProgressUnsupported.
+func (r *TargetRouter) BatchProgress(ctx context.Context, req *ternv1.BatchProgressRequest) (*ternv1.BatchProgressResponse, error) {
+	return routeStoredApply(ctx, r, req, "batch progress", func(client Client, ctx context.Context, req *ternv1.BatchProgressRequest) (*ternv1.BatchProgressResponse, error) {
+		batcher, ok := client.(BatchProgressClient)
+		if !ok {
+			return nil, ErrBatchProgressUnsupported
+		}
+		return batcher.BatchProgress(ctx, req)
+	})
+}
+
 func (r *TargetRouter) Logs(ctx context.Context, req *ternv1.LogsRequest) (*ternv1.LogsResponse, error) {
 	if req == nil {
 		return nil, fmt.Errorf("logs request is required")

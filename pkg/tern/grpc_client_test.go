@@ -10733,6 +10733,7 @@ func TestGRPCMethodDeadlineCoversEveryTernRPC(t *testing.T) {
 	}
 	control := map[string]bool{
 		ternv1.Tern_Progress_FullMethodName:       true,
+		ternv1.Tern_BatchProgress_FullMethodName:  true,
 		ternv1.Tern_Logs_FullMethodName:           true,
 		ternv1.Tern_Cutover_FullMethodName:        true,
 		ternv1.Tern_Health_FullMethodName:         true,
