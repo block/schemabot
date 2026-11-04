@@ -1063,6 +1063,49 @@ func TestAcceptedBlockingOutcomesCarryTheirOwnRemedies(t *testing.T) {
 	assert.Equal(t, unknown.remedy, commit.remedy)
 }
 
+// The outcomes the engine reaches by re-reading the catalog or the rows
+// under the table's lock — a drop that would take a replica identity's index
+// with it, an index or constraint that changed after planning, rows the
+// statement's shape rejects — apply nothing, and an unchanged retry meets
+// the same catalog or the same rows. Each is a permanent refusal whose
+// remedy tells the operator what has to change before the re-plan.
+func TestCatalogAndRowRefusalsNameTheirRemedies(t *testing.T) {
+	tests := []struct {
+		code   executor.Code
+		reason string
+		cause  string
+		remedy string
+	}{
+		{code: executor.CodeReplicaIdentityDrop, reason: "replica-identity-drop",
+			cause:  `the planned drop on "users" would remove what its replica identity index is built on`,
+			remedy: "point REPLICA IDENTITY elsewhere, then re-plan against the current schema"},
+		{code: executor.CodeAdoptedIndexDrift, reason: "planned-object-drift",
+			cause:  `the index or constraint the planned statement for "users" names changed after planning`,
+			remedy: "re-plan against the current schema"},
+		{code: executor.CodeValidatedConstraintDrift, reason: "planned-object-drift",
+			cause:  `the index or constraint the planned statement for "users" names changed after planning`,
+			remedy: "re-plan against the current schema"},
+		{code: executor.CodeRenamedIndexDrift, reason: "planned-object-drift",
+			cause:  `the index or constraint the planned statement for "users" names changed after planning`,
+			remedy: "re-plan against the current schema"},
+		{code: executor.CodeDataFault, reason: "data-fault",
+			cause:  `the rows of "users" do not fit the shape the planned statement gives them`,
+			remedy: "correct the data or the statement, then re-plan against the current schema"},
+	}
+	for _, tt := range tests {
+		t.Run(string(tt.code), func(t *testing.T) {
+			r, known := refusalForOutcome(tt.code, "users")
+			require.True(t, known)
+			require.NotNil(t, r, "outcome %q must not fall into the retryable tail", tt.code)
+			assert.True(t, tt.code.Permanent(), "the engine marks %q permanent", tt.code)
+			assert.Equal(t, tt.reason, r.reason)
+			assert.Equal(t, tt.cause, r.cause)
+			assert.Equal(t, tt.remedy, r.remedy)
+			assert.False(t, r.provisionable, "nothing to provision answers %q", tt.code)
+		})
+	}
+}
+
 // The unverified cause carries only the table name, so like the collision
 // detail it can promise its remedy's lead for a table name of any legal
 // length and spelling. The read-back runs right after the CREATE TABLE, so
