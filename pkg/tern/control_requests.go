@@ -860,6 +860,77 @@ func restoreApplyStateAfterUnacceptedCutover(ctx context.Context, store storage.
 	return nil
 }
 
+// cutoverOutcomeUnknownWindow bounds how long a cutover request stays pending
+// once a send of it has lost its answer. Each progress tick sends it again, so
+// a broken connection that heals settles it within seconds; a database that
+// stays unreachable this long settles it as unconfirmed (CO-2), and neither
+// the drive's poll budget nor its liveness bounds the wait on its own, since
+// the engine's in-memory progress keeps answering.
+const cutoverOutcomeUnknownWindow = 5 * time.Minute
+
+// cutoverOutcomeUnconfirmedMessage answers a cutover request whose outcome was
+// still unknown when the window closed. It does not claim the cutover failed:
+// the restored apply state is outranked by any cutover state progress reports.
+var cutoverOutcomeUnconfirmedMessage = fmt.Sprintf("SchemaBot could not confirm the cutover: the database did not answer for %s after it was sent. The schema change's progress shows whether it ran; if it is still waiting for cutover, run cutover again.", cutoverOutcomeUnknownWindow)
+
+// holdCutoverRequestWithUnknownOutcome keeps a cutover request pending after
+// a send whose outcome is unknown, and reports when the request has been
+// unknown for longer than cutoverOutcomeUnknownWindow so the caller settles
+// it. since is when the request's outcome first became unknown, zero for the
+// send that just lost its answer: that send stamps the request row, so the
+// window survives a lease handover and an error from a later resend is never
+// read as the outcome of the send that may have started the cutover.
+func holdCutoverRequestWithUnknownOutcome(ctx context.Context, store storage.Storage, apply *storage.Apply, controlReq *storage.ApplyControlRequest, since, now time.Time, sendErr error, logger *slog.Logger, attrs ...any) (settle bool, err error) {
+	attrs = append(append(apply.MutableLogAttrs(), attrs...), "requested_by", controlRequestCaller(controlReq), "error", sendErr)
+	if since.IsZero() {
+		if err := stampCutoverOutcomeUnknown(ctx, store, apply, controlReq, now, logger); err != nil {
+			return false, err
+		}
+		logger.Warn("pending cutover request has an unknown outcome; the request stays pending and is sent again at the next progress tick", attrs...)
+		return false, nil
+	}
+	unknownFor := now.Sub(since)
+	if unknownFor < cutoverOutcomeUnknownWindow {
+		logger.Warn("pending cutover request still has an unknown outcome; the request stays pending and is sent again at the next progress tick",
+			append(attrs, "unknown_for", unknownFor)...)
+		return false, nil
+	}
+	logger.Error("pending cutover request outcome could not be confirmed within the window; the request is settled as unconfirmed",
+		append(attrs, "unknown_for", unknownFor, "window", cutoverOutcomeUnknownWindow)...)
+	return true, nil
+}
+
+// stampCutoverOutcomeUnknown records on controlReq's row when its outcome
+// became unknown. A row that has since been settled or re-armed for a new
+// command is left alone, and so is an existing stamp.
+func stampCutoverOutcomeUnknown(ctx context.Context, store storage.Storage, apply *storage.Apply, controlReq *storage.ApplyControlRequest, now time.Time, logger *slog.Logger) error {
+	controlStore := store.ControlRequests()
+	if controlStore == nil {
+		return fmt.Errorf("record unknown cutover outcome for apply %s: control request store is not available", apply.ApplyIdentifier)
+	}
+	_, err := controlStore.UpdateMetadata(ctx, apply.ID, storage.ControlOperationCutover, func(req *storage.ApplyControlRequest) ([]byte, error) {
+		if req.ID != controlReq.ID || req.Revision != controlReq.Revision || req.Status != storage.ControlRequestPending {
+			logger.Debug("cutover request was settled or re-armed after it was sent; its unknown outcome is not recorded",
+				append(apply.MutableLogAttrs(), "status", req.Status, "revision", req.Revision)...)
+			return nil, nil
+		}
+		since, err := req.CutoverOutcomeUnknownSince()
+		if err != nil {
+			return nil, err
+		}
+		if !since.IsZero() {
+			logger.Debug("cutover request already records when its outcome became unknown",
+				append(apply.MutableLogAttrs(), "outcome_unknown_since", since)...)
+			return nil, nil
+		}
+		return req.WithCutoverOutcomeUnknownSince(now)
+	})
+	if err != nil {
+		return fmt.Errorf("record unknown cutover outcome for apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	return nil
+}
+
 // failUnacceptedCutoverRequest resolves a pending cutover request the engine
 // did not take: it restores the apply's pre-cutover state, then fails the
 // request with the engine's reason. The restore comes first so a failed restore

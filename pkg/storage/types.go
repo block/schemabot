@@ -1866,6 +1866,51 @@ func (r *ApplyControlRequest) CutoverOperationIDs() ([]int64, error) {
 	return nil, nil
 }
 
+// cutoverOutcomeUnknownSinceMetadataKey records when a cutover request's
+// outcome became unknown: a send whose answer was lost may have started the
+// cutover. It lives on the request row, so it outlasts the drive that sent
+// the request and is cleared when the row is re-armed for a new command.
+const cutoverOutcomeUnknownSinceMetadataKey = "outcome_unknown_since"
+
+// CutoverOutcomeUnknownSince returns when the request's outcome became
+// unknown, or the zero time when no send of it has lost its answer.
+func (r *ApplyControlRequest) CutoverOutcomeUnknownSince() (time.Time, error) {
+	if r == nil || len(r.Metadata) == 0 {
+		return time.Time{}, nil
+	}
+	var payload struct {
+		Since *time.Time `json:"outcome_unknown_since"`
+	}
+	if err := json.Unmarshal(r.Metadata, &payload); err != nil {
+		return time.Time{}, fmt.Errorf("parse metadata of %s control request %d: %w", r.Operation, r.ID, err)
+	}
+	if payload.Since == nil {
+		return time.Time{}, nil
+	}
+	return *payload.Since, nil
+}
+
+// WithCutoverOutcomeUnknownSince returns the request's metadata with since
+// recorded as the moment its outcome became unknown, keeping every other key.
+func (r *ApplyControlRequest) WithCutoverOutcomeUnknownSince(since time.Time) ([]byte, error) {
+	fields := map[string]json.RawMessage{}
+	if len(r.Metadata) > 0 {
+		if err := json.Unmarshal(r.Metadata, &fields); err != nil {
+			return nil, fmt.Errorf("parse metadata of %s control request %d: %w", r.Operation, r.ID, err)
+		}
+	}
+	raw, err := json.Marshal(since.UTC())
+	if err != nil {
+		return nil, fmt.Errorf("encode %s of %s control request %d: %w", cutoverOutcomeUnknownSinceMetadataKey, r.Operation, r.ID, err)
+	}
+	fields[cutoverOutcomeUnknownSinceMetadataKey] = raw
+	metadata, err := json.Marshal(fields)
+	if err != nil {
+		return nil, fmt.Errorf("encode metadata of %s control request %d: %w", r.Operation, r.ID, err)
+	}
+	return metadata, nil
+}
+
 // ForwardingControlRequestCaller is the requester recorded for a control
 // request that reached this plane over the data-plane RPC boundary. The control
 // RPCs carry no operator identity, so this names the path the request arrived
