@@ -2354,6 +2354,71 @@ schemabot apply -e production
 </details>
 
 <details>
+<summary><a name="rollout-plans-copy-discarded-on-another-target-paused"></a><strong>Rollout Plans (Copy Discarded On Another Target, Paused)</strong></summary>
+
+
+## Schema Change Apply — Production
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+🔒 **Lock acquired by** `block/schemabot#42` at 2026-01-15 14:30:00 UTC
+
+```sql
+CREATE TABLE `users` (
+    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+    `email` varchar(255) NOT NULL,
+    `created_at` timestamp DEFAULT current_timestamp(),
+    PRIMARY KEY(`id`),
+    INDEX `idx_email`(`email`)
+) ENGINE InnoDB,
+  CHARSET utf8mb4,
+  COLLATE utf8mb4_0900_ai_ci;
+```
+
+```sql
+CREATE TABLE `orders` (
+    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+    `user_id` bigint NOT NULL,
+    `total_cents` bigint NOT NULL,
+    `status` varchar(50) NOT NULL DEFAULT 'pending',
+    PRIMARY KEY(`id`),
+    INDEX `idx_user_id`(`user_id`)
+) ENGINE InnoDB,
+  CHARSET utf8mb4,
+  COLLATE utf8mb4_0900_ai_ci;
+```
+
+```sql
+ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
+```
+
+On target `us/testapp_3`:
+
+⚠️ **Applying destroys work in progress**: 1 unfinished copy on the target
+- `products` in `testapp` (last progress 3h 12m ago): the schema change differs from the one that started it, which was `` ALTER TABLE `products` ADD INDEX `idx_category` (`category`) ``
+
+Applying restarts the copy from zero rows. To keep the work already done, apply the schema change that started it.
+
+📋 **Plan**: **2** tables to create, **1** table to alter · rolling out to all 3 targets
+
+
+---
+
+**Confirmation required** — review the plan above, then confirm manually:
+```
+schemabot apply-confirm -e production
+```
+
+🔓 To discard this plan and unlock, comment:
+```
+schemabot unlock
+```
+
+</details>
+
+<details>
 <summary><a name="rollout-plans-table-sizes-two-targets"></a><strong>Rollout Plans (Table Sizes, Two Targets)</strong></summary>
 
 

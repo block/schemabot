@@ -921,6 +921,46 @@ func PreviewCommentPlanRolloutConvergedPrimary() string {
 	})
 }
 
+// PreviewCommentPlanRolloutCopyDiscardedPaused renders the locked comment of
+// an automatic apply on a rollout of independent targets that stopped for
+// confirmation because applying throws away an unfinished copy on a target
+// other than the primary. The copy is named under the plan of the target it
+// is on, and confirming runs every target's plan, that one included.
+func PreviewCommentPlanRolloutCopyDiscardedPaused() string {
+	return RenderPlanComment(PlanCommentData{
+		Database:     "testapp",
+		SchemaName:   "testapp",
+		Environment:  "production",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		RequestedBy:  previewRequestedBy,
+		IsMySQL:      true,
+		DatabaseType: "mysql",
+		IsLocked:     true,
+		LockOwner:    previewRepository + "#42",
+		LockAcquired: "2026-01-15 14:30:00 UTC",
+		Changes:      samplePlanChanges(),
+		DeploymentDrift: &DeploymentDriftData{
+			Computed: true, Clean: true, Independent: true,
+			Deployments: previewRolloutMembers(),
+			Plans: []DeploymentPlanGroup{
+				{Members: []string{"us/testapp_1", "us/testapp_2", "us/testapp_3"}, Primary: true, Changes: samplePlanChanges()},
+			},
+			DiscardedCopies: []TargetExistingCopy{{
+				Target: "us/testapp_3",
+				Copy: ExistingCopyData{
+					Namespace: "testapp",
+					Tables:    []string{"products"},
+					Reason:    "statement_differs",
+					Age:       "3h 12m",
+					Statement: "ALTER TABLE `products` ADD INDEX `idx_category` (`category`)",
+				},
+			}},
+		},
+		PendingManualConfirmation: true,
+	})
+}
+
 // PreviewCommentPlanRolloutDistinctPlans renders a plan comment for a rollout of
 // independent targets that need different work: the primary target and one
 // other need the email column, and the third needs it with an index as well.
