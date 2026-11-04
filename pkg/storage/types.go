@@ -1868,38 +1868,60 @@ func (r *ApplyControlRequest) CutoverOperationIDs() ([]int64, error) {
 
 // cutoverOutcomeUnknownSinceMetadataKey records when a cutover request's
 // outcome became unknown: a send whose answer was lost may have started the
-// cutover. It lives on the request row, so it outlasts the drive that sent
-// the request and is cleared when the row is re-armed for a new command.
+// cutover. Its value is an object keyed by the decimal apply_operation id the
+// send was for, "0" for a request not bound to an operation, each holding the
+// moment that operation's send first lost its answer. A request bound to a
+// set of operations is sent once per member, so the stamps are kept apart:
+// one member's lost answer says nothing about another member's first send. It
+// lives on the request row, so it outlasts the drive that sent the request
+// and is cleared when the row is re-armed for a new command.
 const cutoverOutcomeUnknownSinceMetadataKey = "outcome_unknown_since"
 
-// CutoverOutcomeUnknownSince returns when the request's outcome became
-// unknown, or the zero time when no send of it has lost its answer.
-func (r *ApplyControlRequest) CutoverOutcomeUnknownSince() (time.Time, error) {
+// cutoverOutcomeUnknownStamps decodes the per-operation stamps under
+// cutoverOutcomeUnknownSinceMetadataKey from the request's metadata, and
+// returns the remaining metadata fields so a stamp can be written back
+// without losing them.
+func (r *ApplyControlRequest) cutoverOutcomeUnknownStamps() (map[string]json.RawMessage, map[string]time.Time, error) {
+	fields := map[string]json.RawMessage{}
+	stamps := map[string]time.Time{}
 	if r == nil || len(r.Metadata) == 0 {
-		return time.Time{}, nil
+		return fields, stamps, nil
 	}
-	var payload struct {
-		Since *time.Time `json:"outcome_unknown_since"`
+	if err := json.Unmarshal(r.Metadata, &fields); err != nil {
+		return nil, nil, fmt.Errorf("parse metadata of %s control request %d: %w", r.Operation, r.ID, err)
 	}
-	if err := json.Unmarshal(r.Metadata, &payload); err != nil {
-		return time.Time{}, fmt.Errorf("parse metadata of %s control request %d: %w", r.Operation, r.ID, err)
+	raw, ok := fields[cutoverOutcomeUnknownSinceMetadataKey]
+	if !ok {
+		return fields, stamps, nil
 	}
-	if payload.Since == nil {
-		return time.Time{}, nil
+	if err := json.Unmarshal(raw, &stamps); err != nil {
+		return nil, nil, fmt.Errorf("parse %s of %s control request %d: %w", cutoverOutcomeUnknownSinceMetadataKey, r.Operation, r.ID, err)
 	}
-	return *payload.Since, nil
+	return fields, stamps, nil
+}
+
+// CutoverOutcomeUnknownSince returns when the request's send for operationID
+// (0 for a request not bound to an operation) first lost its answer, or the
+// zero time when no send for that operation has.
+func (r *ApplyControlRequest) CutoverOutcomeUnknownSince(operationID int64) (time.Time, error) {
+	_, stamps, err := r.cutoverOutcomeUnknownStamps()
+	if err != nil {
+		return time.Time{}, err
+	}
+	return stamps[strconv.FormatInt(operationID, 10)], nil
 }
 
 // WithCutoverOutcomeUnknownSince returns the request's metadata with since
-// recorded as the moment its outcome became unknown, keeping every other key.
-func (r *ApplyControlRequest) WithCutoverOutcomeUnknownSince(since time.Time) ([]byte, error) {
-	fields := map[string]json.RawMessage{}
-	if len(r.Metadata) > 0 {
-		if err := json.Unmarshal(r.Metadata, &fields); err != nil {
-			return nil, fmt.Errorf("parse metadata of %s control request %d: %w", r.Operation, r.ID, err)
-		}
+// recorded as the moment its send for operationID (0 for a request not bound
+// to an operation) lost its answer, keeping every other key and every other
+// operation's stamp.
+func (r *ApplyControlRequest) WithCutoverOutcomeUnknownSince(operationID int64, since time.Time) ([]byte, error) {
+	fields, stamps, err := r.cutoverOutcomeUnknownStamps()
+	if err != nil {
+		return nil, err
 	}
-	raw, err := json.Marshal(since.UTC())
+	stamps[strconv.FormatInt(operationID, 10)] = since.UTC()
+	raw, err := json.Marshal(stamps)
 	if err != nil {
 		return nil, fmt.Errorf("encode %s of %s control request %d: %w", cutoverOutcomeUnknownSinceMetadataKey, r.Operation, r.ID, err)
 	}

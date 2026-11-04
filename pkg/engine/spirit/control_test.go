@@ -517,12 +517,9 @@ func TestStatelessControlDatabase(t *testing.T) {
 	})
 }
 
-// The revert-window controls decline with a typed unsupported-operation error.
-// Spirit copies into a shadow table and swaps it in, so once a change cuts over
-// there is no engine phase left to revert from and no window to close. The typed
-// decline is what lets a durable control request resolve terminally instead of
-// retrying a rejection that can never succeed while the schema change keeps
-// executing.
+// A sentinel drop whose connection broke while the statement was in flight may
+// have run, so it is reported as an unknown outcome; a drop the database refused
+// is a plain failure. Either way the driver's error stays reachable.
 func TestSentinelDropErrorReportsAnUnknownOutcomeOnlyForABrokenConnection(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -544,6 +541,12 @@ func TestSentinelDropErrorReportsAnUnknownOutcomeOnlyForABrokenConnection(t *tes
 	}
 }
 
+// The revert-window controls decline with a typed unsupported-operation error.
+// Spirit copies into a shadow table and swaps it in, so once a change cuts over
+// there is no engine phase left to revert from and no window to close. The typed
+// decline is what lets a durable control request resolve terminally instead of
+// retrying a rejection that can never succeed while the schema change keeps
+// executing.
 func TestRevertWindowControlsDeclineAsUnsupported(t *testing.T) {
 	eng := New(Config{})
 

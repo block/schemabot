@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 )
@@ -871,19 +872,30 @@ const cutoverOutcomeUnknownWindow = 5 * time.Minute
 // cutoverOutcomeUnconfirmedMessage answers a cutover request whose outcome was
 // still unknown when the window closed. It does not claim the cutover failed:
 // the restored apply state is outranked by any cutover state progress reports.
-var cutoverOutcomeUnconfirmedMessage = fmt.Sprintf("SchemaBot could not confirm the cutover: the database did not answer for %s after it was sent. The schema change's progress shows whether it ran; if it is still waiting for cutover, run cutover again.", cutoverOutcomeUnknownWindow)
+var cutoverOutcomeUnconfirmedMessage = fmt.Sprintf("SchemaBot could not confirm the cutover: the database did not answer for %d minutes after it was sent. The schema change's progress shows whether it ran; if it is still waiting for cutover, run cutover again.", int(cutoverOutcomeUnknownWindow.Minutes()))
+
+// cutoverOutcomeStillUnknown reports whether a send of a cutover request left
+// its outcome unknown. The engine says so for the send that lost its answer
+// and for every resend that errs; a resend the backend turns away as not ready
+// settles nothing about the send that may have started the cutover either, so
+// once since is set it keeps the request inside the window rather than
+// retrying outside it.
+func cutoverOutcomeStillUnknown(err error, since time.Time) bool {
+	return engine.IsOutcomeUnknown(err) || (engine.IsNotReady(err) && !since.IsZero())
+}
 
 // holdCutoverRequestWithUnknownOutcome keeps a cutover request pending after
 // a send whose outcome is unknown, and reports when the request has been
 // unknown for longer than cutoverOutcomeUnknownWindow so the caller settles
-// it. since is when the request's outcome first became unknown, zero for the
-// send that just lost its answer: that send stamps the request row, so the
+// it. operationID names the operation the send was for, 0 for a request not
+// bound to one. since is when that operation's send first lost its answer,
+// zero for the send that just did: that send stamps the request row, so the
 // window survives a lease handover and an error from a later resend is never
 // read as the outcome of the send that may have started the cutover.
-func holdCutoverRequestWithUnknownOutcome(ctx context.Context, store storage.Storage, apply *storage.Apply, controlReq *storage.ApplyControlRequest, since, now time.Time, sendErr error, logger *slog.Logger, attrs ...any) (settle bool, err error) {
+func holdCutoverRequestWithUnknownOutcome(ctx context.Context, store storage.Storage, apply *storage.Apply, controlReq *storage.ApplyControlRequest, operationID int64, since, now time.Time, sendErr error, logger *slog.Logger, attrs ...any) (settle bool, err error) {
 	attrs = append(append(apply.MutableLogAttrs(), attrs...), "requested_by", controlRequestCaller(controlReq), "error", sendErr)
 	if since.IsZero() {
-		if err := stampCutoverOutcomeUnknown(ctx, store, apply, controlReq, now, logger); err != nil {
+		if err := stampCutoverOutcomeUnknown(ctx, store, apply, controlReq, operationID, now, logger); err != nil {
 			return false, err
 		}
 		logger.Warn("pending cutover request has an unknown outcome; the request stays pending and is sent again at the next progress tick", attrs...)
@@ -900,10 +912,11 @@ func holdCutoverRequestWithUnknownOutcome(ctx context.Context, store storage.Sto
 	return true, nil
 }
 
-// stampCutoverOutcomeUnknown records on controlReq's row when its outcome
-// became unknown. A row that has since been settled or re-armed for a new
-// command is left alone, and so is an existing stamp.
-func stampCutoverOutcomeUnknown(ctx context.Context, store storage.Storage, apply *storage.Apply, controlReq *storage.ApplyControlRequest, now time.Time, logger *slog.Logger) error {
+// stampCutoverOutcomeUnknown records on controlReq's row when its send for
+// operationID (0 for a request not bound to an operation) lost its answer. A
+// row that has since been settled or re-armed for a new command is left
+// alone, and so is an existing stamp for the operation.
+func stampCutoverOutcomeUnknown(ctx context.Context, store storage.Storage, apply *storage.Apply, controlReq *storage.ApplyControlRequest, operationID int64, now time.Time, logger *slog.Logger) error {
 	controlStore := store.ControlRequests()
 	if controlStore == nil {
 		return fmt.Errorf("record unknown cutover outcome for apply %s: control request store is not available", apply.ApplyIdentifier)
@@ -911,23 +924,37 @@ func stampCutoverOutcomeUnknown(ctx context.Context, store storage.Storage, appl
 	_, err := controlStore.UpdateMetadata(ctx, apply.ID, storage.ControlOperationCutover, func(req *storage.ApplyControlRequest) ([]byte, error) {
 		if req.ID != controlReq.ID || req.Revision != controlReq.Revision || req.Status != storage.ControlRequestPending {
 			logger.Debug("cutover request was settled or re-armed after it was sent; its unknown outcome is not recorded",
-				append(apply.MutableLogAttrs(), "status", req.Status, "revision", req.Revision)...)
+				append(apply.MutableLogAttrs(), "status", req.Status, "revision", req.Revision, "operation_id", operationID)...)
 			return nil, nil
 		}
-		since, err := req.CutoverOutcomeUnknownSince()
+		since, err := req.CutoverOutcomeUnknownSince(operationID)
 		if err != nil {
 			return nil, err
 		}
 		if !since.IsZero() {
 			logger.Debug("cutover request already records when its outcome became unknown",
-				append(apply.MutableLogAttrs(), "outcome_unknown_since", since)...)
+				append(apply.MutableLogAttrs(), "outcome_unknown_since", since, "operation_id", operationID)...)
 			return nil, nil
 		}
-		return req.WithCutoverOutcomeUnknownSince(now)
+		return req.WithCutoverOutcomeUnknownSince(operationID, now)
 	})
 	if err != nil {
 		return fmt.Errorf("record unknown cutover outcome for apply %s: %w", apply.ApplyIdentifier, err)
 	}
+	return nil
+}
+
+// settleCutoverRequestUnconfirmed fails, through fail, a cutover request whose
+// outcome stayed unknown for the whole window, and closes the timeline's
+// unknown-outcome entry so the resend it announced does not read as still
+// coming. The timeline entry follows the settle so a failed settle, which
+// leaves the request pending for the next drive, announces nothing.
+func (c *LocalClient) settleCutoverRequestUnconfirmed(ctx context.Context, apply *storage.Apply, fail func(reason string) error) error {
+	if err := fail(cutoverOutcomeUnconfirmedMessage); err != nil {
+		return err
+	}
+	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelWarn, storage.LogEventInfo, storage.LogSourceSchemaBot,
+		cutoverOutcomeUnconfirmedMessage, "", "")
 	return nil
 }
 
