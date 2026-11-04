@@ -47,29 +47,6 @@ func previewCLIMultiDeploymentApplyHaltedWithLiveSibling() {
 	}))
 }
 
-// previewCLIMultiDeploymentApplyStoppedAtCutover is a rollout that deferred
-// its cutover across three deployments. eu-west failed while us-east and
-// ap-south had copied and waited at the cutover, which could then never run
-// for all three, so SchemaBot stopped them, saved their copies, and failed
-// the apply.
-func previewCLIMultiDeploymentApplyStoppedAtCutover() {
-	endedBy := &presentation.OperationRef{Deployment: "eu-west"}
-	ddl := "ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL"
-	data := multiDeploymentProgressData([]ProgressOperation{
-		{Deployment: "us-east", Target: "orders-us-east", State: state.ApplyOperation.Failed, CutoverPolicy: storage.CutoverPolicyParallel, OnFailure: storage.OnFailureHalt, EndedBy: endedBy},
-		{Deployment: "eu-west", Target: "orders-eu-west", State: state.ApplyOperation.Failed, CutoverPolicy: storage.CutoverPolicyParallel, OnFailure: storage.OnFailureHalt, ErrorMessage: "lock wait timeout exceeded; try restarting transaction"},
-		{Deployment: "ap-south", Target: "orders-ap-south", State: state.ApplyOperation.Failed, CutoverPolicy: storage.CutoverPolicyParallel, OnFailure: storage.OnFailureHalt, EndedBy: endedBy},
-	}, []TableProgress{
-		{Deployment: "us-east", Target: "orders-us-east", TableName: "orders", ChangeType: "alter", Dialect: schema.DialectMySQL, DDL: ddl, Status: state.Task.Stopped, RowsCopied: 80000, RowsTotal: 80000, PercentComplete: 100},
-		{Deployment: "eu-west", Target: "orders-eu-west", TableName: "orders", ChangeType: "alter", Dialect: schema.DialectMySQL, DDL: ddl, Status: state.Task.Failed, RowsCopied: 51000, RowsTotal: 120000, PercentComplete: 42},
-		{Deployment: "ap-south", Target: "orders-ap-south", TableName: "orders", ChangeType: "alter", Dialect: schema.DialectMySQL, DDL: ddl, Status: state.Task.Stopped, RowsCopied: 60000, RowsTotal: 60000, PercentComplete: 100},
-	})
-	data.State = state.Apply.Failed
-	data.Options = map[string]string{"defer_cutover": "true"}
-	data.CompletedAt = previewTime.Add(-1 * time.Minute).Format(time.RFC3339)
-	WriteProgress(data)
-}
-
 func previewCLIMultiDeploymentApplyCompleted() {
 	data := multiDeploymentProgressData([]ProgressOperation{
 		{Deployment: "us-east", Target: "orders-us-east", State: state.ApplyOperation.Completed, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt},
@@ -92,7 +69,6 @@ func previewCLIMultiDeployAllOutput() {
 		{"BARRIER ROLLOUT IN PROGRESS", previewCLIMultiDeploymentApplyInProgress},
 		{"HALT ON FAILURE (ONE DEPLOYMENT FAILED)", previewCLIMultiDeploymentApplyFailed},
 		{"HALT ON FAILURE (A SIBLING IS STILL RUNNING)", previewCLIMultiDeploymentApplyHaltedWithLiveSibling},
-		{"DEFERRED CUTOVER STOPPED AFTER A FAILURE", previewCLIMultiDeploymentApplyStoppedAtCutover},
 		{"ALL DEPLOYMENTS COMPLETED", previewCLIMultiDeploymentApplyCompleted},
 		{"MULTI-TARGET ROLLOUT PAST A FAILED TARGET", previewCLIMultiTargetRolloutInProgress},
 		{"MULTI-TARGET ROLLOUT WAITING FOR CUTOVER", previewCLIMultiTargetRolloutWaitingForCutover},

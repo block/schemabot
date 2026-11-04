@@ -438,7 +438,6 @@ func previewCommentMultiDeployAllOutput() {
 		{"ALL DEPLOYMENTS COMPLETED", func() { fmt.Print(webhooktemplates.PreviewCommentMultiDeploymentApplyCompleted()) }},
 		{"SUMMARY: ALL DEPLOYMENTS COMPLETED", func() { fmt.Print(webhooktemplates.PreviewCommentMultiDeploymentApplySummaryCompleted()) }},
 		{"SUMMARY: HALT ON FAILURE (ONE DEPLOYMENT FAILED)", func() { fmt.Print(webhooktemplates.PreviewCommentMultiDeploymentApplySummaryFailed()) }},
-		{"SUMMARY: DEFERRED CUTOVER STOPPED AFTER A FAILURE", func() { fmt.Print(webhooktemplates.PreviewCommentMultiDeploymentApplySummaryStoppedAtCutover()) }},
 		{"ENGINE LOGS FOLD: TWO DATA PLANES", func() { fmt.Print(webhooktemplates.PreviewCommentSummaryFailedEngineLogsMultiDeployment()) }},
 	}
 	printSections(sections)
@@ -461,6 +460,7 @@ func previewCommentShardedAllOutput() {
 		{"SUMMARY: KEYSPACE FINALIZED", func() { fmt.Print(webhooktemplates.PreviewCommentShardedSummaryFinalized()) }},
 		{"SUMMARY: HALT ON FAILURE (ONE SHARD FAILED)", func() { fmt.Print(webhooktemplates.PreviewCommentShardedSummaryFailed()) }},
 		{"SUMMARY: DEFERRED CUTOVER STOPPED AFTER A SHARD FAILED", func() { fmt.Print(webhooktemplates.PreviewCommentShardedSummaryStoppedAtCutover()) }},
+		{"SUMMARY: DEFERRED CUTOVER STOPPED AFTER A TABLE FAILED ON A KEYSPACE'S ONLY SHARD", func() { fmt.Print(webhooktemplates.PreviewCommentSummaryStoppedAtCutoverOnOnlyShard()) }},
 		{"SUMMARY: CANCELLED AFTER PARTIAL LANDING", func() { fmt.Print(webhooktemplates.PreviewCommentShardedSummaryCancelledPartial()) }},
 	}
 	printSections(sections)

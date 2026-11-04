@@ -904,11 +904,12 @@ func rollupTaskStatus(statuses []string) string {
 
 // writeTargetAttention names each failed or retrying target with its error
 // and the data-plane operation and apply to look at, the way a sharded apply
-// names a failed shard.
+// names a failed shard. A target stopped at the cutover for another's failure
+// does not need attention of its own.
 func writeTargetAttention(b *strings.Builder, v RolloutView, g presentation.Group) {
 	var attention []int
 	for _, i := range g.Members {
-		if isTargetFailureState(v.Model.Deployments[i].State) {
+		if v.Model.Deployments[i].FailedOrRetrying() {
 			attention = append(attention, i)
 		}
 	}
@@ -937,12 +938,6 @@ func writeTargetAttention(b *strings.Builder, v RolloutView, g presentation.Grou
 	if more := len(attention) - rolloutAttentionLimit; more > 0 {
 		fmt.Fprintf(b, "    %s…and %d more%s\n", ANSIDim, more, ANSIReset)
 	}
-}
-
-// isTargetFailureState reports whether a target's operation failed, or failed
-// and is being retried.
-func isTargetFailureState(opState string) bool {
-	return state.IsState(opState, state.ApplyOperation.Failed, state.ApplyOperation.FailedRetryable)
 }
 
 // memberTargetName is a member's target, or its name when it carries none.

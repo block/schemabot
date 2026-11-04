@@ -1,12 +1,15 @@
 package templates
 
 import (
+	"encoding/json"
+	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/presentation"
 	"github.com/block/schemabot/pkg/state"
 )
 
@@ -215,4 +218,65 @@ func TestParseProgressResponseCarriesCopyFieldsAndNormalizesStatus(t *testing.T)
 	assert.Equal(t, int64(71436), data.Tables[0].RowsCopied)
 	assert.Equal(t, int64(221193), data.Tables[0].RowsTotal)
 	assert.Equal(t, 32, data.Tables[0].PercentComplete)
+}
+
+// A sharded apply deferred its cutover and shard -40 failed, so SchemaBot
+// stopped 40-80 and 80- at the cutover and failed them for -40 (ended_by).
+// Parsed from the progress response's JSON, the CLI counts those shards as
+// stopped at cutover rather than failed and notes that their copies are
+// saved. A reference to a row the apply no longer lists arrives as an empty
+// ended_by ({}): the shard still reads stopped at cutover, without naming the
+// shard that failed.
+func TestParseProgressResponseCountsShardsStoppedAtCutover(t *testing.T) {
+	const response = `{
+		"state": "failed",
+		"options": {"defer_cutover": "true"},
+		"operations": [
+			{"deployment": "default", "operation_key": "commerce/-40/orders", "state": "failed", "cutover_policy": "parallel", "error_message": "lock wait timeout exceeded"},
+			{"deployment": "default", "operation_key": "commerce/40-80/orders", "state": "failed", "cutover_policy": "parallel", "ended_by": {"deployment": "default", "operation_key": "commerce/-40/orders"}},
+			{"deployment": "default", "operation_key": "commerce/80-/orders", "state": "failed", "cutover_policy": "parallel", "ended_by": %s}
+		],
+		"tables": [{"table_name": "orders", "keyspace": "commerce", "status": "failed", "shards": [
+			{"shard": "-40", "status": "failed", "rows_copied": 400, "rows_total": 1000},
+			{"shard": "40-80", "status": "stopped", "rows_copied": 1000, "rows_total": 1000},
+			{"shard": "80-", "status": "stopped", "rows_copied": 1000, "rows_total": 1000}
+		]}]
+	}`
+	for _, tc := range []struct {
+		name          string
+		lastEndedBy   string
+		wantRef       presentation.OperationRef
+		wantCounts    string
+		wantNoteCause string
+	}{
+		{
+			name:          "names the failed shard",
+			lastEndedBy:   `{"deployment": "default", "operation_key": "commerce/-40/orders"}`,
+			wantRef:       presentation.OperationRef{Deployment: "default", OperationKey: "commerce/-40/orders"},
+			wantCounts:    "1 failed, 2 stopped at cutover",
+			wantNoteCause: "2 shards stopped at the cutover because -40 failed.",
+		},
+		{
+			name:          "an unplaced reference names no shard",
+			lastEndedBy:   `{}`,
+			wantRef:       presentation.OperationRef{},
+			wantCounts:    "1 failed, 2 stopped at cutover",
+			wantNoteCause: "2 shards stopped at the cutover because another shard failed.",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var result apitypes.ProgressResponse
+			require.NoError(t, json.Unmarshal(fmt.Appendf(nil, response, tc.lastEndedBy), &result))
+
+			data := ParseProgressResponse(&result)
+
+			require.Len(t, data.Operations, 3)
+			assert.Nil(t, data.Operations[0].EndedBy)
+			require.NotNil(t, data.Operations[2].EndedBy)
+			assert.Equal(t, tc.wantRef, *data.Operations[2].EndedBy)
+			assert.Equal(t, tc.wantCounts, ShardCounts(data.State, data.Operations, data.Tables, data.Released))
+			assert.Equal(t, tc.wantNoteCause+" Their copies are saved, so applying again resumes them.",
+				ShardsStoppedAtCutoverNote(data.State, data.Operations, data.Tables, data.Released))
+		})
+	}
 }

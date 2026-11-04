@@ -1187,6 +1187,14 @@ func (d Deployment) AlreadyApplied() bool {
 	return state.IsState(d.State, state.ApplyOperation.Completed) && d.AlreadyConverged
 }
 
+// FailedOrRetrying reports whether the member failed on its own or is
+// retrying after a failure: the members an operator acts on. A member
+// SchemaBot stopped at the cutover for another member's failure is not one of
+// them, although its stored state is failed.
+func (d Deployment) FailedOrRetrying() bool {
+	return d.Presentation == StateFailed || d.Presentation == StateRetrying
+}
+
 func (d *Deployment) set(ps PresentationState, label, emoji string, open bool) {
 	d.Presentation = ps
 	d.Label = label

@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/block/schemabot/pkg/presentation"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/stretchr/testify/assert"
@@ -440,23 +441,24 @@ func TestGroupTasksByOperation_SkipsUnlinkedTasks(t *testing.T) {
 	assert.Len(t, grouped, 1)
 }
 
-// A rollout deferred its cutover and us failed, so SchemaBot stopped eu and
-// au at the cutover and failed them for us (ended_by_operation_id). The
-// comment's model reads eu and au as stopped at cutover naming us, and us
-// alone as the first failure, although eu comes first.
+// Target orders-001 deferred its cutover across shards -80 and 80-, and 80-
+// failed while -80 waited at the cutover, so SchemaBot stopped -80 and failed
+// it for 80- (ended_by_operation_id). The comment's model reads -80 as stopped
+// at cutover and counts it apart, and the first failure is the 80- row, even
+// though -80 comes first.
 func TestDeriveApplyPresentation_StoppedAtCutoverNamesTheFailedRow(t *testing.T) {
 	ops := []*storage.ApplyOperation{
-		{ID: 11, Deployment: "eu", State: state.ApplyOperation.Failed, CutoverPolicy: storage.CutoverPolicyParallel, EndedByOperationID: 12},
-		{ID: 12, Deployment: "us", State: state.ApplyOperation.Failed, CutoverPolicy: storage.CutoverPolicyParallel, ErrorMessage: "lock wait timeout exceeded"},
-		{ID: 13, Deployment: "au", State: state.ApplyOperation.Failed, CutoverPolicy: storage.CutoverPolicyParallel, EndedByOperationID: 12},
+		{ID: 11, Deployment: "payments-a", Target: "orders-001", OperationKey: "orders-001/orders/-80/orders", State: state.ApplyOperation.Failed, CutoverPolicy: storage.CutoverPolicyParallel, EndedByOperationID: 12},
+		{ID: 12, Deployment: "payments-a", Target: "orders-001", OperationKey: "orders-001/orders/80-/orders", State: state.ApplyOperation.Failed, CutoverPolicy: storage.CutoverPolicyParallel, ErrorMessage: "lock wait timeout exceeded"},
 	}
 
 	model := deriveApplyPresentation(state.Apply.Failed, ops, nil, false)
 
-	require.Len(t, model.Deployments, 3)
-	assert.Equal(t, "stopped at cutover — us failed; copy saved", model.Deployments[0].Label)
-	assert.Equal(t, "failed", model.Deployments[1].Label)
-	assert.Equal(t, "stopped at cutover — us failed; copy saved", model.Deployments[2].Label)
+	require.Len(t, model.Deployments, 2)
+	assert.Equal(t, presentation.StateStoppedAtCutover, model.Deployments[0].Presentation)
+	assert.Equal(t, presentation.StateFailed, model.Deployments[1].Presentation)
+	assert.Equal(t, []presentation.StateCount{{Label: "failed", Count: 1}, {Label: "stopped at cutover", Count: 1}}, model.Counts)
 	require.NotNil(t, model.FirstFailure)
-	assert.Equal(t, "us", model.FirstFailure.Name)
+	assert.Equal(t, 1, model.FirstFailure.Row)
+	assert.Equal(t, "lock wait timeout exceeded", model.FirstFailure.Error)
 }

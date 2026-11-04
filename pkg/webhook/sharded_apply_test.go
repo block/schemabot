@@ -17,6 +17,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/schemabot/pkg/presentation"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/webhook/templates"
@@ -682,6 +683,32 @@ func TestBuildSingleShardApplyCommentData_TableSizeFromStoredPlan(t *testing.T) 
 	require.NotNil(t, data.Tables[0].EstimatedBytes)
 	assert.Equal(t, int64(1_130_000_000), *data.Tables[0].EstimatedBytes)
 	assert.Contains(t, templates.RenderApplyStatusComment(data), "- Rows: 400 / 1,000 · ~1.1 GB · ETA: 1m 0s")
+}
+
+// A keyspace's only shard deferred its cutover across two tables, and users
+// failed while mutes waited at the cutover, so SchemaBot stopped mutes and
+// failed it for users. mutes comes first and ties users on state, yet the
+// comment names users' error as the failure, and notes that mutes stopped at
+// the cutover with its copy saved.
+func TestBuildSingleShardApplyCommentData_StoppedAtCutoverNamesTheFailedTable(t *testing.T) {
+	mutesID, usersID := int64(1), int64(2)
+	ops := []*storage.ApplyOperation{
+		{ID: mutesID, ApplyID: 1, Deployment: "default", OperationKey: "ks/-/mutes", State: state.ApplyOperation.Failed, CutoverPolicy: storage.CutoverPolicyParallel, OnFailure: storage.OnFailureHalt, EndedByOperationID: usersID},
+		{ID: usersID, ApplyID: 1, Deployment: "default", OperationKey: "ks/-/users", State: state.ApplyOperation.Failed, CutoverPolicy: storage.CutoverPolicyParallel, OnFailure: storage.OnFailureHalt, ErrorMessage: "lock wait timeout exceeded"},
+	}
+	tasks := []*storage.Task{
+		{ID: 1, ApplyID: 1, ApplyOperationID: &mutesID, Shard: "-", Namespace: "ks", TableName: "mutes", State: state.Task.Stopped, RowsCopied: 1000, RowsTotal: 1000, ProgressPercent: 100},
+		{ID: 2, ApplyID: 1, ApplyOperationID: &usersID, Shard: "-", Namespace: "ks", TableName: "users", State: state.Task.Failed, RowsCopied: 400, RowsTotal: 1000, ProgressPercent: 40},
+	}
+	apply := &storage.Apply{ApplyIdentifier: "apply-x", Database: "cdb_resolute", Environment: "staging", State: state.Apply.Failed}
+
+	data := buildSingleShardApplyCommentData(apply, ops, tasks, nil, &shardedPlanView{}, "")
+
+	assert.Equal(t, "lock wait timeout exceeded", data.ErrorMessage)
+	assert.Equal(t, presentation.StoppedAtCutover{Count: 1, EndedBy: "users"}, data.StoppedAtCutover)
+	body := templates.RenderApplyStatusComment(data)
+	assert.Contains(t, body, "**Error:** lock wait timeout exceeded")
+	assert.Contains(t, body, "> ⏹️ 1 table stopped at the cutover because <code>users</code> failed. Its copy is saved, so applying again resumes it.")
 }
 
 // A shard reporting copied rows without a row total has no denominator to

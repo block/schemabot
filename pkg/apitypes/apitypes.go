@@ -1874,9 +1874,10 @@ type ProgressOperationResponse struct {
 }
 
 // ProgressOperationRef names one operation of an apply by its deployment and
-// operation key, which together identify it.
+// operation key, which together identify it. An empty reference ({}) says the
+// operation was failed for another whose row the apply no longer lists.
 type ProgressOperationRef struct {
-	Deployment   string `json:"deployment"`
+	Deployment   string `json:"deployment,omitempty"`
 	OperationKey string `json:"operation_key,omitempty"`
 }
 

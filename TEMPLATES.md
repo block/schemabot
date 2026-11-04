@@ -9850,124 +9850,6 @@ schemabot apply -e production
 </details>
 
 <details>
-<summary><a name="summary-deferred-cutover-stopped-after-a-failure"></a><strong>Summary: Deferred Cutover Stopped After A Failure</strong></summary>
-
-
-## ❌ Schema Change Failed — Production
-
-<!-- schemabot:offer-support-channel -->
-**Apply ID**: `apply-a1b2c3d4e5f6`
-
-*Applied by @aparajon at 2026-01-01 00:00:00 UTC*
-
-**Deployments**: 1 failed, 2 stopped at cutover
-
-> ❌ **First failure:** <code>us</code> — lock wait timeout exceeded; try restarting transaction
-
-> ⏹️ 2 deployments stopped at the cutover because <code>us</code> failed. Their copies are saved, so applying again resumes them.
-
-- ⏹️ `eu` — stopped at cutover — us failed; copy saved
-- ❌ `us` — failed
-- ⏹️ `au` — stopped at cutover — us failed; copy saved
-
-<details open>
-<summary>⏹️ eu — stopped at cutover — us failed; copy saved</summary>
-<dl><dd>
-
-<!-- schemabot:offer-support-channel -->
-**Database**: `payments_eu`
-
-### ⏹️ testapp
-
-**`orders`** — Stopped
-```sql
-ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
-```
-
-**`users`** — Stopped
-```sql
-ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
-```
-
-**`products`** — Stopped
-```sql
-ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
-```
-
-
-</dd></dl>
-</details>
-
-<details open>
-<summary>❌ us — failed</summary>
-<dl><dd>
-
-<!-- schemabot:offer-support-channel -->
-**Database**: `payments_us`
-
-> ❌ **Error:** lock wait timeout exceeded; try restarting transaction
-
-1 of 3 tables completed before failure.
-
-### ❌ testapp
-
-**`users`** — Failed
-```sql
-ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
-```
-
-**`orders`** — Completed
-```sql
-ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
-```
-
-**`products`** — Cancelled
-```sql
-ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
-```
-
-
-</dd></dl>
-</details>
-
-<details open>
-<summary>⏹️ au — stopped at cutover — us failed; copy saved</summary>
-<dl><dd>
-
-<!-- schemabot:offer-support-channel -->
-**Database**: `payments_au`
-
-### ⏹️ testapp
-
-**`orders`** — Stopped
-```sql
-ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
-```
-
-**`users`** — Stopped
-```sql
-ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
-```
-
-**`products`** — Stopped
-```sql
-ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
-```
-
-
-</dd></dl>
-</details>
-
----
-
-To retry once the failure above is resolved — a new apply reprocesses only the tables that haven't completed:
-```
-schemabot apply -e production
-```
-
-</details>
-
-<details>
 <summary><a name="engine-logs-fold-two-data-planes"></a><strong>Engine Logs Fold: Two Data Planes</strong></summary>
 
 
@@ -10500,6 +10382,46 @@ schemabot apply -e production
 </details>
 
 <details>
+<summary><a name="summary-deferred-cutover-stopped-after-a-table-failed-on-a-keyspaces-only-shard"></a><strong>Summary: Deferred Cutover Stopped After A Table Failed On A Keyspace's Only Shard</strong></summary>
+
+
+## ❌ Schema Change Failed — Staging
+
+<!-- schemabot:offer-support-channel -->
+**Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Duration**: 8m
+
+*Applied by @jackjackbits at 2026-03-15 14:22:00 UTC*
+
+> ❌ **Error:** lock wait timeout exceeded; try restarting transaction
+
+> ⏹️ 2 tables stopped at the cutover because <code>users</code> failed. Their copies are saved, so applying again resumes them.
+
+**`orders`** — Stopped
+```sql
+ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
+```
+
+**`users`** — Failed at 30.00%
+```sql
+ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
+```
+
+**`products`** — Stopped
+```sql
+ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
+```
+
+
+---
+
+To retry:
+```
+schemabot apply -e staging
+```
+
+</details>
+
+<details>
 <summary><a name="summary-cancelled-after-partial-landing"></a><strong>Summary: Cancelled After Partial Landing</strong></summary>
 
 
@@ -10659,53 +10581,6 @@ To retry once the failure above is resolved — a new apply reprocesses only the
 To stop this schema change:
   schemabot stop apply-multi-a1b2c3d4 -e production
 A new apply can retry the failure once this one finishes or is stopped; it reprocesses only the tables that haven't completed.
-
-```
-</details>
-
-<details>
-<summary><a name="deferred-cutover-stopped-after-a-failure"></a><strong>Deferred Cutover Stopped After A Failure</strong></summary>
-
-```
-
-┌───────────────────────────────────────────────────────┐
-│  Apply ID:     apply-multi-a1b2c3d4                   │
-│  Environment:  production                             │
-│  State:        failed                                 │
-│  Caller:       github:octocat                         │
-│  Source:       https://github.com/acme/shop/pull/412  │
-│  Started:      Jan 15 14:22:00 UTC                    │
-│  Duration:     7m                                     │
-│  Deployments:  1 failed · 2 stopped at cutover        │
-└───────────────────────────────────────────────────────┘
-
-  ❌ First failure: eu-west — lock wait timeout exceeded; try restarting transaction
-
-  ⏹️ 2 deployments stopped at the cutover because eu-west failed. Their copies are saved, so applying again resumes them.
-
-⏹️ us-east — stopped at cutover — eu-west failed; copy saved (orders-us-east)
-
-     ~ orders: 🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧 ⏹️ Stopped (was waiting for cutover)
-       ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL;
-       • Rows: 80,000 / 80,000
-
-
-❌ eu-west — failed (orders-eu-west)
-  lock wait timeout exceeded; try restarting transaction
-
-     ~ orders: 🟥🟥🟥🟥🟥🟥🟥🟥⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ❌ Failed
-       ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL;
-
-
-⏹️ ap-south — stopped at cutover — eu-west failed; copy saved (orders-ap-south)
-
-     ~ orders: 🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧 ⏹️ Stopped (was waiting for cutover)
-       ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL;
-       • Rows: 60,000 / 60,000
-
-
-To retry once the failure above is resolved — a new apply reprocesses only the tables that haven't completed:
-  schemabot apply -s <schema_dir> -e production
 
 ```
 </details>
