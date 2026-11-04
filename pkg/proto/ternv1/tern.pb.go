@@ -4254,7 +4254,7 @@ type DriverCapacityResponse struct {
 	// deferred_cutover_drivers is how many of those drivers may hold an
 	// operation waiting at a deferred cutover: each server's drivers less the
 	// one it keeps for other work. A waiting operation keeps its driver until
-	// it is cut over.
+	// its cutover runs.
 	DeferredCutoverDrivers int32 `protobuf:"varint,3,opt,name=deferred_cutover_drivers,json=deferredCutoverDrivers,proto3" json:"deferred_cutover_drivers,omitempty"`
 	// max_drivers_per_apply is how many operations of one apply the deployment
 	// runs at once. An operation waiting at its cutover keeps counting, so an

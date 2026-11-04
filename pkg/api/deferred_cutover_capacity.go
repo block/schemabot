@@ -201,7 +201,8 @@ func (s *Service) deferredCutoverCapacityRefusal(ctx context.Context, plan *stor
 // operations the apply would hold there at once must fit its
 // max_drivers_per_apply and the drivers its live servers can keep waiting. A
 // deployment that does not report its drivers is refused, since answering is
-// also what says it cuts over every operation a cutover command names. A
+// also what says it runs the cutover of every operation a cutover command
+// names. A
 // report that cannot be read is returned as an error, so the apply is refused
 // rather than admitted unchecked.
 func (s *Service) deferredCutoverDataPlaneRefusal(ctx context.Context, plan *storage.Plan, environment, applyIdentifier, caller string, groups []*storage.ApplyOperationWithTasks) (*DeferredCutoverCapacityError, error) {

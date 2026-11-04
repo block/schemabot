@@ -166,8 +166,8 @@ type TernClient interface {
 	// caller can refuse up front an apply that could never have all its
 	// operations here waiting at a deferred cutover at once.
 	//
-	// A deployment that answers also cuts over every operation a CutoverRequest
-	// names in apply_operation_ids, and records each command_id once. A caller
+	// A deployment that answers also runs the cutover of every operation a
+	// CutoverRequest names in apply_operation_ids, and records each command_id once. A caller
 	// must not send an apply started with defer_cutover to a deployment that
 	// answers Unimplemented.
 	DriverCapacity(ctx context.Context, in *DriverCapacityRequest, opts ...grpc.CallOption) (*DriverCapacityResponse, error)
@@ -533,8 +533,8 @@ type TernServer interface {
 	// caller can refuse up front an apply that could never have all its
 	// operations here waiting at a deferred cutover at once.
 	//
-	// A deployment that answers also cuts over every operation a CutoverRequest
-	// names in apply_operation_ids, and records each command_id once. A caller
+	// A deployment that answers also runs the cutover of every operation a
+	// CutoverRequest names in apply_operation_ids, and records each command_id once. A caller
 	// must not send an apply started with defer_cutover to a deployment that
 	// answers Unimplemented.
 	DriverCapacity(context.Context, *DriverCapacityRequest) (*DriverCapacityResponse, error)

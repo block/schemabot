@@ -193,8 +193,8 @@ service Tern {
   // caller can refuse up front an apply that could never have all its
   // operations here waiting at a deferred cutover at once.
   //
-  // A deployment that answers also cuts over every operation a CutoverRequest
-  // names in apply_operation_ids, and records each command_id once. A caller
+  // A deployment that answers also runs the cutover of every operation a
+  // CutoverRequest names in apply_operation_ids, and records each command_id once. A caller
   // must not send an apply started with defer_cutover to a deployment that
   // answers Unimplemented.
   rpc DriverCapacity(DriverCapacityRequest) returns (DriverCapacityResponse) {
@@ -1142,7 +1142,7 @@ message DriverCapacityResponse {
   // deferred_cutover_drivers is how many of those drivers may hold an
   // operation waiting at a deferred cutover: each server's drivers less the
   // one it keeps for other work. A waiting operation keeps its driver until
-  // it is cut over.
+  // its cutover runs.
   int32 deferred_cutover_drivers = 3;
   // max_drivers_per_apply is how many operations of one apply the deployment
   // runs at once. An operation waiting at its cutover keeps counting, so an
