@@ -928,29 +928,140 @@ func finalizerFinalizesWorkSQL(d Dialect, finalizerAlias, workAlias string) stri
 	)`
 }
 
-// orphanedFinalizerSQL matches an earlier group_finalizer that nothing will
+// orphanedFinalizerSQL matches a group_finalizer at alias that nothing will
 // ever start: it has not started (pending, or stopped before it started) and
 // work it finalizes has terminally failed. Its own claim waits for that work
 // to complete, and a failed operation never runs again, so it holds the
 // rollout exactly as long as the failure that orphaned it does, and no longer.
 // state.RolloutChildren (pkg/state/rollout.go) applies the same predicate to
 // loaded rows for every rollout state derivation. The fragment references the
-// earlier alias; its placeholders, in order, are the finalizer kind, pending, stopped,
-// the work kind and failed.
-func orphanedFinalizerSQL(d Dialect) string {
+// alias it is given; its placeholders are listed by orphanedFinalizerArgs.
+func orphanedFinalizerSQL(d Dialect, alias string) string {
 	return `(
-	earlier.operation_kind = ?
-	AND earlier.state IN (?, ?)
+	` + alias + `.operation_kind = ?
+	AND ` + alias + `.state IN (?, ?)
 	AND EXISTS (
 		SELECT 1
 		FROM apply_operations AS orphaning
-		WHERE orphaning.apply_id = earlier.apply_id
-			AND orphaning.deployment = earlier.deployment
+		WHERE orphaning.apply_id = ` + alias + `.apply_id
+			AND orphaning.deployment = ` + alias + `.deployment
 			AND orphaning.operation_kind = ?
-			AND ` + finalizerFinalizesWorkSQL(d, "earlier", "orphaning") + `
+			AND ` + finalizerFinalizesWorkSQL(d, alias, "orphaning") + `
 			AND orphaning.state = ?
 	)
 )`
+}
+
+// orphanedFinalizerArgs returns the positional arguments for
+// orphanedFinalizerSQL, in placeholder order: the finalizer kind, pending,
+// stopped, the work kind and failed.
+func orphanedFinalizerArgs() []any {
+	return []any{
+		storage.ApplyOperationKindGroupFinalizer,
+		state.ApplyOperation.Pending,
+		state.ApplyOperation.Stopped,
+		storage.ApplyOperationKindWork,
+		state.ApplyOperation.Failed,
+	}
+}
+
+// orphanedStepSQL matches a table step at alias that nothing will ever start:
+// it has not started (pending, or stopped before it started) and work of an
+// earlier step in its deployment settled without completing. The step gate
+// (rolloutStepGateSQL) starts a step only once every earlier one has
+// completed, so the row is dead rather than queued. It is
+// state.StepRowCanNeverPass applied the way state.RolloutChildren applies it,
+// so the claim and the derivation agree on which steps a failure has ended.
+// The fragment references the alias it is given; its placeholders are listed
+// by orphanedStepArgs.
+func orphanedStepSQL(alias string) string {
+	return `(
+	` + alias + `.rollout_step > 0
+	AND ` + alias + `.state IN (?, ?)
+	AND EXISTS (
+		SELECT 1
+		FROM apply_operations AS ended_step
+		WHERE ended_step.apply_id = ` + alias + `.apply_id
+			AND ended_step.deployment = ` + alias + `.deployment
+			AND ended_step.operation_kind = ?
+			AND ended_step.rollout_step > 0
+			AND ended_step.rollout_step < ` + alias + `.rollout_step
+			AND ended_step.state IN (?, ?, ?)
+	)
+)`
+}
+
+// orphanedStepArgs returns the positional arguments for orphanedStepSQL, in
+// placeholder order: pending, stopped, the work kind, and the three states a
+// step row can never get past.
+func orphanedStepArgs() []any {
+	return []any{
+		state.ApplyOperation.Pending,
+		state.ApplyOperation.Stopped,
+		storage.ApplyOperationKindWork,
+		state.ApplyOperation.Failed,
+		state.ApplyOperation.Cancelled,
+		state.ApplyOperation.Reverted,
+	}
+}
+
+// orphanedOperationSQL matches a row at alias that no claim will ever start,
+// for either reason state.RolloutChildren marks a row Orphaned: a finalizer
+// whose work failed, or a table step behind one that can never pass. The
+// derivation settles a rollout without such rows, so a selection that waits
+// for every row to settle has to leave them out the same way, or it waits for
+// a row that never moves. Its placeholders are listed by orphanedOperationArgs.
+func orphanedOperationSQL(d Dialect, alias string) string {
+	return `(` + orphanedFinalizerSQL(d, alias) + ` OR ` + orphanedStepSQL(alias) + `)`
+}
+
+// orphanedOperationArgs returns the positional arguments for
+// orphanedOperationSQL, in placeholder order.
+func orphanedOperationArgs() []any {
+	return append(orphanedFinalizerArgs(), orphanedStepArgs()...)
+}
+
+// heldBackByFailClosedFailureSQL matches a row at alias that no driver has
+// started — pending, or stopped before it was ever claimed — under a rollout a
+// fail-closed failure has already decided: a sibling in the same apply
+// terminally failed under a policy that neither continues past the failure
+// nor pauses for a release. Only a halting policy, or one the rollout does not
+// recognize, fails closed; a paused rollout either waits for its release or
+// continues once released, so a paused failure never ends a queued sibling.
+// The operation claim admits a later member past a failure only under those
+// two policies, so a row this matches is one nothing will ever start, and
+// state.DeriveRolloutApplyState records the verdict without waiting on it. A
+// selection that waits for every row to settle has to read it the same way,
+// or the rollout the derivation has already failed is never handed to the
+// projection that records that failure. The fragment references the alias it
+// is given; its placeholders are listed by heldBackByFailClosedFailureArgs.
+func heldBackByFailClosedFailureSQL(alias string) string {
+	return `(
+	(
+		` + alias + `.state = ?
+		OR (` + alias + `.state = ? AND ` + alias + `.started_at IS NULL)
+	)
+	AND EXISTS (
+		SELECT 1
+		FROM apply_operations AS fail_closed
+		WHERE fail_closed.apply_id = ` + alias + `.apply_id
+			AND fail_closed.state = ?
+			AND fail_closed.on_failure NOT IN (?, ?)
+	)
+)`
+}
+
+// heldBackByFailClosedFailureArgs returns the positional arguments for
+// heldBackByFailClosedFailureSQL, in placeholder order: pending, stopped,
+// failed, and the two policies that do not fail closed.
+func heldBackByFailClosedFailureArgs() []any {
+	return []any{
+		state.ApplyOperation.Pending,
+		state.ApplyOperation.Stopped,
+		state.ApplyOperation.Failed,
+		storage.OnFailureContinue,
+		storage.OnFailurePause,
+	}
 }
 
 // releasedFailureExemptionSQL stops a terminal-failed earlier sibling from
@@ -974,7 +1085,7 @@ func releasedFailureExemptionSQL(d Dialect) string {
 	return `NOT (
 	(
 		earlier.state = ?
-		OR ` + orphanedFinalizerSQL(d) + `
+		OR ` + orphanedFinalizerSQL(d, "earlier") + `
 	)
 	AND (
 		apply_operations.on_failure = ?
@@ -1575,19 +1686,15 @@ func (s *applyOperationStore) cutoverCapClause(staleClaimCutoff string) (string,
 // releasedFailureExemptionArgs returns the positional arguments for
 // releasedFailureExemptionSQL, in placeholder order.
 func releasedFailureExemptionArgs() []any {
-	return []any{
-		state.ApplyOperation.Failed,
-		storage.ApplyOperationKindGroupFinalizer,
-		state.ApplyOperation.Pending,
-		state.ApplyOperation.Stopped,
-		storage.ApplyOperationKindWork,
-		state.ApplyOperation.Failed,
+	args := []any{state.ApplyOperation.Failed}
+	args = append(args, orphanedFinalizerArgs()...)
+	return append(args,
 		storage.OnFailureContinue,
 		storage.OnFailurePause,
 		storage.ControlOperationRelease,
 		storage.ControlRequestPending,
 		storage.ControlRequestCompleted,
-	}
+	)
 }
 
 // FindNextApplyOperation atomically claims the next apply_operations row that

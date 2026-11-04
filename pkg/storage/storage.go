@@ -912,11 +912,13 @@ type ApplyStore interface {
 	// finish the projection — every operation is terminal, so no operation-level
 	// claim arm matches, and the one-active-apply guard keeps that target blocked
 	// until the parent settles. Requiring a stale heartbeat is what keeps this off
-	// live rollouts: a driver mid-projection still holds a fresh lease. Applies
-	// with no operation rows are excluded (there is nothing to project from), as
-	// are pending, stopped, and failed_retryable parents, which have their own
-	// resume paths. Returns nil when no such apply exists or it is locked by a
-	// peer.
+	// live rollouts: a driver mid-projection still holds a fresh lease. A row no
+	// claim will ever start — a finalizer whose work failed, or a table step
+	// behind one that can never pass — counts as settled, because the rollout
+	// derivation settles the parent without it. Applies with no operation rows
+	// are excluded (there is nothing to project from), as are pending, stopped,
+	// and failed_retryable parents, which have their own resume paths. Returns
+	// nil when no such apply exists or it is locked by a peer.
 	FindNextApplyForOperationProjection(ctx context.Context, owner string) (*Apply, error)
 
 	// Heartbeat updates the apply's updated_at timestamp to maintain the lease.
@@ -1114,6 +1116,32 @@ type ApplyStore interface {
 	// the lock.
 	SettleAppliesStoppedForEndedOperation(ctx context.Context, limit int) ([]*EndedOperationApply, error)
 
+	// ExpireRetryableOperations transitions failed_retryable operation rows
+	// under running_degraded applies to permanent failed, settling their task
+	// rows against that verdict, once the apply's retry budget or recovery
+	// freshness window is spent. The budget is each operation's own, as it is
+	// for ExpireRetryable: the paused operation's attempt is what decides it.
+	// Returns one entry per operation updated, oldest apply first, over at most
+	// limit applies.
+	//
+	// A rollout whose sibling halt-failed holds the parent at running_degraded
+	// over a paused retry rather than moving it back to failed_retryable, so
+	// ExpireRetryable never reaches the paused row. The parent is left as it
+	// is: expiring the row is what lets the rollout's remaining work settle,
+	// and the rollout projection derives the parent's verdict from its rows
+	// once they have. Healthy siblings — pending, parked at the cutover
+	// barrier, or settled — are not touched.
+	//
+	// Eligibility, locking, and the election are those of ExpireRetryable: an
+	// apply is considered only when no driver holds an operation under it, its
+	// parent and every operation are locked and leases rechecked before the
+	// write, and one instance expires per pass under the same advisory lock,
+	// reporting ErrRetryableExpiryBusy when another holds it. Unlike
+	// ExpireRetryable, an apply the ended-operation sweeps are ending is not
+	// passed over: both settle a paused operation failed, so whichever reaches
+	// the row first records the same verdict on it.
+	ExpireRetryableOperations(ctx context.Context, limit int) ([]*RetryableOperationExpiration, error)
+
 	// WithBranchReconcileElection runs fn on the one instance elected to
 	// reconcile engine branches this pass, under an advisory lock held for as
 	// long as fn runs. ErrBranchReconcileBusy reports that another instance
@@ -1250,6 +1278,16 @@ type EndedOperationApply struct {
 type RetryableApplyExpiration struct {
 	Apply  *Apply
 	Reason RetryableExpirationReason
+}
+
+// RetryableOperationExpiration is a failed_retryable operation row under a
+// running_degraded apply that was made permanent because operator recovery
+// should no longer retry it automatically. Apply is the parent as it stood when
+// the row was expired; the parent itself is not transitioned.
+type RetryableOperationExpiration struct {
+	Apply     *Apply
+	Operation *ApplyOperation
+	Reason    RetryableExpirationReason
 }
 
 // StaleRetryableRequest names the rows ApplyStore.MarkStaleApplyRetryable moves

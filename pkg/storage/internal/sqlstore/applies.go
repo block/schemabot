@@ -2359,9 +2359,18 @@ func (s *applyStore) FindNextApplyForOperationProjection(ctx context.Context, ow
 	// Any operation not in a terminal state can still move the parent on its own,
 	// so the parent is not stranded and this path leaves it alone. That includes
 	// pending operations: a pending row under a non-terminal parent is queued
-	// work for the operation claim, not residue.
+	// work for the operation claim, not residue. The exception is a row no claim
+	// will ever start — a finalizer whose work failed, a table step behind one
+	// that can never pass, or a member still queued under a rollout a
+	// fail-closed failure has already ended. The derivation this claim hands
+	// the parent to settles the rollout without those rows (state.RolloutChildren
+	// marks the first two Orphaned, and state.DeriveRolloutApplyState records a
+	// fail-closed verdict over the third), so the selection has to read them as
+	// settled too, or a parent whose last live row failed waits forever on a
+	// row that never moves.
 	settledOpStates := terminalApplyStates()
 	settledOpStatePlaceholders := placeholders(len(settledOpStates))
+	neverStartedOp := `(` + orphanedOperationSQL(s.dialect, "unsettled") + ` OR ` + heldBackByFailClosedFailureSQL("unsettled") + `)`
 
 	// The staleness gate is what keeps this off live rollouts. A driver that is
 	// mid-projection still holds a fresh lease, so only a parent whose owner has
@@ -2370,6 +2379,8 @@ func (s *applyStore) FindNextApplyForOperationProjection(ctx context.Context, ow
 
 	queryArgs := stringArgs(parentStates)
 	queryArgs = append(queryArgs, stringArgs(settledOpStates)...)
+	queryArgs = append(queryArgs, orphanedOperationArgs()...)
+	queryArgs = append(queryArgs, heldBackByFailClosedFailureArgs()...)
 
 	row := tx.QueryRowContext(ctx, fmt.Sprintf(`
 		SELECT %s
@@ -2386,11 +2397,12 @@ func (s *applyStore) FindNextApplyForOperationProjection(ctx context.Context, ow
 				FROM apply_operations unsettled
 				WHERE unsettled.apply_id = a.id
 					AND unsettled.state NOT IN (%s)
+					AND NOT %s
 			)
 		ORDER BY a.created_at
 		LIMIT 1
 		FOR UPDATE SKIP LOCKED
-	`, applyColumns, parentStatePlaceholders, staleClaimCutoff, settledOpStatePlaceholders), queryArgs...)
+	`, applyColumns, parentStatePlaceholders, staleClaimCutoff, settledOpStatePlaceholders, neverStartedOp), queryArgs...)
 
 	apply, err := scanApplyInto(row)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -3238,21 +3250,10 @@ func (s *applyStore) expireRetryable(ctx context.Context, endedOperationStopType
 	// heartbeat that won after the scan causes the whole apply to be deferred.
 	// AttachOperationWithTasks locks the parent, so no new sibling can attach
 	// while we establish and hold this complete set of operation locks.
-	candidateIDs := make([]int64, 0, len(applies))
-	for _, apply := range applies {
-		candidateIDs = append(candidateIDs, apply.ID)
-	}
-	undriven, err := s.lockUndrivenApplies(ctx, tx, candidateIDs)
+	applies, err = s.lockUndrivenCandidates(ctx, tx, applies)
 	if err != nil {
 		return nil, err
 	}
-	eligible := make([]*storage.Apply, 0, len(applies))
-	for _, apply := range applies {
-		if undriven[apply.ID] {
-			eligible = append(eligible, apply)
-		}
-	}
-	applies = eligible
 	if len(applies) == 0 {
 		if err := tx.Commit(); err != nil {
 			return nil, fmt.Errorf("commit deferred expire retryable applies: %w", err)
@@ -3371,6 +3372,250 @@ func (s *applyStore) expireRetryable(ctx context.Context, endedOperationStopType
 		apply.UpdatedAt = now
 	}
 	return expirations, nil
+}
+
+// ExpireRetryableOperations elects one instance per pass and expires under the
+// lock. See storage.ApplyStore for the contract.
+func (s *applyStore) ExpireRetryableOperations(ctx context.Context, limit int) ([]*storage.RetryableOperationExpiration, error) {
+	return reapUnderElection(ctx, s.db, s.locker, retryableExpirySweep,
+		func(ctx context.Context) ([]*storage.RetryableOperationExpiration, error) {
+			return s.expireRetryableOperations(ctx, limit)
+		})
+}
+
+// expireRetryableOperations transitions failed_retryable operation rows under
+// running_degraded applies whose retry budget or recovery freshness window is
+// spent to permanent failed, without electing an instance.
+// ExpireRetryableOperations is the entry point that holds the lock; this is
+// separate so the expiry itself can be exercised on its own.
+//
+// It is the degraded-rollout counterpart of expireRetryable. A rollout under
+// which one deployment halt-failed while another paused failed_retryable is
+// derived running_degraded, and the projection holds it there — nothing moves
+// the parent back to failed_retryable — so the paused row is the one piece of
+// retryable work expireRetryable's selection cannot see. This is the path that
+// retires the row once its retry budget is spent or its recovery window has
+// closed. Without it the row parks until an operator cancels, holding the
+// rollout open and blocking every deployment ordered behind it. The operation
+// claim's redispatch of the same row is this pass's complement: the claim
+// admits the row while it is within budget and its window and charges each
+// redispatch to the row's budget, so a paused row is either the claim's to
+// retry or this pass's to retire, never both and never neither.
+//
+// Only the paused rows and their tasks are written. The parent keeps its state
+// and heartbeat: once its last unsettled row has settled, the rollout
+// projection re-derives the parent from its operations and publishes the
+// verdict, which is the same path a drive takes when it settles the last row
+// itself.
+func (s *applyStore) expireRetryableOperations(ctx context.Context, limit int) ([]*storage.RetryableOperationExpiration, error) {
+	if limit <= 0 {
+		return nil, fmt.Errorf("expire retryable operations: limit must be positive, got %d", limit)
+	}
+
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	if err != nil {
+		return nil, fmt.Errorf("begin expire retryable operations transaction: %w", err)
+	}
+	defer rollbackTx(ctx, tx, "expire retryable operations")
+
+	// The same gate expireRetryable applies, for the same reason: a driver
+	// holding a sibling under this parent is live work whose rows this pass
+	// must not write over, and the parent FOR UPDATE alone says nothing about an
+	// operation-level lease. The eligibility arms read the same budget and the
+	// same window the operation claim reads when it redispatches a paused row
+	// under a degraded rollout, so a row this pass takes is one no claim would
+	// have admitted, and a row a claim would admit is never taken.
+	undrivenApply := undrivenApplyGate(s.dialect)
+
+	// The budget is each operation's own (retryBudgetSpentSQL), so the paused
+	// row's attempt is what decides the budget arm, as it does for
+	// expireRetryable. The window is the paused row's own as well: nothing
+	// writes the parent when a member pauses under a rollout that is already
+	// degraded, so the parent's clock would run from the failure that degraded
+	// it and a member that copied for longer than the window would be retired
+	// on its first pause. The row's updated_at is the lease heartbeat its last
+	// driver left, which is when that member last made progress. The window
+	// arm holds only once every paused row has aged past it, since every
+	// paused row under the apply is retired together.
+	args := append([]any{state.Apply.RunningDegraded}, retryBudgetSpentArgs()...)
+	args = append(args, state.ApplyOperation.FailedRetryable, retryableRecoveryFreshnessDays, state.ApplyOperation.FailedRetryable, limit)
+	rows, err := tx.QueryContext(ctx, `
+		SELECT `+applyColumns+`
+		FROM applies
+		WHERE state = ? AND (
+			`+retryBudgetSpentSQL+`
+			OR NOT EXISTS (
+				SELECT 1 FROM apply_operations fresh
+				WHERE fresh.apply_id = applies.id AND fresh.state = ?
+					AND fresh.updated_at >= `+s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime, ParameterIntervalAmount(), IntervalDay)+`
+			)
+		)
+			AND EXISTS (
+				SELECT 1 FROM apply_operations paused
+				WHERE paused.apply_id = applies.id AND paused.state = ?
+			)
+			AND `+undrivenApply+`
+		ORDER BY updated_at
+		LIMIT ?
+		FOR UPDATE
+	`, args...)
+	if err != nil {
+		return nil, fmt.Errorf("query degraded applies with expired retryable operations: %w", err)
+	}
+	applies, err := scanApplies(rows)
+	utils.CloseAndLog(rows)
+	if err != nil {
+		return nil, fmt.Errorf("scan degraded applies with expired retryable operations: %w", err)
+	}
+	if len(applies) == 0 {
+		if err := tx.Commit(); err != nil {
+			return nil, fmt.Errorf("commit empty expire retryable operations: %w", err)
+		}
+		return nil, nil
+	}
+
+	applies, err = s.lockUndrivenCandidates(ctx, tx, applies)
+	if err != nil {
+		return nil, err
+	}
+	if len(applies) == 0 {
+		if err := tx.Commit(); err != nil {
+			return nil, fmt.Errorf("commit deferred expire retryable operations: %w", err)
+		}
+		return nil, nil
+	}
+
+	budgetSpent, err := retryBudgetSpentApplies(ctx, tx, applies)
+	if err != nil {
+		return nil, err
+	}
+
+	// Every operation row of every remaining apply is now locked by this
+	// transaction, so the paused rows read here are the rows written below.
+	parentsByID := make(map[int64]*storage.Apply, len(applies))
+	applyIDs := make([]any, 0, len(applies))
+	for _, apply := range applies {
+		parentsByID[apply.ID] = apply
+		applyIDs = append(applyIDs, apply.ID)
+	}
+	pausedArgs := append([]any{state.ApplyOperation.FailedRetryable}, applyIDs...)
+	pausedRows, err := tx.QueryContext(ctx, fmt.Sprintf(`
+		SELECT %s
+		FROM apply_operations
+		WHERE state = ? AND apply_id IN (%s)
+		ORDER BY apply_id, id
+	`, applyOperationColumns, placeholders(len(applyIDs))), pausedArgs...)
+	if err != nil {
+		return nil, fmt.Errorf("query expired retryable operations of %d degraded applies: %w", len(applies), err)
+	}
+	paused, err := scanApplyOperations(pausedRows)
+	utils.CloseAndLog(pausedRows)
+	if err != nil {
+		return nil, fmt.Errorf("scan expired retryable operations of %d degraded applies: %w", len(applies), err)
+	}
+	operationIDs := make([]any, 0, len(paused))
+	expirations := make([]*storage.RetryableOperationExpiration, 0, len(paused))
+	pausedUnder := make(map[int64]bool, len(applies))
+	for _, op := range paused {
+		parent, ok := parentsByID[op.ApplyID]
+		if !ok {
+			return nil, fmt.Errorf("expire retryable operations: apply_operation %d belongs to apply %d, which was not selected", op.ID, op.ApplyID)
+		}
+		pausedUnder[parent.ID] = true
+		operationIDs = append(operationIDs, op.ID)
+		expirations = append(expirations, &storage.RetryableOperationExpiration{
+			Apply:     parent,
+			Operation: op,
+			Reason:    retryableExpirationReason(budgetSpent[parent.ID]),
+		})
+	}
+	// A candidate whose paused row settled between the selection and the lock
+	// scan lost a race with another writer, and that writer's outcome stands.
+	// It is left for the next pass to read afresh rather than failing the
+	// batch over an apply that has nothing left to retire.
+	for _, apply := range applies {
+		if !pausedUnder[apply.ID] {
+			slog.WarnContext(ctx, "expire retryable operations: the paused operation settled between the selection and the lock scan; the rollout is read again on the next pass",
+				apply.LogAttrs()...)
+		}
+	}
+	if len(paused) == 0 {
+		if err := tx.Commit(); err != nil {
+			return nil, fmt.Errorf("commit expire retryable operations with nothing left to retire: %w", err)
+		}
+		return nil, nil
+	}
+
+	// Tasks settle the way expireRetryable settles them, scoped to the paused
+	// rows: a pending task was queued behind the failure and is cancelled, and
+	// anything else still open is failed. A sibling's tasks are never reached,
+	// because every task under a multi-operation apply carries the operation it
+	// belongs to.
+	cancelArgs := []any{state.Task.Cancelled, state.Task.Pending}
+	cancelArgs = append(cancelArgs, operationIDs...)
+	_, err = tx.ExecContext(ctx, fmt.Sprintf(`
+		UPDATE tasks
+		SET state = ?, completed_at = COALESCE(completed_at, NOW()), updated_at = NOW()
+		WHERE state = ? AND apply_operation_id IN (%s)
+	`, placeholders(len(operationIDs))), cancelArgs...)
+	if err != nil {
+		return nil, fmt.Errorf("cancel pending tasks for expired retryable operations: %w", err)
+	}
+
+	taskArgs := []any{state.Task.Failed}
+	taskArgs = append(taskArgs, stringArgs(state.TerminalTaskStates)...)
+	taskArgs = append(taskArgs, operationIDs...)
+	_, err = tx.ExecContext(ctx, fmt.Sprintf(`
+		UPDATE tasks
+		SET state = ?, completed_at = COALESCE(completed_at, NOW()), updated_at = NOW()
+		WHERE state NOT IN (%s) AND apply_operation_id IN (%s)
+	`, placeholders(len(state.TerminalTaskStates)), placeholders(len(operationIDs))), taskArgs...)
+	if err != nil {
+		return nil, fmt.Errorf("expire tasks of retryable operations: %w", err)
+	}
+
+	opArgs := []any{state.ApplyOperation.Failed, state.ApplyOperation.FailedRetryable}
+	opArgs = append(opArgs, operationIDs...)
+	_, err = tx.ExecContext(ctx, fmt.Sprintf(`
+		UPDATE apply_operations
+		SET state = ?, completed_at = COALESCE(completed_at, NOW()), updated_at = NOW()
+		WHERE state = ? AND id IN (%s)
+	`, placeholders(len(operationIDs))), opArgs...)
+	if err != nil {
+		return nil, fmt.Errorf("expire retryable operations: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit expire retryable operations: %w", err)
+	}
+	now := time.Now()
+	for _, op := range paused {
+		op.State = state.ApplyOperation.Failed
+		op.CompletedAt = &now
+		op.UpdatedAt = now
+	}
+	return expirations, nil
+}
+
+// lockUndrivenCandidates narrows a candidate set whose parent rows tx already
+// holds FOR UPDATE to the applies whose complete operation set could be locked
+// and still reads as undriven under those locks. The order of the candidates
+// is preserved.
+func (s *applyStore) lockUndrivenCandidates(ctx context.Context, tx *rebindTx, candidates []*storage.Apply) ([]*storage.Apply, error) {
+	candidateIDs := make([]int64, 0, len(candidates))
+	for _, apply := range candidates {
+		candidateIDs = append(candidateIDs, apply.ID)
+	}
+	undriven, err := s.lockUndrivenApplies(ctx, tx, candidateIDs)
+	if err != nil {
+		return nil, err
+	}
+	eligible := make([]*storage.Apply, 0, len(candidates))
+	for _, apply := range candidates {
+		if undriven[apply.ID] {
+			eligible = append(eligible, apply)
+		}
+	}
+	return eligible, nil
 }
 
 // lockUndrivenApplies requires every parent row to be locked by tx. It reports,
