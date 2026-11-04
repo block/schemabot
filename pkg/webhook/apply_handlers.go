@@ -221,16 +221,17 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 			if a.Database == database && !state.IsTerminalApplyState(a.State) {
 				h.logger.Info("apply blocked by in-progress apply", "repo", repo, "pr", pr, "database", database, "apply_id", a.ApplyIdentifier, "state", a.State)
 				h.postComment(repo, pr, installationID, templates.RenderApplyInProgress(templates.ApplyLockConflictData{
-					Database:          database,
-					Environment:       environment,
-					RequestedBy:       requestedBy,
-					ApplyID:           a.ApplyIdentifier,
-					ApplyState:        a.State,
-					ApplyEnvironment:  a.Environment,
-					DeferCutover:      a.GetOptions().DeferCutover,
-					Tenant:            h.deploymentTenant(),
-					ApplyAgainCommand: templates.ApplyCommand(environment, databaseName, applyCommandOptionsOf(result)),
-					ApplyAgainConsent: templates.UnsafeReconsent(applyCommandOptionsOf(result)),
+					Database:            database,
+					Environment:         environment,
+					RequestedBy:         requestedBy,
+					ApplyID:             a.ApplyIdentifier,
+					ApplyState:          a.State,
+					ApplyEnvironment:    a.Environment,
+					DeferCutover:        a.GetOptions().DeferCutover,
+					Tenant:              h.deploymentTenant(),
+					ApplyAgainCommand:   templates.ApplyCommand(environment, databaseName, applyCommandOptionsOf(result)),
+					ApplyAgainConsent:   templates.UnsafeReconsent(applyCommandOptionsOf(result)),
+					AppliesLatestCommit: h.activeApplyAppliesLatestCommit(ctx, environment, prInfo.HeadSHA, a),
 				}))
 				return false, nil
 			}
@@ -1624,4 +1625,60 @@ func (h *Handler) inferUnlockDatabase(ctx context.Context, repo string, pr int, 
 		return "", unlockRejection(errors.New("no database found in SchemaBot config"))
 	}
 	return config.Database, nil
+}
+
+// activeApplyLeavesWork names why an active apply, even one planned from the
+// PR's latest commit, leaves work for another apply once it ends, or returns
+// "" when it applies the whole change. A rollback and a reverting apply undo
+// the change rather than apply it, and an apply narrowed to one target leaves
+// the environment's other targets to a later apply.
+func activeApplyLeavesWork(active *storage.Apply) string {
+	switch {
+	case active.IsRollback():
+		return "rollback"
+	case state.IsState(active.State, state.Apply.Reverting):
+		return "reverting"
+	case storage.ParseApplyOptions(active.Options).NarrowedTo != "":
+		return "narrowed to one target"
+	}
+	return ""
+}
+
+// activeApplyAppliesLatestCommit reports whether this PR's active apply was
+// planned from the PR's latest commit in the requested environment. Such an
+// apply is already applying the change the requester asked for, so applying
+// again once it ends would plan nothing. When the apply's plan cannot be read,
+// it reports false, and the comment offers the apply again as it would for
+// an older commit: that apply is harmless, since it plans first.
+func (h *Handler) activeApplyAppliesLatestCommit(ctx context.Context, environment, headSHA string, active *storage.Apply) bool {
+	if active.Environment != environment {
+		return false
+	}
+	if reason := activeApplyLeavesWork(active); reason != "" {
+		h.logger.Debug("active apply leaves part of the change to a later apply; the comment offers the apply again",
+			append(active.LogAttrs(), "head_sha", headSHA, "reason", reason)...)
+		return false
+	}
+	if active.PlanID == 0 {
+		h.logger.Warn("active apply has no plan to compare with the PR's latest commit; the comment offers the apply again",
+			append(active.LogAttrs(), "head_sha", headSHA)...)
+		return false
+	}
+	plan, err := h.service.Storage().Plans().GetByID(ctx, active.PlanID)
+	if err != nil {
+		h.logger.Warn("could not load the active apply's plan to compare with the PR's latest commit; the comment offers the apply again",
+			append(active.LogAttrs(), "head_sha", headSHA, "error", err)...)
+		return false
+	}
+	if plan == nil {
+		h.logger.Warn("active apply's plan no longer exists to compare with the PR's latest commit; the comment offers the apply again",
+			append(active.LogAttrs(), "head_sha", headSHA)...)
+		return false
+	}
+	if plan.NarrowedTo != "" {
+		h.logger.Debug("active apply's plan was narrowed to one target, leaving the others to a later apply; the comment offers the apply again",
+			append(active.LogAttrs(), "head_sha", headSHA, "narrowed_to", plan.NarrowedTo)...)
+		return false
+	}
+	return plan.HeadSHA != "" && plan.HeadSHA == headSHA
 }

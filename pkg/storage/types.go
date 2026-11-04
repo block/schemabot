@@ -1872,6 +1872,111 @@ type cutoverRequestBinding struct {
 	ApplyOperationIDs []int64 `json:"apply_operation_ids"`
 }
 
+// controlCommandMetadataKey records the operator command a control request
+// carries when it arrived from another plane, which sends the same command
+// more than once. A request that carries one is recorded once per command:
+// see ControlRequestStore.RequestPendingCommand.
+const controlCommandMetadataKey = "command_id"
+
+// WithControlCommandID returns metadata with commandID recorded as the
+// operator command the request carries. An empty commandID leaves metadata as
+// it is.
+func WithControlCommandID(metadata []byte, commandID string) ([]byte, error) {
+	if commandID == "" {
+		return metadata, nil
+	}
+	payload := map[string]any{}
+	if len(metadata) > 0 {
+		if err := json.Unmarshal(metadata, &payload); err != nil {
+			return nil, fmt.Errorf("parse control request metadata to record command %s: %w", commandID, err)
+		}
+	}
+	payload[controlCommandMetadataKey] = commandID
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("encode control request metadata with command %s: %w", commandID, err)
+	}
+	return encoded, nil
+}
+
+// NewControlCommandID names an operator command sent from another plane by
+// where it was issued (origin) and its place in the commands issued there
+// (sequence). Commands from one origin are ordered by sequence, so a data plane
+// can tell a delayed send of an earlier command from a newer command.
+func NewControlCommandID(origin, sequence int64) string {
+	return fmt.Sprintf("%d.%d", origin, sequence)
+}
+
+// parseControlCommandID splits a NewControlCommandID id into its origin and
+// sequence. ok is false for any other id, which is compared only for equality.
+func parseControlCommandID(commandID string) (origin, sequence int64, ok bool) {
+	originPart, sequencePart, found := strings.Cut(commandID, ".")
+	if !found {
+		return 0, 0, false
+	}
+	origin, err := strconv.ParseInt(originPart, 10, 64)
+	if err != nil {
+		return 0, 0, false
+	}
+	sequence, err = strconv.ParseInt(sequencePart, 10, 64)
+	if err != nil {
+		return 0, 0, false
+	}
+	return origin, sequence, true
+}
+
+// SettledByControlCommand reports whether a send of the operator command
+// commandID must leave r settled (ControlRequestStore.RequestPendingCommand):
+// r is settled and carries that command, or carries a later command from the
+// same origin (NewControlCommandID). A send of an earlier command arrives only
+// as a delayed re-send, since its origin issued a newer one since, so it never
+// retries work the newer command already settled.
+func (r *ApplyControlRequest) SettledByControlCommand(commandID string) (bool, error) {
+	if r == nil || commandID == "" || r.Status == ControlRequestPending {
+		return false, nil
+	}
+	recorded, err := r.ControlCommandID()
+	if err != nil {
+		return false, err
+	}
+	if recorded == commandID {
+		return true, nil
+	}
+	return supersedesControlCommand(recorded, commandID), nil
+}
+
+// supersedesControlCommand reports whether the recorded command was issued
+// after commandID by the same origin. Ids that do not both parse as
+// NewControlCommandID ids, or come from different origins, have no order.
+func supersedesControlCommand(recorded, commandID string) bool {
+	recordedOrigin, recordedSequence, ok := parseControlCommandID(recorded)
+	if !ok {
+		return false
+	}
+	origin, sequence, ok := parseControlCommandID(commandID)
+	if !ok {
+		return false
+	}
+	return recordedOrigin == origin && recordedSequence > sequence
+}
+
+// ControlCommandID returns the operator command a control request carries
+// (WithControlCommandID), or "" when it records none. Metadata that does not
+// parse is an error, so a request is never taken for a command it may not
+// carry.
+func (r *ApplyControlRequest) ControlCommandID() (string, error) {
+	if r == nil || len(r.Metadata) == 0 {
+		return "", nil
+	}
+	var command struct {
+		CommandID string `json:"command_id"`
+	}
+	if err := json.Unmarshal(r.Metadata, &command); err != nil {
+		return "", fmt.Errorf("parse metadata of %s control request %d: %w", r.Operation, r.ID, err)
+	}
+	return command.CommandID, nil
+}
+
 func (r *ApplyControlRequest) cutoverBinding() (cutoverRequestBinding, error) {
 	var binding cutoverRequestBinding
 	if r == nil || len(r.Metadata) == 0 {
