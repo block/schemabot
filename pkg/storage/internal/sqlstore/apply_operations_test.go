@@ -2077,8 +2077,12 @@ func TestApplyOperationStore_FindNextApplyOperation_DegradedRolloutRedispatchCon
 // Once a degraded rollout's retry budget is spent, its paused operation is left
 // alone even when the parent and the row are both stale: the row is a retry
 // nobody admitted, so there is no crashed drive to recover and crash recovery
-// must not re-lease it on every staleness window. It parks for the operator
-// instead.
+// must not re-lease it on every staleness window. No claim arm reaches it from
+// here — a cancel requested now stays pending too, since nothing drives the
+// apply to deliver it — so the row parks until the expiry sweep settles it, the
+// same way a plain failed_retryable apply with its budget spent parks until
+// ExpireRetryable fails it; the stranded control-request sweep then answers
+// any request left on the settled apply.
 func TestApplyOperationStore_FindNextApplyOperation_SkipsDegradedRolloutRetryBudgetExhausted(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
