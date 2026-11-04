@@ -4150,29 +4150,6 @@ func (s *Service) updateApplyStateFromOperations(ctx context.Context, driverID i
 		startedAt = &now
 	}
 
-	if state.IsState(apply.State, derived) && startedAt == nil {
-		s.logger.Debug("operator: derived apply state matches current; no update",
-			append(apply.LogAttrs(),
-				"driver", driverID, "operation_count", len(ops))...)
-		return applyProjectionResult{PreviousState: apply.State, DerivedState: derived, OperationCount: len(ops), ManifestHeld: manifestHeld, HeldByResumableChild: heldByResumableChild, OwnsActiveAppliesGauge: ownsGauge}, nil
-	}
-
-	var completedAt *time.Time
-	switch {
-	case state.IsState(derived, state.Apply.Stopped):
-		// stopped is resumable; keep completed_at nil to match the convention.
-		completedAt = nil
-	case state.IsTerminalApplyState(derived):
-		if apply.CompletedAt != nil {
-			completedAt = apply.CompletedAt
-		} else {
-			now := s.clock.Now()
-			completedAt = &now
-		}
-	default:
-		completedAt = nil
-	}
-
 	// The parent's message follows the aggregate the same way its state does.
 	// When the rollout settles to failed, surface the failure reason from the
 	// first failed operation rather than leaving whatever message the last-driven
@@ -4200,6 +4177,33 @@ func (s *Service) updateApplyStateFromOperations(ctx context.Context, driverID i
 		}
 	}
 
+	// A projection that changes nothing the parent records is skipped. The
+	// message is one of those records: a rollout can stay paused while the
+	// operation that supplied its reason is retried and completes beside a
+	// sibling still paused, and the parent then has to name the sibling.
+	if state.IsState(apply.State, derived) && startedAt == nil && errorMessage == apply.ErrorMessage {
+		s.logger.Debug("operator: derived apply state matches current; no update",
+			append(apply.LogAttrs(),
+				"driver", driverID, "operation_count", len(ops))...)
+		return applyProjectionResult{PreviousState: apply.State, DerivedState: derived, OperationCount: len(ops), ManifestHeld: manifestHeld, HeldByResumableChild: heldByResumableChild, OwnsActiveAppliesGauge: ownsGauge}, nil
+	}
+
+	var completedAt *time.Time
+	switch {
+	case state.IsState(derived, state.Apply.Stopped):
+		// stopped is resumable; keep completed_at nil to match the convention.
+		completedAt = nil
+	case state.IsTerminalApplyState(derived):
+		if apply.CompletedAt != nil {
+			completedAt = apply.CompletedAt
+		} else {
+			now := s.clock.Now()
+			completedAt = &now
+		}
+	default:
+		completedAt = nil
+	}
+
 	swapped, err := s.storage.Applies().UpdateDerivedState(ctx, apply.ID, apply.State, derived, errorMessage, startedAt, completedAt)
 	if err != nil {
 		return applyProjectionResult{}, fmt.Errorf("update derived apply state for apply %s (%d) to %q: %w", apply.ApplyIdentifier, apply.ID, derived, err)
@@ -4221,10 +4225,10 @@ func (s *Service) updateApplyStateFromOperations(ctx context.Context, driverID i
 	// lease-lost settle, stop reconciliation). Record the transition in the
 	// apply's own durable log so its timeline states how it reached the derived
 	// state instead of ending at the last claim entry. A swap that only stamps
-	// started_at while the state holds is not a transition, so it writes no
-	// timeline entry.
+	// started_at or refreshes the message while the state holds is not a
+	// transition, so it writes no timeline entry.
 	if state.IsState(apply.State, derived) {
-		s.logger.Debug("operator: derived apply state swap stamped started_at only; no state transition to record",
+		s.logger.Debug("operator: derived apply state swap kept the state; no state transition to record",
 			append(apply.LogAttrs(),
 				"driver", driverID, "derived_state", derived)...)
 	} else {
