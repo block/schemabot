@@ -80,11 +80,11 @@ Users interact with SchemaBot through three interfaces:
 schemabot plan -s ./schema -e staging       # Preview changes
 schemabot apply -s ./schema -e staging -y   # Apply changes
 schemabot progress <apply_id>               # Watch progress
-schemabot cutover -e staging <apply_id>     # Trigger cutover
-schemabot stop -e staging <apply_id>        # Pause execution
-schemabot start -e staging <apply_id>       # Resume execution
-schemabot revert -e staging <apply_id>      # Revert during the revert window (Vitess)
-schemabot skip-revert -e staging <apply_id> # Finalize (Vitess)
+schemabot cutover <apply_id> -e staging     # Trigger cutover
+schemabot stop <apply_id> -e staging        # Pause execution
+schemabot start <apply_id> -e staging       # Resume execution
+schemabot revert <apply_id> -e staging      # Revert during the revert window (Vitess)
+schemabot skip-revert <apply_id> -e staging # Finalize (Vitess)
 ```
 
 **PR Comments** — SchemaBot is a GitHub app installed on repos. The PR workflow:
@@ -845,7 +845,7 @@ canonical task states:
 Only the mid-flight phases refine a running task (`tablePhaseTaskState` accepts
 `catching_up`, `checksumming`, `post_checksum`, `cutting_over`). A per-table
 `"completed"` never completes the task — for Spirit it means only that the
-table's copy finished, not that it cut over.
+table's copy finished, not that its cutover ran.
 
 Because polling is asynchronous, refinement goes through
 `taskStateWithNoBackwardProgress` (`pkg/tern/local_client.go`), which orders the
@@ -917,14 +917,14 @@ Task fields updated during polling (`storage.Task` in `pkg/storage/types.go`):
 | `State`           | string | Mapped from `engine.State` |
 | `StartedAt`       | time   | Set when task transitions to RUNNING |
 | `CompletedAt`     | time   | Set when engine reports a terminal state |
-| `UpdatedAt`       | time   | Bumped on every poll |
+| `UpdatedAt`       | time   | Bumped on every full poll |
 
 **When task rows are updated:**
 
 | Trigger | What writes | Frequency | Fields updated |
 |---------|-------------|-----------|----------------|
-| `pollForCompletionAtomic` (atomic mode) | Poller goroutine | Every 500ms | `State`, `RowsCopied`, `RowsTotal`, `ProgressPercent`, `ETASeconds`, `Throttled`, `ThrottleReason`, `UpdatedAt`, `CompletedAt` (on terminal) |
-| `pollTaskToCompletion` (sequential mode) | Poller goroutine | Every 500ms | Same as above, plus `IsInstant` |
+| `pollForCompletionAtomic` (atomic mode) | Poller goroutine | Every 500ms; every 5s while held at a deferred cutover with no cutover, stop, or cancel pending | `State`, `RowsCopied`, `RowsTotal`, `ProgressPercent`, `ETASeconds`, `Throttled`, `ThrottleReason`, `UpdatedAt`, `CompletedAt` (on terminal) |
+| `pollTaskToCompletion` (sequential mode) | Poller goroutine | Every 500ms; every 5s while held at a deferred cutover with no cutover, stop, or cancel pending | Same as above, plus `IsInstant` |
 | Durable stop request | Lease-held drive | Once, after the engine stops | `State` → STOPPED for non-terminal tasks, `RowsCopied`, `RowsTotal`, `ProgressPercent`, `ETASeconds`, `CompletedAt` |
 | `executeGroupedApply` / `executeApplySequential` | Apply launcher | Once at start | `State` → RUNNING, `StartedAt` |
 
@@ -936,14 +936,14 @@ copy alone does not complete a task: cutover may still be outstanding.
 
 ###### Atomic mode (`--defer-cutover`)
 
-One Spirit runner handles all DDLs together. `pollForCompletionAtomic` polls every 500ms:
+One Spirit runner handles all DDLs together. `pollForCompletionAtomic` polls every 500ms, slowing to a 5s refresh while it holds at a deferred cutover with no cutover, stop, or cancel pending:
 - Updates ALL tasks with the shared engine state and per-table row counts.
 - Maintains a heartbeat (bumps `apply.updated_at` every 10s) so the recovery loop knows it's alive.
 - Auto-triggers cutover if `defer_cutover` is NOT set (shouldn't happen in this mode, but defensive).
 
 ###### Sequential mode (default)
 
-One Spirit runner per table, processed in order. `pollTaskToCompletion` polls every 500ms:
+One Spirit runner per table, processed in order. `pollTaskToCompletion` polls every 500ms, with the same slower refresh while it holds at a deferred cutover:
 - Updates the single active task with engine progress, refining a running task
   into its engine-reported post-copy phase the same way the atomic sync does.
 - Re-fetches task state from storage each tick to detect external Stop signals.

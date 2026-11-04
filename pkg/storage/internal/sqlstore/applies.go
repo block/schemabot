@@ -47,8 +47,6 @@ const (
 	retryableRecoveryFreshnessDays = 1
 )
 
-const applyTargetLockReleaseTimeout = 5 * time.Second
-
 // applyStore implements storage.ApplyStore using MySQL.
 type applyStore struct {
 	db         *rebindDB
@@ -376,54 +374,11 @@ func acquireApplyTargetLockConn(ctx context.Context, db *rebindDB, locker namedl
 }
 
 func releaseApplyTargetLockConn(ctx context.Context, locker namedlock.Locker, conn *rebindConn, lockName, operation string) {
-	if conn == nil {
-		return
-	}
-
-	releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), applyTargetLockReleaseTimeout)
-	defer cancel()
-
-	released, err := locker.Release(releaseCtx, conn.lockerConn(), lockName)
-	switch {
-	case err != nil:
-		slog.WarnContext(releaseCtx, "failed to release apply target lock; discarding connection",
-			"operation", operation,
-			"lock", lockName,
-			"error", err)
-		discardApplyTargetLockConn(releaseCtx, conn, lockName, operation)
-	case !released:
-		slog.WarnContext(releaseCtx, "apply target lock was not held by this session; discarding connection",
-			"operation", operation,
-			"lock", lockName)
-		discardApplyTargetLockConn(releaseCtx, conn, lockName, operation)
-	}
-
-	closeApplyTargetLockConn(releaseCtx, conn, lockName, operation)
-}
-
-// discardApplyTargetLockConn marks the pinned connection as bad so the pool
-// destroys it instead of reusing a session whose advisory-lock state is
-// uncertain.
-func discardApplyTargetLockConn(ctx context.Context, conn *rebindConn, lockName, operation string) {
-	if err := conn.discardBadConn(); err != nil {
-		slog.WarnContext(ctx, "failed to discard apply target lock connection",
-			"operation", operation,
-			"lock", lockName,
-			"error", err)
-	}
+	releaseLockConn(ctx, locker, conn, lockName, "apply target lock", "operation", operation, "lock", lockName)
 }
 
 func closeApplyTargetLockConn(ctx context.Context, conn *rebindConn, lockName, operation string) {
-	err := conn.Close()
-	if err == nil || errors.Is(err, sql.ErrConnDone) {
-		// ErrConnDone means the session was already retired by a preceding
-		// discard; there is nothing left to release.
-		return
-	}
-	slog.WarnContext(ctx, "failed to close apply target lock connection",
-		"operation", operation,
-		"lock", lockName,
-		"error", err)
+	closeLockConn(ctx, conn, "apply target lock", "operation", operation, "lock", lockName)
 }
 
 // dedupeDeployments returns the input deployments as a sorted, de-duplicated
@@ -1015,7 +970,10 @@ func (s *applyStore) CreateWithGroupedOperations(ctx context.Context, apply *sto
 // under an existing apply. The parent applies row is locked and re-read inside
 // the transaction so the attach cannot race a concurrent terminalization; the
 // apply's target reservation and idempotency key are untouched — the attach
-// adds work to the reservation the apply already holds.
+// adds work to the reservation the apply already holds. Each stopped apply
+// named in apply.TakesOverApplyIDs is stamped as taken over by this apply in the
+// same transaction (markTakenOver), after the target lock is held, so the
+// attached operation and the handoff become visible together or not at all.
 func (s *applyStore) AttachOperationWithTasks(ctx context.Context, apply *storage.Apply, operation *storage.ApplyOperation, tasks []*storage.Task) error {
 	if apply == nil {
 		return fmt.Errorf("attach operation: apply is nil")
@@ -1089,6 +1047,14 @@ func (s *applyStore) AttachOperationWithTasks(ctx context.Context, apply *storag
 			return fmt.Errorf("insert task %s for attached operation %s of apply %s: %w", task.TaskIdentifier, operation.OperationKey, apply.ApplyIdentifier, err)
 		}
 		task.ID = taskID
+	}
+	for _, holderID := range apply.TakesOverApplyIDs {
+		if holderID == apply.ID {
+			return fmt.Errorf("attach operation %s to apply %s: an apply cannot take over its own work", operation.OperationKey, apply.ApplyIdentifier)
+		}
+		if err := markTakenOver(ctx, writeTx.tx, holderID, apply.ApplyIdentifier); err != nil {
+			return err
+		}
 	}
 
 	if err := writeTx.commit(); err != nil {
@@ -1250,9 +1216,10 @@ func (s *applyStore) createWithRowsOnce(ctx context.Context, apply *storage.Appl
 }
 
 // markTakenOver records successor as the apply that took over a stopped apply's
-// unfinished work, in the transaction that creates the successor. It is the same
-// write-once superseded_by marker MarkSuperseded writes, so a failure here rolls
-// the successor's creation back and leaves no apply without its handoff.
+// unfinished work, in the transaction that creates the successor or attaches the
+// operation that takes the work over. It is the same write-once superseded_by
+// marker MarkSuperseded writes, so a failure here rolls the create or attach back
+// and leaves no takeover without its handoff.
 //
 // The first successor to record a handoff owns the marker. A holder already
 // stamped by an earlier successor is left alone and is not an error: the stopped
@@ -2294,12 +2261,12 @@ func (s *applyStore) FindNextApplyForStopReconciliation(ctx context.Context, own
 	activeOpStatePlaceholders := placeholders(len(activeOpStates))
 
 	queryArgs := stringArgs(parentStates)
-	queryArgs = append(queryArgs, storage.ControlOperationStop, storage.ControlRequestPending)
+	queryArgs = append(queryArgs, storage.ControlOperationStop, storage.ControlOperationCancel, storage.ControlRequestPending)
 	queryArgs = append(queryArgs, state.ApplyOperation.Pending)
 	queryArgs = append(queryArgs, stringArgs(activeOpStates)...)
 
 	// The claim itself rotates the lease (persistApplyClaim stamps
-	// lease_acquired_at), so a lease newer than the stop request's last write
+	// lease_acquired_at), so a lease newer than the request's last write
 	// means this request was already claimed for reconciliation — re-matching
 	// it every poll would consume the driver's tick before the operation claim
 	// runs and starve the rest of the ladder whenever the reconciliation that
@@ -2315,7 +2282,7 @@ func (s *applyStore) FindNextApplyForStopReconciliation(ctx context.Context, own
 			AND EXISTS (
 				SELECT 1
 				FROM apply_control_requests cr
-				WHERE cr.apply_id = a.id AND cr.operation = ? AND cr.status = ?
+				WHERE cr.apply_id = a.id AND cr.operation IN (?, ?) AND cr.status = ?
 					AND (
 						a.lease_acquired_at IS NULL
 						OR a.lease_acquired_at < cr.updated_at
@@ -2897,6 +2864,103 @@ func (s *applyStore) ReleaseClaim(ctx context.Context, lease storage.ApplyLease)
 	return rows > 0, nil
 }
 
+// MarkStaleApplyRetryable moves a stale, still-active apply, and the named
+// operation with it, to failed_retryable in one transaction. See
+// storage.ApplyStore for the contract.
+func (s *applyStore) MarkStaleApplyRetryable(ctx context.Context, req storage.StaleRetryableRequest) (bool, error) {
+	if req.ApplyID <= 0 {
+		return false, fmt.Errorf("mark stale apply retryable: apply id must be positive, got %d", req.ApplyID)
+	}
+	if req.OperationID < 0 {
+		return false, fmt.Errorf("mark stale apply %d retryable: operation id must not be negative, got %d", req.ApplyID, req.OperationID)
+	}
+	var moved bool
+	err := withLockRetry(ctx, s.classifier, fmt.Sprintf("mark stale apply %d retryable", req.ApplyID), func() error {
+		var err error
+		moved, err = s.markStaleApplyRetryableOnce(ctx, req)
+		return err
+	})
+	return moved, err
+}
+
+// markStaleApplyRetryableOnce runs one attempt of MarkStaleApplyRetryable.
+//
+// The operation row is written before the apply row, the order the operation
+// claim takes them in (it locks the operation, then charges the parent's
+// budget), so the two never wait on each other in opposite orders.
+//
+// The apply's fresh-operation-lease gate is a candidate filter rather than a
+// fence, for the reason undrivenApplyGate gives: it keeps the parent from
+// moving under a sibling drive that already holds its lease, but a sibling
+// claim can still commit right after it is evaluated.
+func (s *applyStore) markStaleApplyRetryableOnce(ctx context.Context, req storage.StaleRetryableRequest) (bool, error) {
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	if err != nil {
+		return false, fmt.Errorf("begin mark stale apply %d retryable transaction: %w", req.ApplyID, err)
+	}
+	defer rollbackTx(ctx, tx, "mark stale apply retryable")
+
+	activeStates := claimableApplyStates()
+	activeStatePlaceholders := placeholders(len(activeStates))
+	staleCutoff := s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime, LiteralIntervalAmount(uint64(storage.ApplyLeaseStaleAfter.Microseconds())), IntervalMicrosecond)
+	// A lease is fresh only while it has an owner and a heartbeat inside the
+	// staleness window, the reading Apply.HasFreshLease and
+	// ApplyOperation.HasFreshLease give it.
+	notFreshlyLeased := fmt.Sprintf("(lease_owner = '' OR updated_at < %s)", staleCutoff)
+
+	if req.OperationID != 0 {
+		opArgs := []any{state.ApplyOperation.FailedRetryable, nullString(req.ErrorMessage), req.OperationID, req.ApplyID}
+		opArgs = append(opArgs, stringArgs(activeStates)...)
+		opArgs = append(opArgs, req.OperationLeaseToken)
+		result, err := tx.ExecContext(ctx, fmt.Sprintf(`
+			UPDATE apply_operations
+			SET state = ?, error_message = ?, completed_at = NULL,
+			    lease_owner = '', lease_token = '', lease_acquired_at = NULL,
+			    updated_at = NOW()
+			WHERE id = ? AND apply_id = ? AND state IN (%s) AND lease_token = ?
+				AND %s
+		`, activeStatePlaceholders, notFreshlyLeased), opArgs...)
+		if err != nil {
+			return false, fmt.Errorf("mark stale apply_operation %d of apply %d retryable: %w", req.OperationID, req.ApplyID, err)
+		}
+		rows, err := result.RowsAffected()
+		if err != nil {
+			return false, fmt.Errorf("read mark stale apply_operation %d retryable rows affected: %w", req.OperationID, err)
+		}
+		if rows == 0 {
+			return false, nil
+		}
+	}
+
+	applyArgs := []any{state.Apply.FailedRetryable, req.ErrorMessage, req.ApplyID}
+	applyArgs = append(applyArgs, stringArgs(activeStates)...)
+	applyArgs = append(applyArgs, req.ApplyLeaseToken)
+	result, err := tx.ExecContext(ctx, fmt.Sprintf(`
+		UPDATE applies
+		SET state = ?, error_message = ?, completed_at = NULL,
+		    lease_owner = '', lease_token = '', lease_acquired_at = NULL,
+		    updated_at = NOW()
+		WHERE id = ? AND state IN (%s) AND lease_token = ?
+			AND %s
+			AND %s
+	`, activeStatePlaceholders, notFreshlyLeased, undrivenApplyGate(s.dialect)), applyArgs...)
+	if err != nil {
+		return false, fmt.Errorf("mark stale apply %d retryable: %w", req.ApplyID, err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("read mark stale apply %d retryable rows affected: %w", req.ApplyID, err)
+	}
+	if rows == 0 {
+		return false, nil
+	}
+
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("commit mark stale apply %d retryable: %w", req.ApplyID, err)
+	}
+	return true, nil
+}
+
 func (s *applyStore) Heartbeat(ctx context.Context, applyID int64) error {
 	// A drive that holds only an operation lease must never bump the parent
 	// applies row: under fan-out the parent's liveness is owned by the parent
@@ -3435,10 +3499,12 @@ func (s *applyStore) GetByDatabase(ctx context.Context, database, dbType, enviro
 // terminal state recently but whose progress comment was never followed by a
 // summary comment. Used by summary reconciliation to post missing summaries.
 //
-// Three forms of "missing" qualify: no summary marker at all (the publisher
+// Four forms of "missing" qualify: no summary marker at all (the publisher
 // never ran); a superseded marker (a stop's summary consumed by a resume
 // rotation, so the summary for the current terminal state was never posted);
-// and a summary claim sentinel (github_comment_id = 0) stale for longer than
+// a posted marker whose summarized state is not the apply's state (a stop's
+// summary still active when the started apply reached its next terminal
+// state, or one a resume rotated past after it did); and a summary claim sentinel (github_comment_id = 0) stale for longer than
 // storage.SummaryClaimStaleAfter (the publisher claimed, then crashed before
 // posting). A fresh sentinel is an in-flight publish and is left alone.
 //
@@ -3476,6 +3542,7 @@ func (s *applyStore) FindMissingSummaryComment(ctx context.Context, settledFor t
 		  AND (
 			acs.id IS NULL
 			OR acs.superseded_at IS NOT NULL
+			OR (acs.github_comment_id != 0 AND acs.summarized_state IS NOT NULL AND acs.summarized_state != a.state)
 			OR (acs.github_comment_id = 0 AND acs.updated_at < `+s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime, ParameterIntervalAmount(), IntervalSecond)+`)
 		  )
 		  AND `+settled+`

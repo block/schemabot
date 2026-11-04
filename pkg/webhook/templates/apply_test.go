@@ -2128,7 +2128,7 @@ func TestRenderApplySummaryComment_NonTerminalTableOutcomeVocabulary(t *testing.
 		label  string
 	}{
 		{state.Task.RevertWindow, "**`orders`** — Completed (revert window open)"},
-		{state.Task.PostChecksum, "**`orders`** — Data verified, not cut over"},
+		{state.Task.PostChecksum, "**`orders`** — Data verified, cutover not run"},
 		{state.Task.FailedRetryable, "**`orders`** — Interrupted"},
 		{state.Task.CuttingOver, "**`orders`** — Cutting over"},
 		{state.Task.Pending, "**`orders`** — Pending"},

@@ -186,6 +186,34 @@ func TestFilterPullSchemaTablesNarrowsTargetDivergence(t *testing.T) {
 	assert.Equal(t, int32(2), converged.TableCount)
 }
 
+// A target whose entry selects namespaces holds only those, so its filtered
+// count covers the filtered tables of its own namespaces rather than every
+// namespace in the response.
+func TestFilterPullSchemaTablesCountsOnlyTheNamespacesATargetHolds(t *testing.T) {
+	resp := &apitypes.PullSchemaResponse{
+		Database:    "orders",
+		Environment: "production",
+		Namespaces: map[string]*apitypes.PulledNamespace{
+			"orders":   {Tables: map[string]string{"user_sequences": "CREATE TABLE `user_sequences` (`id` bigint NOT NULL);"}},
+			"orders_0": {Tables: map[string]string{"users": "CREATE TABLE `users` (`id` bigint NOT NULL);", "payments": "CREATE TABLE `payments` (`id` bigint NOT NULL);"}},
+		},
+		TableCount: 3,
+		Targets: []*apitypes.TargetDivergence{
+			{Deployment: "eu", Target: "orders-001", TableCount: 1, Primary: true, Namespaces: []string{"orders"}},
+			{Deployment: "eu", Target: "orders-002", TableCount: 2, Namespaces: []string{"orders_0"}},
+			{Deployment: "eu", Target: "orders-003", TableCount: 3, Namespaces: []string{"orders_0"}, DivergedTables: []apitypes.DivergedTable{
+				{Namespace: "orders_0", Table: "user_audits", Difference: apitypes.DivergenceOnlyOnTarget},
+			}},
+		},
+	}
+
+	require.NoError(t, filterPullSchemaTables(resp, "user"))
+
+	assert.Equal(t, int32(1), resp.Targets[0].TableCount)
+	assert.Equal(t, int32(1), resp.Targets[1].TableCount)
+	assert.Equal(t, int32(2), resp.Targets[2].TableCount, "the filtered table its namespace holds plus the one only it has")
+}
+
 // A filtered pull that requested lint keeps the explicit empty audit when the
 // selected tables are clean, so "no violations" stays distinguishable from
 // lint not being requested.

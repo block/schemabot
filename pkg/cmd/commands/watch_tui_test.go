@@ -382,8 +382,8 @@ func TestWatchModel_MultiDeploymentView(t *testing.T) {
 
 	assert.Contains(t, view, "1 completed · 1 halted · 1 failed")
 	assert.Contains(t, view, "❌ First failure: eu-west — duplicate key name 'idx_orders_source'")
-	assert.Contains(t, view, "Apply ID: apply-multi-test")
-	assert.Contains(t, view, "Environment: production")
+	assert.NotContains(t, view, "Apply ID:", "the rollout names its apply where the command that needs it does")
+	assert.Contains(t, view, "✗ Apply failed"+templates.ANSIReset+": 1 completed · 1 halted · 1 failed (3 deployments)")
 	assertContainsInOrder(t, view,
 		"✅ us-east — completed (orders-us-east)",
 		"External operation ID: remote-op-us-east-test",
@@ -413,7 +413,7 @@ func TestWatchModel_MultiDeploymentViewRunningDegraded(t *testing.T) {
 
 	view := m.View()
 
-	assert.Contains(t, view, "running (degraded)")
+	assert.Contains(t, view, "Running (degraded)... 1 running · 1 failed (2 deployments)")
 	assert.Contains(t, view, "1 running · 1 failed")
 	assert.Contains(t, view, "❌ First failure: eu — duplicate column")
 	assert.Contains(t, view, "🔄 us — running table copy")
@@ -440,11 +440,11 @@ func TestWatchModel_MultiDeploymentCutoverFollowsDeferCutover(t *testing.T) {
 	}
 
 	automatic := render(nil)
-	assert.Contains(t, automatic, "SchemaBot will cut over us-east next — no action needed.")
+	assert.Contains(t, automatic, "SchemaBot will run the cutover for us-east next — no action needed.")
 	assert.NotContains(t, automatic, "schemabot cutover")
 
 	deferred := render(map[string]string{"defer_cutover": "true"})
-	assert.Contains(t, deferred, "To cut over us-east:")
+	assert.Contains(t, deferred, "To run the cutover for us-east:")
 	assert.Contains(t, deferred, "schemabot cutover apply-cutover-test -e production")
 }
 
@@ -479,7 +479,38 @@ func TestWatchModel_MultiTargetRolloutEndsOnItsRecoveryCommand(t *testing.T) {
 	stopped := render(state.Apply.Stopped, state.ApplyOperation.Stopped)
 	assert.True(t, strings.HasSuffix(stopped, "schemabot start apply-rollout-end -e production"+templates.ANSIReset+"\n\n"),
 		"the resume command closes the view:\n%s", stopped)
-	assert.NotContains(t, stopped, "Apply stopped")
+	assert.Contains(t, stopped, "⏹️ Apply stopped"+templates.ANSIReset+": 1 completed · 1 stopped (2 targets)\nTo resume from where it stopped:\n",
+		"the outcome states how the targets ended above the command:\n%s", stopped)
+	assert.Equal(t, 1, strings.Count(stopped, "Apply stopped"), "the outcome is said once:\n%s", stopped)
+}
+
+// A start moves a stopped rollout to resuming before its targets report
+// leaving stopped. Through that window the watcher keeps following the start
+// the operator sent: a spinner on the resuming state, each table resuming
+// without its pre-stop percent, and the detach key, never the stopped outcome
+// and the start command that would ask for the start again.
+func TestWatchModel_MultiTargetRolloutResumingAwaitsItsTargets(t *testing.T) {
+	m := NewWatchModel("http://localhost:8080", "orders", "staging", true)
+	m.applyID = "apply-rollout-resuming"
+	m.state = state.Apply.Resuming
+	m.initialized = true
+	m.operations = []templates.ProgressOperation{
+		{Deployment: "staging", Target: "payments-001", State: state.ApplyOperation.Stopped, StartedAt: "2026-09-30T12:00:00Z", CutoverPolicy: storage.CutoverPolicyParallel, OnFailure: storage.OnFailureHalt},
+		{Deployment: "staging", Target: "payments-002", State: state.ApplyOperation.Stopped, StartedAt: "2026-09-30T12:00:00Z", CutoverPolicy: storage.CutoverPolicyParallel, OnFailure: storage.OnFailureHalt},
+	}
+	m.tables = []templates.TableProgress{
+		{Deployment: "staging", Target: "payments-001", TableName: "orders", ChangeType: "alter", Status: state.Task.Stopped, PercentComplete: 57, RowsCopied: 57, RowsTotal: 100},
+		{Deployment: "staging", Target: "payments-002", TableName: "orders", ChangeType: "alter", Status: state.Task.Stopped, PercentComplete: 40, RowsCopied: 40, RowsTotal: 100},
+	}
+
+	view := m.View()
+	assert.True(t, strings.HasPrefix(view, m.spinner.View()+"Resuming on all 2 targets...\n"), "the state line spins while the start lands:\n%s", view)
+	assert.Contains(t, view, "~ orders: "+templates.ANSICyan+"🔄 Resuming..."+templates.ANSIReset+"\n")
+	assert.Contains(t, view, "ESC to detach")
+	assert.NotContains(t, view, "Apply stopped")
+	assert.NotContains(t, view, "schemabot start")
+	assert.NotContains(t, view, "57", "the pre-stop percent is not shown while the copy's continuation is unknown")
+	assert.False(t, m.watchHasEnded(), "the watch keeps following a resuming apply")
 }
 
 func TestWatchModel_SingleDeploymentOutputDoesNotUseMultiView(t *testing.T) {
@@ -911,19 +942,66 @@ func TestWatchModel_MultiTargetRollupScopesTablesToTheirMember(t *testing.T) {
 	view := m.View()
 
 	assertContainsInOrder(t, view,
-		"Targets: 1 completed · 1 running",
-		"1 completed · 1 running (2 targets)",
+		"Running... 1 completed · 1 running (2 targets)",
 		"users_002",
 		"target testapp-002",
 		"users_001",
 		"target testapp-001",
-		"To stop this schema change:",
-		"schemabot stop apply-multi-target -e production",
-		"ESC to detach",
+		"ESC detach • s stop",
 	)
 	assert.NotContains(t, view, "primary —", "a sole deployment is not named")
 	assert.Equal(t, 1, strings.Count(view, "users_001:"))
 	assert.Equal(t, 1, strings.Count(view, "users_002:"))
+}
+
+// A rollout of several targets is stopped from the watcher with the same key as
+// a single target, and the footer says so the same way: "ESC detach • s stop",
+// or "c cancel" on PlanetScale. The key stays offered while the stop lands, and
+// gives way to a wait message during cutover, when the watcher ignores keys.
+// Where the key does nothing the footer keeps the stop command instead.
+func TestWatchModel_MultiTargetFooterOffersTheStopKey(t *testing.T) {
+	rollout := func(applyState string) WatchModel {
+		m := NewWatchModel("http://localhost:8080", "testapp", "production", true)
+		m.applyID = "apply-multi-target"
+		m.state = applyState
+		m.initialized = true
+		m.operations = []templates.ProgressOperation{
+			{Deployment: "primary", Target: "testapp-001", State: state.ApplyOperation.Running},
+			{Deployment: "primary", Target: "testapp-002", State: state.ApplyOperation.Running},
+		}
+		m.tables = []templates.TableProgress{
+			{Deployment: "primary", Target: "testapp-001", TableName: "users", ChangeType: "alter", Status: state.Task.Running, PercentComplete: 40},
+			{Deployment: "primary", Target: "testapp-002", TableName: "users", ChangeType: "alter", Status: state.Task.Running, PercentComplete: 20},
+		}
+		return m
+	}
+	footer := func(m WatchModel) string {
+		_, f := m.multiDeploymentProgressSections()
+		return stripANSI(f)
+	}
+
+	running := footer(rollout(state.Apply.Running))
+	assert.Contains(t, running, "ESC detach • s stop")
+	assert.NotContains(t, running, "schemabot stop", "the key replaces the typed command")
+
+	stopping := rollout(state.Apply.Running)
+	updated, cmd := stopping.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
+	require.NotNil(t, cmd, "s requests a stop of the rollout")
+	assert.Contains(t, footer(updated.(WatchModel)), "ESC detach • s stop", "the key stays offered while the stop lands")
+
+	planetScale := rollout(state.Apply.Running)
+	planetScale.engine = "PlanetScale"
+	assert.Contains(t, footer(planetScale), "ESC detach • c cancel")
+
+	cuttingOver := footer(rollout(state.Apply.CuttingOver))
+	assert.Contains(t, cuttingOver, "Cutover in progress - please wait...")
+	assert.NotContains(t, cuttingOver, "ESC", "the watcher ignores ESC during cutover")
+	assert.NotContains(t, cuttingOver, "s stop")
+
+	queued := footer(rollout(state.Apply.Pending))
+	assert.NotContains(t, queued, "s stop", "s does nothing before the apply runs")
+	assert.Contains(t, queued, "schemabot stop apply-multi-target -e production")
+	assert.Contains(t, queued, "ESC to detach")
 }
 
 // An apply SchemaBot has accepted but not yet started reads as queued in the
@@ -938,4 +1016,150 @@ func TestWatchModel_PendingApplyReadsAsQueued(t *testing.T) {
 
 	assert.Contains(t, view, "Queued, starts automatically")
 	assert.NotContains(t, view, "Starting")
+}
+
+// A rollout reads the way a single target does: a spinner and its state while
+// it runs, with the targets' counts on the same line, and no state line once it
+// finishes, where the outcome counts the change once however many targets ran
+// it. Targets that agree are named together rather than counted twice.
+func TestWatchModel_MultiTargetStateLineMatchesTheSingleTarget(t *testing.T) {
+	render := func(opStates []string, taskStatus string, applyState string) string {
+		m := NewWatchModel("http://localhost:8080", "shop", "production", false)
+		m.applyID = "apply-rollout-line"
+		m.state = applyState
+		m.initialized = true
+		for i, opState := range opStates {
+			target := fmt.Sprintf("shop-%03d", i+1)
+			m.operations = append(m.operations, templates.ProgressOperation{Deployment: "prod", Target: target, State: opState, CutoverPolicy: storage.CutoverPolicyParallel, OnFailure: storage.OnFailureHalt})
+			m.tables = append(m.tables, templates.TableProgress{Deployment: "prod", Target: target, TableName: "orders", ChangeType: "alter", Status: taskStatus, RowsCopied: 500, RowsTotal: 1000, PercentComplete: 50})
+		}
+		return stripANSI(m.View())
+	}
+
+	running := render([]string{state.ApplyOperation.Running, state.ApplyOperation.Running, state.ApplyOperation.Running}, state.Task.Running, state.Apply.Running)
+	assert.Contains(t, running, "Running on all 3 targets...\n", running)
+	assert.NotContains(t, running, "Apply ID:", running)
+	assert.Contains(t, running, "50.00%", "the percent across targets has a single target's precision:\n%s", running)
+
+	mixed := render([]string{state.ApplyOperation.Completed, state.ApplyOperation.Running, state.ApplyOperation.Running}, state.Task.Running, state.Apply.Running)
+	assert.Contains(t, mixed, "Running... 1 completed · 2 running (3 targets)\n", mixed)
+
+	completed := render([]string{state.ApplyOperation.Completed, state.ApplyOperation.Completed, state.ApplyOperation.Completed}, state.Task.Completed, state.Apply.Completed)
+	assert.NotContains(t, completed, "Completed on", "a finished rollout has no state line:\n%s", completed)
+	assert.Contains(t, completed, "✓ Apply complete! Changes: 1 altered on all 3 targets. Apply ID: apply-rollout-line\n", completed)
+}
+
+// A finished rollout's outcome line reports what actually ran. Each distinct
+// statement counts once however many targets ran it, the changes are said to
+// run "on all" targets only when every target ran the same ones, and a reverted
+// rollout states its outcome like every other finished one.
+func TestWatchModel_MultiTargetOutcomeReportsWhatRan(t *testing.T) {
+	type member struct {
+		target, opState string
+		tables          []templates.TableProgress
+	}
+	render := func(applyState string, members ...member) string {
+		m := NewWatchModel("http://localhost:8080", "shop", "production", false)
+		m.applyID = "apply-rollout-outcome"
+		m.state = applyState
+		m.initialized = true
+		for _, mem := range members {
+			m.operations = append(m.operations, templates.ProgressOperation{Deployment: "prod", Target: mem.target, State: mem.opState, CutoverPolicy: storage.CutoverPolicyParallel, OnFailure: storage.OnFailureHalt})
+			for _, table := range mem.tables {
+				table.Deployment, table.Target = "prod", mem.target
+				m.tables = append(m.tables, table)
+			}
+		}
+		return stripANSI(m.View())
+	}
+	table := func(name, ddl, status string) templates.TableProgress {
+		return templates.TableProgress{Namespace: "shop", TableName: name, ChangeType: "alter", DDL: ddl, Status: status, RowsCopied: 1000, RowsTotal: 1000, PercentComplete: 100}
+	}
+	byEmail := "ALTER TABLE `orders` ADD INDEX `idx_email` (`email`)"
+	byStatus := "ALTER TABLE `orders` ADD INDEX `idx_status` (`status`)"
+	done := state.ApplyOperation.Completed
+
+	twoIndexes := []templates.TableProgress{table("orders", byEmail, state.Task.Completed), table("orders", byStatus, state.Task.Completed)}
+	sameStatements := render(state.Apply.Completed, member{"shop-001", done, twoIndexes}, member{"shop-002", done, twoIndexes})
+	assert.Contains(t, sameStatements, "✓ Apply complete! Changes: 2 altered on all 2 targets.", "two statements on one table count as two:\n%s", sameStatements)
+
+	differentTables := render(state.Apply.Completed,
+		member{"shop-001", done, []templates.TableProgress{table("users_001", "ALTER TABLE `users_001` ADD COLUMN `note` text", state.Task.Completed)}},
+		member{"shop-002", done, []templates.TableProgress{table("users_002", "ALTER TABLE `users_002` ADD COLUMN `note` text", state.Task.Completed)}},
+	)
+	assert.Contains(t, differentTables, "✓ Apply complete! Changes: 2 altered across 2 targets.", "targets that ran different changes are not said to run all of them:\n%s", differentTables)
+
+	sameTableDifferentStatements := render(state.Apply.Completed,
+		member{"shop-001", done, []templates.TableProgress{table("orders", byEmail, state.Task.Completed)}},
+		member{"shop-002", done, []templates.TableProgress{table("orders", byStatus, state.Task.Completed)}},
+	)
+	assert.Contains(t, sameTableDifferentStatements, "✓ Apply complete! Changes: 2 altered across 2 targets.", "one table changed by a different statement on each target counts both statements, on neither target in full:\n%s", sameTableDifferentStatements)
+
+	reverted := state.ApplyOperation.Reverted
+	revertedTables := []templates.TableProgress{table("orders", byEmail, state.Task.Reverted)}
+	rolledBack := render(state.Apply.Reverted, member{"shop-001", reverted, revertedTables}, member{"shop-002", reverted, revertedTables})
+	assert.Contains(t, rolledBack, "↩️ Schema change reverted on all 2 targets\n", rolledBack)
+}
+
+// The interactive watch ends on every terminal apply state and on no active
+// schema change, and exits the way the non-interactive watch does: 0 only
+// when the apply completed, and 1 for every other end, because the schema
+// change is not on the target.
+func TestWatchModel_EndsOnEveryTerminalState(t *testing.T) {
+	for _, tc := range []struct {
+		end      string
+		terminal bool
+		wantErr  bool
+	}{
+		{state.Apply.Completed, true, false},
+		{state.Apply.Failed, true, true},
+		{state.Apply.Stopped, true, true},
+		{state.Apply.Cancelled, true, true},
+		{state.Apply.Reverted, true, true},
+		{state.NoActiveChange, false, true},
+	} {
+		t.Run(tc.end, func(t *testing.T) {
+			require.Equal(t, tc.terminal, state.IsTerminalApplyState(tc.end))
+			m := NewWatchModel("http://localhost:8080", "testdb", "staging", false)
+			updated, cmd := m.Update(progressMsg{
+				state:  tc.end,
+				tables: []templates.TableProgress{{TableName: "users", Status: state.Task.Completed}},
+			})
+			require.NotNil(t, cmd, "the watch ends")
+			assert.IsType(t, tea.QuitMsg{}, cmd())
+			model := updated.(WatchModel)
+			assert.Equal(t, tc.end, model.state)
+			if tc.wantErr {
+				assert.ErrorIs(t, model.exitError(), ErrSilent)
+			} else {
+				assert.NoError(t, model.exitError())
+			}
+		})
+	}
+
+	// An error the view already shows fails the watch; detaching while
+	// the apply still runs is not an outcome and exits 0.
+	t.Run("an error fails the watch and a detach does not", func(t *testing.T) {
+		m := NewWatchModel("http://localhost:8080", "testdb", "staging", false)
+		updated, _ := m.Update(progressMsg{state: state.Apply.Running})
+		running := updated.(WatchModel)
+		assert.NoError(t, running.exitError(), "detached while running")
+		running.errorMsg = "progress polls kept failing"
+		assert.ErrorIs(t, running.exitError(), ErrSilent)
+	})
+
+	t.Run("reverted says the change was undone and exits non-zero", func(t *testing.T) {
+		m := NewWatchModel("http://localhost:8080", "testdb", "staging", false)
+		m.applyID = "apply-reverted"
+		updated, _ := m.Update(progressMsg{
+			state:  state.Apply.Reverted,
+			tables: []templates.TableProgress{{TableName: "users", Status: state.Task.Reverted}},
+		})
+		model := updated.(WatchModel)
+		view := model.View()
+		assert.Contains(t, view, "Schema change reverted.")
+		assert.Contains(t, view, "Start a new apply to make it again.")
+		assert.NotContains(t, view, "Apply complete")
+		assert.ErrorIs(t, model.exitError(), ErrSilent)
+	})
 }

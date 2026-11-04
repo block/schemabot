@@ -25,13 +25,29 @@ import (
 // recorded so the test can assert on the cleanup. Every delete the engine
 // issues is recorded as attempted; one whose context has already ended then
 // fails without being recorded as deleted, as a real API request would.
+// Listing deploy requests returns openDeployRequests, or fails with listErr.
+// Reading a deploy request's auto-cutover setting answers autoCutover.
 type branchLifecycleClient struct {
 	psclient.PSClient
 
-	mu        sync.Mutex
-	created   []string
-	attempted []string
-	deleted   []string
+	mu                 sync.Mutex
+	created            []string
+	attempted          []string
+	deleted            []string
+	openDeployRequests []*ps.DeployRequest
+	listErr            error
+	autoCutover        bool
+}
+
+func (c *branchLifecycleClient) DeployRequestAutoCutover(context.Context, string, string, uint64) (bool, error) {
+	return c.autoCutover, nil
+}
+
+func (c *branchLifecycleClient) ListDeployRequests(context.Context, *ps.ListDeployRequestsRequest) ([]*ps.DeployRequest, error) {
+	if c.listErr != nil {
+		return nil, c.listErr
+	}
+	return c.openDeployRequests, nil
 }
 
 func (c *branchLifecycleClient) GetBranch(context.Context, *ps.GetDatabaseBranchRequest) (*ps.DatabaseBranch, error) {
@@ -446,7 +462,11 @@ func (c *undeployedDeployRequestClient) CloseDeployRequest(_ context.Context, re
 // reports a deploy began between the read and the close keeps its branch, an
 // operator-supplied branch is never deleted, and a drive whose context ended,
 // before or during the cleanup, leaves what remains to whoever takes the apply
-// over, and sends no request once it has ended. A deploy request already
+// over, and sends no request once it has ended. A deploy request no save
+// names is still found by the driver that resumes the apply from its recorded
+// branch, unless an operator cancelled the apply: no driver resumes a
+// cancelled apply and the cancel reads only the stored state, so the drive
+// names the deploy request for the operator to close. A deploy request already
 // closed is not closed again, and a read, close or delete that fails stops the
 // cleanup at that step. Each outcome is logged on the apply's logger, and a
 // deploy that may be running names the reconcile step for the operator.
@@ -485,7 +505,16 @@ func TestApplyClosesTheUndeployedDeployRequestOfAFailedApply(t *testing.T) {
 		closeNil      bool
 		deleteErr     error
 		endDriveAt    string
-		wantCloses    []uint64
+		// recorded gives the apply a resume state that names the deploy
+		// request, so an unknown deploy outcome pauses for recovery instead
+		// of failing the apply.
+		recorded bool
+		// refuseDeployRequestSave lets the save naming the branch land and
+		// refuses every save naming the deploy request.
+		refuseDeployRequestSave bool
+		// cancelCause is why the drive ends at endDriveAt; nil is a handback.
+		cancelCause error
+		wantCloses  []uint64
 		// wantDelete is "" when no delete is sent, "deleted" when the branch
 		// is deleted, and "failed" when the delete is sent and fails.
 		wantDelete string
@@ -504,8 +533,11 @@ func TestApplyClosesTheUndeployedDeployRequestOfAFailedApply(t *testing.T) {
 		{name: "a deploy request that reports a deploy began by the cleanup's read is left with its branch",
 			createdDR: ready, reread: ready, cleanupReread: queued, deployErr: rejected, wantLog: deployMayRunLog, wantLevel: "ERROR"},
 		{name: "a deploy whose outcome is unknown leaves the deploy request and branch for recovery",
-			createdDR: ready, reread: ready, deployErr: unanswered,
+			createdDR: ready, reread: ready, deployErr: unanswered, recorded: true,
 			wantLog: deployOutcomeUnknownKeepsDeployRequestLog, wantLevel: "WARN"},
+		{name: "a deploy whose outcome is unknown and whose apply cannot pause leaves both and tells the operator to reconcile",
+			createdDR: ready, reread: ready, deployErr: unanswered,
+			wantLog: deployOutcomeUnknownApplyFailingLog, wantLevel: "ERROR"},
 		{name: "a refused deploy request that carries a deploy timestamp is left with its branch",
 			createdDR: refused, reread: refusedDeployed, wantLog: deployMayRunLog, wantLevel: "ERROR"},
 		{name: "a close response showing the deploy queued keeps the branch",
@@ -533,8 +565,17 @@ func TestApplyClosesTheUndeployedDeployRequestOfAFailedApply(t *testing.T) {
 			createdDR: ready, reread: ready, deployErr: rejected, deleteErr: errors.New("branch delete refused"), wantCloses: []uint64{91}, wantDelete: "failed",
 			wantLog: "failed to delete the branch of a failed apply after closing its deploy request; delete it manually to reclaim branch quota", wantLevel: "ERROR"},
 		{name: "a drive that ends after the deploy request leaves both for the driver that takes over",
-			createdDR: ready, reread: ready, endDriveAt: endDriveAtDeploy, wantNoReads: true,
+			createdDR: ready, reread: ready, endDriveAt: endDriveAtDeploy, recorded: true, wantNoReads: true,
 			wantLog: "drive ended after the deploy request was created; leaving the deploy request to the driver or control operation that takes over the apply", wantLevel: "INFO"},
+		{name: "a drive that ends after a deploy request no save names leaves it for the resume from the recorded branch to adopt",
+			createdDR: ready, reread: ready, endDriveAt: endDriveAtDeploy, recorded: true, refuseDeployRequestSave: true, wantNoReads: true,
+			wantLog: "drive ended after the deploy request was created, but no save naming it landed; the driver that resumes the apply finds it open on the branch and adopts it", wantLevel: "INFO"},
+		{name: "a drive that ends with neither the branch nor the deploy request saved names the deploy request for the operator",
+			createdDR: ready, reread: ready, endDriveAt: endDriveAtDeploy, wantNoReads: true,
+			wantLog: "drive ended after the deploy request was created, but no save naming it landed and no driver resumes the apply from its branch; close it by hand", wantLevel: "WARN"},
+		{name: "an operator's cancel after a deploy request no save names reaches only the stored state, so the deploy request is named for the operator",
+			createdDR: ready, reread: ready, endDriveAt: endDriveAtDeploy, recorded: true, refuseDeployRequestSave: true, cancelCause: engine.ErrCancelledByOperator, wantNoReads: true,
+			wantLog: "drive ended after the deploy request was created, but no save naming it landed and no driver resumes the apply from its branch; close it by hand", wantLevel: "WARN"},
 		{name: "a drive that ends while the cleanup reads the deploy request closes nothing",
 			createdDR: ready, reread: ready, deployErr: rejected, endDriveAt: endDriveAtReread,
 			wantLog: readEndedLog, wantLevel: "WARN"},
@@ -547,8 +588,8 @@ func TestApplyClosesTheUndeployedDeployRequestOfAFailedApply(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			ctx, cancel := context.WithCancel(t.Context())
-			defer cancel()
+			ctx, cancel := context.WithCancelCause(t.Context())
+			defer cancel(nil)
 			client := &undeployedDeployRequestClient{
 				createdDR:     tt.createdDR,
 				reread:        tt.reread,
@@ -559,7 +600,7 @@ func TestApplyClosesTheUndeployedDeployRequestOfAFailedApply(t *testing.T) {
 				closeErr:      tt.closeErr,
 				closeNil:      tt.closeNil,
 				deleteErr:     tt.deleteErr,
-				endDrive:      cancel,
+				endDrive:      func() { cancel(tt.cancelCause) },
 				endDriveAt:    tt.endDriveAt,
 			}
 			req := &engine.ApplyRequest{
@@ -567,6 +608,20 @@ func TestApplyClosesTheUndeployedDeployRequestOfAFailedApply(t *testing.T) {
 				Database:    "commerce",
 				Credentials: conformanceCredentials(),
 				Options:     tt.options,
+			}
+			if tt.recorded {
+				req.ResumeState = &engine.ResumeState{MigrationContext: "apply-1a2b3c4d5e6f7890"}
+				req.OnStateChange = func(rs *engine.ResumeState) error {
+					if !tt.refuseDeployRequestSave {
+						return nil
+					}
+					meta, err := decodePSMetadata(rs.Metadata)
+					require.NoError(t, err)
+					if meta.DeployRequestID != 0 {
+						return errors.New("apply apply-1a2b3c4d5e6f7890: storage unavailable")
+					}
+					return nil
+				}
 			}
 			logRecord := captureApplyLogs(t, req)
 
@@ -887,9 +942,13 @@ type resumedDeployRequestClient struct {
 	endDrive      context.CancelFunc
 	reads         int
 	closes        []uint64
+	creates       int
 }
 
 func (c *resumedDeployRequestClient) CreateDeployRequest(context.Context, *ps.CreateDeployRequestRequest) (*ps.DeployRequest, error) {
+	c.mu.Lock()
+	c.creates++
+	c.mu.Unlock()
 	if c.endDrive != nil {
 		c.endDrive()
 	}
@@ -1003,13 +1062,160 @@ func TestResumeApply_ClosesTheUndeployedDeployRequestItCreated(t *testing.T) {
 	}
 }
 
+// A resume that adopts the deploy request it finds open on its branch holds it
+// as one it created: the branch is never reclaimed from under it. When the
+// resume then fails before the deploy begins, the adopted deploy request is
+// retired only on a branch SchemaBot created for the apply; on an
+// operator-supplied branch the operator may have opened it, so it is left
+// open and the branch kept. A resume that cannot tell which deploy request to
+// use creates none: several open deploy requests fail the resume, naming them
+// for the operator, and keep the branch they carry; a listing that fails
+// pauses the resume with the branch kept, since a deploy request may be
+// deploying from it, so the next drive lists again. An adopted deploy request
+// whose deploy already ran is reattached to as a recorded one is, and the
+// reattach's own failure handling is the only cleanup it gets.
+func TestResumeApply_HoldsTheDeployRequestItAdopts(t *testing.T) {
+	shortenEngineWaits(t)
+	const branch = "schemabot-testdb-1a2b"
+	refusedOnBranch := &ps.DeployRequest{Number: 57, Branch: branch, IntoBranch: "main", State: "open", DeploymentState: deployState.Error}
+	readyOnBranch := &ps.DeployRequest{Number: 58, Branch: branch, IntoBranch: "main", State: "open", DeploymentState: deployState.Ready}
+	deployFailedOnBranch := &ps.DeployRequest{Number: 65, Branch: branch, IntoBranch: "main", State: "open", DeploymentState: deployState.CompleteError}
+	ready := &ps.DeployRequest{Number: 42, State: "open", DeploymentState: deployState.Ready}
+	listFailure := errors.New("planetscale unavailable")
+
+	tests := []struct {
+		name    string
+		options map[string]string
+		open    []*ps.DeployRequest
+		listErr error
+		// reread is what every read of a deploy request returns.
+		reread      *ps.DeployRequest
+		wantErr     []string
+		wantCloses  []uint64
+		wantDeleted []string
+		// wantReads counts every read of a deploy request, the cleanup's
+		// included.
+		wantReads int
+		// wantOutcomeUnknown is set when the failure pauses the apply for the
+		// next drive rather than failing it.
+		wantOutcomeUnknown bool
+		wantLog            string
+		wantLevel          string
+	}{
+		{name: "an adopted deploy request PlanetScale refused on a branch SchemaBot created is closed and its branch deleted",
+			open: []*ps.DeployRequest{refusedOnBranch}, reread: refusedOnBranch,
+			wantErr:    []string{"deploy request #57 failed on resume"},
+			wantCloses: []uint64{57}, wantDeleted: []string{branch}, wantReads: 1,
+			wantLog: "deleted the branch of a failed apply after closing its undeployed deploy request", wantLevel: "INFO"},
+		{name: "an adopted deploy request PlanetScale refused on an operator-supplied branch is left open with its branch",
+			options: map[string]string{"branch": branch}, open: []*ps.DeployRequest{refusedOnBranch}, reread: refusedOnBranch,
+			wantErr: []string{"deploy request #57 failed on resume"},
+			wantLog: "resumed apply failed after adopting an open deploy request on the operator-supplied branch; leaving it open, since the operator may have opened it; close it in PlanetScale if it should not deploy", wantLevel: "WARN"},
+		{name: "several open deploy requests fail the resume and keep the branch they carry",
+			open: []*ps.DeployRequest{refusedOnBranch, readyOnBranch}, reread: ready,
+			wantErr: []string{"branch schemabot-testdb-1a2b has 2 open deploy requests into main (#57, #58)", "close all of them in PlanetScale, then plan and apply again"},
+			wantLog: "resumed apply failed on a branch with several open deploy requests; keeping the branch they carry", wantLevel: "INFO"},
+		{name: "a listing that fails pauses the resume and keeps the branch",
+			listErr: listFailure, reread: ready,
+			wantErr:            []string{"check branch schemabot-testdb-1a2b for an open deploy request on resume", "planetscale unavailable"},
+			wantOutcomeUnknown: true,
+			wantLog:            "resumed apply failed before it could tell whether the branch carries an open deploy request; keeping the branch in case one is deploying from it", wantLevel: "INFO"},
+		{name: "an adopted deploy request whose deploy ran and failed is reattached, and the reattach alone handles the failure",
+			open: []*ps.DeployRequest{deployFailedOnBranch}, reread: deployFailedOnBranch,
+			wantErr:   []string{"deploy request #65 failed while deploying (state: complete_error)"},
+			wantReads: 1,
+			wantLog:   "resumed apply failed while reattached to the deploy request it adopted; the reattach handled the failure, so the deploy request and branch are left as it left them", wantLevel: "INFO"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client := &resumedDeployRequestClient{created: ready, reread: tt.reread, deployErr: &ps.Error{Code: ps.ErrInvalid}}
+			client.openDeployRequests = tt.open
+			client.listErr = tt.listErr
+			req := resumeRequest(t, &psMetadata{BranchName: branch}, "apply-1a2b3c4d5e6f7890")
+			req.Options = tt.options
+			logRecord := captureApplyLogs(t, req)
+
+			_, err := conformanceEngine(client).resumeApply(t.Context(), client, "org", req)
+
+			require.Error(t, err)
+			for _, want := range tt.wantErr {
+				assert.ErrorContains(t, err, want)
+			}
+			if tt.listErr != nil {
+				assert.ErrorIs(t, err, tt.listErr)
+			}
+			assert.Equal(t, tt.wantOutcomeUnknown, engine.IsOutcomeUnknown(err))
+			assert.Zero(t, client.creates, "no deploy request is created beside the ones already open on the branch")
+			assert.Equal(t, tt.wantCloses, client.closes)
+			assert.Equal(t, tt.wantDeleted, client.deleteAttempts())
+			assert.Equal(t, tt.wantReads, client.reads)
+			record := logRecord(tt.wantLog)
+			require.NotNil(t, record, "the cleanup decision is logged on the apply's logger")
+			assert.Equal(t, tt.wantLevel, record["level"])
+			assert.Equal(t, branch, record["branch"])
+		})
+	}
+}
+
+// The hold on an adopted deploy request survives the drive that adopted it:
+// stored state records that the deploy request was adopted, so a drive that
+// recovers it and finds PlanetScale refused it retires it under the same rule
+// as the adopting drive. On an operator-supplied branch it is left open with
+// its branch, since the operator may have opened it; on a branch SchemaBot
+// created it is closed and the branch deleted, as a recovered deploy request
+// this engine created is.
+func TestResumeExistingDeployRequest_HoldsTheRefusedDeployRequestAnEarlierDriveAdopted(t *testing.T) {
+	const branch = "schemabot-testdb-1a2b"
+	refused := &ps.DeployRequest{Number: 57, Branch: branch, IntoBranch: "main", State: "open", DeploymentState: deployState.Error}
+	tests := []struct {
+		name        string
+		options     map[string]string
+		adopted     bool
+		wantCloses  []uint64
+		wantDeleted []string
+		wantLog     string
+		wantLevel   string
+	}{
+		{name: "an adopted deploy request on an operator-supplied branch is left open with its branch",
+			options: map[string]string{"branch": branch}, adopted: true,
+			wantLog: "resumed apply failed on a refused deploy request an earlier drive adopted on the operator-supplied branch; leaving it open, since the operator may have opened it; close it in PlanetScale if it should not deploy", wantLevel: "WARN"},
+		{name: "an adopted deploy request on a branch SchemaBot created is closed and its branch deleted",
+			adopted:    true,
+			wantCloses: []uint64{57}, wantDeleted: []string{branch},
+			wantLog: "deleted the branch of a failed apply after closing its undeployed deploy request", wantLevel: "INFO"},
+		{name: "a deploy request this engine created on an operator-supplied branch is closed and the branch kept",
+			options:    map[string]string{"branch": branch},
+			wantCloses: []uint64{57},
+			wantLog:    "closed the undeployed deploy request of a failed apply", wantLevel: "INFO"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client := &resumedDeployRequestClient{reread: refused}
+			meta := &psMetadata{BranchName: branch, DeployRequestID: 57, DeployRequestAdopted: tt.adopted}
+			req := resumeRequest(t, meta, "apply-1a2b3c4d5e6f7890")
+			req.Options = tt.options
+			logRecord := captureApplyLogs(t, req)
+
+			_, err := conformanceEngine(client).resumeApply(t.Context(), client, "org", req)
+
+			require.ErrorContains(t, err, "deploy request #57 failed during preparation (state: error)")
+			assert.Equal(t, tt.wantCloses, client.closes)
+			assert.Equal(t, tt.wantDeleted, client.deleteAttempts())
+			record := logRecord(tt.wantLog)
+			require.NotNil(t, record, "the cleanup decision is logged on the apply's logger")
+			assert.Equal(t, tt.wantLevel, record["level"])
+			assert.Equal(t, float64(57), record["deploy_request"])
+		})
+	}
+}
+
 // pendingDeployRequestHandbackClient serves a resumable branch, creates the
 // deploy request the resume asks for, and ends the drive on the first read of
 // that deploy request, while PlanetScale is still computing its diff, the way
 // a handback mid-wait does.
 type pendingDeployRequestHandbackClient struct {
 	resumeReclaimClient
-	cancel context.CancelFunc
+	cancel func()
 }
 
 func (c *pendingDeployRequestHandbackClient) CreateDeployRequest(context.Context, *ps.CreateDeployRequestRequest) (*ps.DeployRequest, error) {
@@ -1029,16 +1235,21 @@ func (c *pendingDeployRequestHandbackClient) GetDeployRequest(context.Context, *
 // already recorded that deploy request, so the driver that picks the apply up
 // next resumes it instead of opening a second deploy request on the branch.
 // The save runs under the drive's context, as the real one does, so a drive
-// that has ended can no longer save. When the save was refused, the drive
-// warns that the deploy request it leaves behind is one no successor can
-// find, naming it for the operator to close. Either way the branch is kept.
+// that has ended can no longer save. When the save was refused, the stored
+// state still names the branch, so the successor's resume finds the deploy
+// request open there and adopts it, unless an operator cancelled the apply:
+// no driver resumes a cancelled apply and the cancel reads only the stored
+// state, so the drive names the deploy request for the operator to close.
+// Either way the branch is kept.
 func TestResumeApply_RecordsTheDeployRequestBeforeWaitingOnIt(t *testing.T) {
 	const url = "https://app.planetscale.com/org/testdb/deploy-requests/42"
 	tests := []struct {
-		name      string
-		saveErr   error
-		wantLog   string
-		wantLevel string
+		name    string
+		saveErr error
+		// cancelCause is why the drive ends; nil is a handback.
+		cancelCause error
+		wantLog     string
+		wantLevel   string
 	}{
 		{
 			name:      "the save landed, so the successor resumes the deploy request",
@@ -1046,18 +1257,25 @@ func TestResumeApply_RecordsTheDeployRequestBeforeWaitingOnIt(t *testing.T) {
 			wantLevel: "INFO",
 		},
 		{
-			name:      "the save was refused, so the deploy request is named for the operator",
+			name:      "the save was refused, so the successor adopts the deploy request it finds open on the branch",
 			saveErr:   errors.New("apply apply-1a2b3c4d5e6f7890: storage unavailable"),
-			wantLog:   "resumed drive ended after its deploy request was created, but no save naming it landed; the driver that takes over cannot find this deploy request and will open another, so close it by hand",
-			wantLevel: "WARN",
+			wantLog:   "resumed drive ended after its deploy request was opened, but no save naming it landed; the driver that resumes the apply finds it open on the branch and adopts it",
+			wantLevel: "INFO",
+		},
+		{
+			name:        "the save was refused and an operator cancelled the apply, so the deploy request is named for the operator",
+			saveErr:     errors.New("apply apply-1a2b3c4d5e6f7890: storage unavailable"),
+			cancelCause: engine.ErrCancelledByOperator,
+			wantLog:     "resumed apply was cancelled after its deploy request was opened, but no save naming it landed, so the cancel cannot reach it; close it by hand",
+			wantLevel:   "WARN",
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			shortenEngineWaits(t)
-			ctx, cancel := context.WithCancel(t.Context())
-			defer cancel()
-			client := &pendingDeployRequestHandbackClient{cancel: cancel}
+			ctx, cancel := context.WithCancelCause(t.Context())
+			defer cancel(nil)
+			client := &pendingDeployRequestHandbackClient{cancel: func() { cancel(tt.cancelCause) }}
 			req := resumeRequest(t, &psMetadata{BranchName: "schemabot-testdb-1a2b"}, "apply-1a2b3c4d5e6f7890")
 			logRecord := captureApplyLogs(t, req)
 			var saved []*engine.ResumeState

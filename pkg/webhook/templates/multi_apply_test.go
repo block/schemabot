@@ -57,8 +57,8 @@ func TestRenderMultiDeploymentApplyComment_BarrierInProgress(t *testing.T) {
 	// Single next-action points at the cutover-ready deployment, even though the
 	// aggregate is still running. The apply was not deferred, so SchemaBot cuts
 	// eu over itself and the comment offers no command to run.
-	assert.Contains(t, out, "SchemaBot will cut over `eu` next — no action needed.")
-	assert.NotContains(t, out, "To cut over")
+	assert.Contains(t, out, "SchemaBot will run the cutover for `eu` next — no action needed.")
+	assert.NotContains(t, out, "To run the cutover")
 	assert.NotContains(t, out, "schemabot cutover")
 
 	// Per-deployment summary lines, in resolved order, with derived labels.
@@ -1130,7 +1130,7 @@ func TestRenderMultiDeploymentApplyComment_DeferredCutoverOffersCommand(t *testi
 		Details:     deferredCutoverDetails(),
 	})
 
-	assert.Contains(t, out, "To cut over `eu`:\n```\nschemabot cutover apply-123 -e production\n```")
+	assert.Contains(t, out, "To run the cutover for `eu`:\n```\nschemabot cutover apply-123 -e production\n```")
 	assert.NotContains(t, out, "--deployment")
 	assert.NotContains(t, out, "no action needed")
 }
@@ -1149,7 +1149,7 @@ func TestRenderMultiDeploymentApplyComment_NextActionNamesMultiTargetMember(t *t
 		Details:     deferredCutoverDetails(),
 	})
 
-	assert.Contains(t, out, "To cut over `primary/testapp-002`:")
+	assert.Contains(t, out, "To run the cutover for `primary/testapp-002`:")
 }
 
 // A member name is assembled from server config, so it reaches the comment as
@@ -1194,7 +1194,7 @@ func TestRenderMultiDeploymentApplyComment_HostileMemberNamesCannotWriteMarkdown
 		Details:     deferredCutoverDetails(),
 	})
 	assert.NotContains(t, cutover, "\n## Injected")
-	assert.Contains(t, cutover, "To cut over `` us` ## Injected [click](https://example.invalid) ``:")
+	assert.Contains(t, cutover, "To run the cutover for `` us` ## Injected [click](https://example.invalid) ``:")
 
 	// The automatic form names the member in the same prose position.
 	automatic := RenderMultiDeploymentApplyComment(MultiDeploymentApplyData{
@@ -1205,7 +1205,7 @@ func TestRenderMultiDeploymentApplyComment_HostileMemberNamesCannotWriteMarkdown
 		Environment: "production",
 	})
 	assert.NotContains(t, automatic, "\n## Injected")
-	assert.Contains(t, automatic, "SchemaBot will cut over `` us` ## Injected [click](https://example.invalid) `` next — no action needed.")
+	assert.Contains(t, automatic, "SchemaBot will run the cutover for `` us` ## Injected [click](https://example.invalid) `` next — no action needed.")
 }
 
 // Every control command addresses the whole apply, so a rollout writes its
@@ -1282,11 +1282,11 @@ func TestRenderMultiDeploymentApplyComment_LiveMemberKeepsStopBesideThePendingAc
 		"deferred cutover ready beside a copying sibling": {
 			ops:          []presentation.Operation{barrierOp("us", so.WaitingForCutover), barrierOp("eu", so.Running)},
 			deferCutover: true,
-			lead:         "To cut over `us`:\n```\nschemabot cutover apply-123 -e production\n```\n",
+			lead:         "To run the cutover for `us`:\n```\nschemabot cutover apply-123 -e production\n```\n",
 		},
 		"automatic cutover ready beside a copying sibling": {
 			ops:  []presentation.Operation{barrierOp("us", so.WaitingForCutover), barrierOp("eu", so.Running)},
-			lead: "SchemaBot will cut over `us` next — no action needed.\n",
+			lead: "SchemaBot will run the cutover for `us` next — no action needed.\n",
 		},
 		"revert window beside a running sibling": {
 			ops:  []presentation.Operation{rollingOp("us", so.RevertWindow), rollingOp("eu", so.Running)},
@@ -1393,8 +1393,8 @@ func TestRenderMultiDeploymentApplyComment_PausedRolloutWithPendingCutoverShares
 		deferCutover bool
 		cutoverLine  string
 	}{
-		{name: "deferred", deferCutover: true, cutoverLine: "To cut over `us`:\n```\nschemabot cutover apply-123 -e production\n```\n"},
-		{name: "automatic", cutoverLine: "SchemaBot will cut over `us` next — no action needed.\n"},
+		{name: "deferred", deferCutover: true, cutoverLine: "To run the cutover for `us`:\n```\nschemabot cutover apply-123 -e production\n```\n"},
+		{name: "automatic", cutoverLine: "SchemaBot will run the cutover for `us` next — no action needed.\n"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			out := RenderMultiDeploymentApplyComment(MultiDeploymentApplyData{
@@ -1653,7 +1653,8 @@ func TestRenderMultiDeploymentApplyComment_TargetThatAlreadyHadTheChangeIsLeftOu
 // counts line, no per-deployment list, and no section wrapping the table
 // lines: they sit under the status line. Once the rollout completes, the
 // final summary folds them into "Apply details", as a single-target completed
-// summary does. Beside a second deployment, each deployment keeps its section.
+// summary does, and the block's label states the outcome in place of the
+// status line. Beside a second deployment, each deployment keeps its section.
 // Neither layout names or counts the target that already had the change.
 func TestRenderMultiDeploymentApplyComment_SoleMultiTargetDeploymentHasNoWrapper(t *testing.T) {
 	converged := parallelTarget("primary", "testapp-003", so.Completed)
@@ -1676,7 +1677,7 @@ func TestRenderMultiDeploymentApplyComment_SoleMultiTargetDeploymentHasNoWrapper
 		lineTop string
 	}{
 		"status":  {RenderMultiDeploymentApplyComment(data), "\n✅ Rolled out to 2 targets\n\n"},
-		"summary": {RenderMultiDeploymentApplySummaryComment(data), "\n✅ Rolled out to 2 targets\n\n<details><summary>Apply details (1 table)</summary>\n\n"},
+		"summary": {RenderMultiDeploymentApplySummaryComment(data), "\n<details><summary>Apply details (1 table done on 2 targets)</summary>\n\n"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			out := tc.out
@@ -1756,7 +1757,8 @@ func TestRenderMultiDeploymentApplySummaryComment_SoleMultiTargetCountsTableChan
 	}
 
 	out := RenderMultiDeploymentApplySummaryComment(data)
-	assert.Contains(t, out, "<details><summary>Apply details (2 tables)</summary>\n\n")
+	assert.Contains(t, out, "<details><summary>Apply details (2 tables done on 3 targets)</summary>\n\n")
+	assert.NotContains(t, out, "✅ 2 tables done on 3 targets\n", "the label carries the outcome, so no status line repeats it:\n%s", out)
 	assert.Contains(t, out, "**`orders`**: ✅ Complete (3 targets)")
 	assert.Contains(t, out, "**`users`**: ✅ Complete (3 targets)")
 }
@@ -1780,12 +1782,13 @@ func TestRenderMultiDeploymentApplyComment_DeploymentThatAlreadyHadTheChangeIsLe
 		},
 	}
 
-	for name, out := range map[string]string{
-		"status":  RenderMultiDeploymentApplyComment(data),
-		"summary": RenderMultiDeploymentApplySummaryComment(data),
+	for name, tc := range map[string]struct{ out, outcome string }{
+		"status":  {RenderMultiDeploymentApplyComment(data), "\n✅ Rolled out to 2 targets\n"},
+		"summary": {RenderMultiDeploymentApplySummaryComment(data), "<summary>Apply details (1 table done on 2 targets)</summary>"},
 	} {
 		t.Run(name, func(t *testing.T) {
-			assert.Contains(t, out, "\n✅ Rolled out to 2 targets\n")
+			out := tc.out
+			assert.Contains(t, out, tc.outcome)
 			assert.NotContains(t, out, "eu", "the deployment that already had it is not named:\n%s", out)
 			assert.NotContains(t, out, "already had")
 		})
@@ -1843,13 +1846,15 @@ func TestRenderMultiDeploymentApplyComment_SoleMultiTargetStatusFollowsTheApply(
 			targetDetail("testapp_002", state.Task.Completed, addNote, 1000),
 		},
 	}
-	for name, out := range map[string]string{
-		"status":  RenderMultiDeploymentApplyComment(completed),
-		"summary": RenderMultiDeploymentApplySummaryComment(completed),
+	for name, tc := range map[string]struct{ out, outcome string }{
+		"status":  {RenderMultiDeploymentApplyComment(completed), "\n✅ Rolled back on both targets\n"},
+		"summary": {RenderMultiDeploymentApplySummaryComment(completed), "<summary>Apply details (1 table rolled back on 2 targets)</summary>"},
 	} {
 		t.Run("rollback "+name, func(t *testing.T) {
-			assert.Contains(t, out, "\n✅ Rolled back on both targets\n")
+			out := tc.out
+			assert.Contains(t, out, tc.outcome)
 			assert.NotContains(t, out, "Rolled out")
+			assert.NotContains(t, out, " done on ")
 		})
 	}
 
@@ -2198,6 +2203,61 @@ func TestRenderMultiDeploymentApplyComment_StoppedTableListsWhereEachTargetStopp
 
 	assert.Contains(t, out, "**`orders`**: ⏹️ Stopped\n", "%s", out)
 	assert.Contains(t, out, "- Targets: 2 (1 stopped, 1 complete)\n  - ✓ `testapp-001`: 1,000 rows\n  - ○ `testapp-002`: stopped at 40.00% · 400 / 1,000 rows\n", "%s", out)
+}
+
+// A rollout of `orders` then `refunds` table by table is stopped while both
+// targets are copying `orders`. `refunds` has not begun on either target, and
+// nothing begins it until the apply is started again, so its line reads as
+// stopped and not started rather than queued, the way the CLI's progress view
+// prints it, while `orders` still lists where each target stopped.
+func TestRenderMultiDeploymentApplyComment_StoppedRolloutTableNotBegunReadsStopped(t *testing.T) {
+	model := presentation.Derive([]presentation.Operation{
+		steppedTarget("testapp-001", so.Stopped, 1),
+		steppedTarget("testapp-002", so.Stopped, 1),
+		steppedTarget("testapp-001", so.Pending, 2),
+		steppedTarget("testapp-002", so.Pending, 2),
+	})
+	require.Equal(t, state.Apply.Stopped, model.State)
+	detail := func(database string, copied int64) *ApplyStatusCommentData {
+		d := tablesDetail(database,
+			TableProgressData{TableName: "orders", Status: state.Task.Stopped, RowsCopied: copied, RowsTotal: 1000, PercentComplete: int(copied * 100 / 1000)},
+			TableProgressData{TableName: "refunds", Status: state.Task.Pending},
+		)
+		d.State = state.Apply.Stopped
+		return d
+	}
+	out := renderTargets(model, detail("testapp_001", 300), detail("testapp_002", 400))
+
+	assert.Contains(t, out, "**`refunds`**: ⏹️ Stopped (not started)\n\n```sql\nALTER TABLE `refunds` ADD COLUMN `note` text;\n```\n\n", "%s", out)
+	assert.Contains(t, out, "- Targets: 2 (2 stopped)\n  - ○ `testapp-001`: stopped at 30.00% · 300 / 1,000 rows\n", "%s", out)
+	assert.NotContains(t, out, "Queued", "%s", out)
+	assert.NotContains(t, out, "queued", "%s", out)
+}
+
+// The same stopped rollout, but testapp-002's refunds was cancelled before it
+// began while testapp-001's was left to resume. The two targets ended in
+// different states, so the table keeps its target list rather than reading as
+// stopped everywhere.
+func TestRenderMultiDeploymentApplyComment_StoppedRolloutTableWithACancelledTargetKeepsItsList(t *testing.T) {
+	model := presentation.Derive([]presentation.Operation{
+		steppedTarget("testapp-001", so.Stopped, 1),
+		steppedTarget("testapp-002", so.Stopped, 1),
+		steppedTarget("testapp-001", so.Pending, 2),
+		steppedTarget("testapp-002", so.Cancelled, 2),
+	})
+	require.Equal(t, state.Apply.Stopped, model.State)
+	detail := func(database, refunds string) *ApplyStatusCommentData {
+		d := tablesDetail(database,
+			TableProgressData{TableName: "orders", Status: state.Task.Stopped, RowsCopied: 300, RowsTotal: 1000, PercentComplete: 30},
+			TableProgressData{TableName: "refunds", Status: refunds},
+		)
+		d.State = state.Apply.Stopped
+		return d
+	}
+	out := renderTargets(model, detail("testapp_001", state.Task.Pending), detail("testapp_002", state.Task.Cancelled))
+
+	assert.Contains(t, out, "**`refunds`**: ⏹️ Stopped\n", "%s", out)
+	assert.Contains(t, out, "- Targets: 2 (1 stopped, 1 cancelled)\n  - ○ `testapp-001`: stopped\n  - ○ `testapp-002`: cancelled\n", "%s", out)
 }
 
 // orders rolls out to four targets. testapp-002 fails, and the operator stops

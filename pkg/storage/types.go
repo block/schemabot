@@ -143,27 +143,39 @@ type Lock struct {
 
 	// DisclosedCopyDiscard records that the comment this pending confirmation
 	// was posted with told the operator applying would throw away an unfinished
-	// row copy on the target. It is a consent record, and its question is
-	// exactly "were they shown a discard at all?" — not which copy, or how
-	// many. An apply that finds a larger discard set than the one disclosed
-	// therefore still proceeds; narrowing that to the copies actually named
-	// needs the disclosed set persisted, not a flag.
-	//
-	// It travels with PendingPlanID and is written by the same statement, so the
-	// flag always describes the plan the confirm command loads. It is
-	// deliberately not the copy itself: a copy disposition is a reading of the
-	// target that is always re-read at apply time, and only this answer to "did
-	// they know?" has to be durable.
-	//
-	// The lock carries no environment dimension, so the flag alone does not say
-	// which environment the operator was shown. Readers pair it with the pinned
-	// plan's environment before treating it as consent for the apply at hand.
+	// row copy on the target the apply's own plan was planned against. It is
+	// kept for builds that read only the flag, which check it against that
+	// target's copies alone, so it is true exactly when DisclosedCopies includes
+	// one there (DisclosesPrimaryCopy): a disclosure of another target's copy
+	// never reads as consent to discard this one's. Consent is checked against
+	// DisclosedCopies.
 	//
 	// False for locks acquired outside the PR apply path (rollback, CLI) and for
-	// rows written before this column existed, which is the safe default — an
-	// unrecorded disclosure is treated as no disclosure, so the apply asks again
-	// rather than assuming consent.
+	// rows written before this column existed, which is the safe default.
 	DisclosedCopyDiscard bool
+
+	// DisclosedCopies are the unfinished copies the comment this pending
+	// confirmation was posted with told the operator applying throws away, each
+	// named by its target. It is a consent record: an apply proceeds over a
+	// discard only when every copy it would discard is one of these, so a copy
+	// that comes to be discarded after the operator was asked, on any target,
+	// stops the apply and asks again.
+	//
+	// It travels with PendingPlanID and is written by the same statement, so it
+	// always describes the plan the confirm command loads. It names the copies
+	// rather than recording their disposition: a disposition is a reading of the
+	// target that is always re-read at apply time, and only the answer to "were
+	// they shown this copy?" has to be durable.
+	//
+	// The lock carries no environment dimension, so readers pair it with the
+	// pinned plan's environment before treating it as consent for the apply at
+	// hand.
+	//
+	// Empty for locks acquired outside the PR apply path and for rows written by
+	// a build that recorded only DisclosedCopyDiscard. An unrecorded disclosure
+	// is treated as no disclosure, so the apply asks again rather than assuming
+	// consent.
+	DisclosedCopies []DisclosedCopy
 
 	// Acquirer records the verified caller that created this lock row, for
 	// deciding whose operator grant the lock falls under. Owner cannot answer
@@ -186,6 +198,32 @@ type Lock struct {
 
 	// UpdatedAt is when the lock was last updated.
 	UpdatedAt time.Time
+}
+
+// DisclosedCopy names one unfinished copy a confirmation comment disclosed as
+// discarded. Target is the member ID of the rollout member the copy is on, and
+// is empty for a copy on the target the apply's own plan was planned against.
+// It is the member ID rather than the name the comment shows, because that name
+// is qualified against the whole rollout and changes when a target is added.
+// Tables are sorted, so two readings of the same copy compare equal.
+type DisclosedCopy struct {
+	Target    string   `json:"target,omitempty"`
+	Namespace string   `json:"namespace,omitempty"`
+	Tables    []string `json:"tables,omitempty"`
+	Statement string   `json:"statement,omitempty"`
+}
+
+// Equal reports whether c and o name the same copy.
+func (c DisclosedCopy) Equal(o DisclosedCopy) bool {
+	return c.Target == o.Target && c.Namespace == o.Namespace && c.Statement == o.Statement && slices.Equal(c.Tables, o.Tables)
+}
+
+// DisclosesPrimaryCopy reports whether copies include one on the target the
+// apply's own plan was planned against. It is what DisclosedCopyDiscard is
+// written from, since a build that reads only the flag reads it as consent to
+// discard that target's copies and no other's.
+func DisclosesPrimaryCopy(copies []DisclosedCopy) bool {
+	return slices.ContainsFunc(copies, func(c DisclosedCopy) bool { return c.Target == "" })
 }
 
 // LockAcquirer is the verified caller behind a lock acquire.
@@ -317,6 +355,15 @@ type Check struct {
 	// at plan time and preserved across apply-state transitions. Empty for
 	// aggregate rows and for rows recorded before this field existed.
 	ChangeSummary string
+
+	// RolloutTargets and RolloutTargetsWithWork count the targets of a rollout
+	// of several and how many of them the change summary's work is on, so the
+	// aggregate title can say how far the change has rolled out. They are
+	// written with ChangeSummary and kept with it: a write that keeps the stored
+	// summary keeps the stored counts too. Zero when the summary describes no
+	// rollout of several targets.
+	RolloutTargets         int
+	RolloutTargetsWithWork int
 
 	// CreatedAt is when the check was created.
 	CreatedAt time.Time
@@ -1190,10 +1237,12 @@ type Apply struct {
 
 	// TakesOverApplyIDs names the stopped applies whose unfinished work this
 	// apply takes over, by row ID. It is read only when the apply is created
-	// through CreateWithTasksAndOperations or CreateWithGroupedOperations, which
-	// stamp each named apply's SupersededBy with this apply's identifier in the
-	// transaction that creates it, so the apply and the handoff become visible
-	// together or not at all. It is never stored on the new apply's own row.
+	// through CreateWithTasksAndOperations or CreateWithGroupedOperations, or
+	// when an operation is attached to it through AttachOperationWithTasks. Those
+	// paths stamp each named apply's SupersededBy with this apply's identifier in the
+	// transaction that creates the apply or attaches the operation, so the work
+	// and the handoff become visible together or not at all. It is never stored
+	// on this apply's own row.
 	TakesOverApplyIDs []int64
 
 	// Engine is the schema change engine: "spirit", "planetscale", etc.
@@ -1348,6 +1397,17 @@ type AppliedTarget struct {
 	Database    string
 	Environment string
 	Target      string
+}
+
+// DriverPool is one server's pool of drivers, its row in driver_pools.
+type DriverPool struct {
+	// ServerID identifies one run of a server's operator.
+	ServerID string
+	// Drivers is how many drivers the operator runs.
+	Drivers   int
+	CreatedAt time.Time
+	// UpdatedAt is the server's last heartbeat, at the database's clock.
+	UpdatedAt time.Time
 }
 
 // ApplyOperation represents one child row in the apply_operations table:
@@ -1771,20 +1831,260 @@ func CutoverRequestMetadata(applyOperationID int64) []byte {
 	return []byte(`{"` + cutoverRequestOperationMetadataKey + `":` + strconv.FormatInt(applyOperationID, 10) + `}`)
 }
 
-// CutoverOperationID returns the operation a cutover request is bound to, or 0
-// when the request names none. Metadata that does not parse is an error rather
-// than an unbound request, so a drive never takes a request it cannot read.
-func (r *ApplyControlRequest) CutoverOperationID() (int64, error) {
+// cutoverRequestOperationsMetadataKey binds a cutover request to every
+// operation free to cut over when the operator issued it. One command then cuts
+// over each of them, the way a deferred cutover releases every target that is
+// held at once, and still cannot pass on to an operation that became free
+// later.
+const cutoverRequestOperationsMetadataKey = "apply_operation_ids"
+
+// CutoverRequestSetMetadata returns the metadata that binds a cutover request
+// to the operations in ids. A single operation is bound exactly as
+// CutoverRequestMetadata binds it. A larger set also names its first operation
+// under the single-operation key, so a server that reads only that key takes
+// the request for that one operation rather than as an unbound request.
+func CutoverRequestSetMetadata(ids []int64) ([]byte, error) {
+	switch len(ids) {
+	case 0:
+		return nil, fmt.Errorf("a cutover request set needs at least one operation")
+	case 1:
+		return CutoverRequestMetadata(ids[0]), nil
+	}
+	sorted := slices.Clone(ids)
+	slices.Sort(sorted)
+	if len(slices.Compact(slices.Clone(sorted))) != len(sorted) {
+		return nil, fmt.Errorf("a cutover request set names an operation more than once: %v", ids)
+	}
+	payload := map[string]any{
+		cutoverRequestOperationMetadataKey:  sorted[0],
+		cutoverRequestOperationsMetadataKey: sorted,
+	}
+	metadata, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("encode cutover request set %v: %w", ids, err)
+	}
+	return metadata, nil
+}
+
+// cutoverRequestBinding is the decoded operation binding of a cutover request.
+type cutoverRequestBinding struct {
+	ApplyOperationID  int64   `json:"apply_operation_id"`
+	ApplyOperationIDs []int64 `json:"apply_operation_ids"`
+}
+
+// controlCommandMetadataKey records the operator command a control request
+// carries when it arrived from another plane, which sends the same command
+// more than once. A request that carries one is recorded once per command:
+// see ControlRequestStore.RequestPendingCommand.
+const controlCommandMetadataKey = "command_id"
+
+// WithControlCommandID returns metadata with commandID recorded as the
+// operator command the request carries. An empty commandID leaves metadata as
+// it is.
+func WithControlCommandID(metadata []byte, commandID string) ([]byte, error) {
+	if commandID == "" {
+		return metadata, nil
+	}
+	payload := map[string]any{}
+	if len(metadata) > 0 {
+		if err := json.Unmarshal(metadata, &payload); err != nil {
+			return nil, fmt.Errorf("parse control request metadata to record command %s: %w", commandID, err)
+		}
+	}
+	payload[controlCommandMetadataKey] = commandID
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("encode control request metadata with command %s: %w", commandID, err)
+	}
+	return encoded, nil
+}
+
+// NewControlCommandID names an operator command sent from another plane by
+// where it was issued (origin) and its place in the commands issued there
+// (sequence). Commands from one origin are ordered by sequence, so a data plane
+// can tell a delayed send of an earlier command from a newer command.
+func NewControlCommandID(origin, sequence int64) string {
+	return fmt.Sprintf("%d.%d", origin, sequence)
+}
+
+// parseControlCommandID splits a NewControlCommandID id into its origin and
+// sequence. ok is false for any other id, which is compared only for equality.
+func parseControlCommandID(commandID string) (origin, sequence int64, ok bool) {
+	originPart, sequencePart, found := strings.Cut(commandID, ".")
+	if !found {
+		return 0, 0, false
+	}
+	origin, err := strconv.ParseInt(originPart, 10, 64)
+	if err != nil {
+		return 0, 0, false
+	}
+	sequence, err = strconv.ParseInt(sequencePart, 10, 64)
+	if err != nil {
+		return 0, 0, false
+	}
+	return origin, sequence, true
+}
+
+// SettledByControlCommand reports whether a send of the operator command
+// commandID must leave r settled (ControlRequestStore.RequestPendingCommand):
+// r is settled and carries that command, or carries a later command from the
+// same origin (NewControlCommandID). A send of an earlier command arrives only
+// as a delayed re-send, since its origin issued a newer one since, so it never
+// retries work the newer command already settled.
+func (r *ApplyControlRequest) SettledByControlCommand(commandID string) (bool, error) {
+	if r == nil || commandID == "" || r.Status == ControlRequestPending {
+		return false, nil
+	}
+	recorded, err := r.ControlCommandID()
+	if err != nil {
+		return false, err
+	}
+	if recorded == commandID {
+		return true, nil
+	}
+	return supersedesControlCommand(recorded, commandID), nil
+}
+
+// supersedesControlCommand reports whether the recorded command was issued
+// after commandID by the same origin. Ids that do not both parse as
+// NewControlCommandID ids, or come from different origins, have no order.
+func supersedesControlCommand(recorded, commandID string) bool {
+	recordedOrigin, recordedSequence, ok := parseControlCommandID(recorded)
+	if !ok {
+		return false
+	}
+	origin, sequence, ok := parseControlCommandID(commandID)
+	if !ok {
+		return false
+	}
+	return recordedOrigin == origin && recordedSequence > sequence
+}
+
+// ControlCommandID returns the operator command a control request carries
+// (WithControlCommandID), or "" when it records none. Metadata that does not
+// parse is an error, so a request is never taken for a command it may not
+// carry.
+func (r *ApplyControlRequest) ControlCommandID() (string, error) {
 	if r == nil || len(r.Metadata) == 0 {
-		return 0, nil
+		return "", nil
 	}
-	var payload struct {
-		ApplyOperationID int64 `json:"apply_operation_id"`
+	var command struct {
+		CommandID string `json:"command_id"`
 	}
-	if err := json.Unmarshal(r.Metadata, &payload); err != nil {
-		return 0, fmt.Errorf("parse metadata of %s control request %d: %w", r.Operation, r.ID, err)
+	if err := json.Unmarshal(r.Metadata, &command); err != nil {
+		return "", fmt.Errorf("parse metadata of %s control request %d: %w", r.Operation, r.ID, err)
 	}
-	return payload.ApplyOperationID, nil
+	return command.CommandID, nil
+}
+
+func (r *ApplyControlRequest) cutoverBinding() (cutoverRequestBinding, error) {
+	var binding cutoverRequestBinding
+	if r == nil || len(r.Metadata) == 0 {
+		return binding, nil
+	}
+	if err := json.Unmarshal(r.Metadata, &binding); err != nil {
+		return binding, fmt.Errorf("parse metadata of %s control request %d: %w", r.Operation, r.ID, err)
+	}
+	return binding, nil
+}
+
+// CutoverOperationID returns the operation a cutover request is bound to, or 0
+// when the request names none. A request bound to a set of operations names
+// its first one here; CutoverOperationIDs returns the whole set. Metadata that
+// does not parse is an error rather than an unbound request, so a drive never
+// takes a request it cannot read.
+func (r *ApplyControlRequest) CutoverOperationID() (int64, error) {
+	binding, err := r.cutoverBinding()
+	if err != nil {
+		return 0, err
+	}
+	return binding.ApplyOperationID, nil
+}
+
+// CutoverOperationIDs returns every operation a cutover request is bound to,
+// sorted: the set when it names one, the single bound operation otherwise, and
+// nil when the request names none.
+func (r *ApplyControlRequest) CutoverOperationIDs() ([]int64, error) {
+	binding, err := r.cutoverBinding()
+	if err != nil {
+		return nil, err
+	}
+	if len(binding.ApplyOperationIDs) > 0 {
+		ids := slices.Clone(binding.ApplyOperationIDs)
+		slices.Sort(ids)
+		return ids, nil
+	}
+	if binding.ApplyOperationID != 0 {
+		return []int64{binding.ApplyOperationID}, nil
+	}
+	return nil, nil
+}
+
+// cutoverOutcomeUnknownSinceMetadataKey records when a cutover request's
+// outcome became unknown: a send whose answer was lost may have started the
+// cutover. Its value is an object keyed by the decimal apply_operation id the
+// send was for, "0" for a request not bound to an operation, each holding the
+// moment that operation's send first lost its answer. A request bound to a
+// set of operations is sent once per member, so the stamps are kept apart:
+// one member's lost answer says nothing about another member's first send. It
+// lives on the request row, so it outlasts the drive that sent the request
+// and is cleared when the row is re-armed for a new command.
+const cutoverOutcomeUnknownSinceMetadataKey = "outcome_unknown_since"
+
+// cutoverOutcomeUnknownStamps decodes the per-operation stamps under
+// cutoverOutcomeUnknownSinceMetadataKey from the request's metadata, and
+// returns the remaining metadata fields so a stamp can be written back
+// without losing them.
+func (r *ApplyControlRequest) cutoverOutcomeUnknownStamps() (map[string]json.RawMessage, map[string]time.Time, error) {
+	fields := map[string]json.RawMessage{}
+	stamps := map[string]time.Time{}
+	if r == nil || len(r.Metadata) == 0 {
+		return fields, stamps, nil
+	}
+	if err := json.Unmarshal(r.Metadata, &fields); err != nil {
+		return nil, nil, fmt.Errorf("parse metadata of %s control request %d: %w", r.Operation, r.ID, err)
+	}
+	raw, ok := fields[cutoverOutcomeUnknownSinceMetadataKey]
+	if !ok {
+		return fields, stamps, nil
+	}
+	if err := json.Unmarshal(raw, &stamps); err != nil {
+		return nil, nil, fmt.Errorf("parse %s of %s control request %d: %w", cutoverOutcomeUnknownSinceMetadataKey, r.Operation, r.ID, err)
+	}
+	return fields, stamps, nil
+}
+
+// CutoverOutcomeUnknownSince returns when the request's send for operationID
+// (0 for a request not bound to an operation) first lost its answer, or the
+// zero time when no send for that operation has.
+func (r *ApplyControlRequest) CutoverOutcomeUnknownSince(operationID int64) (time.Time, error) {
+	_, stamps, err := r.cutoverOutcomeUnknownStamps()
+	if err != nil {
+		return time.Time{}, err
+	}
+	return stamps[strconv.FormatInt(operationID, 10)], nil
+}
+
+// WithCutoverOutcomeUnknownSince returns the request's metadata with since
+// recorded as the moment its send for operationID (0 for a request not bound
+// to an operation) lost its answer, keeping every other key and every other
+// operation's stamp.
+func (r *ApplyControlRequest) WithCutoverOutcomeUnknownSince(operationID int64, since time.Time) ([]byte, error) {
+	fields, stamps, err := r.cutoverOutcomeUnknownStamps()
+	if err != nil {
+		return nil, err
+	}
+	stamps[strconv.FormatInt(operationID, 10)] = since.UTC()
+	raw, err := json.Marshal(stamps)
+	if err != nil {
+		return nil, fmt.Errorf("encode %s of %s control request %d: %w", cutoverOutcomeUnknownSinceMetadataKey, r.Operation, r.ID, err)
+	}
+	fields[cutoverOutcomeUnknownSinceMetadataKey] = raw
+	metadata, err := json.Marshal(fields)
+	if err != nil {
+		return nil, fmt.Errorf("encode metadata of %s control request %d: %w", r.Operation, r.ID, err)
+	}
+	return metadata, nil
 }
 
 // ForwardingControlRequestCaller is the requester recorded for a control
@@ -2177,6 +2477,35 @@ type TaskFilter struct {
 	Since            time.Time // Only tasks started after this time (optional)
 }
 
+// SummaryRotatedPast is the SummarizedState of a summary marker a resume
+// rotation rotated past after the apply had already reached its next terminal
+// state, so the summary it records describes no state the apply is in. The
+// marker stays active, so the next resume still rotates on it, but it names no
+// terminal state: the publish of the state the apply reached reclaims it, and
+// summary reconciliation posts that summary when the publish already lost its
+// claim to the marker.
+const SummaryRotatedPast = "rotated_past"
+
+// ResumeSummarySettlement is what a resume rotation's write did to the summary
+// marker it rotated for.
+type ResumeSummarySettlement int
+
+const (
+	// ResumeSummaryLeftInPlace means the marker no longer records the summary
+	// the rotation rotated for: it was already consumed, or a later terminal
+	// publish has claimed or posted it. The write left it alone.
+	ResumeSummaryLeftInPlace ResumeSummarySettlement = iota
+	// ResumeSummaryConsumed means the apply was still active, so the write
+	// superseded the marker and the apply's next terminal publish claims a
+	// fresh summary.
+	ResumeSummaryConsumed
+	// ResumeSummaryRotatedPast means the apply had already reached its next
+	// terminal state, so the write marked the marker SummaryRotatedPast: it
+	// stays active for the next resume and no longer blocks that state's
+	// summary.
+	ResumeSummaryRotatedPast
+)
+
 // ApplyComment tracks a GitHub PR comment associated with an apply.
 type ApplyComment struct {
 	// ID is the unique identifier (BIGINT AUTO_INCREMENT).
@@ -2230,6 +2559,17 @@ type ApplyComment struct {
 	// the GitHub comment are kept; SchemaBot just no longer treats it as the active
 	// comment for its state. Nil means active.
 	SupersededAt *time.Time
+
+	// SummarizedState is, on the summary marker, the terminal apply state its
+	// posted summary describes. A stopped apply can be started and reach
+	// another terminal state, and the marker of the stop's summary can still
+	// be active when it does, so the state is what tells the summary the
+	// current terminal state is owed from one already posted for it.
+	// SummaryRotatedPast when a resume rotated past the summary after the
+	// apply had already reached its next terminal state. Nil on other comment
+	// states, on a claim sentinel, and on a marker recorded before the state
+	// was tracked.
+	SummarizedState *string
 
 	// CreatedAt is when the comment was first posted.
 	CreatedAt time.Time

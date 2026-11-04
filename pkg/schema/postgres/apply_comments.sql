@@ -12,6 +12,7 @@ CREATE TABLE apply_comments (
   edit_count integer NOT NULL DEFAULT 0,
   last_edited_at timestamp DEFAULT NULL,
   superseded_at timestamp DEFAULT NULL,
+  summarized_state varchar(32) DEFAULT NULL,
   created_at timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
   PRIMARY KEY (id)

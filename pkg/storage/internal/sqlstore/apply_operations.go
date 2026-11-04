@@ -127,6 +127,30 @@ func (s *applyOperationStore) Get(ctx context.Context, id int64) (*storage.Apply
 	return scanApplyOperation(row)
 }
 
+// GetLocked returns a child row by ID read FOR UPDATE in its own
+// transaction, so the read waits for any claim transaction holding the row
+// and sees what that claim committed.
+func (s *applyOperationStore) GetLocked(ctx context.Context, id int64) (*storage.ApplyOperation, error) {
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	if err != nil {
+		return nil, fmt.Errorf("begin locked read transaction for apply_operation %d: %w", id, err)
+	}
+	defer rollbackTx(ctx, tx, "locked read of apply_operation")
+	op, err := scanApplyOperation(tx.QueryRowContext(ctx, `
+		SELECT `+applyOperationColumns+`
+		FROM apply_operations
+		WHERE id = ?
+		FOR UPDATE
+	`, id))
+	if err != nil {
+		return nil, fmt.Errorf("locked read of apply_operation %d: %w", id, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit locked read transaction for apply_operation %d: %w", id, err)
+	}
+	return op, nil
+}
+
 // GetByApplyAndDeployment returns the legacy unkeyed child row for
 // (apply_id, deployment), or nil if not found.
 func (s *applyOperationStore) GetByApplyAndDeployment(ctx context.Context, applyID int64, deployment string) (*storage.ApplyOperation, error) {
@@ -276,6 +300,49 @@ func (s *applyOperationStore) execStateUpdate(ctx context.Context, id int64, err
 func (s *applyOperationStore) UpdateState(ctx context.Context, id int64, newState string) error {
 	return s.execStateUpdate(ctx, id, "update apply_operations state",
 		[]JoinedUpdateAssignment{{Column: "state", Expr: "?"}}, newState)
+}
+
+// MarkStoppedNeverStarted returns an operation claimed out of pending to
+// stopped before its first dispatch, clearing the started_at its claim
+// stamped. See storage.ApplyOperationStore.
+func (s *applyOperationStore) MarkStoppedNeverStarted(ctx context.Context, id int64) error {
+	return s.execStateUpdate(ctx, id, "return never-started apply_operations row to stopped",
+		[]JoinedUpdateAssignment{{Column: "state", Expr: "?"}, {Column: "started_at", Expr: "NULL"}}, state.ApplyOperation.Stopped)
+}
+
+// MarkResumedRunning moves a resumed operation from resuming to running. The
+// start claim leaves the row resuming while its drive asks the engine to pick
+// the work up again; once the engine is working, running is what the row is.
+// The update is a compare-and-set on resuming, so a row a drive has since
+// settled, or a peer's state written over it, is left alone. It is fenced on
+// the operation lease for this row.
+func (s *applyOperationStore) MarkResumedRunning(ctx context.Context, id int64) (bool, error) {
+	lease, ok := storage.OperationLeaseFromContext(ctx)
+	if !ok {
+		return false, fmt.Errorf("mark resumed apply_operation %d running: no operation lease in context", id)
+	}
+	if !lease.Valid() || lease.OperationID != id {
+		return false, fmt.Errorf("operation lease for apply_operation %d does not authorize marking apply_operation %d running: %w", lease.OperationID, id, storage.ErrApplyLeaseLost)
+	}
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE apply_operations
+		SET state = ?, updated_at = NOW()
+		WHERE id = ? AND state = ? AND lease_token = ?
+	`, state.ApplyOperation.Running, id, state.ApplyOperation.Resuming, lease.Token)
+	if err != nil {
+		return false, fmt.Errorf("mark resumed apply_operation %d running: %w", id, err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("read rows affected marking resumed apply_operation %d running: %w", id, err)
+	}
+	if rows == 1 {
+		return true, nil
+	}
+	if err := ensureOperationLeaseStillOwned(ctx, s.db, lease); err != nil {
+		return false, err
+	}
+	return false, nil
 }
 
 // MarkStarted sets state=running and stamps started_at=NOW().
@@ -553,6 +620,23 @@ func (s *applyOperationStore) MarkFailed(ctx context.Context, id int64, errMsg s
 		state.ApplyOperation.Failed, nullString(errMsg))
 }
 
+// MarkFailedRetryable sets state=failed_retryable and error_message, leaving
+// completed_at untouched: the row is resumable, not terminal, so it carries no
+// completion time. The write goes through the same lease guard as MarkFailed.
+// Returns storage.ErrApplyOperationNotFound if no row matches the ID.
+//
+// Idempotent for the same reason as MarkFailed: re-issuing it against a row
+// already failed_retryable with the same message may report zero rows changed,
+// which checkUpdatedOrExists disambiguates from a missing row.
+func (s *applyOperationStore) MarkFailedRetryable(ctx context.Context, id int64, errMsg string) error {
+	return s.execStateUpdate(ctx, id, "mark apply_operation failed_retryable",
+		[]JoinedUpdateAssignment{
+			{Column: "state", Expr: "?"},
+			{Column: "error_message", Expr: "?"},
+		},
+		state.ApplyOperation.FailedRetryable, nullString(errMsg))
+}
+
 // MarkTerminal sets the given terminal state and stamps completed_at=NOW().
 // Returns storage.ErrApplyOperationNotFound if no row matches the ID.
 //
@@ -771,6 +855,21 @@ func (s *applyOperationStore) GetEngineResumeState(ctx context.Context, operatio
 		MigrationContext: contextVal.String,
 		Metadata:         metadata.String,
 	}, nil
+}
+
+// ClearEngineResumeState removes an operation's engine resume state under the
+// caller's lease guard, so the next GetEngineResumeState reports the state
+// missing. See storage.ApplyOperationStore.
+//
+// Idempotent: clearing a row whose state is already absent leaves the state
+// columns as they are, and checkUpdatedOrExists disambiguates an unchanged row
+// from a missing one.
+func (s *applyOperationStore) ClearEngineResumeState(ctx context.Context, operationID int64) error {
+	return s.execStateUpdate(ctx, operationID, "clear engine resume state for apply_operation",
+		[]JoinedUpdateAssignment{
+			{Column: "engine_resume_context", Expr: "NULL"},
+			{Column: "engine_resume_metadata", Expr: "NULL"},
+		})
 }
 
 // SaveProgressMetadata stores the engine's latest progress display metadata as
@@ -1334,6 +1433,126 @@ func (s *applyOperationStore) driverCapClause(staleClaimCutoff string) (string, 
 	return clause, append(stringArgs(occupyingStates), s.maxDriversPerApply)
 }
 
+// deferredCutoverRecoveryExclusion is deferredCutoverWorkExclusion for the
+// branches that recover a crashed drive: the stale-active arm and the
+// failed_retryable arm's crash-recovery branch. They are the only branches
+// that reach a crashed drive's operation when a stop or cancel is pending for
+// it: stop reconciliation leaves an apply with an active operation to them. A
+// driver skipping deferred work therefore still claims a deferred operation
+// here while its apply has a pending stop or cancel, so the request is
+// delivered even when every other driver is waiting on a cutover. Its drive
+// delivers the request and hands the apply back without driving it on.
+//
+// The fragment begins with AND and binds the arguments it returns.
+func (s *applyOperationStore) deferredCutoverRecoveryExclusion(filter storage.OperationClaimFilter) (string, []any) {
+	if !filter.SkipDeferredCutoverWork {
+		return "", nil
+	}
+	fragment := `
+				AND (
+					NOT ` + s.deferredCutoverApplySQL() + `
+					OR EXISTS (
+						SELECT 1
+						FROM apply_control_requests ending
+						WHERE ending.apply_id = apply_operations.apply_id
+							AND ending.operation IN (?, ?)
+							AND ending.status = ?
+					)
+				)`
+	return fragment, []any{storage.ControlOperationStop, storage.ControlOperationCancel, storage.ControlRequestPending}
+}
+
+// deferredCutoverWorkExclusion returns the predicate FindNextApplyOperation
+// adds to each arm that starts, resumes, or redispatches an operation when
+// filter skips deferred-cutover work, or "" when it does not. The branches that
+// recover a crashed drive take deferredCutoverRecoveryExclusion instead. It matches operations
+// whose apply defers its cutover, read from the same applies.options key the
+// cutover claim reads. The arms that only deliver a stop or cancel request
+// leave it out, so a driver skipping deferred work can still end it.
+//
+// The fragment begins with AND and binds no arguments.
+func (s *applyOperationStore) deferredCutoverWorkExclusion(filter storage.OperationClaimFilter) string {
+	if !filter.SkipDeferredCutoverWork {
+		return ""
+	}
+	return `
+				AND NOT ` + s.deferredCutoverApplySQL()
+}
+
+// deferredCutoverQueueClause keeps deferred applies from deadlocking the
+// drivers between them. A deferred operation keeps its driver until an
+// operator cuts its apply over, and the cutover waits for every operation of
+// the apply. Two deferred applies that each fit the fleet alone could otherwise
+// split it between them, each holding part of its operations with the rest
+// queued behind the other, and neither could ever be cut over.
+//
+// So deferred applies take drivers in turn: an operation of a deferred apply
+// does not start while a deferred apply ahead of it still has an operation
+// waiting to start. An apply's place is when it last started, its creation or
+// the start request that resumed it from stopped (markResumed), with the apply
+// id breaking ties. The apply at the front always gets the drivers it needs:
+// apply creation refuses one wider than the fleet, every apply ahead of it has
+// all its operations running and can be cut over, and no apply behind it takes
+// a driver it is waiting for. A failed_retryable operation keeps its apply's
+// place, since the driver its failed drive released is the one its retry
+// takes. A stopped apply holds no driver and its operations wait on nobody, so
+// it holds no place until a start resumes it, at the back.
+//
+// The gate holds back only operations that start work, on the arms that start
+// it; recovery and control requests are never queued. It matches nothing for
+// an apply that does not defer its cutover. It begins with AND and binds the
+// arguments it returns.
+func (s *applyOperationStore) deferredCutoverQueueClause() (string, []any) {
+	terminal := terminalApplyStates()
+	startPending := func(apply string) string {
+		return `EXISTS (
+							SELECT 1
+							FROM apply_control_requests AS resume
+							WHERE resume.apply_id = ` + apply + `.id
+								AND resume.operation = ?
+								AND resume.status = ?
+						)`
+	}
+	clause := `
+				AND NOT EXISTS (
+					SELECT 1
+					FROM applies AS mine
+					JOIN applies AS ahead
+						ON (COALESCE(ahead.resumed_at, ahead.created_at), ahead.id) < (COALESCE(mine.resumed_at, mine.created_at), mine.id)
+					JOIN apply_operations AS unstarted ON unstarted.apply_id = ahead.id
+					WHERE mine.id = apply_operations.apply_id
+						AND ` + s.dialect.JSONBooleanIsTrue("mine.options", []string{"defer_cutover"}) + `
+						AND ` + s.dialect.JSONBooleanIsTrue("ahead.options", []string{"defer_cutover"}) + `
+						AND (
+							ahead.state NOT IN (` + placeholders(len(terminal)) + `)
+							OR (ahead.state = ? AND ` + startPending("ahead") + `)
+						)
+						AND unstarted.operation_kind = ?
+						AND (
+							unstarted.state IN (?, ?)
+							OR (unstarted.state = ? AND ` + startPending("ahead") + `)
+						)
+				)`
+	args := stringArgs(terminal)
+	args = append(args,
+		state.Apply.Stopped, storage.ControlOperationStart, storage.ControlRequestPending,
+		storage.ApplyOperationKindWork,
+		state.ApplyOperation.Pending, state.ApplyOperation.FailedRetryable,
+		state.ApplyOperation.Stopped, storage.ControlOperationStart, storage.ControlRequestPending)
+	return clause, args
+}
+
+// deferredCutoverApplySQL matches an operation whose apply defers its cutover.
+// It binds no arguments.
+func (s *applyOperationStore) deferredCutoverApplySQL() string {
+	return `EXISTS (
+					SELECT 1
+					FROM applies AS deferred
+					WHERE deferred.id = apply_operations.apply_id
+						AND ` + s.dialect.JSONBooleanIsTrue("deferred.options", []string{"defer_cutover"}) + `
+				)`
+}
+
 // cutoverPhaseOperationStates lists the operation states a driver occupies
 // while it cuts an operation over. The cutover claim caps these on their own
 // lane (cutoverCapClause) rather than against every occupying state, so an
@@ -1485,7 +1704,7 @@ func releasedFailureExemptionArgs() []any {
 // lets one wide fan-out hold every driver on the plane for as long as its
 // slowest operation runs, so the pending arm is additionally capped at
 // maxDriversPerApply fresh leases per apply (see freshLeaseCountSQL).
-func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner string) (*storage.ApplyOperation, error) {
+func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner string, opts ...storage.OperationClaimOption) (*storage.ApplyOperation, error) {
 	if owner == "" {
 		return nil, fmt.Errorf("operator owner is required to claim apply_operation: %w", storage.ErrApplyLeaseLost)
 	}
@@ -1500,6 +1719,19 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 	parentClaimable := claimableParentSQL(placeholders(len(terminalApplyStates())))
 	staleClaimCutoff := s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime, LiteralIntervalAmount(uint64(storage.ApplyLeaseStaleAfter.Microseconds())), IntervalMicrosecond)
 	driverCap, driverCapArgs := s.driverCapClause(staleClaimCutoff)
+	// notDeferred is empty unless the claim skips deferred-cutover work. It
+	// binds no arguments, so adding it to an arm leaves every placeholder's
+	// position unchanged. notDeferredRecovery, its crash-recovery form, binds
+	// arguments that follow that arm's own; the stale-active arm and the
+	// failed_retryable arm's crash-recovery branch take it.
+	claimFilter := storage.BuildOperationClaimFilter(opts...)
+	notDeferred := s.deferredCutoverWorkExclusion(claimFilter)
+	notDeferredRecovery, notDeferredRecoveryArgs := s.deferredCutoverRecoveryExclusion(claimFilter)
+	// deferredQueue holds a deferred apply's operations back while a deferred
+	// apply ahead of it still has operations waiting to start, so deferred
+	// applies never split the drivers between them. It gates the arms that
+	// start work and binds arguments that follow the fan-out cap's.
+	deferredQueue, deferredQueueArgs := s.deferredCutoverQueueClause()
 
 	queryArgs := []any{state.ApplyOperation.Pending}
 	// Member-order gate for the pending claim (operationStartGateSQL): a work
@@ -1513,15 +1745,19 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 	// sibling no longer blocks later ones under "continue", or under "pause"
 	// once a release latches the rollout open.
 	queryArgs = append(queryArgs, operationStartGateArgs()...)
-	// Pending stop gate: a pending operation is not claimable for start while
-	// its apply has a pending stop control request. This is what makes `stop`
-	// halt remaining siblings under on_failure "continue" — without it, a
-	// continue-exempted pending sibling would still be claimed and started even
-	// though the user asked to stop the rollout. The gate covers only pending
-	// (not-yet-started) rows; an already-active row re-leasing a stale heartbeat
-	// is recovering work it started and is handled by the staleness clause below.
+	// Pending stop and cancel gate: a pending operation is not claimable for
+	// start while its apply has a pending stop or cancel control request. This
+	// is what makes `stop` halt remaining siblings under on_failure "continue"
+	// — without it, a continue-exempted pending sibling would still be claimed
+	// and started even though the user asked to stop the rollout — and what
+	// keeps a cancel from starting engine work on a target it is about to
+	// settle. The gate covers only pending (not-yet-started) rows; an
+	// already-active row re-leasing a stale heartbeat is recovering work it
+	// started and is handled by the staleness clause below. A rollout with
+	// nothing active left to carry the request is settled by stop
+	// reconciliation instead.
 	queryArgs = append(queryArgs,
-		storage.ControlOperationStop, storage.ControlRequestPending)
+		storage.ControlOperationStop, storage.ControlOperationCancel, storage.ControlRequestPending)
 	// Claimable-parent gate: a pending operation is claimable exactly while its
 	// parent apply is itself claimable. Starting a deployment belongs to a
 	// rollout a driver can still take somewhere; a terminal parent means the
@@ -1574,6 +1810,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 	// count as it settles, so the rest drain behind it exactly as the pending
 	// arm's do.
 	queryArgs = append(queryArgs, driverCapArgs...)
+	queryArgs = append(queryArgs, deferredQueueArgs...)
 	queryArgs = append(queryArgs, stringArgs(activeStates)...)
 	// Stale-active barrier-park exemption (see the staleness clause below): a
 	// multi-deployment operation parked at the cutover barrier under an
@@ -1584,6 +1821,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 	queryArgs = append(queryArgs,
 		state.ApplyOperation.WaitingForCutover,
 		storage.CutoverPolicyBarrier, storage.CutoverPolicyParallel)
+	queryArgs = append(queryArgs, notDeferredRecoveryArgs...)
 	// A stopped operation is reclaimable for start and for cancel, but the two
 	// arms are separate because only one of them terminates itself. The start
 	// claim always resolves — it either moves the row to resuming or the parent
@@ -1616,6 +1854,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 	queryArgs = append(queryArgs, operationStartGateArgs()...)
 	queryArgs = append(queryArgs, claimableParentArgs()...)
 	queryArgs = append(queryArgs, driverCapArgs...)
+	queryArgs = append(queryArgs, deferredQueueArgs...)
 	queryArgs = append(queryArgs,
 		state.ApplyOperation.Stopped,
 		storage.ControlOperationCancel, storage.ControlRequestPending)
@@ -1647,7 +1886,9 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 	queryArgs = append(queryArgs, state.ApplyOperation.FailedRetryable)
 	queryArgs = append(queryArgs, state.Apply.FailedRetryable, maxRecoveryAttempts, retryableRecoveryFreshnessDays)
 	queryArgs = append(queryArgs, driverCapArgs...)
+	queryArgs = append(queryArgs, deferredQueueArgs...)
 	queryArgs = append(queryArgs, stringArgs(activeStates)...)
+	queryArgs = append(queryArgs, notDeferredRecoveryArgs...)
 
 	// The stopped-row and failed_retryable clauses mirror ApplyStore.ClaimApplyByID.
 	// The failed_retryable clause carries no deployment-order gate, because
@@ -1750,11 +1991,11 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 					SELECT 1
 					FROM apply_control_requests cr
 					WHERE cr.apply_id = apply_operations.apply_id
-						AND cr.operation = ?
+						AND cr.operation IN (?, ?)
 						AND cr.status = ?
 				)
 				AND `+parentClaimable+`
-				AND `+driverCap+`
+				AND `+driverCap+notDeferred+deferredQueue+`
 			)
 			OR (
 				state IN (%s)
@@ -1768,7 +2009,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 						WHERE sibling.apply_id = apply_operations.apply_id
 							AND sibling.id <> apply_operations.id
 					)
-				)
+				)`+notDeferredRecovery+`
 			)
 			OR (
 				state = ?
@@ -1789,7 +2030,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 						AND `+parentClaimable+`
 					)
 				)
-				AND `+driverCap+`
+				AND `+driverCap+notDeferred+deferredQueue+`
 			)
 			OR (
 				state = ?
@@ -1836,7 +2077,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 						AND cr.status = ?
 						AND `+deferredDeployGuard+`
 				)
-				AND `+driverCap+`
+				AND `+driverCap+notDeferred+`
 			)
 			OR (
 				state = ?
@@ -1852,7 +2093,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 								-- Names no column of a, but belongs to this arm
 								-- alone: a deliberate redispatch starts work, so
 								-- it is capped; crash recovery below is not.
-								AND `+driverCap+`
+								AND `+driverCap+notDeferred+deferredQueue+`
 							)
 							OR (
 								a.state IN (%s)
@@ -1861,7 +2102,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 								-- alone: hoisted out of the EXISTS it would gate
 								-- deliberate redispatch too and stall every retry
 								-- for a staleness window.
-								AND apply_operations.updated_at < %s
+								AND apply_operations.updated_at < %s`+notDeferredRecovery+`
 							)
 						)
 				)
@@ -1892,9 +2133,9 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 		// heartbeat in the same write. WHERE state = ? guards against a concurrent
 		// transition landing between the SELECT and this UPDATE; RowsAffected == 0
 		// means another writer already moved the row, so we back off cleanly. The
-		// NOT EXISTS stop guard mirrors the SELECT's pending-stop gate so a stop
-		// request committed between the SELECT and this UPDATE still wins — the
-		// pending sibling is not started once a stop is pending.
+		// NOT EXISTS guard mirrors the SELECT's pending stop and cancel gate so a
+		// stop or cancel committed between the SELECT and this UPDATE still wins:
+		// the pending sibling is not started once either is pending.
 		result, err := tx.ExecContext(ctx, `
 			UPDATE apply_operations
 			SET state = ?, started_at = COALESCE(started_at, NOW()), updated_at = NOW(),
@@ -1903,10 +2144,10 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 				AND NOT EXISTS (
 					SELECT 1
 					FROM apply_control_requests cr
-					WHERE cr.apply_id = ? AND cr.operation = ? AND cr.status = ?
+					WHERE cr.apply_id = ? AND cr.operation IN (?, ?) AND cr.status = ?
 				)
 		`, state.ApplyOperation.Running, owner, leaseToken, ad.ID, state.ApplyOperation.Pending,
-			ad.ApplyID, storage.ControlOperationStop, storage.ControlRequestPending)
+			ad.ApplyID, storage.ControlOperationStop, storage.ControlOperationCancel, storage.ControlRequestPending)
 		if err != nil {
 			return nil, fmt.Errorf("claim pending apply_operation %d: %w", ad.ID, err)
 		}
@@ -2598,6 +2839,161 @@ func (s *applyOperationStore) MarkPendingStoppedByApply(ctx context.Context, app
 // writes are lease guarded exactly as MarkPendingStoppedByApply's.
 func (s *applyOperationStore) MarkPendingCancelledByApply(ctx context.Context, applyID int64) (int64, error) {
 	return s.markPendingByApply(ctx, applyID, state.ApplyOperation.Cancelled, "cancel", neverStartedRows)
+}
+
+// RequeueNeverStartedForStartByApply moves every stopped operation of an apply
+// that never started back to pending while a start request is pending and
+// neither a stop nor a cancel request is. A stop moved such a row from
+// pending to stopped before any driver claimed it, so it wrote nothing; the
+// pending start makes it queued work again. Back at pending, it starts through
+// the same claim gates it would have resumed through, and the rollout reads as
+// queued rather than stopped while the start works through the members ahead
+// of it.
+//
+// Only a row whose tasks are all still pending and that holds no engine
+// handle is requeued: a row a start claimed out of stopped carries no
+// started_at, so its tasks and its external_id are what show whether an
+// engine ever took up its work, and work an engine took up resumes from its
+// checkpoint rather than starting again.
+//
+// The requests are read in a transaction that takes its locks in the order
+// stopQueuedStart takes them, the apply row first, so a stop that withdraws the
+// start either commits before these reads, which then see the start completed,
+// or waits for the requeue and then finds the rows it stops pending. A cancel
+// intake share-locks the apply row too, so a first cancel serializes the same
+// way. The caller's lease is checked inside the same transaction, after the
+// apply row is locked.
+func (s *applyOperationStore) RequeueNeverStartedForStartByApply(ctx context.Context, applyID int64) (int64, error) {
+	// Every operation claim calls this, and almost none has a start pending,
+	// so a plain read settles the common case without locking the apply row
+	// its sibling claims also lock. A start recorded after this read is no
+	// different from one recorded after the transaction: the next claim
+	// requeues for it.
+	startPending, err := s.startRequestPending(ctx, applyID)
+	if err != nil {
+		return 0, err
+	}
+	if !startPending {
+		return 0, nil
+	}
+	var requeued int64
+	err = withLockRetry(ctx, s.classifier, fmt.Sprintf("requeue never-started operations of apply %d for its start", applyID), func() error {
+		var attemptErr error
+		requeued, attemptErr = s.requeueNeverStartedForStart(ctx, applyID)
+		return attemptErr
+	})
+	if err != nil {
+		return 0, err
+	}
+	return requeued, nil
+}
+
+// startRequestPending reports, without taking a lock, whether an apply has a
+// pending start request.
+func (s *applyOperationStore) startRequestPending(ctx context.Context, applyID int64) (bool, error) {
+	var one int
+	err := s.db.QueryRowContext(ctx, `
+		SELECT 1 FROM apply_control_requests
+		WHERE apply_id = ? AND operation = ? AND status = ?
+		LIMIT 1
+	`, applyID, storage.ControlOperationStart, storage.ControlRequestPending).Scan(&one)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("read pending start request of apply %d: %w", applyID, err)
+	}
+	return true, nil
+}
+
+func (s *applyOperationStore) requeueNeverStartedForStart(ctx context.Context, applyID int64) (int64, error) {
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	if err != nil {
+		return 0, fmt.Errorf("begin requeue of never-started operations for apply %d: %w", applyID, err)
+	}
+	defer rollbackTx(ctx, tx, "requeue never-started operations for start")
+
+	var applyLeaseToken sql.NullString
+	if err := tx.QueryRowContext(ctx, `SELECT lease_token FROM applies WHERE id = ? FOR UPDATE`, applyID).Scan(&applyLeaseToken); err != nil {
+		return 0, fmt.Errorf("lock apply %d to requeue its never-started operations: %w", applyID, err)
+	}
+	if err := requeueLeaseStillOwned(ctx, tx, applyID, applyLeaseToken); err != nil {
+		return 0, err
+	}
+	pending, err := pendingControlOperationsForUpdate(ctx, tx, applyID)
+	if err != nil {
+		return 0, err
+	}
+	if !pending[storage.ControlOperationStart] || pending[storage.ControlOperationStop] || pending[storage.ControlOperationCancel] {
+		return 0, nil
+	}
+	result, err := tx.ExecContext(ctx, `
+		UPDATE apply_operations
+		SET state = ?, updated_at = NOW()
+		WHERE apply_id = ? AND state = ? AND started_at IS NULL AND external_id IS NULL
+		  AND NOT EXISTS (
+		    SELECT 1 FROM tasks t
+		    WHERE t.apply_operation_id = apply_operations.id AND t.state <> ?
+		  )
+	`, state.ApplyOperation.Pending, applyID, state.ApplyOperation.Stopped, state.Task.Pending)
+	if err != nil {
+		return 0, fmt.Errorf("requeue never-started stopped operations of apply %d: %w", applyID, err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("read requeued operation rows of apply %d: %w", applyID, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("commit requeue of never-started operations for apply %d: %w", applyID, err)
+	}
+	return rows, nil
+}
+
+// requeueLeaseStillOwned fences a requeue on the caller's lease: the operation
+// lease when ctx carries one, otherwise the apply lease, whose current token is
+// read from the locked apply row.
+func requeueLeaseStillOwned(ctx context.Context, tx *rebindTx, applyID int64, applyLeaseToken sql.NullString) error {
+	if opLease, ok := storage.OperationLeaseFromContext(ctx); ok {
+		if !opLease.Valid() {
+			return fmt.Errorf("invalid operation lease to requeue never-started operations of apply %d: %w", applyID, storage.ErrApplyLeaseLost)
+		}
+		if opLease.ApplyID != applyID {
+			return fmt.Errorf("operation lease for apply %d does not authorize requeuing operations of apply %d: %w", opLease.ApplyID, applyID, storage.ErrApplyLeaseLost)
+		}
+		return ensureOperationLeaseStillOwned(ctx, tx, opLease)
+	}
+	lease, hasLease, err := applyLeaseFromContext(ctx, applyID)
+	if err != nil {
+		return err
+	}
+	if hasLease && (!applyLeaseToken.Valid || applyLeaseToken.String != lease.Token) {
+		return fmt.Errorf("apply lease for apply %d is no longer current to requeue its never-started operations: %w", applyID, storage.ErrApplyLeaseLost)
+	}
+	return nil
+}
+
+// pendingControlOperationsForUpdate locks an apply's control requests and
+// reports which operations are pending.
+func pendingControlOperationsForUpdate(ctx context.Context, tx *rebindTx, applyID int64) (map[storage.ControlOperation]bool, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT operation, status FROM apply_control_requests WHERE apply_id = ? FOR UPDATE`, applyID)
+	if err != nil {
+		return nil, fmt.Errorf("lock control requests of apply %d: %w", applyID, err)
+	}
+	defer utils.CloseAndLog(rows)
+	pending := make(map[storage.ControlOperation]bool)
+	for rows.Next() {
+		var operation, status string
+		if err := rows.Scan(&operation, &status); err != nil {
+			return nil, fmt.Errorf("scan control request of apply %d: %w", applyID, err)
+		}
+		if storage.ControlRequestStatus(status) == storage.ControlRequestPending {
+			pending[storage.ControlOperation(operation)] = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("read control requests of apply %d: %w", applyID, err)
+	}
+	return pending, nil
 }
 
 // sweptRows selects the operation rows a bulk sweep of an apply settles. The

@@ -202,7 +202,7 @@ func previewDeferStoppedOutput() {
 	}
 	WriteProgress(data)
 
-	fmt.Printf("Use '%s start -e staging <apply_id>' to resume.\n", cliname.Name())
+	fmt.Print(FormatNextCommand(ResumeLabel, ControlCommand("start", "<apply_id>", "staging")))
 }
 
 func previewDeferDetachedOutput() {
@@ -217,10 +217,10 @@ func previewDeferDetachedOutput() {
 	fmt.Printf("  %s status <apply_id>\n", cliname.Name())
 	fmt.Println()
 	fmt.Println("To proceed with cutover:")
-	fmt.Printf("  %s cutover -e staging <apply_id>\n", cliname.Name())
+	fmt.Printf("  %s cutover <apply_id> -e staging\n", cliname.Name())
 	fmt.Println()
 	fmt.Println("To abort the schema change:")
-	fmt.Printf("  %s stop -e staging <apply_id>\n", cliname.Name())
+	fmt.Printf("  %s stop <apply_id> -e staging\n", cliname.Name())
 }
 
 func previewDeferCuttingOutput() {

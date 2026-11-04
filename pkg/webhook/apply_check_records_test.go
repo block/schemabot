@@ -64,7 +64,7 @@ func TestUpdateCheckRecordForApplyStartRefusesDriftBlock(t *testing.T) {
 	}
 
 	apply := &storage.Apply{ID: 42, ApplyIdentifier: "apply-drift42"}
-	err := h.updateCheckRecordForApplyStart(t.Context(), nil, "octocat/hello-world", 1, schema, "production", apply)
+	err := h.updateCheckRecordForApplyStart(t.Context(), nil, "octocat/hello-world", 1, schema, "production", apply, applyChangeSummary{})
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "review-time deployment drift block present")
@@ -95,7 +95,7 @@ func TestUpdateCheckRecordForApplyStartRefusesNamespacePlacementBlock(t *testing
 
 	schema := &ghclient.SchemaRequestResult{Database: "orders", Type: "mysql"}
 	apply := &storage.Apply{ID: 43, ApplyIdentifier: "apply-placement43"}
-	err := h.updateCheckRecordForApplyStart(t.Context(), nil, "octocat/hello-world", 1, schema, "production", apply)
+	err := h.updateCheckRecordForApplyStart(t.Context(), nil, "octocat/hello-world", 1, schema, "production", apply, applyChangeSummary{})
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "namespace placement refused this environment's plan; fix the namespace placement")

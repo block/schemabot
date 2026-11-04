@@ -566,6 +566,7 @@ type fakeControlEngine struct {
 	cutoverErr              error
 	cutoverNoResult         bool
 	progressReq             *engine.ProgressRequest
+	progressCalls           int
 	progressResult          *engine.ProgressResult
 	progressErr             error
 	planResult              *engine.PlanResult
@@ -604,6 +605,7 @@ func (e *fakeControlEngine) Apply(context.Context, *engine.ApplyRequest) (*engin
 }
 
 func (e *fakeControlEngine) Progress(_ context.Context, req *engine.ProgressRequest) (*engine.ProgressResult, error) {
+	e.progressCalls++
 	e.progressReq = req
 	if e.progressResult != nil || e.progressErr != nil {
 		return e.progressResult, e.progressErr
@@ -696,13 +698,26 @@ func (s *exactProgressStorage) ApplyOperations() storage.ApplyOperationStore {
 
 type exactProgressApplyOperationStore struct {
 	storage.ApplyOperationStore
-	data            *storage.EngineResumeState
-	ops             []*storage.ApplyOperation
-	err             error
-	saveErr         error
-	progressSaveErr error
-	saved           *storage.EngineResumeState
-	progressWrites  int
+	data *storage.EngineResumeState
+	ops  []*storage.ApplyOperation
+	// claimedUnderLock is what GetLocked reads for an operation a claim was
+	// holding when the locked read began.
+	claimedUnderLock map[int64]*storage.ApplyOperation
+	err              error
+	saveErr          error
+	progressSaveErr  error
+	saved            *storage.EngineResumeState
+	progressWrites   int
+}
+
+// GetLocked answers from claimedUnderLock when it holds the row, standing in
+// for a claim that selected the row before the plain read and committed
+// before the locked read returned. Otherwise it answers like Get.
+func (s *exactProgressApplyOperationStore) GetLocked(ctx context.Context, operationID int64) (*storage.ApplyOperation, error) {
+	if op, ok := s.claimedUnderLock[operationID]; ok {
+		return op, nil
+	}
+	return s.Get(ctx, operationID)
 }
 
 func (s *exactProgressApplyOperationStore) Get(_ context.Context, operationID int64) (*storage.ApplyOperation, error) {
@@ -926,6 +941,40 @@ func (s *testControlRequestStore) RequestPending(_ context.Context, req *storage
 	return cloneTestControlRequest(stored), false, nil
 }
 
+func (s *testControlRequestStore) UpdateMetadata(_ context.Context, applyID int64, operation storage.ControlOperation, update func(*storage.ApplyControlRequest) ([]byte, error)) (bool, error) {
+	for _, req := range slices.Backward(s.requests) {
+		if req.ApplyID != applyID || req.Operation != operation {
+			continue
+		}
+		metadata, err := update(cloneTestControlRequest(req))
+		if err != nil {
+			return true, err
+		}
+		if metadata != nil {
+			req.Metadata = metadata
+		}
+		return true, nil
+	}
+	return false, nil
+}
+
+func (s *testControlRequestStore) RequestPendingCommand(ctx context.Context, req *storage.ApplyControlRequest) (*storage.ApplyControlRequest, bool, error) {
+	commandID, err := req.ControlCommandID()
+	if err != nil {
+		return nil, false, err
+	}
+	existing, err := s.GetByOperation(ctx, req.ApplyID, req.Operation)
+	if err != nil {
+		return nil, false, err
+	}
+	if settled, err := existing.SettledByControlCommand(commandID); err != nil {
+		return nil, false, err
+	} else if settled {
+		return existing, false, nil
+	}
+	return s.RequestPending(ctx, req)
+}
+
 func (s *testControlRequestStore) GetPending(_ context.Context, applyID int64, operation storage.ControlOperation) (*storage.ApplyControlRequest, error) {
 	for _, v := range slices.Backward(s.requests) {
 		req := v
@@ -934,6 +983,19 @@ func (s *testControlRequestStore) GetPending(_ context.Context, applyID int64, o
 		}
 	}
 	return nil, nil
+}
+
+func (s *testControlRequestStore) ListPending(_ context.Context, applyID int64) ([]*storage.ApplyControlRequest, error) {
+	var pending []*storage.ApplyControlRequest
+	for _, req := range s.requests {
+		if req.ApplyID == applyID && req.Status == storage.ControlRequestPending {
+			pending = append(pending, cloneTestControlRequest(req))
+		}
+	}
+	slices.SortStableFunc(pending, func(a, b *storage.ApplyControlRequest) int {
+		return strings.Compare(string(a.Operation), string(b.Operation))
+	})
+	return pending, nil
 }
 
 func (s *testControlRequestStore) GetByOperation(_ context.Context, applyID int64, operation storage.ControlOperation) (*storage.ApplyControlRequest, error) {
@@ -977,6 +1039,20 @@ func (s *testControlRequestStore) FailPending(_ context.Context, applyID int64, 
 		}
 	}
 	return nil
+}
+
+func (s *testControlRequestStore) SettlePendingRevision(_ context.Context, target *storage.ApplyControlRequest, status storage.ControlRequestStatus, errorMessage string) (bool, error) {
+	for _, req := range s.requests {
+		if req.ID != target.ID || req.Revision != target.Revision || req.Status != storage.ControlRequestPending {
+			continue
+		}
+		req.Status = status
+		if status == storage.ControlRequestFailed {
+			req.ErrorMessage = errorMessage
+		}
+		return true, nil
+	}
+	return false, nil
 }
 
 // RecordRemoteFailure mirrors the store's contract: a pending row is a live
@@ -1584,6 +1660,195 @@ func TestExecuteGroupedApplySaveFailureAfterAcceptPausesForRetry(t *testing.T) {
 		assert.True(t, state.IsState(task.State, state.Task.FailedRetryable),
 			"task must pause for operator retry, got %s", task.State)
 	}
+}
+
+// groupedStartFixture builds a fresh grouped Spirit drive over two tables whose
+// engine reports completed on its first poll, so a drive that goes on to poll
+// settles the apply as completed.
+func groupedStartFixture(taskUpdateErr func(*storage.Task) error) (*LocalClient, *storage.Apply, []*storage.Task, *storage.Plan, *snapshotApplyStore, *fakeControlEngine) {
+	apply := &storage.Apply{
+		ID: 42, ApplyIdentifier: "apply-grouped-start", Database: "testdb",
+		DatabaseType: storage.DatabaseTypeMySQL, State: state.Apply.Pending,
+	}
+	tasks := []*storage.Task{
+		{ID: 1, ApplyID: apply.ID, TaskIdentifier: "task-orders", Database: "testdb", Namespace: "testdb", TableName: "orders",
+			DDL: "ALTER TABLE `orders` ADD COLUMN `note` varchar(255)", DDLAction: "alter", State: state.Task.Pending},
+		{ID: 2, ApplyID: apply.ID, TaskIdentifier: "task-users", Database: "testdb", Namespace: "testdb", TableName: "users",
+			DDL: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)", DDLAction: "alter", State: state.Task.Pending},
+	}
+	plan := &storage.Plan{PlanIdentifier: "plan-grouped-start", Namespaces: map[string]*storage.NamespacePlanData{"testdb": {}}}
+	applyStore := &snapshotApplyStore{stored: *apply}
+	eng := &fakeControlEngine{progressResult: &engine.ProgressResult{State: engine.StateCompleted, Message: "Complete"}}
+	client := &LocalClient{
+		config:       LocalConfig{Database: "testdb", Type: storage.DatabaseTypeMySQL},
+		spiritEngine: eng,
+		storage: &exactProgressStorage{
+			applies: applyStore,
+			tasks: &exactProgressTaskStore{tasks: tasks, updateErr: func(_ context.Context, task *storage.Task) error {
+				if state.IsState(task.State, state.Task.Running) {
+					return taskUpdateErr(task)
+				}
+				return nil
+			}},
+			controlRequests: &testControlRequestStore{},
+			applyOperations: &exactProgressApplyOperationStore{},
+		},
+		heartbeatInterval:        time.Hour,
+		taskPollIntervalOverride: time.Millisecond,
+		logger:                   slog.Default(),
+	}
+	return client, apply, tasks, plan, applyStore, eng
+}
+
+// The engine has accepted the work, so a storage failure writing the tasks as
+// running is storage uncertainty, not a failed schema change. The drive stops
+// before polling, pauses the apply for operator retry rather than driving on
+// over tasks storage does not hold as running, and halts the accepted engine
+// work under its own claim as it returns.
+func TestExecuteGroupedApplyTaskStartWriteFailurePausesForRetry(t *testing.T) {
+	client, apply, tasks, plan, applyStore, eng := groupedStartFixture(func(*storage.Task) error {
+		return errors.New("storage unavailable")
+	})
+	halts := &haltRecordingControlEngine{fakeControlEngine: eng}
+	client.spiritEngine = halts
+	drive := driveContext(t.Context(), "token-a")
+
+	require.NoError(t, client.executeGroupedApply(drive, apply, tasks, plan, nil, false))
+
+	assert.True(t, state.IsState(applyStore.stored.State, state.Apply.FailedRetryable),
+		"apply must pause for operator retry, got %s", applyStore.stored.State)
+	assert.Contains(t, applyStore.stored.ErrorMessage, "mark task task-orders running for apply apply-grouped-start")
+	for _, task := range tasks {
+		assert.True(t, state.IsState(task.State, state.Task.FailedRetryable),
+			"task %s must pause for operator retry, got %s", task.TableName, task.State)
+	}
+	assert.Nil(t, eng.progressReq, "a drive that could not record the start never polls the engine")
+	assert.Equal(t, []string{driveWorkOwner(drive)}, halts.haltOwners, "the accepted work is halted under the drive's own owner")
+}
+
+// A task start write refused because another driver holds the lease is not the
+// schema change's failure and not this driver's to settle: the drive stands
+// down, leaves the apply and its tasks as stored for the lease holder, and
+// halts the engine work it started under its own claim.
+func TestExecuteGroupedApplyTaskStartWriteLeaseLostStandsDown(t *testing.T) {
+	client, apply, tasks, plan, applyStore, eng := groupedStartFixture(func(*storage.Task) error {
+		return fmt.Errorf("apply apply-grouped-start lease taken by another driver: %w", storage.ErrApplyLeaseLost)
+	})
+	halts := &haltRecordingControlEngine{fakeControlEngine: eng}
+	client.spiritEngine = halts
+	drive := driveContext(t.Context(), "token-a")
+
+	require.NoError(t, client.executeGroupedApply(drive, apply, tasks, plan, nil, false))
+
+	assert.True(t, state.IsState(applyStore.stored.State, state.Apply.Running),
+		"the apply stays as stored for the lease holder, got %s", applyStore.stored.State)
+	for _, task := range tasks {
+		assert.True(t, state.IsState(task.State, state.Task.Pending),
+			"task %s is not recorded running or settled, got %s", task.TableName, task.State)
+		assert.Nil(t, task.StartedAt)
+	}
+	assert.Nil(t, eng.progressReq, "a displaced drive never polls the engine")
+	assert.Equal(t, []string{driveWorkOwner(drive)}, halts.haltOwners, "the accepted work is halted under the drive's own owner")
+}
+
+// stateRecordingApplyStore records the state of every apply write it stores.
+type stateRecordingApplyStore struct {
+	*snapshotApplyStore
+	written []string
+}
+
+func (s *stateRecordingApplyStore) Update(ctx context.Context, apply *storage.Apply) error {
+	s.written = append(s.written, apply.State)
+	return s.snapshotApplyStore.Update(ctx, apply)
+}
+
+// A drive that holds only its operation's claim records its tasks as running
+// but leaves the parent apply's running state to the operator's projection: it
+// sends no parent write for the start, and goes on to poll the accepted work
+// rather than reading the skipped write as a failure.
+func TestExecuteGroupedApplyOperationScopedStartSkipsTheParentWrite(t *testing.T) {
+	client, apply, tasks, plan, applyStore, eng := groupedStartFixture(func(*storage.Task) error { return nil })
+	recorder := &stateRecordingApplyStore{snapshotApplyStore: applyStore}
+	client.storage.(*exactProgressStorage).applies = recorder
+	drive := storage.WithOperationLease(t.Context(), storage.OperationLease{ApplyID: apply.ID, OperationID: 7, Owner: "driver", Token: "op-token"})
+
+	require.NoError(t, client.executeGroupedApply(drive, apply, tasks, plan, nil, false))
+
+	assert.NotContains(t, recorder.written, state.Apply.Running, "the parent apply's running state is not this drive's to write")
+	for _, task := range tasks {
+		assert.NotNil(t, task.StartedAt, "task %s is recorded running", task.TableName)
+	}
+	assert.NotNil(t, eng.progressReq, "the drive polls the accepted work")
+}
+
+// refusingStateApplyStore refuses the write that records the apply in one
+// state and stores every other.
+type refusingStateApplyStore struct {
+	*snapshotApplyStore
+	refuse string
+	err    error
+}
+
+func (s *refusingStateApplyStore) Update(ctx context.Context, apply *storage.Apply) error {
+	if state.IsState(apply.State, s.refuse) {
+		return s.err
+	}
+	return s.snapshotApplyStore.Update(ctx, apply)
+}
+
+// A storage failure writing the apply's own running state, after the tasks
+// were recorded running, pauses the apply for operator retry the same way, and
+// leaves the in-memory apply at the state storage holds when the pause is
+// recorded from it.
+func TestExecuteGroupedApplyApplyStartWriteFailurePausesForRetry(t *testing.T) {
+	operationID := int64(7)
+	apply := &storage.Apply{
+		ID: 42, ApplyIdentifier: "apply-grouped-start-vitess", Database: "testdb",
+		DatabaseType: storage.DatabaseTypeVitess, Engine: storage.EnginePlanetScale, State: state.Apply.Pending,
+	}
+	tasks := []*storage.Task{{
+		ID: 7, ApplyID: apply.ID, ApplyOperationID: &operationID, TaskIdentifier: "task-grouped-start",
+		Database: "testdb", DatabaseType: storage.DatabaseTypeVitess, Namespace: "commerce", TableName: "users",
+		DDL: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)", DDLAction: "alter", State: state.Task.Pending,
+	}}
+	plan := &storage.Plan{PlanIdentifier: "plan-grouped-start-vitess", Namespaces: map[string]*storage.NamespacePlanData{"commerce": {}}}
+	snapshot := &snapshotApplyStore{stored: *apply}
+	eng := &fakeControlEngine{
+		applyResult: &engine.ApplyResult{
+			Accepted: true,
+			ResumeState: &engine.ResumeState{
+				MigrationContext: "ctx-grouped",
+				Metadata:         `{"branch_name":"branch-1","deploy_request_id":5}`,
+			},
+		},
+		progressResult: &engine.ProgressResult{State: engine.StateCompleted, Message: "Complete"},
+	}
+	client := &LocalClient{
+		config: LocalConfig{Database: "testdb", Type: storage.DatabaseTypeVitess},
+		storage: &exactProgressStorage{
+			applies: &refusingStateApplyStore{
+				snapshotApplyStore: snapshot,
+				refuse:             state.Apply.ValidatingDeployRequest,
+				err:                errors.New("storage unavailable"),
+			},
+			tasks:           &exactProgressTaskStore{tasks: tasks},
+			controlRequests: &testControlRequestStore{},
+			applyOperations: &exactProgressApplyOperationStore{},
+		},
+		planetscaleEngine:        eng,
+		heartbeatInterval:        time.Hour,
+		taskPollIntervalOverride: time.Millisecond,
+		logger:                   slog.Default(),
+	}
+
+	require.NoError(t, client.executeGroupedApply(t.Context(), apply, tasks, plan, nil, false))
+
+	assert.True(t, state.IsState(snapshot.stored.State, state.Apply.FailedRetryable),
+		"apply must pause for operator retry, got %s", snapshot.stored.State)
+	assert.Contains(t, snapshot.stored.ErrorMessage, "record apply apply-grouped-start-vitess")
+	assert.True(t, state.IsState(tasks[0].State, state.Task.FailedRetryable),
+		"task must pause for operator retry, got %s", tasks[0].State)
+	assert.Nil(t, eng.progressReq, "a drive that could not record the start never polls the engine")
 }
 
 // Rebuilt resume changes must preserve each task's namespace and table so
@@ -3001,6 +3266,378 @@ func TestLocalClient_ProcessPendingCutoverControlRequestRetriesWhenCutoverNotRea
 	require.NoError(t, err)
 	assert.Nil(t, pending, "the accepted cutover must complete the pending request")
 	assert.True(t, hasLogMessageContaining(logs.logs, "Cutover triggered (caller: cli:alice)"))
+}
+
+// unknownCutoverFixture is a drive parked at waiting_for_cutover with a pending
+// cutover request whose first send loses its answer.
+type unknownCutoverFixture struct {
+	client          *LocalClient
+	apply           *storage.Apply
+	task            *storage.Task
+	controlRequests *testControlRequestStore
+	engine          *fakeControlEngine
+	logs            *mockApplyLogStore
+}
+
+// newUnknownCutoverFixture builds the fixture; a non-zero operationID binds
+// the request and the task to that operation.
+func newUnknownCutoverFixture(t *testing.T, operationID int64) *unknownCutoverFixture {
+	t.Helper()
+	apply := &storage.Apply{
+		ID:              132,
+		ApplyIdentifier: "apply-cutover-outcome-unknown-local",
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+		State:           state.Apply.WaitingForCutover,
+	}
+	task := &storage.Task{
+		ID:             465,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task-cutover-outcome-unknown-local",
+		Database:       "testdb",
+		Namespace:      "testdb",
+		DatabaseType:   storage.DatabaseTypeMySQL,
+		TableName:      "users",
+		State:          state.Task.WaitingForCutover,
+	}
+	request := &storage.ApplyControlRequest{
+		ID:          1,
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationCutover,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "cli:alice",
+	}
+	var ops []*storage.ApplyOperation
+	if operationID != 0 {
+		task.ApplyOperationID = &operationID
+		request.Metadata = storage.CutoverRequestMetadata(operationID)
+		ops = []*storage.ApplyOperation{{ID: operationID, ApplyID: apply.ID}}
+	}
+	fx := &unknownCutoverFixture{
+		apply:           apply,
+		task:            task,
+		controlRequests: &testControlRequestStore{requests: []*storage.ApplyControlRequest{request}},
+		engine:          &fakeControlEngine{cutoverErr: engine.NewOutcomeUnknownError("drop sentinel table: connection reset by peer")},
+		logs:            &mockApplyLogStore{},
+	}
+	fx.client = &LocalClient{
+		config: LocalConfig{Database: "testdb", Type: storage.DatabaseTypeMySQL},
+		storage: &exactProgressStorage{
+			applies:         &exactProgressApplyStore{apply: apply},
+			tasks:           &exactProgressTaskStore{tasks: []*storage.Task{task}},
+			logs:            fx.logs,
+			controlRequests: fx.controlRequests,
+			applyOperations: &exactProgressApplyOperationStore{ops: ops},
+		},
+		spiritEngine: fx.engine,
+		logger:       slog.Default(),
+	}
+	return fx
+}
+
+// pending returns the stored pending cutover request, or nil.
+func (fx *unknownCutoverFixture) pending(t *testing.T) *storage.ApplyControlRequest {
+	t.Helper()
+	req, err := fx.controlRequests.GetPending(t.Context(), fx.apply.ID, storage.ControlOperationCutover)
+	require.NoError(t, err)
+	return req
+}
+
+// A cutover whose engine cannot tell whether the backend took it (the
+// connection broke while the request was in flight) must not be failed: the
+// cutover may be completing. The request stays pending and records when its
+// outcome became unknown, the apply stays cutting_over, and the next tick sends
+// the cutover again. A resend that fails before reaching the database (here a
+// refused connection) says nothing about the first send, so the request still
+// stays pending; the resend that is accepted completes it.
+func TestLocalClient_ProcessPendingCutoverControlRequestKeepsRequestPendingWhenOutcomeUnknown(t *testing.T) {
+	fx := newUnknownCutoverFixture(t, 0)
+	tasks := []*storage.Task{fx.task}
+
+	require.NoError(t, fx.client.processPendingCutoverControlRequest(t.Context(), fx.apply, tasks))
+	assert.Equal(t, 1, fx.engine.cutoverCount)
+	pending := fx.pending(t)
+	require.NotNil(t, pending, "an unknown outcome must keep the cutover request pending for the next tick")
+	since, err := pending.CutoverOutcomeUnknownSince(0)
+	require.NoError(t, err)
+	assert.False(t, since.IsZero(), "the request row records when its outcome became unknown, so a later drive keeps the window")
+	assert.Equal(t, state.Apply.CuttingOver, fx.apply.State, "the cutover may have taken, so the apply is not restored")
+	assert.True(t, hasLogMessageContaining(fx.logs.logs, "Cutover outcome unknown"))
+	assert.False(t, hasLogMessageContaining(fx.logs.logs, "Cutover failed"), "an unknown outcome must not record a failure in the timeline")
+
+	fx.engine.cutoverErr = errors.New("ping database for cutover: dial tcp 10.0.0.1:3306: connect: connection refused")
+	require.NoError(t, fx.client.processPendingCutoverControlRequest(t.Context(), fx.apply, tasks))
+	assert.Equal(t, 2, fx.engine.cutoverCount)
+	pending = fx.pending(t)
+	require.NotNil(t, pending, "a failed resend must not settle a request whose first send may have cut over")
+	resent, err := pending.CutoverOutcomeUnknownSince(0)
+	require.NoError(t, err)
+	assert.True(t, since.Equal(resent), "a resend keeps the time the outcome first became unknown")
+	assert.Equal(t, state.Apply.CuttingOver, fx.apply.State)
+	assert.False(t, hasLogMessageContaining(fx.logs.logs, "Cutover failed"), "a failed resend must not record a failure in the timeline")
+
+	fx.engine.cutoverErr = nil
+	require.NoError(t, fx.client.processPendingCutoverControlRequest(t.Context(), fx.apply, tasks))
+	assert.Equal(t, 3, fx.engine.cutoverCount)
+	assert.Nil(t, fx.pending(t), "the accepted cutover must complete the pending request")
+}
+
+// A database that stays unreachable for the whole window settles the request
+// as unconfirmed instead of keeping it pending forever. The message does not
+// claim the cutover failed, and the apply returns to waiting_for_cutover, which
+// any cutover state progress reports outranks.
+func TestLocalClient_ProcessPendingCutoverControlRequestSettlesAnUnknownOutcomeAfterTheWindow(t *testing.T) {
+	fx := newUnknownCutoverFixture(t, 0)
+	stamped, err := fx.controlRequests.requests[0].WithCutoverOutcomeUnknownSince(0, time.Now().Add(-cutoverOutcomeUnknownWindow-time.Minute))
+	require.NoError(t, err)
+	fx.controlRequests.requests[0].Metadata = stamped
+	fx.apply.State = state.Apply.CuttingOver
+	fx.engine.cutoverErr = errors.New("ping database for cutover: dial tcp 10.0.0.1:3306: connect: connection refused")
+
+	err = fx.client.processPendingCutoverControlRequest(t.Context(), fx.apply, []*storage.Task{fx.task})
+	require.Error(t, err)
+	assert.Nil(t, fx.pending(t), "the window bounds how long the request stays pending")
+	require.Len(t, fx.controlRequests.requests, 1)
+	assert.Equal(t, storage.ControlRequestFailed, fx.controlRequests.requests[0].Status)
+	assert.Equal(t, cutoverOutcomeUnconfirmedMessage, fx.controlRequests.requests[0].ErrorMessage)
+	assert.Equal(t, state.Apply.WaitingForCutover, fx.apply.State, "an unconfirmed cutover must not leave the apply wedged in cutting_over")
+}
+
+// The same holds for a cutover request bound to one operation of a grouped
+// apply: an unknown outcome keeps the request pending, recorded on the row
+// without losing the binding, a failed resend keeps it pending, and the window
+// settles it as unconfirmed.
+func TestLocalClient_TakeBoundCutoverRequestKeepsRequestPendingWhenOutcomeUnknown(t *testing.T) {
+	const operationID int64 = 77
+	fx := newUnknownCutoverFixture(t, operationID)
+	take := func() error {
+		return fx.client.takeBoundCutoverRequest(t.Context(), fx.apply, fx.pending(t), operationID, slog.Default())
+	}
+
+	require.NoError(t, take())
+	pending := fx.pending(t)
+	require.NotNil(t, pending, "an unknown outcome must keep the bound cutover request pending")
+	bound, err := pending.CutoverOperationID()
+	require.NoError(t, err)
+	assert.Equal(t, operationID, bound, "recording the unknown outcome keeps the request bound to its operation")
+	since, err := pending.CutoverOutcomeUnknownSince(operationID)
+	require.NoError(t, err)
+	assert.False(t, since.IsZero())
+
+	fx.engine.cutoverErr = errors.New("ping database for cutover: dial tcp 10.0.0.1:3306: connect: connection refused")
+	require.NoError(t, take())
+	require.NotNil(t, fx.pending(t), "a failed resend must not settle the bound request")
+	assert.False(t, hasLogMessageContaining(fx.logs.logs, "Cutover failed"), "an unknown outcome must not record a failure in the timeline")
+
+	stamped, err := fx.controlRequests.requests[0].WithCutoverOutcomeUnknownSince(operationID, time.Now().Add(-cutoverOutcomeUnknownWindow-time.Minute))
+	require.NoError(t, err)
+	fx.controlRequests.requests[0].Metadata = stamped
+	require.Error(t, take())
+	assert.Nil(t, fx.pending(t), "the window bounds how long the bound request stays pending")
+	assert.Equal(t, cutoverOutcomeUnconfirmedMessage, fx.controlRequests.requests[0].ErrorMessage)
+	assert.Equal(t, 3, fx.engine.cutoverCount)
+	assert.True(t, hasLogMessageContaining(fx.logs.logs, cutoverOutcomeUnconfirmedMessage), "settling the request closes the timeline's unknown-outcome entry")
+}
+
+// secondReadFailsTaskStore answers the first task read and fails every later
+// one, standing in for a storage outage that begins after the handler has
+// read the apply's tasks and before the resend reaches the engine.
+type secondReadFailsTaskStore struct {
+	*exactProgressTaskStore
+	calls int
+}
+
+func (s *secondReadFailsTaskStore) GetByApplyID(ctx context.Context, id int64) ([]*storage.Task, error) {
+	s.calls++
+	if s.calls >= 2 {
+		return nil, errors.New("storage read timed out")
+	}
+	return s.exactProgressTaskStore.GetByApplyID(ctx, id)
+}
+
+// A resend that fails before it reaches the engine says as little about the
+// send that lost its answer as a resend the engine fails: the request stays
+// pending inside the window instead of being failed and the apply restored.
+func TestResendStorageErrorBeforeEngineKeepsRequestPending(t *testing.T) {
+	fx := newUnknownCutoverFixture(t, 0)
+	stamped, err := fx.controlRequests.requests[0].WithCutoverOutcomeUnknownSince(0, time.Now().Add(-time.Second))
+	require.NoError(t, err)
+	fx.controlRequests.requests[0].Metadata = stamped
+	fx.apply.State = state.Apply.CuttingOver
+	base := fx.client.storage.(*exactProgressStorage)
+	base.tasks = &secondReadFailsTaskStore{exactProgressTaskStore: base.tasks.(*exactProgressTaskStore)}
+
+	require.NoError(t, fx.client.processPendingCutoverControlRequest(t.Context(), fx.apply, []*storage.Task{fx.task}))
+
+	assert.Equal(t, 0, fx.engine.cutoverCount)
+	assert.NotNil(t, fx.pending(t), "a resend that never reached the engine must leave the request pending")
+	assert.Equal(t, state.Apply.CuttingOver, fx.apply.State, "the first send may have cut over, so the apply is not restored")
+	assert.False(t, hasLogMessageContaining(fx.logs.logs, "Cutover failed"))
+}
+
+// Once a send has lost its answer, a resend the backend turns away as not
+// ready is held inside the same window: a fresh stamp keeps the request
+// pending, an expired one settles it as unconfirmed and restores the apply.
+func TestLocalClient_ProcessPendingCutoverControlRequestBoundsANotReadyResendByTheWindow(t *testing.T) {
+	t.Run("fresh stamp stays pending", func(t *testing.T) {
+		fx := newUnknownCutoverFixture(t, 0)
+		stamped, err := fx.controlRequests.requests[0].WithCutoverOutcomeUnknownSince(0, time.Now().Add(-time.Second))
+		require.NoError(t, err)
+		fx.controlRequests.requests[0].Metadata = stamped
+		fx.apply.State = state.Apply.CuttingOver
+		fx.engine.cutoverErr = engine.NewNotReadyError("cutover gate not staged yet")
+
+		require.NoError(t, fx.client.processPendingCutoverControlRequest(t.Context(), fx.apply, []*storage.Task{fx.task}))
+		assert.Equal(t, 1, fx.engine.cutoverCount)
+		require.NotNil(t, fx.pending(t), "a not-ready resend inside the window keeps the request pending")
+		assert.Equal(t, state.Apply.CuttingOver, fx.apply.State)
+	})
+
+	t.Run("expired stamp settles as unconfirmed", func(t *testing.T) {
+		fx := newUnknownCutoverFixture(t, 0)
+		stamped, err := fx.controlRequests.requests[0].WithCutoverOutcomeUnknownSince(0, time.Now().Add(-cutoverOutcomeUnknownWindow-time.Minute))
+		require.NoError(t, err)
+		fx.controlRequests.requests[0].Metadata = stamped
+		fx.apply.State = state.Apply.CuttingOver
+		fx.engine.cutoverErr = engine.NewNotReadyError("cutover gate not staged yet")
+
+		require.Error(t, fx.client.processPendingCutoverControlRequest(t.Context(), fx.apply, []*storage.Task{fx.task}))
+		assert.Nil(t, fx.pending(t), "a not-ready resend must not keep a request pending past the window")
+		require.Len(t, fx.controlRequests.requests, 1)
+		assert.Equal(t, storage.ControlRequestFailed, fx.controlRequests.requests[0].Status)
+		assert.Equal(t, cutoverOutcomeUnconfirmedMessage, fx.controlRequests.requests[0].ErrorMessage)
+		assert.Equal(t, state.Apply.WaitingForCutover, fx.apply.State)
+		assert.True(t, hasLogMessageContaining(fx.logs.logs, cutoverOutcomeUnconfirmedMessage))
+	})
+}
+
+// The bound path holds a stamped request's not-ready resend inside the same
+// window.
+func TestLocalClient_TakeBoundCutoverRequestBoundsANotReadyResendByTheWindow(t *testing.T) {
+	const operationID int64 = 77
+	t.Run("fresh stamp stays pending", func(t *testing.T) {
+		fx := newUnknownCutoverFixture(t, operationID)
+		stamped, err := fx.controlRequests.requests[0].WithCutoverOutcomeUnknownSince(operationID, time.Now().Add(-time.Second))
+		require.NoError(t, err)
+		fx.controlRequests.requests[0].Metadata = stamped
+		fx.engine.cutoverErr = engine.NewNotReadyError("cutover gate not staged yet")
+
+		require.NoError(t, fx.client.takeBoundCutoverRequest(t.Context(), fx.apply, fx.pending(t), operationID, slog.Default()))
+		assert.Equal(t, 1, fx.engine.cutoverCount)
+		require.NotNil(t, fx.pending(t))
+	})
+
+	t.Run("expired stamp settles as unconfirmed", func(t *testing.T) {
+		fx := newUnknownCutoverFixture(t, operationID)
+		stamped, err := fx.controlRequests.requests[0].WithCutoverOutcomeUnknownSince(operationID, time.Now().Add(-cutoverOutcomeUnknownWindow-time.Minute))
+		require.NoError(t, err)
+		fx.controlRequests.requests[0].Metadata = stamped
+		fx.engine.cutoverErr = engine.NewNotReadyError("cutover gate not staged yet")
+
+		require.Error(t, fx.client.takeBoundCutoverRequest(t.Context(), fx.apply, fx.pending(t), operationID, slog.Default()))
+		assert.Nil(t, fx.pending(t))
+		assert.Equal(t, cutoverOutcomeUnconfirmedMessage, fx.controlRequests.requests[0].ErrorMessage)
+		assert.True(t, hasLogMessageContaining(fx.logs.logs, cutoverOutcomeUnconfirmedMessage))
+	})
+}
+
+// A request bound to a set of operations is sent once per member, and one
+// member's lost answer is stamped under that member alone: a sibling's first
+// send is not a resend, so a refusal from it fails the request at once rather
+// than being held until the stamped member's window closes.
+func TestLocalClient_CutOverBoundOperationDoesNotInheritASiblingsUnknownOutcome(t *testing.T) {
+	const stampedID, siblingID int64 = 77, 78
+	fx := newUnknownCutoverFixture(t, stampedID)
+	metadata, err := storage.CutoverRequestSetMetadata([]int64{stampedID, siblingID})
+	require.NoError(t, err)
+	fx.controlRequests.requests[0].Metadata = metadata
+	stamped, err := fx.controlRequests.requests[0].WithCutoverOutcomeUnknownSince(stampedID, time.Now().Add(-cutoverOutcomeUnknownWindow-time.Minute))
+	require.NoError(t, err)
+	fx.controlRequests.requests[0].Metadata = stamped
+	siblingOp := siblingID
+	siblingTask := &storage.Task{
+		ID:               466,
+		ApplyID:          fx.apply.ID,
+		ApplyOperationID: &siblingOp,
+		TaskIdentifier:   "task-cutover-outcome-unknown-local-sibling",
+		Database:         "testdb",
+		Namespace:        "testdb",
+		DatabaseType:     storage.DatabaseTypeMySQL,
+		TableName:        "orders",
+		State:            state.Task.WaitingForCutover,
+	}
+	base := fx.client.storage.(*exactProgressStorage)
+	base.tasks.(*exactProgressTaskStore).tasks = append(base.tasks.(*exactProgressTaskStore).tasks, siblingTask)
+	ops := base.applyOperations.(*exactProgressApplyOperationStore)
+	ops.ops = append(ops.ops, &storage.ApplyOperation{ID: siblingID, ApplyID: fx.apply.ID})
+	fx.engine.cutoverErr = errors.New("access denied for user 'spirit'@'%'")
+	failRequest := func(reason string) error {
+		return failPendingControlRequests(t.Context(), fx.client.storage, fx.apply, storage.ControlOperationCutover, reason)
+	}
+
+	accepted, err := fx.client.cutOverBoundOperation(t.Context(), fx.apply, fx.pending(t), siblingID, slog.Default(), failRequest)
+	require.Error(t, err)
+	assert.False(t, accepted)
+	assert.Equal(t, 1, fx.engine.cutoverCount)
+	assert.Nil(t, fx.pending(t), "the sibling's own refusal settles the request")
+	assert.Equal(t, storage.ControlRequestFailed, fx.controlRequests.requests[0].Status)
+	assert.Contains(t, fx.controlRequests.requests[0].ErrorMessage, "access denied")
+	assert.NotEqual(t, cutoverOutcomeUnconfirmedMessage, fx.controlRequests.requests[0].ErrorMessage)
+	assert.True(t, hasLogMessageContaining(fx.logs.logs, "Cutover failed"))
+	siblingSince, err := fx.controlRequests.requests[0].CutoverOutcomeUnknownSince(siblingID)
+	require.NoError(t, err)
+	assert.True(t, siblingSince.IsZero(), "the sibling's send was answered, so it is not stamped")
+	stampedSince, err := fx.controlRequests.requests[0].CutoverOutcomeUnknownSince(stampedID)
+	require.NoError(t, err)
+	assert.False(t, stampedSince.IsZero(), "the stamped member keeps its own stamp")
+}
+
+// stampCutoverOutcomeUnknown writes only to the row it was sent from: a row
+// that has since been re-armed for a new command, settled, or replaced is
+// left alone, and an existing stamp for the operation is kept.
+func TestStampCutoverOutcomeUnknownLeavesAChangedRowAlone(t *testing.T) {
+	sent := &storage.ApplyControlRequest{
+		ID:        1,
+		ApplyID:   132,
+		Operation: storage.ControlOperationCutover,
+		Status:    storage.ControlRequestPending,
+		Revision:  3,
+	}
+	apply := &storage.Apply{ID: sent.ApplyID, ApplyIdentifier: "apply-stamp-guard"}
+	tests := []struct {
+		name   string
+		stored func(*storage.ApplyControlRequest)
+	}{
+		{name: "replaced row", stored: func(r *storage.ApplyControlRequest) { r.ID = 2 }},
+		{name: "re-armed row", stored: func(r *storage.ApplyControlRequest) { r.Revision = sent.Revision + 1 }},
+		{name: "settled row", stored: func(r *storage.ApplyControlRequest) { r.Status = storage.ControlRequestFailed }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			stored := *sent
+			stored.Metadata = storage.CutoverRequestMetadata(77)
+			tt.stored(&stored)
+			store := &exactProgressStorage{controlRequests: &testControlRequestStore{requests: []*storage.ApplyControlRequest{&stored}}}
+
+			require.NoError(t, stampCutoverOutcomeUnknown(t.Context(), store, apply, sent, 0, time.Now(), discardLogger()))
+			assert.JSONEq(t, string(storage.CutoverRequestMetadata(77)), string(stored.Metadata), "a row the send did not come from is never stamped")
+		})
+	}
+
+	t.Run("matching row keeps its first stamp", func(t *testing.T) {
+		stored := *sent
+		first := time.Now().Add(-time.Minute).Truncate(time.Second)
+		metadata, err := stored.WithCutoverOutcomeUnknownSince(0, first)
+		require.NoError(t, err)
+		stored.Metadata = metadata
+		store := &exactProgressStorage{controlRequests: &testControlRequestStore{requests: []*storage.ApplyControlRequest{&stored}}}
+
+		require.NoError(t, stampCutoverOutcomeUnknown(t.Context(), store, apply, sent, 0, time.Now(), discardLogger()))
+		since, err := stored.CutoverOutcomeUnknownSince(0)
+		require.NoError(t, err)
+		assert.True(t, first.Equal(since), "the window is measured from the first lost answer")
+	})
 }
 
 // A drive claim that reattaches to the engine's durable checkpoint records one

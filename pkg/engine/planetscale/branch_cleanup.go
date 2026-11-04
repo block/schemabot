@@ -105,9 +105,34 @@ func deployRequestNeverDeployed(dr *ps.DeployRequest) bool {
 }
 
 // deployOutcomeUnknownKeepsDeployRequestLog is logged when a drive fails with a
-// deploy whose outcome is unknown, so the failed-apply cleanup leaves the
-// deploy request and its branch for the recovery that re-reads them.
+// deploy whose outcome is unknown and the apply pauses for recovery, so the
+// failed-apply cleanup leaves the deploy request and its branch for the
+// recovery that re-reads them.
 const deployOutcomeUnknownKeepsDeployRequestLog = "deploy outcome is unknown; leaving the deploy request and its branch for the recovery that re-reads the deploy request"
+
+// deployOutcomeUnknownApplyFailingLog is logged when a drive fails with a
+// deploy whose outcome is unknown and the apply is failing rather than
+// pausing, so no recovery will re-read the deploy request.
+const deployOutcomeUnknownApplyFailingLog = "deploy outcome is unknown and the apply is failing; the deploy request and its branch are left in place because a deploy may be running; " + reconcileDeployOfFailedApply
+
+// leaveDeployRequestOfUnknownDeployOutcome logs why the cleanup of a drive
+// whose deploy outcome is unknown (engine.OutcomeUnknownError) leaves the
+// deploy request and its branch untouched. The deploy call failed without a
+// refusal from PlanetScale, and the engine has already judged that no read of
+// the deploy request shows the deploy did not start: a deploy still in flight
+// can leave it reading ready. A cleanup read is no better evidence, so closing
+// on it could close out a deploy that is running. When the error is retryable
+// the drive pauses the apply and recovery re-reads this same deploy request,
+// deploying it only if it still reads ready; otherwise the apply fails and the
+// operator reconciles the deploy request.
+func leaveDeployRequestOfUnknownDeployOutcome(logger *slog.Logger, org, database string, number uint64, branch string, cause error) {
+	attrs := []any{"organization", org, "planetscale_database", database, "deploy_request", number, "branch", branch, "apply_error", cause}
+	if engine.IsRetryable(cause) {
+		logger.Warn(deployOutcomeUnknownKeepsDeployRequestLog, attrs...)
+		return
+	}
+	logger.Error(deployOutcomeUnknownApplyFailingLog, attrs...)
+}
 
 // retireDeployRequestOfFailedApply closes the deploy request a failed apply
 // created and deletes the branch the apply created for it, when the deploy

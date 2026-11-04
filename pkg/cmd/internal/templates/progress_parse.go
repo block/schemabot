@@ -124,6 +124,12 @@ type TableProgress struct {
 	// target left to run, so a target still pending on it never starts it and
 	// reads as not started rather than queued.
 	RolloutSettled bool
+	// Resuming marks a table of a resuming apply. While no target has moved
+	// it on from where the stop left it (presentation.AwaitingResume), its
+	// stopped progress is from before the stop and whether the copy continues
+	// from its checkpoint is not known yet, so it reads as resuming without a
+	// percent.
+	Resuming bool
 }
 
 // ShardProgress contains per-shard progress for template rendering.

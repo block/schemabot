@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 )
@@ -25,6 +26,45 @@ func pendingControlRequest(ctx context.Context, store storage.Storage, apply *st
 		return nil, fmt.Errorf("load pending %s control request for apply %s: %w", operation, apply.ApplyIdentifier, err)
 	}
 	return controlReq, nil
+}
+
+// pendingControlOperations is the set of control operations pending for an
+// apply as of one read. A drive's poll consults several operations, and nearly
+// always none is pending, so it reads them all in one query and runs only the
+// processors whose operation is in the set. The set only gates: a processor it
+// lets through loads its own request again, so it acts on the stored row and
+// never on this snapshot. A request recorded after the read is answered on the
+// next poll.
+type pendingControlOperations map[storage.ControlOperation]struct{}
+
+// loadPendingControlOperations reads the operations pending for an apply.
+func loadPendingControlOperations(ctx context.Context, store storage.Storage, apply *storage.Apply) (pendingControlOperations, error) {
+	if store == nil {
+		return nil, fmt.Errorf("storage is not available")
+	}
+	controlStore := store.ControlRequests()
+	if controlStore == nil {
+		return nil, fmt.Errorf("control request store is not available")
+	}
+	requests, err := controlStore.ListPending(ctx, apply.ID)
+	if err != nil {
+		return nil, fmt.Errorf("list pending control requests for apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	pending := make(pendingControlOperations, len(requests))
+	for _, req := range requests {
+		pending[req.Operation] = struct{}{}
+	}
+	return pending, nil
+}
+
+// has reports whether any of the operations is pending.
+func (p pendingControlOperations) has(operations ...storage.ControlOperation) bool {
+	for _, operation := range operations {
+		if _, ok := p[operation]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 // controlRequestAccepted reports whether the engine has accepted a control
@@ -310,14 +350,18 @@ func SettlePendingCutoverAfterStop(ctx context.Context, store storage.Storage, l
 	if controlReq == nil {
 		return nil
 	}
-	boundID, err := controlReq.CutoverOperationID()
+	boundIDs, err := controlReq.CutoverOperationIDs()
 	if err != nil {
-		return fmt.Errorf("read the operation the pending cutover of apply %s is for: %w", apply.ApplyIdentifier, err)
+		return fmt.Errorf("read the operations the pending cutover of apply %s is for: %w", apply.ApplyIdentifier, err)
 	}
-	if boundID != 0 {
-		return settleBoundPendingCutover(ctx, store, logger, apply, controlReq, boundID, func(*storage.ApplyOperation) string {
-			return cutoverSupersededByStopMessage
-		})
+	supersededByStop := func(*storage.ApplyOperation) string { return cutoverSupersededByStopMessage }
+	switch len(boundIDs) {
+	case 0:
+		// An unbound request is failed as superseded below.
+	case 1:
+		return settleBoundPendingCutover(ctx, store, logger, apply, controlReq, boundIDs[0], supersededByStop)
+	default:
+		return settleCutoverSet(ctx, store, logger, apply, controlReq, boundIDs, supersededByStop)
 	}
 	return failPendingCutover(ctx, store, logger, apply, controlReq, cutoverSupersededByStopMessage)
 }
@@ -340,14 +384,18 @@ func SettlePendingCutoverForResolvedApply(ctx context.Context, store storage.Sto
 	if controlReq == nil {
 		return nil
 	}
-	boundID, err := controlReq.CutoverOperationID()
+	boundIDs, err := controlReq.CutoverOperationIDs()
 	if err != nil {
-		return fmt.Errorf("read the operation the pending cutover of apply %s is for: %w", apply.ApplyIdentifier, err)
+		return fmt.Errorf("read the operations the pending cutover of apply %s is for: %w", apply.ApplyIdentifier, err)
 	}
-	if boundID != 0 {
-		return settleBoundPendingCutover(ctx, store, logger, apply, controlReq, boundID, func(op *storage.ApplyOperation) string {
-			return boundCutoverNotAppliedMessage(apply, op)
-		})
+	notApplied := func(op *storage.ApplyOperation) string { return boundCutoverNotAppliedMessage(apply, op) }
+	switch len(boundIDs) {
+	case 0:
+		// An unbound request is settled from the apply's own state below.
+	case 1:
+		return settleBoundPendingCutover(ctx, store, logger, apply, controlReq, boundIDs[0], notApplied)
+	default:
+		return settleCutoverSet(ctx, store, logger, apply, controlReq, boundIDs, notApplied)
 	}
 	switch {
 	case cutoverRequestResolvedByApplyState(apply.State):
@@ -653,6 +701,38 @@ func failPendingControlRequests(ctx context.Context, store storage.Storage, appl
 	return nil
 }
 
+// settlePendingControlRequestRevision settles controlReq as completed or failed
+// only while its row still carries the revision the caller evaluated, so a
+// drive that decided on one command never settles a later command re-armed on
+// the same row. A row that has moved on is left to the drive evaluating the
+// command it now carries. remoteIDs are the remote applies a failure message
+// may name, kept out of the operator-facing text.
+func settlePendingControlRequestRevision(ctx context.Context, store storage.Storage, logger *slog.Logger, apply *storage.Apply, controlReq *storage.ApplyControlRequest, status storage.ControlRequestStatus, errorMessage string, remoteIDs ...string) error {
+	if store == nil {
+		return fmt.Errorf("storage is not available")
+	}
+	if err := ensureApplyLeaseForControlRequest(ctx, store, apply, controlReq.Operation); err != nil {
+		return err
+	}
+	controlStore := store.ControlRequests()
+	if controlStore == nil {
+		return fmt.Errorf("control request store is not available")
+	}
+	if status == storage.ControlRequestFailed {
+		errorMessage = apply.OperatorFacingMessage(errorMessage, remoteIDs...)
+	}
+	settled, err := controlStore.SettlePendingRevision(ctx, controlReq, status, errorMessage)
+	if err != nil {
+		return fmt.Errorf("settle pending %s control request for apply %s as %s: %w", controlReq.Operation, apply.ApplyIdentifier, status, err)
+	}
+	if !settled {
+		logger.InfoContext(ctx, "pending control request was not settled: the request this drive evaluated has already been settled or replaced by a newer command",
+			append(apply.LogAttrs(), "operation", controlReq.Operation, "requested_by", controlRequestCaller(controlReq),
+				"request_revision", controlReq.Revision, "status", status)...)
+	}
+	return nil
+}
+
 // controlRefusalMessage renders the reason the executing side gave for refusing
 // a control request. A refusal that arrives without a reason still has to read
 // as an answer to the operator's command rather than a bare "not accepted", so
@@ -779,6 +859,103 @@ func restoreApplyStateAfterUnacceptedCutover(ctx context.Context, store storage.
 	}
 	logger.InfoContext(ctx, "restored apply state after the data plane did not accept the cutover",
 		append(apply.MutableLogAttrs(), "marked_state", marked.State)...)
+	return nil
+}
+
+// cutoverOutcomeUnknownWindow bounds how long a cutover request stays pending
+// once a send of it has lost its answer. Each progress tick sends it again, so
+// a broken connection that heals settles it within seconds; a database that
+// stays unreachable this long settles it as unconfirmed (CO-2), and neither
+// the drive's poll budget nor its liveness bounds the wait on its own, since
+// the engine's in-memory progress keeps answering.
+const cutoverOutcomeUnknownWindow = 5 * time.Minute
+
+// cutoverOutcomeUnconfirmedMessage answers a cutover request whose outcome was
+// still unknown when the window closed. It does not claim the cutover failed:
+// the restored apply state is outranked by any cutover state progress reports.
+var cutoverOutcomeUnconfirmedMessage = fmt.Sprintf("SchemaBot could not confirm the cutover: the database did not answer for %d minutes after it was sent. The schema change's progress shows whether it ran; if it is still waiting for cutover, run cutover again.", int(cutoverOutcomeUnknownWindow.Minutes()))
+
+// cutoverOutcomeStillUnknown reports whether a send of a cutover request left
+// its outcome unknown. The engine says so for the send that lost its answer
+// and for every resend that errs; a resend the backend turns away as not ready
+// settles nothing about the send that may have started the cutover either, so
+// once since is set it keeps the request inside the window rather than
+// retrying outside it.
+func cutoverOutcomeStillUnknown(err error, since time.Time) bool {
+	return engine.IsOutcomeUnknown(err) || (engine.IsNotReady(err) && !since.IsZero())
+}
+
+// holdCutoverRequestWithUnknownOutcome keeps a cutover request pending after
+// a send whose outcome is unknown, and reports when the request has been
+// unknown for longer than cutoverOutcomeUnknownWindow so the caller settles
+// it. operationID names the operation the send was for, 0 for a request not
+// bound to one. since is when that operation's send first lost its answer,
+// zero for the send that just did: that send stamps the request row, so the
+// window survives a lease handover and an error from a later resend is never
+// read as the outcome of the send that may have started the cutover.
+func holdCutoverRequestWithUnknownOutcome(ctx context.Context, store storage.Storage, apply *storage.Apply, controlReq *storage.ApplyControlRequest, operationID int64, since, now time.Time, sendErr error, logger *slog.Logger, attrs ...any) (settle bool, err error) {
+	attrs = append(append(apply.MutableLogAttrs(), attrs...), "requested_by", controlRequestCaller(controlReq), "error", sendErr)
+	if since.IsZero() {
+		if err := stampCutoverOutcomeUnknown(ctx, store, apply, controlReq, operationID, now, logger); err != nil {
+			return false, err
+		}
+		logger.Warn("pending cutover request has an unknown outcome; the request stays pending and is sent again at the next progress tick", attrs...)
+		return false, nil
+	}
+	unknownFor := now.Sub(since)
+	if unknownFor < cutoverOutcomeUnknownWindow {
+		logger.Warn("pending cutover request still has an unknown outcome; the request stays pending and is sent again at the next progress tick",
+			append(attrs, "unknown_for", unknownFor)...)
+		return false, nil
+	}
+	logger.Error("pending cutover request outcome could not be confirmed within the window; the request is settled as unconfirmed",
+		append(attrs, "unknown_for", unknownFor, "window", cutoverOutcomeUnknownWindow)...)
+	return true, nil
+}
+
+// stampCutoverOutcomeUnknown records on controlReq's row when its send for
+// operationID (0 for a request not bound to an operation) lost its answer. A
+// row that has since been settled or re-armed for a new command is left
+// alone, and so is an existing stamp for the operation.
+func stampCutoverOutcomeUnknown(ctx context.Context, store storage.Storage, apply *storage.Apply, controlReq *storage.ApplyControlRequest, operationID int64, now time.Time, logger *slog.Logger) error {
+	controlStore := store.ControlRequests()
+	if controlStore == nil {
+		return fmt.Errorf("record unknown cutover outcome for apply %s: control request store is not available", apply.ApplyIdentifier)
+	}
+	_, err := controlStore.UpdateMetadata(ctx, apply.ID, storage.ControlOperationCutover, func(req *storage.ApplyControlRequest) ([]byte, error) {
+		if req.ID != controlReq.ID || req.Revision != controlReq.Revision || req.Status != storage.ControlRequestPending {
+			logger.Debug("cutover request was settled or re-armed after it was sent; its unknown outcome is not recorded",
+				append(apply.MutableLogAttrs(), "status", req.Status, "revision", req.Revision, "operation_id", operationID)...)
+			return nil, nil
+		}
+		since, err := req.CutoverOutcomeUnknownSince(operationID)
+		if err != nil {
+			return nil, err
+		}
+		if !since.IsZero() {
+			logger.Debug("cutover request already records when its outcome became unknown",
+				append(apply.MutableLogAttrs(), "outcome_unknown_since", since, "operation_id", operationID)...)
+			return nil, nil
+		}
+		return req.WithCutoverOutcomeUnknownSince(operationID, now)
+	})
+	if err != nil {
+		return fmt.Errorf("record unknown cutover outcome for apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	return nil
+}
+
+// settleCutoverRequestUnconfirmed fails, through fail, a cutover request whose
+// outcome stayed unknown for the whole window, and closes the timeline's
+// unknown-outcome entry so the resend it announced does not read as still
+// coming. The timeline entry follows the settle so a failed settle, which
+// leaves the request pending for the next drive, announces nothing.
+func (c *LocalClient) settleCutoverRequestUnconfirmed(ctx context.Context, apply *storage.Apply, fail func(reason string) error) error {
+	if err := fail(cutoverOutcomeUnconfirmedMessage); err != nil {
+		return err
+	}
+	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelWarn, storage.LogEventInfo, storage.LogSourceSchemaBot,
+		cutoverOutcomeUnconfirmedMessage, "", "")
 	return nil
 }
 

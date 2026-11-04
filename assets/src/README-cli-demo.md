@@ -5,12 +5,12 @@ through the production Go templates and interactive `commands.WatchModel`:
 
 - `cli-plan-apply.gif`: inspect an index plan, confirm with yes, and follow an apply to completion
 - `cli-ops.gif`: list databases, pull a live schema with lint findings, show the running changes above the latest finished ones, then follow engine logs through completion
-- `cli-cutover.gif`: finish copying, wait for the swap, and press Enter to cut over
+- `cli-cutover.gif`: finish copying, wait for the swap, and press Enter to run the cutover
 - `cli-mysql-throttle.gif`: see a commit-latency throttle pause the copy, read the labeled docs link, and watch the copy resume
 - `cli-rollback.gif`: review the DDL to restore an index, confirm with yes, then follow the new apply to completion
 - `cli-stop.gif`: press s through the real handler, await Stopped, then start and follow the resumed change to completion
 - `cli-vitess.gif`: create a deploy request, deploy with Enter, follow four shards, and close the revert window
-- `cli-multi-target.gif`: apply an index to an environment with four targets, follow their parallel copies, and watch each cut over as its copy finishes
+- `cli-multi-target.gif`: apply an index to an environment with four targets, follow their parallel copies, and watch each run its cutover as its copy finishes
 - `cli-target.gif`: apply the same index to one target with `--target` and follow it to completion
 - `cli-multi-target-stop.gif`: press **s** to stop the four-target rollout part-way, then run `start` and follow every stopped target from its checkpoint to completion
 

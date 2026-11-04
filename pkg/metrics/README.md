@@ -2,6 +2,50 @@
 
 SchemaBot exposes metrics via OpenTelemetry. All metrics are available at `GET /metrics` (Prometheus format) and optionally pushed via OTLP when `OTEL_EXPORTER_OTLP_ENDPOINT` is set.
 
+## Process heartbeat and permanent webhook failures
+
+`schemabot.telemetry.heartbeat` is registered once during telemetry setup and
+observes `1` on every collection, without storage access or event traffic. Its
+Prometheus name is `schemabot_telemetry_heartbeat_ratio`: the exporter adds
+`_ratio` to gauges with unit `1`. Alert on its absence using
+deployment identity from infrastructure tags such as service, deployment `env`,
+tenant, and cluster. `environment="unknown"` remains a process metric attribute;
+apply and command `environment` labels continue to describe the schema target.
+The heartbeat proves metric collection for a live process, not storage, webhook
+processing, every replica, or log ingestion. Inbox snapshot failures retain their
+own counter. Verify the actual exporter names and infrastructure tags before
+activating monitors; do not sum OTLP and OpenMetrics aliases of the same data.
+
+Permanent dispatch failures use the existing `schemabot.webhook.events_total`
+counter with `status="durable_dispatch_failed_permanent"` and `failure_reason`:
+
+| Reason | Meaning |
+| --- | --- |
+| `pr_file_cap` | Typed incomplete PR-file listing; split the PR to make discovery complete |
+| `invalid_payload` | Stored delivery could not be decoded |
+| `unresolved_route` | Stored installation identity is permanently unresolvable |
+| `other` | Any unclassified permanent processing failure |
+
+The reason is emitted only after the lease-guarded permanent-failure write
+succeeds, replacing the prior event increment. Failed writes, lease loss, and
+retries emit no permanent event. Aggregate consumers retain the same metric and
+status; reason labels add no dimensions to the dispatch-duration histogram.
+Exclude only `pr_file_cap` from actionable alerts. Unknown and legacy unlabeled
+failures remain actionable during mixed-version rollout. Metrics are best-effort:
+a crash after persistence can miss a sample; stored deliveries remain authoritative.
+
+The built-in Prometheus exporter retains the counter name
+`schemabot_webhook_events_total`. It exposes the existing remote-command counters
+as `schemabot_remote_control_requests_rejected_total` and
+`schemabot_remote_control_requests_stale_resends_total`. These exceptional counters
+remain absent until an event occurs; absence is not a health signal. Confirm their
+Datadog names after collection mapping before activating alerts.
+
+The paired structured log carries `failure_reason`, delivery `origin`, and the
+existing delivery/repository/PR identifiers. For `origin="organic"`, fix the cause
+and use GitHub Redeliver. For `origin="synthesized"`, use a new head push or re-run
+the SchemaBot check to create fresh work. Origin stays out of the counter labels.
+
 ## Custom Metrics
 
 Every SchemaBot-owned metric emits a non-empty `environment` attribute. Metrics
@@ -11,6 +55,7 @@ available, such as `repository`, `github_app`, and `installation_id`.
 
 | Metric | Type | Attributes | Description |
 |---|---|---|---|
+| `schemabot.telemetry.heartbeat` | Observable gauge | environment | Constant `1` on every collection, including idle processes and storage outages; unit `1` |
 | `schemabot.plans.total` | Counter | repository, database, deployment, environment, status | Plan attempts, each counted once by the API; `success` only once the plan is stored |
 | `schemabot.plan.duration_seconds` | Histogram | repository, database, environment, status | Plan execution time |
 | `schemabot.applies.total` | Counter | repository, database, environment, status | Total apply operations |
@@ -25,7 +70,7 @@ available, such as `repository`, `github_app`, and `installation_id`.
 | `schemabot.check_ownership_misses_total` | Counter | operation, repository, database, database_type, environment | Guarded check updates skipped because ownership changed |
 | `schemabot.promotion.config_error_blocks_total` | Counter | repository, database, environment | Applies blocked because the target environment is absent from the configured promotion order |
 | `schemabot.status_check_operations_total` | Counter | operation, status, repository, database, database_type, environment | Status-check storage and GitHub operations |
-| `schemabot.webhook.events_total` | Counter | environment, app_name, event_type, action, repository, status | GitHub webhook events (`action` is omitted for events that carry none; `repository` is omitted for the `repo_not_configured` status — see [Webhook Ownership Rejections](#webhook-ownership-rejections)) |
+| `schemabot.webhook.events_total` | Counter | environment, app_name, event_type, action, repository, status, failure_reason | GitHub webhook events (`failure_reason` only on permanent dispatch failures) (`action` is omitted for events that carry none; `repository` is omitted for the `repo_not_configured` status — see [Webhook Ownership Rejections](#webhook-ownership-rejections)) |
 | `schemabot.webhook.unregistered_repository_ignored_total` | Counter | environment, app_name, event_type, action, repository | Webhook events ignored because the repository is not configured |
 | `schemabot.webhook.inbox_depth` | Gauge | environment, state | Durable webhook inbox rows by state |
 | `schemabot.webhook.inbox_oldest_claimable_age_seconds` | Gauge | environment | Age of the oldest ready-to-claim durable webhook inbox row |
@@ -130,7 +175,7 @@ available, such as `repository`, `github_app`, and `installation_id`.
 
 **outcome** (webhook dispatch): `completed`, `failed`, `failed_permanent`, `retrying`, `superseded`, `released`, `lease_lost`, `finish_error`, `unknown`
 
-**operation** (GitHub API): `add_comment_reaction`, `create_check_run`, `create_issue_comment`, `create_installation_access_token`, `edit_issue_comment`, `fetch_app_slug`, `fetch_blob`, `fetch_file_content`, `fetch_git_tree`, `fetch_pull_request`, `get_combined_status`, `get_team_membership`, `graphql_minimize_comment`, `graphql_status_check_rollup`, `list_check_runs_for_ref`, `list_pr_files`, `list_reviews`, `list_team_members`, `request_reviewers`, `unknown`, `update_check_run`
+**operation** (GitHub API): `add_comment_reaction`, `create_check_run`, `create_issue_comment`, `create_installation_access_token`, `edit_issue_comment`, `fetch_app_slug`, `fetch_blob`, `fetch_diff`, `fetch_file_content`, `fetch_git_tree`, `fetch_pull_request`, `get_combined_status`, `get_team_membership`, `graphql_minimize_comment`, `graphql_status_check_rollup`, `graphql_tree_entries`, `list_check_runs_for_ref`, `list_pr_files`, `list_reviews`, `list_team_members`, `request_reviewers`, `unknown`, `update_check_run`
 
 **category** (GitHub API): `auth`, `read`, `write`, `unknown`
 
@@ -140,7 +185,7 @@ available, such as `repository`, `github_app`, and `installation_id`.
 
 **reason** (operator claim failures): `expire_retryable_error`, `missing_lease_token`, `operation_storage_error`, `missing_operation_lease_token`, `operation_set_list_error`, `operation_set_missing`, `operation_task_inspect_error`, `operation_cutover_storage_error`, `missing_operation_cutover_lease_token`, `operation_cutover_set_list_error`, `operation_cutover_set_invalid`, `operation_parent_load_error`, `operation_parent_missing`, `operation_parent_claim_error`, `operation_parent_not_claimable`, `operation_parent_release_error`, `operation_lease_release_error`, `operation_lease_recheck_error`, `operation_lease_recheck_missing`, `operation_lease_rotated`, `operation_lease_released_by_peer`, `missing_operation_deployment`, `stop_reconciliation_claim_error`, `stop_reconciliation_missing_lease_token`, `operation_projection_claim_error`, `operation_projection_missing_lease_token`, `stranded_reaper_error`, `stranded_task_reaper_error`, `stranded_active_task_reaper_error`, `stranded_control_request_reaper_error`, `branch_reconcile_error`, `unknown`
 
-**reason** (operator resume failures): `missing_deployment`, `no_client`, `resume_error`, `lease_lost`, `lease_presumed_lost`, `retry_budget_exhausted`, `recovery_window_expired`, `drive_panic`, `drive_stalled`, `operation_no_tasks`, `apply_tasks_not_loaded`, `apply_task_row_missing`, `task_requeue_refused` (storage refused the write putting a task back to `pending` for a retry or a start; the task row stays at rest and the next claim retries the requeue), `task_verdict_refused` (storage refused the write recording a task's terminal outcome; the apply stays active, an operation drive's row is left claimable, and the next claim settles the apply from the stored task rows), `post_terminal_reconcile` (the drive stored the apply's terminal outcome but an answer owed after it, such as completing the pending start, did not land; the operator's post-drive settlement retries it, and the reaper's stranded control-request sweep answers what that settlement could not once the apply is quiescent)
+**reason** (operator resume failures): `missing_deployment`, `no_client`, `resume_error`, `lease_lost`, `lease_presumed_lost`, `retry_budget_exhausted`, `recovery_window_expired`, `drive_panic`, `drive_stalled`, `operation_no_tasks`, `apply_tasks_not_loaded`, `apply_task_row_missing`, `task_requeue_refused` (storage refused the write putting a task back to `pending` for a retry or a start; the task row stays at rest and the next claim retries the requeue), `task_verdict_refused` (storage refused the write recording a task's terminal outcome; the apply stays active, an operation drive's row is left claimable, and the next claim settles the apply from the stored task rows), `remote_operation_never_starts` (the data plane settled the remote apply a rollout member belongs to before that member started, so it will never run there; the drive settled the member's tasks the way the remote apply settled and the rollout derives its verdict from them), `post_terminal_reconcile` (the drive stored the apply's terminal outcome but an answer owed after it, such as completing the pending start, did not land; the operator's post-drive settlement retries it, and the reaper's stranded control-request sweep answers what that settlement could not once the apply is quiescent)
 
 **operation** (storage schema refusals): `alter`, `drop` — the statement types the plan's linters can flag as unsafe
 

@@ -503,6 +503,41 @@ locked. *Enforced:* the bounded waits on the close path (`pkg/drain`, used by `p
 signal-scoped startup context (`pkg/serve/serve.go`, `pkg/cmd/commands/serve.go`), which reaches an
 in-flight storage convergence as the deliberate stop AV-13 permits.
 
+### AV-15: A pull request's GitHub cost grows with its schema inputs, not with the rest of the PR
+
+The GitHub requests SchemaBot makes to handle a pull request grow with schema inputs: the schema
+files and configs the PR changes, and the schema inputs of each database those changes reach,
+changed or not. They never grow with the other files the PR changes or with the rest of the
+repository. Listing the changed files is the one cost that grows with the whole PR, and it is a
+paged list, not a read per file. A question about every changed file is answered from that list,
+or from one request that covers them all, never by a lookup per file.
+
+*Breaks if violated:* an App installation's rate limit is shared by every pull request in every
+repository it serves, so routine edits in one large repository use it up and required checks stop
+posting everywhere. *Enforced:* config discovery that walks only from changed schema files and
+configs, probing each directory once (`pkg/github/config.go`), and
+`TestE2EGitHubRequestsDoNotGrowWithNonSchemaFiles`
+(`pkg/webhook/github_request_cost_integration_test.go`), which plans one PR with one and then four
+hundred one-line edits outside its schema directory and requires the same GitHub requests. It
+covers an auto-plan when the PR opens and when a push lands, a plan command, and a plan command in
+a repository whose tree GitHub truncates.
+
+### AV-16: Applies that wait on a person never wait on each other
+
+An apply that keeps its drivers until an operator cuts it over is admitted only if SchemaBot's
+servers can hold all of it at once, and such applies take drivers in turn: none starts an operation
+while one ahead of it still has an operation waiting to start. The apply at the front therefore
+always gets every driver it needs and can reach its cutover, and the rest follow it. An apply's place is
+when it last started, so one that was stopped and started again goes behind every apply that started
+while it held no drivers.
+
+*Breaks if violated:* two applies each hold part of the drivers with the rest of their operations
+queued behind the other, neither can reach its cutover, and both wait until the waiting-for-cutover
+timeout fails them. *Enforced:* the width refusal at apply and at apply creation
+(`pkg/api/deferred_cutover_capacity.go`), the queue gate on the claim's start arms
+(`deferredCutoverQueueClause`, `pkg/storage/internal/sqlstore/apply_operations.go`), and the resume
+place recorded with a start request (`markResumed`, `pkg/storage/internal/sqlstore/control_requests.go`).
+
 ## Merge gate (MG)
 
 The GitHub Check Run gate is the tier-0 safety feature: it is what stands between a schema PR
@@ -531,7 +566,9 @@ apply must surface as a blocking or absent check, never a passing one. *Breaks i
 merges while its schema state is unknown. *Enforced:* every check-state write and aggregate
 publish path (`pkg/webhook/check_publisher.go`, `pkg/webhook/check_aggregate.go`), and the
 automatic apply, which dispatches only after its pending changes are stored
-(`applyCommandCore` in `pkg/webhook/apply_handlers.go`).
+(`applyCommandCore` in `pkg/webhook/apply_handlers.go`). These guards apply to the state a
+fold observes; concurrent publication can leave stale success over a later blocker
+([publication concurrency](check-runs.md#publication-concurrency)).
 
 ### MG-2: Absence never passes
 
@@ -541,7 +578,9 @@ check as not passing, so having nothing to say has to be said rather than left e
 logic applies in reverse. When SchemaBot expects a check, environment, or config and cannot find
 it, that reads as blocking, never as not-applicable. A gate must not be removable by the very
 change it guards. *Enforced:* aggregate creation on head-commit events
-(`pkg/webhook/check_suite.go`, `pkg/webhook/pull_request.go`); config discovery, the command
+(`pkg/webhook/check_suite.go`, `pkg/webhook/pull_request.go`); verified per-environment
+scope and pending contributions for missing local results (`pkg/webhook/aggregate_scope.go`,
+`pkg/webhook/check_publisher.go`); config discovery, the command
 path's choice of discovery over a passing refresh, and the aggregate leader's expected-participant
 match, which all read the schema paths a PR vacates as well as those it changes
 (`FindConfigsForPRFiles` in `pkg/github/config.go`, `prHasCurrentSchemaBotFiles` in
@@ -550,14 +589,19 @@ required-check and environment-ordering gates (`pkg/webhook/apply_gating.go`,
 `pkg/webhook/check_prior_env.go`); an environment that could not plan while another of the same
 multi-environment plan did, stored as a failing check, or, when that row cannot be stored, a
 failing aggregate carrying a block no fold replaces (`storePlanFailedCheck` in
-`pkg/webhook/check_records.go`, called by `handleMultiEnvPlan` in `pkg/webhook/plan.go`).
+`pkg/webhook/check_records.go`, called by `handleMultiEnvPlan` in `pkg/webhook/plan.go`);
+retry preparation durably invalidating old successes before releasing aggregate blocks (`MarkPlanPending` in `pkg/storage/internal/sqlstore/checks.go`).
 
 ### MG-3: The rollup is conservative
 
 The aggregate check reports the worst result among its per-database checks: one `in_progress`
 blocks, one `failure` fails, one `action_required` demands action, and the aggregate passes only
-when every database passes. A conclusion SchemaBot does not recognize blocks. *Enforced:* the
-aggregate rollup (`pkg/webhook/check_aggregate.go`).
+when every database and every applicable local predecessor passes on the current head. A
+conclusion SchemaBot does not recognize blocks. This rule applies to the contributions read by
+one fold; publication is not serialized, so concurrent folds can publish out of order and leave
+a stale passing or blocking result. See [publication concurrency](check-runs.md#publication-concurrency).
+*Enforced:* the aggregate rollup (`pkg/webhook/check_aggregate.go`,
+`pkg/webhook/check_prerequisites.go`).
 
 ### MG-4: A check belongs to exactly one commit
 
@@ -660,6 +704,8 @@ that would clear the block without the divergence behind it being addressed.
 *Enforced:* stale-check reconciliation (`pkg/webhook/check_records.go`), aggregate re-evaluation
 (`pkg/webhook/check_aggregate.go`, `pkg/webhook/checks_backfill.go`), and the re-plan a settled
 apply owes a PR whose head moved past the commit its check names (`pkg/webhook/handler.go`).
+A concurrent stale publication can leave an obsolete blocker without arming these retries;
+that case requires another fold ([publication concurrency](check-runs.md#publication-concurrency)).
 
 ### MG-11: A terminal outcome lands on the commit the PR is gated on
 
@@ -762,10 +808,9 @@ identifier. State alone cannot express this: the apply is still `stopped`, and o
 settles nothing else tells it apart from a stopped apply nobody touched. Starting it would replay
 its statements against a target where that work has already happened, so a stamped apply can never
 be started. The stamp is write-once, because a second and different successor means the takeover
-is ambiguous, and it is never cleared, outliving the successor it names. A dispatch that creates
-its successor writes the stamp in the create's own transaction, so that successor never exists
-without it. A dispatch that attaches to an apply that already exists stamps after the attach
-commits, and a stamp that fails there is logged rather than retried.
+is ambiguous, and it is never cleared, outliving the successor it names. The create that makes the
+successor, or the attach that adds its work to an existing apply, writes the stamp in its own
+transaction, so a successor never exists without it.
 
 That refusal holds at every surface that could begin the work again: the API rejects the start
 request and points at the successor, a claim to resume refuses and fails the pending start request
@@ -774,10 +819,9 @@ retry. No other claim path can reach a stamped apply, since work must have run b
 can take it over, and an active apply cannot gain one at all. *Enforced:* the finished-apply guard
 on the storage apply update (`finishedApplyGuardPredicate`), the named state arms of the single
 claim query, the terminal-state refusals in the control handlers, and the write-once supersession
-marker consulted by the start, resume, and retry paths and written in the successor's create
-transaction (`markTakenOver`, from `Apply.TakesOverApplyIDs`) (`pkg/storage/internal/sqlstore/applies.go`,
-`pkg/api/control_handlers.go`), or after an attach (`markSupersededHolders`,
-`pkg/tern/local_apply_superseded.go`); the reopen policy each caller passes to the rollout projection,
+marker consulted by the start, resume, and retry paths and written in the successor's create or
+attach transaction (`markTakenOver`, from `Apply.TakesOverApplyIDs`) (`pkg/storage/internal/sqlstore/applies.go`,
+`pkg/api/control_handlers.go`); the reopen policy each caller passes to the rollout projection,
 with the lease-scoped drive paths opting in and the unscoped reconciler opting out
 (`reopensHeldFailedRollout` in `updateApplyStateFromOperations`, `pkg/api/operator.go`), and the
 pending-request gate on a stopped rollout's reopen and drive (`stoppedRolloutDeliverableRequest`,
@@ -792,7 +836,13 @@ is not revived: its failed operation stays failed and is never run again. *Enfor
 and by one refusal. No write re-runs a failed operation, and the rollout projection is the only
 write that moves a failed apply to an active state (ST-1); a start on a stopped apply whose
 operation holds a failed task is refused with that failure (`failedTaskRefusingStart`,
-`pkg/tern/local_control_resume.go`).
+`pkg/tern/local_control_resume.go`). An operation row carries no terminal-state guard in storage:
+the lease fence of OW-2, not a state predicate, stops a drive that has ended or lost its lease from
+writing over a terminal operation (`operationWriteGuard`,
+`pkg/storage/internal/sqlstore/apply_operations.go`). For a drive that ended, the fence holds once
+its end has handed the lease back (`ReleaseFinishedClaim`, called by
+`releaseFinishedOperationClaim` in `pkg/api/operator.go`), pinned by
+`UpdateState_EndedDriveCannotWriteOverTerminalOperation` (`pkg/storage/storagetest/apply_operations.go`).
 
 ### ST-3: Apply state flows upward, never downward
 
@@ -821,7 +871,12 @@ the drive loop reconciles through (`taskStateWithNoBackwardProgress`,
 `pkg/tern/local_client.go`), and the resume's reading of a settled failed task as the apply's
 outcome rather than as work to re-plan (`failedTaskDecidingOutcome` and `replanAndFilterTasks`,
 `pkg/tern/local_control_resume.go`; `checkTaskReady`, `pkg/tern/local_apply_sequential.go`, where
-the sequential drive reads the kept failed row as the verdict).
+the sequential drive reads the kept failed row as the verdict). A task row carries no terminal-state
+guard in storage: the lease fence of OW-2, not a state predicate, stops a drive that has ended or
+lost its lease from writing over a terminal task, under an apply lease and an operation lease alike
+(`taskUpdateStatement`, `pkg/storage/internal/sqlstore/tasks.go`), pinned by
+`Update_DisplacedLeaseCannotWriteOverTerminalTask` and
+`Update_EndedOperationLeaseCannotWriteOverTerminalTask` (`pkg/storage/storagetest/tasks.go`).
 
 ### ST-5: Unknown engine states are visible and blocking
 
@@ -842,8 +897,9 @@ On stop, every non-terminal task goes `stopped` whatever its engine sub-state sa
 engine refuses the stop because the change already settled on its own outcome, in which case the
 drive records that outcome instead (CO-3). A task is
 never promoted to `completed` on partial engine progress, and the stop snapshot is taken only
-after the engine's own stop returns. *Enforced:* stop handling in `pkg/tern/local_control.go` and
-`pkg/tern/stop_terminality.go`.
+after the engine's own stop returns. *Enforced:* stop handling in `pkg/tern/local_control.go`,
+whose engine sweep (`stopEngineForTasks`, `cancelEngineForTasks`) reaches every task with live
+engine work before any is recorded stopped or cancelled, and `pkg/tern/stop_terminality.go`.
 
 ### ST-8: Every state has a recovery story
 
@@ -861,7 +917,9 @@ settles to permanent `failed` when the attempt budget is spent or the recovery w
 *Enforced:* retry preparation in the drive loop (`pkg/api/operator.go`), the re-plan before a drive
 starts again a task another run held the table from (`pkg/tern/local_apply_sequential.go`), the
 resume re-plan that settles a task whose change already landed (`pkg/tern/local_control_resume.go`),
-and the expiry sweep (`pkg/api/reaper.go`, `pkg/storage/internal/sqlstore/applies.go`); budget semantics in
+the group_finalizer drive, which pauses its task-less operation as `failed_retryable` on an error
+retrying can cure instead of failing it (`driveGroupFinalizer`, same file), and the expiry sweep
+(`pkg/api/reaper.go`, `pkg/storage/internal/sqlstore/applies.go`); budget semantics in
 [apply-lifecycle.md](apply-lifecycle.md).
 
 ### ST-10: Rollouts respect order and fail closed on policy
@@ -875,8 +933,8 @@ the cutover barrier under `barrier`, while `parallel` does not order copy start 
 rollout is laid out table by table, work on a table starts on any target only once every earlier
 table has completed on every target, under every cutover policy and every on_failure value, and
 work held behind an earlier table that settled without completing can never start, so it holds no target. Under
-`barrier` and `parallel` cutover follows deployment order: an operation cuts over only once every
-operation of every earlier deployment has completed. Within one deployment, an operation cuts over
+`barrier` and `parallel` cutover follows deployment order: an operation's cutover runs only once every
+operation of every earlier deployment has completed. Within one deployment, an operation's cutover runs
 as soon as its own copy is ready: an earlier operation of the same deployment holds it only while it
 is in a state the rollout halts on (failed, retrying a failure, stopped, cancelled, or reverted),
 never while it is still copying or cutting over. A member's finalizer publishes its change without
@@ -1056,7 +1114,8 @@ admission past a settled manifest hold is `checkNoActiveApplyForNewGeneration` a
 `settledManifestHold`, which record the handoff in the create's transaction (`markAdmittedPast`);
 `activeApplyHoldersForTargets` stops counting the held apply once it carries the handoff, and
 `AttachOperationWithTasks` refuses an attach to it, all in the same file. The same create
-transaction records a stopped apply's takeover (`markTakenOver`). The driver settles the
+transaction, and the attach transaction (`AttachOperationWithTasks`), record a stopped apply's
+takeover (`markTakenOver`). The driver settles the
 held apply once its stored row names the apply that took over its work
 (`updateApplyStateFromOperations`, `pkg/api/operator.go`). A control plane retrying an operation
 that never attached dispatches it under its deployment's unchanged key and manifest, so the retry
@@ -1150,8 +1209,8 @@ each believing it holds the lock. *Enforced:* the session affinity probe
 (`Postgres.VerifySessionAffinity`, `pkg/namedlock/postgres_affinity.go`), refused at bootstrap
 (`verifyStorageSessionAffinity`, `pkg/api/ensure_schema_postgres.go`); the release-answer
 warnings on every advisory lock caller (`releaseEnsureSchemaLock`, `pkg/api/ensure_schema.go`;
-`releaseApplyTargetLockConn`, `pkg/storage/internal/sqlstore/applies.go`; `reapUnderElection`,
-`pkg/storage/internal/sqlstore/reaper.go`).
+`releaseLockConn`, `pkg/storage/internal/sqlstore/lock_release.go`, shared by the apply target
+lock's `releaseApplyTargetLockConn` and the reaper's `reapUnderElection`).
 
 ### OW-10: Only drivers and elected reapers write to the target database
 
@@ -1225,9 +1284,13 @@ terminal resolution of a typed unsupported-operation
 decline (`failPendingRequestForUnsupportedOperation`, `pkg/tern/local_control.go`), reached from
 the stop and cancel paths in that file and from the revert and skip-revert paths in
 `pkg/tern/local_apply_grouped.go`, the claim arms that hand a pending cancel to a rollout's
-stopped and cutover-parked operations and a pending stop to its cutover-parked ones (`FindNextApplyOperation`,
-`pkg/storage/internal/sqlstore/apply_operations.go`) and the settling of its never-started
-operations on the spot (`cancelPendingOperationsForPendingCancel`, `pkg/api/operator.go`), the refusal paths of the pending control-request processors
+stopped and cutover-parked operations and a pending stop to its cutover-parked ones, and that keep
+its pending operations from starting while either pends (`FindNextApplyOperation`,
+`pkg/storage/internal/sqlstore/apply_operations.go`), the settling of its never-started
+operations on the spot (`cancelPendingOperationsForPendingCancel`, `pkg/api/operator.go`), and,
+when no active operation is left to carry the request, stop reconciliation
+(`recoverApplyPendingStop`, `pkg/api/operator.go`, claimed by `FindNextApplyForStopReconciliation`,
+`pkg/storage/internal/sqlstore/applies.go`), the refusal paths of the pending control-request processors
 on both clients (`pkg/tern/local_control.go`, `pkg/tern/grpc_client.go`), and the reaper's sweep
 of requests left pending on an apply that has settled and that no drive still holds
 (`pkg/api/reaper.go`, `ListStrandedPending` in `pkg/storage/internal/sqlstore/control_requests.go`),
@@ -1403,7 +1466,7 @@ chosen upfront. Neither is a command whose effect anyone is waiting to see, so t
 only when a durable skip-revert control request exists for the apply, and otherwise the comment
 transitions in place. Cutting over likewise happens on its own unless the apply deferred its
 cutover, so the phases past the cutover gate rotate only for an apply that deferred it and carries a
-durable cutover control request, once for each member that request is bound to in turn. Operations that resolve straight to a terminal state, cancel among them, do
+durable cutover control request, once for each cutover command, whether the command is bound to one member or to several at once. Operations that resolve straight to a terminal state, cancel among them, do
 not rotate at all, because the terminal summary already lands at the bottom. The phase is derived
 from engine-agnostic apply state, so every engine gets the same PR timeline. *Enforced:* the phase
 and rollout member recorded on the tracked comment row and the rotation predicates
@@ -1431,7 +1494,7 @@ happen that should not. *Enforced:* the acknowledgment points in the comment-com
 
 Every progress surface renders from stored state. No reader polls an engine: the lease-holding
 driver is the only engine poller in the system, advancing task and apply state, persisting
-per-shard rows and engine resume metadata on every tick, and terminalizing the apply. Readers
+per-shard rows and engine resume metadata on every full poll, and terminalizing the apply. Readers
 derive from what it wrote, computing the rollups that are not stored, such as a table's headline
 across its shards, at read time.
 
@@ -1568,7 +1631,7 @@ What does detect it is the lease that sibling drive holds. For task rows the swe
 whose operation carries no heartbeated lease, read the way the claim path reads a lease it may take
 from a peer, so the reaper may write a row only where a driver would be allowed to take it (OW-8).
 That is a mechanism rather than a timing argument, which matters because the alternative signal
-cannot be made sound at any window length: a drive mirrors its task rows every tick, but a remote
+cannot be made sound at any window length: a drive mirrors its task rows on every full poll, but a remote
 sync skips a stored task the remote stopped reporting, so a row can go quiet while its drive is
 alive. The lease is read per operation, so a live deployment holds its own rows without shielding
 an abandoned sibling's.
@@ -1620,9 +1683,14 @@ noise an operator can read past; a missing one is an apply that finished with no
 The duplicate is bounded to one because the reclaim posts and records in the same shape as the
 original, so the failure has to recur to recur.
 
-Single-posting is also scoped to a terminal state, not to the apply's whole life. An apply that
-stops, posts its summary, and later resumes has that marker superseded, which re-arms the claim so
-the next terminal state gets its own summary. Recovery is likewise separated by case: a claim
+Single-posting is also scoped to a terminal state, not to the apply's whole life. The marker
+records the terminal state its summary describes, so an apply that stops, posts its summary, and
+later resumes gets its own summary for the next terminal state it reaches: the claim for that state
+re-arms on a marker that a resume superseded or that names another state the apply can leave,
+while a marker for a settled outcome blocks every later claim. A resume that rotates on a summary
+consumes only that summary, and only while the apply is still active; once the apply is terminal
+again, the summary stays in place for the next resume without blocking the claim of the state the
+apply reached. Recovery is likewise separated by case: a claim
 sentinel abandoned by a crashed publisher is recovered by its own stale-claim path, while the
 ordinary claim path will only reclaim a marker that records an already-posted comment. Stealing an
 in-flight sentinel would hand two writers the same claim, which is the unbounded duplication this
@@ -1664,8 +1732,8 @@ re-plan through `replanVerdictForTask` (`pkg/tern/local_control_resume.go`), whi
 the re-plan speaks for a shard-tagged task at all. `remainingPlannedChanges` on the branch-resume
 path of the PlanetScale engine (`pkg/engine/planetscale/apply.go`) runs only reviewed DDL for the
 tables the branch still lacks, refuses a branch that differs outside the reviewed DDL, and
-validates the branch against the declared schema before creating the deploy request. The
-cross-deployment comparison a plan is reviewed against
+validates the branch against the declared schema before creating or adopting the deploy request.
+The cross-deployment comparison a plan is reviewed against
 is a separate, earlier mechanism (`pkg/tern/change_set_compare.go`, applied on the review-drift
 and rollup paths). Rollback confirmation also re-checks the lock owner and pinned plan in the
 apply-creation transaction (`rollbackConfirmCommandCore` in `pkg/webhook/rollback.go`, enforced
@@ -1691,7 +1759,7 @@ after the confirmation stops rather than running something the operator never sa
 (`pkg/api/plan_handlers.go`, `pkg/webhook/apply_gating.go`, `pkg/webhook/apply_execute.go`), including the re-check that the work of every rollout member, the
 primary target's included, is what the confirmation, or the comment an automatic apply posted,
 was given against and carries no consequence it did not disclose (`confirmedConvergedTargetRound`, `confirmationCoversPrimaryTarget`, `confirmationCoversMemberWork` and `memberWorkRefusal` in
-`pkg/webhook/apply_member_work.go`), with an automatic apply running other members' work only once that comment has landed (`applyCommandCore` in `pkg/webhook/apply_handlers.go`), where a member counts as disclosing its copies only when its engine read the target for every one (`MemberCopyAtStake` in `pkg/api/plan_rollup_work.go`, fed by `engine.PlanResult.ExistingCopiesChecked`); every rollout
+`pkg/webhook/apply_member_work.go`), with an automatic apply running other members' work only once that comment has landed (`applyCommandCore` in `pkg/webhook/apply_handlers.go`), where every member's discarded copies take the same two-step confirm as the primary plan's, consent being recorded copy by copy with the target each is on and a copy the confirmation did not name stopping the apply again (`rolloutDiscardedCopies`, `rolloutDisclosedCopies` and `undisclosedDiscards` in `pkg/webhook/apply_member_work.go`, recorded on the lock as `DisclosedCopies`, disclosed under each target's plan by `writeTargetDiscardedCopies` in `pkg/webhook/templates/plan.go`) and a member counts as disclosing its copies only when its engine read the target for every one (`MemberCopiesUnreported` and `MemberDiscardedCopies` in `pkg/api/plan_rollup_work.go`, fed by `engine.PlanResult.ExistingCopiesChecked`); every rollout
 member's unsafe change requiring the same opt-in as the primary plan's, both at the PR gate
 (`blockUnsafeWithoutOptIn` in `pkg/webhook/apply_member_work.go`, over the per-target disclosure
 `TargetPlanUnsafeChanges` in `pkg/webhook/templates/plan.go`) and at apply creation
@@ -1913,13 +1981,14 @@ repository's default branch; when that cannot be proved, the approval does not c
 targeting any other branch keeps an approval only where its own effect and its base content are
 both the same. This relies on the default branch requiring review for every change that reaches
 it: a change pushed to it without review is carried past an earlier approval as default branch
-content. *Enforced:* the review gate and actor
-authorization (`pkg/webhook/review_gate.go`, `pkg/webhook/actor_authorization.go`), with the
-comparison in `PRSchemaChangeUnchangedSince` (`pkg/github/client.go`), which proves a schema file
-both the change and the default branch edited generates the same statements: with
-`SameTableChange` (`pkg/ddl/table_change.go`) for MySQL-family files, and on the environment's
-primary target with `CompareSchemaFileChange` (`pkg/engine/postgres/table_change.go`) for
-PostgreSQL files.
+content. *Enforced:* the review gate and actor authorization (`pkg/webhook/review_gate.go`,
+`pkg/webhook/actor_authorization.go`), with the comparison in `PRSchemaChangeUnchangedSince`
+(`pkg/github/client.go`), which proves a schema file both the change and the default branch edited
+generates no statement the approval did not cover: with `SameTableChange`
+(`pkg/ddl/table_change.go`) for MySQL-family table files, `SameVSchemaChange`
+(`pkg/ddl/vschema_change.go`) for a Vitess keyspace's VSchema, and on the environment's primary
+target with `CompareSchemaFileChange` (`pkg/engine/postgres/table_change.go`) for PostgreSQL
+files.
 
 ### AZ-5: Commands never guess
 
@@ -1929,8 +1998,9 @@ corrected into something executable, especially one carrying `--allow-unsafe`. E
 receives a response, and silence only ever means another instance owns the reply or the comment
 issues no command: a line that opens with the product name but reads as a sentence about it, not a
 command attempt, is prose. *Enforced:* command discovery, the prose-mention rule, and the
-unowned-command policy (`pkg/webhook/commands.go`), and the fan-out silence predicates
-(`pkg/webhook/schema_source_policy.go`), under which one aggregate leader answers for a database
+unowned-command policy (`pkg/webhook/commands.go`), the stored-apply answer to a control command
+that omits its environment (`pkg/webhook/control_missing_env.go`), and the fan-out silence
+predicates (`pkg/webhook/schema_source_policy.go`), under which one aggregate leader answers for a database
 its own registry lacks under no expected participant's path: the leader serving the command's
 environment, or the first environment in the promotion order when the command names none.
 
@@ -2000,6 +2070,12 @@ The strongest invariants are enforced by structure, so regressions fail CI inste
   of the list and is named here as such: it runs from the pre-commit hook over staged packages
   rather than in CI, so it is bypassable and does not see the repository as a whole. Wiring it
   into the lint workflow is what would make it a peer of the others.
+
+- **GitHub request cost.** An integration test plans the same pull request with one and with
+  hundreds of edits outside its schema directory and fails on any GitHub request the second makes
+  that the first does not. It drives the auto-plan on open and on push, the plan command, and the
+  plan command in a repository whose tree GitHub truncates, so a lookup per changed file on those
+  paths fails CI instead of exhausting the rate limit in production (AV-15).
 
 New invariants should aspire to this tier. When adding one, prefer a completeness test over the
 relevant registry to a hand-maintained list.

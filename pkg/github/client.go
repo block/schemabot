@@ -1156,16 +1156,18 @@ const maxSchemaSymlinkReads = 64
 // so the value leaves wide headroom. Past it, a file counts as changed.
 const maxSchemaStatementComparisons = 16
 
-// SchemaFileChangeComparer reports whether a pull request's edit to one
-// schema file generates the same schema change statements on two bases:
+// SchemaFileChangeComparer reports whether a pull request's edit to the
+// schema file at filePath generates the same schema change on two bases:
 // approvedBase to approved at the approved commit, and headBase to head at
-// the head. It is supplied by the database's dialect, since only the dialect
-// can understand the file, and it may run the files on the database's target
-// to do so. same is false, with reason saying why for operator logs, when the
-// statements differ or the head replaces something the base changed in
-// between. An error means the files could not be compared, which proves
-// nothing.
-type SchemaFileChangeComparer func(ctx context.Context, approvedBase, approved, headBase, head string) (same bool, reason string, err error)
+// the head. The
+// change is the same when the head generates only DDL the approved commit
+// generates, and skips only DDL the head's base already made. It is supplied
+// by the database's dialect, since only the dialect can understand the file,
+// and it may run the files on the database's target to do so. same is false,
+// with reason saying why for operator logs, when the head generates DDL the
+// approved commit does not, or skips approved DDL its base has not made. An
+// error means the files could not be compared, which proves nothing.
+type SchemaFileChangeComparer func(ctx context.Context, filePath, approvedBase, approved, headBase, head string) (same bool, reason string, err error)
 
 // SchemaChangeComparison is the outcome of PRSchemaChangeUnchangedSince.
 type SchemaChangeComparison struct {
@@ -1174,6 +1176,10 @@ type SchemaChangeComparison struct {
 	Unchanged bool
 	// DifferingPath names the first path where the change differs.
 	DifferingPath string
+	// DifferingPathBaseOnly means that path has the same object at the
+	// approved commit and the head, but different objects at their merge
+	// bases. The rejection must not claim the file itself changed.
+	DifferingPathBaseOnly bool
 	// BaseTipSHA, ApprovedMergeBaseSHA, and HeadMergeBaseSHA are the commits
 	// the comparison was measured against, for operator logs.
 	BaseTipSHA           string
@@ -1190,6 +1196,19 @@ type SchemaChangeComparison struct {
 	// between the approved commit and the head but whose statements were
 	// proved the same, for operator logs.
 	StatementComparedPaths []string
+	// DifferingFile names the differing path's blob at each side, so a
+	// caller can show how the pull request's change to it differs. It is nil
+	// when the path is a directory or a symlink at any side.
+	DifferingFile *SchemaFileBlobs
+}
+
+// SchemaFileBlobs names a schema file's blob at the approved commit, the
+// head, and the merge base of each. An empty SHA means the file is absent
+// there. Content holds the text of the blobs the comparison already read,
+// keyed by blob SHA, so a caller reads only the rest.
+type SchemaFileBlobs struct {
+	ApprovedBase, Approved, HeadBase, Head string
+	Content                                map[string]string
 }
 
 // PRSchemaChangeUnchangedSince reports whether the change a pull request
@@ -1221,11 +1240,12 @@ type SchemaChangeComparison struct {
 // A schema file the pull request and the base branch both edited, as a
 // rebase that combines the two in one file produces, still differs by
 // content. When compareStatements is set, such a file is unchanged if the
-// dialect proves the pull request's edit generates the same schema change
-// statements at both commits without replacing anything the base branch
-// changed (see SchemaFileChangeComparer). The file must be a regular .sql
-// file at all four commits, and when the two bases differ the same
-// default-branch rule applies, since the head's statements then rest on base
+// dialect proves the head generates only DDL the approved commit generates,
+// and skips only DDL the head's base already made (see
+// SchemaFileChangeComparer). The file must be a schema file (a .sql file or a
+// vschema.json) that is a regular file at all four commits, or one the pull
+// request adds, absent at both bases. When the two bases differ the same
+// default-branch rule applies, since the head's DDL then rests on base
 // content. A nil compareStatements, an ineligible file, a comparer that
 // cannot prove the change is the same, or more such files than
 // maxSchemaStatementComparisons all leave the file changed.
@@ -1233,7 +1253,11 @@ type SchemaChangeComparison struct {
 // Git objects are content-addressed, so content is compared by object SHA,
 // type, and mode, and a path absent at a commit is compared as absent. A
 // symlink's object holds only its target, so every symlink at or inside a
-// path is followed and its target compared by the same rule.
+// path is followed and its target compared by the same rule. A symlink whose
+// target differs between the commits is compared by the regular file it
+// resolves to at each commit instead, so one a rebase repointed at a renamed
+// directory keeps the approval when it still resolves to the same change; a
+// target that is not a regular file leaves the symlink changed.
 //
 // An error means the comparison could not be completed and proves nothing:
 // GitHub was unavailable, a commit or tree could not be read, a directory was
@@ -1273,6 +1297,8 @@ func (ic *InstallationClient) PRSchemaChangeUnchangedSince(ctx context.Context, 
 		return result, fmt.Errorf("compare schema change in %s between approved commit %s and head %s: %w", repo, approvedSHA, headSHA, err)
 	}
 	result.DifferingPath = differingPath
+	result.DifferingPathBaseOnly = comparer.differingPathBaseOnly
+	result.DifferingFile = comparer.differingFile
 	result.Unchanged = differingPath == ""
 	return result, nil
 }
@@ -1324,6 +1350,8 @@ type schemaChangeComparer struct {
 	// statementComparedPaths are the files proved unchanged by their
 	// statements; each one used up part of maxSchemaStatementComparisons.
 	statementComparedPaths []string
+	differingPathBaseOnly  bool
+	differingFile          *SchemaFileBlobs
 }
 
 type schemaChangeItem struct {
@@ -1332,6 +1360,9 @@ type schemaChangeItem struct {
 	// resolved is false for a top-level path or symlink target, whose sides
 	// are resolved from the commits when the item is processed.
 	resolved bool
+	// throughSymlink is true when a symlink at path was replaced by its
+	// target on at least one side, so the sides are not the path's own.
+	throughSymlink bool
 }
 
 // compare walks paths and returns the first one where the pull request's
@@ -1386,11 +1417,27 @@ func (c *schemaChangeComparer) compare(ctx context.Context, paths []string) (str
 			}
 			pending = append(pending, children...)
 		default:
+			followed, ok, err := c.followSymlinkSides(ctx, item)
+			if err != nil {
+				return "", err
+			}
+			if ok {
+				// The followed sides are already resolved: re-resolving the
+				// path would read the symlinks again, and a top-level path is
+				// already visited, so it would be skipped uncompared.
+				followed.resolved = true
+				followed.throughSymlink = true
+				pending = append(pending, followed)
+				continue
+			}
 			same, err := c.sameStatements(ctx, item)
 			if err != nil {
 				return "", err
 			}
 			if !same {
+				// Equal objects on equal bases already passed pathUnchanged.
+				c.differingPathBaseOnly = identical
+				c.differingFile = c.fileBlobs(item)
 				return item.path, nil
 			}
 		}
@@ -1412,7 +1459,7 @@ func (c *schemaChangeComparer) sameStatements(ctx context.Context, item schemaCh
 		return false, nil
 	}
 	if !statementComparable(item) {
-		c.ic.logger.Debug("review gate comparison: schema path differs and is not a regular .sql file at every commit, so its statements are not compared", logAttrs...)
+		c.ic.logger.Debug("review gate comparison: schema path differs and is not a regular schema file at every commit, so its statements are not compared", logAttrs...)
 		return false, nil
 	}
 	if !sameGitObject(item.sides[sideApprovedBase], item.sides[sideHeadBase]) && !c.baseContentReviewed {
@@ -1442,7 +1489,7 @@ func (c *schemaChangeComparer) sameStatements(ctx context.Context, item schemaCh
 		}
 		contents[i] = text
 	}
-	same, reason, err := c.compareStatements(ctx, contents[sideApprovedBase], contents[sideApproved], contents[sideHeadBase], contents[sideHead])
+	same, reason, err := c.compareStatements(ctx, item.path, contents[sideApprovedBase], contents[sideApproved], contents[sideHeadBase], contents[sideHead])
 	if err != nil {
 		// A comparison cut short by the evaluation's own cancellation proves
 		// nothing about the file, so the evaluation fails instead of
@@ -1465,12 +1512,12 @@ func (c *schemaChangeComparer) sameStatements(ctx context.Context, item schemaCh
 	return true, nil
 }
 
-// statementComparable reports whether item is a .sql file whose content at
-// each commit is a schema file the dialect can parse: a regular file at all
+// statementComparable reports whether item is a schema file whose content at
+// each commit is one the dialect can parse: a regular file at all
 // four commits, or a file the pull request adds, absent at both bases and a
 // regular file at the approved commit and the head.
 func statementComparable(item schemaChangeItem) bool {
-	if path.Ext(item.path) != ".sql" {
+	if !isManagedSchemaFile(item.path) {
 		return false
 	}
 	added := !item.sides[sideApprovedBase].found && !item.sides[sideHeadBase].found
@@ -1489,6 +1536,37 @@ func statementComparable(item schemaChangeItem) bool {
 // symlink, or absent.
 func regularFile(side gitSide) bool {
 	return side.found && side.entry.Type == "blob" && side.entry.Mode != gitSymlinkMode
+}
+
+// fileBlobs names the blob at each side of a path that is a regular file or
+// absent at every side, with the text of those the comparison already read.
+// It returns nil when the path is a directory or a symlink at any side,
+// including a symlink whose sides were replaced by its target's.
+func (c *schemaChangeComparer) fileBlobs(item schemaChangeItem) *SchemaFileBlobs {
+	if item.throughSymlink {
+		return nil
+	}
+	var shas [4]string
+	content := make(map[string]string)
+	for i, side := range item.sides {
+		if !side.found {
+			continue
+		}
+		if !regularFile(side) {
+			return nil
+		}
+		shas[i] = side.entry.SHA
+		if text, ok := c.blobText[side.entry.SHA]; ok {
+			content[side.entry.SHA] = text
+		}
+	}
+	return &SchemaFileBlobs{
+		ApprovedBase: shas[sideApprovedBase],
+		Approved:     shas[sideApproved],
+		HeadBase:     shas[sideHeadBase],
+		Head:         shas[sideHead],
+		Content:      content,
+	}
 }
 
 // pathUnchanged reports whether the pull request's change to a path is the
@@ -1584,6 +1662,46 @@ func (c *schemaChangeComparer) children(ctx context.Context, dir string, sides [
 		items = append(items, *byName[name])
 	}
 	return items, nil
+}
+
+// followSymlinkSides returns item with every symlink side replaced by the
+// regular file its target names at that side's commit, so a symlink the pull
+// request repointed is compared by the file it resolves to, as when a rebase
+// moves the target to a directory the base branch renamed. ok is false, and
+// the item is compared as it is, when no side is a symlink or a target is not
+// a regular file at its commit: absent, a directory, another symlink, or a
+// path that runs through one.
+func (c *schemaChangeComparer) followSymlinkSides(ctx context.Context, item schemaChangeItem) (schemaChangeItem, bool, error) {
+	followed := item
+	hasSymlink := false
+	for i, side := range item.sides {
+		if !side.found || side.entry.Mode != gitSymlinkMode {
+			continue
+		}
+		hasSymlink = true
+		targets, err := c.resolveSymlinks(ctx, []TreeEntry{{Path: item.path, Mode: side.entry.Mode, Type: side.entry.Type, SHA: side.entry.SHA}})
+		if err != nil {
+			return item, false, err
+		}
+		logAttrs := []any{"repo", c.repo, "path", item.path, "target", targets[0], "commit", c.commits[i],
+			"approved_sha", c.commits[sideApproved], "head_sha", c.commits[sideHead]}
+		entry, found, err := c.ic.resolveGitTreeEntry(ctx, c.repo, c.commits[i], targets[0], c.levelCache)
+		if errors.Is(err, errGitPathThroughNonTree) {
+			c.ic.logger.Debug("review gate comparison: schema symlink's target runs through another symlink, so the symlink is compared as it is", logAttrs...)
+			return item, false, nil
+		}
+		if err != nil {
+			return item, false, fmt.Errorf("resolve symlink %s target %s at %s in repo %s: %w", item.path, targets[0], c.commits[i], c.repo, err)
+		}
+		target := gitSide{entry: entry, found: found}
+		if !regularFile(target) {
+			c.ic.logger.Debug("review gate comparison: schema symlink's target is not a regular file, so the symlink is compared as it is",
+				append(logAttrs, "target_found", found, "target_type", entry.Type, "target_mode", entry.Mode)...)
+			return item, false, nil
+		}
+		followed.sides[i] = target
+	}
+	return followed, hasSymlink, nil
 }
 
 // symlinkTargets returns the repo-relative target of the symlink at p, or of

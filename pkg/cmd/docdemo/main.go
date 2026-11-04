@@ -824,7 +824,7 @@ func rolloutDemo() Demo {
 	for i, p := range steps {
 		caption := "Every target copies at once"
 		if i >= 4 {
-			caption = "Each target cuts over as soon as its own copy is ready"
+			caption = "Each target runs its cutover as soon as its own copy is ready"
 		}
 		frames = append(frames, Frame{0.9, "", caption, watchView(rolloutProgress(rolloutApplyID, rolloutTargets, p))})
 	}
@@ -878,7 +878,7 @@ func rolloutStopDemo() Demo {
 	}
 	frames = append(frames, Frame{3.5, "", "Every target still copying stops; shop-004 stays done", stopped})
 	started := rolloutStart(stoppedAt)
-	frames = append(frames, Frame{2, "schemabot start -e production " + rolloutApplyID, "Start resumes every stopped target", started})
+	frames = append(frames, Frame{2, "schemabot start " + rolloutApplyID + " -e production", "Start resumes every stopped target", started})
 	steps := [][]int{{45, 30, 37, 100}, {55, 40, 47, 100}, {65, 50, 57, 100}, {75, 60, 67, 100}, {85, 70, 77, 100}, {95, 80, 87, 100}, {cuttingOver, 90, 97, 100}, {100, 100, cuttingOver, 100}, {100, cuttingOver, 100, 100}}
 	for _, p := range steps {
 		frames = append(frames, Frame{0.6, "", "Each target resumes from its own checkpoint", watchView(rolloutProgress(rolloutApplyID, rolloutTargets, p))})
@@ -986,7 +986,7 @@ func main() {
 		frames = append(frames, Frame{0.18, "", "Follow the row copy to completion", live(p, state.Apply.Running, false, "")})
 	}
 	frames = append(frames, Frame{3, "", "Copy complete; wait for the final swap", live(100, state.Apply.WaitingForCutover, false, "")}, Frame{2, "", "Press Enter to request the final swap", live(100, state.Apply.WaitingForCutover, false, "enter")}, Frame{3, "", "The watcher confirms completion", live(100, state.Apply.Completed, false, "")})
-	demos = append(demos, Demo{Name: "cli-cutover", Title: "Choose when to cut over.", Frames: frames})
+	demos = append(demos, Demo{Name: "cli-cutover", Title: "Choose when the cutover runs.", Frames: frames})
 	// This scenario illustrates a terminal that supports labeled links.
 	previousHyperlinks := ui.Hyperlinks
 	ui.Hyperlinks = true
@@ -1006,7 +1006,7 @@ func main() {
 		{1, "", "", live(55, state.Apply.Running, false, "")},
 		{2, "", "Press s to request a stop", live(55, state.Apply.Running, false, "s")},
 		{3, "", "Wait for Stopped; the CLI shows how to resume", live(55, state.Apply.Stopped, false, "")},
-		{2, "schemabot start -e staging apply-example-73", "Resume the stopped change", capture(func() {
+		{2, "schemabot start apply-example-73 -e staging", "Resume the stopped change", capture(func() {
 			t.WriteStartSuccess(t.StartData{Database: "shop", Environment: "staging", ApplyID: "apply-example-73", StartedCount: 1})
 		})},
 		{1, "", "Start opens the live watcher automatically", live(55, state.Apply.Running, false, "")},

@@ -18,6 +18,15 @@ func TestNormalizeGitHubOperation(t *testing.T) {
 	assert.Equal(t, gitHubMetricValueUnknown, normalizeGitHubOperation("new_github_operation"))
 }
 
+// The operations the symlink mode reader labels its requests with are known,
+// so they are recorded under their own names rather than as unknown.
+func TestSymlinkModeOperationsAreKnownGitHubOperations(t *testing.T) {
+	assert.Equal(t, "fetch_diff", GitHubOperationFetchDiff)
+	assert.Equal(t, "graphql_tree_entries", GitHubOperationGraphQLTreeEntries)
+	assert.True(t, isKnownGitHubOperation(GitHubOperationFetchDiff))
+	assert.True(t, isKnownGitHubOperation(GitHubOperationGraphQLTreeEntries))
+}
+
 func TestNormalizeGitHubRequestCategory(t *testing.T) {
 	assert.Equal(t, GitHubRequestCategoryWrite, normalizeGitHubRequestCategory(GitHubRequestCategoryWrite))
 	assert.Equal(t, GitHubRequestCategoryUnknown, normalizeGitHubRequestCategory("new_category"))

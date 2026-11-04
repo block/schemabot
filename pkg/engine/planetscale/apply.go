@@ -259,6 +259,11 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (result *e
 	// and stops at the first sign of it ending rather than closing or deleting
 	// what a successor resumes against.
 	//
+	// A deploy whose outcome is unknown (engine.OutcomeUnknownError) is not
+	// retired either: the deploy call failed without a refusal, no read of the
+	// deploy request can show its deploy did not start, and recovery re-reads
+	// this same deploy request, so it and its branch are left in place.
+	//
 	// A drive whose context ends after the close has landed but before the
 	// failure is recorded hands the apply back with stored state naming a
 	// deploy request that is now closed and never deployed. A successor that
@@ -283,13 +288,24 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (result *e
 			return
 		}
 		if ctx.Err() != nil {
-			e.applyLogger(req).Info("drive ended after the deploy request was created; leaving the deploy request to the driver or control operation that takes over the apply",
-				"organization", org, "planetscale_database", req.Database, "deploy_request", createdDeployRequest, "branch", branchName, "apply_error", retErr)
+			// A deploy request no landed save names is still found by a resume
+			// from the branch the stored state names, which adopts the open
+			// deploy request it finds there; nothing else can find it.
+			switch {
+			case recordedDeployRequest == createdDeployRequest:
+				e.applyLogger(req).Info("drive ended after the deploy request was created; leaving the deploy request to the driver or control operation that takes over the apply",
+					"organization", org, "planetscale_database", req.Database, "deploy_request", createdDeployRequest, "branch", branchName, "apply_error", retErr)
+			case recordedBranch == branchName && !engine.CancelledByOperator(ctx):
+				e.applyLogger(req).Info("drive ended after the deploy request was created, but no save naming it landed; the driver that resumes the apply finds it open on the branch and adopts it",
+					"organization", org, "planetscale_database", req.Database, "deploy_request", createdDeployRequest, "branch", branchName, "apply_error", retErr)
+			default:
+				e.applyLogger(req).Warn("drive ended after the deploy request was created, but no save naming it landed and no driver resumes the apply from its branch; close it by hand",
+					"organization", org, "planetscale_database", req.Database, "deploy_request", createdDeployRequest, "branch", branchName, "apply_error", retErr)
+			}
 			return
 		}
 		if engine.IsOutcomeUnknown(retErr) {
-			e.applyLogger(req).Warn(deployOutcomeUnknownKeepsDeployRequestLog,
-				"organization", org, "planetscale_database", req.Database, "deploy_request", createdDeployRequest, "branch", branchName, "apply_error", retErr)
+			leaveDeployRequestOfUnknownDeployOutcome(e.applyLogger(req), org, req.Database, createdDeployRequest, branchName, retErr)
 			return
 		}
 		e.retireDeployRequestOfFailedApply(ctx, e.applyLogger(req), client, org, req.Database, createdDeployRequest, deployRequestBranch, retErr)
@@ -922,6 +938,25 @@ func (e *Engine) saveResumeState(req *engine.ApplyRequest, rs *engine.ResumeStat
 	return true
 }
 
+// recordDeployRequestOnResume names the deploy request a resume created or
+// adopted in meta and saves it as the apply's resume state, reporting whether
+// the save landed. adopted is recorded with it, so a later drive that
+// recovers the deploy request knows it was not created by this engine and
+// reads back the settings it would otherwise rely on by construction.
+func (e *Engine) recordDeployRequestOnResume(req *engine.ApplyRequest, meta *psMetadata, dr *ps.DeployRequest, adopted bool) (bool, error) {
+	meta.DeployRequestID = dr.Number
+	meta.DeployRequestURL = dr.HtmlURL
+	meta.DeployRequestAdopted = adopted
+	recordedMeta, err := encodePSMetadata(meta)
+	if err != nil {
+		return false, fmt.Errorf("encode metadata for deploy request #%d on resume: %w", dr.Number, err)
+	}
+	return e.saveResumeState(req, &engine.ResumeState{
+		MigrationContext: req.ResumeState.MigrationContext,
+		Metadata:         recordedMeta,
+	}, "deploy request opened on resume, before its diff is computed"), nil
+}
+
 // remainingPlannedChanges returns the planned changes a resumed branch still
 // needs: each planned table change whose table the branch still differs on,
 // with the DDL the plan approved, plus each keyspace whose planned VSchema
@@ -1055,7 +1090,7 @@ func rowCopyDeclineEvent(unsafe bool, unsafeReason string) engine.ApplyEvent {
 
 // resumeApply resumes a schema change after restart.
 // Handles two crash scenarios:
-//   - Branch exists, no deploy request: diff branch against desired schema, apply remaining DDL, then create and deploy the deploy request
+//   - Branch exists, no deploy request recorded: diff branch against desired schema, apply remaining DDL, then adopt the deploy request already open on the branch or create one, and deploy it; an adopted one whose deploy may have started is reattached instead
 //   - Branch exists, deploy request exists: reattach, deploy it when it was created but never started, and rediscover the Vitess migration_context for progress
 func (e *Engine) resumeApply(ctx context.Context, client psclient.PSClient, org string, req *engine.ApplyRequest) (_ *engine.ApplyResult, retErr error) {
 	meta, err := decodePSMetadata(req.ResumeState.Metadata)
@@ -1085,21 +1120,30 @@ func (e *Engine) resumeApply(ctx context.Context, client psclient.PSClient, org 
 	// crash and recovery; only then does the resume start fresh. A cancelled
 	// drive or a wait that ran out says nothing about the branch, and starting
 	// fresh on either would create a branch the drive cannot finish preparing.
+	// The fresh drive keeps the apply's MigrationContext, as a first drive
+	// carries it, so the branch and deploy request it creates are saved for the
+	// next resume rather than left for no driver to find.
 	if err := e.waitForBranchReady(ctx, client, org, req.Database, meta.BranchName, emitEvent); err != nil {
 		if ctx.Err() == nil && isNotFound(err) {
 			e.logger.Warn("branch no longer exists on resume, starting fresh", "branch", meta.BranchName, "error", err)
-			req.ResumeState = nil
+			req.ResumeState = &engine.ResumeState{MigrationContext: req.ResumeState.MigrationContext}
 			return e.Apply(ctx, req)
 		}
 		return nil, fmt.Errorf("wait for branch %s on resume: %w", meta.BranchName, err)
 	}
 
-	// The branch exists and is ready, and until the deploy request is created
-	// nothing else owns its teardown, so every exit from here to that point
-	// reclaims it. Once the deploy request exists it owns the teardown
-	// (auto_delete_branch) and the reclaim is disarmed. A create response lost
-	// to a timeout leaves the reclaim armed; deleting the branch is still safe
-	// there, for the reasons the fresh drive's cleanup in Apply gives.
+	// The branch exists and is ready. An earlier drive of this apply may have
+	// opened a deploy request on it and ended before a save naming it landed,
+	// so the first thing the resume does is find out: until the branch's open
+	// deploy requests have been listed and found empty, the branch may carry a
+	// deploy request whose deploy may be running, and no failure reclaims it.
+	// Once the listing has answered that none is open, nothing else owns the
+	// branch's teardown until the deploy request is created, so every exit
+	// from there to that point reclaims it. Once the deploy request exists it
+	// owns the teardown (auto_delete_branch) and the reclaim is disarmed. A
+	// create response lost to a timeout leaves the reclaim armed; deleting the
+	// branch is still safe there, for the reasons the fresh drive's cleanup in
+	// Apply gives.
 	//
 	// A resume that creates the deploy request and then fails before its
 	// deploy begins leaves it open and deployable exactly as a fresh drive
@@ -1108,44 +1152,186 @@ func (e *Engine) resumeApply(ctx context.Context, client psclient.PSClient, org 
 	// drive's context ended, never after a deploy whose outcome is unknown,
 	// only while the deploy request reads as never deployed, and never deleting
 	// an operator-supplied branch. Only a deploy
-	// request this resume created is retired; one recovered from stored state
-	// is reattached by resumeExistingDeployRequest, which returns before this
-	// point.
+	// request this resume created or adopted is retired; one recovered from
+	// stored state is reattached by resumeExistingDeployRequest, which returns
+	// before this point.
 	//
-	// createdDeployRequest names the deploy request this resume created;
-	// recordedDeployRequest names the one the stored resume state carries,
-	// once a save naming it has landed. Only a recorded deploy request can be
-	// found by the driver or control operation that takes the apply over.
-	var createdDeployRequest, recordedDeployRequest uint64
+	// A deploy request the resume adopts, found open on the branch instead of
+	// created, is held from the moment it is found exactly as a created one:
+	// the branch is never reclaimed from under it. It is retired only when the
+	// branch is one SchemaBot generated for this apply. Even there the deploy
+	// request is not certainly this apply's: GenerateBranchName derives the
+	// name from the database and the plan alone, so another apply of the same
+	// plan, or a person, could have opened it. It is retired all the same,
+	// because the apply is failing on a branch SchemaBot created and the
+	// retirement closes only a deploy request that provably never deployed.
+	// On an operator-supplied branch the operator may have opened it, so it is
+	// left open rather than closed on their behalf. An adopted deploy request
+	// the resume refuses to deploy because it holds auto-cutover is left open
+	// with its branch on either kind of branch: whoever opened it chose that
+	// setting, and the refusal names it for them.
+	//
+	// An adopted deploy request whose deploy may already have started is
+	// handed to resumeExistingDeployRequest once it is recorded, and from then
+	// on that path owns its failure handling, exactly as for a deploy request
+	// recovered from stored state, so this cleanup does nothing for it
+	// (reattachedDeployRequest).
+	//
+	// heldDeployRequest names the deploy request this resume created or
+	// adopted; recordedDeployRequest names the one the stored resume state
+	// carries, once a save naming it has landed. A recorded deploy request is
+	// found by the driver or control operation that takes the apply over; an
+	// unrecorded one is still found by the driver that resumes the apply, which
+	// lists the branch's open deploy requests and adopts it, but not by an
+	// operator's cancel, which reads only the stored state.
+	var heldDeployRequest, recordedDeployRequest uint64
+	var adoptedDeployRequest bool
+	// adoptedDeployRequestRefused is set when the resume refuses to deploy the
+	// adopted deploy request because it holds auto-cutover.
+	var adoptedDeployRequestRefused bool
+	// reattachedDeployRequest is set once the adopted deploy request is handed
+	// to resumeExistingDeployRequest.
+	var reattachedDeployRequest bool
+	// branchMayCarryDeployRequest is cleared once the branch's open deploy
+	// requests have been listed and none was found.
+	branchMayCarryDeployRequest := true
+	// branchCarriesDeployRequests is set when the branch has more open deploy
+	// requests than the resume can choose between; they carry the branch, so it
+	// is not reclaimed.
+	var branchCarriesDeployRequests bool
 	defer func() {
 		if retErr == nil {
 			return
 		}
-		if createdDeployRequest == 0 {
+		if reattachedDeployRequest {
+			e.applyLogger(req).Info("resumed apply failed while reattached to the deploy request it adopted; the reattach handled the failure, so the deploy request and branch are left as it left them",
+				"organization", org, "planetscale_database", req.Database, "deploy_request", heldDeployRequest, "branch", meta.BranchName, "apply_error", retErr)
+			return
+		}
+		if heldDeployRequest == 0 {
+			if branchCarriesDeployRequests {
+				e.applyLogger(req).Info("resumed apply failed on a branch with several open deploy requests; keeping the branch they carry",
+					"organization", org, "planetscale_database", req.Database, "branch", meta.BranchName, "apply_error", retErr)
+				return
+			}
+			if branchMayCarryDeployRequest {
+				e.applyLogger(req).Info("resumed apply failed before it could tell whether the branch carries an open deploy request; keeping the branch in case one is deploying from it",
+					"organization", org, "planetscale_database", req.Database, "branch", meta.BranchName, "apply_error", retErr)
+				return
+			}
 			e.reclaimBranchAfterFailedResume(ctx, client, org, req, meta.BranchName, retErr)
 			return
 		}
 		if ctx.Err() != nil {
-			if recordedDeployRequest != createdDeployRequest {
-				e.applyLogger(req).Warn("resumed drive ended after its deploy request was created, but no save naming it landed; the driver that takes over cannot find this deploy request and will open another, so close it by hand",
-					"organization", org, "planetscale_database", req.Database, "deploy_request", createdDeployRequest, "branch", meta.BranchName, "apply_error", retErr)
-				return
+			switch {
+			case recordedDeployRequest == heldDeployRequest:
+				e.applyLogger(req).Info("resumed drive ended after its deploy request was created; leaving the deploy request to the driver or control operation that takes over the apply",
+					"organization", org, "planetscale_database", req.Database, "deploy_request", heldDeployRequest, "branch", meta.BranchName, "apply_error", retErr)
+			case engine.CancelledByOperator(ctx):
+				e.applyLogger(req).Warn("resumed apply was cancelled after its deploy request was opened, but no save naming it landed, so the cancel cannot reach it; close it by hand",
+					"organization", org, "planetscale_database", req.Database, "deploy_request", heldDeployRequest, "branch", meta.BranchName, "apply_error", retErr)
+			default:
+				e.applyLogger(req).Info("resumed drive ended after its deploy request was opened, but no save naming it landed; the driver that resumes the apply finds it open on the branch and adopts it",
+					"organization", org, "planetscale_database", req.Database, "deploy_request", heldDeployRequest, "branch", meta.BranchName, "apply_error", retErr)
 			}
-			e.applyLogger(req).Info("resumed drive ended after its deploy request was created; leaving the deploy request to the driver or control operation that takes over the apply",
-				"organization", org, "planetscale_database", req.Database, "deploy_request", createdDeployRequest, "branch", meta.BranchName, "apply_error", retErr)
 			return
 		}
 		if engine.IsOutcomeUnknown(retErr) {
-			e.applyLogger(req).Warn(deployOutcomeUnknownKeepsDeployRequestLog,
-				"organization", org, "planetscale_database", req.Database, "deploy_request", createdDeployRequest, "branch", meta.BranchName, "apply_error", retErr)
+			leaveDeployRequestOfUnknownDeployOutcome(e.applyLogger(req), org, req.Database, heldDeployRequest, meta.BranchName, retErr)
+			return
+		}
+		if adoptedDeployRequestRefused {
+			e.applyLogger(req).Warn("resumed apply refused to deploy the open deploy request it adopted because it holds auto-cutover; leaving it open with its branch, since whoever opened it chose that setting; close it in PlanetScale if it should not deploy",
+				"organization", org, "planetscale_database", req.Database, "deploy_request", heldDeployRequest, "branch", meta.BranchName, "apply_error", retErr)
+			return
+		}
+		if adoptedDeployRequest && !deployRequestDeletesBranch(req.Options) {
+			e.applyLogger(req).Warn("resumed apply failed after adopting an open deploy request on the operator-supplied branch; leaving it open, since the operator may have opened it; close it in PlanetScale if it should not deploy",
+				"organization", org, "planetscale_database", req.Database, "deploy_request", heldDeployRequest, "branch", meta.BranchName, "apply_error", retErr)
 			return
 		}
 		ownedBranch := ""
 		if deployRequestDeletesBranch(req.Options) {
 			ownedBranch = meta.BranchName
 		}
-		e.retireDeployRequestOfFailedApply(ctx, e.applyLogger(req), client, org, req.Database, createdDeployRequest, ownedBranch, retErr)
+		e.retireDeployRequestOfFailedApply(ctx, e.applyLogger(req), client, org, req.Database, heldDeployRequest, ownedBranch, retErr)
 	}()
+
+	main := mainBranch(req.Credentials)
+
+	// An earlier drive of this apply may have opened the deploy request and
+	// ended before a save naming it landed, so the branch's open deploy
+	// requests are listed before any other work touches the branch. One open
+	// deploy request from it into main is adopted rather than joined by a
+	// second one; it is deployed only once the branch has been validated
+	// against the declared schema, as a created one is, and only after its
+	// auto-cutover setting has been read back, since this engine did not
+	// create it. Several open deploy requests are not chosen between, and a
+	// listing that fails does not fall back to creating one: either way the
+	// resume could open a duplicate deploy request on the branch. The failed
+	// listing pauses the apply rather than failing it, so the next drive lists
+	// again instead of leaving a deploy request that may be deploying with
+	// nothing tracking it.
+	open, err := e.openDeployRequests(ctx, client, org, req.Database, meta.BranchName, main)
+	if err != nil {
+		return nil, engine.NewOutcomeUnknownError("check branch %s for an open deploy request on resume: %w", meta.BranchName, err)
+	}
+	var adopted *ps.DeployRequest
+	switch len(open) {
+	case 0:
+		branchMayCarryDeployRequest = false
+	case 1:
+		adopted = open[0]
+		adoptedDeployRequest = true
+		heldDeployRequest = adopted.Number
+		e.logger.Info("adopting the open deploy request found on the branch on resume instead of creating another",
+			"organization", org,
+			"database", req.Database,
+			"branch", meta.BranchName,
+			"deploy_request", adopted.Number,
+		)
+	default:
+		branchCarriesDeployRequests = true
+		numbers := make([]string, len(open))
+		for i, o := range open {
+			numbers[i] = fmt.Sprintf("#%d", o.Number)
+		}
+		e.logger.Warn("refusing to resume: the branch has several open deploy requests and SchemaBot will not choose which one deploys",
+			"organization", org,
+			"database", req.Database,
+			"branch", meta.BranchName,
+			"deploy_requests", numbers,
+		)
+		return nil, engine.NewPermanentError("branch %s has %d open deploy requests into %s (%s), and SchemaBot will not choose which one deploys; close all of them in PlanetScale, then plan and apply again",
+			meta.BranchName, len(open), main, strings.Join(numbers, ", "))
+	}
+
+	// An adopted deploy request whose deploy may already have started is past
+	// what the rest of this path is built for: the branch's DDL is already
+	// being carried to main, so there is nothing left to apply or validate on
+	// the branch, and deploying it again would fail the apply over a schema
+	// change that is running. It is recorded, as a fresh drive records the
+	// deploy request it opens, and then reattached exactly as a recorded one
+	// is.
+	if adopted != nil && deployMayHaveStarted(adopted) {
+		saved, err := e.recordDeployRequestOnResume(req, meta, adopted, true)
+		if err != nil {
+			return nil, err
+		}
+		if saved {
+			recordedDeployRequest = adopted.Number
+		}
+		reattachedDeployRequest = true
+		e.logger.Info("the adopted deploy request's deploy may already have started; reattaching to it instead of deploying it",
+			"organization", org,
+			"database", req.Database,
+			"branch", meta.BranchName,
+			"deploy_request", adopted.Number,
+			"deployment_state", adopted.DeploymentState,
+			"deployed_at", formatDeployedAt(adopted.DeployedAt),
+		)
+		return e.resumeExistingDeployRequest(ctx, client, org, req, meta)
+	}
 
 	resumePwCtx, resumePwCancel := context.WithTimeout(ctx, 10*time.Second)
 	defer resumePwCancel()
@@ -1200,37 +1386,37 @@ func (e *Engine) resumeApply(ctx context.Context, client psclient.PSClient, org 
 	})
 
 	// Create deploy request
-	main := mainBranch(req.Credentials)
 	deferDeploy := req.Options["defer_deploy"] == "true"
 	deferCutover := req.Options["defer_cutover"] == "true"
 
-	// The resume creates the deploy request the crashed drive never did, so it
-	// makes the same teardown decision that drive would have made: a branch the
-	// operator supplied is never handed to the deploy request for deletion.
-	autoDeleteBranch := deployRequestDeletesBranch(req.Options)
-	e.logger.Info("creating deploy request on resume",
-		"database", req.Database,
-		"branch", meta.BranchName,
-		"auto_delete_branch", autoDeleteBranch,
-	)
-	dr, err := e.createDeployRequest(ctx, client, org, req.Database, meta.BranchName, main, autoDeleteBranch)
-	if err != nil {
-		return nil, fmt.Errorf("create deploy request on resume: %w", err)
+	// The branch has just been validated against the declared schema, so the
+	// deploy request adopted from it carries exactly what this resume would
+	// deploy. With none to adopt, the resume creates the deploy request the
+	// crashed drive never did, and makes the same teardown decision that drive
+	// would have made: a branch the operator supplied is never handed to the
+	// deploy request for deletion.
+	dr := adopted
+	if dr == nil {
+		autoDeleteBranch := deployRequestDeletesBranch(req.Options)
+		e.logger.Info("creating deploy request on resume",
+			"database", req.Database,
+			"branch", meta.BranchName,
+			"auto_delete_branch", autoDeleteBranch,
+		)
+		dr, err = e.createDeployRequest(ctx, client, org, req.Database, meta.BranchName, main, autoDeleteBranch)
+		if err != nil {
+			return nil, fmt.Errorf("create deploy request on resume: %w", err)
+		}
+		heldDeployRequest = dr.Number
 	}
-	createdDeployRequest = dr.Number
 	// Record the deploy request before waiting on it, as a fresh drive does,
 	// so a drive that ends during the wait leaves its successor resuming this
 	// deploy request rather than opening a second one on the same branch.
-	meta.DeployRequestID = dr.Number
-	meta.DeployRequestURL = dr.HtmlURL
-	createdMeta, err := encodePSMetadata(meta)
+	saved, err := e.recordDeployRequestOnResume(req, meta, dr, adoptedDeployRequest)
 	if err != nil {
-		return nil, fmt.Errorf("encode metadata for deploy request #%d on resume: %w", dr.Number, err)
+		return nil, err
 	}
-	if e.saveResumeState(req, &engine.ResumeState{
-		MigrationContext: req.ResumeState.MigrationContext,
-		Metadata:         createdMeta,
-	}, "deploy request opened on resume, before its diff is computed") {
+	if saved {
 		recordedDeployRequest = dr.Number
 	}
 	dr, err = e.waitForDeployRequestPending(ctx, client, org, req.Database, dr, emitEvent)
@@ -1242,6 +1428,17 @@ func (e *Engine) resumeApply(ctx context.Context, client psclient.PSClient, org 
 	}
 	if dr.DeploymentState == deployState.NoChanges {
 		return e.noChangesApplyResult(req, org, "no changes detected on resume", req.ResumeState.MigrationContext, meta)
+	}
+
+	// A deploy request this engine created holds auto-cutover off by
+	// construction; an adopted one was created by someone else, and its
+	// setting is only reported once its diff has settled, so it is read back
+	// here, before anything below can deploy it or record it as deferred.
+	if adoptedDeployRequest {
+		if err := e.verifyAdoptedDeployRequestHoldsCutover(ctx, client, org, req.Database, dr.Number); err != nil {
+			adoptedDeployRequestRefused = true
+			return nil, err
+		}
 	}
 
 	if deferCutover {
@@ -1462,6 +1659,16 @@ func (e *Engine) resumeExistingDeployRequest(ctx context.Context, client psclien
 	deferCutover := req.Options["defer_cutover"] == "true"
 
 	if deployRequestNeedsResumeDeploy(dr, meta, deferDeploy) {
+		// A recorded deploy request that an earlier drive adopted rather than
+		// created was opened by someone else, so its auto-cutover setting is
+		// not this engine's choice; it is read back here, as the adopting
+		// drive reads it before deploying.
+		if meta.DeployRequestAdopted {
+			if err := e.verifyAdoptedDeployRequestHoldsCutover(ctx, client, org, req.Database, dr.Number); err != nil {
+				return nil, err
+			}
+		}
+
 		// The cutover setting is settled when the deploy request is created and no
 		// later call can change it, so a recovered request has to be verified here
 		// for the same reason the fresh path verifies before deploying: this drive
@@ -1591,10 +1798,17 @@ func (e *Engine) failRecoveredDeployRequest(req *engine.ApplyRequest, meta *psMe
 // re-reads the deploy request and leaves it in place if a deploy may have
 // begun. A refused deploy request is the only failed state cleaned up here: a
 // complete_error one deployed, so its deploy request and branch are evidence
-// of a change that ran.
+// of a change that ran. A deploy request an earlier drive adopted on an
+// operator-supplied branch is left open, as the adopting drive's cleanup
+// leaves it: the operator may have opened it.
 func (e *Engine) retireRecoveredRefusedDeployRequest(ctx context.Context, client psclient.PSClient, org string, req *engine.ApplyRequest, meta *psMetadata, dr *ps.DeployRequest, failure error) {
 	if ctx.Err() != nil {
 		e.applyLogger(req).Info("resumed drive ended before cleaning up its refused deploy request; leaving the deploy request and branch to the driver that takes over the apply",
+			"organization", org, "planetscale_database", req.Database, "deploy_request", dr.Number, "branch", meta.BranchName, "apply_error", failure)
+		return
+	}
+	if meta.DeployRequestAdopted && !deployRequestDeletesBranch(req.Options) {
+		e.applyLogger(req).Warn("resumed apply failed on a refused deploy request an earlier drive adopted on the operator-supplied branch; leaving it open, since the operator may have opened it; close it in PlanetScale if it should not deploy",
 			"organization", org, "planetscale_database", req.Database, "deploy_request", dr.Number, "branch", meta.BranchName, "apply_error", failure)
 		return
 	}
@@ -1639,6 +1853,25 @@ func (e *Engine) failRecoveredDeployRequestNotFound(req *engine.ApplyRequest, me
 // yet say so, and the request the operator made is what settles it.
 func deployRequestNeedsResumeDeploy(dr *ps.DeployRequest, meta *psMetadata, deferDeploy bool) bool {
 	return dr.DeploymentState == deployState.Ready && !meta.DeferredDeploy && !deferDeploy && dr.DeployedAt == nil
+}
+
+// deployMayHaveStarted reports whether a deploy request may be past the states
+// the branch-resume path after creating a deploy request is built for: still
+// computing its diff (pending), ready to deploy, settled to no changes, or
+// refused (error), each with no deploy timestamp. Anything else — a deploy
+// timestamp, a deploy in flight or finished, a revert, or a state not known
+// here — may have started a deploy, and only resumeExistingDeployRequest,
+// which never deploys a request that is not ready, reattaches to it safely.
+func deployMayHaveStarted(dr *ps.DeployRequest) bool {
+	if dr.DeployedAt != nil {
+		return true
+	}
+	switch dr.DeploymentState {
+	case deployState.Pending, deployState.Ready, deployState.NoChanges, deployState.Error:
+		return false
+	default:
+		return true
+	}
 }
 
 // deployRequestAwaitsDeferredDeployRecord reports whether a recovered deploy

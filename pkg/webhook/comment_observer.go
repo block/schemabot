@@ -2,8 +2,10 @@ package webhook
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/block/schemabot/pkg/api"
@@ -50,6 +52,13 @@ type CommentObserver struct {
 		Warn(msg string, args ...any)
 		Error(msg string, args ...any)
 	}
+
+	// superseded latches once the observer's own lease loses the apply to a
+	// newer claim. Losing the own lease is permanent for this observer — the
+	// lease token never becomes current again — so later side-effect checks
+	// skip the storage re-read and log at debug instead of repeating the
+	// takeover warning on every progress tick.
+	superseded atomic.Bool
 
 	// OnTerminalHook is called after the summary comment is posted.
 	// Used by the webhook handler to update check runs on terminal state.
@@ -104,6 +113,11 @@ type CommentObserver struct {
 	// summary would never post. Later ticks retry only the supersede until it
 	// lands.
 	resumeSupersedePending bool
+
+	// resumeSummaryCommentID is the GitHub comment ID of the summary this
+	// observer's resume rotation rotated for: the only summary marker the
+	// rotation may consume.
+	resumeSummaryCommentID int64
 
 	// settledControlRotations records the control-phase rotations this
 	// observer already rotated for (or confirmed the tracked comment
@@ -223,7 +237,9 @@ func (o *CommentObserver) SetApplyID(id int64) {
 // to correlate GitHub side effects with an apply: repo, PR, and the apply
 // identifier. Without them, a log search scoped to one apply silently misses
 // every GitHub-side failure for that apply.
-func (o *CommentObserver) logError(apply *storage.Apply, msg string, args ...any) {
+// logFields builds the observer's triage attributes — repo, PR, and (when the
+// apply is in hand) its identifiers — followed by the call-specific args.
+func (o *CommentObserver) logFields(apply *storage.Apply, args ...any) []any {
 	fields := []any{
 		"repo", o.repo,
 		"pr", o.pr,
@@ -235,7 +251,11 @@ func (o *CommentObserver) logError(apply *storage.Apply, msg string, args ...any
 			"environment", apply.Environment,
 		)
 	}
-	o.logger.Error(msg, append(fields, args...)...)
+	return append(fields, args...)
+}
+
+func (o *CommentObserver) logError(apply *storage.Apply, msg string, args ...any) {
+	o.logger.Error(msg, o.logFields(apply, args...)...)
 }
 
 func (o *CommentObserver) logInfo(apply *storage.Apply, msg string, args ...any) {
@@ -514,6 +534,14 @@ func (o *CommentObserver) OnTerminal(apply *storage.Apply, tasks []*storage.Task
 	o.resetProgressCommentAuthorityDecision()
 	if !o.leaseStillOwnsObserver(apply, "terminal") {
 		return
+	}
+	// A resume rotation whose marker write failed still owes it. Settling it
+	// now, with the apply terminal, marks the marker rotated past, so the
+	// summary claim below is not blocked by the summary the rotation already
+	// rotated away. A failure here leaves the marker as it was: the claim then
+	// loses to it, and summary reconciliation cannot tell that summary is owed.
+	if o.resumeSupersedePending {
+		o.supersedeResumeSummaryMarker(apply)
 	}
 	// A rotation's fresh comment may be live on the PR but still untracked —
 	// the tracking write failed and no later progress tick landed the
@@ -839,12 +867,22 @@ func (o *CommentObserver) leaseStillOwnsObserver(apply *storage.Apply, operation
 	if o.aggregateTerminalCASWinner {
 		return true
 	}
+	// A superseded observer never regains the apply — its lease token is gone
+	// for good — so skip the storage re-read and keep the log at debug; the
+	// takeover already warned once when the latch was set.
+	if o.superseded.Load() {
+		o.logger.Debug("observer: apply lease superseded by a newer owner; skipping GitHub side effect",
+			o.logFields(apply, "operation", operation)...)
+		return false
+	}
+
 	// PR apply observers are created before the durable apply row is claimed, so
 	// they may not have a lease at construction time. Once progress callbacks pass
 	// the claimed apply, fall back to the apply's current lease and use it as the
 	// authority for external GitHub writes.
 	lease := o.applyLease
-	if !lease.Valid() && apply != nil {
+	holdsOwnLease := lease.Valid()
+	if !holdsOwnLease && apply != nil {
 		lease = apply.Lease()
 	}
 	if !lease.Valid() {
@@ -861,22 +899,88 @@ func (o *CommentObserver) leaseStillOwnsObserver(apply *storage.Apply, operation
 	// or check updates after a newer operator owner has claimed the apply.
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	if err := o.stor.Applies().CheckLease(ctx, lease); err != nil {
-		if apply != nil && !apply.Lease().Valid() {
-			// This observer's construction-time lease no longer matches, and
-			// the apply row records no parent lease at all — the lease was
-			// released back (an operation-scoped drive holds the parent only
-			// transiently per dispatch wave), not claimed by a newer owner.
-			// The durable progress-comment authority decides instead.
-			return o.progressCommentAuthorityOwnsObserver(apply, operation)
-		}
-		o.logError(apply, "observer: apply lease no longer owns apply; skipping GitHub side effect",
+	err := o.stor.Applies().CheckLease(ctx, lease)
+	if err == nil {
+		return true
+	}
+	if apply != nil && !apply.Lease().Valid() {
+		// This observer's construction-time lease no longer matches, and
+		// the apply row records no parent lease at all — the lease was
+		// released back (an operation-scoped drive holds the parent only
+		// transiently per dispatch wave), not claimed by a newer owner.
+		// The durable progress-comment authority decides instead.
+		return o.progressCommentAuthorityOwnsObserver(apply, operation)
+	}
+	if holdsOwnLease && errors.Is(err, storage.ErrApplyLeaseLost) {
+		return o.ownLeaseLostStillOwnsObserver(ctx, apply, operation, lease, err)
+	}
+	switch {
+	case errors.Is(err, storage.ErrApplyLeaseLost):
+		// The fallback lease was read from the apply row moments ago, so losing
+		// it means a concurrent claim landed between the two reads. The next
+		// tick reads the new lease from a fresh row and publishes normally.
+		o.logger.Warn("observer: apply lease changed between reads; skipping GitHub side effect until the next tick",
+			o.logFields(apply, "operation", operation, "lease_owner", lease.Owner, "error", err)...)
+	default:
+		// Storage failed, so ownership is unknown — fail closed for this side
+		// effect without latching; the next check retries the read.
+		o.logError(apply, "observer: apply lease check failed; skipping GitHub side effect",
 			"operation", operation,
 			"lease_owner", lease.Owner,
 			"error", err)
+	}
+	return false
+}
+
+// ownLeaseLostStillOwnsObserver decides a failed check of the observer's own
+// lease from a fresh read of the apply row, never from the callback's
+// snapshot. The snapshot can predate a release of the parent lease, and a
+// release is not a takeover: only a fresh row holding a different lease proves
+// a newer driver claimed the apply (OW-4), so only that latches supersession.
+// A row with no lease defers to the progress-comment authority, and anything
+// else skips this side effect and retries on the next check.
+func (o *CommentObserver) ownLeaseLostStillOwnsObserver(ctx context.Context, apply *storage.Apply, operation string, lease storage.ApplyLease, checkErr error) bool {
+	fresh, err := o.stor.Applies().Get(ctx, lease.ApplyID)
+	if err != nil {
+		o.logError(apply, "observer: apply lease check failed and the apply row could not be re-read; skipping GitHub side effect",
+			"operation", operation,
+			"lease_owner", lease.Owner,
+			"lease_error", checkErr,
+			"error", err)
 		return false
 	}
-	return true
+	if fresh == nil {
+		o.logger.Warn("observer: apply row not found after its lease check failed; skipping GitHub side effect",
+			o.logFields(apply, "operation", operation, "lease_owner", lease.Owner, "error", checkErr)...)
+		return false
+	}
+	current := fresh.Lease()
+	if !current.Valid() {
+		// The parent lease was released back since the snapshot, not claimed
+		// by a newer driver, so the durable progress-comment authority decides.
+		return o.progressCommentAuthorityOwnsObserver(fresh, operation)
+	}
+	if current.Token == lease.Token {
+		// The fresh row still carries this observer's lease, so nothing proves
+		// a takeover. Skip this side effect and check again on the next one.
+		o.logger.Warn("observer: apply lease check failed but the apply row still carries this observer's lease; skipping GitHub side effect until the next check",
+			o.logFields(apply, "operation", operation, "lease_owner", lease.Owner, "error", checkErr)...)
+		return false
+	}
+	// A newer driver holds the apply. That is expected during a handover and
+	// permanent for this observer, so warn once and latch; the new driver's
+	// observer publishes from here on.
+	o.superseded.Store(true)
+	o.logger.Warn("observer: apply lease superseded by a newer owner; this observer stops publishing GitHub side effects",
+		o.logFields(apply, "operation", operation, "lease_owner", lease.Owner, "new_lease_owner", current.Owner, "error", checkErr)...)
+	return false
+}
+
+// Superseded reports whether this observer permanently lost its apply lease to
+// a newer owner. Pollers use it to stop driving an observer that will never
+// publish again.
+func (o *CommentObserver) Superseded() bool {
+	return o.superseded.Load()
 }
 
 // progressCommentAuthorityOwnsObserver reports whether this observer may
@@ -1156,6 +1260,7 @@ func (o *CommentObserver) rotateProgressCommentForResume(apply *storage.Apply, t
 		o.logInfo(apply, "observer: summary claim sentinel is live; deferring resume rotation until the summary posts")
 		return false
 	}
+	o.resumeSummaryCommentID = summary.GitHubCommentID
 
 	tracked, err := o.stor.ApplyComments().Get(ctx, o.applyID, state.Comment.Progress)
 	if err != nil {
@@ -1207,22 +1312,49 @@ func (o *CommentObserver) rotateProgressCommentForResume(apply *storage.Apply, t
 	return true
 }
 
-// supersedeResumeSummaryMarker consumes the summary marker after a resume
-// rotation under its own deadline: the rotation's GitHub round-trips can spend
-// most of the tick's context budget, and this write is the durable record that
-// the rotation happened — left unconsumed, the marker keeps advertising a
-// summary that was already rotated away, and the next terminal publish would
-// lose both claim legs and never post its summary. On failure the pending flag
-// keeps later ticks retrying just this write until it lands.
+// supersedeResumeSummaryMarker consumes the summary marker a resume rotation
+// rotated for, under its own deadline: the rotation's GitHub round-trips can
+// spend most of the tick's context budget, and this write is the durable
+// record that the rotation happened — left unconsumed, the marker keeps
+// advertising a summary that was already rotated away, and the next terminal
+// publish of the same state would lose its claim and never post its summary.
+// On failure the pending flag keeps later ticks, and the terminal publish,
+// retrying just this write until it lands.
+//
+// The write consumes only the summary the rotation saw, and only while the
+// apply is still active. The apply can reach its next terminal state while the
+// rotation posts its fresh comment, and that terminal publish then owns the
+// marker: when it claimed the marker first, the marker records the summary it
+// is posting, which the rotation leaves alone. When the marker still records
+// the summary the rotation saw, consuming it would leave the apply's next
+// resume nothing to rotate on, so the rotation instead marks it rotated past:
+// it stays active for that resume, and no longer blocks the summary the
+// terminal state is owed. Storage picks between the two in one write, under a
+// lock on the apply row, so a stop and a start landing in quick succession
+// cannot slip between a consume that saw the apply terminal and a mark that
+// saw it active again.
 func (o *CommentObserver) supersedeResumeSummaryMarker(apply *storage.Apply) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if err := o.stor.ApplyComments().Supersede(o.contextWithApplyLease(ctx, apply), o.applyID, state.Comment.Summary); err != nil {
+	settled, err := o.stor.ApplyComments().SettleSummaryForResume(o.contextWithApplyLease(ctx, apply), o.applyID, o.resumeSummaryCommentID)
+	if err != nil {
 		o.resumeSupersedePending = true
-		o.logError(apply, "observer: failed to consume summary marker after resume rotation; retrying on the next tick", "error", err)
+		o.logError(apply, "observer: failed to settle summary marker after resume rotation; retrying on the next tick or at the terminal publish",
+			"error", err, "summary_comment_id", o.resumeSummaryCommentID)
 		return
 	}
 	o.resumeSupersedePending = false
+	switch settled {
+	case storage.ResumeSummaryConsumed:
+		o.logDebug(apply, "observer: consumed the summary marker the resume rotation rotated for",
+			"summary_comment_id", o.resumeSummaryCommentID)
+	case storage.ResumeSummaryRotatedPast:
+		o.logInfo(apply, "observer: apply reached another terminal state during resume rotation; summary marker kept for the next resume and marked rotated past so that state's summary posts",
+			"summary_comment_id", o.resumeSummaryCommentID)
+	default:
+		o.logInfo(apply, "observer: summary marker left in place after resume rotation; it records a later terminal summary, or the rotation already consumed it",
+			"summary_comment_id", o.resumeSummaryCommentID)
+	}
 }
 
 // Control-operation phases recorded on tracked progress comments
@@ -1337,7 +1469,9 @@ func (o *CommentObserver) operatorControlRotations(ctx context.Context, apply *s
 
 // deferredCutoverRequest reports whether the apply deferred its cutover and
 // carries a durable cutover control request, whatever its status, and the
-// rollout member that request is bound to (0 when it names none).
+// first rollout member that request is bound to (0 when it names none). A
+// command bound to several members at once keys on its first, so it rotates
+// the comment once.
 func (o *CommentObserver) deferredCutoverRequest(ctx context.Context, apply *storage.Apply) (cutoverOperationID int64, requested bool, err error) {
 	if !o.shouldDeferCutover(apply) {
 		return 0, false, nil
@@ -1368,8 +1502,9 @@ func (o *CommentObserver) controlRequestExists(ctx context.Context, operation st
 
 // cutoverMayRecurInPhase reports whether a later cutover can still owe a
 // rotation while the apply stays in this phase: on an apply that deferred its
-// cutover, each rollout member's cutover re-binds the one cutover request, so
-// the phases at and past a cutover recur once per member. The observer then
+// cutover, each cutover command re-binds the one cutover request, to one
+// member or to several at once, so the phases at and past a cutover recur once
+// per command. The observer then
 // re-reads the cutover request every tick instead of answering from memory by
 // phase alone.
 func (o *CommentObserver) cutoverMayRecurInPhase(apply *storage.Apply, phase string) bool {
@@ -1377,8 +1512,8 @@ func (o *CommentObserver) cutoverMayRecurInPhase(apply *storage.Apply, phase str
 }
 
 // cutoverOperationForPost returns the rollout member whose cutover a progress
-// comment posted now tracks: the member the apply's cutover request is bound
-// to, while the apply is at or past a deferred cutover, and 0 otherwise.
+// comment posted now tracks: the first member the apply's cutover request is
+// bound to, while the apply is at or past a deferred cutover, and 0 otherwise.
 func (o *CommentObserver) cutoverOperationForPost(ctx context.Context, apply *storage.Apply) (int64, error) {
 	if !o.cutoverMayRecurInPhase(apply, controlPhase(apply.State)) {
 		return 0, nil
@@ -1911,7 +2046,7 @@ func (o *CommentObserver) publishClaimedSummary(apply *storage.Apply, body strin
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	won, err := o.stor.ApplyComments().ClaimSummaryComment(ctx, o.applyID)
+	won, err := o.stor.ApplyComments().ClaimSummaryComment(ctx, o.applyID, apply.State)
 	if err != nil {
 		o.logError(apply, "observer: failed to claim terminal summary; summary not posted, left for reconciliation",
 			"error", err)
@@ -1937,10 +2072,12 @@ func (o *CommentObserver) publishClaimedSummary(apply *storage.Apply, body strin
 		return
 	}
 
+	summarized := apply.State
 	marker := &storage.ApplyComment{
 		ApplyID:         o.applyID,
 		CommentState:    state.Comment.Summary,
 		GitHubCommentID: commentID,
+		SummarizedState: &summarized,
 	}
 	if err := o.stor.ApplyComments().Upsert(ctx, marker); err != nil {
 		// The comment is live on the PR but the marker still looks like a claim
@@ -1986,10 +2123,12 @@ func (o *CommentObserver) markSummaryPosted(apply *storage.Apply, editedCommentS
 		return
 	}
 
+	summarized := apply.State
 	marker := &storage.ApplyComment{
 		ApplyID:         o.applyID,
 		CommentState:    state.Comment.Summary,
 		GitHubCommentID: edited.GitHubCommentID,
+		SummarizedState: &summarized,
 	}
 	if !o.leaseStillOwnsObserver(apply, "record summary marker") {
 		return

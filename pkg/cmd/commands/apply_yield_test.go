@@ -115,7 +115,7 @@ func TestApplyYield_StoppedApplyKeepsLock(t *testing.T) {
 	out := stripAnsi(captureStdout(func() { runErr = cmd.Run(t.Context(), &Globals{Endpoint: server.URL}) }))
 
 	require.ErrorContains(t, runErr, "apply apply-yield was stopped, so the schema change is not on the target")
-	assert.ErrorContains(t, runErr, "start -e")
+	assert.ErrorContains(t, runErr, "start apply-yield -e")
 	assert.Contains(t, out, "Apply stopped")
 	assert.Zero(t, releases.Load(), "a resumable apply must keep its lock:\n%s", out)
 	assert.Contains(t, out, "Lock kept for testdb (mysql) despite --yield: apply apply-yield is stopped and can still be resumed.")

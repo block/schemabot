@@ -181,10 +181,18 @@ type Service struct {
 	stopRecovery   chan struct{}
 	cancelRecovery context.CancelFunc
 	operatorWake   chan struct{}
+	// reservedDriverWake is the reserved driver's own wake channel, set when
+	// the pool reserves one (see reservedDriverID). The reserved driver skips
+	// deferred-cutover work, so a wake for that work must never be spent on it:
+	// it listens here instead of on operatorWake, and every wake goes to both.
+	reservedDriverWake chan struct{}
 	// claimingStopped records that stopRecovery has been closed, so the claim
 	// gate can be closed ahead of StopOperator and closed at most once.
 	claimingStopped bool
-	recoveryWg      sync.WaitGroup
+	// driverPoolServerID is this run's row in driver_pools,
+	// set by StartOperator and removed by StopOperator.
+	driverPoolServerID string
+	recoveryWg         sync.WaitGroup
 	// maintenanceWg holds the reaper passes, which share the driver lifecycle
 	// but claim nothing and drive nothing. They are waited on apart from the
 	// drivers so that a reaper which does not return cannot decide whether the
@@ -192,10 +200,17 @@ type Service struct {
 	maintenanceWg        sync.WaitGroup
 	operatorPollInterval time.Duration
 	strandedReaperEvery  time.Duration
-	retryableExpiryEvery time.Duration
+	// operatorHeartbeatEvery overrides OperatorHeartbeatInterval in tests.
+	operatorHeartbeatEvery time.Duration
+	// operatorHeartbeatDeadline overrides operatorHeartbeatTimeout in tests.
+	operatorHeartbeatDeadline time.Duration
+	retryableExpiryEvery      time.Duration
 	// driversBusy counts this process's operator drivers that currently hold
 	// claimed work; it backs the drivers-busy gauge.
 	driversBusy atomic.Int64
+	// operatorDrivers is the driver pool size StartOperator resolved, read by
+	// each driver to decide whether it is the reserved one.
+	operatorDrivers atomic.Int64
 	// heldClaims tracks the apply leases this process's drivers are currently
 	// driving under, keyed by apply id. Shutdown hands them back explicitly so a
 	// peer driver picks the work up on its next poll, instead of waiting out the

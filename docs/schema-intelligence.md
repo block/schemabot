@@ -30,6 +30,12 @@ include `Authorization: Bearer <token>`; for forward-auth, send requests through
 your installation's authenticating proxy. Local installations with authentication
 disabled need no token. The examples below omit authentication headers.
 
+For a PR's merge gate, `GET /api/checks/inspect?repo=org/repo&pull_request=42&environment=production`
+reads current-head check evidence. The environment filter also includes unresolved
+local predecessors, with pending placeholders for missing results. Expected Check
+Run names follow verified repository registrations, so an absent optional
+environment is not reported as a missing check. See [Check Runs](check-runs.md).
+
 ## What databases exist?
 
 Start with `schemabot databases`. It lists the
@@ -324,7 +330,9 @@ A database whose environment lists `targets` addresses several targets at once,
 and each holds its own schema. There is no single live schema to return, so a
 pull returns the primary target's — the one a caller materializes — plus a
 `targets` array naming every target the environment addresses and how each of
-the others differs from the primary.
+the others differs from the primary. Where targets hold different namespaces,
+each namespace comes from the first target holding it; see
+[targets that hold different namespaces](#targets-that-hold-different-namespaces).
 
 ```sh
 schemabot pull -d shop -e production
@@ -371,9 +379,9 @@ Content-Type: application/json
 </details>
 
 Read the array as the environment's whole member set. Exactly one entry carries
-`"primary": true`, and it is the target whose schema is in `namespaces`; it
-never carries `diverged_tables`, because it is the baseline the others are
-compared against. A reconciling caller can take the member set straight from
+`"primary": true`, and it is the target whose schema is in `namespaces` for
+every namespace it holds; it never carries `diverged_tables`, because it is the
+baseline the others are compared against. A reconciling caller can take the member set straight from
 this array rather than deriving it from target names.
 
 `difference` is one of:
@@ -381,7 +389,7 @@ this array rather than deriving it from target names.
 | Value | Meaning |
 |---|---|
 | `differs` | both targets hold the table, with different DDL |
-| `only_on_primary` | only the primary target holds the table |
+| `only_on_primary` | only the baseline target holds the table: the primary, or for a namespace the primary does not hold, the first target holding it |
 | `only_on_target` | only this target holds the table |
 
 An empty `diverged_tables` means the two targets genuinely agree. It never means
@@ -395,12 +403,71 @@ indexes in a different order are reported as `differs`. The comparison errs
 toward reporting: it will send you to look at a table that turns out to agree,
 but it will not call two different schemas equal.
 
+#### Targets that hold different namespaces
+
 A target whose entry [selects namespaces](configuration.md#selecting-namespaces-per-target)
-is pulled for exactly those namespaces, by name, and an explicitly requested
-namespace it does not select is left out of its pull. When every entry of the
-environment selects namespaces, a requested namespace none of them selects is
-rejected with `400` naming it and the selectable ones, rather than answered
-with an empty schema:
+holds exactly those, and is pulled for them by name; an entry selecting nothing
+holds every namespace. Each namespace in `namespaces` comes from its baseline
+target, the first target in rollout order holding it, and every later target
+holding the namespace is compared with that baseline. A target is compared only
+on the namespaces it holds, so a shard target is never reported as missing the
+unsharded schema. Each entry in `targets` carries the `namespaces` its entry
+selects, omitted when it selects none.
+
+Here `shop` sits on `shop-001`, one shard schema sits on each of `shop-002` and
+`shop-003`, and `shop-004` holds a second copy of `shop_0`:
+
+```sh
+schemabot pull -d shop -e production
+```
+
+```sql
+-- Target `shop-001` — primary target, schema below for `shop`
+-- Target `shop-002` — schema below for `shop_0`
+-- Target `shop-003` — schema below for `shop_1`
+-- Target `shop-004` — 1 table differs from the schema below
+--   shop_0.line_items: differs
+```
+
+<details>
+<summary>API equivalent</summary>
+
+```http
+POST /api/pull
+Content-Type: application/json
+
+{"database": "shop", "environment": "production"}
+```
+
+```json
+{
+  "database": "shop",
+  "type": "mysql",
+  "environment": "production",
+  "table_count": 5,
+  "namespaces": {
+    "shop": {"tables": {"…": "CREATE TABLE …"}},
+    "shop_0": {"tables": {"…": "CREATE TABLE …"}},
+    "shop_1": {"tables": {"…": "CREATE TABLE …"}}
+  },
+  "targets": [
+    {"deployment": "commerce-a", "target": "shop-001", "table_count": 1, "primary": true, "namespaces": ["shop"]},
+    {"deployment": "commerce-a", "target": "shop-002", "table_count": 2, "namespaces": ["shop_0"]},
+    {"deployment": "commerce-a", "target": "shop-003", "table_count": 2, "namespaces": ["shop_1"]},
+    {"deployment": "commerce-a", "target": "shop-004", "table_count": 2, "namespaces": ["shop_0"], "diverged_tables": [
+      {"namespace": "shop_0", "table": "line_items", "difference": "differs"}
+    ]}
+  ]
+}
+```
+
+</details>
+
+A pull naming namespaces returns each from the target holding it, so
+`--namespace shop_1` returns `shop_1`'s schema from `shop-003` even though the
+primary does not hold it. When every entry of the environment selects
+namespaces, a requested namespace none of them selects is rejected with `400`
+naming it and the selectable ones, rather than answered with an empty schema:
 
 ```json
 {
@@ -408,11 +475,6 @@ with an empty schema:
   "error_code": ""
 }
 ```
-
-The response shape does not change, but the comparison is still keyed by namespace and table: two
-targets holding different namespaces report each other's tables as
-`only_on_primary` and `only_on_target`, because neither holds the other's
-namespace.
 
 An environment that does not list `targets` carries no `targets` array at all.
 

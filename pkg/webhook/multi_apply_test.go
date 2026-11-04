@@ -1,6 +1,7 @@
 package webhook
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -64,15 +65,15 @@ func TestFormatApplyStatusComment_CutoverNextActionFollowsDeferCutover(t *testin
 	}
 
 	automatic := formatApplyStatusComment(runningApply(), ops, false, nil, nil, nil, nil, "", "")
-	assert.Contains(t, automatic, "SchemaBot will cut over `eu` next — no action needed.")
+	assert.Contains(t, automatic, "SchemaBot will run the cutover for `eu` next — no action needed.")
 	assert.NotContains(t, automatic, "schemabot cutover")
 
 	deferred := runningApply()
 	deferred.Options = storage.MarshalApplyOptions(storage.ApplyOptions{DeferCutover: true})
 	manual := formatApplyStatusComment(deferred, ops, false, nil, nil, nil, nil, "", "")
-	assert.Contains(t, manual, "To cut over `eu`:")
+	assert.Contains(t, manual, "To run the cutover for `eu`:")
 	assert.Contains(t, manual, "schemabot cutover apply-1 -e production")
-	assert.NotContains(t, manual, "SchemaBot will cut over")
+	assert.NotContains(t, manual, "SchemaBot will run the cutover for")
 }
 
 // An apply that failed under on_failure=pause with a held sibling renders the
@@ -131,6 +132,98 @@ func TestFormatApplySummaryComment_MultipleOperationsRendersMulti(t *testing.T) 
 	assert.Contains(t, out, "- ✅ `eu` — completed")
 	assert.Contains(t, out, "- ✅ `us` — completed")
 }
+
+// A start moves a stopped rollout to resuming before its targets' rows leave
+// stopped, and a remote data plane can keep reporting them stopped until it
+// acts on the start. Through that window the progress comment reads as the
+// start under way: the headline does not count stopped targets, a stopped
+// table reads as resuming without its pre-stop rows, a table no target
+// started stays queued, and the comment does not offer the start again.
+func TestFormatApplyStatusComment_ResumingRolloutReadsAsResuming(t *testing.T) {
+	for _, rowState := range []string{state.ApplyOperation.Stopped, state.ApplyOperation.Resuming} {
+		t.Run(rowState, func(t *testing.T) {
+			apply := runningApply()
+			apply.State = state.Apply.Resuming
+			var ops []*storage.ApplyOperation
+			var tasks []*storage.Task
+			for i, target := range []string{"orders-001", "orders-002"} {
+				first, second := int64(2*i+1), int64(2*i+2)
+				ops = append(ops,
+					&storage.ApplyOperation{ID: first, Deployment: "eu", Target: target, OperationKey: target + "/bikes", OperationKind: storage.ApplyOperationKindWork, State: rowState, RolloutStep: 1, StartedAt: new(time.Now())},
+					&storage.ApplyOperation{ID: second, Deployment: "eu", Target: target, OperationKey: target + "/docks", OperationKind: storage.ApplyOperationKindWork, State: state.ApplyOperation.Stopped, RolloutStep: 2},
+				)
+				tasks = append(tasks,
+					&storage.Task{ApplyOperationID: new(first), TableName: "bikes", DDL: "ALTER TABLE `bikes` ADD INDEX `idx_status`(`status`)", State: state.Task.Stopped, RowsCopied: 57, RowsTotal: 100},
+					&storage.Task{ApplyOperationID: new(second), TableName: "docks", DDL: "ALTER TABLE `docks` DROP COLUMN `note`", State: state.Task.Pending},
+				)
+			}
+
+			out := formatApplyStatusComment(apply, ops, false, tasks, nil, nil, nil, "", "")
+			assert.Contains(t, out, "🔄 0 of 2 tables done on 2 targets\n")
+			assert.Contains(t, out, "**`bikes`**: 🔄 Resuming…\n")
+			assert.Contains(t, out, "ADD INDEX `idx_status`", "the table keeps its DDL")
+			assert.Contains(t, out, "**`docks`**: ⏳ Queued")
+			assert.NotContains(t, out, "stopped")
+			assert.NotContains(t, out, "57 / 100", "the pre-stop rows are not shown while the copy's continuation is unknown")
+			assert.NotContains(t, out, "schemabot start")
+		})
+	}
+}
+
+// A start reaches a rollout's targets one claim at a time. A target that
+// finished the table before the stop keeps its outcome beside the resuming
+// line, and once one target is copying again the table shows its live
+// progress rather than hiding it behind the resuming line.
+func TestFormatApplyStatusComment_ResumingRolloutKeepsTargetsThatMovedOn(t *testing.T) {
+	render := func(first *storage.Task) string {
+		apply := runningApply()
+		apply.State = state.Apply.Resuming
+		ops := []*storage.ApplyOperation{
+			{ID: 1, Deployment: "eu", Target: "orders-001", OperationKind: storage.ApplyOperationKindWork, State: state.ApplyOperation.Stopped, StartedAt: new(time.Now())},
+			{ID: 2, Deployment: "eu", Target: "orders-002", OperationKind: storage.ApplyOperationKindWork, State: state.ApplyOperation.Stopped, StartedAt: new(time.Now())},
+		}
+		first.ApplyOperationID = new(int64(1))
+		tasks := []*storage.Task{
+			first,
+			{ApplyOperationID: new(int64(2)), TableName: "bikes", DDL: bikesDDL, State: state.Task.Stopped, RowsCopied: 57, RowsTotal: 100},
+		}
+		return formatApplyStatusComment(apply, ops, false, tasks, nil, nil, nil, "", "")
+	}
+
+	finished := render(&storage.Task{TableName: "bikes", DDL: bikesDDL, State: state.Task.Completed, RowsCopied: 100, RowsTotal: 100})
+	assert.Contains(t, finished, "**`bikes`**: 🔄 Resuming… · 1 complete\n")
+	assert.NotContains(t, finished, "57 / 100")
+
+	copying := render(&storage.Task{TableName: "bikes", DDL: bikesDDL, State: state.Task.Running, RowsCopied: 70, RowsTotal: 100})
+	assert.NotContains(t, copying, "Resuming…")
+	assert.Contains(t, copying, "70 / 100 rows", "the target copying again shows its live progress")
+}
+
+// A rollout whose deployments each address one target renders a section per
+// target. While the apply resumes, each section reads its stopped table as
+// resuming, and a table no target began stays queued, as the rollup reads it.
+func TestFormatApplyStatusComment_ResumingSingleTargetSections(t *testing.T) {
+	apply := runningApply()
+	apply.State = state.Apply.Resuming
+	var ops []*storage.ApplyOperation
+	var tasks []*storage.Task
+	for i, deployment := range []string{"us", "eu"} {
+		id := int64(i + 1)
+		ops = append(ops, &storage.ApplyOperation{ID: id, Deployment: deployment, Target: "orders-" + deployment, OperationKind: storage.ApplyOperationKindWork, State: state.ApplyOperation.Stopped, StartedAt: new(time.Now()), CutoverPolicy: storage.CutoverPolicyParallel})
+		tasks = append(tasks,
+			&storage.Task{ApplyOperationID: new(id), TableName: "bikes", DDL: bikesDDL, State: state.Task.Stopped, RowsCopied: 57, RowsTotal: 100},
+			&storage.Task{ApplyOperationID: new(id), TableName: "docks", DDL: "ALTER TABLE `docks` DROP COLUMN `note`", State: state.Task.Pending},
+		)
+	}
+
+	out := formatApplyStatusComment(apply, ops, false, tasks, nil, nil, nil, "", "")
+	assert.Equal(t, 2, strings.Count(out, "**`bikes`**: 🔄 Resuming…\n"), out)
+	assert.Equal(t, 2, strings.Count(out, "**`docks`**: ⏳ Queued"), out)
+	assert.NotContains(t, out, "**`docks`**: 🔄 Resuming…")
+	assert.NotContains(t, out, "57 / 100")
+}
+
+const bikesDDL = "ALTER TABLE `bikes` ADD INDEX `idx_status`(`status`)"
 
 // Each deployment's tasks are routed into that deployment's section only, by
 // apply_operation_id — a task for `us` must not appear under `eu`.
@@ -313,7 +406,7 @@ func TestDeriveApplyPresentation_MatchesStoredVerdict(t *testing.T) {
 			}
 			stored := state.DeriveRolloutApplyState(state.RolloutChildren(rolloutOps))
 			require.Equal(t, state.Apply.Failed, stored)
-			assert.Equal(t, stored, deriveApplyPresentation(ops, nil, false).State)
+			assert.Equal(t, stored, deriveApplyPresentation(stored, ops, nil, false).State)
 		})
 	}
 }
@@ -330,9 +423,9 @@ func TestDeriveApplyPresentation_HeldByARetryingTask(t *testing.T) {
 	}
 	tasksByOp := map[int64][]*storage.Task{1: {{State: state.Task.FailedRetryable}}}
 
-	got := deriveApplyPresentation(ops, tasksByOp, false)
+	got := deriveApplyPresentation(state.Apply.Running, ops, tasksByOp, false)
 	assert.Equal(t, "ready for cutover — held, shop/shop-001 retrying", got.Deployments[1].Label)
-	assert.Equal(t, "ready for cutover", deriveApplyPresentation(ops, nil, false).Deployments[1].Label)
+	assert.Equal(t, "ready for cutover", deriveApplyPresentation(state.Apply.Running, ops, nil, false).Deployments[1].Label)
 }
 
 // Tasks without an apply_operation_id (legacy rows) are not attributable to a

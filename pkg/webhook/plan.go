@@ -454,6 +454,17 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 	configuredEnvironments = append([]string(nil), configuredEnvironments...)
 	allowedEnvironments := append([]string(nil), h.service.Config().AllowedEnvironments...)
 
+	if len(environments) == 0 && len(configuredEnvironments) > 0 {
+		prInfo, err := client.FetchPullRequest(ctx, repo, pr)
+		if err != nil {
+			h.logger.Error("failed to fetch PR for environment with no local work", "repo", repo, "pr", pr, "error", err)
+			return
+		}
+		h.logger.Info("database has no environments served by this deployment; refreshing aggregate scope",
+			"repo", repo, "pr", pr, "head_sha", prInfo.HeadSHA, "database", schemaDatabase)
+		h.updateAggregateCheck(ctx, client, repo, pr, prInfo.HeadSHA)
+		return
+	}
 	if len(environments) == 0 {
 		prInfo, err := client.FetchPullRequest(ctx, repo, pr)
 		if err != nil {
@@ -1100,6 +1111,11 @@ const msgDeferCutoverAllDirectConfirm = "`--defer-cutover` has no effect on this
 // command holds nothing yet, so it is simply retried; once the lock is taken,
 // unverifiedMemberWorkMessage names the recovery instead.
 const msgOtherTargetPlansUnverified = "SchemaBot could not verify the other targets' plans, so nothing was applied. Retry the command, and see server logs if it persists."
+
+// msgDeferredCutoverCapacityUnverified is the apply comment when SchemaBot
+// could not read what it needs to tell whether the apply's deferred cutover
+// fits. Nothing is held yet, so the command is safe to retry.
+const msgDeferredCutoverCapacityUnverified = "SchemaBot could not check whether it has the drivers this deferred cutover needs, so nothing was applied. Retry the command, and see server logs if it persists."
 
 // shardedDirectChanges collects direct-execution per-shard changes, grouped by
 // (table, reason) so a change present on several shards lists them together

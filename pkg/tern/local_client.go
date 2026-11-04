@@ -275,6 +275,13 @@ type LocalClient struct {
 	// defaultObserverPollInterval. Tests lower it to observe notifications
 	// without waiting out the production cadence.
 	observerPollIntervalOverride time.Duration
+
+	// cutoverSharesTaken records the cutover request sets this client's drives
+	// have already cut over their own operation on, so a drive whose engine
+	// has not yet reported the swap does not trigger it again on every tick.
+	// The durable request in storage stays the source of truth: losing this
+	// record on a restart costs at most one repeated trigger per operation.
+	cutoverSharesTaken sync.Map // cutoverShareKey -> struct{}
 }
 
 type applyCancelHandle struct {
@@ -3179,6 +3186,14 @@ func (c *LocalClient) attachDispatchOperation(ctx context.Context, req *ternv1.A
 		UpdatedAt:     now,
 	}
 
+	// The stopped applies whose resting copies this dispatch meets are stamped
+	// as taken over in the transaction that attaches the operation, so the
+	// handoff is durable exactly when the attach is: a stamp that cannot be
+	// written fails the attach, and the dispatch is retried whole rather than
+	// leaving a stopped apply that a later start would replay.
+	takeovers := c.supersededTakeovers(apply, releasedHolders, scope.ddlChanges)
+	apply.TakesOverApplyIDs = takeoverApplyIDs(takeovers)
+
 	err = c.storage.Applies().AttachOperationWithTasks(ctx, apply, operation, tasks)
 	switch {
 	case errors.Is(err, storage.ErrApplyOperationExists):
@@ -3202,7 +3217,7 @@ func (c *LocalClient) attachDispatchOperation(ctx context.Context, req *ternv1.A
 		return nil, fmt.Errorf("attach operation %s to apply %s: %w", operationKey, apply.ApplyIdentifier, err)
 	}
 
-	c.markSupersededHolders(ctx, apply, releasedHolders, scope.ddlChanges)
+	c.announceSupersededTakeovers(ctx, apply, takeovers)
 
 	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventInfo, storage.LogSourceSchemaBot,
 		fmt.Sprintf("Operation attached: %s", operationKey), "", apply.State)
@@ -3730,6 +3745,10 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 		if len(tasks) == 0 {
 			c.logger.Info("Progress: serving a task-less operation from its own row",
 				append(scopedOp.LogAttrs(), "operation_state", scopedOp.State)...)
+			neverStarts, err := c.operationNeverStarts(ctx, scopedOp, apply)
+			if err != nil {
+				return nil, err
+			}
 			settled, err := c.settledControlRequests(ctx, apply)
 			if err != nil {
 				c.logger.Error("progress: serving a task-less operation without its apply's settled control requests; a rejected command stays invisible to the accepting plane until the next poll",
@@ -3740,6 +3759,8 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 				Engine:                 c.protoEngine(),
 				SettledControlRequests: settled,
 				ApplyOperationId:       req.GetApplyOperationId(),
+				ApplyState:             storageStateToProto(apply.State),
+				OperationNeverStarts:   neverStarts,
 			}, nil
 		}
 	}
@@ -3981,6 +4002,12 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 	}
 	if scopedOp != nil {
 		resp.ApplyOperationId = req.GetApplyOperationId()
+		resp.ApplyState = storageStateToProto(apply.State)
+		neverStarts, err := c.operationNeverStarts(ctx, scopedOp, apply)
+		if err != nil {
+			return nil, err
+		}
+		resp.OperationNeverStarts = neverStarts
 	}
 
 	// Surface the engine's display metadata (e.g. PlanetScale branch_name,
@@ -4376,4 +4403,45 @@ func dsnLogAttrs(dsn string) []any {
 // forever, so an embedder that never states the intent must not inherit it.
 func pendingDropsDisabled(metadata map[string]string) bool {
 	return metadata["pending_drops"] != "true"
+}
+
+// operationNeverStarts reports whether op will never run: no driver has ever
+// claimed it, and its apply has settled, so no driver will claim it now. A
+// halted rollout settles with the members it never reached left pending. The
+// answer reads the operation row rather than its tasks, since a claimed
+// operation whose drive has not yet advanced a task still has pending tasks.
+// A stopped apply has not settled: starting it again starts its pending
+// members.
+//
+// A claim that selected op before the apply settled can still start it after
+// the read that found it pending, so a pending answer is confirmed by reading
+// the row again under its lock, which waits for any such claim to commit. Once
+// that read finds the row unstarted, no later claim can start it, since every
+// claim refuses an operation of a settled apply.
+func (c *LocalClient) operationNeverStarts(ctx context.Context, op *storage.ApplyOperation, apply *storage.Apply) (bool, error) {
+	if !operationUnstartedInSettledApply(op, apply) {
+		return false, nil
+	}
+	confirmed, err := c.storage.ApplyOperations().GetLocked(ctx, op.ID)
+	if err != nil {
+		return false, fmt.Errorf("confirm apply_operation %d of settled apply %s has not started: %w", op.ID, apply.ApplyIdentifier, err)
+	}
+	if confirmed == nil {
+		return false, fmt.Errorf("confirm apply_operation %d of settled apply %s has not started: %w", op.ID, apply.ApplyIdentifier, storage.ErrApplyOperationNotFound)
+	}
+	if !operationUnstartedInSettledApply(confirmed, apply) {
+		c.logger.Info("progress: an operation of a settled apply was started by a claim in flight when it was first read; it is not reported as never starting",
+			append(confirmed.LogAttrs(), "apply_state", apply.State)...)
+		return false, nil
+	}
+	return true, nil
+}
+
+// operationUnstartedInSettledApply reports whether op has never been claimed
+// while its apply has settled.
+func operationUnstartedInSettledApply(op *storage.ApplyOperation, apply *storage.Apply) bool {
+	if !state.IsState(op.State, state.ApplyOperation.Pending) || op.StartedAt != nil || op.LeaseOwner != "" {
+		return false
+	}
+	return state.IsState(apply.State, state.SettledApplyStates...)
 }

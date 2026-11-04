@@ -133,9 +133,6 @@ func (m WatchModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.KeyMsg:
-		// During cutover, ignore all keyboard input except q to force quit
-		isCuttingOver := state.IsState(m.state, state.Apply.CuttingOver) || m.cutoverTriggered
-
 		if isEnterKey(msg) {
 			return m.handleEnterKey()
 		}
@@ -143,7 +140,7 @@ func (m WatchModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch msg.String() {
 		case "esc", "ctrl+c":
 			// Don't allow detach during cutover
-			if isCuttingOver {
+			if m.cuttingOver() {
 				return m, nil
 			}
 			m.detached = true
@@ -152,12 +149,8 @@ func (m WatchModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.quitting = true
 			return m, tea.Quit
 		case "s", "c":
-			// Don't allow stop/cancel during cutover
-			if isCuttingOver {
-				return m, nil
-			}
 			// Stop (Spirit) or cancel (PlanetScale) the schema change
-			if (state.IsRunningApplyState(m.state) || state.IsState(m.state, state.Apply.WaitingForDeploy, state.Apply.WaitingForCutover)) && !m.stopTriggered {
+			if m.stopKeyAvailable() && !m.stopTriggered {
 				m.stopTriggered = true
 				return m, m.triggerStop()
 			}
@@ -280,6 +273,21 @@ func (m WatchModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// cuttingOver reports whether a cutover is underway or was requested from this
+// watcher. During cutover the watcher ignores every key but q.
+func (m WatchModel) cuttingOver() bool {
+	return state.IsState(m.state, state.Apply.CuttingOver) || m.cutoverTriggered
+}
+
+// stopKeyAvailable reports whether the apply is in a state the s (or c) key
+// stops, so a footer advertises the key exactly where pressing it acts.
+func (m WatchModel) stopKeyAvailable() bool {
+	if m.cuttingOver() {
+		return false
+	}
+	return state.IsRunningApplyState(m.state) || state.IsState(m.state, state.Apply.WaitingForDeploy, state.Apply.WaitingForCutover)
+}
+
 func isEnterKey(msg tea.KeyMsg) bool {
 	return msg.Type == tea.KeyEnter || msg.Type == tea.KeyCtrlJ ||
 		msg.String() == "enter" || msg.String() == "ctrl+j"
@@ -353,15 +361,24 @@ func runWatchModel(model WatchModel) (err error) {
 		printExitContext(m.applyID, m.deployRequestURL, m.environment)
 	}
 
-	// The TUI view already displays errors inline, so return ErrSilent
-	// to exit with code 1 without printing the error again.
-	if m.errorMsg != "" && !state.IsState(m.state, state.Apply.Completed) {
-		return ErrSilent
-	}
-	if state.IsState(m.state, state.Apply.Failed) {
-		return ErrSilent
-	}
+	return m.exitError()
+}
 
+// exitError is the watch's exit status for its final model, the same rule
+// terminalWatchExit and noActiveChangeError give the non-interactive watch:
+// only a completed apply succeeds. Any other end (stopped, failed,
+// cancelled, reverted, no active schema change) or an error means the
+// schema change is not on the target. The view already shows the outcome,
+// including the start command for a stopped apply, so the failure is
+// ErrSilent. Detaching while the apply still runs is not an outcome, so it
+// exits 0.
+func (m WatchModel) exitError() error {
+	if state.IsState(m.state, state.Apply.Completed) {
+		return nil
+	}
+	if m.errorMsg != "" || m.watchHasEnded() {
+		return ErrSilent
+	}
 	return nil
 }
 

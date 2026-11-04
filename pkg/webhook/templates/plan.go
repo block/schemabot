@@ -327,6 +327,20 @@ type DeploymentDriftData struct {
 	// planned: a target missing from the list would read as one with nothing
 	// to copy.
 	TableSizes []TargetTableSize
+	// DiscardedCopies are the unfinished copies applying the other targets'
+	// own plans discards, each naming its target, in rollout order. The
+	// primary target's are PlanCommentData.DiscardedCopies. Each is written
+	// under the plan of the target it is on, so the comment the operator
+	// confirms names every copy the apply destroys, wherever it is. Set only
+	// for a clean rollup, the only one whose targets' plans an apply runs.
+	DiscardedCopies []TargetExistingCopy
+}
+
+// TargetExistingCopy is an unfinished copy on one rollout target.
+type TargetExistingCopy struct {
+	// Target names the target the way an operator addresses it.
+	Target string
+	Copy   ExistingCopyData
 }
 
 // TargetTableSize is one rollout target's size estimate for one table its plan
@@ -2352,6 +2366,30 @@ func writeTargetPlans(sb *strings.Builder, data PlanCommentData, budget *ddlBloc
 		} else if unsafe := g.unsafeBeyondPrimaryPlan(); len(unsafe) > 0 && data.disclosesUnsafeChanges() {
 			writeUnsafeWarning(sb, unsafe, nil, data.DatabaseType, data.IsMySQL)
 		}
+		writeTargetDiscardedCopies(sb, data, g)
+	}
+}
+
+// writeTargetDiscardedCopies writes, under a target group's plan, the
+// unfinished copies applying its targets' own plans discards, one section per
+// target. The primary target's are written with its other disclosures. Each
+// section names its target unless the group's heading already names that
+// target alone.
+func writeTargetDiscardedCopies(sb *strings.Builder, data PlanCommentData, g DeploymentPlanGroup) {
+	for _, target := range g.Members {
+		var copies []ExistingCopyData
+		for _, c := range data.DeploymentDrift.DiscardedCopies {
+			if c.Target == target {
+				copies = append(copies, c.Copy)
+			}
+		}
+		if len(copies) == 0 {
+			continue
+		}
+		if !headedByItself(data.DeploymentDrift, g) {
+			fmt.Fprintf(sb, "On target %s:\n\n", inlineCode(target))
+		}
+		writeDiscardedCopies(sb, copies, data.applyingWithoutConfirmation())
 	}
 }
 
@@ -3634,10 +3672,12 @@ func scopedCommand(baseCommand, environment, database, tenant string) string {
 // beyond its environment and database. A pasteable hint for either command has
 // to repeat them, because the command reads its options from the comment that
 // carries it and nothing else: a hint that drops --defer-cutover runs the
-// cutover the operator chose to defer, one that drops --allow-unsafe is blocked
-// again, and one that drops --target applies to every rollout member instead of
-// the one the operator narrowed to. Target is set only for apply hints:
-// apply-confirm takes its target from the plan it confirms.
+// cutover the operator chose to defer, and one that drops --target applies to
+// every rollout member instead of the one the operator narrowed to.
+// --allow-unsafe is the exception: it is repeated only in an apply-confirm
+// hint for the plan the operator consented to, and every other hint leaves it
+// out and asks for it with UnsafeReconsent. Target is set only for apply
+// hints: apply-confirm takes its target from the plan it confirms.
 type ApplyCommandOptions struct {
 	Target       string
 	Tenant       string
@@ -3649,9 +3689,36 @@ type ApplyCommandOptions struct {
 // ApplyCommand renders a pasteable apply command for one environment, carrying
 // the database the operator named with -d and the options they typed, so a
 // refusal that asks the operator to re-run their apply names the apply they
-// asked for.
+// asked for. It leaves out --allow-unsafe: the apply plans again, and consent
+// to unsafe changes is typed against a plan the operator has seen, never
+// pasted from an earlier command. UnsafeReconsent is the sentence that leads
+// into the command when the operator's command carried it.
 func ApplyCommand(environment, database string, opts ApplyCommandOptions) string {
+	opts.AllowUnsafe = false
 	return scopedApplyCommand("schemabot apply", environment, database, opts)
+}
+
+// UnsafeReconsent is the consent clause that leads into an ApplyCommand built
+// from a command that carried --allow-unsafe, and empty for one that did not.
+// Like the plan comment's apply instruction, it states the consent in the
+// sentence that leads into the command rather than putting the flag in it, so
+// consenting again takes typing it.
+func UnsafeReconsent(opts ApplyCommandOptions) string {
+	if !opts.AllowUnsafe {
+		return ""
+	}
+	return "with `--allow-unsafe` to confirm unsafe changes"
+}
+
+// writeRerunCommand writes lead and the apply to re-run in its own fenced
+// block. A consent clause, when there is one, follows lead and leads into the
+// command. gap separates the lead-in from the fence.
+func writeRerunCommand(sb *strings.Builder, lead, consent, command, gap string) {
+	if consent != "" {
+		lead += " " + consent
+	}
+	fmt.Fprintf(sb, "%s:%s", lead, gap)
+	writeCommandBlock(sb, command)
 }
 
 // scopedApplyCommand renders a pasteable apply or apply-confirm command for one
@@ -3714,7 +3781,10 @@ type ConfirmationRefusalData struct {
 
 // RenderConfirmationPlanForOtherEnvironment refuses an apply-confirm whose -e
 // names a different environment than the pending confirmation was planned for.
-// The confirm command it offers keeps the pending confirmation. The apply
+// The confirm command it offers keeps the pending confirmation, but not the
+// --allow-unsafe the operator typed: that consent was aimed at the requested
+// environment, so the pending plan's unsafe changes are confirmed by typing it
+// again, led in by UnsafeReconsent. The apply
 // command it offers for the requested environment does not: it answers to the
 // environment ordering gate like any apply, and once through it releases this
 // pull request's lock, so the pinned plan is gone and the requested
@@ -3728,11 +3798,12 @@ func RenderConfirmationPlanForOtherEnvironment(data ConfirmationRefusalData) str
 
 	writeConfirmationRefusalHeader(&sb, data)
 	fmt.Fprintf(&sb, "The pending confirmation is for `%s`, not `%s`; nothing was applied.\n\n", data.PlanEnvironment, data.RequestedEnvironment)
-	fmt.Fprintf(&sb, "To confirm the `%s` plan:\n\n", data.PlanEnvironment)
-	writeCommandBlock(&sb, scopedApplyCommand("schemabot apply-confirm", data.PlanEnvironment, data.Database, data.Options))
-	fmt.Fprintf(&sb, "\nTo apply `%s` instead, dropping the pending `%s` confirmation and planning and applying `%s` in one step, subject to the environment ordering gate and pausing for `apply-confirm` only if its plan needs it:\n\n",
-		data.RequestedEnvironment, data.PlanEnvironment, data.RequestedEnvironment)
-	writeCommandBlock(&sb, scopedApplyCommand("schemabot apply", data.RequestedEnvironment, data.Database, data.Options))
+	confirmOptions := data.Options
+	confirmOptions.AllowUnsafe = false
+	writeRerunCommand(&sb, fmt.Sprintf("To apply the `%s` plan", data.PlanEnvironment), UnsafeReconsent(data.Options),
+		scopedApplyCommand("schemabot apply-confirm", data.PlanEnvironment, data.Database, confirmOptions), "\n\n")
+	writeApplyCommandBlock(&sb, fmt.Sprintf("\nTo apply `%s` instead, dropping the pending `%s` confirmation and planning and applying `%s` in one step, subject to the environment ordering gate and pausing for `apply-confirm` only if its plan needs it",
+		data.RequestedEnvironment, data.PlanEnvironment, data.RequestedEnvironment), data.RequestedEnvironment, data.Database, data.Options)
 	writeConfirmationRefusalFooter(&sb, data)
 
 	return offerSupportChannel(sb.String())
@@ -3752,8 +3823,8 @@ func RenderConfirmationPlanUnavailable(data ConfirmationRefusalData) string {
 
 	writeConfirmationRefusalHeader(&sb, data)
 	sb.WriteString("The pending confirmation is not backed by a plan SchemaBot can load, so it could not verify which environment was reviewed; nothing was applied.\n\n")
-	fmt.Fprintf(&sb, "To replace that confirmation with a fresh plan and apply it in one step, subject to the environment ordering gate and pausing for `apply-confirm` only if its plan needs it:\n\n")
-	writeCommandBlock(&sb, scopedApplyCommand("schemabot apply", data.RequestedEnvironment, data.Database, data.Options))
+	writeApplyCommandBlock(&sb, "To replace that confirmation with a fresh plan and apply it in one step, subject to the environment ordering gate and pausing for `apply-confirm` only if its plan needs it",
+		data.RequestedEnvironment, data.Database, data.Options)
 	writeConfirmationRefusalFooter(&sb, data)
 
 	return offerSupportChannel(sb.String())
@@ -3776,6 +3847,12 @@ func writeConfirmationRefusalFooter(sb *strings.Builder, data ConfirmationRefusa
 // writeCommandBlock writes one pasteable command in its own fenced block.
 func writeCommandBlock(sb *strings.Builder, command string) {
 	fmt.Fprintf(sb, "```\n%s\n```\n", command)
+}
+
+// writeApplyCommandBlock writes lead and an apply the operator is asked to run
+// again in its own fenced block, led into by UnsafeReconsent when there is one.
+func writeApplyCommandBlock(sb *strings.Builder, lead, environment, database string, opts ApplyCommandOptions) {
+	writeRerunCommand(sb, lead, UnsafeReconsent(opts), ApplyCommand(environment, database, opts), "\n\n")
 }
 
 // allPlansIdentical returns true if all environments have identical changes.

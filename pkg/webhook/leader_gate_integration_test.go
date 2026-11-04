@@ -202,6 +202,7 @@ func TestE2ELeaderPassesOnTrustedSuccessfulParticipant(t *testing.T) {
 	const headSHA = "abc123"
 	mockLeaderPRHead(mux, headSHA)
 	mockLeaderPRFilesTouchTenantB(mux)
+	mockLeaderRepositoryWithoutConfig(t, mux, "abc123")
 
 	prodCheckName := aggregateCheckNameForEnv(tenantBCheckName, "production")
 	stagingCheckName := aggregateCheckNameForEnv(tenantBCheckName, "staging")
@@ -256,6 +257,7 @@ func TestE2ELeaderBlocksOnMissingParticipantCheck(t *testing.T) {
 	const headSHA = "abc123"
 	mockLeaderPRHead(mux, headSHA)
 	mockLeaderPRFilesTouchTenantB(mux)
+	mockLeaderRepositoryWithoutConfig(t, mux, "abc123")
 
 	// No participant runs registered — the lookup returns total_count 0.
 	mockParticipantCheckRuns(mux, nil)
@@ -307,10 +309,37 @@ func TestE2ELeaderBlocksOnParticipantFileRenamedOutOfItsPaths(t *testing.T) {
 					{Filename: new(tt.current), PreviousFilename: new(tt.previous), Status: new("renamed")},
 				})
 			})
+			if strings.HasSuffix(tt.current, "schemabot.yaml") {
+				mux.HandleFunc("GET /repos/octocat/hello-world/contents/"+tt.current, func(w http.ResponseWriter, _ *http.Request) {
+					content := base64.StdEncoding.EncodeToString([]byte("database: participant-db\ntype: mysql\n"))
+					require.NoError(t, json.NewEncoder(w).Encode(gh.RepositoryContent{Type: new("file"), Encoding: new("base64"), Content: &content}))
+				})
+			}
+			registerRepositoryTrees(t, mux, repositoryTreeFixture{
+				headSHA:     headSHA,
+				headEntries: []*gh.TreeEntry{{Path: new(tt.current), Type: new("blob"), SHA: new("renamed-file")}},
+				baseEntries: func() []*gh.TreeEntry {
+					return []*gh.TreeEntry{{Path: new(tt.previous), Type: new("blob"), SHA: new("old-file")}}
+				},
+			})
 			mockParticipantCheckRuns(mux, nil)
 			checkRuns := captureLeaderCheckRuns(mux)
 
 			h := newLeaderHandler(t, svc, client)
+			if tt.name == "config file" {
+				// The config now declares schema outside every known owner's
+				// paths. Its vacated path still selects the participant, but
+				// cannot authorize success for this new, unowned location.
+				installClient := ghclient.NewInstallationClientWithSlug(client, testLogger(), leaderOwnAppSlug, trustedTenantAppSlug)
+				_, err := h.updateAggregateCheckOnce(t.Context(), installClient, "octocat/hello-world", 1, headSHA)
+				require.ErrorContains(t, err, "cannot resolve ownership")
+				require.NotEmpty(t, checkRuns)
+				for len(checkRuns) > 0 {
+					check := <-checkRuns
+					assert.NotEqual(t, checkConclusionSuccess, check.Conclusion)
+				}
+				return
+			}
 			req := buildParticipantCompletedRequest(t, aggregateCheckNameForEnv(tenantBCheckName, "production"), headSHA)
 			rr := httptest.NewRecorder()
 			h.ServeHTTP(rr, req)
@@ -340,6 +369,7 @@ func TestE2ELeaderBlocksOnInProgressParticipant(t *testing.T) {
 	const headSHA = "abc123"
 	mockLeaderPRHead(mux, headSHA)
 	mockLeaderPRFilesTouchTenantB(mux)
+	mockLeaderRepositoryWithoutConfig(t, mux, "abc123")
 
 	prodCheckName := aggregateCheckNameForEnv(tenantBCheckName, "production")
 	stagingCheckName := aggregateCheckNameForEnv(tenantBCheckName, "staging")
@@ -384,6 +414,7 @@ func TestE2ELeaderBlocksOnUntrustedParticipantApp(t *testing.T) {
 	const headSHA = "abc123"
 	mockLeaderPRHead(mux, headSHA)
 	mockLeaderPRFilesTouchTenantB(mux)
+	mockLeaderRepositoryWithoutConfig(t, mux, "abc123")
 
 	prodCheckName := aggregateCheckNameForEnv(tenantBCheckName, "production")
 	stagingCheckName := aggregateCheckNameForEnv(tenantBCheckName, "staging")
