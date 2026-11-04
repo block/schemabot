@@ -12,18 +12,39 @@ import (
 )
 
 // endedOperationFixtureOp is one operation of an apply built by
-// createEndedOperationApply: its shard, the state it is left in, its
-// on_failure policy (halt when empty), and the state of its one task.
+// createEndedOperationApply: its rollout target (empty for the apply's one
+// target), its shard, the state it is left in, its on_failure policy (halt
+// when empty), and the state of its one task. A claimed operation is claimed
+// by a driver before it is moved to its state, as a started shard is, and a
+// driven one keeps that driver's lease afterwards.
 type endedOperationFixtureOp struct {
+	target    string
 	shard     string
 	state     string
 	onFailure string
 	taskState string
+	claimed   bool
+	driven    bool
+}
+
+// key names the operation in the IDs createEndedOperationApply returns: its
+// shard, prefixed by its target when it has one.
+func (op endedOperationFixtureOp) key() string {
+	if op.target == "" {
+		return op.shard
+	}
+	return op.target + "/" + op.shard
 }
 
 // createEndedOperationApply creates an apply in applyState, deferring its
 // cutover when deferred is set, with one operation and one task per op. It
-// returns the apply and each operation's ID keyed by shard.
+// returns the apply and each operation's ID keyed by op.key.
+//
+// Every operation is inserted pending, the claimed ones are claimed in order,
+// and only then is each moved to its state, so a failure the fixture records
+// does not hold back the claim of a shard that started beside it. The claimed
+// operations must come first, and the apply's fan-out cap bounds how many
+// there can be.
 func createEndedOperationApply(t *testing.T, store storage.Storage, name string, planID int64, applyState string, deferred bool, ops ...endedOperationFixtureOp) (*storage.Apply, map[string]int64) {
 	t.Helper()
 	ctx := t.Context()
@@ -36,21 +57,41 @@ func createEndedOperationApply(t *testing.T, store storage.Storage, name string,
 	ids := make(map[string]int64, len(ops))
 	for _, op := range ops {
 		id, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
-			ApplyID: apply.ID, Deployment: "region-a",
-			OperationKey:  "commerce/" + op.shard + "/users",
+			ApplyID: apply.ID, Deployment: "region-a", Target: op.target,
+			OperationKey:  "commerce/" + op.key() + "/users",
 			OperationKind: storage.ApplyOperationKindWork,
 			OnFailure:     op.onFailure,
+			CutoverPolicy: storage.CutoverPolicyParallel,
 		})
 		require.NoError(t, err)
-		if op.state != state.ApplyOperation.Pending {
-			require.NoError(t, store.ApplyOperations().UpdateState(ctx, id, op.state))
-		}
-		task := newTask(apply, "task_"+name+"_"+op.shard, "users", created)
+		task := newTask(apply, "task_"+name+"_"+op.key(), "users", created)
 		task.ApplyOperationID = &id
 		task.State = op.taskState
 		_, err = store.Tasks().Create(ctx, task)
 		require.NoError(t, err)
-		ids[op.shard] = id
+		ids[op.key()] = id
+	}
+	leases := make(map[string]storage.OperationLease, len(ops))
+	for i, op := range ops {
+		if !op.claimed && !op.driven {
+			continue
+		}
+		claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-"+op.key())
+		require.NoError(t, err)
+		require.NotNil(t, claimed, "claim of operation %s", op.key())
+		require.Equal(t, ids[op.key()], claimed.ID, "operation %d of the fixture is claimed in order", i)
+		leases[op.key()] = claimed.Lease()
+	}
+	for _, op := range ops {
+		if op.state != state.ApplyOperation.Pending {
+			require.NoError(t, store.ApplyOperations().UpdateState(ctx, ids[op.key()], op.state))
+		}
+		lease, claimed := leases[op.key()]
+		if claimed && !op.driven {
+			released, err := store.ApplyOperations().ReleaseClaim(ctx, lease)
+			require.NoError(t, err)
+			require.True(t, released, "release claim of operation %s", op.key())
+		}
 	}
 	return apply, ids
 }
@@ -109,8 +150,8 @@ func testEndedOperationApplies(t *testing.T, h Harness) {
 	t.Run("ListAppliesHeldByEndedOperation_HaltedFailureHoldsWaitingShard", func(t *testing.T) {
 		store := h.NewStorage(t)
 		apply, ops := createEndedOperationApply(t, store, "apply_ended_halted", 951, state.Apply.RunningDegraded, true,
-			endedOperationFixtureOp{shard: "-40", state: state.ApplyOperation.Failed, taskState: state.Task.Failed},
-			endedOperationFixtureOp{shard: "40-80", state: state.ApplyOperation.WaitingForCutover, taskState: state.Task.WaitingForCutover},
+			endedOperationFixtureOp{shard: "-40", state: state.ApplyOperation.Failed, taskState: state.Task.Failed, claimed: true},
+			endedOperationFixtureOp{shard: "40-80", state: state.ApplyOperation.WaitingForCutover, taskState: state.Task.WaitingForCutover, driven: true},
 		)
 
 		listed, err := store.Applies().ListAppliesHeldByEndedOperation(t.Context(), pausableTypes, 10)
@@ -129,19 +170,19 @@ func testEndedOperationApplies(t *testing.T, h Harness) {
 	// running or waiting.
 	t.Run("ListAppliesHeldByEndedOperation_SkipsAppliesNotHeld", func(t *testing.T) {
 		store := h.NewStorage(t)
-		failed := endedOperationFixtureOp{shard: "-40", state: state.ApplyOperation.Failed, taskState: state.Task.Failed}
-		waiting := endedOperationFixtureOp{shard: "40-80", state: state.ApplyOperation.WaitingForCutover, taskState: state.Task.WaitingForCutover}
+		failed := endedOperationFixtureOp{shard: "-40", state: state.ApplyOperation.Failed, taskState: state.Task.Failed, claimed: true}
+		waiting := endedOperationFixtureOp{shard: "40-80", state: state.ApplyOperation.WaitingForCutover, taskState: state.Task.WaitingForCutover, driven: true}
 
 		createEndedOperationApply(t, store, "apply_ended_not_deferred", 952, state.Apply.RunningDegraded, false, failed, waiting)
 		createEndedOperationApply(t, store, "apply_ended_continue", 953, state.Apply.RunningDegraded, true,
-			endedOperationFixtureOp{shard: "-40", state: state.ApplyOperation.Failed, onFailure: storage.OnFailureContinue, taskState: state.Task.Failed},
+			endedOperationFixtureOp{shard: "-40", state: state.ApplyOperation.Failed, onFailure: storage.OnFailureContinue, taskState: state.Task.Failed, claimed: true},
 			waiting)
 		stopped, _ := createEndedOperationApply(t, store, "apply_ended_operator_stop", 954, state.Apply.RunningDegraded, true, failed, waiting)
-		requestControlBy(t, store, stopped.ID, storage.ControlOperationStop, "operator-a")
 		cancelled, _ := createEndedOperationApply(t, store, "apply_ended_cancel", 955, state.Apply.RunningDegraded, true, failed, waiting)
-		requestControlBy(t, store, cancelled.ID, storage.ControlOperationCancel, "operator-a")
 		createEndedOperationApply(t, store, "apply_ended_nothing_held", 956, state.Apply.RunningDegraded, true, failed,
 			endedOperationFixtureOp{shard: "40-80", state: state.ApplyOperation.Stopped, taskState: state.Task.Stopped})
+		requestControlBy(t, store, stopped.ID, storage.ControlOperationStop, "operator-a")
+		requestControlBy(t, store, cancelled.ID, storage.ControlOperationCancel, "operator-a")
 
 		listed, err := store.Applies().ListAppliesHeldByEndedOperation(t.Context(), pausableTypes, 10)
 		require.NoError(t, err)
@@ -153,8 +194,8 @@ func testEndedOperationApplies(t *testing.T, h Harness) {
 	t.Run("ListAppliesHeldByEndedOperation_OnlyNamedDatabaseTypes", func(t *testing.T) {
 		store := h.NewStorage(t)
 		createEndedOperationApply(t, store, "apply_ended_other_type", 964, state.Apply.RunningDegraded, true,
-			endedOperationFixtureOp{shard: "-40", state: state.ApplyOperation.Failed, taskState: state.Task.Failed},
-			endedOperationFixtureOp{shard: "40-80", state: state.ApplyOperation.WaitingForCutover, taskState: state.Task.WaitingForCutover},
+			endedOperationFixtureOp{shard: "-40", state: state.ApplyOperation.Failed, taskState: state.Task.Failed, claimed: true},
+			endedOperationFixtureOp{shard: "40-80", state: state.ApplyOperation.WaitingForCutover, taskState: state.Task.WaitingForCutover, driven: true},
 		)
 
 		listed, err := store.Applies().ListAppliesHeldByEndedOperation(t.Context(), []string{storage.DatabaseTypeVitess}, 10)
@@ -165,11 +206,13 @@ func testEndedOperationApplies(t *testing.T, h Harness) {
 	// A shard waiting on a retry ends the apply only once the retry can never
 	// come. With budget left the apply is retrying, not held; once the budget
 	// is spent the waiting shard is held behind it and the apply is listed.
+	// Retry expiry leaves the same apply alone while the waiting shard's drive
+	// holds it, so the two sweeps never both take it.
 	t.Run("ListAppliesHeldByEndedOperation_SpentRetryHoldsWaitingShard", func(t *testing.T) {
 		store := h.NewStorage(t)
 		apply, ops := createEndedOperationApply(t, store, "apply_ended_spent_retry", 957, state.Apply.FailedRetryable, true,
-			endedOperationFixtureOp{shard: "-40", state: state.ApplyOperation.FailedRetryable, taskState: state.Task.FailedRetryable},
-			endedOperationFixtureOp{shard: "40-80", state: state.ApplyOperation.WaitingForCutover, taskState: state.Task.WaitingForCutover},
+			endedOperationFixtureOp{shard: "-40", state: state.ApplyOperation.FailedRetryable, taskState: state.Task.FailedRetryable, claimed: true},
+			endedOperationFixtureOp{shard: "40-80", state: state.ApplyOperation.WaitingForCutover, taskState: state.Task.WaitingForCutover, driven: true},
 		)
 
 		listed, err := store.Applies().ListAppliesHeldByEndedOperation(t.Context(), pausableTypes, 10)
@@ -183,6 +226,50 @@ func testEndedOperationApplies(t *testing.T, h Harness) {
 		assert.Equal(t, apply.ApplyIdentifier, listed[0].Apply.ApplyIdentifier)
 		require.NotNil(t, listed[0].EndedOperation)
 		assert.Equal(t, ops["-40"], listed[0].EndedOperation.ID)
+
+		expired, err := store.Applies().ExpireRetryable(t.Context(), 10)
+		require.NoError(t, err)
+		assert.Empty(t, expired, "retry expiry leaves an apply a drive still holds")
+	})
+
+	// The cutover runs for one rollout member at a time. When target a's shard
+	// fails under halt while target b's shard waits at the cutover, target b
+	// waits on the rollout's barrier, not on target a's cutover, so the apply
+	// is left for the operator to decide. The same failure beside a waiting
+	// shard of its own target is listed.
+	t.Run("ListAppliesHeldByEndedOperation_SkipsOtherMemberAtBarrier", func(t *testing.T) {
+		store := h.NewStorage(t)
+		createEndedOperationApply(t, store, "apply_ended_other_member", 965, state.Apply.RunningDegraded, true,
+			endedOperationFixtureOp{target: "a", shard: "-40", state: state.ApplyOperation.Failed, taskState: state.Task.Failed, claimed: true},
+			endedOperationFixtureOp{target: "b", shard: "-40", state: state.ApplyOperation.WaitingForCutover, taskState: state.Task.WaitingForCutover, driven: true},
+		)
+		sameMember, _ := createEndedOperationApply(t, store, "apply_ended_same_member", 966, state.Apply.RunningDegraded, true,
+			endedOperationFixtureOp{target: "a", shard: "-40", state: state.ApplyOperation.Failed, taskState: state.Task.Failed, claimed: true},
+			endedOperationFixtureOp{target: "a", shard: "40-80", state: state.ApplyOperation.WaitingForCutover, taskState: state.Task.WaitingForCutover, driven: true},
+		)
+
+		listed, err := store.Applies().ListAppliesHeldByEndedOperation(t.Context(), pausableTypes, 10)
+		require.NoError(t, err)
+		assert.Equal(t, []string{sameMember.ApplyIdentifier}, endedApplyIdentifiers(listed))
+	})
+
+	// The drive holding a shard is what delivers the stop and saves the copy,
+	// so a waiting shard nobody drives is left to recovery, which claims it
+	// again. The same apply with the shard's drive alive is listed.
+	t.Run("ListAppliesHeldByEndedOperation_SkipsStartedShardNobodyDrives", func(t *testing.T) {
+		store := h.NewStorage(t)
+		createEndedOperationApply(t, store, "apply_ended_undriven", 967, state.Apply.RunningDegraded, true,
+			endedOperationFixtureOp{shard: "-40", state: state.ApplyOperation.Failed, taskState: state.Task.Failed, claimed: true},
+			endedOperationFixtureOp{shard: "40-80", state: state.ApplyOperation.WaitingForCutover, taskState: state.Task.WaitingForCutover, claimed: true},
+		)
+		driven, _ := createEndedOperationApply(t, store, "apply_ended_driven", 968, state.Apply.RunningDegraded, true,
+			endedOperationFixtureOp{shard: "-40", state: state.ApplyOperation.Failed, taskState: state.Task.Failed, claimed: true},
+			endedOperationFixtureOp{shard: "40-80", state: state.ApplyOperation.WaitingForCutover, taskState: state.Task.WaitingForCutover, driven: true},
+		)
+
+		listed, err := store.Applies().ListAppliesHeldByEndedOperation(t.Context(), pausableTypes, 10)
+		require.NoError(t, err)
+		assert.Equal(t, []string{driven.ApplyIdentifier}, endedApplyIdentifiers(listed))
 	})
 
 	// Once SchemaBot's stop has reached every shard, the settle fails the
@@ -343,6 +430,124 @@ func testEndedOperationApplies(t *testing.T, h Harness) {
 		require.NoError(t, err)
 		require.NotNil(t, stoppedTask)
 		assert.Equal(t, state.Task.Stopped, stoppedTask.State)
+	})
+
+	// A cancel an operator asked for still has engine work to cancel, so the
+	// settle leaves the apply to it, even with SchemaBot's stop pending too.
+	t.Run("SettleAppliesStoppedForEndedOperation_LeavesApplyToPendingCancel", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		ops := []endedOperationFixtureOp{
+			{shard: "-40", state: state.ApplyOperation.Failed, taskState: state.Task.Failed},
+			{shard: "40-80", state: state.ApplyOperation.Stopped, taskState: state.Task.Stopped},
+		}
+		cancelled, _ := createEndedOperationApply(t, store, "apply_ended_settle_cancel", 969, state.Apply.RunningDegraded, true, ops...)
+		requestControlBy(t, store, cancelled.ID, storage.ControlOperationStop, storage.EndedOperationStopCaller)
+		requestControlBy(t, store, cancelled.ID, storage.ControlOperationCancel, "operator-a")
+		plain, _ := createEndedOperationApply(t, store, "apply_ended_settle_no_cancel", 970, state.Apply.RunningDegraded, true, ops...)
+		requestControlBy(t, store, plain.ID, storage.ControlOperationStop, storage.EndedOperationStopCaller)
+
+		settled, err := store.Applies().SettleAppliesStoppedForEndedOperation(ctx, 10)
+		require.NoError(t, err)
+		assert.Equal(t, []string{plain.ApplyIdentifier}, endedApplyIdentifiers(settled))
+
+		reloaded, err := store.Applies().Get(ctx, cancelled.ID)
+		require.NoError(t, err)
+		require.NotNil(t, reloaded)
+		assert.Equal(t, state.Apply.RunningDegraded, reloaded.State)
+	})
+
+	// A pending shard may already have engine work under way: a task past
+	// pending, or an engine handle saved for it. The stop has yet to reach that
+	// work, so the settle leaves the apply to stop reconciliation rather than
+	// cancel the shard over it.
+	t.Run("SettleAppliesStoppedForEndedOperation_LeavesPendingShardThatMayHaveStarted", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		failed := endedOperationFixtureOp{shard: "-40", state: state.ApplyOperation.Failed, taskState: state.Task.Failed}
+		stopped := endedOperationFixtureOp{shard: "40-80", state: state.ApplyOperation.Stopped, taskState: state.Task.Stopped}
+
+		runningTask, _ := createEndedOperationApply(t, store, "apply_ended_settle_running_task", 971, state.Apply.RunningDegraded, true,
+			failed, stopped, endedOperationFixtureOp{shard: "80-", state: state.ApplyOperation.Pending, taskState: state.Task.Running})
+		requestControlBy(t, store, runningTask.ID, storage.ControlOperationStop, storage.EndedOperationStopCaller)
+
+		handled, handledOps := createEndedOperationApply(t, store, "apply_ended_settle_handle", 972, state.Apply.RunningDegraded, true,
+			failed, stopped, endedOperationFixtureOp{shard: "80-", state: state.ApplyOperation.Pending, taskState: state.Task.Pending})
+		require.NoError(t, store.ApplyOperations().SaveExternalID(ctx, handled.ID, handledOps["80-"], "remote-apply-1", "remote-operation-1"))
+		requestControlBy(t, store, handled.ID, storage.ControlOperationStop, storage.EndedOperationStopCaller)
+
+		untouched, _ := createEndedOperationApply(t, store, "apply_ended_settle_untouched", 973, state.Apply.RunningDegraded, true,
+			failed, stopped, endedOperationFixtureOp{shard: "80-", state: state.ApplyOperation.Pending, taskState: state.Task.Pending})
+		requestControlBy(t, store, untouched.ID, storage.ControlOperationStop, storage.EndedOperationStopCaller)
+
+		settled, err := store.Applies().SettleAppliesStoppedForEndedOperation(ctx, 10)
+		require.NoError(t, err)
+		assert.Equal(t, []string{untouched.ApplyIdentifier}, endedApplyIdentifiers(settled))
+	})
+
+	// Stop delivery moves a shard nothing claimed from pending to stopped. It
+	// never started, so the settle cancels it, with its task, rather than
+	// report a failure for work it never did. The shard that copied and was
+	// stopped at the cutover still fails naming -40.
+	t.Run("SettleAppliesStoppedForEndedOperation_CancelsStoppedShardThatNeverStarted", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		apply, ops := createEndedOperationApply(t, store, "apply_ended_settle_unstarted", 974, state.Apply.RunningDegraded, true,
+			endedOperationFixtureOp{shard: "-40", state: state.ApplyOperation.Failed, taskState: state.Task.Failed, claimed: true},
+			endedOperationFixtureOp{shard: "40-80", state: state.ApplyOperation.Stopped, taskState: state.Task.Stopped, claimed: true},
+			endedOperationFixtureOp{shard: "80-", state: state.ApplyOperation.Stopped, taskState: state.Task.Pending},
+		)
+		requestControlBy(t, store, apply.ID, storage.ControlOperationStop, storage.EndedOperationStopCaller)
+
+		settled, err := store.Applies().SettleAppliesStoppedForEndedOperation(ctx, 10)
+		require.NoError(t, err)
+		assert.Equal(t, []string{apply.ApplyIdentifier}, endedApplyIdentifiers(settled))
+
+		copied, err := store.ApplyOperations().Get(ctx, ops["40-80"])
+		require.NoError(t, err)
+		require.NotNil(t, copied)
+		assert.Equal(t, state.ApplyOperation.Failed, copied.State)
+		assert.Equal(t, ops["-40"], copied.EndedByOperationID)
+
+		unstarted, err := store.ApplyOperations().Get(ctx, ops["80-"])
+		require.NoError(t, err)
+		require.NotNil(t, unstarted)
+		assert.Equal(t, state.ApplyOperation.Cancelled, unstarted.State)
+		assert.Zero(t, unstarted.EndedByOperationID)
+
+		unstartedTask, err := store.Tasks().Get(ctx, "task_apply_ended_settle_unstarted_80-")
+		require.NoError(t, err)
+		require.NotNil(t, unstartedTask)
+		assert.Equal(t, state.Task.Cancelled, unstartedTask.State)
+	})
+
+	// Each stopped shard names the failure that ended its own rollout member,
+	// so target b's stopped shard names target b's failure rather than the
+	// apply's first.
+	t.Run("SettleAppliesStoppedForEndedOperation_NamesEachMembersOwnFailure", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		apply, ops := createEndedOperationApply(t, store, "apply_ended_settle_members", 975, state.Apply.RunningDegraded, true,
+			endedOperationFixtureOp{target: "a", shard: "-40", state: state.ApplyOperation.Failed, taskState: state.Task.Failed},
+			endedOperationFixtureOp{target: "b", shard: "-40", state: state.ApplyOperation.Failed, taskState: state.Task.Failed},
+			endedOperationFixtureOp{target: "a", shard: "40-80", state: state.ApplyOperation.Stopped, taskState: state.Task.Stopped},
+			endedOperationFixtureOp{target: "b", shard: "40-80", state: state.ApplyOperation.Stopped, taskState: state.Task.Stopped},
+		)
+		requestControlBy(t, store, apply.ID, storage.ControlOperationStop, storage.EndedOperationStopCaller)
+
+		settled, err := store.Applies().SettleAppliesStoppedForEndedOperation(ctx, 10)
+		require.NoError(t, err)
+		require.Len(t, settled, 1)
+		require.NotNil(t, settled[0].EndedOperation)
+		assert.Equal(t, ops["a/-40"], settled[0].EndedOperation.ID)
+
+		for _, member := range []string{"a", "b"} {
+			op, err := store.ApplyOperations().Get(ctx, ops[member+"/40-80"])
+			require.NoError(t, err)
+			require.NotNil(t, op)
+			assert.Equal(t, state.ApplyOperation.Failed, op.State, "target %s", member)
+			assert.Equal(t, ops[member+"/-40"], op.EndedByOperationID, "target %s", member)
+		}
 	})
 
 	// Retry expiry leaves an apply carrying SchemaBot's stop to the settle,

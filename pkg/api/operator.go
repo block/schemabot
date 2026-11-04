@@ -2545,6 +2545,15 @@ func (s *Service) completeLandedStopForHeldOpenApply(ctx context.Context, logger
 	if controlReq == nil {
 		return nil
 	}
+	// The stop SchemaBot records for an ended operation marks the apply as the
+	// ended-operation settle's, which fails the apply and then answers the
+	// stop. Completing it here would leave the apply open with nothing to
+	// settle it.
+	if controlReq.RequestedBy == storage.EndedOperationStopCaller {
+		logger.Debug("operator: leaving SchemaBot's stop for an ended operation to the settle that fails the apply",
+			apply.LogAttrs()...)
+		return nil
+	}
 
 	ops, err := s.storage.ApplyOperations().ListByApply(ctx, apply.ID)
 	if err != nil {

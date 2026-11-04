@@ -844,6 +844,11 @@ type multiOpSeed struct {
 	// operation per (table, target), in that order, each stamped with its table
 	// step. Per-member maps and opID are then keyed by operation key.
 	tables []string
+	// shards, when set, seeds one operation per shard of the one target
+	// "payments-" + deployments[0], keyed as a sharded apply keys its per-shard
+	// work, so every shard is a member of the same rollout member. Per-member
+	// maps and opID are then keyed by shard.
+	shards []string
 	// databaseType is the apply's and its tasks' database type; MySQL when
 	// unset.
 	databaseType string
@@ -881,6 +886,18 @@ func (m matrixSeedMember) tableName() string {
 }
 
 func (spec multiOpSeed) members() []matrixSeedMember {
+	if len(spec.shards) > 0 {
+		members := make([]matrixSeedMember, 0, len(spec.shards))
+		for _, shard := range spec.shards {
+			members = append(members, matrixSeedMember{
+				name:         shard,
+				deployment:   spec.deployments[0],
+				target:       "payments-" + spec.deployments[0],
+				operationKey: storage.ShardOperationKey("payments", shard, "widgets"),
+			})
+		}
+		return members
+	}
 	if len(spec.targets) == 0 {
 		members := make([]matrixSeedMember, 0, len(spec.deployments))
 		for _, dep := range spec.deployments {

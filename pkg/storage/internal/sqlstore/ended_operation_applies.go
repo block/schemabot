@@ -103,10 +103,27 @@ func (s *applyStore) listAppliesHeldByEndedOperation(ctx context.Context, databa
 	ended, endedArgs := s.endedOperationSQL("ended")
 	args := stringArgs(heldByEndedOperationApplyStates)
 	args = append(args, stringArgs(databaseTypes)...)
+	args = append(args, stringArgs(quietOperationStates)...)
+	args = append(args, stringArgs(quietOperationStates)...)
 	args = append(args, endedArgs...)
 	args = append(args, stringArgs(quietOperationStates)...)
+	args = append(args, state.ApplyOperation.Pending)
 	args = append(args, storage.ControlOperationStop, storage.ControlOperationCancel, storage.ControlRequestPending, limit)
 
+	// The cutover runs for one rollout member, a deployment and target, at a
+	// time, so an ended operation holds only the operations of its own member.
+	// A later member waiting behind it waits on the rollout's barrier, which
+	// leaves the decision to the operator, so an apply with any such member is
+	// not this sweep's.
+	//
+	// Every held operation that started must be held by a live drive, since
+	// the drive is what delivers the stop and saves the copy. A started
+	// operation nobody drives is left to recovery, which claims it again and
+	// brings it back here, or, under a spent retry, to retry expiry. That
+	// makes the two sweeps disjoint: expiry takes only applies no driver
+	// holds. A pending operation needs no drive; stop reconciliation settles
+	// it stopped.
+	//
 	// A pending stop or cancel is already ending the apply, whoever asked for
 	// it, so the apply is left to that request.
 	rows, err := s.db.QueryContext(ctx, fmt.Sprintf(`
@@ -116,12 +133,24 @@ func (s *applyStore) listAppliesHeldByEndedOperation(ctx context.Context, databa
 			AND database_type IN (%s)
 			AND %s
 			AND EXISTS (
-				SELECT 1 FROM apply_operations ended
-				WHERE ended.apply_id = applies.id AND %s
-			)
-			AND EXISTS (
 				SELECT 1 FROM apply_operations held
 				WHERE held.apply_id = applies.id AND held.state NOT IN (%s)
+			)
+			AND NOT EXISTS (
+				SELECT 1 FROM apply_operations held
+				WHERE held.apply_id = applies.id AND held.state NOT IN (%s)
+					AND NOT EXISTS (
+						SELECT 1 FROM apply_operations ended
+						WHERE ended.apply_id = held.apply_id
+							AND ended.deployment = held.deployment
+							AND ended.target = held.target
+							AND %s
+					)
+			)
+			AND NOT EXISTS (
+				SELECT 1 FROM apply_operations held
+				WHERE held.apply_id = applies.id AND held.state NOT IN (%s) AND held.state <> ?
+					AND NOT (%s)
 			)
 			AND NOT EXISTS (
 				SELECT 1 FROM apply_control_requests req
@@ -132,8 +161,11 @@ func (s *applyStore) listAppliesHeldByEndedOperation(ctx context.Context, databa
 	`, placeholders(len(heldByEndedOperationApplyStates)),
 		placeholders(len(databaseTypes)),
 		s.dialect.JSONBooleanIsTrue("applies.options", []string{"defer_cutover"}),
+		placeholders(len(quietOperationStates)),
+		placeholders(len(quietOperationStates)),
 		ended,
-		placeholders(len(quietOperationStates))), args...)
+		placeholders(len(quietOperationStates)),
+		freshLeaseSQL(s.dialect, "held")), args...)
 	if err != nil {
 		return nil, fmt.Errorf("query applies held by an ended operation: %w", err)
 	}
@@ -143,6 +175,14 @@ func (s *applyStore) listAppliesHeldByEndedOperation(ctx context.Context, databa
 		return nil, fmt.Errorf("scan applies held by an ended operation: %w", err)
 	}
 	return s.withEndedOperations(ctx, s.db, applies)
+}
+
+// freshLeaseSQL matches an operation, aliased op, that a live drive holds: the
+// lease undrivenApplyGate looks for, read for one operation.
+func freshLeaseSQL(d Dialect, op string) string {
+	freshLeaseAfter := d.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime,
+		LiteralIntervalAmount(uint64(storage.ApplyLeaseStaleAfter.Microseconds())), IntervalMicrosecond)
+	return fmt.Sprintf("%[1]s.lease_owner <> '' AND %[1]s.updated_at >= %[2]s", op, freshLeaseAfter)
 }
 
 // SettleAppliesStoppedForEndedOperation elects one instance per pass and
@@ -167,14 +207,24 @@ func (s *applyStore) settleAppliesStoppedForEndedOperation(ctx context.Context, 
 
 	// Only the stop SchemaBot recorded for the ended operation marks an apply
 	// as this sweep's. An operator's stop leaves the apply to the operator, who
-	// may start it again. The apply is taken only once every operation is quiet
-	// and no driver holds one, for the reasons expireRetryable gives: the rows
-	// of a live drive are its own.
+	// may start it again, and a pending cancel leaves it to the cancel, which
+	// still has engine work to cancel. The apply is taken only once every
+	// operation is quiet and no driver holds one, for the reasons
+	// expireRetryable gives: the rows of a live drive are its own.
+	//
+	// A pending operation counts as quiet only with evidence it never started:
+	// no engine handle, and no task of the apply doing work. A task still
+	// running means a stop has yet to reach an engine, so the apply is left to
+	// stop reconciliation, which delivers it.
 	ended, endedArgs := s.endedOperationSQL("ended")
+	settledTaskStates := append([]string{state.Task.Pending, state.Task.Stopped, state.Task.FailedRetryable}, state.TerminalTaskStates...)
 	args := stringArgs(heldByEndedOperationApplyStates)
 	args = append(args, storage.ControlOperationStop, storage.ControlRequestPending, storage.EndedOperationStopCaller)
+	args = append(args, storage.ControlOperationCancel, storage.ControlRequestPending)
 	args = append(args, endedArgs...)
 	args = append(args, stringArgs(settleableOperationStates)...)
+	args = append(args, state.ApplyOperation.Pending)
+	args = append(args, stringArgs(settledTaskStates)...)
 	args = append(args, limit)
 	rows, err := tx.QueryContext(ctx, fmt.Sprintf(`
 		SELECT `+applyColumns+`
@@ -185,6 +235,10 @@ func (s *applyStore) settleAppliesStoppedForEndedOperation(ctx context.Context, 
 				SELECT 1 FROM apply_control_requests req
 				WHERE req.apply_id = applies.id AND req.operation = ? AND req.status = ? AND req.requested_by = ?
 			)
+			AND NOT EXISTS (
+				SELECT 1 FROM apply_control_requests req
+				WHERE req.apply_id = applies.id AND req.operation = ? AND req.status = ?
+			)
 			AND EXISTS (
 				SELECT 1 FROM apply_operations ended
 				WHERE ended.apply_id = applies.id AND %s
@@ -192,6 +246,14 @@ func (s *applyStore) settleAppliesStoppedForEndedOperation(ctx context.Context, 
 			AND NOT EXISTS (
 				SELECT 1 FROM apply_operations busy
 				WHERE busy.apply_id = applies.id AND busy.state NOT IN (%s)
+			)
+			AND NOT EXISTS (
+				SELECT 1 FROM apply_operations handled
+				WHERE handled.apply_id = applies.id AND handled.state = ? AND COALESCE(handled.external_id, '') <> ''
+			)
+			AND NOT EXISTS (
+				SELECT 1 FROM tasks working
+				WHERE working.apply_id = applies.id AND working.state NOT IN (%s)
 			)
 			AND %s
 		ORDER BY updated_at
@@ -201,6 +263,7 @@ func (s *applyStore) settleAppliesStoppedForEndedOperation(ctx context.Context, 
 		s.dialect.JSONBooleanIsTrue("applies.options", []string{"defer_cutover"}),
 		ended,
 		placeholders(len(settleableOperationStates)),
+		placeholders(len(settledTaskStates)),
 		undrivenApplyGate(s.dialect)), args...)
 	if err != nil {
 		return nil, fmt.Errorf("query applies stopped for an ended operation: %w", err)
@@ -228,9 +291,13 @@ func (s *applyStore) settleAppliesStoppedForEndedOperation(ctx context.Context, 
 	if err != nil {
 		return nil, err
 	}
+	cancelling, err := appliesWithPendingCancel(ctx, tx, candidateIDs)
+	if err != nil {
+		return nil, err
+	}
 	eligible := make([]*storage.Apply, 0, len(applies))
 	for _, apply := range applies {
-		if undriven[apply.ID] {
+		if undriven[apply.ID] && !cancelling[apply.ID] {
 			eligible = append(eligible, apply)
 		}
 	}
@@ -263,21 +330,70 @@ func (s *applyStore) settleAppliesStoppedForEndedOperation(ctx context.Context, 
 	return settled, nil
 }
 
+// appliesWithPendingCancel reads, inside tx, which of the given applies an
+// operator is cancelling. Recording a cancel holds the apply row shared, so
+// once tx holds the rows for update a cancel has either committed, and this
+// read sees it, or waits for tx. The selection's own check reads without a
+// lock and can miss a cancel that committed while it waited.
+func appliesWithPendingCancel(ctx context.Context, tx *rebindTx, applyIDs []int64) (map[int64]bool, error) {
+	args := make([]any, 0, len(applyIDs)+2)
+	for _, id := range applyIDs {
+		args = append(args, id)
+	}
+	args = append(args, storage.ControlOperationCancel, storage.ControlRequestPending)
+	rows, err := tx.QueryContext(ctx, fmt.Sprintf(`
+		SELECT DISTINCT apply_id FROM apply_control_requests
+		WHERE apply_id IN (%s) AND operation = ? AND status = ?
+	`, placeholders(len(applyIDs))), args...)
+	if err != nil {
+		return nil, fmt.Errorf("query pending cancels of %d applies stopped for an ended operation: %w", len(applyIDs), err)
+	}
+	defer utils.CloseAndLog(rows)
+	cancelling := make(map[int64]bool)
+	for rows.Next() {
+		var applyID int64
+		if err := rows.Scan(&applyID); err != nil {
+			return nil, fmt.Errorf("scan pending cancel of %d applies stopped for an ended operation: %w", len(applyIDs), err)
+		}
+		cancelling[applyID] = true
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("read pending cancels of %d applies stopped for an ended operation: %w", len(applyIDs), err)
+	}
+	return cancelling, nil
+}
+
 // settleStoppedForEndedOperation writes one apply's settlement inside tx, which
 // holds the apply and every one of its operations locked.
 //
-// The stopped operations settle failed and name the operation they failed for.
-// Their tasks keep their stopped state: the copy each one made is saved, and a
-// new apply of the same change resumes it. An operation still waiting on a
-// retry settles failed with its tasks, as expiry settles it. An operation or
-// task that never started is cancelled rather than failed, because it did no
-// work to fail.
+// An operation that never started is cancelled rather than failed, because it
+// did no work to fail. That includes one a stop moved from pending to stopped:
+// no engine handle, no start time, and no task of it that left pending.
+//
+// The other stopped operations settle failed and name the operation they
+// failed for, the one that ended their own rollout member. Their tasks keep
+// their stopped state: the copy each one made is saved, and a new apply of the
+// same change resumes it. An operation still waiting on a retry settles failed
+// with its tasks, as expiry settles it.
 //
 // The stop SchemaBot recorded is left pending here, and so is any cutover an
 // operator asked for. The reaper answers both once the apply is failed, through
 // the same settlement every other path uses.
 func settleStoppedForEndedOperation(ctx context.Context, tx *rebindTx, settled *storage.EndedOperationApply) error {
 	apply := settled.Apply
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE apply_operations
+		SET state = ?, completed_at = COALESCE(completed_at, NOW()), updated_at = NOW()
+		WHERE apply_id = ? AND state IN (?, ?)
+			AND COALESCE(external_id, '') = ''
+			AND started_at IS NULL
+			AND NOT EXISTS (
+				SELECT 1 FROM tasks
+				WHERE tasks.apply_operation_id = apply_operations.id AND tasks.state <> ?
+			)
+	`, state.ApplyOperation.Cancelled, apply.ID, state.ApplyOperation.Pending, state.ApplyOperation.Stopped, state.Task.Pending); err != nil {
+		return fmt.Errorf("cancel never-started operations of apply %s stopped for ended operation %d: %w", apply.ApplyIdentifier, settled.EndedOperation.ID, err)
+	}
 	if _, err := tx.ExecContext(ctx, `
 		UPDATE tasks
 		SET state = ?, completed_at = COALESCE(completed_at, NOW()), updated_at = NOW()
@@ -292,12 +408,8 @@ func settleStoppedForEndedOperation(ctx context.Context, tx *rebindTx, settled *
 	`, state.Task.Failed, apply.ID, state.Task.FailedRetryable); err != nil {
 		return fmt.Errorf("fail retryable tasks of apply %s stopped for ended operation %d: %w", apply.ApplyIdentifier, settled.EndedOperation.ID, err)
 	}
-	if _, err := tx.ExecContext(ctx, `
-		UPDATE apply_operations
-		SET state = ?, ended_by_operation_id = ?, completed_at = COALESCE(completed_at, NOW()), updated_at = NOW()
-		WHERE apply_id = ? AND state = ?
-	`, state.ApplyOperation.Failed, settled.EndedOperation.ID, apply.ID, state.ApplyOperation.Stopped); err != nil {
-		return fmt.Errorf("fail operations of apply %s stopped for ended operation %d: %w", apply.ApplyIdentifier, settled.EndedOperation.ID, err)
+	if err := failStoppedForMemberFailure(ctx, tx, settled); err != nil {
+		return err
 	}
 	if _, err := tx.ExecContext(ctx, `
 		UPDATE apply_operations
@@ -319,6 +431,57 @@ func settleStoppedForEndedOperation(ctx context.Context, tx *rebindTx, settled *
 		WHERE id = ?
 	`, state.Apply.Failed, apply.ID); err != nil {
 		return fmt.Errorf("fail apply %s stopped for ended operation %d: %w", apply.ApplyIdentifier, settled.EndedOperation.ID, err)
+	}
+	return nil
+}
+
+// rolloutMember is the deployment and target a rollout cuts over together.
+type rolloutMember struct {
+	deployment string
+	target     string
+}
+
+// failStoppedForMemberFailure fails each stopped operation of the apply and
+// names the operation that ended its own rollout member. A member with no
+// ended operation of its own names the one that ended the apply.
+func failStoppedForMemberFailure(ctx context.Context, tx *rebindTx, settled *storage.EndedOperationApply) error {
+	apply := settled.Apply
+	rows, err := tx.QueryContext(ctx, `
+		SELECT `+applyOperationColumns+`
+		FROM apply_operations
+		WHERE apply_id = ?
+		ORDER BY id
+	`, apply.ID)
+	if err != nil {
+		return fmt.Errorf("query operations of apply %s stopped for ended operation %d: %w", apply.ApplyIdentifier, settled.EndedOperation.ID, err)
+	}
+	ops, err := scanApplyOperations(rows)
+	utils.CloseAndLog(rows)
+	if err != nil {
+		return fmt.Errorf("scan operations of apply %s stopped for ended operation %d: %w", apply.ApplyIdentifier, settled.EndedOperation.ID, err)
+	}
+	byMember := make(map[rolloutMember][]*storage.ApplyOperation)
+	var members []rolloutMember
+	for _, op := range ops {
+		m := rolloutMember{deployment: op.Deployment, target: op.Target}
+		if _, ok := byMember[m]; !ok {
+			members = append(members, m)
+		}
+		byMember[m] = append(byMember[m], op)
+	}
+	for _, m := range members {
+		endedBy := settled.EndedOperation.ID
+		if ended := firstEndedOperation(byMember[m]); ended != nil {
+			endedBy = ended.ID
+		}
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE apply_operations
+			SET state = ?, ended_by_operation_id = ?, completed_at = COALESCE(completed_at, NOW()), updated_at = NOW()
+			WHERE apply_id = ? AND deployment = ? AND target = ? AND state = ?
+		`, state.ApplyOperation.Failed, endedBy, apply.ID, m.deployment, m.target, state.ApplyOperation.Stopped); err != nil {
+			return fmt.Errorf("fail operations of apply %s deployment %s target %s stopped for ended operation %d: %w",
+				apply.ApplyIdentifier, m.deployment, m.target, endedBy, err)
+		}
 	}
 	return nil
 }
