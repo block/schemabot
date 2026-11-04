@@ -123,7 +123,17 @@ func (s *controlRequestStore) listStrandedPending(ctx context.Context, limit int
 }
 
 func (s *controlRequestStore) RequestPending(ctx context.Context, req *storage.ApplyControlRequest) (*storage.ApplyControlRequest, bool, error) {
-	return s.requestPendingWithRetry(ctx, req, "")
+	return s.requestPendingWithRetry(ctx, req, "", "")
+}
+
+// RequestPendingCommand is RequestPending that leaves a settled row carrying
+// req's command as it is. See storage.ControlRequestStore.
+func (s *controlRequestStore) RequestPendingCommand(ctx context.Context, req *storage.ApplyControlRequest) (*storage.ApplyControlRequest, bool, error) {
+	commandID, err := req.ControlCommandID()
+	if err != nil {
+		return nil, false, fmt.Errorf("request control request for apply %d operation %s: %w", req.ApplyID, req.Operation, err)
+	}
+	return s.requestPendingWithRetry(ctx, req, "", commandID)
 }
 
 // RequestPendingSuperseding is RequestPending with the superseded operation's
@@ -136,18 +146,19 @@ func (s *controlRequestStore) RequestPendingSuperseding(ctx context.Context, req
 	if superseded == req.Operation {
 		return nil, false, fmt.Errorf("request control request for apply %d operation %s: a request cannot supersede its own operation", req.ApplyID, req.Operation)
 	}
-	return s.requestPendingWithRetry(ctx, req, superseded)
+	return s.requestPendingWithRetry(ctx, req, superseded, "")
 }
 
 // requestPendingWithRetry records req, completing superseded's pending request
-// in the same transaction when superseded is set.
-func (s *controlRequestStore) requestPendingWithRetry(ctx context.Context, req *storage.ApplyControlRequest, superseded storage.ControlOperation) (*storage.ApplyControlRequest, bool, error) {
+// in the same transaction when superseded is set, and leaving a settled row
+// that carries commandID as it is when commandID is set.
+func (s *controlRequestStore) requestPendingWithRetry(ctx context.Context, req *storage.ApplyControlRequest, superseded storage.ControlOperation, commandID string) (*storage.ApplyControlRequest, bool, error) {
 	var controlReq *storage.ApplyControlRequest
 	var alreadyPending bool
 	op := fmt.Sprintf("request control request for apply %d operation %s", req.ApplyID, req.Operation)
 	err := withLockRetry(ctx, s.classifier, op, func() error {
 		var attemptErr error
-		controlReq, alreadyPending, attemptErr = s.requestPending(ctx, req, superseded)
+		controlReq, alreadyPending, attemptErr = s.requestPending(ctx, req, superseded, commandID)
 		if attemptErr == nil || !s.classifier.IsDuplicateKey(attemptErr) {
 			return attemptErr
 		}
@@ -162,7 +173,7 @@ func (s *controlRequestStore) requestPendingWithRetry(ctx context.Context, req *
 		// losing insert returns the winning row as "already requested"; if the
 		// re-read also fails, return that storage error instead of hiding an
 		// unexpected conflict.
-		controlReq, alreadyPending, attemptErr = s.requestPending(ctx, req, superseded)
+		controlReq, alreadyPending, attemptErr = s.requestPending(ctx, req, superseded, commandID)
 		if attemptErr != nil {
 			return fmt.Errorf("retry control request after duplicate insert for apply %d operation %s: %w", req.ApplyID, req.Operation, attemptErr)
 		}
@@ -174,7 +185,7 @@ func (s *controlRequestStore) requestPendingWithRetry(ctx context.Context, req *
 	return controlReq, alreadyPending, nil
 }
 
-func (s *controlRequestStore) requestPending(ctx context.Context, req *storage.ApplyControlRequest, superseded storage.ControlOperation) (*storage.ApplyControlRequest, bool, error) {
+func (s *controlRequestStore) requestPending(ctx context.Context, req *storage.ApplyControlRequest, superseded storage.ControlOperation, commandID string) (*storage.ApplyControlRequest, bool, error) {
 	metadata := nullJSON(req.Metadata)
 	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
@@ -215,6 +226,16 @@ func (s *controlRequestStore) requestPending(ctx context.Context, req *storage.A
 			return nil, false, fmt.Errorf("commit pending control request read for apply %d operation %s: %w", req.ApplyID, req.Operation, err)
 		}
 		return existing, true, nil
+	}
+	if settledByCommand, err := existing.SettledByControlCommand(commandID); err != nil {
+		return nil, false, fmt.Errorf("read the command of control request for apply %d operation %s: %w", req.ApplyID, req.Operation, err)
+	} else if settledByCommand {
+		if err := tx.Commit(); err != nil {
+			return nil, false, fmt.Errorf("commit settled control request read for apply %d operation %s: %w", req.ApplyID, req.Operation, err)
+		}
+		slog.DebugContext(ctx, "control request already settled for this command; leaving it settled",
+			"apply_id", req.ApplyID, "operation", req.Operation, "command_id", commandID, "status", existing.Status)
+		return existing, false, nil
 	}
 	if existing != nil {
 		_, err := tx.ExecContext(ctx, `
