@@ -328,6 +328,133 @@ func TestRemoteProgressBatcher_UnusableAnswersHandPollsBack(t *testing.T) {
 	}
 }
 
+// One operation's entry answered Unimplemented hands only that poll back to
+// ask directly. The other operations in the round keep their answers, and
+// the next round is still batched, because only a whole call answered
+// Unimplemented means the data plane cannot batch.
+func TestRemoteProgressBatcher_EntryUnimplementedFallsBackForThatOperationOnly(t *testing.T) {
+	rounds := &manualRounds{}
+	b := &remoteProgressBatcher{afterFunc: rounds.schedule}
+	client := &batchProgressFakeClient{answer: func(req *ternv1.BatchProgressRequest) (*ternv1.BatchProgressResponse, error) {
+		resp, err := answerEachOperationRunning(req)
+		for _, entry := range resp.GetOperations() {
+			if entry.GetApplyOperationId() == "op-1" {
+				entry.Progress = nil
+				entry.ErrorCode = int32(codes.Unimplemented)
+				entry.ErrorMessage = "progress is not implemented for this operation"
+			}
+		}
+		return resp, err
+	}}
+
+	results := startBatchPolls(t, b, rounds, client, "op-1", "op-2")
+	rounds.sendNext(t)
+	assert.ErrorIs(t, receivePoll(t, results[0]).err, errProgressBatchFallback)
+	other := receivePoll(t, results[1])
+	require.NoError(t, other.err)
+	assert.Equal(t, "op-2", other.resp.GetApplyOperationId())
+
+	next := startBatchPolls(t, b, rounds, client, "op-2")
+	rounds.sendNext(t)
+	require.NoError(t, receivePoll(t, next[0]).err)
+	assert.Len(t, client.sent(), 2, "the next round is batched too")
+}
+
+// Drives poll on their own timers, so their polls of one remote apply arrive
+// spread across the poll interval rather than together. With real timers,
+// 32 drives polling at staggered offsets still share their rounds: the data
+// plane is asked a few times per interval in all, not once per drive, and
+// every drive gets the answer for its own operation.
+func TestRemoteProgressBatcher_StaggeredDrivesShareRoundsWithRealTimers(t *testing.T) {
+	const drives, pollsPerDrive = 32, 5
+	run := runStaggeredBatchPolls(t, drives, pollsPerDrive, 20*time.Millisecond)
+	require.Empty(t, run.errs)
+	assert.Equal(t, drives*pollsPerDrive, run.polls)
+	assert.LessOrEqual(t, run.calls, run.polls/4,
+		"rounds are shared across drives (%d calls for %d polls)", run.calls, run.polls)
+	t.Logf("%d BatchProgress calls for %d polls; slowest poll waited %s", run.calls, run.polls, run.slowest)
+}
+
+// BenchmarkRemoteProgressBatcher_StaggeredDrives reports how many
+// BatchProgress calls a round of staggered polls costs and how long a poll
+// waits for its round, at the production poll interval.
+func BenchmarkRemoteProgressBatcher_StaggeredDrives(b *testing.B) {
+	for _, drives := range []int{8, 32, 256} {
+		b.Run(fmt.Sprintf("drives=%d", drives), func(b *testing.B) {
+			var calls, polls int
+			var waited, slowest time.Duration
+			for b.Loop() {
+				run := runStaggeredBatchPolls(b, drives, 4, grpcProgressPollInterval)
+				require.Empty(b, run.errs)
+				calls += run.calls
+				polls += run.polls
+				waited += run.waited
+				slowest = max(slowest, run.slowest)
+			}
+			b.ReportMetric(float64(calls)/float64(polls), "calls/poll")
+			b.ReportMetric(float64(waited.Milliseconds())/float64(polls), "ms-waited/poll")
+			b.ReportMetric(float64(slowest.Milliseconds()), "ms-slowest-wait")
+		})
+	}
+}
+
+type staggeredBatchRun struct {
+	calls, polls    int
+	waited, slowest time.Duration
+	errs            []error
+}
+
+// runStaggeredBatchPolls runs drives that each poll their own operation
+// pollsPerDrive times, one poll per interval, with the drives' first polls
+// spread evenly across one interval. The batcher sends rounds on real timers.
+func runStaggeredBatchPolls(tb testing.TB, drives, pollsPerDrive int, interval time.Duration) staggeredBatchRun {
+	tb.Helper()
+	b := &remoteProgressBatcher{interval: interval}
+	defer b.close()
+	client := &batchProgressFakeClient{answer: answerEachOperationRunning}
+
+	var mu sync.Mutex
+	run := staggeredBatchRun{}
+	var wg sync.WaitGroup
+	for i := range drives {
+		operationID := fmt.Sprintf("op-%d", i)
+		offset := interval * time.Duration(i) / time.Duration(drives)
+		wg.Go(func() {
+			start := time.NewTimer(offset)
+			defer start.Stop()
+			<-start.C
+			// A drive's poll ticker starts when the drive does, so each drive
+			// keeps its own phase across the interval.
+			ticker := time.NewTicker(interval)
+			defer ticker.Stop()
+			for poll := range pollsPerDrive {
+				if poll > 0 {
+					<-ticker.C
+				}
+				ctx, cancel := context.WithTimeout(tb.Context(), 10*time.Second)
+				asked := time.Now()
+				resp, err := b.progress(ctx, client, slog.Default(), testBatchKey, operationID)
+				wait := time.Since(asked)
+				cancel()
+				mu.Lock()
+				run.polls++
+				run.waited += wait
+				run.slowest = max(run.slowest, wait)
+				switch {
+				case err != nil:
+					run.errs = append(run.errs, fmt.Errorf("%s poll %d: %w", operationID, poll, err))
+				case resp.GetApplyOperationId() != operationID:
+					run.errs = append(run.errs, fmt.Errorf("%s poll %d answered for %q", operationID, poll, resp.GetApplyOperationId()))
+				}
+				mu.Unlock()
+			}
+		})
+	}
+	wg.Wait()
+	run.calls = len(client.sent())
+	return run
+}
+
 // A failure of the whole call, such as the data plane not knowing the remote
 // apply, reaches every drive in the round as that drive's own poll error, so
 // each takes the path a direct poll would have.

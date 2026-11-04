@@ -599,7 +599,9 @@ has not been sent, and the round asks for every operation in it with one
 `BatchProgress` call. Each entry of the answer is what `Progress` scoped to
 that operation returns, so the driver checks and handles it exactly as a
 direct answer. Rounds for a remote apply start at most once per poll interval,
-and a poll never receives an answer read before it was made.
+and a poll never receives an answer read before it was made. Drives poll on
+their own timers, so a poll waits for the next round: half a poll interval on
+average, and at most one.
 
 ```
 Driver A (member 1) --poll--+
@@ -610,11 +612,13 @@ Driver C (member 3) --poll--+                         |
 ```
 
 A round that cannot answer an operation hands the poll back, and the driver
-asks `Progress` for it directly. That happens when the data plane answers
-`Unimplemented` (it predates `BatchProgress`, or its client for the target
-cannot batch), in which case the remote apply is polled directly for a while
-before batching is tried again, and when an answer is too large or leaves an
-operation out. Any other error is handed to each driver as its own poll
+asks `Progress` for it directly. When the whole `BatchProgress` call answers
+`Unimplemented` (the data plane predates it, or its client for the target
+cannot batch), every poll in the round is handed back and the remote apply is
+polled directly for a while before batching is tried again. When only one
+operation's entry is `Unimplemented`, or an answer is too large or leaves an
+operation out, only the polls it could not answer are handed back, and the
+next round is still batched. Any other error is handed to each driver as its own poll
 error, as a direct call on the same connection would have met.
 
 ##### Repeated Remote Progress Errors
