@@ -261,11 +261,7 @@ func testEndedOperationApplies(t *testing.T, h Harness) {
 	// drove it restarted.
 	t.Run("ListAppliesHeldByEndedOperation_ParkedShardNeedsNoLiveDrive", func(t *testing.T) {
 		store := h.NewStorage(t)
-		createEndedOperationApply(t, store, "apply_ended_undriven_copy", 967, state.Apply.RunningDegraded, true,
-			endedOperationFixtureOp{shard: "-40", state: state.ApplyOperation.Failed, taskState: state.Task.Failed, claimed: true},
-			endedOperationFixtureOp{shard: "40-80", state: state.ApplyOperation.Running, taskState: state.Task.Running, claimed: true},
-		)
-		parked, parkedOps := createEndedOperationApply(t, store, "apply_ended_undriven_parked", 968, state.Apply.RunningDegraded, true,
+		parked, _ := createEndedOperationApply(t, store, "apply_ended_undriven_parked", 968, state.Apply.RunningDegraded, true,
 			endedOperationFixtureOp{shard: "-40", state: state.ApplyOperation.Failed, taskState: state.Task.Failed, claimed: true},
 			endedOperationFixtureOp{shard: "40-80", state: state.ApplyOperation.WaitingForCutover, taskState: state.Task.WaitingForCutover, claimed: true},
 		)
@@ -273,13 +269,32 @@ func testEndedOperationApplies(t *testing.T, h Harness) {
 			endedOperationFixtureOp{shard: "-40", state: state.ApplyOperation.Failed, taskState: state.Task.Failed, claimed: true},
 			endedOperationFixtureOp{shard: "40-80", state: state.ApplyOperation.WaitingForCutover, taskState: state.Task.WaitingForCutover, driven: true},
 		)
+		// Created last: its released copying shard is claimable, so a fixture
+		// built after it would claim that shard instead of its own.
+		createEndedOperationApply(t, store, "apply_ended_undriven_copy", 967, state.Apply.RunningDegraded, true,
+			endedOperationFixtureOp{shard: "-40", state: state.ApplyOperation.Failed, taskState: state.Task.Failed, claimed: true},
+			endedOperationFixtureOp{shard: "40-80", state: state.ApplyOperation.Running, taskState: state.Task.Running, claimed: true},
+		)
 
 		listed, err := store.Applies().ListAppliesHeldByEndedOperation(t.Context(), pausableTypes, 10)
 		require.NoError(t, err)
 		assert.ElementsMatch(t, []string{parked.ApplyIdentifier, driven.ApplyIdentifier}, endedApplyIdentifiers(listed))
+	})
+
+	// The parked shard that nobody drives is claimed once SchemaBot's stop is
+	// pending, which is how the stop reaches it.
+	t.Run("ListAppliesHeldByEndedOperation_UndrivenParkedShardIsClaimedForTheStop", func(t *testing.T) {
+		store := h.NewStorage(t)
+		parked, parkedOps := createEndedOperationApply(t, store, "apply_ended_undriven_parked", 968, state.Apply.RunningDegraded, true,
+			endedOperationFixtureOp{shard: "-40", state: state.ApplyOperation.Failed, taskState: state.Task.Failed, claimed: true},
+			endedOperationFixtureOp{shard: "40-80", state: state.ApplyOperation.WaitingForCutover, taskState: state.Task.WaitingForCutover, claimed: true},
+		)
+		claimed, err := store.ApplyOperations().FindNextApplyOperation(t.Context(), "driver-recovery")
+		require.NoError(t, err)
+		require.Nil(t, claimed, "a parked shard with a sibling is not claimed before a stop is pending")
 
 		requestControlBy(t, store, parked.ID, storage.ControlOperationStop, storage.EndedOperationStopCaller)
-		claimed, err := store.ApplyOperations().FindNextApplyOperation(t.Context(), "driver-recovery")
+		claimed, err = store.ApplyOperations().FindNextApplyOperation(t.Context(), "driver-recovery")
 		require.NoError(t, err)
 		require.NotNil(t, claimed, "the parked shard is claimed once the stop is pending")
 		assert.Equal(t, parkedOps["40-80"], claimed.ID)
