@@ -169,6 +169,23 @@ func TestRenderApplyInProgressNamesTheNextStep(t *testing.T) {
 		assert.Contains(t, out, "Once it completes, "+applyAgain)
 	})
 
+	t.Run("an apply of the latest commit points at its own progress", func(t *testing.T) {
+		const followProgress = "It is already applying this PR's latest commit. Follow its progress comment for the outcome and next steps.\n"
+		data := base
+		data.AppliesLatestCommit = true
+		data.ApplyState = state.Apply.Running
+		out := RenderApplyInProgress(data)
+		assert.Contains(t, out, "is still running (state: `running`), so a second apply cannot start.\n\n"+followProgress)
+		assert.NotContains(t, out, "schemabot apply")
+
+		data.ApplyState = state.Apply.WaitingForCutover
+		data.DeferCutover = true
+		out = RenderApplyInProgress(data)
+		assert.Contains(t, out, "To cut over:\n```\nschemabot cutover apply-abc123 -e staging --tenant payments\n```\n\n"+followProgress,
+			"the command that moves the running apply on is still offered")
+		assert.NotContains(t, out, "schemabot apply")
+	})
+
 	t.Run("an apply in another environment is named by it and addressed there", func(t *testing.T) {
 		data := base
 		data.ApplyEnvironment = "production"
