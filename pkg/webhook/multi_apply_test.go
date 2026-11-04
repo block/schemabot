@@ -65,15 +65,15 @@ func TestFormatApplyStatusComment_CutoverNextActionFollowsDeferCutover(t *testin
 	}
 
 	automatic := formatApplyStatusComment(runningApply(), ops, false, nil, nil, nil, nil, "", "")
-	assert.Contains(t, automatic, "SchemaBot will cut over `eu` next — no action needed.")
+	assert.Contains(t, automatic, "SchemaBot will run the cutover for `eu` next — no action needed.")
 	assert.NotContains(t, automatic, "schemabot cutover")
 
 	deferred := runningApply()
 	deferred.Options = storage.MarshalApplyOptions(storage.ApplyOptions{DeferCutover: true})
 	manual := formatApplyStatusComment(deferred, ops, false, nil, nil, nil, nil, "", "")
-	assert.Contains(t, manual, "To cut over `eu`:")
+	assert.Contains(t, manual, "To run the cutover for `eu`:")
 	assert.Contains(t, manual, "schemabot cutover apply-1 -e production")
-	assert.NotContains(t, manual, "SchemaBot will cut over")
+	assert.NotContains(t, manual, "SchemaBot will run the cutover for")
 }
 
 // An apply that failed under on_failure=pause with a held sibling renders the

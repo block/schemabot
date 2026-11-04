@@ -390,7 +390,7 @@ func TestWriteProgress_DivergedTargetsWaitingForCutover(t *testing.T) {
 	assertLess(t, out, "ADD COLUMN `region`", "       target payments-003\n")
 	assertLess(t, out, "       target payments-003\n", "ADD COLUMN `zone`")
 	assert.NotContains(t, out, "▸", "each DDL names its targets rather than heading a group")
-	assert.True(t, strings.HasSuffix(out, "To cut over prod/payments-001:\n  schemabot cutover apply-7f3c -e production\n"),
+	assert.True(t, strings.HasSuffix(out, "To run the cutover for prod/payments-001:\n  schemabot cutover apply-7f3c -e production\n"),
 		"the cutover closes the output:\n%s", out)
 	assert.NotContains(t, out, "schemabot stop", "targets only waiting for cutover keep the cutover as the one command")
 }
@@ -516,7 +516,7 @@ func TestFormatRolloutFooter_CutoverNotDeferredNeedsNoAction(t *testing.T) {
 	}
 
 	out := renderRollout(t, data)
-	assertLess(t, out, "SchemaBot will cut over prod/payments-001 next — no action needed.",
+	assertLess(t, out, "SchemaBot will run the cutover for prod/payments-001 next — no action needed.",
 		"To stop this schema change:\n  schemabot stop apply-7f3c -e production")
 	assert.NotContains(t, out, "schemabot cutover", "%s", out)
 }
