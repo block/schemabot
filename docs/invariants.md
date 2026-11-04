@@ -503,6 +503,25 @@ locked. *Enforced:* the bounded waits on the close path (`pkg/drain`, used by `p
 signal-scoped startup context (`pkg/serve/serve.go`, `pkg/cmd/commands/serve.go`), which reaches an
 in-flight storage convergence as the deliberate stop AV-13 permits.
 
+### AV-15: A pull request's GitHub cost grows with its schema inputs, not with the rest of the PR
+
+The GitHub requests SchemaBot makes to handle a pull request grow with schema inputs: the schema
+files and configs the PR changes, and the schema inputs of each database those changes reach,
+changed or not. They never grow with the other files the PR changes or with the rest of the
+repository. Listing the changed files is the one cost that grows with the whole PR, and it is a
+paged list, not a read per file. A question about every changed file is answered from that list,
+or from one request that covers them all, never by a lookup per file.
+
+*Breaks if violated:* an App installation's rate limit is shared by every pull request in every
+repository it serves, so routine edits in one large repository use it up and required checks stop
+posting everywhere. *Enforced:* config discovery that walks only from changed schema files and
+configs, probing each directory once (`pkg/github/config.go`), and
+`TestE2EGitHubRequestsDoNotGrowWithNonSchemaFiles`
+(`pkg/webhook/github_request_cost_integration_test.go`), which plans one PR with one and then four
+hundred one-line edits outside its schema directory and requires the same GitHub requests. It
+covers an auto-plan when the PR opens and when a push lands, a plan command, and a plan command in
+a repository whose tree GitHub truncates.
+
 ## Merge gate (MG)
 
 The GitHub Check Run gate is the tier-0 safety feature: it is what stands between a schema PR
@@ -2034,6 +2053,12 @@ The strongest invariants are enforced by structure, so regressions fail CI inste
   of the list and is named here as such: it runs from the pre-commit hook over staged packages
   rather than in CI, so it is bypassable and does not see the repository as a whole. Wiring it
   into the lint workflow is what would make it a peer of the others.
+
+- **GitHub request cost.** An integration test plans the same pull request with one and with
+  hundreds of edits outside its schema directory and fails on any GitHub request the second makes
+  that the first does not. It drives the auto-plan on open and on push, the plan command, and the
+  plan command in a repository whose tree GitHub truncates, so a lookup per changed file on those
+  paths fails CI instead of exhausting the rate limit in production (AV-15).
 
 New invariants should aspire to this tier. When adding one, prefer a completeness test over the
 relevant registry to a hand-maintained list.
