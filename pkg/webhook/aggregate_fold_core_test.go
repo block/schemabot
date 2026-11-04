@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -89,14 +90,41 @@ func serveHeadSHA(t *testing.T, mux *http.ServeMux, sha string) {
 
 // serveLeaderPRFiles registers the changed-files lookup the aggregate leader
 // performs to resolve which participants a PR requires, reporting the given path
-// as modified so the participant covering it becomes expected.
+// as modified so the participant covering it becomes expected. The file exists
+// at every commit but the default branch tip, so the leader's comparison against
+// the default branch reads it as the PR's own proposal.
 func serveLeaderPRFiles(t *testing.T, mux *http.ServeMux, path string) {
 	t.Helper()
+	const defaultTip, subtreePrefix = "default-tip", "tree~"
 	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1/files", func(w http.ResponseWriter, _ *http.Request) {
 		require.NoError(t, json.NewEncoder(w).Encode([]map[string]string{{
 			"filename": path,
 			"status":   "modified",
 		}}))
+	})
+	mux.HandleFunc("GET /repos/octocat/hello-world", func(w http.ResponseWriter, _ *http.Request) {
+		require.NoError(t, json.NewEncoder(w).Encode(map[string]string{"default_branch": "main"}))
+	})
+	mux.HandleFunc("GET /repos/octocat/hello-world/git/ref/heads/main", func(w http.ResponseWriter, _ *http.Request) {
+		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{"object": map[string]string{"sha": defaultTip}}))
+	})
+	mux.HandleFunc("GET /repos/octocat/hello-world/git/trees/", func(w http.ResponseWriter, req *http.Request) {
+		treeSHA := strings.TrimPrefix(req.URL.Path, "/repos/octocat/hello-world/git/trees/")
+		entries := []map[string]string{}
+		if treeSHA != defaultTip {
+			// A commit SHA serves the root level; a subtree SHA names its directory.
+			dir, rest := "", path
+			if subtree, isSubtree := strings.CutPrefix(treeSHA, subtreePrefix); isSubtree {
+				dir = strings.ReplaceAll(subtree, "~", "/")
+				rest = strings.TrimPrefix(path, dir+"/")
+			}
+			if segment, _, isDir := strings.Cut(rest, "/"); isDir {
+				entries = append(entries, map[string]string{"path": segment, "type": "tree", "sha": subtreePrefix + strings.ReplaceAll(strings.TrimPrefix(dir+"/"+segment, "/"), "/", "~")})
+			} else {
+				entries = append(entries, map[string]string{"path": segment, "type": "blob", "sha": "head-file"})
+			}
+		}
+		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{"tree": entries, "truncated": false}))
 	})
 }
 

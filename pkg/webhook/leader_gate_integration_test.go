@@ -29,6 +29,7 @@ import (
 
 	"github.com/block/schemabot/pkg/api"
 	ghclient "github.com/block/schemabot/pkg/github"
+	"github.com/block/schemabot/pkg/webhook/action"
 )
 
 const (
@@ -350,6 +351,114 @@ func TestE2ELeaderBlocksOnParticipantFileRenamedOutOfItsPaths(t *testing.T) {
 			assert.Equal(t, checkStatusInProgress, cr.Status, "the leader waits for the participant the rename affects")
 			assert.Empty(t, cr.Conclusion)
 		})
+	}
+}
+
+// A stale PR whose only change is a rename out of a participant's paths that
+// the default branch already holds proposes nothing for that participant, so
+// the leader's unscoped refold expects no participant Check Run, the same
+// answer auto-plan reaches for the PR, and publishes no blocking aggregate.
+// The default branch already holds the renamed file and no longer holds the
+// old path.
+func TestE2ELeaderRefoldExpectsNoParticipantForARenameTheDefaultBranchHolds(t *testing.T) {
+	// No environment list: the leader folds one unscoped aggregate and reads
+	// the participants it expects straight from the PR's files.
+	config := leaderRepoConfig()
+	config.AllowedEnvironments = nil
+	svc := setupE2EServiceWithConfig(t, config)
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	const headSHA = "abc123"
+	previous, current := tenantBSchemaDir+"/users.sql", "archive/users.sql"
+	mockLeaderPRHead(mux, headSHA)
+	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1/files", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode([]*gh.CommitFile{
+			{Filename: new(current), PreviousFilename: new(previous), Status: new("renamed")},
+		})
+	})
+	renamed := []*gh.TreeEntry{{Path: new(current), Type: new("blob"), SHA: new("renamed-file")}}
+	registerRepositoryTrees(t, mux, repositoryTreeFixture{
+		headSHA:     headSHA,
+		headEntries: renamed,
+		baseEntries: func() []*gh.TreeEntry { return renamed },
+	})
+	mockParticipantCheckRuns(mux, nil)
+	checkRuns := captureLeaderCheckRuns(mux)
+
+	h := newLeaderHandler(t, svc, client)
+	installClient := ghclient.NewInstallationClientWithSlug(client, testLogger(), leaderOwnAppSlug, trustedTenantAppSlug)
+	followUp, err := h.updateAggregateCheckOnce(t.Context(), installClient, "octocat/hello-world", 1, headSHA)
+	require.NoError(t, err)
+	assert.Equal(t, aggregateFoldNoFollowUp, followUp, "no participant is expected, so no re-fold is armed to wait for one")
+	assert.Empty(t, checkRuns, "no aggregate waits on a participant the PR proposes nothing for")
+}
+
+// `schemabot plan` on a stale PR whose only change is the deletion of a
+// participant's config that the default branch already carries reads the same
+// list: the PR proposes nothing for the participant, so the leader refreshes
+// its checks as passing instead of gating them on a participant that has
+// nothing to report.
+func TestE2ELeaderPlanCommandExpectsNoParticipantForADeletionTheDefaultBranchHolds(t *testing.T) {
+	config := leaderRepoConfig()
+	config.AllowedEnvironments = nil
+	svc := setupE2EServiceWithConfig(t, config)
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	const headSHA = "abc123"
+	mockLeaderPRHead(mux, headSHA)
+	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1/files", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode([]*gh.CommitFile{
+			{Filename: new(tenantBSchemaDir + "/schemabot.yaml"), Status: new("removed")},
+		})
+	})
+	other := []*gh.TreeEntry{{Path: new("README.md"), Type: new("blob"), SHA: new("readme")}}
+	registerRepositoryTrees(t, mux, repositoryTreeFixture{
+		headSHA:     headSHA,
+		headEntries: other,
+		baseEntries: func() []*gh.TreeEntry { return other },
+	})
+	comments := make(chan string, 4)
+	mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Body string `json:"body"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		comments <- body.Body
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": 1})
+	})
+	mockParticipantCheckRuns(mux, nil)
+	checkRuns := captureLeaderCheckRuns(mux)
+
+	h := newLeaderHandler(t, svc, client)
+	installClient := ghclient.NewInstallationClientWithSlug(client, testLogger(), leaderOwnAppSlug, trustedTenantAppSlug)
+	handled, err := h.handleNoManagedSchemaChangesForCommand(t.Context(), installClient, "octocat/hello-world", 1, 0, action.Plan, "", "", "testuser")
+	require.NoError(t, err)
+	require.True(t, handled)
+
+	select {
+	case body := <-comments:
+		assert.Contains(t, body, "were refreshed as passing")
+		assert.NotContains(t, body, "tenant deployments")
+	case <-time.After(30 * time.Second):
+		t.Fatal("timed out waiting for the checks-refreshed comment")
+	}
+	require.NotEmpty(t, checkRuns)
+	for len(checkRuns) > 0 {
+		cr := <-checkRuns
+		assert.Equal(t, checkConclusionSuccess, cr.Conclusion, "no aggregate waits on a participant the PR proposes nothing for")
 	}
 }
 

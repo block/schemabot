@@ -226,6 +226,23 @@ func (h *Handler) updateAggregateCheckOnce(ctx context.Context, client *ghclient
 				"repo", repo, "pr", pr, "head_sha", headSHA, "error", err)
 			return aggregateFoldScheduleParticipantRefold, fmt.Errorf("fetch PR files for aggregate leader %s#%d: %w", repo, pr, err)
 		}
+		// The participants a PR requires are read from what it proposes against
+		// the default branch, the list auto-plan reads, so a file the PR only
+		// inherited from history it has not caught up with expects no
+		// participant on any path. Without the comparison the leader cannot
+		// tell an inherited file from a proposed one, so it fails closed the
+		// same way as a failed listing.
+		files, _, err = client.PRFilesProposedAgainstDefaultBranch(ctx, repo, headSHA, files)
+		if err != nil {
+			metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+				Operation:  "aggregate_check_sync",
+				Repository: repo,
+				Status:     "error",
+			})
+			h.logger.Error("aggregate leader cannot scope PR files to what the PR proposes, not publishing aggregate",
+				"repo", repo, "pr", pr, "head_sha", headSHA, "error", err)
+			return aggregateFoldScheduleParticipantRefold, fmt.Errorf("scope PR files for aggregate leader %s#%d to what it proposes: %w", repo, pr, err)
+		}
 		expectedParticipants = config.ExpectedParticipantChecksForPR(repo, prFilePaths(files))
 	}
 
