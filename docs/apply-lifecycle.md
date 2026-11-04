@@ -193,7 +193,7 @@ it in the rollout order until the retry resolves. Members before it are not held
 the shards of one target never wait on each other. Under `parallel`, the
 default for a `targets` list, the later members keep starting and copying
 while it retries: each finishes its copy, parks at the cutover barrier, which
-frees its driver, and cuts over once the retry succeeds. Under `barrier` and
+frees its driver, and runs its cutover once the retry succeeds. Under `barrier` and
 `rolling` they wait to start. An operation that fails every time holds them
 for its whole budget and then fails, and `on_failure` decides what the rest
 of the rollout does ([Multi-Target
