@@ -867,6 +867,13 @@ func dispatchErrorMessage(err error, msgs dispatchMessages) string {
 		}
 		return strings.Join(parts, " ")
 	}
+	if refused, ok := errors.AsType[*api.DeferredCutoverCapacityError](err); ok {
+		parts := []string{deferredCutoverCapacityMessage(refused, msgs.command, msgs.environment, msgs.tenant)}
+		if msgs.afterRefusal != "" {
+			parts = append(parts, msgs.afterRefusal)
+		}
+		return strings.Join(parts, " ")
+	}
 	if missing, ok := errors.AsType[*api.PlanNotFoundError](err); ok {
 		return templates.PlanNotFoundDetail(missing.PlanID, msgs.replan)
 	}
@@ -931,6 +938,33 @@ func rolloutShapeRefusalMessage(refused *api.RolloutShapeRefusedError, command, 
 		return "An apply to more than one deployment is not supported yet when a deployment has several targets. Apply one target at a time, starting with " + narrowed + "."
 	}
 	return "This rollout shape is not supported. See SchemaBot server logs for details."
+}
+
+// deferredCutoverCapacityMessage is the PR comment line for an apply started
+// with --defer-cutover that would keep more drivers waiting at its cutover
+// than max_drivers_per_apply gives one apply, or than SchemaBot's servers
+// have. It reads only the refusal's counts, so no error text reaches the
+// comment. Re-issuing without the flag always runs. An apply's remedy names
+// `apply`, never `apply-confirm`: the refusal is reached at apply, before
+// the operator is asked to confirm. A rollback's names `rollback-confirm`,
+// which the pinned rollback plan lets the operator re-issue as it stands.
+func deferredCutoverCapacityMessage(refused *api.DeferredCutoverCapacityError, command, environment, tenant string) string {
+	work, rerunCommand := "apply", action.Apply
+	if command == action.RollbackConfirm {
+		work, rerunCommand = "rollback", action.RollbackConfirm
+	}
+	rerun := templates.TenantCommand("schemabot "+rerunCommand, environment, tenant)
+	switch {
+	case refused.ExceedsPerApplyCap():
+		return fmt.Sprintf("This %s can't defer its cutover: it would keep %d drivers waiting for the cutover, and one apply can use at most %d (`max_drivers_per_apply`). To defer it, raise `max_drivers_per_apply` to %d. Otherwise run `%s` without `--defer-cutover`.",
+			work, refused.Operations, refused.PerApplyCap, refused.Operations, rerun)
+	case refused.NoLiveServers():
+		return fmt.Sprintf("This %s can't defer its cutover: no SchemaBot server running drivers has checked in during the last %s. Apply again once SchemaBot's drivers are running, or run `%s` without `--defer-cutover`.",
+			work, api.LiveWindowText(), rerun)
+	default:
+		return fmt.Sprintf("This %s can't defer its cutover: it would keep %d drivers waiting for the cutover, and SchemaBot's servers have %d drivers that can wait. To defer it, give the servers %d more by raising `drivers` or running more servers. Otherwise run `%s` without `--defer-cutover`.",
+			work, refused.Operations, refused.Drivers, refused.Operations-refused.Drivers, rerun)
+	}
 }
 
 // postAutoConfirmDowngrade posts the locked plan comment that pauses an

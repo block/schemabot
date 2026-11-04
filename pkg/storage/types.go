@@ -1399,6 +1399,17 @@ type AppliedTarget struct {
 	Target      string
 }
 
+// DriverPool is one server's pool of drivers, its row in driver_pools.
+type DriverPool struct {
+	// ServerID identifies one run of a server's operator.
+	ServerID string
+	// Drivers is how many drivers the operator runs.
+	Drivers   int
+	CreatedAt time.Time
+	// UpdatedAt is the server's last heartbeat, at the database's clock.
+	UpdatedAt time.Time
+}
+
 // ApplyOperation represents one child row in the apply_operations table:
 // the per-(deployment, operation_key) slice of a multi-operation apply, and the
 // unit of work the driver claim loop reconciles.

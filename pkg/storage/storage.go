@@ -124,6 +124,9 @@ type Storage interface {
 	// WebhookEvents returns the durable webhook event inbox store.
 	WebhookEvents() WebhookEventStore
 
+	// DriverPools returns the driver pool of each server running an operator.
+	DriverPools() DriverPoolStore
+
 	// Ping verifies the database connection is alive.
 	Ping(ctx context.Context) error
 
@@ -374,6 +377,41 @@ type SettingsStore interface {
 	// Delete removes a setting by key. It returns ErrSettingNotFound when no
 	// setting with that key exists.
 	Delete(ctx context.Context, key string) error
+}
+
+// DriverPoolLiveWindow is how recently a server must have heartbeated for
+// DriverPoolStore.ListLive to count its drivers. It matches ApplyLeaseStaleAfter, so a server's drivers leave the
+// count at the moment its leases become reclaimable by peers.
+const DriverPoolLiveWindow = ApplyLeaseStaleAfter
+
+// DriverPoolRetention is how long a server's row outlives its last
+// heartbeat before Heartbeat removes it. A server that exits cleanly removes
+// its own row; this bounds the rows a crashed one leaves behind.
+const DriverPoolRetention = time.Hour
+
+// DriverPoolStore holds the driver pool of each server running an operator:
+// how many drivers it runs. Each server heartbeats its own row, so the drivers live
+// across every replica are read from storage rather than configured, and they
+// follow the replica count as it changes.
+type DriverPoolStore interface {
+	// Heartbeat records that server's operator is running now, with its
+	// driver count, creating its row on the first beat. The time recorded is
+	// the database's clock, so servers whose clocks disagree are still
+	// compared on one.
+	Heartbeat(ctx context.Context, server *DriverPool) error
+
+	// PruneStale removes the rows not heard from within
+	// DriverPoolRetention. A stale row already stops counting once it
+	// leaves DriverPoolLiveWindow, so pruning only keeps the table small.
+	PruneStale(ctx context.Context) error
+
+	// Deregister removes server's row. Removing a row that does not exist is
+	// not an error.
+	Deregister(ctx context.Context, serverID string) error
+
+	// ListLive returns the servers that heartbeated within
+	// DriverPoolLiveWindow, ordered by server ID.
+	ListLive(ctx context.Context) ([]*DriverPool, error)
 }
 
 // WebhookEventStore manages durable webhook inbox rows. It is the storage

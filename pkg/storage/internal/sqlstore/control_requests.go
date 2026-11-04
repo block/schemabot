@@ -185,6 +185,25 @@ func (s *controlRequestStore) requestPendingWithRetry(ctx context.Context, req *
 	return controlReq, alreadyPending, nil
 }
 
+// markResumed records when a start request resumes a stopped apply. A stopped
+// apply holds no driver, so a resumed one queues for drivers behind every
+// deferred apply that started while it was stopped (deferredCutoverQueueSQL).
+// A start against an apply that is not stopped resumes nothing and leaves its
+// place alone. The write keeps updated_at, the apply's heartbeat, as it was:
+// recording a request is not a driver touching the apply.
+func markResumed(ctx context.Context, tx *rebindTx, req *storage.ApplyControlRequest) error {
+	if req.Operation != storage.ControlOperationStart {
+		return nil
+	}
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE applies SET resumed_at = NOW(), updated_at = updated_at
+		WHERE id = ? AND state = ?
+	`, req.ApplyID, state.Apply.Stopped); err != nil {
+		return fmt.Errorf("record resume of stopped apply %d: %w", req.ApplyID, err)
+	}
+	return nil
+}
+
 func (s *controlRequestStore) requestPending(ctx context.Context, req *storage.ApplyControlRequest, superseded storage.ControlOperation, commandID string) (*storage.ApplyControlRequest, bool, error) {
 	metadata := nullJSON(req.Metadata)
 	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
@@ -202,8 +221,17 @@ func (s *controlRequestStore) requestPending(ctx context.Context, req *storage.A
 	// after the requeue, which finds the rows pending for the cancel's sweep
 	// to settle. An apply with no row has nothing to requeue, so its intake
 	// proceeds as before.
+	//
+	// A start request may write the apply row (markResumed), so it takes the
+	// row for update from the start. Two start requests that each held the
+	// row shared would each wait for the other to let go before writing, and
+	// the database would fail one of them as a deadlock.
+	applyLock := "FOR SHARE"
+	if req.Operation == storage.ControlOperationStart {
+		applyLock = "FOR UPDATE"
+	}
 	var lockedApplyID int64
-	if err := tx.QueryRowContext(ctx, `SELECT id FROM applies WHERE id = ? FOR SHARE`, req.ApplyID).Scan(&lockedApplyID); err != nil && !errors.Is(err, sql.ErrNoRows) {
+	if err := tx.QueryRowContext(ctx, `SELECT id FROM applies WHERE id = ? `+applyLock, req.ApplyID).Scan(&lockedApplyID); err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return nil, false, fmt.Errorf("lock apply %d to record %s control request: %w", req.ApplyID, req.Operation, err)
 	}
 
@@ -236,6 +264,9 @@ func (s *controlRequestStore) requestPending(ctx context.Context, req *storage.A
 		slog.DebugContext(ctx, "control request already settled for this command; leaving it settled",
 			"apply_id", req.ApplyID, "operation", req.Operation, "command_id", commandID, "status", existing.Status)
 		return existing, false, nil
+	}
+	if err := markResumed(ctx, tx, req); err != nil {
+		return nil, false, err
 	}
 	if existing != nil {
 		_, err := tx.ExecContext(ctx, `
