@@ -100,9 +100,12 @@ func (e *Engine) CompareSchemaFileChange(ctx context.Context, req *ternv1.Compar
 
 	var models [len(files)]schemadiff.Model
 	for i, d := range desired {
-		// The schema names where a foreign key's referenced tables are read
-		// from; comparableSchema admits no foreign key, so nothing reads it.
-		m, err := schemadiff.IntrospectDesired(ctx, pool, "", d)
+		// The schema sets the scratch search path the file's statements
+		// resolve types against, and names where a foreign key's referenced
+		// tables are read from. comparableSchema admits no foreign key, and
+		// both versions of the file resolve against the same path, so the
+		// comparison schema serves.
+		m, err := schemadiff.IntrospectDesired(ctx, pool, comparisonSchema, d)
 		if err != nil {
 			return nil, fmt.Errorf("compare PostgreSQL schema file for database %q: run table %s at the %s: %w", e.pullDatabase, table, files[i].name, err)
 		}
@@ -259,10 +262,27 @@ func changesCovered(approved, head, baseMove []schemadiff.Change) (bool, error) 
 			if err != nil {
 				return false, fmt.Errorf("read the elements of statement %q: %w", c.SQL, err)
 			}
-			items[i] = append(items[i], ddl.ChangeItem{SQL: c.SQL, Elements: elements})
+			items[i] = append(items[i], ddl.ChangeItem{SQL: changeIdentity(c), Elements: elements})
 		}
 	}
 	return ddl.CoveredByApproval(items[0], items[1], items[2]), nil
+}
+
+// changeIdentity renders a change as the statement it runs plus the live
+// definition it was planned against. An ADD CONSTRAINT ... USING INDEX or a
+// VALIDATE CONSTRAINT names only the index or constraint, so the same
+// statement can take over a different definition on a different base;
+// comparing by statement alone would treat the two as the same approved
+// change.
+func changeIdentity(c schemadiff.Change) string {
+	switch {
+	case c.Adopts != nil:
+		return c.SQL + " adopting " + c.Adopts.Def
+	case c.Validates != nil:
+		return c.SQL + " validating " + c.Validates.Def
+	default:
+		return c.SQL
+	}
 }
 
 // statementElements keys the columns, constraints, and indexes a statement
@@ -328,11 +348,12 @@ func alterTableCmdElement(cmd *pganalyze.AlterTableCmd) string {
 	}
 }
 
-// changeSQL lists the statements of changes, for a reason string.
+// changeSQL lists the statements of changes, each with the definition it
+// adopts or validates, for a reason string.
 func changeSQL(changes []schemadiff.Change) []string {
 	stmts := make([]string, 0, len(changes))
 	for _, c := range changes {
-		stmts = append(stmts, c.SQL)
+		stmts = append(stmts, changeIdentity(c))
 	}
 	return stmts
 }

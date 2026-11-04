@@ -24,7 +24,7 @@ import (
 
 // applyOperationColumns lists all columns for SELECT queries.
 const applyOperationColumns = `id, apply_id, plan_id, deployment, operation_key, operation_kind, target, external_id, external_operation_id, state, error_message,
-	cutover_policy, on_failure, attempt, already_converged, rollout_step, started_at, completed_at, lease_owner, lease_token, lease_acquired_at,
+	cutover_policy, on_failure, attempt, already_converged, rollout_step, ended_by_operation_id, started_at, completed_at, lease_owner, lease_token, lease_acquired_at,
 	engine_resume_context, engine_resume_metadata, progress_metadata, created_at, updated_at`
 
 // applyOperationStore implements storage.ApplyOperationStore using MySQL.
@@ -1547,6 +1547,69 @@ func (s *applyOperationStore) deferredCutoverWorkExclusion(filter storage.Operat
 				AND NOT ` + s.deferredCutoverApplySQL()
 }
 
+// deferredCutoverQueueClause keeps deferred applies from deadlocking the
+// drivers between them. A deferred operation keeps its driver until an
+// operator cuts its apply over, and the cutover waits for every operation of
+// the apply. Two deferred applies that each fit the fleet alone could otherwise
+// split it between them, each holding part of its operations with the rest
+// queued behind the other, and neither could ever be cut over.
+//
+// So deferred applies take drivers in turn: an operation of a deferred apply
+// does not start while a deferred apply ahead of it still has an operation
+// waiting to start. An apply's place is when it last started, its creation or
+// the start request that resumed it from stopped (markResumed), with the apply
+// id breaking ties. The apply at the front always gets the drivers it needs:
+// apply creation refuses one wider than the fleet, every apply ahead of it has
+// all its operations running and can be cut over, and no apply behind it takes
+// a driver it is waiting for. A failed_retryable operation keeps its apply's
+// place, since the driver its failed drive released is the one its retry
+// takes. A stopped apply holds no driver and its operations wait on nobody, so
+// it holds no place until a start resumes it, at the back.
+//
+// The gate holds back only operations that start work, on the arms that start
+// it; recovery and control requests are never queued. It matches nothing for
+// an apply that does not defer its cutover. It begins with AND and binds the
+// arguments it returns.
+func (s *applyOperationStore) deferredCutoverQueueClause() (string, []any) {
+	terminal := terminalApplyStates()
+	startPending := func(apply string) string {
+		return `EXISTS (
+							SELECT 1
+							FROM apply_control_requests AS resume
+							WHERE resume.apply_id = ` + apply + `.id
+								AND resume.operation = ?
+								AND resume.status = ?
+						)`
+	}
+	clause := `
+				AND NOT EXISTS (
+					SELECT 1
+					FROM applies AS mine
+					JOIN applies AS ahead
+						ON (COALESCE(ahead.resumed_at, ahead.created_at), ahead.id) < (COALESCE(mine.resumed_at, mine.created_at), mine.id)
+					JOIN apply_operations AS unstarted ON unstarted.apply_id = ahead.id
+					WHERE mine.id = apply_operations.apply_id
+						AND ` + s.dialect.JSONBooleanIsTrue("mine.options", []string{"defer_cutover"}) + `
+						AND ` + s.dialect.JSONBooleanIsTrue("ahead.options", []string{"defer_cutover"}) + `
+						AND (
+							ahead.state NOT IN (` + placeholders(len(terminal)) + `)
+							OR (ahead.state = ? AND ` + startPending("ahead") + `)
+						)
+						AND unstarted.operation_kind = ?
+						AND (
+							unstarted.state IN (?, ?)
+							OR (unstarted.state = ? AND ` + startPending("ahead") + `)
+						)
+				)`
+	args := stringArgs(terminal)
+	args = append(args,
+		state.Apply.Stopped, storage.ControlOperationStart, storage.ControlRequestPending,
+		storage.ApplyOperationKindWork,
+		state.ApplyOperation.Pending, state.ApplyOperation.FailedRetryable,
+		state.ApplyOperation.Stopped, storage.ControlOperationStart, storage.ControlRequestPending)
+	return clause, args
+}
+
 // deferredCutoverApplySQL matches an operation whose apply defers its cutover.
 // It binds no arguments.
 func (s *applyOperationStore) deferredCutoverApplySQL() string {
@@ -1728,6 +1791,11 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 	claimFilter := storage.BuildOperationClaimFilter(opts...)
 	notDeferred := s.deferredCutoverWorkExclusion(claimFilter)
 	notDeferredRecovery, notDeferredRecoveryArgs := s.deferredCutoverRecoveryExclusion(claimFilter)
+	// deferredQueue holds a deferred apply's operations back while a deferred
+	// apply ahead of it still has operations waiting to start, so deferred
+	// applies never split the drivers between them. It gates the arms that
+	// start work and binds arguments that follow the fan-out cap's.
+	deferredQueue, deferredQueueArgs := s.deferredCutoverQueueClause()
 
 	queryArgs := []any{state.ApplyOperation.Pending}
 	// Member-order gate for the pending claim (operationStartGateSQL): a work
@@ -1806,6 +1874,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 	// count as it settles, so the rest drain behind it exactly as the pending
 	// arm's do.
 	queryArgs = append(queryArgs, driverCapArgs...)
+	queryArgs = append(queryArgs, deferredQueueArgs...)
 	queryArgs = append(queryArgs, stringArgs(activeStates)...)
 	// Stale-active barrier-park exemption (see the staleness clause below): a
 	// multi-deployment operation parked at the cutover barrier under an
@@ -1849,6 +1918,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 	queryArgs = append(queryArgs, operationStartGateArgs()...)
 	queryArgs = append(queryArgs, claimableParentArgs()...)
 	queryArgs = append(queryArgs, driverCapArgs...)
+	queryArgs = append(queryArgs, deferredQueueArgs...)
 	queryArgs = append(queryArgs,
 		state.ApplyOperation.Stopped,
 		storage.ControlOperationCancel, storage.ControlRequestPending)
@@ -1880,6 +1950,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 	queryArgs = append(queryArgs, state.ApplyOperation.FailedRetryable)
 	queryArgs = append(queryArgs, state.Apply.FailedRetryable, maxRecoveryAttempts, retryableRecoveryFreshnessDays)
 	queryArgs = append(queryArgs, driverCapArgs...)
+	queryArgs = append(queryArgs, deferredQueueArgs...)
 	queryArgs = append(queryArgs, stringArgs(activeStates)...)
 	queryArgs = append(queryArgs, notDeferredRecoveryArgs...)
 
@@ -1988,7 +2059,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 						AND cr.status = ?
 				)
 				AND `+parentClaimable+`
-				AND `+driverCap+notDeferred+`
+				AND `+driverCap+notDeferred+deferredQueue+`
 			)
 			OR (
 				state IN (%s)
@@ -2023,7 +2094,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 						AND `+parentClaimable+`
 					)
 				)
-				AND `+driverCap+notDeferred+`
+				AND `+driverCap+notDeferred+deferredQueue+`
 			)
 			OR (
 				state = ?
@@ -2081,12 +2152,14 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 						AND (
 							(
 								a.state = ?
-								AND a.attempt < ?
+								-- The budget is the operation's own: a sibling
+								-- that spent its retries leaves this one's intact.
+								AND apply_operations.attempt < ?
 								AND a.updated_at >= %s
 								-- Names no column of a, but belongs to this arm
 								-- alone: a deliberate redispatch starts work, so
 								-- it is capped; crash recovery below is not.
-								AND `+driverCap+notDeferred+`
+								AND `+driverCap+notDeferred+deferredQueue+`
 							)
 							OR (
 								a.state IN (%s)
@@ -2200,22 +2273,27 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 			return nil, fmt.Errorf("refresh heartbeat for claimed apply_operation %d: %w", ad.ID, err)
 		}
 
-		// Re-claiming a failed_retryable operation is a redispatch, so consume one
-		// unit of the parent apply's retry budget. Only operations the operator
-		// drives under the operation lease are charged here (see
-		// redispatchDrivesUnderOperationLease): a parent-lease drive increments the
-		// parent attempt in the ClaimApplyByID it performs, so bumping here too
-		// would double-count. Without this, an operation-lease retry never
-		// advances applies.attempt, so ExpireRetryable's budget path never fires
-		// and a permanently failing deployment retries forever — stranding a
-		// healthy sibling parked at the cutover barrier under on_failure
+		// Re-claiming a failed_retryable operation is a redispatch, so it spends
+		// one unit of that operation's retry budget, and the parent apply's
+		// attempt is raised to the operation's new attempt. The budget is per
+		// operation: the parent records the highest attempt of any of its
+		// operations, so one interruption that reaches every operation at once
+		// costs each of them one attempt instead of costing the apply one per
+		// operation, and the apply still expires once any one operation has
+		// spent its budget. Only operations the operator drives under the
+		// operation lease raise the parent here (see
+		// redispatchDrivesUnderOperationLease): a parent-lease drive increments
+		// the parent attempt in the ClaimApplyByID it performs, so raising it
+		// here too would double-count. Without this, an operation-lease retry
+		// never advances applies.attempt, so ExpireRetryable's budget path never
+		// fires and a permanently failing deployment retries forever — stranding
+		// a healthy sibling parked at the cutover barrier under on_failure
 		// "continue". The failed_retryable parent guard keeps this to genuine
 		// redispatches (a terminal-failed parent never re-leases its operations).
-		// The attempt < budget guard makes the increment idempotent once the
-		// budget is spent: two operators can claim different failed_retryable
-		// operations of the same apply concurrently, and the row lock this UPDATE
-		// takes serializes them, so the second sees the already-incremented
-		// attempt and does not overshoot maxRecoveryAttempts.
+		// GREATEST makes concurrent redispatches commute: two operators can claim
+		// different failed_retryable operations of the same apply at once, the
+		// row lock this UPDATE takes serializes them, and the parent ends at the
+		// higher of the two attempts whichever commits first.
 		if ad.State == state.ApplyOperation.FailedRetryable {
 			// Advance the operation's own attempt only on a genuine deliberate
 			// redispatch — the parent apply is still failed_retryable. A
@@ -2255,11 +2333,10 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 			if underOperationLease {
 				if _, err := tx.ExecContext(ctx, `
 					UPDATE applies
-					SET attempt = attempt + 1, updated_at = NOW()
+					SET attempt = GREATEST(attempt, ?), updated_at = NOW()
 					WHERE id = ?
 						AND state = ?
-						AND attempt < ?
-				`, ad.ApplyID, state.Apply.FailedRetryable, maxRecoveryAttempts); err != nil {
+				`, ad.Attempt, ad.ApplyID, state.Apply.FailedRetryable); err != nil {
 					return nil, fmt.Errorf("consume retry budget for apply_operation %d redispatch: %w", ad.ID, err)
 				}
 
@@ -3480,11 +3557,11 @@ func scanApplyOperationInto(s scanner) (*storage.ApplyOperation, error) {
 	var externalOperationID sql.NullString
 	var engineResumeContext, engineResumeMetadata, progressMetadata sql.NullString
 	var startedAt, completedAt, leaseAcquiredAt sql.NullTime
-	var planID sql.NullInt64
+	var planID, endedByOperationID sql.NullInt64
 
 	if err := s.Scan(
 		&ad.ID, &ad.ApplyID, &planID, &ad.Deployment, &ad.OperationKey, &ad.OperationKind, &ad.Target, &externalID, &externalOperationID, &ad.State, &errMsg,
-		&ad.CutoverPolicy, &ad.OnFailure, &ad.Attempt, &ad.AlreadyConverged, &ad.RolloutStep, &startedAt, &completedAt, &ad.LeaseOwner, &ad.LeaseToken, &leaseAcquiredAt,
+		&ad.CutoverPolicy, &ad.OnFailure, &ad.Attempt, &ad.AlreadyConverged, &ad.RolloutStep, &endedByOperationID, &startedAt, &completedAt, &ad.LeaseOwner, &ad.LeaseToken, &leaseAcquiredAt,
 		&engineResumeContext, &engineResumeMetadata, &progressMetadata, &ad.CreatedAt, &ad.UpdatedAt,
 	); err != nil {
 		return nil, err
@@ -3492,6 +3569,9 @@ func scanApplyOperationInto(s scanner) (*storage.ApplyOperation, error) {
 
 	if planID.Valid {
 		ad.PlanID = planID.Int64
+	}
+	if endedByOperationID.Valid {
+		ad.EndedByOperationID = endedByOperationID.Int64
 	}
 	if errMsg.Valid {
 		ad.ErrorMessage = errMsg.String

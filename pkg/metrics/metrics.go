@@ -1579,6 +1579,7 @@ const (
 	GitHubOperationEditIssueComment              = "edit_issue_comment"
 	GitHubOperationFetchAppSlug                  = "fetch_app_slug"
 	GitHubOperationFetchBlob                     = "fetch_blob"
+	GitHubOperationFetchDiff                     = "fetch_diff"
 	GitHubOperationFetchFileContent              = "fetch_file_content"
 	GitHubOperationFetchGitTree                  = "fetch_git_tree"
 	GitHubOperationFetchPullRequest              = "fetch_pull_request"
@@ -1586,6 +1587,7 @@ const (
 	GitHubOperationGetTeamMembership             = "get_team_membership"
 	GitHubOperationGraphQLMinimizeComment        = "graphql_minimize_comment"
 	GitHubOperationGraphQLStatusCheckRollup      = "graphql_status_check_rollup"
+	GitHubOperationGraphQLTreeEntries            = "graphql_tree_entries"
 	GitHubOperationListCheckRunsForRef           = "list_check_runs_for_ref"
 	GitHubOperationListPRFiles                   = "list_pr_files"
 	GitHubOperationListReviews                   = "list_reviews"
@@ -1778,6 +1780,7 @@ func isKnownGitHubOperation(operation string) bool {
 		GitHubOperationEditIssueComment,
 		GitHubOperationFetchAppSlug,
 		GitHubOperationFetchBlob,
+		GitHubOperationFetchDiff,
 		GitHubOperationFetchFileContent,
 		GitHubOperationFetchGitTree,
 		GitHubOperationFetchPullRequest,
@@ -1785,6 +1788,7 @@ func isKnownGitHubOperation(operation string) bool {
 		GitHubOperationGetTeamMembership,
 		GitHubOperationGraphQLMinimizeComment,
 		GitHubOperationGraphQLStatusCheckRollup,
+		GitHubOperationGraphQLTreeEntries,
 		GitHubOperationListCheckRunsForRef,
 		GitHubOperationListPRFiles,
 		GitHubOperationListReviews,

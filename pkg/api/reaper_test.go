@@ -502,6 +502,7 @@ type expiringApplyStore struct {
 	expireOperationsErr  error
 	limit                int
 	operationLimit       int
+	stopTypes            []string
 }
 
 func (s *expiringApplyStore) ExpireRetryableOperations(ctx context.Context, limit int) ([]*storage.RetryableOperationExpiration, error) {
@@ -515,8 +516,9 @@ func (s *expiringApplyStore) ExpireRetryableOperations(ctx context.Context, limi
 	return s.operationExpirations, nil
 }
 
-func (s *expiringApplyStore) ExpireRetryable(ctx context.Context, limit int) ([]*storage.RetryableApplyExpiration, error) {
+func (s *expiringApplyStore) ExpireRetryable(ctx context.Context, endedOperationStopTypes []string, limit int) ([]*storage.RetryableApplyExpiration, error) {
 	s.limit = limit
+	s.stopTypes = endedOperationStopTypes
 	// Expirations and an error are mutually exclusive, and deliberately so: the
 	// real pass settles its whole batch in one transaction, so a failure rolls
 	// back everything it had matched. A double that could hand back both would
@@ -698,6 +700,7 @@ func TestRunRetryableExpiryPassBoundsTheBatch(t *testing.T) {
 	assert.Equal(t, retryableExpiryBatch, applies.limit)
 	assert.Equal(t, retryableExpiryBatch, applies.operationLimit,
 		"the degraded-rollout sweep in the same pass is bounded the same way")
+	assert.Equal(t, endedOperationStoppableDatabaseTypes, applies.stopTypes, "expiry passes over what the ended operation sweep stops")
 }
 
 // degradedRollout is a running_degraded rollout whose region-b deployment

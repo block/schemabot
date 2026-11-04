@@ -9016,7 +9016,7 @@ _No details available yet._
 
 ---
 
-SchemaBot will cut over `eu` next — no action needed.
+SchemaBot will run the cutover for `eu` next — no action needed.
 
 To stop this schema change:
 ```
@@ -9365,7 +9365,7 @@ _No details available yet._
 
 ---
 
-To cut over `eu`:
+To run the cutover for `eu`:
 ```
 schemabot cutover apply-a1b2c3d4e5f6 -e production
 ```
@@ -10341,6 +10341,87 @@ schemabot apply -e production
 </details>
 
 <details>
+<summary><a name="summary-deferred-cutover-stopped-after-a-shard-failed"></a><strong>Summary: Deferred Cutover Stopped After A Shard Failed</strong></summary>
+
+
+## ❌ Schema Change Failed — Production
+
+<!-- schemabot:offer-support-channel -->
+**Database**: `shop` | **Type**: `Strata` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Duration**: 28m
+
+*Applied by @jackjackbits at 2026-03-15 14:00:00 UTC*
+
+**Shards**: 1 failed, 3 stopped at cutover
+
+> ❌ **First failure:** shard <code>-40</code> — resolve shard primary for `-40`: context deadline exceeded
+
+> ⏹️ 3 shards stopped at the cutover because <code>-40</code> failed. Their copies are saved, so applying again resumes them.
+
+#### Keyspace `shop_sharded`
+
+**`mutes`**: ❌ Failed
+
+```sql
+ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
+```
+
+| Shard | Status |
+| --- | --- |
+| `-40` | ❌ failed — resolve shard primary for `-40`: context deadline exceeded |
+| `40-80` | ⏹️ stopped at cutover — -40 failed; copy saved |
+| `80-c0` | ⏹️ stopped at cutover — -40 failed; copy saved |
+| `c0-` | ⏹️ stopped at cutover — -40 failed; copy saved |
+
+---
+
+To retry:
+```
+schemabot apply -e production
+```
+
+</details>
+
+<details>
+<summary><a name="summary-deferred-cutover-stopped-after-a-table-failed-on-a-keyspaces-only-shard"></a><strong>Summary: Deferred Cutover Stopped After A Table Failed On A Keyspace's Only Shard</strong></summary>
+
+
+## ❌ Schema Change Failed — Staging
+
+<!-- schemabot:offer-support-channel -->
+**Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Duration**: 8m
+
+*Applied by @jackjackbits at 2026-03-15 14:22:00 UTC*
+
+> ❌ **Error:** lock wait timeout exceeded; try restarting transaction
+
+> ⏹️ 2 tables stopped at the cutover because <code>users</code> failed. Their copies are saved, so applying again resumes them.
+
+**`orders`** — Stopped
+```sql
+ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
+```
+
+**`users`** — Failed at 30.00%
+```sql
+ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
+```
+
+**`products`** — Stopped
+```sql
+ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
+```
+
+
+---
+
+To retry:
+```
+schemabot apply -e staging
+```
+
+</details>
+
+<details>
 <summary><a name="summary-cancelled-after-partial-landing"></a><strong>Summary: Cancelled After Partial Landing</strong></summary>
 
 
@@ -10409,7 +10490,7 @@ This schema change was cancelled and cannot be resumed. Open a new schema change
        ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL;
 
 
-SchemaBot will cut over us-east next — no action needed.
+SchemaBot will run the cutover for us-east next — no action needed.
 To stop this schema change:
   schemabot stop apply-multi-a1b2c3d4 -e production
 
@@ -10613,7 +10694,7 @@ To stop this schema change:
        • Targets: 1 (1 waiting for cutover)
            ● payments-003: waiting for cutover
 
-To cut over prod/payments-001:
+To run the cutover for prod/payments-001:
   schemabot cutover apply-multi-a1b2c3d4 -e production
 
 ```
@@ -10745,6 +10826,53 @@ To resume from where it stopped:
            ○ 40-80: cancelled
            ○ 80-c0: cancelled
            ○ c0-: cancelled
+    ~ VSchema (shop_001): Cancelled
+          "tables": {
+            "orders": {
+       +      "column_vindexes": [{"column": "customer_id", "name": "hash"}]
+            }
+          }
+
+
+To recover: Fix the issue above, then run a new apply.
+The new apply will only process tables that haven't completed.
+
+```
+</details>
+
+<details>
+<summary><a name="sharded-deferred-cutover-stopped-after-a-shard-failed"></a><strong>Sharded Deferred Cutover Stopped After A Shard Failed</strong></summary>
+
+```
+
+┌───────────────────────────────────────────────────────┐
+│  Apply ID:     apply-shard-e5f6a7b8                   │
+│  Database:     shop                                   │
+│  Environment:  production                             │
+│  State:        Failed                                 │
+│  Shards:       1 failed, 3 stopped at cutover         │
+│  Caller:       github:octocat                         │
+│  Source:       https://github.com/acme/shop/pull/412  │
+│  Options:      ⏸️ Defer Cutover                       │
+│  Started:      Jan 15 14:26:00 UTC                    │
+│  Duration:     1m                                     │
+└───────────────────────────────────────────────────────┘
+
+  shard -40: resolve shard primary for -40: context deadline exceeded
+
+  ⏹️ 3 shards stopped at the cutover because -40 failed. Their copies are saved, so applying again resumes them.
+
+
+  ── shop_001 ──
+
+     ~ orders: ⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ❌ Failed
+       ALTER TABLE `orders` ADD INDEX `idx_created_at`(`created_at`);
+
+       • Shards: 4 (1 failed, 3 stopped)
+           ✗ -40: failed
+           ○ 40-80: stopped at 100.00% · 1,466,232 / 1,466,232 rows
+           ○ 80-c0: stopped at 100.00% · 1,402,118 / 1,402,118 rows
+           ○ c0-: stopped at 100.00% · 1,389,004 / 1,389,004 rows
     ~ VSchema (shop_001): Cancelled
           "tables": {
             "orders": {
@@ -11374,7 +11502,7 @@ ESC detach • s stop
        ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL;
 
 
-SchemaBot will cut over us-east next — no action needed.
+SchemaBot will run the cutover for us-east next — no action needed.
 
 ESC detach • s stop
 ```

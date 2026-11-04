@@ -169,7 +169,7 @@ func settleCutoverSet(ctx context.Context, store storage.Storage, logger *slog.L
 // failCutoverSet fails a pending cutover request set because the engine
 // failed or refused the cutover of operationID, naming how many members of
 // the set had cut over by then.
-func failCutoverSet(ctx context.Context, store storage.Storage, logger *slog.Logger, apply *storage.Apply, controlReq *storage.ApplyControlRequest, ids []int64, operationID int64, refusal string) error {
+func failCutoverSet(ctx context.Context, store storage.Storage, logger *slog.Logger, apply *storage.Apply, controlReq *storage.ApplyControlRequest, ids []int64, operationID int64, refusal string, remoteIDs ...string) error {
 	opStore := store.ApplyOperations()
 	if opStore == nil {
 		return fmt.Errorf("fail pending cutover of apply %s: apply operation store is not available", apply.ApplyIdentifier)
@@ -188,7 +188,7 @@ func failCutoverSet(ctx context.Context, store storage.Storage, logger *slog.Log
 	logger.InfoContext(ctx, "failing pending cutover request: the engine did not take the cutover of one of its operations",
 		append(apply.LogAttrs(), "requested_by", controlRequestCaller(controlReq), "cutover_operation_ids", ids,
 			"refused_operation_id", operationID, "cut_over", cutOver, "reason", reason)...)
-	return settlePendingControlRequestRevision(ctx, store, logger, apply, controlReq, storage.ControlRequestFailed, reason)
+	return settlePendingControlRequestRevision(ctx, store, logger, apply, controlReq, storage.ControlRequestFailed, reason, remoteIDs...)
 }
 
 // cutoverSetNotAppliedMessage answers a cutover request set that not every

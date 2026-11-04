@@ -201,7 +201,7 @@ templates: build ## Regenerate TEMPLATES.md from the current binary
 check-templates: build ## Fail if TEMPLATES.md is stale
 	@scripts/update-templates.sh --check
 
-check-terminology: ## Fail if "schema change" appears hyphenated in prose
+check-terminology: ## Fail if "schema change" is hyphenated in prose or "cutover" is split in the docs
 	@scripts/check-terminology.sh
 
 check-vulnerabilities: ## Fail if the code calls into a known vulnerability

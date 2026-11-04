@@ -522,6 +522,22 @@ hundred one-line edits outside its schema directory and requires the same GitHub
 covers an auto-plan when the PR opens and when a push lands, a plan command, and a plan command in
 a repository whose tree GitHub truncates.
 
+### AV-16: Applies that wait on a person never wait on each other
+
+An apply that keeps its drivers until an operator cuts it over is admitted only if SchemaBot's
+servers can hold all of it at once, and such applies take drivers in turn: none starts an operation
+while one ahead of it still has an operation waiting to start. The apply at the front therefore
+always gets every driver it needs and can reach its cutover, and the rest follow it. An apply's place is
+when it last started, so one that was stopped and started again goes behind every apply that started
+while it held no drivers.
+
+*Breaks if violated:* two applies each hold part of the drivers with the rest of their operations
+queued behind the other, neither can reach its cutover, and both wait until the waiting-for-cutover
+timeout fails them. *Enforced:* the width refusal at apply and at apply creation
+(`pkg/api/deferred_cutover_capacity.go`), the queue gate on the claim's start arms
+(`deferredCutoverQueueClause`, `pkg/storage/internal/sqlstore/apply_operations.go`), and the resume
+place recorded with a start request (`markResumed`, `pkg/storage/internal/sqlstore/control_requests.go`).
+
 ## Merge gate (MG)
 
 The GitHub Check Run gate is the tier-0 safety feature: it is what stands between a schema PR
@@ -903,7 +919,9 @@ starts again a task another run held the table from (`pkg/tern/local_apply_seque
 resume re-plan that settles a task whose change already landed (`pkg/tern/local_control_resume.go`),
 the group_finalizer drive, which pauses its task-less operation as `failed_retryable` on an error
 retrying can cure instead of failing it (`driveGroupFinalizer`, same file), and the expiry sweep
-(`pkg/api/reaper.go`, `pkg/storage/internal/sqlstore/applies.go`); budget semantics in
+(`pkg/api/reaper.go`, `pkg/storage/internal/sqlstore/applies.go`), with the per-operation budget in
+the redispatch claim (`FindNextApplyOperation`,
+`pkg/storage/internal/sqlstore/apply_operations.go`); budget semantics in
 [apply-lifecycle.md](apply-lifecycle.md).
 
 ### ST-10: Rollouts respect order and fail closed on policy
@@ -917,8 +935,8 @@ the cutover barrier under `barrier`, while `parallel` does not order copy start 
 rollout is laid out table by table, work on a table starts on any target only once every earlier
 table has completed on every target, under every cutover policy and every on_failure value, and
 work held behind an earlier table that settled without completing can never start, so it holds no target. Under
-`barrier` and `parallel` cutover follows deployment order: an operation cuts over only once every
-operation of every earlier deployment has completed. Within one deployment, an operation cuts over
+`barrier` and `parallel` cutover follows deployment order: an operation's cutover runs only once every
+operation of every earlier deployment has completed. Within one deployment, an operation's cutover runs
 as soon as its own copy is ready: an earlier operation of the same deployment holds it only while it
 is in a state the rollout halts on (failed, retrying a failure, stopped, cancelled, or reverted),
 never while it is still copying or cutting over. A member's finalizer publishes its change without
@@ -958,7 +976,7 @@ arm gates on the hold rule `earlierSiblingHoldsCutoverSQL` that `CutoverBlocker`
 storage parity suite (`pkg/storage/storagetest/apply_operations.go`); on a data plane, an apply a
 dispatcher created leaves member order to the dispatcher's claim (`rolloutMembersOrderedHereSQL`,
 `pkg/storage/internal/sqlstore/apply_operations.go`), and each member's progress and cutover are scoped to its own operation
-(`progressScopeOperation` in `pkg/tern/local_client.go`, `boundCutoverRequestTurn` in
+(`progressReads.scopeOperation` in `pkg/tern/local_progress_reads.go`, `boundCutoverRequestTurn` in
 `pkg/tern/local_control.go`); for a manually deferred cutover, the turn
 check `CutoverBlocker` (`pkg/storage/internal/sqlstore/apply_operations.go`, sharing the automatic cutover claim's
 `earlierSiblingHoldsCutoverSQL`), applied when a drive takes the request
@@ -973,6 +991,24 @@ projection builds its children, with `RolloutHeldByResumableChild` (`pkg/state/a
 `StopSupersedesPendingStart` completing the pending start of an apply driven under the operation lease in the same write that records a stop
 (`pkg/tern/control_requests.go`, reached from `pkg/api/control_handlers.go` and `pkg/tern/local_control.go`, through `RequestPendingSuperseding` in
 `pkg/storage/internal/sqlstore/control_requests.go`).
+
+### ST-11: An apply whose cutover can never run is ended, not left waiting
+
+When an apply holds its operations for a cutover that runs for all of them, and one operation ends
+before it gets there, by failing under a policy that halts the rollout or by waiting on a retry that
+will never come, SchemaBot ends the apply rather than leaving the rest holding their targets until
+the wait times out. It stops the others so each one saves its work, then settles the apply failed
+once nothing drives it, and each stopped operation records the operation it failed for. It does
+this only where a stop pauses the work: where a stop would end the change, the apply waits as
+before. An apply an operator already stopped or cancelled is left to that request.
+*Enforced:* the reaper's ended-operation pass and the stoppable types it passes
+(`runEndedOperationPass`, `endedOperationStoppableDatabaseTypes`, `pkg/api/reaper.go`), its two
+sweeps (`ListAppliesHeldByEndedOperation`, `SettleAppliesStoppedForEndedOperation`,
+`pkg/storage/internal/sqlstore/ended_operation_applies.go`), and retry expiry leaving such an apply
+to the settle (`expireRetryable`, `pkg/storage/internal/sqlstore/applies.go`), pinned on both
+dialects by the storage parity suite (`pkg/storage/storagetest/ended_operation_applies.go`). The
+drive tail leaves SchemaBot's stop pending for the settle (`completeLandedStopForHeldOpenApply`,
+`pkg/api/operator.go`).
 
 ## Ownership and leases (OW)
 
@@ -1193,8 +1229,8 @@ each believing it holds the lock. *Enforced:* the session affinity probe
 (`Postgres.VerifySessionAffinity`, `pkg/namedlock/postgres_affinity.go`), refused at bootstrap
 (`verifyStorageSessionAffinity`, `pkg/api/ensure_schema_postgres.go`); the release-answer
 warnings on every advisory lock caller (`releaseEnsureSchemaLock`, `pkg/api/ensure_schema.go`;
-`releaseApplyTargetLockConn`, `pkg/storage/internal/sqlstore/applies.go`; `reapUnderElection`,
-`pkg/storage/internal/sqlstore/reaper.go`).
+`releaseLockConn`, `pkg/storage/internal/sqlstore/lock_release.go`, shared by the apply target
+lock's `releaseApplyTargetLockConn` and the reaper's `reapUnderElection`).
 
 ### OW-10: Only drivers and elected reapers write to the target database
 
@@ -1327,7 +1363,7 @@ in the write that records the stop, under the locks the resuming claims take (`S
 and failing the cutover a stop superseded before the stop's
 request completes (`completePendingStopControlRequest` and `SettlePendingCutoverAfterStop`,
 `pkg/tern/control_requests.go`, reached from both clients and from
-`pkg/api/control_handlers.go` and `pkg/api/operator.go`).
+`pkg/api/control_handlers.go`, `pkg/api/operator.go`, and `pkg/api/reaper.go`).
 
 ### CO-5: The revert phase owns the outcome
 
@@ -1716,8 +1752,8 @@ re-plan through `replanVerdictForTask` (`pkg/tern/local_control_resume.go`), whi
 the re-plan speaks for a shard-tagged task at all. `remainingPlannedChanges` on the branch-resume
 path of the PlanetScale engine (`pkg/engine/planetscale/apply.go`) runs only reviewed DDL for the
 tables the branch still lacks, refuses a branch that differs outside the reviewed DDL, and
-validates the branch against the declared schema before creating the deploy request. The
-cross-deployment comparison a plan is reviewed against
+validates the branch against the declared schema before creating or adopting the deploy request.
+The cross-deployment comparison a plan is reviewed against
 is a separate, earlier mechanism (`pkg/tern/change_set_compare.go`, applied on the review-drift
 and rollup paths). Rollback confirmation also re-checks the lock owner and pinned plan in the
 apply-creation transaction (`rollbackConfirmCommandCore` in `pkg/webhook/rollback.go`, enforced

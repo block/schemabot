@@ -1532,13 +1532,14 @@ func TestPostgresExpireRetryableDefersToTheOperationLease(t *testing.T) {
 		int64((storage.ApplyLeaseStaleAfter + time.Minute).Seconds()), abandonedOpID)
 	require.NoError(t, err)
 
-	// A third deployment whose drive settled it into failed_retryable and left
-	// its lease behind: indistinguishable from a newly claimed retry, so the
-	// gate must defer until that lease is stale too.
+	// A third deployment whose redispatches spent its own budget, and whose
+	// drive settled it into failed_retryable and left its lease behind:
+	// indistinguishable from a newly claimed retry, so the gate must defer
+	// until that lease is stale too.
 	settledOpID := insertOperation(t, "region-c", "op-3")
 	_, err = db.ExecContext(t.Context(),
-		`UPDATE apply_operations SET state = $1, updated_at = NOW() WHERE id = $2`,
-		state.ApplyOperation.FailedRetryable, settledOpID)
+		`UPDATE apply_operations SET state = $1, attempt = $2, updated_at = NOW() WHERE id = $3`,
+		state.ApplyOperation.FailedRetryable, maxRecoveryAttempts, settledOpID)
 	require.NoError(t, err)
 
 	insertTask := func(t *testing.T, identifier, table string, opID int64, taskState string) {
@@ -1566,7 +1567,7 @@ func TestPostgresExpireRetryableDefersToTheOperationLease(t *testing.T) {
 		return got
 	}
 
-	expired, err := store.Applies().ExpireRetryable(t.Context(), 10)
+	expired, err := store.Applies().ExpireRetryable(t.Context(), endedOperationStopTypes, 10)
 	require.NoError(t, err)
 	assert.Empty(t, expired, "one live sibling holds the whole apply, not just its own rows")
 	assert.Equal(t, state.Task.Running, taskState(t, "task-expire-abandoned"))
@@ -1580,7 +1581,7 @@ func TestPostgresExpireRetryableDefersToTheOperationLease(t *testing.T) {
 		int64((storage.ApplyLeaseStaleAfter + time.Minute).Seconds()), heldOpID, settledOpID)
 	require.NoError(t, err)
 
-	expired, err = store.Applies().ExpireRetryable(t.Context(), 10)
+	expired, err = store.Applies().ExpireRetryable(t.Context(), endedOperationStopTypes, 10)
 	require.NoError(t, err)
 	require.Len(t, expired, 1, "a declined apply is offered again on the next pass")
 	assert.Equal(t, state.Apply.Failed, expired[0].Apply.State)
@@ -1637,9 +1638,11 @@ func TestPostgresExpireRetryableOperationsDefersToTheOperationLease(t *testing.T
 		}
 	}
 
-	// The deployment whose redispatches spent the budget, its lease long stale,
+	// The deployment whose redispatches spent its budget, its lease long stale,
 	// and the sibling a driver is copying under right now.
 	pausedOpID := insertOperation(t, "region-b", "op-1", state.ApplyOperation.FailedRetryable)
+	_, err = db.ExecContext(t.Context(), `UPDATE apply_operations SET attempt = $1 WHERE id = $2`, maxRecoveryAttempts, pausedOpID)
+	require.NoError(t, err)
 	ageLease(t, pausedOpID)
 	heldOpID := insertOperation(t, "region-c", "op-2", state.ApplyOperation.Running)
 
@@ -1729,19 +1732,21 @@ func TestPostgresOperationProjectionReadsAnOrphanedFinalizerAsSettled(t *testing
 		RETURNING id`, state.Apply.RunningDegraded, maxRecoveryAttempts,
 		int64((2*storage.ApplyLeaseStaleAfter).Seconds())).Scan(&applyID))
 
-	insertOperation := func(t *testing.T, deployment, key, kind, opState string) int64 {
+	// The budget is each operation's own, so the paused work row is the one
+	// that has spent it.
+	insertOperation := func(t *testing.T, deployment, key, kind, opState string, attempt int) int64 {
 		t.Helper()
 		var id int64
 		require.NoError(t, db.QueryRowContext(t.Context(), `
-			INSERT INTO apply_operations (apply_id, deployment, operation_key, operation_kind, state, updated_at)
-			VALUES ($1, $2, $3, $4, $5, NOW() - make_interval(secs => $6))
-			RETURNING id`, applyID, deployment, key, kind, opState,
+			INSERT INTO apply_operations (apply_id, deployment, operation_key, operation_kind, state, attempt, updated_at)
+			VALUES ($1, $2, $3, $4, $5, $6, NOW() - make_interval(secs => $7))
+			RETURNING id`, applyID, deployment, key, kind, opState, attempt,
 			int64((storage.ApplyLeaseStaleAfter+time.Minute).Seconds())).Scan(&id))
 		return id
 	}
-	insertOperation(t, "region-a", "commerce/-80/users", storage.ApplyOperationKindWork, state.ApplyOperation.Failed)
-	pausedOpID := insertOperation(t, "region-b", "commerce/-80/users", storage.ApplyOperationKindWork, state.ApplyOperation.FailedRetryable)
-	finalizerOpID := insertOperation(t, "region-b", "commerce/group_finalizer", storage.ApplyOperationKindGroupFinalizer, state.ApplyOperation.Pending)
+	insertOperation(t, "region-a", "commerce/-80/users", storage.ApplyOperationKindWork, state.ApplyOperation.Failed, 0)
+	pausedOpID := insertOperation(t, "region-b", "commerce/-80/users", storage.ApplyOperationKindWork, state.ApplyOperation.FailedRetryable, maxRecoveryAttempts)
+	finalizerOpID := insertOperation(t, "region-b", "commerce/group_finalizer", storage.ApplyOperationKindGroupFinalizer, state.ApplyOperation.Pending, 0)
 
 	operationState := func(t *testing.T, opID int64) string {
 		t.Helper()

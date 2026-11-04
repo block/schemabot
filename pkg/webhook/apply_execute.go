@@ -867,6 +867,13 @@ func dispatchErrorMessage(err error, msgs dispatchMessages) string {
 		}
 		return strings.Join(parts, " ")
 	}
+	if refused, ok := errors.AsType[*api.DeferredCutoverCapacityError](err); ok {
+		parts := []string{deferredCutoverCapacityMessage(refused, msgs.command, msgs.environment, msgs.tenant)}
+		if msgs.afterRefusal != "" {
+			parts = append(parts, msgs.afterRefusal)
+		}
+		return strings.Join(parts, " ")
+	}
 	if missing, ok := errors.AsType[*api.PlanNotFoundError](err); ok {
 		return templates.PlanNotFoundDetail(missing.PlanID, msgs.replan)
 	}
@@ -916,7 +923,7 @@ func unsupportedFeatureRemedy(feature schema.Feature, msgs dispatchMessages) str
 func rolloutShapeRefusalMessage(refused *api.RolloutShapeRefusedError, command, environment, tenant string) string {
 	switch refused.Refusal {
 	case api.RolloutDeferCutoverRefused:
-		return fmt.Sprintf("`--defer-cutover` is not supported on an apply to more than one target: each target cuts over as its table finishes. Run `%s` again without `--defer-cutover`.", templates.TenantCommand("schemabot "+command, environment, tenant))
+		return fmt.Sprintf("`--defer-cutover` is not supported on an apply to more than one target: each target runs its cutover as its table finishes. Run `%s` again without `--defer-cutover`.", templates.TenantCommand("schemabot "+command, environment, tenant))
 	case api.RolloutMultiTargetDeploymentsRefused:
 		narrowed := fmt.Sprintf("`%s --target %s`", templates.TenantCommand("schemabot "+action.Apply, environment, tenant), refused.FirstTarget)
 		if command == action.RollbackConfirm {
@@ -931,6 +938,59 @@ func rolloutShapeRefusalMessage(refused *api.RolloutShapeRefusedError, command, 
 		return "An apply to more than one deployment is not supported yet when a deployment has several targets. Apply one target at a time, starting with " + narrowed + "."
 	}
 	return "This rollout shape is not supported. See SchemaBot server logs for details."
+}
+
+// deferredCutoverCapacityMessage is the PR comment line for an apply started
+// with --defer-cutover that would keep more drivers waiting at its cutover
+// than max_drivers_per_apply gives one apply, or than SchemaBot's servers
+// have. When the refusal is about a deployment whose operations run on
+// another plane, the line names that deployment. It reads only the refusal's
+// counts and deployment, so no error text reaches the comment. Re-issuing
+// without the flag always runs. An apply's remedy names `apply`, never
+// `apply-confirm`: the refusal is reached at apply, before the operator is
+// asked to confirm. A rollback's names `rollback-confirm`, which the pinned
+// rollback plan lets the operator re-issue as it stands.
+func deferredCutoverCapacityMessage(refused *api.DeferredCutoverCapacityError, command, environment, tenant string) string {
+	work, rerunCommand := "apply", action.Apply
+	if command == action.RollbackConfirm {
+		work, rerunCommand = "rollback", action.RollbackConfirm
+	}
+	rerun := templates.TenantCommand("schemabot "+rerunCommand, environment, tenant)
+	if refused.Deployment != "" {
+		return deploymentDeferredCutoverCapacityMessage(refused, work, rerun)
+	}
+	switch {
+	case refused.ExceedsPerApplyCap():
+		return fmt.Sprintf("This %s can't defer its cutover: it would keep %d drivers waiting for the cutover, and one apply can use at most %d (`max_drivers_per_apply`). To defer it, raise `max_drivers_per_apply` to %d. Otherwise run `%s` without `--defer-cutover`.",
+			work, refused.Operations, refused.PerApplyCap, refused.Operations, rerun)
+	case refused.NoLiveServers():
+		return fmt.Sprintf("This %s can't defer its cutover: no SchemaBot server running drivers has checked in during the last %s. Apply again once SchemaBot's drivers are running, or run `%s` without `--defer-cutover`.",
+			work, api.LiveWindowText(), rerun)
+	default:
+		return fmt.Sprintf("This %s can't defer its cutover: it would keep %d drivers waiting for the cutover, and SchemaBot's servers have %d drivers that can wait. To defer it, give the servers %d more by raising `drivers` or running more servers. Otherwise run `%s` without `--defer-cutover`.",
+			work, refused.Operations, refused.Drivers, refused.Operations-refused.Drivers, rerun)
+	}
+}
+
+// deploymentDeferredCutoverCapacityMessage is deferredCutoverCapacityMessage
+// for a refusal about one deployment whose operations run on another plane:
+// the counts are that deployment's operations and that plane's drivers and
+// cap.
+func deploymentDeferredCutoverCapacityMessage(refused *api.DeferredCutoverCapacityError, work, rerun string) string {
+	switch {
+	case refused.Unreported:
+		return fmt.Sprintf("This %s can't defer its cutover: the `%s` deployment doesn't report its drivers. To defer it, upgrade SchemaBot there. Otherwise run `%s` without `--defer-cutover`.",
+			work, refused.Deployment, rerun)
+	case refused.ExceedsPerApplyCap():
+		return fmt.Sprintf("This %s can't defer its cutover: it would keep %d drivers waiting for the cutover on the `%s` deployment, and one apply can use at most %d there (`max_drivers_per_apply`). To defer it, raise `max_drivers_per_apply` on that deployment to %d. Otherwise run `%s` without `--defer-cutover`.",
+			work, refused.Operations, refused.Deployment, refused.PerApplyCap, refused.Operations, rerun)
+	case refused.NoLiveServers():
+		return fmt.Sprintf("This %s can't defer its cutover: no SchemaBot server running drivers on the `%s` deployment has checked in during the last %s. Apply again once its drivers are running, or run `%s` without `--defer-cutover`.",
+			work, refused.Deployment, api.LiveWindowText(), rerun)
+	default:
+		return fmt.Sprintf("This %s can't defer its cutover: it would keep %d drivers waiting for the cutover on the `%s` deployment, and its servers have %d drivers that can wait. To defer it, give that deployment's servers %d more by raising `drivers` or running more servers. Otherwise run `%s` without `--defer-cutover`.",
+			work, refused.Operations, refused.Deployment, refused.Drivers, refused.Operations-refused.Drivers, rerun)
+	}
 }
 
 // postAutoConfirmDowngrade posts the locked plan comment that pauses an
