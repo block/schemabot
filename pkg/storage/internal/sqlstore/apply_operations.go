@@ -1021,6 +1021,49 @@ func orphanedOperationArgs() []any {
 	return append(orphanedFinalizerArgs(), orphanedStepArgs()...)
 }
 
+// heldBackByFailClosedFailureSQL matches a row at alias that no driver has
+// started — pending, or stopped before it was ever claimed — under a rollout a
+// fail-closed failure has already decided: a sibling in the same apply
+// terminally failed under a policy that neither continues past the failure
+// nor pauses for a release. Only a halting policy, or one the rollout does not
+// recognize, fails closed; a paused rollout either waits for its release or
+// continues once released, so a paused failure never ends a queued sibling.
+// The operation claim admits a later member past a failure only under those
+// two policies, so a row this matches is one nothing will ever start, and
+// state.DeriveRolloutApplyState records the verdict without waiting on it. A
+// selection that waits for every row to settle has to read it the same way,
+// or the rollout the derivation has already failed is never handed to the
+// projection that records that failure. The fragment references the alias it
+// is given; its placeholders are listed by heldBackByFailClosedFailureArgs.
+func heldBackByFailClosedFailureSQL(alias string) string {
+	return `(
+	(
+		` + alias + `.state = ?
+		OR (` + alias + `.state = ? AND ` + alias + `.started_at IS NULL)
+	)
+	AND EXISTS (
+		SELECT 1
+		FROM apply_operations AS fail_closed
+		WHERE fail_closed.apply_id = ` + alias + `.apply_id
+			AND fail_closed.state = ?
+			AND fail_closed.on_failure NOT IN (?, ?)
+	)
+)`
+}
+
+// heldBackByFailClosedFailureArgs returns the positional arguments for
+// heldBackByFailClosedFailureSQL, in placeholder order: pending, stopped,
+// failed, and the two policies that do not fail closed.
+func heldBackByFailClosedFailureArgs() []any {
+	return []any{
+		state.ApplyOperation.Pending,
+		state.ApplyOperation.Stopped,
+		state.ApplyOperation.Failed,
+		storage.OnFailureContinue,
+		storage.OnFailurePause,
+	}
+}
+
 // releasedFailureExemptionSQL stops a terminal-failed earlier sibling from
 // blocking a later deployment's claim once the rollout policy says to keep
 // going: on_failure='continue', or on_failure='pause' after a release control

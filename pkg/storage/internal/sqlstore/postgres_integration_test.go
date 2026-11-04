@@ -1773,6 +1773,74 @@ func TestPostgresOperationProjectionReadsAnOrphanedFinalizerAsSettled(t *testing
 	assert.Equal(t, state.ApplyOperation.Pending, operationState(t, finalizerOpID), "the claim writes the parent's lease, not the orphaned row")
 }
 
+// A queued row no claim will ever start does not hold its parent from the
+// projection: a deployment still pending behind a sibling's terminal failure
+// under a halting policy, and a table step queued behind an earlier step that
+// was reverted, are both read as settled, while a deployment queued under a
+// rollout that continues past the failure still owes a start and holds the
+// parent. The policy and the step order are read from the rows in rendered SQL
+// PostgreSQL has to execute.
+func TestPostgresOperationProjectionReadsAQueuedRowNoClaimWillStartAsSettled(t *testing.T) {
+	dsn, fixtureDB := testutil.StartPostgres(t, "sqlstore_projection_queued")
+	db, err := postgresconn.Open(dsn)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	require.NoError(t, db.PingContext(t.Context()))
+	applyPostgresTestSchema(t, fixtureDB)
+	store := postgresHarness{db: db, dsn: dsn}.NewStorage(t)
+
+	type operationRow struct {
+		deployment, key, opState string
+		step                     int
+	}
+	seedRollout := func(t *testing.T, identifier, onFailure string, rows []operationRow) int64 {
+		t.Helper()
+		var applyID int64
+		require.NoError(t, db.QueryRowContext(t.Context(), `
+			INSERT INTO applies (apply_identifier, lock_id, plan_id, database_name, database_type,
+				repository, pull_request, environment, engine, state, options, error_message, updated_at)
+			VALUES ($1, 1, 1, 'testdb', 'mysql', 'org/repo', 7, 'staging', 'spirit', $2, '{}', '',
+				NOW() - make_interval(secs => $3))
+			RETURNING id`, identifier, state.Apply.Running,
+			int64((2*storage.ApplyLeaseStaleAfter).Seconds())).Scan(&applyID))
+		for _, row := range rows {
+			_, err := db.ExecContext(t.Context(), `
+				INSERT INTO apply_operations (apply_id, deployment, operation_key, operation_kind, state, on_failure, rollout_step, updated_at)
+				VALUES ($1, $2, $3, $4, $5, $6, $7, NOW() - make_interval(secs => $8))`,
+				applyID, row.deployment, row.key, storage.ApplyOperationKindWork, row.opState, onFailure, row.step,
+				int64((storage.ApplyLeaseStaleAfter + time.Minute).Seconds()))
+			require.NoError(t, err)
+		}
+		return applyID
+	}
+	claimNext := func(t *testing.T) *storage.Apply {
+		t.Helper()
+		claimed, err := store.Applies().FindNextApplyForOperationProjection(t.Context(), "test-operator")
+		require.NoError(t, err)
+		return claimed
+	}
+	queuedBehindFailure := []operationRow{
+		{"region-a", "commerce/-80/users", state.ApplyOperation.Failed, 0},
+		{"region-b", "commerce/-80/users", state.ApplyOperation.Pending, 0},
+	}
+
+	haltedID := seedRollout(t, "apply-projection-halted", storage.OnFailureHalt, queuedBehindFailure)
+	claimed := claimNext(t)
+	require.NotNil(t, claimed, "a halting policy keeps the queued deployment from ever starting")
+	assert.Equal(t, haltedID, claimed.ID)
+
+	revertedStepID := seedRollout(t, "apply-projection-reverted-step", storage.OnFailureContinue, []operationRow{
+		{"region-a", "commerce/-80/users", state.ApplyOperation.Reverted, 1},
+		{"region-a", "commerce/-80/orders", state.ApplyOperation.Pending, 2},
+	})
+	claimed = claimNext(t)
+	require.NotNil(t, claimed, "a step queued behind a reverted earlier step can never pass")
+	assert.Equal(t, revertedStepID, claimed.ID)
+
+	seedRollout(t, "apply-projection-continuing", storage.OnFailureContinue, queuedBehindFailure)
+	require.Nil(t, claimNext(t), "a rollout that continues past the failure still starts the queued deployment")
+}
+
 // The conflict check settles an abandoned task only while no drive holds the
 // task's operation, and the guard that decides that is rendered SQL PostgreSQL
 // has to execute: a live operation lease refuses the write, and a lease that

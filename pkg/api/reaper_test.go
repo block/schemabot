@@ -775,6 +775,25 @@ func TestRunRetryableExpiryPassLogsNameTheAbandonedDeployment(t *testing.T) {
 	assert.Equal(t, string(storage.RetryableExpirationAttemptBudget), line["reason"])
 }
 
+// The resume-failure counter is the signal an operator alerts on when recovery
+// gives up, so an abandoned deployment counts under the deployment that was
+// abandoned and the reason recovery stopped, not under the parent apply's
+// deployment.
+func TestRunRetryableExpiryPassCountsTheAbandonedDeploymentAsAResumeFailure(t *testing.T) {
+	reader := reaperMetricReader(t)
+	svc, _ := retryableExpiryService(&expiringApplyStore{operationExpirations: degradedBudgetExpiration()})
+
+	svc.runRetryableExpiryPass(t.Context())
+
+	points := collectCounterPoints(t, reader, "schemabot.operator.resume_failures_total")
+	require.Len(t, points, 1)
+	assert.Equal(t, int64(1), points[0].Value)
+	assert.Equal(t, "payments", attributeValue(t, points[0], "database"))
+	assert.Equal(t, "region-b", attributeValue(t, points[0], "deployment"))
+	assert.Equal(t, "staging", attributeValue(t, points[0], "environment"))
+	assert.Equal(t, string(storage.RetryableExpirationAttemptBudget), attributeValue(t, points[0], "reason"))
+}
+
 // The degraded-rollout sweep fails apart from the apply sweep, under its own
 // reason, so an operator alerting on claim failures can tell which one broke.
 // A failure in it does not undo the apply sweep's committed expirations.

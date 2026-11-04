@@ -3690,9 +3690,11 @@ func TestApplyStore_ExpireRetryableOperations_SettlesOnlyThePausedDeployment(t *
 	assert.Empty(t, again, "nothing retryable is left under the rollout")
 }
 
-// The freshness window is the other way a rollout's recovery ends: a parent
-// nobody has written to for longer than the window is expired on that alone,
-// however many attempts remain.
+// The freshness window is the other way a rollout's recovery ends: a paused
+// deployment nobody has written to for longer than the window is expired on
+// that alone, however many attempts remain. The window is measured on the
+// paused row, the row the claim redispatches, so a sibling's progress on the
+// parent does not keep the pause alive.
 func TestApplyStore_ExpireRetryableOperations_ExpiresAStaleRolloutUnderBudget(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
@@ -3700,7 +3702,8 @@ func TestApplyStore_ExpireRetryableOperations_ExpiresAStaleRolloutUnderBudget(t 
 
 	rollout := stageDegradedRollout(t, store, "apply_degraded_window", 531)
 	spendPausedRetryBudget(t, rollout, 1)
-	_, err := testDB.ExecContext(ctx, `UPDATE applies SET updated_at = NOW() - INTERVAL 2 DAY WHERE id = ?`, rollout.apply.ID)
+	backdateOperationHeartbeat(t, rollout.paused, 48*time.Hour)
+	_, err := testDB.ExecContext(ctx, `UPDATE applies SET updated_at = NOW() WHERE id = ?`, rollout.apply.ID)
 	require.NoError(t, err)
 
 	expired, err := store.Applies().ExpireRetryableOperations(ctx, 10)
@@ -3711,10 +3714,12 @@ func TestApplyStore_ExpireRetryableOperations_ExpiresAStaleRolloutUnderBudget(t 
 	assertOperationState(t, store, rollout.queued, state.ApplyOperation.Pending)
 }
 
-// A rollout with attempts left and a recent write is one the operation claim
-// may still redispatch, so expiry leaves it alone. The predicates are each
-// other's complement: a paused row is either still the claim's to retry or
-// expiry's to retire, never both and never neither.
+// A rollout with attempts left whose pause is still inside the window is one
+// the operation claim may still redispatch, so expiry leaves it alone. The
+// claim and expiry read the same budget and the same window on the same row,
+// so a paused row is either still the claim's to retry or expiry's to retire,
+// never both and never neither. The parent's own timestamp plays no part: it
+// is left stale here and the pause is still kept.
 func TestApplyStore_ExpireRetryableOperations_LeavesARolloutStillWithinBudget(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
@@ -3722,7 +3727,7 @@ func TestApplyStore_ExpireRetryableOperations_LeavesARolloutStillWithinBudget(t 
 
 	rollout := stageDegradedRollout(t, store, "apply_degraded_fresh", 532)
 	spendPausedRetryBudget(t, rollout, maxRecoveryAttempts-1)
-	_, err := testDB.ExecContext(ctx, `UPDATE applies SET updated_at = NOW() WHERE id = ?`, rollout.apply.ID)
+	_, err := testDB.ExecContext(ctx, `UPDATE applies SET updated_at = NOW() - INTERVAL 2 DAY WHERE id = ?`, rollout.apply.ID)
 	require.NoError(t, err)
 
 	expired, err := store.Applies().ExpireRetryableOperations(ctx, 10)
@@ -3837,6 +3842,69 @@ func TestApplyStore_ExpireRetryableOperations_HandsTheRolloutToTheProjectionPast
 	require.NotNil(t, claimed, "a finalizer whose work failed never starts, so it does not hold the rollout from the projection")
 	assert.Equal(t, rollout.apply.ID, claimed.ID)
 	assertOperationState(t, store, finalizer, state.ApplyOperation.Pending, "the claim writes the parent's lease, not the orphaned row")
+}
+
+// A rollout under the halting policy keeps a queued deployment behind a
+// failed sibling: the operation claim never starts it, and the derivation
+// records the failed verdict without waiting on it. Once expiry has settled
+// the paused deployment, that queued row is the only unsettled one left, and
+// the projection reads it the way the derivation does and claims the rollout.
+// Under a policy that continues past the failure the same queued row is the
+// claim's next deployment, so it holds the rollout back from the projection.
+func TestApplyStore_ExpireRetryableOperations_HandsTheRolloutToTheProjectionPastAQueuedSiblingTheFailureHoldsBack(t *testing.T) {
+	cases := []struct {
+		name      string
+		onFailure string
+		claimable bool
+		verdict   string
+	}{
+		{"halt", storage.OnFailureHalt, true, state.Apply.Failed},
+		{"continue", storage.OnFailureContinue, false, state.Apply.RunningDegraded},
+		{"pause", storage.OnFailurePause, false, state.Apply.Paused},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			clearTables(t)
+			ctx := t.Context()
+			store := NewMySQL(testDB)
+
+			rollout := stageDegradedRollout(t, store, "apply_degraded_queued_"+tc.name, 537)
+			_, err := testDB.ExecContext(ctx, `UPDATE apply_operations SET on_failure = ? WHERE apply_id = ?`,
+				tc.onFailure, rollout.apply.ID)
+			require.NoError(t, err)
+			backdateOperationHeartbeat(t, rollout.halted, storage.ApplyLeaseStaleAfter+time.Minute)
+			spendPausedRetryBudget(t, rollout, maxRecoveryAttempts)
+			backdateApplyUpdatedAt(t, rollout.apply.ID, 2*storage.ApplyLeaseStaleAfter)
+
+			claimed, err := store.Applies().FindNextApplyForOperationProjection(ctx, "test-operator")
+			require.NoError(t, err)
+			require.Nil(t, claimed, "a paused deployment is unsettled work, so the rollout is not yet the projection's")
+
+			expired, err := store.Applies().ExpireRetryableOperations(ctx, 10)
+			require.NoError(t, err)
+			require.Len(t, expired, 1)
+			assertOperationState(t, store, rollout.queued, state.ApplyOperation.Pending, "expiry leaves the queued deployment as it was")
+
+			ops, err := store.ApplyOperations().ListByApply(ctx, rollout.apply.ID)
+			require.NoError(t, err)
+			rolloutOps := make([]state.RolloutOperation, 0, len(ops))
+			for _, op := range ops {
+				rolloutOps = append(rolloutOps, op.RolloutOperation(false))
+			}
+			assert.Equal(t, tc.verdict, state.DeriveRolloutApplyState(state.RolloutChildren(rolloutOps)),
+				"the verdict the projection would record over these rows")
+
+			claimed, err = store.Applies().FindNextApplyForOperationProjection(ctx, "test-operator")
+			require.NoError(t, err)
+			if !tc.claimable {
+				assert.Nil(t, claimed, "the queued deployment can still start, so it holds the rollout back from the projection")
+				return
+			}
+			require.NotNil(t, claimed, "the failure holds the queued deployment back for good, so it does not hold the rollout from the projection")
+			assert.Equal(t, rollout.apply.ID, claimed.ID)
+			assertOperationState(t, store, rollout.queued, state.ApplyOperation.Pending, "the claim writes the parent's lease, not the queued row")
+		})
+	}
 }
 
 // Oldest rollout first, and no more than limit of them per pass, so a backlog
@@ -4991,12 +5059,16 @@ func TestApplyStore_FindNextApplyForOperationProjection_SkipsLiveAndUnsettledApp
 
 // TestApplyStore_FindNextApplyForOperationProjection_ReadsOrphanedRowsAsSettled
 // verifies the claim agrees with the rollout derivation about which pending
-// rows hold a rollout open. A group_finalizer whose work failed, and a table
-// step behind one that settled without completing, are rows no claim arm will
-// ever start, and the derivation settles the parent without them; the claim
-// reads them as settled so that parent is reached. The same rows behind work
-// that completed, or under another deployment, are queued work and still hold
-// the parent back.
+// rows hold a rollout open. A group_finalizer whose work failed, a table
+// step behind one that settled without completing, and a deployment queued
+// behind a sibling's failure under a policy that halts the rollout, are rows
+// no claim arm will ever start, and the derivation settles the parent without
+// them; the claim reads them as settled so that parent is reached. The same
+// rows behind work that completed, under another deployment, or behind a
+// failure the rollout continues past or pauses on, are queued work and still
+// hold the parent back. Rows that exercise only the finalizer and step arms
+// fail under the continuing policy, so the halting policy's own arm stays out
+// of their way.
 func TestApplyStore_FindNextApplyForOperationProjection_ReadsOrphanedRowsAsSettled(t *testing.T) {
 	work := func(deployment, key, opState string, step int) *storage.ApplyOperation {
 		return &storage.ApplyOperation{
@@ -5010,6 +5082,10 @@ func TestApplyStore_FindNextApplyForOperationProjection_ReadsOrphanedRowsAsSettl
 			State: opState,
 		}
 	}
+	under := func(onFailure string, op *storage.ApplyOperation) *storage.ApplyOperation {
+		op.OnFailure = onFailure
+		return op
+	}
 	cases := []struct {
 		name      string
 		ops       []*storage.ApplyOperation
@@ -5019,7 +5095,7 @@ func TestApplyStore_FindNextApplyForOperationProjection_ReadsOrphanedRowsAsSettl
 		{
 			name: "pending finalizer behind failed work",
 			ops: []*storage.ApplyOperation{
-				work("region-a", "commerce/-80/users", state.ApplyOperation.Failed, 0),
+				under(storage.OnFailureContinue, work("region-a", "commerce/-80/users", state.ApplyOperation.Failed, 0)),
 				finalizer("region-a", "commerce/group_finalizer", state.ApplyOperation.Pending),
 			},
 			claimable: true,
@@ -5028,7 +5104,7 @@ func TestApplyStore_FindNextApplyForOperationProjection_ReadsOrphanedRowsAsSettl
 		{
 			name: "stopped finalizer behind failed work",
 			ops: []*storage.ApplyOperation{
-				work("region-a", "commerce/-80/users", state.ApplyOperation.Failed, 0),
+				under(storage.OnFailureContinue, work("region-a", "commerce/-80/users", state.ApplyOperation.Failed, 0)),
 				finalizer("region-a", "commerce/group_finalizer", state.ApplyOperation.Stopped),
 			},
 			claimable: true,
@@ -5046,7 +5122,7 @@ func TestApplyStore_FindNextApplyForOperationProjection_ReadsOrphanedRowsAsSettl
 		{
 			name: "pending finalizer behind another deployment's failed work",
 			ops: []*storage.ApplyOperation{
-				work("region-a", "commerce/-80/users", state.ApplyOperation.Failed, 0),
+				under(storage.OnFailureContinue, work("region-a", "commerce/-80/users", state.ApplyOperation.Failed, 0)),
 				work("region-b", "commerce/-80/users", state.ApplyOperation.Completed, 0),
 				finalizer("region-b", "commerce/group_finalizer", state.ApplyOperation.Pending),
 			},
@@ -5056,7 +5132,7 @@ func TestApplyStore_FindNextApplyForOperationProjection_ReadsOrphanedRowsAsSettl
 		{
 			name: "pending finalizer of another namespace",
 			ops: []*storage.ApplyOperation{
-				work("region-a", "commerce/-80/users", state.ApplyOperation.Failed, 0),
+				under(storage.OnFailureContinue, work("region-a", "commerce/-80/users", state.ApplyOperation.Failed, 0)),
 				work("region-a", "billing/-80/invoices", state.ApplyOperation.Completed, 0),
 				finalizer("region-a", "billing/group_finalizer", state.ApplyOperation.Pending),
 			},
@@ -5066,7 +5142,7 @@ func TestApplyStore_FindNextApplyForOperationProjection_ReadsOrphanedRowsAsSettl
 		{
 			name: "pending step behind a failed earlier step",
 			ops: []*storage.ApplyOperation{
-				work("region-a", "users", state.ApplyOperation.Failed, 1),
+				under(storage.OnFailureContinue, work("region-a", "users", state.ApplyOperation.Failed, 1)),
 				work("region-a", "orders", state.ApplyOperation.Pending, 2),
 			},
 			claimable: true,
@@ -5082,6 +5158,15 @@ func TestApplyStore_FindNextApplyForOperationProjection_ReadsOrphanedRowsAsSettl
 			reason:    "a cancelled step ends its deployment's rollout the same way a failed one does",
 		},
 		{
+			name: "pending step behind a reverted earlier step",
+			ops: []*storage.ApplyOperation{
+				work("region-a", "users", state.ApplyOperation.Reverted, 1),
+				work("region-a", "orders", state.ApplyOperation.Pending, 2),
+			},
+			claimable: true,
+			reason:    "a reverted step settled without completing, so the step behind it never starts",
+		},
+		{
 			name: "pending step behind a completed earlier step",
 			ops: []*storage.ApplyOperation{
 				work("region-a", "users", state.ApplyOperation.Completed, 1),
@@ -5091,14 +5176,50 @@ func TestApplyStore_FindNextApplyForOperationProjection_ReadsOrphanedRowsAsSettl
 			reason:    "the next step is the operation claim's next row, not residue",
 		},
 		{
+			name: "pending step beside a failed row of its own step",
+			ops: []*storage.ApplyOperation{
+				under(storage.OnFailureContinue, work("region-a", "users", state.ApplyOperation.Failed, 2)),
+				work("region-a", "orders", state.ApplyOperation.Pending, 2),
+			},
+			claimable: false,
+			reason:    "the step gate waits on earlier steps only, so a failure in the same step does not end the step",
+		},
+		{
 			name: "pending step behind another deployment's failed step",
 			ops: []*storage.ApplyOperation{
-				work("region-a", "users", state.ApplyOperation.Failed, 1),
+				under(storage.OnFailureContinue, work("region-a", "users", state.ApplyOperation.Failed, 1)),
 				work("region-b", "users", state.ApplyOperation.Completed, 1),
 				work("region-b", "orders", state.ApplyOperation.Pending, 2),
 			},
 			claimable: false,
 			reason:    "the step gate orders steps within a deployment, so another deployment's failure does not end this one's",
+		},
+		{
+			name: "pending deployment behind a sibling's failure that halts the rollout",
+			ops: []*storage.ApplyOperation{
+				under(storage.OnFailureHalt, work("region-a", "users", state.ApplyOperation.Failed, 0)),
+				work("region-b", "users", state.ApplyOperation.Pending, 0),
+			},
+			claimable: true,
+			reason:    "the halting policy keeps the queued deployment from ever starting, and the derivation records the failure without it",
+		},
+		{
+			name: "pending deployment behind a sibling's failure the rollout continues past",
+			ops: []*storage.ApplyOperation{
+				under(storage.OnFailureContinue, work("region-a", "users", state.ApplyOperation.Failed, 0)),
+				work("region-b", "users", state.ApplyOperation.Pending, 0),
+			},
+			claimable: false,
+			reason:    "the queued deployment is the operation claim's next row",
+		},
+		{
+			name: "pending deployment behind a sibling's failure the rollout pauses on",
+			ops: []*storage.ApplyOperation{
+				under(storage.OnFailurePause, work("region-a", "users", state.ApplyOperation.Failed, 0)),
+				work("region-b", "users", state.ApplyOperation.Pending, 0),
+			},
+			claimable: false,
+			reason:    "a paused rollout waits for its release, and the queued deployment starts once it is released",
 		},
 	}
 	for _, tc := range cases {
