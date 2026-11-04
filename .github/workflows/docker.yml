@@ -1,7 +1,7 @@
 # .github/workflows/docker.yml — Docker image + Helm chart publishing
 #
 # Triggers:
-#   - Pull request: build Docker image (single platform) + lint Helm chart
+#   - Pull request: build Docker image (multi-arch, not pushed) + lint Helm chart
 #   - Push to main: build + push Docker image (multi-arch, latest + sha)
 #   - Tag v*:       build + push Docker image (multi-arch) + package + push Helm chart (if changed)
 #
@@ -143,8 +143,9 @@ jobs:
             fi
           done
 
+      # The builder stage cross-compiles, but the arm64 runtime stage still runs
+      # its apk commands under emulation, so every build needs QEMU.
       - name: Set up QEMU
-        if: github.event_name == 'push'
         uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # docker/setup-qemu-action@v3
 
       - name: Set up Docker Buildx
@@ -182,9 +183,11 @@ jobs:
         with:
           context: .
           file: deploy/Dockerfile
-          # Multi-arch only when publishing (push/tag); single platform on PRs
-          # and in the merge queue for speed (those validate the build, no push)
-          platforms: ${{ github.event_name == 'push' && 'linux/amd64,linux/arm64' || 'linux/amd64' }}
+          # Both platforms on every event, so a Dockerfile change is validated
+          # for arm64 on the PR rather than on the first push after merge. The
+          # arm64 leg cross-compiles, so it costs little more than amd64 alone.
+          # Only pushes (main and tags) publish the result.
+          platforms: linux/amd64,linux/arm64
           push: ${{ github.event_name == 'push' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
