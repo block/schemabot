@@ -128,6 +128,24 @@ func TestLocalClient_StartDiscoveryDoesNotFallBackToAnOlderApplyOnStorageFailure
 	assert.Contains(t, err.Error(), newerTask.TaskIdentifier)
 }
 
+// A stopped task whose apply row no longer exists is not a storage failure: the
+// discovery pass skips it and still resumes the stopped apply that does exist,
+// even when the orphan task is the more recently updated of the two.
+func TestLocalClient_StartDiscoverySkipsStoppedTaskWhoseApplyRowIsMissing(t *testing.T) {
+	now := time.Now()
+	present, presentTask := stoppedApplyWithTask(90, "apply-present", now.Add(-time.Hour))
+	_, orphanTask := stoppedApplyWithTask(95, "apply-orphan", now)
+	client := newGetFailingControlClient(
+		&getFailingApplyStore{applies: map[int64]*storage.Apply{present.ID: present}},
+		[]*storage.Task{presentTask, orphanTask}, &controlCaptureEngine{})
+
+	resolved, _, _, err := client.resolveStartRequest(t.Context(), &ternv1.StartRequest{})
+
+	require.NoError(t, err)
+	require.NotNil(t, resolved)
+	assert.Equal(t, present.ApplyIdentifier, resolved.ApplyIdentifier)
+}
+
 // A stop that names an apply while storage cannot answer must report the storage
 // failure and leave the engine and every stored row untouched.
 func TestLocalClient_StopNamedApplyReportsStorageFailure(t *testing.T) {
