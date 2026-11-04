@@ -197,6 +197,20 @@ A pending `stop` or `cancel` does not wait out the backoff. The operation is
 picked up at once so the command takes effect, and that pickup spends an
 attempt like any other.
 
+In a rollout, an operation that is retrying a failure holds every member after
+it in the rollout order until the retry resolves, so the backoff also sets how
+long the rest of the rollout waits on it. Members before it are not held, and
+the shards of one target never wait on each other. Under `parallel`, the
+default for a `targets` list, the later members keep starting and copying
+while it retries: each finishes its copy, parks at the cutover barrier, which
+frees its driver, and cuts over once the retry succeeds. Under `barrier` and
+`rolling` they wait to start. An operation that fails every time holds them
+for its whole budget, about 20 minutes, and then fails, and `on_failure`
+decides what the rest of the rollout does ([Multi-Target
+Environment](configuration.md#multi-target-environment-preview)). That wait is
+the cost of riding out a data plane restart instead of failing the rollout on
+it. Stop or cancel the apply to end it sooner; neither waits out the backoff.
+
 ```
  running --(recoverable failure)--> failed_retryable
     ^                                     |
