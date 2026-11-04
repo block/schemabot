@@ -990,6 +990,22 @@ projection builds its children, with `RolloutHeldByResumableChild` (`pkg/state/a
 (`pkg/tern/control_requests.go`, reached from `pkg/api/control_handlers.go` and `pkg/tern/local_control.go`, through `RequestPendingSuperseding` in
 `pkg/storage/internal/sqlstore/control_requests.go`).
 
+### ST-11: An apply whose cutover can never run is ended, not left waiting
+
+When an apply holds its operations for a cutover that runs for all of them, and one operation ends
+before it gets there, by failing under a policy that halts the rollout or by waiting on a retry that
+will never come, SchemaBot ends the apply rather than leaving the rest holding their targets until
+the wait times out. It stops the others so each one saves its work, then settles the apply failed
+once nothing drives it, and each stopped operation records the operation it failed for. It does
+this only where a stop pauses the work: where a stop would end the change, the apply waits as
+before. An apply an operator already stopped or cancelled is left to that request.
+*Enforced:* the reaper's ended-operation pass and the stoppable types it passes
+(`runEndedOperationPass`, `endedOperationStoppableDatabaseTypes`, `pkg/api/reaper.go`), its two
+sweeps (`ListAppliesHeldByEndedOperation`, `SettleAppliesStoppedForEndedOperation`,
+`pkg/storage/internal/sqlstore/ended_operation_applies.go`), and retry expiry leaving such an apply
+to the settle (`expireRetryable`, `pkg/storage/internal/sqlstore/applies.go`), pinned on both
+dialects by the storage parity suite (`pkg/storage/storagetest/ended_operation_applies.go`).
+
 ## Ownership and leases (OW)
 
 ### OW-1: Every drive runs under a claim
@@ -1343,7 +1359,7 @@ in the write that records the stop, under the locks the resuming claims take (`S
 and failing the cutover a stop superseded before the stop's
 request completes (`completePendingStopControlRequest` and `SettlePendingCutoverAfterStop`,
 `pkg/tern/control_requests.go`, reached from both clients and from
-`pkg/api/control_handlers.go` and `pkg/api/operator.go`).
+`pkg/api/control_handlers.go`, `pkg/api/operator.go`, and `pkg/api/reaper.go`).
 
 ### CO-5: The revert phase owns the outcome
 

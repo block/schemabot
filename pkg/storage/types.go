@@ -1525,6 +1525,14 @@ type ApplyOperation struct {
 	// a member's whole change.
 	RolloutStep int
 
+	// EndedByOperationID names the sibling operation whose failure ended this
+	// one, or 0 when it ended on its own outcome. It is set when an apply that
+	// deferred its cutover fails because one operation ended before the
+	// cutover: SchemaBot stops the operations still waiting and settles them
+	// failed, and this records which sibling they failed for. Their tasks stay
+	// stopped, because the work they did is saved and a new apply resumes it.
+	EndedByOperationID int64
+
 	// StartedAt is when the operator claimed this child row and execution began.
 	StartedAt *time.Time
 
@@ -2026,12 +2034,18 @@ func (r *ApplyControlRequest) CutoverOperationIDs() ([]int64, error) {
 // on rather than the person who issued it.
 const ForwardingControlRequestCaller = "tern-grpc"
 
+// EndedOperationStopCaller is the requester recorded for the stop SchemaBot
+// itself requests on an apply that deferred its cutover when one of its
+// operations ends before the cutover. No operator issued it, so it names
+// SchemaBot.
+const EndedOperationStopCaller = "schemabot"
+
 // ControlRequestNamesAnOperator reports whether a requester identifies the
 // operator who issued the command. Only such a value is worth showing in the
 // PR notice, whose whole purpose is telling an operator which of their commands
 // did not take effect.
 func ControlRequestNamesAnOperator(requestedBy string) bool {
-	return requestedBy != "" && requestedBy != ForwardingControlRequestCaller
+	return requestedBy != "" && requestedBy != ForwardingControlRequestCaller && requestedBy != EndedOperationStopCaller
 }
 
 // IsMirroredRemoteRejection reports whether this row exists only to carry

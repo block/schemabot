@@ -3130,6 +3130,11 @@ func (s *applyStore) expireRetryable(ctx context.Context, limit int) ([]*storage
 	// ordering's own direction the sort has to see every failed_retryable row
 	// before it can take the first page, so the lease gate below would be
 	// evaluated once per row in the state rather than once per row returned.
+	//
+	// An apply SchemaBot stopped because an operation ended before a deferred
+	// cutover is settled by SettleAppliesStoppedForEndedOperation instead. That
+	// settlement keeps the stopped operations' tasks stopped, with their saved
+	// work, where this one would fail them.
 	rows, err := tx.QueryContext(ctx, `
 		SELECT `+applyColumns+`
 		FROM applies
@@ -3137,11 +3142,16 @@ func (s *applyStore) expireRetryable(ctx context.Context, limit int) ([]*storage
 			attempt >= ?
 			OR updated_at < `+s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime, ParameterIntervalAmount(), IntervalDay)+`
 		)
+			AND NOT EXISTS (
+				SELECT 1 FROM apply_control_requests req
+				WHERE req.apply_id = applies.id AND req.operation = ? AND req.status = ? AND req.requested_by = ?
+			)
 			AND `+undrivenApply+`
 		ORDER BY updated_at
 		LIMIT ?
 		FOR UPDATE
-	`, state.Apply.FailedRetryable, maxRecoveryAttempts, retryableRecoveryFreshnessDays, limit)
+	`, state.Apply.FailedRetryable, maxRecoveryAttempts, retryableRecoveryFreshnessDays,
+		storage.ControlOperationStop, storage.ControlRequestPending, storage.EndedOperationStopCaller, limit)
 	if err != nil {
 		return nil, fmt.Errorf("query expired retryable applies: %w", err)
 	}

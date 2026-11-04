@@ -20,6 +20,8 @@ import (
 // create/get/update lifecycle, claimability and lease rotation, stale-lease
 // recovery, lease-guarded writes, and concurrent claim exclusion.
 func TestApplies(t *testing.T, h Harness) {
+	t.Run("EndedOperation", func(t *testing.T) { testEndedOperationApplies(t, h) })
+
 	t.Run("IdentityKeys_AreCaseInsensitive", func(t *testing.T) {
 		ctx := t.Context()
 		store := h.NewStorage(t)
@@ -1869,6 +1871,14 @@ func TestApplies(t *testing.T, h Harness) {
 		},
 		"ExpireRetryable_DBError": func(t *testing.T, store storage.ApplyStore) error {
 			_, err := store.ExpireRetryable(t.Context(), 10)
+			return err
+		},
+		"ListAppliesHeldByEndedOperation_DBError": func(t *testing.T, store storage.ApplyStore) error {
+			_, err := store.ListAppliesHeldByEndedOperation(t.Context(), []string{storage.DatabaseTypeMySQL}, 10)
+			return err
+		},
+		"SettleAppliesStoppedForEndedOperation_DBError": func(t *testing.T, store storage.ApplyStore) error {
+			_, err := store.SettleAppliesStoppedForEndedOperation(t.Context(), 10)
 			return err
 		},
 		"FindMissingSummaryComment_DBError": func(t *testing.T, store storage.ApplyStore) error {

@@ -126,6 +126,9 @@ func (s *Service) StartOperator(ctx context.Context) {
 		s.reaperLoop(driverCtx, stop, expiryEvery, "retryable expiry", s.runRetryableExpiryPass)
 	})
 	s.maintenanceWg.Go(func() {
+		s.reaperLoop(driverCtx, stop, expiryEvery, "ended operation", s.runEndedOperationPass)
+	})
+	s.maintenanceWg.Go(func() {
 		s.operatorHeartbeatLoop(driverCtx, stop, heartbeatEvery, server)
 	})
 	if pass, ok := s.branchReconcilePass(); ok {

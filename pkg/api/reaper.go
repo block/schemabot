@@ -11,6 +11,7 @@ import (
 	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
+	"github.com/block/schemabot/pkg/tern"
 )
 
 // The reaper is the operator's cleanup component: it settles rows no driver
@@ -133,6 +134,28 @@ const strandedReaperBatch = 200
 // running at the cadence a driver notices.
 const RetryableExpiryInterval = OperatorPollInterval
 
+// endedOperationBatch bounds how many applies one pass of each ended-operation
+// sweep stops or settles, for the same reason as retryableExpiryBatch.
+const endedOperationBatch = 200
+
+// endedOperationStoppableDatabaseTypes are the database types whose stop
+// pauses the work, so stopping the operations held behind an ended one saves
+// what they copied. On a type whose stop ends the change, the stop would throw
+// that work away, so those applies are left to wait out the cutover timeout.
+// A type missing from this list is never stopped, which is the safe direction.
+var endedOperationStoppableDatabaseTypes = func() []string {
+	var types []string
+	for _, databaseType := range []string{
+		storage.DatabaseTypeMySQL, storage.DatabaseTypeStrata,
+		storage.DatabaseTypePostgres, storage.DatabaseTypeVitess,
+	} {
+		if !tern.StopTerminatesChange(databaseType) {
+			types = append(types, databaseType)
+		}
+	}
+	return types
+}()
+
 // retryableExpiryBatch bounds how many applies one expiry pass settles. Sized
 // like strandedReaperBatch and for the same reason: one instance expires per
 // pass, so this is the fleet-wide drain rate per interval.
@@ -254,6 +277,16 @@ var (
 		subject:       "expired retryable applies",
 		failureReason: "expire_retryable_error",
 	}
+	endedOperationStopSweep = reapSweep{
+		busy:          storage.ErrEndedOperationStopBusy,
+		subject:       "applies held by an ended operation",
+		failureReason: "ended_operation_stop_error",
+	}
+	endedOperationSettleSweep = reapSweep{
+		busy:          storage.ErrEndedOperationSettleBusy,
+		subject:       "applies stopped for an ended operation",
+		failureReason: "ended_operation_settle_error",
+	}
 )
 
 // recordSweepOutcome handles how a sweep ended, after its settlements have
@@ -311,6 +344,132 @@ func (s *Service) runRetryableExpiryPass(ctx context.Context) {
 	}
 
 	s.recordSweepOutcome(ctx, retryableExpirySweep, len(expired), err)
+}
+
+// runEndedOperationPass ends applies that deferred their cutover and had an
+// operation end before it. Such an apply can never run its cutover for every
+// operation, and its other operations would otherwise wait at the cutover until
+// the wait timed out, holding the target the whole time. The pass works in two
+// steps, across passes. It first records a stop on the apply as SchemaBot, and
+// the drives holding its operations carry the stop out on whichever plane runs
+// them, saving each operation's work. Once nothing is driven any more, it
+// settles the apply failed. Settling runs first in a pass, so an apply stopped
+// on one pass settles on a later one, after its drives have let go.
+//
+// It runs on the expiry cadence for the same reason expiry does: until the
+// apply settles, it holds its target against every new apply.
+func (s *Service) runEndedOperationPass(ctx context.Context) {
+	s.settleAppliesStoppedForEndedOperation(ctx)
+	s.stopAppliesHeldByEndedOperation(ctx)
+}
+
+// stopAppliesHeldByEndedOperation records SchemaBot's stop on each apply whose
+// deferred cutover an ended operation has made impossible. Each apply is its
+// own outcome: one that fails to stop is logged and offered again next pass,
+// and the rest are still stopped.
+func (s *Service) stopAppliesHeldByEndedOperation(ctx context.Context) {
+	held, err := s.storage.Applies().ListAppliesHeldByEndedOperation(ctx, endedOperationStoppableDatabaseTypes, endedOperationBatch)
+	for _, h := range held {
+		s.stopApplyHeldByEndedOperation(ctx, h)
+	}
+	s.recordSweepOutcome(ctx, endedOperationStopSweep, len(held), err)
+}
+
+func (s *Service) stopApplyHeldByEndedOperation(ctx context.Context, held *storage.EndedOperationApply) {
+	apply, ended := held.Apply, held.EndedOperation
+	endedName, err := s.operationDisplayName(ctx, ended)
+	if err != nil {
+		s.logger.Warn("operator: could not name the ended operation for the stop log; naming it by deployment",
+			append(apply.LogAttrs(), "ended_operation_id", ended.ID, "error", err)...)
+		endedName = ended.Deployment
+	}
+	attrs := append(apply.LogAttrs(),
+		"ended_operation_id", ended.ID,
+		"ended_operation", endedName,
+		"ended_operation_state", ended.State)
+	resp, responseStatus, err := s.queueStopForApplyOwner(ctx, apply, storage.EndedOperationStopCaller)
+	if err != nil {
+		s.logger.Error("operator: failed to stop an apply whose deferred cutover can no longer run; the next pass retries",
+			append(attrs, "error", err)...)
+		return
+	}
+	if !resp.Accepted {
+		s.logger.Error("operator: stop of an apply whose deferred cutover can no longer run was not accepted; the next pass retries",
+			append(attrs, "error_message", resp.ErrorMessage, "response_status", responseStatus)...)
+		return
+	}
+	s.logger.Info("operator: stopping an apply whose deferred cutover can no longer run because an operation ended before it",
+		append(attrs, "response_status", responseStatus)...)
+	s.logControlOperationForApply(ctx, apply, storage.EndedOperationStopCaller, storage.LogEventStopRequested,
+		fmt.Sprintf("%s ended before the cutover, so the cutover cannot run for every operation; stopping the others and saving their work", endedName))
+	s.wakeOperator(apply.ApplyIdentifier, apply.Database, apply.Environment)
+}
+
+// settleAppliesStoppedForEndedOperation settles failed each apply SchemaBot
+// stopped for an ended operation, once nothing drives it, then answers the
+// stop and any cutover an operator asked for, and publishes the apply's
+// terminal summary.
+func (s *Service) settleAppliesStoppedForEndedOperation(ctx context.Context) {
+	settled, err := s.storage.Applies().SettleAppliesStoppedForEndedOperation(ctx, endedOperationBatch)
+
+	// A pass settles its whole batch in one transaction, so this is all of what
+	// it settled or none of it.
+	for _, h := range settled {
+		s.reportApplySettledForEndedOperation(ctx, h)
+	}
+	s.recordSweepOutcome(ctx, endedOperationSettleSweep, len(settled), err)
+}
+
+func (s *Service) reportApplySettledForEndedOperation(ctx context.Context, settled *storage.EndedOperationApply) {
+	apply, ended := settled.Apply, settled.EndedOperation
+	endedName, err := s.operationDisplayName(ctx, ended)
+	if err != nil {
+		s.logger.Warn("operator: could not name the ended operation for the settle log; naming it by deployment",
+			append(apply.LogAttrs(), "ended_operation_id", ended.ID, "error", err)...)
+		endedName = ended.Deployment
+	}
+	attrs := append(apply.LogAttrs(),
+		"ended_operation_id", ended.ID,
+		"ended_operation", endedName)
+	s.logger.Error("operator: apply failed because an operation ended before its deferred cutover; the other operations were stopped with their work saved",
+		append(attrs, "settled_from", settled.SettledFrom)...)
+	adjustActiveAppliesForProjectedTransition(ctx, apply, settled.SettledFrom, apply.State)
+	s.appendApplyLog(ctx, s.logger, &storage.ApplyLog{
+		ApplyID:   apply.ID,
+		Level:     storage.LogLevelError,
+		EventType: storage.LogEventError,
+		Source:    storage.LogSourceSchemaBot,
+		Message: fmt.Sprintf("The apply failed: %s ended before the cutover. The other operations were stopped and their work is saved; applying the change again resumes it",
+			endedName),
+		NewState:  state.Apply.Failed,
+		CreatedAt: s.clock.Now(),
+	}, "why the apply failed", apply.LogAttrs()...)
+
+	// The apply is terminal now, so the requests on it are answered the way
+	// every other path answers them on a terminal apply: the cutover first, so
+	// the stop that kept it from running is still pending while it settles
+	// (CO-4). A failed answer leaves the request pending for the stranded
+	// control request sweep.
+	if err := s.settleCutoverSupersededByStop(ctx, apply); err != nil {
+		s.logger.Warn("operator: failed to answer the pending cutover of an apply stopped for an ended operation; the stranded control request sweep answers it",
+			append(attrs, "error", err)...)
+	} else if err := s.storage.ControlRequests().CompletePending(ctx, apply.ID, storage.ControlOperationStop); err != nil {
+		s.logger.Warn("operator: failed to complete SchemaBot's stop of an apply stopped for an ended operation; the stranded control request sweep answers it",
+			append(attrs, "error", err)...)
+	}
+
+	// No driver holds the apply, so this pass is the one that publishes the
+	// outcome to the PR and completes its Check Run.
+	s.publishTerminalSummary(ctx, apply, "publisher", "ended_operation_settle", "ended_operation_id", ended.ID)
+}
+
+// operationDisplayName names an operation the way the PR comment labels it.
+func (s *Service) operationDisplayName(ctx context.Context, op *storage.ApplyOperation) (string, error) {
+	ops, err := s.storage.ApplyOperations().ListByApply(ctx, op.ApplyID)
+	if err != nil {
+		return "", fmt.Errorf("list operations of apply %d to name operation %d: %w", op.ApplyID, op.ID, err)
+	}
+	return memberDisplayName(ops, memberDisplayNames(ops), op), nil
 }
 
 // logApplyExpiration appends a durable apply log entry recording that operator
