@@ -379,7 +379,12 @@ func TestRemoteProgressBatcher_LargeRoundIsSplitIntoBoundedCalls(t *testing.T) {
 func TestRemoteProgressBatcher_SameOperationTwiceIsAskedOnce(t *testing.T) {
 	rounds := &manualRounds{}
 	b := &remoteProgressBatcher{afterFunc: rounds.schedule}
-	client := &batchProgressFakeClient{answer: answerEachOperationRunning}
+	var source *ternv1.BatchProgressResponse
+	client := &batchProgressFakeClient{answer: func(req *ternv1.BatchProgressRequest) (*ternv1.BatchProgressResponse, error) {
+		resp, err := answerEachOperationRunning(req)
+		source = resp
+		return resp, err
+	}}
 
 	results := startBatchPolls(t, b, rounds, client, "op-1", "op-1")
 	rounds.sendNext(t)
@@ -391,6 +396,10 @@ func TestRemoteProgressBatcher_SameOperationTwiceIsAskedOnce(t *testing.T) {
 	assert.Equal(t, "op-1", first.resp.GetApplyOperationId())
 	assert.Equal(t, "op-1", second.resp.GetApplyOperationId())
 	assert.NotSame(t, first.resp, second.resp, "each poll owns its answer")
+	require.Len(t, source.GetOperations(), 1)
+	entry := source.GetOperations()[0].GetProgress()
+	assert.NotSame(t, entry, first.resp, "no poll is handed the message the others are copied from")
+	assert.NotSame(t, entry, second.resp, "no poll is handed the message the others are copied from")
 	require.Len(t, client.sent(), 1)
 	assert.Equal(t, []string{"op-1"}, client.sent()[0].GetApplyOperationIds())
 }
@@ -418,6 +427,9 @@ func TestRemoteProgressBatcher_CancelledPollAndClosedBatcher(t *testing.T) {
 type batchingTernServer struct {
 	ternv1.UnimplementedTernServer
 	batches bool
+	// entryScopeEcho, when set, is the operation every batch entry's progress
+	// names, whatever operation the entry answers for.
+	entryScopeEcho string
 
 	mu              sync.Mutex
 	progressCalls   int
@@ -440,7 +452,13 @@ func (s *batchingTernServer) BatchProgress(ctx context.Context, req *ternv1.Batc
 	s.batchCalls++
 	s.batchedRequests = append(s.batchedRequests, req.GetApplyOperationIds())
 	s.mu.Unlock()
-	return answerEachOperationRunning(req)
+	resp, err := answerEachOperationRunning(req)
+	if err == nil && s.entryScopeEcho != "" {
+		for _, entry := range resp.GetOperations() {
+			entry.Progress.ApplyOperationId = s.entryScopeEcho
+		}
+	}
+	return resp, err
 }
 
 func (s *batchingTernServer) counts() (progress, batch int) {
@@ -488,4 +506,21 @@ func TestGRPCClient_BatchedProgressUsesBatchProgressWhenTheDataPlaneServesIt(t *
 		assert.Equal(t, 1, progress)
 		assert.Equal(t, 0, batch)
 	})
+}
+
+// A shard's batched poll is held to its scope just as a direct one is: an
+// entry for the shard's remote operation whose progress names its sibling
+// operation is refused rather than read as the shard's own state, since the
+// sibling's tasks match the shard's by table and DDL.
+func TestGRPCClient_BatchedShardProgressAnsweredForAnotherOperationIsRefused(t *testing.T) {
+	server := &batchingTernServer{batches: true, entryScopeEcho: "902"}
+	client := newRetryTestClient(t, server)
+	apply, scope := shardProgressScope()
+
+	_, err := client.pollRemoteProgress(t.Context(), apply, scope, "remote-shared-1")
+
+	require.ErrorContains(t, err, `remote progress for apply remote-shared-1 operation 901 came back scoped to "902"`)
+	progress, batch := server.counts()
+	assert.Equal(t, 1, batch, "the poll was answered through BatchProgress")
+	assert.Zero(t, progress, "the refused entry is not retried as a direct Progress call")
 }

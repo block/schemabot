@@ -246,12 +246,16 @@ func (b *remoteProgressBatcher) sendChunk(ctx context.Context, client ternv1.Ter
 	}
 	for _, operationID := range operationIDs {
 		answer := batchEntryAnswer(logger, key, operationID, entries[operationID])
-		for i, waiter := range waitersByID[operationID] {
-			if i > 0 && answer.resp != nil {
-				// Each drive owns the answer it is handed.
-				answer.resp = proto.Clone(answer.resp).(*ternv1.ProgressResponse)
+		waiters := waitersByID[operationID]
+		for _, waiter := range waiters {
+			handed := answer
+			if len(waiters) > 1 && answer.resp != nil {
+				// Each drive owns the answer it is handed and may change it,
+				// so every drive gets its own copy of the entry and none is
+				// cloned from a message another drive already holds.
+				handed.resp = proto.Clone(answer.resp).(*ternv1.ProgressResponse)
 			}
-			waiter.answer <- answer
+			waiter.answer <- handed
 		}
 	}
 }
