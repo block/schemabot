@@ -233,23 +233,21 @@ to that member.
 
 An apply started with `--defer-cutover` that would keep more drivers waiting
 at its cutover than `max_drivers_per_apply` gives one apply, or than the
-fleet's servers have left to wait at a cutover, is refused with `deferred_cutover_capacity`
+fleet's servers have, is refused with `deferred_cutover_capacity`
 ([Deferred cutover capacity](configuration.md#deferred-cutover-capacity)).
 The check covers this server's operators and, for a deployment that runs its
 operations on a remote data plane, that data plane's, and the `error` names
-the deployment when a data plane refused it. Its status says whether waiting
+the deployment when a data plane refused it. Its status says whether a retry
 can help:
 
-- `409 deferred_cutover_capacity` means other deferred applies hold the rest
-  of the capacity, or no server has reported its drivers yet. The `error`
-  names the holding applies. Retry once they are cut over or cancelled, or
-  apply without `--defer-cutover`.
+- `409 deferred_cutover_capacity` means no server has reported its drivers
+  in the last minute. Retry shortly, or apply without `--defer-cutover`.
 - `422 deferred_cutover_capacity` means the apply is wider than
-  `max_drivers_per_apply`, or than every live deferred driver together, or a
-  deployment it runs on does not report its driver capacity because
-  it runs an older SchemaBot. Apply without `--defer-cutover`, or, when the
-  `error` names `max_drivers_per_apply`, raise it on the named deployment to
-  at least the apply's width there, or upgrade the named deployment.
+  `max_drivers_per_apply`, or than every live server's drivers together, or a
+  deployment it runs on does not report its drivers because it runs an older
+  SchemaBot. Apply without `--defer-cutover`, or, when the `error` names
+  `max_drivers_per_apply`, raise it to at least the apply's width, on the
+  named deployment when it names one, or upgrade the named deployment.
 
 No apply record is created for any of these refusals. Match `error_code`
 rather than parsing the human-readable `error` field.

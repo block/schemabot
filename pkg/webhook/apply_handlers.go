@@ -504,6 +504,36 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 				msgDeferCutoverAllDirect)
 			return false, nil
 		}
+		// An apply that would keep more drivers waiting at its cutover than it
+		// can have is refused before the operator is asked to confirm it, so
+		// the remedy is to re-run this command without the flag. Apply
+		// creation checks again, so this only moves the refusal earlier.
+		refused, capacityErr := h.service.DeferredCutoverCapacityRefusal(ctx, api.ApplyRequest{
+			PlanID:      planResp.PlanID,
+			Environment: environment,
+			Options:     map[string]string{"defer_cutover": "true"},
+			Caller:      formatGitHubCaller(requestedBy, repo, pr),
+			Target:      result.Target,
+		})
+		if capacityErr != nil {
+			h.logger.Error("apply rejected: could not check whether the fleet has the drivers --defer-cutover would keep waiting",
+				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
+				"plan_id", planResp.PlanID, "error", capacityErr)
+			if !result.SuppressRetryComments {
+				h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy,
+					msgDeferredCutoverCapacityUnverified)
+			}
+			return true, fmt.Errorf("apply command deferred cutover capacity check %s#%d: %w", repo, pr, capacityErr)
+		}
+		if refused != nil {
+			h.logger.Info("apply rejected: --defer-cutover would keep more drivers waiting at the cutover than the apply can have",
+				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
+				"plan_id", planResp.PlanID, "operations", refused.Operations, "drivers", refused.Drivers,
+				"live_operator_servers", refused.LiveServers, "max_drivers_per_apply", refused.PerApplyCap)
+			h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy,
+				deferredCutoverCapacityMessage(refused, action.Apply, environment, h.deploymentTenant()))
+			return false, nil
+		}
 	}
 
 	// Block unsafe changes unless --allow-unsafe was specified, on every target

@@ -303,9 +303,7 @@ type ShutdownHalter interface {
 	HaltForShutdown(ctx context.Context) error
 }
 
-// DriverCapacity is the drivers a deployment's live operator servers run. It
-// is the deployment's pool: what is available is that less the work the
-// caller has already booked on it.
+// DriverCapacity is the drivers a deployment's live operator servers run.
 type DriverCapacity struct {
 	// LiveServers is how many of the deployment's servers reported their
 	// drivers within its live window.
@@ -318,17 +316,13 @@ type DriverCapacity struct {
 	// MaxDriversPerApply is how many operations of one apply the deployment
 	// runs at once.
 	MaxDriversPerApply int
-	// PoolID identifies the pool these drivers are. Every route that answers
-	// with the same PoolID reports the same drivers, so what the caller has
-	// booked under any of them counts against the one pool.
-	PoolID string
 }
 
 // DriverCapacityReader is a client for a deployment whose operators run its
 // operations on another plane. Every operation sent there runs on one of that
-// plane's drivers, so apply creation reads the plane's pool to refuse or queue
-// work that would not fit. A nil capacity with no error is a deployment that
-// does not report it, and work that needs it is refused there.
+// plane's drivers, so a deferred apply is checked against that plane's drivers
+// as well as this one's. A nil capacity with no error is a deployment that
+// does not report it, and a deferred apply that needs it is refused there.
 type DriverCapacityReader interface {
 	DriverCapacity(ctx context.Context) (*DriverCapacity, error)
 }

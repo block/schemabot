@@ -1207,31 +1207,6 @@ type Apply struct {
 	// on this apply's own row.
 	TakesOverApplyIDs []int64
 
-	// DeferredCutoverOperations is how many operations this apply would hold
-	// at a deferred cutover at once (DeferredCutoverHeldAtOnce). When it is
-	// two or more, the apply store's create methods that store operations
-	// admit the apply only if those operations fit, beside every other
-	// admitted deferred apply, in the deferred cutover drivers of the live
-	// operator servers, and refuse it with a *DeferredCutoverCapacityError
-	// otherwise; Create, which stores none, refuses it. Admission is
-	// serialized across every server and read in the transaction that stores
-	// the apply, so two applies admitted at once cannot together exceed the
-	// drivers. It is not persisted.
-	DeferredCutoverOperations int
-
-	// DeferredCutoverDataPlanes is, for each driver pool on another plane
-	// that runs some of this apply's operations, how many of that pool's
-	// drivers this apply would hold at a deferred cutover at once and how many
-	// the pool reported it can hold. Each operation waiting at a deferred
-	// cutover keeps a driver on the plane that runs it, so admission also
-	// refuses the apply when its operations on a pool, beside those of the
-	// other admitted deferred applies on that pool under any route
-	// (ApplyOptions.DeferredCutoverPools), exceed what the pool reported. Each
-	// plane serves one control plane, so the applies this store holds are
-	// every deferred apply that plane runs. It is read only when
-	// DeferredCutoverOperations is two or more, and it is not persisted.
-	DeferredCutoverDataPlanes []DeferredCutoverDataPlane
-
 	// Engine is the schema change engine: "spirit", "planetscale", etc.
 	Engine string
 
@@ -1391,92 +1366,10 @@ type OperatorServer struct {
 	// ServerID identifies one run of a server's operator.
 	ServerID string
 	// Drivers is how many drivers the operator runs.
-	Drivers int
-	// DeferredCutoverDrivers is how many of them may run work for an apply
-	// deferring its cutover.
-	DeferredCutoverDrivers int
-	CreatedAt              time.Time
+	Drivers   int
+	CreatedAt time.Time
 	// UpdatedAt is the server's last heartbeat, at the database's clock.
 	UpdatedAt time.Time
-}
-
-// DeferredCutoverDataPlane is what deferred cutover admission checks for one
-// driver pool on another plane that runs some of the apply's operations.
-type DeferredCutoverDataPlane struct {
-	// Pool is the identity the pool reported. Every route that reported it
-	// reaches the same drivers.
-	Pool string
-	// Deployment names the apply's deployments that run on the pool, joined
-	// with ", " when more than one does.
-	Deployment string
-	// Operations is how many of the pool's drivers the apply would hold at a
-	// deferred cutover at once.
-	Operations int
-	// LiveServers is how many of the pool's servers reported their drivers
-	// within its live window.
-	LiveServers int
-	// Capacity is how many drivers those servers leave for deferred work,
-	// together.
-	Capacity int
-}
-
-// DeferredCutoverCapacityError is apply creation refusing an apply deferring
-// its cutover that would keep more drivers waiting there than the live
-// operator servers have left for deferred work. Each waiting operation keeps
-// its driver until an operator cuts it over, so admitting past that capacity
-// would leave every deferred driver waiting on a person.
-type DeferredCutoverCapacityError struct {
-	// Deployment names the deployment whose operators the refusal counted
-	// when they run on another plane, and is empty when it counted this
-	// plane's own.
-	Deployment string
-	// Operations is how many operations the refused apply would hold.
-	Operations int
-	// Reserved is how many operations other admitted deferred applies hold or
-	// will hold.
-	Reserved int
-	// Capacity is how many deferred cutover drivers the live operator servers
-	// run together.
-	Capacity int
-	// LiveServers is how many operator servers heartbeated within
-	// OperatorServerLiveWindow.
-	LiveServers int
-	// HoldingApplyIDs names the admitted deferred applies counted in Reserved.
-	HoldingApplyIDs []string
-}
-
-// ExceedsCapacity reports whether the apply is wider than every live deferred
-// cutover driver together, so waiting for other deferred applies would not
-// admit it.
-func (e *DeferredCutoverCapacityError) ExceedsCapacity() bool {
-	return e.Operations > e.Capacity
-}
-
-func (e *DeferredCutoverCapacityError) Error() string {
-	if e.Deployment != "" {
-		return fmt.Sprintf("deferred cutover of %d operations on deployment %s refused: %d of %d deferred cutover drivers on its %d live operator servers are reserved by %v",
-			e.Operations, e.Deployment, e.Reserved, e.Capacity, e.LiveServers, e.HoldingApplyIDs)
-	}
-	return fmt.Sprintf("deferred cutover of %d operations refused: %d of %d deferred cutover drivers on %d live operator servers are reserved by %v",
-		e.Operations, e.Reserved, e.Capacity, e.LiveServers, e.HoldingApplyIDs)
-}
-
-// DeferredCutoverWidth is how many drivers one apply started with
-// --defer-cutover will hold at once: its work operations that have not reached
-// a terminal state. A deferred operation keeps its driver while it waits for
-// the cutover, and the apply is ready to cut over only once all of them wait,
-// so this is the driver count it needs at the same moment.
-type DeferredCutoverWidth struct {
-	ApplyIdentifier string
-	Database        string
-	Environment     string
-	Operations      int
-	// ByPool is how many drivers of each data-plane pool the apply holds at
-	// once (DeferredCutoverHeldAtOnceByPool over the pools its admission
-	// recorded in ApplyOptions.DeferredCutoverPools), uncapped: a waiting
-	// operation keeps its driver whatever this plane's max_drivers_per_apply
-	// is now.
-	ByPool map[string]int
 }
 
 // ApplyOperation represents one child row in the apply_operations table:
@@ -1762,14 +1655,6 @@ type ApplyOptions struct {
 	// deployment-scoped finalizer or namespace orders' finalizer until a sibling
 	// target's operation had attached.
 	OperationKeysLeadWithTarget bool `json:"operation_keys_lead_with_target,omitempty"`
-
-	// DeferredCutoverPools maps each deployment that runs this deferred
-	// apply's operations on another plane to the driver pool that plane
-	// reported when the apply was admitted. Admission of a later deferred
-	// apply counts this apply's waiting operations against those pools, under
-	// whatever route reaches them. It is recorded at admission and never read
-	// from caller options.
-	DeferredCutoverPools map[string]string `json:"deferred_cutover_pools,omitempty"`
 }
 
 // DirectExecutionPolicy is an apply's durable record of the direct execution

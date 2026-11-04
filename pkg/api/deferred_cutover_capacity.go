@@ -2,11 +2,11 @@ package api
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"maps"
 	"net/http"
 	"slices"
-	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -16,47 +16,37 @@ import (
 )
 
 // DeferredCutoverCapacityError is apply creation refusing an apply started
-// with --defer-cutover that would keep more drivers waiting at its cutover
-// than the running operators have left for deferred work. Each operation
-// waiting at a deferred cutover keeps its driver until an operator cuts it
-// over, so deferred applies admitted past that capacity would leave every
-// deferred driver waiting on a person: another apply's operations could start
-// only as someone cut over one already waiting, and a cutover command would
-// reach only the operations that had started. The message names only the
-// database, environment, counts and SchemaBot's own apply identifiers, so a
-// caller may show it as is.
+// with --defer-cutover that would keep more drivers waiting at its cutover at
+// once than it can have. Each operation waiting at a deferred cutover keeps its
+// driver until an operator cuts it over, and the cutover is accepted only once
+// every one of them waits, so an apply that cannot have them all waiting holds
+// its drivers with nothing cut over until the waiting-for-cutover timeout. The
+// message names only the database, environment and counts, so a caller may
+// show it as is.
 type DeferredCutoverCapacityError struct {
 	Database    string
 	Environment string
-	// Deployment names the deployment whose operators the refusal counted
-	// when they run on another plane, and is empty when it counted this
-	// plane's own. When several of the apply's deployments reach the same
-	// pool of drivers it names them all, joined with ", ".
+	// Deployment is set when the refusal is about a deployment whose
+	// operators run its operations on another plane: the counts are then that
+	// deployment's operations and that plane's drivers and cap.
 	Deployment string
-	// Unreported is a refusal because Deployment does not report how many
-	// operations it can hold at a deferred cutover, which a deployment
-	// running an older SchemaBot does not. Only Operations is counted then.
+	// Unreported is set when Deployment does not report its drivers, which a
+	// deployment running an older SchemaBot does not.
 	Unreported bool
 	// Operations is how many operations the refused apply would hold at its
 	// cutover at once.
 	Operations int
-	// Reserved is how many operations other active deferred applies hold or
-	// will hold at theirs.
-	Reserved int
-	// Capacity is how many deferred operations the running operators run at
-	// once, across every server.
-	Capacity int
+	// Drivers is how many drivers across every live server can run the apply's
+	// operations: each server's drivers but the one it keeps for other work
+	// (reservedDriverID).
+	Drivers int
 	// LiveServers is how many servers' operators reported their drivers
 	// within the live window.
 	LiveServers int
-	// HoldingApplyIDs names the deferred applies counted in Reserved, so an
-	// operator knows which to cut over or cancel to make room.
-	HoldingApplyIDs []string
 	// PerApplyCap is the server's max_drivers_per_apply, set only when the
 	// apply would hold more operations at once than it. A waiting operation
 	// keeps counting against the cap, so the operations past it could never
-	// start while the first ones wait, and the apply would never have every
-	// operation waiting, which its cutover needs.
+	// start while the first ones wait.
 	PerApplyCap int
 }
 
@@ -66,132 +56,62 @@ func (e *DeferredCutoverCapacityError) ExceedsPerApplyCap() bool {
 	return e.PerApplyCap > 0 && e.Operations > e.PerApplyCap
 }
 
-// ExceedsCapacity reports whether the apply is wider than the running
-// operators' whole deferred capacity, so waiting for other deferred applies
-// would not admit it.
-func (e *DeferredCutoverCapacityError) ExceedsCapacity() bool {
-	return e.Operations > e.Capacity
+// NoLiveServers reports whether no server has reported its drivers within the
+// live window, so the fleet's drivers are not known yet.
+func (e *DeferredCutoverCapacityError) NoLiveServers() bool {
+	return !e.Unreported && !e.ExceedsPerApplyCap() && e.LiveServers == 0
 }
 
 // Transient reports whether the refusal can clear without changing the
-// request: other deferred applies finishing, or a server reporting its
-// drivers. An apply wider than max_drivers_per_apply, or than every live
-// deferred driver together, is refused again on every retry.
+// request: only a server reporting its drivers can. An apply wider than
+// max_drivers_per_apply, or than the fleet's drivers, is refused again on
+// every retry.
 func (e *DeferredCutoverCapacityError) Transient() bool {
-	if e.Unreported || e.ExceedsPerApplyCap() {
-		return false
-	}
-	return e.LiveServers == 0 || !e.ExceedsCapacity()
-}
-
-// capacityText says how many drivers the counted servers can keep waiting at
-// a cutover: SchemaBot's own servers, or the servers of the deployment the
-// apply runs on.
-func (e *DeferredCutoverCapacityError) capacityText() string {
-	if e.Deployment == "" {
-		return fmt.Sprintf("SchemaBot can keep %d drivers waiting across all its servers", e.Capacity)
-	}
-	return fmt.Sprintf("%s can keep %d drivers waiting across %s servers", e.deploymentText(), e.Capacity, e.deploymentPossessive())
-}
-
-// deploymentText names the counted deployment, or the deployments that share
-// one pool of drivers.
-func (e *DeferredCutoverCapacityError) deploymentText() string {
-	if e.SharesPool() {
-		return fmt.Sprintf("the %s deployments", e.Deployment)
-	}
-	return fmt.Sprintf("the %s deployment", e.Deployment)
-}
-
-func (e *DeferredCutoverCapacityError) deploymentPossessive() string {
-	if e.SharesPool() {
-		return "their shared"
-	}
-	return "its"
-}
-
-// SharesPool reports whether the refusal counted one pool of drivers that
-// several of the apply's deployments reach, all of which Deployment names.
-func (e *DeferredCutoverCapacityError) SharesPool() bool {
-	return strings.Contains(e.Deployment, ", ")
+	return e.NoLiveServers()
 }
 
 func (e *DeferredCutoverCapacityError) Error() string {
+	if e.Deployment != "" {
+		return e.deploymentError()
+	}
 	switch {
-	case e.Unreported:
-		return fmt.Sprintf("%s/%s: --defer-cutover would keep %d drivers on the %s deployment waiting at the cutover at once, and that deployment does not report how many it can keep waiting; upgrade SchemaBot there, or apply again without --defer-cutover",
-			e.Database, e.Environment, e.Operations, e.Deployment)
-	case e.ExceedsPerApplyCap() && e.Deployment != "":
-		return fmt.Sprintf("%s/%s: --defer-cutover would keep %d drivers on the %s deployment waiting at the cutover at once, and max_drivers_per_apply there gives one apply at most %d; apply again without --defer-cutover, or raise max_drivers_per_apply on that deployment to at least %d",
-			e.Database, e.Environment, e.Operations, e.Deployment, e.PerApplyCap, e.Operations)
 	case e.ExceedsPerApplyCap():
-		return fmt.Sprintf("%s/%s: --defer-cutover would keep %d drivers waiting at the cutover at once, and max_drivers_per_apply gives one apply at most %d; apply again without --defer-cutover, or raise max_drivers_per_apply to at least %d",
+		return fmt.Sprintf("%s/%s can't defer its cutover: it would keep %d drivers waiting until you cut over, and one apply can use at most %d (max_drivers_per_apply). Apply without --defer-cutover, or raise max_drivers_per_apply to %d",
 			e.Database, e.Environment, e.Operations, e.PerApplyCap, e.Operations)
-	case e.LiveServers == 0 && e.Deployment != "":
-		return fmt.Sprintf("%s/%s: --defer-cutover would keep %d drivers on %s waiting at the cutover at once, and no server there has reported its drivers in the last %s; apply again without --defer-cutover",
-			e.Database, e.Environment, e.Operations, e.deploymentText(), LiveWindowText())
-	case e.LiveServers == 0:
-		return fmt.Sprintf("%s/%s: --defer-cutover would keep %d drivers waiting at the cutover at once, and no SchemaBot server has reported its drivers in the last %s; apply again without --defer-cutover",
-			e.Database, e.Environment, e.Operations, LiveWindowText())
-	case e.ExceedsCapacity():
-		return fmt.Sprintf("%s/%s: --defer-cutover would keep %d drivers waiting at the cutover at once, and %s; apply again without --defer-cutover",
-			e.Database, e.Environment, e.Operations, e.capacityText())
+	case e.NoLiveServers():
+		return fmt.Sprintf("%s/%s can't defer its cutover yet: no SchemaBot server has reported its drivers in the last %s. Try again shortly, or apply without --defer-cutover",
+			e.Database, e.Environment, LiveWindowText())
 	default:
-		return fmt.Sprintf("%s/%s: --defer-cutover would keep %d drivers waiting at the cutover at once; %s, and %s, leaving %d; apply again without --defer-cutover, or once %s cut over or cancelled",
-			e.Database, e.Environment, e.Operations, e.capacityText(), HoldingAppliesKeepText(e.HoldingApplyIDs, e.Reserved), e.Free(), HoldingAppliesPronoun(e.HoldingApplyIDs))
+		return fmt.Sprintf("%s/%s can't defer its cutover: it would keep %d drivers waiting until you cut over, and SchemaBot's servers have %d. Apply without --defer-cutover",
+			e.Database, e.Environment, e.Operations, e.Drivers)
 	}
 }
 
-// Free is how many of the drivers that can wait at a cutover no other
-// deferred apply keeps, never below zero: servers dropping out of the live
-// window can leave the holding applies keeping more than the live servers
-// have.
-func (e *DeferredCutoverCapacityError) Free() int {
-	return max(e.Capacity-e.Reserved, 0)
+func (e *DeferredCutoverCapacityError) deploymentError() string {
+	switch {
+	case e.Unreported:
+		return fmt.Sprintf("%s/%s can't defer its cutover: the %s deployment doesn't report its drivers, which upgrading SchemaBot there fixes. Apply without --defer-cutover",
+			e.Database, e.Environment, e.Deployment)
+	case e.ExceedsPerApplyCap():
+		return fmt.Sprintf("%s/%s can't defer its cutover: it would keep %d drivers waiting on the %s deployment until you cut over, and one apply can use at most %d there (max_drivers_per_apply). Apply without --defer-cutover, or raise max_drivers_per_apply on that deployment to %d",
+			e.Database, e.Environment, e.Operations, e.Deployment, e.PerApplyCap, e.Operations)
+	case e.NoLiveServers():
+		return fmt.Sprintf("%s/%s can't defer its cutover yet: no SchemaBot server of the %s deployment has reported its drivers in the last %s. Try again shortly, or apply without --defer-cutover",
+			e.Database, e.Environment, e.Deployment, LiveWindowText())
+	default:
+		return fmt.Sprintf("%s/%s can't defer its cutover: it would keep %d drivers waiting on the %s deployment until you cut over, and its servers have %d. Apply without --defer-cutover",
+			e.Database, e.Environment, e.Operations, e.Deployment, e.Drivers)
+	}
 }
 
 // deferredCutoverRefusalStatus is the HTTP status of a deferred cutover
 // refusal: a conflict with the plane's current state when it can clear on its
-// own, and an unprocessable request when the apply is wider than every live
-// deferred driver together.
+// own, and an unprocessable request otherwise.
 func deferredCutoverRefusalStatus(refused *DeferredCutoverCapacityError) int {
 	if refused.Transient() {
 		return http.StatusConflict
 	}
 	return http.StatusUnprocessableEntity
-}
-
-// maxHoldingAppliesNamed bounds how many holding applies a refusal names, so
-// a crowded plane does not turn one refusal into a wall of identifiers.
-const maxHoldingAppliesNamed = 5
-
-// HoldingAppliesText lists the deferred applies a refusal counted, naming at
-// most maxHoldingAppliesNamed and the number left over.
-func HoldingAppliesText(ids []string) string {
-	if len(ids) <= maxHoldingAppliesNamed {
-		return strings.Join(ids, ", ")
-	}
-	return fmt.Sprintf("%s and %d more", strings.Join(ids[:maxHoldingAppliesNamed], ", "), len(ids)-maxHoldingAppliesNamed)
-}
-
-// HoldingAppliesKeepText says which deferred applies keep how many drivers
-// waiting at their cutover: "apply a already keeps 4 of them waiting" or
-// "applies a, b already keep 8 of them waiting". ids may be pre-formatted, as
-// the PR comment wraps each in code spans.
-func HoldingAppliesKeepText(ids []string, reserved int) string {
-	if len(ids) == 1 {
-		return fmt.Sprintf("apply %s already keeps %d of them waiting", ids[0], reserved)
-	}
-	return fmt.Sprintf("applies %s already keep %d of them waiting", HoldingAppliesText(ids), reserved)
-}
-
-// HoldingAppliesPronoun refers back to the holding applies: "it is" or
-// "they are".
-func HoldingAppliesPronoun(ids []string) string {
-	if len(ids) == 1 {
-		return "it is"
-	}
-	return "they are"
 }
 
 // LiveWindowText names storage.OperatorServerLiveWindow for a sentence ending
@@ -213,155 +133,134 @@ func (c *ServerConfig) resolvedDrivers() int {
 }
 
 // deferredCutoverWidth counts the most operations an apply's groups would
-// hold at a deferred cutover at once, before any max_drivers_per_apply cap
-// (storage.DeferredCutoverHeldAtOnce).
+// hold at a deferred cutover at once (storage.DeferredCutoverHeldAtOnce).
 func deferredCutoverWidth(groups []*storage.ApplyOperationWithTasks) int {
 	ops := make([]*storage.ApplyOperation, 0, len(groups))
 	for _, group := range groups {
 		ops = append(ops, group.Operation)
 	}
-	return storage.DeferredCutoverHeldAtOnce(ops, 0)
+	return storage.DeferredCutoverHeldAtOnce(ops)
 }
 
-// deferredCutoverPerApplyCapRefusal refuses a deferred apply that would hold
-// two or more operations at once, and more of them than max_drivers_per_apply.
-// Each waiting operation keeps counting against the cap, so once the first
-// operations wait at their cutover the rest can never start, and a cutover
-// command, which needs every operation waiting, is refused until the apply
-// times out. It returns nil when the apply fits. The cap is this server's
-// configuration, so the check needs no storage read.
-func (s *Service) deferredCutoverPerApplyCapRefusal(plan *storage.Plan, environment, applyIdentifier, caller string, operations int) *DeferredCutoverCapacityError {
+// deferredCutoverCapacityRefusal refuses a deferred apply that would hold two
+// or more operations at once when it would hold more of them than
+// max_drivers_per_apply, or than the drivers of every live server can run. It
+// returns nil when the apply fits. A deferred apply of one operation is never
+// refused: its one cutover command reaches all of it as soon as it waits.
+//
+// A deployment whose operators run its operations on another plane holds one
+// of that plane's drivers for each of them too, so each such deployment is
+// checked the same way against its own plane (deferredCutoverDataPlaneRefusal).
+//
+// Only the apply's own width is checked. Other applies, deferred or not, use
+// drivers the way any busy fleet does, and an operation waits for a free one.
+// The one driver each server keeps for other work (reservedDriverID) is why
+// deferred applies together can never leave every driver waiting on a person.
+func (s *Service) deferredCutoverCapacityRefusal(ctx context.Context, plan *storage.Plan, environment, applyIdentifier, caller string, groups []*storage.ApplyOperationWithTasks) (*DeferredCutoverCapacityError, error) {
+	operations := deferredCutoverWidth(groups)
+	if operations <= 1 {
+		return nil, nil
+	}
+	refusal := func(refused *DeferredCutoverCapacityError, reason string) *DeferredCutoverCapacityError {
+		s.logger.Warn("apply rejected: "+reason,
+			"plan_id", plan.PlanIdentifier, "apply_id", applyIdentifier, "database", plan.Database,
+			"database_type", plan.DatabaseType, "environment", environment, "caller", caller,
+			"operations", operations, "max_drivers_per_apply", refused.PerApplyCap,
+			"drivers", refused.Drivers, "live_operator_servers", refused.LiveServers)
+		refused.Database = plan.Database
+		refused.Environment = environment
+		refused.Operations = operations
+		return refused
+	}
 	perApplyCap := storage.BuildOptions(storage.WithMaxDriversPerApply(s.config.MaxDriversPerApply)).MaxDriversPerApply
-	if operations <= 1 || operations <= perApplyCap {
-		return nil
+	if operations > perApplyCap {
+		return refusal(&DeferredCutoverCapacityError{PerApplyCap: perApplyCap},
+			"deferred cutover would keep more drivers waiting at once than max_drivers_per_apply gives one apply"), nil
 	}
-	s.logger.Warn("apply rejected: deferred cutover would keep more drivers waiting at once than max_drivers_per_apply gives one apply",
-		"plan_id", plan.PlanIdentifier, "apply_id", applyIdentifier, "database", plan.Database,
-		"database_type", plan.DatabaseType, "environment", environment, "caller", caller,
-		"operations", operations, "max_drivers_per_apply", perApplyCap)
-	return &DeferredCutoverCapacityError{
-		Database:    plan.Database,
-		Environment: environment,
-		Operations:  operations,
-		PerApplyCap: perApplyCap,
+	servers, err := s.storage.OperatorServers().ListLive(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("read live operator servers to admit deferred cutover of %s/%s: %w", plan.Database, environment, err)
 	}
+	drivers := 0
+	for _, server := range servers {
+		drivers += storage.DeferredCutoverDrivers(server.Drivers)
+	}
+	if len(servers) == 0 {
+		return refusal(&DeferredCutoverCapacityError{},
+			"deferred cutover cannot be admitted until an operator server reports its drivers"), nil
+	}
+	if operations > drivers {
+		return refusal(&DeferredCutoverCapacityError{Drivers: drivers, LiveServers: len(servers)},
+			"deferred cutover would keep more drivers waiting at once than the live operator servers run"), nil
+	}
+	return s.deferredCutoverDataPlaneRefusal(ctx, plan, environment, applyIdentifier, caller, groups)
 }
 
-// deferredCutoverDataPlanes reads, for each deployment that runs the apply's
-// operations on another plane's operators, the capacity that plane reports,
-// and returns one entry per pool of drivers those reports identify: how many
-// of the pool's drivers the apply would hold at a deferred cutover at once and
-// how many the pool can hold, for apply creation to admit against
-// (storage.Apply's DeferredCutoverDataPlanes), with the pool each deployment
-// reached, for apply creation to record. Several deployments, or one
-// deployment under several environments, can reach the same pool, so a pool
-// is counted by the identity it reports rather than by route. A deployment
-// that does not report its capacity or its pool cannot hold a deferred apply's
-// operations, and one whose max_drivers_per_apply is below the operations the
-// apply sends it would never have all of them waiting, so the apply is refused
-// here in both cases. A deployment whose report cannot be read refuses it with
-// that error. Either way nothing is stored.
-func (s *Service) deferredCutoverDataPlanes(ctx context.Context, plan *storage.Plan, environment, applyIdentifier, caller string, groups []*storage.ApplyOperationWithTasks) ([]storage.DeferredCutoverDataPlane, map[string]string, error) {
-	ops := make([]*storage.ApplyOperation, 0, len(groups))
+// deferredCutoverDataPlaneRefusal checks each deployment of a deferred apply
+// whose operators run its operations on another plane against that plane: the
+// operations the apply would hold there at once must fit its
+// max_drivers_per_apply and the drivers its live servers can keep waiting. A
+// deployment that does not report its drivers is refused, since answering is
+// also what says it cuts over every operation a cutover command names. A
+// report that cannot be read is returned as an error, so the apply is refused
+// rather than admitted unchecked.
+func (s *Service) deferredCutoverDataPlaneRefusal(ctx context.Context, plan *storage.Plan, environment, applyIdentifier, caller string, groups []*storage.ApplyOperationWithTasks) (*DeferredCutoverCapacityError, error) {
+	byDeployment := make(map[string][]*storage.ApplyOperation)
 	for _, group := range groups {
-		ops = append(ops, group.Operation)
+		byDeployment[group.Operation.Deployment] = append(byDeployment[group.Operation.Deployment], group.Operation)
 	}
-	// Uncapped: each deployment's operations are compared against that
-	// deployment's own max_drivers_per_apply below, not this plane's.
-	widths := storage.DeferredCutoverHeldAtOnceByDeployment(ops, 0)
-	poolOf := make(map[string]string)
-	capacities := make(map[string]*tern.DriverCapacity)
-	for _, deployment := range slices.Sorted(maps.Keys(widths)) {
+	for _, deployment := range slices.Sorted(maps.Keys(byDeployment)) {
+		operations := storage.DeferredCutoverHeldAtOnce(byDeployment[deployment])
+		if operations == 0 {
+			continue
+		}
 		client, err := s.TernClient(deployment, environment)
 		if err != nil {
-			return nil, nil, fmt.Errorf("resolve deployment %s/%s to admit the deferred cutover of apply %s: %w", deployment, environment, applyIdentifier, err)
+			return nil, fmt.Errorf("resolve deployment %s/%s to check the deferred cutover of %s: %w", deployment, environment, plan.Database, err)
 		}
 		if !client.IsRemote() {
-			s.logger.Debug("deferred cutover admission: deployment runs on this plane's operators, which admission counts already",
-				"apply_id", applyIdentifier, "database", plan.Database, "environment", environment, "deployment", deployment)
+			s.logger.Debug("deferred cutover capacity: deployment runs on this plane's drivers, which are already checked",
+				"plan_id", plan.PlanIdentifier, "apply_id", applyIdentifier, "database", plan.Database,
+				"environment", environment, "deployment", deployment)
 			continue
 		}
 		capacity, err := s.readDriverCapacity(ctx, client)
 		if err != nil {
-			return nil, nil, fmt.Errorf("read driver capacity of deployment %s/%s for apply %s: %w", deployment, environment, applyIdentifier, err)
+			return nil, fmt.Errorf("read driver capacity of deployment %s/%s to check the deferred cutover of %s: %w", deployment, environment, plan.Database, err)
 		}
-		refused := &DeferredCutoverCapacityError{
-			Database:    plan.Database,
-			Environment: environment,
-			Deployment:  deployment,
-			Operations:  widths[deployment],
+		refusal := func(refused *DeferredCutoverCapacityError, reason string) *DeferredCutoverCapacityError {
+			s.logger.Warn("apply rejected: "+reason,
+				"plan_id", plan.PlanIdentifier, "apply_id", applyIdentifier, "database", plan.Database,
+				"database_type", plan.DatabaseType, "environment", environment, "caller", caller,
+				"deployment", deployment, "operations", operations, "max_drivers_per_apply", refused.PerApplyCap,
+				"drivers", refused.Drivers, "live_operator_servers", refused.LiveServers)
+			refused.Database = plan.Database
+			refused.Environment = environment
+			refused.Deployment = deployment
+			refused.Operations = operations
+			return refused
 		}
 		switch {
 		case capacity == nil:
-			s.logger.Warn("apply rejected: deferred cutover needs a deployment that reports its driver capacity, and this one does not",
-				"plan_id", plan.PlanIdentifier, "apply_id", applyIdentifier, "database", plan.Database,
-				"database_type", plan.DatabaseType, "environment", environment, "caller", caller,
-				"deployment", deployment, "operations", widths[deployment])
-			refused.Unreported = true
-			return nil, nil, refused
+			return refusal(&DeferredCutoverCapacityError{Unreported: true},
+				"deferred cutover needs a deployment that reports its drivers, and this one does not"), nil
 		case capacity.MaxDriversPerApply <= 0:
 			// A SchemaBot data plane always reports its resolved cap, so a
-			// missing one is a deployment this admission cannot reason about.
-			s.logger.Warn("apply rejected: deployment reported its driver capacity without its max_drivers_per_apply, so it is treated as not reporting one",
-				"plan_id", plan.PlanIdentifier, "apply_id", applyIdentifier, "database", plan.Database,
-				"database_type", plan.DatabaseType, "environment", environment, "caller", caller,
-				"deployment", deployment, "operations", widths[deployment])
-			refused.Unreported = true
-			return nil, nil, refused
-		case capacity.PoolID == "":
-			// Without the pool's identity, admission cannot tell which other
-			// routes reach the same drivers, so it could book them twice.
-			s.logger.Warn("apply rejected: deployment reported its driver capacity without the identity of its driver pool, so it is treated as not reporting one",
-				"plan_id", plan.PlanIdentifier, "apply_id", applyIdentifier, "database", plan.Database,
-				"database_type", plan.DatabaseType, "environment", environment, "caller", caller,
-				"deployment", deployment, "operations", widths[deployment])
-			refused.Unreported = true
-			return nil, nil, refused
-		case widths[deployment] > capacity.MaxDriversPerApply:
-			s.logger.Warn("apply rejected: deferred cutover would hold more operations on a deployment at once than that deployment's max_drivers_per_apply runs of one apply",
-				"plan_id", plan.PlanIdentifier, "apply_id", applyIdentifier, "database", plan.Database,
-				"database_type", plan.DatabaseType, "environment", environment, "caller", caller,
-				"deployment", deployment, "operations", widths[deployment], "max_drivers_per_apply", capacity.MaxDriversPerApply)
-			refused.PerApplyCap = capacity.MaxDriversPerApply
-			return nil, nil, refused
+			// missing one is a deployment this check cannot reason about.
+			return refusal(&DeferredCutoverCapacityError{Unreported: true},
+				"deployment reported its drivers without its max_drivers_per_apply, so it is treated as not reporting them"), nil
+		case operations > capacity.MaxDriversPerApply:
+			return refusal(&DeferredCutoverCapacityError{PerApplyCap: capacity.MaxDriversPerApply},
+				"deferred cutover would keep more drivers waiting on a deployment at once than its max_drivers_per_apply gives one apply"), nil
+		case capacity.LiveServers == 0:
+			return refusal(&DeferredCutoverCapacityError{},
+				"deferred cutover cannot be checked until a server of the deployment reports its drivers"), nil
+		case operations > capacity.DeferredCutoverDrivers:
+			return refusal(&DeferredCutoverCapacityError{Drivers: capacity.DeferredCutoverDrivers, LiveServers: capacity.LiveServers},
+				"deferred cutover would keep more drivers waiting on a deployment at once than its live servers run"), nil
 		}
-		poolOf[deployment] = capacity.PoolID
-		capacities[deployment] = capacity
 	}
-	return deferredCutoverPools(ops, poolOf, capacities), poolOf, nil
-}
-
-// deferredCutoverPools turns each deployment's capacity report into one entry
-// per pool of drivers. The deployments that reach one pool read their reports
-// moments apart, so the entry keeps the smallest capacity any of them saw.
-func deferredCutoverPools(ops []*storage.ApplyOperation, poolOf map[string]string, capacities map[string]*tern.DriverCapacity) []storage.DeferredCutoverDataPlane {
-	widths := storage.DeferredCutoverHeldAtOnceByPool(ops, poolOf)
-	byPool := make(map[string]*storage.DeferredCutoverDataPlane)
-	deployments := make(map[string][]string)
-	for _, deployment := range slices.Sorted(maps.Keys(poolOf)) {
-		pool := poolOf[deployment]
-		capacity := capacities[deployment]
-		deployments[pool] = append(deployments[pool], deployment)
-		plane, ok := byPool[pool]
-		if !ok {
-			byPool[pool] = &storage.DeferredCutoverDataPlane{
-				Pool:        pool,
-				Operations:  widths[pool],
-				LiveServers: capacity.LiveServers,
-				Capacity:    capacity.DeferredCutoverDrivers,
-			}
-			continue
-		}
-		plane.LiveServers = min(plane.LiveServers, capacity.LiveServers)
-		plane.Capacity = min(plane.Capacity, capacity.DeferredCutoverDrivers)
-	}
-	planes := make([]storage.DeferredCutoverDataPlane, 0, len(byPool))
-	for _, pool := range slices.Sorted(maps.Keys(byPool)) {
-		plane := byPool[pool]
-		plane.Deployment = strings.Join(deployments[pool], ", ")
-		planes = append(planes, *plane)
-	}
-	return planes
+	return nil, nil
 }
 
 // readDriverCapacity asks a remote deployment for the drivers its operators
@@ -370,34 +269,13 @@ func deferredCutoverPools(ops []*storage.ApplyOperation, poolOf map[string]strin
 func (s *Service) readDriverCapacity(ctx context.Context, client tern.Client) (*tern.DriverCapacity, error) {
 	reader, ok := client.(tern.DriverCapacityReader)
 	if !ok {
-		s.logger.Warn("deferred cutover admission: the remote deployment's client cannot read its driver capacity, so it is treated as not reporting one",
+		s.logger.Warn("deferred cutover capacity: the remote deployment's client cannot read its drivers, so it is treated as not reporting them",
 			"client_type", fmt.Sprintf("%T", client))
 		return nil, nil
 	}
 	ctx, cancel := context.WithTimeout(ctx, RemoteDeploymentHealthCheckTimeout)
 	defer cancel()
 	return reader.DriverCapacity(ctx)
-}
-
-// deferredCutoverRefusal turns storage refusing a deferred apply's admission
-// into the error apply creation returns, logging what the refusal counted.
-func (s *Service) deferredCutoverRefusal(plan *storage.Plan, environment, applyIdentifier, caller string, refused *storage.DeferredCutoverCapacityError) *DeferredCutoverCapacityError {
-	s.logger.Warn("apply rejected: deferred cutover does not fit in the deferred cutover drivers of the live operator servers",
-		"plan_id", plan.PlanIdentifier, "apply_id", applyIdentifier, "database", plan.Database,
-		"database_type", plan.DatabaseType, "environment", environment, "caller", caller,
-		"operations", refused.Operations, "reserved_operations", refused.Reserved,
-		"deferred_cutover_capacity", refused.Capacity, "live_operator_servers", refused.LiveServers,
-		"holding_apply_ids", refused.HoldingApplyIDs)
-	return &DeferredCutoverCapacityError{
-		Database:        plan.Database,
-		Environment:     environment,
-		Deployment:      refused.Deployment,
-		Operations:      refused.Operations,
-		Reserved:        refused.Reserved,
-		Capacity:        refused.Capacity,
-		LiveServers:     refused.LiveServers,
-		HoldingApplyIDs: refused.HoldingApplyIDs,
-	}
 }
 
 // OperatorHeartbeatInterval is how often a running operator records its
@@ -427,7 +305,7 @@ func newOperatorServerID() string {
 // heartbeatOperatorServer records this server's drivers in the registry. A
 // failure is logged and left to the next heartbeat: until one lands, the
 // server's drivers may drop out of the live count, which refuses wide
-// deferred applies sooner rather than admitting more than run.
+// deferred applies sooner rather than admitting more than can run.
 func (s *Service) heartbeatOperatorServer(ctx context.Context, server *storage.OperatorServer) {
 	timeout := s.operatorHeartbeatDeadline
 	if timeout <= 0 {
@@ -438,7 +316,6 @@ func (s *Service) heartbeatOperatorServer(ctx context.Context, server *storage.O
 	if err := s.storage.OperatorServers().Heartbeat(ctx, server); err != nil {
 		s.logger.Warn("operator heartbeat failed; deferred cutover admission will not count this server's drivers once its last heartbeat leaves the live window",
 			"server_id", server.ServerID, "drivers", server.Drivers,
-			"deferred_cutover_drivers", server.DeferredCutoverDrivers,
 			"live_window", storage.OperatorServerLiveWindow, "timeout", timeout, "error", err)
 		return
 	}
@@ -476,4 +353,70 @@ func (s *Service) deregisterOperatorServer(serverID string) {
 		s.logger.Warn("operator deregistration failed; this server's drivers keep counting toward deferred cutover admission until its last heartbeat leaves the live window",
 			"server_id", serverID, "live_window", storage.OperatorServerLiveWindow, "error", err)
 	}
+}
+
+// DeferredCutoverCapacityRefusal reports whether an apply of req's plan would
+// be refused for keeping more drivers waiting at its deferred cutover than it
+// can have, so a caller that asks a person to confirm the apply can refuse
+// before asking. It returns nil when req does not defer the cutover or the
+// apply fits. Apply creation checks again, so a fleet that shrinks between
+// the two is still refused there.
+func (s *Service) DeferredCutoverCapacityRefusal(ctx context.Context, req ApplyRequest) (*DeferredCutoverCapacityError, error) {
+	plan, err := s.storage.Plans().Get(ctx, req.PlanID)
+	if errors.Is(err, storage.ErrPlanNotFound) {
+		s.logger.Info("deferred cutover capacity not checked ahead of apply creation; the plan is not stored, which apply creation reports",
+			"plan_id", req.PlanID, "environment", req.Environment, "error", err)
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("load plan %s to check deferred cutover capacity: %w", req.PlanID, err)
+	}
+	if plan == nil {
+		s.logger.Info("deferred cutover capacity not checked ahead of apply creation; the plan is not stored, which apply creation reports",
+			"plan_id", req.PlanID, "environment", req.Environment)
+		return nil, nil
+	}
+	options := maps.Clone(req.Options)
+	if options == nil {
+		options = make(map[string]string)
+	}
+	options["target"] = plan.Target
+	applyOpts := storage.ApplyOptionsFromMap(options)
+	if !applyOpts.DeferCutover {
+		return nil, nil
+	}
+	groups, err := s.preflightApplyOperationGroups(ctx, plan, req, applyOpts)
+	if err != nil {
+		if _, ok := errors.AsType[*applyStorageError](err); ok {
+			return nil, fmt.Errorf("build the operations of plan %s to check deferred cutover capacity: %w", req.PlanID, err)
+		}
+		// Apply creation refuses the same request with the refusal's own
+		// message, which says more than a capacity check could.
+		s.logger.Info("deferred cutover capacity not checked ahead of apply creation; apply creation refuses the request",
+			"plan_id", plan.PlanIdentifier, "database", plan.Database, "database_type", plan.DatabaseType,
+			"environment", req.Environment, "error", err)
+		return nil, nil
+	}
+	return s.deferredCutoverCapacityRefusal(ctx, plan, req.Environment, "", resolveCaller(ctx, req.Caller), groups)
+}
+
+// preflightApplyOperationGroups builds the operations an apply of plan would
+// create, the way createStoredApply builds them, without creating anything.
+func (s *Service) preflightApplyOperationGroups(ctx context.Context, plan *storage.Plan, req ApplyRequest, applyOpts storage.ApplyOptions) ([]*storage.ApplyOperationWithTasks, error) {
+	directExecution, err := s.applyDirectExecution(plan, req.Environment)
+	if err != nil {
+		return nil, err
+	}
+	applyOpts.DirectExecution = directExecution
+	targets, _, err := s.applyTargets(plan, req)
+	if err != nil {
+		return nil, err
+	}
+	members, err := s.resolveApplyMembers(ctx, plan, req.Environment, targets)
+	if err != nil {
+		return nil, err
+	}
+	groups, _, err := buildApplyOperationGroups(plan, applyTaskChanges(plan), members, req.Environment, applyOpts,
+		s.config.CutoverPolicyFor(plan.Database, req.Environment), s.config.OnFailure(plan.Database, req.Environment), time.Now())
+	return groups, err
 }

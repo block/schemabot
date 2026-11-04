@@ -1883,9 +1883,8 @@ func TestE2EPlanDisclosesAnotherTargetsUnsafeWork(t *testing.T) {
 func registerLiveOperatorServer(t *testing.T, svc *api.Service, serverID string) {
 	t.Helper()
 	require.NoError(t, svc.Storage().OperatorServers().Heartbeat(t.Context(), &storage.OperatorServer{
-		ServerID:               serverID,
-		Drivers:                5,
-		DeferredCutoverDrivers: 4,
+		ServerID: serverID,
+		Drivers:  5,
 	}))
 	t.Cleanup(func() {
 		require.NoError(t, svc.Storage().OperatorServers().Deregister(context.WithoutCancel(t.Context()), serverID))

@@ -16,12 +16,12 @@ func TestDeferredCutoverHeldAtOnceCountsOnlyWorkStillToDrive(t *testing.T) {
 		ops = append(ops, &ApplyOperation{OperationKind: ApplyOperationKindWork, State: opState})
 	}
 	ops = append(ops, &ApplyOperation{OperationKind: ApplyOperationKindGroupFinalizer, State: state.ApplyOperation.Pending})
-	assert.Equal(t, 2, DeferredCutoverHeldAtOnce(ops, 0))
+	assert.Equal(t, 2, DeferredCutoverHeldAtOnce(ops))
 }
 
 // A deferred apply holds at its cutover only the operations the claim lets run
-// together (ST-10): one member at a time under rolling, every deployment at
-// once under barrier and parallel, and never more than max_drivers_per_apply.
+// together (ST-10): one member at a time under rolling, and every deployment at
+// once under barrier and parallel.
 func TestDeferredCutoverHeldAtOnceCountsOperationsHeldAtOnce(t *testing.T) {
 	shards := func(policy, deployment string, count int) []*ApplyOperation {
 		ops := make([]*ApplyOperation, 0, count)
@@ -34,10 +34,9 @@ func TestDeferredCutoverHeldAtOnceCountsOperationsHeldAtOnce(t *testing.T) {
 		return ops
 	}
 	for _, tc := range []struct {
-		name               string
-		ops                []*ApplyOperation
-		maxDriversPerApply int
-		want               int
+		name string
+		ops  []*ApplyOperation
+		want int
 	}{
 		{
 			name: "rolling holds one deployment at a time",
@@ -54,27 +53,16 @@ func TestDeferredCutoverHeldAtOnceCountsOperationsHeldAtOnce(t *testing.T) {
 			ops:  append(shards(CutoverPolicyParallel, "eu", 4), shards(CutoverPolicyParallel, "us", 2)...),
 			want: 6,
 		},
-		{
-			name:               "a fan-out wider than max_drivers_per_apply holds the cap",
-			ops:                shards("", "eu", 128),
-			maxDriversPerApply: 2,
-			want:               2,
-		},
-		{
-			name:               "barrier wider than max_drivers_per_apply holds the cap",
-			ops:                append(shards(CutoverPolicyBarrier, "eu", 4), shards(CutoverPolicyBarrier, "us", 2)...),
-			maxDriversPerApply: 5,
-			want:               5,
-		},
-		{
-			name:               "a cap above the width leaves it",
-			ops:                shards("", "eu", 3),
-			maxDriversPerApply: 8,
-			want:               3,
-		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			assert.Equal(t, tc.want, DeferredCutoverHeldAtOnce(tc.ops, tc.maxDriversPerApply))
+			assert.Equal(t, tc.want, DeferredCutoverHeldAtOnce(tc.ops))
 		})
 	}
+}
+
+func TestDeferredCutoverDriversLeavesOneDriverPerServer(t *testing.T) {
+	assert.Equal(t, 0, DeferredCutoverDrivers(0))
+	assert.Equal(t, 1, DeferredCutoverDrivers(1), "a single driver is not reserved")
+	assert.Equal(t, 1, DeferredCutoverDrivers(2))
+	assert.Equal(t, 3, DeferredCutoverDrivers(4))
 }

@@ -938,53 +938,54 @@ func rolloutShapeRefusalMessage(refused *api.RolloutShapeRefusedError, command, 
 
 // deferredCutoverCapacityMessage is the PR comment line for an apply started
 // with --defer-cutover that would keep more drivers waiting at its cutover
-// than max_drivers_per_apply gives one apply, or than the servers that run its
-// operations have left to wait at a cutover: SchemaBot's own, or a
-// deployment's on another plane. It reads only the refusal's counts, the
-// deployment name from SchemaBot's own configuration, and SchemaBot's own
-// apply identifiers, so no error text reaches the comment. Re-issuing without
-// the flag always runs; waiting helps only when other deferred applies keep
-// part of the drivers waiting, so that case names them.
+// than max_drivers_per_apply gives one apply, or than SchemaBot's servers
+// have. When the refusal is about a deployment whose operations run on
+// another plane, the line names that deployment. It reads only the refusal's
+// counts and deployment, so no error text reaches the comment. Re-issuing
+// without the flag always runs. An apply's remedy names `apply`, never
+// `apply-confirm`: the refusal is reached at apply, before the operator is
+// asked to confirm. A rollback's names `rollback-confirm`, which the pinned
+// rollback plan lets the operator re-issue as it stands.
 func deferredCutoverCapacityMessage(refused *api.DeferredCutoverCapacityError, command, environment, tenant string) string {
-	rerun := fmt.Sprintf("Run `%s` again without `--defer-cutover`", templates.TenantCommand("schemabot "+command, environment, tenant))
-	waiting := fmt.Sprintf("`--defer-cutover` would keep %d drivers waiting at the cutover at once", refused.Operations)
-	servers := "SchemaBot can keep %d drivers waiting across all its servers"
-	that := "that deployment"
-	if refused.SharesPool() {
-		// Several deployments reach one pool of drivers, counted together.
-		that = "those deployments"
-		waiting = fmt.Sprintf("`--defer-cutover` would keep %d drivers on the `%s` deployments waiting at the cutover at once", refused.Operations, refused.Deployment)
-		servers = that + " can keep %d drivers waiting across their shared servers"
-	} else if refused.Deployment != "" {
-		waiting = fmt.Sprintf("`--defer-cutover` would keep %d drivers on the `%s` deployment waiting at the cutover at once", refused.Operations, refused.Deployment)
-		servers = that + " can keep %d drivers waiting across its servers"
+	work, rerunCommand := "apply", action.Apply
+	if command == action.RollbackConfirm {
+		work, rerunCommand = "rollback", action.RollbackConfirm
 	}
-	capacity := fmt.Sprintf(servers, refused.Capacity)
+	rerun := templates.TenantCommand("schemabot "+rerunCommand, environment, tenant)
+	if refused.Deployment != "" {
+		return deploymentDeferredCutoverCapacityMessage(refused, work, rerun)
+	}
+	switch {
+	case refused.ExceedsPerApplyCap():
+		return fmt.Sprintf("This %s can't defer its cutover: it would keep %d drivers waiting until you cut over, and one apply can use at most %d (`max_drivers_per_apply`). Run `%s` without `--defer-cutover`, or raise `max_drivers_per_apply` to %d.",
+			work, refused.Operations, refused.PerApplyCap, rerun, refused.Operations)
+	case refused.NoLiveServers():
+		return fmt.Sprintf("This %s can't defer its cutover yet: no SchemaBot server has reported its drivers in the last %s. Try again in a minute, or run `%s` without `--defer-cutover`.",
+			work, api.LiveWindowText(), rerun)
+	default:
+		return fmt.Sprintf("This %s can't defer its cutover: it would keep %d drivers waiting until you cut over, and SchemaBot's servers have %d drivers that can wait. Run `%s` without `--defer-cutover`.",
+			work, refused.Operations, refused.Drivers, rerun)
+	}
+}
+
+// deploymentDeferredCutoverCapacityMessage is deferredCutoverCapacityMessage
+// for a refusal about one deployment whose operations run on another plane:
+// the counts are that deployment's operations and that plane's drivers and
+// cap.
+func deploymentDeferredCutoverCapacityMessage(refused *api.DeferredCutoverCapacityError, work, rerun string) string {
 	switch {
 	case refused.Unreported:
-		return fmt.Sprintf("%s, and that deployment does not report how many it can keep waiting. %s, or once SchemaBot there is upgraded.", waiting, rerun)
-	case refused.ExceedsPerApplyCap() && refused.Deployment != "":
-		return fmt.Sprintf("%s, and `max_drivers_per_apply` there gives one apply at most %d. %s, or raise `max_drivers_per_apply` on that deployment to at least %d.",
-			waiting, refused.PerApplyCap, rerun, refused.Operations)
+		return fmt.Sprintf("This %s can't defer its cutover: the `%s` deployment doesn't report its drivers, which upgrading SchemaBot there fixes. Run `%s` without `--defer-cutover`.",
+			work, refused.Deployment, rerun)
 	case refused.ExceedsPerApplyCap():
-		return fmt.Sprintf("%s, and `max_drivers_per_apply` gives one apply at most %d. %s, or raise `max_drivers_per_apply` to at least %d.",
-			waiting, refused.PerApplyCap, rerun, refused.Operations)
-	case refused.LiveServers == 0 && refused.Deployment != "":
-		return fmt.Sprintf("%s, and no server of %s has reported its drivers in the last %s. %s.",
-			waiting, that, api.LiveWindowText(), rerun)
-	case refused.LiveServers == 0:
-		return fmt.Sprintf("%s, and no SchemaBot server has reported its drivers in the last %s. %s.",
-			waiting, api.LiveWindowText(), rerun)
-	case refused.ExceedsCapacity():
-		return fmt.Sprintf("%s, and %s. %s.", waiting, capacity, rerun)
+		return fmt.Sprintf("This %s can't defer its cutover: it would keep %d drivers waiting on the `%s` deployment until you cut over, and one apply can use at most %d there (`max_drivers_per_apply`). Run `%s` without `--defer-cutover`, or raise `max_drivers_per_apply` on that deployment to %d.",
+			work, refused.Operations, refused.Deployment, refused.PerApplyCap, rerun, refused.Operations)
+	case refused.NoLiveServers():
+		return fmt.Sprintf("This %s can't defer its cutover yet: no SchemaBot server of the `%s` deployment has reported its drivers in the last %s. Try again in a minute, or run `%s` without `--defer-cutover`.",
+			work, refused.Deployment, api.LiveWindowText(), rerun)
 	default:
-		holding := make([]string, len(refused.HoldingApplyIDs))
-		for i, id := range refused.HoldingApplyIDs {
-			holding[i] = "`" + id + "`"
-		}
-		// The capacity opens its own sentence here.
-		return fmt.Sprintf("%s. %s%s, and %s, leaving %d. %s, or once %s cut over or cancelled.",
-			waiting, strings.ToUpper(capacity[:1]), capacity[1:], api.HoldingAppliesKeepText(holding, refused.Reserved), refused.Free(), rerun, api.HoldingAppliesPronoun(holding))
+		return fmt.Sprintf("This %s can't defer its cutover: it would keep %d drivers waiting on the `%s` deployment until you cut over, and its servers have %d drivers that can wait. Run `%s` without `--defer-cutover`.",
+			work, refused.Operations, refused.Deployment, refused.Drivers, rerun)
 	}
 }
 

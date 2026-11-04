@@ -3,10 +3,8 @@ package tern
 import (
 	"context"
 	"errors"
-	"fmt"
 	"log/slog"
 
-	"github.com/google/uuid"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -34,18 +32,11 @@ type Server struct {
 }
 
 // driverCapacitySource is what DriverCapacity reads: the live operator
-// servers, the settings that hold the pool's identity, and this instance's
-// per-apply driver cap.
+// servers and this instance's per-apply driver cap.
 type driverCapacitySource struct {
 	servers            storage.OperatorServerStore
-	settings           storage.SettingsStore
 	maxDriversPerApply int
 }
-
-// driverPoolIDSettingKey is the setting that names this storage's driver pool.
-// The operator servers registry lives in the same storage, so every endpoint
-// reading that registry reports the same drivers and the same pool.
-const driverPoolIDSettingKey = "driver_pool_id"
 
 var _ ternv1.TernServer = (*Server)(nil)
 
@@ -62,15 +53,14 @@ func WithStorageSchemaService(service StorageSchemaService) ServerOption {
 }
 
 // WithDriverCapacity lets this endpoint report the drivers its operators run,
-// read from the operator servers registry in this instance's own storage, how
-// many operations of one apply they run at once, and the identity of that pool,
-// kept in the same storage's settings. Every operation a control plane sends
-// here runs on one of these drivers, so the control plane counts what it has
-// booked against them, under every route that reaches the pool, to refuse or
-// queue work that would not fit.
-func WithDriverCapacity(servers storage.OperatorServerStore, settings storage.SettingsStore, maxDriversPerApply int) ServerOption {
+// read from the operator servers registry in this instance's own storage, and
+// how many operations of one apply they run at once. Every operation a control
+// plane sends here runs on one of these drivers, so the control plane refuses
+// a deferred apply that could never have all its operations here waiting at
+// once.
+func WithDriverCapacity(servers storage.OperatorServerStore, maxDriversPerApply int) ServerOption {
 	return func(s *Server) {
-		s.driverCapacity = &driverCapacitySource{servers: servers, settings: settings, maxDriversPerApply: maxDriversPerApply}
+		s.driverCapacity = &driverCapacitySource{servers: servers, maxDriversPerApply: maxDriversPerApply}
 	}
 }
 
@@ -191,49 +181,18 @@ func (s *Server) DriverCapacity(ctx context.Context, req *ternv1.DriverCapacityR
 	}
 	servers, err := s.driverCapacity.servers.ListLive(ctx)
 	if err != nil {
-		s.logger.WarnContext(ctx, "could not read the live operator servers; work that needs this deployment's driver capacity will be refused until it answers", "error", err)
-		return nil, status.Error(codes.Unavailable, "driver capacity unavailable")
-	}
-	poolID, err := s.driverCapacity.poolID(ctx)
-	if err != nil {
-		s.logger.WarnContext(ctx, "could not read the driver pool's identity; work that needs this deployment's driver capacity will be refused until it answers", "error", err)
+		s.logger.WarnContext(ctx, "could not read the live operator servers; deferred applies sent to this deployment will be refused until it answers", "error", err)
 		return nil, status.Error(codes.Unavailable, "driver capacity unavailable")
 	}
 	resp := &ternv1.DriverCapacityResponse{
 		LiveServers:        int32(len(servers)),
 		MaxDriversPerApply: int32(s.driverCapacity.maxDriversPerApply),
-		PoolId:             poolID,
 	}
 	for _, server := range servers {
 		resp.Drivers += int32(server.Drivers)
-		resp.DeferredCutoverDrivers += int32(server.DeferredCutoverDrivers)
+		resp.DeferredCutoverDrivers += int32(storage.DeferredCutoverDrivers(server.Drivers))
 	}
 	return resp, nil
-}
-
-// poolID returns the identity of the driver pool this storage's operator
-// servers registry counts, creating it the first time it is asked for. Every
-// server sharing the storage races to create it with a compare-and-set and
-// then reads back whichever value won, so they all report the same one.
-func (c *driverCapacitySource) poolID(ctx context.Context) (string, error) {
-	stored, err := c.settings.Get(ctx, driverPoolIDSettingKey)
-	if err != nil {
-		return "", fmt.Errorf("read setting %s: %w", driverPoolIDSettingKey, err)
-	}
-	if stored != nil {
-		return stored.Value, nil
-	}
-	if _, err := c.settings.CompareAndSet(ctx, driverPoolIDSettingKey, nil, uuid.NewString()); err != nil {
-		return "", fmt.Errorf("create setting %s: %w", driverPoolIDSettingKey, err)
-	}
-	stored, err = c.settings.Get(ctx, driverPoolIDSettingKey)
-	if err != nil {
-		return "", fmt.Errorf("read setting %s after creating it: %w", driverPoolIDSettingKey, err)
-	}
-	if stored == nil {
-		return "", fmt.Errorf("setting %s is missing after creating it", driverPoolIDSettingKey)
-	}
-	return stored.Value, nil
 }
 
 // callerAbandonedHealthCheck reports whether a failed health check ended because

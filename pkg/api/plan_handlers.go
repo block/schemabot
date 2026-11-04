@@ -1552,7 +1552,7 @@ func applyMetricStatusForError(err error) string {
 	if _, ok := errors.AsType[*RolloutShapeRefusedError](err); ok {
 		return applyMetricStatusRejected
 	}
-	// So is a deferred cutover wider than the drivers left for it.
+	// So is a deferred cutover wider than the drivers that can run it.
 	if _, ok := errors.AsType[*DeferredCutoverCapacityError](err); ok {
 		return applyMetricStatusRejected
 	}
@@ -2186,28 +2186,23 @@ func (s *Service) createStoredApply(
 	}
 	logRolloutShape(s.logger, plan, req.Environment, members, groups, shardedFanout)
 	if applyOpts.DeferCutover {
-		apply.DeferredCutoverOperations = deferredCutoverWidth(groups)
-		if refused := s.deferredCutoverPerApplyCapRefusal(plan, req.Environment, applyIdentifier, caller, apply.DeferredCutoverOperations); refused != nil {
-			return nil, 0, refused
+		refused, err := s.deferredCutoverCapacityRefusal(ctx, plan, req.Environment, applyIdentifier, caller, groups)
+		if err != nil {
+			return nil, 0, &applyStorageError{
+				Operation:       "admit deferred cutover",
+				Plan:            plan,
+				ApplyIdentifier: applyIdentifier,
+				Caller:          caller,
+				Err:             err,
+			}
 		}
-		if apply.DeferredCutoverOperations > 1 {
-			var pools map[string]string
-			apply.DeferredCutoverDataPlanes, pools, err = s.deferredCutoverDataPlanes(ctx, plan, req.Environment, applyIdentifier, caller, groups)
-			if err != nil {
-				return nil, 0, err
-			}
-			if len(pools) > 0 {
-				applyOpts.DeferredCutoverPools = pools
-				apply.Options = storage.MarshalApplyOptions(applyOpts)
-			}
+		if refused != nil {
+			return nil, 0, refused
 		}
 	}
 
 	storedApplyID, err := s.storage.Applies().CreateWithGroupedOperations(ctx, apply, groups)
 	if err != nil {
-		if refused, ok := errors.AsType[*storage.DeferredCutoverCapacityError](err); ok {
-			return nil, 0, s.deferredCutoverRefusal(plan, req.Environment, applyIdentifier, caller, refused)
-		}
 		if isApplyCreationStorageRefusal(err) {
 			return nil, 0, fmt.Errorf("store apply and tasks: %w", err)
 		}

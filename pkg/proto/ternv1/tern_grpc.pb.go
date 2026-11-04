@@ -163,10 +163,8 @@ type TernClient interface {
 	// Health checks service health by verifying storage connectivity.
 	Health(ctx context.Context, in *HealthRequest, opts ...grpc.CallOption) (*HealthResponse, error)
 	// DriverCapacity reports the drivers this deployment's operators run, so a
-	// caller can work out how many are available for the work it sends here and
-	// refuse or queue that work up front instead of starting what cannot fit.
-	// The caller counts what it has already booked against the answer; this
-	// deployment reports only its pool.
+	// caller can refuse up front an apply that could never have all its
+	// operations here waiting at a deferred cutover at once.
 	//
 	// A deployment that answers also cuts over every operation a CutoverRequest
 	// names in apply_operation_ids, and records each command_id once. A caller
@@ -532,10 +530,8 @@ type TernServer interface {
 	// Health checks service health by verifying storage connectivity.
 	Health(context.Context, *HealthRequest) (*HealthResponse, error)
 	// DriverCapacity reports the drivers this deployment's operators run, so a
-	// caller can work out how many are available for the work it sends here and
-	// refuse or queue that work up front instead of starting what cannot fit.
-	// The caller counts what it has already booked against the answer; this
-	// deployment reports only its pool.
+	// caller can refuse up front an apply that could never have all its
+	// operations here waiting at a deferred cutover at once.
 	//
 	// A deployment that answers also cuts over every operation a CutoverRequest
 	// names in apply_operation_ids, and records each command_id once. A caller

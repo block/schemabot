@@ -441,30 +441,14 @@ func TestServerRegisterGRPCThreadsStorageSchemaService(t *testing.T) {
 }
 
 // operatorServersStorage is storage whose operator servers registry answers
-// ListLive with fixed servers, and whose settings already name the driver
-// pool.
+// ListLive with fixed servers.
 type operatorServersStorage struct {
 	storage.Storage
 	servers []*storage.OperatorServer
-	poolID  string
 }
 
 func (s operatorServersStorage) OperatorServers() storage.OperatorServerStore {
 	return liveOperatorServers{servers: s.servers}
-}
-
-func (s operatorServersStorage) Settings() storage.SettingsStore {
-	return poolSettings{poolID: s.poolID}
-}
-
-// poolSettings is a settings store holding only the driver pool's identity.
-type poolSettings struct {
-	storage.SettingsStore
-	poolID string
-}
-
-func (s poolSettings) Get(_ context.Context, key string) (*storage.Setting, error) {
-	return &storage.Setting{Key: key, Value: s.poolID}, nil
 }
 
 type liveOperatorServers struct {
@@ -476,8 +460,8 @@ func (s liveOperatorServers) ListLive(context.Context) ([]*storage.OperatorServe
 	return s.servers, nil
 }
 
-// A control plane books work against what this instance reports over gRPC,
-// so the registration an embedder gets reports the live operator servers of
+// A control plane checks a deferred apply against what this instance reports
+// over gRPC, so the registration an embedder gets reports the live operator servers of
 // its own storage and the max_drivers_per_apply its own drivers run one apply
 // under, the default when the config leaves it unset.
 func TestServerRegisterGRPCReportsDriverCapacity(t *testing.T) {
@@ -493,8 +477,8 @@ func TestServerRegisterGRPCReportsDriverCapacity(t *testing.T) {
 			logger := slog.New(slog.DiscardHandler)
 			cfg := &api.ServerConfig{MaxDriversPerApply: tc.maxDriversPerApply}
 			store := operatorServersStorage{servers: []*storage.OperatorServer{
-				{ServerID: "host-a/1/operator", Drivers: 4, DeferredCutoverDrivers: 3},
-			}, poolID: "pool-east"}
+				{ServerID: "host-a/1/operator", Drivers: 4},
+			}}
 			srv := &Server{
 				cfg:             cfg,
 				dataPlaneClient: stubTernClient{},
@@ -510,7 +494,6 @@ func TestServerRegisterGRPCReportsDriverCapacity(t *testing.T) {
 			assert.Equal(t, int32(4), resp.GetDrivers())
 			assert.Equal(t, int32(3), resp.GetDeferredCutoverDrivers())
 			assert.Equal(t, tc.want, resp.GetMaxDriversPerApply())
-			assert.Equal(t, "pool-east", resp.GetPoolId())
 		})
 	}
 }
