@@ -1781,6 +1781,9 @@ dispatch scope, an attaching shard dispatch re-planned against its own shard and
 shard's verdict, and a shard dispatch this deployment could not re-plan (it carries no schema
 files) treated as unsafe (`verifyAttachedShardDispatch` and `restoreDispatchedUnsafeVerdicts` in
 `pkg/tern/local_plan_drift.go`, gated by `rejectUnsafeDDLChangesWithoutOptIn` in
+`pkg/tern/local_client.go`), and the applying deployment's own re-planned VSchema deletions and
+mutations added to the ones the dispatch carried (`stampReplannedVSchema` in
+`pkg/tern/local_plan_drift.go`, gated by `rejectUnsafeVSchemaChangesWithoutOptIn` in
 `pkg/tern/local_client.go`).
 
 ### RV-4: Engine refusals are known at plan time and gate the apply

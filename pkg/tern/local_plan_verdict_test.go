@@ -288,6 +288,126 @@ func TestDispatchScopeCarriesReplannedUnsafeVerdict(t *testing.T) {
 	}
 }
 
+const (
+	dropEmailVindexReason   = "removing vindex email_idx changes query routing"
+	dropPhoneVindexReason   = "removing vindex phone_idx changes query routing"
+	userVindexTypeReason    = "changing vindex user_idx type re-computes keyspace ids"
+	emailVindexDeletionJSON = `[{"kind":"vindex","name":"email_idx","reason":"` + dropEmailVindexReason + `"}]`
+	phoneVindexDeletionJSON = `[{"kind":"vindex","name":"phone_idx","reason":"` + dropPhoneVindexReason + `"}]`
+	userVindexMutationJSON  = `[{"kind":"vindex_type","name":"user_idx","reason":"` + userVindexTypeReason + `"}]`
+)
+
+// vschemaChangeMetadata is a VSchema change's metadata recording the given
+// deletion and mutation records ("" for none).
+func vschemaChangeMetadata(deletions, mutations string) map[string]string {
+	meta := map[string]string{storage.PlanMetadataVSchemaChanged: "true"}
+	if deletions != "" {
+		meta[storage.PlanMetadataVSchemaDeletions] = deletions
+	}
+	if mutations != "" {
+		meta[storage.PlanMetadataVSchemaMutations] = mutations
+	}
+	return meta
+}
+
+// A non-primary deployment's live VSchema can differ from the primary's, so
+// its own re-plan can find a VSchema deletion or routing change the primary's
+// record — the one the dispatch carries — does not. The materialized plan must
+// carry this deployment's records added to the dispatched ones, so the unsafe
+// VSchema admission gate refuses the apply without the opt-in whenever either
+// side found an unsafe change, and never drops a record the dispatch carried.
+func TestMaterializedPlanCarriesReplannedVSchemaUnsafeRecords(t *testing.T) {
+	cases := []struct {
+		name               string
+		dispatched         map[string]string
+		replanned          map[string]string
+		wantUnsafeReasons  []string
+		wantMaterializeErr string
+	}{
+		{
+			name:              "re-plan finds a deletion the dispatch does not record",
+			dispatched:        vschemaChangeMetadata("", ""),
+			replanned:         vschemaChangeMetadata(emailVindexDeletionJSON, ""),
+			wantUnsafeReasons: []string{dropEmailVindexReason},
+		},
+		{
+			name:              "re-plan finds a mutation the dispatch does not record",
+			dispatched:        vschemaChangeMetadata("", ""),
+			replanned:         vschemaChangeMetadata("", userVindexMutationJSON),
+			wantUnsafeReasons: []string{userVindexTypeReason},
+		},
+		{
+			name:              "dispatched deletion survives a safe re-plan",
+			dispatched:        vschemaChangeMetadata(emailVindexDeletionJSON, ""),
+			replanned:         vschemaChangeMetadata("", ""),
+			wantUnsafeReasons: []string{dropEmailVindexReason},
+		},
+		{
+			name:              "dispatched and re-planned deletions are both kept",
+			dispatched:        vschemaChangeMetadata(emailVindexDeletionJSON, ""),
+			replanned:         vschemaChangeMetadata(phoneVindexDeletionJSON, userVindexMutationJSON),
+			wantUnsafeReasons: []string{dropEmailVindexReason, dropPhoneVindexReason, userVindexTypeReason},
+		},
+		{
+			name:              "a record on both sides is kept once",
+			dispatched:        vschemaChangeMetadata(emailVindexDeletionJSON, ""),
+			replanned:         vschemaChangeMetadata(`[{"kind":"vindex","name":"email_idx","reason":"`+dropEmailVindexReason+`"},{"kind":"vindex","name":"phone_idx","reason":"`+dropPhoneVindexReason+`"}]`, ""),
+			wantUnsafeReasons: []string{dropEmailVindexReason, dropPhoneVindexReason},
+		},
+		{
+			name:       "safe on both sides",
+			dispatched: vschemaChangeMetadata("", ""),
+			replanned:  vschemaChangeMetadata("", ""),
+		},
+		{
+			name:               "a re-planned record that cannot be decoded refuses the plan",
+			dispatched:         vschemaChangeMetadata(emailVindexDeletionJSON, ""),
+			replanned:          vschemaChangeMetadata("not json", ""),
+			wantMaterializeErr: `namespace "testapp": vschema_deletions: decode re-planned records`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store := &fakePlanStore{getFn: func(string) (*storage.Plan, error) { return nil, nil }, createID: 31}
+			c := newPlanMaterializeClientWithPlan(store, &engine.PlanResult{Changes: []engine.SchemaChange{{
+				Namespace: "testapp",
+				Metadata:  tc.replanned,
+			}}})
+
+			plan, err := c.planForApplyRequest(t.Context(), &ternv1.ApplyRequest{
+				PlanId: "plan_vschema_replanned",
+				DdlChanges: []*ternv1.TableChange{
+					{TableName: "VSchema: testapp", ChangeType: ternv1.ChangeType_CHANGE_TYPE_VSCHEMA, Namespace: "testapp", Metadata: tc.dispatched},
+				},
+				SchemaFiles: map[string]*ternv1.SchemaFiles{
+					"testapp": {Files: map[string]string{storage.VSchemaArtifactName: `{"sharded":true}`}},
+				},
+			})
+			if tc.wantMaterializeErr != "" {
+				require.ErrorContains(t, err, tc.wantMaterializeErr)
+				return
+			}
+			require.NoError(t, err)
+			require.NotNil(t, plan)
+
+			var reasons []string
+			for _, change := range plan.UnsafeVSchemaChanges() {
+				assert.Equal(t, "testapp", change.Namespace)
+				reasons = append(reasons, change.Reason)
+			}
+			assert.Equal(t, tc.wantUnsafeReasons, reasons)
+
+			err = rejectUnsafeVSchemaChangesWithoutOptIn(plan, storage.ApplyOptions{})
+			if len(tc.wantUnsafeReasons) == 0 {
+				require.NoError(t, err)
+				return
+			}
+			require.EqualError(t, err, `stored plan plan_vschema_replanned contains an unsafe VSchema change in namespace "testapp": `+tc.wantUnsafeReasons[0]+`; retry with allow_unsafe=true`)
+			require.NoError(t, rejectUnsafeVSchemaChangesWithoutOptIn(plan, storage.ApplyOptions{AllowUnsafe: true}))
+		})
+	}
+}
+
 // A locally planned keyspace whose shards diverge keeps each shard's own
 // changes on its shard row, while the namespace-level tables list each table
 // once with the first shard's text and verdict. A dispatch scoped to the shard
