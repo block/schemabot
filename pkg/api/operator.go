@@ -3791,24 +3791,26 @@ func firstFailedTaskError(tasks []*storage.Task) string {
 	return ""
 }
 
-// firstFailedOperationMessage returns a deployment-qualified failure reason from
-// the first failed operation row that carries one, naming the operation's
+// firstOperationMessageInState returns a deployment-qualified reason from the
+// first operation row in opState that carries one, naming the operation's
 // target as well when it has one, since a deployment addressing several
-// targets says nothing about which of them failed. It surfaces the parent
-// apply's ErrorMessage from the aggregate when the rollout settles to failed,
-// rather than leaving whatever message the last-driven (possibly successful)
-// operation wrote. The rollout's failure verdict is the first failure, so the
-// first failed row in deployment order wins. Empty when no failed operation
-// carries a message, so the caller keeps the existing apply message as fallback.
-func firstFailedOperationMessage(ops []*storage.ApplyOperation) string {
+// targets says nothing about which of them the reason belongs to. outcome is
+// the verb phrase that joins the row to its reason ("failed", "paused for
+// retry"). It surfaces the parent apply's ErrorMessage from the aggregate when
+// the rollout settles or pauses, rather than leaving whatever message the
+// last-driven (possibly successful) operation wrote. The rollout's verdict is
+// the first row to reach the state, so the first such row in deployment order
+// wins. Empty when no row in opState carries a message, so the caller keeps the
+// existing apply message as fallback.
+func firstOperationMessageInState(ops []*storage.ApplyOperation, opState, outcome string) string {
 	for _, op := range ops {
-		if !state.IsState(op.State, state.ApplyOperation.Failed) || op.ErrorMessage == "" {
+		if !state.IsState(op.State, opState) || op.ErrorMessage == "" {
 			continue
 		}
 		if op.Target != "" {
-			return fmt.Sprintf("target %s on deployment %s failed: %s", op.Target, op.Deployment, op.ErrorMessage)
+			return fmt.Sprintf("target %s on deployment %s %s: %s", op.Target, op.Deployment, outcome, op.ErrorMessage)
 		}
-		return fmt.Sprintf("deployment %s failed: %s", op.Deployment, op.ErrorMessage)
+		return fmt.Sprintf("deployment %s %s: %s", op.Deployment, outcome, op.ErrorMessage)
 	}
 	return ""
 }
@@ -4171,14 +4173,29 @@ func (s *Service) updateApplyStateFromOperations(ctx context.Context, driverID i
 		completedAt = nil
 	}
 
+	// The parent's message follows the aggregate the same way its state does.
 	// When the rollout settles to failed, surface the failure reason from the
-	// aggregate (the first failed operation) rather than leaving whatever message
-	// the last-driven operation wrote — under continue the last driver may be a
-	// successful sibling, which would leave the failed verdict with no matching
-	// reason. Keep the existing message as a fallback when no operation carries one.
+	// first failed operation rather than leaving whatever message the last-driven
+	// operation wrote — under continue the last driver may be a successful
+	// sibling, which would leave the failed verdict with no matching reason.
+	// When it pauses for a retry, surface the first paused operation's reason,
+	// so the pause can be triaged from the apply without opening its operation
+	// rows. Either way the existing message is the fallback when no operation
+	// carries one, except a pause reason: it describes work the rollout was
+	// about to retry, so it is cleared when the projection takes the parent out
+	// of its pause, as a claim of a paused parent-lease apply clears it, and
+	// the operation that settles the retry supplies the next reason.
 	errorMessage := apply.ErrorMessage
-	if state.IsState(derived, state.Apply.Failed) {
-		if msg := firstFailedOperationMessage(ops); msg != "" {
+	if state.IsState(apply.State, state.Apply.FailedRetryable) && !state.IsState(derived, state.Apply.FailedRetryable) {
+		errorMessage = ""
+	}
+	switch {
+	case state.IsState(derived, state.Apply.Failed):
+		if msg := firstOperationMessageInState(ops, state.ApplyOperation.Failed, "failed"); msg != "" {
+			errorMessage = msg
+		}
+	case state.IsState(derived, state.Apply.FailedRetryable):
+		if msg := firstOperationMessageInState(ops, state.ApplyOperation.FailedRetryable, "paused for retry"); msg != "" {
 			errorMessage = msg
 		}
 	}
