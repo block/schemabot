@@ -1360,8 +1360,8 @@ func TestE2EAutoPlanNoSchemaFiles(t *testing.T) {
 	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1/files", func(w http.ResponseWriter, r *http.Request) {
 		filesFetchedOnce.Do(func() { close(filesFetched) })
 		files := []*gh.CommitFile{
-			{Filename: new("README.md"), Status: new("modified"), Additions: new(6), Deletions: new(2)},
-			{Filename: new("main.go"), Status: new("modified"), Additions: new(14), Deletions: new(3)},
+			{Filename: new("README.md"), Status: new("modified")},
+			{Filename: new("main.go"), Status: new("modified")},
 		}
 		_ = json.NewEncoder(w).Encode(files)
 	})
@@ -2054,7 +2054,7 @@ func TestE2EAutoPlanUsesRepositoryEnvironmentCoverage(t *testing.T) {
 	client, mux := setupGitHubServer(t)
 	result := setupFakeGitHubForPlanWithPRFiles(t, mux, map[string]string{
 		"users.sql": "CREATE TABLE users (id BIGINT PRIMARY KEY)",
-	}, fmt.Sprintf("database: %s\ntype: mysql\n", dbName), dbName, []*gh.CommitFile{{Filename: new("README.md"), Status: new("modified"), Additions: new(3), Deletions: new(2)}})
+	}, fmt.Sprintf("database: %s\ntype: mysql\n", dbName), dbName, []*gh.CommitFile{{Filename: new("README.md"), Status: new("modified")}})
 	h := newE2EHandler(t, svc, client)
 	drainWebhookWorkOnCleanup(t, h)
 	req := buildPRWebhookRequest(t, prWebhookPayloadOpts{action: "opened", headSHA: "abc123", headRef: "feature-branch"}, nil)

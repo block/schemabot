@@ -1653,7 +1653,8 @@ func TestRenderMultiDeploymentApplyComment_TargetThatAlreadyHadTheChangeIsLeftOu
 // counts line, no per-deployment list, and no section wrapping the table
 // lines: they sit under the status line. Once the rollout completes, the
 // final summary folds them into "Apply details", as a single-target completed
-// summary does. Beside a second deployment, each deployment keeps its section.
+// summary does, and the block's label states the outcome in place of the
+// status line. Beside a second deployment, each deployment keeps its section.
 // Neither layout names or counts the target that already had the change.
 func TestRenderMultiDeploymentApplyComment_SoleMultiTargetDeploymentHasNoWrapper(t *testing.T) {
 	converged := parallelTarget("primary", "testapp-003", so.Completed)
@@ -1676,7 +1677,7 @@ func TestRenderMultiDeploymentApplyComment_SoleMultiTargetDeploymentHasNoWrapper
 		lineTop string
 	}{
 		"status":  {RenderMultiDeploymentApplyComment(data), "\n✅ Rolled out to 2 targets\n\n"},
-		"summary": {RenderMultiDeploymentApplySummaryComment(data), "\n✅ Rolled out to 2 targets\n\n<details><summary>Apply details (1 table)</summary>\n\n"},
+		"summary": {RenderMultiDeploymentApplySummaryComment(data), "\n<details><summary>Apply details (1 table done on 2 targets)</summary>\n\n"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			out := tc.out
@@ -1756,7 +1757,8 @@ func TestRenderMultiDeploymentApplySummaryComment_SoleMultiTargetCountsTableChan
 	}
 
 	out := RenderMultiDeploymentApplySummaryComment(data)
-	assert.Contains(t, out, "<details><summary>Apply details (2 tables)</summary>\n\n")
+	assert.Contains(t, out, "<details><summary>Apply details (2 tables done on 3 targets)</summary>\n\n")
+	assert.NotContains(t, out, "✅ 2 tables done on 3 targets\n", "the label carries the outcome, so no status line repeats it:\n%s", out)
 	assert.Contains(t, out, "**`orders`**: ✅ Complete (3 targets)")
 	assert.Contains(t, out, "**`users`**: ✅ Complete (3 targets)")
 }
@@ -1780,12 +1782,13 @@ func TestRenderMultiDeploymentApplyComment_DeploymentThatAlreadyHadTheChangeIsLe
 		},
 	}
 
-	for name, out := range map[string]string{
-		"status":  RenderMultiDeploymentApplyComment(data),
-		"summary": RenderMultiDeploymentApplySummaryComment(data),
+	for name, tc := range map[string]struct{ out, outcome string }{
+		"status":  {RenderMultiDeploymentApplyComment(data), "\n✅ Rolled out to 2 targets\n"},
+		"summary": {RenderMultiDeploymentApplySummaryComment(data), "<summary>Apply details (1 table done on 2 targets)</summary>"},
 	} {
 		t.Run(name, func(t *testing.T) {
-			assert.Contains(t, out, "\n✅ Rolled out to 2 targets\n")
+			out := tc.out
+			assert.Contains(t, out, tc.outcome)
 			assert.NotContains(t, out, "eu", "the deployment that already had it is not named:\n%s", out)
 			assert.NotContains(t, out, "already had")
 		})
@@ -1843,13 +1846,15 @@ func TestRenderMultiDeploymentApplyComment_SoleMultiTargetStatusFollowsTheApply(
 			targetDetail("testapp_002", state.Task.Completed, addNote, 1000),
 		},
 	}
-	for name, out := range map[string]string{
-		"status":  RenderMultiDeploymentApplyComment(completed),
-		"summary": RenderMultiDeploymentApplySummaryComment(completed),
+	for name, tc := range map[string]struct{ out, outcome string }{
+		"status":  {RenderMultiDeploymentApplyComment(completed), "\n✅ Rolled back on both targets\n"},
+		"summary": {RenderMultiDeploymentApplySummaryComment(completed), "<summary>Apply details (1 table rolled back on 2 targets)</summary>"},
 	} {
 		t.Run("rollback "+name, func(t *testing.T) {
-			assert.Contains(t, out, "\n✅ Rolled back on both targets\n")
+			out := tc.out
+			assert.Contains(t, out, tc.outcome)
 			assert.NotContains(t, out, "Rolled out")
+			assert.NotContains(t, out, " done on ")
 		})
 	}
 

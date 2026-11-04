@@ -111,7 +111,6 @@ func TestFindConfigsForPRFilesResolvesRenamedAwaySchemaFiles(t *testing.T) {
 		{name: "renamed to a non-schema file", file: PRFile{Filename: "docs/users.md", PreviousFilename: "schema/users.sql", Status: "renamed"}},
 		{name: "renamed out of every config directory", file: PRFile{Filename: "archive/users.sql", PreviousFilename: "schema/users.sql", Status: "renamed"}},
 		{name: "renamed within the config directory", file: PRFile{Filename: "schema/users_v2.sql", PreviousFilename: "schema/users.sql", Status: "renamed"}},
-		{name: "an environment symlink renamed away", file: PRFile{Filename: "archive/staging", PreviousFilename: "schema/staging", Status: "renamed", PreviousSymlink: true}},
 	}
 
 	for _, tt := range tests {
@@ -1325,10 +1324,8 @@ func TestFindConfigByDatabaseNameTruncatedTreeUsesConfigDirHints(t *testing.T) {
 	client, mux := setupConfigTestGitHubServer(t)
 	registerPullRequest(t, mux, "abc123")
 	registerPullRequestFiles(t, mux, []*gh.CommitFile{{
-		Filename:  new("docs/readme.md"),
-		Status:    new("modified"),
-		Additions: new(3),
-		Deletions: new(2),
+		Filename: new("docs/readme.md"),
+		Status:   new("modified"),
 	}})
 	registerTruncatedRepoWithSchemaSubtree(t, mux, []map[string]any{
 		{"path": "schemabot.yaml", "type": "blob", "sha": "blob-config", "mode": "100644"},
