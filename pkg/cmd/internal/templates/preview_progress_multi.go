@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/presentation"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
@@ -46,6 +47,29 @@ func previewCLIMultiDeploymentApplyHaltedWithLiveSibling() {
 	}))
 }
 
+// previewCLIMultiDeploymentApplyStoppedAtCutover is a rollout that deferred
+// its cutover across three deployments. eu-west failed while us-east and
+// ap-south had copied and waited at the cutover, which could then never run
+// for all three, so SchemaBot stopped them, saved their copies, and failed
+// the apply.
+func previewCLIMultiDeploymentApplyStoppedAtCutover() {
+	endedBy := &presentation.OperationRef{Deployment: "eu-west"}
+	ddl := "ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL"
+	data := multiDeploymentProgressData([]ProgressOperation{
+		{Deployment: "us-east", Target: "orders-us-east", State: state.ApplyOperation.Failed, CutoverPolicy: storage.CutoverPolicyParallel, OnFailure: storage.OnFailureHalt, EndedBy: endedBy},
+		{Deployment: "eu-west", Target: "orders-eu-west", State: state.ApplyOperation.Failed, CutoverPolicy: storage.CutoverPolicyParallel, OnFailure: storage.OnFailureHalt, ErrorMessage: "lock wait timeout exceeded; try restarting transaction"},
+		{Deployment: "ap-south", Target: "orders-ap-south", State: state.ApplyOperation.Failed, CutoverPolicy: storage.CutoverPolicyParallel, OnFailure: storage.OnFailureHalt, EndedBy: endedBy},
+	}, []TableProgress{
+		{Deployment: "us-east", Target: "orders-us-east", TableName: "orders", ChangeType: "alter", Dialect: schema.DialectMySQL, DDL: ddl, Status: state.Task.Stopped, RowsCopied: 80000, RowsTotal: 80000, PercentComplete: 100},
+		{Deployment: "eu-west", Target: "orders-eu-west", TableName: "orders", ChangeType: "alter", Dialect: schema.DialectMySQL, DDL: ddl, Status: state.Task.Failed, RowsCopied: 51000, RowsTotal: 120000, PercentComplete: 42},
+		{Deployment: "ap-south", Target: "orders-ap-south", TableName: "orders", ChangeType: "alter", Dialect: schema.DialectMySQL, DDL: ddl, Status: state.Task.Stopped, RowsCopied: 60000, RowsTotal: 60000, PercentComplete: 100},
+	})
+	data.State = state.Apply.Failed
+	data.Options = map[string]string{"defer_cutover": "true"}
+	data.CompletedAt = previewTime.Add(-1 * time.Minute).Format(time.RFC3339)
+	WriteProgress(data)
+}
+
 func previewCLIMultiDeploymentApplyCompleted() {
 	data := multiDeploymentProgressData([]ProgressOperation{
 		{Deployment: "us-east", Target: "orders-us-east", State: state.ApplyOperation.Completed, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt},
@@ -68,6 +92,7 @@ func previewCLIMultiDeployAllOutput() {
 		{"BARRIER ROLLOUT IN PROGRESS", previewCLIMultiDeploymentApplyInProgress},
 		{"HALT ON FAILURE (ONE DEPLOYMENT FAILED)", previewCLIMultiDeploymentApplyFailed},
 		{"HALT ON FAILURE (A SIBLING IS STILL RUNNING)", previewCLIMultiDeploymentApplyHaltedWithLiveSibling},
+		{"DEFERRED CUTOVER STOPPED AFTER A FAILURE", previewCLIMultiDeploymentApplyStoppedAtCutover},
 		{"ALL DEPLOYMENTS COMPLETED", previewCLIMultiDeploymentApplyCompleted},
 		{"MULTI-TARGET ROLLOUT PAST A FAILED TARGET", previewCLIMultiTargetRolloutInProgress},
 		{"MULTI-TARGET ROLLOUT WAITING FOR CUTOVER", previewCLIMultiTargetRolloutWaitingForCutover},
@@ -75,6 +100,7 @@ func previewCLIMultiDeployAllOutput() {
 		{"SHARDED APPLY ON A KEYSPACE'S ONLY SHARD", previewCLISingleShardApplyCompleted},
 		{"SHARDED APPLY COPYING ACROSS FOUR SHARDS", previewCLIShardedApplyRunning},
 		{"SHARDED APPLY WITH A FAILED SHARD", previewCLIShardedApplyFailed},
+		{"SHARDED DEFERRED CUTOVER STOPPED AFTER A SHARD FAILED", previewCLIShardedApplyStoppedAtCutover},
 	}
 	for i, section := range sections {
 		if i > 0 {
@@ -259,4 +285,29 @@ func multiDeploymentProgressData(ops []ProgressOperation, tables []TableProgress
 		Operations:  ops,
 		Tables:      tables,
 	}
+}
+
+// previewCLIShardedApplyStoppedAtCutover is a sharded apply that deferred its
+// cutover. Shard -40 failed while the other three had copied and waited at
+// the cutover, which could then never run for every shard, so SchemaBot
+// stopped them, saved their copies, and failed the apply.
+func previewCLIShardedApplyStoppedAtCutover() {
+	data := shardedPreviewProgress(state.Apply.Failed, state.ApplyOperation.Cancelled, "cancelled", []ShardProgress{
+		{Shard: "-40", Status: state.Task.Failed},
+		{Shard: "40-80", Status: state.Task.Stopped, RowsCopied: 1466232, RowsTotal: 1466232, PercentComplete: 100},
+		{Shard: "80-c0", Status: state.Task.Stopped, RowsCopied: 1402118, RowsTotal: 1402118, PercentComplete: 100},
+		{Shard: "c0-", Status: state.Task.Stopped, RowsCopied: 1389004, RowsTotal: 1389004, PercentComplete: 100},
+	}, TableProgress{Status: state.Task.Failed})
+	data.CompletedAt = previewTime.Add(-3 * time.Minute).Format(time.RFC3339)
+	data.Options = map[string]string{"defer_cutover": "true"}
+	failed := data.Operations[0]
+	for i := range data.Operations[:4] {
+		data.Operations[i].State = state.ApplyOperation.Failed
+		if i > 0 {
+			data.Operations[i].EndedBy = &presentation.OperationRef{Deployment: failed.Deployment, OperationKey: failed.OperationKey}
+		}
+	}
+	data.Operations[0].ErrorMessage = "resolve shard primary for -40: context deadline exceeded"
+	data.ErrorMessage = firstOperationError(data.Operations)
+	WriteProgress(data)
 }

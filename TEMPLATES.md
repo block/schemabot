@@ -9850,6 +9850,124 @@ schemabot apply -e production
 </details>
 
 <details>
+<summary><a name="summary-deferred-cutover-stopped-after-a-failure"></a><strong>Summary: Deferred Cutover Stopped After A Failure</strong></summary>
+
+
+## ❌ Schema Change Failed — Production
+
+<!-- schemabot:offer-support-channel -->
+**Apply ID**: `apply-a1b2c3d4e5f6`
+
+*Applied by @aparajon at 2026-01-01 00:00:00 UTC*
+
+**Deployments**: 1 failed, 2 stopped at cutover
+
+> ❌ **First failure:** <code>us</code> — lock wait timeout exceeded; try restarting transaction
+
+> ⏹️ 2 deployments stopped at the cutover because <code>us</code> failed. Their copies are saved, so applying again resumes them.
+
+- ⏹️ `eu` — stopped at cutover — us failed; copy saved
+- ❌ `us` — failed
+- ⏹️ `au` — stopped at cutover — us failed; copy saved
+
+<details open>
+<summary>⏹️ eu — stopped at cutover — us failed; copy saved</summary>
+<dl><dd>
+
+<!-- schemabot:offer-support-channel -->
+**Database**: `payments_eu`
+
+### ⏹️ testapp
+
+**`orders`** — Stopped
+```sql
+ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
+```
+
+**`users`** — Stopped
+```sql
+ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
+```
+
+**`products`** — Stopped
+```sql
+ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
+```
+
+
+</dd></dl>
+</details>
+
+<details open>
+<summary>❌ us — failed</summary>
+<dl><dd>
+
+<!-- schemabot:offer-support-channel -->
+**Database**: `payments_us`
+
+> ❌ **Error:** lock wait timeout exceeded; try restarting transaction
+
+1 of 3 tables completed before failure.
+
+### ❌ testapp
+
+**`users`** — Failed
+```sql
+ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
+```
+
+**`orders`** — Completed
+```sql
+ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
+```
+
+**`products`** — Cancelled
+```sql
+ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
+```
+
+
+</dd></dl>
+</details>
+
+<details open>
+<summary>⏹️ au — stopped at cutover — us failed; copy saved</summary>
+<dl><dd>
+
+<!-- schemabot:offer-support-channel -->
+**Database**: `payments_au`
+
+### ⏹️ testapp
+
+**`orders`** — Stopped
+```sql
+ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
+```
+
+**`users`** — Stopped
+```sql
+ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
+```
+
+**`products`** — Stopped
+```sql
+ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
+```
+
+
+</dd></dl>
+</details>
+
+---
+
+To retry once the failure above is resolved — a new apply reprocesses only the tables that haven't completed:
+```
+schemabot apply -e production
+```
+
+</details>
+
+<details>
 <summary><a name="engine-logs-fold-two-data-planes"></a><strong>Engine Logs Fold: Two Data Planes</strong></summary>
 
 
@@ -10341,6 +10459,47 @@ schemabot apply -e production
 </details>
 
 <details>
+<summary><a name="summary-deferred-cutover-stopped-after-a-shard-failed"></a><strong>Summary: Deferred Cutover Stopped After A Shard Failed</strong></summary>
+
+
+## ❌ Schema Change Failed — Production
+
+<!-- schemabot:offer-support-channel -->
+**Database**: `shop` | **Type**: `Strata` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Duration**: 28m
+
+*Applied by @jackjackbits at 2026-03-15 14:00:00 UTC*
+
+**Shards**: 1 failed, 3 stopped at cutover
+
+> ❌ **First failure:** shard <code>-40</code> — resolve shard primary for `-40`: context deadline exceeded
+
+> ⏹️ 3 shards stopped at the cutover because <code>-40</code> failed. Their copies are saved, so applying again resumes them.
+
+#### Keyspace `shop_sharded`
+
+**`mutes`**: ❌ Failed
+
+```sql
+ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
+```
+
+| Shard | Status |
+| --- | --- |
+| `-40` | ❌ failed — resolve shard primary for `-40`: context deadline exceeded |
+| `40-80` | ⏹️ stopped at cutover — -40 failed; copy saved |
+| `80-c0` | ⏹️ stopped at cutover — -40 failed; copy saved |
+| `c0-` | ⏹️ stopped at cutover — -40 failed; copy saved |
+
+---
+
+To retry:
+```
+schemabot apply -e production
+```
+
+</details>
+
+<details>
 <summary><a name="summary-cancelled-after-partial-landing"></a><strong>Summary: Cancelled After Partial Landing</strong></summary>
 
 
@@ -10500,6 +10659,53 @@ To retry once the failure above is resolved — a new apply reprocesses only the
 To stop this schema change:
   schemabot stop apply-multi-a1b2c3d4 -e production
 A new apply can retry the failure once this one finishes or is stopped; it reprocesses only the tables that haven't completed.
+
+```
+</details>
+
+<details>
+<summary><a name="deferred-cutover-stopped-after-a-failure"></a><strong>Deferred Cutover Stopped After A Failure</strong></summary>
+
+```
+
+┌───────────────────────────────────────────────────────┐
+│  Apply ID:     apply-multi-a1b2c3d4                   │
+│  Environment:  production                             │
+│  State:        failed                                 │
+│  Caller:       github:octocat                         │
+│  Source:       https://github.com/acme/shop/pull/412  │
+│  Started:      Jan 15 14:22:00 UTC                    │
+│  Duration:     7m                                     │
+│  Deployments:  1 failed · 2 stopped at cutover        │
+└───────────────────────────────────────────────────────┘
+
+  ❌ First failure: eu-west — lock wait timeout exceeded; try restarting transaction
+
+  ⏹️ 2 deployments stopped at the cutover because eu-west failed. Their copies are saved, so applying again resumes them.
+
+⏹️ us-east — stopped at cutover — eu-west failed; copy saved (orders-us-east)
+
+     ~ orders: 🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧 ⏹️ Stopped (was waiting for cutover)
+       ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL;
+       • Rows: 80,000 / 80,000
+
+
+❌ eu-west — failed (orders-eu-west)
+  lock wait timeout exceeded; try restarting transaction
+
+     ~ orders: 🟥🟥🟥🟥🟥🟥🟥🟥⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ❌ Failed
+       ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL;
+
+
+⏹️ ap-south — stopped at cutover — eu-west failed; copy saved (orders-ap-south)
+
+     ~ orders: 🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧 ⏹️ Stopped (was waiting for cutover)
+       ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL;
+       • Rows: 60,000 / 60,000
+
+
+To retry once the failure above is resolved — a new apply reprocesses only the tables that haven't completed:
+  schemabot apply -s <schema_dir> -e production
 
 ```
 </details>
@@ -10745,6 +10951,53 @@ To resume from where it stopped:
            ○ 40-80: cancelled
            ○ 80-c0: cancelled
            ○ c0-: cancelled
+    ~ VSchema (shop_001): Cancelled
+          "tables": {
+            "orders": {
+       +      "column_vindexes": [{"column": "customer_id", "name": "hash"}]
+            }
+          }
+
+
+To recover: Fix the issue above, then run a new apply.
+The new apply will only process tables that haven't completed.
+
+```
+</details>
+
+<details>
+<summary><a name="sharded-deferred-cutover-stopped-after-a-shard-failed"></a><strong>Sharded Deferred Cutover Stopped After A Shard Failed</strong></summary>
+
+```
+
+┌───────────────────────────────────────────────────────┐
+│  Apply ID:     apply-shard-e5f6a7b8                   │
+│  Database:     shop                                   │
+│  Environment:  production                             │
+│  State:        Failed                                 │
+│  Shards:       1 failed, 3 stopped at cutover         │
+│  Caller:       github:octocat                         │
+│  Source:       https://github.com/acme/shop/pull/412  │
+│  Options:      ⏸️ Defer Cutover                       │
+│  Started:      Jan 15 14:26:00 UTC                    │
+│  Duration:     1m                                     │
+└───────────────────────────────────────────────────────┘
+
+  shard -40: resolve shard primary for -40: context deadline exceeded
+
+  ⏹️ 3 shards stopped at the cutover because -40 failed. Their copies are saved, so applying again resumes them.
+
+
+  ── shop_001 ──
+
+     ~ orders: ⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ❌ Failed
+       ALTER TABLE `orders` ADD INDEX `idx_created_at`(`created_at`);
+
+       • Shards: 4 (1 failed, 3 stopped)
+           ✗ -40: failed
+           ○ 40-80: stopped at 100.00% · 1,466,232 / 1,466,232 rows
+           ○ 80-c0: stopped at 100.00% · 1,402,118 / 1,402,118 rows
+           ○ c0-: stopped at 100.00% · 1,389,004 / 1,389,004 rows
     ~ VSchema (shop_001): Cancelled
           "tables": {
             "orders": {

@@ -856,6 +856,30 @@ failed`. A table lists its targets while it is in flight on any of them or any o
 them stopped, even when another target's failure makes the table read as
 failed; any other table counts them on its own line.
 
+`ended_by` is set on a failed operation that did not fail on its own. Its
+apply deferred the cutover, which runs for every operation together, and
+another operation failed, so the cutover could never run. SchemaBot stopped
+the operations waiting at the cutover, saved their copies, and failed them.
+`ended_by` names the operation that failed, by `deployment` and
+`operation_key`. A new apply of the same change resumes from the saved
+copies. Response excerpt for `shop-002` failing while `shop-001` waited at
+the cutover:
+
+```json
+{
+  "state": "failed",
+  "operations": [
+    {"deployment": "commerce-a", "target": "shop-001", "operation_key": "shop-001", "state": "failed", "cutover_policy": "parallel", "ended_by": {"deployment": "commerce-a", "operation_key": "shop-002"}},
+    {"deployment": "commerce-a", "target": "shop-002", "operation_key": "shop-002", "state": "failed", "cutover_policy": "parallel", "error_message": "lock wait timeout exceeded; try restarting transaction"}
+  ]
+}
+```
+
+The CLI and the PR comment count such an operation as stopped at cutover, not
+failed: the CLI reads `1 failed · 1 stopped at cutover` and the PR comment
+`1 failed, 1 stopped at cutover`. Both name only `shop-002` as the first
+failure.
+
 </details>
 
 For event-based output while applying a rollout, use log mode:

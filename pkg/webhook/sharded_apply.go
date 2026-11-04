@@ -380,10 +380,18 @@ func isOperationFailureState(opState string) bool {
 // presentation.DeriveShards reads them.
 func shardStatusesByKeyspace(applyState string, groups []shardWorkGroup, released bool, tasksByOp map[int64][]*storage.Task) map[string][]templates.ShardStatus {
 	work := make([]presentation.ShardWork, 0, len(groups))
+	var all []*storage.ApplyOperation
+	for _, g := range groups {
+		all = append(all, g.ops...)
+	}
+	endedBy := endedByRefs(all)
 	for _, g := range groups {
 		sw := presentation.ShardWork{Keyspace: g.namespace, Shard: g.shard}
 		for _, op := range g.ops {
 			sw.Operations = append(sw.Operations, presentation.Operation{
+				Deployment:        op.Deployment,
+				OperationKey:      op.OperationKey,
+				EndedBy:           endedBy[op.ID],
 				State:             op.State,
 				Barrier:           op.CutoverPolicy == storage.CutoverPolicyBarrier,
 				Parallel:          op.CutoverPolicy == storage.CutoverPolicyParallel,
@@ -398,11 +406,13 @@ func shardStatusesByKeyspace(applyState string, groups []shardWorkGroup, release
 	out := make(map[string][]templates.ShardStatus, len(groups))
 	for _, s := range presentation.DeriveShards(applyState, work) {
 		out[s.Keyspace] = append(out[s.Keyspace], templates.ShardStatus{
-			Shard: s.Shard,
-			Emoji: s.Emoji,
-			Label: s.Label,
-			State: s.State,
-			Error: s.Error,
+			Shard:            s.Shard,
+			Emoji:            s.Emoji,
+			Label:            s.Label,
+			State:            s.State,
+			Error:            s.Error,
+			StoppedAtCutover: s.Presentation == presentation.StateStoppedAtCutover,
+			EndedBy:          s.EndedBy,
 		})
 	}
 	return out

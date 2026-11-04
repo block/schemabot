@@ -1252,3 +1252,26 @@ func TestRenderShardedApplyComment_PhaseBarSpansEveryShard(t *testing.T) {
 	assert.Contains(t, out, "**`orders`**: "+ui.ProgressBarRowCopy(25)+" 25%\n", "%s", out)
 	assert.Contains(t, out, "- Rows: 1,000 / 1,000 across 1 of 4 shards\n", "%s", out)
 }
+
+// A sharded apply across two keyspaces deferred its cutover. Shard -80 of
+// the second keyspace failed, so SchemaBot stopped the first keyspace's
+// shard at the cutover. The first failure names the shard that failed, not
+// the stopped shard listed before it, and the note under it explains the
+// stopped shard.
+func TestRenderShardedApplySummary_FirstFailureSkipsShardsStoppedAtCutover(t *testing.T) {
+	got := RenderShardedApplySummaryComment(ShardedApplyData{
+		State: state.Apply.Failed, Environment: "production", Database: "shop",
+		Keyspaces: []ShardedKeyspace{
+			{Keyspace: "shop_a", Shards: []ShardStatus{
+				{Shard: "-", Emoji: "⏹️", Label: "stopped at cutover — shop_b/-80 failed; copy saved", State: state.ApplyOperation.Failed, StoppedAtCutover: true, EndedBy: "shop_b/-80"},
+			}},
+			{Keyspace: "shop_b", Shards: []ShardStatus{
+				{Shard: "-80", Emoji: "❌", Label: "failed", State: state.ApplyOperation.Failed, Error: "duplicate key name"},
+			}},
+		},
+	})
+
+	assert.Contains(t, got, "**First failure:** shard <code>-80</code> — duplicate key name")
+	assert.NotContains(t, got, "**First failure:** shard <code>-</code>")
+	assert.Contains(t, got, "> ⏹️ 1 shard stopped at the cutover because <code>shop_b/-80</code> failed. Its copy is saved, so applying again resumes it.")
+}

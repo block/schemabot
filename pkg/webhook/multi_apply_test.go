@@ -439,3 +439,24 @@ func TestGroupTasksByOperation_SkipsUnlinkedTasks(t *testing.T) {
 	require.Len(t, grouped[1], 2)
 	assert.Len(t, grouped, 1)
 }
+
+// A rollout deferred its cutover and us failed, so SchemaBot stopped eu and
+// au at the cutover and failed them for us (ended_by_operation_id). The
+// comment's model reads eu and au as stopped at cutover naming us, and us
+// alone as the first failure, although eu comes first.
+func TestDeriveApplyPresentation_StoppedAtCutoverNamesTheFailedRow(t *testing.T) {
+	ops := []*storage.ApplyOperation{
+		{ID: 11, Deployment: "eu", State: state.ApplyOperation.Failed, CutoverPolicy: storage.CutoverPolicyParallel, EndedByOperationID: 12},
+		{ID: 12, Deployment: "us", State: state.ApplyOperation.Failed, CutoverPolicy: storage.CutoverPolicyParallel, ErrorMessage: "lock wait timeout exceeded"},
+		{ID: 13, Deployment: "au", State: state.ApplyOperation.Failed, CutoverPolicy: storage.CutoverPolicyParallel, EndedByOperationID: 12},
+	}
+
+	model := deriveApplyPresentation(state.Apply.Failed, ops, nil, false)
+
+	require.Len(t, model.Deployments, 3)
+	assert.Equal(t, "stopped at cutover — us failed; copy saved", model.Deployments[0].Label)
+	assert.Equal(t, "failed", model.Deployments[1].Label)
+	assert.Equal(t, "stopped at cutover — us failed; copy saved", model.Deployments[2].Label)
+	require.NotNil(t, model.FirstFailure)
+	assert.Equal(t, "us", model.FirstFailure.Name)
+}

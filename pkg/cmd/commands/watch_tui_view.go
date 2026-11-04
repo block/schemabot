@@ -131,6 +131,9 @@ func (m WatchModel) progressSections() (string, string) {
 		if counts := templates.ShardCounts(m.state, m.operations, m.tables, m.released); counts != "" {
 			fmt.Fprintf(&b, "  Shards:  %s\n", counts)
 		}
+		if note := templates.ShardsStoppedAtCutoverNote(m.state, m.operations, m.tables, m.released); note != "" {
+			fmt.Fprintf(&b, "  ⏹️ %s\n", note)
+		}
 	}
 
 	// Keep the PlanetScale deploy request link visible throughout the apply,

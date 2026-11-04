@@ -3324,6 +3324,49 @@ func PreviewCommentMultiDeploymentApplySummaryFailed() string {
 	})
 }
 
+// PreviewCommentMultiDeploymentApplySummaryStoppedAtCutover renders the final
+// summary comment for a rollout that deferred its cutover across three
+// deployments. us failed while eu and au had copied and waited at the
+// cutover, which could then never run for all three, so SchemaBot stopped eu
+// and au, saved their copies, and failed the apply. The first failure names
+// us alone, and a note says the stopped deployments resume on a new apply.
+func PreviewCommentMultiDeploymentApplySummaryStoppedAtCutover() string {
+	endedByUS := &presentation.OperationRef{Deployment: "us"}
+	model := presentation.Derive([]presentation.Operation{
+		{Deployment: "eu", State: state.ApplyOperation.Failed, Parallel: true, EndedBy: endedByUS},
+		{Deployment: "us", State: state.ApplyOperation.Failed, Parallel: true, Error: PreviewErrorMiddleFailed},
+		{Deployment: "au", State: state.ApplyOperation.Failed, Parallel: true, EndedBy: endedByUS},
+	})
+
+	stoppedTables := func() []TableProgressData {
+		tables := sampleApplyTables()
+		for i := range tables {
+			tables[i].Status = state.Task.Stopped
+		}
+		return tables
+	}
+	usTables := sampleApplyTables()
+	usTables[0].Status = state.Task.Completed
+	usTables[1].Status = state.Task.Failed
+	usTables[2].Status = state.Task.Cancelled
+	usDetail := sampleDeploymentDetail("payments_us", state.Apply.Failed, usTables)
+	usDetail.ErrorMessage = PreviewErrorMiddleFailed
+
+	return RenderMultiDeploymentApplySummaryComment(MultiDeploymentApplyData{
+		Model:       model,
+		ApplyID:     "apply-a1b2c3d4e5f6",
+		Environment: "production",
+		RequestedBy: "aparajon",
+		StartedAt:   sampleTime().Add(-20 * time.Minute).UTC().Format(time.RFC3339),
+		CompletedAt: sampleTime().Add(-1 * time.Minute).UTC().Format(time.RFC3339),
+		Details: []*ApplyStatusCommentData{
+			sampleDeploymentDetail("payments_eu", state.Apply.Failed, stoppedTables()),
+			usDetail,
+			sampleDeploymentDetail("payments_au", state.Apply.Failed, stoppedTables()),
+		},
+	})
+}
+
 // =============================================================================
 // Single-Table Apply Previews (most common case)
 // =============================================================================

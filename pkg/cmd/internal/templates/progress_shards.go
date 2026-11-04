@@ -10,6 +10,35 @@ import (
 // every keyspace runs on its only shard, which needs no count. The shards of
 // an apply in applyState read as presentation.DeriveShards reads them.
 func ShardCounts(applyState string, ops []ProgressOperation, tables []TableProgress, released bool) string {
+	statuses, ok := shardStatuses(applyState, ops, tables, released)
+	if !ok {
+		return ""
+	}
+	labels := make([]string, 0, len(statuses))
+	for _, s := range statuses {
+		labels = append(labels, s.Label)
+	}
+	return presentation.ShardCounts(labels)
+}
+
+// ShardsStoppedAtCutoverNote explains the shards of a sharded apply that
+// SchemaBot stopped at the cutover because another shard failed, and that
+// applying again resumes their saved copies, or "" when no shard was stopped
+// at the cutover.
+func ShardsStoppedAtCutoverNote(applyState string, ops []ProgressOperation, tables []TableProgress, released bool) string {
+	statuses, _ := shardStatuses(applyState, ops, tables, released)
+	var stopped presentation.StoppedAtCutover
+	for _, s := range statuses {
+		if s.Presentation == presentation.StateStoppedAtCutover {
+			stopped.Add(s.EndedBy)
+		}
+	}
+	return stopped.Note(presentation.ShardNoun, func(name string) string { return name })
+}
+
+// shardStatuses derives one status per keyspace shard of the apply's shard
+// work. It reports false when every keyspace runs on its only shard.
+func shardStatuses(applyState string, ops []ProgressOperation, tables []TableProgress, released bool) ([]presentation.ShardStatus, bool) {
 	type keyspaceShard struct{ keyspace, shard string }
 	index := make(map[keyspaceShard]int)
 	var work []presentation.ShardWork
@@ -32,12 +61,7 @@ func ShardCounts(applyState string, ops []ProgressOperation, tables []TableProgr
 		work[j].Operations = append(work[j].Operations, op)
 	}
 	if !sharded {
-		return ""
+		return nil, false
 	}
-	statuses := presentation.DeriveShards(applyState, work)
-	labels := make([]string, 0, len(statuses))
-	for _, s := range statuses {
-		labels = append(labels, s.Label)
-	}
-	return presentation.ShardCounts(labels)
+	return presentation.DeriveShards(applyState, work), true
 }

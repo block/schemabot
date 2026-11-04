@@ -125,6 +125,16 @@ type Operation struct {
 	// needs attention.
 	ExternalID          string
 	ExternalOperationID string
+
+	// EndedBy is set on a failed row that did not fail on its own: it waited
+	// at a deferred cutover that another row's end meant could never run, so
+	// SchemaBot stopped it, saved its copy, and failed it for that row. It
+	// names the row that ended, and reads as stopped at cutover rather than
+	// failed.
+	EndedBy *OperationRef
+
+	// endedByName is the member name EndedBy resolves to, set by Derive.
+	endedByName string
 }
 
 // continuesPastFailure reports whether a terminal-failed earlier sibling stops
@@ -182,6 +192,10 @@ const (
 	// StateResuming is a stopped member a start has claimed again; its drive
 	// is picking the work back up.
 	StateResuming
+	// StateStoppedAtCutover is a member SchemaBot stopped at a deferred
+	// cutover once another member's failure meant the cutover could never
+	// run. Its copy is saved for a new apply to resume.
+	StateStoppedAtCutover
 
 	// presentationStateCount is one past the last state, so a test can visit
 	// every state and fail when a new one has no histogram category.
@@ -241,6 +255,11 @@ type Deployment struct {
 	// AlreadyConverged is whether the member's operation was recorded as a
 	// target that already held the change when the apply was created.
 	AlreadyConverged bool
+
+	// EndedBy names the member whose failure stopped this one at the
+	// cutover, when its status is StateStoppedAtCutover. Empty when that
+	// member is not among the apply's operations.
+	EndedBy string
 
 	// Rows are the indexes, into the operations Derive was given, of the rows
 	// this member's work spans, in input order. Row is the one that speaks for
@@ -415,7 +434,7 @@ func (a Apply) group(deployment string, members []int) Group {
 // than with a stopped member that invites a second one.
 var attentionOrder = []PresentationState{
 	StateFailed, StateRetrying, StatePaused, StateHalted, StateResuming, StateStopped,
-	StateReadyForCutoverNext, StateCuttingOver, StateRunningCopy, StateRevertWindow,
+	StateStoppedAtCutover, StateReadyForCutoverNext, StateCuttingOver, StateRunningCopy, StateRevertWindow,
 	StateReadyForCutoverWaiting, StateWaiting, StateQueuedNext,
 	StateCancelled, StateReverted, StateCompleted, StateAlreadyApplied,
 }
@@ -473,6 +492,7 @@ func Derive(ops []Operation) Apply {
 		}
 	}
 	names := memberNames(members)
+	resolveEndedBy(ops, members, names, memberOf)
 	deployments := make([]Deployment, len(members))
 	for j := range members {
 		deployments[j] = deriveDeployment(members, names, j)
@@ -553,7 +573,8 @@ func ResumeClaimed(applyState string, ops []Operation) []Operation {
 // failed a later table comes after one that failed an earlier one. memberOf
 // maps each row to its deployment. failed_retryable
 // is excluded: a retrying deployment is still in progress and surfaces no
-// operator-facing failure. The result is a copy, not an alias into Deployments,
+// operator-facing failure. So is a member stopped at the cutover for another
+// member's failure: the failure it names is that member's. The result is a copy, not an alias into Deployments,
 // so a caller that later re-slices or sorts Deployments cannot turn it into a
 // stale pointer.
 func firstFailure(ops []Operation, deps []Deployment, memberOf []int) *Deployment {
@@ -561,7 +582,7 @@ func firstFailure(ops []Operation, deps []Deployment, memberOf []int) *Deploymen
 		if op.State != state.ApplyOperation.Failed {
 			continue
 		}
-		if failed := deps[memberOf[i]]; failed.State == state.ApplyOperation.Failed {
+		if failed := deps[memberOf[i]]; failed.Presentation == StateFailed {
 			return &failed
 		}
 	}
@@ -604,6 +625,11 @@ func deriveDeployment(ops []Operation, names []string, i int) Deployment {
 	case state.ApplyOperation.CuttingOver:
 		d.set(StateCuttingOver, "cutting over", "🔁", true)
 	case state.ApplyOperation.Failed:
+		if op.EndedBy != nil {
+			d.EndedBy = op.endedByName
+			d.set(StateStoppedAtCutover, stoppedAtCutoverLabel(op.endedByName), "⏹️", true)
+			break
+		}
 		d.set(StateFailed, "failed", glyph.Failed, true)
 	case state.ApplyOperation.FailedRetryable:
 		d.set(StateRetrying, "retrying", "🔁", true)
@@ -1103,6 +1129,7 @@ var summaryCategoryOrder = []struct {
 	{"failed", []PresentationState{StateFailed}},
 	{"retrying", []PresentationState{StateRetrying}},
 	{"stopped", []PresentationState{StateStopped}},
+	{StoppedAtCutoverLabel, []PresentationState{StateStoppedAtCutover}},
 	{"in revert window", []PresentationState{StateRevertWindow}},
 	{"cancelled", []PresentationState{StateCancelled}},
 	{"reverted", []PresentationState{StateReverted}},
@@ -1222,7 +1249,7 @@ func (a Apply) TargetProgress(g Group) TargetProgress {
 // run again. Every other status, an unknown one included, can still change.
 func (s PresentationState) final() bool {
 	switch s {
-	case StateCompleted, StateAlreadyApplied, StateFailed, StateHalted, StateCancelled, StateReverted:
+	case StateCompleted, StateAlreadyApplied, StateFailed, StateStoppedAtCutover, StateHalted, StateCancelled, StateReverted:
 		return true
 	default:
 		return false

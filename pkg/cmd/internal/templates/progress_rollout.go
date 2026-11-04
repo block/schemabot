@@ -110,6 +110,15 @@ func RolloutCoverage(model presentation.Apply, groups []presentation.Group) stri
 	return presentation.CoveragePhrase(rolloutNoun(label), n, n)
 }
 
+// RolloutStoppedAtCutoverNote explains the rollout's members that SchemaBot
+// stopped at the cutover because another member failed, and that applying
+// again resumes their saved copies, or "" when none was stopped at the
+// cutover. It names the members as the rollout's counts do.
+func RolloutStoppedAtCutoverNote(model presentation.Apply, groups []presentation.Group) string {
+	noun := rolloutNoun(RolloutCountsUnit(groups))
+	return presentation.StoppedAtCutoverOf(model.Deployments).Note(noun, func(name string) string { return name })
+}
+
 // rolloutNoun is the noun for what RolloutCountsUnit's label counts.
 func rolloutNoun(label string) presentation.Noun {
 	if label == "Targets" {
