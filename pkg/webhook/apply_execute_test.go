@@ -824,16 +824,16 @@ func TestRolloutShapeRefusalMessage(t *testing.T) {
 func TestDispatchErrorMessageNamesDeferredCutoverCapacity(t *testing.T) {
 	tooWide := &api.DeferredCutoverCapacityError{Database: "commerce", Environment: "production", Operations: 128, Drivers: 84, LiveServers: 12}
 	assert.Equal(t,
-		"This apply can't defer its cutover: it would keep 128 drivers waiting until you cut over, and SchemaBot's servers have 84 drivers that can wait. Run `schemabot apply -e production --tenant acme` without `--defer-cutover`.",
+		"This apply can't defer its cutover: it would keep 128 drivers waiting for the cutover, and SchemaBot's servers have 84 drivers that can wait. To defer it, give the servers 44 more by raising `drivers` or running more servers. Otherwise run `schemabot apply -e production --tenant acme` without `--defer-cutover`.",
 		deferredCutoverCapacityMessage(tooWide, action.ApplyConfirm, "production", "acme"))
 	assert.Equal(t,
-		"This apply can't defer its cutover: it would keep 128 drivers waiting until you cut over, and SchemaBot's servers have 84 drivers that can wait. Run `schemabot apply -e production` without `--defer-cutover`.",
+		"This apply can't defer its cutover: it would keep 128 drivers waiting for the cutover, and SchemaBot's servers have 84 drivers that can wait. To defer it, give the servers 44 more by raising `drivers` or running more servers. Otherwise run `schemabot apply -e production` without `--defer-cutover`.",
 		applyExecutionErrorMessage(action.Apply, "production", "", tooWide))
 
 	overCap := &api.DeferredCutoverCapacityError{Database: "commerce", Environment: "production", Operations: 128, PerApplyCap: 2}
 	msg := applyExecutionErrorMessage(action.ApplyConfirm, "production", "", overCap)
 	assert.Equal(t,
-		"This apply can't defer its cutover: it would keep 128 drivers waiting until you cut over, and one apply can use at most 2 (`max_drivers_per_apply`). Run `schemabot apply -e production` without `--defer-cutover`, or raise `max_drivers_per_apply` to 128.",
+		"This apply can't defer its cutover: it would keep 128 drivers waiting for the cutover, and one apply can use at most 2 (`max_drivers_per_apply`). To defer it, raise `max_drivers_per_apply` to 128. Otherwise run `schemabot apply -e production` without `--defer-cutover`.",
 		msg)
 	assert.NotContains(t, msg, "apply-confirm")
 
@@ -843,6 +843,6 @@ func TestDispatchErrorMessageNamesDeferredCutoverCapacity(t *testing.T) {
 		deferredCutoverCapacityMessage(unreported, action.ApplyConfirm, "production", ""))
 
 	assert.Equal(t,
-		"This rollback can't defer its cutover: it would keep 128 drivers waiting until you cut over, and SchemaBot's servers have 84 drivers that can wait. Run `schemabot rollback-confirm -e production` without `--defer-cutover`.",
+		"This rollback can't defer its cutover: it would keep 128 drivers waiting for the cutover, and SchemaBot's servers have 84 drivers that can wait. To defer it, give the servers 44 more by raising `drivers` or running more servers. Otherwise run `schemabot rollback-confirm -e production` without `--defer-cutover`.",
 		deferredCutoverCapacityMessage(tooWide, action.RollbackConfirm, "production", ""))
 }

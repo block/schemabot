@@ -956,14 +956,14 @@ func deferredCutoverCapacityMessage(refused *api.DeferredCutoverCapacityError, c
 	rerun := templates.TenantCommand("schemabot "+rerunCommand, environment, tenant)
 	switch {
 	case refused.ExceedsPerApplyCap():
-		return fmt.Sprintf("This %s can't defer its cutover: it would keep %d drivers waiting until you cut over, and one apply can use at most %d (`max_drivers_per_apply`). Run `%s` without `--defer-cutover`, or raise `max_drivers_per_apply` to %d.",
-			work, refused.Operations, refused.PerApplyCap, rerun, refused.Operations)
+		return fmt.Sprintf("This %s can't defer its cutover: it would keep %d drivers waiting for the cutover, and one apply can use at most %d (`max_drivers_per_apply`). To defer it, raise `max_drivers_per_apply` to %d. Otherwise run `%s` without `--defer-cutover`.",
+			work, refused.Operations, refused.PerApplyCap, refused.Operations, rerun)
 	case refused.NoLiveServers():
 		return fmt.Sprintf("This %s can't defer its cutover yet: no SchemaBot server has reported its drivers in the last %s. Try again in a minute, or run `%s` without `--defer-cutover`.",
 			work, api.LiveWindowText(), rerun)
 	default:
-		return fmt.Sprintf("This %s can't defer its cutover: it would keep %d drivers waiting until you cut over, and SchemaBot's servers have %d drivers that can wait. Run `%s` without `--defer-cutover`.",
-			work, refused.Operations, refused.Drivers, rerun)
+		return fmt.Sprintf("This %s can't defer its cutover: it would keep %d drivers waiting for the cutover, and SchemaBot's servers have %d drivers that can wait. To defer it, give the servers %d more by raising `drivers` or running more servers. Otherwise run `%s` without `--defer-cutover`.",
+			work, refused.Operations, refused.Drivers, refused.Operations-refused.Drivers, rerun)
 	}
 }
 

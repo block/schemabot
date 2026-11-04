@@ -64,14 +64,14 @@ func (e *DeferredCutoverCapacityError) Transient() bool {
 func (e *DeferredCutoverCapacityError) Error() string {
 	switch {
 	case e.ExceedsPerApplyCap():
-		return fmt.Sprintf("%s/%s can't defer its cutover: it would keep %d drivers waiting until you cut over, and one apply can use at most %d (max_drivers_per_apply). Apply without --defer-cutover, or raise max_drivers_per_apply to %d",
+		return fmt.Sprintf("%s/%s can't defer its cutover: it would keep %d drivers waiting for the cutover, and one apply can use at most %d (max_drivers_per_apply). To defer it, raise max_drivers_per_apply to %d; otherwise apply without --defer-cutover",
 			e.Database, e.Environment, e.Operations, e.PerApplyCap, e.Operations)
 	case e.NoLiveServers():
 		return fmt.Sprintf("%s/%s can't defer its cutover yet: no SchemaBot server has reported its drivers in the last %s. Try again shortly, or apply without --defer-cutover",
 			e.Database, e.Environment, LiveWindowText())
 	default:
-		return fmt.Sprintf("%s/%s can't defer its cutover: it would keep %d drivers waiting until you cut over, and SchemaBot's servers have %d. Apply without --defer-cutover",
-			e.Database, e.Environment, e.Operations, e.Drivers)
+		return fmt.Sprintf("%s/%s can't defer its cutover: it would keep %d drivers waiting for the cutover, and SchemaBot's servers have %d drivers that can wait. To defer it, give the servers %d more by raising drivers or running more servers; otherwise apply without --defer-cutover",
+			e.Database, e.Environment, e.Operations, e.Drivers, e.Operations-e.Drivers)
 	}
 }
 
