@@ -193,6 +193,27 @@ func TestLocalClient_BatchProgressAnswersAnUnknownOperationWithItsOwnError(t *te
 	assert.Contains(t, unknown.ErrorMessage, "apply_operation 99 does not exist")
 }
 
+// A batch entry with no operation id is refused with InvalidArgument rather
+// than answered for the whole apply, which would report every member's work as
+// one member's. The members the call does name are still answered.
+func TestLocalClient_BatchProgressRefusesAnEntryWithNoOperation(t *testing.T) {
+	fx := newSharedApplyFixture(state.ApplyOperation.Running, state.ApplyOperation.Running, state.Task.Running, state.Task.Running)
+
+	batch, err := fx.client.BatchProgress(t.Context(), batchProgressRequest(fx, "12", ""))
+	require.NoError(t, err)
+	require.Len(t, batch.Operations, 2)
+
+	require.NotNil(t, batch.Operations[0].Progress)
+	assert.Equal(t, "12", batch.Operations[0].Progress.ApplyOperationId)
+
+	empty := batch.Operations[1]
+	assert.Empty(t, empty.ApplyOperationId)
+	assert.Nil(t, empty.Progress, "no answer carries the whole apply's tables")
+	assert.Equal(t, int32(codes.InvalidArgument), empty.ErrorCode)
+	assert.Contains(t, empty.ErrorMessage, "apply_operation_id is required for each entry")
+	assert.Contains(t, empty.ErrorMessage, fx.apply.ApplyIdentifier)
+}
+
 // An apply the data plane does not know fails the whole call NotFound, the
 // same code a Progress request for it gets, so every member's drive takes the
 // missing remote apply path it takes today.

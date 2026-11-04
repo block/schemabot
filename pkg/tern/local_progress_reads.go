@@ -158,7 +158,10 @@ func (r *progressReads) settledControlRequests(ctx context.Context, c *LocalClie
 // BatchProgress answers Progress for each operation the request names, from
 // one read of the apply, its tasks, and its operations. Each entry carries
 // what Progress scoped to that operation returns, or the error it fails with;
-// an error reading the apply itself fails the call.
+// an error reading the apply itself fails the call. An empty id is refused
+// for its entry alone: Progress without an operation answers for the whole
+// apply, so honoring one here would report every member's work as the
+// caller's own member's.
 func (c *LocalClient) BatchProgress(ctx context.Context, req *ternv1.BatchProgressRequest) (*ternv1.BatchProgressResponse, error) {
 	if req.GetApplyId() == "" {
 		return nil, fmt.Errorf("apply_id is required")
@@ -176,6 +179,14 @@ func (c *LocalClient) BatchProgress(ctx context.Context, req *ternv1.BatchProgre
 	}
 	for _, applyOperationID := range req.GetApplyOperationIds() {
 		entry := &ternv1.OperationProgress{ApplyOperationId: applyOperationID}
+		if applyOperationID == "" {
+			c.logger.Warn("batch progress: answering an entry with no apply_operation_id with INVALID_ARGUMENT instead of the whole apply's progress",
+				reads.apply.LogAttrs()...)
+			entry.ErrorCode = int32(codes.InvalidArgument)
+			entry.ErrorMessage = fmt.Sprintf("batch progress for apply %s: apply_operation_id is required for each entry; ask Progress without one for the whole apply", reads.apply.ApplyIdentifier)
+			resp.Operations = append(resp.Operations, entry)
+			continue
+		}
 		progress, err := c.progressFromReads(ctx, reads, applyOperationID)
 		if err != nil {
 			c.logger.Warn("batch progress: answering one operation with the error its own progress request would fail with",
