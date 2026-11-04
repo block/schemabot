@@ -601,13 +601,14 @@ func TestShouldPublishSeparateSummaryAlwaysTrueForAggregateWinner(t *testing.T) 
 
 // leaseCheckApplyStore records CheckLease calls and returns a configured
 // error, standing in for the ownership re-check before GitHub side effects.
-// fresh serves the progress-comment authority gate's re-read of the row for
-// tests that reach it.
+// fresh (or getErr) serves the re-reads of the row that follow a failed check:
+// the own-lease takeover decision and the progress-comment authority gate.
 type leaseCheckApplyStore struct {
 	storage.ApplyStore
-	err   error
-	calls int
-	fresh *storage.Apply
+	err    error
+	calls  int
+	fresh  *storage.Apply
+	getErr error
 }
 
 func (s *leaseCheckApplyStore) CheckLease(context.Context, storage.ApplyLease) error {
@@ -616,16 +617,31 @@ func (s *leaseCheckApplyStore) CheckLease(context.Context, storage.ApplyLease) e
 }
 
 func (s *leaseCheckApplyStore) Get(context.Context, int64) (*storage.Apply, error) {
-	return s.fresh, nil
+	return s.fresh, s.getErr
+}
+
+// authorityClaimStore grants every progress-comment authority claim and counts
+// them, so a test can tell the authority path decided the side effect.
+type authorityClaimStore struct {
+	storage.ApplyCommentStore
+	claims int
+}
+
+func (s *authorityClaimStore) ClaimProgressCommentAuthority(context.Context, int64, string) (bool, error) {
+	s.claims++
+	return true, nil
 }
 
 type leaseCheckStorage struct {
 	storage.Storage
-	applies *leaseCheckApplyStore
-	ops     storage.ApplyOperationStore
+	applies  *leaseCheckApplyStore
+	ops      storage.ApplyOperationStore
+	comments storage.ApplyCommentStore
 }
 
 func (s *leaseCheckStorage) Applies() storage.ApplyStore { return s.applies }
+
+func (s *leaseCheckStorage) ApplyComments() storage.ApplyCommentStore { return s.comments }
 
 func (s *leaseCheckStorage) ApplyOperations() storage.ApplyOperationStore { return s.ops }
 
@@ -651,16 +667,16 @@ func leaseLostErr() error {
 // re-reporting the same expected handover on every progress tick.
 func TestObserverSupersededByNewerOwnerWarnsOnceAndLatches(t *testing.T) {
 	logger := &capturingLogger{}
-	store := &leaseCheckApplyStore{err: leaseLostErr()}
-	observer := newLeaseCheckObserver(logger, store, storage.ApplyLease{
-		ApplyID: 7, Owner: "host-a/1/driver-0", Token: "token-old",
-	})
 	// The row carries the newer owner's lease — a takeover replaces the lease,
 	// it never leaves the row unleased.
 	apply := &storage.Apply{
 		ID: 7, ApplyIdentifier: "apply-abc123", Database: "mydb", Environment: "staging",
 		State: state.Apply.Running, LeaseOwner: "host-b/2/driver-1", LeaseToken: "token-new",
 	}
+	store := &leaseCheckApplyStore{err: leaseLostErr(), fresh: apply}
+	observer := newLeaseCheckObserver(logger, store, storage.ApplyLease{
+		ApplyID: 7, Owner: "host-a/1/driver-0", Token: "token-old",
+	})
 
 	assert.False(t, observer.leaseStillOwnsObserver(apply, "progress"),
 		"a superseded lease must fail the side-effect check")
@@ -670,6 +686,7 @@ func TestObserverSupersededByNewerOwnerWarnsOnceAndLatches(t *testing.T) {
 	fields := fieldsOf(t, logger.warns[0].args)
 	assert.Equal(t, "apply-abc123", fields["apply_id"])
 	assert.Equal(t, "host-a/1/driver-0", fields["lease_owner"])
+	assert.Equal(t, "host-b/2/driver-1", fields["new_lease_owner"])
 
 	assert.False(t, observer.leaseStillOwnsObserver(apply, "progress"))
 	assert.False(t, observer.leaseStillOwnsObserver(apply, "terminal"))
@@ -714,6 +731,90 @@ func TestObserverReleasedBackLeaseDefersToAuthorityWithoutLatch(t *testing.T) {
 	assert.Empty(t, logger.errors)
 	require.NotEmpty(t, logger.debugs)
 	assert.Contains(t, logger.debugs[len(logger.debugs)-1].msg, "parent apply lease re-claimed")
+}
+
+// The callback's apply snapshot can be a tick old. When it still shows the
+// observer's own lease but the parent lease was released between the snapshot
+// and the check, the lease check fails even though no driver took the apply
+// over. The observer decides from a fresh read of the row, finds it unleased,
+// and hands the side effect to the progress-comment authority, so the release
+// never silences it for the rest of the apply.
+func TestObserverReleaseAfterSnapshotDefersToAuthorityWithoutLatch(t *testing.T) {
+	logger := &capturingLogger{}
+	ownLease := storage.ApplyLease{ApplyID: 7, Owner: "host-a/1/driver-0", Token: "token-wave"}
+	store := &leaseCheckApplyStore{
+		err:   leaseLostErr(),
+		fresh: &storage.Apply{ID: 7, ApplyIdentifier: "apply-abc123", State: state.Apply.Running},
+	}
+	comments := &authorityClaimStore{}
+	observer := NewCommentObserver(CommentObserverConfig{
+		Repo:       "org/repo",
+		PR:         42,
+		ApplyID:    7,
+		ApplyLease: ownLease,
+		Logger:     logger,
+		Storage: &leaseCheckStorage{
+			applies:  store,
+			ops:      &stubApplyOperationStore{ops: inFlightKeyedOps()},
+			comments: comments,
+		},
+	})
+	snapshot := &storage.Apply{
+		ID: 7, ApplyIdentifier: "apply-abc123", Database: "mydb", Environment: "staging",
+		State: state.Apply.Running, LeaseOwner: ownLease.Owner, LeaseToken: ownLease.Token,
+	}
+
+	assert.True(t, observer.leaseStillOwnsObserver(snapshot, "progress"),
+		"the progress-comment authority decides a released lease")
+	assert.False(t, observer.Superseded(), "a release seen only on the fresh row must not latch")
+	assert.Equal(t, 1, comments.claims, "the authority path claimed the comment")
+	assert.Empty(t, logger.warns)
+	assert.Empty(t, logger.errors)
+}
+
+// A failed check of the observer's own lease is only a takeover when a fresh
+// read proves another driver holds the apply. When that read fails or still
+// shows the observer's own lease, nothing is proven: the side effect is
+// skipped and the latch stays unset, so the next check decides again.
+func TestObserverOwnLeaseLossWithoutProofDoesNotLatch(t *testing.T) {
+	ownLease := storage.ApplyLease{ApplyID: 7, Owner: "host-a/1/driver-0", Token: "token-old"}
+	snapshot := &storage.Apply{
+		ID: 7, ApplyIdentifier: "apply-abc123", Database: "mydb", Environment: "staging",
+		State: state.Apply.Running, LeaseOwner: ownLease.Owner, LeaseToken: ownLease.Token,
+	}
+
+	t.Run("the re-read fails", func(t *testing.T) {
+		logger := &capturingLogger{}
+		store := &leaseCheckApplyStore{err: leaseLostErr(), getErr: errors.New("connection refused")}
+		observer := newLeaseCheckObserver(logger, store, ownLease)
+
+		assert.False(t, observer.leaseStillOwnsObserver(snapshot, "progress"))
+		assert.False(t, observer.Superseded())
+		require.Len(t, logger.errors, 1)
+		assert.Contains(t, logger.errors[0].msg, "could not be re-read")
+	})
+
+	t.Run("the row is gone", func(t *testing.T) {
+		logger := &capturingLogger{}
+		store := &leaseCheckApplyStore{err: leaseLostErr()}
+		observer := newLeaseCheckObserver(logger, store, ownLease)
+
+		assert.False(t, observer.leaseStillOwnsObserver(snapshot, "progress"))
+		assert.False(t, observer.Superseded())
+		require.Len(t, logger.warns, 1)
+		assert.Contains(t, logger.warns[0].msg, "apply row not found")
+	})
+
+	t.Run("the fresh row still carries the observer's lease", func(t *testing.T) {
+		logger := &capturingLogger{}
+		store := &leaseCheckApplyStore{err: leaseLostErr(), fresh: snapshot}
+		observer := newLeaseCheckObserver(logger, store, ownLease)
+
+		assert.False(t, observer.leaseStillOwnsObserver(snapshot, "progress"))
+		assert.False(t, observer.Superseded())
+		require.Len(t, logger.warns, 1)
+		assert.Contains(t, logger.warns[0].msg, "still carries this observer's lease")
+	})
 }
 
 // An observer constructed without its own lease borrows the lease from the
