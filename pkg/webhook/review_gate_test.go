@@ -53,6 +53,18 @@ func TestReviewGateErrorDetailGeneric(t *testing.T) {
 	assert.NotContains(t, detail, "GitHub App can read organization members")
 }
 
+// changedDDLLookupFailedLog is the warning the review gate logs when it cannot
+// work out the DDL an approved commit runs for a changed schema file.
+const changedDDLLookupFailedLog = "cannot work out the DDL the approved commit runs"
+
+// unparseableApprovedOrders is a schema file the approved commit cannot be
+// parsed at, so the gate cannot show the DDL that commit runs.
+var unparseableApprovedOrders = map[string]map[string]string{
+	reviewGateOldBase:     {"schema/testdb/orders.sql": "CREATE TABLE `orders` (`id` bigint NOT NULL, PRIMARY KEY (`id`))"},
+	reviewGateApproved:    {"schema/testdb/orders.sql": "CREATE TABLE `orders` (`id` bigint NOT NULL,"},
+	reviewGateTestHeadSHA: {"schema/testdb/orders.sql": "CREATE TABLE `orders` (`id` bigint NOT NULL, `memo` text, PRIMARY KEY (`id`))"},
+}
+
 func setupReviewGateHandler(t *testing.T, config *api.ServerConfig) (*Handler, *http.ServeMux) {
 	t.Helper()
 	if config == nil {
@@ -2228,6 +2240,65 @@ func TestCheckReviewGate_UnmatchedCodeownersWithoutOtherReviewersErrors(t *testi
 	assert.Equal(t, "schema/payments", noOwnersLog["schema_path"])
 }
 
+// TestCheckReviewGate_UnmatchableCodeownersRuleFailsClosed pins that a
+// CODEOWNERS rule the parser accepts but cannot match, such as a bare
+// `/ @owner`, makes the gate fail closed with an evaluation error rather than
+// approve, block, or crash the handler. The error names the base branch and
+// says how to fix it without carrying the panic text; the panic value and
+// stack land in a server log carrying the PR, head commit, base branch and
+// schema directory, so the rule can be found from logs alone.
+func TestCheckReviewGate_UnmatchableCodeownersRuleFailsClosed(t *testing.T) {
+	h, mux := setupReviewGateHandler(t, reviewGateTestConfig(func(cfg *api.ServerConfig) {
+		cfg.ReviewPolicy.IncludeCodeowners = true
+		cfg.ReviewPolicy.IncludeDatabaseOperators = new(false)
+		cfg.ReviewPolicy.AdminUsers = []string{"zoe"}
+	}))
+	var logs syncBuffer
+	h.logger = slog.New(slog.NewJSONHandler(&logs, nil))
+
+	registerPREndpoint(mux, "alice")
+	registerCodeownersEndpoint(mux, "/ @platform-admins\n", true)
+	registerReviewsEndpoint(mux, []*gh.PullRequestReview{
+		{
+			User:        &gh.User{Login: new("zoe")},
+			State:       new(ghclient.ReviewApproved),
+			CommitID:    new(reviewGateTestHeadSHA),
+			SubmittedAt: &gh.Timestamp{Time: time.Now()},
+		},
+	})
+
+	client, err := h.clientForRepo("octocat/hello-world", 12345)
+	require.NoError(t, err)
+
+	var result *ReviewGateResult
+	require.NotPanics(t, func() {
+		result, err = h.checkReviewGate(t.Context(), client, "octocat/hello-world", 1, "staging", reviewGateSchema("schema/payments", reviewGateTestHeadSHA))
+	})
+	require.Error(t, err)
+	assert.Nil(t, result)
+	assert.Contains(t, err.Error(), `the CODEOWNERS file on base branch "main" holds a rule that cannot be matched`)
+	assert.Contains(t, err.Error(), "fix the rule on the base branch")
+	assert.NotContains(t, err.Error(), "index out of range")
+	assert.NotContains(t, err.Error(), "panic")
+
+	var panicLog map[string]any
+	for line := range strings.SplitSeq(strings.TrimSpace(logs.String()), "\n") {
+		var entry map[string]any
+		require.NoError(t, json.Unmarshal([]byte(line), &entry))
+		if entry["msg"] == "review gate: CODEOWNERS holds a rule the parser cannot match; the gate fails closed until the rule is fixed" {
+			panicLog = entry
+		}
+	}
+	require.NotNil(t, panicLog, "no log line carries the recovered panic")
+	assert.Equal(t, "octocat/hello-world", panicLog["repo"])
+	assert.InDelta(t, 1, panicLog["pr"], 0)
+	assert.Equal(t, reviewGateTestHeadSHA, panicLog["head_sha"])
+	assert.Equal(t, "main", panicLog["base_ref"])
+	assert.Equal(t, "schema/payments", panicLog["schema_path"])
+	assert.Contains(t, fmt.Sprint(panicLog["panic"]), "index out of range")
+	assert.Contains(t, fmt.Sprint(panicLog["stack"]), "codeowners")
+}
+
 func TestCheckReviewGate_NoConfiguredReviewersErrors(t *testing.T) {
 	h, mux := setupReviewGateHandler(t, reviewGateTestConfig(func(cfg *api.ServerConfig) {
 		cfg.ReviewPolicy.IncludeDatabaseOperators = new(false)
@@ -2335,7 +2406,7 @@ func TestEnforceReviewGate(t *testing.T) {
 		case body := <-comments:
 			assert.Contains(t, body, "Review Gate Error")
 			assert.Contains(t, body, "**This apply needs an approval of the latest commit.** @bob approved an earlier commit.")
-			assert.Contains(t, body, "1. Ask anyone listed above to approve the latest commit\n2. Once approved, run `schemabot apply -e staging` again\n")
+			assert.Contains(t, body, "1. Ask @bob or anyone listed above to approve the latest commit\n2. Once approved, run `schemabot apply -e staging` again\n")
 			assert.Contains(t, body, "- @bob\n")
 			assert.NotContains(t, body, "Review Required")
 			assert.NotContains(t, body, reviewGateApproved, "raw comparison errors must never render in PR markdown")
@@ -2406,13 +2477,13 @@ func TestEnforceReviewGate(t *testing.T) {
 			name:        "approval on an earlier commit is named in the review-required comment",
 			headBase:    reviewGateOldBase,
 			headColumns: "`memo` text",
-			wantDetail:  "Changed since the approval: `schema/testdb/orders.sql`.",
+			wantDetail:  "@bob approved an earlier commit, but this PR's change to `schema/testdb/orders.sql` is different now. ",
 		},
 		{
 			name:        "identical files on different bases name the base difference",
 			headBase:    reviewGateBaseTip,
 			headColumns: "`note` text",
-			wantDetail:  "Compared with some earlier approvals, file contents are unchanged, but their merge-base versions differ: `schema/testdb/orders.sql`.",
+			wantDetail:  "@bob approved an earlier commit. `schema/testdb/orders.sql` has not changed since then, but the base branch it builds on has, so applying it now would run different DDL. ",
 		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
@@ -2444,16 +2515,181 @@ func TestEnforceReviewGate(t *testing.T) {
 			select {
 			case body := <-comments:
 				assert.Contains(t, body, "Review Required")
-				assert.Contains(t, body, "Approvals on an earlier commit no longer count because this PR's schema change is different now: @bob. "+
-					tt.wantDetail)
-				if tt.headBase == reviewGateBaseTip {
-					assert.NotContains(t, body, "Changed since the approval:")
-				}
+				assert.Contains(t, body, tt.wantDetail+"That approval no longer counts, so the latest commit needs a new approval.\n")
+				assert.NotContains(t, body, "<details>", "a database type with no offline diff names the file without its DDL")
 			case <-time.After(2 * time.Second):
 				require.Fail(t, "timed out waiting for review-required comment")
 			}
 		})
 	}
+
+	// The author drops a column comment after the review, on the same base.
+	// Two operators approved that commit. Neither approval counts, and the
+	// comment folds the DDL each commit runs into one collapsed block, so the
+	// reader can see the dropped COMMENT without opening either commit. The
+	// block reuses the file contents the comparison already read.
+	t.Run("approval on an earlier commit shows the DDL each commit runs", func(t *testing.T) {
+		h, mux := setupReviewGateHandler(t, reviewGateTestConfig(func(cfg *api.ServerConfig) {
+			db := cfg.Databases["orders"]
+			db.OperatorUsers = []string{"bob", "carol"}
+			cfg.Databases["orders"] = db
+		}))
+		registerPREndpoint(mux, "alice")
+		registerReviewsEndpoint(mux, []*gh.PullRequestReview{
+			{User: &gh.User{Login: new("bob")}, State: new(ghclient.ReviewApproved), SubmittedAt: &gh.Timestamp{Time: time.Now()}, CommitID: new(reviewGateApproved)},
+			{User: &gh.User{Login: new("carol")}, State: new(ghclient.ReviewApproved), SubmittedAt: &gh.Timestamp{Time: time.Now()}, CommitID: new(reviewGateApproved)},
+		})
+		registerReviewGateBaseBranch(t, mux, map[string]string{reviewGateApproved: reviewGateOldBase, reviewGateTestHeadSHA: reviewGateOldBase})
+		blobReads := registerReviewGateGitObjects(t, mux, map[string]map[string]string{
+			reviewGateOldBase:     {"schema/testdb/orders.sql": "CREATE TABLE `orders` (`id` bigint NOT NULL, `label` binary(32) NOT NULL, PRIMARY KEY (`id`))"},
+			reviewGateApproved:    {"schema/testdb/orders.sql": "CREATE TABLE `orders` (`id` bigint NOT NULL, `label` binary(32) DEFAULT NULL COMMENT 'NULL until printed', PRIMARY KEY (`id`))"},
+			reviewGateTestHeadSHA: {"schema/testdb/orders.sql": "CREATE TABLE `orders` (`id` bigint NOT NULL, `label` binary(32) DEFAULT NULL, PRIMARY KEY (`id`))"},
+		})
+		comments := registerCommentsCapture(mux)
+
+		client, err := h.clientForRepo("octocat/hello-world", 12345)
+		require.NoError(t, err)
+
+		mysqlSchema := *schemaResult
+		mysqlSchema.Type = "mysql"
+		blocked, err := h.enforceReviewGate(t.Context(), client, "octocat/hello-world", 1, 12345, &mysqlSchema, "staging", "alice", "apply", false)
+		require.NoError(t, err)
+		assert.True(t, blocked)
+
+		select {
+		case body := <-comments:
+			assert.Contains(t, body, "@bob and @carol approved earlier commits, but this PR's change to `schema/testdb/orders.sql` is different now. ")
+			assert.Equal(t, 1, strings.Count(body, "<details>"), "two approvals of one commit show its DDL once")
+			assert.Equal(t, int64(3), blobReads.Load(), "the DDL reuses the base, approved, and head contents the comparison read")
+			assert.Contains(t, body, "<details>\n<summary>How <code>schema/testdb/orders.sql</code> changed since the approval</summary>\n\n"+
+				"Approved at `"+reviewGateApproved+"`:\n\n"+
+				"```sql\nALTER TABLE `orders` MODIFY COLUMN `label` binary(32) NULL DEFAULT NULL COMMENT 'NULL until printed';\n```\n\n"+
+				"Latest commit `"+reviewGateTestHeadSHA+"`:\n\n"+
+				"```sql\nALTER TABLE `orders` MODIFY COLUMN `label` binary(32) NULL DEFAULT NULL;\n```\n\n</details>\n")
+		case <-time.After(2 * time.Second):
+			require.Fail(t, "timed out waiting for review-required comment")
+		}
+	})
+
+	// The schema file is a symlink, and the author points it at a different
+	// file after the review. The comment names the symlink and leaves out the
+	// DDL, since the statements come from files the symlink pointed to, not
+	// from the path the comment names.
+	t.Run("approval on an earlier commit names a retargeted symlink without its DDL", func(t *testing.T) {
+		h, mux := setupReviewGateHandler(t, reviewGateTestConfig(func(cfg *api.ServerConfig) {
+			db := cfg.Databases["orders"]
+			db.OperatorUsers = []string{"bob"}
+			cfg.Databases["orders"] = db
+		}))
+		registerPREndpoint(mux, "alice")
+		registerReviewsEndpoint(mux, []*gh.PullRequestReview{
+			{User: &gh.User{Login: new("bob")}, State: new(ghclient.ReviewApproved), SubmittedAt: &gh.Timestamp{Time: time.Now()}, CommitID: new(reviewGateApproved)},
+		})
+		registerReviewGateBaseBranch(t, mux, map[string]string{reviewGateApproved: reviewGateOldBase, reviewGateTestHeadSHA: reviewGateOldBase})
+		original := "CREATE TABLE `orders` (`id` bigint NOT NULL, PRIMARY KEY (`id`))"
+		withNote := "CREATE TABLE `orders` (`id` bigint NOT NULL, `note` text, PRIMARY KEY (`id`))"
+		withMemo := "CREATE TABLE `orders` (`id` bigint NOT NULL, `memo` text, PRIMARY KEY (`id`))"
+		files := func(target string) map[string]string {
+			return map[string]string{
+				"schema/testdb/orders.sql": reviewGateSymlink + "../shared/" + target,
+				"schema/shared/v1.sql":     original,
+				"schema/shared/v2.sql":     withNote,
+				"schema/shared/v3.sql":     withMemo,
+			}
+		}
+		registerReviewGateGitObjects(t, mux, map[string]map[string]string{
+			reviewGateOldBase:     files("v1.sql"),
+			reviewGateApproved:    files("v2.sql"),
+			reviewGateTestHeadSHA: files("v3.sql"),
+		})
+		comments := registerCommentsCapture(mux)
+
+		client, err := h.clientForRepo("octocat/hello-world", 12345)
+		require.NoError(t, err)
+
+		mysqlSchema := *schemaResult
+		mysqlSchema.Type = "mysql"
+		blocked, err := h.enforceReviewGate(t.Context(), client, "octocat/hello-world", 1, 12345, &mysqlSchema, "staging", "alice", "apply", false)
+		require.NoError(t, err)
+		assert.True(t, blocked)
+
+		select {
+		case body := <-comments:
+			assert.Contains(t, body, "@bob approved an earlier commit, but this PR's change to `schema/testdb/orders.sql` is different now. ")
+			assert.NotContains(t, body, "<details>")
+		case <-time.After(2 * time.Second):
+			require.Fail(t, "timed out waiting for review-required comment")
+		}
+	})
+
+	// Two operators approved a commit whose schema file SchemaBot cannot work
+	// out DDL for. The comment names the file without a DDL block, and the
+	// lookup runs once for the commit, not once per approval.
+	t.Run("approvals of one commit share a failed DDL lookup", func(t *testing.T) {
+		h, mux := setupReviewGateHandler(t, reviewGateTestConfig(func(cfg *api.ServerConfig) {
+			db := cfg.Databases["orders"]
+			db.OperatorUsers = []string{"bob", "carol"}
+			cfg.Databases["orders"] = db
+		}))
+		var logs syncBuffer
+		h.logger = slog.New(slog.NewJSONHandler(&logs, nil))
+		registerPREndpoint(mux, "alice")
+		registerReviewsEndpoint(mux, []*gh.PullRequestReview{
+			{User: &gh.User{Login: new("bob")}, State: new(ghclient.ReviewApproved), SubmittedAt: &gh.Timestamp{Time: time.Now()}, CommitID: new(reviewGateApproved)},
+			{User: &gh.User{Login: new("carol")}, State: new(ghclient.ReviewApproved), SubmittedAt: &gh.Timestamp{Time: time.Now()}, CommitID: new(reviewGateApproved)},
+		})
+		registerReviewGateBaseBranch(t, mux, map[string]string{reviewGateApproved: reviewGateOldBase, reviewGateTestHeadSHA: reviewGateOldBase})
+		registerReviewGateGitObjects(t, mux, unparseableApprovedOrders)
+		comments := registerCommentsCapture(mux)
+
+		client, err := h.clientForRepo("octocat/hello-world", 12345)
+		require.NoError(t, err)
+
+		mysqlSchema := *schemaResult
+		mysqlSchema.Type = "mysql"
+		blocked, err := h.enforceReviewGate(t.Context(), client, "octocat/hello-world", 1, 12345, &mysqlSchema, "staging", "alice", "apply", false)
+		require.NoError(t, err)
+		assert.True(t, blocked)
+
+		select {
+		case body := <-comments:
+			assert.Contains(t, body, "@bob and @carol approved earlier commits, but this PR's change to `schema/testdb/orders.sql` is different now. ")
+			assert.NotContains(t, body, "<details>")
+		case <-time.After(2 * time.Second):
+			require.Fail(t, "timed out waiting for review-required comment")
+		}
+		assert.Equal(t, 1, strings.Count(logs.String(), changedDDLLookupFailedLog), "the failed lookup runs once for both approvals")
+	})
+
+	// An operator approved an earlier commit, and another approved the latest
+	// one. The latest approval lets the apply through, so the gate never works
+	// out the earlier commit's DDL.
+	t.Run("approval of the latest commit skips the DDL lookup", func(t *testing.T) {
+		h, mux := setupReviewGateHandler(t, reviewGateTestConfig(func(cfg *api.ServerConfig) {
+			db := cfg.Databases["orders"]
+			db.OperatorUsers = []string{"bob", "carol"}
+			cfg.Databases["orders"] = db
+		}))
+		var logs syncBuffer
+		h.logger = slog.New(slog.NewJSONHandler(&logs, nil))
+		registerPREndpoint(mux, "alice")
+		registerReviewsEndpoint(mux, []*gh.PullRequestReview{
+			{User: &gh.User{Login: new("bob")}, State: new(ghclient.ReviewApproved), SubmittedAt: &gh.Timestamp{Time: time.Now()}, CommitID: new(reviewGateApproved)},
+			{User: &gh.User{Login: new("carol")}, State: new(ghclient.ReviewApproved), SubmittedAt: &gh.Timestamp{Time: time.Now()}, CommitID: new(reviewGateTestHeadSHA)},
+		})
+		registerReviewGateBaseBranch(t, mux, map[string]string{reviewGateApproved: reviewGateOldBase, reviewGateTestHeadSHA: reviewGateOldBase})
+		registerReviewGateGitObjects(t, mux, unparseableApprovedOrders)
+
+		client, err := h.clientForRepo("octocat/hello-world", 12345)
+		require.NoError(t, err)
+
+		mysqlSchema := *schemaResult
+		mysqlSchema.Type = "mysql"
+		blocked, err := h.enforceReviewGate(t.Context(), client, "octocat/hello-world", 1, 12345, &mysqlSchema, "staging", "alice", "apply", false)
+		require.NoError(t, err)
+		assert.False(t, blocked)
+		assert.NotContains(t, logs.String(), changedDDLLookupFailedLog)
+	})
 
 	t.Run("approved review passes without comment", func(t *testing.T) {
 		h, mux := setupReviewGateHandler(t, reviewGateTestConfig(func(cfg *api.ServerConfig) {

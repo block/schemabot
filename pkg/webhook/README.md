@@ -115,7 +115,7 @@ Three discovery strategies, tried in order:
 
 1. **`-d` flag specified** → `FindConfigByDatabaseName()`: Tree API scan for all `schemabot.yaml` files, match by `database` field (case-insensitive).
 
-2. **Changed schema files in PR** → `FindConfigForPR()`: List PR files, keep schema files (`.sql`, `vschema.json`), changed `schemabot.yaml` files, and environment or namespace symlinks, and search parent directories for `schemabot.yaml`.
+2. **Changed schema files in PR** → `FindConfigForPR()`: List PR files, filter to `.sql`/`vschema.json`, search parent directories for `schemabot.yaml`.
 
 3. **Fallback** → `FindConfigInRepo()`: Full Tree API scan. Returns single config or `ErrMultipleConfigs` if ambiguous.
 

@@ -545,9 +545,9 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	// Acquire lock. PendingPlanID pins the confirmation plan this lock was
 	// posted with so apply-confirm can load the exact plan the human reviewed
 	// (not whatever happens to be newest in the plans table at confirm time).
-	// DisclosedCopyDiscard records whether that plan's comment tells the operator
-	// a copy is destroyed, so the apply can later tell a discard they agreed to
-	// from one that appeared after they were asked.
+	// DisclosedCopies records which copies that plan's comment tells the
+	// operator are destroyed, so the apply can later tell a discard they agreed
+	// to from one that appeared after they were asked.
 	//
 	// The apply saw no lock of its own before planning: either none was held or
 	// it released this PR's stale one above. The acquire is conditional on that
@@ -555,13 +555,13 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	// lock while this one plans, and the pin it holds must not be replaced by a
 	// plan the operator never saw alongside it.
 	lock := &storage.Lock{
-		DatabaseName:         database,
-		DatabaseType:         dbType,
-		Owner:                lockOwner,
-		Repository:           repo,
-		PullRequest:          pr,
-		PendingPlanID:        planResp.PlanID,
-		DisclosedCopyDiscard: len(planResp.DiscardedCopies()) > 0,
+		DatabaseName:    database,
+		DatabaseType:    dbType,
+		Owner:           lockOwner,
+		Repository:      repo,
+		PullRequest:     pr,
+		PendingPlanID:   planResp.PlanID,
+		DisclosedCopies: rolloutDisclosedCopies(planResp, rollout, runsMemberWork),
 	}
 	if err := h.service.Storage().Locks().AcquireIfPendingPlanID(ctx, lock, ""); err != nil {
 		if errors.Is(err, storage.ErrLockHeld) {
@@ -635,10 +635,10 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	// two-step confirm against the locked comment that discloses what is being
 	// thrown away: the operator spends the hours, so the operator decides, and
 	// there is no flag that converts an automatic apply into that consent.
-	if discarded := planResp.DiscardedCopies(); len(discarded) > 0 {
+	if discarded := rolloutDiscardedCopies(planResp, rollout, runsMemberWork); discarded > 0 {
 		h.logger.Info("automatic apply downgraded: applying discards an existing copy",
 			"repo", repo, "pr", pr, "database", database, "environment", environment,
-			"discarded_copies", len(discarded))
+			"discarded_copies", discarded)
 		// Store the check record before posting the paused comment: the pause
 		// is acknowledged only once the stored check state blocks the merge
 		// gate on the pending changes. A storage failure releases the lock
@@ -730,7 +730,7 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	}
 
 	// Check 2 (DDL drift) happens inside executeApply after re-plan
-	h.executeApply(ctx, client, repo, pr, schemaResult, environment, installationID, requestedBy, result, storedPlan, storedPlan, planResp.PlanID, lock.DisclosedCopyDiscard)
+	h.executeApply(ctx, client, repo, pr, schemaResult, environment, installationID, requestedBy, result, storedPlan, storedPlan, planResp.PlanID, lock.DisclosedCopies)
 	return false, nil
 }
 
@@ -1070,26 +1070,24 @@ func (h *Handler) applyConfirmCommandCore(parent context.Context, repo string, p
 		return false, nil
 	}
 
-	disclosedCopyDiscard := disclosureDescribesThisApply(existingLock, storedPlan, environment)
+	disclosedCopies := disclosureDescribesThisApply(existingLock, storedPlan, environment)
 
-	h.executeApply(ctx, client, repo, pr, schemaResult, environment, installationID, requestedBy, result, nil, storedPlan, existingLock.PendingPlanID, disclosedCopyDiscard)
+	h.executeApply(ctx, client, repo, pr, schemaResult, environment, installationID, requestedBy, result, nil, storedPlan, existingLock.PendingPlanID, disclosedCopies)
 	return false, nil
 }
 
-// disclosureDescribesThisApply reports whether the consent recorded on the
-// pending confirmation was earned for the apply about to run. The lock carries
-// no environment dimension, so a disclosure the operator was shown confirming
-// one environment must not disarm the copy gate in another: the pinned plan
-// names the environment they actually saw. A missing plan never counts as
-// consent, though apply-confirm rejects that state before reaching this helper.
-func disclosureDescribesThisApply(lock *storage.Lock, plan *storage.Plan, environment string) bool {
-	if !lock.DisclosedCopyDiscard {
-		return false
+// disclosureDescribesThisApply returns the consent recorded on the pending
+// confirmation when it was earned for the apply about to run, and none when it
+// was not. The lock carries no environment dimension, so a disclosure the
+// operator was shown confirming one environment must not disarm the copy gate
+// in another: the pinned plan names the environment they actually saw. A
+// missing plan never counts as consent, though apply-confirm rejects that state
+// before reaching this helper.
+func disclosureDescribesThisApply(lock *storage.Lock, plan *storage.Plan, environment string) []storage.DisclosedCopy {
+	if plan == nil || plan.Environment != environment {
+		return nil
 	}
-	if plan == nil {
-		return false
-	}
-	return plan.Environment == environment
+	return lock.DisclosedCopies
 }
 
 // isSamePRRollbackLock reports whether this PR holds the lock for a rollback

@@ -44,7 +44,7 @@ func TestE2EFirstApplyToBlankDatabaseThroughNonceEdit(t *testing.T) {
 	requireNoTable(t, dbName, "users")
 
 	t.Run("a PR outside the schema directory gets no plan and the nonce hint", func(t *testing.T) {
-		prFiles := []*gh.CommitFile{{Filename: new("README.md"), Status: new("modified"), Additions: new(3), Deletions: new(2)}}
+		prFiles := []*gh.CommitFile{{Filename: new("README.md"), Status: new("modified")}}
 		h, result := newFirstApplyRepo(t, svc, dbName, schemaFiles, schemabotConfig, prFiles)
 
 		rr := httptest.NewRecorder()

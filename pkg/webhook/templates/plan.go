@@ -327,6 +327,20 @@ type DeploymentDriftData struct {
 	// planned: a target missing from the list would read as one with nothing
 	// to copy.
 	TableSizes []TargetTableSize
+	// DiscardedCopies are the unfinished copies applying the other targets'
+	// own plans discards, each naming its target, in rollout order. The
+	// primary target's are PlanCommentData.DiscardedCopies. Each is written
+	// under the plan of the target it is on, so the comment the operator
+	// confirms names every copy the apply destroys, wherever it is. Set only
+	// for a clean rollup, the only one whose targets' plans an apply runs.
+	DiscardedCopies []TargetExistingCopy
+}
+
+// TargetExistingCopy is an unfinished copy on one rollout target.
+type TargetExistingCopy struct {
+	// Target names the target the way an operator addresses it.
+	Target string
+	Copy   ExistingCopyData
 }
 
 // TargetTableSize is one rollout target's size estimate for one table its plan
@@ -2352,6 +2366,30 @@ func writeTargetPlans(sb *strings.Builder, data PlanCommentData, budget *ddlBloc
 		} else if unsafe := g.unsafeBeyondPrimaryPlan(); len(unsafe) > 0 && data.disclosesUnsafeChanges() {
 			writeUnsafeWarning(sb, unsafe, nil, data.DatabaseType, data.IsMySQL)
 		}
+		writeTargetDiscardedCopies(sb, data, g)
+	}
+}
+
+// writeTargetDiscardedCopies writes, under a target group's plan, the
+// unfinished copies applying its targets' own plans discards, one section per
+// target. The primary target's are written with its other disclosures. Each
+// section names its target unless the group's heading already names that
+// target alone.
+func writeTargetDiscardedCopies(sb *strings.Builder, data PlanCommentData, g DeploymentPlanGroup) {
+	for _, target := range g.Members {
+		var copies []ExistingCopyData
+		for _, c := range data.DeploymentDrift.DiscardedCopies {
+			if c.Target == target {
+				copies = append(copies, c.Copy)
+			}
+		}
+		if len(copies) == 0 {
+			continue
+		}
+		if !headedByItself(data.DeploymentDrift, g) {
+			fmt.Fprintf(sb, "On target %s:\n\n", inlineCode(target))
+		}
+		writeDiscardedCopies(sb, copies, data.applyingWithoutConfirmation())
 	}
 }
 

@@ -164,7 +164,6 @@ func renderMultiDeploymentApplySummaryComment(data MultiDeploymentApplyData, bud
 	writeAggregateMetadata(&sb, data, currentTimestamp())
 	groups := groupsWithChanges(data.Model, data.Model.Groups())
 	if g, ok := presentation.SoleTargetRollout(groups); ok {
-		writeTargetRolloutStatus(&sb, data, g)
 		writeTargetRolloutSummaryDetails(&sb, data, g, budget)
 		writeRolloutFooter(&sb, data)
 		return sb.String()
@@ -189,19 +188,36 @@ func writeTargetRolloutBody(sb *strings.Builder, data MultiDeploymentApplyData, 
 }
 
 // writeTargetRolloutSummaryDetails writes a sole multi-target deployment's
-// rolled-up table lines in its final summary. A completed rollout folds them
-// into the same "Apply details" block a single-target completed summary uses,
-// since nothing in them needs the reader's attention; any other outcome leaves
-// them open so the failed or unfinished targets stay in view.
+// final summary body. A completed rollout folds its rolled-up table lines into
+// the same "Apply details" block a single-target completed summary uses, since
+// nothing in them needs the reader's attention, and the block's label carries
+// the outcome in place of a status line: "Apply details (2 tables done on 4
+// targets)". Any other outcome leaves the status line and the table lines open
+// so the failed or unfinished targets stay in view.
 func writeTargetRolloutSummaryDetails(sb *strings.Builder, data MultiDeploymentApplyData, g presentation.Group, budget *ddlBlockBudget) {
 	tables := targetRolloutTables(data, g)
 	if !state.IsState(data.Model.State, state.Apply.Completed) || len(tables) == 0 {
+		writeTargetRolloutStatus(sb, data, g)
 		writeTargetRollup(sb, data, g, budget)
 		return
 	}
-	fmt.Fprintf(sb, "<details><summary>%s</summary>\n\n", completedSummaryDetailsLabel(ApplyStatusCommentData{Tables: tables}))
+	fmt.Fprintf(sb, "\n<details><summary>Apply details (%s)</summary>\n\n", completedTargetRolloutOutcome(data, g, tables))
 	writeTargetRollup(sb, data, g, budget)
 	sb.WriteString("</details>\n")
+}
+
+// completedTargetRolloutOutcome states a completed multi-target rollout in the
+// words its table-step headline uses once every table is done: "2 tables done
+// on 4 targets", or "rolled back" for a rollback. A target that already had
+// the change ran no table, so it is not counted.
+func completedTargetRolloutOutcome(data MultiDeploymentApplyData, g presentation.Group, tables []TableProgressData) string {
+	verb := "done"
+	if data.Rollback {
+		verb = "rolled back"
+	}
+	progress := data.Model.TargetProgress(g)
+	changing := progress.Total - progress.AlreadyHad
+	return fmt.Sprintf("%d %s %s on %s", len(tables), pluralize(progressUnit(tables), len(tables)), verb, presentation.TargetNoun.Count(changing))
 }
 
 // targetRolloutTables is one row per rolled-up line of a target rollout, so

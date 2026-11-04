@@ -190,13 +190,15 @@ func RenderPRCommandAuthorizationUnavailable(data ActorAuthorizationCommentData)
 func RenderUnsafeChangesBlocked(data PlanCommentData) string {
 	// Every target's plan renders when the apply runs other targets' plans, so
 	// the refusal shows what each would run. The refusal lists every unsafe
-	// change itself, naming its targets, so the groups do not repeat them.
+	// change itself, naming its targets, so the groups do not repeat them, and
+	// like a single target's refusal it discloses no existing copies.
 	if RendersTargetPlans(data.DeploymentDrift) {
 		drift := *data.DeploymentDrift
 		drift.Plans = slices.Clone(drift.Plans)
 		for i := range drift.Plans {
 			drift.Plans[i].UnsafeChanges = nil
 		}
+		drift.DiscardedCopies = nil
 		data.DeploymentDrift = &drift
 	}
 	return renderWithinCommentLimit(countCommentDDLBlocks(data), 0, func(budget *ddlBlockBudget) string {

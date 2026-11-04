@@ -436,40 +436,44 @@ func TestDDLMatchesStoredPlan(t *testing.T) {
 // and a confirmation whose plan cannot be loaded must count as no disclosure at
 // all rather than as consent.
 func TestDisclosureDescribesThisApply(t *testing.T) {
+	disclosed := []storage.DisclosedCopy{{Namespace: "app", Tables: []string{"events"}}}
 	tests := []struct {
 		name        string
 		lock        *storage.Lock
 		plan        *storage.Plan
 		environment string
-		want        bool
+		want        []storage.DisclosedCopy
 	}{
 		{
 			name:        "disclosure shown for this environment is consent",
-			lock:        &storage.Lock{DisclosedCopyDiscard: true, PendingPlanID: "plan-1"},
+			lock:        &storage.Lock{DisclosedCopies: disclosed, PendingPlanID: "plan-1"},
 			plan:        &storage.Plan{PlanIdentifier: "plan-1", Environment: "staging"},
 			environment: "staging",
-			want:        true,
+			want:        disclosed,
 		},
 		{
 			name:        "disclosure shown for another environment is not consent",
-			lock:        &storage.Lock{DisclosedCopyDiscard: true, PendingPlanID: "plan-1"},
+			lock:        &storage.Lock{DisclosedCopies: disclosed, PendingPlanID: "plan-1"},
 			plan:        &storage.Plan{PlanIdentifier: "plan-1", Environment: "staging"},
 			environment: "production",
-			want:        false,
 		},
 		{
 			name:        "no disclosure is not consent",
-			lock:        &storage.Lock{DisclosedCopyDiscard: false, PendingPlanID: "plan-1"},
+			lock:        &storage.Lock{PendingPlanID: "plan-1"},
 			plan:        &storage.Plan{PlanIdentifier: "plan-1", Environment: "staging"},
 			environment: "staging",
-			want:        false,
+		},
+		{
+			name:        "a flag without the copies it disclosed is not consent",
+			lock:        &storage.Lock{DisclosedCopyDiscard: true, PendingPlanID: "plan-1"},
+			plan:        &storage.Plan{PlanIdentifier: "plan-1", Environment: "staging"},
+			environment: "staging",
 		},
 		{
 			name:        "a disclosure whose plan did not load is not consent",
-			lock:        &storage.Lock{DisclosedCopyDiscard: true, PendingPlanID: "plan-1"},
+			lock:        &storage.Lock{DisclosedCopies: disclosed, PendingPlanID: "plan-1"},
 			plan:        nil,
 			environment: "staging",
-			want:        false,
 		},
 	}
 
@@ -478,6 +482,50 @@ func TestDisclosureDescribesThisApply(t *testing.T) {
 			assert.Equal(t, tt.want, disclosureDescribesThisApply(tt.lock, tt.plan, tt.environment))
 		})
 	}
+}
+
+// Consent to discard is consent to the copies the comment named, on the
+// targets it named them on. A copy the re-plan would discard that the comment
+// did not name stops the apply, even when the comment disclosed another copy,
+// while a re-reading of a disclosed copy that lists its tables in another order
+// is the same copy.
+func TestUndisclosedDiscards(t *testing.T) {
+	euEvents := storage.DisclosedCopy{Target: "eu", Namespace: "app", Tables: []string{"events"}, Statement: "ALTER TABLE `events` ADD INDEX `idx_actor_id` (`actor_id`)"}
+	usEvents := euEvents
+	usEvents.Target = "us"
+	primaryEvents := euEvents
+	primaryEvents.Target = ""
+
+	tests := []struct {
+		name       string
+		discarding []storage.DisclosedCopy
+		disclosed  []storage.DisclosedCopy
+		want       int
+	}{
+		{name: "nothing discarded", disclosed: []storage.DisclosedCopy{euEvents}},
+		{name: "the disclosed copy", discarding: []storage.DisclosedCopy{euEvents}, disclosed: []storage.DisclosedCopy{euEvents}},
+		{name: "the same copy on another target", discarding: []storage.DisclosedCopy{euEvents, usEvents}, disclosed: []storage.DisclosedCopy{euEvents}, want: 1},
+		{name: "a copy on the primary target when only another target's was disclosed", discarding: []storage.DisclosedCopy{primaryEvents}, disclosed: []storage.DisclosedCopy{euEvents}, want: 1},
+		{name: "a discard with no disclosure", discarding: []storage.DisclosedCopy{euEvents}, want: 1},
+		{
+			name:       "another statement's copy of the same table",
+			discarding: []storage.DisclosedCopy{{Target: "eu", Namespace: "app", Tables: []string{"events"}, Statement: "ALTER TABLE `events` ADD COLUMN `region` varchar(16)"}},
+			disclosed:  []storage.DisclosedCopy{euEvents},
+			want:       1,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, undisclosedDiscards(tt.discarding, tt.disclosed))
+		})
+	}
+
+	// The tables of a copy are sorted when it is named, so reading them in
+	// another order names the same copy.
+	a := disclosedCopyOf("eu", &apitypes.ExistingCopyResponse{Namespace: "app", Tables: []string{"orders", "events"}})
+	b := disclosedCopyOf("eu", &apitypes.ExistingCopyResponse{Namespace: "app", Tables: []string{"events", "orders"}})
+	assert.Equal(t, []string{"events", "orders"}, a.Tables)
+	assert.Zero(t, undisclosedDiscards([]storage.DisclosedCopy{a}, []storage.DisclosedCopy{b}))
 }
 
 // The drift disclosure names what moved, per table, so the operator can see it
@@ -776,26 +824,26 @@ func TestRolloutShapeRefusalMessage(t *testing.T) {
 func TestDispatchErrorMessageNamesDeferredCutoverCapacity(t *testing.T) {
 	tooWide := &api.DeferredCutoverCapacityError{Database: "commerce", Environment: "production", Operations: 128, Drivers: 84, LiveServers: 12}
 	assert.Equal(t,
-		"This apply can't defer its cutover: it would keep 128 drivers waiting until you cut over, and SchemaBot's servers have 84 drivers that can wait. Run `schemabot apply -e production --tenant acme` without `--defer-cutover`.",
+		"This apply can't defer its cutover: it would keep 128 drivers waiting for the cutover, and SchemaBot's servers have 84 drivers that can wait. To defer it, give the servers 44 more by raising `drivers` or running more servers. Otherwise run `schemabot apply -e production --tenant acme` without `--defer-cutover`.",
 		deferredCutoverCapacityMessage(tooWide, action.ApplyConfirm, "production", "acme"))
 	assert.Equal(t,
-		"This apply can't defer its cutover: it would keep 128 drivers waiting until you cut over, and SchemaBot's servers have 84 drivers that can wait. Run `schemabot apply -e production` without `--defer-cutover`.",
+		"This apply can't defer its cutover: it would keep 128 drivers waiting for the cutover, and SchemaBot's servers have 84 drivers that can wait. To defer it, give the servers 44 more by raising `drivers` or running more servers. Otherwise run `schemabot apply -e production` without `--defer-cutover`.",
 		applyExecutionErrorMessage(action.Apply, "production", "", tooWide))
 
 	overCap := &api.DeferredCutoverCapacityError{Database: "commerce", Environment: "production", Operations: 128, PerApplyCap: 2}
 	msg := applyExecutionErrorMessage(action.ApplyConfirm, "production", "", overCap)
 	assert.Equal(t,
-		"This apply can't defer its cutover: it would keep 128 drivers waiting until you cut over, and one apply can use at most 2 (`max_drivers_per_apply`). Run `schemabot apply -e production` without `--defer-cutover`, or raise `max_drivers_per_apply` to 128.",
+		"This apply can't defer its cutover: it would keep 128 drivers waiting for the cutover, and one apply can use at most 2 (`max_drivers_per_apply`). To defer it, raise `max_drivers_per_apply` to 128. Otherwise run `schemabot apply -e production` without `--defer-cutover`.",
 		msg)
 	assert.NotContains(t, msg, "apply-confirm")
 
 	unreported := &api.DeferredCutoverCapacityError{Database: "commerce", Environment: "production", Operations: 4}
 	assert.Equal(t,
-		"This apply can't defer its cutover yet: no SchemaBot server has reported its drivers in the last minute. Try again in a minute, or run `schemabot apply -e production` without `--defer-cutover`.",
+		"This apply can't defer its cutover: no SchemaBot server running drivers has checked in during the last minute. Apply again once SchemaBot's drivers are running, or run `schemabot apply -e production` without `--defer-cutover`.",
 		deferredCutoverCapacityMessage(unreported, action.ApplyConfirm, "production", ""))
 
 	assert.Equal(t,
-		"This rollback can't defer its cutover: it would keep 128 drivers waiting until you cut over, and SchemaBot's servers have 84 drivers that can wait. Run `schemabot rollback-confirm -e production` without `--defer-cutover`.",
+		"This rollback can't defer its cutover: it would keep 128 drivers waiting for the cutover, and SchemaBot's servers have 84 drivers that can wait. To defer it, give the servers 44 more by raising `drivers` or running more servers. Otherwise run `schemabot rollback-confirm -e production` without `--defer-cutover`.",
 		deferredCutoverCapacityMessage(tooWide, action.RollbackConfirm, "production", ""))
 }
 
@@ -806,21 +854,21 @@ func TestDispatchErrorMessageNamesDeferredCutoverCapacity(t *testing.T) {
 func TestDispatchErrorMessageNamesTheRefusingDeployment(t *testing.T) {
 	unreported := &api.DeferredCutoverCapacityError{Database: "commerce", Environment: "production", Deployment: "east", Unreported: true, Operations: 4}
 	assert.Equal(t,
-		"This apply can't defer its cutover: the `east` deployment doesn't report its drivers, which upgrading SchemaBot there fixes. Run `schemabot apply -e production` without `--defer-cutover`.",
+		"This apply can't defer its cutover: the `east` deployment doesn't report its drivers. To defer it, upgrade SchemaBot there. Otherwise run `schemabot apply -e production` without `--defer-cutover`.",
 		deferredCutoverCapacityMessage(unreported, action.Apply, "production", ""))
 
 	overCap := &api.DeferredCutoverCapacityError{Database: "commerce", Environment: "production", Deployment: "east", Operations: 16, PerApplyCap: 8, LiveServers: 8}
 	assert.Equal(t,
-		"This apply can't defer its cutover: it would keep 16 drivers waiting on the `east` deployment until you cut over, and one apply can use at most 8 there (`max_drivers_per_apply`). Run `schemabot apply -e production` without `--defer-cutover`, or raise `max_drivers_per_apply` on that deployment to 16.",
+		"This apply can't defer its cutover: it would keep 16 drivers waiting for the cutover on the `east` deployment, and one apply can use at most 8 there (`max_drivers_per_apply`). To defer it, raise `max_drivers_per_apply` on that deployment to 16. Otherwise run `schemabot apply -e production` without `--defer-cutover`.",
 		deferredCutoverCapacityMessage(overCap, action.Apply, "production", ""))
 
 	noServers := &api.DeferredCutoverCapacityError{Database: "commerce", Environment: "production", Deployment: "east", Operations: 4}
 	assert.Equal(t,
-		"This apply can't defer its cutover yet: no SchemaBot server of the `east` deployment has reported its drivers in the last minute. Try again in a minute, or run `schemabot apply -e production` without `--defer-cutover`.",
+		"This apply can't defer its cutover: no SchemaBot server running drivers on the `east` deployment has checked in during the last minute. Apply again once its drivers are running, or run `schemabot apply -e production` without `--defer-cutover`.",
 		deferredCutoverCapacityMessage(noServers, action.Apply, "production", ""))
 
 	tooWide := &api.DeferredCutoverCapacityError{Database: "commerce", Environment: "production", Deployment: "east", Operations: 40, Drivers: 32, LiveServers: 8}
 	assert.Equal(t,
-		"This rollback can't defer its cutover: it would keep 40 drivers waiting on the `east` deployment until you cut over, and its servers have 32 drivers that can wait. Run `schemabot rollback-confirm -e production` without `--defer-cutover`.",
+		"This rollback can't defer its cutover: it would keep 40 drivers waiting for the cutover on the `east` deployment, and its servers have 32 drivers that can wait. To defer it, give that deployment's servers 8 more by raising `drivers` or running more servers. Otherwise run `schemabot rollback-confirm -e production` without `--defer-cutover`.",
 		deferredCutoverCapacityMessage(tooWide, action.RollbackConfirm, "production", ""))
 }
