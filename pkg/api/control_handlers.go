@@ -879,7 +879,7 @@ func (h *cutoverTurnHold) message() string {
 		return fmt.Sprintf("cutover is held: %s is stopped ahead of %s; start the schema change to resume it, or cancel it",
 			h.blocker, h.parked)
 	case state.ApplyOperation.Cancelled, state.ApplyOperation.Reverted:
-		return fmt.Sprintf("cutover is held: %s was %s ahead of %s, so later members do not cut over; stop the schema change and apply again",
+		return fmt.Sprintf("cutover is held: %s was %s ahead of %s, so later members do not run their cutover; stop the schema change and apply again",
 			h.blocker, h.blockerState, h.parked)
 	default:
 		return fmt.Sprintf("cutover follows deployment order: %s is in an earlier deployment than %s and is %s; run cutover again once %s has completed",

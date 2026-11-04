@@ -923,7 +923,7 @@ func unsupportedFeatureRemedy(feature schema.Feature, msgs dispatchMessages) str
 func rolloutShapeRefusalMessage(refused *api.RolloutShapeRefusedError, command, environment, tenant string) string {
 	switch refused.Refusal {
 	case api.RolloutDeferCutoverRefused:
-		return fmt.Sprintf("`--defer-cutover` is not supported on an apply to more than one target: each target cuts over as its table finishes. Run `%s` again without `--defer-cutover`.", templates.TenantCommand("schemabot "+command, environment, tenant))
+		return fmt.Sprintf("`--defer-cutover` is not supported on an apply to more than one target: each target runs its cutover as its table finishes. Run `%s` again without `--defer-cutover`.", templates.TenantCommand("schemabot "+command, environment, tenant))
 	case api.RolloutMultiTargetDeploymentsRefused:
 		narrowed := fmt.Sprintf("`%s --target %s`", templates.TenantCommand("schemabot "+action.Apply, environment, tenant), refused.FirstTarget)
 		if command == action.RollbackConfirm {

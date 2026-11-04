@@ -795,10 +795,10 @@ func TestRolloutShapeRefusalMessage(t *testing.T) {
 	wrapped := func(err error) error { return fmt.Errorf("create apply: %w", err) }
 
 	assert.Equal(t,
-		"`--defer-cutover` is not supported on an apply to more than one target: each target cuts over as its table finishes. Run `schemabot apply-confirm -e production` again without `--defer-cutover`.",
+		"`--defer-cutover` is not supported on an apply to more than one target: each target runs its cutover as its table finishes. Run `schemabot apply-confirm -e production` again without `--defer-cutover`.",
 		applyExecutionErrorMessage(action.ApplyConfirm, "production", "", wrapped(deferred)))
 	assert.Equal(t,
-		"`--defer-cutover` is not supported on an apply to more than one target: each target cuts over as its table finishes. Run `schemabot rollback-confirm -e production` again without `--defer-cutover`. The pending rollback stays pinned for it.",
+		"`--defer-cutover` is not supported on an apply to more than one target: each target runs its cutover as its table finishes. Run `schemabot rollback-confirm -e production` again without `--defer-cutover`. The pending rollback stays pinned for it.",
 		rollbackExecutionErrorMessage("production", "", wrapped(deferred)))
 	assert.Equal(t,
 		"An apply to more than one deployment is not supported yet when a deployment has several targets. Apply one target at a time, starting with `schemabot apply -e production --target orders-001`.",
