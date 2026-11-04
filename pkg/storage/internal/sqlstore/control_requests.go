@@ -210,8 +210,17 @@ func (s *controlRequestStore) requestPending(ctx context.Context, req *storage.A
 	// after the requeue, which finds the rows pending for the cancel's sweep
 	// to settle. An apply with no row has nothing to requeue, so its intake
 	// proceeds as before.
+	//
+	// A start request may write the apply row (markResumed), so it takes the
+	// row for update from the start. Two start requests that each held the
+	// row shared would each wait for the other to let go before writing, and
+	// the database would fail one of them as a deadlock.
+	applyLock := "FOR SHARE"
+	if req.Operation == storage.ControlOperationStart {
+		applyLock = "FOR UPDATE"
+	}
 	var lockedApplyID int64
-	if err := tx.QueryRowContext(ctx, `SELECT id FROM applies WHERE id = ? FOR SHARE`, req.ApplyID).Scan(&lockedApplyID); err != nil && !errors.Is(err, sql.ErrNoRows) {
+	if err := tx.QueryRowContext(ctx, `SELECT id FROM applies WHERE id = ? `+applyLock, req.ApplyID).Scan(&lockedApplyID); err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return nil, false, fmt.Errorf("lock apply %d to record %s control request: %w", req.ApplyID, req.Operation, err)
 	}
 
