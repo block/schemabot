@@ -2354,6 +2354,71 @@ schemabot apply -e production
 </details>
 
 <details>
+<summary><a name="rollout-plans-copy-discarded-on-another-target-paused"></a><strong>Rollout Plans (Copy Discarded On Another Target, Paused)</strong></summary>
+
+
+## Schema Change Apply — Production
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+🔒 **Lock acquired by** `block/schemabot#42` at 2026-01-15 14:30:00 UTC
+
+```sql
+CREATE TABLE `users` (
+    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+    `email` varchar(255) NOT NULL,
+    `created_at` timestamp DEFAULT current_timestamp(),
+    PRIMARY KEY(`id`),
+    INDEX `idx_email`(`email`)
+) ENGINE InnoDB,
+  CHARSET utf8mb4,
+  COLLATE utf8mb4_0900_ai_ci;
+```
+
+```sql
+CREATE TABLE `orders` (
+    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+    `user_id` bigint NOT NULL,
+    `total_cents` bigint NOT NULL,
+    `status` varchar(50) NOT NULL DEFAULT 'pending',
+    PRIMARY KEY(`id`),
+    INDEX `idx_user_id`(`user_id`)
+) ENGINE InnoDB,
+  CHARSET utf8mb4,
+  COLLATE utf8mb4_0900_ai_ci;
+```
+
+```sql
+ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
+```
+
+On target `us/testapp_3`:
+
+⚠️ **Applying destroys work in progress**: 1 unfinished copy on the target
+- `products` in `testapp` (last progress 3h 12m ago): the schema change differs from the one that started it, which was `` ALTER TABLE `products` ADD INDEX `idx_category` (`category`) ``
+
+Applying restarts the copy from zero rows. To keep the work already done, apply the schema change that started it.
+
+📋 **Plan**: **2** tables to create, **1** table to alter · rolling out to all 3 targets
+
+
+---
+
+**Confirmation required** — review the plan above, then confirm manually:
+```
+schemabot apply-confirm -e production
+```
+
+🔓 To discard this plan and unlock, comment:
+```
+schemabot unlock
+```
+
+</details>
+
+<details>
 <summary><a name="rollout-plans-table-sizes-two-targets"></a><strong>Rollout Plans (Table Sizes, Two Targets)</strong></summary>
 
 
@@ -3034,6 +3099,20 @@ You'll need to specify which environment to target with the `-e` flag.
 **Example**:
 ```
 schemabot plan -e staging
+```
+<!-- schemabot:offer-support-channel -->
+
+</details>
+
+<details>
+<summary><a name="missing-e-flag-on-a-control-command"></a><strong>Missing -e Flag On A Control Command</strong></summary>
+
+
+## ❌ Missing Argument
+
+`schemabot stop` needs the environment of the apply it controls. Apply `apply-a1b2c3d4e5f6` runs in `staging`, so comment:
+```
+schemabot stop apply-a1b2c3d4e5f6 -e staging
 ```
 <!-- schemabot:offer-support-channel -->
 
@@ -4024,6 +4103,22 @@ schemabot apply -e staging
 </details>
 
 <details>
+<summary><a name="apply-blocked-already-applying-the-latest-commit"></a><strong>Apply Blocked: Already Applying The Latest Commit</strong></summary>
+
+
+## ⚠️ Apply Already In Progress — Staging
+
+**Database**: `testapp`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+This PR's apply `apply-a1b2c3d4e5f6` is still running (state: `running`), so a second apply cannot start.
+
+It is already applying this PR's latest commit. Follow its progress comment for the outcome and next steps.
+
+</details>
+
+<details>
 <summary><a name="apply-blocked-pr-closed"></a><strong>Apply Blocked: PR Closed</strong></summary>
 
 
@@ -4387,9 +4482,24 @@ Schema changes require approval from an authorized reviewer before applying.
 
 *Requested by @jackjackbits at 2026-01-01 00:00:00 UTC*
 
-Schema changes require approval from an authorized reviewer before applying.
+@jdoe approved an earlier commit, but this PR's change to `schema/testapp/orders.sql` is different now. That approval no longer counts, so the latest commit needs a new approval.
 
-Approvals on an earlier commit no longer count because this PR's schema change is different now: @jdoe. Changed since the approval: `schema/testapp/orders.sql`. Ask for an approval of the latest commit.
+<details>
+<summary>How <code>schema/testapp/orders.sql</code> changed since the approval</summary>
+
+Approved at `4f1c2d9`:
+
+```sql
+ALTER TABLE `orders` MODIFY COLUMN `coupon_code` varchar(64) NULL DEFAULT NULL COMMENT 'NULL until a coupon is applied';
+```
+
+Latest commit `9a3b5c7`:
+
+```sql
+ALTER TABLE `orders` MODIFY COLUMN `coupon_code` varchar(64) NULL DEFAULT NULL;
+```
+
+</details>
 
 **Operators of `testapp`**:
 - @acme/testapp-operators
@@ -4399,7 +4509,7 @@ Approvals on an earlier commit no longer count because this PR's schema change i
 - @jdoe
 
 ### Next steps
-1. Request a review from anyone listed above
+1. Ask @jdoe or anyone listed above to approve the latest commit
 2. Once approved, run `schemabot apply -e staging` again
 
 </details>
@@ -4414,9 +4524,7 @@ Approvals on an earlier commit no longer count because this PR's schema change i
 
 *Requested by @jackjackbits at 2026-01-01 00:00:00 UTC*
 
-Schema changes require approval from an authorized reviewer before applying.
-
-Approvals on an earlier commit no longer count because this PR's schema change is different now: @jdoe. Changed since the approval: `schema/testapp/orders.sql`. This PR targets `release-1.2`, not `main`, so changes that reach `release-1.2` count as a change too. Ask for an approval of the latest commit.
+@jdoe approved an earlier commit, but this PR's change to `schema/testapp/orders.sql` is different now. This PR targets `release-1.2`, not `main`, so changes that reach `release-1.2` also count as changes to this PR. That approval no longer counts, so the latest commit needs a new approval.
 
 **Operators of `testapp`**:
 - @acme/testapp-operators
@@ -4426,7 +4534,7 @@ Approvals on an earlier commit no longer count because this PR's schema change i
 - @jdoe
 
 ### Next steps
-1. Request a review from anyone listed above
+1. Ask @jdoe or anyone listed above to approve the latest commit
 2. Once approved, run `schemabot apply -e staging` again
 
 </details>
@@ -4441,9 +4549,7 @@ Approvals on an earlier commit no longer count because this PR's schema change i
 
 *Requested by @jackjackbits at 2026-01-01 00:00:00 UTC*
 
-Schema changes require approval from an authorized reviewer before applying.
-
-Approvals on an earlier commit no longer count because this PR's schema change is different now: @jdoe. Compared with some earlier approvals, file contents are unchanged, but their merge-base versions differ: `schema/testapp/orders.sql`. Ask for an approval of the latest commit.
+@jdoe approved an earlier commit. `schema/testapp/orders.sql` has not changed since then, but the base branch it builds on has, so applying it now would run different DDL. That approval no longer counts, so the latest commit needs a new approval.
 
 **Operators of `testapp`**:
 - @acme/testapp-operators
@@ -4453,7 +4559,7 @@ Approvals on an earlier commit no longer count because this PR's schema change i
 - @jdoe
 
 ### Next steps
-1. Request a review from anyone listed above
+1. Ask @jdoe or anyone listed above to approve the latest commit
 2. Once approved, run `schemabot apply -e staging` again
 
 </details>
@@ -4485,7 +4591,7 @@ Approvals on an earlier commit no longer count because this PR's schema change i
 
 *Requested by @jackjackbits at 2026-01-01 00:00:00 UTC*
 
-**This apply needs an approval of the latest commit.** @jdoe approved an earlier commit. An earlier approval normally still counts when the PR's schema change has not changed since, but SchemaBot hit an error checking that for this PR, so that approval does not count. Operators can find the error in the server logs.
+**This apply needs an approval of the latest commit.** @jdoe approved an earlier commit. An earlier approval still counts when the PR's schema change is the same at the latest commit, but SchemaBot hit an error checking that, so that approval does not count. Operators can find the error in the server logs.
 
 **Operators of `testapp`**:
 - @acme/testapp-operators
@@ -4495,7 +4601,7 @@ Approvals on an earlier commit no longer count because this PR's schema change i
 - @jdoe
 
 ### Next steps
-1. Ask anyone listed above to approve the latest commit
+1. Ask @jdoe or anyone listed above to approve the latest commit
 2. Once approved, run `schemabot apply -e staging` again
 
 </details>
@@ -9138,9 +9244,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 *Applied by @aparajon at 2026-01-01 00:00:00 UTC*
 
-✅ Rolled out to 3 targets
-
-<details><summary>Apply details (1 table)</summary>
+<details><summary>Apply details (1 table done on 3 targets)</summary>
 
 **`orders`**: ✅ Complete (3 targets)
 

@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -544,10 +545,13 @@ type capturingTernServer struct {
 	cancelErr         error
 	cutoverErr        error
 	cutoverAccepted   bool
-	cutoverMessage    string
-	startCalled       bool // tracks whether Start was actually invoked
-	startCalls        int
-	startCaller       string
+	// cutoverEchoesCommandID answers Cutover with the request's command id,
+	// as a data plane that records each command once does.
+	cutoverEchoesCommandID bool
+	cutoverMessage         string
+	startCalled            bool // tracks whether Start was actually invoked
+	startCalls             int
+	startCaller            string
 	// startHook, when set, runs on every Start with the call's 1-based number
 	// and returns that call's error in place of startErr.
 	startHook        func(call int) error
@@ -570,6 +574,7 @@ type capturingTernServer struct {
 	// data plane's verdict that the operation will never start.
 	progressNeverStarts bool
 	cutoverReq          *ternv1.CutoverRequest
+	cutoverCalls        int
 }
 
 // dispatchOperationKeyEcho mirrors the data plane's operation key derivation
@@ -695,15 +700,21 @@ func (s *capturingTernServer) Cutover(_ context.Context, req *ternv1.CutoverRequ
 	s.mu.Lock()
 	s.cutoverApplyID = req.ApplyId
 	s.cutoverCaller = req.Caller
-	s.cutoverReq = &ternv1.CutoverRequest{ApplyId: req.ApplyId, Environment: req.Environment, Caller: req.Caller, ApplyOperationId: req.ApplyOperationId}
+	s.cutoverReq = &ternv1.CutoverRequest{ApplyId: req.ApplyId, Environment: req.Environment, Caller: req.Caller, ApplyOperationId: req.ApplyOperationId, ApplyOperationIds: slices.Clone(req.ApplyOperationIds), CommandId: req.CommandId}
+	s.cutoverCalls++
 	err := s.cutoverErr
 	accepted := s.cutoverAccepted
 	message := s.cutoverMessage
+	echo := s.cutoverEchoesCommandID
 	s.mu.Unlock()
 	if err != nil {
 		return nil, err
 	}
-	return &ternv1.CutoverResponse{Accepted: accepted, ErrorMessage: message}, nil
+	resp := &ternv1.CutoverResponse{Accepted: accepted, ErrorMessage: message}
+	if echo {
+		resp.CommandId = req.CommandId
+	}
+	return resp, nil
 }
 
 func (s *capturingTernServer) SkipRevert(_ context.Context, req *ternv1.SkipRevertRequest) (*ternv1.SkipRevertResponse, error) {

@@ -2,15 +2,48 @@ package github
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/hmarr/codeowners"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+// A CODEOWNERS rule the parser accepts but cannot match, such as a bare
+// `/ @owner`, yields an error rather than a panic, so the review gate can fail
+// closed with a reason. The error text names the path and the fix but not the
+// panic, which travels separately with its stack for server-side logging.
+// Rules the parser handles still match normally.
+func TestMatchCodeownersPathReturnsAnErrorForAnUnmatchableRule(t *testing.T) {
+	broken, err := codeowners.ParseFile(strings.NewReader("/ @platform-admins\n"))
+	require.NoError(t, err)
+	owners, err := MatchCodeownersPath(broken, "schema/orders/.schema")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "schema/orders/.schema")
+	assert.Contains(t, err.Error(), "fix the rule on the base branch")
+	assert.NotContains(t, err.Error(), "index out of range")
+	assert.Nil(t, owners)
+
+	var unmatchable *UnmatchableCodeownersRuleError
+	require.ErrorAs(t, err, &unmatchable)
+	assert.Equal(t, "schema/orders/.schema", unmatchable.Path)
+	require.NotNil(t, unmatchable.Panic)
+	assert.Contains(t, fmt.Sprint(unmatchable.Panic.Value), "index out of range")
+	assert.NotEmpty(t, unmatchable.Panic.Stack)
+
+	working, err := codeowners.ParseFile(strings.NewReader("/schema/orders/ @orders-team\n"))
+	require.NoError(t, err)
+	owners, err = MatchCodeownersPath(working, "schema/orders/.schema")
+	require.NoError(t, err)
+	require.Len(t, owners, 1)
+	assert.Equal(t, "orders-team", owners[0].Value)
+}
 
 func TestGetApprovedReviewers(t *testing.T) {
 	sameSecond := time.Date(2024, 1, 1, 12, 0, 0, 0, time.UTC)
@@ -142,6 +175,25 @@ func TestGetApprovedReviewsCarriesCommit(t *testing.T) {
 	require.Len(t, approvals, 1)
 	assert.Equal(t, "alice", approvals[0].User)
 	assert.Equal(t, "bbb222", approvals[0].CommitID)
+}
+
+// Approvals come in the order they were given, with the login breaking ties,
+// so a comment that names several approvers names them the same way each time.
+func TestGetApprovedReviewsOrdersBySubmission(t *testing.T) {
+	now := time.Now()
+	reviews := []*ReviewInfo{
+		{User: "dave", State: ReviewApproved, SubmittedAt: now},
+		{User: "carol", State: ReviewApproved, SubmittedAt: now.Add(-time.Hour)},
+		{User: "Bob", State: ReviewApproved, SubmittedAt: now},
+		{User: "alice", State: ReviewApproved, SubmittedAt: now.Add(-2 * time.Hour)},
+	}
+
+	var users []string
+	for _, approval := range GetApprovedReviews(reviews) {
+		users = append(users, approval.User)
+	}
+
+	assert.Equal(t, []string{"alice", "carol", "Bob", "dave"}, users)
 }
 
 func TestIsTeamMember(t *testing.T) {

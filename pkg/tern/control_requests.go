@@ -704,8 +704,9 @@ func failPendingControlRequests(ctx context.Context, store storage.Storage, appl
 // only while its row still carries the revision the caller evaluated, so a
 // drive that decided on one command never settles a later command re-armed on
 // the same row. A row that has moved on is left to the drive evaluating the
-// command it now carries.
-func settlePendingControlRequestRevision(ctx context.Context, store storage.Storage, logger *slog.Logger, apply *storage.Apply, controlReq *storage.ApplyControlRequest, status storage.ControlRequestStatus, errorMessage string) error {
+// command it now carries. remoteIDs are the remote applies a failure message
+// may name, kept out of the operator-facing text.
+func settlePendingControlRequestRevision(ctx context.Context, store storage.Storage, logger *slog.Logger, apply *storage.Apply, controlReq *storage.ApplyControlRequest, status storage.ControlRequestStatus, errorMessage string, remoteIDs ...string) error {
 	if store == nil {
 		return fmt.Errorf("storage is not available")
 	}
@@ -717,7 +718,7 @@ func settlePendingControlRequestRevision(ctx context.Context, store storage.Stor
 		return fmt.Errorf("control request store is not available")
 	}
 	if status == storage.ControlRequestFailed {
-		errorMessage = apply.OperatorFacingMessage(errorMessage)
+		errorMessage = apply.OperatorFacingMessage(errorMessage, remoteIDs...)
 	}
 	settled, err := controlStore.SettlePendingRevision(ctx, controlReq, status, errorMessage)
 	if err != nil {

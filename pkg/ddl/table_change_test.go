@@ -632,3 +632,82 @@ func TestClausesCovered(t *testing.T) {
 		})
 	}
 }
+
+// The DDL shown for a changed schema file is the statement the review gate
+// compares: the strict diff from the file's base, the CREATE TABLE of an
+// added file, or a DROP TABLE for a removed one.
+func TestTableChangeStatements(t *testing.T) {
+	const (
+		base = "CREATE TABLE `shipments` (\n" +
+			"  `id` bigint NOT NULL,\n" +
+			"  `label` binary(32) NOT NULL,\n" +
+			"  PRIMARY KEY (`id`)\n" +
+			") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin"
+		commented = "CREATE TABLE `shipments` (\n" +
+			"  `id` bigint NOT NULL,\n" +
+			"  `label` binary(32) DEFAULT NULL COMMENT 'NULL until printed',\n" +
+			"  PRIMARY KEY (`id`)\n" +
+			") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin"
+		uncommented = "CREATE TABLE `shipments` (\n" +
+			"  `id` bigint NOT NULL,\n" +
+			"  `label` binary(32) DEFAULT NULL,\n" +
+			"  PRIMARY KEY (`id`)\n" +
+			") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin"
+	)
+	for _, tc := range []struct {
+		name       string
+		base, file string
+		want       []string
+	}{
+		{
+			name: "modified column with a comment",
+			base: base, file: commented,
+			want: []string{"ALTER TABLE `shipments` MODIFY COLUMN `label` binary(32) NULL DEFAULT NULL COMMENT 'NULL until printed'"},
+		},
+		{
+			name: "modified column without the comment",
+			base: base, file: uncommented,
+			want: []string{"ALTER TABLE `shipments` MODIFY COLUMN `label` binary(32) NULL DEFAULT NULL"},
+		},
+		{
+			name: "unchanged file",
+			base: base, file: base,
+			want: []string{},
+		},
+		{
+			name: "added file",
+			file: base,
+			want: []string{"CREATE TABLE `shipments` (`id` BIGINT NOT NULL,`label` BINARY(32) NOT NULL,PRIMARY KEY(`id`)) ENGINE = InnoDB DEFAULT CHARACTER SET = UTF8MB4 DEFAULT COLLATE = UTF8MB4_BIN"},
+		},
+		{
+			name: "removed file",
+			base: base,
+			want: []string{"DROP TABLE `shipments`"},
+		},
+		{
+			name: "absent at both",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := TableChangeStatements(tc.base, tc.file)
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, got)
+		})
+	}
+}
+
+// A file that does not hold exactly one CREATE TABLE has no DDL to show.
+func TestTableChangeStatements_CannotParse(t *testing.T) {
+	const table = "CREATE TABLE `t` (`id` bigint NOT NULL, PRIMARY KEY (`id`))"
+	for _, tc := range []struct{ name, base, file string }{
+		{name: "two statements in the file", base: table, file: table + ";\n" + table},
+		{name: "not a CREATE TABLE at the base", base: "ALTER TABLE `t` ADD COLUMN `x` int", file: table},
+		{name: "added file that does not parse", file: "CREATE TABLE"},
+		{name: "removed file that does not parse", base: "CREATE TABLE"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := TableChangeStatements(tc.base, tc.file)
+			require.Error(t, err)
+		})
+	}
+}

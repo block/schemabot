@@ -125,4 +125,4 @@ replace github.com/block/schemabot => ../..
 
 // Mirror the parent module's replace directives; replaces do not propagate
 // across module boundaries.
-replace vitess.io/vitess => github.com/block/vitess v0.0.0-20260925015115-736e47fe71a6
+replace vitess.io/vitess => github.com/block/vitess v0.0.0-20261103173808-12cc16cbb567

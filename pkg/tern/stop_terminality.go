@@ -2,7 +2,7 @@ package tern
 
 import "github.com/block/schemabot/pkg/storage"
 
-// stopTerminatesChange reports whether stopping a schema change on the given
+// StopTerminatesChange reports whether stopping a schema change on the given
 // engine type permanently cancels it — the apply and its tasks move to the
 // terminal Cancelled state with no resume possible — rather than pausing it for
 // resume (the Stopped state).
@@ -13,9 +13,10 @@ import "github.com/block/schemabot/pkg/storage"
 // Start resumes. Past binlog expiry a resume restarts the copy from scratch, but
 // that is still a resumable Stopped, not a Cancelled.
 //
-// This is the single source of truth for the stop-terminality decision. It is
-// keyed on database type rather than an engine capability because the gRPC drive
-// must decide it for undispatched applies, where no engine instance — local or
+// This is the single source of truth for the stop-terminality decision, shared
+// by the data plane and by the operator's stop reconciliation. It is keyed on
+// database type rather than an engine capability because the gRPC drive must
+// decide it for undispatched applies, where no engine instance — local or
 // remote — exists to query. Keep it consistent with each engine's Stop
 // implementation in pkg/engine.
 //
@@ -23,6 +24,6 @@ import "github.com/block/schemabot/pkg/storage"
 // recoveryResumesFromCheckpoint), the input here is a persisted apply row
 // value, so an unknown value must take the conservative default — resumable —
 // rather than treating stale or hand-edited storage data as fatal.
-func stopTerminatesChange(databaseType string) bool {
+func StopTerminatesChange(databaseType string) bool {
 	return databaseType == storage.DatabaseTypeVitess
 }
