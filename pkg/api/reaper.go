@@ -321,7 +321,7 @@ func (s *Service) recordSweepOutcome(ctx context.Context, sweep reapSweep, reape
 // because it wants a much shorter interval than the stranded sweeps do; see
 // RetryableExpiryInterval.
 func (s *Service) runRetryableExpiryPass(ctx context.Context) {
-	expired, err := s.storage.Applies().ExpireRetryable(ctx, retryableExpiryBatch)
+	expired, err := s.storage.Applies().ExpireRetryable(ctx, endedOperationStoppableDatabaseTypes, retryableExpiryBatch)
 
 	// A pass settles its whole batch in one transaction, so this is all of what
 	// it expired or none of it — an error means nothing committed and there is
@@ -396,6 +396,11 @@ func (s *Service) stopApplyHeldByEndedOperation(ctx context.Context, held *stora
 	if !resp.Accepted {
 		s.logger.Error("operator: stop of an apply whose deferred cutover can no longer run was not accepted; the next pass retries",
 			append(attrs, "error_message", resp.ErrorMessage, "response_status", responseStatus)...)
+		return
+	}
+	if responseStatus == stopResponseStatusAlreadyRequested {
+		s.logger.Info("operator: an apply whose deferred cutover can no longer run already has a stop pending; leaving the apply to that stop",
+			append(attrs, "response_status", responseStatus)...)
 		return
 	}
 	s.logger.Info("operator: stopping an apply whose deferred cutover can no longer run because an operation ended before it",

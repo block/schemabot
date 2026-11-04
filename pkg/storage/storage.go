@@ -1055,7 +1055,11 @@ type ApplyStore interface {
 	// ErrRetryableExpiryBusy reports that another instance holds it. The lock is
 	// an efficiency gate, not a safety one: the selection is guarded, so
 	// concurrent passes would be correct but would each pay the full scan.
-	ExpireRetryable(ctx context.Context, limit int) ([]*RetryableApplyExpiration, error)
+	//
+	// It passes over every apply ListAppliesHeldByEndedOperation takes for
+	// endedOperationStopTypes, so the two sweeps never select one apply
+	// between them. Empty passes over none.
+	ExpireRetryable(ctx context.Context, endedOperationStopTypes []string, limit int) ([]*RetryableApplyExpiration, error)
 
 	// ListAppliesHeldByEndedOperation returns applies that deferred their
 	// cutover, have an operation that ended before the cutover, and still have

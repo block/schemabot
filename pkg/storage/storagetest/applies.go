@@ -1870,7 +1870,7 @@ func TestApplies(t *testing.T, h Harness) {
 			return store.CheckLease(t.Context(), storage.ApplyLease{ApplyID: 1, Owner: "driver", Token: "token"})
 		},
 		"ExpireRetryable_DBError": func(t *testing.T, store storage.ApplyStore) error {
-			_, err := store.ExpireRetryable(t.Context(), 10)
+			_, err := store.ExpireRetryable(t.Context(), endedOperationStopTypes, 10)
 			return err
 		},
 		"ListAppliesHeldByEndedOperation_DBError": func(t *testing.T, store storage.ApplyStore) error {

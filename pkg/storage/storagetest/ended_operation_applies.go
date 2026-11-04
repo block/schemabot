@@ -137,12 +137,16 @@ func endedApplyIdentifiers(applies []*storage.EndedOperationApply) []string {
 	return identifiers
 }
 
+// endedOperationStopTypes are the database types the ended operation sweep
+// stops in these tests. The fixtures are MySQL applies, so it names that type,
+// and retry expiry is passed the same list, as the reaper passes both.
+var endedOperationStopTypes = []string{storage.DatabaseTypeMySQL}
+
 // testEndedOperationApplies covers the two sweeps that end an apply deferring
 // its cutover once one of its operations ends before the cutover: the list the
 // reaper stops, and the settle that fails the apply once nothing is driven.
 func testEndedOperationApplies(t *testing.T, h Harness) {
-	// The fixtures are MySQL applies, so the list names that type.
-	pausableTypes := []string{storage.DatabaseTypeMySQL}
+	pausableTypes := endedOperationStopTypes
 
 	// A deferred apply whose shard -40 failed under the halt policy while
 	// shard 40-80 waits at the cutover can never run the cutover for every
@@ -227,7 +231,7 @@ func testEndedOperationApplies(t *testing.T, h Harness) {
 		require.NotNil(t, listed[0].EndedOperation)
 		assert.Equal(t, ops["-40"], listed[0].EndedOperation.ID)
 
-		expired, err := store.Applies().ExpireRetryable(t.Context(), 10)
+		expired, err := store.Applies().ExpireRetryable(t.Context(), endedOperationStopTypes, 10)
 		require.NoError(t, err)
 		assert.Empty(t, expired, "retry expiry leaves an apply a drive still holds")
 	})
@@ -253,23 +257,51 @@ func testEndedOperationApplies(t *testing.T, h Harness) {
 		assert.Equal(t, []string{sameMember.ApplyIdentifier}, endedApplyIdentifiers(listed))
 	})
 
-	// The drive holding a shard is what delivers the stop and saves the copy,
-	// so a waiting shard nobody drives is left to recovery, which claims it
-	// again. The same apply with the shard's drive alive is listed.
-	t.Run("ListAppliesHeldByEndedOperation_SkipsStartedShardNobodyDrives", func(t *testing.T) {
+	// The drive holding a copying shard is what delivers the stop and saves
+	// the copy, so a copying shard nobody drives is left to recovery, which
+	// claims it again. A shard parked at the cutover is listed with or without
+	// a live drive: once SchemaBot's stop is recorded, the claim of a parked
+	// shard takes it, so a drive delivers the stop even after the server that
+	// drove it restarted.
+	t.Run("ListAppliesHeldByEndedOperation_ParkedShardNeedsNoLiveDrive", func(t *testing.T) {
 		store := h.NewStorage(t)
-		createEndedOperationApply(t, store, "apply_ended_undriven", 967, state.Apply.RunningDegraded, true,
+		parked, _ := createEndedOperationApply(t, store, "apply_ended_undriven_parked", 968, state.Apply.RunningDegraded, true,
 			endedOperationFixtureOp{shard: "-40", state: state.ApplyOperation.Failed, taskState: state.Task.Failed, claimed: true},
 			endedOperationFixtureOp{shard: "40-80", state: state.ApplyOperation.WaitingForCutover, taskState: state.Task.WaitingForCutover, claimed: true},
 		)
-		driven, _ := createEndedOperationApply(t, store, "apply_ended_driven", 968, state.Apply.RunningDegraded, true,
+		driven, _ := createEndedOperationApply(t, store, "apply_ended_driven", 969, state.Apply.RunningDegraded, true,
 			endedOperationFixtureOp{shard: "-40", state: state.ApplyOperation.Failed, taskState: state.Task.Failed, claimed: true},
 			endedOperationFixtureOp{shard: "40-80", state: state.ApplyOperation.WaitingForCutover, taskState: state.Task.WaitingForCutover, driven: true},
+		)
+		// Created last: its released copying shard is claimable, so a fixture
+		// built after it would claim that shard instead of its own.
+		createEndedOperationApply(t, store, "apply_ended_undriven_copy", 967, state.Apply.RunningDegraded, true,
+			endedOperationFixtureOp{shard: "-40", state: state.ApplyOperation.Failed, taskState: state.Task.Failed, claimed: true},
+			endedOperationFixtureOp{shard: "40-80", state: state.ApplyOperation.Running, taskState: state.Task.Running, claimed: true},
 		)
 
 		listed, err := store.Applies().ListAppliesHeldByEndedOperation(t.Context(), pausableTypes, 10)
 		require.NoError(t, err)
-		assert.Equal(t, []string{driven.ApplyIdentifier}, endedApplyIdentifiers(listed))
+		assert.ElementsMatch(t, []string{parked.ApplyIdentifier, driven.ApplyIdentifier}, endedApplyIdentifiers(listed))
+	})
+
+	// The parked shard that nobody drives is claimed once SchemaBot's stop is
+	// pending, which is how the stop reaches it.
+	t.Run("ListAppliesHeldByEndedOperation_UndrivenParkedShardIsClaimedForTheStop", func(t *testing.T) {
+		store := h.NewStorage(t)
+		parked, parkedOps := createEndedOperationApply(t, store, "apply_ended_undriven_parked", 968, state.Apply.RunningDegraded, true,
+			endedOperationFixtureOp{shard: "-40", state: state.ApplyOperation.Failed, taskState: state.Task.Failed, claimed: true},
+			endedOperationFixtureOp{shard: "40-80", state: state.ApplyOperation.WaitingForCutover, taskState: state.Task.WaitingForCutover, claimed: true},
+		)
+		claimed, err := store.ApplyOperations().FindNextApplyOperation(t.Context(), "driver-recovery")
+		require.NoError(t, err)
+		require.Nil(t, claimed, "a parked shard with a sibling is not claimed before a stop is pending")
+
+		requestControlBy(t, store, parked.ID, storage.ControlOperationStop, storage.EndedOperationStopCaller)
+		claimed, err = store.ApplyOperations().FindNextApplyOperation(t.Context(), "driver-recovery")
+		require.NoError(t, err)
+		require.NotNil(t, claimed, "the parked shard is claimed once the stop is pending")
+		assert.Equal(t, parkedOps["40-80"], claimed.ID)
 	})
 
 	// Once SchemaBot's stop has reached every shard, the settle fails the
@@ -566,7 +598,7 @@ func testEndedOperationApplies(t *testing.T, h Harness) {
 		plain, _ := createEndedOperationApply(t, store, "apply_ended_expiry_plain", 963, state.Apply.FailedRetryable, true, ops...)
 		spendRetryBudget(t, store, plain.ID)
 
-		expired, err := store.Applies().ExpireRetryable(ctx, 10)
+		expired, err := store.Applies().ExpireRetryable(ctx, endedOperationStopTypes, 10)
 		require.NoError(t, err)
 		expiredIDs := make([]string, len(expired))
 		for i, apply := range expired {

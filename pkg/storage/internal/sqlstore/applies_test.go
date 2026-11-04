@@ -3243,7 +3243,7 @@ func TestApplyStore_ExpireRetryable(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	expired, err := store.Applies().ExpireRetryable(ctx, 10)
+	expired, err := store.Applies().ExpireRetryable(ctx, endedOperationStopTypes, 10)
 	require.NoError(t, err)
 	require.Len(t, expired, 1)
 	assert.Equal(t, storage.RetryableExpirationAttemptBudget, expired[0].Reason)
@@ -3286,7 +3286,7 @@ func TestApplyStore_ExpireRetryableExpiresOldFailures(t *testing.T) {
 	`, apply.ID)
 	require.NoError(t, err)
 
-	expired, err := store.Applies().ExpireRetryable(ctx, 10)
+	expired, err := store.Applies().ExpireRetryable(ctx, endedOperationStopTypes, 10)
 	require.NoError(t, err)
 	require.Len(t, expired, 1)
 	assert.Equal(t, storage.RetryableExpirationRecoveryWindow, expired[0].Reason)
@@ -3332,7 +3332,7 @@ func TestApplyStore_ExpireRetryableTerminalizesRetryableOperations(t *testing.T)
 	})
 	require.NoError(t, err)
 
-	expired, err := store.Applies().ExpireRetryable(ctx, 10)
+	expired, err := store.Applies().ExpireRetryable(ctx, endedOperationStopTypes, 10)
 	require.NoError(t, err)
 	require.Len(t, expired, 1)
 	assert.Equal(t, state.Apply.Failed, expired[0].Apply.State)
@@ -3374,14 +3374,14 @@ func TestApplyStore_ExpireRetryable_TakesTheOldestUpToTheLimit(t *testing.T) {
 		require.NoError(t, err)
 	}
 
-	expired, err := store.Applies().ExpireRetryable(ctx, 2)
+	expired, err := store.Applies().ExpireRetryable(ctx, endedOperationStopTypes, 2)
 	require.NoError(t, err)
 	require.Len(t, expired, 2, "a pass settles at most the limit it was given")
 	assert.Equal(t, []string{"apply_expire_oldest", "apply_expire_middle"},
 		[]string{expired[0].Apply.ApplyIdentifier, expired[1].Apply.ApplyIdentifier},
 		"the backlog drains oldest first")
 
-	remaining, err := store.Applies().ExpireRetryable(ctx, 2)
+	remaining, err := store.Applies().ExpireRetryable(ctx, endedOperationStopTypes, 2)
 	require.NoError(t, err)
 	require.Len(t, remaining, 1, "the tail is settled by the next pass")
 	assert.Equal(t, "apply_expire_newest", remaining[0].Apply.ApplyIdentifier)
@@ -3449,7 +3449,7 @@ func TestApplyStore_ExpireRetryableAndTheParentClaimNeverAdmitTheSameApply(t *te
 		assert.Nil(t, claimed, "an apply expiry will take must not be claimable for a drive: %s", apply.ApplyIdentifier)
 	}
 
-	expired, err := store.Applies().ExpireRetryable(ctx, 10)
+	expired, err := store.Applies().ExpireRetryable(ctx, endedOperationStopTypes, 10)
 	require.NoError(t, err)
 
 	expiredIDs := make([]string, 0, len(expired))
@@ -3498,7 +3498,7 @@ func TestApplyStore_ExpireRetryable_DeclinesAnApplyWhoseOperationADriverHolds(t 
 	queuedTask := createRetryableReapTask(t, store, apply, "task_expire_fanout_queued", "products", state.Task.Pending, "")
 	attachTaskToOperation(t, queuedTask.TaskIdentifier, held)
 
-	expired, err := store.Applies().ExpireRetryable(ctx, 10)
+	expired, err := store.Applies().ExpireRetryable(ctx, endedOperationStopTypes, 10)
 	require.NoError(t, err)
 	assert.Empty(t, expired, "one live sibling holds the whole apply, not just its own rows")
 
@@ -3514,7 +3514,7 @@ func TestApplyStore_ExpireRetryable_DeclinesAnApplyWhoseOperationADriverHolds(t 
 	// The driver dies and its lease ages out. Nothing else changes.
 	backdateOperationHeartbeat(t, held, storage.ApplyLeaseStaleAfter+time.Minute)
 
-	expired, err = store.Applies().ExpireRetryable(ctx, 10)
+	expired, err = store.Applies().ExpireRetryable(ctx, endedOperationStopTypes, 10)
 	require.NoError(t, err)
 	require.Len(t, expired, 1, "a declined apply is offered again on the next pass")
 	assert.Equal(t, storage.RetryableExpirationAttemptBudget, expired[0].Reason)
@@ -3551,13 +3551,13 @@ func TestApplyStore_ExpireRetryable_DefersUntilARetryableOperationsLeaseIsStale(
 	queuedTask := createRetryableReapTask(t, store, apply, "task_expire_settled_queued", "orders", state.Task.Pending, "")
 	attachTaskToOperation(t, queuedTask.TaskIdentifier, settled)
 
-	expired, err := store.Applies().ExpireRetryable(ctx, 10)
+	expired, err := store.Applies().ExpireRetryable(ctx, endedOperationStopTypes, 10)
 	require.NoError(t, err)
 	assert.Empty(t, expired, "a fresh retryable lease may belong to a newly admitted drive")
 	assertTaskState(t, store, failedTask.TaskIdentifier, state.Task.FailedRetryable)
 	assertTaskState(t, store, queuedTask.TaskIdentifier, state.Task.Pending)
 	backdateOperationHeartbeat(t, settled, storage.ApplyLeaseStaleAfter+time.Minute)
-	expired, err = store.Applies().ExpireRetryable(ctx, 10)
+	expired, err = store.Applies().ExpireRetryable(ctx, endedOperationStopTypes, 10)
 	require.NoError(t, err)
 	require.Len(t, expired, 1)
 	assert.Equal(t, storage.RetryableExpirationAttemptBudget, expired[0].Reason)

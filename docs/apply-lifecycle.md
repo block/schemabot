@@ -376,7 +376,9 @@ instead of copying from the start.
 This applies only where a stop pauses the work. Where a stop would end the
 change instead, as it does for PlanetScale, stopping would throw the copies
 away, so the apply waits for its cutover until the wait times out. An apply
-an operator has already stopped or cancelled is left to that request.
+an operator has already stopped or cancelled is left to that request. A stop
+sent after SchemaBot's is answered by SchemaBot's, so the apply still ends
+`failed` with its copies saved. A cancel sent at any point wins.
 
 ## Guidance for agents
 
