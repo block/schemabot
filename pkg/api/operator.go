@@ -88,9 +88,8 @@ func (s *Service) StartOperator(ctx context.Context) {
 	s.claimingStopped = false
 	s.operatorDrivers.Store(int64(driverCount))
 	server := &storage.OperatorServer{
-		ServerID:               newOperatorServerID(),
-		Drivers:                driverCount,
-		DeferredCutoverDrivers: deferredCutoverDrivers(driverCount),
+		ServerID: newOperatorServerID(),
+		Drivers:  driverCount,
 	}
 	s.operatorServerID = server.ServerID
 	heartbeatEvery := s.operatorHeartbeatEvery
@@ -141,7 +140,7 @@ func (s *Service) StartOperator(ctx context.Context) {
 	// to the default in storage. Log the resolved cap beside the pool size.
 	s.logger.Info("operator started",
 		"drivers", driverCount,
-		"deferred_cutover_drivers", server.DeferredCutoverDrivers,
+		"deferred_cutover_drivers", deferredCutoverDrivers(driverCount),
 		"server_id", server.ServerID,
 		"heartbeat_interval", heartbeatEvery,
 		"max_drivers_per_apply", storage.BuildOptions(storage.WithMaxDriversPerApply(s.config.MaxDriversPerApply)).MaxDriversPerApply,

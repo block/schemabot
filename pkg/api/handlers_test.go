@@ -57,7 +57,7 @@ func (m *mockStorage) Close() error                   { return nil }
 // memoryOperatorServers is an in-memory operator server registry whose
 // heartbeats are always live. With hang set, a heartbeat answers only when its
 // context ends, as a storage call that stops responding would. With pruneErr
-// set, every prune fails with it.
+// or listErr set, every prune or list fails with it.
 type memoryOperatorServers struct {
 	mu       sync.Mutex
 	servers  map[string]storage.OperatorServer
@@ -65,6 +65,7 @@ type memoryOperatorServers struct {
 	prunes   int
 	hang     bool
 	pruneErr error
+	listErr  error
 }
 
 func (m *memoryOperatorServers) Heartbeat(ctx context.Context, server *storage.OperatorServer) error {
@@ -102,6 +103,9 @@ func (m *memoryOperatorServers) Deregister(_ context.Context, serverID string) e
 func (m *memoryOperatorServers) ListLive(context.Context) ([]*storage.OperatorServer, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.listErr != nil {
+		return nil, m.listErr
+	}
 	servers := make([]*storage.OperatorServer, 0, len(m.servers))
 	for _, server := range m.servers {
 		servers = append(servers, &server)

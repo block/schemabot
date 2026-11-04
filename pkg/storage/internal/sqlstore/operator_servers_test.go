@@ -3,7 +3,6 @@
 package sqlstore
 
 import (
-	"errors"
 	"testing"
 	"time"
 
@@ -27,17 +26,16 @@ func TestPostgresOperatorServersIgnoreAndPruneStaleHeartbeats(t *testing.T) {
 }
 
 // A server whose heartbeat is older than the live window has stopped, so its
-// drivers are neither listed nor counted toward deferred cutover admission,
-// and a row older than the retention is removed by the next prune of any
+// drivers are not listed for deferred cutover admission to count, and a row older than the retention is removed by the next prune of any
 // server.
 func testOperatorServersIgnoreAndPruneStaleHeartbeats(t *testing.T, store *Storage) {
 	ctx := t.Context()
 	servers := store.OperatorServers()
 
 	for _, server := range []*storage.OperatorServer{
-		{ServerID: "host-live/1/operator", Drivers: 2, DeferredCutoverDrivers: 1},
-		{ServerID: "host-stale/1/operator", Drivers: 8, DeferredCutoverDrivers: 7},
-		{ServerID: "host-gone/1/operator", Drivers: 8, DeferredCutoverDrivers: 7},
+		{ServerID: "host-live/1/operator", Drivers: 2},
+		{ServerID: "host-stale/1/operator", Drivers: 8},
+		{ServerID: "host-gone/1/operator", Drivers: 8},
 	} {
 		require.NoError(t, servers.Heartbeat(ctx, server))
 	}
@@ -54,17 +52,7 @@ func testOperatorServersIgnoreAndPruneStaleHeartbeats(t *testing.T, store *Stora
 	require.Len(t, live, 1)
 	assert.Equal(t, "host-live/1/operator", live[0].ServerID)
 
-	apply := newGroupedCreateApply(time.Now(), "apply_deferred_stale_capacity")
-	apply.Options = []byte(`{"defer_cutover":true}`)
-	apply.DeferredCutoverOperations = 2
-	groups := []*storage.ApplyOperationWithTasks{newGroupedCreateGroup(time.Now(), "payments-a", "", "users")}
-	_, err = store.Applies().CreateWithGroupedOperations(ctx, apply, groups)
-	refused, ok := errors.AsType[*storage.DeferredCutoverCapacityError](err)
-	require.True(t, ok, "got %v", err)
-	assert.Equal(t, 1, refused.Capacity, "only the live server's drivers count")
-	assert.Equal(t, 1, refused.LiveServers)
-
-	require.NoError(t, servers.Heartbeat(ctx, &storage.OperatorServer{ServerID: "host-live/1/operator", Drivers: 2, DeferredCutoverDrivers: 1}))
+	require.NoError(t, servers.Heartbeat(ctx, &storage.OperatorServer{ServerID: "host-live/1/operator", Drivers: 2}))
 	assert.Equal(t, []string{"host-gone/1/operator", "host-live/1/operator", "host-stale/1/operator"}, operatorServerIDs(t, store), "a heartbeat alone removes nothing")
 	require.NoError(t, servers.PruneStale(ctx))
 	assert.Equal(t, []string{"host-live/1/operator", "host-stale/1/operator"}, operatorServerIDs(t, store))

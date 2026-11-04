@@ -4,19 +4,13 @@ import "github.com/block/schemabot/pkg/state"
 
 // DeferredCutoverHeldAtOnce counts the most drivers one apply deferring its
 // cutover would keep waiting there at once: its work operations that are not
-// already settled, counting a stopped one since starting its apply again
-// resumes it, taken in the order the claim starts them (ST-10), and capped at
-// maxDriversPerApply. A waiting operation keeps counting against that cap, so
-// an apply wider than it holds no more drivers than the cap; apply creation
-// refuses such an apply, so only one admitted under a larger cap is counted
-// this way. Under `rolling`, and any policy the claim
-// does not order as barrier or parallel, a member starts only once every
-// earlier member has completed, and a held member completes only once an
-// operator cuts it over, so one member holds at a time. Under `barrier` and
-// `parallel` every deployment's members hold together. A finalizer runs after
-// the work it finalizes and never waits at a cutover. A maxDriversPerApply of
-// zero or less leaves the count uncapped.
-func DeferredCutoverHeldAtOnce(ops []*ApplyOperation, maxDriversPerApply int) int {
+// already settled, taken in the order the claim starts them (ST-10). Under
+// `rolling`, and any policy the claim does not order as barrier or parallel, a
+// member starts only once every earlier member has completed, and a held member
+// completes only once an operator cuts it over, so one member holds at a time.
+// Under `barrier` and `parallel` every deployment's members hold together. A
+// finalizer runs after the work it finalizes and never waits at a cutover.
+func DeferredCutoverHeldAtOnce(ops []*ApplyOperation) int {
 	type rolloutMember struct{ deployment, target string }
 	ordered := false
 	byMember := make(map[rolloutMember]int)
@@ -40,9 +34,6 @@ func DeferredCutoverHeldAtOnce(ops []*ApplyOperation, maxDriversPerApply int) in
 		for _, operations := range byMember {
 			width = max(width, operations)
 		}
-	}
-	if maxDriversPerApply > 0 {
-		width = min(width, maxDriversPerApply)
 	}
 	return width
 }

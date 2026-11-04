@@ -380,8 +380,7 @@ type SettingsStore interface {
 }
 
 // OperatorServerLiveWindow is how recently a server must have heartbeated for
-// OperatorServerStore.ListLive and deferred cutover admission to count its
-// drivers. It matches ApplyLeaseStaleAfter, so a server's drivers leave the
+// OperatorServerStore.ListLive to count its drivers. It matches ApplyLeaseStaleAfter, so a server's drivers leave the
 // count at the moment its leases become reclaimable by peers.
 const OperatorServerLiveWindow = ApplyLeaseStaleAfter
 
@@ -396,7 +395,7 @@ const OperatorServerRetention = time.Hour
 // follow the replica count as it changes.
 type OperatorServerStore interface {
 	// Heartbeat records that server's operator is running now, with its
-	// driver counts, creating its row on the first beat. The time recorded is
+	// driver count, creating its row on the first beat. The time recorded is
 	// the database's clock, so servers whose clocks disagree are still
 	// compared on one.
 	Heartbeat(ctx context.Context, server *OperatorServer) error
@@ -1586,14 +1585,6 @@ type ApplyOperationStore interface {
 	// tells a data plane, which resolves targets on demand rather than
 	// listing them in config, which targets it has applied to.
 	ListRecentTargets(ctx context.Context, databaseType string, lookback time.Duration) ([]AppliedTarget, error)
-
-	// ListActiveDeferredCutoverWidths returns, for each apply started with
-	// --defer-cutover that has not settled, the most of its unsettled work
-	// operations that would hold at its cutover at once
-	// (DeferredCutoverHeldAtOnce), ordered by apply identifier. A stopped apply and its
-	// stopped operations are counted, since starting it again resumes them.
-	// Applies with no such operation are left out.
-	ListActiveDeferredCutoverWidths(ctx context.Context) ([]DeferredCutoverWidth, error)
 
 	// UpdateState transitions a child row to a new state. Updates the state
 	// column only; for transitions that should also stamp started_at or

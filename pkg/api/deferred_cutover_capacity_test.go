@@ -2,8 +2,8 @@ package api
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
-	"strings"
 	"testing"
 	"time"
 
@@ -14,49 +14,113 @@ import (
 	"github.com/block/schemabot/pkg/storage"
 )
 
-// An apply started with --defer-cutover asks storage to admit every operation
-// it would hold at its cutover, and an apply that does not defer asks for
-// nothing, so only deferred applies are counted against the drivers.
-func TestDeferredCutoverApplyAsksStorageToAdmitItsOperations(t *testing.T) {
-	for _, tc := range []struct {
-		name    string
-		options map[string]string
-		want    int
-	}{
-		{name: "deferred", options: map[string]string{"defer_cutover": "true"}, want: 1},
-		{name: "not deferred", want: 0},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			applies := &capturingApplyStore{}
-			svc, _ := newQueueApplyTestService(trustedQueueApplyTestPlan(), &mockTernClient{isRemote: true}, applies)
-
-			_, _, err := svc.EnqueueAuthorizedApply(t.Context(), ApplyRequest{PlanID: "plan-1", Environment: "staging", Options: tc.options})
-			require.NoError(t, err)
-			require.NotNil(t, applies.apply)
-			assert.Equal(t, tc.want, applies.apply.DeferredCutoverOperations)
-		})
+// seedLiveServers records one live operator server per entry, each running
+// that many drivers.
+func seedLiveServers(t *testing.T, svc *Service, drivers ...int) {
+	t.Helper()
+	registry := &svc.storage.(*mockStorageWithApplyStores).operatorServers
+	for i, n := range drivers {
+		require.NoError(t, registry.Heartbeat(t.Context(), &storage.OperatorServer{ServerID: fmt.Sprintf("host-%d/1/operator", i), Drivers: n}))
 	}
 }
 
-// Storage refusing a deferred apply's admission reaches the caller as a
-// DeferredCutoverCapacityError naming the database, environment and counts, not
-// as a storage failure.
-func TestDeferredCutoverRefusalFromStorageNamesTheCounts(t *testing.T) {
-	applies := &capturingApplyStore{err: &storage.DeferredCutoverCapacityError{
-		Operations: 128, Reserved: 128, Capacity: 192, LiveServers: 64, HoldingApplyIDs: []string{"apply-first"},
-	}}
-	svc, _ := newQueueApplyTestService(trustedQueueApplyTestPlan(), &mockTernClient{isRemote: true}, applies)
+var deferredApplyRequest = ApplyRequest{PlanID: "plan-1", Environment: "staging", Options: map[string]string{"defer_cutover": "true"}}
 
-	_, _, err := svc.EnqueueAuthorizedApply(t.Context(), ApplyRequest{PlanID: "plan-1", Environment: "staging", Options: map[string]string{"defer_cutover": "true"}})
+// A deferred apply of three shards keeps three drivers waiting at its
+// cutover. Two servers of two drivers each keep one driver apiece for other
+// work, so they have two drivers that can wait and the apply is refused
+// before anything is stored. A third server gives it the third driver, and
+// the same apply is created.
+func TestDeferredCutoverWiderThanTheFleetIsRefused(t *testing.T) {
+	applies := &capturingApplyStore{}
+	svc, _ := newQueueApplyTestService(threeShardQueueApplyTestPlan(), &mockTernClient{isRemote: true}, applies)
+	svc.config.MaxDriversPerApply = 3
+	seedLiveServers(t, svc, 2, 2)
+
+	_, _, err := svc.EnqueueAuthorizedApply(t.Context(), deferredApplyRequest)
 
 	refused, ok := errors.AsType[*DeferredCutoverCapacityError](err)
 	require.True(t, ok, "got %v", err)
-	assert.Equal(t, DeferredCutoverCapacityError{
-		Database: "testdb", Environment: "staging", Operations: 128, Reserved: 128, Capacity: 192, LiveServers: 64,
-		HoldingApplyIDs: []string{"apply-first"},
-	}, *refused)
+	assert.Equal(t, DeferredCutoverCapacityError{Database: "testdb", Environment: "staging", Operations: 3, Drivers: 2, LiveServers: 2}, *refused)
+	assert.Nil(t, applies.apply, "a refused apply stores nothing")
+
+	seedLiveServers(t, svc, 2, 2, 2)
+	_, _, err = svc.EnqueueAuthorizedApply(t.Context(), deferredApplyRequest)
+	require.NoError(t, err)
+	assert.NotNil(t, applies.apply)
+}
+
+// Only the apply's own width is checked: other applies use drivers the way
+// any busy fleet does, so a deferred apply that fits the fleet is created
+// whatever else is running.
+func TestDeferredCutoverIsNotCheckedAgainstOtherApplies(t *testing.T) {
+	applies := &capturingApplyStore{}
+	svc, _ := newQueueApplyTestService(threeShardQueueApplyTestPlan(), &mockTernClient{isRemote: true}, applies)
+	svc.config.MaxDriversPerApply = 3
+	seedLiveServers(t, svc, 4)
+
+	for range 2 {
+		_, _, err := svc.EnqueueAuthorizedApply(t.Context(), deferredApplyRequest)
+		require.NoError(t, err)
+	}
+}
+
+// A deferred apply's waiting operations keep counting against
+// max_drivers_per_apply, and its cutover is accepted only once every
+// operation waits, so an apply that would hold more operations at once than
+// the cap could never be cut over. Apply creation refuses it before reading
+// the fleet, naming the cap.
+func TestDeferredCutoverWiderThanThePerApplyCapIsRefused(t *testing.T) {
+	applies := &capturingApplyStore{}
+	svc, _ := newQueueApplyTestService(threeShardQueueApplyTestPlan(), &mockTernClient{isRemote: true}, applies)
+	seedLiveServers(t, svc, 8)
+
+	_, _, err := svc.EnqueueAuthorizedApply(t.Context(), deferredApplyRequest)
+
+	refused, ok := errors.AsType[*DeferredCutoverCapacityError](err)
+	require.True(t, ok, "got %v", err)
+	assert.Equal(t, DeferredCutoverCapacityError{Database: "testdb", Environment: "staging", Operations: 3, PerApplyCap: storage.DefaultMaxDriversPerApply}, *refused)
+	assert.Nil(t, applies.apply, "a refused apply stores nothing")
+}
+
+// The same sharded apply without --defer-cutover is never checked: its
+// shards cut over on their own, so it runs in batches of the cap on whatever
+// drivers are free, with no server registered at all.
+func TestApplyWithoutDeferCutoverIsNotChecked(t *testing.T) {
+	applies := &capturingApplyStore{}
+	svc, _ := newQueueApplyTestService(threeShardQueueApplyTestPlan(), &mockTernClient{isRemote: true}, applies)
+
+	_, _, err := svc.EnqueueAuthorizedApply(t.Context(), ApplyRequest{PlanID: "plan-1", Environment: "staging"})
+	require.NoError(t, err)
+	assert.NotNil(t, applies.apply)
+}
+
+// A deferred apply of one operation is never checked: its one cutover
+// command reaches all of it as soon as it waits.
+func TestDeferredCutoverOfOneOperationIsNotChecked(t *testing.T) {
+	applies := &capturingApplyStore{}
+	svc, _ := newQueueApplyTestService(trustedQueueApplyTestPlan(), &mockTernClient{isRemote: true}, applies)
+
+	_, _, err := svc.EnqueueAuthorizedApply(t.Context(), deferredApplyRequest)
+	require.NoError(t, err)
+	assert.NotNil(t, applies.apply)
+}
+
+// A registry that cannot be read refuses nothing and admits nothing: apply
+// creation fails as a storage failure, never as a capacity refusal.
+func TestDeferredCutoverRegistryFailureIsAStorageFailure(t *testing.T) {
+	applies := &capturingApplyStore{}
+	svc, _ := newQueueApplyTestService(threeShardQueueApplyTestPlan(), &mockTernClient{isRemote: true}, applies)
+	svc.config.MaxDriversPerApply = 3
+	svc.storage.(*mockStorageWithApplyStores).operatorServers.listErr = errors.New("registry unavailable")
+
+	_, _, err := svc.EnqueueAuthorizedApply(t.Context(), deferredApplyRequest)
+
 	_, isStorageErr := errors.AsType[*applyStorageError](err)
-	assert.False(t, isStorageErr)
+	assert.True(t, isStorageErr, "got %v", err)
+	_, isRefusal := errors.AsType[*DeferredCutoverCapacityError](err)
+	assert.False(t, isRefusal)
+	assert.Nil(t, applies.apply)
 }
 
 func TestDeferredCutoverCapacityErrorMessages(t *testing.T) {
@@ -66,31 +130,19 @@ func TestDeferredCutoverCapacityErrorMessages(t *testing.T) {
 		want    string
 	}{
 		{
-			name:    "alongside other deferred applies",
-			refused: DeferredCutoverCapacityError{Database: "commerce", Environment: "production", Operations: 128, Reserved: 128, Capacity: 192, LiveServers: 64, HoldingApplyIDs: []string{"apply-first"}},
-			want:    "commerce/production: --defer-cutover would keep 128 drivers waiting at the cutover at once; SchemaBot can keep 192 drivers waiting across all its servers, and apply apply-first already keeps 128 of them waiting, leaving 64; apply again without --defer-cutover, or once it is cut over or cancelled",
-		},
-		{
-			name: "alongside many deferred applies",
-			refused: DeferredCutoverCapacityError{Database: "commerce", Environment: "production", Operations: 2, Reserved: 14, Capacity: 15, LiveServers: 5, HoldingApplyIDs: []string{
-				"apply-1", "apply-2", "apply-3", "apply-4", "apply-5", "apply-6", "apply-7",
-			}},
-			want: "commerce/production: --defer-cutover would keep 2 drivers waiting at the cutover at once; SchemaBot can keep 15 drivers waiting across all its servers, and applies apply-1, apply-2, apply-3, apply-4, apply-5 and 2 more already keep 14 of them waiting, leaving 1; apply again without --defer-cutover, or once they are cut over or cancelled",
-		},
-		{
-			name:    "wider than the whole capacity",
-			refused: DeferredCutoverCapacityError{Database: "commerce", Environment: "production", Operations: 100, Capacity: 96, LiveServers: 32},
-			want:    "commerce/production: --defer-cutover would keep 100 drivers waiting at the cutover at once, and SchemaBot can keep 96 drivers waiting across all its servers; apply again without --defer-cutover",
+			name:    "wider than the fleet",
+			refused: DeferredCutoverCapacityError{Database: "commerce", Environment: "production", Operations: 128, Drivers: 84, LiveServers: 12},
+			want:    "commerce/production can't defer its cutover: it would keep 128 drivers waiting until you cut over, and SchemaBot's servers have 84. Apply without --defer-cutover",
 		},
 		{
 			name:    "wider than max_drivers_per_apply",
-			refused: DeferredCutoverCapacityError{Database: "commerce", Environment: "production", Operations: 16, PerApplyCap: 2},
-			want:    "commerce/production: --defer-cutover would keep 16 drivers waiting at the cutover at once, and max_drivers_per_apply gives one apply at most 2; apply again without --defer-cutover, or raise max_drivers_per_apply to at least 16",
+			refused: DeferredCutoverCapacityError{Database: "commerce", Environment: "production", Operations: 128, PerApplyCap: 2},
+			want:    "commerce/production can't defer its cutover: it would keep 128 drivers waiting until you cut over, and one apply can use at most 2 (max_drivers_per_apply). Apply without --defer-cutover, or raise max_drivers_per_apply to 128",
 		},
 		{
 			name:    "no live server",
 			refused: DeferredCutoverCapacityError{Database: "commerce", Environment: "production", Operations: 4},
-			want:    "commerce/production: --defer-cutover would keep 4 drivers waiting at the cutover at once, and no SchemaBot server has reported its drivers in the last minute; apply again without --defer-cutover",
+			want:    "commerce/production can't defer its cutover yet: no SchemaBot server has reported its drivers in the last minute. Try again shortly, or apply without --defer-cutover",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -99,9 +151,92 @@ func TestDeferredCutoverCapacityErrorMessages(t *testing.T) {
 	}
 }
 
+// Only a refusal that can clear on its own, no server having reported its
+// drivers yet, answers 409; one that is refused on every retry answers 422.
+// Both carry the deferred cutover error code, so a caller can tell a refusal
+// of --defer-cutover from any other conflict, and either is a refusal of the
+// request, never a server failure.
+func TestDeferredCutoverRefusalStatusAndCode(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		perApplyCap int
+		servers     []int
+		status      int
+		message     string
+	}{
+		{name: "no live server", perApplyCap: 3, status: http.StatusConflict,
+			message: "apply rejected: testdb/staging can't defer its cutover yet: no SchemaBot server has reported its drivers in the last minute. Try again shortly, or apply without --defer-cutover"},
+		{name: "wider than the fleet", perApplyCap: 3, servers: []int{2, 2}, status: http.StatusUnprocessableEntity,
+			message: "apply rejected: testdb/staging can't defer its cutover: it would keep 3 drivers waiting until you cut over, and SchemaBot's servers have 2. Apply without --defer-cutover"},
+		{name: "wider than max_drivers_per_apply", servers: []int{8}, status: http.StatusUnprocessableEntity,
+			message: "apply rejected: testdb/staging can't defer its cutover: it would keep 3 drivers waiting until you cut over, and one apply can use at most 2 (max_drivers_per_apply). Apply without --defer-cutover, or raise max_drivers_per_apply to 3"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			applies := &capturingApplyStore{}
+			svc, _ := newQueueApplyTestService(threeShardQueueApplyTestPlan(), &mockTernClient{isRemote: true}, applies)
+			svc.config.MaxDriversPerApply = tc.perApplyCap
+			seedLiveServers(t, svc, tc.servers...)
+
+			status, resp := postApplyForRefusal(t, svc, `{"plan_id":"plan-1","environment":"staging","options":{"defer_cutover":"true"}}`)
+
+			assert.Equal(t, tc.status, status)
+			assert.Equal(t, apitypes.ErrCodeDeferredCutoverCapacity, resp.ErrorCode)
+			assert.Equal(t, tc.message, resp.Error)
+			assert.False(t, apitypes.IsRetryableErrorCode(resp.ErrorCode), "a retry without a change to the request or the plane is refused again")
+			assert.Nil(t, applies.apply, "a refused apply stores nothing")
+
+			_, _, err := svc.EnqueueAuthorizedApply(t.Context(), deferredApplyRequest)
+			assert.Equal(t, applyMetricStatusRejected, applyMetricStatusForError(err))
+		})
+	}
+}
+
+// The check a caller runs before asking a person to confirm the apply gives
+// the same answer apply creation would, without storing anything: a refusal
+// for an apply wider than the fleet, and nothing once the fleet fits it or
+// when the apply does not defer its cutover.
+func TestDeferredCutoverCapacityRefusalAheadOfApplyCreation(t *testing.T) {
+	applies := &capturingApplyStore{}
+	svc, _ := newQueueApplyTestService(threeShardQueueApplyTestPlan(), &mockTernClient{isRemote: true}, applies)
+	svc.config.MaxDriversPerApply = 3
+	seedLiveServers(t, svc, 2, 2)
+
+	refused, err := svc.DeferredCutoverCapacityRefusal(t.Context(), deferredApplyRequest)
+	require.NoError(t, err)
+	require.NotNil(t, refused)
+	assert.Equal(t, DeferredCutoverCapacityError{Database: "testdb", Environment: "staging", Operations: 3, Drivers: 2, LiveServers: 2}, *refused)
+
+	refused, err = svc.DeferredCutoverCapacityRefusal(t.Context(), ApplyRequest{PlanID: "plan-1", Environment: "staging"})
+	require.NoError(t, err)
+	assert.Nil(t, refused, "an apply that does not defer is never checked")
+
+	seedLiveServers(t, svc, 2, 2, 2)
+	refused, err = svc.DeferredCutoverCapacityRefusal(t.Context(), deferredApplyRequest)
+	require.NoError(t, err)
+	assert.Nil(t, refused)
+	assert.Nil(t, applies.apply, "the check stores nothing")
+}
+
+// The check ahead of apply creation returns an error only when it cannot read
+// what it needs. A registry that cannot be read is that error; a plan that is
+// not stored is left to apply creation, which says so in its own words.
+func TestDeferredCutoverCapacityRefusalAheadOfApplyCreationErrors(t *testing.T) {
+	svc, _ := newQueueApplyTestService(threeShardQueueApplyTestPlan(), &mockTernClient{isRemote: true}, &capturingApplyStore{})
+	svc.config.MaxDriversPerApply = 3
+	svc.storage.(*mockStorageWithApplyStores).operatorServers.listErr = errors.New("registry unavailable")
+
+	refused, err := svc.DeferredCutoverCapacityRefusal(t.Context(), deferredApplyRequest)
+	require.ErrorContains(t, err, "registry unavailable")
+	assert.Nil(t, refused)
+
+	missing, _ := newQueueApplyTestService(nil, &mockTernClient{isRemote: true}, &capturingApplyStore{})
+	refused, err = missing.DeferredCutoverCapacityRefusal(t.Context(), deferredApplyRequest)
+	require.NoError(t, err)
+	assert.Nil(t, refused)
+}
+
 // A running operator records its drivers in the registry before any driver
-// claims, keeping one driver off deferred work, and removes its row when it
-// stops, so deferred cutover admission counts exactly the servers running
+// claims, and removes its row when it stops, so deferred cutover admission counts exactly the servers running
 // now. A restarted operator registers as a new run.
 func TestOperatorRegistersItsDriversWhileRunning(t *testing.T) {
 	svc, _ := newQueueApplyTestService(trustedQueueApplyTestPlan(), &mockTernClient{}, &capturingApplyStore{})
@@ -118,7 +253,6 @@ func TestOperatorRegistersItsDriversWhileRunning(t *testing.T) {
 	first := live[0].ServerID
 	assert.Contains(t, first, storage.LeaseOwnerProcess()+"/operator-")
 	assert.Equal(t, 4, live[0].Drivers)
-	assert.Equal(t, 3, live[0].DeferredCutoverDrivers)
 
 	svc.StopOperator()
 	live, err = registry.ListLive(t.Context())
@@ -178,45 +312,6 @@ func TestOperatorStartupHeartbeatGivesUpAtItsDeadline(t *testing.T) {
 	assert.Empty(t, live, "a heartbeat that timed out records no row")
 }
 
-// A deferred apply's waiting operations keep counting against
-// max_drivers_per_apply, and its cutover is accepted only once every
-// operation waits, so an apply that would hold more operations at once than
-// the cap could never be cut over. Apply creation refuses it before storing
-// anything, naming the cap, and admits the same apply once the cap covers
-// every operation.
-func TestDeferredCutoverWiderThanThePerApplyCapIsRefused(t *testing.T) {
-	plan := threeShardQueueApplyTestPlan()
-	applies := &capturingApplyStore{}
-	svc, _ := newQueueApplyTestService(plan, &mockTernClient{isRemote: true}, applies)
-	deferred := ApplyRequest{PlanID: "plan-1", Environment: "staging", Options: map[string]string{"defer_cutover": "true"}}
-
-	_, _, err := svc.EnqueueAuthorizedApply(t.Context(), deferred)
-
-	refused, ok := errors.AsType[*DeferredCutoverCapacityError](err)
-	require.True(t, ok, "got %v", err)
-	assert.Equal(t, DeferredCutoverCapacityError{Database: "testdb", Environment: "staging", Operations: 3, PerApplyCap: storage.DefaultMaxDriversPerApply}, *refused)
-	assert.Nil(t, applies.apply, "a refused apply stores nothing")
-
-	svc.config.MaxDriversPerApply = 3
-	_, _, err = svc.EnqueueAuthorizedApply(t.Context(), deferred)
-	require.NoError(t, err)
-	require.NotNil(t, applies.apply)
-	assert.Equal(t, 3, applies.apply.DeferredCutoverOperations)
-}
-
-// The same sharded apply without --defer-cutover is never checked against
-// max_drivers_per_apply: its shards cut over on their own, so it runs in
-// batches of the cap.
-func TestApplyWiderThanThePerApplyCapRunsWithoutDeferCutover(t *testing.T) {
-	applies := &capturingApplyStore{}
-	svc, _ := newQueueApplyTestService(threeShardQueueApplyTestPlan(), &mockTernClient{isRemote: true}, applies)
-
-	_, _, err := svc.EnqueueAuthorizedApply(t.Context(), ApplyRequest{PlanID: "plan-1", Environment: "staging"})
-	require.NoError(t, err)
-	require.NotNil(t, applies.apply)
-	assert.Zero(t, applies.apply.DeferredCutoverOperations)
-}
-
 // threeShardQueueApplyTestPlan is trustedQueueApplyTestPlan with one table
 // change on each of three shards, so the apply is wider than the default
 // max_drivers_per_apply.
@@ -230,53 +325,6 @@ func threeShardQueueApplyTestPlan() *storage.Plan {
 	return plan
 }
 
-// A refusal that can clear on its own answers 409, one that fails on every
-// retry answers 422, and both carry the deferred cutover error code, so a
-// caller can tell a refusal of --defer-cutover from any other conflict. Either
-// is a refusal of the request, never a server failure.
-func TestDeferredCutoverRefusalStatusAndCode(t *testing.T) {
-	for _, tc := range []struct {
-		name    string
-		refused *storage.DeferredCutoverCapacityError
-		status  int
-	}{
-		{name: "crowded by other deferred applies", refused: &storage.DeferredCutoverCapacityError{Operations: 2, Reserved: 5, Capacity: 6, LiveServers: 2, HoldingApplyIDs: []string{"apply-first"}}, status: http.StatusConflict},
-		{name: "no live server", refused: &storage.DeferredCutoverCapacityError{Operations: 2}, status: http.StatusConflict},
-		{name: "wider than every live driver", refused: &storage.DeferredCutoverCapacityError{Operations: 8, Capacity: 6, LiveServers: 2}, status: http.StatusUnprocessableEntity},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			applies := &capturingApplyStore{err: tc.refused}
-			svc, _ := newQueueApplyTestService(trustedQueueApplyTestPlan(), &mockTernClient{isRemote: true}, applies)
-
-			status, resp := postApplyForRefusal(t, svc, `{"plan_id":"plan-1","environment":"staging","options":{"defer_cutover":"true"}}`)
-
-			assert.Equal(t, tc.status, status)
-			assert.Equal(t, apitypes.ErrCodeDeferredCutoverCapacity, resp.ErrorCode)
-			assert.True(t, strings.HasPrefix(resp.Error, "apply rejected: testdb/staging: --defer-cutover would keep"), resp.Error)
-			assert.False(t, apitypes.IsRetryableErrorCode(resp.ErrorCode), "a retry without a change to the request or the plane is refused again")
-
-			_, _, err := svc.EnqueueAuthorizedApply(t.Context(), ApplyRequest{PlanID: "plan-1", Environment: "staging", Options: map[string]string{"defer_cutover": "true"}})
-			assert.Equal(t, applyMetricStatusRejected, applyMetricStatusForError(err))
-		})
-	}
-}
-
-// A deferred apply wider than max_drivers_per_apply is refused before
-// storage with 422 and the deferred cutover error code: raising the cap or
-// dropping the flag is the only way it runs, so a retry of the same request
-// is refused again.
-func TestDeferredCutoverWiderThanThePerApplyCapAnswers422(t *testing.T) {
-	applies := &capturingApplyStore{}
-	svc, _ := newQueueApplyTestService(threeShardQueueApplyTestPlan(), &mockTernClient{isRemote: true}, applies)
-
-	status, resp := postApplyForRefusal(t, svc, `{"plan_id":"plan-1","environment":"staging","options":{"defer_cutover":"true"}}`)
-
-	assert.Equal(t, http.StatusUnprocessableEntity, status)
-	assert.Equal(t, apitypes.ErrCodeDeferredCutoverCapacity, resp.ErrorCode)
-	assert.Equal(t, "apply rejected: testdb/staging: --defer-cutover would keep 3 drivers waiting at the cutover at once, and max_drivers_per_apply gives one apply at most 2; apply again without --defer-cutover, or raise max_drivers_per_apply to at least 3", resp.Error)
-	assert.Nil(t, applies.apply, "a refused apply stores nothing")
-}
-
 // A heartbeat whose prune fails still records the server, so its drivers keep
 // counting toward deferred cutover admission.
 func TestOperatorHeartbeatSurvivesAFailedPrune(t *testing.T) {
@@ -284,11 +332,11 @@ func TestOperatorHeartbeatSurvivesAFailedPrune(t *testing.T) {
 	registry := &svc.storage.(*mockStorageWithApplyStores).operatorServers
 	registry.pruneErr = errors.New("prune failed")
 
-	svc.heartbeatOperatorServer(t.Context(), &storage.OperatorServer{ServerID: "host-a/1/operator", Drivers: 4, DeferredCutoverDrivers: 3})
+	svc.heartbeatOperatorServer(t.Context(), &storage.OperatorServer{ServerID: "host-a/1/operator", Drivers: 4})
 
 	live, err := registry.ListLive(t.Context())
 	require.NoError(t, err)
 	require.Len(t, live, 1)
-	assert.Equal(t, 3, live[0].DeferredCutoverDrivers)
+	assert.Equal(t, 4, live[0].Drivers)
 	assert.Equal(t, 1, registry.prunes)
 }

@@ -59,9 +59,6 @@ type applyStore struct {
 	// session-scoped advisory lock held on the pinned apply connection. It must
 	// match the storage database's family.
 	locker namedlock.Locker
-	// maxDriversPerApply caps how many operations one apply runs at once, and
-	// so how many it can keep waiting at a deferred cutover.
-	maxDriversPerApply int
 }
 
 type applyWriteTx struct {
@@ -69,9 +66,6 @@ type applyWriteTx struct {
 	locker         namedlock.Locker
 	targetLockConn *rebindConn
 	targetLockName string
-	// admissionLocked reports whether targetLockConn also holds
-	// deferredCutoverAdmissionLockName.
-	admissionLocked bool
 }
 
 type queryRower interface {
@@ -298,87 +292,20 @@ func beginApplyWriteTx(ctx context.Context, beginner txBeginner, operation strin
 }
 
 func beginApplyTargetWriteTx(ctx context.Context, db *rebindDB, locker namedlock.Locker, operation, database, dbType, environment string) (*applyWriteTx, error) {
-	return beginApplyTargetWriteTxLocking(ctx, db, locker, operation, database, dbType, environment, false)
-}
-
-// beginApplyTargetWriteTxLocking is beginApplyTargetWriteTx that, when
-// admitDeferred is set, also takes deferredCutoverAdmissionLockName on the
-// target lock's connection before the transaction begins, so the
-// transaction's snapshot is taken under both locks.
-func beginApplyTargetWriteTxLocking(ctx context.Context, db *rebindDB, locker namedlock.Locker, operation, database, dbType, environment string, admitDeferred bool) (*applyWriteTx, error) {
 	conn, lockName, err := acquireApplyTargetLockConn(ctx, db, locker, database, dbType, environment)
 	if err != nil {
 		return nil, err
 	}
-	if admitDeferred {
-		if err := acquireDeferredCutoverAdmissionLock(ctx, locker, conn, database, dbType, environment); err != nil {
-			releaseApplyTargetLockConn(ctx, locker, conn, lockName, operation)
-			return nil, err
-		}
-	}
 
 	writeTx, err := beginApplyWriteTx(ctx, conn, operation)
 	if err != nil {
-		if admitDeferred {
-			releaseDeferredCutoverAdmissionLock(ctx, locker, conn, operation)
-		}
 		releaseApplyTargetLockConn(ctx, locker, conn, lockName, operation)
 		return nil, err
 	}
 	writeTx.locker = locker
 	writeTx.targetLockConn = conn
 	writeTx.targetLockName = lockName
-	writeTx.admissionLocked = admitDeferred
 	return writeTx, nil
-}
-
-// acquireDeferredCutoverAdmissionLock takes deferredCutoverAdmissionLockName on
-// conn, waiting as long as the target lock does.
-func acquireDeferredCutoverAdmissionLock(ctx context.Context, locker namedlock.Locker, conn *rebindConn, database, dbType, environment string) error {
-	acquired, err := locker.Acquire(ctx, conn.lockerConn(), deferredCutoverAdmissionLockName, storage.ApplyTargetLockWait)
-	if err != nil {
-		slog.WarnContext(ctx, "failed to acquire deferred cutover admission lock",
-			"database", database,
-			"database_type", dbType,
-			"environment", environment,
-			"lock", deferredCutoverAdmissionLockName,
-			"error", err)
-		return fmt.Errorf("acquire deferred cutover admission lock for %s/%s/%s: %w", database, dbType, environment, err)
-	}
-	if !acquired {
-		slog.WarnContext(ctx, "timed out waiting for deferred cutover admission lock",
-			"database", database,
-			"database_type", dbType,
-			"environment", environment,
-			"lock", deferredCutoverAdmissionLockName,
-			"wait", storage.ApplyTargetLockWait)
-		return fmt.Errorf("timed out waiting for deferred cutover admission lock for %s/%s/%s", database, dbType, environment)
-	}
-	return nil
-}
-
-// releaseDeferredCutoverAdmissionLock drops the admission lock from conn. A
-// release that fails or finds the lock not held discards the connection, as
-// the target lock's release does, so the pool never reuses a session whose
-// lock state is uncertain.
-func releaseDeferredCutoverAdmissionLock(ctx context.Context, locker namedlock.Locker, conn *rebindConn, operation string) {
-	releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), applyTargetLockReleaseTimeout)
-	defer cancel()
-
-	released, err := locker.Release(releaseCtx, conn.lockerConn(), deferredCutoverAdmissionLockName)
-	switch {
-	case err != nil:
-		slog.WarnContext(releaseCtx, "failed to release deferred cutover admission lock; discarding connection",
-			"operation", operation,
-			"lock", deferredCutoverAdmissionLockName,
-			"error", err)
-		discardApplyTargetLockConn(releaseCtx, conn, deferredCutoverAdmissionLockName, operation)
-	case !released:
-		slog.WarnContext(releaseCtx, "deferred cutover admission lock was not held by this session; discarding connection",
-			"operation", operation,
-			"lock", deferredCutoverAdmissionLockName)
-		discardApplyTargetLockConn(releaseCtx, conn, deferredCutoverAdmissionLockName, operation)
-	}
 }
 
 func (w *applyWriteTx) close(ctx context.Context, operation string) {
@@ -389,10 +316,6 @@ func (w *applyWriteTx) close(ctx context.Context, operation string) {
 		rollbackTx(ctx, w.tx, operation)
 	}
 	if w.targetLockConn != nil {
-		if w.admissionLocked {
-			releaseDeferredCutoverAdmissionLock(ctx, w.locker, w.targetLockConn, operation)
-			w.admissionLocked = false
-		}
 		releaseApplyTargetLockConn(ctx, w.locker, w.targetLockConn, w.targetLockName, operation)
 		w.targetLockConn = nil
 	}
@@ -974,9 +897,6 @@ func (s *applyStore) Create(ctx context.Context, apply *storage.Apply) (int64, e
 	if len(apply.TakesOverApplyIDs) > 0 {
 		return 0, fmt.Errorf("create apply %s: taking over stopped applies is recorded only by the create paths that write rows in one transaction", apply.ApplyIdentifier)
 	}
-	if apply.DeferredCutoverOperations > 1 {
-		return 0, fmt.Errorf("create apply %s: deferred cutover admission counts the operations an apply stores, so it runs only on the create paths that store them", apply.ApplyIdentifier)
-	}
 	canonicalizeApplyIdentity(apply)
 	canonicalizeApplyState(apply)
 
@@ -990,7 +910,7 @@ func (s *applyStore) Create(ctx context.Context, apply *storage.Apply) (int64, e
 	var writeTx *applyWriteTx
 	var err error
 	if lockTarget {
-		writeTx, err = beginApplyTargetWriteTxLocking(ctx, s.db, s.locker, "create apply", apply.Database, apply.DatabaseType, apply.Environment, false)
+		writeTx, err = beginApplyTargetWriteTx(ctx, s.db, s.locker, "create apply", apply.Database, apply.DatabaseType, apply.Environment)
 		if err != nil {
 			return 0, err
 		}
@@ -1271,14 +1191,10 @@ func (s *applyStore) createWithRowsOnce(ctx context.Context, apply *storage.Appl
 	}
 
 	lockTarget := isActiveApplyState(apply.State)
-	admitDeferred := apply.DeferredCutoverOperations > 1
-	if admitDeferred && !lockTarget {
-		return 0, fmt.Errorf("%s %s: deferred cutover admission requires an active apply, got state %s", opName, apply.ApplyIdentifier, apply.State)
-	}
 	var writeTx *applyWriteTx
 	var err error
 	if lockTarget {
-		writeTx, err = beginApplyTargetWriteTxLocking(ctx, s.db, s.locker, opName, apply.Database, apply.DatabaseType, apply.Environment, admitDeferred)
+		writeTx, err = beginApplyTargetWriteTx(ctx, s.db, s.locker, opName, apply.Database, apply.DatabaseType, apply.Environment)
 		if err != nil {
 			return 0, err
 		}
@@ -1299,10 +1215,6 @@ func (s *applyStore) createWithRowsOnce(ctx context.Context, apply *storage.Appl
 		if err != nil {
 			return 0, err
 		}
-	}
-
-	if err := admitDeferredCutover(ctx, writeTx.tx, s.dialect, apply, s.maxDriversPerApply); err != nil {
-		return 0, err
 	}
 
 	expectedOperationKeys, err := expectedOperationKeysValue(apply)

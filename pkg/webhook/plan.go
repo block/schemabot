@@ -1112,6 +1112,11 @@ const msgDeferCutoverAllDirectConfirm = "`--defer-cutover` has no effect on this
 // unverifiedMemberWorkMessage names the recovery instead.
 const msgOtherTargetPlansUnverified = "SchemaBot could not verify the other targets' plans, so nothing was applied. Retry the command, and see server logs if it persists."
 
+// msgDeferredCutoverCapacityUnverified is the apply comment when SchemaBot
+// could not read what it needs to tell whether the apply's deferred cutover
+// fits. Nothing is held yet, so the command is safe to retry.
+const msgDeferredCutoverCapacityUnverified = "SchemaBot could not check whether it has the drivers this deferred cutover needs, so nothing was applied. Retry the command, and see server logs if it persists."
+
 // shardedDirectChanges collects direct-execution per-shard changes, grouped by
 // (table, reason) so a change present on several shards lists them together
 // rather than repeating. Returns nil when the plan carries no per-shard
