@@ -9,20 +9,20 @@ import (
 	"github.com/block/schemabot/pkg/storage"
 )
 
-// TestOperatorServers runs the behavioral parity suite for
-// storage.OperatorServerStore.
-func TestOperatorServers(t *testing.T, h Harness) {
+// TestDriverPools runs the behavioral parity suite for
+// storage.DriverPoolStore.
+func TestDriverPools(t *testing.T, h Harness) {
 	// HeartbeatRegistersAndUpdates verifies a server's first heartbeat creates
 	// its row and later ones replace its driver count, and that Deregister
 	// removes it, including a second time.
 	t.Run("HeartbeatRegistersAndUpdates", func(t *testing.T) {
 		ctx := t.Context()
 		store := h.NewStorage(t)
-		servers := store.OperatorServers()
+		servers := store.DriverPools()
 
-		require.NoError(t, servers.Heartbeat(ctx, &storage.OperatorServer{ServerID: "host-b/1/operator", Drivers: 4}))
-		require.NoError(t, servers.Heartbeat(ctx, &storage.OperatorServer{ServerID: "host-a/1/operator", Drivers: 1}))
-		require.NoError(t, servers.Heartbeat(ctx, &storage.OperatorServer{ServerID: "host-b/1/operator", Drivers: 8}))
+		require.NoError(t, servers.Heartbeat(ctx, &storage.DriverPool{ServerID: "host-b/1/operator", Drivers: 4}))
+		require.NoError(t, servers.Heartbeat(ctx, &storage.DriverPool{ServerID: "host-a/1/operator", Drivers: 1}))
+		require.NoError(t, servers.Heartbeat(ctx, &storage.DriverPool{ServerID: "host-b/1/operator", Drivers: 8}))
 
 		live, err := servers.ListLive(ctx)
 		require.NoError(t, err)
@@ -43,6 +43,6 @@ func TestOperatorServers(t *testing.T, h Harness) {
 
 	t.Run("HeartbeatRequiresServerID", func(t *testing.T) {
 		store := h.NewStorage(t)
-		require.Error(t, store.OperatorServers().Heartbeat(t.Context(), &storage.OperatorServer{Drivers: 4}))
+		require.Error(t, store.DriverPools().Heartbeat(t.Context(), &storage.DriverPool{Drivers: 4}))
 	})
 }

@@ -1399,8 +1399,8 @@ type AppliedTarget struct {
 	Target      string
 }
 
-// OperatorServer is one server's row in the operator registry.
-type OperatorServer struct {
+// DriverPool is one server's pool of drivers, its row in driver_pools.
+type DriverPool struct {
 	// ServerID identifies one run of a server's operator.
 	ServerID string
 	// Drivers is how many drivers the operator runs.

@@ -87,11 +87,11 @@ func (s *Service) StartOperator(ctx context.Context) {
 	s.reservedDriverWake = reservedWake
 	s.claimingStopped = false
 	s.operatorDrivers.Store(int64(driverCount))
-	server := &storage.OperatorServer{
-		ServerID: newOperatorServerID(),
+	server := &storage.DriverPool{
+		ServerID: newDriverPoolServerID(),
 		Drivers:  driverCount,
 	}
-	s.operatorServerID = server.ServerID
+	s.driverPoolServerID = server.ServerID
 	heartbeatEvery := s.operatorHeartbeatEvery
 	if heartbeatEvery <= 0 {
 		heartbeatEvery = OperatorHeartbeatInterval
@@ -100,7 +100,7 @@ func (s *Service) StartOperator(ctx context.Context) {
 
 	// Register before any driver claims, so a deferred apply created as this
 	// server starts is admitted against drivers that are about to run.
-	s.heartbeatOperatorServer(driverCtx, server)
+	s.heartbeatDriverPool(driverCtx, server)
 
 	// Seed both occupancy gauges before any driver claims so the pool's
 	// capacity is visible from startup: pool size minus busy, summed across
@@ -235,12 +235,12 @@ func (s *Service) StopOperator() {
 	// StopClaiming at the shutdown signal.
 	s.stopClaimingLocked()
 	cancel := s.cancelRecovery
-	serverID := s.operatorServerID
+	serverID := s.driverPoolServerID
 	s.stopRecovery = nil
 	s.cancelRecovery = nil
 	s.operatorWake = nil
 	s.reservedDriverWake = nil
-	s.operatorServerID = ""
+	s.driverPoolServerID = ""
 	s.operatorMu.Unlock()
 
 	// From here on a drive that returns leaves its claim registered. A drive
@@ -272,7 +272,7 @@ func (s *Service) StopOperator() {
 	// drivers no longer run deferred work. The heartbeat has stopped with the
 	// other maintenance loops; removing the row stops them counting now
 	// rather than once the live window lapses.
-	s.deregisterOperatorServer(serverID)
+	s.deregisterDriverPool(serverID)
 
 	if !drivesReturned {
 		return

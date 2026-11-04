@@ -529,7 +529,7 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 			h.logger.Info("apply rejected: --defer-cutover would keep more drivers waiting at the cutover than the apply can have",
 				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
 				"plan_id", planResp.PlanID, "operations", refused.Operations, "drivers", refused.Drivers,
-				"live_operator_servers", refused.LiveServers, "max_drivers_per_apply", refused.PerApplyCap)
+				"live_servers", refused.LiveServers, "max_drivers_per_apply", refused.PerApplyCap)
 			h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy,
 				deferredCutoverCapacityMessage(refused, action.Apply, environment, h.deploymentTenant()))
 			return false, nil

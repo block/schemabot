@@ -16,13 +16,13 @@ import (
 	"github.com/block/schemabot/pkg/tern"
 )
 
-// seedLiveServers records one live operator server per entry, each running
+// seedLiveServers records one live driver pool per entry, each running
 // that many drivers.
 func seedLiveServers(t *testing.T, svc *Service, drivers ...int) {
 	t.Helper()
-	registry := &svc.storage.(*mockStorageWithApplyStores).operatorServers
+	pools := &svc.storage.(*mockStorageWithApplyStores).driverPools
 	for i, n := range drivers {
-		require.NoError(t, registry.Heartbeat(t.Context(), &storage.OperatorServer{ServerID: fmt.Sprintf("host-%d/1/operator", i), Drivers: n}))
+		require.NoError(t, pools.Heartbeat(t.Context(), &storage.DriverPool{ServerID: fmt.Sprintf("host-%d/1/operator", i), Drivers: n}))
 	}
 }
 
@@ -108,13 +108,13 @@ func TestDeferredCutoverOfOneOperationIsNotChecked(t *testing.T) {
 	assert.NotNil(t, applies.apply)
 }
 
-// A registry that cannot be read refuses nothing and admits nothing: apply
+// Driver pools that cannot be read refuse nothing and admits nothing: apply
 // creation fails as a storage failure, never as a capacity refusal.
-func TestDeferredCutoverRegistryFailureIsAStorageFailure(t *testing.T) {
+func TestDeferredCutoverDriverPoolReadFailureIsAStorageFailure(t *testing.T) {
 	applies := &capturingApplyStore{}
 	svc, _ := newQueueApplyTestService(threeShardQueueApplyTestPlan(), ampleDataPlane(), applies)
 	svc.config.MaxDriversPerApply = 3
-	svc.storage.(*mockStorageWithApplyStores).operatorServers.listErr = errors.New("registry unavailable")
+	svc.storage.(*mockStorageWithApplyStores).driverPools.listErr = errors.New("driver pools unavailable")
 
 	_, _, err := svc.EnqueueAuthorizedApply(t.Context(), deferredApplyRequest)
 
@@ -220,15 +220,15 @@ func TestDeferredCutoverCapacityRefusalAheadOfApplyCreation(t *testing.T) {
 }
 
 // The check ahead of apply creation returns an error only when it cannot read
-// what it needs. A registry that cannot be read is that error; a plan that is
+// what it needs. A failed read of the driver pools is that error; a plan that is
 // not stored is left to apply creation, which says so in its own words.
 func TestDeferredCutoverCapacityRefusalAheadOfApplyCreationErrors(t *testing.T) {
 	svc, _ := newQueueApplyTestService(threeShardQueueApplyTestPlan(), ampleDataPlane(), &capturingApplyStore{})
 	svc.config.MaxDriversPerApply = 3
-	svc.storage.(*mockStorageWithApplyStores).operatorServers.listErr = errors.New("registry unavailable")
+	svc.storage.(*mockStorageWithApplyStores).driverPools.listErr = errors.New("driver pools unavailable")
 
 	refused, err := svc.DeferredCutoverCapacityRefusal(t.Context(), deferredApplyRequest)
-	require.ErrorContains(t, err, "registry unavailable")
+	require.ErrorContains(t, err, "driver pools unavailable")
 	assert.Nil(t, refused)
 
 	missing, _ := newQueueApplyTestService(nil, ampleDataPlane(), &capturingApplyStore{})
@@ -237,19 +237,19 @@ func TestDeferredCutoverCapacityRefusalAheadOfApplyCreationErrors(t *testing.T) 
 	assert.Nil(t, refused)
 }
 
-// A running operator records its drivers in the registry before any driver
+// A running operator records its drivers in driver_pools before any driver
 // claims, and removes its row when it stops, so deferred cutover admission counts exactly the servers running
 // now. A restarted operator registers as a new run.
 func TestOperatorRegistersItsDriversWhileRunning(t *testing.T) {
 	svc, _ := newQueueApplyTestService(trustedQueueApplyTestPlan(), &mockTernClient{}, &capturingApplyStore{})
 	svc.config.Drivers = 4
 	require.NoError(t, svc.SetOperatorPollInterval(time.Hour))
-	registry := &svc.storage.(*mockStorageWithApplyStores).operatorServers
+	pools := &svc.storage.(*mockStorageWithApplyStores).driverPools
 
 	svc.StartOperator(t.Context())
 	t.Cleanup(svc.StopOperator)
 
-	live, err := registry.ListLive(t.Context())
+	live, err := pools.ListLive(t.Context())
 	require.NoError(t, err)
 	require.Len(t, live, 1)
 	first := live[0].ServerID
@@ -257,12 +257,12 @@ func TestOperatorRegistersItsDriversWhileRunning(t *testing.T) {
 	assert.Equal(t, 4, live[0].Drivers)
 
 	svc.StopOperator()
-	live, err = registry.ListLive(t.Context())
+	live, err = pools.ListLive(t.Context())
 	require.NoError(t, err)
 	assert.Empty(t, live)
 
 	svc.StartOperator(t.Context())
-	live, err = registry.ListLive(t.Context())
+	live, err = pools.ListLive(t.Context())
 	require.NoError(t, err)
 	require.Len(t, live, 1)
 	assert.NotEqual(t, first, live[0].ServerID)
@@ -274,19 +274,19 @@ func TestOperatorHeartbeatsOnItsInterval(t *testing.T) {
 	svc.config.Drivers = 2
 	svc.operatorHeartbeatEvery = 10 * time.Millisecond
 	require.NoError(t, svc.SetOperatorPollInterval(time.Hour))
-	registry := &svc.storage.(*mockStorageWithApplyStores).operatorServers
+	pools := &svc.storage.(*mockStorageWithApplyStores).driverPools
 
 	svc.StartOperator(t.Context())
 	t.Cleanup(svc.StopOperator)
 
 	require.Eventually(t, func() bool {
-		registry.mu.Lock()
-		defer registry.mu.Unlock()
-		return registry.beats >= 3
+		pools.mu.Lock()
+		defer pools.mu.Unlock()
+		return pools.beats >= 3
 	}, drivePassesDeadline, 5*time.Millisecond)
 }
 
-// A registry that stops answering does not hold the operator's startup: the
+// Storage that stops answering does not hold the operator's startup: the
 // first heartbeat gives up at its own deadline, StartOperator returns, and
 // the drivers start without the server's row.
 func TestOperatorStartupHeartbeatGivesUpAtItsDeadline(t *testing.T) {
@@ -294,8 +294,8 @@ func TestOperatorStartupHeartbeatGivesUpAtItsDeadline(t *testing.T) {
 	svc.config.Drivers = 2
 	svc.operatorHeartbeatDeadline = 10 * time.Millisecond
 	require.NoError(t, svc.SetOperatorPollInterval(time.Hour))
-	registry := &svc.storage.(*mockStorageWithApplyStores).operatorServers
-	registry.hang = true
+	pools := &svc.storage.(*mockStorageWithApplyStores).driverPools
+	pools.hang = true
 
 	started := make(chan struct{})
 	go func() {
@@ -305,11 +305,11 @@ func TestOperatorStartupHeartbeatGivesUpAtItsDeadline(t *testing.T) {
 	select {
 	case <-started:
 	case <-time.After(drivePassesDeadline):
-		require.FailNow(t, "StartOperator did not return while the registry stopped answering")
+		require.FailNow(t, "StartOperator did not return while storage stopped answering")
 	}
 	t.Cleanup(svc.StopOperator)
 
-	live, err := registry.ListLive(t.Context())
+	live, err := pools.ListLive(t.Context())
 	require.NoError(t, err)
 	assert.Empty(t, live, "a heartbeat that timed out records no row")
 }
@@ -331,16 +331,16 @@ func threeShardQueueApplyTestPlan() *storage.Plan {
 // counting toward deferred cutover admission.
 func TestOperatorHeartbeatSurvivesAFailedPrune(t *testing.T) {
 	svc, _ := newQueueApplyTestService(trustedQueueApplyTestPlan(), &mockTernClient{}, &capturingApplyStore{})
-	registry := &svc.storage.(*mockStorageWithApplyStores).operatorServers
-	registry.pruneErr = errors.New("prune failed")
+	pools := &svc.storage.(*mockStorageWithApplyStores).driverPools
+	pools.pruneErr = errors.New("prune failed")
 
-	svc.heartbeatOperatorServer(t.Context(), &storage.OperatorServer{ServerID: "host-a/1/operator", Drivers: 4})
+	svc.heartbeatDriverPool(t.Context(), &storage.DriverPool{ServerID: "host-a/1/operator", Drivers: 4})
 
-	live, err := registry.ListLive(t.Context())
+	live, err := pools.ListLive(t.Context())
 	require.NoError(t, err)
 	require.Len(t, live, 1)
 	assert.Equal(t, 4, live[0].Drivers)
-	assert.Equal(t, 1, registry.prunes)
+	assert.Equal(t, 1, pools.prunes)
 }
 
 // capacityReportingTernClient is a remote deployment that reports its

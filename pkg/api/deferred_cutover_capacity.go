@@ -114,13 +114,13 @@ func deferredCutoverRefusalStatus(refused *DeferredCutoverCapacityError) int {
 	return http.StatusUnprocessableEntity
 }
 
-// LiveWindowText names storage.OperatorServerLiveWindow for a sentence ending
+// LiveWindowText names storage.DriverPoolLiveWindow for a sentence ending
 // "during the last ...".
 func LiveWindowText() string {
-	if storage.OperatorServerLiveWindow == time.Minute {
+	if storage.DriverPoolLiveWindow == time.Minute {
 		return "minute"
 	}
-	return storage.OperatorServerLiveWindow.String()
+	return storage.DriverPoolLiveWindow.String()
 }
 
 // resolvedDrivers is this server's driver count: the configured Drivers, or
@@ -166,7 +166,7 @@ func (s *Service) deferredCutoverCapacityRefusal(ctx context.Context, plan *stor
 			"plan_id", plan.PlanIdentifier, "apply_id", applyIdentifier, "database", plan.Database,
 			"database_type", plan.DatabaseType, "environment", environment, "caller", caller,
 			"operations", operations, "max_drivers_per_apply", refused.PerApplyCap,
-			"drivers", refused.Drivers, "live_operator_servers", refused.LiveServers)
+			"drivers", refused.Drivers, "live_servers", refused.LiveServers)
 		refused.Database = plan.Database
 		refused.Environment = environment
 		refused.Operations = operations
@@ -177,9 +177,9 @@ func (s *Service) deferredCutoverCapacityRefusal(ctx context.Context, plan *stor
 		return refusal(&DeferredCutoverCapacityError{PerApplyCap: perApplyCap},
 			"deferred cutover would keep more drivers waiting at once than max_drivers_per_apply gives one apply"), nil
 	}
-	servers, err := s.storage.OperatorServers().ListLive(ctx)
+	servers, err := s.storage.DriverPools().ListLive(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("read live operator servers to admit deferred cutover of %s/%s: %w", plan.Database, environment, err)
+		return nil, fmt.Errorf("read live driver pools to admit deferred cutover of %s/%s: %w", plan.Database, environment, err)
 	}
 	drivers := 0
 	for _, server := range servers {
@@ -187,11 +187,11 @@ func (s *Service) deferredCutoverCapacityRefusal(ctx context.Context, plan *stor
 	}
 	if len(servers) == 0 {
 		return refusal(&DeferredCutoverCapacityError{},
-			"deferred cutover cannot be admitted until an operator server reports its drivers"), nil
+			"deferred cutover cannot be admitted until a server reports its drivers"), nil
 	}
 	if operations > drivers {
 		return refusal(&DeferredCutoverCapacityError{Drivers: drivers, LiveServers: len(servers)},
-			"deferred cutover would keep more drivers waiting at once than the live operator servers run"), nil
+			"deferred cutover would keep more drivers waiting at once than the live servers' drivers can hold"), nil
 	}
 	return s.deferredCutoverDataPlaneRefusal(ctx, plan, environment, applyIdentifier, caller, groups)
 }
@@ -279,55 +279,55 @@ func (s *Service) readDriverCapacity(ctx context.Context, client tern.Client) (*
 }
 
 // OperatorHeartbeatInterval is how often a running operator records its
-// drivers in the operator server registry. It is a quarter of
-// storage.OperatorServerLiveWindow, so three heartbeats in a row can fail
+// drivers in driver_pools. It is a quarter of
+// storage.DriverPoolLiveWindow, so three heartbeats in a row can fail
 // before the server's drivers stop counting toward deferred cutover admission.
-const OperatorHeartbeatInterval = storage.OperatorServerLiveWindow / 4
+const OperatorHeartbeatInterval = storage.DriverPoolLiveWindow / 4
 
-// operatorHeartbeatTimeout bounds one registry heartbeat. The first one runs
+// operatorHeartbeatTimeout bounds one driver pool heartbeat. The first one runs
 // on the startup path, so a storage call that stops answering must not hold
 // startup short of its shutdown handling; a heartbeat that times out is
 // logged and retried on the next tick like any other failure.
 const operatorHeartbeatTimeout = 5 * time.Second
 
-// operatorDeregisterTimeout bounds the registry removal at operator shutdown.
+// operatorDeregisterTimeout bounds the driver pool removal at operator shutdown.
 // A removal that does not finish leaves the row to drop out of the live
 // window on its own.
 const operatorDeregisterTimeout = 5 * time.Second
 
-// newOperatorServerID identifies one run of this process's operator. The
+// newDriverPoolServerID identifies one run of this process's operator. The
 // process identity makes the row readable; the suffix keeps two operators in
 // one process, and a restarted one, from sharing a row.
-func newOperatorServerID() string {
+func newDriverPoolServerID() string {
 	return storage.LeaseOwnerProcess() + "/operator-" + uuid.NewString()[:8]
 }
 
-// heartbeatOperatorServer records this server's drivers in the registry. A
+// heartbeatDriverPool records this server's drivers in driver_pools. A
 // failure is logged and left to the next heartbeat: until one lands, the
 // server's drivers may drop out of the live count, which refuses wide
 // deferred applies sooner rather than admitting more than can run.
-func (s *Service) heartbeatOperatorServer(ctx context.Context, server *storage.OperatorServer) {
+func (s *Service) heartbeatDriverPool(ctx context.Context, server *storage.DriverPool) {
 	timeout := s.operatorHeartbeatDeadline
 	if timeout <= 0 {
 		timeout = operatorHeartbeatTimeout
 	}
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	if err := s.storage.OperatorServers().Heartbeat(ctx, server); err != nil {
+	if err := s.storage.DriverPools().Heartbeat(ctx, server); err != nil {
 		s.logger.Warn("operator heartbeat failed; deferred cutover admission will not count this server's drivers once its last heartbeat leaves the live window",
 			"server_id", server.ServerID, "drivers", server.Drivers,
-			"live_window", storage.OperatorServerLiveWindow, "timeout", timeout, "error", err)
+			"live_window", storage.DriverPoolLiveWindow, "timeout", timeout, "error", err)
 		return
 	}
-	if err := s.storage.OperatorServers().PruneStale(ctx); err != nil {
-		s.logger.Warn("operator server registry prune failed; rows of stopped servers stay in the table until a later heartbeat prunes them, and are not counted toward deferred cutover admission",
-			"server_id", server.ServerID, "retention", storage.OperatorServerRetention, "timeout", timeout, "error", err)
+	if err := s.storage.DriverPools().PruneStale(ctx); err != nil {
+		s.logger.Warn("driver pool prune failed; rows of stopped servers stay in the table until a later heartbeat prunes them, and are not counted toward deferred cutover admission",
+			"server_id", server.ServerID, "retention", storage.DriverPoolRetention, "timeout", timeout, "error", err)
 	}
 }
 
 // operatorHeartbeatLoop heartbeats server every interval until the claim gate
 // closes or ctx ends.
-func (s *Service) operatorHeartbeatLoop(ctx context.Context, stop <-chan struct{}, interval time.Duration, server *storage.OperatorServer) {
+func (s *Service) operatorHeartbeatLoop(ctx context.Context, stop <-chan struct{}, interval time.Duration, server *storage.DriverPool) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
@@ -339,19 +339,19 @@ func (s *Service) operatorHeartbeatLoop(ctx context.Context, stop <-chan struct{
 			s.logger.Debug("operator: heartbeat stopping", "server_id", server.ServerID, "error", ctx.Err())
 			return
 		case <-ticker.C:
-			s.heartbeatOperatorServer(ctx, server)
+			s.heartbeatDriverPool(ctx, server)
 		}
 	}
 }
 
-// deregisterOperatorServer removes this server's registry row at shutdown, so
+// deregisterDriverPool removes this server's driver pool row at shutdown, so
 // its drivers stop counting at once rather than when the live window lapses.
-func (s *Service) deregisterOperatorServer(serverID string) {
+func (s *Service) deregisterDriverPool(serverID string) {
 	ctx, cancel := context.WithTimeout(context.Background(), operatorDeregisterTimeout)
 	defer cancel()
-	if err := s.storage.OperatorServers().Deregister(ctx, serverID); err != nil {
+	if err := s.storage.DriverPools().Deregister(ctx, serverID); err != nil {
 		s.logger.Warn("operator deregistration failed; this server's drivers keep counting toward deferred cutover admission until its last heartbeat leaves the live window",
-			"server_id", serverID, "live_window", storage.OperatorServerLiveWindow, "error", err)
+			"server_id", serverID, "live_window", storage.DriverPoolLiveWindow, "error", err)
 	}
 }
 
