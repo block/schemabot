@@ -1994,13 +1994,13 @@ func TestApplyOperationStore_FindNextApplyOperation_ClaimsFailedRetryableWithinB
 	assert.WithinDuration(t, time.Now(), persisted.UpdatedAt, 5*time.Second, "heartbeat must be refreshed on re-claim")
 }
 
-// setOperationAttempt gives an operation an attempt count, as if it had been
-// redispatched that many times.
-func setOperationAttempt(t *testing.T, id int64, attempt int) {
+// setOperationAttempt gives an operation an attempt count and a failure time
+// failedAgo in the past, as if it had been redispatched that many times.
+func setOperationAttempt(t *testing.T, id int64, attempt int, failedAgo time.Duration) {
 	t.Helper()
 	_, err := testDB.ExecContext(t.Context(), `
-		UPDATE apply_operations SET attempt = ? WHERE id = ?
-	`, attempt, id)
+		UPDATE apply_operations SET attempt = ?, updated_at = NOW() - INTERVAL ? SECOND WHERE id = ?
+	`, attempt, int(failedAgo.Seconds()), id)
 	require.NoError(t, err)
 }
 
@@ -2027,7 +2027,7 @@ func TestApplyOperationStore_FindNextApplyOperation_MultiOpRedispatchRaisesParen
 		ApplyID: apply.ID, Deployment: "region-a", State: state.ApplyOperation.FailedRetryable,
 	})
 	require.NoError(t, err)
-	setOperationAttempt(t, redispatchID, maxRecoveryAttempts-1)
+	setOperationAttempt(t, redispatchID, maxRecoveryAttempts-1, storage.MaxRecoveryBackoff+time.Minute)
 	// A sibling operation makes this a genuine multi-deployment apply.
 	_, err = store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
 		ApplyID: apply.ID, Deployment: "region-b", State: state.ApplyOperation.WaitingForCutover,
@@ -2132,7 +2132,7 @@ func TestApplyOperationStore_FindNextApplyOperation_OperationLeaseRedispatchOfAL
 				State: state.ApplyOperation.FailedRetryable, ErrorMessage: "dispatch failed",
 			})
 			require.NoError(t, err)
-			setOperationAttempt(t, id, maxRecoveryAttempts-1)
+			setOperationAttempt(t, id, maxRecoveryAttempts-1, storage.MaxRecoveryBackoff+time.Minute)
 			if tc.withTask {
 				task := createRetryableReapTask(t, store, apply, "task_op_lone_lease", "users", state.Task.FailedRetryable, "copy failed")
 				attachTaskToOperation(t, task.TaskIdentifier, id)
@@ -2386,7 +2386,7 @@ func TestApplyOperationStore_FindNextApplyOperation_SkipsFailedRetryableBudgetEx
 		ApplyID: apply.ID, Deployment: "region-a", State: state.ApplyOperation.FailedRetryable,
 	})
 	require.NoError(t, err)
-	setOperationAttempt(t, id, maxRecoveryAttempts)
+	setOperationAttempt(t, id, maxRecoveryAttempts, storage.MaxRecoveryBackoff+time.Minute)
 
 	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
 	require.NoError(t, err)

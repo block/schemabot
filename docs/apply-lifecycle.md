@@ -185,27 +185,39 @@ spending one per shard. The apply's attempt counter is the highest any of its
 operations has reached, and it is visible in the PR progress comment, so you
 can watch how much budget the worst-hit operation has burned.
 
-The count is never reset: an operation that recovered at its third attempt
-and fails again hours later has seven attempts left.
+An operation's first pickup is immediate. Each one after that waits twice as
+long as the one before, starting at 5 seconds and capped at 1 minute,
+measured from when the operation last failed. An outage of a few minutes
+therefore spends part of the budget instead of all of it, and the 10
+attempts together span about 6 minutes. The count is never reset: an
+operation that recovered at its third attempt and fails again hours later
+waits 20 seconds, and has seven attempts left.
+
+A pending `stop` or `cancel` does not wait out the backoff. The operation is
+picked up at once so the command takes effect, and that pickup spends an
+attempt like any other.
 
 In a rollout, an operation that is retrying a failure holds every member after
-it in the rollout order until the retry resolves. Members before it are not held, and
+it in the rollout order until the retry resolves, so the backoff also sets how
+long the rest of the rollout waits on it. Members before it are not held, and
 the shards of one target never wait on each other. Under `parallel`, the
 default for a `targets` list, the later members keep starting and copying
 while it retries: each finishes its copy, parks at the cutover barrier, which
 frees its driver, and cuts over once the retry succeeds. Under `barrier` and
 `rolling` they wait to start. An operation that fails every time holds them
-for its whole budget and then fails, and `on_failure` decides what the rest
-of the rollout does ([Multi-Target
-Environment](configuration.md#multi-target-environment-preview)). Stop or
-cancel the apply to end it sooner.
+for its whole budget, about 6 minutes, and then fails, and `on_failure`
+decides what the rest of the rollout does ([Multi-Target
+Environment](configuration.md#multi-target-environment-preview)). That wait is
+the cost of riding out a data plane restart instead of failing the rollout on
+it. Stop or cancel the apply to end it sooner; neither waits out the backoff.
 
 ```
  running --(recoverable failure)--> failed_retryable
     ^                                     |
-    |     recovery driver reclaims,       |
-    +---- operation's attempt +1,    <----+
-          resume from checkpoints         |
+    |     backoff passes, recovery        |
+    |     driver reclaims, operation's    |
+    +---- attempt +1, resume from    <----+
+          checkpoints                     |
                                           |  an operation's budget spent
                                           |  (10 attempts), or the failure
                                           |  is older than the recovery

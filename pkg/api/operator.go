@@ -1833,9 +1833,9 @@ func (s *Service) driveClaimedMultiOperation(ctx context.Context, driverID int, 
 // settledOperationOutcome reports whether the operation a successful drive just
 // settled lets the driver run the claim ladder again at once. Every settled
 // state does except failed_retryable: that is the one settled state the copy
-// claim offers again immediately, so re-running the ladder on it would spend
-// that operation's retry budget back to back rather than one attempt per poll
-// (ST-9).
+// claim offers again, immediately after an operation's first failure, so
+// re-running the ladder on it would spend that operation's retry budget back
+// to back rather than one attempt per poll (ST-9).
 func (s *Service) settledOperationOutcome(ctx context.Context, driverID int, op *storage.ApplyOperation) claimOutcome {
 	current, err := s.storage.ApplyOperations().Get(ctx, op.ID)
 	if err != nil {
