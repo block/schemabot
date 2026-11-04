@@ -137,12 +137,16 @@ func endedApplyIdentifiers(applies []*storage.EndedOperationApply) []string {
 	return identifiers
 }
 
+// endedOperationStopTypes are the database types the ended operation sweep
+// stops in these tests. The fixtures are MySQL applies, so it names that type,
+// and retry expiry is passed the same list, as the reaper passes both.
+var endedOperationStopTypes = []string{storage.DatabaseTypeMySQL}
+
 // testEndedOperationApplies covers the two sweeps that end an apply deferring
 // its cutover once one of its operations ends before the cutover: the list the
 // reaper stops, and the settle that fails the apply once nothing is driven.
 func testEndedOperationApplies(t *testing.T, h Harness) {
-	// The fixtures are MySQL applies, so the list names that type.
-	pausableTypes := []string{storage.DatabaseTypeMySQL}
+	pausableTypes := endedOperationStopTypes
 
 	// A deferred apply whose shard -40 failed under the halt policy while
 	// shard 40-80 waits at the cutover can never run the cutover for every
@@ -227,7 +231,7 @@ func testEndedOperationApplies(t *testing.T, h Harness) {
 		require.NotNil(t, listed[0].EndedOperation)
 		assert.Equal(t, ops["-40"], listed[0].EndedOperation.ID)
 
-		expired, err := store.Applies().ExpireRetryable(t.Context(), 10)
+		expired, err := store.Applies().ExpireRetryable(t.Context(), endedOperationStopTypes, 10)
 		require.NoError(t, err)
 		assert.Empty(t, expired, "retry expiry leaves an apply a drive still holds")
 	})
@@ -594,7 +598,7 @@ func testEndedOperationApplies(t *testing.T, h Harness) {
 		plain, _ := createEndedOperationApply(t, store, "apply_ended_expiry_plain", 963, state.Apply.FailedRetryable, true, ops...)
 		spendRetryBudget(t, store, plain.ID)
 
-		expired, err := store.Applies().ExpireRetryable(ctx, 10)
+		expired, err := store.Applies().ExpireRetryable(ctx, endedOperationStopTypes, 10)
 		require.NoError(t, err)
 		expiredIDs := make([]string, len(expired))
 		for i, apply := range expired {

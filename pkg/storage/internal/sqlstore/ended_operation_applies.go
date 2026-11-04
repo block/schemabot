@@ -100,6 +100,31 @@ func (s *applyStore) listAppliesHeldByEndedOperation(ctx context.Context, databa
 	if len(databaseTypes) == 0 {
 		return nil, fmt.Errorf("list applies held by an ended operation: no database types to list")
 	}
+	held, args := s.heldByEndedOperationSQL(databaseTypes)
+	args = append(args, limit)
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT `+applyColumns+`
+		FROM applies
+		WHERE `+held+`
+		ORDER BY updated_at
+		LIMIT ?
+	`, args...)
+	if err != nil {
+		return nil, fmt.Errorf("query applies held by an ended operation: %w", err)
+	}
+	applies, err := scanApplies(rows)
+	utils.CloseAndLog(rows)
+	if err != nil {
+		return nil, fmt.Errorf("scan applies held by an ended operation: %w", err)
+	}
+	return s.withEndedOperations(ctx, s.db, applies)
+}
+
+// heldByEndedOperationSQL matches an apply, in the enclosing query's
+// applies, that ListAppliesHeldByEndedOperation takes for the given database
+// types. expireRetryable passes over the same applies, so the two sweeps never
+// select one apply between them.
+func (s *applyStore) heldByEndedOperationSQL(databaseTypes []string) (string, []any) {
 	ended, endedArgs := s.endedOperationSQL("ended")
 	args := stringArgs(heldByEndedOperationApplyStates)
 	args = append(args, stringArgs(databaseTypes)...)
@@ -109,7 +134,7 @@ func (s *applyStore) listAppliesHeldByEndedOperation(ctx context.Context, databa
 	args = append(args, stringArgs(quietOperationStates)...)
 	args = append(args, state.ApplyOperation.Pending)
 	args = append(args, state.ApplyOperation.WaitingForCutover, storage.CutoverPolicyBarrier, storage.CutoverPolicyParallel)
-	args = append(args, storage.ControlOperationStop, storage.ControlOperationCancel, storage.ControlRequestPending, limit)
+	args = append(args, storage.ControlOperationStop, storage.ControlOperationCancel, storage.ControlRequestPending)
 
 	// The cutover runs for one rollout member, a deployment and target, at a
 	// time, so an ended operation holds only the operations of its own member.
@@ -120,21 +145,19 @@ func (s *applyStore) listAppliesHeldByEndedOperation(ctx context.Context, databa
 	// Every held operation that is copying must be held by a live drive,
 	// since the drive is what delivers the stop and saves the copy. A copying
 	// operation nobody drives is left to recovery, which claims it again and
-	// brings it back here, or, under a spent retry, to retry expiry. That
-	// makes the two sweeps disjoint: expiry takes only applies no driver
-	// holds. An operation parked at the cutover needs no live drive: recovery
+	// brings it back here, or, under a spent retry, to retry expiry. An
+	// operation parked at the cutover needs no live drive: recovery
 	// never claims it again on its own, but the claim of a parked operation
 	// takes it once a stop is pending, and that drive delivers the stop. A
 	// pending operation needs no drive; stop reconciliation settles it
-	// stopped.
+	// stopped. An apply held only by parked or pending operations has no
+	// driver, which retry expiry would otherwise take too, so expiry passes
+	// over every apply this matches.
 	//
 	// A pending stop or cancel is already ending the apply, whoever asked for
 	// it, so the apply is left to that request.
-	rows, err := s.db.QueryContext(ctx, fmt.Sprintf(`
-		SELECT `+applyColumns+`
-		FROM applies
-		WHERE state IN (%s)
-			AND database_type IN (%s)
+	clause := fmt.Sprintf(`applies.state IN (%s)
+			AND applies.database_type IN (%s)
 			AND %s
 			AND EXISTS (
 				SELECT 1 FROM apply_operations held
@@ -160,26 +183,15 @@ func (s *applyStore) listAppliesHeldByEndedOperation(ctx context.Context, databa
 			AND NOT EXISTS (
 				SELECT 1 FROM apply_control_requests req
 				WHERE req.apply_id = applies.id AND req.operation IN (?, ?) AND req.status = ?
-			)
-		ORDER BY updated_at
-		LIMIT ?
-	`, placeholders(len(heldByEndedOperationApplyStates)),
+			)`, placeholders(len(heldByEndedOperationApplyStates)),
 		placeholders(len(databaseTypes)),
 		s.dialect.JSONBooleanIsTrue("applies.options", []string{"defer_cutover"}),
 		placeholders(len(quietOperationStates)),
 		placeholders(len(quietOperationStates)),
 		ended,
 		placeholders(len(quietOperationStates)),
-		freshLeaseSQL(s.dialect, "held")), args...)
-	if err != nil {
-		return nil, fmt.Errorf("query applies held by an ended operation: %w", err)
-	}
-	applies, err := scanApplies(rows)
-	utils.CloseAndLog(rows)
-	if err != nil {
-		return nil, fmt.Errorf("scan applies held by an ended operation: %w", err)
-	}
-	return s.withEndedOperations(ctx, s.db, applies)
+		freshLeaseSQL(s.dialect, "held"))
+	return clause, args
 }
 
 // freshLeaseSQL matches an operation, aliased op, that a live drive holds: the

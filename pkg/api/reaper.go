@@ -321,7 +321,7 @@ func (s *Service) recordSweepOutcome(ctx context.Context, sweep reapSweep, reape
 // because it wants a much shorter interval than the stranded sweeps do; see
 // RetryableExpiryInterval.
 func (s *Service) runRetryableExpiryPass(ctx context.Context) {
-	expired, err := s.storage.Applies().ExpireRetryable(ctx, retryableExpiryBatch)
+	expired, err := s.storage.Applies().ExpireRetryable(ctx, endedOperationStoppableDatabaseTypes, retryableExpiryBatch)
 
 	// A pass settles its whole batch in one transaction, so this is all of what
 	// it expired or none of it — an error means nothing committed and there is
