@@ -1162,7 +1162,8 @@ each believing it holds the lock. *Enforced:* the session affinity probe
 (`verifyStorageSessionAffinity`, `pkg/api/ensure_schema_postgres.go`); the release-answer
 warnings on every advisory lock caller (`releaseEnsureSchemaLock`, `pkg/api/ensure_schema.go`;
 `releaseLockConn`, `pkg/storage/internal/sqlstore/lock_release.go`, shared by the apply target
-lock's `releaseApplyTargetLockConn` and the reaper's `reapUnderElection`).
+lock's `releaseApplyTargetLockConn` and the reaper's `reapUnderElection`; `releaseCleanupLock`,
+`pkg/pendingdrops/cleaner.go`).
 
 ### OW-10: Only drivers and elected reapers write to the target database
 
