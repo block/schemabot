@@ -1238,7 +1238,10 @@ jobs:
 
   localscale-rollup:
     name: "LocalScale Tests"
-    needs: [changes, localscale-matrix, localscale]
+    # Build is not a required check of its own; no test job waits for it, so
+    # this rollup is what keeps a change that fails to compile out of the
+    # merge queue.
+    needs: [changes, build, localscale-matrix, localscale]
     runs-on: ubuntu-latest
     if: always()
     steps:
@@ -1248,6 +1251,7 @@ jobs:
           CHANGES_CODE: ${{ needs.changes.outputs.code }}
           EVENT_NAME: ${{ github.event_name }}
           FULL: ${{ needs.changes.outputs.full }}
+          BUILD_RESULT: ${{ needs.build.result }}
           LS_MODE: ${{ needs.localscale-matrix.outputs.mode }}
           LS_SHARD_COUNT: ${{ needs.localscale-matrix.outputs.shard_count }}
           LOCALSCALE_RESULT: ${{ needs.localscale.result }}
@@ -1260,6 +1264,10 @@ jobs:
           if [ "$CHANGES_CODE" != "true" ]; then
             echo "Docs-only PR; LocalScale intentionally skipped."
             exit 0
+          fi
+          if [ "$BUILD_RESULT" != "success" ]; then
+            echo "::error::build result=$BUILD_RESULT"
+            exit 1
           fi
           # Fail closed: a merge-gating event must run the full matrix, and the
           # matrix that was actually instantiated must match the claimed mode.
