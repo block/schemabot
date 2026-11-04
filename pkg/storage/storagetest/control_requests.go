@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -323,6 +324,56 @@ func TestControlRequests(t *testing.T, h Harness) {
 		})
 		require.NoError(t, err)
 		assert.False(t, found)
+	})
+
+	// A cutover request's unknown-outcome stamp is written through
+	// UpdateMetadata next to the binding the request already carries, is read
+	// back by a later drive from the same row, and is cleared when the row is
+	// re-armed for a new command, whose sends have all yet to be answered.
+	t.Run("UpdateMetadata_StampsCutoverOutcomeUnknownUntilReArmed", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		controls := store.ControlRequests()
+		const operationID int64 = 42
+
+		applyID := createControlRequestApply(t, store, "control_unknown_db", "apply_control_unknown")
+		sent, _, err := controls.RequestPending(ctx, &storage.ApplyControlRequest{
+			ApplyID: applyID, Operation: storage.ControlOperationCutover, Status: storage.ControlRequestPending,
+			RequestedBy: "operator", Metadata: storage.CutoverRequestMetadata(operationID),
+		})
+		require.NoError(t, err)
+
+		since := time.Date(2026, 11, 4, 10, 0, 0, 0, time.UTC)
+		found, err := controls.UpdateMetadata(ctx, applyID, storage.ControlOperationCutover, func(req *storage.ApplyControlRequest) ([]byte, error) {
+			return req.WithCutoverOutcomeUnknownSince(operationID, since)
+		})
+		require.NoError(t, err)
+		assert.True(t, found)
+
+		stamped, err := controls.GetByOperation(ctx, applyID, storage.ControlOperationCutover)
+		require.NoError(t, err)
+		require.NotNil(t, stamped)
+		bound, err := stamped.CutoverOperationID()
+		require.NoError(t, err)
+		assert.Equal(t, operationID, bound, "the stamp keeps the request bound to its operation")
+		got, err := stamped.CutoverOutcomeUnknownSince(operationID)
+		require.NoError(t, err)
+		assert.WithinDuration(t, since, got, 0, "a later drive reads the stamp from the row")
+		assert.Equal(t, sent.Revision, stamped.Revision, "a stamp is not a new command")
+
+		require.NoError(t, controls.FailPending(ctx, applyID, storage.ControlOperationCutover, "unconfirmed"))
+		rearmed, _, err := controls.RequestPending(ctx, &storage.ApplyControlRequest{
+			ApplyID: applyID, Operation: storage.ControlOperationCutover, Status: storage.ControlRequestPending,
+			RequestedBy: "operator", Metadata: storage.CutoverRequestMetadata(operationID),
+		})
+		require.NoError(t, err)
+		assert.Equal(t, sent.Revision+1, rearmed.Revision)
+		cleared, err := rearmed.CutoverOutcomeUnknownSince(operationID)
+		require.NoError(t, err)
+		assert.True(t, cleared.IsZero(), "re-arming the row for a new command clears the stamp")
+		bound, err = rearmed.CutoverOperationID()
+		require.NoError(t, err)
+		assert.Equal(t, operationID, bound)
 	})
 
 	t.Run("RequestPending_ConcurrentFirstRequests", func(t *testing.T) {
