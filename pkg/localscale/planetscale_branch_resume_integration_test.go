@@ -5,6 +5,7 @@ package localscale_test
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -63,6 +64,45 @@ func TestPlanetScaleResumeFromBranchRunsOnlyTheRemainingPlannedChanges(t *testin
 	tables := branchTableNames(t, ctx, branch, keyspace)
 	assert.Contains(t, tables, "resume_landed")
 	assert.Contains(t, tables, "resume_missing", "the planned table the branch lacked must be created on resume")
+}
+
+// A driver that dies after opening the deploy request but before recording it
+// leaves the next driver a branch whose stored state names no deploy request.
+// The resume lists the open deploy requests from the branch into main through
+// LocalScale's listing, adopts the one it finds instead of opening a second
+// one, and records it as adopted, so the drive that deploys it first confirms
+// it holds the cutover (CO-4).
+func TestPlanetScaleResumeFromBranchAdoptsTheOpenDeployRequest(t *testing.T) {
+	cleanupActiveDeployRequests(t, t.Context())
+	deferCleanupActiveDeployRequests(t)
+	ctx := t.Context()
+	const keyspace = "testapp"
+
+	desired := desiredSchemaWith(t, ctx, keyspace, resumeLandedTable, resumeMissingTable)
+	branch := createBranchWithDDL(t, ctx, "resume-adopt", map[string][]string{keyspace: {resumeLandedTable, resumeMissingTable}}, nil)
+	open := createDeploy(t, ctx, branch, false)
+
+	eng := resumeTestEngineWith(&laggingSchemaAPIClient{PSClient: testClient})
+	result, err := eng.Apply(ctx, resumeFromBranchRequest(t, ctx, branch, desired, keyspace))
+	require.NoError(t, err, "a resume must adopt the open deploy request on its branch")
+	require.NotNil(t, result)
+	assert.True(t, result.Accepted)
+	t.Cleanup(func() { closeDeferredDeployRequest(t, eng, result.ResumeState) })
+
+	var recorded struct {
+		DeployRequestID      uint64 `json:"deploy_request_id"`
+		DeployRequestAdopted bool   `json:"deploy_request_adopted"`
+	}
+	require.NoError(t, json.Unmarshal([]byte(result.ResumeState.Metadata), &recorded))
+	assert.Equal(t, open.Number, recorded.DeployRequestID, "the open deploy request is the one recorded")
+	assert.True(t, recorded.DeployRequestAdopted, "the recorded deploy request is marked adopted")
+
+	listed, err := testClient.ListDeployRequests(ctx, &ps.ListDeployRequestsRequest{
+		Organization: testOrg, Database: testDB, Branch: branch, IntoBranch: "main", State: "open",
+	})
+	require.NoError(t, err)
+	require.Len(t, listed, 1, "the resume adopts the open deploy request rather than opening a second one")
+	assert.Equal(t, open.Number, listed[0].Number)
 }
 
 // A resumed branch that differs from the declared schema on a table the plan
