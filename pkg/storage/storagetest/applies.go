@@ -564,7 +564,7 @@ func TestApplies(t *testing.T, h Harness) {
 		require.NoError(t, err)
 		assert.Nil(t, claimed, "a spent retry budget stops recovery claims")
 
-		expired, err := store.Applies().ExpireRetryable(ctx, 10)
+		expired, err := store.Applies().ExpireRetryable(ctx, endedOperationStopTypes, 10)
 		require.NoError(t, err)
 		require.Len(t, expired, 1)
 		assert.Equal(t, apply.ID, expired[0].Apply.ID)
