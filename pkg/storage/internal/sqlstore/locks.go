@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/spirit/pkg/utils"
@@ -119,7 +120,7 @@ func (s *lockStore) acquireOnce(ctx context.Context, lock *storage.Lock, acquire
 		INSERT INTO locks (database_name, database_type, repository, pull_request, owner, pending_plan_id, disclosed_copy_discard,
 			disclosed_copies, acquired_by, acquired_by_operator_groups)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, lock.DatabaseName, lock.DatabaseType, lock.Repository, lock.PullRequest, lock.Owner, lock.PendingPlanID, len(lock.DisclosedCopies) > 0,
+	`, lock.DatabaseName, lock.DatabaseType, lock.Repository, lock.PullRequest, lock.Owner, lock.PendingPlanID, storage.DisclosesPrimaryCopy(lock.DisclosedCopies),
 		disclosed, acquirer.subject, acquirer.operatorGroups)
 	if err == nil {
 		lock.ID = id
@@ -192,13 +193,21 @@ func encodeLockAcquirer(lock *storage.Lock) (lockAcquirerColumns, error) {
 	return lockAcquirerColumns{subject: lock.Acquirer.Subject, operatorGroups: string(encoded)}, nil
 }
 
+// samePendingConfirmation reports whether stored already pins the confirmation
+// lock describes: the same plan, disclosing the same copies.
+func samePendingConfirmation(lock, stored *storage.Lock) bool {
+	return lock.PendingPlanID == stored.PendingPlanID &&
+		slices.EqualFunc(lock.DisclosedCopies, stored.DisclosedCopies, storage.DisclosedCopy.Equal)
+}
+
 // refreshPendingConfirmation overwrites the stored confirmation plan reference,
 // and the disclosure record that describes it, when the caller supplied a new
-// plan (an apply re-run posts a new confirmation plan). Both move in one
-// statement so the flag can never describe a plan other than the one the confirm
-// command will load. A caller supplying the same plan has nothing to change:
-// DisclosedCopies is a property of that plan's comment, so re-deriving it
-// cannot produce a different answer.
+// plan (an apply re-run posts a new confirmation plan) or the same plan with
+// different copies disclosed. Both move in one statement so the record can never
+// describe a plan other than the one the confirm command will load. The copies
+// are compared, not assumed from the plan ID: another target's copies come from
+// the rollout round, not from the plan, so the same plan can be posted with a
+// different disclosure.
 //
 // The UPDATE is owner-scoped: it only changes the row while this owner still
 // holds the lock. A conditional acquire also scopes it to the pending plan the
@@ -217,7 +226,7 @@ func (s *lockStore) refreshPendingConfirmation(ctx context.Context, lock, existi
 	if observedPendingPlanID != nil && existing.PendingPlanID != *observedPendingPlanID {
 		return storage.ErrLockIntentChanged
 	}
-	if lock.PendingPlanID == "" || lock.PendingPlanID == existing.PendingPlanID {
+	if lock.PendingPlanID == "" || samePendingConfirmation(lock, existing) {
 		return nil
 	}
 	disclosed, err := encodeDisclosedCopies(lock)
@@ -228,7 +237,7 @@ func (s *lockStore) refreshPendingConfirmation(ctx context.Context, lock, existi
 		UPDATE locks
 		SET pending_plan_id = ?, disclosed_copy_discard = ?, disclosed_copies = ?, updated_at = NOW()
 		WHERE database_name = ? AND database_type = ? AND ` + s.dialect.BinaryEquals("owner")
-	args := []any{lock.PendingPlanID, len(lock.DisclosedCopies) > 0, disclosed, lock.DatabaseName, lock.DatabaseType, lock.Owner}
+	args := []any{lock.PendingPlanID, storage.DisclosesPrimaryCopy(lock.DisclosedCopies), disclosed, lock.DatabaseName, lock.DatabaseType, lock.Owner}
 	if observedPendingPlanID != nil {
 		query += ` AND pending_plan_id = ?`
 		args = append(args, *observedPendingPlanID)
@@ -266,7 +275,7 @@ func (s *lockStore) refreshPendingConfirmation(ctx context.Context, lock, existi
 	if current.Owner != lock.Owner {
 		return storage.ErrLockHeld
 	}
-	if current.PendingPlanID == lock.PendingPlanID {
+	if samePendingConfirmation(lock, current) {
 		// The caller still owns the lock; the UPDATE affected no rows only because
 		// the stored value already matched, so the refresh is satisfied.
 		return nil

@@ -1045,10 +1045,11 @@ there as native DDL that blocks writes to the table until it finishes. An
 apply created any other way, such as a
 `POST /api/apply` of the primary target's plan, refuses another target's
 direct-execution change, and its unsafe changes unless the primary target's
-plan carries the same statement up to its schema qualifier. An unfinished copy
-another target's plan would discard is not refused either: the comment names it
-under that target, and the apply pauses for apply-confirm as it does for a copy
-on the primary target, then runs every target's plan once confirmed. A target
+plan carries the same statement up to its schema qualifier. A PR apply does not
+refuse an unfinished copy another target's plan would discard either: the
+comment names it under that target, and the apply pauses for apply-confirm as it
+does for a copy on the primary target, then runs every target's plan once
+confirmed. A target
 whose data plane could not say whether it holds an unfinished copy, because it
 does not look or its lookup failed, is refused, since the comment cannot
 disclose what the target did not report. The plan comment offers no apply

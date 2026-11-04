@@ -196,7 +196,29 @@ func TestLocks(t *testing.T, h Harness) {
 		assert.Equal(t, "plan-1", stored.PendingPlanID)
 		assert.Equal(t, disclosedCopies, stored.DisclosedCopies,
 			"the copies the comment named, each on its target, are the consent")
-		assert.True(t, stored.DisclosedCopyDiscard, "a build that reads only the flag still sees the disclosure")
+		assert.True(t, stored.DisclosedCopyDiscard, "a build that reads only the flag still sees the primary target's copy")
+
+		// The same plan posted again with only another target's copy disclosed:
+		// the record follows the new disclosure though the plan is unchanged,
+		// and the flag drops, since a build that reads only the flag reads it as
+		// consent to discard the primary target's copies.
+		memberOnly := []storage.DisclosedCopy{{Target: "eu/payments-002", Namespace: "app", Tables: []string{"events"}}}
+		require.NoError(t, store.Locks().Acquire(ctx, &storage.Lock{
+			DatabaseName:    "disclosure_db",
+			DatabaseType:    storage.DatabaseTypeMySQL,
+			Repository:      "org/repo",
+			PullRequest:     123,
+			Owner:           "owner-a",
+			PendingPlanID:   "plan-1",
+			DisclosedCopies: memberOnly,
+		}))
+
+		stored, err = store.Locks().Get(ctx, "disclosure_db", storage.DatabaseTypeMySQL)
+		require.NoError(t, err)
+		require.NotNil(t, stored)
+		assert.Equal(t, "plan-1", stored.PendingPlanID)
+		assert.Equal(t, memberOnly, stored.DisclosedCopies, "the same plan re-posted carries the disclosure it was posted with")
+		assert.False(t, stored.DisclosedCopyDiscard, "another target's copy is never consent for the primary target's")
 
 		// A later apply re-plans against a target whose copy is gone and posts
 		// a comment that discloses nothing. The record must follow that
@@ -673,7 +695,7 @@ func TestLocks(t *testing.T, h Harness) {
 		require.NoError(t, err)
 		require.NotNil(t, stored)
 		assert.Equal(t, "plan-3", stored.PendingPlanID)
-		assert.True(t, stored.DisclosedCopyDiscard)
+		assert.False(t, stored.DisclosedCopyDiscard, "only another target's copy was disclosed")
 		assert.Equal(t, disclosing.DisclosedCopies, stored.DisclosedCopies)
 
 		// A rollback pinned the lock after the caller read plan-3: the re-pin

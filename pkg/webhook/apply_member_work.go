@@ -59,19 +59,19 @@ func rolloutDisclosedCopies(planResp *apitypes.PlanResponse, rollout reviewDrift
 	}
 	if runsMemberWork {
 		for _, d := range rollout.work.discarded {
-			copies = append(copies, disclosedCopyOf(d.target, d.copy))
+			copies = append(copies, disclosedCopyOf(d.member, d.copy))
 		}
 	}
 	return copies
 }
 
-// disclosedCopyOf names a copy on target, the empty target being the one the
-// apply's own plan was planned against. Its tables are sorted so two readings
+// disclosedCopyOf names a copy on the member with ID member, the empty member
+// being the target the apply's own plan was planned against. Its tables are sorted so two readings
 // of the same copy name it the same way.
-func disclosedCopyOf(target string, c *apitypes.ExistingCopyResponse) storage.DisclosedCopy {
+func disclosedCopyOf(member string, c *apitypes.ExistingCopyResponse) storage.DisclosedCopy {
 	tables := slices.Clone(c.Tables)
 	slices.Sort(tables)
-	return storage.DisclosedCopy{Target: target, Namespace: c.Namespace, Tables: tables, Statement: c.Statement}
+	return storage.DisclosedCopy{Target: member, Namespace: c.Namespace, Tables: tables, Statement: c.Statement}
 }
 
 // undisclosedDiscards counts the copies applying would discard that the
@@ -81,15 +81,11 @@ func disclosedCopyOf(target string, c *apitypes.ExistingCopyResponse) storage.Di
 func undisclosedDiscards(discarding, disclosed []storage.DisclosedCopy) int {
 	n := 0
 	for _, c := range discarding {
-		if !slices.ContainsFunc(disclosed, func(d storage.DisclosedCopy) bool { return sameDisclosedCopy(c, d) }) {
+		if !slices.ContainsFunc(disclosed, c.Equal) {
 			n++
 		}
 	}
 	return n
-}
-
-func sameDisclosedCopy(a, b storage.DisclosedCopy) bool {
-	return a.Target == b.Target && a.Namespace == b.Namespace && a.Statement == b.Statement && slices.Equal(a.Tables, b.Tables)
 }
 
 // refusePendingRollout answers an apply that cannot run what the rollout has
@@ -198,9 +194,8 @@ func (h *Handler) recordPendingRollout(ctx context.Context, client *ghclient.Ins
 // not succeed, and again against the re-plan the apply runs from.
 //
 // An unreported copy refuses whether or not the primary target has work. The
-// rest is
-// what apply creation asks of each member, which depends on the primary plan:
-// an empty one can carry only per-member table work
+// rest is what apply creation asks of each member, which depends on the primary
+// plan: an empty one can carry only per-member table work
 // (api.MemberWorkAConvergedPrimaryPlanCannotRun), and one with work holds each
 // member to its shape (api.MemberWorkThePrimaryPlanCannotRun). Neither refuses
 // a blocked change any less.

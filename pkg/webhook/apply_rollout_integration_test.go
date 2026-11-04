@@ -1902,6 +1902,7 @@ func requireDisclosesUsersCopyOn(t *testing.T, body, target string) {
 
 // requireCopyDiscardConsent waits for the pending confirmation to record that
 // its comment disclosed the copy of `users` on each of targets and no other,
+// each named by its deployment (consent records the member ID, deployment/target),
 // so confirming it proceeds rather than stopping on the same copies again. The
 // comment is posted before the consent is recorded, so the comment arriving
 // does not mean the record has landed yet.
@@ -1916,7 +1917,8 @@ func requireCopyDiscardConsent(t *testing.T, svc *api.Service, dbName string, ta
 		disclosedOn = nil
 		for _, c := range lock.DisclosedCopies {
 			if slices.Equal(c.Tables, []string{"users"}) {
-				disclosedOn = append(disclosedOn, c.Target)
+				deployment, _, _ := strings.Cut(c.Target, "/")
+				disclosedOn = append(disclosedOn, deployment)
 			}
 		}
 		slices.Sort(disclosedOn)

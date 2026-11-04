@@ -147,7 +147,12 @@ func memberWorkOf(rollup *api.PlanRollup) memberWork {
 		work.copyAtStake = memberRefusal{target: names[at], reason: reason}
 	}
 	for _, d := range rollup.MemberDiscardedCopies() {
-		work.discarded = append(work.discarded, memberDiscardedCopy{target: names[d.Entry], copy: d.Copy})
+		entry := rollup.Entries[d.Entry]
+		work.discarded = append(work.discarded, memberDiscardedCopy{
+			target: names[d.Entry],
+			member: routing.ExecutionTarget{Deployment: entry.Deployment, Target: entry.Target}.MemberID(),
+			copy:   d.Copy,
+		})
 	}
 	return work
 }
@@ -157,6 +162,9 @@ func memberWorkOf(rollup *api.PlanRollup) memberWork {
 type memberDiscardedCopy struct {
 	// target names the member the way an operator addresses it.
 	target string
+	// member is the member's ID, which names it the same way however the rest
+	// of the rollout changes.
+	member string
 	copy   *apitypes.ExistingCopyResponse
 }
 

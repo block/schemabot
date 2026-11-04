@@ -188,6 +188,7 @@ func TestMemberWorkOfCarriesAnotherTargetsDiscardedCopy(t *testing.T) {
 	assert.False(t, got.copyAtStake.refuses(), "a copy the member reported is disclosed, not refused")
 	require.Len(t, got.discarded, 1)
 	assert.Equal(t, "primary/payments-002", got.discarded[0].target)
+	assert.Equal(t, "primary/payments-002", got.discarded[0].member)
 	assert.Equal(t, "payments", got.discarded[0].copy.Namespace)
 	assert.Equal(t, []string{"orders"}, got.discarded[0].copy.Tables)
 	assert.Equal(t, []string{"primary/payments-002"}, got.names)

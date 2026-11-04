@@ -143,9 +143,12 @@ type Lock struct {
 
 	// DisclosedCopyDiscard records that the comment this pending confirmation
 	// was posted with told the operator applying would throw away an unfinished
-	// row copy on a target the apply runs. It is true exactly when
-	// DisclosedCopies is non-empty, and it is kept for builds that read only the
-	// flag: consent is checked against DisclosedCopies.
+	// row copy on the target the apply's own plan was planned against. It is
+	// kept for builds that read only the flag, which check it against that
+	// target's copies alone, so it is true exactly when DisclosedCopies includes
+	// one there (DisclosesPrimaryCopy): a disclosure of another target's copy
+	// never reads as consent to discard this one's. Consent is checked against
+	// DisclosedCopies.
 	//
 	// False for locks acquired outside the PR apply path (rollback, CLI) and for
 	// rows written before this column existed, which is the safe default.
@@ -198,15 +201,29 @@ type Lock struct {
 }
 
 // DisclosedCopy names one unfinished copy a confirmation comment disclosed as
-// discarded. Target is the rollout member the copy is on, named as the comment
-// names it, and is empty for a copy on the target the apply's own plan was
-// planned against. Tables are sorted, so two readings of the same copy compare
-// equal.
+// discarded. Target is the member ID of the rollout member the copy is on, and
+// is empty for a copy on the target the apply's own plan was planned against.
+// It is the member ID rather than the name the comment shows, because that name
+// is qualified against the whole rollout and changes when a target is added.
+// Tables are sorted, so two readings of the same copy compare equal.
 type DisclosedCopy struct {
 	Target    string   `json:"target,omitempty"`
 	Namespace string   `json:"namespace,omitempty"`
 	Tables    []string `json:"tables,omitempty"`
 	Statement string   `json:"statement,omitempty"`
+}
+
+// Equal reports whether c and o name the same copy.
+func (c DisclosedCopy) Equal(o DisclosedCopy) bool {
+	return c.Target == o.Target && c.Namespace == o.Namespace && c.Statement == o.Statement && slices.Equal(c.Tables, o.Tables)
+}
+
+// DisclosesPrimaryCopy reports whether copies include one on the target the
+// apply's own plan was planned against. It is what DisclosedCopyDiscard is
+// written from, since a build that reads only the flag reads it as consent to
+// discard that target's copies and no other's.
+func DisclosesPrimaryCopy(copies []DisclosedCopy) bool {
+	return slices.ContainsFunc(copies, func(c DisclosedCopy) bool { return c.Target == "" })
 }
 
 // LockAcquirer is the verified caller behind a lock acquire.
