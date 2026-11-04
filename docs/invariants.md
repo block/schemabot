@@ -1004,7 +1004,9 @@ before. An apply an operator already stopped or cancelled is left to that reques
 sweeps (`ListAppliesHeldByEndedOperation`, `SettleAppliesStoppedForEndedOperation`,
 `pkg/storage/internal/sqlstore/ended_operation_applies.go`), and retry expiry leaving such an apply
 to the settle (`expireRetryable`, `pkg/storage/internal/sqlstore/applies.go`), pinned on both
-dialects by the storage parity suite (`pkg/storage/storagetest/ended_operation_applies.go`).
+dialects by the storage parity suite (`pkg/storage/storagetest/ended_operation_applies.go`). The
+drive tail leaves SchemaBot's stop pending for the settle (`completeLandedStopForHeldOpenApply`,
+`pkg/api/operator.go`).
 
 ## Ownership and leases (OW)
 
