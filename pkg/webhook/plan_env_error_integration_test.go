@@ -184,6 +184,117 @@ func TestE2EMultiEnvSchemaRequestErrorFailsAggregate(t *testing.T) {
 	assert.Equal(t, checkConclusionFailure, aggregate.Conclusion, "staging passing alone must not pass the aggregate")
 }
 
+// A pull request's staging and production checks both passed on an earlier
+// plan. A plan of production alone then fails outright. The failure replaces
+// production's stored row, so the aggregate fails, and a later plan of staging,
+// which folds the aggregate from stored check state, cannot pass it on
+// production's old success row.
+func TestE2ESingleEnvPlanFailureOverOldSuccessFailsAggregate(t *testing.T) {
+	p := newMultiEnvPlanHarness(t, []api.TargetEntry{
+		{Target: "orders-001", Namespaces: []string{"ns_0"}},
+		{Target: "orders-002", Namespaces: []string{"ns_1"}},
+	}, &planFailingTernClient{failPlans: 1}, nil)
+	p.seedPassingChecks(t, "staging", "production")
+
+	assert.NotEmpty(t, p.comment(t, "schemabot plan -e production"))
+
+	byEnv := p.checksByEnv(t)
+	require.Contains(t, byEnv, "production")
+	assert.Equal(t, checkConclusionFailure, byEnv["production"].Conclusion, "the failed plan replaces the old success row")
+	assert.Empty(t, byEnv["production"].BlockingReason, "a plan failure is a plan result, not a block")
+	assert.Equal(t, planFailedCheckSummary, byEnv["production"].ChangeSummary)
+	aggregate := p.lastAggregate()
+	require.NotNil(t, aggregate, "the aggregate check run is published")
+	assert.Equal(t, checkConclusionFailure, aggregate.Conclusion)
+	require.NotNil(t, aggregate.Output)
+	assert.NotContains(t, aggregate.Output.Summary, "10.0.0.5")
+
+	assert.NotEmpty(t, p.comment(t, "schemabot plan -e staging"))
+	aggregate = p.lastAggregate()
+	require.NotNil(t, aggregate, "the aggregate check run is published")
+	assert.Equal(t, checkConclusionFailure, aggregate.Conclusion, "staging's plan must not pass the aggregate over production's failed plan")
+}
+
+// A pull request's staging and production checks both passed on an earlier
+// plan. The repository's config then ignores every namespace, so a plan of
+// both environments fails in each: neither has schema files to plan. Each
+// failure replaces its environment's stored row, so the aggregate fails, and a
+// later fold from stored check state still fails instead of passing on the old
+// success rows.
+func TestE2EAllEnvPlanFailureOverOldSuccessFailsAggregate(t *testing.T) {
+	table := "CREATE TABLE `orders` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;"
+	p := newMultiEnvPlanHarnessWithRepo(t, []api.TargetEntry{
+		{Target: "orders-001", Namespaces: []string{"ns_production"}},
+	}, &namespaceSelectingTernClient{}, nil, map[string]string{
+		"ns_{env}/orders.sql": table,
+	}, "ignore_namespaces:\n  - ns_staging\n  - ns_production\n")
+	p.seedPassingChecks(t, "staging", "production")
+
+	assert.Contains(t, p.comment(t, "schemabot plan"), "no schema files found")
+
+	byEnv := p.checksByEnv(t)
+	for _, env := range []string{"staging", "production"} {
+		require.Contains(t, byEnv, env)
+		assert.Equal(t, checkConclusionFailure, byEnv[env].Conclusion, "%s's failed plan replaces its old success row", env)
+		assert.Equal(t, planFailedCheckSummary, byEnv[env].ChangeSummary, env)
+		assert.Equal(t, "abc123", byEnv[env].HeadSHA, env)
+	}
+	aggregate := p.lastAggregate()
+	require.NotNil(t, aggregate, "the aggregate check run is published")
+	assert.Equal(t, checkConclusionFailure, aggregate.Conclusion)
+
+	p.handler.updateAggregateCheck(t.Context(), p.client, "octocat/hello-world", 1, "abc123")
+	aggregate = p.lastAggregate()
+	require.NotNil(t, aggregate, "the refold publishes the aggregate check run")
+	assert.Equal(t, checkConclusionFailure, aggregate.Conclusion, "a refold must not pass the aggregate on the old success rows")
+}
+
+// A pull request's staging and production checks both passed on an earlier
+// plan. A plan of production alone then fails outright, and the failing row
+// recording that cannot be stored, so production's stored row is still the old
+// success. The failing aggregate posted in its place carries a block and is
+// posted before the fold, so no passing aggregate is published, and a later
+// plan of staging, whose fold would pass on the old rows, leaves it blocked.
+func TestE2EUnstoredSingleEnvPlanFailureHoldsAggregate(t *testing.T) {
+	p := newMultiEnvPlanHarness(t, []api.TargetEntry{
+		{Target: "orders-001", Namespaces: []string{"ns_0"}},
+		{Target: "orders-002", Namespaces: []string{"ns_1"}},
+	}, &planFailingTernClient{failPlans: 1}, func(st storage.Storage) storage.Storage {
+		return &envPlanResultFailingStorage{Storage: st, env: "production"}
+	})
+	p.seedPassingChecks(t, "staging", "production")
+
+	assert.NotEmpty(t, p.comment(t, "schemabot plan -e production"))
+
+	aggregates := p.publishedAggregates()
+	require.NotEmpty(t, aggregates, "the aggregate check run is published")
+	assertNoPassingAggregate(t, aggregates, "production's unrecorded plan failure")
+	last := aggregates[len(aggregates)-1]
+	require.NotNil(t, last.Output)
+	assert.Equal(t, planFailedUnstoredSummary, last.Output.Summary)
+	byEnv := p.checksByEnv(t)
+	require.Contains(t, byEnv, "production")
+	assert.Equal(t, checkConclusionSuccess, byEnv["production"].Conclusion, "production's failing row could not be stored")
+	p.assertAggregateBlocked(t, checkstate.BlockPlanFailedUnrecorded)
+
+	assert.NotEmpty(t, p.comment(t, "schemabot plan -e staging"))
+	assertNoPassingAggregate(t, p.publishedAggregates(), "staging's plan over production's unrecorded plan failure")
+	p.assertAggregateBlocked(t, checkstate.BlockPlanFailedUnrecorded)
+}
+
+// seedPassingChecks stores a passing check row on the PR's head for each given
+// environment, as an earlier clean plan would have.
+func (p *namespacePlacementHarness) seedPassingChecks(t *testing.T, environments ...string) {
+	t.Helper()
+	for _, env := range environments {
+		require.NoError(t, p.store.Checks().Upsert(t.Context(), &storage.Check{
+			Repository: "octocat/hello-world", PullRequest: 1, HeadSHA: "abc123",
+			Environment: env, DatabaseType: storage.DatabaseTypeMySQL, DatabaseName: p.dbName,
+			CheckRunID: 1, Status: checkStatusCompleted, Conclusion: checkConclusionSuccess,
+		}))
+	}
+}
+
 // A deployment publishes one aggregate per allowed environment. A pull
 // request plans staging and production together; staging plans with no
 // changes, production's plan fails, and the row recording that cannot be
