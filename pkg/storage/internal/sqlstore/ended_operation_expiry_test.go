@@ -35,8 +35,9 @@ func TestPostgresEndedOperationStopAndRetryExpiry(t *testing.T) {
 // that drove it restarted. Both the ended operation sweep and retry expiry see
 // an apply no driver holds. Expiry runs between the sweep listing the apply and
 // recording SchemaBot's stop, and again once the stop is pending, and passes
-// over it both times. The stop then reaches the parked shard, and the settle
-// fails the apply with the shard's copy saved and -40 named as its cause.
+// over it both times. The stop then reaches the parked shard, and once the
+// stop's drive no longer holds the shard, the settle fails the apply with the
+// shard's copy saved and -40 named as its cause.
 //
 // The retry can never come for either of two reasons, and both survive the
 // stop's delivery: a spent budget, and a failure older than the recovery
@@ -93,11 +94,14 @@ func testEndedOperationStopAndRetryExpiry(t *testing.T, newStore func(*testing.T
 			require.NotNil(t, parkedTask)
 			parkedTask.State = state.Task.Stopped
 			require.NoError(t, store.Tasks().Update(ctx, parkedTask))
-			released, err := store.ApplyOperations().ReleaseFinishedClaim(ctx, claimed.Lease())
-			require.NoError(t, err)
-			require.True(t, released)
-
+			// A stopped operation stays addressable, so its drive leaves the
+			// lease in place, and the settle waits until no lease is fresh.
 			settled, err := store.Applies().SettleAppliesStoppedForEndedOperation(ctx, 10)
+			require.NoError(t, err)
+			assert.Empty(t, settled, "the settle waits while the stop's drive still holds the shard")
+			backdateOperationLease(t, ctx, store, parkedID, 2*storage.ApplyLeaseStaleAfter)
+
+			settled, err = store.Applies().SettleAppliesStoppedForEndedOperation(ctx, 10)
 			require.NoError(t, err)
 			require.Len(t, settled, 1, "the stop's delivery leaves the reason the retry can never come")
 			assert.Equal(t, state.Apply.FailedRetryable, settled[0].SettledFrom)
