@@ -7,6 +7,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
+	"net"
 	"net/http"
 	"path"
 	"strconv"
@@ -30,10 +32,12 @@ const gitSymlinkModeDecimal = 0o120000
 // response size rather than the request budget.
 const symlinkModeGraphQLBatch = 100
 
-// ChangeRange identifies a change whose files' modes are read. PR is the pull
-// request number, or 0 for a comparison between two commits. Base is the
-// commit the change was made from: a PR's merge base, or the comparison's base
-// commit. Head is the commit the change produced.
+// ChangeRange identifies a change whose files' modes are read. Base is the
+// commit the change was made from: a PR's merge base, or a comparison's base
+// commit. Head is the commit the change produced. The modes are read for
+// exactly these two commits, so a push to the PR while they are read cannot
+// move the answer. PR is the pull request number, or 0 for a comparison
+// between two commits; it is only carried into logs and metrics.
 type ChangeRange struct {
 	PR   int
 	Base string
@@ -69,6 +73,13 @@ type SymlinkMode struct {
 // in batched GraphQL queries instead, which spend GitHub's GraphQL budget
 // rather than the REST budget webhook deliveries depend on. The tree is never
 // walked level by level.
+//
+// Callers probe only the change's schema inputs: paths in or beside a schema
+// directory, and paths that could be a symlink into one. The diff costs one
+// request however many paths are probed, but the GraphQL fallback costs one
+// query per batch of distinct parent directories, so probing every changed
+// file would let a PR's request count grow with its non-schema files, which
+// AV-15 forbids.
 func (ic *InstallationClient) SymlinkModes(ctx context.Context, repo string, change ChangeRange, probes []SymlinkProbe) (map[string]SymlinkMode, error) {
 	modes := make(map[string]SymlinkMode, len(probes))
 	if len(probes) == 0 {
@@ -136,21 +147,16 @@ type diffModes struct {
 	head map[string]bool
 }
 
-// fetchChangeDiffModes reads the change's diff and parses its file modes. A
-// diff GitHub refuses as too large yields no modes, so every probe falls back
-// to GraphQL.
+// fetchChangeDiffModes reads the diff between the change's two commits and
+// parses its file modes. The diff is read as a comparison of the two commits
+// rather than as the PR's diff, so a push to the PR while it is read cannot
+// move the result away from the commits the GraphQL fallback reads. A diff
+// GitHub refuses as too large yields no modes, so every probe falls back to
+// GraphQL.
 func (ic *InstallationClient) fetchChangeDiffModes(ctx context.Context, repo string, change ChangeRange) (diffModes, error) {
 	owner, repoName := splitRepo(repo)
 	ctx = withGitHubRateLimitContext(ctx, metrics.GitHubOperationFetchDiff, repo)
-	var (
-		diff string
-		err  error
-	)
-	if change.PR > 0 {
-		diff, _, err = ic.client.PullRequests.GetRaw(ctx, owner, repoName, change.PR, gh.RawOptions{Type: gh.Diff})
-	} else {
-		diff, _, err = ic.client.Repositories.CompareCommitsRaw(ctx, owner, repoName, change.Base, change.Head, gh.RawOptions{Type: gh.Diff})
-	}
+	diff, _, err := ic.client.Repositories.CompareCommitsRaw(ctx, owner, repoName, change.Base, change.Head, gh.RawOptions{Type: gh.Diff})
 	if isDiffTooLarge(err) {
 		ic.logger.Info("GitHub refused the change's diff as too large, so changed file modes are read from their directories with GraphQL",
 			"repo", repo, "pr", change.PR, "base_sha", change.Base, "head_sha", change.Head)
@@ -159,7 +165,11 @@ func (ic *InstallationClient) fetchChangeDiffModes(ctx context.Context, repo str
 	if err != nil {
 		return diffModes{}, fmt.Errorf("read the diff of %s (pr %d, %s...%s) for changed file modes: %w", repo, change.PR, change.Base, change.Head, err)
 	}
-	return parseDiffModes(diff), nil
+	modes, err := parseDiffModes(diff)
+	if err != nil {
+		return diffModes{}, fmt.Errorf("parse the diff of %s (pr %d, %s...%s) for changed file modes: %w", repo, change.PR, change.Base, change.Head, err)
+	}
+	return modes, nil
 }
 
 // isDiffTooLarge reports whether GitHub refused a diff for exceeding its size
@@ -178,8 +188,15 @@ func isDiffTooLarge(err error) bool {
 //	index a..b M             mode M on both sides (mode unchanged)
 //
 // A pure rename has none of these, so its paths are left unknown. A block
-// whose paths cannot be read is skipped, leaving its paths unknown too.
-func parseDiffModes(diff string) diffModes {
+// whose paths cannot be read is skipped, leaving its paths unknown too. Git
+// writes a change of a file's type (a symlink replaced by a regular file, or
+// the reverse) as a deletion block followed by a creation block for the same
+// path, so a path's mode on a side is the one its headers state explicitly,
+// and a block's inferred absence never overrides it.
+//
+// A diff the scanner cannot read to the end is an error: the files after the
+// unreadable line would otherwise lose their modes without a trace.
+func parseDiffModes(diff string) (diffModes, error) {
 	modes := diffModes{base: map[string]bool{}, head: map[string]bool{}}
 	var block diffBlock
 	flush := func() {
@@ -221,8 +238,11 @@ func parseDiffModes(diff string) diffModes {
 			block.headPath = unquoteDiffPath(line[strings.Index(line, "to ")+len("to "):])
 		}
 	}
+	if err := scanner.Err(); err != nil {
+		return diffModes{}, fmt.Errorf("scan diff for file modes: %w", err)
+	}
 	flush()
-	return modes
+	return modes, nil
 }
 
 // diffBlock accumulates one file's extended diff headers.
@@ -233,26 +253,32 @@ type diffBlock struct {
 	baseAbsent, headAbsent bool
 }
 
-// record stores the block's modes, for the sides its headers determine.
+// record stores the block's modes, for the sides its headers determine. A
+// mode the headers state explicitly always wins; absence of the file on a
+// side is recorded only while no other block has stated a mode for the path
+// there, since a type change splits one path across a deletion block and a
+// creation block.
 func (b diffBlock) record(modes diffModes) {
 	if b.basePath != "" {
-		switch {
-		case b.baseAbsent:
-			modes.base[b.basePath] = false
-		case b.baseMode != "":
-			modes.base[b.basePath] = b.baseMode == gitSymlinkModeOctal
-		case b.sharedMode != "":
-			modes.base[b.basePath] = b.sharedMode == gitSymlinkModeOctal
-		}
+		recordSideMode(modes.base, b.basePath, b.baseMode, b.sharedMode, b.baseAbsent)
 	}
 	if b.headPath != "" {
-		switch {
-		case b.headAbsent:
-			modes.head[b.headPath] = false
-		case b.headMode != "":
-			modes.head[b.headPath] = b.headMode == gitSymlinkModeOctal
-		case b.sharedMode != "":
-			modes.head[b.headPath] = b.sharedMode == gitSymlinkModeOctal
+		recordSideMode(modes.head, b.headPath, b.headMode, b.sharedMode, b.headAbsent)
+	}
+}
+
+// recordSideMode stores whether p is a symlink on one side: from the side's
+// own mode header, else from the index line's shared mode, else as absent
+// when no other block has already stated a mode for p on that side.
+func recordSideMode(side map[string]bool, p, sideMode, sharedMode string, absent bool) {
+	switch {
+	case sideMode != "":
+		side[p] = sideMode == gitSymlinkModeOctal
+	case sharedMode != "":
+		side[p] = sharedMode == gitSymlinkModeOctal
+	case absent:
+		if _, known := side[p]; !known {
+			side[p] = false
 		}
 	}
 }
@@ -314,7 +340,7 @@ func (ic *InstallationClient) graphQLSymlinks(ctx context.Context, repo, ref str
 	symlinkEntries := map[string]bool{}
 	for start := 0; start < len(dirs); start += symlinkModeGraphQLBatch {
 		batch := dirs[start:min(start+symlinkModeGraphQLBatch, len(dirs))]
-		entries, err := ic.graphQLListDirectories(ctx, repo, ref, batch)
+		entries, err := ic.graphQLListDirectoriesSplitting(ctx, repo, ref, batch)
 		if err != nil {
 			return nil, err
 		}
@@ -340,17 +366,75 @@ type graphQLTreeEntry struct {
 	Mode int    `json:"mode"`
 }
 
+// graphQLStatusError is a GraphQL request GitHub answered with a non-200
+// status, which carries no GraphQL errors payload.
+type graphQLStatusError struct {
+	status string
+	code   int
+}
+
+func (e *graphQLStatusError) Error() string {
+	return "endpoint returned " + e.status
+}
+
+// graphQLListDirectoriesSplitting lists dirs at ref, splitting the batch in
+// half and retrying each half when GitHub fails to answer in time. A query
+// that lists many large directories can be too expensive for GitHub to build
+// before it gives up, and the same query would fail on every redelivery, so
+// the batch shrinks down to one directory before the failure is returned. A
+// refusal GitHub states (a 4xx or a GraphQL errors payload) is returned as
+// is, since a smaller batch would be refused the same way.
+func (ic *InstallationClient) graphQLListDirectoriesSplitting(ctx context.Context, repo, ref string, dirs []string) (map[string][]graphQLTreeEntry, error) {
+	listed, err := ic.graphQLListDirectories(ctx, repo, ref, dirs)
+	if err == nil {
+		return listed, nil
+	}
+	if len(dirs) == 1 || ctx.Err() != nil || !isGraphQLTimeoutClassError(err) {
+		return nil, err
+	}
+	ic.logger.Info("GraphQL directory listing timed out, so the batch is split in half and each half retried",
+		"repo", repo, "ref", ref, "batch", len(dirs), "error", err)
+	half := len(dirs) / 2
+	listed, err = ic.graphQLListDirectoriesSplitting(ctx, repo, ref, dirs[:half])
+	if err != nil {
+		return nil, err
+	}
+	rest, err := ic.graphQLListDirectoriesSplitting(ctx, repo, ref, dirs[half:])
+	if err != nil {
+		return nil, err
+	}
+	maps.Copy(listed, rest)
+	return listed, nil
+}
+
+// isGraphQLTimeoutClassError reports whether a GraphQL listing failed in a
+// way a smaller batch can avoid: GitHub gave up on the query (a 5xx) or the
+// request timed out before it answered.
+func isGraphQLTimeoutClassError(err error) bool {
+	var statusErr *graphQLStatusError
+	if errors.As(err, &statusErr) {
+		return statusErr.code >= http.StatusInternalServerError
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
+}
+
 // graphQLListDirectories lists the entries of dirs at ref in one GraphQL
-// query. A directory absent at ref has no entries.
+// query. The query also resolves ref itself: GitHub answers null for a
+// directory that is absent at ref and for a ref it cannot resolve alike, so
+// a null directory counts as absent only once ref is known to resolve.
 func (ic *InstallationClient) graphQLListDirectories(ctx context.Context, repo, ref string, dirs []string) (map[string][]graphQLTreeEntry, error) {
 	owner, repoName := splitRepo(repo)
 	var query strings.Builder
-	query.WriteString("query($owner: String!, $name: String!")
-	variables := map[string]any{"owner": owner, "name": repoName}
+	query.WriteString("query($owner: String!, $name: String!, $ref: String!")
+	variables := map[string]any{"owner": owner, "name": repoName, "ref": ref}
 	for i := range dirs {
 		fmt.Fprintf(&query, ", $e%d: String!", i)
 	}
-	query.WriteString(") { repository(owner: $owner, name: $name) {")
+	query.WriteString(") { repository(owner: $owner, name: $name) { ref: object(expression: $ref) { oid }")
 	for i, dir := range dirs {
 		fmt.Fprintf(&query, " d%d: object(expression: $e%d) { ... on Tree { entries { name mode } } }", i, i)
 		if dir == "." {
@@ -376,12 +460,13 @@ func (ic *InstallationClient) graphQLListDirectories(ctx context.Context, repo, 
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("list %d directories at %s with GraphQL: endpoint returned %s", len(dirs), ref, resp.Status)
+		return nil, fmt.Errorf("list %d directories at %s with GraphQL: %w", len(dirs), ref, &graphQLStatusError{status: resp.Status, code: resp.StatusCode})
 	}
 
 	var result struct {
 		Data struct {
 			Repository map[string]*struct {
+				OID     string             `json:"oid"`
 				Entries []graphQLTreeEntry `json:"entries"`
 			} `json:"repository"`
 		} `json:"data"`
@@ -397,6 +482,9 @@ func (ic *InstallationClient) graphQLListDirectories(ctx context.Context, repo, 
 	}
 	if result.Data.Repository == nil {
 		return nil, fmt.Errorf("list %d directories at %s with GraphQL: repository %s not returned", len(dirs), ref, repo)
+	}
+	if result.Data.Repository["ref"] == nil {
+		return nil, fmt.Errorf("list %d directories at %s with GraphQL: %s does not resolve in %s", len(dirs), ref, ref, repo)
 	}
 
 	listed := make(map[string][]graphQLTreeEntry, len(dirs))
