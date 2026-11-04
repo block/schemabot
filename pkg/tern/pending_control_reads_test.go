@@ -82,12 +82,12 @@ func (c *manualClock) advance(d time.Duration) {
 func TestSharedPendingControlReads(t *testing.T) {
 	const maxAge = 250 * time.Millisecond
 	apply := &storage.Apply{ID: 11, ApplyIdentifier: "apply-shared-reads"}
-	setup := func() (*sharedPendingControlReads, *manualClock, *sharedReadControlRequestStore, storage.Storage) {
+	setup := func() (*SharedPendingControlReads, *manualClock, *sharedReadControlRequestStore, storage.Storage) {
 		clock := &manualClock{now: time.Unix(1_700_000_000, 0)}
 		controls := &sharedReadControlRequestStore{testControlRequestStore: &testControlRequestStore{requests: []*storage.ApplyControlRequest{
 			{ApplyID: apply.ID, Operation: storage.ControlOperationCutover, Status: storage.ControlRequestPending},
 		}}}
-		return &sharedPendingControlReads{now: clock.read}, clock, controls, &mockStorage{controlRequests: controls}
+		return &SharedPendingControlReads{now: clock.read}, clock, controls, &mockStorage{controlRequests: controls}
 	}
 	load := func(t *testing.T, d *drivePendingControlReads, store storage.Storage, apply *storage.Apply) pendingControlOperations {
 		t.Helper()
@@ -164,6 +164,28 @@ func TestSharedPendingControlReads(t *testing.T) {
 		assert.Equal(t, 1, controls.readCount(), "the second drive waited for the first drive's read")
 	})
 
+	t.Run("a read still in flight is joined however long ago it started", func(t *testing.T) {
+		shared, clock, controls, store := setup()
+		controls.hold, controls.entered = make(chan struct{}), make(chan struct{}, 1)
+		leaderDone := make(chan struct{})
+		go func() {
+			defer close(leaderDone)
+			_, _ = shared.forDrive(maxAge).load(t.Context(), store, apply, slog.Default())
+		}()
+		<-controls.entered
+		clock.advance(2 * maxAge)
+
+		read, leader := shared.join(apply.ID, nil, clock.read().Add(-maxAge), false)
+		assert.False(t, leader, "a check made while storage is slow waits for the read in flight instead of sending another")
+		assert.True(t, read.inFlight())
+
+		close(controls.hold)
+		receiveWithin(t, leaderDone)
+		assert.Equal(t, 1, controls.readCount())
+		_, leader = shared.join(apply.ID, nil, clock.read().Add(-maxAge), false)
+		assert.True(t, leader, "once that read has finished, its age applies again")
+	})
+
 	t.Run("a failed read is not handed to another drive", func(t *testing.T) {
 		shared, _, controls, store := setup()
 		controls.failNext = 1
@@ -219,13 +241,19 @@ func TestSharedPendingControlReads(t *testing.T) {
 	})
 }
 
-// Two drives of one remote apply, each driving its own rollout member,
-// answer their control checks at each poll from one read of the apply's
-// pending requests.
+// Two drives of one remote apply, each driving a rollout member on its own
+// deployment and so through its own client, answer their control checks at
+// each poll from one read of the apply's pending requests, because the
+// clients were built with the same SharedPendingControlReads.
 func TestGRPCClient_DrivesOfOneApplyShareTheirControlRead(t *testing.T) {
-	server := &capturingTernServer{}
-	client, cleanup := testCapturingGRPCClient(t, server)
-	defer cleanup()
+	shared := &SharedPendingControlReads{}
+	var clients []*GRPCClient
+	for range 2 {
+		client, cleanup := testCapturingGRPCClient(t, &capturingTernServer{})
+		defer cleanup()
+		client.pendingControlReads = shared
+		clients = append(clients, client)
+	}
 	apply := &storage.Apply{
 		ID: 1, ApplyIdentifier: "apply-shared-control-read",
 		Database: "testdb", DatabaseType: storage.DatabaseTypeMySQL,
@@ -234,9 +262,10 @@ func TestGRPCClient_DrivesOfOneApplyShareTheirControlRead(t *testing.T) {
 	}
 	stored := *apply
 	controls := &pollReadCountingControlRequestStore{testControlRequestStore: &testControlRequestStore{}}
-	client.storage = &mockStorage{applies: &mockApplyStore{apply: &stored}, tasks: &mockTaskStore{}, logs: &mockApplyLogStore{}, controlRequests: controls}
+	store := &mockStorage{applies: &mockApplyStore{apply: &stored}, tasks: &mockTaskStore{}, logs: &mockApplyLogStore{}, controlRequests: controls}
 
-	for range 2 {
+	for _, client := range clients {
+		client.storage = store
 		standDown, err := client.processPendingControlRequestsAtPoll(t.Context(), apply, applyTaskScope{},
 			client.pendingControlReads.forDrive(grpcProgressPollInterval/2), nil)
 		require.NoError(t, err)

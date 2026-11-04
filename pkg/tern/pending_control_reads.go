@@ -16,12 +16,19 @@ import (
 // any more are dropped.
 const pendingControlReadSweepAfter = time.Minute
 
-// sharedPendingControlReads lets the drives of one apply on this process share
+// SharedPendingControlReads lets the drives of one apply on this process share
 // their reads of its pending control requests. Every drive of an apply checks
 // them on every poll, so an apply with many operations in flight would
 // otherwise send the same query once per drive per poll. A drive asks through
 // its own drivePendingControlReads, which joins a read another drive started
 // recently, or one still in flight, instead of making its own.
+//
+// An apply's drives can run on different clients, such as one per target or
+// one per deployment, so the code that builds those clients passes them one
+// SharedPendingControlReads through LocalConfig or Config. Every client given
+// the same value must use the same storage, since reads are keyed by the
+// apply's storage ID. A client given none shares reads only among its own
+// drives.
 //
 // Sharing a read only changes which query answers the check, not what a
 // drive does with the answer. The set gates which processors run, and each
@@ -31,13 +38,21 @@ const pendingControlReadSweepAfter = time.Minute
 // its own would be.
 //
 // The zero value is ready to use.
-type sharedPendingControlReads struct {
+type SharedPendingControlReads struct {
 	// now reads the clock. Nil selects time.Now; tests set it.
 	now func() time.Time
 
 	mu        sync.Mutex
 	reads     map[int64]*pendingControlRead
 	lastSweep time.Time
+}
+
+// pendingControlReadsOrNew returns shared, or a new set when it is nil.
+func pendingControlReadsOrNew(shared *SharedPendingControlReads) *SharedPendingControlReads {
+	if shared != nil {
+		return shared
+	}
+	return &SharedPendingControlReads{}
 }
 
 // pendingControlRead is one read of an apply's pending control requests. done
@@ -57,7 +72,7 @@ type pendingControlRead struct {
 //
 // A nil handle reads storage directly on every check.
 type drivePendingControlReads struct {
-	shared *sharedPendingControlReads
+	shared *SharedPendingControlReads
 	// maxAge is how long before a check a read may have started and still
 	// answer it.
 	maxAge time.Duration
@@ -65,14 +80,18 @@ type drivePendingControlReads struct {
 }
 
 // forDrive returns a handle for one drive whose checks may be answered by a
-// read that started up to maxAge earlier.
-func (s *sharedPendingControlReads) forDrive(maxAge time.Duration) *drivePendingControlReads {
+// read that started up to maxAge earlier. A nil set returns a nil handle,
+// which reads storage directly on every check.
+func (s *SharedPendingControlReads) forDrive(maxAge time.Duration) *drivePendingControlReads {
+	if s == nil {
+		return nil
+	}
 	return &drivePendingControlReads{shared: s, maxAge: maxAge}
 }
 
 // load answers a check at the start of a poll. It joins the apply's latest
-// read when that read started within maxAge and the drive has not used it
-// yet, and otherwise starts a new read.
+// read when the drive has not used it yet and it is still in flight or
+// started within maxAge, and otherwise starts a new read.
 func (d *drivePendingControlReads) load(ctx context.Context, store storage.Storage, apply *storage.Apply, logger *slog.Logger) (pendingControlOperations, error) {
 	if d == nil {
 		return loadPendingControlOperations(ctx, store, apply)
@@ -116,10 +135,10 @@ func (d *drivePendingControlReads) loadStartedAfter(ctx context.Context, store s
 }
 
 // join returns the read that answers a check. Unless fresh is set, it is the
-// apply's latest read when that read started at or after notBefore and is not
-// the read the drive used last. Otherwise join records a new read and reports
+// apply's latest read when that read is not the one the drive used last and is
+// still in flight or started at or after notBefore. Otherwise join records a new read and reports
 // that the caller leads it, which means the caller must run it and close done.
-func (s *sharedPendingControlReads) join(applyID int64, last *pendingControlRead, notBefore time.Time, fresh bool) (read *pendingControlRead, leader bool) {
+func (s *SharedPendingControlReads) join(applyID int64, last *pendingControlRead, notBefore time.Time, fresh bool) (read *pendingControlRead, leader bool) {
 	now := s.clock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -137,30 +156,43 @@ func (s *sharedPendingControlReads) join(applyID int64, last *pendingControlRead
 
 // sweep drops the finished reads of applies no drive has checked in a while.
 // The caller holds mu.
-func (s *sharedPendingControlReads) sweep(now time.Time) {
+func (s *SharedPendingControlReads) sweep(now time.Time) {
 	if now.Sub(s.lastSweep) < pendingControlReadSweepAfter {
 		return
 	}
 	s.lastSweep = now
 	for applyID, read := range s.reads {
-		if now.Sub(read.started) < pendingControlReadSweepAfter {
+		if now.Sub(read.started) < pendingControlReadSweepAfter || read.inFlight() {
 			continue
 		}
-		select {
-		case <-read.done:
-			delete(s.reads, applyID)
-		default:
-		}
+		delete(s.reads, applyID)
 	}
 }
 
 // answers reports whether this read can answer a drive's check: the drive
-// has not used it yet, and it started at or after notBefore.
+// has not used it yet, and it is still in flight or started at or after
+// notBefore. A read in flight answers however long ago it started, because a
+// new query would wait on the same slow storage, and every drive that joins
+// it instead of starting its own keeps a slow store from also being asked
+// the same query over and over.
 func (r *pendingControlRead) answers(last *pendingControlRead, notBefore time.Time) bool {
-	return r != nil && r != last && !r.started.Before(notBefore)
+	if r == nil || r == last {
+		return false
+	}
+	return r.inFlight() || !r.started.Before(notBefore)
 }
 
-func (s *sharedPendingControlReads) clock() time.Time {
+// inFlight reports whether the read has not finished yet.
+func (r *pendingControlRead) inFlight() bool {
+	select {
+	case <-r.done:
+		return false
+	default:
+		return true
+	}
+}
+
+func (s *SharedPendingControlReads) clock() time.Time {
 	if s.now != nil {
 		return s.now()
 	}

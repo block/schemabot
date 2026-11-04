@@ -157,8 +157,8 @@ type GRPCClient struct {
 	observerPollInterval time.Duration
 
 	// pendingControlReads lets the drives of one apply share their reads of
-	// its pending control requests.
-	pendingControlReads sharedPendingControlReads
+	// its pending control requests. Nil reads storage on every check.
+	pendingControlReads *SharedPendingControlReads
 
 	// controlSendGate throttles retransmission of pending stop/cancel control
 	// requests to the data plane (see remoteControlResendInterval).
@@ -201,6 +201,12 @@ type Config struct {
 	// MaxRecvMsgBytes bounds a single response message. Zero or negative
 	// selects DefaultMaxRecvMsgBytes.
 	MaxRecvMsgBytes int
+
+	// PendingControlReads is shared with the other clients that drive the same
+	// applies against the same storage, so drives of one apply on different
+	// clients share their reads of its pending control requests. Nil gives the
+	// client a set of its own.
+	PendingControlReads *SharedPendingControlReads
 }
 
 // DefaultMaxRecvMsgBytes bounds a single response from a Tern deployment.
@@ -371,11 +377,12 @@ func NewGRPCClient(config Config) (*GRPCClient, error) {
 	}
 
 	return &GRPCClient{
-		conn:    conn,
-		client:  ternv1.NewTernClient(conn),
-		address: config.Address,
-		storage: config.Storage,
-		logger:  config.Logger,
+		conn:                conn,
+		client:              ternv1.NewTernClient(conn),
+		address:             config.Address,
+		storage:             config.Storage,
+		logger:              config.Logger,
+		pendingControlReads: pendingControlReadsOrNew(config.PendingControlReads),
 	}, nil
 }
 

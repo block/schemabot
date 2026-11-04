@@ -147,7 +147,11 @@ type Service struct {
 	defaultTernClient tern.Client            // fallback for any deployment/environment without a static or gRPC client (e.g. a TargetRouter)
 	routingTernClient *tern.RoutingClient
 	ternMu            sync.Mutex // protects tern client caches and engineFactories
-	logger            *slog.Logger
+	// pendingControlReads is handed to every Tern client the service builds,
+	// so the drives of one apply on different deployments share their reads
+	// of its pending control requests.
+	pendingControlReads *tern.SharedPendingControlReads
+	logger              *slog.Logger
 	// checkRunBackfiller replays the auto-plan flow for a PR to recreate
 	// missing Check Runs; wired from the webhook handler at serve startup,
 	// nil when no GitHub webhook runtime exists.
@@ -424,6 +428,7 @@ func New(st storage.Storage, config *ServerConfig, ternClients map[string]tern.C
 		pendingObservers:     make(map[pendingObserverKey]*pendingObserverEntry),
 		heldClaims:           make(map[int64]heldClaim),
 		heldOperationClaims:  make(map[int64]heldOperationClaim),
+		pendingControlReads:  &tern.SharedPendingControlReads{},
 	}
 	s.buildRateLimiters()
 	return s
@@ -624,9 +629,10 @@ func (s *Service) TernClient(deployment, environment string) (tern.Client, error
 	// Create gRPC client lazily
 	// Pass storage so GRPCClient can manage applies (heartbeats, progress tracking)
 	client, err := tern.NewGRPCClient(tern.Config{
-		Address: address,
-		Storage: s.storage,
-		Logger:  s.logger,
+		Address:             address,
+		Storage:             s.storage,
+		Logger:              s.logger,
+		PendingControlReads: s.pendingControlReads,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("create tern client for %s: %w", key, err)
@@ -804,6 +810,7 @@ func (s *Service) newLocalTernClient(key, database, dbType string, envConfig Env
 		PostgresConcurrentIndexMaxDuration:    s.config.Postgres.ConcurrentIndexMaxDurationOrDefault(),
 		WakeOperator:                          s.wakeOperator,
 		EngineFactories:                       s.engineFactories,
+		PendingControlReads:                   s.pendingControlReads,
 	}, s.storage, s.logger)
 	if err != nil {
 		return nil, fmt.Errorf("create local tern client for %s: %w", key, err)
