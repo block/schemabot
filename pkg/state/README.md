@@ -113,7 +113,7 @@ Per-table execution state. Mostly mirrors Apply state, with per-table scheduler/
 
 The apply state rolls up from task state: any `failed_retryable` task makes the apply `failed_retryable` unless a permanent `failed` task is present. Atomic execution can also mark the apply `failed_retryable` while updating the affected tasks from the same retryable engine result.
 
-When the scheduler claims a retryable operation, it refreshes the operation heartbeat as a lease, increments that operation's attempt, raises the apply's attempt to it if it is higher, and re-dispatches the operation once its backoff has passed. The attempt counts the operation's redispatches; it is not a per-task counter.
+When the scheduler claims a retryable operation, it refreshes the operation heartbeat as a lease, increments that operation's attempt, raises the apply's attempt to it if it is higher, and re-dispatches the operation. The attempt counts the operation's redispatches; it is not a per-task counter.
 
 The scheduler does not claim tasks directly. It claims the `failed_retryable` apply, reloads that apply's tasks, then prepares the retry by clearing only the tasks in `failed_retryable`. Those tasks move back to `pending`, their error message is cleared, and their task attempt count increments. Completed tasks are left alone because their table work already succeeded.
 

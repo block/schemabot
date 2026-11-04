@@ -3,7 +3,6 @@
 package sqlstore
 
 import (
-	"fmt"
 	"testing"
 	"time"
 
@@ -31,49 +30,12 @@ func TestPostgresRetryBudget(t *testing.T) {
 	})
 }
 
-// testRetryBudget covers each operation's own retry budget and the backoff
-// between its redispatches on both dialects.
+// testRetryBudget covers each operation's own retry budget on both dialects.
 func testRetryBudget(t *testing.T, newStore func(*testing.T) *Storage) {
-	// A failed_retryable operation is redispatched again only once the backoff
-	// for its own attempt has passed since it failed, for every attempt the
-	// budget allows. The first redispatch is immediate.
-	for attempt := range maxRecoveryAttempts {
-		type backoffCase struct {
-			name      string
-			failedAgo time.Duration
-			claimable bool
-		}
-		backoff := storage.RecoveryBackoff(attempt)
-		cases := []backoffCase{{name: "past the backoff", failedAgo: backoff + 3*time.Second, claimable: true}}
-		if backoff > 0 {
-			cases = append(cases, backoffCase{name: "inside the backoff", failedAgo: backoff - 3*time.Second})
-		}
-		for _, tc := range cases {
-			t.Run(fmt.Sprintf("attempt %d %s", attempt, tc.name), func(t *testing.T) {
-				ctx := t.Context()
-				store := newStore(t)
-				lock := createTestLock(t, store, "retry_backoff_db", storage.DatabaseTypeMySQL)
-				apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_retry_backoff", 1, state.Apply.FailedRetryable, "staging")
-				id := insertOperationAtAttempt(t, store, apply, "region-a", state.ApplyOperation.FailedRetryable, attempt, tc.failedAgo)
-				insertOperationAtAttempt(t, store, apply, "region-b", state.ApplyOperation.WaitingForCutover, 0, 0)
-
-				claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-a")
-				require.NoError(t, err)
-				if !tc.claimable {
-					assert.Nil(t, claimed, "attempt %d waits %s after its failure", attempt, backoff)
-					return
-				}
-				require.NotNil(t, claimed)
-				assert.Equal(t, id, claimed.ID)
-				assert.Equal(t, attempt+1, claimed.Attempt)
-			})
-		}
-	}
-
 	// Shard A spent all its retries and then succeeded, which raised the
 	// apply's attempt to the budget. Shard B fails for the first time
 	// afterwards. B still has its whole budget: expiry passes the apply over,
-	// and B's first redispatch is immediate.
+	// and B is redispatched.
 	t.Run("a sibling that spent its budget leaves the other's intact", func(t *testing.T) {
 		ctx := t.Context()
 		store := newStore(t)
@@ -89,7 +51,7 @@ func testRetryBudget(t *testing.T, newStore func(*testing.T) *Storage) {
 
 		claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-a")
 		require.NoError(t, err)
-		require.NotNil(t, claimed, "the shard's first redispatch is immediate")
+		require.NotNil(t, claimed, "a shard with retries left is redispatched")
 		assert.Equal(t, shardB, claimed.ID)
 		assert.Equal(t, 1, claimed.Attempt)
 		assert.Equal(t, state.ApplyOperation.Running, claimed.State)
@@ -112,7 +74,7 @@ func testRetryBudget(t *testing.T, newStore func(*testing.T) *Storage) {
 		lock := createTestLock(t, store, "retry_spent_db", storage.DatabaseTypeMySQL)
 		apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_retry_spent", 1, state.Apply.FailedRetryable, "staging")
 		setApplyAttempt(t, store, apply.ID, state.Apply.FailedRetryable, maxRecoveryAttempts-1, 0)
-		insertOperationAtAttempt(t, store, apply, "region-a", state.ApplyOperation.FailedRetryable, maxRecoveryAttempts, storage.MaxRecoveryBackoff+time.Minute)
+		insertOperationAtAttempt(t, store, apply, "region-a", state.ApplyOperation.FailedRetryable, maxRecoveryAttempts, 0)
 
 		claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-a")
 		require.NoError(t, err)
@@ -123,31 +85,6 @@ func testRetryBudget(t *testing.T, newStore func(*testing.T) *Storage) {
 		require.Len(t, expired, 1)
 		assert.Equal(t, apply.ID, expired[0].Apply.ID)
 		assert.Equal(t, storage.RetryableExpirationAttemptBudget, expired[0].Reason)
-	})
-
-	// A drive that failed back to failed_retryable hands its lease back on
-	// shutdown. The failure time is what the backoff counts from, so the
-	// handback leaves it in place and the next redispatch still waits.
-	t.Run("handing a failed operation back keeps its backoff", func(t *testing.T) {
-		ctx := t.Context()
-		store := newStore(t)
-		lock := createTestLock(t, store, "retry_handback_db", storage.DatabaseTypeMySQL)
-		apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_retry_handback", 1, state.Apply.FailedRetryable, "staging")
-		id := insertOperationAtAttempt(t, store, apply, "region-a", state.ApplyOperation.FailedRetryable, 2, 0)
-		insertOperationAtAttempt(t, store, apply, "region-b", state.ApplyOperation.WaitingForCutover, 0, 0)
-		_, err := store.db.ExecContext(ctx,
-			"UPDATE apply_operations SET lease_owner = 'driver-a', lease_token = 'token-a', lease_acquired_at = NOW() WHERE id = ?", id)
-		require.NoError(t, err)
-
-		released, err := store.ApplyOperations().ReleaseClaim(ctx, storage.OperationLease{
-			ApplyID: apply.ID, OperationID: id, Owner: "driver-a", Token: "token-a",
-		})
-		require.NoError(t, err)
-		require.True(t, released)
-
-		claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-b")
-		require.NoError(t, err)
-		assert.Nil(t, claimed, "the handed-back operation still waits out its backoff")
 	})
 
 	// A driver crashed part-way through a retry its parent had already
@@ -172,16 +109,16 @@ func testRetryBudget(t *testing.T, newStore func(*testing.T) *Storage) {
 }
 
 // insertOperationAtAttempt inserts an operation in the given state that has
-// had attempt redispatches and last changed failedAgo in the past, on either
+// had attempt redispatches and last changed age in the past, on either
 // dialect.
-func insertOperationAtAttempt(t *testing.T, store *Storage, apply *storage.Apply, deployment, opState string, attempt int, failedAgo time.Duration) int64 {
+func insertOperationAtAttempt(t *testing.T, store *Storage, apply *storage.Apply, deployment, opState string, attempt int, age time.Duration) int64 {
 	t.Helper()
 	id, err := store.ApplyOperations().Insert(t.Context(), &storage.ApplyOperation{
 		ApplyID: apply.ID, Deployment: deployment, State: opState,
 	})
 	require.NoError(t, err)
 	_, err = store.db.ExecContext(t.Context(),
-		"UPDATE apply_operations SET attempt = ?, updated_at = "+agedHeartbeatExpr(store, failedAgo)+" WHERE id = ?",
+		"UPDATE apply_operations SET attempt = ?, updated_at = "+agedHeartbeatExpr(store, age)+" WHERE id = ?",
 		attempt, id)
 	require.NoError(t, err)
 	return id
