@@ -159,6 +159,11 @@ func WriteProgress(data ProgressData) {
 	if data.State == state.Apply.Failed && data.ErrorMessage != "" {
 		fmt.Printf("\n  %s%s%s\n", ANSIRed, data.ErrorMessage, ANSIReset)
 	}
+	if data.Sharded {
+		if note := ShardedStoppedAtCutoverNote(data.State, data.Operations, data.Tables, data.Released); note != "" {
+			fmt.Printf("\n  ⏹️ %s\n", note)
+		}
+	}
 
 	fmt.Println()
 

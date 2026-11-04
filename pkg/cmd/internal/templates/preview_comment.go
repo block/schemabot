@@ -459,6 +459,8 @@ func previewCommentShardedAllOutput() {
 		{"SUMMARY: ALL SHARDS COMPLETED", func() { fmt.Print(webhooktemplates.PreviewCommentShardedSummaryCompleted()) }},
 		{"SUMMARY: KEYSPACE FINALIZED", func() { fmt.Print(webhooktemplates.PreviewCommentShardedSummaryFinalized()) }},
 		{"SUMMARY: HALT ON FAILURE (ONE SHARD FAILED)", func() { fmt.Print(webhooktemplates.PreviewCommentShardedSummaryFailed()) }},
+		{"SUMMARY: DEFERRED CUTOVER STOPPED AFTER A SHARD FAILED", func() { fmt.Print(webhooktemplates.PreviewCommentShardedSummaryStoppedAtCutover()) }},
+		{"SUMMARY: DEFERRED CUTOVER STOPPED AFTER A TABLE FAILED ON A KEYSPACE'S ONLY SHARD", func() { fmt.Print(webhooktemplates.PreviewCommentSummaryStoppedAtCutoverOnOnlyShard()) }},
 		{"SUMMARY: CANCELLED AFTER PARTIAL LANDING", func() { fmt.Print(webhooktemplates.PreviewCommentShardedSummaryCancelledPartial()) }},
 	}
 	printSections(sections)
