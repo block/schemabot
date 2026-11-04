@@ -1278,6 +1278,11 @@ func (e *Engine) resumeApply(ctx context.Context, client psclient.PSClient, org 
 	// between, and a listing that fails does not fall back to creating one:
 	// either way the resume could open a duplicate deploy request on the
 	// branch.
+	//
+	// The baseline of Vitess contexts is captured before the deploy request
+	// exists, as the fresh path captures it, so the deploy's own context is
+	// never part of it.
+	existingContexts := e.captureExistingContexts(ctx, client, req.Database, req.Credentials)
 	open, err := e.openDeployRequests(ctx, client, org, req.Database, meta.BranchName, main)
 	if err != nil {
 		return nil, fmt.Errorf("check branch %s for an open deploy request before creating one on resume: %w", meta.BranchName, err)
@@ -1319,11 +1324,27 @@ func (e *Engine) resumeApply(ctx context.Context, client psclient.PSClient, org 
 			meta.BranchName, len(open), main, strings.Join(numbers, ", "))
 	}
 	heldDeployRequest = dr.Number
+	// An adopted deploy request whose deploy may already have started is past
+	// what the rest of this path is built for, which would deploy it again and
+	// fail the apply over a schema change that is running. Once recorded, it
+	// is reattached exactly as a recorded one is.
+	reattach := adoptedDeployRequest && deployMayHaveStarted(dr)
+	if !adoptedDeployRequest {
+		emitEvent(deployRequestCreatedEvent(dr, meta.BranchName))
+	}
 	// Record the deploy request before waiting on it, as a fresh drive does,
 	// so a drive that ends during the wait leaves its successor resuming this
-	// deploy request rather than opening a second one on the same branch.
+	// deploy request rather than opening a second one on the same branch. The
+	// record carries what the fresh drive's does: the plan's VSchema diffs, and
+	// the context baseline. A deploy that may already have started is recorded
+	// without the baseline, which would hold its own context and hide it from
+	// the reattach's discovery; that discovery then selects without one.
 	meta.DeployRequestID = dr.Number
 	meta.DeployRequestURL = dr.HtmlURL
+	meta.VSchemaDiffs = vschemaDiffsFromChanges(req.Changes)
+	if !reattach {
+		meta.ExistingMigrationCtxs = existingContexts
+	}
 	createdMeta, err := encodePSMetadata(meta)
 	if err != nil {
 		return nil, fmt.Errorf("encode metadata for deploy request #%d on resume: %w", dr.Number, err)
@@ -1334,12 +1355,9 @@ func (e *Engine) resumeApply(ctx context.Context, client psclient.PSClient, org 
 	}, "deploy request opened on resume, before its diff is computed") {
 		recordedDeployRequest = dr.Number
 	}
-	// An adopted deploy request whose deploy may already have started is past
-	// what the rest of this path is built for, which would deploy it again and
-	// fail the apply over a schema change that is running. It is now recorded,
-	// so it is reattached exactly as a recorded one is.
-	if adoptedDeployRequest && deployMayHaveStarted(dr) {
+	if reattach {
 		reattachedDeployRequest = true
+		emitEvent(deployRequestAdoptedEvent(dr, meta.BranchName, ""))
 		e.logger.Info("the adopted deploy request's deploy may already have started; reattaching to it instead of deploying it",
 			"organization", org,
 			"database", req.Database,
@@ -1349,6 +1367,9 @@ func (e *Engine) resumeApply(ctx context.Context, client psclient.PSClient, org 
 			"deployed_at", formatDeployedAt(dr.DeployedAt),
 		)
 		return e.resumeExistingDeployRequest(ctx, client, org, req, meta)
+	}
+	if adoptedDeployRequest {
+		emitEvent(deployRequestAdoptedEvent(dr, meta.BranchName, state.Apply.ValidatingDeployRequest))
 	}
 	dr, err = e.waitForDeployRequestPending(ctx, client, org, req.Database, dr, emitEvent)
 	if err != nil {
@@ -1426,10 +1447,6 @@ func (e *Engine) resumeApply(ctx context.Context, client psclient.PSClient, org 
 	}, "deploy request created on resume") {
 		recordedDeployRequest = dr.Number
 	}
-
-	// Capture the migration_context baseline before deploying so the new Vitess
-	// context can be identified once Vitess creates migrations for this deploy.
-	existingContexts := e.captureExistingContexts(ctx, client, req.Database, req.Credentials)
 
 	// Either save naming the deploy request lets recovery re-read it, so a
 	// deploy whose outcome is unknown pauses when the first save landed even

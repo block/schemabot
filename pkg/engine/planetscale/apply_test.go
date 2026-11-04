@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/block/mysql"
 	ps "github.com/planetscale/planetscale-go/planetscale"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -18,6 +19,7 @@ import (
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/psclient"
 	"github.com/block/schemabot/pkg/schema"
+	"github.com/block/schemabot/pkg/state"
 )
 
 type permanentVSchemaErrorClient struct {
@@ -1997,7 +1999,8 @@ func declineEventMessages(events []engine.ApplyEvent) []string {
 // live PlanetScale API. The branch is ready, its schema already matches the
 // desired files (no remaining DDL to run), and the deploy request this resume
 // creates is instant-DDL eligible so the instant decision is actually reached.
-// Listing deploy requests returns listed and records the request.
+// Listing deploy requests returns listed and records the request; listing
+// keyspaces returns keyspaces.
 type branchResumeClient struct {
 	psclient.PSClient
 	deployCalls int
@@ -2005,6 +2008,7 @@ type branchResumeClient struct {
 	lastCreate  *ps.CreateDeployRequestRequest
 	listed      []*ps.DeployRequest
 	lastList    *ps.ListDeployRequestsRequest
+	keyspaces   []string
 }
 
 func (c *branchResumeClient) GetBranch(_ context.Context, req *ps.GetDatabaseBranchRequest) (*ps.DatabaseBranch, error) {
@@ -2018,6 +2022,16 @@ func (c *branchResumeClient) CreateBranchPassword(context.Context, *ps.DatabaseB
 func (c *branchResumeClient) ListDeployRequests(_ context.Context, req *ps.ListDeployRequestsRequest) ([]*ps.DeployRequest, error) {
 	c.lastList = req
 	return c.listed, nil
+}
+
+// ListKeyspaces returns the keyspaces of the main branch, which the context
+// baseline is captured across.
+func (c *branchResumeClient) ListKeyspaces(context.Context, *ps.ListKeyspacesRequest) ([]*ps.Keyspace, error) {
+	keyspaces := make([]*ps.Keyspace, len(c.keyspaces))
+	for i, name := range c.keyspaces {
+		keyspaces[i] = &ps.Keyspace{Name: name}
+	}
+	return keyspaces, nil
 }
 
 // GetDeployRequest reads back a listed deploy request, as a reattach to an
@@ -2233,6 +2247,104 @@ func TestResumeApply_AdoptsTheOpenDeployRequestOnItsBranch(t *testing.T) {
 			stored, err := decodePSMetadata(result.ResumeState.Metadata)
 			require.NoError(t, err)
 			assert.Equal(t, tt.wantNumber, stored.DeployRequestID)
+		})
+	}
+}
+
+// A resume that brings a deploy request into the apply records and announces
+// it as the fresh drive does. A deploy request the resume creates is announced
+// with the creation event; one it adopts is announced as adopted, claiming no
+// cutover request it did not make. The record saved before the resume waits on
+// the deploy request carries the plan's per-keyspace VSchema diffs and the
+// baseline of Vitess contexts captured before the deploy request existed, so
+// the apply renders its VSchema change and discovers its own context from
+// stored state. A deploy request whose deploy may already have started is
+// recorded without that baseline, which would already hold its own context.
+func TestResumeApply_RecordsAndAnnouncesTheDeployRequestAsTheFreshDriveDoes(t *testing.T) {
+	shortenEngineWaits(t)
+	const branch = "schemabot-testdb-crash"
+	const vschemaDiff = `{"tables":{"orders":{"column_vindexes":[{"column":"customer_id","name":"hash"}]}}}`
+	adoptedReady := &ps.DeployRequest{Number: 58, Branch: branch, IntoBranch: "main", State: deployRequestOpen, DeploymentState: deployState.Ready, HtmlURL: "https://app/dr/58"}
+	adoptedDeploying := &ps.DeployRequest{Number: 62, Branch: branch, IntoBranch: "main", State: deployRequestOpen, DeploymentState: deployState.InProgress, HtmlURL: "https://app/dr/62"}
+	wantDiffs := []vschemaKeyspaceDiff{{Namespace: "orders", Diff: vschemaDiff}}
+	// The fake vtgate reports one running schema change on the orders
+	// keyspace, under context vtctl:orders and with no timestamps.
+	wantBaseline := map[string]MigrationContextTimestamps{"vtctl:orders": {}}
+
+	tests := []struct {
+		name         string
+		listed       []*ps.DeployRequest
+		wantEvent    engine.ApplyEvent
+		wantBaseline map[string]MigrationContextTimestamps
+	}{
+		{name: "a deploy request the resume creates is announced as created",
+			wantEvent: engine.ApplyEvent{
+				Message: "Deploy request #77 created, requesting SchemaBot hold the cutover, validating...",
+				Metadata: map[string]string{
+					"deploy_request_id": "77", "deploy_request_url": "https://app/dr/77", "branch": branch, "requested_auto_cutover": "false",
+				},
+				NewState: state.Apply.ValidatingDeployRequest,
+			},
+			wantBaseline: wantBaseline},
+		{name: "an adopted deploy request that has not deployed is announced as adopted",
+			listed: []*ps.DeployRequest{adoptedReady},
+			wantEvent: engine.ApplyEvent{
+				Message:  "Resuming deploy request #58, already open on branch schemabot-testdb-crash",
+				Metadata: map[string]string{"deploy_request_id": "58", "deploy_request_url": "https://app/dr/58", "branch": branch},
+				NewState: state.Apply.ValidatingDeployRequest,
+			},
+			wantBaseline: wantBaseline},
+		{name: "an adopted deploy request already deploying is announced as adopted and recorded without a baseline",
+			listed: []*ps.DeployRequest{adoptedDeploying},
+			wantEvent: engine.ApplyEvent{
+				Message:  "Resuming deploy request #62, already open on branch schemabot-testdb-crash",
+				Metadata: map[string]string{"deploy_request_id": "62", "deploy_request_url": "https://app/dr/62", "branch": branch},
+			}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := mysql.NewConfig()
+			cfg.User = "schemabot"
+			cfg.Net = "tcp"
+			cfg.Addr = "vtgate.internal:3306"
+			cfg.DBName = "orders"
+			dsn := cfg.FormatDSN()
+
+			client := &branchResumeClient{listed: tt.listed, keyspaces: []string{"orders"}}
+			e := conformanceEngine(client)
+			e.vtgateDBs[dsn] = openSessionVtgate(t, &sessionVtgate{defaultKeyspace: "orders", tables: map[string]string{"orders": "orders"}})
+			req := resumeRequest(t, &psMetadata{BranchName: branch}, "apply-1a2b3c4d5e6f7890")
+			req.Credentials.DSN = dsn
+			// A deferred deploy stops the resume once the deploy request is
+			// recorded, before any deploy whose context discovery would poll.
+			req.Options = map[string]string{"defer_deploy": "true"}
+			req.Changes = []engine.SchemaChange{{Namespace: "orders", Metadata: map[string]string{"vschema": vschemaDiff}}}
+			var events []engine.ApplyEvent
+			req.OnEvent = func(event engine.ApplyEvent) { events = append(events, event) }
+			var saved []*psMetadata
+			req.OnStateChange = func(rs *engine.ResumeState) error {
+				meta, err := decodePSMetadata(rs.Metadata)
+				require.NoError(t, err)
+				saved = append(saved, meta)
+				return nil
+			}
+
+			_, err := e.resumeApply(t.Context(), client, "org", req)
+
+			require.NoError(t, err)
+			var announced []engine.ApplyEvent
+			for _, event := range events {
+				created := strings.Contains(event.Message, " created, requesting SchemaBot hold the cutover")
+				adopted := strings.HasPrefix(event.Message, "Resuming deploy request #")
+				if created || adopted {
+					announced = append(announced, event)
+				}
+			}
+			require.Len(t, announced, 1, "the deploy request is announced exactly once")
+			assert.Equal(t, tt.wantEvent, announced[0])
+			require.NotEmpty(t, saved)
+			assert.Equal(t, wantDiffs, saved[0].VSchemaDiffs, "the first record names the deploy request with the plan's VSchema diffs")
+			assert.Equal(t, tt.wantBaseline, saved[0].ExistingMigrationCtxs)
 		})
 	}
 }

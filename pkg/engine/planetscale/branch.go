@@ -887,6 +887,25 @@ func deployRequestCreatedEvent(dr *ps.DeployRequest, branchName string) engine.A
 	}
 }
 
+// deployRequestAdoptedEvent states, on the operator's timeline, that a resume
+// took over the deploy request it found open on the apply's branch instead of
+// creating one. It names the deploy request as the creation event does, but
+// claims no cutover request: this drive did not create it, and the drive or
+// operator that did may not have left its own record on the timeline.
+// newState is the phase the adoption enters, or empty when the deploy may
+// already be under way and the reattach reports the phase it finds.
+func deployRequestAdoptedEvent(dr *ps.DeployRequest, branchName, newState string) engine.ApplyEvent {
+	return engine.ApplyEvent{
+		Message: fmt.Sprintf("Resuming deploy request #%d, already open on branch %s", dr.Number, branchName),
+		Metadata: map[string]string{
+			"deploy_request_id":  fmt.Sprintf("%d", dr.Number),
+			"deploy_request_url": dr.HtmlURL,
+			"branch":             branchName,
+		},
+		NewState: newState,
+	}
+}
+
 // verifyCutoverHeld checks that the backend is holding the cutover of a deploy
 // request whose cutover the operator deferred.
 //
